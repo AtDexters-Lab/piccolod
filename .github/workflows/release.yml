@@ -1,0 +1,73 @@
+name: Tagged Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            goarch: amd64
+            label: linux-x86_64
+          - runner: ubuntu-22.04-arm64
+            goarch: arm64
+            label: linux-aarch64
+    env:
+      GOOS: linux
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ui-next/package-lock.json
+
+      - name: Build piccolod (server + UI)
+        run: make build
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          mv piccolod "dist/piccolod-${{ github.ref_name }}-${{ matrix.label }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: piccolod-${{ matrix.label }}
+          path: dist/piccolod-${{ github.ref_name }}-${{ matrix.label }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/piccolod-*
