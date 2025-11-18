@@ -42,7 +42,7 @@ jobs:
           cache-dependency-path: ui-next/package-lock.json
 
       - name: Build piccolod (server + UI)
-        run: make build
+        run: make build-release
 
       - name: Prepare artifact
         run: |

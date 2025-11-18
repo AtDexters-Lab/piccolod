@@ -27,7 +27,14 @@ server: ## Build piccolod with embedded ./web
 	@echo "==> Building piccolod (version=$(VERSION))"
 	go build -ldflags "-X main.version=$(VERSION)" -o piccolod ./cmd/piccolod
 
+server-release: ## Build piccolod with embedded ./web
+	@echo "==> Building release piccolod (version=$(VERSION))"
+	go build -buildmode=pie -ldflags "-s -w -X main.version=$(VERSION)" -o piccolod ./cmd/piccolod
+
 build: ui server
+	@echo "==> Build complete: ./piccolod with embedded ./web"
+
+build-release: ui server-release
 	@echo "==> Build complete: ./piccolod with embedded ./web"
 
 # --- Run targets ---

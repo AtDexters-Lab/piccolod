@@ -1,6 +1,6 @@
 [Unit]
 Description=Piccolo OS daemon
-Documentation=https://github.com/AtDexters-Lab/piccolo-os/tree/main/src/l1/piccolod
+Documentation=https://github.com/AtDexters-Lab/piccolod
 After=network-online.target
 Wants=network-online.target
 

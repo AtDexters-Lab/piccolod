@@ -8,10 +8,9 @@ Version:        0.1.0
 Release:        0
 Summary:        Piccolo OS daemon
 License:        AGPL-3.0-only
-URL:            https://github.com/AtDexters-Lab/piccolo-os/tree/main/src/l1/piccolod
+URL:            https://github.com/AtDexters-Lab/piccolod
 Source0:        piccolod.service
-Source1:        piccolod-%{version}-%{_arch}
-Source2:        LICENSE
+Source1:        https://github.com/AtDexters-Lab/piccolod/releases/download/v%{version}/piccolod-v%{version}-linux-%{_arch}
 ExclusiveArch:  x86_64 aarch64
 # service macros still needed for install/uninstall hooks
 BuildRequires:  systemd-rpm-macros
@@ -30,7 +29,6 @@ manages runtime supervisors, and serves the minimal UI.
 %install
 install -Dm0755 %{SOURCE1} %{buildroot}%{_bindir}/piccolod
 install -Dm0644 %{SOURCE0} %{buildroot}%{_unitdir}/piccolod.service
-install -Dm0644 %{SOURCE2} %{buildroot}%{_defaultdocdir}/%{name}/LICENSE
 
 %post
 %systemd_post piccolod.service
@@ -42,6 +40,5 @@ install -Dm0644 %{SOURCE2} %{buildroot}%{_defaultdocdir}/%{name}/LICENSE
 %systemd_postun piccolod.service
 
 %files
-%license %{_defaultdocdir}/%{name}/LICENSE
 %{_bindir}/piccolod
 %{_unitdir}/piccolod.service
