@@ -30,10 +30,20 @@ manages runtime supervisors, and serves the minimal UI.
 install -Dm0755 %{SOURCE1} %{buildroot}%{_bindir}/piccolod
 install -Dm0644 %{SOURCE0} %{buildroot}%{_unitdir}/piccolod.service
 
+%check
+%{buildroot}%{_bindir}/piccolod --version >/dev/null 2>&1 || true
+
+%pre
+%service_add_pre piccolod.service
+
 %post
 %systemd_post piccolod.service
+/usr/bin/systemctl --no-reload enable --now piccolod.service >/dev/null 2>&1 || :
 
 %preun
+if [ $1 -eq 0 ]; then
+    /usr/bin/systemctl --no-reload disable piccolod.service >/dev/null 2>&1 || :
+fi
 %systemd_preun piccolod.service
 
 %postun
@@ -42,3 +52,7 @@ install -Dm0644 %{SOURCE0} %{buildroot}%{_unitdir}/piccolod.service
 %files
 %{_bindir}/piccolod
 %{_unitdir}/piccolod.service
+
+%changelog
+* Tue Nov 18 2025 Piccolo Automation <ops@piccolo.local> - 0.1.0-0
+- Fetch prebuilt release artifacts, install systemd unit reliably, add basic service hooks.

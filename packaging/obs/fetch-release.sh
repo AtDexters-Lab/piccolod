@@ -22,4 +22,5 @@ for ARCH in linux-x86_64 linux-aarch64; do
   fi
   echo "Downloading ${FILE} from ${BASE_URL}"
   curl -fsSL -o "$FILE" "${BASE_URL}/${FILE}"
+  chmod 755 "$FILE"
 done
