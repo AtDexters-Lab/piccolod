@@ -15,10 +15,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: ubuntu-22.04
+          - runner: ubuntu-24.04
             goarch: amd64
             label: linux-x86_64
-          - runner: ubuntu-22.04-arm64
+          - runner: ubuntu-24.04-arm
             goarch: arm64
             label: linux-aarch64
     env:
@@ -59,7 +59,7 @@ jobs:
   release:
     name: Publish Release
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Download binaries
         uses: actions/download-artifact@v4
