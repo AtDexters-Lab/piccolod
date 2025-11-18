@@ -1,0 +1,12 @@
+# Security test: path traversal attempt
+name: malicious-app
+image: nginx:latest
+listeners:
+  - name: web
+    guest_port: 80
+
+storage:
+  persistent:
+    data:
+      container: ../../../etc/passwd
+      size_limit: 1GB

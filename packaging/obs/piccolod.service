@@ -1,0 +1,13 @@
+[Unit]
+Description=Piccolo OS daemon
+Documentation=https://github.com/AtDexters-Lab/piccolo-os/tree/main/src/l1/piccolod
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/piccolod
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

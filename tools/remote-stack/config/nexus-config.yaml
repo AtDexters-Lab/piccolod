@@ -1,0 +1,14 @@
+backendListenAddress: ":8443"
+peerListenAddress: ":8444"
+relayPorts:
+  - 443
+  - 80
+  - 5002
+idleTimeoutSeconds: 300
+backendsJWTSecret: "local-secret"
+peers: []
+peerAuthentication:
+  trustedDomainSuffixes: []
+hubTlsCertFile: "/config/hub.crt"
+hubTlsKeyFile: "/config/hub.key"
+acmeCacheDir: "/var/lib/nexus-proxy-server/acme"
