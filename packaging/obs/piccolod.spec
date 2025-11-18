@@ -14,6 +14,7 @@ Source1:        https://github.com/AtDexters-Lab/piccolod/releases/download/v%{v
 ExclusiveArch:  x86_64 aarch64
 # service macros still needed for install/uninstall hooks
 BuildRequires:  systemd-rpm-macros
+Requires:       gocryptfs
 %{?systemd_requires}
 
 %description
