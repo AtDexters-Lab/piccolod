@@ -1,0 +1,10 @@
+<services>
+  <service name="download_url">
+    <param name="url">https://github.com/AtDexters-Lab/piccolod/releases/download/v0.1.0/piccolod-v0.1.0-linux-x86_64</param>
+    <param name="filename">piccolod-v0.1.0-linux-x86_64</param>
+  </service>
+  <service name="download_url">
+    <param name="url">https://github.com/AtDexters-Lab/piccolod/releases/download/v0.1.0/piccolod-v0.1.0-linux-aarch64</param>
+    <param name="filename">piccolod-v0.1.0-linux-aarch64</param>
+  </service>
+</services>
