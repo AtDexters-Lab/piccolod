@@ -2,8 +2,8 @@ build
 .gocache
 node_modules
 
-# Piccolod artifacts (relative to src/l1/piccolod)
-piccolod
+# Piccolod artifacts (relative to repo root)
+/piccolod
 web
 web-src/test-results/
 web-src/web-src/test-results/
