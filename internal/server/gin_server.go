@@ -32,6 +32,7 @@ import (
 	"piccolod/internal/runtime/supervisor"
 	"piccolod/internal/services"
 	"piccolod/internal/state/paths"
+	"piccolod/internal/update"
 
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/gin-contrib/gzip"
@@ -49,6 +50,12 @@ var errInvalidStaticPath = errors.New("invalid static asset path")
 
 type unlockReloader interface {
 	ReloadFromStorage() error
+}
+
+type osUpdateManager interface {
+	Status(context.Context) (update.Status, error)
+	Apply(context.Context) error
+	Rollback(context.Context, string) error
 }
 
 // GinServer holds all the core components for our application using Gin framework.
@@ -86,6 +93,7 @@ type GinServer struct {
 	// Crypto manager for lock/unlock of app data volumes
 	cryptoManager *crypt.Manager
 	healthTracker *health.Tracker
+	updateManager osUpdateManager
 
 	reloadersMu     sync.RWMutex
 	unlockReloaders []unlockReloader
@@ -255,6 +263,13 @@ func WithGinVersion(version string) GinServerOption {
 	}
 }
 
+// WithUpdateManager allows tests to inject a stub update manager.
+func WithUpdateManager(m osUpdateManager) GinServerOption {
+	return func(s *GinServer) {
+		s.updateManager = m
+	}
+}
+
 // NewGinServer creates the main server application using Gin and initializes all its components.
 func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	// Create Podman CLI for app management
@@ -350,6 +365,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	}
 	healthTracker.Setf("remote", health.LevelWarn, "remote manager initializing")
 	healthTracker.Setf("persistence", health.LevelWarn, "control store locked")
+	healthTracker.Setf("update", health.LevelWarn, "update manager initializing")
 
 	if !mdnsDisabled {
 		s.supervisor.Register(supervisor.NewComponent("mdns", func(ctx context.Context) error {
@@ -427,6 +443,16 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	remote.RegisterHandlers(dispatch, rm)
 	s.healthTracker.Setf("remote", health.LevelOK, "remote manager ready")
 	s.refreshRemoteRuntime()
+
+	// Update manager (MicroOS transactional-update)
+	if s.updateManager == nil {
+		um, err := update.NewManager()
+		if err != nil {
+			return nil, fmt.Errorf("update manager init: %w", err)
+		}
+		s.updateManager = um
+	}
+	s.healthTracker.Setf("update", health.LevelOK, "update manager ready")
 
 	// (Simplified) No dynamic port publish/unpublish wiring; allow dial to fail gracefully.
 
@@ -602,6 +628,10 @@ func (s *GinServer) setupGinRoutes() {
 		authed.POST("/auth/password", s.handleAuthPassword)
 		authed.POST("/auth/staleness/ack", s.handleAuthStalenessAck)
 		authed.GET("/auth/csrf", s.handleAuthCSRF)
+
+		// OS updates
+		authed.POST("/updates/os/apply", s.requireUnlocked(), s.handleOSUpdateApply)
+		authed.POST("/updates/os/rollback", s.requireUnlocked(), s.handleOSUpdateRollback)
 
 		// Catalog (read-only) and services require auth
 		authed.GET("/catalog", s.handleGinCatalog)
