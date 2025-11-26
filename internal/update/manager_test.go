@@ -179,3 +179,66 @@ func (fakeRunner) Run(ctx context.Context, name string, args ...string) (string,
 		return "", "", 0, nil
 	}
 }
+
+// Runner that always reports a running piccolo-tu-* unit to trigger ErrInProgress.
+type inProgressRunner struct{}
+
+func (inProgressRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	switch name {
+	case "systemctl":
+		// List-units path
+		if len(args) >= 5 && args[0] == "list-units" {
+			return "piccolo-tu-apply.service loaded active running\n", "", 0, nil
+		}
+		// is-active transactional-update fallback
+		if len(args) >= 2 && args[0] == "is-active" {
+			return "", "", 0, nil
+		}
+	case "snapper":
+		// Keep a small snapshot set so validation passes when not blocked earlier.
+		return `{"configs":[{"config":"root","snapshots":[{"number":1,"date":"2025-11-20 09:00:00","description":"active"}]}]}`, "", 0, nil
+	}
+	return "", "", 0, nil
+}
+
+// Runner that serves a minimal snapshot list for rollback validation.
+type snapshotRunner struct{}
+
+func (snapshotRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	switch name {
+	case "snapper":
+		return `{"configs":[{"config":"root","snapshots":[{"number":1,"date":"2025-11-20 09:00:00","description":"active"},{"number":2,"date":"2025-11-21 09:00:00","description":"prev"}]}]}`, "", 0, nil
+	default:
+		return "", "", 0, nil
+	}
+}
+
+func TestApplyReturnsInProgressWhenTUAlreadyRunning(t *testing.T) {
+	m, err := newMicroOSBackend(
+		WithRunner(inProgressRunner{}),
+		WithSupportOverride(true),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	if err := m.Apply(context.Background()); err != ErrInProgress {
+		t.Fatalf("expected ErrInProgress, got %v", err)
+	}
+}
+
+func TestRollbackInvalidSnapshotReturnsError(t *testing.T) {
+	m, err := newMicroOSBackend(
+		WithRunner(snapshotRunner{}),
+		WithSupportOverride(true),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	if err := m.Rollback(context.Background(), "999"); err != ErrInvalidSnapshot {
+		t.Fatalf("expected ErrInvalidSnapshot, got %v", err)
+	}
+}
