@@ -402,14 +402,41 @@ paths:
   /updates/os/apply:
     post:
       summary: Apply OS update
+      security:
+        - cookieAuth: []
+        - csrfToken: []
       responses:
         '200': { description: OK }
-        '429': { description: Too Many Requests, headers: { Retry-After: { schema: { type: integer } } } }
+        '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '403': { description: Forbidden (crypto locked), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '429': { description: Too Many Requests, headers: { Retry-After: { schema: { type: integer } } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '501': { description: Not Implemented (unsupported platform), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '504': { description: Gateway Timeout (transactional-update timed out), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '500': { description: Internal Server Error, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
   /updates/os/rollback:
     post:
       summary: Roll back OS to previous version
+      security:
+        - cookieAuth: []
+        - csrfToken: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                snapshot_id:
+                  type: string
+                  description: Optional specific snapshot ID to rollback to; defaults to newest non-active snapshot when omitted.
       responses:
         '200': { description: OK }
+        '400': { description: Bad Request (invalid snapshot id), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '403': { description: Forbidden (crypto locked), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '429': { description: Too Many Requests (update already running), headers: { Retry-After: { schema: { type: integer } } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '501': { description: Not Implemented (unsupported platform), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '504': { description: Gateway Timeout (transactional-update timed out), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '500': { description: Internal Server Error, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
   /updates/apps:
     get:
       summary: App update status
@@ -1058,6 +1085,48 @@ components:
         pending: { type: boolean }
         requires_reboot: { type: boolean }
         last_checked: { type: string, format: date-time }
+        meta:
+          type: object
+          description: Additional MicroOS-specific update details (optional; empty on unsupported hosts).
+          properties:
+            supported: { type: boolean, description: True when transactional-update tooling is available }
+            active_snapshot_id: { type: string }
+            default_snapshot_id: { type: string }
+            active_snapshot_source: { type: string }
+            active_snapshot: { $ref: '#/components/schemas/SnapshotInfo' }
+            default_snapshot: { $ref: '#/components/schemas/SnapshotInfo' }
+            staged_snapshot: { $ref: '#/components/schemas/SnapshotInfo' }
+            rpm_updates_available: { type: integer, description: Count of pending RPM updates (best-effort) }
+            piccolod_active: { type: string, description: Active piccolod RPM version, if installed }
+            piccolod_staged: { type: string, description: Staged piccolod RPM version, if differs from active }
+            last_run: { $ref: '#/components/schemas/TransactionalUpdateRun' }
+            last_request: { $ref: '#/components/schemas/UpdateRequest' }
+            derived_outcome: { type: string, description: Derived outcome of the last request (applied, pending-reboot, not-applied, empty when unknown) }
+    SnapshotInfo:
+      type: object
+      properties:
+        id: { type: string }
+        description: { type: string }
+        created_at: { type: string, format: date-time, nullable: true }
+    TransactionalUpdateRun:
+      type: object
+      properties:
+        result: { type: string, description: Systemd Result field (e.g., success, timeout) }
+        exit_code: { type: integer }
+        ran_at: { type: string, format: date-time, nullable: true }
+        logs:
+          type: array
+          items: { type: string }
+    UpdateRequest:
+      type: object
+      properties:
+        last_action: { type: string, description: apply or rollback }
+        target_snapshot: { type: string, nullable: true }
+        requested_at: { type: string, format: date-time, nullable: true }
+        unit_name: { type: string, nullable: true }
+        exit_code: { type: integer, nullable: true }
+        immediate_result: { type: string, description: success/failed/unknown, nullable: true }
+        message: { type: string, nullable: true }
     RemoteStatus:
       type: object
       properties:
