@@ -1,35 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Local MicroOS update E2E harness (API-driven)
-# - Boots MicroOS qcow2 in QEMU
-# - Reuses cached gocryptfs-enabled image when available (see tools/e2e/microos-cache-gocryptfs.sh)
-# - Sets up admin + crypto via API
-# - Calls /updates/os/apply and /updates/os/rollback via API (with CSRF/cookie)
-# - Reboots between stages, restarts piccolod, and collects logs + summary
-# Prereqs: qemu-system-x86_64, qemu-img, mkisofs/genisoimage, ssh, scp, curl, jq
+# MicroOS piccolod dev server harness for UI workstations.
+# - Boots MicroOS qcow2 in QEMU and forwards piccolod API to the host.
+# - Ensures gocryptfs is present (uses cached image when available).
+# - Sets up crypto + admin defaults for quick UI login.
+# - Leaves the VM running until you Ctrl+C; collects basic logs on exit.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ART_ROOT="$ROOT_DIR/artifacts/e2e-microos"
+ART_ROOT="$ROOT_DIR/artifacts/microos-devserver"
 TS="$(date -u +%Y%m%d-%H%M%S)"
 RUN_DIR="$ART_ROOT/$TS"
 mkdir -p "$RUN_DIR"
 
-# Config (override via env)
 MICROOS_IMAGE_URL=${MICROOS_IMAGE_URL:-"https://download.opensuse.org/tumbleweed/appliances/openSUSE-MicroOS.x86_64-16.0.0-ContainerHost-kvm-and-xen-Snapshot20251121.qcow2"}
 MICROOS_IMAGE_PATH=${MICROOS_IMAGE_PATH:-"$ROOT_DIR/build/microos-base.qcow2"}
 MICROOS_CACHE_IMAGE_PATH=${MICROOS_CACHE_IMAGE_PATH:-"$ROOT_DIR/build/microos-base-gocryptfs.qcow2"}
 MICROOS_USE_CACHE=${MICROOS_USE_CACHE:-1}
 MICROOS_REFRESH_CACHE=${MICROOS_REFRESH_CACHE:-0}
 MICROOS_CACHE_KEY_PATH=${MICROOS_CACHE_KEY_PATH:-"$ROOT_DIR/build/microos-cache-key"}
+MICROOS_CACHE_SSH_PORT=${MICROOS_CACHE_SSH_PORT:-10422}
 PICCOLOD_BIN=${PICCOLOD_BIN:-"$ROOT_DIR/piccolod"}
-SSH_PORT=${MICROOS_SSH_PORT:-10022}
+SSH_PORT=${MICROOS_SSH_PORT:-10032}
 API_PORT=${MICROOS_API_PORT:-8080}
-HOST_API_PORT=${MICROOS_HOST_API_PORT:-${API_PORT}}
+HOST_API_PORT=${MICROOS_HOST_API_PORT:-18080}
 MICROOS_VM_CPUS=${MICROOS_VM_CPUS:-2}
 MICROOS_VM_RAM=${MICROOS_VM_RAM:-2048}
-MICROOS_CACHE_SSH_PORT=${MICROOS_CACHE_SSH_PORT:-10422}
-CSRF=""
 HEADLESS=${E2E_HEADLESS:-1}
 E2E_DAEMONIZE=${E2E_DAEMONIZE:--daemonize}
 SSH_USER=root
@@ -42,13 +38,12 @@ TU_WAIT_TIMEOUT=${TU_WAIT_TIMEOUT:-1800}
 WAIT_FOR_SSH_SECS=${WAIT_FOR_SSH_SECS:-300}
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
-log_file="$RUN_DIR/e2e.log"
+log_file="$RUN_DIR/devserver.log"
 exec > >(tee -a "$log_file") 2>&1
 
 require() { for c in "$@"; do command -v "$c" >/dev/null 2>&1 || { echo "missing $c"; exit 1; }; done; }
 require qemu-system-x86_64 qemu-img mkisofs ssh scp curl jq
 
-# Image prep
 if [ ! -f "$MICROOS_IMAGE_PATH" ]; then
   log "Downloading MicroOS image..."
   mkdir -p "$(dirname "$MICROOS_IMAGE_PATH")"
@@ -62,14 +57,14 @@ if [ "$MICROOS_REFRESH_CACHE" = "1" ] && [ -f "$MICROOS_CACHE_IMAGE_PATH" ]; the
   rm -f "$MICROOS_CACHE_IMAGE_PATH"
 fi
 if [ "$MICROOS_USE_CACHE" = "1" ] && [ ! -f "$MICROOS_CACHE_IMAGE_PATH" ]; then
-  log "Cached MicroOS image missing; building one with gocryptfs installed..."
+  log "Cached image missing; building gocryptfs-enabled image first..."
   MICROOS_IMAGE_URL="$MICROOS_IMAGE_URL" \
   MICROOS_IMAGE_PATH="$MICROOS_IMAGE_PATH" \
   MICROOS_CACHE_IMAGE_PATH="$MICROOS_CACHE_IMAGE_PATH" \
+  MICROOS_CACHE_KEY_PATH="$MICROOS_CACHE_KEY_PATH" \
   MICROOS_REFRESH_CACHE="$MICROOS_REFRESH_CACHE" \
   MICROOS_VM_CPUS="$MICROOS_VM_CPUS" \
   MICROOS_VM_RAM="$MICROOS_VM_RAM" \
-  MICROOS_CACHE_KEY_PATH="$MICROOS_CACHE_KEY_PATH" \
   MICROOS_CACHE_SSH_PORT="$MICROOS_CACHE_SSH_PORT" \
   E2E_HEADLESS="$HEADLESS" \
   "$ROOT_DIR/tools/e2e/microos-cache-gocryptfs.sh"
@@ -107,10 +102,9 @@ cat > "$ISO_ROOT/ignition/config.ign" <<IGN
 IGN
 mkisofs -quiet -o "$IGNITION_ISO" -V ignition -J -r "$ISO_ROOT"
 
-# QEMU
 QEMU_NETDEV="user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${HOST_API_PORT}-:${API_PORT}"
 QEMU_DISPLAY="-display sdl"; [ "$HEADLESS" = "1" ] && QEMU_DISPLAY="-display none"
-log "Starting VM (ssh port $SSH_PORT, api port $API_PORT, cpus $MICROOS_VM_CPUS, ram ${MICROOS_VM_RAM}MB)"
+log "Starting devserver VM (ssh $SSH_PORT, api $HOST_API_PORT -> $API_PORT, cpus $MICROOS_VM_CPUS, ram ${MICROOS_VM_RAM}MB)"
 qemu-system-x86_64 \
   -smp "$MICROOS_VM_CPUS" -m "$MICROOS_VM_RAM" \
   -drive if=virtio,file="$QCOW_WORK",format=qcow2 \
@@ -122,17 +116,16 @@ qemu-system-x86_64 \
   $E2E_DAEMONIZE
 
 cleanup() {
+  collect_logs
   if [ -f "$RUN_DIR/qemu.pid" ]; then kill "$(cat "$RUN_DIR/qemu.pid")" >/dev/null 2>&1 || true; fi
 }
 collect_logs() {
   set +e
-  log "Collecting logs"
   ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "journalctl -u piccolod -n 200 --no-pager" > "$RUN_DIR/piccolod.log" 2>/dev/null || true
   ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "journalctl -t transactional-update -n 200 --no-pager" > "$RUN_DIR/transactional-update.log" 2>/dev/null || true
-  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "cat /var/log/transactional-update.log" >> "$RUN_DIR/transactional-update.log" 2>/dev/null || true
   set -e
 }
-trap 'collect_logs; cleanup' EXIT
+trap cleanup EXIT
 
 wait_for_ssh() {
   log "Waiting for SSH..."
@@ -147,9 +140,6 @@ wait_for_ssh() {
     sleep 2
   done
 }
-
-api_curl() { curl -sf -b "$RUN_DIR/cookies" -c "$RUN_DIR/cookies" -H "X-CSRF-Token: ${CSRF:-}" "$@"; }
-api_post() { curl -sf -X POST -b "$RUN_DIR/cookies" -c "$RUN_DIR/cookies" -H "X-CSRF-Token: ${CSRF:-}" "$@"; }
 
 install_piccolod() {
   if [ ! -x "$PICCOLOD_BIN" ]; then
@@ -181,44 +171,14 @@ ensure_gocryptfs() {
   log "Installing gocryptfs via transactional-update (requires reboot)"
   ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "transactional-update -n pkg install gocryptfs" >/dev/null
   log "Rebooting to apply gocryptfs"
-  request_reboot
+  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "reboot" >/dev/null || true
   sleep 5
   wait_for_ssh
 }
 
-wait_for_tu() {
-  local label=$1
-  local start
-  start=$(date +%s)
-  log "Waiting for transactional-update to finish ($label)..."
-  while true; do
-    local out
-    out=$(ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "systemctl list-units --type=service --state=running 'piccolo-tu-*' transactional-update.service --no-legend --no-pager || true")
-    if [ -z "$(echo "$out" | tr -d ' \n\t')" ]; then
-      log "transactional-update idle"
-      break
-    fi
-    if [ $(( $(date +%s) - start )) -ge "$TU_WAIT_TIMEOUT" ]; then
-      log "Timeout waiting for transactional-update"
-      exit 1
-    fi
-    sleep 5
-  done
-}
+api_curl() { curl -sf -b "$RUN_DIR/cookies" -c "$RUN_DIR/cookies" -H "X-CSRF-Token: ${CSRF:-}" "$@"; }
+api_post() { curl -sf -X POST -b "$RUN_DIR/cookies" -c "$RUN_DIR/cookies" -H "X-CSRF-Token: ${CSRF:-}" "$@"; }
 
-request_reboot() {
-  if ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "reboot"; then
-    return
-  fi
-  code=$?
-  # SSH usually exits 255 when the connection drops during reboot; treat only other codes as fatal.
-  if [ "$code" -ne 255 ]; then
-    log "Reboot command failed (exit $code)"
-    exit 1
-  fi
-}
-
-# Session/bootstrap helpers
 api_setup_admin() {
   curl -sf -X POST -H 'Content-Type: application/json' -d "{\"password\":\"$ADMIN_PASSWORD\"}" "http://127.0.0.1:${HOST_API_PORT}/api/v1/auth/setup" -b "$RUN_DIR/cookies" -c "$RUN_DIR/cookies" >/dev/null || true
 }
@@ -235,7 +195,6 @@ api_crypto_setup() {
 api_crypto_unlock() {
   curl -sf -X POST -H 'Content-Type: application/json' -d "{\"password\":\"$ADMIN_PASSWORD\"}" "http://127.0.0.1:${HOST_API_PORT}/api/v1/crypto/unlock" -b "$RUN_DIR/cookies" -c "$RUN_DIR/cookies" >/dev/null
 }
-
 require_login() {
   for _ in 1 2; do
     if api_login; then return; fi
@@ -245,14 +204,13 @@ require_login() {
   exit 1
 }
 
-# Flow
 wait_for_ssh
 ensure_gocryptfs
 install_piccolod
 start_piccolod
 wait_for_api
 
-# Auth bootstrap
+# Auth bootstrap for UI
 api_crypto_setup
 api_crypto_unlock
 api_setup_admin
@@ -260,45 +218,11 @@ require_login
 fetch_csrf
 
 BASE_STATUS=$(api_curl "http://127.0.0.1:${HOST_API_PORT}/api/v1/updates/os")
-log "Baseline: $BASE_STATUS"
+log "Dev server ready."
+log "API base: http://127.0.0.1:${HOST_API_PORT}"
+log "Login: ${ADMIN_USERNAME} / ${ADMIN_PASSWORD}"
+log "Initial status: $BASE_STATUS"
+log "SSH: ssh -i ${SSH_KEY} -p ${SSH_PORT} ${SSH_USER}@127.0.0.1"
+log "Press Ctrl+C to stop the VM."
 
-log "Triggering apply via API"
-api_post "http://127.0.0.1:${HOST_API_PORT}/api/v1/updates/os/apply"
-wait_for_tu "apply"
-
-log "Rebooting"
-request_reboot
-sleep 5
-wait_for_ssh
-start_piccolod
-wait_for_api
-require_login
-fetch_csrf
-POST_APPLY=$(api_curl "http://127.0.0.1:${HOST_API_PORT}/api/v1/updates/os")
-log "Post-apply: $POST_APPLY"
-
-log "Triggering rollback via API"
-api_post "http://127.0.0.1:${HOST_API_PORT}/api/v1/updates/os/rollback"
-wait_for_tu "rollback"
-
-log "Rebooting after rollback"
-request_reboot
-sleep 5
-wait_for_ssh
-start_piccolod
-wait_for_api
-require_login
-fetch_csrf
-POST_ROLLBACK=$(api_curl "http://127.0.0.1:${HOST_API_PORT}/api/v1/updates/os")
-log "Post-rollback: $POST_ROLLBACK"
-
-cat > "$RUN_DIR/summary.json" <<JSON
-{
-  "base_status": $BASE_STATUS,
-  "post_apply": $POST_APPLY,
-  "post_rollback": $POST_ROLLBACK
-}
-JSON
-
-log "Artifacts in $RUN_DIR"
-log "Done"
+tail -f /dev/null
