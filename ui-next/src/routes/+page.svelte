@@ -1,53 +1,474 @@
 <script lang="ts">
+  import { onDestroy, onMount } from 'svelte';
+  import { derived, get } from 'svelte/store';
+  import AppIcon from '$lib/components/AppIcon.svelte';
+  import Dock from '$lib/components/Dock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
+  import { appManifests, resolvedApps } from '$lib/stores/apps';
+  import { layerExists, layerStack, popLayer, pushLayer, resetStack, topLayer } from '$lib/stores/layers';
+  import { createLayerLifecycle } from '$lib/stores/layerLifecycle';
+  import { layerState as layerStateAction } from '$lib/actions/layerState';
+  import { scrollLock } from '$lib/actions/scrollLock';
+  import type { AppManifest, ResolvedApp } from '$lib/types/apps';
+
+  const seedApps: AppManifest[] = [
+    { id: 'files', displayName: 'Files', origin: 'https://files.piccolo.local', isSystem: true, pinned: true },
+    { id: 'settings', displayName: 'Settings', isSystem: true, pinned: true },
+    { id: 'photos', displayName: 'Photos', origin: 'https://photos.piccolo.local', pinned: true },
+    { id: 'plex', displayName: 'Plex', origin: 'https://plex.local' },
+    { id: 'immich', displayName: 'Immich', origin: 'https://immich.local' },
+    { id: 'nextcloud', displayName: 'Nextcloud', origin: 'https://nextcloud.local' }
+  ];
+
+  const pinnedIds = new Set(seedApps.filter((app) => app.pinned).map((app) => app.id));
+  const runningIds = new Set(['plex', 'immich']);
+
+  const pinnedApps = derived(resolvedApps, ($apps) => $apps.filter((app) => pinnedIds.has(app.id)));
+  const runningApps = derived(resolvedApps, ($apps) => $apps.filter((app) => runningIds.has(app.id)));
+  const drawerApps = resolvedApps;
+
+  let drawerOpen = false;
+  let activeApp: ResolvedApp | null = null;
+  let activeAppLayerId: string | null = null;
+  let headerEl: HTMLElement;
+  let dockEl: HTMLElement;
+  let resizeObserver: ResizeObserver | null = null;
+  const unsubscribers: Array<() => void> = [];
+
+  const SAFE_MARGIN = 12;
+
+  const clearAppLayers = (keepId?: string) => {
+    const stack = get(layerStack);
+    stack
+      .filter((entry) => entry.kind === 'app' && entry.id !== keepId)
+      .forEach((entry) => popLayer(entry.id));
+  };
+
+  const setSafeAreas = () => {
+    const top = (headerEl?.getBoundingClientRect().height || 0) + SAFE_MARGIN;
+    const bottom = (dockEl?.getBoundingClientRect().height || 0) + SAFE_MARGIN;
+    document.documentElement.style.setProperty('--safe-area-top', `${Math.round(top)}px`);
+    document.documentElement.style.setProperty('--safe-area-bottom', `${Math.round(bottom)}px`);
+  };
+
+  const closeDrawer = () => {
+    drawerOpen = false;
+    popLayer('drawer');
+  };
+
+  const openDrawer = () => {
+    drawerOpen = true;
+    const drawerEntry = {
+      id: 'drawer',
+      kind: 'drawer',
+      scrollLock: true,
+      safeArea: true,
+      onForeground: () => document.body.style.setProperty('overscroll-behavior', 'contain'),
+      onBackground: () => document.body.style.removeProperty('overscroll-behavior')
+    };
+    if (!layerExists('drawer')) {
+      pushLayer(drawerEntry);
+    } else {
+      popLayer('drawer');
+      pushLayer(drawerEntry);
+    }
+  };
+
+  const openApp = (app: ResolvedApp) => {
+    const layerId = `app-${app.id}`;
+    const entry = {
+      id: layerId,
+      kind: 'app',
+      scrollLock: true,
+      safeArea: true,
+      payload: { appId: app.id },
+      onForeground: () => document.body.classList.add('app-foreground'),
+      onBackground: () => document.body.classList.remove('app-foreground')
+    };
+
+    // single-visible: clear other apps, then push this one
+    clearAppLayers(layerId);
+    if (layerExists(layerId)) popLayer(layerId);
+    pushLayer(entry);
+
+    activeAppLayerId = layerId;
+    activeApp = app;
+    drawerOpen = false;
+    popLayer('drawer');
+  };
+
+  const closeApp = () => {
+    clearAppLayers();
+    if (activeAppLayerId) popLayer(activeAppLayerId);
+    activeApp = null;
+    activeAppLayerId = null;
+  };
+
+  const openAppInNewTab = (app: ResolvedApp) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set('app', app.id);
+    window.open(url.toString(), '_blank', 'noopener');
+  };
+
+  const hydrateAppFromUrl = () => {
+    const url = new URL(window.location.href);
+    const appParam = url.searchParams.get('app');
+    if (appParam) {
+      const match = get(resolvedApps).find((a) => a.id === appParam);
+      if (match) {
+        openApp(match);
+      }
+    }
+  };
+
+  onMount(() => {
+    appManifests.set(seedApps);
+
+    setSafeAreas();
+    const handleResize = () => setSafeAreas();
+    window.addEventListener('resize', handleResize);
+    resizeObserver = new ResizeObserver(setSafeAreas);
+    if (headerEl) resizeObserver.observe(headerEl);
+    if (dockEl) resizeObserver.observe(dockEl);
+
+    const lifecycle = createLayerLifecycle().subscribe(() => {});
+    unsubscribers.push(lifecycle);
+
+    hydrateAppFromUrl();
+
+    return () => {
+      unsubscribers.forEach((fn) => fn());
+      window.removeEventListener('resize', handleResize);
+      resizeObserver?.disconnect();
+      document.documentElement.style.removeProperty('--safe-area-top');
+      document.documentElement.style.removeProperty('--safe-area-bottom');
+      document.body.style.overflow = '';
+      resetStack();
+    };
+  });
+
+  onDestroy(() => {
+    resizeObserver?.disconnect();
+    document.documentElement.style.removeProperty('--safe-area-top');
+    document.documentElement.style.removeProperty('--safe-area-bottom');
+    document.body.style.overflow = '';
+    resetStack();
+  });
 </script>
 
 <svelte:head>
-  <title>Piccolo UI Next</title>
+  <title>Piccolo OS — Digital Sanctuary</title>
 </svelte:head>
 
-<main class="min-h-screen px-6 py-12 sm:px-10 lg:px-16 flex flex-col gap-8 text-sm">
-  <section class="rounded-3xl border border-white/40 bg-white/80 backdrop-blur-xl elev-3 p-6 text-ink">
-    <p class="meta-label">Foundation</p>
-    <h1 class="text-2xl font-semibold text-ink mt-3">Piccolo UI Next</h1>
-    <p class="text-base text-muted mt-2 max-w-2xl">
-      This workspace hosts the next-generation Piccolo UI. We are bootstrapping the admin setup wizard
-      and the surrounding shell using SvelteKit, Tailwind, and TanStack Query.
-    </p>
-    <div class="mt-4 flex flex-wrap gap-3">
-      <Button variant="primary" href="/setup">
-        Open setup wizard
-      </Button>
-      <Button variant="secondary" href="/docs/foundation.md" target="_blank">
-        View foundations doc
-      </Button>
+<main class="relative min-h-screen text-ink" style="background: var(--hero-gradient);">
+  <header class="fixed left-0 right-0 top-0 z-50 px-6 py-4 sm:px-10 lg:px-16" bind:this={headerEl}>
+    <div class="flex items-center justify-between rounded-2xl border border-white/40 bg-white/80 px-4 py-3 shadow-md backdrop-blur-2xl dark:border-white/10 dark:bg-slate-900/80">
+      <div class="flex items-center gap-3">
+        <div class="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 to-blue-600 text-base font-semibold text-white shadow-md">
+          P
+        </div>
+        <div class="leading-tight">
+          <p class="text-[11px] uppercase tracking-[0.16em] text-muted">Piccolo OS</p>
+          <p class="text-sm font-semibold text-ink">Digital Sanctuary</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <label class="relative hidden md:block">
+          <input
+            class="h-10 w-64 rounded-full border border-white/50 bg-white/70 px-10 text-sm text-ink placeholder:text-muted shadow-sm backdrop-blur-xl focus:outline-none focus:ring-2 focus:ring-blue-200 dark:border-white/10 dark:bg-slate-800/80"
+            placeholder="Search apps or settings"
+            type="search"
+          />
+          <span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted">⌘K</span>
+        </label>
+        <div class="hidden items-center gap-2 rounded-full border border-white/50 bg-white/70 px-3 py-2 text-xs font-medium text-emerald-700 shadow-sm backdrop-blur-xl dark:border-white/10 dark:bg-slate-800/80 dark:text-emerald-200 sm:flex">
+          <span class="inline-flex h-2 w-2 rounded-full bg-emerald-500" aria-hidden="true"></span>
+          System healthy
+        </div>
+        <Button variant="primary" on:click={openDrawer}>
+          Open Drawer
+        </Button>
+      </div>
+    </div>
+  </header>
+
+  <section
+    class={`stage relative z-0 px-6 sm:px-10 lg:px-16 ${activeApp ? 'stage--blocked' : ''}`}
+    aria-label="Stage content"
+    use:layerStateAction={{ entry: { id: 'stage', kind: 'stage' }, isForeground: $topLayer?.id === 'stage' }}
+  >
+    <div class="grid gap-6 lg:grid-cols-3">
+      <article class="lg:col-span-2 rounded-3xl border border-white/40 bg-white/80 backdrop-blur-xl elev-3 p-6 text-ink shadow-lg dark:border-white/10 dark:bg-slate-900/85">
+        <p class="meta-label">Stage</p>
+        <h1 class="mt-3 text-3xl font-semibold">Your personal cloud OS</h1>
+        <p class="mt-2 text-base text-muted max-w-2xl">
+          The Stage keeps widgets like Storage and Memories alive under your apps. Launchers float above it, and closing an app
+          restores the exact state you left behind.
+        </p>
+        <div class="mt-4 flex flex-wrap gap-3">
+          <Button variant="primary" href="/setup">
+            Continue setup
+          </Button>
+          <Button variant="secondary" href="/docs/foundation.md" target="_blank">
+            View foundations
+          </Button>
+          <Button variant="ghost" on:click={openDrawer}>
+            Browse apps
+          </Button>
+        </div>
+        <div class="mt-6 grid gap-4 sm:grid-cols-2">
+          <div class="rounded-2xl border border-white/40 bg-white/70 p-4 shadow-sm backdrop-blur-xl dark:border-white/10 dark:bg-slate-800/70">
+            <p class="text-xs uppercase tracking-[0.18em] text-muted">Layer B · Stage</p>
+            <p class="mt-2 text-sm text-ink">Widgets remain visible when apps close.</p>
+          </div>
+          <div class="rounded-2xl border border-white/40 bg-white/70 p-4 shadow-sm backdrop-blur-xl dark:border-white/10 dark:bg-slate-800/70">
+            <p class="text-xs uppercase tracking-[0.18em] text-muted">Layer C · Launcher</p>
+            <p class="mt-2 text-sm text-ink">Floating Dock for pinned apps; Drawer for everything else.</p>
+          </div>
+        </div>
+      </article>
+
+      <article class="rounded-3xl border border-white/30 bg-white/75 backdrop-blur-xl elev-2 p-5 shadow-md dark:border-white/10 dark:bg-slate-900/80">
+        <p class="meta-label">Status</p>
+        <h2 class="text-lg font-semibold">System pulse</h2>
+        <ul class="mt-3 space-y-2 text-sm text-muted">
+          <li class="flex items-center justify-between">
+            <span>Updates</span>
+            <span class="rounded-full bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-100">Calm</span>
+          </li>
+          <li class="flex items-center justify-between">
+            <span>Storage</span>
+            <span class="text-xs font-medium text-ink">1.2 TB free</span>
+          </li>
+          <li class="flex items-center justify-between">
+            <span>Memories</span>
+            <span class="text-xs font-medium text-ink">3 albums live</span>
+          </li>
+        </ul>
+        <div class="mt-4 rounded-2xl border border-white/40 bg-white/70 p-4 text-xs text-muted shadow-sm backdrop-blur-xl dark:border-white/10 dark:bg-slate-800/70">
+          Floating Dock anchors pinned apps; running apps flare to the right. Drawer opens as a frosted full-screen overlay.
+        </div>
+      </article>
+    </div>
+
+    <div class="mt-8 grid gap-6 lg:grid-cols-3">
+      <article class="rounded-2xl border border-white/30 bg-white/75 backdrop-blur-xl elev-2 p-5 shadow-md dark:border-white/10 dark:bg-slate-900/80">
+        <p class="meta-label">Updates lane</p>
+        <h2 class="text-lg font-semibold">MicroOS transactional update</h2>
+        <p class="text-sm text-muted">
+          UI will consume <code>/updates/os</code> to show staged snapshots, reboot prompts, and apply/rollback actions without leaving the Stage.
+          Behavior aligns with <code>docs/rfc/20251124-microos-transactional-update.md</code>.
+        </p>
+      </article>
+      <article class="rounded-2xl border border-white/30 bg-white/75 backdrop-blur-xl elev-2 p-5 shadow-md dark:border-white/10 dark:bg-slate-900/80">
+        <p class="meta-label">Stack</p>
+        <h2 class="text-lg font-semibold">Tooling installed</h2>
+        <ul class="list-disc list-inside space-y-1 text-sm text-muted">
+          <li>SvelteKit + TypeScript</li>
+          <li>Tailwind CSS / PostCSS / Autoprefixer</li>
+          <li>@tanstack/svelte-query (with provider)</li>
+        </ul>
+      </article>
+      <article class="rounded-2xl border border-white/30 bg-white/75 backdrop-blur-xl elev-2 p-5 shadow-md dark:border-white/10 dark:bg-slate-900/80">
+        <p class="meta-label">Docs</p>
+        <h2 class="text-lg font-semibold">Source of truth</h2>
+        <ul class="space-y-2 text-sm text-muted">
+          <li><code>ui-next/docs/ui-architecture/00_interaction_model.md</code></li>
+          <li><code>ui-next/docs/foundation.md</code></li>
+          <li><code>ui-next/docs/theme-brief.md</code></li>
+        </ul>
+      </article>
     </div>
   </section>
 
-  <div class="grid gap-6 lg:grid-cols-3">
-    <article class="rounded-2xl border border-white/30 bg-white/70 backdrop-blur-lg elev-2 p-5 flex flex-col gap-3">
-      <p class="meta-label">Stack</p>
-      <h2 class="text-lg font-semibold text-ink">Tooling installed</h2>
-      <ul class="text-text list-disc list-inside space-y-1 text-sm">
-        <li>SvelteKit + TypeScript</li>
-        <li>Tailwind CSS / PostCSS / Autoprefixer</li>
-        <li>@tanstack/svelte-query (with provider)</li>
-      </ul>
-    </article>
-    <article class="rounded-2xl border border-white/30 bg-white/70 backdrop-blur-lg elev-2 p-5 flex flex-col gap-3">
-      <p class="meta-label">Next milestone</p>
-      <h2 class="text-lg font-semibold text-ink">Admin setup wizard</h2>
-      <p class="text-sm text-muted">
-        Implement the guided sheet that creates/validates the initial admin password during first boot.
-      </p>
-    </article>
-    <article class="rounded-2xl border border-white/30 bg-white/70 backdrop-blur-lg elev-2 p-5 flex flex-col gap-3">
-      <p class="meta-label">Docs</p>
-      <h2 class="text-lg font-semibold text-ink">Foundations</h2>
-      <p class="text-sm text-muted">
-        Refer to <code>src/l1/piccolod/ui-next/docs/foundation.md</code> for principles, layout rules,
-        theming, and testing workflow.
-      </p>
-    </article>
+  {#if activeApp}
+    <section
+      class="app-layer"
+      use:layerStateAction={{ entry: { id: activeAppLayerId ?? '', kind: 'app' }, isForeground: $topLayer?.id === activeAppLayerId }}
+      use:scrollLock={$topLayer?.id === activeAppLayerId}
+      aria-live="polite"
+      aria-label={`Active app ${activeApp.displayName}`}
+      data-layer-state={$topLayer?.id === activeAppLayerId ? 'foreground' : 'background'}
+    >
+      <div class="app-shell">
+        <div class="app-chrome" aria-label={`${activeApp.displayName} header`}>
+          <div class="flex items-center gap-3">
+            <div class="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 to-blue-600 text-base font-semibold text-white shadow-md">
+              {activeApp.displayName.slice(0, 2).toUpperCase()}
+            </div>
+            <div>
+              <p class="text-[11px] uppercase tracking-[0.16em] text-muted">Active app</p>
+              <p class="text-lg font-semibold text-ink">{activeApp.displayName}</p>
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <Button variant="ghost" on:click={closeApp}>
+              Home
+            </Button>
+            <Button variant="secondary" on:click={openDrawer}>
+              Switch app
+            </Button>
+            <Button variant="ghost" on:click={() => openAppInNewTab(activeApp)}>
+              Open in new tab
+            </Button>
+          </div>
+        </div>
+
+        <div class="app-body" aria-label={`${activeApp.displayName} content`}>
+          <div class="rounded-3xl border border-white/40 bg-white/85 p-6 shadow-lg backdrop-blur-2xl dark:border-white/10 dark:bg-slate-900/85">
+            <p class="meta-label">Layer B · Activity</p>
+            <h3 class="mt-2 text-xl font-semibold">Immersive view</h3>
+            <p class="mt-2 text-sm text-muted">
+              App content stretches edge-to-edge while respecting the safe areas above and below the Dock/Top Bar. Scroll to see how content flows under
+              the Frame while controls remain reachable.
+            </p>
+            <div class="mt-4 grid gap-4 sm:grid-cols-2">
+              <div class="rounded-2xl border border-white/50 bg-white/80 p-4 backdrop-blur-xl dark:border-white/10 dark:bg-slate-800/80">
+                <p class="text-xs uppercase tracking-[0.18em] text-muted">Safe area</p>
+                <p class="mt-1 text-sm text-ink">Top padding from measured bar height: <code>var(--safe-area-top)</code></p>
+              </div>
+              <div class="rounded-2xl border border-white/50 bg-white/80 p-4 backdrop-blur-xl dark:border-white/10 dark:bg-slate-800/80">
+                <p class="text-xs uppercase tracking-[0.18em] text-muted">Single task</p>
+                <p class="mt-1 text-sm text-ink">Only one heavy activity is mounted at a time; switchers replace the current view.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  {/if}
+
+  <div
+    class="dock-wrapper fixed left-1/2 z-50 -translate-x-1/2"
+    bind:this={dockEl}
+    aria-label="App dock"
+  >
+    <Dock pinned={$pinnedApps} running={$runningApps} on:select={(e) => openApp(e.detail)} />
   </div>
+
+  {#if drawerOpen}
+    <div class="fixed inset-0 z-[100] bg-white/75 backdrop-blur-2xl transition-opacity dark:bg-slate-900/85">
+      <div
+        class="drawer-surface mx-auto max-w-5xl px-6 py-8 sm:py-10"
+        aria-label="App drawer"
+        use:layerStateAction={{ entry: { id: 'drawer', kind: 'drawer' }, isForeground: $topLayer?.id === 'drawer' }}
+        use:scrollLock={$topLayer?.id === 'drawer'}
+      >
+        <div class="flex items-center justify-between gap-4">
+          <div>
+            <p class="meta-label">Layer C · Drawer</p>
+            <h2 class="text-2xl font-semibold">Launch an app</h2>
+            <p class="text-sm text-muted">Full-screen activities float above the Stage. Close to return exactly where you left off.</p>
+          </div>
+          <Button variant="secondary" on:click={closeDrawer}>
+            Close
+          </Button>
+        </div>
+        <div class="drawer-grid mt-6 grid grid-cols-3 gap-5 sm:grid-cols-4">
+          {#each $drawerApps as app (app.id)}
+            <AppIcon app={app} size={64} on:select={(e) => openApp(e.detail)} />
+          {/each}
+        </div>
+      </div>
+    </div>
+  {/if}
 </main>
+
+<style>
+  .stage {
+    min-height: 100vh;
+    padding-top: var(--safe-area-top);
+    padding-bottom: var(--safe-area-bottom);
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+    position: relative;
+    z-index: 0;
+  }
+
+  .stage--blocked {
+    overflow: hidden;
+    pointer-events: none;
+  }
+
+  .dock-wrapper {
+    bottom: 16px;
+  }
+
+  [data-layer-state='background'] {
+    pointer-events: none;
+    overflow: hidden !important;
+  }
+
+  .drawer-surface {
+    padding-top: var(--safe-area-top);
+    padding-bottom: var(--safe-area-bottom);
+  }
+
+  .drawer-grid {
+    justify-items: center;
+    align-items: flex-start;
+  }
+
+  .app-layer {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    padding: var(--safe-area-top) 16px var(--safe-area-bottom) 16px;
+    overflow: hidden;
+    background: radial-gradient(circle at 20% 10%, rgba(255, 255, 255, 0.7), rgba(235, 240, 250, 0.8));
+  }
+
+  :global([data-theme='dark']) .app-layer {
+    background: radial-gradient(circle at 20% 10%, rgba(26, 32, 48, 0.9), rgba(12, 16, 28, 0.95));
+  }
+
+  .app-shell {
+    margin: 0 auto;
+    max-width: 1100px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    height: calc(100vh - var(--safe-area-top) - var(--safe-area-bottom));
+    overflow: hidden;
+  }
+
+  .app-chrome {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 16px;
+    border-radius: 18px;
+    border: 1px solid rgba(255, 255, 255, 0.45);
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(20px);
+    box-shadow: 0 10px 30px rgba(18, 24, 40, 0.12);
+  }
+
+  :global([data-theme='dark']) .app-chrome {
+    border-color: rgba(255, 255, 255, 0.12);
+    background: rgba(26, 32, 48, 0.88);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  }
+
+  .app-body {
+    flex: 1;
+    overflow-y: auto;
+    padding-bottom: 4px;
+  }
+
+  @media (max-width: 540px) {
+    .dock-wrapper {
+      bottom: 12px;
+    }
+
+    .drawer-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .app-chrome {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+  }
+</style>

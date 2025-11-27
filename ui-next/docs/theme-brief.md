@@ -46,7 +46,8 @@
 `--sys-success`, `--sys-on-success`, `--sys-warning`, `--sys-on-warning`, `--sys-info`, `--sys-on-info`, `--sys-critical`, `--sys-on-critical`,
 `--sys-ink`, `--sys-ink-muted`, `--sys-link`, `--sys-outline`,
 `--sys-scrim`, `--sys-overlay`, `--sys-hairline`,
-`--sys-disabled-bg`, `--sys-disabled-fg`.
+`--sys-disabled-bg`, `--sys-disabled-fg`,
+`--sys-blur-heavy: backdrop-filter: blur(20px);`.
 
 **Component aliases** — resolve to system tokens so components share a single source of truth
 `--btn-primary-bg`, `--btn-primary-fg`, `--btn-primary-shadow`, `--btn-primary-bg-hover`, `--btn-primary-bg-pressed`,

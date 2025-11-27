@@ -24,7 +24,7 @@
 - Typography ramp: 14/16/20/24/32 with consistent letter spacing; display headlines use Comfortaa (logo-aligned) while body copy stays on Inter for readability.
 
 ## Interaction Patterns
-- Bottom tab bar on mobile, side rail on desktop (identical structure).
+- Unified OS Layout: Floating Dock (bottom), persistent System Status Bar (top), and Desktop Stage (center). This supersedes the side-rail pattern for the main shell.
 - System Status Dock with Remote/Storage/Updates/Apps chips; one CTA per chip.
 - Sheet-based flows (bottom/side) with max 3 steps, inline validation, focus trap.
 - Banners for global issues, toasts for transient feedback.

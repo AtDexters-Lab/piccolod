@@ -25,6 +25,8 @@
   --motion-ease-emphasized: cubic-bezier(0.16, 1, 0.3, 1);
   --motion-distance-sm: 8px;
   --motion-distance-md: 16px;
+  --safe-area-top: 88px;
+  --safe-area-bottom: 110px;
 
   --sys-surface: 244 246 251;
   --sys-surface-variant: 255 255 255;
@@ -189,6 +191,13 @@
   *, *::before, *::after {
     transition-duration: 0ms !important;
     animation-duration: 0ms !important;
+  }
+}
+
+@media (max-width: 540px) {
+  :root {
+    --safe-area-top: 96px;
+    --safe-area-bottom: 128px;
   }
 }
 
