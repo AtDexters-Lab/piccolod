@@ -1,11 +1,13 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { derived, get } from 'svelte/store';
+  import { fly, fade } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
   import AppIcon from '$lib/components/AppIcon.svelte';
   import Dock from '$lib/components/Dock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import { appManifests, resolvedApps } from '$lib/stores/apps';
-  import { layerExists, layerStack, popLayer, pushLayer, resetStack, topLayer } from '$lib/stores/layers';
+  import { LAYER_KIND_APP, LAYER_KIND_DRAWER, layerExists, layerStack, popLayer, pushLayer, resetStack, topLayer } from '$lib/stores/layers';
   import { createLayerLifecycle } from '$lib/stores/layerLifecycle';
   import { layerState as layerStateAction } from '$lib/actions/layerState';
   import { scrollLock } from '$lib/actions/scrollLock';
@@ -34,6 +36,10 @@
   let dockEl: HTMLElement;
   let resizeObserver: ResizeObserver | null = null;
   const unsubscribers: Array<() => void> = [];
+  let reduceMotion = false;
+  let historyLayerCount = 0;
+  let suppressNextPop = false;
+  let startY: number | null = null;
 
   const SAFE_MARGIN = 12;
 
@@ -44,23 +50,11 @@
       .forEach((entry) => popLayer(entry.id));
   };
 
-  const setSafeAreas = () => {
-    const top = (headerEl?.getBoundingClientRect().height || 0) + SAFE_MARGIN;
-    const bottom = (dockEl?.getBoundingClientRect().height || 0) + SAFE_MARGIN;
-    document.documentElement.style.setProperty('--safe-area-top', `${Math.round(top)}px`);
-    document.documentElement.style.setProperty('--safe-area-bottom', `${Math.round(bottom)}px`);
-  };
-
-  const closeDrawer = () => {
-    drawerOpen = false;
-    popLayer('drawer');
-  };
-
-  const openDrawer = () => {
+  const openDrawerFromHistory = () => {
     drawerOpen = true;
     const drawerEntry = {
       id: 'drawer',
-      kind: 'drawer',
+      kind: LAYER_KIND_DRAWER,
       scrollLock: true,
       safeArea: true,
       onForeground: () => document.body.style.setProperty('overscroll-behavior', 'contain'),
@@ -74,11 +68,80 @@
     }
   };
 
+  const openAppFromHistory = (appId: string) => {
+    const match = get(resolvedApps).find((a) => a.id === appId);
+    if (!match) return;
+    const layerId = `app-${match.id}`;
+    const entry = {
+      id: layerId,
+      kind: LAYER_KIND_APP,
+      scrollLock: true,
+      safeArea: true,
+      payload: { appId: match.id },
+      onForeground: () => document.body.classList.add('app-foreground'),
+      onBackground: () => document.body.classList.remove('app-foreground')
+    };
+
+    clearAppLayers(layerId);
+    if (layerExists(layerId)) popLayer(layerId);
+    pushLayer(entry);
+
+    activeAppLayerId = layerId;
+    activeApp = match;
+  };
+
+  const pushHistoryLayer = (id: string) => {
+    if (typeof window === 'undefined') return;
+    history.pushState({ piccoloLayer: id }, '', window.location.href);
+    historyLayerCount += 1;
+  };
+
+  const popHistoryLayer = () => {
+    if (typeof window === 'undefined') return;
+    if (historyLayerCount > 0) {
+      suppressNextPop = true;
+      history.back();
+      historyLayerCount -= 1;
+    }
+  };
+
+  const setSafeAreas = () => {
+    const top = (headerEl?.getBoundingClientRect().height || 0) + SAFE_MARGIN;
+    const bottom = (dockEl?.getBoundingClientRect().height || 0) + SAFE_MARGIN;
+    document.documentElement.style.setProperty('--safe-area-top', `${Math.round(top)}px`);
+    document.documentElement.style.setProperty('--safe-area-bottom', `${Math.round(bottom)}px`);
+  };
+
+  const closeDrawer = () => {
+    drawerOpen = false;
+    popLayer('drawer');
+    popHistoryLayer();
+  };
+
+  const openDrawer = () => {
+    drawerOpen = true;
+    const drawerEntry = {
+      id: 'drawer',
+      kind: LAYER_KIND_DRAWER,
+      scrollLock: true,
+      safeArea: true,
+      onForeground: () => document.body.style.setProperty('overscroll-behavior', 'contain'),
+      onBackground: () => document.body.style.removeProperty('overscroll-behavior')
+    };
+    if (!layerExists('drawer')) {
+      pushLayer(drawerEntry);
+    } else {
+      popLayer('drawer');
+      pushLayer(drawerEntry);
+    }
+    pushHistoryLayer('drawer');
+  };
+
   const openApp = (app: ResolvedApp) => {
     const layerId = `app-${app.id}`;
     const entry = {
       id: layerId,
-      kind: 'app',
+      kind: LAYER_KIND_APP,
       scrollLock: true,
       safeArea: true,
       payload: { appId: app.id },
@@ -86,22 +149,52 @@
       onBackground: () => document.body.classList.remove('app-foreground')
     };
 
+    const hadForegroundApp = Boolean(activeAppLayerId);
+
     // single-visible: clear other apps, then push this one
     clearAppLayers(layerId);
     if (layerExists(layerId)) popLayer(layerId);
     pushLayer(entry);
 
+    // replace drawer history entry with app when launching from drawer; otherwise push a new entry
+    const launchingFromDrawer = layerExists('drawer');
+    if (launchingFromDrawer) {
+      if (historyLayerCount > 0) {
+        history.replaceState({ piccoloLayer: layerId }, '', window.location.href);
+      }
+      drawerOpen = false;
+      popLayer('drawer');
+    } else if (hadForegroundApp && historyLayerCount > 0) {
+      history.replaceState({ piccoloLayer: layerId }, '', window.location.href);
+      historyLayerCount = 1;
+    } else {
+      pushHistoryLayer(layerId);
+    }
+
     activeAppLayerId = layerId;
     activeApp = app;
-    drawerOpen = false;
-    popLayer('drawer');
   };
 
   const closeApp = () => {
     clearAppLayers();
     if (activeAppLayerId) popLayer(activeAppLayerId);
+    popHistoryLayer();
     activeApp = null;
     activeAppLayerId = null;
+  };
+
+  const closeTopLayerFromHistory = () => {
+    const currentTop = get(topLayer);
+    if (!currentTop || currentTop.id === 'stage') return;
+    if (currentTop.kind === LAYER_KIND_APP) {
+      clearAppLayers();
+      if (activeAppLayerId) popLayer(activeAppLayerId);
+      activeApp = null;
+      activeAppLayerId = null;
+    } else if (currentTop.kind === LAYER_KIND_DRAWER) {
+      drawerOpen = false;
+      popLayer('drawer');
+    }
   };
 
   const openAppInNewTab = (app: ResolvedApp) => {
@@ -122,6 +215,42 @@
   };
 
   onMount(() => {
+    const media = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const updateMotion = () => (reduceMotion = media.matches);
+    updateMotion();
+    media.addEventListener('change', updateMotion);
+    unsubscribers.push(() => media.removeEventListener('change', updateMotion));
+
+    const handlePopState = (event: PopStateEvent) => {
+      const targetId = event.state?.piccoloLayer as string | undefined;
+
+      if (suppressNextPop) {
+        suppressNextPop = false;
+        return;
+      }
+
+      // Forward navigation to a stored overlay state
+      if (targetId && $topLayer?.id === 'stage') {
+        if (targetId === 'drawer') {
+          openDrawerFromHistory();
+        } else if (targetId.startsWith('app-')) {
+          const appId = targetId.replace(/^app-/, '');
+          openAppFromHistory(appId);
+        }
+        historyLayerCount = Math.max(historyLayerCount, 1);
+        return;
+      }
+
+      // Back navigation: close current overlay
+      if ($topLayer?.id && $topLayer.id !== 'stage') {
+        closeTopLayerFromHistory();
+        if (historyLayerCount > 0) historyLayerCount -= 1;
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    unsubscribers.push(() => window.removeEventListener('popstate', handlePopState));
+
     appManifests.set(seedApps);
 
     setSafeAreas();
@@ -284,8 +413,10 @@
   {#if activeApp}
     <section
       class="app-layer"
-      use:layerStateAction={{ entry: { id: activeAppLayerId ?? '', kind: 'app' }, isForeground: $topLayer?.id === activeAppLayerId }}
+      use:layerStateAction={{ entry: { id: activeAppLayerId ?? '', kind: 'app'  }, isForeground: $topLayer?.id === activeAppLayerId }}
       use:scrollLock={$topLayer?.id === activeAppLayerId}
+      in:fly={reduceMotion ? { duration: 0 } : { y: 16, duration: 180, easing: cubicOut }}
+      out:fade={reduceMotion ? { duration: 0 } : { duration: 120 }}
       aria-live="polite"
       aria-label={`Active app ${activeApp.displayName}`}
       data-layer-state={$topLayer?.id === activeAppLayerId ? 'foreground' : 'background'}
@@ -308,7 +439,7 @@
             <Button variant="secondary" on:click={openDrawer}>
               Switch app
             </Button>
-            <Button variant="ghost" on:click={() => openAppInNewTab(activeApp)}>
+            <Button variant="ghost" on:click={() => activeApp && openAppInNewTab(activeApp)}>
               Open in new tab
             </Button>
           </div>
@@ -347,12 +478,26 @@
   </div>
 
   {#if drawerOpen}
-    <div class="fixed inset-0 z-[100] bg-white/75 backdrop-blur-2xl transition-opacity dark:bg-slate-900/85">
+    <div
+      class="fixed inset-0 z-[100] bg-white/75 backdrop-blur-2xl transition-opacity dark:bg-slate-900/85"
+      transition:fade={reduceMotion ? { duration: 0 } : { duration: 120 }}
+    >
       <div
         class="drawer-surface mx-auto max-w-5xl px-6 py-8 sm:py-10"
         aria-label="App drawer"
         use:layerStateAction={{ entry: { id: 'drawer', kind: 'drawer' }, isForeground: $topLayer?.id === 'drawer' }}
         use:scrollLock={$topLayer?.id === 'drawer'}
+        transition:fly={reduceMotion ? { duration: 0 } : { y: 12, duration: 160, easing: cubicOut }}
+        on:touchstart={(e) => startY = e.touches[0]?.clientY ?? null}
+        on:touchmove={(e) => {
+          if (startY === null) return;
+          const delta = e.touches[0].clientY - startY;
+          if (delta > 38) {
+            startY = null;
+            closeDrawer();
+          }
+        }}
+        on:touchend={() => (startY = null)}
       >
         <div class="flex items-center justify-between gap-4">
           <div>

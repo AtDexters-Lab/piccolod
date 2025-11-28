@@ -6,5 +6,5 @@ import (
 
 // Embedded UI assets. The directory name includes all files recursively.
 //
-//go:embed web web/_app
+//go:embed all:web
 var FS embed.FS

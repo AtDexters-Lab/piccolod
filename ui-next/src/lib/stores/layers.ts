@@ -1,4 +1,8 @@
 import { derived, get, writable } from 'svelte/store';
+export const LAYER_KIND_STAGE = 'stage' as LayerKind;
+export const LAYER_KIND_APP = 'app' as LayerKind;
+export const LAYER_KIND_DRAWER = 'drawer' as LayerKind;
+export const LAYER_KIND_MODAL = 'modal' as LayerKind;
 
 export type LayerKind = 'stage' | 'app' | 'drawer' | 'modal';
 
