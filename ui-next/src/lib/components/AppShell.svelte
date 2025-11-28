@@ -5,6 +5,7 @@
   import { resetCsrfToken, primeCsrfToken } from '$lib/api/http';
   import { platformController, platformState } from '$lib/stores/platform';
   import { goto } from '$app/navigation';
+  import ToastHost from '$lib/components/ToastHost.svelte';
 
   export let title = 'Piccolo';
 
@@ -71,6 +72,7 @@
     <StalenessBanner />
     <slot />
   </main>
+  <ToastHost />
 </div>
 
 <style>

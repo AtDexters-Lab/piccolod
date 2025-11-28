@@ -70,6 +70,7 @@
 - Current playbooks:
   - **Setup wizard** (`docs/setup-wizard.md`): covers `/setup` and `/unlock`, crypto state transitions, recovery key UX, and first-run vs. routine unlock behaviors.
   - **Interaction model** (`docs/ui-architecture/00_interaction_model.md`): the “Digital Sanctuary” frame, layers (Frame/Stage/Launcher), icon resolution, and navigation philosophy.
+  - **Settings activity** (`docs/settings.md`): split-view settings app (desktop) with mobile stack navigation; profile, appearance, remote access, updates; optimistic toggles and danger-modal confirmations.
 
 ## Directory Layout
 ```

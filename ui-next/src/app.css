@@ -27,6 +27,7 @@
   --motion-distance-md: 16px;
   --safe-area-top: 88px;
   --safe-area-bottom: 110px;
+  --panel-gap: 18px;
 
   --sys-surface: 244 246 251;
   --sys-surface-variant: 255 255 255;
@@ -106,6 +107,12 @@
 
   --hero-gradient: radial-gradient(1150px 560px at 18% -5%, #F6F8FC 0%, #E9EEF6 42%, #E4EAF3 100%);
   --card-gradient: var(--card-bg);
+}
+
+.card-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--panel-gap);
 }
 
 [data-theme='dark'] {

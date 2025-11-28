@@ -12,6 +12,7 @@
   import { layerState as layerStateAction } from '$lib/actions/layerState';
   import { scrollLock } from '$lib/actions/scrollLock';
   import type { AppManifest, ResolvedApp } from '$lib/types/apps';
+  import SettingsActivity from '$lib/components/settings/SettingsActivity.svelte';
 
   const seedApps: AppManifest[] = [
     { id: 'files', displayName: 'Files', origin: 'https://files.piccolo.local', isSystem: true, pinned: true },
@@ -422,47 +423,47 @@
       data-layer-state={$topLayer?.id === activeAppLayerId ? 'foreground' : 'background'}
     >
       <div class="app-shell">
-        <div class="app-chrome" aria-label={`${activeApp.displayName} header`}>
-          <div class="flex items-center gap-3">
-            <div class="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 to-blue-600 text-base font-semibold text-white shadow-md">
-              {activeApp.displayName.slice(0, 2).toUpperCase()}
+        <div class="app-window" aria-label={`${activeApp.displayName} window`}>
+          <header class="window-chrome">
+            <div class="flex items-center gap-3">
+              <div class="pill-icon">
+                {activeApp.displayName.slice(0, 2).toUpperCase()}
+              </div>
+              <div class="leading-tight">
+                <p class="text-[11px] uppercase tracking-[0.16em] text-muted">App</p>
+                <p class="text-base font-semibold text-ink">{activeApp.displayName}</p>
+              </div>
             </div>
-            <div>
-              <p class="text-[11px] uppercase tracking-[0.16em] text-muted">Active app</p>
-              <p class="text-lg font-semibold text-ink">{activeApp.displayName}</p>
+            <div class="flex items-center gap-2">
+              <Button variant="ghost" size="compact" on:click={closeApp}>Close</Button>
+              <Button variant="secondary" size="compact" on:click={openDrawer}>Switch app</Button>
+              <Button variant="ghost" size="compact" on:click={() => activeApp && openAppInNewTab(activeApp)}>Open in new tab</Button>
             </div>
-          </div>
-          <div class="flex items-center gap-2">
-            <Button variant="ghost" on:click={closeApp}>
-              Home
-            </Button>
-            <Button variant="secondary" on:click={openDrawer}>
-              Switch app
-            </Button>
-            <Button variant="ghost" on:click={() => activeApp && openAppInNewTab(activeApp)}>
-              Open in new tab
-            </Button>
-          </div>
-        </div>
+          </header>
 
-        <div class="app-body" aria-label={`${activeApp.displayName} content`}>
-          <div class="rounded-3xl border border-white/40 bg-white/85 p-6 shadow-lg backdrop-blur-2xl dark:border-white/10 dark:bg-slate-900/85">
-            <p class="meta-label">Layer B · Activity</p>
-            <h3 class="mt-2 text-xl font-semibold">Immersive view</h3>
-            <p class="mt-2 text-sm text-muted">
-              App content stretches edge-to-edge while respecting the safe areas above and below the Dock/Top Bar. Scroll to see how content flows under
-              the Frame while controls remain reachable.
-            </p>
-            <div class="mt-4 grid gap-4 sm:grid-cols-2">
-              <div class="rounded-2xl border border-white/50 bg-white/80 p-4 backdrop-blur-xl dark:border-white/10 dark:bg-slate-800/80">
-                <p class="text-xs uppercase tracking-[0.18em] text-muted">Safe area</p>
-                <p class="mt-1 text-sm text-ink">Top padding from measured bar height: <code>var(--safe-area-top)</code></p>
+          <div class="app-body" aria-label={`${activeApp.displayName} content`}>
+            {#if activeApp.id === 'settings'}
+              <SettingsActivity />
+            {:else}
+              <div class="rounded-3xl border border-white/40 bg-white/85 p-6 shadow-lg backdrop-blur-2xl dark:border-white/10 dark:bg-slate-900/85">
+                <p class="meta-label">Layer B · Activity</p>
+                <h3 class="mt-2 text-xl font-semibold">Immersive view</h3>
+                <p class="mt-2 text-sm text-muted">
+                  App content stretches edge-to-edge while respecting the safe areas above and below the Dock/Top Bar. Scroll to see how content flows under
+                  the Frame while controls remain reachable.
+                </p>
+                <div class="mt-4 grid gap-4 sm:grid-cols-2">
+                  <div class="rounded-2xl border border-white/50 bg-white/80 p-4 backdrop-blur-xl dark:border-white/10 dark:bg-slate-800/80">
+                    <p class="text-xs uppercase tracking-[0.18em] text-muted">Safe area</p>
+                    <p class="mt-1 text-sm text-ink">Top padding from measured bar height: <code>var(--safe-area-top)</code></p>
+                  </div>
+                  <div class="rounded-2xl border border-white/50 bg-white/80 p-4 backdrop-blur-xl dark:border-white/10 dark:bg-slate-800/80">
+                    <p class="text-xs uppercase tracking-[0.18em] text-muted">Single task</p>
+                    <p class="mt-1 text-sm text-ink">Only one heavy activity is mounted at a time; switchers replace the current view.</p>
+                  </div>
+                </div>
               </div>
-              <div class="rounded-2xl border border-white/50 bg-white/80 p-4 backdrop-blur-xl dark:border-white/10 dark:bg-slate-800/80">
-                <p class="text-xs uppercase tracking-[0.18em] text-muted">Single task</p>
-                <p class="mt-1 text-sm text-ink">Only one heavy activity is mounted at a time; switchers replace the current view.</p>
-              </div>
-            </div>
+            {/if}
           </div>
         </div>
       </div>
@@ -536,7 +537,7 @@
   }
 
   .dock-wrapper {
-    bottom: 16px;
+    bottom: 8px;
   }
 
   [data-layer-state='background'] {
@@ -572,34 +573,65 @@
     max-width: 1100px;
     display: flex;
     flex-direction: column;
-    gap: 16px;
-    height: calc(100vh - var(--safe-area-top) - var(--safe-area-bottom));
-    overflow: hidden;
+    height: calc(100vh - var(--safe-area-top) - var(--safe-area-bottom) - 16px);
+    align-items: center;
   }
 
-  .app-chrome {
+  .app-window {
+    width: min(1080px, calc(100vw - 32px));
+    max-height: calc(100vh - var(--safe-area-top) - var(--safe-area-bottom));
+    background: rgba(255, 255, 255, 0.94);
+    border-radius: 22px;
+    border: 1px solid rgba(255, 255, 255, 0.65);
+    box-shadow: 0 28px 70px rgba(18, 24, 40, 0.2);
+    backdrop-filter: blur(18px);
+    pointer-events: auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-height: 0;
+  }
+
+  :global([data-theme='dark']) .app-window {
+    background: rgba(18, 22, 34, 0.92);
+    border-color: rgba(255, 255, 255, 0.08);
+    box-shadow: 0 28px 70px rgba(0, 0, 0, 0.4);
+  }
+
+  .window-chrome {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding: 14px 16px;
-    border-radius: 18px;
-    border: 1px solid rgba(255, 255, 255, 0.45);
-    background: rgba(255, 255, 255, 0.82);
-    backdrop-filter: blur(20px);
-    box-shadow: 0 10px 30px rgba(18, 24, 40, 0.12);
+    padding: 12px 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.5);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(255, 255, 255, 0.86));
   }
 
-  :global([data-theme='dark']) .app-chrome {
-    border-color: rgba(255, 255, 255, 0.12);
-    background: rgba(26, 32, 48, 0.88);
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  :global([data-theme='dark']) .window-chrome {
+    border-color: rgba(255, 255, 255, 0.08);
+    background: linear-gradient(180deg, rgba(22, 26, 38, 0.96), rgba(18, 22, 34, 0.9));
   }
 
   .app-body {
+    padding: 0;
     flex: 1;
     overflow-y: auto;
-    padding-bottom: 4px;
+    overflow-x: visible;
+    min-height: 0;
+  }
+
+  .pill-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 12px;
+    background: linear-gradient(180deg, #3d66ff, #2f5af3);
+    color: white;
+    font-weight: 700;
+    font-size: 13px;
   }
 
   @media (max-width: 540px) {
@@ -611,9 +643,10 @@
       grid-template-columns: repeat(3, minmax(0, 1fr));
     }
 
-    .app-chrome {
+    .window-chrome {
       flex-direction: column;
       align-items: flex-start;
+      gap: 8px;
     }
   }
 </style>

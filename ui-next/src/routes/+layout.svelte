@@ -2,16 +2,20 @@
   import { QueryClientProvider } from '@tanstack/svelte-query';
   import '../app.css';
   import { queryClient } from '$lib/clients/queryClient';
-  import { preferencesStore } from '$lib/stores/preferences';
+  import { initPreferencesPersistence, preferencesStore, preferencesWereLoaded } from '$lib/stores/preferences';
   import AppShell from '$lib/components/AppShell.svelte';
   import { onMount } from 'svelte';
 
 const prefs = preferencesStore;
 
 onMount(() => {
+  initPreferencesPersistence();
   if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
   const applyScheme = (matches: boolean) => {
-    prefs.update((current) => ({ ...current, theme: matches ? 'dark' : 'light' }));
+    prefs.update((current) => {
+      if (preferencesWereLoaded()) return current; // respect persisted value
+      return { ...current, theme: matches ? 'dark' : 'light' };
+    });
   };
   const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
   applyScheme(mediaQuery.matches);

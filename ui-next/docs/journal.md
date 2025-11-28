@@ -15,4 +15,7 @@
 - Implemented refcounted scroll lock and lifecycle hooks for layers; reduced-motion-friendly transitions for app/drawer.
 - Updated screenshot capture to cover drawer/app states and fixed waits to real aria targets.
 - Follow-ups: consider perf guardrails for heavy blur on low-end/mobile; pause polling/timers when layers go background.
-
+### 2025-11-28 — Settings activity shell
+- Added split-view Settings app under `/apps/settings` with mobile stack drill-down.
+- New clusters for Profile/Recovery, Appearance (local-only prefs), Remote access, and Updates (stubbed).
+- Introduced shared StatusHero, SettingCard, toast host, and local-storage prefs persistence to bridge until server APIs land.
