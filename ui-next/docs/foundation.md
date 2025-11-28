@@ -69,6 +69,7 @@
   2. Append a bullet here describing the screen, its current ownership/status, and the file location so future contributors can jump straight from `foundation.md` to the detailed brief.
 - Current playbooks:
   - **Setup wizard** (`docs/setup-wizard.md`): covers `/setup` and `/unlock`, crypto state transitions, recovery key UX, and first-run vs. routine unlock behaviors.
+  - **Interaction model** (`docs/ui-architecture/00_interaction_model.md`): the “Digital Sanctuary” frame, layers (Frame/Stage/Launcher), icon resolution, and navigation philosophy.
 
 ## Directory Layout
 ```

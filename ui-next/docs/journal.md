@@ -10,4 +10,9 @@
 - **Cause:** The banner offered only Acknowledge/Details, forcing users to hunt for `/setup`, and CSRF tokens weren’t primed/reset after authentication transitions.
 - **Action:** Banner now links directly to `/setup?focus=recovery`, recovery step handles stale keys (regenerate or continue), and CSRF tokens are refreshed during login/logout so POSTs succeed immediately.
 - **Follow-ups:** Monitor for additional flows that should deep-link into the recovery step; consider adding automated tests for redirect decoding.
+### 2025-11-28 — Layered shell & navigation
+- Added interaction model link and finalized layered shell (Stage/App/Drawer) with history-aware back/forward and swipe-to-close drawer.
+- Implemented refcounted scroll lock and lifecycle hooks for layers; reduced-motion-friendly transitions for app/drawer.
+- Updated screenshot capture to cover drawer/app states and fixed waits to real aria targets.
+- Follow-ups: consider perf guardrails for heavy blur on low-end/mobile; pause polling/timers when layers go background.
 
