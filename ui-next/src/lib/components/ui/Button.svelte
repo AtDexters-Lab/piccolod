@@ -1,24 +1,26 @@
 <script lang="ts">
-  import { createEventDispatcher } from 'svelte';
+  import { createEventDispatcher } from "svelte";
 
-  type ButtonVariant = 'primary' | 'secondary' | 'ghost';
-  type ButtonSize = 'default' | 'compact';
+  type ButtonVariant = "primary" | "secondary" | "ghost";
+  type ButtonSize = "default" | "compact" | "icon";
 
-  export let variant: ButtonVariant = 'primary';
-  export let size: ButtonSize = 'default';
-  export let type: 'button' | 'submit' | 'reset' = 'button';
+  export let variant: ButtonVariant = "primary";
+  export let size: ButtonSize = "default";
+  export let type: "button" | "submit" | "reset" = "button";
   export let href: string | undefined = undefined;
   export let disabled = false;
   export let stretch = false;
   export let target: string | undefined = undefined;
   export let rel: string | undefined = undefined;
   export let loading = false;
+  export let title: string | undefined = undefined;
 
-  $: computedRel = rel ?? (target === '_blank' ? 'noopener noreferrer' : undefined);
+  $: computedRel =
+    rel ?? (target === "_blank" ? "noopener noreferrer" : undefined);
   const dispatch = createEventDispatcher<{ click: MouseEvent }>();
 
   function emit(event: MouseEvent) {
-    dispatch('click', event);
+    dispatch("click", event);
   }
 
   function handleAnchorClick(event: MouseEvent) {
@@ -41,11 +43,12 @@
 
 {#if href}
   <a
-    class={`ui-btn ui-btn--link ui-btn--${variant} ui-btn--${size} ${stretch ? 'ui-btn--stretch' : ''} ${loading ? 'ui-btn--loading' : ''}`}
-    href={href}
-    target={target}
+    class={`ui-btn ui-btn--link ui-btn--${variant} ui-btn--${size} ${stretch ? "ui-btn--stretch" : ""} ${loading ? "ui-btn--loading" : ""}`}
+    {href}
+    {target}
     rel={computedRel}
     aria-disabled={disabled || loading}
+    {title}
     on:click={handleAnchorClick}
   >
     {#if loading}
@@ -56,8 +59,9 @@
 {:else}
   <button
     {type}
-    class={`ui-btn ui-btn--${variant} ui-btn--${size} ${stretch ? 'ui-btn--stretch' : ''} ${loading ? 'ui-btn--loading' : ''}`}
+    class={`ui-btn ui-btn--${variant} ui-btn--${size} ${stretch ? "ui-btn--stretch" : ""} ${loading ? "ui-btn--loading" : ""}`}
     disabled={disabled || loading}
+    {title}
     on:click={handleButtonClick}
   >
     {#if loading}
@@ -73,8 +77,9 @@
     font-size: 1rem;
     font-weight: 600;
     border-radius: var(--radius-pill);
-    padding: 0.9rem 1.8rem;
-    transition: box-shadow var(--motion-dur-fast) var(--motion-ease-emphasized),
+    padding: 0.75rem 1.5rem;
+    transition:
+      box-shadow var(--motion-dur-fast) var(--motion-ease-emphasized),
       transform var(--motion-dur-fast) var(--motion-ease-standard),
       background var(--motion-dur-fast) var(--motion-ease-standard);
     display: inline-flex;
@@ -119,7 +124,7 @@
   }
 
   .ui-btn:disabled,
-  .ui-btn[aria-disabled='true'] {
+  .ui-btn[aria-disabled="true"] {
     opacity: 0.55;
     pointer-events: none;
   }
@@ -152,6 +157,13 @@
   .ui-btn--compact {
     padding: 0.5rem 1.25rem;
     font-size: 0.9rem;
+  }
+
+  .ui-btn--icon {
+    padding: 0;
+    width: 36px;
+    height: 36px;
+    border-radius: 999px;
   }
 
   .ui-btn--link {

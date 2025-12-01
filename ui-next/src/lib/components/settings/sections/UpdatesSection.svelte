@@ -1,29 +1,38 @@
 <script lang="ts">
-  import { getContext, onDestroy } from 'svelte';
-  import { goto } from '$app/navigation';
-  import { createQuery, useQueryClient } from '@tanstack/svelte-query';
-  import SettingCard from '$lib/components/settings/SettingCard.svelte';
-  import SettingsSkeleton from '$lib/components/settings/SettingsSkeleton.svelte';
-  import Button from '$lib/components/ui/Button.svelte';
-  import { checkForUpdates, fetchUpdateInfo, setAutoUpdate } from '$lib/api/updates';
-  import { toasts } from '$lib/stores/toasts';
-  import type { Writable } from 'svelte/store';
-  import type { SettingsNavState } from '../types';
-  import type { SettingsActivityContext } from '../activityContext';
-  import { settingsActivityKey } from '../activityContext';
+  import { getContext, onDestroy } from "svelte";
+  import { goto } from "$app/navigation";
+  import { createQuery, useQueryClient } from "@tanstack/svelte-query";
+  import SettingCard from "$lib/components/settings/SettingCard.svelte";
+  import SettingsSkeleton from "$lib/components/settings/SettingsSkeleton.svelte";
+  import Button from "$lib/components/ui/Button.svelte";
+  import Badge from "$lib/components/ui/Badge.svelte";
+  import {
+    checkForUpdates,
+    fetchUpdateInfo,
+    setAutoUpdate,
+  } from "$lib/api/updates";
+  import { toasts } from "$lib/stores/toasts";
+  import type { Writable } from "svelte/store";
+  import type { SettingsNavState } from "../types";
+  import type { SettingsActivityContext } from "../activityContext";
+  import { settingsActivityKey } from "../activityContext";
 
   const queryClient = useQueryClient();
   const query = createQuery(() => ({
-    queryKey: ['updateInfo'],
+    queryKey: ["updateInfo"],
     queryFn: fetchUpdateInfo,
-    staleTime: 1000 * 60 * 5 // 5 minutes
+    staleTime: 1000 * 60 * 5, // 5 minutes
   }));
 
   let checking = false;
-  let heroTone: 'ok' | 'warn' | 'error' = 'ok';
+  let heroTone: "ok" | "warn" | "error" = "ok";
 
-  const navStore = getContext<Writable<SettingsNavState> | null>('settings-nav');
-  const activity = getContext<SettingsActivityContext | null>(settingsActivityKey);
+  const navStore = getContext<Writable<SettingsNavState> | null>(
+    "settings-nav",
+  );
+  const activity = getContext<SettingsActivityContext | null>(
+    settingsActivityKey,
+  );
   let navState: SettingsNavState | null = null;
   const unsub = navStore?.subscribe((value) => (navState = value));
   onDestroy(() => unsub?.());
@@ -32,11 +41,21 @@
     checking = true;
     try {
       const info = await checkForUpdates();
-      await queryClient.invalidateQueries({ queryKey: ['updateInfo'] });
-      const message = info.available ? `Update ${info.latestVersion} available.` : 'Already up to date.';
-      toasts.push({ message, variant: info.available ? 'success' : 'info', timeout: 3200 });
+      await queryClient.invalidateQueries({ queryKey: ["updateInfo"] });
+      const message = info.available
+        ? `Update ${info.latestVersion} available.`
+        : "Already up to date.";
+      toasts.push({
+        message,
+        variant: info.available ? "success" : "info",
+        timeout: 3200,
+      });
     } catch (error) {
-      toasts.push({ message: (error as Error)?.message ?? 'Failed to check updates.', variant: 'error', timeout: 4200 });
+      toasts.push({
+        message: (error as Error)?.message ?? "Failed to check updates.",
+        variant: "error",
+        timeout: 4200,
+      });
     } finally {
       checking = false;
     }
@@ -47,17 +66,30 @@
     const next = !query.data.autoUpdate;
     try {
       await setAutoUpdate(next);
-      await queryClient.invalidateQueries({ queryKey: ['updateInfo'] });
-      toasts.push({ message: `Auto-update ${next ? 'enabled' : 'disabled'}.`, variant: 'success', timeout: 2600 });
+      await queryClient.invalidateQueries({ queryKey: ["updateInfo"] });
+      toasts.push({
+        message: `Auto-update ${next ? "enabled" : "disabled"}.`,
+        variant: "success",
+        timeout: 2600,
+      });
     } catch (error) {
-      toasts.push({ message: (error as Error)?.message ?? 'Failed to update policy.', variant: 'error', timeout: 4200 });
+      toasts.push({
+        message: (error as Error)?.message ?? "Failed to update policy.",
+        variant: "error",
+        timeout: 4200,
+      });
     }
   };
 </script>
 
 {#if navState && !navState.isSplit}
   <div class="mb-3">
-    <Button variant="ghost" size="compact" on:click={() => (activity?.setActive ? activity.setActive(null) : goto('/apps/settings'))}>
+    <Button
+      variant="ghost"
+      size="compact"
+      on:click={() =>
+        activity?.setActive ? activity.setActive(null) : goto("/apps/settings")}
+    >
       Back
     </Button>
   </div>
@@ -67,33 +99,67 @@
   <div class="card-stack">
     <div class="grid gap-6 md:grid-cols-2">
       <SettingCard title="Current state" description="OS version and channel">
-        <ul class="text-sm text-muted space-y-2">
-          <li><strong>Current:</strong> {query.data.currentVersion}</li>
-          <li><strong>Latest:</strong> {query.data.latestVersion}</li>
-          <li><strong>Channel:</strong> {query.data.channel}</li>
-          {#if query.data.lastChecked}<li><strong>Last checked:</strong> {new Date(query.data.lastChecked).toLocaleString()}</li>{/if}
-        </ul>
-        <div class="flex gap-2 mt-3">
-          <Button variant="primary" on:click={handleCheck} loading={checking}>Check for updates</Button>
-          <Button variant="secondary" disabled={!query.data.available}>Apply update</Button>
+        <div
+          class="grid grid-cols-[auto_1fr] items-center gap-x-4 gap-y-3 text-sm"
+        >
+          <span class="font-medium text-ink">Current:</span>
+          <span class="text-muted font-mono">{query.data.currentVersion}</span>
+
+          <span class="font-medium text-ink">Latest:</span>
+          <span class="text-muted font-mono">{query.data.latestVersion}</span>
+
+          <span class="font-medium text-ink">Channel:</span>
+          <div><Badge variant="neutral">{query.data.channel}</Badge></div>
+
+          {#if query.data.lastChecked}
+            <span class="font-medium text-ink">Last checked:</span>
+            <span class="text-muted"
+              >{new Date(query.data.lastChecked).toLocaleString()}</span
+            >
+          {/if}
         </div>
+
+        <div class="mt-6 flex gap-2">
+          <Button variant="primary" on:click={handleCheck} loading={checking}
+            >Check for updates</Button
+          >
+          <Button variant="secondary" disabled={!query.data.available}
+            >Apply update</Button
+          >
+        </div>
+
         {#if query.data.available}
-          <p class="text-sm text-ink mt-2">Update {query.data.latestVersion} is ready. Applying will reboot.</p>
+          <div
+            class="mt-4 flex items-center gap-2 rounded-lg bg-surface-variant/30 p-3"
+          >
+            <Badge variant="success">Ready</Badge>
+            <p class="text-sm text-ink">
+              Update {query.data.latestVersion} is ready to install.
+            </p>
+          </div>
         {/if}
       </SettingCard>
 
       <SettingCard title="Policy" description="Auto-update and channel">
         <div class="flex items-center gap-3">
           <label class="switch">
-            <input type="checkbox" checked={query.data.autoUpdate} on:change={toggleAuto} />
+            <input
+              type="checkbox"
+              checked={query.data.autoUpdate}
+              on:change={toggleAuto}
+            />
             <span class="slider" aria-hidden="true"></span>
           </label>
           <div>
             <p class="text-sm font-semibold text-ink">Auto-update</p>
-            <p class="text-xs text-muted">Optimistic toggle; reverts and toasts on failure.</p>
+            <p class="text-xs text-muted">
+              Optimistic toggle; reverts and toasts on failure.
+            </p>
           </div>
         </div>
-        <p class="text-xs text-muted mt-3">Channel selection will be wired to the backend. Default is stable.</p>
+        <p class="text-xs text-muted mt-3">
+          Channel selection will be wired to the backend. Default is stable.
+        </p>
       </SettingCard>
     </div>
   </div>
@@ -101,9 +167,16 @@
   <SettingsSkeleton />
 {:else if query.isError}
   <div class="card-stack">
-    <SettingCard title="Updates unavailable" description="Error loading update info.">
+    <SettingCard
+      title="Updates unavailable"
+      description="Error loading update info."
+    >
       <div class="flex gap-2">
-        <Button variant="primary" size="compact" on:click={() => query.refetch()}>Retry</Button>
+        <Button
+          variant="primary"
+          size="compact"
+          on:click={() => query.refetch()}>Retry</Button
+        >
       </div>
     </SettingCard>
   </div>
@@ -134,7 +207,7 @@
 
   .slider::before {
     position: absolute;
-    content: '';
+    content: "";
     height: 20px;
     width: 20px;
     left: 3px;

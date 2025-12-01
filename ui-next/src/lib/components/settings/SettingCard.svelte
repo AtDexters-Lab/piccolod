@@ -4,57 +4,22 @@
   export let actions: boolean = false;
 </script>
 
-<section class="card relative" aria-label={title}>
-  <div class="card-head">
+<section
+  class="relative rounded-2xl border border-surface-variant bg-surface p-6 shadow-soft"
+  aria-label={title}
+>
+  <div class="flex items-start justify-between gap-3">
     <div>
-      <p class="label">{title}</p>
-      {#if description}<p class="desc">{description}</p>{/if}
+      <p class="font-display font-semibold text-ink">{title}</p>
+      {#if description}<p class="mt-1 text-sm text-muted">{description}</p>{/if}
     </div>
     {#if actions}
-      <div class="actions">
+      <div class="flex gap-2">
         <slot name="actions" />
       </div>
     {/if}
   </div>
-  <div class="card-body">
+  <div class="mt-4">
     <slot />
   </div>
 </section>
-
-<style>
-  .card {
-    border: 1px solid var(--card-border);
-    background: var(--card-bg);
-    border-radius: 16px;
-    padding: 18px;
-    box-shadow: var(--shadow-soft);
-  }
-
-  .card-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  .label {
-    font-weight: 600;
-    color: rgb(var(--sys-ink));
-    margin: 0;
-  }
-
-  .desc {
-    margin: 4px 0 0;
-    color: rgb(var(--sys-ink-muted));
-    font-size: 13px;
-  }
-
-  .actions {
-    display: flex;
-    gap: 8px;
-  }
-
-  .card-body {
-    margin-top: 12px;
-  }
-</style>

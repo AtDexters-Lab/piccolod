@@ -55,15 +55,6 @@ release: clean deps typegen ## Produce a clean release build (non-demo)
 	$(MAKE) build DEMO=0
 	@echo "==> Release build available at ./piccolod"
 
-demo: DEMO=1
-demo: build ## Build (demo UI) and run server on :8080
-	@echo "==> Running piccolod in demo mode on http://localhost:8080"
-	PORT=8080 PICCOLO_DEMO=1 ./piccolod
-
-demo-serve: ## Run the server using existing build (no rebuild)
-	@echo "==> Serving existing build on http://localhost:8080"
-	PORT=8080 PICCOLO_DEMO=1 ./piccolod
-
 # --- Utilities ---
 typegen: ## Regenerate API types (not required yet)
 	@true
