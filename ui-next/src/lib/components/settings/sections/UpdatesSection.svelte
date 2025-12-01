@@ -1,19 +1,26 @@
 <script lang="ts">
-  import { getContext, onDestroy, onMount } from 'svelte';
+  import { getContext, onDestroy } from 'svelte';
   import { goto } from '$app/navigation';
+  import { createQuery, useQueryClient } from '@tanstack/svelte-query';
   import SettingCard from '$lib/components/settings/SettingCard.svelte';
+  import SettingsSkeleton from '$lib/components/settings/SettingsSkeleton.svelte';
   import Button from '$lib/components/ui/Button.svelte';
-  import { checkForUpdates, fetchUpdateInfo, setAutoUpdate, type UpdateInfo } from '$lib/api/updates';
+  import { checkForUpdates, fetchUpdateInfo, setAutoUpdate } from '$lib/api/updates';
   import { toasts } from '$lib/stores/toasts';
   import type { Writable } from 'svelte/store';
   import type { SettingsNavState } from '../types';
   import type { SettingsActivityContext } from '../activityContext';
   import { settingsActivityKey } from '../activityContext';
 
-  let info: UpdateInfo | null = null;
+  const queryClient = useQueryClient();
+  const query = createQuery(() => ({
+    queryKey: ['updateInfo'],
+    queryFn: fetchUpdateInfo,
+    staleTime: 1000 * 60 * 5 // 5 minutes
+  }));
+
   let checking = false;
   let heroTone: 'ok' | 'warn' | 'error' = 'ok';
-  let loadError = '';
 
   const navStore = getContext<Writable<SettingsNavState> | null>('settings-nav');
   const activity = getContext<SettingsActivityContext | null>(settingsActivityKey);
@@ -21,21 +28,11 @@
   const unsub = navStore?.subscribe((value) => (navState = value));
   onDestroy(() => unsub?.());
 
-  const loadInfo = async () => {
-    try {
-      info = await fetchUpdateInfo();
-      loadError = '';
-    } catch (error) {
-      loadError = (error as Error)?.message ?? 'Unable to load updates.';
-      info = null;
-      toasts.push({ message: loadError, variant: 'error', timeout: 4200 });
-    }
-  };
-
   const handleCheck = async () => {
     checking = true;
     try {
-      info = await checkForUpdates();
+      const info = await checkForUpdates();
+      await queryClient.invalidateQueries({ queryKey: ['updateInfo'] });
       const message = info.available ? `Update ${info.latestVersion} available.` : 'Already up to date.';
       toasts.push({ message, variant: info.available ? 'success' : 'info', timeout: 3200 });
     } catch (error) {
@@ -46,23 +43,16 @@
   };
 
   const toggleAuto = async () => {
-    if (!info) return;
-    const next = !info.autoUpdate;
-    const prev = info;
-    info = { ...info, autoUpdate: next };
+    if (!query.data) return;
+    const next = !query.data.autoUpdate;
     try {
-      info = await setAutoUpdate(next);
-      toasts.push({ message: `Auto-update ${next ? 'enabled' : 'disabled'} (optimistic).`, variant: 'success', timeout: 2600 });
+      await setAutoUpdate(next);
+      await queryClient.invalidateQueries({ queryKey: ['updateInfo'] });
+      toasts.push({ message: `Auto-update ${next ? 'enabled' : 'disabled'}.`, variant: 'success', timeout: 2600 });
     } catch (error) {
-      info = prev;
       toasts.push({ message: (error as Error)?.message ?? 'Failed to update policy.', variant: 'error', timeout: 4200 });
     }
   };
-
-  onMount(loadInfo);
-
-  $: heroTone = info?.available ? 'warn' : 'ok';
-  $: heroPill = info ? `${info.currentVersion} · ${info.channel} channel` : 'Loading…';
 </script>
 
 {#if navState && !navState.isSplit}
@@ -73,29 +63,29 @@
   </div>
 {/if}
 
-{#if info}
+{#if query.data}
   <div class="card-stack">
     <div class="grid gap-6 md:grid-cols-2">
       <SettingCard title="Current state" description="OS version and channel">
         <ul class="text-sm text-muted space-y-2">
-          <li><strong>Current:</strong> {info.currentVersion}</li>
-          <li><strong>Latest:</strong> {info.latestVersion}</li>
-          <li><strong>Channel:</strong> {info.channel}</li>
-          {#if info.lastChecked}<li><strong>Last checked:</strong> {new Date(info.lastChecked).toLocaleString()}</li>{/if}
+          <li><strong>Current:</strong> {query.data.currentVersion}</li>
+          <li><strong>Latest:</strong> {query.data.latestVersion}</li>
+          <li><strong>Channel:</strong> {query.data.channel}</li>
+          {#if query.data.lastChecked}<li><strong>Last checked:</strong> {new Date(query.data.lastChecked).toLocaleString()}</li>{/if}
         </ul>
         <div class="flex gap-2 mt-3">
           <Button variant="primary" on:click={handleCheck} loading={checking}>Check for updates</Button>
-          <Button variant="secondary" disabled={!info.available}>Apply update</Button>
+          <Button variant="secondary" disabled={!query.data.available}>Apply update</Button>
         </div>
-        {#if info.available}
-          <p class="text-sm text-ink mt-2">Update {info.latestVersion} is ready. Applying will reboot.</p>
+        {#if query.data.available}
+          <p class="text-sm text-ink mt-2">Update {query.data.latestVersion} is ready. Applying will reboot.</p>
         {/if}
       </SettingCard>
 
       <SettingCard title="Policy" description="Auto-update and channel">
         <div class="flex items-center gap-3">
           <label class="switch">
-            <input type="checkbox" checked={info.autoUpdate} on:change={toggleAuto} />
+            <input type="checkbox" checked={query.data.autoUpdate} on:change={toggleAuto} />
             <span class="slider" aria-hidden="true"></span>
           </label>
           <div>
@@ -107,18 +97,16 @@
       </SettingCard>
     </div>
   </div>
-{:else}
-  {#if loadError}
-    <div class="card-stack">
-      <SettingCard title="Updates unavailable" description={loadError}>
-        <div class="flex gap-2">
-          <Button variant="primary" size="compact" on:click={loadInfo}>Retry</Button>
-        </div>
-      </SettingCard>
-    </div>
-  {:else}
-    <p class="text-sm text-muted">Loading update info…</p>
-  {/if}
+{:else if query.isLoading}
+  <SettingsSkeleton />
+{:else if query.isError}
+  <div class="card-stack">
+    <SettingCard title="Updates unavailable" description="Error loading update info.">
+      <div class="flex gap-2">
+        <Button variant="primary" size="compact" on:click={() => query.refetch()}>Retry</Button>
+      </div>
+    </SettingCard>
+  </div>
 {/if}
 
 <style>

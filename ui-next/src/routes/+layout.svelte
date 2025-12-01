@@ -4,6 +4,8 @@
   import { queryClient } from '$lib/clients/queryClient';
   import { initPreferencesPersistence, preferencesStore, preferencesWereLoaded } from '$lib/stores/preferences';
   import AppShell from '$lib/components/AppShell.svelte';
+  import Desktop from '$lib/components/shell/Desktop.svelte';
+  import { page } from '$app/stores';
   import { onMount } from 'svelte';
 
 const prefs = preferencesStore;
@@ -28,6 +30,8 @@ onMount(() => {
     return () => mediaQuery.removeListener(listener);
   }
 });
+
+$: isShellRoute = !['/login', '/setup', '/unlock', '/password-recovery'].some(path => $page.url.pathname === path || $page.url.pathname.startsWith(path + '/'));
 </script>
 
 <svelte:head>
@@ -43,8 +47,14 @@ onMount(() => {
 
 <QueryClientProvider client={queryClient}>
   <div class="min-h-screen" data-theme={$prefs.theme}>
-    <AppShell>
-      <slot />
-    </AppShell>
+    {#if isShellRoute}
+      <Desktop>
+        <slot />
+      </Desktop>
+    {:else}
+      <AppShell>
+        <slot />
+      </AppShell>
+    {/if}
   </div>
 </QueryClientProvider>

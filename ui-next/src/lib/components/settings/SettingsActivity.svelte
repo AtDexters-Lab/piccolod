@@ -80,21 +80,23 @@
       </aside>
       <section class="detail-pane">
         <div class="detail-inner">
-          {#key activeId ?? 'overview'}
-            <div in:fly={{ y: 8, duration: 140 }} out:fly={{ y: 8, duration: 120 }}>
-              {#if activeId === 'profile'}
-                <ProfileSection />
-              {:else if activeId === 'appearance'}
-                <AppearanceSection />
-              {:else if activeId === 'remote'}
-                <RemoteAccessSection />
-              {:else if activeId === 'updates'}
-                <UpdatesSection />
-              {:else}
-                <OverviewSection />
-              {/if}
-            </div>
-          {/key}
+          <div class="transition-stack">
+            {#key activeId ?? 'overview'}
+              <div class="transition-item">
+                {#if activeId === 'profile'}
+                  <ProfileSection />
+                {:else if activeId === 'appearance'}
+                  <AppearanceSection />
+                {:else if activeId === 'remote'}
+                  <RemoteAccessSection />
+                {:else if activeId === 'updates'}
+                  <UpdatesSection />
+                {:else}
+                  <OverviewSection />
+                {/if}
+              </div>
+            {/key}
+          </div>
         </div>
       </section>
     {:else}
@@ -165,6 +167,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--panel-gap);
+    scrollbar-gutter: stable;
   }
 
   .detail-pane {
@@ -184,6 +187,17 @@
     display: flex;
     flex-direction: column;
     gap: var(--panel-gap);
+    scrollbar-gutter: stable;
+  }
+
+  .transition-stack {
+    display: grid;
+    grid-template-areas: 'stack';
+  }
+
+  .transition-item {
+    grid-area: stack;
+    width: 100%;
   }
 
   .stacked-list {

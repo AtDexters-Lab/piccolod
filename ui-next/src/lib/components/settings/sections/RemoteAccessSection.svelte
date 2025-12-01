@@ -1,22 +1,30 @@
 <script lang="ts">
-  import { getContext, onDestroy, onMount } from 'svelte';
+  import { getContext, onDestroy } from 'svelte';
   import { goto } from '$app/navigation';
+  import { createQuery, useQueryClient } from '@tanstack/svelte-query';
   import SettingCard from '$lib/components/settings/SettingCard.svelte';
+  import SettingsSkeleton from '$lib/components/settings/SettingsSkeleton.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import { toasts } from '$lib/stores/toasts';
-  import { fetchRemoteAccess, toggleRemoteAccess, updateRemoteDomain, type RemoteAccessState } from '$lib/api/remote';
+  import { fetchRemoteAccess, toggleRemoteAccess, updateRemoteDomain } from '$lib/api/remote';
   import type { Writable } from 'svelte/store';
   import type { SettingsNavState } from '../types';
   import type { SettingsActivityContext } from '../activityContext';
   import { settingsActivityKey } from '../activityContext';
 
-  let remote: RemoteAccessState | null = null;
-  let loading = false;
+  const queryClient = useQueryClient();
+  const query = createQuery(() => ({
+    queryKey: ['remoteAccess'],
+    queryFn: fetchRemoteAccess,
+    staleTime: 1000 * 30 // 30 seconds
+  }));
+
   let domainInput = '';
   let dangerOpen = false;
   let dangerConfirm = '';
   const dangerPhrase = 'disable-remote';
   let tone: 'ok' | 'warn' | 'error' = 'ok';
+  let toggling = false;
 
   const navStore = getContext<Writable<SettingsNavState> | null>('settings-nav');
   const activity = getContext<SettingsActivityContext | null>(settingsActivityKey);
@@ -24,47 +32,42 @@
   const unsub = navStore?.subscribe((value) => (navState = value));
   onDestroy(() => unsub?.());
 
-  const loadRemote = async () => {
-    loading = true;
-    try {
-      remote = await fetchRemoteAccess();
-      domainInput = remote.domain;
-    } catch (error) {
-      toasts.push({ message: (error as Error)?.message ?? 'Unable to load remote access.', variant: 'error', timeout: 4200 });
-    } finally {
-      loading = false;
-    }
-  };
+  function initializeDomain(node: HTMLInputElement, domain: string) {
+    const update = (d: string) => {
+      if (d && !domainInput) {
+        domainInput = d;
+      }
+    };
+    update(domain);
+    return { update };
+  }
 
   const toggleEnabled = async () => {
-    if (!remote) return;
-    const next = !remote.enabled;
-    const previous = { ...remote };
-    remote = { ...remote, enabled: next, status: next ? 'connecting' : 'disconnected' };
+    if (!query.data) return;
+    toggling = true;
+    const next = !query.data.enabled;
     try {
-      remote = await toggleRemoteAccess(next);
+      await toggleRemoteAccess(next);
+      await queryClient.invalidateQueries({ queryKey: ['remoteAccess'] });
       toasts.push({
-        message: next ? 'Remote access enabled (optimistic apply).' : 'Remote access disabled.',
+        message: next ? 'Remote access enabled.' : 'Remote access disabled.',
         variant: 'success',
         timeout: 2600
       });
     } catch (error) {
-      remote = previous;
       toasts.push({ message: (error as Error)?.message ?? 'Failed to toggle remote access.', variant: 'error', timeout: 4200 });
+    } finally {
+      toggling = false;
     }
   };
 
   const saveDomain = async () => {
-    if (!remote) return;
-    const previous = { ...remote };
-    remote = { ...remote, domain: domainInput, lastError: undefined };
     try {
-      remote = await updateRemoteDomain(domainInput);
+      await updateRemoteDomain(domainInput);
+      await queryClient.invalidateQueries({ queryKey: ['remoteAccess'] });
       toasts.push({ message: 'Domain updated.', variant: 'success', timeout: 2600 });
     } catch (error) {
-      const message = (error as Error)?.message ?? 'Unable to update domain.';
-      remote = { ...previous, lastError: message, status: 'error' };
-      toasts.push({ message, variant: 'error', timeout: 4200 });
+      toasts.push({ message: (error as Error)?.message ?? 'Unable to update domain.', variant: 'error', timeout: 4200 });
     }
   };
 
@@ -78,11 +81,11 @@
       toasts.push({ message: `Type "${dangerPhrase}" to confirm.`, variant: 'warning', timeout: 3200 });
       return;
     }
-    if (!remote) return;
     try {
-      remote = await toggleRemoteAccess(false);
-      remote = await updateRemoteDomain('');
+      await toggleRemoteAccess(false);
+      await updateRemoteDomain('');
       domainInput = '';
+      await queryClient.invalidateQueries({ queryKey: ['remoteAccess'] });
       toasts.push({ message: 'Remote access disabled and domain cleared.', variant: 'info', timeout: 3200 });
     } catch (error) {
       toasts.push({ message: (error as Error)?.message ?? 'Failed to disable remote access.', variant: 'error', timeout: 4200 });
@@ -90,10 +93,6 @@
       dangerOpen = false;
     }
   };
-
-  onMount(loadRemote);
-
-  $: tone = remote?.status === 'error' ? 'error' : remote?.status === 'disconnected' ? 'warn' : 'ok';
 </script>
 
 {#if navState && !navState.isSplit}
@@ -104,24 +103,24 @@
   </div>
 {/if}
 
-{#if remote}
+{#if query.data}
   <div class="card-stack">
     <div class="grid gap-6 md:grid-cols-2">
       <SettingCard title="Remote link" description="Reach your Piccolo over the internet" actions={true}>
         <svelte:fragment slot="actions">
-          <Button variant="ghost" size="compact" on:click={toggleEnabled} loading={loading}>
-            {remote.enabled ? 'Disable' : 'Enable'}
+          <Button variant="ghost" size="compact" on:click={toggleEnabled} loading={toggling}>
+            {query.data.enabled ? 'Disable' : 'Enable'}
           </Button>
       </svelte:fragment>
       <div class="flex items-center gap-3">
-        <span class="chip" data-tone={tone}>
+        <span class="chip" data-tone={query.data.status === 'error' ? 'error' : query.data.status === 'disconnected' ? 'warn' : 'ok'}>
           <span class="dot" aria-hidden="true"></span>
-          {remote.status}
+          {query.data.status}
         </span>
-        {#if remote.endpoint}<code class="text-sm text-ink">{remote.endpoint}</code>{/if}
+        {#if query.data.endpoint}<code class="text-sm text-ink">{query.data.endpoint}</code>{/if}
       </div>
-      {#if remote.lastError}
-        <p class="text-sm text-red-600 mt-2">{remote.lastError}</p>
+      {#if query.data.lastError}
+        <p class="text-sm text-red-600 mt-2">{query.data.lastError}</p>
       {/if}
       <p class="text-xs text-muted mt-2">Status updates will connect to the real API; current data is stubbed.</p>
     </SettingCard>
@@ -137,7 +136,7 @@
         type="text"
         placeholder="myhome.piccolo.link"
         bind:value={domainInput}
-        disabled={loading}
+        use:initializeDomain={query.data.domain}
       />
       <p class="text-xs text-muted mt-2">Enter a reachable hostname. Validation and DNS checks will use the backend once exposed.</p>
     </SettingCard>
@@ -152,8 +151,10 @@
       </p>
     </SettingCard>
   </div>
-{:else}
-  <p class="text-sm text-muted">Loading remote access…</p>
+{:else if query.isLoading}
+  <SettingsSkeleton />
+{:else if query.isError}
+  <p class="text-sm text-red-600">Error loading remote access.</p>
 {/if}
 
 {#if dangerOpen}
