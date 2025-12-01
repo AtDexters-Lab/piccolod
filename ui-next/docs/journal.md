@@ -19,3 +19,12 @@
 - Added split-view Settings app under `/apps/settings` with mobile stack drill-down.
 - New clusters for Profile/Recovery, Appearance (local-only prefs), Remote access, and Updates (stubbed).
 - Introduced shared StatusHero, SettingCard, toast host, and local-storage prefs persistence to bridge until server APIs land.
+### 2025-11-30 — 3-Layer Shell, Animated Wallpaper, and Svelte 5 Migration
+- **Event:** Migrated the monolithic home screen to a modular 3-layer architecture (`Frame`, `Stage`, `Launcher`) orchestrated by `Desktop.svelte`.
+- **UI Polish:** Implemented animated "Aurora" wallpaper (CSS blobs) and "Midnight"/"Plain" variants. Decluttered the Home Stage and redesigned the "System" widget.
+- **Settings Polish:** Fixed window jitter by enforcing stable scrollbar gutters and fixed window height. Replaced text buttons with icon buttons in the window chrome.
+- **Tech Debt (Svelte Query v6 + Svelte 5):**
+  - **Issue:** `createQuery` triggered "t is not a function" or "subscribe is not a function" errors.
+  - **Resolution:** Adopted the correct v6 pattern for Svelte 5 Runes mode: pass options as a function `createQuery(() => ({...}))` and access properties directly `query.data` (no `$` store prefix).
+  - **Reactivity:** Fixed "stuck skeleton" issues by removing conflicting reactive assignments (`$: local = query.data`) and using direct template access or actions (`use:initializeDomain`) for side effects.
+- **Regressions Fixed:** Restored missing `ToastHost` and `Logout` button in the new shell to ensure feedback and session control.

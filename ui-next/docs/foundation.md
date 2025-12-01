@@ -14,7 +14,10 @@
 ## Architecture
 - **Framework:** SvelteKit + TypeScript (SSR, routing, forms).
 - **Components:** Radix UI primitives + Tailwind CSS themed with Material 3 tokens; shared in-house primitives (`Button`, `Stepper`, `ProgressPanel`, etc.) consume the same tokens for consistent theming.
-- **State/data:** TanStack Query (Svelte Query) for fetching/caching; derived Svelte stores for status chips and preferences.
+- **Shell:** 3-layer architecture (`Frame`, `Stage`, `Launcher`) orchestrated by `Desktop.svelte`. Apps run in `Window` overlays.
+- **State/data:** TanStack Query v6 (Svelte Query) for fetching/caching.
+  - **Pattern:** Use `createQuery(() => options)` for Svelte 5 Runes compatibility.
+  - **Access:** Use `query.data` (no `$`) in templates; reactivity is handled via state proxies.
 - **Build:** Vite (via SvelteKit), bundled with piccolod like existing `web-src`.
 
 ## Layout & Tokens
@@ -24,10 +27,14 @@
 - Typography ramp: 14/16/20/24/32 with consistent letter spacing; display headlines use Comfortaa (logo-aligned) while body copy stays on Inter for readability.
 
 ## Interaction Patterns
-- Unified OS Layout: Floating Dock (bottom), persistent System Status Bar (top), and Desktop Stage (center). This supersedes the side-rail pattern for the main shell.
-- System Status Dock with Remote/Storage/Updates/Apps chips; one CTA per chip.
-- Sheet-based flows (bottom/side) with max 3 steps, inline validation, focus trap.
-- Banners for global issues, toasts for transient feedback.
+- **Unified OS Layout:**
+  - **Layer A (Frame):** Persistent Top Bar (Search, System Health, User).
+  - **Layer B (Stage):** The desktop workspace. Shows Widgets (Clock, System Pulse) and animated Wallpaper.
+  - **Layer C (Launcher):** Floating Dock (bottom) and App Drawer (overlay).
+  - **Layer D (Window):** Running apps (e.g. Settings) float above the Stage in a fixed-height container.
+- **System Status Dock:** With Remote/Storage/Updates/Apps chips; one CTA per chip.
+- **Sheet-based flows:** (bottom/side) with max 3 steps, inline validation, focus trap.
+- **Banners:** Global issues; **Toasts** for transient feedback (Layer E).
 
 ## Remote & Storage Flows
 - Remote: single entry CTA → sheet with Connect helper → Assign domain → Verify & enable.
@@ -36,6 +43,7 @@
 
 ## Theming & Personalization
 - Preferences stored via `/api/ui/preferences`; client hydrates on load and updates via API.
+- **Wallpaper:** Animated "Aurora" (CSS blobs), "Midnight" (Gradient), or "Plain" (Solid). Driven by `Wallpaper.svelte`.
 - CSS variables drive tokens; user changes update vars in real time (optimistic UI optional).
 - Guardrails enforce AA contrast before applying custom palettes.
 - Optional dynamic color generation (Material You) from user accent.
