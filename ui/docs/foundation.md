@@ -28,6 +28,10 @@ ui/lib/
 *   **Colors:** Mist (`#F4F6FB`) backgrounds, Cobalt (`#2F5AF3`) accents, Inter typography.
 *   **Theme Data:** Defined in `lib/theme/piccolo_theme.dart`.
 
+## Workflow Guidelines
+*   **Backlog:** Before every commit, developers must check if they have introduced any technical debt or deferred any features. If so, update `docs/backlog.md` immediately.
+
 ## Next Steps
 *   Implement Setup Wizard (`docs/setup-wizard.md`).
 *   Port Settings Logic.
+*   See `docs/backlog.md` for the full list of deferred items and technical debt.
