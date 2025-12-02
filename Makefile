@@ -44,12 +44,12 @@ run: build ## Build (non-demo) and run piccolod locally
 	PORT=$(RUN_PORT) PICCOLO_STATE_DIR="$(RUN_STATE_DIR)" ./piccolod
 
 run-fresh: build ## Build and run piccolod with a temporary state dir
-	@echo "==> Running piccolod on http://localhost:8080 with a fresh ephemeral state dir"
+	@echo "==> Running piccolod on http://localhost:$(RUN_PORT) with a fresh ephemeral state dir"
 	@set -euo pipefail; tmpdir="$$(mktemp -d)"; \
 	  echo "   state dir $$tmpdir"; \
 	  cleanup() { sleep 2; rm -rf "$$tmpdir"; }; \
 	  trap cleanup EXIT; \
-	  PORT=8080 PICCOLO_STATE_DIR="$$tmpdir" ./piccolod
+	  PORT=$(RUN_PORT) PICCOLO_STATE_DIR="$$tmpdir" ./piccolod
 
 release: clean deps typegen ## Produce a clean release build (non-demo)
 	$(MAKE) build DEMO=0
