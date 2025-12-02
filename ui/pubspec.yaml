@@ -7,8 +7,10 @@ environment:
   sdk: ^3.10.1
 
 dependencies:
+  cupertino_icons: ^1.0.8
   flutter:
     sdk: flutter
+  http: ^1.6.0
 
 dev_dependencies:
   flutter_test:

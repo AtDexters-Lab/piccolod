@@ -4,6 +4,7 @@ import 'widgets/stage.dart';
 import 'widgets/top_bar.dart';
 import 'widgets/dock.dart';
 import 'widgets/window_frame.dart';
+import 'features/setup/setup_wizard.dart';
 
 class DesktopShell extends StatefulWidget {
   const DesktopShell({super.key});
@@ -34,62 +35,79 @@ class _DesktopShellState extends State<DesktopShell> {
           body: Stack(
             children: [
               // Layer B: The Stage (Background)
-              const Positioned.fill(
-                child: Stage(),
-              ),
+              const Positioned.fill(child: Stage()),
 
-              // Layer D: Windows
-              ..._controller.windows
-                  .where((w) => !w.isMinimized) // Don't render minimized windows
-                  .map((window) => WindowFrame(
-                    key: ValueKey(window.id),
-                    window: window,
-                    isClosing: window.isClosing,
-                    onClose: () => _controller.closeWindow(window.id),
-                    onMinimize: () => _controller.minimizeWindow(window.id),
-                    onMaximize: () => _controller.maximizeWindow(window.id, screenSize),
-                    onTap: () => _controller.focusWindow(window.id),
-                    onDrag: (newPos) => _controller.moveWindow(window.id, newPos, screenSize),
-                    onResize: (newSize) => _controller.resizeWindow(window.id, newSize),
-                    onAnimationComplete: () => _controller.removeWindowInternal(window.id),
-                  )),
-              
-              // Layer A: Frame (Top Bar)
-              const Positioned(
+              // Layer A: Frame (Top Bar) - Always visible
+              Positioned(
                 top: 0,
                 left: 0,
                 right: 0,
-                child: TopBar(),
+                child: TopBar(controller: _controller),
               ),
 
-              // Layer C: Launcher (Dock)
-              Positioned(
-                bottom: 0,
-                left: 0,
-                right: 0,
-                child: Center(
-                  child: Dock(controller: _controller),
-                ),
-              ),
-              
-              // Launcher Overlay (Example of interacting with state)
-              if (_controller.isLauncherOpen)
+              // If Setup is needed, show Wizard EXCLUSIVELY
+              if (_controller.needsSetup)
                 Positioned.fill(
-                  child: GestureDetector(
-                    onTap: _controller.toggleLauncher, // Close on tap outside
-                    child: Container(
-                      color: Colors.black.withValues(alpha: 0.2),
-                      child: const Center(
-                        child: Card(
-                          child: Padding(
-                            padding: EdgeInsets.all(32.0),
-                            child: Text("App Launcher Overlay"),
+                  child: SetupWizard(onComplete: _controller.completeSetup),
+                )
+              else ...[
+                // Layer D: Windows
+                ..._controller.windows
+                    .where(
+                      (w) => !w.isMinimized,
+                    ) // Don't render minimized windows
+                    .map(
+                      (window) => WindowFrame(
+                        key: ValueKey(window.id),
+                        window: window,
+                        isClosing: window.isClosing,
+                        onClose: () => _controller.closeWindow(window.id),
+                        onMinimize: () => _controller.minimizeWindow(window.id),
+                        onMaximize: () =>
+                            _controller.maximizeWindow(window.id, screenSize),
+                        onTap: () => _controller.focusWindow(window.id),
+                        onDrag: (newPos) => _controller.moveWindow(
+                          window.id,
+                          newPos,
+                          screenSize,
+                        ),
+                        onResize: (newSize) => _controller.resizeWindow(
+                          window.id,
+                          newSize,
+                          screenSize,
+                        ),
+                        onAnimationComplete: () =>
+                            _controller.removeWindowInternal(window.id),
+                      ),
+                    ),
+
+                // Layer C: Launcher (Dock)
+                Positioned(
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  child: Center(child: Dock(controller: _controller)),
+                ),
+
+                // Launcher Overlay (Example of interacting with state)
+                if (_controller.isLauncherOpen)
+                  Positioned.fill(
+                    child: GestureDetector(
+                      onTap: _controller.toggleLauncher, // Close on tap outside
+                      child: Container(
+                        color: Colors.black.withValues(alpha: 0.2),
+                        child: const Center(
+                          child: Card(
+                            child: Padding(
+                              padding: EdgeInsets.all(32.0),
+                              child: Text("App Launcher Overlay"),
+                            ),
                           ),
                         ),
                       ),
                     ),
                   ),
-                ),
+              ],
             ],
           ),
         );

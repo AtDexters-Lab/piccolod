@@ -23,7 +23,7 @@ class _StageState extends State<Stage> with SingleTickerProviderStateMixin {
 
     _topAlignmentAnimation = AlignmentTween(
       begin: const Alignment(-0.8, -0.6), // Start far top-left
-      end: const Alignment(0.8, 0.2),   // End far right-middle
+      end: const Alignment(0.8, 0.2), // End far right-middle
     ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeInOut));
 
     _bottomAlignmentAnimation = AlignmentTween(
@@ -52,9 +52,9 @@ class _StageState extends State<Stage> with SingleTickerProviderStateMixin {
               begin: _topAlignmentAnimation.value,
               end: _bottomAlignmentAnimation.value,
               colors: const [
-                 Color(0xFFF6F8FC),
-                 Color(0xFFE9EEF6),
-                 Color(0xFFE4EAF3),
+                Color(0xFFF6F8FC),
+                Color(0xFFE9EEF6),
+                Color(0xFFE4EAF3),
               ],
               stops: const [0.0, 0.5, 1.0],
             ),

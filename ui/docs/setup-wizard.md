@@ -10,25 +10,63 @@ Guide the user through the initial configuration of their Piccolo node: initiali
 *   **Integration:** Conditionally rendered by `DesktopShell` when `DesktopController.needsSetup` is true. It overlays the entire desktop (Layer D/C) but sits below the Top Bar (Layer A).
 
 ## State Machine
-The flow is linear, managed by `SetupState`:
 
-1.  **Loading:** Checks `/crypto/status` (mocked).
+The flow is managed by `SetupState`:
+
+
+
+1.  **Loading:** Checks `/crypto/status` and `/auth/session`.
+
 2.  **Welcome:**
+
     *   Display: "Hello, [Device Name]".
+
     *   Action: User clicks "Start Setup".
-3.  **Credentials:**
-    *   Input: Password & Confirm Password.
-    *   Features: `AutofillGroup` for password manager support, inline validation.
-    *   Action: Submits to `/crypto/setup` (mocked).
-4.  **Recovery:**
+
+3.  **Credentials (Setup):**
+
+    *   Input: Password & Confirm Password (using `PasswordSetForm` with strength indicator).
+
+    *   Action:
+
+        1.  `/crypto/setup` (Initialize encryption)
+
+        2.  `/crypto/unlock` (Unlock storage)
+
+        3.  `/auth/setup` (Create admin account)
+
+        4.  Generate Recovery Key.
+
+4.  **Unlock / Login:**
+
+    *   States: `unlock` (Device locked) or `login` (Device unlocked but unauthenticated).
+
+    *   Action: Authenticate user and fetch CSRF token.
+
+5.  **Recovery (Reset Password):**
+
+    *   State: `forgotPassword`.
+
+    *   Input: Recovery Key + New Password.
+
+    *   Action: Calls `/crypto/reset-password`.
+
+6.  **Recovery Key Display:**
+
     *   Display: 24-word recovery key.
-    *   Features: "Copy" button, "Download" button (Web-compatible), Mandatory "I have saved this" checkbox.
-    *   Action: User confirms safety -> Setup Complete.
-5.  **Complete:**
+
+    *   Features: "Copy" (WASM-compatible), "Download" (WASM-compatible).
+
+7.  **Complete:**
+
     *   Action: Triggers callback to `DesktopShell` to unlock the full UI.
 
+
+
 ## Key Components
-*   `_WelcomeStep`: Hero text and call to action.
-*   `_CredentialsStep`: Form with validation and loading state.
-*   `_RecoveryStep`: Security-critical step with mandatory user confirmation.
-*   `Downloader`: Utility (`core/utils/downloader`) handling web-based file downloads for the recovery key.
+
+*   `SetupWizard`: Main coordinator widget with Modal Barrier.
+
+*   `PasswordSetForm`: Reusable widget for password entry with validation, visibility toggle, and strength meter.
+
+*   `Downloader` & `Clipboard`: WASM-compatible utilities in `core/utils`.

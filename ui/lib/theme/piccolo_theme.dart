@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
 /// Piccolo OS "Cobalt Neutral" Design System.
-/// 
+///
 /// Mapped from `ui-next/docs/theme-brief.md`.
 class PiccoloTheme {
   // -- Neutrals --
@@ -15,7 +15,7 @@ class PiccoloTheme {
   static const Color cobalt600 = Color(0xFF2F5AF3); // Base / --sys-accent
   static const Color cobalt500 = Color(0xFF3D66FF); // Hover Top
   static const Color cobalt400 = Color(0xFF5F80FF); // Hover Bottom
-  
+
   // -- Semantic --
   static const Color success = Color(0xFF10B981);
   static const Color warning = Color(0xFFF59E0B);
@@ -25,7 +25,7 @@ class PiccoloTheme {
   // -- Text Styles --
   // Note: 'Comfortaa' and 'Inter' need to be added to pubspec.yaml later.
   // For now we use standard system fonts that mimic the weights.
-  
+
   static TextTheme get textTheme => const TextTheme(
     displayLarge: TextStyle(
       fontFamily: 'Comfortaa',
@@ -39,11 +39,7 @@ class PiccoloTheme {
       height: 1.5, // 24px / 16px
       color: ink,
     ),
-    bodyMedium: TextStyle(
-      fontFamily: 'Inter',
-      fontSize: 14,
-      color: ink,
-    ),
+    bodyMedium: TextStyle(fontFamily: 'Inter', fontSize: 14, color: ink),
     labelSmall: TextStyle(
       fontFamily: 'Inter',
       fontSize: 12,
@@ -67,7 +63,7 @@ class PiccoloTheme {
         onError: Colors.white,
         surface: mist,
         onSurface: ink,
-        surfaceContainerHighest: porcelain, 
+        surfaceContainerHighest: porcelain,
       ),
       textTheme: textTheme,
       // Component Themes
@@ -78,6 +74,6 @@ class PiccoloTheme {
       ),
     );
   }
-  
+
   // Dark theme can be added here later mapping to the brief's dark values.
 }

@@ -22,42 +22,64 @@ class Dock extends StatelessWidget {
             offset: const Offset(0, 8),
           ),
         ],
-        border: Border.all(color: Colors.white.withValues(alpha: 0.5), width: 1.5),
+        border: Border.all(
+          color: Colors.white.withValues(alpha: 0.5),
+          width: 1.5,
+        ),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           _DockItem(
-            icon: Icons.grid_view_rounded, 
+            icon: Icons.grid_view_rounded,
             label: "Apps",
             isLauncher: true,
             onTap: controller.toggleLauncher,
           ),
           const SizedBox(width: 16),
-          Container(width: 1, height: 24, color: PiccoloTheme.ink.withValues(alpha: 0.1)), // Separator
+          Container(
+            width: 1,
+            height: 24,
+            color: PiccoloTheme.ink.withValues(alpha: 0.1),
+          ), // Separator
           const SizedBox(width: 16),
           _DockItem(
-            icon: Icons.folder_open_rounded, 
+            icon: Icons.folder_open_rounded,
             label: "Files",
             isOpen: controller.isAppOpen("files"),
             isActive: controller.isAppActive("files"),
-            onTap: () => controller.openApp("files", "Files", Icons.folder_open_rounded, const Center(child: Text("Files App"))),
+            onTap: () => controller.openApp(
+              "files",
+              "Files",
+              Icons.folder_open_rounded,
+              const Center(child: Text("Files App")),
+            ),
           ),
           const SizedBox(width: 12),
           _DockItem(
-            icon: Icons.settings_rounded, 
+            icon: Icons.settings_rounded,
             label: "Settings",
             isOpen: controller.isAppOpen("settings"),
             isActive: controller.isAppActive("settings"),
-            onTap: () => controller.openApp("settings", "Settings", Icons.settings_rounded, const Center(child: Text("Settings App"))),
+            onTap: () => controller.openApp(
+              "settings",
+              "Settings",
+              Icons.settings_rounded,
+              const Center(child: Text("Settings App")),
+            ),
           ),
           const SizedBox(width: 12),
           _DockItem(
-            icon: Icons.terminal_rounded, 
+            icon: Icons.terminal_rounded,
             label: "Terminal",
             isOpen: controller.isAppOpen("terminal"),
             isActive: controller.isAppActive("terminal"),
-            onTap: () => controller.openApp("terminal", "Terminal", Icons.terminal_rounded, const Center(child: Text("Terminal App"))),
+            onTap: () => controller.openApp(
+              "terminal",
+              "Terminal",
+              Icons.terminal_rounded,
+              const Center(child: Text("Terminal App")),
+            ),
           ),
         ],
       ),
@@ -74,8 +96,8 @@ class _DockItem extends StatelessWidget {
   final VoidCallback? onTap;
 
   const _DockItem({
-    required this.icon, 
-    required this.label, 
+    required this.icon,
+    required this.label,
     this.isLauncher = false,
     this.isOpen = false,
     this.isActive = false,
@@ -85,7 +107,7 @@ class _DockItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final color = isLauncher ? PiccoloTheme.cobalt600 : PiccoloTheme.ink;
-    
+
     return Tooltip(
       message: label,
       child: InkWell(
@@ -95,8 +117,8 @@ class _DockItem extends StatelessWidget {
           padding: const EdgeInsets.all(10),
           decoration: BoxDecoration(
             // Active state gets a subtle highlight
-            color: (isLauncher || isActive) 
-                ? PiccoloTheme.cobalt600.withValues(alpha: 0.1) 
+            color: (isLauncher || isActive)
+                ? PiccoloTheme.cobalt600.withValues(alpha: 0.1)
                 : Colors.transparent,
             borderRadius: BorderRadius.circular(12),
           ),

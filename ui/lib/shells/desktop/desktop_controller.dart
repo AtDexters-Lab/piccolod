@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'models/desktop_window.dart';
+import '../../core/services/api_client.dart';
 
 /// Manages the state of the Desktop Shell.
-/// 
+///
 /// Handles:
 /// - Launcher (Dock) visibility/mode.
 /// - Active windows (z-index orchestration).
@@ -14,15 +15,44 @@ class DesktopController extends ChangeNotifier {
   final List<DesktopWindow> _windows = [];
   List<DesktopWindow> get windows => List.unmodifiable(_windows);
 
+  // Setup State
+  bool _needsSetup = true;
+  bool get needsSetup => _needsSetup;
+
+  void completeSetup() {
+    _needsSetup = false;
+    notifyListeners();
+
+    // Open a welcome window
+    openApp(
+      "welcome",
+      "Welcome",
+      Icons.waving_hand,
+      const Center(child: Text("Welcome to Piccolo OS!")),
+    );
+  }
+
+  Future<void> logout() async {
+    try {
+      await ApiClient().post('/api/v1/auth/logout');
+    } catch (e) {
+      debugPrint("Logout failed: $e");
+    }
+    // Force UI back to SetupWizard (which will detect unauthenticated state and show Login)
+    _needsSetup = true;
+    _windows.clear(); // Clean up windows
+    notifyListeners();
+  }
+
   // Helper for Dock to know state
   bool isAppOpen(String id) => _windows.any((w) => w.id == id);
-  
+
   bool isAppActive(String id) {
     if (_windows.isEmpty) return false;
     final topWindow = _windows.last;
     return topWindow.id == id && !topWindow.isMinimized;
   }
-  
+
   bool isAppMinimized(String id) {
     final index = _windows.indexWhere((w) => w.id == id);
     if (index == -1) return false;
@@ -36,7 +66,7 @@ class DesktopController extends ChangeNotifier {
 
   void openApp(String appId, String title, IconData icon, Widget content) {
     final existingIndex = _windows.indexWhere((w) => w.id == appId);
-    
+
     if (existingIndex != -1) {
       final window = _windows[existingIndex];
       // If it's the top-most active window, minimize it (Windows-style toggle)
@@ -54,7 +84,7 @@ class DesktopController extends ChangeNotifier {
 
     // Basic cascade positioning logic
     final offset = _windows.length * 30.0;
-    
+
     final newWindow = DesktopWindow(
       id: appId,
       title: title,
@@ -73,12 +103,12 @@ class DesktopController extends ChangeNotifier {
       // Mark as closing to trigger UI animation
       _windows[index].isClosing = true;
       notifyListeners();
-      
+
       // Actual removal is now triggered by the UI callback 'onAnimationComplete'
       // Or we can set a timer here as a fallback, but UI callback is cleaner.
     }
   }
-  
+
   void removeWindowInternal(String id) {
     _windows.removeWhere((w) => w.id == id);
     notifyListeners();
@@ -94,7 +124,7 @@ class DesktopController extends ChangeNotifier {
       notifyListeners();
     }
   }
-  
+
   void minimizeWindow(String id) {
     final index = _windows.indexWhere((w) => w.id == id);
     if (index != -1) {
@@ -105,10 +135,11 @@ class DesktopController extends ChangeNotifier {
 
   void maximizeWindow(String id, Size availableSpace) {
     final window = _windows.firstWhere((w) => w.id == id);
-    
+
     if (window.isMaximized) {
       // Restore
-      if (window.preMaximizePosition != null && window.preMaximizeSize != null) {
+      if (window.preMaximizePosition != null &&
+          window.preMaximizeSize != null) {
         window.position = window.preMaximizePosition!;
         window.size = window.preMaximizeSize!;
       }
@@ -118,20 +149,20 @@ class DesktopController extends ChangeNotifier {
       // Save state
       window.preMaximizePosition = window.position;
       window.preMaximizeSize = window.size;
-      
+
       // Apply max dimensions
       // Respecting TopBar (48) and roughly the Dock area (bottom 90)
       const double topOffset = 48.0;
       const double bottomReserve = 90.0;
-      
+
       window.position = const Offset(0, topOffset);
       window.size = Size(
-        availableSpace.width, 
-        availableSpace.height - topOffset - bottomReserve
+        availableSpace.width,
+        availableSpace.height - topOffset - bottomReserve,
       );
-      
+
       window.isMaximized = true;
-      
+
       // Also bring to front
       focusWindow(id);
     }
@@ -140,17 +171,18 @@ class DesktopController extends ChangeNotifier {
 
   void moveWindow(String id, Offset newPosition, Size screenSize) {
     final window = _windows.firstWhere((w) => w.id == id);
-    
-    // If maximized, dragging typically restores it. 
-    // For simplicity in this iteration, disable dragging if maximized 
-    // OR we could implement "snap out of maximize" logic. 
+
+    // If maximized, dragging typically restores it.
+    // For simplicity in this iteration, disable dragging if maximized
+    // OR we could implement "snap out of maximize" logic.
     // Let's lock it for now.
     if (window.isMaximized) return;
-    
+
     // Constants for constraints
     const double topBarHeight = 48.0;
     const double minVisibleWidth = 50.0;
-    const double minVisibleHeight = 30.0; // Minimal title bar visibility at bottom
+    const double minVisibleHeight =
+        30.0; // Minimal title bar visibility at bottom
 
     double x = newPosition.dx;
     double y = newPosition.dy;
@@ -182,19 +214,29 @@ class DesktopController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void resizeWindow(String id, Size newSize) {
+  void resizeWindow(String id, Size newSize, Size screenSize) {
     final window = _windows.firstWhere((w) => w.id == id);
-    
+
     if (window.isMaximized) return;
 
     const double minWidth = 300.0;
     const double minHeight = 200.0;
 
+    // Calculate maximum allowed dimensions based on current position
+    // This ensures the bottom-right corner never leaves the screen
+    final double maxWidth = screenSize.width - window.position.dx;
+    final double maxHeight = screenSize.height - window.position.dy;
+
     double w = newSize.width;
     double h = newSize.height;
 
+    // 1. Clamp to Minimums
     if (w < minWidth) w = minWidth;
     if (h < minHeight) h = minHeight;
+
+    // 2. Clamp to Maximums (Screen Bounds)
+    if (w > maxWidth) w = maxWidth;
+    if (h > maxHeight) h = maxHeight;
 
     window.size = Size(w, h);
     notifyListeners();

@@ -6,11 +6,7 @@ class PiccoloWordmark extends StatelessWidget {
   final double height;
   final Color color;
 
-  const PiccoloWordmark({
-    super.key,
-    this.height = 24,
-    required this.color,
-  });
+  const PiccoloWordmark({super.key, this.height = 24, required this.color});
 
   @override
   Widget build(BuildContext context) {
@@ -20,9 +16,7 @@ class PiccoloWordmark extends StatelessWidget {
     return SizedBox(
       width: width,
       height: height,
-      child: CustomPaint(
-        painter: _PiccoloWordmarkPainter(color),
-      ),
+      child: CustomPaint(painter: _PiccoloWordmarkPainter(color)),
     );
   }
 }

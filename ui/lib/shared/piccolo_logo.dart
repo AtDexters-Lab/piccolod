@@ -6,20 +6,14 @@ class PiccoloLogo extends StatelessWidget {
   final double size;
   final Color color;
 
-  const PiccoloLogo({
-    super.key,
-    this.size = 24,
-    required this.color,
-  });
+  const PiccoloLogo({super.key, this.size = 24, required this.color});
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
       width: size,
       height: size,
-      child: CustomPaint(
-        painter: _PiccoloLogoPainter(color),
-      ),
+      child: CustomPaint(painter: _PiccoloLogoPainter(color)),
     );
   }
 }
@@ -34,9 +28,9 @@ class _PiccoloLogoPainter extends CustomPainter {
     // The original viewbox is roughly 0 0 399 399.
     // We scale it to fit 'size'.
     final double scale = size.width / 399.0;
-    
+
     canvas.scale(scale, scale);
-    
+
     final paint = Paint()
       ..color = color
       ..style = PaintingStyle.fill;
@@ -45,7 +39,7 @@ class _PiccoloLogoPainter extends CustomPainter {
     // The SVG group has transform="translate(95 -45)".
     // We need to apply this translation or adjust the path.
     // Since I cannot easily re-calculate the path points, I will apply the translation to the canvas.
-    
+
     canvas.translate(95, -45);
 
     final path = Path();
@@ -69,7 +63,7 @@ class _PiccoloLogoPainter extends CustomPainter {
     path.cubicTo(36.1412, 386.159, 34.4389, 390.483, 31.0343, 393.89);
     path.cubicTo(27.8916, 397.297, 23.5704, 399, 18.0706, 399);
     path.close();
-    
+
     path.moveTo(108.424, 276.352);
     path.cubicTo(122.304, 276.352, 134.744, 273.076, 145.743, 266.524);
     path.cubicTo(157.005, 259.71, 165.778, 250.538, 172.064, 239.007);

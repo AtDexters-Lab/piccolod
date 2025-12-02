@@ -5,15 +5,15 @@ class DesktopWindow {
   final String title;
   final Widget child;
   final IconData icon;
-  
+
   // Mutable state managed by the controller
   Offset position;
   Size size;
-  
+
   bool isMinimized;
   bool isMaximized;
   bool isClosing; // For animation
-  
+
   // Restore state
   Offset? preMaximizePosition;
   Size? preMaximizeSize;

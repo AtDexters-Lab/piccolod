@@ -1,9 +1,12 @@
 import 'package:flutter/material.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../../../shared/piccolo_wordmark.dart';
+import '../desktop_controller.dart';
 
 class TopBar extends StatelessWidget {
-  const TopBar({super.key});
+  final DesktopController? controller;
+
+  const TopBar({super.key, this.controller});
 
   @override
   Widget build(BuildContext context) {
@@ -18,9 +21,9 @@ class TopBar extends StatelessWidget {
             height: 18, // Slightly smaller to fit nicely in 48px bar
             color: PiccoloTheme.ink,
           ),
-          
+
           const SizedBox(width: 32),
-          
+
           // -- Global Search --
           IconButton(
             icon: const Icon(Icons.search, color: PiccoloTheme.ink, size: 20),
@@ -30,17 +33,43 @@ class TopBar extends StatelessWidget {
           ),
 
           const Spacer(),
-          
+
           // -- Trailing: System Health / User --
-          _SystemStatusChip(
+          const _SystemStatusChip(
             label: "Healthy",
             color: PiccoloTheme.success,
           ),
           const SizedBox(width: 16),
-          const CircleAvatar(
-            radius: 14,
-            backgroundColor: PiccoloTheme.cobalt600,
-            child: Text("A", style: TextStyle(color: Colors.white, fontSize: 12)),
+          PopupMenuButton<String>(
+            offset: const Offset(0, 40),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'logout',
+                child: Row(
+                  children: [
+                    Icon(Icons.logout, size: 18, color: PiccoloTheme.ink),
+                    SizedBox(width: 12),
+                    Text("Log Out"),
+                  ],
+                ),
+              ),
+            ],
+            onSelected: (value) {
+              if (value == 'logout') {
+                controller?.logout();
+              }
+            },
+            child: const CircleAvatar(
+              radius: 14,
+              backgroundColor: PiccoloTheme.cobalt600,
+              child: Text(
+                "A",
+                style: TextStyle(color: Colors.white, fontSize: 12),
+              ),
+            ),
           ),
         ],
       ),

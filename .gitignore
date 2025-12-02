@@ -9,6 +9,7 @@ web-src/test-results/
 web-src/web-src/test-results/
 web-src/playwright-report/
 test-results
+.run-state
 
 02_product
 artifacts

@@ -29,6 +29,9 @@ func (s *GinServer) corsMiddleware() gin.HandlerFunc {
 				// o now 'host[:port]'
 				if o == reqHost {
 					allow = true
+				} else if (strings.HasPrefix(o, "localhost") || strings.HasPrefix(o, "127.0.0.1")) && (strings.HasPrefix(reqHost, "localhost") || strings.HasPrefix(reqHost, "127.0.0.1")) {
+					// Allow cross-port localhost for dev
+					allow = true
 				}
 			}
 		}
@@ -70,6 +73,10 @@ func (s *GinServer) securityHeadersMiddleware() gin.HandlerFunc {
 			c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
 		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		// COOP/COEP headers required for Flutter WASM / SharedArrayBuffer
+		c.Header("Cross-Origin-Opener-Policy", "same-origin")
+		c.Header("Cross-Origin-Embedder-Policy", "require-corp")
 
 		// API identification
 		c.Header("X-Powered-By", "Piccolo OS")

@@ -30,7 +30,8 @@ class WindowFrame extends StatefulWidget {
   State<WindowFrame> createState() => _WindowFrameState();
 }
 
-class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStateMixin {
+class _WindowFrameState extends State<WindowFrame>
+    with SingleTickerProviderStateMixin {
   bool _isHoveringHeader = false;
   late AnimationController _entryController;
   late Animation<double> _scaleAnimation;
@@ -43,7 +44,7 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
       vsync: this,
       duration: const Duration(milliseconds: 200),
     );
-    
+
     _entryController.addStatusListener((status) {
       // Use widget.isClosing here to confirm intent
       if (status == AnimationStatus.dismissed && widget.isClosing) {
@@ -51,17 +52,19 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
       }
     });
 
-    _scaleAnimation = Tween<double>(begin: 0.9, end: 1.0).animate(
-      CurvedAnimation(parent: _entryController, curve: Curves.easeOut),
-    );
-    _opacityAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
-      CurvedAnimation(parent: _entryController, curve: Curves.easeOut),
-    );
-    
+    _scaleAnimation = Tween<double>(
+      begin: 0.9,
+      end: 1.0,
+    ).animate(CurvedAnimation(parent: _entryController, curve: Curves.easeOut));
+    _opacityAnimation = Tween<double>(
+      begin: 0.0,
+      end: 1.0,
+    ).animate(CurvedAnimation(parent: _entryController, curve: Curves.easeOut));
+
     // Start open animation
     _entryController.forward();
   }
-  
+
   @override
   void didUpdateWidget(WindowFrame oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -80,7 +83,8 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
   @override
   Widget build(BuildContext context) {
     // If minimized, we shouldn't be here (filtered by Shell), but safe to return empty.
-    if (widget.window.isMinimized && !widget.isClosing) return const SizedBox.shrink();
+    if (widget.window.isMinimized && !widget.isClosing)
+      return const SizedBox.shrink();
 
     return Positioned(
       left: widget.window.position.dx,
@@ -90,10 +94,7 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
         builder: (context, child) {
           return Transform.scale(
             scale: _scaleAnimation.value,
-            child: Opacity(
-              opacity: _opacityAnimation.value,
-              child: child,
-            ),
+            child: Opacity(opacity: _opacityAnimation.value, child: child),
           );
         },
         child: GestureDetector(
@@ -108,7 +109,9 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
                 height: widget.window.size.height,
                 decoration: BoxDecoration(
                   color: PiccoloTheme.porcelain,
-                  borderRadius: BorderRadius.circular(widget.window.isMaximized ? 0 : 14),
+                  borderRadius: BorderRadius.circular(
+                    widget.window.isMaximized ? 0 : 14,
+                  ),
                   boxShadow: [
                     BoxShadow(
                       color: const Color(0xFF0E1322).withValues(alpha: 0.12),
@@ -142,7 +145,9 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
                           decoration: BoxDecoration(
                             color: Colors.transparent,
                             borderRadius: BorderRadius.vertical(
-                              top: Radius.circular(widget.window.isMaximized ? 0 : 14)
+                              top: Radius.circular(
+                                widget.window.isMaximized ? 0 : 14,
+                              ),
                             ),
                           ),
                           padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -165,13 +170,15 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
                               const SizedBox(width: 8),
                               _WindowCaptionButton(
                                 color: PiccoloTheme.success,
-                                icon: widget.window.isMaximized ? Icons.filter_none : Icons.crop_square, 
+                                icon: widget.window.isMaximized
+                                    ? Icons.filter_none
+                                    : Icons.crop_square,
                                 isHoveringWindow: _isHoveringHeader,
                                 onTap: widget.onMaximize,
                               ),
-                              
+
                               const SizedBox(width: 16),
-                              
+
                               // Title Area - Double Tap to Maximize lives here
                               Expanded(
                                 child: GestureDetector(
@@ -183,9 +190,10 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
                                       alignment: Alignment.centerLeft,
                                       child: Text(
                                         widget.window.title,
-                                        style: PiccoloTheme.textTheme.labelSmall?.copyWith(
-                                          fontWeight: FontWeight.w600,
-                                        ),
+                                        style: PiccoloTheme.textTheme.labelSmall
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w600,
+                                            ),
                                       ),
                                     ),
                                   ),
@@ -196,12 +204,14 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
                         ),
                       ),
                     ),
-                    
+
                     // -- App Content --
                     Expanded(
                       child: ClipRRect(
                         borderRadius: BorderRadius.vertical(
-                          bottom: Radius.circular(widget.window.isMaximized ? 0 : 14)
+                          bottom: Radius.circular(
+                            widget.window.isMaximized ? 0 : 14,
+                          ),
                         ),
                         child: widget.window.child,
                       ),
@@ -209,7 +219,7 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
                   ],
                 ),
               ),
-              
+
               // -- Resize Handle (Bottom Right) --
               if (!widget.window.isMaximized)
                 Positioned(
@@ -217,10 +227,12 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
                   bottom: 0,
                   child: GestureDetector(
                     onPanUpdate: (details) {
-                      widget.onResize(Size(
-                        widget.window.size.width + details.delta.dx,
-                        widget.window.size.height + details.delta.dy,
-                      ));
+                      widget.onResize(
+                        Size(
+                          widget.window.size.width + details.delta.dx,
+                          widget.window.size.height + details.delta.dy,
+                        ),
+                      );
                     },
                     child: MouseRegion(
                       cursor: SystemMouseCursors.resizeDownRight,
@@ -236,7 +248,9 @@ class _WindowFrameState extends State<WindowFrame> with SingleTickerProviderStat
                             margin: const EdgeInsets.all(4),
                             decoration: BoxDecoration(
                               color: PiccoloTheme.ink.withValues(alpha: 0.2),
-                              borderRadius: const BorderRadius.only(topLeft: Radius.circular(4)),
+                              borderRadius: const BorderRadius.only(
+                                topLeft: Radius.circular(4),
+                              ),
                             ),
                           ),
                         ),
