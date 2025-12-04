@@ -56,6 +56,7 @@ type osUpdateManager interface {
 	Status(context.Context) (update.Status, error)
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
+	Reboot(context.Context) error
 }
 
 // GinServer holds all the core components for our application using Gin framework.
@@ -446,7 +447,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Update manager (MicroOS transactional-update)
 	if s.updateManager == nil {
-		um, err := update.NewManager()
+		um, err := update.NewManager(update.WithCurrentVersion(s.version))
 		if err != nil {
 			return nil, fmt.Errorf("update manager init: %w", err)
 		}
@@ -566,7 +567,6 @@ func (s *GinServer) setupGinRoutes() {
 		v1.POST("/auth/setup", s.handleAuthSetup)
 
 		// Selected read-only status endpoints remain public
-		v1.GET("/updates/os", s.handleOSUpdateStatus)
 		v1.GET("/remote/status", s.handleRemoteStatus)
 		v1.GET("/storage/disks", s.handleStorageDisks)
 		v1.GET("/health/live", s.handleHealthLive)
@@ -630,8 +630,10 @@ func (s *GinServer) setupGinRoutes() {
 		authed.GET("/auth/csrf", s.handleAuthCSRF)
 
 		// OS updates
+		authed.GET("/updates/os", s.handleOSUpdateStatus)
 		authed.POST("/updates/os/apply", s.requireUnlocked(), s.handleOSUpdateApply)
 		authed.POST("/updates/os/rollback", s.requireUnlocked(), s.handleOSUpdateRollback)
+		authed.POST("/updates/os/reboot", s.requireUnlocked(), s.handleOSUpdateReboot)
 
 		// Catalog (read-only) and services require auth
 		authed.GET("/catalog", s.handleGinCatalog)

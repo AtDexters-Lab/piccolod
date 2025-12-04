@@ -393,6 +393,8 @@ paths:
   /updates/os:
     get:
       summary: OS update status
+      security:
+        - cookieAuth: []
       responses:
         '200':
           description: OK
@@ -436,6 +438,15 @@ paths:
         '429': { description: Too Many Requests (update already running), headers: { Retry-After: { schema: { type: integer } } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
         '501': { description: Not Implemented (unsupported platform), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
         '504': { description: Gateway Timeout (transactional-update timed out), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '500': { description: Internal Server Error, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+  /updates/os/reboot:
+    post:
+      summary: Trigger system reboot
+      security:
+        - cookieAuth: []
+        - csrfToken: []
+      responses:
+        '200': { description: OK }
         '500': { description: Internal Server Error, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
   /updates/apps:
     get:

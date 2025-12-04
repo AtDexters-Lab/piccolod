@@ -99,13 +99,23 @@ request_reboot() {
   fi
 }
 
-ensure_gocryptfs() {
-  if ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "command -v gocryptfs >/dev/null 2>&1"; then
+ensure_gocryptfs_and_piccolod() {
+  if ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "rpm -q gocryptfs piccolod >/dev/null 2>&1"; then
     return
   fi
-  log "Installing gocryptfs via transactional-update (requires reboot)"
-  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "transactional-update -n pkg install gocryptfs" >/dev/null
-  log "Rebooting to apply gocryptfs"
+  log "Adding Piccolo OS repository..."
+  # -G disables GPG check for the repository permanently
+  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" \
+    "zypper ar -G -f https://download.opensuse.org/repositories/home:/abhishekborar93:/piccolo-os/openSUSE_Tumbleweed/home:abhishekborar93:piccolo-os.repo" >/dev/null
+
+  log "Installing gocryptfs and piccolo-os-support via transactional-update (requires reboot)"
+  # We use -n (non-interactive) and accept keys implicitly via repo setup or zypper flags if needed,
+  # but Tumbleweed might prompt for new repo keys.
+  # Let's try installing with --no-recommends to keep it slim.
+  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" \
+    "transactional-update -n pkg install --no-recommends gocryptfs piccolo-os-support" >/dev/null
+
+  log "Rebooting to apply changes"
   request_reboot
   sleep 5
   wait_for_ssh
@@ -130,8 +140,14 @@ wait_for_shutdown() {
 
 QEMU_NETDEV="user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
 QEMU_DISPLAY="-display sdl"; [ "$HEADLESS" = "1" ] && QEMU_DISPLAY="-display none"
+QEMU_ACCEL=""
+if [ -c /dev/kvm ]; then
+  QEMU_ACCEL="-cpu host -enable-kvm"
+fi
+
 log "Starting MicroOS prep VM (ssh port $SSH_PORT, cpus $MICROOS_VM_CPUS, ram ${MICROOS_VM_RAM}MB)"
 qemu-system-x86_64 \
+  $QEMU_ACCEL \
   -smp "$MICROOS_VM_CPUS" -m "$MICROOS_VM_RAM" \
   -drive if=virtio,file="$QCOW_WORK",format=qcow2 \
   -drive if=virtio,file="$IGNITION_ISO",format=raw \
@@ -142,7 +158,7 @@ qemu-system-x86_64 \
   -daemonize
 
 wait_for_ssh
-ensure_gocryptfs
+ensure_gocryptfs_and_piccolod
 persist_cache_key
 
 log "Powering off VM to finalize cached image"

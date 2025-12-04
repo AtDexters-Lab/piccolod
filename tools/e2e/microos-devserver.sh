@@ -104,8 +104,14 @@ mkisofs -quiet -o "$IGNITION_ISO" -V ignition -J -r "$ISO_ROOT"
 
 QEMU_NETDEV="user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${HOST_API_PORT}-:${API_PORT}"
 QEMU_DISPLAY="-display sdl"; [ "$HEADLESS" = "1" ] && QEMU_DISPLAY="-display none"
+QEMU_ACCEL=""
+if [ -c /dev/kvm ]; then
+  QEMU_ACCEL="-cpu host -enable-kvm"
+fi
+
 log "Starting devserver VM (ssh $SSH_PORT, api $HOST_API_PORT -> $API_PORT, cpus $MICROOS_VM_CPUS, ram ${MICROOS_VM_RAM}MB)"
 qemu-system-x86_64 \
+  $QEMU_ACCEL \
   -smp "$MICROOS_VM_CPUS" -m "$MICROOS_VM_RAM" \
   -drive if=virtio,file="$QCOW_WORK",format=qcow2 \
   -drive if=virtio,file="$IGNITION_ISO",format=raw \
@@ -147,30 +153,62 @@ install_piccolod() {
     (cd "$ROOT_DIR" && go build ./cmd/piccolod)
   fi
   scp -i "$SSH_KEY" $SSH_OPTS -P "$SSH_PORT" "$PICCOLOD_BIN" "$SSH_USER@127.0.0.1:/tmp/piccolod" >/dev/null
+  # Install to /usr/local/bin (writable) since /usr/bin is read-only on MicroOS
   ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "install -m 0755 /tmp/piccolod /usr/local/bin/piccolod && rm -f /tmp/piccolod && (command -v restorecon >/dev/null && restorecon /usr/local/bin/piccolod || true)" >/dev/null
 }
 
 start_piccolod() {
-  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "systemd-run --unit=piccolod --collect --setenv=PORT=${API_PORT} /usr/local/bin/piccolod >/root/piccolod.log 2>&1" >/dev/null
+  # Override the piccolod service to use our port and our custom binary in /usr/local/bin
+  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "mkdir -p /etc/systemd/system/piccolod.service.d && printf '[Service]\nEnvironment=PORT=${API_PORT}\nExecStart=\nExecStart=/usr/local/bin/piccolod\n' > /etc/systemd/system/piccolod.service.d/devserver.conf && systemctl daemon-reload && systemctl restart piccolod" >/dev/null
 }
 
 wait_for_api() {
   log "Waiting for piccolod API..."
   for _ in $(seq 1 30); do
-    if curl -sf "http://127.0.0.1:${HOST_API_PORT}/api/v1/updates/os" >/dev/null 2>&1; then return; fi
-    if ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "curl -sf http://127.0.0.1:${API_PORT}/api/v1/updates/os" >/dev/null 2>&1; then return; fi
+    if curl -sf "http://127.0.0.1:${HOST_API_PORT}/api/v1/health/live" >/dev/null 2>&1; then return; fi
+    if ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "curl -sf http://127.0.0.1:${API_PORT}/api/v1/health/live" >/dev/null 2>&1; then return; fi
     sleep 2
   done
   log "piccolod API not responding"; exit 1
 }
 
-ensure_gocryptfs() {
-  if ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "command -v gocryptfs >/dev/null 2>&1"; then
+configure_repos() {
+  # Optional: Use local mirror for speed
+  LOCAL_MIRROR=${LOCAL_OSS_MIRROR:-"http://192.168.0.100:8888/oss/"}
+  
+  if [ -z "$LOCAL_MIRROR" ]; then
     return
   fi
-  log "Installing gocryptfs via transactional-update (requires reboot)"
-  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "transactional-update -n pkg install gocryptfs" >/dev/null
-  log "Rebooting to apply gocryptfs"
+
+  # Verify connectivity from the VM before messing with repos
+  if ! ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" \
+       "curl --head --fail --silent --max-time 2 '$LOCAL_MIRROR'" >/dev/null 2>&1; then
+     log "Local mirror $LOCAL_MIRROR not reachable from VM; keeping default repositories."
+     return
+  fi
+
+  # Check if already configured to avoid re-running
+  if ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "zypper lr local-oss >/dev/null 2>&1"; then
+    return
+  fi
+
+  log "Configuring local OSS mirror: $LOCAL_MIRROR"
+  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" \
+    "zypper mr -d openSUSE-Tumbleweed-Oss repo-oss repo-non-oss && zypper ar -G -f '$LOCAL_MIRROR' local-oss" || true
+}
+
+ensure_gocryptfs() {
+  if ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "rpm -q gocryptfs piccolod >/dev/null 2>&1"; then
+    return
+  fi
+  log "Adding Piccolo OS repository..."
+  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" \
+    "zypper ar -G -f https://download.opensuse.org/repositories/home:/abhishekborar93:/piccolo-os/openSUSE_Tumbleweed/home:abhishekborar93:piccolo-os.repo" >/dev/null
+
+  log "Installing gocryptfs and piccolod via transactional-update (requires reboot)"
+  ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "transactional-update -n pkg install --no-recommends --no-gpg-checks gocryptfs piccolod" >/dev/null
+
+  log "Rebooting to apply changes"
   ssh -i "$SSH_KEY" $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@127.0.0.1" "reboot" >/dev/null || true
   sleep 5
   wait_for_ssh
@@ -206,6 +244,7 @@ require_login() {
 
 wait_for_ssh
 ensure_gocryptfs
+configure_repos
 install_piccolod
 start_piccolod
 wait_for_api

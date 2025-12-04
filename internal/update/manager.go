@@ -52,15 +52,18 @@ type osBackend interface {
 	Status(context.Context) (Status, error)
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
+	Reboot(context.Context) error
 }
 
 // microOSBackend interacts with MicroOS transactional-update to report and apply updates.
 type microOSBackend struct {
-	runner     commandRunner
-	clock      func() time.Time
-	timeout    time.Duration
-	runtimeDir string
-	statePath  string
+	runner         commandRunner
+	clock          func() time.Time
+	timeout        time.Duration
+	runtimeDir     string
+	statePath      string
+	readFile       func(string) ([]byte, error)
+	currentVersion string
 
 	mu              sync.Mutex
 	supported       bool
@@ -94,6 +97,16 @@ func WithSupportOverride(supported bool) Option {
 	return func(m *microOSBackend) { m.overrideSupport = supported }
 }
 
+// WithReadFile injects a file reader (used in tests).
+func WithReadFile(f func(string) ([]byte, error)) Option {
+	return func(m *microOSBackend) { m.readFile = f }
+}
+
+// WithCurrentVersion injects the running application version string.
+func WithCurrentVersion(v string) Option {
+	return func(m *microOSBackend) { m.currentVersion = v }
+}
+
 // NewManager constructs a Manager with an OS backend (MicroOS today).
 func NewManager(opts ...Option) (*Manager, error) {
 	b, err := newMicroOSBackend(opts...)
@@ -114,6 +127,11 @@ func (m *Manager) Rollback(ctx context.Context, targetID string) error {
 	return m.backend.Rollback(ctx, targetID)
 }
 
+// Reboot triggers a system reboot.
+func (m *Manager) Reboot(ctx context.Context) error {
+	return m.backend.Reboot(ctx)
+}
+
 // newMicroOSBackend constructs the MicroOS implementation.
 func newMicroOSBackend(opts ...Option) (*microOSBackend, error) {
 	timeout := defaultTimeout
@@ -129,6 +147,7 @@ func newMicroOSBackend(opts ...Option) (*microOSBackend, error) {
 		timeout:    timeout,
 		runtimeDir: defaultRuntimeDir,
 		statePath:  filepath.Join(paths.Root(), defaultStateSubdir, defaultStateFilename),
+		readFile:   os.ReadFile,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -199,6 +218,17 @@ func (m *microOSBackend) Rollback(ctx context.Context, targetID string) error {
 	return m.runTransactionalUpdate(ctx, []string{"transactional-update", "rollback", targetID}, "rollback", targetID, false)
 }
 
+// Reboot triggers systemctl reboot.
+func (m *microOSBackend) Reboot(ctx context.Context) error {
+	if !m.supported {
+		return ErrUnsupported
+	}
+	// We use the runner to execute reboot. Note that this will likely terminate the API server
+	// before the command returns or shortly after.
+	_, _, _, err := m.runner.Run(ctx, "systemctl", "reboot")
+	return err
+}
+
 // ---- internals ----
 
 type commandRunner interface {
@@ -257,7 +287,9 @@ func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
 	meta["supported"] = true
 
 	activeID, activeSrc := m.activeSnapshot(ctx)
-	defaultID := m.defaultSnapshot(ctx)
+	rawDefaultID := m.defaultSnapshot(ctx)
+	defaultID := m.snapperNumberFromID(ctx, rawDefaultID)
+
 	meta["active_snapshot_source"] = activeSrc
 	meta["active_snapshot_id"] = activeID
 	meta["default_snapshot_id"] = defaultID
@@ -299,16 +331,54 @@ func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
 	}
 
 	intent := m.loadState()
+	derived := ""
 	if intent != nil {
 		meta["last_request"] = intent
-		meta["derived_outcome"] = m.deriveOutcome(activeID, defaultID, intent)
+		derived = m.deriveOutcome(activeID, defaultID, intent)
+	}
+	if derived == "" && defaultID != "" && activeID != "" && defaultID != activeID {
+		// Fallback: if we have no record of the request but the system effectively
+		// has a pending update (default != active), report it.
+		derived = "pending-reboot"
+	}
+	if derived != "" {
+		meta["derived_outcome"] = derived
 	}
 
 	pending := stagedID != ""
-	currentVersion := humanSnapshotLabel(activeID, snapshots)
+
+	// Strategy: "Piccolo OS" version is the piccolod RPM version.
+	// Fallback to underlying OS version (os-release) only if RPM is not installed (e.g. dev).
+	osVersion := m.getOSReleaseVersion("")
+	meta["os_version"] = osVersion
+
+	currentVersion := m.currentVersion
+	if currentVersion == "" {
+		currentVersion = activePiccolo
+	}
+	if currentVersion == "" {
+		currentVersion = osVersion
+	}
+	if currentVersion == "" {
+		currentVersion = humanSnapshotLabel(activeID, snapshots)
+	}
+
 	availableVersion := currentVersion
 	if stagedID != "" {
-		availableVersion = humanSnapshotLabel(stagedID, snapshots)
+		// If we have a staged RPM, that's the new version.
+		if stagedV := meta["piccolod_staged"]; stagedV != nil {
+			availableVersion = stagedV.(string)
+		} else if activePiccolo == "" {
+			// Fallback path: if no RPM, check staged OS version
+			stagedRoot := filepath.Join("/.snapshots", stagedID, "snapshot")
+			if vStaged := m.getOSReleaseVersion(stagedRoot); vStaged != "" {
+				availableVersion = vStaged
+			} else {
+				// If OS version string is missing/empty, append system update ID to current app version
+				// so it doesn't look like a downgrade or weird number (e.g. "269").
+				availableVersion = fmt.Sprintf("%s (System Update %s)", currentVersion, stagedID)
+			}
+		}
 	}
 
 	return Status{
@@ -319,6 +389,31 @@ func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
 		LastChecked:      m.clock(),
 		Meta:             meta,
 	}, nil
+}
+
+func (m *microOSBackend) getOSReleaseVersion(root string) string {
+	path := filepath.Join(root, "etc", "os-release")
+	if root == "" {
+		path = "/etc/os-release"
+	}
+	data, err := m.readFile(path)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(data), "\n")
+	var prettyName, versionID string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "VERSION_ID=") {
+			versionID = strings.Trim(strings.TrimPrefix(line, "VERSION_ID="), `"`)
+		}
+		if strings.HasPrefix(line, "PRETTY_NAME=") {
+			prettyName = strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), `"`)
+		}
+	}
+	if versionID != "" {
+		return versionID
+	}
+	return prettyName
 }
 
 func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []string, action string, targetHint string, wait bool) error {
@@ -399,7 +494,7 @@ func (m *microOSBackend) isInProgress(ctx context.Context) bool {
 	}
 
 	// Check for any running piccolo-tu-* transient units
-	stdout, _, _, _ := m.runner.Run(ctx, "systemctl", "list-units", "--type=service", "--state=running", "piccolo-tu-*")
+	stdout, _, _, _ := m.runner.Run(ctx, "systemctl", "list-units", "--type=service", "--state=running", "--no-legend", "--plain", "piccolo-tu-*")
 	if strings.TrimSpace(stdout) != "" {
 		return true
 	}
@@ -450,6 +545,24 @@ func (m *microOSBackend) deriveOutcome(activeID, defaultID string, ps *persisted
 	return "not-applied"
 }
 
+func (m *microOSBackend) snapperNumberFromID(ctx context.Context, id string) string {
+	// btrfs subvolume list output example:
+	// ID 269 gen 59 top level 257 path @/.snapshots/2/snapshot
+	stdout, _, _, err := m.runner.Run(ctx, "btrfs", "subvolume", "list", "/")
+	if err != nil {
+		return id // fallback
+	}
+	lines := strings.Split(stdout, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, fmt.Sprintf("ID %s ", id)) {
+			// Found the ID, now extract path
+			// path @/.snapshots/2/snapshot
+			return snapshotIDFromPath(line)
+		}
+	}
+	return id
+}
+
 func (m *microOSBackend) activeSnapshot(ctx context.Context) (string, string) {
 	stdout, _, _, err := m.runner.Run(ctx, "findmnt", "-no", "SOURCE", "/")
 	if err != nil {
@@ -485,36 +598,49 @@ func (m *microOSBackend) snapperSnapshots(ctx context.Context) map[string]snapsh
 	if err != nil {
 		return map[string]snapshotInfo{}
 	}
-	var payload struct {
-		Configs []struct {
-			Config    string `json:"config"`
-			Snapshots []struct {
-				Number      int    `json:"number"`
-				Date        string `json:"date"`
-				Description string `json:"description"`
-				Type        string `json:"type"`
-			} `json:"snapshots"`
-		} `json:"configs"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
-		return map[string]snapshotInfo{}
-	}
 
+	// Tumbleweed snapper returns: { "root": [ { "number": 0, ... } ] }
+	// Older/Other versions might return: { "configs": [ { "config": "root", "snapshots": ... } ] }
+	// We try to decode into a generic map to support the observed format first.
+	var simpleFormat map[string][]struct {
+		Number      int    `json:"number"`
+		Date        string `json:"date"`
+		Description string `json:"description"`
+		Type        string `json:"type"`
+	}
+	
 	var chosen []struct {
 		Number      int    `json:"number"`
 		Date        string `json:"date"`
 		Description string `json:"description"`
 		Type        string `json:"type"`
 	}
-	if len(payload.Configs) > 0 {
-		for _, cfg := range payload.Configs {
-			if cfg.Config == "root" {
-				chosen = cfg.Snapshots
-				break
-			}
+
+	if err := json.Unmarshal([]byte(stdout), &simpleFormat); err == nil && len(simpleFormat["root"]) > 0 {
+		chosen = simpleFormat["root"]
+	} else {
+		// Fallback to the nested "configs" format
+		var complexFormat struct {
+			Configs []struct {
+				Config    string `json:"config"`
+				Snapshots []struct {
+					Number      int    `json:"number"`
+					Date        string `json:"date"`
+					Description string `json:"description"`
+					Type        string `json:"type"`
+				} `json:"snapshots"`
+			} `json:"configs"`
 		}
-		if chosen == nil {
-			chosen = payload.Configs[0].Snapshots
+		if err := json.Unmarshal([]byte(stdout), &complexFormat); err == nil {
+			for _, cfg := range complexFormat.Configs {
+				if cfg.Config == "root" {
+					chosen = cfg.Snapshots
+					break
+				}
+			}
+			if chosen == nil && len(complexFormat.Configs) > 0 {
+				chosen = complexFormat.Configs[0].Snapshots
+			}
 		}
 	}
 
@@ -601,7 +727,8 @@ func (m *microOSBackend) rpmUpdateCount(ctx context.Context) (int, bool) {
 }
 
 func (m *microOSBackend) queryRPM(ctx context.Context, pkg, root string) string {
-	args := []string{"-q", pkg}
+	// Return clean "Version-Release" string (e.g. "0.1.0-1")
+	args := []string{"-q", "--qf", "%{VERSION}-%{RELEASE}", pkg}
 	if root != "" {
 		args = append([]string{"--root", root}, args...)
 	}

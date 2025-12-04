@@ -13,12 +13,23 @@ import (
 func TestStatusWithStagedSnapshot(t *testing.T) {
 	tmp := t.TempDir()
 	clock := func() time.Time { return time.Date(2025, 11, 24, 10, 0, 0, 0, time.UTC) }
+	mockReadFile := func(path string) ([]byte, error) {
+		if path == "/etc/os-release" {
+			return []byte(`VERSION_ID="20251124"`), nil
+		}
+		if strings.Contains(path, "/.snapshots/7/snapshot/etc/os-release") {
+			return []byte(`VERSION_ID="20251125"`), nil
+		}
+		return nil, os.ErrNotExist
+	}
 	m, err := NewManager(
 		WithRunner(fakeRunner{}),
 		WithStateDir(tmp),
 		WithRuntimeDir(filepath.Join(tmp, "run")),
 		WithClock(clock),
 		WithSupportOverride(true),
+		WithReadFile(mockReadFile),
+		WithCurrentVersion("1.2.3-1"),
 	)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
@@ -38,8 +49,12 @@ func TestStatusWithStagedSnapshot(t *testing.T) {
 	if !st.Pending || !st.RequiresReboot {
 		t.Fatalf("expected pending/requires_reboot true, got %+v", st)
 	}
-	if st.CurrentVersion == st.AvailableVersion {
-		t.Fatalf("expected different available version when staged")
+	// Expectation: piccolod RPM version (1.2.3-1 / 1.2.4-1) takes precedence over OS version (20251124)
+	if st.CurrentVersion != "1.2.3-1" {
+		t.Fatalf("expected current version 1.2.3-1 (RPM), got %s", st.CurrentVersion)
+	}
+	if st.AvailableVersion != "1.2.4-1" {
+		t.Fatalf("expected available version 1.2.4-1 (RPM), got %s", st.AvailableVersion)
 	}
 	meta := st.Meta
 	if meta == nil {
@@ -54,6 +69,45 @@ func TestStatusWithStagedSnapshot(t *testing.T) {
 	if cnt, ok := meta["rpm_updates_available"].(int); !ok || cnt != 2 {
 		t.Fatalf("expected rpm_updates_available=2, got %v", meta["rpm_updates_available"])
 	}
+}
+
+func TestStatusFallbackToSystemUpdateID(t *testing.T) {
+	tmp := t.TempDir()
+	noRpmRunner := &noRpmRunner{}
+	mockReadFile := func(path string) ([]byte, error) {
+		return nil, os.ErrNotExist // Simulate missing os-release
+	}
+
+	m, err := NewManager(
+		WithRunner(noRpmRunner),
+		WithStateDir(tmp),
+		WithRuntimeDir(filepath.Join(tmp, "run")),
+		WithSupportOverride(true),
+		WithReadFile(mockReadFile),
+		WithCurrentVersion("v0.1.0"),
+	)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	st, err := m.Status(context.Background())
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+
+	expected := "v0.1.0 (System Update 7)"
+	if st.AvailableVersion != expected {
+		t.Fatalf("expected available version %q, got %q", expected, st.AvailableVersion)
+	}
+}
+
+type noRpmRunner struct{ fakeRunner }
+
+func (r *noRpmRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	if name == "rpm" {
+		return "", "package piccolod is not installed", 1, nil
+	}
+	return r.fakeRunner.Run(ctx, name, args...)
 }
 
 func TestTimeoutEnvOverride(t *testing.T) {
@@ -171,10 +225,10 @@ func (fakeRunner) Run(ctx context.Context, name string, args ...string) (string,
 		// Distinguish staged vs active via --root flag
 		for i, a := range args {
 			if a == "--root" && i+1 < len(args) && args[i+1] != "" {
-				return "piccolod-1.2.4\n", "", 0, nil
+				return "1.2.4-1\n", "", 0, nil
 			}
 		}
-		return "piccolod-1.2.3\n", "", 0, nil
+		return "1.2.3-1\n", "", 0, nil
 	default:
 		return "", "", 0, nil
 	}

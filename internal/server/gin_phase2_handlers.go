@@ -109,3 +109,20 @@ func (s *GinServer) handleStorageDisks(c *gin.Context) {
 	// Placeholder: storage manager not yet implemented; return empty list.
 	c.JSON(http.StatusOK, gin.H{"disks": []gin.H{}})
 }
+
+// handleOSUpdateReboot triggers a system reboot.
+func (s *GinServer) handleOSUpdateReboot(c *gin.Context) {
+	if s.updateManager == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update manager not available"})
+		return
+	}
+
+	// This is a fire-and-forget operation from the client's perspective,
+	// as the server will likely die immediately.
+	if err := s.updateManager.Reboot(context.Background()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to trigger reboot: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "reboot initiated"})
+}
