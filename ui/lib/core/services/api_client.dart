@@ -60,6 +60,12 @@ class ApiClient {
   }
 
   Future<dynamic> post(String path, {Object? body}) async {
+    // Automatically ensure we have a CSRF token before mutating state.
+    // This prevents 401/403 errors when developers forget to call fetchCsrfToken().
+    if (_csrfToken == null) {
+      await fetchCsrfToken();
+    }
+
     final uri = _buildUri(path);
     final response = await _client.post(
       uri,

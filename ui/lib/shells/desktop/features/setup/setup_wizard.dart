@@ -1,10 +1,8 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import '../../../../theme/piccolo_theme.dart';
 import '../../../../shared/piccolo_wordmark.dart';
 import '../../../../core/utils/downloader/downloader.dart';
 import '../../../../core/utils/clipboard/clipboard.dart';
-import '../../../../shared/widgets/password_strength_indicator.dart';
 import '../../../../shared/widgets/password_set_form.dart';
 import 'setup_controller.dart';
 

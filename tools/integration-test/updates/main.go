@@ -132,13 +132,19 @@ func main() {
 	ensureOnline(client)
 
 	// === 1. Clean State Check ===
-	st := getStatus(client)
+	st, err := getStatus(client)
+	if err != nil {
+		log.Fatalf("FATAL: Initial status check failed: %v", err)
+	}
 	log.Printf("Initial State: Pending=%v Reboot=%v ActiveSnap=%s", st.Pending, st.RequiresReboot, st.Meta.ActiveSnapshotID)
 
 	if st.Pending {
 		log.Println("System has pending update. Rebooting first to reach clean state...")
 		performRebootCycle(client)
-		st = getStatus(client)
+		st, err = getStatus(client)
+		if err != nil {
+			log.Fatalf("Status check after reboot failed: %v", err)
+		}
 		if st.Pending {
 			log.Fatal("FAIL: System still pending after reboot? Something is wrong.")
 		}
@@ -163,7 +169,10 @@ func main() {
 	log.Println("Waiting for update to finish (this takes minutes)...")
 	waitForPending(client, true)
 	
-	st = getStatus(client)
+	st, err = getStatus(client)
+	if err != nil {
+		log.Fatalf("Status check failed: %v", err)
+	}
 	log.Printf("Update Staged. Active=%s Default=%s AvailableVer=%s", st.Meta.ActiveSnapshotID, st.Meta.DefaultSnapshotID, st.AvailableVersion)
 	if !st.RequiresReboot {
 		log.Fatal("FAIL: Update staged but RequiresReboot is false")
@@ -177,7 +186,10 @@ func main() {
 	log.Println(">>> TEST STAGE: REBOOT INTO NEW SNAPSHOT")
 	performRebootCycle(client)
 	
-	st = getStatus(client)
+	st, err = getStatus(client)
+	if err != nil {
+		log.Fatalf("Status check failed: %v", err)
+	}
 	log.Printf("Post-Reboot State. Active=%s", st.Meta.ActiveSnapshotID)
 	if st.Meta.ActiveSnapshotID != newSnap {
 		log.Fatalf("FAIL: Booted into %s, expected %s", st.Meta.ActiveSnapshotID, newSnap)
@@ -204,7 +216,10 @@ func main() {
 	log.Println("Waiting for rollback to be staged...")
 	waitForPending(client, true)
 
-	st = getStatus(client)
+	st, err = getStatus(client)
+	if err != nil {
+		log.Fatalf("Status check failed: %v", err)
+	}
 	log.Printf("Rollback Staged. Default=%s", st.Meta.DefaultSnapshotID)
 	// Note: default ID might be a NEW snapshot that is a copy of the old one, OR the old one ID.
 	// Snapper rollback usually creates a new read-write snapshot copy of the target.
@@ -217,7 +232,10 @@ func main() {
 	log.Println(">>> TEST STAGE: REBOOT INTO ROLLBACK")
 	performRebootCycle(client)
 
-	st = getStatus(client)
+	st, err = getStatus(client)
+	if err != nil {
+		log.Fatalf("Status check failed: %v", err)
+	}
 	log.Printf("Final State. Active=%s", st.Meta.ActiveSnapshotID)
 	// If we rolled back to baseline, the "OS Release" or content should match baseline.
 	// Since we don't strictly track content hash here, we assume if we booted into the new default, it worked.
@@ -238,27 +256,35 @@ func ensureOnline(c *Client) {
 	log.Fatal("Timed out waiting for API/Auth to be available")
 }
 
-func getStatus(c *Client) OSUpdateStatus {
+func getStatus(c *Client) (OSUpdateStatus, error) {
 	var st OSUpdateStatus
 	if err := c.GetJSON("/updates/os", &st); err != nil {
-		log.Fatalf("Failed to get status: %v", err)
+		return st, err
 	}
-	return st
+	return st, nil
 }
 
 func waitForPending(c *Client, wantPending bool) {
 	start := time.Now()
 	for time.Since(start) < UpdateTimeout {
-		st := getStatus(c)
+		st, err := getStatus(c)
+		if err != nil {
+			// Detect 429 (Too Many Requests) which means update is running
+			// Also handle standard network timeouts
+			errMsg := err.Error()
+			if bytes.Contains([]byte(errMsg), []byte("(429)")) || 
+			   bytes.Contains([]byte(errMsg), []byte("connection refused")) ||
+			   bytes.Contains([]byte(errMsg), []byte("timeout")) {
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			// Fail fast on other errors (401, 500, 404, etc)
+			log.Fatalf("Unexpected error while waiting for pending: %v", err)
+		}
+		
 		if st.Pending == wantPending {
 			return
 		}
-		// Special check: if we want pending=true, but api returns 429, we are still working.
-		// getStatus handles 200. If 429 happened, getStatus would likely fail if we didn't handle it in GetJSON?
-		// My GetJSON fails on non-200.
-		// We should probably handle 429 gracefully in GetJSON or loop logic.
-		// For simplicity, assuming GetJSON retries or we just sleep.
-		// Wait, GetJSON returns error on 429.
 		time.Sleep(10 * time.Second)
 	}
 	log.Fatalf("Timeout waiting for Pending=%v", wantPending)

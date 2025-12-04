@@ -27,7 +27,7 @@ func (s *GinServer) handleOSUpdateStatus(c *gin.Context) {
 	}
 	st, err := s.updateManager.Status(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		s.respondUpdateError(c, err)
 		return
 	}
 	// Ensure RFC3339 string for backward compat

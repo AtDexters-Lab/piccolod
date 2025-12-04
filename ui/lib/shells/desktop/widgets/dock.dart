@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../desktop_controller.dart';
 
+import '../features/settings/settings_app.dart';
+import '../features/files/files_app.dart';
+
 class Dock extends StatelessWidget {
   final DesktopController controller;
 
@@ -9,6 +12,8 @@ class Dock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenSize = MediaQuery.of(context).size;
+
     return Container(
       margin: const EdgeInsets.only(bottom: 24), // Floating
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -52,7 +57,9 @@ class Dock extends StatelessWidget {
               "files",
               "Files",
               Icons.folder_open_rounded,
-              const Center(child: Text("Files App")),
+              const FilesApp(),
+              screenSize: screenSize,
+              initialSize: const Size(1000, 650),
             ),
           ),
           const SizedBox(width: 12),
@@ -65,7 +72,9 @@ class Dock extends StatelessWidget {
               "settings",
               "Settings",
               Icons.settings_rounded,
-              const Center(child: Text("Settings App")),
+              SettingsApp(onLogout: controller.logout),
+              screenSize: screenSize,
+              initialSize: const Size(1100, 750),
             ),
           ),
           const SizedBox(width: 12),
@@ -79,6 +88,8 @@ class Dock extends StatelessWidget {
               "Terminal",
               Icons.terminal_rounded,
               const Center(child: Text("Terminal App")),
+              screenSize: screenSize,
+              initialSize: const Size(850, 550),
             ),
           ),
         ],

@@ -16,10 +16,54 @@ class DesktopController extends ChangeNotifier {
   List<DesktopWindow> get windows => List.unmodifiable(_windows);
 
   // Setup State
-  bool _needsSetup = true;
+  bool _needsSetup = false; // Default to false to avoid flash
   bool get needsSetup => _needsSetup;
 
-  void completeSetup() {
+  bool _isInitializing = true;
+  bool get isInitializing => _isInitializing;
+
+  DesktopController() {
+    _checkSystemStatus();
+  }
+
+  Future<void> _checkSystemStatus() async {
+    try {
+      // Check if admin setup is complete
+      final response = await ApiClient().get('/api/v1/auth/initialized');
+      // response is { "initialized": boolean }
+      final initialized = response['initialized'] == true;
+      
+      if (!initialized) {
+        _needsSetup = true;
+      } else {
+        // If initialized, check if we have a valid session (are we logged in?)
+         try {
+           final session = await ApiClient().get('/api/v1/auth/session');
+           if (session['authenticated'] != true) {
+             // Not authenticated, but system IS initialized. 
+             // We reuse the Setup Wizard in "Login Mode".
+             // The SetupWizard (implemented in features/setup) handles logic to show Login if already setup.
+             _needsSetup = true;
+           } else {
+             _needsSetup = false;
+           }
+         } catch (_) {
+           // If session check fails, assume we need login
+           _needsSetup = true;
+         }
+      }
+    } catch (e) {
+      debugPrint("System status check failed: $e");
+      // If backend is down or unreachable, what do we do?
+      // For now, assume we might need setup/login to be safe.
+      _needsSetup = true;
+    } finally {
+      _isInitializing = false;
+      notifyListeners();
+    }
+  }
+
+  void completeSetup() async {
     _needsSetup = false;
     notifyListeners();
 
@@ -32,7 +76,7 @@ class DesktopController extends ChangeNotifier {
     );
   }
 
-  Future<void> logout() async {
+  void logout() async {
     try {
       await ApiClient().post('/api/v1/auth/logout');
     } catch (e) {
@@ -64,7 +108,14 @@ class DesktopController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void openApp(String appId, String title, IconData icon, Widget content) {
+  void openApp(
+    String appId,
+    String title,
+    IconData icon,
+    Widget content, {
+    Size? screenSize,
+    Size? initialSize,
+  }) {
     final existingIndex = _windows.indexWhere((w) => w.id == appId);
 
     if (existingIndex != -1) {
@@ -82,15 +133,62 @@ class DesktopController extends ChangeNotifier {
       return;
     }
 
-    // Basic cascade positioning logic
-    final offset = _windows.length * 30.0;
+    // 1. Determine Target Size
+    // Use provided initialSize or a sensible default (1024x700)
+    Size targetSize = initialSize ?? const Size(1024, 700);
+
+    // 2. Clamp to Screen Size (Safety)
+    if (screenSize != null) {
+      // Ensure window isn't larger than the screen (minus some padding)
+      final double maxWidth = screenSize.width;
+      final double maxHeight =
+          screenSize.height - 48; // Subtract top bar
+
+      if (targetSize.width > maxWidth) {
+        targetSize = Size(maxWidth, targetSize.height);
+      }
+      if (targetSize.height > maxHeight) {
+        targetSize = Size(targetSize.width, maxHeight);
+      }
+    }
+
+    // 3. Calculate Position (Smart Center)
+    double x, y;
+
+    if (screenSize != null) {
+      const double topBarHeight = 48.0;
+      const double dockAreaHeight = 110.0; // 90px dock + padding
+
+      // Available height for centering
+      final double availableHeight = screenSize.height - topBarHeight - dockAreaHeight;
+      
+      // Clamp height to available space to ensure dock visibility
+      if (targetSize.height > availableHeight) {
+        targetSize = Size(targetSize.width, availableHeight);
+      }
+      
+      // Center horizontally
+      x = (screenSize.width - targetSize.width) / 2;
+      
+      // Center vertically within the safe area, then add top offset
+      y = topBarHeight + (availableHeight - targetSize.height) / 2;
+
+      // Final safety clamps
+      if (y < topBarHeight) y = topBarHeight;
+    } else {
+      // Fallback: Cascade based on window count
+      final offset = _windows.length * 30.0;
+      x = 100.0 + offset;
+      y = 80.0 + offset;
+    }
 
     final newWindow = DesktopWindow(
       id: appId,
       title: title,
       icon: icon,
       child: content,
-      position: Offset(100 + offset, 80 + offset),
+      position: Offset(x, y),
+      size: targetSize,
     );
 
     _windows.add(newWindow);

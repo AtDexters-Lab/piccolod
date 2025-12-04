@@ -184,6 +184,11 @@ func (m *microOSBackend) Status(ctx context.Context) (Status, error) {
 		}, nil
 	}
 
+	// If an update is running, return 429 so clients know to poll/wait.
+	// This ensures multi-tab consistency (Tab A starts update, Tab B sees 429).
+	if m.isInProgress(ctx) {
+		return Status{}, ErrInProgress
+	}
 	return m.readStatus(ctx)
 }
 
@@ -608,7 +613,7 @@ func (m *microOSBackend) snapperSnapshots(ctx context.Context) map[string]snapsh
 		Description string `json:"description"`
 		Type        string `json:"type"`
 	}
-	
+
 	var chosen []struct {
 		Number      int    `json:"number"`
 		Date        string `json:"date"`

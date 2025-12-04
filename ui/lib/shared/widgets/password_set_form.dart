@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import '../../theme/piccolo_theme.dart';
 import 'password_strength_indicator.dart';
 
@@ -29,22 +28,40 @@ class PasswordSetForm extends StatefulWidget {
 
 class _PasswordSetFormState extends State<PasswordSetForm> {
   bool _obscureText = true;
+  String? _internalConfirmError;
 
   @override
   void initState() {
     super.initState();
-    // Listen to password changes to update strength indicator
-    widget.passwordController.addListener(_update);
+    // Listen to controllers for updates and validation
+    widget.passwordController.addListener(_validate);
+    widget.confirmController.addListener(_validate);
   }
 
   @override
   void dispose() {
-    widget.passwordController.removeListener(_update);
+    widget.passwordController.removeListener(_validate);
+    widget.confirmController.removeListener(_validate);
     super.dispose();
   }
 
-  void _update() {
-    if (mounted) setState(() {});
+  void _validate() {
+    final password = widget.passwordController.text;
+    final confirm = widget.confirmController.text;
+
+    String? error;
+    if (confirm.isNotEmpty && password != confirm) {
+      error = "Passwords do not match";
+    }
+
+    if (mounted && _internalConfirmError != error) {
+      setState(() {
+        _internalConfirmError = error;
+      });
+    } else {
+      // Just rebuild for strength indicator if no error change
+      if (mounted) setState(() {});
+    }
   }
 
   void _toggleVisibility() {
@@ -91,7 +108,8 @@ class _PasswordSetFormState extends State<PasswordSetForm> {
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
             filled: true,
             fillColor: Colors.white,
-            errorText: widget.confirmError,
+            // Prefer widget-provided error, fallback to internal validation error
+            errorText: widget.confirmError ?? _internalConfirmError,
             suffixIcon: IconButton(
               icon: Icon(
                 _obscureText

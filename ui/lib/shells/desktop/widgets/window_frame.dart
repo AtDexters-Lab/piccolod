@@ -83,8 +83,9 @@ class _WindowFrameState extends State<WindowFrame>
   @override
   Widget build(BuildContext context) {
     // If minimized, we shouldn't be here (filtered by Shell), but safe to return empty.
-    if (widget.window.isMinimized && !widget.isClosing)
+    if (widget.window.isMinimized && !widget.isClosing) {
       return const SizedBox.shrink();
+    }
 
     return Positioned(
       left: widget.window.position.dx,

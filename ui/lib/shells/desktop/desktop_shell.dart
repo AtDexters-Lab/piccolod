@@ -45,8 +45,13 @@ class _DesktopShellState extends State<DesktopShell> {
                 child: TopBar(controller: _controller),
               ),
 
-              // If Setup is needed, show Wizard EXCLUSIVELY
-              if (_controller.needsSetup)
+              if (_controller.isInitializing)
+                 const Positioned.fill(
+                   child: Center(
+                     child: CircularProgressIndicator(color: Colors.white),
+                   ),
+                 )
+              else if (_controller.needsSetup)
                 Positioned.fill(
                   child: SetupWizard(onComplete: _controller.completeSetup),
                 )
