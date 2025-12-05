@@ -36,6 +36,36 @@ const selectedThemes = (() => {
 
 const flows = [
   { name: 'home', path: '/' },
+  {
+    name: 'drawer',
+    path: '/',
+    action: async (page) => {
+      await page.getByRole('button', { name: /open drawer/i }).click();
+      await page.getByRole('heading', { name: /launch an app/i }).waitFor({ timeout: 3000 });
+    },
+    after: async (page) => {
+      await page.getByRole('button', { name: /close/i }).click({ timeout: 2000 }).catch(() => {});
+    }
+  },
+  {
+    name: 'app-plex',
+    path: '/',
+    action: async (page) => {
+      // Prefer dock icon; fallback to drawer if needed
+      const dockButton = page.getByRole('button', { name: /plex/i });
+      if (await dockButton.isVisible().catch(() => false)) {
+        await dockButton.click();
+      } else {
+        await page.getByRole('button', { name: /open drawer/i }).click();
+        await page.getByRole('heading', { name: /launch an app/i }).waitFor({ timeout: 3000 });
+        await page.getByRole('button', { name: /plex/i }).click();
+      }
+      await page.getByRole('region', { name: /active app/i }).waitFor({ timeout: 3000 });
+    },
+    after: async (page) => {
+      await page.getByRole('button', { name: /home/i }).click({ timeout: 2000 }).catch(() => {});
+    }
+  },
   { name: 'setup', path: '/setup' },
   {
     name: 'setup-start',
@@ -102,6 +132,9 @@ async function capture() {
       const prefix = scheme === 'dark' ? 'dark-' : '';
       const filename = `${prefix}${String(index + 1).padStart(2, '0')}-${flow.name}.png`;
       await page.screenshot({ path: path.join(outputDir, filename), fullPage: true });
+      if (typeof flow.after === 'function') {
+        await flow.after(page);
+      }
     }
 
     await context.close();

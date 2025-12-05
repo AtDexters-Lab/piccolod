@@ -25,6 +25,9 @@
   --motion-ease-emphasized: cubic-bezier(0.16, 1, 0.3, 1);
   --motion-distance-sm: 8px;
   --motion-distance-md: 16px;
+  --safe-area-top: 88px;
+  --safe-area-bottom: 110px;
+  --panel-gap: 18px;
 
   --sys-surface: 244 246 251;
   --sys-surface-variant: 255 255 255;
@@ -102,8 +105,19 @@
   --elev-2: 0 2px 8px rgba(14, 19, 34, 0.08), 0 1px 2px rgba(14, 19, 34, 0.06);
   --elev-3: 0 8px 20px rgba(14, 19, 34, 0.12), 0 2px 6px rgba(14, 19, 34, 0.08);
 
-  --hero-gradient: radial-gradient(1150px 560px at 18% -5%, #F6F8FC 0%, #E9EEF6 42%, #E4EAF3 100%);
+  /* Background variants (Light) */
+  --bg-aurora: radial-gradient(1150px 560px at 18% -5%, #F6F8FC 0%, #E9EEF6 42%, #E4EAF3 100%);
+  --bg-midnight: radial-gradient(circle at 50% 0%, #c7d2fe 0%, #e0e7ff 40%, #eff6ff 100%); /* Indigo-200 -> Blue-50 */
+  --bg-plain: #f1f5f9; /* Slate-100 */
+
+  --hero-gradient: var(--bg-aurora);
   --card-gradient: var(--card-bg);
+}
+
+.card-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--panel-gap);
 }
 
 [data-theme='dark'] {
@@ -134,7 +148,14 @@
   --border-strong: rgba(231, 236, 246, 0.25);
   --outline-strong: rgba(231, 236, 246, 0.3);
   --focus-ring: 0 0 0 2px rgba(126, 162, 255, 0.28), 0 0 0 1px rgba(9, 12, 24, 0.9) inset;
-  --hero-gradient: radial-gradient(circle at 20% 0%, rgba(25, 28, 45, 0.95), rgba(13, 16, 28, 0.98));
+
+  /* Background variants (Dark) */
+  --bg-aurora: radial-gradient(circle at 20% 0%, rgba(25, 28, 45, 0.95), rgba(13, 16, 28, 0.98));
+  --bg-midnight: radial-gradient(circle at 50% 0%, #1e1b4b 0%, #0f172a 60%, #020617 100%);
+  --bg-plain: #0f172a;
+
+  --hero-gradient: var(--bg-aurora);
+  --card-gradient: linear-gradient(160deg, rgba(32, 36, 56, 0.9), rgba(20, 24, 40, 0.9));
   --card-gradient: linear-gradient(160deg, rgba(32, 36, 56, 0.9), rgba(20, 24, 40, 0.9));
   --card-bg: var(--card-gradient);
   --card-border: rgba(255, 255, 255, 0.08);
@@ -189,6 +210,13 @@
   *, *::before, *::after {
     transition-duration: 0ms !important;
     animation-duration: 0ms !important;
+  }
+}
+
+@media (max-width: 540px) {
+  :root {
+    --safe-area-top: 96px;
+    --safe-area-bottom: 128px;
   }
 }
 

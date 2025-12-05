@@ -10,4 +10,21 @@
 - **Cause:** The banner offered only Acknowledge/Details, forcing users to hunt for `/setup`, and CSRF tokens weren’t primed/reset after authentication transitions.
 - **Action:** Banner now links directly to `/setup?focus=recovery`, recovery step handles stale keys (regenerate or continue), and CSRF tokens are refreshed during login/logout so POSTs succeed immediately.
 - **Follow-ups:** Monitor for additional flows that should deep-link into the recovery step; consider adding automated tests for redirect decoding.
-
+### 2025-11-28 — Layered shell & navigation
+- Added interaction model link and finalized layered shell (Stage/App/Drawer) with history-aware back/forward and swipe-to-close drawer.
+- Implemented refcounted scroll lock and lifecycle hooks for layers; reduced-motion-friendly transitions for app/drawer.
+- Updated screenshot capture to cover drawer/app states and fixed waits to real aria targets.
+- Follow-ups: consider perf guardrails for heavy blur on low-end/mobile; pause polling/timers when layers go background.
+### 2025-11-28 — Settings activity shell
+- Added split-view Settings app under `/apps/settings` with mobile stack drill-down.
+- New clusters for Profile/Recovery, Appearance (local-only prefs), Remote access, and Updates (stubbed).
+- Introduced shared StatusHero, SettingCard, toast host, and local-storage prefs persistence to bridge until server APIs land.
+### 2025-11-30 — 3-Layer Shell, Animated Wallpaper, and Svelte 5 Migration
+- **Event:** Migrated the monolithic home screen to a modular 3-layer architecture (`Frame`, `Stage`, `Launcher`) orchestrated by `Desktop.svelte`.
+- **UI Polish:** Implemented animated "Aurora" wallpaper (CSS blobs) and "Midnight"/"Plain" variants. Decluttered the Home Stage and redesigned the "System" widget.
+- **Settings Polish:** Fixed window jitter by enforcing stable scrollbar gutters and fixed window height. Replaced text buttons with icon buttons in the window chrome.
+- **Tech Debt (Svelte Query v6 + Svelte 5):**
+  - **Issue:** `createQuery` triggered "t is not a function" or "subscribe is not a function" errors.
+  - **Resolution:** Adopted the correct v6 pattern for Svelte 5 Runes mode: pass options as a function `createQuery(() => ({...}))` and access properties directly `query.data` (no `$` store prefix).
+  - **Reactivity:** Fixed "stuck skeleton" issues by removing conflicting reactive assignments (`$: local = query.data`) and using direct template access or actions (`use:initializeDomain`) for side effects.
+- **Regressions Fixed:** Restored missing `ToastHost` and `Logout` button in the new shell to ensure feedback and session control.

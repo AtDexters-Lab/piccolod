@@ -14,3 +14,35 @@ const defaultPreferences: Preferences = {
 };
 
 export const preferencesStore = writable<Preferences>(defaultPreferences);
+
+let persistenceInitialized = false;
+let loadedFromStorage = false;
+
+export function initPreferencesPersistence(): void {
+  if (persistenceInitialized || typeof window === 'undefined') return;
+
+  const saved = window.localStorage.getItem('piccolo.preferences');
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved) as Partial<Preferences>;
+      preferencesStore.set({
+        ...defaultPreferences,
+        ...parsed,
+        theme: parsed.theme === 'dark' ? 'dark' : parsed.theme === 'light' ? 'light' : defaultPreferences.theme
+      });
+      loadedFromStorage = true;
+    } catch {
+      // ignore malformed payloads
+    }
+  }
+
+  preferencesStore.subscribe((value) => {
+    window.localStorage.setItem('piccolo.preferences', JSON.stringify(value));
+  });
+
+  persistenceInitialized = true;
+}
+
+export function preferencesWereLoaded(): boolean {
+  return loadedFromStorage;
+}

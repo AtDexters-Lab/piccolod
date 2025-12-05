@@ -27,7 +27,7 @@ func (s *GinServer) handleOSUpdateStatus(c *gin.Context) {
 	}
 	st, err := s.updateManager.Status(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		s.respondUpdateError(c, err)
 		return
 	}
 	// Ensure RFC3339 string for backward compat
@@ -108,4 +108,21 @@ func (s *GinServer) handleRemoteStatus(c *gin.Context) {
 func (s *GinServer) handleStorageDisks(c *gin.Context) {
 	// Placeholder: storage manager not yet implemented; return empty list.
 	c.JSON(http.StatusOK, gin.H{"disks": []gin.H{}})
+}
+
+// handleOSUpdateReboot triggers a system reboot.
+func (s *GinServer) handleOSUpdateReboot(c *gin.Context) {
+	if s.updateManager == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update manager not available"})
+		return
+	}
+
+	// This is a fire-and-forget operation from the client's perspective,
+	// as the server will likely die immediately.
+	if err := s.updateManager.Reboot(context.Background()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to trigger reboot: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "reboot initiated"})
 }

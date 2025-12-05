@@ -33,7 +33,11 @@
   const unsubscribe = controller.subscribe((state) => {
     setupState = state;
     if (state.phase === 'ready') {
-      goto(redirectTarget);
+      if (redirectTarget === '/') {
+        window.location.href = '/';
+      } else {
+        goto(redirectTarget);
+      }
     }
   });
 
