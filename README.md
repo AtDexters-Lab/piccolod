@@ -13,23 +13,23 @@ This repository contains `piccolod`, the control-plane daemon and embedded web p
 ## Repository Layout
 - `cmd/piccolod` – Go entrypoint for the daemon.
 - `internal/` – core packages (API, runtime, persistence, auth, cluster, etc.).
-- `ui-next/` – SvelteKit + TypeScript portal UI, built into `web/` and embedded by `web_embed.go`.
+- `ui/` – Flutter Web app that compiles into `web/` and is embedded by `web_embed.go`.
+- `ui-next/` – Legacy SvelteKit prototype kept for reference.
 - `docs/` – technical docs, runtime and testing notes, RFCs.
 
 ## Build & Run (Local)
-Prerequisites: Go (matching `go.mod`), Node.js 20+, npm.
+Prerequisites: Go (matching `go.mod`) and the Flutter SDK (with web support + Chrome).
 
 ```bash
 make build        # build UI + piccolod binary
 make run          # run on http://localhost:8080 with local state
 ```
 
-For UI-only development:
+For UI-only development (see `ui/docs/dev-guide.md` for details):
 
 ```bash
-cd ui-next
-npm ci
-npm run dev
+cd ui
+flutter run -d chrome --dart-define=API_BASE_URL=http://localhost:8080
 ```
 
 ## Testing

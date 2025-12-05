@@ -4,7 +4,8 @@ node_modules
 
 # Piccolod artifacts (relative to repo root)
 /piccolod
-web
+web/*
+!web/.keep
 web-src/test-results/
 web-src/web-src/test-results/
 web-src/playwright-report/
