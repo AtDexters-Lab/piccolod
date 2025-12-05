@@ -9,8 +9,32 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-ui:
+    name: Build UI (Flutter)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Build UI
+        run: make ui
+
+      - name: Upload Web Assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-assets
+          path: web
+          if-no-files-found: error
+
+  build-server:
     name: Build ${{ matrix.label }}
+    needs: build-ui
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -28,20 +52,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Download Web Assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: web
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: 'stable'
-          cache: true
-
-      - name: Build piccolod (server + UI)
-        run: make build-release
+      - name: Build piccolod (server only)
+        run: make server-release
 
       - name: Prepare artifact
         run: |
@@ -57,12 +81,13 @@ jobs:
 
   release:
     name: Publish Release
-    needs: build
+    needs: build-server
     runs-on: ubuntu-24.04
     steps:
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
+          pattern: piccolod-*
           path: dist
           merge-multiple: true
 
