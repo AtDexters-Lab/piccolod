@@ -171,92 +171,16 @@ paths:
                   services:
                     type: array
                     items: { $ref: '#/components/schemas/ServiceEndpoint' }
-  /services/{name}:
-    get:
-      summary: Get a single service endpoint by name
-      parameters:
-        - in: path
-          name: name
-          required: true
-          schema: { type: string }
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  service: { $ref: '#/components/schemas/ServiceEndpoint' }
   /storage/disks:
     get:
       summary: List disks
+      security: []
       responses:
         '200':
           description: OK
           content:
             application/json:
               schema: { $ref: '#/components/schemas/StorageDisks' }
-  /storage/disks/{id}/init:
-    post:
-      summary: Initialize (partition/format) and mount disk
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string }
-      responses:
-        '200': { description: OK }
-  /storage/disks/{id}/use:
-    post:
-      summary: Use existing disk as-is (mount)
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: string }
-      responses:
-        '200': { description: OK }
-  /storage/mounts:
-    get:
-      summary: List mounts
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/StorageMounts' }
-  /storage/default-root:
-    post:
-      summary: Set default data root
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                path: { type: string }
-      responses:
-        '200': { description: OK }
-  /storage/recovery-key:
-    get:
-      summary: Show recovery key status
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/RecoveryKey' }
-  /storage/recovery-key/generate:
-    post:
-      summary: Generate a new recovery key
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/RecoveryKey' }
   /exports/control:
     post:
       summary: Generate a control-plane export (PCV)
@@ -279,23 +203,10 @@ paths:
               schema: { $ref: '#/components/schemas/ExportResponse' }
         '401': { description: Unauthorized }
         '403': { description: Forbidden (control plane locked) }
-  /storage/unlock:
-    post:
-      summary: Unlock encrypted volumes
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                password: { type: string, nullable: true }
-                recovery_key: { type: string, nullable: true }
-      responses:
-        '200': { description: OK }
   /crypto/status:
     get:
       summary: Crypto status (initialized/locked)
+      security: []
       responses:
         '200':
           description: OK
@@ -309,6 +220,7 @@ paths:
   /crypto/setup:
     post:
       summary: Initialize crypto using admin password
+      security: []
       requestBody:
         required: true
         content:
@@ -323,6 +235,7 @@ paths:
   /crypto/unlock:
     post:
       summary: Unlock crypto with admin password
+      security: []
       requestBody:
         required: true
         content:
@@ -337,6 +250,7 @@ paths:
   /crypto/reset-password:
     post:
       summary: Reset admin password with recovery key
+      security: []
       requestBody:
         required: true
         content:
@@ -358,6 +272,7 @@ paths:
   /crypto/recovery-key:
     get:
       summary: Recovery key status
+      security: []
       responses:
         '200':
           description: OK
@@ -456,6 +371,7 @@ paths:
   /remote/status:
     get:
       summary: Remote access status
+      security: []
       responses:
         '200':
           description: OK
@@ -795,16 +711,6 @@ paths:
                 type: string
                 format: binary
 
-  /health:
-    get:
-      summary: Ecosystem health
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Health' }
-
   /catalog:
     get:
       summary: Curated app catalog
@@ -844,11 +750,13 @@ paths:
   /auth/setup:
     post:
       summary: First-run admin setup
+      security: []
       responses:
         '200': { description: OK }
   /auth/login:
     post:
       summary: Login
+      security: []
       responses:
         '200': { description: OK }
         '401': { description: Unauthorized }
@@ -861,6 +769,7 @@ paths:
   /auth/initialized:
     get:
       summary: Returns whether admin setup has been completed
+      security: []
       responses:
         '200':
           description: OK
@@ -873,6 +782,7 @@ paths:
   /auth/session:
     get:
       summary: Session status
+      security: []
       responses:
         '200':
           description: OK
@@ -1108,11 +1018,11 @@ components:
             default_snapshot: { $ref: '#/components/schemas/SnapshotInfo' }
             staged_snapshot: { $ref: '#/components/schemas/SnapshotInfo' }
             rpm_updates_available: { type: integer, description: Count of pending RPM updates (best-effort) }
-            piccolod_active: { type: string, description: Active piccolod RPM version, if installed }
-            piccolod_staged: { type: string, description: Staged piccolod RPM version, if differs from active }
+            piccolod_active: { type: string, description: "Active piccolod RPM version, if installed" }
+            piccolod_staged: { type: string, description: "Staged piccolod RPM version, if differs from active" }
             last_run: { $ref: '#/components/schemas/TransactionalUpdateRun' }
             last_request: { $ref: '#/components/schemas/UpdateRequest' }
-            derived_outcome: { type: string, description: Derived outcome of the last request (applied, pending-reboot, not-applied, empty when unknown) }
+            derived_outcome: { type: string, description: "Derived outcome of the last request (applied, pending-reboot, not-applied, empty when unknown)" }
     SnapshotInfo:
       type: object
       properties:
@@ -1122,7 +1032,7 @@ components:
     TransactionalUpdateRun:
       type: object
       properties:
-        result: { type: string, description: Systemd Result field (e.g., success, timeout) }
+        result: { type: string, description: "Systemd Result field (e.g., success, timeout)" }
         exit_code: { type: integer }
         ran_at: { type: string, format: date-time, nullable: true }
         logs:
