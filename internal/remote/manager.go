@@ -533,13 +533,16 @@ func (m *Manager) Disable() error {
 	return m.save(cfg)
 }
 
-// Rotate generates a placeholder device secret for testing.
+// Rotate generates a new secure device secret.
 func (m *Manager) Rotate() (string, error) {
 	cfg := m.currentConfig()
 	if cfg.Endpoint == "" {
 		return "", errors.New("remote not configured")
 	}
-	newSecret := fmt.Sprintf("secret-%d", time.Now().UnixNano())
+	newSecret, err := generateSecureSecret()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate secret: %w", err)
+	}
 	cfg.DeviceSecret = newSecret
 	cfg.Events = append(cfg.Events, Event{
 		Timestamp: m.now(),
@@ -551,6 +554,14 @@ func (m *Manager) Rotate() (string, error) {
 		return "", err
 	}
 	return newSecret, nil
+}
+
+func generateSecureSecret() (string, error) {
+	b := make([]byte, 32) // 256 bits of entropy
+	if _, err := cryptoRand.Read(b); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", b), nil
 }
 
 // ListAliases returns the current alias inventory.

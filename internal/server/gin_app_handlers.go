@@ -186,21 +186,34 @@ func (s *GinServer) handleGinCatalogTemplate(c *gin.Context) {
 func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	// Check Content-Type
 	contentType := c.GetHeader("Content-Type")
-	if !strings.Contains(contentType, "application/x-yaml") && !strings.Contains(contentType, "text/yaml") {
-		writeGinError(c, http.StatusUnsupportedMediaType, "Content-Type must be application/x-yaml or text/yaml")
+	if !strings.Contains(contentType, "application/x-yaml") && !strings.Contains(contentType, "text/yaml") && !strings.Contains(contentType, "application/json") {
+		writeGinError(c, http.StatusUnsupportedMediaType, "Content-Type must be application/x-yaml or text/yaml or application/json")
 		return
 	}
 
 	// Read request body
-	yamlData, err := c.GetRawData()
-	if err != nil {
-		writeGinError(c, http.StatusBadRequest, "Failed to read request body: "+err.Error())
-		return
-	}
-
-	if len(yamlData) == 0 {
-		writeGinError(c, http.StatusBadRequest, "Request body cannot be empty")
-		return
+	var yamlData []byte
+	if strings.Contains(contentType, "application/json") {
+		// Accept { app_definition: "...yaml..." }
+		var req struct {
+			AppDefinition string `json:"app_definition"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
+			writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
+			return
+		}
+		yamlData = []byte(req.AppDefinition)
+	} else {
+		body, err := c.GetRawData()
+		if err != nil {
+			writeGinError(c, http.StatusBadRequest, "Failed to read request body: "+err.Error())
+			return
+		}
+		if len(body) == 0 {
+			writeGinError(c, http.StatusBadRequest, "Request body cannot be empty")
+			return
+		}
+		yamlData = body
 	}
 
 	// Parse app.yaml
