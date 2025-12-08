@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import '../../../../theme/piccolo_theme.dart';
 import 'settings_controller.dart';
 import 'tabs/profile_tab.dart';
-import 'tabs/network_tab.dart';
+import 'tabs/remote/remote_tab.dart';
 import 'tabs/system_tab.dart';
 
 class SettingsApp extends StatefulWidget {
@@ -71,8 +71,8 @@ class _SettingsAppState extends State<SettingsApp> {
                         onTap: () => _controller.selectTab(0),
                       ),
                       _SidebarItem(
-                        icon: Icons.wifi,
-                        label: "Network",
+                        icon: Icons.cloud_outlined,
+                        label: "Remote Access",
                         isSelected: _controller.selectedIndex == 1,
                         onTap: () => _controller.selectTab(1),
                       ),
@@ -143,7 +143,7 @@ class _SettingsAppState extends State<SettingsApp> {
           onLogout: widget.onLogout,
         );
       case 1:
-        return NetworkTab(controller: _controller);
+        return const RemoteTab();
       case 2:
         return SystemTab(controller: _controller);
       default:

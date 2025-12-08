@@ -12,7 +12,7 @@ class PiccoloApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Piccolo OS',
+      title: 'Piccolo',
       debugShowCheckedModeBanner: false,
       theme: PiccoloTheme.lightTheme,
       // In the future, we can detect platform/screen size here to choose shell.

@@ -9,11 +9,12 @@ This document tracks features, technical debt, and architectural decisions.
     *   Implemented `Downloader` using `package:web` for WASM compatibility.
     *   Implemented `Clipboard` utility with fallback for insecure contexts.
 *   **UI Components:** Added reusable `PasswordSetForm` and `PasswordStrengthIndicator`.
+*   **Settings - Remote Access:** Implemented the Nexus Remote Access tab (Setup Wizard, Preflight Checks, Dashboard, Secret Rotation).
 
 ## 1. App Implementation (Layer D)
 *   **Current State:** "Settings", "Files", and "Terminal" launch generic placeholder windows.
 *   **Task:** Implement the actual UI for these core applications.
-    *   **Settings:** Tabbed interface for User, Network, and Storage management.
+    *   **Settings:** Tabbed interface for User and Storage management (Remote Access/Network completed).
     *   **Files:** File explorer interfacing with the backend VFS.
 
 ## 2. Mobile Shell

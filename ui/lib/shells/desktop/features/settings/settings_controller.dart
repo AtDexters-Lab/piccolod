@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
-import '../../../../core/models/os_update.dart';
-import '../../../../core/models/session.dart';
-import '../../../../core/models/remote_status.dart';
-import '../../../../core/services/api_client.dart';
+import 'package:piccolo_os/core/models/os_update.dart';
+import 'package:piccolo_os/core/models/session.dart';
+import 'package:piccolo_os/core/models/remote_models.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
 
 class SettingsController extends ChangeNotifier {
   bool _disposed = false;
