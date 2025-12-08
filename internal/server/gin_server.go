@@ -629,6 +629,9 @@ func (s *GinServer) setupGinRoutes() {
 		authed.POST("/auth/staleness/ack", s.handleAuthStalenessAck)
 		authed.GET("/auth/csrf", s.handleAuthCSRF)
 
+		// Debug terminal (Local & Admin only)
+		authed.GET("/terminal", s.handleTerminal, s.allowLocalOnly())
+
 		// OS updates
 		authed.GET("/updates/os", s.handleOSUpdateStatus)
 		authed.POST("/updates/os/apply", s.requireUnlocked(), s.handleOSUpdateApply)

@@ -18,6 +18,7 @@ require (
 require (
 	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/cenkalti/backoff/v4 v4.2.1 // indirect
+	github.com/creack/pty v1.1.24 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-jose/go-jose/v3 v3.0.0 // indirect
 	github.com/goccy/go-yaml v1.18.0 // indirect

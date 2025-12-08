@@ -830,6 +830,19 @@ paths:
                 properties:
                   token: { type: string }
 
+  /terminal:
+    get:
+      summary: Connect to debug terminal (WebSocket)
+      description: |
+        Upgrades to a WebSocket connection for an interactive shell session.
+        **Security:** Restricted to local LAN connections only. Remote access via Nexus is blocked.
+        **Protocol:** JSON messages with Base64 payloads.
+      security:
+        - cookieAuth: []
+      responses:
+        '101':
+          description: Switching Protocols
+
   /sso/start:
     get:
       summary: Begin app SSO (portal issues one-time ticket and redirects)
