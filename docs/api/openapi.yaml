@@ -394,12 +394,12 @@ paths:
                   type: string
                   enum: [http-01, dns-01]
                 tld: { type: string, description: Piccolo remote domain (e.g. example.com or piccolo.example.com) }
-                portal_hostname: { type: string, description: Optional explicit portal hostname }
+                portal_hostname: { type: string, description: Explicit portal hostname }
                 dns_provider: { type: string, description: Required when solver=dns-01 }
                 dns_credentials:
                   type: object
                   additionalProperties: { type: string }
-              required: [endpoint, tld]
+              required: [endpoint, tld, portal_hostname]
       responses:
         '200':
           description: OK
