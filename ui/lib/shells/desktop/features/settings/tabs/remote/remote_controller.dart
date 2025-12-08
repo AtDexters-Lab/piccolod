@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/core/models/service_endpoint.dart';
@@ -8,18 +9,18 @@ import 'package:piccolo_os/core/services/api_client.dart';
 class RemoteController extends ChangeNotifier {
   final RemoteService _service = RemoteService();
   Timer? _pollTimer;
-  bool _disposed = false; // [P1] Guard
-  bool _isPolling = false; // [P2] Guard
+  bool _disposed = false;
+  bool _isPolling = false;
 
   // State
   bool isLoading = true;
   String? error;
-  bool isLocked = false; // [P1] Added
+  bool isLocked = false;
   RemoteStatus? status;
   List<RemoteEvent> events = [];
-  List<RemoteAlias> aliases = []; // [P1] Added
-  List<RemoteCertificate> certificates = []; // [P1] Added
-  List<ServiceEndpoint> services = []; // [P2] Added
+  List<RemoteAlias> aliases = [];
+  List<RemoteCertificate> certificates = [];
+  List<ServiceEndpoint> services = [];
   List<RemoteDNSProvider> dnsProviders = [];
 
   // Setup Wizard State
@@ -41,7 +42,7 @@ class RemoteController extends ChangeNotifier {
 
   @override
   void dispose() {
-    _disposed = true; // [P1] Guard
+    _disposed = true;
     _pollTimer?.cancel();
     super.dispose();
   }
@@ -53,9 +54,8 @@ class RemoteController extends ChangeNotifier {
     isLocked = false;
     notifyListeners();
     await _pollStatus();
-    // [P1] Fetch full lists
     if (!isLocked) {
-      await fetchServices(); // [P3] Fetch static data once per refresh
+      await fetchServices();
       await _fetchEvents();
     }
     if (_disposed) return;
@@ -64,20 +64,14 @@ class RemoteController extends ChangeNotifier {
   }
 
   Future<void> _pollStatus() async {
-    if (_disposed || _isPolling) return; // [P2] Guard
+    if (_disposed || _isPolling) return;
     _isPolling = true;
     
     try {
       status = await _service.getStatus();
       error = null;
       isLocked = false;
-      // We also need to refresh lists occasionally or when status changes, but let's do it on poll for simplicity or just on manual refresh?
-      // Spec says status drives UI. But lists are separate.
-      // Let's poll lists too if active, but maybe less frequently?
-      // For now, let's keep it simple: poll status, but maybe only fetch lists on load/refresh/action.
-      // Actually, if certificates renew automatically, we want to see it.
-      // I'll add _fetchLists() to _pollStatus() but wrapped in try/catch to not block status.
-      await _fetchLists(); // [P1] Added await to ensure sequencing, though we ignore error inside
+      await _fetchLists();
     } catch (e) {
       if (e is ApiException && e.statusCode == 423) {
         isLocked = true;
@@ -86,7 +80,7 @@ class RemoteController extends ChangeNotifier {
       } else {
         error = e.toString();
         isLocked = false;
-        status = null; // [P2] Clear stale status
+        status = null;
       }
     } finally {
       _isPolling = false;
@@ -100,18 +94,17 @@ class RemoteController extends ChangeNotifier {
     try {
       aliases = await _service.getAliases();
       certificates = await _service.getCertificates();
-      // Services removed from poll loop [P3]
     } catch (e) {
-      print("Failed to fetch lists: $e");
+      debugPrint("Failed to fetch lists: $e");
     }
   }
 
   Future<void> fetchServices() async {
     if (_disposed) return;
     try {
-      services = await _service.getServices(); // [P3] Dedicated fetch
+      services = await _service.getServices();
     } catch (e) {
-      print("Failed to fetch services: $e");
+      debugPrint("Failed to fetch services: $e");
     }
   }
 
@@ -120,7 +113,7 @@ class RemoteController extends ChangeNotifier {
     try {
       events = await _service.getEvents();
     } catch (e) {
-      print("Failed to fetch remote events: $e");
+      debugPrint("Failed to fetch remote events: $e");
     }
   }
 
@@ -162,12 +155,9 @@ class RemoteController extends ChangeNotifier {
     try {
       preflightChecks = await _service.runPreflight();
       if (_disposed) return;
-      // Check if all passed
       bool allPassed = preflightChecks.every((c) => c.status == 'pass' || c.status == 'warn');
       if (allPassed && preflightChecks.isNotEmpty) {
-        // Automatically fetch DNS providers if we might need them
         await fetchDNSProviders();
-        // Wait a moment for user to see success, then could advance
       }
     } catch (e) {
       if (_disposed) return;
@@ -186,7 +176,7 @@ class RemoteController extends ChangeNotifier {
       if (_disposed) return;
       notifyListeners();
     } catch (e) {
-      print("Failed to fetch DNS providers: $e");
+      debugPrint("Failed to fetch DNS providers: $e");
     }
   }
 
@@ -196,9 +186,9 @@ class RemoteController extends ChangeNotifier {
     try {
       await _service.configure(config);
       if (_disposed) return;
-      await refresh(); // Should switch state to 'active' or 'provisioning'
+      await refresh();
       if (_disposed) return;
-      wizardStep = 0; // Reset wizard for next time
+      wizardStep = 0;
     } catch (e) {
       if (_disposed) return;
       error = "Configuration failed: $e";
@@ -216,7 +206,7 @@ class RemoteController extends ChangeNotifier {
     try {
       await _service.disable();
       if (_disposed) return;
-      wizardStep = 0; // [P2] Reset wizard step
+      wizardStep = 0;
       await refresh();
     } catch (e) {
       if (_disposed) return;

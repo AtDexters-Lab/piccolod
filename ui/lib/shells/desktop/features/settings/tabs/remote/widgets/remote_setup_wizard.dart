@@ -378,7 +378,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         
         DropdownButtonFormField<String>(
           decoration: const InputDecoration(labelText: "ACME Solver", border: OutlineInputBorder()),
-          value: _selectedSolver,
+          initialValue: _selectedSolver,
           items: const [
             DropdownMenuItem(value: 'http-01', child: Text("HTTP-01 (Requires Port 80)")),
             DropdownMenuItem(value: 'dns-01', child: Text("DNS-01 (Requires API Key)")),
@@ -394,7 +394,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
           const SizedBox(height: 16),
           DropdownButtonFormField<String>(
             decoration: const InputDecoration(labelText: "DNS Provider", border: OutlineInputBorder()),
-            value: _selectedProvider,
+            initialValue: _selectedProvider,
             items: widget.controller.dnsProviders.map((p) => DropdownMenuItem(value: p.id, child: Text(p.name))).toList(),
             onChanged: (val) {
               setState(() {

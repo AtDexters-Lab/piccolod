@@ -10,9 +10,10 @@ This document tracks features, technical debt, and architectural decisions.
     *   Implemented `Clipboard` utility with fallback for insecure contexts.
 *   **UI Components:** Added reusable `PasswordSetForm` and `PasswordStrengthIndicator`.
 *   **Settings - Remote Access:** Implemented the Nexus Remote Access tab (Setup Wizard, Preflight Checks, Dashboard, Secret Rotation).
+*   **Terminal App:** Implemented full `xterm` integration with WebSocket backend (JSON/Base64 protocol).
 
 ## 1. App Implementation (Layer D)
-*   **Current State:** "Settings", "Files", and "Terminal" launch generic placeholder windows.
+*   **Current State:** "Settings" and "Files" launch generic placeholder windows. "Terminal" is functional.
 *   **Task:** Implement the actual UI for these core applications.
     *   **Settings:** Tabbed interface for User and Storage management (Remote Access/Network completed).
     *   **Files:** File explorer interfacing with the backend VFS.
