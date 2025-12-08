@@ -630,7 +630,7 @@ func (s *GinServer) setupGinRoutes() {
 		authed.GET("/auth/csrf", s.handleAuthCSRF)
 
 		// Debug terminal (Local & Admin only)
-		authed.GET("/terminal", s.handleTerminal, s.allowLocalOnly())
+		authed.GET("/terminal", s.allowLocalOnly(), s.handleTerminal)
 
 		// OS updates
 		authed.GET("/updates/os", s.handleOSUpdateStatus)

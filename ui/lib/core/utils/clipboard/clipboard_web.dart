@@ -5,13 +5,11 @@ Future<void> copyText(String text) async {
   // 1. Try Modern Clipboard API (Secure Contexts: HTTPS, localhost)
   // Note: Accessing navigator.clipboard might be restricted, but checking for null is usually safe.
   final clipboard = web.window.navigator.clipboard;
-  if (clipboard != null) {
-    try {
-      await clipboard.writeText(text).toDart;
-      return;
-    } catch (e) {
-      // Fall through to legacy method
-    }
+  try {
+    await clipboard.writeText(text).toDart;
+    return;
+  } catch (e) {
+    // Fall through to legacy method
   }
 
   // 2. Legacy Fallback (Non-Secure Contexts like http://piccolo.local)
