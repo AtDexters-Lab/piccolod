@@ -23,9 +23,6 @@ class PiccoloTheme {
   static const Color info = Color(0xFF3B82F6);
 
   // -- Text Styles --
-  // Note: 'Comfortaa' and 'Inter' need to be added to pubspec.yaml later.
-  // For now we use standard system fonts that mimic the weights.
-
   static TextTheme get textTheme => const TextTheme(
     displayLarge: TextStyle(
       fontFamily: 'Comfortaa',

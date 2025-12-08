@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -195,6 +196,41 @@ func (s *GinServer) csrfMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		c.Next()
+	}
+}
+
+// allowLocalOnly blocks requests from localhost loopback unless they are from the secure loopback context.
+// This effectively prevents remote access via Nexus (which proxies via localhost) while allowing LAN access.
+func (s *GinServer) allowLocalOnly() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// If it's a secure loopback request (via 127.0.0.1:0 secure listener), allow it.
+		// We check secureContextKeyInstance directly from the request context.
+		if c.Request.Context().Value(secureContextKeyInstance) != nil {
+			c.Next()
+			return
+		}
+
+		// Parse the remote IP (direct connection)
+		host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+		if err != nil {
+			// If we can't parse the host/port, it's safer to block in this sensitive context
+			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Invalid RemoteAddr"})
+			c.Abort()
+			return
+		}
+
+		ip := net.ParseIP(host)
+		// If the IP is loopback (and not secure context), it implies it's either:
+		// 1. Nexus remote proxy (which dials 127.0.0.1) -> BLOCK
+		// 2. A local user/script connecting to the public port -> BLOCK
+		//    (We enforce "local inbounds" strictly as LAN/Private, or Secure Context)
+		if ip != nil && ip.IsLoopback() {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Remote/Loopback access denied"})
+			c.Abort()
+			return
+		}
+
 		c.Next()
 	}
 }

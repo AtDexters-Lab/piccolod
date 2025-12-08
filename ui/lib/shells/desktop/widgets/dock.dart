@@ -4,6 +4,7 @@ import '../desktop_controller.dart';
 
 import '../features/settings/settings_app.dart';
 import '../features/files/files_app.dart';
+import '../features/terminal/terminal_view.dart';
 
 class Dock extends StatelessWidget {
   final DesktopController controller;
@@ -87,7 +88,7 @@ class Dock extends StatelessWidget {
               "terminal",
               "Terminal",
               Icons.terminal_rounded,
-              const Center(child: Text("Terminal App")),
+              const TerminalApp(),
               screenSize: screenSize,
               initialSize: const Size(850, 550),
             ),

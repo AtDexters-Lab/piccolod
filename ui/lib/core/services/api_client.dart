@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'http_client_factory.dart'; // Import the factory
 import '../config/core_config.dart';
@@ -45,7 +46,7 @@ class ApiClient {
         _csrfToken = response['token'];
       }
     } catch (e) {
-      print("Failed to fetch CSRF token: $e");
+      debugPrint("Failed to fetch CSRF token: $e");
       // Don't rethrow, just proceed. Some endpoints might not need it.
     }
   }

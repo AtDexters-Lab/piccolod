@@ -81,7 +81,7 @@ class RemoteAliasesCard extends StatelessWidget {
                 else
                   DropdownButtonFormField<String>(
                     decoration: const InputDecoration(labelText: "Internal Service"),
-                    value: selectedListener,
+                    initialValue: selectedListener,
                     items: controller.services.map((s) {
                       return DropdownMenuItem(
                         value: s.name,
