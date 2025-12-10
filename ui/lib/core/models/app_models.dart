@@ -1,0 +1,178 @@
+
+import '../config/core_config.dart';
+
+class App {
+  final String id;
+  final String name;
+  final String image;
+  final String type;
+  final String status;
+  final List<AppVolume> volumes;
+  final Map<String, String> environment;
+  final String? containerId;
+
+  App({
+    required this.id,
+    required this.name,
+    required this.image,
+    required this.type,
+    required this.status,
+    this.volumes = const [],
+    this.environment = const {},
+    this.containerId,
+  });
+
+  factory App.fromJson(Map<String, dynamic> json) {
+    return App(
+      id: json['id'] ?? '',
+      name: json['name'] ?? '',
+      image: json['image'] ?? '',
+      type: json['type'] ?? 'user',
+      status: json['status'] ?? 'unknown',
+      volumes: (json['volumes'] as List<dynamic>?)
+              ?.map((e) => AppVolume.fromJson(e))
+              .toList() ??
+          [],
+      environment: Map<String, String>.from(json['environment'] ?? {}),
+      containerId: json['container_id'],
+    );
+  }
+
+  bool get isRunning => status.toLowerCase() == 'running';
+  bool get isStopped => status.toLowerCase() == 'stopped' || status.toLowerCase() == 'created';
+  bool get isError => status.toLowerCase() == 'error';
+}
+
+class AppVolume {
+  final String containerPath;
+  final String hostPath;
+  final String sizeLimit;
+
+  AppVolume({
+    required this.containerPath,
+    required this.hostPath,
+    required this.sizeLimit,
+  });
+
+  factory AppVolume.fromJson(Map<String, dynamic> json) {
+    return AppVolume(
+      containerPath: json['container'] ?? '',
+      hostPath: json['host'] ?? '',
+      sizeLimit: json['size_limit'] ?? '',
+    );
+  }
+}
+
+class ServiceEndpoint {
+  final String app;
+  final String name;
+  final int guestPort;
+  final int hostPort;
+  final int publicPort;
+  final List<int> remotePorts;
+  final String? remoteHost;
+  final String flow;
+  final String protocol;
+  final String? localUrl;
+
+  ServiceEndpoint({
+    required this.app,
+    required this.name,
+    required this.guestPort,
+    required this.hostPort,
+    required this.publicPort,
+    this.remotePorts = const [],
+    this.remoteHost,
+    required this.flow,
+    required this.protocol,
+    this.localUrl,
+  });
+
+  factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
+    return ServiceEndpoint(
+      app: json['app'] ?? '',
+      name: json['name'] ?? '',
+      guestPort: json['guest_port'] ?? 0,
+      hostPort: json['host_port'] ?? 0,
+      publicPort: json['public_port'] ?? 0,
+      remotePorts: (json['remote_ports'] as List<dynamic>?)?.cast<int>() ?? [],
+      remoteHost: json['remote_host'],
+      flow: json['flow'] ?? 'tcp',
+      protocol: json['protocol'] ?? 'raw',
+      localUrl: json['local_url'],
+    );
+  }
+
+  // Helper to get the primary LAN URL
+  String get lanUrl {
+    // If localUrl is provided by backend, use it
+    if (localUrl != null && localUrl!.isNotEmpty) return localUrl!;
+    
+    // Determine hostname
+    String host = 'piccolo.local';
+    
+    // If API_BASE_URL is set (Dev mode), use that host
+    if (CoreConfig.apiBaseUrl.isNotEmpty) {
+      try {
+        final uri = Uri.parse(CoreConfig.apiBaseUrl);
+        if (uri.host.isNotEmpty) {
+          host = uri.host;
+        }
+      } catch (_) {
+        // Ignore parse errors, stick to default
+      }
+    }
+    
+    // Fallback: Construct http(s)://hostname:publicPort
+    return 'http://$host${publicPort == 80 ? '' : ':$publicPort'}'; 
+  }
+
+  // Helper to get the Remote URL (if enabled)
+  String? get remoteUrl {
+    if (remoteHost == null || remoteHost!.isEmpty) return null;
+    // Nexus endpoints are secured by default.
+    // If remotePorts contains 443, we imply https without port.
+    // If it contains 80, http.
+    // Simplification: Nexus is HTTPS-first.
+    return 'https://$remoteHost';
+  }
+}
+
+class CatalogItem {
+  final String name;
+  final String image;
+  final String description;
+  final String? template; // Optional inline YAML snippet
+
+  CatalogItem({
+    required this.name,
+    required this.image,
+    required this.description,
+    this.template,
+  });
+
+  factory CatalogItem.fromJson(Map<String, dynamic> json) {
+    return CatalogItem(
+      name: json['name'] ?? '',
+      image: json['image'] ?? '',
+      description: json['description'] ?? '',
+      template: json['template'],
+    );
+  }
+}
+
+class AppValidationResult {
+  final bool valid;
+  final String? error;
+
+  AppValidationResult({required this.valid, this.error});
+
+  factory AppValidationResult.fromJson(Map<String, dynamic> json) {
+    // Some validation endpoints might return a 400 with 'error' field in body
+    // or 200 with { "valid": true/false }
+    return AppValidationResult(
+      valid: json['valid'] ?? false,
+      error: json['error'], // If backend returns error detail in 200 OK structure
+    );
+  }
+}

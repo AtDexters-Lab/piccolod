@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'models/desktop_window.dart';
 import '../../core/services/api_client.dart';
+import '../../features/apps/app_store_window.dart';
 
 /// Manages the state of the Desktop Shell.
 ///
@@ -75,6 +76,20 @@ class DesktopController extends ChangeNotifier {
       const Center(child: Text("Welcome to Piccolo OS!")),
     );
   }
+  
+  void openAppStore() {
+    if (isAppOpen("app-store")) {
+      focusWindow("app-store");
+    } else {
+      openApp(
+        "app-store",
+        "App Store",
+        Icons.storefront,
+        AppStoreWindow(desktopController: this),
+        initialSize: const Size(900, 650),
+      );
+    }
+  }
 
   void logout() async {
     try {
@@ -103,6 +118,10 @@ class DesktopController extends ChangeNotifier {
     return _windows[index].isMinimized;
   }
 
+  bool get hasVisibleWebWindow {
+    return _windows.any((w) => !w.isMinimized && !w.requiresInterceptor);
+  }
+
   void toggleLauncher() {
     _isLauncherOpen = !_isLauncherOpen;
     notifyListeners();
@@ -115,6 +134,8 @@ class DesktopController extends ChangeNotifier {
     Widget content, {
     Size? screenSize,
     Size? initialSize,
+    List<Widget>? actions,
+    bool requiresInterceptor = true,
   }) {
     final existingIndex = _windows.indexWhere((w) => w.id == appId);
 
@@ -189,6 +210,8 @@ class DesktopController extends ChangeNotifier {
       child: content,
       position: Offset(x, y),
       size: targetSize,
+      actions: actions,
+      requiresInterceptor: requiresInterceptor,
     );
 
     _windows.add(newWindow);

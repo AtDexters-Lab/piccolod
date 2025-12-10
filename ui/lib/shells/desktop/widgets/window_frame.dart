@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:pointer_interceptor/pointer_interceptor.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../models/desktop_window.dart';
+import 'window_activity.dart';
 
 class WindowFrame extends StatefulWidget {
   final DesktopWindow window;
   final bool isClosing; // Primitive for accurate didUpdateWidget comparison
+  final bool isActive;
   final VoidCallback onClose;
   final VoidCallback onMinimize;
   final VoidCallback onMaximize;
@@ -17,6 +20,7 @@ class WindowFrame extends StatefulWidget {
     super.key,
     required this.window,
     required this.isClosing,
+    required this.isActive,
     required this.onClose,
     required this.onMinimize,
     required this.onMaximize,
@@ -90,19 +94,25 @@ class _WindowFrameState extends State<WindowFrame>
     return Positioned(
       left: widget.window.position.dx,
       top: widget.window.position.dy,
-      child: AnimatedBuilder(
-        animation: _entryController,
-        builder: (context, child) {
-          return Transform.scale(
-            scale: _scaleAnimation.value,
-            child: Opacity(opacity: _opacityAnimation.value, child: child),
-          );
-        },
-        child: GestureDetector(
-          onTap: widget.onTap, // Focus on tap
-          child: Stack(
-            children: [
-              // Main Window Content
+      child: PointerInterceptor(
+        // Intercept if it's a native window.
+        // WebViews now self-manage their interactivity via WindowActivity.
+        intercepting: widget.window.requiresInterceptor,
+        child: WindowActivity(
+          isActive: widget.isActive,
+          child: AnimatedBuilder(
+            animation: _entryController,
+            builder: (context, child) {
+              return Transform.scale(
+                scale: _scaleAnimation.value,
+                child: Opacity(opacity: _opacityAnimation.value, child: child),
+              );
+            },
+            child: Listener(
+              onPointerDown: (_) => widget.onTap(), // Focus immediately on touch/click down
+              child: Stack(
+              children: [
+                // Main Window Content
               AnimatedContainer(
                 duration: const Duration(milliseconds: 200),
                 curve: Curves.easeOutCubic,
@@ -200,6 +210,11 @@ class _WindowFrameState extends State<WindowFrame>
                                   ),
                                 ),
                               ),
+                              
+                              if (widget.window.actions != null) ...[
+                                const SizedBox(width: 8),
+                                ...widget.window.actions!,
+                              ],
                             ],
                           ),
                         ),
@@ -226,7 +241,8 @@ class _WindowFrameState extends State<WindowFrame>
                 Positioned(
                   right: 0,
                   bottom: 0,
-                  child: GestureDetector(
+                  child: PointerInterceptor(
+                    child: GestureDetector(
                     onPanUpdate: (details) {
                       widget.onResize(
                         Size(
@@ -258,9 +274,12 @@ class _WindowFrameState extends State<WindowFrame>
                       ),
                     ),
                   ),
+                  ),
                 ),
             ],
           ),
+        ),
+        ),
         ),
       ),
     );

@@ -76,6 +76,20 @@ class ApiClient {
     return _handleResponse(response);
   }
 
+  Future<dynamic> postRaw(String path, {required String body, required String contentType}) async {
+    if (_csrfToken == null) {
+      await fetchCsrfToken();
+    }
+
+    final uri = _buildUri(path);
+    final response = await _client.post(
+      uri,
+      headers: _getHeaders(contentType: contentType),
+      body: body,
+    );
+    return _handleResponse(response);
+  }
+
   Future<dynamic> delete(String path, {Object? body}) async {
     if (_csrfToken == null) {
       await fetchCsrfToken();

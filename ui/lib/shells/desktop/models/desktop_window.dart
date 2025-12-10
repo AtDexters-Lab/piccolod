@@ -3,16 +3,15 @@ import 'package:flutter/material.dart';
 class DesktopWindow {
   final String id;
   final String title;
-  final Widget child;
   final IconData icon;
-
-  // Mutable state managed by the controller
+  final Widget child;
+  final List<Widget>? actions; // Custom title bar actions
   Offset position;
   Size size;
-
   bool isMinimized;
   bool isMaximized;
-  bool isClosing; // For animation
+  bool isClosing; // Animation state
+  bool requiresInterceptor; // Whether to wrap in PointerInterceptor (disable for WebViews)
 
   // Restore state
   Offset? preMaximizePosition;
@@ -21,12 +20,14 @@ class DesktopWindow {
   DesktopWindow({
     required this.id,
     required this.title,
-    required this.child,
     required this.icon,
-    this.position = const Offset(100, 100),
-    this.size = const Size(600, 400),
+    required this.child,
+    required this.position,
+    required this.size,
+    this.actions,
     this.isMinimized = false,
     this.isMaximized = false,
     this.isClosing = false,
+    this.requiresInterceptor = true,
   });
 }

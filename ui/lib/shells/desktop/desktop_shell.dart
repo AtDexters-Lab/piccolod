@@ -66,6 +66,7 @@ class _DesktopShellState extends State<DesktopShell> {
                         key: ValueKey(window.id),
                         window: window,
                         isClosing: window.isClosing,
+                        isActive: _controller.isAppActive(window.id),
                         onClose: () => _controller.closeWindow(window.id),
                         onMinimize: () => _controller.minimizeWindow(window.id),
                         onMaximize: () =>
