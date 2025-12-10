@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,8 @@ import (
 
 	"piccolod/internal/api"
 )
+
+var frameAncestorsRe = regexp.MustCompile(`(?i)frame-ancestors\s+[^;]+(; ?)?`)
 
 type connectionHint struct {
 	isTLS      bool
@@ -26,15 +29,20 @@ type hintContextKey struct{}
 
 // ProxyManager manages TCP listeners and proxies traffic based on ServiceEndpoint
 type ProxyManager struct {
-	mu        sync.Mutex
-	listeners map[int]net.Listener // by public port
-	hints     map[int]map[int]connectionHint
-	wg        sync.WaitGroup
-	acme      http.Handler
+	mu                sync.Mutex
+	listeners         map[int]net.Listener // by public port
+	hints             map[int]map[int]connectionHint
+	cspFrameAncestors string // pre-calculated CSP header value
+	wg                sync.WaitGroup
+	acme              http.Handler
 }
 
 func NewProxyManager() *ProxyManager {
-	return &ProxyManager{listeners: make(map[int]net.Listener)}
+	// Default safe CSP
+	return &ProxyManager{
+		listeners:         make(map[int]net.Listener),
+		cspFrameAncestors: "frame-ancestors 'self' http://localhost:* http://*.local:* https://*.local:*",
+	}
 }
 
 func (p *ProxyManager) registerHint(listenerPort, sourcePort int, hint connectionHint) {
@@ -71,6 +79,38 @@ func (p *ProxyManager) consumeHint(listenerPort, sourcePort int) (connectionHint
 
 // SetAcmeHandler registers a handler to serve HTTP-01 challenges for all HTTP proxies.
 func (p *ProxyManager) SetAcmeHandler(h http.Handler) { p.mu.Lock(); p.acme = h; p.mu.Unlock() }
+
+// SetAllowedAncestors updates the list of hostnames allowed to frame apps.
+// It constructs a CSP frame-ancestors directive including default local origins and wildcard ports.
+func (p *ProxyManager) SetAllowedAncestors(hosts []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Base defaults with wildcard ports to support dev/non-standard ports
+	sources := []string{
+		"'self'",
+		"http://localhost:*",
+		"http://*.local:*",
+		"https://*.local:*",
+	}
+
+	for _, h := range hosts {
+		if h == "" {
+			continue
+		}
+		// Assume https for remote hosts unless specified
+		var entry string
+		if !strings.Contains(h, "://") {
+			entry = "https://" + h
+		} else {
+			entry = h
+		}
+		// Also allow wildcard ports for the configured host
+		sources = append(sources, entry+":*")
+	}
+
+	p.cspFrameAncestors = fmt.Sprintf("frame-ancestors %s", strings.Join(sources, " "))
+}
 
 // StartListener starts a TCP proxy for the given endpoint
 func (p *ProxyManager) StartListener(ep ServiceEndpoint) {
@@ -157,7 +197,19 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		return
 	}
 	rp := httputil.NewSingleHostReverseProxy(u)
-	// Basic transport tuning; defaults are fine for v1
+	// Strip backend restrictions so we can apply our own
+	rp.ModifyResponse = func(resp *http.Response) error {
+		resp.Header.Del("X-Frame-Options")
+
+		// Remove existing frame-ancestors directive if present, but keep other CSP directives
+		if val := resp.Header.Get("Content-Security-Policy"); val != "" {
+			newVal := frameAncestorsRe.ReplaceAllString(val, "")
+			// If cleaning resulted in empty or just whitespace/semicolons, strictly we might want to keep it empty
+			// But for now, just setting it back is fine.
+			resp.Header.Set("Content-Security-Policy", newVal)
+		}
+		return nil
+	}
 
 	// Default middleware chain (stubs)
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -174,7 +226,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		}
 		rp.ServeHTTP(w, r)
 	}))
-	handler = securityHeaders(handler)
+	handler = p.securityHeaders(handler)
 	handler = requestLogging(handler)
 	handler = basicRateLimit(handler) // stub
 
@@ -198,11 +250,16 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 }
 
 // Middleware stubs
-func securityHeaders(next http.Handler) http.Handler {
+func (p *ProxyManager) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
+
+		p.mu.Lock()
+		csp := p.cspFrameAncestors
+		p.mu.Unlock()
+		w.Header().Add("Content-Security-Policy", csp)
+
 		next.ServeHTTP(w, r)
 	})
 }

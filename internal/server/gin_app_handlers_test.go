@@ -1119,3 +1119,69 @@ func (m *GinMockContainerManager) Logs(ctx context.Context, containerID string, 
 	}
 	return out, nil
 }
+
+func TestServicesLocalURLGeneration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tempDir := t.TempDir()
+	server := createGinTestServer(t, tempDir)
+	sessionCookie, csrfToken := setupTestAdminSession(t, server)
+
+	// Manually inject a service
+	// We can't use Reconcile easily because we don't have a backing app.
+	// But we can use AllocateForApp if we mock it, OR just manually register an app first.
+	// Let's use Install() for consistency
+	appDef := &api.AppDefinition{
+		Name:      "url-test",
+		Image:     "alpine",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+	}
+	_, err := server.appManager.Install(context.Background(), appDef)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	// Fetch endpoint to get allocated port
+	eps, err := server.serviceManager.GetByApp("url-test")
+	if err != nil || len(eps) != 1 {
+		t.Fatalf("expected 1 endpoint, got %v err=%v", eps, err)
+	}
+	ep := eps[0]
+
+	// 1. Request with standard host
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/api/v1/apps/url-test", nil)
+	req.Host = "piccolo.local"
+	attachAuth(req, sessionCookie, csrfToken)
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp GinAppResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	data := resp.Data.(map[string]interface{})
+	svcs := data["services"].([]interface{})
+	svc := svcs[0].(map[string]interface{})
+	
+	expected := fmt.Sprintf("http://piccolo.local:%d", ep.PublicPort)
+	if got := svc["local_url"].(string); got != expected {
+		t.Errorf("Host=piccolo.local: expected %q, got %q", expected, got)
+	}
+
+	// 2. Request with IP host
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/api/v1/apps/url-test", nil)
+	req.Host = "192.168.1.50:8080"
+	attachAuth(req, sessionCookie, csrfToken)
+	server.router.ServeHTTP(w, req)
+
+	// Since we use the request host (minus port) for construction
+	expected = fmt.Sprintf("http://192.168.1.50:%d", ep.PublicPort)
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	data = resp.Data.(map[string]interface{})
+	svc = data["services"].([]interface{})[0].(map[string]interface{})
+	if got := svc["local_url"].(string); got != expected {
+		t.Errorf("Host=192.168.1.50:8080: expected %q, got %q", expected, got)
+	}
+}

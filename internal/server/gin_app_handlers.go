@@ -287,24 +287,7 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 		remoteStatus = &st
 	}
 	for _, ep := range services {
-		remoteHost := s.remoteServiceHostname(remoteStatus, ep)
-		var remoteHostValue interface{}
-		if remoteHost != "" {
-			remoteHostValue = remoteHost
-		}
-		serviceStatus = append(serviceStatus, gin.H{
-			"app":          ep.App,
-			"name":         ep.Name,
-			"guest_port":   ep.GuestPort,
-			"host_port":    ep.HostBind,
-			"public_port":  ep.PublicPort,
-			"remote_ports": ep.RemotePorts,
-			"remote_host":  remoteHostValue,
-			"flow":         ep.Flow,
-			"protocol":     ep.Protocol,
-			"middleware":   ep.Middleware,
-			"scheme":       determineScheme(ep.Flow, ep.Protocol),
-		})
+		serviceStatus = append(serviceStatus, s.formatServiceEndpoint(c, ep, remoteStatus))
 	}
 	writeGinSuccess(c, gin.H{"app": appInstance, "services": serviceStatus}, "")
 }

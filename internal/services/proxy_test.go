@@ -249,3 +249,87 @@ func TestHTTPProxyForwardHeadersRespectTLSHints(t *testing.T) {
 		t.Fatalf("timeout waiting for backend request (tls hint)")
 	}
 }
+
+func TestProxy_SecurityHeaders(t *testing.T) {
+	// 1. Start a backend that sets restrictive headers
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendLn.Close()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+	go srv.Serve(backendLn)
+	defer srv.Shutdown(context.Background())
+
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+
+	// 2. Start Proxy
+	pm := NewProxyManager()
+	public := getFreePort(t)
+	ep := ServiceEndpoint{
+		App:        "test",
+		Name:       "web",
+		GuestPort:  0,
+		HostBind:   backendPort,
+		PublicPort: public,
+		Flow:       api.FlowTCP,
+		Protocol:   api.ListenerProtocolHTTP,
+	}
+	pm.StartListener(ep)
+	defer pm.StopAll()
+	time.Sleep(100 * time.Millisecond)
+
+	target := fmt.Sprintf("http://127.0.0.1:%d/", public)
+
+	// 3. Test Default (Allowed for localhost with wildcard ports, no 127.0.0.1)
+	req, _ := http.NewRequest("GET", target, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("default get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("X-Frame-Options"); got != "" {
+		t.Errorf("default: expected X-Frame-Options to be stripped, got %q", got)
+	}
+
+	csp := resp.Header.Get("Content-Security-Policy")
+	// Check for expanded default list (without 127.0.0.1 and non-wildcards)
+	requiredDefaults := []string{
+		"http://localhost:*",
+		"http://*.local:*", "https://*.local:*",
+	}
+	for _, d := range requiredDefaults {
+		if !strings.Contains(csp, d) {
+			t.Errorf("default: expected CSP to contain %q, got %q", d, csp)
+		}
+	}
+	if strings.Contains(csp, "127.0.0.1") {
+		t.Errorf("default: expected 127.0.0.1 to be removed from CSP, got %q", csp)
+	}
+	if strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Errorf("default: expected backend frame-ancestors 'none' to be removed, got %q", csp)
+	}
+
+	// 4. Test adding an allowed ancestor (only wildcard variant)
+	pm.SetAllowedAncestors([]string{"portal.example.com"})
+
+	req, _ = http.NewRequest("GET", target, nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("allowed get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	csp = strings.Join(resp.Header.Values("Content-Security-Policy"), ", ")
+	if !strings.Contains(csp, "https://portal.example.com:*") {
+		t.Errorf("allowed: expected CSP to contain portal.example.com:*, got %q", csp)
+	}
+}

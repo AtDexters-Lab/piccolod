@@ -679,24 +679,7 @@ func (s *GinServer) handleGinServicesAll(c *gin.Context) {
 		remoteStatus = &st
 	}
 	for _, ep := range eps {
-		remoteHost := s.remoteServiceHostname(remoteStatus, ep)
-		var remoteHostValue interface{}
-		if remoteHost != "" {
-			remoteHostValue = remoteHost
-		}
-		out = append(out, gin.H{
-			"app":          ep.App,
-			"name":         ep.Name,
-			"guest_port":   ep.GuestPort,
-			"host_port":    ep.HostBind,
-			"public_port":  ep.PublicPort,
-			"remote_ports": ep.RemotePorts,
-			"remote_host":  remoteHostValue,
-			"flow":         ep.Flow,
-			"protocol":     ep.Protocol,
-			"middleware":   ep.Middleware,
-			"scheme":       determineScheme(ep.Flow, ep.Protocol),
-		})
+		out = append(out, s.formatServiceEndpoint(c, ep, remoteStatus))
 	}
 	c.JSON(http.StatusOK, gin.H{"services": out})
 }
@@ -716,26 +699,46 @@ func (s *GinServer) handleGinServicesByApp(c *gin.Context) {
 		remoteStatus = &st
 	}
 	for _, ep := range eps {
-		remoteHost := s.remoteServiceHostname(remoteStatus, ep)
-		var remoteHostValue interface{}
-		if remoteHost != "" {
-			remoteHostValue = remoteHost
-		}
-		out = append(out, gin.H{
-			"app":          ep.App,
-			"name":         ep.Name,
-			"guest_port":   ep.GuestPort,
-			"host_port":    ep.HostBind,
-			"public_port":  ep.PublicPort,
-			"remote_ports": ep.RemotePorts,
-			"remote_host":  remoteHostValue,
-			"flow":         ep.Flow,
-			"protocol":     ep.Protocol,
-			"middleware":   ep.Middleware,
-			"scheme":       determineScheme(ep.Flow, ep.Protocol),
-		})
+		out = append(out, s.formatServiceEndpoint(c, ep, remoteStatus))
 	}
 	c.JSON(http.StatusOK, gin.H{"services": out})
+}
+
+func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEndpoint, remoteStatus *remote.Status) gin.H {
+	remoteHost := s.remoteServiceHostname(remoteStatus, ep)
+	var remoteHostValue interface{}
+	if remoteHost != "" {
+		remoteHostValue = remoteHost
+	}
+	scheme := determineScheme(ep.Flow, ep.Protocol)
+	localURL := s.determineLocalURL(c, ep, scheme)
+	return gin.H{
+		"app":          ep.App,
+		"name":         ep.Name,
+		"guest_port":   ep.GuestPort,
+		"host_port":    ep.HostBind,
+		"public_port":  ep.PublicPort,
+		"remote_ports": ep.RemotePorts,
+		"remote_host":  remoteHostValue,
+		"flow":         ep.Flow,
+		"protocol":     ep.Protocol,
+		"middleware":   ep.Middleware,
+		"scheme":       scheme,
+		"local_url":    localURL,
+	}
+}
+
+func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoint, scheme string) string {
+	host := c.Request.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	// Use scheme from determineScheme which handles flow/protocol logic
+	// If public port is standard for scheme, we could omit it, but explicit is safer for services
+	if (scheme == "http" && ep.PublicPort == 80) || (scheme == "https" && ep.PublicPort == 443) {
+		return fmt.Sprintf("%s://%s", scheme, host)
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, host, ep.PublicPort)
 }
 
 func (s *GinServer) remoteServiceHostname(status *remote.Status, ep services.ServiceEndpoint) string {
@@ -852,6 +855,16 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 			TLD:            status.TLD,
 		})
 	}
+
+	// Update allowed frame ancestors for app proxies
+	if s.serviceManager != nil {
+		var ancestors []string
+		if h := strings.TrimSpace(status.PortalHostname); h != "" {
+			ancestors = append(ancestors, h)
+		}
+		s.serviceManager.ProxyManager().SetAllowedAncestors(ancestors)
+	}
+
 	s.tlsMux.UpdateConfig(status.PortalHostname, status.TLD, s.resolvePortalPort())
 	if status.Enabled && strings.TrimSpace(status.PortalHostname) != "" {
 		if port, err := s.tlsMux.Start(); err == nil {
