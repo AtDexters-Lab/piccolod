@@ -42,12 +42,35 @@ class RemoteCertificatesCard extends StatelessWidget {
   }
 
   Widget _buildCertItem(BuildContext context, RemoteCertificate cert) {
-    final expires = cert.expiresAt;
-    final isExpiring = expires != null && expires.difference(DateTime.now()).inDays < 7;
+    IconData icon;
+    Color iconColor;
+    String subtitle;
+    Color subtitleColor;
+    String actionLabel = "Renew";
+
+    if (cert.status == 'error') {
+      icon = Icons.error_outline;
+      iconColor = PiccoloTheme.critical;
+      subtitle = cert.failureReason ?? "Unknown error";
+      subtitleColor = PiccoloTheme.critical;
+      actionLabel = "Retry";
+    } else if (cert.status == 'pending') {
+      icon = Icons.hourglass_empty;
+      iconColor = PiccoloTheme.warning;
+      subtitle = "Issuance in progress...";
+      subtitleColor = PiccoloTheme.inkMuted;
+    } else {
+      icon = Icons.verified_user;
+      iconColor = PiccoloTheme.cobalt600;
+      final expires = cert.expiresAt;
+      final isExpiring = expires != null && expires.difference(DateTime.now()).inDays < 7;
+      subtitle = expires != null ? "Expires: ${expires.toLocal().toString().split(' ')[0]}" : "No expiry";
+      subtitleColor = isExpiring ? PiccoloTheme.warning : PiccoloTheme.inkMuted;
+    }
     
     return Row(
       children: [
-        const Icon(Icons.verified_user, color: PiccoloTheme.cobalt600),
+        Icon(icon, color: iconColor),
         const SizedBox(width: 16),
         Expanded(
           child: Column(
@@ -55,9 +78,9 @@ class RemoteCertificatesCard extends StatelessWidget {
             children: [
               Text(cert.domains.join(", "), style: const TextStyle(fontWeight: FontWeight.bold)),
               Text(
-                expires != null ? "Expires: ${expires.toLocal().toString().split(' ')[0]}" : "No expiry",
+                subtitle,
                 style: TextStyle(
-                  color: isExpiring ? PiccoloTheme.warning : PiccoloTheme.inkMuted,
+                  color: subtitleColor,
                   fontSize: 12,
                 ),
               ),
@@ -66,7 +89,7 @@ class RemoteCertificatesCard extends StatelessWidget {
         ),
         TextButton(
           onPressed: () => controller.renewCertificate(cert.id),
-          child: const Text("Renew"),
+          child: Text(actionLabel),
         ),
       ],
     );

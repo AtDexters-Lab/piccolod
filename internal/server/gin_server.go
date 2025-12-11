@@ -598,6 +598,7 @@ func (s *GinServer) setupGinRoutes() {
 			apps.GET("", s.handleGinAppList)                                    // GET /api/v1/apps
 			apps.GET("/:name", s.handleGinAppGet)                               // GET /api/v1/apps/:name
 			apps.DELETE("/:name", s.requireUnlocked(), s.handleGinAppUninstall) // DELETE /api/v1/apps/:name
+			apps.GET("/:name/services", s.handleGinServicesByApp)
 
 			// App actions
 			apps.POST("/:name/start", s.requireUnlocked(), s.handleGinAppStart) // POST /api/v1/apps/:name/start
@@ -642,7 +643,6 @@ func (s *GinServer) setupGinRoutes() {
 		authed.GET("/catalog", s.handleGinCatalog)
 		authed.GET("/catalog/:name/template", s.handleGinCatalogTemplate)
 		authed.GET("/services", s.handleGinServicesAll)
-		authed.GET("/apps/:name/services", s.handleGinServicesByApp)
 	}
 
 	// Admin routes

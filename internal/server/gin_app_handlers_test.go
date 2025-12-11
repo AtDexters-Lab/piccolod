@@ -880,6 +880,7 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 		t.Fatalf("remote mgr: %v", err)
 	}
 	rm.SetNexusAdapter(nexusclient.NewStub())
+	remote.RegisterHandlers(dispatch, rm)
 	tlsMux := services.NewTlsMux(svcMgr)
 	remoteResolver := newServiceRemoteResolver(svcMgr)
 	server := &GinServer{

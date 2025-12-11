@@ -93,24 +93,11 @@ class _RemoteTabState extends State<RemoteTab> {
         }
 
         final state = _controller.status?.state ?? 'disabled';
-
-        if (state == 'provisioning') {
-          return const Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                CircularProgressIndicator(),
-                SizedBox(height: 16),
-                Text("Provisioning Remote Access...", style: TextStyle(color: PiccoloTheme.inkMuted)),
-                SizedBox(height: 8),
-                Text("This may take a few moments.", style: TextStyle(fontSize: 12, color: PiccoloTheme.inkMuted)),
-              ],
-            ),
-          );
-        }
-
+        
         Widget content;
-        if (state == 'disabled' || state == 'preflight_required') {
+
+        // Allow wizard to handle 'provisioning' so user can resume/reset
+        if (state == 'disabled' || state == 'stopped' || state == 'provisioning') {
            content = RemoteSetupWizard(controller: _controller);
         } else {
            content = RemoteDashboard(controller: _controller);

@@ -438,6 +438,24 @@ paths:
   /remote/preflight:
     post:
       summary: Run remote preflight validation
+      description: |
+        Validates the remote configuration.
+        If a JSON body is provided, it validates that specific candidate configuration (stateless check).
+        If the body is empty, it validates the currently active configuration.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                endpoint: { type: string }
+                device_secret: { type: string }
+                solver: { type: string, enum: [http-01, dns-01] }
+                tld: { type: string }
+                portal_hostname: { type: string }
+                dns_provider: { type: string }
+                dns_credentials: { type: object }
       responses:
         '200':
           description: OK
@@ -570,7 +588,10 @@ paths:
               schema: { $ref: '#/components/schemas/RemoteGuideInfo' }
   /remote/nexus-guide/verify:
     post:
-      summary: Mark guide as verified
+      summary: Validate connection credentials (stateless)
+      description: |
+        Verifies the Nexus connection details.
+        Logs the verification event but does NOT persist the configuration (avoiding partial state).
       requestBody:
         required: true
         content:

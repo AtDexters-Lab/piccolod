@@ -29,8 +29,8 @@ class RemoteService {
     return response['device_secret'] ?? '';
   }
 
-  Future<List<RemotePreflightCheck>> runPreflight() async {
-    final response = await _api.post('/api/v1/remote/preflight');
+  Future<List<RemotePreflightCheck>> runPreflight([Map<String, dynamic>? config]) async {
+    final response = await _api.post('/api/v1/remote/preflight', body: config);
     final List<dynamic> checks = response['checks'] ?? [];
     return checks.map((e) => RemotePreflightCheck.fromJson(e)).toList();
   }

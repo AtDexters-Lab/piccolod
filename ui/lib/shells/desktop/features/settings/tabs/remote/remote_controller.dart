@@ -29,6 +29,9 @@ class RemoteController extends ChangeNotifier {
   List<RemotePreflightCheck> preflightChecks = [];
   bool isRunningPreflight = false;
   bool isSubmittingConfig = false;
+  
+  // Ephemeral configuration state for the wizard (not yet persisted to backend)
+  final Map<String, dynamic> _pendingConfig = {};
 
   RemoteController() {
     _init();
@@ -133,6 +136,7 @@ class RemoteController extends ChangeNotifier {
 
   Future<void> verifyNexusGuide(String endpoint, String tld, String portal, String secret) async {
     try {
+      // Validate with backend (stateless)
       await _service.verifyNexusGuide({
         'endpoint': endpoint,
         'tld': tld,
@@ -140,6 +144,13 @@ class RemoteController extends ChangeNotifier {
         'jwt_secret': secret,
       });
       if (_disposed) return;
+      
+      // Store in memory for subsequent steps
+      _pendingConfig['endpoint'] = endpoint;
+      _pendingConfig['tld'] = tld;
+      _pendingConfig['portal_hostname'] = portal;
+      _pendingConfig['device_secret'] = secret;
+      
       wizardStep = 1; // Move to preflight
       notifyListeners();
     } catch (e) {
@@ -153,7 +164,16 @@ class RemoteController extends ChangeNotifier {
     isRunningPreflight = true;
     notifyListeners();
     try {
-      preflightChecks = await _service.runPreflight();
+      // Pass pending config if we are in the wizard flow (step 1)
+      // Otherwise (re-running on active) pass null/empty
+      Map<String, dynamic>? configPayload;
+      if (_pendingConfig.isNotEmpty && wizardStep > 0) {
+        configPayload = Map.from(_pendingConfig);
+        // Ensure solver is set for validation if not yet selected (default to http-01 for check)
+        configPayload.putIfAbsent('solver', () => 'http-01');
+      }
+
+      preflightChecks = await _service.runPreflight(configPayload);
       if (_disposed) return;
       bool allPassed = preflightChecks.every((c) => c.status == 'pass' || c.status == 'warn');
       if (allPassed && preflightChecks.isNotEmpty) {
@@ -180,12 +200,20 @@ class RemoteController extends ChangeNotifier {
     }
   }
 
-  Future<void> submitConfiguration(Map<String, dynamic> config) async {
+  Future<void> submitConfiguration(Map<String, dynamic> partialConfig) async {
     isSubmittingConfig = true;
     notifyListeners();
     try {
-      await _service.configure(config);
+      // Merge partial config (solver, dns_creds) with pending config (endpoint, secret)
+      final finalConfig = Map<String, dynamic>.from(_pendingConfig);
+      finalConfig.addAll(partialConfig);
+      
+      await _service.configure(finalConfig);
       if (_disposed) return;
+      
+      // Clear pending state on success
+      _pendingConfig.clear();
+      
       await refresh();
       if (_disposed) return;
       wizardStep = 0;

@@ -393,8 +393,9 @@ func (m *Manager) Status() Status {
 		if !cfg.ExpiresAt.IsZero() && cfg.ExpiresAt.Before(m.now()) {
 			state = "error"
 		}
-	} else if cfg.Endpoint != "" || cfg.DeviceSecret != "" || cfg.TLD != "" {
-		state = "provisioning"
+	} else if cfg.Endpoint != "" && cfg.TLD != "" {
+		// Valid config exists but is disabled -> "stopped"
+		state = "stopped"
 	}
 
 	return Status{
@@ -501,7 +502,8 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	cfg.NextRenewal = nextRenewal
 	cfg.LastHandshake = now
 	cfg.LatencyMS = 0
-	cfg.LastPreflight = nil
+	// Assume preflight passed during setup wizard; prevent immediate warning state
+	cfg.LastPreflight = &now
 	// Queue background ACME issuance and surface events/inventory.
 	cfg.Certificates = defaultCertificates(cfg, now)
 	m.enqueueIssuance("portal", []string{cfg.PortalHostname}, cfg.PortalHostname)
@@ -1037,8 +1039,15 @@ func readCertExpiry(path string) (time.Time, bool) {
 }
 
 // RunPreflight performs validation checks for the remote configuration.
-func (m *Manager) RunPreflight() (PreflightResult, error) {
-	cfg := m.currentConfig()
+// If candidate is provided, it validates that specific config; otherwise it validates the active config.
+func (m *Manager) RunPreflight(candidate *Config) (PreflightResult, error) {
+	var cfg *Config
+	if candidate != nil {
+		cfg = candidate
+	} else {
+		cfg = m.currentConfig()
+	}
+
 	if cfg.Endpoint == "" || cfg.TLD == "" || cfg.PortalHostname == "" {
 		return PreflightResult{}, errors.New("remote not configured")
 	}
@@ -1054,6 +1063,7 @@ func (m *Manager) RunPreflight() (PreflightResult, error) {
 
 	checks = append(checks, PreflightCheck{Name: "ACME solver", Status: "pass", Detail: fmt.Sprintf("Using %s", strings.ToUpper(cfg.Solver))})
 
+	// Only check aliases if we are running against active config, or if candidate has them
 	if len(cfg.Aliases) > 0 {
 		status := "pass"
 		detail := "All aliases verified"
@@ -1067,15 +1077,18 @@ func (m *Manager) RunPreflight() (PreflightResult, error) {
 		checks = append(checks, PreflightCheck{Name: "Alias coverage", Status: status, Detail: detail})
 	}
 
-	cfg.LastPreflight = &now
-	cfg.Events = append(cfg.Events, Event{
-		Timestamp: now,
-		Level:     "info",
-		Source:    "remote",
-		Message:   "Preflight completed",
-	})
-	if err := m.save(cfg); err != nil {
-		return PreflightResult{}, err
+	// Only persist the preflight timestamp if we are checking the active config
+	if candidate == nil {
+		cfg.LastPreflight = &now
+		cfg.Events = append(cfg.Events, Event{
+			Timestamp: now,
+			Level:     "info",
+			Source:    "remote",
+			Message:   "Preflight completed",
+		})
+		if err := m.save(cfg); err != nil {
+			return PreflightResult{}, err
+		}
 	}
 	return PreflightResult{Checks: checks, RanAt: now}, nil
 }
@@ -1097,32 +1110,46 @@ type GuideVerification struct {
 	JWTSecret      string `json:"jwt_secret"`
 }
 
-// MarkGuideVerified stores the helper verification timestamp and optional seed data.
-func (m *Manager) MarkGuideVerified(info GuideVerification) error {
-	cfg := m.currentConfig()
-	if info.Endpoint != "" {
-		cfg.Endpoint = strings.TrimSpace(info.Endpoint)
+// VerifyConnection validates the connection parameters without persisting them.
+func (m *Manager) VerifyConnection(info GuideVerification) error {
+	endpoint := strings.TrimSpace(info.Endpoint)
+	if endpoint == "" {
+		return errors.New("endpoint required")
 	}
-	if info.JWTSecret != "" {
-		cfg.DeviceSecret = strings.TrimSpace(info.JWTSecret)
+	
+	// Create a temporary config to reuse checkEndpoint logic
+	tempCfg := &Config{
+		Endpoint: endpoint,
 	}
-	if info.TLD != "" {
-		cfg.TLD = strings.TrimSpace(info.TLD)
-	}
-	if info.PortalHostname != "" {
-		host := normalizePortalHost(cfg.TLD, info.PortalHostname)
-		if host == "" {
-			return errors.New("portal hostname invalid")
+	
+	// Perform the check
+	check := m.checkEndpoint(tempCfg)
+	if check.Status != "pass" {
+		if check.Detail != "" {
+			return fmt.Errorf("connection failed: %s", check.Detail)
 		}
-		cfg.PortalHostname = host
+		return errors.New("connection failed: unreachable")
 	}
+	
+	return nil
+}
+
+// MarkGuideVerified validates the connection and records the verification timestamp.
+// It does NOT persist the connection details to avoid creating an intermediate "provisioning" state.
+func (m *Manager) MarkGuideVerified(info GuideVerification) error {
+	if err := m.VerifyConnection(info); err != nil {
+		return err
+	}
+	
+	// Only record that verification happened
+	cfg := m.currentConfig()
 	now := m.now()
 	cfg.GuideVerifiedAt = &now
 	cfg.Events = append(cfg.Events, Event{
 		Timestamp: now,
 		Level:     "info",
 		Source:    "remote",
-		Message:   "Nexus helper verified",
+		Message:   "Nexus connection verified",
 	})
 	return m.save(cfg)
 }

@@ -163,8 +163,37 @@ func (s *GinServer) handleRemoteRotate(c *gin.Context) {
 // handleRemotePreflight runs a preflight validation.
 func (s *GinServer) handleRemotePreflight(c *gin.Context) {
 	var result remote.PreflightResult
+	
+	// Check if body is provided for stateless preflight
+	var req remote.ConfigureRequest
+	var candidate *remote.Config
+	
+	// BindJSON returns error if body is empty or invalid, but we want to support empty body (use active config)
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err == nil {
+			// Only treat as candidate if it has content.
+			// Clients sending {} should be treated as "check active config"
+			if req.Endpoint != "" || req.TLD != "" || req.PortalHostname != "" {
+				// Map request to config candidate
+				candidate = &remote.Config{
+					Endpoint:       req.Endpoint,
+					DeviceSecret:   req.DeviceSecret,
+					Solver:         req.Solver,
+					TLD:            req.TLD,
+					PortalHostname: req.PortalHostname,
+					DNSProvider:    req.DNSProvider,
+					DNSCredentials: req.DNSCredentials,
+				}
+				// Sanitize/Defaults similar to Configure()
+				if candidate.Solver == "" {
+					candidate.Solver = "http-01"
+				}
+			}
+		}
+	}
+
 	if s.dispatcher != nil {
-		resp, err := s.dispatcher.Dispatch(c.Request.Context(), remote.RunPreflightCommand{})
+		resp, err := s.dispatcher.Dispatch(c.Request.Context(), remote.RunPreflightCommand{Candidate: candidate})
 		if err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
@@ -180,7 +209,7 @@ func (s *GinServer) handleRemotePreflight(c *gin.Context) {
 		}
 		result = preResp.Result
 	} else {
-		resp, err := s.remoteManager.RunPreflight()
+		resp, err := s.remoteManager.RunPreflight(candidate)
 		if err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")

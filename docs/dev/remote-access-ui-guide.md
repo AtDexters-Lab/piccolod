@@ -28,7 +28,7 @@ The backend returns a specific `state` string derived from the configuration and
 | State | Condition | UI Implication |
 | :--- | :--- | :--- |
 | **`disabled`** | `enabled: false`, no config | **Fresh Install.** Show "Setup Remote Access" CTA / Setup Wizard. |
-| **`provisioning`** | `enabled: false`, partial config | **Paused/Draft.** Config exists but is off. Show "Resume Setup" or "Enable". |
+| **`stopped`** | `enabled: false`, config exists | **Paused.** Config is saved but off. Show Setup Wizard (pre-filled) or "Resume". |
 | **`preflight_required`** | `enabled: true`, no preflight run | **Incomplete.** Configuration is saved but not validated. Prompt to run Preflight. |
 | **`active`** | `enabled: true`, no issues | **Healthy.** Show full dashboard (Connection: Connected). |
 | **`warning`** | `enabled: true` + warnings present | **Degraded.** Show dashboard with warning badges (e.g., "Portal hostname missing"). |
@@ -46,37 +46,26 @@ The backend returns a specific `state` string derived from the configuration and
 
 ## 3. Configuration Flow (Setup Wizard)
 
-The setup process should be a multi-step wizard to ensure valid configuration.
+The setup process should be a multi-step wizard to ensure valid configuration. **Note: The backend is stateless during the wizard.** The UI must persist the form data in memory until the final step.
 
 ### Step 1: Nexus Helper (Optional but Helpful)
 If the user is self-hosting the Nexus relay, they need to run a command on their VPS.
 *   **GET** `/api/v1/remote/nexus-guide`
-*   **UI:** Display the `command` and `notes` returned by this endpoint.
-    *   *Why?* The backend provides the authoritative installer command and documentation URL (`docs_url`). **Do not hardcode these in the UI.**
-*   **Verification:** Use **POST** `/api/v1/remote/nexus-guide/verify` to "save progress" and confirm the user has the necessary connection details.
-    *   **Payload:**
-        ```json
-        {
-          "endpoint": "wss://...",
-          "tld": "...",
-          "portal_hostname": "...",
-          "jwt_secret": "..."
-        }
-        ```
-    *   *Note:* This acts as a partial save, persisting these fields to the config so they are pre-filled if the user returns.
+*   **UI:** Display the `command` and `notes`.
+*   **Verification:** Use **POST** `/api/v1/remote/nexus-guide/verify` to validate credentials.
+    *   **Payload:** `{ "endpoint": "...", "tld": "...", "portal_hostname": "...", "jwt_secret": "..." }`
+    *   **Stateless:** This validates the connection but **does not** save the config to disk.
+    *   **UI Logic:** On success, store these credentials in the wizard state (memory) and proceed to Step 2.
 
 ### Step 2: Preflight Checks
 Before finalizing, run validation to ensure the network environment is ready.
 *   **POST** `/api/v1/remote/preflight`
+*   **Payload:** Send the configuration gathered so far (from Step 1) to validate it against the backend.
+    *   Example: `{ "endpoint": "...", "device_secret": "...", "solver": "http-01", ... }`
 *   **Returns:** A list of checks with `name`, `status` (`pass`, `warn`, `fail`), and `detail`.
-*   **Actual Backend Checks:**
-    1.  **"Nexus endpoint reachable"**: TCP dial to the Nexus endpoint.
-    2.  **"DNS records"**: Verifies `portal_hostname` resolves and checks wildcard availability.
-    3.  **"ACME solver"**: Confirmation of selected solver mode.
-    4.  **"Alias coverage"**: (Optional) Verifies that defined aliases are in the `active` state (does **not** perform fresh DNS lookups for them).
 *   **UI:** Show the list. Block progress if any check status is `fail`.
 
-### Step 3: Configuration Form
+### Step 3: Configuration Form (Commit)
 **POST** `/api/v1/remote/configure`
 
 #### Fields:
@@ -116,6 +105,9 @@ Do **not** hardcode provider fields. Fetch them dynamically.
   }
 }
 ```
+*   **Action:** This is the **Commit** step. It saves the configuration to disk and enables the service.
+*   **Success:** Transition UI to "Active" dashboard.
+
 
 ---
 

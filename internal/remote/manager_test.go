@@ -79,7 +79,7 @@ func TestRunPreflightSuccess(t *testing.T) {
 		t.Fatalf("configure failed: %v", err)
 	}
 
-	result, err := m.RunPreflight()
+	result, err := m.RunPreflight(nil)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestRunPreflightFailures(t *testing.T) {
 		DNSProvider:    "cloudflare",
 	})
 
-	result, err := m.RunPreflight()
+	result, err := m.RunPreflight(nil)
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}

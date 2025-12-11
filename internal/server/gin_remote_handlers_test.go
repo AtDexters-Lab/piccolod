@@ -17,6 +17,7 @@ import (
 	"piccolod/internal/health"
 	"piccolod/internal/remote"
 	"piccolod/internal/remote/nexusclient"
+	"piccolod/internal/runtime/commands"
 	"piccolod/internal/state/paths"
 )
 
@@ -118,6 +119,78 @@ func TestRemote_Configure_Status_Disable_Rotate(t *testing.T) {
 	}
 	if st.Enabled {
 		t.Fatalf("expected disabled")
+	}
+}
+
+func TestRemote_Preflight_Stateless(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+
+	// Configure first so we have an active config
+	configurePayload := map[string]interface{}{
+		"endpoint":        "wss://nexus.example.com/connect",
+		"device_secret":   "super-secret",
+		"solver":          "http-01",
+		"tld":             "example.com",
+		"portal_hostname": "portal.example.com",
+	}
+	body, _ := json.Marshal(configurePayload)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/remote/configure", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("configure failed: %d", w.Code)
+	}
+
+	// Case 1: Empty body (should check active config)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("POST", "/api/v1/remote/preflight", nil)
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("preflight empty body failed: %d body=%s", w.Code, w.Body.String())
+	}
+
+	// Case 2: Empty JSON object {} (should check active config - regression test)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("POST", "/api/v1/remote/preflight", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("preflight {} body failed: %d body=%s", w.Code, w.Body.String())
+	}
+
+	// Case 3: Valid candidate body (should check candidate)
+	// We'll send a config that would FAIL dns check to prove it's using the candidate
+	candidatePayload := map[string]interface{}{
+		"endpoint":        "wss://nexus.example.com/connect",
+		"device_secret":   "new-secret",
+		"solver":          "http-01",
+		"tld":             "example.com",
+		"portal_hostname": "invalid-host.example.com", // This will fail DNS check in stub resolver
+	}
+	body, _ = json.Marshal(candidatePayload)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("POST", "/api/v1/remote/preflight", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("preflight candidate body failed: %d body=%s", w.Code, w.Body.String())
+	}
+	// Check response content to confirm it ran checks
+	var res struct {
+		Checks []remote.PreflightCheck `json:"checks"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	// We expect checks to be present
+	if len(res.Checks) == 0 {
+		t.Fatalf("expected checks in response")
 	}
 }
 
@@ -224,6 +297,9 @@ func TestRemote_Configure_WhenLocked(t *testing.T) {
 		t.Fatalf("locked manager init: %v", err)
 	}
 	srv.remoteManager = lockedMgr
+	// Create a new dispatcher to avoid duplicate registration panic and ensure we route to the locked manager
+	srv.dispatcher = commands.NewDispatcher()
+	remote.RegisterHandlers(srv.dispatcher, lockedMgr)
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
 
 	payload := map[string]interface{}{

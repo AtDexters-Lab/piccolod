@@ -50,6 +50,9 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         widget.controller.wizardStep = 1;
         // Auto-run preflight if we are resuming into this state
         _autoRunPreflight();
+      } else if (status.state == 'provisioning') {
+        // [New] Resume at configuration step if we have partial config
+        widget.controller.wizardStep = 2;
       }
     }
 

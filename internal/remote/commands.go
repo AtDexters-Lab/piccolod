@@ -46,7 +46,9 @@ type RotateSecretResponse struct {
 	Secret string
 }
 
-type RunPreflightCommand struct{}
+type RunPreflightCommand struct{
+	Candidate *Config
+}
 
 func (RunPreflightCommand) Name() string { return CommandRunPreflight }
 
@@ -130,10 +132,11 @@ func (m *Manager) handleRotateSecretCommand(ctx context.Context, cmd commands.Co
 }
 
 func (m *Manager) handleRunPreflightCommand(ctx context.Context, cmd commands.Command) (commands.Response, error) {
-	if _, ok := cmd.(RunPreflightCommand); !ok {
+	request, ok := cmd.(RunPreflightCommand)
+	if !ok {
 		return nil, ErrInvalidCommand
 	}
-	result, err := m.RunPreflight()
+	result, err := m.RunPreflight(request.Candidate)
 	if err != nil {
 		return nil, err
 	}
