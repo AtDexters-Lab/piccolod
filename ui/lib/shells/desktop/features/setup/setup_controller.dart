@@ -26,9 +26,6 @@ class SetupController extends ChangeNotifier {
   String? _error;
   String? get error => _error;
 
-  final String _deviceName = "Piccolo Node";
-  String get deviceName => _deviceName;
-
   List<String> _recoveryWords = [];
   List<String> get recoveryWords => _recoveryWords;
 
@@ -81,6 +78,10 @@ class SetupController extends ChangeNotifier {
 
   Future<bool> submitCredentials(String password) async {
     try {
+      _state = SetupState.finishing;
+      _error = null;
+      notifyListeners();
+
       // 1. Initialize Crypto
       await _api.post('/api/v1/crypto/setup', body: {'password': password});
 
@@ -114,6 +115,7 @@ class SetupController extends ChangeNotifier {
       }
     } catch (e) {
       _error = e.toString();
+      _state = SetupState.credentials;
       notifyListeners();
       return false;
     }

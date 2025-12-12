@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../../../theme/piccolo_theme.dart';
-import '../../../../shared/piccolo_wordmark.dart';
 import '../../../../core/utils/downloader/downloader.dart';
-import '../../../../core/utils/clipboard/clipboard.dart';
 import '../../../../shared/widgets/password_set_form.dart';
 import 'setup_controller.dart';
 
@@ -24,73 +22,97 @@ class _SetupWizardState extends State<SetupWizard> {
     return ListenableBuilder(
       listenable: _controller,
       builder: (context, child) {
+        final state = _controller.state;
         // If complete, trigger callback
-        if (_controller.state == SetupState.complete && !_didCallComplete) {
+        if (state == SetupState.complete && !_didCallComplete) {
           _didCallComplete = true;
           // Schedule callback to avoid build-phase issues
           WidgetsBinding.instance.addPostFrameCallback(
             (_) => widget.onComplete(_controller.isFirstSetupFlow),
           );
           return const SizedBox.shrink();
-        } else if (_controller.state == SetupState.complete) {
+        } else if (state == SetupState.complete) {
           return const SizedBox.shrink();
         }
 
-        return Container(
-          color: Colors.black.withValues(alpha: 0.5),
-          child: Center(
-            child: Container(
-              width: 480,
-              constraints: const BoxConstraints(maxHeight: 600),
-              decoration: BoxDecoration(
-                color: PiccoloTheme.porcelain,
-                borderRadius: BorderRadius.circular(24),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.2),
-                    blurRadius: 40,
-                    offset: const Offset(0, 20),
-                  ),
-                ],
-                border: Border.all(color: Colors.white, width: 1),
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // Header
-                  Padding(
-                    padding: const EdgeInsets.all(32.0),
-                    child: Column(
-                      children: [
-                        const PiccoloWordmark(
-                          height: 24,
-                          color: PiccoloTheme.ink,
-                        ),
-                        const SizedBox(height: 8),
-                        if (_controller.state == SetupState.loading)
-                          const Text("Checking status...")
-                        else
-                          Text(
-                            _getTitleForState(_controller.state),
-                            style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
-                              color: PiccoloTheme.inkMuted,
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final dialogWidth = (constraints.maxWidth * 0.9).clamp(
+              360.0,
+              480.0,
+            );
+            final dialogMaxHeight = (constraints.maxHeight * 0.9).clamp(
+              420.0,
+              600.0,
+            );
+            final showFirstRunStepper =
+                _controller.isFirstSetupFlow &&
+                (state == SetupState.welcome ||
+                    state == SetupState.credentials ||
+                    state == SetupState.finishing ||
+                    state == SetupState.recovery);
 
-                  // Content Body
-                  Flexible(
-                    child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 300),
-                      child: _buildStepContent(_controller.state),
-                    ),
+            return Container(
+              color: Colors.black.withValues(alpha: 0.5),
+              child: Center(
+                child: Container(
+                  width: dialogWidth,
+                  constraints: BoxConstraints(maxHeight: dialogMaxHeight),
+                  decoration: BoxDecoration(
+                    color: PiccoloTheme.porcelain,
+                    borderRadius: BorderRadius.circular(24),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.2),
+                        blurRadius: 40,
+                        offset: const Offset(0, 20),
+                      ),
+                    ],
+                    border: Border.all(color: Colors.white, width: 1),
                   ),
-                ],
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Header (logo-free)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(24, 24, 24, 16),
+                        child: Column(
+                          children: [
+                            if (state == SetupState.loading)
+                              const Text("Checking status...")
+                            else if (state != SetupState.welcome)
+                              Text(
+                                _getTitleForState(state),
+                                style: PiccoloTheme.textTheme.bodyMedium
+                                    ?.copyWith(color: PiccoloTheme.inkMuted),
+                              ),
+                            if (showFirstRunStepper) ...[
+                              if (state != SetupState.loading)
+                                const SizedBox(height: 12),
+                              _FirstRunStepper(
+                                currentStep: _getFirstRunStepIndex(state),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+
+                      // Content Body (scrolls on small desktop windows)
+                      Flexible(
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 300),
+                            child: _buildStepContent(state),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
-            ),
-          ),
+            );
+          },
         );
       },
     );
@@ -101,11 +123,11 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.welcome:
         return "Welcome";
       case SetupState.credentials:
-        return "Create Admin Account";
+        return "Create admin password";
       case SetupState.recovery:
-        return "Recovery Key";
+        return "Recovery key";
       case SetupState.finishing:
-        return "Finishing up...";
+        return "Setting up...";
       case SetupState.unlock:
         return "Unlock Device";
       case SetupState.login:
@@ -119,6 +141,20 @@ class _SetupWizardState extends State<SetupWizard> {
     }
   }
 
+  int _getFirstRunStepIndex(SetupState state) {
+    switch (state) {
+      case SetupState.welcome:
+        return 0;
+      case SetupState.credentials:
+      case SetupState.finishing:
+        return 1;
+      case SetupState.recovery:
+        return 2;
+      default:
+        return 0;
+    }
+  }
+
   Widget _buildStepContent(SetupState state) {
     switch (state) {
       case SetupState.loading:
@@ -127,12 +163,16 @@ class _SetupWizardState extends State<SetupWizard> {
           child: CircularProgressIndicator(color: PiccoloTheme.cobalt600),
         );
       case SetupState.welcome:
-        return _WelcomeStep(
-          deviceName: _controller.deviceName,
-          onNext: _controller.startSetup,
-        );
+        return _WelcomeStep(onNext: _controller.startSetup);
       case SetupState.credentials:
-        return _CredentialsStep(onSubmit: _controller.submitCredentials);
+        return _CredentialsStep(
+          onSubmit: _controller.submitCredentials,
+          initialError: _controller.error != null
+              ? "Setup failed. Please try again."
+              : null,
+        );
+      case SetupState.finishing:
+        return const _FinishingStep();
       case SetupState.recovery:
         return _RecoveryStep(
           words: _controller.recoveryWords,
@@ -166,11 +206,95 @@ class _SetupWizardState extends State<SetupWizard> {
 
 // --- Steps ---
 
+class _FirstRunStepper extends StatelessWidget {
+  final int currentStep;
+
+  const _FirstRunStepper({required this.currentStep});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        _buildStepIndicator(0, "Welcome"),
+        _buildStepSeparator(),
+        _buildStepIndicator(1, "Password"),
+        _buildStepSeparator(),
+        _buildStepIndicator(2, "Recovery"),
+      ],
+    );
+  }
+
+  Widget _buildStepIndicator(int step, String label) {
+    final isActive = step == currentStep;
+    final isCompleted = step < currentStep;
+
+    return Expanded(
+      child: Column(
+        children: [
+          CircleAvatar(
+            radius: 12,
+            backgroundColor: isActive || isCompleted
+                ? PiccoloTheme.cobalt600
+                : PiccoloTheme.mist,
+            foregroundColor: isActive || isCompleted
+                ? Colors.white
+                : PiccoloTheme.inkMuted,
+            child: isCompleted
+                ? const Icon(Icons.check, size: 14)
+                : Text("${step + 1}", style: const TextStyle(fontSize: 12)),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: isActive ? FontWeight.w600 : FontWeight.normal,
+              color: isActive ? PiccoloTheme.ink : PiccoloTheme.inkMuted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStepSeparator() {
+    return const SizedBox(width: 24, child: Divider(height: 1));
+  }
+}
+
+class _FinishingStep extends StatelessWidget {
+  const _FinishingStep();
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 24, 32, 48),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const CircularProgressIndicator(color: PiccoloTheme.cobalt600),
+          const SizedBox(height: 24),
+          Text(
+            "Encrypting storage and creating your admin…",
+            style: PiccoloTheme.textTheme.bodyLarge,
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            "This usually takes a few seconds.",
+            style: PiccoloTheme.textTheme.labelSmall,
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _WelcomeStep extends StatelessWidget {
-  final String deviceName;
   final VoidCallback onNext;
 
-  const _WelcomeStep({required this.deviceName, required this.onNext});
+  const _WelcomeStep({required this.onNext});
 
   @override
   Widget build(BuildContext context) {
@@ -180,13 +304,13 @@ class _WelcomeStep extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           Text(
-            "Hello, $deviceName",
+            "Hello",
             style: PiccoloTheme.textTheme.displayLarge,
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 16),
           Text(
-            "Let's set up your Digital Sanctuary.",
+            "Let’s set up your Piccolo.\nCreate an admin password and save a recovery key. Takes about a minute.",
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               color: PiccoloTheme.inkMuted,
             ),
@@ -204,7 +328,7 @@ class _WelcomeStep extends StatelessWidget {
               ),
               elevation: 2,
             ),
-            child: const Text("Start Setup"),
+            child: const Text("Start setup"),
           ),
         ],
       ),
@@ -214,8 +338,9 @@ class _WelcomeStep extends StatelessWidget {
 
 class _CredentialsStep extends StatefulWidget {
   final Future<bool> Function(String) onSubmit;
+  final String? initialError;
 
-  const _CredentialsStep({required this.onSubmit});
+  const _CredentialsStep({required this.onSubmit, this.initialError});
 
   @override
   State<_CredentialsStep> createState() => _CredentialsStepState();
@@ -227,6 +352,22 @@ class _CredentialsStepState extends State<_CredentialsStep> {
   String? _error;
   String? _confirmError;
   bool _isSubmitting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _error = widget.initialError;
+  }
+
+  @override
+  void didUpdateWidget(covariant _CredentialsStep oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.initialError != oldWidget.initialError &&
+        widget.initialError != null &&
+        _error == null) {
+      setState(() => _error = widget.initialError);
+    }
+  }
 
   @override
   void dispose() {
@@ -273,13 +414,15 @@ class _CredentialsStepState extends State<_CredentialsStep> {
             PasswordSetForm(
               passwordController: _passController,
               confirmController: _confirmController,
+              passwordLabel: "Admin password",
+              confirmLabel: "Confirm password",
               passwordError: _error,
               confirmError: _confirmError,
               onSubmitted: _submit,
             ),
             const SizedBox(height: 16),
             const Text(
-              "This password secures your device. Don't lose it.",
+              "This password encrypts storage and unlocks Piccolo. Keep it somewhere safe.",
               style: TextStyle(color: PiccoloTheme.inkMuted, fontSize: 13),
             ),
             const SizedBox(height: 32),
@@ -302,7 +445,7 @@ class _CredentialsStepState extends State<_CredentialsStep> {
                         strokeWidth: 2,
                       ),
                     )
-                  : const Text("Create Account"),
+                  : const Text("Continue"),
             ),
           ],
         ),
@@ -323,28 +466,6 @@ class _RecoveryStep extends StatefulWidget {
 
 class _RecoveryStepState extends State<_RecoveryStep> {
   bool _confirmed = false;
-
-  Future<void> _copyToClipboard() async {
-    try {
-      await copyText(widget.words.join(" "));
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("Recovery key copied to clipboard"),
-          duration: Duration(seconds: 2),
-        ),
-      );
-    } catch (e) {
-      // Fallback for some web contexts
-      debugPrint("Clipboard error: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("Failed to copy. Please download the file instead."),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
-  }
 
   void _downloadKey() {
     final content =
@@ -367,78 +488,80 @@ class _RecoveryStepState extends State<_RecoveryStep> {
         mainAxisSize: MainAxisSize.min,
         children: [
           Text(
-            "Save this Recovery Key",
+            "Your recovery key",
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               fontWeight: FontWeight.bold,
             ),
           ),
-          const SizedBox(height: 16),
-          SelectionArea(
-            child: Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: PiccoloTheme.ink.withValues(alpha: 0.1),
-                ),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: PiccoloTheme.mist,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: PiccoloTheme.cobalt600.withValues(alpha: 0.35),
+                width: 1.2,
               ),
-              constraints: const BoxConstraints(
-                maxHeight: 160,
-              ), // slightly reduced to fit buttons
-              child: SingleChildScrollView(
-                child: Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: widget.words.asMap().entries.map((e) {
-                    return Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
-                      ),
-                      decoration: BoxDecoration(
-                        color: PiccoloTheme.mist,
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: Text(
-                        "${e.key + 1}. ${e.value}",
-                        style: const TextStyle(
-                          fontFamily: 'monospace',
-                          fontSize: 12,
-                        ),
-                      ),
-                    );
-                  }).toList(),
+            ),
+            child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  Icons.info_outline,
+                  color: PiccoloTheme.inkMuted,
+                  size: 18,
                 ),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    "Your 24-word recovery key is below. Store it offline; you’ll need it to reset your password.",
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: PiccoloTheme.inkMuted,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 18),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: PiccoloTheme.porcelain,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: PiccoloTheme.ink.withValues(alpha: 0.06),
+              ),
+            ),
+            constraints: const BoxConstraints(maxHeight: 150),
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SelectableText(
+                    widget.words.join(" "),
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 16,
+                      height: 1.4,
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 18),
 
-          // Action Buttons
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              OutlinedButton.icon(
-                onPressed: _copyToClipboard,
-                icon: const Icon(Icons.copy, size: 16),
-                label: const Text("Copy"),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: PiccoloTheme.ink,
-                ),
-              ),
-              const SizedBox(width: 16),
-              OutlinedButton.icon(
-                onPressed: _downloadKey,
-                icon: const Icon(Icons.download, size: 16),
-                label: const Text("Download"),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: PiccoloTheme.ink,
-                ),
-              ),
-            ],
+          // Download button (clipboard copy is unreliable in insecure contexts)
+          OutlinedButton.icon(
+            onPressed: _downloadKey,
+            icon: const Icon(Icons.download, size: 16),
+            label: const Text("Download key"),
+            style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.ink),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: 20),
 
           // Confirmation Checkbox
           InkWell(
@@ -452,7 +575,7 @@ class _RecoveryStepState extends State<_RecoveryStep> {
                 ),
                 Expanded(
                   child: Text(
-                    "I have saved this key in a safe place.",
+                    "I’ve saved this recovery key somewhere safe.",
                     style: PiccoloTheme.textTheme.bodyMedium,
                   ),
                 ),
@@ -473,7 +596,7 @@ class _RecoveryStepState extends State<_RecoveryStep> {
                 borderRadius: BorderRadius.circular(12),
               ),
             ),
-            child: const Text("Finish Setup"),
+            child: const Text("Finish setup"),
           ),
         ],
       ),
@@ -922,14 +1045,43 @@ class _ErrorStep extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.error_outline, color: Colors.red, size: 48),
-          const SizedBox(height: 16),
+          const Icon(
+            Icons.wifi_off_outlined,
+            color: PiccoloTheme.critical,
+            size: 48,
+          ),
+          const SizedBox(height: 12),
           Text(
-            error,
-            style: const TextStyle(color: Colors.red),
+            "We couldn’t reach Piccolo.",
+            style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
             textAlign: TextAlign.center,
           ),
-          const SizedBox(height: 32),
+          const SizedBox(height: 8),
+          const Text(
+            "Check that your device is online, then try again.",
+            style: TextStyle(color: PiccoloTheme.inkMuted, fontSize: 13),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 12),
+          ExpansionTile(
+            tilePadding: EdgeInsets.zero,
+            childrenPadding: EdgeInsets.zero,
+            title: const Text("Details", style: TextStyle(fontSize: 13)),
+            children: [
+              SelectionArea(
+                child: Text(
+                  error,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: PiccoloTheme.inkMuted,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
           ElevatedButton.icon(
             onPressed: onRetry,
             icon: const Icon(Icons.refresh),
