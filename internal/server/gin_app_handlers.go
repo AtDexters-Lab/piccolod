@@ -14,6 +14,7 @@ import (
 	"piccolod/internal/app"
 	"piccolod/internal/persistence"
 	"piccolod/internal/remote"
+	"piccolod/internal/services"
 )
 
 func determineScheme(flow api.ListenerFlow, protocol api.ListenerProtocol) string {
@@ -81,6 +82,31 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	for h := range hosts {
 		s.remoteManager.QueueHostnameCertificate(h)
 	}
+}
+
+func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, tld string) map[string]struct{} {
+	hosts := map[string]struct{}{}
+	tld = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(tld)), ".")
+	if tld == "" {
+		return hosts
+	}
+	for _, ep := range endpoints {
+		if ep.Flow == api.FlowTLS {
+			continue
+		}
+		switch ep.Protocol {
+		case api.ListenerProtocolHTTP, api.ListenerProtocolWebsocket:
+		default:
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(ep.Name))
+		if name == "" || !isValidDNSLabel(name) {
+			continue
+		}
+		host := name + "." + tld
+		hosts[host] = struct{}{}
+	}
+	return hosts
 }
 
 func isValidDNSLabel(label string) bool {
@@ -223,6 +249,17 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		return
 	}
 
+	// Capture existing remote hosts for this app so we can clean up removed listeners after upsert.
+	var oldHosts map[string]struct{}
+	if s.remoteManager != nil && s.serviceManager != nil {
+		st := s.remoteManager.Status()
+		if st.TLD != "" {
+			if eps, err := s.serviceManager.GetByApp(appDef.Name); err == nil {
+				oldHosts = remoteHostsForEndpoints(eps, st.TLD)
+			}
+		}
+	}
+
 	if err := s.ensureAppVolume(c.Request.Context(), appDef); err != nil {
 		writeGinError(c, http.StatusInternalServerError, err.Error())
 		return
@@ -236,6 +273,21 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		}
 		writeGinError(c, http.StatusInternalServerError, "Failed to install app: "+err.Error())
 		return
+	}
+
+	// Clean up certificates for listeners that were removed in this upsert.
+	if oldHosts != nil && s.remoteManager != nil && s.serviceManager != nil {
+		st := s.remoteManager.Status()
+		if st.TLD != "" {
+			if newEps, err := s.serviceManager.GetByApp(appInstance.Name); err == nil {
+				newHosts := remoteHostsForEndpoints(newEps, st.TLD)
+				for h := range oldHosts {
+					if _, ok := newHosts[h]; !ok {
+						s.remoteManager.RemoveHostnameCertificate(h)
+					}
+				}
+			}
+		}
 	}
 
 	s.queueAppRemoteCertificates(appInstance.Name)
@@ -302,6 +354,17 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 		purge = true
 	}
 
+	// Capture current remote hosts to clean up after uninstall.
+	var hostsToRemove map[string]struct{}
+	if s.remoteManager != nil && s.serviceManager != nil {
+		st := s.remoteManager.Status()
+		if st.TLD != "" {
+			if eps, err := s.serviceManager.GetByApp(appName); err == nil {
+				hostsToRemove = remoteHostsForEndpoints(eps, st.TLD)
+			}
+		}
+	}
+
 	err := s.appManager.UninstallWithOptions(c.Request.Context(), appName, purge)
 	if err != nil {
 		if handleAppManagerError(c, err, "uninstall app") {
@@ -313,6 +376,12 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 			writeGinError(c, http.StatusInternalServerError, "Failed to uninstall app: "+err.Error())
 		}
 		return
+	}
+
+	if hostsToRemove != nil && s.remoteManager != nil {
+		for h := range hostsToRemove {
+			s.remoteManager.RemoveHostnameCertificate(h)
+		}
 	}
 
 	if purge {

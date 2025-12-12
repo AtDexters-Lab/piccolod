@@ -163,11 +163,11 @@ func (s *GinServer) handleRemoteRotate(c *gin.Context) {
 // handleRemotePreflight runs a preflight validation.
 func (s *GinServer) handleRemotePreflight(c *gin.Context) {
 	var result remote.PreflightResult
-	
+
 	// Check if body is provided for stateless preflight
 	var req remote.ConfigureRequest
 	var candidate *remote.Config
-	
+
 	// BindJSON returns error if body is empty or invalid, but we want to support empty body (use active config)
 	if c.Request.ContentLength > 0 {
 		if err := c.ShouldBindJSON(&req); err == nil {
@@ -407,6 +407,14 @@ func (s *GinServer) handleRemoteDNSProviders(c *gin.Context) {
 			"fields": []gin.H{
 				{"id": "access_key", "label": "Access Key ID"},
 				{"id": "secret_key", "label": "Secret Access Key", "secret": true},
+			},
+		},
+		{
+			"id":       "gandi",
+			"name":     "Gandi.net LiveDNS",
+			"docs_url": "https://go-acme.github.io/lego/dns/gandiv5/",
+			"fields": []gin.H{
+				{"id": "api_key", "label": "API Key", "secret": true},
 			},
 		},
 	}

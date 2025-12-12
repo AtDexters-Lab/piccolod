@@ -22,6 +22,7 @@ type FileCertProvider struct {
 	mu         sync.RWMutex
 	cache      map[string]*tls.Certificate
 	portalHost string
+	missing    func(host string)
 }
 
 // NewFileCertProvider constructs a provider rooted at <control>/remote/certs when
@@ -72,6 +73,12 @@ func (p *FileCertProvider) GetCertificate(host string) (*tls.Certificate, error)
 			}
 		}
 	}
+	p.mu.RLock()
+	missing := p.missing
+	p.mu.RUnlock()
+	if missing != nil {
+		go missing(host)
+	}
 	return nil, services.ErrNoCert
 }
 
@@ -92,6 +99,14 @@ func (p *FileCertProvider) SetPortalHostname(host string) {
 	host = strings.TrimSuffix(strings.ToLower(host), ".")
 	p.mu.Lock()
 	p.portalHost = host
+	p.mu.Unlock()
+}
+
+// SetMissingHandler registers a callback invoked when a cert is requested but not found.
+// The handler is called asynchronously.
+func (p *FileCertProvider) SetMissingHandler(fn func(host string)) {
+	p.mu.Lock()
+	p.missing = fn
 	p.mu.Unlock()
 }
 

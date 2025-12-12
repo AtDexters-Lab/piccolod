@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,7 @@ func fixedNow(t time.Time) func() time.Time {
 }
 
 func TestRunPreflightSuccess(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
 	dir := t.TempDir()
 	dial := &stubDialer{}
 	res := &stubResolver{
@@ -78,6 +80,7 @@ func TestRunPreflightSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("configure failed: %v", err)
 	}
+	waitForCertNotPending(t, m, "portal", 200*time.Millisecond)
 
 	result, err := m.RunPreflight(nil)
 	if err != nil {
@@ -138,6 +141,7 @@ func (f *fakeAdapter) awaitStop(timeout time.Duration) error {
 }
 
 func TestManager_NexusAdapterLifecycle(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
 	dir := t.TempDir()
 	storage, err := newFileStorage(dir)
 	if err != nil {
@@ -159,6 +163,7 @@ func TestManager_NexusAdapterLifecycle(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
+	waitForCertNotPending(t, m, "portal", 200*time.Millisecond)
 	if adapter.config.TLD != "example.com" {
 		t.Fatalf("expected TLD to propagate, got %s", adapter.config.TLD)
 	}
@@ -179,6 +184,7 @@ func TestManager_NexusAdapterLifecycle(t *testing.T) {
 }
 
 func TestRunPreflightFailures(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
 	dir := t.TempDir()
 	dial := &stubDialer{err: errors.New("dial failed")}
 	res := &stubResolver{}
@@ -199,6 +205,7 @@ func TestRunPreflightFailures(t *testing.T) {
 		PortalHostname: "portal.example.com",
 		DNSProvider:    "cloudflare",
 	})
+	waitForCertNotPending(t, m, "portal", 200*time.Millisecond)
 
 	result, err := m.RunPreflight(nil)
 	if err != nil {
@@ -213,5 +220,138 @@ func TestRunPreflightFailures(t *testing.T) {
 	}
 	if !foundFail {
 		t.Fatalf("expected failure check, got %+v", result.Checks)
+	}
+}
+
+func waitForCertNotPending(t *testing.T, m *Manager, id string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, c := range m.ListCertificates() {
+			if c.ID == id && !strings.EqualFold(c.Status, "pending") {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestConfigure_DNS01SeedsWildcardWithApex(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m, err := newManagerWithDeps(storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(4, 0)))
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+
+	if err := m.Configure(ConfigureRequest{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		Solver:         "dns-01",
+		TLD:            "example.com",
+		PortalHostname: "portal.example.com",
+		DNSProvider:    "cloudflare",
+	}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	var wildcard *Certificate
+	for _, c := range m.ListCertificates() {
+		if c.ID == "wildcard" {
+			cc := c
+			wildcard = &cc
+			break
+		}
+	}
+	if wildcard == nil {
+		t.Fatalf("expected wildcard certificate entry")
+	}
+	if len(wildcard.Domains) != 2 || wildcard.Domains[0] != "*.example.com" || wildcard.Domains[1] != "example.com" {
+		t.Fatalf("unexpected wildcard domains: %v", wildcard.Domains)
+	}
+}
+
+func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m, err := newManagerWithDeps(storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(10, 0)))
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	now := m.now()
+	cfg := m.currentConfig()
+	cfg.Certificates = []Certificate{{
+		ID:       "portal",
+		Domains:  []string{"portal.example.com"},
+		Status:   "ok",
+		Attempts: 2,
+	}}
+	if err := m.save(cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	m.updateCertFailure("portal", "boom")
+
+	var portal Certificate
+	for _, c := range m.ListCertificates() {
+		if c.ID == "portal" {
+			portal = c
+		}
+	}
+	if portal.Status != "error" {
+		t.Fatalf("expected status error, got %s", portal.Status)
+	}
+	if portal.RetryAt == nil || !portal.RetryAt.After(now) {
+		t.Fatalf("expected retry_at after now, got %v", portal.RetryAt)
+	}
+}
+
+func TestRemoveAliasRemovesCertificateEntry(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m, err := newManagerWithDeps(storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(20, 0)))
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+
+	alias, err := m.AddAlias("portal", "foo.example.com")
+	if err != nil {
+		t.Fatalf("add alias: %v", err)
+	}
+
+	waitForCertEntry(t, m, "alias:foo.example.com", 200*time.Millisecond)
+
+	if err := m.RemoveAlias(alias.ID); err != nil {
+		t.Fatalf("remove alias: %v", err)
+	}
+
+	for _, c := range m.ListCertificates() {
+		if c.ID == "alias:foo.example.com" {
+			t.Fatalf("expected alias cert to be removed, still present")
+		}
+	}
+}
+
+func waitForCertEntry(t *testing.T, m *Manager, id string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, c := range m.ListCertificates() {
+			if c.ID == id {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

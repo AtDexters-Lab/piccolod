@@ -81,6 +81,10 @@ Before finalizing, run validation to ensure the network environment is ready.
 5.  **Solver (`solver`):**
     *   Dropdown: `http-01` or `dns-01`.
     *   *Note:* `http-01` is easier but requires port 80 to be open/forwarded. `dns-01` supports wildcards but requires API keys.
+    *   **Behavior:**
+        *   `dns-01`: Piccolo issues a single “core” certificate covering both `<tld>` and `*.<tld>`. All apps exposed as `<listener>.<tld>` are automatically covered by the wildcard.
+        *   `http-01`: Piccolo issues a portal certificate for `portal_hostname` and per‑listener certificates for HTTP/WS app endpoints (`<listener>.<tld>`). Apps installed before or after remote enable are queued automatically.
+    *   **Reliability:** Failed issuances are retried with exponential backoff. Certificate inventory includes `attempts`, `last_attempt`, and `retry_at` for UI visibility, plus manual renew actions.
 
 #### Dynamic DNS Provider Fields (If Solver is `dns-01`)
 Do **not** hardcode provider fields. Fetch them dynamically.

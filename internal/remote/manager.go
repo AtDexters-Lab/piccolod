@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,6 +72,9 @@ type Certificate struct {
 	ID            string     `json:"id"`
 	Domains       []string   `json:"domains"`
 	Solver        string     `json:"solver,omitempty"`
+	Attempts      int        `json:"attempts,omitempty"`
+	LastAttempt   *time.Time `json:"last_attempt,omitempty"`
+	RetryAt       *time.Time `json:"retry_at,omitempty"`
 	IssuedAt      *time.Time `json:"issued_at,omitempty"`
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 	NextRenewal   *time.Time `json:"next_renewal,omitempty"`
@@ -155,6 +159,10 @@ type Manager struct {
 	challenges    *ChallengeManager
 	acmeMgr       *acme.Manager
 	renewCancel   context.CancelFunc
+	issueCancel   context.CancelFunc
+	issueCh       chan issuanceJob
+	issueMu       sync.Mutex
+	issueQueued   map[string]struct{}
 	needsReload   atomic.Bool
 	eventsBus     *events.Bus
 	baseDir       string
@@ -201,6 +209,11 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 	m.challenges = NewChallengeManager()
 	// ACME manager (wire later on configure)
 	m.acmeMgr = acme.NewManager(baseDir, m.challenges, "", os.Getenv("PICCOLO_ACME_DIR_URL"))
+	m.issueCh = make(chan issuanceJob, 32)
+	m.issueQueued = make(map[string]struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	m.issueCancel = cancel
+	go m.runIssuanceWorker(ctx)
 	if storage != nil {
 		cfg, err := storage.Load(context.Background())
 		if err != nil {
@@ -220,7 +233,8 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 	if m.cfg == nil {
 		m.cfg = &Config{}
 	}
-	m.updateACMEEmail(m.cfg)
+	m.updateACMEConfig(m.cfg)
+	m.requeueOutstandingIssuances()
 	return m, nil
 }
 
@@ -322,7 +336,7 @@ func (m *Manager) save(cfg *Config) error {
 	m.cfg = cfg
 	m.needsReload.Store(false)
 	m.applyAdapterState()
-	m.updateACMEEmail(cfg)
+	m.updateACMEConfig(cfg)
 	m.publishConfigChanged()
 	return nil
 }
@@ -345,8 +359,9 @@ func (m *Manager) reloadFromStorage() error {
 	m.cfg = &cfg
 	m.needsReload.Store(false)
 	m.applyAdapterState()
-	m.updateACMEEmail(&cfg)
+	m.updateACMEConfig(&cfg)
 	m.publishConfigChanged()
+	m.requeueOutstandingIssuances()
 	return nil
 }
 
@@ -478,6 +493,9 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	email := deriveACMEEmail(tld, portalHost)
 	if m.acmeMgr != nil {
 		m.acmeMgr.SetEmail(email)
+		if err := m.acmeMgr.SetSolver(solver, req.DNSProvider, req.DNSCredentials); err != nil {
+			return err
+		}
 	}
 
 	if solver == "dns-01" && strings.TrimSpace(req.DNSProvider) == "" {
@@ -489,6 +507,7 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	nextRenewal := now.Add(60 * 24 * time.Hour)
 
 	cfg := m.currentConfig()
+	existingCerts := append([]Certificate(nil), cfg.Certificates...)
 	cfg.Endpoint = endpoint
 	cfg.DeviceSecret = strings.TrimSpace(req.DeviceSecret)
 	cfg.Solver = solver
@@ -505,10 +524,18 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	// Assume preflight passed during setup wizard; prevent immediate warning state
 	cfg.LastPreflight = &now
 	// Queue background ACME issuance and surface events/inventory.
-	cfg.Certificates = defaultCertificates(cfg, now)
+	newCerts := defaultCertificates(cfg, now)
+	for _, c := range existingCerts {
+		if c.ID == "portal" || c.ID == "wildcard" {
+			continue
+		}
+		newCerts = append(newCerts, c)
+	}
+	cfg.Certificates = newCerts
 	m.enqueueIssuance("portal", []string{cfg.PortalHostname}, cfg.PortalHostname)
 	if cfg.TLD != "" && strings.EqualFold(cfg.Solver, "dns-01") {
-		m.enqueueIssuance("wildcard", []string{"*." + cfg.TLD}, "*."+cfg.TLD)
+		cn := "*." + cfg.TLD
+		m.enqueueIssuance("wildcard", []string{cn, cfg.TLD}, cn)
 	}
 	cfg.Events = append(cfg.Events, Event{
 		Timestamp: now,
@@ -624,7 +651,73 @@ func (m *Manager) RemoveAlias(id string) error {
 		Source:    "remote",
 		Message:   fmt.Sprintf("Alias %s removed", removed.Hostname),
 	})
-	return m.save(cfg)
+	if err := m.save(cfg); err != nil {
+		return err
+	}
+	// Remove associated certificate entry and files (best-effort).
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(removed.Hostname)), ".")
+	if h != "" {
+		m.removeCertificateByID("alias:"+h, h)
+	}
+	return nil
+}
+
+// RemoveHostnameCertificate removes a per-host certificate (host:<hostname>) and its files.
+// Safe to call even if no such certificate exists.
+func (m *Manager) RemoveHostnameCertificate(hostname string) {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+	if h == "" {
+		return
+	}
+	m.removeCertificateByID("host:"+h, h)
+}
+
+func (m *Manager) removeCertificateByID(id, commonName string) {
+	if m == nil {
+		return
+	}
+	cfg := m.currentConfig()
+	if cfg == nil {
+		return
+	}
+	removed := false
+	var out []Certificate
+	for _, c := range cfg.Certificates {
+		if c.ID == id {
+			removed = true
+			continue
+		}
+		out = append(out, c)
+	}
+	if removed {
+		cfg.Certificates = out
+		cfg.Events = append(cfg.Events, Event{
+			Timestamp: m.now(),
+			Level:     "info",
+			Source:    "remote",
+			Message:   fmt.Sprintf("Certificate removed (%s)", id),
+		})
+		_ = m.save(cfg)
+	}
+	m.deleteCertFiles(id, commonName)
+}
+
+func (m *Manager) deleteCertFiles(id, commonName string) {
+	certDir := m.certDir()
+	if certDir == "" || commonName == "" {
+		return
+	}
+	outName := outNameFor(id, commonName)
+	paths := []string{
+		filepath.Join(certDir, outName+".crt"),
+		filepath.Join(certDir, outName+".key"),
+		filepath.Join(certDir, outName+".pem"),
+	}
+	for _, p := range paths {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("WARN: remote: delete cert file %s: %v", p, err)
+		}
+	}
 }
 
 // ListCertificates returns the synthetic certificate inventory.
@@ -695,12 +788,15 @@ func (m *Manager) publishConfigChanged() {
 	})
 }
 
-func (m *Manager) updateACMEEmail(cfg *Config) {
+func (m *Manager) updateACMEConfig(cfg *Config) {
 	if m == nil || m.acmeMgr == nil || cfg == nil {
 		return
 	}
 	email := deriveACMEEmail(cfg.TLD, cfg.PortalHostname)
 	m.acmeMgr.SetEmail(email)
+	if err := m.acmeMgr.SetSolver(cfg.Solver, cfg.DNSProvider, cfg.DNSCredentials); err != nil {
+		log.Printf("WARN: remote: acme solver config failed: %v", err)
+	}
 }
 
 // HTTPChallengeHandler exposes a read-only handler for ACME HTTP-01 tokens.
@@ -771,30 +867,75 @@ func (m *Manager) scanAndQueueRenewals() {
 		if strings.EqualFold(c.Status, "pending") {
 			continue // avoid duplicate queueing
 		}
-		if c.NextRenewal == nil || c.ExpiresAt == nil {
+		dueRetry := c.RetryAt != nil && now.After(*c.RetryAt) && c.Attempts < maxCertAttempts
+		dueRenewal := false
+		if c.NextRenewal != nil && c.ExpiresAt != nil {
+			dueRenewal = now.After(*c.NextRenewal) || now.Add(24*time.Hour).After(*c.ExpiresAt)
+		}
+		if !dueRetry && !dueRenewal {
 			continue
 		}
-		// Renew when due or if within 24h of expiry as a safety net
-		if now.After(*c.NextRenewal) || now.Add(24*time.Hour).After(*c.ExpiresAt) {
-			switch c.ID {
-			case "portal":
-				if cfg.PortalHostname != "" {
-					m.enqueueIssuance("portal", []string{cfg.PortalHostname}, cfg.PortalHostname)
-				}
-			case "wildcard":
-				if cfg.TLD != "" && strings.EqualFold(cfg.Solver, "dns-01") {
-					cn := "*." + cfg.TLD
-					m.enqueueIssuance("wildcard", []string{cn}, cn)
-				}
-			default:
-				if strings.HasPrefix(c.ID, "alias:") || strings.HasPrefix(c.ID, "host:") {
-					// ID suffix is the hostname for our queued entries
-					parts := strings.SplitN(c.ID, ":", 2)
-					if len(parts) == 2 && parts[1] != "" {
-						h := parts[1]
-						m.enqueueIssuance(c.ID, []string{h}, h)
-					}
-				}
+		domains, cn, ok := desiredDomainsAndCN(cfg, c)
+		if !ok {
+			continue
+		}
+		m.enqueueIssuance(c.ID, domains, cn)
+	}
+}
+
+func desiredDomainsAndCN(cfg *Config, c Certificate) ([]string, string, bool) {
+	if cfg == nil {
+		return nil, "", false
+	}
+	switch c.ID {
+	case "portal":
+		if cfg.PortalHostname == "" {
+			return nil, "", false
+		}
+		h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
+		return []string{h}, h, true
+	case "wildcard":
+		if cfg.TLD == "" || !strings.EqualFold(cfg.Solver, "dns-01") {
+			return nil, "", false
+		}
+		tld := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.TLD)), ".")
+		cn := "*." + tld
+		return []string{cn, tld}, cn, true
+	default:
+		if strings.HasPrefix(c.ID, "alias:") || strings.HasPrefix(c.ID, "host:") {
+			parts := strings.SplitN(c.ID, ":", 2)
+			if len(parts) != 2 || parts[1] == "" {
+				return nil, "", false
+			}
+			h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(parts[1])), ".")
+			return []string{h}, h, true
+		}
+	}
+	if len(c.Domains) == 0 {
+		return nil, "", false
+	}
+	cn := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(c.Domains[0])), ".")
+	return append([]string(nil), c.Domains...), cn, true
+}
+
+func (m *Manager) requeueOutstandingIssuances() {
+	if m == nil {
+		return
+	}
+	cfg := m.currentConfig()
+	now := m.now()
+	for _, c := range cfg.Certificates {
+		if strings.EqualFold(c.Status, "pending") {
+			domains, cn, ok := desiredDomainsAndCN(cfg, c)
+			if ok {
+				m.queueIssuanceJob(c.ID, domains, cn, true)
+			}
+			continue
+		}
+		if strings.EqualFold(c.Status, "error") && c.RetryAt != nil && now.After(*c.RetryAt) && c.Attempts < maxCertAttempts {
+			domains, cn, ok := desiredDomainsAndCN(cfg, c)
+			if ok {
+				m.enqueueIssuanceWithForce(c.ID, domains, cn, true)
 			}
 		}
 	}
@@ -816,8 +957,9 @@ func (m *Manager) RenewCertificate(id string) error {
 					return errors.New("wildcard renewals require dns-01 solver")
 				}
 				cn = "*." + cfg.TLD
+				domains = []string{cn, cfg.TLD}
 			}
-			m.enqueueIssuance(id, domains, cn)
+			m.enqueueIssuanceWithForce(id, domains, cn, true)
 			return nil
 		}
 	}
@@ -834,45 +976,144 @@ func (m *Manager) QueueHostnameCertificate(hostname string) {
 	m.enqueueIssuance("host:"+h, []string{h}, h)
 }
 
-// enqueueIssuance starts background issuance for the given id/domains/commonName
-// and records progress into the config certificates inventory and events.
+type issuanceJob struct {
+	id         string
+	domains    []string
+	commonName string
+	force      bool
+}
+
+const maxCertAttempts = 10
+
+// enqueueIssuance records pending inventory and queues issuance for the worker.
 func (m *Manager) enqueueIssuance(id string, domains []string, commonName string) {
+	m.enqueueIssuanceWithForce(id, domains, commonName, false)
+}
+
+func (m *Manager) enqueueIssuanceWithForce(id string, domains []string, commonName string, force bool) {
 	if m.acmeMgr == nil || commonName == "" {
 		return
 	}
 	cfg := m.currentConfig()
+	// Skip duplicate unless forced.
+	for _, c := range cfg.Certificates {
+		if c.ID == id && strings.EqualFold(c.Status, "pending") && !force {
+			return
+		}
+	}
 	now := m.now()
-	// Ensure inventory entry exists and mark pending
 	m.ensureCertPending(cfg, id, domains, now)
 	_ = m.save(cfg)
+	m.queueIssuanceJob(id, domains, commonName, force)
+}
 
+func (m *Manager) queueIssuanceJob(id string, domains []string, commonName string, force bool) {
+	if m == nil || m.issueCh == nil {
+		return
+	}
+	m.issueMu.Lock()
+	if m.issueQueued == nil {
+		m.issueQueued = make(map[string]struct{})
+	}
+	if _, ok := m.issueQueued[id]; ok && !force {
+		m.issueMu.Unlock()
+		return
+	}
+	m.issueQueued[id] = struct{}{}
+	m.issueMu.Unlock()
+
+	job := issuanceJob{id: id, domains: append([]string(nil), domains...), commonName: commonName, force: force}
+	select {
+	case m.issueCh <- job:
+	default:
+		m.issueMu.Lock()
+		delete(m.issueQueued, id)
+		m.issueMu.Unlock()
+		log.Printf("WARN: remote: issuance queue full, dropping job %s", id)
+	}
+}
+
+func (m *Manager) runIssuanceWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-m.issueCh:
+			m.issueMu.Lock()
+			delete(m.issueQueued, job.id)
+			m.issueMu.Unlock()
+			m.processIssuance(job)
+		}
+	}
+}
+
+func (m *Manager) processIssuance(job issuanceJob) {
+	if m == nil || m.acmeMgr == nil || job.commonName == "" {
+		return
+	}
+	cfg := m.currentConfig()
+	now := m.now()
+
+	// Record attempt.
+	attempts := 1
+	for i := range cfg.Certificates {
+		if cfg.Certificates[i].ID == job.id {
+			attempts = cfg.Certificates[i].Attempts + 1
+			cfg.Certificates[i].Attempts = attempts
+			cfg.Certificates[i].LastAttempt = timePtr(now)
+			cfg.Certificates[i].RetryAt = nil
+			break
+		}
+	}
+	_ = m.save(cfg)
+
+	if attempts > maxCertAttempts {
+		m.updateCertFailure(job.id, "max issuance attempts reached")
+		return
+	}
+
+	certDir := m.certDir()
+	outName := outNameFor(job.id, job.commonName)
 	fakeACME := os.Getenv("PICCOLO_REMOTE_FAKE_ACME") == "1"
-	// Fire and forget
-	go func(id string, domains []string, cn string) {
-		certDir := m.certDir()
-		outName := outNameFor(id, cn)
-		if fakeACME {
-			expires, err := writeSelfSignedCertificate(certDir, outName, cn, domains)
-			if err != nil {
-				m.updateCertFailure(id, err.Error())
-				return
-			}
-			m.updateCertSuccess(id, expires)
-			return
-		}
-		_, err := m.acmeMgr.Issue(cn, nil, outName, certDir)
+
+	if fakeACME {
+		expires, err := writeSelfSignedCertificate(certDir, outName, job.commonName, job.domains)
 		if err != nil {
-			m.updateCertFailure(id, err.Error())
+			m.updateCertFailure(job.id, err.Error())
 			return
 		}
-		// Try to read expiry from on-disk certificate
-		if exp, ok := readCertExpiry(filepath.Join(certDir, outName+".crt")); ok {
-			m.updateCertSuccess(id, exp)
-		} else {
-			// Fallback: 90d expiry
-			m.updateCertSuccess(id, m.now().Add(90*24*time.Hour))
+		m.updateCertSuccess(job.id, expires)
+		return
+	}
+
+	sans := buildSans(job.commonName, job.domains)
+	if _, err := m.acmeMgr.Issue(job.commonName, sans, outName, certDir); err != nil {
+		m.updateCertFailure(job.id, err.Error())
+		return
+	}
+	if exp, ok := readCertExpiry(filepath.Join(certDir, outName+".crt")); ok {
+		m.updateCertSuccess(job.id, exp)
+	} else {
+		m.updateCertSuccess(job.id, now.Add(90*24*time.Hour))
+	}
+}
+
+func buildSans(commonName string, domains []string) []string {
+	commonName = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(commonName)), ".")
+	uniq := make(map[string]struct{})
+	for _, d := range domains {
+		h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(d)), ".")
+		if h == "" || h == commonName {
+			continue
 		}
-	}(id, append([]string(nil), domains...), commonName)
+		uniq[h] = struct{}{}
+	}
+	out := make([]string, 0, len(uniq))
+	for h := range uniq {
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func outNameFor(id, cn string) string {
@@ -894,6 +1135,7 @@ func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, no
 			cfg.Certificates[i].Domains = append([]string(nil), domains...)
 			cfg.Certificates[i].Status = "pending"
 			cfg.Certificates[i].FailureReason = ""
+			cfg.Certificates[i].RetryAt = nil
 			cfg.Certificates[i].IssuedAt = nil
 			cfg.Certificates[i].ExpiresAt = nil
 			cfg.Certificates[i].NextRenewal = nil
@@ -927,6 +1169,8 @@ func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
 			cfg.Certificates[i].NextRenewal = timePtr(next)
 			cfg.Certificates[i].Status = "ok"
 			cfg.Certificates[i].FailureReason = ""
+			cfg.Certificates[i].Attempts = 0
+			cfg.Certificates[i].RetryAt = nil
 			break
 		}
 	}
@@ -946,6 +1190,17 @@ func (m *Manager) updateCertFailure(id string, reason string) {
 		if cfg.Certificates[i].ID == id {
 			cfg.Certificates[i].Status = "error"
 			cfg.Certificates[i].FailureReason = reason
+			attempts := cfg.Certificates[i].Attempts
+			if attempts <= 0 {
+				attempts = 1
+				cfg.Certificates[i].Attempts = attempts
+			}
+			if attempts < maxCertAttempts {
+				retry := now.Add(certBackoff(attempts))
+				cfg.Certificates[i].RetryAt = timePtr(retry)
+			} else {
+				cfg.Certificates[i].RetryAt = nil
+			}
 			break
 		}
 	}
@@ -957,6 +1212,23 @@ func (m *Manager) updateCertFailure(id string, reason string) {
 		NextStep:  "Verify DNS/Nexus reachability and retry",
 	})
 	_ = m.save(cfg)
+}
+
+func certBackoff(attempt int) time.Duration {
+	if attempt <= 1 {
+		return time.Minute
+	}
+	shift := attempt - 1
+	if shift > 6 {
+		shift = 6
+	}
+	delay := time.Duration(1<<shift) * time.Minute
+	if delay > time.Hour {
+		delay = time.Hour
+	}
+	// Add up to 20% jitter.
+	jitter := time.Duration(rand.Int63n(int64(delay / 5)))
+	return delay + jitter
 }
 
 func writeSelfSignedCertificate(dir, outName, commonName string, domains []string) (time.Time, error) {
@@ -1116,12 +1388,12 @@ func (m *Manager) VerifyConnection(info GuideVerification) error {
 	if endpoint == "" {
 		return errors.New("endpoint required")
 	}
-	
+
 	// Create a temporary config to reuse checkEndpoint logic
 	tempCfg := &Config{
 		Endpoint: endpoint,
 	}
-	
+
 	// Perform the check
 	check := m.checkEndpoint(tempCfg)
 	if check.Status != "pass" {
@@ -1130,7 +1402,7 @@ func (m *Manager) VerifyConnection(info GuideVerification) error {
 		}
 		return errors.New("connection failed: unreachable")
 	}
-	
+
 	return nil
 }
 
@@ -1140,7 +1412,7 @@ func (m *Manager) MarkGuideVerified(info GuideVerification) error {
 	if err := m.VerifyConnection(info); err != nil {
 		return err
 	}
-	
+
 	// Only record that verification happened
 	cfg := m.currentConfig()
 	now := m.now()
@@ -1245,7 +1517,8 @@ func buildListeners(cfg *Config) []ListenerSummary {
 
 func computeWarnings(cfg *Config) []string {
 	var warnings []string
-	if !cfg.NextRenewal.IsZero() && cfg.NextRenewal.Before(time.Now().Add(7*24*time.Hour)) {
+	now := time.Now()
+	if !cfg.NextRenewal.IsZero() && cfg.NextRenewal.Before(now.Add(7*24*time.Hour)) {
 		warnings = append(warnings, "Certificate renewal due soon")
 	}
 	if cfg.PortalHostname == "" {
@@ -1255,6 +1528,21 @@ func computeWarnings(cfg *Config) []string {
 		if alias.Status != "active" {
 			warnings = append(warnings, fmt.Sprintf("Alias %s is %s", alias.Hostname, alias.Status))
 		}
+	}
+	hasCertError := false
+	hasRetry := false
+	for _, c := range cfg.Certificates {
+		if strings.EqualFold(c.Status, "error") {
+			hasCertError = true
+			if c.RetryAt != nil && c.RetryAt.After(now) {
+				hasRetry = true
+			}
+		}
+	}
+	if hasRetry {
+		warnings = append(warnings, "Certificate retry scheduled")
+	} else if hasCertError {
+		warnings = append(warnings, "Certificate issuance failed")
 	}
 	return warnings
 }
@@ -1277,7 +1565,7 @@ func defaultCertificates(cfg *Config, now time.Time) []Certificate {
 	if cfg.TLD != "" && strings.EqualFold(cfg.Solver, "dns-01") {
 		certificates = append(certificates, Certificate{
 			ID:          "wildcard",
-			Domains:     []string{fmt.Sprintf("*.%s", cfg.TLD)},
+			Domains:     []string{fmt.Sprintf("*.%s", cfg.TLD), cfg.TLD},
 			Solver:      cfg.Solver,
 			IssuedAt:    timePtr(now),
 			ExpiresAt:   timePtr(exp),

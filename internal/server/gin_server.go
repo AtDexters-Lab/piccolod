@@ -432,6 +432,38 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	if rm != nil && svcMgr != nil {
 		svcMgr.ProxyManager().SetAcmeHandler(rm.HTTPChallengeHandler())
 		certProv := remote.NewFileCertProvider(rm.CertDirectory())
+		certProv.SetMissingHandler(func(host string) {
+			if rm == nil {
+				return
+			}
+			st := rm.Status()
+			if !st.Enabled || !strings.EqualFold(st.Solver, "http-01") {
+				return
+			}
+			tld := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(st.TLD)), ".")
+			if tld == "" {
+				return
+			}
+			h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+			if h == "" {
+				return
+			}
+			portal := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(st.PortalHostname)), ".")
+			if portal != "" && h == portal {
+				return
+			}
+			if !strings.HasSuffix(h, "."+tld) {
+				return
+			}
+			label := strings.TrimSuffix(h, "."+tld)
+			if i := strings.Index(label, "."); i != -1 {
+				label = label[:i]
+			}
+			if label == "" || !isValidDNSLabel(label) {
+				return
+			}
+			rm.QueueHostnameCertificate(h)
+		})
 		tlsMux.SetCertProvider(certProv)
 	}
 	var nexusAdapter nexusclient.Adapter

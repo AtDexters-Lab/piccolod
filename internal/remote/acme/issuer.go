@@ -10,16 +10,22 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
+	"github.com/go-acme/lego/v4/challenge"
 	lego "github.com/go-acme/lego/v4/lego"
+	"github.com/go-acme/lego/v4/providers/dns/cloudflare"
+	gandiv5 "github.com/go-acme/lego/v4/providers/dns/gandiv5"
+	"github.com/go-acme/lego/v4/providers/dns/route53"
 	"github.com/go-acme/lego/v4/registration"
 	acmepkg "golang.org/x/crypto/acme"
 )
@@ -37,6 +43,11 @@ type Manager struct {
 	directory string
 	email     string
 	sink      ChallengeSink
+
+	mu             sync.RWMutex
+	solver         string
+	dnsProvider    string
+	dnsCredentials map[string]string
 }
 
 // NewManager constructs a lego-backed ACME manager.
@@ -55,7 +66,15 @@ func NewManager(stateDir string, sink ChallengeSink, email string, directoryURL 
 		}
 	}
 	log.Printf("INFO: ACME directory configured: %s", directoryURL)
-	return &Manager{baseDir: filepath.Join(stateDir, "remote", "acme"), directory: directoryURL, email: email, sink: sink}
+	return &Manager{
+		baseDir:        filepath.Join(stateDir, "remote", "acme"),
+		directory:      directoryURL,
+		email:          email,
+		sink:           sink,
+		solver:         "http-01",
+		dnsCredentials: map[string]string{},
+		dnsProvider:    "",
+	}
 }
 
 type account struct {
@@ -87,7 +106,10 @@ func (m *Manager) loadAccount() (*account, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &account{Email: m.email}
+	m.mu.RLock()
+	curEmail := m.email
+	m.mu.RUnlock()
+	a := &account{Email: curEmail}
 	if data, err := os.ReadFile(regPath); err == nil {
 		var res registration.Resource
 		if e := json.Unmarshal(data, &res); e == nil {
@@ -159,7 +181,101 @@ func (m *Manager) SetEmail(email string) {
 	if email == "" {
 		return
 	}
+	m.mu.Lock()
 	m.email = email
+	m.mu.Unlock()
+}
+
+// SetSolver configures the challenge solver and optional DNS provider credentials.
+// Solver should be "http-01" or "dns-01".
+// For dns-01, dnsProvider must be one of: cloudflare, route53, gandi.
+// Credentials are provider-specific and stored in-memory only.
+func (m *Manager) SetSolver(solver, dnsProvider string, creds map[string]string) error {
+	if m == nil {
+		return nil
+	}
+	s := strings.ToLower(strings.TrimSpace(solver))
+	if s == "" {
+		s = "http-01"
+	}
+	p := strings.ToLower(strings.TrimSpace(dnsProvider))
+	if s == "dns-01" && p != "" {
+		switch p {
+		case "cloudflare", "route53", "gandi", "gandi.net", "gandiv5":
+		default:
+			return fmt.Errorf("acme: unsupported dns provider %q", p)
+		}
+	}
+	m.mu.Lock()
+	m.solver = s
+	m.dnsProvider = p
+	m.dnsCredentials = cloneCredentials(creds)
+	m.mu.Unlock()
+	return nil
+}
+
+func cloneCredentials(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func (m *Manager) configureChallenge(cli *lego.Client) error {
+	if m == nil || cli == nil {
+		return errors.New("acme: client unavailable")
+	}
+	m.mu.RLock()
+	solver := m.solver
+	m.mu.RUnlock()
+	if strings.EqualFold(solver, "dns-01") {
+		prov, err := m.buildDNSProvider()
+		if err != nil {
+			return err
+		}
+		return cli.Challenge.SetDNS01Provider(prov)
+	}
+	prov := &http01Provider{sink: m.sink}
+	return cli.Challenge.SetHTTP01Provider(prov)
+}
+
+func (m *Manager) buildDNSProvider() (challenge.Provider, error) {
+	m.mu.RLock()
+	p := m.dnsProvider
+	creds := cloneCredentials(m.dnsCredentials)
+	m.mu.RUnlock()
+	switch p {
+	case "cloudflare":
+		cfg := cloudflare.NewDefaultConfig()
+		cfg.AuthToken = strings.TrimSpace(creds["api_token"])
+		if cfg.AuthToken == "" {
+			cfg.AuthToken = strings.TrimSpace(creds["dns_api_token"])
+		}
+		cfg.ZoneToken = strings.TrimSpace(creds["zone_api_token"])
+		cfg.AuthEmail = strings.TrimSpace(creds["email"])
+		cfg.AuthKey = strings.TrimSpace(creds["api_key"])
+		return cloudflare.NewDNSProviderConfig(cfg)
+	case "route53":
+		cfg := route53.NewDefaultConfig()
+		cfg.AccessKeyID = strings.TrimSpace(creds["access_key"])
+		cfg.SecretAccessKey = strings.TrimSpace(creds["secret_key"])
+		cfg.Region = strings.TrimSpace(creds["region"])
+		cfg.HostedZoneID = strings.TrimSpace(creds["hosted_zone_id"])
+		return route53.NewDNSProviderConfig(cfg)
+	case "gandi", "gandi.net", "gandiv5":
+		cfg := gandiv5.NewDefaultConfig()
+		cfg.APIKey = strings.TrimSpace(creds["api_key"])
+		if cfg.APIKey == "" {
+			cfg.APIKey = strings.TrimSpace(creds["api_token"])
+		}
+		return gandiv5.NewDNSProviderConfig(cfg)
+	default:
+		return nil, fmt.Errorf("acme: dns provider not configured")
+	}
 }
 
 // EnsureAccount loads or creates a new ACME account (P-256), accepts TOS.
@@ -182,8 +298,9 @@ func (m *Manager) EnsureAccount() (*lego.Client, *account, error) {
 			if err != nil {
 				return nil, nil, err
 			}
-			prov := &http01Provider{sink: m.sink}
-			_ = cli.Challenge.SetHTTP01Provider(prov)
+			if err := m.configureChallenge(cli); err != nil {
+				return nil, nil, err
+			}
 			if acc.Registration != nil {
 				log.Printf("INFO: ACME loaded cached account %s", acc.Registration.URI)
 			}
@@ -192,7 +309,10 @@ func (m *Manager) EnsureAccount() (*lego.Client, *account, error) {
 	}
 	// Create new
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	acc := &account{Email: m.email, key: key}
+	m.mu.RLock()
+	curEmail := m.email
+	m.mu.RUnlock()
+	acc := &account{Email: curEmail, key: key}
 	cfg := lego.NewConfig(acc)
 	cfg.CADirURL = m.directory
 	cfg.Certificate.KeyType = certcrypto.EC256
@@ -200,9 +320,7 @@ func (m *Manager) EnsureAccount() (*lego.Client, *account, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	// HTTP-01 via our sink: use a custom provider that calls sink.Put/Delete
-	prov := &http01Provider{sink: m.sink}
-	if err := cli.Challenge.SetHTTP01Provider(prov); err != nil {
+	if err := m.configureChallenge(cli); err != nil {
 		return nil, nil, err
 	}
 	// New registration with TOS
