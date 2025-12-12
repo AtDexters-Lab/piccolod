@@ -18,6 +18,11 @@ class SetupController extends ChangeNotifier {
   SetupState _state = SetupState.loading;
   SetupState get state => _state;
 
+  // True when this wizard session started on an uninitialized device.
+  // Used by the Desktop shell to show first-run UX only once.
+  bool _isFirstSetupFlow = false;
+  bool get isFirstSetupFlow => _isFirstSetupFlow;
+
   String? _error;
   String? get error => _error;
 
@@ -41,7 +46,10 @@ class SetupController extends ChangeNotifier {
       final status = await _api.get('/api/v1/crypto/status');
       // Expect: {"initialized": bool, "locked": bool}
 
-      if (status['initialized'] == true) {
+      final initialized = status['initialized'] == true;
+      _isFirstSetupFlow = !initialized;
+
+      if (initialized) {
         if (status['locked'] == true) {
           _state = SetupState.unlock;
         } else {

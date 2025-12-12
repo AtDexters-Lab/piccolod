@@ -7,7 +7,7 @@ import '../../../../shared/widgets/password_set_form.dart';
 import 'setup_controller.dart';
 
 class SetupWizard extends StatefulWidget {
-  final VoidCallback onComplete;
+  final void Function(bool isFirstSetupFlow) onComplete;
 
   const SetupWizard({super.key, required this.onComplete});
 
@@ -17,6 +17,7 @@ class SetupWizard extends StatefulWidget {
 
 class _SetupWizardState extends State<SetupWizard> {
   final SetupController _controller = SetupController();
+  bool _didCallComplete = false;
 
   @override
   Widget build(BuildContext context) {
@@ -24,11 +25,14 @@ class _SetupWizardState extends State<SetupWizard> {
       listenable: _controller,
       builder: (context, child) {
         // If complete, trigger callback
-        if (_controller.state == SetupState.complete) {
+        if (_controller.state == SetupState.complete && !_didCallComplete) {
+          _didCallComplete = true;
           // Schedule callback to avoid build-phase issues
           WidgetsBinding.instance.addPostFrameCallback(
-            (_) => widget.onComplete(),
+            (_) => widget.onComplete(_controller.isFirstSetupFlow),
           );
+          return const SizedBox.shrink();
+        } else if (_controller.state == SetupState.complete) {
           return const SizedBox.shrink();
         }
 

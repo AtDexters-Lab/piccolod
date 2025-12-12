@@ -64,17 +64,19 @@ class DesktopController extends ChangeNotifier {
     }
   }
 
-  void completeSetup() async {
+  void completeSetup(bool isFirstSetupFlow) async {
     _needsSetup = false;
     notifyListeners();
 
-    // Open a welcome window
-    openApp(
-      "welcome",
-      "Welcome",
-      Icons.waving_hand,
-      const Center(child: Text("Welcome to Piccolo OS!")),
-    );
+    if (isFirstSetupFlow) {
+      // Open a welcome window only after first device setup.
+      openApp(
+        "welcome",
+        "Welcome",
+        Icons.waving_hand,
+        const Center(child: Text("Welcome to Piccolo OS!")),
+      );
+    }
   }
   
   void openAppStore() {
