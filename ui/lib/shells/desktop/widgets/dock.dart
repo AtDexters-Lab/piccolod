@@ -53,21 +53,21 @@ class Dock extends StatelessWidget {
               color: PiccoloTheme.ink.withValues(alpha: 0.1),
             ), // Separator
             const SizedBox(width: 16),
-            DockItem(
-              icon: Icons.folder_open_rounded,
-              label: "Files",
-              isOpen: controller.isAppOpen("files"),
-              isActive: controller.isAppActive("files"),
-              onTap: () => controller.openApp(
-                "files",
-                "Files",
-                Icons.folder_open_rounded,
-                const FilesApp(),
-                screenSize: screenSize,
-                initialSize: const Size(1000, 650),
-              ),
-            ),
-            const SizedBox(width: 12),
+            // DockItem(
+            //   icon: Icons.folder_open_rounded,
+            //   label: "Files",
+            //   isOpen: controller.isAppOpen("files"),
+            //   isActive: controller.isAppActive("files"),
+            //   onTap: () => controller.openApp(
+            //     "files",
+            //     "Files",
+            //     Icons.folder_open_rounded,
+            //     const FilesApp(),
+            //     screenSize: screenSize,
+            //     initialSize: const Size(1000, 650),
+            //   ),
+            // ),
+            // const SizedBox(width: 12),
             DockItem(
               icon: Icons.settings_rounded,
               label: "Settings",

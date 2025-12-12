@@ -27,12 +27,129 @@
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
 
   <!-- Favicon -->
-  <link rel="icon" type="image/png" href="favicon.png"/>
+  <link rel="icon" type="image/svg+xml" href="assets/assets/piccolo-p.svg" media="(prefers-color-scheme: light)">
+  <link rel="icon" type="image/svg+xml" href="assets/assets/piccolo-p-white.svg" media="(prefers-color-scheme: dark)">
+  <link rel="icon" type="image/png" href="assets/assets/piccolo-p.svg"/>
 
   <title>Piccolo</title>
   <link rel="manifest" href="manifest.json">
+
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: #F4F6FB;
+      color: #141821;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      html, body { background: #0B0E18; color: #E7ECF6; }
+    }
+
+    #preloader {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: inherit;
+      color: inherit;
+      z-index: 9999;
+    }
+
+    .preloader-inner {
+      width: min(420px, 92vw);
+      padding: 24px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.7);
+      border: 1px solid rgba(20,24,33,0.06);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      text-align: center;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .preloader-inner {
+        background: rgba(26,32,48,0.6);
+        border-color: rgba(231,236,246,0.10);
+      }
+    }
+
+    .preloader-logo {
+      width: 44px;
+      height: 44px;
+      margin: 6px auto 16px;
+      display: block;
+    }
+    .preloader-logo.dark { display: none; }
+    @media (prefers-color-scheme: dark) {
+      .preloader-logo.light { display: none; }
+      .preloader-logo.dark { display: block; }
+    }
+
+    .preloader-title {
+      font-size: 16px;
+      font-weight: 600;
+      margin: 0 0 6px;
+      letter-spacing: 0.2px;
+    }
+
+    .preloader-subtitle {
+      margin: 0 0 16px;
+      font-size: 13px;
+      color: rgba(20,24,33,0.65);
+    }
+    @media (prefers-color-scheme: dark) {
+      .preloader-subtitle { color: rgba(231,236,246,0.70); }
+    }
+
+    .progress {
+      height: 6px;
+      width: 100%;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(20,24,33,0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      .progress { background: rgba(231,236,246,0.10); }
+    }
+
+    .progress > .bar {
+      height: 100%;
+      width: 35%;
+      border-radius: 999px;
+      background: #2F5AF3;
+      animation: indeterminate 1.1s cubic-bezier(.2,0,0,1) infinite;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .progress > .bar { animation: none; width: 55%; }
+    }
+
+    @keyframes indeterminate {
+      0%   { transform: translateX(-120%); }
+      100% { transform: translateX(320%); }
+    }
+  </style>
 </head>
 <body>
+  <div id="preloader" role="status" aria-live="polite">
+    <div class="preloader-inner">
+      <img class="preloader-logo light" src="assets/assets/piccolo-p.svg" alt="Piccolo" />
+      <img class="preloader-logo dark" src="assets/assets/piccolo-p-white.svg" alt="Piccolo" />
+      <p class="preloader-title">Loading Piccolo…</p>
+      <p class="preloader-subtitle">Warming up the desktop.</p>
+      <div class="progress" aria-hidden="true"><div class="bar"></div></div>
+    </div>
+  </div>
+
+  <script>
+    // Remove the preloader once Flutter renders the first frame.
+    window.addEventListener('flutter-first-frame', function () {
+      var loader = document.getElementById('preloader');
+      if (loader) loader.remove();
+    });
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

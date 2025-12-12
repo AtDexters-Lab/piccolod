@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import '../../../theme/piccolo_theme.dart';
-import '../../../shared/piccolo_wordmark.dart';
 import '../desktop_controller.dart';
 
 class TopBar extends StatelessWidget {
@@ -16,14 +15,6 @@ class TopBar extends StatelessWidget {
       color: Colors.transparent, // "Frosted" effect would be applied here
       child: Row(
         children: [
-          // -- Branding --
-          const PiccoloWordmark(
-            height: 18, // Slightly smaller to fit nicely in 48px bar
-            color: PiccoloTheme.ink,
-          ),
-
-          const SizedBox(width: 32),
-
           // -- Global Search --
           IconButton(
             icon: const Icon(Icons.search, color: PiccoloTheme.ink, size: 20),
