@@ -490,7 +490,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Register the update watchdog. It blocks until context is cancelled.
 	s.supervisor.Register(supervisor.NewComponent("os-update-watchdog", func(ctx context.Context) error {
-		return s.updateManager.Watch(ctx)
+		go s.updateManager.Watch(ctx) // Start the watch loop in a goroutine
+		return nil                    // Return immediately to the supervisor
 	}, func(ctx context.Context) error {
 		// Cancellation is handled by the context passed to Watch
 		return nil

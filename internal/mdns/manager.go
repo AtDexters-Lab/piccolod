@@ -104,25 +104,32 @@ func (m *Manager) Start() error {
 	m.wg.Add(1)
 	go m.healthMonitorLoop()
 
-	// Perform initial conflict detection
-	if err := m.probeNameAvailability(); err != nil {
-		return fmt.Errorf("conflict detection failed: %w", err)
-	}
-
-	// Start conflict monitoring routine
+	// Launch probing and conflict monitoring in background to avoid blocking startup
 	m.wg.Add(1)
-	go m.conflictMonitor()
+	go func() {
+		defer m.wg.Done()
 
-	m.mutex.RLock()
-	interfaceCount := len(m.interfaces)
-	m.mutex.RUnlock()
+		// Perform initial conflict detection
+		if err := m.probeNameAvailability(); err != nil {
+			log.Printf("ERROR: conflict detection failed: %v", err)
+			return
+		}
 
-	serviceName := m.currentServiceName()
+		// Start conflict monitoring routine
+		m.wg.Add(1)
+		go m.conflictMonitor()
 
-	log.Printf("INFO: Secured dual-stack mDNS server started - advertising %s.local on %d interfaces",
-		serviceName, interfaceCount)
-	log.Printf("INFO: Security limits - %d queries/sec, %d concurrent, %d packet size",
-		m.securityConfig.MaxQueriesPerSecond, m.securityConfig.MaxConcurrentQueries, m.securityConfig.MaxPacketSize)
+		m.mutex.RLock()
+		interfaceCount := len(m.interfaces)
+		m.mutex.RUnlock()
+
+		serviceName := m.currentServiceName()
+
+		log.Printf("INFO: Secured dual-stack mDNS server started - advertising %s.local on %d interfaces",
+			serviceName, interfaceCount)
+		log.Printf("INFO: Security limits - %d queries/sec, %d concurrent, %d packet size",
+			m.securityConfig.MaxQueriesPerSecond, m.securityConfig.MaxConcurrentQueries, m.securityConfig.MaxPacketSize)
+	}()
 
 	return nil
 }
