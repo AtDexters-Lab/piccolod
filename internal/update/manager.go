@@ -53,6 +53,7 @@ type osBackend interface {
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
 	Reboot(context.Context) error
+	Watch(context.Context) error
 }
 
 // microOSBackend interacts with MicroOS transactional-update to report and apply updates.
@@ -132,6 +133,11 @@ func (m *Manager) Reboot(ctx context.Context) error {
 	return m.backend.Reboot(ctx)
 }
 
+// Watch starts a background monitoring loop to detect and recover from update failures.
+func (m *Manager) Watch(ctx context.Context) error {
+	return m.backend.Watch(ctx)
+}
+
 // newMicroOSBackend constructs the MicroOS implementation.
 func newMicroOSBackend(opts ...Option) (*microOSBackend, error) {
 	timeout := defaultTimeout
@@ -166,6 +172,9 @@ func newMicroOSBackend(opts ...Option) (*microOSBackend, error) {
 
 	m.supported = m.overrideSupport || m.detectSupported()
 
+	// Proactive cleanup of stale locks on startup
+	m.cleanupStaleState(context.Background())
+
 	return m, nil
 }
 
@@ -192,13 +201,22 @@ func (m *microOSBackend) Status(ctx context.Context) (Status, error) {
 	return m.readStatus(ctx)
 }
 
-// Apply triggers transactional-update dup.
+// Apply triggers transactional-update dup with a fallback to package-only update.
 func (m *microOSBackend) Apply(ctx context.Context) error {
 	if !m.supported {
 		return ErrUnsupported
 	}
-	// Fire and return; the TU run continues via systemd.
-	return m.runTransactionalUpdate(ctx, []string{"transactional-update", "dup"}, "apply", "", false)
+	// Strategy: Try full distro upgrade first ("dup").
+	// If that fails (e.g. dependency conflicts in base OS), fall back to updating
+	// just the agent packages ("pkg update ..."). This ensures we can still ship
+	// fixes to piccolod even if the base OS repos are messy.
+	// We chain these in a shell to keep it as one "job" from the API's perspective.
+	cmd := []string{
+		"/bin/sh",
+		"-c",
+		"transactional-update --non-interactive dup || transactional-update --non-interactive pkg update piccolo-os-support piccolod",
+	}
+	return m.runTransactionalUpdate(ctx, cmd, "apply", "", false)
 }
 
 // Rollback sets the requested snapshot as default for next boot.
@@ -220,7 +238,7 @@ func (m *microOSBackend) Rollback(ctx context.Context, targetID string) error {
 		return ErrInvalidSnapshot
 	}
 	// Fire and return; the TU run continues via systemd.
-	return m.runTransactionalUpdate(ctx, []string{"transactional-update", "rollback", targetID}, "rollback", targetID, false)
+	return m.runTransactionalUpdate(ctx, []string{"transactional-update", "--non-interactive", "rollback", targetID}, "rollback", targetID, false)
 }
 
 // Reboot triggers systemctl reboot.
@@ -232,6 +250,90 @@ func (m *microOSBackend) Reboot(ctx context.Context) error {
 	// before the command returns or shortly after.
 	_, _, _, err := m.runner.Run(ctx, "systemctl", "reboot")
 	return err
+}
+
+// Watch runs a background loop to monitor system update status and trigger fallbacks.
+func (m *microOSBackend) Watch(ctx context.Context) error {
+	if !m.supported {
+		// Just block until done if unsupported, to satisfy interface
+		<-ctx.Done()
+		return nil
+	}
+
+	// Run an immediate check (in a goroutine to not block startup if called synchronously)
+	go func() {
+		// Small delay to let system settle
+		time.Sleep(10 * time.Second)
+		m.checkAndRecover(ctx)
+	}()
+
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			m.checkAndRecover(ctx)
+		}
+	}
+}
+
+func (m *microOSBackend) checkAndRecover(ctx context.Context) {
+	// 1. Check if we are already running something
+	if m.isInProgress(ctx) {
+		return
+	}
+
+	// 2. Check system status
+	// Use a detached context for the check so we don't fail if the watch loop is cancelling (though mostly it shares life)
+	status, err := m.readStatus(ctx)
+	if err != nil {
+		return
+	}
+
+	// 3. If update is pending (staged), we are good. User needs to reboot.
+	if status.Pending {
+		return
+	}
+
+	// 4. Check Last Run result
+	// The map value is *lastRunInfo because readStatus populates it that way.
+	lastRun, ok := status.Meta["last_run"].(*lastRunInfo)
+	if !ok || lastRun == nil {
+		return
+	}
+
+	// If success or unknown, do nothing
+	if lastRun.ExitCode == 0 {
+		return
+	}
+
+	// 5. Check if we (or the user) already reacted to this failure.
+	if lastRun.RanAt == nil {
+		return
+	}
+
+	state := m.loadState()
+	if state != nil {
+		// If our last request was AFTER the system failure, we assume we responded.
+		if state.RequestedAt.After(*lastRun.RanAt) {
+			return
+		}
+	}
+
+	// 6. Trigger Fallback
+	// "auto-recovery": Update only the agent packages.
+	cmd := []string{
+		"transactional-update",
+		"--non-interactive",
+		"pkg", "update", "piccolo-os-support", "piccolod",
+	}
+	// Fire and forget (wait=false), but we log the start.
+	// We use "auto-fallback" as the action name to distinguish from user actions.
+	// This will update state.json, preventing a retry loop on the next tick (step 5).
+	_ = m.runTransactionalUpdate(ctx, cmd, "auto-fallback", "", false)
 }
 
 // ---- internals ----
@@ -439,7 +541,8 @@ func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []strin
 	}
 	// Persist intent immediately so we survive restarts during TU
 	m.persistState(action, targetHint, unit, -1, "started")
-	args := []string{"--unit", unit}
+	// Enforce 1h hard timeout at the systemd level to kill hung zypper processes.
+	args := []string{"--unit", unit, "--property=RuntimeMaxSec=3600"}
 	if wait {
 		args = append(args, "--wait")
 	}
@@ -479,6 +582,13 @@ func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []strin
 	}
 	m.persistState(action, targetID, unit, code, msg)
 	return nil
+}
+
+func (m *microOSBackend) cleanupStaleState(ctx context.Context) {
+	// Re-use logic from isInProgress to check and clean marker
+	// We just ignore the "true" return value, as we only care about the side effect
+	// of removing the file if the unit is dead.
+	_ = m.isInProgress(ctx)
 }
 
 func (m *microOSBackend) isInProgress(ctx context.Context) bool {

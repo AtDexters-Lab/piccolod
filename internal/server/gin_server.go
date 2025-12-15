@@ -57,6 +57,7 @@ type osUpdateManager interface {
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
 	Reboot(context.Context) error
+	Watch(context.Context) error
 }
 
 // GinServer holds all the core components for our application using Gin framework.
@@ -486,6 +487,14 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		s.updateManager = um
 	}
 	s.healthTracker.Setf("update", health.LevelOK, "update manager ready")
+
+	// Register the update watchdog. It blocks until context is cancelled.
+	s.supervisor.Register(supervisor.NewComponent("os-update-watchdog", func(ctx context.Context) error {
+		return s.updateManager.Watch(ctx)
+	}, func(ctx context.Context) error {
+		// Cancellation is handled by the context passed to Watch
+		return nil
+	}))
 
 	// (Simplified) No dynamic port publish/unpublish wiring; allow dial to fail gracefully.
 
