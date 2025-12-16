@@ -204,12 +204,6 @@ func (s *GinServer) csrfMiddleware() gin.HandlerFunc {
 // This effectively prevents remote access via Nexus (which proxies via localhost) while allowing LAN access.
 func (s *GinServer) allowLocalOnly() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// If it's a secure loopback request (via 127.0.0.1:0 secure listener), allow it.
-		// We check secureContextKeyInstance directly from the request context.
-		if c.Request.Context().Value(secureContextKeyInstance) != nil {
-			c.Next()
-			return
-		}
 
 		// Parse the remote IP (direct connection)
 		host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
