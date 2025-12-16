@@ -821,13 +821,13 @@ func (m *microOSBackend) lastRunInfo(ctx context.Context) *lastRunInfo {
 }
 
 func (m *microOSBackend) readJournal(ctx context.Context, unit string) []string {
-	stdout, _, _, err := m.runner.Run(ctx, "journalctl", "-u", unit, "-n", "10", "--no-pager", "--output=cat")
+	stdout, _, _, err := m.runner.Run(ctx, "journalctl", "-u", unit, "-n", "50", "--no-pager", "--output=cat")
 	if err != nil {
 		return nil
 	}
 	lines := splitNonEmpty(strings.Split(stdout, "\n"))
-	if len(lines) > 10 {
-		lines = lines[len(lines)-10:]
+	if len(lines) > 50 {
+		lines = lines[len(lines)-50:]
 	}
 	return lines
 }
