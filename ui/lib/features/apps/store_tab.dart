@@ -4,6 +4,7 @@ import '../../core/services/app_service.dart';
 import '../../theme/piccolo_theme.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'custom_install_wizard.dart';
+import 'dynamic_install_wizard.dart';
 import 'app_detail_view.dart';
 
 class StoreTab extends StatefulWidget {
@@ -126,7 +127,6 @@ class _StoreTabState extends State<StoreTab> {
     }
   }
 
-  // ... (keep _installFromTemplate) ...
   void _installFromTemplate(CatalogItem item) async {
     String? yaml = item.template;
     
@@ -143,7 +143,34 @@ class _StoreTabState extends State<StoreTab> {
         }
     }
 
-    if (yaml != null && mounted) {
+    if (yaml == null) return;
+
+    // Fetch configuration schema
+    Map<String, dynamic> schema = {};
+    try {
+        schema = await widget.appService.getCatalogConfigure(item.name);
+    } catch (e) {
+        debugPrint("Failed to load config schema (falling back to raw yaml): $e");
+    }
+
+    if (!mounted) return;
+
+    if (schema.isNotEmpty) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => DynamicInstallWizard(
+          appService: widget.appService,
+          appName: item.name,
+          yamlContent: yaml!,
+          schema: schema,
+          onSuccess: (appName) {
+             Navigator.of(context).pop(); // Close Wizard
+             _openAppDetail(appName);
+          },
+        ),
+      );
+    } else {
       showDialog(
         context: context,
         barrierDismissible: false,
@@ -152,21 +179,24 @@ class _StoreTabState extends State<StoreTab> {
           initialYaml: yaml!,
           onSuccess: (appName) {
              Navigator.of(context).pop(); // Close Wizard
-             // Open App Detail Window
-             widget.desktopController.openApp(
-               "app-detail-$appName",
-               appName,
-               Icons.settings_applications,
-               AppDetailView(
-                 appId: appName,
-                 appService: widget.appService,
-                 desktopController: widget.desktopController,
-               ),
-             );
+             _openAppDetail(appName);
           },
         ),
       );
     }
+  }
+
+  void _openAppDetail(String appName) {
+    widget.desktopController.openApp(
+      "app-detail-$appName",
+      appName,
+      Icons.settings_applications,
+      AppDetailView(
+        appId: appName,
+        appService: widget.appService,
+        desktopController: widget.desktopController,
+      ),
+    );
   }
 
   @override

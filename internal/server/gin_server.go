@@ -692,6 +692,7 @@ func (s *GinServer) setupGinRoutes() {
 		authed.GET("/catalog", s.handleGinCatalog)
 		authed.GET("/catalog/categories", s.handleGinCatalogCategories)
 		authed.GET("/catalog/:name/template", s.handleGinCatalogTemplate)
+		authed.GET("/catalog/:name/configure", s.handleGinCatalogConfigure)
 		authed.GET("/services", s.handleGinServicesAll)
 	}
 

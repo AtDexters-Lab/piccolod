@@ -224,6 +224,8 @@ type AppDefinition struct {
 	Image string    `yaml:"image,omitempty" json:"image,omitempty"`
 	Build *AppBuild `yaml:"build,omitempty" json:"build,omitempty"`
 	Type  string    `yaml:"type,omitempty" json:"type,omitempty"` // "system" or "user"
+	// Inputs definition for dynamic configuration
+	Inputs map[string]AppInput `yaml:"inputs,omitempty" json:"inputs,omitempty"`
 	// Service-oriented listener configuration (v1)
 	Listeners   []AppListener          `yaml:"listeners,omitempty" json:"listeners,omitempty"`
 	Storage     *AppStorage            `yaml:"storage,omitempty" json:"storage,omitempty"`
@@ -378,4 +380,21 @@ type CatalogResponse struct {
 	PageSize   int           `json:"page_size"`
 	Total      int           `json:"total"`
 	TotalPages int           `json:"total_pages"`
+}
+
+// AppInput defines a user input field for dynamic configuration
+type AppInput struct {
+	Type        string              `yaml:"type" json:"type"`
+	Label       string              `yaml:"label" json:"label"`
+	Description string              `yaml:"description" json:"description"`
+	Default     interface{}         `yaml:"default,omitempty" json:"default,omitempty"`
+	Required    bool                `yaml:"required,omitempty" json:"required,omitempty"`
+	Generate    bool                `yaml:"generate,omitempty" json:"generate,omitempty"`
+	Validation  *AppInputValidation `yaml:"validation,omitempty" json:"validation,omitempty"`
+}
+
+// AppInputValidation defines validation rules for an input
+type AppInputValidation struct {
+	Regex   string `yaml:"regex" json:"regex"`
+	Message string `yaml:"message" json:"message"`
 }

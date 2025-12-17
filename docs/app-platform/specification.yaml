@@ -1,4 +1,4 @@
-# specification.yaml — Piccolo OS App Manifest (pre-beta)
+# SPECIFICATION.yaml — Piccolo OS App Manifest (pre-beta)
 #
 # Keep this file valid YAML. Delete sections you do not need; comments are for guidance.
 #
@@ -20,6 +20,29 @@ image: ubuntu:22.04            # Provide either image: (pull from registry) or b
 #   # git: https://github.com/org/repo.git   # Breadcrumb: remote repo builds land post pre-beta
 #   # branch: main
 
+# INPUTS (Dynamic Configuration) ----------------------------------------------
+# Defines the form schema presented to the user during installation.
+# The backend uses these values to substitute variables in the rest of the file
+# using Go template syntax: {{ .Inputs.variable_name }}
+#
+# System context is available via: {{ .System.Domain }}, {{ .System.Architecture }}
+inputs:
+  subdomain:
+    type: string               # string | boolean | int | password
+    label: "Subdomain"
+    description: "The address to access this service (e.g., 'dev' -> dev.domain.tld)"
+    default: "dev"             # Backend may override this if the name is taken
+    required: true
+    validation:
+      regex: "^[a-z0-9-]+$"
+      message: "Only lowercase letters, numbers, and hyphens allowed."
+
+  admin_password:
+    type: password             # UI renders masked input; Backend auto-generates secure default
+    label: "Admin Password"
+    generate: true             # Hint to Backend to pre-fill with a strong random string
+    required: true
+
 type: user                     # user (default, starts after unlock) | system (starts during boot)
 
 # LISTENERS -------------------------------------------------------------------
@@ -28,7 +51,7 @@ type: user                     # user (default, starts after unlock) | system (s
 # Local portal: http(s)://<portal-host>:<allocated_port>.
 # If remote_ports omitted, Piccolo advertises ports 80 and 443.
 listeners:
-  - name: web                  # DNS-safe service slug. Forms remote host "https://web.<user-domain>".
+  - name: "{{ .Inputs.subdomain }}"  # Dynamic substitution from inputs
     # aliases: []              # Breadcrumb: future release allows extra FQDNs per listener
     guest_port: 8080           # In-container port to forward
     flow: tcp                  # tcp = Piccolo terminates TLS; tls = passthrough to the container

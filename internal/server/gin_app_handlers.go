@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -215,6 +216,39 @@ func (s *GinServer) handleGinCatalogTemplate(c *gin.Context) {
 	c.Data(http.StatusOK, "application/x-yaml; charset=utf-8", []byte(yaml))
 }
 
+// handleGinCatalogConfigure handles GET /api/v1/catalog/:name/configure - return enriched input schema for a catalog app
+func (s *GinServer) handleGinCatalogConfigure(c *gin.Context) {
+	if s.catalogManager == nil {
+		writeGinError(c, http.StatusInternalServerError, "Catalog manager not initialized")
+		return
+	}
+	name := c.Param("name")
+	yamlContent, err := s.catalogManager.GetAppTemplate(c.Request.Context(), name)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeGinError(c, http.StatusNotFound, "template not found")
+		} else {
+			writeGinError(c, http.StatusInternalServerError, "failed to fetch template: "+err.Error())
+		}
+		return
+	}
+
+	// Parse schema loose
+	def, err := app.ParseAppSchema([]byte(yamlContent))
+	if err != nil {
+		writeGinError(c, http.StatusInternalServerError, "failed to parse app schema: "+err.Error())
+		return
+	}
+
+	// Prepare smart defaults
+	if err := app.PrepareSmartDefaults(c.Request.Context(), s.appManager, def); err != nil {
+		log.Printf("WARN: failed to prepare smart defaults for %s: %v", name, err)
+		// Continue anyway, just without smarts
+	}
+
+	writeGinSuccess(c, def.Inputs, "Configuration schema prepared")
+}
+
 // handleGinAppInstall handles POST /api/v1/apps - Install app from app.yaml upload
 func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	// Check Content-Type
@@ -226,16 +260,20 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 
 	// Read request body
 	var yamlData []byte
+	var userInputs map[string]interface{}
+
 	if strings.Contains(contentType, "application/json") {
-		// Accept { app_definition: "...yaml..." }
+		// Accept { app_definition: "...yaml...", inputs: {...} }
 		var req struct {
-			AppDefinition string `json:"app_definition"`
+			AppDefinition string                 `json:"app_definition"`
+			Inputs        map[string]interface{} `json:"inputs"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
 			writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
 			return
 		}
 		yamlData = []byte(req.AppDefinition)
+		userInputs = req.Inputs
 	} else {
 		body, err := c.GetRawData()
 		if err != nil {
@@ -247,6 +285,28 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 			return
 		}
 		yamlData = body
+	}
+
+	// Construct system context
+	systemContext := map[string]interface{}{
+		"Domain":       "local",
+		"Architecture": runtime.GOARCH,
+	}
+	if s.remoteManager != nil {
+		status := s.remoteManager.Status()
+		if status.Enabled && status.TLD != "" {
+			systemContext["Domain"] = strings.TrimSuffix(status.TLD, ".")
+		}
+	}
+
+	// Render template if inputs provided
+	if len(userInputs) > 0 {
+		rendered, err := app.RenderManifest(yamlData, userInputs, systemContext)
+		if err != nil {
+			writeGinError(c, http.StatusBadRequest, "Failed to render manifest template: "+err.Error())
+			return
+		}
+		yamlData = rendered
 	}
 
 	// Parse app.yaml

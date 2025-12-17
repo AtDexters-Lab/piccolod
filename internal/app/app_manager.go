@@ -643,6 +643,15 @@ func (m *AppManager) Get(ctx context.Context, name string) (*AppInstance, error)
 	return app, nil
 }
 
+// GetAppDefinition returns the full definition (app.yaml content) for an installed app.
+func (m *AppManager) GetAppDefinition(ctx context.Context, name string) (*api.AppDefinition, error) {
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return nil, err
+	}
+	return state.GetAppDefinition(name)
+}
+
 // Start starts an application
 func (m *AppManager) Start(ctx context.Context, name string) error {
 	if err := m.ensureUnlocked(); err != nil {

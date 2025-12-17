@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
 	"strings"
+	"text/template"
 
 	"gopkg.in/yaml.v3"
 	"piccolod/internal/api"
@@ -14,6 +16,41 @@ var (
 	// Must start with letter, end with letter or number
 	appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$`)
 )
+
+// ParseAppSchema parses the YAML to extract metadata and inputs without strict validation.
+// This is used to read the manifest before variable substitution.
+func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
+	var app api.AppDefinition
+	if err := yaml.Unmarshal(content, &app); err != nil {
+		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+	}
+	// We do NOT call SetDefaults or ValidateAppDefinition here because
+	// fields like 'name' might contain "{{ .Inputs... }}" which would fail validation.
+	return &app, nil
+}
+
+// RenderManifest applies user inputs to the app manifest template.
+func RenderManifest(rawYaml []byte, userInputs map[string]interface{}, systemContext map[string]interface{}) ([]byte, error) {
+	// Prepare data for template
+	data := map[string]interface{}{
+		"Inputs": userInputs,
+		"System": systemContext,
+	}
+
+	// Parse and Execute Template
+	// Option "missingkey=error" ensures we fail if the manifest references an input we didn't provide
+	tmpl, err := template.New("manifest").Option("missingkey=error").Parse(string(rawYaml))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse manifest template: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return nil, fmt.Errorf("failed to execute manifest template: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
 
 // ParseAppDefinition parses YAML content into AppDefinition struct with validation
 func ParseAppDefinition(content []byte) (*api.AppDefinition, error) {

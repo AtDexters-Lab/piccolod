@@ -141,4 +141,21 @@ class AppService {
     // Expected: { data: {App}, message: ... }
     return App.fromJson(data['data']);
   }
+
+  Future<Map<String, dynamic>> getCatalogConfigure(String name) async {
+    final data = await _client.get('/api/v1/catalog/$name/configure');
+    // Expected: { data: { inputName: { type:..., default:..., ... } } }
+    return Map<String, dynamic>.from(data['data'] ?? {});
+  }
+
+  Future<App> installAppWithInputs(String yamlContent, Map<String, dynamic> inputs) async {
+    final data = await _client.post(
+      '/api/v1/apps',
+      body: {
+        'app_definition': yamlContent,
+        'inputs': inputs,
+      },
+    );
+    return App.fromJson(data['data']);
+  }
 }
