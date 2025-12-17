@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 DEMO ?= 0
-RUN_PORT ?= 8080
+RUN_PORT ?= 8889
 RUN_STATE_DIR ?= $(CURDIR)/.run-state
 
 .PHONY: all deps ui server build run release demo demo-serve clean typegen e2e
@@ -68,5 +68,36 @@ clean:
 
 e2e:
 	@echo "E2E tests not yet ported to Flutter"
+
+service: build ## Build and install/update piccolod systemd service
+	@echo "==> Generating systemd service file (PORT=$(RUN_PORT))..."
+	@echo '[Unit]' > piccolod.service
+	@echo 'Description=Piccolo Daemon' >> piccolod.service
+	@echo 'After=network.target' >> piccolod.service
+	@echo '' >> piccolod.service
+	@echo '[Service]' >> piccolod.service
+	@echo 'User=root' >> piccolod.service
+	@echo 'Group=root' >> piccolod.service
+	@echo 'ExecStart=/usr/local/bin/piccolod' >> piccolod.service
+	@echo 'Environment="PORT=$(RUN_PORT)"' >> piccolod.service
+	@echo 'Environment="PICCOLO_STATE_DIR=/var/lib/piccolod"' >> piccolod.service
+	@echo 'Restart=always' >> piccolod.service
+	@echo 'RestartSec=5' >> piccolod.service
+	@echo '' >> piccolod.service
+	@echo '[Install]' >> piccolod.service
+	@echo 'WantedBy=multi-user.target' >> piccolod.service
+	@echo "==> Installing/Updating piccolod service"
+	@if systemctl is-active --quiet piccolod; then \
+		echo "Stopping running service to update binary..."; \
+		sudo systemctl stop piccolod; \
+	fi
+	sudo cp piccolod /usr/local/bin/piccolod
+	sudo cp piccolod.service /etc/systemd/system/piccolod.service
+	sudo systemctl daemon-reload
+	sudo systemctl enable piccolod
+	sudo systemctl start piccolod
+	@echo "==> Service piccolod is now running:"
+	@systemctl status piccolod --no-pager
+	@rm piccolod.service
 
 # Removed legacy demo and separate real config; unified on single config.
