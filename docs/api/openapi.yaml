@@ -734,7 +734,29 @@ paths:
 
   /catalog:
     get:
-      summary: Curated app catalog
+      summary: App catalog (cached from remote git)
+      parameters:
+        - in: query
+          name: q
+          schema: { type: string }
+        - in: query
+          name: category
+          schema: { type: string }
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: page_size
+          schema: { type: integer, default: 20 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CatalogResponse' }
+  /catalog/categories:
+    get:
+      summary: List available app categories
       responses:
         '200':
           description: OK
@@ -743,14 +765,9 @@ paths:
               schema:
                 type: object
                 properties:
-                  apps:
+                  categories:
                     type: array
-                    items:
-                      type: object
-                      properties:
-                        name: { type: string }
-                        image: { type: string }
-                        description: { type: string }
+                    items: { type: string }
   /catalog/{name}/template:
     get:
       summary: Get example app.yaml for a catalog item
@@ -1293,6 +1310,30 @@ components:
         volumes_locked: { type: boolean }
         password_stale: { type: boolean }
         recovery_stale: { type: boolean }
+    CatalogResponse:
+      type: object
+      properties:
+        apps:
+          type: array
+          items: { $ref: '#/components/schemas/CatalogItem' }
+        page: { type: integer }
+        page_size: { type: integer }
+        total: { type: integer }
+        total_pages: { type: integer }
+    CatalogItem:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        icon: { type: string, nullable: true }
+        version: { type: string }
+        category: { type: string }
+        compatibility: { type: string, nullable: true }
+        maintainer: { type: string, nullable: true }
+        tags:
+          type: array
+          items: { type: string }
+        source_url: { type: string, nullable: true }
   securitySchemes:
     cookieAuth:
       type: apiKey

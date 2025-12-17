@@ -7,11 +7,13 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"piccolod/internal/api"
 	"piccolod/internal/app"
+	"piccolod/internal/app/catalog"
 	"piccolod/internal/persistence"
 	"piccolod/internal/remote"
 	"piccolod/internal/services"
@@ -196,13 +198,18 @@ func (s *GinServer) handleGinAppValidate(c *gin.Context) {
 
 // handleGinCatalogTemplate handles GET /api/v1/catalog/:name/template - return YAML template for a catalog app
 func (s *GinServer) handleGinCatalogTemplate(c *gin.Context) {
-	name := strings.ToLower(strings.TrimSpace(c.Param("name")))
-	var yaml string
-	switch name {
-	case "wordpress":
-		yaml = "name: wordpress\nimage: docker.io/library/wordpress:6\nlisteners:\n  - name: http\n    guest_port: 80\n    flow: tcp\n    protocol: http\n"
-	default:
-		c.JSON(http.StatusNotFound, gin.H{"error": "template not found"})
+	if s.catalogManager == nil {
+		writeGinError(c, http.StatusInternalServerError, "Catalog manager not initialized")
+		return
+	}
+	name := c.Param("name")
+	yaml, err := s.catalogManager.GetAppTemplate(c.Request.Context(), name)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeGinError(c, http.StatusNotFound, "template not found")
+		} else {
+			writeGinError(c, http.StatusInternalServerError, "failed to fetch template: "+err.Error())
+		}
 		return
 	}
 	c.Data(http.StatusOK, "application/x-yaml; charset=utf-8", []byte(yaml))
@@ -443,15 +450,47 @@ func (s *GinServer) handleGinAppStop(c *gin.Context) {
 
 // handleGinCatalog handles GET /api/v1/catalog - returns curated catalog.
 func (s *GinServer) handleGinCatalog(c *gin.Context) {
-	apps := []gin.H{
-		{
-			"name":        "wordpress",
-			"image":       "docker.io/library/wordpress:6",
-			"description": "WordPress + SQLite",
-			"template":    "name: wordpress\nimage: docker.io/library/wordpress:6\nlisteners:\n  - name: web\n    guest_port: 80\n    flow: tcp\n    protocol: http\n",
-		},
+	if s.catalogManager == nil {
+		writeGinError(c, http.StatusInternalServerError, "Catalog manager not initialized")
+		return
 	}
-	c.JSON(http.StatusOK, gin.H{"apps": apps})
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	query := c.Query("q")
+	category := c.Query("category")
+
+	opts := catalog.FilterOptions{
+		Query:         query,
+		Category:      category,
+		Page:          page,
+		PageSize:      pageSize,
+		SystemVersion: s.version,
+	}
+
+	resp, err := s.catalogManager.GetApps(c.Request.Context(), opts)
+	if err != nil {
+		writeGinError(c, http.StatusInternalServerError, "failed to list catalog apps: "+err.Error())
+		return
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// handleGinCatalogCategories handles GET /api/v1/catalog/categories - returns list of categories
+func (s *GinServer) handleGinCatalogCategories(c *gin.Context) {
+	if s.catalogManager == nil {
+		writeGinError(c, http.StatusInternalServerError, "Catalog manager not initialized")
+		return
+	}
+
+	cats, err := s.catalogManager.GetCategories(c.Request.Context())
+	if err != nil {
+		writeGinError(c, http.StatusInternalServerError, "failed to list categories: "+err.Error())
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"categories": cats})
 }
 
 func handleAppManagerError(c *gin.Context, err error, action string) bool {

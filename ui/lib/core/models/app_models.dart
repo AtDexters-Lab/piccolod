@@ -140,23 +140,70 @@ class ServiceEndpoint {
 
 class CatalogItem {
   final String name;
-  final String image;
   final String description;
+  final String? icon;
+  final String version;
+  final String category;
+  final String? compatibility;
+  final String? maintainer;
+  final List<String> tags;
+  final String? sourceUrl;
   final String? template; // Optional inline YAML snippet
 
   CatalogItem({
     required this.name,
-    required this.image,
     required this.description,
+    this.icon,
+    this.version = '',
+    this.category = 'Uncategorized',
+    this.compatibility,
+    this.maintainer,
+    this.tags = const [],
+    this.sourceUrl,
     this.template,
   });
 
   factory CatalogItem.fromJson(Map<String, dynamic> json) {
     return CatalogItem(
       name: json['name'] ?? '',
-      image: json['image'] ?? '',
       description: json['description'] ?? '',
+      icon: json['icon'],
+      version: json['version'] ?? '',
+      category: json['category'] ?? 'Uncategorized',
+      compatibility: json['compatibility'],
+      maintainer: json['maintainer'],
+      tags: (json['tags'] as List<dynamic>?)?.cast<String>() ?? [],
+      sourceUrl: json['source_url'],
       template: json['template'],
+    );
+  }
+}
+
+class CatalogResponse {
+  final List<CatalogItem> apps;
+  final int page;
+  final int pageSize;
+  final int total;
+  final int totalPages;
+
+  CatalogResponse({
+    required this.apps,
+    required this.page,
+    required this.pageSize,
+    required this.total,
+    required this.totalPages,
+  });
+
+  factory CatalogResponse.fromJson(Map<String, dynamic> json) {
+    return CatalogResponse(
+      apps: (json['apps'] as List<dynamic>?)
+              ?.map((e) => CatalogItem.fromJson(e))
+              .toList() ??
+          [],
+      page: json['page'] ?? 1,
+      pageSize: json['page_size'] ?? 20,
+      total: json['total'] ?? 0,
+      totalPages: json['total_pages'] ?? 0,
     );
   }
 }

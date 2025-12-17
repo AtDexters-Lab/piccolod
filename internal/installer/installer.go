@@ -13,4 +13,4 @@ func NewInstaller() *Installer {
 }
 
 func (i *Installer) GetAvailableDisks() ([]api.DiskInfo, error) { return nil, nil }
-func (i *Installer) StartInstallation(diskPath string) error { return nil }
+func (i *Installer) StartInstallation(diskPath string) error    { return nil }

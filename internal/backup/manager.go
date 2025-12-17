@@ -12,7 +12,7 @@ func NewManager() *Manager {
 	return &Manager{}
 }
 
-func (m *Manager) CreateFullBackup(destination string) error { return nil }
-func (m *Manager) RestoreFromFullBackup(source string) error { return nil }
+func (m *Manager) CreateFullBackup(destination string) error             { return nil }
+func (m *Manager) RestoreFromFullBackup(source string) error             { return nil }
 func (m *Manager) CreateSystemStateBackup(target api.BackupTarget) error { return nil }
-func (m *Manager) RestoreSystemState(source api.BackupTarget) error { return nil }
+func (m *Manager) RestoreSystemState(source api.BackupTarget) error      { return nil }

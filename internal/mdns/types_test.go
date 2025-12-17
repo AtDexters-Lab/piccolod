@@ -333,7 +333,7 @@ func TestHealthMonitor(t *testing.T) {
 	}
 
 	if len(monitor.InterfaceHealth) != len(interfaceNames) {
-		t.Errorf("Expected %d interface health entries, got %d", 
+		t.Errorf("Expected %d interface health entries, got %d",
 			len(interfaceNames), len(monitor.InterfaceHealth))
 	}
 

@@ -356,3 +356,26 @@ type InstallAppRequest struct {
 type AppListResponse struct {
 	Apps []App `json:"apps"`
 }
+
+// CatalogItem represents an available application in the external catalog
+type CatalogItem struct {
+	Name          string   `json:"name" yaml:"name"`
+	Description   string   `json:"description" yaml:"description"`
+	Icon          string   `json:"icon" yaml:"icon"`
+	Version       string   `json:"version" yaml:"version"`
+	Category      string   `json:"category" yaml:"category"`
+	Compatibility string   `json:"compatibility" yaml:"compatibility"` // e.g. ">= 0.1.0"
+	Path          string   `json:"path" yaml:"path"`
+	Maintainer    string   `json:"maintainer" yaml:"maintainer"`
+	Tags          []string `json:"tags" yaml:"tags"`
+	SourceURL     string   `json:"source_url,omitempty" yaml:"source_url,omitempty"`
+}
+
+// CatalogResponse defines the response for the catalog endpoint with pagination
+type CatalogResponse struct {
+	Apps       []CatalogItem `json:"apps"`
+	Page       int           `json:"page"`
+	PageSize   int           `json:"page_size"`
+	Total      int           `json:"total"`
+	TotalPages int           `json:"total_pages"`
+}

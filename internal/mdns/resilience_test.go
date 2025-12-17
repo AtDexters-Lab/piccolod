@@ -31,24 +31,24 @@ func TestUpdateInterfaceHealth_ErrorRate(t *testing.T) {
 	state := createMockInterfaceState("test0", true, true)
 
 	tests := []struct {
-		name         string
-		queryCount   uint64
-		errorCount   uint64
-		expectedMin  float64
-		expectedMax  float64
+		name        string
+		queryCount  uint64
+		errorCount  uint64
+		expectedMin float64
+		expectedMax float64
 	}{
 		{
 			name:        "Low error rate",
 			queryCount:  100,
 			errorCount:  5,
-			expectedMin: 0.9,  // 100% - (5/100 * 50%) = 97.5%
+			expectedMin: 0.9, // 100% - (5/100 * 50%) = 97.5%
 			expectedMax: 1.0,
 		},
 		{
 			name:        "Medium error rate",
 			queryCount:  100,
 			errorCount:  20,
-			expectedMin: 0.8,  // 100% - (20/100 * 50%) = 90%
+			expectedMin: 0.8, // 100% - (20/100 * 50%) = 90%
 			expectedMax: 0.95,
 		},
 		{
@@ -69,7 +69,7 @@ func TestUpdateInterfaceHealth_ErrorRate(t *testing.T) {
 			manager.updateInterfaceHealth(state)
 
 			if state.HealthScore < tt.expectedMin || state.HealthScore > tt.expectedMax {
-				t.Errorf("HealthScore = %v, want between %v and %v", 
+				t.Errorf("HealthScore = %v, want between %v and %v",
 					state.HealthScore, tt.expectedMin, tt.expectedMax)
 			}
 		})
@@ -90,7 +90,7 @@ func TestUpdateInterfaceHealth_FailureImpact(t *testing.T) {
 
 	// With 3 recent failures, health should be reduced by ~30%
 	if state.HealthScore > 0.75 {
-		t.Errorf("Interface with recent failures should have reduced health, got %v", 
+		t.Errorf("Interface with recent failures should have reduced health, got %v",
 			state.HealthScore)
 	}
 
@@ -113,7 +113,7 @@ func TestUpdateInterfaceHealth_FailureDecay(t *testing.T) {
 
 	// Old failures should have minimal impact due to decay
 	if state.HealthScore < 0.95 {
-		t.Errorf("Interface with old failures should have high health due to decay, got %v", 
+		t.Errorf("Interface with old failures should have high health due to decay, got %v",
 			state.HealthScore)
 	}
 }
@@ -132,12 +132,12 @@ func TestUpdateInterfaceHealth_CombinedFactors(t *testing.T) {
 
 	// Health should be impacted by both errors and failures
 	if state.HealthScore > 0.8 {
-		t.Errorf("Interface with both errors and failures should have reduced health, got %v", 
+		t.Errorf("Interface with both errors and failures should have reduced health, got %v",
 			state.HealthScore)
 	}
 
 	if state.HealthScore < 0.6 {
-		t.Errorf("Health reduction seems too severe for moderate issues, got %v", 
+		t.Errorf("Health reduction seems too severe for moderate issues, got %v",
 			state.HealthScore)
 	}
 }
@@ -169,10 +169,10 @@ func TestCalculateBackoffDuration(t *testing.T) {
 	config := manager.resilienceConfig
 
 	tests := []struct {
-		name           string
-		attemptNumber  uint64
-		expectedMin    time.Duration
-		expectedMax    time.Duration
+		name          string
+		attemptNumber uint64
+		expectedMin   time.Duration
+		expectedMax   time.Duration
 	}{
 		{
 			name:          "First attempt",
@@ -204,7 +204,7 @@ func TestCalculateBackoffDuration(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			state := createMockInterfaceState("test", true, true)
 			atomic.StoreUint64(&state.RecoveryAttempts, tt.attemptNumber)
-			
+
 			duration := manager.calculateBackoffDuration(state)
 
 			if duration < tt.expectedMin && tt.attemptNumber <= 3 {
@@ -216,7 +216,7 @@ func TestCalculateBackoffDuration(t *testing.T) {
 			}
 
 			if duration > config.MaxBackoff {
-				t.Errorf("Backoff duration = %v, should not exceed MaxBackoff %v", 
+				t.Errorf("Backoff duration = %v, should not exceed MaxBackoff %v",
 					duration, config.MaxBackoff)
 			}
 		})
@@ -225,12 +225,12 @@ func TestCalculateBackoffDuration(t *testing.T) {
 
 func TestCalculateBackoffDuration_ExponentialGrowth(t *testing.T) {
 	manager := createMockManager()
-	
+
 	// Test that backoff grows exponentially
 	state1 := createMockInterfaceState("test1", true, true)
 	state2 := createMockInterfaceState("test2", true, true)
 	state3 := createMockInterfaceState("test3", true, true)
-	
+
 	atomic.StoreUint64(&state1.RecoveryAttempts, 1)
 	atomic.StoreUint64(&state2.RecoveryAttempts, 2)
 	atomic.StoreUint64(&state3.RecoveryAttempts, 3)
@@ -300,7 +300,7 @@ func TestMarkInterfaceFailure_RepeatedFailures(t *testing.T) {
 	// Verify backoff duration increases with failures
 	expectedBackoff := manager.calculateBackoffDuration(state)
 	timeDiff := state.BackoffUntil.Sub(state.LastFailure)
-	
+
 	// Allow some tolerance for timing
 	tolerance := time.Millisecond * 10
 	if timeDiff < expectedBackoff-tolerance || timeDiff > expectedBackoff+tolerance {
@@ -310,7 +310,7 @@ func TestMarkInterfaceFailure_RepeatedFailures(t *testing.T) {
 
 func TestInterfaceHealthEvaluation(t *testing.T) {
 	manager := createMockManager()
-	
+
 	tests := []struct {
 		name        string
 		healthScore float64
@@ -345,7 +345,7 @@ func TestInterfaceHealthEvaluation(t *testing.T) {
 			// Test if interface meets health threshold
 			healthy := tt.healthScore >= minHealthScore
 			if healthy != tt.expected {
-				t.Errorf("Health evaluation = %v, want %v for health score %v (threshold: %v)", 
+				t.Errorf("Health evaluation = %v, want %v for health score %v (threshold: %v)",
 					healthy, tt.expected, tt.healthScore, minHealthScore)
 			}
 		})

@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 DEMO ?= 0
-RUN_PORT ?= 8889
+RUN_PORT ?= 8080
 RUN_STATE_DIR ?= $(CURDIR)/.run-state
 
 .PHONY: all deps ui server build run release demo demo-serve clean typegen e2e

@@ -1164,7 +1164,7 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	data := resp.Data.(map[string]interface{})
 	svcs := data["services"].([]interface{})
 	svc := svcs[0].(map[string]interface{})
-	
+
 	expected := fmt.Sprintf("http://piccolo.local:%d", ep.PublicPort)
 	if got := svc["local_url"].(string); got != expected {
 		t.Errorf("Host=piccolo.local: expected %q, got %q", expected, got)

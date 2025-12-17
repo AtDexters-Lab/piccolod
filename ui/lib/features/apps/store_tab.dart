@@ -25,27 +25,82 @@ class StoreTab extends StatefulWidget {
 }
 
 class _StoreTabState extends State<StoreTab> {
-  List<CatalogItem> _allItems = [];
+  List<CatalogItem> _items = [];
   bool _isLoading = true;
   String? _error;
+  int _currentPage = 1;
+  int _totalPages = 1;
+  
+  List<String> _categories = ['All'];
+  String _selectedCategory = 'All';
 
   @override
   void initState() {
     super.initState();
+    _loadCategories();
     _loadCatalog();
   }
 
-  Future<void> _loadCatalog() async {
-    setState(() {
-      _isLoading = true;
-      _error = null;
-    });
+  @override
+  void didUpdateWidget(StoreTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.searchQuery != oldWidget.searchQuery) {
+      _loadCatalog(reset: true);
+    }
+  }
 
+  Future<void> _loadCategories() async {
     try {
-      final items = await widget.appService.getCatalog();
+      final cats = await widget.appService.getCategories();
       if (!mounted) return;
       setState(() {
-        _allItems = items;
+        _categories = ['All', ...cats];
+      });
+    } catch (e) {
+      // Log error but don't block main UI
+      debugPrint("Failed to load categories: $e");
+    }
+  }
+
+  Future<void> _loadCatalog({bool reset = false, int? targetPage}) async {
+    final pageToFetch = reset ? 1 : (targetPage ?? _currentPage);
+
+    if (reset) {
+      setState(() {
+        _items = [];
+        _currentPage = 1;
+        _isLoading = true;
+        _error = null;
+      });
+    } else {
+      setState(() {
+        _isLoading = true;
+        _error = null;
+      });
+    }
+
+    try {
+      final response = await widget.appService.getCatalog(
+        page: pageToFetch,
+        pageSize: 20,
+        query: widget.searchQuery,
+        category: _selectedCategory == 'All' ? null : _selectedCategory,
+      );
+      if (!mounted) return;
+      setState(() {
+        if (reset) {
+          _items = response.apps;
+        } else {
+          // Avoid duplicates if any
+          final existingIds = _items.map((e) => e.name).toSet();
+          for (var app in response.apps) {
+            if (!existingIds.contains(app.name)) {
+              _items.add(app);
+            }
+          }
+        }
+        _currentPage = response.page;
+        _totalPages = response.totalPages;
         _isLoading = false;
       });
     } catch (e) {
@@ -57,6 +112,21 @@ class _StoreTabState extends State<StoreTab> {
     }
   }
 
+  void _onCategorySelected(String category) {
+    if (_selectedCategory == category) return;
+    setState(() {
+      _selectedCategory = category;
+    });
+    _loadCatalog(reset: true);
+  }
+
+  void _loadMore() {
+    if (_currentPage < _totalPages && !_isLoading) {
+      _loadCatalog(targetPage: _currentPage + 1);
+    }
+  }
+
+  // ... (keep _installFromTemplate) ...
   void _installFromTemplate(CatalogItem item) async {
     String? yaml = item.template;
     
@@ -79,7 +149,7 @@ class _StoreTabState extends State<StoreTab> {
         barrierDismissible: false,
         builder: (context) => CustomInstallWizard(
           appService: widget.appService,
-          initialYaml: yaml,
+          initialYaml: yaml!,
           onSuccess: (appName) {
              Navigator.of(context).pop(); // Close Wizard
              // Open App Detail Window
@@ -101,11 +171,53 @@ class _StoreTabState extends State<StoreTab> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoading) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Category Pills
+        Container(
+          height: 60,
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          child: ListView.separated(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            scrollDirection: Axis.horizontal,
+            itemCount: _categories.length,
+            separatorBuilder: (c, i) => const SizedBox(width: 8),
+            itemBuilder: (context, index) {
+              final cat = _categories[index];
+              final isSelected = cat == _selectedCategory;
+              return ChoiceChip(
+                label: Text(cat),
+                selected: isSelected,
+                showCheckmark: false,
+                onSelected: (_) => _onCategorySelected(cat),
+                selectedColor: PiccoloTheme.cobalt600,
+                labelStyle: TextStyle(
+                  color: isSelected ? Colors.white : PiccoloTheme.ink,
+                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                ),
+                backgroundColor: PiccoloTheme.porcelain,
+                side: BorderSide.none,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+              );
+            },
+          ),
+        ),
+        
+        // Content
+        Expanded(
+          child: _buildContent(),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildContent() {
+    if (_isLoading && _items.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
 
-    if (_error != null) {
+    if (_error != null && _items.isEmpty) {
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -115,7 +227,7 @@ class _StoreTabState extends State<StoreTab> {
             Text(_error!, style: PiccoloTheme.textTheme.bodyMedium),
             const SizedBox(height: 16),
             OutlinedButton(
-              onPressed: _loadCatalog,
+              onPressed: () => _loadCatalog(reset: true),
               child: const Text("Retry"),
             ),
           ],
@@ -123,16 +235,12 @@ class _StoreTabState extends State<StoreTab> {
       );
     }
 
-    final filteredItems = _allItems.where((item) {
-      final q = widget.searchQuery.toLowerCase();
-      return item.name.toLowerCase().contains(q) ||
-          item.description.toLowerCase().contains(q);
-    }).toList();
-
-    if (filteredItems.isEmpty) {
+    if (_items.isEmpty) {
       return Center(
         child: Text(
-          widget.searchQuery.isEmpty ? "No apps in catalog." : "No matching apps found.",
+          widget.searchQuery.isEmpty 
+             ? "No apps found in this category." 
+             : "No matching apps found.",
           style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
             color: PiccoloTheme.inkMuted,
           ),
@@ -140,22 +248,40 @@ class _StoreTabState extends State<StoreTab> {
       );
     }
 
-    return GridView.builder(
+    return ListView(
       padding: const EdgeInsets.all(24),
-      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 300,
-        mainAxisSpacing: 16,
-        crossAxisSpacing: 16,
-        childAspectRatio: 0.8, // Taller cards for description
-      ),
-      itemCount: filteredItems.length,
-      itemBuilder: (context, index) {
-        final item = filteredItems[index];
-        return _CatalogCard(
-          item: item,
-          onInstall: () => _installFromTemplate(item),
-        );
-      },
+      children: [
+        GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+            maxCrossAxisExtent: 350,
+            mainAxisSpacing: 16,
+            crossAxisSpacing: 16,
+            childAspectRatio: 0.85,
+          ),
+          itemCount: _items.length,
+          itemBuilder: (context, index) {
+            final item = _items[index];
+            return _CatalogCard(
+              item: item,
+              onInstall: () => _installFromTemplate(item),
+            );
+          },
+        ),
+        if (_currentPage < _totalPages)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 32.0),
+            child: Center(
+              child: OutlinedButton(
+                onPressed: _isLoading ? null : _loadMore,
+                child: _isLoading
+                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Text("Load More"),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }
@@ -189,24 +315,36 @@ class _CatalogCard extends StatelessWidget {
                   decoration: BoxDecoration(
                     color: PiccoloTheme.mist,
                     borderRadius: BorderRadius.circular(12),
-                    image: item.image.isNotEmpty ? DecorationImage(
-                        image: NetworkImage(item.image), // Assumption: URL accessible
+                    image: (item.icon != null && item.icon!.isNotEmpty) ? DecorationImage(
+                        image: NetworkImage(item.icon!), 
                         fit: BoxFit.cover,
                     ) : null,
                   ),
-                  child: item.image.isEmpty 
+                  child: (item.icon == null || item.icon!.isEmpty) 
                     ? const Icon(Icons.apps, color: PiccoloTheme.inkMuted)
                     : null,
                 ),
                 const SizedBox(width: 12),
                 Expanded(
-                  child: Text(
-                    item.name,
-                    style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        item.name,
+                        style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+                          fontWeight: FontWeight.bold,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        "${item.category} • v${item.version}",
+                        style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+                          color: PiccoloTheme.inkMuted,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
@@ -219,10 +357,24 @@ class _CatalogCard extends StatelessWidget {
                 style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
                   color: PiccoloTheme.inkMuted,
                 ),
-                maxLines: 4,
+                maxLines: 3,
                 overflow: TextOverflow.ellipsis,
               ),
             ),
+             const SizedBox(height: 8),
+             if (item.tags.isNotEmpty)
+               Wrap(
+                 spacing: 4,
+                 runSpacing: 4,
+                 children: item.tags.take(3).map((tag) => Container(
+                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                   decoration: BoxDecoration(
+                     color: Colors.black.withValues(alpha: 0.05),
+                     borderRadius: BorderRadius.circular(4),
+                   ),
+                   child: Text(tag, style: PiccoloTheme.textTheme.labelSmall?.copyWith(fontSize: 10)),
+                 )).toList(),
+               ),
             const SizedBox(height: 12),
             // Footer Action
             SizedBox(
