@@ -62,7 +62,7 @@ func (c *Client) Login() error {
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
-	
+
 	if resp.StatusCode != 200 {
 		// If login fails, maybe we are already logged in (cookie jar)?
 		// Or maybe creds are wrong.
@@ -127,7 +127,7 @@ func main() {
 	log.Println("Starting E2E Update Test against", BaseURL)
 
 	client := NewClient()
-	
+
 	// Initial Connection & Auth Loop (wait for devserver to be up)
 	ensureOnline(client)
 
@@ -168,7 +168,7 @@ func main() {
 
 	log.Println("Waiting for update to finish (this takes minutes)...")
 	waitForPending(client, true)
-	
+
 	st, err = getStatus(client)
 	if err != nil {
 		log.Fatalf("Status check failed: %v", err)
@@ -185,7 +185,7 @@ func main() {
 	// === 3. Reboot to Apply ===
 	log.Println(">>> TEST STAGE: REBOOT INTO NEW SNAPSHOT")
 	performRebootCycle(client)
-	
+
 	st, err = getStatus(client)
 	if err != nil {
 		log.Fatalf("Status check failed: %v", err)
@@ -240,7 +240,7 @@ func main() {
 	// If we rolled back to baseline, the "OS Release" or content should match baseline.
 	// Since we don't strictly track content hash here, we assume if we booted into the new default, it worked.
 	// In a real test, we'd check `st.CurrentVersion` matches baseline version.
-	
+
 	log.Println("PASS: Full Update & Rollback Cycle Complete.")
 }
 
@@ -272,16 +272,16 @@ func waitForPending(c *Client, wantPending bool) {
 			// Detect 429 (Too Many Requests) which means update is running
 			// Also handle standard network timeouts
 			errMsg := err.Error()
-			if bytes.Contains([]byte(errMsg), []byte("(429)")) || 
-			   bytes.Contains([]byte(errMsg), []byte("connection refused")) ||
-			   bytes.Contains([]byte(errMsg), []byte("timeout")) {
+			if bytes.Contains([]byte(errMsg), []byte("(429)")) ||
+				bytes.Contains([]byte(errMsg), []byte("connection refused")) ||
+				bytes.Contains([]byte(errMsg), []byte("timeout")) {
 				time.Sleep(10 * time.Second)
 				continue
 			}
 			// Fail fast on other errors (401, 500, 404, etc)
 			log.Fatalf("Unexpected error while waiting for pending: %v", err)
 		}
-		
+
 		if st.Pending == wantPending {
 			return
 		}
@@ -295,7 +295,7 @@ func performRebootCycle(c *Client) {
 	if resp, err := c.Post("/updates/os/reboot", nil); err == nil {
 		resp.Body.Close()
 	}
-	
+
 	// 1. Wait for it to go down (login fails)
 	log.Println("Waiting for system to go down...")
 	down := false

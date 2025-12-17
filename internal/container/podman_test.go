@@ -168,17 +168,17 @@ func TestValidateEnvValue(t *testing.T) {
 // TestValidateContainerSpec tests full spec validation
 func TestValidateContainerSpec(t *testing.T) {
 	tests := []struct {
-		name        string
-		spec        ContainerCreateSpec
-		expectError bool
+		name          string
+		spec          ContainerCreateSpec
+		expectError   bool
 		errorContains string
 	}{
 		{
 			name: "valid spec",
 			spec: ContainerCreateSpec{
-				Name:  "test-app",
-				Image: "nginx:latest",
-				Ports: []PortMapping{{Host: 8080, Container: 80}},
+				Name:        "test-app",
+				Image:       "nginx:latest",
+				Ports:       []PortMapping{{Host: 8080, Container: 80}},
 				Environment: map[string]string{"NODE_ENV": "production"},
 			},
 			expectError: false,
@@ -189,7 +189,7 @@ func TestValidateContainerSpec(t *testing.T) {
 				Name:  "invalid!name",
 				Image: "nginx:latest",
 			},
-			expectError: true,
+			expectError:   true,
 			errorContains: "invalid container name",
 		},
 		{
@@ -199,27 +199,27 @@ func TestValidateContainerSpec(t *testing.T) {
 				Image: "nginx:latest",
 				Ports: []PortMapping{{Host: 0, Container: 80}},
 			},
-			expectError: true,
+			expectError:   true,
 			errorContains: "invalid host port",
 		},
 		{
 			name: "invalid volume path",
 			spec: ContainerCreateSpec{
-				Name:  "test-app",
-				Image: "nginx:latest",
+				Name:    "test-app",
+				Image:   "nginx:latest",
 				Volumes: []VolumeMapping{{Host: "relative/path", Container: "/data"}},
 			},
-			expectError: true,
+			expectError:   true,
 			errorContains: "invalid host path",
 		},
 		{
 			name: "invalid env key",
 			spec: ContainerCreateSpec{
-				Name:  "test-app",
-				Image: "nginx:latest",
+				Name:        "test-app",
+				Image:       "nginx:latest",
 				Environment: map[string]string{"123KEY": "value"},
 			},
-			expectError: true,
+			expectError:   true,
 			errorContains: "invalid environment key",
 		},
 	}
@@ -287,24 +287,24 @@ func TestPodmanCLI_CreateContainer(t *testing.T) {
 		t.Fatalf("Spec validation failed: %v", err)
 	}
 
-    // Create container
-    containerID, err := podman.CreateContainer(ctx, spec)
-    if err != nil {
-        // If podman is not available, skip the test
-        if containsString(err.Error(), "executable file not found") {
-            t.Skip("Podman not available, skipping integration test")
-        }
-        t.Fatalf("Failed to create container: %v", err)
-    }
+	// Create container
+	containerID, err := podman.CreateContainer(ctx, spec)
+	if err != nil {
+		// If podman is not available, skip the test
+		if containsString(err.Error(), "executable file not found") {
+			t.Skip("Podman not available, skipping integration test")
+		}
+		t.Fatalf("Failed to create container: %v", err)
+	}
 
 	// Cleanup: remove container
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
-		
+
 		// Stop container first
 		_ = podman.StopContainer(cleanupCtx, containerID)
-		
+
 		// Remove container
 		if err := podman.RemoveContainer(cleanupCtx, containerID); err != nil {
 			t.Errorf("Failed to cleanup container %s: %v", containerID, err)
@@ -354,12 +354,12 @@ func TestIsValidContainerID(t *testing.T) {
 
 // Helper function for string containment check
 func containsString(s, substr string) bool {
-	return len(s) >= len(substr) && 
-		   (s == substr || 
-			len(s) > len(substr) && 
-			(s[:len(substr)] == substr || 
-			 s[len(s)-len(substr):] == substr ||
-			 containsSubstring(s[1:len(s)-1], substr)))
+	return len(s) >= len(substr) &&
+		(s == substr ||
+			len(s) > len(substr) &&
+				(s[:len(substr)] == substr ||
+					s[len(s)-len(substr):] == substr ||
+					containsSubstring(s[1:len(s)-1], substr)))
 }
 
 func containsSubstring(s, substr string) bool {

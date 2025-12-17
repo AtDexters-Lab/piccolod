@@ -13,7 +13,7 @@ type ServiceEndpoint struct {
 	App         string                      `json:"app"`
 	Name        string                      `json:"name"`
 	GuestPort   int                         `json:"guest_port"`
-	HostBind    int                         `json:"host_port"` // 127.0.0.1:HostBind → container:GuestPort
+	HostBind    int                         `json:"host_port"`   // 127.0.0.1:HostBind → container:GuestPort
 	PublicPort  int                         `json:"public_port"` // 0.0.0.0:PublicPort → HostBind
 	Flow        api.ListenerFlow            `json:"flow"`
 	Protocol    api.ListenerProtocol        `json:"protocol"`

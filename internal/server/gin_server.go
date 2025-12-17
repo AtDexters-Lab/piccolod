@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/app"
+	"piccolod/internal/app/catalog"
 	authpkg "piccolod/internal/auth"
 	"piccolod/internal/cluster"
 	"piccolod/internal/consensus"
@@ -93,9 +95,10 @@ type GinServer struct {
 	resetFailures int
 
 	// Crypto manager for lock/unlock of app data volumes
-	cryptoManager *crypt.Manager
-	healthTracker *health.Tracker
-	updateManager osUpdateManager
+	cryptoManager  *crypt.Manager
+	healthTracker  *health.Tracker
+	updateManager  osUpdateManager
+	catalogManager *catalog.Manager
 
 	reloadersMu     sync.RWMutex
 	unlockReloaders []unlockReloader
@@ -341,6 +344,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		mdnsMgr = mdns.NewManager()
 	}
 
+	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), filepath.Join(stateDir, "tmp", "catalog"))
+
 	s := &GinServer{
 		appManager:     appMgr,
 		serviceManager: svcMgr,
@@ -355,6 +360,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		dispatcher:     dispatch,
 		cryptoManager:  cmgr,
 		healthTracker:  healthTracker,
+		catalogManager: catalogMgr,
 	}
 	// Seed baseline health statuses
 	healthTracker.Setf("http", health.LevelOK, "HTTP server initialized")
@@ -673,7 +679,8 @@ func (s *GinServer) setupGinRoutes() {
 		authed.GET("/auth/csrf", s.handleAuthCSRF)
 
 		// Debug terminal (Local & Admin only)
-		authed.GET("/terminal", s.allowLocalOnly(), s.handleTerminal)
+		// Update: enable for all authenticated users for easier remote ux via Nexus
+		authed.GET("/terminal", s.handleTerminal)
 
 		// OS updates
 		authed.GET("/updates/os", s.handleOSUpdateStatus)
@@ -683,6 +690,7 @@ func (s *GinServer) setupGinRoutes() {
 
 		// Catalog (read-only) and services require auth
 		authed.GET("/catalog", s.handleGinCatalog)
+		authed.GET("/catalog/categories", s.handleGinCatalogCategories)
 		authed.GET("/catalog/:name/template", s.handleGinCatalogTemplate)
 		authed.GET("/services", s.handleGinServicesAll)
 	}

@@ -8,20 +8,59 @@ class AppService {
 
   // --- Catalog ---
 
-  Future<List<CatalogItem>> getCatalog() async {
-    final data = await _client.get('/api/v1/catalog');
-    // Expected structure: { data: { apps: [...] } } or { apps: [...] }
+  Future<CatalogResponse> getCatalog({
+    int page = 1,
+    int pageSize = 20,
+    String? query,
+    String? category,
+  }) async {
+    final queryParams = <String, String>{
+      'page': page.toString(),
+      'page_size': pageSize.toString(),
+    };
+    if (query != null && query.isNotEmpty) queryParams['q'] = query;
+    if (category != null && category.isNotEmpty) queryParams['category'] = category;
+
+    // ApiClient.get usually appends query params if provided, or we construct the URL
+    // Assuming ApiClient.get takes a path. We'll construct the query string.
+    final uri = Uri(path: '/api/v1/catalog', queryParameters: queryParams);
     
-    var list = [];
-    if (data is Map) {
-      if (data['data'] != null && data['data'] is Map && data['data']['apps'] != null) {
-        list = data['data']['apps'];
-      } else if (data['apps'] != null) {
-        list = data['apps'];
-      }
+    final data = await _client.get(uri.toString());
+    // Expected structure: { apps: [...], page: 1, ... }
+    
+    // Handle potential wrapper { data: { ... } } if existing ApiClient wraps it?
+    // Based on previous code, it seemed to handle raw response or data wrapper.
+    // The new backend returns JSON matching CatalogResponse directly.
+    
+    Map<String, dynamic> json;
+    if (data is Map<String, dynamic>) {
+        // Check if wrapped in "data"
+        if (data.containsKey('data') && data['data'] is Map) {
+             json = data['data'];
+        } else {
+             json = data;
+        }
+    } else {
+        // Fallback/Error
+        return CatalogResponse(apps: [], page: 1, pageSize: 20, total: 0, totalPages: 0);
     }
+
+    return CatalogResponse.fromJson(json);
+  }
+
+  Future<List<String>> getCategories() async {
+    final data = await _client.get('/api/v1/catalog/categories');
+    // Expected: { categories: ["CMS", "Database"] } or { data: { categories: [...] } }
     
-    return list.map((e) => CatalogItem.fromJson(e)).toList();
+    List<dynamic> list = [];
+    if (data is Map) {
+       if (data['data'] != null && data['data']['categories'] != null) {
+         list = data['data']['categories'];
+       } else if (data['categories'] != null) {
+         list = data['categories'];
+       }
+    }
+    return list.cast<String>();
   }
 
   Future<String?> getCatalogTemplate(String name) async {

@@ -4,7 +4,6 @@ import '../../../theme/piccolo_theme.dart';
 import '../desktop_controller.dart';
 
 import '../features/settings/settings_app.dart';
-import '../features/files/files_app.dart';
 import '../features/terminal/terminal_view.dart';
 
 class Dock extends StatelessWidget {

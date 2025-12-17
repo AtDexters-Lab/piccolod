@@ -46,7 +46,7 @@ type RotateSecretResponse struct {
 	Secret string
 }
 
-type RunPreflightCommand struct{
+type RunPreflightCommand struct {
 	Candidate *Config
 }
 
