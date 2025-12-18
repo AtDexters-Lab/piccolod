@@ -12,6 +12,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/cluster"
 	"piccolod/internal/events"
+	"piccolod/internal/persistence"
 	"piccolod/internal/router"
 	"piccolod/internal/services"
 	"piccolod/internal/state/paths"
@@ -34,10 +35,52 @@ func (s *stubLockReader) set(locked bool) {
 	s.mu.Unlock()
 }
 
+type stubVolumeManager struct {
+	root string
+}
+
+func (s *stubVolumeManager) EnsureVolume(ctx context.Context, req persistence.VolumeRequest) (persistence.VolumeHandle, error) {
+	_ = ctx
+	handle := persistence.VolumeHandle{
+		ID:       req.ID,
+		MountDir: filepath.Join(s.root, "mounts", req.ID),
+	}
+	if err := os.MkdirAll(handle.MountDir, 0o700); err != nil {
+		return persistence.VolumeHandle{}, err
+	}
+	return handle, nil
+}
+
+func (s *stubVolumeManager) Attach(ctx context.Context, handle persistence.VolumeHandle, opts persistence.AttachOptions) error {
+	_ = ctx
+	_ = handle
+	_ = opts
+	return nil
+}
+
+func (s *stubVolumeManager) Detach(ctx context.Context, handle persistence.VolumeHandle) error {
+	_ = ctx
+	_ = handle
+	return nil
+}
+
+func (s *stubVolumeManager) RoleStream(id string) (<-chan persistence.VolumeRole, error) {
+	_ = id
+	ch := make(chan persistence.VolumeRole)
+	close(ch)
+	return ch, nil
+}
+
 func allowHostStorage(t *testing.T, m *AppManager) {
 	t.Helper()
 	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") != "1" {
 		t.Skip("set PICCOLO_ALLOW_UNMOUNTED_TESTS=1 to run without mounted volumes")
+	}
+	if m.stateBaseDir != "" {
+		t.Setenv("PICCOLO_STATE_DIR", m.stateBaseDir)
+		t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(m.stateBaseDir, "run", "podman"))
+		paths.SetRootForTest(m.stateBaseDir)
+		m.SetVolumeManager(&stubVolumeManager{root: m.stateBaseDir})
 	}
 	m.SetMountVerifier(func(string) error { return nil })
 }
@@ -937,5 +980,265 @@ func TestAppManager_BlockedWhenLocked(t *testing.T) {
 	})
 	if !errors.Is(err, ErrLocked) {
 		t.Fatalf("expected ErrLocked, got %v", err)
+	}
+}
+
+func TestAppManager_RestoreServicesSkipsStoppedApps(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:alpine",
+		Type:  "user",
+		Listeners: []api.AppListener{{
+			Name:      "web",
+			GuestPort: 8080,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+		}},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	if _, err := mgr.Install(context.Background(), app); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := mgr.Stop(context.Background(), "demo"); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	// Stop removed endpoints; RestoreServices must not re-create them for stopped apps.
+	mgr.RestoreServices(context.Background())
+	if _, err := svcMgr.GetByApp("demo"); err == nil {
+		t.Fatalf("expected no services for stopped app")
+	}
+}
+
+func TestAppManager_ReconcileOnceStartsDesiredRunningApps(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:alpine",
+		Type:  "user",
+		Listeners: []api.AppListener{{
+			Name:      "web",
+			GuestPort: 8080,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+		}},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	if _, err := mgr.Install(context.Background(), app); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	mgr.ReconcileOnce(context.Background())
+	inst, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if inst.Status != "running" {
+		t.Fatalf("expected status running after reconcile, got %s", inst.Status)
+	}
+	if inst.ContainerID == "" {
+		t.Fatalf("expected container id after reconcile")
+	}
+	if c := mock.containers[inst.ContainerID]; c == nil || c.Status != "running" {
+		t.Fatalf("expected container to be running after reconcile")
+	}
+}
+
+func TestAppManager_ReconcileOnceStopsDesiredStoppedApps(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:alpine",
+		Type:  "user",
+		Listeners: []api.AppListener{{
+			Name:      "web",
+			GuestPort: 8080,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+		}},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	if _, err := mgr.Install(context.Background(), app); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := mgr.Start(context.Background(), "demo"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	// Force desired stopped without stopping the container to simulate drift.
+	if err := state.UpdateAppStatus("demo", "stopped"); err != nil {
+		t.Fatalf("update status: %v", err)
+	}
+
+	mgr.ReconcileOnce(context.Background())
+	inst, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if inst.Status != "stopped" {
+		t.Fatalf("expected status stopped, got %s", inst.Status)
+	}
+	if c := mock.containers[inst.ContainerID]; c == nil || c.Status != "stopped" {
+		t.Fatalf("expected container to be stopped after reconcile")
+	}
+	if _, err := svcMgr.GetByApp("demo"); err == nil {
+		t.Fatalf("expected no services for stopped app")
+	}
+}
+
+func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:alpine",
+		Type:  "user",
+		Listeners: []api.AppListener{{
+			Name:      "web",
+			GuestPort: 8080,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+		}},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	if _, err := mgr.Install(context.Background(), app); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := mgr.Start(context.Background(), "demo"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Simulate follower transition: stop container without changing app status.
+	if err := mgr.stopForFollowerTransition(context.Background(), "demo"); err != nil {
+		t.Fatalf("follower stop: %v", err)
+	}
+
+	inst, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if inst.Status != "running" {
+		t.Fatalf("expected status to remain running, got %s", inst.Status)
+	}
+	if c := mock.containers[inst.ContainerID]; c == nil || c.Status != "stopped" {
+		t.Fatalf("expected container to be stopped after follower transition")
+	}
+
+	// Mark the app as follower so background reconcile does not restart it.
+	mgr.leadershipMu.Lock()
+	mgr.leadershipState[cluster.ResourceForApp("demo")] = cluster.RoleFollower
+	mgr.leadershipMu.Unlock()
+
+	mgr.ReconcileOnce(context.Background())
+	updated, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if updated.Status != "running" {
+		t.Fatalf("expected status to remain running, got %s", updated.Status)
+	}
+	if c := mock.containers[updated.ContainerID]; c == nil || c.Status != "stopped" {
+		t.Fatalf("expected container to remain stopped on follower after reconcile")
+	}
+	if _, err := svcMgr.GetByApp("demo"); err == nil {
+		t.Fatalf("expected no services for follower app")
+	}
+}
+
+func TestAppManager_ReconcileOnceResolvesStaleContainerID(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:alpine",
+		Type:  "user",
+		Listeners: []api.AppListener{{
+			Name:      "web",
+			GuestPort: 8080,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+		}},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	inst, err := mgr.Install(context.Background(), app)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	original := inst.ContainerID
+
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	stale := generateMockContainerID(9)
+	if err := state.UpdateAppRuntime("demo", inst.Status, stale); err != nil {
+		t.Fatalf("update runtime: %v", err)
+	}
+
+	mgr.ReconcileOnce(context.Background())
+	updated, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if updated.ContainerID != original {
+		t.Fatalf("expected container id to be resolved back to %s, got %s", original, updated.ContainerID)
 	}
 }

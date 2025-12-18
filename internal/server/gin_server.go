@@ -330,6 +330,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	// otherwise legacy installations would appear empty after upgrade.
 	appMgr.SetStateBaseDir(controlDir)
 	appMgr.SetLockReader(persist)
+	appMgr.SetVolumeManager(persist.Volumes())
 	svcMgr.SetLockReader(persist)
 
 	// Set Gin to release mode for production (can be overridden by GIN_MODE env var)
@@ -388,6 +389,14 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		return nil
 	}, func(ctx context.Context) error {
 		s.serviceManager.Stop()
+		return nil
+	}))
+
+	s.supervisor.Register(supervisor.NewComponent("app-manager", func(ctx context.Context) error {
+		s.appManager.StartBackground()
+		return nil
+	}, func(ctx context.Context) error {
+		s.appManager.StopBackground()
 		return nil
 	}))
 

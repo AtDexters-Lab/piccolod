@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 )
@@ -242,21 +243,16 @@ func TestValidateContainerSpec(t *testing.T) {
 	}
 }
 
-func TestBuildRunArgsIncludesReplaceForNamedContainers(t *testing.T) {
+func TestBuildRunArgsDoesNotIncludeReplaceForNamedContainers(t *testing.T) {
 	spec := ContainerCreateSpec{
 		Name:  "nginxdemo",
 		Image: "docker.io/library/nginx:alpine",
 	}
 	args := buildRunArgs(spec)
-	foundReplace := false
 	for _, arg := range args {
 		if arg == "--replace" {
-			foundReplace = true
-			break
+			t.Fatalf("did not expect --replace flag in args, got %v", args)
 		}
-	}
-	if !foundReplace {
-		t.Fatalf("expected --replace flag in args, got %v", args)
 	}
 }
 
@@ -266,10 +262,27 @@ func TestPodmanCLI_CreateContainer(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
+	if os.Getenv("PICCOLO_TEST_PODMAN") != "1" {
+		t.Skip("set PICCOLO_TEST_PODMAN=1 to run podman integration test")
+	}
 
 	podman := &PodmanCLI{}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	root, err := os.MkdirTemp("", "podman-root-")
+	if err != nil {
+		t.Fatalf("mkdtemp root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+	runRoot, err := os.MkdirTemp("", "podman-runroot-")
+	if err != nil {
+		t.Fatalf("mkdtemp runroot: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(runRoot) })
+
+	runtime := PodmanRuntime{Root: root, RunRoot: runRoot}
 
 	// Use unique name with timestamp to avoid conflicts
 	uniqueName := fmt.Sprintf("test-container-%d", time.Now().UnixNano())
@@ -288,7 +301,7 @@ func TestPodmanCLI_CreateContainer(t *testing.T) {
 	}
 
 	// Create container
-	containerID, err := podman.CreateContainer(ctx, spec)
+	containerID, err := podman.CreateContainer(ctx, runtime, spec)
 	if err != nil {
 		// If podman is not available, skip the test
 		if containsString(err.Error(), "executable file not found") {
@@ -303,10 +316,10 @@ func TestPodmanCLI_CreateContainer(t *testing.T) {
 		defer cleanupCancel()
 
 		// Stop container first
-		_ = podman.StopContainer(cleanupCtx, containerID)
+		_ = podman.StopContainer(cleanupCtx, runtime, containerID)
 
 		// Remove container
-		if err := podman.RemoveContainer(cleanupCtx, containerID); err != nil {
+		if err := podman.RemoveContainer(cleanupCtx, runtime, containerID); err != nil {
 			t.Errorf("Failed to cleanup container %s: %v", containerID, err)
 		}
 	}()
@@ -317,12 +330,12 @@ func TestPodmanCLI_CreateContainer(t *testing.T) {
 	}
 
 	// Test start container
-	if err := podman.StartContainer(ctx, containerID); err != nil {
+	if err := podman.StartContainer(ctx, runtime, containerID); err != nil {
 		t.Errorf("Failed to start container: %v", err)
 	}
 
 	// Test stop container
-	if err := podman.StopContainer(ctx, containerID); err != nil {
+	if err := podman.StopContainer(ctx, runtime, containerID); err != nil {
 		t.Errorf("Failed to stop container: %v", err)
 	}
 }

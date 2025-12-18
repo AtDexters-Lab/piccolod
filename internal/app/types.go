@@ -9,12 +9,17 @@ import (
 
 // ContainerManager describes the container runtime operations required by the app manager.
 type ContainerManager interface {
-	CreateContainer(ctx context.Context, spec container.ContainerCreateSpec) (string, error)
-	StartContainer(ctx context.Context, containerID string) error
-	StopContainer(ctx context.Context, containerID string) error
-	RemoveContainer(ctx context.Context, containerID string) error
-	PullImage(ctx context.Context, image string) error
-	Logs(ctx context.Context, containerID string, lines int) ([]string, error)
+	CreateContainer(ctx context.Context, runtime container.PodmanRuntime, spec container.ContainerCreateSpec) (string, error)
+	StartContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
+	StopContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
+	RemoveContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
+	PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error
+	Logs(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int) ([]string, error)
+	ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error)
+	InspectContainerState(ctx context.Context, runtime container.PodmanRuntime, containerID string) (container.ContainerState, error)
+	InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[int]int, error)
+	UpdatePublishAdd(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
+	UpdatePublishRemove(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
 }
 
 // AppInstance captures the runtime metadata for an installed application.

@@ -360,6 +360,58 @@ x-piccolo:
 	}
 }
 
+func TestParseAppDefinitionRejectsStorageHostPaths(t *testing.T) {
+	legacy := `
+name: test-app
+image: nginx:latest
+listeners:
+  - name: web
+    guest_port: 80
+storage:
+  persistent:
+    data:
+      container: /data
+      host: /var/lib/piccolod/not-allowed
+x-piccolo:
+  mode: service
+`
+
+	_, err := ParseAppDefinition([]byte(legacy))
+	if err == nil {
+		t.Fatalf("expected error but got none")
+	}
+	if !containsString(err.Error(), "must not specify host") {
+		t.Fatalf("expected host rejection error, got %q", err.Error())
+	}
+}
+
+func TestParseAppDefinitionRejectsStoragePathConflicts(t *testing.T) {
+	conflict := `
+name: test-app
+image: nginx:latest
+listeners:
+  - name: web
+    guest_port: 80
+storage:
+  persistent:
+    data:
+      container: /data
+  temporary:
+    tmp:
+      container: /data
+x-piccolo:
+  mode: service
+`
+
+	_, err := ParseAppDefinition([]byte(conflict))
+	if err == nil {
+		t.Fatalf("expected error but got none")
+	}
+	if !containsString(err.Error(), "conflicts with") {
+		t.Fatalf("expected storage conflict error, got %q", err.Error())
+	}
+}
+
 // TestReservedNames tests that reserved app names are rejected
 func TestReservedNames(t *testing.T) {
 	reservedNames := []string{"api", "www", "admin", "root", "system", "piccolo"}

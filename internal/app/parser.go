@@ -341,6 +341,27 @@ func validateStorage(storage *api.AppStorage) error {
 		return err
 	}
 
+	// Prevent conflicting mountpoints inside the container.
+	seen := make(map[string]string)
+	for name, vol := range storage.Persistent {
+		if vol.Container == "" {
+			continue
+		}
+		if prev, ok := seen[vol.Container]; ok {
+			return fmt.Errorf("storage volume 'persistent.%s' container path %s conflicts with %s", name, vol.Container, prev)
+		}
+		seen[vol.Container] = fmt.Sprintf("persistent.%s", name)
+	}
+	for name, vol := range storage.Temporary {
+		if vol.Container == "" {
+			continue
+		}
+		if prev, ok := seen[vol.Container]; ok {
+			return fmt.Errorf("storage volume 'temporary.%s' container path %s conflicts with %s", name, vol.Container, prev)
+		}
+		seen[vol.Container] = fmt.Sprintf("temporary.%s", name)
+	}
+
 	return nil
 }
 
@@ -357,6 +378,11 @@ func validateStorageVolumes(volumes map[string]api.AppVolume, storageType string
 
 		if volume.Container == "" {
 			return fmt.Errorf("%s storage volume '%s' must specify container path", storageType, name)
+		}
+
+		// Host paths are not user-configurable in Piccolo (all host paths live under the app's encrypted volume).
+		if strings.TrimSpace(volume.Host) != "" {
+			return fmt.Errorf("%s storage volume '%s' must not specify host; Piccolo manages host paths", storageType, name)
 		}
 
 		// Validate container path is absolute

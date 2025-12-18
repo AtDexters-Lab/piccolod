@@ -823,10 +823,47 @@ func TestHandlePersistenceFullExport(t *testing.T) {
 	}
 }
 
+type stubTestVolumeManager struct {
+	root string
+}
+
+func (s *stubTestVolumeManager) EnsureVolume(ctx context.Context, req persistence.VolumeRequest) (persistence.VolumeHandle, error) {
+	_ = ctx
+	handle := persistence.VolumeHandle{
+		ID:       req.ID,
+		MountDir: filepath.Join(s.root, "mounts", req.ID),
+	}
+	if err := os.MkdirAll(handle.MountDir, 0o700); err != nil {
+		return persistence.VolumeHandle{}, err
+	}
+	return handle, nil
+}
+
+func (s *stubTestVolumeManager) Attach(ctx context.Context, handle persistence.VolumeHandle, opts persistence.AttachOptions) error {
+	_ = ctx
+	_ = handle
+	_ = opts
+	return nil
+}
+
+func (s *stubTestVolumeManager) Detach(ctx context.Context, handle persistence.VolumeHandle) error {
+	_ = ctx
+	_ = handle
+	return nil
+}
+
+func (s *stubTestVolumeManager) RoleStream(id string) (<-chan persistence.VolumeRole, error) {
+	_ = id
+	ch := make(chan persistence.VolumeRole)
+	close(ch)
+	return ch, nil
+}
+
 // createGinTestServer creates a Gin test server instance with filesystem state management
 func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	t.Helper()
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(tempDir, "run", "podman"))
 	ensureTestControlMetadata(t, tempDir)
 	// Create mock container manager for app manager
 	mockContainer := &GinMockContainerManager{
@@ -842,6 +879,7 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	}
 	requireMountBypassAllowed(t)
 	appMgr.SetMountVerifier(func(string) error { return nil })
+	appMgr.SetVolumeManager(&stubTestVolumeManager{root: tempDir})
 	eventsBus := events.NewBus()
 	appMgr.ObserveRuntimeEvents(eventsBus)
 	eventsBus.Publish(events.Event{Topic: events.TopicLockStateChanged, Payload: events.LockStateChanged{Locked: false}})
@@ -1048,7 +1086,8 @@ type GinMockContainerManager struct {
 	removeError error
 }
 
-func (m *GinMockContainerManager) CreateContainer(ctx context.Context, spec container.ContainerCreateSpec) (string, error) {
+func (m *GinMockContainerManager) CreateContainer(ctx context.Context, runtime container.PodmanRuntime, spec container.ContainerCreateSpec) (string, error) {
+	_ = runtime
 	if m.createError != nil {
 		return "", m.createError
 	}
@@ -1072,7 +1111,8 @@ func (m *GinMockContainerManager) CreateContainer(ctx context.Context, spec cont
 	return containerID, nil
 }
 
-func (m *GinMockContainerManager) StartContainer(ctx context.Context, containerID string) error {
+func (m *GinMockContainerManager) StartContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
+	_ = runtime
 	if m.startError != nil {
 		return m.startError
 	}
@@ -1084,7 +1124,8 @@ func (m *GinMockContainerManager) StartContainer(ctx context.Context, containerI
 	return container.ErrContainerNotFound(containerID)
 }
 
-func (m *GinMockContainerManager) StopContainer(ctx context.Context, containerID string) error {
+func (m *GinMockContainerManager) StopContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
+	_ = runtime
 	if m.stopError != nil {
 		return m.stopError
 	}
@@ -1096,7 +1137,8 @@ func (m *GinMockContainerManager) StopContainer(ctx context.Context, containerID
 	return container.ErrContainerNotFound(containerID)
 }
 
-func (m *GinMockContainerManager) RemoveContainer(ctx context.Context, containerID string) error {
+func (m *GinMockContainerManager) RemoveContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
+	_ = runtime
 	if m.removeError != nil {
 		return m.removeError
 	}
@@ -1108,11 +1150,14 @@ func (m *GinMockContainerManager) RemoveContainer(ctx context.Context, container
 	return container.ErrContainerNotFound(containerID)
 }
 
-func (m *GinMockContainerManager) PullImage(ctx context.Context, image string) error {
+func (m *GinMockContainerManager) PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error {
+	_ = runtime
+	_ = image
 	return nil
 }
 
-func (m *GinMockContainerManager) Logs(ctx context.Context, containerID string, lines int) ([]string, error) {
+func (m *GinMockContainerManager) Logs(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int) ([]string, error) {
+	_ = runtime
 	if _, ok := m.containers[containerID]; !ok {
 		return nil, container.ErrContainerNotFound(containerID)
 	}
@@ -1124,6 +1169,70 @@ func (m *GinMockContainerManager) Logs(ctx context.Context, containerID string, 
 		out = append(out, "demo log entry")
 	}
 	return out, nil
+}
+
+func (m *GinMockContainerManager) ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error) {
+	_ = ctx
+	_ = runtime
+	for id, c := range m.containers {
+		if c.Name == name {
+			return id, nil
+		}
+	}
+	return "", container.ErrContainerNotFound(name)
+}
+
+func (m *GinMockContainerManager) InspectContainerState(ctx context.Context, runtime container.PodmanRuntime, containerID string) (container.ContainerState, error) {
+	_ = ctx
+	_ = runtime
+	c, ok := m.containers[containerID]
+	if !ok {
+		return container.ContainerState{Exists: false, Running: false}, nil
+	}
+	return container.ContainerState{Exists: true, Running: c.Status == "running"}, nil
+}
+
+func (m *GinMockContainerManager) InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[int]int, error) {
+	_ = ctx
+	_ = runtime
+	c, ok := m.containers[containerID]
+	if !ok {
+		return nil, container.ErrContainerNotFound(containerID)
+	}
+	out := make(map[int]int, len(c.Spec.Ports))
+	for _, p := range c.Spec.Ports {
+		out[p.Container] = p.Host
+	}
+	return out, nil
+}
+
+func (m *GinMockContainerManager) UpdatePublishAdd(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error {
+	_ = ctx
+	_ = runtime
+	c, ok := m.containers[containerID]
+	if !ok {
+		return container.ErrContainerNotFound(containerID)
+	}
+	c.Spec.Ports = append(c.Spec.Ports, container.PortMapping{Host: hostBind, Container: guestPort})
+	return nil
+}
+
+func (m *GinMockContainerManager) UpdatePublishRemove(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error {
+	_ = ctx
+	_ = runtime
+	c, ok := m.containers[containerID]
+	if !ok {
+		return container.ErrContainerNotFound(containerID)
+	}
+	out := make([]container.PortMapping, 0, len(c.Spec.Ports))
+	for _, p := range c.Spec.Ports {
+		if p.Host == hostBind && p.Container == guestPort {
+			continue
+		}
+		out = append(out, p)
+	}
+	c.Spec.Ports = out
+	return nil
 }
 
 func TestServicesLocalURLGeneration(t *testing.T) {

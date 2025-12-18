@@ -264,8 +264,8 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDef
 	return nil
 }
 
-// UpdateAppStatus updates just the app status and updated timestamp
-func (fsm *FilesystemStateManager) UpdateAppStatus(name, status string) error {
+// UpdateAppRuntime updates app runtime metadata (status and container ID) and persists metadata.json.
+func (fsm *FilesystemStateManager) UpdateAppRuntime(name, status, containerID string) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
 
@@ -276,9 +276,14 @@ func (fsm *FilesystemStateManager) UpdateAppStatus(name, status string) error {
 		fsm.cacheMu.Unlock()
 		return fmt.Errorf("app not found: %s", name)
 	}
-
-	app.Status = status
+	if status != "" {
+		app.Status = status
+	}
+	if containerID != "" {
+		app.ContainerID = containerID
+	}
 	app.UpdatedAt = time.Now()
+	createdAt := app.CreatedAt
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem
@@ -287,9 +292,9 @@ func (fsm *FilesystemStateManager) UpdateAppStatus(name, status string) error {
 
 	metadata := AppMetadata{
 		Name:        app.Name,
-		Status:      status,
+		Status:      app.Status,
 		ContainerID: app.ContainerID,
-		CreatedAt:   app.CreatedAt,
+		CreatedAt:   createdAt,
 		UpdatedAt:   app.UpdatedAt,
 	}
 
@@ -303,6 +308,11 @@ func (fsm *FilesystemStateManager) UpdateAppStatus(name, status string) error {
 	}
 
 	return nil
+}
+
+// UpdateAppStatus updates just the app status and updated timestamp
+func (fsm *FilesystemStateManager) UpdateAppStatus(name, status string) error {
+	return fsm.UpdateAppRuntime(name, status, "")
 }
 
 // GetApp retrieves an app from cache (fast access)
