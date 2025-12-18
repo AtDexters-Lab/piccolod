@@ -37,3 +37,8 @@ healthcheck:
 
 depends_on:
   - mysql
+
+# Piccolo-specific policies: typical self-hosted services replicate durable data,
+# while keeping the container "disk" replaceable across upgrades.
+x-piccolo:
+  mode: service

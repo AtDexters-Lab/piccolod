@@ -28,7 +28,8 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 	// Install initial app
 	def := &api.AppDefinition{
 		Name: "demoapp", Image: "alpine:3.18", Type: "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	inst, err := mgr.Install(ctx, def)
 	if err != nil {
@@ -97,7 +98,13 @@ func TestAppManager_Logs(t *testing.T) {
 	mgr.ForceLockState(false)
 	ctx := context.Background()
 
-	def := &api.AppDefinition{Name: "demo", Image: "alpine:latest", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
+	def := &api.AppDefinition{
+		Name:       "demo",
+		Image:      "alpine:latest",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
 	inst, err := mgr.Install(ctx, def)
 	if err != nil {
 		t.Fatalf("install: %v", err)

@@ -205,6 +205,7 @@ func TestAppManager_Install(t *testing.T) {
 		Environment: map[string]string{
 			"ENV_VAR": "test-value",
 		},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
 	// Install the app
@@ -263,7 +264,8 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 	manager.ForceLockState(false)
 	if _, err := manager.Install(context.Background(), &api.AppDefinition{
 		Name: "demo", Image: "alpine:latest", Type: "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}); err != nil {
 		t.Fatalf("seed install: %v", err)
 	}
@@ -282,7 +284,13 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	appDef := &api.AppDefinition{Name: "nope", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
+	appDef := &api.AppDefinition{
+		Name:       "nope",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
 	if _, err := manager.Install(context.Background(), appDef); !errors.Is(err, ErrNotLeader) {
 		t.Fatalf("expected ErrNotLeader, got %v", err)
 	}
@@ -363,8 +371,20 @@ func TestAppManager_List(t *testing.T) {
 	}
 
 	// Install two apps
-	appDef1 := &api.AppDefinition{Name: "app1", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
-	appDef2 := &api.AppDefinition{Name: "app2", Image: "alpine:latest", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
+	appDef1 := &api.AppDefinition{
+		Name:       "app1",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	appDef2 := &api.AppDefinition{
+		Name:       "app2",
+		Image:      "alpine:latest",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
 
 	_, err = manager.Install(ctx, appDef1)
 	if err != nil {
@@ -444,7 +464,13 @@ func TestAppManager_Get(t *testing.T) {
 	}
 
 	// Install an app
-	appDef := &api.AppDefinition{Name: "test-app", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
+	appDef := &api.AppDefinition{
+		Name:       "test-app",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
 	installedApp, err := manager.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
@@ -525,7 +551,13 @@ func TestAppManager_StartStop(t *testing.T) {
 	ctx := context.Background()
 
 	// Install an app
-	appDef := &api.AppDefinition{Name: "test-app", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
+	appDef := &api.AppDefinition{
+		Name:       "test-app",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
 	_, err = manager.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
@@ -618,7 +650,13 @@ func TestAppManager_Uninstall(t *testing.T) {
 	ctx := context.Background()
 
 	// Install an app
-	appDef := &api.AppDefinition{Name: "test-app", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
+	appDef := &api.AppDefinition{
+		Name:       "test-app",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
 	_, err = manager.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
@@ -684,7 +722,13 @@ func TestAppManager_EnableDisable(t *testing.T) {
 	ctx := context.Background()
 
 	// Install an app
-	appDef := &api.AppDefinition{Name: "test-app", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
+	appDef := &api.AppDefinition{
+		Name:       "test-app",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
 	_, err = manager.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
@@ -794,6 +838,7 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 		Environment: map[string]string{
 			"TEST_VAR": "persistent-value",
 		},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
 	_, err = manager1.Install(ctx, appDef)
@@ -887,7 +932,8 @@ func TestAppManager_BlockedWhenLocked(t *testing.T) {
 	ctx := context.Background()
 	_, err = mgr.Install(ctx, &api.AppDefinition{
 		Name: "locked-app", Image: "nginx:latest", Type: "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
 	})
 	if !errors.Is(err, ErrLocked) {
 		t.Fatalf("expected ErrLocked, got %v", err)

@@ -229,7 +229,6 @@ type AppDefinition struct {
 	// Service-oriented listener configuration (v1)
 	Listeners   []AppListener          `yaml:"listeners,omitempty" json:"listeners,omitempty"`
 	Storage     *AppStorage            `yaml:"storage,omitempty" json:"storage,omitempty"`
-	Filesystem  *AppFilesystem         `yaml:"filesystem,omitempty" json:"filesystem,omitempty"`
 	Permissions *AppPermissions        `yaml:"permissions,omitempty" json:"permissions,omitempty"`
 	Environment map[string]string      `yaml:"environment,omitempty" json:"environment,omitempty"`
 	Resources   *AppResources          `yaml:"resources,omitempty" json:"resources,omitempty"`
@@ -269,12 +268,6 @@ type AppBuild struct {
 type AppStorage struct {
 	Persistent map[string]AppVolume `yaml:"persistent,omitempty" json:"persistent,omitempty"`
 	Temporary  map[string]AppVolume `yaml:"temporary,omitempty" json:"temporary,omitempty"`
-}
-
-// AppFilesystem defines filesystem persistence
-type AppFilesystem struct {
-	Persistent bool `yaml:"persistent,omitempty" json:"persistent,omitempty"`
-	// Note: Storage is always local (no federated option for filesystem persistence)
 }
 
 // AppPermissions defines security permissions

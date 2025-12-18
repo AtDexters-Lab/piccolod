@@ -43,3 +43,8 @@ permissions:
     internet: allow
     allowed_domains:
       - api.stripe.com
+
+# Piccolo-specific policies: custom-built web apps are usually "service" mode
+# (replicate durable data, keep container disk replaceable).
+x-piccolo:
+  mode: service

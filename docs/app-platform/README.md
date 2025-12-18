@@ -8,6 +8,13 @@ The Piccolo OS App Platform enables users to easily install, manage, and run con
 ```yaml
 name: blog
 image: ghost:latest
+listeners:
+  - name: web
+    guest_port: 2368
+    flow: tcp
+    protocol: http
+x-piccolo:
+  mode: service
 ```
 
 ### Custom Build  
@@ -16,8 +23,16 @@ name: my-app
 build:
   containerfile: |
     FROM node:18
+    WORKDIR /app
     COPY . /app
     CMD ["npm", "start"]
+listeners:
+  - name: web
+    guest_port: 3000
+    flow: tcp
+    protocol: http
+x-piccolo:
+  mode: service
 ```
 
 ## Documentation
@@ -34,9 +49,9 @@ build:
 
 ### 🔒 **Security by Default**
 - **Network isolation**: No internet access by default
-- **Storage sandboxing**: Each app gets isolated storage
+- **Encrypted app storage**: Each app gets an isolated encrypted volume under `$PICCOLO_STATE_DIR`
 - **Permission model**: Granular control over resources and capabilities
-- **Federated storage**: User data synced across devices
+- **Federated storage**: Hot/cold tier policies replicate app state across devices
 
 ### ⚡ **Developer Experience**
 - **Progressive complexity**: Start simple, add features as needed
@@ -53,12 +68,13 @@ Container Sources:
 └── Git Builds (clone → build → run)
 
 Storage Architecture:
-├── Persistent (/var/piccolo/storage/<app>/<volume>) → Federated Storage
-├── Temporary (/tmp/piccolo/apps/<app>/<volume>) → Local /tmp
-└── Filesystem (/var/piccolo/apps/<app>/filesystem) → Local overlay (optional)
+├── State root ($PICCOLO_STATE_DIR; default: /var/lib/piccolod)
+└── Per-app encrypted volume ($PICCOLO_STATE_DIR/mounts/app-<name>/)
+    ├── data/<volume>  (storage.persistent) → hot/cold replication per policy
+    └── disk/          (Podman --root: overlay + metadata + logs) → roaming in workspace mode
 
 Runtime:
-├── Podman containers (rootless, daemonless)
+├── Podman containers (rootless, daemonless; storage relocated into encrypted volumes)
 ├── systemd integration (proper lifecycle)
 └── mDNS discovery (app.piccolo.local)
 ```

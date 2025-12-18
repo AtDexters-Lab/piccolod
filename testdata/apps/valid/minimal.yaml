@@ -3,3 +3,5 @@ image: alpine:latest
 listeners:
   - name: web
     guest_port: 80
+x-piccolo:
+  mode: service

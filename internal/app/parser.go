@@ -17,11 +17,37 @@ var (
 	appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$`)
 )
 
+func hasTopLevelKey(node *yaml.Node, key string) bool {
+	if node == nil {
+		return false
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) == 1 {
+		node = node.Content[0]
+	}
+	if node.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		k := node.Content[i]
+		if k != nil && k.Kind == yaml.ScalarNode && k.Value == key {
+			return true
+		}
+	}
+	return false
+}
+
 // ParseAppSchema parses the YAML to extract metadata and inputs without strict validation.
 // This is used to read the manifest before variable substitution.
 func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(content, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+	}
+	if hasTopLevelKey(&root, "filesystem") {
+		return nil, fmt.Errorf("filesystem is no longer supported; use x-piccolo.mode")
+	}
 	var app api.AppDefinition
-	if err := yaml.Unmarshal(content, &app); err != nil {
+	if err := root.Decode(&app); err != nil {
 		return nil, fmt.Errorf("failed to parse YAML: %w", err)
 	}
 	// We do NOT call SetDefaults or ValidateAppDefinition here because
@@ -57,7 +83,14 @@ func ParseAppDefinition(content []byte) (*api.AppDefinition, error) {
 	var app api.AppDefinition
 
 	// Parse YAML
-	if err := yaml.Unmarshal(content, &app); err != nil {
+	var root yaml.Node
+	if err := yaml.Unmarshal(content, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+	}
+	if hasTopLevelKey(&root, "filesystem") {
+		return nil, fmt.Errorf("filesystem is no longer supported; use x-piccolo.mode")
+	}
+	if err := root.Decode(&app); err != nil {
 		return nil, fmt.Errorf("failed to parse YAML: %w", err)
 	}
 
@@ -134,6 +167,52 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 	// Validate permissions
 	if err := validatePermissions(app.Permissions); err != nil {
 		return err
+	}
+
+	// Validate Piccolo-specific extensions (required mode + consistency checks).
+	if err := validatePiccoloExtensions(app); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func piccoloModeFromExtensions(extensions map[string]interface{}) (string, bool) {
+	if extensions == nil {
+		return "", false
+	}
+	raw, ok := extensions["mode"]
+	if !ok {
+		return "", false
+	}
+	mode, ok := raw.(string)
+	if !ok {
+		return "", false
+	}
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		return "", false
+	}
+	return mode, true
+}
+
+func validatePiccoloExtensions(app *api.AppDefinition) error {
+	if app == nil {
+		return nil
+	}
+
+	mode, ok := piccoloModeFromExtensions(app.Extensions)
+	if !ok {
+		if app.Extensions == nil {
+			return fmt.Errorf("x-piccolo is required; set x-piccolo.mode to 'service' or 'workspace'")
+		}
+		return fmt.Errorf("x-piccolo.mode is required; must be 'service' or 'workspace'")
+	}
+
+	switch mode {
+	case "service", "workspace":
+	default:
+		return fmt.Errorf("x-piccolo.mode must be 'service' or 'workspace', got '%s'", mode)
 	}
 
 	return nil
