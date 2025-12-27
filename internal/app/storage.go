@@ -23,6 +23,15 @@ func appVolumeID(appName string) string {
 }
 
 func ensureDir(path string, mode os.FileMode) error {
+	if info, err := os.Stat(path); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("%s exists but is not a directory", path)
+		}
+		return os.Chmod(path, mode)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+
 	if err := os.MkdirAll(path, mode); err != nil {
 		return err
 	}

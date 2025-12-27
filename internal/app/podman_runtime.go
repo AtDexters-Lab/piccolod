@@ -2,9 +2,6 @@ package app
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"piccolod/internal/container"
 	"piccolod/internal/state/paths"
@@ -16,60 +13,25 @@ func (m *AppManager) podmanRuntimeForApp(appName string, layout appVolumeLayout)
 		volID = appVolumeID(appName)
 	}
 
-	runRootCandidates := []string{}
-	if base := os.Getenv("PICCOLO_PODMAN_RUNROOT_BASE"); strings.TrimSpace(base) != "" {
-		base = filepath.Clean(base)
-		if filepath.IsAbs(base) {
-			runRootCandidates = append(runRootCandidates, base)
-		}
-	}
-	if xdg := os.Getenv("XDG_RUNTIME_DIR"); strings.TrimSpace(xdg) != "" {
-		runRootCandidates = append(runRootCandidates, filepath.Join(xdg, "piccolo", "podman"))
-	}
-	runRootCandidates = append(runRootCandidates, "/run/piccolo/podman")
-	runRootCandidates = append(runRootCandidates, paths.Join("run", "podman"))
-
-	var runRoot string
-	for _, base := range runRootCandidates {
-		candidate := filepath.Join(base, volID)
-		if err := os.MkdirAll(candidate, 0o700); err != nil {
-			continue
-		}
-		runRoot = candidate
-		break
-	}
-	if runRoot == "" {
-		return container.PodmanRuntime{}, fmt.Errorf("app manager: unable to create a writable podman runroot")
+	runRoot := paths.Join("run", "podman", volID)
+	if err := ensureDir(runRoot, 0o700); err != nil {
+		return container.PodmanRuntime{}, fmt.Errorf("app manager: ensure podman runroot: %w", err)
 	}
 
 	if layout.PodmanRoot == "" {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: podman root missing for %s", appName)
 	}
 
-	imagestoreCandidates := []string{}
-	if base := os.Getenv("PICCOLO_PODMAN_IMAGESTORE_BASE"); strings.TrimSpace(base) != "" {
-		base = filepath.Clean(base)
-		if filepath.IsAbs(base) {
-			imagestoreCandidates = append(imagestoreCandidates, base)
-		}
-	}
-	imagestoreCandidates = append(imagestoreCandidates, paths.Join("podman", "imagestore"))
-
-	var imagestore string
-	for _, candidate := range imagestoreCandidates {
-		if err := os.MkdirAll(candidate, 0o700); err != nil {
-			continue
-		}
-		imagestore = candidate
-		break
-	}
-	if imagestore == "" {
-		return container.PodmanRuntime{}, fmt.Errorf("app manager: unable to create a writable podman imagestore")
-	}
-
+	// We cannot use a shared imagestore with the 'vfs' driver because vfs does not support
+	// the split-store feature (read-only images separate from read-write container layers).
+	// To ensure container data (the RW layer) is encrypted, we must store everything 
+	// (including images) inside the per-app encrypted volume (--root).
+	// imagestore := paths.Join("podman", "imagestore") 
+	
 	return container.PodmanRuntime{
-		Root:       layout.PodmanRoot,
-		RunRoot:    runRoot,
-		Imagestore: imagestore,
+		Root:          layout.PodmanRoot,
+		RunRoot:       runRoot,
+		// Imagestore:    imagestore, // Disabled for vfs security
+		StorageDriver: "vfs",
 	}, nil
 }

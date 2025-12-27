@@ -68,14 +68,23 @@ type mountWaiter func(mountPoint string, timeout time.Duration) error
 type execMountLauncher struct{}
 
 func (execMountLauncher) Launch(ctx context.Context, path string, args []string, stdin []byte) (mountProcess, error) {
-	cmd := exec.CommandContext(ctx, path, args...)
+	// Use Background context so the process is not killed when the parent context (request/app) is cancelled.
+	cmd := exec.CommandContext(context.Background(), path, args...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	configureForegroundAttrs(cmd)
+	
+	// Create a new session group to detach from the parent's signals.
+	// Do NOT use configureForegroundAttrs here as Pdeathsig would kill the mount on parent exit.
+	if runtime.GOOS == "linux" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setsid: true,
+		}
+	}
+	
 	if err := cmd.Start(); err != nil {
 		stdinPipe.Close()
 		return nil, err
@@ -349,6 +358,19 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 		return f.recordVolumeState(handle.ID, volumeStateMounted, volumeStateMounted, opts.Role, nil)
 	}
 
+	// Adoption: If the volume is already mounted (e.g. survived a restart), we adopt it.
+	// We verify it is accessible to avoid adopting a broken mount.
+	if mounted, err := isMountPoint(handle.MountDir); err == nil && mounted {
+		if _, err := os.Stat(handle.MountDir); err == nil {
+			f.mu.Lock()
+			entry.role = opts.Role
+			// We assume metadata was valid when it was originally mounted.
+			entry.metadataReady = true
+			f.mu.Unlock()
+			return f.recordVolumeState(handle.ID, volumeStateMounted, volumeStateMounted, opts.Role, nil)
+		}
+	}
+
 	if err := f.ensureMetadata(ctx, entry); err != nil {
 		return err
 	}
@@ -362,7 +384,7 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 		return err
 	}
 
-	args := []string{"-f", "-q", "-passfile", "/dev/stdin"}
+	args := []string{"-f", "-q", "-passfile", "/dev/stdin", "-allow_other"}
 	if opts.Role == VolumeRoleFollower {
 		args = append(args, "-ro")
 	}
@@ -599,6 +621,17 @@ func (f *fileVolumeManager) reconcileVolumeState(ctx context.Context, entry *vol
 	mounted, err := isMountPoint(entry.handle.MountDir)
 	if err != nil {
 		return err
+	}
+	if mounted {
+		if _, err := os.Stat(entry.handle.MountDir); err != nil {
+			if errors.Is(err, syscall.ENOTCONN) {
+				_ = f.recordVolumeState(entry.handle.ID, state.Desired, volumeStateError, parseVolumeRole(state.Role), fmt.Errorf("broken mount detected: %w", err))
+				if detachErr := f.Detach(ctx, entry.handle); detachErr != nil {
+					return fmt.Errorf("broken mount detected for %s, detach failed: %w", entry.handle.ID, detachErr)
+				}
+				mounted = false
+			}
+		}
 	}
 	role := parseVolumeRole(state.Role)
 	if state.Desired == volumeStateMounted && !mounted {

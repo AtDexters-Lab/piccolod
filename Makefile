@@ -43,7 +43,7 @@ build-release: ui server-release
 run: build ## Build (non-demo) and run piccolod locally
 	@echo "==> Running piccolod on http://localhost:$(RUN_PORT) (state dir: $(RUN_STATE_DIR))"
 	mkdir -p "$(RUN_STATE_DIR)"
-	PORT=$(RUN_PORT) PICCOLO_STATE_DIR="$(RUN_STATE_DIR)" ./piccolod
+	sudo -E PORT=$(RUN_PORT) PICCOLO_STATE_DIR="$(RUN_STATE_DIR)" ./piccolod
 
 run-fresh: build ## Build and run piccolod with a temporary state dir
 	@echo "==> Running piccolod on http://localhost:$(RUN_PORT) with a fresh ephemeral state dir"
@@ -51,7 +51,7 @@ run-fresh: build ## Build and run piccolod with a temporary state dir
 	  echo "   state dir $$tmpdir"; \
 	  cleanup() { sleep 2; rm -rf "$$tmpdir"; }; \
 	  trap cleanup EXIT; \
-	  PORT=$(RUN_PORT) PICCOLO_STATE_DIR="$$tmpdir" ./piccolod
+	  sudo -E PORT=$(RUN_PORT) PICCOLO_STATE_DIR="$$tmpdir" ./piccolod
 
 release: clean deps typegen ## Produce a clean release build (non-demo)
 	$(MAKE) build DEMO=0

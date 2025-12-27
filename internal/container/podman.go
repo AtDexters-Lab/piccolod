@@ -37,9 +37,10 @@ type PodmanCLI struct{}
 //
 // Imagestore optionally splits image storage out of Root into a shared image store.
 type PodmanRuntime struct {
-	Root       string
-	RunRoot    string
-	Imagestore string
+	Root          string
+	RunRoot       string
+	Imagestore    string
+	StorageDriver string
 }
 
 // ContainerState captures minimal observed container state.
@@ -257,7 +258,7 @@ func buildRunArgs(spec ContainerCreateSpec) []string {
 }
 
 func buildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
-	out := make([]string, 0, 4+len(args))
+	out := make([]string, 0, 6+len(args))
 	if runtime.Root != "" {
 		if err := ValidatePath(runtime.Root); err != nil {
 			return nil, fmt.Errorf("invalid podman --root path: %w", err)
@@ -276,11 +277,27 @@ func buildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 		}
 		out = append(out, "--imagestore", runtime.Imagestore)
 	}
+	if runtime.StorageDriver != "" {
+		if !regexp.MustCompile(`^[a-z0-9]+$`).MatchString(runtime.StorageDriver) {
+			return nil, fmt.Errorf("invalid storage driver name")
+		}
+		out = append(out, "--storage-driver", runtime.StorageDriver)
+	}
 	out = append(out, args...)
 	return out, nil
 }
 
 // CreateContainer creates a container using pre-validated arguments
+// NameInUseError indicates the container name is already taken.
+type NameInUseError struct {
+	Name string
+	ID   string
+}
+
+func (e *NameInUseError) Error() string {
+	return fmt.Sprintf("container name %q already in use by %s", e.Name, e.ID)
+}
+
 func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, spec ContainerCreateSpec) (string, error) {
 	// All inputs must be validated before calling this method
 
@@ -303,6 +320,16 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 				}
 			}
 			return "", &PortInUseError{Port: port, Output: outStr, Err: fmt.Errorf("podman run failed: %w", err)}
+		}
+		if strings.Contains(outStr, "name is already in use") || strings.Contains(outStr, "already in use by") {
+			// Try to extract the ID
+			// Error: ... name "code-server" is already in use by <id>. ...
+			// Simple regex to find the ID?
+			// The ID is usually 64 chars hex.
+			re := regexp.MustCompile(`already in use by ([a-f0-9]{12,64})`)
+			if match := re.FindStringSubmatch(outStr); len(match) == 2 {
+				return "", &NameInUseError{Name: spec.Name, ID: match[1]}
+			}
 		}
 		return "", fmt.Errorf("podman run failed: %w, output: %s", err, outStr)
 	}
@@ -461,11 +488,26 @@ func (p *PodmanCLI) ResolveContainerIDByName(ctx context.Context, runtime Podman
 		return "", err
 	}
 	cmd := exec.CommandContext(ctx, "podman", args...)
-	out, err := cmd.CombinedOutput()
+	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("podman inspect (id) failed: %w, output: %s", err, string(out))
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", fmt.Errorf("podman inspect (id) failed: %w, stderr: %s", err, string(exitErr.Stderr))
+		}
+		return "", fmt.Errorf("podman inspect (id) failed: %w", err)
 	}
-	id := strings.TrimSpace(string(out))
+
+	// Parse output: take the last non-empty line
+	lines := strings.Split(string(out), "\n")
+	var id string
+	for i := len(lines) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed != "" {
+			id = trimmed
+			break
+		}
+	}
+
 	if id == "" || !isValidContainerID(id) {
 		return "", fmt.Errorf("podman inspect returned invalid container id for %s: %q", name, id)
 	}
@@ -490,17 +532,33 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 		return ContainerState{}, err
 	}
 	cmd := exec.CommandContext(ctx, "podman", args...)
-	out, err := cmd.CombinedOutput()
+	out, err := cmd.Output()
 	if err != nil {
-		return ContainerState{}, fmt.Errorf("podman inspect (running) failed: %w, output: %s", err, string(out))
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return ContainerState{}, fmt.Errorf("podman inspect (running) failed: %w, stderr: %s", err, string(exitErr.Stderr))
+		}
+		return ContainerState{}, fmt.Errorf("podman inspect (running) failed: %w", err)
 	}
-	switch strings.TrimSpace(string(out)) {
+
+	// Parse output: take the last non-empty line to ignore potential warnings on stdout
+	lines := strings.Split(string(out), "\n")
+	var result string
+	for i := len(lines) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed != "" {
+			result = trimmed
+			break
+		}
+	}
+
+	switch result {
 	case "true":
 		return ContainerState{Exists: true, Running: true}, nil
 	case "false":
 		return ContainerState{Exists: true, Running: false}, nil
 	default:
-		return ContainerState{}, fmt.Errorf("podman inspect returned unexpected running state: %q", strings.TrimSpace(string(out)))
+		return ContainerState{}, fmt.Errorf("podman inspect returned unexpected running state: %q", result)
 	}
 }
 

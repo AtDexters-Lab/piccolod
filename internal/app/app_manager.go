@@ -626,6 +626,7 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 	if containerID != "" {
 		observed, err = m.containerManager.InspectContainerState(ctx, runtime, containerID)
 		if err != nil {
+			log.Printf("WARN: reconcile app %s: inspect state failed: %v", appInst.Name, err)
 			observed = container.ContainerState{}
 		}
 	}
@@ -710,6 +711,16 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 			appInst.ContainerID = cid
 			_ = state.UpdateAppRuntime(appInst.Name, "running", cid)
 			m.serviceManager.SetAppContainerID(appInst.Name, cid)
+			return nil
+		}
+
+		var nameErr *container.NameInUseError
+		if errors.As(err, &nameErr) {
+			log.Printf("INFO: recreate app %s: adopted existing container %s", appInst.Name, nameErr.ID)
+			// Discard speculative port allocation; ensureServicesForRunningApp will restore actual ports.
+			m.serviceManager.RemoveApp(appInst.Name)
+			appInst.ContainerID = nameErr.ID
+			_ = state.UpdateAppRuntime(appInst.Name, appInst.Status, nameErr.ID)
 			return nil
 		}
 
@@ -1547,7 +1558,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
 				Host:      host,
 				Container: vol.Container,
-				Options:   "rw",
+				Options:   "rw,U",
 			})
 			mountedPaths[vol.Container] = struct{}{}
 		}
