@@ -947,7 +947,6 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	}
 
 	// Start container immediately
-	// Start container immediately
 	if err := m.containerManager.StartContainer(ctx, runtime, containerID); err != nil {
 		// Atomic install: if start fails, cleanup and fail.
 		// We do NOT persist the app state, so the user can retry.

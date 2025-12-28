@@ -58,6 +58,7 @@ type sqliteControlStore struct {
 	path               string
 	mountDir           string
 	cipherDir          string
+	metaDir            string
 	keySource          keyProvider
 	loaded             bool
 	readOnly           bool
@@ -116,10 +117,15 @@ func newSQLiteControlStore(stateDir string, kp keyProvider) (*sqliteControlStore
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
 		return nil, err
 	}
+	metaDir := filepath.Join(base, "volumes", "control")
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		return nil, err
+	}
 	store := &sqliteControlStore{
 		path:               filepath.Join(mountDir, "control.db"),
 		mountDir:           mountDir,
 		cipherDir:          cipherDir,
+		metaDir:            metaDir,
 		keySource:          kp,
 		checkpointFn:       defaultCheckpointFn,
 		checkpointInterval: defaultCheckpointInterval,
@@ -149,19 +155,40 @@ func configureSQLite(db *sql.DB, readOnly bool) error {
 	return nil
 }
 
-func ensureControlVolumePrepared(dir string) error {
-	required := []string{
-		filepath.Join(dir, gocryptfsConfigName),
-		filepath.Join(dir, controlVolumeMetadataName),
-	}
-	for _, path := range required {
-		if _, err := os.Stat(path); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return ErrLocked
-			}
-			return err
+func ensureControlVolumePrepared(cipherDir, metaDir string) error {
+	if _, err := os.Stat(filepath.Join(cipherDir, gocryptfsConfigName)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrLocked
 		}
+		return err
 	}
+	
+	metaPath := filepath.Join(metaDir, controlVolumeMetadataName)
+	if _, err := os.Stat(metaPath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	// Not found in metaDir, check legacy location
+	legacyPath := filepath.Join(cipherDir, controlVolumeMetadataName)
+	data, err := os.ReadFile(legacyPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrLocked
+		}
+		return err
+	}
+
+	// Found in legacy, migrate
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		return fmt.Errorf("ensure control meta dir: %w", err)
+	}
+	if err := os.WriteFile(metaPath, data, 0o600); err != nil {
+		return fmt.Errorf("migrate control metadata: %w", err)
+	}
+	_ = os.Remove(legacyPath)
+
 	return nil
 }
 
@@ -496,7 +523,7 @@ func (s *sqliteControlStore) ensureWritableLocked() error {
 }
 
 func (s *sqliteControlStore) volumeReady() error {
-	if err := ensureControlVolumePrepared(s.cipherDir); err != nil {
+	if err := ensureControlVolumePrepared(s.cipherDir, s.metaDir); err != nil {
 		return err
 	}
 	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") != "1" {

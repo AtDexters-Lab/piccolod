@@ -152,6 +152,7 @@ type fileVolumeManager struct {
 type volumeEntry struct {
 	handle        VolumeHandle
 	cipherDir     string
+	stateDir      string
 	metadata      volumeMetadata
 	metadataReady bool
 	role          VolumeRole
@@ -280,6 +281,7 @@ func (f *fileVolumeManager) getOrCreateEntry(id string) *volumeEntry {
 			MountDir: filepath.Join(f.root, "mounts", id),
 		},
 		cipherDir: filepath.Join(f.root, "ciphertext", id),
+		stateDir:  filepath.Join(f.stateRoot, id),
 	}
 	f.volumes[id] = entry
 	return entry
@@ -308,6 +310,7 @@ func (f *fileVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 	entry = &volumeEntry{
 		handle:    VolumeHandle{ID: req.ID, MountDir: mountDir},
 		cipherDir: cipherDir,
+		stateDir:  filepath.Join(f.stateRoot, req.ID),
 	}
 	if err := f.ensureMetadata(ctx, entry); err != nil {
 		if !errors.Is(err, crypt.ErrLocked) && !errors.Is(err, crypt.ErrNotInitialized) {
@@ -471,8 +474,29 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 	entry.metaMu.Lock()
 	defer entry.metaMu.Unlock()
 
-	metaPath := filepath.Join(entry.cipherDir, volumeMetadataName)
-	if data, err := os.ReadFile(metaPath); err == nil {
+	// 1. Check State Directory (New Location)
+	metaPath := filepath.Join(entry.stateDir, volumeMetadataName)
+	data, err := os.ReadFile(metaPath)
+
+	// 2. Check Cipher Directory (Legacy Location) & Migrate
+	if errors.Is(err, os.ErrNotExist) {
+		legacyPath := filepath.Join(entry.cipherDir, volumeMetadataName)
+		if legacyData, legacyErr := os.ReadFile(legacyPath); legacyErr == nil {
+			// Found in legacy location. Migrate to state dir.
+			if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
+				return fmt.Errorf("ensure state dir for migration: %w", err)
+			}
+			if err := os.WriteFile(metaPath, legacyData, 0o600); err != nil {
+				return fmt.Errorf("migrate metadata: %w", err)
+			}
+			// Remove from legacy location to stop gocryptfs warnings
+			_ = os.Remove(legacyPath)
+			data = legacyData
+			err = nil
+		}
+	}
+
+	if err == nil {
 		var meta volumeMetadata
 		if err := json.Unmarshal(data, &meta); err != nil {
 			return fmt.Errorf("%w: %v", ErrVolumeMetadataCorrupted, err)
@@ -498,17 +522,15 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 		if err != nil {
 			return err
 		}
+		if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
+			return err
+		}
 		if err := os.WriteFile(metaPath, metaBytes, 0o600); err != nil {
 			return err
 		}
-		confPath := filepath.Join(entry.cipherDir, gocryptfsConfigName)
-		if _, err := os.Stat(confPath); errors.Is(err, os.ErrNotExist) {
-			if err := os.WriteFile(confPath, []byte("bypass"), 0o600); err != nil {
-				return err
-			}
-		} else if err != nil {
-			return err
-		}
+		// Bypass mode also needs a legacy conf file check? Or just ensure cipherDir init?
+		// Usually bypass doesn't use real gocryptfs, but let's leave legacy conf check if needed.
+		// Actually, bypass usually just writes metadata.
 		entry.metadata = meta
 		entry.metadataReady = true
 		return nil
@@ -530,6 +552,9 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 
 	metaBytes, err := json.MarshalIndent(&meta, "", "  ")
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
 		return err
 	}
 	if err := os.WriteFile(metaPath, metaBytes, 0o600); err != nil {

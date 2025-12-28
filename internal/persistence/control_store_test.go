@@ -453,6 +453,13 @@ func prepareControlCipherDir(t *testing.T, root string) {
 	if err := os.WriteFile(filepath.Join(cipherDir, gocryptfsConfigName), []byte("stub"), 0o600); err != nil {
 		t.Fatalf("write gocryptfs.conf: %v", err)
 	}
+	
+	// Metadata now lives in volumes/<id>
+	stateDir := filepath.Join(root, "volumes", "control")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("mkdir stateDir: %v", err)
+	}
+
 	meta := volumeMetadata{
 		Version:    metadataVersion,
 		WrappedKey: "stub",
@@ -462,7 +469,58 @@ func prepareControlCipherDir(t *testing.T, root string) {
 	if err != nil {
 		t.Fatalf("marshal metadata: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(cipherDir, controlVolumeMetadataName), data, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, controlVolumeMetadataName), data, 0o600); err != nil {
 		t.Fatalf("write metadata: %v", err)
+	}
+}
+
+func TestSQLiteControlStoreMigratesLegacyMetadata(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	key, _ := hex.DecodeString("7f1c8a6c3b5d7e91aabbccddeeff00112233445566778899aabbccddeeff0011")
+
+	// Setup legacy state: metadata in cipherDir
+	cipherDir := filepath.Join(dir, "ciphertext", "control")
+	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
+		t.Fatalf("mkdir ciphertext: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cipherDir, gocryptfsConfigName), []byte("stub"), 0o600); err != nil {
+		t.Fatalf("write gocryptfs.conf: %v", err)
+	}
+	meta := volumeMetadata{
+		Version:    metadataVersion,
+		WrappedKey: "stub",
+		Nonce:      base64.RawStdEncoding.EncodeToString([]byte("nonce")),
+	}
+	data, err := json.Marshal(&meta)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	legacyPath := filepath.Join(cipherDir, controlVolumeMetadataName)
+	if err := os.WriteFile(legacyPath, data, 0o600); err != nil {
+		t.Fatalf("write legacy metadata: %v", err)
+	}
+
+	// Ensure new location is empty
+	stateDir := filepath.Join(dir, "volumes", "control")
+	newPath := filepath.Join(stateDir, controlVolumeMetadataName)
+
+	store, err := newSQLiteControlStore(dir, staticKeyProvider{key: key})
+	if err != nil {
+		t.Fatalf("newSQLiteControlStore: %v", err)
+	}
+	defer store.Close(context.Background())
+
+	// Unlock should trigger migration
+	if err := store.Unlock(context.Background()); err != nil {
+		t.Fatalf("unlock failed: %v", err)
+	}
+
+	// Verify migration
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("expected metadata at new path %s: %v", newPath, err)
+	}
+	if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected legacy metadata to be removed from %s", legacyPath)
 	}
 }
