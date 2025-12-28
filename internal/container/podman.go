@@ -41,6 +41,7 @@ type PodmanRuntime struct {
 	RunRoot       string
 	Imagestore    string
 	StorageDriver string
+	StorageOpts   []string
 }
 
 // ContainerState captures minimal observed container state.
@@ -258,7 +259,7 @@ func buildRunArgs(spec ContainerCreateSpec) []string {
 }
 
 func buildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
-	out := make([]string, 0, 6+len(args))
+	out := make([]string, 0, 6+len(runtime.StorageOpts)+len(args))
 	if runtime.Root != "" {
 		if err := ValidatePath(runtime.Root); err != nil {
 			return nil, fmt.Errorf("invalid podman --root path: %w", err)
@@ -282,6 +283,13 @@ func buildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 			return nil, fmt.Errorf("invalid storage driver name")
 		}
 		out = append(out, "--storage-driver", runtime.StorageDriver)
+	}
+	for _, opt := range runtime.StorageOpts {
+		// Basic validation for options (key=value or key)
+		if !regexp.MustCompile(`^[a-z0-9_]+=[/a-zA-Z0-9._-]+$|^[a-z0-9_]+$`).MatchString(opt) {
+			return nil, fmt.Errorf("invalid storage option: %s", opt)
+		}
+		out = append(out, "--storage-opt", opt)
 	}
 	out = append(out, args...)
 	return out, nil
