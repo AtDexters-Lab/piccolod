@@ -945,6 +945,17 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		}
 		return nil, fmt.Errorf("failed to create container: %w", err)
 	}
+
+	// Start container immediately
+	// Start container immediately
+	if err := m.containerManager.StartContainer(ctx, runtime, containerID); err != nil {
+		// Atomic install: if start fails, cleanup and fail.
+		// We do NOT persist the app state, so the user can retry.
+		_ = m.containerManager.RemoveContainer(ctx, runtime, containerID)
+		// Defer will cleanup services
+		return nil, fmt.Errorf("failed to start container: %w", err)
+	}
+
 	// Record container ID for watcher reconciliation
 	if m.serviceManager != nil {
 		m.serviceManager.SetAppContainerID(appDef.Name, containerID)
@@ -956,7 +967,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		Name:        appDef.Name,
 		Image:       appDef.Image,
 		Type:        appDef.Type,
-		Status:      "created",
+		Status:      "running",
 		ContainerID: containerID,
 		Environment: appDef.Environment,
 		CreatedAt:   now,
@@ -966,6 +977,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	// Store app to filesystem
 	if err := state.StoreApp(app, appDef); err != nil {
 		// Cleanup container if storage fails
+		_ = m.containerManager.StopContainer(ctx, runtime, containerID)
 		_ = m.containerManager.RemoveContainer(ctx, runtime, containerID)
 		m.serviceManager.RemoveApp(appDef.Name)
 		cleanupServices = false
