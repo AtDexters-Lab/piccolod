@@ -20,6 +20,13 @@ type ContainerManager interface {
 	InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[int]int, error)
 	UpdatePublishAdd(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
 	UpdatePublishRemove(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
+	ResetStorage(ctx context.Context, runtime container.PodmanRuntime) error
+	// CommitContainer commits a container's current state to a new image.
+	CommitContainer(ctx context.Context, runtime container.PodmanRuntime, containerID, imageName string) error
+	// ImageExists checks if an image exists in local storage.
+	ImageExists(ctx context.Context, runtime container.PodmanRuntime, imageName string) (bool, error)
+	// RemoveImage removes an image from local storage.
+	RemoveImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) error
 }
 
 // AppInstance captures the runtime metadata for an installed application.

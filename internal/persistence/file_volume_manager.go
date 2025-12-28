@@ -464,6 +464,95 @@ func (f *fileVolumeManager) Detach(ctx context.Context, handle VolumeHandle) err
 	return nil
 }
 
+func (f *fileVolumeManager) DestroyVolume(ctx context.Context, id string) error {
+	mountDir := filepath.Join(f.root, "mounts", id)
+	handle := VolumeHandle{ID: id, MountDir: mountDir}
+
+	// 1. Detach if mounted - with retries and lazy unmount fallback
+	if mounted, _ := isMountPoint(mountDir); mounted {
+		if err := f.detachWithRetry(ctx, handle); err != nil {
+			return fmt.Errorf("destroy: detach failed: %w", err)
+		}
+	}
+
+	// 2. Remove Ciphertext
+	cipherDir := filepath.Join(f.root, "ciphertext", id)
+	if err := os.RemoveAll(cipherDir); err != nil {
+		return fmt.Errorf("destroy: remove ciphertext: %w", err)
+	}
+
+	// 3. Remove Metadata/State
+	stateDir := filepath.Join(f.stateRoot, id)
+	if err := os.RemoveAll(stateDir); err != nil {
+		return fmt.Errorf("destroy: remove state: %w", err)
+	}
+
+	// 4. Remove Mountpoint
+	_ = os.Remove(mountDir)
+
+	// 5. Remove from memory
+	f.mu.Lock()
+	delete(f.volumes, id)
+	f.mu.Unlock()
+
+	return nil
+}
+
+// detachWithRetry attempts normal unmount first, then retries with lazy unmount if device is busy.
+func (f *fileVolumeManager) detachWithRetry(ctx context.Context, handle VolumeHandle) error {
+	const maxRetries = 3
+	const retryDelay = 500 * time.Millisecond
+
+	// First try normal detach
+	err := f.Detach(ctx, handle)
+	if err == nil {
+		return nil
+	}
+
+	// Check if error indicates device busy
+	errStr := err.Error()
+	if !strings.Contains(errStr, "busy") && !strings.Contains(errStr, "exit status 1") {
+		return err
+	}
+
+	// Retry with delay - sometimes processes need a moment to release
+	for i := 0; i < maxRetries; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(retryDelay):
+		}
+
+		// Check if still mounted
+		if mounted, _ := isMountPoint(handle.MountDir); !mounted {
+			return nil
+		}
+
+		// Try normal unmount again
+		if err := f.Detach(ctx, handle); err == nil {
+			return nil
+		}
+	}
+
+	// Last resort: lazy unmount (-z flag) which detaches immediately and cleans up when no longer busy
+	args := []string{"-uz", handle.MountDir}
+	if err := f.runner.Run(ctx, f.fusermountPath, args, nil); err != nil {
+		return fmt.Errorf("lazy unmount failed for %s: %w", handle.ID, err)
+	}
+
+	f.awaitProcessExit(handle.ID)
+
+	// Give a moment for lazy unmount to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify unmount succeeded
+	if mounted, _ := isMountPoint(handle.MountDir); mounted {
+		return fmt.Errorf("volume %s still mounted after lazy unmount", handle.ID)
+	}
+
+	return nil
+}
+
 func (f *fileVolumeManager) RoleStream(volumeID string) (<-chan VolumeRole, error) {
 	ch := make(chan VolumeRole)
 	close(ch)

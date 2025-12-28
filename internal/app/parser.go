@@ -17,6 +17,22 @@ var (
 	appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$`)
 )
 
+// PiccoloMode represents the execution mode for an app as defined in x-piccolo.mode.
+type PiccoloMode string
+
+const (
+	// ModeService indicates a stateless/replaceable container mode.
+	// Container filesystem is ephemeral and not preserved across reinstalls.
+	ModeService PiccoloMode = "service"
+
+	// ModeWorkspace indicates a persistent workspace mode.
+	// Container filesystem changes are preserved via snapshots across reinstalls (without purge).
+	ModeWorkspace PiccoloMode = "workspace"
+
+	// ModeUnknown indicates the mode could not be determined.
+	ModeUnknown PiccoloMode = ""
+)
+
 func hasTopLevelKey(node *yaml.Node, key string) bool {
 	if node == nil {
 		return false
@@ -177,23 +193,27 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 	return nil
 }
 
-func piccoloModeFromExtensions(extensions map[string]interface{}) (string, bool) {
+func piccoloModeFromExtensions(extensions map[string]interface{}) PiccoloMode {
 	if extensions == nil {
-		return "", false
+		return ModeUnknown
 	}
 	raw, ok := extensions["mode"]
 	if !ok {
-		return "", false
+		return ModeUnknown
 	}
-	mode, ok := raw.(string)
+	modeStr, ok := raw.(string)
 	if !ok {
-		return "", false
+		return ModeUnknown
 	}
-	mode = strings.TrimSpace(mode)
-	if mode == "" {
-		return "", false
+	modeStr = strings.TrimSpace(modeStr)
+	switch PiccoloMode(modeStr) {
+	case ModeService:
+		return ModeService
+	case ModeWorkspace:
+		return ModeWorkspace
+	default:
+		return ModeUnknown
 	}
-	return mode, true
 }
 
 func validatePiccoloExtensions(app *api.AppDefinition) error {
@@ -201,18 +221,16 @@ func validatePiccoloExtensions(app *api.AppDefinition) error {
 		return nil
 	}
 
-	mode, ok := piccoloModeFromExtensions(app.Extensions)
-	if !ok {
+	mode := piccoloModeFromExtensions(app.Extensions)
+	if mode == ModeUnknown {
 		if app.Extensions == nil {
 			return fmt.Errorf("x-piccolo is required; set x-piccolo.mode to 'service' or 'workspace'")
 		}
+		// Check if mode key exists but has invalid value
+		if raw, ok := app.Extensions["mode"]; ok {
+			return fmt.Errorf("x-piccolo.mode must be 'service' or 'workspace', got '%v'", raw)
+		}
 		return fmt.Errorf("x-piccolo.mode is required; must be 'service' or 'workspace'")
-	}
-
-	switch mode {
-	case "service", "workspace":
-	default:
-		return fmt.Errorf("x-piccolo.mode must be 'service' or 'workspace', got '%s'", mode)
 	}
 
 	return nil

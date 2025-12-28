@@ -42,6 +42,7 @@ type VolumeManager interface {
 	EnsureVolume(ctx context.Context, req VolumeRequest) (VolumeHandle, error)
 	Attach(ctx context.Context, handle VolumeHandle, opts AttachOptions) error
 	Detach(ctx context.Context, handle VolumeHandle) error
+	DestroyVolume(ctx context.Context, id string) error
 	RoleStream(volumeID string) (<-chan VolumeRole, error)
 }
 

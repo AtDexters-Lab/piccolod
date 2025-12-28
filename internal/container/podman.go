@@ -415,6 +415,72 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 	return nil
 }
 
+// CommitContainer commits a container's current state to a new image.
+// This preserves all filesystem changes made inside the container.
+func (p *PodmanCLI) CommitContainer(ctx context.Context, runtime PodmanRuntime, containerID, imageName string) error {
+	if !isValidContainerID(containerID) {
+		return fmt.Errorf("invalid container ID format: %s", containerID)
+	}
+	if err := ValidateContainerName(imageName); err != nil {
+		return fmt.Errorf("invalid image name: %w", err)
+	}
+
+	args, err := buildPodmanArgs(runtime, []string{"commit", containerID, imageName})
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		return fmt.Errorf("podman commit failed: %w, output: %s", err, string(output))
+	}
+
+	return nil
+}
+
+// ImageExists checks if an image exists in the local storage.
+func (p *PodmanCLI) ImageExists(ctx context.Context, runtime PodmanRuntime, imageName string) (bool, error) {
+	if err := ValidateContainerName(imageName); err != nil {
+		return false, fmt.Errorf("invalid image name: %w", err)
+	}
+
+	args, err := buildPodmanArgs(runtime, []string{"image", "exists", imageName})
+	if err != nil {
+		return false, err
+	}
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	err = cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	// Exit code 1 means image doesn't exist
+	if code, ok := exitCode(err); ok && code == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("podman image exists failed: %w", err)
+}
+
+// RemoveImage removes an image from local storage.
+func (p *PodmanCLI) RemoveImage(ctx context.Context, runtime PodmanRuntime, imageName string) error {
+	if err := ValidateContainerName(imageName); err != nil {
+		return fmt.Errorf("invalid image name: %w", err)
+	}
+
+	args, err := buildPodmanArgs(runtime, []string{"rmi", imageName})
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		return fmt.Errorf("podman rmi failed: %w, output: %s", err, string(output))
+	}
+
+	return nil
+}
+
 // PullImage pulls an image by name
 func (p *PodmanCLI) PullImage(ctx context.Context, runtime PodmanRuntime, image string) error {
 	if err := ValidateContainerName(image); err != nil {
@@ -668,6 +734,19 @@ func (p *PodmanCLI) UpdatePublishRemove(ctx context.Context, runtime PodmanRunti
 	if err != nil {
 		return fmt.Errorf("podman update --publish-rm failed: %w, output: %s", err, string(output))
 	}
+	return nil
+}
+
+// ResetStorage cleans up container references for this runtime's storage.
+// Only removes containers, does NOT touch the shared imagestore.
+func (p *PodmanCLI) ResetStorage(ctx context.Context, runtime PodmanRuntime) error {
+	// Remove all containers for this runtime (should already be done, but be thorough)
+	rmArgs, err := buildPodmanArgs(runtime, []string{"rm", "--all", "--force"})
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "podman", rmArgs...)
+	_ = cmd.Run() // Ignore errors - containers may already be gone
 	return nil
 }
 

@@ -64,6 +64,11 @@ func (s *stubVolumeManager) Detach(ctx context.Context, handle persistence.Volum
 	return nil
 }
 
+func (s *stubVolumeManager) DestroyVolume(ctx context.Context, id string) error {
+	_ = ctx
+	return os.RemoveAll(filepath.Join(s.root, "mounts", id))
+}
+
 func (s *stubVolumeManager) RoleStream(id string) (<-chan persistence.VolumeRole, error) {
 	_ = id
 	ch := make(chan persistence.VolumeRole)
@@ -262,8 +267,8 @@ func TestAppManager_Install(t *testing.T) {
 		t.Errorf("Expected app name 'test-app', got %s", app.Name)
 	}
 
-	if app.Status != "created" {
-		t.Errorf("Expected app status 'created', got %s", app.Status)
+	if app.Status != "running" {
+		t.Errorf("Expected app status 'running', got %s", app.Status)
 	}
 
 	// Verify container was created

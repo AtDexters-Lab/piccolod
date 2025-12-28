@@ -160,6 +160,38 @@ func (m *MockContainerManager) UpdatePublishRemove(ctx context.Context, runtime 
 	return nil
 }
 
+func (m *MockContainerManager) ResetStorage(ctx context.Context, runtime container.PodmanRuntime) error {
+	_ = ctx
+	_ = runtime
+	return nil
+}
+
+func (m *MockContainerManager) CommitContainer(ctx context.Context, runtime container.PodmanRuntime, containerID, imageName string) error {
+	_ = ctx
+	_ = runtime
+	if _, ok := m.containers[containerID]; !ok {
+		return container.ErrContainerNotFound(containerID)
+	}
+	// Mock: just succeed (image is not actually tracked in the mock)
+	return nil
+}
+
+func (m *MockContainerManager) ImageExists(ctx context.Context, runtime container.PodmanRuntime, imageName string) (bool, error) {
+	_ = ctx
+	_ = runtime
+	_ = imageName
+	// Mock: always return false (no images stored in mock)
+	return false, nil
+}
+
+func (m *MockContainerManager) RemoveImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) error {
+	_ = ctx
+	_ = runtime
+	_ = imageName
+	// Mock: just succeed
+	return nil
+}
+
 func generateMockContainerID(id int) string {
 	return "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd" + string(rune('0'+id%10))
 }

@@ -62,6 +62,13 @@ type LockStateReader interface {
 
 const maxInstallPortRetries = 5
 
+// workspaceSnapshotImage returns the local image name used to store workspace snapshots.
+// Snapshots are committed when a workspace app is uninstalled without purge, preserving
+// container filesystem changes for restoration on reinstall.
+func workspaceSnapshotImage(appName string) string {
+	return fmt.Sprintf("localhost/%s:snapshot", appName)
+}
+
 // NewAppManagerWithServices creates a new filesystem-based app manager with an injected ServiceManager
 func NewAppManagerWithServices(containerManager ContainerManager, stateDir string, serviceManager *services.ServiceManager, lockReader LockStateReader) (*AppManager, error) {
 	base := stateDir
@@ -870,6 +877,12 @@ func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefi
 
 // Install installs a new application from its definition
 func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	return m.installLocked(ctx, appDef)
+}
+
+func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
 	if err := m.ensureUnlocked(); err != nil {
 		return nil, err
 	}
@@ -926,8 +939,65 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		return nil, fmt.Errorf("failed to create container spec: %w", err)
 	}
 
-	// Create container
-	containerID, err := m.containerManager.CreateContainer(ctx, runtime, containerSpec)
+	// For workspace mode, check if a snapshot image exists from a previous uninstall.
+	// If so, use the snapshot to restore the previous container filesystem state.
+	mode := piccoloModeFromExtensions(appDef.Extensions)
+	useSnapshot := false
+	if mode == ModeWorkspace {
+		snapshotImage := workspaceSnapshotImage(appDef.Name)
+		exists, err := m.containerManager.ImageExists(ctx, runtime, snapshotImage)
+		if err != nil {
+			log.Printf("WARN: install %s: failed to check snapshot image: %v", appDef.Name, err)
+		} else if exists {
+			log.Printf("INFO: install %s: using workspace snapshot %s", appDef.Name, snapshotImage)
+			containerSpec.Image = snapshotImage
+			useSnapshot = true
+		}
+	}
+
+	// Pull image to app's isolated storage to detect download issues early
+	// Skip pull if using a local snapshot image
+	if !useSnapshot {
+		if err := m.containerManager.PullImage(ctx, runtime, appDef.Image); err != nil {
+			log.Printf("WARN: install %s: image pull failed: %v", appDef.Name, err)
+			// Proceeding anyway as CreateContainer might succeed if local, or fail with same error
+		}
+	}
+
+	// Create container with zombie cleanup
+	var containerID string
+	for i := 0; i < 2; i++ {
+		containerID, err = m.containerManager.CreateContainer(ctx, runtime, containerSpec)
+		if err == nil {
+			break
+		}
+
+		// If PortInUse, don't local retry - let the outer recursion handle it
+		var portErr *container.PortInUseError
+		if errors.As(err, &portErr) {
+			break
+		}
+
+		// Check for cleanup opportunities (NameInUse or Zombie)
+		zombieID := ""
+		var nameErr *container.NameInUseError
+		if errors.As(err, &nameErr) {
+			zombieID = nameErr.ID
+		} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, appDef.Name); resolveErr == nil {
+			zombieID = id
+		}
+
+		if zombieID != "" {
+			log.Printf("INFO: install %s: removing zombie container %s", appDef.Name, zombieID)
+			_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
+			// Continue loop to retry creation
+			continue
+		}
+
+		// If no zombie to clean, hard failure
+		break
+	}
+
 	if err != nil {
 		var portErr *container.PortInUseError
 		if errors.As(err, &portErr) {
@@ -943,6 +1013,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 			}
 			return m.installWithRetries(ctx, state, appDef, attempt+1)
 		}
+
 		return nil, fmt.Errorf("failed to create container: %w", err)
 	}
 
@@ -990,6 +1061,12 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 
 // Upsert installs or updates an application by name. If the app exists, it is uninstalled and reinstalled.
 func (m *AppManager) Upsert(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	return m.upsertLocked(ctx, appDef)
+}
+
+func (m *AppManager) upsertLocked(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
 	if err := m.ensureUnlocked(); err != nil {
 		return nil, err
 	}
@@ -1041,7 +1118,7 @@ func (m *AppManager) Upsert(ctx context.Context, appDef *api.AppDefinition) (*Ap
 		}
 		return existing, nil
 	}
-	return m.Install(ctx, appDef)
+	return m.installLocked(ctx, appDef)
 }
 
 // List returns all installed applications
@@ -1078,6 +1155,12 @@ func (m *AppManager) GetAppDefinition(ctx context.Context, name string) (*api.Ap
 
 // Start starts an application
 func (m *AppManager) Start(ctx context.Context, name string) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	return m.startLocked(ctx, name)
+}
+
+func (m *AppManager) startLocked(ctx context.Context, name string) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1140,6 +1223,9 @@ func (m *AppManager) Start(ctx context.Context, name string) error {
 
 // Stop stops an application
 func (m *AppManager) Stop(ctx context.Context, name string) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1228,6 +1314,12 @@ func (m *AppManager) Uninstall(ctx context.Context, name string) error {
 
 // UninstallWithOptions removes an application; when purge is true, also deletes app data directories
 func (m *AppManager) UninstallWithOptions(ctx context.Context, name string, purge bool) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	return m.uninstallLocked(ctx, name, purge)
+}
+
+func (m *AppManager) uninstallLocked(ctx context.Context, name string, purge bool) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1255,6 +1347,23 @@ func (m *AppManager) UninstallWithOptions(ctx context.Context, name string, purg
 	// Stop container first (ignore error if already stopped)
 	_ = m.containerManager.StopContainer(ctx, runtime, app.ContainerID)
 
+	// For workspace mode without purge, commit container state to snapshot image.
+	// This preserves the container filesystem so it can be restored on reinstall.
+	if !purge {
+		def, defErr := state.GetAppDefinition(name)
+		if defErr == nil {
+			mode := piccoloModeFromExtensions(def.Extensions)
+			if mode == ModeWorkspace && app.ContainerID != "" {
+				snapshotImage := workspaceSnapshotImage(name)
+				if err := m.containerManager.CommitContainer(ctx, runtime, app.ContainerID, snapshotImage); err != nil {
+					log.Printf("WARN: workspace %s: failed to commit snapshot: %v", name, err)
+				} else {
+					log.Printf("INFO: workspace %s: committed snapshot to %s", name, snapshotImage)
+				}
+			}
+		}
+	}
+
 	// Remove container
 	if err := m.containerManager.RemoveContainer(ctx, runtime, app.ContainerID); err != nil {
 		return fmt.Errorf("failed to remove container: %w", err)
@@ -1265,9 +1374,22 @@ func (m *AppManager) UninstallWithOptions(ctx context.Context, name string, purg
 		m.serviceManager.RemoveApp(name)
 	}
 
-	// Optionally purge app data (based on app definition storage)
+	// Optionally purge app data (destroy volume and podman runtime state)
 	if purge {
-		_ = m.purgeAppData(ctx, name)
+		// Reset podman storage to clean up any remaining containers
+		if err := m.containerManager.ResetStorage(ctx, runtime); err != nil {
+			log.Printf("WARN: podman storage reset for %s failed: %v", name, err)
+		}
+
+		volID := appVolumeID(name)
+		if err := m.volumeManager.DestroyVolume(ctx, volID); err != nil {
+			return fmt.Errorf("failed to purge app data: %w", err)
+		}
+
+		// Remove podman runRoot which lives outside the encrypted volume
+		if err := os.RemoveAll(runtime.RunRoot); err != nil {
+			log.Printf("WARN: failed to remove podman runRoot %s: %v", runtime.RunRoot, err)
+		}
 	}
 
 	// Remove from filesystem and cache (state only)
@@ -1340,6 +1462,12 @@ func (m *AppManager) ListEnabled(ctx context.Context) ([]string, error) {
 
 // UpdateImage updates an app's container image tag and recreates the container preserving services
 func (m *AppManager) UpdateImage(ctx context.Context, name string, tag *string) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	return m.updateImageLocked(ctx, name, tag)
+}
+
+func (m *AppManager) updateImageLocked(ctx context.Context, name string, tag *string) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1400,7 +1528,7 @@ func (m *AppManager) UpdateImage(ctx context.Context, name string, tag *string) 
 	if err := state.BackupCurrentAppDefinition(name); err != nil {
 		return fmt.Errorf("backup app.yaml: %w", err)
 	}
-	// Pull image (best effort)
+	// Pull image to app's storage (best effort)
 	_ = m.containerManager.PullImage(ctx, runtime, newImage)
 	// Preserve endpoints
 	endpoints, _ := m.serviceManager.GetByApp(name)
@@ -1432,6 +1560,12 @@ func (m *AppManager) UpdateImage(ctx context.Context, name string, tag *string) 
 
 // Revert reverts an app to the previous app.yaml (if available) and recreates container
 func (m *AppManager) Revert(ctx context.Context, name string) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	return m.revertLocked(ctx, name)
+}
+
+func (m *AppManager) revertLocked(ctx context.Context, name string) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1465,7 +1599,7 @@ func (m *AppManager) Revert(ctx context.Context, name string) error {
 	// Stop and remove current container
 	_ = m.containerManager.StopContainer(ctx, runtime, appInst.ContainerID)
 	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.ContainerID)
-	// Pull best-effort
+	// Pull to app's storage (best-effort)
 	if prevDef.Image != "" {
 		_ = m.containerManager.PullImage(ctx, runtime, prevDef.Image)
 	}
