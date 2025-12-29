@@ -14,9 +14,20 @@ class AppLauncher {
     required ServiceEndpoint service,
     String? overrideUrl, // Allow passing a specific URL (e.g. remote vs local)
   }) {
-    final url = overrideUrl ?? service.lanUrl;
-    final windowId = "app-window-${app.name}-${service.name}";
+    final url = overrideUrl ?? service.localUrl ?? service.remoteUrl;
+    final windowId = "app-window-${app.name}-${service.name}-$url";
     final title = "${app.displayTitle} (${service.name})";
+
+    if (url == null || url.isEmpty) {
+      // Cannot open app without a URL
+      controller.openApp(
+        windowId,
+        "Launch failed",
+        Icons.error_outline,
+        const Center(child: Text("No URL available to launch the app.")),
+      );
+      return;
+    }
 
     controller.openApp(
       windowId,

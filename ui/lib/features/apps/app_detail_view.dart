@@ -21,14 +21,15 @@ class AppDetailView extends StatefulWidget {
   State<AppDetailView> createState() => _AppDetailViewState();
 }
 
-class _AppDetailViewState extends State<AppDetailView> with SingleTickerProviderStateMixin {
+class _AppDetailViewState extends State<AppDetailView>
+    with SingleTickerProviderStateMixin {
   late TabController _tabController;
-  
+
   App? _app;
   List<ServiceEndpoint> _services = [];
   bool _isLoading = true;
   String? _error;
-  
+
   // Action states
   bool _isActionLoading = false;
 
@@ -38,7 +39,7 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
     _tabController = TabController(length: 3, vsync: this);
     _loadData();
   }
-  
+
   @override
   void dispose() {
     _tabController.dispose();
@@ -54,7 +55,7 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
     try {
       final app = await widget.appService.getAppDetail(widget.appId);
       final services = await widget.appService.getAppServices(widget.appId);
-      
+
       if (!mounted) return;
 
       setState(() {
@@ -81,7 +82,9 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
       await _loadData(); // Refresh UI
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Action failed: $e")));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text("Action failed: $e")));
       }
     } finally {
       if (mounted) setState(() => _isActionLoading = false);
@@ -90,7 +93,7 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
 
   void _confirmUninstall() {
     bool purgeData = false;
-    
+
     showDialog(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
@@ -107,17 +110,23 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
                   decoration: BoxDecoration(
                     color: PiccoloTheme.critical.withValues(alpha: 0.1),
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: PiccoloTheme.critical.withValues(alpha: 0.3)),
+                    border: Border.all(
+                      color: PiccoloTheme.critical.withValues(alpha: 0.3),
+                    ),
                   ),
                   child: CheckboxListTile(
                     title: const Text(
                       "Delete Data Volumes",
-                      style: TextStyle(color: PiccoloTheme.critical, fontWeight: FontWeight.bold),
+                      style: TextStyle(
+                        color: PiccoloTheme.critical,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                     subtitle: const Text("This action cannot be undone."),
                     value: purgeData,
                     activeColor: PiccoloTheme.critical,
-                    onChanged: (val) => setDialogState(() => purgeData = val ?? false),
+                    onChanged: (val) =>
+                        setDialogState(() => purgeData = val ?? false),
                     controlAffinity: ListTileControlAffinity.leading,
                     contentPadding: const EdgeInsets.symmetric(horizontal: 8),
                   ),
@@ -130,30 +139,35 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
                 child: const Text("Cancel"),
               ),
               FilledButton(
-                style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.critical),
+                style: FilledButton.styleFrom(
+                  backgroundColor: PiccoloTheme.critical,
+                ),
                 onPressed: () async {
                   Navigator.of(dialogContext).pop(); // Close dialog
-                  
+
                   // Use outer setState to trigger main view rebuild
                   setState(() => _isActionLoading = true);
                   final messenger = ScaffoldMessenger.of(context);
-                  
+
                   try {
-                     await widget.appService.uninstallApp(widget.appId, purge: purgeData);
-                     
-                     if (mounted) {
-                       setState(() {
-                         _app = null; // Forces "App uninstalled" state
-                         _isActionLoading = false;
-                       });
-                     }
+                    await widget.appService.uninstallApp(
+                      widget.appId,
+                      purge: purgeData,
+                    );
+
+                    if (mounted) {
+                      setState(() {
+                        _app = null; // Forces "App uninstalled" state
+                        _isActionLoading = false;
+                      });
+                    }
                   } catch (e) {
-                     if (mounted) {
-                        setState(() => _isActionLoading = false);
-                        messenger.showSnackBar(
-                           SnackBar(content: Text("Uninstall failed: $e")),
-                        );
-                     }
+                    if (mounted) {
+                      setState(() => _isActionLoading = false);
+                      messenger.showSnackBar(
+                        SnackBar(content: Text("Uninstall failed: $e")),
+                      );
+                    }
                   }
                 },
                 child: const Text("Uninstall"),
@@ -180,7 +194,7 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
       children: [
         // Header
         _buildHeader(),
-        
+
         // Tabs
         TabBar(
           controller: _tabController,
@@ -193,7 +207,7 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
             Tab(text: "Configuration"),
           ],
         ),
-        
+
         // Content
         Expanded(
           child: Container(
@@ -234,12 +248,16 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
             child: Center(
               child: Text(
                 _app!.displayTitle[0].toUpperCase(),
-                style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: PiccoloTheme.cobalt600),
+                style: const TextStyle(
+                  fontSize: 32,
+                  fontWeight: FontWeight.bold,
+                  color: PiccoloTheme.cobalt600,
+                ),
               ),
             ),
           ),
           const SizedBox(width: 24),
-          
+
           // Info
           Expanded(
             child: Column(
@@ -247,11 +265,19 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
               children: [
                 Row(
                   children: [
-                    Text(_app!.displayTitle, style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 24)),
+                    Text(
+                      _app!.displayTitle,
+                      style: PiccoloTheme.textTheme.displayLarge?.copyWith(
+                        fontSize: 24,
+                      ),
+                    ),
                     const Spacer(),
                     // Uninstall Button (Moved here from AppBar)
                     IconButton(
-                      icon: const Icon(Icons.delete_outline, color: PiccoloTheme.critical),
+                      icon: const Icon(
+                        Icons.delete_outline,
+                        color: PiccoloTheme.critical,
+                      ),
                       onPressed: _confirmUninstall,
                       tooltip: "Uninstall",
                     ),
@@ -261,7 +287,10 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
                 Row(
                   children: [
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
                       decoration: BoxDecoration(
                         color: statusColor.withValues(alpha: 0.1),
                         borderRadius: BorderRadius.circular(12),
@@ -272,43 +301,59 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
                           Container(
                             width: 8,
                             height: 8,
-                            decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle),
+                            decoration: BoxDecoration(
+                              color: statusColor,
+                              shape: BoxShape.circle,
+                            ),
                           ),
                           const SizedBox(width: 6),
                           Text(
                             _app!.status.toUpperCase(),
-                            style: TextStyle(color: statusColor, fontSize: 12, fontWeight: FontWeight.bold),
+                            style: TextStyle(
+                              color: statusColor,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                            ),
                           ),
                         ],
                       ),
                     ),
                     const SizedBox(width: 16),
-                    Text("Image: ${_app!.image}", style: PiccoloTheme.textTheme.labelSmall),
+                    Text(
+                      "Image: ${_app!.image}",
+                      style: PiccoloTheme.textTheme.labelSmall,
+                    ),
                   ],
                 ),
               ],
             ),
           ),
-          
+
           const SizedBox(width: 24),
 
           // Actions
           if (_isActionLoading)
-             const CircularProgressIndicator()
+            const CircularProgressIndicator()
           else if (_app!.isRunning)
-             FilledButton.icon(
-               onPressed: () => _handleAction(() => widget.appService.stopApp(_app!.name)),
-               icon: const Icon(Icons.stop),
-               label: const Text("Stop"),
-               style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.inkMuted),
-             )
+            FilledButton.icon(
+              onPressed: () =>
+                  _handleAction(() => widget.appService.stopApp(_app!.name)),
+              icon: const Icon(Icons.stop),
+              label: const Text("Stop"),
+              style: FilledButton.styleFrom(
+                backgroundColor: PiccoloTheme.inkMuted,
+              ),
+            )
           else
-             FilledButton.icon(
-               onPressed: () => _handleAction(() => widget.appService.startApp(_app!.name)),
-               icon: const Icon(Icons.play_arrow),
-               label: const Text("Start"),
-               style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.success),
-             ),
+            FilledButton.icon(
+              onPressed: () =>
+                  _handleAction(() => widget.appService.startApp(_app!.name)),
+              icon: const Icon(Icons.play_arrow),
+              label: const Text("Start"),
+              style: FilledButton.styleFrom(
+                backgroundColor: PiccoloTheme.success,
+              ),
+            ),
         ],
       ),
     );
@@ -322,126 +367,168 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
         if (_app!.volumes.isEmpty)
           const Text("No persistent volumes configured.")
         else
-          ..._app!.volumes.map((v) => Card(
-            child: ListTile(
-              leading: const Icon(Icons.storage),
-              title: Text(v.containerPath),
-              subtitle: Text("Host: ${v.hostPath}"),
-              trailing: Text(v.sizeLimit),
+          ..._app!.volumes.map(
+            (v) => Card(
+              child: ListTile(
+                leading: const Icon(Icons.storage),
+                title: Text(v.containerPath),
+                subtitle: Text("Host: ${v.hostPath}"),
+                trailing: Text(v.sizeLimit),
+              ),
             ),
-          )),
-          
+          ),
+
         const SizedBox(height: 24),
         _buildSectionTitle("Environment Variables"),
         if (_app!.environment.isEmpty)
-           const Text("No environment variables.")
+          const Text("No environment variables.")
         else
-           Container(
-             padding: const EdgeInsets.all(16),
-             decoration: BoxDecoration(
-               color: Colors.white,
-               borderRadius: BorderRadius.circular(8),
-               border: Border.all(color: Colors.black12),
-             ),
-             child: Column(
-               crossAxisAlignment: CrossAxisAlignment.start,
-               children: _app!.environment.entries.map((e) => Padding(
-                 padding: const EdgeInsets.symmetric(vertical: 4),
-                 child: Row(
-                   crossAxisAlignment: CrossAxisAlignment.start,
-                   children: [
-                     SizedBox(
-                       width: 120, 
-                       child: Text(e.key, style: const TextStyle(fontWeight: FontWeight.bold, fontFamily: 'JetBrainsMono', fontSize: 12)),
-                     ),
-                     Expanded(
-                       child: Text(e.value, style: const TextStyle(fontFamily: 'JetBrainsMono', fontSize: 12)),
-                     ),
-                   ],
-                 ),
-               )).toList(),
-             ),
-           ),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.black12),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: _app!.environment.entries
+                  .map(
+                    (e) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          SizedBox(
+                            width: 120,
+                            child: SelectableText(
+                              e.key,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontFamily: 'JetBrainsMono',
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                          Expanded(
+                            child: SelectableText(
+                              e.value,
+                              style: const TextStyle(
+                                fontFamily: 'JetBrainsMono',
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                  .toList(),
+            ),
+          ),
       ],
     );
   }
 
   Widget _buildNetworkTab() {
-     if (_services.isEmpty) {
-       return const Center(child: Text("No network services exposed."));
-     }
-     
-     return ListView(
-       padding: const EdgeInsets.all(24),
-       children: _services.map((svc) => Card(
-         child: Padding(
-           padding: const EdgeInsets.all(16.0),
-           child: Column(
-             crossAxisAlignment: CrossAxisAlignment.start,
-             children: [
-               Row(
-                 children: [
-                   const Icon(Icons.router, color: PiccoloTheme.cobalt600),
-                   const SizedBox(width: 12),
-                   Text(svc.name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                   const Spacer(),
-                   Container(
-                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                     decoration: BoxDecoration(
-                       color: PiccoloTheme.mist,
-                       borderRadius: BorderRadius.circular(4),
-                       border: Border.all(color: Colors.black12),
-                     ),
-                     child: Text(svc.protocol.toUpperCase(), style: const TextStyle(fontSize: 12)),
-                   ),
-                 ],
-               ),
-               const Divider(height: 24),
-               _buildNetworkRow("Internal Port", "${svc.guestPort}"),
-               _buildNetworkRow("LAN Access", "${svc.lanUrl} (Port ${svc.publicPort})"),
-               
-               if (svc.remoteUrl != null)
-                  _buildNetworkRow("Remote Access", svc.remoteUrl!),
-                  
-               const SizedBox(height: 16),
-               Row(
-                 children: [
-                   Expanded(
-                     child: OutlinedButton.icon(
-                       onPressed: () => AppLauncher.openAppWindow(
-                         controller: widget.desktopController,
-                         appService: widget.appService,
-                         app: _app!,
-                         service: svc,
-                       ),
-                       icon: const Icon(Icons.lan, size: 16),
-                       label: const Text("Open Local"),
-                     ),
-                   ),
-                   if (svc.remoteUrl != null) ...[
-                     const SizedBox(width: 12),
-                     Expanded(
-                       child: FilledButton.icon(
-                         onPressed: () => AppLauncher.openAppWindow(
-                           controller: widget.desktopController,
-                           appService: widget.appService,
-                           app: _app!,
-                           service: svc,
-                           overrideUrl: svc.remoteUrl!,
-                         ),
-                         icon: const Icon(Icons.public, size: 16),
-                         label: const Text("Open Remote"),
-                         style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.cobalt600),
-                       ),
-                     ),
-                   ],
-                 ],
-               ),
-             ],
-           ),
-         ),
-       )).toList(),
-     );
+    if (_services.isEmpty) {
+      return const Center(child: Text("No network services exposed."));
+    }
+
+    return ListView(
+      padding: const EdgeInsets.all(24),
+      children: _services
+          .map(
+            (svc) => Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.router, color: PiccoloTheme.cobalt600),
+                        const SizedBox(width: 12),
+                        Text(
+                          svc.name,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                        const Spacer(),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: PiccoloTheme.mist,
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: Colors.black12),
+                          ),
+                          child: Text(
+                            svc.protocol.toUpperCase(),
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const Divider(height: 24),
+                    _buildNetworkRow("Internal Port", "${svc.guestPort}"),
+                    if (svc.localUrl != null)
+                      _buildNetworkRow(
+                        "LAN Access",
+                        "${svc.localUrl} (Port ${svc.publicPort})",
+                      ),
+
+                    if (svc.remoteUrl != null)
+                      _buildNetworkRow("Remote Access", svc.remoteUrl!),
+
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        if (svc.localUrl != null)
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: () => AppLauncher.openAppWindow(
+                                controller: widget.desktopController,
+                                appService: widget.appService,
+                                app: _app!,
+                                service: svc,
+                              ),
+                              icon: const Icon(Icons.lan, size: 16),
+                              label: const Text("Open Local"),
+                            ),
+                          ),
+                        if (svc.remoteUrl != null) ...[
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: FilledButton.icon(
+                              onPressed: () => AppLauncher.openAppWindow(
+                                controller: widget.desktopController,
+                                appService: widget.appService,
+                                app: _app!,
+                                service: svc,
+                                overrideUrl: svc.remoteUrl!,
+                              ),
+                              icon: const Icon(Icons.public, size: 16),
+                              label: const Text("Open Remote"),
+                              style: FilledButton.styleFrom(
+                                backgroundColor: PiccoloTheme.cobalt600,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          )
+          .toList(),
+    );
   }
 
   Widget _buildConfigTab() {
@@ -465,21 +552,37 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
       ),
     );
   }
-  
+
   Widget _buildSectionTitle(String title) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
-      child: Text(title, style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+      child: Text(
+        title,
+        style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+          fontWeight: FontWeight.bold,
+        ),
+      ),
     );
   }
-  
+
   Widget _buildNetworkRow(String label, String value) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         children: [
-          SizedBox(width: 120, child: Text(label, style: const TextStyle(color: PiccoloTheme.inkMuted))),
-          Expanded(child: SelectableText(value, style: const TextStyle(fontFamily: 'JetBrainsMono'))),
+          SizedBox(
+            width: 120,
+            child: Text(
+              label,
+              style: const TextStyle(color: PiccoloTheme.inkMuted),
+            ),
+          ),
+          Expanded(
+            child: SelectableText(
+              value,
+              style: const TextStyle(fontFamily: 'JetBrainsMono'),
+            ),
+          ),
         ],
       ),
     );

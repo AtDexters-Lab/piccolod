@@ -789,17 +789,21 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 	}
 }
 
-func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoint, scheme string) string {
+func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoint, scheme string) *string {
+
+	if s.isSecureRequest(c.Request) {
+		// secure context requests are nexus proxied requests with TLS muxing
+		// prevent local non-secure urls from being generated in that context
+		return nil
+	}
+
 	host := c.Request.Host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	// Use scheme from determineScheme which handles flow/protocol logic
-	// If public port is standard for scheme, we could omit it, but explicit is safer for services
-	if (scheme == "http" && ep.PublicPort == 80) || (scheme == "https" && ep.PublicPort == 443) {
-		return fmt.Sprintf("%s://%s", scheme, host)
-	}
-	return fmt.Sprintf("%s://%s:%d", scheme, host, ep.PublicPort)
+
+	url := fmt.Sprintf("%s://%s:%d", scheme, host, ep.PublicPort)
+	return &url
 }
 
 func (s *GinServer) remoteServiceHostname(status *remote.Status, ep services.ServiceEndpoint) string {
