@@ -41,7 +41,7 @@ func NewProxyManager() *ProxyManager {
 	// Default safe CSP
 	return &ProxyManager{
 		listeners:         make(map[int]net.Listener),
-		cspFrameAncestors: "frame-ancestors 'self' http://localhost:* http://*.local:* https://*.local:*",
+		cspFrameAncestors: "frame-ancestors \"self\" http://localhost:* http://*.local:* https://*.local:*",
 	}
 }
 
@@ -261,6 +261,14 @@ func (p *ProxyManager) securityHeaders(next http.Handler) http.Handler {
 		p.mu.Lock()
 		csp := p.cspFrameAncestors
 		p.mu.Unlock()
+
+		host, _ := splitHostPortValue(r.Host)
+		ip := net.ParseIP(host)
+		if ip != nil && (ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate()) {
+			host = host + ":*"
+			csp += " https://" + host + " http://" + host
+		}
+
 		w.Header().Add("Content-Security-Policy", csp)
 
 		next.ServeHTTP(w, r)
