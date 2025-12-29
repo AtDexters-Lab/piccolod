@@ -4,6 +4,8 @@ import '../config/core_config.dart';
 class App {
   final String id;
   final String name;
+  final String appName;
+  final String displayName;
   final String image;
   final String type;
   final String status;
@@ -14,6 +16,8 @@ class App {
   App({
     required this.id,
     required this.name,
+    this.appName = '',
+    this.displayName = '',
     required this.image,
     required this.type,
     required this.status,
@@ -23,9 +27,15 @@ class App {
   });
 
   factory App.fromJson(Map<String, dynamic> json) {
+    final instanceId = (json['instance_id'] ?? json['name'] ?? json['id'] ?? '').toString();
+    final appName = (json['app_name'] ?? json['name'] ?? '').toString();
+    final displayName = (json['display_name'] ?? '').toString();
+
     return App(
-      id: json['id'] ?? '',
-      name: json['name'] ?? '',
+      id: instanceId,
+      name: instanceId,
+      appName: appName,
+      displayName: displayName,
       image: json['image'] ?? '',
       type: json['type'] ?? 'user',
       status: json['status'] ?? 'unknown',
@@ -41,6 +51,12 @@ class App {
   bool get isRunning => status.toLowerCase() == 'running';
   bool get isStopped => status.toLowerCase() == 'stopped' || status.toLowerCase() == 'created';
   bool get isError => status.toLowerCase() == 'error';
+
+  String get displayTitle {
+    if (displayName.isNotEmpty) return displayName;
+    if (appName.isNotEmpty) return appName;
+    return name;
+  }
 }
 
 class AppVolume {

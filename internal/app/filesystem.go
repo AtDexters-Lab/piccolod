@@ -35,7 +35,9 @@ type FilesystemStateManager struct {
 
 // AppMetadata represents runtime metadata stored separately from app.yaml
 type AppMetadata struct {
-	Name        string    `json:"name"`
+	InstanceID  string    `json:"instance_id"`
+	DisplayName string    `json:"display_name,omitempty"`
+	AppName     string    `json:"app_name"`
 	Status      string    `json:"status"` // "created", "running", "stopped", "error"
 	ContainerID string    `json:"container_id"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -106,23 +108,25 @@ func (fsm *FilesystemStateManager) loadCache() error {
 			continue
 		}
 
-		appName := entry.Name()
-		app, err := fsm.loadAppFromDisk(appName)
+		// Directory name is the instance ID
+		instanceID := entry.Name()
+		app, err := fsm.loadAppFromDisk(instanceID)
 		if err != nil {
 			// Log error but continue loading other apps
-			fmt.Printf("Warning: failed to load app %s: %v\n", appName, err)
+			fmt.Printf("Warning: failed to load app instance %s: %v\n", instanceID, err)
 			continue
 		}
 
-		fsm.cache[appName] = app
+		fsm.cache[instanceID] = app
 	}
 
 	return nil
 }
 
-// loadAppFromDisk loads a single app from filesystem
-func (fsm *FilesystemStateManager) loadAppFromDisk(appName string) (*AppInstance, error) {
-	appDir := filepath.Join(fsm.appsDir, appName)
+// loadAppFromDisk loads a single app instance from filesystem.
+// The instanceID parameter is the directory name under apps/.
+func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInstance, error) {
+	appDir := filepath.Join(fsm.appsDir, instanceID)
 
 	// Load app.yaml
 	appDefPath := filepath.Join(appDir, "app.yaml")
@@ -148,32 +152,38 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(appName string) (*AppInstance
 		return nil, fmt.Errorf("failed to parse metadata.json: %w", err)
 	}
 
-	// Check if app is enabled (symlink exists)
-	enabledPath := filepath.Join(fsm.enabledDir, appName)
-	_, err = os.Lstat(enabledPath)
-	// enabled := err == nil  // Not currently used in AppInstance
-
-	// Create AppInstance
+	// Create AppInstance with instance-aware fields
 	app := &AppInstance{
-		Name:        appDef.Name,
+		InstanceID:  metadata.InstanceID,
+		DisplayName: metadata.DisplayName,
+		AppName:     metadata.AppName,
 		Image:       appDef.Image,
 		Type:        appDef.Type,
 		Status:      metadata.Status,
 		ContainerID: metadata.ContainerID,
-		// Ports removed in listeners model
 		Environment: appDef.Environment,
 		CreatedAt:   metadata.CreatedAt,
 		UpdatedAt:   metadata.UpdatedAt,
 	}
 
+	// Fallback: if InstanceID is empty in metadata, use directory name
+	if app.InstanceID == "" {
+		app.InstanceID = instanceID
+	}
+	// Fallback: if AppName is empty, use app definition name
+	if app.AppName == "" {
+		app.AppName = appDef.Name
+	}
+
 	return app, nil
 }
 
-// BackupCurrentAppDefinition writes current app.yaml to app.prev.yaml for rollback
-func (fsm *FilesystemStateManager) BackupCurrentAppDefinition(name string) error {
+// BackupCurrentAppDefinition writes current app.yaml to app.prev.yaml for rollback.
+// The instanceID parameter is the unique instance identifier.
+func (fsm *FilesystemStateManager) BackupCurrentAppDefinition(instanceID string) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
-	appDir := filepath.Join(fsm.appsDir, name)
+	appDir := filepath.Join(fsm.appsDir, instanceID)
 	cur := filepath.Join(appDir, "app.yaml")
 	prev := filepath.Join(appDir, "app.prev.yaml")
 	data, err := os.ReadFile(cur)
@@ -186,9 +196,10 @@ func (fsm *FilesystemStateManager) BackupCurrentAppDefinition(name string) error
 	return nil
 }
 
-// GetPreviousAppDefinition reads app.prev.yaml if present
-func (fsm *FilesystemStateManager) GetPreviousAppDefinition(name string) (*api.AppDefinition, error) {
-	appDir := filepath.Join(fsm.appsDir, name)
+// GetPreviousAppDefinition reads app.prev.yaml if present.
+// The instanceID parameter is the unique instance identifier.
+func (fsm *FilesystemStateManager) GetPreviousAppDefinition(instanceID string) (*api.AppDefinition, error) {
+	appDir := filepath.Join(fsm.appsDir, instanceID)
 	prev := filepath.Join(appDir, "app.prev.yaml")
 	data, err := os.ReadFile(prev)
 	if err != nil {
@@ -201,9 +212,10 @@ func (fsm *FilesystemStateManager) GetPreviousAppDefinition(name string) (*api.A
 	return def, nil
 }
 
-// GetAppDefinition reads and parses app.yaml for a given app name
-func (fsm *FilesystemStateManager) GetAppDefinition(name string) (*api.AppDefinition, error) {
-	appDir := filepath.Join(fsm.appsDir, name)
+// GetAppDefinition reads and parses app.yaml for a given app instance.
+// The instanceID parameter is the unique instance identifier.
+func (fsm *FilesystemStateManager) GetAppDefinition(instanceID string) (*api.AppDefinition, error) {
+	appDir := filepath.Join(fsm.appsDir, instanceID)
 	appDefPath := filepath.Join(appDir, "app.yaml")
 	data, err := os.ReadFile(appDefPath)
 	if err != nil {
@@ -216,12 +228,13 @@ func (fsm *FilesystemStateManager) GetAppDefinition(name string) (*api.AppDefini
 	return appDef, nil
 }
 
-// StoreApp saves app definition and metadata to filesystem
+// StoreApp saves app definition and metadata to filesystem.
+// The app instance is stored under apps/{InstanceID}/.
 func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDefinition) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
 
-	appDir := filepath.Join(fsm.appsDir, app.Name)
+	appDir := filepath.Join(fsm.appsDir, app.InstanceID)
 	if err := os.MkdirAll(appDir, 0755); err != nil {
 		return fmt.Errorf("failed to create app directory: %w", err)
 	}
@@ -237,9 +250,11 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDef
 		return fmt.Errorf("failed to write app.yaml: %w", err)
 	}
 
-	// Store metadata.json
+	// Store metadata.json with instance-aware fields
 	metadata := AppMetadata{
-		Name:        app.Name,
+		InstanceID:  app.InstanceID,
+		DisplayName: app.DisplayName,
+		AppName:     app.AppName,
 		Status:      app.Status,
 		ContainerID: app.ContainerID,
 		CreatedAt:   app.CreatedAt,
@@ -256,25 +271,26 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDef
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}
 
-	// Update cache
+	// Update cache keyed by InstanceID
 	fsm.cacheMu.Lock()
-	fsm.cache[app.Name] = app
+	fsm.cache[app.InstanceID] = app
 	fsm.cacheMu.Unlock()
 
 	return nil
 }
 
 // UpdateAppRuntime updates app runtime metadata (status and container ID) and persists metadata.json.
-func (fsm *FilesystemStateManager) UpdateAppRuntime(name, status, containerID string) error {
+// The instanceID parameter is the unique instance identifier.
+func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containerID string) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
 
 	// Update cache first
 	fsm.cacheMu.Lock()
-	app, exists := fsm.cache[name]
+	app, exists := fsm.cache[instanceID]
 	if !exists {
 		fsm.cacheMu.Unlock()
-		return fmt.Errorf("app not found: %s", name)
+		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
 	if status != "" {
 		app.Status = status
@@ -284,14 +300,18 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(name, status, containerID st
 	}
 	app.UpdatedAt = time.Now()
 	createdAt := app.CreatedAt
+	displayName := app.DisplayName
+	appName := app.AppName
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem
-	appDir := filepath.Join(fsm.appsDir, name)
+	appDir := filepath.Join(fsm.appsDir, instanceID)
 	metadataPath := filepath.Join(appDir, "metadata.json")
 
 	metadata := AppMetadata{
-		Name:        app.Name,
+		InstanceID:  instanceID,
+		DisplayName: displayName,
+		AppName:     appName,
 		Status:      app.Status,
 		ContainerID: app.ContainerID,
 		CreatedAt:   createdAt,
@@ -310,18 +330,32 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(name, status, containerID st
 	return nil
 }
 
-// UpdateAppStatus updates just the app status and updated timestamp
-func (fsm *FilesystemStateManager) UpdateAppStatus(name, status string) error {
-	return fsm.UpdateAppRuntime(name, status, "")
+// UpdateAppStatus updates just the app status and updated timestamp.
+// The instanceID parameter is the unique instance identifier.
+func (fsm *FilesystemStateManager) UpdateAppStatus(instanceID, status string) error {
+	return fsm.UpdateAppRuntime(instanceID, status, "")
 }
 
-// GetApp retrieves an app from cache (fast access)
-func (fsm *FilesystemStateManager) GetApp(name string) (*AppInstance, bool) {
+// GetApp retrieves an app instance from cache by instance ID (fast access).
+func (fsm *FilesystemStateManager) GetApp(instanceID string) (*AppInstance, bool) {
 	fsm.cacheMu.RLock()
 	defer fsm.cacheMu.RUnlock()
 
-	app, exists := fsm.cache[name]
+	app, exists := fsm.cache[instanceID]
 	return app, exists
+}
+
+// ListInstanceIDs returns all instance IDs currently in the cache.
+// Used for conflict detection during instance ID generation.
+func (fsm *FilesystemStateManager) ListInstanceIDs() []string {
+	fsm.cacheMu.RLock()
+	defer fsm.cacheMu.RUnlock()
+
+	ids := make([]string, 0, len(fsm.cache))
+	for id := range fsm.cache {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // ListApps returns all apps from cache
@@ -337,44 +371,46 @@ func (fsm *FilesystemStateManager) ListApps() []*AppInstance {
 	return apps
 }
 
-// RemoveApp removes an app from both filesystem and cache
-func (fsm *FilesystemStateManager) RemoveApp(name string) error {
+// RemoveApp removes an app instance from both filesystem and cache.
+// The instanceID parameter is the unique instance identifier.
+func (fsm *FilesystemStateManager) RemoveApp(instanceID string) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
 
 	// Remove from filesystem
-	appDir := filepath.Join(fsm.appsDir, name)
+	appDir := filepath.Join(fsm.appsDir, instanceID)
 	if err := os.RemoveAll(appDir); err != nil {
 		return fmt.Errorf("failed to remove app directory: %w", err)
 	}
 
 	// Remove enabled symlink if it exists
-	enabledPath := filepath.Join(fsm.enabledDir, name)
+	enabledPath := filepath.Join(fsm.enabledDir, instanceID)
 	_ = os.Remove(enabledPath) // Ignore error if symlink doesn't exist
 
 	// Remove from cache
 	fsm.cacheMu.Lock()
-	delete(fsm.cache, name)
+	delete(fsm.cache, instanceID)
 	fsm.cacheMu.Unlock()
 
 	return nil
 }
 
-// EnableApp creates a symlink to enable app (systemctl-style)
-func (fsm *FilesystemStateManager) EnableApp(name string) error {
+// EnableApp creates a symlink to enable app instance (systemctl-style).
+// The instanceID parameter is the unique instance identifier.
+func (fsm *FilesystemStateManager) EnableApp(instanceID string) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
 
-	appDir := filepath.Join(fsm.appsDir, name)
-	enabledPath := filepath.Join(fsm.enabledDir, name)
+	appDir := filepath.Join(fsm.appsDir, instanceID)
+	enabledPath := filepath.Join(fsm.enabledDir, instanceID)
 
-	// Check if app exists
+	// Check if app instance exists
 	if _, err := os.Stat(appDir); err != nil {
-		return fmt.Errorf("app not found: %s", name)
+		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
 	// Create symlink (relative path for portability)
-	relativePath := filepath.Join("..", AppsDir, name)
+	relativePath := filepath.Join("..", AppsDir, instanceID)
 	if err := os.Symlink(relativePath, enabledPath); err != nil {
 		if os.IsExist(err) {
 			return nil // Already enabled
@@ -385,12 +421,13 @@ func (fsm *FilesystemStateManager) EnableApp(name string) error {
 	return nil
 }
 
-// DisableApp removes the symlink to disable app
-func (fsm *FilesystemStateManager) DisableApp(name string) error {
+// DisableApp removes the symlink to disable app instance.
+// The instanceID parameter is the unique instance identifier.
+func (fsm *FilesystemStateManager) DisableApp(instanceID string) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
 
-	enabledPath := filepath.Join(fsm.enabledDir, name)
+	enabledPath := filepath.Join(fsm.enabledDir, instanceID)
 	if err := os.Remove(enabledPath); err != nil {
 		if os.IsNotExist(err) {
 			return nil // Already disabled
@@ -401,14 +438,15 @@ func (fsm *FilesystemStateManager) DisableApp(name string) error {
 	return nil
 }
 
-// IsAppEnabled checks if app is enabled (symlink exists)
-func (fsm *FilesystemStateManager) IsAppEnabled(name string) bool {
-	enabledPath := filepath.Join(fsm.enabledDir, name)
+// IsAppEnabled checks if app instance is enabled (symlink exists).
+// The instanceID parameter is the unique instance identifier.
+func (fsm *FilesystemStateManager) IsAppEnabled(instanceID string) bool {
+	enabledPath := filepath.Join(fsm.enabledDir, instanceID)
 	_, err := os.Lstat(enabledPath)
 	return err == nil
 }
 
-// ListEnabledApps returns names of all enabled apps
+// ListEnabledApps returns instance IDs of all enabled app instances.
 func (fsm *FilesystemStateManager) ListEnabledApps() ([]string, error) {
 	entries, err := os.ReadDir(fsm.enabledDir)
 	if err != nil {

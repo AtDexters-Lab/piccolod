@@ -29,9 +29,14 @@ type ContainerManager interface {
 	RemoveImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) error
 }
 
-// AppInstance captures the runtime metadata for an installed application.
+// AppInstance captures the runtime metadata for an installed application instance.
+// InstanceID is the system-generated unique key used everywhere (containers, volumes, services).
+// AppName is the original app definition name from the manifest.
+// DisplayName is an optional user-provided friendly name for UI purposes.
 type AppInstance struct {
-	Name        string            `json:"name"`
+	InstanceID  string            `json:"instance_id"`
+	DisplayName string            `json:"display_name,omitempty"`
+	AppName     string            `json:"app_name"`
 	Image       string            `json:"image"`
 	Type        string            `json:"type"`
 	Status      string            `json:"status"`

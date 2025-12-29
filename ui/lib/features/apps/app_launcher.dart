@@ -16,7 +16,7 @@ class AppLauncher {
   }) {
     final url = overrideUrl ?? service.lanUrl;
     final windowId = "app-window-${app.name}-${service.name}";
-    final title = "${app.name} (${service.name})";
+    final title = "${app.displayTitle} (${service.name})";
 
     controller.openApp(
       windowId,
@@ -43,7 +43,7 @@ class AppLauncher {
               // Open it
               controller.openApp(
                 settingsId,
-                app.name,
+                app.displayTitle,
                 Icons.settings_applications,
                 AppDetailView(
                   appId: app.name,

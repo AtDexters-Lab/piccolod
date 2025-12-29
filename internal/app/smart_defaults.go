@@ -28,9 +28,9 @@ func IsSubdomainTaken(ctx context.Context, mgr *AppManager, subdomain string) (b
 	for _, app := range apps {
 		// We need the definition to see listener names.
 		// AppManager now needs to expose GetAppDefinition or we use a helper.
-		def, err := mgr.GetAppDefinition(ctx, app.Name)
+		def, err := mgr.GetAppDefinition(ctx, app.InstanceID)
 		if err != nil {
-			// If we can't read an app's definition, we assume it's not conflicting 
+			// If we can't read an app's definition, we assume it's not conflicting
 			// (or we could be conservative and say it is, but let's be optimistic).
 			continue
 		}

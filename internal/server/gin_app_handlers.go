@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -15,7 +14,6 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/app"
 	"piccolod/internal/app/catalog"
-	"piccolod/internal/persistence"
 	"piccolod/internal/remote"
 	"piccolod/internal/services"
 )
@@ -261,12 +259,14 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	// Read request body
 	var yamlData []byte
 	var userInputs map[string]interface{}
+	displayName := ""
 
 	if strings.Contains(contentType, "application/json") {
 		// Accept { app_definition: "...yaml...", inputs: {...} }
 		var req struct {
 			AppDefinition string                 `json:"app_definition"`
 			Inputs        map[string]interface{} `json:"inputs"`
+			DisplayName   string                 `json:"display_name"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
 			writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
@@ -274,6 +274,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		}
 		yamlData = []byte(req.AppDefinition)
 		userInputs = req.Inputs
+		displayName = req.DisplayName
 	} else {
 		body, err := c.GetRawData()
 		if err != nil {
@@ -316,24 +317,8 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		return
 	}
 
-	// Capture existing remote hosts for this app so we can clean up removed listeners after upsert.
-	var oldHosts map[string]struct{}
-	if s.remoteManager != nil && s.serviceManager != nil {
-		st := s.remoteManager.Status()
-		if st.TLD != "" {
-			if eps, err := s.serviceManager.GetByApp(appDef.Name); err == nil {
-				oldHosts = remoteHostsForEndpoints(eps, st.TLD)
-			}
-		}
-	}
-
-	if err := s.ensureAppVolume(c.Request.Context(), appDef); err != nil {
-		writeGinError(c, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	// Install or update (upsert) the app
-	appInstance, err := s.appManager.Upsert(c.Request.Context(), appDef)
+	// Install a new app instance
+	appInstance, err := s.appManager.Install(c.Request.Context(), appDef, displayName)
 	if err != nil {
 		if handleAppManagerError(c, err, "install app") {
 			return
@@ -342,26 +327,11 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		return
 	}
 
-	// Clean up certificates for listeners that were removed in this upsert.
-	if oldHosts != nil && s.remoteManager != nil && s.serviceManager != nil {
-		st := s.remoteManager.Status()
-		if st.TLD != "" {
-			if newEps, err := s.serviceManager.GetByApp(appInstance.Name); err == nil {
-				newHosts := remoteHostsForEndpoints(newEps, st.TLD)
-				for h := range oldHosts {
-					if _, ok := newHosts[h]; !ok {
-						s.remoteManager.RemoveHostnameCertificate(h)
-					}
-				}
-			}
-		}
-	}
-
-	s.queueAppRemoteCertificates(appInstance.Name)
+	s.queueAppRemoteCertificates(appInstance.InstanceID)
 
 	response := GinAppResponse{
 		Data:    appInstance,
-		Message: "App '" + appInstance.Name + "' installed successfully",
+		Message: "App '" + appInstance.InstanceID + "' installed successfully",
 	}
 	c.JSON(http.StatusCreated, response)
 }
@@ -562,18 +532,46 @@ func handleAppManagerError(c *gin.Context, err error, action string) bool {
 	return false
 }
 
-func (s *GinServer) ensureAppVolume(ctx context.Context, appDef *api.AppDefinition) error {
-	if s.dispatcher == nil || appDef == nil {
-		return nil
+// handleGinAppCheckInstance handles GET /api/v1/apps/check-instance?id=<candidate>
+// It returns whether an instance ID is available and, if not, a suggested alternative.
+func (s *GinServer) handleGinAppCheckInstance(c *gin.Context) {
+	candidate := strings.TrimSpace(c.Query("id"))
+	if candidate == "" {
+		writeGinError(c, http.StatusBadRequest, "Missing query parameter: id")
+		return
 	}
-	volID := fmt.Sprintf("app-%s", appDef.Name)
-	req := persistence.VolumeRequest{ID: volID, Class: persistence.VolumeClassApplication, ClusterMode: persistence.ClusterModeStateful}
-	resp, err := s.dispatcher.Dispatch(ctx, persistence.EnsureVolumeCommand{Req: req})
+	if err := app.ValidateInstanceID(candidate); err != nil {
+		writeGinError(c, http.StatusBadRequest, "Invalid instance ID: "+err.Error())
+		return
+	}
+
+	apps, err := s.appManager.List(c.Request.Context())
 	if err != nil {
-		return fmt.Errorf("failed to ensure app volume: %w", err)
+		if handleAppManagerError(c, err, "check instance") {
+			return
+		}
+		writeGinError(c, http.StatusInternalServerError, "Failed to list apps: "+err.Error())
+		return
 	}
-	if _, ok := resp.(persistence.EnsureVolumeResponse); !ok {
-		return fmt.Errorf("unexpected response from persistence for volume %s", volID)
+
+	existing := make([]string, 0, len(apps))
+	available := true
+	for _, inst := range apps {
+		existing = append(existing, inst.InstanceID)
+		if inst.InstanceID == candidate {
+			available = false
+		}
 	}
-	return nil
+
+	suggested := candidate
+	if !available {
+		if alt, err := app.GenerateInstanceID(candidate, existing); err == nil {
+			suggested = alt
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"available": available,
+		"suggested": suggested,
+	})
 }

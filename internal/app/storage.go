@@ -18,8 +18,10 @@ type appVolumeLayout struct {
 	DataDir    string
 }
 
-func appVolumeID(appName string) string {
-	return fmt.Sprintf("app-%s", appName)
+// appVolumeID returns the volume ID for an app instance.
+// The instanceID is the unique instance identifier.
+func appVolumeID(instanceID string) string {
+	return fmt.Sprintf("app-%s", instanceID)
 }
 
 func ensureDir(path string, mode os.FileMode) error {
@@ -44,13 +46,15 @@ func (m *AppManager) currentVolumeManager() persistence.VolumeManager {
 	return m.volumeManager
 }
 
-func (m *AppManager) ensureAppVolumeLayout(ctx context.Context, appName string) (appVolumeLayout, error) {
+// ensureAppVolumeLayout ensures the per-app encrypted volume is mounted and returns its layout.
+// The instanceID parameter is the unique instance identifier.
+func (m *AppManager) ensureAppVolumeLayout(ctx context.Context, instanceID string) (appVolumeLayout, error) {
 	volumes := m.currentVolumeManager()
 	if volumes == nil {
 		return appVolumeLayout{}, fmt.Errorf("app manager: volume manager not configured")
 	}
 
-	volID := appVolumeID(appName)
+	volID := appVolumeID(instanceID)
 	req := persistence.VolumeRequest{
 		ID:          volID,
 		Class:       persistence.VolumeClassApplication,
@@ -94,10 +98,10 @@ func (m *AppManager) ensureAppVolumeLayout(ctx context.Context, appName string) 
 	dataDir := filepath.Join(handle.MountDir, "data")
 
 	if err := ensureDir(podmanRoot, 0o700); err != nil {
-		return appVolumeLayout{}, fmt.Errorf("app manager: ensure disk dataset for %s: %w", appName, err)
+		return appVolumeLayout{}, fmt.Errorf("app manager: ensure disk dataset for %s: %w", instanceID, err)
 	}
 	if err := ensureDir(dataDir, 0o755); err != nil {
-		return appVolumeLayout{}, fmt.Errorf("app manager: ensure data dataset for %s: %w", appName, err)
+		return appVolumeLayout{}, fmt.Errorf("app manager: ensure data dataset for %s: %w", instanceID, err)
 	}
 
 	return appVolumeLayout{

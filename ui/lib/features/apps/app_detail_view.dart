@@ -96,7 +96,7 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
       builder: (dialogContext) => StatefulBuilder(
         builder: (context, setDialogState) {
           return AlertDialog(
-            title: Text("Uninstall ${_app?.name}?"),
+            title: Text("Uninstall ${_app?.displayTitle}?"),
             content: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -233,7 +233,7 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
             ),
             child: Center(
               child: Text(
-                _app!.name[0].toUpperCase(),
+                _app!.displayTitle[0].toUpperCase(),
                 style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: PiccoloTheme.cobalt600),
               ),
             ),
@@ -247,7 +247,7 @@ class _AppDetailViewState extends State<AppDetailView> with SingleTickerProvider
               children: [
                 Row(
                   children: [
-                    Text(_app!.name, style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 24)),
+                    Text(_app!.displayTitle, style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 24)),
                     const Spacer(),
                     // Uninstall Button (Moved here from AppBar)
                     IconButton(

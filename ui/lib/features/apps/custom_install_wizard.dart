@@ -20,6 +20,7 @@ class CustomInstallWizard extends StatefulWidget {
 
 class _CustomInstallWizardState extends State<CustomInstallWizard> {
   late TextEditingController _yamlController;
+  late TextEditingController _displayNameController;
   int _currentStep = 0;
   bool _isValidating = false;
   bool _isInstalling = false;
@@ -36,6 +37,7 @@ class _CustomInstallWizardState extends State<CustomInstallWizard> {
   void initState() {
     super.initState();
     _yamlController = TextEditingController(text: widget.initialYaml ?? _defaultTemplate);
+    _displayNameController = TextEditingController();
   }
 
   static const String _defaultTemplate = '''
@@ -56,6 +58,7 @@ storage:
   @override
   void dispose() {
     _yamlController.dispose();
+    _displayNameController.dispose();
     super.dispose();
   }
 
@@ -84,7 +87,11 @@ storage:
     });
 
     try {
-      final app = await widget.appService.installApp(_yamlController.text);
+      final app = await widget.appService.installAppWithInputs(
+        _yamlController.text,
+        <String, dynamic>{},
+        displayName: _displayNameController.text.trim(),
+      );
       
       if (mounted) {
         widget.onSuccess?.call(app.name);
@@ -265,6 +272,17 @@ storage:
           const SizedBox(height: 16),
           const Text(
             "Your app definition is valid syntax. Proceeding with installation will:",
+          ),
+          const SizedBox(height: 24),
+          TextField(
+            controller: _displayNameController,
+            decoration: const InputDecoration(
+              labelText: "Display name (optional)",
+              hintText: "e.g., Work Projects",
+              filled: true,
+              fillColor: Colors.white,
+              border: OutlineInputBorder(),
+            ),
           ),
           const SizedBox(height: 24),
           

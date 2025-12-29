@@ -8,13 +8,14 @@ import (
 	"piccolod/internal/state/paths"
 )
 
-// podmanRuntimeForApp returns a runtime configured for a specific app.
-// Each app has fully isolated podman storage within its encrypted volume.
+// podmanRuntimeForApp returns a runtime configured for a specific app instance.
+// Each app instance has fully isolated podman storage within its encrypted volume.
 // This avoids cross-reference issues with shared imagestores.
-func (m *AppManager) podmanRuntimeForApp(appName string, layout appVolumeLayout) (container.PodmanRuntime, error) {
+// The instanceID parameter is the unique instance identifier.
+func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayout) (container.PodmanRuntime, error) {
 	volID := layout.VolumeID
 	if volID == "" {
-		volID = appVolumeID(appName)
+		volID = appVolumeID(instanceID)
 	}
 
 	runRoot := paths.Join("run", "podman", volID)
@@ -23,7 +24,7 @@ func (m *AppManager) podmanRuntimeForApp(appName string, layout appVolumeLayout)
 	}
 
 	if layout.PodmanRoot == "" {
-		return container.PodmanRuntime{}, fmt.Errorf("app manager: podman root missing for %s", appName)
+		return container.PodmanRuntime{}, fmt.Errorf("app manager: podman root missing for %s", instanceID)
 	}
 
 	fuseOverlayfs, err := exec.LookPath("fuse-overlayfs")

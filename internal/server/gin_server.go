@@ -652,6 +652,7 @@ func (s *GinServer) setupGinRoutes() {
 		{
 			apps.POST("", s.requireUnlocked(), s.handleGinAppInstall)           // POST /api/v1/apps
 			apps.POST("/validate", s.handleGinAppValidate)                      // POST /api/v1/apps/validate
+			apps.GET("/check-instance", s.handleGinAppCheckInstance)            // GET /api/v1/apps/check-instance?id=...
 			apps.GET("", s.handleGinAppList)                                    // GET /api/v1/apps
 			apps.GET("/:name", s.handleGinAppGet)                               // GET /api/v1/apps/:name
 			apps.DELETE("/:name", s.requireUnlocked(), s.handleGinAppUninstall) // DELETE /api/v1/apps/:name

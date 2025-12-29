@@ -257,14 +257,17 @@ func TestAppManager_Install(t *testing.T) {
 	}
 
 	// Install the app
-	app, err := manager.Install(ctx, appDef)
+	app, err := manager.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
 	// Verify app was created correctly
-	if app.Name != "test-app" {
-		t.Errorf("Expected app name 'test-app', got %s", app.Name)
+	if app.AppName != "test-app" {
+		t.Errorf("Expected app name 'test-app', got %s", app.AppName)
+	}
+	if app.InstanceID != "test-app" {
+		t.Errorf("Expected first instance ID 'test-app', got %s", app.InstanceID)
 	}
 
 	if app.Status != "running" {
@@ -277,7 +280,7 @@ func TestAppManager_Install(t *testing.T) {
 	}
 
 	// Verify filesystem structure was created
-	appDir := filepath.Join(tempDir, AppsDir, "test-app")
+	appDir := filepath.Join(tempDir, AppsDir, app.InstanceID)
 	if _, err := os.Stat(appDir); os.IsNotExist(err) {
 		t.Error("App directory was not created")
 	}
@@ -294,10 +297,16 @@ func TestAppManager_Install(t *testing.T) {
 		t.Error("metadata.json was not created")
 	}
 
-	// Test duplicate installation should fail
-	_, err = manager.Install(ctx, appDef)
-	if err == nil {
-		t.Error("Expected error when installing duplicate app")
+	// Second installation of same app should create new instance with different ID
+	app2, err := manager.Install(ctx, appDef, "")
+	if err != nil {
+		t.Fatalf("Failed to install second instance: %v", err)
+	}
+	if app2.InstanceID == app.InstanceID {
+		t.Error("Expected different instance ID for second installation")
+	}
+	if app2.AppName != "test-app" {
+		t.Errorf("Expected app name 'test-app', got %s", app2.AppName)
 	}
 }
 
@@ -314,7 +323,7 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 		Name: "demo", Image: "alpine:latest", Type: "user",
 		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
 		Extensions: map[string]interface{}{"mode": "service"},
-	}); err != nil {
+	}, ""); err != nil {
 		t.Fatalf("seed install: %v", err)
 	}
 
@@ -339,7 +348,7 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	if _, err := manager.Install(context.Background(), appDef); !errors.Is(err, ErrNotLeader) {
+	if _, err := manager.Install(context.Background(), appDef, ""); !errors.Is(err, ErrNotLeader) {
 		t.Fatalf("expected ErrNotLeader, got %v", err)
 	}
 }
@@ -434,12 +443,12 @@ func TestAppManager_List(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = manager.Install(ctx, appDef1)
+	_, err = manager.Install(ctx, appDef1, "")
 	if err != nil {
 		t.Fatalf("Failed to install app1: %v", err)
 	}
 
-	_, err = manager.Install(ctx, appDef2)
+	_, err = manager.Install(ctx, appDef2, "")
 	if err != nil {
 		t.Fatalf("Failed to install app2: %v", err)
 	}
@@ -457,7 +466,7 @@ func TestAppManager_List(t *testing.T) {
 	// Verify app names are present
 	appNames := make(map[string]bool)
 	for _, app := range apps {
-		appNames[app.Name] = true
+		appNames[app.AppName] = true
 	}
 
 	if !appNames["app1"] || !appNames["app2"] {
@@ -519,7 +528,7 @@ func TestAppManager_Get(t *testing.T) {
 		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	installedApp, err := manager.Install(ctx, appDef)
+	installedApp, err := manager.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -531,8 +540,8 @@ func TestAppManager_Get(t *testing.T) {
 	}
 
 	// Verify app details
-	if retrievedApp.Name != installedApp.Name {
-		t.Errorf("Expected name %s, got %s", installedApp.Name, retrievedApp.Name)
+	if retrievedApp.InstanceID != installedApp.InstanceID {
+		t.Errorf("Expected instance ID %s, got %s", installedApp.InstanceID, retrievedApp.InstanceID)
 	}
 
 	if retrievedApp.Status != installedApp.Status {
@@ -606,7 +615,7 @@ func TestAppManager_StartStop(t *testing.T) {
 		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	_, err = manager.Install(ctx, appDef)
+	_, err = manager.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -705,7 +714,7 @@ func TestAppManager_Uninstall(t *testing.T) {
 		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	_, err = manager.Install(ctx, appDef)
+	_, err = manager.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -777,7 +786,7 @@ func TestAppManager_EnableDisable(t *testing.T) {
 		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	_, err = manager.Install(ctx, appDef)
+	_, err = manager.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -889,7 +898,7 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = manager1.Install(ctx, appDef)
+	_, err = manager1.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -937,8 +946,8 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 	}
 
 	// Verify all properties were preserved
-	if app2.Name != "persistent-app" {
-		t.Errorf("Expected name 'persistent-app', got %s", app2.Name)
+	if app2.InstanceID != "persistent-app" {
+		t.Errorf("Expected instance ID 'persistent-app', got %s", app2.InstanceID)
 	}
 
 	if app2.Image != "nginx:alpine" {
@@ -982,7 +991,7 @@ func TestAppManager_BlockedWhenLocked(t *testing.T) {
 		Name: "locked-app", Image: "nginx:latest", Type: "user",
 		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
 		Extensions: map[string]interface{}{"mode": "service"},
-	})
+	}, "")
 	if !errors.Is(err, ErrLocked) {
 		t.Fatalf("expected ErrLocked, got %v", err)
 	}
@@ -1013,7 +1022,7 @@ func TestAppManager_RestoreServicesSkipsStoppedApps(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
-	if _, err := mgr.Install(context.Background(), app); err != nil {
+	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	if err := mgr.Stop(context.Background(), "demo"); err != nil {
@@ -1052,7 +1061,7 @@ func TestAppManager_ReconcileOnceStartsDesiredRunningApps(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
-	if _, err := mgr.Install(context.Background(), app); err != nil {
+	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 
@@ -1097,7 +1106,7 @@ func TestAppManager_ReconcileOnceStopsDesiredStoppedApps(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
-	if _, err := mgr.Install(context.Background(), app); err != nil {
+	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	if err := mgr.Start(context.Background(), "demo"); err != nil {
@@ -1154,7 +1163,7 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
-	if _, err := mgr.Install(context.Background(), app); err != nil {
+	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	if err := mgr.Start(context.Background(), "demo"); err != nil {
@@ -1223,7 +1232,7 @@ func TestAppManager_ReconcileOnceResolvesStaleContainerID(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
-	inst, err := mgr.Install(context.Background(), app)
+	inst, err := mgr.Install(context.Background(), app, "")
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}

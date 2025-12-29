@@ -65,8 +65,9 @@ const maxInstallPortRetries = 5
 // workspaceSnapshotImage returns the local image name used to store workspace snapshots.
 // Snapshots are committed when a workspace app is uninstalled without purge, preserving
 // container filesystem changes for restoration on reinstall.
-func workspaceSnapshotImage(appName string) string {
-	return fmt.Sprintf("localhost/%s:snapshot", appName)
+// The instanceID parameter is the unique instance identifier.
+func workspaceSnapshotImage(instanceID string) string {
+	return fmt.Sprintf("localhost/%s:snapshot", instanceID)
 }
 
 // NewAppManagerWithServices creates a new filesystem-based app manager with an injected ServiceManager
@@ -440,8 +441,8 @@ func (m *AppManager) snapshotApps(allowLocked bool) []*AppInstance {
 func (m *AppManager) enterFollower(ctx context.Context) {
 	apps := m.snapshotApps(true)
 	for _, app := range apps {
-		if err := m.stopInternal(ctx, app.Name); err != nil {
-			log.Printf("WARN: follower transition stop app %s failed: %v", app.Name, err)
+		if err := m.stopInternal(ctx, app.InstanceID); err != nil {
+			log.Printf("WARN: follower transition stop app %s failed: %v", app.InstanceID, err)
 		}
 	}
 }
@@ -514,46 +515,46 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 		// Respect desired state: stopped apps should not have proxies restored.
 		if app.Status == "stopped" {
 			if m.serviceManager != nil {
-				m.serviceManager.RemoveApp(app.Name)
+				m.serviceManager.RemoveApp(app.InstanceID)
 			}
 			continue
 		}
 		// Followers should not restore proxies for apps they don't lead.
-		if m.LastObservedRole(cluster.ResourceForApp(app.Name)) == cluster.RoleFollower {
+		if m.LastObservedRole(cluster.ResourceForApp(app.InstanceID)) == cluster.RoleFollower {
 			if m.serviceManager != nil {
-				m.serviceManager.RemoveApp(app.Name)
+				m.serviceManager.RemoveApp(app.InstanceID)
 			}
 			continue
 		}
-		def, err := state.GetAppDefinition(app.Name)
+		def, err := state.GetAppDefinition(app.InstanceID)
 		if err != nil {
-			log.Printf("WARN: restore services: failed to read app definition for %s: %v", app.Name, err)
+			log.Printf("WARN: restore services: failed to read app definition for %s: %v", app.InstanceID, err)
 			continue
 		}
-		layout, err := m.ensureAppVolumeLayout(ctx, app.Name)
+		layout, err := m.ensureAppVolumeLayout(ctx, app.InstanceID)
 		if err != nil {
-			log.Printf("WARN: restore services: app volume unavailable for %s: %v", app.Name, err)
+			log.Printf("WARN: restore services: app volume unavailable for %s: %v", app.InstanceID, err)
 			continue
 		}
-		runtime, err := m.podmanRuntimeForApp(app.Name, layout)
+		runtime, err := m.podmanRuntimeForApp(app.InstanceID, layout)
 		if err != nil {
-			log.Printf("WARN: restore services: podman runtime unavailable for %s: %v", app.Name, err)
+			log.Printf("WARN: restore services: podman runtime unavailable for %s: %v", app.InstanceID, err)
 			continue
 		}
 		ports, err := m.containerManager.InspectPublishedPorts(ctx, runtime, app.ContainerID)
 		if err != nil {
-			log.Printf("WARN: restore services: podman port inspect failed for %s: %v", app.Name, err)
+			log.Printf("WARN: restore services: podman port inspect failed for %s: %v", app.InstanceID, err)
 			continue
 		}
 		if len(ports) == 0 {
-			m.serviceManager.RemoveApp(app.Name)
+			m.serviceManager.RemoveApp(app.InstanceID)
 			continue
 		}
-		if _, err := m.serviceManager.RestoreFromPodman(app.Name, def.Listeners, ports); err != nil {
-			log.Printf("WARN: restore services: failed to restore proxies for %s: %v", app.Name, err)
+		if _, err := m.serviceManager.RestoreFromPodman(app.InstanceID, def.Listeners, ports); err != nil {
+			log.Printf("WARN: restore services: failed to restore proxies for %s: %v", app.InstanceID, err)
 			continue
 		}
-		m.serviceManager.SetAppContainerID(app.Name, app.ContainerID)
+		m.serviceManager.SetAppContainerID(app.InstanceID, app.ContainerID)
 	}
 }
 
@@ -585,38 +586,38 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if appInst == nil || strings.TrimSpace(appInst.Name) == "" {
+		if appInst == nil || strings.TrimSpace(appInst.InstanceID) == "" {
 			continue
 		}
 		if err := m.reconcileApp(ctx, state, appInst); err != nil {
-			log.Printf("WARN: reconcile app %s: %v", appInst.Name, err)
+			log.Printf("WARN: reconcile app %s: %v", appInst.InstanceID, err)
 		}
 	}
 }
 
 func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance) error {
 	desiredRunning := appInst.Status != "stopped"
-	if m.LastObservedRole(cluster.ResourceForApp(appInst.Name)) == cluster.RoleFollower {
+	if m.LastObservedRole(cluster.ResourceForApp(appInst.InstanceID)) == cluster.RoleFollower {
 		desiredRunning = false
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, appInst.Name)
+	layout, err := m.ensureAppVolumeLayout(ctx, appInst.InstanceID)
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(appInst.Name, layout)
+	runtime, err := m.podmanRuntimeForApp(appInst.InstanceID, layout)
 	if err != nil {
 		return err
 	}
 
 	containerID := strings.TrimSpace(appInst.ContainerID)
 	resolveID := func() (string, error) {
-		id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, appInst.Name)
+		id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, appInst.InstanceID)
 		if err != nil {
 			return "", err
 		}
 		if strings.TrimSpace(id) == "" {
-			return "", container.ErrContainerNotFound(appInst.Name)
+			return "", container.ErrContainerNotFound(appInst.InstanceID)
 		}
 		return id, nil
 	}
@@ -624,7 +625,7 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 	if containerID == "" {
 		if id, err := resolveID(); err == nil {
 			containerID = id
-			_ = state.UpdateAppRuntime(appInst.Name, appInst.Status, containerID)
+			_ = state.UpdateAppRuntime(appInst.InstanceID, appInst.Status, containerID)
 			appInst.ContainerID = containerID
 		}
 	}
@@ -633,7 +634,7 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 	if containerID != "" {
 		observed, err = m.containerManager.InspectContainerState(ctx, runtime, containerID)
 		if err != nil {
-			log.Printf("WARN: reconcile app %s: inspect state failed: %v", appInst.Name, err)
+			log.Printf("WARN: reconcile app %s: inspect state failed: %v", appInst.InstanceID, err)
 			observed = container.ContainerState{}
 		}
 	}
@@ -641,7 +642,7 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 	if containerID == "" || !observed.Exists {
 		if id, err := resolveID(); err == nil && id != "" && id != containerID {
 			containerID = id
-			_ = state.UpdateAppRuntime(appInst.Name, appInst.Status, containerID)
+			_ = state.UpdateAppRuntime(appInst.InstanceID, appInst.Status, containerID)
 			appInst.ContainerID = containerID
 			observed, _ = m.containerManager.InspectContainerState(ctx, runtime, containerID)
 		}
@@ -650,11 +651,11 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 	if containerID == "" || !observed.Exists {
 		if !desiredRunning {
 			if m.serviceManager != nil {
-				m.serviceManager.RemoveApp(appInst.Name)
+				m.serviceManager.RemoveApp(appInst.InstanceID)
 			}
 			return nil
 		}
-		def, err := state.GetAppDefinition(appInst.Name)
+		def, err := state.GetAppDefinition(appInst.InstanceID)
 		if err != nil {
 			return err
 		}
@@ -666,7 +667,7 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 			_ = m.containerManager.StopContainer(ctx, runtime, containerID)
 		}
 		if m.serviceManager != nil {
-			m.serviceManager.RemoveApp(appInst.Name)
+			m.serviceManager.RemoveApp(appInst.InstanceID)
 		}
 		return nil
 	}
@@ -674,25 +675,25 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 	// Desired running.
 	if !observed.Running {
 		if err := m.containerManager.StartContainer(ctx, runtime, containerID); err != nil {
-			_ = state.UpdateAppStatus(appInst.Name, "error")
+			_ = state.UpdateAppStatus(appInst.InstanceID, "error")
 			return err
 		}
 	}
 	if appInst.Status != "running" {
-		_ = state.UpdateAppStatus(appInst.Name, "running")
+		_ = state.UpdateAppStatus(appInst.InstanceID, "running")
 	}
 
-	def, err := state.GetAppDefinition(appInst.Name)
+	def, err := state.GetAppDefinition(appInst.InstanceID)
 	if err != nil {
 		return err
 	}
 
 	if m.serviceManager != nil {
-		if err := m.ensureServicesForRunningApp(ctx, def, appInst.Name, containerID, runtime); err != nil {
-			log.Printf("WARN: reconcile app %s: restore services failed: %v", appInst.Name, err)
+		if err := m.ensureServicesForRunningApp(ctx, def, appInst.InstanceID, containerID, runtime); err != nil {
+			log.Printf("WARN: reconcile app %s: restore services failed: %v", appInst.InstanceID, err)
 		}
-		if err := m.ensurePodmanPublishes(ctx, def, appInst.Name, containerID, runtime); err != nil {
-			log.Printf("WARN: reconcile app %s: publish reconcile failed: %v", appInst.Name, err)
+		if err := m.ensurePodmanPublishes(ctx, def, appInst.InstanceID, containerID, runtime); err != nil {
+			log.Printf("WARN: reconcile app %s: publish reconcile failed: %v", appInst.InstanceID, err)
 		}
 	}
 	return nil
@@ -704,36 +705,36 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 	}
 
 	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
-		endpoints, err := m.serviceManager.AllocateForApp(appInst.Name, def.Listeners)
+		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners)
 		if err != nil {
 			return fmt.Errorf("allocate service ports: %w", err)
 		}
-		spec, err := m.appDefToContainerSpec(def, endpoints, layout)
+		spec, err := m.appDefToContainerSpec(def, endpoints, layout, appInst.InstanceID)
 		if err != nil {
-			m.serviceManager.RemoveApp(appInst.Name)
+			m.serviceManager.RemoveApp(appInst.InstanceID)
 			return err
 		}
 		cid, err := m.containerManager.CreateContainer(ctx, runtime, spec)
 		if err == nil {
 			appInst.ContainerID = cid
-			_ = state.UpdateAppRuntime(appInst.Name, "running", cid)
-			m.serviceManager.SetAppContainerID(appInst.Name, cid)
+			_ = state.UpdateAppRuntime(appInst.InstanceID, "running", cid)
+			m.serviceManager.SetAppContainerID(appInst.InstanceID, cid)
 			return nil
 		}
 
 		var nameErr *container.NameInUseError
 		if errors.As(err, &nameErr) {
-			log.Printf("INFO: recreate app %s: adopted existing container %s", appInst.Name, nameErr.ID)
+			log.Printf("INFO: recreate app %s: adopted existing container %s", appInst.InstanceID, nameErr.ID)
 			// Discard speculative port allocation; ensureServicesForRunningApp will restore actual ports.
-			m.serviceManager.RemoveApp(appInst.Name)
+			m.serviceManager.RemoveApp(appInst.InstanceID)
 			appInst.ContainerID = nameErr.ID
-			_ = state.UpdateAppRuntime(appInst.Name, appInst.Status, nameErr.ID)
+			_ = state.UpdateAppRuntime(appInst.InstanceID, appInst.Status, nameErr.ID)
 			return nil
 		}
 
 		var portErr *container.PortInUseError
 		if errors.As(err, &portErr) {
-			log.Printf("WARN: recreate app %s: host port conflict port=%d attempt=%d", appInst.Name, portErr.Port, attempt)
+			log.Printf("WARN: recreate app %s: host port conflict port=%d attempt=%d", appInst.InstanceID, portErr.Port, attempt)
 			if portErr.Port > 0 {
 				_ = m.serviceManager.ReserveHostPort(portErr.Port)
 			} else {
@@ -741,22 +742,22 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 					_ = m.serviceManager.ReserveHostPort(ep.HostBind)
 				}
 			}
-			m.serviceManager.RemoveApp(appInst.Name)
+			m.serviceManager.RemoveApp(appInst.InstanceID)
 			continue
 		}
 
-		m.serviceManager.RemoveApp(appInst.Name)
+		m.serviceManager.RemoveApp(appInst.InstanceID)
 		return err
 	}
 
-	return fmt.Errorf("failed to recreate %s: exhausted host-port retries", appInst.Name)
+	return fmt.Errorf("failed to recreate %s: exhausted host-port retries", appInst.InstanceID)
 }
 
-func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.AppDefinition, appName, containerID string, runtime container.PodmanRuntime) error {
+func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.AppDefinition, instanceID, containerID string, runtime container.PodmanRuntime) error {
 	if m.serviceManager == nil {
 		return nil
 	}
-	if _, err := m.serviceManager.GetByApp(appName); err == nil {
+	if _, err := m.serviceManager.GetByApp(instanceID); err == nil {
 		return nil
 	}
 
@@ -769,28 +770,28 @@ func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.A
 			return nil
 		}
 		// No published ports observed; allocate fresh endpoints. Publish reconciliation happens separately.
-		if _, err := m.serviceManager.AllocateForApp(appName, def.Listeners); err != nil {
+		if _, err := m.serviceManager.AllocateForApp(instanceID, def.Listeners); err != nil {
 			return err
 		}
-		m.serviceManager.SetAppContainerID(appName, containerID)
+		m.serviceManager.SetAppContainerID(instanceID, containerID)
 		return nil
 	}
 
-	if _, err := m.serviceManager.RestoreFromPodman(appName, def.Listeners, ports); err != nil {
+	if _, err := m.serviceManager.RestoreFromPodman(instanceID, def.Listeners, ports); err != nil {
 		return err
 	}
-	m.serviceManager.SetAppContainerID(appName, containerID)
+	m.serviceManager.SetAppContainerID(instanceID, containerID)
 	return nil
 }
 
-func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefinition, appName, containerID string, runtime container.PodmanRuntime) error {
+func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefinition, instanceID, containerID string, runtime container.PodmanRuntime) error {
 	if m.serviceManager == nil {
 		return nil
 	}
 	if def == nil {
 		return fmt.Errorf("app manager: app definition required to reconcile publishes")
 	}
-	endpoints, err := m.serviceManager.GetByApp(appName)
+	endpoints, err := m.serviceManager.GetByApp(instanceID)
 	if err != nil {
 		return nil
 	}
@@ -815,16 +816,16 @@ func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefi
 					if portErr.Port > 0 {
 						conflict = portErr.Port
 					}
-					m.serviceManager.RemoveApp(appName)
+					m.serviceManager.RemoveApp(instanceID)
 					if conflict > 0 {
 						_ = m.serviceManager.ReserveHostPort(conflict)
 					}
 					// Re-allocate endpoints and retry with new host ports.
-					endpoints, err = m.serviceManager.AllocateForApp(appName, def.Listeners)
+					endpoints, err = m.serviceManager.AllocateForApp(instanceID, def.Listeners)
 					if err != nil {
 						return err
 					}
-					m.serviceManager.SetAppContainerID(appName, containerID)
+					m.serviceManager.SetAppContainerID(instanceID, containerID)
 					retry = true
 					return nil
 				}
@@ -849,7 +850,7 @@ func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefi
 					break
 				}
 				if err := m.containerManager.UpdatePublishRemove(ctx, runtime, containerID, host, guest); err != nil {
-					log.Printf("WARN: reconcile app %s: publish remove failed: %v", appName, err)
+					log.Printf("WARN: reconcile app %s: publish remove failed: %v", instanceID, err)
 				}
 			}
 			if retry {
@@ -865,24 +866,25 @@ func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefi
 		for guest, host := range observed {
 			if _, ok := expected[guest]; !ok {
 				if err := m.containerManager.UpdatePublishRemove(ctx, runtime, containerID, host, guest); err != nil {
-					log.Printf("WARN: reconcile app %s: publish remove failed: %v", appName, err)
+					log.Printf("WARN: reconcile app %s: publish remove failed: %v", instanceID, err)
 				}
 			}
 		}
 		return nil
 	}
 
-	return fmt.Errorf("failed to reconcile publishes for %s: exhausted host-port retries", appName)
+	return fmt.Errorf("failed to reconcile publishes for %s: exhausted host-port retries", instanceID)
 }
 
-// Install installs a new application from its definition
-func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
+// Install installs a new application instance from its definition.
+// The displayName parameter is an optional user-friendly name for the instance.
+func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition, displayName string) (*AppInstance, error) {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-	return m.installLocked(ctx, appDef)
+	return m.installLocked(ctx, appDef, displayName)
 }
 
-func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
+func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinition, displayName string) (*AppInstance, error) {
 	if err := m.ensureUnlocked(); err != nil {
 		return nil, err
 	}
@@ -900,41 +902,48 @@ func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinitio
 		return nil, err
 	}
 
-	// Check if app already exists
-	if _, exists := state.GetApp(appDef.Name); exists {
-		return nil, fmt.Errorf("app already exists: %s", appDef.Name)
+	// Generate unique instance ID
+	existingIDs := state.ListInstanceIDs()
+	instanceID, err := GenerateInstanceID(appDef.Name, existingIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate instance ID: %w", err)
 	}
 
-	return m.installWithRetries(ctx, state, appDef, 0)
+	// Validate generated instance ID
+	if err := ValidateInstanceID(instanceID); err != nil {
+		return nil, fmt.Errorf("invalid generated instance ID: %w", err)
+	}
+
+	return m.installWithRetries(ctx, state, appDef, instanceID, displayName, 0)
 }
 
-func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemStateManager, appDef *api.AppDefinition, attempt int) (*AppInstance, error) {
+func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemStateManager, appDef *api.AppDefinition, instanceID, displayName string, attempt int) (*AppInstance, error) {
 	if attempt >= maxInstallPortRetries {
-		return nil, fmt.Errorf("failed to install %s: exhausted host-port retries", appDef.Name)
+		return nil, fmt.Errorf("failed to install %s: exhausted host-port retries", instanceID)
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, appDef.Name)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := m.podmanRuntimeForApp(appDef.Name, layout)
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
 	if err != nil {
 		return nil, err
 	}
 
-	// Allocate services and convert to container spec
-	endpoints, err := m.serviceManager.AllocateForApp(appDef.Name, appDef.Listeners)
+	// Allocate services and convert to container spec using instanceID
+	endpoints, err := m.serviceManager.AllocateForApp(instanceID, appDef.Listeners)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate service ports: %w", err)
 	}
 	cleanupServices := true
 	defer func() {
 		if cleanupServices {
-			m.serviceManager.RemoveApp(appDef.Name)
+			m.serviceManager.RemoveApp(instanceID)
 		}
 	}()
 
-	containerSpec, err := m.appDefToContainerSpec(appDef, endpoints, layout)
+	containerSpec, err := m.appDefToContainerSpec(appDef, endpoints, layout, instanceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create container spec: %w", err)
 	}
@@ -944,12 +953,12 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	mode := piccoloModeFromExtensions(appDef.Extensions)
 	useSnapshot := false
 	if mode == ModeWorkspace {
-		snapshotImage := workspaceSnapshotImage(appDef.Name)
+		snapshotImage := workspaceSnapshotImage(instanceID)
 		exists, err := m.containerManager.ImageExists(ctx, runtime, snapshotImage)
 		if err != nil {
-			log.Printf("WARN: install %s: failed to check snapshot image: %v", appDef.Name, err)
+			log.Printf("WARN: install %s: failed to check snapshot image: %v", instanceID, err)
 		} else if exists {
-			log.Printf("INFO: install %s: using workspace snapshot %s", appDef.Name, snapshotImage)
+			log.Printf("INFO: install %s: using workspace snapshot %s", instanceID, snapshotImage)
 			containerSpec.Image = snapshotImage
 			useSnapshot = true
 		}
@@ -959,7 +968,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	// Skip pull if using a local snapshot image
 	if !useSnapshot {
 		if err := m.containerManager.PullImage(ctx, runtime, appDef.Image); err != nil {
-			log.Printf("WARN: install %s: image pull failed: %v", appDef.Name, err)
+			log.Printf("WARN: install %s: image pull failed: %v", instanceID, err)
 			// Proceeding anyway as CreateContainer might succeed if local, or fail with same error
 		}
 	}
@@ -983,12 +992,12 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		var nameErr *container.NameInUseError
 		if errors.As(err, &nameErr) {
 			zombieID = nameErr.ID
-		} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, appDef.Name); resolveErr == nil {
+		} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, instanceID); resolveErr == nil {
 			zombieID = id
 		}
 
 		if zombieID != "" {
-			log.Printf("INFO: install %s: removing zombie container %s", appDef.Name, zombieID)
+			log.Printf("INFO: install %s: removing zombie container %s", instanceID, zombieID)
 			_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
 			// Continue loop to retry creation
 			continue
@@ -1002,8 +1011,8 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		var portErr *container.PortInUseError
 		if errors.As(err, &portErr) {
 			cleanupServices = false
-			m.serviceManager.RemoveApp(appDef.Name)
-			log.Printf("WARN: retrying install for %s due to host port conflict port=%d attempt=%d", appDef.Name, portErr.Port, attempt)
+			m.serviceManager.RemoveApp(instanceID)
+			log.Printf("WARN: retrying install for %s due to host port conflict port=%d attempt=%d", instanceID, portErr.Port, attempt)
 			if portErr.Port > 0 {
 				_ = m.serviceManager.ReserveHostPort(portErr.Port)
 			} else {
@@ -1011,7 +1020,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 					_ = m.serviceManager.ReserveHostPort(ep.HostBind)
 				}
 			}
-			return m.installWithRetries(ctx, state, appDef, attempt+1)
+			return m.installWithRetries(ctx, state, appDef, instanceID, displayName, attempt+1)
 		}
 
 		return nil, fmt.Errorf("failed to create container: %w", err)
@@ -1028,13 +1037,15 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 
 	// Record container ID for watcher reconciliation
 	if m.serviceManager != nil {
-		m.serviceManager.SetAppContainerID(appDef.Name, containerID)
+		m.serviceManager.SetAppContainerID(instanceID, containerID)
 	}
 
-	// Create app instance
+	// Create app instance with instance-aware fields
 	now := time.Now()
 	app := &AppInstance{
-		Name:        appDef.Name,
+		InstanceID:  instanceID,
+		DisplayName: displayName,
+		AppName:     appDef.Name,
 		Image:       appDef.Image,
 		Type:        appDef.Type,
 		Status:      "running",
@@ -1049,7 +1060,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		// Cleanup container if storage fails
 		_ = m.containerManager.StopContainer(ctx, runtime, containerID)
 		_ = m.containerManager.RemoveContainer(ctx, runtime, containerID)
-		m.serviceManager.RemoveApp(appDef.Name)
+		m.serviceManager.RemoveApp(instanceID)
 		cleanupServices = false
 		return nil, fmt.Errorf("failed to store app: %w", err)
 	}
@@ -1059,66 +1070,11 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	return app, nil
 }
 
-// Upsert installs or updates an application by name. If the app exists, it is uninstalled and reinstalled.
+// Upsert installs a new application instance.
+// Deprecated: With multi-instance support, use Install() directly.
+// This method now always creates a new instance (no update behavior).
 func (m *AppManager) Upsert(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
-	return m.upsertLocked(ctx, appDef)
-}
-
-func (m *AppManager) upsertLocked(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
-	if err := m.ensureUnlocked(); err != nil {
-		return nil, err
-	}
-	if err := m.ensureKernelLeader(); err != nil {
-		return nil, err
-	}
-	state, err := m.ensureStateManager()
-	if err != nil {
-		return nil, err
-	}
-	if existing, exists := state.GetApp(appDef.Name); exists {
-		layout, err := m.ensureAppVolumeLayout(ctx, appDef.Name)
-		if err != nil {
-			return nil, err
-		}
-		runtime, err := m.podmanRuntimeForApp(appDef.Name, layout)
-		if err != nil {
-			return nil, err
-		}
-
-		// Reconcile listeners first
-		rec, containerChange, err := m.serviceManager.Reconcile(appDef.Name, appDef.Listeners)
-		if err != nil {
-			return nil, fmt.Errorf("failed to reconcile services: %w", err)
-		}
-
-		// Try in-place publish updates via Podman for adds/removes/guest port changes
-		// Added
-		for _, ep := range rec.Added {
-			_ = m.containerManager.UpdatePublishAdd(ctx, runtime, existing.ContainerID, ep.HostBind, ep.GuestPort)
-		}
-		// Guest port changes: add new mapping, then remove old
-		for _, ch := range rec.GuestPortChanged {
-			_ = m.containerManager.UpdatePublishAdd(ctx, runtime, existing.ContainerID, ch.New.HostBind, ch.New.GuestPort)
-			_ = m.containerManager.UpdatePublishRemove(ctx, runtime, existing.ContainerID, ch.Old.HostBind, ch.Old.GuestPort)
-		}
-		// Removed
-		for _, ep := range rec.Removed {
-			_ = m.containerManager.UpdatePublishRemove(ctx, runtime, existing.ContainerID, ep.HostBind, ep.GuestPort)
-		}
-
-		if containerChange {
-			// If some podman updates failed silently, a full recreate could be a fallback in future.
-		}
-
-		// Persist new app.yaml and metadata
-		if err := state.StoreApp(existing, appDef); err != nil {
-			return nil, fmt.Errorf("failed to store app: %w", err)
-		}
-		return existing, nil
-	}
-	return m.installLocked(ctx, appDef)
+	return m.Install(ctx, appDef, "")
 }
 
 // List returns all installed applications
@@ -1130,37 +1086,37 @@ func (m *AppManager) List(ctx context.Context) ([]*AppInstance, error) {
 	return state.ListApps(), nil
 }
 
-// Get returns a specific application by name
-func (m *AppManager) Get(ctx context.Context, name string) (*AppInstance, error) {
+// Get returns a specific application instance by instanceID.
+func (m *AppManager) Get(ctx context.Context, instanceID string) (*AppInstance, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return nil, err
 	}
-	app, exists := state.GetApp(name)
+	app, exists := state.GetApp(instanceID)
 	if !exists {
-		return nil, fmt.Errorf("app not found: %s", name)
+		return nil, fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
 	return app, nil
 }
 
-// GetAppDefinition returns the full definition (app.yaml content) for an installed app.
-func (m *AppManager) GetAppDefinition(ctx context.Context, name string) (*api.AppDefinition, error) {
+// GetAppDefinition returns the full definition (app.yaml content) for an installed app instance.
+func (m *AppManager) GetAppDefinition(ctx context.Context, instanceID string) (*api.AppDefinition, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return nil, err
 	}
-	return state.GetAppDefinition(name)
+	return state.GetAppDefinition(instanceID)
 }
 
-// Start starts an application
-func (m *AppManager) Start(ctx context.Context, name string) error {
+// Start starts an application instance by instanceID.
+func (m *AppManager) Start(ctx context.Context, instanceID string) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-	return m.startLocked(ctx, name)
+	return m.startLocked(ctx, instanceID)
 }
 
-func (m *AppManager) startLocked(ctx context.Context, name string) error {
+func (m *AppManager) startLocked(ctx context.Context, instanceID string) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1171,16 +1127,16 @@ func (m *AppManager) startLocked(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	app, exists := state.GetApp(name)
+	app, exists := state.GetApp(instanceID)
 	if !exists {
-		return fmt.Errorf("app not found: %s", name)
+		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, name)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(name, layout)
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
 	if err != nil {
 		return err
 	}
@@ -1188,31 +1144,31 @@ func (m *AppManager) startLocked(ctx context.Context, name string) error {
 	// Start the container
 	if err := m.containerManager.StartContainer(ctx, runtime, app.ContainerID); err != nil {
 		// Update status to error
-		_ = state.UpdateAppStatus(name, "error")
+		_ = state.UpdateAppStatus(instanceID, "error")
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 
 	// Update status to running
-	if err := state.UpdateAppStatus(name, "running"); err != nil {
+	if err := state.UpdateAppStatus(instanceID, "running"); err != nil {
 		return fmt.Errorf("failed to update app status: %w", err)
 	}
 
 	// Rehydrate service proxies if they were removed while the app was stopped
-	if _, err := m.serviceManager.GetByApp(name); err != nil {
-		def, defErr := state.GetAppDefinition(name)
+	if _, err := m.serviceManager.GetByApp(instanceID); err != nil {
+		def, defErr := state.GetAppDefinition(instanceID)
 		if defErr != nil {
-			log.Printf("WARN: start app %s: failed to load app definition: %v", name, defErr)
+			log.Printf("WARN: start app %s: failed to load app definition: %v", instanceID, defErr)
 		} else {
 			ports, portErr := m.containerManager.InspectPublishedPorts(ctx, runtime, app.ContainerID)
 			if portErr != nil {
-				log.Printf("WARN: start app %s: inspect ports failed: %v", name, portErr)
+				log.Printf("WARN: start app %s: inspect ports failed: %v", instanceID, portErr)
 			} else if len(ports) == 0 {
-				log.Printf("WARN: start app %s: no published ports found during restore", name)
+				log.Printf("WARN: start app %s: no published ports found during restore", instanceID)
 			} else {
-				if _, restoreErr := m.serviceManager.RestoreFromPodman(name, def.Listeners, ports); restoreErr != nil {
-					log.Printf("WARN: start app %s: failed to restore services: %v", name, restoreErr)
+				if _, restoreErr := m.serviceManager.RestoreFromPodman(instanceID, def.Listeners, ports); restoreErr != nil {
+					log.Printf("WARN: start app %s: failed to restore services: %v", instanceID, restoreErr)
 				} else {
-					m.serviceManager.SetAppContainerID(name, app.ContainerID)
+					m.serviceManager.SetAppContainerID(instanceID, app.ContainerID)
 				}
 			}
 		}
@@ -1221,8 +1177,8 @@ func (m *AppManager) startLocked(ctx context.Context, name string) error {
 	return nil
 }
 
-// Stop stops an application
-func (m *AppManager) Stop(ctx context.Context, name string) error {
+// Stop stops an application instance by instanceID.
+func (m *AppManager) Stop(ctx context.Context, instanceID string) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 
@@ -1232,24 +1188,24 @@ func (m *AppManager) Stop(ctx context.Context, name string) error {
 	if err := m.ensureKernelLeader(); err != nil {
 		return err
 	}
-	return m.stopInternal(ctx, name)
+	return m.stopInternal(ctx, instanceID)
 }
 
-func (m *AppManager) stopForFollowerTransition(ctx context.Context, name string) error {
+func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID string) error {
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return err
 	}
-	app, exists := state.GetApp(name)
+	app, exists := state.GetApp(instanceID)
 	if !exists {
 		return nil
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, name)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(name, layout)
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
 	if err != nil {
 		return err
 	}
@@ -1261,65 +1217,65 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, name string)
 		}
 	}
 	if m.serviceManager != nil {
-		m.serviceManager.RemoveApp(name)
+		m.serviceManager.RemoveApp(instanceID)
 	}
 	return nil
 }
 
-func (m *AppManager) stopInternal(ctx context.Context, name string) error {
+func (m *AppManager) stopInternal(ctx context.Context, instanceID string) error {
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return err
 	}
-	app, exists := state.GetApp(name)
+	app, exists := state.GetApp(instanceID)
 	if !exists {
-		return fmt.Errorf("app not found: %s", name)
+		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, name)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(name, layout)
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
 	if err != nil {
 		return err
 	}
 
 	if err := m.containerManager.StopContainer(ctx, runtime, app.ContainerID); err != nil {
-		_ = state.UpdateAppStatus(name, "error")
+		_ = state.UpdateAppStatus(instanceID, "error")
 		return fmt.Errorf("failed to stop container: %w", err)
 	}
 
-	if err := state.UpdateAppStatus(name, "stopped"); err != nil {
+	if err := state.UpdateAppStatus(instanceID, "stopped"); err != nil {
 		return fmt.Errorf("failed to update app status: %w", err)
 	}
 
 	if m.serviceManager != nil {
-		m.serviceManager.RemoveApp(name)
+		m.serviceManager.RemoveApp(instanceID)
 	}
 
 	return nil
 }
 
-// Uninstall removes an application completely
-func (m *AppManager) Uninstall(ctx context.Context, name string) error {
+// Uninstall removes an application instance completely by instanceID.
+func (m *AppManager) Uninstall(ctx context.Context, instanceID string) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
 	if err := m.ensureKernelLeader(); err != nil {
 		return err
 	}
-	return m.UninstallWithOptions(ctx, name, false)
+	return m.UninstallWithOptions(ctx, instanceID, false)
 }
 
-// UninstallWithOptions removes an application; when purge is true, also deletes app data directories
-func (m *AppManager) UninstallWithOptions(ctx context.Context, name string, purge bool) error {
+// UninstallWithOptions removes an application instance; when purge is true, also deletes app data directories.
+func (m *AppManager) UninstallWithOptions(ctx context.Context, instanceID string, purge bool) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-	return m.uninstallLocked(ctx, name, purge)
+	return m.uninstallLocked(ctx, instanceID, purge)
 }
 
-func (m *AppManager) uninstallLocked(ctx context.Context, name string, purge bool) error {
+func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, purge bool) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1330,16 +1286,16 @@ func (m *AppManager) uninstallLocked(ctx context.Context, name string, purge boo
 	if err != nil {
 		return err
 	}
-	app, exists := state.GetApp(name)
+	app, exists := state.GetApp(instanceID)
 	if !exists {
-		return fmt.Errorf("app not found: %s", name)
+		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, name)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(name, layout)
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
 	if err != nil {
 		return err
 	}
@@ -1350,15 +1306,15 @@ func (m *AppManager) uninstallLocked(ctx context.Context, name string, purge boo
 	// For workspace mode without purge, commit container state to snapshot image.
 	// This preserves the container filesystem so it can be restored on reinstall.
 	if !purge {
-		def, defErr := state.GetAppDefinition(name)
+		def, defErr := state.GetAppDefinition(instanceID)
 		if defErr == nil {
 			mode := piccoloModeFromExtensions(def.Extensions)
 			if mode == ModeWorkspace && app.ContainerID != "" {
-				snapshotImage := workspaceSnapshotImage(name)
+				snapshotImage := workspaceSnapshotImage(instanceID)
 				if err := m.containerManager.CommitContainer(ctx, runtime, app.ContainerID, snapshotImage); err != nil {
-					log.Printf("WARN: workspace %s: failed to commit snapshot: %v", name, err)
+					log.Printf("WARN: workspace %s: failed to commit snapshot: %v", instanceID, err)
 				} else {
-					log.Printf("INFO: workspace %s: committed snapshot to %s", name, snapshotImage)
+					log.Printf("INFO: workspace %s: committed snapshot to %s", instanceID, snapshotImage)
 				}
 			}
 		}
@@ -1371,17 +1327,17 @@ func (m *AppManager) uninstallLocked(ctx context.Context, name string, purge boo
 
 	// Stop and remove service listeners for this app
 	if m.serviceManager != nil {
-		m.serviceManager.RemoveApp(name)
+		m.serviceManager.RemoveApp(instanceID)
 	}
 
 	// Optionally purge app data (destroy volume and podman runtime state)
 	if purge {
 		// Reset podman storage to clean up any remaining containers
 		if err := m.containerManager.ResetStorage(ctx, runtime); err != nil {
-			log.Printf("WARN: podman storage reset for %s failed: %v", name, err)
+			log.Printf("WARN: podman storage reset for %s failed: %v", instanceID, err)
 		}
 
-		volID := appVolumeID(name)
+		volID := appVolumeID(instanceID)
 		if err := m.volumeManager.DestroyVolume(ctx, volID); err != nil {
 			return fmt.Errorf("failed to purge app data: %w", err)
 		}
@@ -1393,15 +1349,15 @@ func (m *AppManager) uninstallLocked(ctx context.Context, name string, purge boo
 	}
 
 	// Remove from filesystem and cache (state only)
-	if err := state.RemoveApp(name); err != nil {
+	if err := state.RemoveApp(instanceID); err != nil {
 		return fmt.Errorf("failed to remove app from storage: %w", err)
 	}
 
 	return nil
 }
 
-// Enable enables an application (systemctl-style)
-func (m *AppManager) Enable(ctx context.Context, name string) error {
+// Enable enables an application instance (systemctl-style) by instanceID.
+func (m *AppManager) Enable(ctx context.Context, instanceID string) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1412,15 +1368,15 @@ func (m *AppManager) Enable(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	if _, exists := state.GetApp(name); !exists {
-		return fmt.Errorf("app not found: %s", name)
+	if _, exists := state.GetApp(instanceID); !exists {
+		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
-	return state.EnableApp(name)
+	return state.EnableApp(instanceID)
 }
 
-// Disable disables an application (systemctl-style)
-func (m *AppManager) Disable(ctx context.Context, name string) error {
+// Disable disables an application instance (systemctl-style) by instanceID.
+func (m *AppManager) Disable(ctx context.Context, instanceID string) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1431,27 +1387,27 @@ func (m *AppManager) Disable(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	if _, exists := state.GetApp(name); !exists {
-		return fmt.Errorf("app not found: %s", name)
+	if _, exists := state.GetApp(instanceID); !exists {
+		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
-	return state.DisableApp(name)
+	return state.DisableApp(instanceID)
 }
 
-// IsEnabled checks if an application is enabled
-func (m *AppManager) IsEnabled(ctx context.Context, name string) (bool, error) {
+// IsEnabled checks if an application instance is enabled by instanceID.
+func (m *AppManager) IsEnabled(ctx context.Context, instanceID string) (bool, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return false, err
 	}
-	if _, exists := state.GetApp(name); !exists {
-		return false, fmt.Errorf("app not found: %s", name)
+	if _, exists := state.GetApp(instanceID); !exists {
+		return false, fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
-	return state.IsAppEnabled(name), nil
+	return state.IsAppEnabled(instanceID), nil
 }
 
-// ListEnabled returns names of all enabled apps
+// ListEnabled returns instanceIDs of all enabled app instances.
 func (m *AppManager) ListEnabled(ctx context.Context) ([]string, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
@@ -1460,14 +1416,14 @@ func (m *AppManager) ListEnabled(ctx context.Context) ([]string, error) {
 	return state.ListEnabledApps()
 }
 
-// UpdateImage updates an app's container image tag and recreates the container preserving services
-func (m *AppManager) UpdateImage(ctx context.Context, name string, tag *string) error {
+// UpdateImage updates an app instance's container image tag and recreates the container preserving services.
+func (m *AppManager) UpdateImage(ctx context.Context, instanceID string, tag *string) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-	return m.updateImageLocked(ctx, name, tag)
+	return m.updateImageLocked(ctx, instanceID, tag)
 }
 
-func (m *AppManager) updateImageLocked(ctx context.Context, name string, tag *string) error {
+func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, tag *string) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1478,20 +1434,20 @@ func (m *AppManager) updateImageLocked(ctx context.Context, name string, tag *st
 	if err != nil {
 		return err
 	}
-	appInst, exists := state.GetApp(name)
+	appInst, exists := state.GetApp(instanceID)
 	if !exists {
-		return fmt.Errorf("app not found: %s", name)
+		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
-	layout, err := m.ensureAppVolumeLayout(ctx, name)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(name, layout)
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
 	if err != nil {
 		return err
 	}
 	// Load current app definition
-	curDef, err := state.GetAppDefinition(name)
+	curDef, err := state.GetAppDefinition(instanceID)
 	if err != nil {
 		return fmt.Errorf("failed to read current app.yaml: %w", err)
 	}
@@ -1525,18 +1481,18 @@ func (m *AppManager) updateImageLocked(ctx context.Context, name string, tag *st
 	if err := ValidateAppDefinition(&newDef); err != nil {
 		return fmt.Errorf("invalid new app definition: %w", err)
 	}
-	if err := state.BackupCurrentAppDefinition(name); err != nil {
+	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
 		return fmt.Errorf("backup app.yaml: %w", err)
 	}
 	// Pull image to app's storage (best effort)
 	_ = m.containerManager.PullImage(ctx, runtime, newImage)
 	// Preserve endpoints
-	endpoints, _ := m.serviceManager.GetByApp(name)
+	endpoints, _ := m.serviceManager.GetByApp(instanceID)
 	// Stop and remove old container
 	_ = m.containerManager.StopContainer(ctx, runtime, appInst.ContainerID)
 	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.ContainerID)
 	// Create new container with same endpoints
-	spec, err := m.appDefToContainerSpec(&newDef, endpoints, layout)
+	spec, err := m.appDefToContainerSpec(&newDef, endpoints, layout, instanceID)
 	if err != nil {
 		return fmt.Errorf("build container spec: %w", err)
 	}
@@ -1545,7 +1501,7 @@ func (m *AppManager) updateImageLocked(ctx context.Context, name string, tag *st
 		return fmt.Errorf("create container: %w", err)
 	}
 	if m.serviceManager != nil {
-		m.serviceManager.SetAppContainerID(name, newCID)
+		m.serviceManager.SetAppContainerID(instanceID, newCID)
 	}
 	// Update instance and persist app.yaml + metadata
 	appInst.Image = newImage
@@ -1558,14 +1514,14 @@ func (m *AppManager) updateImageLocked(ctx context.Context, name string, tag *st
 	return nil
 }
 
-// Revert reverts an app to the previous app.yaml (if available) and recreates container
-func (m *AppManager) Revert(ctx context.Context, name string) error {
+// Revert reverts an app instance to the previous app.yaml (if available) and recreates container.
+func (m *AppManager) Revert(ctx context.Context, instanceID string) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-	return m.revertLocked(ctx, name)
+	return m.revertLocked(ctx, instanceID)
 }
 
-func (m *AppManager) revertLocked(ctx context.Context, name string) error {
+func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1573,29 +1529,29 @@ func (m *AppManager) revertLocked(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	appInst, exists := state.GetApp(name)
+	appInst, exists := state.GetApp(instanceID)
 	if !exists {
-		return fmt.Errorf("app not found: %s", name)
+		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
-	layout, err := m.ensureAppVolumeLayout(ctx, name)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(name, layout)
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
 	if err != nil {
 		return err
 	}
 	// Read previous def
-	prevDef, err := state.GetPreviousAppDefinition(name)
+	prevDef, err := state.GetPreviousAppDefinition(instanceID)
 	if err != nil {
 		return fmt.Errorf("no previous version to revert to: %w", err)
 	}
 	// Backup current before writing previous
-	if err := state.BackupCurrentAppDefinition(name); err != nil {
+	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
 		return fmt.Errorf("backup current: %w", err)
 	}
 	// Preserve endpoints
-	endpoints, _ := m.serviceManager.GetByApp(name)
+	endpoints, _ := m.serviceManager.GetByApp(instanceID)
 	// Stop and remove current container
 	_ = m.containerManager.StopContainer(ctx, runtime, appInst.ContainerID)
 	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.ContainerID)
@@ -1604,7 +1560,7 @@ func (m *AppManager) revertLocked(ctx context.Context, name string) error {
 		_ = m.containerManager.PullImage(ctx, runtime, prevDef.Image)
 	}
 	// Create new container from prev
-	spec, err := m.appDefToContainerSpec(prevDef, endpoints, layout)
+	spec, err := m.appDefToContainerSpec(prevDef, endpoints, layout, instanceID)
 	if err != nil {
 		return fmt.Errorf("build container spec: %w", err)
 	}
@@ -1613,7 +1569,7 @@ func (m *AppManager) revertLocked(ctx context.Context, name string) error {
 		return fmt.Errorf("create container: %w", err)
 	}
 	if m.serviceManager != nil {
-		m.serviceManager.SetAppContainerID(name, newCID)
+		m.serviceManager.SetAppContainerID(instanceID, newCID)
 	}
 	// Update instance and persist prev as current
 	appInst.Image = prevDef.Image
@@ -1626,24 +1582,24 @@ func (m *AppManager) revertLocked(ctx context.Context, name string) error {
 	return nil
 }
 
-// Logs fetches recent container logs for an app
-func (m *AppManager) Logs(ctx context.Context, name string, lines int) ([]string, error) {
+// Logs fetches recent container logs for an app instance by instanceID.
+func (m *AppManager) Logs(ctx context.Context, instanceID string, lines int) ([]string, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return nil, err
 	}
-	appInst, exists := state.GetApp(name)
+	appInst, exists := state.GetApp(instanceID)
 	if !exists {
-		return nil, fmt.Errorf("app not found: %s", name)
+		return nil, fmt.Errorf("app instance not found: %s", instanceID)
 	}
 	if lines <= 0 {
 		lines = 200
 	}
-	layout, err := m.ensureAppVolumeLayout(ctx, name)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := m.podmanRuntimeForApp(name, layout)
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
 	if err != nil {
 		return nil, err
 	}
@@ -1652,9 +1608,10 @@ func (m *AppManager) Logs(ctx context.Context, name string, lines int) ([]string
 
 // appDefToContainerSpec converts an AppDefinition to a ContainerCreateSpec.
 // storage volumes are mapped into the per-app encrypted volume at <mount>/data/<volume-name>.
-func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints []services.ServiceEndpoint, layout appVolumeLayout) (container.ContainerCreateSpec, error) {
+// The instanceID parameter is the unique instance identifier used for container naming.
+func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints []services.ServiceEndpoint, layout appVolumeLayout, instanceID string) (container.ContainerCreateSpec, error) {
 	spec := container.ContainerCreateSpec{
-		Name:        appDef.Name,
+		Name:        instanceID,
 		Image:       appDef.Image,
 		Environment: appDef.Environment,
 	}
@@ -1745,11 +1702,11 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 
 // purgeAppData removes all app data within the per-app encrypted volume.
 // This is best-effort and is only intended to run when uninstalling with purge=true.
-func (m *AppManager) purgeAppData(ctx context.Context, name string) error {
+func (m *AppManager) purgeAppData(ctx context.Context, instanceID string) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
-	layout, err := m.ensureAppVolumeLayout(ctx, name)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return err
 	}
