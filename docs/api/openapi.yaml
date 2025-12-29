@@ -139,6 +139,32 @@ paths:
           schema: { type: string }
       responses:
         '200': { description: OK }
+  /apps/{name}/listeners:
+    patch:
+      summary: Update app listeners
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                listeners:
+                  type: array
+                  items: { $ref: '#/components/schemas/AppListener' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResponseAppListenersUpdate' }
+        '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '404': { description: Not Found, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
   /apps/{name}/logs:
     get:
       summary: Get recent logs for an app
@@ -1013,6 +1039,34 @@ components:
         container: { type: string }
         host: { type: string }
         size_limit: { type: string }
+    AppListener:
+      type: object
+      properties:
+        name: { type: string }
+        guest_port: { type: integer }
+        flow: { type: string, enum: [tcp, tls], nullable: true }
+        protocol: { type: string, enum: [raw, http, websocket], nullable: true }
+        protocol_middleware:
+          type: array
+          items: { $ref: '#/components/schemas/AppProtocolMiddleware' }
+        remote_ports:
+          type: array
+          items: { type: integer }
+    AppProtocolMiddleware:
+      type: object
+      properties:
+        name: { type: string }
+        params: { type: object, additionalProperties: { type: object } }
+    ResponseAppListenersUpdate:
+      type: object
+      properties:
+        instance_id: { type: string }
+        status: { type: string }
+        listeners_updated: { type: boolean }
+        container_recreated: { type: boolean }
+        endpoints:
+          type: array
+          items: { $ref: '#/components/schemas/ServiceEndpoint' }
     ServiceEndpoint:
       type: object
       properties:

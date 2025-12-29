@@ -335,7 +335,8 @@ type App struct {
 	Name        string `json:"name"`
 	Image       string `json:"image"`
 	Type        string `json:"type"`
-	Status      string `json:"status"` // "running", "stopped", "error"
+	Mode        string `json:"mode,omitempty"` // "workspace" or "service"
+	Status      string `json:"status"`         // "running", "stopped", "error"
 	ContainerID string `json:"container_id,omitempty"`
 	// Legacy Ports removed
 	Volumes     []AppVolume       `json:"volumes,omitempty"`

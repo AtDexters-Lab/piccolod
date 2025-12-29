@@ -1006,6 +1006,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		AppName:     appDef.Name,
 		Image:       appDef.Image,
 		Type:        appDef.Type,
+		Mode:        string(mode),
 		Status:      "running",
 		ContainerID: containerID,
 		Environment: appDef.Environment,
@@ -1466,10 +1467,196 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	appInst.ContainerID = newCID
 	appInst.Status = "created"
 	appInst.UpdatedAt = time.Now()
+	// Mode comes from definition which might have updated extensions
+	mode := piccoloModeFromExtensions(newDef.Extensions)
+	if mode != ModeUnknown {
+		appInst.Mode = string(mode)
+	}
 	if err := state.StoreApp(appInst, &newDef); err != nil {
 		return fmt.Errorf("store app: %w", err)
 	}
 	return nil
+}
+
+// UpdateListeners updates an app instance's listeners and recreates the container if necessary.
+func (m *AppManager) UpdateListeners(ctx context.Context, instanceID string, listeners []api.AppListener) (*api.AppDefinition, error) {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	return m.updateListenersLocked(ctx, instanceID, listeners)
+}
+
+func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID string, listeners []api.AppListener) (*api.AppDefinition, error) {
+	if err := m.ensureUnlocked(); err != nil {
+		return nil, err
+	}
+	if err := m.ensureKernelLeader(); err != nil {
+		return nil, err
+	}
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return nil, err
+	}
+	appInst, exists := state.GetApp(instanceID)
+	if !exists {
+		return nil, fmt.Errorf("app instance not found: %s", instanceID)
+	}
+
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
+	if err != nil {
+		return nil, err
+	}
+
+	// Load current app definition
+	curDef, err := state.GetAppDefinition(instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read current app.yaml: %w", err)
+	}
+
+	// Prepare new definition
+	newDef := *curDef
+	newDef.Listeners = listeners
+
+	// Check mode - listener updates are only supported for workspace apps
+	mode := piccoloModeFromExtensions(curDef.Extensions)
+	if mode != ModeWorkspace {
+		return nil, fmt.Errorf("listener updates are only supported for workspace mode apps")
+	}
+
+	// Validate new definition
+	if err := ValidateAppDefinition(&newDef); err != nil {
+		return nil, fmt.Errorf("invalid listener configuration: %w", err)
+	}
+
+	// Backup current definition
+	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
+		return nil, fmt.Errorf("backup app.yaml: %w", err)
+	}
+
+	// Reconcile services
+	result, containerChange, err := m.serviceManager.Reconcile(instanceID, listeners)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reconcile services: %w", err)
+	}
+
+	needsRecreation := containerChange || len(result.Added) > 0 || len(result.Removed) > 0
+
+	if needsRecreation {
+		// Snapshot workspace (always performed for workspace apps)
+		if appInst.ContainerID != "" {
+			snapshotImage := workspaceSnapshotImage(instanceID)
+			if err := m.containerManager.CommitContainer(ctx, runtime, appInst.ContainerID, snapshotImage); err != nil {
+				return nil, fmt.Errorf("failed to snapshot workspace before update: %w", err)
+			}
+			log.Printf("INFO: update listeners %s: committed snapshot to %s", instanceID, snapshotImage)
+		}
+
+		// Stop and remove old container
+		_ = m.containerManager.StopContainer(ctx, runtime, appInst.ContainerID)
+		_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.ContainerID)
+
+		// Create new container with updated endpoints
+		var newCID string
+		spec, err := m.appDefToContainerSpec(&newDef, result.Endpoints, layout, instanceID)
+		if err == nil {
+			// Use snapshot (always for workspace apps)
+			snapshotImage := workspaceSnapshotImage(instanceID)
+			exists, imgErr := m.containerManager.ImageExists(ctx, runtime, snapshotImage)
+			if imgErr == nil && exists {
+				spec.Image = snapshotImage
+			}
+			newCID, err = m.containerManager.CreateContainer(ctx, runtime, spec)
+		}
+
+		if err != nil {
+			// Attempt rollback
+			log.Printf("WARN: update listeners %s: creation failed: %v. Rolling back...", instanceID, err)
+
+			// 1. Revert ports
+			rbResult, _, rbErr := m.serviceManager.Reconcile(instanceID, curDef.Listeners)
+			if rbErr != nil {
+				log.Printf("ERROR: update listeners %s: port rollback failed: %v", instanceID, rbErr)
+				appInst.Status = "error"
+				appInst.ContainerID = ""
+				_ = state.StoreApp(appInst, curDef)
+				return nil, fmt.Errorf("update failed: %w; rollback failed (ports): %v", err, rbErr)
+			}
+
+			// 2. Rebuild old spec
+			rbSpec, rbErr := m.appDefToContainerSpec(curDef, rbResult.Endpoints, layout, instanceID)
+			if rbErr != nil {
+				log.Printf("ERROR: update listeners %s: spec rollback failed: %v", instanceID, rbErr)
+				appInst.Status = "error"
+				appInst.ContainerID = ""
+				_ = state.StoreApp(appInst, curDef)
+				return nil, fmt.Errorf("update failed: %w; rollback failed (spec): %v", err, rbErr)
+			}
+
+			// Restore snapshot image
+			snap := workspaceSnapshotImage(instanceID)
+			if exists, _ := m.containerManager.ImageExists(ctx, runtime, snap); exists {
+				rbSpec.Image = snap
+			}
+
+			// 3. Create old container
+			rbCID, rbErr := m.containerManager.CreateContainer(ctx, runtime, rbSpec)
+			if rbErr != nil {
+				log.Printf("ERROR: update listeners %s: container rollback failed: %v", instanceID, rbErr)
+				appInst.Status = "error"
+				appInst.ContainerID = ""
+				_ = state.StoreApp(appInst, curDef)
+				return nil, fmt.Errorf("update failed: %w; rollback failed (create): %v", err, rbErr)
+			}
+
+			// 4. Start old container
+			if rbErr := m.containerManager.StartContainer(ctx, runtime, rbCID); rbErr != nil {
+				log.Printf("ERROR: update listeners %s: start rollback failed: %v", instanceID, rbErr)
+				appInst.Status = "error"
+				appInst.ContainerID = rbCID // It exists but failed to start
+				_ = state.StoreApp(appInst, curDef)
+				return nil, fmt.Errorf("update failed: %w; rollback failed (start): %v", err, rbErr)
+			}
+
+			// Rollback successful
+			log.Printf("INFO: update listeners %s: rollback successful", instanceID)
+			if m.serviceManager != nil {
+				m.serviceManager.SetAppContainerID(instanceID, rbCID)
+			}
+			appInst.ContainerID = rbCID
+			appInst.Status = "running"
+			// Save the restored state to ensure persistence of new CID
+			if saveErr := state.StoreApp(appInst, curDef); saveErr != nil {
+				log.Printf("WARN: update listeners %s: failed to save rollback state: %v", instanceID, saveErr)
+			}
+
+			return nil, fmt.Errorf("update failed: %w (rolled back to previous state)", err)
+		}
+
+		if m.serviceManager != nil {
+			m.serviceManager.SetAppContainerID(instanceID, newCID)
+		}
+
+		// Update instance
+		appInst.ContainerID = newCID
+
+		// Start container automatically
+		if err := m.containerManager.StartContainer(ctx, runtime, newCID); err != nil {
+			appInst.Status = "error"
+			log.Printf("WARN: update listeners %s: failed to start new container: %v", instanceID, err)
+		} else {
+			appInst.Status = "running"
+		}
+	}
+
+	appInst.UpdatedAt = time.Now()
+	if err := state.StoreApp(appInst, &newDef); err != nil {
+		return nil, fmt.Errorf("store app: %w", err)
+	}
+
+	return &newDef, nil
 }
 
 // Revert reverts an app instance to the previous app.yaml (if available) and recreates container.
@@ -1534,6 +1721,11 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	appInst.ContainerID = newCID
 	appInst.Status = "created"
 	appInst.UpdatedAt = time.Now()
+	// Restore mode if available, although it shouldn't change between versions ideally
+	mode := piccoloModeFromExtensions(prevDef.Extensions)
+	if mode != ModeUnknown {
+		appInst.Mode = string(mode)
+	}
 	if err := state.StoreApp(appInst, prevDef); err != nil {
 		return fmt.Errorf("store app: %w", err)
 	}

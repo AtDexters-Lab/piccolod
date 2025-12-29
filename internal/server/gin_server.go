@@ -657,6 +657,7 @@ func (s *GinServer) setupGinRoutes() {
 			apps.GET("/:name", s.handleGinAppGet)                               // GET /api/v1/apps/:name
 			apps.DELETE("/:name", s.requireUnlocked(), s.handleGinAppUninstall) // DELETE /api/v1/apps/:name
 			apps.GET("/:name/services", s.handleGinServicesByApp)
+			apps.PATCH("/:name/listeners", s.requireUnlocked(), s.handleGinAppUpdateListeners)
 
 			// App actions
 			apps.POST("/:name/start", s.requireUnlocked(), s.handleGinAppStart) // POST /api/v1/apps/:name/start

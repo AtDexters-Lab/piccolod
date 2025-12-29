@@ -90,6 +90,20 @@ class ApiClient {
     return _handleResponse(response);
   }
 
+  Future<dynamic> patch(String path, {Object? body}) async {
+    if (_csrfToken == null) {
+      await fetchCsrfToken();
+    }
+
+    final uri = _buildUri(path);
+    final response = await _client.patch(
+      uri,
+      headers: _getHeaders(contentType: 'application/json'),
+      body: body != null ? jsonEncode(body) : null,
+    );
+    return _handleResponse(response);
+  }
+
   Future<dynamic> delete(String path, {Object? body}) async {
     if (_csrfToken == null) {
       await fetchCsrfToken();

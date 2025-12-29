@@ -39,6 +39,7 @@ type AppInstance struct {
 	AppName     string            `json:"app_name"`
 	Image       string            `json:"image"`
 	Type        string            `json:"type"`
+	Mode        string            `json:"mode,omitempty"`
 	Status      string            `json:"status"`
 	ContainerID string            `json:"container_id"`
 	Environment map[string]string `json:"environment,omitempty"`

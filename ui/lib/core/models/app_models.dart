@@ -7,6 +7,7 @@ class App {
   final String displayName;
   final String image;
   final String type;
+  final String mode;
   final String status;
   final List<AppVolume> volumes;
   final Map<String, String> environment;
@@ -19,6 +20,7 @@ class App {
     this.displayName = '',
     required this.image,
     required this.type,
+    this.mode = '',
     required this.status,
     this.volumes = const [],
     this.environment = const {},
@@ -38,6 +40,7 @@ class App {
       displayName: displayName,
       image: json['image'] ?? '',
       type: json['type'] ?? 'user',
+      mode: json['mode'] ?? '',
       status: json['status'] ?? 'unknown',
       volumes:
           (json['volumes'] as List<dynamic>?)
@@ -53,6 +56,7 @@ class App {
   bool get isStopped =>
       status.toLowerCase() == 'stopped' || status.toLowerCase() == 'created';
   bool get isError => status.toLowerCase() == 'error';
+  bool get isWorkspace => mode.toLowerCase() == 'workspace';
 
   String get displayTitle {
     if (displayName.isNotEmpty) return displayName;
@@ -81,6 +85,46 @@ class AppVolume {
   }
 }
 
+class AppListener {
+  final String name;
+  final int guestPort;
+  final String flow;
+  final String protocol;
+  final List<int> remotePorts;
+  final List<dynamic> middleware;
+
+  AppListener({
+    required this.name,
+    required this.guestPort,
+    this.flow = 'tcp',
+    this.protocol = 'raw',
+    this.remotePorts = const [],
+    this.middleware = const [],
+  });
+
+  factory AppListener.fromServiceEndpoint(ServiceEndpoint ep) {
+    return AppListener(
+      name: ep.name,
+      guestPort: ep.guestPort,
+      flow: ep.flow,
+      protocol: ep.protocol,
+      remotePorts: ep.remotePorts,
+      middleware: ep.middleware,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'name': name,
+      'guest_port': guestPort,
+      'flow': flow,
+      'protocol': protocol,
+      'remote_ports': remotePorts,
+      'protocol_middleware': middleware,
+    };
+  }
+}
+
 class ServiceEndpoint {
   final String app;
   final String name;
@@ -92,6 +136,7 @@ class ServiceEndpoint {
   final String flow;
   final String protocol;
   final String? localUrl;
+  final List<dynamic> middleware;
 
   ServiceEndpoint({
     required this.app,
@@ -104,6 +149,7 @@ class ServiceEndpoint {
     required this.flow,
     required this.protocol,
     this.localUrl,
+    this.middleware = const [],
   });
 
   factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
@@ -118,6 +164,7 @@ class ServiceEndpoint {
       flow: json['flow'] ?? 'tcp',
       protocol: json['protocol'] ?? 'raw',
       localUrl: json['local_url'],
+      middleware: json['middleware'] ?? [],
     );
   }
 

@@ -4,6 +4,7 @@ import '../../core/models/app_models.dart';
 import '../../core/services/app_service.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'app_launcher.dart';
+import 'widgets/edit_listeners_dialog.dart';
 
 class AppDetailView extends StatefulWidget {
   final String appId;
@@ -174,6 +175,30 @@ class _AppDetailViewState extends State<AppDetailView>
               ),
             ],
           );
+        },
+      ),
+    );
+  }
+
+  void _showEditListenersDialog() {
+    if (_app == null) return;
+
+    // Convert current services to AppListener list
+    final initialListeners = _services
+        .map((s) => AppListener.fromServiceEndpoint(s))
+        .toList();
+
+    showDialog(
+      context: context,
+      builder: (context) => EditListenersDialog(
+        initialListeners: initialListeners,
+        onSave: (newListeners) async {
+          await _handleAction(() async {
+            await widget.appService.updateAppListeners(
+              _app!.name,
+              newListeners,
+            );
+          });
         },
       ),
     );
@@ -431,103 +456,121 @@ class _AppDetailViewState extends State<AppDetailView>
   }
 
   Widget _buildNetworkTab() {
-    if (_services.isEmpty) {
-      return const Center(child: Text("No network services exposed."));
-    }
-
-    return ListView(
-      padding: const EdgeInsets.all(24),
-      children: _services
-          .map(
-            (svc) => Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Icon(Icons.router, color: PiccoloTheme.cobalt600),
-                        const SizedBox(width: 12),
-                        Text(
-                          svc.name,
-                          style: const TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 16,
-                          ),
-                        ),
-                        const Spacer(),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: PiccoloTheme.mist,
-                            borderRadius: BorderRadius.circular(4),
-                            border: Border.all(color: Colors.black12),
-                          ),
-                          child: Text(
-                            svc.protocol.toUpperCase(),
-                            style: const TextStyle(fontSize: 12),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const Divider(height: 24),
-                    _buildNetworkRow("Internal Port", "${svc.guestPort}"),
-                    if (svc.localUrl != null)
-                      _buildNetworkRow(
-                        "LAN Access",
-                        "${svc.localUrl} (Port ${svc.publicPort})",
-                      ),
-
-                    if (svc.remoteUrl != null)
-                      _buildNetworkRow("Remote Access", svc.remoteUrl!),
-
-                    const SizedBox(height: 16),
-                    Row(
-                      children: [
-                        if (svc.localUrl != null)
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: () => AppLauncher.openAppWindow(
-                                controller: widget.desktopController,
-                                appService: widget.appService,
-                                app: _app!,
-                                service: svc,
+    final content = _services.isEmpty
+        ? const Center(child: Text("No network services exposed."))
+        : ListView(
+            padding: const EdgeInsets.all(24),
+            children: _services
+                .map(
+                  (svc) => Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const Icon(Icons.router, color: PiccoloTheme.cobalt600),
+                              const SizedBox(width: 12),
+                              Text(
+                                svc.name,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 16,
+                                ),
                               ),
-                              icon: const Icon(Icons.lan, size: 16),
-                              label: const Text("Open Local"),
+                              const Spacer(),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: PiccoloTheme.mist,
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(color: Colors.black12),
+                                ),
+                                child: Text(
+                                  svc.protocol.toUpperCase(),
+                                  style: const TextStyle(fontSize: 12),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const Divider(height: 24),
+                          _buildNetworkRow("Internal Port", "${svc.guestPort}"),
+                          if (svc.localUrl != null)
+                            _buildNetworkRow(
+                              "LAN Access",
+                              "${svc.localUrl} (Port ${svc.publicPort})",
                             ),
-                          ),
-                        if (svc.remoteUrl != null) ...[
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: FilledButton.icon(
-                              onPressed: () => AppLauncher.openAppWindow(
-                                controller: widget.desktopController,
-                                appService: widget.appService,
-                                app: _app!,
-                                service: svc,
-                                overrideUrl: svc.remoteUrl!,
-                              ),
-                              icon: const Icon(Icons.public, size: 16),
-                              label: const Text("Open Remote"),
-                              style: FilledButton.styleFrom(
-                                backgroundColor: PiccoloTheme.cobalt600,
-                              ),
-                            ),
+
+                          if (svc.remoteUrl != null)
+                            _buildNetworkRow("Remote Access", svc.remoteUrl!),
+
+                          const SizedBox(height: 16),
+                          Row(
+                            children: [
+                              if (svc.localUrl != null)
+                                Expanded(
+                                  child: OutlinedButton.icon(
+                                    onPressed: () => AppLauncher.openAppWindow(
+                                      controller: widget.desktopController,
+                                      appService: widget.appService,
+                                      app: _app!,
+                                      service: svc,
+                                    ),
+                                    icon: const Icon(Icons.lan, size: 16),
+                                    label: const Text("Open Local"),
+                                  ),
+                                ),
+                              if (svc.remoteUrl != null) ...[
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: FilledButton.icon(
+                                    onPressed: () => AppLauncher.openAppWindow(
+                                      controller: widget.desktopController,
+                                      appService: widget.appService,
+                                      app: _app!,
+                                      service: svc,
+                                      overrideUrl: svc.remoteUrl!,
+                                    ),
+                                    icon: const Icon(Icons.public, size: 16),
+                                    label: const Text("Open Remote"),
+                                    style: FilledButton.styleFrom(
+                                      backgroundColor: PiccoloTheme.cobalt600,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
                           ),
                         ],
-                      ],
+                      ),
                     ),
-                  ],
+                  ),
+                )
+                .toList(),
+          );
+
+    return Column(
+      children: [
+        if (_app!.isWorkspace)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 24, 24, 0),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _showEditListenersDialog,
+                  icon: const Icon(Icons.edit, size: 16),
+                  label: const Text("Edit Listeners"),
                 ),
-              ),
+              ],
             ),
-          )
-          .toList(),
+          ),
+        Expanded(child: content),
+      ],
     );
   }
 

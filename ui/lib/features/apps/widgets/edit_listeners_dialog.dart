@@ -1,0 +1,245 @@
+import 'package:flutter/material.dart';
+import '../../../../core/models/app_models.dart';
+import '../../../../theme/piccolo_theme.dart';
+
+class EditListenersDialog extends StatefulWidget {
+  final List<AppListener> initialListeners;
+  final Function(List<AppListener>) onSave;
+
+  const EditListenersDialog({
+    super.key,
+    required this.initialListeners,
+    required this.onSave,
+  });
+
+  @override
+  State<EditListenersDialog> createState() => _EditListenersDialogState();
+}
+
+class _EditListenersDialogState extends State<EditListenersDialog> {
+  late List<AppListener> _listeners;
+  final _formKey = GlobalKey<FormState>();
+
+  @override
+  void initState() {
+    super.initState();
+    _listeners = List.from(widget.initialListeners);
+  }
+
+  void _addListener() {
+    setState(() {
+      _listeners.add(AppListener(
+        name: 'service-${_listeners.length + 1}',
+        guestPort: 8080,
+      ));
+    });
+  }
+
+  void _removeListener(int index) {
+    setState(() {
+      _listeners.removeAt(index);
+    });
+  }
+
+  void _updateListener(int index, AppListener updated) {
+    setState(() {
+      _listeners[index] = updated;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text("Edit Listeners"),
+      content: SizedBox(
+        width: 700,
+        height: 500,
+        child: Column(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: PiccoloTheme.mist,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.info_outline, size: 16, color: PiccoloTheme.cobalt600),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      "Updating listeners may cause the application container to recreate.",
+                      style: TextStyle(
+                        color: PiccoloTheme.inkMuted,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            Expanded(
+              child: Form(
+                key: _formKey,
+                child: ListView.separated(
+                  itemCount: _listeners.length,
+                  separatorBuilder: (context, index) => const Divider(),
+                  itemBuilder: (context, index) {
+                    final l = _listeners[index];
+                    return _ListenerRow(
+                      listener: l,
+                      onDelete: () => _removeListener(index),
+                      onChange: (updated) => _updateListener(index, updated),
+                    );
+                  },
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            OutlinedButton.icon(
+              onPressed: _addListener,
+              icon: const Icon(Icons.add),
+              label: const Text("Add Listener"),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text("Cancel"),
+        ),
+        FilledButton(
+          onPressed: () {
+            if (_formKey.currentState!.validate()) {
+              widget.onSave(_listeners);
+              Navigator.of(context).pop();
+            }
+          },
+          child: const Text("Save Changes"),
+        ),
+      ],
+    );
+  }
+}
+
+class _ListenerRow extends StatelessWidget {
+  final AppListener listener;
+  final VoidCallback onDelete;
+  final ValueChanged<AppListener> onChange;
+
+  const _ListenerRow({
+    required this.listener,
+    required this.onDelete,
+    required this.onChange,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            flex: 3,
+            child: TextFormField(
+              initialValue: listener.name,
+              decoration: const InputDecoration(
+                labelText: "Name", 
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (val) => onChange(_copyWith(name: val)),
+              validator: (val) =>
+                  val == null || val.isEmpty ? "Required" : null,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            flex: 2,
+            child: TextFormField(
+              initialValue: listener.guestPort.toString(),
+              decoration: const InputDecoration(
+                labelText: "Port", 
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+              keyboardType: TextInputType.number,
+              onChanged: (val) {
+                final port = int.tryParse(val);
+                if (port != null) onChange(_copyWith(guestPort: port));
+              },
+              validator: (val) {
+                final p = int.tryParse(val ?? '');
+                return p == null || p <= 0 || p > 65535 ? "Invalid" : null;
+              },
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            flex: 2,
+            child: DropdownButtonFormField<String>(
+              value: listener.protocol,
+              decoration: const InputDecoration(
+                labelText: "Protocol", 
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+              items: const [
+                DropdownMenuItem(value: "raw", child: Text("Raw (TCP/UDP)")),
+                DropdownMenuItem(value: "http", child: Text("HTTP")),
+                DropdownMenuItem(value: "websocket", child: Text("WebSocket")),
+              ],
+              onChanged: (val) {
+                if (val != null) onChange(_copyWith(protocol: val));
+              },
+            ),
+          ),
+          const SizedBox(width: 12),
+           Expanded(
+            flex: 2,
+            child: DropdownButtonFormField<String>(
+              value: listener.flow,
+              decoration: const InputDecoration(
+                labelText: "Flow", 
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+              items: const [
+                DropdownMenuItem(value: "tcp", child: Text("TCP")),
+                DropdownMenuItem(value: "tls", child: Text("TLS")),
+              ],
+              onChanged: (val) {
+                if (val != null) onChange(_copyWith(flow: val));
+              },
+            ),
+          ),
+          const SizedBox(width: 8),
+          IconButton(
+            icon: const Icon(Icons.delete_outline, color: PiccoloTheme.critical),
+            onPressed: onDelete,
+            tooltip: "Remove Listener",
+          ),
+        ],
+      ),
+    );
+  }
+
+  AppListener _copyWith({
+    String? name,
+    int? guestPort,
+    String? flow,
+    String? protocol,
+  }) {
+    return AppListener(
+      name: name ?? listener.name,
+      guestPort: guestPort ?? listener.guestPort,
+      flow: flow ?? listener.flow,
+      protocol: protocol ?? listener.protocol,
+      remotePorts: listener.remotePorts,
+      middleware: listener.middleware,
+    );
+  }
+}
