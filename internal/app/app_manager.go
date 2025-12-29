@@ -693,6 +693,15 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 			log.Printf("WARN: reconcile app %s: restore services failed: %v", appInst.InstanceID, err)
 		}
 		if err := m.ensurePodmanPublishes(ctx, def, appInst.InstanceID, containerID, runtime); err != nil {
+			if errors.Is(err, container.ErrPortReconciliationRequired) {
+				// Port bindings don't match and Podman doesn't support dynamic updates.
+				// Recreate the container with the correct ports.
+				log.Printf("INFO: reconcile app %s: port bindings mismatch, recreating container", appInst.InstanceID)
+				_ = m.containerManager.StopContainer(ctx, runtime, containerID)
+				_ = m.containerManager.RemoveContainer(ctx, runtime, containerID)
+				m.serviceManager.RemoveApp(appInst.InstanceID)
+				return m.recreateMissingContainer(ctx, state, appInst, def, layout, runtime)
+			}
 			log.Printf("WARN: reconcile app %s: publish reconcile failed: %v", appInst.InstanceID, err)
 		}
 	}
@@ -796,84 +805,33 @@ func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefi
 		return nil
 	}
 
-	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
-		observed, err := m.containerManager.InspectPublishedPorts(ctx, runtime, containerID)
-		if err != nil {
-			return err
-		}
-
-		expected := make(map[int]services.ServiceEndpoint, len(endpoints)) // guest -> endpoint
-		for _, ep := range endpoints {
-			expected[ep.GuestPort] = ep
-		}
-
-		retry := false
-		applyAdd := func(ep services.ServiceEndpoint) error {
-			if err := m.containerManager.UpdatePublishAdd(ctx, runtime, containerID, ep.HostBind, ep.GuestPort); err != nil {
-				var portErr *container.PortInUseError
-				if errors.As(err, &portErr) {
-					conflict := ep.HostBind
-					if portErr.Port > 0 {
-						conflict = portErr.Port
-					}
-					m.serviceManager.RemoveApp(instanceID)
-					if conflict > 0 {
-						_ = m.serviceManager.ReserveHostPort(conflict)
-					}
-					// Re-allocate endpoints and retry with new host ports.
-					endpoints, err = m.serviceManager.AllocateForApp(instanceID, def.Listeners)
-					if err != nil {
-						return err
-					}
-					m.serviceManager.SetAppContainerID(instanceID, containerID)
-					retry = true
-					return nil
-				}
-				return err
-			}
-			return nil
-		}
-
-		// Ensure required mappings exist and match.
-		for guest, ep := range expected {
-			host, ok := observed[guest]
-			switch {
-			case !ok:
-				if err := applyAdd(ep); err != nil {
-					return err
-				}
-			case host != ep.HostBind:
-				if err := applyAdd(ep); err != nil {
-					return err
-				}
-				if retry {
-					break
-				}
-				if err := m.containerManager.UpdatePublishRemove(ctx, runtime, containerID, host, guest); err != nil {
-					log.Printf("WARN: reconcile app %s: publish remove failed: %v", instanceID, err)
-				}
-			}
-			if retry {
-				break
-			}
-		}
-
-		if retry {
-			continue
-		}
-
-		// Remove mappings for guest ports that are no longer expected.
-		for guest, host := range observed {
-			if _, ok := expected[guest]; !ok {
-				if err := m.containerManager.UpdatePublishRemove(ctx, runtime, containerID, host, guest); err != nil {
-					log.Printf("WARN: reconcile app %s: publish remove failed: %v", instanceID, err)
-				}
-			}
-		}
-		return nil
+	observed, err := m.containerManager.InspectPublishedPorts(ctx, runtime, containerID)
+	if err != nil {
+		return err
 	}
 
-	return fmt.Errorf("failed to reconcile publishes for %s: exhausted host-port retries", instanceID)
+	expected := make(map[int]services.ServiceEndpoint, len(endpoints)) // guest -> endpoint
+	for _, ep := range endpoints {
+		expected[ep.GuestPort] = ep
+	}
+
+	// Check if any port reconciliation is needed.
+	for guest, ep := range expected {
+		host, ok := observed[guest]
+		if !ok || host != ep.HostBind {
+			// Podman does not support dynamic port binding updates on running containers.
+			// Return error to trigger container recreation.
+			return container.ErrPortReconciliationRequired
+		}
+	}
+	for guest := range observed {
+		if _, ok := expected[guest]; !ok {
+			// Extra port exists that shouldn't - needs recreation.
+			return container.ErrPortReconciliationRequired
+		}
+	}
+
+	return nil
 }
 
 // Install installs a new application instance from its definition.

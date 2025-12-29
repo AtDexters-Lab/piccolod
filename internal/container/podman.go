@@ -25,6 +25,16 @@ func ErrContainerNotFound(containerRef string) error {
 	return &ContainerNotFoundError{Ref: containerRef}
 }
 
+// ErrDynamicPortUpdateNotSupported indicates that Podman does not support
+// dynamically adding or removing port bindings on running containers.
+// Port binding changes require container recreation.
+var ErrDynamicPortUpdateNotSupported = errors.New("podman does not support dynamic port binding updates on running containers")
+
+// ErrPortReconciliationRequired indicates that the container's published ports
+// do not match the expected ports and the container needs to be recreated.
+var ErrPortReconciliationRequired = errors.New("container port bindings do not match expected; recreation required")
+
+
 // PodmanCLI provides safe Podman CLI integration with injection prevention
 type PodmanCLI struct{}
 
@@ -679,62 +689,18 @@ func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRun
 	return result, nil
 }
 
-// UpdatePublishAdd adds a port publish mapping to a running container
+// UpdatePublishAdd adds a port publish mapping to a running container.
+// NOTE: Podman does not support dynamic port binding updates on running containers.
+// This function returns ErrDynamicPortUpdateNotSupported. Port changes require container recreation.
 func (p *PodmanCLI) UpdatePublishAdd(ctx context.Context, runtime PodmanRuntime, containerID string, hostBind, guestPort int) error {
-	if !isValidContainerID(containerID) {
-		return fmt.Errorf("invalid container ID format: %s", containerID)
-	}
-	if err := ValidatePort(hostBind); err != nil {
-		return err
-	}
-	if err := ValidatePort(guestPort); err != nil {
-		return err
-	}
-	mapping := fmt.Sprintf("127.0.0.1:%d:%d", hostBind, guestPort)
-	args, err := buildPodmanArgs(runtime, []string{"container", "update", "--publish-add", mapping, containerID})
-	if err != nil {
-		return err
-	}
-	cmd := exec.CommandContext(ctx, "podman", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		outStr := string(output)
-		if strings.Contains(outStr, "address already in use") {
-			port := hostBind
-			if match := portInUseRe.FindStringSubmatch(outStr); len(match) == 2 {
-				if parsed, perr := strconv.Atoi(match[1]); perr == nil {
-					port = parsed
-				}
-			}
-			return &PortInUseError{Port: port, Output: outStr, Err: fmt.Errorf("podman update --publish-add failed: %w", err)}
-		}
-		return fmt.Errorf("podman update --publish-add failed: %w, output: %s", err, outStr)
-	}
-	return nil
+	return ErrDynamicPortUpdateNotSupported
 }
 
-// UpdatePublishRemove removes a port publish mapping from a running container
+// UpdatePublishRemove removes a port publish mapping from a running container.
+// NOTE: Podman does not support dynamic port binding updates on running containers.
+// This function returns ErrDynamicPortUpdateNotSupported. Port changes require container recreation.
 func (p *PodmanCLI) UpdatePublishRemove(ctx context.Context, runtime PodmanRuntime, containerID string, hostBind, guestPort int) error {
-	if !isValidContainerID(containerID) {
-		return fmt.Errorf("invalid container ID format: %s", containerID)
-	}
-	if err := ValidatePort(hostBind); err != nil {
-		return err
-	}
-	if err := ValidatePort(guestPort); err != nil {
-		return err
-	}
-	mapping := fmt.Sprintf("127.0.0.1:%d:%d", hostBind, guestPort)
-	args, err := buildPodmanArgs(runtime, []string{"container", "update", "--publish-rm", mapping, containerID})
-	if err != nil {
-		return err
-	}
-	cmd := exec.CommandContext(ctx, "podman", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("podman update --publish-rm failed: %w, output: %s", err, string(output))
-	}
-	return nil
+	return ErrDynamicPortUpdateNotSupported
 }
 
 // ResetStorage cleans up container references for this runtime's storage.
