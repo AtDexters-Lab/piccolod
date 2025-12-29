@@ -147,7 +147,7 @@ func TestFileVolumeManagerEnsureVolume(t *testing.T) {
 	if _, err := os.Stat(cipherDir); err != nil {
 		t.Fatalf("cipher dir missing: %v", err)
 	}
-	metaPath := filepath.Join(cipherDir, volumeMetadataName)
+	metaPath := filepath.Join(root, "volumes", "control", volumeMetadataName)
 	if _, err := os.Stat(metaPath); err != nil {
 		t.Fatalf("metadata missing: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestFileVolumeManagerAttachDetectsCorruptedMetadata(t *testing.T) {
 		t.Fatalf("EnsureVolume: %v", err)
 	}
 
-	metaPath := filepath.Join(root, "ciphertext", "corrupt", volumeMetadataName)
+	metaPath := filepath.Join(root, "volumes", "corrupt", volumeMetadataName)
 	if err := os.WriteFile(metaPath, []byte("{"), 0o600); err != nil {
 		t.Fatalf("corrupt metadata: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestFileVolumeManagerAttachFailsWhenMetadataCorruptedWhileRunning(t *testin
 		t.Fatalf("EnsureVolume: %v", err)
 	}
 
-	metaPath := filepath.Join(root, "ciphertext", "livecorrupt", volumeMetadataName)
+	metaPath := filepath.Join(root, "volumes", "livecorrupt", volumeMetadataName)
 	if err := os.WriteFile(metaPath, []byte("{"), 0o600); err != nil {
 		t.Fatalf("corrupt metadata: %v", err)
 	}
@@ -377,7 +377,7 @@ func TestFileVolumeManagerAttachFailsWithInvalidMetadataValues(t *testing.T) {
 				t.Fatalf("EnsureVolume: %v", err)
 			}
 
-			metaPath := filepath.Join(root, "ciphertext", "victim", volumeMetadataName)
+			metaPath := filepath.Join(root, "volumes", "victim", volumeMetadataName)
 			metaBytes, err := os.ReadFile(metaPath)
 			if err != nil {
 				t.Fatalf("read metadata: %v", err)

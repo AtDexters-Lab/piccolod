@@ -201,6 +201,9 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	rp.ModifyResponse = func(resp *http.Response) error {
 		resp.Header.Del("X-Frame-Options")
 
+		resp.Header.Set("Cross-Origin-Resource-Policy", "same-site")
+		resp.Header.Set("Cross-Origin-Embedder-Policy", "require-corp")
+
 		// Remove existing frame-ancestors directive if present, but keep other CSP directives
 		if val := resp.Header.Get("Content-Security-Policy"); val != "" {
 			newVal := frameAncestorsRe.ReplaceAllString(val, "")

@@ -1,4 +1,4 @@
-# Development environment with filesystem persistence
+# Development environment (workspace-style persistence)
 name: code-server
 image: codercom/code-server:latest
 
@@ -26,10 +26,6 @@ storage:
       container: /tmp/cache
       size_limit: 10GB
 
-# Enable filesystem persistence for package installs, etc.
-filesystem:
-  persistent: true
-
 environment:
   PASSWORD: mypassword
   SUDO_PASSWORD: mypassword
@@ -49,3 +45,10 @@ app_config:
   settings:
     theme: dark
     font_size: 14
+
+# Piccolo-specific policies: a workspace is a "roaming" instance by default
+# (disk + data replicated per policy; secrets may be injected via env for compatibility).
+x-piccolo:
+  mode: workspace
+  secrets:
+    injection: env

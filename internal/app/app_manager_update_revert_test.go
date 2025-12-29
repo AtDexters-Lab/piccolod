@@ -28,22 +28,24 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 	// Install initial app
 	def := &api.AppDefinition{
 		Name: "demoapp", Image: "alpine:3.18", Type: "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	inst, err := mgr.Install(ctx, def)
+	inst, err := mgr.Install(ctx, def, "")
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	firstCID := inst.ContainerID
+	instanceID := inst.InstanceID
 
 	// Update tag to 3.19
 	tag := "3.19"
-	if err := mgr.UpdateImage(ctx, "demoapp", &tag); err != nil {
+	if err := mgr.UpdateImage(ctx, instanceID, &tag); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 
 	// Verify new image written
-	defPath := filepath.Join(tmp, AppsDir, "demoapp", "app.yaml")
+	defPath := filepath.Join(tmp, AppsDir, instanceID, "app.yaml")
 	curData, err := os.ReadFile(defPath)
 	if err != nil {
 		t.Fatalf("read app.yaml: %v", err)
@@ -56,7 +58,7 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 		t.Fatalf("expected image alpine:3.19, got %s", cur.Image)
 	}
 	// Instance should have new CID
-	inst2, err := mgr.Get(ctx, "demoapp")
+	inst2, err := mgr.Get(ctx, instanceID)
 	if err != nil {
 		t.Fatalf("get app: %v", err)
 	}
@@ -65,7 +67,7 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 	}
 
 	// Revert back to previous
-	if err := mgr.Revert(ctx, "demoapp"); err != nil {
+	if err := mgr.Revert(ctx, instanceID); err != nil {
 		t.Fatalf("revert: %v", err)
 	}
 	curData2, err := os.ReadFile(defPath)
@@ -97,15 +99,21 @@ func TestAppManager_Logs(t *testing.T) {
 	mgr.ForceLockState(false)
 	ctx := context.Background()
 
-	def := &api.AppDefinition{Name: "demo", Image: "alpine:latest", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
-	inst, err := mgr.Install(ctx, def)
+	def := &api.AppDefinition{
+		Name:       "demo",
+		Image:      "alpine:latest",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	inst, err := mgr.Install(ctx, def, "")
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	if inst.ContainerID == "" {
 		t.Fatalf("no container id")
 	}
-	lines, err := mgr.Logs(ctx, "demo", 5)
+	lines, err := mgr.Logs(ctx, inst.InstanceID, 5)
 	if err != nil {
 		t.Fatalf("logs: %v", err)
 	}

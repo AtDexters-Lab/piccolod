@@ -330,6 +330,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	// otherwise legacy installations would appear empty after upgrade.
 	appMgr.SetStateBaseDir(controlDir)
 	appMgr.SetLockReader(persist)
+	appMgr.SetVolumeManager(persist.Volumes())
 	svcMgr.SetLockReader(persist)
 
 	// Set Gin to release mode for production (can be overridden by GIN_MODE env var)
@@ -388,6 +389,14 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		return nil
 	}, func(ctx context.Context) error {
 		s.serviceManager.Stop()
+		return nil
+	}))
+
+	s.supervisor.Register(supervisor.NewComponent("app-manager", func(ctx context.Context) error {
+		s.appManager.StartBackground()
+		return nil
+	}, func(ctx context.Context) error {
+		s.appManager.StopBackground()
 		return nil
 	}))
 
@@ -643,6 +652,7 @@ func (s *GinServer) setupGinRoutes() {
 		{
 			apps.POST("", s.requireUnlocked(), s.handleGinAppInstall)           // POST /api/v1/apps
 			apps.POST("/validate", s.handleGinAppValidate)                      // POST /api/v1/apps/validate
+			apps.GET("/check-instance", s.handleGinAppCheckInstance)            // GET /api/v1/apps/check-instance?id=...
 			apps.GET("", s.handleGinAppList)                                    // GET /api/v1/apps
 			apps.GET("/:name", s.handleGinAppGet)                               // GET /api/v1/apps/:name
 			apps.DELETE("/:name", s.requireUnlocked(), s.handleGinAppUninstall) // DELETE /api/v1/apps/:name
@@ -779,17 +789,21 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 	}
 }
 
-func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoint, scheme string) string {
+func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoint, scheme string) *string {
+
+	if s.isSecureRequest(c.Request) {
+		// secure context requests are nexus proxied requests with TLS muxing
+		// prevent local non-secure urls from being generated in that context
+		return nil
+	}
+
 	host := c.Request.Host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	// Use scheme from determineScheme which handles flow/protocol logic
-	// If public port is standard for scheme, we could omit it, but explicit is safer for services
-	if (scheme == "http" && ep.PublicPort == 80) || (scheme == "https" && ep.PublicPort == 443) {
-		return fmt.Sprintf("%s://%s", scheme, host)
-	}
-	return fmt.Sprintf("%s://%s:%d", scheme, host, ep.PublicPort)
+
+	url := fmt.Sprintf("%s://%s:%d", scheme, host, ep.PublicPort)
+	return &url
 }
 
 func (s *GinServer) remoteServiceHostname(status *remote.Status, ep services.ServiceEndpoint) string {

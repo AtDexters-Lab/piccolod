@@ -12,6 +12,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/cluster"
 	"piccolod/internal/events"
+	"piccolod/internal/persistence"
 	"piccolod/internal/router"
 	"piccolod/internal/services"
 	"piccolod/internal/state/paths"
@@ -34,10 +35,57 @@ func (s *stubLockReader) set(locked bool) {
 	s.mu.Unlock()
 }
 
+type stubVolumeManager struct {
+	root string
+}
+
+func (s *stubVolumeManager) EnsureVolume(ctx context.Context, req persistence.VolumeRequest) (persistence.VolumeHandle, error) {
+	_ = ctx
+	handle := persistence.VolumeHandle{
+		ID:       req.ID,
+		MountDir: filepath.Join(s.root, "mounts", req.ID),
+	}
+	if err := os.MkdirAll(handle.MountDir, 0o700); err != nil {
+		return persistence.VolumeHandle{}, err
+	}
+	return handle, nil
+}
+
+func (s *stubVolumeManager) Attach(ctx context.Context, handle persistence.VolumeHandle, opts persistence.AttachOptions) error {
+	_ = ctx
+	_ = handle
+	_ = opts
+	return nil
+}
+
+func (s *stubVolumeManager) Detach(ctx context.Context, handle persistence.VolumeHandle) error {
+	_ = ctx
+	_ = handle
+	return nil
+}
+
+func (s *stubVolumeManager) DestroyVolume(ctx context.Context, id string) error {
+	_ = ctx
+	return os.RemoveAll(filepath.Join(s.root, "mounts", id))
+}
+
+func (s *stubVolumeManager) RoleStream(id string) (<-chan persistence.VolumeRole, error) {
+	_ = id
+	ch := make(chan persistence.VolumeRole)
+	close(ch)
+	return ch, nil
+}
+
 func allowHostStorage(t *testing.T, m *AppManager) {
 	t.Helper()
 	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") != "1" {
 		t.Skip("set PICCOLO_ALLOW_UNMOUNTED_TESTS=1 to run without mounted volumes")
+	}
+	if m.stateBaseDir != "" {
+		t.Setenv("PICCOLO_STATE_DIR", m.stateBaseDir)
+		t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(m.stateBaseDir, "run", "podman"))
+		paths.SetRootForTest(m.stateBaseDir)
+		m.SetVolumeManager(&stubVolumeManager{root: m.stateBaseDir})
 	}
 	m.SetMountVerifier(func(string) error { return nil })
 }
@@ -205,21 +253,25 @@ func TestAppManager_Install(t *testing.T) {
 		Environment: map[string]string{
 			"ENV_VAR": "test-value",
 		},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
 	// Install the app
-	app, err := manager.Install(ctx, appDef)
+	app, err := manager.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
 	// Verify app was created correctly
-	if app.Name != "test-app" {
-		t.Errorf("Expected app name 'test-app', got %s", app.Name)
+	if app.AppName != "test-app" {
+		t.Errorf("Expected app name 'test-app', got %s", app.AppName)
+	}
+	if app.InstanceID != "test-app" {
+		t.Errorf("Expected first instance ID 'test-app', got %s", app.InstanceID)
 	}
 
-	if app.Status != "created" {
-		t.Errorf("Expected app status 'created', got %s", app.Status)
+	if app.Status != "running" {
+		t.Errorf("Expected app status 'running', got %s", app.Status)
 	}
 
 	// Verify container was created
@@ -228,7 +280,7 @@ func TestAppManager_Install(t *testing.T) {
 	}
 
 	// Verify filesystem structure was created
-	appDir := filepath.Join(tempDir, AppsDir, "test-app")
+	appDir := filepath.Join(tempDir, AppsDir, app.InstanceID)
 	if _, err := os.Stat(appDir); os.IsNotExist(err) {
 		t.Error("App directory was not created")
 	}
@@ -245,10 +297,16 @@ func TestAppManager_Install(t *testing.T) {
 		t.Error("metadata.json was not created")
 	}
 
-	// Test duplicate installation should fail
-	_, err = manager.Install(ctx, appDef)
-	if err == nil {
-		t.Error("Expected error when installing duplicate app")
+	// Second installation of same app should create new instance with different ID
+	app2, err := manager.Install(ctx, appDef, "")
+	if err != nil {
+		t.Fatalf("Failed to install second instance: %v", err)
+	}
+	if app2.InstanceID == app.InstanceID {
+		t.Error("Expected different instance ID for second installation")
+	}
+	if app2.AppName != "test-app" {
+		t.Errorf("Expected app name 'test-app', got %s", app2.AppName)
 	}
 }
 
@@ -263,8 +321,9 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 	manager.ForceLockState(false)
 	if _, err := manager.Install(context.Background(), &api.AppDefinition{
 		Name: "demo", Image: "alpine:latest", Type: "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
-	}); err != nil {
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}, ""); err != nil {
 		t.Fatalf("seed install: %v", err)
 	}
 
@@ -282,8 +341,14 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	appDef := &api.AppDefinition{Name: "nope", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
-	if _, err := manager.Install(context.Background(), appDef); !errors.Is(err, ErrNotLeader) {
+	appDef := &api.AppDefinition{
+		Name:       "nope",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	if _, err := manager.Install(context.Background(), appDef, ""); !errors.Is(err, ErrNotLeader) {
 		t.Fatalf("expected ErrNotLeader, got %v", err)
 	}
 }
@@ -363,15 +428,27 @@ func TestAppManager_List(t *testing.T) {
 	}
 
 	// Install two apps
-	appDef1 := &api.AppDefinition{Name: "app1", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
-	appDef2 := &api.AppDefinition{Name: "app2", Image: "alpine:latest", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
+	appDef1 := &api.AppDefinition{
+		Name:       "app1",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	appDef2 := &api.AppDefinition{
+		Name:       "app2",
+		Image:      "alpine:latest",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
 
-	_, err = manager.Install(ctx, appDef1)
+	_, err = manager.Install(ctx, appDef1, "")
 	if err != nil {
 		t.Fatalf("Failed to install app1: %v", err)
 	}
 
-	_, err = manager.Install(ctx, appDef2)
+	_, err = manager.Install(ctx, appDef2, "")
 	if err != nil {
 		t.Fatalf("Failed to install app2: %v", err)
 	}
@@ -389,7 +466,7 @@ func TestAppManager_List(t *testing.T) {
 	// Verify app names are present
 	appNames := make(map[string]bool)
 	for _, app := range apps {
-		appNames[app.Name] = true
+		appNames[app.AppName] = true
 	}
 
 	if !appNames["app1"] || !appNames["app2"] {
@@ -444,8 +521,14 @@ func TestAppManager_Get(t *testing.T) {
 	}
 
 	// Install an app
-	appDef := &api.AppDefinition{Name: "test-app", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
-	installedApp, err := manager.Install(ctx, appDef)
+	appDef := &api.AppDefinition{
+		Name:       "test-app",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	installedApp, err := manager.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -457,8 +540,8 @@ func TestAppManager_Get(t *testing.T) {
 	}
 
 	// Verify app details
-	if retrievedApp.Name != installedApp.Name {
-		t.Errorf("Expected name %s, got %s", installedApp.Name, retrievedApp.Name)
+	if retrievedApp.InstanceID != installedApp.InstanceID {
+		t.Errorf("Expected instance ID %s, got %s", installedApp.InstanceID, retrievedApp.InstanceID)
 	}
 
 	if retrievedApp.Status != installedApp.Status {
@@ -525,8 +608,14 @@ func TestAppManager_StartStop(t *testing.T) {
 	ctx := context.Background()
 
 	// Install an app
-	appDef := &api.AppDefinition{Name: "test-app", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
-	_, err = manager.Install(ctx, appDef)
+	appDef := &api.AppDefinition{
+		Name:       "test-app",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	_, err = manager.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -618,8 +707,14 @@ func TestAppManager_Uninstall(t *testing.T) {
 	ctx := context.Background()
 
 	// Install an app
-	appDef := &api.AppDefinition{Name: "test-app", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
-	_, err = manager.Install(ctx, appDef)
+	appDef := &api.AppDefinition{
+		Name:       "test-app",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	_, err = manager.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -684,8 +779,14 @@ func TestAppManager_EnableDisable(t *testing.T) {
 	ctx := context.Background()
 
 	// Install an app
-	appDef := &api.AppDefinition{Name: "test-app", Image: "nginx:alpine", Type: "user", Listeners: []api.AppListener{{Name: "web", GuestPort: 80}}}
-	_, err = manager.Install(ctx, appDef)
+	appDef := &api.AppDefinition{
+		Name:       "test-app",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	_, err = manager.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -794,9 +895,10 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 		Environment: map[string]string{
 			"TEST_VAR": "persistent-value",
 		},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = manager1.Install(ctx, appDef)
+	_, err = manager1.Install(ctx, appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -844,8 +946,8 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 	}
 
 	// Verify all properties were preserved
-	if app2.Name != "persistent-app" {
-		t.Errorf("Expected name 'persistent-app', got %s", app2.Name)
+	if app2.InstanceID != "persistent-app" {
+		t.Errorf("Expected instance ID 'persistent-app', got %s", app2.InstanceID)
 	}
 
 	if app2.Image != "nginx:alpine" {
@@ -887,9 +989,270 @@ func TestAppManager_BlockedWhenLocked(t *testing.T) {
 	ctx := context.Background()
 	_, err = mgr.Install(ctx, &api.AppDefinition{
 		Name: "locked-app", Image: "nginx:latest", Type: "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
-	})
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}, "")
 	if !errors.Is(err, ErrLocked) {
 		t.Fatalf("expected ErrLocked, got %v", err)
+	}
+}
+
+func TestAppManager_RestoreServicesSkipsStoppedApps(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:alpine",
+		Type:  "user",
+		Listeners: []api.AppListener{{
+			Name:      "web",
+			GuestPort: 8080,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+		}},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := mgr.Stop(context.Background(), "demo"); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	// Stop removed endpoints; RestoreServices must not re-create them for stopped apps.
+	mgr.RestoreServices(context.Background())
+	if _, err := svcMgr.GetByApp("demo"); err == nil {
+		t.Fatalf("expected no services for stopped app")
+	}
+}
+
+func TestAppManager_ReconcileOnceStartsDesiredRunningApps(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:alpine",
+		Type:  "user",
+		Listeners: []api.AppListener{{
+			Name:      "web",
+			GuestPort: 8080,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+		}},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	mgr.ReconcileOnce(context.Background())
+	inst, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if inst.Status != "running" {
+		t.Fatalf("expected status running after reconcile, got %s", inst.Status)
+	}
+	if inst.ContainerID == "" {
+		t.Fatalf("expected container id after reconcile")
+	}
+	if c := mock.containers[inst.ContainerID]; c == nil || c.Status != "running" {
+		t.Fatalf("expected container to be running after reconcile")
+	}
+}
+
+func TestAppManager_ReconcileOnceStopsDesiredStoppedApps(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:alpine",
+		Type:  "user",
+		Listeners: []api.AppListener{{
+			Name:      "web",
+			GuestPort: 8080,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+		}},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := mgr.Start(context.Background(), "demo"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	// Force desired stopped without stopping the container to simulate drift.
+	if err := state.UpdateAppStatus("demo", "stopped"); err != nil {
+		t.Fatalf("update status: %v", err)
+	}
+
+	mgr.ReconcileOnce(context.Background())
+	inst, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if inst.Status != "stopped" {
+		t.Fatalf("expected status stopped, got %s", inst.Status)
+	}
+	if c := mock.containers[inst.ContainerID]; c == nil || c.Status != "stopped" {
+		t.Fatalf("expected container to be stopped after reconcile")
+	}
+	if _, err := svcMgr.GetByApp("demo"); err == nil {
+		t.Fatalf("expected no services for stopped app")
+	}
+}
+
+func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:alpine",
+		Type:  "user",
+		Listeners: []api.AppListener{{
+			Name:      "web",
+			GuestPort: 8080,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+		}},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := mgr.Start(context.Background(), "demo"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Simulate follower transition: stop container without changing app status.
+	if err := mgr.stopForFollowerTransition(context.Background(), "demo"); err != nil {
+		t.Fatalf("follower stop: %v", err)
+	}
+
+	inst, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if inst.Status != "running" {
+		t.Fatalf("expected status to remain running, got %s", inst.Status)
+	}
+	if c := mock.containers[inst.ContainerID]; c == nil || c.Status != "stopped" {
+		t.Fatalf("expected container to be stopped after follower transition")
+	}
+
+	// Mark the app as follower so background reconcile does not restart it.
+	mgr.leadershipMu.Lock()
+	mgr.leadershipState[cluster.ResourceForApp("demo")] = cluster.RoleFollower
+	mgr.leadershipMu.Unlock()
+
+	mgr.ReconcileOnce(context.Background())
+	updated, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if updated.Status != "running" {
+		t.Fatalf("expected status to remain running, got %s", updated.Status)
+	}
+	if c := mock.containers[updated.ContainerID]; c == nil || c.Status != "stopped" {
+		t.Fatalf("expected container to remain stopped on follower after reconcile")
+	}
+	if _, err := svcMgr.GetByApp("demo"); err == nil {
+		t.Fatalf("expected no services for follower app")
+	}
+}
+
+func TestAppManager_ReconcileOnceResolvesStaleContainerID(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		Name:  "demo",
+		Image: "docker.io/library/nginx:alpine",
+		Type:  "user",
+		Listeners: []api.AppListener{{
+			Name:      "web",
+			GuestPort: 8080,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+		}},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	inst, err := mgr.Install(context.Background(), app, "")
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	original := inst.ContainerID
+
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	stale := generateMockContainerID(9)
+	if err := state.UpdateAppRuntime("demo", inst.Status, stale); err != nil {
+		t.Fatalf("update runtime: %v", err)
+	}
+
+	mgr.ReconcileOnce(context.Background())
+	updated, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if updated.ContainerID != original {
+		t.Fatalf("expected container id to be resolved back to %s, got %s", original, updated.ContainerID)
 	}
 }

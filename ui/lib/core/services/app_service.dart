@@ -148,13 +148,18 @@ class AppService {
     return Map<String, dynamic>.from(data['data'] ?? {});
   }
 
-  Future<App> installAppWithInputs(String yamlContent, Map<String, dynamic> inputs) async {
+  Future<App> installAppWithInputs(String yamlContent, Map<String, dynamic> inputs, {String displayName = ''}) async {
+    final body = <String, dynamic>{
+      'app_definition': yamlContent,
+      'inputs': inputs,
+    };
+    if (displayName.isNotEmpty) {
+      body['display_name'] = displayName;
+    }
+
     final data = await _client.post(
       '/api/v1/apps',
-      body: {
-        'app_definition': yamlContent,
-        'inputs': inputs,
-      },
+      body: body,
     );
     return App.fromJson(data['data']);
   }

@@ -110,10 +110,11 @@ func (s *stubLockableControl) QuickCheck(context.Context) (ControlHealthReport, 
 }
 
 type stubVolumeManager struct {
-	onEnsure func(context.Context, VolumeRequest) (VolumeHandle, error)
-	onAttach func(context.Context, VolumeHandle, AttachOptions) error
-	onDetach func(context.Context, VolumeHandle) error
-	onStream func(string) (<-chan VolumeRole, error)
+	onEnsure  func(context.Context, VolumeRequest) (VolumeHandle, error)
+	onAttach  func(context.Context, VolumeHandle, AttachOptions) error
+	onDetach  func(context.Context, VolumeHandle) error
+	onDestroy func(context.Context, string) error
+	onStream  func(string) (<-chan VolumeRole, error)
 }
 
 func (s *stubVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest) (VolumeHandle, error) {
@@ -133,6 +134,13 @@ func (s *stubVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 func (s *stubVolumeManager) Detach(ctx context.Context, handle VolumeHandle) error {
 	if s.onDetach != nil {
 		return s.onDetach(ctx, handle)
+	}
+	return nil
+}
+
+func (s *stubVolumeManager) DestroyVolume(ctx context.Context, id string) error {
+	if s.onDestroy != nil {
+		return s.onDestroy(ctx, id)
 	}
 	return nil
 }

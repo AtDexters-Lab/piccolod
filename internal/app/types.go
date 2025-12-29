@@ -9,17 +9,34 @@ import (
 
 // ContainerManager describes the container runtime operations required by the app manager.
 type ContainerManager interface {
-	CreateContainer(ctx context.Context, spec container.ContainerCreateSpec) (string, error)
-	StartContainer(ctx context.Context, containerID string) error
-	StopContainer(ctx context.Context, containerID string) error
-	RemoveContainer(ctx context.Context, containerID string) error
-	PullImage(ctx context.Context, image string) error
-	Logs(ctx context.Context, containerID string, lines int) ([]string, error)
+	CreateContainer(ctx context.Context, runtime container.PodmanRuntime, spec container.ContainerCreateSpec) (string, error)
+	StartContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
+	StopContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
+	RemoveContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
+	PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error
+	Logs(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int) ([]string, error)
+	ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error)
+	InspectContainerState(ctx context.Context, runtime container.PodmanRuntime, containerID string) (container.ContainerState, error)
+	InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[int]int, error)
+	UpdatePublishAdd(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
+	UpdatePublishRemove(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
+	ResetStorage(ctx context.Context, runtime container.PodmanRuntime) error
+	// CommitContainer commits a container's current state to a new image.
+	CommitContainer(ctx context.Context, runtime container.PodmanRuntime, containerID, imageName string) error
+	// ImageExists checks if an image exists in local storage.
+	ImageExists(ctx context.Context, runtime container.PodmanRuntime, imageName string) (bool, error)
+	// RemoveImage removes an image from local storage.
+	RemoveImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) error
 }
 
-// AppInstance captures the runtime metadata for an installed application.
+// AppInstance captures the runtime metadata for an installed application instance.
+// InstanceID is the system-generated unique key used everywhere (containers, volumes, services).
+// AppName is the original app definition name from the manifest.
+// DisplayName is an optional user-provided friendly name for UI purposes.
 type AppInstance struct {
-	Name        string            `json:"name"`
+	InstanceID  string            `json:"instance_id"`
+	DisplayName string            `json:"display_name,omitempty"`
+	AppName     string            `json:"app_name"`
 	Image       string            `json:"image"`
 	Type        string            `json:"type"`
 	Status      string            `json:"status"`

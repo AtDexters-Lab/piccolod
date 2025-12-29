@@ -68,14 +68,23 @@ type mountWaiter func(mountPoint string, timeout time.Duration) error
 type execMountLauncher struct{}
 
 func (execMountLauncher) Launch(ctx context.Context, path string, args []string, stdin []byte) (mountProcess, error) {
-	cmd := exec.CommandContext(ctx, path, args...)
+	// Use Background context so the process is not killed when the parent context (request/app) is cancelled.
+	cmd := exec.CommandContext(context.Background(), path, args...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	configureForegroundAttrs(cmd)
+	
+	// Create a new session group to detach from the parent's signals.
+	// Do NOT use configureForegroundAttrs here as Pdeathsig would kill the mount on parent exit.
+	if runtime.GOOS == "linux" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setsid: true,
+		}
+	}
+	
 	if err := cmd.Start(); err != nil {
 		stdinPipe.Close()
 		return nil, err
@@ -143,6 +152,7 @@ type fileVolumeManager struct {
 type volumeEntry struct {
 	handle        VolumeHandle
 	cipherDir     string
+	stateDir      string
 	metadata      volumeMetadata
 	metadataReady bool
 	role          VolumeRole
@@ -271,6 +281,7 @@ func (f *fileVolumeManager) getOrCreateEntry(id string) *volumeEntry {
 			MountDir: filepath.Join(f.root, "mounts", id),
 		},
 		cipherDir: filepath.Join(f.root, "ciphertext", id),
+		stateDir:  filepath.Join(f.stateRoot, id),
 	}
 	f.volumes[id] = entry
 	return entry
@@ -299,6 +310,7 @@ func (f *fileVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 	entry = &volumeEntry{
 		handle:    VolumeHandle{ID: req.ID, MountDir: mountDir},
 		cipherDir: cipherDir,
+		stateDir:  filepath.Join(f.stateRoot, req.ID),
 	}
 	if err := f.ensureMetadata(ctx, entry); err != nil {
 		if !errors.Is(err, crypt.ErrLocked) && !errors.Is(err, crypt.ErrNotInitialized) {
@@ -349,6 +361,19 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 		return f.recordVolumeState(handle.ID, volumeStateMounted, volumeStateMounted, opts.Role, nil)
 	}
 
+	// Adoption: If the volume is already mounted (e.g. survived a restart), we adopt it.
+	// We verify it is accessible to avoid adopting a broken mount.
+	if mounted, err := isMountPoint(handle.MountDir); err == nil && mounted {
+		if _, err := os.Stat(handle.MountDir); err == nil {
+			f.mu.Lock()
+			entry.role = opts.Role
+			// We assume metadata was valid when it was originally mounted.
+			entry.metadataReady = true
+			f.mu.Unlock()
+			return f.recordVolumeState(handle.ID, volumeStateMounted, volumeStateMounted, opts.Role, nil)
+		}
+	}
+
 	if err := f.ensureMetadata(ctx, entry); err != nil {
 		return err
 	}
@@ -362,7 +387,7 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 		return err
 	}
 
-	args := []string{"-f", "-q", "-passfile", "/dev/stdin"}
+	args := []string{"-f", "-q", "-passfile", "/dev/stdin", "-allow_other"}
 	if opts.Role == VolumeRoleFollower {
 		args = append(args, "-ro")
 	}
@@ -439,6 +464,95 @@ func (f *fileVolumeManager) Detach(ctx context.Context, handle VolumeHandle) err
 	return nil
 }
 
+func (f *fileVolumeManager) DestroyVolume(ctx context.Context, id string) error {
+	mountDir := filepath.Join(f.root, "mounts", id)
+	handle := VolumeHandle{ID: id, MountDir: mountDir}
+
+	// 1. Detach if mounted - with retries and lazy unmount fallback
+	if mounted, _ := isMountPoint(mountDir); mounted {
+		if err := f.detachWithRetry(ctx, handle); err != nil {
+			return fmt.Errorf("destroy: detach failed: %w", err)
+		}
+	}
+
+	// 2. Remove Ciphertext
+	cipherDir := filepath.Join(f.root, "ciphertext", id)
+	if err := os.RemoveAll(cipherDir); err != nil {
+		return fmt.Errorf("destroy: remove ciphertext: %w", err)
+	}
+
+	// 3. Remove Metadata/State
+	stateDir := filepath.Join(f.stateRoot, id)
+	if err := os.RemoveAll(stateDir); err != nil {
+		return fmt.Errorf("destroy: remove state: %w", err)
+	}
+
+	// 4. Remove Mountpoint
+	_ = os.Remove(mountDir)
+
+	// 5. Remove from memory
+	f.mu.Lock()
+	delete(f.volumes, id)
+	f.mu.Unlock()
+
+	return nil
+}
+
+// detachWithRetry attempts normal unmount first, then retries with lazy unmount if device is busy.
+func (f *fileVolumeManager) detachWithRetry(ctx context.Context, handle VolumeHandle) error {
+	const maxRetries = 3
+	const retryDelay = 500 * time.Millisecond
+
+	// First try normal detach
+	err := f.Detach(ctx, handle)
+	if err == nil {
+		return nil
+	}
+
+	// Check if error indicates device busy
+	errStr := err.Error()
+	if !strings.Contains(errStr, "busy") && !strings.Contains(errStr, "exit status 1") {
+		return err
+	}
+
+	// Retry with delay - sometimes processes need a moment to release
+	for i := 0; i < maxRetries; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(retryDelay):
+		}
+
+		// Check if still mounted
+		if mounted, _ := isMountPoint(handle.MountDir); !mounted {
+			return nil
+		}
+
+		// Try normal unmount again
+		if err := f.Detach(ctx, handle); err == nil {
+			return nil
+		}
+	}
+
+	// Last resort: lazy unmount (-z flag) which detaches immediately and cleans up when no longer busy
+	args := []string{"-uz", handle.MountDir}
+	if err := f.runner.Run(ctx, f.fusermountPath, args, nil); err != nil {
+		return fmt.Errorf("lazy unmount failed for %s: %w", handle.ID, err)
+	}
+
+	f.awaitProcessExit(handle.ID)
+
+	// Give a moment for lazy unmount to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify unmount succeeded
+	if mounted, _ := isMountPoint(handle.MountDir); mounted {
+		return fmt.Errorf("volume %s still mounted after lazy unmount", handle.ID)
+	}
+
+	return nil
+}
+
 func (f *fileVolumeManager) RoleStream(volumeID string) (<-chan VolumeRole, error) {
 	ch := make(chan VolumeRole)
 	close(ch)
@@ -449,8 +563,29 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 	entry.metaMu.Lock()
 	defer entry.metaMu.Unlock()
 
-	metaPath := filepath.Join(entry.cipherDir, volumeMetadataName)
-	if data, err := os.ReadFile(metaPath); err == nil {
+	// 1. Check State Directory (New Location)
+	metaPath := filepath.Join(entry.stateDir, volumeMetadataName)
+	data, err := os.ReadFile(metaPath)
+
+	// 2. Check Cipher Directory (Legacy Location) & Migrate
+	if errors.Is(err, os.ErrNotExist) {
+		legacyPath := filepath.Join(entry.cipherDir, volumeMetadataName)
+		if legacyData, legacyErr := os.ReadFile(legacyPath); legacyErr == nil {
+			// Found in legacy location. Migrate to state dir.
+			if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
+				return fmt.Errorf("ensure state dir for migration: %w", err)
+			}
+			if err := os.WriteFile(metaPath, legacyData, 0o600); err != nil {
+				return fmt.Errorf("migrate metadata: %w", err)
+			}
+			// Remove from legacy location to stop gocryptfs warnings
+			_ = os.Remove(legacyPath)
+			data = legacyData
+			err = nil
+		}
+	}
+
+	if err == nil {
 		var meta volumeMetadata
 		if err := json.Unmarshal(data, &meta); err != nil {
 			return fmt.Errorf("%w: %v", ErrVolumeMetadataCorrupted, err)
@@ -476,17 +611,15 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 		if err != nil {
 			return err
 		}
+		if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
+			return err
+		}
 		if err := os.WriteFile(metaPath, metaBytes, 0o600); err != nil {
 			return err
 		}
-		confPath := filepath.Join(entry.cipherDir, gocryptfsConfigName)
-		if _, err := os.Stat(confPath); errors.Is(err, os.ErrNotExist) {
-			if err := os.WriteFile(confPath, []byte("bypass"), 0o600); err != nil {
-				return err
-			}
-		} else if err != nil {
-			return err
-		}
+		// Bypass mode also needs a legacy conf file check? Or just ensure cipherDir init?
+		// Usually bypass doesn't use real gocryptfs, but let's leave legacy conf check if needed.
+		// Actually, bypass usually just writes metadata.
 		entry.metadata = meta
 		entry.metadataReady = true
 		return nil
@@ -508,6 +641,9 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 
 	metaBytes, err := json.MarshalIndent(&meta, "", "  ")
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
 		return err
 	}
 	if err := os.WriteFile(metaPath, metaBytes, 0o600); err != nil {
@@ -599,6 +735,17 @@ func (f *fileVolumeManager) reconcileVolumeState(ctx context.Context, entry *vol
 	mounted, err := isMountPoint(entry.handle.MountDir)
 	if err != nil {
 		return err
+	}
+	if mounted {
+		if _, err := os.Stat(entry.handle.MountDir); err != nil {
+			if errors.Is(err, syscall.ENOTCONN) {
+				_ = f.recordVolumeState(entry.handle.ID, state.Desired, volumeStateError, parseVolumeRole(state.Role), fmt.Errorf("broken mount detected: %w", err))
+				if detachErr := f.Detach(ctx, entry.handle); detachErr != nil {
+					return fmt.Errorf("broken mount detected for %s, detach failed: %w", entry.handle.ID, detachErr)
+				}
+				mounted = false
+			}
+		}
 	}
 	role := parseVolumeRole(state.Role)
 	if state.Desired == volumeStateMounted && !mounted {

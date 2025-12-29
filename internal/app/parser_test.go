@@ -164,11 +164,23 @@ func TestValidateAppDefinition(t *testing.T) {
 		{
 			name: "valid minimal app",
 			app: &api.AppDefinition{
-				Name:      "test-app",
-				Image:     "nginx:latest",
-				Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+				Name:       "test-app",
+				Image:      "nginx:latest",
+				Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+				Extensions: map[string]interface{}{"mode": "service"},
 			},
 			expectError: false,
+		},
+		{
+			name: "missing x-piccolo.mode",
+			app: &api.AppDefinition{
+				Name:       "test-app",
+				Image:      "nginx:latest",
+				Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+				Extensions: map[string]interface{}{},
+			},
+			expectError: true,
+			expectedErr: "x-piccolo.mode is required",
 		},
 		{
 			name:        "empty name",
@@ -323,6 +335,80 @@ func TestLargeContentHandling(t *testing.T) {
 
 	if app.Name != "large-app" {
 		t.Errorf("Expected name 'large-app', got %s", app.Name)
+	}
+}
+
+func TestParseAppDefinitionRejectsFilesystemBlock(t *testing.T) {
+	legacy := `
+name: test-app
+image: nginx:latest
+listeners:
+  - name: web
+    guest_port: 80
+filesystem:
+  persistent: true
+x-piccolo:
+  mode: workspace
+`
+
+	_, err := ParseAppDefinition([]byte(legacy))
+	if err == nil {
+		t.Fatalf("expected error but got none")
+	}
+	if !containsString(err.Error(), "filesystem is no longer supported") {
+		t.Fatalf("expected filesystem rejection error, got %q", err.Error())
+	}
+}
+
+func TestParseAppDefinitionRejectsStorageHostPaths(t *testing.T) {
+	legacy := `
+name: test-app
+image: nginx:latest
+listeners:
+  - name: web
+    guest_port: 80
+storage:
+  persistent:
+    data:
+      container: /data
+      host: /var/lib/piccolod/not-allowed
+x-piccolo:
+  mode: service
+`
+
+	_, err := ParseAppDefinition([]byte(legacy))
+	if err == nil {
+		t.Fatalf("expected error but got none")
+	}
+	if !containsString(err.Error(), "must not specify host") {
+		t.Fatalf("expected host rejection error, got %q", err.Error())
+	}
+}
+
+func TestParseAppDefinitionRejectsStoragePathConflicts(t *testing.T) {
+	conflict := `
+name: test-app
+image: nginx:latest
+listeners:
+  - name: web
+    guest_port: 80
+storage:
+  persistent:
+    data:
+      container: /data
+  temporary:
+    tmp:
+      container: /data
+x-piccolo:
+  mode: service
+`
+
+	_, err := ParseAppDefinition([]byte(conflict))
+	if err == nil {
+		t.Fatalf("expected error but got none")
+	}
+	if !containsString(err.Error(), "conflicts with") {
+		t.Fatalf("expected storage conflict error, got %q", err.Error())
 	}
 }
 

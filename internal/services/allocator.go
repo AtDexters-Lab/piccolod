@@ -2,6 +2,8 @@ package services
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 )
 
 // PortAllocator allocates ephemeral ports within configured ranges (in-memory)
@@ -50,11 +52,14 @@ func (a *PortAllocator) allocateHost() (int, error) {
 	startHB := hb
 	for {
 		if _, ok := a.usedHost[hb]; !ok {
-			a.usedHost[hb] = struct{}{}
-			if hb >= a.nextHostBind {
-				a.nextHostBind = hb + 1
+			// Probe OS availability
+			if isPortFree("127.0.0.1", hb) {
+				a.usedHost[hb] = struct{}{}
+				if hb >= a.nextHostBind {
+					a.nextHostBind = hb + 1
+				}
+				return hb, nil
 			}
-			return hb, nil
 		}
 		hb++
 		hb = a.nextInRange(hb, a.hostBindRange)
@@ -69,11 +74,14 @@ func (a *PortAllocator) allocatePublic() (int, error) {
 	startPP := pp
 	for {
 		if _, ok := a.usedPublic[pp]; !ok {
-			a.usedPublic[pp] = struct{}{}
-			if pp >= a.nextPublic {
-				a.nextPublic = pp + 1
+			// Probe OS availability (public ports bind to all interfaces usually)
+			if isPortFree("", pp) {
+				a.usedPublic[pp] = struct{}{}
+				if pp >= a.nextPublic {
+					a.nextPublic = pp + 1
+				}
+				return pp, nil
 			}
-			return pp, nil
 		}
 		pp++
 		pp = a.nextInRange(pp, a.publicRange)
@@ -81,6 +89,16 @@ func (a *PortAllocator) allocatePublic() (int, error) {
 			return 0, fmt.Errorf("no available public ports in range %d-%d", a.publicRange.Start, a.publicRange.End)
 		}
 	}
+}
+
+func isPortFree(host string, port int) bool {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return false
+	}
+	l.Close()
+	return true
 }
 
 // ReserveHost reserves an existing host-bind port so it won't be reused.

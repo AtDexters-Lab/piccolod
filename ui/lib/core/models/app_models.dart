@@ -1,9 +1,10 @@
-
 import '../config/core_config.dart';
 
 class App {
   final String id;
   final String name;
+  final String appName;
+  final String displayName;
   final String image;
   final String type;
   final String status;
@@ -14,6 +15,8 @@ class App {
   App({
     required this.id,
     required this.name,
+    this.appName = '',
+    this.displayName = '',
     required this.image,
     required this.type,
     required this.status,
@@ -23,13 +26,21 @@ class App {
   });
 
   factory App.fromJson(Map<String, dynamic> json) {
+    final instanceId = (json['instance_id'] ?? json['name'] ?? json['id'] ?? '')
+        .toString();
+    final appName = (json['app_name'] ?? json['name'] ?? '').toString();
+    final displayName = (json['display_name'] ?? '').toString();
+
     return App(
-      id: json['id'] ?? '',
-      name: json['name'] ?? '',
+      id: instanceId,
+      name: instanceId,
+      appName: appName,
+      displayName: displayName,
       image: json['image'] ?? '',
       type: json['type'] ?? 'user',
       status: json['status'] ?? 'unknown',
-      volumes: (json['volumes'] as List<dynamic>?)
+      volumes:
+          (json['volumes'] as List<dynamic>?)
               ?.map((e) => AppVolume.fromJson(e))
               .toList() ??
           [],
@@ -39,8 +50,15 @@ class App {
   }
 
   bool get isRunning => status.toLowerCase() == 'running';
-  bool get isStopped => status.toLowerCase() == 'stopped' || status.toLowerCase() == 'created';
+  bool get isStopped =>
+      status.toLowerCase() == 'stopped' || status.toLowerCase() == 'created';
   bool get isError => status.toLowerCase() == 'error';
+
+  String get displayTitle {
+    if (displayName.isNotEmpty) return displayName;
+    if (appName.isNotEmpty) return appName;
+    return name;
+  }
 }
 
 class AppVolume {
@@ -101,30 +119,6 @@ class ServiceEndpoint {
       protocol: json['protocol'] ?? 'raw',
       localUrl: json['local_url'],
     );
-  }
-
-  // Helper to get the primary LAN URL
-  String get lanUrl {
-    // If localUrl is provided by backend, use it
-    if (localUrl != null && localUrl!.isNotEmpty) return localUrl!;
-    
-    // Determine hostname
-    String host = 'piccolo.local';
-    
-    // If API_BASE_URL is set (Dev mode), use that host
-    if (CoreConfig.apiBaseUrl.isNotEmpty) {
-      try {
-        final uri = Uri.parse(CoreConfig.apiBaseUrl);
-        if (uri.host.isNotEmpty) {
-          host = uri.host;
-        }
-      } catch (_) {
-        // Ignore parse errors, stick to default
-      }
-    }
-    
-    // Fallback: Construct http(s)://hostname:publicPort
-    return 'http://$host${publicPort == 80 ? '' : ':$publicPort'}'; 
   }
 
   // Helper to get the Remote URL (if enabled)
@@ -196,7 +190,8 @@ class CatalogResponse {
 
   factory CatalogResponse.fromJson(Map<String, dynamic> json) {
     return CatalogResponse(
-      apps: (json['apps'] as List<dynamic>?)
+      apps:
+          (json['apps'] as List<dynamic>?)
               ?.map((e) => CatalogItem.fromJson(e))
               .toList() ??
           [],
@@ -219,7 +214,8 @@ class AppValidationResult {
     // or 200 with { "valid": true/false }
     return AppValidationResult(
       valid: json['valid'] ?? false,
-      error: json['error'], // If backend returns error detail in 200 OK structure
+      error:
+          json['error'], // If backend returns error detail in 200 OK structure
     );
   }
 }

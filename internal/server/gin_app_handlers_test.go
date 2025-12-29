@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -99,8 +100,8 @@ environment:
 		{
 			name:           "install with wrong content type",
 			method:         "POST",
-			contentType:    "application/json",
-			body:           `{"name": "test"}`,
+			contentType:    "text/plain",
+			body:           "name: test",
 			expectedStatus: http.StatusUnsupportedMediaType,
 			expectError:    true,
 		},
@@ -172,6 +173,113 @@ environment:
 	}
 }
 
+func TestGinAppAPI_Install_JSON_WithDisplayName(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tempDir := t.TempDir()
+	server := createGinTestServer(t, tempDir)
+	sessionCookie, csrfToken := setupTestAdminSession(t, server)
+
+	payload := map[string]interface{}{
+		"app_definition": `name: test-nginx
+image: docker.io/library/nginx:alpine
+type: user
+listeners:
+  - name: web
+    guest_port: 80
+    flow: tcp
+    protocol: http`,
+		"display_name": "Work Projects",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/apps", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+	server.router.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected %d, got %d body=%s", http.StatusCreated, w.Code, w.Body.String())
+	}
+
+	var resp GinAppResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	data, ok := resp.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("response data not object: %#v", resp.Data)
+	}
+	if got := data["display_name"]; got != "Work Projects" {
+		t.Fatalf("expected display_name %q, got %#v", "Work Projects", got)
+	}
+	if got := data["app_name"]; got != "test-nginx" {
+		t.Fatalf("expected app_name %q, got %#v", "test-nginx", got)
+	}
+	if got := data["instance_id"]; got != "test-nginx" {
+		t.Fatalf("expected instance_id %q, got %#v", "test-nginx", got)
+	}
+}
+
+func TestGinAppAPI_CheckInstance(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tempDir := t.TempDir()
+	server := createGinTestServer(t, tempDir)
+	sessionCookie, csrfToken := setupTestAdminSession(t, server)
+
+	check := func(id string) (bool, string) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/apps/check-instance?id="+id, nil)
+		attachAuth(req, sessionCookie, csrfToken)
+		server.router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("check-instance: expected %d, got %d body=%s", http.StatusOK, w.Code, w.Body.String())
+		}
+		var resp struct {
+			Available bool   `json:"available"`
+			Suggested string `json:"suggested"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode check-instance: %v", err)
+		}
+		return resp.Available, resp.Suggested
+	}
+
+	available, suggested := check("demo")
+	if !available {
+		t.Fatalf("expected demo to be available")
+	}
+	if suggested != "demo" {
+		t.Fatalf("expected suggested to be demo, got %q", suggested)
+	}
+
+	appDef := &api.AppDefinition{
+		Name:       "demo",
+		Image:      "alpine:latest",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	if _, err := server.appManager.Install(context.Background(), appDef, ""); err != nil {
+		t.Fatalf("install app: %v", err)
+	}
+
+	available, suggested = check("demo")
+	if available {
+		t.Fatalf("expected demo to be unavailable")
+	}
+	if suggested == "demo" {
+		t.Fatalf("expected suggested to differ from demo")
+	}
+	if !strings.HasPrefix(suggested, "demo-") {
+		t.Fatalf("expected suggested to start with demo-, got %q", suggested)
+	}
+}
+
 // TestGinAppAPI_List tests GET /api/v1/apps endpoint with Gin
 func TestGinAppAPI_List(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -214,13 +322,14 @@ func TestGinAppAPI_List(t *testing.T) {
 
 	// Install an app via the app manager directly
 	appDef := &api.AppDefinition{
-		Name:      "test-app",
-		Image:     "nginx:alpine",
-		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:       "test-app",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
+	_, err = server.appManager.Install(context.Background(), appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -286,7 +395,8 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 			Flow:      api.FlowTCP,
 			Protocol:  api.ListenerProtocolHTTP,
 		}},
-	})
+		Extensions: map[string]interface{}{"mode": "service"},
+	}, "")
 	if err != nil {
 		t.Fatalf("install app: %v", err)
 	}
@@ -342,13 +452,14 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:      "test-app",
-		Image:     "nginx:alpine",
-		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:       "test-app",
+		Image:      "nginx:alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
+	_, err = server.appManager.Install(context.Background(), appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -416,13 +527,14 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:      "test-app",
-		Image:     "alpine:latest",
-		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:       "test-app",
+		Image:      "alpine:latest",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
+	_, err = server.appManager.Install(context.Background(), appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -623,13 +735,14 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:      "test-app",
-		Image:     "alpine:latest",
-		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:       "test-app",
+		Image:      "alpine:latest",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
+	_, err = server.appManager.Install(context.Background(), appDef, "")
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -818,14 +931,57 @@ func TestHandlePersistenceFullExport(t *testing.T) {
 	}
 }
 
+type stubTestVolumeManager struct {
+	root string
+}
+
+func (s *stubTestVolumeManager) EnsureVolume(ctx context.Context, req persistence.VolumeRequest) (persistence.VolumeHandle, error) {
+	_ = ctx
+	handle := persistence.VolumeHandle{
+		ID:       req.ID,
+		MountDir: filepath.Join(s.root, "mounts", req.ID),
+	}
+	if err := os.MkdirAll(handle.MountDir, 0o700); err != nil {
+		return persistence.VolumeHandle{}, err
+	}
+	return handle, nil
+}
+
+func (s *stubTestVolumeManager) Attach(ctx context.Context, handle persistence.VolumeHandle, opts persistence.AttachOptions) error {
+	_ = ctx
+	_ = handle
+	_ = opts
+	return nil
+}
+
+func (s *stubTestVolumeManager) Detach(ctx context.Context, handle persistence.VolumeHandle) error {
+	_ = ctx
+	_ = handle
+	return nil
+}
+
+func (s *stubTestVolumeManager) DestroyVolume(ctx context.Context, id string) error {
+	_ = ctx
+	return os.RemoveAll(filepath.Join(s.root, "mounts", id))
+}
+
+func (s *stubTestVolumeManager) RoleStream(id string) (<-chan persistence.VolumeRole, error) {
+	_ = id
+	ch := make(chan persistence.VolumeRole)
+	close(ch)
+	return ch, nil
+}
+
 // createGinTestServer creates a Gin test server instance with filesystem state management
 func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	t.Helper()
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(tempDir, "run", "podman"))
 	ensureTestControlMetadata(t, tempDir)
 	// Create mock container manager for app manager
 	mockContainer := &GinMockContainerManager{
 		containers: make(map[string]*MockContainer),
+		images:     make(map[string]struct{}),
 		nextID:     1,
 	}
 
@@ -837,6 +993,7 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	}
 	requireMountBypassAllowed(t)
 	appMgr.SetMountVerifier(func(string) error { return nil })
+	appMgr.SetVolumeManager(&stubTestVolumeManager{root: tempDir})
 	eventsBus := events.NewBus()
 	appMgr.ObserveRuntimeEvents(eventsBus)
 	eventsBus.Publish(events.Event{Topic: events.TopicLockStateChanged, Payload: events.LockStateChanged{Locked: false}})
@@ -1036,6 +1193,7 @@ func generateMockContainerID(id int) string {
 // GinMockContainerManager implements the ContainerManager interface for Gin testing
 type GinMockContainerManager struct {
 	containers  map[string]*MockContainer
+	images      map[string]struct{}
 	nextID      int
 	createError error
 	startError  error
@@ -1043,7 +1201,8 @@ type GinMockContainerManager struct {
 	removeError error
 }
 
-func (m *GinMockContainerManager) CreateContainer(ctx context.Context, spec container.ContainerCreateSpec) (string, error) {
+func (m *GinMockContainerManager) CreateContainer(ctx context.Context, runtime container.PodmanRuntime, spec container.ContainerCreateSpec) (string, error) {
+	_ = runtime
 	if m.createError != nil {
 		return "", m.createError
 	}
@@ -1067,7 +1226,8 @@ func (m *GinMockContainerManager) CreateContainer(ctx context.Context, spec cont
 	return containerID, nil
 }
 
-func (m *GinMockContainerManager) StartContainer(ctx context.Context, containerID string) error {
+func (m *GinMockContainerManager) StartContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
+	_ = runtime
 	if m.startError != nil {
 		return m.startError
 	}
@@ -1079,7 +1239,8 @@ func (m *GinMockContainerManager) StartContainer(ctx context.Context, containerI
 	return container.ErrContainerNotFound(containerID)
 }
 
-func (m *GinMockContainerManager) StopContainer(ctx context.Context, containerID string) error {
+func (m *GinMockContainerManager) StopContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
+	_ = runtime
 	if m.stopError != nil {
 		return m.stopError
 	}
@@ -1091,7 +1252,8 @@ func (m *GinMockContainerManager) StopContainer(ctx context.Context, containerID
 	return container.ErrContainerNotFound(containerID)
 }
 
-func (m *GinMockContainerManager) RemoveContainer(ctx context.Context, containerID string) error {
+func (m *GinMockContainerManager) RemoveContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
+	_ = runtime
 	if m.removeError != nil {
 		return m.removeError
 	}
@@ -1103,11 +1265,55 @@ func (m *GinMockContainerManager) RemoveContainer(ctx context.Context, container
 	return container.ErrContainerNotFound(containerID)
 }
 
-func (m *GinMockContainerManager) PullImage(ctx context.Context, image string) error {
+func (m *GinMockContainerManager) PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error {
+	_ = runtime
+	_ = image
 	return nil
 }
 
-func (m *GinMockContainerManager) Logs(ctx context.Context, containerID string, lines int) ([]string, error) {
+func (m *GinMockContainerManager) ResetStorage(ctx context.Context, runtime container.PodmanRuntime) error {
+	_ = ctx
+	_ = runtime
+	m.containers = make(map[string]*MockContainer)
+	m.images = make(map[string]struct{})
+	return nil
+}
+
+func (m *GinMockContainerManager) CommitContainer(ctx context.Context, runtime container.PodmanRuntime, containerID, imageName string) error {
+	_ = ctx
+	_ = runtime
+	if _, ok := m.containers[containerID]; !ok {
+		return container.ErrContainerNotFound(containerID)
+	}
+	if m.images == nil {
+		m.images = make(map[string]struct{})
+	}
+	m.images[imageName] = struct{}{}
+	return nil
+}
+
+func (m *GinMockContainerManager) ImageExists(ctx context.Context, runtime container.PodmanRuntime, imageName string) (bool, error) {
+	_ = ctx
+	_ = runtime
+	if m.images == nil {
+		return false, nil
+	}
+	_, ok := m.images[imageName]
+	return ok, nil
+}
+
+func (m *GinMockContainerManager) RemoveImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) error {
+	_ = ctx
+	_ = runtime
+	if m.images == nil {
+		return nil
+	}
+	delete(m.images, imageName)
+	return nil
+}
+
+func (m *GinMockContainerManager) Logs(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int) ([]string, error) {
+	_ = runtime
 	if _, ok := m.containers[containerID]; !ok {
 		return nil, container.ErrContainerNotFound(containerID)
 	}
@@ -1121,6 +1327,70 @@ func (m *GinMockContainerManager) Logs(ctx context.Context, containerID string, 
 	return out, nil
 }
 
+func (m *GinMockContainerManager) ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error) {
+	_ = ctx
+	_ = runtime
+	for id, c := range m.containers {
+		if c.Name == name {
+			return id, nil
+		}
+	}
+	return "", container.ErrContainerNotFound(name)
+}
+
+func (m *GinMockContainerManager) InspectContainerState(ctx context.Context, runtime container.PodmanRuntime, containerID string) (container.ContainerState, error) {
+	_ = ctx
+	_ = runtime
+	c, ok := m.containers[containerID]
+	if !ok {
+		return container.ContainerState{Exists: false, Running: false}, nil
+	}
+	return container.ContainerState{Exists: true, Running: c.Status == "running"}, nil
+}
+
+func (m *GinMockContainerManager) InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[int]int, error) {
+	_ = ctx
+	_ = runtime
+	c, ok := m.containers[containerID]
+	if !ok {
+		return nil, container.ErrContainerNotFound(containerID)
+	}
+	out := make(map[int]int, len(c.Spec.Ports))
+	for _, p := range c.Spec.Ports {
+		out[p.Container] = p.Host
+	}
+	return out, nil
+}
+
+func (m *GinMockContainerManager) UpdatePublishAdd(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error {
+	_ = ctx
+	_ = runtime
+	c, ok := m.containers[containerID]
+	if !ok {
+		return container.ErrContainerNotFound(containerID)
+	}
+	c.Spec.Ports = append(c.Spec.Ports, container.PortMapping{Host: hostBind, Container: guestPort})
+	return nil
+}
+
+func (m *GinMockContainerManager) UpdatePublishRemove(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error {
+	_ = ctx
+	_ = runtime
+	c, ok := m.containers[containerID]
+	if !ok {
+		return container.ErrContainerNotFound(containerID)
+	}
+	out := make([]container.PortMapping, 0, len(c.Spec.Ports))
+	for _, p := range c.Spec.Ports {
+		if p.Host == hostBind && p.Container == guestPort {
+			continue
+		}
+		out = append(out, p)
+	}
+	c.Spec.Ports = out
+	return nil
+}
+
 func TestServicesLocalURLGeneration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tempDir := t.TempDir()
@@ -1132,12 +1402,13 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	// But we can use AllocateForApp if we mock it, OR just manually register an app first.
 	// Let's use Install() for consistency
 	appDef := &api.AppDefinition{
-		Name:      "url-test",
-		Image:     "alpine",
-		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Name:       "url-test",
+		Image:      "alpine",
+		Type:       "user",
+		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	_, err := server.appManager.Install(context.Background(), appDef)
+	_, err := server.appManager.Install(context.Background(), appDef, "")
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}

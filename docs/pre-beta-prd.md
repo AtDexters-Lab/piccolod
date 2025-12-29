@@ -28,7 +28,7 @@ Purpose: Ship a dependable, privacy‑first image that tinkerers can boot, insta
 - Logging: never log secrets; redact sensitive data.
 
 ## Encryption Architecture
-- Per‑app encrypted directories (gocryptfs‑style) under `/var/piccolo/apps/<app>/data`.
+- Per‑app encrypted volumes (gocryptfs‑style) mounted under `$PICCOLO_STATE_DIR/mounts/app-<app>/` (datasets: `disk/` and `data/`).
 - Keys
   - SDEK: random per‑directory data key used by gocryptfs.
   - KEK: derived via Argon2id(admin password + salt). Optional TPM‑sealed pepper to harden KEK derivation. TPM never auto‑unlocks data.
@@ -42,8 +42,8 @@ Purpose: Ship a dependable, privacy‑first image that tinkerers can boot, insta
 - Non‑TPM devices: remote unlock unavailable; must unlock on the LAN; remote publish resumes only after unlock.
 - TPM devices: remote portal can be available over HTTPS in locked mode within ≤ 5 minutes after reboot.
 - TEK approach
-  - Generate TEK (256‑bit) and seal to TPM PolicyPCR (PCR7 pre‑beta). Store sealed blob at `/var/piccolo/tpm/sealed_tek`.
-  - On boot, unseal TEK and decrypt the auto‑unlock secrets directory `/var/piccolo/auto-unlock/` (AES‑256‑GCM per file):
+  - Generate TEK (256‑bit) and seal to TPM PolicyPCR (PCR7 pre‑beta). Store sealed blob at `$PICCOLO_STATE_DIR/tpm/sealed_tek`.
+  - On boot, unseal TEK and decrypt the auto‑unlock secrets directory `$PICCOLO_STATE_DIR/auto-unlock/` (AES‑256‑GCM per file):
     - `nexus.jwt.enc` — full‑claim JWT (Phase 1) for Nexus tunnel while locked.
     - `portal_acme_account.key.enc` — ACME account key (e.g., ECDSA P‑256).
     - `portal_tls.key.enc` — portal TLS private key; `portal_tls.chain.pem` stores public chain (may be plaintext).
@@ -118,14 +118,14 @@ Purpose: Ship a dependable, privacy‑first image that tinkerers can boot, insta
 
 ## Data & Secret Paths
 - Auto‑unlock (TPM only)
-  - TEK sealed blob: `/var/piccolo/tpm/sealed_tek`
-  - Encrypted secrets dir: `/var/piccolo/auto-unlock/`
+  - TEK sealed blob: `$PICCOLO_STATE_DIR/tpm/sealed_tek`
+  - Encrypted secrets dir: `$PICCOLO_STATE_DIR/auto-unlock/`
     - `nexus.jwt.enc`
     - `portal_acme_account.key.enc`
     - `portal_tls.key.enc`
     - `portal_tls.chain.pem`
-- Encrypted app data: `/var/piccolo/apps/<app>/data` (gocryptfs mount)
-- App certs (encrypted after unlock): `/var/piccolo/certs/<app>/`
+- Encrypted app data: `$PICCOLO_STATE_DIR/mounts/app-<app>/data/` (inside per-app encrypted volume)
+- Portal/remote certs (encrypted on bootstrap volume after unlock): `$PICCOLO_STATE_DIR/mounts/bootstrap/remote/certs/`
 
 ## Risks & Mitigations
 - PCR drift after updates → Pre‑seal next PCRs with PolicyOR; on mismatch, require LAN unlock and re‑seal.

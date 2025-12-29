@@ -36,6 +36,22 @@ func TestPersistenceStateDirHasNoPlaintextArtifacts(t *testing.T) {
 		f.Close()
 	}
 
+	// Check for user_allow_other in /etc/fuse.conf, required for -allow_other
+	if content, err := os.ReadFile("/etc/fuse.conf"); err == nil {
+		found := false
+		for _, line := range strings.Split(string(content), "\n") {
+			if strings.TrimSpace(line) == "user_allow_other" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Skip("skipping test: user_allow_other not enabled in /etc/fuse.conf")
+		}
+	} else {
+		t.Skipf("skipping test: cannot read /etc/fuse.conf: %v", err)
+	}
+
 	stateDir := t.TempDir()
 	t.Setenv("PICCOLO_STATE_DIR", stateDir)
 	t.Setenv("PICCOLO_GOCRYPTFS_PATH", gocryptfsPath)

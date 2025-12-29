@@ -61,7 +61,7 @@ class _LibraryTabState extends State<LibraryTab> {
   void _openAppDetail(App app) {
     widget.desktopController.openApp(
       "app-detail-${app.name}",
-      app.name,
+      app.displayTitle,
       Icons.settings_applications,
       AppDetailView(
         appId: app.name,
@@ -130,7 +130,8 @@ class _LibraryTabState extends State<LibraryTab> {
 
     final filteredApps = _allApps.where((app) {
       final q = widget.searchQuery.toLowerCase();
-      return app.name.toLowerCase().contains(q) ||
+      return app.displayTitle.toLowerCase().contains(q) ||
+          app.name.toLowerCase().contains(q) ||
           app.image.toLowerCase().contains(q);
     }).toList();
 
@@ -184,6 +185,8 @@ class _AppCard extends StatelessWidget {
     if (app.isRunning) statusColor = PiccoloTheme.success;
     if (app.isError) statusColor = PiccoloTheme.critical;
 
+    final title = app.displayTitle.isNotEmpty ? app.displayTitle : app.name;
+
     return Card(
       elevation: 0,
       color: Colors.white, // White card on porcelain bg? No, Window is white/porcelain.
@@ -210,7 +213,7 @@ class _AppCard extends StatelessWidget {
                 ),
                 child: Center(
                     child: Text(
-                        app.name.isNotEmpty ? app.name[0].toUpperCase() : "?",
+                        title.isNotEmpty ? title[0].toUpperCase() : "?",
                         style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: PiccoloTheme.cobalt600),
                     ),
                 ),
@@ -218,7 +221,7 @@ class _AppCard extends StatelessWidget {
               const SizedBox(height: 16),
               // Name
               Text(
-                app.name,
+                title,
                 style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold),
                 textAlign: TextAlign.center,
                 maxLines: 1,

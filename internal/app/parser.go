@@ -17,11 +17,53 @@ var (
 	appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$`)
 )
 
+// PiccoloMode represents the execution mode for an app as defined in x-piccolo.mode.
+type PiccoloMode string
+
+const (
+	// ModeService indicates a stateless/replaceable container mode.
+	// Container filesystem is ephemeral and not preserved across reinstalls.
+	ModeService PiccoloMode = "service"
+
+	// ModeWorkspace indicates a persistent workspace mode.
+	// Container filesystem changes are preserved via snapshots across reinstalls (without purge).
+	ModeWorkspace PiccoloMode = "workspace"
+
+	// ModeUnknown indicates the mode could not be determined.
+	ModeUnknown PiccoloMode = ""
+)
+
+func hasTopLevelKey(node *yaml.Node, key string) bool {
+	if node == nil {
+		return false
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) == 1 {
+		node = node.Content[0]
+	}
+	if node.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		k := node.Content[i]
+		if k != nil && k.Kind == yaml.ScalarNode && k.Value == key {
+			return true
+		}
+	}
+	return false
+}
+
 // ParseAppSchema parses the YAML to extract metadata and inputs without strict validation.
 // This is used to read the manifest before variable substitution.
 func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(content, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+	}
+	if hasTopLevelKey(&root, "filesystem") {
+		return nil, fmt.Errorf("filesystem is no longer supported; use x-piccolo.mode")
+	}
 	var app api.AppDefinition
-	if err := yaml.Unmarshal(content, &app); err != nil {
+	if err := root.Decode(&app); err != nil {
 		return nil, fmt.Errorf("failed to parse YAML: %w", err)
 	}
 	// We do NOT call SetDefaults or ValidateAppDefinition here because
@@ -57,7 +99,14 @@ func ParseAppDefinition(content []byte) (*api.AppDefinition, error) {
 	var app api.AppDefinition
 
 	// Parse YAML
-	if err := yaml.Unmarshal(content, &app); err != nil {
+	var root yaml.Node
+	if err := yaml.Unmarshal(content, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse YAML: %w", err)
+	}
+	if hasTopLevelKey(&root, "filesystem") {
+		return nil, fmt.Errorf("filesystem is no longer supported; use x-piccolo.mode")
+	}
+	if err := root.Decode(&app); err != nil {
 		return nil, fmt.Errorf("failed to parse YAML: %w", err)
 	}
 
@@ -134,6 +183,54 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 	// Validate permissions
 	if err := validatePermissions(app.Permissions); err != nil {
 		return err
+	}
+
+	// Validate Piccolo-specific extensions (required mode + consistency checks).
+	if err := validatePiccoloExtensions(app); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func piccoloModeFromExtensions(extensions map[string]interface{}) PiccoloMode {
+	if extensions == nil {
+		return ModeUnknown
+	}
+	raw, ok := extensions["mode"]
+	if !ok {
+		return ModeUnknown
+	}
+	modeStr, ok := raw.(string)
+	if !ok {
+		return ModeUnknown
+	}
+	modeStr = strings.TrimSpace(modeStr)
+	switch PiccoloMode(modeStr) {
+	case ModeService:
+		return ModeService
+	case ModeWorkspace:
+		return ModeWorkspace
+	default:
+		return ModeUnknown
+	}
+}
+
+func validatePiccoloExtensions(app *api.AppDefinition) error {
+	if app == nil {
+		return nil
+	}
+
+	mode := piccoloModeFromExtensions(app.Extensions)
+	if mode == ModeUnknown {
+		if app.Extensions == nil {
+			return fmt.Errorf("x-piccolo is required; set x-piccolo.mode to 'service' or 'workspace'")
+		}
+		// Check if mode key exists but has invalid value
+		if raw, ok := app.Extensions["mode"]; ok {
+			return fmt.Errorf("x-piccolo.mode must be 'service' or 'workspace', got '%v'", raw)
+		}
+		return fmt.Errorf("x-piccolo.mode is required; must be 'service' or 'workspace'")
 	}
 
 	return nil
@@ -262,6 +359,27 @@ func validateStorage(storage *api.AppStorage) error {
 		return err
 	}
 
+	// Prevent conflicting mountpoints inside the container.
+	seen := make(map[string]string)
+	for name, vol := range storage.Persistent {
+		if vol.Container == "" {
+			continue
+		}
+		if prev, ok := seen[vol.Container]; ok {
+			return fmt.Errorf("storage volume 'persistent.%s' container path %s conflicts with %s", name, vol.Container, prev)
+		}
+		seen[vol.Container] = fmt.Sprintf("persistent.%s", name)
+	}
+	for name, vol := range storage.Temporary {
+		if vol.Container == "" {
+			continue
+		}
+		if prev, ok := seen[vol.Container]; ok {
+			return fmt.Errorf("storage volume 'temporary.%s' container path %s conflicts with %s", name, vol.Container, prev)
+		}
+		seen[vol.Container] = fmt.Sprintf("temporary.%s", name)
+	}
+
 	return nil
 }
 
@@ -278,6 +396,11 @@ func validateStorageVolumes(volumes map[string]api.AppVolume, storageType string
 
 		if volume.Container == "" {
 			return fmt.Errorf("%s storage volume '%s' must specify container path", storageType, name)
+		}
+
+		// Host paths are not user-configurable in Piccolo (all host paths live under the app's encrypted volume).
+		if strings.TrimSpace(volume.Host) != "" {
+			return fmt.Errorf("%s storage volume '%s' must not specify host; Piccolo manages host paths", storageType, name)
 		}
 
 		// Validate container path is absolute

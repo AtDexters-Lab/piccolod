@@ -1,14 +1,11 @@
 package services
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"net"
-	"os/exec"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -478,7 +475,6 @@ func (m *ServiceManager) Stop() {
 func (m *ServiceManager) checkBackends() {
 	// Snapshot under lock
 	snap := m.snapshotRegistry()
-	ids := m.snapshotContainerIDs()
 
 	// TCP connectivity check per endpoint
 	for _, mapp := range snap {
@@ -490,16 +486,6 @@ func (m *ServiceManager) checkBackends() {
 				continue
 			}
 			_ = conn.Close()
-		}
-	}
-
-	// Podman publish mapping check per app (best-effort)
-	for app, id := range ids {
-		if id == "" {
-			continue
-		}
-		if err := verifyPodmanPorts(id, snap[app]); err != nil {
-			log.Printf("WARN: Podman port mapping mismatch for app %s (cid=%s): %v", app, id, err)
 		}
 	}
 }
@@ -516,59 +502,6 @@ func (m *ServiceManager) snapshotRegistry() map[string]map[string]ServiceEndpoin
 		clone[app] = mm
 	}
 	return clone
-}
-
-func (m *ServiceManager) snapshotContainerIDs() map[string]string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	clone := make(map[string]string, len(m.containerIDs))
-	for app, id := range m.containerIDs {
-		clone[app] = id
-	}
-	return clone
-}
-
-// verifyPodmanPorts compares published ports via `podman port` with registry endpoints
-func verifyPodmanPorts(containerID string, eps map[string]ServiceEndpoint) error {
-	if len(eps) == 0 {
-		return nil
-	}
-	cmd := exec.Command("podman", "port", containerID)
-	out, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("podman port failed: %w", err)
-	}
-
-	published := make(map[int]int) // hostBind -> guest
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		// Expected: "80/tcp -> 127.0.0.1:15001"
-		parts := strings.Split(line, "->")
-		if len(parts) != 2 {
-			continue
-		}
-		left := strings.TrimSpace(parts[0])
-		right := strings.TrimSpace(parts[1])
-		// left like "80/tcp"
-		guestStr := strings.Split(left, "/")[0]
-		gp, _ := strconv.Atoi(strings.TrimSpace(guestStr))
-		hostStr := strings.Split(right, ":")
-		if len(hostStr) < 2 {
-			continue
-		}
-		hb, _ := strconv.Atoi(strings.TrimSpace(hostStr[len(hostStr)-1]))
-		if hb > 0 && gp > 0 {
-			published[hb] = gp
-		}
-	}
-	// Compare
-	for _, ep := range eps {
-		if gp, ok := published[ep.HostBind]; !ok || gp != ep.GuestPort {
-			return fmt.Errorf("expected mapping 127.0.0.1:%d:%d missing or mismatched (have %d)", ep.HostBind, ep.GuestPort, published[ep.HostBind])
-		}
-	}
-	return nil
 }
 
 // SetAppContainerID records the container ID for an app (used by watcher reconciliation)

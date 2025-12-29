@@ -1,6 +1,13 @@
-# SPECIFICATION.yaml — Piccolo OS App Manifest (pre-beta)
+# SPECIFICATION.yaml — Piccolo OS App Manifest (design checkpoint)
 #
 # Keep this file valid YAML. Delete sections you do not need; comments are for guidance.
+#
+# This file is the single source of truth for the *intended* app runtime model:
+# - Every app’s durable bytes live under PICCOLO_STATE_DIR (default: /var/lib/piccolod)
+# - Every app’s durable bytes are encrypted at rest (gocryptfs-style volumes)
+# - Podman container storage is relocated into the app’s encrypted volume so env/config/overlay
+#   never land plaintext on the host outside the Piccolo state dir.
+# - Every app MUST declare its persistence mode via x-piccolo.mode (service | workspace)
 #
 # REQUIRED FIELDS -------------------------------------------------------------
 
@@ -45,6 +52,29 @@ inputs:
 
 type: user                     # user (default, starts after unlock) | system (starts during boot)
 
+# STATE, ENCRYPTION, AND PERSISTENCE MODEL -----------------------------------
+# Piccolo treats containers as "apps" (closer to VM instances than ephemeral cloud deploys).
+#
+# State root:
+#   - PICCOLO_STATE_DIR (default /var/lib/piccolod) is the only place piccolod may write durable state.
+#
+# Per-app encrypted volume:
+#   - Every app gets an encrypted volume with ID: app-<name>
+#   - Plaintext mount:  $PICCOLO_STATE_DIR/mounts/app-<name>/
+#   - Ciphertext lives under $PICCOLO_STATE_DIR/ciphertext/app-<name>/ (implementation detail)
+#
+# Datasets inside the app volume (high-level intent):
+#   - disk/: "instance disk" — container writable layer + container metadata + container logs.
+#            piccolod configures Podman with:
+#              --root    $PICCOLO_STATE_DIR/mounts/app-<name>/disk/podman
+#              --runroot /run/piccolo/podman/app-<name>   (ephemeral tmpfs runtime state)
+#            Because Podman --root lives inside the encrypted app volume, env secrets are encrypted at rest.
+#   - data/: "user data" — explicitly mounted paths declared under storage.persistent (recommended for service apps).
+#
+# Replication tiers (design intent; implementation evolves over time):
+#   - hot tier: replicated across cluster devices for fast failover (policy-driven per dataset)
+#   - cold tier: erasure-coded federation storage for durability (policy-driven cadence/RPO per dataset)
+
 # LISTENERS -------------------------------------------------------------------
 # Each listener defines a service Piccolo proxies. piccolod allocates host + proxy ports.
 # Remote access: https://<listener>.<user-domain>[:remote_port].
@@ -66,9 +96,23 @@ listeners:
     protocol: raw              # raw = minimal proxying (default)
     remote_ports: [22]
 
-# STORAGE ---------------------------------------------------------------------
-# Persistent volumes survive container restarts and live under /var/piccolo/storage/<app>/<volume>.
-# Temporary volumes map to /tmp/piccolo/... and reset on restart.
+# STORAGE (data dataset) ------------------------------------------------------
+# storage.persistent declares the *durable user data* mountpoints for this app.
+#
+# Modes:
+#   - service: you MUST enumerate every path that must survive updates/reinstalls under storage.persistent.
+#              Anything not mapped here may be lost when Piccolo performs an automatic update (recreate).
+#   - workspace: everything persists by default via the disk dataset. storage.persistent is optional but recommended
+#                for important data paths (so Piccolo can treat them as "data" for replication cadence/priority).
+#
+# Where data is stored (host paths are NOT user-configurable):
+#   - Each declared volume maps to a directory inside the app’s encrypted volume:
+#       $PICCOLO_STATE_DIR/mounts/app-<name>/data/<volume-name>
+#   - piccolod bind-mounts that directory into the container at volume.container.
+#
+# storage.temporary declares *non-durable* mountpoints:
+#   - Temporary volumes reset on restart and are NOT replicated.
+#   - piccolod mounts these as tmpfs where possible (or as encrypted local scratch when tmpfs is unsuitable).
 storage:
   persistent:
     projects:
@@ -78,11 +122,6 @@ storage:
     build-cache:
       container: /workspace/build
       size_limit: 10GB
-
-# FILESYSTEM ------------------------------------------------------------------
-# Controls whether the container root filesystem is immutable between runs.
-filesystem:
-  persistent: false            # false (default) keeps the root reset on restart; true enables overlay persistence
 
 # PERMISSIONS -----------------------------------------------------------------
 # Omit to accept Piccolo defaults (internet denied, LAN allowed, root read-only).
@@ -99,7 +138,7 @@ permissions:
     max_open_files: 2048
     privileged: false          # true grants additional Linux capabilities and should be avoided
   filesystem:
-    read_only_root: false      # false permits writes when filesystem.persistent: true
+    read_only_root: false      # false permits writes to the container root filesystem
     device_access: deny        # allow | deny access to /dev devices
 
 # ENVIRONMENT -----------------------------------------------------------------
@@ -137,5 +176,51 @@ app_config:
       port: 8888
 
 # EXTENSIONS ------------------------------------------------------------------
-# Reserved namespace for future Piccolo-specific features; safe to omit.
-x-piccolo: {}
+# Piccolo-specific policies. REQUIRED: you must set x-piccolo.mode for every app.
+#
+# x-piccolo.mode selects the persistence contract:
+#   - service: container root is replaceable; Piccolo may auto-update by recreating the container.
+#              You must map durable paths under storage.persistent.
+#   - workspace: container acts like a roaming "instance"; Piccolo persists disk + data.
+#                Auto-updates are disabled by default because rebasing a mutable instance can be unsafe.
+#
+# x-piccolo.replication controls which datasets participate in hot/cold tiers.
+# If omitted, defaults are derived from x-piccolo.mode.
+#
+# x-piccolo.secrets documents how the app expects secrets to be injected.
+# Env secrets are allowed because Podman storage lives inside the encrypted disk dataset, but file-based secrets are
+# preferred for compatibility and auditability.
+#
+# x-piccolo.runtime.podman.imagestore documents sensitivity policy:
+#   - catalog images may use a non-sensitive shared imagestore (bandwidth/dedupe win)
+#   - custom images must use an encrypted imagestore (images may embed secrets)
+x-piccolo:
+  mode: workspace              # service | workspace
+  replication:
+    hot:
+      datasets: [disk, data]   # hot tier: cluster replication for fast failover
+    cold:
+      datasets: [disk, data]   # cold tier: federation / erasure-coded durability
+      rpo: 15m                 # target max data loss window for cold tier (policy-driven)
+      consistency: crash_consistent  # crash_consistent | quiesced
+  tmpfs:
+    # Canonical ephemeral mounts (never persisted/replicated).
+    - /tmp
+    - /run
+    - /var/run
+    - /var/tmp
+  secrets:
+    # One of: env | files | mixed
+    # - env: secrets are passed via environment variables
+    # - files: secrets are mounted as files under /piccolo/secrets (preferred)
+    # - mixed: env for compatibility, files for long-lived secrets
+    injection: mixed
+  runtime:
+    podman:
+      # podman --root is always inside the encrypted per-app disk dataset:
+      #   $PICCOLO_STATE_DIR/mounts/app-<name>/disk/podman
+      imagestore:
+        # Sensitivity classification policy (design intent):
+        # - catalog images (curated store) => non_sensitive
+        # - custom images (user-supplied/build) => sensitive (encrypted)
+        policy: catalog_non_sensitive_else_encrypted
