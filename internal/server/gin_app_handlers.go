@@ -381,6 +381,77 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 	writeGinSuccess(c, gin.H{"app": appInstance, "services": serviceStatus}, "")
 }
 
+// handleGinAppUpdateListeners handles PATCH /api/v1/apps/:name/listeners
+func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
+	appName := c.Param("name")
+
+	var req struct {
+		Listeners []api.AppListener `json:"listeners"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeGinError(c, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	// Get current state to detect container recreation
+	oldApp, err := s.appManager.Get(c.Request.Context(), appName)
+	if err != nil {
+		if handleAppManagerError(c, err, "update listeners") {
+			return
+		}
+		writeGinError(c, http.StatusNotFound, err.Error())
+		return
+	}
+
+	_, err = s.appManager.UpdateListeners(c.Request.Context(), appName, req.Listeners)
+	if err != nil {
+		if handleAppManagerError(c, err, "update listeners") {
+			return
+		}
+		// Check for validation errors (e.g., from ValidateAppDefinition)
+		if strings.Contains(err.Error(), "invalid listener") || strings.Contains(err.Error(), "invalid app definition") {
+			writeGinError(c, http.StatusBadRequest, "Invalid listener configuration: "+err.Error())
+			return
+		}
+		writeGinError(c, http.StatusInternalServerError, "Failed to update listeners: "+err.Error())
+		return
+	}
+
+	// Queue certs for new listeners
+	s.queueAppRemoteCertificates(appName)
+
+	// Fetch updated details
+	newApp, err := s.appManager.Get(c.Request.Context(), appName)
+	if err != nil {
+		writeGinError(c, http.StatusInternalServerError, "Updated successfully but failed to fetch fresh status")
+		return
+	}
+
+	recreated := oldApp.ContainerID != newApp.ContainerID
+
+	// Include services inline
+	services, _ := s.serviceManager.GetByApp(appName)
+	serviceStatus := make([]gin.H, 0, len(services))
+	var remoteStatus *remote.Status
+	if s.remoteManager != nil {
+		st := s.remoteManager.Status()
+		remoteStatus = &st
+	}
+	for _, ep := range services {
+		serviceStatus = append(serviceStatus, s.formatServiceEndpoint(c, ep, remoteStatus))
+	}
+
+	resp := gin.H{
+		"instance_id":         newApp.InstanceID,
+		"status":              newApp.Status,
+		"listeners_updated":   true,
+		"container_recreated": recreated,
+		"endpoints":           serviceStatus,
+	}
+
+	writeGinSuccess(c, resp, "Listeners updated successfully")
+}
+
 // handleGinAppUninstall handles DELETE /api/v1/apps/:name - Uninstall app completely
 func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	appName := c.Param("name")

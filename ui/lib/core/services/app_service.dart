@@ -103,6 +103,13 @@ class AppService {
     await _client.post('/api/v1/apps/$name/stop', body: {});
   }
 
+  Future<void> updateAppListeners(String name, List<AppListener> listeners) async {
+    await _client.patch(
+      '/api/v1/apps/$name/listeners',
+      body: {'listeners': listeners.map((e) => e.toJson()).toList()},
+    );
+  }
+
   Future<void> uninstallApp(String name, {bool purge = false}) async {
     // Query params not supported in delete? ApiClient.delete supports body.
     // Need to append query to path.
