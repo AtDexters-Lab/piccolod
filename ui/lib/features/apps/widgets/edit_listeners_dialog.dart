@@ -181,7 +181,7 @@ class _ListenerRow extends StatelessWidget {
           Expanded(
             flex: 2,
             child: DropdownButtonFormField<String>(
-              value: listener.protocol,
+              initialValue: listener.protocol,
               decoration: const InputDecoration(
                 labelText: "Protocol", 
                 isDense: true,
@@ -201,7 +201,7 @@ class _ListenerRow extends StatelessWidget {
            Expanded(
             flex: 2,
             child: DropdownButtonFormField<String>(
-              value: listener.flow,
+              initialValue: listener.flow,
               decoration: const InputDecoration(
                 labelText: "Flow", 
                 isDense: true,

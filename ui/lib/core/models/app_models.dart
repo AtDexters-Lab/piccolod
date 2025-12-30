@@ -1,4 +1,3 @@
-import '../config/core_config.dart';
 
 class App {
   final String id;
