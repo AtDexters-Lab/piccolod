@@ -1,35 +1,107 @@
 # Repository Guidelines
 
-This repository contains the `piccolod` Go backend and the SvelteKit UI that is built into `./web` and embedded via `web_embed.go`.
+This repository contains `piccolod`, the control-plane daemon and embedded web portal for Piccolo OS: a headless home/edge OS that provides container orchestration, storage management, and a web admin portal accessible at `http://piccolo.local`.
+
+**Tech Stack:**
+- Backend: Go (1.24+) with Gin web framework
+- Frontend: Flutter Web (WASM) embedded in the binary
+- Containers: Podman (rootless)
 
 ## Project Structure & Modules
 - Backend: Go entrypoint in `cmd/piccolod`, domain packages in `internal/*`, shared test fixtures in `testdata/`.
-- UI: `ui-next/` (Svelte + TypeScript); built assets land in `web/`.
-- Documentation: product specs in `02_product/`, technical docs and RFCs in `docs/`.
+- UI: `ui/` (Flutter Web); built assets land in `web/` and are embedded via `web_embed.go`.
+- Documentation: technical docs and RFCs in `docs/`.
 - Packaging and tooling: release tooling in `packaging/`, auxiliary services in `tools/`.
 
 ## Build, Test, and Development
-- `make build` – build the Go server and bundle the UI into `./piccolod`.
-- `make run` – build and run locally on `http://localhost:8080` with state in `./run-state`.
-- `cd ui-next && npm run dev` – run the UI in dev mode.
-- `go test ./...` – run the Go test suite; use `go test ./internal/app -tags=integration` for Podman-based integration tests.
-- `make e2e` – build and run Playwright end‑to‑end tests in `ui-next/tests`.
+
+### Building
+```bash
+make build          # Build UI + server binary
+make run            # Build and run on http://localhost:8080 (state in .run-state/)
+make run-fresh      # Build and run with ephemeral state dir (cleanup on exit)
+make clean          # Clean all build artifacts
+```
+
+### UI Development
+```bash
+cd ui
+flutter run -d chrome --dart-define=API_BASE_URL=http://localhost:8080
+```
+
+**Architecture:** Adaptive Shells pattern with ChangeNotifier controllers. Logic in controllers, views are reactive via ListenableBuilder. Read `ui/docs/foundation.md` before making UI changes.
+
+### Testing
+
+**Go Unit Tests:**
+```bash
+go test ./...                                    # All packages
+go test ./internal/app -short                    # Fast unit tests only
+go test ./internal/some/package -run TestSpecificName -v
+```
+
+**Integration Tests (requires Podman):**
+```bash
+go test ./internal/app -tags=integration
+go test ./internal/app -tags=integration -run TestAppManager_FullLifecycle
+```
+
+**Test Environment Variables:**
+- `PICCOLO_ALLOW_UNMOUNTED_TESTS=1` - Allow tests without mounted volumes
+
+**E2E Tests:**
+- `make e2e` – Playwright end-to-end tests
+- See `docs/testing/e2e-policy.md` for lanes and execution details
+
+### Environment Variables
+- `PORT` (default: 80) - HTTP server port
+- `PICCOLO_STATE_DIR` (default: /var/lib/piccolod) - State directory
+- `PICCOLO_DISABLE_MDNS` - Disable mDNS discovery
+- `GIN_MODE` (default: release) - Gin framework mode
+
+## Key Architecture Patterns
+
+### Supervisor Pattern
+All core services register with `internal/runtime/supervisor/` for coordinated Start/Stop lifecycle. Failure triggers rollback.
+
+### Filesystem State Management
+App state persists as JSON files via `FilesystemStateManager` in `internal/app/filesystem.go`. No database.
+
+### Per-App Podman Isolation
+Each app gets isolated Podman storage (Root, RunRoot, Imagestore) to avoid image conflicts. See `internal/app/podman_runtime.go`.
+
+### Event Bus
+In-process pub-sub in `internal/events/`. Topics: lock state, leadership, device events, exports, audit.
+
+### Service Proxying
+`internal/services/` handles port allocation and HTTP/TLS proxying. Endpoints have guest ports (container), host-bind (127.0.0.1), and public ports (0.0.0.0).
+
+### Encrypted Control Volume
+Sensitive control plane data uses gocryptfs encryption. Keys managed via `internal/crypt/`.
+
+## Important Entry Points & Paths
+- `cmd/piccolod/main.go` - Entry point
+- `internal/server/gin_server.go` - HTTP server, routes, middleware
+- `internal/app/app_manager.go` - App lifecycle (install/start/stop/uninstall)
+- `internal/container/podman.go` - Podman CLI wrapper
+- `internal/persistence/service.go` - Storage orchestration
+- `internal/services/manager.go` - Port allocation and proxying
 
 ## Coding Style & Naming
-- Go: follow `gofmt`; keep package names short and lower‑case (for example `internal/app`, `internal/router`); exported identifiers use `CamelCase`, unexported use `camelCase`.
-- UI: prefer 2‑space indentation, Svelte components in `ui-next/src/lib/components`, and route files under `ui-next/src/routes`. All UI contributors must read, internalise, and adhere to `ui-next/docs/foundation.md` before making changes.
-- Keep configuration in env vars (for example `PORT`, `PICCOLO_STATE_DIR`), not hard‑coded.
+- Go: follow `gofmt`; keep package names short and lowercase (for example `internal/app`, `internal/router`); exported identifiers use `CamelCase`, unexported use `camelCase`.
+- Go: use interfaces for abstraction and testability
+- UI: prefer 2-space indentation. All UI contributors must read, internalize, and adhere to `ui/docs/foundation.md` before making changes.
+- Keep configuration in env vars (for example `PORT`, `PICCOLO_STATE_DIR`), not hard-coded.
 
 ## Testing Guidelines
 - New Go code should include `*_test.go` files with `TestXxx` functions in the same package.
-- UI and flow tests live in Playwright specs (`*.spec.ts`) under `ui-next/tests`; follow the patterns in existing specs.
 - For E2E behavior and lanes, align with `docs/testing/e2e-policy.md`.
 
 ## Commit & Pull Request Guidelines
 - Use concise, imperative commit subjects that reference the area touched (for example `internal/app: add app manager tests`).
-- PRs should describe the change, link to any relevant docs in `docs/` or `02_product/`, and list how it was tested (for example `go test ./...`, `make e2e`, manual UI checks with `make run`).
-- Include screenshots or short notes for user‑visible UI changes.
+- PRs should describe the change, link to any relevant docs in `docs/`, and list how it was tested (for example `go test ./...`, `make e2e`, manual UI checks with `make run`).
+- Include screenshots or short notes for user-visible UI changes.
 
 ## Agent-Specific Instructions
-- Prefer minimal, focused changes; avoid drive‑by refactors.
+- Prefer minimal, focused changes; avoid drive-by refactors.
 - Use the `Makefile` and existing scripts where possible, and keep docs in sync when behavior changes.
