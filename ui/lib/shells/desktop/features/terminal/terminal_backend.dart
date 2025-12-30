@@ -1,284 +1,119 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:xterm/xterm.dart';
 
+import '../../../../core/services/websocket_connection.dart';
+
 class PiccoloTerminalBackend {
-
   final Terminal terminal;
-
   final String url;
 
-  WebSocketChannel? _channel;
+  late final WebSocketConnection _connection;
+  late final void Function() _connectionListener;
 
   StreamSubscription? _subscription;
-
   Timer? _resizeDebounce;
-  Timer? _reconnectTimer;
 
-  // Exponential backoff for reconnects
-  Duration _reconnectDelay = const Duration(seconds: 2);
+  WebSocketConnectionState _lastState = WebSocketConnectionState.disconnected;
+  String? _lastErrorShown;
 
-  bool _isDisposed = false;
-  bool _isConnecting = false;
-
-
-
-  PiccoloTerminalBackend(this.terminal, this.url);
-
-
+  PiccoloTerminalBackend(this.terminal, this.url) {
+    _connection = WebSocketConnection(
+      url,
+      onReconnectScheduled: (delay) {
+        terminal.write(
+          '\r\n\x1b[33mReconnecting in ${delay.inSeconds}s...\x1b[0m\r\n',
+        );
+      },
+    );
+    _connectionListener = _handleConnectionUpdate;
+    _connection.addListener(_connectionListener);
+  }
 
   void init() {
+    _subscription = _connection.messages.listen(_handleMessage);
+    _connection.connect();
 
-    _connect();
-
-
-
-    // Handle user input (keystrokes)
-
-    terminal.onOutput = (data) {
-
-      _sendInput(data);
-
-    };
-
-
-
-    // Handle resize with debounce (cols, rows, pixelWidth, pixelHeight)
+    terminal.onOutput = _sendInput;
 
     terminal.onResize = (cols, rows, pixelWidth, pixelHeight) {
-
       if (_resizeDebounce?.isActive ?? false) _resizeDebounce!.cancel();
-
       _resizeDebounce = Timer(const Duration(milliseconds: 50), () {
-
         _sendResize(cols, rows);
-
       });
-
     };
-
   }
 
+  void _handleConnectionUpdate() {
+    final state = _connection.state;
+    if (state == _lastState) return;
+    _lastState = state;
 
-
-  void _connect() {
-
-    if (_isDisposed || _isConnecting) return;
-
-    _isConnecting = true;
-
-    try {
-
-      // In a real app, we might need to handle auth headers if cookies aren't enough,
-
-      // but for browser-based, cookies are sent automatically.
-
-      _channel = WebSocketChannel.connect(Uri.parse(url));
-
-
-
-      _subscription = _channel!.stream.listen(
-        (message) {
-          _handleMessage(message);
-        },
-        onDone: () => _handleDisconnect('Connection closed'),
-        onError: (error) => _handleDisconnect('Connection error: $error'),
-      );
-
-      
-
-      // Initial resize to sync state
-
-      // Give it a tiny delay to ensure socket is open
-
-      Future.delayed(const Duration(milliseconds: 100), () {
-
-        _sendResize(terminal.viewWidth, terminal.viewHeight);
-
-      });
-
-      // Reset backoff on successful connect
-      _reconnectDelay = const Duration(seconds: 2);
-
-      _isConnecting = false;
-      
-
-    } catch (e) {
-
-      _isConnecting = false;
-
-      _handleDisconnect('Failed to connect: $e');
-
+    if (state == WebSocketConnectionState.connected) {
+      _lastErrorShown = null;
+      _sendResize(terminal.viewWidth, terminal.viewHeight);
+      return;
     }
 
+    if (state == WebSocketConnectionState.error) {
+      final err = _connection.lastError;
+      if (err != null && err.isNotEmpty && err != _lastErrorShown) {
+        terminal.write('\r\n\x1b[31m$err\x1b[0m\r\n');
+        _lastErrorShown = err;
+      }
+    }
   }
-
-
-
-  void _handleDisconnect(String reason) {
-
-    if (_isDisposed) return;
-
-
-
-    _subscription?.cancel();
-
-    _subscription = null;
-
-
-
-    _channel?.sink.close();
-
-    _channel = null;
-
-
-
-    terminal.write('\r\n\x1b[31m$reason\x1b[0m\r\n');
-
-    _scheduleReconnect();
-
-  }
-
-
-
-  void _scheduleReconnect() {
-
-    if (_reconnectTimer?.isActive ?? false) return;
-
-
-
-    final delay = _reconnectDelay;
-
-    terminal.write('\r\n\x1b[33mReconnecting in ${delay.inSeconds}s...\x1b[0m\r\n');
-
-
-
-    _reconnectTimer = Timer(delay, () {
-
-      _reconnectTimer = null;
-
-      _connect();
-
-    });
-
-
-
-    // Exponential backoff with cap
-
-    final nextSeconds = (_reconnectDelay.inSeconds * 2).clamp(2, 30);
-
-    _reconnectDelay = Duration(seconds: nextSeconds);
-
-  }
-
-
 
   void _handleMessage(dynamic message) {
-
-    if (message is! String) return; // We expect JSON strings
-
-
+    if (message is! String) return;
 
     try {
-
       final Map<String, dynamic> payload = jsonDecode(message);
-
       final type = payload['type'];
 
-
-
       if (type == 'stdout') {
-
         final encoded = payload['data'] as String;
-
-        // Robust Base64 decode
-
         final bytes = base64.decode(encoded);
-
         final text = utf8.decode(bytes);
-
         terminal.write(text);
-
       }
-
-    } catch (e) {
-
-      // Silently ignore malformed messages to avoid spamming the term
-
-      // print('Terminal protocol error: $e');
-
+    } catch (_) {
+      // Ignore malformed messages to avoid spamming the terminal.
     }
-
   }
-
-
 
   void _sendInput(String data) {
-
-    if (_channel == null) return;
-
-    
+    if (_connection.state != WebSocketConnectionState.connected) return;
 
     final encoded = base64.encode(utf8.encode(data));
-
     final payload = jsonEncode({
-
       'type': 'stdin',
-
       'data': encoded,
-
     });
 
-    
-
-    _channel!.sink.add(payload);
-
+    _connection.send(payload);
   }
-
-
 
   void _sendResize(int cols, int rows) {
-
-    if (_channel == null) return;
-
-    
-
-    // print('Terminal: Resizing to ${cols}x${rows}');
-
-
+    if (_connection.state != WebSocketConnectionState.connected) return;
 
     final payload = jsonEncode({
-
       'type': 'resize',
-
       'cols': cols,
-
       'rows': rows,
-
     });
 
-
-
-    _channel!.sink.add(payload);
-
+    _connection.send(payload);
   }
-
-
 
   void dispose() {
-
     _resizeDebounce?.cancel();
-
-    _reconnectTimer?.cancel();
-
-    _isDisposed = true;
-
     _subscription?.cancel();
+    _subscription = null;
 
-    _channel?.sink.close();
-
+    _connection.removeListener(_connectionListener);
+    _connection.dispose();
   }
-
 }
+

@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import '../../theme/piccolo_theme.dart';
 import '../../core/services/app_service.dart';
+import '../../core/utils/task_id.dart';
+import '../../shared/widgets/task_progress_panel.dart';
 
 class CustomInstallWizard extends StatefulWidget {
   final AppService appService;
@@ -24,6 +26,7 @@ class _CustomInstallWizardState extends State<CustomInstallWizard> {
   int _currentStep = 0;
   bool _isValidating = false;
   bool _isInstalling = false;
+  String? _taskId;
   
   // Validation State
   bool _isValid = false;
@@ -82,8 +85,10 @@ storage:
   }
 
   Future<void> _install() async {
+    final taskId = generateTaskId();
     setState(() {
       _isInstalling = true;
+      _taskId = taskId;
     });
 
     try {
@@ -91,6 +96,7 @@ storage:
         _yamlController.text,
         <String, dynamic>{},
         displayName: _displayNameController.text.trim(),
+        taskId: taskId,
       );
       
       if (mounted) {
@@ -108,6 +114,7 @@ storage:
       if (mounted) {
         setState(() {
           _isInstalling = false;
+          _taskId = null;
           _validationError = "Install failed: $e";
           _currentStep = 0; // Go back to edit
         });
@@ -155,7 +162,7 @@ storage:
                    ),
                    IconButton(
                      icon: const Icon(Icons.close),
-                     onPressed: () => Navigator.of(context).pop(),
+                     onPressed: _isInstalling ? null : () => Navigator.of(context).pop(),
                    )
                 ],
               ),
@@ -163,7 +170,17 @@ storage:
 
             // Body
             Expanded(
-              child: _currentStep == 0 ? _buildEditorStep() : _buildReviewStep(),
+              child: _isInstalling && _taskId != null
+                  ? Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: TaskProgressPanel(
+                        taskId: _taskId!,
+                        taskType: 'install_app',
+                      ),
+                    )
+                  : _currentStep == 0
+                      ? _buildEditorStep()
+                      : _buildReviewStep(),
             ),
 
             // Footer
@@ -177,7 +194,7 @@ storage:
                 children: [
                   if (_currentStep == 1)
                     TextButton(
-                      onPressed: () => setState(() => _currentStep = 0),
+                      onPressed: _isInstalling ? null : () => setState(() => _currentStep = 0),
                       child: const Text("Back"),
                     ),
                   const SizedBox(width: 16),

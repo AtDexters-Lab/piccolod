@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -31,6 +32,7 @@ type AppManager struct {
 	stateInitMu      sync.Mutex
 	serviceManager   *services.ServiceManager
 	routeRegistrar   router.Registrar
+	progressReporter events.ProgressReporter
 	eventsMu         sync.Mutex
 	eventCancel      context.CancelFunc
 	eventsWG         sync.WaitGroup
@@ -94,6 +96,13 @@ func (m *AppManager) SetRouter(reg router.Registrar) {
 	m.stateMu.Unlock()
 }
 
+// SetProgressReporter configures the optional progress reporter used for long-running operations.
+func (m *AppManager) SetProgressReporter(r events.ProgressReporter) {
+	m.stateMu.Lock()
+	m.progressReporter = r
+	m.stateMu.Unlock()
+}
+
 // SetMountVerifier overrides the mount verification callback. Intended for tests.
 func (m *AppManager) SetMountVerifier(fn func(string) error) {
 	m.stateInitMu.Lock()
@@ -120,6 +129,37 @@ func (m *AppManager) currentRouter() router.Registrar {
 	m.stateMu.RLock()
 	defer m.stateMu.RUnlock()
 	return m.routeRegistrar
+}
+
+func (m *AppManager) currentProgressReporter() events.ProgressReporter {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.progressReporter
+}
+
+func (m *AppManager) emitProgress(ctx context.Context, taskType, instanceID, phase string, progress int, message string, complete bool, opErr error) {
+	taskID := TaskIDFromContext(ctx)
+	if taskID == "" {
+		return
+	}
+	reporter := m.currentProgressReporter()
+	if reporter == nil {
+		return
+	}
+	evt := events.TaskProgressEvent{
+		TaskID:     taskID,
+		TaskType:   taskType,
+		InstanceID: instanceID,
+		Phase:      phase,
+		Progress:   progress,
+		Message:    message,
+		IsComplete: complete,
+		Timestamp:  time.Now().UTC(),
+	}
+	if opErr != nil {
+		evt.Error = opErr.Error()
+	}
+	reporter.Report(evt)
 }
 
 // SetVolumeManager wires the persistence volume manager so apps can use per-app encrypted volumes.
@@ -842,7 +882,20 @@ func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition, dis
 	return m.installLocked(ctx, appDef, displayName)
 }
 
-func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinition, displayName string) (*AppInstance, error) {
+func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinition, displayName string) (inst *AppInstance, err error) {
+	instanceID := ""
+	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseValidating, 0, "Validating app manifest", false, nil)
+	defer func() {
+		if err != nil {
+			m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseComplete, 100, "Install failed", true, err)
+			return
+		}
+		if inst != nil {
+			instanceID = inst.InstanceID
+		}
+		m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseComplete, 100, "Install complete", true, nil)
+	}()
+
 	if err := m.ensureUnlocked(); err != nil {
 		return nil, err
 	}
@@ -862,7 +915,7 @@ func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinitio
 
 	// Generate unique instance ID
 	existingIDs := state.ListInstanceIDs()
-	instanceID, err := GenerateInstanceID(appDef.Name, existingIDs)
+	instanceID, err = GenerateInstanceID(appDef.Name, existingIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate instance ID: %w", err)
 	}
@@ -872,12 +925,17 @@ func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinitio
 		return nil, fmt.Errorf("invalid generated instance ID: %w", err)
 	}
 
-	return m.installWithRetries(ctx, state, appDef, instanceID, displayName, 0)
+	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseAllocatingPorts, 10, "Allocating ports", false, nil)
+	inst, err = m.installWithRetries(ctx, state, appDef, instanceID, displayName, 0)
+	return inst, err
 }
 
 func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemStateManager, appDef *api.AppDefinition, instanceID, displayName string, attempt int) (*AppInstance, error) {
 	if attempt >= maxInstallPortRetries {
 		return nil, fmt.Errorf("failed to install %s: exhausted host-port retries", instanceID)
+	}
+	if attempt > 0 {
+		m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseAllocatingPorts, 10, fmt.Sprintf("Retrying installation (attempt %d)", attempt+1), false, nil)
 	}
 
 	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
@@ -925,14 +983,19 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	// Pull image to app's isolated storage to detect download issues early
 	// Skip pull if using a local snapshot image
 	if !useSnapshot {
+		m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, fmt.Sprintf("Pulling image %s", appDef.Image), false, nil)
 		if err := m.containerManager.PullImage(ctx, runtime, appDef.Image); err != nil {
 			log.Printf("WARN: install %s: image pull failed: %v", instanceID, err)
+			m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, fmt.Sprintf("Image pull failed (continuing): %v", err), false, nil)
 			// Proceeding anyway as CreateContainer might succeed if local, or fail with same error
 		}
+	} else {
+		m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, "Using workspace snapshot", false, nil)
 	}
 
 	// Create container with zombie cleanup
 	var containerID string
+	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseCreatingContainer, 60, "Creating container", false, nil)
 	for i := 0; i < 2; i++ {
 		containerID, err = m.containerManager.CreateContainer(ctx, runtime, containerSpec)
 		if err == nil {
@@ -985,6 +1048,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	}
 
 	// Start container immediately
+	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseStarting, 80, "Starting container", false, nil)
 	if err := m.containerManager.StartContainer(ctx, runtime, containerID); err != nil {
 		// Atomic install: if start fails, cleanup and fail.
 		// We do NOT persist the app state, so the user can retry.
@@ -1015,6 +1079,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	}
 
 	// Store app to filesystem
+	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseRegisteringServices, 90, "Finalizing installation", false, nil)
 	if err := state.StoreApp(app, appDef); err != nil {
 		// Cleanup container if storage fails
 		_ = m.containerManager.StopContainer(ctx, runtime, containerID)
@@ -1075,7 +1140,16 @@ func (m *AppManager) Start(ctx context.Context, instanceID string) error {
 	return m.startLocked(ctx, instanceID)
 }
 
-func (m *AppManager) startLocked(ctx context.Context, instanceID string) error {
+func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err error) {
+	m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseStarting, 0, "Starting app", false, nil)
+	defer func() {
+		if err != nil {
+			m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseComplete, 100, "Start failed", true, err)
+			return
+		}
+		m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseComplete, 100, "Started", true, nil)
+	}()
+
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1108,6 +1182,7 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) error {
 	}
 
 	// Update status to running
+	m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseUpdatingServices, 80, "Updating services", false, nil)
 	if err := state.UpdateAppStatus(instanceID, "running"); err != nil {
 		return fmt.Errorf("failed to update app status: %w", err)
 	}
@@ -1181,7 +1256,16 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 	return nil
 }
 
-func (m *AppManager) stopInternal(ctx context.Context, instanceID string) error {
+func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err error) {
+	m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseStopping, 0, "Stopping app", false, nil)
+	defer func() {
+		if err != nil {
+			m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseComplete, 100, "Stop failed", true, err)
+			return
+		}
+		m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseComplete, 100, "Stopped", true, nil)
+	}()
+
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return err
@@ -1205,6 +1289,7 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) error 
 		return fmt.Errorf("failed to stop container: %w", err)
 	}
 
+	m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseUpdatingServices, 80, "Updating services", false, nil)
 	if err := state.UpdateAppStatus(instanceID, "stopped"); err != nil {
 		return fmt.Errorf("failed to update app status: %w", err)
 	}
@@ -1234,7 +1319,16 @@ func (m *AppManager) UninstallWithOptions(ctx context.Context, instanceID string
 	return m.uninstallLocked(ctx, instanceID, purge)
 }
 
-func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, purge bool) error {
+func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, purge bool) (err error) {
+	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseStopping, 0, "Stopping app", false, nil)
+	defer func() {
+		if err != nil {
+			m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseComplete, 100, "Uninstall failed", true, err)
+			return
+		}
+		m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseComplete, 100, "Uninstalled", true, nil)
+	}()
+
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1280,6 +1374,7 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 	}
 
 	// Remove container
+	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseRemovingContainer, 40, "Removing container", false, nil)
 	if err := m.containerManager.RemoveContainer(ctx, runtime, app.ContainerID); err != nil {
 		return fmt.Errorf("failed to remove container: %w", err)
 	}
@@ -1291,6 +1386,7 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 
 	// Optionally purge app data (destroy volume and podman runtime state)
 	if purge {
+		m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseCleaningVolumes, 80, "Purging app data", false, nil)
 		// Reset podman storage to clean up any remaining containers
 		if err := m.containerManager.ResetStorage(ctx, runtime); err != nil {
 			log.Printf("WARN: podman storage reset for %s failed: %v", instanceID, err)
@@ -1485,7 +1581,16 @@ func (m *AppManager) UpdateListeners(ctx context.Context, instanceID string, lis
 	return m.updateListenersLocked(ctx, instanceID, listeners)
 }
 
-func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID string, listeners []api.AppListener) (*api.AppDefinition, error) {
+func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID string, listeners []api.AppListener) (def *api.AppDefinition, err error) {
+	m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseValidating, 0, "Validating listener configuration", false, nil)
+	defer func() {
+		if err != nil {
+			m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseComplete, 100, "Update failed", true, err)
+			return
+		}
+		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseComplete, 100, "Listeners updated", true, nil)
+	}()
+
 	if err := m.ensureUnlocked(); err != nil {
 		return nil, err
 	}
@@ -1537,6 +1642,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 	}
 
 	// Reconcile services
+	m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseReconcilingServices, 30, "Reconciling services", false, nil)
 	result, containerChange, err := m.serviceManager.Reconcile(instanceID, listeners)
 	if err != nil {
 		return nil, fmt.Errorf("failed to reconcile services: %w", err)
@@ -1545,6 +1651,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 	needsRecreation := containerChange || len(result.Added) > 0 || len(result.Removed) > 0
 
 	if needsRecreation {
+		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseSnapshotting, 50, "Snapshotting workspace", false, nil)
 		// Snapshot workspace (always performed for workspace apps)
 		if appInst.ContainerID != "" {
 			snapshotImage := workspaceSnapshotImage(instanceID)
@@ -1554,6 +1661,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			log.Printf("INFO: update listeners %s: committed snapshot to %s", instanceID, snapshotImage)
 		}
 
+		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseRecreatingContainer, 60, "Recreating container", false, nil)
 		// Stop and remove old container
 		_ = m.containerManager.StopContainer(ctx, runtime, appInst.ContainerID)
 		_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.ContainerID)
@@ -1643,6 +1751,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		appInst.ContainerID = newCID
 
 		// Start container automatically
+		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseStarting, 80, "Starting container", false, nil)
 		if err := m.containerManager.StartContainer(ctx, runtime, newCID); err != nil {
 			appInst.Status = "error"
 			log.Printf("WARN: update listeners %s: failed to start new container: %v", instanceID, err)
@@ -1651,6 +1760,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		}
 	}
 
+	m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseFinalizing, 90, "Saving configuration", false, nil)
 	appInst.UpdatedAt = time.Now()
 	if err := state.StoreApp(appInst, &newDef); err != nil {
 		return nil, fmt.Errorf("store app: %w", err)
@@ -1754,6 +1864,30 @@ func (m *AppManager) Logs(ctx context.Context, instanceID string, lines int) ([]
 		return nil, err
 	}
 	return m.containerManager.Logs(ctx, runtime, appInst.ContainerID, lines)
+}
+
+// LogsStream returns a follow-stream of container logs for an app instance by instanceID.
+func (m *AppManager) LogsStream(ctx context.Context, instanceID string, lines int, timestamps bool) (io.ReadCloser, error) {
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return nil, err
+	}
+	appInst, exists := state.GetApp(instanceID)
+	if !exists {
+		return nil, fmt.Errorf("app instance not found: %s", instanceID)
+	}
+	if lines <= 0 {
+		lines = 200
+	}
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
+	if err != nil {
+		return nil, err
+	}
+	return m.containerManager.LogsStream(ctx, runtime, appInst.ContainerID, lines, timestamps)
 }
 
 // appDefToContainerSpec converts an AppDefinition to a ContainerCreateSpec.

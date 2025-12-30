@@ -6,6 +6,11 @@ class AppService {
 
   AppService(this._client);
 
+  Map<String, String>? _taskHeaders(String? taskId) {
+    if (taskId == null || taskId.isEmpty) return null;
+    return {'X-Piccolo-Task-ID': taskId};
+  }
+
   // --- Catalog ---
 
   Future<CatalogResponse> getCatalog({
@@ -95,25 +100,41 @@ class AppService {
 
   // --- Lifecycle ---
 
-  Future<void> startApp(String name) async {
-    await _client.post('/api/v1/apps/$name/start', body: {});
-  }
-
-  Future<void> stopApp(String name) async {
-    await _client.post('/api/v1/apps/$name/stop', body: {});
-  }
-
-  Future<void> updateAppListeners(String name, List<AppListener> listeners) async {
-    await _client.patch(
-      '/api/v1/apps/$name/listeners',
-      body: {'listeners': listeners.map((e) => e.toJson()).toList()},
+  Future<void> startApp(String name, {String? taskId}) async {
+    await _client.post(
+      '/api/v1/apps/$name/start',
+      body: {},
+      headers: _taskHeaders(taskId),
     );
   }
 
-  Future<void> uninstallApp(String name, {bool purge = false}) async {
+  Future<void> stopApp(String name, {String? taskId}) async {
+    await _client.post(
+      '/api/v1/apps/$name/stop',
+      body: {},
+      headers: _taskHeaders(taskId),
+    );
+  }
+
+  Future<void> updateAppListeners(
+    String name,
+    List<AppListener> listeners, {
+    String? taskId,
+  }) async {
+    await _client.patch(
+      '/api/v1/apps/$name/listeners',
+      body: {'listeners': listeners.map((e) => e.toJson()).toList()},
+      headers: _taskHeaders(taskId),
+    );
+  }
+
+  Future<void> uninstallApp(String name, {bool purge = false, String? taskId}) async {
     // Query params not supported in delete? ApiClient.delete supports body.
     // Need to append query to path.
-    await _client.delete('/api/v1/apps/$name?purge=$purge');
+    await _client.delete(
+      '/api/v1/apps/$name?purge=$purge',
+      headers: _taskHeaders(taskId),
+    );
   }
 
   // --- Install / Validate ---
@@ -138,11 +159,12 @@ class AppService {
     }
   }
 
-  Future<App> installApp(String yamlContent) async {
+  Future<App> installApp(String yamlContent, {String? taskId}) async {
     final data = await _client.postRaw(
       '/api/v1/apps',
       body: yamlContent,
       contentType: 'application/x-yaml',
+      headers: _taskHeaders(taskId),
     );
     
     // Expected: { data: {App}, message: ... }
@@ -155,7 +177,12 @@ class AppService {
     return Map<String, dynamic>.from(data['data'] ?? {});
   }
 
-  Future<App> installAppWithInputs(String yamlContent, Map<String, dynamic> inputs, {String displayName = ''}) async {
+  Future<App> installAppWithInputs(
+    String yamlContent,
+    Map<String, dynamic> inputs, {
+    String displayName = '',
+    String? taskId,
+  }) async {
     final body = <String, dynamic>{
       'app_definition': yamlContent,
       'inputs': inputs,
@@ -167,6 +194,7 @@ class AppService {
     final data = await _client.post(
       '/api/v1/apps',
       body: body,
+      headers: _taskHeaders(taskId),
     );
     return App.fromJson(data['data']);
   }

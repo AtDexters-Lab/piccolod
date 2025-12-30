@@ -1,0 +1,27 @@
+package app
+
+const (
+	taskTypeInstallApp      = "install_app"
+	taskTypeStartApp        = "start_app"
+	taskTypeStopApp         = "stop_app"
+	taskTypeUninstallApp    = "uninstall_app"
+	taskTypeUpdateListeners = "update_listeners"
+)
+
+const (
+	taskPhaseAllocatingPorts     = "allocating_ports"
+	taskPhaseCleaningVolumes     = "cleaning_volumes"
+	taskPhaseComplete            = "complete"
+	taskPhaseCreatingContainer   = "creating_container"
+	taskPhaseFinalizing          = "finalizing"
+	taskPhasePullingImage        = "pulling_image"
+	taskPhaseReconcilingServices = "reconciling_services"
+	taskPhaseRecreatingContainer = "recreating_container"
+	taskPhaseRegisteringServices = "registering_services"
+	taskPhaseRemovingContainer   = "removing_container"
+	taskPhaseSnapshotting        = "snapshotting"
+	taskPhaseStarting            = "starting"
+	taskPhaseStopping            = "stopping"
+	taskPhaseUpdatingServices    = "updating_services"
+	taskPhaseValidating          = "validating"
+)

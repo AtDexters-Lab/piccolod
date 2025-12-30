@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"io"
+	"strings"
 
 	"piccolod/internal/container"
 )
@@ -94,6 +96,23 @@ func (m *MockContainerManager) Logs(ctx context.Context, runtime container.Podma
 		out[i] = "log line"
 	}
 	return out, nil
+}
+
+func (m *MockContainerManager) LogsStream(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int, timestamps bool) (io.ReadCloser, error) {
+	_ = ctx
+	_ = runtime
+	_ = timestamps
+	if _, ok := m.containers[containerID]; !ok {
+		return nil, container.ErrContainerNotFound(containerID)
+	}
+	if lines <= 0 {
+		lines = 3
+	}
+	var b strings.Builder
+	for i := 0; i < lines; i++ {
+		b.WriteString("log line\n")
+	}
+	return io.NopCloser(strings.NewReader(b.String())), nil
 }
 
 func (m *MockContainerManager) ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error) {

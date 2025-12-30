@@ -1,7 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../../theme/piccolo_theme.dart';
 import '../../core/models/app_models.dart';
 import '../../core/services/app_service.dart';
+import '../../core/utils/task_id.dart';
+import '../../shared/widgets/log_stream_viewer.dart';
+import '../../shared/widgets/task_progress_panel.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'app_launcher.dart';
 import 'widgets/edit_listeners_dialog.dart';
@@ -37,7 +42,7 @@ class _AppDetailViewState extends State<AppDetailView>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this);
     _loadData();
   }
 
@@ -73,23 +78,61 @@ class _AppDetailViewState extends State<AppDetailView>
     }
   }
 
-  Future<void> _handleAction(Future<void> Function() action) async {
+  Future<bool> _handleActionWithProgress({
+    required String taskType,
+    required Future<void> Function(String taskId) action,
+    bool refreshOnSuccess = true,
+  }) async {
+    if (!mounted) return false;
+
+    final taskId = generateTaskId();
+    final progressDone = Completer<void>();
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: Text(taskType),
+        content: SizedBox(
+          width: 520,
+          child: TaskProgressPanel(
+            taskId: taskId,
+            taskType: taskType,
+            onComplete: () {
+              if (!progressDone.isCompleted) progressDone.complete();
+            },
+          ),
+        ),
+      ),
+    );
+
     setState(() => _isActionLoading = true);
+    Object? actionError;
     try {
-      await action();
-      // Delay slightly to allow backend state to propagate/Podman to react
-      await Future.delayed(const Duration(seconds: 1));
-      if (!mounted) return;
-      await _loadData(); // Refresh UI
+      await action(taskId);
+      await progressDone.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {},
+      );
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text("Action failed: $e")));
-      }
+      actionError = e;
     } finally {
       if (mounted) setState(() => _isActionLoading = false);
+      if (mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
     }
+
+    if (actionError != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Action failed: $actionError")),
+      );
+      return false;
+    }
+
+    if (!refreshOnSuccess || !mounted) return true;
+    await _loadData();
+    return true;
   }
 
   void _confirmUninstall() {
@@ -146,30 +189,20 @@ class _AppDetailViewState extends State<AppDetailView>
                 onPressed: () async {
                   Navigator.of(dialogContext).pop(); // Close dialog
 
-                  // Use outer setState to trigger main view rebuild
-                  setState(() => _isActionLoading = true);
-                  final messenger = ScaffoldMessenger.of(context);
-
-                  try {
-                    await widget.appService.uninstallApp(
+                  final ok = await _handleActionWithProgress(
+                    taskType: 'uninstall_app',
+                    refreshOnSuccess: false,
+                    action: (taskId) => widget.appService.uninstallApp(
                       widget.appId,
                       purge: purgeData,
-                    );
-
-                    if (mounted) {
-                      setState(() {
-                        _app = null; // Forces "App uninstalled" state
-                        _isActionLoading = false;
-                      });
-                    }
-                  } catch (e) {
-                    if (mounted) {
-                      setState(() => _isActionLoading = false);
-                      messenger.showSnackBar(
-                        SnackBar(content: Text("Uninstall failed: $e")),
-                      );
-                    }
-                  }
+                      taskId: taskId,
+                    ),
+                  );
+                  if (!ok || !mounted) return;
+                  setState(() {
+                    _app = null;
+                    _services = [];
+                  });
                 },
                 child: const Text("Uninstall"),
               ),
@@ -193,12 +226,14 @@ class _AppDetailViewState extends State<AppDetailView>
       builder: (context) => EditListenersDialog(
         initialListeners: initialListeners,
         onSave: (newListeners) async {
-          await _handleAction(() async {
-            await widget.appService.updateAppListeners(
+          await _handleActionWithProgress(
+            taskType: 'update_listeners',
+            action: (taskId) => widget.appService.updateAppListeners(
               _app!.name,
               newListeners,
-            );
-          });
+              taskId: taskId,
+            ),
+          );
         },
       ),
     );
@@ -230,6 +265,7 @@ class _AppDetailViewState extends State<AppDetailView>
             Tab(text: "Overview"),
             Tab(text: "Network"),
             Tab(text: "Configuration"),
+            Tab(text: "Logs"),
           ],
         ),
 
@@ -243,6 +279,7 @@ class _AppDetailViewState extends State<AppDetailView>
                 _buildOverviewTab(),
                 _buildNetworkTab(),
                 _buildConfigTab(),
+                _buildLogsTab(),
               ],
             ),
           ),
@@ -361,8 +398,11 @@ class _AppDetailViewState extends State<AppDetailView>
             const CircularProgressIndicator()
           else if (_app!.isRunning)
             FilledButton.icon(
-              onPressed: () =>
-                  _handleAction(() => widget.appService.stopApp(_app!.name)),
+              onPressed: () => _handleActionWithProgress(
+                taskType: 'stop_app',
+                action: (taskId) =>
+                    widget.appService.stopApp(_app!.name, taskId: taskId),
+              ),
               icon: const Icon(Icons.stop),
               label: const Text("Stop"),
               style: FilledButton.styleFrom(
@@ -371,8 +411,11 @@ class _AppDetailViewState extends State<AppDetailView>
             )
           else
             FilledButton.icon(
-              onPressed: () =>
-                  _handleAction(() => widget.appService.startApp(_app!.name)),
+              onPressed: () => _handleActionWithProgress(
+                taskType: 'start_app',
+                action: (taskId) =>
+                    widget.appService.startApp(_app!.name, taskId: taskId),
+              ),
               icon: const Icon(Icons.play_arrow),
               label: const Text("Start"),
               style: FilledButton.styleFrom(
@@ -592,6 +635,16 @@ class _AppDetailViewState extends State<AppDetailView>
           "Container ID: ${_app!.containerId}\n",
           style: const TextStyle(fontFamily: 'JetBrainsMono'),
         ),
+      ),
+    );
+  }
+
+  Widget _buildLogsTab() {
+    return Padding(
+      padding: const EdgeInsets.all(24.0),
+      child: LogStreamViewer(
+        appName: _app!.name,
+        tailLines: 200,
       ),
     );
   }

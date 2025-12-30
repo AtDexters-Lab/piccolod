@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1325,6 +1326,23 @@ func (m *GinMockContainerManager) Logs(ctx context.Context, runtime container.Po
 		out = append(out, "demo log entry")
 	}
 	return out, nil
+}
+
+func (m *GinMockContainerManager) LogsStream(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int, timestamps bool) (io.ReadCloser, error) {
+	_ = ctx
+	_ = runtime
+	_ = timestamps
+	if _, ok := m.containers[containerID]; !ok {
+		return nil, container.ErrContainerNotFound(containerID)
+	}
+	if lines <= 0 {
+		lines = 2
+	}
+	var b strings.Builder
+	for i := 0; i < lines; i++ {
+		b.WriteString("demo log entry\n")
+	}
+	return io.NopCloser(strings.NewReader(b.String())), nil
 }
 
 func (m *GinMockContainerManager) ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error) {

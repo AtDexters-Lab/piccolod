@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ContainerNotFoundError indicates Podman could not find a container by the given reference.
@@ -33,7 +35,6 @@ var ErrDynamicPortUpdateNotSupported = errors.New("podman does not support dynam
 // ErrPortReconciliationRequired indicates that the container's published ports
 // do not match the expected ports and the container needs to be recreated.
 var ErrPortReconciliationRequired = errors.New("container port bindings do not match expected; recreation required")
-
 
 // PodmanCLI provides safe Podman CLI integration with injection prevention
 type PodmanCLI struct{}
@@ -536,6 +537,92 @@ func (p *PodmanCLI) Logs(ctx context.Context, runtime PodmanRuntime, containerID
 		linesOut = append(linesOut, ln)
 	}
 	return linesOut, nil
+}
+
+type streamReadCloser struct {
+	r    *io.PipeReader
+	once sync.Once
+	stop func() error
+}
+
+func (s *streamReadCloser) Read(p []byte) (int, error) { return s.r.Read(p) }
+
+func (s *streamReadCloser) Close() error {
+	var err error
+	s.once.Do(func() {
+		if s.stop != nil {
+			err = s.stop()
+		}
+		_ = s.r.Close()
+	})
+	return err
+}
+
+func (p *PodmanCLI) LogsStream(ctx context.Context, runtime PodmanRuntime, containerID string, lines int, timestamps bool) (io.ReadCloser, error) {
+	if !isValidContainerID(containerID) {
+		return nil, fmt.Errorf("invalid container ID format: %s", containerID)
+	}
+	if lines <= 0 {
+		lines = 200
+	}
+	args := []string{"logs", "--follow", "--tail", fmt.Sprintf("%d", lines)}
+	if timestamps {
+		args = append(args, "--timestamps")
+	}
+	args = append(args, containerID)
+	cmdArgs, err := buildPodmanArgs(runtime, args)
+	if err != nil {
+		return nil, err
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(runCtx, "podman", cmdArgs...)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("podman logs stream stdout: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("podman logs stream stderr: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("podman logs stream start failed: %w", err)
+	}
+
+	pr, pw := io.Pipe()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(pw, stdout)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(pw, stderr)
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		wg.Wait()
+		_ = pw.Close()
+		done <- err
+		close(done)
+	}()
+
+	stop := func() error {
+		cancel()
+		err, ok := <-done
+		if ok && err != nil {
+			return err
+		}
+		return nil
+	}
+	return &streamReadCloser{r: pr, stop: stop}, nil
 }
 
 func (p *PodmanCLI) containerExists(ctx context.Context, runtime PodmanRuntime, containerRef string) (bool, error) {

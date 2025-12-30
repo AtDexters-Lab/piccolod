@@ -88,6 +88,50 @@ func (b *Bus) Subscribe(topic Topic, buffer int) <-chan Event {
 	return ch
 }
 
+// SubscribeWithCancel registers a buffered channel for a topic and returns a cancel
+// function that removes and closes the channel.
+func (b *Bus) SubscribeWithCancel(topic Topic, buffer int) (<-chan Event, func()) {
+	ch := make(chan Event, buffer)
+
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		close(ch)
+		return ch, func() {}
+	}
+	b.subs[topic] = append(b.subs[topic], ch)
+	b.mu.Unlock()
+
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			if b.closed {
+				return
+			}
+			chans := b.subs[topic]
+			for i, existing := range chans {
+				if existing != ch {
+					continue
+				}
+				// Remove without preserving order.
+				chans[i] = chans[len(chans)-1]
+				chans[len(chans)-1] = nil
+				chans = chans[:len(chans)-1]
+				break
+			}
+			if len(chans) == 0 {
+				delete(b.subs, topic)
+			} else {
+				b.subs[topic] = chans
+			}
+			close(ch)
+		})
+	}
+	return ch, cancel
+}
+
 // Publish broadcasts an event to all subscribers.
 func (b *Bus) Publish(evt Event) {
 	b.mu.RLock()

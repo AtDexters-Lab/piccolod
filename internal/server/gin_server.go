@@ -73,6 +73,7 @@ type GinServer struct {
 	router         *gin.Engine
 	version        string
 	events         *events.Bus
+	progress       *events.BusProgressReporter
 	leadership     *cluster.Registry
 	supervisor     *supervisor.Supervisor
 	dispatcher     *commands.Dispatcher
@@ -282,6 +283,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Initialize shared infrastructure
 	eventsBus := events.NewBus()
+	progressReporter := events.NewBusProgressReporter(eventsBus)
 	leadershipReg := cluster.NewRegistry()
 	sup := supervisor.New()
 	dispatch := commands.NewDispatcher()
@@ -307,6 +309,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	}
 	appMgr.ObserveRuntimeEvents(eventsBus)
 	appMgr.SetRouter(routeMgr)
+	appMgr.SetProgressReporter(progressReporter)
 
 	// Initialize persistence module (skeleton; concrete components wired later)
 	persist, err := persistence.NewService(persistence.Options{
@@ -356,6 +359,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		tlsMux:         tlsMux,
 		remoteResolver: remoteResolver,
 		events:         eventsBus,
+		progress:       progressReporter,
 		leadership:     leadershipReg,
 		supervisor:     sup,
 		dispatcher:     dispatch,
@@ -657,12 +661,17 @@ func (s *GinServer) setupGinRoutes() {
 			apps.GET("/:name", s.handleGinAppGet)                               // GET /api/v1/apps/:name
 			apps.DELETE("/:name", s.requireUnlocked(), s.handleGinAppUninstall) // DELETE /api/v1/apps/:name
 			apps.GET("/:name/services", s.handleGinServicesByApp)
+			apps.GET("/:name/logs", s.handleGinAppLogs) // GET /api/v1/apps/:name/logs?tail=200
+			apps.GET("/:name/logs/stream", s.handleGinAppLogStream)
 			apps.PATCH("/:name/listeners", s.requireUnlocked(), s.handleGinAppUpdateListeners)
 
 			// App actions
 			apps.POST("/:name/start", s.requireUnlocked(), s.handleGinAppStart) // POST /api/v1/apps/:name/start
 			apps.POST("/:name/stop", s.requireUnlocked(), s.handleGinAppStop)   // POST /api/v1/apps/:name/stop
 		}
+
+		authed.GET("/system/logs/stream", s.handleGinSystemLogStream)
+		authed.GET("/events/progress/stream", s.handleGinTaskProgressStream)
 
 		// Remote config endpoints require auth
 		authed.POST("/remote/configure", s.handleRemoteConfigure)
