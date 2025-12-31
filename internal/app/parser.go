@@ -166,7 +166,9 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 	}
 
 	// Validate listeners (service-oriented)
-	if err := validateListeners(app.Listeners); err != nil {
+	// Workspace mode apps are allowed to have no listeners
+	mode := piccoloModeFromExtensions(app.Extensions)
+	if err := validateListeners(app.Listeners, mode); err != nil {
 		return err
 	}
 
@@ -293,9 +295,15 @@ func validateType(appType string) error {
 	return fmt.Errorf("type must be either 'user' or 'system', got '%s'", appType)
 }
 
-// validatePorts validates port mappings
-func validateListeners(listeners []api.AppListener) error {
+// validateListeners validates listener configurations.
+// Workspace mode apps are allowed to have no listeners (blank environments).
+func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 	if len(listeners) == 0 {
+		// Workspace mode apps can have no listeners - they're blank environments
+		// where users add ports as needed via Edit Listeners
+		if mode == ModeWorkspace {
+			return nil
+		}
 		return fmt.Errorf("listeners are required; legacy ports are no longer supported")
 	}
 

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"io"
+	"os/exec"
 	"strings"
 
 	"piccolod/internal/container"
@@ -209,6 +210,34 @@ func (m *MockContainerManager) RemoveImage(ctx context.Context, runtime containe
 	_ = imageName
 	// Mock: just succeed
 	return nil
+}
+
+func (m *MockContainerManager) InspectImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) (*container.ImageConfig, error) {
+	_ = ctx
+	_ = runtime
+	_ = imageName
+	// Mock: return a typical image config with shell defaults
+	return &container.ImageConfig{
+		Entrypoint: nil,
+		Cmd:        []string{"/bin/sh"},
+	}, nil
+}
+
+func (m *MockContainerManager) SearchRegistry(ctx context.Context, runtime container.PodmanRuntime, query string, limit int) ([]container.ImageSearchResult, error) {
+	_ = ctx
+	_ = runtime
+	_ = limit
+	// Mock: return some example results based on query
+	return []container.ImageSearchResult{
+		{Index: "docker.io", Name: "library/" + query, Description: "Mock image", Stars: 100, Official: "[OK]"},
+	}, nil
+}
+
+func (m *MockContainerManager) ExecShellCmd(runtime container.PodmanRuntime, containerID string) (*exec.Cmd, error) {
+	_ = runtime
+	// Mock: return a simple echo command for testing purposes
+	// In production this would exec into the container
+	return exec.Command("echo", "mock shell"), nil
 }
 
 func generateMockContainerID(id int) string {

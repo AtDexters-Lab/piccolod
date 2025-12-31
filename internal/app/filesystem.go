@@ -152,27 +152,20 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 		return nil, fmt.Errorf("failed to parse metadata.json: %w", err)
 	}
 
-	// Create AppInstance with instance-aware fields
+	// Create AppInstance with embedded definition
 	app := &AppInstance{
 		InstanceID:  metadata.InstanceID,
 		DisplayName: metadata.DisplayName,
-		AppName:     metadata.AppName,
-		Image:       appDef.Image,
-		Type:        appDef.Type,
 		Status:      metadata.Status,
 		ContainerID: metadata.ContainerID,
-		Environment: appDef.Environment,
 		CreatedAt:   metadata.CreatedAt,
 		UpdatedAt:   metadata.UpdatedAt,
+		Definition:  appDef,
 	}
 
 	// Fallback: if InstanceID is empty in metadata, use directory name
 	if app.InstanceID == "" {
 		app.InstanceID = instanceID
-	}
-	// Fallback: if AppName is empty, use app definition name
-	if app.AppName == "" {
-		app.AppName = appDef.Name
 	}
 
 	return app, nil
@@ -230,9 +223,20 @@ func (fsm *FilesystemStateManager) GetAppDefinition(instanceID string) (*api.App
 
 // StoreApp saves app definition and metadata to filesystem.
 // The app instance is stored under apps/{InstanceID}/.
+// Uses app.Definition for the app.yaml; the separate appDef parameter is kept for
+// backward compatibility but is ignored if app.Definition is set.
 func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDefinition) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
+
+	// Use embedded definition if available, fall back to parameter
+	def := app.Definition
+	if def == nil {
+		def = appDef
+	}
+	if def == nil {
+		return fmt.Errorf("no app definition provided")
+	}
 
 	appDir := filepath.Join(fsm.appsDir, app.InstanceID)
 	if err := os.MkdirAll(appDir, 0755); err != nil {
@@ -241,7 +245,7 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDef
 
 	// Store app.yaml
 	appDefPath := filepath.Join(appDir, "app.yaml")
-	appDefData, err := SerializeAppDefinition(appDef)
+	appDefData, err := SerializeAppDefinition(def)
 	if err != nil {
 		return fmt.Errorf("failed to serialize app definition: %w", err)
 	}
@@ -250,11 +254,12 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDef
 		return fmt.Errorf("failed to write app.yaml: %w", err)
 	}
 
-	// Store metadata.json with instance-aware fields
+	// Store metadata.json with runtime fields
+	// AppName is stored for backward compatibility with existing metadata.json files
 	metadata := AppMetadata{
 		InstanceID:  app.InstanceID,
 		DisplayName: app.DisplayName,
-		AppName:     app.AppName,
+		AppName:     def.Name,
 		Status:      app.Status,
 		ContainerID: app.ContainerID,
 		CreatedAt:   app.CreatedAt,
@@ -301,7 +306,7 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 	app.UpdatedAt = time.Now()
 	createdAt := app.CreatedAt
 	displayName := app.DisplayName
-	appName := app.AppName
+	appName := app.AppName() // Use method to get name from Definition
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem

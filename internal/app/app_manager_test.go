@@ -263,8 +263,8 @@ func TestAppManager_Install(t *testing.T) {
 	}
 
 	// Verify app was created correctly
-	if app.AppName != "test-app" {
-		t.Errorf("Expected app name 'test-app', got %s", app.AppName)
+	if app.AppName() != "test-app" {
+		t.Errorf("Expected app name 'test-app', got %s", app.AppName())
 	}
 	if app.InstanceID != "test-app" {
 		t.Errorf("Expected first instance ID 'test-app', got %s", app.InstanceID)
@@ -305,8 +305,8 @@ func TestAppManager_Install(t *testing.T) {
 	if app2.InstanceID == app.InstanceID {
 		t.Error("Expected different instance ID for second installation")
 	}
-	if app2.AppName != "test-app" {
-		t.Errorf("Expected app name 'test-app', got %s", app2.AppName)
+	if app2.AppName() != "test-app" {
+		t.Errorf("Expected app name 'test-app', got %s", app2.AppName())
 	}
 }
 
@@ -466,7 +466,7 @@ func TestAppManager_List(t *testing.T) {
 	// Verify app names are present
 	appNames := make(map[string]bool)
 	for _, app := range apps {
-		appNames[app.AppName] = true
+		appNames[app.AppName()] = true
 	}
 
 	if !appNames["app1"] || !appNames["app2"] {
@@ -950,16 +950,16 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 		t.Errorf("Expected instance ID 'persistent-app', got %s", app2.InstanceID)
 	}
 
-	if app2.Image != "nginx:alpine" {
-		t.Errorf("Expected image 'nginx:alpine', got %s", app2.Image)
+	if app2.Image() != "nginx:alpine" {
+		t.Errorf("Expected image 'nginx:alpine', got %s", app2.Image())
 	}
 
 	if app2.Status != "running" {
 		t.Errorf("Expected status 'running', got %s", app2.Status)
 	}
 
-	if app2.Environment["TEST_VAR"] != "persistent-value" {
-		t.Errorf("Expected TEST_VAR='persistent-value', got %s", app2.Environment["TEST_VAR"])
+	if app2.Definition.Environment["TEST_VAR"] != "persistent-value" {
+		t.Errorf("Expected TEST_VAR='persistent-value', got %s", app2.Definition.Environment["TEST_VAR"])
 	}
 
 	if !app2.CreatedAt.Equal(installTime) {

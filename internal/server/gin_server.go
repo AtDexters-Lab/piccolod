@@ -668,7 +668,13 @@ func (s *GinServer) setupGinRoutes() {
 			// App actions
 			apps.POST("/:name/start", s.requireUnlocked(), s.handleGinAppStart) // POST /api/v1/apps/:name/start
 			apps.POST("/:name/stop", s.requireUnlocked(), s.handleGinAppStop)   // POST /api/v1/apps/:name/stop
+
+			// Workspace terminal - WebSocket endpoint for exec'ing into container
+			apps.GET("/:name/terminal", s.handleWorkspaceTerminal) // GET /api/v1/apps/:name/terminal (WebSocket)
 		}
+
+		// Image search for workspace creation
+		authed.GET("/images/search", s.handleImageSearch) // GET /api/v1/images/search?q=nginx&limit=25
 
 		authed.GET("/system/logs/stream", s.handleGinSystemLogStream)
 		authed.GET("/events/progress/stream", s.handleGinTaskProgressStream)

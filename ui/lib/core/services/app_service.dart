@@ -198,4 +198,34 @@ class AppService {
     );
     return App.fromJson(data['data']);
   }
+
+  // --- Image Search (for Workspace creation) ---
+
+  /// Searches for container images in Docker Hub and other registries.
+  Future<List<ImageSearchResult>> searchImages(String query, {int limit = 25}) async {
+    final uri = Uri(
+      path: '/api/v1/images/search',
+      queryParameters: {
+        'q': query,
+        'limit': limit.toString(),
+      },
+    );
+
+    final data = await _client.get(uri.toString());
+
+    // Expected: { data: { images: [...], query: "..." } }
+    Map<String, dynamic> response;
+    if (data is Map<String, dynamic>) {
+      if (data.containsKey('data') && data['data'] is Map) {
+        response = data['data'];
+      } else {
+        response = data;
+      }
+    } else {
+      return [];
+    }
+
+    final List<dynamic> images = response['images'] ?? [];
+    return images.map((e) => ImageSearchResult.fromJson(e)).toList();
+  }
 }

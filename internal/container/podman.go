@@ -3,9 +3,11 @@ package container
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -192,6 +194,11 @@ type ContainerCreateSpec struct {
 	Resources     ResourceLimits
 	NetworkMode   string
 	RestartPolicy string
+
+	// Workspace mode fields
+	UseInit    bool     // If true, adds --init flag for PID 1 safety
+	Entrypoint []string // Custom entrypoint (overrides image default)
+	Command    []string // Command arguments appended after image
 }
 
 type PortMapping struct {
@@ -217,6 +224,11 @@ type ResourceLimits struct {
 
 func buildRunArgs(spec ContainerCreateSpec) []string {
 	args := []string{"run", "-d"}
+
+	// PID 1 init process for proper signal handling and zombie reaping
+	if spec.UseInit {
+		args = append(args, "--init")
+	}
 
 	if spec.Name != "" {
 		args = append(args, "--name", spec.Name)
@@ -262,9 +274,20 @@ func buildRunArgs(spec ContainerCreateSpec) []string {
 		args = append(args, "--restart", spec.RestartPolicy)
 	}
 
+	// Custom entrypoint (for workspace mode boot.sh wrapper)
+	if len(spec.Entrypoint) > 0 {
+		args = append(args, "--entrypoint", spec.Entrypoint[0])
+	}
+
 	if spec.Image != "" {
 		args = append(args, spec.Image)
 	}
+
+	// Append remaining entrypoint args and command after image
+	if len(spec.Entrypoint) > 1 {
+		args = append(args, spec.Entrypoint[1:]...)
+	}
+	args = append(args, spec.Command...)
 
 	return args
 }
@@ -879,4 +902,123 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 	}
 
 	return nil
+}
+
+// ImageConfig holds the entrypoint and command from a container image configuration.
+// These are extracted via `podman image inspect` to enable entrypoint wrapping for workspace mode.
+type ImageConfig struct {
+	Entrypoint []string
+	Cmd        []string
+}
+
+// InspectImage retrieves the configuration of a container image, including its entrypoint and command.
+// This is used to extract the original command so it can be wrapped with boot.sh for workspace mode.
+func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, imageName string) (*ImageConfig, error) {
+	if err := ValidateContainerName(imageName); err != nil {
+		return nil, fmt.Errorf("invalid image name: %w", err)
+	}
+
+	// Use podman image inspect to get the image configuration
+	// Format: JSON array with Entrypoint and Cmd
+	args, err := buildPodmanArgs(runtime, []string{
+		"image", "inspect",
+		"--format", `{"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}}}`,
+		imageName,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("podman image inspect failed: %w, output: %s", err, string(output))
+	}
+
+	// Parse the JSON output
+	var result struct {
+		Entrypoint []string `json:"entrypoint"`
+		Cmd        []string `json:"cmd"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse image config: %w, output: %s", err, string(output))
+	}
+
+	return &ImageConfig{
+		Entrypoint: result.Entrypoint,
+		Cmd:        result.Cmd,
+	}, nil
+}
+
+// ImageSearchResult represents a single search result from a container registry.
+type ImageSearchResult struct {
+	Index       string `json:"Index"`
+	Name        string `json:"Name"`
+	Description string `json:"Description"`
+	Stars       int    `json:"Stars"`
+	Official    string `json:"Official"`
+}
+
+// ExecShellCmd returns an exec.Cmd configured for running an interactive shell
+// inside a container. The caller is responsible for starting the command,
+// typically with pty.Start() for terminal access.
+func (p *PodmanCLI) ExecShellCmd(runtime PodmanRuntime, containerID string) (*exec.Cmd, error) {
+	if !isValidContainerID(containerID) {
+		return nil, fmt.Errorf("invalid container ID format: %s", containerID)
+	}
+
+	// Build podman exec args: podman [runtime-opts] exec -it <container> /bin/sh
+	// We use /bin/sh as it's more universally available than bash
+	args, err := buildPodmanArgs(runtime, []string{
+		"exec",
+		"-i", "-t", // Interactive + TTY
+		containerID,
+		"/bin/sh",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.Command("podman", args...)
+	// Preserve existing environment (XDG_RUNTIME_DIR, PATH, etc. needed for rootless podman)
+	// and add TERM for proper terminal handling
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	return cmd, nil
+}
+
+// SearchRegistry searches for images in container registries using podman search.
+// The query is passed directly to podman search. Results are limited by the limit parameter.
+func (p *PodmanCLI) SearchRegistry(ctx context.Context, runtime PodmanRuntime, query string, limit int) ([]ImageSearchResult, error) {
+	if query == "" {
+		return nil, fmt.Errorf("search query cannot be empty")
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	args, err := buildPodmanArgs(runtime, []string{
+		"search",
+		"--format", "json",
+		"--limit", fmt.Sprintf("%d", limit),
+		fmt.Sprintf("docker.io/%s", query),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("podman search failed: %w, output: %s", err, string(output))
+	}
+
+	var results []ImageSearchResult
+	if err := json.Unmarshal(output, &results); err != nil {
+		return nil, fmt.Errorf("failed to parse search results: %w, output: %s", err, string(output))
+	}
+
+	return results, nil
 }

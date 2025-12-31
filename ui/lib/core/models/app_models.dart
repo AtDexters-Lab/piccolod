@@ -29,24 +29,53 @@ class App {
   factory App.fromJson(Map<String, dynamic> json) {
     final instanceId = (json['instance_id'] ?? json['name'] ?? json['id'] ?? '')
         .toString();
-    final appName = (json['app_name'] ?? json['name'] ?? '').toString();
     final displayName = (json['display_name'] ?? '').toString();
+
+    // Definition is now nested - extract it (with fallback for backward compatibility)
+    final def = json['definition'] as Map<String, dynamic>? ?? {};
+
+    // App name comes from definition.name, with fallbacks
+    final appName = (def['name'] ?? json['app_name'] ?? json['name'] ?? '').toString();
+
+    // Image, type, environment come from definition
+    final image = (def['image'] ?? json['image'] ?? '').toString();
+    final type = (def['type'] ?? json['type'] ?? 'user').toString();
+    final environment = Map<String, String>.from(def['environment'] ?? json['environment'] ?? {});
+
+    // Mode comes from x-piccolo extensions in definition
+    String mode = '';
+    final extensions = def['x-piccolo'] as Map<String, dynamic>?;
+    if (extensions != null) {
+      mode = (extensions['mode'] ?? '').toString();
+    } else {
+      // Fallback for backward compatibility
+      mode = (json['mode'] ?? '').toString();
+    }
+
+    // Volumes come from definition.storage.volumes
+    List<AppVolume> volumes = [];
+    final storage = def['storage'] as Map<String, dynamic>?;
+    if (storage != null) {
+      final volumeList = storage['volumes'] as List<dynamic>?;
+      if (volumeList != null) {
+        volumes = volumeList.map((e) => AppVolume.fromJson(e)).toList();
+      }
+    } else if (json['volumes'] != null) {
+      // Fallback for backward compatibility
+      volumes = (json['volumes'] as List<dynamic>).map((e) => AppVolume.fromJson(e)).toList();
+    }
 
     return App(
       id: instanceId,
       name: instanceId,
       appName: appName,
       displayName: displayName,
-      image: json['image'] ?? '',
-      type: json['type'] ?? 'user',
-      mode: json['mode'] ?? '',
+      image: image,
+      type: type,
+      mode: mode,
       status: json['status'] ?? 'unknown',
-      volumes:
-          (json['volumes'] as List<dynamic>?)
-              ?.map((e) => AppVolume.fromJson(e))
-              .toList() ??
-          [],
-      environment: Map<String, String>.from(json['environment'] ?? {}),
+      volumes: volumes,
+      environment: environment,
       containerId: json['container_id'],
     );
   }
@@ -263,5 +292,40 @@ class AppValidationResult {
       error:
           json['error'], // If backend returns error detail in 200 OK structure
     );
+  }
+}
+
+/// Represents a container image search result from Docker Hub or other registries.
+class ImageSearchResult {
+  final String name;
+  final String description;
+  final int stars;
+  final bool official;
+  final String index;
+
+  ImageSearchResult({
+    required this.name,
+    required this.description,
+    required this.stars,
+    required this.official,
+    required this.index,
+  });
+
+  factory ImageSearchResult.fromJson(Map<String, dynamic> json) {
+    return ImageSearchResult(
+      name: json['name'] ?? '',
+      description: json['description'] ?? '',
+      stars: json['stars'] ?? 0,
+      official: json['official'] ?? false,
+      index: json['index'] ?? 'docker.io',
+    );
+  }
+
+  /// Returns the full image name including registry index.
+  String get fullName {
+    if (index.isEmpty || index == 'docker.io') {
+      return name;
+    }
+    return '$index/$name';
   }
 }

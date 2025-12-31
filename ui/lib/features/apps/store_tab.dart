@@ -5,6 +5,7 @@ import '../../theme/piccolo_theme.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'custom_install_wizard.dart';
 import 'dynamic_install_wizard.dart';
+import 'create_workspace_wizard.dart';
 import 'app_detail_view.dart';
 
 class StoreTab extends StatefulWidget {
@@ -199,38 +200,72 @@ class _StoreTabState extends State<StoreTab> {
     );
   }
 
+  void _openCreateWorkspace() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => CreateWorkspaceWizard(
+        appService: widget.appService,
+        onSuccess: () {
+          Navigator.of(context).pop();
+          // Refresh library or show the new workspace
+        },
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // Category Pills
+        // Category Pills and Create Workspace Button
         Container(
           height: 60,
           padding: const EdgeInsets.symmetric(vertical: 12),
-          child: ListView.separated(
-            padding: const EdgeInsets.symmetric(horizontal: 24),
-            scrollDirection: Axis.horizontal,
-            itemCount: _categories.length,
-            separatorBuilder: (c, i) => const SizedBox(width: 8),
-            itemBuilder: (context, index) {
-              final cat = _categories[index];
-              final isSelected = cat == _selectedCategory;
-              return ChoiceChip(
-                label: Text(cat),
-                selected: isSelected,
-                showCheckmark: false,
-                onSelected: (_) => _onCategorySelected(cat),
-                selectedColor: PiccoloTheme.cobalt600,
-                labelStyle: TextStyle(
-                  color: isSelected ? Colors.white : PiccoloTheme.ink,
-                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+          child: Row(
+            children: [
+              // Create Workspace Button
+              Padding(
+                padding: const EdgeInsets.only(left: 24, right: 16),
+                child: FilledButton.icon(
+                  onPressed: _openCreateWorkspace,
+                  icon: const Icon(Icons.terminal, size: 18),
+                  label: const Text('Create Workspace'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: PiccoloTheme.success,
+                    foregroundColor: Colors.white,
+                  ),
                 ),
-                backgroundColor: PiccoloTheme.porcelain,
-                side: BorderSide.none,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-              );
-            },
+              ),
+              // Category Pills
+              Expanded(
+                child: ListView.separated(
+                  padding: const EdgeInsets.only(right: 24),
+                  scrollDirection: Axis.horizontal,
+                  itemCount: _categories.length,
+                  separatorBuilder: (c, i) => const SizedBox(width: 8),
+                  itemBuilder: (context, index) {
+                    final cat = _categories[index];
+                    final isSelected = cat == _selectedCategory;
+                    return ChoiceChip(
+                      label: Text(cat),
+                      selected: isSelected,
+                      showCheckmark: false,
+                      onSelected: (_) => _onCategorySelected(cat),
+                      selectedColor: PiccoloTheme.cobalt600,
+                      labelStyle: TextStyle(
+                        color: isSelected ? Colors.white : PiccoloTheme.ink,
+                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                      ),
+                      backgroundColor: PiccoloTheme.porcelain,
+                      side: BorderSide.none,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                    );
+                  },
+                ),
+              ),
+            ],
           ),
         ),
         

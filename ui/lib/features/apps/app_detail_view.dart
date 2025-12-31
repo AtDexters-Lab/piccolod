@@ -10,6 +10,7 @@ import '../../shared/widgets/task_progress_panel.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'app_launcher.dart';
 import 'widgets/edit_listeners_dialog.dart';
+import 'workspace_terminal.dart';
 
 class AppDetailView extends StatefulWidget {
   final String appId;
@@ -239,6 +240,17 @@ class _AppDetailViewState extends State<AppDetailView>
     );
   }
 
+  void _openTerminal() {
+    if (_app == null) return;
+
+    widget.desktopController.openApp(
+      "terminal-${_app!.name}",
+      "${_app!.displayTitle} Terminal",
+      Icons.terminal,
+      WorkspaceTerminal(appId: _app!.name),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     // Removed Scaffold/AppBar to fit into WindowFrame naturally
@@ -396,32 +408,47 @@ class _AppDetailViewState extends State<AppDetailView>
           // Actions
           if (_isActionLoading)
             const CircularProgressIndicator()
-          else if (_app!.isRunning)
-            FilledButton.icon(
-              onPressed: () => _handleActionWithProgress(
-                taskType: 'stop_app',
-                action: (taskId) =>
-                    widget.appService.stopApp(_app!.name, taskId: taskId),
+          else ...[
+            // Terminal button for running workspace apps
+            if (_app!.isWorkspace && _app!.isRunning) ...[
+              FilledButton.icon(
+                onPressed: _openTerminal,
+                icon: const Icon(Icons.terminal),
+                label: const Text("Terminal"),
+                style: FilledButton.styleFrom(
+                  backgroundColor: PiccoloTheme.cobalt600,
+                ),
               ),
-              icon: const Icon(Icons.stop),
-              label: const Text("Stop"),
-              style: FilledButton.styleFrom(
-                backgroundColor: PiccoloTheme.inkMuted,
+              const SizedBox(width: 12),
+            ],
+            // Start/Stop button
+            if (_app!.isRunning)
+              FilledButton.icon(
+                onPressed: () => _handleActionWithProgress(
+                  taskType: 'stop_app',
+                  action: (taskId) =>
+                      widget.appService.stopApp(_app!.name, taskId: taskId),
+                ),
+                icon: const Icon(Icons.stop),
+                label: const Text("Stop"),
+                style: FilledButton.styleFrom(
+                  backgroundColor: PiccoloTheme.inkMuted,
+                ),
+              )
+            else
+              FilledButton.icon(
+                onPressed: () => _handleActionWithProgress(
+                  taskType: 'start_app',
+                  action: (taskId) =>
+                      widget.appService.startApp(_app!.name, taskId: taskId),
+                ),
+                icon: const Icon(Icons.play_arrow),
+                label: const Text("Start"),
+                style: FilledButton.styleFrom(
+                  backgroundColor: PiccoloTheme.success,
+                ),
               ),
-            )
-          else
-            FilledButton.icon(
-              onPressed: () => _handleActionWithProgress(
-                taskType: 'start_app',
-                action: (taskId) =>
-                    widget.appService.startApp(_app!.name, taskId: taskId),
-              ),
-              icon: const Icon(Icons.play_arrow),
-              label: const Text("Start"),
-              style: FilledButton.styleFrom(
-                backgroundColor: PiccoloTheme.success,
-              ),
-            ),
+          ],
         ],
       ),
     );

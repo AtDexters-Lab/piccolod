@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -993,6 +994,21 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, "Using workspace snapshot", false, nil)
 	}
 
+	// Workspace mode: wrap the original entrypoint with boot.sh
+	if mode == ModeWorkspace {
+		imgConfig, err := m.containerManager.InspectImage(ctx, runtime, containerSpec.Image)
+		if err != nil {
+			// Fallback: use shell as default command
+			log.Printf("WARN: install %s: failed to inspect image config, using shell fallback: %v", instanceID, err)
+			containerSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+			containerSpec.Command = []string{"/bin/sh"}
+		} else {
+			// Wrap original entrypoint/cmd with boot.sh
+			containerSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+			containerSpec.Command = buildOriginalCommand(imgConfig)
+		}
+	}
+
 	// Create container with zombie cleanup
 	var containerID string
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseCreatingContainer, 60, "Creating container", false, nil)
@@ -1062,20 +1078,16 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		m.serviceManager.SetAppContainerID(instanceID, containerID)
 	}
 
-	// Create app instance with instance-aware fields
+	// Create app instance with embedded definition
 	now := time.Now()
 	app := &AppInstance{
 		InstanceID:  instanceID,
 		DisplayName: displayName,
-		AppName:     appDef.Name,
-		Image:       appDef.Image,
-		Type:        appDef.Type,
-		Mode:        string(mode),
 		Status:      "running",
 		ContainerID: containerID,
-		Environment: appDef.Environment,
 		CreatedAt:   now,
 		UpdatedAt:   now,
+		Definition:  appDef,
 	}
 
 	// Store app to filesystem
@@ -1558,17 +1570,12 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	if m.serviceManager != nil {
 		m.serviceManager.SetAppContainerID(instanceID, newCID)
 	}
-	// Update instance and persist app.yaml + metadata
-	appInst.Image = newImage
+	// Update instance with new definition and persist
+	appInst.Definition = &newDef
 	appInst.ContainerID = newCID
 	appInst.Status = "created"
 	appInst.UpdatedAt = time.Now()
-	// Mode comes from definition which might have updated extensions
-	mode := piccoloModeFromExtensions(newDef.Extensions)
-	if mode != ModeUnknown {
-		appInst.Mode = string(mode)
-	}
-	if err := state.StoreApp(appInst, &newDef); err != nil {
+	if err := state.StoreApp(appInst, nil); err != nil {
 		return fmt.Errorf("store app: %w", err)
 	}
 	return nil
@@ -1826,17 +1833,12 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	if m.serviceManager != nil {
 		m.serviceManager.SetAppContainerID(instanceID, newCID)
 	}
-	// Update instance and persist prev as current
-	appInst.Image = prevDef.Image
+	// Update instance with previous definition and persist
+	appInst.Definition = prevDef
 	appInst.ContainerID = newCID
 	appInst.Status = "created"
 	appInst.UpdatedAt = time.Now()
-	// Restore mode if available, although it shouldn't change between versions ideally
-	mode := piccoloModeFromExtensions(prevDef.Extensions)
-	if mode != ModeUnknown {
-		appInst.Mode = string(mode)
-	}
-	if err := state.StoreApp(appInst, prevDef); err != nil {
+	if err := state.StoreApp(appInst, nil); err != nil {
 		return fmt.Errorf("store app: %w", err)
 	}
 	return nil
@@ -1976,6 +1978,38 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 		}
 	}
 
+	// Workspace mode: enable init and mount boot.sh wrapper
+	mode := piccoloModeFromExtensions(appDef.Extensions)
+	if mode == ModeWorkspace {
+		// Use --init for proper PID 1 signal handling and zombie reaping
+		spec.UseInit = true
+
+		// Ensure boot.sh wrapper exists on host filesystem
+		if err := EnsureBootShAsset(); err != nil {
+			return spec, fmt.Errorf("failed to ensure boot.sh asset: %w", err)
+		}
+
+		// Mount boot.sh as read-only into the container
+		// Use :z for SELinux shared label (required for rootless podman on SELinux systems)
+		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
+			Host:      BootShHostPath(),
+			Container: "/piccolo/boot.sh",
+			Options:   "ro,z",
+		})
+
+		// Mount a writable config directory for user startup hooks (start.sh)
+		// This directory is persistent and writable by the container user
+		configDir := filepath.Join(layout.DataDir, "piccolo-config")
+		if err := os.MkdirAll(configDir, 0o777); err != nil {
+			return spec, fmt.Errorf("failed to create piccolo config dir: %w", err)
+		}
+		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
+			Host:      configDir,
+			Container: "/piccolo/config",
+			Options:   "rw,U,z", // U for rootless UID mapping
+		})
+	}
+
 	// Validate the container spec
 	if err := container.ValidateContainerSpec(spec); err != nil {
 		return spec, fmt.Errorf("invalid container spec: %w", err)
@@ -1997,4 +2031,57 @@ func (m *AppManager) purgeAppData(ctx context.Context, instanceID string) error 
 	_ = os.RemoveAll(filepath.Join(layout.MountDir, "data"))
 	_ = os.RemoveAll(filepath.Join(layout.MountDir, "disk"))
 	return nil
+}
+
+// buildOriginalCommand constructs the original container command from image config.
+// The entrypoint and cmd are combined into a single command slice that will be
+// passed to boot.sh, which will execute it as the primary process.
+func buildOriginalCommand(imgConfig *container.ImageConfig) []string {
+	var cmd []string
+	cmd = append(cmd, imgConfig.Entrypoint...)
+	cmd = append(cmd, imgConfig.Cmd...)
+	if len(cmd) == 0 {
+		// Fallback for images without explicit entrypoint/cmd
+		cmd = []string{"/bin/sh"}
+	}
+	return cmd
+}
+
+// SearchImages searches for container images in registries.
+// This uses system defaults (no app-specific storage) since image search
+// doesn't require access to app-specific container storage.
+func (m *AppManager) SearchImages(ctx context.Context, query string, limit int) ([]container.ImageSearchResult, error) {
+	// Use empty runtime to use system defaults
+	runtime := container.PodmanRuntime{}
+	return m.containerManager.SearchRegistry(ctx, runtime, query, limit)
+}
+
+// ExecShellCmd returns an exec.Cmd for running a shell inside the container for the given app instance.
+// The caller is responsible for starting the command and managing its lifecycle (e.g., with PTY).
+func (m *AppManager) ExecShellCmd(ctx context.Context, instanceID string) (*exec.Cmd, error) {
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return nil, err
+	}
+	appInst, exists := state.GetApp(instanceID)
+	if !exists {
+		return nil, fmt.Errorf("app instance not found: %s", instanceID)
+	}
+	if appInst.ContainerID == "" {
+		return nil, fmt.Errorf("app %s has no container ID", instanceID)
+	}
+	if appInst.Status != "running" {
+		return nil, fmt.Errorf("app %s is not running (status: %s)", instanceID, appInst.Status)
+	}
+
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve volume layout: %w", err)
+	}
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create podman runtime: %w", err)
+	}
+
+	return m.containerManager.ExecShellCmd(runtime, appInst.ContainerID)
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1407,6 +1408,33 @@ func (m *GinMockContainerManager) UpdatePublishRemove(ctx context.Context, runti
 	}
 	c.Spec.Ports = out
 	return nil
+}
+
+func (m *GinMockContainerManager) InspectImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) (*container.ImageConfig, error) {
+	_ = ctx
+	_ = runtime
+	_ = imageName
+	// Mock: return a typical image config with shell defaults
+	return &container.ImageConfig{
+		Entrypoint: nil,
+		Cmd:        []string{"/bin/sh"},
+	}, nil
+}
+
+func (m *GinMockContainerManager) SearchRegistry(ctx context.Context, runtime container.PodmanRuntime, query string, limit int) ([]container.ImageSearchResult, error) {
+	_ = ctx
+	_ = runtime
+	_ = limit
+	// Mock: return some example results based on query
+	return []container.ImageSearchResult{
+		{Index: "docker.io", Name: "library/" + query, Description: "Mock image", Stars: 100, Official: "[OK]"},
+	}, nil
+}
+
+func (m *GinMockContainerManager) ExecShellCmd(runtime container.PodmanRuntime, containerID string) (*exec.Cmd, error) {
+	_ = runtime
+	// Mock: return a simple echo command for testing purposes
+	return exec.Command("echo", "mock shell"), nil
 }
 
 func TestServicesLocalURLGeneration(t *testing.T) {
