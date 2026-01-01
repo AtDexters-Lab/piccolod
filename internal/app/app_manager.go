@@ -1004,8 +1004,18 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 			containerSpec.Command = []string{"/bin/sh"}
 		} else {
 			// Wrap original entrypoint/cmd with boot.sh
-			containerSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-			containerSpec.Command = buildOriginalCommand(imgConfig)
+			// If the image is a snapshot, it might already have the wrapper in its Entrypoint.
+			// We detect this to avoid infinite recursion (boot.sh -> boot.sh -> ...).
+			originalCmd := buildOriginalCommand(imgConfig)
+			if len(originalCmd) >= 2 && originalCmd[0] == "/bin/sh" && originalCmd[1] == "/piccolo/boot.sh" {
+				// Already wrapped: just reset Entrypoint and strip the wrapper prefix from Command
+				containerSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+				containerSpec.Command = originalCmd[2:]
+			} else {
+				// Not wrapped: wrap it
+				containerSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+				containerSpec.Command = originalCmd
+			}
 		}
 	}
 
