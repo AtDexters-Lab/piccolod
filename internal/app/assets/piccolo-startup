@@ -1,0 +1,134 @@
+#!/bin/sh
+# piccolo-startup - Helper for managing Piccolo workspace startup scripts
+#
+# This script helps users discover and manage their workspace startup hook.
+
+STARTUP_SCRIPT="/piccolo/config/start.sh"
+CONFIG_DIR="/piccolo/config"
+
+show_status() {
+    echo "Piccolo Workspace Startup Script"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Location: $STARTUP_SCRIPT"
+    echo ""
+
+    if [ -f "$STARTUP_SCRIPT" ]; then
+        if [ -x "$STARTUP_SCRIPT" ]; then
+            echo "Status:   ✓ Configured (executable)"
+        else
+            echo "Status:   ✓ Configured (will be auto-chmod on next start)"
+        fi
+        echo ""
+        echo "Current contents:"
+        echo "─────────────────"
+        cat "$STARTUP_SCRIPT"
+    else
+        echo "Status:   Not configured"
+        echo ""
+        echo "Commands:"
+        echo "  piccolo-startup edit     Create/edit the startup script"
+        echo "  piccolo-startup show     Show current script contents"
+        echo "  piccolo-startup disable  Disable the startup script"
+        echo ""
+        echo "Your script will run automatically when the workspace starts."
+    fi
+}
+
+create_template() {
+    mkdir -p "$CONFIG_DIR"
+    cat > "$STARTUP_SCRIPT" << 'TEMPLATE'
+#!/bin/sh
+# Piccolo Workspace Startup Script
+# This script runs automatically when your workspace starts.
+# Add commands below to start services, set up your environment, etc.
+
+# Example: Start nginx
+# nginx
+
+# Example: Start a background process
+# my-service &
+
+TEMPLATE
+    chmod +x "$STARTUP_SCRIPT"
+    echo "Created startup script template at $STARTUP_SCRIPT"
+}
+
+do_edit() {
+    if [ ! -f "$STARTUP_SCRIPT" ]; then
+        create_template
+    fi
+
+    # Try editors in order of preference
+    if [ -n "$EDITOR" ]; then
+        $EDITOR "$STARTUP_SCRIPT"
+    elif command -v nano >/dev/null 2>&1; then
+        nano "$STARTUP_SCRIPT"
+    elif command -v vi >/dev/null 2>&1; then
+        vi "$STARTUP_SCRIPT"
+    else
+        echo "No editor found. Please edit manually: $STARTUP_SCRIPT"
+        exit 1
+    fi
+}
+
+do_show() {
+    if [ -f "$STARTUP_SCRIPT" ]; then
+        cat "$STARTUP_SCRIPT"
+    else
+        echo "No startup script configured."
+        echo "Create one with: piccolo-startup edit"
+        exit 1
+    fi
+}
+
+do_disable() {
+    if [ -f "$STARTUP_SCRIPT" ]; then
+        mv "$STARTUP_SCRIPT" "${STARTUP_SCRIPT}.disabled"
+        echo "Startup script disabled."
+        echo "Renamed to: ${STARTUP_SCRIPT}.disabled"
+        echo "Re-enable with: mv ${STARTUP_SCRIPT}.disabled $STARTUP_SCRIPT"
+    else
+        echo "No startup script to disable."
+    fi
+}
+
+do_enable() {
+    if [ -f "${STARTUP_SCRIPT}.disabled" ]; then
+        mv "${STARTUP_SCRIPT}.disabled" "$STARTUP_SCRIPT"
+        chmod +x "$STARTUP_SCRIPT"
+        echo "Startup script enabled."
+    else
+        echo "No disabled startup script found."
+        echo "Create one with: piccolo-startup edit"
+    fi
+}
+
+# Main
+case "${1:-}" in
+    edit)
+        do_edit
+        ;;
+    show)
+        do_show
+        ;;
+    disable)
+        do_disable
+        ;;
+    enable)
+        do_enable
+        ;;
+    ""|status)
+        show_status
+        ;;
+    *)
+        echo "Usage: piccolo-startup [command]"
+        echo ""
+        echo "Commands:"
+        echo "  (none)   Show status and help"
+        echo "  edit     Create or edit the startup script"
+        echo "  show     Display the current startup script"
+        echo "  enable   Enable a disabled startup script"
+        echo "  disable  Disable the startup script"
+        exit 1
+        ;;
+esac

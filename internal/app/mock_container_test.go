@@ -218,8 +218,10 @@ func (m *MockContainerManager) InspectImage(ctx context.Context, runtime contain
 	_ = imageName
 	// Mock: return a typical image config with shell defaults
 	return &container.ImageConfig{
-		Entrypoint: nil,
-		Cmd:        []string{"/bin/sh"},
+		Entrypoint:  nil,
+		Cmd:         []string{"/bin/sh"},
+		Digest:      "sha256:mockdigest",
+		RepoDigests: []string{"docker.io/library/mock-image@sha256:mockdigest"},
 	}, nil
 }
 

@@ -8,6 +8,7 @@ import '../../../../core/services/websocket_connection.dart';
 class PiccoloTerminalBackend {
   final Terminal terminal;
   final String url;
+  final void Function()? onSessionEnd;
 
   late final WebSocketConnection _connection;
   late final void Function() _connectionListener;
@@ -18,7 +19,7 @@ class PiccoloTerminalBackend {
   WebSocketConnectionState _lastState = WebSocketConnectionState.disconnected;
   String? _lastErrorShown;
 
-  PiccoloTerminalBackend(this.terminal, this.url) {
+  PiccoloTerminalBackend(this.terminal, this.url, {this.onSessionEnd}) {
     _connection = WebSocketConnection(
       url,
       onReconnectScheduled: (delay) {
@@ -26,6 +27,7 @@ class PiccoloTerminalBackend {
           '\r\n\x1b[33mReconnecting in ${delay.inSeconds}s...\x1b[0m\r\n',
         );
       },
+      onSessionEnd: onSessionEnd,
     );
     _connectionListener = _handleConnectionUpdate;
     _connection.addListener(_connectionListener);

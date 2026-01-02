@@ -243,11 +243,15 @@ class _AppDetailViewState extends State<AppDetailView>
   void _openTerminal() {
     if (_app == null) return;
 
+    final windowId = "terminal-${_app!.name}";
     widget.desktopController.openApp(
-      "terminal-${_app!.name}",
+      windowId,
       "${_app!.displayTitle} Terminal",
       Icons.terminal,
-      WorkspaceTerminal(appId: _app!.name),
+      WorkspaceTerminal(
+        appId: _app!.name,
+        onSessionEnd: () => widget.desktopController.closeWindow(windowId),
+      ),
     );
   }
 

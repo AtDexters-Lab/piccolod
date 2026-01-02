@@ -6,6 +6,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 enum WebSocketConnectionState { disconnected, connecting, connected, error }
 
 typedef ReconnectScheduledCallback = void Function(Duration delay);
+typedef SessionEndCallback = void Function();
 
 class WebSocketConnection extends ChangeNotifier {
   final String url;
@@ -13,6 +14,7 @@ class WebSocketConnection extends ChangeNotifier {
   final Duration initialReconnectDelay;
   final Duration maxReconnectDelay;
   final ReconnectScheduledCallback? onReconnectScheduled;
+  final SessionEndCallback? onSessionEnd;
 
   WebSocketChannel? _channel;
   StreamSubscription? _subscription;
@@ -40,6 +42,7 @@ class WebSocketConnection extends ChangeNotifier {
     this.initialReconnectDelay = const Duration(seconds: 2),
     this.maxReconnectDelay = const Duration(seconds: 30),
     this.onReconnectScheduled,
+    this.onSessionEnd,
   }) : _reconnectDelay = initialReconnectDelay;
 
   void connect() {
@@ -61,14 +64,27 @@ class WebSocketConnection extends ChangeNotifier {
       _channel = WebSocketChannel.connect(Uri.parse(url));
       _subscription = _channel!.stream.listen(
         (message) => _messagesController.add(message),
-        onDone: () => _handleDisconnect('Connection closed'),
-        onError: (error) => _handleDisconnect('Connection error: $error'),
+        onDone: () {
+          // Check close code: 1000 = normal closure (e.g., shell exited via Ctrl+D)
+          final closeCode = _channel?.closeCode;
+          final isNormalClosure = closeCode == 1000;
+          _handleDisconnect(
+            'Connection closed',
+            shouldReconnect: !isNormalClosure,
+          );
+          // Notify listener that session ended normally (for window close)
+          if (isNormalClosure) {
+            onSessionEnd?.call();
+          }
+        },
+        onError: (error) =>
+            _handleDisconnect('Connection error: $error', shouldReconnect: true),
       );
       _reconnectDelay = initialReconnectDelay;
       _lastError = null;
       _setState(WebSocketConnectionState.connected);
     } catch (e) {
-      _handleDisconnect('Failed to connect: $e');
+      _handleDisconnect('Failed to connect: $e', shouldReconnect: true);
     } finally {
       _isConnecting = false;
     }
@@ -97,7 +113,7 @@ class WebSocketConnection extends ChangeNotifier {
     _channel?.sink.add(data);
   }
 
-  void _handleDisconnect(String reason) {
+  void _handleDisconnect(String reason, {bool shouldReconnect = true}) {
     if (_isDisposed) return;
 
     _subscription?.cancel();
@@ -109,7 +125,7 @@ class WebSocketConnection extends ChangeNotifier {
     _lastError = reason;
     _setState(WebSocketConnectionState.error);
 
-    if (_manualDisconnect || !autoReconnect) return;
+    if (_manualDisconnect || !autoReconnect || !shouldReconnect) return;
     _scheduleReconnect();
   }
 

@@ -44,6 +44,10 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
   /// Example: '/api/v1/terminal' or '/api/v1/apps/myapp/terminal'
   String getTerminalPath();
 
+  /// Optional callback when terminal session ends normally (e.g., Ctrl+D).
+  /// Subclasses can override to close window/navigate away.
+  void Function()? getOnSessionEnd() => null;
+
   /// Initialize terminal components. Call in initState().
   void initTerminal() {
     terminal = Terminal(maxLines: 10000);
@@ -54,7 +58,11 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
   /// Connect to the WebSocket terminal. Call in postFrameCallback.
   void connectTerminal() {
     final url = _buildWebSocketUrl(getTerminalPath());
-    terminalBackend = PiccoloTerminalBackend(terminal, url);
+    terminalBackend = PiccoloTerminalBackend(
+      terminal,
+      url,
+      onSessionEnd: getOnSessionEnd(),
+    );
     terminalBackend!.init();
   }
 

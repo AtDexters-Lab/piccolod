@@ -13,7 +13,12 @@ set -e
 # The hook lives on the container's persistent overlay filesystem.
 USER_HOOK="/piccolo/config/start.sh"
 
-if [ -x "$USER_HOOK" ]; then
+if [ -f "$USER_HOOK" ]; then
+    # Auto-chmod: make executable if it exists but isn't
+    if [ ! -x "$USER_HOOK" ]; then
+        echo "[piccolo] Making $USER_HOOK executable"
+        chmod +x "$USER_HOOK"
+    fi
     echo "[piccolo] Starting user hook: $USER_HOOK"
     "$USER_HOOK" &
 fi

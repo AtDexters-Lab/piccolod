@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"piccolod/internal/api"
+	"piccolod/internal/app/workspacedisk"
 	"piccolod/internal/cluster"
 	"piccolod/internal/container"
 	"piccolod/internal/events"
@@ -50,6 +51,11 @@ type AppManager struct {
 	lockOverrideMu   sync.RWMutex
 	lockOverride     *bool
 	mountVerifier    func(string) error
+
+	// Workspace disk manager for container-independent persistence
+	workspaceDiskMgr      *workspacedisk.DefaultManager
+	workspacePathResolver *workspacePathResolver
+	workspaceImageMounter *workspacedisk.PodmanImageMounter
 }
 
 var (
@@ -73,6 +79,73 @@ func workspaceSnapshotImage(instanceID string) string {
 	return fmt.Sprintf("localhost/%s:snapshot", instanceID)
 }
 
+// parseEnvSlice converts OCI-style env slice (KEY=VALUE) to a map.
+// If duplicate keys exist, the last value wins.
+func parseEnvSlice(envSlice []string) map[string]string {
+	result := make(map[string]string, len(envSlice))
+	for _, entry := range envSlice {
+		if idx := strings.Index(entry, "="); idx > 0 {
+			key := entry[:idx]
+			value := entry[idx+1:]
+			result[key] = value
+		}
+	}
+	return result
+}
+
+// mergeEnvMaps merges base and override env maps.
+// Values from override take precedence over base.
+func mergeEnvMaps(base, override map[string]string) map[string]string {
+	result := make(map[string]string, len(base)+len(override))
+	for k, v := range base {
+		result[k] = v
+	}
+	for k, v := range override {
+		result[k] = v
+	}
+	return result
+}
+
+// workspaceRuntimeResolver implements workspacedisk.RuntimeResolver
+// by looking up podman runtime configuration for app instances.
+type workspaceRuntimeResolver struct {
+	am *AppManager
+}
+
+func (r *workspaceRuntimeResolver) GetRuntimeArgs(ctx context.Context, instanceID string) ([]string, error) {
+	// Ensure the volume is available (this might trigger attachment)
+	layout, err := r.am.ensureAppVolumeLayout(ctx, instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("ensure volume layout: %w", err)
+	}
+
+	// Get the podman runtime configuration
+	runtime, err := r.am.podmanRuntimeForApp(instanceID, layout)
+	if err != nil {
+		return nil, fmt.Errorf("get runtime: %w", err)
+	}
+
+	// Convert configuration to command-line arguments
+	args := []string{}
+	if runtime.Root != "" {
+		args = append(args, "--root", runtime.Root)
+	}
+	if runtime.RunRoot != "" {
+		args = append(args, "--runroot", runtime.RunRoot)
+	}
+	if runtime.Imagestore != "" {
+		args = append(args, "--imagestore", runtime.Imagestore)
+	}
+	if runtime.StorageDriver != "" {
+		args = append(args, "--storage-driver", runtime.StorageDriver)
+	}
+	for _, opt := range runtime.StorageOpts {
+		args = append(args, "--storage-opt", opt)
+	}
+
+	return args, nil
+}
+
 // NewAppManagerWithServices creates a new filesystem-based app manager with an injected ServiceManager
 func NewAppManagerWithServices(containerManager ContainerManager, stateDir string, serviceManager *services.ServiceManager, lockReader LockStateReader) (*AppManager, error) {
 	base := stateDir
@@ -80,14 +153,28 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		base = paths.Root()
 	}
 	base = filepath.Clean(base)
-	return &AppManager{
-		containerManager: containerManager,
-		stateBaseDir:     base,
-		serviceManager:   serviceManager,
-		leadershipState:  make(map[string]cluster.Role),
-		lockReader:       lockReader,
-		mountVerifier:    defaultMountVerifier,
-	}, nil
+
+	// Initialize workspace disk components
+	pathResolver := newWorkspacePathResolver()
+	imageMounter := workspacedisk.NewPodmanImageMounter()
+
+	mgr := &AppManager{
+		containerManager:      containerManager,
+		stateBaseDir:          base,
+		serviceManager:        serviceManager,
+		leadershipState:       make(map[string]cluster.Role),
+		lockReader:            lockReader,
+		mountVerifier:         defaultMountVerifier,
+		workspacePathResolver: pathResolver,
+		workspaceImageMounter: imageMounter,
+	}
+
+	// Wire up runtime resolver and disk manager
+	runtimeResolver := &workspaceRuntimeResolver{am: mgr}
+	diskMgr := workspacedisk.NewManager(pathResolver, runtimeResolver, imageMounter)
+	mgr.workspaceDiskMgr = diskMgr
+
+	return mgr, nil
 }
 
 // SetRouter wires the router registrar for leadership-based routing decisions.
@@ -754,6 +841,26 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 		return fmt.Errorf("app manager: service manager not configured")
 	}
 
+	// Check if this is a workspace app that needs --rootfs mode
+	mode := piccoloModeFromExtensions(def.Extensions)
+	var mergedPath string
+	var workspaceMeta *workspacedisk.WorkspaceMeta
+	if mode == ModeWorkspace {
+		// Mount workspace disk overlay (idempotent)
+		var err error
+		mergedPath, err = m.ensureWorkspaceDiskMounted(ctx, appInst.InstanceID, layout)
+		if err != nil {
+			return fmt.Errorf("failed to mount workspace disk: %w", err)
+		}
+
+		// Get metadata for image config
+		workspaceMeta, err = m.getWorkspaceDiskMeta(ctx, appInst.InstanceID, layout)
+		if err != nil {
+			return fmt.Errorf("failed to get workspace disk metadata: %w", err)
+		}
+		log.Printf("INFO: recreate %s: using workspace disk (base=%s)", appInst.InstanceID, workspaceMeta.BaseImageRef)
+	}
+
 	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
 		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners)
 		if err != nil {
@@ -764,6 +871,23 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 			m.serviceManager.RemoveApp(appInst.InstanceID)
 			return err
 		}
+
+		// For workspace mode, configure --rootfs and apply image config
+		if mode == ModeWorkspace && mergedPath != "" && workspaceMeta != nil {
+			spec.Rootfs = mergedPath
+			spec.Image = ""
+
+			// Apply image config (env, workdir, user) since Podman doesn't do it in --rootfs mode.
+			spec.Environment = mergeEnvMaps(parseEnvSlice(workspaceMeta.ImageConfig.Env), spec.Environment)
+			spec.WorkingDir = workspaceMeta.ImageConfig.WorkingDir
+			spec.User = workspaceMeta.ImageConfig.User
+
+			// Use boot.sh entrypoint with original command
+			originalCmd := workspaceMeta.ImageConfig.BuildOriginalCommand()
+			spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+			spec.Command = originalCmd
+		}
+
 		cid, err := m.containerManager.CreateContainer(ctx, runtime, spec)
 		if err == nil {
 			appInst.ContainerID = cid
@@ -965,57 +1089,104 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		return nil, fmt.Errorf("failed to create container spec: %w", err)
 	}
 
-	// For workspace mode, check if a snapshot image exists from a previous uninstall.
-	// If so, use the snapshot to restore the previous container filesystem state.
 	mode := piccoloModeFromExtensions(appDef.Extensions)
-	useSnapshot := false
-	if mode == ModeWorkspace {
-		snapshotImage := workspaceSnapshotImage(instanceID)
-		exists, err := m.containerManager.ImageExists(ctx, runtime, snapshotImage)
-		if err != nil {
-			log.Printf("WARN: install %s: failed to check snapshot image: %v", instanceID, err)
-		} else if exists {
-			log.Printf("INFO: install %s: using workspace snapshot %s", instanceID, snapshotImage)
-			containerSpec.Image = snapshotImage
-			useSnapshot = true
-		}
-	}
 
-	// Pull image to app's isolated storage to detect download issues early
-	// Skip pull if using a local snapshot image
-	if !useSnapshot {
+	// Workspace mode: use container-independent persistence via workspace disk.
+	// The workspace disk combines the base image (lowerdir) with a persistent
+	// writable layer (upperdir) using fuse-overlayfs, eliminating the need for
+	// podman commit snapshots.
+	if mode == ModeWorkspace {
+		// Check if workspace disk is already initialized (reinstall case)
+		diskInitialized := m.isWorkspaceDiskInitialized(ctx, instanceID, layout)
+
+		if !diskInitialized {
+			// New install: pull base image and initialize workspace disk
+			m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, fmt.Sprintf("Pulling image %s", appDef.Image), false, nil)
+			if err := m.containerManager.PullImage(ctx, runtime, appDef.Image); err != nil {
+				log.Printf("WARN: install %s: image pull failed: %v", instanceID, err)
+				m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, fmt.Sprintf("Image pull failed (continuing): %v", err), false, nil)
+			}
+
+			// Get image config for workspace disk metadata
+			imgConfig, err := m.containerManager.InspectImage(ctx, runtime, appDef.Image)
+			if err != nil {
+				return nil, fmt.Errorf("install %s: failed to inspect image %s: %w", instanceID, appDef.Image, err)
+			}
+
+			// Initialize and mount workspace disk
+			m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseInitializingDisk, 40, "Initializing workspace disk", false, nil)
+
+			// Use the canonical digest from image inspect to ensure the same base image
+			// is used across reinstalls and failovers (tags are mutable).
+			// We prefer RepoDigests to ensure we have the registry context (repo@digest)
+			// which is required for pulling on other nodes.
+			baseImageDigest := ""
+			if len(imgConfig.RepoDigests) > 0 {
+				baseImageDigest = imgConfig.RepoDigests[0]
+			} else {
+				baseImageDigest = imgConfig.Digest
+			}
+
+			if baseImageDigest == "" {
+				return nil, fmt.Errorf("install %s: image digest not available for %s", instanceID, appDef.Image)
+			}
+			mergedPath, err := m.initWorkspaceDisk(ctx, instanceID, layout, runtime, imgConfig, baseImageDigest, appDef.Image)
+			if err != nil {
+				return nil, fmt.Errorf("failed to initialize workspace disk: %w", err)
+			}
+
+			// Configure container to use --rootfs mode with the merged overlay
+			containerSpec.Rootfs = mergedPath
+			containerSpec.Image = "" // Clear image since we're using rootfs
+
+			// Apply image config (env, workdir, user) since Podman doesn't do it in --rootfs mode.
+			// Base image env is merged with manifest env (manifest takes precedence).
+			containerSpec.Environment = mergeEnvMaps(parseEnvSlice(imgConfig.Env), containerSpec.Environment)
+			containerSpec.WorkingDir = imgConfig.WorkingDir
+			containerSpec.User = imgConfig.User
+
+			// Wrap entrypoint with boot.sh
+			originalCmd := buildOriginalCommand(imgConfig)
+			containerSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+			containerSpec.Command = originalCmd
+		} else {
+			// Reinstall: workspace disk exists, just mount it
+			m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseMountingWorkspace, 30, "Mounting workspace disk", false, nil)
+
+			mergedPath, err := m.ensureWorkspaceDiskMounted(ctx, instanceID, layout)
+			if err != nil {
+				return nil, fmt.Errorf("failed to mount workspace disk: %w", err)
+			}
+
+			// Get metadata for entrypoint config
+			meta, err := m.getWorkspaceDiskMeta(ctx, instanceID, layout)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get workspace disk metadata: %w", err)
+			}
+
+			// Configure container to use --rootfs mode
+			containerSpec.Rootfs = mergedPath
+			containerSpec.Image = ""
+
+			// Apply image config (env, workdir, user) since Podman doesn't do it in --rootfs mode.
+			// Base image env is merged with manifest env (manifest takes precedence).
+			containerSpec.Environment = mergeEnvMaps(parseEnvSlice(meta.ImageConfig.Env), containerSpec.Environment)
+			containerSpec.WorkingDir = meta.ImageConfig.WorkingDir
+			containerSpec.User = meta.ImageConfig.User
+
+			// Use entrypoint from saved metadata
+			originalCmd := meta.ImageConfig.BuildOriginalCommand()
+			containerSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+			containerSpec.Command = originalCmd
+
+			log.Printf("INFO: install %s: using existing workspace disk (base=%s)", instanceID, meta.BaseImageRef)
+		}
+	} else {
+		// Service mode: pull image normally
 		m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, fmt.Sprintf("Pulling image %s", appDef.Image), false, nil)
 		if err := m.containerManager.PullImage(ctx, runtime, appDef.Image); err != nil {
 			log.Printf("WARN: install %s: image pull failed: %v", instanceID, err)
 			m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, fmt.Sprintf("Image pull failed (continuing): %v", err), false, nil)
-			// Proceeding anyway as CreateContainer might succeed if local, or fail with same error
-		}
-	} else {
-		m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, "Using workspace snapshot", false, nil)
-	}
-
-	// Workspace mode: wrap the original entrypoint with boot.sh
-	if mode == ModeWorkspace {
-		imgConfig, err := m.containerManager.InspectImage(ctx, runtime, containerSpec.Image)
-		if err != nil {
-			// Fallback: use shell as default command
-			log.Printf("WARN: install %s: failed to inspect image config, using shell fallback: %v", instanceID, err)
-			containerSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-			containerSpec.Command = []string{"/bin/sh"}
-		} else {
-			// Wrap original entrypoint/cmd with boot.sh
-			// If the image is a snapshot, it might already have the wrapper in its Entrypoint.
-			// We detect this to avoid infinite recursion (boot.sh -> boot.sh -> ...).
-			originalCmd := buildOriginalCommand(imgConfig)
-			if len(originalCmd) >= 2 && originalCmd[0] == "/bin/sh" && originalCmd[1] == "/piccolo/boot.sh" {
-				// Already wrapped: just reset Entrypoint and strip the wrapper prefix from Command
-				containerSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-				containerSpec.Command = originalCmd[2:]
-			} else {
-				// Not wrapped: wrap it
-				containerSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-				containerSpec.Command = originalCmd
-			}
 		}
 	}
 
@@ -1196,7 +1367,28 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 		return err
 	}
 
+	// For workspace mode apps, ensure the overlay is mounted before starting.
+	// After a host restart or daemon crash, the fuse-overlayfs mount will be gone,
+	// so we must remount it before the --rootfs container can start.
+	def, defErr := state.GetAppDefinition(instanceID)
+	if defErr == nil {
+		mode := piccoloModeFromExtensions(def.Extensions)
+		if mode == ModeWorkspace {
+			m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseMountingWorkspace, 30, "Mounting workspace disk", false, nil)
+
+			// Cleanup any stale mounts from previous crashes (RFC §5.6)
+			m.cleanupStaleWorkspaceMounts(ctx, instanceID, layout)
+
+			// Ensure workspace disk is mounted
+			if _, err := m.ensureWorkspaceDiskMounted(ctx, instanceID, layout); err != nil {
+				_ = state.UpdateAppStatus(instanceID, "error")
+				return fmt.Errorf("failed to mount workspace disk: %w", err)
+			}
+		}
+	}
+
 	// Start the container
+	m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseStarting, 60, "Starting container", false, nil)
 	if err := m.containerManager.StartContainer(ctx, runtime, app.ContainerID); err != nil {
 		// Update status to error
 		_ = state.UpdateAppStatus(instanceID, "error")
@@ -1311,6 +1503,20 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 		return fmt.Errorf("failed to stop container: %w", err)
 	}
 
+	// For workspace mode apps, unmount the overlay on clean stop (RFC §5.6).
+	// This is good practice but not strictly required since we remount on start.
+	def, defErr := state.GetAppDefinition(instanceID)
+	if defErr == nil {
+		mode := piccoloModeFromExtensions(def.Extensions)
+		if mode == ModeWorkspace {
+			m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseUnmountingWorkspace, 60, "Unmounting workspace disk", false, nil)
+			if err := m.unmountWorkspaceDisk(ctx, instanceID); err != nil {
+				// Log but don't fail - the data is safe, mount will be cleaned up on next start
+				log.Printf("WARN: stop %s: failed to unmount workspace disk: %v", instanceID, err)
+			}
+		}
+	}
+
 	m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseUpdatingServices, 80, "Updating services", false, nil)
 	if err := state.UpdateAppStatus(instanceID, "stopped"); err != nil {
 		return fmt.Errorf("failed to update app status: %w", err)
@@ -1378,19 +1584,17 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 	// Stop container first (ignore error if already stopped)
 	_ = m.containerManager.StopContainer(ctx, runtime, app.ContainerID)
 
-	// For workspace mode without purge, commit container state to snapshot image.
-	// This preserves the container filesystem so it can be restored on reinstall.
-	if !purge {
-		def, defErr := state.GetAppDefinition(instanceID)
-		if defErr == nil {
-			mode := piccoloModeFromExtensions(def.Extensions)
-			if mode == ModeWorkspace && app.ContainerID != "" {
-				snapshotImage := workspaceSnapshotImage(instanceID)
-				if err := m.containerManager.CommitContainer(ctx, runtime, app.ContainerID, snapshotImage); err != nil {
-					log.Printf("WARN: workspace %s: failed to commit snapshot: %v", instanceID, err)
-				} else {
-					log.Printf("INFO: workspace %s: committed snapshot to %s", instanceID, snapshotImage)
-				}
+	// For workspace mode apps, unmount the workspace disk overlay.
+	// With workspace disk, no snapshot is needed - data persists independently of the container.
+	def, defErr := state.GetAppDefinition(instanceID)
+	if defErr == nil {
+		mode := piccoloModeFromExtensions(def.Extensions)
+		if mode == ModeWorkspace {
+			m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseUnmountingWorkspace, 20, "Unmounting workspace disk", false, nil)
+			if err := m.unmountWorkspaceDisk(ctx, instanceID); err != nil {
+				log.Printf("WARN: workspace %s: failed to unmount workspace disk: %v", instanceID, err)
+			} else {
+				log.Printf("INFO: workspace %s: unmounted workspace disk (data preserved)", instanceID)
 			}
 		}
 	}
@@ -1528,6 +1732,16 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	if err != nil {
 		return fmt.Errorf("failed to read current app.yaml: %w", err)
 	}
+
+	// Workspace mode apps cannot have their image updated because the workspace disk
+	// overlay is the persistence mechanism. Changing the base image would require
+	// "rebasing" the overlay which is complex and out of scope (see RFC non-goals).
+	// Users who want a new base image should uninstall and reinstall the workspace.
+	mode := piccoloModeFromExtensions(curDef.Extensions)
+	if mode == ModeWorkspace {
+		return fmt.Errorf("cannot update image for workspace apps: workspace persistence is tied to the base image; uninstall and reinstall to use a different base image")
+	}
+
 	// Compute new image
 	newImage := curDef.Image
 	if tag != nil {
@@ -1668,36 +1882,50 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 	needsRecreation := containerChange || len(result.Added) > 0 || len(result.Removed) > 0
 
 	if needsRecreation {
-		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseSnapshotting, 50, "Snapshotting workspace", false, nil)
-		// Snapshot workspace (always performed for workspace apps)
-		if appInst.ContainerID != "" {
-			snapshotImage := workspaceSnapshotImage(instanceID)
-			if err := m.containerManager.CommitContainer(ctx, runtime, appInst.ContainerID, snapshotImage); err != nil {
-				return nil, fmt.Errorf("failed to snapshot workspace before update: %w", err)
-			}
-			log.Printf("INFO: update listeners %s: committed snapshot to %s", instanceID, snapshotImage)
-		}
+		// With workspace disk, container recreation is always safe - no snapshot needed.
+		// The workspace disk persists independently of the container, so we can simply
+		// stop/remove/recreate the container wrapper without data loss.
+		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseRecreatingContainer, 50, "Recreating container", false, nil)
 
-		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseRecreatingContainer, 60, "Recreating container", false, nil)
 		// Stop and remove old container
 		_ = m.containerManager.StopContainer(ctx, runtime, appInst.ContainerID)
 		_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.ContainerID)
 
-		// Create new container with updated endpoints
+		// Ensure workspace disk is mounted and get the merged path
+		mergedPath, err := m.ensureWorkspaceDiskMounted(ctx, instanceID, layout)
+		if err != nil {
+			return nil, fmt.Errorf("failed to ensure workspace disk mounted: %w", err)
+		}
+
+		// Get metadata for entrypoint config
+		meta, err := m.getWorkspaceDiskMeta(ctx, instanceID, layout)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get workspace disk metadata: %w", err)
+		}
+
+		// Create new container with updated endpoints and --rootfs mode
 		var newCID string
 		spec, err := m.appDefToContainerSpec(&newDef, result.Endpoints, layout, instanceID)
 		if err == nil {
-			// Use snapshot (always for workspace apps)
-			snapshotImage := workspaceSnapshotImage(instanceID)
-			exists, imgErr := m.containerManager.ImageExists(ctx, runtime, snapshotImage)
-			if imgErr == nil && exists {
-				spec.Image = snapshotImage
-			}
+			// Use --rootfs mode with workspace disk
+			spec.Rootfs = mergedPath
+			spec.Image = ""
+
+			// Apply image config (env, workdir, user) since Podman doesn't do it in --rootfs mode.
+			spec.Environment = mergeEnvMaps(parseEnvSlice(meta.ImageConfig.Env), spec.Environment)
+			spec.WorkingDir = meta.ImageConfig.WorkingDir
+			spec.User = meta.ImageConfig.User
+
+			// Use entrypoint from saved metadata
+			originalCmd := meta.ImageConfig.BuildOriginalCommand()
+			spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+			spec.Command = originalCmd
+
 			newCID, err = m.containerManager.CreateContainer(ctx, runtime, spec)
 		}
 
 		if err != nil {
-			// Attempt rollback
+			// Attempt rollback - with workspace disk this is simpler since data is safe
 			log.Printf("WARN: update listeners %s: creation failed: %v. Rolling back...", instanceID, err)
 
 			// 1. Revert ports
@@ -1710,7 +1938,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				return nil, fmt.Errorf("update failed: %w; rollback failed (ports): %v", err, rbErr)
 			}
 
-			// 2. Rebuild old spec
+			// 2. Rebuild old spec with --rootfs mode
 			rbSpec, rbErr := m.appDefToContainerSpec(curDef, rbResult.Endpoints, layout, instanceID)
 			if rbErr != nil {
 				log.Printf("ERROR: update listeners %s: spec rollback failed: %v", instanceID, rbErr)
@@ -1720,11 +1948,14 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				return nil, fmt.Errorf("update failed: %w; rollback failed (spec): %v", err, rbErr)
 			}
 
-			// Restore snapshot image
-			snap := workspaceSnapshotImage(instanceID)
-			if exists, _ := m.containerManager.ImageExists(ctx, runtime, snap); exists {
-				rbSpec.Image = snap
-			}
+			// Use --rootfs mode for rollback too
+			rbSpec.Rootfs = mergedPath
+			rbSpec.Image = ""
+			rbSpec.Environment = mergeEnvMaps(parseEnvSlice(meta.ImageConfig.Env), rbSpec.Environment)
+			rbSpec.WorkingDir = meta.ImageConfig.WorkingDir
+			rbSpec.User = meta.ImageConfig.User
+			rbSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+			rbSpec.Command = meta.ImageConfig.BuildOriginalCommand()
 
 			// 3. Create old container
 			rbCID, rbErr := m.containerManager.CreateContainer(ctx, runtime, rbSpec)
@@ -1994,9 +2225,9 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 		// Use --init for proper PID 1 signal handling and zombie reaping
 		spec.UseInit = true
 
-		// Ensure boot.sh wrapper exists on host filesystem
-		if err := EnsureBootShAsset(); err != nil {
-			return spec, fmt.Errorf("failed to ensure boot.sh asset: %w", err)
+		// Ensure workspace assets exist on host filesystem
+		if err := EnsureWorkspaceAssets(); err != nil {
+			return spec, fmt.Errorf("failed to ensure workspace assets: %w", err)
 		}
 
 		// Mount boot.sh as read-only into the container
@@ -2004,6 +2235,13 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
 			Host:      BootShHostPath(),
 			Container: "/piccolo/boot.sh",
+			Options:   "ro,z",
+		})
+
+		// Mount piccolo-startup helper to /usr/local/bin (which is in PATH by default)
+		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
+			Host:      PiccoloStartupHostPath(),
+			Container: "/usr/local/bin/piccolo-startup",
 			Options:   "ro,z",
 		})
 

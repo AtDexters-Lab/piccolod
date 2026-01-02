@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/base64"
-	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -50,14 +49,21 @@ func (s *PTYSession) Close() {
 }
 
 // handleOutput reads from PTY and writes to WebSocket.
+// When the PTY closes (shell exits), this sends a proper close frame to signal the frontend.
 func (s *PTYSession) handleOutput() {
 	buf := make([]byte, 4096)
 	for {
 		n, err := s.ptmx.Read(buf)
 		if err != nil {
-			if err != io.EOF {
-				// Connection closed or PTY terminated
-			}
+			// PTY closed (shell exited) - send proper WebSocket close frame
+			// Code 1000 = normal closure, frontend should NOT reconnect
+			s.wsMu.Lock()
+			_ = s.conn.WriteMessage(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, "shell exited"),
+			)
+			_ = s.conn.Close()
+			s.wsMu.Unlock()
 			break
 		}
 

@@ -24,4 +24,9 @@ const (
 	taskPhaseStopping            = "stopping"
 	taskPhaseUpdatingServices    = "updating_services"
 	taskPhaseValidating          = "validating"
+
+	// Workspace disk phases
+	taskPhaseMountingWorkspace   = "mounting_workspace"
+	taskPhaseUnmountingWorkspace = "unmounting_workspace"
+	taskPhaseInitializingDisk    = "initializing_disk"
 )

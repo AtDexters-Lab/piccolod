@@ -18,6 +18,7 @@ func TestValidateContainerName(t *testing.T) {
 		{"valid simple name", "nginx", false},
 		{"valid name with hyphen", "my-app", false},
 		{"valid registry image", "docker.io/nginx:latest", false},
+		{"valid digest reference", "docker.io/library/ubuntu@sha256:45b23dee08af5e43a7fea6c4cf9c25ccf269ee113168c19722f87876677c5cb2", false},
 		{"valid with underscore", "my_app", false},
 		{"empty name", "", true},
 		{"too long", string(make([]byte, 256)), true},

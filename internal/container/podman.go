@@ -65,8 +65,8 @@ type ContainerState struct {
 
 // Validation patterns for different argument types
 var (
-	// Container/image names: lowercase letters, numbers, hyphens, slashes, colons
-	namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/-]*[a-z0-9]$|^[a-z0-9]$`)
+	// Container/image names: lowercase letters, numbers, hyphens, slashes, colons, and @ (for digests)
+	namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:@/-]*[a-z0-9]$|^[a-z0-9]$`)
 
 	// Volume paths: absolute paths only, no special chars
 	pathPattern = regexp.MustCompile(`^/[a-zA-Z0-9._/-]*$`)
@@ -199,6 +199,20 @@ type ContainerCreateSpec struct {
 	UseInit    bool     // If true, adds --init flag for PID 1 safety
 	Entrypoint []string // Custom entrypoint (overrides image default)
 	Command    []string // Command arguments appended after image
+
+	// Rootfs mode: when set, uses --rootfs instead of Image.
+	// This is used for workspace disk mode where the rootfs is a pre-mounted overlay.
+	// When Rootfs is set, Image is ignored and the container runs directly from the
+	// specified rootfs path. The caller must ensure the rootfs is properly mounted.
+	Rootfs string
+
+	// WorkingDir sets the working directory inside the container.
+	// Used with --rootfs mode to apply image config since Podman doesn't do it automatically.
+	WorkingDir string
+
+	// User sets the user/group to run the container as (format: "uid:gid" or "user:group").
+	// Used with --rootfs mode to apply image config since Podman doesn't do it automatically.
+	User string
 }
 
 type PortMapping struct {
@@ -279,11 +293,28 @@ func buildRunArgs(spec ContainerCreateSpec) []string {
 		args = append(args, "--entrypoint", spec.Entrypoint[0])
 	}
 
-	if spec.Image != "" {
+	// Working directory (used with --rootfs to apply image config)
+	if spec.WorkingDir != "" {
+		args = append(args, "--workdir", spec.WorkingDir)
+	}
+
+	// User (used with --rootfs to apply image config)
+	if spec.User != "" {
+		args = append(args, "--user", spec.User)
+	}
+
+	// Rootfs mode: use --rootfs instead of image reference.
+	// When using --rootfs, Podman runs the container directly from the specified
+	// filesystem path without pulling or resolving an image. This is used for
+	// workspace disk mode where we mount an overlay filesystem combining the base
+	// image with a persistent writable layer.
+	if spec.Rootfs != "" {
+		args = append(args, "--rootfs", spec.Rootfs)
+	} else if spec.Image != "" {
 		args = append(args, spec.Image)
 	}
 
-	// Append remaining entrypoint args and command after image
+	// Append remaining entrypoint args and command after image/rootfs
 	if len(spec.Entrypoint) > 1 {
 		args = append(args, spec.Entrypoint[1:]...)
 	}
@@ -848,9 +879,19 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 		return fmt.Errorf("invalid container name: %w", err)
 	}
 
-	// Validate image
-	if err := ValidateContainerName(spec.Image); err != nil {
-		return fmt.Errorf("invalid image name: %w", err)
+	// Validate image or rootfs (one must be set)
+	if spec.Rootfs != "" {
+		// Rootfs mode: validate the path
+		if err := ValidatePath(spec.Rootfs); err != nil {
+			return fmt.Errorf("invalid rootfs path: %w", err)
+		}
+	} else if spec.Image != "" {
+		// Image mode: validate the image name
+		if err := ValidateContainerName(spec.Image); err != nil {
+			return fmt.Errorf("invalid image name: %w", err)
+		}
+	} else {
+		return fmt.Errorf("either image or rootfs must be specified")
 	}
 
 	// Validate ports
@@ -904,25 +945,33 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 	return nil
 }
 
-// ImageConfig holds the entrypoint and command from a container image configuration.
-// These are extracted via `podman image inspect` to enable entrypoint wrapping for workspace mode.
+// ImageConfig holds OCI image configuration fields.
+// These are extracted from the base image and used when running containers in --rootfs mode,
+// since Podman does not apply image config automatically in that mode.
 type ImageConfig struct {
 	Entrypoint []string
 	Cmd        []string
+	Env        []string // OCI-style KEY=VALUE entries
+	WorkingDir string
+	User       string
+	Digest     string   // Canonical digest (e.g., "sha256:abc123...")
+	RepoDigests []string // List of canonical references (e.g., "docker.io/library/ubuntu@sha256:...")
 }
 
-// InspectImage retrieves the configuration of a container image, including its entrypoint and command.
-// This is used to extract the original command so it can be wrapped with boot.sh for workspace mode.
+// InspectImage retrieves the configuration of a container image.
+// This extracts entrypoint, cmd, env, working directory, user, and digest from the image config.
+// When using --rootfs mode, these must be explicitly applied since Podman doesn't do it automatically.
+// The digest is the canonical image digest (sha256:...) which should be used for persistence
+// to ensure the same base image is used across reinstalls and failovers.
 func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, imageName string) (*ImageConfig, error) {
 	if err := ValidateContainerName(imageName); err != nil {
 		return nil, fmt.Errorf("invalid image name: %w", err)
 	}
 
-	// Use podman image inspect to get the image configuration
-	// Format: JSON array with Entrypoint and Cmd
+	// Use podman image inspect to get the full image configuration including digest
 	args, err := buildPodmanArgs(runtime, []string{
 		"image", "inspect",
-		"--format", `{"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}}}`,
+		"--format", `{"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"env":{{json .Config.Env}},"workingDir":{{json .Config.WorkingDir}},"user":{{json .Config.User}},"digest":{{json .Digest}},"repoDigests":{{json .RepoDigests}}}`,
 		imageName,
 	})
 	if err != nil {
@@ -937,16 +986,26 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 
 	// Parse the JSON output
 	var result struct {
-		Entrypoint []string `json:"entrypoint"`
-		Cmd        []string `json:"cmd"`
+		Entrypoint  []string `json:"entrypoint"`
+		Cmd         []string `json:"cmd"`
+		Env         []string `json:"env"`
+		WorkingDir  string   `json:"workingDir"`
+		User        string   `json:"user"`
+		Digest      string   `json:"digest"`
+		RepoDigests []string `json:"repoDigests"`
 	}
 	if err := json.Unmarshal(output, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse image config: %w, output: %s", err, string(output))
 	}
 
 	return &ImageConfig{
-		Entrypoint: result.Entrypoint,
-		Cmd:        result.Cmd,
+		Entrypoint:  result.Entrypoint,
+		Cmd:         result.Cmd,
+		Env:         result.Env,
+		WorkingDir:  result.WorkingDir,
+		User:        result.User,
+		Digest:      result.Digest,
+		RepoDigests: result.RepoDigests,
 	}, nil
 }
 
@@ -967,13 +1026,17 @@ func (p *PodmanCLI) ExecShellCmd(runtime PodmanRuntime, containerID string) (*ex
 		return nil, fmt.Errorf("invalid container ID format: %s", containerID)
 	}
 
-	// Build podman exec args: podman [runtime-opts] exec -it <container> /bin/sh
-	// We use /bin/sh as it's more universally available than bash
+	// Shell wrapper that prefers bash (for readline/completion) but falls back to sh.
+	// Uses login shell (-l) to load full shell initialization (.bash_profile, .bashrc).
+	shellCmd := `if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh; fi`
+
+	// Build podman exec args with proper environment propagation
 	args, err := buildPodmanArgs(runtime, []string{
 		"exec",
 		"-i", "-t", // Interactive + TTY
+		"-e", "TERM=xterm-256color", // Pass TERM into the container
 		containerID,
-		"/bin/sh",
+		"/bin/sh", "-c", shellCmd,
 	})
 	if err != nil {
 		return nil, err
@@ -981,8 +1044,7 @@ func (p *PodmanCLI) ExecShellCmd(runtime PodmanRuntime, containerID string) (*ex
 
 	cmd := exec.Command("podman", args...)
 	// Preserve existing environment (XDG_RUNTIME_DIR, PATH, etc. needed for rootless podman)
-	// and add TERM for proper terminal handling
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	cmd.Env = os.Environ()
 	return cmd, nil
 }
 

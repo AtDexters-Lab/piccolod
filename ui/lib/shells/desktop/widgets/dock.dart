@@ -91,7 +91,9 @@ class Dock extends StatelessWidget {
                 "terminal",
                 "Terminal",
                 Icons.terminal_rounded,
-                const TerminalApp(),
+                TerminalApp(
+                  onSessionEnd: () => controller.closeWindow("terminal"),
+                ),
                 screenSize: screenSize,
                 initialSize: const Size(850, 550),
               ),

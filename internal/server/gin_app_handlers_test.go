@@ -1416,8 +1416,10 @@ func (m *GinMockContainerManager) InspectImage(ctx context.Context, runtime cont
 	_ = imageName
 	// Mock: return a typical image config with shell defaults
 	return &container.ImageConfig{
-		Entrypoint: nil,
-		Cmd:        []string{"/bin/sh"},
+		Entrypoint:  nil,
+		Cmd:         []string{"/bin/sh"},
+		Digest:      "sha256:mockdigest",
+		RepoDigests: []string{imageName + "@sha256:mockdigest"},
 	}, nil
 }
 

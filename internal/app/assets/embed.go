@@ -9,3 +9,9 @@ import _ "embed"
 //
 //go:embed boot.sh
 var BootSh []byte
+
+// PiccoloStartup contains the piccolo-startup helper command.
+// This script helps users discover and manage their workspace startup hook.
+//
+//go:embed piccolo-startup
+var PiccoloStartup []byte

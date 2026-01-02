@@ -8,7 +8,10 @@ class WorkspaceTerminal extends StatefulWidget {
   /// The app instance ID (name) to connect to.
   final String appId;
 
-  const WorkspaceTerminal({super.key, required this.appId});
+  /// Optional callback when terminal session ends normally (e.g., Ctrl+D).
+  final void Function()? onSessionEnd;
+
+  const WorkspaceTerminal({super.key, required this.appId, this.onSessionEnd});
 
   @override
   State<WorkspaceTerminal> createState() => _WorkspaceTerminalState();
@@ -18,6 +21,9 @@ class _WorkspaceTerminalState extends State<WorkspaceTerminal>
     with TerminalWidgetMixin {
   @override
   String getTerminalPath() => '/api/v1/apps/${widget.appId}/terminal';
+
+  @override
+  void Function()? getOnSessionEnd() => widget.onSessionEnd;
 
   @override
   void initState() {
