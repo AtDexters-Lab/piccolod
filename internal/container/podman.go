@@ -480,30 +480,6 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 	return nil
 }
 
-// CommitContainer commits a container's current state to a new image.
-// This preserves all filesystem changes made inside the container.
-func (p *PodmanCLI) CommitContainer(ctx context.Context, runtime PodmanRuntime, containerID, imageName string) error {
-	if !isValidContainerID(containerID) {
-		return fmt.Errorf("invalid container ID format: %s", containerID)
-	}
-	if err := ValidateContainerName(imageName); err != nil {
-		return fmt.Errorf("invalid image name: %w", err)
-	}
-
-	args, err := buildPodmanArgs(runtime, []string{"commit", containerID, imageName})
-	if err != nil {
-		return err
-	}
-	cmd := exec.CommandContext(ctx, "podman", args...)
-	output, err := cmd.CombinedOutput()
-
-	if err != nil {
-		return fmt.Errorf("podman commit failed: %w, output: %s", err, string(output))
-	}
-
-	return nil
-}
-
 // ImageExists checks if an image exists in the local storage.
 func (p *PodmanCLI) ImageExists(ctx context.Context, runtime PodmanRuntime, imageName string) (bool, error) {
 	if err := ValidateContainerName(imageName); err != nil {
@@ -949,12 +925,12 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 // These are extracted from the base image and used when running containers in --rootfs mode,
 // since Podman does not apply image config automatically in that mode.
 type ImageConfig struct {
-	Entrypoint []string
-	Cmd        []string
-	Env        []string // OCI-style KEY=VALUE entries
-	WorkingDir string
-	User       string
-	Digest     string   // Canonical digest (e.g., "sha256:abc123...")
+	Entrypoint  []string
+	Cmd         []string
+	Env         []string // OCI-style KEY=VALUE entries
+	WorkingDir  string
+	User        string
+	Digest      string   // Canonical digest (e.g., "sha256:abc123...")
 	RepoDigests []string // List of canonical references (e.g., "docker.io/library/ubuntu@sha256:...")
 }
 
