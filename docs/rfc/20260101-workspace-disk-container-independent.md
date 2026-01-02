@@ -296,9 +296,48 @@ Commonalities / intersections:
 - Digest pinning and follower “warm-cache” prefetch (see §7.2) benefits both modes, but is more critical for workspaces because failover must be able to reassemble the rootfs from `meta.json` + base digest.
 
 ## Implementation Notes & Status
-- _Draft only (no implementation yet)._
-- Follow-ups:
-  - add a workspace disk mount manager
-  - update app manager recreate flows to never depend on `podman commit` for correctness
-  - add stress tests for `gocryptfs` + `fuse-overlayfs` + `--rootfs` runtime
-  - wire basic metrics/events for mount health
+
+**Status:** Core implementation complete (2026-01-03). Manual testing in progress.
+
+### Implemented
+
+#### Workspace Disk Mount Manager (`internal/app/workspacedisk/`)
+- `manager.go` — `WorkspaceDiskManager` with `EnsureInitialized`, `Mount`, `Unmount`, `CleanupStale`, `Status`
+- `mount.go` — `fuse-overlayfs` mounting/unmounting, stale mount detection and cleanup
+- `meta.go` — `meta.json` schema (v1) with `WorkspaceMeta` and `ImageConfig` types
+- `errors.go` — Typed errors (`ErrNotInitialized`, `ErrAlreadyMounted`, etc.)
+
+#### App Manager Integration (`internal/app/`)
+- `workspace_disk_integration.go` — Glue between `AppManager` and `WorkspaceDiskManager`
+- **Install flow** (`installLocked`):
+  - New install: pulls image, initializes workspace disk, mounts overlay, creates container with `--rootfs merged`
+  - Reinstall: mounts existing workspace disk, preserves `upper/` data
+- **Start/Stop** (`startLocked`, `stopInternal`):
+  - Start ensures overlay is mounted before starting container
+  - Stop unmounts overlay on clean shutdown
+- **Container recreation** (`recreateMissingContainer`):
+  - Properly mounts workspace disk and uses `--rootfs` mode
+  - Fixes bug where stop/start lost overlay data
+- **UpdateImage blocked** for workspace apps — returns error explaining persistence is tied to base image
+
+#### Container Runtime (`internal/container/podman.go`)
+- `ContainerSpec.Rootfs` field for `--rootfs` mode
+- `MountImage` / `UnmountImage` for base layer access via `podman image mount`
+- Terminal exec uses bash with login shell (`-l`) for proper completion/colors
+- TERM propagated into container via `-e TERM=xterm-256color`
+
+#### UX Improvements
+- `piccolo-startup` helper command (`internal/app/assets/piccolo-startup`)
+  - Discoverable via `/usr/local/bin/piccolo-startup` in workspace containers
+  - Commands: `edit`, `show`, `enable`, `disable`
+- `boot.sh` auto-chmod — makes `start.sh` executable if it exists but isn't
+- Terminal window closes on Ctrl+D (WebSocket close code 1000 handling)
+
+### Not Yet Implemented
+- Stress tests for `gocryptfs` + `fuse-overlayfs` + `--rootfs` runtime (§11)
+- Metrics/events for mount health (§13)
+- Periodic health checks for mounted overlays
+
+### Known Limitations
+- Image rebase not supported — users must uninstall/reinstall to change base image
+- No automatic stale mount cleanup on daemon startup (cleanup happens on next `Mount` call per-workspace)
