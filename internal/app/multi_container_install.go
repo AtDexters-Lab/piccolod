@@ -26,6 +26,74 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 		return nil, err
 	}
 
+	const createBaseProgress = 60
+	const createSpanProgress = 25
+	totalContainers := 1 + len(startOrder) // anchor + services
+	doneContainers := 0
+
+	subtasks := make([]map[string]any, 0, totalContainers)
+	subtaskIdx := make(map[string]int, totalContainers)
+	addSubtask := func(service, name, role string) {
+		subtaskIdx[service] = len(subtasks)
+		subtasks = append(subtasks, map[string]any{
+			"service":  service,
+			"name":     name,
+			"role":     role,
+			"progress": 0,
+			"message":  "Pending",
+		})
+	}
+	updateSubtask := func(service string, progress int, message string) {
+		i, ok := subtaskIdx[service]
+		if !ok {
+			return
+		}
+		subtasks[i]["progress"] = progress
+		subtasks[i]["message"] = message
+	}
+	cloneSubtasks := func(in []map[string]any) []map[string]any {
+		out := make([]map[string]any, len(in))
+		for i, task := range in {
+			copied := make(map[string]any, len(task))
+			for k, v := range task {
+				copied[k] = v
+			}
+			out[i] = copied
+		}
+		return out
+	}
+	overallProgress := func(done int) int {
+		if totalContainers <= 0 {
+			return createBaseProgress
+		}
+		if done < 0 {
+			done = 0
+		}
+		if done > totalContainers {
+			done = totalContainers
+		}
+		return createBaseProgress + (createSpanProgress*done)/totalContainers
+	}
+	emitCreateProgress := func(message string) {
+		m.emitProgressWithMetadata(
+			ctx,
+			taskTypeInstallApp,
+			instanceID,
+			taskPhaseCreatingContainer,
+			overallProgress(doneContainers),
+			message,
+			false,
+			map[string]any{"subtasks": cloneSubtasks(subtasks)},
+			nil,
+		)
+	}
+
+	addSubtask(networkAnchorServiceName, "network", "network_anchor")
+	for _, svcName := range startOrder {
+		addSubtask(svcName, svcName, "service")
+	}
+	emitCreateProgress(fmt.Sprintf("Creating containers (0/%d)", totalContainers))
+
 	// Defensive cleanup: prune labeled containers that belong to this instance but are not expected.
 	// This addresses partial installs (e.g., crash mid-way) where no app state exists yet to trigger reconcile.
 	expectedNames := make(map[string]struct{}, 1+len(appDef.Services))
@@ -74,9 +142,12 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 	}
 
 	var anchorID string
+	updateSubtask(networkAnchorServiceName, 10, "Creating")
+	emitCreateProgress(fmt.Sprintf("Creating container (1/%d): network", totalContainers))
 	for i := 0; i < 2; i++ {
 		anchorID, err = m.containerManager.CreateContainer(ctx, runtime, anchorSpec)
 		if err == nil {
+			updateSubtask(networkAnchorServiceName, 50, "Created")
 			break
 		}
 
@@ -106,14 +177,23 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 	}
 	created = append(created, anchorID)
 
+	updateSubtask(networkAnchorServiceName, 70, "Starting")
 	if err := m.containerManager.StartContainer(ctx, runtime, anchorID); err != nil {
+		updateSubtask(networkAnchorServiceName, 70, "Error")
+		emitCreateProgress("Failed to start network container")
 		cleanup()
 		return nil, fmt.Errorf("failed to start network anchor: %w", err)
 	}
+	updateSubtask(networkAnchorServiceName, 100, "Running")
+	doneContainers++
+	emitCreateProgress(fmt.Sprintf("Created container (1/%d): network", totalContainers))
 
 	// 2) Create + start all service containers attached to the anchor netns.
 	containers := make(map[string]string, len(appDef.Services))
 	for _, svcName := range startOrder {
+		updateSubtask(svcName, 10, "Creating")
+		emitCreateProgress(fmt.Sprintf("Creating container (%d/%d): %s", doneContainers+1, totalContainers, svcName))
+
 		spec, err := m.buildServiceContainerSpec(layout, appDef, instanceID, primary, svcName, anchorID)
 		if err != nil {
 			cleanup()
@@ -124,6 +204,7 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 		for i := 0; i < 2; i++ {
 			cid, err = m.containerManager.CreateContainer(ctx, runtime, spec)
 			if err == nil {
+				updateSubtask(svcName, 50, "Created")
 				break
 			}
 
@@ -148,15 +229,24 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 			break
 		}
 		if err != nil {
+			updateSubtask(svcName, 50, "Error")
+			emitCreateProgress(fmt.Sprintf("Failed to create container: %s", svcName))
 			cleanup()
 			return nil, fmt.Errorf("failed to create service container '%s': %w", svcName, err)
 		}
 		created = append(created, cid)
 
+		updateSubtask(svcName, 70, "Starting")
 		if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
+			updateSubtask(svcName, 70, "Error")
+			emitCreateProgress(fmt.Sprintf("Failed to start container: %s", svcName))
 			cleanup()
 			return nil, fmt.Errorf("failed to start service container '%s': %w", svcName, err)
 		}
+
+		updateSubtask(svcName, 100, "Running")
+		doneContainers++
+		emitCreateProgress(fmt.Sprintf("Created container (%d/%d): %s", doneContainers, totalContainers, svcName))
 
 		containers[svcName] = cid
 	}

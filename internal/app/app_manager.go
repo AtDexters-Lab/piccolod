@@ -226,6 +226,10 @@ func (m *AppManager) currentProgressReporter() events.ProgressReporter {
 }
 
 func (m *AppManager) emitProgress(ctx context.Context, taskType, instanceID, phase string, progress int, message string, complete bool, opErr error) {
+	m.emitProgressWithMetadata(ctx, taskType, instanceID, phase, progress, message, complete, nil, opErr)
+}
+
+func (m *AppManager) emitProgressWithMetadata(ctx context.Context, taskType, instanceID, phase string, progress int, message string, complete bool, metadata map[string]any, opErr error) {
 	taskID := TaskIDFromContext(ctx)
 	if taskID == "" {
 		return
@@ -241,6 +245,7 @@ func (m *AppManager) emitProgress(ctx context.Context, taskType, instanceID, pha
 		Phase:      phase,
 		Progress:   progress,
 		Message:    message,
+		Metadata:   metadata,
 		IsComplete: complete,
 		Timestamp:  time.Now().UTC(),
 	}

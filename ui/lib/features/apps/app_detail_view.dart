@@ -490,8 +490,12 @@ class _AppDetailViewState extends State<AppDetailView>
           ),
 
         const SizedBox(height: 24),
-        _buildSectionTitle("Environment Variables"),
-        if (_app!.environment.isEmpty)
+        _buildSectionTitle(
+          _containers.length > 1 && (_selectedService?.isNotEmpty ?? false)
+              ? "Environment Variables (${_selectedService!})"
+              : "Environment Variables",
+        ),
+        if (_app!.environmentForService(_selectedService).isEmpty)
           const Text("No environment variables.")
         else
           Container(
@@ -503,7 +507,9 @@ class _AppDetailViewState extends State<AppDetailView>
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: _app!.environment.entries
+              children: _app!
+                  .environmentForService(_selectedService)
+                  .entries
                   .map(
                     (e) => Padding(
                       padding: const EdgeInsets.symmetric(vertical: 4),

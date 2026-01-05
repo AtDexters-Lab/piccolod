@@ -32,6 +32,35 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
   final List<TaskProgressEvent> _history = [];
   TaskProgressEvent? _latest;
 
+  List<_ProgressSubtask> _subtasksFromMetadata(Map<String, dynamic>? metadata) {
+    if (metadata == null) return const [];
+    final raw = metadata['subtasks'];
+    if (raw is! List) return const [];
+
+    final out = <_ProgressSubtask>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final map = Map<String, dynamic>.from(item);
+      final name = (map['name'] ?? map['service'] ?? '').toString().trim();
+      if (name.isEmpty) continue;
+
+      final message = (map['message'] ?? '').toString().trim();
+
+      final rawProgress = map['progress'];
+      var progress = -1;
+      if (rawProgress is int) {
+        progress = rawProgress;
+      } else if (rawProgress != null) {
+        progress = int.tryParse(rawProgress.toString()) ?? -1;
+      }
+
+      out.add(
+        _ProgressSubtask(name: name, message: message, progress: progress),
+      );
+    }
+    return out;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -94,8 +123,9 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
 
     final devBase = CoreConfig.wsBaseUrl;
     if (devBase.isNotEmpty) {
-      final cleanBase =
-          devBase.endsWith('/') ? devBase.substring(0, devBase.length - 1) : devBase;
+      final cleanBase = devBase.endsWith('/')
+          ? devBase.substring(0, devBase.length - 1)
+          : devBase;
       return '$cleanBase$path';
     }
 
@@ -146,6 +176,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
     final progress = latest?.progress ?? -1;
     final isIndeterminate = progress < 0;
     final error = latest?.error;
+    final subtasks = _subtasksFromMetadata(latest?.metadata);
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -222,6 +253,52 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
               ),
             ),
             children: [
+              if (subtasks.isNotEmpty) ...[
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    'Containers',
+                    style: PiccoloTheme.textTheme.labelMedium?.copyWith(
+                      color: PiccoloTheme.inkMuted,
+                    ),
+                  ),
+                ),
+                for (final st in subtasks)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        SizedBox(
+                          width: 120,
+                          child: Text(
+                            st.name,
+                            style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+                              color: PiccoloTheme.inkMuted,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            st.message,
+                            style: PiccoloTheme.textTheme.bodyMedium,
+                          ),
+                        ),
+                        if (st.progress >= 0) ...[
+                          const SizedBox(width: 8),
+                          Text(
+                            '${st.progress}%',
+                            style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+                              color: PiccoloTheme.inkMuted,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                const Divider(height: 24),
+              ],
               for (final evt in _history)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 8),
@@ -253,4 +330,16 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
       ),
     );
   }
+}
+
+class _ProgressSubtask {
+  final String name;
+  final String message;
+  final int progress;
+
+  const _ProgressSubtask({
+    required this.name,
+    required this.message,
+    required this.progress,
+  });
 }
