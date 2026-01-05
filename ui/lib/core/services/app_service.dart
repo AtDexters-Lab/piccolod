@@ -23,31 +23,41 @@ class AppService {
       'page': page.toString(),
       'page_size': pageSize.toString(),
     };
-    if (query != null && query.isNotEmpty) queryParams['q'] = query;
-    if (category != null && category.isNotEmpty) queryParams['category'] = category;
+    if (query != null && query.isNotEmpty) {
+      queryParams['q'] = query;
+    }
+    if (category != null && category.isNotEmpty) {
+      queryParams['category'] = category;
+    }
 
     // ApiClient.get usually appends query params if provided, or we construct the URL
     // Assuming ApiClient.get takes a path. We'll construct the query string.
     final uri = Uri(path: '/api/v1/catalog', queryParameters: queryParams);
-    
+
     final data = await _client.get(uri.toString());
     // Expected structure: { apps: [...], page: 1, ... }
-    
+
     // Handle potential wrapper { data: { ... } } if existing ApiClient wraps it?
     // Based on previous code, it seemed to handle raw response or data wrapper.
     // The new backend returns JSON matching CatalogResponse directly.
-    
+
     Map<String, dynamic> json;
     if (data is Map<String, dynamic>) {
-        // Check if wrapped in "data"
-        if (data.containsKey('data') && data['data'] is Map) {
-             json = data['data'];
-        } else {
-             json = data;
-        }
+      // Check if wrapped in "data"
+      if (data.containsKey('data') && data['data'] is Map) {
+        json = data['data'];
+      } else {
+        json = data;
+      }
     } else {
-        // Fallback/Error
-        return CatalogResponse(apps: [], page: 1, pageSize: 20, total: 0, totalPages: 0);
+      // Fallback/Error
+      return CatalogResponse(
+        apps: [],
+        page: 1,
+        pageSize: 20,
+        total: 0,
+        totalPages: 0,
+      );
     }
 
     return CatalogResponse.fromJson(json);
@@ -56,14 +66,14 @@ class AppService {
   Future<List<String>> getCategories() async {
     final data = await _client.get('/api/v1/catalog/categories');
     // Expected: { categories: ["CMS", "Database"] } or { data: { categories: [...] } }
-    
+
     List<dynamic> list = [];
     if (data is Map) {
-       if (data['data'] != null && data['data']['categories'] != null) {
-         list = data['data']['categories'];
-       } else if (data['categories'] != null) {
-         list = data['categories'];
-       }
+      if (data['data'] != null && data['data']['categories'] != null) {
+        list = data['data']['categories'];
+      } else if (data['categories'] != null) {
+        list = data['categories'];
+      }
     }
     return list.cast<String>();
   }
@@ -82,17 +92,39 @@ class AppService {
     return list.map((e) => App.fromJson(e)).toList();
   }
 
-  Future<App> getAppDetail(String name) async {
+  Future<AppDetail> getAppDetail(String name) async {
     final data = await _client.get('/api/v1/apps/$name');
-    // Expected: { data: { app: {...}, services: [...] } }
-    return App.fromJson(data['data']['app']);
+    // Expected: { data: { app: {...}, listeners: [...], containers: [...] } }
+
+    final payload = (data is Map) ? data['data'] : null;
+    final json = payload is Map
+        ? Map<String, dynamic>.from(payload)
+        : <String, dynamic>{};
+
+    final appJson = json['app'];
+    final app = App.fromJson(
+      appJson is Map ? Map<String, dynamic>.from(appJson) : <String, dynamic>{},
+    );
+
+    final rawListeners = json['listeners'] ?? json['services'];
+    final listeners = (rawListeners is List ? rawListeners : const [])
+        .whereType<Map>()
+        .map((e) => ServiceEndpoint.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+
+    final rawContainers = json['containers'];
+    final containers = (rawContainers is List ? rawContainers : const [])
+        .whereType<Map>()
+        .map((e) => AppContainerStatus.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+
+    return AppDetail(app: app, listeners: listeners, containers: containers);
   }
 
   Future<List<ServiceEndpoint>> getAppServices(String name) async {
     try {
-      final data = await _client.get('/api/v1/apps/$name');
-      final List<dynamic> list = data['data']['services'] ?? [];
-      return list.map((e) => ServiceEndpoint.fromJson(e)).toList();
+      final detail = await getAppDetail(name);
+      return detail.listeners;
     } catch (_) {
       return [];
     }
@@ -128,7 +160,11 @@ class AppService {
     );
   }
 
-  Future<void> uninstallApp(String name, {bool purge = false, String? taskId}) async {
+  Future<void> uninstallApp(
+    String name, {
+    bool purge = false,
+    String? taskId,
+  }) async {
     // Query params not supported in delete? ApiClient.delete supports body.
     // Need to append query to path.
     await _client.delete(
@@ -146,7 +182,7 @@ class AppService {
         body: yamlContent,
         contentType: 'application/x-yaml',
       );
-      
+
       // Expected: { data: { valid: true }, message: "valid" }
       final valid = data['data']?['valid'] ?? false;
       return AppValidationResult(valid: valid);
@@ -166,7 +202,7 @@ class AppService {
       contentType: 'application/x-yaml',
       headers: _taskHeaders(taskId),
     );
-    
+
     // Expected: { data: {App}, message: ... }
     return App.fromJson(data['data']);
   }
@@ -202,13 +238,13 @@ class AppService {
   // --- Image Search (for Workspace creation) ---
 
   /// Searches for container images in Docker Hub and other registries.
-  Future<List<ImageSearchResult>> searchImages(String query, {int limit = 25}) async {
+  Future<List<ImageSearchResult>> searchImages(
+    String query, {
+    int limit = 25,
+  }) async {
     final uri = Uri(
       path: '/api/v1/images/search',
-      queryParameters: {
-        'q': query,
-        'limit': limit.toString(),
-      },
+      queryParameters: {'q': query, 'limit': limit.toString()},
     );
 
     final data = await _client.get(uri.toString());

@@ -33,7 +33,9 @@ class _AppDetailViewState extends State<AppDetailView>
   late TabController _tabController;
 
   App? _app;
-  List<ServiceEndpoint> _services = [];
+  List<ServiceEndpoint> _listeners = [];
+  List<AppContainerStatus> _containers = [];
+  String? _selectedService;
   bool _isLoading = true;
   String? _error;
 
@@ -60,14 +62,18 @@ class _AppDetailViewState extends State<AppDetailView>
     });
 
     try {
-      final app = await widget.appService.getAppDetail(widget.appId);
-      final services = await widget.appService.getAppServices(widget.appId);
+      final detail = await widget.appService.getAppDetail(widget.appId);
 
       if (!mounted) return;
 
       setState(() {
-        _app = app;
-        _services = services;
+        _app = detail.app;
+        _listeners = detail.listeners;
+        _containers = detail.containers;
+        _selectedService = _pickSelectedService(
+          _selectedService,
+          detail.containers,
+        );
         _isLoading = false;
       });
     } catch (e) {
@@ -125,9 +131,9 @@ class _AppDetailViewState extends State<AppDetailView>
     }
 
     if (actionError != null && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Action failed: $actionError")),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text("Action failed: $actionError")));
       return false;
     }
 
@@ -202,7 +208,9 @@ class _AppDetailViewState extends State<AppDetailView>
                   if (!ok || !mounted) return;
                   setState(() {
                     _app = null;
-                    _services = [];
+                    _listeners = [];
+                    _containers = [];
+                    _selectedService = null;
                   });
                 },
                 child: const Text("Uninstall"),
@@ -218,7 +226,7 @@ class _AppDetailViewState extends State<AppDetailView>
     if (_app == null) return;
 
     // Convert current services to AppListener list
-    final initialListeners = _services
+    final initialListeners = _listeners
         .map((s) => AppListener.fromServiceEndpoint(s))
         .toList();
 
@@ -250,6 +258,7 @@ class _AppDetailViewState extends State<AppDetailView>
       Icons.terminal,
       WorkspaceTerminal(
         appId: _app!.name,
+        serviceName: _selectedService,
         onSessionEnd: () => widget.desktopController.closeWindow(windowId),
       ),
     );
@@ -413,8 +422,11 @@ class _AppDetailViewState extends State<AppDetailView>
           if (_isActionLoading)
             const CircularProgressIndicator()
           else ...[
-            // Terminal button for running workspace apps
-            if (_app!.isWorkspace && _app!.isRunning) ...[
+            if (_containers.length > 1) ...[
+              _buildServiceSelector(),
+              const SizedBox(width: 12),
+            ],
+            if (_app!.isRunning) ...[
               FilledButton.icon(
                 onPressed: _openTerminal,
                 icon: const Icon(Icons.terminal),
@@ -530,11 +542,11 @@ class _AppDetailViewState extends State<AppDetailView>
   }
 
   Widget _buildNetworkTab() {
-    final content = _services.isEmpty
+    final content = _listeners.isEmpty
         ? const Center(child: Text("No network services exposed."))
         : ListView(
             padding: const EdgeInsets.all(24),
-            children: _services
+            children: _listeners
                 .map(
                   (svc) => Card(
                     child: Padding(
@@ -544,7 +556,10 @@ class _AppDetailViewState extends State<AppDetailView>
                         children: [
                           Row(
                             children: [
-                              const Icon(Icons.router, color: PiccoloTheme.cobalt600),
+                              const Icon(
+                                Icons.router,
+                                color: PiccoloTheme.cobalt600,
+                              ),
                               const SizedBox(width: 12),
                               Text(
                                 svc.name,
@@ -675,7 +690,52 @@ class _AppDetailViewState extends State<AppDetailView>
       padding: const EdgeInsets.all(24.0),
       child: LogStreamViewer(
         appName: _app!.name,
+        serviceName: _selectedService,
         tailLines: 200,
+      ),
+    );
+  }
+
+  String? _pickSelectedService(
+    String? current,
+    List<AppContainerStatus> containers,
+  ) {
+    if (containers.isEmpty) return null;
+    if (current != null && containers.any((c) => c.service == current)) {
+      return current;
+    }
+    return containers.first.service;
+  }
+
+  Widget _buildServiceSelector() {
+    if (_containers.length <= 1) return const SizedBox.shrink();
+
+    var selected = _selectedService;
+    if (selected == null || !_containers.any((c) => c.service == selected)) {
+      selected = _containers.first.service;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      decoration: BoxDecoration(
+        color: PiccoloTheme.mist,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.black12),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: selected,
+          isDense: true,
+          items: _containers
+              .map(
+                (c) => DropdownMenuItem<String>(
+                  value: c.service,
+                  child: Text(c.running ? c.service : '${c.service} (stopped)'),
+                ),
+              )
+              .toList(),
+          onChanged: (value) => setState(() => _selectedService = value),
+        ),
       ),
     );
   }

@@ -10,6 +10,7 @@ import '../../theme/piccolo_theme.dart';
 class LogStreamViewer extends StatefulWidget {
   final String? appName;
   final String? systemUnit;
+  final String? serviceName;
   final int tailLines;
   final double? height;
   final bool autoConnect;
@@ -18,13 +19,14 @@ class LogStreamViewer extends StatefulWidget {
     super.key,
     this.appName,
     this.systemUnit,
+    this.serviceName,
     this.tailLines = 200,
     this.height,
     this.autoConnect = true,
   }) : assert(
-          (appName == null) != (systemUnit == null),
-          'Provide exactly one of appName or systemUnit',
-        );
+         (appName == null) != (systemUnit == null),
+         'Provide exactly one of appName or systemUnit',
+       );
 
   @override
   State<LogStreamViewer> createState() => _LogStreamViewerState();
@@ -57,6 +59,7 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.appName != widget.appName ||
         oldWidget.systemUnit != widget.systemUnit ||
+        oldWidget.serviceName != widget.serviceName ||
         oldWidget.tailLines != widget.tailLines) {
       _disconnect();
       if (widget.autoConnect) {
@@ -97,8 +100,9 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
 
     final devBase = CoreConfig.wsBaseUrl;
     if (devBase.isNotEmpty) {
-      final cleanBase =
-          devBase.endsWith('/') ? devBase.substring(0, devBase.length - 1) : devBase;
+      final cleanBase = devBase.endsWith('/')
+          ? devBase.substring(0, devBase.length - 1)
+          : devBase;
       return '$cleanBase$path';
     }
 
@@ -115,8 +119,11 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
   String _buildPath() {
     final tail = widget.tailLines;
     if (widget.appName != null) {
-      final id = Uri.encodeComponent(widget.appName!);
-      return '/api/v1/apps/$id/logs/stream?tail=$tail&timestamps=1';
+      return buildAppLogStreamPath(
+        appId: widget.appName!,
+        tail: tail,
+        serviceName: widget.serviceName,
+      );
     }
     final unit = Uri.encodeQueryComponent(widget.systemUnit!);
     return '/api/v1/system/logs/stream?unit=$unit&tail=$tail';
@@ -179,8 +186,8 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
         final terminalView = widget.height != null
             ? SizedBox(height: widget.height, child: terminalBody)
             : constraints.hasBoundedHeight
-                ? Expanded(child: terminalBody)
-                : SizedBox(height: 320, child: terminalBody);
+            ? Expanded(child: terminalBody)
+            : SizedBox(height: 320, child: terminalBody);
 
         return Container(
           decoration: BoxDecoration(
@@ -192,7 +199,10 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
                 child: Row(
                   children: [
                     Container(
@@ -215,12 +225,15 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
                       ),
                     ),
                     TextButton(
-                      onPressed: _backend == null ? null : () => _backend!.clear(),
+                      onPressed: _backend == null
+                          ? null
+                          : () => _backend!.clear(),
                       child: const Text('Clear'),
                     ),
                     const SizedBox(width: 8),
                     if (_backend == null ||
-                        _backend!.state == WebSocketConnectionState.disconnected ||
+                        _backend!.state ==
+                            WebSocketConnectionState.disconnected ||
                         _backend!.state == WebSocketConnectionState.error)
                       FilledButton(
                         onPressed: _connect,
@@ -242,4 +255,24 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
       },
     );
   }
+}
+
+String buildAppLogStreamPath({
+  required String appId,
+  required int tail,
+  String? serviceName,
+}) {
+  final id = Uri.encodeComponent(appId);
+
+  final query = <String, String>{'tail': tail.toString(), 'timestamps': '1'};
+
+  final svc = serviceName?.trim();
+  if (svc != null && svc.isNotEmpty) {
+    query['service'] = svc;
+  }
+
+  return Uri(
+    path: '/api/v1/apps/$id/logs/stream',
+    queryParameters: query,
+  ).toString();
 }

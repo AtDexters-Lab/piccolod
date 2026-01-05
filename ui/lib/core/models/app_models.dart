@@ -1,4 +1,3 @@
-
 class App {
   final String id;
   final String name;
@@ -35,12 +34,15 @@ class App {
     final def = json['definition'] as Map<String, dynamic>? ?? {};
 
     // App name comes from definition.name, with fallbacks
-    final appName = (def['name'] ?? json['app_name'] ?? json['name'] ?? '').toString();
+    final appName = (def['name'] ?? json['app_name'] ?? json['name'] ?? '')
+        .toString();
 
     // Image, type, environment come from definition
     final image = (def['image'] ?? json['image'] ?? '').toString();
     final type = (def['type'] ?? json['type'] ?? 'user').toString();
-    final environment = Map<String, String>.from(def['environment'] ?? json['environment'] ?? {});
+    final environment = Map<String, String>.from(
+      def['environment'] ?? json['environment'] ?? {},
+    );
 
     // Mode comes from x-piccolo extensions in definition
     String mode = '';
@@ -62,7 +64,9 @@ class App {
       }
     } else if (json['volumes'] != null) {
       // Fallback for backward compatibility
-      volumes = (json['volumes'] as List<dynamic>).map((e) => AppVolume.fromJson(e)).toList();
+      volumes = (json['volumes'] as List<dynamic>)
+          .map((e) => AppVolume.fromJson(e))
+          .toList();
     }
 
     return App(
@@ -90,6 +94,38 @@ class App {
     if (displayName.isNotEmpty) return displayName;
     if (appName.isNotEmpty) return appName;
     return name;
+  }
+}
+
+class AppDetail {
+  final App app;
+  final List<ServiceEndpoint> listeners;
+  final List<AppContainerStatus> containers;
+
+  const AppDetail({
+    required this.app,
+    this.listeners = const [],
+    this.containers = const [],
+  });
+}
+
+class AppContainerStatus {
+  final String service;
+  final String containerId;
+  final bool running;
+
+  const AppContainerStatus({
+    required this.service,
+    required this.containerId,
+    required this.running,
+  });
+
+  factory AppContainerStatus.fromJson(Map<String, dynamic> json) {
+    return AppContainerStatus(
+      service: (json['service'] ?? '').toString(),
+      containerId: (json['container_id'] ?? '').toString(),
+      running: json['running'] == true,
+    );
   }
 }
 
