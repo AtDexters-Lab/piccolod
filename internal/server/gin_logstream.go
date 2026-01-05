@@ -119,9 +119,10 @@ func (s *GinServer) handleGinAppLogStream(c *gin.Context) {
 	instanceID := c.Param("name")
 	tail := parseLogTail(c, 200)
 	timestamps := parseBoolQuery(c, "timestamps", true)
+	service := strings.TrimSpace(c.Query("service"))
 
 	ctx, cancel := context.WithCancel(c.Request.Context())
-	stream, err := s.appManager.LogsStream(ctx, instanceID, tail, timestamps)
+	stream, err := s.appManager.LogsStreamForService(ctx, instanceID, service, tail, timestamps)
 	if err != nil {
 		cancel()
 		if handleAppManagerError(c, err, "stream logs") {

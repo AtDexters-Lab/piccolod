@@ -1,7 +1,7 @@
 # RFC: Multi-Container Apps (Compose-Style) for Piccolo OS
 
 **Date:** 2026-01-02  
-**Status:** Draft
+**Status:** Implemented (Backend)
 
 ## 1. Summary
 Piccolo apps are currently modeled as **one app instance = one Podman container**. This RFC proposes evolving the runtime and manifest format to support **multiple containers per app instance** (Compose-style) for **`x-piccolo.mode: service` apps only**.
@@ -424,5 +424,9 @@ These are the recommended choices for the initial implementation:
 - None for v1; decisions above are intentional to keep scope tight.
 
 ## Implementation Notes & Status
-- _Draft only (no implementation yet)._
-- Next step: publish this RFC for review, then update `docs/app-platform/specification.yaml` to remove `build` and `depends_on`, and to document `services` + `after`.
+- **Implemented (2026-01-03):** backend/runtime support for `services`-based multi-container apps in `x-piccolo.mode: service`.
+- **Manifest:** `build:` and top-level `depends_on:` are rejected; `services` + `primary_service` + `bind_ports` validated; explicit persistent volume sharing via `shared: true` enforced.
+- **Runtime:** a per-app **network anchor** container (`<instanceID>__netns__`) holds published listener ports; all services join its network namespace via `--network container:<anchorID>`.
+- **State:** `metadata.json` now persists `primary_service`, `network_anchor_id`, and `containers{service:container_id}` for multi-container apps.
+- **API:** app logs + log streaming + terminal exec accept `?service=<name>` (defaults to primary service).
+- **UI:** service selection UX is not yet wired; existing UI continues to use primary service defaults.

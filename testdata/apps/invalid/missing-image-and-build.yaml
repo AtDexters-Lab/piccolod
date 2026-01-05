@@ -1,2 +1,4 @@
-# Missing both 'image' and 'build' fields
+# Missing required 'image' field
 name: invalid-app
+x-piccolo:
+  mode: service

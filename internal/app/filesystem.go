@@ -35,14 +35,18 @@ type FilesystemStateManager struct {
 
 // AppMetadata represents runtime metadata stored separately from app.yaml
 type AppMetadata struct {
-	InstanceID  string    `json:"instance_id"`
-	DisplayName string    `json:"display_name,omitempty"`
-	AppName     string    `json:"app_name"`
-	Status      string    `json:"status"` // "created", "running", "stopped", "error"
-	ContainerID string    `json:"container_id"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	Enabled     bool      `json:"enabled"`
+	InstanceID  string `json:"instance_id"`
+	DisplayName string `json:"display_name,omitempty"`
+	AppName     string `json:"app_name"`
+	Status      string `json:"status"` // "created", "running", "stopped", "error"
+	ContainerID string `json:"container_id"`
+	// Multi-container runtime metadata (service mode only).
+	PrimaryService  string            `json:"primary_service,omitempty"`
+	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`
+	Containers      map[string]string `json:"containers,omitempty"`
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at"`
+	Enabled         bool              `json:"enabled"`
 }
 
 // NewFilesystemStateManager creates a new filesystem state manager
@@ -154,13 +158,16 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 
 	// Create AppInstance with embedded definition
 	app := &AppInstance{
-		InstanceID:  metadata.InstanceID,
-		DisplayName: metadata.DisplayName,
-		Status:      metadata.Status,
-		ContainerID: metadata.ContainerID,
-		CreatedAt:   metadata.CreatedAt,
-		UpdatedAt:   metadata.UpdatedAt,
-		Definition:  appDef,
+		InstanceID:      metadata.InstanceID,
+		DisplayName:     metadata.DisplayName,
+		Status:          metadata.Status,
+		ContainerID:     metadata.ContainerID,
+		PrimaryService:  metadata.PrimaryService,
+		NetworkAnchorID: metadata.NetworkAnchorID,
+		Containers:      metadata.Containers,
+		CreatedAt:       metadata.CreatedAt,
+		UpdatedAt:       metadata.UpdatedAt,
+		Definition:      appDef,
 	}
 
 	// Fallback: if InstanceID is empty in metadata, use directory name
@@ -257,13 +264,16 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDef
 	// Store metadata.json with runtime fields
 	// AppName is stored for backward compatibility with existing metadata.json files
 	metadata := AppMetadata{
-		InstanceID:  app.InstanceID,
-		DisplayName: app.DisplayName,
-		AppName:     def.Name,
-		Status:      app.Status,
-		ContainerID: app.ContainerID,
-		CreatedAt:   app.CreatedAt,
-		UpdatedAt:   app.UpdatedAt,
+		InstanceID:      app.InstanceID,
+		DisplayName:     app.DisplayName,
+		AppName:         def.Name,
+		Status:          app.Status,
+		ContainerID:     app.ContainerID,
+		PrimaryService:  app.PrimaryService,
+		NetworkAnchorID: app.NetworkAnchorID,
+		Containers:      app.Containers,
+		CreatedAt:       app.CreatedAt,
+		UpdatedAt:       app.UpdatedAt,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -307,6 +317,9 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 	createdAt := app.CreatedAt
 	displayName := app.DisplayName
 	appName := app.AppName() // Use method to get name from Definition
+	primaryService := app.PrimaryService
+	networkAnchorID := app.NetworkAnchorID
+	containers := app.Containers
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem
@@ -314,13 +327,16 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 	metadataPath := filepath.Join(appDir, "metadata.json")
 
 	metadata := AppMetadata{
-		InstanceID:  instanceID,
-		DisplayName: displayName,
-		AppName:     appName,
-		Status:      app.Status,
-		ContainerID: app.ContainerID,
-		CreatedAt:   createdAt,
-		UpdatedAt:   app.UpdatedAt,
+		InstanceID:      instanceID,
+		DisplayName:     displayName,
+		AppName:         appName,
+		Status:          app.Status,
+		ContainerID:     app.ContainerID,
+		PrimaryService:  primaryService,
+		NetworkAnchorID: networkAnchorID,
+		Containers:      containers,
+		CreatedAt:       createdAt,
+		UpdatedAt:       app.UpdatedAt,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")

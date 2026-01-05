@@ -368,18 +368,23 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 		return
 	}
 
-	// Include services inline
-	services, _ := s.serviceManager.GetByApp(appName)
-	serviceStatus := make([]gin.H, 0, len(services))
+	// Include listener endpoints inline (keyed as "listeners" to avoid colliding with manifest services).
+	listeners, _ := s.serviceManager.GetByApp(appName)
+	listenerStatus := make([]gin.H, 0, len(listeners))
 	var remoteStatus *remote.Status
 	if s.remoteManager != nil {
 		st := s.remoteManager.Status()
 		remoteStatus = &st
 	}
-	for _, ep := range services {
-		serviceStatus = append(serviceStatus, s.formatServiceEndpoint(c, ep, remoteStatus))
+	for _, ep := range listeners {
+		listenerStatus = append(listenerStatus, s.formatServiceEndpoint(c, ep, remoteStatus))
 	}
-	writeGinSuccess(c, gin.H{"app": appInstance, "services": serviceStatus}, "")
+
+	containerStatus, err := s.appManager.ContainerStatuses(c.Request.Context(), appName)
+	if err != nil {
+		log.Printf("WARN: app get %s: container status unavailable: %v", appName, err)
+	}
+	writeGinSuccess(c, gin.H{"app": appInstance, "listeners": listenerStatus, "containers": containerStatus}, "")
 }
 
 // handleGinAppLogs returns recent container logs for an app instance.
@@ -387,8 +392,9 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 func (s *GinServer) handleGinAppLogs(c *gin.Context) {
 	appName := c.Param("name")
 	tail := parseLogTail(c, 200)
+	service := strings.TrimSpace(c.Query("service"))
 
-	lines, err := s.appManager.Logs(c.Request.Context(), appName, tail)
+	lines, err := s.appManager.LogsForService(c.Request.Context(), appName, service, tail)
 	if err != nil {
 		if handleAppManagerError(c, err, "fetch logs") {
 			return

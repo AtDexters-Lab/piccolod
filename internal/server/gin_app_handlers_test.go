@@ -420,13 +420,13 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	if !ok {
 		t.Fatalf("response data not object: %#v", resp.Data)
 	}
-	rawServices, ok := data["services"].([]interface{})
-	if !ok || len(rawServices) == 0 {
-		t.Fatalf("expected services list in response: %#v", data)
+	rawListeners, ok := data["listeners"].([]interface{})
+	if !ok || len(rawListeners) == 0 {
+		t.Fatalf("expected listeners list in response: %#v", data)
 	}
-	first, ok := rawServices[0].(map[string]interface{})
+	first, ok := rawListeners[0].(map[string]interface{})
 	if !ok {
-		t.Fatalf("service entry not object: %#v", rawServices[0])
+		t.Fatalf("listener entry not object: %#v", rawListeners[0])
 	}
 
 	remoteHost, ok := first["remote_host"].(string)
@@ -435,6 +435,11 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	}
 	if remoteHost != "web.example.com" {
 		t.Fatalf("unexpected remote_host %q", remoteHost)
+	}
+
+	rawContainers, ok := data["containers"].([]interface{})
+	if !ok || len(rawContainers) == 0 {
+		t.Fatalf("expected containers list in response: %#v", data)
 	}
 }
 
@@ -1267,6 +1272,21 @@ func (m *GinMockContainerManager) RemoveContainer(ctx context.Context, runtime c
 	return container.ErrContainerNotFound(containerID)
 }
 
+func (m *GinMockContainerManager) ListContainersByLabel(ctx context.Context, runtime container.PodmanRuntime, labelKey, labelValue string) ([]container.ContainerListItem, error) {
+	_ = ctx
+	_ = runtime
+	out := []container.ContainerListItem{}
+	for id, c := range m.containers {
+		if c == nil || c.Spec.Labels == nil {
+			continue
+		}
+		if c.Spec.Labels[labelKey] == labelValue {
+			out = append(out, container.ContainerListItem{ID: id, Name: c.Name})
+		}
+	}
+	return out, nil
+}
+
 func (m *GinMockContainerManager) PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error {
 	_ = runtime
 	_ = image
@@ -1481,12 +1501,15 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	var resp GinAppResponse
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	data := resp.Data.(map[string]interface{})
-	svcs := data["services"].([]interface{})
-	svc := svcs[0].(map[string]interface{})
+	lis := data["listeners"].([]interface{})
+	li := lis[0].(map[string]interface{})
 
 	expected := fmt.Sprintf("http://piccolo.local:%d", ep.PublicPort)
-	if got := svc["local_url"].(string); got != expected {
+	if got := li["local_url"].(string); got != expected {
 		t.Errorf("Host=piccolo.local: expected %q, got %q", expected, got)
+	}
+	if containers, ok := data["containers"].([]interface{}); !ok || len(containers) == 0 {
+		t.Fatalf("expected containers list in response: %#v", data)
 	}
 
 	// 2. Request with IP host
@@ -1500,8 +1523,11 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	expected = fmt.Sprintf("http://192.168.1.50:%d", ep.PublicPort)
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	data = resp.Data.(map[string]interface{})
-	svc = data["services"].([]interface{})[0].(map[string]interface{})
-	if got := svc["local_url"].(string); got != expected {
+	li = data["listeners"].([]interface{})[0].(map[string]interface{})
+	if got := li["local_url"].(string); got != expected {
 		t.Errorf("Host=192.168.1.50:8080: expected %q, got %q", expected, got)
+	}
+	if containers, ok := data["containers"].([]interface{}); !ok || len(containers) == 0 {
+		t.Fatalf("expected containers list in response: %#v", data)
 	}
 }

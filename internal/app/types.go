@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os/exec"
+	"strings"
 	"time"
 
 	"piccolod/internal/api"
@@ -16,6 +17,7 @@ type ContainerManager interface {
 	StartContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
 	StopContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
 	RemoveContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
+	ListContainersByLabel(ctx context.Context, runtime container.PodmanRuntime, labelKey, labelValue string) ([]container.ContainerListItem, error)
 	PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error
 	Logs(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int) ([]string, error)
 	LogsStream(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int, timestamps bool) (io.ReadCloser, error)
@@ -42,13 +44,17 @@ type ContainerManager interface {
 // DisplayName is an optional user-provided friendly name for UI purposes.
 // Definition contains the full app manifest (image, type, listeners, extensions, etc).
 type AppInstance struct {
-	InstanceID  string             `json:"instance_id"`
-	DisplayName string             `json:"display_name,omitempty"`
-	Status      string             `json:"status"`
-	ContainerID string             `json:"container_id"`
-	CreatedAt   time.Time          `json:"created_at"`
-	UpdatedAt   time.Time          `json:"updated_at"`
-	Definition  *api.AppDefinition `json:"definition,omitempty"`
+	InstanceID  string `json:"instance_id"`
+	DisplayName string `json:"display_name,omitempty"`
+	Status      string `json:"status"`
+	ContainerID string `json:"container_id"`
+	// Multi-container runtime metadata (service mode only).
+	PrimaryService  string             `json:"primary_service,omitempty"`
+	NetworkAnchorID string             `json:"network_anchor_id,omitempty"`
+	Containers      map[string]string  `json:"containers,omitempty"`
+	CreatedAt       time.Time          `json:"created_at"`
+	UpdatedAt       time.Time          `json:"updated_at"`
+	Definition      *api.AppDefinition `json:"definition,omitempty"`
 }
 
 // Helper methods to access commonly used Definition fields safely
@@ -83,4 +89,16 @@ func (a *AppInstance) Mode() PiccoloMode {
 		return ModeUnknown
 	}
 	return piccoloModeFromExtensions(a.Definition.Extensions)
+}
+
+// PublishContainerID returns the container ID that owns published listener ports.
+// For single-container apps this is the primary container; for multi-container apps it is the network anchor.
+func (a *AppInstance) PublishContainerID() string {
+	if a == nil {
+		return ""
+	}
+	if strings.TrimSpace(a.NetworkAnchorID) != "" {
+		return a.NetworkAnchorID
+	}
+	return a.ContainerID
 }

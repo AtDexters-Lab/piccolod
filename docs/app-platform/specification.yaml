@@ -12,20 +12,7 @@
 # REQUIRED FIELDS -------------------------------------------------------------
 
 name: dev-workspace            # Logical app identifier (dependency graph, UI labels). Keep unique.
-image: ubuntu:22.04            # Provide either image: (pull from registry) or build: (see below).
-# build:
-#   containerfile: |          # Inline Containerfile when uploading sources through the API
-#     FROM node:18
-#     WORKDIR /app
-#     COPY package*.json ./
-#     RUN npm ci
-#     COPY . .
-#     CMD ["npm", "start"]
-#   context: .                 # Optional build context path (defaults to current directory)
-#   build_args:                # Optional key/value build arguments
-#     NODE_ENV: production
-#   # git: https://github.com/org/repo.git   # Breadcrumb: remote repo builds land post pre-beta
-#   # branch: main
+image: ubuntu:22.04            # Required. Use pre-built images from a registry.
 
 # INPUTS (Dynamic Configuration) ----------------------------------------------
 # Defines the form schema presented to the user during installation.
@@ -98,6 +85,7 @@ listeners:
 
 # STORAGE (data dataset) ------------------------------------------------------
 # storage.persistent declares the *durable user data* mountpoints for this app.
+# For multi-container service apps, storage is defined per-service under services.<name>.storage.
 #
 # Modes:
 #   - service: you MUST enumerate every path that must survive updates/reinstalls under storage.persistent.
@@ -154,6 +142,50 @@ resources:
     cpu: 2.0                  # CPU cores (fractional allowed)
     storage: 100GB            # Aggregate persistent storage quota (across volumes)
 
+# MULTI-CONTAINER APPS (service mode only) ------------------------------------
+# Compose-style apps can run multiple containers (services) per app instance.
+# When services is present, the following top-level fields are rejected and must be moved under each service:
+#   - image, environment, storage, resources
+#
+# Listeners remain app-level and default to the primary service.
+# primary_service defaults to "main" when omitted.
+#
+# primary_service: web
+# services:
+#   web:
+#     image: docker.io/library/nginx:alpine
+#     bind_ports: [8080]           # Required (may be empty). Shared port namespace contract.
+#     environment:
+#       FOO: bar
+#     storage:
+#       persistent:
+#         content:
+#           container: /usr/share/nginx/html
+#   db:
+#     image: docker.io/library/postgres:16
+#     after: [web]                 # Start/stop ordering only (not readiness)
+#     bind_ports: [5432]
+#     storage:
+#       persistent:
+#         pgdata:
+#           container: /var/lib/postgresql/data
+#
+# Volume sharing: if a persistent volume name is mounted by multiple services, every reference must set shared: true.
+# Example:
+#   services:
+#     web:
+#       storage:
+#         persistent:
+#           cache:
+#             container: /cache
+#             shared: true
+#     worker:
+#       storage:
+#         persistent:
+#           cache:
+#             container: /cache
+#             shared: true
+
 # HEALTH MONITORING ------------------------------------------------------------
 healthcheck:
   http:
@@ -163,9 +195,7 @@ healthcheck:
     retries: 3
 
 # DEPENDENCY GRAPH -------------------------------------------------------------
-depends_on:
-  - postgres
-  - redis
+# Piccolo does not support inter-app dependencies. Package dependencies as sidecars within a single app.
 
 # APP CONFIG ------------------------------------------------------------------
 # Free-form YAML copied to /piccolo/config/app.yaml inside the container.

@@ -78,6 +78,21 @@ func (m *MockContainerManager) RemoveContainer(ctx context.Context, runtime cont
 	return container.ErrContainerNotFound(containerID)
 }
 
+func (m *MockContainerManager) ListContainersByLabel(ctx context.Context, runtime container.PodmanRuntime, labelKey, labelValue string) ([]container.ContainerListItem, error) {
+	_ = ctx
+	_ = runtime
+	out := []container.ContainerListItem{}
+	for id, c := range m.containers {
+		if c == nil || c.Spec.Labels == nil {
+			continue
+		}
+		if c.Spec.Labels[labelKey] == labelValue {
+			out = append(out, container.ContainerListItem{ID: id, Name: c.Spec.Name})
+		}
+	}
+	return out, nil
+}
+
 func (m *MockContainerManager) PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error {
 	_ = runtime
 	_ = image

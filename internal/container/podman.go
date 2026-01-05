@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,10 +64,16 @@ type ContainerState struct {
 	Running bool
 }
 
+// ContainerListItem captures minimal container identity information from `podman ps`.
+type ContainerListItem struct {
+	ID   string
+	Name string
+}
+
 // Validation patterns for different argument types
 var (
 	// Container/image names: lowercase letters, numbers, hyphens, slashes, colons, and @ (for digests)
-	namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:@/-]*[a-z0-9]$|^[a-z0-9]$`)
+	namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:@/-]*[a-z0-9_]$|^[a-z0-9]$`)
 
 	// Volume paths: absolute paths only, no special chars
 	pathPattern = regexp.MustCompile(`^/[a-zA-Z0-9._/-]*$`)
@@ -76,6 +83,9 @@ var (
 
 	// Environment variable keys
 	envKeyPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+	// Label keys: allow dotted namespaces (e.g. io.piccolo.instance) with conservative characters.
+	labelKeyPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
 )
 
 var portInUseRe = regexp.MustCompile(`:(\d+): bind: address already in use`)
@@ -183,6 +193,29 @@ func ValidateEnvValue(value string) error {
 	return nil
 }
 
+// ValidateLabelKey validates container label keys.
+func ValidateLabelKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("label key cannot be empty")
+	}
+	if len(key) > 255 {
+		return fmt.Errorf("label key too long (max 255 chars)")
+	}
+	if strings.ContainsAny(key, "=\n\r\t") {
+		return fmt.Errorf("label key contains invalid characters")
+	}
+	if !labelKeyPattern.MatchString(key) {
+		return fmt.Errorf("invalid label key format: %s", key)
+	}
+	return nil
+}
+
+// ValidateLabelValue validates container label values.
+func ValidateLabelValue(value string) error {
+	// Reuse env value constraints (printable, no control chars, reasonable length).
+	return ValidateEnvValue(value)
+}
+
 // ContainerCreateSpec defines validated parameters for container creation
 type ContainerCreateSpec struct {
 	Name          string
@@ -191,6 +224,7 @@ type ContainerCreateSpec struct {
 	Volumes       []VolumeMapping
 	Tmpfs         []TmpfsMount
 	Environment   map[string]string
+	Labels        map[string]string
 	Resources     ResourceLimits
 	NetworkMode   string
 	RestartPolicy string
@@ -236,8 +270,8 @@ type ResourceLimits struct {
 	CPU    string
 }
 
-func buildRunArgs(spec ContainerCreateSpec) []string {
-	args := []string{"run", "-d"}
+func buildCreateArgs(spec ContainerCreateSpec) []string {
+	args := []string{"create"}
 
 	// PID 1 init process for proper signal handling and zombie reaping
 	if spec.UseInit {
@@ -246,6 +280,17 @@ func buildRunArgs(spec ContainerCreateSpec) []string {
 
 	if spec.Name != "" {
 		args = append(args, "--name", spec.Name)
+	}
+
+	if len(spec.Labels) > 0 {
+		keys := make([]string, 0, len(spec.Labels))
+		for k := range spec.Labels {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			args = append(args, "--label", fmt.Sprintf("%s=%s", k, spec.Labels[k]))
+		}
 	}
 
 	for _, port := range spec.Ports {
@@ -375,8 +420,8 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 	// All inputs must be validated before calling this method
 
 	// Execute command using exec.CommandContext (no shell interpretation)
-	runArgs := buildRunArgs(spec)
-	args, err := buildPodmanArgs(runtime, runArgs)
+	createArgs := buildCreateArgs(spec)
+	args, err := buildPodmanArgs(runtime, createArgs)
 	if err != nil {
 		return "", err
 	}
@@ -392,7 +437,7 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 					port = parsed
 				}
 			}
-			return "", &PortInUseError{Port: port, Output: outStr, Err: fmt.Errorf("podman run failed: %w", err)}
+			return "", &PortInUseError{Port: port, Output: outStr, Err: fmt.Errorf("podman create failed: %w", err)}
 		}
 		if strings.Contains(outStr, "name is already in use") || strings.Contains(outStr, "already in use by") {
 			// Try to extract the ID
@@ -404,7 +449,7 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 				return "", &NameInUseError{Name: spec.Name, ID: match[1]}
 			}
 		}
-		return "", fmt.Errorf("podman run failed: %w, output: %s", err, outStr)
+		return "", fmt.Errorf("podman create failed: %w, output: %s", err, outStr)
 	}
 
 	// Extract container ID from output - look for the actual hex container ID
@@ -715,6 +760,61 @@ func (p *PodmanCLI) ResolveContainerIDByName(ctx context.Context, runtime Podman
 	return id, nil
 }
 
+// ListContainersByLabel returns all containers (running or stopped) matching a single label selector.
+// This is used for best-effort cleanup of orphaned containers created by Piccolo.
+func (p *PodmanCLI) ListContainersByLabel(ctx context.Context, runtime PodmanRuntime, labelKey, labelValue string) ([]ContainerListItem, error) {
+	if err := ValidateLabelKey(labelKey); err != nil {
+		return nil, fmt.Errorf("invalid label key: %w", err)
+	}
+	if err := ValidateLabelValue(labelValue); err != nil {
+		return nil, fmt.Errorf("invalid label value: %w", err)
+	}
+
+	filter := fmt.Sprintf("label=%s=%s", labelKey, labelValue)
+	args, err := buildPodmanArgs(runtime, []string{
+		"ps", "-a",
+		"--filter", filter,
+		"--format", "{{.ID}}\t{{.Names}}",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("podman ps failed: %w, output: %s", err, string(out))
+	}
+
+	lines := strings.Split(string(out), "\n")
+	items := make([]ContainerListItem, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		id := strings.TrimSpace(parts[0])
+		name := strings.TrimSpace(parts[1])
+		if id == "" || name == "" {
+			continue
+		}
+		if !isValidContainerID(id) {
+			continue
+		}
+		// Podman may print multiple names; keep the first.
+		if idx := strings.Index(name, ","); idx >= 0 {
+			name = strings.TrimSpace(name[:idx])
+		}
+		items = append(items, ContainerListItem{ID: id, Name: name})
+	}
+
+	return items, nil
+}
+
 // InspectContainerState returns whether the container exists, and if so whether it is running.
 func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRuntime, containerID string) (ContainerState, error) {
 	if !isValidContainerID(containerID) {
@@ -903,6 +1003,16 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 		}
 		if err := ValidateEnvValue(value); err != nil {
 			return fmt.Errorf("invalid environment value for key '%s': %w", key, err)
+		}
+	}
+
+	// Validate labels
+	for key, value := range spec.Labels {
+		if err := ValidateLabelKey(key); err != nil {
+			return fmt.Errorf("invalid label key '%s': %w", key, err)
+		}
+		if err := ValidateLabelValue(value); err != nil {
+			return fmt.Errorf("invalid label value for key '%s': %w", key, err)
 		}
 	}
 

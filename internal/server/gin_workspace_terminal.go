@@ -14,6 +14,7 @@ func (s *GinServer) handleWorkspaceTerminal(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "app name required"})
 		return
 	}
+	service := c.Query("service")
 
 	log.Printf("DEBUG: handleWorkspaceTerminal - Request for app %s from %s", appName, c.ClientIP())
 
@@ -26,7 +27,7 @@ func (s *GinServer) handleWorkspaceTerminal(c *gin.Context) {
 
 	log.Printf("DEBUG: handleWorkspaceTerminal - WebSocket upgraded for app %s", appName)
 
-	cmd, err := s.appManager.ExecShellCmd(c.Request.Context(), appName)
+	cmd, err := s.appManager.ExecShellCmdForService(c.Request.Context(), appName, service)
 	if err != nil {
 		sendError(conn, "Failed to exec into container: "+err.Error())
 		return
