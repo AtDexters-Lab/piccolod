@@ -318,7 +318,8 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	}
 
 	// Install a new app instance
-	appInstance, err := s.appManager.Install(c.Request.Context(), appDef, displayName)
+	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	appInstance, err := s.appManager.Install(ctx, appDef, displayName)
 	if err != nil {
 		if handleAppManagerError(c, err, "install app") {
 			return
@@ -367,18 +368,45 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 		return
 	}
 
-	// Include services inline
-	services, _ := s.serviceManager.GetByApp(appName)
-	serviceStatus := make([]gin.H, 0, len(services))
+	// Include listener endpoints inline (keyed as "listeners" to avoid colliding with manifest services).
+	listeners, _ := s.serviceManager.GetByApp(appName)
+	listenerStatus := make([]gin.H, 0, len(listeners))
 	var remoteStatus *remote.Status
 	if s.remoteManager != nil {
 		st := s.remoteManager.Status()
 		remoteStatus = &st
 	}
-	for _, ep := range services {
-		serviceStatus = append(serviceStatus, s.formatServiceEndpoint(c, ep, remoteStatus))
+	for _, ep := range listeners {
+		listenerStatus = append(listenerStatus, s.formatServiceEndpoint(c, ep, remoteStatus))
 	}
-	writeGinSuccess(c, gin.H{"app": appInstance, "services": serviceStatus}, "")
+
+	containerStatus, err := s.appManager.ContainerStatuses(c.Request.Context(), appName)
+	if err != nil {
+		log.Printf("WARN: app get %s: container status unavailable: %v", appName, err)
+	}
+	writeGinSuccess(c, gin.H{"app": appInstance, "listeners": listenerStatus, "containers": containerStatus}, "")
+}
+
+// handleGinAppLogs returns recent container logs for an app instance.
+// GET /api/v1/apps/:name/logs?tail=200
+func (s *GinServer) handleGinAppLogs(c *gin.Context) {
+	appName := c.Param("name")
+	tail := parseLogTail(c, 200)
+	service := strings.TrimSpace(c.Query("service"))
+
+	lines, err := s.appManager.LogsForService(c.Request.Context(), appName, service, tail)
+	if err != nil {
+		if handleAppManagerError(c, err, "fetch logs") {
+			return
+		}
+		if strings.Contains(err.Error(), "not found") {
+			writeGinError(c, http.StatusNotFound, err.Error())
+			return
+		}
+		writeGinError(c, http.StatusInternalServerError, "Failed to fetch logs: "+err.Error())
+		return
+	}
+	writeGinSuccess(c, gin.H{"lines": lines}, "")
 }
 
 // handleGinAppUpdateListeners handles PATCH /api/v1/apps/:name/listeners
@@ -403,7 +431,8 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 		return
 	}
 
-	_, err = s.appManager.UpdateListeners(c.Request.Context(), appName, req.Listeners)
+	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	_, err = s.appManager.UpdateListeners(ctx, appName, req.Listeners)
 	if err != nil {
 		if handleAppManagerError(c, err, "update listeners") {
 			return
@@ -473,7 +502,8 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 		}
 	}
 
-	err := s.appManager.UninstallWithOptions(c.Request.Context(), appName, purge)
+	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	err := s.appManager.UninstallWithOptions(ctx, appName, purge)
 	if err != nil {
 		if handleAppManagerError(c, err, "uninstall app") {
 			return
@@ -508,7 +538,8 @@ func (s *GinServer) handleGinAppStart(c *gin.Context) {
 		return
 	}
 
-	err := s.appManager.Start(c.Request.Context(), appName)
+	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	err := s.appManager.Start(ctx, appName)
 	if err != nil {
 		if handleAppManagerError(c, err, "start app") {
 			return
@@ -533,7 +564,8 @@ func (s *GinServer) handleGinAppStop(c *gin.Context) {
 		return
 	}
 
-	err := s.appManager.Stop(c.Request.Context(), appName)
+	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	err := s.appManager.Stop(ctx, appName)
 	if err != nil {
 		if handleAppManagerError(c, err, "stop app") {
 			return

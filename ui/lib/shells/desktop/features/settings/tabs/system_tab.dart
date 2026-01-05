@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../../../../../theme/piccolo_theme.dart';
 import '../../../../../core/models/os_update.dart';
+import '../../../../../shared/widgets/log_stream_viewer.dart';
 import '../settings_controller.dart';
 
 class SystemTab extends StatelessWidget {
@@ -95,6 +96,16 @@ class SystemTab extends StatelessWidget {
               ),
             ),
           ],
+
+          const SizedBox(height: 48),
+          Text("Update Logs", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 16),
+          LogStreamViewer(
+            systemUnit: 'transactional-update',
+            tailLines: 200,
+            height: 320,
+            autoConnect: isBusy,
+          ),
         ] else 
            const Text("System information unavailable."),
       ],

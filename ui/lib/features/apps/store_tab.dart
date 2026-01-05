@@ -5,6 +5,7 @@ import '../../theme/piccolo_theme.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'custom_install_wizard.dart';
 import 'dynamic_install_wizard.dart';
+import 'create_workspace_wizard.dart';
 import 'app_detail_view.dart';
 
 class StoreTab extends StatefulWidget {
@@ -31,7 +32,7 @@ class _StoreTabState extends State<StoreTab> {
   String? _error;
   int _currentPage = 1;
   int _totalPages = 1;
-  
+
   List<String> _categories = ['All'];
   String _selectedCategory = 'All';
 
@@ -129,18 +130,18 @@ class _StoreTabState extends State<StoreTab> {
 
   void _installFromTemplate(CatalogItem item) async {
     String? yaml = item.template;
-    
+
     if (yaml == null || yaml.isEmpty) {
-        try {
-            yaml = await widget.appService.getCatalogTemplate(item.name);
-        } catch (e) {
-            if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text("Failed to load template: $e")),
-                );
-            }
-            return;
+      try {
+        yaml = await widget.appService.getCatalogTemplate(item.name);
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Failed to load template: $e")),
+          );
         }
+        return;
+      }
     }
 
     if (yaml == null) return;
@@ -148,9 +149,9 @@ class _StoreTabState extends State<StoreTab> {
     // Fetch configuration schema
     Map<String, dynamic> schema = {};
     try {
-        schema = await widget.appService.getCatalogConfigure(item.name);
+      schema = await widget.appService.getCatalogConfigure(item.name);
     } catch (e) {
-        debugPrint("Failed to load config schema (falling back to raw yaml): $e");
+      debugPrint("Failed to load config schema (falling back to raw yaml): $e");
     }
 
     if (!mounted) return;
@@ -165,8 +166,8 @@ class _StoreTabState extends State<StoreTab> {
           yamlContent: yaml!,
           schema: schema,
           onSuccess: (appName) {
-             Navigator.of(context).pop(); // Close Wizard
-             _openAppDetail(appName);
+            Navigator.of(context).pop(); // Close Wizard
+            _openAppDetail(appName);
           },
         ),
       );
@@ -178,8 +179,8 @@ class _StoreTabState extends State<StoreTab> {
           appService: widget.appService,
           initialYaml: yaml!,
           onSuccess: (appName) {
-             Navigator.of(context).pop(); // Close Wizard
-             _openAppDetail(appName);
+            Navigator.of(context).pop(); // Close Wizard
+            _openAppDetail(appName);
           },
         ),
       );
@@ -199,45 +200,69 @@ class _StoreTabState extends State<StoreTab> {
     );
   }
 
+  void _openCreateWorkspace() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => CreateWorkspaceWizard(
+        appService: widget.appService,
+        onSuccess: () {
+          Navigator.of(context).pop();
+          // Refresh library or show the new workspace
+        },
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // Category Pills
-        Container(
-          height: 60,
-          padding: const EdgeInsets.symmetric(vertical: 12),
-          child: ListView.separated(
-            padding: const EdgeInsets.symmetric(horizontal: 24),
-            scrollDirection: Axis.horizontal,
-            itemCount: _categories.length,
-            separatorBuilder: (c, i) => const SizedBox(width: 8),
-            itemBuilder: (context, index) {
-              final cat = _categories[index];
-              final isSelected = cat == _selectedCategory;
-              return ChoiceChip(
-                label: Text(cat),
-                selected: isSelected,
-                showCheckmark: false,
-                onSelected: (_) => _onCategorySelected(cat),
-                selectedColor: PiccoloTheme.cobalt600,
-                labelStyle: TextStyle(
-                  color: isSelected ? Colors.white : PiccoloTheme.ink,
-                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+        // Category Pills and Create Workspace Button
+        Padding(
+          padding: const EdgeInsets.fromLTRB(24, 12, 24, 12),
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              FilledButton.icon(
+                onPressed: _openCreateWorkspace,
+                icon: const Icon(Icons.terminal, size: 18),
+                label: const Text('Create Workspace'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: PiccoloTheme.success,
+                  foregroundColor: Colors.white,
                 ),
-                backgroundColor: PiccoloTheme.porcelain,
-                side: BorderSide.none,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-              );
-            },
+              ),
+              for (final cat in _categories)
+                ChoiceChip(
+                  label: Text(cat),
+                  selected: cat == _selectedCategory,
+                  showCheckmark: false,
+                  onSelected: (_) => _onCategorySelected(cat),
+                  selectedColor: PiccoloTheme.cobalt600,
+                  labelStyle: TextStyle(
+                    color: cat == _selectedCategory
+                        ? Colors.white
+                        : PiccoloTheme.ink,
+                    fontWeight: cat == _selectedCategory
+                        ? FontWeight.bold
+                        : FontWeight.normal,
+                  ),
+                  backgroundColor: PiccoloTheme.porcelain,
+                  side: BorderSide.none,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                ),
+            ],
           ),
         ),
-        
+
         // Content
-        Expanded(
-          child: _buildContent(),
-        ),
+        Expanded(child: _buildContent()),
       ],
     );
   }
@@ -252,7 +277,11 @@ class _StoreTabState extends State<StoreTab> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.error_outline, color: PiccoloTheme.critical, size: 48),
+            const Icon(
+              Icons.error_outline,
+              color: PiccoloTheme.critical,
+              size: 48,
+            ),
             const SizedBox(height: 16),
             Text(_error!, style: PiccoloTheme.textTheme.bodyMedium),
             const SizedBox(height: 16),
@@ -268,9 +297,9 @@ class _StoreTabState extends State<StoreTab> {
     if (_items.isEmpty) {
       return Center(
         child: Text(
-          widget.searchQuery.isEmpty 
-             ? "No apps found in this category." 
-             : "No matching apps found.",
+          widget.searchQuery.isEmpty
+              ? "No apps found in this category."
+              : "No matching apps found.",
           style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
             color: PiccoloTheme.inkMuted,
           ),
@@ -306,7 +335,11 @@ class _StoreTabState extends State<StoreTab> {
               child: OutlinedButton(
                 onPressed: _isLoading ? null : _loadMore,
                 child: _isLoading
-                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
                     : const Text("Load More"),
               ),
             ),
@@ -345,14 +378,16 @@ class _CatalogCard extends StatelessWidget {
                   decoration: BoxDecoration(
                     color: PiccoloTheme.mist,
                     borderRadius: BorderRadius.circular(12),
-                    image: (item.icon != null && item.icon!.isNotEmpty) ? DecorationImage(
-                        image: NetworkImage(item.icon!), 
-                        fit: BoxFit.cover,
-                    ) : null,
+                    image: (item.icon != null && item.icon!.isNotEmpty)
+                        ? DecorationImage(
+                            image: NetworkImage(item.icon!),
+                            fit: BoxFit.cover,
+                          )
+                        : null,
                   ),
-                  child: (item.icon == null || item.icon!.isEmpty) 
-                    ? const Icon(Icons.apps, color: PiccoloTheme.inkMuted)
-                    : null,
+                  child: (item.icon == null || item.icon!.isEmpty)
+                      ? const Icon(Icons.apps, color: PiccoloTheme.inkMuted)
+                      : null,
                 ),
                 const SizedBox(width: 12),
                 Expanded(
@@ -391,20 +426,33 @@ class _CatalogCard extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
               ),
             ),
-             const SizedBox(height: 8),
-             if (item.tags.isNotEmpty)
-               Wrap(
-                 spacing: 4,
-                 runSpacing: 4,
-                 children: item.tags.take(3).map((tag) => Container(
-                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                   decoration: BoxDecoration(
-                     color: Colors.black.withValues(alpha: 0.05),
-                     borderRadius: BorderRadius.circular(4),
-                   ),
-                   child: Text(tag, style: PiccoloTheme.textTheme.labelSmall?.copyWith(fontSize: 10)),
-                 )).toList(),
-               ),
+            const SizedBox(height: 8),
+            if (item.tags.isNotEmpty)
+              Wrap(
+                spacing: 4,
+                runSpacing: 4,
+                children: item.tags
+                    .take(3)
+                    .map(
+                      (tag) => Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.05),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          tag,
+                          style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+                            fontSize: 10,
+                          ),
+                        ),
+                      ),
+                    )
+                    .toList(),
+              ),
             const SizedBox(height: 12),
             // Footer Action
             SizedBox(

@@ -2,14 +2,11 @@ package server
 
 import (
 	"encoding/base64"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
-	"sync"
 
-	"github.com/creack/pty"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
@@ -30,6 +27,15 @@ type terminalMessage struct {
 	Rows int    `json:"rows,omitempty"`
 }
 
+// getShell returns the path to the preferred shell, defaulting to bash then sh.
+func getShell() string {
+	shell := "/bin/bash"
+	if _, err := os.Stat(shell); err != nil {
+		shell = "/bin/sh"
+	}
+	return shell
+}
+
 func (s *GinServer) handleTerminal(c *gin.Context) {
 	log.Println("DEBUG: handleTerminal - Request received from", c.ClientIP())
 
@@ -42,79 +48,17 @@ func (s *GinServer) handleTerminal(c *gin.Context) {
 
 	log.Println("DEBUG: handleTerminal - WebSocket upgraded successfully")
 
-	// Default to bash, fall back to sh
-	shell := "/bin/bash"
-	if _, err := os.Stat(shell); err != nil {
-		shell = "/bin/sh"
-	}
-
-	cmd := exec.Command(shell)
-	// Inherit environment but force xterm-256color as requested by UI
+	cmd := exec.Command(getShell())
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
-	ptmx, err := pty.Start(cmd)
+	session, err := NewPTYSession(conn, cmd)
 	if err != nil {
 		sendError(conn, "Failed to start shell: "+err.Error())
 		return
 	}
-	defer func() { _ = ptmx.Close() }() // closes the pty, killing the command
+	defer session.Close()
 
-	// Use a mutex to prevent concurrent writes to the websocket
-	// (NextWriter and WriteMessage are not thread-safe)
-	var wsMu sync.Mutex
-
-	// Handle PTY -> WebSocket (Output)
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := ptmx.Read(buf)
-			if err != nil {
-				if err != io.EOF {
-					// log.Printf("PTY read error: %v", err)
-				}
-				break
-			}
-
-			// Encode raw PTY bytes to Base64
-			encoded := base64.StdEncoding.EncodeToString(buf[:n])
-
-			msg := terminalMessage{
-				Type: "stdout",
-				Data: encoded,
-			}
-
-			wsMu.Lock()
-			if err := conn.WriteJSON(msg); err != nil {
-				wsMu.Unlock()
-				break
-			}
-			wsMu.Unlock()
-		}
-	}()
-
-	// Handle WebSocket -> PTY (Input + Resize)
-	for {
-		// Read JSON message
-		var msg terminalMessage
-		err := conn.ReadJSON(&msg)
-		if err != nil {
-			break
-		}
-
-		switch msg.Type {
-		case "stdin":
-			if msg.Data != "" {
-				decoded, err := base64.StdEncoding.DecodeString(msg.Data)
-				if err == nil {
-					_, _ = ptmx.Write(decoded)
-				}
-			}
-		case "resize":
-			if msg.Cols > 0 && msg.Rows > 0 {
-				_ = pty.Setsize(ptmx, &pty.Winsize{Rows: uint16(msg.Rows), Cols: uint16(msg.Cols)})
-			}
-		}
-	}
+	session.Run()
 }
 
 func sendError(conn *websocket.Conn, msg string) {

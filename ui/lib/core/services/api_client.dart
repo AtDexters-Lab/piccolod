@@ -54,13 +54,16 @@ class ApiClient {
   Future<dynamic> get(
     String path, {
     Map<String, dynamic>? queryParameters,
+    Map<String, String>? headers,
   }) async {
     final uri = _buildUri(path, queryParameters);
-    final response = await _client.get(uri, headers: _getHeaders());
+    final mergedHeaders = _getHeaders();
+    if (headers != null) mergedHeaders.addAll(headers);
+    final response = await _client.get(uri, headers: mergedHeaders);
     return _handleResponse(response);
   }
 
-  Future<dynamic> post(String path, {Object? body}) async {
+  Future<dynamic> post(String path, {Object? body, Map<String, String>? headers}) async {
     // Automatically ensure we have a CSRF token before mutating state.
     // This prevents 401/403 errors when developers forget to call fetchCsrfToken().
     if (_csrfToken == null) {
@@ -68,51 +71,64 @@ class ApiClient {
     }
 
     final uri = _buildUri(path);
+    final mergedHeaders = _getHeaders(contentType: 'application/json');
+    if (headers != null) mergedHeaders.addAll(headers);
     final response = await _client.post(
       uri,
-      headers: _getHeaders(contentType: 'application/json'),
+      headers: mergedHeaders,
       body: body != null ? jsonEncode(body) : null,
     );
     return _handleResponse(response);
   }
 
-  Future<dynamic> postRaw(String path, {required String body, required String contentType}) async {
+  Future<dynamic> postRaw(
+    String path, {
+    required String body,
+    required String contentType,
+    Map<String, String>? headers,
+  }) async {
     if (_csrfToken == null) {
       await fetchCsrfToken();
     }
 
     final uri = _buildUri(path);
+    final mergedHeaders = _getHeaders(contentType: contentType);
+    if (headers != null) mergedHeaders.addAll(headers);
     final response = await _client.post(
       uri,
-      headers: _getHeaders(contentType: contentType),
+      headers: mergedHeaders,
       body: body,
     );
     return _handleResponse(response);
   }
 
-  Future<dynamic> patch(String path, {Object? body}) async {
+  Future<dynamic> patch(String path, {Object? body, Map<String, String>? headers}) async {
     if (_csrfToken == null) {
       await fetchCsrfToken();
     }
 
     final uri = _buildUri(path);
+    final mergedHeaders = _getHeaders(contentType: 'application/json');
+    if (headers != null) mergedHeaders.addAll(headers);
     final response = await _client.patch(
       uri,
-      headers: _getHeaders(contentType: 'application/json'),
+      headers: mergedHeaders,
       body: body != null ? jsonEncode(body) : null,
     );
     return _handleResponse(response);
   }
 
-  Future<dynamic> delete(String path, {Object? body}) async {
+  Future<dynamic> delete(String path, {Object? body, Map<String, String>? headers}) async {
     if (_csrfToken == null) {
       await fetchCsrfToken();
     }
 
     final uri = _buildUri(path);
+    final mergedHeaders = _getHeaders(contentType: 'application/json');
+    if (headers != null) mergedHeaders.addAll(headers);
     final response = await _client.delete(
       uri,
-      headers: _getHeaders(contentType: 'application/json'),
+      headers: mergedHeaders,
       body: body != null ? jsonEncode(body) : null,
     );
     return _handleResponse(response);

@@ -52,6 +52,80 @@ func hasTopLevelKey(node *yaml.Node, key string) bool {
 	return false
 }
 
+func topLevelMapping(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) == 1 {
+		node = node.Content[0]
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	return node
+}
+
+func topLevelValue(node *yaml.Node, key string) *yaml.Node {
+	m := topLevelMapping(node)
+	if m == nil {
+		return nil
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		k := m.Content[i]
+		v := m.Content[i+1]
+		if k != nil && k.Kind == yaml.ScalarNode && k.Value == key {
+			return v
+		}
+	}
+	return nil
+}
+
+func validateRawServicesBlocks(root *yaml.Node) error {
+	services := topLevelValue(root, "services")
+	if services == nil {
+		return nil
+	}
+	if services.Kind != yaml.MappingNode {
+		return fmt.Errorf("services must be a mapping")
+	}
+
+	allowedServiceKeys := map[string]struct{}{
+		"image":       {},
+		"after":       {},
+		"bind_ports":  {},
+		"environment": {},
+		"storage":     {},
+		"resources":   {},
+	}
+
+	for i := 0; i+1 < len(services.Content); i += 2 {
+		svcKey := services.Content[i]
+		svcVal := services.Content[i+1]
+		if svcKey == nil || svcKey.Kind != yaml.ScalarNode {
+			continue
+		}
+		name := strings.TrimSpace(svcKey.Value)
+		if svcVal == nil || svcVal.Kind != yaml.MappingNode {
+			return fmt.Errorf("services.%s must be a mapping", name)
+		}
+		for j := 0; j+1 < len(svcVal.Content); j += 2 {
+			fieldKey := svcVal.Content[j]
+			if fieldKey == nil || fieldKey.Kind != yaml.ScalarNode {
+				continue
+			}
+			field := strings.TrimSpace(fieldKey.Value)
+			if field == "wait_for" {
+				return fmt.Errorf("services.%s.wait_for is not supported yet", name)
+			}
+			if _, ok := allowedServiceKeys[field]; !ok {
+				return fmt.Errorf("services.%s contains unsupported field '%s'", name, field)
+			}
+		}
+	}
+
+	return nil
+}
+
 // ParseAppSchema parses the YAML to extract metadata and inputs without strict validation.
 // This is used to read the manifest before variable substitution.
 func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
@@ -61,6 +135,12 @@ func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
 	}
 	if hasTopLevelKey(&root, "filesystem") {
 		return nil, fmt.Errorf("filesystem is no longer supported; use x-piccolo.mode")
+	}
+	if hasTopLevelKey(&root, "build") {
+		return nil, fmt.Errorf("build is not supported; specify image")
+	}
+	if hasTopLevelKey(&root, "depends_on") {
+		return nil, fmt.Errorf("depends_on is not supported; dependencies must be packaged as sidecars")
 	}
 	var app api.AppDefinition
 	if err := root.Decode(&app); err != nil {
@@ -105,6 +185,15 @@ func ParseAppDefinition(content []byte) (*api.AppDefinition, error) {
 	}
 	if hasTopLevelKey(&root, "filesystem") {
 		return nil, fmt.Errorf("filesystem is no longer supported; use x-piccolo.mode")
+	}
+	if hasTopLevelKey(&root, "build") {
+		return nil, fmt.Errorf("build is not supported; specify image")
+	}
+	if hasTopLevelKey(&root, "depends_on") {
+		return nil, fmt.Errorf("depends_on is not supported; dependencies must be packaged as sidecars")
+	}
+	if err := validateRawServicesBlocks(&root); err != nil {
+		return nil, err
 	}
 	if err := root.Decode(&app); err != nil {
 		return nil, fmt.Errorf("failed to parse YAML: %w", err)
@@ -155,18 +244,26 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 		return err
 	}
 
-	// Validate image/build requirement
-	if err := validateImageOrBuild(app); err != nil {
-		return err
-	}
-
 	// Validate type
 	if err := validateType(app.Type); err != nil {
 		return err
 	}
 
+	// Validate Piccolo-specific extensions (required mode + consistency checks).
+	// We validate this early because mode impacts several other validations.
+	if err := validatePiccoloExtensions(app); err != nil {
+		return err
+	}
+	mode := piccoloModeFromExtensions(app.Extensions)
+
+	// Validate container model (single vs multi-container) and disallowed fields.
+	if err := validateContainerModel(app, mode); err != nil {
+		return err
+	}
+
 	// Validate listeners (service-oriented)
-	if err := validateListeners(app.Listeners); err != nil {
+	// Workspace mode apps are allowed to have no listeners
+	if err := validateListeners(app.Listeners, mode); err != nil {
 		return err
 	}
 
@@ -182,11 +279,6 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 
 	// Validate permissions
 	if err := validatePermissions(app.Permissions); err != nil {
-		return err
-	}
-
-	// Validate Piccolo-specific extensions (required mode + consistency checks).
-	if err := validatePiccoloExtensions(app); err != nil {
 		return err
 	}
 
@@ -236,6 +328,163 @@ func validatePiccoloExtensions(app *api.AppDefinition) error {
 	return nil
 }
 
+const defaultPrimaryServiceName = "main"
+
+func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
+	if app == nil {
+		return nil
+	}
+
+	// Multi-container is represented by presence of the top-level 'services' map.
+	if app.Services != nil {
+		if mode == ModeWorkspace {
+			return fmt.Errorf("services is not supported for workspace mode apps")
+		}
+		if len(app.Services) == 0 {
+			return fmt.Errorf("services must not be empty")
+		}
+
+		// When services is present, all container-level fields must be per-service.
+		if strings.TrimSpace(app.Image) != "" {
+			return fmt.Errorf("image must be specified per-service under services when services is present")
+		}
+		if app.Environment != nil {
+			return fmt.Errorf("environment must be specified per-service under services when services is present")
+		}
+		if app.Storage != nil {
+			return fmt.Errorf("storage must be specified per-service under services when services is present")
+		}
+		if app.Resources != nil {
+			return fmt.Errorf("resources must be specified per-service under services when services is present")
+		}
+
+		primary := strings.TrimSpace(app.PrimaryService)
+		if primary == "" {
+			primary = defaultPrimaryServiceName
+		}
+		if _, ok := app.Services[primary]; !ok {
+			return fmt.Errorf("primary_service '%s' not found in services", primary)
+		}
+
+		return validateServices(app.Services, primary, app.Listeners)
+	}
+
+	// Single-container app (legacy v1).
+	if strings.TrimSpace(app.PrimaryService) != "" {
+		return fmt.Errorf("primary_service requires services")
+	}
+	if strings.TrimSpace(app.Image) == "" {
+		return fmt.Errorf("image is required")
+	}
+	return nil
+}
+
+func validateServiceName(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("service name cannot be empty")
+	}
+	if !appNameRegex.MatchString(name) {
+		return fmt.Errorf("service name '%s' must contain only lowercase letters, numbers, and hyphens, and must start with a letter", name)
+	}
+	return nil
+}
+
+func validateServices(services map[string]api.AppService, primary string, listeners []api.AppListener) error {
+	// Validate service specs first (names, images, per-service storage/resources).
+	for name, svc := range services {
+		if err := validateServiceName(name); err != nil {
+			return err
+		}
+		if strings.TrimSpace(svc.Image) == "" {
+			return fmt.Errorf("services.%s.image is required", name)
+		}
+		// bind_ports is required (may be empty) so Piccolo can validate shared port namespace collisions.
+		if svc.BindPorts == nil {
+			return fmt.Errorf("services.%s.bind_ports is required (may be empty)", name)
+		}
+		if err := validateResources(svc.Resources); err != nil {
+			return fmt.Errorf("services.%s.resources invalid: %w", name, err)
+		}
+		if err := validateStorage(svc.Storage); err != nil {
+			return fmt.Errorf("services.%s.storage invalid: %w", name, err)
+		}
+	}
+
+	// Validate after graph (unknown refs + cycles) and ensure stable order exists.
+	if _, err := serviceStartOrder(services); err != nil {
+		return err
+	}
+
+	// Validate bind_ports across shared network namespace.
+	portOwners := make(map[int]string)
+	for name, svc := range services {
+		seen := make(map[int]struct{}, len(svc.BindPorts))
+		for _, port := range svc.BindPorts {
+			if port < 1 || port > 65535 {
+				return fmt.Errorf("services.%s.bind_ports contains invalid port %d", name, port)
+			}
+			if _, ok := seen[port]; ok {
+				return fmt.Errorf("services.%s.bind_ports contains duplicate port %d", name, port)
+			}
+			seen[port] = struct{}{}
+			if other, ok := portOwners[port]; ok {
+				return fmt.Errorf("bind_ports collision: port %d declared by both services '%s' and '%s'", port, other, name)
+			}
+			portOwners[port] = name
+		}
+	}
+
+	// Primary service must declare all listener guest ports (v1 listeners target primary by default).
+	primarySvc := services[primary]
+	primaryPorts := make(map[int]struct{}, len(primarySvc.BindPorts))
+	for _, p := range primarySvc.BindPorts {
+		primaryPorts[p] = struct{}{}
+	}
+	for _, l := range listeners {
+		if _, ok := primaryPorts[l.GuestPort]; !ok {
+			return fmt.Errorf("primary service '%s' must declare listener guest_port %d in bind_ports", primary, l.GuestPort)
+		}
+	}
+
+	// Explicit persistent volume sharing rules.
+	type volumeRef struct {
+		service   string
+		sizeLimit string
+		shared    bool
+	}
+	refs := make(map[string][]volumeRef)
+	for svcName, svc := range services {
+		if svc.Storage == nil || svc.Storage.Persistent == nil {
+			continue
+		}
+		for volName, vol := range svc.Storage.Persistent {
+			size := strings.TrimSpace(vol.SizeLimit)
+			refs[volName] = append(refs[volName], volumeRef{
+				service:   svcName,
+				sizeLimit: size,
+				shared:    vol.Shared,
+			})
+		}
+	}
+
+	for volName, volRefs := range refs {
+		if len(volRefs) <= 1 {
+			continue
+		}
+		wantSize := volRefs[0].sizeLimit
+		for _, r := range volRefs {
+			if r.sizeLimit != wantSize {
+				return fmt.Errorf("persistent volume '%s' has conflicting size_limit across services", volName)
+			}
+			if !r.shared {
+				return fmt.Errorf("persistent volume '%s' is referenced by multiple services; set shared: true for service '%s'", volName, r.service)
+			}
+		}
+	}
+
+	return nil
+}
+
 // validateName validates app name follows naming conventions
 func validateName(name string) error {
 	if name == "" {
@@ -261,27 +510,6 @@ func validateName(name string) error {
 	return nil
 }
 
-// validateImageOrBuild ensures either image or build is specified (but not both)
-func validateImageOrBuild(app *api.AppDefinition) error {
-	hasImage := app.Image != ""
-	hasBuild := app.Build != nil && (app.Build.Containerfile != "" || app.Build.Git != "")
-
-	if !hasImage && !hasBuild {
-		return fmt.Errorf("either image or build must be specified")
-	}
-
-	if hasImage && hasBuild {
-		return fmt.Errorf("cannot specify both image and build")
-	}
-
-	// If build is specified, validate it
-	if hasBuild {
-		return validateBuild(app.Build)
-	}
-
-	return nil
-}
-
 // validateType validates app type field
 func validateType(appType string) error {
 	validTypes := []string{"user", "system"}
@@ -293,9 +521,15 @@ func validateType(appType string) error {
 	return fmt.Errorf("type must be either 'user' or 'system', got '%s'", appType)
 }
 
-// validatePorts validates port mappings
-func validateListeners(listeners []api.AppListener) error {
+// validateListeners validates listener configurations.
+// Workspace mode apps are allowed to have no listeners (blank environments).
+func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 	if len(listeners) == 0 {
+		// Workspace mode apps can have no listeners - they're blank environments
+		// where users add ports as needed via Edit Listeners
+		if mode == ModeWorkspace {
+			return nil
+		}
 		return fmt.Errorf("listeners are required; legacy ports are no longer supported")
 	}
 
@@ -512,26 +746,6 @@ func validateResourcePermissions(resources *api.AppResourcePermissions) error {
 	if resources.MaxOpenFiles < 0 {
 		return fmt.Errorf("max_open_files must be non-negative")
 	}
-	return nil
-}
-
-// validateBuild validates build configuration
-func validateBuild(build *api.AppBuild) error {
-	if build == nil {
-		return nil
-	}
-
-	hasContainerfile := build.Containerfile != ""
-	hasGit := build.Git != ""
-
-	if !hasContainerfile && !hasGit {
-		return fmt.Errorf("build must specify either containerfile or git")
-	}
-
-	if hasContainerfile && hasGit {
-		return fmt.Errorf("build cannot specify both containerfile and git")
-	}
-
 	return nil
 }
 

@@ -11,11 +11,12 @@ import (
 )
 
 type appVolumeLayout struct {
-	VolumeID   string
-	MountDir   string
-	DiskDir    string
-	PodmanRoot string
-	DataDir    string
+	VolumeID     string
+	MountDir     string
+	DiskDir      string
+	PodmanRoot   string
+	DataDir      string
+	WorkspaceDir string // Workspace disk directory ({MountDir}/disk/workspace)
 }
 
 // appVolumeID returns the volume ID for an app instance.
@@ -96,6 +97,7 @@ func (m *AppManager) ensureAppVolumeLayout(ctx context.Context, instanceID strin
 	diskDir := filepath.Join(handle.MountDir, "disk")
 	podmanRoot := filepath.Join(diskDir, "podman")
 	dataDir := filepath.Join(handle.MountDir, "data")
+	workspaceDir := filepath.Join(diskDir, "workspace")
 
 	if err := ensureDir(podmanRoot, 0o700); err != nil {
 		return appVolumeLayout{}, fmt.Errorf("app manager: ensure disk dataset for %s: %w", instanceID, err)
@@ -105,10 +107,11 @@ func (m *AppManager) ensureAppVolumeLayout(ctx context.Context, instanceID strin
 	}
 
 	return appVolumeLayout{
-		VolumeID:   volID,
-		MountDir:   handle.MountDir,
-		DiskDir:    diskDir,
-		PodmanRoot: podmanRoot,
-		DataDir:    dataDir,
+		VolumeID:     volID,
+		MountDir:     handle.MountDir,
+		DiskDir:      diskDir,
+		PodmanRoot:   podmanRoot,
+		DataDir:      dataDir,
+		WorkspaceDir: workspaceDir,
 	}, nil
 }

@@ -123,16 +123,10 @@ func (a *PortAllocator) AllocatePublic() (int, error) {
 
 func (a *PortAllocator) freeHost(port int) {
 	delete(a.usedHost, port)
-	if port < a.nextHostBind {
-		a.nextHostBind = port
-	}
 }
 
 func (a *PortAllocator) freePublic(port int) {
 	delete(a.usedPublic, port)
-	if port < a.nextPublic {
-		a.nextPublic = port
-	}
 }
 
 func (a *PortAllocator) Release(host, public int) {

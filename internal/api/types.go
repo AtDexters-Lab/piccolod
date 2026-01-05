@@ -220,12 +220,14 @@ type BackupTarget struct {
 
 // AppDefinition represents an app.yaml definition file
 type AppDefinition struct {
-	Name  string    `yaml:"name" json:"name"`
-	Image string    `yaml:"image,omitempty" json:"image,omitempty"`
-	Build *AppBuild `yaml:"build,omitempty" json:"build,omitempty"`
-	Type  string    `yaml:"type,omitempty" json:"type,omitempty"` // "system" or "user"
+	Name  string `yaml:"name" json:"name"`
+	Image string `yaml:"image,omitempty" json:"image,omitempty"`
+	Type  string `yaml:"type,omitempty" json:"type,omitempty"` // "system" or "user"
 	// Inputs definition for dynamic configuration
 	Inputs map[string]AppInput `yaml:"inputs,omitempty" json:"inputs,omitempty"`
+	// Compose-style multi-container apps (service mode only)
+	PrimaryService string                `yaml:"primary_service,omitempty" json:"primary_service,omitempty"`
+	Services       map[string]AppService `yaml:"services,omitempty" json:"services,omitempty"`
 	// Service-oriented listener configuration (v1)
 	Listeners   []AppListener          `yaml:"listeners,omitempty" json:"listeners,omitempty"`
 	Storage     *AppStorage            `yaml:"storage,omitempty" json:"storage,omitempty"`
@@ -233,7 +235,6 @@ type AppDefinition struct {
 	Environment map[string]string      `yaml:"environment,omitempty" json:"environment,omitempty"`
 	Resources   *AppResources          `yaml:"resources,omitempty" json:"resources,omitempty"`
 	HealthCheck *AppHealthCheck        `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
-	DependsOn   []string               `yaml:"depends_on,omitempty" json:"depends_on,omitempty"`
 	AppConfig   interface{}            `yaml:"app_config,omitempty" json:"app_config,omitempty"`
 	Extensions  map[string]interface{} `yaml:"x-piccolo,omitempty" json:"x-piccolo,omitempty"`
 }
@@ -254,14 +255,14 @@ type AppProtocolMiddleware struct {
 	Params map[string]interface{} `yaml:"params,omitempty" json:"params,omitempty"`
 }
 
-// AppBuild defines container build configuration
-type AppBuild struct {
-	Containerfile string            `yaml:"containerfile,omitempty" json:"containerfile,omitempty"` // Path or inline content
-	Context       string            `yaml:"context,omitempty" json:"context,omitempty"`
-	BuildArgs     map[string]string `yaml:"build_args,omitempty" json:"build_args,omitempty"`
-	Target        string            `yaml:"target,omitempty" json:"target,omitempty"`
-	Git           string            `yaml:"git,omitempty" json:"git,omitempty"`
-	Branch        string            `yaml:"branch,omitempty" json:"branch,omitempty"`
+// AppService defines a single container within a compose-style app (service mode).
+type AppService struct {
+	Image       string            `yaml:"image" json:"image"`
+	After       []string          `yaml:"after,omitempty" json:"after,omitempty"`
+	BindPorts   []int             `yaml:"bind_ports,omitempty" json:"bind_ports,omitempty"`
+	Environment map[string]string `yaml:"environment,omitempty" json:"environment,omitempty"`
+	Storage     *AppStorage       `yaml:"storage,omitempty" json:"storage,omitempty"`
+	Resources   *AppResources     `yaml:"resources,omitempty" json:"resources,omitempty"`
 }
 
 // AppStorage defines storage configuration
@@ -327,6 +328,7 @@ type AppVolume struct {
 	Container string `yaml:"container" json:"container"`
 	Host      string `yaml:"host,omitempty" json:"host,omitempty"` // Auto-generated if not specified
 	SizeLimit string `yaml:"size_limit,omitempty" json:"size_limit,omitempty"`
+	Shared    bool   `yaml:"shared,omitempty" json:"shared,omitempty"`
 }
 
 // App represents an installed application

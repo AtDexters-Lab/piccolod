@@ -25,11 +25,6 @@ func TestParseAppDefinition(t *testing.T) {
 			expectedImage: "alpine:latest",
 			expectedType:  "user", // default
 			expectError:   false,
-			validateFields: func(t *testing.T, app *api.AppDefinition) {
-				if app.Build != nil {
-					t.Error("Expected nil build for image-based app")
-				}
-			},
 		},
 		{
 			name:         "complete app",
@@ -123,9 +118,9 @@ func TestParseAppDefinitionErrors(t *testing.T) {
 			expectedErr: "name is required",
 		},
 		{
-			name:        "missing image and build",
+			name:        "missing image",
 			filePath:    "../../testdata/apps/invalid/missing-image-and-build.yaml",
-			expectedErr: "either image or build must be specified",
+			expectedErr: "image is required",
 		},
 	}
 
@@ -201,27 +196,18 @@ func TestValidateAppDefinition(t *testing.T) {
 			expectedErr: "name must be 50 characters or less",
 		},
 		{
-			name:        "missing image and build",
-			app:         &api.AppDefinition{Name: "test-app"},
+			name:        "missing image",
+			app:         &api.AppDefinition{Name: "test-app", Extensions: map[string]interface{}{"mode": "service"}},
 			expectError: true,
-			expectedErr: "either image or build must be specified",
-		},
-		{
-			name: "both image and build specified",
-			app: &api.AppDefinition{
-				Name:  "test-app",
-				Image: "nginx:latest",
-				Build: &api.AppBuild{Containerfile: "FROM nginx"},
-			},
-			expectError: true,
-			expectedErr: "cannot specify both image and build",
+			expectedErr: "image is required",
 		},
 		{
 			name: "invalid listener port",
 			app: &api.AppDefinition{
-				Name:      "test-app",
-				Image:     "nginx:latest",
-				Listeners: []api.AppListener{{Name: "web", GuestPort: 0}},
+				Name:       "test-app",
+				Image:      "nginx:latest",
+				Listeners:  []api.AppListener{{Name: "web", GuestPort: 0}},
+				Extensions: map[string]interface{}{"mode": "service"},
 			},
 			expectError: true,
 			expectedErr: "guest_port must be between 1 and 65535",
@@ -248,6 +234,48 @@ func TestValidateAppDefinition(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestParseAppDefinition_RejectsBuild(t *testing.T) {
+	manifest := `
+name: demo
+build:
+  containerfile: |
+    FROM alpine:latest
+listeners:
+  - name: web
+    guest_port: 8080
+x-piccolo:
+  mode: service
+`
+	_, err := ParseAppDefinition([]byte(manifest))
+	if err == nil {
+		t.Fatalf("expected error but got none")
+	}
+	if !containsString(err.Error(), "build is not supported") {
+		t.Fatalf("expected build rejection, got %q", err.Error())
+	}
+}
+
+func TestParseAppDefinition_RejectsDependsOn(t *testing.T) {
+	manifest := `
+name: demo
+image: alpine:latest
+listeners:
+  - name: web
+    guest_port: 8080
+depends_on:
+  - other
+x-piccolo:
+  mode: service
+`
+	_, err := ParseAppDefinition([]byte(manifest))
+	if err == nil {
+		t.Fatalf("expected error but got none")
+	}
+	if !containsString(err.Error(), "depends_on") {
+		t.Fatalf("expected depends_on rejection, got %q", err.Error())
 	}
 }
 
@@ -371,7 +399,7 @@ storage:
   persistent:
     data:
       container: /data
-      host: /var/lib/piccolod/not-allowed
+      host: /not/allowed
 x-piccolo:
   mode: service
 `

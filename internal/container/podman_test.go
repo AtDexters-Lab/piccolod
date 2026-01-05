@@ -18,7 +18,9 @@ func TestValidateContainerName(t *testing.T) {
 		{"valid simple name", "nginx", false},
 		{"valid name with hyphen", "my-app", false},
 		{"valid registry image", "docker.io/nginx:latest", false},
+		{"valid digest reference", "docker.io/library/ubuntu@sha256:45b23dee08af5e43a7fea6c4cf9c25ccf269ee113168c19722f87876677c5cb2", false},
 		{"valid with underscore", "my_app", false},
+		{"valid trailing underscore", "demo__netns__", false},
 		{"empty name", "", true},
 		{"too long", string(make([]byte, 256)), true},
 		{"invalid chars", "app!@#", true},
@@ -243,12 +245,12 @@ func TestValidateContainerSpec(t *testing.T) {
 	}
 }
 
-func TestBuildRunArgsDoesNotIncludeReplaceForNamedContainers(t *testing.T) {
+func TestBuildCreateArgsDoesNotIncludeReplaceForNamedContainers(t *testing.T) {
 	spec := ContainerCreateSpec{
 		Name:  "nginxdemo",
 		Image: "docker.io/library/nginx:alpine",
 	}
-	args := buildRunArgs(spec)
+	args := buildCreateArgs(spec)
 	for _, arg := range args {
 		if arg == "--replace" {
 			t.Fatalf("did not expect --replace flag in args, got %v", args)

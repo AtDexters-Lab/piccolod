@@ -3,12 +3,17 @@ package container
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ContainerNotFoundError indicates Podman could not find a container by the given reference.
@@ -33,7 +38,6 @@ var ErrDynamicPortUpdateNotSupported = errors.New("podman does not support dynam
 // ErrPortReconciliationRequired indicates that the container's published ports
 // do not match the expected ports and the container needs to be recreated.
 var ErrPortReconciliationRequired = errors.New("container port bindings do not match expected; recreation required")
-
 
 // PodmanCLI provides safe Podman CLI integration with injection prevention
 type PodmanCLI struct{}
@@ -60,10 +64,16 @@ type ContainerState struct {
 	Running bool
 }
 
+// ContainerListItem captures minimal container identity information from `podman ps`.
+type ContainerListItem struct {
+	ID   string
+	Name string
+}
+
 // Validation patterns for different argument types
 var (
-	// Container/image names: lowercase letters, numbers, hyphens, slashes, colons
-	namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/-]*[a-z0-9]$|^[a-z0-9]$`)
+	// Container/image names: lowercase letters, numbers, hyphens, slashes, colons, and @ (for digests)
+	namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:@/-]*[a-z0-9_]$|^[a-z0-9]$`)
 
 	// Volume paths: absolute paths only, no special chars
 	pathPattern = regexp.MustCompile(`^/[a-zA-Z0-9._/-]*$`)
@@ -73,6 +83,9 @@ var (
 
 	// Environment variable keys
 	envKeyPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+	// Label keys: allow dotted namespaces (e.g. io.piccolo.instance) with conservative characters.
+	labelKeyPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
 )
 
 var portInUseRe = regexp.MustCompile(`:(\d+): bind: address already in use`)
@@ -180,6 +193,29 @@ func ValidateEnvValue(value string) error {
 	return nil
 }
 
+// ValidateLabelKey validates container label keys.
+func ValidateLabelKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("label key cannot be empty")
+	}
+	if len(key) > 255 {
+		return fmt.Errorf("label key too long (max 255 chars)")
+	}
+	if strings.ContainsAny(key, "=\n\r\t") {
+		return fmt.Errorf("label key contains invalid characters")
+	}
+	if !labelKeyPattern.MatchString(key) {
+		return fmt.Errorf("invalid label key format: %s", key)
+	}
+	return nil
+}
+
+// ValidateLabelValue validates container label values.
+func ValidateLabelValue(value string) error {
+	// Reuse env value constraints (printable, no control chars, reasonable length).
+	return ValidateEnvValue(value)
+}
+
 // ContainerCreateSpec defines validated parameters for container creation
 type ContainerCreateSpec struct {
 	Name          string
@@ -188,9 +224,29 @@ type ContainerCreateSpec struct {
 	Volumes       []VolumeMapping
 	Tmpfs         []TmpfsMount
 	Environment   map[string]string
+	Labels        map[string]string
 	Resources     ResourceLimits
 	NetworkMode   string
 	RestartPolicy string
+
+	// Workspace mode fields
+	UseInit    bool     // If true, adds --init flag for PID 1 safety
+	Entrypoint []string // Custom entrypoint (overrides image default)
+	Command    []string // Command arguments appended after image
+
+	// Rootfs mode: when set, uses --rootfs instead of Image.
+	// This is used for workspace disk mode where the rootfs is a pre-mounted overlay.
+	// When Rootfs is set, Image is ignored and the container runs directly from the
+	// specified rootfs path. The caller must ensure the rootfs is properly mounted.
+	Rootfs string
+
+	// WorkingDir sets the working directory inside the container.
+	// Used with --rootfs mode to apply image config since Podman doesn't do it automatically.
+	WorkingDir string
+
+	// User sets the user/group to run the container as (format: "uid:gid" or "user:group").
+	// Used with --rootfs mode to apply image config since Podman doesn't do it automatically.
+	User string
 }
 
 type PortMapping struct {
@@ -214,11 +270,27 @@ type ResourceLimits struct {
 	CPU    string
 }
 
-func buildRunArgs(spec ContainerCreateSpec) []string {
-	args := []string{"run", "-d"}
+func buildCreateArgs(spec ContainerCreateSpec) []string {
+	args := []string{"create"}
+
+	// PID 1 init process for proper signal handling and zombie reaping
+	if spec.UseInit {
+		args = append(args, "--init")
+	}
 
 	if spec.Name != "" {
 		args = append(args, "--name", spec.Name)
+	}
+
+	if len(spec.Labels) > 0 {
+		keys := make([]string, 0, len(spec.Labels))
+		for k := range spec.Labels {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			args = append(args, "--label", fmt.Sprintf("%s=%s", k, spec.Labels[k]))
+		}
 	}
 
 	for _, port := range spec.Ports {
@@ -261,9 +333,37 @@ func buildRunArgs(spec ContainerCreateSpec) []string {
 		args = append(args, "--restart", spec.RestartPolicy)
 	}
 
-	if spec.Image != "" {
+	// Custom entrypoint (for workspace mode boot.sh wrapper)
+	if len(spec.Entrypoint) > 0 {
+		args = append(args, "--entrypoint", spec.Entrypoint[0])
+	}
+
+	// Working directory (used with --rootfs to apply image config)
+	if spec.WorkingDir != "" {
+		args = append(args, "--workdir", spec.WorkingDir)
+	}
+
+	// User (used with --rootfs to apply image config)
+	if spec.User != "" {
+		args = append(args, "--user", spec.User)
+	}
+
+	// Rootfs mode: use --rootfs instead of image reference.
+	// When using --rootfs, Podman runs the container directly from the specified
+	// filesystem path without pulling or resolving an image. This is used for
+	// workspace disk mode where we mount an overlay filesystem combining the base
+	// image with a persistent writable layer.
+	if spec.Rootfs != "" {
+		args = append(args, "--rootfs", spec.Rootfs)
+	} else if spec.Image != "" {
 		args = append(args, spec.Image)
 	}
+
+	// Append remaining entrypoint args and command after image/rootfs
+	if len(spec.Entrypoint) > 1 {
+		args = append(args, spec.Entrypoint[1:]...)
+	}
+	args = append(args, spec.Command...)
 
 	return args
 }
@@ -320,8 +420,8 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 	// All inputs must be validated before calling this method
 
 	// Execute command using exec.CommandContext (no shell interpretation)
-	runArgs := buildRunArgs(spec)
-	args, err := buildPodmanArgs(runtime, runArgs)
+	createArgs := buildCreateArgs(spec)
+	args, err := buildPodmanArgs(runtime, createArgs)
 	if err != nil {
 		return "", err
 	}
@@ -337,7 +437,7 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 					port = parsed
 				}
 			}
-			return "", &PortInUseError{Port: port, Output: outStr, Err: fmt.Errorf("podman run failed: %w", err)}
+			return "", &PortInUseError{Port: port, Output: outStr, Err: fmt.Errorf("podman create failed: %w", err)}
 		}
 		if strings.Contains(outStr, "name is already in use") || strings.Contains(outStr, "already in use by") {
 			// Try to extract the ID
@@ -349,7 +449,7 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 				return "", &NameInUseError{Name: spec.Name, ID: match[1]}
 			}
 		}
-		return "", fmt.Errorf("podman run failed: %w, output: %s", err, outStr)
+		return "", fmt.Errorf("podman create failed: %w, output: %s", err, outStr)
 	}
 
 	// Extract container ID from output - look for the actual hex container ID
@@ -420,30 +520,6 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 
 	if err != nil {
 		return fmt.Errorf("podman rm failed: %w, output: %s", err, string(output))
-	}
-
-	return nil
-}
-
-// CommitContainer commits a container's current state to a new image.
-// This preserves all filesystem changes made inside the container.
-func (p *PodmanCLI) CommitContainer(ctx context.Context, runtime PodmanRuntime, containerID, imageName string) error {
-	if !isValidContainerID(containerID) {
-		return fmt.Errorf("invalid container ID format: %s", containerID)
-	}
-	if err := ValidateContainerName(imageName); err != nil {
-		return fmt.Errorf("invalid image name: %w", err)
-	}
-
-	args, err := buildPodmanArgs(runtime, []string{"commit", containerID, imageName})
-	if err != nil {
-		return err
-	}
-	cmd := exec.CommandContext(ctx, "podman", args...)
-	output, err := cmd.CombinedOutput()
-
-	if err != nil {
-		return fmt.Errorf("podman commit failed: %w, output: %s", err, string(output))
 	}
 
 	return nil
@@ -538,6 +614,92 @@ func (p *PodmanCLI) Logs(ctx context.Context, runtime PodmanRuntime, containerID
 	return linesOut, nil
 }
 
+type streamReadCloser struct {
+	r    *io.PipeReader
+	once sync.Once
+	stop func() error
+}
+
+func (s *streamReadCloser) Read(p []byte) (int, error) { return s.r.Read(p) }
+
+func (s *streamReadCloser) Close() error {
+	var err error
+	s.once.Do(func() {
+		if s.stop != nil {
+			err = s.stop()
+		}
+		_ = s.r.Close()
+	})
+	return err
+}
+
+func (p *PodmanCLI) LogsStream(ctx context.Context, runtime PodmanRuntime, containerID string, lines int, timestamps bool) (io.ReadCloser, error) {
+	if !isValidContainerID(containerID) {
+		return nil, fmt.Errorf("invalid container ID format: %s", containerID)
+	}
+	if lines <= 0 {
+		lines = 200
+	}
+	args := []string{"logs", "--follow", "--tail", fmt.Sprintf("%d", lines)}
+	if timestamps {
+		args = append(args, "--timestamps")
+	}
+	args = append(args, containerID)
+	cmdArgs, err := buildPodmanArgs(runtime, args)
+	if err != nil {
+		return nil, err
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(runCtx, "podman", cmdArgs...)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("podman logs stream stdout: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("podman logs stream stderr: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("podman logs stream start failed: %w", err)
+	}
+
+	pr, pw := io.Pipe()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(pw, stdout)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(pw, stderr)
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		wg.Wait()
+		_ = pw.Close()
+		done <- err
+		close(done)
+	}()
+
+	stop := func() error {
+		cancel()
+		err, ok := <-done
+		if ok && err != nil {
+			return err
+		}
+		return nil
+	}
+	return &streamReadCloser{r: pr, stop: stop}, nil
+}
+
 func (p *PodmanCLI) containerExists(ctx context.Context, runtime PodmanRuntime, containerRef string) (bool, error) {
 	args, err := buildPodmanArgs(runtime, []string{"container", "exists", containerRef})
 	if err != nil {
@@ -596,6 +758,61 @@ func (p *PodmanCLI) ResolveContainerIDByName(ctx context.Context, runtime Podman
 		return "", fmt.Errorf("podman inspect returned invalid container id for %s: %q", name, id)
 	}
 	return id, nil
+}
+
+// ListContainersByLabel returns all containers (running or stopped) matching a single label selector.
+// This is used for best-effort cleanup of orphaned containers created by Piccolo.
+func (p *PodmanCLI) ListContainersByLabel(ctx context.Context, runtime PodmanRuntime, labelKey, labelValue string) ([]ContainerListItem, error) {
+	if err := ValidateLabelKey(labelKey); err != nil {
+		return nil, fmt.Errorf("invalid label key: %w", err)
+	}
+	if err := ValidateLabelValue(labelValue); err != nil {
+		return nil, fmt.Errorf("invalid label value: %w", err)
+	}
+
+	filter := fmt.Sprintf("label=%s=%s", labelKey, labelValue)
+	args, err := buildPodmanArgs(runtime, []string{
+		"ps", "-a",
+		"--filter", filter,
+		"--format", "{{.ID}}\t{{.Names}}",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("podman ps failed: %w, output: %s", err, string(out))
+	}
+
+	lines := strings.Split(string(out), "\n")
+	items := make([]ContainerListItem, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		id := strings.TrimSpace(parts[0])
+		name := strings.TrimSpace(parts[1])
+		if id == "" || name == "" {
+			continue
+		}
+		if !isValidContainerID(id) {
+			continue
+		}
+		// Podman may print multiple names; keep the first.
+		if idx := strings.Index(name, ","); idx >= 0 {
+			name = strings.TrimSpace(name[:idx])
+		}
+		items = append(items, ContainerListItem{ID: id, Name: name})
+	}
+
+	return items, nil
 }
 
 // InspectContainerState returns whether the container exists, and if so whether it is running.
@@ -738,9 +955,19 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 		return fmt.Errorf("invalid container name: %w", err)
 	}
 
-	// Validate image
-	if err := ValidateContainerName(spec.Image); err != nil {
-		return fmt.Errorf("invalid image name: %w", err)
+	// Validate image or rootfs (one must be set)
+	if spec.Rootfs != "" {
+		// Rootfs mode: validate the path
+		if err := ValidatePath(spec.Rootfs); err != nil {
+			return fmt.Errorf("invalid rootfs path: %w", err)
+		}
+	} else if spec.Image != "" {
+		// Image mode: validate the image name
+		if err := ValidateContainerName(spec.Image); err != nil {
+			return fmt.Errorf("invalid image name: %w", err)
+		}
+	} else {
+		return fmt.Errorf("either image or rootfs must be specified")
 	}
 
 	// Validate ports
@@ -779,6 +1006,16 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 		}
 	}
 
+	// Validate labels
+	for key, value := range spec.Labels {
+		if err := ValidateLabelKey(key); err != nil {
+			return fmt.Errorf("invalid label key '%s': %w", key, err)
+		}
+		if err := ValidateLabelValue(value); err != nil {
+			return fmt.Errorf("invalid label value for key '%s': %w", key, err)
+		}
+	}
+
 	// Validate resources
 	if spec.Resources.Memory != "" {
 		if err := ValidateResource(spec.Resources.Memory); err != nil {
@@ -792,4 +1029,144 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 	}
 
 	return nil
+}
+
+// ImageConfig holds OCI image configuration fields.
+// These are extracted from the base image and used when running containers in --rootfs mode,
+// since Podman does not apply image config automatically in that mode.
+type ImageConfig struct {
+	Entrypoint  []string
+	Cmd         []string
+	Env         []string // OCI-style KEY=VALUE entries
+	WorkingDir  string
+	User        string
+	Digest      string   // Canonical digest (e.g., "sha256:abc123...")
+	RepoDigests []string // List of canonical references (e.g., "docker.io/library/ubuntu@sha256:...")
+}
+
+// InspectImage retrieves the configuration of a container image.
+// This extracts entrypoint, cmd, env, working directory, user, and digest from the image config.
+// When using --rootfs mode, these must be explicitly applied since Podman doesn't do it automatically.
+// The digest is the canonical image digest (sha256:...) which should be used for persistence
+// to ensure the same base image is used across reinstalls and failovers.
+func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, imageName string) (*ImageConfig, error) {
+	if err := ValidateContainerName(imageName); err != nil {
+		return nil, fmt.Errorf("invalid image name: %w", err)
+	}
+
+	// Use podman image inspect to get the full image configuration including digest
+	args, err := buildPodmanArgs(runtime, []string{
+		"image", "inspect",
+		"--format", `{"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"env":{{json .Config.Env}},"workingDir":{{json .Config.WorkingDir}},"user":{{json .Config.User}},"digest":{{json .Digest}},"repoDigests":{{json .RepoDigests}}}`,
+		imageName,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("podman image inspect failed: %w, output: %s", err, string(output))
+	}
+
+	// Parse the JSON output
+	var result struct {
+		Entrypoint  []string `json:"entrypoint"`
+		Cmd         []string `json:"cmd"`
+		Env         []string `json:"env"`
+		WorkingDir  string   `json:"workingDir"`
+		User        string   `json:"user"`
+		Digest      string   `json:"digest"`
+		RepoDigests []string `json:"repoDigests"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse image config: %w, output: %s", err, string(output))
+	}
+
+	return &ImageConfig{
+		Entrypoint:  result.Entrypoint,
+		Cmd:         result.Cmd,
+		Env:         result.Env,
+		WorkingDir:  result.WorkingDir,
+		User:        result.User,
+		Digest:      result.Digest,
+		RepoDigests: result.RepoDigests,
+	}, nil
+}
+
+// ImageSearchResult represents a single search result from a container registry.
+type ImageSearchResult struct {
+	Index       string `json:"Index"`
+	Name        string `json:"Name"`
+	Description string `json:"Description"`
+	Stars       int    `json:"Stars"`
+	Official    string `json:"Official"`
+}
+
+// ExecShellCmd returns an exec.Cmd configured for running an interactive shell
+// inside a container. The caller is responsible for starting the command,
+// typically with pty.Start() for terminal access.
+func (p *PodmanCLI) ExecShellCmd(runtime PodmanRuntime, containerID string) (*exec.Cmd, error) {
+	if !isValidContainerID(containerID) {
+		return nil, fmt.Errorf("invalid container ID format: %s", containerID)
+	}
+
+	// Shell wrapper that prefers bash (for readline/completion) but falls back to sh.
+	// Uses login shell (-l) to load full shell initialization (.bash_profile, .bashrc).
+	shellCmd := `if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh; fi`
+
+	// Build podman exec args with proper environment propagation
+	args, err := buildPodmanArgs(runtime, []string{
+		"exec",
+		"-i", "-t", // Interactive + TTY
+		"-e", "TERM=xterm-256color", // Pass TERM into the container
+		containerID,
+		"/bin/sh", "-c", shellCmd,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.Command("podman", args...)
+	// Preserve existing environment (XDG_RUNTIME_DIR, PATH, etc. needed for rootless podman)
+	cmd.Env = os.Environ()
+	return cmd, nil
+}
+
+// SearchRegistry searches for images in container registries using podman search.
+// The query is passed directly to podman search. Results are limited by the limit parameter.
+func (p *PodmanCLI) SearchRegistry(ctx context.Context, runtime PodmanRuntime, query string, limit int) ([]ImageSearchResult, error) {
+	if query == "" {
+		return nil, fmt.Errorf("search query cannot be empty")
+	}
+	if limit <= 0 {
+		limit = 25
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	args, err := buildPodmanArgs(runtime, []string{
+		"search",
+		"--format", "json",
+		"--limit", fmt.Sprintf("%d", limit),
+		fmt.Sprintf("docker.io/%s", query),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("podman search failed: %w, output: %s", err, string(output))
+	}
+
+	var results []ImageSearchResult
+	if err := json.Unmarshal(output, &results); err != nil {
+		return nil, fmt.Errorf("failed to parse search results: %w, output: %s", err, string(output))
+	}
+
+	return results, nil
 }

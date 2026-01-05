@@ -262,9 +262,10 @@ func (p *ProxyManager) securityHeaders(next http.Handler) http.Handler {
 		csp := p.cspFrameAncestors
 		p.mu.Unlock()
 
-		host, _ := splitHostPortValue(r.Host)
-		ip := net.ParseIP(host)
+		remoteIp, _ := splitHostPortValue(r.RemoteAddr)
+		ip := net.ParseIP(remoteIp)
 		if ip != nil && (ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate()) {
+			host, _ := splitHostPortValue(r.Host)
 			host = host + ":*"
 			csp += " https://" + host + " http://" + host
 		}

@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -418,13 +420,13 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	if !ok {
 		t.Fatalf("response data not object: %#v", resp.Data)
 	}
-	rawServices, ok := data["services"].([]interface{})
-	if !ok || len(rawServices) == 0 {
-		t.Fatalf("expected services list in response: %#v", data)
+	rawListeners, ok := data["listeners"].([]interface{})
+	if !ok || len(rawListeners) == 0 {
+		t.Fatalf("expected listeners list in response: %#v", data)
 	}
-	first, ok := rawServices[0].(map[string]interface{})
+	first, ok := rawListeners[0].(map[string]interface{})
 	if !ok {
-		t.Fatalf("service entry not object: %#v", rawServices[0])
+		t.Fatalf("listener entry not object: %#v", rawListeners[0])
 	}
 
 	remoteHost, ok := first["remote_host"].(string)
@@ -433,6 +435,11 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	}
 	if remoteHost != "web.example.com" {
 		t.Fatalf("unexpected remote_host %q", remoteHost)
+	}
+
+	rawContainers, ok := data["containers"].([]interface{})
+	if !ok || len(rawContainers) == 0 {
+		t.Fatalf("expected containers list in response: %#v", data)
 	}
 }
 
@@ -1265,6 +1272,21 @@ func (m *GinMockContainerManager) RemoveContainer(ctx context.Context, runtime c
 	return container.ErrContainerNotFound(containerID)
 }
 
+func (m *GinMockContainerManager) ListContainersByLabel(ctx context.Context, runtime container.PodmanRuntime, labelKey, labelValue string) ([]container.ContainerListItem, error) {
+	_ = ctx
+	_ = runtime
+	out := []container.ContainerListItem{}
+	for id, c := range m.containers {
+		if c == nil || c.Spec.Labels == nil {
+			continue
+		}
+		if c.Spec.Labels[labelKey] == labelValue {
+			out = append(out, container.ContainerListItem{ID: id, Name: c.Name})
+		}
+	}
+	return out, nil
+}
+
 func (m *GinMockContainerManager) PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error {
 	_ = runtime
 	_ = image
@@ -1325,6 +1347,23 @@ func (m *GinMockContainerManager) Logs(ctx context.Context, runtime container.Po
 		out = append(out, "demo log entry")
 	}
 	return out, nil
+}
+
+func (m *GinMockContainerManager) LogsStream(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int, timestamps bool) (io.ReadCloser, error) {
+	_ = ctx
+	_ = runtime
+	_ = timestamps
+	if _, ok := m.containers[containerID]; !ok {
+		return nil, container.ErrContainerNotFound(containerID)
+	}
+	if lines <= 0 {
+		lines = 2
+	}
+	var b strings.Builder
+	for i := 0; i < lines; i++ {
+		b.WriteString("demo log entry\n")
+	}
+	return io.NopCloser(strings.NewReader(b.String())), nil
 }
 
 func (m *GinMockContainerManager) ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error) {
@@ -1391,6 +1430,35 @@ func (m *GinMockContainerManager) UpdatePublishRemove(ctx context.Context, runti
 	return nil
 }
 
+func (m *GinMockContainerManager) InspectImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) (*container.ImageConfig, error) {
+	_ = ctx
+	_ = runtime
+	_ = imageName
+	// Mock: return a typical image config with shell defaults
+	return &container.ImageConfig{
+		Entrypoint:  nil,
+		Cmd:         []string{"/bin/sh"},
+		Digest:      "sha256:mockdigest",
+		RepoDigests: []string{imageName + "@sha256:mockdigest"},
+	}, nil
+}
+
+func (m *GinMockContainerManager) SearchRegistry(ctx context.Context, runtime container.PodmanRuntime, query string, limit int) ([]container.ImageSearchResult, error) {
+	_ = ctx
+	_ = runtime
+	_ = limit
+	// Mock: return some example results based on query
+	return []container.ImageSearchResult{
+		{Index: "docker.io", Name: "library/" + query, Description: "Mock image", Stars: 100, Official: "[OK]"},
+	}, nil
+}
+
+func (m *GinMockContainerManager) ExecShellCmd(runtime container.PodmanRuntime, containerID string) (*exec.Cmd, error) {
+	_ = runtime
+	// Mock: return a simple echo command for testing purposes
+	return exec.Command("echo", "mock shell"), nil
+}
+
 func TestServicesLocalURLGeneration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tempDir := t.TempDir()
@@ -1433,12 +1501,15 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	var resp GinAppResponse
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	data := resp.Data.(map[string]interface{})
-	svcs := data["services"].([]interface{})
-	svc := svcs[0].(map[string]interface{})
+	lis := data["listeners"].([]interface{})
+	li := lis[0].(map[string]interface{})
 
 	expected := fmt.Sprintf("http://piccolo.local:%d", ep.PublicPort)
-	if got := svc["local_url"].(string); got != expected {
+	if got := li["local_url"].(string); got != expected {
 		t.Errorf("Host=piccolo.local: expected %q, got %q", expected, got)
+	}
+	if containers, ok := data["containers"].([]interface{}); !ok || len(containers) == 0 {
+		t.Fatalf("expected containers list in response: %#v", data)
 	}
 
 	// 2. Request with IP host
@@ -1452,8 +1523,11 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	expected = fmt.Sprintf("http://192.168.1.50:%d", ep.PublicPort)
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	data = resp.Data.(map[string]interface{})
-	svc = data["services"].([]interface{})[0].(map[string]interface{})
-	if got := svc["local_url"].(string); got != expected {
+	li = data["listeners"].([]interface{})[0].(map[string]interface{})
+	if got := li["local_url"].(string); got != expected {
 		t.Errorf("Host=192.168.1.50:8080: expected %q, got %q", expected, got)
+	}
+	if containers, ok := data["containers"].([]interface{}); !ok || len(containers) == 0 {
+		t.Fatalf("expected containers list in response: %#v", data)
 	}
 }

@@ -2,6 +2,9 @@ package app
 
 import (
 	"context"
+	"io"
+	"os/exec"
+	"strings"
 
 	"piccolod/internal/container"
 )
@@ -75,6 +78,21 @@ func (m *MockContainerManager) RemoveContainer(ctx context.Context, runtime cont
 	return container.ErrContainerNotFound(containerID)
 }
 
+func (m *MockContainerManager) ListContainersByLabel(ctx context.Context, runtime container.PodmanRuntime, labelKey, labelValue string) ([]container.ContainerListItem, error) {
+	_ = ctx
+	_ = runtime
+	out := []container.ContainerListItem{}
+	for id, c := range m.containers {
+		if c == nil || c.Spec.Labels == nil {
+			continue
+		}
+		if c.Spec.Labels[labelKey] == labelValue {
+			out = append(out, container.ContainerListItem{ID: id, Name: c.Spec.Name})
+		}
+	}
+	return out, nil
+}
+
 func (m *MockContainerManager) PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error {
 	_ = runtime
 	_ = image
@@ -94,6 +112,23 @@ func (m *MockContainerManager) Logs(ctx context.Context, runtime container.Podma
 		out[i] = "log line"
 	}
 	return out, nil
+}
+
+func (m *MockContainerManager) LogsStream(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int, timestamps bool) (io.ReadCloser, error) {
+	_ = ctx
+	_ = runtime
+	_ = timestamps
+	if _, ok := m.containers[containerID]; !ok {
+		return nil, container.ErrContainerNotFound(containerID)
+	}
+	if lines <= 0 {
+		lines = 3
+	}
+	var b strings.Builder
+	for i := 0; i < lines; i++ {
+		b.WriteString("log line\n")
+	}
+	return io.NopCloser(strings.NewReader(b.String())), nil
 }
 
 func (m *MockContainerManager) ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error) {
@@ -190,6 +225,36 @@ func (m *MockContainerManager) RemoveImage(ctx context.Context, runtime containe
 	_ = imageName
 	// Mock: just succeed
 	return nil
+}
+
+func (m *MockContainerManager) InspectImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) (*container.ImageConfig, error) {
+	_ = ctx
+	_ = runtime
+	_ = imageName
+	// Mock: return a typical image config with shell defaults
+	return &container.ImageConfig{
+		Entrypoint:  nil,
+		Cmd:         []string{"/bin/sh"},
+		Digest:      "sha256:mockdigest",
+		RepoDigests: []string{"docker.io/library/mock-image@sha256:mockdigest"},
+	}, nil
+}
+
+func (m *MockContainerManager) SearchRegistry(ctx context.Context, runtime container.PodmanRuntime, query string, limit int) ([]container.ImageSearchResult, error) {
+	_ = ctx
+	_ = runtime
+	_ = limit
+	// Mock: return some example results based on query
+	return []container.ImageSearchResult{
+		{Index: "docker.io", Name: "library/" + query, Description: "Mock image", Stars: 100, Official: "[OK]"},
+	}, nil
+}
+
+func (m *MockContainerManager) ExecShellCmd(runtime container.PodmanRuntime, containerID string) (*exec.Cmd, error) {
+	_ = runtime
+	// Mock: return a simple echo command for testing purposes
+	// In production this would exec into the container
+	return exec.Command("echo", "mock shell"), nil
 }
 
 func generateMockContainerID(id int) string {

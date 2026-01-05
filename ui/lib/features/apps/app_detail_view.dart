@@ -1,10 +1,16 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../../theme/piccolo_theme.dart';
 import '../../core/models/app_models.dart';
 import '../../core/services/app_service.dart';
+import '../../core/utils/task_id.dart';
+import '../../shared/widgets/log_stream_viewer.dart';
+import '../../shared/widgets/task_progress_panel.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'app_launcher.dart';
 import 'widgets/edit_listeners_dialog.dart';
+import 'workspace_terminal.dart';
 
 class AppDetailView extends StatefulWidget {
   final String appId;
@@ -27,7 +33,9 @@ class _AppDetailViewState extends State<AppDetailView>
   late TabController _tabController;
 
   App? _app;
-  List<ServiceEndpoint> _services = [];
+  List<ServiceEndpoint> _listeners = [];
+  List<AppContainerStatus> _containers = [];
+  String? _selectedService;
   bool _isLoading = true;
   String? _error;
 
@@ -37,7 +45,7 @@ class _AppDetailViewState extends State<AppDetailView>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this);
     _loadData();
   }
 
@@ -54,14 +62,18 @@ class _AppDetailViewState extends State<AppDetailView>
     });
 
     try {
-      final app = await widget.appService.getAppDetail(widget.appId);
-      final services = await widget.appService.getAppServices(widget.appId);
+      final detail = await widget.appService.getAppDetail(widget.appId);
 
       if (!mounted) return;
 
       setState(() {
-        _app = app;
-        _services = services;
+        _app = detail.app;
+        _listeners = detail.listeners;
+        _containers = detail.containers;
+        _selectedService = _pickSelectedService(
+          _selectedService,
+          detail.containers,
+        );
         _isLoading = false;
       });
     } catch (e) {
@@ -73,23 +85,61 @@ class _AppDetailViewState extends State<AppDetailView>
     }
   }
 
-  Future<void> _handleAction(Future<void> Function() action) async {
+  Future<bool> _handleActionWithProgress({
+    required String taskType,
+    required Future<void> Function(String taskId) action,
+    bool refreshOnSuccess = true,
+  }) async {
+    if (!mounted) return false;
+
+    final taskId = generateTaskId();
+    final progressDone = Completer<void>();
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: Text(taskType),
+        content: SizedBox(
+          width: 520,
+          child: TaskProgressPanel(
+            taskId: taskId,
+            taskType: taskType,
+            onComplete: () {
+              if (!progressDone.isCompleted) progressDone.complete();
+            },
+          ),
+        ),
+      ),
+    );
+
     setState(() => _isActionLoading = true);
+    Object? actionError;
     try {
-      await action();
-      // Delay slightly to allow backend state to propagate/Podman to react
-      await Future.delayed(const Duration(seconds: 1));
-      if (!mounted) return;
-      await _loadData(); // Refresh UI
+      await action(taskId);
+      await progressDone.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {},
+      );
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text("Action failed: $e")));
-      }
+      actionError = e;
     } finally {
       if (mounted) setState(() => _isActionLoading = false);
+      if (mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
     }
+
+    if (actionError != null && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text("Action failed: $actionError")));
+      return false;
+    }
+
+    if (!refreshOnSuccess || !mounted) return true;
+    await _loadData();
+    return true;
   }
 
   void _confirmUninstall() {
@@ -146,30 +196,22 @@ class _AppDetailViewState extends State<AppDetailView>
                 onPressed: () async {
                   Navigator.of(dialogContext).pop(); // Close dialog
 
-                  // Use outer setState to trigger main view rebuild
-                  setState(() => _isActionLoading = true);
-                  final messenger = ScaffoldMessenger.of(context);
-
-                  try {
-                    await widget.appService.uninstallApp(
+                  final ok = await _handleActionWithProgress(
+                    taskType: 'uninstall_app',
+                    refreshOnSuccess: false,
+                    action: (taskId) => widget.appService.uninstallApp(
                       widget.appId,
                       purge: purgeData,
-                    );
-
-                    if (mounted) {
-                      setState(() {
-                        _app = null; // Forces "App uninstalled" state
-                        _isActionLoading = false;
-                      });
-                    }
-                  } catch (e) {
-                    if (mounted) {
-                      setState(() => _isActionLoading = false);
-                      messenger.showSnackBar(
-                        SnackBar(content: Text("Uninstall failed: $e")),
-                      );
-                    }
-                  }
+                      taskId: taskId,
+                    ),
+                  );
+                  if (!ok || !mounted) return;
+                  setState(() {
+                    _app = null;
+                    _listeners = [];
+                    _containers = [];
+                    _selectedService = null;
+                  });
                 },
                 child: const Text("Uninstall"),
               ),
@@ -184,7 +226,7 @@ class _AppDetailViewState extends State<AppDetailView>
     if (_app == null) return;
 
     // Convert current services to AppListener list
-    final initialListeners = _services
+    final initialListeners = _listeners
         .map((s) => AppListener.fromServiceEndpoint(s))
         .toList();
 
@@ -193,13 +235,31 @@ class _AppDetailViewState extends State<AppDetailView>
       builder: (context) => EditListenersDialog(
         initialListeners: initialListeners,
         onSave: (newListeners) async {
-          await _handleAction(() async {
-            await widget.appService.updateAppListeners(
+          await _handleActionWithProgress(
+            taskType: 'update_listeners',
+            action: (taskId) => widget.appService.updateAppListeners(
               _app!.name,
               newListeners,
-            );
-          });
+              taskId: taskId,
+            ),
+          );
         },
+      ),
+    );
+  }
+
+  void _openTerminal() {
+    if (_app == null) return;
+
+    final windowId = "terminal-${_app!.name}";
+    widget.desktopController.openApp(
+      windowId,
+      "${_app!.displayTitle} Terminal",
+      Icons.terminal,
+      WorkspaceTerminal(
+        appId: _app!.name,
+        serviceName: _selectedService,
+        onSessionEnd: () => widget.desktopController.closeWindow(windowId),
       ),
     );
   }
@@ -230,6 +290,7 @@ class _AppDetailViewState extends State<AppDetailView>
             Tab(text: "Overview"),
             Tab(text: "Network"),
             Tab(text: "Configuration"),
+            Tab(text: "Logs"),
           ],
         ),
 
@@ -243,6 +304,7 @@ class _AppDetailViewState extends State<AppDetailView>
                 _buildOverviewTab(),
                 _buildNetworkTab(),
                 _buildConfigTab(),
+                _buildLogsTab(),
               ],
             ),
           ),
@@ -359,26 +421,50 @@ class _AppDetailViewState extends State<AppDetailView>
           // Actions
           if (_isActionLoading)
             const CircularProgressIndicator()
-          else if (_app!.isRunning)
-            FilledButton.icon(
-              onPressed: () =>
-                  _handleAction(() => widget.appService.stopApp(_app!.name)),
-              icon: const Icon(Icons.stop),
-              label: const Text("Stop"),
-              style: FilledButton.styleFrom(
-                backgroundColor: PiccoloTheme.inkMuted,
+          else ...[
+            if (_containers.length > 1) ...[
+              _buildServiceSelector(),
+              const SizedBox(width: 12),
+            ],
+            if (_app!.isRunning) ...[
+              FilledButton.icon(
+                onPressed: _openTerminal,
+                icon: const Icon(Icons.terminal),
+                label: const Text("Terminal"),
+                style: FilledButton.styleFrom(
+                  backgroundColor: PiccoloTheme.cobalt600,
+                ),
               ),
-            )
-          else
-            FilledButton.icon(
-              onPressed: () =>
-                  _handleAction(() => widget.appService.startApp(_app!.name)),
-              icon: const Icon(Icons.play_arrow),
-              label: const Text("Start"),
-              style: FilledButton.styleFrom(
-                backgroundColor: PiccoloTheme.success,
+              const SizedBox(width: 12),
+            ],
+            // Start/Stop button
+            if (_app!.isRunning)
+              FilledButton.icon(
+                onPressed: () => _handleActionWithProgress(
+                  taskType: 'stop_app',
+                  action: (taskId) =>
+                      widget.appService.stopApp(_app!.name, taskId: taskId),
+                ),
+                icon: const Icon(Icons.stop),
+                label: const Text("Stop"),
+                style: FilledButton.styleFrom(
+                  backgroundColor: PiccoloTheme.inkMuted,
+                ),
+              )
+            else
+              FilledButton.icon(
+                onPressed: () => _handleActionWithProgress(
+                  taskType: 'start_app',
+                  action: (taskId) =>
+                      widget.appService.startApp(_app!.name, taskId: taskId),
+                ),
+                icon: const Icon(Icons.play_arrow),
+                label: const Text("Start"),
+                style: FilledButton.styleFrom(
+                  backgroundColor: PiccoloTheme.success,
+                ),
               ),
-            ),
+          ],
         ],
       ),
     );
@@ -404,8 +490,12 @@ class _AppDetailViewState extends State<AppDetailView>
           ),
 
         const SizedBox(height: 24),
-        _buildSectionTitle("Environment Variables"),
-        if (_app!.environment.isEmpty)
+        _buildSectionTitle(
+          _containers.length > 1 && (_selectedService?.isNotEmpty ?? false)
+              ? "Environment Variables (${_selectedService!})"
+              : "Environment Variables",
+        ),
+        if (_app!.environmentForService(_selectedService).isEmpty)
           const Text("No environment variables.")
         else
           Container(
@@ -417,7 +507,9 @@ class _AppDetailViewState extends State<AppDetailView>
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: _app!.environment.entries
+              children: _app!
+                  .environmentForService(_selectedService)
+                  .entries
                   .map(
                     (e) => Padding(
                       padding: const EdgeInsets.symmetric(vertical: 4),
@@ -456,11 +548,11 @@ class _AppDetailViewState extends State<AppDetailView>
   }
 
   Widget _buildNetworkTab() {
-    final content = _services.isEmpty
+    final content = _listeners.isEmpty
         ? const Center(child: Text("No network services exposed."))
         : ListView(
             padding: const EdgeInsets.all(24),
-            children: _services
+            children: _listeners
                 .map(
                   (svc) => Card(
                     child: Padding(
@@ -470,7 +562,10 @@ class _AppDetailViewState extends State<AppDetailView>
                         children: [
                           Row(
                             children: [
-                              const Icon(Icons.router, color: PiccoloTheme.cobalt600),
+                              const Icon(
+                                Icons.router,
+                                color: PiccoloTheme.cobalt600,
+                              ),
                               const SizedBox(width: 12),
                               Text(
                                 svc.name,
@@ -591,6 +686,61 @@ class _AppDetailViewState extends State<AppDetailView>
           "Type: ${_app!.type}\n"
           "Container ID: ${_app!.containerId}\n",
           style: const TextStyle(fontFamily: 'JetBrainsMono'),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLogsTab() {
+    return Padding(
+      padding: const EdgeInsets.all(24.0),
+      child: LogStreamViewer(
+        appName: _app!.name,
+        serviceName: _selectedService,
+        tailLines: 200,
+      ),
+    );
+  }
+
+  String? _pickSelectedService(
+    String? current,
+    List<AppContainerStatus> containers,
+  ) {
+    if (containers.isEmpty) return null;
+    if (current != null && containers.any((c) => c.service == current)) {
+      return current;
+    }
+    return containers.first.service;
+  }
+
+  Widget _buildServiceSelector() {
+    if (_containers.length <= 1) return const SizedBox.shrink();
+
+    var selected = _selectedService;
+    if (selected == null || !_containers.any((c) => c.service == selected)) {
+      selected = _containers.first.service;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      decoration: BoxDecoration(
+        color: PiccoloTheme.mist,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.black12),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: selected,
+          isDense: true,
+          items: _containers
+              .map(
+                (c) => DropdownMenuItem<String>(
+                  value: c.service,
+                  child: Text(c.running ? c.service : '${c.service} (stopped)'),
+                ),
+              )
+              .toList(),
+          onChanged: (value) => setState(() => _selectedService = value),
         ),
       ),
     );

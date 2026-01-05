@@ -1,6 +1,5 @@
 # Web service example - typical self-hosted app
 name: nextcloud
-image: nextcloud:latest
 
 listeners:
   - name: web
@@ -9,19 +8,39 @@ listeners:
     protocol: http
     remote_ports: [80, 443]
 
-storage:
-  persistent:
-    data:
-      container: /var/www/html
-      size_limit: 50GB
-    config:
-      container: /var/www/html/config
-      size_limit: 1GB
-
-environment:
-  MYSQL_HOST: db.piccolo.local
-  MYSQL_DATABASE: nextcloud
-  NEXTCLOUD_ADMIN_USER: admin
+primary_service: web
+services:
+  web:
+    image: nextcloud:latest
+    bind_ports: [80]
+    environment:
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: example
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: example
+    storage:
+      persistent:
+        data:
+          container: /var/www/html
+          size_limit: 50GB
+        config:
+          container: /var/www/html/config
+          size_limit: 1GB
+  mysql:
+    image: mysql:8
+    bind_ports: [3306]
+    environment:
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: example
+      MYSQL_ROOT_PASSWORD: example
+    storage:
+      persistent:
+        db:
+          container: /var/lib/mysql
+          size_limit: 10GB
 
 permissions:
   network:
@@ -34,9 +53,6 @@ healthcheck:
     port: web
     timeout: 30s
     retries: 3
-
-depends_on:
-  - mysql
 
 # Piccolo-specific policies: typical self-hosted services replicate durable data,
 # while keeping the container "disk" replaceable across upgrades.

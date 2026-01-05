@@ -65,7 +65,7 @@ paths:
         '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
   /apps/{name}:
     get:
-      summary: Get app details (with services)
+      summary: Get app details (with listeners and container status)
       parameters:
         - in: path
           name: name
@@ -174,8 +174,11 @@ paths:
           required: true
           schema: { type: string }
         - in: query
-          name: since
-          schema: { type: string, format: date-time }
+          name: service
+          schema: { type: string }
+        - in: query
+          name: tail
+          schema: { type: integer, minimum: 1, maximum: 5000 }
       responses:
         '200':
           description: OK
@@ -183,6 +186,45 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AppLogs' }
         '404': { description: Not Found, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+  /apps/{name}/logs/stream:
+    get:
+      summary: Stream app container logs (WebSocket)
+      description: |
+        Upgrades to a WebSocket connection for a read-only container log stream.
+        **Protocol:** JSON messages with Base64 payloads (type=stdout).
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+        - in: query
+          name: service
+          schema: { type: string }
+        - in: query
+          name: tail
+          schema: { type: integer, minimum: 1, maximum: 5000 }
+        - in: query
+          name: timestamps
+          schema: { type: boolean }
+      responses:
+        '101':
+          description: Switching Protocols
+  /apps/{name}/terminal:
+    get:
+      summary: Connect to app terminal (WebSocket)
+      description: |
+        Upgrades to a WebSocket connection for a PTY session inside the app container.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+        - in: query
+          name: service
+          schema: { type: string }
+      responses:
+        '101':
+          description: Switching Protocols
   /services:
     get:
       summary: List all service endpoints
@@ -907,6 +949,44 @@ paths:
         '101':
           description: Switching Protocols
 
+  /system/logs/stream:
+    get:
+      summary: Stream system logs (WebSocket)
+      description: |
+        Upgrades to a WebSocket connection for a read-only journald stream.
+        Units are allowlisted by the server.
+        **Protocol:** JSON messages with Base64 payloads (type=stdout).
+      security:
+        - cookieAuth: []
+      parameters:
+        - in: query
+          name: unit
+          required: true
+          schema: { type: string }
+        - in: query
+          name: tail
+          schema: { type: integer, minimum: 1, maximum: 5000 }
+      responses:
+        '101':
+          description: Switching Protocols
+
+  /events/progress/stream:
+    get:
+      summary: Stream task progress events (WebSocket)
+      description: |
+        Upgrades to a WebSocket connection for structured task progress events.
+        The client should pass a unique task_id and subscribe before triggering an operation.
+      security:
+        - cookieAuth: []
+      parameters:
+        - in: query
+          name: task_id
+          required: true
+          schema: { type: string }
+      responses:
+        '101':
+          description: Switching Protocols
+
   /sso/start:
     get:
       summary: Begin app SSO (portal issues one-time ticket and redirects)
@@ -1020,9 +1100,18 @@ components:
           type: object
           properties:
             app: { $ref: '#/components/schemas/App' }
-            services:
+            listeners:
               type: array
               items: { $ref: '#/components/schemas/ServiceEndpoint' }
+            containers:
+              type: array
+              items: { $ref: '#/components/schemas/AppContainerStatus' }
+    AppContainerStatus:
+      type: object
+      properties:
+        service: { type: string }
+        container_id: { type: string }
+        running: { type: boolean }
     App:
       type: object
       properties:
@@ -1031,6 +1120,11 @@ components:
         image: { type: string }
         type: { type: string }
         status: { type: string, enum: [running, stopped, error] }
+        primary_service: { type: string }
+        network_anchor_id: { type: string }
+        containers:
+          type: object
+          additionalProperties: { type: string }
         volumes: { type: array, items: { $ref: '#/components/schemas/AppVolume' } }
         environment: { type: object, additionalProperties: { type: string } }
     AppVolume:
@@ -1039,6 +1133,7 @@ components:
         container: { type: string }
         host: { type: string }
         size_limit: { type: string }
+        shared: { type: boolean }
     AppListener:
       type: object
       properties:

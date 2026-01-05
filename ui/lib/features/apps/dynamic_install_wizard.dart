@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import '../../theme/piccolo_theme.dart';
 import '../../core/services/app_service.dart';
+import '../../core/utils/task_id.dart';
+import '../../shared/widgets/task_progress_panel.dart';
 
 class DynamicInstallWizard extends StatefulWidget {
   final AppService appService;
@@ -27,6 +29,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
   final Map<String, dynamic> _formValues = {};
   final TextEditingController _displayNameController = TextEditingController();
   bool _isInstalling = false;
+  String? _taskId;
   String? _error;
 
   @override
@@ -50,8 +53,10 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
     if (!_formKey.currentState!.validate()) return;
     _formKey.currentState!.save();
 
+    final taskId = generateTaskId();
     setState(() {
       _isInstalling = true;
+      _taskId = taskId;
       _error = null;
     });
 
@@ -60,6 +65,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
         widget.yamlContent,
         _formValues,
         displayName: _displayNameController.text.trim(),
+        taskId: taskId,
       );
 
       if (mounted) {
@@ -72,6 +78,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
       if (mounted) {
         setState(() {
           _isInstalling = false;
+          _taskId = null;
           _error = e.toString();
         });
       }
@@ -118,7 +125,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
                   ),
                   IconButton(
                     icon: const Icon(Icons.close),
-                    onPressed: () => Navigator.of(context).pop(),
+                    onPressed: _isInstalling ? null : () => Navigator.of(context).pop(),
                   )
                 ],
               ),
@@ -126,43 +133,52 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
 
             // Form Body
             Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(24),
-                child: Form(
-                  key: _formKey,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      TextFormField(
-                        controller: _displayNameController,
-                        decoration: const InputDecoration(
-                          labelText: "Display name (optional)",
-                          hintText: "e.g., Work Projects",
-                          filled: true,
-                          fillColor: Colors.white,
-                          border: OutlineInputBorder(),
+              child: _isInstalling && _taskId != null
+                  ? Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: TaskProgressPanel(
+                        taskId: _taskId!,
+                        taskType: 'install_app',
+                      ),
+                    )
+                  : SingleChildScrollView(
+                      padding: const EdgeInsets.all(24),
+                      child: Form(
+                        key: _formKey,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            TextFormField(
+                              controller: _displayNameController,
+                              decoration: const InputDecoration(
+                                labelText: "Display name (optional)",
+                                hintText: "e.g., Work Projects",
+                                filled: true,
+                                fillColor: Colors.white,
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                            const SizedBox(height: 24),
+                            if (_error != null)
+                              Container(
+                                width: double.infinity,
+                                margin: const EdgeInsets.only(bottom: 24),
+                                padding: const EdgeInsets.all(12),
+                                color: PiccoloTheme.critical.withValues(alpha: 0.1),
+                                child: Row(
+                                  children: [
+                                    const Icon(Icons.error, color: PiccoloTheme.critical, size: 20),
+                                    const SizedBox(height: 12, width: 12),
+                                    Expanded(child: Text(_error!, style: const TextStyle(color: PiccoloTheme.critical))),
+                                  ],
+                                ),
+                              ),
+                            ...widget.schema.entries
+                                .map((entry) => _buildField(entry.key, entry.value)),
+                          ],
                         ),
                       ),
-                      const SizedBox(height: 24),
-                      if (_error != null)
-                        Container(
-                          width: double.infinity,
-                          margin: const EdgeInsets.only(bottom: 24),
-                          padding: const EdgeInsets.all(12),
-                          color: PiccoloTheme.critical.withValues(alpha: 0.1),
-                          child: Row(
-                            children: [
-                              const Icon(Icons.error, color: PiccoloTheme.critical, size: 20),
-                              const SizedBox(width: 12),
-                              Expanded(child: Text(_error!, style: const TextStyle(color: PiccoloTheme.critical))),
-                            ],
-                          ),
-                        ),
-                      ...widget.schema.entries.map((entry) => _buildField(entry.key, entry.value)),
-                    ],
-                  ),
-                ),
-              ),
+                    ),
             ),
 
             // Footer
@@ -175,7 +191,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
                   TextButton(
-                    onPressed: () => Navigator.of(context).pop(),
+                    onPressed: _isInstalling ? null : () => Navigator.of(context).pop(),
                     child: const Text("Cancel"),
                   ),
                   const SizedBox(width: 16),
