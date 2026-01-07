@@ -4,6 +4,7 @@ import 'settings_controller.dart';
 import 'tabs/profile_tab.dart';
 import 'tabs/remote/remote_tab.dart';
 import 'tabs/system_tab.dart';
+import 'tabs/users/users_tab.dart';
 
 class SettingsApp extends StatefulWidget {
   final VoidCallback? onLogout;
@@ -77,10 +78,16 @@ class _SettingsAppState extends State<SettingsApp> {
                         onTap: () => _controller.selectTab(1),
                       ),
                       _SidebarItem(
-                        icon: Icons.dns_outlined, // or system icon
-                        label: "System",
+                        icon: Icons.people_outline,
+                        label: "Users",
                         isSelected: _controller.selectedIndex == 2,
                         onTap: () => _controller.selectTab(2),
+                      ),
+                      _SidebarItem(
+                        icon: Icons.dns_outlined, // or system icon
+                        label: "System",
+                        isSelected: _controller.selectedIndex == 3,
+                        onTap: () => _controller.selectTab(3),
                       ),
                     ],
                   ),
@@ -145,6 +152,8 @@ class _SettingsAppState extends State<SettingsApp> {
       case 1:
         return const RemoteTab();
       case 2:
+        return const UsersTab();
+      case 3:
         return SystemTab(controller: _controller);
       default:
         return const SizedBox.shrink();

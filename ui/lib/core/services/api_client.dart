@@ -102,6 +102,22 @@ class ApiClient {
     return _handleResponse(response);
   }
 
+  Future<dynamic> put(String path, {Object? body, Map<String, String>? headers}) async {
+    if (_csrfToken == null) {
+      await fetchCsrfToken();
+    }
+
+    final uri = _buildUri(path);
+    final mergedHeaders = _getHeaders(contentType: 'application/json');
+    if (headers != null) mergedHeaders.addAll(headers);
+    final response = await _client.put(
+      uri,
+      headers: mergedHeaders,
+      body: body != null ? jsonEncode(body) : null,
+    );
+    return _handleResponse(response);
+  }
+
   Future<dynamic> patch(String path, {Object? body, Map<String, String>? headers}) async {
     if (_csrfToken == null) {
       await fetchCsrfToken();

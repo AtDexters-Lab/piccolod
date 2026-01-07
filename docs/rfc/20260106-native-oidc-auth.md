@@ -21,22 +21,20 @@ This RFC proposes integrating a minimal OpenID Connect (OIDC) Provider directly 
 ### 3.1 The "Stable Issuer" Strategy
 To satisfy OIDC strictness while allowing variable access origins:
 
-1.  **Issuer Identity:** The Issuer is **always** `piccolo.local` (scheme configurable).
-    *   Apps are configured with `ISSUER_URL=https://piccolo.local` (preferred) or `http://piccolo.local` (insecure / best-effort compatibility).
-    *   Tokens are signed with `iss: <configured_issuer>`.
+1.  **Issuer Identity:** The Issuer is **always** `https://piccolo.local`.
+    *   Apps are configured with `ISSUER_URL=https://piccolo.local`.
+    *   Tokens are signed with `iss: https://piccolo.local`.
     *   **Multi-NIC:** `piccolo.local` is advertised via mDNS on all NICs; v1 does not embed raw LAN IPs into discovery.
 
 2.  **Internal Resolution (The "Back-Channel"):**
-    *   `piccolod` exposes an internal issuer origin reachable **from app containers** (even when the user is remote).
-        *   **HTTPS issuer:** listener bound on a host address reachable from containers via `<host-gateway-ip>:443` with a self-signed cert.
-        *   **HTTP issuer:** uses the normal portal HTTP listener (same host/port as `http://piccolo.local`).
-    *   **Host Gateway Discovery (no hard-coded IP):**
-        *   `piccolod` determines the "host gateway" IP address as seen from containers (runtime-dependent).
-        *   In rootless Podman, this is discovered by resolving `host.containers.internal` from a helper container.
-    *   **Container Networking:** `piccolod` injects `--add-host piccolo.local:<host-gateway-ip>` into every app container.
-    *   **Trust (HTTPS):** `piccolod` mounts its internal CA certificate to `/var/lib/piccolo/certs/internal-ca.crt` in every container.
+    *   `piccolod` exposes an internal HTTPS listener reachable **from app containers** (even when the user is remote).
+        *   Listener bound to `127.0.0.1:443` with a self-signed certificate from the internal CA.
+    *   **Host Gateway Resolution:**
+        *   `piccolod` uses the `host-gateway` special token supported by Podman/Docker, which is automatically resolved to the correct host IP at container creation time.
+        *   This works in both rootful and rootless modes without requiring runtime IP discovery.
+    *   **Container Networking:** `piccolod` injects `--add-host piccolo.local:host-gateway` into every app container.
+    *   **Trust:** `piccolod` mounts its internal CA certificate to `/var/lib/piccolo/certs/internal-ca.crt` in every container.
         *   `app.yaml` templates are updated to set `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, or `REQUESTS_CA_BUNDLE` to this path.
-    *   **Trust (HTTP):** If app allows, `issuer_protocol: http` can be used to bypass TLS complexity.
 
 3.  **Dynamic Discovery (The "Front-Channel"):**
     `piccolod` serves `/.well-known/openid-configuration`. The content is generated dynamically based on the **Best Reachable Origin**:
@@ -63,6 +61,7 @@ The key invariant is that the **issuer stays stable** for apps, while the **fron
 ### 3.3 User Model
 *   **Admin (Root):** Single user. Full system access. Can unlock device.
 *   **Standard:** Created by Admin. Restricted to `allowed_apps`. Cannot unlock. Cannot access system settings.
+    *   **Access Control:** Standard users have **no access** to any apps by default. Access must be explicitly granted per-app. An empty or nil `allowed_apps` list results in zero access.
 *   **Storage:** Persisted in `control.db` (SQLite).
 
 ## 4. Application Integration (`app.yaml`)
@@ -72,17 +71,13 @@ Apps use the templating system to receive credentials. `piccolod` acts as the Dy
 auth:
   strategy: oidc # or 'header'
   injection:
-    # Protocol preference for internal back-channel (default: https)
-    # Use 'http' if app allows insecure issuer to avoid CA trust issues.
-    issuer_protocol: https 
-    
     # Custom mount path for CA cert if standard env vars don't work
     ca_mount_path: "/etc/ssl/certs/piccolo-ca.crt"
 
     env:
-      ISSUER_URL: "{{ .Auth.Issuer }}" # https://piccolo.local or http://piccolo.local
-      CLIENT_ID: "{{ .Auth.ClientID }}"
-      CLIENT_SECRET: "{{ .Auth.ClientSecret }}"
+      ISSUER_URL: "{{ .System.Auth.Issuer }}" # https://piccolo.local
+      CLIENT_ID: "{{ .System.Auth.ClientID }}"
+      CLIENT_SECRET: "{{ .System.Auth.ClientSecret }}"
 ```
 
 ### 4.1 Redirect URI Validation (v1)
@@ -158,7 +153,7 @@ CREATE TABLE oidc_keys (
 1.  **Core Auth:** Refactor `internal/auth` to support Multi-User + SQLite Persistence.
 2.  **OIDC Engine:** Implement `op.Storage` and Dynamic Discovery Handler.
 3.  **Networking:**
-    *   Implement host-gateway discovery + `--add-host piccolo.local:<host-gateway-ip>` injection.
+    *   Inject `--add-host piccolo.local:host-gateway` into all app containers (uses Podman/Docker's built-in host-gateway resolution).
     *   Implement Internal HTTPS Listener (host loopback `127.0.0.1:443`) and optional HTTP mode.
     *   Implement CA Generation & Volume Mounting.
 4.  **Orchestration:** Implement Remote State Monitor & App Restart Logic.

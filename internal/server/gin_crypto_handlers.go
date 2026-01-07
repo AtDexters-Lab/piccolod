@@ -96,7 +96,13 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 		}
 		if init {
 			if ok, err := s.authManager.Verify(ctx, "admin", password); err == nil && ok {
-				sess := s.sessions.Create("admin", 3600)
+				userID := ""
+				if s.userManager != nil {
+					if u, err := s.userManager.GetByUsername(ctx, "admin"); err == nil {
+						userID = u.ID
+					}
+				}
+				sess := s.sessions.CreateWithUserInfo(userID, "admin", "admin", 3600)
 				s.setSessionCookie(c, sess.ID, time.Hour)
 			}
 		}

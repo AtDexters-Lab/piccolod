@@ -169,6 +169,31 @@ func (s *GinServer) requireSession() gin.HandlerFunc {
 	}
 }
 
+// requireAdmin ensures the session user has admin role.
+// Must be used after requireSession middleware.
+func (s *GinServer) requireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, ok := s.getSession(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+		sess, ok := s.sessions.Get(id)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+		if sess.Role != "admin" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
 // csrfMiddleware enforces X-CSRF-Token on state-changing requests when session exists
 func (s *GinServer) csrfMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {

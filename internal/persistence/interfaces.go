@@ -32,6 +32,12 @@ type ControlStore interface {
 	Auth() AuthRepo
 	Remote() RemoteRepo
 	AppState() AppStateRepo
+	Users() UserRepo
+	OIDCClients() OIDCClientRepo
+	OIDCKeys() OIDCKeyRepo
+	OIDCAuthCodes() OIDCAuthCodeRepo
+	OIDCRefreshTokens() OIDCRefreshTokenRepo
+	OIDCConfig() OIDCConfigRepo
 	Close(ctx context.Context) error
 	Revision(ctx context.Context) (uint64, string, error)
 	QuickCheck(ctx context.Context) (ControlHealthReport, error)
@@ -91,6 +97,52 @@ type RemoteRepo interface {
 type AppStateRepo interface {
 	ListApps(ctx context.Context) ([]AppRecord, error)
 	UpsertApp(ctx context.Context, record AppRecord) error
+}
+
+// UserRepo manages user accounts for the family user model.
+type UserRepo interface {
+	Create(ctx context.Context, user User) error
+	Get(ctx context.Context, id string) (User, error)
+	GetByUsername(ctx context.Context, username string) (User, error)
+	GetByEmail(ctx context.Context, email string) (User, error)
+	List(ctx context.Context) ([]User, error)
+	Update(ctx context.Context, user User) error
+	Delete(ctx context.Context, id string) error
+	Count(ctx context.Context) (int, error)
+}
+
+// OIDCClientRepo manages OIDC client registrations for apps.
+type OIDCClientRepo interface {
+	Create(ctx context.Context, client OIDCClient) error
+	Get(ctx context.Context, clientID string) (OIDCClient, error)
+	GetByAppID(ctx context.Context, appID string) (OIDCClient, error)
+	Delete(ctx context.Context, clientID string) error
+	List(ctx context.Context) ([]OIDCClient, error)
+}
+
+// OIDCKeyRepo manages JWT signing keys for the OIDC provider.
+type OIDCKeyRepo interface {
+	Create(ctx context.Context, key OIDCKey) error
+	GetActive(ctx context.Context) ([]OIDCKey, error)
+	Get(ctx context.Context, kid string) (OIDCKey, error)
+	Retire(ctx context.Context, kid string) error
+}
+
+// OIDCAuthCodeRepo manages short-lived authorization codes.
+type OIDCAuthCodeRepo interface {
+	Store(ctx context.Context, code OIDCAuthCode) error
+	Consume(ctx context.Context, code string) (OIDCAuthCode, error)
+	Delete(ctx context.Context, code string) error
+	Cleanup(ctx context.Context) error
+}
+
+// OIDCRefreshTokenRepo manages refresh tokens for token rotation.
+type OIDCRefreshTokenRepo interface {
+	Store(ctx context.Context, token OIDCRefreshToken) error
+	Get(ctx context.Context, token string) (OIDCRefreshToken, error)
+	Revoke(ctx context.Context, token string) error
+	RevokeByUserAndClient(ctx context.Context, userID, clientID string) error
+	Cleanup(ctx context.Context) error
 }
 
 // Data structures -----------------------------------------------------------
@@ -210,4 +262,77 @@ type AuthStalenessUpdate struct {
 	RecoveryStale   *bool
 	RecoveryStaleAt *time.Time
 	RecoveryAckAt   *time.Time
+}
+
+// User data structures -------------------------------------------------------
+
+// UserRole defines the role of a user in the system.
+type UserRole string
+
+const (
+	UserRoleAdmin    UserRole = "admin"
+	UserRoleStandard UserRole = "standard"
+)
+
+// User represents a user account in the family user model.
+type User struct {
+	ID           string
+	Username     string
+	Email        string
+	PasswordHash string
+	Role         UserRole
+	AllowedApps  []string  // JSON-encoded list of allowed app instance IDs (nil for admin)
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// OIDC data structures -------------------------------------------------------
+
+// OIDCClient represents a registered OIDC client for an app.
+type OIDCClient struct {
+	ID        string // client_id
+	Secret    string // hashed client_secret
+	AppID     string // app instance ID
+	CreatedAt time.Time
+}
+
+// OIDCKey represents a JWT signing key for the OIDC provider.
+type OIDCKey struct {
+	KID        string // Key ID
+	Alg        string // Algorithm (e.g., "RS256")
+	PrivateKey []byte // PEM-encoded private key
+	CreatedAt  time.Time
+	RetiredAt  *time.Time // nil = active
+}
+
+// OIDCAuthCode represents an authorization code in the OIDC flow.
+type OIDCAuthCode struct {
+	Code                string
+	ClientID            string
+	UserID              string
+	RedirectURI         string
+	Scope               string
+	Nonce               string
+	CodeChallenge       string
+	CodeChallengeMethod string
+	ExpiresAt           time.Time
+	CreatedAt           time.Time
+}
+
+// OIDCRefreshToken represents a refresh token for token rotation.
+type OIDCRefreshToken struct {
+	Token     string
+	ClientID  string
+	UserID    string
+	Scope     string
+	ExpiresAt time.Time
+	CreatedAt time.Time
+}
+
+// OIDCConfigRepo manages OIDC configuration like encryption keys.
+type OIDCConfigRepo interface {
+	// GetEncryptionKey returns the OIDC encryption key, or nil if not set.
+	GetEncryptionKey(ctx context.Context) ([]byte, error)
+	// SetEncryptionKey stores the OIDC encryption key.
+	SetEncryptionKey(ctx context.Context, key []byte) error
 }

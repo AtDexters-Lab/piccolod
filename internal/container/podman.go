@@ -247,6 +247,26 @@ type ContainerCreateSpec struct {
 	// User sets the user/group to run the container as (format: "uid:gid" or "user:group").
 	// Used with --rootfs mode to apply image config since Podman doesn't do it automatically.
 	User string
+
+	// ExtraHosts adds entries to /etc/hosts (format: "hostname:IP").
+	// Used for OIDC back-channel communication to allow containers to reach piccolo.local.
+	ExtraHosts []HostEntry
+
+	// CAMounts contains paths to CA certificates to mount into the container.
+	// Used to trust the internal CA for OIDC HTTPS communication.
+	CAMounts []CAMount
+}
+
+// HostEntry represents an /etc/hosts entry for --add-host.
+type HostEntry struct {
+	Hostname string
+	IP       string
+}
+
+// CAMount represents a CA certificate mount for OIDC trust.
+type CAMount struct {
+	HostPath      string
+	ContainerPath string
 }
 
 type PortMapping struct {
@@ -346,6 +366,16 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 	// User (used with --rootfs to apply image config)
 	if spec.User != "" {
 		args = append(args, "--user", spec.User)
+	}
+
+	// Extra hosts (for OIDC back-channel communication)
+	for _, host := range spec.ExtraHosts {
+		args = append(args, "--add-host", fmt.Sprintf("%s:%s", host.Hostname, host.IP))
+	}
+
+	// CA certificate mounts (for OIDC HTTPS trust)
+	for _, ca := range spec.CAMounts {
+		args = append(args, "--volume", fmt.Sprintf("%s:%s:ro", ca.HostPath, ca.ContainerPath))
 	}
 
 	// Rootfs mode: use --rootfs instead of image reference.

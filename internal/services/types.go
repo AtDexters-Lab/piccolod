@@ -10,14 +10,15 @@ type PortRange struct {
 
 // ServiceEndpoint represents a fully allocated listener
 type ServiceEndpoint struct {
-	App         string                      `json:"app"`
-	Name        string                      `json:"name"`
-	GuestPort   int                         `json:"guest_port"`
-	HostBind    int                         `json:"host_port"`   // 127.0.0.1:HostBind → container:GuestPort
-	PublicPort  int                         `json:"public_port"` // 0.0.0.0:PublicPort → HostBind
-	Flow        api.ListenerFlow            `json:"flow"`
-	Protocol    api.ListenerProtocol        `json:"protocol"`
-	Middleware  []api.AppProtocolMiddleware `json:"middleware"`
-	RemotePorts []int                       `json:"remote_ports"`
-	LocalURL    string                      `json:"local_url,omitempty"` // Optional pre-calculated LAN URL
+	App          string                      `json:"app"`
+	Name         string                      `json:"name"`
+	GuestPort    int                         `json:"guest_port"`
+	HostBind     int                         `json:"host_port"`   // 127.0.0.1:HostBind → container:GuestPort
+	PublicPort   int                         `json:"public_port"` // 0.0.0.0:PublicPort → HostBind
+	Flow         api.ListenerFlow            `json:"flow"`
+	Protocol     api.ListenerProtocol        `json:"protocol"`
+	Middleware   []api.AppProtocolMiddleware `json:"middleware"`
+	RemotePorts  []int                       `json:"remote_ports"`
+	LocalURL     string                      `json:"local_url,omitempty"` // Optional pre-calculated LAN URL
+	AuthStrategy string                      `json:"auth_strategy,omitempty"` // "oidc", "headers", or "" (none)
 }

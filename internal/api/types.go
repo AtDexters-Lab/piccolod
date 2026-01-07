@@ -237,6 +237,8 @@ type AppDefinition struct {
 	HealthCheck *AppHealthCheck        `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
 	AppConfig   interface{}            `yaml:"app_config,omitempty" json:"app_config,omitempty"`
 	Extensions  map[string]interface{} `yaml:"x-piccolo,omitempty" json:"x-piccolo,omitempty"`
+	// Auth defines how the app integrates with Piccolo's authentication system
+	Auth *AppAuth `yaml:"auth,omitempty" json:"auth,omitempty"`
 }
 
 // AppListener defines a named service exposed by the app (service-oriented model)
@@ -393,4 +395,39 @@ type AppInput struct {
 type AppInputValidation struct {
 	Regex   string `yaml:"regex" json:"regex"`
 	Message string `yaml:"message" json:"message"`
+}
+
+// AppAuth defines authentication configuration for an app.
+type AppAuth struct {
+	// Strategy defines how the app authenticates users.
+	// Values: "oidc", "headers", "none" (default: "none")
+	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// Injection defines how OIDC credentials are injected into the app.
+	Injection *AppAuthInjection `yaml:"injection,omitempty" json:"injection,omitempty"`
+}
+
+// AppAuthInjection defines how auth credentials are passed to the app.
+type AppAuthInjection struct {
+	// Custom mount path for CA cert
+	CAMountPath string `yaml:"ca_mount_path,omitempty" json:"ca_mount_path,omitempty"`
+
+	// Env maps environment variable names to template values.
+	// Example: {"ISSUER_URL": "{{ .Auth.Issuer }}", "CLIENT_ID": "{{ .Auth.ClientID }}"}
+	Env map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+}
+
+// AuthTemplateContext provides auth-related values for app manifest templating.
+type AuthTemplateContext struct {
+	// Issuer is the OIDC issuer URL (e.g., "https://piccolo.local")
+	Issuer string
+
+	// ClientID is the dynamically registered OIDC client ID for this app
+	ClientID string
+
+	// ClientSecret is the OIDC client secret (only returned once during registration)
+	ClientSecret string
+
+	// CAPath is the path to the internal CA certificate inside the container
+	CAPath string
 }

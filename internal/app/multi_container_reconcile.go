@@ -189,7 +189,7 @@ func (m *AppManager) pruneMultiContainerZombies(ctx context.Context, runtime con
 func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
 	// Allocate endpoints and recreate the group (anchor + services).
 	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
-		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners)
+		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners, getAuthStrategy(def))
 		if err != nil {
 			return fmt.Errorf("allocate service ports: %w", err)
 		}

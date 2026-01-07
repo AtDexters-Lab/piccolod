@@ -56,6 +56,9 @@ type AppManager struct {
 	workspaceDiskMgr      *workspacedisk.DefaultManager
 	workspacePathResolver *workspacePathResolver
 	workspaceImageMounter *workspacedisk.PodmanImageMounter
+
+	// Internal CA path for OIDC trust
+	internalCAPath string
 }
 
 var (
@@ -104,6 +107,15 @@ func mergeEnvMaps(base, override map[string]string) map[string]string {
 		result[k] = v
 	}
 	return result
+}
+
+// getAuthStrategy extracts the auth strategy from an app definition.
+// Returns empty string if no auth config is present.
+func getAuthStrategy(def *api.AppDefinition) string {
+	if def == nil || def.Auth == nil {
+		return ""
+	}
+	return string(def.Auth.Strategy)
 }
 
 // workspaceRuntimeResolver implements workspacedisk.RuntimeResolver
@@ -188,6 +200,14 @@ func (m *AppManager) SetRouter(reg router.Registrar) {
 func (m *AppManager) SetProgressReporter(r events.ProgressReporter) {
 	m.stateMu.Lock()
 	m.progressReporter = r
+	m.stateMu.Unlock()
+}
+
+// SetInternalCAPath configures the path to the internal CA certificate on the host.
+// This certificate is mounted into containers to enable trust for piccolo.local.
+func (m *AppManager) SetInternalCAPath(path string) {
+	m.stateMu.Lock()
+	m.internalCAPath = path
 	m.stateMu.Unlock()
 }
 
@@ -871,7 +891,7 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 	}
 
 	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
-		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners)
+		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners, getAuthStrategy(def))
 		if err != nil {
 			return fmt.Errorf("allocate service ports: %w", err)
 		}
@@ -958,7 +978,7 @@ func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.A
 			return nil
 		}
 		// No published ports observed; allocate fresh endpoints. Publish reconciliation happens separately.
-		if _, err := m.serviceManager.AllocateForApp(instanceID, def.Listeners); err != nil {
+		if _, err := m.serviceManager.AllocateForApp(instanceID, def.Listeners, getAuthStrategy(def)); err != nil {
 			return err
 		}
 		m.serviceManager.SetAppContainerID(instanceID, containerID)
@@ -1087,7 +1107,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	}
 
 	// Allocate services and convert to container spec using instanceID
-	endpoints, err := m.serviceManager.AllocateForApp(instanceID, appDef.Listeners)
+	endpoints, err := m.serviceManager.AllocateForApp(instanceID, appDef.Listeners, getAuthStrategy(appDef))
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate service ports: %w", err)
 	}
@@ -2485,6 +2505,41 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	// - storage.temporary  -> tmpfs mounts (ephemeral)
 	if err := m.applyServiceStorageAndTmpfs(&spec, appDef.Storage, layout, appDef.Extensions); err != nil {
 		return spec, err
+	}
+
+	// Inject OIDC auth environment variables if configured
+	if appDef.Auth != nil && appDef.Auth.Injection != nil && len(appDef.Auth.Injection.Env) > 0 {
+		if spec.Environment == nil {
+			spec.Environment = make(map[string]string)
+		}
+		for k, v := range appDef.Auth.Injection.Env {
+			spec.Environment[k] = v
+		}
+	}
+
+	// Inject Piccolo Internal CA and host gateway for OIDC/internal communication
+	m.stateMu.RLock()
+	caPath := m.internalCAPath
+	m.stateMu.RUnlock()
+
+	if caPath != "" {
+		// 1. Mount CA
+		containerPath := "/var/lib/piccolo/certs/internal-ca.crt"
+		if appDef.Auth != nil && appDef.Auth.Injection != nil && appDef.Auth.Injection.CAMountPath != "" {
+			containerPath = appDef.Auth.Injection.CAMountPath
+		}
+
+		spec.CAMounts = append(spec.CAMounts, container.CAMount{
+			HostPath:      caPath,
+			ContainerPath: containerPath,
+		})
+
+		// 2. Add piccolo.local -> host-gateway
+		if hostEntry, err := container.HostGatewayEntry(); err == nil {
+			spec.ExtraHosts = append(spec.ExtraHosts, hostEntry)
+		} else {
+			log.Printf("WARN: failed to resolve host gateway for piccolo.local: %v", err)
+		}
 	}
 
 	// Workspace mode: enable init and mount boot.sh wrapper

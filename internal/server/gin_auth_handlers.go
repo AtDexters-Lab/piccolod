@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	authpkg "piccolod/internal/auth"
 	"piccolod/internal/crypt"
 	"piccolod/internal/events"
 	"piccolod/internal/persistence"
@@ -147,6 +148,22 @@ func (s *GinServer) handleAuthSetup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
+	// Create admin user in new users table (sync with legacy auth state)
+	if s.userManager != nil {
+		adminInput := authpkg.CreateUserInput{
+			Username: "admin",
+			Email:    "admin@piccolo.local",
+			Password: body.Password,
+			Role:     persistence.UserRoleAdmin,
+		}
+		if _, err := s.userManager.Create(ctx, adminInput); err != nil {
+			log.Printf("WARN: failed to create admin user during setup: %v", err)
+			// Don't fail the request, as legacy auth setup succeeded.
+			// The user might be able to login via legacy path or migration on restart.
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
 
@@ -162,10 +179,23 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "username required"})
 		return
 	}
-	// Single local admin account; verify password only
+
 	ctx := c.Request.Context()
-	ok, err := s.authManager.Verify(ctx, username, body.Password)
+	var userInfo *authpkg.UserInfo
+	var err error
+
+	// 1. Try to verify against user manager (unified auth)
+	if s.userManager != nil {
+		userInfo, err = s.userManager.Verify(ctx, username, body.Password)
+	} else {
+		// Fallback for extremely early init stages (should be rare)
+		err = errors.New("user manager unavailable")
+	}
+
+	// 2. Handle locked state / legacy unlock logic
 	if err != nil {
+		// If locked, we might need to unlock first (only for admin/disk-key holder)
+		// We assume "admin" user password == disk key.
 		if errors.Is(err, persistence.ErrLocked) && s.cryptoManager != nil {
 			if unlockErr := s.cryptoManager.Unlock(body.Password); unlockErr != nil {
 				if errors.Is(unlockErr, crypt.ErrNotInitialized) {
@@ -180,21 +210,25 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 				}
 				return
 			}
+			// Unlock successful
 			if notifyErr := s.notifyPersistenceLockState(ctx, false); notifyErr != nil {
 				log.Printf("WARN: auth login persistence unlock failed: %v", notifyErr)
 			}
-			ok, err = s.authManager.Verify(ctx, username, body.Password)
-		}
-		if err != nil {
-			if errors.Is(err, persistence.ErrLocked) {
-				c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
-				return
+			
+			// Retry verification after unlock
+			if s.userManager != nil {
+				userInfo, err = s.userManager.Verify(ctx, username, body.Password)
 			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify credentials"})
-			return
 		}
 	}
-	if !ok {
+
+	// 3. Final verdict
+	if err != nil {
+		if errors.Is(err, persistence.ErrLocked) {
+			c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
+			return
+		}
+		// Generic failure
 		if s.recordLoginFailure() {
 			c.Header("Retry-After", "5")
 			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too Many Requests"})
@@ -203,8 +237,13 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 		}
 		return
 	}
+
 	s.resetLoginFailures()
-	sess := s.sessions.Create("admin", 3600) // 1h default
+	
+	// Create session with full user info
+	userID := userInfo.ID
+	userRole := string(userInfo.Role)
+	sess := s.sessions.CreateWithUserInfo(userID, userInfo.Username, userRole, 3600) // 1h default
 	s.setSessionCookie(c, sess.ID, time.Hour)
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
@@ -237,21 +276,69 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	if err := s.authManager.ChangePassword(c.Request.Context(), body.OldPassword, body.NewPassword); err != nil {
-		if errors.Is(err, persistence.ErrLocked) {
-			c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
+
+	// 1. Update User Manager (Primary Source of Truth for Login)
+	// If user manager is available, we use it to update the user's password.
+	if s.userManager != nil {
+		sess, _ := s.sessions.Get(id)
+		if sess.UserID != "" {
+			if err := s.userManager.ChangePassword(c.Request.Context(), sess.UserID, body.OldPassword, body.NewPassword); err != nil {
+				if errors.Is(err, persistence.ErrLocked) {
+					c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
+					return
+				}
+				if errors.Is(err, authpkg.ErrInvalidCredentials) {
+					c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				} else {
+					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				}
+				return
+			}
+
+			// 2. Sync Legacy Auth Manager (Only for Admin)
+			// This is required for crypto/unlock handlers that still rely on authManager.
+			// We do this silently as a best-effort sync.
+			if sess.Role == "admin" || sess.User == "admin" {
+				_ = s.authManager.ChangePassword(c.Request.Context(), body.OldPassword, body.NewPassword)
+			}
+		} else {
+			// Fallback for sessions without UserID (legacy/migration edge case)
+			if err := s.authManager.ChangePassword(c.Request.Context(), body.OldPassword, body.NewPassword); err != nil {
+				// existing error handling
+				if errors.Is(err, persistence.ErrLocked) {
+					c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
+					return
+				}
+				switch err.Error() {
+				case "invalid credentials":
+					c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+				case "not initialized":
+					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				default:
+					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				}
+				return
+			}
+		}
+	} else {
+		// Fallback when user manager is unavailable (should be rare/legacy)
+		if err := s.authManager.ChangePassword(c.Request.Context(), body.OldPassword, body.NewPassword); err != nil {
+			if errors.Is(err, persistence.ErrLocked) {
+				c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
+				return
+			}
+			switch err.Error() {
+			case "invalid credentials":
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			case "not initialized":
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			default:
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			}
 			return
 		}
-		switch err.Error() {
-		case "invalid credentials":
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		case "not initialized":
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		default:
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		}
-		return
 	}
+
 	// Rewrap crypto SDEK if initialized
 	if s.cryptoManager != nil && s.cryptoManager.IsInitialized() {
 		if err := s.cryptoManager.Rewrap(body.OldPassword, body.NewPassword); err != nil {

@@ -39,6 +39,40 @@ inputs:
 
 type: user                     # user (default, starts after unlock) | system (starts during boot)
 
+# AUTHENTICATION --------------------------------------------------------------
+# Apps may optionally declare an auth section to enable Piccolo-managed authentication.
+#
+# Strategies:
+#   - oidc: Native OIDC flow. Piccolo acts as the Identity Provider (IdP).
+#           The app receives dynamically-registered client credentials via templating.
+#           Modern apps (Immich, Nextcloud, Gitea) should use this.
+#   - header: Trusted headers. Piccolo's reverse proxy validates user session and injects:
+#             X-Piccolo-User, X-Piccolo-Email, X-Piccolo-Name
+#           Legacy apps without OIDC support (Vaultwarden, FileBrowser) use this.
+#
+# Injection: Defines how credentials/CA certs are passed to the container.
+#   - ca_mount_path: Override the default CA certificate mount path (internal HTTPS).
+#   - env: Environment variables to inject. Use {{ .System.Auth.* }} for OIDC credentials.
+#
+# Access Control: Piccolo enforces user access via the allowed_apps list on each user account.
+#   - Admin users: Access all apps.
+#   - Standard users: Must be explicitly granted access per-app.
+#
+# Example (OIDC):
+# auth:
+#   strategy: oidc
+#   injection:
+#     ca_mount_path: "/etc/ssl/certs/piccolo-ca.crt"
+#     env:
+#       ISSUER_URL: "{{ .System.Auth.Issuer }}"
+#       CLIENT_ID: "{{ .System.Auth.ClientID }}"
+#       CLIENT_SECRET: "{{ .System.Auth.ClientSecret }}"
+#
+# Example (Trusted Headers):
+# auth:
+#   strategy: header
+#   # No injection needed; Piccolo proxy injects X-Piccolo-* headers automatically.
+
 # STATE, ENCRYPTION, AND PERSISTENCE MODEL -----------------------------------
 # Piccolo treats containers as "apps" (closer to VM instances than ephemeral cloud deploys).
 #

@@ -300,8 +300,39 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		}
 	}
 
+	// Check for OIDC strategy in loose schema to pre-generate credentials
+	// We do this before rendering so we can inject the credentials into the template.
+	var oidcClientID, oidcClientSecret string
+	if looseDef, err := app.ParseAppSchema(yamlData); err == nil && looseDef.Auth != nil && looseDef.Auth.Strategy == "oidc" {
+		clientMgr := s.getOIDCClientManager()
+		if clientMgr != nil {
+			var credErr error
+			oidcClientID, oidcClientSecret, credErr = clientMgr.GenerateCredentials()
+			if credErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate OIDC credentials: " + credErr.Error()})
+				return
+			}
+
+			// Inject Auth context for templating
+			// Issuer is always https://piccolo.local for internal back-channel communication
+			issuer := "https://piccolo.local"
+			caPath := "/var/lib/piccolo/certs/internal-ca.crt"
+
+			if looseDef.Auth.Injection != nil && looseDef.Auth.Injection.CAMountPath != "" {
+				caPath = looseDef.Auth.Injection.CAMountPath
+			}
+
+			systemContext["Auth"] = map[string]string{
+				"Issuer":       issuer,
+				"ClientID":     oidcClientID,
+				"ClientSecret": oidcClientSecret,
+				"CAPath":       caPath,
+			}
+		}
+	}
+
 	// Render template if inputs provided
-	if len(userInputs) > 0 {
+	if len(userInputs) > 0 || oidcClientID != "" {
 		rendered, err := app.RenderManifest(yamlData, userInputs, systemContext)
 		if err != nil {
 			writeGinError(c, http.StatusBadRequest, "Failed to render manifest template: "+err.Error())
@@ -328,6 +359,20 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		return
 	}
 
+	// Persist OIDC client if generated
+	if oidcClientID != "" {
+		clientMgr := s.getOIDCClientManager()
+		if err := clientMgr.CreateClient(ctx, oidcClientID, oidcClientSecret, appInstance.InstanceID); err != nil {
+			log.Printf("ERROR: failed to persist OIDC client for %s: %v. Rolling back install.", appInstance.InstanceID, err)
+			// Rollback: uninstall the app
+			if rbErr := s.appManager.UninstallWithOptions(ctx, appInstance.InstanceID, true); rbErr != nil {
+				log.Printf("CRITICAL: failed to rollback uninstall for %s: %v", appInstance.InstanceID, rbErr)
+			}
+			writeGinError(c, http.StatusInternalServerError, "Failed to register OIDC client: "+err.Error())
+			return
+		}
+	}
+
 	s.queueAppRemoteCertificates(appInstance.InstanceID)
 
 	response := GinAppResponse{
@@ -348,12 +393,40 @@ func (s *GinServer) handleGinAppList(c *gin.Context) {
 		return
 	}
 
+	// Filter for standard users
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		if s.userManager != nil {
+			user, err := s.userManager.Get(c.Request.Context(), sess.UserID)
+			if err != nil {
+				// User not found or error, return empty list
+				writeGinSuccess(c, []*app.AppInstance{}, "Found 0 apps")
+				return
+			}
+			filtered := make([]*app.AppInstance, 0)
+			for _, a := range apps {
+				if isIDAllowed(user.AllowedApps, a.InstanceID) {
+					filtered = append(filtered, a)
+				}
+			}
+			apps = filtered
+		}
+	}
+
 	writeGinSuccess(c, apps, fmt.Sprintf("Found %d apps", len(apps)))
 }
 
 // handleGinAppGet handles GET /api/v1/apps/:name - Get specific app details
 func (s *GinServer) handleGinAppGet(c *gin.Context) {
 	appName := c.Param("name")
+
+	// Check access for standard users
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		allowed, err := s.userManager.IsAppAllowed(c.Request.Context(), sess.UserID, appName)
+		if err != nil || !allowed {
+			writeGinError(c, http.StatusForbidden, "Access denied")
+			return
+		}
+	}
 
 	appInstance, err := s.appManager.Get(c.Request.Context(), appName)
 	if err != nil {
@@ -391,6 +464,16 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 // GET /api/v1/apps/:name/logs?tail=200
 func (s *GinServer) handleGinAppLogs(c *gin.Context) {
 	appName := c.Param("name")
+
+	// Check access for standard users
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		allowed, err := s.userManager.IsAppAllowed(c.Request.Context(), sess.UserID, appName)
+		if err != nil || !allowed {
+			writeGinError(c, http.StatusForbidden, "Access denied")
+			return
+		}
+	}
+
 	tail := parseLogTail(c, 200)
 	service := strings.TrimSpace(c.Query("service"))
 
@@ -413,9 +496,13 @@ func (s *GinServer) handleGinAppLogs(c *gin.Context) {
 func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 	appName := c.Param("name")
 
+	// Only Admin can update listeners (enforced by middleware), but double check if needed.
+	// Since we moved this to requireAdmin group, no extra check needed here.
+
 	var req struct {
 		Listeners []api.AppListener `json:"listeners"`
 	}
+// ... (rest of function)
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeGinError(c, http.StatusBadRequest, "Invalid request body")
 		return
@@ -677,4 +764,17 @@ func (s *GinServer) handleGinAppCheckInstance(c *gin.Context) {
 		"available": available,
 		"suggested": suggested,
 	})
+}
+
+// isIDAllowed checks if the given app ID is in the user's allowed apps list.
+func isIDAllowed(allowedApps []string, appID string) bool {
+	if len(allowedApps) == 0 {
+		return false
+	}
+	for _, allowed := range allowedApps {
+		if allowed == appID {
+			return true
+		}
+	}
+	return false
 }

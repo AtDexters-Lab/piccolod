@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"piccolod/internal/api"
+	"piccolod/internal/auth"
 )
 
 var frameAncestorsRe = regexp.MustCompile(`(?i)frame-ancestors\s+[^;]+(; ?)?`)
@@ -35,6 +36,10 @@ type ProxyManager struct {
 	cspFrameAncestors string // pre-calculated CSP header value
 	wg                sync.WaitGroup
 	acme              http.Handler
+
+	// Auth dependencies for trusted headers middleware (RFC 5.2)
+	userManager   *auth.UserManager
+	sessionGetter func(r *http.Request) (*auth.Session, bool)
 }
 
 func NewProxyManager() *ProxyManager {
@@ -79,6 +84,15 @@ func (p *ProxyManager) consumeHint(listenerPort, sourcePort int) (connectionHint
 
 // SetAcmeHandler registers a handler to serve HTTP-01 challenges for all HTTP proxies.
 func (p *ProxyManager) SetAcmeHandler(h http.Handler) { p.mu.Lock(); p.acme = h; p.mu.Unlock() }
+
+// SetAuthConfig configures the auth dependencies required for trusted headers middleware.
+// This must be called before starting proxies for apps using auth.strategy: headers.
+func (p *ProxyManager) SetAuthConfig(um *auth.UserManager, sg func(r *http.Request) (*auth.Session, bool)) {
+	p.mu.Lock()
+	p.userManager = um
+	p.sessionGetter = sg
+	p.mu.Unlock()
+}
 
 // SetAllowedAncestors updates the list of hostnames allowed to frame apps.
 // It constructs a CSP frame-ancestors directive including default local origins and wildcard ports.
@@ -214,8 +228,8 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		return nil
 	}
 
-	// Default middleware chain (stubs)
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Core handler that forwards to backend
+	coreHandler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		applyForwardHeaders(r, ep)
 		// Intercept ACME HTTP-01 challenges on HTTP proxies only
 		if strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
@@ -229,6 +243,35 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		}
 		rp.ServeHTTP(w, r)
 	}))
+
+	// Build middleware chain based on auth strategy
+	var handler http.Handler
+	if ep.AuthStrategy == "headers" {
+		// RFC 5.2: Trusted Headers auth - validate session, check allowed_apps, inject headers
+		p.mu.Lock()
+		um := p.userManager
+		sg := p.sessionGetter
+		p.mu.Unlock()
+
+		if um != nil && sg != nil {
+			thm := NewTrustedHeadersMiddleware(TrustedHeadersConfig{
+				UserManager:   um,
+				SessionGetter: sg,
+				AppIDResolver: func(r *http.Request) string { return ep.App },
+			})
+			handler = thm.Wrap(coreHandler)
+			log.Printf("INFO: Trusted headers middleware enabled for app=%s listener=%s", ep.App, ep.Name)
+		} else {
+			// Auth config not set - log warning and fall back to stripping headers only
+			log.Printf("WARN: Auth config not set for headers strategy app=%s; stripping headers only", ep.App)
+			handler = stripPiccoloHeadersMiddleware(coreHandler)
+		}
+	} else {
+		// For OIDC or no auth: just strip any spoofed X-Piccolo-* headers as a security baseline
+		handler = stripPiccoloHeadersMiddleware(coreHandler)
+	}
+
+	// Apply common middleware chain
 	handler = p.securityHeaders(handler)
 	handler = requestLogging(handler)
 	handler = basicRateLimit(handler) // stub
@@ -236,7 +279,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		log.Printf("INFO: HTTP proxy %s → %s (app=%s listener=%s protocol=%s)", ln.Addr().String(), target, ep.App, ep.Name, ep.Protocol.String())
+		log.Printf("INFO: HTTP proxy %s → %s (app=%s listener=%s protocol=%s auth=%s)", ln.Addr().String(), target, ep.App, ep.Name, ep.Protocol.String(), ep.AuthStrategy)
 		srv := &http.Server{
 			Handler: handler,
 			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
@@ -250,6 +293,15 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		}
 		_ = srv.Serve(ln) // returns on ln.Close()
 	}()
+}
+
+// stripPiccoloHeadersMiddleware removes all X-Piccolo-* headers from incoming requests.
+// This prevents clients from spoofing trusted headers regardless of auth strategy.
+func stripPiccoloHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		StripHeadersFromRequest(r)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Middleware stubs

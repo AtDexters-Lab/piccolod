@@ -45,16 +45,16 @@ func TestManager_ChangePasswordWithRecovery(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	ctx := context.Background()
-	if err := m.Setup(ctx, "initial"); err != nil {
+	if err := m.Setup(ctx, "initial1"); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	if err := m.ChangePasswordWithRecovery(ctx, "recovered"); err != nil {
+	if err := m.ChangePasswordWithRecovery(ctx, "recovered1"); err != nil {
 		t.Fatalf("ChangePasswordWithRecovery: %v", err)
 	}
-	if ok, _ := m.Verify(ctx, "admin", "initial"); ok {
+	if ok, _ := m.Verify(ctx, "admin", "initial1"); ok {
 		t.Fatalf("expected old password to fail")
 	}
-	if ok, err := m.Verify(ctx, "admin", "recovered"); err != nil || !ok {
+	if ok, err := m.Verify(ctx, "admin", "recovered1"); err != nil || !ok {
 		t.Fatalf("expected recovered password to verify, ok=%v err=%v", ok, err)
 	}
 }

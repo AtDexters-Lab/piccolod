@@ -23,9 +23,11 @@ import (
 	"piccolod/internal/consensus"
 	"piccolod/internal/container"
 	crypt "piccolod/internal/crypt"
+	pki "piccolod/internal/crypto"
 	"piccolod/internal/events"
 	"piccolod/internal/health"
 	"piccolod/internal/mdns"
+	"piccolod/internal/oidc"
 	"piccolod/internal/persistence"
 	"piccolod/internal/remote"
 	"piccolod/internal/remote/nexusclient"
@@ -91,6 +93,7 @@ type GinServer struct {
 	// Auth & sessions (Phase 1)
 	authManager *authpkg.Manager
 	sessions    *authpkg.SessionStore
+	userManager *authpkg.UserManager
 	// simple rate-limit counters for login failures
 	loginFailures int
 	resetFailures int
@@ -100,6 +103,20 @@ type GinServer struct {
 	healthTracker  *health.Tracker
 	updateManager  osUpdateManager
 	catalogManager *catalog.Manager
+
+	// Remote state tracking for OIDC app cache busting
+	remoteStateMu         sync.Mutex
+	remoteStateEnabled    bool
+	oidcRestartTimer      *time.Timer
+	oidcRestartDebounceMs int
+
+	// OIDC Provider (cached)
+	oidcProvider   *oidc.Provider
+	oidcProviderMu sync.Mutex
+
+	// Internal CA for OIDC Back-Channel
+	internalCA  *pki.InternalCA
+	internalSrv *http.Server
 
 	reloadersMu     sync.RWMutex
 	unlockReloaders []unlockReloader
@@ -429,6 +446,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.authManager = am
 	s.sessions = authpkg.NewSessionStore()
 	s.authRepo = authRepo
+	s.userManager = authpkg.NewUserManager(persist.Control().Users())
 
 	// Remote manager
 	bootstrapDir := persist.BootstrapVolume().MountDir
@@ -448,6 +466,19 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.remoteManager = rm
 	s.registerUnlockReloader(rm)
 	rm.SetEventsBus(eventsBus)
+
+	// Internal CA (for OIDC Back-Channel)
+	// We use the bootstrap volume for certs as it is available early.
+	ca, err := pki.NewInternalCA(bootstrapDir)
+	if err != nil {
+		return nil, fmt.Errorf("internal CA init: %w", err)
+	}
+	if err := ca.EnsureServerCertificate(); err != nil {
+		return nil, fmt.Errorf("ensure server cert: %w", err)
+	}
+	s.internalCA = ca
+	s.appManager.SetInternalCAPath(ca.CertPath())
+
 	// Now that remote manager exists, wire ACME challenge handler and cert provider
 	if rm != nil && svcMgr != nil {
 		svcMgr.ProxyManager().SetAcmeHandler(rm.HTTPChallengeHandler())
@@ -540,6 +571,7 @@ func (s *GinServer) Start() error {
 	}
 
 	s.startSecureLoopback()
+	s.startInternalHTTPSListener()
 
 	log.Printf("INFO: Starting piccolod server with Gin on http://localhost:%s", port)
 
@@ -560,6 +592,7 @@ func (s *GinServer) Stop() error {
 		s.appManager.StopRuntimeEvents()
 	}
 	s.stopSecureLoopback()
+	s.stopInternalHTTPSListener()
 	if err := s.supervisor.Stop(context.Background()); err != nil {
 		log.Printf("WARN: Failed to stop components cleanly: %v", err)
 		return err
@@ -609,6 +642,21 @@ func (s *GinServer) setupGinRoutes() {
 		h.ServeHTTP(c.Writer, c.Request)
 	})
 
+	// OIDC Discovery
+	r.GET("/.well-known/openid-configuration", s.handleOIDCDiscovery)
+
+	// OIDC Endpoints
+	r.GET("/oauth/authorize", s.handleOIDCAuthorize)
+	r.POST("/oauth/authorize", s.handleOIDCAuthorize) // Support POST for form submissions
+	r.POST("/oauth/token", s.handleOIDCToken)
+	r.GET("/oauth/jwks", s.handleOIDCJwks)
+	r.GET("/oauth/userinfo", s.handleOIDCUserinfo)
+	r.POST("/oauth/userinfo", s.handleOIDCUserinfo)
+	r.POST("/oauth/revoke", s.handleOIDCRevoke)
+	r.POST("/oauth/introspect", s.handleOIDCIntrospect)
+	r.GET("/oauth/logout", s.handleOIDCLogout)
+	r.POST("/oauth/logout", s.handleOIDCLogout)
+
 	// API v1 group
 	v1 := r.Group("/api/v1")
 	{
@@ -647,78 +695,108 @@ func (s *GinServer) setupGinRoutes() {
 		authed.Use(s.requireSession())
 		authed.Use(s.csrfMiddleware())
 
+		// Create Admin-only group
+		admin := authed.Group("/")
+		admin.Use(s.requireAdmin())
+
 		// Crypto endpoints (session required for lock/recovery management)
-		authed.POST("/crypto/lock", s.handleCryptoLock)
-		authed.POST("/crypto/recovery-key/generate", s.handleCryptoRecoveryGenerate)
+		admin.POST("/crypto/lock", s.handleCryptoLock)
+		admin.POST("/crypto/recovery-key/generate", s.handleCryptoRecoveryGenerate)
 
 		// App management endpoints
 		apps := authed.Group("/apps")
 		{
-			apps.POST("", s.requireUnlocked(), s.handleGinAppInstall)           // POST /api/v1/apps
-			apps.POST("/validate", s.handleGinAppValidate)                      // POST /api/v1/apps/validate
-			apps.GET("/check-instance", s.handleGinAppCheckInstance)            // GET /api/v1/apps/check-instance?id=...
-			apps.GET("", s.handleGinAppList)                                    // GET /api/v1/apps
-			apps.GET("/:name", s.handleGinAppGet)                               // GET /api/v1/apps/:name
-			apps.DELETE("/:name", s.requireUnlocked(), s.handleGinAppUninstall) // DELETE /api/v1/apps/:name
+			// Read-only / User-specific access (Handlers must enforce filtering)
+			apps.GET("/check-instance", s.handleGinAppCheckInstance)
+			apps.GET("", s.handleGinAppList)
+			apps.GET("/:name", s.handleGinAppGet)
 			apps.GET("/:name/services", s.handleGinServicesByApp)
-			apps.GET("/:name/logs", s.handleGinAppLogs) // GET /api/v1/apps/:name/logs?tail=200
+			apps.GET("/:name/logs", s.handleGinAppLogs)
 			apps.GET("/:name/logs/stream", s.handleGinAppLogStream)
-			apps.PATCH("/:name/listeners", s.requireUnlocked(), s.handleGinAppUpdateListeners)
 
-			// App actions
-			apps.POST("/:name/start", s.requireUnlocked(), s.handleGinAppStart) // POST /api/v1/apps/:name/start
-			apps.POST("/:name/stop", s.requireUnlocked(), s.handleGinAppStop)   // POST /api/v1/apps/:name/stop
-
-			// Workspace terminal - WebSocket endpoint for exec'ing into container
-			apps.GET("/:name/terminal", s.handleWorkspaceTerminal) // GET /api/v1/apps/:name/terminal (WebSocket)
+			// Admin-only actions
+			apps.POST("", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppInstall)
+			apps.POST("/validate", s.requireAdmin(), s.handleGinAppValidate)
+			apps.DELETE("/:name", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUninstall)
+			apps.PATCH("/:name/listeners", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUpdateListeners)
+			apps.POST("/:name/start", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppStart)
+			apps.POST("/:name/stop", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppStop)
+			apps.GET("/:name/terminal", s.requireAdmin(), s.handleWorkspaceTerminal)
 		}
 
-		// Image search for workspace creation
-		authed.GET("/images/search", s.handleImageSearch) // GET /api/v1/images/search?q=nginx&limit=25
+		// Image search (Admin only)
+		admin.GET("/images/search", s.handleImageSearch)
 
-		authed.GET("/system/logs/stream", s.handleGinSystemLogStream)
+		// System logs (Admin only)
+		admin.GET("/system/logs/stream", s.handleGinSystemLogStream)
+		
+		// Task progress (Admin only?) - Maybe standard user needs to see progress of their own actions?
+		// But they can't trigger actions. So Admin only is safe.
+		// Actually, let's allow it for now as it's harmless read-only.
 		authed.GET("/events/progress/stream", s.handleGinTaskProgressStream)
 
-		// Remote config endpoints require auth
-		authed.POST("/remote/configure", s.handleRemoteConfigure)
-		authed.POST("/remote/disable", s.handleRemoteDisable)
-		authed.POST("/remote/rotate", s.handleRemoteRotate)
-		authed.POST("/remote/preflight", s.handleRemotePreflight)
-		authed.GET("/remote/aliases", s.handleRemoteAliasesList)
-		authed.POST("/remote/aliases", s.handleRemoteAliasesCreate)
-		authed.DELETE("/remote/aliases/:id", s.handleRemoteAliasesDelete)
-		authed.GET("/remote/certificates", s.handleRemoteCertificatesList)
-		authed.POST("/remote/certificates/:id/renew", s.handleRemoteCertificateRenew)
-		authed.GET("/remote/events", s.handleRemoteEvents)
-		authed.GET("/remote/dns/providers", s.handleRemoteDNSProviders)
-		authed.GET("/remote/nexus-guide", s.handleRemoteGuideInfo)
-		authed.POST("/remote/nexus-guide/verify", s.handleRemoteGuideVerify)
+		// Remote config endpoints (Admin only)
+		remote := admin.Group("/remote")
+		{
+			remote.POST("/configure", s.handleRemoteConfigure)
+			remote.POST("/disable", s.handleRemoteDisable)
+			remote.POST("/rotate", s.handleRemoteRotate)
+			remote.POST("/preflight", s.handleRemotePreflight)
+			remote.GET("/aliases", s.handleRemoteAliasesList)
+			remote.POST("/aliases", s.handleRemoteAliasesCreate)
+			remote.DELETE("/aliases/:id", s.handleRemoteAliasesDelete)
+			remote.GET("/certificates", s.handleRemoteCertificatesList)
+			remote.POST("/certificates/:id/renew", s.handleRemoteCertificateRenew)
+			remote.GET("/events", s.handleRemoteEvents)
+			remote.GET("/dns/providers", s.handleRemoteDNSProviders)
+			remote.GET("/nexus-guide", s.handleRemoteGuideInfo)
+			remote.POST("/nexus-guide/verify", s.handleRemoteGuideVerify)
+		}
 
-		// Persistence exports (prototype)
-		authed.POST("/exports/control", s.requireUnlocked(), s.handlePersistenceControlExport)
-		authed.POST("/exports/full", s.requireUnlocked(), s.handlePersistenceFullExport)
+		// Persistence exports (Admin only)
+		admin.POST("/exports/control", s.requireUnlocked(), s.handlePersistenceControlExport)
+		admin.POST("/exports/full", s.requireUnlocked(), s.handlePersistenceFullExport)
 
-		// Auth-only endpoints
+		// Auth-only endpoints (Accessible to all logged-in users)
 		authed.POST("/auth/logout", s.handleAuthLogout)
 		authed.POST("/auth/password", s.handleAuthPassword)
 		authed.POST("/auth/staleness/ack", s.handleAuthStalenessAck)
 		authed.GET("/auth/csrf", s.handleAuthCSRF)
+		authed.POST("/oauth/resume", s.handleOIDCResume)
 
-		// Debug terminal (Local & Admin only)
-		// Update: enable for all authenticated users for easier remote ux via Nexus
-		authed.GET("/terminal", s.handleTerminal)
+		// Debug terminal (Admin only)
+		admin.GET("/terminal", s.handleTerminal)
 
-		// OS updates
-		authed.GET("/updates/os", s.handleOSUpdateStatus)
-		authed.POST("/updates/os/apply", s.requireUnlocked(), s.handleOSUpdateApply)
-		authed.POST("/updates/os/rollback", s.requireUnlocked(), s.handleOSUpdateRollback)
-		authed.POST("/updates/os/reboot", s.requireUnlocked(), s.handleOSUpdateReboot)
+		// OS updates (Admin only)
+		updates := admin.Group("/updates/os")
+		{
+			updates.GET("", s.handleOSUpdateStatus)
+			updates.POST("/apply", s.requireUnlocked(), s.handleOSUpdateApply)
+			updates.POST("/rollback", s.requireUnlocked(), s.handleOSUpdateRollback)
+			updates.POST("/reboot", s.requireUnlocked(), s.handleOSUpdateReboot)
+		}
 
-		// Catalog (read-only) and services require auth
-		authed.GET("/catalog", s.handleGinCatalog)
-		authed.GET("/catalog/categories", s.handleGinCatalogCategories)
-		authed.GET("/catalog/:name/template", s.handleGinCatalogTemplate)
-		authed.GET("/catalog/:name/configure", s.handleGinCatalogConfigure)
+		// User management (Admin only)
+		users := admin.Group("/users")
+		{
+			users.GET("", s.handleListUsers)
+			users.POST("", s.handleCreateUser)
+			users.GET("/:id", s.handleGetUser)
+			users.PUT("/:id", s.handleUpdateUser)
+			users.DELETE("/:id", s.handleDeleteUser)
+			users.POST("/:id/password", s.handleSetUserPassword)
+		}
+
+		// Catalog (read-only) - Allow standard users to view catalog?
+		// RFC says "Restricted to allowed_apps". 
+		// If they can't install, viewing catalog is useless or maybe confusing.
+		// Let's restrict to Admin for now to be safe.
+		admin.GET("/catalog", s.handleGinCatalog)
+		admin.GET("/catalog/categories", s.handleGinCatalogCategories)
+		admin.GET("/catalog/:name/template", s.handleGinCatalogTemplate)
+		admin.GET("/catalog/:name/configure", s.handleGinCatalogConfigure)
+		
+		// Services list (Needs filtering)
 		authed.GET("/services", s.handleGinServicesAll)
 	}
 
@@ -755,7 +833,29 @@ func (s *GinServer) handleGinServicesAll(c *gin.Context) {
 		st := s.remoteManager.Status()
 		remoteStatus = &st
 	}
+
+	// Filter for standard users
+	var allowedApps map[string]struct{}
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		if s.userManager != nil {
+			user, err := s.userManager.Get(c.Request.Context(), sess.UserID)
+			if err != nil {
+				writeGinSuccess(c, []gin.H{}, "Found 0 services")
+				return
+			}
+			allowedApps = make(map[string]struct{})
+			for _, id := range user.AllowedApps {
+				allowedApps[id] = struct{}{}
+			}
+		}
+	}
+
 	for _, ep := range eps {
+		if allowedApps != nil {
+			if _, ok := allowedApps[ep.App]; !ok {
+				continue
+			}
+		}
 		out = append(out, s.formatServiceEndpoint(c, ep, remoteStatus))
 	}
 	c.JSON(http.StatusOK, gin.H{"services": out})
@@ -764,6 +864,18 @@ func (s *GinServer) handleGinServicesAll(c *gin.Context) {
 // handleGinServicesByApp returns services for a single app
 func (s *GinServer) handleGinServicesByApp(c *gin.Context) {
 	name := c.Param("name")
+
+	// Check access for standard users
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		if s.userManager != nil {
+			allowed, err := s.userManager.IsAppAllowed(c.Request.Context(), sess.UserID, name)
+			if err != nil || !allowed {
+				writeGinError(c, http.StatusForbidden, "Access denied")
+				return
+			}
+		}
+	}
+
 	eps, err := s.serviceManager.GetByApp(name)
 	if err != nil {
 		writeGinError(c, http.StatusNotFound, err.Error())
@@ -961,6 +1073,88 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 			s.remoteResolver.SetTlsMuxPort(0)
 		}
 	}
+
+	// Detect remote state transition and schedule OIDC app restart
+	s.remoteStateMu.Lock()
+	wasEnabled := s.remoteStateEnabled
+	nowEnabled := status.Enabled && strings.TrimSpace(status.PortalHostname) != ""
+	s.remoteStateEnabled = nowEnabled
+	s.remoteStateMu.Unlock()
+
+	if wasEnabled != nowEnabled {
+		s.scheduleOIDCAppsRestart()
+	}
+}
+
+// scheduleOIDCAppsRestart schedules a debounced restart of apps with auth.strategy: oidc.
+// This is called when remote state changes to ensure OIDC discovery endpoints update.
+func (s *GinServer) scheduleOIDCAppsRestart() {
+	if s == nil || s.appManager == nil {
+		return
+	}
+
+	// Only run on kernel leader (local mode)
+	if s.routeManager != nil && s.routeManager.KernelRoute().Mode != router.ModeLocal {
+		log.Printf("INFO: skipping OIDC app restart - not kernel leader")
+		return
+	}
+
+	debounceMs := s.oidcRestartDebounceMs
+	if debounceMs <= 0 {
+		debounceMs = 5000 // default 5 second debounce
+	}
+
+	s.remoteStateMu.Lock()
+	if s.oidcRestartTimer != nil {
+		s.oidcRestartTimer.Stop()
+	}
+	s.oidcRestartTimer = time.AfterFunc(time.Duration(debounceMs)*time.Millisecond, func() {
+		s.restartOIDCApps()
+	})
+	s.remoteStateMu.Unlock()
+
+	log.Printf("INFO: scheduled OIDC apps restart in %dms due to remote state change", debounceMs)
+}
+
+// restartOIDCApps restarts all apps with auth.strategy: oidc to update OIDC discovery.
+func (s *GinServer) restartOIDCApps() {
+	if s == nil || s.appManager == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	apps, err := s.appManager.List(ctx)
+	if err != nil {
+		log.Printf("ERROR: failed to list apps for OIDC restart: %v", err)
+		return
+	}
+
+	var oidcApps []string
+	for _, a := range apps {
+		if a.Definition != nil && a.Definition.Auth != nil && a.Definition.Auth.Strategy == "oidc" {
+			oidcApps = append(oidcApps, a.InstanceID)
+		}
+	}
+
+	if len(oidcApps) == 0 {
+		log.Printf("INFO: no OIDC apps to restart")
+		return
+	}
+
+	log.Printf("INFO: restarting %d OIDC apps due to remote state change: %v", len(oidcApps), oidcApps)
+
+	for _, id := range oidcApps {
+		// Stop then start to trigger fresh discovery endpoint configuration
+		if err := s.appManager.Stop(ctx, id); err != nil {
+			log.Printf("WARN: failed to stop OIDC app %s: %v", id, err)
+			continue
+		}
+		if err := s.appManager.Start(ctx, id); err != nil {
+			log.Printf("WARN: failed to start OIDC app %s: %v", id, err)
+		}
+	}
 }
 
 func (s *GinServer) observeLockState(bus *events.Bus) {
@@ -1137,6 +1331,42 @@ func (s *GinServer) stopSecureLoopback() {
 	s.secureSrv = nil
 	s.secureListener = nil
 	s.securePort = 0
+}
+
+func (s *GinServer) startInternalHTTPSListener() {
+	if s == nil || s.internalCA == nil {
+		return
+	}
+
+	// RFC 3.1: Bind to loopback only. Containers reach this via host-gateway (--add-host piccolo.local:host-gateway).
+	// This prevents exposing the self-signed OIDC surface to LAN/Internet.
+	addr := "127.0.0.1:443"
+	s.internalSrv = &http.Server{
+		Addr:    addr,
+		Handler: s.router,
+		// We rely on ListenAndServeTLS to load certs from disk
+	}
+
+	go func() {
+		certPath := s.internalCA.ServerCertPath()
+		keyPath := s.internalCA.ServerKeyPath()
+		log.Printf("INFO: Starting Internal HTTPS Listener on %s (piccolo.local back-channel)", addr)
+		if err := s.internalSrv.ListenAndServeTLS(certPath, keyPath); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("ERROR: Internal HTTPS Listener failed: %v", err)
+		}
+	}()
+}
+
+func (s *GinServer) stopInternalHTTPSListener() {
+	if s == nil || s.internalSrv == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.internalSrv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("WARN: Internal HTTPS listener shutdown failed: %v", err)
+	}
+	s.internalSrv = nil
 }
 
 func (s *GinServer) httpsRedirectMiddleware() gin.HandlerFunc {

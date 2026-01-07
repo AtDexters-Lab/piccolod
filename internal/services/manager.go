@@ -311,12 +311,19 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 	return endpoints, nil
 }
 
-// AllocateForApp allocates ports for all listeners of an app and starts proxies
-func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListener) ([]ServiceEndpoint, error) {
+// AllocateForApp allocates ports for all listeners of an app and starts proxies.
+// authStrategy is the app's auth.strategy ("oidc", "headers", or empty for none).
+func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListener, authStrategy ...string) ([]ServiceEndpoint, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	endpoints := make([]ServiceEndpoint, 0, len(listeners))
+
+	// Extract auth strategy from variadic param (allows backward compat with existing calls)
+	strategy := ""
+	if len(authStrategy) > 0 {
+		strategy = authStrategy[0]
+	}
 
 	for _, l := range listeners {
 		hb, pp, err := m.allocator.AllocatePair()
@@ -325,15 +332,16 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 		}
 		remotePorts := defaultRemotePorts(l)
 		ep := ServiceEndpoint{
-			App:         appName,
-			Name:        l.Name,
-			GuestPort:   l.GuestPort,
-			HostBind:    hb,
-			PublicPort:  pp,
-			Flow:        l.Flow,
-			Protocol:    l.Protocol,
-			Middleware:  l.Middleware,
-			RemotePorts: remotePorts,
+			App:          appName,
+			Name:         l.Name,
+			GuestPort:    l.GuestPort,
+			HostBind:     hb,
+			PublicPort:   pp,
+			Flow:         l.Flow,
+			Protocol:     l.Protocol,
+			Middleware:   l.Middleware,
+			RemotePorts:  remotePorts,
+			AuthStrategy: strategy,
 		}
 		endpoints = append(endpoints, ep)
 		if _, ok := m.registry[appName]; !ok {

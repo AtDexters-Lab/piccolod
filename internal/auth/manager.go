@@ -117,6 +117,9 @@ func (m *Manager) Setup(ctx context.Context, password string) error {
 	if strings.TrimSpace(password) == "" {
 		return errors.New("password required")
 	}
+	if err := validatePasswordStrength(password); err != nil {
+		return err
+	}
 	return m.updateState(ctx, func(state *State) error {
 		if state.Initialized {
 			return errors.New("admin already set up")
@@ -135,6 +138,9 @@ func (m *Manager) Setup(ctx context.Context, password string) error {
 func (m *Manager) ChangePassword(ctx context.Context, old, newp string) error {
 	if strings.TrimSpace(old) == "" || strings.TrimSpace(newp) == "" {
 		return errors.New("passwords required")
+	}
+	if err := validatePasswordStrength(newp); err != nil {
+		return err
 	}
 	return m.updateState(ctx, func(state *State) error {
 		if !state.Initialized {
@@ -156,6 +162,9 @@ func (m *Manager) ChangePassword(ctx context.Context, old, newp string) error {
 func (m *Manager) ChangePasswordWithRecovery(ctx context.Context, newp string) error {
 	if strings.TrimSpace(newp) == "" {
 		return errors.New("password required")
+	}
+	if err := validatePasswordStrength(newp); err != nil {
+		return err
 	}
 	return m.updateState(ctx, func(state *State) error {
 		if !state.Initialized {
@@ -183,6 +192,11 @@ func (m *Manager) Verify(ctx context.Context, username, password string) (bool, 
 		return false, nil
 	}
 	return verifyArgon2id(st.PasswordHash, password), nil
+}
+
+// VerifyHash verifies a password against an Argon2id hash.
+func (m *Manager) VerifyHash(hash, password string) bool {
+	return verifyArgon2id(hash, password)
 }
 
 type fileState struct {
@@ -319,7 +333,9 @@ func verifyArgon2id(encoded, password string) bool {
 // Session store (in-memory)
 type Session struct {
 	ID        string
-	User      string
+	UserID    string // User UUID from users table
+	User      string // Username for display
+	Role      string // "admin" or "standard"
 	CSRF      string
 	ExpiresAt int64 // unix seconds
 }
@@ -339,10 +355,18 @@ func randString(n int) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-func (s *SessionStore) Create(user string, ttlSeconds int64) *Session {
+// CreateWithUserInfo creates a new session with full user information.
+func (s *SessionStore) CreateWithUserInfo(userID, username, role string, ttlSeconds int64) *Session {
 	id := randString(32)
 	csrf := randString(16)
-	sess := &Session{ID: id, User: user, CSRF: csrf, ExpiresAt: (timeNow().Unix() + ttlSeconds)}
+	sess := &Session{
+		ID:        id,
+		UserID:    userID,
+		User:      username,
+		Role:      role,
+		CSRF:      csrf,
+		ExpiresAt: timeNow().Unix() + ttlSeconds,
+	}
 	s.mu.Lock()
 	s.sessions[id] = sess
 	s.mu.Unlock()
