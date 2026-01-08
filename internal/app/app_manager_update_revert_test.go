@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"piccolod/internal/api"
@@ -27,76 +26,29 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 
 	// Install initial app
 	def := &api.AppDefinition{
-		Name: "demoapp", Image: "alpine:3.18", Type: "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "demoapp",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:3.18", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	inst, err := mgr.Install(ctx, def, "")
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
-	firstCID := inst.ContainerID
 	instanceID := inst.InstanceID
 
-	// Update tag to 3.19
+	// UpdateImage is not supported for service-mode apps (multi-container only).
 	tag := "3.19"
-	if err := mgr.UpdateImage(ctx, instanceID, &tag); err != nil {
-		t.Fatalf("update: %v", err)
+	if err := mgr.UpdateImage(ctx, instanceID, &tag); err == nil {
+		t.Fatalf("expected update image to fail for service-mode apps")
 	}
 
-	// Verify new image written
-	defPath := filepath.Join(tmp, AppsDir, instanceID, "app.yaml")
-	curData, err := os.ReadFile(defPath)
-	if err != nil {
-		t.Fatalf("read app.yaml: %v", err)
-	}
-	cur, err := ParseAppDefinition(curData)
-	if err != nil {
-		t.Fatalf("parse app.yaml: %v", err)
-	}
-	if cur.Image != "alpine:3.19" {
-		t.Fatalf("expected image alpine:3.19, got %s", cur.Image)
-	}
-	// Instance should have new CID
-	inst2, err := mgr.Get(ctx, instanceID)
-	if err != nil {
-		t.Fatalf("get app: %v", err)
-	}
-	if inst2.ContainerID == firstCID {
-		t.Fatalf("expected new container id after update")
-	}
-	if inst2.Status != "running" {
-		t.Fatalf("expected status running after update, got %s", inst2.Status)
-	}
-	if c := mock.containers[inst2.ContainerID]; c == nil || c.Status != "running" {
-		t.Fatalf("expected container to be started after update")
-	}
-
-	// Revert back to previous
-	if err := mgr.Revert(ctx, instanceID); err != nil {
-		t.Fatalf("revert: %v", err)
-	}
-	curData2, err := os.ReadFile(defPath)
-	if err != nil {
-		t.Fatalf("read app.yaml after revert: %v", err)
-	}
-	cur2, err := ParseAppDefinition(curData2)
-	if err != nil {
-		t.Fatalf("parse app.yaml after revert: %v", err)
-	}
-	// Expect image to be 3.18 again
-	if cur2.Image != "alpine:3.18" {
-		t.Fatalf("expected image alpine:3.18 after revert, got %s", cur2.Image)
-	}
-	inst3, err := mgr.Get(ctx, instanceID)
-	if err != nil {
-		t.Fatalf("get app after revert: %v", err)
-	}
-	if inst3.Status != "running" {
-		t.Fatalf("expected status running after revert, got %s", inst3.Status)
-	}
-	if c := mock.containers[inst3.ContainerID]; c == nil || c.Status != "running" {
-		t.Fatalf("expected container to be started after revert")
+	// Revert is also not supported for service-mode apps.
+	if err := mgr.Revert(ctx, instanceID); err == nil {
+		t.Fatalf("expected revert to fail for service-mode apps")
 	}
 }
 
@@ -116,10 +68,12 @@ func TestAppManager_Logs(t *testing.T) {
 	ctx := context.Background()
 
 	def := &api.AppDefinition{
-		Name:       "demo",
-		Image:      "alpine:latest",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "demo",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	inst, err := mgr.Install(ctx, def, "")

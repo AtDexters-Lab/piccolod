@@ -1,6 +1,5 @@
 # Development environment (workspace-style persistence)
 name: code-server
-image: codercom/code-server:latest
 
 listeners:
   - name: web
@@ -13,22 +12,25 @@ listeners:
     flow: tcp
     protocol: raw
 
-storage:
-  persistent:
-    projects:
-      container: /home/coder/projects
-      size_limit: 100GB
-    config:
-      container: /home/coder/.local
-      size_limit: 5GB
-  temporary:
-    cache:
-      container: /tmp/cache
-      size_limit: 10GB
-
-environment:
-  PASSWORD: mypassword
-  SUDO_PASSWORD: mypassword
+services:
+  main:
+    image: codercom/code-server:latest
+    bind_ports: [8080, 22]
+    storage:
+      persistent:
+        projects:
+          container: /home/coder/projects
+          size_limit: 100GB
+        config:
+          container: /home/coder/.local
+          size_limit: 5GB
+      temporary:
+        cache:
+          container: /tmp/cache
+          size_limit: 10GB
+    environment:
+      PASSWORD: mypassword
+      SUDO_PASSWORD: mypassword
 
 permissions:
   network:

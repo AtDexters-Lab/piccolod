@@ -260,10 +260,12 @@ func TestGinAppAPI_CheckInstance(t *testing.T) {
 	}
 
 	appDef := &api.AppDefinition{
-		Name:       "demo",
-		Image:      "alpine:latest",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "demo",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	if _, err := server.appManager.Install(context.Background(), appDef, ""); err != nil {
@@ -324,10 +326,12 @@ func TestGinAppAPI_List(t *testing.T) {
 
 	// Install an app via the app manager directly
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "nginx:alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "test-app",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
@@ -388,15 +392,17 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	srv.refreshRemoteRuntime()
 
 	_, err := srv.appManager.Install(context.Background(), &api.AppDefinition{
-		Name:  "blog",
-		Image: "docker.io/library/nginx:alpine",
-		Type:  "user",
+		Name: "blog",
+		Type: "user",
 		Listeners: []api.AppListener{{
 			Name:      "web",
 			GuestPort: 80,
 			Flow:      api.FlowTCP,
 			Protocol:  api.ListenerProtocolHTTP,
 		}},
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}, "")
 	if err != nil {
@@ -459,10 +465,12 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "nginx:alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "test-app",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
@@ -534,10 +542,12 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "alpine:latest",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "test-app",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
@@ -742,10 +752,12 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "alpine:latest",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "test-app",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
@@ -1470,10 +1482,12 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	// But we can use AllocateForApp if we mock it, OR just manually register an app first.
 	// Let's use Install() for consistency
 	appDef := &api.AppDefinition{
-		Name:       "url-test",
-		Image:      "alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Name:      "url-test",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	_, err := server.appManager.Install(context.Background(), appDef, "")

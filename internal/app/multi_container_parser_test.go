@@ -42,13 +42,13 @@ func TestValidateAppDefinition_MultiContainer_ServiceMode(t *testing.T) {
 	}
 }
 
-func TestValidateAppDefinition_MultiContainer_RejectsWorkspaceMode(t *testing.T) {
+func TestValidateAppDefinition_WorkspaceRequiresSingleService(t *testing.T) {
 	app := &api.AppDefinition{
-		Name:           "demo",
-		Type:           "user",
-		PrimaryService: "main",
+		Name: "demo",
+		Type: "user",
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine:latest", BindPorts: []int{}},
+			"side": {Image: "alpine:latest", BindPorts: []int{}},
 		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}

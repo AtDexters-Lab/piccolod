@@ -261,7 +261,7 @@ type AppProtocolMiddleware struct {
 type AppService struct {
 	Image       string            `yaml:"image" json:"image"`
 	After       []string          `yaml:"after,omitempty" json:"after,omitempty"`
-	BindPorts   []int             `yaml:"bind_ports,omitempty" json:"bind_ports,omitempty"`
+	BindPorts   []int             `yaml:"bind_ports" json:"bind_ports"`
 	Environment map[string]string `yaml:"environment,omitempty" json:"environment,omitempty"`
 	Storage     *AppStorage       `yaml:"storage,omitempty" json:"storage,omitempty"`
 	Resources   *AppResources     `yaml:"resources,omitempty" json:"resources,omitempty"`

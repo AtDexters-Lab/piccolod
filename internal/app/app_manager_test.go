@@ -81,9 +81,19 @@ func allowHostStorage(t *testing.T, m *AppManager) {
 	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") != "1" {
 		t.Skip("set PICCOLO_ALLOW_UNMOUNTED_TESTS=1 to run without mounted volumes")
 	}
+	runtimeDir, err := os.MkdirTemp("", "pcl-xdg-")
+	if err != nil {
+		t.Fatalf("create XDG runtime dir: %v", err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(runtimeDir)
+	})
 	if m.stateBaseDir != "" {
 		t.Setenv("PICCOLO_STATE_DIR", m.stateBaseDir)
-		t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(m.stateBaseDir, "run", "podman"))
+		shortRunroot := filepath.Join(os.TempDir(), "piccolo-podman-runroot")
+		_ = os.MkdirAll(shortRunroot, 0o755)
+		t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", shortRunroot)
 		paths.SetRootForTest(m.stateBaseDir)
 		m.SetVolumeManager(&stubVolumeManager{root: m.stateBaseDir})
 	}
@@ -247,11 +257,16 @@ func TestAppManager_Install(t *testing.T) {
 	// Test app definition
 	appDef := &api.AppDefinition{
 		Name:      "test-app",
-		Image:     "nginx:alpine",
 		Type:      "user",
 		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
-		Environment: map[string]string{
-			"ENV_VAR": "test-value",
+		Services: map[string]api.AppService{
+			"main": {
+				Image:     "nginx:alpine",
+				BindPorts: []int{80},
+				Environment: map[string]string{
+					"ENV_VAR": "test-value",
+				},
+			},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
@@ -274,9 +289,9 @@ func TestAppManager_Install(t *testing.T) {
 		t.Errorf("Expected app status 'running', got %s", app.Status)
 	}
 
-	// Verify container was created
-	if len(mockContainer.containers) != 1 {
-		t.Errorf("Expected 1 container created, got %d", len(mockContainer.containers))
+	// Verify containers were created (network anchor + main service)
+	if len(mockContainer.containers) != 2 {
+		t.Errorf("Expected 2 containers created, got %d", len(mockContainer.containers))
 	}
 
 	// Verify filesystem structure was created
@@ -320,8 +335,12 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 	allowHostStorage(t, manager)
 	manager.ForceLockState(false)
 	if _, err := manager.Install(context.Background(), &api.AppDefinition{
-		Name: "demo", Image: "alpine:latest", Type: "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Name:      "demo",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}, ""); err != nil {
 		t.Fatalf("seed install: %v", err)
@@ -342,10 +361,12 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 	}
 
 	appDef := &api.AppDefinition{
-		Name:       "nope",
-		Image:      "nginx:alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "nope",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	if _, err := manager.Install(context.Background(), appDef, ""); !errors.Is(err, ErrNotLeader) {
@@ -429,17 +450,21 @@ func TestAppManager_List(t *testing.T) {
 
 	// Install two apps
 	appDef1 := &api.AppDefinition{
-		Name:       "app1",
-		Image:      "nginx:alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "app1",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	appDef2 := &api.AppDefinition{
-		Name:       "app2",
-		Image:      "alpine:latest",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "app2",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
@@ -522,10 +547,12 @@ func TestAppManager_Get(t *testing.T) {
 
 	// Install an app
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "nginx:alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "test-app",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	installedApp, err := manager.Install(ctx, appDef, "")
@@ -609,10 +636,12 @@ func TestAppManager_StartStop(t *testing.T) {
 
 	// Install an app
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "nginx:alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "test-app",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	_, err = manager.Install(ctx, appDef, "")
@@ -633,8 +662,8 @@ func TestAppManager_StartStop(t *testing.T) {
 			startedContainers++
 		}
 	}
-	if startedContainers != 1 {
-		t.Errorf("Expected 1 container started, got %d", startedContainers)
+	if startedContainers != 2 {
+		t.Errorf("Expected 2 containers started, got %d", startedContainers)
 	}
 
 	// Verify status was updated
@@ -660,8 +689,8 @@ func TestAppManager_StartStop(t *testing.T) {
 			stoppedContainers++
 		}
 	}
-	if stoppedContainers != 1 {
-		t.Errorf("Expected 1 container stopped, got %d", stoppedContainers)
+	if stoppedContainers != 2 {
+		t.Errorf("Expected 2 containers stopped, got %d", stoppedContainers)
 	}
 
 	// Verify status was updated
@@ -708,10 +737,12 @@ func TestAppManager_Uninstall(t *testing.T) {
 
 	// Install an app
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "nginx:alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "test-app",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	_, err = manager.Install(ctx, appDef, "")
@@ -780,10 +811,12 @@ func TestAppManager_EnableDisable(t *testing.T) {
 
 	// Install an app
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "nginx:alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "test-app",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	_, err = manager.Install(ctx, appDef, "")
@@ -889,11 +922,16 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 	// Install an app and enable it
 	appDef := &api.AppDefinition{
 		Name:      "persistent-app",
-		Image:     "nginx:alpine",
 		Type:      "user",
 		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
-		Environment: map[string]string{
-			"TEST_VAR": "persistent-value",
+		Services: map[string]api.AppService{
+			"main": {
+				Image:     "nginx:alpine",
+				BindPorts: []int{80},
+				Environment: map[string]string{
+					"TEST_VAR": "persistent-value",
+				},
+			},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
@@ -958,8 +996,8 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 		t.Errorf("Expected status 'running', got %s", app2.Status)
 	}
 
-	if app2.Definition.Environment["TEST_VAR"] != "persistent-value" {
-		t.Errorf("Expected TEST_VAR='persistent-value', got %s", app2.Definition.Environment["TEST_VAR"])
+	if app2.Definition.Services["main"].Environment["TEST_VAR"] != "persistent-value" {
+		t.Errorf("Expected TEST_VAR='persistent-value', got %s", app2.Definition.Services["main"].Environment["TEST_VAR"])
 	}
 
 	if !app2.CreatedAt.Equal(installTime) {
@@ -988,8 +1026,12 @@ func TestAppManager_BlockedWhenLocked(t *testing.T) {
 	mgr.ForceLockState(true)
 	ctx := context.Background()
 	_, err = mgr.Install(ctx, &api.AppDefinition{
-		Name: "locked-app", Image: "nginx:latest", Type: "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "locked-app",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:latest", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}, "")
 	if !errors.Is(err, ErrLocked) {
@@ -1010,15 +1052,11 @@ func TestAppManager_RestoreServicesSkipsStoppedApps(t *testing.T) {
 	mgr.ForceLockState(false)
 
 	app := &api.AppDefinition{
-		Name:  "demo",
-		Image: "docker.io/library/nginx:alpine",
-		Type:  "user",
-		Listeners: []api.AppListener{{
-			Name:      "web",
-			GuestPort: 8080,
-			Flow:      api.FlowTCP,
-			Protocol:  api.ListenerProtocolHTTP,
-		}},
+		Name: "demo",
+		Type: "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
+		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
@@ -1049,15 +1087,11 @@ func TestAppManager_ReconcileOnceStartsDesiredRunningApps(t *testing.T) {
 	mgr.ForceLockState(false)
 
 	app := &api.AppDefinition{
-		Name:  "demo",
-		Image: "docker.io/library/nginx:alpine",
-		Type:  "user",
-		Listeners: []api.AppListener{{
-			Name:      "web",
-			GuestPort: 8080,
-			Flow:      api.FlowTCP,
-			Protocol:  api.ListenerProtocolHTTP,
-		}},
+		Name: "demo",
+		Type: "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
+		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
@@ -1094,15 +1128,11 @@ func TestAppManager_ReconcileOnceStopsDesiredStoppedApps(t *testing.T) {
 	mgr.ForceLockState(false)
 
 	app := &api.AppDefinition{
-		Name:  "demo",
-		Image: "docker.io/library/nginx:alpine",
-		Type:  "user",
-		Listeners: []api.AppListener{{
-			Name:      "web",
-			GuestPort: 8080,
-			Flow:      api.FlowTCP,
-			Protocol:  api.ListenerProtocolHTTP,
-		}},
+		Name: "demo",
+		Type: "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
+		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
@@ -1151,15 +1181,11 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 	mgr.ForceLockState(false)
 
 	app := &api.AppDefinition{
-		Name:  "demo",
-		Image: "docker.io/library/nginx:alpine",
-		Type:  "user",
-		Listeners: []api.AppListener{{
-			Name:      "web",
-			GuestPort: 8080,
-			Flow:      api.FlowTCP,
-			Protocol:  api.ListenerProtocolHTTP,
-		}},
+		Name: "demo",
+		Type: "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
+		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
@@ -1220,15 +1246,11 @@ func TestAppManager_ReconcileOnceResolvesStaleContainerID(t *testing.T) {
 	mgr.ForceLockState(false)
 
 	app := &api.AppDefinition{
-		Name:  "demo",
-		Image: "docker.io/library/nginx:alpine",
-		Type:  "user",
-		Listeners: []api.AppListener{{
-			Name:      "web",
-			GuestPort: 8080,
-			Flow:      api.FlowTCP,
-			Protocol:  api.ListenerProtocolHTTP,
-		}},
+		Name: "demo",
+		Type: "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
+		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 

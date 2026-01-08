@@ -768,7 +768,8 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 	if err != nil {
 		return err
 	}
-	if def.Services != nil {
+	mode := piccoloModeFromExtensions(def.Extensions)
+	if mode == ModeService {
 		return m.reconcileMultiContainer(ctx, state, appInst, def, layout, runtime, desiredRunning)
 	}
 
@@ -1118,8 +1119,10 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		}
 	}()
 
-	// Multi-container service-mode apps (compose-style) are installed as a group.
-	if appDef.Services != nil {
+	mode := piccoloModeFromExtensions(appDef.Extensions)
+
+	// Service-mode apps are always installed as a multi-container group.
+	if mode == ModeService {
 		m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseCreatingContainer, 60, "Creating containers", false, nil)
 		app, err := m.installMultiContainer(ctx, appDef, instanceID, displayName, layout, runtime, endpoints)
 		if err != nil {
@@ -1165,28 +1168,30 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		return nil, fmt.Errorf("failed to create container spec: %w", err)
 	}
 
-	mode := piccoloModeFromExtensions(appDef.Extensions)
-
 	// Workspace mode: use container-independent persistence via workspace disk.
 	// The workspace disk combines the base image (lowerdir) with a persistent
 	// writable layer (upperdir) using fuse-overlayfs, eliminating the need for
 	// podman commit snapshots.
 	if mode == ModeWorkspace {
+		workspaceImage := imageFromDefinition(appDef)
+		if strings.TrimSpace(workspaceImage) == "" {
+			return nil, fmt.Errorf("workspace app requires an image in services")
+		}
 		// Check if workspace disk is already initialized (reinstall case)
 		diskInitialized := m.isWorkspaceDiskInitialized(ctx, instanceID, layout)
 
 		if !diskInitialized {
 			// New install: pull base image and initialize workspace disk
-			m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, fmt.Sprintf("Pulling image %s", appDef.Image), false, nil)
-			if err := m.containerManager.PullImage(ctx, runtime, appDef.Image); err != nil {
+			m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, fmt.Sprintf("Pulling image %s", workspaceImage), false, nil)
+			if err := m.containerManager.PullImage(ctx, runtime, workspaceImage); err != nil {
 				log.Printf("WARN: install %s: image pull failed: %v", instanceID, err)
 				m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, 30, fmt.Sprintf("Image pull failed (continuing): %v", err), false, nil)
 			}
 
 			// Get image config for workspace disk metadata
-			imgConfig, err := m.containerManager.InspectImage(ctx, runtime, appDef.Image)
+			imgConfig, err := m.containerManager.InspectImage(ctx, runtime, workspaceImage)
 			if err != nil {
-				return nil, fmt.Errorf("install %s: failed to inspect image %s: %w", instanceID, appDef.Image, err)
+				return nil, fmt.Errorf("install %s: failed to inspect image %s: %w", instanceID, workspaceImage, err)
 			}
 
 			// Initialize and mount workspace disk
@@ -1204,9 +1209,9 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 			}
 
 			if baseImageDigest == "" {
-				return nil, fmt.Errorf("install %s: image digest not available for %s", instanceID, appDef.Image)
+				return nil, fmt.Errorf("install %s: image digest not available for %s", instanceID, workspaceImage)
 			}
-			mergedPath, err := m.initWorkspaceDisk(ctx, instanceID, layout, runtime, imgConfig, baseImageDigest, appDef.Image)
+			mergedPath, err := m.initWorkspaceDisk(ctx, instanceID, layout, runtime, imgConfig, baseImageDigest, workspaceImage)
 			if err != nil {
 				return nil, fmt.Errorf("failed to initialize workspace disk: %w", err)
 			}
@@ -1448,12 +1453,12 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 	// so we must remount it before the --rootfs container can start.
 	def, defErr := state.GetAppDefinition(instanceID)
 	if defErr == nil {
-		if def.Services != nil {
+		mode := piccoloModeFromExtensions(def.Extensions)
+		if mode == ModeService {
 			// Multi-container service-mode app: start network anchor + services in order.
 			m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseStarting, 60, "Starting containers", false, nil)
 			return m.startMultiContainer(ctx, state, app, def, layout, runtime)
 		}
-		mode := piccoloModeFromExtensions(def.Extensions)
 		if mode == ModeWorkspace {
 			m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseMountingWorkspace, 30, "Mounting workspace disk", false, nil)
 
@@ -1540,7 +1545,7 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 	}
 
 	def, defErr := state.GetAppDefinition(instanceID)
-	if defErr == nil && def.Services != nil {
+	if defErr == nil && piccoloModeFromExtensions(def.Extensions) == ModeService {
 		primary := primaryServiceFor(def, app)
 		order, _ := serviceStartOrder(def.Services)
 		for i := len(order) - 1; i >= 0; i-- {
@@ -1625,7 +1630,7 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 	}
 
 	def, defErr := state.GetAppDefinition(instanceID)
-	if defErr == nil && def.Services != nil {
+	if defErr == nil && piccoloModeFromExtensions(def.Extensions) == ModeService {
 		m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseStopping, 40, "Stopping containers", false, nil)
 		return m.stopMultiContainer(ctx, state, app, def, runtime)
 	}
@@ -1713,7 +1718,7 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 	}
 
 	def, defErr := state.GetAppDefinition(instanceID)
-	if defErr == nil && def.Services != nil {
+	if defErr == nil && piccoloModeFromExtensions(def.Extensions) == ModeService {
 		primary := primaryServiceFor(def, app)
 		order, _ := serviceStartOrder(def.Services)
 
@@ -1947,8 +1952,8 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	if err != nil {
 		return fmt.Errorf("failed to read current app.yaml: %w", err)
 	}
-	if curDef.Services != nil {
-		return fmt.Errorf("cannot update image for multi-container apps; update per-service images in the manifest and reinstall")
+	if piccoloModeFromExtensions(curDef.Extensions) == ModeService {
+		return fmt.Errorf("cannot update image for service-mode apps; update per-service images in the manifest and reinstall")
 	}
 
 	// Workspace mode apps cannot have their image updated because the workspace disk
@@ -2280,8 +2285,11 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	if err != nil {
 		return fmt.Errorf("no previous version to revert to: %w", err)
 	}
-	if prevDef.Services != nil || (appInst.Definition != nil && appInst.Definition.Services != nil) {
-		return fmt.Errorf("revert is not supported for multi-container apps")
+	if piccoloModeFromExtensions(prevDef.Extensions) == ModeService {
+		return fmt.Errorf("revert is not supported for service-mode apps")
+	}
+	if appInst.Definition != nil && piccoloModeFromExtensions(appInst.Definition.Extensions) == ModeService {
+		return fmt.Errorf("revert is not supported for service-mode apps")
 	}
 	// Backup current before writing previous
 	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
@@ -2293,8 +2301,8 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	_ = m.containerManager.StopContainer(ctx, runtime, appInst.ContainerID)
 	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.ContainerID)
 	// Pull to app's storage (best-effort)
-	if prevDef.Image != "" {
-		_ = m.containerManager.PullImage(ctx, runtime, prevDef.Image)
+	if prevImage := imageFromDefinition(prevDef); strings.TrimSpace(prevImage) != "" {
+		_ = m.containerManager.PullImage(ctx, runtime, prevImage)
 	}
 	// Create new container from prev
 	spec, err := m.appDefToContainerSpec(prevDef, endpoints, layout, instanceID)
@@ -2363,7 +2371,7 @@ func (m *AppManager) LogsForService(ctx context.Context, instanceID, service str
 	}
 
 	def := appInst.Definition
-	if def != nil && def.Services != nil {
+	if def != nil && piccoloModeFromExtensions(def.Extensions) == ModeService {
 		primary := primaryServiceFor(def, appInst)
 		target := strings.TrimSpace(service)
 		if target == "" {
@@ -2424,7 +2432,7 @@ func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, servi
 	}
 
 	def := appInst.Definition
-	if def != nil && def.Services != nil {
+	if def != nil && piccoloModeFromExtensions(def.Extensions) == ModeService {
 		primary := primaryServiceFor(def, appInst)
 		target := strings.TrimSpace(service)
 		if target == "" {
@@ -2465,11 +2473,39 @@ func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, servi
 // storage volumes are mapped into the per-app encrypted volume at <mount>/data/<volume-name>.
 // The instanceID parameter is the unique instance identifier used for container naming.
 func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints []services.ServiceEndpoint, layout appVolumeLayout, instanceID string) (container.ContainerCreateSpec, error) {
+	if appDef == nil {
+		return container.ContainerCreateSpec{}, fmt.Errorf("app definition required")
+	}
+	def := appDef
+	if piccoloModeFromExtensions(appDef.Extensions) == ModeWorkspace && appDef.Services != nil {
+		primary := primaryServiceFor(appDef, nil)
+		if primary == "" {
+			return container.ContainerCreateSpec{}, fmt.Errorf("workspace app requires primary service")
+		}
+		svc, ok := appDef.Services[primary]
+		if !ok {
+			return container.ContainerCreateSpec{}, fmt.Errorf("primary service '%s' not found", primary)
+		}
+		derived := *appDef
+		derived.Image = svc.Image
+		derived.Environment = svc.Environment
+		derived.Storage = svc.Storage
+		derived.Resources = svc.Resources
+		def = &derived
+	}
+
+	labelService := defaultPrimaryServiceName
+	if def.Services != nil {
+		if primary := primaryServiceFor(def, nil); strings.TrimSpace(primary) != "" {
+			labelService = primary
+		}
+	}
+
 	spec := container.ContainerCreateSpec{
 		Name:        instanceID,
-		Image:       appDef.Image,
-		Environment: appDef.Environment,
-		Labels:      piccoloLabels(instanceID, defaultPrimaryServiceName, "service"),
+		Image:       def.Image,
+		Environment: def.Environment,
+		Labels:      piccoloLabels(instanceID, labelService, "service"),
 	}
 
 	// Convert listeners to port mappings using allocated endpoints
@@ -2481,66 +2517,33 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	}
 
 	// Convert resources if present
-	if appDef.Resources != nil && appDef.Resources.Limits != nil {
+	if def.Resources != nil && def.Resources.Limits != nil {
 		spec.Resources = container.ResourceLimits{
-			Memory: appDef.Resources.Limits.Memory,
-			CPU:    fmt.Sprintf("%.1f", appDef.Resources.Limits.CPU),
+			Memory: def.Resources.Limits.Memory,
+			CPU:    fmt.Sprintf("%.1f", def.Resources.Limits.CPU),
 		}
 	}
 
 	// Set network mode based on permissions
-	if appDef.Permissions != nil && appDef.Permissions.Network != nil {
-		if appDef.Permissions.Network.Internet == "deny" {
+	if def.Permissions != nil && def.Permissions.Network != nil {
+		if def.Permissions.Network.Internet == "deny" {
 			spec.NetworkMode = "none"
 		}
 	}
 
 	// Set restart policy for system apps
-	if appDef.Type == "system" {
+	if def.Type == "system" {
 		spec.RestartPolicy = "always"
 	}
 
 	// Storage mounts:
 	// - storage.persistent -> bind mounts inside <app-volume>/data/<volume-name>
 	// - storage.temporary  -> tmpfs mounts (ephemeral)
-	if err := m.applyServiceStorageAndTmpfs(&spec, appDef.Storage, layout, appDef.Extensions); err != nil {
+	if err := m.applyServiceStorageAndTmpfs(&spec, def.Storage, layout, def.Extensions); err != nil {
 		return spec, err
 	}
 
-	// Inject OIDC auth environment variables if configured
-	if appDef.Auth != nil && appDef.Auth.Injection != nil && len(appDef.Auth.Injection.Env) > 0 {
-		if spec.Environment == nil {
-			spec.Environment = make(map[string]string)
-		}
-		for k, v := range appDef.Auth.Injection.Env {
-			spec.Environment[k] = v
-		}
-	}
-
-	// Inject Piccolo Internal CA and host gateway for OIDC/internal communication
-	m.stateMu.RLock()
-	caPath := m.internalCAPath
-	m.stateMu.RUnlock()
-
-	if caPath != "" {
-		// 1. Mount CA
-		containerPath := "/var/lib/piccolo/certs/internal-ca.crt"
-		if appDef.Auth != nil && appDef.Auth.Injection != nil && appDef.Auth.Injection.CAMountPath != "" {
-			containerPath = appDef.Auth.Injection.CAMountPath
-		}
-
-		spec.CAMounts = append(spec.CAMounts, container.CAMount{
-			HostPath:      caPath,
-			ContainerPath: containerPath,
-		})
-
-		// 2. Add piccolo.local -> host-gateway
-		if hostEntry, err := container.HostGatewayEntry(); err == nil {
-			spec.ExtraHosts = append(spec.ExtraHosts, hostEntry)
-		} else {
-			log.Printf("WARN: failed to resolve host gateway for piccolo.local: %v", err)
-		}
-	}
+	m.applyAuthInjection(&spec, def)
 
 	// Workspace mode: enable init and mount boot.sh wrapper
 	mode := piccoloModeFromExtensions(appDef.Extensions)
@@ -2587,6 +2590,47 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	}
 
 	return spec, nil
+}
+
+func (m *AppManager) applyAuthInjection(spec *container.ContainerCreateSpec, appDef *api.AppDefinition) {
+	if spec == nil || appDef == nil {
+		return
+	}
+
+	// Inject auth environment variables if configured
+	if appDef.Auth != nil && appDef.Auth.Injection != nil && len(appDef.Auth.Injection.Env) > 0 {
+		if spec.Environment == nil {
+			spec.Environment = make(map[string]string)
+		}
+		for k, v := range appDef.Auth.Injection.Env {
+			spec.Environment[k] = v
+		}
+	}
+
+	// Inject Piccolo Internal CA and host gateway for OIDC/internal communication
+	m.stateMu.RLock()
+	caPath := m.internalCAPath
+	m.stateMu.RUnlock()
+
+	if caPath == "" {
+		return
+	}
+
+	containerPath := "/var/lib/piccolo/certs/internal-ca.crt"
+	if appDef.Auth != nil && appDef.Auth.Injection != nil && appDef.Auth.Injection.CAMountPath != "" {
+		containerPath = appDef.Auth.Injection.CAMountPath
+	}
+
+	spec.CAMounts = append(spec.CAMounts, container.CAMount{
+		HostPath:      caPath,
+		ContainerPath: containerPath,
+	})
+
+	if hostEntry, err := container.HostGatewayEntry(); err == nil {
+		spec.ExtraHosts = append(spec.ExtraHosts, hostEntry)
+	} else {
+		log.Printf("WARN: failed to resolve host gateway for piccolo.local: %v", err)
+	}
 }
 
 // buildOriginalCommand constructs the original container command from image config.
@@ -2646,7 +2690,7 @@ func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, ser
 	}
 
 	def := appInst.Definition
-	if def != nil && def.Services != nil {
+	if def != nil && piccoloModeFromExtensions(def.Extensions) == ModeService {
 		primary := primaryServiceFor(def, appInst)
 		target := strings.TrimSpace(service)
 		if target == "" {

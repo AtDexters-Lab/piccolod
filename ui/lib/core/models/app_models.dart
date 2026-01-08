@@ -42,12 +42,39 @@ class App {
     final appName = (def['name'] ?? json['app_name'] ?? json['name'] ?? '')
         .toString();
 
-    // Image, type, environment come from definition
-    final image = (def['image'] ?? json['image'] ?? '').toString();
+    // Image, type, environment come from definition (fallback to primary service)
+    final services = def['services'] is Map ? Map.from(def['services']) : null;
+    String primaryService = (def['primary_service'] ?? '').toString();
+    if (primaryService.isEmpty) {
+      primaryService = 'main';
+    }
+    Map? primarySvc;
+    if (services != null) {
+      final svc = services[primaryService];
+      if (svc is Map) {
+        primarySvc = svc;
+      } else if (services.length == 1) {
+        final only = services.values.first;
+        if (only is Map) {
+          primarySvc = only;
+        }
+      }
+    }
+
+    String image = (def['image'] ?? json['image'] ?? '').toString();
+    if (image.isEmpty && primarySvc != null) {
+      image = (primarySvc['image'] ?? '').toString();
+    }
     final type = (def['type'] ?? json['type'] ?? 'user').toString();
-    final environment = Map<String, String>.from(
+    Map<String, String> environment = Map<String, String>.from(
       def['environment'] ?? json['environment'] ?? {},
     );
+    if (environment.isEmpty && primarySvc != null) {
+      final rawEnv = primarySvc['environment'];
+      if (rawEnv is Map) {
+        environment = rawEnv.map((k, v) => MapEntry(k.toString(), v.toString()));
+      }
+    }
 
     // Mode comes from x-piccolo extensions in definition
     String mode = '';

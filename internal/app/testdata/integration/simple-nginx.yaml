@@ -1,11 +1,16 @@
 name: simple-nginx-integration
-image: docker.io/library/nginx:alpine
 type: user
 listeners:
   - name: web
     guest_port: 80
     flow: tcp
     protocol: http
-environment:
-  NGINX_HOST: localhost
-  NGINX_PORT: "80"
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+    environment:
+      NGINX_HOST: localhost
+      NGINX_PORT: "80"
+x-piccolo:
+  mode: service

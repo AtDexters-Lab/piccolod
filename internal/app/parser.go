@@ -7,8 +7,9 @@ import (
 	"strings"
 	"text/template"
 
-	"gopkg.in/yaml.v3"
 	"piccolod/internal/api"
+
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -335,27 +336,59 @@ func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
 		return nil
 	}
 
-	// Multi-container is represented by presence of the top-level 'services' map.
-	if app.Services != nil {
-		if mode == ModeWorkspace {
-			return fmt.Errorf("services is not supported for workspace mode apps")
-		}
+	switch mode {
+	case ModeService:
 		if len(app.Services) == 0 {
-			return fmt.Errorf("services must not be empty")
+			return fmt.Errorf("services is required for service mode apps")
 		}
 
-		// When services is present, all container-level fields must be per-service.
+		// Service-mode apps must define container fields per-service only.
 		if strings.TrimSpace(app.Image) != "" {
-			return fmt.Errorf("image must be specified per-service under services when services is present")
+			return fmt.Errorf("image must be specified per-service under services for service mode apps")
 		}
 		if app.Environment != nil {
-			return fmt.Errorf("environment must be specified per-service under services when services is present")
+			return fmt.Errorf("environment must be specified per-service under services for service mode apps")
 		}
 		if app.Storage != nil {
-			return fmt.Errorf("storage must be specified per-service under services when services is present")
+			return fmt.Errorf("storage must be specified per-service under services for service mode apps")
 		}
 		if app.Resources != nil {
-			return fmt.Errorf("resources must be specified per-service under services when services is present")
+			return fmt.Errorf("resources must be specified per-service under services for service mode apps")
+		}
+
+		primary := strings.TrimSpace(app.PrimaryService)
+		if primary == "" {
+			primary = defaultPrimaryServiceName
+			if len(app.Services) == 1 {
+				for name := range app.Services {
+					primary = name
+				}
+			}
+		}
+		if _, ok := app.Services[primary]; !ok {
+			return fmt.Errorf("primary_service '%s' not found in services", primary)
+		}
+
+		return validateServices(app.Services, primary, app.Listeners)
+	case ModeWorkspace:
+		if len(app.Services) == 0 {
+			return fmt.Errorf("services is required for workspace mode apps")
+		}
+		if len(app.Services) != 1 {
+			return fmt.Errorf("workspace mode apps must define exactly one service")
+		}
+		// Workspace-mode apps must define container fields per-service only.
+		if strings.TrimSpace(app.Image) != "" {
+			return fmt.Errorf("image must be specified per-service under services for workspace mode apps")
+		}
+		if app.Environment != nil {
+			return fmt.Errorf("environment must be specified per-service under services for workspace mode apps")
+		}
+		if app.Storage != nil {
+			return fmt.Errorf("storage must be specified per-service under services for workspace mode apps")
+		}
+		if app.Resources != nil {
+			return fmt.Errorf("resources must be specified per-service under services for workspace mode apps")
 		}
 
 		primary := strings.TrimSpace(app.PrimaryService)
@@ -365,17 +398,9 @@ func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
 		if _, ok := app.Services[primary]; !ok {
 			return fmt.Errorf("primary_service '%s' not found in services", primary)
 		}
-
 		return validateServices(app.Services, primary, app.Listeners)
 	}
 
-	// Single-container app (legacy v1).
-	if strings.TrimSpace(app.PrimaryService) != "" {
-		return fmt.Errorf("primary_service requires services")
-	}
-	if strings.TrimSpace(app.Image) == "" {
-		return fmt.Errorf("image is required")
-	}
 	return nil
 }
 

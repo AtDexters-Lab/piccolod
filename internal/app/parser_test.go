@@ -13,7 +13,6 @@ func TestParseAppDefinition(t *testing.T) {
 		name           string
 		filePath       string
 		expectedName   string
-		expectedImage  string
 		expectedType   string
 		expectError    bool
 		validateFields func(*testing.T, *api.AppDefinition)
@@ -22,9 +21,20 @@ func TestParseAppDefinition(t *testing.T) {
 			name:          "minimal app",
 			filePath:      "../../testdata/apps/valid/minimal.yaml",
 			expectedName:  "test-minimal",
-			expectedImage: "alpine:latest",
 			expectedType:  "user", // default
 			expectError:   false,
+			validateFields: func(t *testing.T, app *api.AppDefinition) {
+				if app.Services == nil {
+					t.Fatal("expected services to be defined")
+				}
+				main, ok := app.Services["main"]
+				if !ok {
+					t.Fatal("expected main service to be defined")
+				}
+				if main.Image != "alpine:latest" {
+					t.Errorf("expected main image alpine:latest, got %s", main.Image)
+				}
+			},
 		},
 		{
 			name:         "complete app",
@@ -45,13 +55,20 @@ func TestParseAppDefinition(t *testing.T) {
 				if !found {
 					t.Error("Expected web listener with guest_port 80")
 				}
-				if app.Storage == nil || app.Storage.Persistent == nil {
+				if app.Services == nil {
+					t.Fatal("expected services to be defined")
+				}
+				main, ok := app.Services["main"]
+				if !ok {
+					t.Fatal("expected main service to be defined")
+				}
+				if main.Storage == nil || main.Storage.Persistent == nil {
 					t.Error("Expected persistent storage to be defined")
 				}
-				if app.Environment == nil {
+				if main.Environment == nil {
 					t.Error("Expected environment variables to be defined")
 				}
-				if env, ok := app.Environment["ENV"]; !ok || env != "test" {
+				if env, ok := main.Environment["ENV"]; !ok || env != "test" {
 					t.Error("Expected ENV=test environment variable")
 				}
 			},
@@ -85,10 +102,6 @@ func TestParseAppDefinition(t *testing.T) {
 				t.Errorf("Expected name %s, got %s", tt.expectedName, app.Name)
 			}
 
-			if tt.expectedImage != "" && app.Image != tt.expectedImage {
-				t.Errorf("Expected image %s, got %s", tt.expectedImage, app.Image)
-			}
-
 			// Validate default values
 			if app.Type == "" {
 				app.Type = "user" // Parser should set this default
@@ -120,7 +133,7 @@ func TestParseAppDefinitionErrors(t *testing.T) {
 		{
 			name:        "missing image",
 			filePath:    "../../testdata/apps/invalid/missing-image-and-build.yaml",
-			expectedErr: "image is required",
+			expectedErr: "services is required",
 		},
 	}
 
@@ -159,9 +172,11 @@ func TestValidateAppDefinition(t *testing.T) {
 		{
 			name: "valid minimal app",
 			app: &api.AppDefinition{
-				Name:       "test-app",
-				Image:      "nginx:latest",
-				Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+				Name:      "test-app",
+				Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+				Services: map[string]api.AppService{
+					"main": {Image: "nginx:latest", BindPorts: []int{80}},
+				},
 				Extensions: map[string]interface{}{"mode": "service"},
 			},
 			expectError: false,
@@ -169,9 +184,11 @@ func TestValidateAppDefinition(t *testing.T) {
 		{
 			name: "missing x-piccolo.mode",
 			app: &api.AppDefinition{
-				Name:       "test-app",
-				Image:      "nginx:latest",
-				Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+				Name:      "test-app",
+				Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+				Services: map[string]api.AppService{
+					"main": {Image: "nginx:latest", BindPorts: []int{80}},
+				},
 				Extensions: map[string]interface{}{},
 			},
 			expectError: true,
@@ -179,38 +196,40 @@ func TestValidateAppDefinition(t *testing.T) {
 		},
 		{
 			name:        "empty name",
-			app:         &api.AppDefinition{Image: "nginx:latest"},
+			app:         &api.AppDefinition{Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
 			expectError: true,
 			expectedErr: "name is required",
 		},
 		{
 			name:        "invalid name characters",
-			app:         &api.AppDefinition{Name: "test_app!", Image: "nginx:latest"},
+			app:         &api.AppDefinition{Name: "test_app!", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
 			expectError: true,
 			expectedErr: "name must contain only lowercase letters, numbers, and hyphens",
 		},
 		{
 			name:        "name too long",
-			app:         &api.AppDefinition{Name: "this-is-a-very-long-app-name-that-exceeds-the-maximum-allowed-length", Image: "nginx:latest"},
+			app:         &api.AppDefinition{Name: "this-is-a-very-long-app-name-that-exceeds-the-maximum-allowed-length", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
 			expectError: true,
 			expectedErr: "name must be 50 characters or less",
 		},
 		{
-			name:        "missing image",
+			name:        "missing services",
 			app:         &api.AppDefinition{Name: "test-app", Extensions: map[string]interface{}{"mode": "service"}},
 			expectError: true,
-			expectedErr: "image is required",
+			expectedErr: "services is required",
 		},
 		{
 			name: "invalid listener port",
 			app: &api.AppDefinition{
-				Name:       "test-app",
-				Image:      "nginx:latest",
-				Listeners:  []api.AppListener{{Name: "web", GuestPort: 0}},
+				Name:      "test-app",
+				Listeners: []api.AppListener{{Name: "web", GuestPort: 0}},
+				Services: map[string]api.AppService{
+					"main": {Image: "nginx:latest", BindPorts: []int{80}},
+				},
 				Extensions: map[string]interface{}{"mode": "service"},
 			},
 			expectError: true,
-			expectedErr: "guest_port must be between 1 and 65535",
+			expectedErr: "must declare listener guest_port",
 		},
 	}
 
@@ -261,10 +280,13 @@ x-piccolo:
 func TestParseAppDefinition_RejectsDependsOn(t *testing.T) {
 	manifest := `
 name: demo
-image: alpine:latest
 listeners:
   - name: web
     guest_port: 8080
+services:
+  main:
+    image: alpine:latest
+    bind_ports: [8080]
 depends_on:
   - other
 x-piccolo:
@@ -369,10 +391,13 @@ func TestLargeContentHandling(t *testing.T) {
 func TestParseAppDefinitionRejectsFilesystemBlock(t *testing.T) {
 	legacy := `
 name: test-app
-image: nginx:latest
 listeners:
   - name: web
     guest_port: 80
+services:
+  main:
+    image: nginx:latest
+    bind_ports: [80]
 filesystem:
   persistent: true
 x-piccolo:
@@ -391,15 +416,18 @@ x-piccolo:
 func TestParseAppDefinitionRejectsStorageHostPaths(t *testing.T) {
 	legacy := `
 name: test-app
-image: nginx:latest
 listeners:
   - name: web
     guest_port: 80
-storage:
-  persistent:
-    data:
-      container: /data
-      host: /not/allowed
+services:
+  main:
+    image: nginx:latest
+    bind_ports: [80]
+    storage:
+      persistent:
+        data:
+          container: /data
+          host: /not/allowed
 x-piccolo:
   mode: service
 `
@@ -416,17 +444,20 @@ x-piccolo:
 func TestParseAppDefinitionRejectsStoragePathConflicts(t *testing.T) {
 	conflict := `
 name: test-app
-image: nginx:latest
 listeners:
   - name: web
     guest_port: 80
-storage:
-  persistent:
-    data:
-      container: /data
-  temporary:
-    tmp:
-      container: /data
+services:
+  main:
+    image: nginx:latest
+    bind_ports: [80]
+    storage:
+      persistent:
+        data:
+          container: /data
+      temporary:
+        tmp:
+          container: /data
 x-piccolo:
   mode: service
 `

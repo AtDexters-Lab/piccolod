@@ -183,8 +183,11 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
     // Custom images get no default listeners - user adds via Edit Listeners
     return '''
 name: $name
-image: $image
 type: user
+services:
+  main:
+    image: $image
+    bind_ports: []
 x-piccolo:
   mode: workspace
 ''';

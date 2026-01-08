@@ -2,7 +2,9 @@ package app
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 
 	"piccolod/internal/container"
 	"piccolod/internal/state/paths"
@@ -18,7 +20,13 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 		volID = appVolumeID(instanceID)
 	}
 
-	runRoot := paths.Join("run", "podman", volID)
+	runRootBase := os.Getenv("PICCOLO_PODMAN_RUNROOT_BASE")
+	runRoot := ""
+	if runRootBase != "" {
+		runRoot = filepath.Join(filepath.Clean(runRootBase), volID)
+	} else {
+		runRoot = paths.Join("run", "podman", volID)
+	}
 	if err := ensureDir(runRoot, 0o700); err != nil {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: ensure podman runroot: %w", err)
 	}

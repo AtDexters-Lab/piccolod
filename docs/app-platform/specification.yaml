@@ -12,7 +12,12 @@
 # REQUIRED FIELDS -------------------------------------------------------------
 
 name: dev-workspace            # Logical app identifier (dependency graph, UI labels). Keep unique.
-image: ubuntu:22.04            # Required. Use pre-built images from a registry.
+
+# Services are required for both service and workspace modes.
+services:
+  main:
+    image: ubuntu:22.04        # Required image for the primary container.
+    bind_ports: [8080, 22]     # Required (may be empty if no listeners).
 
 # INPUTS (Dynamic Configuration) ----------------------------------------------
 # Defines the form schema presented to the user during installation.
@@ -119,7 +124,7 @@ listeners:
 
 # STORAGE (data dataset) ------------------------------------------------------
 # storage.persistent declares the *durable user data* mountpoints for this app.
-# For multi-container service apps, storage is defined per-service under services.<name>.storage.
+# For service/workspace apps, storage is defined per-service under services.<name>.storage.
 #
 # Modes:
 #   - service: you MUST enumerate every path that must survive updates/reinstalls under storage.persistent.
@@ -135,15 +140,18 @@ listeners:
 # storage.temporary declares *non-durable* mountpoints:
 #   - Temporary volumes reset on restart and are NOT replicated.
 #   - piccolod mounts these as tmpfs where possible (or as encrypted local scratch when tmpfs is unsuitable).
-storage:
-  persistent:
-    projects:
-      container: /workspace/projects
-      size_limit: 50GB         # Optional quota (accepts B, KB, MB, GB, TB)
-  temporary:
-    build-cache:
-      container: /workspace/build
-      size_limit: 10GB
+# Example (per-service):
+# services:
+#   main:
+#     storage:
+#       persistent:
+#         projects:
+#           container: /workspace/projects
+#           size_limit: 50GB         # Optional quota (accepts B, KB, MB, GB, TB)
+#       temporary:
+#         build-cache:
+#           container: /workspace/build
+#           size_limit: 10GB
 
 # PERMISSIONS -----------------------------------------------------------------
 # Omit to accept Piccolo defaults (internet denied, LAN allowed, root read-only).
@@ -164,25 +172,33 @@ permissions:
     device_access: deny        # allow | deny access to /dev devices
 
 # ENVIRONMENT -----------------------------------------------------------------
-# Arbitrary string map injected into the container at runtime.
-environment:
-  NODE_ENV: development
-  DATABASE_HOST: postgres.piccolo.local
+# Environment variables are defined per-service under services.<name>.environment.
+# Example:
+# services:
+#   main:
+#     environment:
+#       NODE_ENV: development
+#       DATABASE_HOST: postgres.piccolo.local
 
 # RESOURCE LIMITS --------------------------------------------------------------
-resources:
-  limits:
-    memory: 4GB               # Memory limit per container
-    cpu: 2.0                  # CPU cores (fractional allowed)
-    storage: 100GB            # Aggregate persistent storage quota (across volumes)
+# Resource limits are defined per-service under services.<name>.resources.
+# Example:
+# services:
+#   main:
+#     resources:
+#       limits:
+#         memory: 4GB               # Memory limit per container
+#         cpu: 2.0                  # CPU cores (fractional allowed)
+#         storage: 100GB            # Aggregate persistent storage quota (across volumes)
 
-# MULTI-CONTAINER APPS (service mode only) ------------------------------------
-# Compose-style apps can run multiple containers (services) per app instance.
-# When services is present, the following top-level fields are rejected and must be moved under each service:
+# SERVICES (required for service + workspace modes) ---------------------------
+# All apps define containers under services. Workspace mode must define exactly
+# one service; service mode may define one or more services.
+# The following top-level fields are invalid in both modes:
 #   - image, environment, storage, resources
 #
 # Listeners remain app-level and default to the primary service.
-# primary_service defaults to "main" when omitted.
+# primary_service defaults to "main" when omitted (workspace mode uses the sole service).
 #
 # primary_service: web
 # services:

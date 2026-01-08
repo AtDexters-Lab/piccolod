@@ -1,4 +1,4 @@
-# Missing required 'image' field
+# Missing required 'services' field for service mode
 name: invalid-app
 x-piccolo:
   mode: service

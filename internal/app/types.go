@@ -69,10 +69,32 @@ func (a *AppInstance) AppName() string {
 
 // Image returns the image from the definition, or empty string if nil.
 func (a *AppInstance) Image() string {
-	if a.Definition == nil {
+	return imageFromDefinition(a.Definition)
+}
+
+func imageFromDefinition(def *api.AppDefinition) string {
+	if def == nil {
 		return ""
 	}
-	return a.Definition.Image
+	if strings.TrimSpace(def.Image) != "" {
+		return def.Image
+	}
+	if def.Services == nil {
+		return ""
+	}
+	primary := strings.TrimSpace(def.PrimaryService)
+	if primary == "" {
+		primary = defaultPrimaryServiceName
+	}
+	if svc, ok := def.Services[primary]; ok {
+		return svc.Image
+	}
+	if len(def.Services) == 1 {
+		for _, svc := range def.Services {
+			return svc.Image
+		}
+	}
+	return ""
 }
 
 // Type returns the type from the definition, or empty string if nil.

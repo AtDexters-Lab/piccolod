@@ -45,6 +45,11 @@ func primaryServiceFor(def *api.AppDefinition, inst *AppInstance) string {
 		return strings.TrimSpace(def.PrimaryService)
 	}
 	if def != nil && def.Services != nil {
+		if piccoloModeFromExtensions(def.Extensions) == ModeWorkspace && len(def.Services) == 1 {
+			for name := range def.Services {
+				return name
+			}
+		}
 		return defaultPrimaryServiceName
 	}
 	return ""
@@ -103,6 +108,7 @@ func (m *AppManager) buildServiceContainerSpec(layout appVolumeLayout, def *api.
 	if err := m.applyServiceStorageAndTmpfs(&spec, svc.Storage, layout, def.Extensions); err != nil {
 		return container.ContainerCreateSpec{}, err
 	}
+	m.applyAuthInjection(&spec, def)
 	if err := container.ValidateContainerSpec(spec); err != nil {
 		return container.ContainerCreateSpec{}, fmt.Errorf("invalid service container spec for '%s': %w", svcName, err)
 	}
