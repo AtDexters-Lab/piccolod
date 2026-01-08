@@ -61,11 +61,11 @@ func TestInstallMultiContainer_PrunesZombiesBeforeCreate(t *testing.T) {
 		t.Fatalf("ValidateAppDefinition: %v", err)
 	}
 
-	_, err = mgr.installMultiContainer(ctx, def, "demo", "", layout, runtime, []services.ServiceEndpoint{
+	_, err = mgr.installContainerGroup(ctx, def, "demo", "", layout, runtime, []services.ServiceEndpoint{
 		{App: "demo", Name: "web", GuestPort: 8080, HostBind: 18080, PublicPort: 28080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
 	})
 	if err != nil {
-		t.Fatalf("installMultiContainer: %v", err)
+		t.Fatalf("installContainerGroup: %v", err)
 	}
 
 	for _, c := range mock.containers {

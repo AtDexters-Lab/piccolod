@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 
+	"piccolod/internal/api"
 	"piccolod/internal/app/workspacedisk"
 	"piccolod/internal/container"
 )
@@ -148,6 +149,111 @@ func (m *AppManager) isWorkspaceDiskInitialized(ctx context.Context, instanceID 
 	return status.Initialized
 }
 
+// workspaceMountInfo holds the result of workspace disk preparation.
+// Used by installContainerGroup to configure --rootfs mode containers.
+type workspaceMountInfo struct {
+	mergedPath string
+	meta       *workspacedisk.WorkspaceMeta
+}
+
+// prepareServiceStorage prepares storage for a service container.
+// For ModeService: pulls the image (best-effort) and returns nil.
+// For ModeWorkspace: initializes/mounts workspace disk and returns mount info.
+func (m *AppManager) prepareServiceStorage(
+	ctx context.Context,
+	mode PiccoloMode,
+	svcName string,
+	def *api.AppDefinition,
+	instanceID string,
+	layout appVolumeLayout,
+	runtime container.PodmanRuntime,
+) (*workspaceMountInfo, error) {
+	if def == nil || def.Services == nil {
+		return nil, fmt.Errorf("app definition with services required")
+	}
+	svc, ok := def.Services[svcName]
+	if !ok {
+		return nil, fmt.Errorf("unknown service '%s'", svcName)
+	}
+
+	if mode != ModeWorkspace {
+		// Service mode: just pull the image (best-effort)
+		if svc.Image != "" {
+			if err := m.containerManager.PullImage(ctx, runtime, svc.Image); err != nil {
+				log.Printf("WARN: install %s: image pull failed for service %s: %v", instanceID, svcName, err)
+			}
+		}
+		return nil, nil
+	}
+
+	// Workspace mode: prepare workspace disk
+	if svc.Image == "" {
+		return nil, fmt.Errorf("workspace service '%s' requires an image", svcName)
+	}
+
+	// Check if workspace disk is already initialized (reinstall case)
+	diskInitialized := m.isWorkspaceDiskInitialized(ctx, instanceID, layout)
+
+	if !diskInitialized {
+		// New install: pull base image and initialize workspace disk
+		if err := m.containerManager.PullImage(ctx, runtime, svc.Image); err != nil {
+			log.Printf("WARN: install %s: image pull failed: %v", instanceID, err)
+		}
+
+		// Get image config for workspace disk metadata
+		imgConfig, err := m.containerManager.InspectImage(ctx, runtime, svc.Image)
+		if err != nil {
+			return nil, fmt.Errorf("inspect image %s: %w", svc.Image, err)
+		}
+
+		// Get canonical digest for the base image
+		baseImageDigest := ""
+		if len(imgConfig.RepoDigests) > 0 {
+			baseImageDigest = imgConfig.RepoDigests[0]
+		} else {
+			baseImageDigest = imgConfig.Digest
+		}
+		if baseImageDigest == "" {
+			return nil, fmt.Errorf("image digest not available for %s", svc.Image)
+		}
+
+		// Initialize and mount workspace disk
+		mergedPath, err := m.initWorkspaceDisk(ctx, instanceID, layout, runtime, imgConfig, baseImageDigest, svc.Image)
+		if err != nil {
+			return nil, fmt.Errorf("init workspace disk: %w", err)
+		}
+
+		// Get metadata for return
+		meta, err := m.getWorkspaceDiskMeta(ctx, instanceID, layout)
+		if err != nil {
+			return nil, fmt.Errorf("get workspace metadata: %w", err)
+		}
+
+		return &workspaceMountInfo{
+			mergedPath: mergedPath,
+			meta:       meta,
+		}, nil
+	}
+
+	// Reinstall: workspace disk exists, just mount it
+	mergedPath, err := m.ensureWorkspaceDiskMounted(ctx, instanceID, layout)
+	if err != nil {
+		return nil, fmt.Errorf("mount workspace disk: %w", err)
+	}
+
+	meta, err := m.getWorkspaceDiskMeta(ctx, instanceID, layout)
+	if err != nil {
+		return nil, fmt.Errorf("get workspace metadata: %w", err)
+	}
+
+	log.Printf("INFO: install %s: using existing workspace disk (base=%s)", instanceID, meta.BaseImageRef)
+
+	return &workspaceMountInfo{
+		mergedPath: mergedPath,
+		meta:       meta,
+	}, nil
+}
+
 // ensureWorkspaceDiskMounted ensures the workspace disk is mounted, mounting if needed.
 // It also ensures the base image is present locally before mounting (RFC §5.3).
 // Returns the merged rootfs path.
@@ -208,4 +314,28 @@ func (m *AppManager) ensureWorkspaceDiskMounted(ctx context.Context, instanceID 
 
 	// Mount the overlay
 	return m.workspaceDiskMgr.Mount(ctx, instanceID)
+}
+
+// getWorkspaceMountInfo returns workspace mount info for an already-mounted workspace disk.
+// Call this after ensureWorkspaceDiskMounted to get both the merged path and metadata.
+// Returns nil for service-mode apps or if workspace disk is not mounted.
+func (m *AppManager) getWorkspaceMountInfo(ctx context.Context, instanceID string) *workspaceMountInfo {
+	if m.workspaceDiskMgr == nil {
+		return nil
+	}
+
+	status, err := m.workspaceDiskMgr.Status(ctx, instanceID)
+	if err != nil || !status.Mounted {
+		return nil
+	}
+
+	meta, err := m.workspaceDiskMgr.GetMeta(ctx, instanceID)
+	if err != nil {
+		return nil
+	}
+
+	return &workspaceMountInfo{
+		mergedPath: status.MergedPath,
+		meta:       meta,
+	}
 }

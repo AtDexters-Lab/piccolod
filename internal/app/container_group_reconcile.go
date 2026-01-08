@@ -12,12 +12,27 @@ import (
 	"piccolod/internal/container"
 )
 
-func (m *AppManager) reconcileMultiContainer(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, desiredRunning bool) error {
+// reconcileContainerGroup reconciles a container group (network anchor + service containers).
+// This is the unified reconcile path for both service and workspace modes.
+func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, desiredRunning bool) error {
 	if m.serviceManager == nil {
 		return fmt.Errorf("app manager: service manager not configured")
 	}
 	if appInst == nil || def == nil || def.Services == nil {
-		return fmt.Errorf("reconcile: invalid multi-container app state")
+		return fmt.Errorf("reconcile: invalid container group app state")
+	}
+
+	mode := piccoloModeFromExtensions(def.Extensions)
+
+	// For workspace mode, ensure workspace disk is mounted before starting containers
+	// and capture the mount info for container recreation.
+	var workspaceInfo *workspaceMountInfo
+	if mode == ModeWorkspace && desiredRunning {
+		m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
+		if _, err := m.ensureWorkspaceDiskMounted(ctx, appInst.InstanceID, layout); err != nil {
+			return fmt.Errorf("failed to mount workspace disk: %w", err)
+		}
+		workspaceInfo = m.getWorkspaceMountInfo(ctx, appInst.InstanceID)
 	}
 
 	primary := primaryServiceFor(def, appInst)
@@ -118,7 +133,23 @@ func (m *AppManager) reconcileMultiContainer(ctx context.Context, state *Filesys
 		}
 
 		if cid == "" || !st.Exists {
-			newCID, err := m.createAndStartServiceContainer(ctx, runtime, layout, def, appInst.InstanceID, primary, svcName, anchorID)
+			opts := serviceContainerOptions{
+				layout:     layout,
+				appDef:     def,
+				instanceID: appInst.InstanceID,
+				primary:    primary,
+				svcName:    svcName,
+				anchorID:   anchorID,
+			}
+			if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
+				opts.mergedRootfs = workspaceInfo.mergedPath
+				opts.workspaceMeta = workspaceInfo.meta
+			} else if mode == ModeWorkspace {
+				// Workspace mode requires valid mount info for container recreation
+				_ = state.UpdateAppStatus(appInst.InstanceID, "error")
+				return fmt.Errorf("workspace mount info unavailable for service '%s' recreation", svcName)
+			}
+			newCID, err := m.createAndStartServiceContainer(ctx, runtime, opts)
 			if err != nil {
 				_ = state.UpdateAppStatus(appInst.InstanceID, "error")
 				return err
@@ -137,6 +168,12 @@ func (m *AppManager) reconcileMultiContainer(ctx context.Context, state *Filesys
 				return fmt.Errorf("failed to start service '%s': %w", svcName, err)
 			}
 		}
+	}
+
+	// Ensure ContainerID matches the primary service container ID
+	if primaryCID := appInst.Containers[primary]; primaryCID != "" && appInst.ContainerID != primaryCID {
+		appInst.ContainerID = primaryCID
+		_ = state.StoreApp(appInst, nil)
 	}
 
 	if appInst.Status != "running" {
@@ -194,7 +231,7 @@ func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *F
 			return fmt.Errorf("allocate service ports: %w", err)
 		}
 
-		newInst, err := m.installMultiContainer(ctx, def, appInst.InstanceID, appInst.DisplayName, layout, runtime, endpoints)
+		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, appInst.DisplayName, layout, runtime, endpoints)
 		if err == nil {
 			// Preserve timestamps.
 			newInst.CreatedAt = appInst.CreatedAt
@@ -229,10 +266,10 @@ func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *F
 	return fmt.Errorf("failed to recreate %s: exhausted host-port retries", appInst.InstanceID)
 }
 
-func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime container.PodmanRuntime, layout appVolumeLayout, def *api.AppDefinition, instanceID, primary, svcName, anchorID string) (string, error) {
-	spec, err := m.buildServiceContainerSpec(layout, def, instanceID, primary, svcName, anchorID)
+func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime container.PodmanRuntime, opts serviceContainerOptions) (string, error) {
+	spec, err := m.buildServiceContainerSpec(opts)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("build container spec for service '%s': %w", opts.svcName, err)
 	}
 
 	var cid string
@@ -249,18 +286,19 @@ func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime
 			zombieID = id
 		}
 		if zombieID != "" {
-			log.Printf("INFO: recreate %s: removing zombie container %s (service=%s)", instanceID, zombieID, svcName)
+			log.Printf("INFO: recreate %s: removing zombie container %s (service=%s)", opts.instanceID, zombieID, opts.svcName)
+			_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
 			_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
 			continue
 		}
 		break
 	}
 	if err != nil {
-		return "", fmt.Errorf("create service container '%s': %w", svcName, err)
+		return "", fmt.Errorf("create service container '%s': %w", opts.svcName, err)
 	}
 	if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
 		_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
-		return "", fmt.Errorf("start service container '%s': %w", svcName, err)
+		return "", fmt.Errorf("start service container '%s': %w", opts.svcName, err)
 	}
 	return cid, nil
 }

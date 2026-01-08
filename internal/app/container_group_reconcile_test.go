@@ -96,8 +96,8 @@ func TestReconcileMultiContainer_StopsServicesWhenAnchorMissingAndDesiredStopped
 		t.Fatalf("StoreApp: %v", err)
 	}
 
-	if err := mgr.reconcileMultiContainer(ctx, state, appInst, def, layout, runtime, false); err != nil {
-		t.Fatalf("reconcileMultiContainer: %v", err)
+	if err := mgr.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, false); err != nil {
+		t.Fatalf("reconcileContainerGroup: %v", err)
 	}
 
 	mainState, _ := mock.InspectContainerState(ctx, runtime, mainCID)
