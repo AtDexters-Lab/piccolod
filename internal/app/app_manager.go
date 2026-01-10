@@ -132,7 +132,8 @@ func (r *workspaceRuntimeResolver) GetRuntimeArgs(ctx context.Context, instanceI
 	}
 
 	// Get the podman runtime configuration
-	runtime, err := r.am.podmanRuntimeForApp(instanceID, layout)
+	// Use ModeWorkspace since this resolver is specifically for workspace terminal access
+	runtime, err := r.am.podmanRuntimeForApp(instanceID, layout, ModeWorkspace)
 	if err != nil {
 		return nil, fmt.Errorf("get runtime: %w", err)
 	}
@@ -690,7 +691,7 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 			log.Printf("WARN: restore services: app volume unavailable for %s: %v", app.InstanceID, err)
 			continue
 		}
-		runtime, err := m.podmanRuntimeForApp(app.InstanceID, layout)
+		runtime, err := m.podmanRuntimeForApp(app.InstanceID, layout, piccoloModeFromExtensions(def.Extensions))
 		if err != nil {
 			log.Printf("WARN: restore services: podman runtime unavailable for %s: %v", app.InstanceID, err)
 			continue
@@ -759,12 +760,13 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(appInst.InstanceID, layout)
+
+	def, err := state.GetAppDefinition(appInst.InstanceID)
 	if err != nil {
 		return err
 	}
 
-	def, err := state.GetAppDefinition(appInst.InstanceID)
+	runtime, err := m.podmanRuntimeForApp(appInst.InstanceID, layout, piccoloModeFromExtensions(def.Extensions))
 	if err != nil {
 		return err
 	}
@@ -1009,7 +1011,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(appDef.Extensions))
 	if err != nil {
 		return nil, err
 	}
@@ -1062,7 +1064,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		// Cleanup workspace disk if applicable
 		mode := piccoloModeFromExtensions(appDef.Extensions)
 		if mode == ModeWorkspace {
-			_ = m.unmountWorkspaceDisk(ctx, instanceID)
+			_ = m.unmountWorkspaceDisk(ctx, instanceID, layout)
 		}
 		m.serviceManager.RemoveApp(instanceID)
 		cleanupServices = false
@@ -1148,14 +1150,15 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
-	if err != nil {
-		return err
-	}
 
 	def, defErr := state.GetAppDefinition(instanceID)
 	if defErr != nil {
 		return fmt.Errorf("failed to load app definition: %w", defErr)
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	if err != nil {
+		return err
 	}
 
 	// Unified start path for all app modes (container group: network anchor + services)
@@ -1191,13 +1194,19 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
+
+	def, defErr := state.GetAppDefinition(instanceID)
+	mode := ModeService
+	if defErr == nil {
+		mode = piccoloModeFromExtensions(def.Extensions)
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return err
 	}
 
-	def, defErr := state.GetAppDefinition(instanceID)
-	if defErr == nil && piccoloModeFromExtensions(def.Extensions) == ModeService {
+	if defErr == nil && mode == ModeService {
 		primary := primaryServiceFor(def, app)
 		order, _ := serviceStartOrder(def.Services)
 		for i := len(order) - 1; i >= 0; i-- {
@@ -1276,19 +1285,20 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
-	if err != nil {
-		return err
-	}
 
 	def, defErr := state.GetAppDefinition(instanceID)
 	if defErr != nil {
 		return fmt.Errorf("failed to load app definition: %w", defErr)
 	}
 
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	if err != nil {
+		return err
+	}
+
 	// Unified stop path for all app modes (container group: network anchor + services)
 	m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseStopping, 40, "Stopping containers", false, nil)
-	return m.stopContainerGroup(ctx, state, app, def, runtime)
+	return m.stopContainerGroup(ctx, state, app, def, layout, runtime)
 }
 
 // Uninstall removes an application instance completely by instanceID.
@@ -1338,31 +1348,48 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
-	if err != nil {
-		return err
-	}
 
 	def, defErr := state.GetAppDefinition(instanceID)
 	if defErr != nil {
 		return fmt.Errorf("failed to load app definition: %w", defErr)
 	}
 
-	// Unified uninstall path for all app modes (container group: network anchor + services)
-	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseRemovingContainer, 40, "Removing containers", false, nil)
-	if err := m.uninstallContainerGroup(ctx, app, def, runtime); err != nil {
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	if err != nil {
 		return err
 	}
 
-	// Optionally purge app data (destroy volume and podman runtime state)
+	// Unified uninstall path for all app modes (container group: network anchor + services)
+	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseRemovingContainer, 40, "Removing containers", false, nil)
+	if err := m.uninstallContainerGroup(ctx, app, def, layout, runtime); err != nil {
+		return err
+	}
+
+	// If purging, reset podman storage BEFORE unmounting the volume.
+	// This allows podman to properly clean its metadata files (db.sql, locks, etc.)
+	// which live inside the encrypted volume.
 	if purge {
 		m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseCleaningVolumes, 80, "Purging app data", false, nil)
-		// Reset podman storage to clean up any remaining containers
 		if err := m.containerManager.ResetStorage(ctx, runtime); err != nil {
 			log.Printf("WARN: podman storage reset for %s failed: %v", instanceID, err)
 		}
+	}
 
-		volID := appVolumeID(instanceID)
+	// Detach (unmount) the encrypted volume even without purge.
+	// This prevents data access until reinstall while preserving the data.
+	volID := appVolumeID(instanceID)
+	volumes := m.currentVolumeManager()
+	if volumes != nil {
+		req := persistence.VolumeRequest{ID: volID, Class: persistence.VolumeClassApplication}
+		if handle, err := volumes.EnsureVolume(ctx, req); err == nil {
+			if detachErr := volumes.Detach(ctx, handle); detachErr != nil {
+				log.Printf("WARN: failed to detach volume %s: %v", volID, detachErr)
+			}
+		}
+	}
+
+	// If purging, destroy the volume (ciphertext, metadata, mount directory)
+	if purge {
 		if err := m.volumeManager.DestroyVolume(ctx, volID); err != nil {
 			return fmt.Errorf("failed to purge app data: %w", err)
 		}
@@ -1470,10 +1497,7 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
-	if err != nil {
-		return err
-	}
+
 	// Load current app definition
 	curDef, err := state.GetAppDefinition(instanceID)
 	if err != nil {
@@ -1481,6 +1505,11 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	}
 	if piccoloModeFromExtensions(curDef.Extensions) == ModeService {
 		return fmt.Errorf("cannot update image for service-mode apps; update per-service images in the manifest and reinstall")
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(curDef.Extensions))
+	if err != nil {
+		return err
 	}
 
 	// Workspace mode apps cannot have their image updated because the workspace disk
@@ -1601,10 +1630,6 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
-	if err != nil {
-		return nil, err
-	}
 
 	// Load current app definition
 	curDef, err := state.GetAppDefinition(instanceID)
@@ -1620,6 +1645,11 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 	mode := piccoloModeFromExtensions(curDef.Extensions)
 	if mode != ModeWorkspace {
 		return nil, fmt.Errorf("listener updates are only supported for workspace mode apps")
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	if err != nil {
+		return nil, err
 	}
 
 	// Validate new definition
@@ -1803,10 +1833,7 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
-	if err != nil {
-		return err
-	}
+
 	// Read previous def
 	prevDef, err := state.GetPreviousAppDefinition(instanceID)
 	if err != nil {
@@ -1817,6 +1844,11 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	}
 	if appInst.Definition != nil && piccoloModeFromExtensions(appInst.Definition.Extensions) == ModeService {
 		return fmt.Errorf("revert is not supported for service-mode apps")
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(prevDef.Extensions))
+	if err != nil {
+		return err
 	}
 	// Backup current before writing previous
 	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
@@ -1892,13 +1924,19 @@ func (m *AppManager) LogsForService(ctx context.Context, instanceID, service str
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
+
+	def := appInst.Definition
+	mode := ModeService
+	if def != nil {
+		mode = piccoloModeFromExtensions(def.Extensions)
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return nil, err
 	}
 
-	def := appInst.Definition
-	if def != nil && piccoloModeFromExtensions(def.Extensions) == ModeService {
+	if def != nil && mode == ModeService {
 		primary := primaryServiceFor(def, appInst)
 		target := strings.TrimSpace(service)
 		if target == "" {
@@ -1953,13 +1991,19 @@ func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, servi
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
+
+	def := appInst.Definition
+	mode := ModeService
+	if def != nil {
+		mode = piccoloModeFromExtensions(def.Extensions)
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return nil, err
 	}
 
-	def := appInst.Definition
-	if def != nil && piccoloModeFromExtensions(def.Extensions) == ModeService {
+	if def != nil && mode == ModeService {
 		primary := primaryServiceFor(def, appInst)
 		target := strings.TrimSpace(service)
 		if target == "" {
@@ -2153,10 +2197,15 @@ func (m *AppManager) applyAuthInjection(spec *container.ContainerCreateSpec, app
 		ContainerPath: containerPath,
 	})
 
-	if hostEntry, err := container.HostGatewayEntry(); err == nil {
-		spec.ExtraHosts = append(spec.ExtraHosts, hostEntry)
-	} else {
-		log.Printf("WARN: failed to resolve host gateway for piccolo.local: %v", err)
+	// Only add extra hosts if the container owns its network namespace.
+	// Containers using NetworkMode "container:<id>" share the network namespace
+	// and podman doesn't allow extra hosts in that case.
+	if !strings.HasPrefix(spec.NetworkMode, "container:") {
+		if hostEntry, err := container.HostGatewayEntry(); err == nil {
+			spec.ExtraHosts = append(spec.ExtraHosts, hostEntry)
+		} else {
+			log.Printf("WARN: failed to resolve host gateway for piccolo.local: %v", err)
+		}
 	}
 }
 
@@ -2211,13 +2260,19 @@ func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, ser
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve volume layout: %w", err)
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
+
+	def := appInst.Definition
+	mode := ModeService
+	if def != nil {
+		mode = piccoloModeFromExtensions(def.Extensions)
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create podman runtime: %w", err)
 	}
 
-	def := appInst.Definition
-	if def != nil && piccoloModeFromExtensions(def.Extensions) == ModeService {
+	if def != nil && mode == ModeService {
 		primary := primaryServiceFor(def, appInst)
 		target := strings.TrimSpace(service)
 		if target == "" {

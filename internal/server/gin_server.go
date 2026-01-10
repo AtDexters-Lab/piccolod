@@ -115,8 +115,10 @@ type GinServer struct {
 	oidcProviderMu sync.Mutex
 
 	// Internal CA for OIDC Back-Channel
-	internalCA  *pki.InternalCA
-	internalSrv *http.Server
+	internalCA    *pki.InternalCA
+	internalCAMu  sync.Mutex
+	internalSrv   *http.Server
+	bootstrapDir  string // stored for deferred CA initialization
 
 	reloadersMu     sync.RWMutex
 	unlockReloaders []unlockReloader
@@ -468,16 +470,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	rm.SetEventsBus(eventsBus)
 
 	// Internal CA (for OIDC Back-Channel)
-	// We use the bootstrap volume for certs as it is available early.
-	ca, err := pki.NewInternalCA(bootstrapDir)
-	if err != nil {
-		return nil, fmt.Errorf("internal CA init: %w", err)
-	}
-	if err := ca.EnsureServerCertificate(); err != nil {
-		return nil, fmt.Errorf("ensure server cert: %w", err)
-	}
-	s.internalCA = ca
-	s.appManager.SetInternalCAPath(ca.CertPath())
+	// Defer CA initialization until after unlock when bootstrap volume is mounted.
+	// Store bootstrapDir for later use in ensureInternalCA().
+	s.bootstrapDir = bootstrapDir
 
 	// Now that remote manager exists, wire ACME challenge handler and cert provider
 	if rm != nil && svcMgr != nil {
@@ -673,7 +668,6 @@ func (s *GinServer) setupGinRoutes() {
 		v1.GET("/auth/session", s.handleAuthSession)
 		v1.GET("/auth/initialized", s.handleAuthInitialized)
 		v1.POST("/auth/login", s.handleAuthLogin)
-		v1.POST("/auth/setup", s.handleAuthSetup)
 
 		// Selected read-only status endpoints remain public
 		v1.GET("/remote/status", s.handleRemoteStatus)
@@ -1017,6 +1011,12 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 	if s == nil {
 		return
 	}
+
+	// Initialize internal CA now that bootstrap volume is mounted
+	if err := s.ensureInternalCA(); err != nil {
+		log.Printf("WARN: internal CA initialization failed: %v", err)
+	}
+
 	s.reloadersMu.RLock()
 	reloaders := append([]unlockReloader(nil), s.unlockReloaders...)
 	s.reloadersMu.RUnlock()
@@ -1028,6 +1028,42 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 			log.Printf("WARN: unlock reload failed: %v", err)
 		}
 	}
+}
+
+// ensureInternalCA lazily initializes the internal CA for OIDC back-channel communication.
+// This must be called after unlock when the bootstrap volume is mounted.
+func (s *GinServer) ensureInternalCA() error {
+	if s == nil {
+		return nil
+	}
+
+	s.internalCAMu.Lock()
+	defer s.internalCAMu.Unlock()
+
+	// Already initialized
+	if s.internalCA != nil {
+		return nil
+	}
+
+	if s.bootstrapDir == "" {
+		return fmt.Errorf("bootstrap directory not configured")
+	}
+
+	ca, err := pki.NewInternalCA(s.bootstrapDir)
+	if err != nil {
+		return fmt.Errorf("internal CA init: %w", err)
+	}
+	if err := ca.EnsureServerCertificate(); err != nil {
+		return fmt.Errorf("ensure server cert: %w", err)
+	}
+
+	s.internalCA = ca
+	if s.appManager != nil {
+		s.appManager.SetInternalCAPath(ca.CertPath())
+	}
+
+	log.Printf("INFO: internal CA initialized from %s", s.bootstrapDir)
+	return nil
 }
 
 func (s *GinServer) refreshRemoteRuntime() {

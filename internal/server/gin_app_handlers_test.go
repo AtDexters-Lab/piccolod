@@ -1129,26 +1129,26 @@ func setupTestAdminSession(t *testing.T, server *GinServer) (*http.Cookie, strin
 	t.Helper()
 	const password = "TestPass123!"
 
-	// First-run setup
+	// Use /crypto/setup which atomically sets up crypto, auth, and admin user
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest(http.MethodPost, "/api/v1/auth/setup", strings.NewReader(fmt.Sprintf(`{"password":"%s"}`, password)))
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/crypto/setup", strings.NewReader(fmt.Sprintf(`{"password":"%s"}`, password)))
 	req.Header.Set("Content-Type", "application/json")
 	server.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		// Allow already-initialized if tests re-use the helper on same server
 		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "already") {
-			t.Fatalf("auth setup failed: status=%d body=%s", w.Code, w.Body.String())
+			t.Fatalf("crypto setup failed: status=%d body=%s", w.Code, w.Body.String())
+		}
+		// If already initialized, login to get session
+		w = httptest.NewRecorder()
+		req, _ = http.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(fmt.Sprintf(`{"username":"admin","password":"%s"}`, password)))
+		req.Header.Set("Content-Type", "application/json")
+		server.router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("auth login failed: status=%d body=%s", w.Code, w.Body.String())
 		}
 	}
-
-	// Login to obtain session cookie
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(fmt.Sprintf(`{"username":"admin","password":"%s"}`, password)))
-	req.Header.Set("Content-Type", "application/json")
-	server.router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("auth login failed: status=%d body=%s", w.Code, w.Body.String())
-	}
+	// crypto/setup returns session cookie directly
 	var sessionCookie *http.Cookie
 	for _, c := range w.Result().Cookies() {
 		if c.Name == sessionCookieName {
@@ -1157,7 +1157,7 @@ func setupTestAdminSession(t *testing.T, server *GinServer) (*http.Cookie, strin
 		}
 	}
 	if sessionCookie == nil {
-		t.Fatalf("missing session cookie in login response")
+		t.Fatalf("missing session cookie in response")
 	}
 
 	// Fetch CSRF token

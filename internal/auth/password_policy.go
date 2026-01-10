@@ -9,6 +9,12 @@ import (
 
 const minPasswordLength = 8
 
+// ValidatePasswordStrength checks if a password meets the minimum requirements.
+// Exported for use by crypto setup to validate before any state changes.
+func ValidatePasswordStrength(password string) error {
+	return validatePasswordStrength(password)
+}
+
 func validatePasswordStrength(password string) error {
 	if utf8.RuneCountInString(password) < minPasswordLength {
 		return fmt.Errorf("password must be at least %d characters long", minPasswordLength)

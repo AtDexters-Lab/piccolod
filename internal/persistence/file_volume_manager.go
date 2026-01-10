@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -461,6 +462,15 @@ func (f *fileVolumeManager) Detach(ctx context.Context, handle VolumeHandle) err
 	if err := f.recordVolumeState(handle.ID, volumeStateUnmounted, volumeStateUnmounted, role, nil); err != nil {
 		return err
 	}
+
+	// Clean the mount directory after unmount.
+	// Any remaining files are orphaned (were inside the encrypted volume) and
+	// must be removed so gocryptfs can mount again (requires empty directory).
+	if err := cleanDirectory(handle.MountDir); err != nil {
+		log.Printf("WARN: volume %s: failed to clean mount directory after unmount: %v", handle.ID, err)
+		// Don't fail - the unmount succeeded, this is just cleanup
+	}
+
 	return nil
 }
 
@@ -487,8 +497,10 @@ func (f *fileVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 		return fmt.Errorf("destroy: remove state: %w", err)
 	}
 
-	// 4. Remove Mountpoint
-	_ = os.Remove(mountDir)
+	// 4. Remove Mountpoint (use RemoveAll to handle non-empty directories from lazy unmounts)
+	if err := os.RemoveAll(mountDir); err != nil {
+		log.Printf("WARN: destroy volume %s: failed to remove mount directory: %v", id, err)
+	}
 
 	// 5. Remove from memory
 	f.mu.Lock()
@@ -548,6 +560,11 @@ func (f *fileVolumeManager) detachWithRetry(ctx context.Context, handle VolumeHa
 	// Verify unmount succeeded
 	if mounted, _ := isMountPoint(handle.MountDir); mounted {
 		return fmt.Errorf("volume %s still mounted after lazy unmount", handle.ID)
+	}
+
+	// Clean the mount directory after lazy unmount (same as regular Detach)
+	if err := cleanDirectory(handle.MountDir); err != nil {
+		log.Printf("WARN: volume %s: failed to clean mount directory after lazy unmount: %v", handle.ID, err)
 	}
 
 	return nil
@@ -1002,6 +1019,26 @@ func syncDir(path string) error {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+// cleanDirectory removes all contents of a directory but keeps the directory itself.
+// This is used to clean the mount directory after unmount to ensure gocryptfs
+// can mount again (gocryptfs requires an empty mount directory).
+func cleanDirectory(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove %s: %w", path, err)
+		}
+	}
+	return nil
 }
 
 var _ VolumeManager = (*fileVolumeManager)(nil)

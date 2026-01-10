@@ -117,7 +117,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 
 // stopContainerGroup stops a container group (network anchor + service containers).
 // This is the unified stop path for both service and workspace modes.
-func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, runtime container.PodmanRuntime) error {
+func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
 	if appInst == nil || def == nil {
 		return fmt.Errorf("stop: app definition required")
 	}
@@ -160,7 +160,7 @@ func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemSt
 	// For workspace mode apps, unmount the overlay on clean stop (RFC §5.6).
 	// This is good practice but not strictly required since we remount on start.
 	if mode == ModeWorkspace {
-		if err := m.unmountWorkspaceDisk(ctx, appInst.InstanceID); err != nil {
+		if err := m.unmountWorkspaceDisk(ctx, appInst.InstanceID, layout); err != nil {
 			// Log but don't fail - the data is safe, mount will be cleaned up on next start
 			log.Printf("WARN: stop %s: failed to unmount workspace disk: %v", appInst.InstanceID, err)
 		}
@@ -178,7 +178,7 @@ func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemSt
 // uninstallContainerGroup removes a container group (network anchor + service containers).
 // This is the unified uninstall path for both service and workspace modes.
 // Note: This does not handle purge or state removal - those are handled by the caller.
-func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, runtime container.PodmanRuntime) error {
+func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
 	if appInst == nil || def == nil {
 		return fmt.Errorf("uninstall: app definition required")
 	}
@@ -215,7 +215,7 @@ func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppIn
 
 	// For workspace mode apps, unmount the workspace disk overlay.
 	if mode == ModeWorkspace {
-		if err := m.unmountWorkspaceDisk(ctx, appInst.InstanceID); err != nil {
+		if err := m.unmountWorkspaceDisk(ctx, appInst.InstanceID, layout); err != nil {
 			log.Printf("WARN: workspace %s: failed to unmount workspace disk: %v", appInst.InstanceID, err)
 		} else {
 			log.Printf("INFO: workspace %s: unmounted workspace disk (data preserved)", appInst.InstanceID)

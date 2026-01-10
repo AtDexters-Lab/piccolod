@@ -287,7 +287,15 @@ paths:
                   locked: { type: boolean }
   /crypto/setup:
     post:
-      summary: Initialize crypto using admin password
+      summary: Initialize Piccolo (crypto, auth, and admin user)
+      description: |
+        Single atomic initialization endpoint for Piccolo. This sets up:
+        1. Disk encryption (SDEK)
+        2. Auth manager
+        3. Admin user in the users database
+        4. Auto-unlocks and creates a session
+
+        After successful setup, the caller is logged in as admin.
       security: []
       requestBody:
         required: true
@@ -297,9 +305,11 @@ paths:
               type: object
               properties:
                 password: { type: string }
+              required: [password]
       responses:
-        '200': { description: OK }
-        '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '200': { description: OK (also sets session cookie) }
+        '400': { description: Bad Request (invalid password or already initialized), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '500': { description: Internal Server Error, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
   /crypto/unlock:
     post:
       summary: Unlock crypto with admin password
@@ -853,12 +863,6 @@ paths:
                 type: string
         '404': { description: Not Found }
 
-  /auth/setup:
-    post:
-      summary: First-run admin setup
-      security: []
-      responses:
-        '200': { description: OK }
   /auth/login:
     post:
       summary: Login

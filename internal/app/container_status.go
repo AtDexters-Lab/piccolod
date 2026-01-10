@@ -32,12 +32,18 @@ func (m *AppManager) ContainerStatuses(ctx context.Context, instanceID string) (
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
+
+	def := appInst.Definition
+	mode := ModeService
+	if def != nil {
+		mode = piccoloModeFromExtensions(def.Extensions)
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return nil, err
 	}
 
-	def := appInst.Definition
 	if def != nil && def.Services != nil {
 		primary := primaryServiceFor(def, appInst)
 

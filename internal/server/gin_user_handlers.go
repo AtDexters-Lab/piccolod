@@ -249,6 +249,32 @@ func (s *GinServer) handleSetUserPassword(c *gin.Context) {
 	}
 
 	id := c.Param("id")
+	ctx := c.Request.Context()
+
+	// First, get the user to check if it's the admin
+	user, err := s.userManager.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, auth.ErrUserNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+			return
+		}
+		if errors.Is(err, persistence.ErrLocked) {
+			c.JSON(http.StatusLocked, gin.H{"error": "storage locked"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get user"})
+		return
+	}
+
+	// Block admin password changes via this endpoint.
+	// Admin password is tied to disk encryption (crypto SDEK) and requires the old
+	// password for rewrap. Use POST /api/v1/auth/password instead.
+	if user.Username == "admin" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "admin password must be changed via profile settings (requires current password for disk encryption sync)",
+		})
+		return
+	}
 
 	var req SetPasswordRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -256,7 +282,7 @@ func (s *GinServer) handleSetUserPassword(c *gin.Context) {
 		return
 	}
 
-	if err := s.userManager.SetPassword(c.Request.Context(), id, req.Password); err != nil {
+	if err := s.userManager.SetPassword(ctx, id, req.Password); err != nil {
 		if errors.Is(err, auth.ErrUserNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 			return

@@ -26,7 +26,7 @@ func TestInstallMultiContainer_PrunesZombiesBeforeCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureAppVolumeLayout: %v", err)
 	}
-	runtime, err := mgr.podmanRuntimeForApp("demo", layout)
+	runtime, err := mgr.podmanRuntimeForApp("demo", layout, ModeService)
 	if err != nil {
 		t.Fatalf("podmanRuntimeForApp: %v", err)
 	}

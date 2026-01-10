@@ -117,56 +117,6 @@ func (s *GinServer) handleAuthSession(c *gin.Context) {
 	})
 }
 
-// handleAuthSetup: POST /api/v1/auth/setup
-func (s *GinServer) handleAuthSetup(c *gin.Context) {
-	var body struct {
-		Password string `json:"password"`
-	}
-	if err := c.BindJSON(&body); err != nil || body.Password == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
-		return
-	}
-	ctx := c.Request.Context()
-	initialized, err := s.authManager.IsInitialized(ctx)
-	if err != nil {
-		if errors.Is(err, persistence.ErrLocked) {
-			c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read auth state"})
-		return
-	}
-	if initialized {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "already initialized"})
-		return
-	}
-	if err := s.authManager.Setup(ctx, body.Password); err != nil {
-		if errors.Is(err, persistence.ErrLocked) {
-			c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
-			return
-		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Create admin user in new users table (sync with legacy auth state)
-	if s.userManager != nil {
-		adminInput := authpkg.CreateUserInput{
-			Username: "admin",
-			Email:    "admin@piccolo.local",
-			Password: body.Password,
-			Role:     persistence.UserRoleAdmin,
-		}
-		if _, err := s.userManager.Create(ctx, adminInput); err != nil {
-			log.Printf("WARN: failed to create admin user during setup: %v", err)
-			// Don't fail the request, as legacy auth setup succeeded.
-			// The user might be able to login via legacy path or migration on restart.
-		}
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "ok"})
-}
-
 // handleAuthLogin: POST /api/v1/auth/login
 func (s *GinServer) handleAuthLogin(c *gin.Context) {
 	var body struct{ Username, Password string }
@@ -187,9 +137,24 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 	// 1. Try to verify against user manager (unified auth)
 	if s.userManager != nil {
 		userInfo, err = s.userManager.Verify(ctx, username, body.Password)
+	} else if s.authManager != nil {
+		// Fallback to legacy auth manager (for tests/migration scenarios without userManager)
+		ok, verifyErr := s.authManager.Verify(ctx, username, body.Password)
+		if verifyErr != nil {
+			err = verifyErr
+		} else if !ok {
+			err = authpkg.ErrInvalidCredentials
+		} else {
+			// Legacy auth only supports admin
+			userInfo = &authpkg.UserInfo{
+				ID:       "legacy-admin",
+				Username: "admin",
+				Email:    "admin@piccolo.local",
+				Role:     persistence.UserRoleAdmin,
+			}
+		}
 	} else {
-		// Fallback for extremely early init stages (should be rare)
-		err = errors.New("user manager unavailable")
+		err = errors.New("auth unavailable")
 	}
 
 	// 2. Handle locked state / legacy unlock logic
@@ -214,10 +179,26 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 			if notifyErr := s.notifyPersistenceLockState(ctx, false); notifyErr != nil {
 				log.Printf("WARN: auth login persistence unlock failed: %v", notifyErr)
 			}
-			
+
 			// Retry verification after unlock
 			if s.userManager != nil {
 				userInfo, err = s.userManager.Verify(ctx, username, body.Password)
+			} else if s.authManager != nil {
+				// Fallback retry with legacy auth manager
+				ok, verifyErr := s.authManager.Verify(ctx, username, body.Password)
+				if verifyErr != nil {
+					err = verifyErr
+				} else if !ok {
+					err = authpkg.ErrInvalidCredentials
+				} else {
+					err = nil
+					userInfo = &authpkg.UserInfo{
+						ID:       "legacy-admin",
+						Username: "admin",
+						Email:    "admin@piccolo.local",
+						Role:     persistence.UserRoleAdmin,
+					}
+				}
 			}
 		}
 	}

@@ -115,7 +115,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		if err != nil {
 			// Cleanup any workspace disks already initialized
 			if mode == ModeWorkspace {
-				if unmountErr := m.unmountWorkspaceDisk(ctx, instanceID); unmountErr != nil {
+				if unmountErr := m.unmountWorkspaceDisk(ctx, instanceID, layout); unmountErr != nil {
 					log.Printf("WARN: install %s: cleanup unmount failed: %v", instanceID, unmountErr)
 				}
 			}
@@ -138,7 +138,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		}
 		// Cleanup workspace disk on failure
 		if mode == ModeWorkspace {
-			if unmountErr := m.unmountWorkspaceDisk(ctx, instanceID); unmountErr != nil {
+			if unmountErr := m.unmountWorkspaceDisk(ctx, instanceID, layout); unmountErr != nil {
 				log.Printf("WARN: install %s: cleanup unmount failed: %v", instanceID, unmountErr)
 			}
 		}
@@ -154,6 +154,11 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 	for _, ep := range endpoints {
 		anchorSpec.Ports = append(anchorSpec.Ports, container.PortMapping{Host: ep.HostBind, Container: ep.GuestPort})
+	}
+	// Add host gateway entry to the anchor (which owns the network namespace).
+	// Service containers share this namespace and inherit the /etc/hosts entries.
+	if hostEntry, err := container.HostGatewayEntry(); err == nil {
+		anchorSpec.ExtraHosts = append(anchorSpec.ExtraHosts, hostEntry)
 	}
 	if err := container.ValidateContainerSpec(anchorSpec); err != nil {
 		return nil, fmt.Errorf("invalid network anchor spec: %w", err)

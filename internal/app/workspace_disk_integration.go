@@ -90,10 +90,15 @@ func (m *AppManager) initWorkspaceDisk(
 }
 
 // unmountWorkspaceDisk unmounts the workspace disk overlay.
-func (m *AppManager) unmountWorkspaceDisk(ctx context.Context, instanceID string) error {
+// The layout parameter is required because the workspacePathResolver is an in-memory
+// map that may be empty after server restart - we need the layout to locate the workspace.
+func (m *AppManager) unmountWorkspaceDisk(ctx context.Context, instanceID string, layout appVolumeLayout) error {
 	if m.workspaceDiskMgr == nil {
 		return nil
 	}
+
+	// Register path for this operation (may not be registered after restart)
+	m.workspacePathResolver.Register(instanceID, layout.WorkspaceDir)
 
 	if err := m.workspaceDiskMgr.Unmount(ctx, instanceID); err != nil {
 		log.Printf("WARN: workspace %s: unmount failed: %v", instanceID, err)
@@ -196,6 +201,8 @@ func (m *AppManager) prepareServiceStorage(
 
 	if !diskInitialized {
 		// New install: pull base image and initialize workspace disk
+		// The runtime uses vfs driver for workspace apps, but images are stored
+		// in the shared imagestore for layer deduplication regardless of driver.
 		if err := m.containerManager.PullImage(ctx, runtime, svc.Image); err != nil {
 			log.Printf("WARN: install %s: image pull failed: %v", instanceID, err)
 		}
@@ -286,7 +293,9 @@ func (m *AppManager) ensureWorkspaceDiskMounted(ctx context.Context, instanceID 
 		return "", fmt.Errorf("get workspace metadata: %w", err)
 	}
 
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout)
+	// Use ModeWorkspace (vfs) consistently for workspace apps.
+	// Layer deduplication happens via the shared imagestore, not the driver choice.
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, ModeWorkspace)
 	if err != nil {
 		return "", fmt.Errorf("get podman runtime: %w", err)
 	}
