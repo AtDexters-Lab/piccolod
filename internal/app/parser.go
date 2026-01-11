@@ -460,14 +460,17 @@ func validateServices(services map[string]api.AppService, primary string, listen
 	}
 
 	// Primary service must declare all listener guest ports (v1 listeners target primary by default).
-	primarySvc := services[primary]
-	primaryPorts := make(map[int]struct{}, len(primarySvc.BindPorts))
-	for _, p := range primarySvc.BindPorts {
-		primaryPorts[p] = struct{}{}
-	}
-	for _, l := range listeners {
-		if _, ok := primaryPorts[l.GuestPort]; !ok {
-			return fmt.Errorf("primary service '%s' must declare listener guest_port %d in bind_ports", primary, l.GuestPort)
+	// Skip this check for single-service apps since port conflicts are impossible.
+	if len(services) > 1 {
+		primarySvc := services[primary]
+		primaryPorts := make(map[int]struct{}, len(primarySvc.BindPorts))
+		for _, p := range primarySvc.BindPorts {
+			primaryPorts[p] = struct{}{}
+		}
+		for _, l := range listeners {
+			if _, ok := primaryPorts[l.GuestPort]; !ok {
+				return fmt.Errorf("primary service '%s' must declare listener guest_port %d in bind_ports", primary, l.GuestPort)
+			}
 		}
 	}
 

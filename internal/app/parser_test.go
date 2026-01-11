@@ -229,7 +229,7 @@ func TestValidateAppDefinition(t *testing.T) {
 				Extensions: map[string]interface{}{"mode": "service"},
 			},
 			expectError: true,
-			expectedErr: "must declare listener guest_port",
+			expectedErr: "guest_port must be between 1 and 65535",
 		},
 	}
 
