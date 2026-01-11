@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/zitadel/oidc/v3/pkg/op"
 
 	"piccolod/internal/oidc"
 )
@@ -70,12 +73,22 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 		return nil, nil
 	}
 
+	// Get the current local hostname (handles mDNS conflicts like "piccolo-abc123.local")
+	localHostname := "piccolo.local"
+	if s.mdnsManager != nil {
+		localHostname = s.mdnsManager.Hostname()
+	}
+
 	// 1. Dynamic Origin Matching (RFC compliant)
 	// If we have a requested redirect_uri, check if its origin matches a listener.
 	requested, _ := ctx.Value(requestedRedirectURIContextKey).(string)
 	if requested != "" {
 		u, err := url.Parse(requested)
 		if err == nil {
+			// Extract port from host (u.Host includes port if present)
+			_, portStr, _ := net.SplitHostPort(u.Host)
+			requestedPort, _ := strconv.Atoi(portStr)
+
 			// Check against known listeners
 			for _, ep := range endpoints {
 				// Check Remote Host
@@ -83,21 +96,37 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 					st := s.remoteManager.Status()
 					if st.Enabled && st.TLD != "" {
 						remoteHost := s.remoteServiceHostname(&st, ep)
-						if remoteHost != "" && strings.EqualFold(u.Host, remoteHost) {
-							if u.Scheme == "https" { // Remote is always https
+						if remoteHost != "" && u.Scheme == "https" {
+							// Compare hostname, handling explicit :443 port
+							reqHost := u.Host
+							if h, p, err := net.SplitHostPort(u.Host); err == nil && p == "443" {
+								reqHost = h // Strip explicit :443
+							}
+							if strings.EqualFold(reqHost, remoteHost) {
 								return []string{requested}, nil
 							}
 						}
 					}
 				}
 
-				// Check Local Host
-				// Local origin is http://piccolo.local:<PublicPort>
-				// Note: u.Host includes port if present.
-				localHost := fmt.Sprintf("piccolo.local:%d", ep.PublicPort)
+				// Check Local Host - support both mDNS hostname and IP address access
+				// Local origin can be:
+				// - http://piccolo.local:<PublicPort> (or piccolo-abc123.local if conflict)
+				// - http://<lan-ip>:<PublicPort> (for clients without mDNS)
+				localHost := fmt.Sprintf("%s:%d", localHostname, ep.PublicPort)
 				if strings.EqualFold(u.Host, localHost) {
 					// Allow http for local LAN access as per RFC
 					if u.Scheme == "http" || u.Scheme == "https" {
+						return []string{requested}, nil
+					}
+				}
+
+				// Also accept IP address access if it's a local machine IP with matching port
+				// This supports clients that can't resolve mDNS names but limits to piccolo's own IPs
+				// to prevent redirects to attacker-controlled servers on LAN
+				if requestedPort == ep.PublicPort && u.Scheme == "http" {
+					host, _, _ := net.SplitHostPort(u.Host)
+					if ip := net.ParseIP(host); ip != nil && isLocalMachineIP(ip) {
 						return []string{requested}, nil
 					}
 				}
@@ -124,17 +153,17 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 		}
 	}
 
-	// Local info
-	uris = append(uris, "http://piccolo.local/callback")
-	uris = append(uris, "https://piccolo.local/callback")
+	// Local info (using dynamic hostname which handles mDNS conflicts)
+	uris = append(uris, "http://"+localHostname+"/callback")
+	uris = append(uris, "https://"+localHostname+"/callback")
 
 	// Let's try to return roots and common paths.
 	for _, ep := range endpoints {
 		// Local
-		uris = append(uris, fmt.Sprintf("http://piccolo.local:%d/callback", ep.PublicPort))
-		uris = append(uris, fmt.Sprintf("http://piccolo.local:%d/auth/callback", ep.PublicPort))
-		uris = append(uris, fmt.Sprintf("http://piccolo.local:%d/oauth/callback", ep.PublicPort))
-		uris = append(uris, fmt.Sprintf("http://piccolo.local:%d/login/callback", ep.PublicPort))
+		uris = append(uris, fmt.Sprintf("http://%s:%d/callback", localHostname, ep.PublicPort))
+		uris = append(uris, fmt.Sprintf("http://%s:%d/auth/callback", localHostname, ep.PublicPort))
+		uris = append(uris, fmt.Sprintf("http://%s:%d/oauth/callback", localHostname, ep.PublicPort))
+		uris = append(uris, fmt.Sprintf("http://%s:%d/login/callback", localHostname, ep.PublicPort))
 	}
 
 	return uris, nil
@@ -159,26 +188,188 @@ func (s *GinServer) handleOIDCDiscovery(c *gin.Context) {
 			}
 			return s.remoteManager.Status().PortalHostname
 		},
+		GetLocalHostname: func() string {
+			// Use mDNS hostname if available (handles conflicts like "piccolo-abc123.local")
+			if s.mdnsManager != nil {
+				return s.mdnsManager.Hostname()
+			}
+			// mDNS disabled: fall back to local IP address
+			return getPreferredOutboundIP()
+		},
 		Logger: slog.Default(),
 	}
 	h := oidc.NewDiscoveryHandler(cfg)
 	h.ServeHTTP(c.Writer, c.Request)
 }
 
-func (s *GinServer) handleOIDCAuthorize(c *gin.Context) {
-	// Inject requested redirect_uri into context for dynamic origin validation
-	redirectURI := c.Request.FormValue("redirect_uri")
-	if redirectURI != "" {
-		ctx := context.WithValue(c.Request.Context(), requestedRedirectURIContextKey, redirectURI)
-		c.Request = c.Request.WithContext(ctx)
+// getPreferredOutboundIP returns a local IP address suitable for LAN access.
+// Used when mDNS is disabled.
+func getPreferredOutboundIP() string {
+	// Connect to a non-routable address to determine preferred outbound IP
+	conn, err := net.Dial("udp", "10.255.255.255:1")
+	if err != nil {
+		return "127.0.0.1"
 	}
+	defer conn.Close()
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return addr.IP.String()
+	}
+	return "127.0.0.1"
+}
+
+// isLocalMachineIP checks if the IP belongs to this machine.
+// This prevents accepting redirects to attacker-controlled servers on LAN.
+func isLocalMachineIP(ip net.IP) bool {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok {
+			if ipnet.IP.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *GinServer) handleOIDCAuthorize(c *gin.Context) {
+	clientID := c.Request.FormValue("client_id")
+	redirectURI := c.Request.FormValue("redirect_uri")
+	// Use "id" parameter (OIDC library standard)
+	authRequestID := c.Request.FormValue("id")
+
+	// Log incoming authorize request for debugging
+	slog.Info("OIDC authorize request",
+		"client_id", clientID,
+		"redirect_uri", redirectURI,
+		"id", authRequestID,
+		"response_type", c.Request.FormValue("response_type"),
+		"scope", c.Request.FormValue("scope"),
+	)
 
 	p, err := s.getOIDCProvider()
 	if err != nil {
 		c.Status(http.StatusInternalServerError)
 		return
 	}
+
+	// Case 1: Callback with authRequestID (after user login via portal)
+	if authRequestID != "" && clientID == "" {
+		s.handleOIDCAuthorizeCallback(c, p, authRequestID)
+		return
+	}
+
+	// Case 2: New authorize request - check if user already has a portal session
+	if clientID != "" {
+		sess := s.getSessionFromContext(c)
+		if sess != nil {
+			slog.Info("OIDC authorize: user already authenticated, fast-path",
+				"user_id", sess.UserID,
+				"client_id", clientID,
+			)
+
+			// User is already logged in - create auth request and immediately complete it
+			// This avoids redirecting to login page
+			s.handleOIDCAuthorizeFastPath(c, p, sess.UserID)
+			return
+		}
+	}
+
+	// Case 3: Regular authorize request (user not logged in)
+	// Inject redirect_uri for validation
+	if redirectURI != "" {
+		ctx := context.WithValue(c.Request.Context(), requestedRedirectURIContextKey, redirectURI)
+		c.Request = c.Request.WithContext(ctx)
+	}
+
 	p.Handler().ServeHTTP(c.Writer, c.Request)
+}
+
+// handleOIDCAuthorizeCallback handles the authorize callback after user login
+func (s *GinServer) handleOIDCAuthorizeCallback(c *gin.Context, p *oidc.Provider, authRequestID string) {
+	authReq, err := p.Storage().AuthRequestByID(c.Request.Context(), authRequestID)
+	if err != nil {
+		slog.Error("OIDC callback: auth request not found", "id", authRequestID, "error", err)
+		writeGinError(c, http.StatusBadRequest, "Auth request not found or expired")
+		return
+	}
+
+	if !authReq.Done() {
+		slog.Error("OIDC callback: auth request not completed", "id", authRequestID)
+		writeGinError(c, http.StatusBadRequest, "Auth request not completed - please login first")
+		return
+	}
+
+	// Inject redirect_uri from the auth request for validation
+	ctx := context.WithValue(c.Request.Context(), requestedRedirectURIContextKey, authReq.GetRedirectURI())
+	c.Request = c.Request.WithContext(ctx)
+
+	slog.Info("OIDC callback: completing auth request",
+		"id", authRequestID,
+		"client_id", authReq.GetClientID(),
+		"redirect_uri", authReq.GetRedirectURI(),
+	)
+
+	// Use the library's AuthorizeCallback to complete the flow
+	op.AuthorizeCallback(c.Writer, c.Request, p.Inner())
+}
+
+// handleOIDCAuthorizeFastPath handles authorize when user is already logged in
+func (s *GinServer) handleOIDCAuthorizeFastPath(c *gin.Context, p *oidc.Provider, userID string) {
+	redirectURI := c.Request.FormValue("redirect_uri")
+
+	// Inject redirect_uri for validation
+	ctx := c.Request.Context()
+	if redirectURI != "" {
+		ctx = context.WithValue(ctx, requestedRedirectURIContextKey, redirectURI)
+	}
+
+	// Parse the authorize request parameters
+	authReq, err := op.ParseAuthorizeRequest(c.Request, p.Inner().Decoder())
+	if err != nil {
+		slog.Error("OIDC fast-path: failed to parse authorize request", "error", err)
+		// Fall back to regular flow
+		c.Request = c.Request.WithContext(ctx)
+		p.Handler().ServeHTTP(c.Writer, c.Request)
+		return
+	}
+
+	// Create auth request with userID (marks it as Done)
+	storedReq, err := p.Storage().CreateAuthRequest(ctx, authReq, userID)
+	if err != nil {
+		slog.Error("OIDC fast-path: failed to create auth request", "error", err)
+		c.Request = c.Request.WithContext(ctx)
+		p.Handler().ServeHTTP(c.Writer, c.Request)
+		return
+	}
+
+	slog.Info("OIDC fast-path: created auth request with user",
+		"id", storedReq.GetID(),
+		"user_id", userID,
+		"client_id", storedReq.GetClientID(),
+	)
+
+	// Create new request with id parameter for AuthorizeCallback
+	// We must set id in both URL and Form because:
+	// - Clone() preserves the cached Form field
+	// - FormValue() reads from Form, not URL
+	newURL := *c.Request.URL
+	q := newURL.Query()
+	q.Set("id", storedReq.GetID())
+	newURL.RawQuery = q.Encode()
+
+	newReq := c.Request.Clone(ctx)
+	newReq.URL = &newURL
+
+	// Ensure Form is initialized and contains the id parameter
+	if newReq.Form == nil {
+		newReq.Form = make(map[string][]string)
+	}
+	newReq.Form.Set("id", storedReq.GetID())
+
+	op.AuthorizeCallback(c.Writer, newReq, p.Inner())
 }
 
 func (s *GinServer) handleOIDCToken(c *gin.Context) {
@@ -268,14 +459,15 @@ func (s *GinServer) handleOIDCResume(c *gin.Context) {
 	}
 
 	if err := p.CompleteAuthRequest(c.Request.Context(), req.AuthRequestID, sess.UserID); err != nil {
-		// This might fail if the request is expired or invalid
-		writeGinError(c, http.StatusBadRequest, "Failed to complete auth request: "+err.Error())
+		// Log detailed error server-side, return generic message to client
+		slog.Error("OIDC resume: failed to complete auth request", "id", req.AuthRequestID, "error", err)
+		writeGinError(c, http.StatusBadRequest, "Failed to complete authentication request")
 		return
 	}
 
 	// Return the URL for the frontend to redirect to.
 	// Redirecting back to the authorize endpoint with the ID triggers the final step (code issuance).
-	target := fmt.Sprintf("/oauth/authorize?authRequestID=%s", req.AuthRequestID)
+	target := fmt.Sprintf("/oauth/authorize?id=%s", req.AuthRequestID)
 	writeGinSuccess(c, gin.H{"redirect_url": target}, "Auth request completed")
 }
 

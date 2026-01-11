@@ -53,7 +53,8 @@ func (c *Client) GrantTypes() []oidc.GrantType {
 }
 
 func (c *Client) LoginURL(id string) string {
-	return "/?authRequestID=" + id
+	// Use "id" parameter (OIDC library standard)
+	return "/?id=" + id
 }
 
 func (c *Client) AccessTokenType() op.AccessTokenType {

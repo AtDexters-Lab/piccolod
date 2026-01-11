@@ -25,6 +25,9 @@ type AuthRequest struct {
 	UserID   string
 	AuthTime time.Time
 	IsDone   bool
+
+	// For cleanup tracking
+	CreatedAt time.Time
 }
 
 var _ op.AuthRequest = (*AuthRequest)(nil)

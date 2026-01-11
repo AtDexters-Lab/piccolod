@@ -17,6 +17,10 @@ type DiscoveryConfig struct {
 	// GetPortalHostname returns the portal hostname for WAN access
 	GetPortalHostname func() string
 
+	// GetLocalHostname returns the local hostname for LAN access (e.g., "piccolo.local",
+	// "piccolo-abc123.local", or an IP address if mDNS is disabled)
+	GetLocalHostname func() string
+
 	// Logger for discovery handler warnings
 	Logger *slog.Logger
 }
@@ -76,9 +80,15 @@ func (h *DiscoveryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if authEndpoint == "" {
-		// Local only or no portal hostname: use http://piccolo.local for LAN authorization.
+		// Local only or no portal hostname: use local hostname for LAN authorization.
 		// This allows the browser to reach the authorization endpoint on LAN without TLS issues.
-		authEndpoint = "http://piccolo.local/oauth/authorize"
+		localHost := "piccolo.local" // fallback
+		if h.config.GetLocalHostname != nil {
+			if lh := h.config.GetLocalHostname(); lh != "" {
+				localHost = lh
+			}
+		}
+		authEndpoint = "http://" + localHost + "/oauth/authorize"
 	}
 
 	config := OpenIDConfiguration{

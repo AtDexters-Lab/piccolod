@@ -90,6 +90,14 @@ func NewProvider(ctx context.Context, cfg ProviderConfig) (*Provider, error) {
 
 	inner, err := op.NewProvider(config, storage, issuerFactory,
 		op.WithAllowInsecure(), // Allow HTTP for local development
+		// Configure endpoints to use /oauth/ prefix to match our Gin routes
+		op.WithCustomAuthEndpoint(op.NewEndpoint("oauth/authorize")),
+		op.WithCustomTokenEndpoint(op.NewEndpoint("oauth/token")),
+		op.WithCustomUserinfoEndpoint(op.NewEndpoint("oauth/userinfo")),
+		op.WithCustomRevocationEndpoint(op.NewEndpoint("oauth/revoke")),
+		op.WithCustomIntrospectionEndpoint(op.NewEndpoint("oauth/introspect")),
+		op.WithCustomEndSessionEndpoint(op.NewEndpoint("oauth/logout")),
+		op.WithCustomKeysEndpoint(op.NewEndpoint("oauth/jwks")),
 	)
 	if err != nil {
 		return nil, err

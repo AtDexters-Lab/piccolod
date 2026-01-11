@@ -566,7 +566,6 @@ func (s *GinServer) Start() error {
 	}
 
 	s.startSecureLoopback()
-	s.startInternalHTTPSListener()
 
 	log.Printf("INFO: Starting piccolod server with Gin on http://localhost:%s", port)
 
@@ -588,6 +587,14 @@ func (s *GinServer) Stop() error {
 	}
 	s.stopSecureLoopback()
 	s.stopInternalHTTPSListener()
+
+	// Stop OIDC provider's background goroutines
+	s.oidcProviderMu.Lock()
+	if s.oidcProvider != nil {
+		s.oidcProvider.Storage().Close()
+	}
+	s.oidcProviderMu.Unlock()
+
 	if err := s.supervisor.Stop(context.Background()); err != nil {
 		log.Printf("WARN: Failed to stop components cleanly: %v", err)
 		return err
@@ -1015,6 +1022,9 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 	// Initialize internal CA now that bootstrap volume is mounted
 	if err := s.ensureInternalCA(); err != nil {
 		log.Printf("WARN: internal CA initialization failed: %v", err)
+	} else {
+		// Start internal HTTPS listener now that CA is available
+		s.startInternalHTTPSListener()
 	}
 
 	s.reloadersMu.RLock()
@@ -1374,9 +1384,14 @@ func (s *GinServer) startInternalHTTPSListener() {
 		return
 	}
 
-	// RFC 3.1: Bind to loopback only. Containers reach this via host-gateway (--add-host piccolo.local:host-gateway).
-	// This prevents exposing the self-signed OIDC surface to LAN/Internet.
-	addr := "127.0.0.1:443"
+	// Bind to all interfaces (0.0.0.0) instead of localhost only.
+	// RFC specifies 127.0.0.1:443, but containers access via host-gateway IP
+	// (e.g., 10.88.0.1 via --add-host piccolo.local:host-gateway), not localhost.
+	// Security relies on:
+	// 1. Internal CA - only piccolo's CA can issue valid certs
+	// 2. TLS verification - clients must verify cert is from internal CA
+	// 3. OIDC spec endpoints - no sensitive data beyond standard OIDC claims
+	addr := "0.0.0.0:443"
 	s.internalSrv = &http.Server{
 		Addr:    addr,
 		Handler: s.router,

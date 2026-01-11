@@ -231,3 +231,10 @@ func (m *Manager) currentServiceName() string {
 	defer m.mutex.RUnlock()
 	return m.finalName
 }
+
+// Hostname returns the full mDNS hostname (e.g., "piccolo.local" or "piccolo-abc123.local").
+func (m *Manager) Hostname() string {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return m.finalName + ".local"
+}

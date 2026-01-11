@@ -1240,6 +1240,14 @@ func (r *sqliteUserRepo) Delete(ctx context.Context, id string) error {
 	if err := r.store.ensureWritableLocked(); err != nil {
 		return err
 	}
+
+	// Delete refresh tokens first (no foreign key, so manual cascade)
+	// This revokes all OIDC sessions for the deleted user
+	_, err := r.store.db.ExecContext(ctx, `DELETE FROM oidc_refresh_tokens WHERE user_id=?`, id)
+	if err != nil {
+		return fmt.Errorf("delete user refresh tokens: %w", err)
+	}
+
 	result, err := r.store.db.ExecContext(ctx, `DELETE FROM users WHERE id=?`, id)
 	if err != nil {
 		return err

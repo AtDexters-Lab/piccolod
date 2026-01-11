@@ -37,6 +37,13 @@ type Storage struct {
 	authRequests   map[string]*AuthRequest
 	authRequestsMu sync.RWMutex
 
+	// Auth request limits
+	maxAuthRequests int
+	authRequestTTL  time.Duration
+
+	// Shutdown signal for cleanup goroutine
+	stopCleanup chan struct{}
+
 	// Cached signing key
 	signingKey   *signingKey
 	signingKeyMu sync.RWMutex
@@ -61,6 +68,10 @@ type StorageConfig struct {
 	RefreshTokens   persistence.OIDCRefreshTokenRepo
 	ResolveRedirect func(ctx context.Context, appID string) ([]string, error)
 	Logger          *slog.Logger
+
+	// Auth request limits (optional, defaults applied if zero)
+	MaxAuthRequests int           // Default: 1000
+	AuthRequestTTL  time.Duration // Default: 10 minutes
 }
 
 // NewStorage creates a new OIDC storage backed by our persistence layer.
@@ -68,6 +79,17 @@ func NewStorage(cfg StorageConfig) *Storage {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+
+	// Apply defaults for auth request limits
+	maxAuthRequests := cfg.MaxAuthRequests
+	if maxAuthRequests == 0 {
+		maxAuthRequests = 1000
+	}
+	authRequestTTL := cfg.AuthRequestTTL
+	if authRequestTTL == 0 {
+		authRequestTTL = 10 * time.Minute
+	}
+
 	s := &Storage{
 		users:           cfg.Users,
 		clients:         cfg.Clients,
@@ -75,12 +97,19 @@ func NewStorage(cfg StorageConfig) *Storage {
 		authCodes:       cfg.AuthCodes,
 		refreshTokens:   cfg.RefreshTokens,
 		authRequests:    make(map[string]*AuthRequest),
+		maxAuthRequests: maxAuthRequests,
+		authRequestTTL:  authRequestTTL,
+		stopCleanup:     make(chan struct{}),
 		resolveRedirect: cfg.ResolveRedirect,
 		logger:          cfg.Logger,
 	}
 	if s.resolveRedirect == nil {
 		s.resolveRedirect = func(ctx context.Context, appID string) ([]string, error) { return nil, nil }
 	}
+
+	// Start background cleanup goroutine
+	go s.authRequestCleanupLoop()
+
 	return s
 }
 
@@ -98,6 +127,54 @@ func (s *Storage) Health(ctx context.Context) error {
 }
 
 // -----------------------------------------------------------------------------
+// Auth request cleanup
+// -----------------------------------------------------------------------------
+
+// authRequestCleanupLoop runs periodically to remove expired auth requests.
+func (s *Storage) authRequestCleanupLoop() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.cleanupExpiredAuthRequests()
+		case <-s.stopCleanup:
+			return
+		}
+	}
+}
+
+// Close stops background goroutines. Safe to call multiple times.
+func (s *Storage) Close() {
+	select {
+	case <-s.stopCleanup:
+		// Already closed
+	default:
+		close(s.stopCleanup)
+	}
+}
+
+// cleanupExpiredAuthRequests removes auth requests older than the TTL.
+func (s *Storage) cleanupExpiredAuthRequests() {
+	s.authRequestsMu.Lock()
+	defer s.authRequestsMu.Unlock()
+
+	now := time.Now()
+	cleaned := 0
+	for id, req := range s.authRequests {
+		if now.Sub(req.CreatedAt) > s.authRequestTTL {
+			delete(s.authRequests, id)
+			cleaned++
+		}
+	}
+
+	if cleaned > 0 {
+		s.logger.Debug("cleaned up expired auth requests", "count", cleaned)
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Client operations (OPStorage)
 // -----------------------------------------------------------------------------
 
@@ -105,7 +182,8 @@ func (s *Storage) GetClientByClientID(ctx context.Context, clientID string) (op.
 	client, err := s.clients.Get(ctx, clientID)
 	if err != nil {
 		if errors.Is(err, persistence.ErrNotFound) {
-			return nil, fmt.Errorf("client not found: %s", clientID)
+			// Generic error to prevent client ID enumeration
+			return nil, errors.New("invalid client")
 		}
 		return nil, err
 	}
@@ -127,12 +205,15 @@ func (s *Storage) AuthorizeClientIDSecret(ctx context.Context, clientID, clientS
 	client, err := s.clients.Get(ctx, clientID)
 	if err != nil {
 		if errors.Is(err, persistence.ErrNotFound) {
-			return fmt.Errorf("client not found: %s", clientID)
+			// Log for security monitoring, return generic error to prevent enumeration
+			s.logger.Warn("OIDC client auth failed: unknown client", "client_id", clientID)
+			return errors.New("invalid client credentials")
 		}
 		return err
 	}
 
 	if !VerifyClientSecret(client.Secret, clientSecret) {
+		s.logger.Warn("OIDC client auth failed: invalid secret", "client_id", clientID)
 		return errors.New("invalid client credentials")
 	}
 
@@ -213,6 +294,15 @@ func (s *Storage) ValidateJWTProfileScopes(ctx context.Context, userID string, s
 // -----------------------------------------------------------------------------
 
 func (s *Storage) CreateAuthRequest(ctx context.Context, authReq *oidc.AuthRequest, userID string) (op.AuthRequest, error) {
+	// Check limit before creating
+	s.authRequestsMu.RLock()
+	currentCount := len(s.authRequests)
+	s.authRequestsMu.RUnlock()
+
+	if currentCount >= s.maxAuthRequests {
+		return nil, errors.New("too many pending auth requests")
+	}
+
 	id, err := generateID()
 	if err != nil {
 		return nil, fmt.Errorf("generate request ID: %w", err)
@@ -226,6 +316,7 @@ func (s *Storage) CreateAuthRequest(ctx context.Context, authReq *oidc.AuthReque
 		}
 	}
 
+	now := time.Now().UTC()
 	request := &AuthRequest{
 		ID:            id,
 		ClientID:      authReq.ClientID,
@@ -238,10 +329,19 @@ func (s *Storage) CreateAuthRequest(ctx context.Context, authReq *oidc.AuthReque
 		CodeChallenge: codeChallenge,
 		UserID:        userID,
 		IsDone:        userID != "",
+		CreatedAt:     now,
 	}
 	if userID != "" {
-		request.AuthTime = time.Now().UTC()
+		request.AuthTime = now
 	}
+
+	s.logger.Debug("OIDC CreateAuthRequest",
+		"id", id,
+		"client_id", authReq.ClientID,
+		"redirect_uri", authReq.RedirectURI,
+		"scopes", authReq.Scopes,
+		"user_id", userID,
+	)
 
 	s.authRequestsMu.Lock()
 	s.authRequests[id] = request
@@ -256,8 +356,17 @@ func (s *Storage) AuthRequestByID(ctx context.Context, id string) (op.AuthReques
 	s.authRequestsMu.RUnlock()
 
 	if !ok {
+		s.logger.Warn("OIDC AuthRequestByID not found", "id", id)
 		return nil, fmt.Errorf("auth request not found: %s", id)
 	}
+
+	s.logger.Debug("OIDC AuthRequestByID found",
+		"id", id,
+		"client_id", request.ClientID,
+		"redirect_uri", request.RedirectURI,
+		"user_id", request.UserID,
+		"is_done", request.IsDone,
+	)
 	return request, nil
 }
 
@@ -332,16 +441,24 @@ func (s *Storage) DeleteAuthRequest(ctx context.Context, id string) error {
 
 // CompleteAuthRequest marks an auth request as authenticated.
 func (s *Storage) CompleteAuthRequest(ctx context.Context, id, userID string) error {
+	s.logger.Debug("OIDC CompleteAuthRequest starting", "id", id, "user_id", userID)
+
 	// 1. Get Request (Read Lock)
 	s.authRequestsMu.RLock()
 	request, ok := s.authRequests[id]
 	clientID := ""
 	if ok {
 		clientID = request.ClientID
+		s.logger.Debug("OIDC CompleteAuthRequest found request",
+			"id", id,
+			"client_id", clientID,
+			"redirect_uri", request.RedirectURI,
+		)
 	}
 	s.authRequestsMu.RUnlock()
 
 	if !ok {
+		s.logger.Warn("OIDC CompleteAuthRequest request not found", "id", id)
 		return fmt.Errorf("auth request not found: %s", id)
 	}
 
@@ -376,10 +493,13 @@ func (s *Storage) CompleteAuthRequest(ctx context.Context, id, userID string) er
 	s.authRequestsMu.Lock()
 	defer s.authRequestsMu.Unlock()
 
-	// Re-check existence after lock
+	// Re-check existence and verify clientID hasn't changed (TOCTOU protection)
 	request, ok = s.authRequests[id]
 	if !ok {
 		return fmt.Errorf("auth request not found: %s", id)
+	}
+	if request.ClientID != clientID {
+		return errors.New("auth request modified during validation")
 	}
 
 	request.UserID = userID
@@ -610,7 +730,8 @@ func (s *Storage) SignatureAlgorithms(ctx context.Context) ([]jose.SignatureAlgo
 }
 
 func (s *Storage) generateAndStoreKey(ctx context.Context) (op.SigningKey, error) {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	// Use 3072-bit RSA keys for long-term security (NIST recommendation for post-2030)
+	privateKey, err := rsa.GenerateKey(rand.Reader, 3072)
 	if err != nil {
 		return nil, fmt.Errorf("generate RSA key: %w", err)
 	}
