@@ -70,9 +70,6 @@ func (m *AppManager) ContainerStatuses(ctx context.Context, instanceID string) (
 					appInst.Containers = make(map[string]string)
 				}
 				appInst.Containers[svcName] = id
-				if svcName == primary {
-					appInst.ContainerID = id
-				}
 				changed = true
 			}
 		}

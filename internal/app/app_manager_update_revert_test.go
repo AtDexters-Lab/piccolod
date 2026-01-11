@@ -80,7 +80,7 @@ func TestAppManager_Logs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
-	if inst.ContainerID == "" {
+	if inst.PrimaryContainerID() == "" {
 		t.Fatalf("no container id")
 	}
 	lines, err := mgr.Logs(ctx, inst.InstanceID, 5)

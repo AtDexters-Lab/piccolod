@@ -133,6 +133,19 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			}
 		}
 
+		// If stored ID is stale (container doesn't exist), try name-based resolution before recreating.
+		if cid != "" && !st.Exists {
+			name := containerNameForService(appInst.InstanceID, svcName, primary)
+			if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" {
+				cid = id
+				appInst.Containers[svcName] = id
+				_ = state.StoreApp(appInst, nil)
+				if observed, err := m.containerManager.InspectContainerState(ctx, runtime, cid); err == nil {
+					st = observed
+				}
+			}
+		}
+
 		if cid == "" || !st.Exists {
 			opts := serviceContainerOptions{
 				layout:     layout,
@@ -159,9 +172,6 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[svcName] = newCID
-			if svcName == primary {
-				appInst.ContainerID = newCID
-			}
 			_ = state.StoreApp(appInst, nil)
 			continue
 		}
@@ -172,12 +182,6 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				return fmt.Errorf("failed to start service '%s': %w", svcName, err)
 			}
 		}
-	}
-
-	// Ensure ContainerID matches the primary service container ID
-	if primaryCID := appInst.Containers[primary]; primaryCID != "" && appInst.ContainerID != primaryCID {
-		appInst.ContainerID = primaryCID
-		_ = state.StoreApp(appInst, nil)
 	}
 
 	if appInst.Status != "running" {
@@ -240,7 +244,6 @@ func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *F
 			// Preserve timestamps.
 			newInst.CreatedAt = appInst.CreatedAt
 			newInst.UpdatedAt = time.Now()
-			appInst.ContainerID = newInst.ContainerID
 			appInst.PrimaryService = newInst.PrimaryService
 			appInst.NetworkAnchorID = newInst.NetworkAnchorID
 			appInst.Containers = newInst.Containers

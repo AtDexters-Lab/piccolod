@@ -48,13 +48,12 @@ type AppInstance struct {
 	InstanceID  string `json:"instance_id"`
 	DisplayName string `json:"display_name,omitempty"`
 	Status      string `json:"status"`
-	ContainerID string `json:"container_id"`
-	// Multi-container runtime metadata (service mode only).
-	PrimaryService  string             `json:"primary_service,omitempty"`
-	NetworkAnchorID string             `json:"network_anchor_id,omitempty"`
-	Containers      map[string]string  `json:"containers,omitempty"`
-	CreatedAt       time.Time          `json:"created_at"`
-	UpdatedAt       time.Time          `json:"updated_at"`
+	// Container runtime metadata.
+	PrimaryService  string            `json:"primary_service,omitempty"`
+	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`
+	Containers      map[string]string `json:"containers,omitempty"` // service name -> container ID
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at"`
 	Definition      *api.AppDefinition `json:"definition,omitempty"`
 }
 
@@ -112,6 +111,34 @@ func (a *AppInstance) Mode() PiccoloMode {
 	return piccoloModeFromExtensions(a.Definition.Extensions)
 }
 
+// PrimaryContainerID returns the container ID of the primary service.
+// This is the canonical method to get the primary container ID.
+func (a *AppInstance) PrimaryContainerID() string {
+	if a == nil || a.Containers == nil {
+		return ""
+	}
+	primary := a.PrimaryService
+	if primary == "" {
+		primary = defaultPrimaryServiceName
+	}
+	return a.Containers[primary]
+}
+
+// SetPrimaryContainerID sets the container ID for the primary service.
+func (a *AppInstance) SetPrimaryContainerID(cid string) {
+	if a == nil {
+		return
+	}
+	primary := a.PrimaryService
+	if primary == "" {
+		primary = defaultPrimaryServiceName
+	}
+	if a.Containers == nil {
+		a.Containers = make(map[string]string)
+	}
+	a.Containers[primary] = cid
+}
+
 // PublishContainerID returns the container ID that owns published listener ports.
 // For single-container apps this is the primary container; for multi-container apps it is the network anchor.
 func (a *AppInstance) PublishContainerID() string {
@@ -121,5 +148,5 @@ func (a *AppInstance) PublishContainerID() string {
 	if strings.TrimSpace(a.NetworkAnchorID) != "" {
 		return a.NetworkAnchorID
 	}
-	return a.ContainerID
+	return a.PrimaryContainerID()
 }

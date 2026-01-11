@@ -543,7 +543,7 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 		return
 	}
 
-	recreated := oldApp.ContainerID != newApp.ContainerID
+	recreated := oldApp.PrimaryContainerID() != newApp.PrimaryContainerID()
 
 	// Include services inline
 	services, _ := s.serviceManager.GetByApp(appName)

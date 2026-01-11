@@ -1107,10 +1107,10 @@ func TestAppManager_ReconcileOnceStartsDesiredRunningApps(t *testing.T) {
 	if inst.Status != "running" {
 		t.Fatalf("expected status running after reconcile, got %s", inst.Status)
 	}
-	if inst.ContainerID == "" {
+	if inst.PrimaryContainerID() == "" {
 		t.Fatalf("expected container id after reconcile")
 	}
-	if c := mock.containers[inst.ContainerID]; c == nil || c.Status != "running" {
+	if c := mock.containers[inst.PrimaryContainerID()]; c == nil || c.Status != "running" {
 		t.Fatalf("expected container to be running after reconcile")
 	}
 }
@@ -1160,7 +1160,7 @@ func TestAppManager_ReconcileOnceStopsDesiredStoppedApps(t *testing.T) {
 	if inst.Status != "stopped" {
 		t.Fatalf("expected status stopped, got %s", inst.Status)
 	}
-	if c := mock.containers[inst.ContainerID]; c == nil || c.Status != "stopped" {
+	if c := mock.containers[inst.PrimaryContainerID()]; c == nil || c.Status != "stopped" {
 		t.Fatalf("expected container to be stopped after reconcile")
 	}
 	if _, err := svcMgr.GetByApp("demo"); err == nil {
@@ -1208,7 +1208,7 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 	if inst.Status != "running" {
 		t.Fatalf("expected status to remain running, got %s", inst.Status)
 	}
-	if c := mock.containers[inst.ContainerID]; c == nil || c.Status != "stopped" {
+	if c := mock.containers[inst.PrimaryContainerID()]; c == nil || c.Status != "stopped" {
 		t.Fatalf("expected container to be stopped after follower transition")
 	}
 
@@ -1225,7 +1225,7 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 	if updated.Status != "running" {
 		t.Fatalf("expected status to remain running, got %s", updated.Status)
 	}
-	if c := mock.containers[updated.ContainerID]; c == nil || c.Status != "stopped" {
+	if c := mock.containers[updated.PrimaryContainerID()]; c == nil || c.Status != "stopped" {
 		t.Fatalf("expected container to remain stopped on follower after reconcile")
 	}
 	if _, err := svcMgr.GetByApp("demo"); err == nil {
@@ -1258,7 +1258,7 @@ func TestAppManager_ReconcileOnceResolvesStaleContainerID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
-	original := inst.ContainerID
+	original := inst.PrimaryContainerID()
 
 	state, err := mgr.ensureStateManager()
 	if err != nil {
@@ -1274,7 +1274,7 @@ func TestAppManager_ReconcileOnceResolvesStaleContainerID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if updated.ContainerID != original {
-		t.Fatalf("expected container id to be resolved back to %s, got %s", original, updated.ContainerID)
+	if updated.PrimaryContainerID() != original {
+		t.Fatalf("expected container id to be resolved back to %s, got %s", original, updated.PrimaryContainerID())
 	}
 }

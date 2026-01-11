@@ -834,7 +834,7 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 				m.serviceManager.RemoveApp(appInst.InstanceID)
 				return fmt.Errorf("failed to start container: %w", err)
 			}
-			appInst.ContainerID = cid
+			appInst.SetPrimaryContainerID(cid)
 			_ = state.UpdateAppRuntime(appInst.InstanceID, "running", cid)
 			m.serviceManager.SetAppContainerID(appInst.InstanceID, cid)
 			return nil
@@ -845,7 +845,7 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 			log.Printf("INFO: recreate app %s: adopted existing container %s", appInst.InstanceID, nameErr.ID)
 			// Discard speculative port allocation; ensureServicesForRunningApp will restore actual ports.
 			m.serviceManager.RemoveApp(appInst.InstanceID)
-			appInst.ContainerID = nameErr.ID
+			appInst.SetPrimaryContainerID(nameErr.ID)
 			_ = state.UpdateAppRuntime(appInst.InstanceID, appInst.Status, nameErr.ID)
 			return nil
 		}
@@ -1250,7 +1250,7 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 		return nil
 	}
 
-	if err := m.containerManager.StopContainer(ctx, runtime, app.ContainerID); err != nil {
+	if err := m.containerManager.StopContainer(ctx, runtime, app.PrimaryContainerID()); err != nil {
 		var notFound *container.ContainerNotFoundError
 		if !errors.As(err, &notFound) {
 			return err
@@ -1559,8 +1559,8 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	// Preserve endpoints
 	endpoints, _ := m.serviceManager.GetByApp(instanceID)
 	// Stop and remove old container
-	_ = m.containerManager.StopContainer(ctx, runtime, appInst.ContainerID)
-	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.ContainerID)
+	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
+	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
 	// Create new container with same endpoints
 	spec, err := m.appDefToContainerSpec(&newDef, endpoints, layout, instanceID)
 	if err != nil {
@@ -1576,7 +1576,7 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	startErr := m.containerManager.StartContainer(ctx, runtime, newCID)
 	// Update instance with new definition and persist
 	appInst.Definition = &newDef
-	appInst.ContainerID = newCID
+	appInst.SetPrimaryContainerID(newCID)
 	if startErr != nil {
 		appInst.Status = "error"
 	} else {
@@ -1678,8 +1678,8 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseRecreatingContainer, 50, "Recreating container", false, nil)
 
 		// Stop and remove old container
-		_ = m.containerManager.StopContainer(ctx, runtime, appInst.ContainerID)
-		_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.ContainerID)
+		_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
+		_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
 
 		// Ensure workspace disk is mounted and get the merged path
 		mergedPath, err := m.ensureWorkspaceDiskMounted(ctx, instanceID, layout)
@@ -1723,7 +1723,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			if rbErr != nil {
 				log.Printf("ERROR: update listeners %s: port rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
-				appInst.ContainerID = ""
+				appInst.SetPrimaryContainerID("")
 				_ = state.StoreApp(appInst, curDef)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (ports): %v", err, rbErr)
 			}
@@ -1733,7 +1733,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			if rbErr != nil {
 				log.Printf("ERROR: update listeners %s: spec rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
-				appInst.ContainerID = ""
+				appInst.SetPrimaryContainerID("")
 				_ = state.StoreApp(appInst, curDef)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (spec): %v", err, rbErr)
 			}
@@ -1752,7 +1752,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			if rbErr != nil {
 				log.Printf("ERROR: update listeners %s: container rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
-				appInst.ContainerID = ""
+				appInst.SetPrimaryContainerID("")
 				_ = state.StoreApp(appInst, curDef)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (create): %v", err, rbErr)
 			}
@@ -1761,7 +1761,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			if rbErr := m.containerManager.StartContainer(ctx, runtime, rbCID); rbErr != nil {
 				log.Printf("ERROR: update listeners %s: start rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
-				appInst.ContainerID = rbCID // It exists but failed to start
+				appInst.SetPrimaryContainerID(rbCID) // It exists but failed to start
 				_ = state.StoreApp(appInst, curDef)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (start): %v", err, rbErr)
 			}
@@ -1771,7 +1771,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			if m.serviceManager != nil {
 				m.serviceManager.SetAppContainerID(instanceID, rbCID)
 			}
-			appInst.ContainerID = rbCID
+			appInst.SetPrimaryContainerID(rbCID)
 			appInst.Status = "running"
 			// Save the restored state to ensure persistence of new CID
 			if saveErr := state.StoreApp(appInst, curDef); saveErr != nil {
@@ -1786,7 +1786,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		}
 
 		// Update instance
-		appInst.ContainerID = newCID
+		appInst.SetPrimaryContainerID(newCID)
 
 		// Start container automatically
 		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseStarting, 80, "Starting container", false, nil)
@@ -1857,8 +1857,8 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	// Preserve endpoints
 	endpoints, _ := m.serviceManager.GetByApp(instanceID)
 	// Stop and remove current container
-	_ = m.containerManager.StopContainer(ctx, runtime, appInst.ContainerID)
-	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.ContainerID)
+	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
+	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
 	// Pull to app's storage (best-effort)
 	if prevImage := imageFromDefinition(prevDef); strings.TrimSpace(prevImage) != "" {
 		_ = m.containerManager.PullImage(ctx, runtime, prevImage)
@@ -1878,7 +1878,7 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	startErr := m.containerManager.StartContainer(ctx, runtime, newCID)
 	// Update instance with previous definition and persist
 	appInst.Definition = prevDef
-	appInst.ContainerID = newCID
+	appInst.SetPrimaryContainerID(newCID)
 	if startErr != nil {
 		appInst.Status = "error"
 	} else {
@@ -1957,9 +1957,6 @@ func (m *AppManager) LogsForService(ctx context.Context, instanceID, service str
 				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[target] = id
-			if target == primary {
-				appInst.ContainerID = id
-			}
 			_ = state.StoreApp(appInst, nil)
 		}
 	}
@@ -2020,9 +2017,6 @@ func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, servi
 				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[target] = id
-			if target == primary {
-				appInst.ContainerID = id
-			}
 			_ = state.StoreApp(appInst, nil)
 		}
 	}
@@ -2277,9 +2271,6 @@ func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, ser
 				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[target] = id
-			if target == primary {
-				appInst.ContainerID = id
-			}
 			_ = state.StoreApp(appInst, nil)
 		}
 	}

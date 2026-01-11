@@ -333,28 +333,9 @@ type AppVolume struct {
 	Shared    bool   `yaml:"shared,omitempty" json:"shared,omitempty"`
 }
 
-// App represents an installed application
-type App struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Image       string `json:"image"`
-	Type        string `json:"type"`
-	Mode        string `json:"mode,omitempty"` // "workspace" or "service"
-	Status      string `json:"status"`         // "running", "stopped", "error"
-	ContainerID string `json:"container_id,omitempty"`
-	// Legacy Ports removed
-	Volumes     []AppVolume       `json:"volumes,omitempty"`
-	Environment map[string]string `json:"environment,omitempty"`
-}
-
 // InstallAppRequest defines the request to install an app
 type InstallAppRequest struct {
 	AppDefinition string `json:"app_definition"` // YAML content as string
-}
-
-// AppListResponse defines the response for listing apps
-type AppListResponse struct {
-	Apps []App `json:"apps"`
 }
 
 // CatalogItem represents an available application in the external catalog

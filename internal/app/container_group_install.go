@@ -303,7 +303,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		InstanceID:      instanceID,
 		DisplayName:     displayName,
 		Status:          "running",
-		ContainerID:     primaryCID,
 		PrimaryService:  primary,
 		NetworkAnchorID: anchorID,
 		Containers:      containers,
