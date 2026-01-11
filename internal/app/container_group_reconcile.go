@@ -26,9 +26,11 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 	// For workspace mode, ensure workspace disk is mounted before starting containers
 	// and capture the mount info for container recreation.
+	// NOTE: We do NOT call cleanupStaleWorkspaceMounts here because the container
+	// may be actively using the overlay as its rootfs. Stale cleanup is only safe
+	// during startContainerGroup when we know containers aren't running.
 	var workspaceInfo *workspaceMountInfo
 	if mode == ModeWorkspace && desiredRunning {
-		m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
 		if _, err := m.ensureWorkspaceDiskMounted(ctx, appInst.InstanceID, layout); err != nil {
 			return fmt.Errorf("failed to mount workspace disk: %w", err)
 		}
@@ -107,10 +109,6 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 	m.serviceManager.SetAppContainerID(appInst.InstanceID, anchorID)
 
-	if appInst.Containers == nil {
-		appInst.Containers = make(map[string]string, len(def.Services))
-	}
-
 	// Ensure all declared services exist and are running.
 	for _, svcName := range startOrder {
 		cid := strings.TrimSpace(appInst.Containers[svcName])
@@ -118,6 +116,9 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			name := containerNameForService(appInst.InstanceID, svcName, primary)
 			if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" {
 				cid = id
+				if appInst.Containers == nil {
+					appInst.Containers = make(map[string]string)
+				}
 				appInst.Containers[svcName] = id
 				_ = state.StoreApp(appInst, nil)
 			}
@@ -153,6 +154,9 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			if err != nil {
 				_ = state.UpdateAppStatus(appInst.InstanceID, "error")
 				return err
+			}
+			if appInst.Containers == nil {
+				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[svcName] = newCID
 			if svcName == primary {

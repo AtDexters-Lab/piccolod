@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -73,13 +74,7 @@ func (a *AppInstance) Image() string {
 }
 
 func imageFromDefinition(def *api.AppDefinition) string {
-	if def == nil {
-		return ""
-	}
-	if strings.TrimSpace(def.Image) != "" {
-		return def.Image
-	}
-	if def.Services == nil {
+	if def == nil || def.Services == nil {
 		return ""
 	}
 	primary := strings.TrimSpace(def.PrimaryService)
@@ -89,10 +84,14 @@ func imageFromDefinition(def *api.AppDefinition) string {
 	if svc, ok := def.Services[primary]; ok {
 		return svc.Image
 	}
-	if len(def.Services) == 1 {
-		for _, svc := range def.Services {
-			return svc.Image
-		}
+	// Fallback to first service alphabetically if primary not found
+	names := make([]string, 0, len(def.Services))
+	for name := range def.Services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) > 0 {
+		return def.Services[names[0]].Image
 	}
 	return ""
 }

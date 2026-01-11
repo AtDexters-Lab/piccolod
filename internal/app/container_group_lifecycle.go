@@ -49,16 +49,15 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		return fmt.Errorf("start: network anchor container missing for %s", appInst.InstanceID)
 	}
 
-	if appInst.Containers == nil {
-		appInst.Containers = make(map[string]string, len(def.Services))
-		changed = true
-	}
 	for svcName := range def.Services {
 		if strings.TrimSpace(appInst.Containers[svcName]) != "" {
 			continue
 		}
 		name := containerNameForService(appInst.InstanceID, svcName, primary)
 		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" {
+			if appInst.Containers == nil {
+				appInst.Containers = make(map[string]string)
+			}
 			appInst.Containers[svcName] = id
 			changed = true
 		}

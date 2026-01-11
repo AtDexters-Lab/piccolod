@@ -15,9 +15,7 @@ type ServiceContainerStatus struct {
 	Running     bool   `json:"running"`
 }
 
-// ContainerStatuses returns best-effort per-service container status for an app instance.
-//
-// For legacy single-container apps, it returns a single entry with service "main".
+// ContainerStatuses returns per-service container status for an app instance.
 func (m *AppManager) ContainerStatuses(ctx context.Context, instanceID string) ([]ServiceContainerStatus, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
@@ -34,86 +32,68 @@ func (m *AppManager) ContainerStatuses(ctx context.Context, instanceID string) (
 	}
 
 	def := appInst.Definition
-	mode := ModeService
-	if def != nil {
-		mode = piccoloModeFromExtensions(def.Extensions)
+	if def == nil || def.Services == nil {
+		return nil, fmt.Errorf("app %s has no valid definition", instanceID)
 	}
 
+	mode := piccoloModeFromExtensions(def.Extensions)
 	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return nil, err
 	}
 
-	if def != nil && def.Services != nil {
-		primary := primaryServiceFor(def, appInst)
+	primary := primaryServiceFor(def, appInst)
 
-		names := make([]string, 0, len(def.Services))
-		for name := range def.Services {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		if primary != "" {
-			for i, name := range names {
-				if name == primary {
-					names = append([]string{primary}, append(names[:i], names[i+1:]...)...)
-					break
-				}
+	names := make([]string, 0, len(def.Services))
+	for name := range def.Services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if primary != "" {
+		for i, name := range names {
+			if name == primary {
+				names = append([]string{primary}, append(names[:i], names[i+1:]...)...)
+				break
 			}
 		}
-
-		changed := false
-		if appInst.Containers == nil {
-			appInst.Containers = make(map[string]string, len(def.Services))
-			changed = true
-		}
-
-		out := make([]ServiceContainerStatus, 0, len(names))
-		for _, svcName := range names {
-			cid := strings.TrimSpace(appInst.Containers[svcName])
-			if cid == "" {
-				name := containerNameForService(instanceID, svcName, primary)
-				if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" {
-					cid = id
-					appInst.Containers[svcName] = id
-					if svcName == primary {
-						appInst.ContainerID = id
-					}
-					changed = true
-				}
-			}
-
-			running := false
-			if cid != "" {
-				if st, err := m.containerManager.InspectContainerState(ctx, runtime, cid); err == nil && st.Exists {
-					running = st.Running
-				}
-			}
-
-			out = append(out, ServiceContainerStatus{
-				Service:     svcName,
-				ContainerID: cid,
-				Running:     running,
-			})
-		}
-
-		if changed {
-			_ = state.StoreApp(appInst, nil)
-		}
-
-		return out, nil
 	}
 
-	// Legacy single-container apps: expose a stable service token for clients.
-	cid := strings.TrimSpace(appInst.ContainerID)
-	running := false
-	if cid != "" {
-		if st, err := m.containerManager.InspectContainerState(ctx, runtime, cid); err == nil && st.Exists {
-			running = st.Running
+	changed := false
+	out := make([]ServiceContainerStatus, 0, len(names))
+	for _, svcName := range names {
+		cid := strings.TrimSpace(appInst.Containers[svcName])
+		if cid == "" {
+			name := containerNameForService(instanceID, svcName, primary)
+			if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" {
+				cid = id
+				if appInst.Containers == nil {
+					appInst.Containers = make(map[string]string)
+				}
+				appInst.Containers[svcName] = id
+				if svcName == primary {
+					appInst.ContainerID = id
+				}
+				changed = true
+			}
 		}
+
+		running := false
+		if cid != "" {
+			if st, err := m.containerManager.InspectContainerState(ctx, runtime, cid); err == nil && st.Exists {
+				running = st.Running
+			}
+		}
+
+		out = append(out, ServiceContainerStatus{
+			Service:     svcName,
+			ContainerID: cid,
+			Running:     running,
+		})
 	}
-	return []ServiceContainerStatus{{
-		Service:     defaultPrimaryServiceName,
-		ContainerID: cid,
-		Running:     running,
-	}}, nil
+
+	if changed {
+		_ = state.StoreApp(appInst, nil)
+	}
+
+	return out, nil
 }

@@ -1907,7 +1907,7 @@ func (m *AppManager) LogsStream(ctx context.Context, instanceID string, lines in
 }
 
 // LogsForService fetches recent container logs for a specific service container in an app instance.
-// If service is empty, defaults to the primary service (or the single container for legacy apps).
+// If service is empty, defaults to the primary service.
 func (m *AppManager) LogsForService(ctx context.Context, instanceID, service string, lines int) ([]string, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
@@ -1926,55 +1926,51 @@ func (m *AppManager) LogsForService(ctx context.Context, instanceID, service str
 	}
 
 	def := appInst.Definition
-	mode := ModeService
-	if def != nil {
-		mode = piccoloModeFromExtensions(def.Extensions)
+	if def == nil || def.Services == nil {
+		return nil, fmt.Errorf("app %s has no valid definition", instanceID)
 	}
 
+	mode := piccoloModeFromExtensions(def.Extensions)
 	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return nil, err
 	}
 
-	if def != nil && mode == ModeService {
-		primary := primaryServiceFor(def, appInst)
-		target := strings.TrimSpace(service)
-		if target == "" {
-			target = primary
-		}
-		if target == networkAnchorServiceName {
-			return nil, fmt.Errorf("invalid service name")
-		}
-		if _, ok := def.Services[target]; !ok {
-			return nil, fmt.Errorf("unknown service '%s'", target)
-		}
-
-		cid := strings.TrimSpace(appInst.Containers[target])
-		if cid == "" {
-			name := containerNameForService(instanceID, target, primary)
-			if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil {
-				cid = id
-				if appInst.Containers == nil {
-					appInst.Containers = make(map[string]string)
-				}
-				appInst.Containers[target] = id
-				if target == primary {
-					appInst.ContainerID = id
-				}
-				_ = state.StoreApp(appInst, nil)
-			}
-		}
-		if cid == "" {
-			return nil, fmt.Errorf("container not found for service '%s'", target)
-		}
-		return m.containerManager.Logs(ctx, runtime, cid, lines)
+	primary := primaryServiceFor(def, appInst)
+	target := strings.TrimSpace(service)
+	if target == "" {
+		target = primary
+	}
+	if target == networkAnchorServiceName {
+		return nil, fmt.Errorf("invalid service name")
+	}
+	if _, ok := def.Services[target]; !ok {
+		return nil, fmt.Errorf("unknown service '%s'", target)
 	}
 
-	return m.containerManager.Logs(ctx, runtime, appInst.ContainerID, lines)
+	cid := strings.TrimSpace(appInst.Containers[target])
+	if cid == "" {
+		name := containerNameForService(instanceID, target, primary)
+		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil {
+			cid = id
+			if appInst.Containers == nil {
+				appInst.Containers = make(map[string]string)
+			}
+			appInst.Containers[target] = id
+			if target == primary {
+				appInst.ContainerID = id
+			}
+			_ = state.StoreApp(appInst, nil)
+		}
+	}
+	if cid == "" {
+		return nil, fmt.Errorf("container not found for service '%s'", target)
+	}
+	return m.containerManager.Logs(ctx, runtime, cid, lines)
 }
 
 // LogsStreamForService returns a follow-stream of container logs for a specific service container in an app instance.
-// If service is empty, defaults to the primary service (or the single container for legacy apps).
+// If service is empty, defaults to the primary service.
 func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, service string, lines int, timestamps bool) (io.ReadCloser, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
@@ -1993,51 +1989,47 @@ func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, servi
 	}
 
 	def := appInst.Definition
-	mode := ModeService
-	if def != nil {
-		mode = piccoloModeFromExtensions(def.Extensions)
+	if def == nil || def.Services == nil {
+		return nil, fmt.Errorf("app %s has no valid definition", instanceID)
 	}
 
+	mode := piccoloModeFromExtensions(def.Extensions)
 	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return nil, err
 	}
 
-	if def != nil && mode == ModeService {
-		primary := primaryServiceFor(def, appInst)
-		target := strings.TrimSpace(service)
-		if target == "" {
-			target = primary
-		}
-		if target == networkAnchorServiceName {
-			return nil, fmt.Errorf("invalid service name")
-		}
-		if _, ok := def.Services[target]; !ok {
-			return nil, fmt.Errorf("unknown service '%s'", target)
-		}
-
-		cid := strings.TrimSpace(appInst.Containers[target])
-		if cid == "" {
-			name := containerNameForService(instanceID, target, primary)
-			if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil {
-				cid = id
-				if appInst.Containers == nil {
-					appInst.Containers = make(map[string]string)
-				}
-				appInst.Containers[target] = id
-				if target == primary {
-					appInst.ContainerID = id
-				}
-				_ = state.StoreApp(appInst, nil)
-			}
-		}
-		if cid == "" {
-			return nil, fmt.Errorf("container not found for service '%s'", target)
-		}
-		return m.containerManager.LogsStream(ctx, runtime, cid, lines, timestamps)
+	primary := primaryServiceFor(def, appInst)
+	target := strings.TrimSpace(service)
+	if target == "" {
+		target = primary
+	}
+	if target == networkAnchorServiceName {
+		return nil, fmt.Errorf("invalid service name")
+	}
+	if _, ok := def.Services[target]; !ok {
+		return nil, fmt.Errorf("unknown service '%s'", target)
 	}
 
-	return m.containerManager.LogsStream(ctx, runtime, appInst.ContainerID, lines, timestamps)
+	cid := strings.TrimSpace(appInst.Containers[target])
+	if cid == "" {
+		name := containerNameForService(instanceID, target, primary)
+		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil {
+			cid = id
+			if appInst.Containers == nil {
+				appInst.Containers = make(map[string]string)
+			}
+			appInst.Containers[target] = id
+			if target == primary {
+				appInst.ContainerID = id
+			}
+			_ = state.StoreApp(appInst, nil)
+		}
+	}
+	if cid == "" {
+		return nil, fmt.Errorf("container not found for service '%s'", target)
+	}
+	return m.containerManager.LogsStream(ctx, runtime, cid, lines, timestamps)
 }
 
 // appDefToContainerSpec converts an AppDefinition to a ContainerCreateSpec.
@@ -2100,11 +2092,6 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 		if def.Permissions.Network.Internet == "deny" {
 			spec.NetworkMode = "none"
 		}
-	}
-
-	// Set restart policy for system apps
-	if def.Type == "system" {
-		spec.RestartPolicy = "always"
 	}
 
 	// Storage mounts:
@@ -2239,7 +2226,7 @@ func (m *AppManager) ExecShellCmd(ctx context.Context, instanceID string) (*exec
 }
 
 // ExecShellCmdForService returns an exec.Cmd for running a shell inside a specific service container.
-// If service is empty, defaults to the primary service (or the single container for legacy apps).
+// If service is empty, defaults to the primary service.
 func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, service string) (*exec.Cmd, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
@@ -2248,9 +2235,6 @@ func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, ser
 	appInst, exists := state.GetApp(instanceID)
 	if !exists {
 		return nil, fmt.Errorf("app instance not found: %s", instanceID)
-	}
-	if appInst.ContainerID == "" {
-		return nil, fmt.Errorf("app %s has no container ID", instanceID)
 	}
 	if appInst.Status != "running" {
 		return nil, fmt.Errorf("app %s is not running (status: %s)", instanceID, appInst.Status)
@@ -2262,49 +2246,45 @@ func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, ser
 	}
 
 	def := appInst.Definition
-	mode := ModeService
-	if def != nil {
-		mode = piccoloModeFromExtensions(def.Extensions)
+	if def == nil || def.Services == nil {
+		return nil, fmt.Errorf("app %s has no valid definition", instanceID)
 	}
 
+	mode := piccoloModeFromExtensions(def.Extensions)
 	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create podman runtime: %w", err)
 	}
 
-	if def != nil && mode == ModeService {
-		primary := primaryServiceFor(def, appInst)
-		target := strings.TrimSpace(service)
-		if target == "" {
-			target = primary
-		}
-		if target == networkAnchorServiceName {
-			return nil, fmt.Errorf("invalid service name")
-		}
-		if _, ok := def.Services[target]; !ok {
-			return nil, fmt.Errorf("unknown service '%s'", target)
-		}
-
-		cid := strings.TrimSpace(appInst.Containers[target])
-		if cid == "" {
-			name := containerNameForService(instanceID, target, primary)
-			if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil {
-				cid = id
-				if appInst.Containers == nil {
-					appInst.Containers = make(map[string]string)
-				}
-				appInst.Containers[target] = id
-				if target == primary {
-					appInst.ContainerID = id
-				}
-				_ = state.StoreApp(appInst, nil)
-			}
-		}
-		if cid == "" {
-			return nil, fmt.Errorf("container not found for service '%s'", target)
-		}
-		return m.containerManager.ExecShellCmd(runtime, cid)
+	primary := primaryServiceFor(def, appInst)
+	target := strings.TrimSpace(service)
+	if target == "" {
+		target = primary
+	}
+	if target == networkAnchorServiceName {
+		return nil, fmt.Errorf("invalid service name")
+	}
+	if _, ok := def.Services[target]; !ok {
+		return nil, fmt.Errorf("unknown service '%s'", target)
 	}
 
-	return m.containerManager.ExecShellCmd(runtime, appInst.ContainerID)
+	cid := strings.TrimSpace(appInst.Containers[target])
+	if cid == "" {
+		name := containerNameForService(instanceID, target, primary)
+		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil {
+			cid = id
+			if appInst.Containers == nil {
+				appInst.Containers = make(map[string]string)
+			}
+			appInst.Containers[target] = id
+			if target == primary {
+				appInst.ContainerID = id
+			}
+			_ = state.StoreApp(appInst, nil)
+		}
+	}
+	if cid == "" {
+		return nil, fmt.Errorf("container not found for service '%s'", target)
+	}
+	return m.containerManager.ExecShellCmd(runtime, cid)
 }

@@ -858,7 +858,8 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 		return ContainerState{Exists: false, Running: false}, nil
 	}
 
-	args, err := buildPodmanArgs(runtime, []string{"inspect", "--format", "{{.State.Running}}", containerID})
+	// Get both running state and PID to detect stale state after reboot
+	args, err := buildPodmanArgs(runtime, []string{"inspect", "--format", "{{.State.Running}}|{{.State.Pid}}", containerID})
 	if err != nil {
 		return ContainerState{}, err
 	}
@@ -883,14 +884,26 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 		}
 	}
 
-	switch result {
-	case "true":
-		return ContainerState{Exists: true, Running: true}, nil
-	case "false":
-		return ContainerState{Exists: true, Running: false}, nil
-	default:
-		return ContainerState{}, fmt.Errorf("podman inspect returned unexpected running state: %q", result)
+	// Parse "running|pid" format
+	parts := strings.SplitN(result, "|", 2)
+	if len(parts) != 2 {
+		return ContainerState{}, fmt.Errorf("podman inspect returned unexpected format: %q", result)
 	}
+
+	running := parts[0] == "true"
+	pid := strings.TrimSpace(parts[1])
+
+	// If podman reports running but PID doesn't exist, the container is stale
+	// This happens after system reboot when podman DB has stale state
+	if running && pid != "" && pid != "0" {
+		procPath := fmt.Sprintf("/proc/%s", pid)
+		if _, err := os.Stat(procPath); os.IsNotExist(err) {
+			// PID doesn't exist - container is stale, treat as not running
+			return ContainerState{Exists: true, Running: false}, nil
+		}
+	}
+
+	return ContainerState{Exists: true, Running: running}, nil
 }
 
 // InspectPublishedPorts returns a map of guest_port -> host_port for a container.

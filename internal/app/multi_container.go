@@ -65,10 +65,9 @@ func piccoloLabels(instanceID, serviceName, role string) map[string]string {
 }
 
 func appRestartPolicy(def *api.AppDefinition) string {
-	if def != nil && def.Type == "system" {
-		return "always"
-	}
-	return ""
+	// Always return "no" - piccolod is the sole lifecycle manager for all containers.
+	// We don't want Podman to auto-restart containers outside of piccolod's control.
+	return "no"
 }
 
 func appNetworkMode(def *api.AppDefinition) string {
