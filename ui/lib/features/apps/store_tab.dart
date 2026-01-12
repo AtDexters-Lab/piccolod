@@ -207,8 +207,8 @@ class _StoreTabState extends State<StoreTab> {
       builder: (context) => CreateWorkspaceWizard(
         appService: widget.appService,
         onSuccess: () {
-          Navigator.of(context).pop();
-          // Refresh library or show the new workspace
+          // Navigation is handled by CreateWorkspaceWizard itself.
+          // This callback is for any refresh/follow-up logic after successful install.
         },
       ),
     );

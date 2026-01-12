@@ -28,7 +28,8 @@ class CreateWorkspaceWizard extends StatefulWidget {
 }
 
 class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
-  int _currentStep = 0; // 0: Select Image, 1: Configure (custom only), 2: Installing
+  int _currentStep =
+      0; // 0: Select Image, 1: Configure (custom only), 2: Installing
 
   // Catalog workspaces (loaded from store)
   List<CatalogItem> _catalogWorkspaces = [];
@@ -43,7 +44,9 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
   String? _selectedImage;
   String? _selectedImageName;
   final TextEditingController _displayNameController = TextEditingController();
-  final TextEditingController _tagController = TextEditingController(text: 'latest');
+  final TextEditingController _tagController = TextEditingController(
+    text: 'latest',
+  );
 
   // Install state (for custom image flow)
   bool _isInstalling = false;
@@ -109,13 +112,16 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
   }
 
   void _installFromCatalog(CatalogItem item) async {
-    // Close this wizard and open DynamicInstallWizard for the catalog item
-    Navigator.of(context).pop();
+    // Capture references before any async operations or navigation changes
+    final appService = widget.appService;
+    final onSuccess = widget.onSuccess;
+    final navigator = Navigator.of(context);
 
+    // Fetch template and schema before closing this wizard
     String? yaml = item.template;
     if (yaml == null || yaml.isEmpty) {
       try {
-        yaml = await widget.appService.getCatalogTemplate(item.name);
+        yaml = await appService.getCatalogTemplate(item.name);
       } catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -131,27 +137,31 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
     // Fetch configuration schema
     Map<String, dynamic> schema = {};
     try {
-      schema = await widget.appService.getCatalogConfigure(item.name);
+      schema = await appService.getCatalogConfigure(item.name);
     } catch (e) {
       debugPrint("Failed to load config schema: $e");
     }
 
     if (!mounted) return;
-
-    showDialog(
+    // Show DynamicInstallWizard first (while context is still valid), then pop this wizard.
+    showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (context) => DynamicInstallWizard(
-        appService: widget.appService,
+      builder: (dialogContext) => DynamicInstallWizard(
+        appService: appService,
         appName: item.name,
         yamlContent: yaml!,
         schema: schema,
         onSuccess: (appName) {
-          Navigator.of(context).pop();
-          widget.onSuccess?.call();
+          Navigator.of(dialogContext).pop(true);
+          onSuccess?.call();
         },
       ),
-    );
+    ).then((done) {
+      if ((done ?? false) && mounted) {
+        navigator.pop();
+      }
+    });
   }
 
   void _selectCustomImage(String image, String displayName) {
@@ -197,7 +207,9 @@ x-piccolo:
     if (_selectedImage == null) return;
 
     final taskId = generateTaskId();
-    final tag = _tagController.text.trim().isNotEmpty ? _tagController.text.trim() : 'latest';
+    final tag = _tagController.text.trim().isNotEmpty
+        ? _tagController.text.trim()
+        : 'latest';
     final image = '$_selectedImage:$tag';
 
     setState(() {
@@ -253,7 +265,11 @@ x-piccolo:
   }
 
   Widget _buildHeader() {
-    final titles = ['Select Base Image', 'Configure Workspace', 'Creating Workspace'];
+    final titles = [
+      'Select Base Image',
+      'Configure Workspace',
+      'Creating Workspace',
+    ];
 
     return Container(
       padding: const EdgeInsets.all(24),
@@ -270,11 +286,15 @@ x-piccolo:
               children: [
                 Text(
                   'Create Workspace',
-                  style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold),
+                  style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
                 Text(
                   titles[_currentStep],
-                  style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
+                  style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
+                    color: PiccoloTheme.inkMuted,
+                  ),
                 ),
               ],
             ),
@@ -310,7 +330,12 @@ x-piccolo:
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // Catalog workspaces section
-          Text('Featured Workspaces', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600)),
+          Text(
+            'Featured Workspaces',
+            style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           const SizedBox(height: 16),
           if (_isLoadingCatalog)
             const Center(child: CircularProgressIndicator())
@@ -321,23 +346,34 @@ x-piccolo:
                 color: PiccoloTheme.mist,
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: const Text('No workspace templates available. Use Docker Hub search below.'),
+              child: const Text(
+                'No workspace templates available. Use Docker Hub search below.',
+              ),
             )
           else
             Wrap(
               spacing: 12,
               runSpacing: 12,
-              children: _catalogWorkspaces.map((item) => _buildCatalogCard(item)).toList(),
+              children: _catalogWorkspaces
+                  .map((item) => _buildCatalogCard(item))
+                  .toList(),
             ),
 
           const SizedBox(height: 32),
 
           // Custom image section
-          Text('Custom Image (Docker Hub)', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600)),
+          Text(
+            'Custom Image (Docker Hub)',
+            style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           const SizedBox(height: 8),
           Text(
             'Search Docker Hub for any container image to use as a workspace base.',
-            style: PiccoloTheme.textTheme.bodySmall?.copyWith(color: PiccoloTheme.inkMuted),
+            style: PiccoloTheme.textTheme.bodySmall?.copyWith(
+              color: PiccoloTheme.inkMuted,
+            ),
           ),
           const SizedBox(height: 16),
           Row(
@@ -350,7 +386,10 @@ x-piccolo:
                     border: OutlineInputBorder(),
                     filled: true,
                     fillColor: Colors.white,
-                    contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
+                    ),
                   ),
                   onSubmitted: (_) => _searchImages(),
                 ),
@@ -359,7 +398,14 @@ x-piccolo:
               FilledButton(
                 onPressed: _isSearching ? null : _searchImages,
                 child: _isSearching
-                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
                     : const Text('Search'),
               ),
             ],
@@ -380,7 +426,12 @@ x-piccolo:
                 children: [
                   const Icon(Icons.error_outline, color: PiccoloTheme.critical),
                   const SizedBox(width: 12),
-                  Expanded(child: Text(_error!, style: const TextStyle(color: PiccoloTheme.critical))),
+                  Expanded(
+                    child: Text(
+                      _error!,
+                      style: const TextStyle(color: PiccoloTheme.critical),
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -431,11 +482,19 @@ x-piccolo:
                   width: 32,
                   height: 32,
                   fit: BoxFit.contain,
-                  errorBuilder: (context, error, stackTrace) => const Icon(Icons.terminal, size: 32, color: PiccoloTheme.cobalt600),
+                  errorBuilder: (context, error, stackTrace) => const Icon(
+                    Icons.terminal,
+                    size: 32,
+                    color: PiccoloTheme.cobalt600,
+                  ),
                 ),
               )
             else
-              const Icon(Icons.terminal, size: 32, color: PiccoloTheme.cobalt600),
+              const Icon(
+                Icons.terminal,
+                size: 32,
+                color: PiccoloTheme.cobalt600,
+              ),
             const SizedBox(height: 8),
             Text(
               item.name.replaceFirst('workspace-', '').toUpperCase(),
@@ -495,14 +554,27 @@ x-piccolo:
             ),
             child: Row(
               children: [
-                const Icon(Icons.memory, size: 32, color: PiccoloTheme.cobalt600),
+                const Icon(
+                  Icons.memory,
+                  size: 32,
+                  color: PiccoloTheme.cobalt600,
+                ),
                 const SizedBox(width: 16),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('Selected Image', style: TextStyle(color: PiccoloTheme.inkMuted, fontSize: 12)),
-                      Text(_selectedImageName ?? _selectedImage ?? '', style: const TextStyle(fontWeight: FontWeight.bold)),
+                      Text(
+                        'Selected Image',
+                        style: TextStyle(
+                          color: PiccoloTheme.inkMuted,
+                          fontSize: 12,
+                        ),
+                      ),
+                      Text(
+                        _selectedImageName ?? _selectedImage ?? '',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
                     ],
                   ),
                 ),
@@ -516,7 +588,12 @@ x-piccolo:
           const SizedBox(height: 24),
 
           // Tag input
-          Text('Image Tag', style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+          Text(
+            'Image Tag',
+            style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           const SizedBox(height: 8),
           TextField(
             controller: _tagController,
@@ -525,13 +602,21 @@ x-piccolo:
               border: OutlineInputBorder(),
               filled: true,
               fillColor: Colors.white,
-              contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              contentPadding: EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 12,
+              ),
             ),
           ),
           const SizedBox(height: 24),
 
           // Display name
-          Text('Display Name (optional)', style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600)),
+          Text(
+            'Display Name (optional)',
+            style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           const SizedBox(height: 8),
           TextField(
             controller: _displayNameController,
@@ -540,7 +625,10 @@ x-piccolo:
               border: OutlineInputBorder(),
               filled: true,
               fillColor: Colors.white,
-              contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              contentPadding: EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 12,
+              ),
             ),
           ),
           const SizedBox(height: 16),
@@ -578,7 +666,12 @@ x-piccolo:
                 children: [
                   const Icon(Icons.error_outline, color: PiccoloTheme.critical),
                   const SizedBox(width: 12),
-                  Expanded(child: Text(_error!, style: const TextStyle(color: PiccoloTheme.critical))),
+                  Expanded(
+                    child: Text(
+                      _error!,
+                      style: const TextStyle(color: PiccoloTheme.critical),
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -604,13 +697,22 @@ x-piccolo:
           const SizedBox(width: 16),
           if (_currentStep < 2)
             FilledButton(
-              onPressed: _currentStep == 0 ? null : (_isInstalling ? null : _createCustomWorkspace),
+              onPressed: _currentStep == 0
+                  ? null
+                  : (_isInstalling ? null : _createCustomWorkspace),
               style: FilledButton.styleFrom(
                 backgroundColor: PiccoloTheme.success,
                 foregroundColor: Colors.white,
               ),
               child: _isInstalling
-                  ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
                   : const Text('Create Workspace'),
             ),
           if (_currentStep == 2)
