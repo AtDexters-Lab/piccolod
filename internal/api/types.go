@@ -249,6 +249,19 @@ type AppListener struct {
 	Protocol    ListenerProtocol        `yaml:"protocol,omitempty" json:"protocol,omitempty"`
 	Middleware  []AppProtocolMiddleware `yaml:"protocol_middleware,omitempty" json:"protocol_middleware,omitempty"`
 	RemotePorts []int                   `yaml:"remote_ports,omitempty" json:"remote_ports,omitempty"`
+	Auth        *ListenerAuth           `yaml:"auth,omitempty" json:"auth,omitempty"`
+}
+
+// ListenerAuth configures path-based auth strategies for an HTTP-visible listener.
+type ListenerAuth struct {
+	Rules []ListenerAuthRule `yaml:"rules,omitempty" json:"rules,omitempty"`
+}
+
+// ListenerAuthRule matches a request path and selects an auth strategy.
+type ListenerAuthRule struct {
+	Path     string `yaml:"path" json:"path"`
+	Type     string `yaml:"type" json:"type"`         // exact | prefix | pattern
+	Strategy string `yaml:"strategy" json:"strategy"` // oidc_passthrough | headers | protected | public
 }
 
 // AppProtocolMiddleware defines protocol-specific middleware entry
@@ -257,14 +270,22 @@ type AppProtocolMiddleware struct {
 	Params map[string]interface{} `yaml:"params,omitempty" json:"params,omitempty"`
 }
 
+// ServiceOIDCClient configures OIDC credential injection scoped to a single service.
+type ServiceOIDCClient struct {
+	RedirectURIs []string          `yaml:"redirect_uris,omitempty" json:"redirect_uris,omitempty"`
+	CAMountPath  string            `yaml:"ca_mount_path" json:"ca_mount_path"`
+	Env          map[string]string `yaml:"env" json:"env"`
+}
+
 // AppService defines a single container within a compose-style app (service mode).
 type AppService struct {
-	Image       string            `yaml:"image" json:"image"`
-	After       []string          `yaml:"after,omitempty" json:"after,omitempty"`
-	BindPorts   []int             `yaml:"bind_ports" json:"bind_ports"`
-	Environment map[string]string `yaml:"environment,omitempty" json:"environment,omitempty"`
-	Storage     *AppStorage       `yaml:"storage,omitempty" json:"storage,omitempty"`
-	Resources   *AppResources     `yaml:"resources,omitempty" json:"resources,omitempty"`
+	Image       string             `yaml:"image" json:"image"`
+	After       []string           `yaml:"after,omitempty" json:"after,omitempty"`
+	BindPorts   []int              `yaml:"bind_ports" json:"bind_ports"`
+	Environment map[string]string  `yaml:"environment,omitempty" json:"environment,omitempty"`
+	Storage     *AppStorage        `yaml:"storage,omitempty" json:"storage,omitempty"`
+	Resources   *AppResources      `yaml:"resources,omitempty" json:"resources,omitempty"`
+	OIDCClient  *ServiceOIDCClient `yaml:"oidc_client,omitempty" json:"oidc_client,omitempty"`
 }
 
 // AppStorage defines storage configuration

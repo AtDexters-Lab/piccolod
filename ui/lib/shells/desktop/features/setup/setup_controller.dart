@@ -34,10 +34,14 @@ class SetupController extends ChangeNotifier {
   String? _authRequestId;
   String? get authRequestId => _authRequestId;
 
+  // Redirect target after login (for proxy-driven login flow)
+  String? _nextUrl;
+
   final ApiClient _api = ApiClient();
 
   SetupController() {
     _parseAuthRequestFromUrl();
+    _parseNextFromUrl();
     _checkStatus();
   }
 
@@ -53,6 +57,41 @@ class SetupController extends ChangeNotifier {
     } catch (e) {
       debugPrint('Failed to parse URL: $e');
     }
+  }
+
+  void _parseNextFromUrl() {
+    try {
+      final uri = Uri.base;
+      _nextUrl = uri.queryParameters['next'];
+      if (_nextUrl != null && _nextUrl!.isNotEmpty) {
+        debugPrint('Login redirect target detected: $_nextUrl');
+      }
+    } catch (e) {
+      debugPrint('Failed to parse next URL: $e');
+    }
+  }
+
+  Future<bool> _redirectToNextIfValid() async {
+    if (_nextUrl == null || _nextUrl!.isEmpty) return false;
+
+    try {
+      final response = await _api.get(
+        '/api/v1/auth/validate-next',
+        queryParameters: {'next': _nextUrl},
+      );
+      if (response is Map && response['valid'] == true) {
+        final redirectUrl = response['redirect_url'] as String?;
+        if (redirectUrl != null && redirectUrl.isNotEmpty) {
+          debugPrint('Redirecting to validated next URL: $redirectUrl');
+          web.window.location.href = redirectUrl;
+          return true;
+        }
+      }
+    } catch (e) {
+      debugPrint('Next URL validation failed: $e');
+    }
+
+    return false;
   }
 
   Future<void> _checkStatus() async {
@@ -79,6 +118,13 @@ class SetupController extends ChangeNotifier {
             if (_authRequestId != null) {
               await _completeOidcAuthRequest();
               return; // Don't update state - we're redirecting
+            }
+
+            // Proxy-driven login flow: redirect back to the original target
+            if (_nextUrl != null && _nextUrl!.isNotEmpty) {
+              if (await _redirectToNextIfValid()) {
+                return;
+              }
             }
 
             _state = SetupState.complete;
@@ -168,6 +214,12 @@ class SetupController extends ChangeNotifier {
           return true; // Don't set complete state - we're redirecting
         }
 
+        if (_nextUrl != null && _nextUrl!.isNotEmpty) {
+          if (await _redirectToNextIfValid()) {
+            return true;
+          }
+        }
+
         _state = SetupState.complete;
       } else {
         // Unlocked but no session (weird but possible) -> Login
@@ -186,9 +238,9 @@ class SetupController extends ChangeNotifier {
   Future<bool> login(String username, String password) async {
     try {
       debugPrint('Login attempt for user: $username');
-      await _api.post(
+      final resp = await _api.post(
         '/api/v1/auth/login',
-        body: {'username': username, 'password': password},
+        body: {'username': username, 'password': password, 'next': _nextUrl},
       );
       await _api.fetchCsrfToken();
       debugPrint('Login successful, authRequestId: $_authRequestId');
@@ -198,6 +250,15 @@ class SetupController extends ChangeNotifier {
         debugPrint('OIDC flow detected, completing auth request...');
         await _completeOidcAuthRequest();
         return true; // Don't set complete state - we're redirecting
+      }
+
+      if (resp is Map && resp['redirect_url'] is String) {
+        final redirectUrl = resp['redirect_url'] as String;
+        if (redirectUrl.isNotEmpty) {
+          debugPrint('Redirecting to login next URL: $redirectUrl');
+          web.window.location.href = redirectUrl;
+          return true;
+        }
       }
 
       _state = SetupState.complete;

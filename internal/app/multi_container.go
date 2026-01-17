@@ -179,7 +179,7 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 	if err := m.applyServiceStorageAndTmpfs(&spec, svc.Storage, opts.layout, opts.appDef.Extensions); err != nil {
 		return container.ContainerCreateSpec{}, err
 	}
-	m.applyAuthInjection(&spec, opts.appDef)
+	m.applyOIDCClientInjection(&spec, svc.OIDCClient)
 	if err := container.ValidateContainerSpec(spec); err != nil {
 		return container.ContainerCreateSpec{}, fmt.Errorf("invalid service container spec for '%s': %w", opts.svcName, err)
 	}

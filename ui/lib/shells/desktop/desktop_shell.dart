@@ -5,6 +5,7 @@ import 'widgets/top_bar.dart';
 import 'widgets/dock.dart';
 import 'widgets/window_frame.dart';
 import 'features/setup/setup_wizard.dart';
+import 'features/access_denied/access_denied_view.dart';
 
 class DesktopShell extends StatefulWidget {
   const DesktopShell({super.key});
@@ -26,6 +27,9 @@ class _DesktopShellState extends State<DesktopShell> {
   @override
   Widget build(BuildContext context) {
     final screenSize = MediaQuery.of(context).size;
+    final uri = Uri.base;
+    final isAccessDeniedRoute = uri.path == '/access-denied';
+    final next = uri.queryParameters['next'];
 
     // ListenableBuilder listens to the controller and rebuilds only this widget when it changes.
     return ListenableBuilder(
@@ -54,6 +58,10 @@ class _DesktopShellState extends State<DesktopShell> {
               else if (_controller.needsSetup)
                 Positioned.fill(
                   child: SetupWizard(onComplete: _controller.completeSetup),
+                )
+              else if (isAccessDeniedRoute)
+                Positioned.fill(
+                  child: AccessDeniedView(next: next),
                 )
               else ...[
                 // Layer D: Windows

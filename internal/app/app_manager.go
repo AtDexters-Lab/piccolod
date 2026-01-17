@@ -109,15 +109,6 @@ func mergeEnvMaps(base, override map[string]string) map[string]string {
 	return result
 }
 
-// getAuthStrategy extracts the auth strategy from an app definition.
-// Returns empty string if no auth config is present.
-func getAuthStrategy(def *api.AppDefinition) string {
-	if def == nil || def.Auth == nil {
-		return ""
-	}
-	return string(def.Auth.Strategy)
-}
-
 // workspaceRuntimeResolver implements workspacedisk.RuntimeResolver
 // by looking up podman runtime configuration for app instances.
 type workspaceRuntimeResolver struct {
@@ -801,7 +792,7 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 	}
 
 	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
-		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners, getAuthStrategy(def))
+		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners)
 		if err != nil {
 			return fmt.Errorf("allocate service ports: %w", err)
 		}
@@ -888,7 +879,7 @@ func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.A
 			return nil
 		}
 		// No published ports observed; allocate fresh endpoints. Publish reconciliation happens separately.
-		if _, err := m.serviceManager.AllocateForApp(instanceID, def.Listeners, getAuthStrategy(def)); err != nil {
+		if _, err := m.serviceManager.AllocateForApp(instanceID, def.Listeners); err != nil {
 			return err
 		}
 		m.serviceManager.SetAppContainerID(instanceID, containerID)
@@ -1017,7 +1008,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	}
 
 	// Allocate services and convert to container spec using instanceID
-	endpoints, err := m.serviceManager.AllocateForApp(instanceID, appDef.Listeners, getAuthStrategy(appDef))
+	endpoints, err := m.serviceManager.AllocateForApp(instanceID, appDef.Listeners)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate service ports: %w", err)
 	}
@@ -2034,6 +2025,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 		return container.ContainerCreateSpec{}, fmt.Errorf("app definition required")
 	}
 	def := appDef
+	var oidcClient *api.ServiceOIDCClient
 	if piccoloModeFromExtensions(appDef.Extensions) == ModeWorkspace && appDef.Services != nil {
 		primary := primaryServiceFor(appDef, nil)
 		if primary == "" {
@@ -2043,6 +2035,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 		if !ok {
 			return container.ContainerCreateSpec{}, fmt.Errorf("primary service '%s' not found", primary)
 		}
+		oidcClient = svc.OIDCClient
 		derived := *appDef
 		derived.Image = svc.Image
 		derived.Environment = svc.Environment
@@ -2095,7 +2088,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 		return spec, err
 	}
 
-	m.applyAuthInjection(&spec, def)
+	m.applyOIDCClientInjection(&spec, oidcClient)
 
 	// Workspace mode: enable init and mount boot.sh wrapper
 	mode := piccoloModeFromExtensions(appDef.Extensions)
@@ -2144,39 +2137,46 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	return spec, nil
 }
 
-func (m *AppManager) applyAuthInjection(spec *container.ContainerCreateSpec, appDef *api.AppDefinition) {
-	if spec == nil || appDef == nil {
+func (m *AppManager) applyOIDCClientInjection(spec *container.ContainerCreateSpec, oidcClient *api.ServiceOIDCClient) {
+	if spec == nil || oidcClient == nil {
 		return
 	}
 
-	// Inject auth environment variables if configured
-	if appDef.Auth != nil && appDef.Auth.Injection != nil && len(appDef.Auth.Injection.Env) > 0 {
+	// Inject auth environment variables (service-scoped).
+	if len(oidcClient.Env) > 0 {
 		if spec.Environment == nil {
 			spec.Environment = make(map[string]string)
 		}
-		for k, v := range appDef.Auth.Injection.Env {
+		for k, v := range oidcClient.Env {
 			spec.Environment[k] = v
 		}
 	}
 
-	// Inject Piccolo Internal CA and host gateway for OIDC/internal communication
+	// Mount Piccolo Internal CA for OIDC back-channel trust.
 	m.stateMu.RLock()
-	caPath := m.internalCAPath
+	caHostPath := m.internalCAPath
 	m.stateMu.RUnlock()
-
-	if caPath == "" {
+	if caHostPath == "" {
 		return
 	}
 
-	containerPath := "/var/lib/piccolo/certs/internal-ca.crt"
-	if appDef.Auth != nil && appDef.Auth.Injection != nil && appDef.Auth.Injection.CAMountPath != "" {
-		containerPath = appDef.Auth.Injection.CAMountPath
+	containerPath := strings.TrimSpace(oidcClient.CAMountPath)
+	if containerPath != "" {
+		spec.CAMounts = append(spec.CAMounts, container.CAMount{
+			HostPath:      caHostPath,
+			ContainerPath: containerPath,
+		})
 	}
 
-	spec.CAMounts = append(spec.CAMounts, container.CAMount{
-		HostPath:      caPath,
-		ContainerPath: containerPath,
-	})
+	// Also mount at the canonical path used by templates to avoid coupling template values to
+	// service-specific mount locations.
+	const canonicalCAPath = "/var/lib/piccolo/certs/internal-ca.crt"
+	if containerPath != "" && containerPath != canonicalCAPath {
+		spec.CAMounts = append(spec.CAMounts, container.CAMount{
+			HostPath:      caHostPath,
+			ContainerPath: canonicalCAPath,
+		})
+	}
 
 	// Only add extra hosts if the container owns its network namespace.
 	// Containers using NetworkMode "container:<id>" share the network namespace

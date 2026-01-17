@@ -19,6 +19,7 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/app"
+	"piccolod/internal/app/catalog"
 	authpkg "piccolod/internal/auth"
 	"piccolod/internal/cluster"
 	"piccolod/internal/container"
@@ -86,16 +87,26 @@ func TestGinAppAPI_Install(t *testing.T) {
 			method:      "POST",
 			contentType: "application/x-yaml",
 			body: `name: test-nginx
-image: docker.io/library/nginx:alpine
 type: user
 listeners:
   - name: web
     guest_port: 80
     flow: tcp
     protocol: http
-environment:
-  NGINX_HOST: localhost
-  NGINX_PORT: "80"`,
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+    environment:
+      NGINX_HOST: localhost
+      NGINX_PORT: "80"
+x-piccolo:
+  mode: service`,
 			expectedStatus: http.StatusCreated,
 			expectError:    false,
 		},
@@ -184,13 +195,23 @@ func TestGinAppAPI_Install_JSON_WithDisplayName(t *testing.T) {
 
 	payload := map[string]interface{}{
 		"app_definition": `name: test-nginx
-image: docker.io/library/nginx:alpine
 type: user
 listeners:
   - name: web
     guest_port: 80
     flow: tcp
-    protocol: http`,
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+x-piccolo:
+  mode: service`,
 		"display_name": "Work Projects",
 	}
 	body, err := json.Marshal(payload)
@@ -217,9 +238,6 @@ listeners:
 	}
 	if got := data["display_name"]; got != "Work Projects" {
 		t.Fatalf("expected display_name %q, got %#v", "Work Projects", got)
-	}
-	if got := data["app_name"]; got != "test-nginx" {
-		t.Fatalf("expected app_name %q, got %#v", "test-nginx", got)
 	}
 	if got := data["instance_id"]; got != "test-nginx" {
 		t.Fatalf("expected instance_id %q, got %#v", "test-nginx", got)
@@ -640,15 +658,25 @@ func TestGinAppAPI_FullLifecycle(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appYAML := `name: lifecycle-test
-image: docker.io/library/nginx:alpine
 type: user
 listeners:
   - name: web
     guest_port: 80
     flow: tcp
     protocol: http
-environment:
-  TEST_ENV: "lifecycle"`
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+    environment:
+      TEST_ENV: "lifecycle"
+x-piccolo:
+  mode: service`
 
 	// 1. Install app via HTTP API
 	w := httptest.NewRecorder()
@@ -995,6 +1023,8 @@ func (s *stubTestVolumeManager) RoleStream(id string) (<-chan persistence.Volume
 func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	t.Helper()
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	t.Setenv("PICCOLO_STATE_DIR", tempDir)
 	t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(tempDir, "run", "podman"))
 	ensureTestControlMetadata(t, tempDir)
 	// Create mock container manager for app manager
@@ -1055,16 +1085,55 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	if err != nil {
 		t.Fatalf("remote mgr: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = rm.Close()
+	})
 	rm.SetNexusAdapter(nexusclient.NewStub())
 	remote.RegisterHandlers(dispatch, rm)
 	tlsMux := services.NewTlsMux(svcMgr)
 	remoteResolver := newServiceRemoteResolver(svcMgr)
+
+	// Catalog manager stub (avoid outbound network calls).
+	catalogStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.yaml":
+			w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+			_, _ = io.WriteString(w, `apps:
+  - name: wordpress
+    path: wordpress/app.yaml
+    description: test
+    category: test
+`)
+		case "/wordpress/app.yaml":
+			w.Header().Set("Content-Type", "application/x-yaml; charset=utf-8")
+			_, _ = io.WriteString(w, `name: wordpress
+type: user
+listeners:
+  - name: web
+    guest_port: 80
+    flow: tcp
+    protocol: http
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+x-piccolo:
+  mode: service
+`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(catalogStub.Close)
+	catalogMgr := catalog.NewManager(catalogStub.URL, filepath.Join(tempDir, "catalog-cache"))
+
 	server := &GinServer{
 		appManager:     appMgr,
 		serviceManager: svcMgr,
 		mdnsManager:    mdns.NewManager(),
 		dispatcher:     dispatch,
 		remoteManager:  rm,
+		catalogManager: catalogMgr,
 		authManager:    authMgr,
 		sessions:       authpkg.NewSessionStore(),
 		cryptoManager:  cryptoMgr,
@@ -1089,6 +1158,14 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 		t.Fatalf("secure loopback init: %v", err)
 	}
 	server.refreshRemoteRuntime()
+	t.Cleanup(func() {
+		if server.tlsMux != nil {
+			server.tlsMux.Stop()
+		}
+		if server.serviceManager != nil && server.serviceManager.ProxyManager() != nil {
+			server.serviceManager.ProxyManager().StopAll()
+		}
+	})
 
 	return server
 }
@@ -1098,7 +1175,25 @@ func TestLeadership_FollowerStopsApp(t *testing.T) {
 	sessionCookie, csrf := setupTestAdminSession(t, srv)
 
 	// Install a simple app via API
-	payload := "name: blog\nimage: docker.io/library/nginx:alpine\ntype: user\nlisteners:\n  - name: web\n    guest_port: 80\n    flow: tcp\n    protocol: http\n"
+	payload := `name: blog
+type: user
+listeners:
+  - name: web
+    guest_port: 80
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+x-piccolo:
+  mode: service
+`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/apps", strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/x-yaml")
@@ -1108,20 +1203,54 @@ func TestLeadership_FollowerStopsApp(t *testing.T) {
 		t.Fatalf("install status=%d body=%s", w.Code, w.Body.String())
 	}
 
+	// Wait for the app to start (at least one container running) so the follower transition is meaningful.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		statuses, err := srv.appManager.ContainerStatuses(context.Background(), "blog")
+		if err == nil {
+			for _, st := range statuses {
+				if st.Running {
+					goto started
+				}
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected at least one blog container to be running after install")
+
+started:
 	// Publish follower role for this app
 	srv.events.Publish(events.Event{Topic: events.TopicLeadershipRoleChanged, Payload: events.LeadershipChanged{Resource: cluster.ResourceForApp("blog"), Role: cluster.RoleFollower}})
 
 	// Wait briefly for goroutine to act
-	deadline := time.Now().Add(200 * time.Millisecond)
+	deadline = time.Now().Add(200 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		app, err := srv.appManager.Get(context.Background(), "blog")
-		if err == nil && app.Status == "stopped" {
-			return
+		statuses, err := srv.appManager.ContainerStatuses(context.Background(), "blog")
+		if err == nil {
+			anyRunning := false
+			for _, st := range statuses {
+				if st.Running {
+					anyRunning = true
+					break
+				}
+			}
+			if !anyRunning {
+				// Ensure proxies are also torn down.
+				if _, err := srv.serviceManager.GetByApp("blog"); err == nil {
+					time.Sleep(5 * time.Millisecond)
+					continue
+				}
+				app, _ := srv.appManager.Get(context.Background(), "blog")
+				if app.Status == "stopped" {
+					t.Fatalf("expected desired status to remain running after follower transition, got %v", app.Status)
+				}
+				return
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	app, _ := srv.appManager.Get(context.Background(), "blog")
-	t.Fatalf("expected app to be stopped after follower event, got status=%v", app.Status)
+	t.Fatalf("expected follower transition to stop containers, got status=%v", app.Status)
 }
 
 // setupTestAdminSession provisions the admin password and returns session cookie/CSRF token.

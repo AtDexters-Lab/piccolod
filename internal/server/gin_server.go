@@ -115,10 +115,10 @@ type GinServer struct {
 	oidcProviderMu sync.Mutex
 
 	// Internal CA for OIDC Back-Channel
-	internalCA    *pki.InternalCA
-	internalCAMu  sync.Mutex
-	internalSrv   *http.Server
-	bootstrapDir  string // stored for deferred CA initialization
+	internalCA   *pki.InternalCA
+	internalCAMu sync.Mutex
+	internalSrv  *http.Server
+	bootstrapDir string // stored for deferred CA initialization
 
 	reloadersMu     sync.RWMutex
 	unlockReloaders []unlockReloader
@@ -450,6 +450,46 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.authRepo = authRepo
 	s.userManager = authpkg.NewUserManager(persist.Control().Users())
 
+	// Wire proxy auth dependencies (listener auth rules enforcement happens in services.ProxyManager).
+	if svcMgr != nil {
+		svcMgr.ProxyManager().SetAuthConfig(s.userManager, func(r *http.Request) (*authpkg.Session, bool) {
+			if r == nil {
+				return nil, false
+			}
+			c, err := r.Cookie("piccolo_session")
+			if err != nil || strings.TrimSpace(c.Value) == "" {
+				return nil, false
+			}
+			return s.sessions.Get(c.Value)
+		})
+
+		svcMgr.ProxyManager().SetPortalOriginResolver(s.portalOriginForRequest)
+
+		// RFC 20260112: alias-domain warnings for protected/headers strategies.
+		svcMgr.ProxyManager().SetAliasChecker(func(host, listener string) bool {
+			if s == nil || s.remoteManager == nil {
+				return false
+			}
+			h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+			if h == "" || listener == "" {
+				return false
+			}
+			for _, a := range s.remoteManager.ListAliases() {
+				if strings.TrimSpace(a.Hostname) == "" {
+					continue
+				}
+				if a.Listener != listener {
+					continue
+				}
+				aliasHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(a.Hostname)), ".")
+				if aliasHost != "" && strings.EqualFold(h, aliasHost) {
+					return true
+				}
+			}
+			return false
+		})
+	}
+
 	// Remote manager
 	bootstrapDir := persist.BootstrapVolume().MountDir
 	if strings.TrimSpace(bootstrapDir) == "" {
@@ -602,9 +642,75 @@ func (s *GinServer) Stop() error {
 	return nil
 }
 
+func (s *GinServer) portalOriginForRequest(r *http.Request) string {
+	if s == nil || r == nil {
+		return ""
+	}
+
+	// WAN via Nexus proxy: RemoteAddr is loopback.
+	remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip := net.ParseIP(remoteHost); ip != nil && ip.IsLoopback() {
+		if s.remoteManager != nil {
+			st := s.remoteManager.Status()
+			if st.Enabled && strings.TrimSpace(st.PortalHostname) != "" {
+				return "https://" + strings.TrimSuffix(strings.TrimSpace(st.PortalHostname), ".")
+			}
+		}
+	}
+
+	scheme := "http"
+	if s.isSecureRequest(r) {
+		scheme = "https"
+	}
+	defaultPort := 80
+	if scheme == "https" {
+		defaultPort = 443
+	}
+
+	// Use piccolod's portal port (PORT), not the app listener port from r.Host.
+	envPort := 80
+	if p := os.Getenv("PORT"); p != "" {
+		if v, err := strconv.Atoi(p); err == nil && v > 0 {
+			envPort = v
+		}
+	}
+	portalPort := 0
+	switch scheme {
+	case "http":
+		portalPort = envPort
+	case "https":
+		// In a common "https reverse proxy → piccolod:80" setup, X-Forwarded-Proto indicates https
+		// while piccolod listens on 80; do not append :80 to the external origin.
+		if envPort != 80 {
+			portalPort = envPort
+		}
+	}
+
+	host := ""
+	if s.mdnsManager != nil {
+		host = strings.TrimSpace(s.mdnsManager.Hostname())
+	}
+	if host == "" {
+		host = canonicalHost(r.Host)
+	}
+	if host == "" {
+		host = getPreferredOutboundIP()
+	}
+	if host == "" {
+		return ""
+	}
+	if portalPort != 0 && portalPort != defaultPort {
+		host = net.JoinHostPort(host, strconv.Itoa(portalPort))
+	}
+	return scheme + "://" + host
+}
+
 // setupGinRoutes defines all API endpoints using Gin router.
 func (s *GinServer) setupGinRoutes() {
 	r := gin.New()
+	// For API routes, prefer deterministic 404s over implicit redirects.
+	r.RedirectTrailingSlash = false
+	r.RedirectFixedPath = false
 
 	// Add basic middleware
 	r.Use(gin.Logger())
@@ -674,6 +780,7 @@ func (s *GinServer) setupGinRoutes() {
 		// Auth & sessions (selected public endpoints)
 		v1.GET("/auth/session", s.handleAuthSession)
 		v1.GET("/auth/initialized", s.handleAuthInitialized)
+		v1.GET("/auth/validate-next", s.handleAuthValidateNext)
 		v1.POST("/auth/login", s.handleAuthLogin)
 
 		// Selected read-only status endpoints remain public
@@ -730,7 +837,7 @@ func (s *GinServer) setupGinRoutes() {
 
 		// System logs (Admin only)
 		admin.GET("/system/logs/stream", s.handleGinSystemLogStream)
-		
+
 		// Task progress (Admin only?) - Maybe standard user needs to see progress of their own actions?
 		// But they can't trigger actions. So Admin only is safe.
 		// Actually, let's allow it for now as it's harmless read-only.
@@ -789,14 +896,14 @@ func (s *GinServer) setupGinRoutes() {
 		}
 
 		// Catalog (read-only) - Allow standard users to view catalog?
-		// RFC says "Restricted to allowed_apps". 
+		// RFC says "Restricted to allowed_apps".
 		// If they can't install, viewing catalog is useless or maybe confusing.
 		// Let's restrict to Admin for now to be safe.
 		admin.GET("/catalog", s.handleGinCatalog)
 		admin.GET("/catalog/categories", s.handleGinCatalogCategories)
 		admin.GET("/catalog/:name/template", s.handleGinCatalogTemplate)
 		admin.GET("/catalog/:name/configure", s.handleGinCatalogConfigure)
-		
+
 		// Services list (Needs filtering)
 		authed.GET("/services", s.handleGinServicesAll)
 	}
@@ -808,6 +915,10 @@ func (s *GinServer) setupGinRoutes() {
 	r.NoRoute(func(c *gin.Context) {
 		if c.Request.Method == http.MethodGet {
 			requestedPath := c.Request.URL.Path
+			if strings.HasPrefix(requestedPath, "/api/") || strings.HasPrefix(requestedPath, "/oauth/") {
+				c.Status(http.StatusNotFound)
+				return
+			}
 			if strings.HasSuffix(requestedPath, "/") {
 				requestedPath += "entry.html"
 			}
@@ -1132,8 +1243,8 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 	}
 }
 
-// scheduleOIDCAppsRestart schedules a debounced restart of apps with auth.strategy: oidc.
-// This is called when remote state changes to ensure OIDC discovery endpoints update.
+// scheduleOIDCAppsRestart schedules a debounced restart of apps that declare oidc_client.
+// This is called when remote state changes to ensure apps refresh OIDC discovery behavior.
 func (s *GinServer) scheduleOIDCAppsRestart() {
 	if s == nil || s.appManager == nil {
 		return
@@ -1162,7 +1273,7 @@ func (s *GinServer) scheduleOIDCAppsRestart() {
 	log.Printf("INFO: scheduled OIDC apps restart in %dms due to remote state change", debounceMs)
 }
 
-// restartOIDCApps restarts all apps with auth.strategy: oidc to update OIDC discovery.
+// restartOIDCApps restarts all apps with oidc_client to update OIDC discovery behavior.
 func (s *GinServer) restartOIDCApps() {
 	if s == nil || s.appManager == nil {
 		return
@@ -1179,7 +1290,7 @@ func (s *GinServer) restartOIDCApps() {
 
 	var oidcApps []string
 	for _, a := range apps {
-		if a.Definition != nil && a.Definition.Auth != nil && a.Definition.Auth.Strategy == "oidc" {
+		if a.Definition != nil && appDeclaresOIDCClient(a.Definition) {
 			oidcApps = append(oidcApps, a.InstanceID)
 		}
 	}
@@ -1201,6 +1312,18 @@ func (s *GinServer) restartOIDCApps() {
 			log.Printf("WARN: failed to start OIDC app %s: %v", id, err)
 		}
 	}
+}
+
+func appDeclaresOIDCClient(def *api.AppDefinition) bool {
+	if def == nil {
+		return false
+	}
+	for _, svc := range def.Services {
+		if svc.OIDCClient != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *GinServer) observeLockState(bus *events.Bus) {

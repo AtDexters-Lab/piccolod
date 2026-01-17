@@ -3,7 +3,9 @@ package server
 import (
 	"errors"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -18,10 +20,66 @@ import (
 // cookie name as per OpenAPI cookieAuth
 const sessionCookieName = "piccolo_session"
 
+func (s *GinServer) sessionCookieDomain(r *http.Request) string {
+	if s == nil || r == nil {
+		return ""
+	}
+
+	reqHost := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(canonicalHost(r.Host)), "."))
+	if reqHost == "" || reqHost == "localhost" {
+		return ""
+	}
+	if ip := net.ParseIP(reqHost); ip != nil {
+		// Browsers may reject Domain on IP literals; rely on host-only cookies.
+		return ""
+	}
+
+	// RFC 20260112: session cookies are scoped per access context.
+	// - Remote (WAN): Domain=<remote-base> so portal + apps share SSO.
+	// - LAN (mDNS): Domain=<local-host> so portal + apps share SSO.
+	remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip := net.ParseIP(remoteHost); ip != nil && ip.IsLoopback() {
+		if s.remoteManager != nil {
+			st := s.remoteManager.Status()
+			if st.Enabled && strings.TrimSpace(st.TLD) != "" {
+				d := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(st.TLD), "."))
+				if d != "" {
+					// Only scope to remote base when the request host is within that base domain.
+					// This avoids setting invalid cookies when accessed via alias domains.
+					if reqHost == d || strings.HasSuffix(reqHost, "."+d) {
+						return d
+					}
+					return ""
+				}
+			}
+		}
+	}
+
+	// LAN host-based routing: scope to the mDNS base hostname so portal + app subdomains share SSO.
+	if s.mdnsManager != nil {
+		localHost := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s.mdnsManager.Hostname()), "."))
+		if localHost != "" && localHost != "localhost" && net.ParseIP(localHost) == nil {
+			if reqHost == localHost || strings.HasSuffix(reqHost, "."+localHost) {
+				if _, err := url.Parse("http://" + localHost); err == nil {
+					return localHost
+				}
+			}
+		}
+	}
+
+	// Ensure this is a valid cookie domain.
+	if _, err := url.Parse("http://" + reqHost); err != nil {
+		return ""
+	}
+	return reqHost
+}
+
 func (s *GinServer) setSessionCookie(c *gin.Context, id string, ttl time.Duration) {
 	secure := false
+	domain := ""
 	if s != nil {
 		secure = s.isSecureRequest(c.Request)
+		domain = s.sessionCookieDomain(c.Request)
 	}
 	// Prefer SameSite=Lax for session cookie
 	c.SetSameSite(http.SameSiteLaxMode)
@@ -29,6 +87,7 @@ func (s *GinServer) setSessionCookie(c *gin.Context, id string, ttl time.Duratio
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    id,
+		Domain:   domain,
 		Path:     "/",
 		MaxAge:   int(ttl.Seconds()),
 		HttpOnly: true,
@@ -38,11 +97,16 @@ func (s *GinServer) setSessionCookie(c *gin.Context, id string, ttl time.Duratio
 }
 
 func (s *GinServer) clearSessionCookie(c *gin.Context) {
+	domain := ""
+	if s != nil {
+		domain = s.sessionCookieDomain(c.Request)
+	}
 	// Clear with SameSite=Lax
 	c.SetSameSite(http.SameSiteLaxMode)
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
+		Domain:   domain,
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
@@ -119,7 +183,11 @@ func (s *GinServer) handleAuthSession(c *gin.Context) {
 
 // handleAuthLogin: POST /api/v1/auth/login
 func (s *GinServer) handleAuthLogin(c *gin.Context) {
-	var body struct{ Username, Password string }
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Next     string `json:"next,omitempty"`
+	}
 	if err := c.BindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
@@ -220,13 +288,20 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 	}
 
 	s.resetLoginFailures()
-	
+
 	// Create session with full user info
 	userID := userInfo.ID
 	userRole := string(userInfo.Role)
 	sess := s.sessions.CreateWithUserInfo(userID, userInfo.Username, userRole, 3600) // 1h default
 	s.setSessionCookie(c, sess.ID, time.Hour)
-	c.JSON(http.StatusOK, gin.H{"message": "ok"})
+
+	resp := gin.H{"message": "ok"}
+	if next := strings.TrimSpace(body.Next); next != "" {
+		if validated, ok := s.validateNextURL(next); ok {
+			resp["redirect_url"] = validated
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // handleAuthLogout: POST /api/v1/auth/logout

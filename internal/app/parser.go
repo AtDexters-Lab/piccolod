@@ -3,6 +3,9 @@ package app
 import (
 	"bytes"
 	"fmt"
+	"net"
+	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"text/template"
@@ -97,6 +100,7 @@ func validateRawServicesBlocks(root *yaml.Node) error {
 		"environment": {},
 		"storage":     {},
 		"resources":   {},
+		"oidc_client": {},
 	}
 
 	for i := 0; i+1 < len(services.Content); i += 2 {
@@ -250,6 +254,11 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 		return err
 	}
 
+	// RFC 20260112: App-level auth block is removed.
+	if app.Auth != nil {
+		return newValidationError("APP_AUTH_DEPRECATED", "app-level auth block is deprecated; use listeners[].auth and services[].oidc_client")
+	}
+
 	// Validate Piccolo-specific extensions (required mode + consistency checks).
 	// We validate this early because mode impacts several other validations.
 	if err := validatePiccoloExtensions(app); err != nil {
@@ -281,6 +290,11 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 	// Validate permissions
 	if err := validatePermissions(app.Permissions); err != nil {
 		return err
+	}
+
+	// RFC 20260112: oidc_passthrough requires at least one service to declare oidc_client.
+	if usesOIDCPassthrough(app.Listeners) && !hasOIDCClient(app.Services) {
+		return newValidationError("OIDC_CLIENT_REQUIRED", "oidc_passthrough strategy requires at least one service to declare oidc_client")
 	}
 
 	return nil
@@ -415,6 +429,8 @@ func validateServiceName(name string) error {
 }
 
 func validateServices(services map[string]api.AppService, primary string, listeners []api.AppListener) error {
+	oidcEnv := make(map[string]string)
+
 	// Validate service specs first (names, images, per-service storage/resources).
 	for name, svc := range services {
 		if err := validateServiceName(name); err != nil {
@@ -432,6 +448,26 @@ func validateServices(services map[string]api.AppService, primary string, listen
 		}
 		if err := validateStorage(svc.Storage); err != nil {
 			return fmt.Errorf("services.%s.storage invalid: %w", name, err)
+		}
+
+		if svc.OIDCClient != nil {
+			if len(svc.OIDCClient.Env) == 0 {
+				return newValidationError("OIDC_ENV_REQUIRED", "oidc_client.env must not be empty")
+			}
+			if strings.TrimSpace(svc.OIDCClient.CAMountPath) == "" {
+				return newValidationError("OIDC_CA_PATH_REQUIRED", "oidc_client.ca_mount_path is required")
+			}
+			for k, v := range svc.OIDCClient.Env {
+				if prior, ok := oidcEnv[k]; ok && prior != v {
+					return fmt.Errorf("oidc_client.env conflicts for key '%s' across services", k)
+				}
+				oidcEnv[k] = v
+			}
+			for _, redirectURI := range svc.OIDCClient.RedirectURIs {
+				if err := validateOIDCRedirectURI(redirectURI); err != nil {
+					return newValidationError("INVALID_REDIRECT_URI", fmt.Sprintf("redirect_uri \"%s\" must be localhost, loopback (127.0.0.1, ::1), or custom scheme", redirectURI))
+				}
+			}
 		}
 	}
 
@@ -601,8 +637,115 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 				return fmt.Errorf("listener '%s' middleware[%d] name is required", l.Name, j)
 			}
 		}
+
+		// RFC 20260112: Listener-level auth rules (path-based).
+		if l.Auth != nil {
+			if l.Flow != api.FlowTCP || (l.Protocol != api.ListenerProtocolHTTP && l.Protocol != api.ListenerProtocolWebsocket) {
+				if l.Flow == api.FlowTLS || l.Protocol == api.ListenerProtocolRaw {
+					return newValidationError("INVALID_AUTH_PROTOCOL", "auth block not supported on flow: tls or protocol: raw")
+				}
+				return newValidationError("INVALID_AUTH_FLOW", "auth block requires flow: tcp with protocol: http or websocket")
+			}
+
+			for _, rule := range l.Auth.Rules {
+				ruleType := strings.TrimSpace(rule.Type)
+				if ruleType == "" {
+					return newValidationError("INVALID_MATCH_TYPE", "auth.rules[].type is required and must be one of: exact, prefix, pattern")
+				}
+				switch ruleType {
+				case "exact", "prefix", "pattern":
+					// ok
+				default:
+					return newValidationError("INVALID_MATCH_TYPE", "auth.rules[].type is required and must be one of: exact, prefix, pattern")
+				}
+
+				strategy := strings.TrimSpace(rule.Strategy)
+				switch strategy {
+				case "oidc_passthrough", "headers", "protected", "public":
+					// ok
+				default:
+					return newValidationError("INVALID_STRATEGY", fmt.Sprintf("invalid strategy \"%s\", must be one of: oidc_passthrough, headers, protected, public", strategy))
+				}
+
+				rulePath := strings.TrimSpace(rule.Path)
+				if rulePath == "" {
+					return newValidationError("INVALID_PATH", fmt.Sprintf("invalid path \"%s\" for type \"%s\": path is required", rule.Path, rule.Type))
+				}
+				switch ruleType {
+				case "prefix":
+					if !strings.HasSuffix(rulePath, "/") {
+						return newValidationError("INVALID_PATH", fmt.Sprintf("invalid path \"%s\" for type \"%s\": prefix paths must end with '/'", rule.Path, rule.Type))
+					}
+				case "pattern":
+					if _, err := path.Match(rulePath, "/"); err != nil {
+						return newValidationError("INVALID_PATH", fmt.Sprintf("invalid path \"%s\" for type \"%s\": %s", rule.Path, rule.Type, err.Error()))
+					}
+				}
+			}
+		}
 	}
 	return nil
+}
+
+func usesOIDCPassthrough(listeners []api.AppListener) bool {
+	for _, l := range listeners {
+		if l.Auth == nil {
+			continue
+		}
+		for _, rule := range l.Auth.Rules {
+			if strings.TrimSpace(rule.Strategy) == "oidc_passthrough" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasOIDCClient(services map[string]api.AppService) bool {
+	for _, svc := range services {
+		if svc.OIDCClient != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func validateOIDCRedirectURI(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(u.Scheme) == "" {
+		return fmt.Errorf("scheme required")
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		host := strings.TrimSpace(u.Hostname())
+		if host == "" {
+			return fmt.Errorf("host required")
+		}
+
+		if strings.EqualFold(host, "localhost") {
+			return nil
+		}
+
+		if ip := net.ParseIP(host); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				if ip4[0] == 127 && ip4[1] == 0 && ip4[2] == 0 && ip4[3] == 1 {
+					return nil
+				}
+				return fmt.Errorf("host must be localhost or loopback")
+			}
+			if ip.Equal(net.IPv6loopback) {
+				return nil
+			}
+		}
+		return fmt.Errorf("host must be localhost or loopback")
+	default:
+		// Custom scheme redirect URIs are allowed.
+		return nil
+	}
 }
 
 // validateStorage validates storage configuration

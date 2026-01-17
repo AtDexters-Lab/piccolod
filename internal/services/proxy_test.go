@@ -121,6 +121,34 @@ func TestApplyForwardHeadersUsesTLSHint(t *testing.T) {
 	}
 }
 
+func TestApplyForwardHeaders_ForwardedHeaderQuotesIPv6For(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+	req.Host = "example.test"
+	req.RemoteAddr = "[2001:db8::1]:1234"
+	ep := ServiceEndpoint{Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}
+
+	applyForwardHeaders(req, ep)
+
+	fwd := req.Header.Get("Forwarded")
+	if !strings.Contains(fwd, `for="[2001:db8::1]"`) {
+		t.Fatalf("expected Forwarded to include quoted IPv6 for, got %q", fwd)
+	}
+}
+
+func TestApplyForwardHeaders_ForwardedHeaderQuotesHostWithPort(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:35000/", nil)
+	req.Host = "127.0.0.1:35000"
+	req.RemoteAddr = "192.0.2.1:1234"
+	ep := ServiceEndpoint{Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}
+
+	applyForwardHeaders(req, ep)
+
+	fwd := req.Header.Get("Forwarded")
+	if !strings.Contains(fwd, `host="127.0.0.1:35000"`) {
+		t.Fatalf("expected Forwarded to include quoted host with port, got %q", fwd)
+	}
+}
+
 func TestHTTPProxyForwardHeadersRespectTLSHints(t *testing.T) {
 	backendReqs := make(chan map[string]string, 2)
 
@@ -160,6 +188,11 @@ func TestHTTPProxyForwardHeadersRespectTLSHints(t *testing.T) {
 		PublicPort: public,
 		Flow:       api.FlowTCP,
 		Protocol:   api.ListenerProtocolHTTP,
+		Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{{
+			Path:     "/",
+			Type:     "prefix",
+			Strategy: "public",
+		}}},
 	}
 	pm.StartListener(ep)
 	defer pm.StopAll()
@@ -281,6 +314,11 @@ func TestProxy_SecurityHeaders(t *testing.T) {
 		PublicPort: public,
 		Flow:       api.FlowTCP,
 		Protocol:   api.ListenerProtocolHTTP,
+		Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{{
+			Path:     "/",
+			Type:     "prefix",
+			Strategy: "public",
+		}}},
 	}
 	pm.StartListener(ep)
 	defer pm.StopAll()
@@ -331,5 +369,60 @@ func TestProxy_SecurityHeaders(t *testing.T) {
 	csp = strings.Join(resp.Header.Values("Content-Security-Policy"), ", ")
 	if !strings.Contains(csp, "https://portal.example.com:*") {
 		t.Errorf("allowed: expected CSP to contain portal.example.com:*, got %q", csp)
+	}
+}
+
+func TestHTTPProxy_RewriteHttpOnlySetCookiePreservesMultibyteValue(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendLn.Close()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Add("Set-Cookie", "session=✓; Path=/; HttpOnly")
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+	go srv.Serve(backendLn)
+	defer srv.Shutdown(context.Background())
+
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+
+	pm := NewProxyManager()
+	public := getFreePort(t)
+	ep := ServiceEndpoint{
+		App:        "demo",
+		Name:       "web",
+		GuestPort:  0,
+		HostBind:   backendPort,
+		PublicPort: public,
+		Flow:       api.FlowTCP,
+		Protocol:   api.ListenerProtocolHTTP,
+		Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{{
+			Path:     "/",
+			Type:     "prefix",
+			Strategy: "public",
+		}}},
+	}
+	pm.StartListener(ep)
+	defer pm.StopAll()
+
+	time.Sleep(100 * time.Millisecond)
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/", public))
+	if err != nil {
+		t.Fatalf("http get: %v", err)
+	}
+	resp.Body.Close()
+
+	cookies := resp.Header.Values("Set-Cookie")
+	if len(cookies) != 1 {
+		t.Fatalf("expected 1 Set-Cookie, got %v", cookies)
+	}
+	want := "__piccolo_demo_session=✓; Path=/; HttpOnly"
+	if cookies[0] != want {
+		t.Fatalf("unexpected Set-Cookie: got %q want %q", cookies[0], want)
 	}
 }

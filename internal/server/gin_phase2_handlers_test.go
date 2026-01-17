@@ -30,8 +30,10 @@ func setupBasicServer(t *testing.T) *GinServer {
 
 func TestOSUpdateStatus_OK(t *testing.T) {
 	srv := setupBasicServer(t)
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/api/v1/updates/os", nil)
+	attachAuth(req, sessionCookie, csrfToken)
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d", w.Code)

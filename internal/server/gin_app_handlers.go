@@ -131,6 +131,7 @@ func isValidDNSLabel(label string) bool {
 type APIError struct {
 	Error   string `json:"error"`
 	Code    int    `json:"code"`
+	Key     string `json:"key,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
@@ -143,10 +144,15 @@ type GinAppResponse struct {
 
 // writeGinError writes a structured error response using Gin
 func writeGinError(c *gin.Context, statusCode int, message string) {
+	writeGinErrorWithKey(c, statusCode, message, "")
+}
+
+func writeGinErrorWithKey(c *gin.Context, statusCode int, message, key string) {
 	response := GinAppResponse{
 		Error: &APIError{
 			Error:   http.StatusText(statusCode),
 			Code:    statusCode,
+			Key:     key,
 			Message: message,
 		},
 	}
@@ -189,6 +195,11 @@ func (s *GinServer) handleGinAppValidate(c *gin.Context) {
 		yamlData = body
 	}
 	if _, err := app.ParseAppDefinition(yamlData); err != nil {
+		var ve *app.ValidationError
+		if errors.As(err, &ve) && ve != nil {
+			writeGinErrorWithKey(c, http.StatusBadRequest, "Invalid app.yaml: "+ve.Message, ve.Code)
+			return
+		}
 		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
 		return
 	}
@@ -300,10 +311,17 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		}
 	}
 
-	// Check for OIDC strategy in loose schema to pre-generate credentials
+	// Check for service-level oidc_client in loose schema to pre-generate credentials.
 	// We do this before rendering so we can inject the credentials into the template.
 	var oidcClientID, oidcClientSecret string
-	if looseDef, err := app.ParseAppSchema(yamlData); err == nil && looseDef.Auth != nil && looseDef.Auth.Strategy == "oidc" {
+	if looseDef, err := app.ParseAppSchema(yamlData); err == nil && func() bool {
+		for _, svc := range looseDef.Services {
+			if svc.OIDCClient != nil {
+				return true
+			}
+		}
+		return false
+	}() {
 		clientMgr := s.getOIDCClientManager()
 		if clientMgr != nil {
 			var credErr error
@@ -313,14 +331,10 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 				return
 			}
 
-			// Inject Auth context for templating
-			// Issuer is always https://piccolo.local for internal back-channel communication
+			// Inject Auth context for templating.
+			// Issuer is always https://piccolo.local for internal back-channel communication.
 			issuer := "https://piccolo.local"
 			caPath := "/var/lib/piccolo/certs/internal-ca.crt"
-
-			if looseDef.Auth.Injection != nil && looseDef.Auth.Injection.CAMountPath != "" {
-				caPath = looseDef.Auth.Injection.CAMountPath
-			}
 
 			systemContext["Auth"] = map[string]string{
 				"Issuer":       issuer,
@@ -344,6 +358,11 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	// Parse app.yaml
 	appDef, err := app.ParseAppDefinition(yamlData)
 	if err != nil {
+		var ve *app.ValidationError
+		if errors.As(err, &ve) && ve != nil {
+			writeGinErrorWithKey(c, http.StatusBadRequest, "Invalid app.yaml: "+ve.Message, ve.Code)
+			return
+		}
 		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
 		return
 	}
@@ -502,7 +521,7 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 	var req struct {
 		Listeners []api.AppListener `json:"listeners"`
 	}
-// ... (rest of function)
+	// ... (rest of function)
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeGinError(c, http.StatusBadRequest, "Invalid request body")
 		return
@@ -601,6 +620,15 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 			writeGinError(c, http.StatusInternalServerError, "Failed to uninstall app: "+err.Error())
 		}
 		return
+	}
+
+	// RFC 20260112: delete OIDC client on uninstall (best-effort).
+	if clientMgr := s.getOIDCClientManager(); clientMgr != nil {
+		if client, err := clientMgr.GetClientByAppID(ctx, appName); err == nil && client != nil {
+			if err := clientMgr.DeleteClient(ctx, client.ID); err != nil {
+				log.Printf("WARN: failed to delete OIDC client for %s: %v", appName, err)
+			}
+		}
 	}
 
 	if hostsToRemove != nil && s.remoteManager != nil {

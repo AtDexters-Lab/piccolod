@@ -216,7 +216,16 @@ func (fakeRunner) Run(ctx context.Context, name string, args ...string) (string,
 	case "snapper":
 		return `{"configs":[{"config":"root","snapshots":[{"number":5,"date":"2025-11-20 09:00:00","description":"active"},{"number":6,"date":"2025-11-21 09:00:00","description":"prev"},{"number":7,"date":"2025-11-23 10:00:00","description":"staged"}]}]}`, "", 0, nil
 	case "systemctl":
-		return "success\n0\nMon 2025-11-24 09:59:00 UTC", "", 0, nil
+		if len(args) > 0 && args[0] == "list-units" {
+			return "", "", 0, nil
+		}
+		if len(args) > 0 && args[0] == "is-active" {
+			return "", "", 3, nil
+		}
+		if len(args) > 0 && args[0] == "show" {
+			return "success\n0\nMon 2025-11-24 09:59:00 UTC", "", 0, nil
+		}
+		return "", "", 0, nil
 	case "journalctl":
 		return "txn ok\nprepared snapshot 7\n", "", 0, nil
 	case "zypper":

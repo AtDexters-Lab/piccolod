@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	zitadelOIDC "github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 
 	"piccolod/internal/oidc"
@@ -73,6 +74,30 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 		return nil, nil
 	}
 
+	// Collect additional redirect URIs declared via services[].oidc_client.redirect_uris.
+	extraRedirectURIs := make([]string, 0)
+	if s.appManager != nil {
+		if inst, err := s.appManager.Get(ctx, appID); err == nil && inst != nil && inst.Definition != nil {
+			seen := make(map[string]struct{})
+			for _, svc := range inst.Definition.Services {
+				if svc.OIDCClient == nil {
+					continue
+				}
+				for _, u := range svc.OIDCClient.RedirectURIs {
+					u = strings.TrimSpace(u)
+					if u == "" {
+						continue
+					}
+					if _, ok := seen[u]; ok {
+						continue
+					}
+					seen[u] = struct{}{}
+					extraRedirectURIs = append(extraRedirectURIs, u)
+				}
+			}
+		}
+	}
+
 	// Get the current local hostname (handles mDNS conflicts like "piccolo-abc123.local")
 	localHostname := "piccolo.local"
 	if s.mdnsManager != nil {
@@ -83,6 +108,13 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 	// If we have a requested redirect_uri, check if its origin matches a listener.
 	requested, _ := ctx.Value(requestedRedirectURIContextKey).(string)
 	if requested != "" {
+		// First, allow explicitly-declared redirect URIs (native/loopback/custom scheme).
+		for _, allowed := range extraRedirectURIs {
+			if requested == allowed {
+				return []string{requested}, nil
+			}
+		}
+
 		u, err := url.Parse(requested)
 		if err == nil {
 			// Extract port from host (u.Host includes port if present)
@@ -105,6 +137,25 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 							if strings.EqualFold(reqHost, remoteHost) {
 								return []string{requested}, nil
 							}
+						}
+					}
+				}
+
+				// Check Alias Domains (remote config)
+				if s.remoteManager != nil && u.Scheme == "https" {
+					reqHost := u.Host
+					if h, p, err := net.SplitHostPort(u.Host); err == nil && p == "443" {
+						reqHost = h
+					}
+					for _, alias := range s.remoteManager.ListAliases() {
+						if strings.TrimSpace(alias.Hostname) == "" {
+							continue
+						}
+						if alias.Listener != ep.Name {
+							continue
+						}
+						if strings.EqualFold(reqHost, alias.Hostname) {
+							return []string{requested}, nil
 						}
 					}
 				}
@@ -165,6 +216,8 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 		uris = append(uris, fmt.Sprintf("http://%s:%d/oauth/callback", localHostname, ep.PublicPort))
 		uris = append(uris, fmt.Sprintf("http://%s:%d/login/callback", localHostname, ep.PublicPort))
 	}
+
+	uris = append(uris, extraRedirectURIs...)
 
 	return uris, nil
 }
@@ -340,6 +393,11 @@ func (s *GinServer) handleOIDCAuthorizeFastPath(c *gin.Context, p *oidc.Provider
 	storedReq, err := p.Storage().CreateAuthRequest(ctx, authReq, userID)
 	if err != nil {
 		slog.Error("OIDC fast-path: failed to create auth request", "error", err)
+		var oe *zitadelOIDC.Error
+		if errors.As(err, &oe) && oe.ErrorType == zitadelOIDC.AccessDenied {
+			c.Status(http.StatusForbidden)
+			return
+		}
 		c.Request = c.Request.WithContext(ctx)
 		p.Handler().ServeHTTP(c.Writer, c.Request)
 		return
@@ -373,14 +431,23 @@ func (s *GinServer) handleOIDCAuthorizeFastPath(c *gin.Context, p *oidc.Provider
 }
 
 func (s *GinServer) handleOIDCToken(c *gin.Context) {
-	// Inject requested redirect_uri into context for dynamic origin validation
-	// Note: For token exchange, redirect_uri is optional but if present must match.
-	// We extract it from form values (POST body).
+	ctx := c.Request.Context()
+
+	// Inject requested redirect_uri into context for dynamic origin validation.
 	redirectURI := c.Request.FormValue("redirect_uri")
 	if redirectURI != "" {
-		ctx := context.WithValue(c.Request.Context(), requestedRedirectURIContextKey, redirectURI)
-		c.Request = c.Request.WithContext(ctx)
+		ctx = context.WithValue(ctx, requestedRedirectURIContextKey, redirectURI)
 	}
+
+	// RFC 20260112: hybrid token endpoint authentication uses PKCE-only for loopback/custom-scheme
+	// redirect URIs. We pass code + redirect_uri through context so storage can apply the rule.
+	if strings.EqualFold(c.Request.FormValue("grant_type"), "authorization_code") {
+		code := c.Request.FormValue("code")
+		if strings.TrimSpace(code) != "" && strings.TrimSpace(redirectURI) != "" {
+			ctx = oidc.WithTokenExchangeContext(ctx, code, redirectURI)
+		}
+	}
+	c.Request = c.Request.WithContext(ctx)
 
 	p, err := s.getOIDCProvider()
 	if err != nil {

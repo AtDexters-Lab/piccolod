@@ -25,6 +25,37 @@ import (
 // ErrInvalidRefreshToken is returned when a token is not a refresh token.
 var ErrInvalidRefreshToken = errors.New("invalid refresh token")
 
+func (s *Storage) ensureUserAllowedForClient(ctx context.Context, userID, clientID string) error {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("user id required")
+	}
+	client, err := s.clients.Get(ctx, clientID)
+	if err != nil {
+		return fmt.Errorf("client not found: %w", err)
+	}
+	user, err := s.users.Get(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("user not found: %w", err)
+	}
+
+	if user.Role != persistence.UserRoleStandard {
+		return nil
+	}
+
+	allowed := false
+	for _, appID := range user.AllowedApps {
+		if appID == client.AppID {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return oidc.ErrAccessDenied().WithDescription("access denied")
+	}
+	return nil
+}
+
 // Storage implements op.Storage using our persistence layer.
 type Storage struct {
 	users         persistence.UserRepo
@@ -36,6 +67,10 @@ type Storage struct {
 	// In-memory auth request store (short-lived, no need for persistence)
 	authRequests   map[string]*AuthRequest
 	authRequestsMu sync.RWMutex
+
+	// In-memory metadata for auth codes (needed for hybrid token auth)
+	consumedAuthCodes   map[string]consumedAuthCodeMeta
+	consumedAuthCodesMu sync.Mutex
 
 	// Auth request limits
 	maxAuthRequests int
@@ -57,6 +92,13 @@ type Storage struct {
 type signingKey struct {
 	kid        string
 	privateKey *rsa.PrivateKey
+}
+
+type consumedAuthCodeMeta struct {
+	ClientID          string
+	RedirectURI       string
+	AllowPKCEOnlyAuth bool
+	ConsumedAt        time.Time
 }
 
 // StorageConfig configures the OIDC storage.
@@ -91,17 +133,18 @@ func NewStorage(cfg StorageConfig) *Storage {
 	}
 
 	s := &Storage{
-		users:           cfg.Users,
-		clients:         cfg.Clients,
-		keys:            cfg.Keys,
-		authCodes:       cfg.AuthCodes,
-		refreshTokens:   cfg.RefreshTokens,
-		authRequests:    make(map[string]*AuthRequest),
-		maxAuthRequests: maxAuthRequests,
-		authRequestTTL:  authRequestTTL,
-		stopCleanup:     make(chan struct{}),
-		resolveRedirect: cfg.ResolveRedirect,
-		logger:          cfg.Logger,
+		users:             cfg.Users,
+		clients:           cfg.Clients,
+		keys:              cfg.Keys,
+		authCodes:         cfg.AuthCodes,
+		refreshTokens:     cfg.RefreshTokens,
+		authRequests:      make(map[string]*AuthRequest),
+		consumedAuthCodes: make(map[string]consumedAuthCodeMeta),
+		maxAuthRequests:   maxAuthRequests,
+		authRequestTTL:    authRequestTTL,
+		stopCleanup:       make(chan struct{}),
+		resolveRedirect:   cfg.ResolveRedirect,
+		logger:            cfg.Logger,
 	}
 	if s.resolveRedirect == nil {
 		s.resolveRedirect = func(ctx context.Context, appID string) ([]string, error) { return nil, nil }
@@ -172,6 +215,15 @@ func (s *Storage) cleanupExpiredAuthRequests() {
 	if cleaned > 0 {
 		s.logger.Debug("cleaned up expired auth requests", "count", cleaned)
 	}
+
+	// Best-effort cleanup for consumed auth-code metadata (should usually be deleted during token exchange).
+	s.consumedAuthCodesMu.Lock()
+	for code, meta := range s.consumedAuthCodes {
+		if now.Sub(meta.ConsumedAt) > 5*time.Minute {
+			delete(s.consumedAuthCodes, code)
+		}
+	}
+	s.consumedAuthCodesMu.Unlock()
 }
 
 // -----------------------------------------------------------------------------
@@ -202,6 +254,15 @@ func (s *Storage) GetClientByClientID(ctx context.Context, clientID string) (op.
 }
 
 func (s *Storage) AuthorizeClientIDSecret(ctx context.Context, clientID, clientSecret string) error {
+	exchange, hasExchange := TokenExchangeContextFrom(ctx)
+	if hasExchange && exchange.Code != "" {
+		defer func() {
+			s.consumedAuthCodesMu.Lock()
+			delete(s.consumedAuthCodes, exchange.Code)
+			s.consumedAuthCodesMu.Unlock()
+		}()
+	}
+
 	client, err := s.clients.Get(ctx, clientID)
 	if err != nil {
 		if errors.Is(err, persistence.ErrNotFound) {
@@ -210,6 +271,39 @@ func (s *Storage) AuthorizeClientIDSecret(ctx context.Context, clientID, clientS
 			return errors.New("invalid client credentials")
 		}
 		return err
+	}
+
+	// Hybrid model: allow token exchange without a client secret only when PKCE is present and the
+	// original redirect URI was loopback/custom-scheme and matches the token request redirect_uri.
+	if clientSecret == "" {
+		if !hasExchange || strings.TrimSpace(exchange.Code) == "" || strings.TrimSpace(exchange.RedirectURI) == "" {
+			s.logger.Warn("OIDC client auth failed: missing secret and no token exchange context", "client_id", clientID)
+			return errors.New("invalid client credentials")
+		}
+
+		s.consumedAuthCodesMu.Lock()
+		meta, ok := s.consumedAuthCodes[exchange.Code]
+		s.consumedAuthCodesMu.Unlock()
+		if !ok {
+			s.logger.Warn("OIDC client auth failed: missing auth code metadata", "client_id", clientID)
+			return errors.New("invalid client credentials")
+		}
+
+		if meta.ClientID != clientID {
+			s.logger.Warn("OIDC client auth failed: client_id mismatch for auth code", "client_id", clientID)
+			return errors.New("invalid client credentials")
+		}
+		if meta.RedirectURI != exchange.RedirectURI {
+			s.logger.Warn("OIDC client auth failed: redirect_uri mismatch for auth code", "client_id", clientID)
+			return errors.New("invalid client credentials")
+		}
+		if !meta.AllowPKCEOnlyAuth {
+			s.logger.Warn("OIDC client auth failed: pkce-only auth not allowed for redirect uri", "client_id", clientID)
+			return errors.New("invalid client credentials")
+		}
+
+		s.logger.Info("OIDC client auth: allowed pkce-only token exchange", "client_id", clientID, "app_id", client.AppID)
+		return nil
 	}
 
 	if !VerifyClientSecret(client.Secret, clientSecret) {
@@ -294,6 +388,20 @@ func (s *Storage) ValidateJWTProfileScopes(ctx context.Context, userID string, s
 // -----------------------------------------------------------------------------
 
 func (s *Storage) CreateAuthRequest(ctx context.Context, authReq *oidc.AuthRequest, userID string) (op.AuthRequest, error) {
+	// RFC 20260112: PKCE required for all authorization flows (S256 only).
+	if strings.TrimSpace(authReq.CodeChallenge) == "" {
+		return nil, oidc.ErrInvalidRequest().WithDescription("code_challenge required")
+	}
+	if authReq.CodeChallengeMethod != oidc.CodeChallengeMethodS256 {
+		return nil, oidc.ErrInvalidRequest().WithDescription("code_challenge_method must be S256")
+	}
+
+	if strings.TrimSpace(userID) != "" {
+		if err := s.ensureUserAllowedForClient(ctx, userID, authReq.ClientID); err != nil {
+			return nil, err
+		}
+	}
+
 	// Check limit before creating
 	s.authRequestsMu.RLock()
 	currentCount := len(s.authRequests)
@@ -308,12 +416,9 @@ func (s *Storage) CreateAuthRequest(ctx context.Context, authReq *oidc.AuthReque
 		return nil, fmt.Errorf("generate request ID: %w", err)
 	}
 
-	var codeChallenge *oidc.CodeChallenge
-	if authReq.CodeChallenge != "" {
-		codeChallenge = &oidc.CodeChallenge{
-			Challenge: authReq.CodeChallenge,
-			Method:    authReq.CodeChallengeMethod,
-		}
+	codeChallenge := &oidc.CodeChallenge{
+		Challenge: authReq.CodeChallenge,
+		Method:    authReq.CodeChallengeMethod,
 	}
 
 	now := time.Now().UTC()
@@ -386,6 +491,21 @@ func (s *Storage) AuthRequestByCode(ctx context.Context, code string) (op.AuthRe
 			Method:    oidc.CodeChallengeMethod(authCode.CodeChallengeMethod),
 		}
 	}
+
+	// Store metadata for hybrid token endpoint authentication.
+	// This is read later by AuthorizeClientIDSecret for pkce-only (native) flows.
+	allowPKCEOnly := false
+	if codeChallenge != nil {
+		allowPKCEOnly = isLoopbackOrCustomSchemeRedirectURI(authCode.RedirectURI)
+	}
+	s.consumedAuthCodesMu.Lock()
+	s.consumedAuthCodes[authCode.Code] = consumedAuthCodeMeta{
+		ClientID:          authCode.ClientID,
+		RedirectURI:       authCode.RedirectURI,
+		AllowPKCEOnlyAuth: allowPKCEOnly,
+		ConsumedAt:        time.Now().UTC(),
+	}
+	s.consumedAuthCodesMu.Unlock()
 
 	return &AuthRequest{
 		ID:            authCode.Code,
@@ -463,30 +583,8 @@ func (s *Storage) CompleteAuthRequest(ctx context.Context, id, userID string) er
 	}
 
 	// 2. Validate Access (DB Ops)
-	client, err := s.clients.Get(ctx, clientID)
-	if err != nil {
-		return fmt.Errorf("client not found: %w", err)
-	}
-
-	user, err := s.users.Get(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("user not found: %w", err)
-	}
-
-	// Standard users must be explicitly allowed
-	if user.Role == persistence.UserRoleStandard {
-		allowed := false
-		if user.AllowedApps != nil {
-			for _, appID := range user.AllowedApps {
-				if appID == client.AppID {
-					allowed = true
-					break
-				}
-			}
-		}
-		if !allowed {
-			return fmt.Errorf("access denied to app %s", client.AppID)
-		}
+	if err := s.ensureUserAllowedForClient(ctx, userID, clientID); err != nil {
+		return err
 	}
 
 	// 3. Update Request (Write Lock)
@@ -519,7 +617,7 @@ func (s *Storage) CreateAccessToken(ctx context.Context, request op.TokenRequest
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("generate token ID: %w", err)
 	}
-	expiry := time.Now().UTC().Add(time.Hour)
+	expiry := time.Now().UTC().Add(15 * time.Minute)
 	return id, expiry, nil
 }
 
@@ -528,7 +626,7 @@ func (s *Storage) CreateAccessAndRefreshTokens(ctx context.Context, request op.T
 	if err != nil {
 		return "", "", time.Time{}, fmt.Errorf("generate access token ID: %w", err)
 	}
-	expiry := time.Now().UTC().Add(time.Hour)
+	expiry := time.Now().UTC().Add(15 * time.Minute)
 
 	// Revoke old refresh token if rotating
 	if currentRefreshToken != "" {
@@ -557,7 +655,7 @@ func (s *Storage) CreateAccessAndRefreshTokens(ctx context.Context, request op.T
 		if err != nil {
 			return "", "", time.Time{}, fmt.Errorf("generate refresh token: %w", err)
 		}
-		refreshExpiry := time.Now().UTC().Add(30 * 24 * time.Hour) // 30 days
+		refreshExpiry := time.Now().UTC().Add(7 * 24 * time.Hour) // 7 days
 
 		// Get client ID from audience (first audience is typically the client)
 		clientID := ""
@@ -604,24 +702,8 @@ func (s *Storage) TokenRequestByRefreshToken(ctx context.Context, refreshToken s
 	}
 
 	// Validate Access (Enforce allowed_apps on refresh)
-	client, err := s.clients.Get(ctx, token.ClientID)
-	if err != nil {
-		return nil, fmt.Errorf("client not found: %w", err)
-	}
-
-	if user.Role == persistence.UserRoleStandard {
-		allowed := false
-		if user.AllowedApps != nil {
-			for _, appID := range user.AllowedApps {
-				if appID == client.AppID {
-					allowed = true
-					break
-				}
-			}
-		}
-		if !allowed {
-			return nil, fmt.Errorf("access denied to app %s", client.AppID)
-		}
+	if err := s.ensureUserAllowedForClient(ctx, token.UserID, token.ClientID); err != nil {
+		return nil, err
 	}
 
 	return &RefreshTokenRequest{

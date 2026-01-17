@@ -27,6 +27,27 @@ type connectionHint struct {
 }
 
 type hintContextKey struct{}
+type hintLookupContextKey struct{}
+
+type hintLookup struct {
+	pm           *ProxyManager
+	listenerPort int
+	sourcePort   int
+
+	once sync.Once
+	hint connectionHint
+	ok   bool
+}
+
+func (l *hintLookup) get() (connectionHint, bool) {
+	if l == nil || l.pm == nil || l.listenerPort <= 0 || l.sourcePort <= 0 {
+		return connectionHint{}, false
+	}
+	l.once.Do(func() {
+		l.hint, l.ok = l.pm.consumeHint(l.listenerPort, l.sourcePort)
+	})
+	return l.hint, l.ok
+}
 
 // ProxyManager manages TCP listeners and proxies traffic based on ServiceEndpoint
 type ProxyManager struct {
@@ -40,6 +61,8 @@ type ProxyManager struct {
 	// Auth dependencies for trusted headers middleware (RFC 5.2)
 	userManager   *auth.UserManager
 	sessionGetter func(r *http.Request) (*auth.Session, bool)
+	portalOrigin  func(r *http.Request) string
+	aliasChecker  func(host, listener string) bool
 }
 
 func NewProxyManager() *ProxyManager {
@@ -91,6 +114,22 @@ func (p *ProxyManager) SetAuthConfig(um *auth.UserManager, sg func(r *http.Reque
 	p.mu.Lock()
 	p.userManager = um
 	p.sessionGetter = sg
+	p.mu.Unlock()
+}
+
+// SetPortalOriginResolver configures how browser redirects should resolve the portal origin.
+// This is required for correct login redirects in WAN mode (portal and app are different origins).
+func (p *ProxyManager) SetPortalOriginResolver(fn func(r *http.Request) string) {
+	p.mu.Lock()
+	p.portalOrigin = fn
+	p.mu.Unlock()
+}
+
+// SetAliasChecker configures a callback that reports whether a request host is an alias domain
+// for a given listener name. Used for RFC 20260112 alias-domain warnings.
+func (p *ProxyManager) SetAliasChecker(fn func(host, listener string) bool) {
+	p.mu.Lock()
+	p.aliasChecker = fn
 	p.mu.Unlock()
 }
 
@@ -225,13 +264,172 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			// But for now, just setting it back is fine.
 			resp.Header.Set("Content-Security-Policy", newVal)
 		}
+
+		// RFC 20260112: Set-Cookie blocking + optional LAN port-based cookie isolation.
+		setCookies := resp.Header.Values("Set-Cookie")
+		if len(setCookies) > 0 {
+			resp.Header.Del("Set-Cookie")
+
+			appHost := normalizeHostNoPort(proxyContextAppHost(resp.Request.Context()))
+			rewriteCookies := proxyContextCookieRewrite(resp.Request.Context())
+			appPrefix := cookiePrefixForApp(ep.App)
+
+			for _, sc := range setCookies {
+				name, eq := parseSetCookieName(sc)
+				if name == "" || eq == -1 {
+					continue
+				}
+				if isPiccoloCookieName(name) {
+					continue
+				}
+
+				if dom, ok := setCookieDomain(sc); ok {
+					// If we can't determine the app host, fail closed for Domain cookies.
+					if appHost == "" {
+						continue
+					}
+					if normalizeCookieDomain(dom) != appHost {
+						continue
+					}
+				}
+
+				if rewriteCookies && setCookieHasHttpOnly(sc) && !strings.HasPrefix(name, appPrefix) {
+					sc = appPrefix + name + sc[eq:]
+				}
+				resp.Header.Add("Set-Cookie", sc)
+			}
+		}
 		return nil
 	}
 
-	// Core handler that forwards to backend
-	coreHandler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Single handler that enforces listener auth rules (per-path) before forwarding.
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cleanedPath, pathErr := normalizeAndSetRequestPath(r)
+		if pathErr != "" {
+			// RFC 7.2: runtime path errors
+			if pathErr == "INVALID_PATH" {
+				writeProxyJSONError(w, http.StatusBadRequest, "invalid_request_path", "INVALID_PATH")
+				return
+			}
+			writeProxyJSONError(w, http.StatusBadRequest, "path_normalization_failed", "PATH_INVALID")
+			return
+		}
+
+		strategy := listenerStrategyForPath(ep.Auth, cleanedPath)
+
+		// RFC 4.1.5: Strip spoofed trusted headers for all strategies.
+		StripHeadersFromRequest(r)
+
+		// RFC 4.1.6: Strategy-specific behavior.
+		switch strategy {
+		case "protected", "headers":
+			p.mu.Lock()
+			um := p.userManager
+			sg := p.sessionGetter
+			portalOrigin := p.portalOrigin
+			aliasChecker := p.aliasChecker
+			p.mu.Unlock()
+
+			if sg == nil {
+				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+				return
+			}
+
+			// RFC 20260112: alias domains are not compatible with protected/headers strategies.
+			// The session cookie cannot be shared across custom domains.
+			if aliasChecker != nil && aliasChecker(normalizeHostNoPort(r.Host), ep.Name) {
+				log.Printf("WARN: alias domain access is not supported for auth strategy=%s (host=%s app=%s listener=%s)", strategy, normalizeHostNoPort(r.Host), ep.App, ep.Name)
+			}
+
+			_, cookieErr := r.Cookie("piccolo_session")
+			cookiePresent := cookieErr == nil
+
+			sess, ok := sg(r)
+			if !ok || sess == nil {
+				if isBrowserNavigation(r) {
+					origin := ""
+					if portalOrigin != nil {
+						origin = portalOrigin(r)
+					}
+					if origin == "" {
+						scheme := "http"
+						if shouldRewriteAsHTTPS(ep, r) {
+							scheme = "https"
+						}
+						origin = scheme + "://" + normalizeHostNoPort(r.Host)
+					}
+					http.Redirect(w, r, portalLoginURL(origin, absoluteRequestURL(r, ep)), http.StatusFound)
+					return
+				}
+				if cookiePresent {
+					writeProxyJSONError(w, http.StatusUnauthorized, "session_expired", "SESSION_EXPIRED")
+				} else {
+					writeProxyJSONError(w, http.StatusUnauthorized, "authentication_required", "AUTH_REQUIRED")
+				}
+				return
+			}
+
+			// Check allowed_apps for standard users (admin has full access).
+			if sess.Role != "admin" {
+				if um == nil {
+					http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				allowed, err := um.IsAppAllowed(r.Context(), sess.UserID, ep.App)
+				if err != nil || !allowed {
+					if isBrowserNavigation(r) {
+						origin := ""
+						if portalOrigin != nil {
+							origin = portalOrigin(r)
+						}
+						if origin == "" {
+							scheme := "http"
+							if shouldRewriteAsHTTPS(ep, r) {
+								scheme = "https"
+							}
+							origin = scheme + "://" + normalizeHostNoPort(r.Host)
+						}
+						http.Redirect(w, r, portalAccessDeniedURL(origin, absoluteRequestURL(r, ep)), http.StatusFound)
+						return
+					}
+					writeProxyJSONError(w, http.StatusForbidden, "app_access_denied", "APP_NOT_ALLOWED")
+					return
+				}
+			}
+
+			if strategy == "headers" {
+				if um == nil {
+					http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				user, err := um.Get(r.Context(), sess.UserID)
+				if err != nil {
+					writeProxyJSONError(w, http.StatusUnauthorized, "session_expired", "SESSION_EXPIRED")
+					return
+				}
+				// Inject trusted identity headers (RFC 4.1.6).
+				r.Header.Set(HeaderPiccoloUser, user.Username)
+				r.Header.Set(HeaderPiccoloEmail, user.Email)
+				r.Header.Set(HeaderPiccoloName, user.Username)
+				r.Header.Set(HeaderPiccoloRole, string(user.Role))
+			}
+		case "oidc_passthrough", "public":
+			// Pass-through; app manages auth or requires none.
+		default:
+			// Unknown strategy should fail closed.
+			writeProxyJSONError(w, http.StatusUnauthorized, "authentication_required", "AUTH_REQUIRED")
+			return
+		}
+
+		// RFC 4.1.5 + 4.1.8: Strip Piccolo cookies before forwarding and optionally rewrite cookies
+		// for LAN port-based isolation.
+		rewriteCookies := shouldRewriteLegacyCookies(r.Host)
+		stripAndRewriteRequestCookies(r, ep.App, rewriteCookies)
+		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies)
+
 		applyForwardHeaders(r, ep)
-		// Intercept ACME HTTP-01 challenges on HTTP proxies only
+
+		// Intercept ACME HTTP-01 challenges (must still pass auth rules).
 		if strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
 			p.mu.Lock()
 			acme := p.acme
@@ -241,35 +439,9 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				return
 			}
 		}
+
 		rp.ServeHTTP(w, r)
 	}))
-
-	// Build middleware chain based on auth strategy
-	var handler http.Handler
-	if ep.AuthStrategy == "headers" {
-		// RFC 5.2: Trusted Headers auth - validate session, check allowed_apps, inject headers
-		p.mu.Lock()
-		um := p.userManager
-		sg := p.sessionGetter
-		p.mu.Unlock()
-
-		if um != nil && sg != nil {
-			thm := NewTrustedHeadersMiddleware(TrustedHeadersConfig{
-				UserManager:   um,
-				SessionGetter: sg,
-				AppIDResolver: func(r *http.Request) string { return ep.App },
-			})
-			handler = thm.Wrap(coreHandler)
-			log.Printf("INFO: Trusted headers middleware enabled for app=%s listener=%s", ep.App, ep.Name)
-		} else {
-			// Auth config not set - log warning and fall back to stripping headers only
-			log.Printf("WARN: Auth config not set for headers strategy app=%s; stripping headers only", ep.App)
-			handler = stripPiccoloHeadersMiddleware(coreHandler)
-		}
-	} else {
-		// For OIDC or no auth: just strip any spoofed X-Piccolo-* headers as a security baseline
-		handler = stripPiccoloHeadersMiddleware(coreHandler)
-	}
 
 	// Apply common middleware chain
 	handler = p.securityHeaders(handler)
@@ -279,14 +451,16 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		log.Printf("INFO: HTTP proxy %s → %s (app=%s listener=%s protocol=%s auth=%s)", ln.Addr().String(), target, ep.App, ep.Name, ep.Protocol.String(), ep.AuthStrategy)
+		log.Printf("INFO: HTTP proxy %s → %s (app=%s listener=%s protocol=%s)", ln.Addr().String(), target, ep.App, ep.Name, ep.Protocol.String())
 		srv := &http.Server{
 			Handler: handler,
 			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 				if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
-					if hint, ok := p.consumeHint(ep.PublicPort, addr.Port); ok {
-						ctx = context.WithValue(ctx, hintContextKey{}, hint)
-					}
+					ctx = context.WithValue(ctx, hintLookupContextKey{}, &hintLookup{
+						pm:           p,
+						listenerPort: ep.PublicPort,
+						sourcePort:   addr.Port,
+					})
 				}
 				return ctx
 			},
@@ -318,8 +492,11 @@ func (p *ProxyManager) securityHeaders(next http.Handler) http.Handler {
 		ip := net.ParseIP(remoteIp)
 		if ip != nil && (ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate()) {
 			host, _ := splitHostPortValue(r.Host)
-			host = host + ":*"
-			csp += " https://" + host + " http://" + host
+			// Avoid adding raw IP hosts to CSP (e.g., 127.0.0.1) to keep policy tight.
+			if host != "" && net.ParseIP(host) == nil {
+				host = host + ":*"
+				csp += " https://" + host + " http://" + host
+			}
 		}
 
 		w.Header().Add("Content-Security-Policy", csp)
@@ -345,38 +522,114 @@ func hintFromRequest(r *http.Request) (connectionHint, bool) {
 	if hint, ok := r.Context().Value(hintContextKey{}).(connectionHint); ok {
 		return hint, true
 	}
+	if lookup, ok := r.Context().Value(hintLookupContextKey{}).(*hintLookup); ok {
+		return lookup.get()
+	}
 	return connectionHint{}, false
 }
 
 func applyForwardHeaders(r *http.Request, ep ServiceEndpoint) {
+	clientIP := ""
+	if remoteHost, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		clientIP = remoteHost
+	} else {
+		clientIP = r.RemoteAddr
+	}
+	trusted := false
+	if ip := net.ParseIP(clientIP); ip != nil && ip.IsLoopback() {
+		trusted = true
+	}
+
 	host, hostPort := splitHostPortValue(r.Host)
 	if host == "" {
 		altHost, altPort := splitHostPortValue(r.URL.Host)
 		host, hostPort = altHost, altPort
 	}
+	forwardHost := host
+	if hostPort != "" {
+		forwardHost = net.JoinHostPort(host, hostPort)
+	}
 
-	proto := resolveProto(r, ep)
-	ensureHeader(r, "X-Forwarded-Proto", proto)
-	if host != "" {
-		forwardHost := host
-		if hostPort != "" {
-			forwardHost = net.JoinHostPort(host, hostPort)
+	// Derive proto/host/port, but preserve existing forwarded headers for trusted loopback sources.
+	proto := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
+	if !trusted || proto == "" {
+		proto = "http"
+		if shouldRewriteAsHTTPS(ep, r) {
+			proto = "https"
 		}
-		ensureHeader(r, "X-Forwarded-Host", forwardHost)
-		host = forwardHost
 	}
 
-	port := resolvePortHeader(r, proto, hostPort)
-	ensureHeader(r, "X-Forwarded-Port", port)
-
-	ip := ensureClientIPHeaders(r)
-	appendForwardedHeader(r, proto, host, ip)
-
-	if proto == "https" {
-		r.URL.Scheme = "https"
+	if trusted {
+		if r.Header.Get("X-Forwarded-Proto") == "" {
+			r.Header.Set("X-Forwarded-Proto", proto)
+		}
+		if forwardHost != "" && r.Header.Get("X-Forwarded-Host") == "" {
+			r.Header.Set("X-Forwarded-Host", forwardHost)
+		}
 	} else {
-		r.URL.Scheme = "http"
+		r.Header.Set("X-Forwarded-Proto", proto)
+		if forwardHost != "" {
+			r.Header.Set("X-Forwarded-Host", forwardHost)
+		}
 	}
+
+	port := ""
+	if hint, ok := hintFromRequest(r); ok && hint.remotePort > 0 {
+		port = strconv.Itoa(hint.remotePort)
+	} else if hostPort != "" {
+		port = hostPort
+	} else if proto == "https" {
+		port = "443"
+	} else {
+		port = "80"
+	}
+
+	if trusted {
+		if r.Header.Get("X-Forwarded-Port") == "" && port != "" {
+			r.Header.Set("X-Forwarded-Port", port)
+		}
+		if r.Header.Get("X-Real-IP") == "" && clientIP != "" {
+			r.Header.Set("X-Real-IP", clientIP)
+		}
+		// X-Forwarded-For: append
+		if clientIP != "" {
+			if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
+				r.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+			} else {
+				r.Header.Set("X-Forwarded-For", clientIP)
+			}
+		}
+	} else {
+		if port != "" {
+			r.Header.Set("X-Forwarded-Port", port)
+		}
+		if clientIP != "" {
+			r.Header.Set("X-Real-IP", clientIP)
+			r.Header.Set("X-Forwarded-For", clientIP)
+		}
+	}
+
+	// Forwarded header (RFC 7239): append for trusted, overwrite for untrusted.
+	fwdHost := normalizeForwardedHostValue(r.Header.Get("X-Forwarded-Host"))
+	parts := []string{fmt.Sprintf("proto=%s", proto)}
+	if fwdHost != "" {
+		parts = append(parts, fmt.Sprintf("host=%s", forwardedPairValue(fwdHost)))
+	}
+	if forValue := normalizeForwardedForValue(clientIP); forValue != "" {
+		parts = append(parts, fmt.Sprintf("for=%s", forwardedPairValue(forValue)))
+	}
+	fwdValue := strings.Join(parts, ";")
+	if trusted {
+		if prior := r.Header.Get("Forwarded"); prior != "" {
+			r.Header.Set("Forwarded", prior+", "+fwdValue)
+		} else {
+			r.Header.Set("Forwarded", fwdValue)
+		}
+	} else {
+		r.Header.Set("Forwarded", fwdValue)
+	}
+
+	r.URL.Scheme = proto
 }
 
 func splitHostPortValue(value string) (string, string) {
@@ -391,14 +644,82 @@ func splitHostPortValue(value string) (string, string) {
 	return value, ""
 }
 
-func resolveProto(r *http.Request, ep ServiceEndpoint) string {
-	if v := strings.ToLower(r.Header.Get("X-Forwarded-Proto")); v != "" {
+func normalizeForwardedHostValue(hostport string) string {
+	h, p := splitHostPortValue(strings.TrimSpace(hostport))
+	if h == "" {
+		return ""
+	}
+
+	h = strings.Trim(h, "[]")
+	if i := strings.IndexByte(h, '%'); i != -1 {
+		h = h[:i] // drop zone (e.g., fe80::1%eth0)
+	}
+
+	if ip := net.ParseIP(h); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			h = ip4.String()
+		} else {
+			h = "[" + ip.String() + "]"
+		}
+	} else {
+		h = strings.ToLower(h)
+	}
+
+	if p != "" {
+		return h + ":" + p
+	}
+	return h
+}
+
+func normalizeForwardedForValue(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	v = strings.Trim(v, "[]")
+	if i := strings.IndexByte(v, '%'); i != -1 {
+		v = v[:i]
+	}
+	if ip := net.ParseIP(v); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4.String()
+		}
+		return "[" + ip.String() + "]"
+	}
+	return v
+}
+
+func forwardedPairValue(v string) string {
+	if v == "" {
+		return ""
+	}
+	if !needsForwardedQuotedString(v) {
 		return v
 	}
-	if shouldRewriteAsHTTPS(ep, r) {
-		return "https"
+	escaped := strings.ReplaceAll(v, "\\", "\\\\")
+	escaped = strings.ReplaceAll(escaped, "\"", "\\\"")
+	return "\"" + escaped + "\""
+}
+
+func needsForwardedQuotedString(v string) bool {
+	for i := 0; i < len(v); i++ {
+		ch := v[i]
+		switch {
+		case 'a' <= ch && ch <= 'z':
+			continue
+		case 'A' <= ch && ch <= 'Z':
+			continue
+		case '0' <= ch && ch <= '9':
+			continue
+		}
+		switch ch {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		default:
+			return true
+		}
 	}
-	return "http"
+	return false
 }
 
 func shouldRewriteAsHTTPS(ep ServiceEndpoint, r *http.Request) bool {
@@ -421,64 +742,6 @@ func requestArrivedViaTLS(r *http.Request) bool {
 		return true
 	}
 	return false
-}
-
-func resolvePortHeader(r *http.Request, proto, hostPort string) string {
-	if v := r.Header.Get("X-Forwarded-Port"); v != "" {
-		return v
-	}
-	if hint, ok := hintFromRequest(r); ok && hint.remotePort > 0 {
-		return strconv.Itoa(hint.remotePort)
-	}
-	if hostPort != "" {
-		return hostPort
-	}
-	if proto == "https" {
-		return "443"
-	}
-	return "80"
-}
-
-func ensureClientIPHeaders(r *http.Request) string {
-	ip := r.RemoteAddr
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		ip = host
-	}
-	if ip == "" {
-		return ""
-	}
-	if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
-		r.Header.Set("X-Forwarded-For", prior+", "+ip)
-	} else {
-		r.Header.Set("X-Forwarded-For", ip)
-	}
-	ensureHeader(r, "X-Real-Ip", ip)
-	return ip
-}
-
-func appendForwardedHeader(r *http.Request, proto, host, ip string) {
-	parts := []string{fmt.Sprintf("proto=%s", proto)}
-	if host != "" {
-		parts = append(parts, fmt.Sprintf("host=%s", strings.ToLower(host)))
-	}
-	if ip != "" {
-		parts = append(parts, fmt.Sprintf("for=%s", ip))
-	}
-	value := strings.Join(parts, ";")
-	if prior := r.Header.Get("Forwarded"); prior != "" {
-		r.Header.Set("Forwarded", prior+", "+value)
-	} else {
-		r.Header.Set("Forwarded", value)
-	}
-}
-
-func ensureHeader(r *http.Request, key, value string) {
-	if value == "" {
-		return
-	}
-	if r.Header.Get(key) == "" {
-		r.Header.Set(key, value)
-	}
 }
 
 // no extra helpers

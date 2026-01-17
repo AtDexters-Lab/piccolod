@@ -13,7 +13,25 @@ func TestAppServicesDiscovery_RealHandlers(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
 
 	// Install via API
-	body := []byte("name: demo\nimage: alpine:3.18\ntype: user\nlisteners:\n - name: web\n   guest_port: 80\n")
+	body := []byte(`name: demo
+type: user
+listeners:
+  - name: web
+    guest_port: 80
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+services:
+  main:
+    image: alpine:3.18
+    bind_ports: [80]
+x-piccolo:
+  mode: service
+`)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/api/v1/apps", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/x-yaml")

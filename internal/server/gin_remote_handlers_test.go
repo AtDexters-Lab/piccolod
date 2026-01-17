@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"piccolod/internal/events"
 	"piccolod/internal/health"
+	"piccolod/internal/persistence"
 	"piccolod/internal/remote"
 	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/runtime/commands"
@@ -296,9 +298,32 @@ func TestRemote_Configure_WhenLocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("locked manager init: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = lockedMgr.Close()
+	})
 	srv.remoteManager = lockedMgr
 	// Create a new dispatcher to avoid duplicate registration panic and ensure we route to the locked manager
 	srv.dispatcher = commands.NewDispatcher()
+	srv.dispatcher.Register(persistence.CommandEnsureVolume, commands.HandlerFunc(func(ctx context.Context, cmd commands.Command) (commands.Response, error) {
+		req, ok := cmd.(persistence.EnsureVolumeCommand)
+		if !ok {
+			return nil, fmt.Errorf("unexpected command type %T", cmd)
+		}
+		handle := persistence.VolumeHandle{
+			ID:       req.Req.ID,
+			MountDir: filepath.Join(baseDir, "mounts", req.Req.ID),
+		}
+		if err := os.MkdirAll(handle.MountDir, 0o700); err != nil {
+			return nil, err
+		}
+		return persistence.EnsureVolumeResponse{Handle: handle}, nil
+	}))
+	srv.dispatcher.Register(persistence.CommandAttachVolume, commands.HandlerFunc(func(context.Context, commands.Command) (commands.Response, error) {
+		return nil, nil
+	}))
+	srv.dispatcher.Register(persistence.CommandRecordLockState, commands.HandlerFunc(func(context.Context, commands.Command) (commands.Response, error) {
+		return nil, nil
+	}))
 	remote.RegisterHandlers(srv.dispatcher, lockedMgr)
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
 
@@ -331,6 +356,9 @@ func TestRemote_ReloadsConfigAfterUnlockEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("primary manager init: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = primaryMgr.Close()
+	})
 	if err := primaryMgr.Configure(remote.ConfigureRequest{
 		Endpoint:       "wss://nexus.example.com/connect",
 		DeviceSecret:   "primary-secret",
@@ -347,6 +375,9 @@ func TestRemote_ReloadsConfigAfterUnlockEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restarted manager init: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = restartedMgr.Close()
+	})
 	restartedMgr.SetNexusAdapter(nexusclient.NewStub())
 
 	if st := restartedMgr.Status(); st.Enabled || st.PortalHostname != "" {
@@ -507,7 +538,24 @@ func TestRemote_PortalHostnamePersistsAndAppCertQueued(t *testing.T) {
 		t.Fatalf("expected portal certificate to be issued, got status=%q", status)
 	}
 
-	wordpress := "name: wordpress\nimage: docker.io/library/wordpress:6\nlisteners:\n  - name: web\n    guest_port: 80\n    flow: tcp\n    protocol: http\n  - name: \"Web App\"\n    guest_port: 8080\n    flow: tcp\n    protocol: http\n"
+	wordpress := `name: wordpress
+type: user
+listeners:
+  - name: web
+    guest_port: 80
+    flow: tcp
+    protocol: http
+  - name: "Web App"
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+services:
+  main:
+    image: docker.io/library/wordpress:6
+    bind_ports: [80, 8080]
+x-piccolo:
+  mode: service
+`
 	w = httptest.NewRecorder()
 	req, _ = http.NewRequest("POST", "/api/v1/apps", strings.NewReader(wordpress))
 	req.Header.Set("Content-Type", "application/x-yaml")

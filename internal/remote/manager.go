@@ -159,11 +159,16 @@ type Manager struct {
 	challenges    *ChallengeManager
 	acmeMgr       *acme.Manager
 	renewCancel   context.CancelFunc
+	renewDone     chan struct{}
 	issueCancel   context.CancelFunc
+	issueDone     chan struct{}
 	issueCh       chan issuanceJob
 	issueMu       sync.Mutex
 	issueQueued   map[string]struct{}
 	needsReload   atomic.Bool
+	closed        atomic.Bool
+	closeOnce     sync.Once
+	closeErr      error
 	eventsBus     *events.Bus
 	baseDir       string
 }
@@ -211,9 +216,13 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 	m.acmeMgr = acme.NewManager(baseDir, m.challenges, "", os.Getenv("PICCOLO_ACME_DIR_URL"))
 	m.issueCh = make(chan issuanceJob, 32)
 	m.issueQueued = make(map[string]struct{})
+	m.issueDone = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	m.issueCancel = cancel
-	go m.runIssuanceWorker(ctx)
+	go func() {
+		defer close(m.issueDone)
+		m.runIssuanceWorker(ctx)
+	}()
 	if storage != nil {
 		cfg, err := storage.Load(context.Background())
 		if err != nil {
@@ -726,6 +735,9 @@ func (m *Manager) ListCertificates() []Certificate {
 }
 
 func (m *Manager) applyAdapterState() {
+	if m.closed.Load() {
+		return
+	}
 	m.adapterMu.Lock()
 	adapter := m.adapter
 	cancel := m.adapterCancel
@@ -826,12 +838,17 @@ func (m *Manager) stopAdapter() {
 
 // startRenewScheduler starts a background loop to renew certificates when due.
 func (m *Manager) startRenewScheduler() {
-	if m.renewCancel != nil {
+	if m.closed.Load() || m.renewCancel != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.renewCancel = cancel
-	go m.runRenewScheduler(ctx)
+	done := make(chan struct{})
+	m.renewDone = done
+	go func() {
+		defer close(done)
+		m.runRenewScheduler(ctx)
+	}()
 }
 
 func (m *Manager) stopRenewScheduler() {
@@ -1039,12 +1056,53 @@ func (m *Manager) runIssuanceWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case job := <-m.issueCh:
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			m.issueMu.Lock()
 			delete(m.issueQueued, job.id)
 			m.issueMu.Unlock()
 			m.processIssuance(job)
 		}
 	}
+}
+
+// Close stops background goroutines (issuance worker, renew scheduler, nexus adapter).
+// It is safe to call multiple times.
+func (m *Manager) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.closeOnce.Do(func() {
+		m.closed.Store(true)
+		m.stopAdapter()
+		m.stopRenewScheduler()
+		if m.issueCancel != nil {
+			m.issueCancel()
+			m.issueCancel = nil
+		}
+
+		timeout := 5 * time.Second
+		if done := m.renewDone; done != nil {
+			select {
+			case <-done:
+			case <-time.After(timeout):
+				m.closeErr = errors.New("remote: shutdown timeout")
+				return
+			}
+		}
+		if done := m.issueDone; done != nil {
+			select {
+			case <-done:
+			case <-time.After(timeout):
+				m.closeErr = errors.New("remote: shutdown timeout")
+				return
+			}
+		}
+	})
+	return m.closeErr
 }
 
 func (m *Manager) processIssuance(job issuanceJob) {
