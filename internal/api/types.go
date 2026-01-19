@@ -429,7 +429,4 @@ type AuthTemplateContext struct {
 
 	// ClientSecret is the OIDC client secret (only returned once during registration)
 	ClientSecret string
-
-	// CAPath is the path to the internal CA certificate inside the container
-	CAPath string
 }

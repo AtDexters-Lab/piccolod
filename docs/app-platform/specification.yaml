@@ -1,306 +1,257 @@
-# SPECIFICATION.yaml — Piccolo OS App Manifest (design checkpoint)
+# specification.yaml — Piccolo OS app.yaml reference
 #
-# Keep this file valid YAML. Delete sections you do not need; comments are for guidance.
+# This file is:
+# 1) A human-readable reference for the Piccolo App Manifest schema, and
+# 2) Valid YAML you can copy as a starting point.
 #
-# This file is the single source of truth for the *intended* app runtime model:
-# - Every app’s durable bytes live under PICCOLO_STATE_DIR (default: /var/lib/piccolod)
-# - Every app’s durable bytes are encrypted at rest (gocryptfs-style volumes)
-# - Podman container storage is relocated into the app’s encrypted volume so env/config/overlay
-#   never land plaintext on the host outside the Piccolo state dir.
-# - Every app MUST declare its persistence mode via x-piccolo.mode (service | workspace)
+# Conventions:
+# - Fields that must exist in a runnable manifest are marked "REQUIRED".
+# - All examples are safe to delete; the schema only cares about the YAML keys/values.
+# - This documentation is aligned with the parser in `internal/app/parser.go`.
 #
-# REQUIRED FIELDS -------------------------------------------------------------
+# Templating (install-time):
+# - The manifest is rendered as a Go template. You can reference:
+#   - Inputs: {{ .Inputs.<name> }}
+#   - System: {{ .System.Domain }}, {{ .System.Architecture }}
+# - If at least one service declares `oidc_client`, Piccolo also provides:
+#   - {{ .System.Auth.Issuer }}
+#   - {{ .System.Auth.ClientID }}
+#   - {{ .System.Auth.ClientSecret }}
+# - The internal CA is mounted at each service's `oidc_client.ca_mount_path`.
+#
+# RFC references:
+# - Listener auth rules + service-level `oidc_client`: docs/rfc/20260112-listener-auth-rules.md
+#
+# -----------------------------------------------------------------------------
+# Minimal app (service mode)
+#
+# name: blog
+# services:
+#   main:
+#     image: ghost:latest
+#     bind_ports: [2368]
+# listeners:
+#   - name: web
+#     guest_port: 2368
+#     flow: tcp
+#     protocol: http
+# x-piccolo:
+#   mode: service
+#
+# -----------------------------------------------------------------------------
+# Full reference (all fields documented)
+#
 
-name: dev-workspace            # Logical app identifier (dependency graph, UI labels). Keep unique.
+# REQUIRED: App identifier.
+# Constraints:
+# - 1..50 chars
+# - lowercase letters, numbers, and hyphens only
+# - must start with a letter
+# - must end with a letter or number
+# - reserved names not allowed: api, www, admin, root, system, piccolo
+name: example-app
 
-# Services are required for both service and workspace modes.
-services:
-  main:
-    image: ubuntu:22.04        # Required image for the primary container.
-    bind_ports: [8080, 22]     # Required (may be empty if no listeners).
+# Optional: user (default) | system (starts during boot).
+type: user
 
-# INPUTS (Dynamic Configuration) ----------------------------------------------
-# Defines the form schema presented to the user during installation.
-# The backend uses these values to substitute variables in the rest of the file
-# using Go template syntax: {{ .Inputs.variable_name }}
-#
-# System context is available via: {{ .System.Domain }}, {{ .System.Architecture }}
+# Optional: Dynamic configuration collected from the installer UI.
+# Values are available via {{ .Inputs.<name> }}.
 inputs:
   subdomain:
-    type: string               # string | boolean | int | password
+    type: string # string | boolean | int | password
     label: "Subdomain"
-    description: "The address to access this service (e.g., 'dev' -> dev.domain.tld)"
-    default: "dev"             # Backend may override this if the name is taken
+    description: "Used in hostnames and UI (e.g., 'dev' → dev.<domain>)"
+    default: "dev"
     required: true
     validation:
       regex: "^[a-z0-9-]+$"
       message: "Only lowercase letters, numbers, and hyphens allowed."
-
   admin_password:
-    type: password             # UI renders masked input; Backend auto-generates secure default
+    type: password
     label: "Admin Password"
-    generate: true             # Hint to Backend to pre-fill with a strong random string
+    description: "If generate=true, the backend can pre-fill a strong random value."
+    generate: true
     required: true
 
-type: user                     # user (default, starts after unlock) | system (starts during boot)
+# Optional: Which service receives all listener traffic (v1 listeners target the primary service).
+# Defaults to "main".
+# Service mode only: if exactly one service is defined, that service name is also accepted as the default.
+# Workspace mode: set primary_service explicitly if your sole service is not named "main".
+primary_service: main
 
-# AUTHENTICATION --------------------------------------------------------------
-# Apps may optionally declare an auth section to enable Piccolo-managed authentication.
-#
-# Strategies:
-#   - oidc: Native OIDC flow. Piccolo acts as the Identity Provider (IdP).
-#           The app receives dynamically-registered client credentials via templating.
-#           Modern apps (Immich, Nextcloud, Gitea) should use this.
-#   - header: Trusted headers. Piccolo's reverse proxy validates user session and injects:
-#             X-Piccolo-User, X-Piccolo-Email, X-Piccolo-Name
-#           Legacy apps without OIDC support (Vaultwarden, FileBrowser) use this.
-#
-# Injection: Defines how credentials/CA certs are passed to the container.
-#   - ca_mount_path: Override the default CA certificate mount path (internal HTTPS).
-#   - env: Environment variables to inject. Use {{ .System.Auth.* }} for OIDC credentials.
-#
-# Access Control: Piccolo enforces user access via the allowed_apps list on each user account.
-#   - Admin users: Access all apps.
-#   - Standard users: Must be explicitly granted access per-app.
-#
-# Example (OIDC):
-# auth:
-#   strategy: oidc
-#   injection:
-#     ca_mount_path: "/etc/ssl/certs/piccolo-ca.crt"
-#     env:
-#       ISSUER_URL: "{{ .System.Auth.Issuer }}"
-#       CLIENT_ID: "{{ .System.Auth.ClientID }}"
-#       CLIENT_SECRET: "{{ .System.Auth.ClientSecret }}"
-#
-# Example (Trusted Headers):
-# auth:
-#   strategy: header
-#   # No injection needed; Piccolo proxy injects X-Piccolo-* headers automatically.
+# REQUIRED: Container definitions.
+# - `x-piccolo.mode: workspace` MUST define exactly one service.
+# - `x-piccolo.mode: service` MAY define multiple services.
+# - Top-level `image`, `environment`, `storage`, `resources`, and `auth` are deprecated and rejected.
+services:
+  main:
+    # REQUIRED
+    image: ubuntu:22.04
 
-# STATE, ENCRYPTION, AND PERSISTENCE MODEL -----------------------------------
-# Piccolo treats containers as "apps" (closer to VM instances than ephemeral cloud deploys).
-#
-# State root:
-#   - PICCOLO_STATE_DIR (default /var/lib/piccolod) is the only place piccolod may write durable state.
-#
-# Per-app encrypted volume:
-#   - Every app gets an encrypted volume with ID: app-<name>
-#   - Plaintext mount:  $PICCOLO_STATE_DIR/mounts/app-<name>/
-#   - Ciphertext lives under $PICCOLO_STATE_DIR/ciphertext/app-<name>/ (implementation detail)
-#
-# Datasets inside the app volume (high-level intent):
-#   - disk/: "instance disk" — container writable layer + container metadata + container logs.
-#            piccolod configures Podman with:
-#              --root    $PICCOLO_STATE_DIR/mounts/app-<name>/disk/podman
-#              --runroot /run/piccolo/podman/app-<name>   (ephemeral tmpfs runtime state)
-#            Because Podman --root lives inside the encrypted app volume, env secrets are encrypted at rest.
-#   - data/: "user data" — explicitly mounted paths declared under storage.persistent (recommended for service apps).
-#
-# Replication tiers (design intent; implementation evolves over time):
-#   - hot tier: replicated across cluster devices for fast failover (policy-driven per dataset)
-#   - cold tier: erasure-coded federation storage for durability (policy-driven cadence/RPO per dataset)
+    # REQUIRED (may be empty): declare every port this service binds inside the shared network namespace.
+    # If multiple services exist, the primary service MUST include every listener guest_port here.
+    bind_ports: [8080, 22]
+
+    # Optional: start/stop ordering only (not readiness).
+    after: []
+
+    # Optional: environment variables passed to the container.
+    environment:
+      EXAMPLE_ENV: "hello"
+
+    # Optional: storage mounts for durable and temporary data.
+    # Host paths are NOT user-configurable; Piccolo maps these into the per-app encrypted volume.
+    storage:
+      persistent:
+        data:
+          container: /var/lib/example/data
+          size_limit: 50GB # Optional: quota (B, KB, MB, GB, TB)
+      temporary:
+        cache:
+          container: /var/lib/example/cache
+          size_limit: 1GB
+
+    # Optional: resource limits.
+    resources:
+      limits:
+        memory: 1GB
+        cpu: 1.0
+        storage: 10GB
+
+    # Optional: OIDC client injection (RFC 20260112 §4.2).
+    #
+    # When used, Piccolo registers an OIDC client for the app and provides credentials during install-time
+    # templating via {{ .System.Auth.* }}. Only services that declare `oidc_client` receive the secrets.
+    #
+    # Required if any listener auth rule uses strategy: oidc_passthrough.
+    oidc_client:
+      redirect_uris:
+        # Optional: native/desktop redirects (RFC 8252). Only localhost/127.0.0.1/::1 or custom schemes are allowed.
+        - "app.example:///oauth-callback"
+        - "http://localhost:8081/callback"
+      ca_mount_path: /etc/ssl/certs/piccolo-internal-ca.crt # REQUIRED
+      env: # REQUIRED (may be templated)
+        ISSUER_URL: "{{ .System.Auth.Issuer }}"
+        CLIENT_ID: "{{ .System.Auth.ClientID }}"
+        CLIENT_SECRET: "{{ .System.Auth.ClientSecret }}"
+        PICCOLO_CA_PATH: "/etc/ssl/certs/piccolo-internal-ca.crt"
+
+  # Optional additional services (service mode only).
+  worker:
+    image: busybox:1.36
+    bind_ports: [] # REQUIRED even if empty
+    after: [main]
+    environment:
+      WORKER: "1"
 
 # LISTENERS -------------------------------------------------------------------
-# Each listener defines a service Piccolo proxies. piccolod allocates host + proxy ports.
-# Remote access: https://<listener>.<user-domain>[:remote_port].
-# Local portal: http(s)://<portal-host>:<allocated_port>.
-# If remote_ports omitted, Piccolo advertises ports 80 and 443.
+# Listeners are required in service mode. Workspace mode may omit listeners.
+#
+# Each listener defines a public proxy endpoint; piccolod allocates a per-listener public port on the host.
+# - LAN (legacy port-based): http://<host>:<public_port>/...
+# - Remote/WAN: https://<listener>.<remote-base>[:remote_port]/... (published via Nexus)
+#
+# If remote_ports is omitted, Piccolo defaults to [80, 443].
 listeners:
-  - name: "{{ .Inputs.subdomain }}"  # Dynamic substitution from inputs
-    # aliases: []              # Breadcrumb: future release allows extra FQDNs per listener
-    guest_port: 8080           # In-container port to forward
-    flow: tcp                  # tcp = Piccolo terminates TLS; tls = passthrough to the container
-    protocol: http             # Hint for health/metrics (http | websocket | raw | ...). Defaults to raw.
-    remote_ports: [80, 443]    # Optional explicit list of proxy ports for remote publish
-    # protocol_middleware:      # Future extension: ordered middleware pipeline (auth, rate limit, ...)
-    #   - name: enforce_private_auth
+  - name: "{{ .Inputs.subdomain }}"
+    guest_port: 8080
+    flow: tcp # tcp (default) | tls (passthrough; no HTTP visibility)
+    protocol: http # raw (default) | http | websocket
+    remote_ports: [80, 443]
 
-  - name: ssh                   # Additional listener example
+    # Optional: ordered protocol middleware pipeline. Reserved for future use.
+    # protocol_middleware:
+    #   - name: some_middleware
+
+    # Optional: listener auth rules (RFC 20260112 §4.1).
+    # Auth is enforced only when flow: tcp AND protocol: http|websocket.
+    # TLS or raw listeners ignore auth rules entirely.
+    #
+    # - If auth is omitted OR rules is empty: all paths default to "protected".
+    # - Rules evaluate top-to-bottom; first match wins.
+    # - match types:
+    #   - exact: byte-for-byte match
+    #   - prefix: strings.HasPrefix() match; prefix paths MUST end with "/"
+    #   - pattern: Go path.Match(rule.path, requestPath)
+    # - strategies:
+    #   - public: pass-through (no session checks)
+    #   - protected: require Piccolo session + allowed_apps, no identity headers
+    #   - headers: require Piccolo session + allowed_apps, inject X-Piccolo-* identity headers
+    #   - oidc_passthrough: pass-through; app authenticates users via Piccolo OIDC (requires services[].oidc_client)
+    #
+    # Constraints:
+    # - auth rules require flow: tcp AND protocol: http|websocket.
+    auth:
+      rules:
+        - path: "/.well-known/acme-challenge/"
+          type: prefix
+          strategy: public
+        - path: "/admin/"
+          type: prefix
+          strategy: protected
+        - path: "/"
+          type: prefix
+          strategy: oidc_passthrough
+
+  - name: ssh
     guest_port: 22
     flow: tcp
-    protocol: raw              # raw = minimal proxying (default)
+    protocol: raw
     remote_ports: [22]
 
-# STORAGE (data dataset) ------------------------------------------------------
-# storage.persistent declares the *durable user data* mountpoints for this app.
-# For service/workspace apps, storage is defined per-service under services.<name>.storage.
-#
-# Modes:
-#   - service: you MUST enumerate every path that must survive updates/reinstalls under storage.persistent.
-#              Anything not mapped here may be lost when Piccolo performs an automatic update (recreate).
-#   - workspace: everything persists by default via the disk dataset. storage.persistent is optional but recommended
-#                for important data paths (so Piccolo can treat them as "data" for replication cadence/priority).
-#
-# Where data is stored (host paths are NOT user-configurable):
-#   - Each declared volume maps to a directory inside the app’s encrypted volume:
-#       $PICCOLO_STATE_DIR/mounts/app-<name>/data/<volume-name>
-#   - piccolod bind-mounts that directory into the container at volume.container.
-#
-# storage.temporary declares *non-durable* mountpoints:
-#   - Temporary volumes reset on restart and are NOT replicated.
-#   - piccolod mounts these as tmpfs where possible (or as encrypted local scratch when tmpfs is unsuitable).
-# Example (per-service):
-# services:
-#   main:
-#     storage:
-#       persistent:
-#         projects:
-#           container: /workspace/projects
-#           size_limit: 50GB         # Optional quota (accepts B, KB, MB, GB, TB)
-#       temporary:
-#         build-cache:
-#           container: /workspace/build
-#           size_limit: 10GB
+# HEALTH MONITORING ------------------------------------------------------------
+# Optional: Piccolo can probe an HTTP endpoint through a named listener.
+healthcheck:
+  http:
+    path: /health
+    port: "{{ .Inputs.subdomain }}" # Listener name to route the probe through
+    timeout: 30s
+    retries: 3
+
+# APP CONFIG ------------------------------------------------------------------
+# Optional: free-form YAML copied to `/piccolo/config/app.yaml` inside each container.
+app_config:
+  feature_flags:
+    demo_mode: true
 
 # PERMISSIONS -----------------------------------------------------------------
-# Omit to accept Piccolo defaults (internet denied, LAN allowed, root read-only).
+# Optional: omit to accept Piccolo defaults.
 permissions:
   network:
-    internet: allow            # allow | deny
-    local_network: allow       # allow access to LAN services (default: allow)
+    internet: allow # allow | deny
+    local_network: allow
     dns: allow
     allowed_domains:
-      - "github.com"          # Whitelist specific domains when internet: deny
+      - "github.com"
       - "registry.npmjs.org"
   resources:
     max_processes: 200
     max_open_files: 2048
-    privileged: false          # true grants additional Linux capabilities and should be avoided
+    privileged: false
   filesystem:
-    read_only_root: false      # false permits writes to the container root filesystem
-    device_access: deny        # allow | deny access to /dev devices
-
-# ENVIRONMENT -----------------------------------------------------------------
-# Environment variables are defined per-service under services.<name>.environment.
-# Example:
-# services:
-#   main:
-#     environment:
-#       NODE_ENV: development
-#       DATABASE_HOST: postgres.piccolo.local
-
-# RESOURCE LIMITS --------------------------------------------------------------
-# Resource limits are defined per-service under services.<name>.resources.
-# Example:
-# services:
-#   main:
-#     resources:
-#       limits:
-#         memory: 4GB               # Memory limit per container
-#         cpu: 2.0                  # CPU cores (fractional allowed)
-#         storage: 100GB            # Aggregate persistent storage quota (across volumes)
-
-# SERVICES (required for service + workspace modes) ---------------------------
-# All apps define containers under services. Workspace mode must define exactly
-# one service; service mode may define one or more services.
-# The following top-level fields are invalid in both modes:
-#   - image, environment, storage, resources
-#
-# Listeners remain app-level and default to the primary service.
-# primary_service defaults to "main" when omitted (workspace mode uses the sole service).
-#
-# primary_service: web
-# services:
-#   web:
-#     image: docker.io/library/nginx:alpine
-#     bind_ports: [8080]           # Required (may be empty). Shared port namespace contract.
-#     environment:
-#       FOO: bar
-#     storage:
-#       persistent:
-#         content:
-#           container: /usr/share/nginx/html
-#   db:
-#     image: docker.io/library/postgres:16
-#     after: [web]                 # Start/stop ordering only (not readiness)
-#     bind_ports: [5432]
-#     storage:
-#       persistent:
-#         pgdata:
-#           container: /var/lib/postgresql/data
-#
-# Volume sharing: if a persistent volume name is mounted by multiple services, every reference must set shared: true.
-# Example:
-#   services:
-#     web:
-#       storage:
-#         persistent:
-#           cache:
-#             container: /cache
-#             shared: true
-#     worker:
-#       storage:
-#         persistent:
-#           cache:
-#             container: /cache
-#             shared: true
-
-# HEALTH MONITORING ------------------------------------------------------------
-healthcheck:
-  http:
-    path: /health              # HTTP path queried by Piccolo
-    port: web                  # Listener name to route the probe through
-    timeout: 30s
-    retries: 3
-
-# DEPENDENCY GRAPH -------------------------------------------------------------
-# Piccolo does not support inter-app dependencies. Package dependencies as sidecars within a single app.
-
-# APP CONFIG ------------------------------------------------------------------
-# Free-form YAML copied to /piccolo/config/app.yaml inside the container.
-app_config:
-  services:
-    jupyter:
-      enabled: true
-      port: 8888
+    read_only_root: false
+    device_access: deny # allow | deny
 
 # EXTENSIONS ------------------------------------------------------------------
-# Piccolo-specific policies. REQUIRED: you must set x-piccolo.mode for every app.
-#
-# x-piccolo.mode selects the persistence contract:
-#   - service: container root is replaceable; Piccolo may auto-update by recreating the container.
-#              You must map durable paths under storage.persistent.
-#   - workspace: container acts like a roaming "instance"; Piccolo persists disk + data.
-#                Auto-updates are disabled by default because rebasing a mutable instance can be unsafe.
-#
-# x-piccolo.replication controls which datasets participate in hot/cold tiers.
-# If omitted, defaults are derived from x-piccolo.mode.
-#
-# x-piccolo.secrets documents how the app expects secrets to be injected.
-# Env secrets are allowed because Podman storage lives inside the encrypted disk dataset, but file-based secrets are
-# preferred for compatibility and auditability.
-#
-# x-piccolo.runtime.podman.imagestore documents sensitivity policy:
-#   - catalog images may use a non-sensitive shared imagestore (bandwidth/dedupe win)
-#   - custom images must use an encrypted imagestore (images may embed secrets)
+# REQUIRED: you must set `x-piccolo.mode` for every app.
 x-piccolo:
-  mode: workspace              # service | workspace
+  mode: service # service | workspace
   replication:
     hot:
-      datasets: [disk, data]   # hot tier: cluster replication for fast failover
+      datasets: [disk, data]
     cold:
-      datasets: [disk, data]   # cold tier: federation / erasure-coded durability
-      rpo: 15m                 # target max data loss window for cold tier (policy-driven)
-      consistency: crash_consistent  # crash_consistent | quiesced
+      datasets: [disk, data]
+      rpo: 15m
+      consistency: crash_consistent # crash_consistent | quiesced
   tmpfs:
-    # Canonical ephemeral mounts (never persisted/replicated).
     - /tmp
     - /run
     - /var/run
     - /var/tmp
   secrets:
-    # One of: env | files | mixed
-    # - env: secrets are passed via environment variables
-    # - files: secrets are mounted as files under /piccolo/secrets (preferred)
-    # - mixed: env for compatibility, files for long-lived secrets
+    # One of: env | files | mixed (informational; enforcement is implementation-defined).
     injection: mixed
   runtime:
     podman:
-      # podman --root is always inside the encrypted per-app disk dataset:
-      #   $PICCOLO_STATE_DIR/mounts/app-<name>/disk/podman
       imagestore:
-        # Sensitivity classification policy (design intent):
-        # - catalog images (curated store) => non_sensitive
-        # - custom images (user-supplied/build) => sensitive (encrypted)
         policy: catalog_non_sensitive_else_encrypted

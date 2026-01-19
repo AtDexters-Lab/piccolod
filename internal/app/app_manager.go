@@ -2168,16 +2168,6 @@ func (m *AppManager) applyOIDCClientInjection(spec *container.ContainerCreateSpe
 		})
 	}
 
-	// Also mount at the canonical path used by templates to avoid coupling template values to
-	// service-specific mount locations.
-	const canonicalCAPath = "/var/lib/piccolo/certs/internal-ca.crt"
-	if containerPath != "" && containerPath != canonicalCAPath {
-		spec.CAMounts = append(spec.CAMounts, container.CAMount{
-			HostPath:      caHostPath,
-			ContainerPath: canonicalCAPath,
-		})
-	}
-
 	// Only add extra hosts if the container owns its network namespace.
 	// Containers using NetworkMode "container:<id>" share the network namespace
 	// and podman doesn't allow extra hosts in that case.

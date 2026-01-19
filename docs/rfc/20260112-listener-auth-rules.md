@@ -656,7 +656,8 @@ Piccolo guarantees these variables when `oidc_client` is declared:
 - `{{ .System.Auth.Issuer }}` — OIDC issuer URL (e.g., `https://piccolo.local`)
 - `{{ .System.Auth.ClientID }}` — Client ID
 - `{{ .System.Auth.ClientSecret }}` — Client secret
-- `{{ .System.Auth.CAPath }}` — CA cert path inside container
+
+The internal CA certificate is mounted at the service’s `oidc_client.ca_mount_path`.
 
 **Discovery:**
 Apps **SHOULD** use the provided `ISSUER_URL` to fetch the OIDC discovery document (`/.well-known/openid-configuration`) to locate the correct `authorization_endpoint`, `token_endpoint`, and `jwks_uri`.

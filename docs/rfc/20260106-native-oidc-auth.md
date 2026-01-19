@@ -33,8 +33,8 @@ To satisfy OIDC strictness while allowing variable access origins:
         *   `piccolod` uses the `host-gateway` special token supported by Podman/Docker, which is automatically resolved to the correct host IP at container creation time.
         *   This works in both rootful and rootless modes without requiring runtime IP discovery.
     *   **Container Networking:** `piccolod` injects `--add-host piccolo.local:host-gateway` into every app container.
-    *   **Trust:** `piccolod` mounts its internal CA certificate to `/var/lib/piccolo/certs/internal-ca.crt` in every container.
-        *   `app.yaml` templates are updated to set `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, or `REQUESTS_CA_BUNDLE` to this path.
+    *   **Trust:** `piccolod` mounts its internal CA certificate at each service’s `oidc_client.ca_mount_path`.
+        *   `app.yaml` templates should set `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, or `REQUESTS_CA_BUNDLE` to that same path.
 
 3.  **Dynamic Discovery (The "Front-Channel"):**
     `piccolod` serves `/.well-known/openid-configuration`. The content is generated dynamically based on the **Best Reachable Origin**:
