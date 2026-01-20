@@ -1,6 +1,7 @@
 package mdns
 
 import (
+	"errors"
 	"log"
 	"net"
 	"strings"
@@ -201,51 +202,48 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 
 	// Process each question with dual-stack support
 	for _, q := range msg.Question {
-		serviceName := m.currentServiceName()
+		if q.Qclass != dns.ClassINET || !m.matchesAdvertisedName(q.Name) {
+			continue
+		}
 
-		if q.Qclass == dns.ClassINET && strings.EqualFold(q.Name, serviceName+".local.") {
-			// Handle A record requests (IPv4)
-			if (q.Qtype == dns.TypeA || q.Qtype == dns.TypeANY) && state.HasIPv4 && state.IPv4 != nil {
-				rr := &dns.A{
-					Hdr: dns.RR_Header{
-						Name:   q.Name,
-						Rrtype: dns.TypeA,
-						Class:  dns.ClassINET,
-						Ttl:    120,
-					},
-					A: state.IPv4,
-				}
-				response.Answer = append(response.Answer, rr)
-				log.Printf("DEBUG: [%s-%s] Adding A record: %s -> %s",
-					state.Interface.Name, stack, serviceName, state.IPv4.String())
+		// Handle A record requests (IPv4)
+		if (q.Qtype == dns.TypeA || q.Qtype == dns.TypeANY) && state.HasIPv4 && state.IPv4 != nil {
+			rr := &dns.A{
+				Hdr: dns.RR_Header{
+					Name:   q.Name,
+					Rrtype: dns.TypeA,
+					Class:  dns.ClassINET,
+					Ttl:    120,
+				},
+				A: state.IPv4,
 			}
+			response.Answer = append(response.Answer, rr)
+			log.Printf("DEBUG: [%s-%s] Adding A record: %s -> %s",
+				state.Interface.Name, stack, strings.TrimSuffix(q.Name, "."), state.IPv4.String())
+		}
 
-			// Handle AAAA record requests (IPv6)
-			if (q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeANY) && state.HasIPv6 && state.IPv6 != nil {
-				rr := &dns.AAAA{
-					Hdr: dns.RR_Header{
-						Name:   q.Name,
-						Rrtype: dns.TypeAAAA,
-						Class:  dns.ClassINET,
-						Ttl:    120,
-					},
-					AAAA: state.IPv6,
-				}
-				response.Answer = append(response.Answer, rr)
-				log.Printf("DEBUG: [%s-%s] Adding AAAA record: %s -> %s",
-					state.Interface.Name, stack, serviceName, state.IPv6.String())
+		// Handle AAAA record requests (IPv6)
+		if (q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeANY) && state.HasIPv6 && state.IPv6 != nil {
+			rr := &dns.AAAA{
+				Hdr: dns.RR_Header{
+					Name:   q.Name,
+					Rrtype: dns.TypeAAAA,
+					Class:  dns.ClassINET,
+					Ttl:    120,
+				},
+				AAAA: state.IPv6,
 			}
+			response.Answer = append(response.Answer, rr)
+			log.Printf("DEBUG: [%s-%s] Adding AAAA record: %s -> %s",
+				state.Interface.Name, stack, strings.TrimSuffix(q.Name, "."), state.IPv6.String())
 		}
 	}
 
 	// Send response if we have answers
 	if len(response.Answer) > 0 {
-		// Verify name is still current before transmitting
-		currentName := m.currentServiceName()
-		expectedName := currentName + ".local."
-
+		// Verify names are still current before transmitting
 		for _, rr := range response.Answer {
-			if !strings.EqualFold(rr.Header().Name, expectedName) {
+			if !m.matchesAdvertisedName(rr.Header().Name) {
 				// Name changed while we built the response; drop it.
 				return
 			}
@@ -273,8 +271,8 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 					log.Printf("WARN: [%s-%s] Failed to send response to %s: %v",
 						state.Interface.Name, stack, clientAddr.IP, err)
 				} else {
-					log.Printf("DEBUG: [%s-%s] Responded to query from %s for %s.local",
-						state.Interface.Name, stack, clientAddr.IP, currentName)
+					log.Printf("DEBUG: [%s-%s] Responded to query from %s",
+						state.Interface.Name, stack, clientAddr.IP)
 				}
 			}
 		}
@@ -312,30 +310,72 @@ func (m *Manager) announcer() {
 
 // sendMultiInterfaceAnnouncements sends dual-stack mDNS announcements on all active interfaces
 func (m *Manager) sendMultiInterfaceAnnouncements() {
+	m.sendMultiInterfaceAnnouncementsWithTTL(120)
+}
+
+func (m *Manager) sendMultiInterfaceAnnouncementsWithTTL(ttl uint32) {
+	names := m.AdvertisedNames()
+	if len(names) == 0 {
+		return
+	}
+
+	type ifaceSnapshot struct {
+		name     string
+		state    *InterfaceState
+		active   bool
+		hasIPv4  bool
+		hasIPv6  bool
+		ipv4     net.IP
+		ipv6     net.IP
+		ipv4Conn *net.UDPConn
+		ipv6Conn *net.UDPConn
+	}
+
 	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	serviceName := m.finalName
-
+	snapshots := make([]ifaceSnapshot, 0, len(m.interfaces))
 	for name, state := range m.interfaces {
-		if !state.Active {
+		if state == nil {
 			continue
 		}
-
-		// Send IPv4 announcements
-		if state.HasIPv4 && state.IPv4Conn != nil && state.IPv4 != nil {
-			m.sendIPv4Announcement(name, state, serviceName)
+		snap := ifaceSnapshot{
+			name:     name,
+			state:    state,
+			active:   state.Active,
+			hasIPv4:  state.HasIPv4,
+			hasIPv6:  state.HasIPv6,
+			ipv4Conn: state.IPv4Conn,
+			ipv6Conn: state.IPv6Conn,
 		}
+		if state.IPv4 != nil {
+			snap.ipv4 = append(net.IP(nil), state.IPv4...)
+		}
+		if state.IPv6 != nil {
+			snap.ipv6 = append(net.IP(nil), state.IPv6...)
+		}
+		snapshots = append(snapshots, snap)
+	}
+	m.mutex.RUnlock()
 
-		// Send IPv6 announcements
-		if state.HasIPv6 && state.IPv6Conn != nil && state.IPv6 != nil {
-			m.sendIPv6Announcement(name, state, serviceName)
+	for _, snap := range snapshots {
+		if !snap.active {
+			continue
+		}
+		for _, fqdn := range names {
+			// Send IPv4 announcements
+			if snap.hasIPv4 && snap.ipv4Conn != nil && snap.ipv4 != nil {
+				m.sendIPv4Announcement(snap.name, snap.state, snap.ipv4Conn, snap.ipv4, fqdn, ttl)
+			}
+
+			// Send IPv6 announcements
+			if snap.hasIPv6 && snap.ipv6Conn != nil && snap.ipv6 != nil {
+				m.sendIPv6Announcement(snap.name, snap.state, snap.ipv6Conn, snap.ipv6, fqdn, ttl)
+			}
 		}
 	}
 }
 
 // sendIPv4Announcement sends IPv4 mDNS announcement
-func (m *Manager) sendIPv4Announcement(name string, state *InterfaceState, serviceName string) {
+func (m *Manager) sendIPv4Announcement(name string, state *InterfaceState, conn *net.UDPConn, ip net.IP, fqdn string, ttl uint32) {
 	msg := &dns.Msg{}
 	msg.Response = true
 	msg.Authoritative = true
@@ -343,12 +383,12 @@ func (m *Manager) sendIPv4Announcement(name string, state *InterfaceState, servi
 
 	rr := &dns.A{
 		Hdr: dns.RR_Header{
-			Name:   serviceName + ".local.",
+			Name:   fqdn,
 			Rrtype: dns.TypeA,
 			Class:  dns.ClassINET,
-			Ttl:    120,
+			Ttl:    ttl,
 		},
-		A: state.IPv4,
+		A: ip,
 	}
 	msg.Answer = append(msg.Answer, rr)
 
@@ -358,18 +398,18 @@ func (m *Manager) sendIPv4Announcement(name string, state *InterfaceState, servi
 			Port: 5353,
 		}
 
-		if _, err := state.IPv4Conn.WriteToUDP(data, multicastAddr); err == nil {
-			log.Printf("DEBUG: [%s-IPv4] Announced %s.local -> %s",
-				name, serviceName, state.IPv4.String())
+		if _, err := conn.WriteToUDP(data, multicastAddr); err == nil {
+			log.Printf("DEBUG: [%s-IPv4] Announced %s -> %s",
+				name, strings.TrimSuffix(fqdn, "."), ip.String())
 		} else {
 			log.Printf("WARN: Failed to send IPv4 announcement on %s: %v", name, err)
-			m.markInterfaceFailure(state, err)
+			m.markInterfaceFailureSnapshot(name, state, err)
 		}
 	}
 }
 
 // sendIPv6Announcement sends IPv6 mDNS announcement
-func (m *Manager) sendIPv6Announcement(name string, state *InterfaceState, serviceName string) {
+func (m *Manager) sendIPv6Announcement(name string, state *InterfaceState, conn *net.UDPConn, ip net.IP, fqdn string, ttl uint32) {
 	msg := &dns.Msg{}
 	msg.Response = true
 	msg.Authoritative = true
@@ -377,12 +417,12 @@ func (m *Manager) sendIPv6Announcement(name string, state *InterfaceState, servi
 
 	rr := &dns.AAAA{
 		Hdr: dns.RR_Header{
-			Name:   serviceName + ".local.",
+			Name:   fqdn,
 			Rrtype: dns.TypeAAAA,
 			Class:  dns.ClassINET,
-			Ttl:    120,
+			Ttl:    ttl,
 		},
-		AAAA: state.IPv6,
+		AAAA: ip,
 	}
 	msg.Answer = append(msg.Answer, rr)
 
@@ -392,12 +432,31 @@ func (m *Manager) sendIPv6Announcement(name string, state *InterfaceState, servi
 			Port: 5353,
 		}
 
-		if _, err := state.IPv6Conn.WriteToUDP(data, multicastAddr); err == nil {
-			log.Printf("DEBUG: [%s-IPv6] Announced %s.local -> %s",
-				name, serviceName, state.IPv6.String())
+		if _, err := conn.WriteToUDP(data, multicastAddr); err == nil {
+			log.Printf("DEBUG: [%s-IPv6] Announced %s -> %s",
+				name, strings.TrimSuffix(fqdn, "."), ip.String())
 		} else {
 			log.Printf("WARN: Failed to send IPv6 announcement on %s: %v", name, err)
-			m.markInterfaceFailure(state, err)
+			m.markInterfaceFailureSnapshot(name, state, err)
 		}
 	}
+}
+
+func (m *Manager) markInterfaceFailureSnapshot(name string, state *InterfaceState, err error) {
+	if state == nil || err == nil {
+		return
+	}
+	if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+		return
+	}
+	if m.stopped.Load() {
+		return
+	}
+	m.mutex.RLock()
+	current := m.interfaces[name]
+	m.mutex.RUnlock()
+	if current != state {
+		return
+	}
+	m.markInterfaceFailure(state, err)
 }

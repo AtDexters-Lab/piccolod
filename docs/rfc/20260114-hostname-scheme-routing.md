@@ -182,4 +182,5 @@ mDNS is not universally reliable. Piccolo MUST retain a port-based fallback for 
 ## 10. Implementation Notes & Status
 
 - **Status:** Draft
-- **Notes:** TBD (add PR/commit references and follow-ups as work lands)
+- **Notes:**
+  - 2026-01-20: mDNS manager supports dynamic alias labels and multi-name announcements; wiring to app/service registry pending.

@@ -10,9 +10,12 @@ import (
 	"time"
 )
 
+const defaultBaseName = "piccolo"
+
 // NewManager creates a new mDNS manager
 func NewManager() *Manager {
 	machineID := getMachineID()
+	baseName := sanitizeBaseName(defaultBaseName)
 
 	// Initialize security configuration with safe defaults
 	securityConfig := &SecurityConfig{
@@ -41,12 +44,13 @@ func NewManager() *Manager {
 
 	manager := &Manager{
 		interfaces: make(map[string]*InterfaceState),
-		hostname:   "piccolo",
+		hostname:   baseName,
 		port:       80,
 		stopCh:     make(chan struct{}),
-		baseName:   "piccolo",
+		baseName:   baseName,
 		machineID:  machineID,
-		finalName:  "piccolo", // Will be updated if conflicts detected
+		finalName:  baseName, // Will be updated if conflicts detected
+		names:      newNameRegistry(baseName),
 
 		// Security components
 		rateLimiter: &RateLimiter{
@@ -81,12 +85,28 @@ func NewManager() *Manager {
 
 // Start begins advertising the service via mDNS
 func (m *Manager) Start() error {
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+
+	if m.started.Load() {
+		return fmt.Errorf("mdns manager already started")
+	}
+	if m.stopped.Load() {
+		return fmt.Errorf("mdns manager already stopped")
+	}
+
 	log.Printf("INFO: Starting multi-interface mDNS manager (machine ID: %s)", m.machineID)
 
 	// Discover and setup all network interfaces
 	if err := m.discoverInterfaces(); err != nil {
 		return fmt.Errorf("failed to discover network interfaces: %w", err)
 	}
+
+	if m.stopped.Load() {
+		return fmt.Errorf("mdns manager stopped during startup")
+	}
+
+	m.started.Store(true)
 
 	// Start network monitor for interface changes
 	m.wg.Add(1)
@@ -136,11 +156,18 @@ func (m *Manager) Start() error {
 
 // Stop shuts down the mDNS server
 func (m *Manager) Stop() error {
-	close(m.stopCh)
+	m.stopOnce.Do(func() {
+		if m.started.Load() {
+			m.sendMultiInterfaceAnnouncementsWithTTL(0)
+		}
+		close(m.stopCh)
+		m.stopped.Store(true)
+	})
 
 	// Close all interface connections
 	m.mutex.Lock()
 	for name, state := range m.interfaces {
+		state.Active = false
 		if state.IPv4Conn != nil {
 			state.IPv4Conn.Close()
 			log.Printf("INFO: Closed IPv4 connection for interface %s", name)
@@ -154,6 +181,7 @@ func (m *Manager) Stop() error {
 
 	// Wait for all goroutines to finish
 	m.wg.Wait()
+	m.started.Store(false)
 
 	log.Printf("INFO: Multi-interface mDNS manager stopped")
 	return nil
@@ -227,14 +255,83 @@ func getMachineIDFromHostname() string {
 
 // currentServiceName returns the currently advertised service name.
 func (m *Manager) currentServiceName() string {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-	return m.finalName
+	if m.names == nil {
+		m.mutex.RLock()
+		defer m.mutex.RUnlock()
+		return m.finalName
+	}
+	return m.names.BaseName()
 }
 
 // Hostname returns the full mDNS hostname (e.g., "piccolo.local" or "piccolo-abc123.local").
 func (m *Manager) Hostname() string {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-	return m.finalName + ".local"
+	if m.names == nil {
+		m.mutex.RLock()
+		defer m.mutex.RUnlock()
+		return m.finalName + ".local"
+	}
+	return m.names.Hostname()
+}
+
+// AdvertisedNames returns the list of currently advertised FQDNs (with trailing dot).
+func (m *Manager) AdvertisedNames() []string {
+	if m.names == nil {
+		return []string{m.currentServiceName() + ".local."}
+	}
+	return m.names.Names()
+}
+
+// HostAliases returns the current alias labels (without the base domain).
+func (m *Manager) HostAliases() []string {
+	if m.names == nil {
+		return nil
+	}
+	return m.names.AliasLabels()
+}
+
+func (m *Manager) matchesAdvertisedName(name string) bool {
+	if m.names == nil {
+		expected := normalizeFQDN(m.currentServiceName() + ".local.")
+		return normalizeFQDN(name) == expected
+	}
+	return m.names.MatchName(name)
+}
+
+// SetHostAliases replaces the set of alias labels to advertise (e.g., "immich", "metrics-immich").
+// Invalid labels are ignored; if any are present, an error is returned.
+func (m *Manager) SetHostAliases(labels []string) error {
+	if m.names == nil {
+		return fmt.Errorf("name registry not initialized")
+	}
+
+	valid, invalid := normalizeLabels(labels)
+	m.names.SetAliases(valid)
+
+	if len(invalid) > 0 {
+		log.Printf("WARN: Ignored invalid mDNS alias labels: %s", strings.Join(invalid, ", "))
+		if m.started.Load() {
+			m.sendMultiInterfaceAnnouncements()
+		}
+		return fmt.Errorf("invalid mDNS alias labels: %s", strings.Join(invalid, ", "))
+	}
+
+	if m.started.Load() {
+		m.sendMultiInterfaceAnnouncements()
+	}
+	return nil
+}
+
+func sanitizeBaseName(name string) string {
+	normalized, err := normalizeLabel(name)
+	if err != nil {
+		return defaultBaseName
+	}
+	return normalized
+}
+
+func (m *Manager) setFinalNameLocked(name string) {
+	m.finalName = name
+	if m.names != nil {
+		m.names.SetBaseName(name)
+	}
 }

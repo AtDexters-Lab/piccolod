@@ -264,16 +264,7 @@ func TestIPv6LinkLocal_mDNSCompliance(t *testing.T) {
 	}
 
 	t.Cleanup(func() {
-		close(manager.stopCh)
-		manager.wg.Wait()
-		for _, state := range manager.interfaces {
-			if state.IPv4Conn != nil {
-				state.IPv4Conn.Close()
-			}
-			if state.IPv6Conn != nil {
-				state.IPv6Conn.Close()
-			}
-		}
+		_ = manager.Stop()
 	})
 
 	if err := manager.discoverInterfaces(); err != nil {

@@ -17,7 +17,7 @@ func (m *Manager) detectNameConflicts() bool {
 	defer m.mutex.RUnlock()
 
 	conflictFound := false
-	serviceName := m.finalName
+	serviceName := m.currentServiceName()
 
 	// Send probes on all active interfaces
 	for _, state := range m.interfaces {
@@ -88,7 +88,7 @@ func (m *Manager) sendConflictProbe(state *InterfaceState, stack, hostname strin
 func (m *Manager) handleConflictDetection(msg *dns.Msg, clientAddr *net.UDPAddr) {
 	// Check if this is a response to our hostname query
 	for _, answer := range msg.Answer {
-		serviceName := m.currentServiceName()
+	serviceName := m.currentServiceName()
 
 		if !strings.EqualFold(answer.Header().Name, serviceName+".local.") {
 			continue
@@ -186,7 +186,7 @@ func (m *Manager) resolveNameConflict() {
 
 	// Update to deterministic name
 	oldName := m.finalName
-	m.finalName = newName
+	m.setFinalNameLocked(newName)
 	m.conflictDetector.CurrentSuffix = m.machineID
 
 	log.Printf("CONFLICT: Resolved conflict - renamed from %s.local to %s.local", oldName, m.finalName)

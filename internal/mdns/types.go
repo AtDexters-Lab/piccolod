@@ -3,6 +3,7 @@ package mdns
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -133,11 +134,16 @@ type Manager struct {
 	port     int
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
+	startMu  sync.Mutex
+	stopOnce sync.Once
+	started  atomic.Bool
+	stopped  atomic.Bool
 
 	// Deterministic naming support
 	baseName  string
 	machineID string
 	finalName string
+	names     *NameRegistry
 
 	// Security components
 	rateLimiter     *RateLimiter
