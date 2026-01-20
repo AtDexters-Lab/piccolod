@@ -11,12 +11,14 @@ import (
 	"github.com/miekg/dns"
 )
 
-// detectNameConflicts probes the network for existing instances of our hostname
-func (m *Manager) detectNameConflicts() bool {
+// sendConflictProbes sends probe queries on all interfaces to trigger responses
+// from any devices already using our hostname. Actual conflict detection happens
+// asynchronously via handleConflictDetection() in the responder goroutines,
+// which sets the ConflictDetected flag when a conflicting response is received.
+func (m *Manager) sendConflictProbes() {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	conflictFound := false
 	serviceName := m.currentServiceName()
 
 	// Send probes on all active interfaces
@@ -27,23 +29,19 @@ func (m *Manager) detectNameConflicts() bool {
 
 		// Probe both IPv4 and IPv6 if available
 		if state.HasIPv4 && state.IPv4Conn != nil {
-			if m.sendConflictProbe(state, "IPv4", serviceName+".local.") {
-				conflictFound = true
-			}
+			m.sendConflictProbe(state, "IPv4", serviceName+".local.")
 		}
 
 		if state.HasIPv6 && state.IPv6Conn != nil {
-			if m.sendConflictProbe(state, "IPv6", serviceName+".local.") {
-				conflictFound = true
-			}
+			m.sendConflictProbe(state, "IPv6", serviceName+".local.")
 		}
 	}
-
-	return conflictFound
 }
 
-// sendConflictProbe sends a DNS query to detect name conflicts
-func (m *Manager) sendConflictProbe(state *InterfaceState, stack, hostname string) bool {
+// sendConflictProbe sends a probe query to the multicast group. This triggers
+// any device already using the hostname to respond. The response is received
+// by our responder goroutines and processed by handleConflictDetection().
+func (m *Manager) sendConflictProbe(state *InterfaceState, stack, hostname string) {
 	// Create probe query
 	msg := &dns.Msg{}
 	msg.SetQuestion(hostname, dns.TypeANY)
@@ -52,7 +50,7 @@ func (m *Manager) sendConflictProbe(state *InterfaceState, stack, hostname strin
 	data, err := msg.Pack()
 	if err != nil {
 		log.Printf("CONFLICT: Failed to pack probe query: %v", err)
-		return false
+		return
 	}
 
 	var multicastAddr *net.UDPAddr
@@ -67,29 +65,26 @@ func (m *Manager) sendConflictProbe(state *InterfaceState, stack, hostname strin
 	}
 
 	if conn == nil {
-		return false
+		return
 	}
 
 	// Send probe query
 	if _, err := conn.WriteToUDP(data, multicastAddr); err != nil {
 		log.Printf("CONFLICT: Failed to send probe on %s-%s: %v", state.Interface.Name, stack, err)
-		return false
+		return
 	}
 
-	// Wait briefly for responses (this is a simplified approach)
-	// In production, this should be handled asynchronously
-	time.Sleep(1000 * time.Millisecond)
-
 	log.Printf("DEBUG: [%s-%s] Sent conflict probe for %s", state.Interface.Name, stack, hostname)
-	return false // TODO: Implement response detection
+
+	// Allow time for responses to arrive and be processed by handleConflictDetection()
+	time.Sleep(1000 * time.Millisecond)
 }
 
 // handleConflictDetection processes responses that might indicate conflicts
 func (m *Manager) handleConflictDetection(msg *dns.Msg, clientAddr *net.UDPAddr) {
 	// Check if this is a response to our hostname query
-	for _, answer := range msg.Answer {
 	serviceName := m.currentServiceName()
-
+	for _, answer := range msg.Answer {
 		if !strings.EqualFold(answer.Header().Name, serviceName+".local.") {
 			continue
 		}
@@ -213,24 +208,26 @@ func (m *Manager) resolveNameConflict() {
 	m.conflictDetector.ConflictingSources = make(map[string]ConflictingHost)
 }
 
-// probeNameAvailability performs initial conflict detection during startup
+// probeNameAvailability performs initial conflict detection during startup.
+// It sends probe queries and waits for the responder goroutines to detect
+// any conflicting responses via handleConflictDetection().
 func (m *Manager) probeNameAvailability() error {
 	initialName := m.currentServiceName()
 	log.Printf("CONFLICT: Probing name availability for %s.local", initialName)
 
-	// Send probes and wait for responses
-	if m.detectNameConflicts() {
-		log.Printf("CONFLICT: Name conflict detected during startup")
-		m.resolveNameConflict()
-	}
+	// Send probes on all interfaces. Responses are processed asynchronously
+	// by handleConflictDetection() which sets ConflictDetected if needed.
+	m.sendConflictProbes()
 
-	// Always wait a bit for any late responses
+	// Allow additional time for late responses to arrive
 	time.Sleep(time.Second)
 
+	// Check if any conflicts were detected during probing
 	m.conflictDetector.mutex.RLock()
 	conflictDetected := m.conflictDetector.ConflictDetected
 	m.conflictDetector.mutex.RUnlock()
 
+	// If conflict was detected, resolution already happened in handleConflictDetection()
 	finalName := m.currentServiceName()
 
 	if conflictDetected {
@@ -242,11 +239,12 @@ func (m *Manager) probeNameAvailability() error {
 	return nil
 }
 
-// conflictMonitor periodically checks for name conflicts
+// conflictMonitor periodically sends probe queries to detect name conflicts.
+// This supplements the passive conflict detection in handleConflictDetection().
 func (m *Manager) conflictMonitor() {
 	defer m.wg.Done()
 
-	ticker := time.NewTicker(5 * time.Minute) // Check every 5 minutes
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -254,9 +252,7 @@ func (m *Manager) conflictMonitor() {
 		case <-m.stopCh:
 			return
 		case <-ticker.C:
-			if m.detectNameConflicts() {
-				log.Printf("CONFLICT: Periodic conflict check detected issues")
-			}
+			m.sendConflictProbes()
 			m.conflictDetector.mutex.Lock()
 			m.conflictDetector.LastConflictCheck = time.Now()
 			m.conflictDetector.mutex.Unlock()

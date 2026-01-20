@@ -38,39 +38,18 @@ type InterfaceState struct {
 	resilienceMu     sync.RWMutex
 }
 
-// RateLimiter tracks query rates per client IP
-type RateLimiter struct {
-	clients map[string]*ClientState
-	mutex   sync.RWMutex
-}
-
-// ClientState tracks per-client security metrics
-type ClientState struct {
-	IP           string
-	QueryCount   uint64
-	LastQuery    time.Time
-	Blocked      bool
-	BlockedUntil time.Time
-}
-
 // SecurityConfig defines security limits and thresholds
 type SecurityConfig struct {
-	MaxQueriesPerSecond  int
-	MaxQueriesPerMinute  int
 	MaxPacketSize        int
 	MaxResponseSize      int
 	MaxConcurrentQueries int
 	QueryTimeout         time.Duration
-	ClientBlockDuration  time.Duration
-	CleanupInterval      time.Duration
 }
 
 // SecurityMetrics tracks overall security statistics
 type SecurityMetrics struct {
 	TotalQueries     uint64
-	BlockedQueries   uint64
 	MalformedPackets uint64
-	RateLimitHits    uint64
 	LargePackets     uint64
 }
 
@@ -146,7 +125,6 @@ type Manager struct {
 	names     *NameRegistry
 
 	// Security components
-	rateLimiter     *RateLimiter
 	securityConfig  *SecurityConfig
 	securityMetrics *SecurityMetrics
 	queryProcessor  *QueryProcessor

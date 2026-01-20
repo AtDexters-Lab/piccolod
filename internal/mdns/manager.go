@@ -19,14 +19,10 @@ func NewManager() *Manager {
 
 	// Initialize security configuration with safe defaults
 	securityConfig := &SecurityConfig{
-		MaxQueriesPerSecond:  10,   // Max 10 queries per second per client
-		MaxQueriesPerMinute:  100,  // Max 100 queries per minute per client
 		MaxPacketSize:        1500, // Standard MTU limit
 		MaxResponseSize:      512,  // DNS standard response limit
 		MaxConcurrentQueries: 50,   // Max concurrent query processing
 		QueryTimeout:         time.Second * 2,
-		ClientBlockDuration:  time.Minute * 5,
-		CleanupInterval:      time.Minute * 5,
 	}
 
 	// Initialize resilience configuration with recovery defaults
@@ -53,9 +49,6 @@ func NewManager() *Manager {
 		names:      newNameRegistry(baseName),
 
 		// Security components
-		rateLimiter: &RateLimiter{
-			clients: make(map[string]*ClientState),
-		},
 		securityConfig:  securityConfig,
 		securityMetrics: &SecurityMetrics{},
 		queryProcessor: &QueryProcessor{
@@ -116,10 +109,6 @@ func (m *Manager) Start() error {
 	m.wg.Add(1)
 	go m.announcer()
 
-	// Start security cleanup routine
-	m.wg.Add(1)
-	go m.cleanupSecurityState()
-
 	// Start health monitoring routine
 	m.wg.Add(1)
 	go m.healthMonitorLoop()
@@ -147,8 +136,8 @@ func (m *Manager) Start() error {
 
 		log.Printf("INFO: Secured dual-stack mDNS server started - advertising %s.local on %d interfaces",
 			serviceName, interfaceCount)
-		log.Printf("INFO: Security limits - %d queries/sec, %d concurrent, %d packet size",
-			m.securityConfig.MaxQueriesPerSecond, m.securityConfig.MaxConcurrentQueries, m.securityConfig.MaxPacketSize)
+		log.Printf("INFO: Security limits - %d concurrent queries, %d max packet size",
+			m.securityConfig.MaxConcurrentQueries, m.securityConfig.MaxPacketSize)
 	}()
 
 	return nil

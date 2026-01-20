@@ -1,33 +1,39 @@
 package mdns
 
 import (
+	"net"
 	"sync/atomic"
 	"testing"
-	"time"
+
+	"github.com/miekg/dns"
 )
 
-func TestBug6_SecurityMetricsNotUpdated(t *testing.T) {
-	t.Log("=== TESTING Bug #6: Security Metrics Not Updated ===")
+func TestSecurityMetrics_TotalQueries(t *testing.T) {
+	t.Log("=== TESTING Security Metrics: Total Queries ===")
 
 	manager := NewManager()
+	state := createMockInterfaceState("eth0", true, false)
+	manager.interfaces["eth0"] = state
 
 	// Check initial metrics
 	initialTotal := atomic.LoadUint64(&manager.securityMetrics.TotalQueries)
 	t.Logf("Initial TotalQueries: %d", initialTotal)
 
-	// Simulate queries from different clients
-	testIPs := []string{
-		"192.168.1.100",
-		"192.168.1.101",
-		"192.168.1.102",
+	// Create a valid mDNS query
+	msg := dns.Msg{}
+	msg.SetQuestion(manager.finalName+".local.", dns.TypeA)
+
+	data, err := msg.Pack()
+	if err != nil {
+		t.Fatalf("failed to pack DNS query: %v", err)
 	}
 
-	queryCount := 0
-	for _, ip := range testIPs {
-		for i := 0; i < 5; i++ {
-			manager.isRateLimited(ip)
-			queryCount++
-		}
+	clientAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 50)}
+
+	// Process a few queries
+	queryCount := 5
+	for i := 0; i < queryCount; i++ {
+		manager.handleDualStackQuery(data, clientAddr, state, "IPv4")
 	}
 
 	// Check metrics after queries
@@ -35,169 +41,126 @@ func TestBug6_SecurityMetricsNotUpdated(t *testing.T) {
 	t.Logf("After %d queries - TotalQueries: %d", queryCount, finalTotal)
 
 	if finalTotal == initialTotal {
-		t.Error("BUG CONFIRMED: TotalQueries counter is not being incremented")
-		t.Error("ISSUE: isRateLimited() processes queries but doesn't update TotalQueries metric")
-		integrationBugs.Add("Security metrics not tracking total queries - TotalQueries always 0")
+		t.Error("BUG: TotalQueries counter is not being incremented")
+	} else if finalTotal < initialTotal+uint64(queryCount) {
+		t.Errorf("TotalQueries lower than expected: got %d, expected at least %d",
+			finalTotal, initialTotal+uint64(queryCount))
 	} else {
 		t.Log("SUCCESS: TotalQueries counter is being updated")
 	}
-
-	// Expected: TotalQueries should equal the number of calls to isRateLimited()
-	if finalTotal != uint64(queryCount) {
-		t.Errorf("TotalQueries mismatch: got %d, expected %d", finalTotal, queryCount)
-	}
 }
 
-func TestBug6_AllSecurityMetrics(t *testing.T) {
-	t.Log("=== TESTING All Security Metrics ===")
+func TestSecurityMetrics_MalformedPackets(t *testing.T) {
+	t.Log("=== TESTING Security Metrics: Malformed Packets ===")
 
 	manager := NewManager()
-	attackerIP := "10.0.0.1"
 
-	// Track metrics before
-	initialMetrics := struct {
-		total   uint64
-		blocked uint64
-		hits    uint64
-	}{
-		total:   atomic.LoadUint64(&manager.securityMetrics.TotalQueries),
-		blocked: atomic.LoadUint64(&manager.securityMetrics.BlockedQueries),
-		hits:    atomic.LoadUint64(&manager.securityMetrics.RateLimitHits),
+	initialMalformed := atomic.LoadUint64(&manager.securityMetrics.MalformedPackets)
+
+	// Test with packet that's too small
+	smallPacket := make([]byte, 5)
+	err := manager.validatePacket(smallPacket)
+	if err == nil {
+		t.Error("Expected error for small packet")
 	}
 
-	t.Logf("Initial metrics - Total: %d, Blocked: %d, Hits: %d",
-		initialMetrics.total, initialMetrics.blocked, initialMetrics.hits)
+	finalMalformed := atomic.LoadUint64(&manager.securityMetrics.MalformedPackets)
 
-	// Generate enough queries to trigger rate limiting
-	queriesGenerated := 0
-	for i := 0; i < 20; i++ {
-		isLimited := manager.isRateLimited(attackerIP)
-		queriesGenerated++
-
-		if isLimited {
-			t.Logf("Query %d: Rate limited", i+1)
-		}
-
-		// Small delay to avoid hitting per-second limits too quickly
-		time.Sleep(time.Millisecond * 10)
-	}
-
-	// Check final metrics
-	finalMetrics := struct {
-		total   uint64
-		blocked uint64
-		hits    uint64
-	}{
-		total:   atomic.LoadUint64(&manager.securityMetrics.TotalQueries),
-		blocked: atomic.LoadUint64(&manager.securityMetrics.BlockedQueries),
-		hits:    atomic.LoadUint64(&manager.securityMetrics.RateLimitHits),
-	}
-
-	t.Logf("Final metrics - Total: %d, Blocked: %d, Hits: %d",
-		finalMetrics.total, finalMetrics.blocked, finalMetrics.hits)
-
-	// Test TotalQueries
-	if finalMetrics.total == initialMetrics.total {
-		t.Error("BUG: TotalQueries not incremented despite processing queries")
-	} else if finalMetrics.total != initialMetrics.total+uint64(queriesGenerated) {
-		t.Errorf("TotalQueries incorrect: got %d, expected %d",
-			finalMetrics.total, initialMetrics.total+uint64(queriesGenerated))
+	if finalMalformed <= initialMalformed {
+		t.Error("MalformedPackets metric not incremented for small packet")
 	} else {
-		t.Log("SUCCESS: TotalQueries tracking correctly")
-	}
-
-	// Test other metrics - these should work if rate limiting occurred
-	if finalMetrics.hits > initialMetrics.hits {
-		t.Log("SUCCESS: RateLimitHits metric working")
-	}
-
-	if finalMetrics.blocked > initialMetrics.blocked {
-		t.Log("SUCCESS: BlockedQueries metric working")
+		t.Log("SUCCESS: MalformedPackets metric working correctly")
 	}
 }
 
-func TestBug6_MetricsConsistency(t *testing.T) {
+func TestSecurityMetrics_LargePackets(t *testing.T) {
+	t.Log("=== TESTING Security Metrics: Large Packets ===")
+
+	manager := NewManager()
+
+	initialLarge := atomic.LoadUint64(&manager.securityMetrics.LargePackets)
+
+	// Test with packet that's too large
+	largePacket := make([]byte, manager.securityConfig.MaxPacketSize+100)
+	err := manager.validatePacket(largePacket)
+	if err == nil {
+		t.Error("Expected error for large packet")
+	}
+
+	finalLarge := atomic.LoadUint64(&manager.securityMetrics.LargePackets)
+
+	if finalLarge <= initialLarge {
+		t.Error("LargePackets metric not incremented for oversized packet")
+	} else {
+		t.Log("SUCCESS: LargePackets metric working correctly")
+	}
+}
+
+func TestSecurityMetrics_AllMetricsConsistency(t *testing.T) {
 	t.Log("=== TESTING Security Metrics Consistency ===")
 
 	manager := NewManager()
 
-	// Normal queries (should not be blocked)
-	normalClient := "192.168.1.50"
-	for i := 0; i < 5; i++ {
-		manager.isRateLimited(normalClient)
-		time.Sleep(time.Second) // Wait between queries to avoid rate limiting
-	}
+	// Trigger each type of metric
+	// 1. Large packet
+	largePacket := make([]byte, manager.securityConfig.MaxPacketSize+100)
+	manager.validatePacket(largePacket)
 
-	// Rapid queries (should trigger rate limiting)
-	rapidClient := "192.168.1.51"
-	for i := 0; i < 15; i++ {
-		manager.isRateLimited(rapidClient)
-		// No delay - rapid fire
-	}
+	// 2. Small/malformed packet
+	smallPacket := make([]byte, 5)
+	manager.validatePacket(smallPacket)
 
+	// Get all metrics
 	totalQueries := atomic.LoadUint64(&manager.securityMetrics.TotalQueries)
-	blockedQueries := atomic.LoadUint64(&manager.securityMetrics.BlockedQueries)
-	rateLimitHits := atomic.LoadUint64(&manager.securityMetrics.RateLimitHits)
+	malformedPackets := atomic.LoadUint64(&manager.securityMetrics.MalformedPackets)
+	largePackets := atomic.LoadUint64(&manager.securityMetrics.LargePackets)
 
 	t.Logf("Metrics after mixed workload:")
 	t.Logf("  TotalQueries: %d", totalQueries)
-	t.Logf("  BlockedQueries: %d", blockedQueries)
-	t.Logf("  RateLimitHits: %d", rateLimitHits)
+	t.Logf("  MalformedPackets: %d", malformedPackets)
+	t.Logf("  LargePackets: %d", largePackets)
 
-	// Logical consistency checks
-	if totalQueries == 0 {
-		t.Error("BUG: TotalQueries should be > 0 after processing queries")
+	// Each packet rejection should have incremented TotalQueries
+	if totalQueries < 2 {
+		t.Errorf("TotalQueries should be at least 2 (for the two validation failures), got %d", totalQueries)
 	}
 
-	if totalQueries != 20 { // 5 normal + 15 rapid
-		t.Errorf("TotalQueries should be 20, got %d", totalQueries)
+	if malformedPackets == 0 {
+		t.Error("MalformedPackets should be > 0")
 	}
 
-	// BlockedQueries should be <= TotalQueries
-	if blockedQueries > totalQueries {
-		t.Error("INCONSISTENCY: BlockedQueries cannot exceed TotalQueries")
-	}
-
-	// If we had rate limiting, RateLimitHits should be > 0
-	if rateLimitHits == 0 && blockedQueries > 0 {
-		t.Error("INCONSISTENCY: RateLimitHits should be > 0 if queries were blocked")
+	if largePackets == 0 {
+		t.Error("LargePackets should be > 0")
 	}
 }
 
-func TestBug6_RealWorldScenario(t *testing.T) {
-	t.Log("=== TESTING Real-World Security Metrics Scenario ===")
+func TestSecurityMetrics_ConcurrentAccess(t *testing.T) {
+	t.Log("=== TESTING Security Metrics Thread Safety ===")
 
 	manager := NewManager()
 
-	// Simulate a real-world scenario with multiple clients
-	clients := map[string]int{
-		"192.168.1.10": 3,  // Normal usage
-		"192.168.1.11": 5,  // Heavy usage
-		"192.168.1.12": 25, // Potential attack
-		"192.168.1.13": 2,  // Light usage
+	// Concurrent incrementing from multiple goroutines
+	done := make(chan bool, 10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer func() { done <- true }()
+			for j := 0; j < 100; j++ {
+				atomic.AddUint64(&manager.securityMetrics.TotalQueries, 1)
+			}
+		}()
 	}
 
-	expectedTotal := 0
-	for ip, queryCount := range clients {
-		for i := 0; i < queryCount; i++ {
-			manager.isRateLimited(ip)
-			expectedTotal++
-		}
-		// Small delay between clients
-		time.Sleep(time.Millisecond * 50)
+	// Wait for all goroutines
+	for i := 0; i < 10; i++ {
+		<-done
 	}
 
-	actualTotal := atomic.LoadUint64(&manager.securityMetrics.TotalQueries)
+	finalTotal := atomic.LoadUint64(&manager.securityMetrics.TotalQueries)
+	expected := uint64(10 * 100)
 
-	t.Logf("Expected TotalQueries: %d", expectedTotal)
-	t.Logf("Actual TotalQueries: %d", actualTotal)
-
-	if actualTotal == 0 {
-		t.Error("BUG: Security monitoring completely broken - no queries tracked")
-		t.Error("IMPACT: Admin dashboards would show 0 queries despite active traffic")
-	} else if actualTotal != uint64(expectedTotal) {
-		t.Errorf("BUG: Query count mismatch - security monitoring inaccurate")
+	if finalTotal != expected {
+		t.Errorf("Concurrent access issue: got %d, expected %d", finalTotal, expected)
 	} else {
-		t.Log("SUCCESS: Security metrics accurately reflect query activity")
+		t.Log("SUCCESS: Security metrics are thread-safe")
 	}
 }

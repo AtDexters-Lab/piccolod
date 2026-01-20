@@ -1,7 +1,6 @@
 package mdns
 
 import (
-	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -114,66 +113,33 @@ func TestDNSResponseGeneration_InvalidQueries(t *testing.T) {
 	}
 }
 
-func TestRateLimiting_UnderLoad(t *testing.T) {
-	manager := createMockManager()
-	clientIP := "192.168.1.50"
-
-	// Simulate rapid-fire queries from same client
-	var blockedCount int
-	for i := 0; i < 20; i++ {
-		if manager.isRateLimited(clientIP) {
-			blockedCount++
-		}
-		// Small delay to simulate real network timing
-		time.Sleep(time.Millisecond * 10)
-	}
-
-	// Should eventually start blocking
-	if blockedCount == 0 {
-		t.Error("Rate limiting didn't kick in after 20 rapid queries - potential DoS vulnerability")
-	}
-
-	// Check if metrics were updated
-	if manager.securityMetrics.TotalQueries == 0 {
-		t.Error("Security metrics not being updated")
-	}
-}
-
-func TestConcurrentConnections_ResourceUsage(t *testing.T) {
+func TestConcurrentQuerySlots_ResourceUsage(t *testing.T) {
 	manager := createMockManager()
 
-	// Simulate many concurrent clients
-	clientIPs := make([]string, 100)
+	// Test concurrent slot acquisition
+	done := make(chan bool, 100)
 	for i := 0; i < 100; i++ {
-		clientIPs[i] = fmt.Sprintf("192.168.1.%d", i)
-	}
-
-	// Test concurrent access
-	done := make(chan bool, len(clientIPs))
-	for _, ip := range clientIPs {
-		go func(clientIP string) {
+		go func() {
 			defer func() { done <- true }()
 
-			// Each client makes multiple requests
+			// Each goroutine tries to acquire and release slots
 			for j := 0; j < 5; j++ {
-				manager.isRateLimited(clientIP)
-				time.Sleep(time.Millisecond)
+				if manager.acquireQuerySlot() {
+					time.Sleep(time.Millisecond)
+					manager.releaseQuerySlot()
+				}
 			}
-		}(ip)
+		}()
 	}
 
 	// Wait for all goroutines
-	for i := 0; i < len(clientIPs); i++ {
+	for i := 0; i < 100; i++ {
 		<-done
 	}
 
-	// Check resource usage
-	manager.rateLimiter.mutex.RLock()
-	clientCount := len(manager.rateLimiter.clients)
-	manager.rateLimiter.mutex.RUnlock()
-
-	if clientCount != 100 {
-		t.Errorf("Expected 100 clients tracked, got %d - possible memory leak or cleanup issue", clientCount)
+	// Check that all slots are released
+	if manager.queryProcessor.activeCount != 0 {
+		t.Errorf("Expected 0 active slots after completion, got %d - possible leak", manager.queryProcessor.activeCount)
 	}
 }
 

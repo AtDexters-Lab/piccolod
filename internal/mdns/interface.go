@@ -342,7 +342,11 @@ func (m *Manager) checkInterfaceChanges() {
 				existing.LastSeen = time.Now()
 			}
 		} else {
-			// New interface detected
+			// New interface detected - only log and setup if it's suitable
+			// Skip loopback and down interfaces to avoid noise
+			if ifaceCopy.Flags&net.FlagLoopback != 0 || ifaceCopy.Flags&net.FlagUp == 0 {
+				continue
+			}
 			log.Printf("INFO: New interface detected: %s", ifaceCopy.Name)
 			m.setupInterface(&ifaceCopy)
 		}

@@ -160,8 +160,8 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 	atomic.AddUint64(&state.QueryCount, 1)
 	state.LastQuery = time.Now()
 
-	// Validate packet security
-	if err := m.validatePacket(data, clientAddr); err != nil {
+	// Validate packet security (size checks)
+	if err := m.validatePacket(data); err != nil {
 		atomic.AddUint64(&state.ErrorCount, 1)
 		log.Printf("SECURITY: [%s] Rejected packet from %s: %v", state.Interface.Name, clientAddr.IP, err)
 		return
@@ -176,16 +176,20 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 		return
 	}
 
-	// Additional DNS message validation
-	if err := m.validateDNSMessage(&msg); err != nil {
-		atomic.AddUint64(&state.ErrorCount, 1)
-		log.Printf("SECURITY: [%s] Invalid DNS message from %s: %v", state.Interface.Name, clientAddr.IP, err)
+	// Track total queries (after successful parse)
+	atomic.AddUint64(&m.securityMetrics.TotalQueries, 1)
+
+	// Handle responses (for conflict detection) BEFORE query validation
+	// Responses legitimately have answers without questions (RFC 6762)
+	if msg.Response {
+		m.handleConflictDetection(&msg, clientAddr)
 		return
 	}
 
-	// Handle responses for conflict detection
-	if msg.Response {
-		m.handleConflictDetection(&msg, clientAddr)
+	// Only validate queries - skip validation for responses
+	if err := m.validateDNSMessage(&msg); err != nil {
+		atomic.AddUint64(&state.ErrorCount, 1)
+		log.Printf("SECURITY: [%s] Invalid DNS query from %s: %v", state.Interface.Name, clientAddr.IP, err)
 		return
 	}
 
@@ -202,7 +206,9 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 
 	// Process each question with dual-stack support
 	for _, q := range msg.Question {
-		if q.Qclass != dns.ClassINET || !m.matchesAdvertisedName(q.Name) {
+		// RFC 6762 Section 5.4: Mask out the QU bit when checking class
+		qclass := q.Qclass & 0x7FFF
+		if qclass != dns.ClassINET || !m.matchesAdvertisedName(q.Name) {
 			continue
 		}
 

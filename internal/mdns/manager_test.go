@@ -41,10 +41,6 @@ func TestNewManager(t *testing.T) {
 	}
 
 	// Test security components initialization
-	if manager.rateLimiter == nil {
-		t.Error("rateLimiter should be initialized")
-	}
-
 	if manager.securityConfig == nil {
 		t.Error("securityConfig should be initialized")
 	}
@@ -95,14 +91,10 @@ func TestManagerSecurityConfigDefaults(t *testing.T) {
 		actual   interface{}
 		expected interface{}
 	}{
-		{"MaxQueriesPerSecond", config.MaxQueriesPerSecond, 10},
-		{"MaxQueriesPerMinute", config.MaxQueriesPerMinute, 100},
 		{"MaxPacketSize", config.MaxPacketSize, 1500},
 		{"MaxResponseSize", config.MaxResponseSize, 512},
 		{"MaxConcurrentQueries", config.MaxConcurrentQueries, 50},
 		{"QueryTimeout", config.QueryTimeout, time.Second * 2},
-		{"ClientBlockDuration", config.ClientBlockDuration, time.Minute * 5},
-		{"CleanupInterval", config.CleanupInterval, time.Minute * 5},
 	}
 
 	for _, tt := range tests {
@@ -204,20 +196,6 @@ func TestManagerConflictDetectorDefaults(t *testing.T) {
 
 	if detector.CurrentSuffix != "" {
 		t.Errorf("CurrentSuffix = %v, want empty string", detector.CurrentSuffix)
-	}
-}
-
-func TestManagerRateLimiterDefaults(t *testing.T) {
-	manager := NewManager()
-
-	rateLimiter := manager.rateLimiter
-
-	if rateLimiter.clients == nil {
-		t.Error("rateLimiter.clients map should be initialized")
-	}
-
-	if len(rateLimiter.clients) != 0 {
-		t.Error("rateLimiter.clients map should be empty initially")
 	}
 }
 
