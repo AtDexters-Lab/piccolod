@@ -323,8 +323,8 @@ The `next` parameter is validated against an allowlist to prevent open redirects
 | Type | Format | Example |
 |------|--------|---------|
 | Relative path | Starts with `/`, no scheme/host | `/dashboard`, `/app/settings` |
-| Portal origin | Full URI to portal hostname | `https://portal.example.com/...` |
-| App hostname (remote) | Full URI to an app hostname under the remote base domain | `https://immich.example.com/...`, `https://metrics-immich.example.com/...` |
+| Portal origin | Full URI to portal hostname | `https://piccolo-xyz.example.com/...` |
+| App hostname (remote) | Full URI to an app hostname under the remote base domain | `https://immich.piccolo-xyz.example.com/...`, `https://metrics-immich.piccolo-xyz.example.com/...` |
 | LAN app hostname | Full URI to an app hostname under the LAN base hostname (mDNS) | `http://immich.piccolo.local/...`, `http://metrics-immich.piccolo.local/...` |
 | LAN port-based origin (legacy) | Full URI to mDNS hostname/IP + listener port | `http://piccolo.local:35080/...`, `http://192.168.1.50:35080/...` |
 | Alias domain | Full URI to configured alias domain | `https://myblog.com/...` |
@@ -392,18 +392,18 @@ The following cookies are reserved and managed by Piccolo:
   - Attempt to set any "Piccolo Cookie Names" (prevent session fixation/clobbering)
   - Include `Domain=` attribute that doesn't match the app's own host exactly
 
-  | `Set-Cookie` Header (app at `immich.example.com`) | Action |
+  | `Set-Cookie` Header (app at `immich.piccolo-xyz.example.com`) | Action |
   |--------------------------------------------------|--------|
   | `session=abc; Path=/` | Pass through (host-only cookie) |
   | `piccolo_session=xyz` | **Strip** (reserved name) |
-  | `token=xyz; Domain=immich.example.com` | Pass through (matches app host) |
-  | `token=xyz; Domain=portal.example.com` | **Strip** (doesn't match app host) |
+  | `token=xyz; Domain=immich.piccolo-xyz.example.com` | Pass through (matches app host) |
+  | `token=xyz; Domain=piccolo-xyz.example.com` | **Strip** (doesn't match app host) |
   | `token=xyz; Domain=example.com` | **Strip** (doesn't match app host) |
-  | `token=xyz; Domain=other.example.com` | **Strip** (doesn't match app host) |
+  | `token=xyz; Domain=other.piccolo-xyz.example.com` | **Strip** (doesn't match app host) |
 
   **Host normalization for Domain comparison:**
   1. Lowercase both Domain attribute value and app host
-  2. Strip leading `.` from Domain (`.example.com` → `example.com`)
+  2. Strip leading `.` from Domain (`.piccolo-xyz.example.com` → `piccolo-xyz.example.com`)
   3. Strip port from app host for comparison (cookies are port-agnostic)
   4. Compare normalized strings for exact match
 
@@ -412,7 +412,7 @@ The following cookies are reserved and managed by Piccolo:
   |---------|----------|
   | LAN (host-based) | `<app>.<local-host>` or `<listener>-<app>.<local-host>` (e.g., `immich.piccolo.local`) |
   | LAN (port-based legacy) | `piccolo.local` (shared across apps; cookie isolation requires additional measures) |
-  | WAN | `<app>.<remote-base>` or `<listener>-<app>.<remote-base>` (e.g., `immich.example.com`) |
+  | WAN | `<app>.<remote-base>` or `<listener>-<app>.<remote-base>` (e.g., `immich.piccolo-xyz.example.com`) |
   | Alias | The alias domain (e.g., `myblog.com`) |
 
   This simple rule prevents apps from setting cookies that affect other apps or the portal **when apps are accessed via distinct hostnames** (WAN and LAN host-based routing). In port-based LAN mode, multiple apps share `piccolo.local`, so `Domain` filtering alone cannot prevent cross-app scoping; use hostname-based routing (preferred) or the optional cookie isolation mechanism in Section 4.1.8.
@@ -467,7 +467,7 @@ Piccolo session cookies work across app listeners without special configuration:
 
 - **LAN (host-based, preferred):** Apps are on per-app hostnames (e.g., `immich.piccolo.local`). Piccolo session cookies SHOULD be set with `Domain=<local-host>` (e.g., `piccolo.local`) so portal and apps share SSO within LAN context.
 - **LAN (port-based legacy):** Apps are `piccolo.local:<port>` — cookies are port-agnostic and therefore shared across apps (see Section 4.1.8).
-- **Remote:** Apps are per-app hostnames under the remote base domain (e.g., `immich.example.com`) while the portal is at `remoteManager.Status().PortalHostname` (e.g., `portal.example.com`). Piccolo session cookies SHOULD be set with `Domain=<remote-base>` (e.g., `example.com`) so portal and apps share SSO within Remote context.
+- **Remote:** Portal is served from `remoteManager.Status().PortalHostname` (e.g., `piccolo-xyz.example.com`) and apps are per-app hostnames under that base (e.g., `immich.piccolo-xyz.example.com`). Piccolo session cookies SHOULD be set with `Domain=<remote-base>` (e.g., `piccolo-xyz.example.com`) so portal and apps share SSO within Remote context.
 
 Users authenticate separately for LAN and Remote access (separate sessions).
 
@@ -562,7 +562,7 @@ Alias domains are derived from remote config (`remoteManager`), which is user-ed
 
 **OIDC redirect URI validation:**
 When validating redirect URIs for `oidc_passthrough` apps, Piccolo accepts URIs from:
-1. Standard listener URLs (e.g., `https://immich.example.com/callback`)
+1. Standard listener URLs (e.g., `https://immich.piccolo-xyz.example.com/callback`)
 2. Alias domain URLs (`https://myblog.com/callback`)
 
 Alias list is resolved at auth-time from current remote config.
@@ -838,7 +838,7 @@ x-piccolo:
   mode: service
 ```
 
-> **⚠️ WAN Compatibility Warning:** This example uses hardcoded OAuth URLs (`{{ .System.Auth.Issuer }}/oauth/authorize`). Apps with static URL configuration are **LAN-only compatible**. In WAN mode, the authorization endpoint is served from a different origin (e.g., `https://portal.example.com/oauth/authorize`), which these hardcoded URLs won't reach.
+> **⚠️ WAN Compatibility Warning:** This example uses hardcoded OAuth URLs (`{{ .System.Auth.Issuer }}/oauth/authorize`). Apps with static URL configuration are **LAN-only compatible**. In WAN mode, the authorization endpoint is served from a different origin (e.g., `https://piccolo-xyz.example.com/oauth/authorize`), which these hardcoded URLs won't reach.
 >
 > For WAN support, use apps that support OIDC discovery from the issuer URL (`/.well-known/openid-configuration`).
 
