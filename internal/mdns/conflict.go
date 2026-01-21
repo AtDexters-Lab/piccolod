@@ -191,6 +191,7 @@ func (m *Manager) resolveNameConflict() {
 	go func() {
 		defer m.wg.Done()
 		// Send multiple announcements to establish the new name quickly
+		// Include both hostname (A/AAAA) and service (PTR/SRV/TXT) records
 		for i := 0; i < 3; i++ {
 			// Check stop channel to allow early termination
 			select {
@@ -198,6 +199,7 @@ func (m *Manager) resolveNameConflict() {
 				return
 			default:
 				m.sendMultiInterfaceAnnouncements()
+				m.sendServiceAnnouncement()
 				time.Sleep(time.Second)
 			}
 		}

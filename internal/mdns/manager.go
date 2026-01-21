@@ -38,6 +38,10 @@ func NewManager() *Manager {
 		RecoveryTimeout:       time.Minute * 2,
 	}
 
+	// Capture device info at startup
+	deviceModel := GetDeviceModel()
+	bootTime := GetBootTime()
+
 	manager := &Manager{
 		interfaces: make(map[string]*InterfaceState),
 		hostname:   baseName,
@@ -68,7 +72,15 @@ func NewManager() *Manager {
 			ConflictingSources: make(map[string]ConflictingHost),
 			LastConflictCheck:  time.Now(),
 		},
+
+		// Peer discovery
+		peerRegistry: newPeerRegistry(),
+		deviceModel:  deviceModel,
+		bootTime:     bootTime,
 	}
+
+	// Initialize service metadata
+	manager.rebuildServiceMetadata()
 
 	manager.ipv4SocketFactory = manager.createIPv4Socket
 	manager.ipv6SocketFactory = manager.createIPv6Socket
@@ -113,6 +125,14 @@ func (m *Manager) Start() error {
 	m.wg.Add(1)
 	go m.healthMonitorLoop()
 
+	// Start DNS-SD service announcer
+	m.wg.Add(1)
+	go m.serviceAnnouncer()
+
+	// Start peer discovery loop
+	m.wg.Add(1)
+	go m.peerDiscoveryLoop()
+
 	// Launch probing and conflict monitoring in background to avoid blocking startup
 	m.wg.Add(1)
 	go func() {
@@ -138,6 +158,9 @@ func (m *Manager) Start() error {
 			serviceName, interfaceCount)
 		log.Printf("INFO: Security limits - %d concurrent queries, %d max packet size",
 			m.securityConfig.MaxConcurrentQueries, m.securityConfig.MaxPacketSize)
+
+		// Log service metadata
+		m.logServiceMetadata()
 	}()
 
 	return nil
@@ -147,7 +170,10 @@ func (m *Manager) Start() error {
 func (m *Manager) Stop() error {
 	m.stopOnce.Do(func() {
 		if m.started.Load() {
+			// Send goodbye for host records
 			m.sendMultiInterfaceAnnouncementsWithTTL(0)
+			// Send goodbye for service records
+			m.sendServiceAnnouncementWithTTL(0)
 		}
 		close(m.stopCh)
 		m.stopped.Store(true)
@@ -308,6 +334,37 @@ func (m *Manager) SetHostAliases(labels []string) error {
 		m.sendMultiInterfaceAnnouncements()
 	}
 	return nil
+}
+
+// SetPort sets the port number advertised in SRV records.
+// This should be called before Start() or will trigger re-announcement.
+func (m *Manager) SetPort(port int) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if port < 1 || port > 65535 {
+		log.Printf("WARN: Invalid port %d, keeping current port %d", port, m.port)
+		return
+	}
+
+	m.port = port
+	log.Printf("INFO: mDNS service port set to %d", port)
+
+	// Re-announce if already started
+	if m.started.Load() {
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.sendServiceAnnouncement()
+		}()
+	}
+}
+
+// Port returns the currently configured port.
+func (m *Manager) Port() int {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return m.port
 }
 
 func sanitizeBaseName(name string) string {

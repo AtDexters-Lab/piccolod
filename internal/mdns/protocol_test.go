@@ -198,15 +198,13 @@ func TestMDNSAnnouncement_MessageFormat(t *testing.T) {
 }
 
 func TestIPv6LinkLocal_mDNSCompliance(t *testing.T) {
+	interfaceFuncsMu.Lock()
 	origList := listNetworkInterfaces
 	origAddrs := interfaceAddrs
-	defer func() {
-		listNetworkInterfaces = origList
-		interfaceAddrs = origAddrs
-	}()
 
 	linkLocalIP := net.ParseIP("fe80::1234:5678:9abc:def0")
 	if linkLocalIP == nil {
+		interfaceFuncsMu.Unlock()
 		t.Fatal("failed to parse link-local IPv6 address")
 	}
 
@@ -220,6 +218,14 @@ func TestIPv6LinkLocal_mDNSCompliance(t *testing.T) {
 	interfaceAddrs = func(iface *net.Interface) ([]net.Addr, error) {
 		return []net.Addr{ipv4Net, ipv6Net}, nil
 	}
+	interfaceFuncsMu.Unlock()
+
+	t.Cleanup(func() {
+		interfaceFuncsMu.Lock()
+		listNetworkInterfaces = origList
+		interfaceAddrs = origAddrs
+		interfaceFuncsMu.Unlock()
+	})
 
 	manager := NewManager()
 	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {

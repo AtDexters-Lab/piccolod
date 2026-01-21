@@ -60,12 +60,9 @@ func TestSetupInterface_InvalidInterface(t *testing.T) {
 }
 
 func TestDiscoverInterfacesCopiesInterfacePointers(t *testing.T) {
+	interfaceFuncsMu.Lock()
 	origList := listNetworkInterfaces
 	origAddrs := interfaceAddrs
-	defer func() {
-		listNetworkInterfaces = origList
-		interfaceAddrs = origAddrs
-	}()
 
 	iface1 := net.Interface{Name: "eth0", Flags: net.FlagUp | net.FlagMulticast}
 	iface2 := net.Interface{Name: "wlan0", Flags: net.FlagUp | net.FlagMulticast}
@@ -82,6 +79,14 @@ func TestDiscoverInterfacesCopiesInterfacePointers(t *testing.T) {
 			},
 		}, nil
 	}
+	interfaceFuncsMu.Unlock()
+
+	t.Cleanup(func() {
+		interfaceFuncsMu.Lock()
+		listNetworkInterfaces = origList
+		interfaceAddrs = origAddrs
+		interfaceFuncsMu.Unlock()
+	})
 
 	manager := NewManager()
 	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {

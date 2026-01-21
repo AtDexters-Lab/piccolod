@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,11 +19,18 @@ var (
 	interfaceAddrs        = func(iface *net.Interface) ([]net.Addr, error) {
 		return iface.Addrs()
 	}
+	// interfaceFuncsMu protects listNetworkInterfaces and interfaceAddrs from concurrent access.
+	// This is primarily needed for tests that replace these functions.
+	interfaceFuncsMu sync.RWMutex
 )
 
 // discoverInterfaces finds and sets up all suitable network interfaces
 func (m *Manager) discoverInterfaces() error {
-	interfaces, err := listNetworkInterfaces()
+	interfaceFuncsMu.RLock()
+	listFn := listNetworkInterfaces
+	interfaceFuncsMu.RUnlock()
+
+	interfaces, err := listFn()
 	if err != nil {
 		return err
 	}
@@ -61,7 +69,11 @@ func (m *Manager) setupInterface(iface *net.Interface) error {
 	}
 
 	// Get all addresses for this interface
-	addrs, err := interfaceAddrs(iface)
+	interfaceFuncsMu.RLock()
+	addrsFn := interfaceAddrs
+	interfaceFuncsMu.RUnlock()
+
+	addrs, err := addrsFn(iface)
 	if err != nil {
 		return err
 	}
@@ -311,7 +323,11 @@ func (m *Manager) networkMonitor() {
 
 // checkInterfaceChanges detects and handles interface changes
 func (m *Manager) checkInterfaceChanges() {
-	interfaces, err := listNetworkInterfaces()
+	interfaceFuncsMu.RLock()
+	listFn := listNetworkInterfaces
+	interfaceFuncsMu.RUnlock()
+
+	interfaces, err := listFn()
 	if err != nil {
 		log.Printf("WARN: Failed to check interfaces: %v", err)
 		return
@@ -369,7 +385,11 @@ func (m *Manager) checkInterfaceChanges() {
 
 // hasIPChanged checks if an interface's IPv4 or IPv6 addresses have changed
 func (m *Manager) hasIPChanged(iface *net.Interface, state *InterfaceState) bool {
-	addrs, err := interfaceAddrs(iface)
+	interfaceFuncsMu.RLock()
+	addrsFn := interfaceAddrs
+	interfaceFuncsMu.RUnlock()
+
+	addrs, err := addrsFn(iface)
 	if err != nil {
 		return true // Assume changed if we can't check
 	}

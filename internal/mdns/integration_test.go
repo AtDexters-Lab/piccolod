@@ -56,6 +56,7 @@ func defaultStubNetworkEnv() stubNetworkEnv {
 }
 
 func installStubNetworkEnv(t *testing.T, env stubNetworkEnv) {
+	interfaceFuncsMu.Lock()
 	origList := listNetworkInterfaces
 	origAddrs := interfaceAddrs
 
@@ -74,10 +75,13 @@ func installStubNetworkEnv(t *testing.T, env stubNetworkEnv) {
 		copy(res, addrs)
 		return res, nil
 	}
+	interfaceFuncsMu.Unlock()
 
 	t.Cleanup(func() {
+		interfaceFuncsMu.Lock()
 		listNetworkInterfaces = origList
 		interfaceAddrs = origAddrs
+		interfaceFuncsMu.Unlock()
 	})
 }
 

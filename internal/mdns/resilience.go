@@ -158,7 +158,10 @@ func (m *Manager) performHealthCheck() {
 	defer m.mutex.Unlock()
 
 	now := time.Now()
+
+	m.healthMonitor.mutex.Lock()
 	m.healthMonitor.LastHealthCheck = now
+	m.healthMonitor.mutex.Unlock()
 
 	totalInterfaces := len(m.interfaces)
 	healthyInterfaces := 0
@@ -194,30 +197,40 @@ func (m *Manager) performHealthCheck() {
 	}
 
 	// Calculate overall system health
+	var overallHealth float64
 	if totalInterfaces > 0 {
-		m.healthMonitor.OverallHealth = totalHealth / float64(totalInterfaces)
+		overallHealth = totalHealth / float64(totalInterfaces)
 	} else {
-		m.healthMonitor.OverallHealth = 0.0
+		overallHealth = 0.0
 	}
+
+	m.healthMonitor.mutex.Lock()
+	m.healthMonitor.OverallHealth = overallHealth
+	recoveryActive := m.healthMonitor.RecoveryActive
+	m.healthMonitor.mutex.Unlock()
 
 	// Log health summary
 	log.Printf("RESILIENCE: Health check - Overall: %.2f, Healthy: %d/%d, System errors: %d",
-		m.healthMonitor.OverallHealth, healthyInterfaces, totalInterfaces,
+		overallHealth, healthyInterfaces, totalInterfaces,
 		atomic.LoadUint64(&m.healthMonitor.SystemErrors))
 
 	// Trigger recovery mode if health is critically low
-	if m.healthMonitor.OverallHealth < 0.3 && !m.healthMonitor.RecoveryActive {
+	if overallHealth < 0.3 && !recoveryActive {
 		m.enterRecoveryMode()
-	} else if m.healthMonitor.OverallHealth > 0.8 && m.healthMonitor.RecoveryActive {
+	} else if overallHealth > 0.8 && recoveryActive {
 		m.exitRecoveryMode()
 	}
 }
 
 // enterRecoveryMode activates aggressive recovery measures
 func (m *Manager) enterRecoveryMode() {
+	m.healthMonitor.mutex.Lock()
 	m.healthMonitor.RecoveryActive = true
+	overallHealth := m.healthMonitor.OverallHealth
+	m.healthMonitor.mutex.Unlock()
+
 	log.Printf("RESILIENCE: ENTERING RECOVERY MODE - System health critically low (%.2f)",
-		m.healthMonitor.OverallHealth)
+		overallHealth)
 
 	// Trigger immediate interface rediscovery
 	m.wg.Add(1)
@@ -231,9 +244,13 @@ func (m *Manager) enterRecoveryMode() {
 
 // exitRecoveryMode deactivates recovery mode when health improves
 func (m *Manager) exitRecoveryMode() {
+	m.healthMonitor.mutex.Lock()
 	m.healthMonitor.RecoveryActive = false
+	overallHealth := m.healthMonitor.OverallHealth
+	m.healthMonitor.mutex.Unlock()
+
 	log.Printf("RESILIENCE: EXITING RECOVERY MODE - System health restored (%.2f)",
-		m.healthMonitor.OverallHealth)
+		overallHealth)
 }
 
 // healthMonitorLoop runs periodic health checks and recovery operations

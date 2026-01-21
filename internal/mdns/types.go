@@ -136,6 +136,13 @@ type Manager struct {
 	// Conflict detection and resolution
 	conflictDetector *ConflictDetector
 
+	// Peer discovery
+	peerRegistry    *PeerRegistry
+	serviceMetadata *ServiceMetadata
+	version         string
+	deviceModel     string
+	bootTime        time.Time
+
 	// Socket factories (overrideable for tests)
 	ipv4SocketFactory func(*net.Interface) (*net.UDPConn, error)
 	ipv6SocketFactory func(*net.Interface) (*net.UDPConn, error)

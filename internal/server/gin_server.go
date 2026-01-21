@@ -365,6 +365,14 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	var mdnsMgr *mdns.Manager
 	if !mdnsDisabled {
 		mdnsMgr = mdns.NewManager()
+		// Wire the HTTP port to mDNS so SRV records advertise the correct port
+		mdnsPort := 80
+		if p := os.Getenv("PORT"); p != "" {
+			if v, err := strconv.Atoi(p); err == nil && v > 0 {
+				mdnsPort = v
+			}
+		}
+		mdnsMgr.SetPort(mdnsPort)
 	}
 
 	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), filepath.Join(stateDir, "tmp", "catalog"))
@@ -431,6 +439,11 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	for _, opt := range opts {
 		opt(s)
+	}
+
+	// Wire version to mDNS service metadata (after options are applied)
+	if s.mdnsManager != nil && s.version != "" {
+		s.mdnsManager.SetVersion(s.version)
 	}
 
 	// Initialize auth & sessions

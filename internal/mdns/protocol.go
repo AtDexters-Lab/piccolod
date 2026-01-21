@@ -152,13 +152,18 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 	startTime := time.Now()
 	defer func() {
 		if time.Since(startTime) > m.securityConfig.QueryTimeout {
-			log.Printf("SECURITY: Query timeout from %s", clientAddr.IP)
+			// Don't log timeout warnings for self-responses (common during conflict probing)
+			if !m.isSelfResponse(clientAddr.IP) {
+				log.Printf("SECURITY: Query timeout from %s", clientAddr.IP)
+			}
 		}
 	}()
 
 	// Update interface metrics
 	atomic.AddUint64(&state.QueryCount, 1)
+	state.resilienceMu.Lock()
 	state.LastQuery = time.Now()
+	state.resilienceMu.Unlock()
 
 	// Validate packet security (size checks)
 	if err := m.validatePacket(data); err != nil {
@@ -179,10 +184,11 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 	// Track total queries (after successful parse)
 	atomic.AddUint64(&m.securityMetrics.TotalQueries, 1)
 
-	// Handle responses (for conflict detection) BEFORE query validation
+	// Handle responses (for conflict detection and peer discovery) BEFORE query validation
 	// Responses legitimately have answers without questions (RFC 6762)
 	if msg.Response {
 		m.handleConflictDetection(&msg, clientAddr)
+		m.handlePeerDiscoveryResponse(&msg, clientAddr)
 		return
 	}
 
@@ -208,50 +214,63 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 	for _, q := range msg.Question {
 		// RFC 6762 Section 5.4: Mask out the QU bit when checking class
 		qclass := q.Qclass & 0x7FFF
-		if qclass != dns.ClassINET || !m.matchesAdvertisedName(q.Name) {
+		if qclass != dns.ClassINET {
 			continue
 		}
 
-		// Handle A record requests (IPv4)
-		if (q.Qtype == dns.TypeA || q.Qtype == dns.TypeANY) && state.HasIPv4 && state.IPv4 != nil {
-			rr := &dns.A{
-				Hdr: dns.RR_Header{
-					Name:   q.Name,
-					Rrtype: dns.TypeA,
-					Class:  dns.ClassINET,
-					Ttl:    120,
-				},
-				A: state.IPv4,
+		// Handle A record requests (IPv4) - for hostname queries
+		if m.matchesAdvertisedName(q.Name) {
+			if (q.Qtype == dns.TypeA || q.Qtype == dns.TypeANY) && state.HasIPv4 && state.IPv4 != nil {
+				rr := &dns.A{
+					Hdr: dns.RR_Header{
+						Name:   q.Name,
+						Rrtype: dns.TypeA,
+						Class:  dns.ClassINET,
+						Ttl:    120,
+					},
+					A: state.IPv4,
+				}
+				response.Answer = append(response.Answer, rr)
+				log.Printf("DEBUG: [%s-%s] Adding A record: %s -> %s",
+					state.Interface.Name, stack, strings.TrimSuffix(q.Name, "."), state.IPv4.String())
 			}
-			response.Answer = append(response.Answer, rr)
-			log.Printf("DEBUG: [%s-%s] Adding A record: %s -> %s",
-				state.Interface.Name, stack, strings.TrimSuffix(q.Name, "."), state.IPv4.String())
+
+			// Handle AAAA record requests (IPv6) - for hostname queries
+			if (q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeANY) && state.HasIPv6 && state.IPv6 != nil {
+				rr := &dns.AAAA{
+					Hdr: dns.RR_Header{
+						Name:   q.Name,
+						Rrtype: dns.TypeAAAA,
+						Class:  dns.ClassINET,
+						Ttl:    120,
+					},
+					AAAA: state.IPv6,
+				}
+				response.Answer = append(response.Answer, rr)
+				log.Printf("DEBUG: [%s-%s] Adding AAAA record: %s -> %s",
+					state.Interface.Name, stack, strings.TrimSuffix(q.Name, "."), state.IPv6.String())
+			}
 		}
 
-		// Handle AAAA record requests (IPv6)
-		if (q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeANY) && state.HasIPv6 && state.IPv6 != nil {
-			rr := &dns.AAAA{
-				Hdr: dns.RR_Header{
-					Name:   q.Name,
-					Rrtype: dns.TypeAAAA,
-					Class:  dns.ClassINET,
-					Ttl:    120,
-				},
-				AAAA: state.IPv6,
-			}
-			response.Answer = append(response.Answer, rr)
-			log.Printf("DEBUG: [%s-%s] Adding AAAA record: %s -> %s",
-				state.Interface.Name, stack, strings.TrimSuffix(q.Name, "."), state.IPv6.String())
-		}
+		// Handle DNS-SD service discovery queries (PTR/SRV/TXT)
+		m.handlePTRQuery(q, response, state)
+		m.handleSRVQuery(q, response, state)
+		m.handleTXTQuery(q, response, state)
+		m.handleANYQueryForService(q, response, state)
 	}
 
 	// Send response if we have answers
 	if len(response.Answer) > 0 {
-		// Verify names are still current before transmitting
+		// Verify host record names are still current before transmitting.
+		// Only check A/AAAA records - service records (PTR/SRV/TXT) use different
+		// naming patterns and are already derived from currentServiceName().
 		for _, rr := range response.Answer {
-			if !m.matchesAdvertisedName(rr.Header().Name) {
-				// Name changed while we built the response; drop it.
-				return
+			switch rr.Header().Rrtype {
+			case dns.TypeA, dns.TypeAAAA:
+				if !m.matchesAdvertisedName(rr.Header().Name) {
+					// Host name changed while we built the response; drop it.
+					return
+				}
 			}
 		}
 
