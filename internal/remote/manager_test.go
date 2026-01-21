@@ -63,8 +63,8 @@ func TestRunPreflightSuccess(t *testing.T) {
 	dial := &stubDialer{}
 	res := &stubResolver{
 		hosts: map[string][]string{
-			"portal.example.com": {"1.2.3.4"},
-			"app.example.com":    {"1.2.3.4"},
+			"portal.example.com":     {"1.2.3.4"},
+			"app.portal.example.com": {"1.2.3.4"},
 		},
 		cnames: map[string]string{
 			"portal.example.com": "nexus.example.com.",
@@ -268,7 +268,7 @@ func TestConfigure_DNS01SeedsWildcardWithApex(t *testing.T) {
 	if wildcard == nil {
 		t.Fatalf("expected wildcard certificate entry")
 	}
-	if len(wildcard.Domains) != 2 || wildcard.Domains[0] != "*.example.com" || wildcard.Domains[1] != "example.com" {
+	if len(wildcard.Domains) != 2 || wildcard.Domains[0] != "*.portal.example.com" || wildcard.Domains[1] != "portal.example.com" {
 		t.Fatalf("unexpected wildcard domains: %v", wildcard.Domains)
 	}
 }

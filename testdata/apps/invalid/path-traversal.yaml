@@ -1,5 +1,5 @@
 # Security test: path traversal attempt
-name: malicious-app
+name: maliciousapp
 listeners:
   - name: web
     guest_port: 80

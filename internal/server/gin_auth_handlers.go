@@ -41,16 +41,14 @@ func (s *GinServer) sessionCookieDomain(r *http.Request) string {
 	if ip := net.ParseIP(remoteHost); ip != nil && ip.IsLoopback() {
 		if s.remoteManager != nil {
 			st := s.remoteManager.Status()
-			if st.Enabled && strings.TrimSpace(st.TLD) != "" {
-				d := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(st.TLD), "."))
-				if d != "" {
-					// Only scope to remote base when the request host is within that base domain.
-					// This avoids setting invalid cookies when accessed via alias domains.
-					if reqHost == d || strings.HasSuffix(reqHost, "."+d) {
-						return d
-					}
-					return ""
+			base := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(st.PortalHostname), "."))
+			if st.Enabled && base != "" {
+				// Only scope to remote base when the request host is within that base hostname.
+				// This avoids setting invalid cookies when accessed via alias domains.
+				if reqHost == base || strings.HasSuffix(reqHost, "."+base) {
+					return base
 				}
+				return ""
 			}
 		}
 	}

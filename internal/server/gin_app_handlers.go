@@ -49,8 +49,8 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	if !strings.EqualFold(status.Solver, "http-01") {
 		return
 	}
-	tld := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(status.TLD)), ".")
-	if tld == "" {
+	base := remoteBaseHostname(&status)
+	if base == "" {
 		return
 	}
 	endpoints, err := s.serviceManager.GetByApp(appName)
@@ -60,24 +60,12 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	}
 	hosts := map[string]struct{}{}
 	for _, ep := range endpoints {
-		if ep.Flow == api.FlowTLS {
+		// Only queue certs for HTTP/WS listeners that have host-based routing
+		// DerivedHostLabel is empty for raw/tls listeners (per RFC 20260114)
+		if ep.DerivedHostLabel == "" {
 			continue
 		}
-		switch ep.Protocol {
-		case api.ListenerProtocolHTTP, api.ListenerProtocolWebsocket:
-			// allowed
-		default:
-			continue
-		}
-		name := strings.ToLower(strings.TrimSpace(ep.Name))
-		if name == "" {
-			continue
-		}
-		if !isValidDNSLabel(name) {
-			log.Printf("WARN: remote: skipping remote certificate queue for listener %q on app %q (not DNS-safe)", ep.Name, appName)
-			continue
-		}
-		host := name + "." + tld
+		host := ep.DerivedHostLabel + "." + base
 		hosts[host] = struct{}{}
 	}
 	for h := range hosts {
@@ -85,26 +73,19 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	}
 }
 
-func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, tld string) map[string]struct{} {
+func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, base string) map[string]struct{} {
 	hosts := map[string]struct{}{}
-	tld = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(tld)), ".")
-	if tld == "" {
+	base = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
+	if base == "" {
 		return hosts
 	}
 	for _, ep := range endpoints {
-		if ep.Flow == api.FlowTLS {
+		// Only include HTTP/WS listeners that have host-based routing
+		// DerivedHostLabel is empty for raw/tls listeners (per RFC 20260114)
+		if ep.DerivedHostLabel == "" {
 			continue
 		}
-		switch ep.Protocol {
-		case api.ListenerProtocolHTTP, api.ListenerProtocolWebsocket:
-		default:
-			continue
-		}
-		name := strings.ToLower(strings.TrimSpace(ep.Name))
-		if name == "" || !isValidDNSLabel(name) {
-			continue
-		}
-		host := name + "." + tld
+		host := ep.DerivedHostLabel + "." + base
 		hosts[host] = struct{}{}
 	}
 	return hosts
@@ -306,8 +287,9 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	}
 	if s.remoteManager != nil {
 		status := s.remoteManager.Status()
-		if status.Enabled && status.TLD != "" {
-			systemContext["Domain"] = strings.TrimSuffix(status.TLD, ".")
+		if status.Enabled && strings.TrimSpace(status.PortalHostname) != "" {
+			// RFC 20260114: remote base is the portal hostname apex.
+			systemContext["Domain"] = strings.TrimSuffix(strings.TrimSpace(status.PortalHostname), ".")
 		}
 	}
 
@@ -391,6 +373,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	}
 
 	s.queueAppRemoteCertificates(appInstance.InstanceID)
+	s.refreshMDNSAliases()
 
 	response := GinAppResponse{
 		Data:    appInstance,
@@ -552,6 +535,7 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 
 	// Queue certs for new listeners
 	s.queueAppRemoteCertificates(appName)
+	s.refreshMDNSAliases()
 
 	// Fetch updated details
 	newApp, err := s.appManager.Get(c.Request.Context(), appName)
@@ -599,9 +583,9 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	var hostsToRemove map[string]struct{}
 	if s.remoteManager != nil && s.serviceManager != nil {
 		st := s.remoteManager.Status()
-		if st.TLD != "" {
+		if base := remoteBaseHostname(&st); base != "" {
 			if eps, err := s.serviceManager.GetByApp(appName); err == nil {
-				hostsToRemove = remoteHostsForEndpoints(eps, st.TLD)
+				hostsToRemove = remoteHostsForEndpoints(eps, base)
 			}
 		}
 	}
@@ -634,6 +618,9 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 			s.remoteManager.RemoveHostnameCertificate(h)
 		}
 	}
+
+	// Update mDNS aliases after app removal
+	s.refreshMDNSAliases()
 
 	if purge {
 		writeGinSuccess(c, nil, "App '"+appName+"' uninstalled and data purged successfully")

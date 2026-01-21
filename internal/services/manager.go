@@ -12,6 +12,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/cluster"
 	"piccolod/internal/events"
+	"piccolod/internal/hostname"
 )
 
 // ServiceManager coordinates listener allocation, registry, and proxy startup
@@ -272,6 +273,9 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 		return endpoints, nil
 	}
 
+	// Determine the primary listener for host-based routing
+	primaryName, _ := hostname.ResolvePrimaryListener(listeners)
+
 	registry := make(map[string]ServiceEndpoint)
 	for _, l := range listeners {
 		host, ok := hostByGuest[l.GuestPort]
@@ -287,17 +291,21 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 			return endpoints, err
 		}
 		remotePorts := defaultRemotePorts(l)
+		isPrimary := l.Name == primaryName
+		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
 		ep := ServiceEndpoint{
-			App:         appName,
-			Name:        l.Name,
-			GuestPort:   l.GuestPort,
-			HostBind:    host,
-			PublicPort:  public,
-			Flow:        l.Flow,
-			Protocol:    l.Protocol,
-			Middleware:  l.Middleware,
-			RemotePorts: remotePorts,
-			Auth:        l.Auth,
+			App:              appName,
+			Name:             l.Name,
+			GuestPort:        l.GuestPort,
+			HostBind:         host,
+			PublicPort:       public,
+			Flow:             l.Flow,
+			Protocol:         l.Protocol,
+			Primary:          isPrimary,
+			DerivedHostLabel: hostLabel,
+			Middleware:       l.Middleware,
+			RemotePorts:      remotePorts,
+			Auth:             l.Auth,
 		}
 		registry[l.Name] = ep
 		endpoints = append(endpoints, ep)
@@ -316,6 +324,14 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Determine the primary listener for host-based routing
+	primaryName, _ := hostname.ResolvePrimaryListener(listeners)
+
+	// Check for host label collisions before allocating
+	if err := m.checkHostLabelCollisions(appName, listeners, primaryName); err != nil {
+		return nil, err
+	}
+
 	endpoints := make([]ServiceEndpoint, 0, len(listeners))
 
 	for _, l := range listeners {
@@ -324,17 +340,21 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 			return nil, err
 		}
 		remotePorts := defaultRemotePorts(l)
+		isPrimary := l.Name == primaryName
+		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
 		ep := ServiceEndpoint{
-			App:         appName,
-			Name:        l.Name,
-			GuestPort:   l.GuestPort,
-			HostBind:    hb,
-			PublicPort:  pp,
-			Flow:        l.Flow,
-			Protocol:    l.Protocol,
-			Middleware:  l.Middleware,
-			RemotePorts: remotePorts,
-			Auth:        l.Auth,
+			App:              appName,
+			Name:             l.Name,
+			GuestPort:        l.GuestPort,
+			HostBind:         hb,
+			PublicPort:       pp,
+			Flow:             l.Flow,
+			Protocol:         l.Protocol,
+			Primary:          isPrimary,
+			DerivedHostLabel: hostLabel,
+			Middleware:       l.Middleware,
+			RemotePorts:      remotePorts,
+			Auth:             l.Auth,
 		}
 		endpoints = append(endpoints, ep)
 		if _, ok := m.registry[appName]; !ok {
@@ -442,6 +462,89 @@ func matchesRemotePort(ep ServiceEndpoint, remotePort int) bool {
 	return false
 }
 
+// ResolveByHostLabel finds an endpoint by its derived host label (app or listener-app).
+// This is the primary method for host-based routing.
+func (m *ServiceManager) ResolveByHostLabel(label string, remotePort int) (ServiceEndpoint, bool) {
+	if label == "" {
+		return ServiceEndpoint{}, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, mapp := range m.registry {
+		for _, ep := range mapp {
+			if ep.DerivedHostLabel == label && matchesRemotePort(ep, remotePort) {
+				return ep, true
+			}
+		}
+	}
+	return ServiceEndpoint{}, false
+}
+
+// ResolveAppPrimary finds the primary listener for an app.
+func (m *ServiceManager) ResolveAppPrimary(appName string) (ServiceEndpoint, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	mapp, ok := m.registry[appName]
+	if !ok {
+		return ServiceEndpoint{}, false
+	}
+	for _, ep := range mapp {
+		if ep.Primary {
+			return ep, true
+		}
+	}
+	return ServiceEndpoint{}, false
+}
+
+// GetAllHostLabels returns a map of all host labels to their endpoints.
+// Only includes HTTP/WS listeners that have host-based routing enabled.
+func (m *ServiceManager) GetAllHostLabels() map[string]ServiceEndpoint {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make(map[string]ServiceEndpoint)
+	for _, mapp := range m.registry {
+		for _, ep := range mapp {
+			if ep.DerivedHostLabel != "" {
+				result[ep.DerivedHostLabel] = ep
+			}
+		}
+	}
+	return result
+}
+
+// checkHostLabelCollisions validates that new host labels don't collide with existing ones.
+// Must be called while holding m.mu lock.
+func (m *ServiceManager) checkHostLabelCollisions(appName string, listeners []api.AppListener, primaryName string) error {
+	// Compute new host labels
+	newLabels := make([]string, 0, len(listeners))
+	for _, l := range listeners {
+		isPrimary := l.Name == primaryName
+		label := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
+		if label != "" {
+			newLabels = append(newLabels, label)
+		}
+	}
+
+	if len(newLabels) == 0 {
+		return nil // No host-based labels to check
+	}
+
+	// Build existing labels map (excluding the app being allocated/reconciled)
+	existingLabels := make(map[string]string)
+	for app, mapp := range m.registry {
+		if app == appName {
+			continue // Skip the app being modified
+		}
+		for _, ep := range mapp {
+			if ep.DerivedHostLabel != "" {
+				existingLabels[ep.DerivedHostLabel] = fmt.Sprintf("app:%s/listener:%s", ep.App, ep.Name)
+			}
+		}
+	}
+
+	return hostname.CheckCollisions(newLabels, existingLabels)
+}
+
 // StopAll stops all proxy listeners
 func (m *ServiceManager) StopAll() {
 	m.proxyManager.StopAll()
@@ -539,12 +642,23 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 		existing = make(map[string]ServiceEndpoint)
 	}
 
+	// Determine the primary listener for host-based routing
+	primaryName, _ := hostname.ResolvePrimaryListener(listeners)
+
+	// Check for host label collisions before making changes
+	if err := m.checkHostLabelCollisions(appName, listeners, primaryName); err != nil {
+		return ReconcileResult{}, false, err
+	}
+
 	newMap := make(map[string]ServiceEndpoint)
 	containerChange := false
 	result := ReconcileResult{}
 
 	// Index new by name
 	for _, l := range listeners {
+		isPrimary := l.Name == primaryName
+		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
+
 		if old, ok := existing[l.Name]; ok {
 			// Reuse ports; update config
 			ep := old
@@ -554,15 +668,17 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 				result.GuestPortChanged = append(result.GuestPortChanged, struct{ Old, New ServiceEndpoint }{
 					Old: ep,
 					New: ServiceEndpoint{
-						App:         appName,
-						Name:        l.Name,
-						GuestPort:   l.GuestPort,
-						HostBind:    ep.HostBind,
-						PublicPort:  ep.PublicPort,
-						Flow:        l.Flow,
-						Protocol:    l.Protocol,
-						Middleware:  l.Middleware,
-						RemotePorts: defaultRemotePorts(l),
+						App:              appName,
+						Name:             l.Name,
+						GuestPort:        l.GuestPort,
+						HostBind:         ep.HostBind,
+						PublicPort:       ep.PublicPort,
+						Flow:             l.Flow,
+						Protocol:         l.Protocol,
+						Primary:          isPrimary,
+						DerivedHostLabel: hostLabel,
+						Middleware:       l.Middleware,
+						RemotePorts:      defaultRemotePorts(l),
 					},
 				})
 			}
@@ -571,6 +687,8 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 			proxyChanged := ep.Flow != l.Flow || ep.Protocol != l.Protocol || !middlewareEqual(ep.Middleware, l.Middleware)
 			ep.Flow = l.Flow
 			ep.Protocol = l.Protocol
+			ep.Primary = isPrimary
+			ep.DerivedHostLabel = hostLabel
 			ep.Middleware = l.Middleware
 			ep.RemotePorts = defaultRemotePorts(l)
 			newMap[l.Name] = ep
@@ -587,15 +705,17 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 				return ReconcileResult{}, false, err
 			}
 			ep := ServiceEndpoint{
-				App:         appName,
-				Name:        l.Name,
-				GuestPort:   l.GuestPort,
-				HostBind:    hb,
-				PublicPort:  pp,
-				Flow:        l.Flow,
-				Protocol:    l.Protocol,
-				Middleware:  l.Middleware,
-				RemotePorts: defaultRemotePorts(l),
+				App:              appName,
+				Name:             l.Name,
+				GuestPort:        l.GuestPort,
+				HostBind:         hb,
+				PublicPort:       pp,
+				Flow:             l.Flow,
+				Protocol:         l.Protocol,
+				Primary:          isPrimary,
+				DerivedHostLabel: hostLabel,
+				Middleware:       l.Middleware,
+				RemotePorts:      defaultRemotePorts(l),
 			}
 			newMap[l.Name] = ep
 			m.proxyManager.StartListener(ep)

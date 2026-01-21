@@ -1,4 +1,4 @@
-name: test-minimal
+name: testminimal
 listeners:
   - name: web
     guest_port: 80

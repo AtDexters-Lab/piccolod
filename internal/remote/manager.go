@@ -542,9 +542,12 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	}
 	cfg.Certificates = newCerts
 	m.enqueueIssuance("portal", []string{cfg.PortalHostname}, cfg.PortalHostname)
-	if cfg.TLD != "" && strings.EqualFold(cfg.Solver, "dns-01") {
-		cn := "*." + cfg.TLD
-		m.enqueueIssuance("wildcard", []string{cn, cfg.TLD}, cn)
+	if cfg.TLD != "" && strings.EqualFold(cfg.Solver, "dns-01") && strings.TrimSpace(cfg.PortalHostname) != "" {
+		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
+		if base != "" {
+			cn := "*." + base
+			m.enqueueIssuance("wildcard", []string{cn, base}, cn)
+		}
 	}
 	cfg.Events = append(cfg.Events, Event{
 		Timestamp: now,
@@ -912,12 +915,15 @@ func desiredDomainsAndCN(cfg *Config, c Certificate) ([]string, string, bool) {
 		h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
 		return []string{h}, h, true
 	case "wildcard":
-		if cfg.TLD == "" || !strings.EqualFold(cfg.Solver, "dns-01") {
+		if cfg.TLD == "" || cfg.PortalHostname == "" || !strings.EqualFold(cfg.Solver, "dns-01") {
 			return nil, "", false
 		}
-		tld := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.TLD)), ".")
-		cn := "*." + tld
-		return []string{cn, tld}, cn, true
+		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
+		if base == "" {
+			return nil, "", false
+		}
+		cn := "*." + base
+		return []string{cn, base}, cn, true
 	default:
 		if strings.HasPrefix(c.ID, "alias:") || strings.HasPrefix(c.ID, "host:") {
 			parts := strings.SplitN(c.ID, ":", 2)
@@ -973,8 +979,12 @@ func (m *Manager) RenewCertificate(id string) error {
 				if !strings.EqualFold(cfg.Solver, "dns-01") {
 					return errors.New("wildcard renewals require dns-01 solver")
 				}
-				cn = "*." + cfg.TLD
-				domains = []string{cn, cfg.TLD}
+				base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
+				if base == "" {
+					return errors.New("portal hostname missing")
+				}
+				cn = "*." + base
+				domains = []string{cn, base}
 			}
 			m.enqueueIssuanceWithForce(id, domains, cn, true)
 			return nil
@@ -1554,8 +1564,8 @@ func (m *Manager) checkDNS(cfg *Config) (string, string) {
 		detail = fmt.Sprintf("portal host lookup failed: %v", addrErr)
 	}
 
-	if cfg.TLD != "" && cfg.PortalHostname != cfg.TLD {
-		sample := fmt.Sprintf("app.%s", cfg.TLD)
+	if strings.TrimSpace(cfg.PortalHostname) != "" {
+		sample := fmt.Sprintf("app.%s", strings.TrimSuffix(strings.TrimSpace(cfg.PortalHostname), "."))
 		if _, err := m.resolver.LookupHost(ctx, sample); err != nil {
 			status = "warn"
 			detail = detail + "; wildcard host unresolved"
@@ -1621,9 +1631,13 @@ func defaultCertificates(cfg *Config, now time.Time) []Certificate {
 		})
 	}
 	if cfg.TLD != "" && strings.EqualFold(cfg.Solver, "dns-01") {
+		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
+		if base == "" {
+			return certificates
+		}
 		certificates = append(certificates, Certificate{
 			ID:          "wildcard",
-			Domains:     []string{fmt.Sprintf("*.%s", cfg.TLD), cfg.TLD},
+			Domains:     []string{fmt.Sprintf("*.%s", base), base},
 			Solver:      cfg.Solver,
 			IssuedAt:    timePtr(now),
 			ExpiresAt:   timePtr(exp),

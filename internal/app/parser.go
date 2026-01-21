@@ -11,6 +11,7 @@ import (
 	"text/template"
 
 	"piccolod/internal/api"
+	"piccolod/internal/hostname"
 
 	"gopkg.in/yaml.v3"
 )
@@ -244,8 +245,8 @@ func SetDefaults(app *api.AppDefinition) {
 
 // ValidateAppDefinition validates an AppDefinition struct
 func ValidateAppDefinition(app *api.AppDefinition) error {
-	// Validate name
-	if err := validateName(app.Name); err != nil {
+	// Validate app name using RFC 20260114 DNS-compliant rules (no hyphens)
+	if err := hostname.ValidateAppName(app.Name); err != nil {
 		return err
 	}
 
@@ -549,7 +550,8 @@ func validateServices(services map[string]api.AppService, primary string, listen
 	return nil
 }
 
-// validateName validates app name follows naming conventions
+// validateName validates names (for instance IDs) - allows hyphens.
+// For app names, use hostname.ValidateAppName() which is stricter (no hyphens).
 func validateName(name string) error {
 	if name == "" {
 		return fmt.Errorf("name is required")
@@ -597,6 +599,11 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 		return fmt.Errorf("listeners are required; legacy ports are no longer supported")
 	}
 
+	// Validate primary listener configuration using hostname package
+	if _, err := hostname.ResolvePrimaryListener(listeners); err != nil {
+		return fmt.Errorf("invalid primary listener configuration: %w", err)
+	}
+
 	names := make(map[string]struct{})
 	guestPorts := make(map[int]string)
 
@@ -604,6 +611,10 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 		// name required
 		if strings.TrimSpace(l.Name) == "" {
 			return fmt.Errorf("listener[%d] name is required", i)
+		}
+		// Validate listener name per RFC 20260114 (DNS-compliant, no hyphens)
+		if err := hostname.ValidateListenerName(l.Name); err != nil {
+			return fmt.Errorf("listener[%d] %w", i, err)
 		}
 		// unique name per app
 		if _, ok := names[l.Name]; ok {

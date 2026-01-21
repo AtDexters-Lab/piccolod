@@ -121,6 +121,26 @@ func TestApplyForwardHeadersUsesTLSHint(t *testing.T) {
 	}
 }
 
+func TestApplyForwardHeadersUsesClientIPHint(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+	req.Host = "example.test"
+	req.RemoteAddr = "10.0.0.2:1234"
+	req = req.WithContext(context.WithValue(req.Context(), hintContextKey{}, connectionHint{clientIP: "203.0.113.9"}))
+	ep := ServiceEndpoint{Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}
+
+	applyForwardHeaders(req, ep)
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "203.0.113.9" {
+		t.Fatalf("expected X-Forwarded-For=203.0.113.9, got %q", got)
+	}
+	if got := req.Header.Get("X-Real-IP"); got != "203.0.113.9" {
+		t.Fatalf("expected X-Real-IP=203.0.113.9, got %q", got)
+	}
+	if fwd := req.Header.Get("Forwarded"); !strings.Contains(fwd, "for=203.0.113.9") {
+		t.Fatalf("expected Forwarded to include for=203.0.113.9, got %q", fwd)
+	}
+}
+
 func TestApplyForwardHeaders_ForwardedHeaderQuotesIPv6For(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
 	req.Host = "example.test"
@@ -146,6 +166,159 @@ func TestApplyForwardHeaders_ForwardedHeaderQuotesHostWithPort(t *testing.T) {
 	fwd := req.Header.Get("Forwarded")
 	if !strings.Contains(fwd, `host="127.0.0.1:35000"`) {
 		t.Fatalf("expected Forwarded to include quoted host with port, got %q", fwd)
+	}
+}
+
+func getNonLoopbackIPv4(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("interface addrs: %v", err)
+	}
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil {
+			continue
+		}
+		ip = ip.To4()
+		if ip == nil {
+			continue
+		}
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		// Prefer private addresses; fall back to any non-loopback v4.
+		if ip.IsPrivate() || ip.IsGlobalUnicast() {
+			return ip.String()
+		}
+	}
+	t.Skip("no non-loopback IPv4 address available")
+	return ""
+}
+
+func TestProxyManagerRequestHintTokenSingleUse(t *testing.T) {
+	pm := NewProxyManager()
+	token, ok := pm.IssueRequestHint(12345, "203.0.113.10", true, 443)
+	if !ok || token == "" {
+		t.Fatalf("expected hint token issuance to succeed")
+	}
+	hint, ok := pm.consumeRequestHint(12345, token)
+	if !ok {
+		t.Fatalf("expected hint token to be consumable")
+	}
+	if hint.clientIP != "203.0.113.10" {
+		t.Fatalf("expected hinted clientIP preserved, got %q", hint.clientIP)
+	}
+	if _, ok := pm.consumeRequestHint(12345, token); ok {
+		t.Fatalf("expected hint token to be single-use")
+	}
+}
+
+func TestHTTPProxyForwardHeadersRespectHintTokenClientIP(t *testing.T) {
+	backendReqs := make(chan map[string]string, 2)
+
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendLn.Close()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			headers := map[string]string{
+				"xff":       r.Header.Get("X-Forwarded-For"),
+				"realip":    r.Header.Get("X-Real-IP"),
+				"forwarded": r.Header.Get("Forwarded"),
+				"token":     r.Header.Get(HeaderPiccoloHintToken),
+			}
+			select {
+			case backendReqs <- headers:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+	go srv.Serve(backendLn)
+	defer srv.Shutdown(context.Background())
+
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+
+	pm := NewProxyManager()
+	public := getFreePort(t)
+	ep := ServiceEndpoint{
+		App:        "test",
+		Name:       "web",
+		GuestPort:  0,
+		HostBind:   backendPort,
+		PublicPort: public,
+		Flow:       api.FlowTCP,
+		Protocol:   api.ListenerProtocolHTTP,
+		Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{{
+			Path:     "/",
+			Type:     "prefix",
+			Strategy: "public",
+		}}},
+	}
+	pm.StartListener(ep)
+	defer pm.StopAll()
+	time.Sleep(100 * time.Millisecond)
+
+	hostIP := getNonLoopbackIPv4(t)
+	target := fmt.Sprintf("http://%s:%d/", hostIP, public)
+
+	token, ok := pm.IssueRequestHint(ep.PublicPort, "203.0.113.99", false, 80)
+	if !ok || token == "" {
+		t.Fatalf("expected hint token issuance to succeed")
+	}
+	req, _ := http.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set(HeaderPiccoloHintToken, token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Skipf("dial %s failed: %v", target, err)
+	}
+	resp.Body.Close()
+
+	select {
+	case headers := <-backendReqs:
+		// ReverseProxy appends its own hop to X-Forwarded-For; the hinted client IP must be first.
+		if !strings.HasPrefix(headers["xff"], "203.0.113.99") {
+			t.Fatalf("expected X-Forwarded-For to start with hinted client IP, got %q", headers["xff"])
+		}
+		if headers["realip"] != "203.0.113.99" {
+			t.Fatalf("expected X-Real-IP to use hinted client IP, got %q", headers["realip"])
+		}
+		if !strings.Contains(headers["forwarded"], "for=203.0.113.99") {
+			t.Fatalf("expected Forwarded to include hinted for, got %q", headers["forwarded"])
+		}
+		if headers["token"] != "" {
+			t.Fatalf("expected hint token header to not reach backend, got %q", headers["token"])
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for backend request (hint token)")
+	}
+
+	// Reusing the same token should have no effect (single-use consumption).
+	req, _ = http.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set(HeaderPiccoloHintToken, token)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Skipf("second dial %s failed: %v", target, err)
+	}
+	resp.Body.Close()
+
+	select {
+	case headers := <-backendReqs:
+		if headers["xff"] == "203.0.113.99" {
+			t.Fatalf("expected X-Forwarded-For to not reuse consumed hint token")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for backend request (reused token)")
 	}
 }
 

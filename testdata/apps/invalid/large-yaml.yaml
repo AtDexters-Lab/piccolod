@@ -1,5 +1,5 @@
 # Security test: extremely large YAML content
-name: large-app
+name: largeapp
 listeners:
   - name: web
     guest_port: 80

@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -22,12 +24,26 @@ import (
 var frameAncestorsRe = regexp.MustCompile(`(?i)frame-ancestors\s+[^;]+(; ?)?`)
 
 type connectionHint struct {
+	clientIP   string
 	isTLS      bool
 	remotePort int
 }
 
 type hintContextKey struct{}
 type hintLookupContextKey struct{}
+
+const (
+	HeaderPiccoloHintToken = "X-Piccolo-Hint-Token"
+	requestHintTokenBytes  = 18
+	requestHintTokenTTL    = 15 * time.Second
+	requestHintTokenMax    = 4096
+)
+
+type tokenHintEntry struct {
+	hint         connectionHint
+	listenerPort int
+	expiresAt    time.Time
+}
 
 type hintLookup struct {
 	pm           *ProxyManager
@@ -54,6 +70,7 @@ type ProxyManager struct {
 	mu                sync.Mutex
 	listeners         map[int]net.Listener // by public port
 	hints             map[int]map[int]connectionHint
+	tokenHints        map[string]tokenHintEntry
 	cspFrameAncestors string // pre-calculated CSP header value
 	wg                sync.WaitGroup
 	acme              http.Handler
@@ -71,6 +88,119 @@ func NewProxyManager() *ProxyManager {
 		listeners:         make(map[int]net.Listener),
 		cspFrameAncestors: "frame-ancestors \"self\" http://localhost:* http://*.local:* https://*.local:*",
 	}
+}
+
+func (p *ProxyManager) IssueRequestHint(listenerPort int, clientIP string, isTLS bool, remotePort int) (string, bool) {
+	if listenerPort <= 0 {
+		return "", false
+	}
+	clientIP = strings.TrimSpace(clientIP)
+	if clientIP != "" {
+		if ip := net.ParseIP(clientIP); ip == nil {
+			return "", false
+		}
+	}
+	if remotePort < 0 {
+		return "", false
+	}
+
+	token, err := randomHintToken()
+	if err != nil {
+		return "", false
+	}
+	now := time.Now()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.pruneTokenHintsLocked(now)
+	if p.tokenHints == nil {
+		p.tokenHints = make(map[string]tokenHintEntry)
+	}
+
+	for i := 0; i < 4; i++ {
+		if _, exists := p.tokenHints[token]; !exists {
+			break
+		}
+		tok, err := randomHintToken()
+		if err != nil {
+			return "", false
+		}
+		token = tok
+	}
+	if _, exists := p.tokenHints[token]; exists {
+		return "", false
+	}
+
+	// Best-effort bound: if we're at max after pruning, evict one arbitrary entry.
+	if len(p.tokenHints) >= requestHintTokenMax {
+		for k := range p.tokenHints {
+			delete(p.tokenHints, k)
+			break
+		}
+	}
+
+	p.tokenHints[token] = tokenHintEntry{
+		hint: connectionHint{
+			clientIP:   clientIP,
+			isTLS:      isTLS,
+			remotePort: remotePort,
+		},
+		listenerPort: listenerPort,
+		expiresAt:    now.Add(requestHintTokenTTL),
+	}
+	return token, true
+}
+
+func (p *ProxyManager) consumeRequestHint(listenerPort int, token string) (connectionHint, bool) {
+	if p == nil || listenerPort <= 0 {
+		return connectionHint{}, false
+	}
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return connectionHint{}, false
+	}
+	now := time.Now()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pruneTokenHintsLocked(now)
+	if p.tokenHints == nil {
+		return connectionHint{}, false
+	}
+	entry, ok := p.tokenHints[token]
+	if ok {
+		delete(p.tokenHints, token)
+	}
+	if !ok {
+		return connectionHint{}, false
+	}
+	if entry.listenerPort != listenerPort {
+		return connectionHint{}, false
+	}
+	if now.After(entry.expiresAt) {
+		return connectionHint{}, false
+	}
+	return entry.hint, true
+}
+
+func (p *ProxyManager) pruneTokenHintsLocked(now time.Time) {
+	if p == nil || p.tokenHints == nil {
+		return
+	}
+	for k, v := range p.tokenHints {
+		if now.After(v.expiresAt) {
+			delete(p.tokenHints, k)
+		}
+	}
+}
+
+func randomHintToken() (string, error) {
+	var b [requestHintTokenBytes]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
 func (p *ProxyManager) registerHint(listenerPort, sourcePort int, hint connectionHint) {
@@ -304,6 +434,33 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 
 	// Single handler that enforces listener auth rules (per-path) before forwarding.
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Zero-trust: for non-loopback listener hops, do not allow clients to influence
+		// portal origin / redirect scheme / host via spoofed forwarding headers.
+		// Loopback-only sources (e.g., Nexus via TLS mux) remain eligible for trusted forwarding.
+		trustedLoopback := false
+		if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+			if host, _, err := net.SplitHostPort(localAddr.String()); err == nil {
+				if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+					trustedLoopback = true
+				}
+			}
+		}
+		if !trustedLoopback {
+			r.Header.Del("Forwarded")
+			r.Header.Del("X-Forwarded-For")
+			r.Header.Del("X-Forwarded-Proto")
+			r.Header.Del("X-Forwarded-Host")
+			r.Header.Del("X-Forwarded-Port")
+			r.Header.Del("X-Real-IP")
+		}
+
+		if token := strings.TrimSpace(r.Header.Get(HeaderPiccoloHintToken)); token != "" {
+			r.Header.Del(HeaderPiccoloHintToken)
+			if hint, ok := p.consumeRequestHint(ep.PublicPort, token); ok {
+				r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, hint))
+			}
+		}
+
 		cleanedPath, pathErr := normalizeAndSetRequestPath(r)
 		if pathErr != "" {
 			// RFC 7.2: runtime path errors
@@ -535,9 +692,22 @@ func applyForwardHeaders(r *http.Request, ep ServiceEndpoint) {
 	} else {
 		clientIP = r.RemoteAddr
 	}
+	if hint, ok := hintFromRequest(r); ok {
+		if strings.TrimSpace(hint.clientIP) != "" {
+			clientIP = hint.clientIP
+		}
+	}
+
+	// Trust based on LocalAddr (the interface that received the connection), not RemoteAddr.
+	// This prevents header spoofing via internal routing (e.g., LAN host-based routing)
+	// while still trusting traffic that arrives on loopback-only listeners (e.g., Nexus via TLS mux).
 	trusted := false
-	if ip := net.ParseIP(clientIP); ip != nil && ip.IsLoopback() {
-		trusted = true
+	if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+		if host, _, err := net.SplitHostPort(localAddr.String()); err == nil {
+			if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+				trusted = true
+			}
+		}
 	}
 
 	host, hostPort := splitHostPortValue(r.Host)

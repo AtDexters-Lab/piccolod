@@ -538,6 +538,7 @@ func TestRemote_PortalHostnamePersistsAndAppCertQueued(t *testing.T) {
 		t.Fatalf("expected portal certificate to be issued, got status=%q", status)
 	}
 
+	// Per RFC 20260114: listener names must be lowercase letters and numbers only
 	wordpress := `name: wordpress
 type: user
 listeners:
@@ -545,7 +546,7 @@ listeners:
     guest_port: 80
     flow: tcp
     protocol: http
-  - name: "Web App"
+  - name: webapp
     guest_port: 8080
     flow: tcp
     protocol: http
@@ -565,10 +566,12 @@ x-piccolo:
 		t.Fatalf("install status=%d body=%s", w.Code, w.Body.String())
 	}
 
-	if status := waitForCertificateDomain(t, srv.remoteManager, "web.example.com", 5*time.Second); !strings.EqualFold(status, "ok") {
+	// Per RFC 20260114: primary listener gets <app>.<base> hostname where <base> is the portal hostname apex.
+	// "web" is the first HTTP listener so it's primary, hostname = "wordpress.piccolo.example.com"
+	if status := waitForCertificateDomain(t, srv.remoteManager, "wordpress.piccolo.example.com", 5*time.Second); !strings.EqualFold(status, "ok") {
 		for _, cert := range srv.remoteManager.ListCertificates() {
-			if hasDomain(cert, "web.example.com") {
-				t.Logf("alias certificate status=%s reason=%s", cert.Status, cert.FailureReason)
+			if hasDomain(cert, "wordpress.piccolo.example.com") {
+				t.Logf("primary listener certificate status=%s reason=%s", cert.Status, cert.FailureReason)
 			}
 		}
 		t.Fatalf("expected app listener certificate to be issued, got status=%q", status)

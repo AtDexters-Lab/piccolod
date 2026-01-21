@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -86,7 +87,7 @@ func TestGinAppAPI_Install(t *testing.T) {
 			name:        "install valid nginx app",
 			method:      "POST",
 			contentType: "application/x-yaml",
-			body: `name: test-nginx
+			body: `name: testnginx
 type: user
 listeners:
   - name: web
@@ -194,7 +195,7 @@ func TestGinAppAPI_Install_JSON_WithDisplayName(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	payload := map[string]interface{}{
-		"app_definition": `name: test-nginx
+		"app_definition": `name: testnginx
 type: user
 listeners:
   - name: web
@@ -239,8 +240,8 @@ x-piccolo:
 	if got := data["display_name"]; got != "Work Projects" {
 		t.Fatalf("expected display_name %q, got %#v", "Work Projects", got)
 	}
-	if got := data["instance_id"]; got != "test-nginx" {
-		t.Fatalf("expected instance_id %q, got %#v", "test-nginx", got)
+	if got := data["instance_id"]; got != "testnginx" {
+		t.Fatalf("expected instance_id %q, got %#v", "testnginx", got)
 	}
 }
 
@@ -344,7 +345,7 @@ func TestGinAppAPI_List(t *testing.T) {
 
 	// Install an app via the app manager directly
 	appDef := &api.AppDefinition{
-		Name:      "test-app",
+		Name:      "testapp",
 		Type:      "user",
 		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
 		Services: map[string]api.AppService{
@@ -404,7 +405,8 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	if strings.TrimSpace(status.TLD) == "" {
 		t.Fatalf("remote status missing tld: %+v", status)
 	}
-	if host := srv.remoteServiceHostname(&status, services.ServiceEndpoint{Name: "web"}); host == "" {
+	// Test hostname derivation with proper DerivedHostLabel (per RFC 20260114)
+	if host := srv.remoteServiceHostname(&status, services.ServiceEndpoint{Name: "web", DerivedHostLabel: "testapp"}); host == "" {
 		t.Fatalf("remote hostname derivation failed")
 	}
 	srv.refreshRemoteRuntime()
@@ -457,8 +459,9 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected remote_host field on service: %#v", first)
 	}
-	if remoteHost != "web.example.com" {
-		t.Fatalf("unexpected remote_host %q", remoteHost)
+	// Per RFC 20260114: primary listener gets <app>.<base> hostname where <base> is the portal hostname apex.
+	if remoteHost != "blog.portal.example.com" {
+		t.Fatalf("unexpected remote_host %q (expected blog.portal.example.com per RFC 20260114)", remoteHost)
 	}
 
 	rawContainers, ok := data["containers"].([]interface{})
@@ -483,7 +486,7 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:      "test-app",
+		Name:      "testapp",
 		Type:      "user",
 		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
 		Services: map[string]api.AppService{
@@ -505,7 +508,7 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 	}{
 		{
 			name:           "get existing app",
-			appName:        "test-app",
+			appName:        "testapp",
 			expectedStatus: http.StatusOK,
 			expectError:    false,
 		},
@@ -560,7 +563,7 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:      "test-app",
+		Name:      "testapp",
 		Type:      "user",
 		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
 		Services: map[string]api.AppService{
@@ -584,21 +587,21 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 		{
 			name:           "start app",
 			method:         "POST",
-			url:            "/api/v1/apps/test-app/start",
+			url:            "/api/v1/apps/testapp/start",
 			expectedStatus: http.StatusOK,
 			expectError:    false,
 		},
 		{
 			name:           "stop app",
 			method:         "POST",
-			url:            "/api/v1/apps/test-app/stop",
+			url:            "/api/v1/apps/testapp/stop",
 			expectedStatus: http.StatusOK,
 			expectError:    false,
 		},
 		{
 			name:           "wrong method for action",
 			method:         "GET",
-			url:            "/api/v1/apps/test-app/start",
+			url:            "/api/v1/apps/testapp/start",
 			expectedStatus: http.StatusNotFound, // Gin returns 404 for unregistered routes
 			expectError:    false,               // 404 responses are plain text, not JSON
 		},
@@ -657,7 +660,7 @@ func TestGinAppAPI_FullLifecycle(t *testing.T) {
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
-	appYAML := `name: lifecycle-test
+	appYAML := `name: lifecycletest
 type: user
 listeners:
   - name: web
@@ -701,7 +704,7 @@ x-piccolo:
 
 	// 3. Get specific app details
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("GET", "/api/v1/apps/lifecycle-test", nil)
+	req, _ = http.NewRequest("GET", "/api/v1/apps/lifecycletest", nil)
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -711,7 +714,7 @@ x-piccolo:
 
 	// 4. Start the app
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/api/v1/apps/lifecycle-test/start", nil)
+	req, _ = http.NewRequest("POST", "/api/v1/apps/lifecycletest/start", nil)
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -721,7 +724,7 @@ x-piccolo:
 
 	// 5. Stop the app
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/api/v1/apps/lifecycle-test/stop", nil)
+	req, _ = http.NewRequest("POST", "/api/v1/apps/lifecycletest/stop", nil)
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -731,7 +734,7 @@ x-piccolo:
 
 	// 6. Uninstall the app
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("DELETE", "/api/v1/apps/lifecycle-test", nil)
+	req, _ = http.NewRequest("DELETE", "/api/v1/apps/lifecycletest", nil)
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -780,7 +783,7 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:      "test-app",
+		Name:      "testapp",
 		Type:      "user",
 		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
 		Services: map[string]api.AppService{
@@ -796,7 +799,7 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 
 	// Test successful uninstall
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("DELETE", "/api/v1/apps/test-app", nil)
+	req, _ := http.NewRequest("DELETE", "/api/v1/apps/testapp", nil)
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -1094,7 +1097,7 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	remoteResolver := newServiceRemoteResolver(svcMgr)
 
 	// Catalog manager stub (avoid outbound network calls).
-	catalogStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	catalogHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/index.yaml":
 			w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
@@ -1123,7 +1126,16 @@ x-piccolo:
 		default:
 			http.NotFound(w, r)
 		}
-	}))
+	})
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("catalog stub listen: %v", err)
+	}
+	catalogStub := &httptest.Server{
+		Listener: ln,
+		Config:   &http.Server{Handler: catalogHandler},
+	}
+	catalogStub.Start()
 	t.Cleanup(catalogStub.Close)
 	catalogMgr := catalog.NewManager(catalogStub.URL, filepath.Join(tempDir, "catalog-cache"))
 
@@ -1611,7 +1623,7 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	// But we can use AllocateForApp if we mock it, OR just manually register an app first.
 	// Let's use Install() for consistency
 	appDef := &api.AppDefinition{
-		Name:      "url-test",
+		Name:      "urltest",
 		Type:      "user",
 		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
 		Services: map[string]api.AppService{
@@ -1625,7 +1637,7 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	}
 
 	// Fetch endpoint to get allocated port
-	eps, err := server.serviceManager.GetByApp("url-test")
+	eps, err := server.serviceManager.GetByApp("urltest")
 	if err != nil || len(eps) != 1 {
 		t.Fatalf("expected 1 endpoint, got %v err=%v", eps, err)
 	}
@@ -1633,7 +1645,7 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 
 	// 1. Request with standard host
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/api/v1/apps/url-test", nil)
+	req, _ := http.NewRequest("GET", "/api/v1/apps/urltest", nil)
 	req.Host = "piccolo.local"
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
@@ -1657,7 +1669,7 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 
 	// 2. Request with IP host
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("GET", "/api/v1/apps/url-test", nil)
+	req, _ = http.NewRequest("GET", "/api/v1/apps/urltest", nil)
 	req.Host = "192.168.1.50:8080"
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)

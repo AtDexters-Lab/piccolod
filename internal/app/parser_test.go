@@ -18,11 +18,11 @@ func TestParseAppDefinition(t *testing.T) {
 		validateFields func(*testing.T, *api.AppDefinition)
 	}{
 		{
-			name:          "minimal app",
-			filePath:      "../../testdata/apps/valid/minimal.yaml",
-			expectedName:  "test-minimal",
-			expectedType:  "user", // default
-			expectError:   false,
+			name:         "minimal app",
+			filePath:     "../../testdata/apps/valid/minimal.yaml",
+			expectedName: "testminimal",
+			expectedType: "user", // default
+			expectError:  false,
 			validateFields: func(t *testing.T, app *api.AppDefinition) {
 				if app.Services == nil {
 					t.Fatal("expected services to be defined")
@@ -39,7 +39,7 @@ func TestParseAppDefinition(t *testing.T) {
 		{
 			name:         "complete app",
 			filePath:     "../../testdata/apps/valid/complete.yaml",
-			expectedName: "test-complete",
+			expectedName: "testcomplete",
 			expectedType: "user",
 			expectError:  false,
 			validateFields: func(t *testing.T, app *api.AppDefinition) {
@@ -172,7 +172,7 @@ func TestValidateAppDefinition(t *testing.T) {
 		{
 			name: "valid minimal app",
 			app: &api.AppDefinition{
-				Name:      "test-app",
+				Name:      "testapp",
 				Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
 				Services: map[string]api.AppService{
 					"main": {Image: "nginx:latest", BindPorts: []int{80}},
@@ -184,7 +184,7 @@ func TestValidateAppDefinition(t *testing.T) {
 		{
 			name: "missing x-piccolo.mode",
 			app: &api.AppDefinition{
-				Name:      "test-app",
+				Name:      "testapp",
 				Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
 				Services: map[string]api.AppService{
 					"main": {Image: "nginx:latest", BindPorts: []int{80}},
@@ -204,24 +204,30 @@ func TestValidateAppDefinition(t *testing.T) {
 			name:        "invalid name characters",
 			app:         &api.AppDefinition{Name: "test_app!", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
 			expectError: true,
-			expectedErr: "name must contain only lowercase letters, numbers, and hyphens",
+			expectedErr: "name must contain only lowercase letters and numbers",
+		},
+		{
+			name:        "name with hyphen",
+			app:         &api.AppDefinition{Name: "test-app", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
+			expectError: true,
+			expectedErr: "no hyphens allowed",
 		},
 		{
 			name:        "name too long",
-			app:         &api.AppDefinition{Name: "this-is-a-very-long-app-name-that-exceeds-the-maximum-allowed-length", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
+			app:         &api.AppDefinition{Name: "abcdefghijklmnopqrstuvwxyz123456", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
 			expectError: true,
-			expectedErr: "name must be 50 characters or less",
+			expectedErr: "name must be 31 characters or less",
 		},
 		{
 			name:        "missing services",
-			app:         &api.AppDefinition{Name: "test-app", Extensions: map[string]interface{}{"mode": "service"}},
+			app:         &api.AppDefinition{Name: "testapp", Extensions: map[string]interface{}{"mode": "service"}},
 			expectError: true,
 			expectedErr: "services is required",
 		},
 		{
 			name: "invalid listener port",
 			app: &api.AppDefinition{
-				Name:      "test-app",
+				Name:      "testapp",
 				Listeners: []api.AppListener{{Name: "web", GuestPort: 0}},
 				Services: map[string]api.AppService{
 					"main": {Image: "nginx:latest", BindPorts: []int{80}},
@@ -383,14 +389,14 @@ func TestLargeContentHandling(t *testing.T) {
 		t.Fatalf("Should handle reasonably large content, but got error: %v", err)
 	}
 
-	if app.Name != "large-app" {
-		t.Errorf("Expected name 'large-app', got %s", app.Name)
+	if app.Name != "largeapp" {
+		t.Errorf("Expected name 'largeapp', got %s", app.Name)
 	}
 }
 
 func TestParseAppDefinitionRejectsFilesystemBlock(t *testing.T) {
 	legacy := `
-name: test-app
+name: testapp
 listeners:
   - name: web
     guest_port: 80
@@ -415,7 +421,7 @@ x-piccolo:
 
 func TestParseAppDefinitionRejectsStorageHostPaths(t *testing.T) {
 	legacy := `
-name: test-app
+name: testapp
 listeners:
   - name: web
     guest_port: 80
@@ -443,7 +449,7 @@ x-piccolo:
 
 func TestParseAppDefinitionRejectsStoragePathConflicts(t *testing.T) {
 	conflict := `
-name: test-app
+name: testapp
 listeners:
   - name: web
     guest_port: 80

@@ -247,6 +247,7 @@ type AppListener struct {
 	GuestPort   int                     `yaml:"guest_port" json:"guest_port"`
 	Flow        ListenerFlow            `yaml:"flow,omitempty" json:"flow,omitempty"`
 	Protocol    ListenerProtocol        `yaml:"protocol,omitempty" json:"protocol,omitempty"`
+	Primary     bool                    `yaml:"primary,omitempty" json:"primary,omitempty"` // Marks this as the primary HTTP/WS listener for host-based routing
 	Middleware  []AppProtocolMiddleware `yaml:"protocol_middleware,omitempty" json:"protocol_middleware,omitempty"`
 	RemotePorts []int                   `yaml:"remote_ports,omitempty" json:"remote_ports,omitempty"`
 	Auth        *ListenerAuth           `yaml:"auth,omitempty" json:"auth,omitempty"`

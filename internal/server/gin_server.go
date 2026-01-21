@@ -159,14 +159,11 @@ func newServiceRemoteResolver(svc *services.ServiceManager) *serviceRemoteResolv
 
 func (r *serviceRemoteResolver) UpdateConfig(cfg nexusclient.Config) {
 	r.mu.Lock()
-	r.portal = strings.TrimSuffix(strings.ToLower(cfg.PortalHostname), ".")
-	domain := strings.TrimSuffix(strings.ToLower(cfg.TLD), ".")
-	if domain == "" && r.portal != "" {
-		if idx := strings.Index(r.portal, "."); idx != -1 {
-			domain = r.portal[idx+1:]
-		}
-	}
-	r.domain = domain
+	portal := strings.TrimSuffix(strings.ToLower(cfg.PortalHostname), ".")
+	// RFC 20260114: remote base is the portal hostname apex itself.
+	// App hostnames are <label>.<portal>.
+	r.portal = portal
+	r.domain = portal
 	r.mu.Unlock()
 }
 
@@ -214,12 +211,19 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 	tlsMuxPort := r.tlsMuxPort
 	r.mu.RUnlock()
 
+	// Strict RFC 20260114: remote resolution is only valid when the portal hostname (remote base)
+	// is configured. Without it, we do not attempt any hostname/port fallbacks.
+	if portal == "" || domain == "" {
+		return 0, false
+	}
+
 	normPort := remotePort
 	if normPort == acmeHTTPFallbackPort {
 		normPort = 80
 	}
 
-	// Portal host: treat as flow=tcp (device-terminated TLS when not 80)
+	// Portal host (apex): treat as flow=tcp (device-terminated TLS when not 80)
+	// Per RFC 20260114 Section 5.1 step 1: <base> always routes to portal
 	if portal != "" && h == portal {
 		if normPort == 80 {
 			return portalPort, true
@@ -227,27 +231,30 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 		if isTLS && tlsMuxPort > 0 {
 			return tlsMuxPort, true
 		}
-		// Fallback to portalPort if mux not running (unit tests)
-		return portalPort, true
+		return 0, false
 	}
 
-	listener := ""
+	// Extract host label from hostname (RFC 20260114)
+	// Format: <app>.<base> (primary) or <listener>-<app>.<base> (non-primary)
+	hostLabel := ""
 	if domain != "" {
 		suffix := "." + domain
 		if strings.HasSuffix(h, suffix) {
 			label := h[:len(h)-len(suffix)]
+			// Only take the first label (no nested subdomains)
 			if idx := strings.Index(label, "."); idx != -1 {
 				label = label[:idx]
 			}
-			listener = label
+			hostLabel = label
 		}
 	} else if idx := strings.Index(h, "."); idx != -1 {
-		listener = h[:idx]
+		hostLabel = h[:idx]
 	}
 
-	// Listener host
-	if listener != "" {
-		if ep, ok := r.services.ResolveListener(listener, normPort); ok {
+	// Resolve by host label (RFC 20260114)
+	// This handles both <app>.<base> (primary) and <listener>-<app>.<base> (non-primary)
+	if hostLabel != "" {
+		if ep, ok := r.services.ResolveByHostLabel(hostLabel, normPort); ok {
 			if ep.Flow == api.FlowTLS {
 				return ep.PublicPort, true
 			}
@@ -259,20 +266,6 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 			}
 			return ep.PublicPort, true
 		}
-	}
-
-	// Fallback by port only (rare): apply same flow policy when we find an ep
-	if ep, ok := r.services.ResolveByRemotePort(normPort); ok {
-		if ep.Flow == api.FlowTLS {
-			return ep.PublicPort, true
-		}
-		if normPort == 80 {
-			return ep.PublicPort, true
-		}
-		if isTLS && tlsMuxPort > 0 {
-			return tlsMuxPort, true
-		}
-		return ep.PublicPort, true
 	}
 
 	return 0, false
@@ -539,8 +532,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if !st.Enabled || !strings.EqualFold(st.Solver, "http-01") {
 				return
 			}
-			tld := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(st.TLD)), ".")
-			if tld == "" {
+			base := remoteBaseHostname(&st)
+			if base == "" {
 				return
 			}
 			h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
@@ -551,10 +544,10 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if portal != "" && h == portal {
 				return
 			}
-			if !strings.HasSuffix(h, "."+tld) {
+			if !strings.HasSuffix(h, "."+base) {
 				return
 			}
-			label := strings.TrimSuffix(h, "."+tld)
+			label := strings.TrimSuffix(h, "."+base)
 			if i := strings.Index(label, "."); i != -1 {
 				label = label[:i]
 			}
@@ -599,6 +592,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Rehydrate proxies for containers that survived restarts
 	appMgr.RestoreServices(context.Background())
+
+	// Refresh mDNS aliases for restored apps so host-based routing works after restart
+	s.refreshMDNSAliases()
 
 	s.setupGinRoutes()
 	if err := s.initSecureLoopback(); err != nil {
@@ -731,6 +727,9 @@ func (s *GinServer) setupGinRoutes() {
 	r.Use(gzip.Gzip(gzip.DefaultCompression))
 	r.Use(s.corsMiddleware())
 	r.Use(s.httpsRedirectMiddleware())
+	// LAN host routing must run BEFORE security headers to avoid portal-only headers
+	// (e.g., X-Frame-Options: DENY, Cross-Origin-Embedder-Policy) leaking into app responses.
+	r.Use(s.lanHostRoutingMiddleware())
 	r.Use(s.securityHeadersMiddleware())
 
 	// Optional: OpenAPI request validation (enabled when validator is initialized)
@@ -1025,8 +1024,9 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 		remoteHostValue = remoteHost
 	}
 	scheme := determineScheme(ep.Flow, ep.Protocol)
-	localURL := s.determineLocalURL(c, ep, scheme)
-	return gin.H{
+	lanPortURL := s.determineLocalURL(c, ep, scheme)
+
+	result := gin.H{
 		"app":          ep.App,
 		"name":         ep.Name,
 		"guest_port":   ep.GuestPort,
@@ -1036,10 +1036,30 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 		"remote_host":  remoteHostValue,
 		"flow":         ep.Flow,
 		"protocol":     ep.Protocol,
+		"primary":      ep.Primary,
 		"middleware":   ep.Middleware,
 		"scheme":       scheme,
-		"local_url":    localURL,
+		"local_url":    lanPortURL, // Keep for backward compatibility
+		"lan_port_url": lanPortURL, // New explicit name
 	}
+
+	// Add host-based URLs only for HTTP/WS listeners (per RFC 20260114)
+	if ep.DerivedHostLabel != "" {
+		// LAN host URL: only if mDNS is enabled (mdnsManager is nil when disabled)
+		if s.mdnsManager != nil {
+			lanBase := s.mdnsManager.Hostname()
+			lanHostURL := fmt.Sprintf("%s://%s.%s", scheme, ep.DerivedHostLabel, lanBase)
+			result["lan_host_url"] = lanHostURL
+		}
+
+		// Remote URL: only if remote is enabled
+		if remoteHost != "" {
+			remoteURL := "https://" + remoteHost
+			result["remote_url"] = remoteURL
+		}
+	}
+
+	return result
 }
 
 func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoint, scheme string) *string {
@@ -1059,23 +1079,34 @@ func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoin
 	return &url
 }
 
+// remoteBaseHostname returns the RFC 20260114 remote base hostname (portal hostname apex).
+// It is used as the suffix for all derived remote app hostnames: <label>.<base>.
+func remoteBaseHostname(status *remote.Status) string {
+	if status == nil || !status.Enabled {
+		return ""
+	}
+	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(status.PortalHostname)), ".")
+	if base == "" {
+		return ""
+	}
+	// Defensive: remote config should not include ports, but normalize if it does.
+	if h, _, err := net.SplitHostPort(base); err == nil {
+		base = h
+	}
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
+}
+
 func (s *GinServer) remoteServiceHostname(status *remote.Status, ep services.ServiceEndpoint) string {
-	if s == nil || status == nil || !status.Enabled {
+	base := remoteBaseHostname(status)
+	if s == nil || base == "" {
 		return ""
 	}
-	tld := strings.Trim(strings.TrimSuffix(strings.ToLower(status.TLD), "."), " ")
-	if tld == "" {
+	// Only HTTP/WS listeners get host-based URLs (per RFC 20260114)
+	// DerivedHostLabel is empty for raw/tls listeners
+	if ep.DerivedHostLabel == "" {
 		return ""
 	}
-	name := strings.TrimSpace(ep.Name)
-	if name == "" {
-		return ""
-	}
-	label := strings.ToLower(name)
-	if !isValidDNSLabel(label) {
-		return ""
-	}
-	return label + "." + tld
+	return ep.DerivedHostLabel + "." + base
 }
 
 func (s *GinServer) handlePersistenceControlExport(c *gin.Context) {
@@ -1208,6 +1239,29 @@ func (s *GinServer) refreshRemoteRuntime() {
 	s.applyRemoteRuntimeFromStatus(status)
 }
 
+// refreshMDNSAliases updates mDNS to advertise host labels for all HTTP/WS listeners.
+// Per RFC 20260114 Section 5.2, aliases are only advertised for listeners eligible
+// for host-based routing (protocol:http|websocket + flow:tcp).
+func (s *GinServer) refreshMDNSAliases() {
+	// mdnsManager is nil when mDNS is disabled via PICCOLO_DISABLE_MDNS
+	if s == nil || s.mdnsManager == nil || s.serviceManager == nil {
+		return
+	}
+	labels := s.serviceManager.GetAllHostLabels()
+	aliases := make([]string, 0, len(labels))
+	for label := range labels {
+		if label != "" { // Only HTTP/WS listeners have labels
+			aliases = append(aliases, label)
+		}
+	}
+	// SetHostAliases takes LABELS (e.g., "immich", "metrics-immich")
+	// mDNS manager advertises base hostname (piccolo.local.) plus
+	// alias FQDNs ({label}.{baseName}.local.)
+	if err := s.mdnsManager.SetHostAliases(aliases); err != nil {
+		log.Printf("WARN: mDNS alias update failed: %v", err)
+	}
+}
+
 func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 	if s == nil || s.tlsMux == nil {
 		return
@@ -1228,7 +1282,8 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 		s.serviceManager.ProxyManager().SetAllowedAncestors(ancestors)
 	}
 
-	s.tlsMux.UpdateConfig(status.PortalHostname, status.TLD, s.resolvePortalPort())
+	// RFC 20260114: remote base is the portal hostname apex; app hosts are <label>.<base>.
+	s.tlsMux.UpdateConfig(status.PortalHostname, status.PortalHostname, s.resolvePortalPort())
 	if status.Enabled && strings.TrimSpace(status.PortalHostname) != "" {
 		if port, err := s.tlsMux.Start(); err == nil {
 			if s.remoteResolver != nil {
@@ -1577,7 +1632,6 @@ func (s *GinServer) httpsRedirectMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		log.Println("[DEBUG] doing redirect")
 		if net.ParseIP(host) != nil {
 			c.Next()
 			return

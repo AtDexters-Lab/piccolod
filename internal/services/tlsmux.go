@@ -227,14 +227,16 @@ func (m *TlsMux) resolveUpstream(host string) int {
 	if host == portal {
 		return portalPort
 	}
-	// listener.<domain> → map to ServiceManager public_port
+	// <app>.<domain> or <listener>-<app>.<domain> → map to ServiceManager public_port
+	// Per RFC 20260114: use DerivedHostLabel for routing (primary=<app>, others=<listener>-<app>)
 	if domain != "" && strings.HasSuffix(host, "."+domain) {
 		label := strings.TrimSuffix(host, "."+domain)
 		if i := strings.Index(label, "."); i != -1 {
 			label = label[:i]
 		}
 		if label != "" && m.services != nil {
-			if ep, ok := m.services.ResolveListener(label, 443); ok {
+			// Use ResolveByHostLabel for RFC 20260114 hostname scheme
+			if ep, ok := m.services.ResolveByHostLabel(label, 443); ok {
 				return ep.PublicPort
 			}
 		}

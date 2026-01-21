@@ -126,7 +126,7 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 				// Check Remote Host
 				if s.remoteManager != nil {
 					st := s.remoteManager.Status()
-					if st.Enabled && st.TLD != "" {
+					if st.Enabled && strings.TrimSpace(st.PortalHostname) != "" {
 						remoteHost := s.remoteServiceHostname(&st, ep)
 						if remoteHost != "" && u.Scheme == "https" {
 							// Compare hostname, handling explicit :443 port
@@ -160,7 +160,23 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 					}
 				}
 
-				// Check Local Host - support both mDNS hostname and IP address access
+				// Check LAN host-based URLs (per RFC 20260114)
+				// Format: http://<app>.piccolo.local or http://<listener>-<app>.piccolo.local
+				if ep.DerivedHostLabel != "" && (u.Scheme == "http" || u.Scheme == "https") {
+					lanHost := ep.DerivedHostLabel + "." + localHostname
+					reqHost := u.Host
+					// Strip default ports for comparison (:80 for http, :443 for https)
+					if h, p, err := net.SplitHostPort(u.Host); err == nil {
+						if (u.Scheme == "http" && p == "80") || (u.Scheme == "https" && p == "443") {
+							reqHost = h
+						}
+					}
+					if strings.EqualFold(reqHost, lanHost) {
+						return []string{requested}, nil
+					}
+				}
+
+				// Check Local Host (port-based) - support both mDNS hostname and IP address access
 				// Local origin can be:
 				// - http://piccolo.local:<PublicPort> (or piccolo-abc123.local if conflict)
 				// - http://<lan-ip>:<PublicPort> (for clients without mDNS)
@@ -192,7 +208,7 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 	// Remote info
 	if s.remoteManager != nil {
 		st := s.remoteManager.Status()
-		if st.Enabled && st.TLD != "" {
+		if st.Enabled && strings.TrimSpace(st.PortalHostname) != "" {
 			for _, ep := range endpoints {
 				host := s.remoteServiceHostname(&st, ep)
 				if host != "" {
@@ -210,7 +226,15 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 
 	// Let's try to return roots and common paths.
 	for _, ep := range endpoints {
-		// Local
+		// LAN host-based URLs (per RFC 20260114)
+		if ep.DerivedHostLabel != "" {
+			lanHost := ep.DerivedHostLabel + "." + localHostname
+			uris = append(uris, fmt.Sprintf("http://%s/callback", lanHost))
+			uris = append(uris, fmt.Sprintf("http://%s/oauth/callback", lanHost))
+			uris = append(uris, fmt.Sprintf("http://%s/", lanHost))
+		}
+
+		// LAN port-based URLs (fallback)
 		uris = append(uris, fmt.Sprintf("http://%s:%d/callback", localHostname, ep.PublicPort))
 		uris = append(uris, fmt.Sprintf("http://%s:%d/auth/callback", localHostname, ep.PublicPort))
 		uris = append(uris, fmt.Sprintf("http://%s:%d/oauth/callback", localHostname, ep.PublicPort))
