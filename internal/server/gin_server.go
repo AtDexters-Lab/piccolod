@@ -312,6 +312,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	routeMgr := router.NewManager()
 	remoteResolver := newServiceRemoteResolver(svcMgr)
 	svcMgr.ObserveRuntimeEvents(eventsBus)
+	svcMgr.SetEventBus(eventsBus)
 	// TLS mux (loopback, remote-only) — created now, started when remote is configured
 	tlsMux := services.NewTlsMux(svcMgr)
 	// Wire ACME HTTP-01 handler into HTTP proxies (set after remote manager init)
@@ -366,6 +367,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			}
 		}
 		mdnsMgr.SetPort(mdnsPort)
+		mdnsMgr.ObserveServiceEndpoints(eventsBus)
 	}
 
 	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), filepath.Join(stateDir, "tmp", "catalog"))
@@ -592,9 +594,6 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Rehydrate proxies for containers that survived restarts
 	appMgr.RestoreServices(context.Background())
-
-	// Refresh mDNS aliases for restored apps so host-based routing works after restart
-	s.refreshMDNSAliases()
 
 	s.setupGinRoutes()
 	if err := s.initSecureLoopback(); err != nil {
@@ -1237,29 +1236,6 @@ func (s *GinServer) refreshRemoteRuntime() {
 	}
 	status := s.remoteManager.Status()
 	s.applyRemoteRuntimeFromStatus(status)
-}
-
-// refreshMDNSAliases updates mDNS to advertise host labels for all HTTP/WS listeners.
-// Per RFC 20260114 Section 5.2, aliases are only advertised for listeners eligible
-// for host-based routing (protocol:http|websocket + flow:tcp).
-func (s *GinServer) refreshMDNSAliases() {
-	// mdnsManager is nil when mDNS is disabled via PICCOLO_DISABLE_MDNS
-	if s == nil || s.mdnsManager == nil || s.serviceManager == nil {
-		return
-	}
-	labels := s.serviceManager.GetAllHostLabels()
-	aliases := make([]string, 0, len(labels))
-	for label := range labels {
-		if label != "" { // Only HTTP/WS listeners have labels
-			aliases = append(aliases, label)
-		}
-	}
-	// SetHostAliases takes LABELS (e.g., "immich", "metrics-immich")
-	// mDNS manager advertises base hostname (piccolo.local.) plus
-	// alias FQDNs ({label}.{baseName}.local.)
-	if err := s.mdnsManager.SetHostAliases(aliases); err != nil {
-		log.Printf("WARN: mDNS alias update failed: %v", err)
-	}
 }
 
 func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {

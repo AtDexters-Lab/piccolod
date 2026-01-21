@@ -26,6 +26,7 @@ type ServiceManager struct {
 	containerIDs   map[string]string // app -> containerID (optional)
 	eventsMu       sync.Mutex
 	eventCancel    context.CancelFunc
+	eventBus       *events.Bus
 	statusMu       sync.RWMutex
 	leadership     map[string]cluster.Role
 	unpublisher    PortUnpublisher
@@ -95,6 +96,46 @@ func (m *ServiceManager) notifyPublish(port int) {
 		defer func() { _ = recover() }()
 		p.Publish(port)
 	}
+}
+
+// SetEventBus wires an event bus for publishing endpoint changes.
+func (m *ServiceManager) SetEventBus(bus *events.Bus) {
+	m.eventsMu.Lock()
+	m.eventBus = bus
+	m.eventsMu.Unlock()
+}
+
+func (m *ServiceManager) publishEndpointsChanged(app string, added, removed []ServiceEndpoint) {
+	m.eventsMu.Lock()
+	bus := m.eventBus
+	m.eventsMu.Unlock()
+	if bus == nil {
+		return
+	}
+	addedInfo := make([]events.ServiceEndpointInfo, len(added))
+	for i, ep := range added {
+		addedInfo[i] = events.ServiceEndpointInfo{
+			App:              ep.App,
+			Name:             ep.Name,
+			DerivedHostLabel: ep.DerivedHostLabel,
+		}
+	}
+	removedInfo := make([]events.ServiceEndpointInfo, len(removed))
+	for i, ep := range removed {
+		removedInfo[i] = events.ServiceEndpointInfo{
+			App:              ep.App,
+			Name:             ep.Name,
+			DerivedHostLabel: ep.DerivedHostLabel,
+		}
+	}
+	bus.Publish(events.Event{
+		Topic: events.TopicServiceEndpointsChanged,
+		Payload: events.ServiceEndpointsChanged{
+			App:     app,
+			Added:   addedInfo,
+			Removed: removedInfo,
+		},
+	})
 }
 
 const ACMEHTTPFallbackPort = 5002
@@ -316,6 +357,12 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 	if len(registry) > 0 {
 		m.registry[appName] = registry
 	}
+
+	// Publish endpoint changes (non-blocking)
+	if len(endpoints) > 0 {
+		m.publishEndpointsChanged(appName, endpoints, nil)
+	}
+
 	return endpoints, nil
 }
 
@@ -368,6 +415,9 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 		m.proxyManager.StartListener(ep)
 		m.notifyPublish(ep.PublicPort)
 	}
+
+	// Publish endpoint changes (non-blocking)
+	m.publishEndpointsChanged(appName, endpoints, nil)
 
 	return endpoints, nil
 }
@@ -494,22 +544,6 @@ func (m *ServiceManager) ResolveAppPrimary(appName string) (ServiceEndpoint, boo
 		}
 	}
 	return ServiceEndpoint{}, false
-}
-
-// GetAllHostLabels returns a map of all host labels to their endpoints.
-// Only includes HTTP/WS listeners that have host-based routing enabled.
-func (m *ServiceManager) GetAllHostLabels() map[string]ServiceEndpoint {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	result := make(map[string]ServiceEndpoint)
-	for _, mapp := range m.registry {
-		for _, ep := range mapp {
-			if ep.DerivedHostLabel != "" {
-				result[ep.DerivedHostLabel] = ep
-			}
-		}
-	}
-	return result
 }
 
 // checkHostLabelCollisions validates that new host labels don't collide with existing ones.
@@ -688,10 +722,20 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 			ep.Flow = l.Flow
 			ep.Protocol = l.Protocol
 			ep.Primary = isPrimary
+			oldHostLabel := ep.DerivedHostLabel
 			ep.DerivedHostLabel = hostLabel
 			ep.Middleware = l.Middleware
 			ep.RemotePorts = defaultRemotePorts(l)
 			newMap[l.Name] = ep
+
+			// Detect host label changes for mDNS updates
+			if oldHostLabel != hostLabel {
+				oldEp := old
+				oldEp.DerivedHostLabel = oldHostLabel
+				result.Removed = append(result.Removed, oldEp)
+				result.Added = append(result.Added, ep)
+			}
+
 			if proxyChanged {
 				m.proxyManager.StopPort(ep.PublicPort)
 				m.proxyManager.StartListener(ep)
@@ -744,6 +788,12 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 		eps = append(eps, ep)
 	}
 	result.Endpoints = eps
+
+	// Publish endpoint changes (non-blocking)
+	if len(result.Added) > 0 || len(result.Removed) > 0 {
+		m.publishEndpointsChanged(appName, result.Added, result.Removed)
+	}
+
 	return result, containerChange, nil
 }
 
@@ -764,8 +814,11 @@ func middlewareEqual(a, b []api.AppProtocolMiddleware) bool {
 func (m *ServiceManager) RemoveApp(appName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var removed []ServiceEndpoint
 	if mapp, ok := m.registry[appName]; ok {
+		removed = make([]ServiceEndpoint, 0, len(mapp))
 		for _, ep := range mapp {
+			removed = append(removed, ep)
 			m.proxyManager.StopPort(ep.PublicPort)
 			m.allocator.Release(ep.HostBind, ep.PublicPort)
 			m.notifyUnpublish(ep.PublicPort)
@@ -773,4 +826,9 @@ func (m *ServiceManager) RemoveApp(appName string) {
 		delete(m.registry, appName)
 	}
 	delete(m.containerIDs, appName)
+
+	// Publish endpoint changes (non-blocking)
+	if len(removed) > 0 {
+		m.publishEndpointsChanged(appName, nil, removed)
+	}
 }

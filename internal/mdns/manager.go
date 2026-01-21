@@ -1,6 +1,7 @@
 package mdns
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"log"
@@ -8,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"piccolod/internal/events"
 )
 
 const defaultBaseName = "piccolo"
@@ -77,6 +80,9 @@ func NewManager() *Manager {
 		peerRegistry: newPeerRegistry(),
 		deviceModel:  deviceModel,
 		bootTime:     bootTime,
+
+		// Service endpoint observation
+		appHostLabels: make(map[string][]string),
 	}
 
 	// Initialize service metadata
@@ -169,6 +175,9 @@ func (m *Manager) Start() error {
 // Stop shuts down the mDNS server
 func (m *Manager) Stop() error {
 	m.stopOnce.Do(func() {
+		// Stop service endpoint observer first
+		m.StopServiceEndpointsObserver()
+
 		if m.started.Load() {
 			// Send goodbye for host records
 			m.sendMultiInterfaceAnnouncementsWithTTL(0)
@@ -334,6 +343,198 @@ func (m *Manager) SetHostAliases(labels []string) error {
 		m.sendMultiInterfaceAnnouncements()
 	}
 	return nil
+}
+
+// GoodbyeAliases sends TTL=0 goodbye announcements for the specified alias labels.
+// This is used to notify peers that these aliases are no longer valid.
+func (m *Manager) GoodbyeAliases(labels []string) {
+	if m.names == nil || !m.started.Load() || len(labels) == 0 {
+		return
+	}
+
+	baseName := m.names.BaseName()
+	fqdns := make([]string, 0, len(labels))
+	for _, label := range labels {
+		normalized, err := normalizeLabel(label)
+		if err != nil {
+			continue
+		}
+		fqdn := normalized + "." + baseName + "." + localTLD + "."
+		fqdns = append(fqdns, fqdn)
+	}
+
+	if len(fqdns) > 0 {
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.sendAnnouncementsForNames(fqdns, 0)
+		}()
+	}
+}
+
+// ObserveServiceEndpoints subscribes to service endpoint changes and updates mDNS aliases.
+func (m *Manager) ObserveServiceEndpoints(bus *events.Bus) {
+	if bus == nil {
+		return
+	}
+
+	m.endpointsMu.Lock()
+	if m.endpointsCancel != nil {
+		m.endpointsCancel()
+	}
+	if m.endpointsUnsubscribe != nil {
+		m.endpointsUnsubscribe()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.endpointsCancel = cancel
+
+	ch, unsubscribe := bus.SubscribeWithCancel(events.TopicServiceEndpointsChanged, 64)
+	m.endpointsUnsubscribe = unsubscribe
+	m.endpointsMu.Unlock()
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		for {
+			select {
+			case evt, ok := <-ch:
+				if !ok {
+					return
+				}
+				payload, ok := evt.Payload.(events.ServiceEndpointsChanged)
+				if !ok {
+					log.Printf("WARN: mDNS received unexpected service endpoints payload: %#v", evt.Payload)
+					continue
+				}
+				m.handleServiceEndpointsChanged(payload)
+			case <-ctx.Done():
+				return
+			case <-m.stopCh:
+				return
+			}
+		}
+	}()
+}
+
+// StopServiceEndpointsObserver cancels the service endpoint subscription.
+func (m *Manager) StopServiceEndpointsObserver() {
+	m.endpointsMu.Lock()
+	if m.endpointsCancel != nil {
+		m.endpointsCancel()
+		m.endpointsCancel = nil
+	}
+	if m.endpointsUnsubscribe != nil {
+		m.endpointsUnsubscribe()
+		m.endpointsUnsubscribe = nil
+	}
+	m.endpointsMu.Unlock()
+
+	// Cancel any pending debounced announcement
+	m.announceDebounceMu.Lock()
+	if m.announceDebounceTimer != nil {
+		m.announceDebounceTimer.Stop()
+		m.announceDebounceTimer = nil
+		m.announcePending = false
+	}
+	m.announceDebounceMu.Unlock()
+}
+
+func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsChanged) {
+	// Collect labels to goodbye (from removed endpoints)
+	var labelsToGoodbye []string
+	for _, ep := range payload.Removed {
+		if ep.DerivedHostLabel != "" {
+			labelsToGoodbye = append(labelsToGoodbye, ep.DerivedHostLabel)
+		}
+	}
+
+	// Send goodbye for removed aliases first
+	if len(labelsToGoodbye) > 0 {
+		m.GoodbyeAliases(labelsToGoodbye)
+	}
+
+	// Update internal tracking by merging delta with existing state
+	m.appHostLabelsMu.Lock()
+	if payload.App == "" {
+		m.appHostLabelsMu.Unlock()
+		return
+	}
+
+	// Build set of labels to remove
+	removeSet := make(map[string]struct{}, len(payload.Removed))
+	for _, ep := range payload.Removed {
+		if ep.DerivedHostLabel != "" {
+			removeSet[ep.DerivedHostLabel] = struct{}{}
+		}
+	}
+
+	// Start with existing labels, filtering out removed ones
+	existing := m.appHostLabels[payload.App]
+	merged := make([]string, 0, len(existing)+len(payload.Added))
+	for _, label := range existing {
+		if _, shouldRemove := removeSet[label]; !shouldRemove {
+			merged = append(merged, label)
+		}
+	}
+
+	// Add new labels
+	for _, ep := range payload.Added {
+		if ep.DerivedHostLabel != "" {
+			merged = append(merged, ep.DerivedHostLabel)
+		}
+	}
+
+	// Update or delete the app entry
+	if len(merged) > 0 {
+		m.appHostLabels[payload.App] = merged
+	} else {
+		delete(m.appHostLabels, payload.App)
+	}
+
+	m.appHostLabelsMu.Unlock()
+
+	// Schedule debounced announcement
+	m.scheduleDebouncedAnnouncement()
+}
+
+// announcementDebounceDelay is the delay before announcing mDNS changes.
+// This allows batching multiple rapid changes into a single announcement.
+const announcementDebounceDelay = 500 * time.Millisecond
+
+// scheduleDebouncedAnnouncement schedules an mDNS announcement after a delay.
+// If called multiple times within the delay, only one announcement is sent.
+func (m *Manager) scheduleDebouncedAnnouncement() {
+	m.announceDebounceMu.Lock()
+	defer m.announceDebounceMu.Unlock()
+
+	// If there's already a pending timer, reset it
+	if m.announceDebounceTimer != nil {
+		m.announceDebounceTimer.Stop()
+	}
+
+	m.announcePending = true
+	m.announceDebounceTimer = time.AfterFunc(announcementDebounceDelay, func() {
+		m.announceDebounceMu.Lock()
+		m.announcePending = false
+		m.announceDebounceTimer = nil
+		m.announceDebounceMu.Unlock()
+
+		m.flushDebouncedAnnouncement()
+	})
+}
+
+// flushDebouncedAnnouncement rebuilds the alias set and announces.
+func (m *Manager) flushDebouncedAnnouncement() {
+	m.appHostLabelsMu.RLock()
+	allLabels := make([]string, 0)
+	for _, appLabels := range m.appHostLabels {
+		allLabels = append(allLabels, appLabels...)
+	}
+	m.appHostLabelsMu.RUnlock()
+
+	if err := m.SetHostAliases(allLabels); err != nil {
+		log.Printf("WARN: mDNS failed to update aliases: %v", err)
+	}
 }
 
 // SetPort sets the port number advertised in SRV records.

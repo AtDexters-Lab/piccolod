@@ -373,7 +373,6 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	}
 
 	s.queueAppRemoteCertificates(appInstance.InstanceID)
-	s.refreshMDNSAliases()
 
 	response := GinAppResponse{
 		Data:    appInstance,
@@ -535,7 +534,6 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 
 	// Queue certs for new listeners
 	s.queueAppRemoteCertificates(appName)
-	s.refreshMDNSAliases()
 
 	// Fetch updated details
 	newApp, err := s.appManager.Get(c.Request.Context(), appName)
@@ -618,9 +616,6 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 			s.remoteManager.RemoveHostnameCertificate(h)
 		}
 	}
-
-	// Update mDNS aliases after app removal
-	s.refreshMDNSAliases()
 
 	if purge {
 		writeGinSuccess(c, nil, "App '"+appName+"' uninstalled and data purged successfully")

@@ -11,15 +11,16 @@ import (
 type Topic string
 
 const (
-	TopicLockStateChanged      Topic = "lock_state_changed"
-	TopicLeadershipRoleChanged Topic = "leadership_role_changed"
-	TopicDeviceEvent           Topic = "device_event"
-	TopicExportResult          Topic = "export_result"
-	TopicControlHealth         Topic = "control_health"
-	TopicControlStoreCommit    Topic = "control_store_commit"
-	TopicRemoteConfigChanged   Topic = "remote_config_changed"
-	TopicVolumeStateChanged    Topic = "volume_state_changed"
-	TopicAudit                 Topic = "audit"
+	TopicLockStateChanged        Topic = "lock_state_changed"
+	TopicLeadershipRoleChanged   Topic = "leadership_role_changed"
+	TopicDeviceEvent             Topic = "device_event"
+	TopicExportResult            Topic = "export_result"
+	TopicControlHealth           Topic = "control_health"
+	TopicControlStoreCommit      Topic = "control_store_commit"
+	TopicRemoteConfigChanged     Topic = "remote_config_changed"
+	TopicVolumeStateChanged      Topic = "volume_state_changed"
+	TopicAudit                   Topic = "audit"
+	TopicServiceEndpointsChanged Topic = "service_endpoints_changed"
 )
 
 // Event represents a message broadcast on the event bus.
@@ -60,6 +61,20 @@ type ControlStoreCommit struct {
 	Revision uint64
 	Checksum string
 	Role     cluster.Role
+}
+
+// ServiceEndpointInfo is a lightweight representation of a service endpoint for events.
+type ServiceEndpointInfo struct {
+	App              string
+	Name             string
+	DerivedHostLabel string
+}
+
+// ServiceEndpointsChanged announces that service endpoints have been added or removed.
+type ServiceEndpointsChanged struct {
+	App     string
+	Added   []ServiceEndpointInfo
+	Removed []ServiceEndpointInfo
 }
 
 // Bus is a simple pub/sub dispatcher for intra-process events.

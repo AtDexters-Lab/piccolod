@@ -399,6 +399,65 @@ func (m *Manager) sendMultiInterfaceAnnouncementsWithTTL(ttl uint32) {
 	}
 }
 
+// sendAnnouncementsForNames sends announcements for specific FQDNs with the given TTL.
+// Used primarily for sending goodbye (TTL=0) announcements for removed aliases.
+func (m *Manager) sendAnnouncementsForNames(fqdns []string, ttl uint32) {
+	if len(fqdns) == 0 {
+		return
+	}
+
+	type ifaceSnapshot struct {
+		name     string
+		state    *InterfaceState
+		active   bool
+		hasIPv4  bool
+		hasIPv6  bool
+		ipv4     net.IP
+		ipv6     net.IP
+		ipv4Conn *net.UDPConn
+		ipv6Conn *net.UDPConn
+	}
+
+	m.mutex.RLock()
+	snapshots := make([]ifaceSnapshot, 0, len(m.interfaces))
+	for name, state := range m.interfaces {
+		if state == nil {
+			continue
+		}
+		snap := ifaceSnapshot{
+			name:     name,
+			state:    state,
+			active:   state.Active,
+			hasIPv4:  state.HasIPv4,
+			hasIPv6:  state.HasIPv6,
+			ipv4Conn: state.IPv4Conn,
+			ipv6Conn: state.IPv6Conn,
+		}
+		if state.IPv4 != nil {
+			snap.ipv4 = append(net.IP(nil), state.IPv4...)
+		}
+		if state.IPv6 != nil {
+			snap.ipv6 = append(net.IP(nil), state.IPv6...)
+		}
+		snapshots = append(snapshots, snap)
+	}
+	m.mutex.RUnlock()
+
+	for _, snap := range snapshots {
+		if !snap.active {
+			continue
+		}
+		for _, fqdn := range fqdns {
+			if snap.hasIPv4 && snap.ipv4Conn != nil && snap.ipv4 != nil {
+				m.sendIPv4Announcement(snap.name, snap.state, snap.ipv4Conn, snap.ipv4, fqdn, ttl)
+			}
+			if snap.hasIPv6 && snap.ipv6Conn != nil && snap.ipv6 != nil {
+				m.sendIPv6Announcement(snap.name, snap.state, snap.ipv6Conn, snap.ipv6, fqdn, ttl)
+			}
+		}
+	}
+}
+
 // sendIPv4Announcement sends IPv4 mDNS announcement
 func (m *Manager) sendIPv4Announcement(name string, state *InterfaceState, conn *net.UDPConn, ip net.IP, fqdn string, ttl uint32) {
 	msg := &dns.Msg{}

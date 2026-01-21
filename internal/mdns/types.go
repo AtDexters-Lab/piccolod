@@ -146,4 +146,16 @@ type Manager struct {
 	// Socket factories (overrideable for tests)
 	ipv4SocketFactory func(*net.Interface) (*net.UDPConn, error)
 	ipv6SocketFactory func(*net.Interface) (*net.UDPConn, error)
+
+	// Service endpoint observation
+	endpointsMu          sync.Mutex
+	endpointsCancel      func()
+	endpointsUnsubscribe func() // Unsubscribe from event bus
+	appHostLabels        map[string][]string // app -> host labels for that app
+	appHostLabelsMu      sync.RWMutex
+
+	// Announcement debouncing
+	announceDebounceMu    sync.Mutex
+	announceDebounceTimer *time.Timer
+	announcePending       bool
 }
