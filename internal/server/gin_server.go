@@ -723,12 +723,15 @@ func (s *GinServer) setupGinRoutes() {
 	// Add basic middleware
 	r.Use(gin.Logger())
 	r.Use(gin.Recovery())
+	// LAN host routing must run BEFORE gzip and security headers:
+	// 1. Before gzip: proxied app responses are already compressed; gzip middleware
+	//    would strip Content-Encoding and corrupt the response.
+	// 2. Before security headers: avoid portal-only headers (e.g., X-Frame-Options: DENY,
+	//    Cross-Origin-Embedder-Policy) leaking into app responses.
+	r.Use(s.lanHostRoutingMiddleware())
 	r.Use(gzip.Gzip(gzip.DefaultCompression))
 	r.Use(s.corsMiddleware())
 	r.Use(s.httpsRedirectMiddleware())
-	// LAN host routing must run BEFORE security headers to avoid portal-only headers
-	// (e.g., X-Frame-Options: DENY, Cross-Origin-Embedder-Policy) leaking into app responses.
-	r.Use(s.lanHostRoutingMiddleware())
 	r.Use(s.securityHeadersMiddleware())
 
 	// Optional: OpenAPI request validation (enabled when validator is initialized)
