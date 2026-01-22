@@ -7,8 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
-	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +14,7 @@ import (
 	"github.com/zitadel/oidc/v3/pkg/op"
 
 	"piccolod/internal/oidc"
+	"piccolod/internal/services"
 )
 
 // getOIDCClientManager helper to get client manager from persistence
@@ -34,6 +33,21 @@ const stableIssuer = "https://piccolo.local"
 type requestedRedirectURIKey struct{}
 
 var requestedRedirectURIContextKey = requestedRedirectURIKey{}
+
+// validOrigin represents a valid OAuth redirect origin for an app.
+type validOrigin struct {
+	scheme string // "http" or "https"
+	host   string // hostname (lowercase, without port)
+	port   int    // 0 = default port for scheme; >0 = explicit port required
+}
+
+// toBaseURL returns the origin as a URL string (without trailing slash).
+func (o validOrigin) toBaseURL() string {
+	if o.port == 0 {
+		return o.scheme + "://" + o.host
+	}
+	return fmt.Sprintf("%s://%s:%d", o.scheme, o.host, o.port)
+}
 
 // initOIDCProvider initializes the OIDC provider if enabled/configured
 func (s *GinServer) initOIDCProvider() (*oidc.Provider, error) {
@@ -63,7 +77,13 @@ func (s *GinServer) initOIDCProvider() (*oidc.Provider, error) {
 	return oidc.NewProvider(context.Background(), cfg)
 }
 
-// resolveAppRedirectURI resolves the valid redirect URIs for an app based on its listeners.
+// resolveAppRedirectURI generates the exhaustive list of valid redirect URIs for an app.
+// It computes the cartesian product of:
+//   - All valid access origins (Remote, Alias, LAN host-based, LAN port-based, local IP)
+//   - All declared redirect_uri_paths from the app manifest
+//
+// Additionally, explicit redirect_uris (for native apps) are appended as-is.
+// This approach is fully compliant with OAuth 2.0 exact URI matching (RFC 6749, RFC 9700).
 func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]string, error) {
 	if s.serviceManager == nil {
 		return nil, nil
@@ -74,176 +94,143 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 		return nil, nil
 	}
 
-	// Collect additional redirect URIs declared via services[].oidc_client.redirect_uris.
-	extraRedirectURIs := make([]string, 0)
-	if s.appManager != nil {
-		if inst, err := s.appManager.Get(ctx, appID); err == nil && inst != nil && inst.Definition != nil {
-			seen := make(map[string]struct{})
-			for _, svc := range inst.Definition.Services {
-				if svc.OIDCClient == nil {
-					continue
-				}
-				for _, u := range svc.OIDCClient.RedirectURIs {
-					u = strings.TrimSpace(u)
-					if u == "" {
-						continue
-					}
-					if _, ok := seen[u]; ok {
-						continue
-					}
-					seen[u] = struct{}{}
-					extraRedirectURIs = append(extraRedirectURIs, u)
-				}
-			}
+	// Collect redirect_uri_paths and explicit redirect_uris from app manifest.
+	paths, explicitURIs := s.collectRedirectConfig(ctx, appID)
+	if len(paths) == 0 {
+		// No paths declared - return only explicit URIs (if any).
+		return explicitURIs, nil
+	}
+
+	// Build all valid origins for this app.
+	origins := s.buildValidOrigins(endpoints)
+
+	// Generate cartesian product: origins × paths
+	var uris []string
+	for _, origin := range origins {
+		baseURL := origin.toBaseURL()
+		for _, path := range paths {
+			uris = append(uris, baseURL+path)
 		}
 	}
 
-	// Get the current local hostname (handles mDNS conflicts like "piccolo-abc123.local")
+	// Append explicit URIs (native/desktop apps with loopback or custom schemes).
+	uris = append(uris, explicitURIs...)
+
+	return uris, nil
+}
+
+// collectRedirectConfig extracts redirect_uri_paths and redirect_uris from app manifest.
+func (s *GinServer) collectRedirectConfig(ctx context.Context, appID string) (paths []string, explicitURIs []string) {
+	if s.appManager == nil {
+		return nil, nil
+	}
+
+	inst, err := s.appManager.Get(ctx, appID)
+	if err != nil || inst == nil || inst.Definition == nil {
+		return nil, nil
+	}
+
+	seenPaths := make(map[string]struct{})
+	seenURIs := make(map[string]struct{})
+
+	for _, svc := range inst.Definition.Services {
+		if svc.OIDCClient == nil {
+			continue
+		}
+		for _, p := range svc.OIDCClient.RedirectURIPaths {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if _, ok := seenPaths[p]; ok {
+				continue
+			}
+			seenPaths[p] = struct{}{}
+			paths = append(paths, p)
+		}
+		for _, u := range svc.OIDCClient.RedirectURIs {
+			u = strings.TrimSpace(u)
+			if u == "" {
+				continue
+			}
+			if _, ok := seenURIs[u]; ok {
+				continue
+			}
+			seenURIs[u] = struct{}{}
+			explicitURIs = append(explicitURIs, u)
+		}
+	}
+
+	return paths, explicitURIs
+}
+
+// buildValidOrigins constructs all valid redirect origins for an app's endpoints.
+func (s *GinServer) buildValidOrigins(endpoints []services.ServiceEndpoint) []validOrigin {
+	var origins []validOrigin
+
 	localHostname := "piccolo.local"
 	if s.mdnsManager != nil {
 		localHostname = s.mdnsManager.Hostname()
 	}
+	localHostname = strings.ToLower(localHostname)
 
-	// 1. Dynamic Origin Matching (RFC compliant)
-	// If we have a requested redirect_uri, check if its origin matches a listener.
-	requested, _ := ctx.Value(requestedRedirectURIContextKey).(string)
-	if requested != "" {
-		// First, allow explicitly-declared redirect URIs (native/loopback/custom scheme).
-		for _, allowed := range extraRedirectURIs {
-			if requested == allowed {
-				return []string{requested}, nil
-			}
-		}
-
-		u, err := url.Parse(requested)
-		if err == nil {
-			// Extract port from host (u.Host includes port if present)
-			_, portStr, _ := net.SplitHostPort(u.Host)
-			requestedPort, _ := strconv.Atoi(portStr)
-
-			// Check against known listeners
-			for _, ep := range endpoints {
-				// Check Remote Host
-				if s.remoteManager != nil {
-					st := s.remoteManager.Status()
-					if st.Enabled && strings.TrimSpace(st.PortalHostname) != "" {
-						remoteHost := s.remoteServiceHostname(&st, ep)
-						if remoteHost != "" && u.Scheme == "https" {
-							// Compare hostname, handling explicit :443 port
-							reqHost := u.Host
-							if h, p, err := net.SplitHostPort(u.Host); err == nil && p == "443" {
-								reqHost = h // Strip explicit :443
-							}
-							if strings.EqualFold(reqHost, remoteHost) {
-								return []string{requested}, nil
-							}
-						}
-					}
-				}
-
-				// Check Alias Domains (remote config)
-				if s.remoteManager != nil && u.Scheme == "https" {
-					reqHost := u.Host
-					if h, p, err := net.SplitHostPort(u.Host); err == nil && p == "443" {
-						reqHost = h
-					}
-					for _, alias := range s.remoteManager.ListAliases() {
-						if strings.TrimSpace(alias.Hostname) == "" {
-							continue
-						}
-						if alias.Listener != ep.Name {
-							continue
-						}
-						if strings.EqualFold(reqHost, alias.Hostname) {
-							return []string{requested}, nil
-						}
-					}
-				}
-
-				// Check LAN host-based URLs (per RFC 20260114)
-				// Format: http://<app>.piccolo.local or http://<listener>-<app>.piccolo.local
-				if ep.DerivedHostLabel != "" && (u.Scheme == "http" || u.Scheme == "https") {
-					lanHost := ep.DerivedHostLabel + "." + localHostname
-					reqHost := u.Host
-					// Strip default ports for comparison (:80 for http, :443 for https)
-					if h, p, err := net.SplitHostPort(u.Host); err == nil {
-						if (u.Scheme == "http" && p == "80") || (u.Scheme == "https" && p == "443") {
-							reqHost = h
-						}
-					}
-					if strings.EqualFold(reqHost, lanHost) {
-						return []string{requested}, nil
-					}
-				}
-
-				// Check Local Host (port-based) - support both mDNS hostname and IP address access
-				// Local origin can be:
-				// - http://piccolo.local:<PublicPort> (or piccolo-abc123.local if conflict)
-				// - http://<lan-ip>:<PublicPort> (for clients without mDNS)
-				localHost := fmt.Sprintf("%s:%d", localHostname, ep.PublicPort)
-				if strings.EqualFold(u.Host, localHost) {
-					// Allow http for local LAN access as per RFC
-					if u.Scheme == "http" || u.Scheme == "https" {
-						return []string{requested}, nil
-					}
-				}
-
-				// Also accept IP address access if it's a local machine IP with matching port
-				// This supports clients that can't resolve mDNS names but limits to piccolo's own IPs
-				// to prevent redirects to attacker-controlled servers on LAN
-				if requestedPort == ep.PublicPort && u.Scheme == "http" {
-					host, _, _ := net.SplitHostPort(u.Host)
-					if ip := net.ParseIP(host); ip != nil && isLocalMachineIP(ip) {
-						return []string{requested}, nil
-					}
-				}
-			}
-		}
-	}
-
-	// 2. Fallback: Return best-guess list for clients that don't provide context or
-	// for introspection/display purposes.
-	var uris []string
-
-	// Remote info
-	if s.remoteManager != nil {
-		st := s.remoteManager.Status()
-		if st.Enabled && strings.TrimSpace(st.PortalHostname) != "" {
-			for _, ep := range endpoints {
-				host := s.remoteServiceHostname(&st, ep)
-				if host != "" {
-					uris = append(uris, "https://"+host+"/callback")
-					uris = append(uris, "https://"+host+"/oauth/callback")
-					uris = append(uris, "https://"+host+"/")
-				}
-			}
-		}
-	}
-
-	// Local info (using dynamic hostname which handles mDNS conflicts)
-	uris = append(uris, "http://"+localHostname+"/callback")
-	uris = append(uris, "https://"+localHostname+"/callback")
-
-	// Let's try to return roots and common paths.
 	for _, ep := range endpoints {
-		// LAN host-based URLs (per RFC 20260114)
-		if ep.DerivedHostLabel != "" {
-			lanHost := ep.DerivedHostLabel + "." + localHostname
-			uris = append(uris, fmt.Sprintf("http://%s/callback", lanHost))
-			uris = append(uris, fmt.Sprintf("http://%s/oauth/callback", lanHost))
-			uris = append(uris, fmt.Sprintf("http://%s/", lanHost))
+		// Remote: https://<app>.<portal-base>
+		if s.remoteManager != nil {
+			st := s.remoteManager.Status()
+			if st.Enabled && strings.TrimSpace(st.PortalHostname) != "" {
+				if remoteHost := s.remoteServiceHostname(&st, ep); remoteHost != "" {
+					origins = append(origins, validOrigin{"https", strings.ToLower(remoteHost), 0})
+				}
+			}
+
+			// Alias domains: https://<alias>
+			for _, alias := range s.remoteManager.ListAliases() {
+				if alias.Listener == ep.Name && strings.TrimSpace(alias.Hostname) != "" {
+					origins = append(origins, validOrigin{"https", strings.ToLower(alias.Hostname), 0})
+				}
+			}
 		}
 
-		// LAN port-based URLs (fallback)
-		uris = append(uris, fmt.Sprintf("http://%s:%d/callback", localHostname, ep.PublicPort))
-		uris = append(uris, fmt.Sprintf("http://%s:%d/auth/callback", localHostname, ep.PublicPort))
-		uris = append(uris, fmt.Sprintf("http://%s:%d/oauth/callback", localHostname, ep.PublicPort))
-		uris = append(uris, fmt.Sprintf("http://%s:%d/login/callback", localHostname, ep.PublicPort))
+		// LAN host-based: http://<app>.piccolo.local (or https)
+		if ep.DerivedHostLabel != "" {
+			lanHost := strings.ToLower(ep.DerivedHostLabel + "." + localHostname)
+			origins = append(origins, validOrigin{"http", lanHost, 0})
+			origins = append(origins, validOrigin{"https", lanHost, 0})
+		}
+
+		// LAN port-based: http://piccolo.local:<port> (or https)
+		origins = append(origins, validOrigin{"http", localHostname, ep.PublicPort})
+		origins = append(origins, validOrigin{"https", localHostname, ep.PublicPort})
 	}
 
-	uris = append(uris, extraRedirectURIs...)
+	// Local IP-based access for mDNS-less clients.
+	// Add origins for each local machine IP with each app port.
+	localIPs := getLocalMachineIPs()
+	for _, ep := range endpoints {
+		for _, ip := range localIPs {
+			origins = append(origins, validOrigin{"http", ip, ep.PublicPort})
+		}
+	}
 
-	return uris, nil
+	return origins
+}
+
+// getLocalMachineIPs returns IPv4 addresses of local network interfaces.
+func getLocalMachineIPs() []string {
+	var ips []string
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok {
+			if ip4 := ipnet.IP.To4(); ip4 != nil && !ip4.IsLoopback() {
+				ips = append(ips, ip4.String())
+			}
+		}
+	}
+	return ips
 }
 
 // OIDC Handlers ---------------------------------------------------------------

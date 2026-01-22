@@ -273,9 +273,22 @@ type AppProtocolMiddleware struct {
 
 // ServiceOIDCClient configures OIDC credential injection scoped to a single service.
 type ServiceOIDCClient struct {
-	RedirectURIs []string          `yaml:"redirect_uris,omitempty" json:"redirect_uris,omitempty"`
-	CAMountPath  string            `yaml:"ca_mount_path" json:"ca_mount_path"`
-	Env          map[string]string `yaml:"env" json:"env"`
+	// RedirectURIPaths declares the callback path segments for OIDC redirects.
+	// Piccolo generates full redirect URIs by combining all valid access origins
+	// (Remote, Alias, LAN host-based, LAN port-based) with these paths.
+	// Required and must be non-empty. Paths must start with "/".
+	// Example: ["/callback", "/oauth/callback"]
+	// Note: Comparison is case-sensitive with no normalization per RFC 3986 §6.2.1.
+	RedirectURIPaths []string `yaml:"redirect_uri_paths" json:"redirect_uri_paths"`
+
+	// RedirectURIs declares explicit redirect URIs for native/desktop apps.
+	// Only localhost (127.0.0.1, ::1) or custom scheme URIs are allowed (RFC 8252).
+	// These are used as-is without origin expansion.
+	// Example: ["myapp://callback", "http://localhost:8081/callback"]
+	RedirectURIs []string `yaml:"redirect_uris,omitempty" json:"redirect_uris,omitempty"`
+
+	CAMountPath string            `yaml:"ca_mount_path" json:"ca_mount_path"`
+	Env         map[string]string `yaml:"env" json:"env"`
 }
 
 // AppService defines a single container within a compose-style app (service mode).

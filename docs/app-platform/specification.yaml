@@ -127,8 +127,17 @@ services:
     #
     # Required if any listener auth rule uses strategy: oidc_passthrough.
     oidc_client:
+      redirect_uri_paths: # REQUIRED: callback path segments for OIDC redirects.
+        # Piccolo generates full redirect URIs by combining all valid access origins
+        # (Remote, Alias, LAN host-based, LAN port-based) with these paths.
+        # Must be non-empty. Each path must start with "/".
+        # Comparison is case-sensitive with no normalization (RFC 3986 section 6.2.1).
+        - /callback
+        - /oauth/callback
       redirect_uris:
-        # Optional: native/desktop redirects (RFC 8252). Only localhost/127.0.0.1/::1 or custom schemes are allowed.
+        # Optional: explicit URIs for native/desktop apps (RFC 8252).
+        # Only localhost/127.0.0.1/::1 or custom schemes are allowed.
+        # These are used as-is without origin expansion.
         - "app.example:///oauth-callback"
         - "http://localhost:8081/callback"
       ca_mount_path: /etc/ssl/certs/piccolo-internal-ca.crt # REQUIRED

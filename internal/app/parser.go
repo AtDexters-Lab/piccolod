@@ -458,6 +458,14 @@ func validateServices(services map[string]api.AppService, primary string, listen
 			if strings.TrimSpace(svc.OIDCClient.CAMountPath) == "" {
 				return newValidationError("OIDC_CA_PATH_REQUIRED", "oidc_client.ca_mount_path is required")
 			}
+			if len(svc.OIDCClient.RedirectURIPaths) == 0 {
+				return newValidationError("OIDC_REDIRECT_PATHS_REQUIRED", "oidc_client.redirect_uri_paths must be a non-empty list")
+			}
+			for _, p := range svc.OIDCClient.RedirectURIPaths {
+				if err := validateOIDCRedirectPath(p); err != nil {
+					return newValidationError("INVALID_REDIRECT_PATH", err.Error())
+				}
+			}
 			for k, v := range svc.OIDCClient.Env {
 				if prior, ok := oidcEnv[k]; ok && prior != v {
 					return fmt.Errorf("oidc_client.env conflicts for key '%s' across services", k)
@@ -757,6 +765,41 @@ func validateOIDCRedirectURI(raw string) error {
 		// Custom scheme redirect URIs are allowed.
 		return nil
 	}
+}
+
+// validateOIDCRedirectPath validates a redirect URI path segment.
+// Paths must:
+// - Start with "/"
+// - Not be empty or whitespace-only
+// - Not contain query strings or fragments
+// - Contain only valid URI path characters (RFC 3986)
+// Note: No normalization is performed per RFC 3986 §6.2.1 (simple string comparison).
+func validateOIDCRedirectPath(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("redirect_uri_paths entry cannot be empty")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("redirect_uri_paths entry %q must start with /", path)
+	}
+	if strings.Contains(path, "?") {
+		return fmt.Errorf("redirect_uri_paths entry %q must not contain query string", path)
+	}
+	if strings.Contains(path, "#") {
+		return fmt.Errorf("redirect_uri_paths entry %q must not contain fragment", path)
+	}
+	// Validate path contains only valid URI characters by attempting to parse it.
+	// This catches spaces, control characters, and other invalid characters.
+	testURI := "http://example.com" + path
+	parsed, err := url.Parse(testURI)
+	if err != nil {
+		return fmt.Errorf("redirect_uri_paths entry %q contains invalid characters: %v", path, err)
+	}
+	// Ensure the path wasn't modified during parsing (e.g., spaces encoded).
+	// If the raw path differs from input, the input contained characters that needed encoding.
+	if parsed.Path != path {
+		return fmt.Errorf("redirect_uri_paths entry %q contains characters that require encoding (got %q after parsing)", path, parsed.Path)
+	}
+	return nil
 }
 
 // validateStorage validates storage configuration
