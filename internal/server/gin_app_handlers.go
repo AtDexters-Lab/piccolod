@@ -151,14 +151,16 @@ func writeGinSuccess(c *gin.Context, data interface{}, message string) {
 }
 
 // requiresProxyOIDCClient checks if an app requires a proxy OIDC client per RFC 20260122 §5.3.
-// Proxy clients are needed for apps with "headers" or "protected" auth strategies.
+// Proxy clients are needed for apps whose listeners use "headers" or "protected" auth strategies.
+// Per RFC 20260122 §4.1.1: auth omitted or empty rules → all paths default to "protected".
 func (s *GinServer) requiresProxyOIDCClient(appDef *api.AppDefinition) bool {
 	if appDef == nil {
 		return false
 	}
 	for _, listener := range appDef.Listeners {
 		if listener.Auth == nil || len(listener.Auth.Rules) == 0 {
-			continue
+			// Auth omitted → all paths default to "protected" strategy.
+			return true
 		}
 		for _, rule := range listener.Auth.Rules {
 			strategy := rule.Strategy

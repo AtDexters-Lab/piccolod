@@ -141,8 +141,9 @@ func (s *GinServer) appUsesProxyAuth(ctx context.Context, appID string) bool {
 	}
 
 	for _, l := range inst.Definition.Listeners {
-		if l.Auth == nil {
-			continue
+		if l.Auth == nil || len(l.Auth.Rules) == 0 {
+			// Auth omitted → all paths default to "protected" strategy.
+			return true
 		}
 		for _, rule := range l.Auth.Rules {
 			if rule.Strategy == "headers" || rule.Strategy == "protected" {
