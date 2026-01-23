@@ -249,6 +249,7 @@ class ServiceEndpoint {
   final String flow;
   final String protocol;
   final String? localUrl;
+  final String? lanHostUrl;
   final List<dynamic> middleware;
 
   ServiceEndpoint({
@@ -262,6 +263,7 @@ class ServiceEndpoint {
     required this.flow,
     required this.protocol,
     this.localUrl,
+    this.lanHostUrl,
     this.middleware = const [],
   });
 
@@ -277,6 +279,7 @@ class ServiceEndpoint {
       flow: json['flow'] ?? 'tcp',
       protocol: json['protocol'] ?? 'raw',
       localUrl: json['local_url'],
+      lanHostUrl: json['lan_host_url'],
       middleware: json['middleware'] ?? [],
     );
   }

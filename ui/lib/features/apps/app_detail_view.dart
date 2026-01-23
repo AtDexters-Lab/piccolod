@@ -594,9 +594,13 @@ class _AppDetailViewState extends State<AppDetailView>
                           ),
                           const Divider(height: 24),
                           _buildNetworkRow("Internal Port", "${svc.guestPort}"),
+                          if (svc.lanHostUrl != null)
+                            _buildNetworkRow("LAN Access", svc.lanHostUrl!),
                           if (svc.localUrl != null)
                             _buildNetworkRow(
-                              "LAN Access",
+                              svc.lanHostUrl != null
+                                  ? "LAN Fallback"
+                                  : "LAN Access",
                               "${svc.localUrl} (Port ${svc.publicPort})",
                             ),
 
@@ -606,7 +610,8 @@ class _AppDetailViewState extends State<AppDetailView>
                           const SizedBox(height: 16),
                           Row(
                             children: [
-                              if (svc.localUrl != null)
+                              if (svc.localUrl != null ||
+                                  svc.lanHostUrl != null)
                                 Expanded(
                                   child: OutlinedButton.icon(
                                     onPressed: () => AppLauncher.openAppWindow(
