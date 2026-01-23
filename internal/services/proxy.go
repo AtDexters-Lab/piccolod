@@ -80,6 +80,11 @@ type ProxyManager struct {
 	sessionGetter func(r *http.Request) (*auth.Session, bool)
 	portalOrigin  func(r *http.Request) string
 	aliasChecker  func(host, listener string) bool
+
+	// RFC 20260122: Proxy OIDC handler for headers/protected strategies
+	proxyOIDC        *ProxyOIDCHandler
+	sessionStore     *auth.SessionStore
+	localHostnameGetter func() string
 }
 
 func NewProxyManager() *ProxyManager {
@@ -260,6 +265,27 @@ func (p *ProxyManager) SetPortalOriginResolver(fn func(r *http.Request) string) 
 func (p *ProxyManager) SetAliasChecker(fn func(host, listener string) bool) {
 	p.mu.Lock()
 	p.aliasChecker = fn
+	p.mu.Unlock()
+}
+
+// SetSessionStore sets the session store for app session creation per RFC 20260122.
+func (p *ProxyManager) SetSessionStore(store *auth.SessionStore) {
+	p.mu.Lock()
+	p.sessionStore = store
+	p.mu.Unlock()
+}
+
+// SetLocalHostnameGetter sets the function to get the current mDNS hostname.
+func (p *ProxyManager) SetLocalHostnameGetter(fn func() string) {
+	p.mu.Lock()
+	p.localHostnameGetter = fn
+	p.mu.Unlock()
+}
+
+// SetProxyOIDCConfig configures the proxy OIDC handler per RFC 20260122.
+func (p *ProxyManager) SetProxyOIDCConfig(config ProxyOIDCConfig) {
+	p.mu.Lock()
+	p.proxyOIDC = NewProxyOIDCHandler(config)
 	p.mu.Unlock()
 }
 
@@ -472,6 +498,27 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			return
 		}
 
+		// RFC 20260122 §5.10: Intercept reserved proxy OIDC paths
+		if IsReservedPath(cleanedPath) {
+			p.mu.Lock()
+			proxyOIDC := p.proxyOIDC
+			p.mu.Unlock()
+
+			if proxyOIDC == nil {
+				writeProxyJSONError(w, http.StatusServiceUnavailable, "proxy_oidc_not_configured", "OIDC_UNAVAILABLE")
+				return
+			}
+
+			if cleanedPath == ProxyOIDCCallbackPath {
+				proxyOIDC.HandleCallback(w, r, ep.App, ep)
+				return
+			}
+
+			// Other reserved paths (future: logout, session status)
+			writeProxyJSONError(w, http.StatusNotFound, "not_found", "RESERVED_PATH_NOT_IMPLEMENTED")
+			return
+		}
+
 		strategy := listenerStrategyForPath(ep.Auth, cleanedPath)
 
 		// RFC 4.1.5: Strip spoofed trusted headers for all strategies.
@@ -480,11 +527,19 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		// RFC 4.1.6: Strategy-specific behavior.
 		switch strategy {
 		case "protected", "headers":
+			// RFC 20260122 §5: Allow CORS preflight (OPTIONS) to bypass auth.
+			// Browsers send preflight without cookies; blocking them breaks cross-origin API calls.
+			if r.Method == http.MethodOptions && r.Header.Get("Origin") != "" && r.Header.Get("Access-Control-Request-Method") != "" {
+				break
+			}
+
 			p.mu.Lock()
 			um := p.userManager
 			sg := p.sessionGetter
 			portalOrigin := p.portalOrigin
 			aliasChecker := p.aliasChecker
+			proxyOIDC := p.proxyOIDC
+			sessionStore := p.sessionStore
 			p.mu.Unlock()
 
 			if sg == nil {
@@ -498,12 +553,27 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				log.Printf("WARN: alias domain access is not supported for auth strategy=%s (host=%s app=%s listener=%s)", strategy, normalizeHostNoPort(r.Host), ep.App, ep.Name)
 			}
 
-			_, cookieErr := r.Cookie("piccolo_session")
+			_, cookieErr := r.Cookie(sessionCookieName)
 			cookiePresent := cookieErr == nil
 
+			// RFC 20260122 §5: Try to get session and validate with app audience/origin binding
 			sess, ok := sg(r)
+			if ok && sess != nil && sessionStore != nil {
+				// Validate app session with audience and origin binding
+				requestOrigin := computeRequestOrigin(r, ep)
+				sess, ok = sessionStore.ValidateAppSession(sess.ID, ep.App, requestOrigin)
+			}
+
 			if !ok || sess == nil {
-				if isBrowserNavigation(r) {
+				// RFC 20260122 §5.9: Only redirect safe methods (GET/HEAD) into OIDC flow.
+				// Non-safe methods (POST/PUT/DELETE) would lose the request body on redirect.
+				isSafeMethod := r.Method == http.MethodGet || r.Method == http.MethodHead
+				if isSafeMethod && isBrowserNavigation(r) {
+					if proxyOIDC != nil {
+						proxyOIDC.InitiateOIDCFlow(w, r, ep.App, ep)
+						return
+					}
+					// Fallback to portal redirect if proxy OIDC not configured
 					origin := ""
 					if portalOrigin != nil {
 						origin = portalOrigin(r)
@@ -912,6 +982,50 @@ func requestArrivedViaTLS(r *http.Request) bool {
 		return true
 	}
 	return false
+}
+
+// computeRequestOrigin computes the canonical origin (scheme://host[:port]) for a request.
+// Used for session origin binding per RFC 20260122 §6.1.
+// IPv6 addresses are preserved with brackets per RFC 3986.
+func computeRequestOrigin(r *http.Request, ep ServiceEndpoint) string {
+	scheme := "http"
+	if shouldRewriteAsHTTPS(ep, r) || r.TLS != nil {
+		scheme = "https"
+	}
+
+	// Use net.SplitHostPort for correct IPv6 handling
+	host, portStr, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		// No port in Host header
+		host = r.Host
+		portStr = ""
+	}
+
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" {
+		return ""
+	}
+
+	// Strip existing brackets before re-adding to avoid double-bracketing (e.g., Host: [::1] without port)
+	host = strings.TrimPrefix(host, "[")
+	host = strings.TrimSuffix(host, "]")
+
+	// Preserve IPv6 brackets per RFC 3986
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+
+	// Omit default ports
+	if portStr != "" {
+		port, parseErr := strconv.Atoi(portStr)
+		if parseErr == nil {
+			if (scheme == "http" && port != 80) || (scheme == "https" && port != 443) {
+				return scheme + "://" + host + ":" + portStr
+			}
+		}
+	}
+
+	return scheme + "://" + host
 }
 
 // no extra helpers

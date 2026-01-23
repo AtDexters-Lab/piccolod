@@ -2,6 +2,7 @@ package mdns
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -104,8 +105,16 @@ func (r *NameRegistry) rebuildLocked() {
 	fqdns[baseFQDN] = struct{}{}
 	snapshot = append(snapshot, baseFQDN)
 
+	// RFC 20260122 §4.1: 2-level mDNS format uses hyphen separator
+	// Before: <label>.<baseName>.<localTLD>. (e.g., immich.piccolo.local.)
+	// After:  <label>-<baseName>.<localTLD>. (e.g., immich-piccolo.local.)
 	for label := range r.aliases {
-		name := label + "." + r.baseName + "." + localTLD + "."
+		combined := label + "-" + r.baseName
+		if len(combined) > 63 {
+			log.Printf("[mdns] skipping alias %q: combined label %q exceeds 63-char DNS limit (%d)", label, combined, len(combined))
+			continue
+		}
+		name := combined + "." + localTLD + "."
 		fqdns[name] = struct{}{}
 		snapshot = append(snapshot, name)
 	}

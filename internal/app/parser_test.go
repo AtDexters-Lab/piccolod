@@ -214,9 +214,9 @@ func TestValidateAppDefinition(t *testing.T) {
 		},
 		{
 			name:        "name too long",
-			app:         &api.AppDefinition{Name: "abcdefghijklmnopqrstuvwxyz123456", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
+			app:         &api.AppDefinition{Name: "abcdefghijklmnopq", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
 			expectError: true,
-			expectedErr: "name must be 31 characters or less",
+			expectedErr: "name must be 16 characters or less",
 		},
 		{
 			name:        "missing services",

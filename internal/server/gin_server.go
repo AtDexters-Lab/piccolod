@@ -26,6 +26,7 @@ import (
 	pki "piccolod/internal/crypto"
 	"piccolod/internal/events"
 	"piccolod/internal/health"
+	hostnamepkg "piccolod/internal/hostname"
 	"piccolod/internal/mdns"
 	"piccolod/internal/oidc"
 	"piccolod/internal/persistence"
@@ -464,11 +465,21 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if r == nil {
 				return nil, false
 			}
-			c, err := r.Cookie("piccolo_session")
-			if err != nil || strings.TrimSpace(c.Value) == "" {
-				return nil, false
+			// RFC 20260122 §6.1: Check port-based app session cookie first for non-default ports.
+			// On port-based access the browser sends both piccolo_session and piccolo_app_session_p<port>;
+			// the app cookie must take priority to avoid returning the portal session (wrong audience).
+			if _, port, splitErr := net.SplitHostPort(r.Host); splitErr == nil && port != "80" && port != "443" {
+				portCookie, portErr := r.Cookie("piccolo_app_session_p" + port)
+				if portErr == nil && strings.TrimSpace(portCookie.Value) != "" {
+					return s.sessions.Get(portCookie.Value)
+				}
 			}
-			return s.sessions.Get(c.Value)
+			// Fallback to standard portal session cookie
+			c, err := r.Cookie("piccolo_session")
+			if err == nil && strings.TrimSpace(c.Value) != "" {
+				return s.sessions.Get(c.Value)
+			}
+			return nil, false
 		})
 
 		svcMgr.ProxyManager().SetPortalOriginResolver(s.portalOriginForRequest)
@@ -495,6 +506,37 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 				}
 			}
 			return false
+		})
+
+		// RFC 20260122: Configure proxy OIDC for headers/protected auth strategies
+		svcMgr.ProxyManager().SetSessionStore(s.sessions)
+		svcMgr.ProxyManager().SetLocalHostnameGetter(func() string {
+			if s.mdnsManager != nil {
+				return s.mdnsManager.Hostname()
+			}
+			return "piccolo.local"
+		})
+		svcMgr.ProxyManager().SetProxyOIDCConfig(services.ProxyOIDCConfig{
+			SessionStore: s.sessions,
+			UserManager:  s.userManager,
+			GetPortalOrigin: s.portalOriginForRequest,
+			GetLocalHostname: func() string {
+				if s.mdnsManager != nil {
+					return s.mdnsManager.Hostname()
+				}
+				return "piccolo.local"
+			},
+			ExchangeCode: s.proxyOIDCExchangeCode,
+			GetUserInfo:  s.proxyOIDCGetUserInfo,
+			UserCanAccessApp: func(ctx context.Context, userID, appName string) (bool, error) {
+				if s.userManager == nil {
+					return false, errors.New("user manager unavailable")
+				}
+				return s.userManager.IsAppAllowed(ctx, userID, appName)
+			},
+			// RFC 20260122 §6.2: Trust X-Forwarded-Proto because Piccolo's TLS mux
+			// terminates TLS and sets this header for downstream handlers.
+			TrustForwardedProto: true,
 		})
 	}
 
@@ -1050,7 +1092,9 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 		// LAN host URL: only if mDNS is enabled (mdnsManager is nil when disabled)
 		if s.mdnsManager != nil {
 			lanBase := s.mdnsManager.Hostname()
-			lanHostURL := fmt.Sprintf("%s://%s.%s", scheme, ep.DerivedHostLabel, lanBase)
+			// RFC 20260122 §4.4: Use 2-level mDNS format with hyphen separator
+			lanHostname := hostnamepkg.DeriveLANHostname(ep.DerivedHostLabel, lanBase)
+			lanHostURL := fmt.Sprintf("%s://%s", scheme, lanHostname)
 			result["lan_host_url"] = lanHostURL
 		}
 

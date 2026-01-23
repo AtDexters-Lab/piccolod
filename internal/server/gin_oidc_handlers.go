@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -83,6 +85,7 @@ func (s *GinServer) initOIDCProvider() (*oidc.Provider, error) {
 //   - All declared redirect_uri_paths from the app manifest
 //
 // Additionally, explicit redirect_uris (for native apps) are appended as-is.
+// RFC 20260122 §5.3: Proxy OIDC clients also include the reserved callback path.
 // This approach is fully compliant with OAuth 2.0 exact URI matching (RFC 6749, RFC 9700).
 func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]string, error) {
 	if s.serviceManager == nil {
@@ -96,6 +99,12 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 
 	// Collect redirect_uri_paths and explicit redirect_uris from app manifest.
 	paths, explicitURIs := s.collectRedirectConfig(ctx, appID)
+
+	// RFC 20260122 §5.3: Include proxy OIDC callback path for apps using headers/protected strategies.
+	if s.appUsesProxyAuth(ctx, appID) {
+		paths = append(paths, services.ProxyOIDCCallbackPath)
+	}
+
 	if len(paths) == 0 {
 		// No paths declared - return only explicit URIs (if any).
 		return explicitURIs, nil
@@ -117,6 +126,31 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 	uris = append(uris, explicitURIs...)
 
 	return uris, nil
+}
+
+// appUsesProxyAuth returns true if the app has any listeners using headers/protected auth strategy.
+// These apps require proxy OIDC clients with the reserved callback path.
+func (s *GinServer) appUsesProxyAuth(ctx context.Context, appID string) bool {
+	if s.appManager == nil {
+		return false
+	}
+
+	inst, err := s.appManager.Get(ctx, appID)
+	if err != nil || inst == nil || inst.Definition == nil {
+		return false
+	}
+
+	for _, l := range inst.Definition.Listeners {
+		if l.Auth == nil {
+			continue
+		}
+		for _, rule := range l.Auth.Rules {
+			if rule.Strategy == "headers" || rule.Strategy == "protected" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // collectRedirectConfig extracts redirect_uri_paths and redirect_uris from app manifest.
@@ -192,9 +226,9 @@ func (s *GinServer) buildValidOrigins(endpoints []services.ServiceEndpoint) []va
 			}
 		}
 
-		// LAN host-based: http://<app>.piccolo.local (or https)
+		// LAN host-based: http://<app>-piccolo.local (or https) - 2-level format per RFC 20260122
 		if ep.DerivedHostLabel != "" {
-			lanHost := strings.ToLower(ep.DerivedHostLabel + "." + localHostname)
+			lanHost := strings.ToLower(ep.DerivedHostLabel + "-" + localHostname)
 			origins = append(origins, validOrigin{"http", lanHost, 0})
 			origins = append(origins, validOrigin{"https", lanHost, 0})
 		}
@@ -331,12 +365,14 @@ func (s *GinServer) handleOIDCAuthorize(c *gin.Context) {
 		if sess != nil {
 			slog.Info("OIDC authorize: user already authenticated, fast-path",
 				"user_id", sess.UserID,
+				"session_id", sess.ID,
 				"client_id", clientID,
 			)
 
 			// User is already logged in - create auth request and immediately complete it
 			// This avoids redirecting to login page
-			s.handleOIDCAuthorizeFastPath(c, p, sess.UserID)
+			// RFC 20260122 §6.3: Pass portal session ID for logout propagation
+			s.handleOIDCAuthorizeFastPath(c, p, sess.UserID, sess.ID)
 			return
 		}
 	}
@@ -381,13 +417,19 @@ func (s *GinServer) handleOIDCAuthorizeCallback(c *gin.Context, p *oidc.Provider
 }
 
 // handleOIDCAuthorizeFastPath handles authorize when user is already logged in
-func (s *GinServer) handleOIDCAuthorizeFastPath(c *gin.Context, p *oidc.Provider, userID string) {
+// portalSessionID is passed for logout propagation per RFC 20260122 §6.3
+func (s *GinServer) handleOIDCAuthorizeFastPath(c *gin.Context, p *oidc.Provider, userID, portalSessionID string) {
 	redirectURI := c.Request.FormValue("redirect_uri")
 
 	// Inject redirect_uri for validation
 	ctx := c.Request.Context()
 	if redirectURI != "" {
 		ctx = context.WithValue(ctx, requestedRedirectURIContextKey, redirectURI)
+	}
+
+	// RFC 20260122 §6.3: Inject portal session ID for logout propagation
+	if portalSessionID != "" {
+		ctx = oidc.WithPortalSessionID(ctx, portalSessionID)
 	}
 
 	// Parse the authorize request parameters
@@ -536,7 +578,7 @@ func (s *GinServer) handleOIDCResume(c *gin.Context) {
 		return
 	}
 
-	if err := p.CompleteAuthRequest(c.Request.Context(), req.AuthRequestID, sess.UserID); err != nil {
+	if err := p.CompleteAuthRequest(c.Request.Context(), req.AuthRequestID, sess.UserID, sess.ID); err != nil {
 		// Log detailed error server-side, return generic message to client
 		slog.Error("OIDC resume: failed to complete auth request", "id", req.AuthRequestID, "error", err)
 		writeGinError(c, http.StatusBadRequest, "Failed to complete authentication request")
@@ -565,4 +607,84 @@ func (s *GinServer) getOIDCProvider() (*oidc.Provider, error) {
 
 	s.oidcProvider = p
 	return p, nil
+}
+
+// proxyOIDCExchangeCode performs the OIDC token exchange for proxy clients per RFC 20260122 §5.6.
+// This is a back-channel request from the proxy OIDC handler to the OIDC provider.
+func (s *GinServer) proxyOIDCExchangeCode(ctx context.Context, code, redirectURI, codeVerifier string) (*services.ExchangeResult, error) {
+	p, err := s.getOIDCProvider()
+	if err != nil {
+		return nil, fmt.Errorf("OIDC provider unavailable: %w", err)
+	}
+
+	// Retrieve the auth request by code
+	authReq, err := p.Storage().AuthRequestByCode(ctx, code)
+	if err != nil {
+		return nil, fmt.Errorf("invalid authorization code: %w", err)
+	}
+
+	// Verify PKCE code_verifier
+	if authReq.GetCodeChallenge() != nil {
+		expectedChallenge := authReq.GetCodeChallenge().Challenge
+		computedChallenge := computePKCEChallenge(codeVerifier)
+		if expectedChallenge != computedChallenge {
+			return nil, fmt.Errorf("PKCE verification failed")
+		}
+	}
+
+	// Verify redirect_uri matches
+	if authReq.GetRedirectURI() != redirectURI {
+		return nil, fmt.Errorf("redirect_uri mismatch")
+	}
+
+	// Verify user exists
+	userID := authReq.GetSubject()
+	if _, err := p.Storage().GetUserByID(ctx, userID); err != nil {
+		return nil, fmt.Errorf("user not found: %w", err)
+	}
+
+	// Create access token (we don't need a full JWT for in-process use)
+	// The proxy OIDC handler will create an app session directly
+	accessToken := userID // For in-process flow, we just pass the user ID
+
+	// Extract PortalSessionID for logout propagation (RFC 20260122 §6.3)
+	var portalSessionID string
+	if ar, ok := authReq.(*oidc.AuthRequest); ok {
+		portalSessionID = ar.PortalSessionID
+	}
+
+	return &services.ExchangeResult{
+		AccessToken:     accessToken,
+		TokenType:       "Bearer",
+		ExpiresIn:       3600,
+		PortalSessionID: portalSessionID,
+	}, nil
+}
+
+// proxyOIDCGetUserInfo retrieves user info for proxy OIDC flow per RFC 20260122 §5.6.
+func (s *GinServer) proxyOIDCGetUserInfo(ctx context.Context, accessToken string) (*services.UserInfoResult, error) {
+	p, err := s.getOIDCProvider()
+	if err != nil {
+		return nil, fmt.Errorf("OIDC provider unavailable: %w", err)
+	}
+
+	// For in-process flow, accessToken is the user ID
+	userID := accessToken
+	user, err := p.Storage().GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("user not found: %w", err)
+	}
+
+	return &services.UserInfoResult{
+		Sub:      user.ID,
+		Username: user.Username,
+		Email:    user.Email,
+		Role:     string(user.Role),
+	}, nil
+}
+
+// computePKCEChallenge computes the S256 PKCE code challenge.
+func computePKCEChallenge(verifier string) string {
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
 }

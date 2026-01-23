@@ -18,7 +18,7 @@ func TestServiceRemoteResolver(t *testing.T) {
 	resolver := newServiceRemoteResolver(svc)
 
 	listeners := []api.AppListener{
-		{Name: "web", GuestPort: 8080, RemotePorts: []int{80, 443, 8000}},
+		{Name: "web", GuestPort: 8080, Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTCP, RemotePorts: []int{80, 443, 8000}},
 	}
 	eps, err := svc.AllocateForApp("demo", listeners)
 	if err != nil {

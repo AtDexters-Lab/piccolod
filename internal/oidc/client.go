@@ -99,7 +99,7 @@ func NewClientManager(repo persistence.OIDCClientRepo) *ClientManager {
 	return &ClientManager{repo: repo}
 }
 
-// RegisterClient creates a new OIDC client for an app.
+// RegisterClient creates a new OIDC client for an app (oidc_passthrough strategy).
 // Returns the client ID and unhashed secret (secret is only returned once).
 func (m *ClientManager) RegisterClient(ctx context.Context, appID string) (clientID, clientSecret string, err error) {
 	// Generate client credentials
@@ -122,6 +122,7 @@ func (m *ClientManager) RegisterClient(ctx context.Context, appID string) (clien
 		ID:        clientID,
 		Secret:    hashedSecret,
 		AppID:     appID,
+		Type:      persistence.OIDCClientTypeApp, // App-declared client
 		CreatedAt: time.Now().UTC(),
 	}
 
@@ -130,6 +131,53 @@ func (m *ClientManager) RegisterClient(ctx context.Context, appID string) (clien
 	}
 
 	return clientID, clientSecret, nil
+}
+
+// RegisterProxyClient creates a proxy OIDC client for an app per RFC 20260122 §5.3.
+// Proxy clients are auto-generated for apps using headers/protected auth strategies.
+// Returns the client ID and unhashed secret (secret is only returned once).
+func (m *ClientManager) RegisterProxyClient(ctx context.Context, appName string) (clientID, clientSecret string, err error) {
+	// Generate proxy client ID: piccolo-<app>-proxy
+	clientID = "piccolo-" + appName + "-proxy"
+
+	// Generate client secret
+	clientSecret, err = generateClientSecret()
+	if err != nil {
+		return "", "", fmt.Errorf("generate client secret: %w", err)
+	}
+
+	// Hash the secret for storage
+	hashedSecret, err := hashClientSecret(clientSecret)
+	if err != nil {
+		return "", "", fmt.Errorf("hash client secret: %w", err)
+	}
+
+	client := persistence.OIDCClient{
+		ID:        clientID,
+		Secret:    hashedSecret,
+		AppID:     appName, // For proxy clients, AppID is the app name
+		Type:      persistence.OIDCClientTypeProxy,
+		CreatedAt: time.Now().UTC(),
+	}
+
+	if err := m.repo.Create(ctx, client); err != nil {
+		return "", "", err
+	}
+
+	return clientID, clientSecret, nil
+}
+
+// GetProxyClientByAppName returns the proxy client for an app, if registered.
+func (m *ClientManager) GetProxyClientByAppName(ctx context.Context, appName string) (*persistence.OIDCClient, error) {
+	clientID := "piccolo-" + appName + "-proxy"
+	client, err := m.repo.Get(ctx, clientID)
+	if err != nil {
+		return nil, err
+	}
+	if client.Type != persistence.OIDCClientTypeProxy {
+		return nil, fmt.Errorf("client %s is not a proxy client", clientID)
+	}
+	return &client, nil
 }
 
 // GenerateCredentials generates a new client ID and secret.
@@ -155,6 +203,7 @@ func (m *ClientManager) CreateClient(ctx context.Context, clientID, clientSecret
 		ID:        clientID,
 		Secret:    hashedSecret,
 		AppID:     appID,
+		Type:      persistence.OIDCClientTypeApp, // Default to app-declared client
 		CreatedAt: time.Now().UTC(),
 	}
 	return m.repo.Create(ctx, client)
@@ -172,6 +221,11 @@ func (m *ClientManager) GetClientByAppID(ctx context.Context, appID string) (*pe
 // DeleteClient removes an OIDC client.
 func (m *ClientManager) DeleteClient(ctx context.Context, clientID string) error {
 	return m.repo.Delete(ctx, clientID)
+}
+
+// DeleteClientsByAppID removes all OIDC clients for an app.
+func (m *ClientManager) DeleteClientsByAppID(ctx context.Context, appID string) error {
+	return m.repo.DeleteByAppID(ctx, appID)
 }
 
 // VerifyClientSecret verifies a client secret against the stored hash.

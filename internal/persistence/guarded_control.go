@@ -251,6 +251,12 @@ func (r *guardedOIDCClientRepo) Delete(ctx context.Context, clientID string) err
 	}
 	return r.store.notifyCommit(ctx, r.repo.Delete(ctx, clientID))
 }
+func (r *guardedOIDCClientRepo) DeleteByAppID(ctx context.Context, appID string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.DeleteByAppID(ctx, appID))
+}
 
 // -----------------------------------------------------------------------------
 // Guarded OIDC Key Repository

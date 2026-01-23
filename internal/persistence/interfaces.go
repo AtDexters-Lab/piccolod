@@ -117,6 +117,7 @@ type OIDCClientRepo interface {
 	Get(ctx context.Context, clientID string) (OIDCClient, error)
 	GetByAppID(ctx context.Context, appID string) (OIDCClient, error)
 	Delete(ctx context.Context, clientID string) error
+	DeleteByAppID(ctx context.Context, appID string) error
 	List(ctx context.Context) ([]OIDCClient, error)
 }
 
@@ -288,11 +289,22 @@ type User struct {
 
 // OIDC data structures -------------------------------------------------------
 
+// OIDCClientType distinguishes between app-declared and proxy OIDC clients.
+type OIDCClientType string
+
+const (
+	// OIDCClientTypeApp is an app-declared OIDC client (oidc_passthrough strategy).
+	OIDCClientTypeApp OIDCClientType = "app"
+	// OIDCClientTypeProxy is an auto-generated proxy OIDC client (headers/protected strategies).
+	OIDCClientTypeProxy OIDCClientType = "proxy"
+)
+
 // OIDCClient represents a registered OIDC client for an app.
 type OIDCClient struct {
-	ID        string // client_id
-	Secret    string // hashed client_secret
-	AppID     string // app instance ID
+	ID        string         // client_id
+	Secret    string         // hashed client_secret
+	AppID     string         // app instance ID
+	Type      OIDCClientType // RFC 20260122: "app" (oidc_passthrough) or "proxy" (headers/protected)
 	CreatedAt time.Time
 }
 
@@ -315,6 +327,7 @@ type OIDCAuthCode struct {
 	Nonce               string
 	CodeChallenge       string
 	CodeChallengeMethod string
+	PortalSessionID     string // RFC 20260122 §6.3: Links to portal session for logout propagation
 	ExpiresAt           time.Time
 	CreatedAt           time.Time
 }

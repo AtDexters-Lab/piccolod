@@ -156,7 +156,8 @@ func (s *GinServer) requireUnlocked() gin.HandlerFunc {
 	}
 }
 
-// requireSession ensures a valid session cookie is present and not expired
+// requireSession ensures a valid portal session cookie is present and not expired.
+// RFC 20260122 §6.2: Validates audience="portal" and origin binding.
 func (s *GinServer) requireSession() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id, ok := s.getSession(c)
@@ -165,7 +166,8 @@ func (s *GinServer) requireSession() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if _, ok := s.sessions.Get(id); !ok {
+		origin := s.computeCanonicalOrigin(c)
+		if _, ok := s.sessions.ValidatePortalSession(id, origin); !ok {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			c.Abort()
 			return
@@ -258,14 +260,14 @@ func (s *GinServer) allowLANOnly() gin.HandlerFunc {
 	}
 }
 
-// lanHostRoutingMiddleware implements LAN host-based routing per RFC 20260114.
-// It routes requests to app subdomains to the appropriate backend.
+// lanHostRoutingMiddleware implements LAN host-based routing per RFC 20260122.
+// It routes requests to app 2-level hostnames to the appropriate backend.
 //
 // Routing logic:
 // - piccolo.local / localhost / IP → continue to portal routes
-// - <app>.piccolo.local → app primary listener
-// - <listener>-<app>.piccolo.local → specific listener
-// - Unknown .piccolo.local subdomain → 404
+// - <app>-piccolo.local → app primary listener (2-level format)
+// - <listener>-<app>-piccolo.local → specific listener (2-level format)
+// - Unknown -piccolo.local subdomain → 404
 func (s *GinServer) lanHostRoutingMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if s == nil || s.serviceManager == nil {
@@ -296,10 +298,10 @@ func (s *GinServer) lanHostRoutingMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Check for app hostname: <label>.<base>
-		baseSuffix := "." + strings.ToLower(lanBase)
+		// Check for app hostname: <label>-<base> (2-level format per RFC 20260122)
+		baseSuffix := "-" + strings.ToLower(lanBase)
 		if !strings.HasSuffix(reqHost, baseSuffix) {
-			// Not a piccolo.local subdomain, continue to portal
+			// Not a 2-level piccolo.local hostname, continue to portal
 			c.Next()
 			return
 		}

@@ -102,7 +102,9 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 			userID = u.ID
 		}
 	}
-	sess := s.sessions.CreateWithUserInfo(userID, "admin", "admin", 3600)
+	// RFC 20260122 §6.2: Create portal session with origin binding
+	boundOrigin := s.computeCanonicalOrigin(c)
+	sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, 3600)
 	s.setSessionCookie(c, sess.ID, time.Hour)
 
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
@@ -157,7 +159,9 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 						userID = u.ID
 					}
 				}
-				sess := s.sessions.CreateWithUserInfo(userID, "admin", "admin", 3600)
+				// RFC 20260122 §6.2: Create portal session with origin binding
+				boundOrigin := s.computeCanonicalOrigin(c)
+				sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, 3600)
 				s.setSessionCookie(c, sess.ID, time.Hour)
 			}
 		}

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -147,6 +148,53 @@ func writeGinSuccess(c *gin.Context, data interface{}, message string) {
 		Message: message,
 	}
 	c.JSON(http.StatusOK, response)
+}
+
+// requiresProxyOIDCClient checks if an app requires a proxy OIDC client per RFC 20260122 §5.3.
+// Proxy clients are needed for apps with "headers" or "protected" auth strategies.
+func (s *GinServer) requiresProxyOIDCClient(appDef *api.AppDefinition) bool {
+	if appDef == nil {
+		return false
+	}
+	for _, listener := range appDef.Listeners {
+		if listener.Auth == nil || len(listener.Auth.Rules) == 0 {
+			continue
+		}
+		for _, rule := range listener.Auth.Rules {
+			strategy := rule.Strategy
+			if strategy == "" {
+				strategy = "public"
+			}
+			if strategy == "headers" || strategy == "protected" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// registerProxyOIDCClient registers a proxy OIDC client for an app per RFC 20260122 §5.3.
+func (s *GinServer) registerProxyOIDCClient(ctx context.Context, appName string) error {
+	clientMgr := s.getOIDCClientManager()
+	if clientMgr == nil {
+		return errors.New("OIDC client manager unavailable")
+	}
+
+	// Check if proxy client already exists
+	_, err := clientMgr.GetProxyClientByAppName(ctx, appName)
+	if err == nil {
+		// Client already exists
+		return nil
+	}
+
+	// Register new proxy client
+	_, _, err = clientMgr.RegisterProxyClient(ctx, appName)
+	if err != nil {
+		return fmt.Errorf("register proxy client: %w", err)
+	}
+
+	log.Printf("INFO: registered proxy OIDC client for app %s", appName)
+	return nil
 }
 
 // handleGinAppValidate handles POST /api/v1/apps/validate - Validate app.yaml without installing
@@ -369,6 +417,14 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 			}
 			writeGinError(c, http.StatusInternalServerError, "Failed to register OIDC client: "+err.Error())
 			return
+		}
+	}
+
+	// RFC 20260122 §5.3: Auto-register proxy OIDC client for apps with headers/protected auth strategies
+	if s.requiresProxyOIDCClient(appDef) {
+		if err := s.registerProxyOIDCClient(ctx, appInstance.InstanceID); err != nil {
+			// Non-fatal: log but don't fail the install
+			log.Printf("WARN: failed to register proxy OIDC client for %s: %v", appInstance.InstanceID, err)
 		}
 	}
 
@@ -602,12 +658,10 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 		return
 	}
 
-	// RFC 20260112: delete OIDC client on uninstall (best-effort).
+	// Delete all OIDC clients (passthrough + proxy) for this app on uninstall (best-effort).
 	if clientMgr := s.getOIDCClientManager(); clientMgr != nil {
-		if client, err := clientMgr.GetClientByAppID(ctx, appName); err == nil && client != nil {
-			if err := clientMgr.DeleteClient(ctx, client.ID); err != nil {
-				log.Printf("WARN: failed to delete OIDC client for %s: %v", appName, err)
-			}
+		if err := clientMgr.DeleteClientsByAppID(ctx, appName); err != nil {
+			log.Printf("WARN: failed to delete OIDC clients for %s: %v", appName, err)
 		}
 	}
 

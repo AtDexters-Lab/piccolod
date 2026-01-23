@@ -25,6 +25,25 @@ import (
 // ErrInvalidRefreshToken is returned when a token is not a refresh token.
 var ErrInvalidRefreshToken = errors.New("invalid refresh token")
 
+// portalSessionIDContextKey is used to pass portal session ID through context.
+// RFC 20260122 §6.3: Links auth codes to portal sessions for logout propagation.
+type portalSessionIDContextKey struct{}
+
+// WithPortalSessionID adds the portal session ID to the context.
+func WithPortalSessionID(ctx context.Context, sessionID string) context.Context {
+	return context.WithValue(ctx, portalSessionIDContextKey{}, sessionID)
+}
+
+// portalSessionIDFromContext extracts the portal session ID from the context.
+func portalSessionIDFromContext(ctx context.Context) string {
+	if v := ctx.Value(portalSessionIDContextKey{}); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
 func (s *Storage) ensureUserAllowedForClient(ctx context.Context, userID, clientID string) error {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
@@ -423,18 +442,19 @@ func (s *Storage) CreateAuthRequest(ctx context.Context, authReq *oidc.AuthReque
 
 	now := time.Now().UTC()
 	request := &AuthRequest{
-		ID:            id,
-		ClientID:      authReq.ClientID,
-		RedirectURI:   authReq.RedirectURI,
-		Scopes:        authReq.Scopes,
-		State:         authReq.State,
-		Nonce:         authReq.Nonce,
-		ResponseType:  authReq.ResponseType,
-		ResponseMode:  authReq.ResponseMode,
-		CodeChallenge: codeChallenge,
-		UserID:        userID,
-		IsDone:        userID != "",
-		CreatedAt:     now,
+		ID:              id,
+		ClientID:        authReq.ClientID,
+		RedirectURI:     authReq.RedirectURI,
+		Scopes:          authReq.Scopes,
+		State:           authReq.State,
+		Nonce:           authReq.Nonce,
+		ResponseType:    authReq.ResponseType,
+		ResponseMode:    authReq.ResponseMode,
+		CodeChallenge:   codeChallenge,
+		UserID:          userID,
+		IsDone:          userID != "",
+		PortalSessionID: portalSessionIDFromContext(ctx), // RFC 20260122 §6.3
+		CreatedAt:       now,
 	}
 	if userID != "" {
 		request.AuthTime = now
@@ -508,15 +528,16 @@ func (s *Storage) AuthRequestByCode(ctx context.Context, code string) (op.AuthRe
 	s.consumedAuthCodesMu.Unlock()
 
 	return &AuthRequest{
-		ID:            authCode.Code,
-		ClientID:      authCode.ClientID,
-		RedirectURI:   authCode.RedirectURI,
-		Scopes:        strings.Split(authCode.Scope, " "),
-		Nonce:         authCode.Nonce,
-		CodeChallenge: codeChallenge,
-		UserID:        authCode.UserID,
-		AuthTime:      authCode.CreatedAt,
-		IsDone:        true,
+		ID:              authCode.Code,
+		ClientID:        authCode.ClientID,
+		RedirectURI:     authCode.RedirectURI,
+		Scopes:          strings.Split(authCode.Scope, " "),
+		Nonce:           authCode.Nonce,
+		CodeChallenge:   codeChallenge,
+		UserID:          authCode.UserID,
+		AuthTime:        authCode.CreatedAt,
+		IsDone:          true,
+		PortalSessionID: authCode.PortalSessionID, // RFC 20260122 §6.3
 	}, nil
 }
 
@@ -545,6 +566,7 @@ func (s *Storage) SaveAuthCode(ctx context.Context, id, code string) error {
 		Nonce:               request.Nonce,
 		CodeChallenge:       challenge,
 		CodeChallengeMethod: challengeMethod,
+		PortalSessionID:     request.PortalSessionID, // RFC 20260122 §6.3
 		ExpiresAt:           time.Now().UTC().Add(10 * time.Minute),
 		CreatedAt:           time.Now().UTC(),
 	}
@@ -560,7 +582,8 @@ func (s *Storage) DeleteAuthRequest(ctx context.Context, id string) error {
 }
 
 // CompleteAuthRequest marks an auth request as authenticated.
-func (s *Storage) CompleteAuthRequest(ctx context.Context, id, userID string) error {
+// portalSessionID links the auth flow to the portal session for logout propagation (RFC 20260122 §6.3).
+func (s *Storage) CompleteAuthRequest(ctx context.Context, id, userID, portalSessionID string) error {
 	s.logger.Debug("OIDC CompleteAuthRequest starting", "id", id, "user_id", userID)
 
 	// 1. Get Request (Read Lock)
@@ -603,6 +626,9 @@ func (s *Storage) CompleteAuthRequest(ctx context.Context, id, userID string) er
 	request.UserID = userID
 	request.AuthTime = time.Now().UTC()
 	request.IsDone = true
+	if portalSessionID != "" {
+		request.PortalSessionID = portalSessionID
+	}
 	return nil
 }
 

@@ -5,7 +5,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -21,55 +20,12 @@ import (
 const sessionCookieName = "piccolo_session"
 
 func (s *GinServer) sessionCookieDomain(r *http.Request) string {
-	if s == nil || r == nil {
-		return ""
-	}
-
-	reqHost := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(canonicalHost(r.Host)), "."))
-	if reqHost == "" || reqHost == "localhost" {
-		return ""
-	}
-	if ip := net.ParseIP(reqHost); ip != nil {
-		// Browsers may reject Domain on IP literals; rely on host-only cookies.
-		return ""
-	}
-
-	// RFC 20260112: session cookies are scoped per access context.
-	// - Remote (WAN): Domain=<remote-base> so portal + apps share SSO.
-	// - LAN (mDNS): Domain=<local-host> so portal + apps share SSO.
-	remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if ip := net.ParseIP(remoteHost); ip != nil && ip.IsLoopback() {
-		if s.remoteManager != nil {
-			st := s.remoteManager.Status()
-			base := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(st.PortalHostname), "."))
-			if st.Enabled && base != "" {
-				// Only scope to remote base when the request host is within that base hostname.
-				// This avoids setting invalid cookies when accessed via alias domains.
-				if reqHost == base || strings.HasSuffix(reqHost, "."+base) {
-					return base
-				}
-				return ""
-			}
-		}
-	}
-
-	// LAN host-based routing: scope to the mDNS base hostname so portal + app subdomains share SSO.
-	if s.mdnsManager != nil {
-		localHost := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s.mdnsManager.Hostname()), "."))
-		if localHost != "" && localHost != "localhost" && net.ParseIP(localHost) == nil {
-			if reqHost == localHost || strings.HasSuffix(reqHost, "."+localHost) {
-				if _, err := url.Parse("http://" + localHost); err == nil {
-					return localHost
-				}
-			}
-		}
-	}
-
-	// Ensure this is a valid cookie domain.
-	if _, err := url.Parse("http://" + reqHost); err != nil {
-		return ""
-	}
-	return reqHost
+	// RFC 20260122 §6.1: Always use host-only cookies (no Domain attribute).
+	// This simplifies cookie architecture and improves security:
+	// - Portal session never sent to app backends
+	// - No cross-domain cookie leakage
+	// - Works uniformly across all access paths (LAN 2-level, Remote, Alias)
+	return ""
 }
 
 func (s *GinServer) setSessionCookie(c *gin.Context, id string, ttl time.Duration) {
@@ -129,6 +85,56 @@ func (s *GinServer) recordResetFailure() bool {
 
 func (s *GinServer) resetResetFailures() {
 	s.resetFailures = 0
+}
+
+// computeCanonicalOrigin computes the canonical origin for session binding per RFC 20260122 §6.2.
+// Origin format: scheme://host[:port] with default ports omitted.
+// IPv6 addresses are preserved with brackets per RFC 3986.
+func (s *GinServer) computeCanonicalOrigin(c *gin.Context) string {
+	scheme := "http"
+	// RFC 20260122 §6.2: Only trust TLS indicators from trusted sources (direct TLS or TLS mux context).
+	// X-Forwarded-Proto is NOT trusted here — it requires explicit opt-in configuration to prevent
+	// clients from spoofing the scheme and causing origin-binding mismatches.
+	if c.Request.TLS != nil {
+		scheme = "https"
+	} else if v := c.Request.Context().Value(secureContextKeyInstance); v != nil {
+		scheme = "https"
+	}
+
+	// Use net.SplitHostPort for correct IPv6 handling
+	rawHost := c.Request.Host
+	host, port, err := net.SplitHostPort(rawHost)
+	if err != nil {
+		// No port in Host header
+		host = rawHost
+		port = ""
+	}
+
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" {
+		return ""
+	}
+
+	// Strip existing brackets before re-adding to avoid double-bracketing (e.g., Host: [::1] without port)
+	host = strings.TrimPrefix(host, "[")
+	host = strings.TrimSuffix(host, "]")
+
+	// Preserve IPv6 brackets per RFC 3986
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+
+	// Omit default ports
+	if port != "" {
+		if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+			port = ""
+		}
+	}
+
+	if port != "" {
+		return scheme + "://" + host + ":" + port
+	}
+	return scheme + "://" + host
 }
 
 func (s *GinServer) getSession(c *gin.Context) (id string, ok bool) {
@@ -290,7 +296,9 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 	// Create session with full user info
 	userID := userInfo.ID
 	userRole := string(userInfo.Role)
-	sess := s.sessions.CreateWithUserInfo(userID, userInfo.Username, userRole, 3600) // 1h default
+	// RFC 20260122 §6.2: Create portal session with origin binding for security
+	boundOrigin := s.computeCanonicalOrigin(c)
+	sess := s.sessions.CreatePortalSession(userID, userInfo.Username, userRole, boundOrigin, 3600) // 1h default
 	s.setSessionCookie(c, sess.ID, time.Hour)
 
 	resp := gin.H{"message": "ok"}
@@ -303,9 +311,11 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 }
 
 // handleAuthLogout: POST /api/v1/auth/logout
+// Per RFC 20260122 §6.3: Portal logout invalidates all derived app sessions.
 func (s *GinServer) handleAuthLogout(c *gin.Context) {
 	if id, ok := s.getSession(c); ok {
-		s.sessions.Delete(id)
+		// Use DeleteWithPropagation to invalidate both portal session and all derived app sessions
+		s.sessions.DeleteWithPropagation(id)
 	}
 	s.clearSessionCookie(c)
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})

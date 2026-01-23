@@ -297,6 +297,9 @@ func applyMigrations(db *sql.DB) error {
 	if err := ensureAuthStateColumns(tx); err != nil {
 		return err
 	}
+	if err := ensureOIDCSchemaColumns(tx); err != nil {
+		return err
+	}
 	err = tx.Commit()
 	return err
 }
@@ -349,6 +352,44 @@ func ensureAuthStateColumns(tx *sql.Tx) error {
 		return err
 	}
 	return nil
+}
+
+// ensureOIDCSchemaColumns adds columns introduced by RFC 20260122 to OIDC tables.
+func ensureOIDCSchemaColumns(tx *sql.Tx) error {
+	// Add portal_session_id to oidc_auth_codes for logout propagation (RFC 20260122 §6.3)
+	if err := ensureColumn(tx, "oidc_auth_codes", "portal_session_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// Add type to oidc_clients for proxy client detection (RFC 20260122 §5.3)
+	if err := ensureColumn(tx, "oidc_clients", "type", "TEXT NOT NULL DEFAULT 'app'"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureColumn adds a column to a table if it doesn't already exist.
+func ensureColumn(tx *sql.Tx, table, column, definition string) error {
+	rows, err := tx.Query(fmt.Sprintf(`PRAGMA table_info(%s);`, table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var defaultVal sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultVal, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(name, column) {
+			return nil // Column already exists
+		}
+	}
+	_, err = tx.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
+	return err
 }
 
 func (s *sqliteControlStore) Close(ctx context.Context) error {
@@ -1286,9 +1327,13 @@ func (r *sqliteOIDCClientRepo) Create(ctx context.Context, client OIDCClient) er
 		return err
 	}
 	now := formatTimestamp(time.Now().UTC())
+	clientType := string(client.Type)
+	if clientType == "" {
+		clientType = string(OIDCClientTypeApp)
+	}
 	_, err := r.store.db.ExecContext(ctx,
-		`INSERT INTO oidc_clients (id, secret, app_id, created_at) VALUES (?, ?, ?, ?)`,
-		client.ID, client.Secret, client.AppID, now)
+		`INSERT INTO oidc_clients (id, secret, app_id, type, created_at) VALUES (?, ?, ?, ?, ?)`,
+		client.ID, client.Secret, client.AppID, clientType, now)
 	return err
 }
 
@@ -1300,15 +1345,17 @@ func (r *sqliteOIDCClientRepo) Get(ctx context.Context, clientID string) (OIDCCl
 	}
 	var client OIDCClient
 	var createdAt string
+	var clientType string
 	err := r.store.db.QueryRowContext(ctx,
-		`SELECT id, secret, app_id, created_at FROM oidc_clients WHERE id=?`, clientID).
-		Scan(&client.ID, &client.Secret, &client.AppID, &createdAt)
+		`SELECT id, secret, app_id, type, created_at FROM oidc_clients WHERE id=?`, clientID).
+		Scan(&client.ID, &client.Secret, &client.AppID, &clientType, &createdAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return OIDCClient{}, ErrNotFound
 		}
 		return OIDCClient{}, err
 	}
+	client.Type = OIDCClientType(clientType)
 	client.CreatedAt = parseTimestamp(createdAt)
 	return client, nil
 }
@@ -1321,15 +1368,17 @@ func (r *sqliteOIDCClientRepo) GetByAppID(ctx context.Context, appID string) (OI
 	}
 	var client OIDCClient
 	var createdAt string
+	var clientType string
 	err := r.store.db.QueryRowContext(ctx,
-		`SELECT id, secret, app_id, created_at FROM oidc_clients WHERE app_id=?`, appID).
-		Scan(&client.ID, &client.Secret, &client.AppID, &createdAt)
+		`SELECT id, secret, app_id, type, created_at FROM oidc_clients WHERE app_id=?`, appID).
+		Scan(&client.ID, &client.Secret, &client.AppID, &clientType, &createdAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return OIDCClient{}, ErrNotFound
 		}
 		return OIDCClient{}, err
 	}
+	client.Type = OIDCClientType(clientType)
 	client.CreatedAt = parseTimestamp(createdAt)
 	return client, nil
 }
@@ -1351,6 +1400,16 @@ func (r *sqliteOIDCClientRepo) Delete(ctx context.Context, clientID string) erro
 	return nil
 }
 
+func (r *sqliteOIDCClientRepo) DeleteByAppID(ctx context.Context, appID string) error {
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	if err := r.store.ensureWritableLocked(); err != nil {
+		return err
+	}
+	_, err := r.store.db.ExecContext(ctx, `DELETE FROM oidc_clients WHERE app_id=?`, appID)
+	return err
+}
+
 func (r *sqliteOIDCClientRepo) List(ctx context.Context) ([]OIDCClient, error) {
 	r.store.mu.RLock()
 	defer r.store.mu.RUnlock()
@@ -1358,7 +1417,7 @@ func (r *sqliteOIDCClientRepo) List(ctx context.Context) ([]OIDCClient, error) {
 		return nil, ErrLocked
 	}
 	rows, err := r.store.db.QueryContext(ctx,
-		`SELECT id, secret, app_id, created_at FROM oidc_clients ORDER BY created_at`)
+		`SELECT id, secret, app_id, type, created_at FROM oidc_clients ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -1367,9 +1426,11 @@ func (r *sqliteOIDCClientRepo) List(ctx context.Context) ([]OIDCClient, error) {
 	for rows.Next() {
 		var client OIDCClient
 		var createdAt string
-		if err := rows.Scan(&client.ID, &client.Secret, &client.AppID, &createdAt); err != nil {
+		var clientType string
+		if err := rows.Scan(&client.ID, &client.Secret, &client.AppID, &clientType, &createdAt); err != nil {
 			return nil, err
 		}
+		client.Type = OIDCClientType(clientType)
 		client.CreatedAt = parseTimestamp(createdAt)
 		clients = append(clients, client)
 	}
@@ -1491,10 +1552,10 @@ func (r *sqliteOIDCAuthCodeRepo) Store(ctx context.Context, code OIDCAuthCode) e
 	now := formatTimestamp(time.Now().UTC())
 	expiresAt := formatTimestamp(code.ExpiresAt)
 	_, err := r.store.db.ExecContext(ctx,
-		`INSERT INTO oidc_auth_codes (code, client_id, user_id, redirect_uri, scope, nonce, code_challenge, code_challenge_method, expires_at, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO oidc_auth_codes (code, client_id, user_id, redirect_uri, scope, nonce, code_challenge, code_challenge_method, portal_session_id, expires_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		code.Code, code.ClientID, code.UserID, code.RedirectURI, code.Scope,
-		code.Nonce, code.CodeChallenge, code.CodeChallengeMethod, expiresAt, now)
+		code.Nonce, code.CodeChallenge, code.CodeChallengeMethod, code.PortalSessionID, expiresAt, now)
 	return err
 }
 
@@ -1518,12 +1579,12 @@ func (r *sqliteOIDCAuthCodeRepo) Consume(ctx context.Context, code string) (OIDC
 
 	var authCode OIDCAuthCode
 	var expiresAt, createdAt string
-	var nonce, codeChallenge, codeChallengeMethod sql.NullString
+	var nonce, codeChallenge, codeChallengeMethod, portalSessionID sql.NullString
 	err = tx.QueryRowContext(ctx,
-		`SELECT code, client_id, user_id, redirect_uri, scope, nonce, code_challenge, code_challenge_method, expires_at, created_at
+		`SELECT code, client_id, user_id, redirect_uri, scope, nonce, code_challenge, code_challenge_method, portal_session_id, expires_at, created_at
 		 FROM oidc_auth_codes WHERE code=?`, code).
 		Scan(&authCode.Code, &authCode.ClientID, &authCode.UserID, &authCode.RedirectURI,
-			&authCode.Scope, &nonce, &codeChallenge, &codeChallengeMethod, &expiresAt, &createdAt)
+			&authCode.Scope, &nonce, &codeChallenge, &codeChallengeMethod, &portalSessionID, &expiresAt, &createdAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return OIDCAuthCode{}, ErrNotFound
@@ -1534,6 +1595,7 @@ func (r *sqliteOIDCAuthCodeRepo) Consume(ctx context.Context, code string) (OIDC
 	authCode.Nonce = nonce.String
 	authCode.CodeChallenge = codeChallenge.String
 	authCode.CodeChallengeMethod = codeChallengeMethod.String
+	authCode.PortalSessionID = portalSessionID.String
 	authCode.ExpiresAt = parseTimestamp(expiresAt)
 	authCode.CreatedAt = parseTimestamp(createdAt)
 

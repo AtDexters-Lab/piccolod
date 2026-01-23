@@ -10,9 +10,10 @@ func TestNameRegistryAliases(t *testing.T) {
 	reg.SetAliases([]string{"immich", "metrics-immich"})
 
 	names := reg.Names()
+	// RFC 20260122 §4.1: 2-level mDNS format uses hyphen separator
 	expect := []string{
-		"immich.piccolo.local.",
-		"metrics-immich.piccolo.local.",
+		"immich-piccolo.local.",
+		"metrics-immich-piccolo.local.",
 		"piccolo.local.",
 	}
 
@@ -40,9 +41,10 @@ func TestManagerSetHostAliasesFiltersInvalid(t *testing.T) {
 	}
 
 	fqdns := manager.AdvertisedNames()
+	// RFC 20260122 §4.1: 2-level mDNS format uses hyphen separator
 	expect := []string{
-		"immich.piccolo.local.",
-		"metrics-immich.piccolo.local.",
+		"immich-piccolo.local.",
+		"metrics-immich-piccolo.local.",
 		"piccolo.local.",
 	}
 	for _, name := range expect {

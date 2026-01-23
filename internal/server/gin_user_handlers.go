@@ -298,13 +298,15 @@ func (s *GinServer) handleSetUserPassword(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "password updated"})
 }
 
-// getSessionFromContext retrieves the session from the gin context.
+// getSessionFromContext retrieves the validated portal session from the gin context.
+// RFC 20260122 §6.2: Validates audience="portal" and origin binding.
 func (s *GinServer) getSessionFromContext(c *gin.Context) *auth.Session {
 	id, ok := s.getSession(c)
 	if !ok {
 		return nil
 	}
-	sess, ok := s.sessions.Get(id)
+	origin := s.computeCanonicalOrigin(c)
+	sess, ok := s.sessions.ValidatePortalSession(id, origin)
 	if !ok {
 		return nil
 	}

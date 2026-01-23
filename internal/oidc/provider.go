@@ -134,8 +134,9 @@ func (p *Provider) Inner() *op.Provider {
 }
 
 // CompleteAuthRequest completes an auth request after successful login.
-func (p *Provider) CompleteAuthRequest(ctx context.Context, authRequestID, userID string) error {
-	return p.storage.CompleteAuthRequest(ctx, authRequestID, userID)
+// portalSessionID links the auth flow to the portal session for logout propagation (RFC 20260122 §6.3).
+func (p *Provider) CompleteAuthRequest(ctx context.Context, authRequestID, userID, portalSessionID string) error {
+	return p.storage.CompleteAuthRequest(ctx, authRequestID, userID, portalSessionID)
 }
 
 // AuthCallbackURL returns the URL to redirect to after login.

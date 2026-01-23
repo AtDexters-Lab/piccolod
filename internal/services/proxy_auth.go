@@ -13,15 +13,24 @@ type proxyAppIDContextKey struct{}
 type proxyAppHostContextKey struct{}
 type proxyCookieRewriteContextKey struct{}
 
+// Cookie names for Piccolo sessions and OIDC flows
+const (
+	sessionCookieName   = "piccolo_session"
+	oidcStateCookieName = "piccolo_oidc_state"
+	nonceCookieName     = "piccolo_nonce"
+)
+
 var piccoloCookieNames = map[string]struct{}{
-	"piccolo_session":    {},
-	"piccolo_oidc_state": {},
-	"piccolo_nonce":      {},
+	sessionCookieName:   {},
+	oidcStateCookieName: {},
+	nonceCookieName:     {},
 }
 
 func isPiccoloCookieName(name string) bool {
-	_, ok := piccoloCookieNames[name]
-	return ok
+	// RFC 20260122 §6.1: The entire piccolo_ namespace is reserved.
+	// This covers piccolo_session, piccolo_oidc_state, piccolo_nonce,
+	// and port-based cookies like piccolo_app_session_p<port>.
+	return strings.HasPrefix(name, "piccolo_")
 }
 
 func isBrowserNavigation(r *http.Request) bool {
@@ -241,7 +250,8 @@ func stripAndRewriteRequestCookies(r *http.Request, appID string, rewrite bool) 
 		return
 	}
 
-	needsProcessing := strings.Contains(raw, "piccolo_session") || strings.Contains(raw, "piccolo_oidc_state") || strings.Contains(raw, "piccolo_nonce")
+	// RFC 20260122 §6.1: Check for any piccolo_ prefixed cookie or rewrite-eligible cookies
+	needsProcessing := strings.Contains(raw, "piccolo_")
 	if rewrite && strings.Contains(raw, "__piccolo_") {
 		needsProcessing = true
 	}

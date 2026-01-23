@@ -1,7 +1,8 @@
-// Package hostname provides validation and hostname derivation for RFC 20260114.
+// Package hostname provides validation and hostname derivation for RFC 20260114 & RFC 20260122.
 // It implements the unified hostname scheme for HTTP/WebSocket listeners:
-// - Primary listener: <app>.<base>
-// - Additional listeners: <listener>-<app>.<base>
+// - Primary listener (LAN): <app>-<base> (2-level mDNS format per RFC 20260122)
+// - Additional listeners (LAN): <listener>-<app>-<base>
+// - Remote access continues to use subdomain format: <app>.<portal-base>
 package hostname
 
 import (
@@ -12,9 +13,11 @@ import (
 	"piccolod/internal/api"
 )
 
-// appNameRegex validates app names per RFC 20260114 Section 4.4 and specification.yaml.
-// Must start with a letter, lowercase letters and numbers only (NO hyphens), 1-31 chars.
-var appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9]{0,30}$`)
+// appNameRegex validates app names per RFC 20260122 Section 4.3.
+// Must start with a letter, lowercase letters and numbers only (NO hyphens), 1-16 chars.
+// Rationale for 16-char limit: With 2-level format <listener>-<app>-<base>.local,
+// worst case is 16+1+16+1+16 = 50 chars for the left-most label, under DNS 63-char limit.
+var appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9]{0,15}$`)
 
 // ReservedAppNames are names that cannot be used as app names.
 // Per specification.yaml: api, www, admin, root, system, piccolo, piccoloos
@@ -24,19 +27,19 @@ var ReservedAppNames = []string{"api", "www", "admin", "root", "system", "piccol
 // Per specification.yaml: piccolo, piccoloos
 var ReservedListenerNames = []string{"piccolo", "piccoloos"}
 
-// ValidateAppName validates an app name per RFC 20260114 Section 4.4.
+// ValidateAppName validates an app name per RFC 20260122 Section 4.3.
 // Rules:
 // - Must start with a letter
 // - Lowercase letters and numbers only (NO hyphens)
-// - Length 1-31 characters
+// - Length 1-16 characters (to ensure derived hostnames stay under DNS 63-char limit)
 // - Cannot be a reserved name
 func ValidateAppName(name string) error {
 	if name == "" {
 		return fmt.Errorf("name is required")
 	}
 
-	if len(name) > 31 {
-		return fmt.Errorf("name must be 31 characters or less")
+	if len(name) > 16 {
+		return fmt.Errorf("name must be 16 characters or less")
 	}
 
 	if !appNameRegex.MatchString(name) {
@@ -52,15 +55,15 @@ func ValidateAppName(name string) error {
 	return nil
 }
 
-// ValidateListenerName validates a listener name per specification.yaml.
-// Same rules as app name: 1-31 chars, [a-z][a-z0-9]*, starts with letter.
+// ValidateListenerName validates a listener name per RFC 20260122 Section 4.3.
+// Same rules as app name: 1-16 chars, [a-z][a-z0-9]*, starts with letter, no hyphens.
 func ValidateListenerName(name string) error {
 	if name == "" {
 		return fmt.Errorf("listener name is required")
 	}
 
-	if len(name) > 31 {
-		return fmt.Errorf("listener name must be 31 characters or less")
+	if len(name) > 16 {
+		return fmt.Errorf("listener name must be 16 characters or less")
 	}
 
 	if !appNameRegex.MatchString(name) {
@@ -162,8 +165,9 @@ func ResolvePrimaryListener(listeners []api.AppListener) (string, error) {
 }
 
 // NormalizeHostLabel extracts the host label from a full hostname.
-// Given "immich.piccolo.local" and base "piccolo.local", returns "immich".
-// Given "metrics-immich.piccolo.local" and base "piccolo.local", returns "metrics-immich".
+// Uses 2-level mDNS format per RFC 20260122: <app>-<base>.local
+// Given "immich-piccolo.local" and base "piccolo.local", returns "immich".
+// Given "metrics-immich-piccolo.local" and base "piccolo.local", returns "metrics-immich".
 // Returns empty string if the hostname doesn't match the base.
 func NormalizeHostLabel(hostname, base string) string {
 	hostname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
@@ -173,7 +177,8 @@ func NormalizeHostLabel(hostname, base string) string {
 		return ""
 	}
 
-	suffix := "." + base
+	// RFC 20260122 §4.4: 2-level format uses hyphen separator
+	suffix := "-" + base
 	if !strings.HasSuffix(hostname, suffix) {
 		return ""
 	}
@@ -198,4 +203,39 @@ func ParseHostLabel(label string) (app, listener string, isPrimary bool) {
 
 	// Has hyphen: listener-app format
 	return label[idx+1:], label[:idx], false
+}
+
+// DeriveLANHostname constructs a 2-level mDNS hostname per RFC 20260122.
+// Given hostLabel "immich" and base "piccolo.local", returns "immich-piccolo.local".
+// Given hostLabel "metrics-immich" and base "piccolo.local", returns "metrics-immich-piccolo.local".
+func DeriveLANHostname(hostLabel, base string) string {
+	if hostLabel == "" {
+		return base
+	}
+	base = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
+	return strings.ToLower(hostLabel) + "-" + base
+}
+
+// ValidateDerivedHostname validates that a derived hostname's left-most DNS label
+// does not exceed 63 characters (DNS limit). Per RFC 20260122 §4.3, this is defense in depth.
+func ValidateDerivedHostname(hostname string) error {
+	hostname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+	if hostname == "" {
+		return nil
+	}
+
+	// Extract left-most label (before first dot)
+	idx := strings.Index(hostname, ".")
+	var leftmostLabel string
+	if idx == -1 {
+		leftmostLabel = hostname
+	} else {
+		leftmostLabel = hostname[:idx]
+	}
+
+	if len(leftmostLabel) > 63 {
+		return fmt.Errorf("derived hostname left-most label exceeds 63 characters: %d", len(leftmostLabel))
+	}
+
+	return nil
 }

@@ -22,9 +22,10 @@ type AuthRequest struct {
 	CodeChallenge *oidc.CodeChallenge
 
 	// Set after user authenticates
-	UserID   string
-	AuthTime time.Time
-	IsDone   bool
+	UserID          string
+	AuthTime        time.Time
+	IsDone          bool
+	PortalSessionID string // RFC 20260122 §6.3: Links to portal session for logout propagation
 
 	// For cleanup tracking
 	CreatedAt time.Time

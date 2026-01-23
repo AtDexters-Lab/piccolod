@@ -15,10 +15,10 @@ func TestValidateAppName(t *testing.T) {
 		{"valid simple", "myapp", false},
 		{"valid with numbers", "app123", false},
 		{"valid single char", "a", false},
-		{"valid max length", "abcdefghijklmnopqrstuvwxyz12345", false}, // 31 chars
+		{"valid max length", "abcdefghij123456", false}, // 16 chars (RFC 20260122 §4.3)
 
 		{"empty", "", true},
-		{"too long", "abcdefghijklmnopqrstuvwxyz123456", true}, // 32 chars
+		{"too long", "abcdefghij1234567", true}, // 17 chars (RFC 20260122: 16 max)
 		{"starts with number", "1app", true},
 		{"contains hyphen", "my-app", true},
 		{"contains underscore", "my_app", true},
@@ -191,18 +191,20 @@ func TestResolvePrimaryListener(t *testing.T) {
 }
 
 func TestNormalizeHostLabel(t *testing.T) {
+	// RFC 20260122 §4.4: 2-level format uses hyphen separator
 	tests := []struct {
 		name     string
 		hostname string
 		base     string
 		want     string
 	}{
-		{"simple app", "immich.piccolo.local", "piccolo.local", "immich"},
-		{"listener-app", "metrics-immich.piccolo.local", "piccolo.local", "metrics-immich"},
+		{"simple app 2-level", "immich-piccolo.local", "piccolo.local", "immich"},
+		{"listener-app 2-level", "metrics-immich-piccolo.local", "piccolo.local", "metrics-immich"},
 		{"apex returns empty", "piccolo.local", "piccolo.local", ""},
 		{"no match", "example.com", "piccolo.local", ""},
-		{"trailing dots", "immich.piccolo.local.", "piccolo.local.", "immich"},
-		{"case insensitive", "IMMICH.PICCOLO.LOCAL", "piccolo.local", "immich"},
+		{"trailing dots", "immich-piccolo.local.", "piccolo.local.", "immich"},
+		{"case insensitive", "IMMICH-PICCOLO.LOCAL", "piccolo.local", "immich"},
+		{"old 3-level format no match", "immich.piccolo.local", "piccolo.local", ""}, // Old format should not match
 	}
 
 	for _, tt := range tests {
