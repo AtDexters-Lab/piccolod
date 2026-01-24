@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../theme/piccolo_theme.dart';
 import '../../core/models/app_models.dart';
 import '../../core/services/app_service.dart';
@@ -595,56 +596,42 @@ class _AppDetailViewState extends State<AppDetailView>
                           const Divider(height: 24),
                           _buildNetworkRow("Internal Port", "${svc.guestPort}"),
                           if (svc.lanHostUrl != null)
-                            _buildNetworkRow("LAN Access", svc.lanHostUrl!),
+                            _buildNetworkLinkRow(
+                              "LAN Access",
+                              svc.lanHostUrl!,
+                              onTap: () => launchUrl(Uri.parse(svc.lanHostUrl!)),
+                              icon: Icons.open_in_new,
+                              tooltip: "Opens in new tab",
+                            ),
                           if (svc.localUrl != null)
-                            _buildNetworkRow(
+                            _buildNetworkLinkRow(
                               svc.lanHostUrl != null
                                   ? "LAN Fallback"
                                   : "LAN Access",
                               "${svc.localUrl} (Port ${svc.publicPort})",
+                              onTap: () => AppLauncher.openAppWindow(
+                                controller: widget.desktopController,
+                                appService: widget.appService,
+                                app: _app!,
+                                service: svc,
+                              ),
+                              icon: Icons.web_asset,
+                              tooltip: "Opens in app window",
                             ),
-
                           if (svc.remoteUrl != null)
-                            _buildNetworkRow("Remote Access", svc.remoteUrl!),
-
-                          const SizedBox(height: 16),
-                          Row(
-                            children: [
-                              if (svc.localUrl != null ||
-                                  svc.lanHostUrl != null)
-                                Expanded(
-                                  child: OutlinedButton.icon(
-                                    onPressed: () => AppLauncher.openAppWindow(
-                                      controller: widget.desktopController,
-                                      appService: widget.appService,
-                                      app: _app!,
-                                      service: svc,
-                                    ),
-                                    icon: const Icon(Icons.lan, size: 16),
-                                    label: const Text("Open Local"),
-                                  ),
-                                ),
-                              if (svc.remoteUrl != null) ...[
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: FilledButton.icon(
-                                    onPressed: () => AppLauncher.openAppWindow(
-                                      controller: widget.desktopController,
-                                      appService: widget.appService,
-                                      app: _app!,
-                                      service: svc,
-                                      overrideUrl: svc.remoteUrl!,
-                                    ),
-                                    icon: const Icon(Icons.public, size: 16),
-                                    label: const Text("Open Remote"),
-                                    style: FilledButton.styleFrom(
-                                      backgroundColor: PiccoloTheme.cobalt600,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ],
-                          ),
+                            _buildNetworkLinkRow(
+                              "Remote Access",
+                              svc.remoteUrl!,
+                              onTap: () => AppLauncher.openAppWindow(
+                                controller: widget.desktopController,
+                                appService: widget.appService,
+                                app: _app!,
+                                service: svc,
+                                overrideUrl: svc.remoteUrl!,
+                              ),
+                              icon: Icons.web_asset,
+                              tooltip: "Opens in app window",
+                            ),
                         ],
                       ),
                     ),
@@ -779,6 +766,57 @@ class _AppDetailViewState extends State<AppDetailView>
             child: SelectableText(
               value,
               style: const TextStyle(fontFamily: 'JetBrainsMono'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildNetworkLinkRow(
+    String label,
+    String value, {
+    required VoidCallback onTap,
+    required IconData icon,
+    String? tooltip,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 120,
+            child: Text(
+              label,
+              style: const TextStyle(color: PiccoloTheme.inkMuted),
+            ),
+          ),
+          Expanded(
+            child: InkWell(
+              onTap: onTap,
+              borderRadius: BorderRadius.circular(4),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        value,
+                        style: const TextStyle(
+                          fontFamily: 'JetBrainsMono',
+                          color: PiccoloTheme.cobalt600,
+                          decoration: TextDecoration.underline,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Tooltip(
+                      message: tooltip ?? '',
+                      child: Icon(icon, size: 14, color: PiccoloTheme.cobalt600),
+                    ),
+                  ],
+                ),
+              ),
             ),
           ),
         ],

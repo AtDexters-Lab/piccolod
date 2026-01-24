@@ -7,21 +7,46 @@ import 'app_detail_view.dart';
 import 'widgets/app_web_view.dart';
 
 class AppLauncher {
-  static String? _preferredUrl(ServiceEndpoint service, {String? overrideUrl}) {
+  /// URL for embedding in an iframe. Prefers port-based (localUrl) on HTTP
+  /// because it shares the portal's hostname, keeping cookies same-site.
+  /// On HTTPS (remote), uses remoteUrl where SameSite=None;Secure works.
+  static String? _iframeUrl(ServiceEndpoint service, {String? overrideUrl}) {
     if (overrideUrl != null) return overrideUrl;
 
     final currentHost = Uri.base.host.toLowerCase();
 
+    if (_isLocalAccess(currentHost)) {
+      // HTTP LAN access: port-based URL is same-site with portal → cookies work
+      return service.localUrl ?? service.remoteUrl;
+    } else {
+      // Remote (HTTPS): remoteUrl works for iframes with Secure cookies
+      if (service.remoteUrl != null) return service.remoteUrl;
+      // Avoid Mixed Content: do not fall back to HTTP localUrl on an HTTPS page
+      if (Uri.base.scheme == 'https') return null;
+      return service.localUrl;
+    }
+  }
+
+  /// URL for opening in a new browser tab. Prefers host-based LAN URL
+  /// when on .local since top-level navigations have no cookie restrictions.
+  static String? _browserUrl(ServiceEndpoint service) {
+    final currentHost = Uri.base.host.toLowerCase();
+
     if (currentHost.endsWith('.local')) {
-      // Portal loaded via mDNS → resolver works → prefer host-based LAN URL
       return service.lanHostUrl ?? service.localUrl ?? service.remoteUrl;
-    } else if (_isIpAddress(currentHost)) {
-      // Portal loaded via IP → mDNS likely not working → prefer port-based
+    } else if (_isIpAddress(currentHost) || _isLoopback(currentHost)) {
       return service.localUrl ?? service.lanHostUrl ?? service.remoteUrl;
     } else {
-      // Remote access (external hostname)
       return service.remoteUrl ?? service.lanHostUrl ?? service.localUrl;
     }
+  }
+
+  static bool _isLocalAccess(String host) {
+    return host.endsWith('.local') || _isLoopback(host) || _isIpAddress(host);
+  }
+
+  static bool _isLoopback(String host) {
+    return host == 'localhost';
   }
 
   static bool _isIpAddress(String host) {
@@ -39,11 +64,12 @@ class AppLauncher {
     required ServiceEndpoint service,
     String? overrideUrl, // Allow passing a specific URL (e.g. remote vs local)
   }) {
-    final url = _preferredUrl(service, overrideUrl: overrideUrl);
-    final windowId = "app-window-${app.name}-${service.name}-$url";
+    final iframeUrl = _iframeUrl(service, overrideUrl: overrideUrl);
+    final browserUrl = _browserUrl(service) ?? iframeUrl;
+    final windowId = "app-window-${app.name}-${service.name}-$iframeUrl";
     final title = "${app.displayTitle} (${service.name})";
 
-    if (url == null || url.isEmpty) {
+    if (iframeUrl == null || iframeUrl.isEmpty) {
       // Cannot open app without a URL
       controller.openApp(
         windowId,
@@ -58,14 +84,14 @@ class AppLauncher {
       windowId,
       title,
       Icons.web_asset,
-      AppWebView(url: url),
+      AppWebView(url: iframeUrl),
       initialSize: const Size(1280, 800),
       requiresInterceptor: false,
       actions: [
         IconButton(
           icon: const Icon(Icons.open_in_new, size: 20),
           tooltip: "Open in Browser",
-          onPressed: () => launchUrl(Uri.parse(url)),
+          onPressed: () => launchUrl(Uri.parse(browserUrl!)),
         ),
         IconButton(
           icon: const Icon(Icons.settings, size: 20),

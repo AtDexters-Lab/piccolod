@@ -40,7 +40,7 @@ func isBrowserNavigation(r *http.Request) bool {
 
 	mode := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")))
 	dest := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")))
-	if mode == "navigate" && dest == "document" {
+	if mode == "navigate" && (dest == "document" || dest == "iframe") {
 		return true
 	}
 

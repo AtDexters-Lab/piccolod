@@ -193,12 +193,13 @@ class _UsersTabState extends State<UsersTab> {
           ),
           ElevatedButton(
             onPressed: () async {
+              final messenger = ScaffoldMessenger.of(context);
               Navigator.of(context).pop();
               try {
                 await _controller.deleteUser(user.id);
               } catch (e) {
                 if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
+                  messenger.showSnackBar(
                     SnackBar(
                       content: Text('Failed to delete user: $e'),
                       backgroundColor: PiccoloTheme.critical,
