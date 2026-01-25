@@ -519,10 +519,24 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			return
 		}
 
-		strategy := listenerStrategyForPath(ep.Auth, cleanedPath)
-
 		// RFC 4.1.5: Strip spoofed trusted headers for all strategies.
+		// Must happen before any handler (ACME, backend) to prevent header spoofing.
 		StripHeadersFromRequest(r)
+
+		// Intercept ACME HTTP-01 challenges for remote cert issuance (RFC 20260122).
+		// These bypass auth rules because they're infrastructure-level (piccolod's TLS
+		// termination), not app business logic. External ACME verifiers have no session.
+		if strings.HasPrefix(cleanedPath, "/.well-known/acme-challenge/") {
+			p.mu.Lock()
+			acme := p.acme
+			p.mu.Unlock()
+			if acme != nil {
+				acme.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		strategy := listenerStrategyForPath(ep.Auth, cleanedPath)
 
 		// RFC 4.1.6: Strategy-specific behavior.
 		switch strategy {
@@ -655,17 +669,6 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies)
 
 		applyForwardHeaders(r, ep)
-
-		// Intercept ACME HTTP-01 challenges (must still pass auth rules).
-		if strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
-			p.mu.Lock()
-			acme := p.acme
-			p.mu.Unlock()
-			if acme != nil {
-				acme.ServeHTTP(w, r)
-				return
-			}
-		}
 
 		rp.ServeHTTP(w, r)
 	}))

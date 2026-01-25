@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -597,5 +598,106 @@ func TestHTTPProxy_RewriteHttpOnlySetCookiePreservesMultibyteValue(t *testing.T)
 	want := "__piccolo_demo_session=✓; Path=/; HttpOnly"
 	if cookies[0] != want {
 		t.Fatalf("unexpected Set-Cookie: got %q want %q", cookies[0], want)
+	}
+}
+
+func TestProxy_ACMEChallengeBypassesAuth(t *testing.T) {
+	// Setup: backend that should NOT be reached for ACME challenges
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendLn.Close()
+
+	backendHit := make(chan struct{}, 1)
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case backendHit <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+	go srv.Serve(backendLn)
+	defer srv.Shutdown(context.Background())
+
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+
+	pm := NewProxyManager()
+
+	// Register mock ACME handler that returns a known challenge response
+	acmeChallengeToken := "test-challenge-token-12345"
+	acmeChallengeResponse := "test-challenge-response.key-authorization"
+	pm.SetAcmeHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, acmeChallengeToken) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(acmeChallengeResponse))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+
+	public := getFreePort(t)
+	ep := ServiceEndpoint{
+		App:        "test",
+		Name:       "web",
+		GuestPort:  0,
+		HostBind:   backendPort,
+		PublicPort: public,
+		Flow:       api.FlowTCP,
+		Protocol:   api.ListenerProtocolHTTP,
+		// Protected auth strategy: requires session, which ACME verifiers don't have
+		Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{{
+			Path:     "/",
+			Type:     "prefix",
+			Strategy: "protected",
+		}}},
+	}
+	pm.StartListener(ep)
+	defer pm.StopAll()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Test 1: ACME challenge request should bypass auth and return 200
+	challengeURL := fmt.Sprintf("http://127.0.0.1:%d/.well-known/acme-challenge/%s", public, acmeChallengeToken)
+	resp, err := http.Get(challengeURL)
+	if err != nil {
+		t.Fatalf("ACME challenge request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected ACME challenge to return 200, got %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read ACME challenge response: %v", err)
+	}
+	if string(body) != acmeChallengeResponse {
+		t.Fatalf("expected ACME challenge response %q, got %q", acmeChallengeResponse, string(body))
+	}
+
+	// Verify backend was NOT hit (ACME handler intercepted the request)
+	select {
+	case <-backendHit:
+		t.Fatalf("backend was hit for ACME challenge - should have been intercepted")
+	default:
+		// Expected: backend not hit
+	}
+
+	// Test 2: Regular protected path should still require auth (return 401 or 503)
+	// 503 is returned when sessionGetter is nil (auth infra not configured for test)
+	regularURL := fmt.Sprintf("http://127.0.0.1:%d/api/data", public)
+	resp2, err := http.Get(regularURL)
+	if err != nil {
+		t.Fatalf("regular request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusUnauthorized && resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected protected path to return 401 or 503, got %d", resp2.StatusCode)
 	}
 }
