@@ -102,3 +102,8 @@ Sensitive control plane data uses gocryptfs encryption. Keys managed via `intern
 - PRs should describe the change, link to any relevant docs in `docs/`, and list how it was tested (for example `go test ./...`, `make e2e`, manual UI checks with `make run`).
 - Include screenshots or short notes for user-visible UI changes.
 
+# Agent Instructions
+
+## Commit Messages
+- Don't add authoring
+- Should be succinct
