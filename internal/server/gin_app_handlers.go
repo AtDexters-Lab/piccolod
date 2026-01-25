@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"piccolod/internal/api"
@@ -397,9 +398,15 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		return
 	}
 
-	// Install a new app instance
-	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
-	appInstance, err := s.appManager.Install(ctx, appDef, displayName)
+	// Install a new app instance.
+	// Use a background context with a generous timeout instead of the HTTP request context.
+	// The request context is canceled by the server's WriteTimeout (60s) or remote tunnel
+	// disconnects, which kills podman pull processes mid-download for large images.
+	// The install must survive connection drops.
+	installCtx, cancelInstall := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancelInstall()
+	installCtx = app.WithTaskID(installCtx, c.GetHeader("X-Piccolo-Task-ID"))
+	appInstance, err := s.appManager.Install(installCtx, appDef, displayName)
 	if err != nil {
 		if handleAppManagerError(c, err, "install app") {
 			return
@@ -411,10 +418,10 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	// Persist OIDC client if generated
 	if oidcClientID != "" {
 		clientMgr := s.getOIDCClientManager()
-		if err := clientMgr.CreateClient(ctx, oidcClientID, oidcClientSecret, appInstance.InstanceID); err != nil {
+		if err := clientMgr.CreateClient(installCtx, oidcClientID, oidcClientSecret, appInstance.InstanceID); err != nil {
 			log.Printf("ERROR: failed to persist OIDC client for %s: %v. Rolling back install.", appInstance.InstanceID, err)
 			// Rollback: uninstall the app
-			if rbErr := s.appManager.UninstallWithOptions(ctx, appInstance.InstanceID, true); rbErr != nil {
+			if rbErr := s.appManager.UninstallWithOptions(installCtx, appInstance.InstanceID, true); rbErr != nil {
 				log.Printf("CRITICAL: failed to rollback uninstall for %s: %v", appInstance.InstanceID, rbErr)
 			}
 			writeGinError(c, http.StatusInternalServerError, "Failed to register OIDC client: "+err.Error())
@@ -424,7 +431,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 
 	// RFC 20260122 §5.3: Auto-register proxy OIDC client for apps with headers/protected auth strategies
 	if s.requiresProxyOIDCClient(appDef) {
-		if err := s.registerProxyOIDCClient(ctx, appInstance.InstanceID); err != nil {
+		if err := s.registerProxyOIDCClient(installCtx, appInstance.InstanceID); err != nil {
 			// Non-fatal: log but don't fail the install
 			log.Printf("WARN: failed to register proxy OIDC client for %s: %v", appInstance.InstanceID, err)
 		}

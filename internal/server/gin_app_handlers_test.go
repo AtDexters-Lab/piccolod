@@ -1454,6 +1454,12 @@ func (m *GinMockContainerManager) ResetStorage(ctx context.Context, runtime cont
 	return nil
 }
 
+func (m *GinMockContainerManager) ValidateAndRepairStorage(ctx context.Context, runtime container.PodmanRuntime) (bool, error) {
+	_ = ctx
+	_ = runtime
+	return false, nil
+}
+
 func (m *GinMockContainerManager) CommitContainer(ctx context.Context, runtime container.PodmanRuntime, containerID, imageName string) error {
 	_ = ctx
 	_ = runtime

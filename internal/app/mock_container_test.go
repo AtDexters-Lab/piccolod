@@ -201,6 +201,12 @@ func (m *MockContainerManager) ResetStorage(ctx context.Context, runtime contain
 	return nil
 }
 
+func (m *MockContainerManager) ValidateAndRepairStorage(ctx context.Context, runtime container.PodmanRuntime) (bool, error) {
+	_ = ctx
+	_ = runtime
+	return false, nil
+}
+
 func (m *MockContainerManager) CommitContainer(ctx context.Context, runtime container.PodmanRuntime, containerID, imageName string) error {
 	_ = ctx
 	_ = runtime

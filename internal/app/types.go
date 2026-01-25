@@ -28,6 +28,9 @@ type ContainerManager interface {
 	UpdatePublishAdd(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
 	UpdatePublishRemove(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
 	ResetStorage(ctx context.Context, runtime container.PodmanRuntime) error
+	// ValidateAndRepairStorage checks if overlay storage is healthy and repairs if corrupted.
+	// Returns true if repair was performed.
+	ValidateAndRepairStorage(ctx context.Context, runtime container.PodmanRuntime) (bool, error)
 	// ImageExists checks if an image exists in local storage.
 	ImageExists(ctx context.Context, runtime container.PodmanRuntime, imageName string) (bool, error)
 	// RemoveImage removes an image from local storage.

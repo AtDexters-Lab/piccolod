@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -974,6 +976,233 @@ func (p *PodmanCLI) ResetStorage(ctx context.Context, runtime PodmanRuntime) err
 	cmd := exec.CommandContext(ctx, "podman", rmArgs...)
 	_ = cmd.Run() // Ignore errors - containers may already be gone
 	return nil
+}
+
+// storageCorruptionIndicators are specific error patterns that always indicate overlay
+// storage corruption from killed image pulls.
+var storageCorruptionIndicators = []string{
+	"creating file-getter",
+	"readlink",
+	"layers.lock",
+	"layers.json",
+	"structure needs cleaning",
+	"input/output error",
+}
+
+// storageGenericErrors are generic error strings that only indicate corruption
+// when the output also references storage-related paths. Without path context,
+// these could come from unrelated failures (e.g., missing podman binary, bad --root path).
+var storageGenericErrors = []string{
+	"no such file or directory",
+	"invalid argument",
+}
+
+// storagePathKeywords confirm that a generic error is storage-related.
+var storagePathKeywords = []string{
+	"overlay",
+	"layer",
+	"diff/",
+	"imagestore",
+}
+
+// ValidateAndRepairStorage checks if the podman overlay storage for a runtime is healthy.
+// If corruption is detected (e.g., from a previous killed image pull), it cleans up the
+// per-app overlay directories and removes dangling entries from the shared imagestore.
+// Only repairs when the error output matches known corruption patterns; other failures
+// (missing binary, permission denied, context timeout) are returned as errors.
+// Returns true if repair was performed.
+func (p *PodmanCLI) ValidateAndRepairStorage(ctx context.Context, runtime PodmanRuntime) (bool, error) {
+	// Quick health check: try listing images
+	args, err := buildPodmanArgs(runtime, []string{"images", "--quiet", "--noheading"})
+	if err != nil {
+		return false, fmt.Errorf("build podman args: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	output, runErr := cmd.CombinedOutput()
+	if runErr == nil {
+		return false, nil // Storage is healthy
+	}
+
+	// Check if the failure indicates storage corruption vs. a transient/unrelated error.
+	// Two-tier matching: specific indicators always mean corruption; generic errors
+	// only count when the output also mentions storage-related paths.
+	outputStr := strings.ToLower(string(output) + " " + runErr.Error())
+	isCorruption := false
+	for _, pattern := range storageCorruptionIndicators {
+		if strings.Contains(outputStr, pattern) {
+			isCorruption = true
+			break
+		}
+	}
+	if !isCorruption {
+		// Check generic errors, but only if output references storage paths.
+		hasStorageContext := false
+		for _, kw := range storagePathKeywords {
+			if strings.Contains(outputStr, kw) {
+				hasStorageContext = true
+				break
+			}
+		}
+		if hasStorageContext {
+			for _, pattern := range storageGenericErrors {
+				if strings.Contains(outputStr, pattern) {
+					isCorruption = true
+					break
+				}
+			}
+		}
+	}
+	if !isCorruption {
+		return false, fmt.Errorf("podman images check failed (non-corruption): %w, output: %s", runErr, string(output))
+	}
+
+	log.Printf("WARN: podman storage corruption detected for root=%s (output: %s), attempting repair", runtime.Root, strings.TrimSpace(string(output)))
+
+	repaired := false
+
+	// Phase 1: Clean per-app overlay storage directories.
+	// These contain stale layers from killed pulls. Removing them allows a fresh pull.
+	if runtime.Root != "" {
+		overlayDirs := []string{"overlay", "overlay-images", "overlay-layers", "overlay-containers"}
+		for _, dir := range overlayDirs {
+			target := filepath.Join(runtime.Root, dir)
+			if _, statErr := os.Stat(target); statErr == nil {
+				if rmErr := os.RemoveAll(target); rmErr != nil {
+					log.Printf("WARN: failed to remove stale overlay dir %s: %v", target, rmErr)
+				} else {
+					log.Printf("INFO: removed stale overlay dir: %s", target)
+					repaired = true
+				}
+			}
+		}
+	}
+
+	// Phase 2: Clean dangling entries from the shared imagestore.
+	// When a pull is killed, the imagestore may retain layer references that point
+	// to the per-app overlay directory. These dangling references cause subsequent
+	// pulls to fail with "readlink .../diff: no such file or directory".
+	if runtime.Imagestore != "" && runtime.Root != "" {
+		cleaned, cleanErr := cleanDanglingImagestoreEntries(runtime.Imagestore, runtime.Root)
+		if cleanErr != nil {
+			log.Printf("WARN: imagestore cleanup failed: %v", cleanErr)
+		}
+		if cleaned {
+			repaired = true
+		}
+	}
+
+	if repaired {
+		log.Printf("INFO: podman storage repair completed for root=%s", runtime.Root)
+	}
+	return repaired, nil
+}
+
+// isUnderPath checks if resolved is a path under (or equal to) the given root directory.
+// Uses proper path-prefix matching to avoid substring false positives
+// (e.g., /apps/app1 should not match /apps/app10).
+func isUnderPath(resolved, root string) bool {
+	// Exact match
+	if resolved == root {
+		return true
+	}
+	// Proper prefix with path separator boundary
+	prefix := root + string(os.PathSeparator)
+	return strings.HasPrefix(resolved, prefix)
+}
+
+// cleanDanglingImagestoreEntries removes entries from the shared imagestore's overlay
+// directory that reference the given per-app root and are dangling (target doesn't exist).
+// Returns true if any entries were actually removed.
+func cleanDanglingImagestoreEntries(imagestore, appRoot string) (bool, error) {
+	appRoot = filepath.Clean(appRoot)
+	overlayDir := filepath.Join(imagestore, "overlay")
+	if _, err := os.Stat(overlayDir); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil // No overlay dir in imagestore, nothing to clean
+		}
+		return false, fmt.Errorf("stat imagestore overlay dir: %w", err)
+	}
+
+	cleaned := false
+
+	// Walk the imagestore overlay/l/ directory for dangling symlinks.
+	// Each entry in l/ is a symlink (short ID) pointing to ../<layer-id>/diff.
+	linkDir := filepath.Join(overlayDir, "l")
+	if entries, err := os.ReadDir(linkDir); err == nil {
+		for _, entry := range entries {
+			linkPath := filepath.Join(linkDir, entry.Name())
+			target, err := os.Readlink(linkPath)
+			if err != nil {
+				continue
+			}
+			// Resolve relative symlink targets
+			resolved := target
+			if !filepath.IsAbs(target) {
+				resolved = filepath.Join(linkDir, target)
+			}
+			resolved = filepath.Clean(resolved)
+			// Check if target is under the per-app root and is dangling
+			if isUnderPath(resolved, appRoot) {
+				if _, statErr := os.Stat(resolved); os.IsNotExist(statErr) {
+					if rmErr := os.Remove(linkPath); rmErr == nil {
+						log.Printf("INFO: removed dangling imagestore link: %s -> %s", linkPath, target)
+						cleaned = true
+					}
+				}
+			}
+		}
+	}
+
+	// Walk imagestore overlay/ for layer directories whose content references the per-app root.
+	// In containers/storage overlay layout, overlay/<layer-id>/link is a regular file
+	// containing the short link name (not a symlink). We read it to find the corresponding
+	// l/<short-id> symlink and check if that symlink's target references the per-app root.
+	entries, err := os.ReadDir(overlayDir)
+	if err != nil {
+		return cleaned, fmt.Errorf("read imagestore overlay dir: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == "l" {
+			continue
+		}
+		layerDir := filepath.Join(overlayDir, entry.Name())
+		linkFile := filepath.Join(layerDir, "link")
+
+		// Read the link file (regular file containing the short ID)
+		shortIDBytes, readErr := os.ReadFile(linkFile)
+		if readErr != nil {
+			continue
+		}
+		shortID := strings.TrimSpace(string(shortIDBytes))
+		if shortID == "" {
+			continue
+		}
+
+		// Check the corresponding l/<short-id> symlink
+		lSymlink := filepath.Join(linkDir, shortID)
+		target, linkErr := os.Readlink(lSymlink)
+		if linkErr != nil {
+			continue
+		}
+		resolved := target
+		if !filepath.IsAbs(target) {
+			resolved = filepath.Join(linkDir, target)
+		}
+		resolved = filepath.Clean(resolved)
+
+		// If the symlink target is under the per-app root and dangling, remove both
+		if isUnderPath(resolved, appRoot) {
+			if _, statErr := os.Stat(resolved); os.IsNotExist(statErr) {
+				_ = os.Remove(lSymlink)
+				if rmErr := os.RemoveAll(layerDir); rmErr == nil {
+					log.Printf("INFO: removed dangling imagestore layer: %s (link=%s)", layerDir, shortID)
+					cleaned = true
+				}
+			}
+		}
+	}
+
+	return cleaned, nil
 }
 
 // isValidContainerID validates container ID format

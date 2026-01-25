@@ -108,6 +108,15 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 	m.pruneMultiContainerZombies(ctx, runtime, instanceID, expectedNames)
 
+	// Validate and repair podman overlay storage before pulling images.
+	// Previous failed installs (e.g., killed by HTTP timeout) can leave corrupted overlay
+	// layers that cause subsequent pulls to fail with "readlink .../diff: no such file or directory".
+	if repaired, err := m.containerManager.ValidateAndRepairStorage(ctx, runtime); err != nil {
+		log.Printf("WARN: install %s: storage validation error: %v", instanceID, err)
+	} else if repaired {
+		log.Printf("INFO: install %s: repaired corrupted podman storage before pull", instanceID)
+	}
+
 	// Prepare storage for each service (pull images or init workspace disks)
 	workspaceInfos := make(map[string]*workspaceMountInfo, len(appDef.Services))
 	for svcName := range appDef.Services {
