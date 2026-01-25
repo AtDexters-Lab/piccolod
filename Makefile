@@ -69,7 +69,13 @@ clean:
 e2e:
 	@echo "E2E tests not yet ported to Flutter"
 
-service: build ## Build and install/update piccolod systemd service
+service: ## Build and install/update piccolod systemd service
+	@if [ ! -f piccolod ]; then \
+		echo "==> piccolod binary not found, building..."; \
+		$(MAKE) build; \
+	else \
+		echo "==> Using existing piccolod binary"; \
+	fi
 	@echo "==> Generating systemd service file (PORT=$(RUN_PORT))..."
 	@echo '[Unit]' > piccolod.service
 	@echo 'Description=Piccolo Daemon' >> piccolod.service
@@ -99,5 +105,17 @@ service: build ## Build and install/update piccolod systemd service
 	@echo "==> Service piccolod is now running:"
 	@systemctl status piccolod --no-pager
 	@rm piccolod.service
+
+service-uninstall: ## Uninstall piccolod systemd service
+	@echo "==> Uninstalling piccolod service"
+	@if systemctl is-active --quiet piccolod; then \
+		echo "Stopping service..."; \
+		sudo systemctl stop piccolod; \
+	fi
+	sudo systemctl disable piccolod || true
+	sudo rm -f /etc/systemd/system/piccolod.service
+	sudo rm -f /usr/local/bin/piccolod
+	sudo systemctl daemon-reload
+	@echo "==> Service piccolod uninstalled"
 
 # Removed legacy demo and separate real config; unified on single config.
