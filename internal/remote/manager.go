@@ -80,6 +80,19 @@ type Certificate struct {
 	NextRenewal   *time.Time `json:"next_renewal,omitempty"`
 	Status        string     `json:"status,omitempty"`
 	FailureReason string     `json:"failure_reason,omitempty"`
+
+	// Failure classification for self-healing ACME (RFC 20260125)
+	FailureClass FailureClass `json:"failure_class,omitempty"` // Classification of failure
+	FailureCode  string       `json:"failure_code,omitempty"`  // Machine-readable code (canonical "cert_*" namespace)
+
+	// Per-class attempt tracking to avoid cross-class backoff jumps
+	TransientAttempts  int `json:"transient_attempts,omitempty"`  // Attempts with transient failures
+	RateLimitAttempts  int `json:"rate_limit_attempts,omitempty"` // Attempts with rate-limit failures
+	ConnectionAttempts int `json:"connection_attempts,omitempty"` // Attempts with connection failures (for hybrid handling)
+
+	// Failure timing for hybrid escalation
+	FirstConnectionFailureAt *time.Time `json:"first_connection_failure_at,omitempty"` // When connection failures started (for 24h escalation)
+	FirstUnauthorizedAt      *time.Time `json:"first_unauthorized_at,omitempty"`       // When unauthorized failures started (for 24h escalation)
 }
 
 // Event is surfaced in the activity log for remote actions.
@@ -89,6 +102,7 @@ type Event struct {
 	Source    string    `json:"source"`
 	Message   string    `json:"message"`
 	NextStep  string    `json:"next_step,omitempty"`
+	CertID    string    `json:"cert_id,omitempty"` // For per-cert event retention (RFC 20260125)
 }
 
 // ListenerSummary mirrors the UI expectations for listener metadata.
@@ -150,6 +164,7 @@ type Storage interface {
 type Manager struct {
 	storage       Storage
 	cfg           *Config
+	cfgMu         sync.RWMutex // Protects cfg access during concurrent reads/writes
 	dialer        dialer
 	resolver      resolver
 	now           func() time.Time
@@ -171,6 +186,9 @@ type Manager struct {
 	closeErr      error
 	eventsBus     *events.Bus
 	baseDir       string
+
+	// Wake signal for RetryAt-driven scheduler (RFC 20260125)
+	scheduleWakeCh chan struct{}
 }
 
 func (m *Manager) certDir() string {
@@ -205,11 +223,12 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 		baseDir = paths.Root()
 	}
 	m := &Manager{
-		storage:  storage,
-		dialer:   d,
-		resolver: r,
-		now:      now,
-		baseDir:  baseDir,
+		storage:        storage,
+		dialer:         d,
+		resolver:       r,
+		now:            now,
+		baseDir:        baseDir,
+		scheduleWakeCh: make(chan struct{}, 1), // Buffered to avoid blocking
 	}
 	m.challenges = NewChallengeManager()
 	// ACME manager (wire later on configure)
@@ -253,7 +272,10 @@ func (m *Manager) SetNexusAdapter(adapter nexusclient.Adapter) {
 	m.adapter = adapter
 	m.adapterMu.Unlock()
 	m.ensureConfigHydrated()
-	m.applyAdapterState()
+	m.cfgMu.RLock()
+	snap := extractAdapterSnapshot(m.cfg)
+	m.cfgMu.RUnlock()
+	m.applyAdapterState(snap)
 }
 
 // SetEventsBus wires the shared event bus so the manager can publish config changes.
@@ -327,15 +349,23 @@ func (s *fileStorage) Save(ctx context.Context, cfg Config) error {
 	return os.WriteFile(s.path, payload, 0o644)
 }
 
+// save persists the config. Caller MUST hold cfgMu.Lock() - this function
+// releases it after storage I/O completes but before post-save hooks.
 func (m *Manager) save(cfg *Config) error {
+	// Caller must hold cfgMu.Lock() when calling this function.
+	// We release it after storage operations complete.
 	if cfg == nil {
+		m.cfgMu.Unlock()
 		return errors.New("config cannot be nil")
 	}
 	if cfg.DNSCredentials == nil {
 		cfg.DNSCredentials = map[string]string{}
 	}
+
+	// Storage save (JSON marshal) happens under lock to prevent races.
 	if m.storage != nil {
 		if err := m.storage.Save(context.Background(), *cfg); err != nil {
+			m.cfgMu.Unlock()
 			if errors.Is(err, ErrLocked) {
 				m.needsReload.Store(true)
 			}
@@ -343,8 +373,11 @@ func (m *Manager) save(cfg *Config) error {
 		}
 	}
 	m.cfg = cfg
+	snap := extractAdapterSnapshot(cfg)
+	m.cfgMu.Unlock()
+
 	m.needsReload.Store(false)
-	m.applyAdapterState()
+	m.applyAdapterState(snap)
 	m.updateACMEConfig(cfg)
 	m.publishConfigChanged()
 	return nil
@@ -365,9 +398,12 @@ func (m *Manager) reloadFromStorage() error {
 	if cfg.DNSCredentials == nil {
 		cfg.DNSCredentials = map[string]string{}
 	}
+	m.cfgMu.Lock()
 	m.cfg = &cfg
+	snap := extractAdapterSnapshot(&cfg)
+	m.cfgMu.Unlock()
 	m.needsReload.Store(false)
-	m.applyAdapterState()
+	m.applyAdapterState(snap)
 	m.updateACMEConfig(&cfg)
 	m.publishConfigChanged()
 	m.requeueOutstandingIssuances()
@@ -397,8 +433,22 @@ func (m *Manager) currentConfig() *Config {
 	return m.cfg
 }
 
+// currentConfigLocked returns the config without triggering a reload.
+// Must be used when cfgMu is already held (read or write) to avoid deadlock,
+// since ensureConfigHydrated -> reloadFromStorage acquires cfgMu.Lock().
+func (m *Manager) currentConfigLocked() *Config {
+	if m == nil {
+		return &Config{}
+	}
+	if m.cfg == nil {
+		m.cfg = &Config{}
+	}
+	return m.cfg
+}
+
 func (m *Manager) Status() Status {
-	cfg := m.currentConfig()
+	m.cfgMu.RLock()
+	cfg := m.currentConfigLocked()
 	warnings := computeWarnings(cfg)
 
 	var latency *int
@@ -422,7 +472,7 @@ func (m *Manager) Status() Status {
 		state = "stopped"
 	}
 
-	return Status{
+	result := Status{
 		Enabled:         cfg.Enabled,
 		State:           state,
 		Solver:          cfg.Solver,
@@ -440,6 +490,8 @@ func (m *Manager) Status() Status {
 		Aliases:         cloneAliases(cfg.Aliases),
 		Certificates:    cloneCertificates(cfg.Certificates),
 	}
+	m.cfgMu.RUnlock()
+	return result
 }
 
 // ReloadFromStorage attempts to refresh the in-memory configuration from the backing storage.
@@ -515,7 +567,8 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	expires := now.Add(90 * 24 * time.Hour)
 	nextRenewal := now.Add(60 * 24 * time.Hour)
 
-	cfg := m.currentConfig()
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
 	existingCerts := append([]Certificate(nil), cfg.Certificates...)
 	cfg.Endpoint = endpoint
 	cfg.DeviceSecret = strings.TrimSpace(req.DeviceSecret)
@@ -541,14 +594,6 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 		newCerts = append(newCerts, c)
 	}
 	cfg.Certificates = newCerts
-	m.enqueueIssuance("portal", []string{cfg.PortalHostname}, cfg.PortalHostname)
-	if cfg.TLD != "" && strings.EqualFold(cfg.Solver, "dns-01") && strings.TrimSpace(cfg.PortalHostname) != "" {
-		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
-		if base != "" {
-			cn := "*." + base
-			m.enqueueIssuance("wildcard", []string{cn, base}, cn)
-		}
-	}
 	cfg.Events = append(cfg.Events, Event{
 		Timestamp: now,
 		Level:     "info",
@@ -556,13 +601,27 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 		Message:   "Remote configuration saved",
 		NextStep:  "Run preflight",
 	})
+	// save() releases cfgMu.Lock()
+	if err := m.save(cfg); err != nil {
+		return err
+	}
 
-	return m.save(cfg)
+	// Queue issuance jobs after releasing lock (enqueueIssuance acquires its own lock)
+	m.enqueueIssuance("portal", []string{portalHost}, portalHost)
+	if tld != "" && strings.EqualFold(solver, "dns-01") && portalHost != "" {
+		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portalHost)), ".")
+		if base != "" {
+			cn := "*." + base
+			m.enqueueIssuance("wildcard", []string{cn, base}, cn)
+		}
+	}
+	return nil
 }
 
 // Disable switches remote access off but retains configuration.
 func (m *Manager) Disable() error {
-	cfg := m.currentConfig()
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
 	cfg.Enabled = false
 	now := m.now()
 	cfg.Events = append(cfg.Events, Event{
@@ -571,18 +630,22 @@ func (m *Manager) Disable() error {
 		Source:    "remote",
 		Message:   "Remote access disabled",
 	})
+	// save() releases cfgMu.Lock()
 	return m.save(cfg)
 }
 
 // Rotate generates a new secure device secret.
 func (m *Manager) Rotate() (string, error) {
-	cfg := m.currentConfig()
-	if cfg.Endpoint == "" {
-		return "", errors.New("remote not configured")
-	}
 	newSecret, err := generateSecureSecret()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate secret: %w", err)
+	}
+
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
+	if cfg.Endpoint == "" {
+		m.cfgMu.Unlock()
+		return "", errors.New("remote not configured")
 	}
 	cfg.DeviceSecret = newSecret
 	cfg.Events = append(cfg.Events, Event{
@@ -591,6 +654,7 @@ func (m *Manager) Rotate() (string, error) {
 		Source:    "remote",
 		Message:   "Remote device secret rotated",
 	})
+	// save() releases cfgMu.Lock()
 	if err := m.save(cfg); err != nil {
 		return "", err
 	}
@@ -607,7 +671,10 @@ func generateSecureSecret() (string, error) {
 
 // ListAliases returns the current alias inventory.
 func (m *Manager) ListAliases() []Alias {
-	return cloneAliases(m.currentConfig().Aliases)
+	m.cfgMu.RLock()
+	aliases := cloneAliases(m.currentConfigLocked().Aliases)
+	m.cfgMu.RUnlock()
+	return aliases
 }
 
 // AddAlias appends a new alias entry.
@@ -619,7 +686,9 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 	if listener == "" {
 		listener = "portal"
 	}
-	cfg := m.currentConfig()
+
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
 	alias := Alias{
 		ID:       fmt.Sprintf("alias-%d", time.Now().UnixNano()+rand.Int63n(1000)),
 		Hostname: hostname,
@@ -634,6 +703,7 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 		Source:    "remote",
 		Message:   fmt.Sprintf("Alias %s queued for listener %s", hostname, listener),
 	})
+	// save() releases cfgMu.Lock()
 	if err := m.save(cfg); err != nil {
 		return Alias{}, err
 	}
@@ -644,7 +714,8 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 
 // RemoveAlias deletes an alias by ID.
 func (m *Manager) RemoveAlias(id string) error {
-	cfg := m.currentConfig()
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
 	idx := -1
 	for i, a := range cfg.Aliases {
 		if a.ID == id {
@@ -653,6 +724,7 @@ func (m *Manager) RemoveAlias(id string) error {
 		}
 	}
 	if idx == -1 {
+		m.cfgMu.Unlock()
 		return errors.New("alias not found")
 	}
 	removed := cfg.Aliases[idx]
@@ -663,6 +735,7 @@ func (m *Manager) RemoveAlias(id string) error {
 		Source:    "remote",
 		Message:   fmt.Sprintf("Alias %s removed", removed.Hostname),
 	})
+	// save() releases cfgMu.Lock()
 	if err := m.save(cfg); err != nil {
 		return err
 	}
@@ -688,8 +761,12 @@ func (m *Manager) removeCertificateByID(id, commonName string) {
 	if m == nil {
 		return
 	}
-	cfg := m.currentConfig()
+
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
 	if cfg == nil {
+		m.cfgMu.Unlock()
+		m.deleteCertFiles(id, commonName)
 		return
 	}
 	removed := false
@@ -709,7 +786,10 @@ func (m *Manager) removeCertificateByID(id, commonName string) {
 			Source:    "remote",
 			Message:   fmt.Sprintf("Certificate removed (%s)", id),
 		})
+		// save() releases cfgMu.Lock()
 		_ = m.save(cfg)
+	} else {
+		m.cfgMu.Unlock()
 	}
 	m.deleteCertFiles(id, commonName)
 }
@@ -734,37 +814,59 @@ func (m *Manager) deleteCertFiles(id, commonName string) {
 
 // ListCertificates returns the synthetic certificate inventory.
 func (m *Manager) ListCertificates() []Certificate {
-	return cloneCertificates(m.currentConfig().Certificates)
+	m.cfgMu.RLock()
+	certs := cloneCertificates(m.currentConfigLocked().Certificates)
+	m.cfgMu.RUnlock()
+	return certs
 }
 
-func (m *Manager) applyAdapterState() {
+// adapterStateSnapshot holds the config fields needed by applyAdapterState,
+// extracted to avoid data races when reading from the live config pointer.
+type adapterStateSnapshot struct {
+	Endpoint       string
+	DeviceSecret   string
+	PortalHostname string
+	TLD            string
+	Enabled        bool
+}
+
+func extractAdapterSnapshot(cfg *Config) adapterStateSnapshot {
+	if cfg == nil {
+		return adapterStateSnapshot{}
+	}
+	return adapterStateSnapshot{
+		Endpoint:       cfg.Endpoint,
+		DeviceSecret:   cfg.DeviceSecret,
+		PortalHostname: cfg.PortalHostname,
+		TLD:            cfg.TLD,
+		Enabled:        cfg.Enabled,
+	}
+}
+
+func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 	if m.closed.Load() {
 		return
 	}
 	m.adapterMu.Lock()
 	adapter := m.adapter
 	cancel := m.adapterCancel
-	cfg := m.cfg
 	m.adapterMu.Unlock()
 
 	if adapter == nil {
 		return
 	}
-	if cfg == nil {
-		cfg = &Config{}
-	}
 
 	adapterCfg := nexusclient.Config{
-		Endpoint:       cfg.Endpoint,
-		DeviceSecret:   cfg.DeviceSecret,
-		PortalHostname: cfg.PortalHostname,
-		TLD:            cfg.TLD,
+		Endpoint:       snap.Endpoint,
+		DeviceSecret:   snap.DeviceSecret,
+		PortalHostname: snap.PortalHostname,
+		TLD:            snap.TLD,
 	}
 	if err := adapter.Configure(adapterCfg); err != nil {
 		log.Printf("WARN: remote: configure nexus adapter failed: %v", err)
 	}
 
-	if !cfg.Enabled || cfg.Endpoint == "" || cfg.DeviceSecret == "" || cfg.PortalHostname == "" {
+	if !snap.Enabled || snap.Endpoint == "" || snap.DeviceSecret == "" || snap.PortalHostname == "" {
 		m.stopAdapter()
 		m.stopRenewScheduler()
 		return
@@ -841,13 +943,19 @@ func (m *Manager) stopAdapter() {
 
 // startRenewScheduler starts a background loop to renew certificates when due.
 func (m *Manager) startRenewScheduler() {
-	if m.closed.Load() || m.renewCancel != nil {
+	if m.closed.Load() {
+		return
+	}
+	m.adapterMu.Lock()
+	if m.renewCancel != nil {
+		m.adapterMu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.renewCancel = cancel
 	done := make(chan struct{})
 	m.renewDone = done
+	m.adapterMu.Unlock()
 	go func() {
 		defer close(done)
 		m.runRenewScheduler(ctx)
@@ -855,41 +963,122 @@ func (m *Manager) startRenewScheduler() {
 }
 
 func (m *Manager) stopRenewScheduler() {
+	m.adapterMu.Lock()
 	if m.renewCancel != nil {
 		m.renewCancel()
 		m.renewCancel = nil
 	}
+	m.adapterMu.Unlock()
 }
 
+// notifySchedulerWake signals the scheduler to re-evaluate wake time.
+// Called whenever RetryAt is set or changed (e.g., after updateCertFailure).
+func (m *Manager) notifySchedulerWake() {
+	if m == nil || m.scheduleWakeCh == nil {
+		return
+	}
+	select {
+	case m.scheduleWakeCh <- struct{}{}:
+	default:
+		// Already pending wake, no need to queue another
+	}
+}
+
+// runRenewScheduler implements a RetryAt-driven scheduler per RFC 20260125.
+// Instead of fixed hourly ticks, it computes the next wake time from certificate RetryAt/NextRenewal.
 func (m *Manager) runRenewScheduler(ctx context.Context) {
-	// Check hourly; jitter issuance via pending-state gate
-	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
-	// Initial quick check after a short delay
-	initial := time.NewTimer(10 * time.Second)
-	defer initial.Stop()
+	// Initial scan after a short delay
+	m.scanAndQueueRenewals()
+
 	for {
+		// Compute next wake time based on earliest RetryAt or renewal
+		nextWake := m.computeNextWakeTime()
+
+		// Cap at 1 hour to ensure periodic health checks even if no retries due
+		if nextWake > time.Hour {
+			nextWake = time.Hour
+		}
+		// Minimum 10 seconds to prevent busy-loop on clock skew
+		if nextWake < 10*time.Second {
+			nextWake = 10 * time.Second
+		}
+
+		timer := time.NewTimer(nextWake)
 		select {
 		case <-ctx.Done():
+			// Clean shutdown: stop timer and drain if needed
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return
-		case <-initial.C:
-			m.scanAndQueueRenewals()
-		case <-ticker.C:
+		case <-m.scheduleWakeCh:
+			// RetryAt changed - re-evaluate immediately
+			// Must drain timer channel after Stop() to prevent spurious wakeup
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			// Don't scan yet, just recalculate wake time
+			continue
+		case <-timer.C:
 			m.scanAndQueueRenewals()
 		}
 	}
 }
 
-func (m *Manager) scanAndQueueRenewals() {
-	cfg := m.currentConfig()
+// computeNextWakeTime finds the earliest RetryAt or NextRenewal across all certificates.
+// Acquires read lock to safely iterate certificates while other goroutines may modify them.
+func (m *Manager) computeNextWakeTime() time.Duration {
+	m.cfgMu.RLock()
+	defer m.cfgMu.RUnlock()
+
+	cfg := m.currentConfigLocked()
 	now := m.now()
+	earliest := now.Add(time.Hour) // Default: 1 hour
+
+	for _, c := range cfg.Certificates {
+		// Check RetryAt for failed certs (including config_error weekly probes)
+		// Note: config_error certs are NOT skipped - they have RetryAt set for weekly probes
+		if c.RetryAt != nil && c.RetryAt.Before(earliest) {
+			earliest = *c.RetryAt
+		}
+		// Check NextRenewal for non-error certs (error certs use RetryAt backoff only)
+		if !strings.EqualFold(c.Status, "error") && c.NextRenewal != nil && c.NextRenewal.Before(earliest) {
+			earliest = *c.NextRenewal
+		}
+	}
+
+	if earliest.Before(now) {
+		return 0 // Due now
+	}
+	return earliest.Sub(now)
+}
+
+func (m *Manager) scanAndQueueRenewals() {
+	m.cfgMu.RLock()
+	cfg := m.currentConfigLocked()
+	now := m.now()
+	// Collect certificates needing renewal under read lock
+	type renewalJob struct {
+		id      string
+		domains []string
+		cn      string
+	}
+	var jobs []renewalJob
 	for _, c := range cfg.Certificates {
 		if strings.EqualFold(c.Status, "pending") {
 			continue // avoid duplicate queueing
 		}
-		dueRetry := c.RetryAt != nil && now.After(*c.RetryAt) && c.Attempts < maxCertAttempts
+		// RetryAt-driven: retry when due (no max attempts - indefinite retry per RFC 20260125)
+		dueRetry := c.RetryAt != nil && now.After(*c.RetryAt)
+		// Only check renewal schedule for non-error certs; error certs must wait for RetryAt backoff
 		dueRenewal := false
-		if c.NextRenewal != nil && c.ExpiresAt != nil {
+		if !strings.EqualFold(c.Status, "error") && c.NextRenewal != nil && c.ExpiresAt != nil {
 			dueRenewal = now.After(*c.NextRenewal) || now.Add(24*time.Hour).After(*c.ExpiresAt)
 		}
 		if !dueRetry && !dueRenewal {
@@ -899,7 +1088,13 @@ func (m *Manager) scanAndQueueRenewals() {
 		if !ok {
 			continue
 		}
-		m.enqueueIssuance(c.ID, domains, cn)
+		jobs = append(jobs, renewalJob{id: c.ID, domains: domains, cn: cn})
+	}
+	m.cfgMu.RUnlock()
+
+	// Enqueue jobs outside of lock
+	for _, job := range jobs {
+		m.enqueueIssuance(job.id, job.domains, job.cn)
 	}
 }
 
@@ -945,52 +1140,89 @@ func (m *Manager) requeueOutstandingIssuances() {
 	if m == nil {
 		return
 	}
-	cfg := m.currentConfig()
+
+	type requeueJob struct {
+		id       string
+		domains  []string
+		cn       string
+		isPending bool // true = queueIssuanceJob, false = enqueueIssuanceWithForce
+	}
+
+	m.cfgMu.RLock()
+	cfg := m.currentConfigLocked()
 	now := m.now()
+	var jobs []requeueJob
 	for _, c := range cfg.Certificates {
 		if strings.EqualFold(c.Status, "pending") {
 			domains, cn, ok := desiredDomainsAndCN(cfg, c)
 			if ok {
-				m.queueIssuanceJob(c.ID, domains, cn, true)
+				jobs = append(jobs, requeueJob{id: c.ID, domains: domains, cn: cn, isPending: true})
 			}
 			continue
 		}
-		if strings.EqualFold(c.Status, "error") && c.RetryAt != nil && now.After(*c.RetryAt) && c.Attempts < maxCertAttempts {
+		// Requeue error certs that are due for retry (no max attempts - indefinite retry per RFC 20260125)
+		if strings.EqualFold(c.Status, "error") && c.RetryAt != nil && now.After(*c.RetryAt) {
 			domains, cn, ok := desiredDomainsAndCN(cfg, c)
 			if ok {
-				m.enqueueIssuanceWithForce(c.ID, domains, cn, true)
+				jobs = append(jobs, requeueJob{id: c.ID, domains: domains, cn: cn, isPending: false})
 			}
+		}
+	}
+	m.cfgMu.RUnlock()
+
+	// Process jobs outside of lock
+	for _, job := range jobs {
+		if job.isPending {
+			m.queueIssuanceJob(job.id, job.domains, job.cn, true)
+		} else {
+			m.enqueueIssuanceWithForce(job.id, job.domains, job.cn, true)
 		}
 	}
 }
 
 // RenewCertificate simulates a manual renewal.
 func (m *Manager) RenewCertificate(id string) error {
-	cfg := m.currentConfig()
-	// Find target cert and queue issuance
+	m.cfgMu.RLock()
+	cfg := m.currentConfigLocked()
+	// Find target cert and collect info under lock
+	var domains []string
+	var cn string
+	var found bool
+	var errMsg string
 	for _, c := range cfg.Certificates {
 		if c.ID == id {
-			domains := append([]string(nil), c.Domains...)
-			cn := domains[0]
+			found = true
+			domains = append([]string(nil), c.Domains...)
+			cn = domains[0]
 			if id == "portal" && cfg.PortalHostname != "" {
 				cn = cfg.PortalHostname
 			}
 			if id == "wildcard" && cfg.TLD != "" {
 				if !strings.EqualFold(cfg.Solver, "dns-01") {
-					return errors.New("wildcard renewals require dns-01 solver")
+					errMsg = "wildcard renewals require dns-01 solver"
+					break
 				}
 				base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
 				if base == "" {
-					return errors.New("portal hostname missing")
+					errMsg = "portal hostname missing"
+					break
 				}
 				cn = "*." + base
 				domains = []string{cn, base}
 			}
-			m.enqueueIssuanceWithForce(id, domains, cn, true)
-			return nil
+			break
 		}
 	}
-	return errors.New("certificate not found")
+	m.cfgMu.RUnlock()
+
+	if errMsg != "" {
+		return errors.New(errMsg)
+	}
+	if !found {
+		return errors.New("certificate not found")
+	}
+	m.enqueueIssuanceWithForce(id, domains, cn, true)
+	return nil
 }
 
 // QueueHostnameCertificate requests background issuance for a specific hostname.
@@ -1010,8 +1242,6 @@ type issuanceJob struct {
 	force      bool
 }
 
-const maxCertAttempts = 10
-
 // enqueueIssuance records pending inventory and queues issuance for the worker.
 func (m *Manager) enqueueIssuance(id string, domains []string, commonName string) {
 	m.enqueueIssuanceWithForce(id, domains, commonName, false)
@@ -1021,15 +1251,20 @@ func (m *Manager) enqueueIssuanceWithForce(id string, domains []string, commonNa
 	if m.acmeMgr == nil || commonName == "" {
 		return
 	}
-	cfg := m.currentConfig()
+
+	// Check and modify config under lock to prevent races with scheduler reads
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
 	// Skip duplicate unless forced.
 	for _, c := range cfg.Certificates {
 		if c.ID == id && strings.EqualFold(c.Status, "pending") && !force {
+			m.cfgMu.Unlock()
 			return
 		}
 	}
 	now := m.now()
 	m.ensureCertPending(cfg, id, domains, now)
+	// save() releases cfgMu.Lock()
 	_ = m.save(cfg)
 	m.queueIssuanceJob(id, domains, commonName, force)
 }
@@ -1119,26 +1354,21 @@ func (m *Manager) processIssuance(job issuanceJob) {
 	if m == nil || m.acmeMgr == nil || job.commonName == "" {
 		return
 	}
-	cfg := m.currentConfig()
-	now := m.now()
 
-	// Record attempt.
-	attempts := 1
+	// Record attempt under lock (no max attempts - indefinite retry per RFC 20260125)
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
+	now := m.now()
 	for i := range cfg.Certificates {
 		if cfg.Certificates[i].ID == job.id {
-			attempts = cfg.Certificates[i].Attempts + 1
-			cfg.Certificates[i].Attempts = attempts
+			cfg.Certificates[i].Attempts++
 			cfg.Certificates[i].LastAttempt = timePtr(now)
 			cfg.Certificates[i].RetryAt = nil
 			break
 		}
 	}
+	// save() releases cfgMu.Lock()
 	_ = m.save(cfg)
-
-	if attempts > maxCertAttempts {
-		m.updateCertFailure(job.id, "max issuance attempts reached")
-		return
-	}
 
 	certDir := m.certDir()
 	outName := outNameFor(job.id, job.commonName)
@@ -1147,7 +1377,7 @@ func (m *Manager) processIssuance(job issuanceJob) {
 	if fakeACME {
 		expires, err := writeSelfSignedCertificate(certDir, outName, job.commonName, job.domains)
 		if err != nil {
-			m.updateCertFailure(job.id, err.Error())
+			m.updateCertFailureWithError(job.id, err.Error(), err)
 			return
 		}
 		m.updateCertSuccess(job.id, expires)
@@ -1156,7 +1386,8 @@ func (m *Manager) processIssuance(job issuanceJob) {
 
 	sans := buildSans(job.commonName, job.domains)
 	if _, err := m.acmeMgr.Issue(job.commonName, sans, outName, certDir); err != nil {
-		m.updateCertFailure(job.id, err.Error())
+		// Pass the full error for failure classification
+		m.updateCertFailureWithError(job.id, err.Error(), err)
 		return
 	}
 	if exp, ok := readCertExpiry(filepath.Join(certDir, outName+".crt")); ok {
@@ -1227,9 +1458,12 @@ func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, no
 }
 
 func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
-	cfg := m.currentConfig()
 	now := m.now()
 	next := now.Add(60 * 24 * time.Hour)
+
+	// Modify certificate under lock to prevent races with scheduler reads
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
 	for i := range cfg.Certificates {
 		if cfg.Certificates[i].ID == id {
 			cfg.Certificates[i].IssuedAt = timePtr(now)
@@ -1239,64 +1473,329 @@ func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
 			cfg.Certificates[i].FailureReason = ""
 			cfg.Certificates[i].Attempts = 0
 			cfg.Certificates[i].RetryAt = nil
+			// Reset all failure tracking (RFC 20260125)
+			m.resetCertificateTracking(&cfg.Certificates[i])
 			break
 		}
 	}
-	cfg.Events = append(cfg.Events, Event{
+	// Use retention policy for event appending
+	m.appendEventWithRetention(cfg, Event{
 		Timestamp: now,
 		Level:     "info",
 		Source:    "remote",
 		Message:   fmt.Sprintf("Certificate issuance succeeded (%s)", id),
+		CertID:    id,
 	})
+	// save() releases cfgMu.Lock()
 	_ = m.save(cfg)
+
+	// Emit certificate status change event
+	m.publishCertificateChanged(id, "ok", "", "ok")
 }
 
+// updateCertFailure records a certificate issuance failure with failure classification.
+// It uses the error to classify the failure and compute appropriate retry timing.
 func (m *Manager) updateCertFailure(id string, reason string) {
-	cfg := m.currentConfig()
+	m.updateCertFailureWithError(id, reason, nil)
+}
+
+// updateCertFailureWithError records a certificate issuance failure with full error context.
+// The error is used to classify the failure type and determine retry behavior.
+func (m *Manager) updateCertFailureWithError(id string, reason string, err error) {
 	now := m.now()
+	class, code := classifyFailure(err)
+
+	// Modify certificate under lock to prevent races with scheduler reads
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
+
 	for i := range cfg.Certificates {
-		if cfg.Certificates[i].ID == id {
-			cfg.Certificates[i].Status = "error"
-			cfg.Certificates[i].FailureReason = reason
-			attempts := cfg.Certificates[i].Attempts
-			if attempts <= 0 {
-				attempts = 1
-				cfg.Certificates[i].Attempts = attempts
-			}
-			if attempts < maxCertAttempts {
-				retry := now.Add(certBackoff(attempts))
-				cfg.Certificates[i].RetryAt = timePtr(retry)
-			} else {
-				cfg.Certificates[i].RetryAt = nil
-			}
-			break
+		if cfg.Certificates[i].ID != id {
+			continue
 		}
+
+		cert := &cfg.Certificates[i]
+
+		// Handle connection errors with hybrid escalation
+		if code == "cert_connection_failed" {
+			class, code = m.handleConnectionFailure(cert, now)
+		}
+
+		// Handle unauthorized errors with hybrid escalation
+		if code == "cert_unauthorized" {
+			class, code = m.handleUnauthorizedFailure(cert, now)
+		}
+
+		cert.Status = "error"
+		cert.FailureReason = reason
+		cert.FailureClass = class
+		cert.FailureCode = code
+
+		// Increment class-specific attempt counter
+		switch class {
+		case FailureClassTransient:
+			cert.TransientAttempts++
+		case FailureClassRateLimited:
+			cert.RateLimitAttempts++
+		}
+
+		// Compute retry time based on failure class using class-specific attempts
+		switch class {
+		case FailureClassRateLimited:
+			// Prefer server-provided Retry-After if available
+			if retryAt := parseRetryAfter(err); retryAt != nil {
+				cert.RetryAt = retryAt
+			} else {
+				// Fall back to conservative backoff
+				retry := now.Add(rateLimitBackoff(cert.RateLimitAttempts))
+				cert.RetryAt = timePtr(retry)
+			}
+
+		case FailureClassConfigError:
+			// Schedule weekly probe (not fully paused - allows catching external fixes)
+			probe := now.Add(ConfigErrorProbeInterval)
+			cert.RetryAt = timePtr(probe)
+
+		case FailureClassTransient:
+			retry := now.Add(transientBackoff(cert.TransientAttempts))
+			cert.RetryAt = timePtr(retry)
+		}
+
+		break
 	}
-	cfg.Events = append(cfg.Events, Event{
+
+	// Append event with retention policy
+	m.appendEventWithRetention(cfg, Event{
 		Timestamp: now,
 		Level:     "warn",
 		Source:    "remote",
 		Message:   fmt.Sprintf("Certificate issuance failed (%s): %s", id, reason),
-		NextStep:  "Verify DNS/Nexus reachability and retry",
+		NextStep:  nextStepForCode(code),
+		CertID:    id,
 	})
+	// save() releases cfgMu.Lock()
 	_ = m.save(cfg)
+
+	// Signal scheduler to re-evaluate wake time
+	m.notifySchedulerWake()
+
+	// Emit certificate status change event
+	m.publishCertificateChanged(id, "error", class, code)
 }
 
-func certBackoff(attempt int) time.Duration {
-	if attempt <= 1 {
-		return time.Minute
+// handleConnectionFailure applies hybrid escalation for persistent connection errors.
+// Returns the (potentially escalated) failure class and code.
+func (m *Manager) handleConnectionFailure(cert *Certificate, now time.Time) (FailureClass, string) {
+	cert.ConnectionAttempts++
+
+	// Track when connection failures started
+	if cert.FirstConnectionFailureAt == nil {
+		cert.FirstConnectionFailureAt = timePtr(now)
 	}
-	shift := attempt - 1
-	if shift > 6 {
-		shift = 6
+
+	// Check if we should escalate to config error
+	persistent := cert.ConnectionAttempts >= ConnectionEscalateAfterAttempts ||
+		now.Sub(*cert.FirstConnectionFailureAt) >= ConnectionEscalateAfterDuration
+
+	if persistent {
+		// Escalate: treat as config error requiring user action
+		return FailureClassConfigError, "cert_connection_failed"
 	}
-	delay := time.Duration(1<<shift) * time.Minute
-	if delay > time.Hour {
-		delay = time.Hour
+
+	// Still treating as transient
+	return FailureClassTransient, "cert_connection_failed"
+}
+
+// handleUnauthorizedFailure applies hybrid escalation for persistent unauthorized errors.
+// Returns the (potentially escalated) failure class and code.
+//
+// Note: This function does NOT increment TransientAttempts - the caller's switch statement
+// handles incrementing counters based on the returned FailureClass. The escalation check
+// uses TransientAttempts+1 to account for the pending increment.
+func (m *Manager) handleUnauthorizedFailure(cert *Certificate, now time.Time) (FailureClass, string) {
+	// Track when unauthorized errors started
+	if cert.FirstUnauthorizedAt == nil {
+		cert.FirstUnauthorizedAt = timePtr(now)
 	}
-	// Add up to 20% jitter.
-	jitter := time.Duration(rand.Int63n(int64(delay / 5)))
-	return delay + jitter
+
+	// Escalate to config error if persistent
+	// Use TransientAttempts+1 because the switch statement will increment after this returns
+	persistent := (cert.TransientAttempts+1) >= UnauthorizedEscalateAfterAttempts ||
+		now.Sub(*cert.FirstUnauthorizedAt) >= UnauthorizedEscalateAfterDuration
+
+	if persistent {
+		return FailureClassConfigError, "cert_unauthorized_persistent"
+	}
+
+	return FailureClassTransient, "cert_unauthorized"
+}
+
+// resetCertificateTracking clears failure tracking when a certificate succeeds or config changes.
+func (m *Manager) resetCertificateTracking(cert *Certificate) {
+	cert.TransientAttempts = 0
+	cert.RateLimitAttempts = 0
+	cert.ConnectionAttempts = 0
+	cert.FirstConnectionFailureAt = nil
+	cert.FirstUnauthorizedAt = nil
+	cert.FailureClass = ""
+	cert.FailureCode = ""
+}
+
+// nextStepForCode returns actionable guidance for a failure code.
+func nextStepForCode(code string) string {
+	steps := map[string]string{
+		"cert_dns_error":               "Configure DNS records to point to your device",
+		"cert_domain_unreachable":      "Ensure your domain resolves to this device's public IP",
+		"cert_caa_forbidden":           "Update CAA DNS record to allow Let's Encrypt",
+		"cert_rejected_identifier":     "Contact Let's Encrypt or use a different domain",
+		"cert_invalid_contact":         "Update the ACME account email in Remote settings",
+		"cert_account_error":           "Re-configure Remote Access to register a new account",
+		"cert_unauthorized_persistent": "Check domain DNS, firewall rules, and port forwarding",
+		"cert_connection_failed":       "Verify port 80 is forwarded and firewall allows inbound connections",
+		"cert_rate_limited":            "Wait for rate limit to expire (check Remote settings for timing)",
+		"cert_unauthorized":            "Retry will happen automatically",
+		"cert_acme_error":              "Check Let's Encrypt status page for outages",
+		"cert_unknown_error":           "Verify DNS/Nexus reachability and retry",
+	}
+	if step, ok := steps[code]; ok {
+		return step
+	}
+	return "Verify DNS/Nexus reachability and retry"
+}
+
+// publishCertificateChanged emits a certificate status change event.
+func (m *Manager) publishCertificateChanged(certID, status string, class FailureClass, code string) {
+	if m == nil || m.eventsBus == nil {
+		return
+	}
+	m.eventsBus.Publish(events.Event{
+		Topic: events.TopicCertificateChanged,
+		Payload: events.CertificateChangedEvent{
+			CertID:       certID,
+			Status:       status,
+			FailureClass: string(class),
+			FailureCode:  code,
+			Timestamp:    m.now(),
+		},
+	})
+}
+
+// Event retention policy constants (RFC 20260125)
+const (
+	maxEventsTotal      = 100 // Max events in config overall
+	maxEventsPerCert    = 10  // Max events per certificate ID
+	dedupeWindowMinutes = 60  // Dedupe identical consecutive errors within this window
+)
+
+// appendEventWithRetention appends an event with deduplication and retention policy.
+// Prevents unbounded event growth from indefinite retries.
+func (m *Manager) appendEventWithRetention(cfg *Config, evt Event) {
+	if cfg == nil {
+		return
+	}
+	now := m.now()
+
+	// 1. Dedupe: Skip if last event for same cert has identical message within window
+	if evt.CertID != "" {
+		for i := len(cfg.Events) - 1; i >= 0; i-- {
+			last := cfg.Events[i]
+			if last.CertID != "" && last.CertID == evt.CertID && last.Message == evt.Message {
+				if now.Sub(last.Timestamp) < time.Duration(dedupeWindowMinutes)*time.Minute {
+					// Update timestamp only, don't append duplicate
+					cfg.Events[i].Timestamp = evt.Timestamp
+					return
+				}
+				break
+			}
+		}
+	}
+
+	// 2. Append new event
+	cfg.Events = append(cfg.Events, evt)
+
+	// 3. Trim by certificate: keep only last N events per cert ID
+	cfg.Events = trimEventsByCert(cfg.Events, maxEventsPerCert)
+
+	// 4. Trim total: keep only last N events overall
+	if len(cfg.Events) > maxEventsTotal {
+		cfg.Events = cfg.Events[len(cfg.Events)-maxEventsTotal:]
+	}
+}
+
+// trimEventsByCert keeps only the last maxPerCert events per certificate ID.
+// Events without CertID (general events) are always kept (not subject to per-cert trimming).
+// Preserves overall chronological order.
+func trimEventsByCert(events []Event, maxPerCert int) []Event {
+	certCounts := make(map[string]int)
+	var result []Event
+
+	// Iterate in reverse to keep most recent
+	for i := len(events) - 1; i >= 0; i-- {
+		evt := events[i]
+		// Events without CertID pass through; cert events are counted
+		if evt.CertID == "" || certCounts[evt.CertID] < maxPerCert {
+			result = append([]Event{evt}, result...)
+			if evt.CertID != "" {
+				certCounts[evt.CertID]++
+			}
+		}
+	}
+	return result
+}
+
+// certBackoff computes retry delay based on failure class and class-specific attempt count.
+// This replaces the original attempt-based backoff with class-aware logic per RFC 20260125.
+func certBackoff(attempt int, class FailureClass) time.Duration {
+	switch class {
+	case FailureClassRateLimited:
+		return rateLimitBackoff(attempt)
+	case FailureClassConfigError:
+		return ConfigErrorProbeInterval // 168 hours (weekly)
+	default: // FailureClassTransient
+		return transientBackoff(attempt)
+	}
+}
+
+// transientBackoff implements exponential backoff for transient failures.
+// 1min → 2min → 4min → 8min → 16min → 32min → 1hr (capped) for attempts 1-10.
+// For long-term retries (> 10 attempts), switches to daily probes.
+func transientBackoff(attempt int) time.Duration {
+	if attempt <= 10 {
+		if attempt <= 1 {
+			return time.Minute
+		}
+		shift := attempt - 1
+		if shift > 6 {
+			shift = 6
+		}
+		delay := time.Duration(1<<shift) * time.Minute
+		if delay > time.Hour {
+			delay = time.Hour
+		}
+		// Add up to 20% jitter
+		jitter := time.Duration(rand.Int63n(int64(delay / 5)))
+		return delay + jitter
+	}
+	// Long-term retries for persistent transient failures: daily with jitter
+	base := 24 * time.Hour
+	jitter := time.Duration(rand.Int63n(int64(4 * time.Hour)))
+	return base + jitter
+}
+
+// rateLimitBackoff implements conservative backoff for Let's Encrypt rate limits.
+// Uses increasingly longer delays to avoid hitting rate limits again.
+func rateLimitBackoff(attempt int) time.Duration {
+	switch {
+	case attempt <= 1:
+		// First rate limit: 12-24 hours
+		return 12*time.Hour + time.Duration(rand.Int63n(int64(12*time.Hour)))
+	case attempt <= 3:
+		// Subsequent: 24-48 hours
+		return 24*time.Hour + time.Duration(rand.Int63n(int64(24*time.Hour)))
+	default:
+		// Persistent rate limits: 3-7 days
+		return 72*time.Hour + time.Duration(rand.Int63n(int64(96*time.Hour)))
+	}
 }
 
 func writeSelfSignedCertificate(dir, outName, commonName string, domains []string) (time.Time, error) {
@@ -1419,6 +1918,7 @@ func (m *Manager) RunPreflight(candidate *Config) (PreflightResult, error) {
 
 	// Only persist the preflight timestamp if we are checking the active config
 	if candidate == nil {
+		m.cfgMu.Lock()
 		cfg.LastPreflight = &now
 		cfg.Events = append(cfg.Events, Event{
 			Timestamp: now,
@@ -1426,6 +1926,7 @@ func (m *Manager) RunPreflight(candidate *Config) (PreflightResult, error) {
 			Source:    "remote",
 			Message:   "Preflight completed",
 		})
+		// save() releases cfgMu.Lock()
 		if err := m.save(cfg); err != nil {
 			return PreflightResult{}, err
 		}
@@ -1435,7 +1936,9 @@ func (m *Manager) RunPreflight(candidate *Config) (PreflightResult, error) {
 
 // ListEvents returns the persisted remote-related events.
 func (m *Manager) ListEvents() []Event {
-	events := append([]Event(nil), m.currentConfig().Events...)
+	m.cfgMu.RLock()
+	events := append([]Event(nil), m.currentConfigLocked().Events...)
+	m.cfgMu.RUnlock()
 	for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
 		events[i], events[j] = events[j], events[i]
 	}
@@ -1482,7 +1985,8 @@ func (m *Manager) MarkGuideVerified(info GuideVerification) error {
 	}
 
 	// Only record that verification happened
-	cfg := m.currentConfig()
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
 	now := m.now()
 	cfg.GuideVerifiedAt = &now
 	cfg.Events = append(cfg.Events, Event{
@@ -1491,6 +1995,7 @@ func (m *Manager) MarkGuideVerified(info GuideVerification) error {
 		Source:    "remote",
 		Message:   "Nexus connection verified",
 	})
+	// save() releases cfgMu.Lock()
 	return m.save(cfg)
 }
 
@@ -1504,7 +2009,9 @@ type GuideInfo struct {
 }
 
 func (m *Manager) GuideInfo() GuideInfo {
-	cfg := m.currentConfig()
+	m.cfgMu.RLock()
+	verifiedAt := m.currentConfigLocked().GuideVerifiedAt
+	m.cfgMu.RUnlock()
 	return GuideInfo{
 		Command: "sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/AtDexters-Lab/nexus-proxy-server/main/scripts/install.sh | bash'",
 		Requirements: []string{
@@ -1517,7 +2024,7 @@ func (m *Manager) GuideInfo() GuideInfo {
 			"Keep the terminal open until the script finishes.",
 		},
 		DocsURL:    "https://github.com/AtDexters-Lab/nexus-proxy-server/blob/main/readme.md#install",
-		VerifiedAt: cfg.GuideVerifiedAt,
+		VerifiedAt: verifiedAt,
 	}
 }
 

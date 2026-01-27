@@ -33,3 +33,8 @@ type ServiceEndpoint struct {
 	LocalURL         string                      `json:"local_url,omitempty"` // Optional pre-calculated LAN URL
 	Auth             *api.ListenerAuth           `json:"auth,omitempty"`
 }
+
+// endpointKey returns a unique key for an endpoint (app/listener)
+func (e ServiceEndpoint) endpointKey() string {
+	return e.App + "/" + e.Name
+}

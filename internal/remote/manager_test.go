@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -107,6 +108,7 @@ func TestRunPreflightSuccess(t *testing.T) {
 }
 
 type fakeAdapter struct {
+	mu      sync.Mutex
 	config  nexusclient.Config
 	startCh chan struct{}
 	stopCh  chan struct{}
@@ -117,8 +119,16 @@ func newFakeAdapter() *fakeAdapter {
 }
 
 func (f *fakeAdapter) Configure(cfg nexusclient.Config) error {
+	f.mu.Lock()
 	f.config = cfg
+	f.mu.Unlock()
 	return nil
+}
+
+func (f *fakeAdapter) getConfig() nexusclient.Config {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.config
 }
 
 func (f *fakeAdapter) Start(ctx context.Context) error {
@@ -168,8 +178,8 @@ func TestManager_NexusAdapterLifecycle(t *testing.T) {
 		t.Fatalf("configure: %v", err)
 	}
 	waitForCertNotPending(t, m, "portal", 200*time.Millisecond)
-	if adapter.config.TLD != "example.com" {
-		t.Fatalf("expected TLD to propagate, got %s", adapter.config.TLD)
+	if cfg := adapter.getConfig(); cfg.TLD != "example.com" {
+		t.Fatalf("expected TLD to propagate, got %s", cfg.TLD)
 	}
 
 	select {
@@ -281,6 +291,7 @@ func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 	}
 	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(10, 0)))
 	now := m.now()
+	m.cfgMu.Lock()
 	cfg := m.currentConfig()
 	cfg.Certificates = []Certificate{{
 		ID:       "portal",
@@ -288,6 +299,7 @@ func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 		Status:   "ok",
 		Attempts: 2,
 	}}
+	// save() releases cfgMu.Lock()
 	if err := m.save(cfg); err != nil {
 		t.Fatalf("save: %v", err)
 	}

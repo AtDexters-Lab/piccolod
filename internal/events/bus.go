@@ -21,6 +21,10 @@ const (
 	TopicVolumeStateChanged      Topic = "volume_state_changed"
 	TopicAudit                   Topic = "audit"
 	TopicServiceEndpointsChanged Topic = "service_endpoints_changed"
+
+	// Certificate and listener health events (RFC 20260125)
+	TopicCertificateChanged    Topic = "certificate_changed"     // Emitted by remote manager on cert status change
+	TopicListenerHealthChanged Topic = "listener_health_changed" // Emitted by health aggregator on health change
 )
 
 // Event represents a message broadcast on the event bus.
@@ -75,6 +79,47 @@ type ServiceEndpointsChanged struct {
 	App     string
 	Added   []ServiceEndpointInfo
 	Removed []ServiceEndpointInfo
+}
+
+// CertificateChangedEvent is emitted when a certificate's status changes.
+// The health aggregator subscribes to this and recomputes affected listener health.
+type CertificateChangedEvent struct {
+	CertID       string    `json:"cert_id"`
+	Status       string    `json:"status"`        // "ok", "pending", "error"
+	FailureClass string    `json:"failure_class,omitempty"`
+	FailureCode  string    `json:"failure_code,omitempty"`
+	Timestamp    time.Time `json:"timestamp"`
+}
+
+// ListenerHealthEvent is emitted when a listener's health status changes.
+// UI/WebSocket subscribers receive this for real-time health updates.
+type ListenerHealthEvent struct {
+	App       string         `json:"app"`
+	Listener  string         `json:"listener"`
+	Health    ListenerHealth `json:"health"`
+	Timestamp time.Time      `json:"timestamp"`
+}
+
+// ListenerHealth represents the health status of an app listener.
+// This is a summary type for events; the full type is in services/health.go.
+type ListenerHealth struct {
+	Status         string                     `json:"status"`                    // ok, degraded, recovering, error
+	ReasonCode     string                     `json:"reason_code"`               // Machine-readable code
+	Reason         string                     `json:"reason"`                    // Human-readable explanation
+	Details        *string                    `json:"details,omitempty"`         // Technical details
+	RecoveryETA    *time.Time                 `json:"recovery_eta,omitempty"`    // When next retry/check will occur
+	Recoverable    bool                       `json:"recoverable"`               // Can system self-heal?
+	ActionRequired bool                       `json:"action_required"`           // Does user need to do something?
+	CertStatuses   map[string]CertHealthStatus `json:"cert_statuses,omitempty"` // Per-cert health (certID → status)
+	LastChecked    time.Time                  `json:"last_checked"`
+	LastOK         *time.Time                 `json:"last_ok,omitempty"` // When backend was last healthy
+}
+
+// CertHealthStatus tracks individual certificate health for events.
+type CertHealthStatus struct {
+	Status      string     `json:"status"`                   // ok, recovering, error
+	ReasonCode  string     `json:"reason_code"`              // e.g., "cert_pending", "cert_dns_error"
+	RecoveryETA *time.Time `json:"recovery_eta,omitempty"`
 }
 
 // Bus is a simple pub/sub dispatcher for intra-process events.

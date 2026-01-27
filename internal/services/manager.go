@@ -34,6 +34,15 @@ type ServiceManager struct {
 	lockReader     LockStateReader
 	lockOverrideMu sync.RWMutex
 	lockOverride   *bool
+
+	// Backend health debouncing (RFC 20260125)
+	backendHealth *BackendHealthState
+
+	// Remote status provider for health computation (RFC 20260125)
+	remoteProvider RemoteStatusProvider
+
+	// Health aggregator cancellation
+	healthAggregatorCancel func()
 }
 
 // LockStateReader exposes the control lock state for services.
@@ -47,12 +56,13 @@ func NewServiceManager() *ServiceManager {
 		PortRange{Start: 35000, End: 45000},
 	)
 	return &ServiceManager{
-		allocator:    allocator,
-		registry:     make(map[string]map[string]ServiceEndpoint),
-		proxyManager: NewProxyManager(),
-		stopCh:       make(chan struct{}),
-		containerIDs: make(map[string]string),
-		leadership:   make(map[string]cluster.Role),
+		allocator:     allocator,
+		registry:      make(map[string]map[string]ServiceEndpoint),
+		proxyManager:  NewProxyManager(),
+		stopCh:        make(chan struct{}),
+		containerIDs:  make(map[string]string),
+		leadership:    make(map[string]cluster.Role),
+		backendHealth: NewBackendHealthState(),
 	}
 }
 
@@ -98,11 +108,23 @@ func (m *ServiceManager) notifyPublish(port int) {
 	}
 }
 
-// SetEventBus wires an event bus for publishing endpoint changes.
+// SetEventBus wires an event bus for publishing endpoint changes and starts the health aggregator.
 func (m *ServiceManager) SetEventBus(bus *events.Bus) {
 	m.eventsMu.Lock()
 	m.eventBus = bus
 	m.eventsMu.Unlock()
+
+	// Start health aggregator if event bus is available
+	if bus != nil {
+		m.startHealthAggregator()
+	}
+}
+
+// SetRemoteStatusProvider wires the remote status provider for health computation.
+func (m *ServiceManager) SetRemoteStatusProvider(provider RemoteStatusProvider) {
+	m.statusMu.Lock()
+	m.remoteProvider = provider
+	m.statusMu.Unlock()
 }
 
 func (m *ServiceManager) publishEndpointsChanged(app string, added, removed []ServiceEndpoint) {
@@ -614,18 +636,74 @@ func (m *ServiceManager) checkBackends() {
 	// Snapshot under lock
 	snap := m.snapshotRegistry()
 
-	// TCP connectivity check per endpoint
+	// TCP connectivity check per endpoint with debouncing
 	for _, mapp := range snap {
 		for _, ep := range mapp {
 			addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(ep.HostBind))
 			conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
-			if err != nil {
-				log.Printf("WARN: Backend not reachable for %s/%s at %s: %v", ep.App, ep.Name, addr, err)
-				continue
+			checkOK := err == nil
+			if checkOK {
+				_ = conn.Close()
 			}
-			_ = conn.Close()
+
+			// Record check with debouncing
+			endpointKey := ep.endpointKey()
+			result := m.backendHealth.RecordCheck(endpointKey, checkOK)
+
+			// Log only on state change or first failure in a series
+			if !checkOK && result.StateChanged {
+				log.Printf("WARN: Backend unhealthy for %s/%s at %s (after %d consecutive failures)",
+					ep.App, ep.Name, addr, backendFailureThreshold)
+			} else if checkOK && result.StateChanged {
+				log.Printf("INFO: Backend recovered for %s/%s at %s", ep.App, ep.Name, addr)
+			}
+
+			// Emit event on state change if event bus is configured
+			if result.StateChanged && m.eventBus != nil {
+				m.emitBackendHealthEvent(ep, result)
+			}
 		}
 	}
+}
+
+// emitBackendHealthEvent emits a listener health changed event for backend state changes.
+//
+// Design note: This emits a simplified health based only on backend status, not including
+// certificate health. This is intentional because:
+// 1. ServiceManager doesn't have access to certificate data (avoiding import cycle)
+// 2. Full health is computed on-demand via API (handleGinListenerHealth) and on WebSocket connect
+// 3. This event serves as a notification that health may have changed, prompting clients to
+//    refresh via API if needed
+//
+// The WebSocket stream provides initial full health on connect, and clients should treat
+// subsequent events as hints to refresh the complete health state via the API endpoint.
+func (m *ServiceManager) emitBackendHealthEvent(ep ServiceEndpoint, result RecordCheckResult) {
+	reasonCode := "ok"
+	reason := "Operational"
+	status := "ok"
+	if !result.IsHealthy {
+		reasonCode = "backend_unreachable"
+		reason = "Backend not responding"
+		status = "error"
+	}
+
+	m.eventBus.Publish(events.Event{
+		Topic: events.TopicListenerHealthChanged,
+		Payload: events.ListenerHealthEvent{
+			App:      ep.App,
+			Listener: ep.Name,
+			Health: events.ListenerHealth{
+				Status:         status,
+				ReasonCode:     reasonCode,
+				Reason:         reason,
+				Recoverable:    true, // Backend issues are always auto-recoverable
+				ActionRequired: false,
+				LastChecked:    time.Now(),
+				LastOK:         result.LastOK,
+			},
+			Timestamp: time.Now(),
+		},
+	})
 }
 
 func (m *ServiceManager) snapshotRegistry() map[string]map[string]ServiceEndpoint {
@@ -655,6 +733,179 @@ func (m *ServiceManager) GetAppContainerID(appName string) (string, bool) {
 	id, ok := m.containerIDs[appName]
 	m.mu.RUnlock()
 	return id, ok
+}
+
+// GetBackendHealth returns the debounced backend health state for an endpoint.
+// Returns (isHealthy, lastOK). If endpoint is unknown, returns (true, nil) (optimistic).
+func (m *ServiceManager) GetBackendHealth(endpointKey string) (bool, *time.Time) {
+	if m.backendHealth == nil {
+		return true, nil // Optimistic if health state not initialized
+	}
+	return m.backendHealth.GetHealthState(endpointKey)
+}
+
+// GetListenerHealth computes the health status for a listener by aggregating
+// certificate status (from remote manager) and backend connectivity (from backend health state).
+func (m *ServiceManager) GetListenerHealth(ep ServiceEndpoint) ListenerHealth {
+	// 1. Get remote status and certificates
+	var remoteEnabled bool
+	var solver string
+	var portalHostname string
+	var certs map[string]*CertificateInfo
+
+	m.statusMu.RLock()
+	provider := m.remoteProvider
+	m.statusMu.RUnlock()
+
+	if provider != nil {
+		status := provider.GetRemoteStatus()
+		remoteEnabled = status.Enabled
+		solver = status.Solver
+		portalHostname = status.PortalHostname
+
+		// Build certificate lookup map
+		remoteCerts := provider.GetCertificates()
+		certs = make(map[string]*CertificateInfo, len(remoteCerts))
+		for _, rc := range remoteCerts {
+			certID := resolveCertID(rc.ID, rc.Domains)
+			certs[certID] = &CertificateInfo{
+				Status:        rc.Status,
+				FailureClass:  rc.FailureClass,
+				FailureCode:   rc.FailureCode,
+				FailureReason: rc.FailureReason,
+				RetryAt:       rc.RetryAt,
+				ExpiresAt:     rc.ExpiresAt,
+			}
+		}
+	}
+
+	// 2. Get aliases for this app's listener
+	var aliases []RemoteAlias
+	if provider != nil {
+		aliases = provider.GetAliases()
+	}
+
+	// 3. Resolve which certificates this listener depends on
+	certIDs, _ := ResolveCertificatesForListener(ep, remoteEnabled, solver, portalHostname, aliases)
+
+	// 4. Get backend health state
+	endpointKey := ep.App + "/" + ep.Name
+	backendOK, lastOK := m.GetBackendHealth(endpointKey)
+
+	// 5. Derive health from all signals
+	return DeriveListenerHealth(certIDs, certs, backendOK, lastOK)
+}
+
+// startHealthAggregator subscribes to TopicCertificateChanged events and emits
+// TopicListenerHealthChanged events for affected listeners. This bridges certificate
+// status changes from the remote manager to listener health updates for the UI.
+func (m *ServiceManager) startHealthAggregator() {
+	m.eventsMu.Lock()
+	bus := m.eventBus
+	m.eventsMu.Unlock()
+
+	if bus == nil {
+		return
+	}
+
+	// Cancel any existing aggregator
+	if m.healthAggregatorCancel != nil {
+		m.healthAggregatorCancel()
+	}
+
+	ch, unsubscribe := bus.SubscribeWithCancel(events.TopicCertificateChanged, 64)
+	m.healthAggregatorCancel = unsubscribe
+
+	go func() {
+		for evt := range ch {
+			certEvt, ok := evt.Payload.(events.CertificateChangedEvent)
+			if !ok {
+				continue
+			}
+			m.recomputeAffectedListenerHealth(certEvt.CertID)
+		}
+	}()
+}
+
+// recomputeAffectedListenerHealth finds all listeners that depend on the given certificate
+// and emits TopicListenerHealthChanged events for each.
+func (m *ServiceManager) recomputeAffectedListenerHealth(certID string) {
+	m.statusMu.RLock()
+	provider := m.remoteProvider
+	m.statusMu.RUnlock()
+
+	if provider == nil {
+		return
+	}
+
+	status := provider.GetRemoteStatus()
+	aliases := provider.GetAliases()
+
+	// Iterate all endpoints to find affected listeners
+	endpoints := m.GetAll()
+	for _, ep := range endpoints {
+		certIDs, needsCert := ResolveCertificatesForListener(
+			ep, status.Enabled, status.Solver, status.PortalHostname, aliases,
+		)
+		if !needsCert {
+			continue
+		}
+
+		// Check if this listener depends on the changed certificate
+		for _, cid := range certIDs {
+			if cid == certID {
+				// Recompute and emit listener health
+				health := m.GetListenerHealth(ep)
+				m.emitListenerHealthChanged(ep, health)
+				break
+			}
+		}
+	}
+}
+
+// emitListenerHealthChanged publishes a listener health changed event.
+func (m *ServiceManager) emitListenerHealthChanged(ep ServiceEndpoint, health ListenerHealth) {
+	m.eventsMu.Lock()
+	bus := m.eventBus
+	m.eventsMu.Unlock()
+
+	if bus == nil {
+		return
+	}
+
+	// Convert CertStatuses to events format
+	var certStatuses map[string]events.CertHealthStatus
+	if len(health.CertStatuses) > 0 {
+		certStatuses = make(map[string]events.CertHealthStatus, len(health.CertStatuses))
+		for certID, cs := range health.CertStatuses {
+			certStatuses[certID] = events.CertHealthStatus{
+				Status:      string(cs.Status),
+				ReasonCode:  cs.ReasonCode,
+				RecoveryETA: cs.RecoveryETA,
+			}
+		}
+	}
+
+	bus.Publish(events.Event{
+		Topic: events.TopicListenerHealthChanged,
+		Payload: events.ListenerHealthEvent{
+			App:      ep.App,
+			Listener: ep.Name,
+			Health: events.ListenerHealth{
+				Status:         string(health.Status),
+				ReasonCode:     health.ReasonCode,
+				Reason:         health.Reason,
+				Details:        health.Details,
+				RecoveryETA:    health.RecoveryETA,
+				Recoverable:    health.Recoverable,
+				ActionRequired: health.ActionRequired,
+				CertStatuses:   certStatuses,
+				LastChecked:    health.LastChecked,
+				LastOK:         health.LastOK,
+			},
+			Timestamp: time.Now(),
+		},
+	})
 }
 
 // ReconcileResult contains details of changes detected
@@ -776,6 +1027,9 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 			containerChange = true
 			result.Removed = append(result.Removed, ep)
 			m.notifyUnpublish(ep.PublicPort)
+			if m.backendHealth != nil {
+				m.backendHealth.RemoveEndpoint(ep.endpointKey())
+			}
 		}
 	}
 
@@ -822,6 +1076,10 @@ func (m *ServiceManager) RemoveApp(appName string) {
 			m.proxyManager.StopPort(ep.PublicPort)
 			m.allocator.Release(ep.HostBind, ep.PublicPort)
 			m.notifyUnpublish(ep.PublicPort)
+			// Clean up backend health state for removed endpoint
+			if m.backendHealth != nil {
+				m.backendHealth.RemoveEndpoint(ep.endpointKey())
+			}
 		}
 		delete(m.registry, appName)
 	}

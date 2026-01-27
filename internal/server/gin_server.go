@@ -272,6 +272,60 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 	return 0, false
 }
 
+// remoteStatusAdapter adapts remote.Manager to services.RemoteStatusProvider.
+// This bridges the remote manager to the services layer for health computation.
+type remoteStatusAdapter struct {
+	rm *remote.Manager
+}
+
+func (a *remoteStatusAdapter) GetRemoteStatus() services.RemoteStatus {
+	if a.rm == nil {
+		return services.RemoteStatus{}
+	}
+	st := a.rm.Status()
+	return services.RemoteStatus{
+		Enabled:        st.Enabled,
+		Solver:         st.Solver,
+		PortalHostname: st.PortalHostname,
+	}
+}
+
+func (a *remoteStatusAdapter) GetCertificates() []services.RemoteCertificate {
+	if a.rm == nil {
+		return nil
+	}
+	certs := a.rm.ListCertificates()
+	result := make([]services.RemoteCertificate, len(certs))
+	for i, c := range certs {
+		result[i] = services.RemoteCertificate{
+			ID:            c.ID,
+			Domains:       c.Domains,
+			Status:        c.Status,
+			FailureClass:  string(c.FailureClass),
+			FailureCode:   c.FailureCode,
+			FailureReason: c.FailureReason,
+			RetryAt:       c.RetryAt,
+			ExpiresAt:     c.ExpiresAt,
+		}
+	}
+	return result
+}
+
+func (a *remoteStatusAdapter) GetAliases() []services.RemoteAlias {
+	if a.rm == nil {
+		return nil
+	}
+	aliases := a.rm.ListAliases()
+	result := make([]services.RemoteAlias, len(aliases))
+	for i, al := range aliases {
+		result[i] = services.RemoteAlias{
+			Hostname: al.Hostname,
+			Listener: al.Listener,
+		}
+	}
+	return result
+}
+
 // GinServerOption is a function that configures a GinServer.
 type GinServerOption func(*GinServer)
 
@@ -558,6 +612,11 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.remoteManager = rm
 	s.registerUnlockReloader(rm)
 	rm.SetEventsBus(eventsBus)
+
+	// Wire remote status provider for health aggregation (RFC 20260125)
+	if rm != nil && svcMgr != nil {
+		svcMgr.SetRemoteStatusProvider(&remoteStatusAdapter{rm: rm})
+	}
 
 	// Internal CA (for OIDC Back-Channel)
 	// Defer CA initialization until after unlock when bootstrap volume is mounted.
@@ -875,6 +934,7 @@ func (s *GinServer) setupGinRoutes() {
 			apps.GET("", s.handleGinAppList)
 			apps.GET("/:name", s.handleGinAppGet)
 			apps.GET("/:name/services", s.handleGinServicesByApp)
+			apps.GET("/:name/listeners/:listener/health", s.handleGinListenerHealth)
 			apps.GET("/:name/logs", s.handleGinAppLogs)
 			apps.GET("/:name/logs/stream", s.handleGinAppLogStream)
 
@@ -898,6 +958,9 @@ func (s *GinServer) setupGinRoutes() {
 		// But they can't trigger actions. So Admin only is safe.
 		// Actually, let's allow it for now as it's harmless read-only.
 		authed.GET("/events/progress/stream", s.handleGinTaskProgressStream)
+
+		// Listener health stream (RFC 20260125) - streams real-time health updates
+		authed.GET("/events/health/stream", s.handleGinListenerHealthStream)
 
 		// Remote config endpoints (Admin only)
 		remote := admin.Group("/remote")
@@ -1056,7 +1119,10 @@ func (s *GinServer) handleGinServicesByApp(c *gin.Context) {
 		remoteStatus = &st
 	}
 	for _, ep := range eps {
-		out = append(out, s.formatServiceEndpoint(c, ep, remoteStatus))
+		formatted := s.formatServiceEndpoint(c, ep, remoteStatus)
+		// Add listener health status (RFC 20260125)
+		formatted["health"] = s.computeListenerHealth(ep)
+		out = append(out, formatted)
 	}
 	c.JSON(http.StatusOK, gin.H{"services": out})
 }
@@ -1105,6 +1171,21 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 		}
 	}
 
+	// Add request-independent LAN fallback URL (RFC 20260125)
+	// This is used by UI for "Access Locally" overlay when remote access is degraded.
+	if ep.DerivedHostLabel != "" && s.mdnsManager != nil {
+		// Host-based fallback via mDNS
+		lanBase := s.mdnsManager.Hostname()
+		lanHostname := hostnamepkg.DeriveLANHostname(ep.DerivedHostLabel, lanBase)
+		result["lan_fallback_url"] = fmt.Sprintf("%s://%s", scheme, lanHostname)
+	} else {
+		// Port-based fallback using device's preferred outbound IP
+		// Use computed scheme to match listener protocol (http/https/ws/wss)
+		if deviceIP := getPreferredOutboundIP(); deviceIP != "" {
+			result["lan_fallback_url"] = fmt.Sprintf("%s://%s:%d", scheme, deviceIP, ep.PublicPort)
+		}
+	}
+
 	return result
 }
 
@@ -1143,16 +1224,13 @@ func remoteBaseHostname(status *remote.Status) string {
 }
 
 func (s *GinServer) remoteServiceHostname(status *remote.Status, ep services.ServiceEndpoint) string {
+	// Use remoteBaseHostname for enhanced validation (port handling, etc.)
 	base := remoteBaseHostname(status)
 	if s == nil || base == "" {
 		return ""
 	}
-	// Only HTTP/WS listeners get host-based URLs (per RFC 20260114)
-	// DerivedHostLabel is empty for raw/tls listeners
-	if ep.DerivedHostLabel == "" {
-		return ""
-	}
-	return ep.DerivedHostLabel + "." + base
+	// Delegate to shared implementation (RFC 20260125: avoid logic drift)
+	return services.RemoteServiceHostname(ep.DerivedHostLabel, base)
 }
 
 func (s *GinServer) handlePersistenceControlExport(c *gin.Context) {

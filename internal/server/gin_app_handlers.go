@@ -16,6 +16,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/app"
 	"piccolod/internal/app/catalog"
+	"piccolod/internal/hostname"
 	"piccolod/internal/remote"
 	"piccolod/internal/services"
 )
@@ -463,7 +464,7 @@ func (s *GinServer) handleGinAppList(c *gin.Context) {
 			user, err := s.userManager.Get(c.Request.Context(), sess.UserID)
 			if err != nil {
 				// User not found or error, return empty list
-				writeGinSuccess(c, []*app.AppInstance{}, "Found 0 apps")
+				writeGinSuccess(c, []*AppInstanceWithHealth{}, "Found 0 apps")
 				return
 			}
 			filtered := make([]*app.AppInstance, 0)
@@ -476,7 +477,16 @@ func (s *GinServer) handleGinAppList(c *gin.Context) {
 		}
 	}
 
-	writeGinSuccess(c, apps, fmt.Sprintf("Found %d apps", len(apps)))
+	// Wrap apps with health data (RFC 20260125 §7.2)
+	result := make([]*AppInstanceWithHealth, len(apps))
+	for i, inst := range apps {
+		result[i] = &AppInstanceWithHealth{
+			AppInstance:           inst,
+			PrimaryListenerHealth: s.deriveAppHealth(inst),
+		}
+	}
+
+	writeGinSuccess(c, result, fmt.Sprintf("Found %d apps", len(result)))
 }
 
 // handleGinAppGet handles GET /api/v1/apps/:name - Get specific app details
@@ -514,7 +524,10 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 		remoteStatus = &st
 	}
 	for _, ep := range listeners {
-		listenerStatus = append(listenerStatus, s.formatServiceEndpoint(c, ep, remoteStatus))
+		formatted := s.formatServiceEndpoint(c, ep, remoteStatus)
+		// Add listener health status (RFC 20260125)
+		formatted["health"] = s.computeListenerHealth(ep)
+		listenerStatus = append(listenerStatus, formatted)
 	}
 
 	containerStatus, err := s.appManager.ContainerStatuses(c.Request.Context(), appName)
@@ -848,4 +861,128 @@ func isIDAllowed(allowedApps []string, appID string) bool {
 		}
 	}
 	return false
+}
+
+// handleGinListenerHealth handles GET /api/v1/apps/:name/listeners/:listener/health
+// Returns the health status for a specific listener including certificate and backend status.
+func (s *GinServer) handleGinListenerHealth(c *gin.Context) {
+	appName := c.Param("name")
+	listenerName := c.Param("listener")
+
+	// Check access for standard users
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		if s.userManager != nil {
+			allowed, err := s.userManager.IsAppAllowed(c.Request.Context(), sess.UserID, appName)
+			if err != nil || !allowed {
+				writeGinError(c, http.StatusForbidden, "Access denied")
+				return
+			}
+		}
+	}
+
+	// Get the endpoint
+	endpoints, err := s.serviceManager.GetByApp(appName)
+	if err != nil {
+		writeGinError(c, http.StatusNotFound, "App not found: "+err.Error())
+		return
+	}
+
+	// Find the specific listener
+	var endpoint *services.ServiceEndpoint
+	for i := range endpoints {
+		if endpoints[i].Name == listenerName {
+			endpoint = &endpoints[i]
+			break
+		}
+	}
+	if endpoint == nil {
+		writeGinError(c, http.StatusNotFound, "Listener not found: "+listenerName)
+		return
+	}
+
+	// Compute listener health
+	health := s.computeListenerHealth(*endpoint)
+
+	c.JSON(http.StatusOK, gin.H{
+		"app":      appName,
+		"listener": listenerName,
+		"health":   health,
+	})
+}
+
+// computeListenerHealth computes the health status for a listener by delegating
+// to ServiceManager.GetListenerHealth, which aggregates certificate status and backend connectivity.
+func (s *GinServer) computeListenerHealth(ep services.ServiceEndpoint) services.ListenerHealth {
+	return s.serviceManager.GetListenerHealth(ep)
+}
+
+// AppInstanceWithHealth is an API response DTO that adds derived health state
+// to the persisted AppInstance. This keeps ephemeral/derived data out of the
+// on-disk app state (RFC 20260125 §7.2).
+type AppInstanceWithHealth struct {
+	*app.AppInstance
+	PrimaryListenerHealth *services.ListenerHealth `json:"primary_listener_health,omitempty"`
+}
+
+// deriveAppHealth computes the primary listener health for an app instance.
+// Returns nil for stopped apps or apps without a primary listener (raw-only).
+func (s *GinServer) deriveAppHealth(inst *app.AppInstance) *services.ListenerHealth {
+	// Stopped apps don't have health (expected state, not an error)
+	if inst.Status == "stopped" {
+		return nil
+	}
+
+	// Starting apps show recovering status
+	if inst.Status == "starting" {
+		h := services.ListenerHealth{
+			Status:         services.ListenerHealthRecovering,
+			ReasonCode:     "app_starting",
+			Reason:         "App is starting up",
+			Recoverable:    true,
+			ActionRequired: false,
+			LastChecked:    time.Now(),
+		}
+		return &h
+	}
+
+	// Error apps show error status
+	if inst.Status == "error" {
+		h := services.ListenerHealth{
+			Status:         services.ListenerHealthError,
+			ReasonCode:     "app_error",
+			Reason:         "App failed to start",
+			Recoverable:    false,
+			ActionRequired: true,
+			LastChecked:    time.Now(),
+		}
+		return &h
+	}
+
+	// Need definition for listener resolution
+	if inst.Definition == nil {
+		return nil
+	}
+
+	// Raw-only apps have no primary listener
+	primaryName, _ := hostname.ResolvePrimaryListener(inst.Definition.Listeners)
+	if primaryName == "" {
+		return nil
+	}
+
+	// Find the endpoint for this listener
+	if s.serviceManager == nil {
+		return nil
+	}
+	eps, err := s.serviceManager.GetByApp(inst.InstanceID)
+	if err != nil {
+		return nil
+	}
+
+	for _, ep := range eps {
+		if ep.Name == primaryName {
+			h := s.computeListenerHealth(ep)
+			return &h
+		}
+	}
+	return nil
 }
