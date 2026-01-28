@@ -4,13 +4,17 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../theme/piccolo_theme.dart';
 import '../../core/models/app_models.dart';
+import '../../core/models/listener_health.dart';
 import '../../core/services/app_service.dart';
+import '../../core/services/health_stream_client.dart';
 import '../../core/utils/task_id.dart';
+import '../../shared/widgets/health_badge.dart';
 import '../../shared/widgets/log_stream_viewer.dart';
 import '../../shared/widgets/task_progress_panel.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'app_launcher.dart';
 import 'widgets/edit_listeners_dialog.dart';
+import 'widgets/health_banner.dart';
 import 'workspace_terminal.dart';
 
 class AppDetailView extends StatefulWidget {
@@ -43,15 +47,41 @@ class _AppDetailViewState extends State<AppDetailView>
   // Action states
   bool _isActionLoading = false;
 
+  // Health stream
+  HealthStreamClient? _healthStream;
+  StreamSubscription<ListenerHealthEvent>? _healthSub;
+  ListenerHealth? _primaryHealth;
+
   @override
   void initState() {
     super.initState();
     _tabController = TabController(length: 4, vsync: this);
     _loadData();
+    _connectHealthStream();
+  }
+
+  String? _primaryListenerName;
+
+  void _connectHealthStream() {
+    _healthStream = HealthStreamClient(app: widget.appId);
+    _healthSub = _healthStream!.events.listen((event) {
+      if (!mounted) return;
+      // Only update primary health from the primary listener's events
+      if (_primaryListenerName != null &&
+          event.listener != _primaryListenerName) {
+        return;
+      }
+      setState(() {
+        _primaryHealth = event.health;
+      });
+    });
+    _healthStream!.connect();
   }
 
   @override
   void dispose() {
+    _healthSub?.cancel();
+    _healthStream?.dispose();
     _tabController.dispose();
     super.dispose();
   }
@@ -71,6 +101,9 @@ class _AppDetailViewState extends State<AppDetailView>
         _app = detail.app;
         _listeners = detail.listeners;
         _containers = detail.containers;
+        _primaryHealth = detail.app.primaryListenerHealth;
+        // Identify the primary listener name for stream filtering
+        _primaryListenerName = _findPrimaryListenerName(detail.listeners);
         _selectedService = _pickSelectedService(
           _selectedService,
           detail.containers,
@@ -281,6 +314,15 @@ class _AppDetailViewState extends State<AppDetailView>
         // Header
         _buildHeader(),
 
+        // Health banner
+        if (_primaryHealth != null && !_primaryHealth!.isOk)
+          AppDetailHealthBanner(
+            health: _primaryHealth!,
+            lanFallbackUrl: _getLanFallbackUrl(),
+            appService: widget.appService,
+            desktopController: widget.desktopController,
+          ),
+
         // Tabs
         TabBar(
           controller: _tabController,
@@ -471,6 +513,41 @@ class _AppDetailViewState extends State<AppDetailView>
     );
   }
 
+  static String? _findPrimaryListenerName(List<ServiceEndpoint> listeners) {
+    // Prefer the endpoint marked as primary
+    for (final l in listeners) {
+      if (l.primary) return l.name;
+    }
+    // RFC: first HTTP or WebSocket listener; null for raw-only apps
+    for (final l in listeners) {
+      if (l.protocol == 'http' || l.protocol == 'ws') return l.name;
+    }
+    return null;
+  }
+
+  String _getLanFallbackUrl() {
+    // Prefer the primary listener's fallback URL
+    final primary = _primaryListenerName;
+    if (primary != null) {
+      for (final l in _listeners) {
+        if (l.name == primary) {
+          return l.lanFallbackUrl ?? l.lanHostUrl ?? l.localUrl ?? '';
+        }
+      }
+    }
+    // Fallback: first listener with a URL
+    for (final l in _listeners) {
+      if (l.lanFallbackUrl != null) return l.lanFallbackUrl!;
+    }
+    for (final l in _listeners) {
+      if (l.lanHostUrl != null) return l.lanHostUrl!;
+    }
+    for (final l in _listeners) {
+      if (l.localUrl != null) return l.localUrl!;
+    }
+    return '';
+  }
+
   Widget _buildOverviewTab() {
     return ListView(
       padding: const EdgeInsets.all(24),
@@ -575,6 +652,10 @@ class _AppDetailViewState extends State<AppDetailView>
                                   fontSize: 16,
                                 ),
                               ),
+                              if (svc.health != null && !svc.health!.isOk) ...[
+                                const SizedBox(width: 8),
+                                HealthBadge(health: svc.health),
+                              ],
                               const Spacer(),
                               Container(
                                 padding: const EdgeInsets.symmetric(
@@ -622,12 +703,17 @@ class _AppDetailViewState extends State<AppDetailView>
                             _buildNetworkLinkRow(
                               "Remote Access",
                               svc.remoteUrl!,
-                              onTap: () => AppLauncher.openAppWindow(
+                              onTap: () => AppLauncher.healthGatedOpen(
+                                context: context,
                                 controller: widget.desktopController,
                                 appService: widget.appService,
                                 app: _app!,
                                 service: svc,
                                 overrideUrl: svc.remoteUrl!,
+                                // Only override with live stream health for primary listener
+                                healthOverride: svc.name == _primaryListenerName
+                                    ? _primaryHealth
+                                    : null,
                               ),
                               icon: Icons.web_asset,
                               tooltip: "Opens in app window",

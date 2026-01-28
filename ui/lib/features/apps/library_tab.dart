@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import '../../core/models/app_models.dart';
 import '../../core/services/app_service.dart';
+import '../../shared/widgets/health_badge.dart';
 import '../../theme/piccolo_theme.dart';
+import 'widgets/health_policy.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'app_detail_view.dart';
 import 'app_launcher.dart';
@@ -90,7 +92,8 @@ class _LibraryTabState extends State<LibraryTab> {
       }
 
       if (primary != null && mounted) {
-        AppLauncher.openAppWindow(
+        AppLauncher.healthGatedOpen(
+          context: context,
           controller: widget.desktopController,
           appService: widget.appService,
           app: app,
@@ -198,61 +201,73 @@ class _AppCard extends StatelessWidget {
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(12),
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              // Icon Placeholder
-              Container(
-                width: 64,
-                height: 64,
-                decoration: BoxDecoration(
-                  color: PiccoloTheme.mist,
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: Center(
-                    child: Text(
-                        title.isNotEmpty ? title[0].toUpperCase() : "?",
-                        style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: PiccoloTheme.cobalt600),
+        child: Stack(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  // Icon Placeholder
+                  Container(
+                    width: 64,
+                    height: 64,
+                    decoration: BoxDecoration(
+                      color: PiccoloTheme.mist,
+                      borderRadius: BorderRadius.circular(16),
                     ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              // Name
-              Text(
-                title,
-                style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold),
-                textAlign: TextAlign.center,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              const SizedBox(height: 8),
-              // Status Badge
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: statusColor.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      width: 8,
-                      height: 8,
-                      decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle),
+                    child: Center(
+                        child: Text(
+                            title.isNotEmpty ? title[0].toUpperCase() : "?",
+                            style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: PiccoloTheme.cobalt600),
+                        ),
                     ),
-                    const SizedBox(width: 6),
-                    Text(
-                      app.status.toUpperCase(),
-                      style: TextStyle(color: statusColor, fontSize: 10, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 16),
+                  // Name
+                  Text(
+                    title,
+                    style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold),
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 8),
+                  // Status Badge
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: statusColor.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(12),
                     ),
-                  ],
-                ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          app.status.toUpperCase(),
+                          style: TextStyle(color: statusColor, fontSize: 10, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
               ),
-            ],
-          ),
+            ),
+            // Health badge (top-right) — driven by policy framework
+            if (policyForStatus(app.primaryListenerHealth?.status).cardAction ==
+                ListenerHealthAction.showWarningBadge)
+              Positioned(
+                top: 8,
+                right: 8,
+                child: HealthBadge(health: app.primaryListenerHealth),
+              ),
+          ],
         ),
       ),
     );

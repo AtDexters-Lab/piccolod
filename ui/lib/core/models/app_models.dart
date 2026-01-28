@@ -1,3 +1,5 @@
+import 'listener_health.dart';
+
 class App {
   final String id;
   final String name;
@@ -11,6 +13,7 @@ class App {
   final Map<String, String> environment;
   final String? containerId;
   final Map<String, dynamic> definition;
+  final ListenerHealth? primaryListenerHealth;
 
   App({
     required this.id,
@@ -25,6 +28,7 @@ class App {
     this.environment = const {},
     this.containerId,
     this.definition = const {},
+    this.primaryListenerHealth,
   });
 
   factory App.fromJson(Map<String, dynamic> json) {
@@ -101,6 +105,11 @@ class App {
           .toList();
     }
 
+    final rawHealth = json['primary_listener_health'];
+    final primaryHealth = rawHealth is Map
+        ? ListenerHealth.fromJson(Map<String, dynamic>.from(rawHealth))
+        : null;
+
     return App(
       id: instanceId,
       name: instanceId,
@@ -114,6 +123,7 @@ class App {
       environment: environment,
       containerId: json['container_id'],
       definition: def,
+      primaryListenerHealth: primaryHealth,
     );
   }
 
@@ -250,6 +260,10 @@ class ServiceEndpoint {
   final String protocol;
   final String? localUrl;
   final String? lanHostUrl;
+  final String? lanFallbackUrl;
+  final String? lanPortUrl;
+  final bool primary;
+  final ListenerHealth? health;
   final List<dynamic> middleware;
 
   ServiceEndpoint({
@@ -264,10 +278,19 @@ class ServiceEndpoint {
     required this.protocol,
     this.localUrl,
     this.lanHostUrl,
+    this.lanFallbackUrl,
+    this.lanPortUrl,
+    this.primary = false,
+    this.health,
     this.middleware = const [],
   });
 
   factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
+    final rawHealth = json['health'];
+    final endpointHealth = rawHealth is Map
+        ? ListenerHealth.fromJson(Map<String, dynamic>.from(rawHealth))
+        : null;
+
     return ServiceEndpoint(
       app: json['app'] ?? '',
       name: json['name'] ?? '',
@@ -280,6 +303,10 @@ class ServiceEndpoint {
       protocol: json['protocol'] ?? 'raw',
       localUrl: json['local_url'],
       lanHostUrl: json['lan_host_url'],
+      lanFallbackUrl: json['lan_fallback_url'],
+      lanPortUrl: json['lan_port_url'],
+      primary: json['primary'] == true,
+      health: endpointHealth,
       middleware: json['middleware'] ?? [],
     );
   }
@@ -287,10 +314,6 @@ class ServiceEndpoint {
   // Helper to get the Remote URL (if enabled)
   String? get remoteUrl {
     if (remoteHost == null || remoteHost!.isEmpty) return null;
-    // Nexus endpoints are secured by default.
-    // If remotePorts contains 443, we imply https without port.
-    // If it contains 80, http.
-    // Simplification: Nexus is HTTPS-first.
     return 'https://$remoteHost';
   }
 }
