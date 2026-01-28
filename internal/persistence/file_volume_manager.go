@@ -16,7 +16,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -77,7 +76,7 @@ func (execMountLauncher) Launch(ctx context.Context, path string, args []string,
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
+
 	// Create a new session group to detach from the parent's signals.
 	// Do NOT use configureForegroundAttrs here as Pdeathsig would kill the mount on parent exit.
 	if runtime.GOOS == "linux" {
@@ -85,7 +84,7 @@ func (execMountLauncher) Launch(ctx context.Context, path string, args []string,
 			Setsid: true,
 		}
 	}
-	
+
 	if err := cmd.Start(); err != nil {
 		stdinPipe.Close()
 		return nil, err
@@ -187,13 +186,6 @@ const (
 	volumeStateError     = "error"
 )
 
-var mountPointReplacer = strings.NewReplacer(
-	`\040`, " ",
-	`\011`, "\t",
-	`\012`, "\n",
-	`\134`, `\`,
-)
-
 func newFileVolumeManager(root string, crypto *crypt.Manager, bus *events.Bus) *fileVolumeManager {
 	if root == "" {
 		root = paths.Root()
@@ -288,41 +280,88 @@ func (f *fileVolumeManager) getOrCreateEntry(id string) *volumeEntry {
 	return entry
 }
 
+func shouldGuardMountDir(volumeID string) bool {
+	// Guard all mount points under PICCOLO_STATE_DIR/mounts to prevent accidental
+	// plaintext writes to an unmounted directory where an encrypted volume is expected.
+	return volumeID != ""
+}
+
+// cleanAndReprotectMountDir removes orphaned files from a mount directory after
+// unmount, temporarily removing the immutable guard if active, then re-applying it.
+func cleanAndReprotectMountDir(volumeID, mountDir string) {
+	guarded := shouldGuardMountDir(volumeID)
+	if guarded {
+		if err := unprotectMountDir(mountDir); err != nil {
+			log.Printf("WARN: volume %s: failed to unprotect mountpoint for cleanup, skipping clean: %v", volumeID, err)
+			return
+		}
+	}
+	if err := cleanDirectory(mountDir); err != nil {
+		log.Printf("WARN: volume %s: failed to clean mount directory after unmount: %v", volumeID, err)
+	}
+	if guarded {
+		if err := protectMountDir(mountDir); err != nil {
+			log.Printf("WARN: volume %s: failed to re-protect mountpoint after cleanup: %v", volumeID, err)
+		}
+	}
+}
+
 func (f *fileVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest) (VolumeHandle, error) {
-	f.mu.RLock()
+	f.mu.Lock()
 	entry, ok := f.volumes[req.ID]
-	f.mu.RUnlock()
 	if ok {
+		f.mu.Unlock()
 		if err := f.reconcileVolumeState(ctx, entry); err != nil {
 			return entry.handle, err
 		}
 		return entry.handle, nil
 	}
-
+	// Hold the lock to prevent concurrent init of the same volume.
+	// Create a placeholder entry so other callers see it immediately.
 	cipherDir := filepath.Join(f.root, "ciphertext", req.ID)
-	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
-		return VolumeHandle{}, fmt.Errorf("ensure volume %s ciphertext: %w", req.ID, err)
-	}
 	mountDir := filepath.Join(f.root, "mounts", req.ID)
-	if err := os.MkdirAll(mountDir, 0o700); err != nil {
-		return VolumeHandle{}, fmt.Errorf("ensure volume %s mount: %w", req.ID, err)
-	}
-
 	entry = &volumeEntry{
 		handle:    VolumeHandle{ID: req.ID, MountDir: mountDir},
 		cipherDir: cipherDir,
 		stateDir:  filepath.Join(f.stateRoot, req.ID),
 	}
+	f.volumes[req.ID] = entry
+	f.mu.Unlock()
+
+	initOK := false
+	defer func() {
+		if !initOK {
+			f.mu.Lock()
+			// Only remove if the map still points to our entry; a concurrent
+			// caller may have replaced it after we released the lock.
+			if f.volumes[req.ID] == entry {
+				delete(f.volumes, req.ID)
+			}
+			f.mu.Unlock()
+		}
+	}()
+
+	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
+		return VolumeHandle{}, fmt.Errorf("ensure volume %s ciphertext: %w", req.ID, err)
+	}
+	if err := os.MkdirAll(mountDir, 0o700); err != nil {
+		return VolumeHandle{}, fmt.Errorf("ensure volume %s mount: %w", req.ID, err)
+	}
+	if shouldGuardMountDir(req.ID) && !f.bypassMount {
+		if mounted, err := isMountPoint(mountDir); err == nil && !mounted {
+			if err := protectMountDir(mountDir); err != nil {
+				log.Printf("WARN: volume %s: failed to protect mountpoint: %v", req.ID, err)
+			}
+		}
+	}
+
 	if err := f.ensureMetadata(ctx, entry); err != nil {
 		if !errors.Is(err, crypt.ErrLocked) && !errors.Is(err, crypt.ErrNotInitialized) {
 			return VolumeHandle{}, err
 		}
 	}
 
-	f.mu.Lock()
-	f.volumes[req.ID] = entry
-	f.mu.Unlock()
-
+	initOK = true
 	if err := f.reconcileVolumeState(ctx, entry); err != nil {
 		return entry.handle, err
 	}
@@ -339,6 +378,17 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 	}
 	if opts.Role == VolumeRoleLeader && checker != nil && !checker(handle.ID, opts.Role) {
 		return fmt.Errorf("attach: leadership not granted for volume %s", handle.ID)
+	}
+
+	if err := os.MkdirAll(handle.MountDir, 0o700); err != nil {
+		return fmt.Errorf("attach: ensure mount directory for volume %s: %w", handle.ID, err)
+	}
+	if shouldGuardMountDir(handle.ID) && !f.bypassMount {
+		if mounted, err := isMountPoint(handle.MountDir); err == nil && !mounted {
+			if err := protectMountDir(handle.MountDir); err != nil {
+				log.Printf("WARN: volume %s: failed to protect mountpoint: %v", handle.ID, err)
+			}
+		}
 	}
 
 	if f.bypassMount {
@@ -436,14 +486,30 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 func (f *fileVolumeManager) Detach(ctx context.Context, handle VolumeHandle) error {
 	if f.bypassMount {
 		role := VolumeRoleUnknown
-		f.mu.RLock()
+		f.mu.Lock()
 		if entry, ok := f.volumes[handle.ID]; ok {
 			role = entry.role
 			entry.role = VolumeRoleUnknown
 		}
-		f.mu.RUnlock()
+		f.mu.Unlock()
 		return f.recordVolumeState(handle.ID, volumeStateUnmounted, volumeStateUnmounted, role, nil)
 	}
+	if err := f.fusermountDetach(ctx, handle); err != nil {
+		return err
+	}
+
+	// Clean the mount directory after unmount.
+	// Any remaining files are orphaned (were inside the encrypted volume) and
+	// must be removed so gocryptfs can mount again (requires empty directory).
+	cleanAndReprotectMountDir(handle.ID, handle.MountDir)
+
+	return nil
+}
+
+// fusermountDetach performs the fusermount unmount, state recording, and process
+// cleanup without the post-unmount directory cleanup. Used by detachWithRetry to
+// avoid running cleanup on each retry attempt.
+func (f *fileVolumeManager) fusermountDetach(ctx context.Context, handle VolumeHandle) error {
 	role := VolumeRoleUnknown
 	f.mu.RLock()
 	if entry, ok := f.volumes[handle.ID]; ok {
@@ -462,21 +528,21 @@ func (f *fileVolumeManager) Detach(ctx context.Context, handle VolumeHandle) err
 	if err := f.recordVolumeState(handle.ID, volumeStateUnmounted, volumeStateUnmounted, role, nil); err != nil {
 		return err
 	}
-
-	// Clean the mount directory after unmount.
-	// Any remaining files are orphaned (were inside the encrypted volume) and
-	// must be removed so gocryptfs can mount again (requires empty directory).
-	if err := cleanDirectory(handle.MountDir); err != nil {
-		log.Printf("WARN: volume %s: failed to clean mount directory after unmount: %v", handle.ID, err)
-		// Don't fail - the unmount succeeded, this is just cleanup
-	}
-
 	return nil
 }
 
 func (f *fileVolumeManager) DestroyVolume(ctx context.Context, id string) error {
 	mountDir := filepath.Join(f.root, "mounts", id)
 	handle := VolumeHandle{ID: id, MountDir: mountDir}
+
+	// Acquire the entry's metaMu to serialize against concurrent Attach/ensureMetadata.
+	f.mu.RLock()
+	entry, hasEntry := f.volumes[id]
+	f.mu.RUnlock()
+	if hasEntry {
+		entry.metaMu.Lock()
+		defer entry.metaMu.Unlock()
+	}
 
 	// 1. Detach if mounted - with retries and lazy unmount fallback
 	if mounted, _ := isMountPoint(mountDir); mounted {
@@ -498,6 +564,11 @@ func (f *fileVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 	}
 
 	// 4. Remove Mountpoint (use RemoveAll to handle non-empty directories from lazy unmounts)
+	if shouldGuardMountDir(id) {
+		if err := unprotectMountDir(mountDir); err != nil {
+			return fmt.Errorf("destroy: unprotect mountpoint: %w", err)
+		}
+	}
 	if err := os.RemoveAll(mountDir); err != nil {
 		log.Printf("WARN: destroy volume %s: failed to remove mount directory: %v", id, err)
 	}
@@ -515,15 +586,17 @@ func (f *fileVolumeManager) detachWithRetry(ctx context.Context, handle VolumeHa
 	const maxRetries = 3
 	const retryDelay = 500 * time.Millisecond
 
-	// First try normal detach
-	err := f.Detach(ctx, handle)
+	// First try normal unmount (without post-unmount cleanup)
+	err := f.fusermountDetach(ctx, handle)
 	if err == nil {
+		cleanAndReprotectMountDir(handle.ID, handle.MountDir)
 		return nil
 	}
 
-	// Check if error indicates device busy
-	errStr := err.Error()
-	if !strings.Contains(errStr, "busy") && !strings.Contains(errStr, "exit status 1") {
+	// Retry only if fusermount exited non-zero (e.g. device busy); propagate
+	// other errors (context cancelled, binary not found, etc.) immediately.
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
 		return err
 	}
 
@@ -537,11 +610,13 @@ func (f *fileVolumeManager) detachWithRetry(ctx context.Context, handle VolumeHa
 
 		// Check if still mounted
 		if mounted, _ := isMountPoint(handle.MountDir); !mounted {
+			cleanAndReprotectMountDir(handle.ID, handle.MountDir)
 			return nil
 		}
 
-		// Try normal unmount again
-		if err := f.Detach(ctx, handle); err == nil {
+		// Try normal unmount again (no cleanup on each retry)
+		if err := f.fusermountDetach(ctx, handle); err == nil {
+			cleanAndReprotectMountDir(handle.ID, handle.MountDir)
 			return nil
 		}
 	}
@@ -562,11 +637,7 @@ func (f *fileVolumeManager) detachWithRetry(ctx context.Context, handle VolumeHa
 		return fmt.Errorf("volume %s still mounted after lazy unmount", handle.ID)
 	}
 
-	// Clean the mount directory after lazy unmount (same as regular Detach)
-	if err := cleanDirectory(handle.MountDir); err != nil {
-		log.Printf("WARN: volume %s: failed to clean mount directory after lazy unmount: %v", handle.ID, err)
-	}
-
+	cleanAndReprotectMountDir(handle.ID, handle.MountDir)
 	return nil
 }
 
@@ -956,51 +1027,6 @@ func (f *fileVolumeManager) awaitProcessExit(volumeID string) {
 		_ = proc.Kill()
 		<-proc.Wait()
 	}
-}
-
-func waitForMountReady(mountPoint string, timeout time.Duration) error {
-	mountPoint = filepath.Clean(mountPoint)
-	deadline := time.Now().Add(timeout)
-	for {
-		mounted, err := isMountPoint(mountPoint)
-		if err != nil {
-			return err
-		}
-		if mounted {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for mount %s", mountPoint)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-func isMountPoint(mountPoint string) (bool, error) {
-	data, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		return false, err
-	}
-	target := filepath.Clean(mountPoint)
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		fields := strings.Split(line, " ")
-		if len(fields) < 5 {
-			continue
-		}
-		pathField := decodeMountPoint(fields[4])
-		if pathField == target {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func decodeMountPoint(raw string) string {
-	return mountPointReplacer.Replace(raw)
 }
 
 func generatePassphrase() ([]byte, error) {

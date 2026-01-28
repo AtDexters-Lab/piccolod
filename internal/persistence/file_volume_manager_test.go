@@ -621,6 +621,48 @@ func TestFileVolumeManagerReconcilesStaleMountedStateOnEnsure(t *testing.T) {
 	}
 }
 
+func TestFileVolumeManagerReconcilesMissingMountDirOnStartup(t *testing.T) {
+	root := t.TempDir()
+	cryptoMgr := newUnlockedCrypto(t, root)
+	runner := &fakeRunner{}
+	launcher := &fakeMountLauncher{}
+	waiter := func(string, time.Duration) error { return nil }
+	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
+
+	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "missing-mountdir", Class: VolumeClassApplication})
+	if err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+	if err := mgr.Attach(context.Background(), handle, AttachOptions{Role: VolumeRoleLeader}); err != nil {
+		t.Fatalf("Attach leader: %v", err)
+	}
+
+	if err := os.RemoveAll(handle.MountDir); err != nil {
+		t.Fatalf("remove mount dir: %v", err)
+	}
+
+	// Restart manager and reconcile. Reattach should recreate the mount directory so marker writes succeed.
+	runner2 := &fakeRunner{}
+	launcher2 := &fakeMountLauncher{}
+	mgr2 := newFileVolumeManagerWithDeps(root, cryptoMgr, runner2, "gocryptfs", "fusermount3", launcher2, waiter)
+
+	if err := mgr2.reconcileAllVolumeStates(); err != nil {
+		t.Fatalf("reconcileAllVolumeStates: %v", err)
+	}
+	if len(launcher2.calls) == 0 {
+		t.Fatalf("expected auto-reattach during startup")
+	}
+	if _, err := os.Stat(handle.MountDir); err != nil {
+		t.Fatalf("mount dir missing after reconcile: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(handle.MountDir, ".mode")); err != nil {
+		t.Fatalf("mode marker missing after reconcile: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(handle.MountDir, ".cipher")); err != nil {
+		t.Fatalf("cipher marker missing after reconcile: %v", err)
+	}
+}
+
 func TestFileVolumeManagerReconcileSkipsLeaderWithoutAuthority(t *testing.T) {
 	root := t.TempDir()
 	cryptoMgr := newUnlockedCrypto(t, root)
@@ -788,10 +830,10 @@ func TestFileVolumeManagerStateGenerationAndNeedsRepair(t *testing.T) {
 }
 
 func containsArgs(args []string, target []string) bool {
-	for _, t := range target {
+	for _, want := range target {
 		found := false
 		for _, a := range args {
-			if a == t {
+			if a == want {
 				found = true
 				break
 			}
