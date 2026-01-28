@@ -82,8 +82,8 @@ type ProxyManager struct {
 	aliasChecker  func(host, listener string) bool
 
 	// RFC 20260122: Proxy OIDC handler for headers/protected strategies
-	proxyOIDC        *ProxyOIDCHandler
-	sessionStore     *auth.SessionStore
+	proxyOIDC           *ProxyOIDCHandler
+	sessionStore        *auth.SessionStore
 	localHostnameGetter func() string
 }
 
@@ -408,10 +408,11 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	rp := httputil.NewSingleHostReverseProxy(u)
 	// Strip backend restrictions so we can apply our own
 	rp.ModifyResponse = func(resp *http.Response) error {
+		// Strip backend security headers that conflict with proxy-level policies.
+		// The proxy's securityHeaders middleware sets consistent CORP/COEP for all responses.
 		resp.Header.Del("X-Frame-Options")
-
-		resp.Header.Set("Cross-Origin-Resource-Policy", "same-site")
-		resp.Header.Set("Cross-Origin-Embedder-Policy", "require-corp")
+		resp.Header.Del("Cross-Origin-Resource-Policy")
+		resp.Header.Del("Cross-Origin-Embedder-Policy")
 
 		// Remove existing frame-ancestors directive if present, but keep other CSP directives
 		if val := resp.Header.Get("Content-Security-Policy"); val != "" {
@@ -699,20 +700,16 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	}()
 }
 
-// stripPiccoloHeadersMiddleware removes all X-Piccolo-* headers from incoming requests.
-// This prevents clients from spoofing trusted headers regardless of auth strategy.
-func stripPiccoloHeadersMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		StripHeadersFromRequest(r)
-		next.ServeHTTP(w, r)
-	})
-}
-
 // Middleware stubs
 func (p *ProxyManager) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		// CORP cross-origin: required because portal (piccolo.domain.com) embeds apps
+		// (app.piccolo.domain.com) in iframes. These are different origins, so same-site
+		// would block embedding. frame-ancestors CSP still restricts framing origins.
+		w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
+		w.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
 
 		p.mu.Lock()
 		csp := p.cspFrameAncestors
