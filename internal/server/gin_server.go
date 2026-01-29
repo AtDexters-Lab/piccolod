@@ -730,24 +730,51 @@ func (s *GinServer) Start() error {
 }
 
 // Stop gracefully shuts down the server and all its components.
-func (s *GinServer) Stop() error {
+// The context is used for timeout control during shutdown.
+func (s *GinServer) Stop(ctx context.Context) error {
+	log.Printf("INFO: Beginning graceful shutdown...")
+
+	// Notify systemd that we're stopping
+	if sent, err := daemon.SdNotify(false, daemon.SdNotifyStopping); err != nil {
+		log.Printf("WARN: Failed to notify systemd of stopping: %v", err)
+	} else if sent {
+		log.Printf("INFO: Notified systemd that service is stopping")
+	}
+
+	// 1. Stop accepting new requests (handled by caller stopping the listener)
+
+	// 2. Stop app manager background tasks and all running apps
 	if s.appManager != nil {
 		s.appManager.StopRuntimeEvents()
+		if err := s.appManager.StopAllApps(ctx); err != nil {
+			log.Printf("WARN: Failed to stop all apps cleanly: %v", err)
+		}
 	}
+
+	// 3. Stop internal listeners
 	s.stopSecureLoopback()
 	s.stopInternalHTTPSListener()
 
-	// Stop OIDC provider's background goroutines
+	// 4. Stop OIDC provider's background goroutines
 	s.oidcProviderMu.Lock()
 	if s.oidcProvider != nil {
 		s.oidcProvider.Storage().Close()
 	}
 	s.oidcProviderMu.Unlock()
 
-	if err := s.supervisor.Stop(context.Background()); err != nil {
+	// 5. Stop supervisor-managed components
+	if err := s.supervisor.Stop(ctx); err != nil {
 		log.Printf("WARN: Failed to stop components cleanly: %v", err)
-		return err
 	}
+
+	// 6. Shutdown persistence (detach control and bootstrap volumes) - AFTER apps stopped
+	if s.persistence != nil {
+		if err := s.persistence.Shutdown(ctx); err != nil {
+			log.Printf("WARN: Failed to shutdown persistence cleanly: %v", err)
+		}
+	}
+
+	log.Printf("INFO: Graceful shutdown completed")
 	return nil
 }
 

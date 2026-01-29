@@ -349,6 +349,7 @@ func (m *AppManager) ObserveRuntimeEvents(bus *events.Bus) {
 }
 
 // StopRuntimeEvents stops event observers and waits for goroutines to exit.
+// Uses a 10-second timeout to prevent indefinite blocking during shutdown.
 func (m *AppManager) StopRuntimeEvents() {
 	m.eventsMu.Lock()
 	if m.eventCancel != nil {
@@ -356,7 +357,19 @@ func (m *AppManager) StopRuntimeEvents() {
 		m.eventCancel = nil
 	}
 	m.eventsMu.Unlock()
-	m.eventsWG.Wait()
+
+	// Wait with timeout to prevent indefinite blocking
+	done := make(chan struct{})
+	go func() {
+		m.eventsWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Goroutines exited cleanly
+	case <-time.After(10 * time.Second):
+		log.Printf("WARN: StopRuntimeEvents timed out waiting for event goroutines")
+	}
 }
 
 func (m *AppManager) StartBackground() {
@@ -397,6 +410,158 @@ func (m *AppManager) StopBackground() {
 		cancel()
 	}
 	m.reconcileWG.Wait()
+}
+
+// StopAllApps stops all running applications and detaches their volumes.
+// This is called during graceful shutdown to ensure containers are stopped
+// before FUSE mounts are unmounted. Apps are stopped in parallel for efficiency.
+func (m *AppManager) StopAllApps(ctx context.Context) error {
+	log.Printf("INFO: Stopping all running apps for graceful shutdown...")
+
+	// First, stop the background reconciliation loop
+	m.StopBackground()
+
+	// Get the state manager - if unavailable (locked/unmounted), skip app stopping
+	// since containers won't be able to access their volumes anyway
+	m.stateInitMu.Lock()
+	stateMgr := m.stateManager
+	m.stateInitMu.Unlock()
+
+	if stateMgr == nil {
+		log.Printf("INFO: State manager not initialized, skipping app shutdown")
+		return nil
+	}
+
+	apps := stateMgr.ListApps()
+	if len(apps) == 0 {
+		log.Printf("INFO: No apps to stop")
+		return nil
+	}
+
+	// Filter to only running/starting apps
+	var runningApps []*AppInstance
+	for _, app := range apps {
+		if app.Status == "running" || app.Status == "starting" {
+			runningApps = append(runningApps, app)
+		} else {
+			log.Printf("DEBUG: Skipping %s (status: %s)", app.InstanceID, app.Status)
+		}
+	}
+
+	if len(runningApps) == 0 {
+		log.Printf("INFO: No running apps to stop")
+		return nil
+	}
+
+	log.Printf("INFO: Stopping %d running apps in parallel...", len(runningApps))
+
+	// Stop apps in parallel with a concurrency limit of 4
+	const maxConcurrency = 4
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var errs []error
+
+	for i, app := range runningApps {
+		wg.Add(1)
+		go func(idx int, appInst *AppInstance) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				errMu.Lock()
+				errs = append(errs, fmt.Errorf("app %s: context cancelled before stop", appInst.InstanceID))
+				errMu.Unlock()
+				return
+			}
+
+			log.Printf("INFO: [%d/%d] Stopping app %s...", idx+1, len(runningApps), appInst.InstanceID)
+
+			// Stop container group for this app
+			if err := m.stopAppForShutdown(ctx, appInst.InstanceID); err != nil {
+				log.Printf("WARN: Failed to stop app %s: %v", appInst.InstanceID, err)
+				errMu.Lock()
+				errs = append(errs, fmt.Errorf("stop %s: %w", appInst.InstanceID, err))
+				errMu.Unlock()
+			}
+
+			// Detach the app's encrypted volume
+			if err := m.detachAppVolume(ctx, appInst.InstanceID); err != nil {
+				log.Printf("WARN: Failed to detach volume for %s: %v", appInst.InstanceID, err)
+				errMu.Lock()
+				errs = append(errs, fmt.Errorf("detach %s: %w", appInst.InstanceID, err))
+				errMu.Unlock()
+			}
+
+			log.Printf("INFO: [%d/%d] Stopped app %s", idx+1, len(runningApps), appInst.InstanceID)
+		}(i, app)
+	}
+
+	wg.Wait()
+	log.Printf("INFO: Finished stopping all apps")
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+// stopAppForShutdown stops an app's containers without updating state or
+// emitting progress events. This is a simplified path for graceful shutdown.
+func (m *AppManager) stopAppForShutdown(ctx context.Context, instanceID string) error {
+	m.stateInitMu.Lock()
+	stateMgr := m.stateManager
+	m.stateInitMu.Unlock()
+
+	if stateMgr == nil {
+		return nil
+	}
+
+	app, exists := stateMgr.GetApp(instanceID)
+	if !exists {
+		return nil
+	}
+
+	def, err := stateMgr.GetAppDefinition(instanceID)
+	if err != nil {
+		return fmt.Errorf("failed to load app definition: %w", err)
+	}
+
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
+	if err != nil {
+		// Volume might already be detached or unavailable
+		log.Printf("DEBUG: Could not get volume layout for %s: %v", instanceID, err)
+		return nil
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	if err != nil {
+		return err
+	}
+
+	return m.stopContainerGroup(ctx, stateMgr, app, def, layout, runtime)
+}
+
+// detachAppVolume detaches (unmounts) an app's encrypted volume.
+func (m *AppManager) detachAppVolume(ctx context.Context, instanceID string) error {
+	volumes := m.currentVolumeManager()
+	if volumes == nil {
+		return nil
+	}
+
+	volID := appVolumeID(instanceID)
+	req := persistence.VolumeRequest{ID: volID, Class: persistence.VolumeClassApplication}
+
+	handle, err := volumes.EnsureVolume(ctx, req)
+	if err != nil {
+		// Volume might not exist or already be detached
+		return nil
+	}
+
+	return volumes.Detach(ctx, handle)
 }
 
 // LastObservedRole returns the most recently observed leadership role for the provided resource.

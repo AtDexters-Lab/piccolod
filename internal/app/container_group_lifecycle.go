@@ -131,6 +131,11 @@ func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemSt
 
 	// Stop services in reverse order, then anchor.
 	for i := len(startOrder) - 1; i >= 0; i-- {
+		// Check for context cancellation to avoid wasting time if shutdown is timing out
+		if ctx.Err() != nil {
+			log.Printf("WARN: stop %s: context cancelled, %d service containers not stopped", appInst.InstanceID, i+1)
+			break
+		}
 		svcName := startOrder[i]
 		cid := strings.TrimSpace(appInst.Containers[svcName])
 		if cid == "" {
@@ -143,7 +148,15 @@ func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemSt
 		if strings.TrimSpace(cid) == "" {
 			continue
 		}
-		_ = m.containerManager.StopContainer(ctx, runtime, cid)
+		if err := m.containerManager.StopContainer(ctx, runtime, cid); err != nil {
+			log.Printf("WARN: stop %s: failed to stop container %s (%s): %v", appInst.InstanceID, svcName, cid, err)
+		}
+	}
+
+	// Check context before stopping anchor
+	if ctx.Err() != nil {
+		log.Printf("WARN: stop %s: context cancelled, network anchor not stopped", appInst.InstanceID)
+		return ctx.Err()
 	}
 
 	anchorID := strings.TrimSpace(appInst.NetworkAnchorID)
@@ -153,7 +166,9 @@ func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemSt
 		}
 	}
 	if strings.TrimSpace(anchorID) != "" {
-		_ = m.containerManager.StopContainer(ctx, runtime, anchorID)
+		if err := m.containerManager.StopContainer(ctx, runtime, anchorID); err != nil {
+			log.Printf("WARN: stop %s: failed to stop network anchor %s: %v", appInst.InstanceID, anchorID, err)
+		}
 	}
 
 	// For workspace mode apps, unmount the overlay on clean stop (RFC §5.6).

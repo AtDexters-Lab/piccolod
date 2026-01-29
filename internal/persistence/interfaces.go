@@ -18,6 +18,8 @@ type Service interface {
 	Consensus() ConsensusManager
 	BootstrapVolume() VolumeHandle
 	ControlVolume() VolumeHandle
+	// Shutdown terminates background tasks and detaches mounted volumes.
+	Shutdown(ctx context.Context) error
 }
 
 // BootstrapStore manages the device-local bootstrap shard lifecycle.

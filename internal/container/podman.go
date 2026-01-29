@@ -517,13 +517,14 @@ func (p *PodmanCLI) StartContainer(ctx context.Context, runtime PodmanRuntime, c
 	return nil
 }
 
-// StopContainer stops a container by validated ID
+// StopContainer stops a container by validated ID.
+// Uses a 30-second timeout to allow containers to gracefully shutdown.
 func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, containerID string) error {
 	if !isValidContainerID(containerID) {
 		return fmt.Errorf("invalid container ID format: %s", containerID)
 	}
 
-	args, err := buildPodmanArgs(runtime, []string{"stop", containerID})
+	args, err := buildPodmanArgs(runtime, []string{"stop", "--time", "30", containerID})
 	if err != nil {
 		return err
 	}
