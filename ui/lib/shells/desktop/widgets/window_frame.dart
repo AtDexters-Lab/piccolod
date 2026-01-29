@@ -86,15 +86,15 @@ class _WindowFrameState extends State<WindowFrame>
 
   @override
   Widget build(BuildContext context) {
-    // If minimized, we shouldn't be here (filtered by Shell), but safe to return empty.
-    if (widget.window.isMinimized && !widget.isClosing) {
-      return const SizedBox.shrink();
-    }
+    // Use Offstage to hide minimized windows while preserving their state (iframes)
+    final isMinimized = widget.window.isMinimized && !widget.isClosing;
 
     return Positioned(
       left: widget.window.position.dx,
       top: widget.window.position.dy,
-      child: PointerInterceptor(
+      child: Offstage(
+        offstage: isMinimized,
+        child: PointerInterceptor(
         // Intercept if it's a native window.
         // WebViews now self-manage their interactivity via WindowActivity.
         intercepting: widget.window.requiresInterceptor,
@@ -278,6 +278,7 @@ class _WindowFrameState extends State<WindowFrame>
                 ),
             ],
           ),
+        ),
         ),
         ),
         ),

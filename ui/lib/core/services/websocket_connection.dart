@@ -63,7 +63,9 @@ class WebSocketConnection extends ChangeNotifier {
     try {
       _channel = WebSocketChannel.connect(Uri.parse(url));
       _subscription = _channel!.stream.listen(
-        (message) => _messagesController.add(message),
+        (message) {
+          if (!_isDisposed) _messagesController.add(message);
+        },
         onDone: () {
           // Check close code: 1000 = normal closure (e.g., shell exited via Ctrl+D)
           final closeCode = _channel?.closeCode;

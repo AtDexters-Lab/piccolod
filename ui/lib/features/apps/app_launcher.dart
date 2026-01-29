@@ -70,6 +70,7 @@ class AppLauncher {
     required ServiceEndpoint service,
     String? overrideUrl,
     ListenerHealth? healthOverride,
+    String? iconUrl,
   }) {
     // Prefer explicit override (live stream data), then per-listener, then app-level
     final health = healthOverride ?? service.health ?? app.primaryListenerHealth;
@@ -86,6 +87,7 @@ class AppLauncher {
         app: app,
         service: service,
         overrideUrl: overrideUrl,
+        iconUrl: iconUrl,
       );
       return;
     }
@@ -100,6 +102,7 @@ class AppLauncher {
         app: app,
         service: service,
         overrideUrl: overrideUrl,
+        iconUrl: iconUrl,
       );
       return;
     }
@@ -112,6 +115,7 @@ class AppLauncher {
       service: service,
       health: health,
       overrideUrl: overrideUrl,
+      iconUrl: iconUrl,
     );
   }
 
@@ -122,6 +126,7 @@ class AppLauncher {
     required App app,
     required ServiceEndpoint service,
     String? overrideUrl,
+    String? iconUrl,
   }) async {
     // Show a brief loading dialog while we fetch health
     showDialog(
@@ -174,6 +179,7 @@ class AppLauncher {
         service: service,
         health: health,
         overrideUrl: overrideUrl,
+        iconUrl: iconUrl,
       );
     } catch (_) {
       if (navigator.canPop()) navigator.pop();
@@ -204,6 +210,7 @@ class AppLauncher {
     required ServiceEndpoint service,
     required ListenerHealth health,
     String? overrideUrl,
+    String? iconUrl,
   }) {
     // RFC §6.1: ok and degraded are usable — only gate recovering/error
     if (health.isOk || health.isDegraded) {
@@ -213,6 +220,7 @@ class AppLauncher {
         app: app,
         service: service,
         overrideUrl: overrideUrl,
+        iconUrl: iconUrl,
       );
       return;
     }
@@ -251,6 +259,7 @@ class AppLauncher {
     required App app,
     required ServiceEndpoint service,
     String? overrideUrl, // Allow passing a specific URL (e.g. remote vs local)
+    String? iconUrl,
   }) {
     final iframeUrl = _iframeUrl(service, overrideUrl: overrideUrl);
     final browserUrl = _browserUrl(service) ?? iframeUrl;
@@ -275,6 +284,7 @@ class AppLauncher {
       AppWebView(url: iframeUrl),
       initialSize: const Size(1280, 800),
       requiresInterceptor: false,
+      iconUrl: iconUrl,
       actions: [
         IconButton(
           icon: const Icon(Icons.open_in_new, size: 20),
@@ -299,7 +309,9 @@ class AppLauncher {
                   appId: app.name,
                   appService: appService,
                   desktopController: controller,
+                  iconUrl: iconUrl,
                 ),
+                iconUrl: iconUrl,
               );
             }
           },

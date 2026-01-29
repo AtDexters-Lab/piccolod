@@ -5,21 +5,22 @@ import '../../theme/piccolo_theme.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'custom_install_wizard.dart';
 import 'dynamic_install_wizard.dart';
-import 'create_workspace_wizard.dart';
 import 'app_detail_view.dart';
 
 class StoreTab extends StatefulWidget {
   final AppService appService;
   final String searchQuery;
-  final VoidCallback onInstallCustom;
   final DesktopController desktopController;
+
+  // Category filter (managed by parent)
+  final String selectedCategory;
 
   const StoreTab({
     super.key,
     required this.appService,
     required this.searchQuery,
-    required this.onInstallCustom,
     required this.desktopController,
+    required this.selectedCategory,
   });
 
   @override
@@ -33,34 +34,18 @@ class _StoreTabState extends State<StoreTab> {
   int _currentPage = 1;
   int _totalPages = 1;
 
-  List<String> _categories = ['All'];
-  String _selectedCategory = 'All';
-
   @override
   void initState() {
     super.initState();
-    _loadCategories();
     _loadCatalog();
   }
 
   @override
   void didUpdateWidget(StoreTab oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.searchQuery != oldWidget.searchQuery) {
+    if (widget.searchQuery != oldWidget.searchQuery ||
+        widget.selectedCategory != oldWidget.selectedCategory) {
       _loadCatalog(reset: true);
-    }
-  }
-
-  Future<void> _loadCategories() async {
-    try {
-      final cats = await widget.appService.getCategories();
-      if (!mounted) return;
-      setState(() {
-        _categories = ['All', ...cats];
-      });
-    } catch (e) {
-      // Log error but don't block main UI
-      debugPrint("Failed to load categories: $e");
     }
   }
 
@@ -86,7 +71,9 @@ class _StoreTabState extends State<StoreTab> {
         page: pageToFetch,
         pageSize: 20,
         query: widget.searchQuery,
-        category: _selectedCategory == 'All' ? null : _selectedCategory,
+        category: widget.selectedCategory == 'All'
+            ? null
+            : widget.selectedCategory,
       );
       if (!mounted) return;
       setState(() {
@@ -112,14 +99,6 @@ class _StoreTabState extends State<StoreTab> {
         _isLoading = false;
       });
     }
-  }
-
-  void _onCategorySelected(String category) {
-    if (_selectedCategory == category) return;
-    setState(() {
-      _selectedCategory = category;
-    });
-    _loadCatalog(reset: true);
   }
 
   void _loadMore() {
@@ -156,6 +135,8 @@ class _StoreTabState extends State<StoreTab> {
 
     if (!mounted) return;
 
+    final iconUrl = item.icon;
+
     if (schema.isNotEmpty) {
       showDialog(
         context: context,
@@ -167,7 +148,7 @@ class _StoreTabState extends State<StoreTab> {
           schema: schema,
           onSuccess: (appName) {
             Navigator.of(context).pop(); // Close Wizard
-            _openAppDetail(appName);
+            _openAppDetail(appName, iconUrl: iconUrl);
           },
         ),
       );
@@ -180,14 +161,15 @@ class _StoreTabState extends State<StoreTab> {
           initialYaml: yaml!,
           onSuccess: (appName) {
             Navigator.of(context).pop(); // Close Wizard
-            _openAppDetail(appName);
+            _openAppDetail(appName, iconUrl: iconUrl);
           },
         ),
       );
     }
   }
 
-  void _openAppDetail(String appName) {
+  void _openAppDetail(String appName, {String? iconUrl}) {
+    widget.desktopController.notifyAppsChanged();
     widget.desktopController.openApp(
       "app-detail-$appName",
       appName,
@@ -196,75 +178,15 @@ class _StoreTabState extends State<StoreTab> {
         appId: appName,
         appService: widget.appService,
         desktopController: widget.desktopController,
+        iconUrl: iconUrl,
       ),
-    );
-  }
-
-  void _openCreateWorkspace() {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => CreateWorkspaceWizard(
-        appService: widget.appService,
-        onSuccess: () {
-          // Navigation is handled by CreateWorkspaceWizard itself.
-          // This callback is for any refresh/follow-up logic after successful install.
-        },
-      ),
+      iconUrl: iconUrl,
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        // Category Pills and Create Workspace Button
-        Padding(
-          padding: const EdgeInsets.fromLTRB(24, 12, 24, 12),
-          child: Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              FilledButton.icon(
-                onPressed: _openCreateWorkspace,
-                icon: const Icon(Icons.terminal, size: 18),
-                label: const Text('Create Workspace'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: PiccoloTheme.success,
-                  foregroundColor: Colors.white,
-                ),
-              ),
-              for (final cat in _categories)
-                ChoiceChip(
-                  label: Text(cat),
-                  selected: cat == _selectedCategory,
-                  showCheckmark: false,
-                  onSelected: (_) => _onCategorySelected(cat),
-                  selectedColor: PiccoloTheme.cobalt600,
-                  labelStyle: TextStyle(
-                    color: cat == _selectedCategory
-                        ? Colors.white
-                        : PiccoloTheme.ink,
-                    fontWeight: cat == _selectedCategory
-                        ? FontWeight.bold
-                        : FontWeight.normal,
-                  ),
-                  backgroundColor: PiccoloTheme.porcelain,
-                  side: BorderSide.none,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                ),
-            ],
-          ),
-        ),
-
-        // Content
-        Expanded(child: _buildContent()),
-      ],
-    );
+    return _buildContent();
   }
 
   Widget _buildContent() {

@@ -86,6 +86,7 @@ class HealthStreamClient extends ChangeNotifier {
   }
 
   void _handleMessage(dynamic message) {
+    if (_isDisposed) return;
     if (message is! String) return;
     try {
       final decoded = jsonDecode(message);
@@ -98,7 +99,9 @@ class HealthStreamClient extends ChangeNotifier {
       final payload = decoded['payload'];
       if (payload is! Map<String, dynamic>) return;
 
-      _eventsController.add(ListenerHealthEvent.fromJson(payload));
+      if (!_isDisposed) {
+        _eventsController.add(ListenerHealthEvent.fromJson(payload));
+      }
     } catch (e) {
       debugPrint('Health stream decode error: $e');
     }

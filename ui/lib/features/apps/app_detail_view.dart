@@ -11,6 +11,7 @@ import '../../core/utils/task_id.dart';
 import '../../shared/widgets/health_badge.dart';
 import '../../shared/widgets/log_stream_viewer.dart';
 import '../../shared/widgets/task_progress_panel.dart';
+import '../../shared/widgets/uninstall_confirmation_dialog.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'app_launcher.dart';
 import 'widgets/edit_listeners_dialog.dart';
@@ -18,15 +19,24 @@ import 'widgets/health_banner.dart';
 import 'workspace_terminal.dart';
 
 class AppDetailView extends StatefulWidget {
+  static const int tabOverview = 0;
+  static const int tabNetwork = 1;
+  static const int tabConfiguration = 2;
+  static const int tabLogs = 3;
+
   final String appId;
   final AppService appService;
   final DesktopController desktopController;
+  final int initialTab;
+  final String? iconUrl;
 
   const AppDetailView({
     super.key,
     required this.appId,
     required this.appService,
     required this.desktopController,
+    this.initialTab = 0,
+    this.iconUrl,
   });
 
   @override
@@ -55,7 +65,11 @@ class _AppDetailViewState extends State<AppDetailView>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
+    _tabController = TabController(
+      length: 4,
+      vsync: this,
+      initialIndex: widget.initialTab.clamp(0, 3),
+    );
     _loadData();
     _connectHealthStream();
   }
@@ -171,89 +185,38 @@ class _AppDetailViewState extends State<AppDetailView>
       return false;
     }
 
+    // Notify other widgets (e.g., Stage) that app state changed
+    widget.desktopController.notifyAppsChanged();
+
     if (!refreshOnSuccess || !mounted) return true;
     await _loadData();
     return true;
   }
 
-  void _confirmUninstall() {
-    bool purgeData = false;
+  void _confirmUninstall() async {
+    final result = await UninstallConfirmationDialog.show(
+      context,
+      appDisplayTitle: _app?.displayTitle ?? widget.appId,
+    );
 
-    showDialog(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) {
-          return AlertDialog(
-            title: Text("Uninstall ${_app?.displayTitle}?"),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text("This will remove the application container."),
-                const SizedBox(height: 16),
-                Container(
-                  decoration: BoxDecoration(
-                    color: PiccoloTheme.critical.withValues(alpha: 0.1),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: PiccoloTheme.critical.withValues(alpha: 0.3),
-                    ),
-                  ),
-                  child: CheckboxListTile(
-                    title: const Text(
-                      "Delete Data Volumes",
-                      style: TextStyle(
-                        color: PiccoloTheme.critical,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    subtitle: const Text("This action cannot be undone."),
-                    value: purgeData,
-                    activeColor: PiccoloTheme.critical,
-                    onChanged: (val) =>
-                        setDialogState(() => purgeData = val ?? false),
-                    controlAffinity: ListTileControlAffinity.leading,
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 8),
-                  ),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(),
-                child: const Text("Cancel"),
-              ),
-              FilledButton(
-                style: FilledButton.styleFrom(
-                  backgroundColor: PiccoloTheme.critical,
-                ),
-                onPressed: () async {
-                  Navigator.of(dialogContext).pop(); // Close dialog
+    if (result == null || !result.confirmed) return;
 
-                  final ok = await _handleActionWithProgress(
-                    taskType: 'uninstall_app',
-                    refreshOnSuccess: false,
-                    action: (taskId) => widget.appService.uninstallApp(
-                      widget.appId,
-                      purge: purgeData,
-                      taskId: taskId,
-                    ),
-                  );
-                  if (!ok || !mounted) return;
-                  setState(() {
-                    _app = null;
-                    _listeners = [];
-                    _containers = [];
-                    _selectedService = null;
-                  });
-                },
-                child: const Text("Uninstall"),
-              ),
-            ],
-          );
-        },
+    final ok = await _handleActionWithProgress(
+      taskType: 'uninstall_app',
+      refreshOnSuccess: false,
+      action: (taskId) => widget.appService.uninstallApp(
+        widget.appId,
+        purge: result.purgeData,
+        taskId: taskId,
       ),
     );
+    if (!ok || !mounted) return;
+    setState(() {
+      _app = null;
+      _listeners = [];
+      _containers = [];
+      _selectedService = null;
+    });
   }
 
   void _showEditListenersDialog() {
@@ -376,14 +339,36 @@ class _AppDetailViewState extends State<AppDetailView>
               borderRadius: BorderRadius.circular(16),
             ),
             child: Center(
-              child: Text(
-                _app!.displayTitle[0].toUpperCase(),
-                style: const TextStyle(
-                  fontSize: 32,
-                  fontWeight: FontWeight.bold,
-                  color: PiccoloTheme.cobalt600,
-                ),
-              ),
+              child: widget.iconUrl != null && widget.iconUrl!.isNotEmpty
+                  ? ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: Image.network(
+                        widget.iconUrl!,
+                        width: 64,
+                        height: 64,
+                        fit: BoxFit.cover,
+                        errorBuilder: (context, error, stackTrace) => Text(
+                          _app!.displayTitle.isNotEmpty
+                              ? _app!.displayTitle[0].toUpperCase()
+                              : '?',
+                          style: const TextStyle(
+                            fontSize: 32,
+                            fontWeight: FontWeight.bold,
+                            color: PiccoloTheme.cobalt600,
+                          ),
+                        ),
+                      ),
+                    )
+                  : Text(
+                      _app!.displayTitle.isNotEmpty
+                          ? _app!.displayTitle[0].toUpperCase()
+                          : '?',
+                      style: const TextStyle(
+                        fontSize: 32,
+                        fontWeight: FontWeight.bold,
+                        color: PiccoloTheme.cobalt600,
+                      ),
+                    ),
             ),
           ),
           const SizedBox(width: 24),
