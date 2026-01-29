@@ -492,69 +492,86 @@ func (m *AppManager) StopAllApps(ctx context.Context) error {
 		return nil
 	}
 
-	// Filter to only running/starting apps
+	// Separate running apps (need container stop) from stopped apps (only need volume detach)
 	var runningApps []*AppInstance
+	var stoppedApps []*AppInstance
 	for _, app := range apps {
 		if app.Status == "running" || app.Status == "starting" {
 			runningApps = append(runningApps, app)
 		} else {
-			log.Printf("DEBUG: Skipping %s (status: %s)", app.InstanceID, app.Status)
+			stoppedApps = append(stoppedApps, app)
 		}
 	}
 
-	if len(runningApps) == 0 {
-		log.Printf("INFO: No running apps to stop")
+	if len(runningApps) == 0 && len(stoppedApps) == 0 {
+		log.Printf("INFO: No apps to process")
 		return nil
 	}
 
-	log.Printf("INFO: Stopping %d running apps in parallel...", len(runningApps))
-
-	// Stop apps in parallel with a concurrency limit of 4
-	const maxConcurrency = 4
-	sem := make(chan struct{}, maxConcurrency)
-	var wg sync.WaitGroup
-	var errMu sync.Mutex
 	var errs []error
 
-	for i, app := range runningApps {
-		wg.Add(1)
-		go func(idx int, appInst *AppInstance) {
-			defer wg.Done()
+	// Stop running apps in parallel with a concurrency limit of 4
+	if len(runningApps) > 0 {
+		log.Printf("INFO: Stopping %d running apps in parallel...", len(runningApps))
 
-			// Acquire semaphore
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				errMu.Lock()
-				errs = append(errs, fmt.Errorf("app %s: context cancelled before stop", appInst.InstanceID))
-				errMu.Unlock()
-				return
-			}
+		const maxConcurrency = 4
+		sem := make(chan struct{}, maxConcurrency)
+		var wg sync.WaitGroup
+		var errMu sync.Mutex
 
-			log.Printf("INFO: [%d/%d] Stopping app %s...", idx+1, len(runningApps), appInst.InstanceID)
+		for i, app := range runningApps {
+			wg.Add(1)
+			go func(idx int, appInst *AppInstance) {
+				defer wg.Done()
 
-			// Stop container group for this app
-			if err := m.stopAppForShutdown(ctx, appInst.InstanceID); err != nil {
-				log.Printf("WARN: Failed to stop app %s: %v", appInst.InstanceID, err)
-				errMu.Lock()
-				errs = append(errs, fmt.Errorf("stop %s: %w", appInst.InstanceID, err))
-				errMu.Unlock()
-			}
+				// Acquire semaphore
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-ctx.Done():
+					errMu.Lock()
+					errs = append(errs, fmt.Errorf("app %s: context cancelled before stop", appInst.InstanceID))
+					errMu.Unlock()
+					return
+				}
 
-			// Detach the app's encrypted volume
-			if err := m.detachAppVolume(ctx, appInst.InstanceID); err != nil {
-				log.Printf("WARN: Failed to detach volume for %s: %v", appInst.InstanceID, err)
-				errMu.Lock()
-				errs = append(errs, fmt.Errorf("detach %s: %w", appInst.InstanceID, err))
-				errMu.Unlock()
-			}
+				log.Printf("INFO: [%d/%d] Stopping app %s...", idx+1, len(runningApps), appInst.InstanceID)
 
-			log.Printf("INFO: [%d/%d] Stopped app %s", idx+1, len(runningApps), appInst.InstanceID)
-		}(i, app)
+				// Stop container group for this app
+				if err := m.stopAppForShutdown(ctx, appInst.InstanceID); err != nil {
+					log.Printf("WARN: Failed to stop app %s: %v", appInst.InstanceID, err)
+					errMu.Lock()
+					errs = append(errs, fmt.Errorf("stop %s: %w", appInst.InstanceID, err))
+					errMu.Unlock()
+				}
+
+				// Detach the app's encrypted volume
+				if err := m.detachAppVolume(ctx, appInst.InstanceID); err != nil {
+					log.Printf("WARN: Failed to detach volume for %s: %v", appInst.InstanceID, err)
+					errMu.Lock()
+					errs = append(errs, fmt.Errorf("detach %s: %w", appInst.InstanceID, err))
+					errMu.Unlock()
+				}
+
+				log.Printf("INFO: [%d/%d] Stopped app %s", idx+1, len(runningApps), appInst.InstanceID)
+			}(i, app)
+		}
+
+		wg.Wait()
+		log.Printf("INFO: Finished stopping running apps")
 	}
 
-	wg.Wait()
+	// Detach volumes for stopped apps (they may still have mounted volumes from earlier)
+	if len(stoppedApps) > 0 {
+		log.Printf("INFO: Detaching volumes for %d stopped apps...", len(stoppedApps))
+		for _, app := range stoppedApps {
+			if err := m.detachAppVolume(ctx, app.InstanceID); err != nil {
+				log.Printf("DEBUG: Volume detach for stopped app %s: %v", app.InstanceID, err)
+				// Don't treat as error - volume may already be detached
+			}
+		}
+	}
+
 	log.Printf("INFO: Finished stopping all apps")
 
 	if len(errs) > 0 {
@@ -596,7 +613,9 @@ func (m *AppManager) stopAppForShutdown(ctx context.Context, instanceID string) 
 		return err
 	}
 
-	return m.stopContainerGroup(ctx, stateMgr, app, def, layout, runtime)
+	return m.stopContainerGroupWithOpts(ctx, stateMgr, app, def, layout, runtime, stopContainerGroupOpts{
+		ShutdownMode: true,
+	})
 }
 
 // detachAppVolume detaches (unmounts) an app's encrypted volume.

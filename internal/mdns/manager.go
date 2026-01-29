@@ -178,14 +178,18 @@ func (m *Manager) Stop() error {
 		// Stop service endpoint observer first
 		m.StopServiceEndpointsObserver()
 
+		// Mark as stopped BEFORE sending goodbyes so that any interface failures
+		// during goodbye sending don't trigger resilience tracking (backoff, retries).
+		// This is important because container interfaces (veth) may already be gone.
+		m.stopped.Store(true)
+		close(m.stopCh)
+
 		if m.started.Load() {
 			// Send goodbye for host records
 			m.sendMultiInterfaceAnnouncementsWithTTL(0)
 			// Send goodbye for service records
 			m.sendServiceAnnouncementWithTTL(0)
 		}
-		close(m.stopCh)
-		m.stopped.Store(true)
 	})
 
 	// Close all interface connections

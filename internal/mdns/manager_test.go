@@ -381,7 +381,7 @@ func TestGoroutineDeadlockRegression(t *testing.T) {
 	// Timeout test - should not hang
 	select {
 	case <-done:
-		t.Log("✅ Manager stopped cleanly - no deadlock")
+		t.Log("Manager stopped cleanly - no deadlock")
 	case <-time.After(5 * time.Second):
 		t.Error("REGRESSION: Manager.Stop() hung - deadlock detected!")
 	}

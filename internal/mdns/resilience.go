@@ -88,6 +88,10 @@ func (m *Manager) isInterfaceInBackoff(state *InterfaceState) bool {
 
 // markInterfaceFailure records a failure and updates resilience tracking
 func (m *Manager) markInterfaceFailure(state *InterfaceState, err error) {
+	// Skip resilience tracking during shutdown - interfaces may be gone
+	if m.stopped.Load() {
+		return
+	}
 	now := time.Now()
 
 	atomic.AddUint64(&state.FailureCount, 1)

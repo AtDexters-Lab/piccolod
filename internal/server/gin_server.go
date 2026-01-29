@@ -1488,12 +1488,15 @@ func (s *GinServer) restartOIDCApps() {
 	var oidcApps []string
 	for _, a := range apps {
 		if a.Definition != nil && appDeclaresOIDCClient(a.Definition) {
-			oidcApps = append(oidcApps, a.InstanceID)
+			// Only restart apps that were running - don't start stopped apps
+			if a.Status == "running" || a.Status == "starting" {
+				oidcApps = append(oidcApps, a.InstanceID)
+			}
 		}
 	}
 
 	if len(oidcApps) == 0 {
-		log.Printf("INFO: no OIDC apps to restart")
+		log.Printf("INFO: no running OIDC apps to restart")
 		return
 	}
 

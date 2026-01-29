@@ -494,16 +494,10 @@ func (f *fileVolumeManager) Detach(ctx context.Context, handle VolumeHandle) err
 		f.mu.Unlock()
 		return f.recordVolumeState(handle.ID, volumeStateUnmounted, volumeStateUnmounted, role, nil)
 	}
-	if err := f.fusermountDetach(ctx, handle); err != nil {
-		return err
-	}
-
-	// Clean the mount directory after unmount.
-	// Any remaining files are orphaned (were inside the encrypted volume) and
-	// must be removed so gocryptfs can mount again (requires empty directory).
-	cleanAndReprotectMountDir(handle.ID, handle.MountDir)
-
-	return nil
+	// Use retry logic to handle cases where container cleanup (fuse-overlayfs unmount)
+	// is still in progress after container stop. This is especially important during
+	// graceful shutdown where podman stop returns before container storage is fully released.
+	return f.detachWithRetry(ctx, handle)
 }
 
 // fusermountDetach performs the fusermount unmount, state recording, and process

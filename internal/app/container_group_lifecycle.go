@@ -128,9 +128,22 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 	return nil
 }
 
+// stopContainerGroupOpts contains options for stopping a container group.
+type stopContainerGroupOpts struct {
+	// ShutdownMode indicates this is a graceful shutdown operation.
+	// When true, status update failures are logged but don't cause the stop to fail,
+	// since the control volume may become unavailable during shutdown.
+	ShutdownMode bool
+}
+
 // stopContainerGroup stops a container group (network anchor + service containers).
 // This is the unified stop path for both service and workspace modes.
 func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
+	return m.stopContainerGroupWithOpts(ctx, state, appInst, def, layout, runtime, stopContainerGroupOpts{})
+}
+
+// stopContainerGroupWithOpts stops a container group with configurable options.
+func (m *AppManager) stopContainerGroupWithOpts(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, opts stopContainerGroupOpts) error {
 	if appInst == nil || def == nil {
 		return fmt.Errorf("stop: app definition required")
 	}
@@ -194,8 +207,15 @@ func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemSt
 		}
 	}
 
-	if err := m.updateStatusWithEvent(state, appInst.InstanceID, "stopped"); err != nil {
-		return fmt.Errorf("failed to update app status: %w", err)
+	// During graceful shutdown, don't update status to "stopped" - preserve the current
+	// status so apps that were running will auto-start on service restart.
+	// For explicit user-initiated stops, update status normally.
+	if !opts.ShutdownMode {
+		if err := m.updateStatusWithEvent(state, appInst.InstanceID, "stopped"); err != nil {
+			return fmt.Errorf("failed to update app status: %w", err)
+		}
+	} else {
+		log.Printf("DEBUG: stop %s: preserving status for auto-restart on service resume", appInst.InstanceID)
 	}
 	if m.serviceManager != nil {
 		m.serviceManager.RemoveApp(appInst.InstanceID)
