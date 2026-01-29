@@ -6,7 +6,6 @@ import '../../theme/piccolo_theme.dart';
 import '../../core/models/app_models.dart';
 import '../../core/models/listener_health.dart';
 import '../../core/services/app_service.dart';
-import '../../core/services/health_stream_client.dart';
 import '../../core/utils/task_id.dart';
 import '../../shared/widgets/health_badge.dart';
 import '../../shared/widgets/log_stream_viewer.dart';
@@ -57,8 +56,7 @@ class _AppDetailViewState extends State<AppDetailView>
   // Action states
   bool _isActionLoading = false;
 
-  // Health stream
-  HealthStreamClient? _healthStream;
+  // Health stream (via unified EventStreamClient)
   StreamSubscription<ListenerHealthEvent>? _healthSub;
   ListenerHealth? _primaryHealth;
 
@@ -77,9 +75,13 @@ class _AppDetailViewState extends State<AppDetailView>
   String? _primaryListenerName;
 
   void _connectHealthStream() {
-    _healthStream = HealthStreamClient(app: widget.appId);
-    _healthSub = _healthStream!.events.listen((event) {
+    final client = widget.desktopController.eventStreamClient;
+    if (client == null) return;
+
+    _healthSub = client.healthEvents.listen((event) {
       if (!mounted) return;
+      // Only process events for this specific app
+      if (event.app != widget.appId) return;
       // Only update primary health from the primary listener's events
       if (_primaryListenerName != null &&
           event.listener != _primaryListenerName) {
@@ -89,13 +91,11 @@ class _AppDetailViewState extends State<AppDetailView>
         _primaryHealth = event.health;
       });
     });
-    _healthStream!.connect();
   }
 
   @override
   void dispose() {
     _healthSub?.cancel();
-    _healthStream?.dispose();
     _tabController.dispose();
     super.dispose();
   }
@@ -277,6 +277,10 @@ class _AppDetailViewState extends State<AppDetailView>
         // Header
         _buildHeader(),
 
+        // Starting status banner
+        if (_app!.isStarting)
+          _buildStartingBanner(),
+
         // Health banner
         if (_primaryHealth != null && !_primaryHealth!.isOk)
           AppDetailHealthBanner(
@@ -322,6 +326,7 @@ class _AppDetailViewState extends State<AppDetailView>
   Widget _buildHeader() {
     Color statusColor = PiccoloTheme.inkMuted;
     if (_app!.isRunning) statusColor = PiccoloTheme.success;
+    if (_app!.isStarting) statusColor = PiccoloTheme.warning;
     if (_app!.isError) statusColor = PiccoloTheme.critical;
 
     return Container(
@@ -805,6 +810,47 @@ class _AppDetailViewState extends State<AppDetailView>
               .toList(),
           onChanged: (value) => setState(() => _selectedService = value),
         ),
+      ),
+    );
+  }
+
+  Widget _buildStartingBanner() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      color: PiccoloTheme.warning.withValues(alpha: 0.1),
+      child: Row(
+        children: [
+          Icon(
+            Icons.hourglass_empty,
+            color: PiccoloTheme.warning,
+            size: 20,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'App is starting...',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  'The app is initializing. Check logs if startup takes too long.',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: PiccoloTheme.inkMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          TextButton.icon(
+            onPressed: () => _tabController.animateTo(AppDetailView.tabLogs),
+            icon: const Icon(Icons.article_outlined, size: 16),
+            label: const Text('View Logs'),
+          ),
+        ],
       ),
     );
   }

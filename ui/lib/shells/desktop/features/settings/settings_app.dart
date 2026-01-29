@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../../core/services/event_stream_client.dart';
 import '../../../../theme/piccolo_theme.dart';
 import 'settings_controller.dart';
 import 'tabs/profile_tab.dart';
@@ -8,8 +9,9 @@ import 'tabs/users/users_tab.dart';
 
 class SettingsApp extends StatefulWidget {
   final VoidCallback? onLogout;
+  final EventStreamClient? eventStreamClient;
 
-  const SettingsApp({super.key, this.onLogout});
+  const SettingsApp({super.key, this.onLogout, this.eventStreamClient});
 
   @override
   State<SettingsApp> createState() => _SettingsAppState();
@@ -150,7 +152,7 @@ class _SettingsAppState extends State<SettingsApp> {
           onLogout: widget.onLogout,
         );
       case 1:
-        return const RemoteTab();
+        return RemoteTab(eventStreamClient: widget.eventStreamClient);
       case 2:
         return const UsersTab();
       case 3:

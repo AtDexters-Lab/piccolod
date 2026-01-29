@@ -12,6 +12,59 @@ import (
 	"piccolod/internal/container"
 )
 
+// Startup failure escalation thresholds (RFC 20260125)
+// After these thresholds, status escalates from "starting" to "error".
+const (
+	startupEscalateAfterAttempts = 5
+	startupEscalateAfterDuration = 10 * time.Minute
+)
+
+// shouldEscalateToError checks if startup failures have exceeded escalation thresholds.
+func shouldEscalateToError(app *AppInstance) bool {
+	if app.StartupAttempts >= startupEscalateAfterAttempts {
+		return true
+	}
+	if app.FirstStartupFailureAt != nil &&
+		time.Since(*app.FirstStartupFailureAt) >= startupEscalateAfterDuration {
+		return true
+	}
+	return false
+}
+
+// recordStartupFailure increments the startup attempt counter and sets first failure time.
+// Returns the appropriate status ("starting" or "error" if escalated).
+func recordStartupFailure(app *AppInstance) string {
+	app.StartupAttempts++
+	if app.FirstStartupFailureAt == nil {
+		now := time.Now()
+		app.FirstStartupFailureAt = &now
+	}
+
+	if shouldEscalateToError(app) {
+		return "error"
+	}
+	return "starting"
+}
+
+// resetStartupTracking clears startup failure tracking on successful start.
+func resetStartupTracking(app *AppInstance) {
+	app.StartupAttempts = 0
+	app.FirstStartupFailureAt = nil
+}
+
+// handleStartupFailure records a startup failure, persists state, and emits the appropriate status event.
+// Returns the computed status ("starting" or "error" if escalated).
+func (m *AppManager) handleStartupFailure(state *FilesystemStateManager, appInst *AppInstance) string {
+	status := recordStartupFailure(appInst)
+	if err := state.StoreApp(appInst, nil); err != nil {
+		log.Printf("WARN: handleStartupFailure %s: failed to persist state: %v", appInst.InstanceID, err)
+	}
+	if err := m.updateStatusWithEvent(state, appInst.InstanceID, status); err != nil {
+		log.Printf("WARN: handleStartupFailure %s: failed to emit status event: %v", appInst.InstanceID, err)
+	}
+	return status
+}
+
 // reconcileContainerGroup reconciles a container group (network anchor + service containers).
 // This is the unified reconcile path for both service and workspace modes.
 func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, desiredRunning bool) error {
@@ -20,6 +73,14 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	}
 	if appInst == nil || def == nil || def.Services == nil {
 		return fmt.Errorf("reconcile: invalid container group app state")
+	}
+
+	// Emit "starting" status if we're about to start containers (RFC 20260125).
+	// This ensures UI shows the "Starting..." banner during reconciliation-triggered starts.
+	if desiredRunning && appInst.Status != "running" && appInst.Status != "starting" {
+		if err := m.updateStatusWithEvent(state, appInst.InstanceID, "starting"); err != nil {
+			log.Printf("WARN: reconcile %s: failed to persist starting status: %v", appInst.InstanceID, err)
+		}
 	}
 
 	mode := piccoloModeFromExtensions(def.Extensions)
@@ -102,7 +163,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	// Ensure anchor running.
 	if !anchorState.Running {
 		if err := m.containerManager.StartContainer(ctx, runtime, anchorID); err != nil {
-			_ = state.UpdateAppStatus(appInst.InstanceID, "error")
+			m.handleStartupFailure(state, appInst)
 			return fmt.Errorf("failed to start network anchor: %w", err)
 		}
 	}
@@ -160,12 +221,12 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				opts.workspaceMeta = workspaceInfo.meta
 			} else if mode == ModeWorkspace {
 				// Workspace mode requires valid mount info for container recreation
-				_ = state.UpdateAppStatus(appInst.InstanceID, "error")
+				m.handleStartupFailure(state, appInst)
 				return fmt.Errorf("workspace mount info unavailable for service '%s' recreation", svcName)
 			}
 			newCID, err := m.createAndStartServiceContainer(ctx, runtime, opts)
 			if err != nil {
-				_ = state.UpdateAppStatus(appInst.InstanceID, "error")
+				m.handleStartupFailure(state, appInst)
 				return err
 			}
 			if appInst.Containers == nil {
@@ -178,14 +239,22 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 		if !st.Running {
 			if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
-				_ = state.UpdateAppStatus(appInst.InstanceID, "error")
+				m.handleStartupFailure(state, appInst)
 				return fmt.Errorf("failed to start service '%s': %w", svcName, err)
 			}
 		}
 	}
 
 	if appInst.Status != "running" {
-		_ = state.UpdateAppStatus(appInst.InstanceID, "running")
+		// Reset startup failure tracking and update status in a single persistence operation.
+		prevStatus := appInst.Status
+		resetStartupTracking(appInst)
+		appInst.Status = "running"
+		appInst.UpdatedAt = time.Now()
+		if err := state.StoreApp(appInst, nil); err != nil {
+			log.Printf("WARN: reconcile %s: failed to persist running status: %v", appInst.InstanceID, err)
+		}
+		m.publishAppStatusChanged(appInst.InstanceID, "running", prevStatus)
 	}
 
 	// Restore endpoints/proxies and ensure published ports match our expected allocations.

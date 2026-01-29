@@ -25,6 +25,9 @@ const (
 	// Certificate and listener health events (RFC 20260125)
 	TopicCertificateChanged    Topic = "certificate_changed"     // Emitted by remote manager on cert status change
 	TopicListenerHealthChanged Topic = "listener_health_changed" // Emitted by health aggregator on health change
+
+	// App status events
+	TopicAppStatusChanged Topic = "app_status_changed" // Emitted by app manager on status change
 )
 
 // Event represents a message broadcast on the event bus.
@@ -117,9 +120,18 @@ type ListenerHealth struct {
 
 // CertHealthStatus tracks individual certificate health for events.
 type CertHealthStatus struct {
-	Status      string     `json:"status"`                   // ok, recovering, error
-	ReasonCode  string     `json:"reason_code"`              // e.g., "cert_pending", "cert_dns_error"
+	Status      string     `json:"status"`                 // ok, recovering, error
+	ReasonCode  string     `json:"reason_code"`            // e.g., "cert_pending", "cert_dns_error"
 	RecoveryETA *time.Time `json:"recovery_eta,omitempty"`
+}
+
+// AppStatusChangedEvent is emitted when an app's status changes.
+// Status values: installed, uninstalled, running, stopped, error, starting
+type AppStatusChangedEvent struct {
+	App        string    `json:"app"`
+	Status     string    `json:"status"`
+	PrevStatus string    `json:"prev_status,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 // Bus is a simple pub/sub dispatcher for intra-process events.

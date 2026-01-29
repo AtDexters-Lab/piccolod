@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'models/desktop_window.dart';
 import '../../core/services/api_client.dart';
 import '../../core/services/app_service.dart';
+import '../../core/services/event_stream_client.dart';
 import '../../features/apps/app_store_window.dart';
 
 /// Manages the state of the Desktop Shell.
@@ -26,6 +27,10 @@ class DesktopController extends ChangeNotifier {
 
   // App Service for accessing installed apps
   late final AppService appService;
+
+  // Unified event stream client
+  EventStreamClient? _eventStreamClient;
+  EventStreamClient? get eventStreamClient => _eventStreamClient;
 
   // Callbacks for app lifecycle changes (install, uninstall, start, stop)
   final List<VoidCallback> _appChangeListeners = [];
@@ -89,15 +94,32 @@ class DesktopController extends ChangeNotifier {
       _needsSetup = true;
     } finally {
       _isInitializing = false;
-      notifyListeners();
+      // If already authenticated (returning user with valid session), transition to authenticated state
+      if (!_needsSetup) {
+        _onAuthenticated(isFirstSetup: false);
+      } else {
+        notifyListeners();
+      }
     }
   }
 
-  void completeSetup(bool isFirstSetupFlow) async {
+  /// Called from SetupWizard when login/setup completes.
+  void completeSetup(bool isFirstSetupFlow) {
+    _onAuthenticated(isFirstSetup: isFirstSetupFlow);
+  }
+
+  /// Single source of truth for "user is now authenticated" state transition.
+  /// Handles event stream connection and optional first-setup welcome.
+  void _onAuthenticated({required bool isFirstSetup}) {
     _needsSetup = false;
+
+    // Connect event stream
+    _eventStreamClient ??= EventStreamClient();
+    _eventStreamClient!.connect();
+
     notifyListeners();
 
-    if (isFirstSetupFlow) {
+    if (isFirstSetup) {
       // Open a welcome window only after first device setup.
       openApp(
         "welcome",
@@ -128,6 +150,12 @@ class DesktopController extends ChangeNotifier {
     } catch (e) {
       debugPrint("Logout failed: $e");
     }
+
+    // Disconnect event stream
+    _eventStreamClient?.disconnect();
+    _eventStreamClient?.dispose();
+    _eventStreamClient = null;
+
     // Force UI back to SetupWizard (which will detect unauthenticated state and show Login)
     _needsSetup = true;
     _windows.clear(); // Clean up windows
@@ -386,5 +414,12 @@ class DesktopController extends ChangeNotifier {
 
     window.size = Size(w, h);
     notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _eventStreamClient?.dispose();
+    _eventStreamClient = null;
+    super.dispose();
   }
 }

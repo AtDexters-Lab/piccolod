@@ -1,18 +1,27 @@
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/services/event_stream_client.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'remote_controller.dart';
 import 'widgets/remote_dashboard.dart';
 import 'widgets/remote_setup_wizard.dart';
 
 class RemoteTab extends StatefulWidget {
-  const RemoteTab({super.key});
+  final EventStreamClient? eventStreamClient;
+
+  const RemoteTab({super.key, this.eventStreamClient});
 
   @override
   State<RemoteTab> createState() => _RemoteTabState();
 }
 
 class _RemoteTabState extends State<RemoteTab> {
-  final RemoteController _controller = RemoteController();
+  late final RemoteController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = RemoteController(eventStreamClient: widget.eventStreamClient);
+  }
 
   @override
   void dispose() {

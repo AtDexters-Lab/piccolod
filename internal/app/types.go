@@ -58,6 +58,12 @@ type AppInstance struct {
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
 	Definition      *api.AppDefinition `json:"definition,omitempty"`
+
+	// Startup failure tracking for escalation (RFC 20260125)
+	// After StartupEscalateAfterAttempts consecutive failures OR StartupEscalateAfterDuration,
+	// status escalates from "starting" to "error".
+	StartupAttempts       int        `json:"startup_attempts,omitempty"`
+	FirstStartupFailureAt *time.Time `json:"first_startup_failure_at,omitempty"`
 }
 
 // Helper methods to access commonly used Definition fields safely

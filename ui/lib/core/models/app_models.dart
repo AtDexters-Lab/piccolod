@@ -1,3 +1,4 @@
+import 'app_status_event.dart';
 import 'listener_health.dart';
 
 class App {
@@ -127,10 +128,12 @@ class App {
     );
   }
 
-  bool get isRunning => status.toLowerCase() == 'running';
+  bool get isRunning => status.toLowerCase() == AppStatusEvent.statusRunning;
   bool get isStopped =>
-      status.toLowerCase() == 'stopped' || status.toLowerCase() == 'created';
-  bool get isError => status.toLowerCase() == 'error';
+      status.toLowerCase() == AppStatusEvent.statusStopped ||
+      status.toLowerCase() == 'created';
+  bool get isError => status.toLowerCase() == AppStatusEvent.statusError;
+  bool get isStarting => status.toLowerCase() == AppStatusEvent.statusStarting;
   bool get isWorkspace => mode.toLowerCase() == 'workspace';
 
   Map<String, String> environmentForService(String? serviceName) {
@@ -153,6 +156,25 @@ class App {
     if (displayName.isNotEmpty) return displayName;
     if (appName.isNotEmpty) return appName;
     return name;
+  }
+
+  /// Returns a copy of this App with a new status value.
+  App copyWithStatus(String newStatus) {
+    return App(
+      id: id,
+      name: name,
+      appName: appName,
+      displayName: displayName,
+      image: image,
+      type: type,
+      mode: mode,
+      status: newStatus,
+      volumes: volumes,
+      environment: environment,
+      containerId: containerId,
+      definition: definition,
+      primaryListenerHealth: primaryListenerHealth,
+    );
   }
 }
 

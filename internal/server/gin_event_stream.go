@@ -1,0 +1,345 @@
+package server
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"piccolod/internal/events"
+	"piccolod/internal/services"
+)
+
+// Supported event stream topics
+const (
+	topicAppStatus      = "app_status"
+	topicListenerHealth = "listener_health"
+	topicRemoteConfig   = "remote_config"
+	topicCertificate    = "certificate"
+)
+
+var supportedTopics = map[string]events.Topic{
+	topicAppStatus:      events.TopicAppStatusChanged,
+	topicListenerHealth: events.TopicListenerHealthChanged,
+	topicRemoteConfig:   events.TopicRemoteConfigChanged,
+	topicCertificate:    events.TopicCertificateChanged,
+}
+
+type streamMessage struct {
+	Type    string `json:"type"`
+	Payload any    `json:"payload,omitempty"`
+}
+
+// handleGinEventStream streams multiple event types via a single WebSocket connection.
+// Clients can subscribe to specific topics or receive all events.
+//
+// Query parameters:
+//   - topics: (optional) comma-separated list of topics to subscribe to.
+//     Supported: app_status, listener_health, remote_config, certificate
+//     If omitted, subscribes to all topics.
+//
+// WebSocket message format:
+//
+//	{ "type": "app_status", "payload": AppStatusChangedEvent }
+//	{ "type": "listener_health", "payload": ListenerHealthEvent }
+//	{ "type": "remote_config", "payload": remote.Status }
+//	{ "type": "certificate", "payload": CertificateChangedEvent }
+//	{ "type": "keepalive" }
+//
+// On connect, sends initial snapshot for subscribed topics.
+// Access control: standard users only receive events for their allowed apps.
+func (s *GinServer) handleGinEventStream(c *gin.Context) {
+	// Parse topics query param
+	topicsParam := strings.TrimSpace(c.Query("topics"))
+	requestedTopics := make(map[string]bool)
+
+	if topicsParam == "" {
+		// Subscribe to all supported topics
+		for topic := range supportedTopics {
+			requestedTopics[topic] = true
+		}
+	} else {
+		// Parse comma-separated topics
+		for _, t := range strings.Split(topicsParam, ",") {
+			t = strings.TrimSpace(t)
+			if _, ok := supportedTopics[t]; ok {
+				requestedTopics[t] = true
+			}
+			// Ignore unknown topics (per reviewer suggestion: log warning)
+		}
+		if len(requestedTopics) == 0 {
+			writeGinError(c, http.StatusBadRequest, "No valid topics specified")
+			return
+		}
+	}
+
+	// Validate session BEFORE WebSocket upgrade (so we can return proper HTTP errors)
+	sess := s.getSessionFromContext(c)
+	if sess == nil {
+		// Session should always exist after requireSession middleware.
+		// If nil, abort as defense-in-depth (don't default to privileged access).
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "session required"})
+		return
+	}
+	isAdmin := sess.Role == "admin"
+
+	conn, err := wsupgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+
+	wsSendMu := sync.Mutex{}
+	sendJSON := func(v any) error {
+		wsSendMu.Lock()
+		defer wsSendMu.Unlock()
+		return conn.WriteJSON(v)
+	}
+
+	// Build access control helper for non-admin users
+	isAppAllowed := func(appID string) bool {
+		if isAdmin {
+			return true
+		}
+		if s.userManager == nil {
+			return false
+		}
+		allowed, _ := s.userManager.IsAppAllowed(c.Request.Context(), sess.UserID, appID)
+		return allowed
+	}
+
+	// Subscribe to event bus topics BEFORE sending initial snapshot
+	// This ensures no events are missed during snapshot collection
+	type subscription struct {
+		topic  string
+		ch     <-chan events.Event
+		cancel func()
+	}
+	var subscriptions []subscription
+
+	for topicName := range requestedTopics {
+		busTopic := supportedTopics[topicName]
+		ch, cancelFn := s.events.SubscribeWithCancel(busTopic, 256)
+		subscriptions = append(subscriptions, subscription{
+			topic:  topicName,
+			ch:     ch,
+			cancel: cancelFn,
+		})
+	}
+	defer func() {
+		for _, sub := range subscriptions {
+			sub.cancel()
+		}
+	}()
+
+	// Start read pump FIRST to handle control frames/disconnects during snapshot transmission
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				cancel()
+				return
+			}
+		}
+	}()
+
+	// Send initial snapshots (read pump is running, so disconnects are detected)
+	if requestedTopics[topicAppStatus] {
+		s.sendInitialAppStatus(isAppAllowed, sendJSON)
+	}
+	if requestedTopics[topicListenerHealth] {
+		s.sendInitialListenerHealthUnified(isAppAllowed, sendJSON)
+	}
+	if requestedTopics[topicRemoteConfig] && isAdmin {
+		s.sendInitialRemoteConfig(sendJSON)
+	}
+	// Certificate topic doesn't need initial snapshot (included in remote_config)
+
+	// Merge all subscription channels
+	eventCh := make(chan struct {
+		topic string
+		evt   events.Event
+	}, 256)
+
+	for _, sub := range subscriptions {
+		go func(topicName string, ch <-chan events.Event) {
+			for evt := range ch {
+				select {
+				case eventCh <- struct {
+					topic string
+					evt   events.Event
+				}{topicName, evt}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(sub.topic, sub.ch)
+	}
+
+	keepalive := time.NewTicker(15 * time.Second)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case <-keepalive.C:
+			_ = sendJSON(streamMessage{Type: "keepalive"})
+
+		case <-ctx.Done():
+			_ = conn.Close()
+			<-readDone
+			return
+
+		case item := <-eventCh:
+			msg := s.processEvent(item.topic, item.evt, isAppAllowed, isAdmin)
+			if msg != nil {
+				if err := sendJSON(msg); err != nil {
+					cancel()
+				}
+			}
+		}
+	}
+}
+
+// processEvent converts an event bus event to a stream message, applying access control.
+// Returns nil if the event should be filtered out.
+func (s *GinServer) processEvent(topic string, evt events.Event, isAppAllowed func(string) bool, isAdmin bool) *streamMessage {
+	switch topic {
+	case topicAppStatus:
+		payload, ok := evt.Payload.(events.AppStatusChangedEvent)
+		if !ok {
+			return nil
+		}
+		if !isAppAllowed(payload.App) {
+			return nil
+		}
+		return &streamMessage{Type: topicAppStatus, Payload: payload}
+
+	case topicListenerHealth:
+		payload, ok := evt.Payload.(events.ListenerHealthEvent)
+		if !ok {
+			return nil
+		}
+		if !isAppAllowed(payload.App) {
+			return nil
+		}
+		return &streamMessage{Type: topicListenerHealth, Payload: payload}
+
+	case topicRemoteConfig:
+		// Remote config is admin-only
+		if !isAdmin {
+			return nil
+		}
+		return &streamMessage{Type: topicRemoteConfig, Payload: evt.Payload}
+
+	case topicCertificate:
+		// Certificate events are admin-only
+		if !isAdmin {
+			return nil
+		}
+		payload, ok := evt.Payload.(events.CertificateChangedEvent)
+		if !ok {
+			return nil
+		}
+		return &streamMessage{Type: topicCertificate, Payload: payload}
+	}
+	return nil
+}
+
+// sendInitialAppStatus sends current status for all accessible apps.
+func (s *GinServer) sendInitialAppStatus(isAppAllowed func(string) bool, sendJSON func(any) error) {
+	if s.appManager == nil {
+		return
+	}
+
+	apps, err := s.appManager.List(context.Background())
+	if err != nil {
+		return
+	}
+
+	for _, app := range apps {
+		if !isAppAllowed(app.InstanceID) {
+			continue
+		}
+		_ = sendJSON(streamMessage{
+			Type: topicAppStatus,
+			Payload: events.AppStatusChangedEvent{
+				App:       app.InstanceID,
+				Status:    app.Status,
+				Timestamp: time.Now(),
+			},
+		})
+	}
+}
+
+// sendInitialListenerHealthUnified sends current health for all accessible listeners.
+func (s *GinServer) sendInitialListenerHealthUnified(isAppAllowed func(string) bool, sendJSON func(any) error) {
+	if s.serviceManager == nil {
+		return
+	}
+
+	endpoints := s.serviceManager.GetAll()
+	for _, ep := range endpoints {
+		if !isAppAllowed(ep.App) {
+			continue
+		}
+		health := s.computeListenerHealth(ep)
+		_ = sendJSON(streamMessage{
+			Type: topicListenerHealth,
+			Payload: events.ListenerHealthEvent{
+				App:       ep.App,
+				Listener:  ep.Name,
+				Health:    toEventsListenerHealth(health),
+				Timestamp: time.Now(),
+			},
+		})
+	}
+}
+
+// sendInitialRemoteConfig sends current remote access configuration.
+func (s *GinServer) sendInitialRemoteConfig(sendJSON func(any) error) {
+	if s.remoteManager == nil {
+		return
+	}
+	status := s.remoteManager.Status()
+	_ = sendJSON(streamMessage{
+		Type:    topicRemoteConfig,
+		Payload: status,
+	})
+}
+
+// toEventsListenerHealth converts services.ListenerHealth to events.ListenerHealth.
+func toEventsListenerHealth(h services.ListenerHealth) events.ListenerHealth {
+	// Convert CertStatuses if present
+	var certStatuses map[string]events.CertHealthStatus
+	if len(h.CertStatuses) > 0 {
+		certStatuses = make(map[string]events.CertHealthStatus, len(h.CertStatuses))
+		for certID, cs := range h.CertStatuses {
+			certStatuses[certID] = events.CertHealthStatus{
+				Status:      string(cs.Status),
+				ReasonCode:  cs.ReasonCode,
+				RecoveryETA: cs.RecoveryETA,
+			}
+		}
+	}
+
+	return events.ListenerHealth{
+		Status:         string(h.Status),
+		ReasonCode:     h.ReasonCode,
+		Reason:         h.Reason,
+		Details:        h.Details,
+		RecoveryETA:    h.RecoveryETA,
+		Recoverable:    h.Recoverable,
+		ActionRequired: h.ActionRequired,
+		CertStatuses:   certStatuses,
+		LastChecked:    h.LastChecked,
+		LastOK:         h.LastOK,
+	}
+}
+

@@ -1,5 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:pointer_interceptor/pointer_interceptor.dart';
+import '../../../core/models/listener_health.dart';
+import '../../../core/services/websocket_connection.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../desktop_controller.dart';
 import '../models/desktop_window.dart';
@@ -57,7 +61,7 @@ class Dock extends StatelessWidget {
             const SizedBox(width: 12),
 
             // Health indicator
-            const _HealthIndicator(),
+            _HealthIndicator(controller: controller),
             const SizedBox(width: 16),
 
             _buildSeparator(),
@@ -81,7 +85,10 @@ class Dock extends StatelessWidget {
                 "settings",
                 "Settings",
                 Icons.settings_rounded,
-                SettingsApp(onLogout: controller.logout),
+                SettingsApp(
+                  onLogout: controller.logout,
+                  eventStreamClient: controller.eventStreamClient,
+                ),
                 screenSize: screenSize,
                 initialSize: const Size(1100, 750),
               ),
@@ -140,16 +147,162 @@ class Dock extends StatelessWidget {
   }
 }
 
-class _HealthIndicator extends StatelessWidget {
-  const _HealthIndicator();
+class _HealthIndicator extends StatefulWidget {
+  final DesktopController controller;
+
+  const _HealthIndicator({required this.controller});
+
+  @override
+  State<_HealthIndicator> createState() => _HealthIndicatorState();
+}
+
+class _HealthIndicatorState extends State<_HealthIndicator> {
+  // Map of app:listener -> health status
+  final Map<String, ListenerHealth> _healthMap = {};
+  StreamSubscription<ListenerHealthEvent>? _subscription;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_onControllerChanged);
+    _subscribeToEvents();
+  }
+
+  @override
+  void didUpdateWidget(covariant _HealthIndicator oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_onControllerChanged);
+      widget.controller.addListener(_onControllerChanged);
+      _unsubscribeFromClient();
+      _subscribeToEvents();
+    }
+  }
+
+  void _onControllerChanged() {
+    // Re-subscribe when eventStreamClient becomes available or changes
+    final client = widget.controller.eventStreamClient;
+    if (client != null && _subscription == null) {
+      _subscribeToEvents();
+    }
+    // Trigger rebuild to reflect connection state changes
+    if (mounted) setState(() {});
+  }
+
+  void _subscribeToEvents() {
+    final client = widget.controller.eventStreamClient;
+    if (client != null) {
+      _unsubscribeFromClient();
+      client.addListener(_onClientStateChanged);
+      _subscription = client.healthEvents.listen(_handleHealthEvent);
+    }
+  }
+
+  void _unsubscribeFromClient() {
+    _subscription?.cancel();
+    _subscription = null;
+    widget.controller.eventStreamClient?.removeListener(_onClientStateChanged);
+  }
+
+  void _onClientStateChanged() {
+    if (!mounted) return;
+    final client = widget.controller.eventStreamClient;
+    // Clear stale health data on reconnect; server will send fresh snapshot
+    if (client?.state == WebSocketConnectionState.connected) {
+      _healthMap.clear();
+    }
+    setState(() {});
+  }
+
+  void _handleHealthEvent(ListenerHealthEvent event) {
+    if (!mounted) return;
+    setState(() {
+      final key = '${event.app}:${event.listener}';
+      _healthMap[key] = event.health;
+    });
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onControllerChanged);
+    _unsubscribeFromClient();
+    super.dispose();
+  }
+
+  bool get _isConnected {
+    final client = widget.controller.eventStreamClient;
+    if (client == null) return false;
+    return client.state == WebSocketConnectionState.connected;
+  }
+
+  /// Aggregates health across all listeners to find worst status.
+  /// Priority: error > degraded > recovering > ok
+  String get _aggregateStatus {
+    if (_healthMap.isEmpty) return 'ok';
+
+    bool hasError = false;
+    bool hasDegraded = false;
+    bool hasRecovering = false;
+
+    for (final health in _healthMap.values) {
+      if (health.isError) hasError = true;
+      if (health.isDegraded) hasDegraded = true;
+      if (health.isRecovering) hasRecovering = true;
+    }
+
+    if (hasError) return 'error';
+    if (hasDegraded) return 'degraded';
+    if (hasRecovering) return 'recovering';
+    return 'ok';
+  }
+
+  Color get _statusColor {
+    if (!_isConnected) return PiccoloTheme.inkMuted;
+    switch (_aggregateStatus) {
+      case 'error':
+        return PiccoloTheme.critical;
+      case 'degraded':
+      case 'recovering':
+        return PiccoloTheme.warning;
+      default:
+        return PiccoloTheme.success;
+    }
+  }
+
+  String get _statusLabel {
+    if (!_isConnected) return 'Offline';
+    switch (_aggregateStatus) {
+      case 'error':
+        return 'Error';
+      case 'degraded':
+        return 'Degraded';
+      case 'recovering':
+        return 'Recovering';
+      default:
+        return 'Healthy';
+    }
+  }
+
+  String get _tooltipMessage {
+    if (!_isConnected) return 'Connection lost - Reconnecting...';
+    switch (_aggregateStatus) {
+      case 'error':
+        return 'System Error - Check app details';
+      case 'degraded':
+        return 'System Degraded - Action may be required';
+      case 'recovering':
+        return 'System Recovering - Auto-healing in progress';
+      default:
+        return 'System Healthy';
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    // TODO(backlog): Connect to actual health service - see docs/backlog.md
-    const color = PiccoloTheme.success;
+    final color = _statusColor;
 
     return Tooltip(
-      message: "System Healthy",
+      message: _tooltipMessage,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
@@ -163,14 +316,14 @@ class _HealthIndicator extends StatelessWidget {
             Container(
               width: 8,
               height: 8,
-              decoration: const BoxDecoration(
+              decoration: BoxDecoration(
                 color: color,
                 shape: BoxShape.circle,
               ),
             ),
             const SizedBox(width: 6),
             Text(
-              "Healthy",
+              _statusLabel,
               style: PiccoloTheme.textTheme.labelSmall?.copyWith(
                 color: PiccoloTheme.ink,
                 fontWeight: FontWeight.w500,

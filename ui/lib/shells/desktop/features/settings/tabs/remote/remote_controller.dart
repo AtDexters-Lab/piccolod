@@ -5,12 +5,18 @@ import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/core/models/service_endpoint.dart';
 import 'package:piccolo_os/core/services/remote_service.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
+import 'package:piccolo_os/core/services/event_stream_client.dart';
 
 class RemoteController extends ChangeNotifier {
   final RemoteService _service = RemoteService();
-  Timer? _pollTimer;
   bool _disposed = false;
   bool _isPolling = false;
+
+  // Event stream for real-time updates (shared or owned)
+  final EventStreamClient? _sharedEventStream;
+  EventStreamClient? _ownedEventStream;
+  StreamSubscription<Map<String, dynamic>>? _remoteConfigSub;
+  StreamSubscription<Map<String, dynamic>>? _certificateSub;
 
   // State
   bool isLoading = true;
@@ -29,24 +35,49 @@ class RemoteController extends ChangeNotifier {
   List<RemotePreflightCheck> preflightChecks = [];
   bool isRunningPreflight = false;
   bool isSubmittingConfig = false;
-  
+
   // Ephemeral configuration state for the wizard (not yet persisted to backend)
   final Map<String, dynamic> _pendingConfig = {};
 
-  RemoteController() {
+  RemoteController({EventStreamClient? eventStreamClient})
+      : _sharedEventStream = eventStreamClient {
     _init();
   }
 
   void _init() {
     refresh();
-    // Poll every 5 seconds for status updates (as per spec)
-    _pollTimer = Timer.periodic(const Duration(seconds: 5), (_) => _pollStatus());
+    _connectEventStream();
+  }
+
+  void _connectEventStream() {
+    // Use shared client if provided, otherwise create our own
+    EventStreamClient client;
+    if (_sharedEventStream != null) {
+      client = _sharedEventStream;
+    } else {
+      _ownedEventStream = EventStreamClient();
+      client = _ownedEventStream!;
+      client.connect();
+    }
+
+    // Subscribe to remote config changes
+    _remoteConfigSub = client.remoteConfigEvents.listen((_) {
+      if (!_disposed) _pollStatus();
+    });
+
+    // Subscribe to certificate status changes
+    _certificateSub = client.certificateEvents.listen((_) {
+      if (!_disposed) _pollStatus();
+    });
   }
 
   @override
   void dispose() {
     _disposed = true;
-    _pollTimer?.cancel();
+    _remoteConfigSub?.cancel();
+    _certificateSub?.cancel();
+    // Only dispose the event stream if we own it
+    _ownedEventStream?.dispose();
     super.dispose();
   }
 

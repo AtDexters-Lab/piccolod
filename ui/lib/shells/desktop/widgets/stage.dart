@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../../../core/models/app_models.dart';
+import '../../../core/models/app_status_event.dart';
 import '../../../features/apps/app_detail_view.dart';
 import '../../../features/apps/app_launcher.dart';
 import '../../../shared/widgets/action_progress_dialog.dart';
@@ -27,6 +30,9 @@ class _StageState extends State<Stage> {
   // Track previous auth state to detect changes
   bool _wasAuthenticated = false;
 
+  // Event stream subscription for reactive updates
+  StreamSubscription<AppStatusEvent>? _eventSubscription;
+
   bool get _isAuthenticated =>
       !widget.controller.needsSetup && !widget.controller.isInitializing;
 
@@ -38,6 +44,33 @@ class _StageState extends State<Stage> {
     _wasAuthenticated = _isAuthenticated;
     if (_isAuthenticated) {
       _loadApps();
+      _subscribeToEvents();
+    }
+  }
+
+  void _subscribeToEvents() {
+    _eventSubscription?.cancel();
+    final client = widget.controller.eventStreamClient;
+    if (client != null) {
+      _eventSubscription = client.appStatusEvents.listen(_handleAppStatusEvent);
+    }
+  }
+
+  void _handleAppStatusEvent(AppStatusEvent event) {
+    if (!mounted) return;
+
+    // For install/uninstall events, reload the full list
+    if (event.isInstalled || event.isUninstalled) {
+      _loadApps();
+      return;
+    }
+
+    // For status changes (running, stopped, error, starting), update in-place
+    final index = _apps.indexWhere((a) => a.name == event.app);
+    if (index != -1) {
+      setState(() {
+        _apps[index] = _apps[index].copyWithStatus(event.status);
+      });
     }
   }
 
@@ -45,10 +78,13 @@ class _StageState extends State<Stage> {
     if (!mounted) return;
     final nowAuthenticated = _isAuthenticated;
     if (!_wasAuthenticated && nowAuthenticated) {
-      // Just became authenticated - load apps
+      // Just became authenticated - load apps and subscribe to events
       _loadApps();
+      _subscribeToEvents();
     } else if (_wasAuthenticated && !nowAuthenticated) {
-      // Just logged out - clear apps and icon cache
+      // Just logged out - cancel subscription and clear apps
+      _eventSubscription?.cancel();
+      _eventSubscription = null;
       setState(() {
         _apps = [];
         _iconCache.clear();
@@ -61,6 +97,7 @@ class _StageState extends State<Stage> {
 
   @override
   void dispose() {
+    _eventSubscription?.cancel();
     widget.controller.removeAppChangeListener(_loadApps);
     widget.controller.removeListener(_onControllerChanged);
     super.dispose();

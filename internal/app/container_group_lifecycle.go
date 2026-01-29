@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"piccolod/internal/api"
 	"piccolod/internal/container"
@@ -17,13 +18,18 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		return fmt.Errorf("start: app definition required")
 	}
 
+	// Update status to starting immediately so UI reflects progress
+	if err := m.updateStatusWithEvent(state, appInst.InstanceID, "starting"); err != nil {
+		log.Printf("WARN: start %s: failed to persist starting status: %v", appInst.InstanceID, err)
+	}
+
 	mode := piccoloModeFromExtensions(def.Extensions)
 
 	// For workspace mode, ensure workspace disk is mounted before starting containers
 	if mode == ModeWorkspace {
 		m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
 		if _, err := m.ensureWorkspaceDiskMounted(ctx, appInst.InstanceID, layout); err != nil {
-			_ = state.UpdateAppStatus(appInst.InstanceID, "error")
+			_ = m.updateStatusWithEvent(state, appInst.InstanceID, "error")
 			return fmt.Errorf("failed to mount workspace disk: %w", err)
 		}
 	}
@@ -72,25 +78,33 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 
 	// Start anchor first, then services in order.
 	if err := m.containerManager.StartContainer(ctx, runtime, anchorID); err != nil {
-		_ = state.UpdateAppStatus(appInst.InstanceID, "error")
+		_ = m.updateStatusWithEvent(state, appInst.InstanceID, "error")
 		return fmt.Errorf("failed to start network anchor: %w", err)
 	}
 
 	for _, svcName := range startOrder {
 		cid := strings.TrimSpace(appInst.Containers[svcName])
 		if cid == "" {
-			_ = state.UpdateAppStatus(appInst.InstanceID, "error")
+			_ = m.updateStatusWithEvent(state, appInst.InstanceID, "error")
 			return fmt.Errorf("missing container ID for service '%s'", svcName)
 		}
 		if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
-			_ = state.UpdateAppStatus(appInst.InstanceID, "error")
+			_ = m.updateStatusWithEvent(state, appInst.InstanceID, "error")
 			return fmt.Errorf("failed to start service '%s': %w", svcName, err)
 		}
 	}
 
-	// Update status to running.
-	if err := state.UpdateAppStatus(appInst.InstanceID, "running"); err != nil {
+	// Reset startup failure tracking and update status in a single persistence operation (RFC 20260125).
+	// This avoids double disk writes and ensures atomic state transition.
+	prevStatus := appInst.Status
+	resetStartupTracking(appInst)
+	appInst.Status = "running"
+	appInst.UpdatedAt = time.Now()
+	if err := state.StoreApp(appInst, nil); err != nil {
 		return fmt.Errorf("failed to update app status: %w", err)
+	}
+	if prevStatus != "running" {
+		m.publishAppStatusChanged(appInst.InstanceID, "running", prevStatus)
 	}
 
 	// Rehydrate service proxies if they were removed while the app was stopped.
@@ -180,7 +194,7 @@ func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemSt
 		}
 	}
 
-	if err := state.UpdateAppStatus(appInst.InstanceID, "stopped"); err != nil {
+	if err := m.updateStatusWithEvent(state, appInst.InstanceID, "stopped"); err != nil {
 		return fmt.Errorf("failed to update app status: %w", err)
 	}
 	if m.serviceManager != nil {

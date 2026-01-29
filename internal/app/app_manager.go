@@ -35,6 +35,7 @@ type AppManager struct {
 	serviceManager   *services.ServiceManager
 	routeRegistrar   router.Registrar
 	progressReporter events.ProgressReporter
+	eventBus         *events.Bus
 	eventsMu         sync.Mutex
 	eventCancel      context.CancelFunc
 	eventsWG         sync.WaitGroup
@@ -210,6 +211,13 @@ func (m *AppManager) SetMountVerifier(fn func(string) error) {
 	m.stateInitMu.Unlock()
 }
 
+// SetEventBus configures the event bus for publishing app status change events.
+func (m *AppManager) SetEventBus(bus *events.Bus) {
+	m.stateMu.Lock()
+	m.eventBus = bus
+	m.stateMu.Unlock()
+}
+
 // SetStateBaseDir overrides the base directory used for filesystem-backed state.
 func (m *AppManager) SetStateBaseDir(dir string) {
 	base := dir
@@ -235,6 +243,52 @@ func (m *AppManager) currentProgressReporter() events.ProgressReporter {
 	m.stateMu.RLock()
 	defer m.stateMu.RUnlock()
 	return m.progressReporter
+}
+
+func (m *AppManager) currentEventBus() *events.Bus {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.eventBus
+}
+
+// publishAppStatusChanged emits an app status changed event if the event bus is configured.
+func (m *AppManager) publishAppStatusChanged(instanceID, status, prevStatus string) {
+	bus := m.currentEventBus()
+	if bus == nil {
+		return
+	}
+	bus.Publish(events.Event{
+		Topic: events.TopicAppStatusChanged,
+		Payload: events.AppStatusChangedEvent{
+			App:        instanceID,
+			Status:     status,
+			PrevStatus: prevStatus,
+			Timestamp:  time.Now(),
+		},
+	})
+}
+
+// updateStatusWithEvent updates the app status and publishes an event if the status changed.
+// This should be called within the appropriate lock context (reconcileMu for reconciler paths,
+// request-scoped for lifecycle operations).
+func (m *AppManager) updateStatusWithEvent(state *FilesystemStateManager, instanceID, newStatus string) error {
+	// Get previous status before updating
+	app, exists := state.GetApp(instanceID)
+	prevStatus := ""
+	if exists && app != nil {
+		prevStatus = app.Status
+	}
+
+	// Update status
+	if err := state.UpdateAppStatus(instanceID, newStatus); err != nil {
+		return err
+	}
+
+	// Publish event if status actually changed
+	if prevStatus != newStatus {
+		m.publishAppStatusChanged(instanceID, newStatus, prevStatus)
+	}
+	return nil
 }
 
 func (m *AppManager) emitProgress(ctx context.Context, taskType, instanceID, phase string, progress int, message string, complete bool, opErr error) {
@@ -1227,6 +1281,9 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		return nil, fmt.Errorf("failed to store app: %w", err)
 	}
 
+	// Emit "installed" event
+	m.publishAppStatusChanged(instanceID, "installed", "")
+
 	cleanupServices = false
 	return app, nil
 }
@@ -1560,6 +1617,9 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 	if err := state.RemoveApp(instanceID); err != nil {
 		return fmt.Errorf("failed to remove app from storage: %w", err)
 	}
+
+	// Emit "uninstalled" event (prevStatus was the app's last status before removal)
+	m.publishAppStatusChanged(instanceID, "uninstalled", app.Status)
 
 	return nil
 }

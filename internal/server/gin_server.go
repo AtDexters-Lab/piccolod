@@ -378,6 +378,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	appMgr.ObserveRuntimeEvents(eventsBus)
 	appMgr.SetRouter(routeMgr)
 	appMgr.SetProgressReporter(progressReporter)
+	appMgr.SetEventBus(eventsBus)
 
 	// Initialize persistence module (skeleton; concrete components wired later)
 	persist, err := persistence.NewService(persistence.Options{
@@ -986,8 +987,8 @@ func (s *GinServer) setupGinRoutes() {
 		// Actually, let's allow it for now as it's harmless read-only.
 		authed.GET("/events/progress/stream", s.handleGinTaskProgressStream)
 
-		// Listener health stream (RFC 20260125) - streams real-time health updates
-		authed.GET("/events/health/stream", s.handleGinListenerHealthStream)
+		// Unified event stream - streams app status, listener health, remote config, certificates
+		authed.GET("/events/stream", s.handleGinEventStream)
 
 		// Remote config endpoints (Admin only)
 		remote := admin.Group("/remote")
