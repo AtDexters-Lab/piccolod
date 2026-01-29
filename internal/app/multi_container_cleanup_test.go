@@ -25,7 +25,7 @@ func TestStopRemoveContainersForMultiApp_UsesNamesWhenIDsStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureAppVolumeLayout: %v", err)
 	}
-	runtime, err := mgr.podmanRuntimeForApp("demo", layout)
+	runtime, err := mgr.podmanRuntimeForApp("demo", layout, ModeService)
 	if err != nil {
 		t.Fatalf("podmanRuntimeForApp: %v", err)
 	}
@@ -61,7 +61,6 @@ func TestStopRemoveContainersForMultiApp_UsesNamesWhenIDsStale(t *testing.T) {
 	appInst := &AppInstance{
 		InstanceID:     "demo",
 		Status:         "running",
-		ContainerID:    mainCID,
 		PrimaryService: "main",
 		Containers: map[string]string{
 			"main": "deadbeefdeadbeef", // stale (non-empty) ID should not block name-based stop/remove

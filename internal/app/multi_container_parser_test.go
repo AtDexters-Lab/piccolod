@@ -42,13 +42,13 @@ func TestValidateAppDefinition_MultiContainer_ServiceMode(t *testing.T) {
 	}
 }
 
-func TestValidateAppDefinition_MultiContainer_RejectsWorkspaceMode(t *testing.T) {
+func TestValidateAppDefinition_WorkspaceRequiresSingleService(t *testing.T) {
 	app := &api.AppDefinition{
-		Name:           "demo",
-		Type:           "user",
-		PrimaryService: "main",
+		Name: "demo",
+		Type: "user",
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine:latest", BindPorts: []int{}},
+			"side": {Image: "alpine:latest", BindPorts: []int{}},
 		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
@@ -98,6 +98,8 @@ func TestValidateAppDefinition_MultiContainer_RejectsBindPortCollision(t *testin
 }
 
 func TestValidateAppDefinition_MultiContainer_RequiresPrimaryBindPortsForListeners(t *testing.T) {
+	// This test verifies that multi-container apps require bind_ports to include listener guest_ports.
+	// The check only applies when there are 2+ services (single-service apps skip this check).
 	app := &api.AppDefinition{
 		Name: "demo",
 		Listeners: []api.AppListener{
@@ -106,6 +108,7 @@ func TestValidateAppDefinition_MultiContainer_RequiresPrimaryBindPortsForListene
 		PrimaryService: "main",
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{}},
+			"db":   {Image: "postgres:16", BindPorts: []int{5432}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}

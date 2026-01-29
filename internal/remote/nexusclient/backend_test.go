@@ -67,7 +67,7 @@ func TestStartConfiguresAttestation(t *testing.T) {
 		t.Fatalf("expected client Start to be invoked")
 	}
 
-	expectedHosts := []string{"portal.example.com", "*.example.com"}
+	expectedHosts := []string{"portal.example.com", "*.portal.example.com"}
 	if !reflect.DeepEqual(captured.Hostnames, expectedHosts) {
 		t.Fatalf("unexpected hostnames: got %v want %v", captured.Hostnames, expectedHosts)
 	}

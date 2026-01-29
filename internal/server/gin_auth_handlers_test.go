@@ -111,6 +111,28 @@ func (m *memoryAuthRepo) UpdateStaleness(ctx context.Context, update persistence
 	return nil
 }
 
+// setupAuthDirectly initializes auth via internal APIs (for tests using memory repos).
+// This replaces the removed /auth/setup endpoint for test scenarios.
+func setupAuthDirectly(t *testing.T, srv *GinServer, password string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := srv.authManager.Setup(ctx, password); err != nil {
+		t.Fatalf("direct auth setup: %v", err)
+	}
+	// Also create admin user in userManager if available (mirrors what /crypto/setup does)
+	if srv.userManager != nil {
+		adminInput := authpkg.CreateUserInput{
+			Username: "admin",
+			Email:    "admin@piccolo.local",
+			Password: password,
+			Role:     persistence.UserRoleAdmin,
+		}
+		if _, err := srv.userManager.Create(ctx, adminInput); err != nil {
+			t.Fatalf("direct admin user creation: %v", err)
+		}
+	}
+}
+
 func TestAuth_Setup_Login_Session_Logout(t *testing.T) {
 	srv := setupAuthTestServer(t)
 
@@ -127,14 +149,8 @@ func TestAuth_Setup_Login_Session_Logout(t *testing.T) {
 		t.Fatalf("expected unauthenticated")
 	}
 
-	// 2) setup admin
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/api/v1/auth/setup", strings.NewReader(`{"password":"pw123456"}`))
-	req.Header.Set("Content-Type", "application/json")
-	srv.router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("setup status %d body=%s", w.Code, w.Body.String())
-	}
+	// 2) setup admin via internal API (endpoint removed - use /crypto/setup in prod)
+	setupAuthDirectly(t, srv, "pw123456")
 
 	// 3) wrong login -> 401
 	w = httptest.NewRecorder()
@@ -236,19 +252,13 @@ func TestAuth_Setup_Login_Session_Logout(t *testing.T) {
 
 func TestAuth_LoginRateLimit(t *testing.T) {
 	srv := setupAuthTestServer(t)
-	// setup
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/api/v1/auth/setup", strings.NewReader(`{"password":"pw123456"}`))
-	req.Header.Set("Content-Type", "application/json")
-	srv.router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("setup: %d", w.Code)
-	}
+	// setup via internal API
+	setupAuthDirectly(t, srv, "pw123456")
 
 	// 4 failed attempts
 	for i := 0; i < 4; i++ {
-		w = httptest.NewRecorder()
-		req, _ = http.NewRequest("POST", "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"bad"}`))
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"bad"}`))
 		req.Header.Set("Content-Type", "application/json")
 		srv.router.ServeHTTP(w, req)
 		if w.Code != http.StatusUnauthorized {
@@ -256,10 +266,9 @@ func TestAuth_LoginRateLimit(t *testing.T) {
 		}
 	}
 	// Next should yield 429
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"bad"}`))
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"bad"}`))
 	req.Header.Set("Content-Type", "application/json")
-	// (Next line intentionally left unchanged)
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429, got %d", w.Code)
@@ -273,14 +282,8 @@ func TestAuthSessionIncludesStaleness(t *testing.T) {
 	srv := setupAuthTestServer(t)
 	ctx := context.Background()
 
-	// initialize auth
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/api/v1/auth/setup", strings.NewReader(`{"password":"pw123456"}`))
-	req.Header.Set("Content-Type", "application/json")
-	srv.router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("setup: %d", w.Code)
-	}
+	// initialize auth via internal API
+	setupAuthDirectly(t, srv, "pw123456")
 
 	repo, ok := srv.authRepo.(*memoryAuthRepo)
 	if !ok {
@@ -292,8 +295,8 @@ func TestAuthSessionIncludesStaleness(t *testing.T) {
 		t.Fatalf("update staleness: %v", err)
 	}
 
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("GET", "/api/v1/auth/session", nil)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/api/v1/auth/session", nil)
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("session: %d", w.Code)
@@ -352,14 +355,9 @@ func TestAuthStalenessAckClearsFlags(t *testing.T) {
 
 func TestCryptoRecoveryStatusStale(t *testing.T) {
 	srv := setupAuthTestServer(t)
-	// Setup auth to ensure repo initialized to avoid ErrLocked
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/api/v1/auth/setup", strings.NewReader(`{"password":"pw123456"}`))
-	req.Header.Set("Content-Type", "application/json")
-	srv.router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("setup: %d", w.Code)
-	}
+	// Setup auth via internal API to ensure repo initialized
+	setupAuthDirectly(t, srv, "pw123456")
+
 	repo := srv.authRepo.(*memoryAuthRepo)
 	if err := repo.UpdateStaleness(context.Background(), persistence.AuthStalenessUpdate{
 		RecoveryStale: boolPtr(true),
@@ -367,8 +365,8 @@ func TestCryptoRecoveryStatusStale(t *testing.T) {
 		t.Fatalf("update staleness: %v", err)
 	}
 
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("GET", "/api/v1/crypto/recovery-key", nil)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/api/v1/crypto/recovery-key", nil)
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("recovery status: %d", w.Code)
@@ -386,21 +384,13 @@ func TestCryptoResetPasswordFlow(t *testing.T) {
 	srv := setupAuthTestServer(t)
 	ctx := context.Background()
 
-	// Setup crypto
+	// Setup crypto + auth via unified endpoint
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/api/v1/crypto/setup", strings.NewReader(`{"password":"OrigPass123!"}`))
 	req.Header.Set("Content-Type", "application/json")
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("crypto setup: %d", w.Code)
-	}
-	// Setup auth
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/api/v1/auth/setup", strings.NewReader(`{"password":"OrigPass123!"}`))
-	req.Header.Set("Content-Type", "application/json")
-	srv.router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("auth setup: %d", w.Code)
+		t.Fatalf("crypto setup: %d body=%s", w.Code, w.Body.String())
 	}
 
 	// Generate recovery key
@@ -462,15 +452,8 @@ func TestCryptoRecoveryKeyGenerateRotatesAndClearsStaleness(t *testing.T) {
 		t.Fatalf("unexpected repo type %T", srv.authRepo)
 	}
 
-	// Initialize crypto with the same password used for auth setup.
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/api/v1/crypto/setup", strings.NewReader(`{"password":"TestPass123!"}`))
-	req.Header.Set("Content-Type", "application/json")
-	srv.router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("crypto setup: %d body=%s", w.Code, w.Body.String())
-	}
-
+	// Crypto is already initialized by setupTestAdminSession via /crypto/setup
+	// Generate initial recovery key with the same password
 	initialWords, err := srv.cryptoManager.GenerateRecoveryKeyWithPassword("TestPass123!", false)
 	if err != nil {
 		t.Fatalf("initial generate: %v", err)
@@ -486,8 +469,8 @@ func TestCryptoRecoveryKeyGenerateRotatesAndClearsStaleness(t *testing.T) {
 		t.Fatalf("unlock before rotation: %v", err)
 	}
 
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/api/v1/crypto/recovery-key/generate", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/crypto/recovery-key/generate", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	attachAuth(req, sessionCookie, csrf)
 	srv.router.ServeHTTP(w, req)

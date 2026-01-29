@@ -2,134 +2,257 @@ package mdns
 
 import (
 	"net"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/miekg/dns"
 )
 
-func TestIsRateLimited_NewClient(t *testing.T) {
+func TestValidatePacket_LargePacket(t *testing.T) {
 	manager := createMockManager()
-	clientIP := "192.168.1.100"
 
-	// New client should not be rate limited
-	limited := manager.isRateLimited(clientIP)
-	if limited {
-		t.Error("New client should not be rate limited")
+	// Create a packet larger than the max size
+	largePacket := make([]byte, manager.securityConfig.MaxPacketSize+100)
+
+	err := manager.validatePacket(largePacket)
+	if err == nil {
+		t.Error("Expected error for large packet")
 	}
 
-	// Verify client was added to rate limiter
-	manager.rateLimiter.mutex.RLock()
-	client, exists := manager.rateLimiter.clients[clientIP]
-	manager.rateLimiter.mutex.RUnlock()
-
-	if !exists {
-		t.Error("Client should be added to rate limiter")
-	}
-
-	if client.IP != clientIP {
-		t.Errorf("Client IP = %v, want %v", client.IP, clientIP)
-	}
-
-	if client.Blocked {
-		t.Error("New client should not be blocked")
-	}
-
-	if client.QueryCount != 0 {
-		t.Errorf("New client QueryCount = %v, want %v", client.QueryCount, 0)
+	// Verify metrics were updated
+	if manager.securityMetrics.LargePackets != 1 {
+		t.Errorf("LargePackets = %d, want 1", manager.securityMetrics.LargePackets)
 	}
 }
 
-func TestIsRateLimited_BlockedClient(t *testing.T) {
+func TestValidatePacket_SmallPacket(t *testing.T) {
 	manager := createMockManager()
-	clientIP := "192.168.1.101"
 
-	// Add a blocked client
-	manager.rateLimiter.mutex.Lock()
-	manager.rateLimiter.clients[clientIP] = &ClientState{
-		IP:           clientIP,
-		Blocked:      true,
-		BlockedUntil: time.Now().Add(time.Minute),
-		QueryCount:   100,
-		LastQuery:    time.Now(),
-	}
-	manager.rateLimiter.mutex.Unlock()
+	// Create a packet smaller than the minimum DNS header
+	smallPacket := make([]byte, 10)
 
-	// Should be rate limited
-	limited := manager.isRateLimited(clientIP)
-	if !limited {
-		t.Error("Blocked client should be rate limited")
+	err := manager.validatePacket(smallPacket)
+	if err == nil {
+		t.Error("Expected error for small packet")
 	}
 
-	// Verify blocked queries metric was incremented
-	if manager.securityMetrics.BlockedQueries != 1 {
-		t.Errorf("BlockedQueries = %v, want %v", manager.securityMetrics.BlockedQueries, 1)
+	// Verify metrics were updated
+	if manager.securityMetrics.MalformedPackets != 1 {
+		t.Errorf("MalformedPackets = %d, want 1", manager.securityMetrics.MalformedPackets)
 	}
 }
 
-func TestIsRateLimited_ExpiredBlock(t *testing.T) {
+func TestValidatePacket_ValidPacket(t *testing.T) {
 	manager := createMockManager()
-	clientIP := "192.168.1.102"
 
-	// Add a client with expired block
-	manager.rateLimiter.mutex.Lock()
-	manager.rateLimiter.clients[clientIP] = &ClientState{
-		IP:           clientIP,
-		Blocked:      true,
-		BlockedUntil: time.Now().Add(-time.Minute), // Expired
-		QueryCount:   100,
-		LastQuery:    time.Now(),
-	}
-	manager.rateLimiter.mutex.Unlock()
+	// Create a valid-sized packet (minimum DNS header size is 12)
+	validPacket := make([]byte, 100)
 
-	// Should not be rate limited
-	limited := manager.isRateLimited(clientIP)
-	if limited {
-		t.Error("Client with expired block should not be rate limited")
-	}
-
-	// Verify block status was reset
-	manager.rateLimiter.mutex.RLock()
-	client := manager.rateLimiter.clients[clientIP]
-	manager.rateLimiter.mutex.RUnlock()
-
-	if client.Blocked {
-		t.Error("Expired block should be reset")
-	}
-
-	if client.QueryCount != 1 {
-		t.Errorf("Query count should be reset and then incremented for expired block, got %d", client.QueryCount)
+	err := manager.validatePacket(validPacket)
+	if err != nil {
+		t.Errorf("Unexpected error for valid packet: %v", err)
 	}
 }
 
-func TestIsRateLimited_QueryCountReset(t *testing.T) {
+func TestValidateDNSMessage_TooManyQuestions(t *testing.T) {
 	manager := createMockManager()
-	clientIP := "192.168.1.103"
 
-	// Add a client with old queries
-	manager.rateLimiter.mutex.Lock()
-	manager.rateLimiter.clients[clientIP] = &ClientState{
-		IP:         clientIP,
-		Blocked:    false,
-		QueryCount: 50,
-		LastQuery:  time.Now().Add(-time.Minute * 2), // More than a minute ago
-	}
-	manager.rateLimiter.mutex.Unlock()
-
-	// Should not be rate limited and count should reset
-	limited := manager.isRateLimited(clientIP)
-	if limited {
-		t.Error("Client with old queries should not be rate limited")
+	msg := &dns.Msg{}
+	for i := 0; i < 15; i++ {
+		msg.Question = append(msg.Question, dns.Question{
+			Name:   "test.local.",
+			Qtype:  dns.TypeA,
+			Qclass: dns.ClassINET,
+		})
 	}
 
-	// Verify query count was reset
-	manager.rateLimiter.mutex.RLock()
-	client := manager.rateLimiter.clients[clientIP]
-	manager.rateLimiter.mutex.RUnlock()
+	err := manager.validateDNSMessage(msg)
+	if err == nil {
+		t.Error("Expected error for too many questions")
+	}
+}
 
-	if client.QueryCount != 1 {
-		t.Errorf("Query count should be reset and then incremented for old queries, got %d", client.QueryCount)
+func TestValidateDNSMessage_TooManyAnswers(t *testing.T) {
+	manager := createMockManager()
+
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "test.local.",
+		Qtype:  dns.TypeA,
+		Qclass: dns.ClassINET,
+	})
+	for i := 0; i < 15; i++ {
+		msg.Answer = append(msg.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: "test.local.", Rrtype: dns.TypeA, Class: dns.ClassINET},
+			A:   net.ParseIP("192.168.1.1"),
+		})
+	}
+
+	err := manager.validateDNSMessage(msg)
+	if err == nil {
+		t.Error("Expected error for too many answers")
+	}
+}
+
+func TestValidateDNSMessage_QUBit(t *testing.T) {
+	manager := createMockManager()
+
+	// RFC 6762 Section 5.4: The QU bit (0x8000) requests unicast response
+	// Qclass 0x8001 = ClassINET (1) | QU bit (0x8000)
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "piccolo.local.",
+		Qtype:  dns.TypeA,
+		Qclass: 0x8001, // ClassINET with QU bit set
+	})
+
+	err := manager.validateDNSMessage(msg)
+	if err != nil {
+		t.Errorf("QU bit (class 0x8001) should be accepted: %v", err)
+	}
+}
+
+func TestValidateDNSMessage_PTRQuery(t *testing.T) {
+	manager := createMockManager()
+
+	// PTR queries are essential for mDNS service discovery
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "_services._dns-sd._udp.local.",
+		Qtype:  dns.TypePTR,
+		Qclass: dns.ClassINET,
+	})
+
+	err := manager.validateDNSMessage(msg)
+	if err != nil {
+		t.Errorf("PTR queries should be accepted: %v", err)
+	}
+}
+
+func TestValidateDNSMessage_SRVQuery(t *testing.T) {
+	manager := createMockManager()
+
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "_http._tcp.local.",
+		Qtype:  dns.TypeSRV,
+		Qclass: dns.ClassINET,
+	})
+
+	err := manager.validateDNSMessage(msg)
+	if err != nil {
+		t.Errorf("SRV queries should be accepted: %v", err)
+	}
+}
+
+func TestValidateDNSMessage_TXTQuery(t *testing.T) {
+	manager := createMockManager()
+
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "piccolo.local.",
+		Qtype:  dns.TypeTXT,
+		Qclass: dns.ClassINET,
+	})
+
+	err := manager.validateDNSMessage(msg)
+	if err != nil {
+		t.Errorf("TXT queries should be accepted: %v", err)
+	}
+}
+
+func TestValidateDNSMessage_UnsupportedQueryType(t *testing.T) {
+	manager := createMockManager()
+
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "piccolo.local.",
+		Qtype:  dns.TypeMX, // MX is not a valid mDNS query type
+		Qclass: dns.ClassINET,
+	})
+
+	err := manager.validateDNSMessage(msg)
+	if err == nil {
+		t.Error("Unsupported query type (MX) should be rejected")
+	}
+}
+
+func TestValidateDNSMessage_NonLocalQuery(t *testing.T) {
+	manager := createMockManager()
+
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "google.com.",
+		Qtype:  dns.TypeA,
+		Qclass: dns.ClassINET,
+	})
+
+	err := manager.validateDNSMessage(msg)
+	if err == nil {
+		t.Error("Non-.local queries should be rejected")
+	}
+}
+
+func TestValidateDNSMessage_UnsupportedClass(t *testing.T) {
+	manager := createMockManager()
+
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "piccolo.local.",
+		Qtype:  dns.TypeA,
+		Qclass: dns.ClassCHAOS, // Not ClassINET
+	})
+
+	err := manager.validateDNSMessage(msg)
+	if err == nil {
+		t.Error("Non-INET class should be rejected")
+	}
+}
+
+func TestValidateDNSMessage_ValidAQuery(t *testing.T) {
+	manager := createMockManager()
+
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "piccolo.local.",
+		Qtype:  dns.TypeA,
+		Qclass: dns.ClassINET,
+	})
+
+	err := manager.validateDNSMessage(msg)
+	if err != nil {
+		t.Errorf("Valid A query should be accepted: %v", err)
+	}
+}
+
+func TestValidateDNSMessage_ValidAAAAQuery(t *testing.T) {
+	manager := createMockManager()
+
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "piccolo.local.",
+		Qtype:  dns.TypeAAAA,
+		Qclass: dns.ClassINET,
+	})
+
+	err := manager.validateDNSMessage(msg)
+	if err != nil {
+		t.Errorf("Valid AAAA query should be accepted: %v", err)
+	}
+}
+
+func TestValidateDNSMessage_ValidANYQuery(t *testing.T) {
+	manager := createMockManager()
+
+	msg := &dns.Msg{}
+	msg.Question = append(msg.Question, dns.Question{
+		Name:   "piccolo.local.",
+		Qtype:  dns.TypeANY,
+		Qclass: dns.ClassINET,
+	})
+
+	err := manager.validateDNSMessage(msg)
+	if err != nil {
+		t.Errorf("Valid ANY query should be accepted: %v", err)
 	}
 }
 
@@ -205,9 +328,7 @@ func TestSecurityMetricsIncrement(t *testing.T) {
 
 	// Test incrementing metrics (simulating what would happen in real usage)
 	metrics.TotalQueries++
-	metrics.BlockedQueries++
 	metrics.MalformedPackets++
-	metrics.RateLimitHits++
 	metrics.LargePackets++
 
 	// Verify increments
@@ -217,9 +338,7 @@ func TestSecurityMetricsIncrement(t *testing.T) {
 		expected uint64
 	}{
 		{"TotalQueries", metrics.TotalQueries, 1},
-		{"BlockedQueries", metrics.BlockedQueries, 1},
 		{"MalformedPackets", metrics.MalformedPackets, 1},
-		{"RateLimitHits", metrics.RateLimitHits, 1},
 		{"LargePackets", metrics.LargePackets, 1},
 	}
 
@@ -232,53 +351,6 @@ func TestSecurityMetricsIncrement(t *testing.T) {
 	}
 }
 
-func TestRateLimiterConcurrentAccess(t *testing.T) {
-	manager := createMockManager()
-	clientIPs := []string{
-		"192.168.1.10", "192.168.1.11", "192.168.1.12",
-		"192.168.1.13", "192.168.1.14", "192.168.1.15",
-	}
-
-	// Test concurrent access to rate limiter
-	var wg sync.WaitGroup
-	for _, ip := range clientIPs {
-		wg.Add(1)
-		go func(clientIP string) {
-			defer wg.Done()
-			for i := 0; i < 10; i++ {
-				manager.isRateLimited(clientIP)
-				time.Sleep(time.Microsecond)
-			}
-		}(ip)
-	}
-
-	wg.Wait()
-
-	// Verify all clients were added
-	manager.rateLimiter.mutex.RLock()
-	clientCount := len(manager.rateLimiter.clients)
-	manager.rateLimiter.mutex.RUnlock()
-
-	if clientCount != len(clientIPs) {
-		t.Errorf("Client count = %v, want %v", clientCount, len(clientIPs))
-	}
-
-	// Verify each client exists
-	for _, ip := range clientIPs {
-		manager.rateLimiter.mutex.RLock()
-		client, exists := manager.rateLimiter.clients[ip]
-		manager.rateLimiter.mutex.RUnlock()
-
-		if !exists {
-			t.Errorf("Client %s should exist", ip)
-		}
-
-		if client.IP != ip {
-			t.Errorf("Client IP = %v, want %v", client.IP, ip)
-		}
-	}
-}
-
 func TestSecurityConfigValidation(t *testing.T) {
 	manager := createMockManager()
 	config := manager.securityConfig
@@ -288,8 +360,6 @@ func TestSecurityConfigValidation(t *testing.T) {
 		name  string
 		value int
 	}{
-		{"MaxQueriesPerSecond", config.MaxQueriesPerSecond},
-		{"MaxQueriesPerMinute", config.MaxQueriesPerMinute},
 		{"MaxPacketSize", config.MaxPacketSize},
 		{"MaxResponseSize", config.MaxResponseSize},
 		{"MaxConcurrentQueries", config.MaxConcurrentQueries},
@@ -304,21 +374,8 @@ func TestSecurityConfigValidation(t *testing.T) {
 	}
 
 	// Test duration values are positive
-	durationTests := []struct {
-		name  string
-		value time.Duration
-	}{
-		{"QueryTimeout", config.QueryTimeout},
-		{"ClientBlockDuration", config.ClientBlockDuration},
-		{"CleanupInterval", config.CleanupInterval},
-	}
-
-	for _, tt := range durationTests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.value <= 0 {
-				t.Errorf("%s should be positive, got %v", tt.name, tt.value)
-			}
-		})
+	if config.QueryTimeout <= 0 {
+		t.Error("QueryTimeout should be positive")
 	}
 
 	// Test reasonable limits
@@ -329,97 +386,58 @@ func TestSecurityConfigValidation(t *testing.T) {
 	if config.MaxResponseSize > config.MaxPacketSize {
 		t.Error("MaxResponseSize should not exceed MaxPacketSize")
 	}
+}
 
-	if config.MaxQueriesPerSecond > config.MaxQueriesPerMinute {
-		t.Error("MaxQueriesPerSecond should not exceed MaxQueriesPerMinute")
+func TestAcquireReleaseQuerySlot(t *testing.T) {
+	manager := createMockManager()
+
+	// Acquire a slot
+	if !manager.acquireQuerySlot() {
+		t.Error("Should be able to acquire query slot")
+	}
+
+	if manager.queryProcessor.activeCount != 1 {
+		t.Errorf("activeCount = %d, want 1", manager.queryProcessor.activeCount)
+	}
+
+	// Release the slot
+	manager.releaseQuerySlot()
+
+	if manager.queryProcessor.activeCount != 0 {
+		t.Errorf("activeCount = %d, want 0", manager.queryProcessor.activeCount)
 	}
 }
 
-func TestClientStateLifecycle(t *testing.T) {
+func TestAcquireQuerySlotConcurrent(t *testing.T) {
 	manager := createMockManager()
-	clientIP := "192.168.1.200"
+	maxConcurrent := manager.securityConfig.MaxConcurrentQueries
 
-	// Test client creation
-	limited := manager.isRateLimited(clientIP)
-	if limited {
-		t.Error("New client should not be rate limited")
-	}
-
-	// Verify client was created
-	manager.rateLimiter.mutex.RLock()
-	client, exists := manager.rateLimiter.clients[clientIP]
-	manager.rateLimiter.mutex.RUnlock()
-
-	if !exists {
-		t.Fatal("Client should exist after first check")
-	}
-
-	originalTime := client.LastQuery
-
-	// Test client update
-	time.Sleep(time.Millisecond * 10) // Small delay
-	limited = manager.isRateLimited(clientIP)
-	if limited {
-		t.Error("Client should still not be rate limited")
-	}
-
-	// Verify client was updated
-	manager.rateLimiter.mutex.RLock()
-	client = manager.rateLimiter.clients[clientIP]
-	manager.rateLimiter.mutex.RUnlock()
-
-	if !client.LastQuery.After(originalTime) {
-		t.Error("LastQuery should be updated on subsequent checks")
-	}
-}
-
-func TestRateLimiterCleanup(t *testing.T) {
-	manager := createMockManager()
-
-	// Add several clients with different states
-	testClients := map[string]*ClientState{
-		"192.168.1.1": {
-			IP:        "192.168.1.1",
-			LastQuery: time.Now().Add(-time.Hour), // Very old
-			Blocked:   false,
-		},
-		"192.168.1.2": {
-			IP:           "192.168.1.2",
-			LastQuery:    time.Now().Add(-time.Minute),
-			Blocked:      true,
-			BlockedUntil: time.Now().Add(-time.Minute), // Expired block
-		},
-		"192.168.1.3": {
-			IP:           "192.168.1.3",
-			LastQuery:    time.Now(),
-			Blocked:      true,
-			BlockedUntil: time.Now().Add(time.Minute), // Active block
-		},
-	}
-
-	manager.rateLimiter.mutex.Lock()
-	for ip, client := range testClients {
-		manager.rateLimiter.clients[ip] = client
-	}
-	manager.rateLimiter.mutex.Unlock()
-
-	// Verify initial count
-	manager.rateLimiter.mutex.RLock()
-	initialCount := len(manager.rateLimiter.clients)
-	manager.rateLimiter.mutex.RUnlock()
-
-	if initialCount != 3 {
-		t.Errorf("Initial client count = %v, want %v", initialCount, 3)
-	}
-
-	// Test that clients still exist (cleanup is implemented elsewhere)
-	for ip := range testClients {
-		manager.rateLimiter.mutex.RLock()
-		_, exists := manager.rateLimiter.clients[ip]
-		manager.rateLimiter.mutex.RUnlock()
-
-		if !exists {
-			t.Errorf("Client %s should still exist", ip)
+	// Fill up all slots
+	for i := 0; i < maxConcurrent; i++ {
+		if !manager.acquireQuerySlot() {
+			t.Fatalf("Failed to acquire slot %d", i)
 		}
+	}
+
+	// Verify no more slots available
+	if manager.acquireQuerySlot() {
+		t.Error("Should not be able to acquire more slots than maxConcurrent")
+		manager.releaseQuerySlot()
+	}
+
+	// Release all slots
+	for i := 0; i < maxConcurrent; i++ {
+		manager.releaseQuerySlot()
+	}
+
+	// Verify all slots are available again
+	if !manager.acquireQuerySlot() {
+		t.Error("Should be able to acquire slot after releasing all")
+	}
+	manager.releaseQuerySlot()
+
+	// Verify active count is 0
+	if manager.queryProcessor.activeCount != 0 {
+		t.Errorf("activeCount should be 0, got %d", manager.queryProcessor.activeCount)
 	}
 }

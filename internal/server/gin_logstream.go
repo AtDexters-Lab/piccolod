@@ -117,6 +117,18 @@ func startCommandStream(ctx context.Context, cmd *exec.Cmd, cancel context.Cance
 
 func (s *GinServer) handleGinAppLogStream(c *gin.Context) {
 	instanceID := c.Param("name")
+
+	// Check access for standard users
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		if s.userManager != nil {
+			allowed, err := s.userManager.IsAppAllowed(c.Request.Context(), sess.UserID, instanceID)
+			if err != nil || !allowed {
+				writeGinError(c, http.StatusForbidden, "Access denied")
+				return
+			}
+		}
+	}
+
 	tail := parseLogTail(c, 200)
 	timestamps := parseBoolQuery(c, "timestamps", true)
 	service := strings.TrimSpace(c.Query("service"))

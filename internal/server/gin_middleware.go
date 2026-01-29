@@ -4,10 +4,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"piccolod/internal/hostname"
+	"piccolod/internal/services"
 )
 
 // corsMiddleware adds CORS headers for web UI access
@@ -151,7 +156,8 @@ func (s *GinServer) requireUnlocked() gin.HandlerFunc {
 	}
 }
 
-// requireSession ensures a valid session cookie is present and not expired
+// requireSession ensures a valid portal session cookie is present and not expired.
+// RFC 20260122 §6.2: Validates audience="portal" and origin binding.
 func (s *GinServer) requireSession() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id, ok := s.getSession(c)
@@ -160,8 +166,34 @@ func (s *GinServer) requireSession() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if _, ok := s.sessions.Get(id); !ok {
+		origin := s.computeCanonicalOrigin(c)
+		if _, ok := s.sessions.ValidatePortalSession(id, origin); !ok {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// requireAdmin ensures the session user has admin role.
+// Must be used after requireSession middleware.
+func (s *GinServer) requireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, ok := s.getSession(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+		sess, ok := s.sessions.Get(id)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+		if sess.Role != "admin" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "admin role required"})
 			c.Abort()
 			return
 		}
@@ -226,4 +258,164 @@ func (s *GinServer) allowLANOnly() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// lanHostRoutingMiddleware implements LAN host-based routing per RFC 20260122.
+// It routes requests to app 2-level hostnames to the appropriate backend.
+//
+// Routing logic:
+// - piccolo.local / localhost / IP → continue to portal routes
+// - <app>-piccolo.local → app primary listener (2-level format)
+// - <listener>-<app>-piccolo.local → specific listener (2-level format)
+// - Unknown -piccolo.local subdomain → 404
+func (s *GinServer) lanHostRoutingMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s == nil || s.serviceManager == nil {
+			c.Next()
+			return
+		}
+
+		// Get the LAN base hostname
+		lanBase := "piccolo.local"
+		if s.mdnsManager != nil {
+			lanBase = s.mdnsManager.Hostname()
+		}
+
+		// Normalize the request host (strip port if present)
+		reqHost := c.Request.Host
+		if h, _, err := net.SplitHostPort(reqHost); err == nil {
+			reqHost = h
+		}
+		reqHost = strings.TrimSuffix(strings.ToLower(reqHost), ".")
+
+		// Portal hosts: base domain, localhost, or IP addresses
+		// These continue to normal portal routing
+		if reqHost == strings.ToLower(lanBase) ||
+			reqHost == "localhost" ||
+			reqHost == "127.0.0.1" ||
+			net.ParseIP(reqHost) != nil {
+			c.Next()
+			return
+		}
+
+		// Check for app hostname: <label>-<base> (2-level format per RFC 20260122)
+		baseSuffix := "-" + strings.ToLower(lanBase)
+		if !strings.HasSuffix(reqHost, baseSuffix) {
+			// Not a 2-level piccolo.local hostname, continue to portal
+			c.Next()
+			return
+		}
+
+		// Extract the host label (app name or listener-app)
+		hostLabel := hostname.NormalizeHostLabel(reqHost, lanBase)
+		if hostLabel == "" {
+			// Apex domain, continue to portal
+			c.Next()
+			return
+		}
+
+		// Resolve the endpoint by host label
+		// LAN host-based routing is independent of remote port publishing.
+		// Pass 0 to ignore remote port filtering (RFC 20260114 §5.2).
+		ep, ok := s.serviceManager.ResolveByHostLabel(hostLabel, 0)
+		if !ok {
+			// Unknown subdomain
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "no_route",
+				"host":  reqHost,
+			})
+			c.Abort()
+			return
+		}
+
+		// Proxy the request to the resolved endpoint
+		s.proxyToEndpoint(c, ep)
+		c.Abort()
+	}
+}
+
+// proxyToEndpoint proxies the HTTP request to the backend service endpoint.
+// Used for LAN host-based routing per RFC 20260114.
+//
+// Routes to the PublicPort listener which goes through the existing ProxyManager
+// with full auth, cookie handling, and security features.
+//
+// Uses the LocalAddr (interface IP that received the request) to route, ensuring
+// ProxyManager can distinguish LAN traffic from trusted loopback sources (Nexus).
+func (s *GinServer) proxyToEndpoint(c *gin.Context, ep services.ServiceEndpoint) {
+	// Extract the local interface IP that received this request.
+	// This ensures ProxyManager sees a non-loopback LocalAddr for LAN traffic,
+	// preventing header spoofing while still trusting Nexus traffic via loopback.
+	localAddr, ok := c.Request.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "internal_error",
+			"message": "Could not determine local address",
+		})
+		return
+	}
+	targetHost, _, err := net.SplitHostPort(localAddr.String())
+	if err != nil || targetHost == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "internal_error",
+			"message": "Could not parse local address",
+		})
+		return
+	}
+
+	target := &url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(targetHost, strconv.Itoa(ep.PublicPort)),
+	}
+
+	// Provide per-request, non-spoofable forwarding hints to ProxyManager without relying on
+	// loopback trust. This preserves real LAN client IP while keeping forwarded headers
+	// zero-trust by default (ProxyManager still overwrites X-Forwarded-* for untrusted hops).
+	hintToken := ""
+	if s != nil && s.serviceManager != nil {
+		if pm := s.serviceManager.ProxyManager(); pm != nil {
+			clientIP := ""
+			if host, _, err := net.SplitHostPort(c.Request.RemoteAddr); err == nil {
+				clientIP = host
+			} else if ip := net.ParseIP(strings.Trim(c.Request.RemoteAddr, "[]")); ip != nil {
+				clientIP = ip.String()
+			}
+			isTLS := s.isSecureRequest(c.Request)
+			remotePort := 80
+			if isTLS {
+				remotePort = 443
+			}
+			if _, port, err := net.SplitHostPort(c.Request.Host); err == nil {
+				if p, err := strconv.Atoi(port); err == nil && p > 0 {
+					remotePort = p
+				}
+			}
+			if tok, ok := pm.IssueRequestHint(ep.PublicPort, clientIP, isTLS, remotePort); ok {
+				hintToken = tok
+			}
+		}
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Director = func(req *http.Request) {
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.Host = c.Request.Host // Preserve original Host for ProxyManager to use
+
+		// Attach a one-time hint token so ProxyManager can recover the real client address
+		// even when the portal is the TCP peer for the PublicPort hop.
+		req.Header.Del(services.HeaderPiccoloHintToken)
+		if hintToken != "" {
+			req.Header.Set(services.HeaderPiccoloHintToken, hintToken)
+		}
+	}
+
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":   "backend_unavailable",
+			"message": "The backend service is not responding",
+		})
+	}
+
+	proxy.ServeHTTP(c.Writer, c.Request)
 }

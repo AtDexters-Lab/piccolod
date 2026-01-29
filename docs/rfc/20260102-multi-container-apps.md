@@ -4,11 +4,11 @@
 **Status:** Implemented
 
 ## 1. Summary
-Piccolo apps are currently modeled as **one app instance = one Podman container**. This RFC proposes evolving the runtime and manifest format to support **multiple containers per app instance** (Compose-style) for **`x-piccolo.mode: service` apps only**.
+Piccolo apps are currently modeled as **one app instance = one Podman container**. This RFC evolves the runtime and manifest format to support **multiple containers per app instance** (Compose-style) for **`x-piccolo.mode: service` apps**, while standardizing on a `services`-first manifest for **all modes**.
 
 Explicit product/platform decisions captured here:
 - **No in-daemon image builds:** manifests must specify `image`; `build:` (containerfile/git) is rejected.
-- **Workspaces stay single-container:** `x-piccolo.mode: workspace` remains a single container (VM-like). Multi-container is not supported for workspace mode (see `docs/rfc/20260101-workspace-disk-container-independent.md` for workspace persistence direction).
+- **Workspaces stay single-container:** `x-piccolo.mode: workspace` remains a single container (VM-like) at runtime, but manifests still use `services` with exactly one service (see `docs/rfc/20260101-workspace-disk-container-independent.md` for workspace persistence direction).
 - **No inter-app dependencies, ever:** the platform does not model “app A depends on app B”. Dependencies must be packaged inside an app as sidecars.
 - **No backwards-compat requirement:** assume no existing deployments; manifest/runtime changes do not need a migration strategy.
 
@@ -63,23 +63,23 @@ Key implementation touchpoints (non-exhaustive):
 
 ## 4. Proposed Manifest Evolution
 
-### 4.1 Add `services` (service-mode only)
-We introduce an optional `services:` map for **`x-piccolo.mode: service`** apps. Each entry describes one container (“service”) belonging to the app instance.
+### 4.1 Add `services` (required for service + workspace)
+We introduce a required `services:` map for **all apps**. Each entry describes one container (“service”) belonging to the app instance.
 
 Ergonomics rules:
-- If `services` is omitted: treat the manifest as a single-service app with the implicit service name `main` (using the existing top-level container fields).
-- If `services` is present:
-  - The primary service is `primary_service` if specified, else defaults to `main`.
-  - All per-container fields must live under `services.<name>`; top-level container fields are rejected when `services` is present (e.g. `image`, `environment`, `storage`, `resources`).
-  - App-level fields remain at the root (e.g. `listeners`, `healthcheck`, `permissions`, `app_config`, `x-piccolo`).
+- Service mode: `services` may define multiple containers.
+- Workspace mode: `services` must define **exactly one** container (workspace remains single-container at runtime).
+- The primary service is `primary_service` if specified, else defaults to `main`.
+- All per-container fields must live under `services.<name>`; top-level container fields are rejected (e.g. `image`, `environment`, `storage`, `resources`).
+- App-level fields remain at the root (e.g. `listeners`, `healthcheck`, `permissions`, `app_config`, `x-piccolo`).
 
 Validation rules:
 - `build:` is rejected (platform does not build images).
 - Top-level `depends_on:` is rejected (no inter-app dependencies).
-- If `x-piccolo.mode: workspace`, `services:` is rejected (workspace is single-container).
-- If `services` is present, reject top-level container fields (no implicit “defaults for primary”).
-- If `services` is present, every service must declare `bind_ports` (may be empty) so Piccolo can validate shared port namespace collisions at manifest time.
-- If `services` is present, the primary service’s `bind_ports` must include every `listeners[].guest_port` (v1 listeners target the primary service by default).
+- Workspace mode requires exactly one service; service mode requires at least one service.
+- Reject top-level container fields (no implicit “defaults for primary”).
+- Every service must declare `bind_ports` (may be empty) so Piccolo can validate shared port namespace collisions at manifest time.
+- The primary service’s `bind_ports` must include every `listeners[].guest_port` (v1 listeners target the primary service by default).
 
 ### 4.2 New fields
 

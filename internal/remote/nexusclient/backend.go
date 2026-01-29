@@ -188,12 +188,11 @@ func (a *BackendAdapter) currentConfig() Config {
 }
 
 func buildHostnameList(cfg Config) []string {
-	hosts := []string{strings.TrimSuffix(strings.ToLower(cfg.PortalHostname), ".")}
-	if cfg.TLD != "" {
-		trimmed := strings.TrimSuffix(strings.ToLower(cfg.TLD), ".")
-		if trimmed != "" {
-			hosts = append(hosts, "*."+trimmed)
-		}
+	base := strings.TrimSuffix(strings.ToLower(cfg.PortalHostname), ".")
+	hosts := []string{base}
+	if base != "" {
+		// RFC 20260114: remote base is the portal hostname apex; apps are <label>.<base>.
+		hosts = append(hosts, "*."+base)
 	}
 	return hosts
 }

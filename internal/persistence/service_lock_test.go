@@ -97,6 +97,30 @@ func (s *stubLockableControl) AppState() AppStateRepo {
 	return nil
 }
 
+func (s *stubLockableControl) Users() UserRepo {
+	return nil
+}
+
+func (s *stubLockableControl) OIDCClients() OIDCClientRepo {
+	return nil
+}
+
+func (s *stubLockableControl) OIDCKeys() OIDCKeyRepo {
+	return nil
+}
+
+func (s *stubLockableControl) OIDCAuthCodes() OIDCAuthCodeRepo {
+	return nil
+}
+
+func (s *stubLockableControl) OIDCRefreshTokens() OIDCRefreshTokenRepo {
+	return nil
+}
+
+func (s *stubLockableControl) OIDCConfig() OIDCConfigRepo {
+	return nil
+}
+
 func (s *stubLockableControl) Close(context.Context) error {
 	return nil
 }

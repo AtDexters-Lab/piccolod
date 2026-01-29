@@ -12,14 +12,19 @@ import (
 	"piccolod/internal/services"
 )
 
-func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppDefinition, instanceID, displayName string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint) (*AppInstance, error) {
+// installContainerGroup installs an app as a container group (network anchor + service containers).
+// This is the unified install path for both service and workspace modes.
+// For workspace mode, it prepares workspace disks and uses --rootfs mode.
+// For service mode, it uses standard image-based containers.
+func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID, displayName string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint) (*AppInstance, error) {
 	if m.serviceManager == nil {
 		return nil, fmt.Errorf("app manager: service manager not configured")
 	}
 	if appDef == nil || appDef.Services == nil || len(appDef.Services) == 0 {
-		return nil, fmt.Errorf("multi-container install requires services")
+		return nil, fmt.Errorf("container group install requires services")
 	}
 
+	mode := piccoloModeFromExtensions(appDef.Extensions)
 	primary := primaryServiceFor(appDef, nil)
 	startOrder, err := serviceStartOrder(appDef.Services)
 	if err != nil {
@@ -103,18 +108,34 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 	}
 	m.pruneMultiContainerZombies(ctx, runtime, instanceID, expectedNames)
 
-	// Best-effort pulls: multi-container apps may reference multiple images.
-	images := map[string]struct{}{}
-	images[networkAnchorImage()] = struct{}{}
-	for _, svc := range appDef.Services {
-		if svc.Image != "" {
-			images[svc.Image] = struct{}{}
-		}
+	// Validate and repair podman overlay storage before pulling images.
+	// Previous failed installs (e.g., killed by HTTP timeout) can leave corrupted overlay
+	// layers that cause subsequent pulls to fail with "readlink .../diff: no such file or directory".
+	if repaired, err := m.containerManager.ValidateAndRepairStorage(ctx, runtime); err != nil {
+		log.Printf("WARN: install %s: storage validation error: %v", instanceID, err)
+	} else if repaired {
+		log.Printf("INFO: install %s: repaired corrupted podman storage before pull", instanceID)
 	}
-	for img := range images {
-		if err := m.containerManager.PullImage(ctx, runtime, img); err != nil {
-			log.Printf("WARN: install %s: image pull failed image=%s: %v", instanceID, img, err)
+
+	// Prepare storage for each service (pull images or init workspace disks)
+	workspaceInfos := make(map[string]*workspaceMountInfo, len(appDef.Services))
+	for svcName := range appDef.Services {
+		info, err := m.prepareServiceStorage(ctx, mode, svcName, appDef, instanceID, layout, runtime)
+		if err != nil {
+			// Cleanup any workspace disks already initialized
+			if mode == ModeWorkspace {
+				if unmountErr := m.unmountWorkspaceDisk(ctx, instanceID, layout); unmountErr != nil {
+					log.Printf("WARN: install %s: cleanup unmount failed: %v", instanceID, unmountErr)
+				}
+			}
+			return nil, fmt.Errorf("prepare storage for service '%s': %w", svcName, err)
 		}
+		workspaceInfos[svcName] = info
+	}
+
+	// Pull network anchor image (always image-based)
+	if err := m.containerManager.PullImage(ctx, runtime, networkAnchorImage()); err != nil {
+		log.Printf("WARN: install %s: network anchor image pull failed: %v", instanceID, err)
 	}
 
 	created := make([]string, 0, 1+len(appDef.Services))
@@ -123,6 +144,12 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 			cid := created[i]
 			_ = m.containerManager.StopContainer(ctx, runtime, cid)
 			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
+		}
+		// Cleanup workspace disk on failure
+		if mode == ModeWorkspace {
+			if unmountErr := m.unmountWorkspaceDisk(ctx, instanceID, layout); unmountErr != nil {
+				log.Printf("WARN: install %s: cleanup unmount failed: %v", instanceID, unmountErr)
+			}
 		}
 	}
 
@@ -136,6 +163,11 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 	}
 	for _, ep := range endpoints {
 		anchorSpec.Ports = append(anchorSpec.Ports, container.PortMapping{Host: ep.HostBind, Container: ep.GuestPort})
+	}
+	// Add host gateway entry to the anchor (which owns the network namespace).
+	// Service containers share this namespace and inherit the /etc/hosts entries.
+	if hostEntry, err := container.HostGatewayEntry(); err == nil {
+		anchorSpec.ExtraHosts = append(anchorSpec.ExtraHosts, hostEntry)
 	}
 	if err := container.ValidateContainerSpec(anchorSpec); err != nil {
 		return nil, fmt.Errorf("invalid network anchor spec: %w", err)
@@ -167,6 +199,7 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 		}
 		if zombieID != "" {
 			log.Printf("INFO: install %s: removing zombie container %s (network anchor)", instanceID, zombieID)
+			_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
 			_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
 			continue
 		}
@@ -194,7 +227,20 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 		updateSubtask(svcName, 10, "Creating")
 		emitCreateProgress(fmt.Sprintf("Creating container (%d/%d): %s", doneContainers+1, totalContainers, svcName))
 
-		spec, err := m.buildServiceContainerSpec(layout, appDef, instanceID, primary, svcName, anchorID)
+		// Build container spec, with workspace info if available
+		opts := serviceContainerOptions{
+			layout:     layout,
+			appDef:     appDef,
+			instanceID: instanceID,
+			primary:    primary,
+			svcName:    svcName,
+			anchorID:   anchorID,
+		}
+		if info := workspaceInfos[svcName]; info != nil {
+			opts.mergedRootfs = info.mergedPath
+			opts.workspaceMeta = info.meta
+		}
+		spec, err := m.buildServiceContainerSpec(opts)
 		if err != nil {
 			cleanup()
 			return nil, err
@@ -223,6 +269,7 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 			}
 			if zombieID != "" {
 				log.Printf("INFO: install %s: removing zombie container %s (service=%s)", instanceID, zombieID, svcName)
+				_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
 				_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
 				continue
 			}
@@ -265,7 +312,6 @@ func (m *AppManager) installMultiContainer(ctx context.Context, appDef *api.AppD
 		InstanceID:      instanceID,
 		DisplayName:     displayName,
 		Status:          "running",
-		ContainerID:     primaryCID,
 		PrimaryService:  primary,
 		NetworkAnchorID: anchorID,
 		Containers:      containers,

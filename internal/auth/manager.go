@@ -117,6 +117,9 @@ func (m *Manager) Setup(ctx context.Context, password string) error {
 	if strings.TrimSpace(password) == "" {
 		return errors.New("password required")
 	}
+	if err := validatePasswordStrength(password); err != nil {
+		return err
+	}
 	return m.updateState(ctx, func(state *State) error {
 		if state.Initialized {
 			return errors.New("admin already set up")
@@ -135,6 +138,9 @@ func (m *Manager) Setup(ctx context.Context, password string) error {
 func (m *Manager) ChangePassword(ctx context.Context, old, newp string) error {
 	if strings.TrimSpace(old) == "" || strings.TrimSpace(newp) == "" {
 		return errors.New("passwords required")
+	}
+	if err := validatePasswordStrength(newp); err != nil {
+		return err
 	}
 	return m.updateState(ctx, func(state *State) error {
 		if !state.Initialized {
@@ -156,6 +162,9 @@ func (m *Manager) ChangePassword(ctx context.Context, old, newp string) error {
 func (m *Manager) ChangePasswordWithRecovery(ctx context.Context, newp string) error {
 	if strings.TrimSpace(newp) == "" {
 		return errors.New("password required")
+	}
+	if err := validatePasswordStrength(newp); err != nil {
+		return err
 	}
 	return m.updateState(ctx, func(state *State) error {
 		if !state.Initialized {
@@ -183,6 +192,11 @@ func (m *Manager) Verify(ctx context.Context, username, password string) (bool, 
 		return false, nil
 	}
 	return verifyArgon2id(st.PasswordHash, password), nil
+}
+
+// VerifyHash verifies a password against an Argon2id hash.
+func (m *Manager) VerifyHash(hash, password string) bool {
+	return verifyArgon2id(hash, password)
 }
 
 type fileState struct {
@@ -317,11 +331,17 @@ func verifyArgon2id(encoded, password string) bool {
 }
 
 // Session store (in-memory)
+// RFC 20260122 §6.2: Each session is bound to an audience and origin
 type Session struct {
-	ID        string
-	User      string
-	CSRF      string
-	ExpiresAt int64 // unix seconds
+	ID              string
+	UserID          string // User UUID from users table
+	User            string // Username for display
+	Role            string // "admin" or "standard"
+	CSRF            string
+	ExpiresAt       int64  // unix seconds
+	Audience        string // RFC 20260122 §6.2: "portal" | "app:<appname>" - binds session to specific context
+	BoundOrigin     string // RFC 20260122 §6.2: Canonical origin (scheme://host[:port]) - prevents cross-origin replay
+	ParentSessionID string // RFC 20260122 §6.3: For app sessions, ID of portal session that authorized this session
 }
 
 type SessionStore struct {
@@ -339,10 +359,73 @@ func randString(n int) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-func (s *SessionStore) Create(user string, ttlSeconds int64) *Session {
+// CreateWithUserInfo creates a new portal session with full user information.
+// This method creates a session with audience="portal" for backwards compatibility.
+func (s *SessionStore) CreateWithUserInfo(userID, username, role string, ttlSeconds int64) *Session {
 	id := randString(32)
 	csrf := randString(16)
-	sess := &Session{ID: id, User: user, CSRF: csrf, ExpiresAt: (timeNow().Unix() + ttlSeconds)}
+	sess := &Session{
+		ID:        id,
+		UserID:    userID,
+		User:      username,
+		Role:      role,
+		CSRF:      csrf,
+		ExpiresAt: timeNow().Unix() + ttlSeconds,
+		Audience:  "portal", // Default to portal audience for backwards compatibility
+	}
+	s.mu.Lock()
+	s.sessions[id] = sess
+	s.mu.Unlock()
+	return sess
+}
+
+// CreatePortalSession creates a new portal session with origin binding per RFC 20260122 §6.2.
+func (s *SessionStore) CreatePortalSession(userID, username, role, boundOrigin string, ttlSeconds int64) *Session {
+	id := randString(32)
+	csrf := randString(16)
+	sess := &Session{
+		ID:          id,
+		UserID:      userID,
+		User:        username,
+		Role:        role,
+		CSRF:        csrf,
+		ExpiresAt:   timeNow().Unix() + ttlSeconds,
+		Audience:    "portal",
+		BoundOrigin: boundOrigin,
+	}
+	s.mu.Lock()
+	s.sessions[id] = sess
+	s.mu.Unlock()
+	return sess
+}
+
+// AppSessionParams contains parameters for creating an app session.
+type AppSessionParams struct {
+	UserID          string
+	Username        string
+	Role            string
+	AppName         string // App name for audience binding
+	BoundOrigin     string // Canonical origin (scheme://host[:port])
+	ParentSessionID string // Portal session that authorized this session
+	TTLSeconds      int64
+}
+
+// CreateAppSession creates a new app-scoped session per RFC 20260122 §5.8.
+// The session is bound to a specific app and origin for security.
+func (s *SessionStore) CreateAppSession(params AppSessionParams) *Session {
+	id := randString(32)
+	csrf := randString(16)
+	sess := &Session{
+		ID:              id,
+		UserID:          params.UserID,
+		User:            params.Username,
+		Role:            params.Role,
+		CSRF:            csrf,
+		ExpiresAt:       timeNow().Unix() + params.TTLSeconds,
+		Audience:        "app:" + params.AppName,
+		BoundOrigin:     params.BoundOrigin,
+		ParentSessionID: params.ParentSessionID,
+	}
 	s.mu.Lock()
 	s.sessions[id] = sess
 	s.mu.Unlock()
@@ -380,5 +463,117 @@ func (s *SessionStore) RotateCSRF(id string) (string, bool) {
 	return sess.CSRF, true
 }
 
+// ValidatePortalSession validates a session for portal access per RFC 20260122 §6.2.
+// Checks that the session has audience="portal" and validates origin binding.
+func (s *SessionStore) ValidatePortalSession(id, requestOrigin string) (*Session, bool) {
+	sess, ok := s.Get(id)
+	if !ok {
+		return nil, false
+	}
+
+	// Check audience is "portal"
+	if sess.Audience != "portal" && sess.Audience != "" {
+		// Empty audience for backwards compatibility with existing sessions
+		return nil, false
+	}
+
+	// Check origin binding: fail closed if session has BoundOrigin but request origin is empty
+	// (indicates an origin computation failure — must not bypass validation).
+	if sess.BoundOrigin != "" {
+		if requestOrigin == "" || sess.BoundOrigin != requestOrigin {
+			return nil, false
+		}
+	}
+
+	return sess, true
+}
+
+// ValidateAppSession validates a session for app access per RFC 20260122 §6.2.
+// Checks that the session has audience="app:<appName>" and validates origin binding.
+func (s *SessionStore) ValidateAppSession(id, appName, requestOrigin string) (*Session, bool) {
+	sess, ok := s.Get(id)
+	if !ok {
+		return nil, false
+	}
+
+	// Check audience matches the app
+	expectedAudience := "app:" + appName
+	if sess.Audience != expectedAudience {
+		return nil, false
+	}
+
+	// Check origin binding: fail closed if session has BoundOrigin but request origin is empty
+	// (indicates an origin computation failure — must not bypass validation).
+	if sess.BoundOrigin != "" {
+		if requestOrigin == "" || sess.BoundOrigin != requestOrigin {
+			return nil, false
+		}
+	}
+
+	return sess, true
+}
+
+// DeleteWithPropagation deletes a portal session and all derived app sessions per RFC 20260122 §6.3.
+// This implements logout propagation: portal logout invalidates all app sessions.
+func (s *SessionStore) DeleteWithPropagation(portalSessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// First, collect all sessions with this parent (while holding the lock)
+	toDelete := []string{portalSessionID}
+	for id, sess := range s.sessions {
+		if sess.ParentSessionID == portalSessionID {
+			toDelete = append(toDelete, id)
+		}
+	}
+
+	// Delete all collected sessions
+	for _, id := range toDelete {
+		delete(s.sessions, id)
+	}
+}
+
+// FindByParent returns all sessions with the given parent session ID.
+// Used for logout propagation per RFC 20260122 §6.3.
+func (s *SessionStore) FindByParent(parentID string) []*Session {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []*Session
+	for _, sess := range s.sessions {
+		if sess.ParentSessionID == parentID {
+			result = append(result, sess)
+		}
+	}
+	return result
+}
+
 // timeNow is a small indirection for tests
 var timeNow = func() time.Time { return time.Now() }
+
+// CanonicalOrigin computes the canonical origin from a request per RFC 20260122 §6.2.
+// Origin format: scheme://host[:port] with default ports omitted.
+// This function does NOT trust X-Forwarded-Proto by default (set trustForwardedProto explicitly).
+func CanonicalOrigin(scheme, host string, port int, trustForwardedProto bool, forwardedProto string) string {
+	// Determine scheme
+	if trustForwardedProto && forwardedProto == "https" {
+		scheme = "https"
+	}
+	if scheme == "" {
+		scheme = "http"
+	}
+
+	// Normalize host
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" {
+		return ""
+	}
+
+	// Handle default ports
+	isDefaultPort := (scheme == "http" && port == 80) || (scheme == "https" && port == 443) || port == 0
+	if isDefaultPort {
+		return scheme + "://" + host
+	}
+
+	return fmt.Sprintf("%s://%s:%d", scheme, host, port)
+}

@@ -39,11 +39,10 @@ type AppMetadata struct {
 	DisplayName string `json:"display_name,omitempty"`
 	AppName     string `json:"app_name"`
 	Status      string `json:"status"` // "created", "running", "stopped", "error"
-	ContainerID string `json:"container_id"`
-	// Multi-container runtime metadata (service mode only).
+	// Container runtime metadata.
 	PrimaryService  string            `json:"primary_service,omitempty"`
 	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`
-	Containers      map[string]string `json:"containers,omitempty"`
+	Containers      map[string]string `json:"containers,omitempty"` // service name -> container ID
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
 	Enabled         bool              `json:"enabled"`
@@ -161,7 +160,6 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 		InstanceID:      metadata.InstanceID,
 		DisplayName:     metadata.DisplayName,
 		Status:          metadata.Status,
-		ContainerID:     metadata.ContainerID,
 		PrimaryService:  metadata.PrimaryService,
 		NetworkAnchorID: metadata.NetworkAnchorID,
 		Containers:      metadata.Containers,
@@ -268,7 +266,6 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDef
 		DisplayName:     app.DisplayName,
 		AppName:         def.Name,
 		Status:          app.Status,
-		ContainerID:     app.ContainerID,
 		PrimaryService:  app.PrimaryService,
 		NetworkAnchorID: app.NetworkAnchorID,
 		Containers:      app.Containers,
@@ -296,6 +293,7 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDef
 
 // UpdateAppRuntime updates app runtime metadata (status and container ID) and persists metadata.json.
 // The instanceID parameter is the unique instance identifier.
+// The containerID parameter updates the primary service container ID via SetPrimaryContainerID().
 func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containerID string) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
@@ -311,7 +309,7 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 		app.Status = status
 	}
 	if containerID != "" {
-		app.ContainerID = containerID
+		app.SetPrimaryContainerID(containerID)
 	}
 	app.UpdatedAt = time.Now()
 	createdAt := app.CreatedAt
@@ -331,7 +329,6 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 		DisplayName:     displayName,
 		AppName:         appName,
 		Status:          app.Status,
-		ContainerID:     app.ContainerID,
 		PrimaryService:  primaryService,
 		NetworkAnchorID: networkAnchorID,
 		Containers:      containers,

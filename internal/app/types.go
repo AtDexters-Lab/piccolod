@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,9 @@ type ContainerManager interface {
 	UpdatePublishAdd(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
 	UpdatePublishRemove(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
 	ResetStorage(ctx context.Context, runtime container.PodmanRuntime) error
+	// ValidateAndRepairStorage checks if overlay storage is healthy and repairs if corrupted.
+	// Returns true if repair was performed.
+	ValidateAndRepairStorage(ctx context.Context, runtime container.PodmanRuntime) (bool, error)
 	// ImageExists checks if an image exists in local storage.
 	ImageExists(ctx context.Context, runtime container.PodmanRuntime, imageName string) (bool, error)
 	// RemoveImage removes an image from local storage.
@@ -47,14 +51,19 @@ type AppInstance struct {
 	InstanceID  string `json:"instance_id"`
 	DisplayName string `json:"display_name,omitempty"`
 	Status      string `json:"status"`
-	ContainerID string `json:"container_id"`
-	// Multi-container runtime metadata (service mode only).
-	PrimaryService  string             `json:"primary_service,omitempty"`
-	NetworkAnchorID string             `json:"network_anchor_id,omitempty"`
-	Containers      map[string]string  `json:"containers,omitempty"`
-	CreatedAt       time.Time          `json:"created_at"`
-	UpdatedAt       time.Time          `json:"updated_at"`
+	// Container runtime metadata.
+	PrimaryService  string            `json:"primary_service,omitempty"`
+	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`
+	Containers      map[string]string `json:"containers,omitempty"` // service name -> container ID
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at"`
 	Definition      *api.AppDefinition `json:"definition,omitempty"`
+
+	// Startup failure tracking for escalation (RFC 20260125)
+	// After StartupEscalateAfterAttempts consecutive failures OR StartupEscalateAfterDuration,
+	// status escalates from "starting" to "error".
+	StartupAttempts       int        `json:"startup_attempts,omitempty"`
+	FirstStartupFailureAt *time.Time `json:"first_startup_failure_at,omitempty"`
 }
 
 // Helper methods to access commonly used Definition fields safely
@@ -69,10 +78,30 @@ func (a *AppInstance) AppName() string {
 
 // Image returns the image from the definition, or empty string if nil.
 func (a *AppInstance) Image() string {
-	if a.Definition == nil {
+	return imageFromDefinition(a.Definition)
+}
+
+func imageFromDefinition(def *api.AppDefinition) string {
+	if def == nil || def.Services == nil {
 		return ""
 	}
-	return a.Definition.Image
+	primary := strings.TrimSpace(def.PrimaryService)
+	if primary == "" {
+		primary = defaultPrimaryServiceName
+	}
+	if svc, ok := def.Services[primary]; ok {
+		return svc.Image
+	}
+	// Fallback to first service alphabetically if primary not found
+	names := make([]string, 0, len(def.Services))
+	for name := range def.Services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) > 0 {
+		return def.Services[names[0]].Image
+	}
+	return ""
 }
 
 // Type returns the type from the definition, or empty string if nil.
@@ -91,6 +120,34 @@ func (a *AppInstance) Mode() PiccoloMode {
 	return piccoloModeFromExtensions(a.Definition.Extensions)
 }
 
+// PrimaryContainerID returns the container ID of the primary service.
+// This is the canonical method to get the primary container ID.
+func (a *AppInstance) PrimaryContainerID() string {
+	if a == nil || a.Containers == nil {
+		return ""
+	}
+	primary := a.PrimaryService
+	if primary == "" {
+		primary = defaultPrimaryServiceName
+	}
+	return a.Containers[primary]
+}
+
+// SetPrimaryContainerID sets the container ID for the primary service.
+func (a *AppInstance) SetPrimaryContainerID(cid string) {
+	if a == nil {
+		return
+	}
+	primary := a.PrimaryService
+	if primary == "" {
+		primary = defaultPrimaryServiceName
+	}
+	if a.Containers == nil {
+		a.Containers = make(map[string]string)
+	}
+	a.Containers[primary] = cid
+}
+
 // PublishContainerID returns the container ID that owns published listener ports.
 // For single-container apps this is the primary container; for multi-container apps it is the network anchor.
 func (a *AppInstance) PublishContainerID() string {
@@ -100,5 +157,5 @@ func (a *AppInstance) PublishContainerID() string {
 	if strings.TrimSpace(a.NetworkAnchorID) != "" {
 		return a.NetworkAnchorID
 	}
-	return a.ContainerID
+	return a.PrimaryContainerID()
 }

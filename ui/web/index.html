@@ -149,6 +149,12 @@
       var loader = document.getElementById('preloader');
       if (loader) loader.remove();
     });
+
+    // Prevent browser context menu on Flutter app to allow custom right-click menus
+    document.addEventListener('contextmenu', function (e) {
+      e.preventDefault();
+      return false;
+    });
   </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>

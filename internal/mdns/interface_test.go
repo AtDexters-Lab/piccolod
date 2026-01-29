@@ -60,12 +60,9 @@ func TestSetupInterface_InvalidInterface(t *testing.T) {
 }
 
 func TestDiscoverInterfacesCopiesInterfacePointers(t *testing.T) {
+	interfaceFuncsMu.Lock()
 	origList := listNetworkInterfaces
 	origAddrs := interfaceAddrs
-	defer func() {
-		listNetworkInterfaces = origList
-		interfaceAddrs = origAddrs
-	}()
 
 	iface1 := net.Interface{Name: "eth0", Flags: net.FlagUp | net.FlagMulticast}
 	iface2 := net.Interface{Name: "wlan0", Flags: net.FlagUp | net.FlagMulticast}
@@ -82,6 +79,14 @@ func TestDiscoverInterfacesCopiesInterfacePointers(t *testing.T) {
 			},
 		}, nil
 	}
+	interfaceFuncsMu.Unlock()
+
+	t.Cleanup(func() {
+		interfaceFuncsMu.Lock()
+		listNetworkInterfaces = origList
+		interfaceAddrs = origAddrs
+		interfaceFuncsMu.Unlock()
+	})
 
 	manager := NewManager()
 	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
@@ -92,16 +97,7 @@ func TestDiscoverInterfacesCopiesInterfacePointers(t *testing.T) {
 	}
 
 	t.Cleanup(func() {
-		close(manager.stopCh)
-		manager.wg.Wait()
-		for _, state := range manager.interfaces {
-			if state.IPv4Conn != nil {
-				state.IPv4Conn.Close()
-			}
-			if state.IPv6Conn != nil {
-				state.IPv6Conn.Close()
-			}
-		}
+		_ = manager.Stop()
 	})
 
 	if err := manager.discoverInterfaces(); err != nil {
@@ -253,4 +249,94 @@ func TestInterfaceResponder_Goroutine(t *testing.T) {
 	}()
 
 	manager.wg.Wait()
+}
+
+func TestIsVirtualInterface(t *testing.T) {
+	tests := []struct {
+		name     string
+		iface    string
+		expected bool
+	}{
+		// Container runtimes
+		{"podman bridge", "podman0", true},
+		{"podman network", "podman1", true},
+		{"docker bridge", "docker0", true},
+		{"docker network", "docker_gwbridge", true},
+		{"cni interface", "cni0", true},
+
+		// Virtual ethernet pairs
+		{"veth pair", "veth123abc", true},
+		{"veth uppercase", "VETH456DEF", true},
+		{"vnet interface", "vnet0", true},
+
+		// Virtual bridges
+		{"docker bridge prefix", "br-abc123", true},
+		{"libvirt bridge", "virbr0", true},
+		{"libvirt bridge 1", "virbr1", true},
+
+		// Tunnel interfaces
+		{"tap interface", "tap0", true},
+		{"tun interface", "tun0", true},
+
+		// Dummy interfaces
+		{"dummy interface", "dummy0", true},
+
+		// macOS/BSD specific
+		{"macos vpn tunnel", "utun0", true},
+		{"apple wireless direct", "awdl0", true},
+		{"low latency wlan", "llw0", true},
+		{"gif tunnel", "gif0", true},
+		{"stf tunnel", "stf0", true},
+
+		// Kubernetes CNI
+		{"flannel interface", "flannel.1", true},
+		{"calico interface", "cali123", true},
+		{"weave interface", "weave", true},
+
+		// LXC/LXD
+		{"lxc bridge", "lxcbr0", true},
+		{"lxd bridge", "lxdbr0", true},
+
+		// Hypervisors
+		{"virtualbox", "vboxnet0", true},
+		{"vmware", "vmnet8", true},
+		{"hyperv", "hyperv0", true},
+
+		// Physical interfaces (should NOT match)
+		{"ethernet", "eth0", false},
+		{"ethernet predictable", "enp0s3", false},
+		{"ethernet systemd", "ens192", false},
+		{"ethernet onboard", "eno1", false},
+		{"wireless", "wlan0", false},
+		{"wireless predictable", "wlp2s0", false},
+		{"macos ethernet", "en0", false},
+		{"macos ethernet 1", "en1", false},
+		{"loopback", "lo", false},
+
+		// Edge cases
+		{"empty string", "", false},
+		{"partial match pod", "pod", false},
+		{"partial match doc", "doc", false},
+		{"similar but not veth", "vethereum", true}, // starts with veth
+		{"bridge without dash", "bridge0", false},   // "br-" requires dash
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isVirtualInterface(tt.iface)
+			if result != tt.expected {
+				t.Errorf("isVirtualInterface(%q) = %v, want %v", tt.iface, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsVirtualInterface_AllPrefixesCovered(t *testing.T) {
+	// Ensure each prefix in virtualInterfacePrefixes is tested
+	for _, prefix := range virtualInterfacePrefixes {
+		testName := prefix + "0"
+		if !isVirtualInterface(testName) {
+			t.Errorf("prefix %q not detected: isVirtualInterface(%q) = false", prefix, testName)
+		}
+	}
 }

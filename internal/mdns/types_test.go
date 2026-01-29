@@ -80,56 +80,6 @@ func TestInterfaceState(t *testing.T) {
 	}
 }
 
-func TestClientState(t *testing.T) {
-	tests := []struct {
-		name       string
-		ip         string
-		queryCount uint64
-		blocked    bool
-	}{
-		{
-			name:       "Normal client",
-			ip:         "192.168.1.100",
-			queryCount: 5,
-			blocked:    false,
-		},
-		{
-			name:       "Blocked client",
-			ip:         "192.168.1.200",
-			queryCount: 100,
-			blocked:    true,
-		},
-		{
-			name:       "IPv6 client",
-			ip:         "2001:db8::1",
-			queryCount: 0,
-			blocked:    false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			client := createMockClientState(tt.ip, tt.queryCount, tt.blocked)
-
-			if client.IP != tt.ip {
-				t.Errorf("IP = %v, want %v", client.IP, tt.ip)
-			}
-
-			if client.QueryCount != tt.queryCount {
-				t.Errorf("QueryCount = %v, want %v", client.QueryCount, tt.queryCount)
-			}
-
-			if client.Blocked != tt.blocked {
-				t.Errorf("Blocked = %v, want %v", client.Blocked, tt.blocked)
-			}
-
-			if !assertTimestamp(client.LastQuery, time.Second) {
-				t.Error("LastQuery timestamp should be recent")
-			}
-		})
-	}
-}
-
 func TestSecurityConfig(t *testing.T) {
 	config := createMockSecurityConfig()
 
@@ -140,12 +90,6 @@ func TestSecurityConfig(t *testing.T) {
 		getValue func() interface{}
 		isValid  func(interface{}) bool
 	}{
-		{
-			name:     "MaxQueriesPerSecond positive",
-			field:    "MaxQueriesPerSecond",
-			getValue: func() interface{} { return config.MaxQueriesPerSecond },
-			isValid:  func(v interface{}) bool { return v.(int) > 0 },
-		},
 		{
 			name:     "MaxPacketSize reasonable",
 			field:    "MaxPacketSize",
@@ -159,10 +103,10 @@ func TestSecurityConfig(t *testing.T) {
 			isValid:  func(v interface{}) bool { return v.(time.Duration) > 0 },
 		},
 		{
-			name:     "ClientBlockDuration positive",
-			field:    "ClientBlockDuration",
-			getValue: func() interface{} { return config.ClientBlockDuration },
-			isValid:  func(v interface{}) bool { return v.(time.Duration) > 0 },
+			name:     "MaxConcurrentQueries positive",
+			field:    "MaxConcurrentQueries",
+			getValue: func() interface{} { return config.MaxConcurrentQueries },
+			isValid:  func(v interface{}) bool { return v.(int) > 0 },
 		},
 	}
 
@@ -247,43 +191,10 @@ func TestConflictingHost(t *testing.T) {
 	}
 }
 
-func TestRateLimiter(t *testing.T) {
-	rateLimiter := &RateLimiter{
-		clients: make(map[string]*ClientState),
-	}
-
-	// Test initial state
-	if len(rateLimiter.clients) != 0 {
-		t.Error("Expected empty clients map initially")
-	}
-
-	// Test adding clients
-	testIPs := []string{"192.168.1.1", "192.168.1.2", "2001:db8::1"}
-	for _, ip := range testIPs {
-		client := createMockClientState(ip, 0, false)
-		rateLimiter.clients[ip] = client
-	}
-
-	if len(rateLimiter.clients) != len(testIPs) {
-		t.Errorf("Expected %d clients, got %d", len(testIPs), len(rateLimiter.clients))
-	}
-
-	// Test client retrieval
-	for _, ip := range testIPs {
-		if client, exists := rateLimiter.clients[ip]; !exists {
-			t.Errorf("Client with IP %s not found", ip)
-		} else if client.IP != ip {
-			t.Errorf("Client IP mismatch: got %s, want %s", client.IP, ip)
-		}
-	}
-}
-
 func TestSecurityMetrics(t *testing.T) {
 	metrics := &SecurityMetrics{
 		TotalQueries:     100,
-		BlockedQueries:   5,
 		MalformedPackets: 2,
-		RateLimitHits:    3,
 		LargePackets:     1,
 	}
 
@@ -291,17 +202,16 @@ func TestSecurityMetrics(t *testing.T) {
 		t.Errorf("TotalQueries = %v, want %v", metrics.TotalQueries, 100)
 	}
 
-	if metrics.BlockedQueries != 5 {
-		t.Errorf("BlockedQueries = %v, want %v", metrics.BlockedQueries, 5)
+	if metrics.MalformedPackets != 2 {
+		t.Errorf("MalformedPackets = %v, want %v", metrics.MalformedPackets, 2)
 	}
 
-	// Test that blocked queries don't exceed total queries
-	if metrics.BlockedQueries > metrics.TotalQueries {
-		t.Error("BlockedQueries should not exceed TotalQueries")
+	if metrics.LargePackets != 1 {
+		t.Errorf("LargePackets = %v, want %v", metrics.LargePackets, 1)
 	}
 
-	// Test individual counters don't exceed blocked queries
-	individualBlocked := metrics.MalformedPackets + metrics.RateLimitHits + metrics.LargePackets
+	// Test individual counters don't exceed total queries
+	individualBlocked := metrics.MalformedPackets + metrics.LargePackets
 	if individualBlocked > metrics.TotalQueries {
 		t.Error("Sum of individual blocked counters should not exceed TotalQueries")
 	}

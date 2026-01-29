@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:web/web.dart' as web;
 import '../../../../core/services/api_client.dart';
 
 enum SetupState {
@@ -29,10 +30,68 @@ class SetupController extends ChangeNotifier {
   List<String> _recoveryWords = [];
   List<String> get recoveryWords => _recoveryWords;
 
+  // OIDC auth request ID from URL (for SSO flow)
+  String? _authRequestId;
+  String? get authRequestId => _authRequestId;
+
+  // Redirect target after login (for proxy-driven login flow)
+  String? _nextUrl;
+
   final ApiClient _api = ApiClient();
 
   SetupController() {
+    _parseAuthRequestFromUrl();
+    _parseNextFromUrl();
     _checkStatus();
+  }
+
+  /// Parse auth request ID from URL query parameters (for OIDC SSO flow)
+  void _parseAuthRequestFromUrl() {
+    try {
+      final uri = Uri.base;
+      // Use "id" parameter (OIDC library standard)
+      _authRequestId = uri.queryParameters['id'];
+      if (_authRequestId != null) {
+        debugPrint('OIDC auth request detected: $_authRequestId');
+      }
+    } catch (e) {
+      debugPrint('Failed to parse URL: $e');
+    }
+  }
+
+  void _parseNextFromUrl() {
+    try {
+      final uri = Uri.base;
+      _nextUrl = uri.queryParameters['next'];
+      if (_nextUrl != null && _nextUrl!.isNotEmpty) {
+        debugPrint('Login redirect target detected: $_nextUrl');
+      }
+    } catch (e) {
+      debugPrint('Failed to parse next URL: $e');
+    }
+  }
+
+  Future<bool> _redirectToNextIfValid() async {
+    if (_nextUrl == null || _nextUrl!.isEmpty) return false;
+
+    try {
+      final response = await _api.get(
+        '/api/v1/auth/validate-next',
+        queryParameters: {'next': _nextUrl},
+      );
+      if (response is Map && response['valid'] == true) {
+        final redirectUrl = response['redirect_url'] as String?;
+        if (redirectUrl != null && redirectUrl.isNotEmpty) {
+          debugPrint('Redirecting to validated next URL: $redirectUrl');
+          web.window.location.href = redirectUrl;
+          return true;
+        }
+      }
+    } catch (e) {
+      debugPrint('Next URL validation failed: $e');
+    }
+
+    return false;
   }
 
   Future<void> _checkStatus() async {
@@ -54,6 +113,20 @@ class SetupController extends ChangeNotifier {
           final session = await _api.get('/api/v1/auth/session');
           if (session['authenticated'] == true) {
             await _api.fetchCsrfToken();
+
+            // If there's an OIDC auth request, complete it immediately
+            if (_authRequestId != null) {
+              await _completeOidcAuthRequest();
+              return; // Don't update state - we're redirecting
+            }
+
+            // Proxy-driven login flow: redirect back to the original target
+            if (_nextUrl != null && _nextUrl!.isNotEmpty) {
+              if (await _redirectToNextIfValid()) {
+                return;
+              }
+            }
+
             _state = SetupState.complete;
           } else {
             _state = SetupState.login;
@@ -123,6 +196,7 @@ class SetupController extends ChangeNotifier {
 
   Future<bool> unlock(String password) async {
     try {
+      debugPrint('Unlock attempt, authRequestId: $_authRequestId');
       await _api.post('/api/v1/crypto/unlock', body: {'password': password});
       // After unlock, we might have an auto-created session (best-effort).
       // Let's verify or just proceed to login if needed.
@@ -132,6 +206,20 @@ class SetupController extends ChangeNotifier {
       final session = await _api.get('/api/v1/auth/session');
       if (session['authenticated'] == true) {
         await _api.fetchCsrfToken();
+
+        // Handle OIDC auth request if present (SSO flow)
+        if (_authRequestId != null) {
+          debugPrint('OIDC flow detected after unlock, completing auth request...');
+          await _completeOidcAuthRequest();
+          return true; // Don't set complete state - we're redirecting
+        }
+
+        if (_nextUrl != null && _nextUrl!.isNotEmpty) {
+          if (await _redirectToNextIfValid()) {
+            return true;
+          }
+        }
+
         _state = SetupState.complete;
       } else {
         // Unlocked but no session (weird but possible) -> Login
@@ -149,19 +237,71 @@ class SetupController extends ChangeNotifier {
 
   Future<bool> login(String username, String password) async {
     try {
-      await _api.post(
+      debugPrint('Login attempt for user: $username');
+      final resp = await _api.post(
         '/api/v1/auth/login',
-        body: {'username': username, 'password': password},
+        body: {'username': username, 'password': password, 'next': _nextUrl},
       );
       await _api.fetchCsrfToken();
+      debugPrint('Login successful, authRequestId: $_authRequestId');
+
+      // Handle OIDC auth request if present (SSO flow)
+      if (_authRequestId != null) {
+        debugPrint('OIDC flow detected, completing auth request...');
+        await _completeOidcAuthRequest();
+        return true; // Don't set complete state - we're redirecting
+      }
+
+      if (resp is Map && resp['redirect_url'] is String) {
+        final redirectUrl = resp['redirect_url'] as String;
+        if (redirectUrl.isNotEmpty) {
+          debugPrint('Redirecting to login next URL: $redirectUrl');
+          web.window.location.href = redirectUrl;
+          return true;
+        }
+      }
 
       _state = SetupState.complete;
       notifyListeners();
       return true;
     } catch (e) {
+      debugPrint('Login failed: $e');
       _error = e.toString();
       notifyListeners();
       return false;
+    }
+  }
+
+  /// Complete the OIDC auth request and redirect back to the app
+  Future<void> _completeOidcAuthRequest() async {
+    if (_authRequestId == null) return;
+
+    try {
+      debugPrint('Completing OIDC auth request: $_authRequestId');
+
+      final response = await _api.post(
+        '/api/v1/oauth/resume',
+        body: {'auth_request_id': _authRequestId},
+      );
+
+      // The backend returns {data: {redirect_url: "..."}, message: "..."}
+      final data = response['data'] as Map<String, dynamic>?;
+      final redirectUrl = data?['redirect_url'] as String?;
+      if (redirectUrl != null && redirectUrl.isNotEmpty) {
+        debugPrint('OIDC redirect to: $redirectUrl');
+        // Redirect the browser to complete the OIDC flow
+        web.window.location.href = redirectUrl;
+      } else {
+        // Fallback: if no redirect URL, just go to desktop
+        _state = SetupState.complete;
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('OIDC resume failed: $e');
+      _error = 'Failed to complete SSO login: $e';
+      // On error, still go to desktop (the OIDC flow failed but user is logged in)
+      _state = SetupState.complete;
+      notifyListeners();
     }
   }
 

@@ -3,6 +3,7 @@ package mdns
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,39 +38,18 @@ type InterfaceState struct {
 	resilienceMu     sync.RWMutex
 }
 
-// RateLimiter tracks query rates per client IP
-type RateLimiter struct {
-	clients map[string]*ClientState
-	mutex   sync.RWMutex
-}
-
-// ClientState tracks per-client security metrics
-type ClientState struct {
-	IP           string
-	QueryCount   uint64
-	LastQuery    time.Time
-	Blocked      bool
-	BlockedUntil time.Time
-}
-
 // SecurityConfig defines security limits and thresholds
 type SecurityConfig struct {
-	MaxQueriesPerSecond  int
-	MaxQueriesPerMinute  int
 	MaxPacketSize        int
 	MaxResponseSize      int
 	MaxConcurrentQueries int
 	QueryTimeout         time.Duration
-	ClientBlockDuration  time.Duration
-	CleanupInterval      time.Duration
 }
 
 // SecurityMetrics tracks overall security statistics
 type SecurityMetrics struct {
 	TotalQueries     uint64
-	BlockedQueries   uint64
 	MalformedPackets uint64
-	RateLimitHits    uint64
 	LargePackets     uint64
 }
 
@@ -133,14 +113,18 @@ type Manager struct {
 	port     int
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
+	startMu  sync.Mutex
+	stopOnce sync.Once
+	started  atomic.Bool
+	stopped  atomic.Bool
 
 	// Deterministic naming support
 	baseName  string
 	machineID string
 	finalName string
+	names     *NameRegistry
 
 	// Security components
-	rateLimiter     *RateLimiter
 	securityConfig  *SecurityConfig
 	securityMetrics *SecurityMetrics
 	queryProcessor  *QueryProcessor
@@ -152,7 +136,26 @@ type Manager struct {
 	// Conflict detection and resolution
 	conflictDetector *ConflictDetector
 
+	// Peer discovery
+	peerRegistry    *PeerRegistry
+	serviceMetadata *ServiceMetadata
+	version         string
+	deviceModel     string
+	bootTime        time.Time
+
 	// Socket factories (overrideable for tests)
 	ipv4SocketFactory func(*net.Interface) (*net.UDPConn, error)
 	ipv6SocketFactory func(*net.Interface) (*net.UDPConn, error)
+
+	// Service endpoint observation
+	endpointsMu          sync.Mutex
+	endpointsCancel      func()
+	endpointsUnsubscribe func() // Unsubscribe from event bus
+	appHostLabels        map[string][]string // app -> host labels for that app
+	appHostLabelsMu      sync.RWMutex
+
+	// Announcement debouncing
+	announceDebounceMu    sync.Mutex
+	announceDebounceTimer *time.Timer
+	announcePending       bool
 }

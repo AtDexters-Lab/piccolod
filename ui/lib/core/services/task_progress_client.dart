@@ -44,6 +44,7 @@ class TaskProgressClient extends ChangeNotifier {
   }
 
   void _handleMessage(dynamic message) {
+    if (_isDisposed) return;
     if (message is! String) return;
     try {
       final decoded = jsonDecode(message);
@@ -57,7 +58,9 @@ class TaskProgressClient extends ChangeNotifier {
       if (payload is! Map<String, dynamic>) return;
 
       final evt = TaskProgressEvent.fromJson(payload);
-      _eventsController.add(evt);
+      if (!_isDisposed) {
+        _eventsController.add(evt);
+      }
 
       if (evt.isComplete) {
         _isComplete = true;

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -9,11 +10,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"piccolod/internal/api"
 	"piccolod/internal/app"
 	"piccolod/internal/app/catalog"
+	"piccolod/internal/hostname"
 	"piccolod/internal/remote"
 	"piccolod/internal/services"
 )
@@ -49,8 +52,8 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	if !strings.EqualFold(status.Solver, "http-01") {
 		return
 	}
-	tld := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(status.TLD)), ".")
-	if tld == "" {
+	base := remoteBaseHostname(&status)
+	if base == "" {
 		return
 	}
 	endpoints, err := s.serviceManager.GetByApp(appName)
@@ -60,24 +63,12 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	}
 	hosts := map[string]struct{}{}
 	for _, ep := range endpoints {
-		if ep.Flow == api.FlowTLS {
+		// Only queue certs for HTTP/WS listeners that have host-based routing
+		// DerivedHostLabel is empty for raw/tls listeners (per RFC 20260114)
+		if ep.DerivedHostLabel == "" {
 			continue
 		}
-		switch ep.Protocol {
-		case api.ListenerProtocolHTTP, api.ListenerProtocolWebsocket:
-			// allowed
-		default:
-			continue
-		}
-		name := strings.ToLower(strings.TrimSpace(ep.Name))
-		if name == "" {
-			continue
-		}
-		if !isValidDNSLabel(name) {
-			log.Printf("WARN: remote: skipping remote certificate queue for listener %q on app %q (not DNS-safe)", ep.Name, appName)
-			continue
-		}
-		host := name + "." + tld
+		host := ep.DerivedHostLabel + "." + base
 		hosts[host] = struct{}{}
 	}
 	for h := range hosts {
@@ -85,26 +76,19 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	}
 }
 
-func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, tld string) map[string]struct{} {
+func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, base string) map[string]struct{} {
 	hosts := map[string]struct{}{}
-	tld = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(tld)), ".")
-	if tld == "" {
+	base = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
+	if base == "" {
 		return hosts
 	}
 	for _, ep := range endpoints {
-		if ep.Flow == api.FlowTLS {
+		// Only include HTTP/WS listeners that have host-based routing
+		// DerivedHostLabel is empty for raw/tls listeners (per RFC 20260114)
+		if ep.DerivedHostLabel == "" {
 			continue
 		}
-		switch ep.Protocol {
-		case api.ListenerProtocolHTTP, api.ListenerProtocolWebsocket:
-		default:
-			continue
-		}
-		name := strings.ToLower(strings.TrimSpace(ep.Name))
-		if name == "" || !isValidDNSLabel(name) {
-			continue
-		}
-		host := name + "." + tld
+		host := ep.DerivedHostLabel + "." + base
 		hosts[host] = struct{}{}
 	}
 	return hosts
@@ -131,6 +115,7 @@ func isValidDNSLabel(label string) bool {
 type APIError struct {
 	Error   string `json:"error"`
 	Code    int    `json:"code"`
+	Key     string `json:"key,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
@@ -143,10 +128,15 @@ type GinAppResponse struct {
 
 // writeGinError writes a structured error response using Gin
 func writeGinError(c *gin.Context, statusCode int, message string) {
+	writeGinErrorWithKey(c, statusCode, message, "")
+}
+
+func writeGinErrorWithKey(c *gin.Context, statusCode int, message, key string) {
 	response := GinAppResponse{
 		Error: &APIError{
 			Error:   http.StatusText(statusCode),
 			Code:    statusCode,
+			Key:     key,
 			Message: message,
 		},
 	}
@@ -160,6 +150,55 @@ func writeGinSuccess(c *gin.Context, data interface{}, message string) {
 		Message: message,
 	}
 	c.JSON(http.StatusOK, response)
+}
+
+// requiresProxyOIDCClient checks if an app requires a proxy OIDC client per RFC 20260122 §5.3.
+// Proxy clients are needed for apps whose listeners use "headers" or "protected" auth strategies.
+// Per RFC 20260122 §4.1.1: auth omitted or empty rules → all paths default to "protected".
+func (s *GinServer) requiresProxyOIDCClient(appDef *api.AppDefinition) bool {
+	if appDef == nil {
+		return false
+	}
+	for _, listener := range appDef.Listeners {
+		if listener.Auth == nil || len(listener.Auth.Rules) == 0 {
+			// Auth omitted → all paths default to "protected" strategy.
+			return true
+		}
+		for _, rule := range listener.Auth.Rules {
+			strategy := rule.Strategy
+			if strategy == "" {
+				strategy = "public"
+			}
+			if strategy == "headers" || strategy == "protected" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// registerProxyOIDCClient registers a proxy OIDC client for an app per RFC 20260122 §5.3.
+func (s *GinServer) registerProxyOIDCClient(ctx context.Context, appName string) error {
+	clientMgr := s.getOIDCClientManager()
+	if clientMgr == nil {
+		return errors.New("OIDC client manager unavailable")
+	}
+
+	// Check if proxy client already exists
+	_, err := clientMgr.GetProxyClientByAppName(ctx, appName)
+	if err == nil {
+		// Client already exists
+		return nil
+	}
+
+	// Register new proxy client
+	_, _, err = clientMgr.RegisterProxyClient(ctx, appName)
+	if err != nil {
+		return fmt.Errorf("register proxy client: %w", err)
+	}
+
+	log.Printf("INFO: registered proxy OIDC client for app %s", appName)
+	return nil
 }
 
 // handleGinAppValidate handles POST /api/v1/apps/validate - Validate app.yaml without installing
@@ -189,6 +228,11 @@ func (s *GinServer) handleGinAppValidate(c *gin.Context) {
 		yamlData = body
 	}
 	if _, err := app.ParseAppDefinition(yamlData); err != nil {
+		var ve *app.ValidationError
+		if errors.As(err, &ve) && ve != nil {
+			writeGinErrorWithKey(c, http.StatusBadRequest, "Invalid app.yaml: "+ve.Message, ve.Code)
+			return
+		}
 		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
 		return
 	}
@@ -295,13 +339,46 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	}
 	if s.remoteManager != nil {
 		status := s.remoteManager.Status()
-		if status.Enabled && status.TLD != "" {
-			systemContext["Domain"] = strings.TrimSuffix(status.TLD, ".")
+		if status.Enabled && strings.TrimSpace(status.PortalHostname) != "" {
+			// RFC 20260114: remote base is the portal hostname apex.
+			systemContext["Domain"] = strings.TrimSuffix(strings.TrimSpace(status.PortalHostname), ".")
+		}
+	}
+
+	// Check for service-level oidc_client in loose schema to pre-generate credentials.
+	// We do this before rendering so we can inject the credentials into the template.
+	var oidcClientID, oidcClientSecret string
+	if looseDef, err := app.ParseAppSchema(yamlData); err == nil && func() bool {
+		for _, svc := range looseDef.Services {
+			if svc.OIDCClient != nil {
+				return true
+			}
+		}
+		return false
+	}() {
+		clientMgr := s.getOIDCClientManager()
+		if clientMgr != nil {
+			var credErr error
+			oidcClientID, oidcClientSecret, credErr = clientMgr.GenerateCredentials()
+			if credErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate OIDC credentials: " + credErr.Error()})
+				return
+			}
+
+			// Inject Auth context for templating.
+			// Issuer is always https://piccolo.local for internal back-channel communication.
+			issuer := "https://piccolo.local"
+
+			systemContext["Auth"] = map[string]string{
+				"Issuer":       issuer,
+				"ClientID":     oidcClientID,
+				"ClientSecret": oidcClientSecret,
+			}
 		}
 	}
 
 	// Render template if inputs provided
-	if len(userInputs) > 0 {
+	if len(userInputs) > 0 || oidcClientID != "" {
 		rendered, err := app.RenderManifest(yamlData, userInputs, systemContext)
 		if err != nil {
 			writeGinError(c, http.StatusBadRequest, "Failed to render manifest template: "+err.Error())
@@ -313,19 +390,52 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	// Parse app.yaml
 	appDef, err := app.ParseAppDefinition(yamlData)
 	if err != nil {
+		var ve *app.ValidationError
+		if errors.As(err, &ve) && ve != nil {
+			writeGinErrorWithKey(c, http.StatusBadRequest, "Invalid app.yaml: "+ve.Message, ve.Code)
+			return
+		}
 		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
 		return
 	}
 
-	// Install a new app instance
-	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
-	appInstance, err := s.appManager.Install(ctx, appDef, displayName)
+	// Install a new app instance.
+	// Use a background context with a generous timeout instead of the HTTP request context.
+	// The request context is canceled by the server's WriteTimeout (60s) or remote tunnel
+	// disconnects, which kills podman pull processes mid-download for large images.
+	// The install must survive connection drops.
+	installCtx, cancelInstall := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancelInstall()
+	installCtx = app.WithTaskID(installCtx, c.GetHeader("X-Piccolo-Task-ID"))
+	appInstance, err := s.appManager.Install(installCtx, appDef, displayName)
 	if err != nil {
 		if handleAppManagerError(c, err, "install app") {
 			return
 		}
 		writeGinError(c, http.StatusInternalServerError, "Failed to install app: "+err.Error())
 		return
+	}
+
+	// Persist OIDC client if generated
+	if oidcClientID != "" {
+		clientMgr := s.getOIDCClientManager()
+		if err := clientMgr.CreateClient(installCtx, oidcClientID, oidcClientSecret, appInstance.InstanceID); err != nil {
+			log.Printf("ERROR: failed to persist OIDC client for %s: %v. Rolling back install.", appInstance.InstanceID, err)
+			// Rollback: uninstall the app
+			if rbErr := s.appManager.UninstallWithOptions(installCtx, appInstance.InstanceID, true); rbErr != nil {
+				log.Printf("CRITICAL: failed to rollback uninstall for %s: %v", appInstance.InstanceID, rbErr)
+			}
+			writeGinError(c, http.StatusInternalServerError, "Failed to register OIDC client: "+err.Error())
+			return
+		}
+	}
+
+	// RFC 20260122 §5.3: Auto-register proxy OIDC client for apps with headers/protected auth strategies
+	if s.requiresProxyOIDCClient(appDef) {
+		if err := s.registerProxyOIDCClient(installCtx, appInstance.InstanceID); err != nil {
+			// Non-fatal: log but don't fail the install
+			log.Printf("WARN: failed to register proxy OIDC client for %s: %v", appInstance.InstanceID, err)
+		}
 	}
 
 	s.queueAppRemoteCertificates(appInstance.InstanceID)
@@ -348,12 +458,49 @@ func (s *GinServer) handleGinAppList(c *gin.Context) {
 		return
 	}
 
-	writeGinSuccess(c, apps, fmt.Sprintf("Found %d apps", len(apps)))
+	// Filter for standard users
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		if s.userManager != nil {
+			user, err := s.userManager.Get(c.Request.Context(), sess.UserID)
+			if err != nil {
+				// User not found or error, return empty list
+				writeGinSuccess(c, []*AppInstanceWithHealth{}, "Found 0 apps")
+				return
+			}
+			filtered := make([]*app.AppInstance, 0)
+			for _, a := range apps {
+				if isIDAllowed(user.AllowedApps, a.InstanceID) {
+					filtered = append(filtered, a)
+				}
+			}
+			apps = filtered
+		}
+	}
+
+	// Wrap apps with health data (RFC 20260125 §7.2)
+	result := make([]*AppInstanceWithHealth, len(apps))
+	for i, inst := range apps {
+		result[i] = &AppInstanceWithHealth{
+			AppInstance:           inst,
+			PrimaryListenerHealth: s.deriveAppHealth(inst),
+		}
+	}
+
+	writeGinSuccess(c, result, fmt.Sprintf("Found %d apps", len(result)))
 }
 
 // handleGinAppGet handles GET /api/v1/apps/:name - Get specific app details
 func (s *GinServer) handleGinAppGet(c *gin.Context) {
 	appName := c.Param("name")
+
+	// Check access for standard users
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		allowed, err := s.userManager.IsAppAllowed(c.Request.Context(), sess.UserID, appName)
+		if err != nil || !allowed {
+			writeGinError(c, http.StatusForbidden, "Access denied")
+			return
+		}
+	}
 
 	appInstance, err := s.appManager.Get(c.Request.Context(), appName)
 	if err != nil {
@@ -377,7 +524,10 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 		remoteStatus = &st
 	}
 	for _, ep := range listeners {
-		listenerStatus = append(listenerStatus, s.formatServiceEndpoint(c, ep, remoteStatus))
+		formatted := s.formatServiceEndpoint(c, ep, remoteStatus)
+		// Add listener health status (RFC 20260125)
+		formatted["health"] = s.computeListenerHealth(ep)
+		listenerStatus = append(listenerStatus, formatted)
 	}
 
 	containerStatus, err := s.appManager.ContainerStatuses(c.Request.Context(), appName)
@@ -391,6 +541,16 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 // GET /api/v1/apps/:name/logs?tail=200
 func (s *GinServer) handleGinAppLogs(c *gin.Context) {
 	appName := c.Param("name")
+
+	// Check access for standard users
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		allowed, err := s.userManager.IsAppAllowed(c.Request.Context(), sess.UserID, appName)
+		if err != nil || !allowed {
+			writeGinError(c, http.StatusForbidden, "Access denied")
+			return
+		}
+	}
+
 	tail := parseLogTail(c, 200)
 	service := strings.TrimSpace(c.Query("service"))
 
@@ -413,9 +573,13 @@ func (s *GinServer) handleGinAppLogs(c *gin.Context) {
 func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 	appName := c.Param("name")
 
+	// Only Admin can update listeners (enforced by middleware), but double check if needed.
+	// Since we moved this to requireAdmin group, no extra check needed here.
+
 	var req struct {
 		Listeners []api.AppListener `json:"listeners"`
 	}
+	// ... (rest of function)
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeGinError(c, http.StatusBadRequest, "Invalid request body")
 		return
@@ -456,7 +620,7 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 		return
 	}
 
-	recreated := oldApp.ContainerID != newApp.ContainerID
+	recreated := oldApp.PrimaryContainerID() != newApp.PrimaryContainerID()
 
 	// Include services inline
 	services, _ := s.serviceManager.GetByApp(appName)
@@ -495,9 +659,9 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	var hostsToRemove map[string]struct{}
 	if s.remoteManager != nil && s.serviceManager != nil {
 		st := s.remoteManager.Status()
-		if st.TLD != "" {
+		if base := remoteBaseHostname(&st); base != "" {
 			if eps, err := s.serviceManager.GetByApp(appName); err == nil {
-				hostsToRemove = remoteHostsForEndpoints(eps, st.TLD)
+				hostsToRemove = remoteHostsForEndpoints(eps, base)
 			}
 		}
 	}
@@ -514,6 +678,13 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 			writeGinError(c, http.StatusInternalServerError, "Failed to uninstall app: "+err.Error())
 		}
 		return
+	}
+
+	// Delete all OIDC clients (passthrough + proxy) for this app on uninstall (best-effort).
+	if clientMgr := s.getOIDCClientManager(); clientMgr != nil {
+		if err := clientMgr.DeleteClientsByAppID(ctx, appName); err != nil {
+			log.Printf("WARN: failed to delete OIDC clients for %s: %v", appName, err)
+		}
 	}
 
 	if hostsToRemove != nil && s.remoteManager != nil {
@@ -677,4 +848,141 @@ func (s *GinServer) handleGinAppCheckInstance(c *gin.Context) {
 		"available": available,
 		"suggested": suggested,
 	})
+}
+
+// isIDAllowed checks if the given app ID is in the user's allowed apps list.
+func isIDAllowed(allowedApps []string, appID string) bool {
+	if len(allowedApps) == 0 {
+		return false
+	}
+	for _, allowed := range allowedApps {
+		if allowed == appID {
+			return true
+		}
+	}
+	return false
+}
+
+// handleGinListenerHealth handles GET /api/v1/apps/:name/listeners/:listener/health
+// Returns the health status for a specific listener including certificate and backend status.
+func (s *GinServer) handleGinListenerHealth(c *gin.Context) {
+	appName := c.Param("name")
+	listenerName := c.Param("listener")
+
+	// Check access for standard users
+	if sess := s.getSessionFromContext(c); sess != nil && sess.Role != "admin" {
+		if s.userManager != nil {
+			allowed, err := s.userManager.IsAppAllowed(c.Request.Context(), sess.UserID, appName)
+			if err != nil || !allowed {
+				writeGinError(c, http.StatusForbidden, "Access denied")
+				return
+			}
+		}
+	}
+
+	// Get the endpoint
+	endpoints, err := s.serviceManager.GetByApp(appName)
+	if err != nil {
+		writeGinError(c, http.StatusNotFound, "App not found: "+err.Error())
+		return
+	}
+
+	// Find the specific listener
+	var endpoint *services.ServiceEndpoint
+	for i := range endpoints {
+		if endpoints[i].Name == listenerName {
+			endpoint = &endpoints[i]
+			break
+		}
+	}
+	if endpoint == nil {
+		writeGinError(c, http.StatusNotFound, "Listener not found: "+listenerName)
+		return
+	}
+
+	// Compute listener health
+	health := s.computeListenerHealth(*endpoint)
+
+	c.JSON(http.StatusOK, gin.H{
+		"app":      appName,
+		"listener": listenerName,
+		"health":   health,
+	})
+}
+
+// computeListenerHealth computes the health status for a listener by delegating
+// to ServiceManager.GetListenerHealth, which aggregates certificate status and backend connectivity.
+func (s *GinServer) computeListenerHealth(ep services.ServiceEndpoint) services.ListenerHealth {
+	return s.serviceManager.GetListenerHealth(ep)
+}
+
+// AppInstanceWithHealth is an API response DTO that adds derived health state
+// to the persisted AppInstance. This keeps ephemeral/derived data out of the
+// on-disk app state (RFC 20260125 §7.2).
+type AppInstanceWithHealth struct {
+	*app.AppInstance
+	PrimaryListenerHealth *services.ListenerHealth `json:"primary_listener_health,omitempty"`
+}
+
+// deriveAppHealth computes the primary listener health for an app instance.
+// Returns nil for stopped apps or apps without a primary listener (raw-only).
+func (s *GinServer) deriveAppHealth(inst *app.AppInstance) *services.ListenerHealth {
+	// Stopped apps don't have health (expected state, not an error)
+	if inst.Status == "stopped" {
+		return nil
+	}
+
+	// Starting apps show recovering status
+	if inst.Status == "starting" {
+		h := services.ListenerHealth{
+			Status:         services.ListenerHealthRecovering,
+			ReasonCode:     "app_starting",
+			Reason:         "App is starting up",
+			Recoverable:    true,
+			ActionRequired: false,
+			LastChecked:    time.Now(),
+		}
+		return &h
+	}
+
+	// Error apps show error status
+	if inst.Status == "error" {
+		h := services.ListenerHealth{
+			Status:         services.ListenerHealthError,
+			ReasonCode:     "app_error",
+			Reason:         "App failed to start",
+			Recoverable:    false,
+			ActionRequired: true,
+			LastChecked:    time.Now(),
+		}
+		return &h
+	}
+
+	// Need definition for listener resolution
+	if inst.Definition == nil {
+		return nil
+	}
+
+	// Raw-only apps have no primary listener
+	primaryName, _ := hostname.ResolvePrimaryListener(inst.Definition.Listeners)
+	if primaryName == "" {
+		return nil
+	}
+
+	// Find the endpoint for this listener
+	if s.serviceManager == nil {
+		return nil
+	}
+	eps, err := s.serviceManager.GetByApp(inst.InstanceID)
+	if err != nil {
+		return nil
+	}
+
+	for _, ep := range eps {
+		if ep.Name == primaryName {
+			h := s.computeListenerHealth(ep)
+			return &h
+		}
+	}
+	return nil
 }

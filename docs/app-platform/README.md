@@ -7,7 +7,10 @@ The Piccolo OS App Platform enables users to easily install, manage, and run con
 ### Minimal App
 ```yaml
 name: blog
-image: ghost:latest
+services:
+  main:
+    image: ghost:latest
+    bind_ports: [2368]
 listeners:
   - name: web
     guest_port: 2368
@@ -70,7 +73,7 @@ Apps are deployed via HTTP API with flexible upload methods:
 ```bash
 # Method 1: Inline YAML
 curl -X POST /api/v1/apps \
-  -H "Content-Type: application/yaml" \
+  -H "Content-Type: application/x-yaml" \
   --data-binary @app.yaml
 ```
 

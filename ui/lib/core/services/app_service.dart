@@ -235,6 +235,15 @@ class AppService {
     return App.fromJson(data['data']);
   }
 
+  // --- Certificate Management ---
+
+  Future<void> renewCertificate(String certId) async {
+    await _client.post(
+      '/api/v1/remote/certificates/$certId/renew',
+      body: {},
+    );
+  }
+
   // --- Image Search (for Workspace creation) ---
 
   /// Searches for container images in Docker Hub and other registries.

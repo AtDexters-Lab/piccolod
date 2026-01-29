@@ -221,6 +221,13 @@ func (m *DefaultManager) Mount(ctx context.Context, instanceID string) (string, 
 		return "", WrapError(instanceID, "load meta", err)
 	}
 
+	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") == "1" {
+		if err := layout.EnsureDirs(); err != nil {
+			return "", WrapError(instanceID, "ensure directories", err)
+		}
+		return layout.Merged, nil
+	}
+
 	// Get runtime args for this instance to ensure we access the correct imagestore
 	runtimeArgs, err := m.runtimeResolver.GetRuntimeArgs(ctx, instanceID)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -47,14 +48,24 @@ func fixedNow(t time.Time) func() time.Time {
 	return func() time.Time { return t }
 }
 
+func newTestManagerWithDeps(t *testing.T, storage Storage, dir string, d dialer, r resolver, now func() time.Time) *Manager {
+	t.Helper()
+	m, err := newManagerWithDeps(storage, dir, d, r, now)
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	return m
+}
+
 func TestRunPreflightSuccess(t *testing.T) {
 	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
 	dir := t.TempDir()
 	dial := &stubDialer{}
 	res := &stubResolver{
 		hosts: map[string][]string{
-			"portal.example.com": {"1.2.3.4"},
-			"app.example.com":    {"1.2.3.4"},
+			"portal.example.com":     {"1.2.3.4"},
+			"app.portal.example.com": {"1.2.3.4"},
 		},
 		cnames: map[string]string{
 			"portal.example.com": "nexus.example.com.",
@@ -65,10 +76,7 @@ func TestRunPreflightSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := newManagerWithDeps(storage, dir, dial, res, fixedNow(time.Unix(1, 0)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	m := newTestManagerWithDeps(t, storage, dir, dial, res, fixedNow(time.Unix(1, 0)))
 
 	err = m.Configure(ConfigureRequest{
 		Endpoint:       "wss://nexus.example.com/connect",
@@ -100,6 +108,7 @@ func TestRunPreflightSuccess(t *testing.T) {
 }
 
 type fakeAdapter struct {
+	mu      sync.Mutex
 	config  nexusclient.Config
 	startCh chan struct{}
 	stopCh  chan struct{}
@@ -110,8 +119,16 @@ func newFakeAdapter() *fakeAdapter {
 }
 
 func (f *fakeAdapter) Configure(cfg nexusclient.Config) error {
+	f.mu.Lock()
 	f.config = cfg
+	f.mu.Unlock()
 	return nil
+}
+
+func (f *fakeAdapter) getConfig() nexusclient.Config {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.config
 }
 
 func (f *fakeAdapter) Start(ctx context.Context) error {
@@ -147,10 +164,7 @@ func TestManager_NexusAdapterLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
-	m, err := newManagerWithDeps(storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(3, 0)))
-	if err != nil {
-		t.Fatalf("manager: %v", err)
-	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(3, 0)))
 	adapter := newFakeAdapter()
 	m.SetNexusAdapter(adapter)
 
@@ -164,8 +178,8 @@ func TestManager_NexusAdapterLifecycle(t *testing.T) {
 		t.Fatalf("configure: %v", err)
 	}
 	waitForCertNotPending(t, m, "portal", 200*time.Millisecond)
-	if adapter.config.TLD != "example.com" {
-		t.Fatalf("expected TLD to propagate, got %s", adapter.config.TLD)
+	if cfg := adapter.getConfig(); cfg.TLD != "example.com" {
+		t.Fatalf("expected TLD to propagate, got %s", cfg.TLD)
 	}
 
 	select {
@@ -192,10 +206,7 @@ func TestRunPreflightFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := newManagerWithDeps(storage, dir, dial, res, fixedNow(time.Unix(2, 0)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	m := newTestManagerWithDeps(t, storage, dir, dial, res, fixedNow(time.Unix(2, 0)))
 
 	_ = m.Configure(ConfigureRequest{
 		Endpoint:       "wss://nexus.example.com/connect",
@@ -243,10 +254,7 @@ func TestConfigure_DNS01SeedsWildcardWithApex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
-	m, err := newManagerWithDeps(storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(4, 0)))
-	if err != nil {
-		t.Fatalf("manager: %v", err)
-	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(4, 0)))
 
 	if err := m.Configure(ConfigureRequest{
 		Endpoint:       "wss://nexus.example.com/connect",
@@ -270,7 +278,7 @@ func TestConfigure_DNS01SeedsWildcardWithApex(t *testing.T) {
 	if wildcard == nil {
 		t.Fatalf("expected wildcard certificate entry")
 	}
-	if len(wildcard.Domains) != 2 || wildcard.Domains[0] != "*.example.com" || wildcard.Domains[1] != "example.com" {
+	if len(wildcard.Domains) != 2 || wildcard.Domains[0] != "*.portal.example.com" || wildcard.Domains[1] != "portal.example.com" {
 		t.Fatalf("unexpected wildcard domains: %v", wildcard.Domains)
 	}
 }
@@ -281,11 +289,9 @@ func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
-	m, err := newManagerWithDeps(storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(10, 0)))
-	if err != nil {
-		t.Fatalf("manager: %v", err)
-	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(10, 0)))
 	now := m.now()
+	m.cfgMu.Lock()
 	cfg := m.currentConfig()
 	cfg.Certificates = []Certificate{{
 		ID:       "portal",
@@ -293,6 +299,7 @@ func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 		Status:   "ok",
 		Attempts: 2,
 	}}
+	// save() releases cfgMu.Lock()
 	if err := m.save(cfg); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -320,10 +327,7 @@ func TestRemoveAliasRemovesCertificateEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("storage: %v", err)
 	}
-	m, err := newManagerWithDeps(storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(20, 0)))
-	if err != nil {
-		t.Fatalf("manager: %v", err)
-	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(20, 0)))
 
 	alias, err := m.AddAlias("portal", "foo.example.com")
 	if err != nil {

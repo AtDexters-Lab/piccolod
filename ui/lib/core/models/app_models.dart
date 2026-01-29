@@ -1,3 +1,6 @@
+import 'app_status_event.dart';
+import 'listener_health.dart';
+
 class App {
   final String id;
   final String name;
@@ -11,6 +14,7 @@ class App {
   final Map<String, String> environment;
   final String? containerId;
   final Map<String, dynamic> definition;
+  final ListenerHealth? primaryListenerHealth;
 
   App({
     required this.id,
@@ -25,6 +29,7 @@ class App {
     this.environment = const {},
     this.containerId,
     this.definition = const {},
+    this.primaryListenerHealth,
   });
 
   factory App.fromJson(Map<String, dynamic> json) {
@@ -42,12 +47,39 @@ class App {
     final appName = (def['name'] ?? json['app_name'] ?? json['name'] ?? '')
         .toString();
 
-    // Image, type, environment come from definition
-    final image = (def['image'] ?? json['image'] ?? '').toString();
+    // Image, type, environment come from definition (fallback to primary service)
+    final services = def['services'] is Map ? Map.from(def['services']) : null;
+    String primaryService = (def['primary_service'] ?? '').toString();
+    if (primaryService.isEmpty) {
+      primaryService = 'main';
+    }
+    Map? primarySvc;
+    if (services != null) {
+      final svc = services[primaryService];
+      if (svc is Map) {
+        primarySvc = svc;
+      } else if (services.length == 1) {
+        final only = services.values.first;
+        if (only is Map) {
+          primarySvc = only;
+        }
+      }
+    }
+
+    String image = (def['image'] ?? json['image'] ?? '').toString();
+    if (image.isEmpty && primarySvc != null) {
+      image = (primarySvc['image'] ?? '').toString();
+    }
     final type = (def['type'] ?? json['type'] ?? 'user').toString();
-    final environment = Map<String, String>.from(
+    Map<String, String> environment = Map<String, String>.from(
       def['environment'] ?? json['environment'] ?? {},
     );
+    if (environment.isEmpty && primarySvc != null) {
+      final rawEnv = primarySvc['environment'];
+      if (rawEnv is Map) {
+        environment = rawEnv.map((k, v) => MapEntry(k.toString(), v.toString()));
+      }
+    }
 
     // Mode comes from x-piccolo extensions in definition
     String mode = '';
@@ -74,6 +106,11 @@ class App {
           .toList();
     }
 
+    final rawHealth = json['primary_listener_health'];
+    final primaryHealth = rawHealth is Map
+        ? ListenerHealth.fromJson(Map<String, dynamic>.from(rawHealth))
+        : null;
+
     return App(
       id: instanceId,
       name: instanceId,
@@ -87,13 +124,16 @@ class App {
       environment: environment,
       containerId: json['container_id'],
       definition: def,
+      primaryListenerHealth: primaryHealth,
     );
   }
 
-  bool get isRunning => status.toLowerCase() == 'running';
+  bool get isRunning => status.toLowerCase() == AppStatusEvent.statusRunning;
   bool get isStopped =>
-      status.toLowerCase() == 'stopped' || status.toLowerCase() == 'created';
-  bool get isError => status.toLowerCase() == 'error';
+      status.toLowerCase() == AppStatusEvent.statusStopped ||
+      status.toLowerCase() == 'created';
+  bool get isError => status.toLowerCase() == AppStatusEvent.statusError;
+  bool get isStarting => status.toLowerCase() == AppStatusEvent.statusStarting;
   bool get isWorkspace => mode.toLowerCase() == 'workspace';
 
   Map<String, String> environmentForService(String? serviceName) {
@@ -116,6 +156,25 @@ class App {
     if (displayName.isNotEmpty) return displayName;
     if (appName.isNotEmpty) return appName;
     return name;
+  }
+
+  /// Returns a copy of this App with a new status value.
+  App copyWithStatus(String newStatus) {
+    return App(
+      id: id,
+      name: name,
+      appName: appName,
+      displayName: displayName,
+      image: image,
+      type: type,
+      mode: mode,
+      status: newStatus,
+      volumes: volumes,
+      environment: environment,
+      containerId: containerId,
+      definition: definition,
+      primaryListenerHealth: primaryListenerHealth,
+    );
   }
 }
 
@@ -222,6 +281,11 @@ class ServiceEndpoint {
   final String flow;
   final String protocol;
   final String? localUrl;
+  final String? lanHostUrl;
+  final String? lanFallbackUrl;
+  final String? lanPortUrl;
+  final bool primary;
+  final ListenerHealth? health;
   final List<dynamic> middleware;
 
   ServiceEndpoint({
@@ -235,10 +299,20 @@ class ServiceEndpoint {
     required this.flow,
     required this.protocol,
     this.localUrl,
+    this.lanHostUrl,
+    this.lanFallbackUrl,
+    this.lanPortUrl,
+    this.primary = false,
+    this.health,
     this.middleware = const [],
   });
 
   factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
+    final rawHealth = json['health'];
+    final endpointHealth = rawHealth is Map
+        ? ListenerHealth.fromJson(Map<String, dynamic>.from(rawHealth))
+        : null;
+
     return ServiceEndpoint(
       app: json['app'] ?? '',
       name: json['name'] ?? '',
@@ -250,6 +324,11 @@ class ServiceEndpoint {
       flow: json['flow'] ?? 'tcp',
       protocol: json['protocol'] ?? 'raw',
       localUrl: json['local_url'],
+      lanHostUrl: json['lan_host_url'],
+      lanFallbackUrl: json['lan_fallback_url'],
+      lanPortUrl: json['lan_port_url'],
+      primary: json['primary'] == true,
+      health: endpointHealth,
       middleware: json['middleware'] ?? [],
     );
   }
@@ -257,10 +336,6 @@ class ServiceEndpoint {
   // Helper to get the Remote URL (if enabled)
   String? get remoteUrl {
     if (remoteHost == null || remoteHost!.isEmpty) return null;
-    // Nexus endpoints are secured by default.
-    // If remotePorts contains 443, we imply https without port.
-    // If it contains 80, http.
-    // Simplification: Nexus is HTTPS-first.
     return 'https://$remoteHost';
   }
 }

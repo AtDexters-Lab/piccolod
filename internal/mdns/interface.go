@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,11 +19,18 @@ var (
 	interfaceAddrs        = func(iface *net.Interface) ([]net.Addr, error) {
 		return iface.Addrs()
 	}
+	// interfaceFuncsMu protects listNetworkInterfaces and interfaceAddrs from concurrent access.
+	// This is primarily needed for tests that replace these functions.
+	interfaceFuncsMu sync.RWMutex
 )
 
 // discoverInterfaces finds and sets up all suitable network interfaces
 func (m *Manager) discoverInterfaces() error {
-	interfaces, err := listNetworkInterfaces()
+	interfaceFuncsMu.RLock()
+	listFn := listNetworkInterfaces
+	interfaceFuncsMu.RUnlock()
+
+	interfaces, err := listFn()
 	if err != nil {
 		return err
 	}
@@ -34,10 +42,16 @@ func (m *Manager) discoverInterfaces() error {
 	for _, iface := range interfaces {
 		ifaceCopy := iface
 		if err := m.setupInterface(&ifaceCopy); err != nil {
-			log.Printf("WARN: Failed to setup interface %s: %v", iface.Name, err)
-			// Track interface setup failure for resilience
-			if state, exists := m.interfaces[iface.Name]; exists {
-				m.markInterfaceFailure(state, err)
+			// Use DEBUG for intentionally skipped interfaces, WARN for unexpected failures
+			if isVirtualInterface(iface.Name) || iface.Flags&net.FlagLoopback != 0 ||
+				iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
+				log.Printf("DEBUG: Skipping interface %s: %v", iface.Name, err)
+			} else {
+				log.Printf("WARN: Failed to setup interface %s: %v", iface.Name, err)
+				// Track interface setup failure for resilience only for unexpected failures
+				if state, exists := m.interfaces[iface.Name]; exists {
+					m.markInterfaceFailure(state, err)
+				}
 			}
 			continue
 		}
@@ -53,6 +67,41 @@ func (m *Manager) discoverInterfaces() error {
 	return nil
 }
 
+// virtualInterfacePrefixes lists name prefixes for virtual/container interfaces
+// that should be skipped for mDNS. These interfaces cannot send multicast
+// traffic to the local network and would cause repeated failures.
+var virtualInterfacePrefixes = []string{
+	// Container runtimes
+	"podman", "docker", "cni",
+	// Virtual ethernet pairs
+	"veth", "vnet",
+	// Virtual bridges
+	"br-", "virbr",
+	// Tunnel interfaces
+	"tap", "tun",
+	// Dummy/test interfaces
+	"dummy",
+	// macOS/BSD specific
+	"utun", "awdl", "llw", "gif", "stf",
+	// Kubernetes CNI plugins
+	"flannel", "cali", "weave",
+	// LXC/LXD containers
+	"lxc", "lxd",
+	// Hypervisors
+	"vbox", "vmnet", "hyperv",
+}
+
+// isVirtualInterface checks if an interface name matches known virtual interface patterns.
+func isVirtualInterface(name string) bool {
+	nameLower := strings.ToLower(name)
+	for _, prefix := range virtualInterfacePrefixes {
+		if strings.HasPrefix(nameLower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // setupInterface configures dual-stack mDNS for a specific network interface
 func (m *Manager) setupInterface(iface *net.Interface) error {
 	// Skip loopback and down interfaces
@@ -60,8 +109,22 @@ func (m *Manager) setupInterface(iface *net.Interface) error {
 		return fmt.Errorf("interface %s not suitable (loopback or down)", iface.Name)
 	}
 
+	// Skip interfaces without multicast capability
+	if iface.Flags&net.FlagMulticast == 0 {
+		return fmt.Errorf("interface %s has no multicast capability", iface.Name)
+	}
+
+	// Skip virtual/container interfaces that can't reach the local network
+	if isVirtualInterface(iface.Name) {
+		return fmt.Errorf("interface %s is a virtual interface", iface.Name)
+	}
+
 	// Get all addresses for this interface
-	addrs, err := interfaceAddrs(iface)
+	interfaceFuncsMu.RLock()
+	addrsFn := interfaceAddrs
+	interfaceFuncsMu.RUnlock()
+
+	addrs, err := addrsFn(iface)
 	if err != nil {
 		return err
 	}
@@ -311,7 +374,11 @@ func (m *Manager) networkMonitor() {
 
 // checkInterfaceChanges detects and handles interface changes
 func (m *Manager) checkInterfaceChanges() {
-	interfaces, err := listNetworkInterfaces()
+	interfaceFuncsMu.RLock()
+	listFn := listNetworkInterfaces
+	interfaceFuncsMu.RUnlock()
+
+	interfaces, err := listFn()
 	if err != nil {
 		log.Printf("WARN: Failed to check interfaces: %v", err)
 		return
@@ -342,7 +409,14 @@ func (m *Manager) checkInterfaceChanges() {
 				existing.LastSeen = time.Now()
 			}
 		} else {
-			// New interface detected
+			// New interface detected - only log and setup if it's suitable
+			// Skip loopback, down, non-multicast, and virtual interfaces to avoid noise
+			if ifaceCopy.Flags&net.FlagLoopback != 0 || ifaceCopy.Flags&net.FlagUp == 0 {
+				continue
+			}
+			if ifaceCopy.Flags&net.FlagMulticast == 0 || isVirtualInterface(ifaceCopy.Name) {
+				continue
+			}
 			log.Printf("INFO: New interface detected: %s", ifaceCopy.Name)
 			m.setupInterface(&ifaceCopy)
 		}
@@ -365,7 +439,11 @@ func (m *Manager) checkInterfaceChanges() {
 
 // hasIPChanged checks if an interface's IPv4 or IPv6 addresses have changed
 func (m *Manager) hasIPChanged(iface *net.Interface, state *InterfaceState) bool {
-	addrs, err := interfaceAddrs(iface)
+	interfaceFuncsMu.RLock()
+	addrsFn := interfaceAddrs
+	interfaceFuncsMu.RUnlock()
+
+	addrs, err := addrsFn(iface)
 	if err != nil {
 		return true // Assume changed if we can't check
 	}

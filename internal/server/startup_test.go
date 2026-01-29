@@ -93,7 +93,7 @@ func TestServerStartup_WithBlockingWatchdog(t *testing.T) {
 				if resp.StatusCode == http.StatusOK {
 					// Success! The server is serving traffic.
 					t.Logf("Server successfully started and serving traffic.")
-					_ = srv.Stop()
+					_ = srv.Stop(context.Background())
 					return
 				}
 			}

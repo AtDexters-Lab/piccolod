@@ -56,6 +56,7 @@ func defaultStubNetworkEnv() stubNetworkEnv {
 }
 
 func installStubNetworkEnv(t *testing.T, env stubNetworkEnv) {
+	interfaceFuncsMu.Lock()
 	origList := listNetworkInterfaces
 	origAddrs := interfaceAddrs
 
@@ -74,10 +75,13 @@ func installStubNetworkEnv(t *testing.T, env stubNetworkEnv) {
 		copy(res, addrs)
 		return res, nil
 	}
+	interfaceFuncsMu.Unlock()
 
 	t.Cleanup(func() {
+		interfaceFuncsMu.Lock()
 		listNetworkInterfaces = origList
 		interfaceAddrs = origAddrs
+		interfaceFuncsMu.Unlock()
 	})
 }
 
@@ -263,39 +267,7 @@ func TestSecurityMechanisms_Integration(t *testing.T) {
 
 	manager := newStubbedManager(t, defaultStubNetworkEnv())
 
-	// Test rate limiting with realistic scenario
-	t.Log("Testing rate limiting under realistic load...")
-
-	attackerIP := "192.168.1.200"
-	var totalQueries uint64
-	var blockedQueries uint64
-
-	// Simulate an attack: 50 queries in rapid succession
-	for i := 0; i < 50; i++ {
-		totalQueries++
-		if manager.isRateLimited(attackerIP) {
-			blockedQueries++
-		}
-		time.Sleep(time.Millisecond * 10) // 100 queries/second
-	}
-
-	if blockedQueries == 0 {
-		integrationBugs.Add("Rate limiting failed to block rapid queries - DoS vulnerability")
-		t.Error("BUG: No queries blocked during simulated attack")
-	}
-
-	// Check if security metrics are properly tracked
-	if manager.securityMetrics.TotalQueries == 0 {
-		integrationBugs.Add("Security metrics not tracking total queries")
-		t.Error("BUG: TotalQueries metric not updated")
-	}
-
-	if manager.securityMetrics.RateLimitHits == 0 && blockedQueries > 0 {
-		integrationBugs.Add("Security metrics not tracking rate limit hits")
-		t.Error("BUG: RateLimitHits metric not updated")
-	}
-
-	// Test concurrent query processing limits
+	// Test concurrent query processing limits (protects against goroutine exhaustion)
 	t.Log("Testing concurrent query limits...")
 	testConcurrentQueryLimits(t, manager)
 }
@@ -440,30 +412,20 @@ func TestMemoryLeaks_Integration(t *testing.T) {
 
 	manager := newStubbedManager(t, defaultStubNetworkEnv())
 
-	// Test client tracking cleanup
-	t.Log("Testing client state cleanup...")
+	// Test semaphore slot management under load
+	t.Log("Testing semaphore slot management...")
 
-	// Add many clients
-	clientCount := 1000
-	for i := 0; i < clientCount; i++ {
-		clientIP := fmt.Sprintf("10.0.%d.%d", i/254, i%254)
-		manager.isRateLimited(clientIP) // This adds the client
+	// Acquire and release slots many times to check for leaks
+	for i := 0; i < 1000; i++ {
+		if manager.acquireQuerySlot() {
+			manager.releaseQuerySlot()
+		}
 	}
 
-	manager.rateLimiter.mutex.RLock()
-	actualClientCount := len(manager.rateLimiter.clients)
-	manager.rateLimiter.mutex.RUnlock()
-
-	if actualClientCount != clientCount {
-		integrationBugs.Add(fmt.Sprintf("Client tracking inconsistent: added %d clients, found %d", clientCount, actualClientCount))
-		t.Errorf("BUG: Client count mismatch: %d vs %d", clientCount, actualClientCount)
-	}
-
-	// In a real system, old clients should be cleaned up
-	// But we haven't implemented cleanup yet...
-	if actualClientCount == clientCount {
-		integrationBugs.Add("No client cleanup mechanism - potential memory leak with many clients")
-		t.Log("POTENTIAL BUG: Client states never cleaned up - memory leak risk")
+	// Verify active count returns to zero
+	if manager.queryProcessor.activeCount != 0 {
+		integrationBugs.Add(fmt.Sprintf("Query processor leak: activeCount=%d after slot cycling", manager.queryProcessor.activeCount))
+		t.Errorf("BUG: Query processor active count should be 0, got %d", manager.queryProcessor.activeCount)
 	}
 }
 

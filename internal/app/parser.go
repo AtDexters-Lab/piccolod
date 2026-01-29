@@ -3,12 +3,17 @@ package app
 import (
 	"bytes"
 	"fmt"
+	"net"
+	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"text/template"
 
-	"gopkg.in/yaml.v3"
 	"piccolod/internal/api"
+	"piccolod/internal/hostname"
+
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -96,6 +101,7 @@ func validateRawServicesBlocks(root *yaml.Node) error {
 		"environment": {},
 		"storage":     {},
 		"resources":   {},
+		"oidc_client": {},
 	}
 
 	for i := 0; i+1 < len(services.Content); i += 2 {
@@ -239,14 +245,19 @@ func SetDefaults(app *api.AppDefinition) {
 
 // ValidateAppDefinition validates an AppDefinition struct
 func ValidateAppDefinition(app *api.AppDefinition) error {
-	// Validate name
-	if err := validateName(app.Name); err != nil {
+	// Validate app name using RFC 20260114 DNS-compliant rules (no hyphens)
+	if err := hostname.ValidateAppName(app.Name); err != nil {
 		return err
 	}
 
 	// Validate type
 	if err := validateType(app.Type); err != nil {
 		return err
+	}
+
+	// RFC 20260112: App-level auth block is removed.
+	if app.Auth != nil {
+		return newValidationError("APP_AUTH_DEPRECATED", "app-level auth block is deprecated; use listeners[].auth and services[].oidc_client")
 	}
 
 	// Validate Piccolo-specific extensions (required mode + consistency checks).
@@ -280,6 +291,11 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 	// Validate permissions
 	if err := validatePermissions(app.Permissions); err != nil {
 		return err
+	}
+
+	// RFC 20260112: oidc_passthrough requires at least one service to declare oidc_client.
+	if usesOIDCPassthrough(app.Listeners) && !hasOIDCClient(app.Services) {
+		return newValidationError("OIDC_CLIENT_REQUIRED", "oidc_passthrough strategy requires at least one service to declare oidc_client")
 	}
 
 	return nil
@@ -335,27 +351,59 @@ func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
 		return nil
 	}
 
-	// Multi-container is represented by presence of the top-level 'services' map.
-	if app.Services != nil {
-		if mode == ModeWorkspace {
-			return fmt.Errorf("services is not supported for workspace mode apps")
-		}
+	switch mode {
+	case ModeService:
 		if len(app.Services) == 0 {
-			return fmt.Errorf("services must not be empty")
+			return fmt.Errorf("services is required for service mode apps")
 		}
 
-		// When services is present, all container-level fields must be per-service.
+		// Service-mode apps must define container fields per-service only.
 		if strings.TrimSpace(app.Image) != "" {
-			return fmt.Errorf("image must be specified per-service under services when services is present")
+			return fmt.Errorf("image must be specified per-service under services for service mode apps")
 		}
 		if app.Environment != nil {
-			return fmt.Errorf("environment must be specified per-service under services when services is present")
+			return fmt.Errorf("environment must be specified per-service under services for service mode apps")
 		}
 		if app.Storage != nil {
-			return fmt.Errorf("storage must be specified per-service under services when services is present")
+			return fmt.Errorf("storage must be specified per-service under services for service mode apps")
 		}
 		if app.Resources != nil {
-			return fmt.Errorf("resources must be specified per-service under services when services is present")
+			return fmt.Errorf("resources must be specified per-service under services for service mode apps")
+		}
+
+		primary := strings.TrimSpace(app.PrimaryService)
+		if primary == "" {
+			primary = defaultPrimaryServiceName
+			if len(app.Services) == 1 {
+				for name := range app.Services {
+					primary = name
+				}
+			}
+		}
+		if _, ok := app.Services[primary]; !ok {
+			return fmt.Errorf("primary_service '%s' not found in services", primary)
+		}
+
+		return validateServices(app.Services, primary, app.Listeners)
+	case ModeWorkspace:
+		if len(app.Services) == 0 {
+			return fmt.Errorf("services is required for workspace mode apps")
+		}
+		if len(app.Services) != 1 {
+			return fmt.Errorf("workspace mode apps must define exactly one service")
+		}
+		// Workspace-mode apps must define container fields per-service only.
+		if strings.TrimSpace(app.Image) != "" {
+			return fmt.Errorf("image must be specified per-service under services for workspace mode apps")
+		}
+		if app.Environment != nil {
+			return fmt.Errorf("environment must be specified per-service under services for workspace mode apps")
+		}
+		if app.Storage != nil {
+			return fmt.Errorf("storage must be specified per-service under services for workspace mode apps")
+		}
+		if app.Resources != nil {
+			return fmt.Errorf("resources must be specified per-service under services for workspace mode apps")
 		}
 
 		primary := strings.TrimSpace(app.PrimaryService)
@@ -365,17 +413,9 @@ func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
 		if _, ok := app.Services[primary]; !ok {
 			return fmt.Errorf("primary_service '%s' not found in services", primary)
 		}
-
 		return validateServices(app.Services, primary, app.Listeners)
 	}
 
-	// Single-container app (legacy v1).
-	if strings.TrimSpace(app.PrimaryService) != "" {
-		return fmt.Errorf("primary_service requires services")
-	}
-	if strings.TrimSpace(app.Image) == "" {
-		return fmt.Errorf("image is required")
-	}
 	return nil
 }
 
@@ -390,6 +430,8 @@ func validateServiceName(name string) error {
 }
 
 func validateServices(services map[string]api.AppService, primary string, listeners []api.AppListener) error {
+	oidcEnv := make(map[string]string)
+
 	// Validate service specs first (names, images, per-service storage/resources).
 	for name, svc := range services {
 		if err := validateServiceName(name); err != nil {
@@ -407,6 +449,34 @@ func validateServices(services map[string]api.AppService, primary string, listen
 		}
 		if err := validateStorage(svc.Storage); err != nil {
 			return fmt.Errorf("services.%s.storage invalid: %w", name, err)
+		}
+
+		if svc.OIDCClient != nil {
+			if len(svc.OIDCClient.Env) == 0 {
+				return newValidationError("OIDC_ENV_REQUIRED", "oidc_client.env must not be empty")
+			}
+			if strings.TrimSpace(svc.OIDCClient.CAMountPath) == "" {
+				return newValidationError("OIDC_CA_PATH_REQUIRED", "oidc_client.ca_mount_path is required")
+			}
+			if len(svc.OIDCClient.RedirectURIPaths) == 0 {
+				return newValidationError("OIDC_REDIRECT_PATHS_REQUIRED", "oidc_client.redirect_uri_paths must be a non-empty list")
+			}
+			for _, p := range svc.OIDCClient.RedirectURIPaths {
+				if err := validateOIDCRedirectPath(p); err != nil {
+					return newValidationError("INVALID_REDIRECT_PATH", err.Error())
+				}
+			}
+			for k, v := range svc.OIDCClient.Env {
+				if prior, ok := oidcEnv[k]; ok && prior != v {
+					return fmt.Errorf("oidc_client.env conflicts for key '%s' across services", k)
+				}
+				oidcEnv[k] = v
+			}
+			for _, redirectURI := range svc.OIDCClient.RedirectURIs {
+				if err := validateOIDCRedirectURI(redirectURI); err != nil {
+					return newValidationError("INVALID_REDIRECT_URI", fmt.Sprintf("redirect_uri \"%s\" must be localhost, loopback (127.0.0.1, ::1), or custom scheme", redirectURI))
+				}
+			}
 		}
 	}
 
@@ -435,14 +505,17 @@ func validateServices(services map[string]api.AppService, primary string, listen
 	}
 
 	// Primary service must declare all listener guest ports (v1 listeners target primary by default).
-	primarySvc := services[primary]
-	primaryPorts := make(map[int]struct{}, len(primarySvc.BindPorts))
-	for _, p := range primarySvc.BindPorts {
-		primaryPorts[p] = struct{}{}
-	}
-	for _, l := range listeners {
-		if _, ok := primaryPorts[l.GuestPort]; !ok {
-			return fmt.Errorf("primary service '%s' must declare listener guest_port %d in bind_ports", primary, l.GuestPort)
+	// Skip this check for single-service apps since port conflicts are impossible.
+	if len(services) > 1 {
+		primarySvc := services[primary]
+		primaryPorts := make(map[int]struct{}, len(primarySvc.BindPorts))
+		for _, p := range primarySvc.BindPorts {
+			primaryPorts[p] = struct{}{}
+		}
+		for _, l := range listeners {
+			if _, ok := primaryPorts[l.GuestPort]; !ok {
+				return fmt.Errorf("primary service '%s' must declare listener guest_port %d in bind_ports", primary, l.GuestPort)
+			}
 		}
 	}
 
@@ -485,7 +558,8 @@ func validateServices(services map[string]api.AppService, primary string, listen
 	return nil
 }
 
-// validateName validates app name follows naming conventions
+// validateName validates names (for instance IDs) - allows hyphens.
+// For app names, use hostname.ValidateAppName() which is stricter (no hyphens).
 func validateName(name string) error {
 	if name == "" {
 		return fmt.Errorf("name is required")
@@ -533,6 +607,11 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 		return fmt.Errorf("listeners are required; legacy ports are no longer supported")
 	}
 
+	// Validate primary listener configuration using hostname package
+	if _, err := hostname.ResolvePrimaryListener(listeners); err != nil {
+		return fmt.Errorf("invalid primary listener configuration: %w", err)
+	}
+
 	names := make(map[string]struct{})
 	guestPorts := make(map[int]string)
 
@@ -540,6 +619,10 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 		// name required
 		if strings.TrimSpace(l.Name) == "" {
 			return fmt.Errorf("listener[%d] name is required", i)
+		}
+		// Validate listener name per RFC 20260114 (DNS-compliant, no hyphens)
+		if err := hostname.ValidateListenerName(l.Name); err != nil {
+			return fmt.Errorf("listener[%d] %w", i, err)
 		}
 		// unique name per app
 		if _, ok := names[l.Name]; ok {
@@ -573,6 +656,148 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 				return fmt.Errorf("listener '%s' middleware[%d] name is required", l.Name, j)
 			}
 		}
+
+		// RFC 20260112: Listener-level auth rules (path-based).
+		if l.Auth != nil {
+			if l.Flow != api.FlowTCP || (l.Protocol != api.ListenerProtocolHTTP && l.Protocol != api.ListenerProtocolWebsocket) {
+				if l.Flow == api.FlowTLS || l.Protocol == api.ListenerProtocolRaw {
+					return newValidationError("INVALID_AUTH_PROTOCOL", "auth block not supported on flow: tls or protocol: raw")
+				}
+				return newValidationError("INVALID_AUTH_FLOW", "auth block requires flow: tcp with protocol: http or websocket")
+			}
+
+			for _, rule := range l.Auth.Rules {
+				ruleType := strings.TrimSpace(rule.Type)
+				if ruleType == "" {
+					return newValidationError("INVALID_MATCH_TYPE", "auth.rules[].type is required and must be one of: exact, prefix, pattern")
+				}
+				switch ruleType {
+				case "exact", "prefix", "pattern":
+					// ok
+				default:
+					return newValidationError("INVALID_MATCH_TYPE", "auth.rules[].type is required and must be one of: exact, prefix, pattern")
+				}
+
+				strategy := strings.TrimSpace(rule.Strategy)
+				switch strategy {
+				case "oidc_passthrough", "headers", "protected", "public":
+					// ok
+				default:
+					return newValidationError("INVALID_STRATEGY", fmt.Sprintf("invalid strategy \"%s\", must be one of: oidc_passthrough, headers, protected, public", strategy))
+				}
+
+				rulePath := strings.TrimSpace(rule.Path)
+				if rulePath == "" {
+					return newValidationError("INVALID_PATH", fmt.Sprintf("invalid path \"%s\" for type \"%s\": path is required", rule.Path, rule.Type))
+				}
+				switch ruleType {
+				case "prefix":
+					if !strings.HasSuffix(rulePath, "/") {
+						return newValidationError("INVALID_PATH", fmt.Sprintf("invalid path \"%s\" for type \"%s\": prefix paths must end with '/'", rule.Path, rule.Type))
+					}
+				case "pattern":
+					if _, err := path.Match(rulePath, "/"); err != nil {
+						return newValidationError("INVALID_PATH", fmt.Sprintf("invalid path \"%s\" for type \"%s\": %s", rule.Path, rule.Type, err.Error()))
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func usesOIDCPassthrough(listeners []api.AppListener) bool {
+	for _, l := range listeners {
+		if l.Auth == nil {
+			continue
+		}
+		for _, rule := range l.Auth.Rules {
+			if strings.TrimSpace(rule.Strategy) == "oidc_passthrough" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasOIDCClient(services map[string]api.AppService) bool {
+	for _, svc := range services {
+		if svc.OIDCClient != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func validateOIDCRedirectURI(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(u.Scheme) == "" {
+		return fmt.Errorf("scheme required")
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		host := strings.TrimSpace(u.Hostname())
+		if host == "" {
+			return fmt.Errorf("host required")
+		}
+
+		if strings.EqualFold(host, "localhost") {
+			return nil
+		}
+
+		if ip := net.ParseIP(host); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				if ip4[0] == 127 && ip4[1] == 0 && ip4[2] == 0 && ip4[3] == 1 {
+					return nil
+				}
+				return fmt.Errorf("host must be localhost or loopback")
+			}
+			if ip.Equal(net.IPv6loopback) {
+				return nil
+			}
+		}
+		return fmt.Errorf("host must be localhost or loopback")
+	default:
+		// Custom scheme redirect URIs are allowed.
+		return nil
+	}
+}
+
+// validateOIDCRedirectPath validates a redirect URI path segment.
+// Paths must:
+// - Start with "/"
+// - Not be empty or whitespace-only
+// - Not contain query strings or fragments
+// - Contain only valid URI path characters (RFC 3986)
+// Note: No normalization is performed per RFC 3986 §6.2.1 (simple string comparison).
+func validateOIDCRedirectPath(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("redirect_uri_paths entry cannot be empty")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("redirect_uri_paths entry %q must start with /", path)
+	}
+	if strings.Contains(path, "?") {
+		return fmt.Errorf("redirect_uri_paths entry %q must not contain query string", path)
+	}
+	if strings.Contains(path, "#") {
+		return fmt.Errorf("redirect_uri_paths entry %q must not contain fragment", path)
+	}
+	// Validate path contains only valid URI characters by attempting to parse it.
+	// This catches spaces, control characters, and other invalid characters.
+	testURI := "http://example.com" + path
+	parsed, err := url.Parse(testURI)
+	if err != nil {
+		return fmt.Errorf("redirect_uri_paths entry %q contains invalid characters: %v", path, err)
+	}
+	// Ensure the path wasn't modified during parsing (e.g., spaces encoded).
+	// If the raw path differs from input, the input contained characters that needed encoding.
+	if parsed.Path != path {
+		return fmt.Errorf("redirect_uri_paths entry %q contains characters that require encoding (got %q after parsing)", path, parsed.Path)
 	}
 	return nil
 }

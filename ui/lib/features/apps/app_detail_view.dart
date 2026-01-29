@@ -1,27 +1,41 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../theme/piccolo_theme.dart';
 import '../../core/models/app_models.dart';
+import '../../core/models/listener_health.dart';
 import '../../core/services/app_service.dart';
 import '../../core/utils/task_id.dart';
+import '../../shared/widgets/health_badge.dart';
 import '../../shared/widgets/log_stream_viewer.dart';
 import '../../shared/widgets/task_progress_panel.dart';
+import '../../shared/widgets/uninstall_confirmation_dialog.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'app_launcher.dart';
 import 'widgets/edit_listeners_dialog.dart';
+import 'widgets/health_banner.dart';
 import 'workspace_terminal.dart';
 
 class AppDetailView extends StatefulWidget {
+  static const int tabOverview = 0;
+  static const int tabNetwork = 1;
+  static const int tabConfiguration = 2;
+  static const int tabLogs = 3;
+
   final String appId;
   final AppService appService;
   final DesktopController desktopController;
+  final int initialTab;
+  final String? iconUrl;
 
   const AppDetailView({
     super.key,
     required this.appId,
     required this.appService,
     required this.desktopController,
+    this.initialTab = 0,
+    this.iconUrl,
   });
 
   @override
@@ -42,15 +56,46 @@ class _AppDetailViewState extends State<AppDetailView>
   // Action states
   bool _isActionLoading = false;
 
+  // Health stream (via unified EventStreamClient)
+  StreamSubscription<ListenerHealthEvent>? _healthSub;
+  ListenerHealth? _primaryHealth;
+
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
+    _tabController = TabController(
+      length: 4,
+      vsync: this,
+      initialIndex: widget.initialTab.clamp(0, 3),
+    );
     _loadData();
+    _connectHealthStream();
+  }
+
+  String? _primaryListenerName;
+
+  void _connectHealthStream() {
+    final client = widget.desktopController.eventStreamClient;
+    if (client == null) return;
+
+    _healthSub = client.healthEvents.listen((event) {
+      if (!mounted) return;
+      // Only process events for this specific app
+      if (event.app != widget.appId) return;
+      // Only update primary health from the primary listener's events
+      if (_primaryListenerName != null &&
+          event.listener != _primaryListenerName) {
+        return;
+      }
+      setState(() {
+        _primaryHealth = event.health;
+      });
+    });
   }
 
   @override
   void dispose() {
+    _healthSub?.cancel();
     _tabController.dispose();
     super.dispose();
   }
@@ -70,6 +115,9 @@ class _AppDetailViewState extends State<AppDetailView>
         _app = detail.app;
         _listeners = detail.listeners;
         _containers = detail.containers;
+        _primaryHealth = detail.app.primaryListenerHealth;
+        // Identify the primary listener name for stream filtering
+        _primaryListenerName = _findPrimaryListenerName(detail.listeners);
         _selectedService = _pickSelectedService(
           _selectedService,
           detail.containers,
@@ -137,89 +185,38 @@ class _AppDetailViewState extends State<AppDetailView>
       return false;
     }
 
+    // Notify other widgets (e.g., Stage) that app state changed
+    widget.desktopController.notifyAppsChanged();
+
     if (!refreshOnSuccess || !mounted) return true;
     await _loadData();
     return true;
   }
 
-  void _confirmUninstall() {
-    bool purgeData = false;
+  void _confirmUninstall() async {
+    final result = await UninstallConfirmationDialog.show(
+      context,
+      appDisplayTitle: _app?.displayTitle ?? widget.appId,
+    );
 
-    showDialog(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) {
-          return AlertDialog(
-            title: Text("Uninstall ${_app?.displayTitle}?"),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text("This will remove the application container."),
-                const SizedBox(height: 16),
-                Container(
-                  decoration: BoxDecoration(
-                    color: PiccoloTheme.critical.withValues(alpha: 0.1),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: PiccoloTheme.critical.withValues(alpha: 0.3),
-                    ),
-                  ),
-                  child: CheckboxListTile(
-                    title: const Text(
-                      "Delete Data Volumes",
-                      style: TextStyle(
-                        color: PiccoloTheme.critical,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    subtitle: const Text("This action cannot be undone."),
-                    value: purgeData,
-                    activeColor: PiccoloTheme.critical,
-                    onChanged: (val) =>
-                        setDialogState(() => purgeData = val ?? false),
-                    controlAffinity: ListTileControlAffinity.leading,
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 8),
-                  ),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(),
-                child: const Text("Cancel"),
-              ),
-              FilledButton(
-                style: FilledButton.styleFrom(
-                  backgroundColor: PiccoloTheme.critical,
-                ),
-                onPressed: () async {
-                  Navigator.of(dialogContext).pop(); // Close dialog
+    if (result == null || !result.confirmed) return;
 
-                  final ok = await _handleActionWithProgress(
-                    taskType: 'uninstall_app',
-                    refreshOnSuccess: false,
-                    action: (taskId) => widget.appService.uninstallApp(
-                      widget.appId,
-                      purge: purgeData,
-                      taskId: taskId,
-                    ),
-                  );
-                  if (!ok || !mounted) return;
-                  setState(() {
-                    _app = null;
-                    _listeners = [];
-                    _containers = [];
-                    _selectedService = null;
-                  });
-                },
-                child: const Text("Uninstall"),
-              ),
-            ],
-          );
-        },
+    final ok = await _handleActionWithProgress(
+      taskType: 'uninstall_app',
+      refreshOnSuccess: false,
+      action: (taskId) => widget.appService.uninstallApp(
+        widget.appId,
+        purge: result.purgeData,
+        taskId: taskId,
       ),
     );
+    if (!ok || !mounted) return;
+    setState(() {
+      _app = null;
+      _listeners = [];
+      _containers = [];
+      _selectedService = null;
+    });
   }
 
   void _showEditListenersDialog() {
@@ -280,6 +277,19 @@ class _AppDetailViewState extends State<AppDetailView>
         // Header
         _buildHeader(),
 
+        // Starting status banner
+        if (_app!.isStarting)
+          _buildStartingBanner(),
+
+        // Health banner
+        if (_primaryHealth != null && !_primaryHealth!.isOk)
+          AppDetailHealthBanner(
+            health: _primaryHealth!,
+            lanFallbackUrl: _getLanFallbackUrl(),
+            appService: widget.appService,
+            desktopController: widget.desktopController,
+          ),
+
         // Tabs
         TabBar(
           controller: _tabController,
@@ -316,6 +326,7 @@ class _AppDetailViewState extends State<AppDetailView>
   Widget _buildHeader() {
     Color statusColor = PiccoloTheme.inkMuted;
     if (_app!.isRunning) statusColor = PiccoloTheme.success;
+    if (_app!.isStarting) statusColor = PiccoloTheme.warning;
     if (_app!.isError) statusColor = PiccoloTheme.critical;
 
     return Container(
@@ -333,14 +344,36 @@ class _AppDetailViewState extends State<AppDetailView>
               borderRadius: BorderRadius.circular(16),
             ),
             child: Center(
-              child: Text(
-                _app!.displayTitle[0].toUpperCase(),
-                style: const TextStyle(
-                  fontSize: 32,
-                  fontWeight: FontWeight.bold,
-                  color: PiccoloTheme.cobalt600,
-                ),
-              ),
+              child: widget.iconUrl != null && widget.iconUrl!.isNotEmpty
+                  ? ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: Image.network(
+                        widget.iconUrl!,
+                        width: 64,
+                        height: 64,
+                        fit: BoxFit.cover,
+                        errorBuilder: (context, error, stackTrace) => Text(
+                          _app!.displayTitle.isNotEmpty
+                              ? _app!.displayTitle[0].toUpperCase()
+                              : '?',
+                          style: const TextStyle(
+                            fontSize: 32,
+                            fontWeight: FontWeight.bold,
+                            color: PiccoloTheme.cobalt600,
+                          ),
+                        ),
+                      ),
+                    )
+                  : Text(
+                      _app!.displayTitle.isNotEmpty
+                          ? _app!.displayTitle[0].toUpperCase()
+                          : '?',
+                      style: const TextStyle(
+                        fontSize: 32,
+                        fontWeight: FontWeight.bold,
+                        color: PiccoloTheme.cobalt600,
+                      ),
+                    ),
             ),
           ),
           const SizedBox(width: 24),
@@ -470,6 +503,41 @@ class _AppDetailViewState extends State<AppDetailView>
     );
   }
 
+  static String? _findPrimaryListenerName(List<ServiceEndpoint> listeners) {
+    // Prefer the endpoint marked as primary
+    for (final l in listeners) {
+      if (l.primary) return l.name;
+    }
+    // RFC: first HTTP or WebSocket listener; null for raw-only apps
+    for (final l in listeners) {
+      if (l.protocol == 'http' || l.protocol == 'ws') return l.name;
+    }
+    return null;
+  }
+
+  String _getLanFallbackUrl() {
+    // Prefer the primary listener's fallback URL
+    final primary = _primaryListenerName;
+    if (primary != null) {
+      for (final l in _listeners) {
+        if (l.name == primary) {
+          return l.lanFallbackUrl ?? l.lanHostUrl ?? l.localUrl ?? '';
+        }
+      }
+    }
+    // Fallback: first listener with a URL
+    for (final l in _listeners) {
+      if (l.lanFallbackUrl != null) return l.lanFallbackUrl!;
+    }
+    for (final l in _listeners) {
+      if (l.lanHostUrl != null) return l.lanHostUrl!;
+    }
+    for (final l in _listeners) {
+      if (l.localUrl != null) return l.localUrl!;
+    }
+    return '';
+  }
+
   Widget _buildOverviewTab() {
     return ListView(
       padding: const EdgeInsets.all(24),
@@ -574,6 +642,10 @@ class _AppDetailViewState extends State<AppDetailView>
                                   fontSize: 16,
                                 ),
                               ),
+                              if (svc.health != null && !svc.health!.isOk) ...[
+                                const SizedBox(width: 8),
+                                HealthBadge(health: svc.health),
+                              ],
                               const Spacer(),
                               Container(
                                 padding: const EdgeInsets.symmetric(
@@ -594,52 +666,48 @@ class _AppDetailViewState extends State<AppDetailView>
                           ),
                           const Divider(height: 24),
                           _buildNetworkRow("Internal Port", "${svc.guestPort}"),
-                          if (svc.localUrl != null)
-                            _buildNetworkRow(
+                          if (svc.lanHostUrl != null)
+                            _buildNetworkLinkRow(
                               "LAN Access",
-                              "${svc.localUrl} (Port ${svc.publicPort})",
+                              svc.lanHostUrl!,
+                              onTap: () => launchUrl(Uri.parse(svc.lanHostUrl!)),
+                              icon: Icons.open_in_new,
+                              tooltip: "Opens in new tab",
                             ),
-
+                          if (svc.localUrl != null)
+                            _buildNetworkLinkRow(
+                              svc.lanHostUrl != null
+                                  ? "LAN Fallback"
+                                  : "LAN Access",
+                              "${svc.localUrl} (Port ${svc.publicPort})",
+                              onTap: () => AppLauncher.openAppWindow(
+                                controller: widget.desktopController,
+                                appService: widget.appService,
+                                app: _app!,
+                                service: svc,
+                              ),
+                              icon: Icons.web_asset,
+                              tooltip: "Opens in app window",
+                            ),
                           if (svc.remoteUrl != null)
-                            _buildNetworkRow("Remote Access", svc.remoteUrl!),
-
-                          const SizedBox(height: 16),
-                          Row(
-                            children: [
-                              if (svc.localUrl != null)
-                                Expanded(
-                                  child: OutlinedButton.icon(
-                                    onPressed: () => AppLauncher.openAppWindow(
-                                      controller: widget.desktopController,
-                                      appService: widget.appService,
-                                      app: _app!,
-                                      service: svc,
-                                    ),
-                                    icon: const Icon(Icons.lan, size: 16),
-                                    label: const Text("Open Local"),
-                                  ),
-                                ),
-                              if (svc.remoteUrl != null) ...[
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: FilledButton.icon(
-                                    onPressed: () => AppLauncher.openAppWindow(
-                                      controller: widget.desktopController,
-                                      appService: widget.appService,
-                                      app: _app!,
-                                      service: svc,
-                                      overrideUrl: svc.remoteUrl!,
-                                    ),
-                                    icon: const Icon(Icons.public, size: 16),
-                                    label: const Text("Open Remote"),
-                                    style: FilledButton.styleFrom(
-                                      backgroundColor: PiccoloTheme.cobalt600,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ],
-                          ),
+                            _buildNetworkLinkRow(
+                              "Remote Access",
+                              svc.remoteUrl!,
+                              onTap: () => AppLauncher.healthGatedOpen(
+                                context: context,
+                                controller: widget.desktopController,
+                                appService: widget.appService,
+                                app: _app!,
+                                service: svc,
+                                overrideUrl: svc.remoteUrl!,
+                                // Only override with live stream health for primary listener
+                                healthOverride: svc.name == _primaryListenerName
+                                    ? _primaryHealth
+                                    : null,
+                              ),
+                              icon: Icons.web_asset,
+                              tooltip: "Opens in app window",
+                            ),
                         ],
                       ),
                     ),
@@ -746,6 +814,47 @@ class _AppDetailViewState extends State<AppDetailView>
     );
   }
 
+  Widget _buildStartingBanner() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      color: PiccoloTheme.warning.withValues(alpha: 0.1),
+      child: Row(
+        children: [
+          Icon(
+            Icons.hourglass_empty,
+            color: PiccoloTheme.warning,
+            size: 20,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'App is starting...',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  'The app is initializing. Check logs if startup takes too long.',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: PiccoloTheme.inkMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          TextButton.icon(
+            onPressed: () => _tabController.animateTo(AppDetailView.tabLogs),
+            icon: const Icon(Icons.article_outlined, size: 16),
+            label: const Text('View Logs'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSectionTitle(String title) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
@@ -774,6 +883,57 @@ class _AppDetailViewState extends State<AppDetailView>
             child: SelectableText(
               value,
               style: const TextStyle(fontFamily: 'JetBrainsMono'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildNetworkLinkRow(
+    String label,
+    String value, {
+    required VoidCallback onTap,
+    required IconData icon,
+    String? tooltip,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 120,
+            child: Text(
+              label,
+              style: const TextStyle(color: PiccoloTheme.inkMuted),
+            ),
+          ),
+          Expanded(
+            child: InkWell(
+              onTap: onTap,
+              borderRadius: BorderRadius.circular(4),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        value,
+                        style: const TextStyle(
+                          fontFamily: 'JetBrainsMono',
+                          color: PiccoloTheme.cobalt600,
+                          decoration: TextDecoration.underline,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Tooltip(
+                      message: tooltip ?? '',
+                      child: Icon(icon, size: 14, color: PiccoloTheme.cobalt600),
+                    ),
+                  ],
+                ),
+              ),
             ),
           ),
         ],

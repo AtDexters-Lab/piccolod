@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +20,7 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/app"
+	"piccolod/internal/app/catalog"
 	authpkg "piccolod/internal/auth"
 	"piccolod/internal/cluster"
 	"piccolod/internal/container"
@@ -85,17 +87,27 @@ func TestGinAppAPI_Install(t *testing.T) {
 			name:        "install valid nginx app",
 			method:      "POST",
 			contentType: "application/x-yaml",
-			body: `name: test-nginx
-image: docker.io/library/nginx:alpine
+			body: `name: testnginx
 type: user
 listeners:
   - name: web
     guest_port: 80
     flow: tcp
     protocol: http
-environment:
-  NGINX_HOST: localhost
-  NGINX_PORT: "80"`,
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+    environment:
+      NGINX_HOST: localhost
+      NGINX_PORT: "80"
+x-piccolo:
+  mode: service`,
 			expectedStatus: http.StatusCreated,
 			expectError:    false,
 		},
@@ -183,14 +195,24 @@ func TestGinAppAPI_Install_JSON_WithDisplayName(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	payload := map[string]interface{}{
-		"app_definition": `name: test-nginx
-image: docker.io/library/nginx:alpine
+		"app_definition": `name: testnginx
 type: user
 listeners:
   - name: web
     guest_port: 80
     flow: tcp
-    protocol: http`,
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+x-piccolo:
+  mode: service`,
 		"display_name": "Work Projects",
 	}
 	body, err := json.Marshal(payload)
@@ -218,11 +240,8 @@ listeners:
 	if got := data["display_name"]; got != "Work Projects" {
 		t.Fatalf("expected display_name %q, got %#v", "Work Projects", got)
 	}
-	if got := data["app_name"]; got != "test-nginx" {
-		t.Fatalf("expected app_name %q, got %#v", "test-nginx", got)
-	}
-	if got := data["instance_id"]; got != "test-nginx" {
-		t.Fatalf("expected instance_id %q, got %#v", "test-nginx", got)
+	if got := data["instance_id"]; got != "testnginx" {
+		t.Fatalf("expected instance_id %q, got %#v", "testnginx", got)
 	}
 }
 
@@ -260,10 +279,12 @@ func TestGinAppAPI_CheckInstance(t *testing.T) {
 	}
 
 	appDef := &api.AppDefinition{
-		Name:       "demo",
-		Image:      "alpine:latest",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "demo",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	if _, err := server.appManager.Install(context.Background(), appDef, ""); err != nil {
@@ -324,10 +345,12 @@ func TestGinAppAPI_List(t *testing.T) {
 
 	// Install an app via the app manager directly
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "nginx:alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "testapp",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
@@ -382,21 +405,24 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	if strings.TrimSpace(status.TLD) == "" {
 		t.Fatalf("remote status missing tld: %+v", status)
 	}
-	if host := srv.remoteServiceHostname(&status, services.ServiceEndpoint{Name: "web"}); host == "" {
+	// Test hostname derivation with proper DerivedHostLabel (per RFC 20260114)
+	if host := srv.remoteServiceHostname(&status, services.ServiceEndpoint{Name: "web", DerivedHostLabel: "testapp"}); host == "" {
 		t.Fatalf("remote hostname derivation failed")
 	}
 	srv.refreshRemoteRuntime()
 
 	_, err := srv.appManager.Install(context.Background(), &api.AppDefinition{
-		Name:  "blog",
-		Image: "docker.io/library/nginx:alpine",
-		Type:  "user",
+		Name: "blog",
+		Type: "user",
 		Listeners: []api.AppListener{{
 			Name:      "web",
 			GuestPort: 80,
 			Flow:      api.FlowTCP,
 			Protocol:  api.ListenerProtocolHTTP,
 		}},
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}, "")
 	if err != nil {
@@ -433,8 +459,9 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected remote_host field on service: %#v", first)
 	}
-	if remoteHost != "web.example.com" {
-		t.Fatalf("unexpected remote_host %q", remoteHost)
+	// Per RFC 20260114: primary listener gets <app>.<base> hostname where <base> is the portal hostname apex.
+	if remoteHost != "blog.portal.example.com" {
+		t.Fatalf("unexpected remote_host %q (expected blog.portal.example.com per RFC 20260114)", remoteHost)
 	}
 
 	rawContainers, ok := data["containers"].([]interface{})
@@ -459,10 +486,12 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "nginx:alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "testapp",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
@@ -479,7 +508,7 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 	}{
 		{
 			name:           "get existing app",
-			appName:        "test-app",
+			appName:        "testapp",
 			expectedStatus: http.StatusOK,
 			expectError:    false,
 		},
@@ -534,10 +563,12 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "alpine:latest",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "testapp",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
@@ -556,21 +587,21 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 		{
 			name:           "start app",
 			method:         "POST",
-			url:            "/api/v1/apps/test-app/start",
+			url:            "/api/v1/apps/testapp/start",
 			expectedStatus: http.StatusOK,
 			expectError:    false,
 		},
 		{
 			name:           "stop app",
 			method:         "POST",
-			url:            "/api/v1/apps/test-app/stop",
+			url:            "/api/v1/apps/testapp/stop",
 			expectedStatus: http.StatusOK,
 			expectError:    false,
 		},
 		{
 			name:           "wrong method for action",
 			method:         "GET",
-			url:            "/api/v1/apps/test-app/start",
+			url:            "/api/v1/apps/testapp/start",
 			expectedStatus: http.StatusNotFound, // Gin returns 404 for unregistered routes
 			expectError:    false,               // 404 responses are plain text, not JSON
 		},
@@ -629,16 +660,26 @@ func TestGinAppAPI_FullLifecycle(t *testing.T) {
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
-	appYAML := `name: lifecycle-test
-image: docker.io/library/nginx:alpine
+	appYAML := `name: lifecycletest
 type: user
 listeners:
   - name: web
     guest_port: 80
     flow: tcp
     protocol: http
-environment:
-  TEST_ENV: "lifecycle"`
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+    environment:
+      TEST_ENV: "lifecycle"
+x-piccolo:
+  mode: service`
 
 	// 1. Install app via HTTP API
 	w := httptest.NewRecorder()
@@ -663,7 +704,7 @@ environment:
 
 	// 3. Get specific app details
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("GET", "/api/v1/apps/lifecycle-test", nil)
+	req, _ = http.NewRequest("GET", "/api/v1/apps/lifecycletest", nil)
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -673,7 +714,7 @@ environment:
 
 	// 4. Start the app
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/api/v1/apps/lifecycle-test/start", nil)
+	req, _ = http.NewRequest("POST", "/api/v1/apps/lifecycletest/start", nil)
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -683,7 +724,7 @@ environment:
 
 	// 5. Stop the app
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/api/v1/apps/lifecycle-test/stop", nil)
+	req, _ = http.NewRequest("POST", "/api/v1/apps/lifecycletest/stop", nil)
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -693,7 +734,7 @@ environment:
 
 	// 6. Uninstall the app
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("DELETE", "/api/v1/apps/lifecycle-test", nil)
+	req, _ = http.NewRequest("DELETE", "/api/v1/apps/lifecycletest", nil)
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -742,10 +783,12 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
 	appDef := &api.AppDefinition{
-		Name:       "test-app",
-		Image:      "alpine:latest",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80}},
+		Name:      "testapp",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
@@ -756,7 +799,7 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 
 	// Test successful uninstall
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("DELETE", "/api/v1/apps/test-app", nil)
+	req, _ := http.NewRequest("DELETE", "/api/v1/apps/testapp", nil)
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -983,6 +1026,8 @@ func (s *stubTestVolumeManager) RoleStream(id string) (<-chan persistence.Volume
 func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	t.Helper()
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	t.Setenv("PICCOLO_STATE_DIR", tempDir)
 	t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(tempDir, "run", "podman"))
 	ensureTestControlMetadata(t, tempDir)
 	// Create mock container manager for app manager
@@ -1043,16 +1088,64 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	if err != nil {
 		t.Fatalf("remote mgr: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = rm.Close()
+	})
 	rm.SetNexusAdapter(nexusclient.NewStub())
 	remote.RegisterHandlers(dispatch, rm)
 	tlsMux := services.NewTlsMux(svcMgr)
 	remoteResolver := newServiceRemoteResolver(svcMgr)
+
+	// Catalog manager stub (avoid outbound network calls).
+	catalogHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.yaml":
+			w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+			_, _ = io.WriteString(w, `apps:
+  - name: wordpress
+    path: wordpress/app.yaml
+    description: test
+    category: test
+`)
+		case "/wordpress/app.yaml":
+			w.Header().Set("Content-Type", "application/x-yaml; charset=utf-8")
+			_, _ = io.WriteString(w, `name: wordpress
+type: user
+listeners:
+  - name: web
+    guest_port: 80
+    flow: tcp
+    protocol: http
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+x-piccolo:
+  mode: service
+`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("catalog stub listen: %v", err)
+	}
+	catalogStub := &httptest.Server{
+		Listener: ln,
+		Config:   &http.Server{Handler: catalogHandler},
+	}
+	catalogStub.Start()
+	t.Cleanup(catalogStub.Close)
+	catalogMgr := catalog.NewManager(catalogStub.URL, filepath.Join(tempDir, "catalog-cache"))
+
 	server := &GinServer{
 		appManager:     appMgr,
 		serviceManager: svcMgr,
 		mdnsManager:    mdns.NewManager(),
 		dispatcher:     dispatch,
 		remoteManager:  rm,
+		catalogManager: catalogMgr,
 		authManager:    authMgr,
 		sessions:       authpkg.NewSessionStore(),
 		cryptoManager:  cryptoMgr,
@@ -1077,6 +1170,14 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 		t.Fatalf("secure loopback init: %v", err)
 	}
 	server.refreshRemoteRuntime()
+	t.Cleanup(func() {
+		if server.tlsMux != nil {
+			server.tlsMux.Stop()
+		}
+		if server.serviceManager != nil && server.serviceManager.ProxyManager() != nil {
+			server.serviceManager.ProxyManager().StopAll()
+		}
+	})
 
 	return server
 }
@@ -1086,7 +1187,25 @@ func TestLeadership_FollowerStopsApp(t *testing.T) {
 	sessionCookie, csrf := setupTestAdminSession(t, srv)
 
 	// Install a simple app via API
-	payload := "name: blog\nimage: docker.io/library/nginx:alpine\ntype: user\nlisteners:\n  - name: web\n    guest_port: 80\n    flow: tcp\n    protocol: http\n"
+	payload := `name: blog
+type: user
+listeners:
+  - name: web
+    guest_port: 80
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+services:
+  main:
+    image: docker.io/library/nginx:alpine
+    bind_ports: [80]
+x-piccolo:
+  mode: service
+`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/apps", strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/x-yaml")
@@ -1096,20 +1215,54 @@ func TestLeadership_FollowerStopsApp(t *testing.T) {
 		t.Fatalf("install status=%d body=%s", w.Code, w.Body.String())
 	}
 
+	// Wait for the app to start (at least one container running) so the follower transition is meaningful.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		statuses, err := srv.appManager.ContainerStatuses(context.Background(), "blog")
+		if err == nil {
+			for _, st := range statuses {
+				if st.Running {
+					goto started
+				}
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected at least one blog container to be running after install")
+
+started:
 	// Publish follower role for this app
 	srv.events.Publish(events.Event{Topic: events.TopicLeadershipRoleChanged, Payload: events.LeadershipChanged{Resource: cluster.ResourceForApp("blog"), Role: cluster.RoleFollower}})
 
 	// Wait briefly for goroutine to act
-	deadline := time.Now().Add(200 * time.Millisecond)
+	deadline = time.Now().Add(200 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		app, err := srv.appManager.Get(context.Background(), "blog")
-		if err == nil && app.Status == "stopped" {
-			return
+		statuses, err := srv.appManager.ContainerStatuses(context.Background(), "blog")
+		if err == nil {
+			anyRunning := false
+			for _, st := range statuses {
+				if st.Running {
+					anyRunning = true
+					break
+				}
+			}
+			if !anyRunning {
+				// Ensure proxies are also torn down.
+				if _, err := srv.serviceManager.GetByApp("blog"); err == nil {
+					time.Sleep(5 * time.Millisecond)
+					continue
+				}
+				app, _ := srv.appManager.Get(context.Background(), "blog")
+				if app.Status == "stopped" {
+					t.Fatalf("expected desired status to remain running after follower transition, got %v", app.Status)
+				}
+				return
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	app, _ := srv.appManager.Get(context.Background(), "blog")
-	t.Fatalf("expected app to be stopped after follower event, got status=%v", app.Status)
+	t.Fatalf("expected follower transition to stop containers, got status=%v", app.Status)
 }
 
 // setupTestAdminSession provisions the admin password and returns session cookie/CSRF token.
@@ -1117,26 +1270,26 @@ func setupTestAdminSession(t *testing.T, server *GinServer) (*http.Cookie, strin
 	t.Helper()
 	const password = "TestPass123!"
 
-	// First-run setup
+	// Use /crypto/setup which atomically sets up crypto, auth, and admin user
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest(http.MethodPost, "/api/v1/auth/setup", strings.NewReader(fmt.Sprintf(`{"password":"%s"}`, password)))
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/crypto/setup", strings.NewReader(fmt.Sprintf(`{"password":"%s"}`, password)))
 	req.Header.Set("Content-Type", "application/json")
 	server.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		// Allow already-initialized if tests re-use the helper on same server
 		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "already") {
-			t.Fatalf("auth setup failed: status=%d body=%s", w.Code, w.Body.String())
+			t.Fatalf("crypto setup failed: status=%d body=%s", w.Code, w.Body.String())
+		}
+		// If already initialized, login to get session
+		w = httptest.NewRecorder()
+		req, _ = http.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(fmt.Sprintf(`{"username":"admin","password":"%s"}`, password)))
+		req.Header.Set("Content-Type", "application/json")
+		server.router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("auth login failed: status=%d body=%s", w.Code, w.Body.String())
 		}
 	}
-
-	// Login to obtain session cookie
-	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(fmt.Sprintf(`{"username":"admin","password":"%s"}`, password)))
-	req.Header.Set("Content-Type", "application/json")
-	server.router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("auth login failed: status=%d body=%s", w.Code, w.Body.String())
-	}
+	// crypto/setup returns session cookie directly
 	var sessionCookie *http.Cookie
 	for _, c := range w.Result().Cookies() {
 		if c.Name == sessionCookieName {
@@ -1145,7 +1298,7 @@ func setupTestAdminSession(t *testing.T, server *GinServer) (*http.Cookie, strin
 		}
 	}
 	if sessionCookie == nil {
-		t.Fatalf("missing session cookie in login response")
+		t.Fatalf("missing session cookie in response")
 	}
 
 	// Fetch CSRF token
@@ -1299,6 +1452,12 @@ func (m *GinMockContainerManager) ResetStorage(ctx context.Context, runtime cont
 	m.containers = make(map[string]*MockContainer)
 	m.images = make(map[string]struct{})
 	return nil
+}
+
+func (m *GinMockContainerManager) ValidateAndRepairStorage(ctx context.Context, runtime container.PodmanRuntime) (bool, error) {
+	_ = ctx
+	_ = runtime
+	return false, nil
 }
 
 func (m *GinMockContainerManager) CommitContainer(ctx context.Context, runtime container.PodmanRuntime, containerID, imageName string) error {
@@ -1470,10 +1629,12 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	// But we can use AllocateForApp if we mock it, OR just manually register an app first.
 	// Let's use Install() for consistency
 	appDef := &api.AppDefinition{
-		Name:       "url-test",
-		Image:      "alpine",
-		Type:       "user",
-		Listeners:  []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Name:      "urltest",
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine", BindPorts: []int{80}},
+		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	_, err := server.appManager.Install(context.Background(), appDef, "")
@@ -1482,7 +1643,7 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	}
 
 	// Fetch endpoint to get allocated port
-	eps, err := server.serviceManager.GetByApp("url-test")
+	eps, err := server.serviceManager.GetByApp("urltest")
 	if err != nil || len(eps) != 1 {
 		t.Fatalf("expected 1 endpoint, got %v err=%v", eps, err)
 	}
@@ -1490,7 +1651,7 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 
 	// 1. Request with standard host
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/api/v1/apps/url-test", nil)
+	req, _ := http.NewRequest("GET", "/api/v1/apps/urltest", nil)
 	req.Host = "piccolo.local"
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
@@ -1514,7 +1675,7 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 
 	// 2. Request with IP host
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("GET", "/api/v1/apps/url-test", nil)
+	req, _ = http.NewRequest("GET", "/api/v1/apps/urltest", nil)
 	req.Host = "192.168.1.50:8080"
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)

@@ -53,10 +53,13 @@ class SettingsController extends ChangeNotifier {
       case 0: // Profile
         await fetchSession();
         break;
-      case 1: // Network
+      case 1: // Remote Access
         await fetchRemoteStatus();
         break;
-      case 2: // System
+      case 2: // Users
+        // Users tab has its own controller
+        break;
+      case 3: // System
         await fetchOSUpdate();
         if (!_disposed && _isBackendBusy) {
           _pollWhileBusy();

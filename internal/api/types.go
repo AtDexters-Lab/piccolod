@@ -237,6 +237,8 @@ type AppDefinition struct {
 	HealthCheck *AppHealthCheck        `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
 	AppConfig   interface{}            `yaml:"app_config,omitempty" json:"app_config,omitempty"`
 	Extensions  map[string]interface{} `yaml:"x-piccolo,omitempty" json:"x-piccolo,omitempty"`
+	// Auth defines how the app integrates with Piccolo's authentication system
+	Auth *AppAuth `yaml:"auth,omitempty" json:"auth,omitempty"`
 }
 
 // AppListener defines a named service exposed by the app (service-oriented model)
@@ -245,8 +247,22 @@ type AppListener struct {
 	GuestPort   int                     `yaml:"guest_port" json:"guest_port"`
 	Flow        ListenerFlow            `yaml:"flow,omitempty" json:"flow,omitempty"`
 	Protocol    ListenerProtocol        `yaml:"protocol,omitempty" json:"protocol,omitempty"`
+	Primary     bool                    `yaml:"primary,omitempty" json:"primary,omitempty"` // Marks this as the primary HTTP/WS listener for host-based routing
 	Middleware  []AppProtocolMiddleware `yaml:"protocol_middleware,omitempty" json:"protocol_middleware,omitempty"`
 	RemotePorts []int                   `yaml:"remote_ports,omitempty" json:"remote_ports,omitempty"`
+	Auth        *ListenerAuth           `yaml:"auth,omitempty" json:"auth,omitempty"`
+}
+
+// ListenerAuth configures path-based auth strategies for an HTTP-visible listener.
+type ListenerAuth struct {
+	Rules []ListenerAuthRule `yaml:"rules,omitempty" json:"rules,omitempty"`
+}
+
+// ListenerAuthRule matches a request path and selects an auth strategy.
+type ListenerAuthRule struct {
+	Path     string `yaml:"path" json:"path"`
+	Type     string `yaml:"type" json:"type"`         // exact | prefix | pattern
+	Strategy string `yaml:"strategy" json:"strategy"` // oidc_passthrough | headers | protected | public
 }
 
 // AppProtocolMiddleware defines protocol-specific middleware entry
@@ -255,14 +271,35 @@ type AppProtocolMiddleware struct {
 	Params map[string]interface{} `yaml:"params,omitempty" json:"params,omitempty"`
 }
 
+// ServiceOIDCClient configures OIDC credential injection scoped to a single service.
+type ServiceOIDCClient struct {
+	// RedirectURIPaths declares the callback path segments for OIDC redirects.
+	// Piccolo generates full redirect URIs by combining all valid access origins
+	// (Remote, Alias, LAN host-based, LAN port-based) with these paths.
+	// Required and must be non-empty. Paths must start with "/".
+	// Example: ["/callback", "/oauth/callback"]
+	// Note: Comparison is case-sensitive with no normalization per RFC 3986 §6.2.1.
+	RedirectURIPaths []string `yaml:"redirect_uri_paths" json:"redirect_uri_paths"`
+
+	// RedirectURIs declares explicit redirect URIs for native/desktop apps.
+	// Only localhost (127.0.0.1, ::1) or custom scheme URIs are allowed (RFC 8252).
+	// These are used as-is without origin expansion.
+	// Example: ["myapp://callback", "http://localhost:8081/callback"]
+	RedirectURIs []string `yaml:"redirect_uris,omitempty" json:"redirect_uris,omitempty"`
+
+	CAMountPath string            `yaml:"ca_mount_path" json:"ca_mount_path"`
+	Env         map[string]string `yaml:"env" json:"env"`
+}
+
 // AppService defines a single container within a compose-style app (service mode).
 type AppService struct {
-	Image       string            `yaml:"image" json:"image"`
-	After       []string          `yaml:"after,omitempty" json:"after,omitempty"`
-	BindPorts   []int             `yaml:"bind_ports,omitempty" json:"bind_ports,omitempty"`
-	Environment map[string]string `yaml:"environment,omitempty" json:"environment,omitempty"`
-	Storage     *AppStorage       `yaml:"storage,omitempty" json:"storage,omitempty"`
-	Resources   *AppResources     `yaml:"resources,omitempty" json:"resources,omitempty"`
+	Image       string             `yaml:"image" json:"image"`
+	After       []string           `yaml:"after,omitempty" json:"after,omitempty"`
+	BindPorts   []int              `yaml:"bind_ports" json:"bind_ports"`
+	Environment map[string]string  `yaml:"environment,omitempty" json:"environment,omitempty"`
+	Storage     *AppStorage        `yaml:"storage,omitempty" json:"storage,omitempty"`
+	Resources   *AppResources      `yaml:"resources,omitempty" json:"resources,omitempty"`
+	OIDCClient  *ServiceOIDCClient `yaml:"oidc_client,omitempty" json:"oidc_client,omitempty"`
 }
 
 // AppStorage defines storage configuration
@@ -331,28 +368,9 @@ type AppVolume struct {
 	Shared    bool   `yaml:"shared,omitempty" json:"shared,omitempty"`
 }
 
-// App represents an installed application
-type App struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Image       string `json:"image"`
-	Type        string `json:"type"`
-	Mode        string `json:"mode,omitempty"` // "workspace" or "service"
-	Status      string `json:"status"`         // "running", "stopped", "error"
-	ContainerID string `json:"container_id,omitempty"`
-	// Legacy Ports removed
-	Volumes     []AppVolume       `json:"volumes,omitempty"`
-	Environment map[string]string `json:"environment,omitempty"`
-}
-
 // InstallAppRequest defines the request to install an app
 type InstallAppRequest struct {
 	AppDefinition string `json:"app_definition"` // YAML content as string
-}
-
-// AppListResponse defines the response for listing apps
-type AppListResponse struct {
-	Apps []App `json:"apps"`
 }
 
 // CatalogItem represents an available application in the external catalog
@@ -393,4 +411,36 @@ type AppInput struct {
 type AppInputValidation struct {
 	Regex   string `yaml:"regex" json:"regex"`
 	Message string `yaml:"message" json:"message"`
+}
+
+// AppAuth defines authentication configuration for an app.
+type AppAuth struct {
+	// Strategy defines how the app authenticates users.
+	// Values: "oidc", "headers", "none" (default: "none")
+	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// Injection defines how OIDC credentials are injected into the app.
+	Injection *AppAuthInjection `yaml:"injection,omitempty" json:"injection,omitempty"`
+}
+
+// AppAuthInjection defines how auth credentials are passed to the app.
+type AppAuthInjection struct {
+	// Custom mount path for CA cert
+	CAMountPath string `yaml:"ca_mount_path,omitempty" json:"ca_mount_path,omitempty"`
+
+	// Env maps environment variable names to template values.
+	// Example: {"ISSUER_URL": "{{ .Auth.Issuer }}", "CLIENT_ID": "{{ .Auth.ClientID }}"}
+	Env map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+}
+
+// AuthTemplateContext provides auth-related values for app manifest templating.
+type AuthTemplateContext struct {
+	// Issuer is the OIDC issuer URL (e.g., "https://piccolo.local")
+	Issuer string
+
+	// ClientID is the dynamically registered OIDC client ID for this app
+	ClientID string
+
+	// ClientSecret is the OIDC client secret (only returned once during registration)
+	ClientSecret string
 }

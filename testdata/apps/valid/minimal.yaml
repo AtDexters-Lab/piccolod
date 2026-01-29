@@ -1,7 +1,10 @@
-name: test-minimal
-image: alpine:latest
+name: testminimal
 listeners:
   - name: web
     guest_port: 80
+services:
+  main:
+    image: alpine:latest
+    bind_ports: [80]
 x-piccolo:
   mode: service

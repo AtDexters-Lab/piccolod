@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"piccolod/internal/events"
 )
 
 func TestNewManager(t *testing.T) {
@@ -41,10 +43,6 @@ func TestNewManager(t *testing.T) {
 	}
 
 	// Test security components initialization
-	if manager.rateLimiter == nil {
-		t.Error("rateLimiter should be initialized")
-	}
-
 	if manager.securityConfig == nil {
 		t.Error("securityConfig should be initialized")
 	}
@@ -95,14 +93,10 @@ func TestManagerSecurityConfigDefaults(t *testing.T) {
 		actual   interface{}
 		expected interface{}
 	}{
-		{"MaxQueriesPerSecond", config.MaxQueriesPerSecond, 10},
-		{"MaxQueriesPerMinute", config.MaxQueriesPerMinute, 100},
 		{"MaxPacketSize", config.MaxPacketSize, 1500},
 		{"MaxResponseSize", config.MaxResponseSize, 512},
 		{"MaxConcurrentQueries", config.MaxConcurrentQueries, 50},
 		{"QueryTimeout", config.QueryTimeout, time.Second * 2},
-		{"ClientBlockDuration", config.ClientBlockDuration, time.Minute * 5},
-		{"CleanupInterval", config.CleanupInterval, time.Minute * 5},
 	}
 
 	for _, tt := range tests {
@@ -204,20 +198,6 @@ func TestManagerConflictDetectorDefaults(t *testing.T) {
 
 	if detector.CurrentSuffix != "" {
 		t.Errorf("CurrentSuffix = %v, want empty string", detector.CurrentSuffix)
-	}
-}
-
-func TestManagerRateLimiterDefaults(t *testing.T) {
-	manager := NewManager()
-
-	rateLimiter := manager.rateLimiter
-
-	if rateLimiter.clients == nil {
-		t.Error("rateLimiter.clients map should be initialized")
-	}
-
-	if len(rateLimiter.clients) != 0 {
-		t.Error("rateLimiter.clients map should be empty initially")
 	}
 }
 
@@ -401,8 +381,195 @@ func TestGoroutineDeadlockRegression(t *testing.T) {
 	// Timeout test - should not hang
 	select {
 	case <-done:
-		t.Log("✅ Manager stopped cleanly - no deadlock")
+		t.Log("Manager stopped cleanly - no deadlock")
 	case <-time.After(5 * time.Second):
 		t.Error("REGRESSION: Manager.Stop() hung - deadlock detected!")
+	}
+}
+
+func TestHandleServiceEndpointsChanged_AddLabels(t *testing.T) {
+	manager := NewManager()
+
+	payload := events.ServiceEndpointsChanged{
+		App: "myapp",
+		Added: []events.ServiceEndpointInfo{
+			{App: "myapp", Name: "web", DerivedHostLabel: "myapp"},
+			{App: "myapp", Name: "api", DerivedHostLabel: "api-myapp"},
+		},
+		Removed: nil,
+	}
+
+	manager.handleServiceEndpointsChanged(payload)
+
+	manager.appHostLabelsMu.RLock()
+	labels := manager.appHostLabels["myapp"]
+	manager.appHostLabelsMu.RUnlock()
+
+	if len(labels) != 2 {
+		t.Fatalf("expected 2 labels, got %d", len(labels))
+	}
+
+	// Check that all labels are present
+	labelSet := make(map[string]bool)
+	for _, l := range labels {
+		labelSet[l] = true
+	}
+	if !labelSet["myapp"] || !labelSet["api-myapp"] {
+		t.Errorf("expected labels [myapp, api-myapp], got %v", labels)
+	}
+}
+
+func TestHandleServiceEndpointsChanged_RemoveLabels(t *testing.T) {
+	manager := NewManager()
+
+	// Pre-populate with labels
+	manager.appHostLabelsMu.Lock()
+	manager.appHostLabels["myapp"] = []string{"myapp", "api-myapp", "db-myapp"}
+	manager.appHostLabelsMu.Unlock()
+
+	// Remove one label
+	payload := events.ServiceEndpointsChanged{
+		App: "myapp",
+		Added: nil,
+		Removed: []events.ServiceEndpointInfo{
+			{App: "myapp", Name: "db", DerivedHostLabel: "db-myapp"},
+		},
+	}
+
+	manager.handleServiceEndpointsChanged(payload)
+
+	manager.appHostLabelsMu.RLock()
+	labels := manager.appHostLabels["myapp"]
+	manager.appHostLabelsMu.RUnlock()
+
+	if len(labels) != 2 {
+		t.Fatalf("expected 2 labels after removal, got %d", len(labels))
+	}
+
+	// Check that removed label is gone
+	for _, l := range labels {
+		if l == "db-myapp" {
+			t.Error("db-myapp should have been removed")
+		}
+	}
+}
+
+func TestHandleServiceEndpointsChanged_MergeDelta(t *testing.T) {
+	manager := NewManager()
+
+	// Pre-populate with existing labels
+	manager.appHostLabelsMu.Lock()
+	manager.appHostLabels["myapp"] = []string{"myapp", "api-myapp"}
+	manager.appHostLabelsMu.Unlock()
+
+	// Reconcile: remove api, add db
+	payload := events.ServiceEndpointsChanged{
+		App: "myapp",
+		Added: []events.ServiceEndpointInfo{
+			{App: "myapp", Name: "db", DerivedHostLabel: "db-myapp"},
+		},
+		Removed: []events.ServiceEndpointInfo{
+			{App: "myapp", Name: "api", DerivedHostLabel: "api-myapp"},
+		},
+	}
+
+	manager.handleServiceEndpointsChanged(payload)
+
+	manager.appHostLabelsMu.RLock()
+	labels := manager.appHostLabels["myapp"]
+	manager.appHostLabelsMu.RUnlock()
+
+	if len(labels) != 2 {
+		t.Fatalf("expected 2 labels after merge, got %d: %v", len(labels), labels)
+	}
+
+	labelSet := make(map[string]bool)
+	for _, l := range labels {
+		labelSet[l] = true
+	}
+
+	if !labelSet["myapp"] {
+		t.Error("myapp label should be preserved")
+	}
+	if labelSet["api-myapp"] {
+		t.Error("api-myapp should have been removed")
+	}
+	if !labelSet["db-myapp"] {
+		t.Error("db-myapp should have been added")
+	}
+}
+
+func TestHandleServiceEndpointsChanged_EmptyAppIgnored(t *testing.T) {
+	manager := NewManager()
+
+	// Payload with empty app should be ignored
+	payload := events.ServiceEndpointsChanged{
+		App: "",
+		Added: []events.ServiceEndpointInfo{
+			{App: "", Name: "web", DerivedHostLabel: "test"},
+		},
+	}
+
+	manager.handleServiceEndpointsChanged(payload)
+
+	manager.appHostLabelsMu.RLock()
+	count := len(manager.appHostLabels)
+	manager.appHostLabelsMu.RUnlock()
+
+	if count != 0 {
+		t.Errorf("expected no labels for empty app, got %d entries", count)
+	}
+}
+
+func TestDebouncedAnnouncement(t *testing.T) {
+	manager := NewManager()
+
+	// Send multiple rapid events
+	for i := 0; i < 10; i++ {
+		payload := events.ServiceEndpointsChanged{
+			App: fmt.Sprintf("app%d", i),
+			Added: []events.ServiceEndpointInfo{
+				{App: fmt.Sprintf("app%d", i), Name: "web", DerivedHostLabel: fmt.Sprintf("app%d", i)},
+			},
+		}
+		manager.handleServiceEndpointsChanged(payload)
+	}
+
+	// Verify a timer is pending
+	manager.announceDebounceMu.Lock()
+	pending := manager.announcePending
+	hasTimer := manager.announceDebounceTimer != nil
+	manager.announceDebounceMu.Unlock()
+
+	if !pending {
+		t.Error("expected announcePending to be true after rapid events")
+	}
+	if !hasTimer {
+		t.Error("expected debounce timer to be set")
+	}
+
+	// Verify internal state was accumulated correctly
+	manager.appHostLabelsMu.RLock()
+	appCount := len(manager.appHostLabels)
+	manager.appHostLabelsMu.RUnlock()
+
+	if appCount != 10 {
+		t.Errorf("expected 10 apps tracked, got %d", appCount)
+	}
+
+	// Stop the observer to cancel the timer (cleanup)
+	manager.StopServiceEndpointsObserver()
+
+	// Verify timer was cancelled
+	manager.announceDebounceMu.Lock()
+	pendingAfter := manager.announcePending
+	timerAfter := manager.announceDebounceTimer
+	manager.announceDebounceMu.Unlock()
+
+	if pendingAfter {
+		t.Error("expected announcePending to be false after stop")
+	}
+	if timerAfter != nil {
+		t.Error("expected timer to be nil after stop")
 	}
 }

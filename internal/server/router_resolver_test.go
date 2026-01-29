@@ -18,7 +18,7 @@ func TestServiceRemoteResolver(t *testing.T) {
 	resolver := newServiceRemoteResolver(svc)
 
 	listeners := []api.AppListener{
-		{Name: "web", GuestPort: 8080, RemotePorts: []int{80, 443, 8000}},
+		{Name: "web", GuestPort: 8080, Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTCP, RemotePorts: []int{80, 443, 8000}},
 	}
 	eps, err := svc.AllocateForApp("demo", listeners)
 	if err != nil {
@@ -38,12 +38,12 @@ func TestServiceRemoteResolver(t *testing.T) {
 		t.Fatalf("expected portal TLS traffic to map to tls mux (9090), got %d (ok=%v)", port, ok)
 	}
 
-	port, ok = resolver.Resolve("web.example.com", 443, true)
+	port, ok = resolver.Resolve("demo.portal.example.com", 443, true)
 	if !ok || port != 9090 {
 		t.Fatalf("expected tls mux to terminate tls traffic on 443, got %d (ok=%v)", port, ok)
 	}
 
-	port, ok = resolver.Resolve("web.example.com", 443, false)
+	port, ok = resolver.Resolve("demo.portal.example.com", 443, false)
 	if !ok || port != webEndpoint.PublicPort {
 		t.Fatalf("expected plain traffic on 443 to map to %d, got %d (ok=%v)", webEndpoint.PublicPort, port, ok)
 	}
@@ -53,12 +53,12 @@ func TestServiceRemoteResolver(t *testing.T) {
 		t.Fatalf("expected portal HTTP traffic to map to 8081, got %d (ok=%v)", port, ok)
 	}
 
-	port, ok = resolver.Resolve("web.example.com", 8000, true)
+	port, ok = resolver.Resolve("demo.portal.example.com", 8000, true)
 	if !ok || port != 9090 {
 		t.Fatalf("expected tls mux to handle tls requests on 8000, got %d (ok=%v)", port, ok)
 	}
 
-	port, ok = resolver.Resolve("web.example.com", 8000, false)
+	port, ok = resolver.Resolve("demo.portal.example.com", 8000, false)
 	if !ok || port != webEndpoint.PublicPort {
 		t.Fatalf("expected plain requests on 8000 to route to %d, got %d (ok=%v)", webEndpoint.PublicPort, port, ok)
 	}

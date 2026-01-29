@@ -56,6 +56,24 @@ func (g *guardedControlStore) Remote() RemoteRepo {
 func (g *guardedControlStore) AppState() AppStateRepo {
 	return &guardedAppStateRepo{store: g, repo: g.inner.AppState()}
 }
+func (g *guardedControlStore) Users() UserRepo {
+	return &guardedUserRepo{store: g, repo: g.inner.Users()}
+}
+func (g *guardedControlStore) OIDCClients() OIDCClientRepo {
+	return &guardedOIDCClientRepo{store: g, repo: g.inner.OIDCClients()}
+}
+func (g *guardedControlStore) OIDCKeys() OIDCKeyRepo {
+	return &guardedOIDCKeyRepo{store: g, repo: g.inner.OIDCKeys()}
+}
+func (g *guardedControlStore) OIDCAuthCodes() OIDCAuthCodeRepo {
+	return &guardedOIDCAuthCodeRepo{store: g, repo: g.inner.OIDCAuthCodes()}
+}
+func (g *guardedControlStore) OIDCRefreshTokens() OIDCRefreshTokenRepo {
+	return &guardedOIDCRefreshTokenRepo{store: g, repo: g.inner.OIDCRefreshTokens()}
+}
+func (g *guardedControlStore) OIDCConfig() OIDCConfigRepo {
+	return &guardedOIDCConfigRepo{store: g, repo: g.inner.OIDCConfig()}
+}
 func (g *guardedControlStore) Close(ctx context.Context) error { return g.inner.Close(ctx) }
 
 func (g *guardedControlStore) Lock() {
@@ -158,4 +176,206 @@ func (r *guardedAppStateRepo) UpsertApp(ctx context.Context, record AppRecord) e
 		return ErrNotLeader
 	}
 	return r.store.notifyCommit(ctx, r.repo.UpsertApp(ctx, record))
+}
+
+// -----------------------------------------------------------------------------
+// Guarded User Repository
+// -----------------------------------------------------------------------------
+
+type guardedUserRepo struct {
+	store *guardedControlStore
+	repo  UserRepo
+}
+
+func (r *guardedUserRepo) Get(ctx context.Context, id string) (User, error) {
+	return r.repo.Get(ctx, id)
+}
+func (r *guardedUserRepo) GetByUsername(ctx context.Context, username string) (User, error) {
+	return r.repo.GetByUsername(ctx, username)
+}
+func (r *guardedUserRepo) GetByEmail(ctx context.Context, email string) (User, error) {
+	return r.repo.GetByEmail(ctx, email)
+}
+func (r *guardedUserRepo) List(ctx context.Context) ([]User, error) {
+	return r.repo.List(ctx)
+}
+func (r *guardedUserRepo) Count(ctx context.Context) (int, error) {
+	return r.repo.Count(ctx)
+}
+func (r *guardedUserRepo) Create(ctx context.Context, user User) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Create(ctx, user))
+}
+func (r *guardedUserRepo) Update(ctx context.Context, user User) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Update(ctx, user))
+}
+func (r *guardedUserRepo) Delete(ctx context.Context, id string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Delete(ctx, id))
+}
+
+// -----------------------------------------------------------------------------
+// Guarded OIDC Client Repository
+// -----------------------------------------------------------------------------
+
+type guardedOIDCClientRepo struct {
+	store *guardedControlStore
+	repo  OIDCClientRepo
+}
+
+func (r *guardedOIDCClientRepo) Get(ctx context.Context, clientID string) (OIDCClient, error) {
+	return r.repo.Get(ctx, clientID)
+}
+func (r *guardedOIDCClientRepo) GetByAppID(ctx context.Context, appID string) (OIDCClient, error) {
+	return r.repo.GetByAppID(ctx, appID)
+}
+func (r *guardedOIDCClientRepo) List(ctx context.Context) ([]OIDCClient, error) {
+	return r.repo.List(ctx)
+}
+func (r *guardedOIDCClientRepo) Create(ctx context.Context, client OIDCClient) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Create(ctx, client))
+}
+func (r *guardedOIDCClientRepo) Delete(ctx context.Context, clientID string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Delete(ctx, clientID))
+}
+func (r *guardedOIDCClientRepo) DeleteByAppID(ctx context.Context, appID string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.DeleteByAppID(ctx, appID))
+}
+
+// -----------------------------------------------------------------------------
+// Guarded OIDC Key Repository
+// -----------------------------------------------------------------------------
+
+type guardedOIDCKeyRepo struct {
+	store *guardedControlStore
+	repo  OIDCKeyRepo
+}
+
+func (r *guardedOIDCKeyRepo) GetActive(ctx context.Context) ([]OIDCKey, error) {
+	return r.repo.GetActive(ctx)
+}
+func (r *guardedOIDCKeyRepo) Get(ctx context.Context, kid string) (OIDCKey, error) {
+	return r.repo.Get(ctx, kid)
+}
+func (r *guardedOIDCKeyRepo) Create(ctx context.Context, key OIDCKey) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Create(ctx, key))
+}
+func (r *guardedOIDCKeyRepo) Retire(ctx context.Context, kid string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Retire(ctx, kid))
+}
+
+// -----------------------------------------------------------------------------
+// Guarded OIDC Auth Code Repository
+// -----------------------------------------------------------------------------
+
+type guardedOIDCAuthCodeRepo struct {
+	store *guardedControlStore
+	repo  OIDCAuthCodeRepo
+}
+
+func (r *guardedOIDCAuthCodeRepo) Store(ctx context.Context, code OIDCAuthCode) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Store(ctx, code))
+}
+func (r *guardedOIDCAuthCodeRepo) Consume(ctx context.Context, code string) (OIDCAuthCode, error) {
+	if r.store.leader != nil && !r.store.leader() {
+		return OIDCAuthCode{}, ErrNotLeader
+	}
+	authCode, err := r.repo.Consume(ctx, code)
+	if err == nil && r.store.onCommit != nil {
+		r.store.onCommit(ctx)
+	}
+	return authCode, err
+}
+func (r *guardedOIDCAuthCodeRepo) Delete(ctx context.Context, code string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Delete(ctx, code))
+}
+func (r *guardedOIDCAuthCodeRepo) Cleanup(ctx context.Context) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Cleanup(ctx))
+}
+
+// -----------------------------------------------------------------------------
+// Guarded OIDC Refresh Token Repository
+// -----------------------------------------------------------------------------
+
+type guardedOIDCRefreshTokenRepo struct {
+	store *guardedControlStore
+	repo  OIDCRefreshTokenRepo
+}
+
+func (r *guardedOIDCRefreshTokenRepo) Get(ctx context.Context, token string) (OIDCRefreshToken, error) {
+	return r.repo.Get(ctx, token)
+}
+func (r *guardedOIDCRefreshTokenRepo) Store(ctx context.Context, token OIDCRefreshToken) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Store(ctx, token))
+}
+func (r *guardedOIDCRefreshTokenRepo) Revoke(ctx context.Context, token string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Revoke(ctx, token))
+}
+func (r *guardedOIDCRefreshTokenRepo) RevokeByUserAndClient(ctx context.Context, userID, clientID string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.RevokeByUserAndClient(ctx, userID, clientID))
+}
+func (r *guardedOIDCRefreshTokenRepo) Cleanup(ctx context.Context) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Cleanup(ctx))
+}
+
+// -----------------------------------------------------------------------------
+// Guarded OIDC Config Repository
+// -----------------------------------------------------------------------------
+
+type guardedOIDCConfigRepo struct {
+	store *guardedControlStore
+	repo  OIDCConfigRepo
+}
+
+func (r *guardedOIDCConfigRepo) GetEncryptionKey(ctx context.Context) ([]byte, error) {
+	return r.repo.GetEncryptionKey(ctx)
+}
+func (r *guardedOIDCConfigRepo) SetEncryptionKey(ctx context.Context, key []byte) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.SetEncryptionKey(ctx, key))
 }

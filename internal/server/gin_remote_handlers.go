@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"piccolod/internal/api"
 	"piccolod/internal/remote"
 )
 
@@ -65,21 +64,16 @@ func (s *GinServer) handleRemoteConfigure(c *gin.Context) {
 	}
 	s.refreshRemoteRuntime()
 	// For HTTP-01 solver (wildcard unsupported), proactively issue per-listener certs
-	if strings.EqualFold(configureReq.Solver, "http-01") && configureReq.TLD != "" && s.remoteManager != nil {
+	if strings.EqualFold(configureReq.Solver, "http-01") && strings.TrimSpace(configureReq.PortalHostname) != "" && s.remoteManager != nil {
+		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(configureReq.PortalHostname)), ".")
 		hosts := map[string]struct{}{}
 		for _, ep := range s.serviceManager.GetAll() {
-			if ep.Flow == api.FlowTLS {
+			// Only queue certs for HTTP/WS listeners that have host-based routing
+			// DerivedHostLabel is empty for raw/tls listeners (per RFC 20260114)
+			if ep.DerivedHostLabel == "" {
 				continue
 			}
-			switch ep.Protocol {
-			case api.ListenerProtocolHTTP, api.ListenerProtocolWebsocket:
-			default:
-				continue
-			}
-			if ep.Name == "" {
-				continue
-			}
-			host := strings.ToLower(ep.Name + "." + configureReq.TLD)
+			host := ep.DerivedHostLabel + "." + base
 			hosts[host] = struct{}{}
 		}
 		for h := range hosts {

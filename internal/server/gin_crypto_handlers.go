@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"piccolod/internal/auth"
 	"piccolod/internal/events"
 	"piccolod/internal/persistence"
 )
@@ -33,6 +34,8 @@ func (s *GinServer) handleCryptoStatus(c *gin.Context) {
 }
 
 // handleCryptoSetup: POST /api/v1/crypto/setup { password }
+// This is the single atomic initialization point for Piccolo.
+// It sets up: crypto (disk encryption), auth manager, and admin user.
 func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	var body struct {
 		Password string `json:"password"`
@@ -41,15 +44,69 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+
+	// 1. Validate password policy FIRST (before any state changes)
+	if err := auth.ValidatePasswordStrength(body.Password); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 2. Setup crypto manager (disk encryption key)
 	if err := s.cryptoManager.Setup(body.Password); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := s.notifyPersistenceLockState(c.Request.Context(), true); err != nil {
-		log.Printf("WARN: failed to propagate lock state: %v", err)
+
+	// 3. Unlock crypto and notify persistence (required for SQLite access)
+	if err := s.cryptoManager.Unlock(body.Password); err != nil {
+		log.Printf("ERROR: crypto unlock after setup failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to unlock after setup"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	if err := s.notifyPersistenceLockState(ctx, false); err != nil {
+		log.Printf("WARN: failed to propagate unlock state: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
 		return
 	}
+
+	// 4. Setup auth manager (mandatory - not best-effort)
+	if s.authManager != nil {
+		if err := s.authManager.Setup(ctx, body.Password); err != nil {
+			log.Printf("ERROR: auth manager setup failed: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to setup auth: " + err.Error()})
+			return
+		}
+	}
+
+	// 5. Create admin user in SQLite (mandatory - not best-effort)
+	if s.userManager != nil {
+		adminInput := auth.CreateUserInput{
+			Username: "admin",
+			Email:    "admin@piccolo.local",
+			Password: body.Password,
+			Role:     persistence.UserRoleAdmin,
+		}
+		if _, err := s.userManager.Create(ctx, adminInput); err != nil {
+			log.Printf("ERROR: admin user creation failed: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create admin user: " + err.Error()})
+			return
+		}
+	}
+
+	// 6. Create session for the admin user
+	userID := ""
+	if s.userManager != nil {
+		if u, err := s.userManager.GetByUsername(ctx, "admin"); err == nil {
+			userID = u.ID
+		}
+	}
+	// RFC 20260122 §6.2: Create portal session with origin binding
+	boundOrigin := s.computeCanonicalOrigin(c)
+	sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, 3600)
+	s.setSessionCookie(c, sess.ID, time.Hour)
+
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
 
@@ -96,7 +153,15 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 		}
 		if init {
 			if ok, err := s.authManager.Verify(ctx, "admin", password); err == nil && ok {
-				sess := s.sessions.Create("admin", 3600)
+				userID := ""
+				if s.userManager != nil {
+					if u, err := s.userManager.GetByUsername(ctx, "admin"); err == nil {
+						userID = u.ID
+					}
+				}
+				// RFC 20260122 §6.2: Create portal session with origin binding
+				boundOrigin := s.computeCanonicalOrigin(c)
+				sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, 3600)
 				s.setSessionCookie(c, sess.ID, time.Hour)
 			}
 		}
@@ -164,6 +229,19 @@ func (s *GinServer) handleCryptoResetPassword(c *gin.Context) {
 	if err := s.authManager.ChangePasswordWithRecovery(ctx, newPassword); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Also update admin user password in SQLite (userManager)
+	if s.userManager != nil {
+		if admin, err := s.userManager.GetByUsername(ctx, "admin"); err == nil {
+			if err := s.userManager.SetPassword(ctx, admin.ID, newPassword); err != nil {
+				log.Printf("ERROR: reset-password userManager sync failed: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync admin password"})
+				return
+			}
+		} else {
+			log.Printf("WARN: admin user not found in userManager during reset: %v", err)
+		}
 	}
 
 	if err := s.cryptoManager.RewrapUnlocked(newPassword); err != nil {

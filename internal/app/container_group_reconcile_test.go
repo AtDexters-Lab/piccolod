@@ -48,7 +48,7 @@ func TestReconcileMultiContainer_StopsServicesWhenAnchorMissingAndDesiredStopped
 	if err != nil {
 		t.Fatalf("ensureAppVolumeLayout: %v", err)
 	}
-	runtime, err := mgr.podmanRuntimeForApp("demo", layout)
+	runtime, err := mgr.podmanRuntimeForApp("demo", layout, ModeService)
 	if err != nil {
 		t.Fatalf("podmanRuntimeForApp: %v", err)
 	}
@@ -81,7 +81,6 @@ func TestReconcileMultiContainer_StopsServicesWhenAnchorMissingAndDesiredStopped
 	appInst := &AppInstance{
 		InstanceID:      "demo",
 		Status:          "running",
-		ContainerID:     mainCID,
 		PrimaryService:  "main",
 		NetworkAnchorID: "", // missing anchor (manual deletion or partial failure)
 		Containers: map[string]string{
@@ -96,8 +95,8 @@ func TestReconcileMultiContainer_StopsServicesWhenAnchorMissingAndDesiredStopped
 		t.Fatalf("StoreApp: %v", err)
 	}
 
-	if err := mgr.reconcileMultiContainer(ctx, state, appInst, def, layout, runtime, false); err != nil {
-		t.Fatalf("reconcileMultiContainer: %v", err)
+	if err := mgr.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, false); err != nil {
+		t.Fatalf("reconcileContainerGroup: %v", err)
 	}
 
 	mainState, _ := mock.InspectContainerState(ctx, runtime, mainCID)

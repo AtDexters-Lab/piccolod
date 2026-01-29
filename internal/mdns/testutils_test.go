@@ -44,27 +44,13 @@ func createMockManager() *Manager {
 	return NewManager()
 }
 
-// MockClientState creates a test client state
-func createMockClientState(ip string, queryCount uint64, blocked bool) *ClientState {
-	return &ClientState{
-		IP:         ip,
-		QueryCount: queryCount,
-		LastQuery:  time.Now(),
-		Blocked:    blocked,
-	}
-}
-
 // MockSecurityConfig creates test security configuration
 func createMockSecurityConfig() *SecurityConfig {
 	return &SecurityConfig{
-		MaxQueriesPerSecond:  5,
-		MaxQueriesPerMinute:  50,
 		MaxPacketSize:        1024,
 		MaxResponseSize:      512,
 		MaxConcurrentQueries: 10,
 		QueryTimeout:         time.Second,
-		ClientBlockDuration:  time.Minute,
-		CleanupInterval:      time.Minute * 5,
 	}
 }
 

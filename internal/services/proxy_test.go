@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -121,6 +122,207 @@ func TestApplyForwardHeadersUsesTLSHint(t *testing.T) {
 	}
 }
 
+func TestApplyForwardHeadersUsesClientIPHint(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+	req.Host = "example.test"
+	req.RemoteAddr = "10.0.0.2:1234"
+	req = req.WithContext(context.WithValue(req.Context(), hintContextKey{}, connectionHint{clientIP: "203.0.113.9"}))
+	ep := ServiceEndpoint{Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}
+
+	applyForwardHeaders(req, ep)
+
+	if got := req.Header.Get("X-Forwarded-For"); got != "203.0.113.9" {
+		t.Fatalf("expected X-Forwarded-For=203.0.113.9, got %q", got)
+	}
+	if got := req.Header.Get("X-Real-IP"); got != "203.0.113.9" {
+		t.Fatalf("expected X-Real-IP=203.0.113.9, got %q", got)
+	}
+	if fwd := req.Header.Get("Forwarded"); !strings.Contains(fwd, "for=203.0.113.9") {
+		t.Fatalf("expected Forwarded to include for=203.0.113.9, got %q", fwd)
+	}
+}
+
+func TestApplyForwardHeaders_ForwardedHeaderQuotesIPv6For(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+	req.Host = "example.test"
+	req.RemoteAddr = "[2001:db8::1]:1234"
+	ep := ServiceEndpoint{Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}
+
+	applyForwardHeaders(req, ep)
+
+	fwd := req.Header.Get("Forwarded")
+	if !strings.Contains(fwd, `for="[2001:db8::1]"`) {
+		t.Fatalf("expected Forwarded to include quoted IPv6 for, got %q", fwd)
+	}
+}
+
+func TestApplyForwardHeaders_ForwardedHeaderQuotesHostWithPort(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:35000/", nil)
+	req.Host = "127.0.0.1:35000"
+	req.RemoteAddr = "192.0.2.1:1234"
+	ep := ServiceEndpoint{Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}
+
+	applyForwardHeaders(req, ep)
+
+	fwd := req.Header.Get("Forwarded")
+	if !strings.Contains(fwd, `host="127.0.0.1:35000"`) {
+		t.Fatalf("expected Forwarded to include quoted host with port, got %q", fwd)
+	}
+}
+
+func getNonLoopbackIPv4(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("interface addrs: %v", err)
+	}
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil {
+			continue
+		}
+		ip = ip.To4()
+		if ip == nil {
+			continue
+		}
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		// Prefer private addresses; fall back to any non-loopback v4.
+		if ip.IsPrivate() || ip.IsGlobalUnicast() {
+			return ip.String()
+		}
+	}
+	t.Skip("no non-loopback IPv4 address available")
+	return ""
+}
+
+func TestProxyManagerRequestHintTokenSingleUse(t *testing.T) {
+	pm := NewProxyManager()
+	token, ok := pm.IssueRequestHint(12345, "203.0.113.10", true, 443)
+	if !ok || token == "" {
+		t.Fatalf("expected hint token issuance to succeed")
+	}
+	hint, ok := pm.consumeRequestHint(12345, token)
+	if !ok {
+		t.Fatalf("expected hint token to be consumable")
+	}
+	if hint.clientIP != "203.0.113.10" {
+		t.Fatalf("expected hinted clientIP preserved, got %q", hint.clientIP)
+	}
+	if _, ok := pm.consumeRequestHint(12345, token); ok {
+		t.Fatalf("expected hint token to be single-use")
+	}
+}
+
+func TestHTTPProxyForwardHeadersRespectHintTokenClientIP(t *testing.T) {
+	backendReqs := make(chan map[string]string, 2)
+
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendLn.Close()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			headers := map[string]string{
+				"xff":       r.Header.Get("X-Forwarded-For"),
+				"realip":    r.Header.Get("X-Real-IP"),
+				"forwarded": r.Header.Get("Forwarded"),
+				"token":     r.Header.Get(HeaderPiccoloHintToken),
+			}
+			select {
+			case backendReqs <- headers:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+	go srv.Serve(backendLn)
+	defer srv.Shutdown(context.Background())
+
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+
+	pm := NewProxyManager()
+	public := getFreePort(t)
+	ep := ServiceEndpoint{
+		App:        "test",
+		Name:       "web",
+		GuestPort:  0,
+		HostBind:   backendPort,
+		PublicPort: public,
+		Flow:       api.FlowTCP,
+		Protocol:   api.ListenerProtocolHTTP,
+		Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{{
+			Path:     "/",
+			Type:     "prefix",
+			Strategy: "public",
+		}}},
+	}
+	pm.StartListener(ep)
+	defer pm.StopAll()
+	time.Sleep(100 * time.Millisecond)
+
+	hostIP := getNonLoopbackIPv4(t)
+	target := fmt.Sprintf("http://%s:%d/", hostIP, public)
+
+	token, ok := pm.IssueRequestHint(ep.PublicPort, "203.0.113.99", false, 80)
+	if !ok || token == "" {
+		t.Fatalf("expected hint token issuance to succeed")
+	}
+	req, _ := http.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set(HeaderPiccoloHintToken, token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Skipf("dial %s failed: %v", target, err)
+	}
+	resp.Body.Close()
+
+	select {
+	case headers := <-backendReqs:
+		// ReverseProxy appends its own hop to X-Forwarded-For; the hinted client IP must be first.
+		if !strings.HasPrefix(headers["xff"], "203.0.113.99") {
+			t.Fatalf("expected X-Forwarded-For to start with hinted client IP, got %q", headers["xff"])
+		}
+		if headers["realip"] != "203.0.113.99" {
+			t.Fatalf("expected X-Real-IP to use hinted client IP, got %q", headers["realip"])
+		}
+		if !strings.Contains(headers["forwarded"], "for=203.0.113.99") {
+			t.Fatalf("expected Forwarded to include hinted for, got %q", headers["forwarded"])
+		}
+		if headers["token"] != "" {
+			t.Fatalf("expected hint token header to not reach backend, got %q", headers["token"])
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for backend request (hint token)")
+	}
+
+	// Reusing the same token should have no effect (single-use consumption).
+	req, _ = http.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set(HeaderPiccoloHintToken, token)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Skipf("second dial %s failed: %v", target, err)
+	}
+	resp.Body.Close()
+
+	select {
+	case headers := <-backendReqs:
+		if headers["xff"] == "203.0.113.99" {
+			t.Fatalf("expected X-Forwarded-For to not reuse consumed hint token")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for backend request (reused token)")
+	}
+}
+
 func TestHTTPProxyForwardHeadersRespectTLSHints(t *testing.T) {
 	backendReqs := make(chan map[string]string, 2)
 
@@ -160,6 +362,11 @@ func TestHTTPProxyForwardHeadersRespectTLSHints(t *testing.T) {
 		PublicPort: public,
 		Flow:       api.FlowTCP,
 		Protocol:   api.ListenerProtocolHTTP,
+		Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{{
+			Path:     "/",
+			Type:     "prefix",
+			Strategy: "public",
+		}}},
 	}
 	pm.StartListener(ep)
 	defer pm.StopAll()
@@ -281,6 +488,11 @@ func TestProxy_SecurityHeaders(t *testing.T) {
 		PublicPort: public,
 		Flow:       api.FlowTCP,
 		Protocol:   api.ListenerProtocolHTTP,
+		Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{{
+			Path:     "/",
+			Type:     "prefix",
+			Strategy: "public",
+		}}},
 	}
 	pm.StartListener(ep)
 	defer pm.StopAll()
@@ -331,5 +543,161 @@ func TestProxy_SecurityHeaders(t *testing.T) {
 	csp = strings.Join(resp.Header.Values("Content-Security-Policy"), ", ")
 	if !strings.Contains(csp, "https://portal.example.com:*") {
 		t.Errorf("allowed: expected CSP to contain portal.example.com:*, got %q", csp)
+	}
+}
+
+func TestHTTPProxy_RewriteHttpOnlySetCookiePreservesMultibyteValue(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendLn.Close()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Add("Set-Cookie", "session=✓; Path=/; HttpOnly")
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+	go srv.Serve(backendLn)
+	defer srv.Shutdown(context.Background())
+
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+
+	pm := NewProxyManager()
+	public := getFreePort(t)
+	ep := ServiceEndpoint{
+		App:        "demo",
+		Name:       "web",
+		GuestPort:  0,
+		HostBind:   backendPort,
+		PublicPort: public,
+		Flow:       api.FlowTCP,
+		Protocol:   api.ListenerProtocolHTTP,
+		Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{{
+			Path:     "/",
+			Type:     "prefix",
+			Strategy: "public",
+		}}},
+	}
+	pm.StartListener(ep)
+	defer pm.StopAll()
+
+	time.Sleep(100 * time.Millisecond)
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/", public))
+	if err != nil {
+		t.Fatalf("http get: %v", err)
+	}
+	resp.Body.Close()
+
+	cookies := resp.Header.Values("Set-Cookie")
+	if len(cookies) != 1 {
+		t.Fatalf("expected 1 Set-Cookie, got %v", cookies)
+	}
+	want := "__piccolo_demo_session=✓; Path=/; HttpOnly"
+	if cookies[0] != want {
+		t.Fatalf("unexpected Set-Cookie: got %q want %q", cookies[0], want)
+	}
+}
+
+func TestProxy_ACMEChallengeBypassesAuth(t *testing.T) {
+	// Setup: backend that should NOT be reached for ACME challenges
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendLn.Close()
+
+	backendHit := make(chan struct{}, 1)
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case backendHit <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+	go srv.Serve(backendLn)
+	defer srv.Shutdown(context.Background())
+
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+
+	pm := NewProxyManager()
+
+	// Register mock ACME handler that returns a known challenge response
+	acmeChallengeToken := "test-challenge-token-12345"
+	acmeChallengeResponse := "test-challenge-response.key-authorization"
+	pm.SetAcmeHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, acmeChallengeToken) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(acmeChallengeResponse))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+
+	public := getFreePort(t)
+	ep := ServiceEndpoint{
+		App:        "test",
+		Name:       "web",
+		GuestPort:  0,
+		HostBind:   backendPort,
+		PublicPort: public,
+		Flow:       api.FlowTCP,
+		Protocol:   api.ListenerProtocolHTTP,
+		// Protected auth strategy: requires session, which ACME verifiers don't have
+		Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{{
+			Path:     "/",
+			Type:     "prefix",
+			Strategy: "protected",
+		}}},
+	}
+	pm.StartListener(ep)
+	defer pm.StopAll()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Test 1: ACME challenge request should bypass auth and return 200
+	challengeURL := fmt.Sprintf("http://127.0.0.1:%d/.well-known/acme-challenge/%s", public, acmeChallengeToken)
+	resp, err := http.Get(challengeURL)
+	if err != nil {
+		t.Fatalf("ACME challenge request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected ACME challenge to return 200, got %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read ACME challenge response: %v", err)
+	}
+	if string(body) != acmeChallengeResponse {
+		t.Fatalf("expected ACME challenge response %q, got %q", acmeChallengeResponse, string(body))
+	}
+
+	// Verify backend was NOT hit (ACME handler intercepted the request)
+	select {
+	case <-backendHit:
+		t.Fatalf("backend was hit for ACME challenge - should have been intercepted")
+	default:
+		// Expected: backend not hit
+	}
+
+	// Test 2: Regular protected path should still require auth (return 401 or 503)
+	// 503 is returned when sessionGetter is nil (auth infra not configured for test)
+	regularURL := fmt.Sprintf("http://127.0.0.1:%d/api/data", public)
+	resp2, err := http.Get(regularURL)
+	if err != nil {
+		t.Fatalf("regular request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusUnauthorized && resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected protected path to return 401 or 503, got %d", resp2.StatusCode)
 	}
 }

@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'models/desktop_window.dart';
 import '../../core/services/api_client.dart';
+import '../../core/services/app_service.dart';
+import '../../core/services/event_stream_client.dart';
 import '../../features/apps/app_store_window.dart';
 
 /// Manages the state of the Desktop Shell.
@@ -10,11 +12,42 @@ import '../../features/apps/app_store_window.dart';
 /// - Active windows (z-index orchestration).
 /// - Global overlays (Search, Notifications).
 class DesktopController extends ChangeNotifier {
+  // Window positioning constants
+  static const double kTopMargin = 8.0;
+  static const double kDockAreaHeight = 120.0; // ~90px dock + padding
+  static const double kBottomReserve = 100.0; // Space for dock when maximized
+  static const double kMinVisibleWidth = 50.0;
+  static const double kMinVisibleHeight = 30.0; // Title bar visibility
+
   bool _isLauncherOpen = false;
   bool get isLauncherOpen => _isLauncherOpen;
 
   final List<DesktopWindow> _windows = [];
   List<DesktopWindow> get windows => List.unmodifiable(_windows);
+
+  // App Service for accessing installed apps
+  late final AppService appService;
+
+  // Unified event stream client
+  EventStreamClient? _eventStreamClient;
+  EventStreamClient? get eventStreamClient => _eventStreamClient;
+
+  // Callbacks for app lifecycle changes (install, uninstall, start, stop)
+  final List<VoidCallback> _appChangeListeners = [];
+
+  void addAppChangeListener(VoidCallback listener) {
+    _appChangeListeners.add(listener);
+  }
+
+  void removeAppChangeListener(VoidCallback listener) {
+    _appChangeListeners.remove(listener);
+  }
+
+  void notifyAppsChanged() {
+    for (final listener in List.of(_appChangeListeners)) {
+      listener();
+    }
+  }
 
   // Setup State
   bool _needsSetup = false; // Default to false to avoid flash
@@ -24,6 +57,7 @@ class DesktopController extends ChangeNotifier {
   bool get isInitializing => _isInitializing;
 
   DesktopController() {
+    appService = AppService(ApiClient());
     _checkSystemStatus();
   }
 
@@ -60,15 +94,32 @@ class DesktopController extends ChangeNotifier {
       _needsSetup = true;
     } finally {
       _isInitializing = false;
-      notifyListeners();
+      // If already authenticated (returning user with valid session), transition to authenticated state
+      if (!_needsSetup) {
+        _onAuthenticated(isFirstSetup: false);
+      } else {
+        notifyListeners();
+      }
     }
   }
 
-  void completeSetup(bool isFirstSetupFlow) async {
+  /// Called from SetupWizard when login/setup completes.
+  void completeSetup(bool isFirstSetupFlow) {
+    _onAuthenticated(isFirstSetup: isFirstSetupFlow);
+  }
+
+  /// Single source of truth for "user is now authenticated" state transition.
+  /// Handles event stream connection and optional first-setup welcome.
+  void _onAuthenticated({required bool isFirstSetup}) {
     _needsSetup = false;
+
+    // Connect event stream
+    _eventStreamClient ??= EventStreamClient();
+    _eventStreamClient!.connect();
+
     notifyListeners();
 
-    if (isFirstSetupFlow) {
+    if (isFirstSetup) {
       // Open a welcome window only after first device setup.
       openApp(
         "welcome",
@@ -99,6 +150,12 @@ class DesktopController extends ChangeNotifier {
     } catch (e) {
       debugPrint("Logout failed: $e");
     }
+
+    // Disconnect event stream
+    _eventStreamClient?.disconnect();
+    _eventStreamClient?.dispose();
+    _eventStreamClient = null;
+
     // Force UI back to SetupWizard (which will detect unauthenticated state and show Login)
     _needsSetup = true;
     _windows.clear(); // Clean up windows
@@ -138,6 +195,7 @@ class DesktopController extends ChangeNotifier {
     Size? initialSize,
     List<Widget>? actions,
     bool requiresInterceptor = true,
+    String? iconUrl,
   }) {
     final existingIndex = _windows.indexWhere((w) => w.id == appId);
 
@@ -162,10 +220,9 @@ class DesktopController extends ChangeNotifier {
 
     // 2. Clamp to Screen Size (Safety)
     if (screenSize != null) {
-      // Ensure window isn't larger than the screen (minus some padding)
+      // Ensure window isn't larger than the screen (minus dock area)
       final double maxWidth = screenSize.width;
-      final double maxHeight =
-          screenSize.height - 48; // Subtract top bar
+      final double maxHeight = screenSize.height - kDockAreaHeight;
 
       if (targetSize.width > maxWidth) {
         targetSize = Size(maxWidth, targetSize.height);
@@ -179,25 +236,22 @@ class DesktopController extends ChangeNotifier {
     double x, y;
 
     if (screenSize != null) {
-      const double topBarHeight = 48.0;
-      const double dockAreaHeight = 110.0; // 90px dock + padding
-
       // Available height for centering
-      final double availableHeight = screenSize.height - topBarHeight - dockAreaHeight;
-      
+      final double availableHeight = screenSize.height - kTopMargin - kDockAreaHeight;
+
       // Clamp height to available space to ensure dock visibility
       if (targetSize.height > availableHeight) {
         targetSize = Size(targetSize.width, availableHeight);
       }
-      
+
       // Center horizontally
       x = (screenSize.width - targetSize.width) / 2;
-      
+
       // Center vertically within the safe area, then add top offset
-      y = topBarHeight + (availableHeight - targetSize.height) / 2;
+      y = kTopMargin + (availableHeight - targetSize.height) / 2;
 
       // Final safety clamps
-      if (y < topBarHeight) y = topBarHeight;
+      if (y < kTopMargin) y = kTopMargin;
     } else {
       // Fallback: Cascade based on window count
       final offset = _windows.length * 30.0;
@@ -209,6 +263,7 @@ class DesktopController extends ChangeNotifier {
       id: appId,
       title: title,
       icon: icon,
+      iconUrl: iconUrl,
       child: content,
       position: Offset(x, y),
       size: targetSize,
@@ -256,6 +311,17 @@ class DesktopController extends ChangeNotifier {
     }
   }
 
+  void minimizeAllWindows() {
+    bool changed = false;
+    for (final window in List.of(_windows)) {
+      if (!window.isMinimized) {
+        window.isMinimized = true;
+        changed = true;
+      }
+    }
+    if (changed) notifyListeners();
+  }
+
   void maximizeWindow(String id, Size availableSpace) {
     final window = _windows.firstWhere((w) => w.id == id);
 
@@ -273,15 +339,11 @@ class DesktopController extends ChangeNotifier {
       window.preMaximizePosition = window.position;
       window.preMaximizeSize = window.size;
 
-      // Apply max dimensions
-      // Respecting TopBar (48) and roughly the Dock area (bottom 90)
-      const double topOffset = 48.0;
-      const double bottomReserve = 90.0;
-
-      window.position = const Offset(0, topOffset);
+      // Apply max dimensions with space for dock at bottom
+      window.position = Offset.zero;
       window.size = Size(
         availableSpace.width,
-        availableSpace.height - topOffset - bottomReserve,
+        availableSpace.height - kBottomReserve,
       );
 
       window.isMaximized = true;
@@ -301,36 +363,25 @@ class DesktopController extends ChangeNotifier {
     // Let's lock it for now.
     if (window.isMaximized) return;
 
-    // Constants for constraints
-    const double topBarHeight = 48.0;
-    const double minVisibleWidth = 50.0;
-    const double minVisibleHeight =
-        30.0; // Minimal title bar visibility at bottom
-
     double x = newPosition.dx;
     double y = newPosition.dy;
 
-    // 1. Top Constraint: Cannot go above the Top Bar
-    if (y < topBarHeight) {
-      y = topBarHeight;
+    // 1. Top Constraint: Cannot go above the top margin
+    if (y < kTopMargin) {
+      y = kTopMargin;
     }
 
     // 2. Bottom Constraint: Title bar must stay visible
-    // (y cannot be greater than screen height - min visible amount)
-    if (y > screenSize.height - minVisibleHeight) {
-      y = screenSize.height - minVisibleHeight;
+    if (y > screenSize.height - kMinVisibleHeight) {
+      y = screenSize.height - kMinVisibleHeight;
     }
 
-    // 3. Horizontal Constraints: Keep at least 'minVisibleWidth' on screen
-    // Left Edge: Window right edge > minVisibleWidth
-    // (x + width > minVisibleWidth) => x > minVisibleWidth - width
-    if (x + window.size.width < minVisibleWidth) {
-      x = minVisibleWidth - window.size.width;
+    // 3. Horizontal Constraints: Keep at least some window visible on screen
+    if (x + window.size.width < kMinVisibleWidth) {
+      x = kMinVisibleWidth - window.size.width;
     }
-
-    // Right Edge: Window left edge < screenWidth - minVisibleWidth
-    if (x > screenSize.width - minVisibleWidth) {
-      x = screenSize.width - minVisibleWidth;
+    if (x > screenSize.width - kMinVisibleWidth) {
+      x = screenSize.width - kMinVisibleWidth;
     }
 
     window.position = Offset(x, y);
@@ -363,5 +414,12 @@ class DesktopController extends ChangeNotifier {
 
     window.size = Size(w, h);
     notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _eventStreamClient?.dispose();
+    _eventStreamClient = null;
+    super.dispose();
   }
 }
