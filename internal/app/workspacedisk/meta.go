@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"piccolod/internal/fsutil"
 )
 
 // MetaFormatVersion is the current schema version for meta.json files.
@@ -120,7 +122,9 @@ func LoadMeta(workspaceDir string) (*WorkspaceMeta, error) {
 	return &meta, nil
 }
 
-// SaveMeta writes meta.json to the workspace directory.
+// SaveMeta writes meta.json to the workspace directory atomically.
+// Uses fsutil.AtomicWriteFile to prevent corruption during interruption
+// (e.g., VM save state or unexpected shutdown).
 func SaveMeta(workspaceDir string, meta *WorkspaceMeta) error {
 	if err := meta.Validate(); err != nil {
 		return fmt.Errorf("invalid workspace meta: %w", err)
@@ -132,14 +136,8 @@ func SaveMeta(workspaceDir string, meta *WorkspaceMeta) error {
 		return fmt.Errorf("marshal workspace meta: %w", err)
 	}
 
-	// Write atomically using temp file + rename
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+	if err := fsutil.AtomicWriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("write workspace meta: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename workspace meta: %w", err)
 	}
 
 	return nil

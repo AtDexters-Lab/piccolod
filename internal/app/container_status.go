@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 )
@@ -89,7 +90,9 @@ func (m *AppManager) ContainerStatuses(ctx context.Context, instanceID string) (
 	}
 
 	if changed {
-		_ = state.StoreApp(appInst, nil)
+		if err := state.StoreAppMetadata(appInst); err != nil {
+			log.Printf("WARN: ContainerStatuses %s: failed to persist repaired container IDs: %v", instanceID, err)
+		}
 	}
 
 	return out, nil

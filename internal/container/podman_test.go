@@ -367,6 +367,93 @@ func TestIsValidContainerID(t *testing.T) {
 	}
 }
 
+func TestIsStaleNetworkNamespaceError(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		expected bool
+	}{
+		{
+			name:     "runc namespace path error",
+			output:   `Error: unable to start container "abc123": runc: runc create failed: unable to create new parent process: namespace path: lstat /proc/723206/ns/net: no such file or directory: OCI runtime attempted to invoke a command that was not found`,
+			expected: true,
+		},
+		{
+			name:     "netavark named netns error",
+			output:   `Error: unable to start container "abc123": netavark: open container netns: open /run/netns/netns-a6fff1bd-d334-190e-ac07-b865cb1e9f9c: IO error: No such file or directory (os error 2)`,
+			expected: true,
+		},
+		{
+			name:     "netavark with IPAM error prefix",
+			output:   "time=\"2026-01-30T14:25:30+05:30\" level=error msg=\"IPAM error: failed to get ips for container\"\nError: unable to start container: netavark: open container netns: open /run/netns/netns-xxx: IO error: No such file or directory",
+			expected: true,
+		},
+		{
+			name:     "unrelated podman error - already running",
+			output:   `Error: unable to start container: container is already running`,
+			expected: false,
+		},
+		{
+			name:     "port in use error",
+			output:   `Error: rootlessport cannot expose privileged port 80, you can add 'net.ipv4.ip_unprivileged_port_start=80' to /etc/sysctl.conf`,
+			expected: false,
+		},
+		{
+			name:     "partial match - has namespace but not netns",
+			output:   `Error: namespace mismatch`,
+			expected: false,
+		},
+		{
+			name:     "case insensitive detection - uppercase",
+			output:   `NAMESPACE PATH: LSTAT /PROC/123/NS/NET: NO SUCH FILE OR DIRECTORY`,
+			expected: true,
+		},
+		{
+			name:     "image not found error",
+			output:   `Error: docker.io/nonexistent/image:latest: image not known`,
+			expected: false,
+		},
+		{
+			name:     "empty output",
+			output:   ``,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isStaleNetworkNamespaceError(tt.output)
+			if result != tt.expected {
+				t.Errorf("isStaleNetworkNamespaceError() = %v, want %v for output: %s", result, tt.expected, tt.output)
+			}
+		})
+	}
+}
+
+func TestStaleNetworkNamespaceErrorType(t *testing.T) {
+	baseErr := fmt.Errorf("podman start failed: exit status 125")
+	err := &StaleNetworkNamespaceError{
+		ContainerID: "abc123",
+		Output:      "namespace path: lstat /proc/999/ns/net: no such file or directory",
+		Err:         baseErr,
+	}
+
+	// Test Error() method
+	errMsg := err.Error()
+	if !containsSubstring(errMsg, "abc123") {
+		t.Errorf("Error message should contain container ID, got: %s", errMsg)
+	}
+	if !containsSubstring(errMsg, "stale network namespace") {
+		t.Errorf("Error message should mention stale network namespace, got: %s", errMsg)
+	}
+
+	// Test Unwrap() method
+	unwrapped := err.Unwrap()
+	if unwrapped != baseErr {
+		t.Errorf("Unwrap() should return the wrapped error")
+	}
+}
+
 // Helper function for string containment check
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) &&

@@ -71,7 +71,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 
 	// Persist repaired metadata before starting.
 	if changed {
-		if err := state.StoreApp(appInst, nil); err != nil {
+		if err := state.StoreAppMetadata(appInst); err != nil {
 			log.Printf("WARN: start %s: failed to persist repaired container IDs: %v", appInst.InstanceID, err)
 		}
 	}
@@ -100,7 +100,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 	resetStartupTracking(appInst)
 	appInst.Status = "running"
 	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst, nil); err != nil {
+	if err := state.StoreAppMetadata(appInst); err != nil {
 		return fmt.Errorf("failed to update app status: %w", err)
 	}
 	if prevStatus != "running" {

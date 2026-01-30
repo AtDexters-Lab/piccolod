@@ -1818,7 +1818,8 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 		appInst.Status = "running"
 	}
 	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst, nil); err != nil {
+	// Must use StoreApp to persist the updated Definition (app.yaml with new image)
+	if err := state.StoreApp(appInst, &newDef); err != nil {
 		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
 		_ = m.containerManager.RemoveContainer(ctx, runtime, newCID)
 		return fmt.Errorf("store app: %w", err)
@@ -2192,7 +2193,9 @@ func (m *AppManager) LogsForService(ctx context.Context, instanceID, service str
 				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[target] = id
-			_ = state.StoreApp(appInst, nil)
+			if err := state.StoreAppMetadata(appInst); err != nil {
+				log.Printf("WARN: LogsForService %s: failed to persist resolved container ID: %v", instanceID, err)
+			}
 		}
 	}
 	if cid == "" {
@@ -2252,7 +2255,9 @@ func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, servi
 				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[target] = id
-			_ = state.StoreApp(appInst, nil)
+			if err := state.StoreAppMetadata(appInst); err != nil {
+				log.Printf("WARN: LogsStreamForService %s: failed to persist resolved container ID: %v", instanceID, err)
+			}
 		}
 	}
 	if cid == "" {
@@ -2505,7 +2510,9 @@ func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, ser
 				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[target] = id
-			_ = state.StoreApp(appInst, nil)
+			if err := state.StoreAppMetadata(appInst); err != nil {
+				log.Printf("WARN: ShellForService %s: failed to persist resolved container ID: %v", instanceID, err)
+			}
 		}
 	}
 	if cid == "" {
