@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"piccolod/internal/fsutil"
 )
 
 // InternalCA manages a self-signed CA for internal HTTPS communication.
@@ -241,11 +243,11 @@ func (ca *InternalCA) generate() error {
 	})
 
 	// Write to disk
-	if err := os.WriteFile(ca.certPath, certPEM, 0o644); err != nil {
+	if err := fsutil.AtomicWriteFile(ca.certPath, certPEM, 0o644); err != nil {
 		return fmt.Errorf("write certificate: %w", err)
 	}
 
-	if err := os.WriteFile(ca.keyPath, keyPEM, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(ca.keyPath, keyPEM, 0o600); err != nil {
 		return fmt.Errorf("write private key: %w", err)
 	}
 
@@ -296,11 +298,11 @@ func (ca *InternalCA) EnsureServerCertificate() error {
 		return fmt.Errorf("issue server certificate: %w", err)
 	}
 
-	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+	if err := fsutil.AtomicWriteFile(certPath, certPEM, 0o644); err != nil {
 		return fmt.Errorf("write server certificate: %w", err)
 	}
 
-	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(keyPath, keyPEM, 0o600); err != nil {
 		return fmt.Errorf("write server key: %w", err)
 	}
 

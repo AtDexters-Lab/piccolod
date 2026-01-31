@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"piccolod/internal/fsutil"
 	"piccolod/internal/persistence"
 	"piccolod/internal/remote"
 	"piccolod/internal/state/paths"
@@ -91,7 +91,9 @@ func (s *bootstrapRemoteStorage) Load(ctx context.Context) (remote.Config, error
 	if err := json.Unmarshal(repoCfg.Payload, &cfg); err != nil {
 		return remote.Config{}, err
 	}
-	if err := writeAtomicJSON(s.path, repoCfg.Payload, 0o600); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		log.Printf("WARN: failed to create bootstrap remote config dir: %v", err)
+	} else if err := fsutil.AtomicWriteFile(s.path, repoCfg.Payload, 0o600); err != nil {
 		log.Printf("WARN: failed to seed bootstrap remote config: %v", err)
 	}
 	return cfg, nil
@@ -119,10 +121,10 @@ func (s *bootstrapRemoteStorage) Save(ctx context.Context, cfg remote.Config) er
 			return err
 		}
 	}
-	if err := writeAtomicJSON(s.path, payload, 0o600); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	return nil
+	return fsutil.AtomicWriteFile(s.path, payload, 0o600)
 }
 
 func (s *bootstrapRemoteStorage) isMounted() bool {
@@ -133,49 +135,4 @@ func (s *bootstrapRemoteStorage) isMounted() bool {
 		return false
 	}
 	return true
-}
-
-func writeAtomicJSON(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("ensure dir: %w", err)
-	}
-	tmp, err := os.CreateTemp(dir, "config-*.tmp")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(name)
-		return err
-	}
-	if err := os.Rename(name, path); err != nil {
-		os.Remove(name)
-		return err
-	}
-	return syncDir(dir)
-}
-
-func syncDir(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
 }

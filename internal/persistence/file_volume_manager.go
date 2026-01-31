@@ -22,6 +22,7 @@ import (
 
 	"piccolod/internal/crypt"
 	"piccolod/internal/events"
+	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 )
 
@@ -399,10 +400,10 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 		if opts.Role == VolumeRoleFollower {
 			modeBytes = []byte("ro")
 		}
-		if err := os.WriteFile(filepath.Join(entry.handle.MountDir, ".mode"), modeBytes, 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(filepath.Join(entry.handle.MountDir, ".mode"), modeBytes, 0o600); err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(entry.handle.MountDir, ".cipher"), []byte(entry.cipherDir), 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(filepath.Join(entry.handle.MountDir, ".cipher"), []byte(entry.cipherDir), 0o600); err != nil {
 			return err
 		}
 		f.mu.Lock()
@@ -465,10 +466,10 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 	if opts.Role == VolumeRoleFollower {
 		mode = []byte("ro")
 	}
-	if err := os.WriteFile(filepath.Join(entry.handle.MountDir, ".mode"), mode, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(filepath.Join(entry.handle.MountDir, ".mode"), mode, 0o600); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(entry.handle.MountDir, ".cipher"), []byte(entry.cipherDir), 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(filepath.Join(entry.handle.MountDir, ".cipher"), []byte(entry.cipherDir), 0o600); err != nil {
 		return err
 	}
 
@@ -657,7 +658,7 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 			if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
 				return fmt.Errorf("ensure state dir for migration: %w", err)
 			}
-			if err := os.WriteFile(metaPath, legacyData, 0o600); err != nil {
+			if err := fsutil.AtomicWriteFile(metaPath, legacyData, 0o600); err != nil {
 				return fmt.Errorf("migrate metadata: %w", err)
 			}
 			// Remove from legacy location to stop gocryptfs warnings
@@ -696,7 +697,7 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 		if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
 			return err
 		}
-		if err := os.WriteFile(metaPath, metaBytes, 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(metaPath, metaBytes, 0o600); err != nil {
 			return err
 		}
 		// Bypass mode also needs a legacy conf file check? Or just ensure cipherDir init?
@@ -728,7 +729,7 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 	if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(metaPath, metaBytes, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(metaPath, metaBytes, 0o600); err != nil {
 		return err
 	}
 
@@ -901,35 +902,16 @@ func (f *fileVolumeManager) writeVolumeState(volumeID string, state volumeState)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, "state-*.tmp")
+	data, err := json.MarshalIndent(&state, "", "  ")
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(tmp)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(&state); err != nil {
-		tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmp.Name())
-		return err
-	}
 	finalPath := filepath.Join(dir, "state.json")
-	if err := os.Rename(tmp.Name(), finalPath); err != nil {
-		_ = os.Remove(tmp.Name())
+	if err := fsutil.AtomicWriteFile(finalPath, data, 0o600); err != nil {
 		return err
 	}
-	if err := syncDir(dir); err != nil {
-		return err
-	}
-	return syncDir(f.stateRoot)
+	// Also sync the parent state root for extra durability
+	return fsutil.SyncDir(f.stateRoot)
 }
 
 func (f *fileVolumeManager) sealVolumeKey(ctx context.Context, passphrase []byte) (volumeMetadata, error) {
@@ -1030,15 +1012,6 @@ func generatePassphrase() ([]byte, error) {
 	}
 	encoded := base64.RawStdEncoding.EncodeToString(raw)
 	return []byte(encoded), nil
-}
-
-func syncDir(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
 }
 
 // cleanDirectory removes all contents of a directory but keeps the directory itself.

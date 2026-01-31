@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"piccolod/internal/events"
+	"piccolod/internal/fsutil"
 	"piccolod/internal/remote/acme"
 	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/state/paths"
@@ -346,7 +347,7 @@ func (s *fileStorage) Save(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, payload, 0o644)
+	return fsutil.AtomicWriteFile(s.path, payload, 0o600)
 }
 
 // save persists the config. Caller MUST hold cfgMu.Lock() - this function
@@ -1848,10 +1849,10 @@ func writeSelfSignedCertificate(dir, outName, commonName string, domains []strin
 	}
 	certPath := filepath.Join(dir, outName+".crt")
 	keyPath := filepath.Join(dir, outName+".key")
-	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
 		return time.Time{}, err
 	}
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}), 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}), 0o600); err != nil {
 		return time.Time{}, err
 	}
 	return expires, nil

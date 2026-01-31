@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 )
 
@@ -142,6 +143,10 @@ func (m *fileExportManager) streamExport(ctx context.Context, kind ExportKind, v
 	}
 
 	if err := os.Rename(tmpPath, dest); err != nil {
+		return ExportArtifact{}, err
+	}
+	// Sync parent directory for durability after atomic rename
+	if err := fsutil.SyncDir(filepath.Dir(dest)); err != nil {
 		return ExportArtifact{}, err
 	}
 

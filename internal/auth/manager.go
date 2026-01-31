@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/argon2"
+
+	"piccolod/internal/fsutil"
 )
 
 // State captures the persisted authentication metadata.
@@ -249,7 +251,7 @@ func (s *filesystemStorage) Save(ctx context.Context, state State) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0o600)
+	return fsutil.AtomicWriteFile(s.path, data, 0o600)
 }
 
 // Argon2id helpers (simple encoded format: argon2id$v=19$m=...,t=...,p=...$saltB64$hashB64)

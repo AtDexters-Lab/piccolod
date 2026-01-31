@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"piccolod/internal/app/assets"
+	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 )
 
@@ -70,7 +71,7 @@ func writeBootShAsset() error {
 	}
 
 	// Always overwrite to ensure the latest version is deployed
-	if err := os.WriteFile(hostPath, assets.BootSh, 0o755); err != nil {
+	if err := fsutil.AtomicWriteFile(hostPath, assets.BootSh, 0o755); err != nil {
 		return fmt.Errorf("write boot.sh asset: %w", err)
 	}
 
@@ -87,7 +88,7 @@ func writePiccoloStartupAsset() error {
 	}
 
 	// Always overwrite to ensure the latest version is deployed
-	if err := os.WriteFile(hostPath, assets.PiccoloStartup, 0o755); err != nil {
+	if err := fsutil.AtomicWriteFile(hostPath, assets.PiccoloStartup, 0o755); err != nil {
 		return fmt.Errorf("write piccolo-startup asset: %w", err)
 	}
 

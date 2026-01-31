@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"piccolod/internal/api"
+	"piccolod/internal/fsutil"
 
 	"golang.org/x/mod/semver"
 	"gopkg.in/yaml.v3"
@@ -165,7 +166,7 @@ func (m *Manager) refreshCache(ctx context.Context) error {
 	// Persist to disk
 	if m.cacheDir != "" {
 		path := filepath.Join(m.cacheDir, DefaultIndexFile)
-		if err := os.WriteFile(path, body, 0644); err != nil {
+		if err := fsutil.AtomicWriteFile(path, body, 0644); err != nil {
 			log.Printf("WARN: failed to write catalog cache: %v", err)
 		}
 	}

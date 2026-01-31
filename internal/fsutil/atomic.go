@@ -75,13 +75,13 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	// This is defense-in-depth: without this, the directory entry pointing
 	// to the new file might not be persisted on some filesystems (ext4/xfs).
 	// Best-effort: failure here doesn't affect correctness, only durability.
-	_ = syncDir(dir)
+	_ = SyncDir(dir)
 
 	return nil
 }
 
-// syncDir syncs a directory to ensure all metadata changes are durable.
-func syncDir(dir string) error {
+// SyncDir syncs a directory to ensure all metadata changes are durable.
+func SyncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err

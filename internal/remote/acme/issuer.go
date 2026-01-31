@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 
+	"piccolod/internal/fsutil"
+
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
 	"github.com/go-acme/lego/v4/challenge"
@@ -136,12 +138,12 @@ func (m *Manager) saveAccount(a *account) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(keyPath, b, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(keyPath, b, 0o600); err != nil {
 		return err
 	}
 	if a.Registration != nil {
 		data, _ := json.MarshalIndent(a.Registration, "", "  ")
-		_ = os.WriteFile(regPath, data, 0o600)
+		_ = fsutil.AtomicWriteFile(regPath, data, 0o600)
 	}
 	return nil
 }
@@ -362,10 +364,10 @@ func (m *Manager) Issue(commonName string, sans []string, outName string, certDi
 		}
 		crtPath := filepath.Join(certDir, outName+".crt")
 		keyPath := filepath.Join(certDir, outName+".key")
-		if err := os.WriteFile(crtPath, certRes.Certificate, 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(crtPath, certRes.Certificate, 0o600); err != nil {
 			return nil, err
 		}
-		if err := os.WriteFile(keyPath, certRes.PrivateKey, 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(keyPath, certRes.PrivateKey, 0o600); err != nil {
 			return nil, err
 		}
 		pair, err := tls.X509KeyPair(certRes.Certificate, certRes.PrivateKey)
