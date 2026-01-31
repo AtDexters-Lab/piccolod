@@ -42,7 +42,7 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
   @override
   void initState() {
     super.initState();
-    _terminal = Terminal(maxLines: 50000);
+    _terminal = Terminal(maxLines: 10000);
     _controller = TerminalController();
     _scrollController = ScrollController();
 
@@ -79,19 +79,14 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
   void _connect() {
     final url = _buildUrl();
     _backend?.dispose();
-    _backend = LogStreamBackend(_terminal, url)..addListener(_onBackendUpdate);
+    _backend = LogStreamBackend(_terminal, url);
     _backend!.connect();
+    setState(() {}); // Single rebuild to update ListenableBuilder's listenable
   }
 
   void _disconnect() {
-    _backend?.removeListener(_onBackendUpdate);
     _backend?.dispose();
     _backend = null;
-    setState(() {});
-  }
-
-  void _onBackendUpdate() {
-    if (!mounted) return;
     setState(() {});
   }
 
@@ -157,26 +152,78 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
+  Widget _buildStatusBar() {
     final status = _statusLabel();
     final err = _backend?.lastError;
 
-    final terminalBody = Container(
-      color: const Color(0xFF1E1E1E),
-      child: Scrollbar(
-        controller: _scrollController,
-        thumbVisibility: true,
-        child: TerminalView(
-          _terminal,
-          controller: _controller,
-          scrollController: _scrollController,
-          textStyle: const TerminalStyle(
-            fontFamily: 'JetBrainsMono',
-            height: 1.2,
+    return Padding(
+      padding: const EdgeInsets.symmetric(
+        horizontal: 12,
+        vertical: 8,
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(
+              color: _statusColor(),
+              shape: BoxShape.circle,
+            ),
           ),
-          padding: const EdgeInsets.all(12.0),
-          autofocus: false,
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              err == null ? status : '$status • $err',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: PiccoloTheme.textTheme.labelMedium?.copyWith(
+                color: PiccoloTheme.inkMuted,
+              ),
+            ),
+          ),
+          TextButton(
+            onPressed: _backend == null ? null : () => _backend!.clear(),
+            child: const Text('Clear'),
+          ),
+          const SizedBox(width: 8),
+          if (_backend == null ||
+              _backend!.state == WebSocketConnectionState.disconnected ||
+              _backend!.state == WebSocketConnectionState.error)
+            FilledButton(
+              onPressed: _connect,
+              child: const Text('Connect'),
+            )
+          else
+            OutlinedButton(
+              onPressed: _disconnect,
+              child: const Text('Disconnect'),
+            ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Terminal body with RepaintBoundary for paint isolation
+    final terminalBody = RepaintBoundary(
+      child: Container(
+        color: const Color(0xFF1E1E1E),
+        child: Scrollbar(
+          controller: _scrollController,
+          thumbVisibility: true,
+          child: TerminalView(
+            _terminal,
+            controller: _controller,
+            scrollController: _scrollController,
+            textStyle: const TerminalStyle(
+              fontFamily: 'JetBrainsMono',
+              height: 1.2,
+            ),
+            padding: const EdgeInsets.all(12.0),
+            autofocus: false,
+          ),
         ),
       ),
     );
@@ -186,8 +233,8 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
         final terminalView = widget.height != null
             ? SizedBox(height: widget.height, child: terminalBody)
             : constraints.hasBoundedHeight
-            ? Expanded(child: terminalBody)
-            : SizedBox(height: 320, child: terminalBody);
+                ? Expanded(child: terminalBody)
+                : SizedBox(height: 320, child: terminalBody);
 
         return Container(
           decoration: BoxDecoration(
@@ -198,55 +245,14 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 8,
-                ),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 10,
-                      height: 10,
-                      decoration: BoxDecoration(
-                        color: _statusColor(),
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        err == null ? status : '$status • $err',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: PiccoloTheme.textTheme.labelMedium?.copyWith(
-                          color: PiccoloTheme.inkMuted,
-                        ),
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: _backend == null
-                          ? null
-                          : () => _backend!.clear(),
-                      child: const Text('Clear'),
-                    ),
-                    const SizedBox(width: 8),
-                    if (_backend == null ||
-                        _backend!.state ==
-                            WebSocketConnectionState.disconnected ||
-                        _backend!.state == WebSocketConnectionState.error)
-                      FilledButton(
-                        onPressed: _connect,
-                        child: const Text('Connect'),
-                      )
-                    else
-                      OutlinedButton(
-                        onPressed: _disconnect,
-                        child: const Text('Disconnect'),
-                      ),
-                  ],
-                ),
-              ),
+              // Only status bar rebuilds on backend state changes
+              if (_backend != null)
+                ListenableBuilder(
+                  listenable: _backend!,
+                  builder: (context, _) => _buildStatusBar(),
+                )
+              else
+                _buildStatusBar(),
               const Divider(height: 1),
               terminalView,
             ],

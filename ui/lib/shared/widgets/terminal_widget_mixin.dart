@@ -145,24 +145,26 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
 
   /// Build the terminal view widget with standard styling.
   Widget buildTerminalView() {
-    return Container(
-      color: const Color(0xFF1E1E1E),
-      child: SizedBox.expand(
-        child: Scrollbar(
-          controller: terminalScrollController,
-          thumbVisibility: true,
-          child: TerminalView(
-            terminal,
-            controller: terminalController,
-            scrollController: terminalScrollController,
-            textStyle: const TerminalStyle(
-              fontFamily: 'JetBrainsMono',
-              height: 1.2,
+    return RepaintBoundary(
+      child: Container(
+        color: const Color(0xFF1E1E1E),
+        child: SizedBox.expand(
+          child: Scrollbar(
+            controller: terminalScrollController,
+            thumbVisibility: true,
+            child: TerminalView(
+              terminal,
+              controller: terminalController,
+              scrollController: terminalScrollController,
+              textStyle: const TerminalStyle(
+                fontFamily: 'JetBrainsMono',
+                height: 1.2,
+              ),
+              padding: const EdgeInsets.all(12.0),
+              autofocus: true,
+              onSecondaryTapDown: (details, cell) =>
+                  showTerminalContextMenu(context, details.globalPosition),
             ),
-            padding: const EdgeInsets.all(12.0),
-            autofocus: true,
-            onSecondaryTapDown: (details, cell) =>
-                showTerminalContextMenu(context, details.globalPosition),
           ),
         ),
       ),
