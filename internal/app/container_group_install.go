@@ -118,9 +118,29 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 
 	// Prepare storage for each service (pull images or init workspace disks)
+	// Progress range 15-55% is divided equally among images
+	const pullProgressMin = 15
+	const pullProgressMax = 55
+	numServices := len(appDef.Services)
+	pullRangePerService := 0
+	if numServices > 0 {
+		pullRangePerService = (pullProgressMax - pullProgressMin) / numServices
+	}
+
 	workspaceInfos := make(map[string]*workspaceMountInfo, len(appDef.Services))
+	serviceIdx := 0
 	for svcName := range appDef.Services {
-		info, err := m.prepareServiceStorage(ctx, mode, svcName, appDef, instanceID, layout, runtime)
+		// Calculate progress range for this service
+		progressRange := imagePullProgressRange{
+			Min: pullProgressMin + (serviceIdx * pullRangePerService),
+			Max: pullProgressMin + ((serviceIdx + 1) * pullRangePerService),
+		}
+		// Ensure last service gets the full remaining range
+		if serviceIdx == numServices-1 {
+			progressRange.Max = pullProgressMax
+		}
+
+		info, err := m.prepareServiceStorage(ctx, mode, svcName, appDef, instanceID, layout, runtime, progressRange)
 		if err != nil {
 			// Cleanup any workspace disks already initialized
 			if mode == ModeWorkspace {
@@ -131,6 +151,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			return nil, fmt.Errorf("prepare storage for service '%s': %w", svcName, err)
 		}
 		workspaceInfos[svcName] = info
+		serviceIdx++
 	}
 
 	// Pull network anchor image (always image-based)

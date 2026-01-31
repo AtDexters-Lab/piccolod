@@ -99,6 +99,25 @@ func (m *MockContainerManager) PullImage(ctx context.Context, runtime container.
 	return nil
 }
 
+func (m *MockContainerManager) PullImageWithProgress(ctx context.Context, runtime container.PodmanRuntime, image string, callback container.ImagePullCallback) error {
+	_ = runtime
+	_ = image
+	// Mock: if callback provided, emit a quick progress sequence
+	if callback != nil {
+		callback(container.ImagePullReport{
+			Image:          image,
+			OverallPercent: 0,
+			Phase:          "pulling",
+		})
+		callback(container.ImagePullReport{
+			Image:          image,
+			OverallPercent: 100,
+			Phase:          "complete",
+		})
+	}
+	return nil
+}
+
 func (m *MockContainerManager) Logs(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int) ([]string, error) {
 	_ = runtime
 	if _, ok := m.containers[containerID]; !ok {

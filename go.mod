@@ -5,6 +5,7 @@ go 1.24.10
 replace github.com/docker/docker => github.com/moby/moby v26.1.4+incompatible
 
 require (
+	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d
 	github.com/coreos/go-systemd/v22 v22.6.0
 	github.com/creack/pty v1.1.24
 	github.com/gin-contrib/gzip v1.2.5

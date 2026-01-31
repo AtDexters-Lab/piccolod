@@ -1390,6 +1390,19 @@ func (m *GinMockContainerManager) PullImage(ctx context.Context, runtime contain
 	return nil
 }
 
+func (m *GinMockContainerManager) PullImageWithProgress(ctx context.Context, runtime container.PodmanRuntime, image string, callback container.ImagePullCallback) error {
+	_ = runtime
+	_ = image
+	if callback != nil {
+		callback(container.ImagePullReport{
+			Image:          image,
+			OverallPercent: 100,
+			Phase:          "complete",
+		})
+	}
+	return nil
+}
+
 func (m *GinMockContainerManager) ResetStorage(ctx context.Context, runtime container.PodmanRuntime) error {
 	_ = ctx
 	_ = runtime

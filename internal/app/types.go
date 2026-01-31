@@ -20,6 +20,8 @@ type ContainerManager interface {
 	RemoveContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
 	ListContainersByLabel(ctx context.Context, runtime container.PodmanRuntime, labelKey, labelValue string) ([]container.ContainerListItem, error)
 	PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error
+	// PullImageWithProgress pulls an image with real-time progress callbacks.
+	PullImageWithProgress(ctx context.Context, runtime container.PodmanRuntime, image string, callback container.ImagePullCallback) error
 	Logs(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int) ([]string, error)
 	LogsStream(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int, timestamps bool) (io.ReadCloser, error)
 	ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error)
