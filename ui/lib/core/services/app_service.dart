@@ -216,15 +216,15 @@ class AppService {
   Future<App> installAppWithInputs(
     String yamlContent,
     Map<String, dynamic> inputs, {
-    String displayName = '',
     String? taskId,
+    String? catalogSource, // Tracks which catalog item this app was installed from
   }) async {
     final body = <String, dynamic>{
       'app_definition': yamlContent,
       'inputs': inputs,
     };
-    if (displayName.isNotEmpty) {
-      body['display_name'] = displayName;
+    if (catalogSource != null && catalogSource.isNotEmpty) {
+      body['catalog_source'] = catalogSource;
     }
 
     final data = await _client.post(

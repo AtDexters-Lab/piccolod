@@ -12,29 +12,16 @@ func TestAppServicesDiscovery_RealHandlers(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
 
-	// Install via API
-	body := []byte(`name: demo
-type: user
-listeners:
-  - name: web
-    guest_port: 80
-    flow: tcp
-    protocol: http
-    auth:
-      rules:
-        - path: "/"
-          type: prefix
-          strategy: public
-services:
-  main:
-    image: alpine:3.18
-    bind_ports: [80]
-x-piccolo:
-  mode: service
-`)
+	// RFC 20260130: all apps with listeners must use __primary marker
+	body := []byte(`{
+		"app_definition": "type: user\nlisteners:\n  - name: __primary\n    guest_port: 80\n    flow: tcp\n    protocol: http\n    auth:\n      rules:\n        - path: \"/\"\n          type: prefix\n          strategy: public\nservices:\n  main:\n    image: alpine:3.18\n    bind_ports: [80]\nx-piccolo:\n  mode: service\n",
+		"inputs": {
+			"__app_address__": "demo"
+		}
+	}`)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/api/v1/apps", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/x-yaml")
+	req.Header.Set("Content-Type", "application/json")
 	attachAuth(req, sessionCookie, csrfToken)
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {

@@ -538,11 +538,10 @@ func TestRemote_PortalHostnamePersistsAndAppCertQueued(t *testing.T) {
 		t.Fatalf("expected portal certificate to be issued, got status=%q", status)
 	}
 
-	// Per RFC 20260114: listener names must be lowercase letters and numbers only
-	wordpress := `name: wordpress
-type: user
+	// RFC 20260130: Use __primary marker for multi-listener apps
+	wordpressYAML := `type: user
 listeners:
-  - name: web
+  - name: __primary
     guest_port: 80
     flow: tcp
     protocol: http
@@ -557,9 +556,16 @@ services:
 x-piccolo:
   mode: service
 `
+	installPayload := map[string]interface{}{
+		"app_definition": wordpressYAML,
+		"inputs": map[string]interface{}{
+			"__app_address__": "wordpress",
+		},
+	}
+	installBody, _ := json.Marshal(installPayload)
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest("POST", "/api/v1/apps", strings.NewReader(wordpress))
-	req.Header.Set("Content-Type", "application/x-yaml")
+	req, _ = http.NewRequest("POST", "/api/v1/apps", bytes.NewReader(installBody))
+	req.Header.Set("Content-Type", "application/json")
 	attachAuth(req, sessionCookie, csrfToken)
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {

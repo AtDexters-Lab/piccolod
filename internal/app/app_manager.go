@@ -1173,14 +1173,16 @@ func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefi
 }
 
 // Install installs a new application instance from its definition.
-// The displayName parameter is an optional user-friendly name for the instance.
-func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition, displayName string) (*AppInstance, error) {
+// Per RFC 20260130, the instanceID is derived from:
+// - The primary listener name (for apps with listeners)
+// - The workspace_name (for workspace apps without listeners)
+func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-	return m.installLocked(ctx, appDef, displayName)
+	return m.installLocked(ctx, appDef)
 }
 
-func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinition, displayName string) (inst *AppInstance, err error) {
+func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinition) (inst *AppInstance, err error) {
 	instanceID := ""
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseValidating, 0, "Validating app manifest", false, nil)
 	defer func() {
@@ -1211,24 +1213,53 @@ func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinitio
 		return nil, err
 	}
 
-	// Generate unique instance ID
-	existingIDs := state.ListInstanceIDs()
-	instanceID, err = GenerateInstanceID(appDef.Name, existingIDs)
+	// RFC 20260130: Derive instanceID from primary listener name or workspace_name
+	instanceID, err = deriveInstanceID(appDef)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate instance ID: %w", err)
+		return nil, fmt.Errorf("failed to derive instance ID: %w", err)
 	}
 
-	// Validate generated instance ID
+	// Validate instance ID format and reserved names (RFC 20260130)
 	if err := ValidateInstanceID(instanceID); err != nil {
-		return nil, fmt.Errorf("invalid generated instance ID: %w", err)
+		return nil, fmt.Errorf("invalid app identity: %w", err)
+	}
+
+	// Validate instance ID doesn't collide with existing apps
+	existingIDs := state.ListInstanceIDs()
+	if err := ValidatePrimaryNameAvailable(instanceID, existingIDs); err != nil {
+		return nil, err
 	}
 
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseAllocatingPorts, 10, "Allocating ports", false, nil)
-	inst, err = m.installWithRetries(ctx, state, appDef, instanceID, displayName, 0)
+	inst, err = m.installWithRetries(ctx, state, appDef, instanceID, 0)
 	return inst, err
 }
 
-func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemStateManager, appDef *api.AppDefinition, instanceID, displayName string, attempt int) (*AppInstance, error) {
+// deriveInstanceID returns the instance ID from the app definition per RFC 20260130.
+// For apps with listeners, it's the primary listener name.
+// For workspace apps without listeners, it's the workspace_name.
+func deriveInstanceID(appDef *api.AppDefinition) (string, error) {
+	if len(appDef.Listeners) > 0 {
+		// Find the primary listener (the one with Primary=true, set programmatically)
+		for _, l := range appDef.Listeners {
+			if l.Primary {
+				return l.Name, nil
+			}
+		}
+		// RFC 20260130: All apps with listeners must have Primary=true set on exactly one listener.
+		// No fallback - this indicates a bug in install handler if we reach here.
+		return "", fmt.Errorf("no primary listener found; this indicates a bug in listener processing")
+	}
+
+	// Workspace app without listeners - use workspace_name
+	if appDef.WorkspaceName != "" {
+		return appDef.WorkspaceName, nil
+	}
+
+	return "", fmt.Errorf("cannot derive instance ID: no listeners and no workspace_name")
+}
+
+func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemStateManager, appDef *api.AppDefinition, instanceID string, attempt int) (*AppInstance, error) {
 	if attempt >= maxInstallPortRetries {
 		return nil, fmt.Errorf("failed to install %s: exhausted host-port retries", instanceID)
 	}
@@ -1260,7 +1291,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	// Unified install path: all apps (service and workspace) use container groups.
 	// Storage preparation (image pull vs workspace disk) is handled inside installContainerGroup.
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseCreatingContainer, 60, "Creating containers", false, nil)
-	app, err := m.installContainerGroup(ctx, appDef, instanceID, displayName, layout, runtime, endpoints)
+	app, err := m.installContainerGroup(ctx, appDef, instanceID, layout, runtime, endpoints)
 	if err != nil {
 		var portErr *container.PortInUseError
 		if errors.As(err, &portErr) {
@@ -1274,7 +1305,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 					_ = m.serviceManager.ReserveHostPort(ep.HostBind)
 				}
 			}
-			return m.installWithRetries(ctx, state, appDef, instanceID, displayName, attempt+1)
+			return m.installWithRetries(ctx, state, appDef, instanceID, attempt+1)
 		}
 		return nil, err
 	}
@@ -1311,7 +1342,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 // Deprecated: With multi-instance support, use Install() directly.
 // This method now always creates a new instance (no update behavior).
 func (m *AppManager) Upsert(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
-	return m.Install(ctx, appDef, "")
+	return m.Install(ctx, appDef)
 }
 
 // List returns all installed applications

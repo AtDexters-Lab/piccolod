@@ -17,8 +17,9 @@ func TestServiceRemoteResolver(t *testing.T) {
 	svc := services.NewServiceManager()
 	resolver := newServiceRemoteResolver(svc)
 
+	// RFC 20260130: listener name is the app identity, so app "demo" needs listener named "demo"
 	listeners := []api.AppListener{
-		{Name: "web", GuestPort: 8080, Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTCP, RemotePorts: []int{80, 443, 8000}},
+		{Name: "demo", GuestPort: 8080, Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTCP, RemotePorts: []int{80, 443, 8000}, Primary: true},
 	}
 	eps, err := svc.AllocateForApp("demo", listeners)
 	if err != nil {

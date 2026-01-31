@@ -27,14 +27,12 @@ class DynamicInstallWizard extends StatefulWidget {
 class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
   final _formKey = GlobalKey<FormState>();
   final Map<String, dynamic> _formValues = {};
-  final TextEditingController _displayNameController = TextEditingController();
   bool _isInstalling = false;
   String? _taskId;
   String? _error;
 
   @override
   void dispose() {
-    _displayNameController.dispose();
     super.dispose();
   }
 
@@ -64,8 +62,8 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
       final app = await widget.appService.installAppWithInputs(
         widget.yamlContent,
         _formValues,
-        displayName: _displayNameController.text.trim(),
         taskId: taskId,
+        catalogSource: widget.appName, // Track which catalog item this was installed from
       );
 
       if (mounted) {
@@ -148,17 +146,6 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            TextFormField(
-                              controller: _displayNameController,
-                              decoration: const InputDecoration(
-                                labelText: "Display name (optional)",
-                                hintText: "e.g., Work Projects",
-                                filled: true,
-                                fillColor: Colors.white,
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
-                            const SizedBox(height: 24),
                             if (_error != null)
                               Container(
                                 width: double.infinity,

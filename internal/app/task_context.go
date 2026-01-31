@@ -25,3 +25,26 @@ func TaskIDFromContext(ctx context.Context) string {
 	}
 	return strings.TrimSpace(v)
 }
+
+// Catalog source context: tracks which catalog item an app was installed from.
+// Used for icon lookup and update tracking.
+type catalogSourceContextKey struct{}
+
+func WithCatalogSource(ctx context.Context, catalogSource string) context.Context {
+	catalogSource = strings.TrimSpace(catalogSource)
+	if catalogSource == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, catalogSourceContextKey{}, catalogSource)
+}
+
+func CatalogSourceFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, ok := ctx.Value(catalogSourceContextKey{}).(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(v)
+}

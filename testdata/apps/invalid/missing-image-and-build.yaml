@@ -1,4 +1,7 @@
-# Missing required 'services' field for service mode
-name: invalidapp
+# RFC 20260130: Missing required 'services' field for service mode
+# Has __primary listener to pass identity validation
+listeners:
+  - name: __primary
+    guest_port: 80
 x-piccolo:
   mode: service

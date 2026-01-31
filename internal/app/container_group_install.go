@@ -16,7 +16,7 @@ import (
 // This is the unified install path for both service and workspace modes.
 // For workspace mode, it prepares workspace disks and uses --rootfs mode.
 // For service mode, it uses standard image-based containers.
-func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID, displayName string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint) (*AppInstance, error) {
+func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint) (*AppInstance, error) {
 	if m.serviceManager == nil {
 		return nil, fmt.Errorf("app manager: service manager not configured")
 	}
@@ -310,7 +310,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	now := time.Now()
 	return &AppInstance{
 		InstanceID:      instanceID,
-		DisplayName:     displayName,
 		Status:          "running",
 		PrimaryService:  primary,
 		NetworkAnchorID: anchorID,
@@ -318,5 +317,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		CreatedAt:       now,
 		UpdatedAt:       now,
 		Definition:      appDef,
+		CatalogSource:   CatalogSourceFromContext(ctx),
 	}, nil
 }

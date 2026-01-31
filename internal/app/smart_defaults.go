@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"piccolod/internal/api"
+	"piccolod/internal/hostname"
 )
 
 // GenerateSecurePassword generates a random secure string (32 bytes, base64 encoded)
@@ -44,7 +45,9 @@ func IsSubdomainTaken(ctx context.Context, mgr *AppManager, subdomain string) (b
 	return false, nil
 }
 
-// FindFreeSubdomain tries the base name, then appends -1, -2, etc. until a free one is found.
+// FindFreeSubdomain tries the base name, then appends 1, 2, etc. until a free one is found.
+// RFC 20260130: Suffixes use no hyphen (e.g., "blog1", "blog2") since hyphens are not allowed
+// in listener names and primary listener names.
 func FindFreeSubdomain(ctx context.Context, mgr *AppManager, base string) (string, error) {
 	taken, err := IsSubdomainTaken(ctx, mgr, base)
 	if err != nil {
@@ -55,7 +58,7 @@ func FindFreeSubdomain(ctx context.Context, mgr *AppManager, base string) (strin
 	}
 
 	for i := 1; i < 100; i++ {
-		candidate := fmt.Sprintf("%s-%d", base, i)
+		candidate := fmt.Sprintf("%s%d", base, i)
 		taken, err := IsSubdomainTaken(ctx, mgr, candidate)
 		if err != nil {
 			return base, err
@@ -69,7 +72,34 @@ func FindFreeSubdomain(ctx context.Context, mgr *AppManager, base string) (strin
 
 // PrepareSmartDefaults modifies the input schema with generated values and collision-free defaults.
 // This is called by the API handler before sending the schema to the UI.
-func PrepareSmartDefaults(ctx context.Context, mgr *AppManager, schema *api.AppDefinition) error {
+// catalogItemName is optional - if provided, it's used as the default for __app_address__.
+func PrepareSmartDefaults(ctx context.Context, mgr *AppManager, schema *api.AppDefinition, catalogItemName string) error {
+	// RFC 20260130: Detect __primary listener and inject __app_address__ synthetic input
+	if hasPrimaryMarker := detectPrimaryMarker(schema.Listeners); hasPrimaryMarker {
+		if schema.Inputs == nil {
+			schema.Inputs = make(map[string]api.AppInput)
+		}
+		// Inject __app_address__ input if not already present
+		if _, exists := schema.Inputs["__app_address__"]; !exists {
+			// Use catalog item name as default, sanitized for hostname rules
+			defaultName := sanitizeForHostname(catalogItemName)
+			if defaultName == "" {
+				defaultName = "app"
+			}
+			schema.Inputs["__app_address__"] = api.AppInput{
+				Type:        "string",
+				Label:       "App Address",
+				Description: "The subdomain/address for this app (e.g., 'blog' for blog-piccolo.local)",
+				Required:    true,
+				Default:     defaultName,
+				Validation: &api.AppInputValidation{
+					Regex:   "^[a-z][a-z0-9]{0,15}$",
+					Message: "Lowercase letters and numbers only, must start with letter, max 16 chars",
+				},
+			}
+		}
+	}
+
 	if schema.Inputs == nil {
 		return nil
 	}
@@ -84,10 +114,9 @@ func PrepareSmartDefaults(ctx context.Context, mgr *AppManager, schema *api.AppD
 			}
 		}
 
-		// 2. Subdomain Collision
-		// Heuristic: If key is "subdomain", check availability.
-		if key == "subdomain" {
-			if val, ok := input.Default.(string); ok {
+		// 2. Subdomain Collision (for __app_address__ or legacy subdomain inputs)
+		if key == "subdomain" || key == "__app_address__" {
+			if val, ok := input.Default.(string); ok && val != "" {
 				freeName, err := FindFreeSubdomain(ctx, mgr, val)
 				if err == nil {
 					input.Default = freeName
@@ -97,4 +126,47 @@ func PrepareSmartDefaults(ctx context.Context, mgr *AppManager, schema *api.AppD
 		}
 	}
 	return nil
+}
+
+// detectPrimaryMarker checks if any listener is named __primary.
+func detectPrimaryMarker(listeners []api.AppListener) bool {
+	for _, l := range listeners {
+		if hostname.IsPrimaryMarker(l.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeForHostname converts a string to a valid hostname component.
+// Removes hyphens, underscores, converts to lowercase, keeps only letters and numbers,
+// ensures it starts with a letter, and truncates to 16 characters.
+func sanitizeForHostname(s string) string {
+	if s == "" {
+		return ""
+	}
+
+	// Convert to lowercase and remove hyphens/underscores
+	result := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			result = append(result, c+'a'-'A')
+		} else if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			result = append(result, c)
+		}
+		// Skip hyphens, underscores, and other characters
+	}
+
+	// Ensure starts with a letter
+	for len(result) > 0 && result[0] >= '0' && result[0] <= '9' {
+		result = result[1:]
+	}
+
+	// Truncate to 16 characters
+	if len(result) > 16 {
+		result = result[:16]
+	}
+
+	return string(result)
 }

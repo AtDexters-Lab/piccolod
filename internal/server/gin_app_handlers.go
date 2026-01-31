@@ -282,8 +282,8 @@ func (s *GinServer) handleGinCatalogConfigure(c *gin.Context) {
 		return
 	}
 
-	// Prepare smart defaults
-	if err := app.PrepareSmartDefaults(c.Request.Context(), s.appManager, def); err != nil {
+	// Prepare smart defaults (pass catalog item name for __app_address__ default)
+	if err := app.PrepareSmartDefaults(c.Request.Context(), s.appManager, def, name); err != nil {
 		log.Printf("WARN: failed to prepare smart defaults for %s: %v", name, err)
 		// Continue anyway, just without smarts
 	}
@@ -303,14 +303,14 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	// Read request body
 	var yamlData []byte
 	var userInputs map[string]interface{}
-	displayName := ""
 
+	var catalogSource string
 	if strings.Contains(contentType, "application/json") {
-		// Accept { app_definition: "...yaml...", inputs: {...} }
+		// Accept { app_definition: "...yaml...", inputs: {...}, catalog_source: "..." }
 		var req struct {
 			AppDefinition string                 `json:"app_definition"`
 			Inputs        map[string]interface{} `json:"inputs"`
-			DisplayName   string                 `json:"display_name"`
+			CatalogSource string                 `json:"catalog_source"` // Optional: tracks which catalog item this was installed from
 		}
 		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
 			writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
@@ -318,7 +318,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		}
 		yamlData = []byte(req.AppDefinition)
 		userInputs = req.Inputs
-		displayName = req.DisplayName
+		catalogSource = req.CatalogSource
 	} else {
 		body, err := c.GetRawData()
 		if err != nil {
@@ -387,9 +387,62 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		yamlData = rendered
 	}
 
-	// Parse app.yaml
-	appDef, err := app.ParseAppDefinition(yamlData)
+	// RFC 20260130: Parse YAML first, then handle __primary substitution via struct manipulation.
+	// This is safer than regex replacement which could corrupt comments/descriptions/env vars.
+	looseDef, err := app.ParseAppSchema(yamlData)
 	if err != nil {
+		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
+		return
+	}
+
+	// RFC 20260130: Find __primary listener and substitute with user-provided value
+	var primaryListenerName string
+	hasPrimaryMarker := false
+	for i := range looseDef.Listeners {
+		if hostname.IsPrimaryMarker(looseDef.Listeners[i].Name) {
+			hasPrimaryMarker = true
+			// Get user-provided app address
+			if appAddress, ok := userInputs["__app_address__"].(string); ok && strings.TrimSpace(appAddress) != "" {
+				primaryListenerName = strings.TrimSpace(appAddress)
+				// Validate the provided name before using it
+				if err := app.ValidateInstanceID(primaryListenerName); err != nil {
+					writeGinError(c, http.StatusBadRequest, "Invalid app address: "+err.Error())
+					return
+				}
+				// RFC 20260130: Check for collision with existing app instance IDs
+				existingApps, err := s.appManager.List(c.Request.Context())
+				if err != nil {
+					writeGinError(c, http.StatusInternalServerError, "Failed to check existing apps: "+err.Error())
+					return
+				}
+				existingIDs := make([]string, len(existingApps))
+				for i, a := range existingApps {
+					existingIDs[i] = a.InstanceID
+				}
+				if err := app.ValidatePrimaryNameAvailable(primaryListenerName, existingIDs); err != nil {
+					writeGinError(c, http.StatusConflict, err.Error())
+					return
+				}
+				// Substitute the listener name and mark as primary
+				looseDef.Listeners[i].Name = primaryListenerName
+				looseDef.Listeners[i].Primary = true
+			} else {
+				writeGinError(c, http.StatusBadRequest, "App requires '__app_address__' input for primary listener name")
+				return
+			}
+			break
+		}
+	}
+
+	// RFC 20260130: All apps with listeners MUST use __primary marker
+	if !hasPrimaryMarker && len(looseDef.Listeners) > 0 {
+		writeGinError(c, http.StatusBadRequest, "Apps with listeners must have exactly one listener named '__primary'; update your app.yaml to use the __primary marker")
+		return
+	}
+
+	// Set defaults and validate
+	app.SetDefaults(looseDef)
+	if err := app.ValidateAppDefinition(looseDef); err != nil {
 		var ve *app.ValidationError
 		if errors.As(err, &ve) && ve != nil {
 			writeGinErrorWithKey(c, http.StatusBadRequest, "Invalid app.yaml: "+ve.Message, ve.Code)
@@ -398,6 +451,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
 		return
 	}
+	appDef := looseDef
 
 	// Install a new app instance.
 	// Use a background context with a generous timeout instead of the HTTP request context.
@@ -407,7 +461,10 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	installCtx, cancelInstall := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancelInstall()
 	installCtx = app.WithTaskID(installCtx, c.GetHeader("X-Piccolo-Task-ID"))
-	appInstance, err := s.appManager.Install(installCtx, appDef, displayName)
+	if catalogSource != "" {
+		installCtx = app.WithCatalogSource(installCtx, catalogSource)
+	}
+	appInstance, err := s.appManager.Install(installCtx, appDef)
 	if err != nil {
 		if handleAppManagerError(c, err, "install app") {
 			return
@@ -828,25 +885,17 @@ func (s *GinServer) handleGinAppCheckInstance(c *gin.Context) {
 		return
 	}
 
-	existing := make([]string, 0, len(apps))
 	available := true
 	for _, inst := range apps {
-		existing = append(existing, inst.InstanceID)
 		if inst.InstanceID == candidate {
 			available = false
+			break
 		}
 	}
 
-	suggested := candidate
-	if !available {
-		if alt, err := app.GenerateInstanceID(candidate, existing); err == nil {
-			suggested = alt
-		}
-	}
-
+	// RFC 20260130: We no longer suggest alternatives; users must choose a unique name
 	c.JSON(http.StatusOK, gin.H{
 		"available": available,
-		"suggested": suggested,
 	})
 }
 

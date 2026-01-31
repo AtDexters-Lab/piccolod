@@ -1,8 +1,8 @@
-name: testcomplete
+# RFC 20260130: __primary marker gets replaced at install time
 type: user
 
 listeners:
-  - name: web
+  - name: __primary
     guest_port: 80
     flow: tcp
     protocol: http

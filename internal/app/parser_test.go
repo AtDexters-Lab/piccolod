@@ -12,7 +12,6 @@ func TestParseAppDefinition(t *testing.T) {
 	tests := []struct {
 		name           string
 		filePath       string
-		expectedName   string
 		expectedType   string
 		expectError    bool
 		validateFields func(*testing.T, *api.AppDefinition)
@@ -20,10 +19,13 @@ func TestParseAppDefinition(t *testing.T) {
 		{
 			name:         "minimal app",
 			filePath:     "../../testdata/apps/valid/minimal.yaml",
-			expectedName: "testminimal",
 			expectedType: "user", // default
 			expectError:  false,
 			validateFields: func(t *testing.T, app *api.AppDefinition) {
+				// RFC 20260130: Raw YAML should have __primary as listener name
+				if len(app.Listeners) == 0 || app.Listeners[0].Name != "__primary" {
+					t.Error("Expected __primary listener in raw YAML")
+				}
 				if app.Services == nil {
 					t.Fatal("expected services to be defined")
 				}
@@ -39,21 +41,21 @@ func TestParseAppDefinition(t *testing.T) {
 		{
 			name:         "complete app",
 			filePath:     "../../testdata/apps/valid/complete.yaml",
-			expectedName: "testcomplete",
 			expectedType: "user",
 			expectError:  false,
 			validateFields: func(t *testing.T, app *api.AppDefinition) {
 				if len(app.Listeners) == 0 {
 					t.Error("Expected listeners to be defined")
 				}
+				// RFC 20260130: Raw YAML should have __primary as listener name
 				found := false
 				for _, l := range app.Listeners {
-					if l.Name == "web" && l.GuestPort == 80 {
+					if l.Name == "__primary" && l.GuestPort == 80 {
 						found = true
 					}
 				}
 				if !found {
-					t.Error("Expected web listener with guest_port 80")
+					t.Error("Expected __primary listener with guest_port 80")
 				}
 				if app.Services == nil {
 					t.Fatal("expected services to be defined")
@@ -97,11 +99,6 @@ func TestParseAppDefinition(t *testing.T) {
 				t.Fatalf("Unexpected error: %v", err)
 			}
 
-			// Basic field validation
-			if app.Name != tt.expectedName {
-				t.Errorf("Expected name %s, got %s", tt.expectedName, app.Name)
-			}
-
 			// Validate default values
 			if app.Type == "" {
 				app.Type = "user" // Parser should set this default
@@ -126,9 +123,9 @@ func TestParseAppDefinitionErrors(t *testing.T) {
 		expectedErr string
 	}{
 		{
-			name:        "missing name",
+			name:        "missing identity",
 			filePath:    "../../testdata/apps/invalid/missing-name.yaml",
-			expectedErr: "name is required",
+			expectedErr: "listeners are required for service mode apps",
 		},
 		{
 			name:        "missing image",
@@ -172,8 +169,8 @@ func TestValidateAppDefinition(t *testing.T) {
 		{
 			name: "valid minimal app",
 			app: &api.AppDefinition{
-				Name:      "testapp",
-				Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+				// RFC 20260130: listener name is the app identity, Primary: true
+				Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Primary: true}},
 				Services: map[string]api.AppService{
 					"main": {Image: "nginx:latest", BindPorts: []int{80}},
 				},
@@ -184,8 +181,7 @@ func TestValidateAppDefinition(t *testing.T) {
 		{
 			name: "missing x-piccolo.mode",
 			app: &api.AppDefinition{
-				Name:      "testapp",
-				Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+				Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Primary: true}},
 				Services: map[string]api.AppService{
 					"main": {Image: "nginx:latest", BindPorts: []int{80}},
 				},
@@ -195,40 +191,57 @@ func TestValidateAppDefinition(t *testing.T) {
 			expectedErr: "x-piccolo.mode is required",
 		},
 		{
-			name:        "empty name",
-			app:         &api.AppDefinition{Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
+			name: "missing identity",
+			app: &api.AppDefinition{
+				Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}},
+				Extensions: map[string]interface{}{"mode": "service"},
+			},
 			expectError: true,
-			expectedErr: "name is required",
+			expectedErr: "listeners are required for service mode apps",
 		},
 		{
-			name:        "invalid name characters",
-			app:         &api.AppDefinition{Name: "test_app!", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
+			name: "invalid listener name characters",
+			app: &api.AppDefinition{
+				Listeners:  []api.AppListener{{Name: "test_app!", GuestPort: 80, Primary: true}},
+				Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}},
+				Extensions: map[string]interface{}{"mode": "service"},
+			},
 			expectError: true,
 			expectedErr: "name must contain only lowercase letters and numbers",
 		},
 		{
-			name:        "name with hyphen",
-			app:         &api.AppDefinition{Name: "test-app", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
+			name: "listener name with hyphen",
+			app: &api.AppDefinition{
+				Listeners:  []api.AppListener{{Name: "test-app", GuestPort: 80, Primary: true}},
+				Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}},
+				Extensions: map[string]interface{}{"mode": "service"},
+			},
 			expectError: true,
 			expectedErr: "no hyphens allowed",
 		},
 		{
-			name:        "name too long",
-			app:         &api.AppDefinition{Name: "abcdefghijklmnopq", Services: map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}}},
+			name: "listener name too long",
+			app: &api.AppDefinition{
+				Listeners:  []api.AppListener{{Name: "abcdefghijklmnopq", GuestPort: 80, Primary: true}},
+				Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}},
+				Extensions: map[string]interface{}{"mode": "service"},
+			},
 			expectError: true,
 			expectedErr: "name must be 16 characters or less",
 		},
 		{
-			name:        "missing services",
-			app:         &api.AppDefinition{Name: "testapp", Extensions: map[string]interface{}{"mode": "service"}},
+			name: "missing services",
+			app: &api.AppDefinition{
+				Listeners:  []api.AppListener{{Name: "testapp", GuestPort: 80, Primary: true}},
+				Extensions: map[string]interface{}{"mode": "service"},
+			},
 			expectError: true,
 			expectedErr: "services is required",
 		},
 		{
 			name: "invalid listener port",
 			app: &api.AppDefinition{
-				Name:      "testapp",
-				Listeners: []api.AppListener{{Name: "web", GuestPort: 0}},
+				Listeners: []api.AppListener{{Name: "testapp", GuestPort: 0, Primary: true}},
 				Services: map[string]api.AppService{
 					"main": {Image: "nginx:latest", BindPorts: []int{80}},
 				},
@@ -331,9 +344,12 @@ func containsSubstring(s, substr string) bool {
 
 // TestSetDefaults tests that parser sets appropriate default values
 func TestSetDefaults(t *testing.T) {
+	// RFC 20260130: Use listener name as identity
 	app := &api.AppDefinition{
-		Name:  "test-app",
-		Image: "nginx:latest",
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Primary: true}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:latest", BindPorts: []int{80}},
+		},
 	}
 
 	SetDefaults(app)
@@ -389,8 +405,9 @@ func TestLargeContentHandling(t *testing.T) {
 		t.Fatalf("Should handle reasonably large content, but got error: %v", err)
 	}
 
-	if app.Name != "largeapp" {
-		t.Errorf("Expected name 'largeapp', got %s", app.Name)
+	// RFC 20260130: Raw YAML should have __primary as listener name
+	if len(app.Listeners) == 0 || app.Listeners[0].Name != "__primary" {
+		t.Error("Expected __primary listener in raw YAML")
 	}
 }
 
@@ -477,15 +494,19 @@ x-piccolo:
 	}
 }
 
-// TestReservedNames tests that reserved app names are rejected
+// TestReservedNames tests that reserved listener names are rejected
 func TestReservedNames(t *testing.T) {
+	// RFC 20260130: Reserved names now apply to listener names
 	reservedNames := []string{"api", "www", "admin", "root", "system", "piccolo"}
 
 	for _, name := range reservedNames {
 		t.Run(name, func(t *testing.T) {
 			app := &api.AppDefinition{
-				Name:  name,
-				Image: "nginx:latest",
+				Listeners: []api.AppListener{{Name: name, GuestPort: 80, Primary: true}},
+				Services: map[string]api.AppService{
+					"main": {Image: "nginx:latest", BindPorts: []int{80}},
+				},
+				Extensions: map[string]interface{}{"mode": "service"},
 			}
 
 			SetDefaults(app)

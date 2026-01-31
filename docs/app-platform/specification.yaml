@@ -22,17 +22,54 @@
 # RFC references:
 # - Listener auth rules + service-level `oidc_client`: docs/rfc/20260112-listener-auth-rules.md
 # - Hostname scheme + optional LAN host-based routing: docs/rfc/20260114-hostname-scheme-routing.md
+# - Unified app identity model: docs/rfc/20260130-unified-app-identity-model.md
 #
 # -----------------------------------------------------------------------------
-# Minimal app (service mode)
+# App Identity (RFC 20260130)
 #
-# name: blog
+# Apps are identified by their PRIMARY LISTENER NAME (service mode) or WORKSPACE_NAME (workspace mode).
+# There is no separate `name` field. The identity is derived from:
+#
+#   - Service mode: the listener marked with `name: __primary` (catalog apps) or the
+#     single listener's name (single-listener apps auto-select primary).
+#   - Workspace mode: the `workspace_name` field under x-piccolo.
+#
+# The `__primary` marker is a magic placeholder that gets replaced at install time with
+# the user-provided `__app_address__` input value. This enables catalog apps to have
+# user-customizable addresses while maintaining a single source of identity.
+#
+# Reserved names (cannot be used as listener names or workspace_name):
+#   api, www, admin, root, system, piccolo, piccoloos, __primary
+#
+# -----------------------------------------------------------------------------
+# Minimal app (service mode, single listener — auto-selects primary)
+#
 # services:
 #   main:
 #     image: ghost:latest
 #     bind_ports: [2368]
 # listeners:
-#   - name: web
+#   - name: blog
+#     guest_port: 2368
+#     flow: tcp
+#     protocol: http
+# x-piccolo:
+#   mode: service
+#
+# -----------------------------------------------------------------------------
+# Catalog app (service mode, __primary marker for user-provided address)
+#
+# inputs:
+#   __app_address__:
+#     type: string
+#     label: "App Address"
+#     required: true
+# services:
+#   main:
+#     image: ghost:latest
+#     bind_ports: [2368]
+# listeners:
+#   - name: __primary
 #     guest_port: 2368
 #     flow: tcp
 #     protocol: http
@@ -43,22 +80,23 @@
 # Full reference (all fields documented)
 #
 
-# REQUIRED: App identifier.
-# Constraints:
-# - 1..31 chars
-# - lowercase letters and numbers only (no hyphens)
-# - must start with a letter
-# - must end with a letter or number
-# - reserved names not allowed: api, www, admin, root, system, piccolo, piccoloos
-# - required for host-based routing (RFC 20260114)
-name: exampleapp
-
 # Optional: user (default) | system (starts during boot).
 type: user
 
 # Optional: Dynamic configuration collected from the installer UI.
 # Values are available via {{ .Inputs.<name> }}.
 inputs:
+  # RESERVED INPUT (RFC 20260130): When a listener is named `__primary`, you MUST
+  # define an `__app_address__` input. The install handler substitutes this value
+  # for `__primary` at install time, making it the app's identity.
+  __app_address__:
+    type: string
+    label: "App Address"
+    description: "The subdomain/address for your app (e.g., 'blog' → blog.piccolo.local)"
+    required: true
+    validation:
+      regex: "^[a-z][a-z0-9]{0,15}$"
+      message: "Only lowercase letters and numbers allowed; must start with a letter; max 16 chars."
   subdomain:
     type: string # string | boolean | int | password
     label: "Subdomain"
@@ -66,8 +104,8 @@ inputs:
     default: "dev"
     required: true
     validation:
-      regex: "^[a-z][a-z0-9]{0,30}$"
-      message: "Only lowercase letters and numbers allowed; must start with a letter; max 31 chars."
+      regex: "^[a-z][a-z0-9]{0,15}$"
+      message: "Only lowercase letters and numbers allowed; must start with a letter; max 16 chars."
   admin_password:
     type: password
     label: "Admin Password"
@@ -167,16 +205,25 @@ services:
 # - <lan-base> is the device mDNS hostname (e.g., piccolo.local).
 # - <remote-base> is the remote portal hostname apex (device base domain).
 #
+# App Identity (RFC 20260130):
+# - Service-mode apps derive their identity from the PRIMARY listener name.
+# - Single-listener apps: the listener is automatically marked as primary.
+# - Multi-listener apps (including catalog apps): exactly one listener must be named `__primary`.
+# - The `__primary` marker is replaced at install time with the `__app_address__` input value.
+#
 # If remote_ports is omitted, Piccolo defaults to [80, 443].
 listeners:
   # REQUIRED: Listener identifier.
   # Constraints:
-  # - 1..31 chars
-  # - lowercase letters and numbers only (no hyphens)
-  # - must start with a letter
-  # - reserved names not allowed: piccolo, piccoloos
+  # - 1..16 chars
+  # - lowercase letters and numbers only (no hyphens), except `__primary` magic marker
+  # - must start with a letter (or `_` for __primary)
+  # - reserved names not allowed: api, www, admin, root, system, piccolo, piccoloos, __primary
   # - required for host-based routing (RFC 20260114)
-  - name: "{{ .Inputs.subdomain }}"
+  #
+  # Use `__primary` as the name for catalog apps. This marker is replaced with the
+  # user-provided `__app_address__` input value during installation.
+  - name: __primary
     guest_port: 8080
     flow: tcp # tcp (default) | tls (passthrough; no HTTP visibility)
     protocol: http # raw (default) | http | websocket
@@ -227,7 +274,7 @@ listeners:
 healthcheck:
   http:
     path: /health
-    port: "{{ .Inputs.subdomain }}" # Listener name to route the probe through
+    port: "{{ .Inputs.__app_address__ }}" # Listener name to route the probe through (use app address for primary)
     timeout: 30s
     retries: 3
 
@@ -255,10 +302,27 @@ permissions:
     read_only_root: false
     device_access: deny # allow | deny
 
+# WORKSPACE NAME ---------------------------------------------------------------
+# REQUIRED for workspace mode (RFC 20260130): app identity when no listeners exist.
+# This is a ROOT-LEVEL field, not under x-piccolo.
+# Constraints:
+# - 1..16 chars
+# - lowercase letters and numbers only (no hyphens)
+# - must start with a letter
+# - reserved names not allowed: api, www, admin, root, system, piccolo, piccoloos, __primary
+# - ignored when listeners are present (identity comes from primary listener instead)
+#
+# Example workspace app:
+# workspace_name: devenv
+# x-piccolo:
+#   mode: workspace
+workspace_name: ""  # Only used when mode: workspace AND no listeners defined
+
 # EXTENSIONS ------------------------------------------------------------------
 # REQUIRED: you must set `x-piccolo.mode` for every app.
 x-piccolo:
   mode: service # service | workspace
+
   replication:
     hot:
       datasets: [disk, data]

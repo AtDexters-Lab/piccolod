@@ -255,11 +255,10 @@ func TestAppManager_Install(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Test app definition
+	// Test app definition - RFC 20260130: instanceID derived from primary listener name
 	appDef := &api.AppDefinition{
-		Name:      "testapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {
 				Image:     "nginx:alpine",
@@ -273,12 +272,12 @@ func TestAppManager_Install(t *testing.T) {
 	}
 
 	// Install the app
-	app, err := manager.Install(ctx, appDef, "")
+	app, err := manager.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
-	// Verify app was created correctly
+	// Verify app was created correctly - instanceID = primary listener name
 	if app.AppName() != "testapp" {
 		t.Errorf("Expected app name 'testapp', got %s", app.AppName())
 	}
@@ -313,16 +312,30 @@ func TestAppManager_Install(t *testing.T) {
 		t.Error("metadata.json was not created")
 	}
 
-	// Second installation of same app should create new instance with different ID
-	app2, err := manager.Install(ctx, appDef, "")
+	// RFC 20260130: Second installation of same app definition should fail (collision)
+	_, err = manager.Install(ctx, appDef)
+	if err == nil {
+		t.Error("Expected collision error for second installation with same primary listener name")
+	}
+
+	// Install with different primary listener name should succeed
+	appDef2 := &api.AppDefinition{
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "testapp2", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
+		Services: map[string]api.AppService{
+			"main": {
+				Image:     "nginx:alpine",
+				BindPorts: []int{80},
+			},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	app2, err := manager.Install(ctx, appDef2)
 	if err != nil {
-		t.Fatalf("Failed to install second instance: %v", err)
+		t.Fatalf("Failed to install second app with different name: %v", err)
 	}
-	if app2.InstanceID == app.InstanceID {
-		t.Error("Expected different instance ID for second installation")
-	}
-	if app2.AppName() != "testapp" {
-		t.Errorf("Expected app name 'testapp', got %s", app2.AppName())
+	if app2.InstanceID != "testapp2" {
+		t.Errorf("Expected instance ID 'testapp2', got %s", app2.InstanceID)
 	}
 }
 
@@ -336,14 +349,13 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 	allowHostStorage(t, manager)
 	manager.ForceLockState(false)
 	if _, err := manager.Install(context.Background(), &api.AppDefinition{
-		Name:      "demo",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Listeners: []api.AppListener{{Name: "demo", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine:latest", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
-	}, ""); err != nil {
+	}); err != nil {
 		t.Fatalf("seed install: %v", err)
 	}
 
@@ -362,15 +374,14 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 	}
 
 	appDef := &api.AppDefinition{
-		Name:      "nope",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "nope", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	if _, err := manager.Install(context.Background(), appDef, ""); !errors.Is(err, ErrNotLeader) {
+	if _, err := manager.Install(context.Background(), appDef); !errors.Is(err, ErrNotLeader) {
 		t.Fatalf("expected ErrNotLeader, got %v", err)
 	}
 }
@@ -449,32 +460,30 @@ func TestAppManager_List(t *testing.T) {
 		t.Errorf("Expected 0 apps, got %d", len(apps))
 	}
 
-	// Install two apps
+	// Install two apps - RFC 20260130: listener name is the app identity
 	appDef1 := &api.AppDefinition{
-		Name:      "app1",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "app1", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	appDef2 := &api.AppDefinition{
-		Name:      "app2",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "app2", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine:latest", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = manager.Install(ctx, appDef1, "")
+	_, err = manager.Install(ctx, appDef1)
 	if err != nil {
 		t.Fatalf("Failed to install app1: %v", err)
 	}
 
-	_, err = manager.Install(ctx, appDef2, "")
+	_, err = manager.Install(ctx, appDef2)
 	if err != nil {
 		t.Fatalf("Failed to install app2: %v", err)
 	}
@@ -546,17 +555,16 @@ func TestAppManager_Get(t *testing.T) {
 		t.Error("Expected error when getting nonexistent app")
 	}
 
-	// Install an app
+	// Install an app - RFC 20260130: listener name is the app identity
 	appDef := &api.AppDefinition{
-		Name:      "testapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	installedApp, err := manager.Install(ctx, appDef, "")
+	installedApp, err := manager.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -635,17 +643,16 @@ func TestAppManager_StartStop(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Install an app
+	// Install an app - RFC 20260130: listener name is the app identity
 	appDef := &api.AppDefinition{
-		Name:      "testapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	_, err = manager.Install(ctx, appDef, "")
+	_, err = manager.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -736,17 +743,16 @@ func TestAppManager_Uninstall(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Install an app
+	// Install an app - RFC 20260130: listener name is the app identity
 	appDef := &api.AppDefinition{
-		Name:      "testapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	_, err = manager.Install(ctx, appDef, "")
+	_, err = manager.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -812,15 +818,14 @@ func TestAppManager_EnableDisable(t *testing.T) {
 
 	// Install an app
 	appDef := &api.AppDefinition{
-		Name:      "testapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	_, err = manager.Install(ctx, appDef, "")
+	_, err = manager.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -920,11 +925,10 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Install an app and enable it
+	// Install an app and enable it - RFC 20260130: listener name is the app identity
 	appDef := &api.AppDefinition{
-		Name:      "persistentapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "persistentapp", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {
 				Image:     "nginx:alpine",
@@ -937,7 +941,7 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = manager1.Install(ctx, appDef, "")
+	_, err = manager1.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -1027,14 +1031,13 @@ func TestAppManager_BlockedWhenLocked(t *testing.T) {
 	mgr.ForceLockState(true)
 	ctx := context.Background()
 	_, err = mgr.Install(ctx, &api.AppDefinition{
-		Name:      "lockedapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "lockedapp", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:latest", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
-	}, "")
+	})
 	if !errors.Is(err, ErrLocked) {
 		t.Fatalf("expected ErrLocked, got %v", err)
 	}
@@ -1052,16 +1055,17 @@ func TestAppManager_RestoreServicesSkipsStoppedApps(t *testing.T) {
 	allowHostStorage(t, mgr)
 	mgr.ForceLockState(false)
 
+	// RFC 20260130: workspace apps without listeners use workspace_name
 	app := &api.AppDefinition{
-		Name: "demo",
-		Type: "user",
+		WorkspaceName: "demo",
+		Type:          "user",
 		Services: map[string]api.AppService{
 			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
 		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
-	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
+	if _, err := mgr.Install(context.Background(), app); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	if err := mgr.Stop(context.Background(), "demo"); err != nil {
@@ -1087,16 +1091,17 @@ func TestAppManager_ReconcileOnceStartsDesiredRunningApps(t *testing.T) {
 	allowHostStorage(t, mgr)
 	mgr.ForceLockState(false)
 
+	// RFC 20260130: workspace apps without listeners use workspace_name
 	app := &api.AppDefinition{
-		Name: "demo",
-		Type: "user",
+		WorkspaceName: "demo",
+		Type:          "user",
 		Services: map[string]api.AppService{
 			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
 		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
-	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
+	if _, err := mgr.Install(context.Background(), app); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 
@@ -1128,16 +1133,17 @@ func TestAppManager_ReconcileOnceStopsDesiredStoppedApps(t *testing.T) {
 	allowHostStorage(t, mgr)
 	mgr.ForceLockState(false)
 
+	// RFC 20260130: workspace apps without listeners use workspace_name
 	app := &api.AppDefinition{
-		Name: "demo",
-		Type: "user",
+		WorkspaceName: "demo",
+		Type:          "user",
 		Services: map[string]api.AppService{
 			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
 		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
-	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
+	if _, err := mgr.Install(context.Background(), app); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	if err := mgr.Start(context.Background(), "demo"); err != nil {
@@ -1181,16 +1187,17 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 	allowHostStorage(t, mgr)
 	mgr.ForceLockState(false)
 
+	// RFC 20260130: workspace apps without listeners use workspace_name
 	app := &api.AppDefinition{
-		Name: "demo",
-		Type: "user",
+		WorkspaceName: "demo",
+		Type:          "user",
 		Services: map[string]api.AppService{
 			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
 		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
-	if _, err := mgr.Install(context.Background(), app, ""); err != nil {
+	if _, err := mgr.Install(context.Background(), app); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	if err := mgr.Start(context.Background(), "demo"); err != nil {
@@ -1246,16 +1253,17 @@ func TestAppManager_ReconcileOnceResolvesStaleContainerID(t *testing.T) {
 	allowHostStorage(t, mgr)
 	mgr.ForceLockState(false)
 
+	// RFC 20260130: workspace apps without listeners use workspace_name
 	app := &api.AppDefinition{
-		Name: "demo",
-		Type: "user",
+		WorkspaceName: "demo",
+		Type:          "user",
 		Services: map[string]api.AppService{
 			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
 		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
 
-	inst, err := mgr.Install(context.Background(), app, "")
+	inst, err := mgr.Install(context.Background(), app)
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
@@ -1294,17 +1302,17 @@ func TestAppManager_StopAllApps_Basic(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Install and start multiple apps
+	// Install and start multiple apps - RFC 20260130: workspace apps use workspace_name
 	for _, name := range []string{"app1", "app2", "app3"} {
 		appDef := &api.AppDefinition{
-			Name: name,
-			Type: "user",
+			WorkspaceName: name,
+			Type:          "user",
 			Services: map[string]api.AppService{
 				"main": {Image: "nginx:alpine", BindPorts: []int{}},
 			},
 			Extensions: map[string]interface{}{"mode": "workspace"},
 		}
-		if _, err := mgr.Install(ctx, appDef, ""); err != nil {
+		if _, err := mgr.Install(ctx, appDef); err != nil {
 			t.Fatalf("install %s: %v", name, err)
 		}
 	}
@@ -1361,17 +1369,17 @@ func TestAppManager_StopAllApps_SkipsNonRunningApps(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Install two apps
+	// Install two apps - RFC 20260130: workspace apps use workspace_name
 	for _, name := range []string{"runningapp", "stoppedapp"} {
 		appDef := &api.AppDefinition{
-			Name: name,
-			Type: "user",
+			WorkspaceName: name,
+			Type:          "user",
 			Services: map[string]api.AppService{
 				"main": {Image: "nginx:alpine", BindPorts: []int{}},
 			},
 			Extensions: map[string]interface{}{"mode": "workspace"},
 		}
-		if _, err := mgr.Install(ctx, appDef, ""); err != nil {
+		if _, err := mgr.Install(ctx, appDef); err != nil {
 			t.Fatalf("install %s: %v", name, err)
 		}
 	}
@@ -1418,17 +1426,17 @@ func TestAppManager_StopAllApps_ErrorAggregation(t *testing.T) {
 	allowHostStorage(t, mgr)
 	mgr.ForceLockState(false)
 
-	// Install multiple apps
+	// Install multiple apps - RFC 20260130: workspace apps use workspace_name
 	for _, name := range []string{"app1", "app2", "app3"} {
 		appDef := &api.AppDefinition{
-			Name: name,
-			Type: "user",
+			WorkspaceName: name,
+			Type:          "user",
 			Services: map[string]api.AppService{
 				"main": {Image: "nginx:alpine", BindPorts: []int{}},
 			},
 			Extensions: map[string]interface{}{"mode": "workspace"},
 		}
-		if _, err := mgr.Install(context.Background(), appDef, ""); err != nil {
+		if _, err := mgr.Install(context.Background(), appDef); err != nil {
 			t.Fatalf("install %s: %v", name, err)
 		}
 	}
@@ -1466,16 +1474,16 @@ func TestAppManager_StopAllApps_ContainerStopErrorsLogged(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Install an app
+	// Install an app - RFC 20260130: workspace apps use workspace_name
 	appDef := &api.AppDefinition{
-		Name: "app1",
-		Type: "user",
+		WorkspaceName: "app1",
+		Type:          "user",
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{}},
 		},
 		Extensions: map[string]interface{}{"mode": "workspace"},
 	}
-	if _, err := mgr.Install(ctx, appDef, ""); err != nil {
+	if _, err := mgr.Install(ctx, appDef); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 
@@ -1504,17 +1512,17 @@ func TestAppManager_StopAllApps_ContextCancellation(t *testing.T) {
 	allowHostStorage(t, mgr)
 	mgr.ForceLockState(false)
 
-	// Install multiple apps
+	// Install multiple apps - RFC 20260130: workspace apps use workspace_name
 	for _, name := range []string{"app1", "app2", "app3", "app4", "app5"} {
 		appDef := &api.AppDefinition{
-			Name: name,
-			Type: "user",
+			WorkspaceName: name,
+			Type:          "user",
 			Services: map[string]api.AppService{
 				"main": {Image: "nginx:alpine", BindPorts: []int{}},
 			},
 			Extensions: map[string]interface{}{"mode": "workspace"},
 		}
-		if _, err := mgr.Install(context.Background(), appDef, ""); err != nil {
+		if _, err := mgr.Install(context.Background(), appDef); err != nil {
 			t.Fatalf("install %s: %v", name, err)
 		}
 	}
@@ -1551,18 +1559,18 @@ func TestAppManager_StopAllApps_Parallelism(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Install 8 apps (more than maxConcurrency=4)
+	// Install 8 apps (more than maxConcurrency=4) - RFC 20260130: workspace apps use workspace_name
 	appNames := []string{"app1", "app2", "app3", "app4", "app5", "app6", "app7", "app8"}
 	for _, name := range appNames {
 		appDef := &api.AppDefinition{
-			Name: name,
-			Type: "user",
+			WorkspaceName: name,
+			Type:          "user",
 			Services: map[string]api.AppService{
 				"main": {Image: "nginx:alpine", BindPorts: []int{}},
 			},
 			Extensions: map[string]interface{}{"mode": "workspace"},
 		}
-		if _, err := mgr.Install(ctx, appDef, ""); err != nil {
+		if _, err := mgr.Install(ctx, appDef); err != nil {
 			t.Fatalf("install %s: %v", name, err)
 		}
 	}

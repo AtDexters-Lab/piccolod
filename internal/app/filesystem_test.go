@@ -41,7 +41,6 @@ func TestStoreAppMetadata(t *testing.T) {
 			CreatedAt:       time.Now(),
 			UpdatedAt:       time.Now(),
 			Definition: &api.AppDefinition{
-				Name:  "test-app",
 				Image: "test:latest",
 			},
 		}
@@ -80,7 +79,6 @@ func TestStoreAppMetadata(t *testing.T) {
 			CreatedAt:       time.Now(),
 			UpdatedAt:       time.Now(),
 			Definition: &api.AppDefinition{
-				Name:  "test-app-2",
 				Image: "test:latest",
 			},
 		}

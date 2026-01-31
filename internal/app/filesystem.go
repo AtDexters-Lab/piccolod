@@ -38,16 +38,17 @@ type FilesystemStateManager struct {
 // Note: The actual enabled state is tracked via symlinks in the enabled/ directory,
 // not in this struct. See EnableApp/DisableApp/IsAppEnabled methods.
 type AppMetadata struct {
-	InstanceID  string `json:"instance_id"`
-	DisplayName string `json:"display_name,omitempty"`
-	AppName     string `json:"app_name"`
-	Status      string `json:"status"` // "created", "running", "stopped", "error"
+	InstanceID string `json:"instance_id"`
+	Status     string `json:"status"` // "created", "running", "stopped", "error"
 	// Container runtime metadata.
 	PrimaryService  string            `json:"primary_service,omitempty"`
 	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`
 	Containers      map[string]string `json:"containers,omitempty"` // service name -> container ID
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
+	// CatalogSource tracks the catalog item name this app was installed from.
+	// Used for icon lookup and update tracking.
+	CatalogSource string `json:"catalog_source,omitempty"`
 }
 
 // NewFilesystemStateManager creates a new filesystem state manager
@@ -160,7 +161,6 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 	// Create AppInstance with embedded definition
 	app := &AppInstance{
 		InstanceID:      metadata.InstanceID,
-		DisplayName:     metadata.DisplayName,
 		Status:          metadata.Status,
 		PrimaryService:  metadata.PrimaryService,
 		NetworkAnchorID: metadata.NetworkAnchorID,
@@ -168,6 +168,7 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 		CreatedAt:       metadata.CreatedAt,
 		UpdatedAt:       metadata.UpdatedAt,
 		Definition:      appDef,
+		CatalogSource:   metadata.CatalogSource,
 	}
 
 	// Fallback: if InstanceID is empty in metadata, use directory name
@@ -262,17 +263,15 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDef
 	}
 
 	// Store metadata.json with runtime fields (atomic write)
-	// AppName is stored for backward compatibility with existing metadata.json files
 	metadata := AppMetadata{
 		InstanceID:      app.InstanceID,
-		DisplayName:     app.DisplayName,
-		AppName:         def.Name,
 		Status:          app.Status,
 		PrimaryService:  app.PrimaryService,
 		NetworkAnchorID: app.NetworkAnchorID,
 		Containers:      app.Containers,
 		CreatedAt:       app.CreatedAt,
 		UpdatedAt:       app.UpdatedAt,
+		CatalogSource:   app.CatalogSource,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -315,11 +314,10 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 	}
 	app.UpdatedAt = time.Now()
 	createdAt := app.CreatedAt
-	displayName := app.DisplayName
-	appName := app.AppName() // Use method to get name from Definition
 	primaryService := app.PrimaryService
 	networkAnchorID := app.NetworkAnchorID
 	containers := app.Containers
+	catalogSource := app.CatalogSource
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem
@@ -328,14 +326,13 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 
 	metadata := AppMetadata{
 		InstanceID:      instanceID,
-		DisplayName:     displayName,
-		AppName:         appName,
 		Status:          app.Status,
 		PrimaryService:  primaryService,
 		NetworkAnchorID: networkAnchorID,
 		Containers:      containers,
 		CreatedAt:       createdAt,
 		UpdatedAt:       app.UpdatedAt,
+		CatalogSource:   catalogSource,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -364,22 +361,15 @@ func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 		return fmt.Errorf("failed to create app directory: %w", err)
 	}
 
-	// Get app name from definition if available
-	appName := ""
-	if app.Definition != nil {
-		appName = app.Definition.Name
-	}
-
 	metadata := AppMetadata{
 		InstanceID:      app.InstanceID,
-		DisplayName:     app.DisplayName,
-		AppName:         appName,
 		Status:          app.Status,
 		PrimaryService:  app.PrimaryService,
 		NetworkAnchorID: app.NetworkAnchorID,
 		Containers:      app.Containers,
 		CreatedAt:       app.CreatedAt,
 		UpdatedAt:       app.UpdatedAt,
+		CatalogSource:   app.CatalogSource,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")

@@ -44,10 +44,10 @@ func TestInstallMultiContainer_PrunesZombiesBeforeCreate(t *testing.T) {
 		t.Fatalf("start zombie container: %v", err)
 	}
 
+	// RFC 20260130: listener name is the app identity, set Primary=true for test
 	def := &api.AppDefinition{
-		Name: "demo",
 		Listeners: []api.AppListener{
-			{Name: "web", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
 		},
 		PrimaryService: "main",
 		Services: map[string]api.AppService{
@@ -57,12 +57,9 @@ func TestInstallMultiContainer_PrunesZombiesBeforeCreate(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	SetDefaults(def)
-	if err := ValidateAppDefinition(def); err != nil {
-		t.Fatalf("ValidateAppDefinition: %v", err)
-	}
 
-	_, err = mgr.installContainerGroup(ctx, def, "demo", "", layout, runtime, []services.ServiceEndpoint{
-		{App: "demo", Name: "web", GuestPort: 8080, HostBind: 18080, PublicPort: 28080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
+	_, err = mgr.installContainerGroup(ctx, def, "demo", layout, runtime, []services.ServiceEndpoint{
+		{App: "demo", Name: "demo", GuestPort: 8080, HostBind: 18080, PublicPort: 28080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
 	})
 	if err != nil {
 		t.Fatalf("installContainerGroup: %v", err)
