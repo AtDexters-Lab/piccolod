@@ -1,5 +1,7 @@
 // Models for LAN device discovery.
 
+import '../utils/string_utils.dart';
+
 class DiscoveredPeer {
   final String hostname;
   final String machineId;
@@ -33,20 +35,7 @@ class DiscoveredPeer {
 
   String get url => 'http://$hostname';
 
-  String get displayName {
-    // "piccolo-abc123.local" -> "Piccolo ABC123"
-    final name = hostname.replaceAll('.local', '');
-    final parts = name.split('-');
-    if (parts.length == 2) {
-      return '${_capitalize(parts[0])} ${parts[1].toUpperCase()}';
-    }
-    return name;
-  }
-
-  static String _capitalize(String s) {
-    if (s.isEmpty) return s;
-    return s[0].toUpperCase() + s.substring(1);
-  }
+  String get displayName => formatHostnameDisplayName(hostname);
 }
 
 class NetworkPeersResponse {
@@ -68,14 +57,32 @@ class NetworkPeersResponse {
 
 class NetworkSelf {
   final String hostname;
+  final String specificHostname;
   final String machineId;
+  final String? model;
+  final String? version;
+  final bool isGatewayLeader;
 
-  NetworkSelf({required this.hostname, required this.machineId});
+  NetworkSelf({
+    required this.hostname,
+    required this.specificHostname,
+    required this.machineId,
+    this.model,
+    this.version,
+    required this.isGatewayLeader,
+  });
 
   factory NetworkSelf.fromJson(Map<String, dynamic> json) {
     return NetworkSelf(
       hostname: json['hostname'] ?? '',
+      specificHostname: json['specific_hostname'] ?? json['hostname'] ?? '',
       machineId: json['machine_id'] ?? '',
+      model: json['model'],
+      version: json['version'],
+      isGatewayLeader: json['is_gateway_leader'] ?? false,
     );
   }
+
+  /// Display name using the specific hostname format.
+  String get displayName => formatHostnameDisplayName(specificHostname);
 }

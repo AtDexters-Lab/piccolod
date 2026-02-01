@@ -6,7 +6,7 @@ import (
 )
 
 func TestNameRegistryAliases(t *testing.T) {
-	reg := newNameRegistry("piccolo")
+	reg := newNameRegistry("piccolo", "piccolo-abc123")
 	reg.SetAliases([]string{"immich", "metrics-immich"})
 
 	names := reg.Names()
@@ -15,6 +15,7 @@ func TestNameRegistryAliases(t *testing.T) {
 		"immich-piccolo.local.",
 		"metrics-immich-piccolo.local.",
 		"piccolo.local.",
+		"piccolo-abc123.local.", // specific hostname always published
 	}
 
 	for _, name := range expect {
@@ -24,8 +25,41 @@ func TestNameRegistryAliases(t *testing.T) {
 	}
 }
 
+func TestNameRegistrySpecificHostnameAlwaysPublished(t *testing.T) {
+	// When baseName differs from specificName, both should be published
+	reg := newNameRegistry("piccolo", "piccolo-abc123")
+	names := reg.Names()
+
+	if !contains(names, "piccolo.local.") {
+		t.Fatalf("base hostname should be published, got %v", names)
+	}
+	if !contains(names, "piccolo-abc123.local.") {
+		t.Fatalf("specific hostname should always be published, got %v", names)
+	}
+
+	// After conflict resolution, baseName changes but specific stays
+	reg.SetBaseName("piccolo-abc123")
+	names = reg.Names()
+
+	// Should still have piccolo-abc123.local (now as baseName, but not duplicated)
+	if !contains(names, "piccolo-abc123.local.") {
+		t.Fatalf("specific hostname should still be published, got %v", names)
+	}
+	// Should only have one entry for piccolo-abc123.local (no duplicate)
+	count := 0
+	for _, n := range names {
+		if n == "piccolo-abc123.local." {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("specific hostname should appear exactly once, got %d in %v", count, names)
+	}
+}
+
 func TestManagerSetHostAliasesFiltersInvalid(t *testing.T) {
 	manager := NewManager()
+	baseName := manager.baseName // e.g., "piccolo-abc123"
 
 	err := manager.SetHostAliases([]string{"immich", "bad.label", "metrics-immich", "-bad"})
 	if err == nil {
@@ -42,10 +76,11 @@ func TestManagerSetHostAliasesFiltersInvalid(t *testing.T) {
 
 	fqdns := manager.AdvertisedNames()
 	// RFC 20260122 §4.1: 2-level mDNS format uses hyphen separator
+	// Now baseName is piccolo-<machineId>, not just "piccolo"
 	expect := []string{
-		"immich-piccolo.local.",
-		"metrics-immich-piccolo.local.",
-		"piccolo.local.",
+		"immich-" + baseName + ".local.",
+		"metrics-immich-" + baseName + ".local.",
+		baseName + ".local.",
 	}
 	for _, name := range expect {
 		if !contains(fqdns, name) {

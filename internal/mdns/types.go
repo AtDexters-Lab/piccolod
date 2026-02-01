@@ -143,6 +143,10 @@ type Manager struct {
 	deviceModel     string
 	bootTime        time.Time
 
+	// Gateway leadership
+	gatewayLeader    *GatewayLeader
+	specificHostname string // Always "piccolo-<machineId>.local"
+
 	// Socket factories (overrideable for tests)
 	ipv4SocketFactory func(*net.Interface) (*net.UDPConn, error)
 	ipv6SocketFactory func(*net.Interface) (*net.UDPConn, error)

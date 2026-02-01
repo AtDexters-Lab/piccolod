@@ -14,17 +14,20 @@ const localTLD = "local"
 
 // NameRegistry tracks the base hostname and per-app alias labels.
 type NameRegistry struct {
-	mu       sync.RWMutex
-	baseName string
-	aliases  map[string]struct{}
-	fqdns    map[string]struct{}
-	snapshot []string
+	mu              sync.RWMutex
+	baseName        string            // Current base name (may be "piccolo" or "piccolo-<machineId>" after conflict)
+	specificName    string            // Always "piccolo-<machineId>" - published regardless of conflict state
+	aliases         map[string]struct{}
+	fqdns           map[string]struct{}
+	snapshot        []string
+	includeGateway  bool              // Whether to include piccolo.local (gateway leader)
 }
 
-func newNameRegistry(base string) *NameRegistry {
+func newNameRegistry(base, specificName string) *NameRegistry {
 	reg := &NameRegistry{
-		baseName: base,
-		aliases:  make(map[string]struct{}),
+		baseName:     base,
+		specificName: specificName,
+		aliases:      make(map[string]struct{}),
 	}
 	reg.rebuildLocked()
 	return reg
@@ -97,13 +100,68 @@ func (r *NameRegistry) SetAliases(labels []string) {
 	r.rebuildLocked()
 }
 
-func (r *NameRegistry) rebuildLocked() {
-	fqdns := make(map[string]struct{}, len(r.aliases)+1)
-	snapshot := make([]string, 0, len(r.aliases)+1)
+// AddGatewayHostname adds piccolo.local to the advertised hostnames.
+// This is called when the device becomes the gateway leader.
+func (r *NameRegistry) AddGatewayHostname() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.includeGateway {
+		return // Already included
+	}
+	r.includeGateway = true
+	r.rebuildLocked()
+	log.Printf("[mdns] Gateway hostname added: piccolo.local")
+}
 
+// RemoveGatewayHostname removes piccolo.local from the advertised hostnames.
+// This is called when the device yields gateway leadership.
+func (r *NameRegistry) RemoveGatewayHostname() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.includeGateway {
+		return // Already excluded
+	}
+	r.includeGateway = false
+	r.rebuildLocked()
+	log.Printf("[mdns] Gateway hostname removed: piccolo.local")
+}
+
+// IncludesGateway returns true if piccolo.local is currently advertised.
+func (r *NameRegistry) IncludesGateway() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.includeGateway
+}
+
+func (r *NameRegistry) rebuildLocked() {
+	capacity := len(r.aliases) + 3 // base + specific + possible gateway + aliases
+	fqdns := make(map[string]struct{}, capacity)
+	snapshot := make([]string, 0, capacity)
+
+	// Primary hostname based on conflict state (may be "piccolo" or "piccolo-<machineId>")
 	baseFQDN := r.baseName + "." + localTLD + "."
 	fqdns[baseFQDN] = struct{}{}
 	snapshot = append(snapshot, baseFQDN)
+
+	// Specific hostname: always publish piccolo-<machineId>.local regardless of conflict state
+	// This ensures the device is always reachable via its unique hostname
+	if r.specificName != "" && r.specificName != r.baseName {
+		specificFQDN := r.specificName + "." + localTLD + "."
+		if _, exists := fqdns[specificFQDN]; !exists {
+			fqdns[specificFQDN] = struct{}{}
+			snapshot = append(snapshot, specificFQDN)
+		}
+	}
+
+	// Gateway hostname: piccolo.local (only when leader)
+	if r.includeGateway {
+		gatewayFQDN := "piccolo." + localTLD + "."
+		// Only add if not already the base (avoid duplicate if base is "piccolo")
+		if _, exists := fqdns[gatewayFQDN]; !exists {
+			fqdns[gatewayFQDN] = struct{}{}
+			snapshot = append(snapshot, gatewayFQDN)
+		}
+	}
 
 	// RFC 20260122 §4.1: 2-level mDNS format uses hyphen separator
 	// Before: <label>.<baseName>.<localTLD>. (e.g., immich.piccolo.local.)

@@ -4,6 +4,7 @@ import (
 	"net"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -95,6 +96,23 @@ func (r *PeerRegistry) GetPeer(machineID string) (DiscoveredPeer, bool) {
 	return *peer, true
 }
 
+// GetPeerByHostname returns a copy of a peer by hostname (case-insensitive).
+// Used for PTR goodbye handling where only hostname is available.
+func (r *PeerRegistry) GetPeerByHostname(hostname string) (DiscoveredPeer, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	hostname = strings.ToLower(strings.TrimSuffix(hostname, "."))
+	for _, peer := range r.peers {
+		peerHost := strings.ToLower(strings.TrimSuffix(peer.Hostname, "."))
+		if peerHost == hostname {
+			return *peer, true
+		}
+	}
+
+	return DiscoveredPeer{}, false
+}
+
 // List returns a copy of all peers sorted by hostname.
 func (r *PeerRegistry) List() []DiscoveredPeer {
 	r.mu.RLock()
@@ -158,6 +176,14 @@ func (m *Manager) GetPeer(machineID string) (DiscoveredPeer, bool) {
 		return DiscoveredPeer{}, false
 	}
 	return m.peerRegistry.GetPeer(machineID)
+}
+
+// GetPeerByHostname returns a specific peer by hostname.
+func (m *Manager) GetPeerByHostname(hostname string) (DiscoveredPeer, bool) {
+	if m.peerRegistry == nil {
+		return DiscoveredPeer{}, false
+	}
+	return m.peerRegistry.GetPeerByHostname(hostname)
 }
 
 // MachineID returns the local machine's ID.

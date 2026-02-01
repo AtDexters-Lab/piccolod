@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	peerDiscoveryInterval = 60 * time.Second  // Time between PTR queries
-	peerTimeout           = 180 * time.Second // 3 missed intervals
+	peerDiscoveryInterval = 60 * time.Second // Time between PTR queries
+	// peerTimeout uses PeerOnlineThreshold from gateway_leader.go (180s = 3 missed intervals)
 )
 
 // peerDiscoveryLoop periodically sends PTR queries and cleans up stale peers.
@@ -112,6 +112,7 @@ func (m *Manager) sendPeerDiscoveryQuery() {
 
 // handlePeerDiscoveryResponse processes mDNS responses for peer discovery.
 // This looks for PTR, SRV, and TXT records advertising _piccolo._tcp services.
+// It also detects goodbye announcements (TTL=0) for immediate leader handoff.
 func (m *Manager) handlePeerDiscoveryResponse(msg *dns.Msg, clientAddr *net.UDPAddr) {
 	if m.peerRegistry == nil {
 		return
@@ -121,6 +122,9 @@ func (m *Manager) handlePeerDiscoveryResponse(msg *dns.Msg, clientAddr *net.UDPA
 	if m.isSelfResponse(clientAddr.IP) {
 		return
 	}
+
+	// Check for goodbye announcements (TTL=0) - handle these immediately for fast leader handoff
+	m.checkForGoodbyeAnnouncements(msg)
 
 	serviceFQDN := m.ServiceFQDN()
 
@@ -259,6 +263,11 @@ func (m *Manager) processDiscoveredInstance(info *peerInfo, fallbackIP net.IP) {
 		peer, _ := m.peerRegistry.GetPeer(machineID)
 		log.Printf("DISCOVERY: New peer discovered - ID: %s, Hostname: %s, Model: %s, Version: %s",
 			peer.MachineID, peer.Hostname, peer.Model, peer.Version)
+
+		// Notify gateway leader of new peer for leadership evaluation
+		if m.gatewayLeader != nil {
+			m.gatewayLeader.OnPeerDiscovered(peer)
+		}
 	}
 }
 
@@ -268,10 +277,104 @@ func (m *Manager) cleanupStalePeers() {
 		return
 	}
 
-	cutoff := time.Now().Add(-peerTimeout)
+	cutoff := time.Now().Add(-PeerOnlineThreshold)
+
+	// Get list of stale peers before removing for gateway leader notification
+	var staleMachineIDs []string
+	if m.gatewayLeader != nil {
+		for _, peer := range m.peerRegistry.List() {
+			if peer.LastSeen.Before(cutoff) {
+				staleMachineIDs = append(staleMachineIDs, peer.MachineID)
+			}
+		}
+	}
+
 	removed := m.peerRegistry.RemoveStale(cutoff)
 
 	if removed > 0 {
 		log.Printf("DISCOVERY: Removed %d stale peer(s)", removed)
+
+		// Notify gateway leader about stale peer removal for leadership re-evaluation
+		if m.gatewayLeader != nil {
+			for _, machineID := range staleMachineIDs {
+				m.gatewayLeader.OnPeerTimeout(machineID)
+			}
+		}
+	}
+}
+
+// handlePeerGoodbye processes a goodbye announcement (TTL=0) from a peer.
+// This triggers immediate leadership re-evaluation for faster handoff.
+func (m *Manager) handlePeerGoodbye(machineID string) {
+	if machineID == "" || machineID == m.machineID {
+		return
+	}
+
+	log.Printf("DISCOVERY: Peer goodbye received - ID: %s", machineID)
+
+	// Notify gateway leader for immediate leadership re-evaluation
+	if m.gatewayLeader != nil {
+		m.gatewayLeader.OnPeerGoodbye(machineID)
+	}
+}
+
+// checkForGoodbyeAnnouncements scans mDNS response for TTL=0 records indicating peer departure.
+// Per RFC 6762, TTL=0 is a "goodbye" announcement meaning the record is no longer valid.
+func (m *Manager) checkForGoodbyeAnnouncements(msg *dns.Msg) {
+	if msg == nil {
+		return
+	}
+
+	serviceFQDN := m.ServiceFQDN()
+
+	// Check all answer records for TTL=0 (goodbye)
+	for _, rr := range msg.Answer {
+		if rr.Header().Ttl != 0 {
+			continue
+		}
+
+		// Look for TXT records with machine ID (most reliable identifier)
+		if txt, ok := rr.(*dns.TXT); ok {
+			// Check if it's a Piccolo service record
+			name := normalizeFQDN(txt.Hdr.Name)
+			if !strings.HasSuffix(name, normalizeFQDN(serviceFQDN)) {
+				continue
+			}
+
+			// Parse TXT to get machine ID
+			metadata := parseTXTRecord(txt.Txt)
+			if metadata != nil && metadata.MachineID != "" && metadata.MachineID != m.machineID {
+				m.handlePeerGoodbye(metadata.MachineID)
+			}
+		}
+
+		// Also check PTR goodbye for service deregistration
+		if ptr, ok := rr.(*dns.PTR); ok {
+			if !strings.EqualFold(ptr.Hdr.Name, serviceFQDN) {
+				continue
+			}
+			// Instance FQDN from PTR can help identify which peer left
+			// The format is: <hostname>._piccolo._tcp.local
+			instanceFQDN := normalizeFQDN(ptr.Ptr)
+			if instanceFQDN == "" {
+				continue
+			}
+
+			// Extract hostname from instance FQDN
+			// e.g., "piccolo-abc123._piccolo._tcp.local." -> "piccolo-abc123"
+			hostname := strings.TrimSuffix(instanceFQDN, "."+normalizeFQDN(serviceFQDN))
+			hostname = strings.TrimSuffix(hostname, ".")
+			if hostname == "" || hostname == instanceFQDN {
+				continue
+			}
+
+			// Try to find the peer by hostname and trigger goodbye
+			if peer, found := m.GetPeerByHostname(hostname); found {
+				log.Printf("DISCOVERY: PTR goodbye for instance %s (machine ID: %s)", instanceFQDN, peer.MachineID)
+				m.handlePeerGoodbye(peer.MachineID)
+			} else {
+				log.Printf("DISCOVERY: PTR goodbye for unknown instance: %s", instanceFQDN)
+			}
+		}
 	}
 }

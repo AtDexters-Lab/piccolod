@@ -25,8 +25,12 @@ type networkPeersResponse struct {
 }
 
 type networkSelfResponse struct {
-	Hostname  string `json:"hostname"`
-	MachineID string `json:"machine_id"`
+	Hostname         string `json:"hostname"`
+	SpecificHostname string `json:"specific_hostname"` // Always piccolo-<machineId>.local
+	MachineID        string `json:"machine_id"`
+	Model            string `json:"model,omitempty"`
+	Version          string `json:"version,omitempty"`
+	IsGatewayLeader  bool   `json:"is_gateway_leader"`
 }
 
 // handleNetworkPeers returns discovered Piccolo devices on the LAN.
@@ -56,10 +60,18 @@ func (s *GinServer) handleNetworkPeers(c *gin.Context) {
 	var self *networkSelfResponse
 	hostname := s.mdnsManager.Hostname()
 	machineID := s.mdnsManager.MachineID()
+	specificHostname := s.mdnsManager.SpecificHostname()
+	isGatewayLeader := s.mdnsManager.IsGatewayLeader()
+	model := s.mdnsManager.DeviceModel()
+	version := s.mdnsManager.Version()
 	if hostname != "" {
 		self = &networkSelfResponse{
-			Hostname:  hostname,
-			MachineID: machineID,
+			Hostname:         hostname,
+			SpecificHostname: specificHostname,
+			MachineID:        machineID,
+			Model:            model,
+			Version:          version,
+			IsGatewayLeader:  isGatewayLeader,
 		}
 	}
 
