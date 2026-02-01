@@ -125,14 +125,6 @@ class RemoteDashboard extends StatelessWidget {
         const SizedBox(width: 16),
         Expanded(
           child: _InfoCard(
-            label: "Base Domain (TLD)",
-            value: status.tld ?? "Unknown",
-            icon: Icons.public,
-          ),
-        ),
-        const SizedBox(width: 16),
-        Expanded(
-          child: _InfoCard(
             label: "Nexus Relay",
             value: status.endpoint ?? "Unknown",
             icon: Icons.router,

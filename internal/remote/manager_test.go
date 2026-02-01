@@ -81,8 +81,6 @@ func TestRunPreflightSuccess(t *testing.T) {
 	err = m.Configure(ConfigureRequest{
 		Endpoint:       "wss://nexus.example.com/connect",
 		DeviceSecret:   "secret",
-		Solver:         "http-01",
-		TLD:            "example.com",
 		PortalHostname: "portal.example.com",
 	})
 	if err != nil {
@@ -171,15 +169,13 @@ func TestManager_NexusAdapterLifecycle(t *testing.T) {
 	if err := m.Configure(ConfigureRequest{
 		Endpoint:       "wss://nexus.example.com/connect",
 		DeviceSecret:   "secret",
-		Solver:         "http-01",
-		TLD:            "example.com",
 		PortalHostname: "portal.example.com",
 	}); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
 	waitForCertNotPending(t, m, "portal", 200*time.Millisecond)
-	if cfg := adapter.getConfig(); cfg.TLD != "example.com" {
-		t.Fatalf("expected TLD to propagate, got %s", cfg.TLD)
+	if cfg := adapter.getConfig(); cfg.PortalHostname != "portal.example.com" {
+		t.Fatalf("expected PortalHostname to propagate, got %s", cfg.PortalHostname)
 	}
 
 	select {
@@ -208,13 +204,11 @@ func TestRunPreflightFailures(t *testing.T) {
 	}
 	m := newTestManagerWithDeps(t, storage, dir, dial, res, fixedNow(time.Unix(2, 0)))
 
+	// Configure with HTTP-01 (user-managed mode)
 	_ = m.Configure(ConfigureRequest{
 		Endpoint:       "wss://nexus.example.com/connect",
 		DeviceSecret:   "secret",
-		Solver:         "dns-01",
-		TLD:            "example.com",
 		PortalHostname: "portal.example.com",
-		DNSProvider:    "cloudflare",
 	})
 	waitForCertNotPending(t, m, "portal", 200*time.Millisecond)
 
@@ -247,7 +241,7 @@ func waitForCertNotPending(t *testing.T, m *Manager, id string, timeout time.Dur
 	}
 }
 
-func TestConfigure_DNS01SeedsWildcardWithApex(t *testing.T) {
+func TestConfigureManaged_DNS01SeedsWildcardWithApex(t *testing.T) {
 	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
 	dir := t.TempDir()
 	storage, err := newFileStorage(dir)
@@ -256,15 +250,22 @@ func TestConfigure_DNS01SeedsWildcardWithApex(t *testing.T) {
 	}
 	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(4, 0)))
 
-	if err := m.Configure(ConfigureRequest{
-		Endpoint:       "wss://nexus.example.com/connect",
-		DeviceSecret:   "secret",
-		Solver:         "dns-01",
-		TLD:            "example.com",
-		PortalHostname: "portal.example.com",
-		DNSProvider:    "cloudflare",
+	// ConfigureManaged uses DNS-01 via orchestrator (managed mode)
+	if err := m.ConfigureManaged(ManagedConfigureRequest{
+		OrchestratorEndpoint: "https://orchestrator.example.com",
+		DeviceToken:          "secret",
+		PortalHostname:       "portal.example.com",
 	}); err != nil {
-		t.Fatalf("configure: %v", err)
+		t.Fatalf("configure managed: %v", err)
+	}
+
+	// Check that managed mode is set
+	st := m.Status()
+	if !st.Managed {
+		t.Fatalf("expected managed=true, got managed=%v", st.Managed)
+	}
+	if st.Solver != "dns-01" {
+		t.Fatalf("expected solver=dns-01, got solver=%s", st.Solver)
 	}
 
 	var wildcard *Certificate
@@ -280,6 +281,41 @@ func TestConfigure_DNS01SeedsWildcardWithApex(t *testing.T) {
 	}
 	if len(wildcard.Domains) != 2 || wildcard.Domains[0] != "*.portal.example.com" || wildcard.Domains[1] != "portal.example.com" {
 		t.Fatalf("unexpected wildcard domains: %v", wildcard.Domains)
+	}
+}
+
+func TestConfigure_HTTP01NoWildcard(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(5, 0)))
+
+	// Configure with HTTP-01 (user-managed mode) - no wildcard support
+	if err := m.Configure(ConfigureRequest{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		PortalHostname: "portal.example.com",
+	}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	// Check that managed mode is false
+	st := m.Status()
+	if st.Managed {
+		t.Fatalf("expected managed=false, got managed=%v", st.Managed)
+	}
+	if st.Solver != "http-01" {
+		t.Fatalf("expected solver=http-01, got solver=%s", st.Solver)
+	}
+
+	// Should NOT have wildcard certificate in user-managed mode
+	for _, c := range m.ListCertificates() {
+		if c.ID == "wildcard" {
+			t.Fatalf("unexpected wildcard certificate in HTTP-01 mode")
+		}
 	}
 }
 

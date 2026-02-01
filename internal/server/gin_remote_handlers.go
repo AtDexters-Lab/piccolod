@@ -12,17 +12,21 @@ import (
 	"piccolod/internal/remote"
 )
 
+// remoteConfigureRequest is for user-managed mode (HTTP-01 only)
 type remoteConfigureRequest struct {
-	Endpoint       string            `json:"endpoint"`
-	DeviceSecret   string            `json:"device_secret"`
-	Solver         string            `json:"solver"`
-	TLD            string            `json:"tld"`
-	PortalHostname string            `json:"portal_hostname"`
-	DNSProvider    string            `json:"dns_provider"`
-	DNSCredentials map[string]string `json:"dns_credentials"`
+	Endpoint       string `json:"endpoint"`
+	DeviceSecret   string `json:"device_secret"`
+	PortalHostname string `json:"portal_hostname"`
 }
 
-// handleRemoteConfigure handles POST /api/v1/remote/configure
+// remoteManagedConfigureRequest is for managed mode (DNS-01 via orchestrator)
+type remoteManagedConfigureRequest struct {
+	OrchestratorEndpoint string `json:"orchestrator_endpoint"`
+	DeviceToken          string `json:"device_token"`
+	PortalHostname       string `json:"portal_hostname"`
+}
+
+// handleRemoteConfigure handles POST /api/v1/remote/configure (user-managed mode, HTTP-01 only)
 func (s *GinServer) handleRemoteConfigure(c *gin.Context) {
 	var req remoteConfigureRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -32,11 +36,7 @@ func (s *GinServer) handleRemoteConfigure(c *gin.Context) {
 	configureReq := remote.ConfigureRequest{
 		Endpoint:       req.Endpoint,
 		DeviceSecret:   req.DeviceSecret,
-		Solver:         req.Solver,
-		TLD:            req.TLD,
 		PortalHostname: req.PortalHostname,
-		DNSProvider:    req.DNSProvider,
-		DNSCredentials: req.DNSCredentials,
 	}
 	if s.dispatcher != nil {
 		resp, err := s.dispatcher.Dispatch(c.Request.Context(), remote.ConfigureCommand{Req: configureReq})
@@ -63,9 +63,9 @@ func (s *GinServer) handleRemoteConfigure(c *gin.Context) {
 		}
 	}
 	s.refreshRemoteRuntime()
-	// For HTTP-01 solver (wildcard unsupported), proactively issue per-listener certs
-	if strings.EqualFold(configureReq.Solver, "http-01") && strings.TrimSpace(configureReq.PortalHostname) != "" && s.remoteManager != nil {
-		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(configureReq.PortalHostname)), ".")
+	// User-managed mode uses HTTP-01 (wildcard unsupported), proactively issue per-listener certs
+	if strings.TrimSpace(req.PortalHostname) != "" && s.remoteManager != nil {
+		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(req.PortalHostname)), ".")
 		hosts := map[string]struct{}{}
 		for _, ep := range s.serviceManager.GetAll() {
 			// Only queue certs for HTTP/WS listeners that have host-based routing
@@ -81,6 +81,47 @@ func (s *GinServer) handleRemoteConfigure(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "remote configured"})
+}
+
+// handleRemoteManagedConfigure handles POST /api/v1/remote/managed/configure (managed mode, DNS-01 via orchestrator)
+func (s *GinServer) handleRemoteManagedConfigure(c *gin.Context) {
+	var req remoteManagedConfigureRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeGinError(c, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	configureReq := remote.ManagedConfigureRequest{
+		OrchestratorEndpoint: req.OrchestratorEndpoint,
+		DeviceToken:          req.DeviceToken,
+		PortalHostname:       req.PortalHostname,
+	}
+	if s.dispatcher != nil {
+		resp, err := s.dispatcher.Dispatch(c.Request.Context(), remote.ManagedConfigureCommand{Req: configureReq})
+		if err != nil {
+			if errors.Is(err, remote.ErrLocked) {
+				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
+				return
+			}
+			writeGinError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if _, ok := resp.(remote.ManagedConfigureResponse); !ok {
+			writeGinError(c, http.StatusInternalServerError, "unexpected response from remote dispatcher")
+			return
+		}
+	} else {
+		if err := s.remoteManager.ConfigureManaged(configureReq); err != nil {
+			if errors.Is(err, remote.ErrLocked) {
+				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
+				return
+			}
+			writeGinError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	s.refreshRemoteRuntime()
+	// Managed mode uses DNS-01 with wildcard cert, no need to queue per-listener certs
+	c.JSON(http.StatusOK, gin.H{"message": "remote configured (managed)"})
 }
 
 func (s *GinServer) resolvePortalPort() int {
@@ -159,7 +200,7 @@ func (s *GinServer) handleRemotePreflight(c *gin.Context) {
 	var result remote.PreflightResult
 
 	// Check if body is provided for stateless preflight
-	var req remote.ConfigureRequest
+	var req remoteConfigureRequest
 	var candidate *remote.Config
 
 	// BindJSON returns error if body is empty or invalid, but we want to support empty body (use active config)
@@ -167,20 +208,14 @@ func (s *GinServer) handleRemotePreflight(c *gin.Context) {
 		if err := c.ShouldBindJSON(&req); err == nil {
 			// Only treat as candidate if it has content.
 			// Clients sending {} should be treated as "check active config"
-			if req.Endpoint != "" || req.TLD != "" || req.PortalHostname != "" {
-				// Map request to config candidate
+			if req.Endpoint != "" || req.PortalHostname != "" {
+				// Map request to config candidate (user-managed mode, HTTP-01)
 				candidate = &remote.Config{
 					Endpoint:       req.Endpoint,
 					DeviceSecret:   req.DeviceSecret,
-					Solver:         req.Solver,
-					TLD:            req.TLD,
+					Solver:         "http-01", // User-managed mode is always HTTP-01
 					PortalHostname: req.PortalHostname,
-					DNSProvider:    req.DNSProvider,
-					DNSCredentials: req.DNSCredentials,
-				}
-				// Sanitize/Defaults similar to Configure()
-				if candidate.Solver == "" {
-					candidate.Solver = "http-01"
+					Managed:        false,
 				}
 			}
 		}
@@ -333,7 +368,6 @@ func (s *GinServer) handleRemoteEvents(c *gin.Context) {
 
 type guideVerifyRequest struct {
 	Endpoint       string `json:"endpoint"`
-	TLD            string `json:"tld"`
 	PortalHostname string `json:"portal_hostname"`
 	JWTSecret      string `json:"jwt_secret"`
 }
@@ -347,7 +381,6 @@ func (s *GinServer) handleRemoteGuideVerify(c *gin.Context) {
 	}
 	verification := remote.GuideVerification{
 		Endpoint:       req.Endpoint,
-		TLD:            req.TLD,
 		PortalHostname: req.PortalHostname,
 		JWTSecret:      req.JWTSecret,
 	}
@@ -383,34 +416,3 @@ func (s *GinServer) handleRemoteGuideInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, info)
 }
 
-// handleRemoteDNSProviders returns the supported DNS provider metadata.
-func (s *GinServer) handleRemoteDNSProviders(c *gin.Context) {
-	providers := []gin.H{
-		{
-			"id":       "cloudflare",
-			"name":     "Cloudflare",
-			"docs_url": "https://go-acme.github.io/lego/dns/cloudflare/",
-			"fields": []gin.H{
-				{"id": "api_token", "label": "API Token", "secret": true},
-			},
-		},
-		{
-			"id":       "route53",
-			"name":     "AWS Route53",
-			"docs_url": "https://go-acme.github.io/lego/dns/route53/",
-			"fields": []gin.H{
-				{"id": "access_key", "label": "Access Key ID"},
-				{"id": "secret_key", "label": "Secret Access Key", "secret": true},
-			},
-		},
-		{
-			"id":       "gandi",
-			"name":     "Gandi.net LiveDNS",
-			"docs_url": "https://go-acme.github.io/lego/dns/gandiv5/",
-			"fields": []gin.H{
-				{"id": "api_key", "label": "API Key", "secret": true},
-			},
-		},
-	}
-	c.JSON(http.StatusOK, gin.H{"providers": providers})
-}

@@ -27,7 +27,6 @@ class RemoteController extends ChangeNotifier {
   List<RemoteAlias> aliases = [];
   List<RemoteCertificate> certificates = [];
   List<ServiceEndpoint> services = [];
-  List<RemoteDNSProvider> dnsProviders = [];
 
   // Setup Wizard State
   int wizardStep = 0;
@@ -153,6 +152,15 @@ class RemoteController extends ChangeNotifier {
 
   // --- Setup Wizard ---
 
+  /// Seeds pending config from current status (used when resuming wizard)
+  void seedPendingConfigFromStatus() {
+    if (status == null) return;
+    if (status!.endpoint != null) _pendingConfig['endpoint'] = status!.endpoint;
+    if (status!.portalHostname != null) _pendingConfig['portal_hostname'] = status!.portalHostname;
+    // Note: device_secret is not returned in status for security reasons
+    // When resuming, the backend will use the existing stored secret
+  }
+
   Future<void> loadNexusGuide() async {
     try {
       guideInfo = await _service.getNexusGuide();
@@ -165,23 +173,21 @@ class RemoteController extends ChangeNotifier {
     }
   }
 
-  Future<void> verifyNexusGuide(String endpoint, String tld, String portal, String secret) async {
+  Future<void> verifyNexusGuide(String endpoint, String portal, String secret) async {
     try {
       // Validate with backend (stateless)
       await _service.verifyNexusGuide({
         'endpoint': endpoint,
-        'tld': tld,
         'portal_hostname': portal,
         'jwt_secret': secret,
       });
       if (_disposed) return;
-      
+
       // Store in memory for subsequent steps
       _pendingConfig['endpoint'] = endpoint;
-      _pendingConfig['tld'] = tld;
       _pendingConfig['portal_hostname'] = portal;
       _pendingConfig['device_secret'] = secret;
-      
+
       wizardStep = 1; // Move to preflight
       notifyListeners();
     } catch (e) {
@@ -200,16 +206,10 @@ class RemoteController extends ChangeNotifier {
       Map<String, dynamic>? configPayload;
       if (_pendingConfig.isNotEmpty && wizardStep > 0) {
         configPayload = Map.from(_pendingConfig);
-        // Ensure solver is set for validation if not yet selected (default to http-01 for check)
-        configPayload.putIfAbsent('solver', () => 'http-01');
       }
 
       preflightChecks = await _service.runPreflight(configPayload);
       if (_disposed) return;
-      bool allPassed = preflightChecks.every((c) => c.status == 'pass' || c.status == 'warn');
-      if (allPassed && preflightChecks.isNotEmpty) {
-        await fetchDNSProviders();
-      }
     } catch (e) {
       if (_disposed) return;
       error = "Preflight failed: $e";
@@ -221,30 +221,18 @@ class RemoteController extends ChangeNotifier {
     }
   }
 
-  Future<void> fetchDNSProviders() async {
-    try {
-      dnsProviders = await _service.getDNSProviders();
-      if (_disposed) return;
-      notifyListeners();
-    } catch (e) {
-      debugPrint("Failed to fetch DNS providers: $e");
-    }
-  }
-
-  Future<void> submitConfiguration(Map<String, dynamic> partialConfig) async {
+  Future<void> submitConfiguration() async {
     isSubmittingConfig = true;
     notifyListeners();
     try {
-      // Merge partial config (solver, dns_creds) with pending config (endpoint, secret)
-      final finalConfig = Map<String, dynamic>.from(_pendingConfig);
-      finalConfig.addAll(partialConfig);
-      
-      await _service.configure(finalConfig);
+      // Submit the pending config (endpoint, device_secret, portal_hostname)
+      // HTTP-01 solver is implicit on the backend for user-managed mode
+      await _service.configure(_pendingConfig);
       if (_disposed) return;
-      
+
       // Clear pending state on success
       _pendingConfig.clear();
-      
+
       await refresh();
       if (_disposed) return;
       wizardStep = 0;

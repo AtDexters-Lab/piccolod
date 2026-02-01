@@ -45,7 +45,7 @@ func NewTlsMux(svc *ServiceManager) *TlsMux {
 	return &TlsMux{services: svc, stopCh: make(chan struct{})}
 }
 
-// UpdateConfig sets portal hostname, TLD, and portal upstream port.
+// UpdateConfig sets portal hostname, domain, and portal upstream port.
 func (m *TlsMux) UpdateConfig(portalHost, domain string, portalPort int) {
 	m.mu.Lock()
 	m.portalHost = strings.TrimSuffix(strings.ToLower(portalHost), ".")

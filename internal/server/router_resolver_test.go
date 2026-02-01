@@ -30,7 +30,7 @@ func TestServiceRemoteResolver(t *testing.T) {
 	}
 	webEndpoint := eps[0]
 
-	resolver.UpdateConfig(nexusclient.Config{PortalHostname: "portal.example.com", TLD: "example.com"})
+	resolver.UpdateConfig(nexusclient.Config{PortalHostname: "portal.example.com"})
 
 	resolver.SetTlsMuxPort(9090)
 

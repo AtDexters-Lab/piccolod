@@ -6,8 +6,7 @@ import "context"
 type Config struct {
 	Endpoint       string
 	DeviceSecret   string
-	PortalHostname string
-	TLD            string
+	PortalHostname string // Fully-qualified hostname (e.g., portal.home.example.com)
 }
 
 // Adapter provides a lifecycle wrapper around the nexus backend client.

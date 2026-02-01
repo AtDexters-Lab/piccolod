@@ -63,8 +63,6 @@ func TestPortalOriginForRequest_RemoteLoopbackUsesPortalHostname(t *testing.T) {
 	if err := rm.Configure(remote.ConfigureRequest{
 		Endpoint:       "wss://nexus.example.com/connect",
 		DeviceSecret:   "secret",
-		Solver:         "http-01",
-		TLD:            "example.com",
 		PortalHostname: "portal.example.com",
 	}); err != nil {
 		t.Fatalf("configure remote: %v", err)

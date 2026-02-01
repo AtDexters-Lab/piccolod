@@ -34,7 +34,7 @@ func TestRemotePortalOverTLSEmitsHSTS(t *testing.T) {
 	cert := mustSelfSignedCert(t, host)
 	srv.tlsMux.SetCertProvider(&staticCertProvider{cert: cert})
 
-	runtimeStatus := remote.Status{Enabled: true, PortalHostname: host, TLD: "example.com"}
+	runtimeStatus := remote.Status{Enabled: true, PortalHostname: host}
 	srv.applyRemoteRuntimeFromStatus(runtimeStatus)
 
 	port := srv.tlsMux.Port()
@@ -76,9 +76,9 @@ func TestRemotePortalHTTPRedirectsToHTTPS(t *testing.T) {
 
 	const host = "portal.example.com"
 
-	runtimeStatus := remote.Status{Enabled: true, PortalHostname: host, TLD: "example.com"}
+	runtimeStatus := remote.Status{Enabled: true, PortalHostname: host}
 	srv.applyRemoteRuntimeFromStatus(runtimeStatus)
-	srv.remoteResolver.UpdateConfig(nexusclient.Config{PortalHostname: host, TLD: "example.com"})
+	srv.remoteResolver.UpdateConfig(nexusclient.Config{PortalHostname: host})
 
 	deadline := time.Now().Add(200 * time.Millisecond)
 	for !srv.remoteResolver.IsRemoteHostname(host) && time.Now().Before(deadline) {
@@ -97,7 +97,6 @@ func TestRemotePortalHTTPRedirectsToHTTPS(t *testing.T) {
 	srv.applyRemoteRuntimeFromStatus(remote.Status{
 		Enabled:        true,
 		PortalHostname: host,
-		TLD:            "example.com",
 	})
 
 	w := httptest.NewRecorder()
@@ -120,9 +119,9 @@ func TestLocalHostSkipsHTTPSRedirect(t *testing.T) {
 
 	const host = "piccolo.local"
 
-	runtimeStatus := remote.Status{Enabled: true, PortalHostname: host, TLD: "local"}
+	runtimeStatus := remote.Status{Enabled: true, PortalHostname: host}
 	srv.applyRemoteRuntimeFromStatus(runtimeStatus)
-	srv.remoteResolver.UpdateConfig(nexusclient.Config{PortalHostname: host, TLD: "local"})
+	srv.remoteResolver.UpdateConfig(nexusclient.Config{PortalHostname: host})
 
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)

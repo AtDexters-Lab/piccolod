@@ -994,6 +994,7 @@ func (s *GinServer) setupGinRoutes() {
 		remote := admin.Group("/remote")
 		{
 			remote.POST("/configure", s.handleRemoteConfigure)
+			remote.POST("/managed/configure", s.handleRemoteManagedConfigure)
 			remote.POST("/disable", s.handleRemoteDisable)
 			remote.POST("/rotate", s.handleRemoteRotate)
 			remote.POST("/preflight", s.handleRemotePreflight)
@@ -1003,7 +1004,6 @@ func (s *GinServer) setupGinRoutes() {
 			remote.GET("/certificates", s.handleRemoteCertificatesList)
 			remote.POST("/certificates/:id/renew", s.handleRemoteCertificateRenew)
 			remote.GET("/events", s.handleRemoteEvents)
-			remote.GET("/dns/providers", s.handleRemoteDNSProviders)
 			remote.GET("/nexus-guide", s.handleRemoteGuideInfo)
 			remote.POST("/nexus-guide/verify", s.handleRemoteGuideVerify)
 		}
@@ -1398,7 +1398,6 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 	if s.remoteResolver != nil {
 		s.remoteResolver.UpdateConfig(nexusclient.Config{
 			PortalHostname: status.PortalHostname,
-			TLD:            status.TLD,
 		})
 	}
 

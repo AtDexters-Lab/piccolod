@@ -147,10 +147,8 @@ func TestBootstrapRemoteStorage_SavePersistsRepo(t *testing.T) {
 	repo := &stubRemoteRepo{}
 	storage := newBootstrapRemoteStorage(repo, dir)
 	want := remote.Config{
-		Endpoint: "wss://nexus.example.com/connect",
-		DNSCredentials: map[string]string{
-			"provider": "token",
-		},
+		Endpoint:     "wss://nexus.example.com/connect",
+		DeviceSecret: "test-secret",
 	}
 
 	if err := storage.Save(context.Background(), want); err != nil {

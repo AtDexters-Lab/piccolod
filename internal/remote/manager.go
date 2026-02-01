@@ -29,19 +29,18 @@ import (
 	"piccolod/internal/fsutil"
 	"piccolod/internal/remote/acme"
 	"piccolod/internal/remote/nexusclient"
+	"piccolod/internal/remote/orchestrator"
 	"piccolod/internal/state/paths"
 )
 
 // Config holds the persisted remote (Nexus) configuration and runtime state.
 type Config struct {
-	Endpoint        string            `json:"endpoint"`
-	DeviceSecret    string            `json:"device_secret"`
-	Solver          string            `json:"solver"`
-	TLD             string            `json:"tld"`
-	PortalHostname  string            `json:"portal_hostname"`
-	DNSProvider     string            `json:"dns_provider,omitempty"`
-	DNSCredentials  map[string]string `json:"dns_credentials,omitempty"`
-	Enabled         bool              `json:"enabled"`
+	Endpoint       string `json:"endpoint"`
+	DeviceSecret   string `json:"device_secret"`
+	Solver         string `json:"solver"`
+	PortalHostname string `json:"portal_hostname"` // Fully-qualified hostname (e.g., portal.home.example.com)
+	Managed        bool   `json:"managed,omitempty"` // True for piccolospace managed nexus (DNS-01 via orchestrator)
+	Enabled        bool   `json:"enabled"`
 	Issuer          string            `json:"issuer,omitempty"`
 	ExpiresAt       time.Time         `json:"expires_at,omitempty"`
 	NextRenewal     time.Time         `json:"next_renewal,omitempty"`
@@ -52,6 +51,9 @@ type Config struct {
 	Aliases         []Alias           `json:"aliases,omitempty"`
 	Certificates    []Certificate     `json:"certificates,omitempty"`
 	Events          []Event           `json:"events,omitempty"`
+
+	// Managed mode orchestrator config (not persisted as credentials)
+	OrchestratorEndpoint string `json:"orchestrator_endpoint,omitempty"` // Orchestrator API endpoint
 }
 
 func init() {
@@ -117,8 +119,8 @@ type Status struct {
 	Enabled         bool              `json:"enabled"`
 	State           string            `json:"state"`
 	Solver          string            `json:"solver,omitempty"`
+	Managed         bool              `json:"managed,omitempty"`
 	Endpoint        string            `json:"endpoint,omitempty"`
-	TLD             string            `json:"tld,omitempty"`
 	PortalHostname  string            `json:"portal_hostname,omitempty"`
 	LatencyMS       *int              `json:"latency_ms,omitempty"`
 	LastHandshake   *time.Time        `json:"last_handshake,omitempty"`
@@ -253,9 +255,6 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 			}
 		} else {
 			m.cfg = &cfg
-			if m.cfg.DNSCredentials == nil {
-				m.cfg.DNSCredentials = map[string]string{}
-			}
 			m.needsReload.Store(false)
 		}
 	}
@@ -340,9 +339,6 @@ func (s *fileStorage) Load(ctx context.Context) (Config, error) {
 
 func (s *fileStorage) Save(ctx context.Context, cfg Config) error {
 	_ = ctx
-	if cfg.DNSCredentials == nil {
-		cfg.DNSCredentials = map[string]string{}
-	}
 	payload, err := json.MarshalIndent(&cfg, "", "  ")
 	if err != nil {
 		return err
@@ -358,9 +354,6 @@ func (m *Manager) save(cfg *Config) error {
 	if cfg == nil {
 		m.cfgMu.Unlock()
 		return errors.New("config cannot be nil")
-	}
-	if cfg.DNSCredentials == nil {
-		cfg.DNSCredentials = map[string]string{}
 	}
 
 	// Storage save (JSON marshal) happens under lock to prevent races.
@@ -396,9 +389,7 @@ func (m *Manager) reloadFromStorage() error {
 		}
 		return err
 	}
-	if cfg.DNSCredentials == nil {
-		cfg.DNSCredentials = map[string]string{}
-	}
+
 	m.cfgMu.Lock()
 	m.cfg = &cfg
 	snap := extractAdapterSnapshot(&cfg)
@@ -468,7 +459,7 @@ func (m *Manager) Status() Status {
 		if !cfg.ExpiresAt.IsZero() && cfg.ExpiresAt.Before(m.now()) {
 			state = "error"
 		}
-	} else if cfg.Endpoint != "" && cfg.TLD != "" {
+	} else if cfg.Endpoint != "" && cfg.PortalHostname != "" {
 		// Valid config exists but is disabled -> "stopped"
 		state = "stopped"
 	}
@@ -477,8 +468,8 @@ func (m *Manager) Status() Status {
 		Enabled:         cfg.Enabled,
 		State:           state,
 		Solver:          cfg.Solver,
+		Managed:         cfg.Managed,
 		Endpoint:        cfg.Endpoint,
-		TLD:             cfg.TLD,
 		PortalHostname:  cfg.PortalHostname,
 		LatencyMS:       latency,
 		LastHandshake:   timePtr(cfg.LastHandshake),
@@ -509,18 +500,21 @@ func (m *Manager) ReloadFromStorage() error {
 	return nil
 }
 
-// ConfigureRequest holds the payload accepted by Configure.
+// ConfigureRequest holds the payload accepted by Configure (user-managed mode, HTTP-01 only).
 type ConfigureRequest struct {
-	Endpoint       string            `json:"endpoint"`
-	DeviceSecret   string            `json:"device_secret"`
-	Solver         string            `json:"solver"`
-	TLD            string            `json:"tld"`
-	PortalHostname string            `json:"portal_hostname"`
-	DNSProvider    string            `json:"dns_provider"`
-	DNSCredentials map[string]string `json:"dns_credentials"`
+	Endpoint       string `json:"endpoint"`
+	DeviceSecret   string `json:"device_secret"`
+	PortalHostname string `json:"portal_hostname"` // Fully-qualified hostname (e.g., portal.home.example.com)
 }
 
-// Configure persists a new remote configuration.
+// ManagedConfigureRequest holds the payload for managed nexus configuration (DNS-01 via orchestrator).
+type ManagedConfigureRequest struct {
+	OrchestratorEndpoint string `json:"orchestrator_endpoint"`
+	DeviceToken          string `json:"device_token"`
+	PortalHostname       string `json:"portal_hostname"` // Fully-qualified hostname (e.g., portal.home.example.com)
+}
+
+// Configure persists a new user-managed remote configuration (HTTP-01 only).
 func (m *Manager) Configure(req ConfigureRequest) error {
 	endpoint := strings.TrimSpace(req.Endpoint)
 	if endpoint == "" {
@@ -530,38 +524,23 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 		return fmt.Errorf("invalid endpoint: %w", err)
 	}
 
-	solver := strings.ToLower(strings.TrimSpace(req.Solver))
-	if solver == "" {
-		solver = "http-01"
-	}
-	if solver != "http-01" && solver != "dns-01" {
-		return fmt.Errorf("unsupported solver %q", solver)
-	}
+	// User-managed mode always uses HTTP-01
+	solver := "http-01"
 
-	tld := strings.TrimSpace(req.TLD)
-	if tld == "" || !strings.Contains(tld, ".") {
-		return errors.New("tld required")
-	}
-
-	rawPortal := strings.TrimSpace(req.PortalHostname)
-	if rawPortal == "" {
-		return errors.New("portal hostname required")
-	}
-	portalHost := normalizePortalHost(tld, rawPortal)
+	portalHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(req.PortalHostname)), ".")
 	if portalHost == "" {
-		return errors.New("portal hostname invalid")
+		return errors.New("portal_hostname required")
+	}
+	if !strings.Contains(portalHost, ".") {
+		return errors.New("portal_hostname must be a fully-qualified hostname (e.g., portal.home.example.com)")
 	}
 
-	email := deriveACMEEmail(tld, portalHost)
+	email := deriveACMEEmail(portalHost)
 	if m.acmeMgr != nil {
 		m.acmeMgr.SetEmail(email)
-		if err := m.acmeMgr.SetSolver(solver, req.DNSProvider, req.DNSCredentials); err != nil {
+		if err := m.acmeMgr.SetSolver(solver); err != nil {
 			return err
 		}
-	}
-
-	if solver == "dns-01" && strings.TrimSpace(req.DNSProvider) == "" {
-		return errors.New("dns_provider required for dns-01")
 	}
 
 	now := m.now()
@@ -572,12 +551,18 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	cfg := m.currentConfigLocked()
 	existingCerts := append([]Certificate(nil), cfg.Certificates...)
 	cfg.Endpoint = endpoint
-	cfg.DeviceSecret = strings.TrimSpace(req.DeviceSecret)
+	// Preserve existing secret if not provided (allows reconfigure without re-entering secret)
+	newSecret := strings.TrimSpace(req.DeviceSecret)
+	if newSecret != "" {
+		cfg.DeviceSecret = newSecret
+	} else if cfg.DeviceSecret == "" {
+		m.cfgMu.Unlock()
+		return errors.New("device_secret required")
+	}
 	cfg.Solver = solver
-	cfg.TLD = tld
 	cfg.PortalHostname = portalHost
-	cfg.DNSProvider = strings.TrimSpace(req.DNSProvider)
-	cfg.DNSCredentials = cloneCredentials(req.DNSCredentials)
+	cfg.Managed = false
+	cfg.OrchestratorEndpoint = ""
 	cfg.Enabled = true
 	cfg.Issuer = "Let's Encrypt"
 	cfg.ExpiresAt = expires
@@ -587,6 +572,7 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	// Assume preflight passed during setup wizard; prevent immediate warning state
 	cfg.LastPreflight = &now
 	// Queue background ACME issuance and surface events/inventory.
+	// User-managed mode only issues portal cert (no wildcard)
 	newCerts := defaultCertificates(cfg, now)
 	for _, c := range existingCerts {
 		if c.ID == "portal" || c.ID == "wildcard" {
@@ -599,7 +585,93 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 		Timestamp: now,
 		Level:     "info",
 		Source:    "remote",
-		Message:   "Remote configuration saved",
+		Message:   "Remote configuration saved (user-managed, HTTP-01)",
+		NextStep:  "Run preflight",
+	})
+	// save() releases cfgMu.Lock()
+	if err := m.save(cfg); err != nil {
+		return err
+	}
+
+	// Queue issuance jobs after releasing lock (enqueueIssuance acquires its own lock)
+	// User-managed mode only issues portal cert (no wildcard - HTTP-01 doesn't support it)
+	m.enqueueIssuance("portal", []string{portalHost}, portalHost)
+	return nil
+}
+
+// ConfigureManaged persists a new managed remote configuration (DNS-01 via Piccolo orchestrator).
+func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
+	endpoint := strings.TrimSpace(req.OrchestratorEndpoint)
+	if endpoint == "" {
+		return errors.New("orchestrator_endpoint required")
+	}
+	if _, err := url.ParseRequestURI(endpoint); err != nil {
+		return fmt.Errorf("invalid orchestrator_endpoint: %w", err)
+	}
+
+	deviceToken := strings.TrimSpace(req.DeviceToken)
+	if deviceToken == "" {
+		return errors.New("device_token required")
+	}
+
+	// Managed mode always uses DNS-01
+	solver := "dns-01"
+
+	portalHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(req.PortalHostname)), ".")
+	if portalHost == "" {
+		return errors.New("portal_hostname required")
+	}
+	if !strings.Contains(portalHost, ".") {
+		return errors.New("portal_hostname must be a fully-qualified hostname (e.g., portal.home.example.com)")
+	}
+
+	// Create orchestrator client and wire to ACME manager
+	orchClient := orchestrator.NewClient(endpoint, deviceToken)
+	email := deriveACMEEmail(portalHost)
+	if m.acmeMgr != nil {
+		m.acmeMgr.SetEmail(email)
+		if err := m.acmeMgr.SetSolver(solver); err != nil {
+			return err
+		}
+		m.acmeMgr.SetOrchestratorClient(orchClient)
+	}
+
+	now := m.now()
+	expires := now.Add(90 * 24 * time.Hour)
+	nextRenewal := now.Add(60 * 24 * time.Hour)
+
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
+	existingCerts := append([]Certificate(nil), cfg.Certificates...)
+	cfg.Endpoint = endpoint // Use orchestrator endpoint as nexus endpoint for managed mode
+	cfg.DeviceSecret = deviceToken
+	cfg.Solver = solver
+	cfg.PortalHostname = portalHost
+	cfg.Managed = true
+	cfg.OrchestratorEndpoint = endpoint
+	cfg.Enabled = true
+	cfg.Issuer = "Let's Encrypt"
+	cfg.ExpiresAt = expires
+	cfg.NextRenewal = nextRenewal
+	cfg.LastHandshake = now
+	cfg.LatencyMS = 0
+	// Assume preflight passed during setup wizard; prevent immediate warning state
+	cfg.LastPreflight = &now
+	// Queue background ACME issuance and surface events/inventory.
+	// Managed mode issues both portal cert and wildcard cert
+	newCerts := defaultCertificates(cfg, now)
+	for _, c := range existingCerts {
+		if c.ID == "portal" || c.ID == "wildcard" {
+			continue
+		}
+		newCerts = append(newCerts, c)
+	}
+	cfg.Certificates = newCerts
+	cfg.Events = append(cfg.Events, Event{
+		Timestamp: now,
+		Level:     "info",
+		Source:    "remote",
+		Message:   "Remote configuration saved (managed, DNS-01)",
 		NextStep:  "Run preflight",
 	})
 	// save() releases cfgMu.Lock()
@@ -609,12 +681,11 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 
 	// Queue issuance jobs after releasing lock (enqueueIssuance acquires its own lock)
 	m.enqueueIssuance("portal", []string{portalHost}, portalHost)
-	if tld != "" && strings.EqualFold(solver, "dns-01") && portalHost != "" {
-		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portalHost)), ".")
-		if base != "" {
-			cn := "*." + base
-			m.enqueueIssuance("wildcard", []string{cn, base}, cn)
-		}
+	// Managed mode supports wildcard via DNS-01
+	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portalHost)), ".")
+	if base != "" {
+		cn := "*." + base
+		m.enqueueIssuance("wildcard", []string{cn, base}, cn)
 	}
 	return nil
 }
@@ -827,7 +898,6 @@ type adapterStateSnapshot struct {
 	Endpoint       string
 	DeviceSecret   string
 	PortalHostname string
-	TLD            string
 	Enabled        bool
 }
 
@@ -839,7 +909,6 @@ func extractAdapterSnapshot(cfg *Config) adapterStateSnapshot {
 		Endpoint:       cfg.Endpoint,
 		DeviceSecret:   cfg.DeviceSecret,
 		PortalHostname: cfg.PortalHostname,
-		TLD:            cfg.TLD,
 		Enabled:        cfg.Enabled,
 	}
 }
@@ -861,7 +930,6 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 		Endpoint:       snap.Endpoint,
 		DeviceSecret:   snap.DeviceSecret,
 		PortalHostname: snap.PortalHostname,
-		TLD:            snap.TLD,
 	}
 	if err := adapter.Configure(adapterCfg); err != nil {
 		log.Printf("WARN: remote: configure nexus adapter failed: %v", err)
@@ -910,10 +978,15 @@ func (m *Manager) updateACMEConfig(cfg *Config) {
 	if m == nil || m.acmeMgr == nil || cfg == nil {
 		return
 	}
-	email := deriveACMEEmail(cfg.TLD, cfg.PortalHostname)
+	email := deriveACMEEmail(cfg.PortalHostname)
 	m.acmeMgr.SetEmail(email)
-	if err := m.acmeMgr.SetSolver(cfg.Solver, cfg.DNSProvider, cfg.DNSCredentials); err != nil {
+	if err := m.acmeMgr.SetSolver(cfg.Solver); err != nil {
 		log.Printf("WARN: remote: acme solver config failed: %v", err)
+	}
+	// For managed mode, recreate orchestrator client from stored endpoint
+	if cfg.Managed && cfg.OrchestratorEndpoint != "" && cfg.DeviceSecret != "" {
+		orchClient := orchestrator.NewClient(cfg.OrchestratorEndpoint, cfg.DeviceSecret)
+		m.acmeMgr.SetOrchestratorClient(orchClient)
 	}
 }
 
@@ -1111,7 +1184,8 @@ func desiredDomainsAndCN(cfg *Config, c Certificate) ([]string, string, bool) {
 		h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
 		return []string{h}, h, true
 	case "wildcard":
-		if cfg.TLD == "" || cfg.PortalHostname == "" || !strings.EqualFold(cfg.Solver, "dns-01") {
+		// Wildcard only for managed mode (DNS-01 via orchestrator)
+		if !cfg.Managed || cfg.PortalHostname == "" || !strings.EqualFold(cfg.Solver, "dns-01") {
 			return nil, "", false
 		}
 		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
@@ -1198,7 +1272,11 @@ func (m *Manager) RenewCertificate(id string) error {
 			if id == "portal" && cfg.PortalHostname != "" {
 				cn = cfg.PortalHostname
 			}
-			if id == "wildcard" && cfg.TLD != "" {
+			if id == "wildcard" && cfg.PortalHostname != "" {
+				if !cfg.Managed {
+					errMsg = "wildcard renewals require managed mode"
+					break
+				}
 				if !strings.EqualFold(cfg.Solver, "dns-01") {
 					errMsg = "wildcard renewals require dns-01 solver"
 					break
@@ -1888,7 +1966,7 @@ func (m *Manager) RunPreflight(candidate *Config) (PreflightResult, error) {
 		cfg = m.currentConfig()
 	}
 
-	if cfg.Endpoint == "" || cfg.TLD == "" || cfg.PortalHostname == "" {
+	if cfg.Endpoint == "" || cfg.PortalHostname == "" {
 		return PreflightResult{}, errors.New("remote not configured")
 	}
 
@@ -1949,8 +2027,7 @@ func (m *Manager) ListEvents() []Event {
 // GuideVerification carries helper verification metadata.
 type GuideVerification struct {
 	Endpoint       string `json:"endpoint"`
-	TLD            string `json:"tld"`
-	PortalHostname string `json:"portal_hostname"`
+	PortalHostname string `json:"portal_hostname"` // Fully-qualified hostname (e.g., portal.home.example.com)
 	JWTSecret      string `json:"jwt_secret"`
 }
 
@@ -2138,7 +2215,8 @@ func defaultCertificates(cfg *Config, now time.Time) []Certificate {
 			Status:      "ok",
 		})
 	}
-	if cfg.TLD != "" && strings.EqualFold(cfg.Solver, "dns-01") {
+	// Wildcard cert only for managed mode (DNS-01 via orchestrator)
+	if cfg.Managed && cfg.PortalHostname != "" && strings.EqualFold(cfg.Solver, "dns-01") {
 		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
 		if base == "" {
 			return certificates
@@ -2174,17 +2252,6 @@ func cloneCertificates(in []Certificate) []Certificate {
 	return out
 }
 
-func cloneCredentials(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return map[string]string{}
-	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
 func endpointHostPort(endpoint string) (string, string) {
 	if endpoint == "" {
 		return "", ""
@@ -2214,34 +2281,12 @@ func endpointHostPort(endpoint string) (string, string) {
 	return host, port
 }
 
-func deriveACMEEmail(tld, portal string) string {
-	host := strings.TrimSpace(strings.ToLower(portal))
-	if host == "" {
-		host = strings.TrimSpace(strings.ToLower(tld))
-	}
-	host = strings.Trim(host, ".")
+func deriveACMEEmail(portalHostname string) string {
+	host := strings.Trim(strings.TrimSpace(strings.ToLower(portalHostname)), ".")
 	if host == "" || !strings.Contains(host, ".") {
 		return "admin@piccolo.invalid"
 	}
 	return fmt.Sprintf("admin@%s", host)
-}
-
-func normalizePortalHost(tld, portal string) string {
-	tld = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(tld)), ".")
-	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portal)), ".")
-	if host == "" {
-		return ""
-	}
-	if tld == "" {
-		return host
-	}
-	if host == tld || strings.HasSuffix(host, "."+tld) {
-		return host
-	}
-	if !strings.Contains(host, ".") {
-		return host + "." + tld
-	}
-	return host
 }
 
 func stringPtr(s string) *string {

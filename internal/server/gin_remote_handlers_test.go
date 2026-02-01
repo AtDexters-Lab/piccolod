@@ -36,12 +36,10 @@ func TestRemote_Configure_Status_Disable_Rotate(t *testing.T) {
 		t.Fatalf("status %d", w.Code)
 	}
 
-	// Configure
+	// Configure (user-managed mode, HTTP-01 is implicit)
 	payload := map[string]interface{}{
 		"endpoint":        "wss://nexus.example.com/connect",
 		"device_secret":   "super-secret",
-		"solver":          "http-01",
-		"tld":             "example.com",
 		"portal_hostname": "portal.example.com",
 	}
 	body, _ := json.Marshal(payload)
@@ -65,7 +63,6 @@ func TestRemote_Configure_Status_Disable_Rotate(t *testing.T) {
 	var st struct {
 		Enabled        bool   `json:"enabled"`
 		PortalHostname string `json:"portal_hostname"`
-		TLD            string `json:"tld"`
 		State          string `json:"state"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
@@ -76,9 +73,6 @@ func TestRemote_Configure_Status_Disable_Rotate(t *testing.T) {
 	}
 	if st.PortalHostname != "portal.example.com" {
 		t.Fatalf("unexpected portal hostname %s", st.PortalHostname)
-	}
-	if st.TLD != "example.com" {
-		t.Fatalf("unexpected tld %s", st.TLD)
 	}
 
 	// Rotate
@@ -128,12 +122,10 @@ func TestRemote_Preflight_Stateless(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
 
-	// Configure first so we have an active config
+	// Configure first so we have an active config (user-managed mode, HTTP-01 implicit)
 	configurePayload := map[string]interface{}{
 		"endpoint":        "wss://nexus.example.com/connect",
 		"device_secret":   "super-secret",
-		"solver":          "http-01",
-		"tld":             "example.com",
 		"portal_hostname": "portal.example.com",
 	}
 	body, _ := json.Marshal(configurePayload)
@@ -170,8 +162,6 @@ func TestRemote_Preflight_Stateless(t *testing.T) {
 	candidatePayload := map[string]interface{}{
 		"endpoint":        "wss://nexus.example.com/connect",
 		"device_secret":   "new-secret",
-		"solver":          "http-01",
-		"tld":             "example.com",
 		"portal_hostname": "invalid-host.example.com", // This will fail DNS check in stub resolver
 	}
 	body, _ = json.Marshal(candidatePayload)
@@ -203,8 +193,6 @@ func TestRemote_Configure_RequirePortalHostname(t *testing.T) {
 	payload := map[string]interface{}{
 		"endpoint":        "wss://nexus.example.com/connect",
 		"device_secret":   "super-secret",
-		"solver":          "http-01",
-		"tld":             "example.com",
 		"portal_hostname": "",
 	}
 	body, _ := json.Marshal(payload)
@@ -265,12 +253,6 @@ func (s *toggledRemoteStorage) SetLocked(v bool) {
 
 func cloneRemoteConfig(cfg remote.Config) remote.Config {
 	out := cfg
-	if cfg.DNSCredentials != nil {
-		out.DNSCredentials = make(map[string]string, len(cfg.DNSCredentials))
-		for k, v := range cfg.DNSCredentials {
-			out.DNSCredentials[k] = v
-		}
-	}
 	if cfg.Aliases != nil {
 		out.Aliases = append([]remote.Alias(nil), cfg.Aliases...)
 	}
@@ -330,8 +312,6 @@ func TestRemote_Configure_WhenLocked(t *testing.T) {
 	payload := map[string]interface{}{
 		"endpoint":        "wss://nexus.example.com/connect",
 		"device_secret":   "super-secret",
-		"solver":          "http-01",
-		"tld":             "example.com",
 		"portal_hostname": "portal.example.com",
 	}
 	body, _ := json.Marshal(payload)
@@ -362,8 +342,6 @@ func TestRemote_ReloadsConfigAfterUnlockEvent(t *testing.T) {
 	if err := primaryMgr.Configure(remote.ConfigureRequest{
 		Endpoint:       "wss://nexus.example.com/connect",
 		DeviceSecret:   "primary-secret",
-		Solver:         "http-01",
-		TLD:            "example.com",
 		PortalHostname: "portal.example.com",
 	}); err != nil {
 		t.Fatalf("configure primary: %v", err)
@@ -423,8 +401,6 @@ func TestRemote_TlsMuxRestartsAfterReload(t *testing.T) {
 	payload := map[string]interface{}{
 		"endpoint":        "wss://nexus.example.com/connect",
 		"device_secret":   "super-secret",
-		"solver":          "http-01",
-		"tld":             "example.com",
 		"portal_hostname": "portal.example.com",
 	}
 	body, _ := json.Marshal(payload)
@@ -515,8 +491,6 @@ func TestRemote_PortalHostnamePersistsAndAppCertQueued(t *testing.T) {
 	configurePayload := map[string]interface{}{
 		"endpoint":        "wss://nexus.example.com/connect",
 		"device_secret":   "super-secret",
-		"solver":          "http-01",
-		"tld":             "example.com",
 		"portal_hostname": "piccolo.example.com",
 	}
 	body, _ := json.Marshal(configurePayload)

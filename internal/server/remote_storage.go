@@ -106,9 +106,6 @@ func (s *bootstrapRemoteStorage) Save(ctx context.Context, cfg remote.Config) er
 	if !s.isMounted() {
 		return remote.ErrLocked
 	}
-	if cfg.DNSCredentials == nil {
-		cfg.DNSCredentials = map[string]string{}
-	}
 	payload, err := json.MarshalIndent(&cfg, "", "  ")
 	if err != nil {
 		return err

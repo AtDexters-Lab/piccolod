@@ -69,12 +69,6 @@ class RemoteService {
     return list.map((e) => RemoteEvent.fromJson(e)).toList();
   }
 
-  Future<List<RemoteDNSProvider>> getDNSProviders() async {
-    final response = await _api.get('/api/v1/remote/dns/providers');
-    final List<dynamic> list = response['providers'] ?? [];
-    return list.map((e) => RemoteDNSProvider.fromJson(e)).toList();
-  }
-
   Future<RemoteGuideInfo> getNexusGuide() async {
     final response = await _api.get('/api/v1/remote/nexus-guide');
     return RemoteGuideInfo.fromJson(response);
