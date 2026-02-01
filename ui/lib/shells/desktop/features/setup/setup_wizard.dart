@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../../../theme/piccolo_theme.dart';
+import '../../../../core/models/network_models.dart';
+import '../../../../core/services/api_client.dart';
+import '../../../../core/services/network_service.dart';
 import '../../../../core/utils/downloader/downloader.dart';
 import '../../../../shared/widgets/password_set_form.dart';
 import 'setup_controller.dart';
@@ -101,9 +105,19 @@ class _SetupWizardState extends State<SetupWizard> {
                       Flexible(
                         child: SingleChildScrollView(
                           padding: const EdgeInsets.only(bottom: 8),
-                          child: AnimatedSwitcher(
-                            duration: const Duration(milliseconds: 300),
-                            child: _buildStepContent(state),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 300),
+                                child: _buildStepContent(state),
+                              ),
+                              // Other devices panel (shown in all states except loading/finishing)
+                              if (state != SetupState.loading &&
+                                  state != SetupState.finishing &&
+                                  state != SetupState.recovery)
+                                const _OtherDevicesPanel(),
+                            ],
                           ),
                         ),
                       ),
@@ -1052,7 +1066,7 @@ class _ErrorStep extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           Text(
-            "We couldn’t reach Piccolo.",
+            "We couldn't reach Piccolo.",
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               fontWeight: FontWeight.w600,
             ),
@@ -1093,6 +1107,229 @@ class _ErrorStep extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _OtherDevicesPanel extends StatefulWidget {
+  const _OtherDevicesPanel();
+
+  @override
+  State<_OtherDevicesPanel> createState() => _OtherDevicesPanelState();
+}
+
+class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
+  final NetworkService _networkService = NetworkService(ApiClient());
+  List<DiscoveredPeer> _peers = [];
+  bool _isLoading = false;
+  bool _hasLoaded = false;
+  String? _error;
+  DateTime? _lastFetch;
+
+  Future<void> _fetchPeers() async {
+    if (_isLoading) return;
+
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    try {
+      final response = await _networkService.getPeers();
+      if (mounted) {
+        setState(() {
+          _peers = response.peers;
+          _isLoading = false;
+          _hasLoaded = true;
+          _lastFetch = DateTime.now();
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _hasLoaded = true;
+          _error = "Could not discover devices";
+        });
+      }
+    }
+  }
+
+  void _onExpansionChanged(bool expanded) {
+    if (!expanded) return;
+
+    // Fetch on first expand or if last fetch was > 30s ago
+    final shouldRefetch = !_hasLoaded ||
+        (_lastFetch != null &&
+            DateTime.now().difference(_lastFetch!).inSeconds > 30);
+
+    if (shouldRefetch) {
+      _fetchPeers();
+    }
+  }
+
+  Future<void> _openPeerUrl(String url) async {
+    final uri = Uri.parse(url);
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      child: ExpansionTile(
+        tilePadding: const EdgeInsets.symmetric(horizontal: 16),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: PiccoloTheme.ink.withValues(alpha: 0.1)),
+        ),
+        collapsedShape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: PiccoloTheme.ink.withValues(alpha: 0.1)),
+        ),
+        backgroundColor: PiccoloTheme.mist.withValues(alpha: 0.5),
+        collapsedBackgroundColor: PiccoloTheme.mist.withValues(alpha: 0.3),
+        onExpansionChanged: _onExpansionChanged,
+        title: Row(
+          children: [
+            Icon(
+              Icons.devices,
+              size: 18,
+              color: PiccoloTheme.inkMuted,
+            ),
+            const SizedBox(width: 8),
+            Text(
+              "Other Devices on Network",
+              style: TextStyle(
+                fontSize: 13,
+                color: PiccoloTheme.inkMuted,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            if (_hasLoaded && _peers.isNotEmpty) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  '${_peers.length}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: PiccoloTheme.cobalt600,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+        children: [
+          if (_isLoading)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: PiccoloTheme.cobalt600,
+                ),
+              ),
+            )
+          else if (_error != null)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Text(
+                    _error!,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: PiccoloTheme.inkMuted,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton.icon(
+                    onPressed: _fetchPeers,
+                    icon: const Icon(Icons.refresh, size: 16),
+                    label: const Text("Retry"),
+                  ),
+                ],
+              ),
+            )
+          else if (_peers.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                "No other devices found on this network",
+                style: TextStyle(
+                  fontSize: 13,
+                  color: PiccoloTheme.inkMuted,
+                ),
+              ),
+            )
+          else
+            ..._peers.map((peer) => _buildPeerTile(peer)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPeerTile(DiscoveredPeer peer) {
+    return InkWell(
+      onTap: peer.online ? () => _openPeerUrl(peer.url) : null,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+        child: Row(
+          children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: peer.online ? PiccoloTheme.success : PiccoloTheme.inkMuted,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    peer.displayName,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w500,
+                      fontSize: 14,
+                    ),
+                  ),
+                  Text(
+                    peer.online
+                        ? [peer.model, peer.ipv4].where((s) => s != null).join(' \u2022 ')
+                        : '(offline)',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: PiccoloTheme.inkMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (peer.online)
+              Icon(
+                Icons.arrow_forward_ios,
+                size: 14,
+                color: PiccoloTheme.inkMuted,
+              ),
+          ],
+        ),
       ),
     );
   }

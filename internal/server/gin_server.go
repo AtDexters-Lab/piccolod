@@ -941,6 +941,9 @@ func (s *GinServer) setupGinRoutes() {
 		v1.POST("/crypto/reset-password", s.handleCryptoResetPassword)
 		v1.GET("/crypto/recovery-key", s.handleCryptoRecoveryStatus)
 
+		// Network discovery (public, LAN-only data)
+		v1.GET("/network/peers", s.handleNetworkPeers)
+
 		// All other API endpoints require session + CSRF
 		authed := v1.Group("/")
 		authed.Use(s.requireSession())
