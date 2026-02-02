@@ -1,10 +1,12 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import '../../core/config/core_config.dart';
 import '../../core/services/log_stream_backend.dart';
 import '../../core/services/websocket_connection.dart';
+import '../../core/utils/clipboard/clipboard.dart' as clipboard_utils;
 import '../../theme/piccolo_theme.dart';
 
 class LogStreamViewer extends StatefulWidget {
@@ -204,6 +206,51 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
     );
   }
 
+  /// Copy selected text to clipboard.
+  Future<void> _copySelection() async {
+    final selection = _controller.selection;
+    if (selection == null) return;
+    final text = _terminal.buffer.getText(selection);
+    try {
+      await clipboard_utils.copyText(text);
+    } catch (e) {
+      // Clipboard unavailable - silently fail for log viewer
+    }
+  }
+
+  /// Handle Ctrl+C shortcut: copy if selection exists.
+  /// Log viewer is read-only so no SIGINT handling needed.
+  void _handleCopyShortcut() {
+    if (_controller.selection != null) {
+      _copySelection();
+    }
+  }
+
+  /// Show context menu with copy option.
+  Future<void> _showContextMenu(Offset position) async {
+    final hasSelection = _controller.selection != null;
+    final choice = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: [
+        PopupMenuItem<String>(
+          value: 'copy',
+          enabled: hasSelection,
+          child: const Text('Copy'),
+        ),
+      ],
+    );
+
+    if (choice == 'copy') {
+      await _copySelection();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     // Terminal body with RepaintBoundary for paint isolation
@@ -213,16 +260,28 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
         child: Scrollbar(
           controller: _scrollController,
           thumbVisibility: true,
-          child: TerminalView(
-            _terminal,
-            controller: _controller,
-            scrollController: _scrollController,
-            textStyle: const TerminalStyle(
-              fontFamily: 'JetBrainsMono',
-              height: 1.2,
+          child: CallbackShortcuts(
+            bindings: {
+              // Ctrl+C to copy selected text (Linux/Windows)
+              const SingleActivator(LogicalKeyboardKey.keyC, control: true):
+                  _handleCopyShortcut,
+              // Cmd+C on macOS
+              const SingleActivator(LogicalKeyboardKey.keyC, meta: true):
+                  _handleCopyShortcut,
+            },
+            child: TerminalView(
+              _terminal,
+              controller: _controller,
+              scrollController: _scrollController,
+              textStyle: const TerminalStyle(
+                fontFamily: 'JetBrainsMono',
+                height: 1.2,
+              ),
+              padding: const EdgeInsets.all(12.0),
+              autofocus: false,
+              onSecondaryTapDown: (details, cell) =>
+                  _showContextMenu(details.globalPosition),
             ),
-            padding: const EdgeInsets.all(12.0),
-            autofocus: false,
           ),
         ),
       ),
