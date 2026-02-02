@@ -320,23 +320,36 @@ func SetDefaults(app *api.AppDefinition) {
 // Apps must provide identity via exactly one of:
 // - listeners with exactly one __primary (apps with network access)
 // - workspace_name (workspace apps without listeners)
+//
+// RFC 20260130 §10.1: Workspace mode apps can evolve to have both workspace_name
+// and listeners. This occurs when listeners are added to a workspace that was
+// originally installed with workspace_name. The instanceID remains workspace_name
+// (accepted asymmetry). Service mode apps still require mutual exclusivity.
 func validateAppIdentity(app *api.AppDefinition, mode PiccoloMode) error {
 	hasListeners := len(app.Listeners) > 0
 	hasWorkspaceName := strings.TrimSpace(app.WorkspaceName) != ""
 
-	// Mutual exclusivity: can't have both listeners and workspace_name
-	if hasListeners && hasWorkspaceName {
-		return fmt.Errorf("workspace_name cannot be used with listeners; the primary listener name becomes the app identity")
-	}
-
-	// workspace_name is only valid for workspace mode apps without listeners
+	// workspace_name format validation (if present)
 	if hasWorkspaceName {
-		if mode != ModeWorkspace {
-			return fmt.Errorf("workspace_name is only allowed for workspace mode apps without listeners")
-		}
-		// Validate workspace_name format per RFC 20260130
 		if err := hostname.ValidateWorkspaceName(app.WorkspaceName); err != nil {
 			return err
+		}
+	}
+
+	// RFC 20260130 §10.1: Workspace mode apps can have both workspace_name and listeners
+	// (evolved workspace). Service mode requires mutual exclusivity.
+	if hasListeners && hasWorkspaceName {
+		if mode != ModeWorkspace {
+			return fmt.Errorf("workspace_name cannot be used with listeners; the primary listener name becomes the app identity")
+		}
+		// Workspace mode with both: valid (evolved workspace per §10.1)
+		return nil
+	}
+
+	// workspace_name without listeners is only valid for workspace mode
+	if hasWorkspaceName && !hasListeners {
+		if mode != ModeWorkspace {
+			return fmt.Errorf("workspace_name is only allowed for workspace mode apps")
 		}
 	}
 

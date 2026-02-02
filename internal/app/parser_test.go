@@ -250,6 +250,34 @@ func TestValidateAppDefinition(t *testing.T) {
 			expectError: true,
 			expectedErr: "guest_port must be between 1 and 65535",
 		},
+		// RFC 20260130 §10.1: Evolved workspace tests
+		{
+			name: "evolved workspace - workspace_name with listeners is valid",
+			app: &api.AppDefinition{
+				// Workspace app originally installed with workspace_name, then had listeners added
+				WorkspaceName: "myworkspace",
+				Listeners:     []api.AppListener{{Name: "web", GuestPort: 8080, Primary: true}},
+				Services: map[string]api.AppService{
+					"main": {Image: "ubuntu:22.04", BindPorts: []int{8080}},
+				},
+				Extensions: map[string]interface{}{"mode": "workspace"},
+			},
+			expectError: false,
+		},
+		{
+			name: "service mode with workspace_name and listeners is invalid",
+			app: &api.AppDefinition{
+				// Service mode cannot have both
+				WorkspaceName: "myworkspace",
+				Listeners:     []api.AppListener{{Name: "web", GuestPort: 8080, Primary: true}},
+				Services: map[string]api.AppService{
+					"main": {Image: "nginx:latest", BindPorts: []int{8080}},
+				},
+				Extensions: map[string]interface{}{"mode": "service"},
+			},
+			expectError: true,
+			expectedErr: "workspace_name cannot be used with listeners",
+		},
 	}
 
 	for _, tt := range tests {
