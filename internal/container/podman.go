@@ -601,7 +601,8 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 	return nil
 }
 
-// RemoveContainer removes a container by validated ID
+// RemoveContainer removes a container by validated ID.
+// Returns ContainerNotFoundError if the container does not exist.
 func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, containerID string) error {
 	if !isValidContainerID(containerID) {
 		return fmt.Errorf("invalid container ID format: %s", containerID)
@@ -615,7 +616,14 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		return fmt.Errorf("podman rm failed: %w, output: %s", err, string(output))
+		outStr := string(output)
+		// Detect "no such container" errors and return typed error.
+		// Use case-insensitive matching for robustness across Podman versions.
+		lower := strings.ToLower(outStr)
+		if strings.Contains(lower, "no such container") || strings.Contains(lower, "no container with") {
+			return &ContainerNotFoundError{Ref: containerID}
+		}
+		return fmt.Errorf("podman rm failed: %w, output: %s", err, outStr)
 	}
 
 	return nil
