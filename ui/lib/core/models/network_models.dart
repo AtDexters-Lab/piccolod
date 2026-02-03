@@ -35,6 +35,8 @@ class DiscoveredPeer {
 
   String get url => 'http://$hostname';
 
+  String get httpsUrl => 'https://$hostname';
+
   String get displayName => formatHostnameDisplayName(hostname);
 }
 
@@ -82,6 +84,8 @@ class NetworkSelf {
       isGatewayLeader: json['is_gateway_leader'] ?? false,
     );
   }
+
+  String get httpsUrl => 'https://${specificHostname.isNotEmpty ? specificHostname : hostname}';
 
   /// Display name using the specific hostname format.
   String get displayName => formatHostnameDisplayName(specificHostname);

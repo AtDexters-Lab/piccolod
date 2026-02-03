@@ -364,6 +364,14 @@ func (m *Manager) Version() string {
 	return m.version
 }
 
+// Hostnames returns all advertised hostnames without trailing dots, suitable for TLS SANs.
+func (m *Manager) Hostnames() []string {
+	if m == nil || m.names == nil {
+		return nil
+	}
+	return m.names.Hostnames()
+}
+
 // AdvertisedNames returns the list of currently advertised FQDNs (with trailing dot).
 func (m *Manager) AdvertisedNames() []string {
 	if m.names == nil {

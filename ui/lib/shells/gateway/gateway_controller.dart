@@ -1,3 +1,5 @@
+import 'dart:js_interop';
+
 import 'package:flutter/foundation.dart';
 import 'package:web/web.dart' as web;
 import '../../core/models/network_models.dart';
@@ -48,7 +50,7 @@ class GatewayController extends ChangeNotifier {
 
       // Auto-redirect if single device (no peers and we have self info)
       if (_peers.isEmpty && _self != null) {
-        _redirectToSelf();
+        await _redirectToSelf();
         return;
       }
 
@@ -63,7 +65,8 @@ class GatewayController extends ChangeNotifier {
   }
 
   /// Redirect to this device's specific hostname.
-  void _redirectToSelf() {
+  /// Probes HTTPS first — if CA is trusted, redirects to HTTPS; otherwise HTTP.
+  Future<void> _redirectToSelf() async {
     if (_self == null) return;
 
     // Use specific hostname (piccolo-<machineId>.local) for redirect
@@ -86,18 +89,48 @@ class GatewayController extends ChangeNotifier {
     _redirecting = true;
     notifyListeners();
 
-    final url = 'http://$hostname';
+    // Probe HTTPS — if CA is trusted, redirect to HTTPS
+    final useHttps = await _probeHttps(hostname);
+    final scheme = useHttps ? 'https' : 'http';
 
     // Small delay to show loading state before redirect
     Future.delayed(const Duration(milliseconds: 500), () {
-      web.window.location.replace(url);
+      web.window.location.replace('$scheme://$hostname');
     });
   }
 
-  /// Navigate to a specific device.
+  /// Probe whether the device's HTTPS endpoint is reachable and trusted.
+  ///
+  /// Uses `no-cors` mode because the gateway page is served from
+  /// http://piccolo.local while the probe targets a device-specific HTTPS
+  /// hostname (a different origin). With `no-cors`, a successful TLS handshake returns
+  /// an opaque response (type "opaque") instead of throwing. If the CA is
+  /// untrusted, the fetch throws a network error and we fall back to HTTP.
+  Future<bool> _probeHttps(String hostname) async {
+    try {
+      final url = 'https://$hostname/api/v1/health/live';
+      final init = web.RequestInit(mode: 'no-cors');
+      final response = await web.window.fetch(url.toJS, init).toDart
+          .timeout(const Duration(seconds: 2));
+      // In no-cors mode, a successful response has type "opaque" with status 0.
+      // Any non-throwing result means TLS succeeded (CA is trusted).
+      return response.type == 'opaque' || response.ok;
+    } catch (e) {
+      debugPrint('GatewayController._probeHttps failed for $hostname: $e');
+      return false;
+    }
+  }
+
+  /// Navigate to a specific device via HTTP.
   void navigateToDevice(DiscoveredPeer peer) {
     if (!peer.online) return;
     web.window.location.href = peer.url;
+  }
+
+  /// Navigate to a specific device via HTTPS.
+  void navigateToDeviceHttps(DiscoveredPeer peer) {
+    if (!peer.online) return;
+    web.window.location.href = peer.httpsUrl;
   }
 
   /// Refresh the peer list.

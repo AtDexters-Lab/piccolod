@@ -4,6 +4,7 @@ import '../../../../theme/piccolo_theme.dart';
 import 'settings_controller.dart';
 import 'tabs/profile_tab.dart';
 import 'tabs/remote/remote_tab.dart';
+import 'tabs/security_tab.dart';
 import 'tabs/system_tab.dart';
 import 'tabs/users/users_tab.dart';
 
@@ -86,10 +87,16 @@ class _SettingsAppState extends State<SettingsApp> {
                         onTap: () => _controller.selectTab(2),
                       ),
                       _SidebarItem(
-                        icon: Icons.dns_outlined, // or system icon
-                        label: "System",
+                        icon: Icons.shield_outlined,
+                        label: "Security",
                         isSelected: _controller.selectedIndex == 3,
                         onTap: () => _controller.selectTab(3),
+                      ),
+                      _SidebarItem(
+                        icon: Icons.dns_outlined,
+                        label: "System",
+                        isSelected: _controller.selectedIndex == 4,
+                        onTap: () => _controller.selectTab(4),
                       ),
                     ],
                   ),
@@ -156,6 +163,8 @@ class _SettingsAppState extends State<SettingsApp> {
       case 2:
         return const UsersTab();
       case 3:
+        return SecurityTab(controller: _controller);
+      case 4:
         return SystemTab(controller: _controller);
       default:
         return const SizedBox.shrink();

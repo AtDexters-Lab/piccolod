@@ -54,6 +54,19 @@ func (r *NameRegistry) Names() []string {
 	return out
 }
 
+// Hostnames returns all advertised hostnames without trailing dots.
+// Suitable for TLS certificate SANs.
+func (r *NameRegistry) Hostnames() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.snapshot))
+	for _, fqdn := range r.snapshot {
+		host := strings.TrimSuffix(fqdn, ".")
+		out = append(out, host)
+	}
+	return out
+}
+
 // AliasLabels returns the alias labels (not FQDNs).
 func (r *NameRegistry) AliasLabels() []string {
 	r.mu.RLock()

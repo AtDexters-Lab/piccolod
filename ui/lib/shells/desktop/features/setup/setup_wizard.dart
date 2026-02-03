@@ -54,7 +54,8 @@ class _SetupWizardState extends State<SetupWizard> {
                 (state == SetupState.welcome ||
                     state == SetupState.credentials ||
                     state == SetupState.finishing ||
-                    state == SetupState.recovery);
+                    state == SetupState.recovery ||
+                    state == SetupState.security);
 
             return Container(
               color: Colors.black.withValues(alpha: 0.5),
@@ -115,7 +116,8 @@ class _SetupWizardState extends State<SetupWizard> {
                               // Other devices panel (shown in all states except loading/finishing)
                               if (state != SetupState.loading &&
                                   state != SetupState.finishing &&
-                                  state != SetupState.recovery)
+                                  state != SetupState.recovery &&
+                                  state != SetupState.security)
                                 const _OtherDevicesPanel(),
                             ],
                           ),
@@ -140,6 +142,8 @@ class _SetupWizardState extends State<SetupWizard> {
         return "Create admin password";
       case SetupState.recovery:
         return "Recovery key";
+      case SetupState.security:
+        return "Security";
       case SetupState.finishing:
         return "Setting up...";
       case SetupState.unlock:
@@ -164,6 +168,8 @@ class _SetupWizardState extends State<SetupWizard> {
         return 1;
       case SetupState.recovery:
         return 2;
+      case SetupState.security:
+        return 3;
       default:
         return 0;
     }
@@ -190,6 +196,10 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.recovery:
         return _RecoveryStep(
           words: _controller.recoveryWords,
+          onNext: _controller.proceedToSecurity,
+        );
+      case SetupState.security:
+        return _SecurityStep(
           onNext: _controller.completeSetup,
         );
       case SetupState.unlock:
@@ -234,6 +244,8 @@ class _FirstRunStepper extends StatelessWidget {
         _buildStepIndicator(1, "Password"),
         _buildStepSeparator(),
         _buildStepIndicator(2, "Recovery"),
+        _buildStepSeparator(),
+        _buildStepIndicator(3, "Security"),
       ],
     );
   }
@@ -609,6 +621,98 @@ class _RecoveryStepState extends State<_RecoveryStep> {
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(12),
               ),
+            ),
+            child: const Text("Continue"),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SecurityStep extends StatefulWidget {
+  final VoidCallback onNext;
+  const _SecurityStep({required this.onNext});
+
+  @override
+  State<_SecurityStep> createState() => _SecurityStepState();
+}
+
+class _SecurityStepState extends State<_SecurityStep> {
+  bool _downloading = false;
+
+  Future<void> _downloadCA() async {
+    setState(() => _downloading = true);
+    try {
+      final response = await ApiClient().get('/api/v1/system/ca.crt');
+      downloadTextFile(response as String, 'piccolo-ca.crt');
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Download failed. You can download later from Settings > Security."),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _downloading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text("Secure your connection",
+              style: PiccoloTheme.textTheme.bodyLarge
+                  ?.copyWith(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: PiccoloTheme.mist,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: PiccoloTheme.cobalt600.withValues(alpha: 0.35),
+                width: 1.2,
+              ),
+            ),
+            child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.lock_outline, color: PiccoloTheme.inkMuted, size: 18),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    "Your device supports HTTPS on the local network. "
+                    "Download the CA certificate and import it into your browser "
+                    "to access the portal securely without warnings.",
+                    style: TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+          OutlinedButton.icon(
+            onPressed: _downloading ? null : _downloadCA,
+            icon: const Icon(Icons.download, size: 16),
+            label: Text(_downloading ? "Downloading..." : "Download CA Certificate"),
+            style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.ink),
+          ),
+          const SizedBox(height: 24),
+          ElevatedButton(
+            onPressed: widget.onNext,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: PiccoloTheme.success,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
             ),
             child: const Text("Finish setup"),
           ),

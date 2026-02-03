@@ -262,6 +262,9 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
           thumbVisibility: true,
           child: CallbackShortcuts(
             bindings: {
+              // Ctrl+Shift+C - explicit copy (Linux terminal convention)
+              const SingleActivator(LogicalKeyboardKey.keyC, control: true, shift: true):
+                  _handleCopyShortcut,
               // Ctrl+C to copy selected text (Linux/Windows)
               const SingleActivator(LogicalKeyboardKey.keyC, control: true):
                   _handleCopyShortcut,

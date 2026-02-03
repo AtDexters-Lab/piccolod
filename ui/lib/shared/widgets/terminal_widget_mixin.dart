@@ -169,12 +169,21 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
             thumbVisibility: true,
             child: CallbackShortcuts(
               bindings: {
+                // Ctrl+Shift+C - explicit copy (Linux terminal convention)
+                const SingleActivator(LogicalKeyboardKey.keyC, control: true, shift: true):
+                    copyTerminalSelection,
+                // Ctrl+Shift+V - explicit paste (Linux terminal convention)
+                const SingleActivator(LogicalKeyboardKey.keyV, control: true, shift: true):
+                    pasteToTerminal,
                 // Ctrl+C on Linux/Windows - intercept to handle copy vs SIGINT
                 const SingleActivator(LogicalKeyboardKey.keyC, control: true):
                     _handleCopyShortcut,
                 // Cmd+C on macOS
                 const SingleActivator(LogicalKeyboardKey.keyC, meta: true):
                     _handleCopyShortcut,
+                // Cmd+V on macOS
+                const SingleActivator(LogicalKeyboardKey.keyV, meta: true):
+                    pasteToTerminal,
               },
               child: TerminalView(
                 terminal,

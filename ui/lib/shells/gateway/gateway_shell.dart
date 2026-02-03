@@ -148,6 +148,7 @@ class _GatewayShellState extends State<GatewayShell> {
             offlinePeers: _controller.offlinePeers,
             self: _controller.self,
             onDeviceSelected: _controller.navigateToDevice,
+            onDeviceSelectedHttps: _controller.navigateToDeviceHttps,
           ),
         ),
         const SizedBox(height: 24),

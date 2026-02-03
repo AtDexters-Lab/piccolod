@@ -71,11 +71,7 @@ func (s *GinServer) securityHeadersMiddleware() gin.HandlerFunc {
 		c.Header("X-Content-Type-Options", "nosniff")
 		c.Header("X-Frame-Options", "DENY")
 		c.Header("X-XSS-Protection", "1; mode=block")
-		host := canonicalHost(c.Request.Host)
-		if host == "" {
-			host = canonicalHost(c.GetHeader("X-Forwarded-Host"))
-		}
-		if s != nil && s.isSecureRequest(c.Request) && host != "localhost" && host != "127.0.0.1" {
+		if s != nil && s.isRemoteSecureRequest(c.Request) {
 			c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
 		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")

@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import '../../../core/models/network_models.dart';
-import '../../../core/utils/string_utils.dart';
 
 /// A widget that displays a list of discovered Piccolo devices.
 ///
@@ -12,6 +11,7 @@ class DeviceSelector extends StatelessWidget {
   final List<DiscoveredPeer> offlinePeers;
   final NetworkSelf? self;
   final void Function(DiscoveredPeer) onDeviceSelected;
+  final void Function(DiscoveredPeer)? onDeviceSelectedHttps;
 
   const DeviceSelector({
     super.key,
@@ -19,6 +19,7 @@ class DeviceSelector extends StatelessWidget {
     required this.offlinePeers,
     required this.self,
     required this.onDeviceSelected,
+    this.onDeviceSelectedHttps,
   });
 
   @override
@@ -53,18 +54,20 @@ class DeviceSelector extends StatelessWidget {
           final specificHost = device.self.specificHostname.isNotEmpty
               ? device.self.specificHostname
               : device.self.hostname;
+          final selfPeer = DiscoveredPeer(
+            hostname: specificHost,
+            machineId: device.self.machineId,
+            online: true,
+          );
           return _DeviceCard(
             displayName: device.self.displayName,
             subtitle: device.self.model ?? '',
             ipAddress: null, // We don't have our own IP in self response
             online: true,
-            onTap: () {
-              onDeviceSelected(DiscoveredPeer(
-                hostname: specificHost,
-                machineId: device.self.machineId,
-                online: true,
-              ));
-            },
+            onTap: () => onDeviceSelected(selfPeer),
+            onHttpsTap: onDeviceSelectedHttps != null
+                ? () => onDeviceSelectedHttps!(selfPeer)
+                : null,
           );
         } else if (device is _PeerDevice) {
           return _DeviceCard(
@@ -73,6 +76,9 @@ class DeviceSelector extends StatelessWidget {
             ipAddress: device.peer.ipv4 ?? device.peer.ipv6,
             online: device.online,
             onTap: device.online ? () => onDeviceSelected(device.peer) : null,
+            onHttpsTap: device.online && onDeviceSelectedHttps != null
+                ? () => onDeviceSelectedHttps!(device.peer)
+                : null,
           );
         }
         return const SizedBox.shrink();
@@ -98,6 +104,7 @@ class _DeviceCard extends StatelessWidget {
   final String? ipAddress;
   final bool online;
   final VoidCallback? onTap;
+  final VoidCallback? onHttpsTap;
 
   const _DeviceCard({
     required this.displayName,
@@ -105,6 +112,7 @@ class _DeviceCard extends StatelessWidget {
     required this.ipAddress,
     required this.online,
     required this.onTap,
+    this.onHttpsTap,
   });
 
   @override
@@ -158,7 +166,19 @@ class _DeviceCard extends StatelessWidget {
                     ],
                   ),
                 ),
-                // Arrow indicator for online devices
+                // HTTPS button for online devices
+                if (online && onHttpsTap != null) ...[
+                  IconButton(
+                    onPressed: onHttpsTap,
+                    icon: const Icon(Icons.lock_outline, size: 18),
+                    tooltip: 'Open via HTTPS',
+                    color: Colors.white.withValues(alpha: 0.7),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+                  ),
+                  const SizedBox(width: 4),
+                ],
+                // Arrow indicator for online devices (HTTP)
                 if (online)
                   Icon(
                     Icons.arrow_forward_ios,

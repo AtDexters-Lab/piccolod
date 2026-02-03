@@ -419,8 +419,8 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 // computeCallbackOrigin computes the canonical callback origin for the request.
 func (h *ProxyOIDCHandler) computeCallbackOrigin(r *http.Request, ep ServiceEndpoint) string {
 	scheme := "http"
-	// Use requestArrivedViaTLS to detect TLS from both direct TLS and TLS mux (connection hint).
-	if requestArrivedViaTLS(r) || (h.config.TrustForwardedProto && r.Header.Get("X-Forwarded-Proto") == "https") {
+	// Use RequestArrivedViaTLS to detect TLS from both direct TLS and TLS mux (connection hint).
+	if RequestArrivedViaTLS(r) || (h.config.TrustForwardedProto && r.Header.Get("X-Forwarded-Proto") == "https") {
 		scheme = "https"
 	}
 

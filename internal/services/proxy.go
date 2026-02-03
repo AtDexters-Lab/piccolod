@@ -968,13 +968,16 @@ func shouldRewriteAsHTTPS(ep ServiceEndpoint, r *http.Request) bool {
 	}
 	switch ep.Protocol {
 	case api.ListenerProtocolHTTP, api.ListenerProtocolWebsocket:
-		return requestArrivedViaTLS(r)
+		return RequestArrivedViaTLS(r)
 	default:
 		return false
 	}
 }
 
-func requestArrivedViaTLS(r *http.Request) bool {
+// RequestArrivedViaTLS reports whether the original client request was made
+// over TLS, even if the current hop is plain HTTP. It checks direct TLS
+// (r.TLS) and the connection hint issued by the portal's lanHostRoutingMiddleware.
+func RequestArrivedViaTLS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}

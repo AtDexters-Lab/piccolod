@@ -11,13 +11,26 @@ import 'widgets/local_fallback_overlay.dart';
 class AppLauncher {
   /// URL for embedding in an iframe. Prefers port-based (localUrl) on HTTP
   /// because it shares the portal's hostname, keeping cookies same-site.
-  /// On HTTPS (remote), uses remoteUrl where SameSite=None;Secure works.
+  /// On HTTPS portal, uses host-based LAN URL upgraded to https (served by
+  /// the internal HTTPS listener on :443). On remote, uses remoteUrl.
   static String? _iframeUrl(ServiceEndpoint service, {String? overrideUrl}) {
     if (overrideUrl != null) return overrideUrl;
 
     final currentHost = Uri.base.host.toLowerCase();
 
     if (isLocalAccess(currentHost)) {
+      if (Uri.base.scheme == 'https') {
+        // HTTPS portal: use host-based URL upgraded to https to avoid Mixed Content.
+        // The internal HTTPS listener (:443) serves the same routes via host routing.
+        if (service.lanHostUrl != null) {
+          final lanUri = Uri.tryParse(service.lanHostUrl!);
+          if (lanUri != null) {
+            return lanUri.replace(scheme: 'https').toString();
+          }
+        }
+        // No host-based URL — can't embed HTTP in HTTPS iframe
+        return null;
+      }
       // HTTP LAN access: port-based URL is same-site with portal → cookies work
       return service.localUrl ?? service.remoteUrl;
     } else {
@@ -267,7 +280,13 @@ class AppLauncher {
     final title = "${app.displayTitle} (${service.name})";
 
     if (iframeUrl == null || iframeUrl.isEmpty) {
-      // Cannot open app without a URL
+      // Iframe embedding unavailable (e.g., mixed content on HTTPS portal).
+      // Fall back to opening in a new browser tab if a URL exists.
+      if (browserUrl != null && browserUrl.isNotEmpty) {
+        launchUrl(Uri.parse(browserUrl));
+        return;
+      }
+      // No URL available at all
       controller.openApp(
         windowId,
         "Launch failed",
