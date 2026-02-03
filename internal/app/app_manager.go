@@ -1311,7 +1311,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	}
 
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseRegisteringServices, 90, "Finalizing installation", false, nil)
-	if err := state.StoreApp(app, appDef); err != nil {
+	if err := state.StoreApp(app); err != nil {
 		// Cleanup all containers if storage fails
 		if app.NetworkAnchorID != "" {
 			_ = m.containerManager.StopContainer(ctx, runtime, app.NetworkAnchorID)
@@ -1850,7 +1850,7 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	}
 	appInst.UpdatedAt = time.Now()
 	// Must use StoreApp to persist the updated Definition (app.yaml with new image)
-	if err := state.StoreApp(appInst, &newDef); err != nil {
+	if err := state.StoreApp(appInst); err != nil {
 		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
 		_ = m.containerManager.RemoveContainer(ctx, runtime, newCID)
 		return fmt.Errorf("store app: %w", err)
@@ -1917,6 +1917,28 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return nil, err
+	}
+
+	// Auto-designate a primary listener if none is marked.
+	// The API caller doesn't set Primary (it's an internal concept from YAML install).
+	// For workspace apps editing listeners, pick the first eligible listener as primary.
+	// Primary listeners must support host-based routing (not flow:tls or protocol:raw).
+	if len(newDef.Listeners) > 0 {
+		hasPrimary := false
+		for _, l := range newDef.Listeners {
+			if l.Primary {
+				hasPrimary = true
+				break
+			}
+		}
+		if !hasPrimary {
+			for i, l := range newDef.Listeners {
+				if l.Flow != api.FlowTLS && l.Protocol != api.ListenerProtocolRaw {
+					newDef.Listeners[i].Primary = true
+					break
+				}
+			}
+		}
 	}
 
 	// Validate new definition
@@ -1991,7 +2013,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				log.Printf("ERROR: update listeners %s: port rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
 				appInst.SetPrimaryContainerID("")
-				_ = state.StoreApp(appInst, curDef)
+				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (ports): %v", err, rbErr)
 			}
 
@@ -2001,7 +2023,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				log.Printf("ERROR: update listeners %s: spec rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
 				appInst.SetPrimaryContainerID("")
-				_ = state.StoreApp(appInst, curDef)
+				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (spec): %v", err, rbErr)
 			}
 
@@ -2020,7 +2042,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				log.Printf("ERROR: update listeners %s: container rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
 				appInst.SetPrimaryContainerID("")
-				_ = state.StoreApp(appInst, curDef)
+				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (create): %v", err, rbErr)
 			}
 
@@ -2029,7 +2051,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				log.Printf("ERROR: update listeners %s: start rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
 				appInst.SetPrimaryContainerID(rbCID) // It exists but failed to start
-				_ = state.StoreApp(appInst, curDef)
+				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (start): %v", err, rbErr)
 			}
 
@@ -2041,7 +2063,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			appInst.SetPrimaryContainerID(rbCID)
 			appInst.Status = "running"
 			// Save the restored state to ensure persistence of new CID
-			if saveErr := state.StoreApp(appInst, curDef); saveErr != nil {
+			if saveErr := state.StoreApp(appInst); saveErr != nil {
 				log.Printf("WARN: update listeners %s: failed to save rollback state: %v", instanceID, saveErr)
 			}
 
@@ -2067,7 +2089,8 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 
 	m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseFinalizing, 90, "Saving configuration", false, nil)
 	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst, &newDef); err != nil {
+	appInst.Definition = &newDef
+	if err := state.StoreApp(appInst); err != nil {
 		return nil, fmt.Errorf("store app: %w", err)
 	}
 
@@ -2152,7 +2175,7 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 		appInst.Status = "running"
 	}
 	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst, nil); err != nil {
+	if err := state.StoreApp(appInst); err != nil {
 		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
 		_ = m.containerManager.RemoveContainer(ctx, runtime, newCID)
 		return fmt.Errorf("store app: %w", err)

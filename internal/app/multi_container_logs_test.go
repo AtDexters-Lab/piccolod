@@ -74,7 +74,7 @@ func TestAppManager_LogsForService_MultiContainer(t *testing.T) {
 		Definition: def,
 	}
 
-	if err := state.StoreApp(appInst, nil); err != nil {
+	if err := state.StoreApp(appInst); err != nil {
 		t.Fatalf("StoreApp: %v", err)
 	}
 

@@ -231,20 +231,18 @@ func (fsm *FilesystemStateManager) GetAppDefinition(instanceID string) (*api.App
 
 // StoreApp saves app definition and metadata to filesystem.
 // The app instance is stored under apps/{InstanceID}/.
-// Uses app.Definition for the app.yaml; the separate appDef parameter is kept for
-// backward compatibility but is ignored if app.Definition is set.
-func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDefinition) error {
+//
+// TODO: Callers mutate the cached AppInstance in-place before calling StoreApp.
+// If StoreApp fails (e.g. disk I/O), the in-memory cache diverges from disk.
+// Consider accepting a copy and updating the cache only on successful persist.
+func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
 
-	// Use embedded definition if available, fall back to parameter
+	if app.Definition == nil {
+		return fmt.Errorf("no app definition provided for instance %s", app.InstanceID)
+	}
 	def := app.Definition
-	if def == nil {
-		def = appDef
-	}
-	if def == nil {
-		return fmt.Errorf("no app definition provided")
-	}
 
 	appDir := filepath.Join(fsm.appsDir, app.InstanceID)
 	if err := os.MkdirAll(appDir, 0755); err != nil {
