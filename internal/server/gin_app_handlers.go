@@ -152,55 +152,6 @@ func writeGinSuccess(c *gin.Context, data interface{}, message string) {
 	c.JSON(http.StatusOK, response)
 }
 
-// requiresProxyOIDCClient checks if an app requires a proxy OIDC client per RFC 20260122 §5.3.
-// Proxy clients are needed for apps whose listeners use "headers" or "protected" auth strategies.
-// Per RFC 20260122 §4.1.1: auth omitted or empty rules → all paths default to "protected".
-func (s *GinServer) requiresProxyOIDCClient(appDef *api.AppDefinition) bool {
-	if appDef == nil {
-		return false
-	}
-	for _, listener := range appDef.Listeners {
-		if listener.Auth == nil || len(listener.Auth.Rules) == 0 {
-			// Auth omitted → all paths default to "protected" strategy.
-			return true
-		}
-		for _, rule := range listener.Auth.Rules {
-			strategy := rule.Strategy
-			if strategy == "" {
-				strategy = "public"
-			}
-			if strategy == "headers" || strategy == "protected" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// registerProxyOIDCClient registers a proxy OIDC client for an app per RFC 20260122 §5.3.
-func (s *GinServer) registerProxyOIDCClient(ctx context.Context, appName string) error {
-	clientMgr := s.getOIDCClientManager()
-	if clientMgr == nil {
-		return errors.New("OIDC client manager unavailable")
-	}
-
-	// Check if proxy client already exists
-	_, err := clientMgr.GetProxyClientByAppName(ctx, appName)
-	if err == nil {
-		// Client already exists
-		return nil
-	}
-
-	// Register new proxy client
-	_, _, err = clientMgr.RegisterProxyClient(ctx, appName)
-	if err != nil {
-		return fmt.Errorf("register proxy client: %w", err)
-	}
-
-	log.Printf("INFO: registered proxy OIDC client for app %s", appName)
-	return nil
-}
-
 // handleGinAppValidate handles POST /api/v1/apps/validate - Validate app.yaml without installing
 func (s *GinServer) handleGinAppValidate(c *gin.Context) {
 	contentType := c.GetHeader("Content-Type")
@@ -487,14 +438,6 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		}
 	}
 
-	// RFC 20260122 §5.3: Auto-register proxy OIDC client for apps with headers/protected auth strategies
-	if s.requiresProxyOIDCClient(appDef) {
-		if err := s.registerProxyOIDCClient(installCtx, appInstance.InstanceID); err != nil {
-			// Non-fatal: log but don't fail the install
-			log.Printf("WARN: failed to register proxy OIDC client for %s: %v", appInstance.InstanceID, err)
-		}
-	}
-
 	s.queueAppRemoteCertificates(appInstance.InstanceID)
 
 	response := GinAppResponse{
@@ -675,6 +618,18 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 	if err != nil {
 		writeGinError(c, http.StatusInternalServerError, "Updated successfully but failed to fetch fresh status")
 		return
+	}
+
+	// RFC 20260122 §5.3: Register/cleanup proxy OIDC client based on updated listener auth.
+	// No post-persist event exists for listener updates, so this is done explicitly here.
+	// Install and restore paths are handled by observeProxyOIDCClients.
+	// Use context.Background() so OIDC registration outlives the HTTP request.
+	if s.requiresProxyOIDCClient(newApp.Definition) {
+		if err := s.registerProxyOIDCClient(context.Background(), appName); err != nil {
+			log.Printf("WARN: failed to register proxy OIDC client for %s: %v", appName, err)
+		}
+	} else {
+		s.deleteProxyOIDCClient(context.Background(), appName)
 	}
 
 	recreated := oldApp.PrimaryContainerID() != newApp.PrimaryContainerID()

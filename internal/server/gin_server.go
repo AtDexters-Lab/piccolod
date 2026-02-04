@@ -494,6 +494,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.observeLockState(eventsBus)
 	s.observeLeadership(eventsBus)
 	s.observeRemoteConfig(eventsBus)
+	s.observeProxyOIDCClients(eventsBus)
 
 	for _, opt := range opts {
 		opt(s)
@@ -1694,6 +1695,129 @@ func (s *GinServer) observeRemoteConfig(bus *events.Bus) {
 			s.applyRemoteRuntimeFromStatus(status)
 		}
 	}()
+}
+
+// observeProxyOIDCClients auto-registers proxy OIDC clients for apps whose
+// listeners require authentication (RFC 20260122 §5.3).
+//
+// Subscribes to two topics:
+//   - TopicAppStatusChanged ("installed"): fires after StoreApp, covers new installs.
+//   - TopicServiceEndpointsChanged (added): covers RestoreFromPodman on reboot and
+//     any future path that adds endpoints.
+//
+// Note: cleanup of proxy OIDC clients on uninstall is handled separately in
+// handleGinAppUninstall (via DeleteClientsByAppID). Update-listeners uses an
+// explicit handler-level call because no post-persist event exists for that path.
+func (s *GinServer) observeProxyOIDCClients(bus *events.Bus) {
+	if bus == nil {
+		return
+	}
+	appStatusCh := bus.Subscribe(events.TopicAppStatusChanged, 8)
+	endpointsCh := bus.Subscribe(events.TopicServiceEndpointsChanged, 8)
+
+	tryRegister := func(appName string) {
+		ctx := context.Background()
+		appInst, err := s.appManager.Get(ctx, appName)
+		if err != nil || appInst.Definition == nil {
+			return
+		}
+		if !s.requiresProxyOIDCClient(appInst.Definition) {
+			return
+		}
+		if err := s.registerProxyOIDCClient(ctx, appName); err != nil {
+			// errOIDCManagerUnavailable means control store is still locked (expected during boot);
+			// RestoreServices will re-emit endpoint events after unlock.
+			if !errors.Is(err, errOIDCManagerUnavailable) {
+				log.Printf("WARN: auto-register proxy OIDC client for %s: %v", appName, err)
+			}
+		}
+	}
+
+	go func() {
+		for evt := range appStatusCh {
+			payload, ok := evt.Payload.(events.AppStatusChangedEvent)
+			if !ok || payload.Status != "installed" {
+				continue
+			}
+			tryRegister(payload.App)
+		}
+	}()
+	go func() {
+		for evt := range endpointsCh {
+			payload, ok := evt.Payload.(events.ServiceEndpointsChanged)
+			if !ok || len(payload.Added) == 0 {
+				continue
+			}
+			tryRegister(payload.App)
+		}
+	}()
+}
+
+// requiresProxyOIDCClient checks if an app requires a proxy OIDC client per RFC 20260122 §5.3.
+// Proxy clients are needed for apps whose listeners use "headers" or "protected" auth strategies.
+// Per RFC 20260122 §4.1.1: auth omitted or empty rules → all paths default to "protected".
+func (s *GinServer) requiresProxyOIDCClient(appDef *api.AppDefinition) bool {
+	if appDef == nil {
+		return false
+	}
+	for _, listener := range appDef.Listeners {
+		if listener.Auth == nil || len(listener.Auth.Rules) == 0 {
+			return true
+		}
+		for _, rule := range listener.Auth.Rules {
+			strategy := rule.Strategy
+			if strategy == "" {
+				strategy = "public"
+			}
+			if strategy == "headers" || strategy == "protected" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// errOIDCManagerUnavailable is returned when the OIDC client manager cannot be
+// obtained (e.g. control store still locked during boot).
+var errOIDCManagerUnavailable = errors.New("OIDC client manager unavailable")
+
+// deleteProxyOIDCClient removes the proxy OIDC client for an app if one exists.
+// Used when listener auth rules change such that a proxy client is no longer needed.
+func (s *GinServer) deleteProxyOIDCClient(ctx context.Context, appName string) {
+	clientMgr := s.getOIDCClientManager()
+	if clientMgr == nil {
+		return
+	}
+	client, err := clientMgr.GetProxyClientByAppName(ctx, appName)
+	if err != nil {
+		return // no proxy client exists — nothing to clean up
+	}
+	if err := clientMgr.DeleteClient(ctx, client.ID); err != nil {
+		log.Printf("WARN: failed to delete stale proxy OIDC client for %s: %v", appName, err)
+	} else {
+		log.Printf("INFO: deleted proxy OIDC client for app %s (auth no longer required)", appName)
+	}
+}
+
+// registerProxyOIDCClient registers a proxy OIDC client for an app per RFC 20260122 §5.3.
+func (s *GinServer) registerProxyOIDCClient(ctx context.Context, appName string) error {
+	clientMgr := s.getOIDCClientManager()
+	if clientMgr == nil {
+		return errOIDCManagerUnavailable
+	}
+
+	_, err := clientMgr.GetProxyClientByAppName(ctx, appName)
+	if err == nil {
+		return nil
+	}
+
+	_, _, err = clientMgr.RegisterProxyClient(ctx, appName)
+	if err != nil {
+		return fmt.Errorf("register proxy client: %w", err)
+	}
+
+	log.Printf("INFO: registered proxy OIDC client for app %s", appName)
+	return nil
 }
 
 func (s *GinServer) handleGinReadinessCheck(c *gin.Context) {
