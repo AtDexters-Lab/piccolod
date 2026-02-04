@@ -463,6 +463,13 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				resp.Header.Add("Set-Cookie", sc)
 			}
 		}
+
+		// Set embedded marker cookie on initial iframe loads so subsequent
+		// XHR/fetch from within the iframe can propagate CHIPS context.
+		if proxyContextNeedsMarker(resp.Request.Context()) {
+			resp.Header.Add("Set-Cookie", embeddedMarkerSetCookie())
+		}
+
 		return nil
 	}
 
@@ -674,8 +681,9 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		// for LAN port-based isolation.
 		rewriteCookies := shouldRewriteLegacyCookies(r.Host)
 		partitionCookies := shouldPartitionCookies(r)
+		needsMarker := needsEmbeddedMarker(r)
 		stripAndRewriteRequestCookies(r, ep.App, rewriteCookies)
-		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies, partitionCookies)
+		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies, partitionCookies, needsMarker)
 
 		applyForwardHeaders(r, ep)
 

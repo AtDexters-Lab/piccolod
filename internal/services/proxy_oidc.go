@@ -50,6 +50,7 @@ type OIDCState struct {
 	OriginalPath   string    // Path+query to redirect back to (MUST be relative, no scheme/host)
 	ExpectedApp    string    // App name (prevents confused deputy)
 	ExpectedOrigin string    // Expected callback origin (scheme://host[:port])
+	IsIframe       bool      // True when the OIDC flow was initiated from an iframe context (CHIPS)
 	CreatedAt      time.Time // For expiry
 }
 
@@ -255,18 +256,30 @@ func (h *ProxyOIDCHandler) InitiateOIDCFlow(w http.ResponseWriter, r *http.Reque
 		originalPath += "?" + r.URL.RawQuery
 	}
 
+	// Detect iframe context for CHIPS propagation. The initial OIDC redirect
+	// is the last point where Sec-Fetch-Dest: iframe is available; subsequent
+	// redirects within the frame carry Sec-Fetch-Dest: document.
+	isIframe := needsEmbeddedMarker(r)
+
 	// Create state entry
 	state := &OIDCState{
 		CodeVerifier:   codeVerifier,
 		OriginalPath:   originalPath,
 		ExpectedApp:    appName,
 		ExpectedOrigin: callbackOrigin,
+		IsIframe:       isIframe,
 	}
 
 	if err := h.stateStore.Create(state); err != nil {
 		log.Printf("ERROR: proxy OIDC: failed to create state: %v", err)
 		writeProxyJSONError(w, http.StatusInternalServerError, "internal_error", "STATE_CREATE_FAILED")
 		return
+	}
+
+	// Set the embedded marker cookie early (on the redirect response) so the
+	// browser stores it in the iframe partition before navigating to the IdP.
+	if isIframe {
+		http.SetCookie(w, embeddedMarkerCookie())
 	}
 
 	// Build authorization URL
@@ -409,14 +422,23 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 		cookie.Secure = true
 	}
 
-	// CHIPS: partition cookies for host-based HTTPS LAN iframe embedding
-	if shouldPartitionCookies(r) {
+	// CHIPS: partition cookies for host-based HTTPS LAN iframe embedding.
+	// Use the stored IsIframe flag from the OIDC state since Sec-Fetch-Dest
+	// is no longer "iframe" by the time the callback fires (it's "document"
+	// for navigations within a frame).
+	if state.IsIframe || shouldPartitionCookies(r) {
 		cookie.SameSite = http.SameSiteNoneMode
 		cookie.Secure = true
 		cookie.Partitioned = true
 	}
 
 	http.SetCookie(w, cookie)
+
+	// Re-set the embedded marker cookie on the callback response so subsequent
+	// XHR/fetch from within the iframe propagate the CHIPS context.
+	if state.IsIframe {
+		http.SetCookie(w, embeddedMarkerCookie())
+	}
 
 	// Redirect to original path (safe: OriginalPath is relative, not absolute)
 	redirectURL := state.ExpectedOrigin + state.OriginalPath
@@ -503,8 +525,8 @@ func (h *ProxyOIDCHandler) computePortalOrigin(r *http.Request) string {
 	// Get base hostname from mDNS manager
 	hostname := "piccolo.local"
 	if h.config.GetLocalHostname != nil {
-		if h := h.config.GetLocalHostname(); h != "" {
-			hostname = h
+		if name := h.config.GetLocalHostname(); name != "" {
+			hostname = name
 		}
 	}
 
