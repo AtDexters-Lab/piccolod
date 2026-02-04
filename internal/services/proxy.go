@@ -429,6 +429,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 
 			appHost := normalizeHostNoPort(proxyContextAppHost(resp.Request.Context()))
 			rewriteCookies := proxyContextCookieRewrite(resp.Request.Context())
+			partitionCookies := proxyContextPartitionCookies(resp.Request.Context())
 			appPrefix := cookiePrefixForApp(ep.App)
 
 			for _, sc := range setCookies {
@@ -453,6 +454,12 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				if rewriteCookies && setCookieHasHttpOnly(sc) && !strings.HasPrefix(name, appPrefix) {
 					sc = appPrefix + name + sc[eq:]
 				}
+
+				// CHIPS: add Partitioned, SameSite=None, Secure for cross-site iframe embedding
+				if partitionCookies {
+					sc = ensurePartitionedAttributes(sc)
+				}
+
 				resp.Header.Add("Set-Cookie", sc)
 			}
 		}
@@ -666,8 +673,9 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		// RFC 4.1.5 + 4.1.8: Strip Piccolo cookies before forwarding and optionally rewrite cookies
 		// for LAN port-based isolation.
 		rewriteCookies := shouldRewriteLegacyCookies(r.Host)
+		partitionCookies := shouldPartitionCookies(r)
 		stripAndRewriteRequestCookies(r, ep.App, rewriteCookies)
-		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies)
+		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies, partitionCookies)
 
 		applyForwardHeaders(r, ep)
 

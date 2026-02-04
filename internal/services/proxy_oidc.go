@@ -409,6 +409,13 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 		cookie.Secure = true
 	}
 
+	// CHIPS: partition cookies for host-based HTTPS LAN iframe embedding
+	if shouldPartitionCookies(r) {
+		cookie.SameSite = http.SameSiteNoneMode
+		cookie.Secure = true
+		cookie.Partitioned = true
+	}
+
 	http.SetCookie(w, cookie)
 
 	// Redirect to original path (safe: OriginalPath is relative, not absolute)
