@@ -11,8 +11,9 @@ import 'widgets/local_fallback_overlay.dart';
 class AppLauncher {
   /// URL for embedding in an iframe. Prefers port-based (localUrl) on HTTP
   /// because it shares the portal's hostname, keeping cookies same-site.
-  /// On HTTPS portal, uses host-based LAN URL upgraded to https (served by
-  /// the internal HTTPS listener on :443). On remote, uses remoteUrl.
+  /// On HTTPS portal, uses host-based LAN URL (backend returns https:// when
+  /// request is HTTPS, routed via the internal :443 TLS mux). On remote, uses
+  /// remoteUrl.
   static String? _iframeUrl(ServiceEndpoint service, {String? overrideUrl}) {
     if (overrideUrl != null) return overrideUrl;
 
@@ -26,14 +27,8 @@ class AppLauncher {
         if (isIpAddress(currentHost) || isLoopback(currentHost)) {
           return null;
         }
-        // HTTPS + .local: use host-based URL upgraded to https to avoid Mixed Content.
-        // The internal HTTPS listener (:443) serves the same routes via host routing.
-        if (service.lanHostUrl != null) {
-          final lanUri = Uri.tryParse(service.lanHostUrl!);
-          if (lanUri != null) {
-            return lanUri.replace(scheme: 'https').toString();
-          }
-        }
+        // HTTPS + .local: lanHostUrl is already https:// (backend honors request scheme).
+        if (service.lanHostUrl != null) return service.lanHostUrl;
         // No host-based URL — can't embed HTTP in HTTPS iframe
         return null;
       }
@@ -50,6 +45,7 @@ class AppLauncher {
 
   /// URL for opening in a new browser tab. Prefers host-based LAN URL
   /// when on .local since top-level navigations have no cookie restrictions.
+  /// Backend returns lanHostUrl with the correct scheme (https when portal is HTTPS).
   static String? _browserUrl(ServiceEndpoint service) {
     final currentHost = Uri.base.host.toLowerCase();
 

@@ -1230,7 +1230,18 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 			lanBase := s.mdnsManager.Hostname()
 			// RFC 20260122 §4.4: Use 2-level mDNS format with hyphen separator
 			lanHostname := hostnamepkg.DeriveLANHostname(ep.DerivedHostLabel, lanBase)
-			lanHostURL := fmt.Sprintf("%s://%s", scheme, lanHostname)
+			// Honor request scheme: host-based URLs route through the :443 TLS mux
+			// when the portal is on HTTPS, so return https:// directly instead of
+			// forcing every frontend consumer to upgrade the scheme.
+			lanScheme := scheme
+			if s.isSecureRequest(c.Request) && (scheme == "http" || scheme == "ws") {
+				if scheme == "http" {
+					lanScheme = "https"
+				} else {
+					lanScheme = "wss"
+				}
+			}
+			lanHostURL := fmt.Sprintf("%s://%s", lanScheme, lanHostname)
 			result["lan_host_url"] = lanHostURL
 		}
 
