@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	"piccolod/internal/api"
 	"piccolod/internal/app/workspacedisk"
@@ -249,14 +251,65 @@ func (m *AppManager) pullImageWithProgress(
 		)
 	}
 
-	// Pull image with progress
-	err := m.containerManager.PullImageWithProgress(ctx, runtime, image, callback)
-	if err != nil {
-		log.Printf("WARN: install %s: image pull failed for %s: %v", instanceID, image, err)
-		return err
+	// Pull image with progress, retrying on transient failures.
+	retryDelays := []time.Duration{2 * time.Second, 5 * time.Second}
+	maxAttempts := len(retryDelays) + 1
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		lastErr = m.containerManager.PullImageWithProgress(ctx, runtime, image, callback)
+		if lastErr == nil {
+			return nil
+		}
+
+		// Don't retry on context cancellation or deterministic failures
+		if ctx.Err() != nil {
+			return lastErr
+		}
+		errMsg := strings.ToLower(lastErr.Error())
+		for _, pattern := range []string{
+			"invalid image name",
+			"manifest unknown",
+			"repository does not exist",
+			"unauthorized",
+			"authentication required",
+			"denied:",
+		} {
+			if strings.Contains(errMsg, pattern) {
+				return lastErr
+			}
+		}
+
+		log.Printf("WARN: install %s: image pull attempt %d/%d failed for %s: %v",
+			instanceID, attempt, maxAttempts, image, lastErr)
+
+		if attempt < maxAttempts {
+			delay := retryDelays[attempt-1]
+			m.emitProgressWithMetadata(
+				ctx,
+				taskTypeInstallApp,
+				instanceID,
+				taskPhasePullingImage,
+				progressRange.Min,
+				fmt.Sprintf("Retrying image pull (attempt %d/%d)", attempt+1, maxAttempts),
+				false,
+				map[string]any{
+					"service": svcName,
+					"image":   image,
+					"attempt": attempt + 1,
+				},
+				nil,
+			)
+
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 	}
 
-	return nil
+	return lastErr
 }
 
 // formatBytes formats bytes into a human-readable string.
@@ -314,16 +367,24 @@ func (m *AppManager) prepareServiceStorage(
 	diskInitialized := m.isWorkspaceDiskInitialized(ctx, instanceID, layout)
 
 	if !diskInitialized {
-		// New install: pull base image with progress and initialize workspace disk
-		// The runtime uses vfs driver for workspace apps, but images are stored
-		// in the shared imagestore for layer deduplication regardless of driver.
-		if err := m.pullImageWithProgress(ctx, runtime, svc.Image, instanceID, svcName, progressRange); err != nil {
-			log.Printf("WARN: install %s: image pull failed: %v", instanceID, err)
+		// New install: pull base image with progress and initialize workspace disk.
+		// Pull is best-effort to preserve offline resilience — if the image is
+		// already cached locally, a pull failure (network down, registry issue)
+		// should not block installation. The subsequent InspectImage call is the
+		// hard gate: if the image isn't available at all, it will fail there.
+		pullErr := m.pullImageWithProgress(ctx, runtime, svc.Image, instanceID, svcName, progressRange)
+		if pullErr != nil {
+			log.Printf("WARN: install %s: image pull failed, will attempt to use cached image: %v", instanceID, pullErr)
 		}
 
-		// Get image config for workspace disk metadata
+		// Get image config for workspace disk metadata.
+		// If the pull failed and the image isn't cached either, surface both
+		// the pull error (root cause) and the inspect error (symptom).
 		imgConfig, err := m.containerManager.InspectImage(ctx, runtime, svc.Image)
 		if err != nil {
+			if pullErr != nil {
+				return nil, fmt.Errorf("image %s unavailable: pull failed: %v, and image not cached locally: %w", svc.Image, pullErr, err)
+			}
 			return nil, fmt.Errorf("inspect image %s: %w", svc.Image, err)
 		}
 
