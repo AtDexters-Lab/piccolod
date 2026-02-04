@@ -187,11 +187,6 @@ type ProxyOIDCConfig struct {
 
 	// UserCanAccessApp checks if a user can access an app (allowed_apps)
 	UserCanAccessApp func(ctx context.Context, userID, appName string) (bool, error)
-
-	// TrustForwardedProto controls whether X-Forwarded-Proto is trusted for origin computation.
-	// RFC 20260122 §6.2: Must be explicitly set; defaults to false for security.
-	// Set to true when the proxy runs behind a trusted TLS terminator (e.g., Piccolo's TLS mux).
-	TrustForwardedProto bool
 }
 
 // ExchangeResult contains the result of an OIDC token exchange per RFC 20260122 §5.6.
@@ -418,7 +413,7 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 	}
 
 	// Set Secure flag for HTTPS (must match computeCallbackOrigin logic)
-	if r.TLS != nil || (h.config.TrustForwardedProto && r.Header.Get("X-Forwarded-Proto") == "https") {
+	if RequestArrivedViaTLS(r) {
 		cookie.Secure = true
 	}
 
@@ -449,7 +444,7 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 func (h *ProxyOIDCHandler) computeCallbackOrigin(r *http.Request, ep ServiceEndpoint) string {
 	scheme := "http"
 	// Use RequestArrivedViaTLS to detect TLS from both direct TLS and TLS mux (connection hint).
-	if RequestArrivedViaTLS(r) || (h.config.TrustForwardedProto && r.Header.Get("X-Forwarded-Proto") == "https") {
+	if RequestArrivedViaTLS(r) {
 		scheme = "https"
 	}
 
@@ -518,7 +513,7 @@ func (h *ProxyOIDCHandler) computeCallbackOrigin(r *http.Request, ep ServiceEndp
 // computePortalOrigin computes the portal origin for redirects.
 func (h *ProxyOIDCHandler) computePortalOrigin(r *http.Request) string {
 	scheme := "http"
-	if r.TLS != nil || (h.config.TrustForwardedProto && r.Header.Get("X-Forwarded-Proto") == "https") {
+	if RequestArrivedViaTLS(r) {
 		scheme = "https"
 	}
 

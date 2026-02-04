@@ -597,9 +597,10 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 				}
 				return s.userManager.IsAppAllowed(ctx, userID, appName)
 			},
-			// RFC 20260122 §6.2: Trust X-Forwarded-Proto because Piccolo's TLS mux
-			// terminates TLS and sets this header for downstream handlers.
-			TrustForwardedProto: true,
+			// X-Forwarded-Proto is NOT trusted anywhere: the TLS mux terminates
+			// TLS and forwards cleartext HTTP via io.Copy — it never injects
+			// HTTP headers. TLS is detected via RequestArrivedViaTLS
+			// (r.TLS + proxy hints).
 		})
 	}
 
@@ -835,8 +836,9 @@ func (s *GinServer) portalOriginForRequest(r *http.Request) string {
 	case "http":
 		portalPort = envPort
 	case "https":
-		// In a common "https reverse proxy → piccolod:80" setup, X-Forwarded-Proto indicates https
-		// while piccolod listens on 80; do not append :80 to the external origin.
+		// When the request arrived over TLS (r.TLS or secureContextKeyInstance), the scheme
+		// is https. PORT typically reflects the HTTP listener (e.g. 80); do not
+		// append :80 to an https origin.
 		if envPort != 80 {
 			portalPort = envPort
 		}
@@ -1274,14 +1276,11 @@ func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoin
 	r := c.Request
 
 	// Suppress local URLs only for nexus/TLS-mux proxied requests (remote access).
-	// These are identified by the secureContextKey set in the secure loopback handler,
-	// or by the X-Forwarded-Proto header set by the TLS mux.
+	// Identified by secureContextKey set in the secure loopback handler.
 	// Internal HTTPS requests (r.TLS != nil from :443 listener) are still LAN requests
 	// and should receive local URLs so the UI can offer new-tab fallback.
+	// X-Forwarded-Proto is NOT trusted (spoofable by any client).
 	if r.Context().Value(secureContextKeyInstance) != nil {
-		return nil
-	}
-	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
 		return nil
 	}
 
@@ -2084,22 +2083,30 @@ func (s *GinServer) httpsRedirectMiddleware() gin.HandlerFunc {
 }
 
 // isRemoteSecureRequest returns true only for requests arriving through the
-// nexus/remote TLS path (secureContextKey) or an HTTPS reverse proxy
-// (X-Forwarded-Proto). Internal HTTPS (LAN :443) is NOT included because
-// those requests should not receive remote-only headers such as HSTS.
+// nexus/remote TLS path (secureContextKey). Internal HTTPS (LAN :443) is NOT
+// included because those requests should not receive remote-only headers such
+// as HSTS.
+//
+// X-Forwarded-Proto is NOT trusted here — the TLS mux terminates TLS and
+// forwards cleartext HTTP via io.Copy without injecting HTTP headers. Remote
+// portal traffic goes through the secure loopback which sets
+// secureContextKeyInstance. Trusting X-Forwarded-Proto would let any LAN
+// client spoof a remote-secure context.
 func (s *GinServer) isRemoteSecureRequest(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
-	if r.Context().Value(secureContextKeyInstance) != nil {
-		return true
-	}
-	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		return true
-	}
-	return false
+	return r.Context().Value(secureContextKeyInstance) != nil
 }
 
+// isSecureRequest returns true for requests that arrived over a secure channel:
+// direct TLS (:443) or the TLS mux secure loopback (secureContextKey).
+//
+// X-Forwarded-Proto is NOT trusted — the TLS mux terminates TLS and forwards
+// cleartext HTTP via io.Copy without injecting HTTP headers. All legitimate
+// secure paths are covered by r.TLS (LAN HTTPS) and secureContextKeyInstance
+// (TLS mux → secure loopback). Trusting the header would let any client
+// bypass the HTTPS redirect.
 func (s *GinServer) isSecureRequest(r *http.Request) bool {
 	if r == nil {
 		return false
@@ -2107,13 +2114,7 @@ func (s *GinServer) isSecureRequest(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	if v := r.Context().Value(secureContextKeyInstance); v != nil {
-		return true
-	}
-	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		return true
-	}
-	return false
+	return r.Context().Value(secureContextKeyInstance) != nil
 }
 
 func canonicalHost(v string) string {

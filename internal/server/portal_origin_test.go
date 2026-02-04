@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http/httptest"
 	"testing"
 
@@ -40,13 +41,31 @@ func TestPortalOriginForRequest_HTTPSDoesNotAppendPort80(t *testing.T) {
 
 	s := &GinServer{}
 	req := httptest.NewRequest("GET", "http://piccolo.local:35080/", nil)
-	req.Header.Set("X-Forwarded-Proto", "https")
+	// Use the secure loopback context key (the trusted TLS indicator) instead of
+	// X-Forwarded-Proto which is client-spoofable and no longer trusted.
+	ctx := context.WithValue(req.Context(), secureContextKeyInstance, true)
+	req = req.WithContext(ctx)
 	req.Host = "piccolo.local:35080"
 	req.RemoteAddr = "192.0.2.1:1234"
 
 	origin := s.portalOriginForRequest(req)
 	if origin != "https://piccolo.local" {
 		t.Fatalf("expected origin https://piccolo.local, got %q", origin)
+	}
+}
+
+func TestPortalOriginForRequest_IgnoresSpoofedXForwardedProto(t *testing.T) {
+	t.Setenv("PORT", "80")
+
+	s := &GinServer{}
+	req := httptest.NewRequest("GET", "http://piccolo.local:35080/", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Host = "piccolo.local:35080"
+	req.RemoteAddr = "192.0.2.1:1234"
+
+	origin := s.portalOriginForRequest(req)
+	if origin != "http://piccolo.local" {
+		t.Fatalf("expected spoofed X-Forwarded-Proto to be ignored, got %q", origin)
 	}
 }
 
