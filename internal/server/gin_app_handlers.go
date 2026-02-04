@@ -391,6 +391,36 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		return
 	}
 
+	// Workspace apps: handle workspace_name identity
+	if looseDef.WorkspaceName != "" && len(looseDef.Listeners) == 0 {
+		wsName := looseDef.WorkspaceName // default: template's workspace_name (custom Docker Hub flow)
+
+		// Catalog flow: substitute __app_address__ into workspace_name
+		if appAddress, ok := userInputs["__app_address__"].(string); ok && strings.TrimSpace(appAddress) != "" {
+			wsName = strings.TrimSpace(appAddress)
+		}
+
+		// Validate and check collision (both flows)
+		if err := app.ValidateInstanceID(wsName); err != nil {
+			writeGinError(c, http.StatusBadRequest, "Invalid workspace name: "+err.Error())
+			return
+		}
+		existingApps, err := s.appManager.List(c.Request.Context())
+		if err != nil {
+			writeGinError(c, http.StatusInternalServerError, "Failed to check existing apps: "+err.Error())
+			return
+		}
+		existingIDs := make([]string, len(existingApps))
+		for i, a := range existingApps {
+			existingIDs[i] = a.InstanceID
+		}
+		if err := app.ValidatePrimaryNameAvailable(wsName, existingIDs); err != nil {
+			writeGinError(c, http.StatusConflict, err.Error())
+			return
+		}
+		looseDef.WorkspaceName = wsName
+	}
+
 	// Set defaults and validate
 	app.SetDefaults(looseDef)
 	if err := app.ValidateAppDefinition(looseDef); err != nil {
