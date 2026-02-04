@@ -33,6 +33,10 @@ Future<bool> _tryUpgradeToHttps() async {
   final host = uri.host.toLowerCase();
   if (host == 'localhost' || host == '127.0.0.1') return false;
 
+  // Skip IP addresses — cert doesn't cover LAN IPs (DHCP-assigned),
+  // and HTTPS+IP can't embed apps in iframes anyway.
+  if (_isIpAddress(host)) return false;
+
   // Probe HTTPS using no-cors mode (cross-origin safe).
   // A non-throwing fetch means TLS succeeded → CA is trusted.
   try {
@@ -50,6 +54,12 @@ Future<bool> _tryUpgradeToHttps() async {
     // HTTPS unavailable or CA not trusted — continue on HTTP
   }
 
+  return false;
+}
+
+bool _isIpAddress(String host) {
+  if (RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(host)) return true;
+  if (host.contains(':')) return true; // IPv6
   return false;
 }
 

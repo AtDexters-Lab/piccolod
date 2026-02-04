@@ -467,6 +467,15 @@ func (m *Manager) ObserveServiceEndpoints(bus *events.Bus) {
 	m.endpointsUnsubscribe = unsubscribe
 	m.endpointsMu.Unlock()
 
+	// Wire NameRegistry hostname changes to the event bus.
+	// The callback runs synchronously inside rebuildLocked() (under NameRegistry.mu)
+	// so it must not block. Bus.Publish uses non-blocking send with drop semantics.
+	if m.names != nil {
+		m.names.SetOnChange(func() {
+			bus.Publish(events.Event{Topic: events.TopicHostnamesChanged})
+		})
+	}
+
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -503,6 +512,11 @@ func (m *Manager) StopServiceEndpointsObserver() {
 		m.endpointsUnsubscribe = nil
 	}
 	m.endpointsMu.Unlock()
+
+	// Deregister hostname change callback
+	if m.names != nil {
+		m.names.SetOnChange(nil)
+	}
 
 	// Cancel any pending debounced announcement
 	m.announceDebounceMu.Lock()

@@ -667,13 +667,23 @@ class _AppDetailViewState extends State<AppDetailView>
                           const Divider(height: 24),
                           _buildNetworkRow("Internal Port", "${svc.guestPort}"),
                           if (svc.lanHostUrl != null)
-                            _buildNetworkLinkRow(
-                              "LAN Access",
-                              svc.lanHostUrl!,
-                              onTap: () => launchUrl(Uri.parse(svc.lanHostUrl!)),
-                              icon: Icons.open_in_new,
-                              tooltip: "Opens in new tab",
-                            ),
+                            Builder(builder: (_) {
+                              final host = Uri.base.host.toLowerCase();
+                              // When accessed via IP, prefer localUrl (port-based) since
+                              // mDNS hostname won't resolve for this user.
+                              final useLocal = AppLauncher.isIpAddress(host) ||
+                                  AppLauncher.isLoopback(host);
+                              final url = useLocal
+                                  ? (svc.localUrl ?? svc.lanHostUrl!)
+                                  : svc.lanHostUrl!;
+                              return _buildNetworkLinkRow(
+                                "LAN Access",
+                                url,
+                                onTap: () => launchUrl(Uri.parse(url)),
+                                icon: Icons.open_in_new,
+                                tooltip: "Opens in new tab",
+                              );
+                            }),
                           if (svc.localUrl != null)
                             _buildNetworkLinkRow(
                               svc.lanHostUrl != null

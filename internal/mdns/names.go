@@ -3,6 +3,7 @@ package mdns
 import (
 	"fmt"
 	"log"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +22,11 @@ type NameRegistry struct {
 	fqdns           map[string]struct{}
 	snapshot        []string
 	includeGateway  bool              // Whether to include piccolo.local (gateway leader)
+
+	// onChange is called synchronously inside rebuildLocked() when the snapshot
+	// changes. The callback MUST NOT block (e.g., use a non-blocking channel
+	// send). Lock ordering: NameRegistry.mu → any lock acquired by onChange.
+	onChange func()
 }
 
 func newNameRegistry(base, specificName string) *NameRegistry {
@@ -89,6 +95,14 @@ func (r *NameRegistry) MatchName(name string) bool {
 	defer r.mu.RUnlock()
 	_, ok := r.fqdns[key]
 	return ok
+}
+
+// SetOnChange registers a callback invoked when the hostname snapshot changes.
+// Pass nil to deregister. The callback runs under the write lock and must not block.
+func (r *NameRegistry) SetOnChange(fn func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onChange = fn
 }
 
 // SetBaseName updates the base hostname and rebuilds derived FQDNs.
@@ -191,8 +205,16 @@ func (r *NameRegistry) rebuildLocked() {
 	}
 
 	sort.Strings(snapshot)
+
+	changed := !slices.Equal(r.snapshot, snapshot)
 	r.fqdns = fqdns
 	r.snapshot = snapshot
+
+	if changed {
+		if fn := r.onChange; fn != nil {
+			fn()
+		}
+	}
 }
 
 func normalizeFQDN(name string) string {

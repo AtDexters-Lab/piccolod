@@ -1387,25 +1387,24 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 }
 
 // subscribeCertRefresh watches for hostname/leadership changes to regenerate cert SANs.
-// TopicServiceEndpointsChanged: app endpoints change mDNS aliases
-// TopicLeadershipRoleChanged: gateway leader may add/remove piccolo.local
-// Updates are serialized through a single channel to prevent concurrent
-// cert/key writes and reduce redundant I/O during event bursts.
+// subscribeCertRefresh listens for TopicHostnamesChanged events (emitted by the
+// mDNS NameRegistry after its hostname snapshot is updated) and regenerates the
+// server TLS certificate with the current SAN list. This replaces the previous
+// approach of subscribing to raw TopicServiceEndpointsChanged / TopicLeadershipRoleChanged
+// events which raced with the mDNS debounce, causing stale SAN lists.
 func (s *GinServer) subscribeCertRefresh() {
 	if s.certRefreshUnsub != nil {
 		s.certRefreshUnsub()
 	}
-	if s.events == nil {
+	if s.events == nil || s.internalCA == nil {
 		return
 	}
 
-	ch1, unsub1 := s.events.SubscribeWithCancel(events.TopicServiceEndpointsChanged, 16)
-	ch2, unsub2 := s.events.SubscribeWithCancel(events.TopicLeadershipRoleChanged, 4)
+	ch, unsub := s.events.SubscribeWithCancel(events.TopicHostnamesChanged, 4)
 	refreshCh := make(chan struct{}, 1)
 	done := make(chan struct{})
 	s.certRefreshUnsub = func() {
-		unsub1() // closes ch1
-		unsub2() // closes ch2
+		unsub()
 		close(done)
 	}
 	trigger := func() {
@@ -1415,12 +1414,7 @@ func (s *GinServer) subscribeCertRefresh() {
 		}
 	}
 	go func() {
-		for range ch1 {
-			trigger()
-		}
-	}()
-	go func() {
-		for range ch2 {
+		for range ch {
 			trigger()
 		}
 	}()

@@ -162,4 +162,5 @@ type Manager struct {
 	announceDebounceMu    sync.Mutex
 	announceDebounceTimer *time.Timer
 	announcePending       bool
+
 }

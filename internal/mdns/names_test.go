@@ -89,6 +89,72 @@ func TestManagerSetHostAliasesFiltersInvalid(t *testing.T) {
 	}
 }
 
+// --- onChange callback tests ---
+
+func TestOnChange_FiresOnSetAliases(t *testing.T) {
+	reg := newNameRegistry("piccolo", "piccolo-abc123")
+	fired := 0
+	reg.SetOnChange(func() { fired++ })
+
+	reg.SetAliases([]string{"immich"})
+	if fired != 1 {
+		t.Fatalf("expected onChange to fire once, got %d", fired)
+	}
+}
+
+func TestOnChange_DoesNotFireWhenSnapshotUnchanged(t *testing.T) {
+	reg := newNameRegistry("piccolo", "piccolo-abc123")
+	reg.SetAliases([]string{"immich"})
+
+	fired := 0
+	reg.SetOnChange(func() { fired++ })
+
+	// Set same aliases again — snapshot unchanged
+	reg.SetAliases([]string{"immich"})
+	if fired != 0 {
+		t.Fatalf("expected onChange not to fire for identical snapshot, got %d", fired)
+	}
+}
+
+func TestOnChange_FiresOnGatewayHostname(t *testing.T) {
+	reg := newNameRegistry("piccolo-abc123", "piccolo-abc123")
+	fired := 0
+	reg.SetOnChange(func() { fired++ })
+
+	reg.AddGatewayHostname()
+	if fired != 1 {
+		t.Fatalf("expected onChange on AddGatewayHostname, got %d", fired)
+	}
+
+	reg.RemoveGatewayHostname()
+	if fired != 2 {
+		t.Fatalf("expected onChange on RemoveGatewayHostname, got %d", fired)
+	}
+}
+
+func TestOnChange_NilCallbackNoPanic(t *testing.T) {
+	reg := newNameRegistry("piccolo", "piccolo-abc123")
+	// No callback set — should not panic
+	reg.SetAliases([]string{"immich"})
+}
+
+func TestOnChange_Deregister(t *testing.T) {
+	reg := newNameRegistry("piccolo", "piccolo-abc123")
+	fired := 0
+	reg.SetOnChange(func() { fired++ })
+
+	reg.SetAliases([]string{"immich"})
+	if fired != 1 {
+		t.Fatalf("expected 1, got %d", fired)
+	}
+
+	reg.SetOnChange(nil) // deregister
+	reg.SetAliases([]string{"immich", "blog"})
+	if fired != 1 {
+		t.Fatalf("expected still 1 after deregister, got %d", fired)
+	}
+}
+
 func contains(list []string, target string) bool {
 	for _, item := range list {
 		if strings.EqualFold(item, target) {

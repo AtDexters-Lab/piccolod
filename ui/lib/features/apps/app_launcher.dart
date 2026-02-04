@@ -20,7 +20,13 @@ class AppLauncher {
 
     if (isLocalAccess(currentHost)) {
       if (Uri.base.scheme == 'https') {
-        // HTTPS portal: use host-based URL upgraded to https to avoid Mixed Content.
+        // HTTPS + IP/loopback: can't embed via mDNS hostname (user lacks mDNS)
+        // and can't embed HTTP port-based URL (Mixed Content).
+        // Return null to trigger browser tab fallback in openAppWindow().
+        if (isIpAddress(currentHost) || isLoopback(currentHost)) {
+          return null;
+        }
+        // HTTPS + .local: use host-based URL upgraded to https to avoid Mixed Content.
         // The internal HTTPS listener (:443) serves the same routes via host routing.
         if (service.lanHostUrl != null) {
           final lanUri = Uri.tryParse(service.lanHostUrl!);
@@ -50,7 +56,8 @@ class AppLauncher {
     if (currentHost.endsWith('.local')) {
       return service.lanHostUrl ?? service.localUrl ?? service.remoteUrl;
     } else if (isIpAddress(currentHost) || isLoopback(currentHost)) {
-      return service.localUrl ?? service.lanHostUrl ?? service.remoteUrl;
+      // IP/loopback access: skip lanHostUrl (mDNS hostname won't resolve for this user)
+      return service.localUrl ?? service.remoteUrl;
     } else {
       return service.remoteUrl ?? service.lanHostUrl ?? service.localUrl;
     }
