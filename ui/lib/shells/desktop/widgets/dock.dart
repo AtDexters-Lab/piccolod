@@ -168,6 +168,10 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   // Map of app:listener -> health status
   final Map<String, ListenerHealth> _healthMap = {};
   StreamSubscription<ListenerHealthEvent>? _subscription;
+  // True between WebSocket connect and receiving health data (or grace timeout).
+  // Prevents a brief "Healthy" flash on transient reconnects when backend is down.
+  bool _pendingSnapshot = false;
+  Timer? _snapshotGrace;
 
   @override
   void initState() {
@@ -215,9 +219,26 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   void _onClientStateChanged() {
     if (!mounted) return;
     final client = widget.controller.eventStreamClient;
-    // Clear stale health data on reconnect; server will send fresh snapshot
+    // Clear stale health data on reconnect; server will send fresh snapshot.
+    // Mark as pending so the UI shows "Offline" until real data arrives,
+    // preventing a brief "Healthy" flash on transient reconnects.
     if (client?.state == WebSocketConnectionState.connected) {
       _healthMap.clear();
+      _pendingSnapshot = true;
+      _snapshotGrace?.cancel();
+      _snapshotGrace = Timer(const Duration(seconds: 3), () {
+        if (!mounted) return;
+        // Grace period expired — only clear the pending flag if we actually
+        // received health data. If the map is still empty, keep showing
+        // "Offline" rather than a false "Healthy".
+        if (_healthMap.isNotEmpty) {
+          setState(() => _pendingSnapshot = false);
+        }
+      });
+    } else {
+      // Disconnected — cancel any pending grace timer.
+      _snapshotGrace?.cancel();
+      _pendingSnapshot = false;
     }
     setState(() {});
   }
@@ -227,11 +248,17 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
     setState(() {
       final key = '${event.app}:${event.listener}';
       _healthMap[key] = event.health;
+      // Real health data arrived — no longer pending.
+      if (_pendingSnapshot) {
+        _pendingSnapshot = false;
+        _snapshotGrace?.cancel();
+      }
     });
   }
 
   @override
   void dispose() {
+    _snapshotGrace?.cancel();
     widget.controller.removeListener(_onControllerChanged);
     _unsubscribeFromClient();
     super.dispose();
@@ -265,7 +292,7 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   }
 
   Color get _statusColor {
-    if (!_isConnected) return PiccoloTheme.inkMuted;
+    if (!_isConnected || _pendingSnapshot) return PiccoloTheme.inkMuted;
     switch (_aggregateStatus) {
       case 'error':
         return PiccoloTheme.critical;
@@ -278,7 +305,7 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   }
 
   String get _statusLabel {
-    if (!_isConnected) return 'Offline';
+    if (!_isConnected || _pendingSnapshot) return 'Offline';
     switch (_aggregateStatus) {
       case 'error':
         return 'Error';
@@ -293,6 +320,7 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
 
   String get _tooltipMessage {
     if (!_isConnected) return 'Connection lost - Reconnecting...';
+    if (_pendingSnapshot) return 'Connected - Waiting for health data...';
     switch (_aggregateStatus) {
       case 'error':
         return 'System Error - Check app details';
