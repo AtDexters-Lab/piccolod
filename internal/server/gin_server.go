@@ -1712,8 +1712,8 @@ func (s *GinServer) observeProxyOIDCClients(bus *events.Bus) {
 	if bus == nil {
 		return
 	}
-	appStatusCh := bus.Subscribe(events.TopicAppStatusChanged, 8)
-	endpointsCh := bus.Subscribe(events.TopicServiceEndpointsChanged, 8)
+	appStatusCh := bus.Subscribe(events.TopicAppStatusChanged, 16)
+	endpointsCh := bus.Subscribe(events.TopicServiceEndpointsChanged, 16)
 
 	tryRegister := func(appName string) {
 		ctx := context.Background()
