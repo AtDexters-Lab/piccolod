@@ -843,11 +843,24 @@ func (s *GinServer) portalOriginForRequest(r *http.Request) string {
 	}
 
 	host := ""
-	if s.mdnsManager != nil {
+	// Honor access mode: if the request arrived via IP, use that IP as the portal
+	// host instead of the mDNS hostname. Validate via LocalAddrContextKey to ensure
+	// the claimed Host IP matches the actual interface that received the connection.
+	reqHost := canonicalHost(r.Host)
+	if reqIP := net.ParseIP(reqHost); reqIP != nil && !reqIP.IsLoopback() {
+		if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+			if localHost, _, err := net.SplitHostPort(localAddr.String()); err == nil {
+				if localIP := net.ParseIP(localHost); localIP != nil && localIP.Equal(reqIP) {
+					host = reqHost
+				}
+			}
+		}
+	}
+	if host == "" && s.mdnsManager != nil {
 		host = strings.TrimSpace(s.mdnsManager.Hostname())
 	}
 	if host == "" {
-		host = canonicalHost(r.Host)
+		host = reqHost
 	}
 	if host == "" {
 		host = getPreferredOutboundIP()
@@ -857,6 +870,10 @@ func (s *GinServer) portalOriginForRequest(r *http.Request) string {
 	}
 	if portalPort != 0 && portalPort != defaultPort {
 		host = net.JoinHostPort(host, strconv.Itoa(portalPort))
+	} else if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		// Bracket bare IPv6 for valid URI syntax when port is omitted (default port).
+		// net.JoinHostPort handles this in the non-default-port branch above.
+		host = "[" + host + "]"
 	}
 	return scheme + "://" + host
 }

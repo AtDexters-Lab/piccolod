@@ -727,10 +727,29 @@ func (p *ProxyManager) securityHeaders(next http.Handler) http.Handler {
 		ip := net.ParseIP(remoteIp)
 		if ip != nil && (ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate()) {
 			host, _ := splitHostPortValue(r.Host)
-			// Avoid adding raw IP hosts to CSP (e.g., 127.0.0.1) to keep policy tight.
-			if host != "" && net.ParseIP(host) == nil {
-				host = host + ":*"
-				csp += " https://" + host + " http://" + host
+			if host != "" {
+				if net.ParseIP(host) == nil {
+					// Hostname-based access: add wildcard-port entries.
+					host = host + ":*"
+					csp += " https://" + host + " http://" + host
+				} else {
+					// IP-based LAN access: validate via LocalAddrContextKey to prevent
+					// Host header spoofing, then allow the portal IP as frame ancestor.
+					// Skip loopback — already covered by http://localhost:* in base CSP.
+					hostIP := net.ParseIP(host)
+					if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && hostIP != nil {
+						if localHost, _, err := net.SplitHostPort(localAddr.String()); err == nil {
+							if localIP := net.ParseIP(localHost); localIP != nil && !localIP.IsLoopback() && localIP.Equal(hostIP) {
+								// Bracket IPv6 for valid URI syntax in CSP source expressions.
+								cspHost := host
+								if hostIP.To4() == nil {
+									cspHost = "[" + host + "]"
+								}
+								csp += " http://" + cspHost + ":* https://" + cspHost + ":*"
+							}
+						}
+					}
+				}
 			}
 		}
 
