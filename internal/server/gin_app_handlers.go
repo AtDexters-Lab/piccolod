@@ -391,13 +391,19 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		return
 	}
 
-	// Workspace apps: handle workspace_name identity
-	if looseDef.WorkspaceName != "" && len(looseDef.Listeners) == 0 {
+	// Workspace apps: handle workspace_name identity.
+	// This block fires when the app has no listeners AND either:
+	//   - the template already contains workspace_name (custom Docker Hub flow), or
+	//   - the user supplied __app_address__ via inputs (catalog flow where
+	//     PrepareSmartDefaults injected the synthetic input).
+	appAddr, _ := userInputs["__app_address__"].(string)
+	appAddr = strings.TrimSpace(appAddr)
+	if len(looseDef.Listeners) == 0 && (looseDef.WorkspaceName != "" || appAddr != "") {
 		wsName := looseDef.WorkspaceName // default: template's workspace_name (custom Docker Hub flow)
 
 		// Catalog flow: substitute __app_address__ into workspace_name
-		if appAddress, ok := userInputs["__app_address__"].(string); ok && strings.TrimSpace(appAddress) != "" {
-			wsName = strings.TrimSpace(appAddress)
+		if appAddr != "" {
+			wsName = appAddr
 		}
 
 		// Validate and check collision (both flows)
