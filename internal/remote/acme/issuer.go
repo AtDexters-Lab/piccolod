@@ -19,13 +19,12 @@ import (
 	"strings"
 	"sync"
 
+	"piccolod/internal/fsutil"
+
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
 	"github.com/go-acme/lego/v4/challenge"
 	lego "github.com/go-acme/lego/v4/lego"
-	"github.com/go-acme/lego/v4/providers/dns/cloudflare"
-	gandiv5 "github.com/go-acme/lego/v4/providers/dns/gandiv5"
-	"github.com/go-acme/lego/v4/providers/dns/route53"
 	"github.com/go-acme/lego/v4/registration"
 	acmepkg "golang.org/x/crypto/acme"
 )
@@ -37,17 +36,16 @@ type ChallengeSink interface {
 	Delete(token string)
 }
 
-// Manager orchestrates ACME account and issuance via lego with HTTP-01.
+// Manager orchestrates ACME account and issuance via lego with HTTP-01 or DNS-01.
 type Manager struct {
 	baseDir   string
 	directory string
 	email     string
 	sink      ChallengeSink
 
-	mu             sync.RWMutex
-	solver         string
-	dnsProvider    string
-	dnsCredentials map[string]string
+	mu                 sync.RWMutex
+	solver             string
+	orchestratorClient OrchestratorClient
 }
 
 // NewManager constructs a lego-backed ACME manager.
@@ -67,13 +65,11 @@ func NewManager(stateDir string, sink ChallengeSink, email string, directoryURL 
 	}
 	log.Printf("INFO: ACME directory configured: %s", directoryURL)
 	return &Manager{
-		baseDir:        filepath.Join(stateDir, "remote", "acme"),
-		directory:      directoryURL,
-		email:          email,
-		sink:           sink,
-		solver:         "http-01",
-		dnsCredentials: map[string]string{},
-		dnsProvider:    "",
+		baseDir:   filepath.Join(stateDir, "remote", "acme"),
+		directory: directoryURL,
+		email:     email,
+		sink:      sink,
+		solver:    "http-01",
 	}
 }
 
@@ -136,12 +132,12 @@ func (m *Manager) saveAccount(a *account) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(keyPath, b, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(keyPath, b, 0o600); err != nil {
 		return err
 	}
 	if a.Registration != nil {
 		data, _ := json.MarshalIndent(a.Registration, "", "  ")
-		_ = os.WriteFile(regPath, data, 0o600)
+		_ = fsutil.AtomicWriteFile(regPath, data, 0o600)
 	}
 	return nil
 }
@@ -186,11 +182,10 @@ func (m *Manager) SetEmail(email string) {
 	m.mu.Unlock()
 }
 
-// SetSolver configures the challenge solver and optional DNS provider credentials.
+// SetSolver configures the challenge solver.
 // Solver should be "http-01" or "dns-01".
-// For dns-01, dnsProvider must be one of: cloudflare, route53, gandi.
-// Credentials are provider-specific and stored in-memory only.
-func (m *Manager) SetSolver(solver, dnsProvider string, creds map[string]string) error {
+// For dns-01, SetOrchestratorClient must be called to configure the provider.
+func (m *Manager) SetSolver(solver string) error {
 	if m == nil {
 		return nil
 	}
@@ -198,31 +193,23 @@ func (m *Manager) SetSolver(solver, dnsProvider string, creds map[string]string)
 	if s == "" {
 		s = "http-01"
 	}
-	p := strings.ToLower(strings.TrimSpace(dnsProvider))
-	if s == "dns-01" && p != "" {
-		switch p {
-		case "cloudflare", "route53", "gandi", "gandi.net", "gandiv5":
-		default:
-			return fmt.Errorf("acme: unsupported dns provider %q", p)
-		}
+	if s != "http-01" && s != "dns-01" {
+		return fmt.Errorf("acme: unsupported solver %q", s)
 	}
 	m.mu.Lock()
 	m.solver = s
-	m.dnsProvider = p
-	m.dnsCredentials = cloneCredentials(creds)
 	m.mu.Unlock()
 	return nil
 }
 
-func cloneCredentials(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return map[string]string{}
+// SetOrchestratorClient configures the Piccolo orchestrator client for DNS-01 challenges.
+func (m *Manager) SetOrchestratorClient(client OrchestratorClient) {
+	if m == nil {
+		return
 	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
+	m.mu.Lock()
+	m.orchestratorClient = client
+	m.mu.Unlock()
 }
 
 func (m *Manager) configureChallenge(cli *lego.Client) error {
@@ -245,37 +232,12 @@ func (m *Manager) configureChallenge(cli *lego.Client) error {
 
 func (m *Manager) buildDNSProvider() (challenge.Provider, error) {
 	m.mu.RLock()
-	p := m.dnsProvider
-	creds := cloneCredentials(m.dnsCredentials)
+	client := m.orchestratorClient
 	m.mu.RUnlock()
-	switch p {
-	case "cloudflare":
-		cfg := cloudflare.NewDefaultConfig()
-		cfg.AuthToken = strings.TrimSpace(creds["api_token"])
-		if cfg.AuthToken == "" {
-			cfg.AuthToken = strings.TrimSpace(creds["dns_api_token"])
-		}
-		cfg.ZoneToken = strings.TrimSpace(creds["zone_api_token"])
-		cfg.AuthEmail = strings.TrimSpace(creds["email"])
-		cfg.AuthKey = strings.TrimSpace(creds["api_key"])
-		return cloudflare.NewDNSProviderConfig(cfg)
-	case "route53":
-		cfg := route53.NewDefaultConfig()
-		cfg.AccessKeyID = strings.TrimSpace(creds["access_key"])
-		cfg.SecretAccessKey = strings.TrimSpace(creds["secret_key"])
-		cfg.Region = strings.TrimSpace(creds["region"])
-		cfg.HostedZoneID = strings.TrimSpace(creds["hosted_zone_id"])
-		return route53.NewDNSProviderConfig(cfg)
-	case "gandi", "gandi.net", "gandiv5":
-		cfg := gandiv5.NewDefaultConfig()
-		cfg.APIKey = strings.TrimSpace(creds["api_key"])
-		if cfg.APIKey == "" {
-			cfg.APIKey = strings.TrimSpace(creds["api_token"])
-		}
-		return gandiv5.NewDNSProviderConfig(cfg)
-	default:
-		return nil, fmt.Errorf("acme: dns provider not configured")
+	if client == nil {
+		return nil, errors.New("acme: orchestrator client not configured")
 	}
+	return NewPiccoloProvider(client), nil
 }
 
 // EnsureAccount loads or creates a new ACME account (P-256), accepts TOS.
@@ -362,10 +324,10 @@ func (m *Manager) Issue(commonName string, sans []string, outName string, certDi
 		}
 		crtPath := filepath.Join(certDir, outName+".crt")
 		keyPath := filepath.Join(certDir, outName+".key")
-		if err := os.WriteFile(crtPath, certRes.Certificate, 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(crtPath, certRes.Certificate, 0o600); err != nil {
 			return nil, err
 		}
-		if err := os.WriteFile(keyPath, certRes.PrivateKey, 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(keyPath, certRes.PrivateKey, 0o600); err != nil {
 			return nil, err
 		}
 		pair, err := tls.X509KeyPair(certRes.Certificate, certRes.PrivateKey)

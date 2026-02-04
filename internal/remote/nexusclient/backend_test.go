@@ -34,7 +34,6 @@ func TestStartConfiguresAttestation(t *testing.T) {
 		Endpoint:       "wss://nexus.example.com/connect",
 		DeviceSecret:   "  secret-value  ",
 		PortalHostname: "portal.example.com",
-		TLD:            "example.com",
 	}
 	if err := adapter.Configure(cfg); err != nil {
 		t.Fatalf("configure: %v", err)

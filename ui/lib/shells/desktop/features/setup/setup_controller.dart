@@ -7,6 +7,7 @@ enum SetupState {
   welcome, // First run intro
   credentials, // Set password
   recovery, // Recovery key
+  security, // CA download for HTTPS
   finishing, // Finalizing setup
   unlock, // Already initialized, just need password
   login, // Unlocked but needs session
@@ -335,6 +336,11 @@ class SetupController extends ChangeNotifier {
       notifyListeners();
       return false;
     }
+  }
+
+  void proceedToSecurity() {
+    _state = SetupState.security;
+    notifyListeners();
   }
 
   void completeSetup() {

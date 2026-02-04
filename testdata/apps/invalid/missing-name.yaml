@@ -1,2 +1,7 @@
-# Missing required 'name' field
-image: nginx:latest
+# RFC 20260130: Missing app identity (no listeners or workspace_name)
+services:
+  main:
+    image: nginx:latest
+    bind_ports: [80]
+x-piccolo:
+  mode: service

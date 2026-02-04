@@ -33,11 +33,12 @@ func Join(elements ...string) string {
 	return filepath.Join(all...)
 }
 
-func CryptoDir() string    { return Join("crypto") }
-func ControlDir() string   { return Join("control") }
-func ExportsDir() string   { return Join("exports") }
-func BootstrapDir() string { return Join("bootstrap") }
-func VolumesDir() string   { return Join("volumes") }
+func CryptoDir() string           { return Join("crypto") }
+func ControlDir() string          { return Join("control") }
+func ExportsDir() string          { return Join("exports") }
+func BootstrapDir() string        { return Join("bootstrap") }
+func VolumesDir() string          { return Join("volumes") }
+func NetworkBootstrapDir() string { return Join("network-bootstrap") }
 
 // SetRootForTest resets the cached root so tests can override PICCOLO_STATE_DIR.
 func SetRootForTest(dir string) {

@@ -22,46 +22,53 @@ class CustomInstallWizard extends StatefulWidget {
 
 class _CustomInstallWizardState extends State<CustomInstallWizard> {
   late TextEditingController _yamlController;
-  late TextEditingController _displayNameController;
   int _currentStep = 0;
   bool _isValidating = false;
   bool _isInstalling = false;
   String? _taskId;
-  
+
   // Validation State
   bool _isValid = false;
   String? _validationError;
-  
+
   // Parsed Metadata (Mock for now, real parser would be client-side or richer backend response)
   // Since /apps/validate only returns {valid: true}, we don't get structured metadata back yet.
   // We will parse minimal info via regex for the UI feedback or rely on user trust for v1.
-  
+
   @override
   void initState() {
     super.initState();
     _yamlController = TextEditingController(text: widget.initialYaml ?? _defaultTemplate);
-    _displayNameController = TextEditingController();
   }
 
+  // RFC 20260130: use __primary marker for primary listener
+  // The __primary marker will be substituted with the __app_address__ input during installation
   static const String _defaultTemplate = '''
-name: my-app
-image: nginx:alpine
 type: user
+inputs:
+  __app_address__:
+    type: string
+    label: "App Address"
+    required: true
+    validation:
+      regex: "^[a-z][a-z0-9]{0,15}\$"
+      message: "Lowercase letters and numbers only; max 16 chars"
 listeners:
-  - name: web
+  - name: __primary
     guest_port: 80
-    remote_ports: [80, 443]
-storage:
-  persistent:
-    data:
-      container: /usr/share/nginx/html
-      size_limit: 1GB
+    flow: tcp
+    protocol: http
+services:
+  main:
+    image: nginx:alpine
+    bind_ports: [80]
+x-piccolo:
+  mode: service
 ''';
 
   @override
   void dispose() {
     _yamlController.dispose();
-    _displayNameController.dispose();
     super.dispose();
   }
 
@@ -95,7 +102,6 @@ storage:
       final app = await widget.appService.installAppWithInputs(
         _yamlController.text,
         <String, dynamic>{},
-        displayName: _displayNameController.text.trim(),
         taskId: taskId,
       );
       
@@ -291,18 +297,6 @@ storage:
             "Your app definition is valid syntax. Proceeding with installation will:",
           ),
           const SizedBox(height: 24),
-          TextField(
-            controller: _displayNameController,
-            decoration: const InputDecoration(
-              labelText: "Display name (optional)",
-              hintText: "e.g., Work Projects",
-              filled: true,
-              fillColor: Colors.white,
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 24),
-          
           _buildInfoRow(Icons.download, "Pull container image (if not present)"),
           const SizedBox(height: 12),
           _buildInfoRow(Icons.sd_storage, "Create persistent storage volumes"),

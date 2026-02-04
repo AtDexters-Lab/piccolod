@@ -16,7 +16,7 @@ import (
 // This is the unified install path for both service and workspace modes.
 // For workspace mode, it prepares workspace disks and uses --rootfs mode.
 // For service mode, it uses standard image-based containers.
-func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID, displayName string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint) (*AppInstance, error) {
+func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint) (*AppInstance, error) {
 	if m.serviceManager == nil {
 		return nil, fmt.Errorf("app manager: service manager not configured")
 	}
@@ -118,9 +118,29 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 
 	// Prepare storage for each service (pull images or init workspace disks)
+	// Progress range 15-55% is divided equally among images
+	const pullProgressMin = 15
+	const pullProgressMax = 55
+	numServices := len(appDef.Services)
+	pullRangePerService := 0
+	if numServices > 0 {
+		pullRangePerService = (pullProgressMax - pullProgressMin) / numServices
+	}
+
 	workspaceInfos := make(map[string]*workspaceMountInfo, len(appDef.Services))
+	serviceIdx := 0
 	for svcName := range appDef.Services {
-		info, err := m.prepareServiceStorage(ctx, mode, svcName, appDef, instanceID, layout, runtime)
+		// Calculate progress range for this service
+		progressRange := imagePullProgressRange{
+			Min: pullProgressMin + (serviceIdx * pullRangePerService),
+			Max: pullProgressMin + ((serviceIdx + 1) * pullRangePerService),
+		}
+		// Ensure last service gets the full remaining range
+		if serviceIdx == numServices-1 {
+			progressRange.Max = pullProgressMax
+		}
+
+		info, err := m.prepareServiceStorage(ctx, mode, svcName, appDef, instanceID, layout, runtime, progressRange)
 		if err != nil {
 			// Cleanup any workspace disks already initialized
 			if mode == ModeWorkspace {
@@ -131,6 +151,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			return nil, fmt.Errorf("prepare storage for service '%s': %w", svcName, err)
 		}
 		workspaceInfos[svcName] = info
+		serviceIdx++
 	}
 
 	// Pull network anchor image (always image-based)
@@ -310,7 +331,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	now := time.Now()
 	return &AppInstance{
 		InstanceID:      instanceID,
-		DisplayName:     displayName,
 		Status:          "running",
 		PrimaryService:  primary,
 		NetworkAnchorID: anchorID,
@@ -318,5 +338,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		CreatedAt:       now,
 		UpdatedAt:       now,
 		Definition:      appDef,
+		CatalogSource:   CatalogSourceFromContext(ctx),
 	}, nil
 }

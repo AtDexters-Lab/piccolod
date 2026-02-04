@@ -179,6 +179,7 @@ func ReasonForCode(code string) string {
 		"cert_invalid_contact":         "Invalid account contact email",
 		"cert_account_error":           "Certificate account needs re-registration",
 		"cert_unauthorized_persistent": "Challenge verification persistently failing",
+		"cert_orchestrator_error":      "Piccolo orchestrator unavailable",
 
 		// Transient error states (auto-recoverable)
 		"cert_connection_failed": "Unable to reach this device from internet",

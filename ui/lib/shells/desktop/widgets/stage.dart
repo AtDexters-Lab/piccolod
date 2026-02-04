@@ -140,10 +140,17 @@ class _StageState extends State<Stage> {
   }
 
   Future<void> _loadAppIcons(List<App> apps) async {
-    // Get app names that need icons
-    final appNames = apps.map((a) => a.appName).toSet();
-    final needsIcons = appNames.where((name) => !_iconCache.containsKey(name));
-    if (needsIcons.isEmpty) return;
+    // Get catalog sources for apps that need icons
+    // Use catalogSource if available (tracks which catalog item this was installed from),
+    // otherwise fall back to name (instanceID) which may match catalog item name
+    final catalogKeys = <String>{};
+    for (final app in apps) {
+      final key = app.catalogSource.isNotEmpty ? app.catalogSource : app.name;
+      if (key.isNotEmpty && !_iconCache.containsKey(key)) {
+        catalogKeys.add(key);
+      }
+    }
+    if (catalogKeys.isEmpty) return;
 
     try {
       // Fetch catalog to get icons (fetch enough to cover installed apps)
@@ -154,15 +161,15 @@ class _StageState extends State<Stage> {
 
       // Build icon map from catalog items
       for (final item in catalog.apps) {
-        if (appNames.contains(item.name)) {
+        if (catalogKeys.contains(item.name)) {
           _iconCache[item.name] = item.icon;
         }
       }
 
       // Mark remaining apps as having no icon (so we don't refetch)
-      for (final name in needsIcons) {
-        if (!_iconCache.containsKey(name)) {
-          _iconCache[name] = null;
+      for (final key in catalogKeys) {
+        if (!_iconCache.containsKey(key)) {
+          _iconCache[key] = null;
         }
       }
 
@@ -173,7 +180,9 @@ class _StageState extends State<Stage> {
   }
 
   String? _getAppIconUrl(App app) {
-    return _iconCache[app.appName];
+    // Use catalogSource for icon lookup if available, otherwise fall back to name
+    final key = app.catalogSource.isNotEmpty ? app.catalogSource : app.name;
+    return _iconCache[key];
   }
 
   void _openApp(App app) async {

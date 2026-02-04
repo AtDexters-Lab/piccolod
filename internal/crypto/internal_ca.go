@@ -12,8 +12,12 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"sync"
 	"time"
+
+	"piccolod/internal/fsutil"
 )
 
 // InternalCA manages a self-signed CA for internal HTTPS communication.
@@ -241,11 +245,11 @@ func (ca *InternalCA) generate() error {
 	})
 
 	// Write to disk
-	if err := os.WriteFile(ca.certPath, certPEM, 0o644); err != nil {
+	if err := fsutil.AtomicWriteFile(ca.certPath, certPEM, 0o644); err != nil {
 		return fmt.Errorf("write certificate: %w", err)
 	}
 
-	if err := os.WriteFile(ca.keyPath, keyPEM, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(ca.keyPath, keyPEM, 0o600); err != nil {
 		return fmt.Errorf("write private key: %w", err)
 	}
 
@@ -289,20 +293,72 @@ func (ca *InternalCA) EnsureServerCertificate() error {
 	// Generate new certificate
 	certPEM, keyPEM, err := ca.IssueCertificate(
 		"piccolo.local",
-		[]string{"piccolo.local", "localhost"},
+		[]string{"piccolo.local"},
 		365*24*time.Hour, // 1 year
 	)
 	if err != nil {
 		return fmt.Errorf("issue server certificate: %w", err)
 	}
 
-	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+	if err := fsutil.AtomicWriteFile(certPath, certPEM, 0o644); err != nil {
 		return fmt.Errorf("write server certificate: %w", err)
 	}
 
-	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(keyPath, keyPEM, 0o600); err != nil {
 		return fmt.Errorf("write server key: %w", err)
 	}
 
 	return nil
+}
+
+// EnsureServerCertificateForHosts generates a server certificate covering all
+// provided hostnames. Regenerates only if SANs differ or cert expires within 30 days.
+// Returns true if a new certificate was written to disk.
+func (ca *InternalCA) EnsureServerCertificateForHosts(hostnames []string) (bool, error) {
+	certPath := ca.ServerCertPath()
+	keyPath := ca.ServerKeyPath()
+
+	// Normalize and sort requested hostnames for comparison
+	requested := make([]string, len(hostnames))
+	copy(requested, hostnames)
+	sort.Strings(requested)
+
+	// Check if existing certificate is valid and has matching SANs
+	if certPEM, err := os.ReadFile(certPath); err == nil {
+		block, _ := pem.Decode(certPEM)
+		if block != nil {
+			if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
+				// Check validity (30-day buffer)
+				if time.Now().Add(30 * 24 * time.Hour).Before(cert.NotAfter) {
+					// Compare SANs
+					existing := make([]string, len(cert.DNSNames))
+					copy(existing, cert.DNSNames)
+					sort.Strings(existing)
+					if slices.Equal(requested, existing) {
+						return false, nil // Certificate is valid with matching SANs
+					}
+				}
+			}
+		}
+	}
+
+	// Generate new certificate with all hostnames
+	certPEM, keyPEM, err := ca.IssueCertificate(
+		"piccolo.local",
+		requested,
+		365*24*time.Hour, // 1 year
+	)
+	if err != nil {
+		return false, fmt.Errorf("issue server certificate: %w", err)
+	}
+
+	if err := fsutil.AtomicWriteFile(certPath, certPEM, 0o644); err != nil {
+		return false, fmt.Errorf("write server certificate: %w", err)
+	}
+
+	if err := fsutil.AtomicWriteFile(keyPath, keyPEM, 0o600); err != nil {
+		return false, fmt.Errorf("write server key: %w", err)
+	}
+
+	return true, nil
 }

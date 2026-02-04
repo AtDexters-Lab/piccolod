@@ -106,8 +106,9 @@ class SystemTab extends StatelessWidget {
             height: 320,
             autoConnect: isBusy,
           ),
-        ] else 
+        ] else
            const Text("System information unavailable."),
+
       ],
     );
   }

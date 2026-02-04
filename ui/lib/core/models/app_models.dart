@@ -4,8 +4,6 @@ import 'listener_health.dart';
 class App {
   final String id;
   final String name;
-  final String appName;
-  final String displayName;
   final String image;
   final String type;
   final String mode;
@@ -15,12 +13,11 @@ class App {
   final String? containerId;
   final Map<String, dynamic> definition;
   final ListenerHealth? primaryListenerHealth;
+  final String catalogSource; // Tracks which catalog item this app was installed from
 
   App({
     required this.id,
     required this.name,
-    this.appName = '',
-    this.displayName = '',
     required this.image,
     required this.type,
     this.mode = '',
@@ -30,22 +27,18 @@ class App {
     this.containerId,
     this.definition = const {},
     this.primaryListenerHealth,
+    this.catalogSource = '',
   });
 
   factory App.fromJson(Map<String, dynamic> json) {
     final instanceId = (json['instance_id'] ?? json['name'] ?? json['id'] ?? '')
         .toString();
-    final displayName = (json['display_name'] ?? '').toString();
 
     // Definition is now nested - extract it (with fallback for backward compatibility)
     final rawDefinition = json['definition'];
     final def = rawDefinition is Map
         ? Map<String, dynamic>.from(rawDefinition)
         : <String, dynamic>{};
-
-    // App name comes from definition.name, with fallbacks
-    final appName = (def['name'] ?? json['app_name'] ?? json['name'] ?? '')
-        .toString();
 
     // Image, type, environment come from definition (fallback to primary service)
     final services = def['services'] is Map ? Map.from(def['services']) : null;
@@ -111,11 +104,12 @@ class App {
         ? ListenerHealth.fromJson(Map<String, dynamic>.from(rawHealth))
         : null;
 
+    // Catalog source tracks which catalog item this app was installed from
+    final catalogSource = (json['catalog_source'] ?? '').toString();
+
     return App(
       id: instanceId,
       name: instanceId,
-      appName: appName,
-      displayName: displayName,
       image: image,
       type: type,
       mode: mode,
@@ -125,6 +119,7 @@ class App {
       containerId: json['container_id'],
       definition: def,
       primaryListenerHealth: primaryHealth,
+      catalogSource: catalogSource,
     );
   }
 
@@ -152,19 +147,15 @@ class App {
     return rawEnv.map((k, v) => MapEntry(k.toString(), v.toString()));
   }
 
-  String get displayTitle {
-    if (displayName.isNotEmpty) return displayName;
-    if (appName.isNotEmpty) return appName;
-    return name;
-  }
+  /// RFC 20260130: App identity is the instanceID (name), which comes from
+  /// the primary listener name (service mode) or workspace_name (workspace mode).
+  String get displayTitle => name;
 
   /// Returns a copy of this App with a new status value.
   App copyWithStatus(String newStatus) {
     return App(
       id: id,
       name: name,
-      appName: appName,
-      displayName: displayName,
       image: image,
       type: type,
       mode: mode,
@@ -174,6 +165,7 @@ class App {
       containerId: containerId,
       definition: definition,
       primaryListenerHealth: primaryListenerHealth,
+      catalogSource: catalogSource,
     );
   }
 }

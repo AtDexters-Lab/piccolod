@@ -159,10 +159,11 @@ func TestServiceManagerPublishesEndpointEventsOnLabelChange(t *testing.T) {
 	// Subscribe after allocate to only get the reconcile event
 	ch := bus.Subscribe(events.TopicServiceEndpointsChanged, 4)
 
-	// Reconcile with "api" as primary (simulates primary listener change)
+	// Reconcile with "backend" as primary (simulates primary listener change)
+	// RFC 20260130: "api" is reserved, use "backend" instead
 	listenersNewPrimary := []api.AppListener{
 		{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
-		{Name: "api", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+		{Name: "backend", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
 	}
 	_, _, err = mgr.Reconcile("testapp", listenersNewPrimary)
 	if err != nil {

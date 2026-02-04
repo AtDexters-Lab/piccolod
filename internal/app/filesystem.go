@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"piccolod/internal/api"
+	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 )
 
@@ -33,19 +34,21 @@ type FilesystemStateManager struct {
 	fsMu sync.Mutex
 }
 
-// AppMetadata represents runtime metadata stored separately from app.yaml
+// AppMetadata represents runtime metadata stored separately from app.yaml.
+// Note: The actual enabled state is tracked via symlinks in the enabled/ directory,
+// not in this struct. See EnableApp/DisableApp/IsAppEnabled methods.
 type AppMetadata struct {
-	InstanceID  string `json:"instance_id"`
-	DisplayName string `json:"display_name,omitempty"`
-	AppName     string `json:"app_name"`
-	Status      string `json:"status"` // "created", "running", "stopped", "error"
+	InstanceID string `json:"instance_id"`
+	Status     string `json:"status"` // "created", "running", "stopped", "error"
 	// Container runtime metadata.
 	PrimaryService  string            `json:"primary_service,omitempty"`
 	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`
 	Containers      map[string]string `json:"containers,omitempty"` // service name -> container ID
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
-	Enabled         bool              `json:"enabled"`
+	// CatalogSource tracks the catalog item name this app was installed from.
+	// Used for icon lookup and update tracking.
+	CatalogSource string `json:"catalog_source,omitempty"`
 }
 
 // NewFilesystemStateManager creates a new filesystem state manager
@@ -158,7 +161,6 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 	// Create AppInstance with embedded definition
 	app := &AppInstance{
 		InstanceID:      metadata.InstanceID,
-		DisplayName:     metadata.DisplayName,
 		Status:          metadata.Status,
 		PrimaryService:  metadata.PrimaryService,
 		NetworkAnchorID: metadata.NetworkAnchorID,
@@ -166,6 +168,7 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 		CreatedAt:       metadata.CreatedAt,
 		UpdatedAt:       metadata.UpdatedAt,
 		Definition:      appDef,
+		CatalogSource:   metadata.CatalogSource,
 	}
 
 	// Fallback: if InstanceID is empty in metadata, use directory name
@@ -188,7 +191,7 @@ func (fsm *FilesystemStateManager) BackupCurrentAppDefinition(instanceID string)
 	if err != nil {
 		return fmt.Errorf("read current app.yaml: %w", err)
 	}
-	if err := os.WriteFile(prev, data, 0644); err != nil {
+	if err := fsutil.AtomicWriteFile(prev, data, 0644); err != nil {
 		return fmt.Errorf("write app.prev.yaml: %w", err)
 	}
 	return nil
@@ -228,49 +231,45 @@ func (fsm *FilesystemStateManager) GetAppDefinition(instanceID string) (*api.App
 
 // StoreApp saves app definition and metadata to filesystem.
 // The app instance is stored under apps/{InstanceID}/.
-// Uses app.Definition for the app.yaml; the separate appDef parameter is kept for
-// backward compatibility but is ignored if app.Definition is set.
-func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDefinition) error {
+//
+// TODO: Callers mutate the cached AppInstance in-place before calling StoreApp.
+// If StoreApp fails (e.g. disk I/O), the in-memory cache diverges from disk.
+// Consider accepting a copy and updating the cache only on successful persist.
+func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
 
-	// Use embedded definition if available, fall back to parameter
+	if app.Definition == nil {
+		return fmt.Errorf("no app definition provided for instance %s", app.InstanceID)
+	}
 	def := app.Definition
-	if def == nil {
-		def = appDef
-	}
-	if def == nil {
-		return fmt.Errorf("no app definition provided")
-	}
 
 	appDir := filepath.Join(fsm.appsDir, app.InstanceID)
 	if err := os.MkdirAll(appDir, 0755); err != nil {
 		return fmt.Errorf("failed to create app directory: %w", err)
 	}
 
-	// Store app.yaml
+	// Store app.yaml (atomic write to prevent corruption during interruption)
 	appDefPath := filepath.Join(appDir, "app.yaml")
 	appDefData, err := SerializeAppDefinition(def)
 	if err != nil {
 		return fmt.Errorf("failed to serialize app definition: %w", err)
 	}
 
-	if err := os.WriteFile(appDefPath, appDefData, 0644); err != nil {
+	if err := fsutil.AtomicWriteFile(appDefPath, appDefData, 0644); err != nil {
 		return fmt.Errorf("failed to write app.yaml: %w", err)
 	}
 
-	// Store metadata.json with runtime fields
-	// AppName is stored for backward compatibility with existing metadata.json files
+	// Store metadata.json with runtime fields (atomic write)
 	metadata := AppMetadata{
 		InstanceID:      app.InstanceID,
-		DisplayName:     app.DisplayName,
-		AppName:         def.Name,
 		Status:          app.Status,
 		PrimaryService:  app.PrimaryService,
 		NetworkAnchorID: app.NetworkAnchorID,
 		Containers:      app.Containers,
 		CreatedAt:       app.CreatedAt,
 		UpdatedAt:       app.UpdatedAt,
+		CatalogSource:   app.CatalogSource,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -279,7 +278,7 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance, appDef *api.AppDef
 	}
 
 	metadataPath := filepath.Join(appDir, "metadata.json")
-	if err := os.WriteFile(metadataPath, metadataData, 0644); err != nil {
+	if err := fsutil.AtomicWriteFile(metadataPath, metadataData, 0644); err != nil {
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}
 
@@ -313,11 +312,10 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 	}
 	app.UpdatedAt = time.Now()
 	createdAt := app.CreatedAt
-	displayName := app.DisplayName
-	appName := app.AppName() // Use method to get name from Definition
 	primaryService := app.PrimaryService
 	networkAnchorID := app.NetworkAnchorID
 	containers := app.Containers
+	catalogSource := app.CatalogSource
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem
@@ -326,14 +324,13 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 
 	metadata := AppMetadata{
 		InstanceID:      instanceID,
-		DisplayName:     displayName,
-		AppName:         appName,
 		Status:          app.Status,
 		PrimaryService:  primaryService,
 		NetworkAnchorID: networkAnchorID,
 		Containers:      containers,
 		CreatedAt:       createdAt,
 		UpdatedAt:       app.UpdatedAt,
+		CatalogSource:   catalogSource,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -341,9 +338,52 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 		return fmt.Errorf("failed to serialize metadata: %w", err)
 	}
 
-	if err := os.WriteFile(metadataPath, metadataData, 0644); err != nil {
+	if err := fsutil.AtomicWriteFile(metadataPath, metadataData, 0644); err != nil {
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}
+
+	return nil
+}
+
+// StoreAppMetadata persists only the runtime metadata (metadata.json) without touching app.yaml.
+// Use this for runtime state changes like container IDs, status updates, etc.
+// This is more efficient than StoreApp when the app definition hasn't changed.
+func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
+	fsm.fsMu.Lock()
+	defer fsm.fsMu.Unlock()
+
+	appDir := filepath.Join(fsm.appsDir, app.InstanceID)
+
+	// Ensure directory exists (should already exist, but be safe)
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		return fmt.Errorf("failed to create app directory: %w", err)
+	}
+
+	metadata := AppMetadata{
+		InstanceID:      app.InstanceID,
+		Status:          app.Status,
+		PrimaryService:  app.PrimaryService,
+		NetworkAnchorID: app.NetworkAnchorID,
+		Containers:      app.Containers,
+		CreatedAt:       app.CreatedAt,
+		UpdatedAt:       app.UpdatedAt,
+		CatalogSource:   app.CatalogSource,
+	}
+
+	metadataData, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to serialize metadata: %w", err)
+	}
+
+	metadataPath := filepath.Join(appDir, "metadata.json")
+	if err := fsutil.AtomicWriteFile(metadataPath, metadataData, 0644); err != nil {
+		return fmt.Errorf("failed to write metadata.json: %w", err)
+	}
+
+	// Update cache
+	fsm.cacheMu.Lock()
+	fsm.cache[app.InstanceID] = app
+	fsm.cacheMu.Unlock()
 
 	return nil
 }

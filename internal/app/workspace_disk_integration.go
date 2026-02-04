@@ -161,9 +161,122 @@ type workspaceMountInfo struct {
 	meta       *workspacedisk.WorkspaceMeta
 }
 
+// imagePullProgressRange defines the progress percentage range for an image pull.
+type imagePullProgressRange struct {
+	Min int // Starting progress percentage
+	Max int // Ending progress percentage
+}
+
+// pullImageWithProgress pulls an image with real-time progress events emitted to the frontend.
+// The progressRange maps the pull progress (0-100%) to the specified percentage range.
+// Always pulls to ensure mutable tags (like "latest") are refreshed.
+func (m *AppManager) pullImageWithProgress(
+	ctx context.Context,
+	runtime container.PodmanRuntime,
+	image string,
+	instanceID string,
+	svcName string,
+	progressRange imagePullProgressRange,
+) error {
+	// Emit initial progress
+	m.emitProgressWithMetadata(
+		ctx,
+		taskTypeInstallApp,
+		instanceID,
+		taskPhasePullingImage,
+		progressRange.Min,
+		fmt.Sprintf("Pulling image %s", image),
+		false,
+		map[string]any{
+			"service": svcName,
+			"image":   image,
+		},
+		nil,
+	)
+
+	// Create progress callback that maps pull progress to our range
+	callback := func(report container.ImagePullReport) {
+		// Map the pull progress (0-100) to our range (Min-Max)
+		var progress int
+		if report.OverallPercent < 0 {
+			// Indeterminate - use midpoint
+			progress = (progressRange.Min + progressRange.Max) / 2
+		} else {
+			rangeSpan := progressRange.Max - progressRange.Min
+			progress = progressRange.Min + (report.OverallPercent*rangeSpan)/100
+		}
+
+		// Build layer progress metadata
+		layers := make([]map[string]any, 0, len(report.Layers))
+		for _, layer := range report.Layers {
+			layers = append(layers, map[string]any{
+				"layer_id":      layer.LayerID,
+				"status":        layer.Status,
+				"bytes_current": layer.BytesCurrent,
+				"bytes_total":   layer.BytesTotal,
+			})
+		}
+
+		message := fmt.Sprintf("Pulling image %s", image)
+		if report.Phase == "complete" {
+			message = fmt.Sprintf("Image %s pulled successfully", image)
+			progress = progressRange.Max
+		} else if report.TotalBytes > 0 {
+			// Format bytes for display
+			downloaded := formatBytes(report.DownloadedBytes)
+			total := formatBytes(report.TotalBytes)
+			message = fmt.Sprintf("Pulling %s: %s / %s", image, downloaded, total)
+		}
+
+		m.emitProgressWithMetadata(
+			ctx,
+			taskTypeInstallApp,
+			instanceID,
+			taskPhasePullingImage,
+			progress,
+			message,
+			false,
+			map[string]any{
+				"service":          svcName,
+				"image":            image,
+				"phase":            report.Phase,
+				"overall_percent":  report.OverallPercent,
+				"total_bytes":      report.TotalBytes,
+				"downloaded_bytes": report.DownloadedBytes,
+				"layers":           layers,
+			},
+			nil,
+		)
+	}
+
+	// Pull image with progress
+	err := m.containerManager.PullImageWithProgress(ctx, runtime, image, callback)
+	if err != nil {
+		log.Printf("WARN: install %s: image pull failed for %s: %v", instanceID, image, err)
+		return err
+	}
+
+	return nil
+}
+
+// formatBytes formats bytes into a human-readable string.
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
 // prepareServiceStorage prepares storage for a service container.
-// For ModeService: pulls the image (best-effort) and returns nil.
+// For ModeService: pulls the image (best-effort) with progress tracking and returns nil.
 // For ModeWorkspace: initializes/mounts workspace disk and returns mount info.
+// The progressRange maps the image pull progress to the specified percentage range.
 func (m *AppManager) prepareServiceStorage(
 	ctx context.Context,
 	mode PiccoloMode,
@@ -172,6 +285,7 @@ func (m *AppManager) prepareServiceStorage(
 	instanceID string,
 	layout appVolumeLayout,
 	runtime container.PodmanRuntime,
+	progressRange imagePullProgressRange,
 ) (*workspaceMountInfo, error) {
 	if def == nil || def.Services == nil {
 		return nil, fmt.Errorf("app definition with services required")
@@ -182,9 +296,9 @@ func (m *AppManager) prepareServiceStorage(
 	}
 
 	if mode != ModeWorkspace {
-		// Service mode: just pull the image (best-effort)
+		// Service mode: pull the image with progress tracking (best-effort)
 		if svc.Image != "" {
-			if err := m.containerManager.PullImage(ctx, runtime, svc.Image); err != nil {
+			if err := m.pullImageWithProgress(ctx, runtime, svc.Image, instanceID, svcName, progressRange); err != nil {
 				log.Printf("WARN: install %s: image pull failed for service %s: %v", instanceID, svcName, err)
 			}
 		}
@@ -200,10 +314,10 @@ func (m *AppManager) prepareServiceStorage(
 	diskInitialized := m.isWorkspaceDiskInitialized(ctx, instanceID, layout)
 
 	if !diskInitialized {
-		// New install: pull base image and initialize workspace disk
+		// New install: pull base image with progress and initialize workspace disk
 		// The runtime uses vfs driver for workspace apps, but images are stored
 		// in the shared imagestore for layer deduplication regardless of driver.
-		if err := m.containerManager.PullImage(ctx, runtime, svc.Image); err != nil {
+		if err := m.pullImageWithProgress(ctx, runtime, svc.Image, instanceID, svcName, progressRange); err != nil {
 			log.Printf("WARN: install %s: image pull failed: %v", instanceID, err)
 		}
 

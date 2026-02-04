@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 
+	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 )
 
@@ -185,7 +186,7 @@ func ensureControlVolumePrepared(cipherDir, metaDir string) error {
 	if err := os.MkdirAll(metaDir, 0o700); err != nil {
 		return fmt.Errorf("ensure control meta dir: %w", err)
 	}
-	if err := os.WriteFile(metaPath, data, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(metaPath, data, 0o600); err != nil {
 		return fmt.Errorf("migrate control metadata: %w", err)
 	}
 	_ = os.Remove(legacyPath)

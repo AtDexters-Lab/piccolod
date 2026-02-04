@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/argon2"
+
+	"piccolod/internal/fsutil"
 )
 
 // State captures the persisted authentication metadata.
@@ -249,7 +251,7 @@ func (s *filesystemStorage) Save(ctx context.Context, state State) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0o600)
+	return fsutil.AtomicWriteFile(s.path, data, 0o600)
 }
 
 // Argon2id helpers (simple encoded format: argon2id$v=19$m=...,t=...,p=...$saltB64$hashB64)
@@ -480,7 +482,10 @@ func (s *SessionStore) ValidatePortalSession(id, requestOrigin string) (*Session
 	// Check origin binding: fail closed if session has BoundOrigin but request origin is empty
 	// (indicates an origin computation failure — must not bypass validation).
 	if sess.BoundOrigin != "" {
-		if requestOrigin == "" || sess.BoundOrigin != requestOrigin {
+		if requestOrigin == "" {
+			return nil, false
+		}
+		if sess.BoundOrigin != requestOrigin && !originsMatchIgnoringScheme(sess.BoundOrigin, requestOrigin) {
 			return nil, false
 		}
 	}
@@ -505,12 +510,38 @@ func (s *SessionStore) ValidateAppSession(id, appName, requestOrigin string) (*S
 	// Check origin binding: fail closed if session has BoundOrigin but request origin is empty
 	// (indicates an origin computation failure — must not bypass validation).
 	if sess.BoundOrigin != "" {
-		if requestOrigin == "" || sess.BoundOrigin != requestOrigin {
+		if requestOrigin == "" {
+			return nil, false
+		}
+		if sess.BoundOrigin != requestOrigin && !originsMatchIgnoringScheme(sess.BoundOrigin, requestOrigin) {
 			return nil, false
 		}
 	}
 
 	return sess, true
+}
+
+// originsMatchIgnoringScheme returns true if two origins differ only in scheme (http vs https).
+// This allows sessions created on HTTP to remain valid when the user switches to HTTPS
+// on the same host, which is the expected behavior for LAN HTTPS with self-signed certificates.
+// Both origins are served by the same piccolod instance, so this is safe.
+func originsMatchIgnoringScheme(a, b string) bool {
+	normalize := func(o string) string {
+		// Strip scheme
+		if after, ok := strings.CutPrefix(o, "https://"); ok {
+			o = after
+		} else if after, ok := strings.CutPrefix(o, "http://"); ok {
+			o = after
+		}
+		// Only strip default HTTP/HTTPS ports so http://h:80 matches https://h:443.
+		// Non-default ports are preserved to maintain origin binding strength.
+		o = strings.TrimSuffix(o, ":80")
+		o = strings.TrimSuffix(o, ":443")
+		return o
+	}
+	hostA := normalize(a)
+	hostB := normalize(b)
+	return hostA != "" && hostA == hostB
 }
 
 // DeleteWithPropagation deletes a portal session and all derived app sessions per RFC 20260122 §6.3.

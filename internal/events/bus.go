@@ -26,6 +26,9 @@ const (
 	TopicCertificateChanged    Topic = "certificate_changed"     // Emitted by remote manager on cert status change
 	TopicListenerHealthChanged Topic = "listener_health_changed" // Emitted by health aggregator on health change
 
+	// Hostname events
+	TopicHostnamesChanged Topic = "hostnames_changed" // Emitted by mDNS manager when advertised hostname set changes
+
 	// App status events
 	TopicAppStatusChanged Topic = "app_status_changed" // Emitted by app manager on status change
 )

@@ -7,11 +7,11 @@ import (
 )
 
 func TestValidateAppDefinition_MultiContainer_ServiceMode(t *testing.T) {
+	// RFC 20260130: listener name is the app identity, set Primary=true for test
 	app := &api.AppDefinition{
-		Name: "demo",
 		Type: "user",
 		Listeners: []api.AppListener{
-			{Name: "web", GuestPort: 8080},
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
 		},
 		PrimaryService: "web",
 		Services: map[string]api.AppService{
@@ -43,9 +43,10 @@ func TestValidateAppDefinition_MultiContainer_ServiceMode(t *testing.T) {
 }
 
 func TestValidateAppDefinition_WorkspaceRequiresSingleService(t *testing.T) {
+	// RFC 20260130: workspace apps without listeners use workspace_name
 	app := &api.AppDefinition{
-		Name: "demo",
-		Type: "user",
+		WorkspaceName: "demo",
+		Type:          "user",
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine:latest", BindPorts: []int{}},
 			"side": {Image: "alpine:latest", BindPorts: []int{}},
@@ -60,11 +61,11 @@ func TestValidateAppDefinition_WorkspaceRequiresSingleService(t *testing.T) {
 }
 
 func TestValidateAppDefinition_MultiContainer_RejectsTopLevelContainerFields(t *testing.T) {
+	// RFC 20260130: listener name is the app identity, set Primary=true for test
 	app := &api.AppDefinition{
-		Name:  "demo",
-		Image: "nginx:alpine",
+		Image: "nginx:alpine", // This should be rejected - must use services
 		Listeners: []api.AppListener{
-			{Name: "web", GuestPort: 8080},
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
 		},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{8080}},
@@ -79,10 +80,10 @@ func TestValidateAppDefinition_MultiContainer_RejectsTopLevelContainerFields(t *
 }
 
 func TestValidateAppDefinition_MultiContainer_RejectsBindPortCollision(t *testing.T) {
+	// RFC 20260130: listener name is the app identity, set Primary=true for test
 	app := &api.AppDefinition{
-		Name: "demo",
 		Listeners: []api.AppListener{
-			{Name: "web", GuestPort: 8080},
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
 		},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{8080}},
@@ -100,10 +101,10 @@ func TestValidateAppDefinition_MultiContainer_RejectsBindPortCollision(t *testin
 func TestValidateAppDefinition_MultiContainer_RequiresPrimaryBindPortsForListeners(t *testing.T) {
 	// This test verifies that multi-container apps require bind_ports to include listener guest_ports.
 	// The check only applies when there are 2+ services (single-service apps skip this check).
+	// RFC 20260130: listener name is the app identity, set Primary=true for test
 	app := &api.AppDefinition{
-		Name: "demo",
 		Listeners: []api.AppListener{
-			{Name: "web", GuestPort: 8080},
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
 		},
 		PrimaryService: "main",
 		Services: map[string]api.AppService{
@@ -120,10 +121,10 @@ func TestValidateAppDefinition_MultiContainer_RequiresPrimaryBindPortsForListene
 }
 
 func TestValidateAppDefinition_MultiContainer_ExplicitVolumeSharingRequired(t *testing.T) {
+	// RFC 20260130: listener name is the app identity, set Primary=true for test
 	app := &api.AppDefinition{
-		Name: "demo",
 		Listeners: []api.AppListener{
-			{Name: "web", GuestPort: 8080},
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
 		},
 		Services: map[string]api.AppService{
 			"main": {

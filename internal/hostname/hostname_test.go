@@ -58,8 +58,8 @@ func TestValidateListenerName(t *testing.T) {
 		{"contains hyphen", "my-listener", true},
 		{"reserved piccolo", "piccolo", true},
 		{"reserved piccoloos", "piccoloos", true},
-		// Note: "api" is reserved for app names but not listener names
-		{"api allowed for listener", "api", false},
+		// RFC 20260130: listener name is app identity, so "api" is reserved
+		{"api reserved for listener", "api", true},
 	}
 
 	for _, tt := range tests {
@@ -81,8 +81,11 @@ func TestDeriveHostLabel(t *testing.T) {
 		eligible bool // whether listener is eligible for host routing
 		want     string
 	}{
-		{"primary http", "immich", "web", true, true, "immich"},
-		{"primary ws", "immich", "ws", true, true, "immich"},
+		// RFC 20260130: For primary listeners, the listener name IS the app identity
+		// so app == listener for primary. DeriveHostLabel returns the listener name.
+		{"primary http", "immich", "immich", true, true, "immich"},
+		{"primary ws", "myapp", "myapp", true, true, "myapp"},
+		// Non-primary listeners use "listener-app" format
 		{"non-primary http", "immich", "metrics", false, true, "metrics-immich"},
 		{"non-primary ws", "immich", "live", false, true, "live-immich"},
 		{"raw listener", "myapp", "tcp", true, false, ""},

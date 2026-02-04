@@ -20,6 +20,8 @@ type ContainerManager interface {
 	RemoveContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error
 	ListContainersByLabel(ctx context.Context, runtime container.PodmanRuntime, labelKey, labelValue string) ([]container.ContainerListItem, error)
 	PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error
+	// PullImageWithProgress pulls an image with real-time progress callbacks.
+	PullImageWithProgress(ctx context.Context, runtime container.PodmanRuntime, image string, callback container.ImagePullCallback) error
 	Logs(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int) ([]string, error)
 	LogsStream(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int, timestamps bool) (io.ReadCloser, error)
 	ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error)
@@ -44,13 +46,11 @@ type ContainerManager interface {
 }
 
 // AppInstance captures the runtime metadata for an installed application instance.
-// InstanceID is the system-generated unique key used everywhere (containers, volumes, services).
-// DisplayName is an optional user-provided friendly name for UI purposes.
+// InstanceID is the unique key derived from the primary listener name or workspace_name (RFC 20260130).
 // Definition contains the full app manifest (image, type, listeners, extensions, etc).
 type AppInstance struct {
-	InstanceID  string `json:"instance_id"`
-	DisplayName string `json:"display_name,omitempty"`
-	Status      string `json:"status"`
+	InstanceID string `json:"instance_id"`
+	Status     string `json:"status"`
 	// Container runtime metadata.
 	PrimaryService  string            `json:"primary_service,omitempty"`
 	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`
@@ -58,6 +58,10 @@ type AppInstance struct {
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
 	Definition      *api.AppDefinition `json:"definition,omitempty"`
+
+	// CatalogSource tracks the catalog item name this app was installed from.
+	// Used for icon lookup and update tracking.
+	CatalogSource string `json:"catalog_source,omitempty"`
 
 	// Startup failure tracking for escalation (RFC 20260125)
 	// After StartupEscalateAfterAttempts consecutive failures OR StartupEscalateAfterDuration,
@@ -68,12 +72,11 @@ type AppInstance struct {
 
 // Helper methods to access commonly used Definition fields safely
 
-// AppName returns the app name from the definition, or empty string if nil.
+// AppName returns the app's canonical name, which is the instanceID.
+// Per RFC 20260130, the instanceID is derived from the primary listener name
+// or workspace_name, making it the app's identity.
 func (a *AppInstance) AppName() string {
-	if a.Definition == nil {
-		return ""
-	}
-	return a.Definition.Name
+	return a.InstanceID
 }
 
 // Image returns the image from the definition, or empty string if nil.

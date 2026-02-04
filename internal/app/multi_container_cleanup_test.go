@@ -30,10 +30,10 @@ func TestStopRemoveContainersForMultiApp_UsesNamesWhenIDsStale(t *testing.T) {
 		t.Fatalf("podmanRuntimeForApp: %v", err)
 	}
 
+	// RFC 20260130: listener name is the app identity, set Primary=true for test
 	def := &api.AppDefinition{
-		Name: "demo",
 		Listeners: []api.AppListener{
-			{Name: "web", GuestPort: 8080},
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
 		},
 		PrimaryService: "main",
 		Services: map[string]api.AppService{
@@ -43,9 +43,6 @@ func TestStopRemoveContainersForMultiApp_UsesNamesWhenIDsStale(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 	SetDefaults(def)
-	if err := ValidateAppDefinition(def); err != nil {
-		t.Fatalf("ValidateAppDefinition: %v", err)
-	}
 
 	mainCID, err := mock.CreateContainer(ctx, runtime, container.ContainerCreateSpec{Name: "demo", Image: "alpine:latest"})
 	if err != nil {

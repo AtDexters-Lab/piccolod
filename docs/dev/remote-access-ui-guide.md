@@ -48,12 +48,21 @@ The backend returns a specific `state` string derived from the configuration and
 
 The setup process should be a multi-step wizard to ensure valid configuration. **Note: The backend is stateless during the wizard.** The UI must persist the form data in memory until the final step.
 
+### Configuration Modes
+
+Piccolo supports two remote access configuration modes:
+
+| Mode | API Endpoint | Challenge | DNS Provider | Wildcard Certs |
+|------|--------------|-----------|--------------|----------------|
+| **User-managed** | `POST /api/v1/remote/configure` | HTTP-01 | N/A | No |
+| **Managed** (Piccolo Space) | `POST /api/v1/remote/managed/configure` | DNS-01 | Piccolo orchestrator | Yes |
+
 ### Step 1: Nexus Helper (Optional but Helpful)
-If the user is self-hosting the Nexus relay, they need to run a command on their VPS.
+If the user is self-hosting the Nexus relay (user-managed mode), they need to run a command on their VPS.
 *   **GET** `/api/v1/remote/nexus-guide`
 *   **UI:** Display the `command` and `notes`.
 *   **Verification:** Use **POST** `/api/v1/remote/nexus-guide/verify` to validate credentials.
-    *   **Payload:** `{ "endpoint": "...", "tld": "...", "portal_hostname": "...", "jwt_secret": "..." }`
+    *   **Payload:** `{ "endpoint": "...", "portal_hostname": "...", "jwt_secret": "..." }`
     *   **Stateless:** This validates the connection but **does not** save the config to disk.
     *   **UI Logic:** On success, store these credentials in the wizard state (memory) and proceed to Step 2.
 
@@ -61,54 +70,70 @@ If the user is self-hosting the Nexus relay, they need to run a command on their
 Before finalizing, run validation to ensure the network environment is ready.
 *   **POST** `/api/v1/remote/preflight`
 *   **Payload:** Send the configuration gathered so far (from Step 1) to validate it against the backend.
-    *   Example: `{ "endpoint": "...", "device_secret": "...", "solver": "http-01", ... }`
+    *   Example: `{ "endpoint": "...", "device_secret": "...", "portal_hostname": "..." }`
 *   **Returns:** A list of checks with `name`, `status` (`pass`, `warn`, `fail`), and `detail`.
 *   **UI:** Show the list. Block progress if any check status is `fail`.
 
-### Step 3: Configuration Form (Commit)
+### Step 3a: User-Managed Configuration (HTTP-01)
 **POST** `/api/v1/remote/configure`
+
+This mode is for users self-hosting their Nexus relay. It uses HTTP-01 challenge which requires port 80 to be accessible from the internet.
 
 #### Fields:
 1.  **Endpoint (`endpoint`):**
     *   URL of the Nexus relay (e.g., `wss://nexus.example.com`).
 2.  **Device Secret (`device_secret`):**
     *   Shared secret for authentication.
-3.  **TLD (`tld`):**
-    *   The base domain for this device (e.g., `piccolo.example.com`).
-4.  **Portal Hostname (`portal_hostname`):**
-    *   **CRITICAL:** The specific FQDN for the admin panel.
-    *   *Suggestion:* Default to `portal.<tld>`.
-5.  **Solver (`solver`):**
-    *   Dropdown: `http-01` or `dns-01`.
-    *   *Note:* `http-01` is easier but requires port 80 to be open/forwarded. `dns-01` supports wildcards but requires API keys.
-    *   **Behavior:**
-        *   `dns-01`: Piccolo issues a single “core” certificate covering both `<tld>` and `*.<tld>`. All apps exposed as `<listener>.<tld>` are automatically covered by the wildcard.
-        *   `http-01`: Piccolo issues a portal certificate for `portal_hostname` and per‑listener certificates for HTTP/WS app endpoints (`<listener>.<tld>`). Apps installed before or after remote enable are queued automatically.
-    *   **Reliability:** Failed issuances are retried with exponential backoff. Certificate inventory includes `attempts`, `last_attempt`, and `retry_at` for UI visibility, plus manual renew actions.
+3.  **Portal Hostname (`portal_hostname`):**
+    *   **CRITICAL:** The fully-qualified domain name for the admin panel (e.g., `portal.home.example.com`).
+    *   App subdomains will be derived from this hostname (e.g., `myapp.portal.home.example.com`).
 
-#### Dynamic DNS Provider Fields (If Solver is `dns-01`)
-Do **not** hardcode provider fields. Fetch them dynamically.
-*   **GET** `/api/v1/remote/dns/providers`
-*   **Render:**
-    *   Dropdown to select provider (`id`).
-    *   Render inputs based on the `fields` array for the selected provider.
-    *   Mark `secret: true` fields as password inputs.
-    *   Send these as a map in `dns_credentials`.
+#### Behavior:
+*   Always uses HTTP-01 challenge (solver is implicit)
+*   Issues a portal certificate for `portal_hostname`
+*   Issues per-listener certificates for HTTP/WS app endpoints (`<listener>.<portal_hostname>`)
+*   **No wildcard support** - each app listener gets its own certificate
+*   Apps installed before or after remote enable are queued automatically
+*   Failed issuances are retried with exponential backoff
 
-### Payload Example
+#### Payload Example
 ```json
 {
   "endpoint": "wss://nexus.piccolo.link",
   "device_secret": "my-secret-key",
-  "solver": "dns-01",
-  "tld": "home.piccolo.link",
-  "portal_hostname": "piccolo.home.piccolo.link",
-  "dns_provider": "cloudflare",
-  "dns_credentials": {
-    "api_token": "..."
-  }
+  "portal_hostname": "piccolo.home.piccolo.link"
 }
 ```
+
+### Step 3b: Managed Configuration (DNS-01 via Piccolo Orchestrator)
+**POST** `/api/v1/remote/managed/configure`
+
+This mode is for Piccolo Space managed devices. It uses DNS-01 challenge via the Piccolo orchestrator, which supports wildcard certificates.
+
+#### Fields:
+1.  **Orchestrator Endpoint (`orchestrator_endpoint`):**
+    *   URL of the Piccolo orchestrator API.
+2.  **Device Token (`device_token`):**
+    *   Device authentication token from Piccolo Space.
+3.  **Portal Hostname (`portal_hostname`):**
+    *   The fully-qualified domain name for the admin panel (e.g., `portal.home.example.com`).
+
+#### Behavior:
+*   Always uses DNS-01 challenge (solver is automatic)
+*   Issues a portal certificate for `portal_hostname`
+*   Issues a **wildcard certificate** covering `*.<portal_hostname>` and `<portal_hostname>`
+*   All apps automatically covered by wildcard - no per-listener certificates needed
+*   Failed issuances are retried with exponential backoff
+
+#### Payload Example
+```json
+{
+  "orchestrator_endpoint": "https://api.piccolo.space",
+  "device_token": "device-auth-token",
+  "portal_hostname": "piccolo.home.piccolo.link"
+}
+```
+
 *   **Action:** This is the **Commit** step. It saves the configuration to disk and enables the service.
 *   **Success:** Transition UI to "Active" dashboard.
 

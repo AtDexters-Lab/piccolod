@@ -22,6 +22,7 @@ import (
 
 	"piccolod/internal/crypt"
 	"piccolod/internal/events"
+	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 )
 
@@ -286,22 +287,32 @@ func shouldGuardMountDir(volumeID string) bool {
 	return volumeID != ""
 }
 
-// cleanAndReprotectMountDir removes orphaned files from a mount directory after
-// unmount, temporarily removing the immutable guard if active, then re-applying it.
-func cleanAndReprotectMountDir(volumeID, mountDir string) {
-	guarded := shouldGuardMountDir(volumeID)
-	if guarded {
-		if err := unprotectMountDir(mountDir); err != nil {
-			log.Printf("WARN: volume %s: failed to unprotect mountpoint for cleanup, skipping clean: %v", volumeID, err)
-			return
+// reprotectMountDir re-applies the immutable guard to a mount directory after unmount.
+// If the directory is not empty (which indicates a bug - data written outside encrypted volume),
+// it logs a CRITICAL error but does NOT delete anything. This ensures bugs are surfaced
+// immediately rather than silently causing data loss.
+//
+// When files are found, gocryptfs will fail to mount on next attempt (it requires an
+// empty mount directory), which is the desired "fail loudly" behavior.
+func reprotectMountDir(volumeID, mountDir string) {
+	// Check if directory is empty - it should be after gocryptfs unmount
+	entries, err := os.ReadDir(mountDir)
+	if err != nil && !os.IsNotExist(err) {
+		log.Printf("WARN: volume %s: failed to read mount directory: %v", volumeID, err)
+	}
+
+	if len(entries) > 0 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
 		}
+		log.Printf("CRITICAL: volume %s: mount directory not empty after unmount - contains: %v. This indicates data was written outside the encrypted volume (a bug). NOT cleaning to preserve data. gocryptfs will fail to mount until this is manually resolved.", volumeID, names)
 	}
-	if err := cleanDirectory(mountDir); err != nil {
-		log.Printf("WARN: volume %s: failed to clean mount directory after unmount: %v", volumeID, err)
-	}
-	if guarded {
+
+	// Re-apply immutable guard if configured
+	if shouldGuardMountDir(volumeID) {
 		if err := protectMountDir(mountDir); err != nil {
-			log.Printf("WARN: volume %s: failed to re-protect mountpoint after cleanup: %v", volumeID, err)
+			log.Printf("WARN: volume %s: failed to re-protect mountpoint: %v", volumeID, err)
 		}
 	}
 }
@@ -399,10 +410,10 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 		if opts.Role == VolumeRoleFollower {
 			modeBytes = []byte("ro")
 		}
-		if err := os.WriteFile(filepath.Join(entry.handle.MountDir, ".mode"), modeBytes, 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(filepath.Join(entry.handle.MountDir, ".mode"), modeBytes, 0o600); err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(entry.handle.MountDir, ".cipher"), []byte(entry.cipherDir), 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(filepath.Join(entry.handle.MountDir, ".cipher"), []byte(entry.cipherDir), 0o600); err != nil {
 			return err
 		}
 		f.mu.Lock()
@@ -465,10 +476,10 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 	if opts.Role == VolumeRoleFollower {
 		mode = []byte("ro")
 	}
-	if err := os.WriteFile(filepath.Join(entry.handle.MountDir, ".mode"), mode, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(filepath.Join(entry.handle.MountDir, ".mode"), mode, 0o600); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(entry.handle.MountDir, ".cipher"), []byte(entry.cipherDir), 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(filepath.Join(entry.handle.MountDir, ".cipher"), []byte(entry.cipherDir), 0o600); err != nil {
 		return err
 	}
 
@@ -583,7 +594,7 @@ func (f *fileVolumeManager) detachWithRetry(ctx context.Context, handle VolumeHa
 	// First try normal unmount (without post-unmount cleanup)
 	err := f.fusermountDetach(ctx, handle)
 	if err == nil {
-		cleanAndReprotectMountDir(handle.ID, handle.MountDir)
+		reprotectMountDir(handle.ID, handle.MountDir)
 		return nil
 	}
 
@@ -604,13 +615,13 @@ func (f *fileVolumeManager) detachWithRetry(ctx context.Context, handle VolumeHa
 
 		// Check if still mounted
 		if mounted, _ := isMountPoint(handle.MountDir); !mounted {
-			cleanAndReprotectMountDir(handle.ID, handle.MountDir)
+			reprotectMountDir(handle.ID, handle.MountDir)
 			return nil
 		}
 
 		// Try normal unmount again (no cleanup on each retry)
 		if err := f.fusermountDetach(ctx, handle); err == nil {
-			cleanAndReprotectMountDir(handle.ID, handle.MountDir)
+			reprotectMountDir(handle.ID, handle.MountDir)
 			return nil
 		}
 	}
@@ -631,7 +642,7 @@ func (f *fileVolumeManager) detachWithRetry(ctx context.Context, handle VolumeHa
 		return fmt.Errorf("volume %s still mounted after lazy unmount", handle.ID)
 	}
 
-	cleanAndReprotectMountDir(handle.ID, handle.MountDir)
+	reprotectMountDir(handle.ID, handle.MountDir)
 	return nil
 }
 
@@ -657,7 +668,7 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 			if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
 				return fmt.Errorf("ensure state dir for migration: %w", err)
 			}
-			if err := os.WriteFile(metaPath, legacyData, 0o600); err != nil {
+			if err := fsutil.AtomicWriteFile(metaPath, legacyData, 0o600); err != nil {
 				return fmt.Errorf("migrate metadata: %w", err)
 			}
 			// Remove from legacy location to stop gocryptfs warnings
@@ -696,7 +707,7 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 		if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
 			return err
 		}
-		if err := os.WriteFile(metaPath, metaBytes, 0o600); err != nil {
+		if err := fsutil.AtomicWriteFile(metaPath, metaBytes, 0o600); err != nil {
 			return err
 		}
 		// Bypass mode also needs a legacy conf file check? Or just ensure cipherDir init?
@@ -728,7 +739,7 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 	if err := os.MkdirAll(entry.stateDir, 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(metaPath, metaBytes, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(metaPath, metaBytes, 0o600); err != nil {
 		return err
 	}
 
@@ -901,35 +912,16 @@ func (f *fileVolumeManager) writeVolumeState(volumeID string, state volumeState)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, "state-*.tmp")
+	data, err := json.MarshalIndent(&state, "", "  ")
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(tmp)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(&state); err != nil {
-		tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmp.Name())
-		return err
-	}
 	finalPath := filepath.Join(dir, "state.json")
-	if err := os.Rename(tmp.Name(), finalPath); err != nil {
-		_ = os.Remove(tmp.Name())
+	if err := fsutil.AtomicWriteFile(finalPath, data, 0o600); err != nil {
 		return err
 	}
-	if err := syncDir(dir); err != nil {
-		return err
-	}
-	return syncDir(f.stateRoot)
+	// Also sync the parent state root for extra durability
+	return fsutil.SyncDir(f.stateRoot)
 }
 
 func (f *fileVolumeManager) sealVolumeKey(ctx context.Context, passphrase []byte) (volumeMetadata, error) {
@@ -1030,35 +1022,6 @@ func generatePassphrase() ([]byte, error) {
 	}
 	encoded := base64.RawStdEncoding.EncodeToString(raw)
 	return []byte(encoded), nil
-}
-
-func syncDir(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
-}
-
-// cleanDirectory removes all contents of a directory but keeps the directory itself.
-// This is used to clean the mount directory after unmount to ensure gocryptfs
-// can mount again (gocryptfs requires an empty mount directory).
-func cleanDirectory(dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	for _, entry := range entries {
-		path := filepath.Join(dir, entry.Name())
-		if err := os.RemoveAll(path); err != nil {
-			return fmt.Errorf("remove %s: %w", path, err)
-		}
-	}
-	return nil
 }
 
 var _ VolumeManager = (*fileVolumeManager)(nil)

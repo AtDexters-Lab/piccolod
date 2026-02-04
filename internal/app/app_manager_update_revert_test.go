@@ -24,17 +24,16 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 	mgr.ForceLockState(false)
 	ctx := context.Background()
 
-	// Install initial app
+	// Install initial app - RFC 20260130: listener name is the app identity
 	def := &api.AppDefinition{
-		Name:      "demoapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "demoapp", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine:3.18", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	inst, err := mgr.Install(ctx, def, "")
+	inst, err := mgr.Install(ctx, def)
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
@@ -67,16 +66,16 @@ func TestAppManager_Logs(t *testing.T) {
 	mgr.ForceLockState(false)
 	ctx := context.Background()
 
+	// RFC 20260130: listener name is the app identity
 	def := &api.AppDefinition{
-		Name:      "demo",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "demo", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine:latest", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	inst, err := mgr.Install(ctx, def, "")
+	inst, err := mgr.Install(ctx, def)
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}

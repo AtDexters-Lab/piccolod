@@ -2,7 +2,11 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:pointer_interceptor/pointer_interceptor.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../../core/models/listener_health.dart';
+import '../../../core/models/network_models.dart';
+import '../../../core/services/api_client.dart';
+import '../../../core/services/network_service.dart';
 import '../../../core/services/websocket_connection.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../desktop_controller.dart';
@@ -62,6 +66,10 @@ class Dock extends StatelessWidget {
 
             // Health indicator
             _HealthIndicator(controller: controller),
+            const SizedBox(width: 12),
+
+            // Network peers indicator
+            const _NetworkPeersIndicator(),
             const SizedBox(width: 16),
 
             _buildSeparator(),
@@ -160,6 +168,10 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   // Map of app:listener -> health status
   final Map<String, ListenerHealth> _healthMap = {};
   StreamSubscription<ListenerHealthEvent>? _subscription;
+  // True between WebSocket connect and receiving health data (or grace timeout).
+  // Prevents a brief "Healthy" flash on transient reconnects when backend is down.
+  bool _pendingSnapshot = false;
+  Timer? _snapshotGrace;
 
   @override
   void initState() {
@@ -207,9 +219,26 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   void _onClientStateChanged() {
     if (!mounted) return;
     final client = widget.controller.eventStreamClient;
-    // Clear stale health data on reconnect; server will send fresh snapshot
+    // Clear stale health data on reconnect; server will send fresh snapshot.
+    // Mark as pending so the UI shows "Offline" until real data arrives,
+    // preventing a brief "Healthy" flash on transient reconnects.
     if (client?.state == WebSocketConnectionState.connected) {
       _healthMap.clear();
+      _pendingSnapshot = true;
+      _snapshotGrace?.cancel();
+      _snapshotGrace = Timer(const Duration(seconds: 3), () {
+        if (!mounted) return;
+        // Grace period expired — only clear the pending flag if we actually
+        // received health data. If the map is still empty, keep showing
+        // "Offline" rather than a false "Healthy".
+        if (_healthMap.isNotEmpty) {
+          setState(() => _pendingSnapshot = false);
+        }
+      });
+    } else {
+      // Disconnected — cancel any pending grace timer.
+      _snapshotGrace?.cancel();
+      _pendingSnapshot = false;
     }
     setState(() {});
   }
@@ -219,11 +248,17 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
     setState(() {
       final key = '${event.app}:${event.listener}';
       _healthMap[key] = event.health;
+      // Real health data arrived — no longer pending.
+      if (_pendingSnapshot) {
+        _pendingSnapshot = false;
+        _snapshotGrace?.cancel();
+      }
     });
   }
 
   @override
   void dispose() {
+    _snapshotGrace?.cancel();
     widget.controller.removeListener(_onControllerChanged);
     _unsubscribeFromClient();
     super.dispose();
@@ -257,7 +292,7 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   }
 
   Color get _statusColor {
-    if (!_isConnected) return PiccoloTheme.inkMuted;
+    if (!_isConnected || _pendingSnapshot) return PiccoloTheme.inkMuted;
     switch (_aggregateStatus) {
       case 'error':
         return PiccoloTheme.critical;
@@ -270,7 +305,7 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   }
 
   String get _statusLabel {
-    if (!_isConnected) return 'Offline';
+    if (!_isConnected || _pendingSnapshot) return 'Offline';
     switch (_aggregateStatus) {
       case 'error':
         return 'Error';
@@ -285,6 +320,7 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
 
   String get _tooltipMessage {
     if (!_isConnected) return 'Connection lost - Reconnecting...';
+    if (_pendingSnapshot) return 'Connected - Waiting for health data...';
     switch (_aggregateStatus) {
       case 'error':
         return 'System Error - Check app details';
@@ -505,6 +541,157 @@ class DockItem extends StatelessWidget {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _NetworkPeersIndicator extends StatefulWidget {
+  const _NetworkPeersIndicator();
+
+  @override
+  State<_NetworkPeersIndicator> createState() => _NetworkPeersIndicatorState();
+}
+
+class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
+  final NetworkService _networkService = NetworkService(ApiClient());
+  List<DiscoveredPeer> _peers = [];
+  Timer? _pollTimer;
+  bool _isLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchPeers();
+    // Poll every 30 seconds (half of mDNS discovery interval)
+    _pollTimer = Timer.periodic(const Duration(seconds: 30), (_) => _fetchPeers());
+  }
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _fetchPeers() async {
+    if (_isLoading) return;
+    _isLoading = true;
+
+    try {
+      final response = await _networkService.getPeers();
+      if (mounted) {
+        setState(() {
+          _peers = response.peers;
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _openPeerUrl(String url) async {
+    final uri = Uri.parse(url);
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Hide if no peers
+    if (_peers.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final onlinePeers = _peers.where((p) => p.online).length;
+
+    return PopupMenuButton<DiscoveredPeer>(
+      offset: const Offset(0, -80),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      tooltip: "Other Piccolo devices on your network",
+      onSelected: (peer) => _openPeerUrl(peer.url),
+      itemBuilder: (context) => [
+        const PopupMenuItem(
+          enabled: false,
+          child: Text(
+            "Other Piccolo Devices",
+            style: TextStyle(
+              fontWeight: FontWeight.w600,
+              color: PiccoloTheme.ink,
+            ),
+          ),
+        ),
+        const PopupMenuDivider(),
+        ..._peers.map((peer) => PopupMenuItem<DiscoveredPeer>(
+              value: peer.online ? peer : null,
+              enabled: peer.online,
+              child: Row(
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: peer.online ? PiccoloTheme.success : PiccoloTheme.inkMuted,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          peer.displayName,
+                          style: const TextStyle(fontWeight: FontWeight.w500),
+                        ),
+                        if (peer.model != null || peer.ipv4 != null)
+                          Text(
+                            peer.online
+                                ? (peer.model ?? peer.ipv4 ?? '')
+                                : '(offline)',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: PiccoloTheme.inkMuted,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            )),
+      ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: PiccoloTheme.cobalt600.withValues(alpha: 0.3)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.devices,
+              size: 16,
+              color: PiccoloTheme.cobalt600,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              '$onlinePeers',
+              style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+                color: PiccoloTheme.ink,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
         ),
       ),
     );

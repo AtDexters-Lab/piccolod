@@ -16,23 +16,6 @@ func TestNewManager(t *testing.T) {
 		t.Fatal("NewManager() returned nil")
 	}
 
-	// Test basic fields
-	if manager.hostname != "piccolo" {
-		t.Errorf("hostname = %v, want %v", manager.hostname, "piccolo")
-	}
-
-	if manager.port != 80 {
-		t.Errorf("port = %v, want %v", manager.port, 80)
-	}
-
-	if manager.baseName != "piccolo" {
-		t.Errorf("baseName = %v, want %v", manager.baseName, "piccolo")
-	}
-
-	if manager.finalName != "piccolo" {
-		t.Errorf("finalName = %v, want %v", manager.finalName, "piccolo")
-	}
-
 	// Test machine ID generation
 	if manager.machineID == "" {
 		t.Error("machineID should not be empty")
@@ -40,6 +23,25 @@ func TestNewManager(t *testing.T) {
 
 	if len(manager.machineID) != 6 {
 		t.Errorf("machineID length = %v, want 6", len(manager.machineID))
+	}
+
+	// Test that baseName is now the specific name (piccolo-<machineId>)
+	// This ensures only gateway leader serves piccolo.local
+	expectedBaseName := "piccolo-" + manager.machineID
+	if manager.hostname != expectedBaseName {
+		t.Errorf("hostname = %v, want %v", manager.hostname, expectedBaseName)
+	}
+
+	if manager.port != 80 {
+		t.Errorf("port = %v, want %v", manager.port, 80)
+	}
+
+	if manager.baseName != expectedBaseName {
+		t.Errorf("baseName = %v, want %v", manager.baseName, expectedBaseName)
+	}
+
+	if manager.finalName != expectedBaseName {
+		t.Errorf("finalName = %v, want %v", manager.finalName, expectedBaseName)
 	}
 
 	// Test security components initialization

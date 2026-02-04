@@ -8,14 +8,15 @@ import (
 )
 
 const (
-	CommandConfigure    = "remote.configure"
-	CommandDisable      = "remote.disable"
-	CommandRotateSecret = "remote.rotate_secret"
-	CommandRunPreflight = "remote.run_preflight"
-	CommandAddAlias     = "remote.add_alias"
-	CommandRemoveAlias  = "remote.remove_alias"
-	CommandRenewCert    = "remote.renew_certificate"
-	CommandGuideVerify  = "remote.guide_verify"
+	CommandConfigure        = "remote.configure"
+	CommandManagedConfigure = "remote.managed_configure"
+	CommandDisable          = "remote.disable"
+	CommandRotateSecret     = "remote.rotate_secret"
+	CommandRunPreflight     = "remote.run_preflight"
+	CommandAddAlias         = "remote.add_alias"
+	CommandRemoveAlias      = "remote.remove_alias"
+	CommandRenewCert        = "remote.renew_certificate"
+	CommandGuideVerify      = "remote.guide_verify"
 )
 
 var ErrInvalidCommand = errors.New("remote: invalid command")
@@ -27,6 +28,16 @@ type ConfigureCommand struct {
 func (ConfigureCommand) Name() string { return CommandConfigure }
 
 type ConfigureResponse struct {
+	Status Status
+}
+
+type ManagedConfigureCommand struct {
+	Req ManagedConfigureRequest
+}
+
+func (ManagedConfigureCommand) Name() string { return CommandManagedConfigure }
+
+type ManagedConfigureResponse struct {
 	Status Status
 }
 
@@ -90,6 +101,7 @@ func RegisterHandlers(dispatcher *commands.Dispatcher, manager *Manager) {
 		return
 	}
 	dispatcher.Register(CommandConfigure, commands.HandlerFunc(manager.handleConfigureCommand))
+	dispatcher.Register(CommandManagedConfigure, commands.HandlerFunc(manager.handleManagedConfigureCommand))
 	dispatcher.Register(CommandDisable, commands.HandlerFunc(manager.handleDisableCommand))
 	dispatcher.Register(CommandRotateSecret, commands.HandlerFunc(manager.handleRotateSecretCommand))
 	dispatcher.Register(CommandRunPreflight, commands.HandlerFunc(manager.handleRunPreflightCommand))
@@ -108,6 +120,17 @@ func (m *Manager) handleConfigureCommand(ctx context.Context, cmd commands.Comma
 		return nil, err
 	}
 	return ConfigureResponse{Status: m.Status()}, nil
+}
+
+func (m *Manager) handleManagedConfigureCommand(ctx context.Context, cmd commands.Command) (commands.Response, error) {
+	request, ok := cmd.(ManagedConfigureCommand)
+	if !ok {
+		return nil, ErrInvalidCommand
+	}
+	if err := m.ConfigureManaged(request.Req); err != nil {
+		return nil, err
+	}
+	return ManagedConfigureResponse{Status: m.Status()}, nil
 }
 
 func (m *Manager) handleDisableCommand(ctx context.Context, cmd commands.Command) (commands.Response, error) {

@@ -3,7 +3,6 @@ class RemoteStatus {
   final String state;
   final String solver;
   final String? endpoint;
-  final String? tld;
   final String? portalHostname;
   final int? latencyMs;
   final DateTime? lastHandshake;
@@ -21,7 +20,6 @@ class RemoteStatus {
     required this.state,
     required this.solver,
     this.endpoint,
-    this.tld,
     this.portalHostname,
     this.latencyMs,
     this.lastHandshake,
@@ -41,7 +39,6 @@ class RemoteStatus {
       state: json['state'] ?? 'unknown',
       solver: json['solver'] ?? 'unknown',
       endpoint: json['endpoint'],
-      tld: json['tld'],
       portalHostname: json['portal_hostname'],
       latencyMs: json['latency_ms'],
       lastHandshake: json['last_handshake'] != null ? DateTime.parse(json['last_handshake']) : null,
@@ -180,55 +177,6 @@ class RemoteEvent {
       source: json['source'] ?? 'unknown',
       message: json['message'] ?? '',
       nextStep: json['next_step'],
-    );
-  }
-}
-
-class RemoteDNSProvider {
-  final String id;
-  final String name;
-  final String? docsUrl;
-  final List<RemoteDNSProviderField> fields;
-
-  RemoteDNSProvider({
-    required this.id,
-    required this.name,
-    this.docsUrl,
-    required this.fields,
-  });
-
-  factory RemoteDNSProvider.fromJson(Map<String, dynamic> json) {
-    return RemoteDNSProvider(
-      id: json['id'] ?? '',
-      name: json['name'] ?? '',
-      docsUrl: json['docs_url'],
-      fields: (json['fields'] as List<dynamic>?)?.map((e) => RemoteDNSProviderField.fromJson(e)).toList() ?? [],
-    );
-  }
-}
-
-class RemoteDNSProviderField {
-  final String id;
-  final String label;
-  final bool secret;
-  final String? placeholder;
-  final String? description;
-
-  RemoteDNSProviderField({
-    required this.id,
-    required this.label,
-    required this.secret,
-    this.placeholder,
-    this.description,
-  });
-
-  factory RemoteDNSProviderField.fromJson(Map<String, dynamic> json) {
-    return RemoteDNSProviderField(
-      id: json['id'] ?? '',
-      label: json['label'] ?? '',
-      secret: json['secret'] ?? false,
-      placeholder: json['placeholder'],
-      description: json['description'],
     );
   }
 }

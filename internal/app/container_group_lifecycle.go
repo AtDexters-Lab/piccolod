@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -71,7 +72,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 
 	// Persist repaired metadata before starting.
 	if changed {
-		if err := state.StoreApp(appInst, nil); err != nil {
+		if err := state.StoreAppMetadata(appInst); err != nil {
 			log.Printf("WARN: start %s: failed to persist repaired container IDs: %v", appInst.InstanceID, err)
 		}
 	}
@@ -100,7 +101,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 	resetStartupTracking(appInst)
 	appInst.Status = "running"
 	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst, nil); err != nil {
+	if err := state.StoreAppMetadata(appInst); err != nil {
 		return fmt.Errorf("failed to update app status: %w", err)
 	}
 	if prevStatus != "running" {
@@ -285,10 +286,14 @@ func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppIn
 		}
 	}
 
-	// Remove network anchor.
+	// Remove network anchor. Treat "not found" as success since the goal is removal.
 	if anchorID != "" {
 		if err := m.containerManager.RemoveContainer(ctx, runtime, anchorID); err != nil {
-			return fmt.Errorf("failed to remove network anchor: %w", err)
+			var notFound *container.ContainerNotFoundError
+			if !errors.As(err, &notFound) {
+				return fmt.Errorf("failed to remove network anchor: %w", err)
+			}
+			log.Printf("INFO: uninstall %s: network anchor %s already removed", appInst.InstanceID, anchorID)
 		}
 	}
 

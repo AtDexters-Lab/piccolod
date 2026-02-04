@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -118,8 +119,14 @@ type GinServer struct {
 	// Internal CA for OIDC Back-Channel
 	internalCA   *pki.InternalCA
 	internalCAMu sync.Mutex
-	internalSrv  *http.Server
-	bootstrapDir string // stored for deferred CA initialization
+	internalSrv *http.Server
+
+	// Cached TLS certificate for GetCertificate callback (avoids disk I/O per handshake)
+	cachedCert   *tls.Certificate
+	cachedCertMu sync.RWMutex
+
+	// Cert SAN refresh subscription cleanup
+	certRefreshUnsub func()
 
 	reloadersMu     sync.RWMutex
 	unlockReloaders []unlockReloader
@@ -487,6 +494,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.observeLockState(eventsBus)
 	s.observeLeadership(eventsBus)
 	s.observeRemoteConfig(eventsBus)
+	s.observeProxyOIDCClients(eventsBus)
 
 	for _, opt := range opts {
 		opt(s)
@@ -619,10 +627,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		svcMgr.SetRemoteStatusProvider(&remoteStatusAdapter{rm: rm})
 	}
 
-	// Internal CA (for OIDC Back-Channel)
-	// Defer CA initialization until after unlock when bootstrap volume is mounted.
-	// Store bootstrapDir for later use in ensureInternalCA().
-	s.bootstrapDir = bootstrapDir
+	// Internal CA is initialized at Start() from network-bootstrap dir (pre-unlock).
 
 	// Now that remote manager exists, wire ACME challenge handler and cert provider
 	if rm != nil && svcMgr != nil {
@@ -717,6 +722,16 @@ func (s *GinServer) Start() error {
 
 	s.startSecureLoopback()
 
+	// Initialize internal CA and HTTPS listener from network-bootstrap dir (pre-unlock).
+	// This ensures HTTPS is available for the unlock page and CA download.
+	if err := s.ensureInternalCA(); err != nil {
+		log.Printf("WARN: internal CA initialization failed (HTTPS unavailable): %v", err)
+	} else {
+		s.refreshServerCertSANs()
+		s.startInternalHTTPSListener()
+		s.subscribeCertRefresh()
+	}
+
 	log.Printf("INFO: Starting piccolod server with Gin on http://localhost:%s", port)
 
 	// Notify systemd that we're ready (for Type=notify services)
@@ -752,7 +767,11 @@ func (s *GinServer) Stop(ctx context.Context) error {
 		}
 	}
 
-	// 3. Stop internal listeners
+	// 3. Stop cert refresh subscription and internal listeners
+	if s.certRefreshUnsub != nil {
+		s.certRefreshUnsub()
+		s.certRefreshUnsub = nil
+	}
 	s.stopSecureLoopback()
 	s.stopInternalHTTPSListener()
 
@@ -796,7 +815,7 @@ func (s *GinServer) portalOriginForRequest(r *http.Request) string {
 	}
 
 	scheme := "http"
-	if s.isSecureRequest(r) {
+	if s.isSecureRequest(r) || services.RequestArrivedViaTLS(r) {
 		scheme = "https"
 	}
 	defaultPort := 80
@@ -941,6 +960,12 @@ func (s *GinServer) setupGinRoutes() {
 		v1.POST("/crypto/reset-password", s.handleCryptoResetPassword)
 		v1.GET("/crypto/recovery-key", s.handleCryptoRecoveryStatus)
 
+		// Network discovery (public, LAN-only data)
+		v1.GET("/network/peers", s.handleNetworkPeers)
+
+		// CA certificate download (public - needed before login for HTTPS setup)
+		v1.GET("/system/ca.crt", s.handleCADownload)
+
 		// All other API endpoints require session + CSRF
 		authed := v1.Group("/")
 		authed.Use(s.requireSession())
@@ -994,6 +1019,7 @@ func (s *GinServer) setupGinRoutes() {
 		remote := admin.Group("/remote")
 		{
 			remote.POST("/configure", s.handleRemoteConfigure)
+			remote.POST("/managed/configure", s.handleRemoteManagedConfigure)
 			remote.POST("/disable", s.handleRemoteDisable)
 			remote.POST("/rotate", s.handleRemoteRotate)
 			remote.POST("/preflight", s.handleRemotePreflight)
@@ -1003,7 +1029,6 @@ func (s *GinServer) setupGinRoutes() {
 			remote.GET("/certificates", s.handleRemoteCertificatesList)
 			remote.POST("/certificates/:id/renew", s.handleRemoteCertificateRenew)
 			remote.GET("/events", s.handleRemoteEvents)
-			remote.GET("/dns/providers", s.handleRemoteDNSProviders)
 			remote.GET("/nexus-guide", s.handleRemoteGuideInfo)
 			remote.POST("/nexus-guide/verify", s.handleRemoteGuideVerify)
 		}
@@ -1218,14 +1243,21 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 }
 
 func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoint, scheme string) *string {
+	r := c.Request
 
-	if s.isSecureRequest(c.Request) {
-		// secure context requests are nexus proxied requests with TLS muxing
-		// prevent local non-secure urls from being generated in that context
+	// Suppress local URLs only for nexus/TLS-mux proxied requests (remote access).
+	// These are identified by the secureContextKey set in the secure loopback handler,
+	// or by the X-Forwarded-Proto header set by the TLS mux.
+	// Internal HTTPS requests (r.TLS != nil from :443 listener) are still LAN requests
+	// and should receive local URLs so the UI can offer new-tab fallback.
+	if r.Context().Value(secureContextKeyInstance) != nil {
+		return nil
+	}
+	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
 		return nil
 	}
 
-	host := c.Request.Host
+	host := r.Host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
@@ -1326,12 +1358,19 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 		return
 	}
 
-	// Initialize internal CA now that bootstrap volume is mounted
-	if err := s.ensureInternalCA(); err != nil {
-		log.Printf("WARN: internal CA initialization failed: %v", err)
+	// CA and HTTPS listener are initialized at Start() from network-bootstrap dir.
+	// If pre-unlock init failed (e.g., directory not ready), retry now.
+	if s.internalCA == nil {
+		if err := s.ensureInternalCA(); err != nil {
+			log.Printf("WARN: internal CA retry after unlock failed: %v", err)
+		} else {
+			s.refreshServerCertSANs()
+			s.startInternalHTTPSListener()
+			s.subscribeCertRefresh()
+		}
 	} else {
-		// Start internal HTTPS listener now that CA is available
-		s.startInternalHTTPSListener()
+		// Refresh cert SANs after unlock in case mDNS hostnames changed.
+		s.refreshServerCertSANs()
 	}
 
 	s.reloadersMu.RLock()
@@ -1347,8 +1386,53 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 	}
 }
 
-// ensureInternalCA lazily initializes the internal CA for OIDC back-channel communication.
-// This must be called after unlock when the bootstrap volume is mounted.
+// subscribeCertRefresh watches for hostname/leadership changes to regenerate cert SANs.
+// subscribeCertRefresh listens for TopicHostnamesChanged events (emitted by the
+// mDNS NameRegistry after its hostname snapshot is updated) and regenerates the
+// server TLS certificate with the current SAN list. This replaces the previous
+// approach of subscribing to raw TopicServiceEndpointsChanged / TopicLeadershipRoleChanged
+// events which raced with the mDNS debounce, causing stale SAN lists.
+func (s *GinServer) subscribeCertRefresh() {
+	if s.certRefreshUnsub != nil {
+		s.certRefreshUnsub()
+	}
+	if s.events == nil || s.internalCA == nil {
+		return
+	}
+
+	ch, unsub := s.events.SubscribeWithCancel(events.TopicHostnamesChanged, 4)
+	refreshCh := make(chan struct{}, 1)
+	done := make(chan struct{})
+	s.certRefreshUnsub = func() {
+		unsub()
+		close(done)
+	}
+	trigger := func() {
+		select {
+		case refreshCh <- struct{}{}:
+		default: // already pending
+		}
+	}
+	go func() {
+		for range ch {
+			trigger()
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-refreshCh:
+				s.refreshServerCertSANs()
+			case <-done:
+				return
+			}
+		}
+	}()
+}
+
+// ensureInternalCA initializes the internal CA from the network-bootstrap directory.
+// The CA is stored outside the encrypted control volume so HTTPS is available pre-unlock.
+// The network-bootstrap directory is always present on the root filesystem.
 func (s *GinServer) ensureInternalCA() error {
 	if s == nil {
 		return nil
@@ -1362,11 +1446,8 @@ func (s *GinServer) ensureInternalCA() error {
 		return nil
 	}
 
-	if s.bootstrapDir == "" {
-		return fmt.Errorf("bootstrap directory not configured")
-	}
-
-	ca, err := pki.NewInternalCA(s.bootstrapDir)
+	caDir := paths.NetworkBootstrapDir()
+	ca, err := pki.NewInternalCA(caDir)
 	if err != nil {
 		return fmt.Errorf("internal CA init: %w", err)
 	}
@@ -1379,8 +1460,21 @@ func (s *GinServer) ensureInternalCA() error {
 		s.appManager.SetInternalCAPath(ca.CertPath())
 	}
 
-	log.Printf("INFO: internal CA initialized from %s", s.bootstrapDir)
+	log.Printf("INFO: internal CA initialized from %s", caDir)
 	return nil
+}
+
+// handleCADownload serves the internal CA certificate for browser trust.
+func (s *GinServer) handleCADownload(c *gin.Context) {
+	s.internalCAMu.Lock()
+	ca := s.internalCA
+	s.internalCAMu.Unlock()
+	if ca == nil {
+		c.Status(http.StatusServiceUnavailable)
+		return
+	}
+	c.Header("Content-Disposition", `attachment; filename="piccolo-ca.crt"`)
+	c.Data(http.StatusOK, "application/x-x509-ca-cert", ca.CertPEM())
 }
 
 func (s *GinServer) refreshRemoteRuntime() {
@@ -1398,7 +1492,6 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 	if s.remoteResolver != nil {
 		s.remoteResolver.UpdateConfig(nexusclient.Config{
 			PortalHostname: status.PortalHostname,
-			TLD:            status.TLD,
 		})
 	}
 
@@ -1598,6 +1691,129 @@ func (s *GinServer) observeRemoteConfig(bus *events.Bus) {
 	}()
 }
 
+// observeProxyOIDCClients auto-registers proxy OIDC clients for apps whose
+// listeners require authentication (RFC 20260122 §5.3).
+//
+// Subscribes to two topics:
+//   - TopicAppStatusChanged ("installed"): fires after StoreApp, covers new installs.
+//   - TopicServiceEndpointsChanged (added): covers RestoreFromPodman on reboot and
+//     any future path that adds endpoints.
+//
+// Note: cleanup of proxy OIDC clients on uninstall is handled separately in
+// handleGinAppUninstall (via DeleteClientsByAppID). Update-listeners uses an
+// explicit handler-level call because no post-persist event exists for that path.
+func (s *GinServer) observeProxyOIDCClients(bus *events.Bus) {
+	if bus == nil {
+		return
+	}
+	appStatusCh := bus.Subscribe(events.TopicAppStatusChanged, 16)
+	endpointsCh := bus.Subscribe(events.TopicServiceEndpointsChanged, 16)
+
+	tryRegister := func(appName string) {
+		ctx := context.Background()
+		appInst, err := s.appManager.Get(ctx, appName)
+		if err != nil || appInst.Definition == nil {
+			return
+		}
+		if !s.requiresProxyOIDCClient(appInst.Definition) {
+			return
+		}
+		if err := s.registerProxyOIDCClient(ctx, appName); err != nil {
+			// errOIDCManagerUnavailable means control store is still locked (expected during boot);
+			// RestoreServices will re-emit endpoint events after unlock.
+			if !errors.Is(err, errOIDCManagerUnavailable) {
+				log.Printf("WARN: auto-register proxy OIDC client for %s: %v", appName, err)
+			}
+		}
+	}
+
+	go func() {
+		for evt := range appStatusCh {
+			payload, ok := evt.Payload.(events.AppStatusChangedEvent)
+			if !ok || payload.Status != "installed" {
+				continue
+			}
+			tryRegister(payload.App)
+		}
+	}()
+	go func() {
+		for evt := range endpointsCh {
+			payload, ok := evt.Payload.(events.ServiceEndpointsChanged)
+			if !ok || len(payload.Added) == 0 {
+				continue
+			}
+			tryRegister(payload.App)
+		}
+	}()
+}
+
+// requiresProxyOIDCClient checks if an app requires a proxy OIDC client per RFC 20260122 §5.3.
+// Proxy clients are needed for apps whose listeners use "headers" or "protected" auth strategies.
+// Per RFC 20260122 §4.1.1: auth omitted or empty rules → all paths default to "protected".
+func (s *GinServer) requiresProxyOIDCClient(appDef *api.AppDefinition) bool {
+	if appDef == nil {
+		return false
+	}
+	for _, listener := range appDef.Listeners {
+		if listener.Auth == nil || len(listener.Auth.Rules) == 0 {
+			return true
+		}
+		for _, rule := range listener.Auth.Rules {
+			strategy := rule.Strategy
+			if strategy == "" {
+				strategy = "public"
+			}
+			if strategy == "headers" || strategy == "protected" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// errOIDCManagerUnavailable is returned when the OIDC client manager cannot be
+// obtained (e.g. control store still locked during boot).
+var errOIDCManagerUnavailable = errors.New("OIDC client manager unavailable")
+
+// deleteProxyOIDCClient removes the proxy OIDC client for an app if one exists.
+// Used when listener auth rules change such that a proxy client is no longer needed.
+func (s *GinServer) deleteProxyOIDCClient(ctx context.Context, appName string) {
+	clientMgr := s.getOIDCClientManager()
+	if clientMgr == nil {
+		return
+	}
+	client, err := clientMgr.GetProxyClientByAppName(ctx, appName)
+	if err != nil {
+		return // no proxy client exists — nothing to clean up
+	}
+	if err := clientMgr.DeleteClient(ctx, client.ID); err != nil {
+		log.Printf("WARN: failed to delete stale proxy OIDC client for %s: %v", appName, err)
+	} else {
+		log.Printf("INFO: deleted proxy OIDC client for app %s (auth no longer required)", appName)
+	}
+}
+
+// registerProxyOIDCClient registers a proxy OIDC client for an app per RFC 20260122 §5.3.
+func (s *GinServer) registerProxyOIDCClient(ctx context.Context, appName string) error {
+	clientMgr := s.getOIDCClientManager()
+	if clientMgr == nil {
+		return errOIDCManagerUnavailable
+	}
+
+	_, err := clientMgr.GetProxyClientByAppName(ctx, appName)
+	if err == nil {
+		return nil
+	}
+
+	_, _, err = clientMgr.RegisterProxyClient(ctx, appName)
+	if err != nil {
+		return fmt.Errorf("register proxy client: %w", err)
+	}
+
+	log.Printf("INFO: registered proxy OIDC client for app %s", appName)
+	return nil
+}
+
 func (s *GinServer) handleGinReadinessCheck(c *gin.Context) {
 	if s.healthTracker == nil {
 		c.JSON(http.StatusOK, gin.H{"ready": true, "status": "unknown"})
@@ -1714,21 +1930,78 @@ func (s *GinServer) startInternalHTTPSListener() {
 	// 1. Internal CA - only piccolo's CA can issue valid certs
 	// 2. TLS verification - clients must verify cert is from internal CA
 	// 3. OIDC spec endpoints - no sensitive data beyond standard OIDC claims
+	// Preload cert into cache before starting listener to fail fast on missing/corrupt certs
+	if _, err := s.reloadServerCertFromDisk(); err != nil {
+		log.Printf("ERROR: cannot start HTTPS listener: failed to load server cert: %v", err)
+		return
+	}
+
 	addr := "0.0.0.0:443"
+	tlsCfg := &tls.Config{
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return s.loadServerCert()
+		},
+		MinVersion: tls.VersionTLS12,
+	}
 	s.internalSrv = &http.Server{
-		Addr:    addr,
-		Handler: s.router,
-		// We rely on ListenAndServeTLS to load certs from disk
+		Addr:      addr,
+		Handler:   s.router,
+		TLSConfig: tlsCfg,
 	}
 
 	go func() {
-		certPath := s.internalCA.ServerCertPath()
-		keyPath := s.internalCA.ServerKeyPath()
-		log.Printf("INFO: Starting Internal HTTPS Listener on %s (piccolo.local back-channel)", addr)
-		if err := s.internalSrv.ListenAndServeTLS(certPath, keyPath); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("INFO: Starting Internal HTTPS Listener on %s (LAN + back-channel)", addr)
+		// Empty cert/key paths: GetCertificate handles loading from disk
+		if err := s.internalSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("ERROR: Internal HTTPS Listener failed: %v", err)
 		}
 	}()
+}
+
+func (s *GinServer) loadServerCert() (*tls.Certificate, error) {
+	s.cachedCertMu.RLock()
+	cert := s.cachedCert
+	s.cachedCertMu.RUnlock()
+	if cert != nil {
+		return cert, nil
+	}
+	// Fallback: load from disk (initial handshake before cache is populated)
+	return s.reloadServerCertFromDisk()
+}
+
+func (s *GinServer) reloadServerCertFromDisk() (*tls.Certificate, error) {
+	if s.internalCA == nil {
+		return nil, fmt.Errorf("internal CA not initialized")
+	}
+	certPath := s.internalCA.ServerCertPath()
+	keyPath := s.internalCA.ServerKeyPath()
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, err
+	}
+	s.cachedCertMu.Lock()
+	s.cachedCert = &cert
+	s.cachedCertMu.Unlock()
+	return &cert, nil
+}
+
+func (s *GinServer) refreshServerCertSANs() {
+	if s.internalCA == nil || s.mdnsManager == nil {
+		return
+	}
+	hostnames := s.mdnsManager.Hostnames()
+	changed, err := s.internalCA.EnsureServerCertificateForHosts(hostnames)
+	if err != nil {
+		log.Printf("WARN: cert SAN refresh: %v", err)
+		return
+	}
+	if changed {
+		log.Printf("INFO: server certificate regenerated with SANs: %v", hostnames)
+		// Atomically reload the new cert into memory cache
+		if _, err := s.reloadServerCertFromDisk(); err != nil {
+			log.Printf("WARN: failed to reload cert into cache: %v", err)
+		}
+	}
 }
 
 func (s *GinServer) stopInternalHTTPSListener() {
@@ -1780,6 +2053,23 @@ func (s *GinServer) httpsRedirectMiddleware() gin.HandlerFunc {
 		c.Redirect(http.StatusMovedPermanently, target)
 		c.Abort()
 	}
+}
+
+// isRemoteSecureRequest returns true only for requests arriving through the
+// nexus/remote TLS path (secureContextKey) or an HTTPS reverse proxy
+// (X-Forwarded-Proto). Internal HTTPS (LAN :443) is NOT included because
+// those requests should not receive remote-only headers such as HSTS.
+func (s *GinServer) isRemoteSecureRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.Context().Value(secureContextKeyInstance) != nil {
+		return true
+	}
+	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		return true
+	}
+	return false
 }
 
 func (s *GinServer) isSecureRequest(r *http.Request) bool {

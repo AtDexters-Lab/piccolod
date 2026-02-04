@@ -121,7 +121,7 @@ Backend fields already exposed (via `/services` or `apps/{name}` detail):
 - `remote_ports`: preferred remote ports (defaults `[80, 443]`).
 
 Recommended client logic
-1) Fetch `/api/v1/remote/status` once to know if remote is enabled and what `tld/portal_hostname` are.
+1) Fetch `/api/v1/remote/status` once to know if remote is enabled and what the `portal_hostname` is.
 2) For each service endpoint:
    - **Remote context**: if `remote_host` is non-empty, build `scheme://remote_host[:port]` where `port` is chosen from `remote_ports` (prefer 443/80 defaults; omit port when using 80 for http or 443 for https). Show as “Remote” link; still keep a LAN link as fallback.
    - **Local/LAN context**: use the current page host (`window.location.hostname`) with the endpoint’s `public_port`. URL = `scheme://{currentHost}:{public_port}` (omit port only if it matches the current page port and you’re intentionally reusing it—generally include the port because services bind in the 35k range).

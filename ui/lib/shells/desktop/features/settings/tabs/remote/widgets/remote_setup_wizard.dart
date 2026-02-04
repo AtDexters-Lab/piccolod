@@ -18,14 +18,8 @@ class RemoteSetupWizard extends StatefulWidget {
 class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
   // Step 0: Guide
   final TextEditingController _endpointCtrl = TextEditingController();
-  final TextEditingController _tldCtrl = TextEditingController();
   final TextEditingController _portalCtrl = TextEditingController();
   final TextEditingController _secretCtrl = TextEditingController();
-
-  // Step 2: Config
-  String _selectedSolver = 'http-01';
-  String? _selectedProvider;
-  final Map<String, TextEditingController> _dnsFieldCtrls = {};
 
   @override
   void initState() {
@@ -34,25 +28,20 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     final status = widget.controller.status;
     if (status != null) {
       if (status.endpoint != null) _endpointCtrl.text = status.endpoint!;
-      if (status.tld != null) {
-        _tldCtrl.text = status.tld!;
-        // Default portal
-        if (status.portalHostname != null) {
-          _portalCtrl.text = status.portalHostname!;
-        } else {
-           _portalCtrl.text = "portal.${status.tld}";
-        }
-      }
-      _selectedSolver = status.solver != 'unknown' ? status.solver : 'http-01';
+      if (status.portalHostname != null) _portalCtrl.text = status.portalHostname!;
 
       // Smart Resume Logic
       if (status.state == 'preflight_required') {
-        widget.controller.wizardStep = 1;
-        // Auto-run preflight if we are resuming into this state
-        _autoRunPreflight();
-      } else if (status.state == 'provisioning') {
-        // [New] Resume at configuration step if we have partial config
-        widget.controller.wizardStep = 2;
+        // Check if we have the config data in status (re-running on existing config)
+        // vs first-time setup interrupted (config not yet persisted)
+        if (status.endpoint != null && status.endpoint!.isNotEmpty) {
+          widget.controller.wizardStep = 1;
+          // Seed pending config from status so submitConfiguration has the data
+          widget.controller.seedPendingConfigFromStatus();
+          // Auto-run preflight if we are resuming into this state
+          _autoRunPreflight();
+        }
+        // Otherwise stay on Step 0 - user needs to re-enter config
       }
     }
 
@@ -72,12 +61,8 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
   @override
   void dispose() {
     _endpointCtrl.dispose();
-    _tldCtrl.dispose();
     _portalCtrl.dispose();
     _secretCtrl.dispose();
-    for (var c in _dnsFieldCtrls.values) {
-      c.dispose();
-    }
     super.dispose();
   }
 
@@ -97,9 +82,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
       children: [
         _buildStepIndicator(0, "Connect"),
         _buildStepSeparator(),
-        _buildStepIndicator(1, "Preflight"),
-        _buildStepSeparator(),
-        _buildStepIndicator(2, "Configure"),
+        _buildStepIndicator(1, "Verify & Enable"),
       ],
     );
   }
@@ -140,8 +123,6 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         return _buildStep0Guide();
       case 1:
         return _buildStep1Preflight();
-      case 2:
-        return _buildStep2Config();
       default:
         return const Text("Unknown step");
     }
@@ -273,34 +254,38 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         const SizedBox(height: 16),
         _buildTextField("Nexus Endpoint", _endpointCtrl, hint: "wss://nexus.example.com"),
         const SizedBox(height: 16),
-        _buildTextField("Base Domain (TLD)", _tldCtrl, hint: "home.example.com", onChanged: (val) {
-          if (_portalCtrl.text.isEmpty || _portalCtrl.text.endsWith(val)) {
-            // Auto-update portal suggestion
-            // This is naive but helpful
-          }
-        }),
-        const SizedBox(height: 16),
         _buildTextField("Portal Hostname", _portalCtrl, hint: "portal.home.example.com"),
-        const SizedBox(height: 16),
+        Padding(
+          padding: const EdgeInsets.only(top: 8, bottom: 8),
+          child: Text(
+            "This is the fully-qualified domain name where this Piccolo device will be accessible remotely. "
+            "All app subdomains (e.g., myapp.home.example.com) will be derived from this hostname's parent domain.",
+            style: PiccoloTheme.textTheme.labelSmall?.copyWith(color: PiccoloTheme.inkMuted),
+          ),
+        ),
+        const SizedBox(height: 8),
         _buildTextField("Device Secret", _secretCtrl, obscureText: true),
-        
+
         const SizedBox(height: 32),
         Align(
           alignment: Alignment.centerRight,
           child: ElevatedButton(
             onPressed: () async {
-               if (_endpointCtrl.text.isEmpty || _tldCtrl.text.isEmpty || _secretCtrl.text.isEmpty || _portalCtrl.text.isEmpty) {
-                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Please fill all fields")));
-                 return;
-               }
-               await widget.controller.verifyNexusGuide(
-                 _endpointCtrl.text,
-                 _tldCtrl.text,
-                 _portalCtrl.text,
-                 _secretCtrl.text,
-               );
-               // Auto-run preflight after transition
-               _autoRunPreflight();
+              if (_endpointCtrl.text.isEmpty || _secretCtrl.text.isEmpty || _portalCtrl.text.isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Please fill all fields")));
+                return;
+              }
+              if (!_portalCtrl.text.contains('.')) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Portal hostname must be a fully-qualified domain (e.g., portal.home.example.com)")));
+                return;
+              }
+              await widget.controller.verifyNexusGuide(
+                _endpointCtrl.text,
+                _portalCtrl.text,
+                _secretCtrl.text,
+              );
+              // Auto-run preflight after transition
+              _autoRunPreflight();
             },
             child: const Text("Next: Run Preflight"),
           ),
@@ -309,17 +294,20 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     );
   }
 
-  // --- Step 1: Preflight ---
+  // --- Step 1: Preflight & Enable ---
 
   Widget _buildStep1Preflight() {
+    final bool allPassed = widget.controller.preflightChecks.isNotEmpty &&
+        !widget.controller.preflightChecks.any((c) => c.status == 'fail');
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text("Preflight Checks", style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 24)),
+        Text("Verify & Enable", style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 24)),
         const SizedBox(height: 16),
         const Text("Verifying your environment and connection settings."),
         const SizedBox(height: 24),
-        
+
         if (!widget.controller.isRunningPreflight && widget.controller.preflightChecks.isEmpty)
            Center(
              child: ElevatedButton(
@@ -345,114 +333,57 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         if (widget.controller.isRunningPreflight)
           const Padding(padding: EdgeInsets.only(top: 16), child: Center(child: CircularProgressIndicator())),
 
+        if (widget.controller.isSubmittingConfig)
+          const Padding(padding: EdgeInsets.only(top: 16), child: Center(child: CircularProgressIndicator())),
+
         const SizedBox(height: 32),
-        if (widget.controller.preflightChecks.isNotEmpty && !widget.controller.isRunningPreflight)
+        if (widget.controller.preflightChecks.isNotEmpty &&
+            !widget.controller.isRunningPreflight &&
+            !widget.controller.isSubmittingConfig)
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               TextButton(onPressed: () {
                 setState(() => widget.controller.wizardStep = 0);
               }, child: const Text("Back")),
-              
+
               ElevatedButton(
-                onPressed: widget.controller.preflightChecks.any((c) => c.status == 'fail') 
-                    ? null // Disable if failed
-                    : () async {
-                      // Fetch DNS providers before moving if needed
-                      await widget.controller.fetchDNSProviders();
-                      setState(() => widget.controller.wizardStep = 2);
-                    },
-                child: const Text("Next: Configure"),
+                onPressed: allPassed
+                    ? () => widget.controller.submitConfiguration()
+                    : null, // Disable if any check failed
+                child: const Text("Enable Remote Access"),
               ),
             ],
           ),
-      ],
-    );
-  }
 
-  // --- Step 2: Configure ---
-
-  Widget _buildStep2Config() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text("Configuration", style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 24)),
-        const SizedBox(height: 16),
-        
-        DropdownButtonFormField<String>(
-          decoration: const InputDecoration(labelText: "ACME Solver", border: OutlineInputBorder()),
-          initialValue: _selectedSolver,
-          items: const [
-            DropdownMenuItem(value: 'http-01', child: Text("HTTP-01 (Requires Port 80)")),
-            DropdownMenuItem(value: 'dns-01', child: Text("DNS-01 (Requires API Key)")),
-          ],
-          onChanged: (val) {
-            setState(() {
-              _selectedSolver = val!;
-            });
-          },
-        ),
-        
-        if (_selectedSolver == 'dns-01') ...[
-          const SizedBox(height: 16),
-          DropdownButtonFormField<String>(
-            decoration: const InputDecoration(labelText: "DNS Provider", border: OutlineInputBorder()),
-            initialValue: _selectedProvider,
-            items: widget.controller.dnsProviders.map((p) => DropdownMenuItem(value: p.id, child: Text(p.name))).toList(),
-            onChanged: (val) {
-              setState(() {
-                _selectedProvider = val;
-                // Reset fields
-                _dnsFieldCtrls.clear();
-              });
-            },
+        // Info box about HTTP-01
+        if (allPassed) ...[
+          const SizedBox(height: 24),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: PiccoloTheme.info.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: PiccoloTheme.info.withValues(alpha: 0.3)),
+            ),
+            child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.info_outline, size: 16, color: PiccoloTheme.info),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    "Certificates will be issued using HTTP-01 challenge. "
+                    "Each app will receive its own certificate automatically.",
+                    style: TextStyle(fontSize: 13),
+                  ),
+                ),
+              ],
+            ),
           ),
-          if (_selectedProvider != null) ...[
-            const SizedBox(height: 16),
-            ..._buildDNSFields(),
-          ]
         ],
-
-        const SizedBox(height: 32),
-        if (widget.controller.isSubmittingConfig)
-          const Center(child: CircularProgressIndicator())
-        else
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-               TextButton(onPressed: () {
-                setState(() => widget.controller.wizardStep = 1);
-              }, child: const Text("Back")),
-              ElevatedButton(
-                onPressed: _submitConfig,
-                child: const Text("Finish & Enable"),
-              ),
-            ],
-          ),
       ],
     );
-  }
-
-  List<Widget> _buildDNSFields() {
-    final provider = widget.controller.dnsProviders.firstWhere((p) => p.id == _selectedProvider);
-    return provider.fields.map((field) {
-      // Ensure controller exists
-      _dnsFieldCtrls.putIfAbsent(field.id, () => TextEditingController());
-      
-      return Padding(
-        padding: const EdgeInsets.only(bottom: 16),
-        child: TextField(
-          controller: _dnsFieldCtrls[field.id],
-          obscureText: field.secret,
-          decoration: InputDecoration(
-            labelText: field.label,
-            hintText: field.placeholder,
-            helperText: field.description,
-            border: const OutlineInputBorder(),
-          ),
-        ),
-      );
-    }).toList();
   }
 
   Widget _buildTextField(String label, TextEditingController ctrl, {String? hint, bool obscureText = false, Function(String)? onChanged}) {
@@ -466,28 +397,5 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         border: const OutlineInputBorder(),
       ),
     );
-  }
-
-  void _submitConfig() {
-    final Map<String, dynamic> dnsCreds = {};
-    if (_selectedSolver == 'dns-01') {
-      if (_selectedProvider == null) {
-         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Select a DNS provider")));
-         return;
-      }
-      for (var entry in _dnsFieldCtrls.entries) {
-        dnsCreds[entry.key] = entry.value.text;
-      }
-    }
-
-    widget.controller.submitConfiguration({
-      'endpoint': _endpointCtrl.text,
-      'device_secret': _secretCtrl.text,
-      'tld': _tldCtrl.text,
-      'portal_hostname': _portalCtrl.text,
-      'solver': _selectedSolver,
-      'dns_provider': _selectedProvider,
-      'dns_credentials': dnsCreds,
-    });
   }
 }

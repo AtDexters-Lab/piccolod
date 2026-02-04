@@ -409,6 +409,13 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 		cookie.Secure = true
 	}
 
+	// CHIPS: partition cookies for host-based HTTPS LAN iframe embedding
+	if shouldPartitionCookies(r) {
+		cookie.SameSite = http.SameSiteNoneMode
+		cookie.Secure = true
+		cookie.Partitioned = true
+	}
+
 	http.SetCookie(w, cookie)
 
 	// Redirect to original path (safe: OriginalPath is relative, not absolute)
@@ -419,8 +426,8 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 // computeCallbackOrigin computes the canonical callback origin for the request.
 func (h *ProxyOIDCHandler) computeCallbackOrigin(r *http.Request, ep ServiceEndpoint) string {
 	scheme := "http"
-	// Use requestArrivedViaTLS to detect TLS from both direct TLS and TLS mux (connection hint).
-	if requestArrivedViaTLS(r) || (h.config.TrustForwardedProto && r.Header.Get("X-Forwarded-Proto") == "https") {
+	// Use RequestArrivedViaTLS to detect TLS from both direct TLS and TLS mux (connection hint).
+	if RequestArrivedViaTLS(r) || (h.config.TrustForwardedProto && r.Header.Get("X-Forwarded-Proto") == "https") {
 		scheme = "https"
 	}
 

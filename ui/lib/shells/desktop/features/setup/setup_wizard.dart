@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../../../theme/piccolo_theme.dart';
+import '../../../../core/models/network_models.dart';
+import '../../../../core/services/api_client.dart';
+import '../../../../core/services/network_service.dart';
 import '../../../../core/utils/downloader/downloader.dart';
 import '../../../../shared/widgets/password_set_form.dart';
 import 'setup_controller.dart';
@@ -50,7 +54,8 @@ class _SetupWizardState extends State<SetupWizard> {
                 (state == SetupState.welcome ||
                     state == SetupState.credentials ||
                     state == SetupState.finishing ||
-                    state == SetupState.recovery);
+                    state == SetupState.recovery ||
+                    state == SetupState.security);
 
             return Container(
               color: Colors.black.withValues(alpha: 0.5),
@@ -101,9 +106,20 @@ class _SetupWizardState extends State<SetupWizard> {
                       Flexible(
                         child: SingleChildScrollView(
                           padding: const EdgeInsets.only(bottom: 8),
-                          child: AnimatedSwitcher(
-                            duration: const Duration(milliseconds: 300),
-                            child: _buildStepContent(state),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 300),
+                                child: _buildStepContent(state),
+                              ),
+                              // Other devices panel (shown in all states except loading/finishing)
+                              if (state != SetupState.loading &&
+                                  state != SetupState.finishing &&
+                                  state != SetupState.recovery &&
+                                  state != SetupState.security)
+                                const _OtherDevicesPanel(),
+                            ],
                           ),
                         ),
                       ),
@@ -126,6 +142,8 @@ class _SetupWizardState extends State<SetupWizard> {
         return "Create admin password";
       case SetupState.recovery:
         return "Recovery key";
+      case SetupState.security:
+        return "Security";
       case SetupState.finishing:
         return "Setting up...";
       case SetupState.unlock:
@@ -150,6 +168,8 @@ class _SetupWizardState extends State<SetupWizard> {
         return 1;
       case SetupState.recovery:
         return 2;
+      case SetupState.security:
+        return 3;
       default:
         return 0;
     }
@@ -176,6 +196,10 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.recovery:
         return _RecoveryStep(
           words: _controller.recoveryWords,
+          onNext: _controller.proceedToSecurity,
+        );
+      case SetupState.security:
+        return _SecurityStep(
           onNext: _controller.completeSetup,
         );
       case SetupState.unlock:
@@ -220,6 +244,8 @@ class _FirstRunStepper extends StatelessWidget {
         _buildStepIndicator(1, "Password"),
         _buildStepSeparator(),
         _buildStepIndicator(2, "Recovery"),
+        _buildStepSeparator(),
+        _buildStepIndicator(3, "Security"),
       ],
     );
   }
@@ -595,6 +621,98 @@ class _RecoveryStepState extends State<_RecoveryStep> {
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(12),
               ),
+            ),
+            child: const Text("Continue"),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SecurityStep extends StatefulWidget {
+  final VoidCallback onNext;
+  const _SecurityStep({required this.onNext});
+
+  @override
+  State<_SecurityStep> createState() => _SecurityStepState();
+}
+
+class _SecurityStepState extends State<_SecurityStep> {
+  bool _downloading = false;
+
+  Future<void> _downloadCA() async {
+    setState(() => _downloading = true);
+    try {
+      final response = await ApiClient().get('/api/v1/system/ca.crt');
+      downloadTextFile(response as String, 'piccolo-ca.crt');
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Download failed. You can download later from Settings > Security."),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _downloading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text("Secure your connection",
+              style: PiccoloTheme.textTheme.bodyLarge
+                  ?.copyWith(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: PiccoloTheme.mist,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: PiccoloTheme.cobalt600.withValues(alpha: 0.35),
+                width: 1.2,
+              ),
+            ),
+            child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.lock_outline, color: PiccoloTheme.inkMuted, size: 18),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    "Your device supports HTTPS on the local network. "
+                    "Download the CA certificate and import it into your browser "
+                    "to access the portal securely without warnings.",
+                    style: TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+          OutlinedButton.icon(
+            onPressed: _downloading ? null : _downloadCA,
+            icon: const Icon(Icons.download, size: 16),
+            label: Text(_downloading ? "Downloading..." : "Download CA Certificate"),
+            style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.ink),
+          ),
+          const SizedBox(height: 24),
+          ElevatedButton(
+            onPressed: widget.onNext,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: PiccoloTheme.success,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
             ),
             child: const Text("Finish setup"),
           ),
@@ -1052,7 +1170,7 @@ class _ErrorStep extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           Text(
-            "We couldn’t reach Piccolo.",
+            "We couldn't reach Piccolo.",
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               fontWeight: FontWeight.w600,
             ),
@@ -1093,6 +1211,229 @@ class _ErrorStep extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _OtherDevicesPanel extends StatefulWidget {
+  const _OtherDevicesPanel();
+
+  @override
+  State<_OtherDevicesPanel> createState() => _OtherDevicesPanelState();
+}
+
+class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
+  final NetworkService _networkService = NetworkService(ApiClient());
+  List<DiscoveredPeer> _peers = [];
+  bool _isLoading = false;
+  bool _hasLoaded = false;
+  String? _error;
+  DateTime? _lastFetch;
+
+  Future<void> _fetchPeers() async {
+    if (_isLoading) return;
+
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    try {
+      final response = await _networkService.getPeers();
+      if (mounted) {
+        setState(() {
+          _peers = response.peers;
+          _isLoading = false;
+          _hasLoaded = true;
+          _lastFetch = DateTime.now();
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _hasLoaded = true;
+          _error = "Could not discover devices";
+        });
+      }
+    }
+  }
+
+  void _onExpansionChanged(bool expanded) {
+    if (!expanded) return;
+
+    // Fetch on first expand or if last fetch was > 30s ago
+    final shouldRefetch = !_hasLoaded ||
+        (_lastFetch != null &&
+            DateTime.now().difference(_lastFetch!).inSeconds > 30);
+
+    if (shouldRefetch) {
+      _fetchPeers();
+    }
+  }
+
+  Future<void> _openPeerUrl(String url) async {
+    final uri = Uri.parse(url);
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      child: ExpansionTile(
+        tilePadding: const EdgeInsets.symmetric(horizontal: 16),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: PiccoloTheme.ink.withValues(alpha: 0.1)),
+        ),
+        collapsedShape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: PiccoloTheme.ink.withValues(alpha: 0.1)),
+        ),
+        backgroundColor: PiccoloTheme.mist.withValues(alpha: 0.5),
+        collapsedBackgroundColor: PiccoloTheme.mist.withValues(alpha: 0.3),
+        onExpansionChanged: _onExpansionChanged,
+        title: Row(
+          children: [
+            Icon(
+              Icons.devices,
+              size: 18,
+              color: PiccoloTheme.inkMuted,
+            ),
+            const SizedBox(width: 8),
+            Text(
+              "Other Devices on Network",
+              style: TextStyle(
+                fontSize: 13,
+                color: PiccoloTheme.inkMuted,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            if (_hasLoaded && _peers.isNotEmpty) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  '${_peers.length}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: PiccoloTheme.cobalt600,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+        children: [
+          if (_isLoading)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: PiccoloTheme.cobalt600,
+                ),
+              ),
+            )
+          else if (_error != null)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Text(
+                    _error!,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: PiccoloTheme.inkMuted,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton.icon(
+                    onPressed: _fetchPeers,
+                    icon: const Icon(Icons.refresh, size: 16),
+                    label: const Text("Retry"),
+                  ),
+                ],
+              ),
+            )
+          else if (_peers.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                "No other devices found on this network",
+                style: TextStyle(
+                  fontSize: 13,
+                  color: PiccoloTheme.inkMuted,
+                ),
+              ),
+            )
+          else
+            ..._peers.map((peer) => _buildPeerTile(peer)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPeerTile(DiscoveredPeer peer) {
+    return InkWell(
+      onTap: peer.online ? () => _openPeerUrl(peer.url) : null,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+        child: Row(
+          children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: peer.online ? PiccoloTheme.success : PiccoloTheme.inkMuted,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    peer.displayName,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w500,
+                      fontSize: 14,
+                    ),
+                  ),
+                  Text(
+                    peer.online
+                        ? [peer.model, peer.ipv4].where((s) => s != null).join(' \u2022 ')
+                        : '(offline)',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: PiccoloTheme.inkMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (peer.online)
+              Icon(
+                Icons.arrow_forward_ios,
+                size: 14,
+                color: PiccoloTheme.inkMuted,
+              ),
+          ],
+        ),
       ),
     );
   }

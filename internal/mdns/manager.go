@@ -18,7 +18,10 @@ const defaultBaseName = "piccolo"
 // NewManager creates a new mDNS manager
 func NewManager() *Manager {
 	machineID := getMachineID()
-	baseName := sanitizeBaseName(defaultBaseName)
+	// Use specific name (piccolo-<machineId>) as base to avoid piccolo.local conflicts.
+	// Gateway leader will add piccolo.local separately via AddGatewayHostname().
+	specificName := "piccolo-" + machineID
+	baseName := sanitizeBaseName(specificName)
 
 	// Initialize security configuration with safe defaults
 	securityConfig := &SecurityConfig{
@@ -53,7 +56,7 @@ func NewManager() *Manager {
 		baseName:   baseName,
 		machineID:  machineID,
 		finalName:  baseName, // Will be updated if conflicts detected
-		names:      newNameRegistry(baseName),
+		names:      newNameRegistry(baseName, specificName),
 
 		// Security components
 		securityConfig:  securityConfig,
@@ -83,10 +86,35 @@ func NewManager() *Manager {
 
 		// Service endpoint observation
 		appHostLabels: make(map[string][]string),
+
+		// Gateway leadership
+		specificHostname: specificName + ".local",
+		gatewayLeader:    NewGatewayLeader(machineID),
 	}
 
 	// Initialize service metadata
 	manager.rebuildServiceMetadata()
+
+	// Wire gateway leader to peer registry
+	manager.gatewayLeader.SetPeersFunc(func() []DiscoveredPeer {
+		if manager.peerRegistry == nil {
+			return nil
+		}
+		return manager.peerRegistry.List()
+	})
+
+	// Wire leadership change callback to update advertised hostnames
+	manager.gatewayLeader.SetLeadershipChangeCallback(func(isLeader bool) {
+		if isLeader {
+			manager.names.AddGatewayHostname()
+		} else {
+			manager.names.RemoveGatewayHostname()
+		}
+		// Re-announce with updated hostnames
+		if manager.started.Load() {
+			manager.sendMultiInterfaceAnnouncements()
+		}
+	})
 
 	manager.ipv4SocketFactory = manager.createIPv4Socket
 	manager.ipv6SocketFactory = manager.createIPv6Socket
@@ -118,6 +146,11 @@ func (m *Manager) Start() error {
 	}
 
 	m.started.Store(true)
+
+	// Start gateway leader election
+	if m.gatewayLeader != nil {
+		m.gatewayLeader.Start()
+	}
 
 	// Start network monitor for interface changes
 	m.wg.Add(1)
@@ -175,7 +208,12 @@ func (m *Manager) Start() error {
 // Stop shuts down the mDNS server
 func (m *Manager) Stop() error {
 	m.stopOnce.Do(func() {
-		// Stop service endpoint observer first
+		// Stop gateway leader first
+		if m.gatewayLeader != nil {
+			m.gatewayLeader.Stop()
+		}
+
+		// Stop service endpoint observer
 		m.StopServiceEndpointsObserver()
 
 		// Mark as stopped BEFORE sending goodbyes so that any interface failures
@@ -301,6 +339,39 @@ func (m *Manager) Hostname() string {
 	return m.names.Hostname()
 }
 
+// SpecificHostname returns the device's unique hostname (always includes machine ID).
+// This hostname is always advertised, regardless of gateway leadership status.
+// Example: "piccolo-abc123.local"
+func (m *Manager) SpecificHostname() string {
+	return m.specificHostname
+}
+
+// IsGatewayLeader returns true if this device is currently serving piccolo.local.
+func (m *Manager) IsGatewayLeader() bool {
+	if m.gatewayLeader == nil {
+		return false
+	}
+	return m.gatewayLeader.IsLeader()
+}
+
+// DeviceModel returns the device model string (e.g., "Raspberry Pi 4 Model B").
+func (m *Manager) DeviceModel() string {
+	return m.deviceModel
+}
+
+// Version returns the service version string.
+func (m *Manager) Version() string {
+	return m.version
+}
+
+// Hostnames returns all advertised hostnames without trailing dots, suitable for TLS SANs.
+func (m *Manager) Hostnames() []string {
+	if m == nil || m.names == nil {
+		return nil
+	}
+	return m.names.Hostnames()
+}
+
 // AdvertisedNames returns the list of currently advertised FQDNs (with trailing dot).
 func (m *Manager) AdvertisedNames() []string {
 	if m.names == nil {
@@ -396,6 +467,15 @@ func (m *Manager) ObserveServiceEndpoints(bus *events.Bus) {
 	m.endpointsUnsubscribe = unsubscribe
 	m.endpointsMu.Unlock()
 
+	// Wire NameRegistry hostname changes to the event bus.
+	// The callback runs synchronously inside rebuildLocked() (under NameRegistry.mu)
+	// so it must not block. Bus.Publish uses non-blocking send with drop semantics.
+	if m.names != nil {
+		m.names.SetOnChange(func() {
+			bus.Publish(events.Event{Topic: events.TopicHostnamesChanged})
+		})
+	}
+
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -432,6 +512,11 @@ func (m *Manager) StopServiceEndpointsObserver() {
 		m.endpointsUnsubscribe = nil
 	}
 	m.endpointsMu.Unlock()
+
+	// Deregister hostname change callback
+	if m.names != nil {
+		m.names.SetOnChange(nil)
+	}
 
 	// Cancel any pending debounced announcement
 	m.announceDebounceMu.Lock()

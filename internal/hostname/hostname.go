@@ -1,8 +1,8 @@
-// Package hostname provides validation and hostname derivation for RFC 20260114 & RFC 20260122.
+// Package hostname provides validation and hostname derivation for RFC 20260114, RFC 20260122 & RFC 20260130.
 // It implements the unified hostname scheme for HTTP/WebSocket listeners:
-// - Primary listener (LAN): <app>-<base> (2-level mDNS format per RFC 20260122)
+// - Primary listener (LAN): <listener>-<base> (2-level mDNS format per RFC 20260122, RFC 20260130)
 // - Additional listeners (LAN): <listener>-<app>-<base>
-// - Remote access continues to use subdomain format: <app>.<portal-base>
+// - Remote access continues to use subdomain format: <listener>.<portal-base> for primary
 package hostname
 
 import (
@@ -19,15 +19,24 @@ import (
 // worst case is 16+1+16+1+16 = 50 chars for the left-most label, under DNS 63-char limit.
 var appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9]{0,15}$`)
 
-// ReservedAppNames are names that cannot be used as app names.
-// Per specification.yaml: api, www, admin, root, system, piccolo, piccoloos
-var ReservedAppNames = []string{"api", "www", "admin", "root", "system", "piccolo", "piccoloos"}
+// ReservedNames are names that cannot be used as app names, listener names, or workspace names.
+// Per RFC 20260130, all identifiers share the same reserved list.
+// __primary is the magic listener name marker and must not be used as an actual name.
+var ReservedNames = []string{"api", "www", "admin", "root", "system", "piccolo", "piccoloos", "__primary"}
 
-// ReservedListenerNames are names that cannot be used as listener names.
-// Per specification.yaml: piccolo, piccoloos
-var ReservedListenerNames = []string{"piccolo", "piccoloos"}
+// ReservedAppNames is kept for backward compatibility but points to ReservedNames.
+// Deprecated: Use ReservedNames instead.
+var ReservedAppNames = ReservedNames
 
-// ValidateAppName validates an app name per RFC 20260122 Section 4.3.
+// ReservedListenerNames is kept for backward compatibility but points to ReservedNames.
+// Deprecated: Use ReservedNames instead.
+var ReservedListenerNames = ReservedNames
+
+// PrimaryListenerMarker is the magic listener name that indicates user input is required.
+// Per RFC 20260130, this marker is replaced with the user-provided value at install time.
+const PrimaryListenerMarker = "__primary"
+
+// ValidateAppName validates an app name per RFC 20260122 Section 4.3 and RFC 20260130.
 // Rules:
 // - Must start with a letter
 // - Lowercase letters and numbers only (NO hyphens)
@@ -46,7 +55,7 @@ func ValidateAppName(name string) error {
 		return fmt.Errorf("name must contain only lowercase letters and numbers, and must start with a letter (no hyphens allowed)")
 	}
 
-	for _, r := range ReservedAppNames {
+	for _, r := range ReservedNames {
 		if name == r {
 			return fmt.Errorf("name '%s' is reserved", name)
 		}
@@ -55,8 +64,11 @@ func ValidateAppName(name string) error {
 	return nil
 }
 
-// ValidateListenerName validates a listener name per RFC 20260122 Section 4.3.
+// ValidateListenerName validates a listener name per RFC 20260122 Section 4.3 and RFC 20260130.
 // Same rules as app name: 1-16 chars, [a-z][a-z0-9]*, starts with letter, no hyphens.
+//
+// Note: The magic marker "__primary" is exempt from this validation during initial parsing.
+// Callers should use IsPrimaryMarker() to check before calling this function.
 func ValidateListenerName(name string) error {
 	if name == "" {
 		return fmt.Errorf("listener name is required")
@@ -70,7 +82,7 @@ func ValidateListenerName(name string) error {
 		return fmt.Errorf("listener name must contain only lowercase letters and numbers, and must start with a letter (no hyphens allowed)")
 	}
 
-	for _, r := range ReservedListenerNames {
+	for _, r := range ReservedNames {
 		if name == r {
 			return fmt.Errorf("listener name '%s' is reserved", name)
 		}
@@ -79,20 +91,55 @@ func ValidateListenerName(name string) error {
 	return nil
 }
 
+// IsPrimaryMarker returns true if the name is the __primary magic marker.
+// Per RFC 20260130, this marker is exempt from normal validation during initial parsing.
+func IsPrimaryMarker(name string) bool {
+	return name == PrimaryListenerMarker
+}
+
+// ValidateWorkspaceName validates a workspace_name per RFC 20260130.
+// Same rules as app/listener names: 1-16 chars, [a-z][a-z0-9]*, starts with letter, no hyphens.
+func ValidateWorkspaceName(name string) error {
+	if name == "" {
+		return fmt.Errorf("workspace_name is required")
+	}
+
+	if len(name) > 16 {
+		return fmt.Errorf("workspace_name must be 16 characters or less")
+	}
+
+	if !appNameRegex.MatchString(name) {
+		return fmt.Errorf("workspace_name must contain only lowercase letters and numbers, and must start with a letter (no hyphens allowed)")
+	}
+
+	for _, r := range ReservedNames {
+		if name == r {
+			return fmt.Errorf("workspace_name '%s' is reserved", name)
+		}
+	}
+
+	return nil
+}
+
 // DeriveHostLabel returns the host label for a listener.
-// - Primary HTTP/WS listener: returns app name (e.g., "immich")
-// - Non-primary HTTP/WS listener: returns "listener-app" (e.g., "metrics-immich")
+// Per RFC 20260130:
+// - Primary HTTP/WS listener: returns listener name (e.g., "blog")
+// - Non-primary HTTP/WS listener: returns "listener-app" (e.g., "api-blog")
 // - Raw/TLS listeners (eligible=false): returns "" (no host-based routing)
 //
 // The eligible parameter indicates whether the listener can have host-based routing.
 // Callers should use services.IsEligibleForHostRouting to compute this value.
+//
+// Note: For apps installed with listeners, instanceID = primary listener name,
+// so for primary listeners: app == listener and the result is the same.
+// For workspace apps that later add listeners, app (instanceID) may differ from listener name.
 func DeriveHostLabel(app, listener string, primary, eligible bool) string {
 	if !eligible {
 		return ""
 	}
 
 	if primary {
-		return app
+		return listener
 	}
 	return listener + "-" + app
 }
@@ -104,12 +151,9 @@ func DeriveHostLabel(app, listener string, primary, eligible bool) string {
 // The existingLabels map is keyed by host label, value is the owner (e.g., "app:myapp" or "listener:myapp/web").
 // Returns an error if any newLabel collides with an existing label or reserved name.
 func CheckCollisions(newLabels []string, existingLabels map[string]string) error {
-	// Check against reserved names
+	// Check against reserved names (unified list per RFC 20260130)
 	reserved := make(map[string]struct{})
-	for _, r := range ReservedAppNames {
-		reserved[r] = struct{}{}
-	}
-	for _, r := range ReservedListenerNames {
+	for _, r := range ReservedNames {
 		reserved[r] = struct{}{}
 	}
 

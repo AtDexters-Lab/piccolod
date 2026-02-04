@@ -43,10 +43,12 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
   // Selection (for custom image flow)
   String? _selectedImage;
   String? _selectedImageName;
-  final TextEditingController _displayNameController = TextEditingController();
+  // RFC 20260130: workspace_name is the identity for workspace mode apps
+  final TextEditingController _workspaceNameController = TextEditingController();
   final TextEditingController _tagController = TextEditingController(
     text: 'latest',
   );
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
 
   // Install state (for custom image flow)
   bool _isInstalling = false;
@@ -62,7 +64,7 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
   @override
   void dispose() {
     _searchController.dispose();
-    _displayNameController.dispose();
+    _workspaceNameController.dispose();
     _tagController.dispose();
     super.dispose();
   }
@@ -174,25 +176,37 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
       _selectedImage = baseImage;
       _selectedImageName = displayName;
       _tagController.text = tag;
+      // RFC 20260130: Pre-fill workspace name from image, user can modify
+      _workspaceNameController.text = _workspaceNameFromImage(baseImage);
       _currentStep = 1;
     });
   }
 
   String _workspaceNameFromImage(String image) {
+    // RFC 20260130: workspace_name must be lowercase letters and numbers only (no hyphens)
     // Extract base name: library/nginx -> nginx, nginx:alpine -> nginx
     var name = image.split('/').last;
     if (name.contains(':')) {
       name = name.split(':').first;
     }
-    return name.toLowerCase().replaceAll('_', '-');
+    // Remove underscores and hyphens (RFC 20260130 constraints)
+    name = name.toLowerCase().replaceAll(RegExp(r'[_-]'), '');
+    // Truncate to 16 chars max
+    if (name.length > 16) {
+      name = name.substring(0, 16);
+    }
+    return name;
   }
 
   String _generateWorkspaceManifest(String image) {
-    final name = _workspaceNameFromImage(image);
+    // RFC 20260130: workspace_name is the identity for workspace mode apps without listeners
+    final workspaceName = _workspaceNameController.text.trim().isNotEmpty
+        ? _workspaceNameController.text.trim()
+        : _workspaceNameFromImage(image);
 
     // Custom images get no default listeners - user adds via Edit Listeners
     return '''
-name: $name
+workspace_name: $workspaceName
 type: user
 services:
   main:
@@ -205,6 +219,11 @@ x-piccolo:
 
   Future<void> _createCustomWorkspace() async {
     if (_selectedImage == null) return;
+
+    // Validate form before proceeding
+    if (!(_formKey.currentState?.validate() ?? false)) {
+      return;
+    }
 
     final taskId = generateTaskId();
     final tag = _tagController.text.trim().isNotEmpty
@@ -225,7 +244,6 @@ x-piccolo:
       await widget.appService.installAppWithInputs(
         yaml,
         {},
-        displayName: _displayNameController.text.trim(),
         taskId: taskId,
       );
 
@@ -541,9 +559,11 @@ x-piccolo:
   Widget _buildConfigureStep() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
+      child: Form(
+        key: _formKey,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
           // Selected image display
           Container(
             padding: const EdgeInsets.all(16),
@@ -610,18 +630,26 @@ x-piccolo:
           ),
           const SizedBox(height: 24),
 
-          // Display name
+          // RFC 20260130: Workspace name is the identity for workspace mode apps
           Text(
-            'Display Name (optional)',
+            'Workspace Name',
             style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
               fontWeight: FontWeight.w600,
             ),
           ),
+          const SizedBox(height: 4),
+          Text(
+            'Lowercase letters and numbers only, max 16 characters',
+            style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+              color: PiccoloTheme.inkMuted,
+            ),
+          ),
           const SizedBox(height: 8),
-          TextField(
-            controller: _displayNameController,
+          TextFormField(
+            controller: _workspaceNameController,
+            autovalidateMode: AutovalidateMode.onUserInteraction,
             decoration: const InputDecoration(
-              hintText: 'e.g., Development Server',
+              hintText: 'e.g., devserver',
               border: OutlineInputBorder(),
               filled: true,
               fillColor: Colors.white,
@@ -630,6 +658,23 @@ x-piccolo:
                 vertical: 12,
               ),
             ),
+            validator: (value) {
+              if (value == null || value.isEmpty) {
+                return null; // Optional field, will use default from image name
+              }
+              // Must be lowercase letters and numbers only, start with letter, max 16 chars
+              final regex = RegExp(r'^[a-z][a-z0-9]{0,15}$');
+              if (!regex.hasMatch(value)) {
+                if (value.length > 16) {
+                  return 'Maximum 16 characters allowed';
+                }
+                if (!RegExp(r'^[a-z]').hasMatch(value)) {
+                  return 'Must start with a lowercase letter';
+                }
+                return 'Only lowercase letters and numbers allowed';
+              }
+              return null;
+            },
           ),
           const SizedBox(height: 16),
 
@@ -675,7 +720,8 @@ x-piccolo:
                 ],
               ),
             ),
-        ],
+          ],
+        ),
       ),
     );
   }

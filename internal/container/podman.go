@@ -16,6 +16,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
+
+	"github.com/acarl005/stripansi"
+	"github.com/creack/pty"
 )
 
 // ContainerNotFoundError indicates Podman could not find a container by the given reference.
@@ -116,6 +121,47 @@ func (e *PortInUseError) Error() string {
 
 func (e *PortInUseError) Unwrap() error {
 	return e.Err
+}
+
+// StaleNetworkNamespaceError indicates the container references a network
+// namespace that no longer exists (typically after a reboot when the process
+// that owned the namespace is gone).
+type StaleNetworkNamespaceError struct {
+	ContainerID string
+	Output      string
+	Err         error
+}
+
+func (e *StaleNetworkNamespaceError) Error() string {
+	return fmt.Sprintf("container %s has stale network namespace reference: %v", e.ContainerID, e.Err)
+}
+
+func (e *StaleNetworkNamespaceError) Unwrap() error {
+	return e.Err
+}
+
+// isStaleNetworkNamespaceError checks if podman output indicates a stale netns.
+// Detects two patterns:
+//   - runc: "namespace path: lstat /proc/723206/ns/net: no such file or directory"
+//   - netavark: "netavark: open container netns: open /run/netns/netns-XXX: ... No such file or directory"
+func isStaleNetworkNamespaceError(output string) bool {
+	lower := strings.ToLower(output)
+
+	// Pattern 1: runc fails to find process namespace path
+	if strings.Contains(lower, "namespace path") &&
+		strings.Contains(lower, "ns/net") &&
+		strings.Contains(lower, "no such file or directory") {
+		return true
+	}
+
+	// Pattern 2: netavark fails to open named network namespace
+	if strings.Contains(lower, "netavark") &&
+		strings.Contains(lower, "netns") &&
+		strings.Contains(lower, "no such file or directory") {
+		return true
+	}
+
+	return false
 }
 
 // ValidateContainerName validates container/image names for security
@@ -481,6 +527,14 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 				return "", &NameInUseError{Name: spec.Name, ID: match[1]}
 			}
 		}
+		// Check for stale network namespace (e.g., --network=container:STALE_ID)
+		if isStaleNetworkNamespaceError(outStr) {
+			return "", &StaleNetworkNamespaceError{
+				ContainerID: spec.Name, // Use name since container wasn't created
+				Output:      outStr,
+				Err:         fmt.Errorf("podman create failed: %w", err),
+			}
+		}
 		return "", fmt.Errorf("podman create failed: %w, output: %s", err, outStr)
 	}
 
@@ -511,7 +565,16 @@ func (p *PodmanCLI) StartContainer(ctx context.Context, runtime PodmanRuntime, c
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		return fmt.Errorf("podman start failed: %w, output: %s", err, string(output))
+		outStr := string(output)
+		// Check for stale network namespace before returning generic error
+		if isStaleNetworkNamespaceError(outStr) {
+			return &StaleNetworkNamespaceError{
+				ContainerID: containerID,
+				Output:      outStr,
+				Err:         fmt.Errorf("podman start failed: %w", err),
+			}
+		}
+		return fmt.Errorf("podman start failed: %w, output: %s", err, outStr)
 	}
 
 	return nil
@@ -538,7 +601,8 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 	return nil
 }
 
-// RemoveContainer removes a container by validated ID
+// RemoveContainer removes a container by validated ID.
+// Returns ContainerNotFoundError if the container does not exist.
 func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, containerID string) error {
 	if !isValidContainerID(containerID) {
 		return fmt.Errorf("invalid container ID format: %s", containerID)
@@ -552,7 +616,14 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		return fmt.Errorf("podman rm failed: %w, output: %s", err, string(output))
+		outStr := string(output)
+		// Detect "no such container" errors and return typed error.
+		// Use case-insensitive matching for robustness across Podman versions.
+		lower := strings.ToLower(outStr)
+		if strings.Contains(lower, "no such container") || strings.Contains(lower, "no container with") {
+			return &ContainerNotFoundError{Ref: containerID}
+		}
+		return fmt.Errorf("podman rm failed: %w, output: %s", err, outStr)
 	}
 
 	return nil
@@ -1442,4 +1513,368 @@ func (p *PodmanCLI) SearchRegistry(ctx context.Context, runtime PodmanRuntime, q
 	}
 
 	return results, nil
+}
+
+// ImagePullProgress represents the download progress of a single layer.
+type ImagePullProgress struct {
+	LayerID      string `json:"layer_id"`
+	BytesTotal   int64  `json:"bytes_total"`
+	BytesCurrent int64  `json:"bytes_current"`
+	Status       string `json:"status"` // "downloading", "extracting", "done", "exists"
+}
+
+// ImagePullReport aggregates progress across all layers being pulled.
+type ImagePullReport struct {
+	Image           string              `json:"image"`
+	Layers          []ImagePullProgress `json:"layers"`
+	TotalBytes      int64               `json:"total_bytes"`
+	DownloadedBytes int64               `json:"downloaded_bytes"`
+	OverallPercent  int                 `json:"overall_percent"` // -1 for indeterminate
+	Phase           string              `json:"phase"`           // "pulling", "extracting", "complete"
+}
+
+// ImagePullCallback is invoked with progress updates during image pull.
+type ImagePullCallback func(report ImagePullReport)
+
+// pullProgressParser parses podman pull output and tracks layer progress.
+type pullProgressParser struct {
+	image   string
+	layers  map[string]*ImagePullProgress
+	mu      sync.Mutex
+	lastCB  time.Time
+	minRate time.Duration // minimum time between callbacks (throttle)
+}
+
+// newPullProgressParser creates a parser for the given image.
+func newPullProgressParser(image string) *pullProgressParser {
+	return &pullProgressParser{
+		image:   image,
+		layers:  make(map[string]*ImagePullProgress),
+		minRate: 250 * time.Millisecond, // max 4 callbacks/sec
+	}
+}
+
+// Regular expressions for parsing podman pull output
+var (
+	// Matches: "Copying blob sha256:abc123 [======>    ] 15.2MiB / 45.3MiB"
+	// Also handles: "Copying blob sha256:abc123 1.2KiB / 5.6KiB"
+	// Layer ID can be sha256:hex or just hex
+	pullProgressRe = regexp.MustCompile(`Copying blob ([a-zA-Z0-9:]+)\s*(?:\[.*?\])?\s*([\d.]+)\s*([KMGTkmgt]?i?[Bb]?)\s*/\s*([\d.]+)\s*([KMGTkmgt]?i?[Bb]?)`)
+
+	// Matches: "Copying blob sha256:abc123 done"
+	pullDoneRe = regexp.MustCompile(`Copying blob ([a-zA-Z0-9:]+)\s+done`)
+
+	// Matches: "Copying blob sha256:abc123 skipped: already exists"
+	pullExistsRe = regexp.MustCompile(`Copying blob ([a-zA-Z0-9:]+)\s+skipped.*exists`)
+
+	// Matches: "Getting image source signatures" or "Copying config sha256:..."
+	pullPhaseRe = regexp.MustCompile(`^(Getting image|Copying config|Writing manifest)`)
+)
+
+// parseLine processes a single line of podman pull output.
+func (p *pullProgressParser) parseLine(line string) {
+	// Strip ANSI escape codes and handle carriage returns
+	clean := stripansi.Strip(line)
+	clean = strings.TrimSpace(clean)
+	if clean == "" {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Check for layer download progress
+	if match := pullProgressRe.FindStringSubmatch(clean); len(match) >= 6 {
+		layerID := match[1]
+		current := parseBytes(match[2], match[3])
+		total := parseBytes(match[4], match[5])
+
+		layer, ok := p.layers[layerID]
+		if !ok {
+			layer = &ImagePullProgress{LayerID: layerID, Status: "downloading"}
+			p.layers[layerID] = layer
+		}
+		layer.BytesCurrent = current
+		layer.BytesTotal = total
+		layer.Status = "downloading"
+		return
+	}
+
+	// Check for layer done
+	if match := pullDoneRe.FindStringSubmatch(clean); len(match) >= 2 {
+		layerID := match[1]
+		layer, ok := p.layers[layerID]
+		if !ok {
+			layer = &ImagePullProgress{LayerID: layerID}
+			p.layers[layerID] = layer
+		}
+		layer.Status = "done"
+		if layer.BytesTotal > 0 {
+			layer.BytesCurrent = layer.BytesTotal
+		}
+		return
+	}
+
+	// Check for layer already exists
+	if match := pullExistsRe.FindStringSubmatch(clean); len(match) >= 2 {
+		layerID := match[1]
+		layer, ok := p.layers[layerID]
+		if !ok {
+			layer = &ImagePullProgress{LayerID: layerID}
+			p.layers[layerID] = layer
+		}
+		layer.Status = "exists"
+		return
+	}
+}
+
+// parseBytes converts a size string like "15.2" with unit "MiB" to bytes.
+func parseBytes(numStr, unit string) int64 {
+	val, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0
+	}
+
+	unit = strings.ToLower(strings.TrimSpace(unit))
+	multiplier := float64(1)
+
+	switch {
+	case strings.HasPrefix(unit, "k"):
+		multiplier = 1024
+	case strings.HasPrefix(unit, "m"):
+		multiplier = 1024 * 1024
+	case strings.HasPrefix(unit, "g"):
+		multiplier = 1024 * 1024 * 1024
+	case strings.HasPrefix(unit, "t"):
+		multiplier = 1024 * 1024 * 1024 * 1024
+	}
+
+	return int64(val * multiplier)
+}
+
+// report generates an ImagePullReport from current state.
+func (p *pullProgressParser) report() ImagePullReport {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	report := ImagePullReport{
+		Image:  p.image,
+		Layers: make([]ImagePullProgress, 0, len(p.layers)),
+		Phase:  "pulling",
+	}
+
+	// Collect and sort layer IDs for stable ordering in UI
+	layerIDs := make([]string, 0, len(p.layers))
+	for id := range p.layers {
+		layerIDs = append(layerIDs, id)
+	}
+	sort.Strings(layerIDs)
+
+	for _, id := range layerIDs {
+		layer := p.layers[id]
+		report.Layers = append(report.Layers, *layer)
+		report.TotalBytes += layer.BytesTotal
+		report.DownloadedBytes += layer.BytesCurrent
+	}
+
+	// Calculate overall percentage
+	if report.TotalBytes > 0 {
+		report.OverallPercent = int((report.DownloadedBytes * 100) / report.TotalBytes)
+		if report.OverallPercent > 100 {
+			report.OverallPercent = 100
+		}
+	} else if len(p.layers) > 0 {
+		// Count done/exists layers
+		done := 0
+		for _, layer := range p.layers {
+			if layer.Status == "done" || layer.Status == "exists" {
+				done++
+			}
+		}
+		if done == len(p.layers) {
+			report.OverallPercent = 100
+			report.Phase = "complete"
+		} else {
+			report.OverallPercent = -1 // indeterminate
+		}
+	} else {
+		report.OverallPercent = -1 // indeterminate
+	}
+
+	// Check if all layers are done
+	allDone := len(p.layers) > 0
+	for _, layer := range p.layers {
+		if layer.Status != "done" && layer.Status != "exists" {
+			allDone = false
+			break
+		}
+	}
+	if allDone {
+		report.Phase = "complete"
+		report.OverallPercent = 100
+	}
+
+	return report
+}
+
+// shouldCallback returns true if enough time has passed since the last callback.
+func (p *pullProgressParser) shouldCallback() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if time.Since(p.lastCB) < p.minRate {
+		return false
+	}
+	p.lastCB = time.Now()
+	return true
+}
+
+// markCallbackSent marks the current time as the last callback time.
+func (p *pullProgressParser) markCallbackSent() {
+	p.mu.Lock()
+	p.lastCB = time.Now()
+	p.mu.Unlock()
+}
+
+// PullImageWithProgress pulls an image with real-time progress callbacks.
+// Uses a PTY to get progress output from podman, which only outputs progress bars when running in a TTY.
+// If callback is nil, behaves like PullImage without progress.
+func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRuntime, image string, callback ImagePullCallback) error {
+	if err := ValidateContainerName(image); err != nil {
+		return fmt.Errorf("invalid image name: %w", err)
+	}
+
+	args, err := buildPodmanArgs(runtime, []string{"pull", image})
+	if err != nil {
+		return err
+	}
+
+	// If no callback, just use regular pull
+	if callback == nil {
+		cmd := exec.CommandContext(ctx, "podman", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("podman pull failed: %w, output: %s", err, string(output))
+		}
+		return nil
+	}
+
+	// Use PTY for progress output
+	cmd := exec.Command("podman", args...)
+	// Inherit environment but force C locale to ensure consistent number formatting
+	// (some locales use comma as decimal separator which breaks our parsing)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+
+	// Start command with PTY using wide terminal to prevent line wrapping
+	// which would break our line-based regex parsing
+	ptySize := &pty.Winsize{Rows: 24, Cols: 500}
+	ptmx, err := pty.StartWithSize(cmd, ptySize)
+	if err != nil {
+		return fmt.Errorf("failed to start podman pull with pty: %w", err)
+	}
+	defer ptmx.Close()
+
+	// Channel to signal normal completion
+	done := make(chan struct{})
+	var cmdErr error
+
+	// Handle context cancellation with proper signal handling
+	go func() {
+		select {
+		case <-ctx.Done():
+			if cmd.Process != nil {
+				// Send SIGTERM for graceful shutdown
+				_ = cmd.Process.Signal(syscall.SIGTERM)
+				// Give 5 seconds for graceful shutdown, then SIGKILL
+				time.AfterFunc(5*time.Second, func() {
+					if cmd.Process != nil {
+						_ = cmd.Process.Kill()
+					}
+				})
+			}
+		case <-done:
+			// Normal completion
+		}
+	}()
+
+	parser := newPullProgressParser(image)
+
+	// Emit initial progress
+	callback(ImagePullReport{
+		Image:          image,
+		OverallPercent: 0,
+		Phase:          "pulling",
+	})
+
+	// Read PTY output and parse progress
+	go func() {
+		buf := make([]byte, 4096)
+		var lineBuf strings.Builder
+
+		for {
+			n, readErr := ptmx.Read(buf)
+			if readErr != nil {
+				break
+			}
+			if n == 0 {
+				continue
+			}
+
+			// Process the bytes
+			data := string(buf[:n])
+
+			// Handle carriage returns - they reset the line buffer
+			for _, ch := range data {
+				if ch == '\r' {
+					// Process current line and reset
+					line := lineBuf.String()
+					if line != "" {
+						parser.parseLine(line)
+					}
+					lineBuf.Reset()
+				} else if ch == '\n' {
+					// Process current line
+					line := lineBuf.String()
+					if line != "" {
+						parser.parseLine(line)
+					}
+					lineBuf.Reset()
+				} else {
+					lineBuf.WriteRune(ch)
+				}
+			}
+
+			// Throttled callback
+			if parser.shouldCallback() {
+				callback(parser.report())
+			}
+		}
+
+		// Process any remaining data
+		if lineBuf.Len() > 0 {
+			parser.parseLine(lineBuf.String())
+		}
+	}()
+
+	// Wait for command to finish
+	cmdErr = cmd.Wait()
+	close(done)
+
+	// Always emit final completion
+	finalReport := parser.report()
+	if cmdErr == nil {
+		finalReport.Phase = "complete"
+		finalReport.OverallPercent = 100
+	}
+	callback(finalReport)
+
+	if cmdErr != nil {
+		// Check if it was due to context cancellation
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("podman pull failed: %w", cmdErr)
+	}
+
+	return nil
 }

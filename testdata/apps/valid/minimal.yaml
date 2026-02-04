@@ -1,6 +1,6 @@
-name: testminimal
+# RFC 20260130: __primary marker gets replaced at install time
 listeners:
-  - name: web
+  - name: __primary
     guest_port: 80
 services:
   main:

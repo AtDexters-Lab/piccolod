@@ -3,6 +3,7 @@ import 'package:piccolo_os/core/models/os_update.dart';
 import 'package:piccolo_os/core/models/session.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
+import 'package:piccolo_os/core/utils/downloader/downloader.dart' as downloader;
 
 class SettingsController extends ChangeNotifier {
   bool _disposed = false;
@@ -59,7 +60,9 @@ class SettingsController extends ChangeNotifier {
       case 2: // Users
         // Users tab has its own controller
         break;
-      case 3: // System
+      case 3: // Security — no data fetch needed
+        break;
+      case 4: // System
         await fetchOSUpdate();
         if (!_disposed && _isBackendBusy) {
           _pollWhileBusy();
@@ -194,6 +197,18 @@ class SettingsController extends ChangeNotifier {
      }
   }
   
+  Future<void> downloadCACertificate() async {
+    try {
+      final response = await ApiClient().get('/api/v1/system/ca.crt');
+      downloader.downloadTextFile(response as String, 'piccolo-ca.crt');
+    } catch (e) {
+      if (!_disposed) {
+        _error = 'Failed to download CA certificate';
+        notifyListeners();
+      }
+    }
+  }
+
   // Callbacks
   VoidCallback? onSessionExpired;
 

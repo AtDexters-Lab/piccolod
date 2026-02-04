@@ -3,6 +3,7 @@ package mdns
 import (
 	"fmt"
 	"log"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -14,17 +15,25 @@ const localTLD = "local"
 
 // NameRegistry tracks the base hostname and per-app alias labels.
 type NameRegistry struct {
-	mu       sync.RWMutex
-	baseName string
-	aliases  map[string]struct{}
-	fqdns    map[string]struct{}
-	snapshot []string
+	mu              sync.RWMutex
+	baseName        string            // Current base name (may be "piccolo" or "piccolo-<machineId>" after conflict)
+	specificName    string            // Always "piccolo-<machineId>" - published regardless of conflict state
+	aliases         map[string]struct{}
+	fqdns           map[string]struct{}
+	snapshot        []string
+	includeGateway  bool              // Whether to include piccolo.local (gateway leader)
+
+	// onChange is called synchronously inside rebuildLocked() when the snapshot
+	// changes. The callback MUST NOT block (e.g., use a non-blocking channel
+	// send). Lock ordering: NameRegistry.mu → any lock acquired by onChange.
+	onChange func()
 }
 
-func newNameRegistry(base string) *NameRegistry {
+func newNameRegistry(base, specificName string) *NameRegistry {
 	reg := &NameRegistry{
-		baseName: base,
-		aliases:  make(map[string]struct{}),
+		baseName:     base,
+		specificName: specificName,
+		aliases:      make(map[string]struct{}),
 	}
 	reg.rebuildLocked()
 	return reg
@@ -48,6 +57,19 @@ func (r *NameRegistry) Names() []string {
 	defer r.mu.RUnlock()
 	out := make([]string, len(r.snapshot))
 	copy(out, r.snapshot)
+	return out
+}
+
+// Hostnames returns all advertised hostnames without trailing dots.
+// Suitable for TLS certificate SANs.
+func (r *NameRegistry) Hostnames() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.snapshot))
+	for _, fqdn := range r.snapshot {
+		host := strings.TrimSuffix(fqdn, ".")
+		out = append(out, host)
+	}
 	return out
 }
 
@@ -75,6 +97,14 @@ func (r *NameRegistry) MatchName(name string) bool {
 	return ok
 }
 
+// SetOnChange registers a callback invoked when the hostname snapshot changes.
+// Pass nil to deregister. The callback runs under the write lock and must not block.
+func (r *NameRegistry) SetOnChange(fn func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onChange = fn
+}
+
 // SetBaseName updates the base hostname and rebuilds derived FQDNs.
 func (r *NameRegistry) SetBaseName(base string) {
 	r.mu.Lock()
@@ -97,13 +127,68 @@ func (r *NameRegistry) SetAliases(labels []string) {
 	r.rebuildLocked()
 }
 
-func (r *NameRegistry) rebuildLocked() {
-	fqdns := make(map[string]struct{}, len(r.aliases)+1)
-	snapshot := make([]string, 0, len(r.aliases)+1)
+// AddGatewayHostname adds piccolo.local to the advertised hostnames.
+// This is called when the device becomes the gateway leader.
+func (r *NameRegistry) AddGatewayHostname() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.includeGateway {
+		return // Already included
+	}
+	r.includeGateway = true
+	r.rebuildLocked()
+	log.Printf("[mdns] Gateway hostname added: piccolo.local")
+}
 
+// RemoveGatewayHostname removes piccolo.local from the advertised hostnames.
+// This is called when the device yields gateway leadership.
+func (r *NameRegistry) RemoveGatewayHostname() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.includeGateway {
+		return // Already excluded
+	}
+	r.includeGateway = false
+	r.rebuildLocked()
+	log.Printf("[mdns] Gateway hostname removed: piccolo.local")
+}
+
+// IncludesGateway returns true if piccolo.local is currently advertised.
+func (r *NameRegistry) IncludesGateway() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.includeGateway
+}
+
+func (r *NameRegistry) rebuildLocked() {
+	capacity := len(r.aliases) + 3 // base + specific + possible gateway + aliases
+	fqdns := make(map[string]struct{}, capacity)
+	snapshot := make([]string, 0, capacity)
+
+	// Primary hostname based on conflict state (may be "piccolo" or "piccolo-<machineId>")
 	baseFQDN := r.baseName + "." + localTLD + "."
 	fqdns[baseFQDN] = struct{}{}
 	snapshot = append(snapshot, baseFQDN)
+
+	// Specific hostname: always publish piccolo-<machineId>.local regardless of conflict state
+	// This ensures the device is always reachable via its unique hostname
+	if r.specificName != "" && r.specificName != r.baseName {
+		specificFQDN := r.specificName + "." + localTLD + "."
+		if _, exists := fqdns[specificFQDN]; !exists {
+			fqdns[specificFQDN] = struct{}{}
+			snapshot = append(snapshot, specificFQDN)
+		}
+	}
+
+	// Gateway hostname: piccolo.local (only when leader)
+	if r.includeGateway {
+		gatewayFQDN := "piccolo." + localTLD + "."
+		// Only add if not already the base (avoid duplicate if base is "piccolo")
+		if _, exists := fqdns[gatewayFQDN]; !exists {
+			fqdns[gatewayFQDN] = struct{}{}
+			snapshot = append(snapshot, gatewayFQDN)
+		}
+	}
 
 	// RFC 20260122 §4.1: 2-level mDNS format uses hyphen separator
 	// Before: <label>.<baseName>.<localTLD>. (e.g., immich.piccolo.local.)
@@ -120,8 +205,16 @@ func (r *NameRegistry) rebuildLocked() {
 	}
 
 	sort.Strings(snapshot)
+
+	changed := !slices.Equal(r.snapshot, snapshot)
 	r.fqdns = fqdns
 	r.snapshot = snapshot
+
+	if changed {
+		if fn := r.onChange; fn != nil {
+			fn()
+		}
+	}
 }
 
 func normalizeFQDN(name string) string {

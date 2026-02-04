@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"sync"
 
+	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 
 	"golang.org/x/crypto/argon2"
@@ -152,7 +153,7 @@ func (m *Manager) Setup(password string) error {
 		KDF:   params,
 	}
 	b, _ := json.MarshalIndent(&st, "", "  ")
-	if err := os.WriteFile(m.path, b, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(m.path, b, 0o600); err != nil {
 		return err
 	}
 	m.inited = true
@@ -289,7 +290,7 @@ func (m *Manager) Rewrap(oldPassword, newPassword string) error {
 	st.Nonce = base64.RawStdEncoding.EncodeToString(newNonce)
 	// Save
 	nb, _ := json.MarshalIndent(&st, "", "  ")
-	if err := os.WriteFile(m.path, nb, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(m.path, nb, 0o600); err != nil {
 		return err
 	}
 	return nil
@@ -345,7 +346,7 @@ func (m *Manager) RewrapUnlocked(newPassword string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.path, nb, 0o600)
+	return fsutil.AtomicWriteFile(m.path, nb, 0o600)
 }
 
 // Recovery key management
@@ -411,7 +412,7 @@ func (m *Manager) GenerateRecoveryKey(force bool) ([]string, error) {
 	st.SDEKRK = base64.RawStdEncoding.EncodeToString(rkCT)
 	// Save
 	nb, _ := json.MarshalIndent(&st, "", "  ")
-	if err := os.WriteFile(m.path, nb, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(m.path, nb, 0o600); err != nil {
 		return nil, err
 	}
 	return words, nil
@@ -476,7 +477,7 @@ func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) (
 	st.RKNonce = base64.RawStdEncoding.EncodeToString(rkNonce)
 	st.SDEKRK = base64.RawStdEncoding.EncodeToString(rkCT)
 	nb, _ := json.MarshalIndent(&st, "", "  ")
-	if err := os.WriteFile(m.path, nb, 0o600); err != nil {
+	if err := fsutil.AtomicWriteFile(m.path, nb, 0o600); err != nil {
 		return nil, err
 	}
 	return words, nil

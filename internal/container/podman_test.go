@@ -367,6 +367,93 @@ func TestIsValidContainerID(t *testing.T) {
 	}
 }
 
+func TestIsStaleNetworkNamespaceError(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		expected bool
+	}{
+		{
+			name:     "runc namespace path error",
+			output:   `Error: unable to start container "abc123": runc: runc create failed: unable to create new parent process: namespace path: lstat /proc/723206/ns/net: no such file or directory: OCI runtime attempted to invoke a command that was not found`,
+			expected: true,
+		},
+		{
+			name:     "netavark named netns error",
+			output:   `Error: unable to start container "abc123": netavark: open container netns: open /run/netns/netns-a6fff1bd-d334-190e-ac07-b865cb1e9f9c: IO error: No such file or directory (os error 2)`,
+			expected: true,
+		},
+		{
+			name:     "netavark with IPAM error prefix",
+			output:   "time=\"2026-01-30T14:25:30+05:30\" level=error msg=\"IPAM error: failed to get ips for container\"\nError: unable to start container: netavark: open container netns: open /run/netns/netns-xxx: IO error: No such file or directory",
+			expected: true,
+		},
+		{
+			name:     "unrelated podman error - already running",
+			output:   `Error: unable to start container: container is already running`,
+			expected: false,
+		},
+		{
+			name:     "port in use error",
+			output:   `Error: rootlessport cannot expose privileged port 80, you can add 'net.ipv4.ip_unprivileged_port_start=80' to /etc/sysctl.conf`,
+			expected: false,
+		},
+		{
+			name:     "partial match - has namespace but not netns",
+			output:   `Error: namespace mismatch`,
+			expected: false,
+		},
+		{
+			name:     "case insensitive detection - uppercase",
+			output:   `NAMESPACE PATH: LSTAT /PROC/123/NS/NET: NO SUCH FILE OR DIRECTORY`,
+			expected: true,
+		},
+		{
+			name:     "image not found error",
+			output:   `Error: docker.io/nonexistent/image:latest: image not known`,
+			expected: false,
+		},
+		{
+			name:     "empty output",
+			output:   ``,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isStaleNetworkNamespaceError(tt.output)
+			if result != tt.expected {
+				t.Errorf("isStaleNetworkNamespaceError() = %v, want %v for output: %s", result, tt.expected, tt.output)
+			}
+		})
+	}
+}
+
+func TestStaleNetworkNamespaceErrorType(t *testing.T) {
+	baseErr := fmt.Errorf("podman start failed: exit status 125")
+	err := &StaleNetworkNamespaceError{
+		ContainerID: "abc123",
+		Output:      "namespace path: lstat /proc/999/ns/net: no such file or directory",
+		Err:         baseErr,
+	}
+
+	// Test Error() method
+	errMsg := err.Error()
+	if !containsSubstring(errMsg, "abc123") {
+		t.Errorf("Error message should contain container ID, got: %s", errMsg)
+	}
+	if !containsSubstring(errMsg, "stale network namespace") {
+		t.Errorf("Error message should mention stale network namespace, got: %s", errMsg)
+	}
+
+	// Test Unwrap() method
+	unwrapped := err.Unwrap()
+	if unwrapped != baseErr {
+		t.Errorf("Unwrap() should return the wrapped error")
+	}
+}
+
 // Helper function for string containment check
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) &&
@@ -387,4 +474,232 @@ func containsSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// Tests for image pull progress parser
+
+func TestParseBytes(t *testing.T) {
+	tests := []struct {
+		numStr   string
+		unit     string
+		expected int64
+	}{
+		{"10", "B", 10},
+		{"10", "", 10},
+		{"1.5", "KiB", 1536},
+		{"1.5", "kib", 1536},
+		{"15.2", "MiB", 15938355},
+		{"15.2", "mib", 15938355},
+		{"1.0", "GiB", 1073741824},
+		{"45.3", "MiB", 47500902},
+		{"0", "B", 0},
+		{"invalid", "B", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s%s", tt.numStr, tt.unit), func(t *testing.T) {
+			result := parseBytes(tt.numStr, tt.unit)
+			// Allow some tolerance for floating point
+			tolerance := int64(float64(tt.expected) * 0.01)
+			if tolerance < 1 {
+				tolerance = 1
+			}
+			diff := result - tt.expected
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff > tolerance {
+				t.Errorf("parseBytes(%q, %q) = %d, expected %d (tolerance %d)", tt.numStr, tt.unit, result, tt.expected, tolerance)
+			}
+		})
+	}
+}
+
+func TestPullProgressParser_ParseLine(t *testing.T) {
+	parser := newPullProgressParser("docker.io/library/nginx:latest")
+
+	tests := []struct {
+		name           string
+		line           string
+		expectedLayers int
+		checkFunc      func(t *testing.T, parser *pullProgressParser)
+	}{
+		{
+			name:           "progress with bracket format",
+			line:           "Copying blob sha256:abc123 [======>    ] 15.2MiB / 45.3MiB",
+			expectedLayers: 1,
+			checkFunc: func(t *testing.T, p *pullProgressParser) {
+				layer, ok := p.layers["sha256:abc123"]
+				if !ok {
+					t.Fatal("layer not found")
+				}
+				if layer.Status != "downloading" {
+					t.Errorf("status = %q, want 'downloading'", layer.Status)
+				}
+				if layer.BytesTotal == 0 {
+					t.Error("BytesTotal should not be 0")
+				}
+			},
+		},
+		{
+			name:           "progress without bracket format",
+			line:           "Copying blob sha256:def456 1.2KiB / 5.6KiB",
+			expectedLayers: 2,
+			checkFunc: func(t *testing.T, p *pullProgressParser) {
+				layer, ok := p.layers["sha256:def456"]
+				if !ok {
+					t.Fatal("layer not found")
+				}
+				if layer.Status != "downloading" {
+					t.Errorf("status = %q, want 'downloading'", layer.Status)
+				}
+			},
+		},
+		{
+			name:           "layer done",
+			line:           "Copying blob sha256:abc123 done",
+			expectedLayers: 2,
+			checkFunc: func(t *testing.T, p *pullProgressParser) {
+				layer, ok := p.layers["sha256:abc123"]
+				if !ok {
+					t.Fatal("layer not found")
+				}
+				if layer.Status != "done" {
+					t.Errorf("status = %q, want 'done'", layer.Status)
+				}
+			},
+		},
+		{
+			name:           "layer already exists",
+			line:           "Copying blob sha256:exists123 skipped: already exists",
+			expectedLayers: 3,
+			checkFunc: func(t *testing.T, p *pullProgressParser) {
+				layer, ok := p.layers["sha256:exists123"]
+				if !ok {
+					t.Fatal("layer not found")
+				}
+				if layer.Status != "exists" {
+					t.Errorf("status = %q, want 'exists'", layer.Status)
+				}
+			},
+		},
+		{
+			name:           "line with ANSI codes",
+			line:           "\x1b[32mCopying blob sha256:ansi123 done\x1b[0m",
+			expectedLayers: 4,
+			checkFunc: func(t *testing.T, p *pullProgressParser) {
+				layer, ok := p.layers["sha256:ansi123"]
+				if !ok {
+					t.Fatal("layer not found")
+				}
+				if layer.Status != "done" {
+					t.Errorf("status = %q, want 'done'", layer.Status)
+				}
+			},
+		},
+		{
+			name:           "unrelated line",
+			line:           "Getting image source signatures",
+			expectedLayers: 4,
+			checkFunc:      nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser.parseLine(tt.line)
+			if len(parser.layers) != tt.expectedLayers {
+				t.Errorf("layer count = %d, want %d", len(parser.layers), tt.expectedLayers)
+			}
+			if tt.checkFunc != nil {
+				tt.checkFunc(t, parser)
+			}
+		})
+	}
+}
+
+func TestPullProgressParser_Report(t *testing.T) {
+	parser := newPullProgressParser("test-image")
+
+	// Add some layers
+	parser.layers["sha256:layer1"] = &ImagePullProgress{
+		LayerID:      "sha256:layer1",
+		Status:       "downloading",
+		BytesCurrent: 50 * 1024 * 1024, // 50 MiB
+		BytesTotal:   100 * 1024 * 1024, // 100 MiB
+	}
+	parser.layers["sha256:layer2"] = &ImagePullProgress{
+		LayerID:      "sha256:layer2",
+		Status:       "done",
+		BytesCurrent: 30 * 1024 * 1024,
+		BytesTotal:   30 * 1024 * 1024,
+	}
+
+	report := parser.report()
+
+	if report.Image != "test-image" {
+		t.Errorf("Image = %q, want 'test-image'", report.Image)
+	}
+	if len(report.Layers) != 2 {
+		t.Errorf("Layers count = %d, want 2", len(report.Layers))
+	}
+	if report.TotalBytes != 130*1024*1024 {
+		t.Errorf("TotalBytes = %d, want %d", report.TotalBytes, 130*1024*1024)
+	}
+	if report.DownloadedBytes != 80*1024*1024 {
+		t.Errorf("DownloadedBytes = %d, want %d", report.DownloadedBytes, 80*1024*1024)
+	}
+	// 80/130 ≈ 61%
+	expectedPercent := 61
+	if report.OverallPercent < expectedPercent-2 || report.OverallPercent > expectedPercent+2 {
+		t.Errorf("OverallPercent = %d, want ~%d", report.OverallPercent, expectedPercent)
+	}
+	if report.Phase != "pulling" {
+		t.Errorf("Phase = %q, want 'pulling'", report.Phase)
+	}
+}
+
+func TestPullProgressParser_Report_AllDone(t *testing.T) {
+	parser := newPullProgressParser("test-image")
+
+	parser.layers["sha256:layer1"] = &ImagePullProgress{
+		LayerID: "sha256:layer1",
+		Status:  "done",
+	}
+	parser.layers["sha256:layer2"] = &ImagePullProgress{
+		LayerID: "sha256:layer2",
+		Status:  "exists",
+	}
+
+	report := parser.report()
+
+	if report.Phase != "complete" {
+		t.Errorf("Phase = %q, want 'complete'", report.Phase)
+	}
+	if report.OverallPercent != 100 {
+		t.Errorf("OverallPercent = %d, want 100", report.OverallPercent)
+	}
+}
+
+func TestPullProgressParser_ShouldCallback(t *testing.T) {
+	parser := newPullProgressParser("test-image")
+	parser.minRate = 50 * time.Millisecond
+
+	// First call should always allow
+	if !parser.shouldCallback() {
+		t.Error("First shouldCallback() should return true")
+	}
+
+	// Immediate second call should be throttled
+	if parser.shouldCallback() {
+		t.Error("Immediate second shouldCallback() should return false")
+	}
+
+	// Wait for throttle window
+	time.Sleep(60 * time.Millisecond)
+
+	// Should now allow
+	if !parser.shouldCallback() {
+		t.Error("shouldCallback() after waiting should return true")
+	}
 }

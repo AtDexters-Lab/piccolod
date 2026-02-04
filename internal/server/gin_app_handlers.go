@@ -152,55 +152,6 @@ func writeGinSuccess(c *gin.Context, data interface{}, message string) {
 	c.JSON(http.StatusOK, response)
 }
 
-// requiresProxyOIDCClient checks if an app requires a proxy OIDC client per RFC 20260122 §5.3.
-// Proxy clients are needed for apps whose listeners use "headers" or "protected" auth strategies.
-// Per RFC 20260122 §4.1.1: auth omitted or empty rules → all paths default to "protected".
-func (s *GinServer) requiresProxyOIDCClient(appDef *api.AppDefinition) bool {
-	if appDef == nil {
-		return false
-	}
-	for _, listener := range appDef.Listeners {
-		if listener.Auth == nil || len(listener.Auth.Rules) == 0 {
-			// Auth omitted → all paths default to "protected" strategy.
-			return true
-		}
-		for _, rule := range listener.Auth.Rules {
-			strategy := rule.Strategy
-			if strategy == "" {
-				strategy = "public"
-			}
-			if strategy == "headers" || strategy == "protected" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// registerProxyOIDCClient registers a proxy OIDC client for an app per RFC 20260122 §5.3.
-func (s *GinServer) registerProxyOIDCClient(ctx context.Context, appName string) error {
-	clientMgr := s.getOIDCClientManager()
-	if clientMgr == nil {
-		return errors.New("OIDC client manager unavailable")
-	}
-
-	// Check if proxy client already exists
-	_, err := clientMgr.GetProxyClientByAppName(ctx, appName)
-	if err == nil {
-		// Client already exists
-		return nil
-	}
-
-	// Register new proxy client
-	_, _, err = clientMgr.RegisterProxyClient(ctx, appName)
-	if err != nil {
-		return fmt.Errorf("register proxy client: %w", err)
-	}
-
-	log.Printf("INFO: registered proxy OIDC client for app %s", appName)
-	return nil
-}
-
 // handleGinAppValidate handles POST /api/v1/apps/validate - Validate app.yaml without installing
 func (s *GinServer) handleGinAppValidate(c *gin.Context) {
 	contentType := c.GetHeader("Content-Type")
@@ -282,8 +233,8 @@ func (s *GinServer) handleGinCatalogConfigure(c *gin.Context) {
 		return
 	}
 
-	// Prepare smart defaults
-	if err := app.PrepareSmartDefaults(c.Request.Context(), s.appManager, def); err != nil {
+	// Prepare smart defaults (pass catalog item name for __app_address__ default)
+	if err := app.PrepareSmartDefaults(c.Request.Context(), s.appManager, def, name); err != nil {
 		log.Printf("WARN: failed to prepare smart defaults for %s: %v", name, err)
 		// Continue anyway, just without smarts
 	}
@@ -303,14 +254,14 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	// Read request body
 	var yamlData []byte
 	var userInputs map[string]interface{}
-	displayName := ""
 
+	var catalogSource string
 	if strings.Contains(contentType, "application/json") {
-		// Accept { app_definition: "...yaml...", inputs: {...} }
+		// Accept { app_definition: "...yaml...", inputs: {...}, catalog_source: "..." }
 		var req struct {
 			AppDefinition string                 `json:"app_definition"`
 			Inputs        map[string]interface{} `json:"inputs"`
-			DisplayName   string                 `json:"display_name"`
+			CatalogSource string                 `json:"catalog_source"` // Optional: tracks which catalog item this was installed from
 		}
 		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
 			writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
@@ -318,7 +269,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		}
 		yamlData = []byte(req.AppDefinition)
 		userInputs = req.Inputs
-		displayName = req.DisplayName
+		catalogSource = req.CatalogSource
 	} else {
 		body, err := c.GetRawData()
 		if err != nil {
@@ -387,9 +338,92 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		yamlData = rendered
 	}
 
-	// Parse app.yaml
-	appDef, err := app.ParseAppDefinition(yamlData)
+	// RFC 20260130: Parse YAML first, then handle __primary substitution via struct manipulation.
+	// This is safer than regex replacement which could corrupt comments/descriptions/env vars.
+	looseDef, err := app.ParseAppSchema(yamlData)
 	if err != nil {
+		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
+		return
+	}
+
+	// RFC 20260130: Find __primary listener and substitute with user-provided value
+	var primaryListenerName string
+	hasPrimaryMarker := false
+	for i := range looseDef.Listeners {
+		if hostname.IsPrimaryMarker(looseDef.Listeners[i].Name) {
+			hasPrimaryMarker = true
+			// Get user-provided app address
+			if appAddress, ok := userInputs["__app_address__"].(string); ok && strings.TrimSpace(appAddress) != "" {
+				primaryListenerName = strings.TrimSpace(appAddress)
+				// Validate the provided name before using it
+				if err := app.ValidateInstanceID(primaryListenerName); err != nil {
+					writeGinError(c, http.StatusBadRequest, "Invalid app address: "+err.Error())
+					return
+				}
+				// RFC 20260130: Check for collision with existing app instance IDs
+				existingApps, err := s.appManager.List(c.Request.Context())
+				if err != nil {
+					writeGinError(c, http.StatusInternalServerError, "Failed to check existing apps: "+err.Error())
+					return
+				}
+				existingIDs := make([]string, len(existingApps))
+				for i, a := range existingApps {
+					existingIDs[i] = a.InstanceID
+				}
+				if err := app.ValidatePrimaryNameAvailable(primaryListenerName, existingIDs); err != nil {
+					writeGinError(c, http.StatusConflict, err.Error())
+					return
+				}
+				// Substitute the listener name and mark as primary
+				looseDef.Listeners[i].Name = primaryListenerName
+				looseDef.Listeners[i].Primary = true
+			} else {
+				writeGinError(c, http.StatusBadRequest, "App requires '__app_address__' input for primary listener name")
+				return
+			}
+			break
+		}
+	}
+
+	// RFC 20260130: All apps with listeners MUST use __primary marker
+	if !hasPrimaryMarker && len(looseDef.Listeners) > 0 {
+		writeGinError(c, http.StatusBadRequest, "Apps with listeners must have exactly one listener named '__primary'; update your app.yaml to use the __primary marker")
+		return
+	}
+
+	// Workspace apps: handle workspace_name identity
+	if looseDef.WorkspaceName != "" && len(looseDef.Listeners) == 0 {
+		wsName := looseDef.WorkspaceName // default: template's workspace_name (custom Docker Hub flow)
+
+		// Catalog flow: substitute __app_address__ into workspace_name
+		if appAddress, ok := userInputs["__app_address__"].(string); ok && strings.TrimSpace(appAddress) != "" {
+			wsName = strings.TrimSpace(appAddress)
+		}
+
+		// Validate and check collision (both flows)
+		if err := app.ValidateInstanceID(wsName); err != nil {
+			writeGinError(c, http.StatusBadRequest, "Invalid workspace name: "+err.Error())
+			return
+		}
+		existingApps, err := s.appManager.List(c.Request.Context())
+		if err != nil {
+			writeGinError(c, http.StatusInternalServerError, "Failed to check existing apps: "+err.Error())
+			return
+		}
+		existingIDs := make([]string, len(existingApps))
+		for i, a := range existingApps {
+			existingIDs[i] = a.InstanceID
+		}
+		if err := app.ValidatePrimaryNameAvailable(wsName, existingIDs); err != nil {
+			writeGinError(c, http.StatusConflict, err.Error())
+			return
+		}
+		looseDef.WorkspaceName = wsName
+	}
+
+	// Set defaults and validate
+	app.SetDefaults(looseDef)
+	if err := app.ValidateAppDefinition(looseDef); err != nil {
 		var ve *app.ValidationError
 		if errors.As(err, &ve) && ve != nil {
 			writeGinErrorWithKey(c, http.StatusBadRequest, "Invalid app.yaml: "+ve.Message, ve.Code)
@@ -398,6 +432,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
 		return
 	}
+	appDef := looseDef
 
 	// Install a new app instance.
 	// Use a background context with a generous timeout instead of the HTTP request context.
@@ -407,7 +442,10 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	installCtx, cancelInstall := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancelInstall()
 	installCtx = app.WithTaskID(installCtx, c.GetHeader("X-Piccolo-Task-ID"))
-	appInstance, err := s.appManager.Install(installCtx, appDef, displayName)
+	if catalogSource != "" {
+		installCtx = app.WithCatalogSource(installCtx, catalogSource)
+	}
+	appInstance, err := s.appManager.Install(installCtx, appDef)
 	if err != nil {
 		if handleAppManagerError(c, err, "install app") {
 			return
@@ -427,14 +465,6 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 			}
 			writeGinError(c, http.StatusInternalServerError, "Failed to register OIDC client: "+err.Error())
 			return
-		}
-	}
-
-	// RFC 20260122 §5.3: Auto-register proxy OIDC client for apps with headers/protected auth strategies
-	if s.requiresProxyOIDCClient(appDef) {
-		if err := s.registerProxyOIDCClient(installCtx, appInstance.InstanceID); err != nil {
-			// Non-fatal: log but don't fail the install
-			log.Printf("WARN: failed to register proxy OIDC client for %s: %v", appInstance.InstanceID, err)
 		}
 	}
 
@@ -618,6 +648,18 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 	if err != nil {
 		writeGinError(c, http.StatusInternalServerError, "Updated successfully but failed to fetch fresh status")
 		return
+	}
+
+	// RFC 20260122 §5.3: Register/cleanup proxy OIDC client based on updated listener auth.
+	// No post-persist event exists for listener updates, so this is done explicitly here.
+	// Install and restore paths are handled by observeProxyOIDCClients.
+	// Use context.Background() so OIDC registration outlives the HTTP request.
+	if s.requiresProxyOIDCClient(newApp.Definition) {
+		if err := s.registerProxyOIDCClient(context.Background(), appName); err != nil {
+			log.Printf("WARN: failed to register proxy OIDC client for %s: %v", appName, err)
+		}
+	} else {
+		s.deleteProxyOIDCClient(context.Background(), appName)
 	}
 
 	recreated := oldApp.PrimaryContainerID() != newApp.PrimaryContainerID()
@@ -828,25 +870,17 @@ func (s *GinServer) handleGinAppCheckInstance(c *gin.Context) {
 		return
 	}
 
-	existing := make([]string, 0, len(apps))
 	available := true
 	for _, inst := range apps {
-		existing = append(existing, inst.InstanceID)
 		if inst.InstanceID == candidate {
 			available = false
+			break
 		}
 	}
 
-	suggested := candidate
-	if !available {
-		if alt, err := app.GenerateInstanceID(candidate, existing); err == nil {
-			suggested = alt
-		}
-	}
-
+	// RFC 20260130: We no longer suggest alternatives; users must choose a unique name
 	c.JSON(http.StatusOK, gin.H{
 		"available": available,
-		"suggested": suggested,
 	})
 }
 

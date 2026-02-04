@@ -85,6 +85,64 @@ func topLevelValue(node *yaml.Node, key string) *yaml.Node {
 	return nil
 }
 
+// validateRawListenersNoPrimary validates that no listener specifies the 'primary' field
+// in user-authored manifests. Per RFC 20260130, the primary listener is determined by
+// the __primary name marker, not by a primary: true field.
+//
+// However, the 'primary' field IS allowed in persisted/loaded app definitions where the
+// __primary marker has already been substituted with the actual app name.
+func validateRawListenersNoPrimary(root *yaml.Node) error {
+	listeners := topLevelValue(root, "listeners")
+	if listeners == nil {
+		return nil
+	}
+	if listeners.Kind != yaml.SequenceNode {
+		return nil // Let the decoder handle the type error
+	}
+
+	// First pass: check if any listener has the __primary marker
+	// If so, this is a pre-substitution manifest and NO listener should have primary: true
+	hasPrimaryMarkerAnywhere := false
+	for _, item := range listeners.Content {
+		if item == nil || item.Kind != yaml.MappingNode {
+			continue
+		}
+		for j := 0; j+1 < len(item.Content); j += 2 {
+			keyNode := item.Content[j]
+			valueNode := item.Content[j+1]
+			if keyNode == nil || keyNode.Kind != yaml.ScalarNode {
+				continue
+			}
+			if keyNode.Value == "name" && valueNode != nil && valueNode.Value == "__primary" {
+				hasPrimaryMarkerAnywhere = true
+				break
+			}
+		}
+		if hasPrimaryMarkerAnywhere {
+			break
+		}
+	}
+
+	// Second pass: if this is a pre-substitution manifest, reject any primary: true field
+	if hasPrimaryMarkerAnywhere {
+		for i, item := range listeners.Content {
+			if item == nil || item.Kind != yaml.MappingNode {
+				continue
+			}
+			for j := 0; j+1 < len(item.Content); j += 2 {
+				keyNode := item.Content[j]
+				if keyNode == nil || keyNode.Kind != yaml.ScalarNode {
+					continue
+				}
+				if keyNode.Value == "primary" {
+					return fmt.Errorf("listeners[%d].primary is not allowed in YAML; use the '__primary' listener name instead", i)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func validateRawServicesBlocks(root *yaml.Node) error {
 	services := topLevelValue(root, "services")
 	if services == nil {
@@ -148,12 +206,16 @@ func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
 	if hasTopLevelKey(&root, "depends_on") {
 		return nil, fmt.Errorf("depends_on is not supported; dependencies must be packaged as sidecars")
 	}
+	// RFC 20260130: Reject primary field in listener YAML even during schema parsing
+	if err := validateRawListenersNoPrimary(&root); err != nil {
+		return nil, err
+	}
 	var app api.AppDefinition
 	if err := root.Decode(&app); err != nil {
 		return nil, fmt.Errorf("failed to parse YAML: %w", err)
 	}
 	// We do NOT call SetDefaults or ValidateAppDefinition here because
-	// fields like 'name' might contain "{{ .Inputs... }}" which would fail validation.
+	// fields like listener names might contain "{{ .Inputs... }}" which would fail validation.
 	return &app, nil
 }
 
@@ -201,6 +263,10 @@ func ParseAppDefinition(content []byte) (*api.AppDefinition, error) {
 	if err := validateRawServicesBlocks(&root); err != nil {
 		return nil, err
 	}
+	// RFC 20260130: Reject primary field in listener YAML - it's set programmatically only
+	if err := validateRawListenersNoPrimary(&root); err != nil {
+		return nil, err
+	}
 	if err := root.Decode(&app); err != nil {
 		return nil, fmt.Errorf("failed to parse YAML: %w", err)
 	}
@@ -238,18 +304,73 @@ func SetDefaults(app *api.AppDefinition) {
 			app.Listeners[i].Flow = api.FlowTCP
 		}
 		if app.Listeners[i].Protocol == api.ListenerProtocolUnknown {
-			app.Listeners[i].Protocol = api.ListenerProtocolRaw
+			// RFC 20260130: Primary listeners require host-based routing, so default to http.
+			// Non-primary listeners default to raw for backward compatibility.
+			isPrimary := app.Listeners[i].Primary || hostname.IsPrimaryMarker(app.Listeners[i].Name)
+			if isPrimary {
+				app.Listeners[i].Protocol = api.ListenerProtocolHTTP
+			} else {
+				app.Listeners[i].Protocol = api.ListenerProtocolRaw
+			}
 		}
 	}
 }
 
-// ValidateAppDefinition validates an AppDefinition struct
-func ValidateAppDefinition(app *api.AppDefinition) error {
-	// Validate app name using RFC 20260114 DNS-compliant rules (no hyphens)
-	if err := hostname.ValidateAppName(app.Name); err != nil {
-		return err
+// validateAppIdentity validates the app identity configuration per RFC 20260130.
+// Apps must provide identity via exactly one of:
+// - listeners with exactly one __primary (apps with network access)
+// - workspace_name (workspace apps without listeners)
+//
+// RFC 20260130 §10.1: Workspace mode apps can evolve to have both workspace_name
+// and listeners. This occurs when listeners are added to a workspace that was
+// originally installed with workspace_name. The instanceID remains workspace_name
+// (accepted asymmetry). Service mode apps still require mutual exclusivity.
+func validateAppIdentity(app *api.AppDefinition, mode PiccoloMode) error {
+	hasListeners := len(app.Listeners) > 0
+	hasWorkspaceName := strings.TrimSpace(app.WorkspaceName) != ""
+
+	// workspace_name format validation (if present)
+	if hasWorkspaceName {
+		if err := hostname.ValidateWorkspaceName(app.WorkspaceName); err != nil {
+			return err
+		}
 	}
 
+	// RFC 20260130 §10.1: Workspace mode apps can have both workspace_name and listeners
+	// (evolved workspace). Service mode requires mutual exclusivity.
+	if hasListeners && hasWorkspaceName {
+		if mode != ModeWorkspace {
+			return fmt.Errorf("workspace_name cannot be used with listeners; the primary listener name becomes the app identity")
+		}
+		// Workspace mode with both: valid (evolved workspace per §10.1)
+		return nil
+	}
+
+	// workspace_name without listeners is only valid for workspace mode
+	if hasWorkspaceName && !hasListeners {
+		if mode != ModeWorkspace {
+			return fmt.Errorf("workspace_name is only allowed for workspace mode apps")
+		}
+	}
+
+	// Apps without listeners must have workspace_name (workspace mode only)
+	if !hasListeners && !hasWorkspaceName {
+		if mode == ModeWorkspace {
+			return fmt.Errorf("workspace_name is required for workspace apps without listeners")
+		}
+		// RFC 20260130: Service mode apps require listeners for identity
+		if mode == ModeService {
+			return fmt.Errorf("listeners are required for service mode apps")
+		}
+		// For unknown mode, return generic error
+		return fmt.Errorf("listeners or workspace_name is required for app identity")
+	}
+
+	return nil
+}
+
+// ValidateAppDefinition validates an AppDefinition struct
+func ValidateAppDefinition(app *api.AppDefinition) error {
 	// Validate type
 	if err := validateType(app.Type); err != nil {
 		return err
@@ -266,6 +387,14 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 		return err
 	}
 	mode := piccoloModeFromExtensions(app.Extensions)
+
+	// RFC 20260130: Validate app identity configuration.
+	// Apps must provide identity via exactly one of:
+	// - listeners with exactly one __primary (service/workspace apps with network access)
+	// - workspace_name (workspace apps without listeners)
+	if err := validateAppIdentity(app, mode); err != nil {
+		return err
+	}
 
 	// Validate container model (single vs multi-container) and disallowed fields.
 	if err := validateContainerModel(app, mode); err != nil {
@@ -573,9 +702,8 @@ func validateName(name string) error {
 		return fmt.Errorf("name must contain only lowercase letters, numbers, and hyphens, and must start with a letter")
 	}
 
-	// Reserved names check
-	reserved := []string{"api", "www", "admin", "root", "system", "piccolo"}
-	for _, r := range reserved {
+	// Reserved names check - use unified list from hostname package (RFC 20260130)
+	for _, r := range hostname.ReservedNames {
 		if name == r {
 			return fmt.Errorf("name '%s' is reserved", name)
 		}
@@ -597,6 +725,7 @@ func validateType(appType string) error {
 
 // validateListeners validates listener configurations.
 // Workspace mode apps are allowed to have no listeners (blank environments).
+// Per RFC 20260130, apps with listeners must have exactly one __primary listener.
 func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 	if len(listeners) == 0 {
 		// Workspace mode apps can have no listeners - they're blank environments
@@ -607,23 +736,44 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 		return fmt.Errorf("listeners are required; legacy ports are no longer supported")
 	}
 
-	// Validate primary listener configuration using hostname package
-	if _, err := hostname.ResolvePrimaryListener(listeners); err != nil {
-		return fmt.Errorf("invalid primary listener configuration: %w", err)
-	}
-
 	names := make(map[string]struct{})
 	guestPorts := make(map[int]string)
+	hasPrimaryMarker := false
 
 	for i, l := range listeners {
 		// name required
 		if strings.TrimSpace(l.Name) == "" {
 			return fmt.Errorf("listener[%d] name is required", i)
 		}
-		// Validate listener name per RFC 20260114 (DNS-compliant, no hyphens)
-		if err := hostname.ValidateListenerName(l.Name); err != nil {
-			return fmt.Errorf("listener[%d] %w", i, err)
+
+		// RFC 20260130: __primary is a magic marker that gets replaced at install time.
+		// It's exempt from normal name validation but still must be unique.
+		// Also accept Primary: true for programmatically created definitions (tests, reconcile).
+		isPrimary := hostname.IsPrimaryMarker(l.Name) || l.Primary
+		if isPrimary {
+			if hasPrimaryMarker {
+				return fmt.Errorf("only one listener can be named '__primary' or have Primary=true")
+			}
+			hasPrimaryMarker = true
+
+			// Primary listeners must be eligible for host-based routing.
+			// TLS flow and raw protocol don't support host-based routing.
+			if l.Flow == api.FlowTLS {
+				return fmt.Errorf("primary listener '%s' cannot use flow: tls (not eligible for host routing)", l.Name)
+			}
+			if l.Protocol == api.ListenerProtocolRaw {
+				return fmt.Errorf("primary listener '%s' cannot use protocol: raw (not eligible for host routing)", l.Name)
+			}
 		}
+
+		// Validate listener name only if not __primary marker
+		if !hostname.IsPrimaryMarker(l.Name) {
+			// Validate listener name per RFC 20260114 (DNS-compliant, no hyphens)
+			if err := hostname.ValidateListenerName(l.Name); err != nil {
+				return fmt.Errorf("listener[%d] %w", i, err)
+			}
+		}
+
 		// unique name per app
 		if _, ok := names[l.Name]; ok {
 			return fmt.Errorf("duplicate listener name '%s'", l.Name)
@@ -703,6 +853,15 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 			}
 		}
 	}
+
+	// RFC 20260130: Apps with listeners must have exactly one primary listener.
+	// For raw YAML, this is the __primary marker which gets replaced at install time.
+	// For programmatic definitions (tests, reconcile), this is Primary=true.
+	// No auto-select for single-listener apps - all apps must explicitly designate primary.
+	if !hasPrimaryMarker {
+		return fmt.Errorf("apps with listeners must have exactly one listener named '__primary' or with Primary=true")
+	}
+
 	return nil
 }
 

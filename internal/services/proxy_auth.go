@@ -12,6 +12,7 @@ import (
 type proxyAppIDContextKey struct{}
 type proxyAppHostContextKey struct{}
 type proxyCookieRewriteContextKey struct{}
+type proxyPartitionCookiesContextKey struct{}
 
 // Cookie names for Piccolo sessions and OIDC flows
 const (
@@ -107,7 +108,7 @@ func portalAccessDeniedURL(portalOrigin, nextAbs string) string {
 	return strings.TrimSuffix(portalOrigin, "/") + "/access-denied?next=" + next
 }
 
-func withProxyContext(r *http.Request, appID, appHost string, rewriteCookies bool) *http.Request {
+func withProxyContext(r *http.Request, appID, appHost string, rewriteCookies, partitionCookies bool) *http.Request {
 	if r == nil {
 		return nil
 	}
@@ -115,6 +116,7 @@ func withProxyContext(r *http.Request, appID, appHost string, rewriteCookies boo
 	ctx = context.WithValue(ctx, proxyAppIDContextKey{}, appID)
 	ctx = context.WithValue(ctx, proxyAppHostContextKey{}, appHost)
 	ctx = context.WithValue(ctx, proxyCookieRewriteContextKey{}, rewriteCookies)
+	ctx = context.WithValue(ctx, proxyPartitionCookiesContextKey{}, partitionCookies)
 	return r.WithContext(ctx)
 }
 
@@ -133,6 +135,16 @@ func proxyContextCookieRewrite(ctx context.Context) bool {
 		return false
 	}
 	if v, ok := ctx.Value(proxyCookieRewriteContextKey{}).(bool); ok {
+		return v
+	}
+	return false
+}
+
+func proxyContextPartitionCookies(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	if v, ok := ctx.Value(proxyPartitionCookiesContextKey{}).(bool); ok {
 		return v
 	}
 	return false
@@ -329,4 +341,77 @@ func setCookieDomain(setCookie string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// shouldPartitionCookies returns true when CHIPS (Partitioned) attributes should
+// be applied to Set-Cookie headers. This targets host-based HTTPS LAN access where
+// the app iframe is cross-site relative to the portal (e.g., homebox-piccolo-xyz.local
+// embedded by piccolo-xyz.local). Remote mode apps (blog.example.com) are same-site
+// with the portal and don't need partitioning.
+func shouldPartitionCookies(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if !RequestArrivedViaTLS(r) {
+		return false
+	}
+	if isPortBasedAccess(r) {
+		return false
+	}
+	// Only LAN .local hostnames need CHIPS — remote subdomains are same-site.
+	host := normalizeHostNoPort(r.Host)
+	if !strings.HasSuffix(host, ".local") {
+		return false
+	}
+	return !shouldRewriteLegacyCookies(r.Host)
+}
+
+// hasCookieAttribute checks if a raw Set-Cookie header string contains
+// a given attribute (case-insensitive, flag-style like "Secure" or "Partitioned").
+func hasCookieAttribute(sc, attr string) bool {
+	for _, part := range strings.Split(sc, ";") {
+		if strings.EqualFold(strings.TrimSpace(part), attr) {
+			return true
+		}
+	}
+	return false
+}
+
+// removeCookieAttribute removes all occurrences of a cookie attribute from a raw
+// Set-Cookie header string. Matches attributes by case-insensitive prefix before '='
+// (e.g., "samesite" matches "SameSite=Lax") and flag-style attributes (e.g., "secure").
+// The first segment (name=value pair) is always preserved.
+func removeCookieAttribute(sc, attr string) string {
+	parts := strings.Split(sc, ";")
+	if len(parts) == 0 {
+		return sc
+	}
+	out := make([]string, 0, len(parts))
+	out = append(out, parts[0]) // always keep name=value pair
+	lowerAttr := strings.ToLower(attr)
+	for _, part := range parts[1:] {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		// Match flag-style (e.g., "Secure") or key=value (e.g., "SameSite=Lax")
+		if lower == lowerAttr || strings.HasPrefix(lower, lowerAttr+"=") {
+			continue
+		}
+		out = append(out, part)
+	}
+	return strings.Join(out, ";")
+}
+
+// ensurePartitionedAttributes rewrites a raw Set-Cookie header string to add
+// CHIPS attributes: Partitioned, SameSite=None, and Secure. Idempotent.
+func ensurePartitionedAttributes(sc string) string {
+	sc = removeCookieAttribute(sc, "samesite")
+	sc = removeCookieAttribute(sc, "partitioned")
+	if !hasCookieAttribute(sc, "secure") {
+		sc += "; Secure"
+	}
+	sc += "; SameSite=None; Partitioned"
+	return sc
 }

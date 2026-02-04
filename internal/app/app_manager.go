@@ -1173,14 +1173,16 @@ func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefi
 }
 
 // Install installs a new application instance from its definition.
-// The displayName parameter is an optional user-friendly name for the instance.
-func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition, displayName string) (*AppInstance, error) {
+// Per RFC 20260130, the instanceID is derived from:
+// - The primary listener name (for apps with listeners)
+// - The workspace_name (for workspace apps without listeners)
+func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-	return m.installLocked(ctx, appDef, displayName)
+	return m.installLocked(ctx, appDef)
 }
 
-func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinition, displayName string) (inst *AppInstance, err error) {
+func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinition) (inst *AppInstance, err error) {
 	instanceID := ""
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseValidating, 0, "Validating app manifest", false, nil)
 	defer func() {
@@ -1211,24 +1213,53 @@ func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinitio
 		return nil, err
 	}
 
-	// Generate unique instance ID
-	existingIDs := state.ListInstanceIDs()
-	instanceID, err = GenerateInstanceID(appDef.Name, existingIDs)
+	// RFC 20260130: Derive instanceID from primary listener name or workspace_name
+	instanceID, err = deriveInstanceID(appDef)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate instance ID: %w", err)
+		return nil, fmt.Errorf("failed to derive instance ID: %w", err)
 	}
 
-	// Validate generated instance ID
+	// Validate instance ID format and reserved names (RFC 20260130)
 	if err := ValidateInstanceID(instanceID); err != nil {
-		return nil, fmt.Errorf("invalid generated instance ID: %w", err)
+		return nil, fmt.Errorf("invalid app identity: %w", err)
+	}
+
+	// Validate instance ID doesn't collide with existing apps
+	existingIDs := state.ListInstanceIDs()
+	if err := ValidatePrimaryNameAvailable(instanceID, existingIDs); err != nil {
+		return nil, err
 	}
 
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseAllocatingPorts, 10, "Allocating ports", false, nil)
-	inst, err = m.installWithRetries(ctx, state, appDef, instanceID, displayName, 0)
+	inst, err = m.installWithRetries(ctx, state, appDef, instanceID, 0)
 	return inst, err
 }
 
-func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemStateManager, appDef *api.AppDefinition, instanceID, displayName string, attempt int) (*AppInstance, error) {
+// deriveInstanceID returns the instance ID from the app definition per RFC 20260130.
+// For apps with listeners, it's the primary listener name.
+// For workspace apps without listeners, it's the workspace_name.
+func deriveInstanceID(appDef *api.AppDefinition) (string, error) {
+	if len(appDef.Listeners) > 0 {
+		// Find the primary listener (the one with Primary=true, set programmatically)
+		for _, l := range appDef.Listeners {
+			if l.Primary {
+				return l.Name, nil
+			}
+		}
+		// RFC 20260130: All apps with listeners must have Primary=true set on exactly one listener.
+		// No fallback - this indicates a bug in install handler if we reach here.
+		return "", fmt.Errorf("no primary listener found; this indicates a bug in listener processing")
+	}
+
+	// Workspace app without listeners - use workspace_name
+	if appDef.WorkspaceName != "" {
+		return appDef.WorkspaceName, nil
+	}
+
+	return "", fmt.Errorf("cannot derive instance ID: no listeners and no workspace_name")
+}
+
+func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemStateManager, appDef *api.AppDefinition, instanceID string, attempt int) (*AppInstance, error) {
 	if attempt >= maxInstallPortRetries {
 		return nil, fmt.Errorf("failed to install %s: exhausted host-port retries", instanceID)
 	}
@@ -1260,7 +1291,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	// Unified install path: all apps (service and workspace) use container groups.
 	// Storage preparation (image pull vs workspace disk) is handled inside installContainerGroup.
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseCreatingContainer, 60, "Creating containers", false, nil)
-	app, err := m.installContainerGroup(ctx, appDef, instanceID, displayName, layout, runtime, endpoints)
+	app, err := m.installContainerGroup(ctx, appDef, instanceID, layout, runtime, endpoints)
 	if err != nil {
 		var portErr *container.PortInUseError
 		if errors.As(err, &portErr) {
@@ -1274,13 +1305,13 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 					_ = m.serviceManager.ReserveHostPort(ep.HostBind)
 				}
 			}
-			return m.installWithRetries(ctx, state, appDef, instanceID, displayName, attempt+1)
+			return m.installWithRetries(ctx, state, appDef, instanceID, attempt+1)
 		}
 		return nil, err
 	}
 
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseRegisteringServices, 90, "Finalizing installation", false, nil)
-	if err := state.StoreApp(app, appDef); err != nil {
+	if err := state.StoreApp(app); err != nil {
 		// Cleanup all containers if storage fails
 		if app.NetworkAnchorID != "" {
 			_ = m.containerManager.StopContainer(ctx, runtime, app.NetworkAnchorID)
@@ -1311,7 +1342,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 // Deprecated: With multi-instance support, use Install() directly.
 // This method now always creates a new instance (no update behavior).
 func (m *AppManager) Upsert(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
-	return m.Install(ctx, appDef, "")
+	return m.Install(ctx, appDef)
 }
 
 // List returns all installed applications
@@ -1818,7 +1849,8 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 		appInst.Status = "running"
 	}
 	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst, nil); err != nil {
+	// Must use StoreApp to persist the updated Definition (app.yaml with new image)
+	if err := state.StoreApp(appInst); err != nil {
 		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
 		_ = m.containerManager.RemoveContainer(ctx, runtime, newCID)
 		return fmt.Errorf("store app: %w", err)
@@ -1885,6 +1917,28 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return nil, err
+	}
+
+	// Auto-designate a primary listener if none is marked.
+	// The API caller doesn't set Primary (it's an internal concept from YAML install).
+	// For workspace apps editing listeners, pick the first eligible listener as primary.
+	// Primary listeners must support host-based routing (not flow:tls or protocol:raw).
+	if len(newDef.Listeners) > 0 {
+		hasPrimary := false
+		for _, l := range newDef.Listeners {
+			if l.Primary {
+				hasPrimary = true
+				break
+			}
+		}
+		if !hasPrimary {
+			for i, l := range newDef.Listeners {
+				if l.Flow != api.FlowTLS && l.Protocol != api.ListenerProtocolRaw {
+					newDef.Listeners[i].Primary = true
+					break
+				}
+			}
+		}
 	}
 
 	// Validate new definition
@@ -1959,7 +2013,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				log.Printf("ERROR: update listeners %s: port rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
 				appInst.SetPrimaryContainerID("")
-				_ = state.StoreApp(appInst, curDef)
+				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (ports): %v", err, rbErr)
 			}
 
@@ -1969,7 +2023,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				log.Printf("ERROR: update listeners %s: spec rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
 				appInst.SetPrimaryContainerID("")
-				_ = state.StoreApp(appInst, curDef)
+				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (spec): %v", err, rbErr)
 			}
 
@@ -1988,7 +2042,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				log.Printf("ERROR: update listeners %s: container rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
 				appInst.SetPrimaryContainerID("")
-				_ = state.StoreApp(appInst, curDef)
+				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (create): %v", err, rbErr)
 			}
 
@@ -1997,7 +2051,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				log.Printf("ERROR: update listeners %s: start rollback failed: %v", instanceID, rbErr)
 				appInst.Status = "error"
 				appInst.SetPrimaryContainerID(rbCID) // It exists but failed to start
-				_ = state.StoreApp(appInst, curDef)
+				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (start): %v", err, rbErr)
 			}
 
@@ -2009,7 +2063,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			appInst.SetPrimaryContainerID(rbCID)
 			appInst.Status = "running"
 			// Save the restored state to ensure persistence of new CID
-			if saveErr := state.StoreApp(appInst, curDef); saveErr != nil {
+			if saveErr := state.StoreApp(appInst); saveErr != nil {
 				log.Printf("WARN: update listeners %s: failed to save rollback state: %v", instanceID, saveErr)
 			}
 
@@ -2035,7 +2089,8 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 
 	m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseFinalizing, 90, "Saving configuration", false, nil)
 	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst, &newDef); err != nil {
+	appInst.Definition = &newDef
+	if err := state.StoreApp(appInst); err != nil {
 		return nil, fmt.Errorf("store app: %w", err)
 	}
 
@@ -2120,7 +2175,7 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 		appInst.Status = "running"
 	}
 	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst, nil); err != nil {
+	if err := state.StoreApp(appInst); err != nil {
 		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
 		_ = m.containerManager.RemoveContainer(ctx, runtime, newCID)
 		return fmt.Errorf("store app: %w", err)
@@ -2192,7 +2247,9 @@ func (m *AppManager) LogsForService(ctx context.Context, instanceID, service str
 				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[target] = id
-			_ = state.StoreApp(appInst, nil)
+			if err := state.StoreAppMetadata(appInst); err != nil {
+				log.Printf("WARN: LogsForService %s: failed to persist resolved container ID: %v", instanceID, err)
+			}
 		}
 	}
 	if cid == "" {
@@ -2252,7 +2309,9 @@ func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, servi
 				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[target] = id
-			_ = state.StoreApp(appInst, nil)
+			if err := state.StoreAppMetadata(appInst); err != nil {
+				log.Printf("WARN: LogsStreamForService %s: failed to persist resolved container ID: %v", instanceID, err)
+			}
 		}
 	}
 	if cid == "" {
@@ -2505,7 +2564,9 @@ func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, ser
 				appInst.Containers = make(map[string]string)
 			}
 			appInst.Containers[target] = id
-			_ = state.StoreApp(appInst, nil)
+			if err := state.StoreAppMetadata(appInst); err != nil {
+				log.Printf("WARN: ShellForService %s: failed to persist resolved container ID: %v", instanceID, err)
+			}
 		}
 	}
 	if cid == "" {

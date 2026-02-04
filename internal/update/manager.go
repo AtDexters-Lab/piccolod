@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 )
 
@@ -535,7 +536,7 @@ func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []strin
 	runCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 	marker := filepath.Join(m.runtimeDir, "update.inprogress")
-	_ = os.WriteFile(marker, []byte(action+" "+unit), 0o644)
+	_ = fsutil.AtomicWriteFile(marker, []byte(action+" "+unit), 0o644)
 	if wait {
 		defer os.Remove(marker)
 	}
@@ -632,7 +633,7 @@ func (m *microOSBackend) persistState(action, target, unit string, exit int, msg
 		Message:         msg,
 	}
 	_ = os.MkdirAll(filepath.Dir(m.statePath), 0o700)
-	_ = os.WriteFile(m.statePath, mustJSON(ps), 0o600)
+	_ = fsutil.AtomicWriteFile(m.statePath, mustJSON(ps), 0o600)
 }
 
 func (m *microOSBackend) loadState() *persistedState {

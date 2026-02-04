@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import '../../core/config/core_config.dart';
+import '../../core/utils/clipboard/clipboard.dart' as clipboard_utils;
 import '../../shells/desktop/features/terminal/terminal_backend.dart';
 
 /// Mixin providing common terminal functionality for host and workspace terminals.
@@ -87,13 +88,15 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
   }
 
   /// Copy selected text to clipboard.
+  /// Uses platform-specific clipboard utils that fall back to execCommand('copy')
+  /// on non-secure origins (HTTP), enabling copy on http://piccolo.local.
   Future<void> copyTerminalSelection() async {
     final selection = terminalController.selection;
     if (selection == null) return;
     final text = terminal.buffer.getText(selection);
     try {
-      await Clipboard.setData(ClipboardData(text: text));
-    } on PlatformException {
+      await clipboard_utils.copyText(text);
+    } catch (e) {
       terminal.write(_clipboardHint);
     }
   }
@@ -107,6 +110,16 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
       terminal.paste(text);
     } on PlatformException {
       terminal.write(_clipboardHint);
+    }
+  }
+
+  /// Handle Ctrl+C shortcut: copy if selection exists, otherwise let terminal handle (SIGINT).
+  void _handleCopyShortcut() {
+    if (terminalController.selection != null) {
+      copyTerminalSelection();
+    } else {
+      // No selection - send Ctrl+C to terminal (SIGINT)
+      terminal.keyInput(TerminalKey.keyC, ctrl: true);
     }
   }
 
@@ -144,25 +157,48 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
   }
 
   /// Build the terminal view widget with standard styling.
+  /// Uses CallbackShortcuts to intercept Ctrl+C before it reaches xterm,
+  /// copying selected text or sending SIGINT if no selection.
   Widget buildTerminalView() {
-    return Container(
-      color: const Color(0xFF1E1E1E),
-      child: SizedBox.expand(
-        child: Scrollbar(
-          controller: terminalScrollController,
-          thumbVisibility: true,
-          child: TerminalView(
-            terminal,
-            controller: terminalController,
-            scrollController: terminalScrollController,
-            textStyle: const TerminalStyle(
-              fontFamily: 'JetBrainsMono',
-              height: 1.2,
+    return RepaintBoundary(
+      child: Container(
+        color: const Color(0xFF1E1E1E),
+        child: SizedBox.expand(
+          child: Scrollbar(
+            controller: terminalScrollController,
+            thumbVisibility: true,
+            child: CallbackShortcuts(
+              bindings: {
+                // Ctrl+Shift+C - explicit copy (Linux terminal convention)
+                const SingleActivator(LogicalKeyboardKey.keyC, control: true, shift: true):
+                    copyTerminalSelection,
+                // Ctrl+Shift+V - explicit paste (Linux terminal convention)
+                const SingleActivator(LogicalKeyboardKey.keyV, control: true, shift: true):
+                    pasteToTerminal,
+                // Ctrl+C on Linux/Windows - intercept to handle copy vs SIGINT
+                const SingleActivator(LogicalKeyboardKey.keyC, control: true):
+                    _handleCopyShortcut,
+                // Cmd+C on macOS
+                const SingleActivator(LogicalKeyboardKey.keyC, meta: true):
+                    _handleCopyShortcut,
+                // Cmd+V on macOS
+                const SingleActivator(LogicalKeyboardKey.keyV, meta: true):
+                    pasteToTerminal,
+              },
+              child: TerminalView(
+                terminal,
+                controller: terminalController,
+                scrollController: terminalScrollController,
+                textStyle: const TerminalStyle(
+                  fontFamily: 'JetBrainsMono',
+                  height: 1.2,
+                ),
+                padding: const EdgeInsets.all(12.0),
+                autofocus: true,
+                onSecondaryTapDown: (details, cell) =>
+                    showTerminalContextMenu(context, details.globalPosition),
+              ),
             ),
-            padding: const EdgeInsets.all(12.0),
-            autofocus: true,
-            onSecondaryTapDown: (details, cell) =>
-                showTerminalContextMenu(context, details.globalPosition),
           ),
         ),
       ),

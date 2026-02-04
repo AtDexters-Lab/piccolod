@@ -84,30 +84,15 @@ func TestGinAppAPI_Install(t *testing.T) {
 		expectError    bool
 	}{
 		{
+			// RFC 20260130: All apps with listeners must use __primary marker
+			// Use JSON format with inputs to provide __app_address__
 			name:        "install valid nginx app",
 			method:      "POST",
-			contentType: "application/x-yaml",
-			body: `name: testnginx
-type: user
-listeners:
-  - name: web
-    guest_port: 80
-    flow: tcp
-    protocol: http
-    auth:
-      rules:
-        - path: "/"
-          type: prefix
-          strategy: public
-services:
-  main:
-    image: docker.io/library/nginx:alpine
-    bind_ports: [80]
-    environment:
-      NGINX_HOST: localhost
-      NGINX_PORT: "80"
-x-piccolo:
-  mode: service`,
+			contentType: "application/json",
+			body: `{
+				"app_definition": "type: user\nlisteners:\n  - name: __primary\n    guest_port: 80\n    flow: tcp\n    protocol: http\n    auth:\n      rules:\n        - path: \"/\"\n          type: prefix\n          strategy: public\nservices:\n  main:\n    image: docker.io/library/nginx:alpine\n    bind_ports: [80]\n    environment:\n      NGINX_HOST: localhost\n      NGINX_PORT: \"80\"\nx-piccolo:\n  mode: service",
+				"inputs": {"__app_address__": "testnginx"}
+			}`,
 			expectedStatus: http.StatusCreated,
 			expectError:    false,
 		},
@@ -194,11 +179,11 @@ func TestGinAppAPI_Install_JSON_WithDisplayName(t *testing.T) {
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
+	// RFC 20260130: listener name is the app identity, no display_name
 	payload := map[string]interface{}{
-		"app_definition": `name: testnginx
-type: user
+		"app_definition": `type: user
 listeners:
-  - name: web
+  - name: __primary
     guest_port: 80
     flow: tcp
     protocol: http
@@ -213,7 +198,9 @@ services:
     bind_ports: [80]
 x-piccolo:
   mode: service`,
-		"display_name": "Work Projects",
+		"inputs": map[string]interface{}{
+			"__app_address__": "testnginx",
+		},
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -237,9 +224,7 @@ x-piccolo:
 	if !ok {
 		t.Fatalf("response data not object: %#v", resp.Data)
 	}
-	if got := data["display_name"]; got != "Work Projects" {
-		t.Fatalf("expected display_name %q, got %#v", "Work Projects", got)
-	}
+	// RFC 20260130: instance_id is the primary listener name
 	if got := data["instance_id"]; got != "testnginx" {
 		t.Fatalf("expected instance_id %q, got %#v", "testnginx", got)
 	}
@@ -252,7 +237,8 @@ func TestGinAppAPI_CheckInstance(t *testing.T) {
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
-	check := func(id string) (bool, string) {
+	// RFC 20260130: check-instance only returns available, no suggested field
+	check := func(id string) bool {
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequest(http.MethodGet, "/api/v1/apps/check-instance?id="+id, nil)
 		attachAuth(req, sessionCookie, csrfToken)
@@ -261,45 +247,33 @@ func TestGinAppAPI_CheckInstance(t *testing.T) {
 			t.Fatalf("check-instance: expected %d, got %d body=%s", http.StatusOK, w.Code, w.Body.String())
 		}
 		var resp struct {
-			Available bool   `json:"available"`
-			Suggested string `json:"suggested"`
+			Available bool `json:"available"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("decode check-instance: %v", err)
 		}
-		return resp.Available, resp.Suggested
+		return resp.Available
 	}
 
-	available, suggested := check("demo")
-	if !available {
+	if !check("demo") {
 		t.Fatalf("expected demo to be available")
 	}
-	if suggested != "demo" {
-		t.Fatalf("expected suggested to be demo, got %q", suggested)
-	}
 
+	// RFC 20260130: listener name is the app identity
 	appDef := &api.AppDefinition{
-		Name:      "demo",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "demo", GuestPort: 80, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine:latest", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	if _, err := server.appManager.Install(context.Background(), appDef, ""); err != nil {
+	if _, err := server.appManager.Install(context.Background(), appDef); err != nil {
 		t.Fatalf("install app: %v", err)
 	}
 
-	available, suggested = check("demo")
-	if available {
-		t.Fatalf("expected demo to be unavailable")
-	}
-	if suggested == "demo" {
-		t.Fatalf("expected suggested to differ from demo")
-	}
-	if !strings.HasPrefix(suggested, "demo-") {
-		t.Fatalf("expected suggested to start with demo-, got %q", suggested)
+	if check("demo") {
+		t.Fatalf("expected demo to be unavailable after install")
 	}
 }
 
@@ -343,18 +317,17 @@ func TestGinAppAPI_List(t *testing.T) {
 		t.Errorf("Expected 0 apps, got %d", len(apps))
 	}
 
-	// Install an app via the app manager directly
+	// RFC 20260130: listener name is the app identity
 	appDef := &api.AppDefinition{
-		Name:      "testapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef, "")
+	_, err = server.appManager.Install(context.Background(), appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -392,8 +365,6 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	if err := srv.remoteManager.Configure(remote.ConfigureRequest{
 		Endpoint:       "wss://nexus.example.com/connect",
 		DeviceSecret:   "secret-value",
-		Solver:         "http-01",
-		TLD:            "example.com",
 		PortalHostname: "portal.example.com",
 	}); err != nil {
 		t.Fatalf("remote configure: %v", err)
@@ -402,8 +373,8 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	if !status.Enabled {
 		t.Fatalf("remote status not enabled: %+v", status)
 	}
-	if strings.TrimSpace(status.TLD) == "" {
-		t.Fatalf("remote status missing tld: %+v", status)
+	if strings.TrimSpace(status.PortalHostname) == "" {
+		t.Fatalf("remote status missing portal_hostname: %+v", status)
 	}
 	// Test hostname derivation with proper DerivedHostLabel (per RFC 20260114)
 	if host := srv.remoteServiceHostname(&status, services.ServiceEndpoint{Name: "web", DerivedHostLabel: "testapp"}); host == "" {
@@ -411,20 +382,21 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 	}
 	srv.refreshRemoteRuntime()
 
+	// RFC 20260130: listener name is the app identity
 	_, err := srv.appManager.Install(context.Background(), &api.AppDefinition{
-		Name: "blog",
 		Type: "user",
 		Listeners: []api.AppListener{{
-			Name:      "web",
+			Name:      "blog",
 			GuestPort: 80,
 			Flow:      api.FlowTCP,
 			Protocol:  api.ListenerProtocolHTTP,
+			Primary:   true,
 		}},
 		Services: map[string]api.AppService{
 			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
-	}, "")
+	})
 	if err != nil {
 		t.Fatalf("install app: %v", err)
 	}
@@ -485,17 +457,17 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
+	// RFC 20260130: listener name is the app identity
 	appDef := &api.AppDefinition{
-		Name:      "testapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef, "")
+	_, err = server.appManager.Install(context.Background(), appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -562,17 +534,17 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
+	// RFC 20260130: listener name is the app identity
 	appDef := &api.AppDefinition{
-		Name:      "testapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine:latest", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef, "")
+	_, err = server.appManager.Install(context.Background(), appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -660,31 +632,16 @@ func TestGinAppAPI_FullLifecycle(t *testing.T) {
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
-	appYAML := `name: lifecycletest
-type: user
-listeners:
-  - name: web
-    guest_port: 80
-    flow: tcp
-    protocol: http
-    auth:
-      rules:
-        - path: "/"
-          type: prefix
-          strategy: public
-services:
-  main:
-    image: docker.io/library/nginx:alpine
-    bind_ports: [80]
-    environment:
-      TEST_ENV: "lifecycle"
-x-piccolo:
-  mode: service`
+	// RFC 20260130: All apps with listeners must use __primary marker
+	appJSON := `{
+		"app_definition": "type: user\nlisteners:\n  - name: __primary\n    guest_port: 80\n    flow: tcp\n    protocol: http\n    auth:\n      rules:\n        - path: \"/\"\n          type: prefix\n          strategy: public\nservices:\n  main:\n    image: docker.io/library/nginx:alpine\n    bind_ports: [80]\n    environment:\n      TEST_ENV: \"lifecycle\"\nx-piccolo:\n  mode: service",
+		"inputs": {"__app_address__": "lifecycletest"}
+	}`
 
 	// 1. Install app via HTTP API
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/api/v1/apps", strings.NewReader(appYAML))
-	req.Header.Set("Content-Type", "application/x-yaml")
+	req, _ := http.NewRequest("POST", "/api/v1/apps", strings.NewReader(appJSON))
+	req.Header.Set("Content-Type", "application/json")
 	attachAuth(req, sessionCookie, csrfToken)
 	server.router.ServeHTTP(w, req)
 
@@ -782,17 +739,17 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
+	// RFC 20260130: listener name is the app identity
 	appDef := &api.AppDefinition{
-		Name:      "testapp",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80}},
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine:latest", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef, "")
+	_, err = server.appManager.Install(context.Background(), appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
@@ -1108,11 +1065,11 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
     category: test
 `)
 		case "/wordpress/app.yaml":
+			// RFC 20260130: use __primary marker for catalog apps
 			w.Header().Set("Content-Type", "application/x-yaml; charset=utf-8")
-			_, _ = io.WriteString(w, `name: wordpress
-type: user
+			_, _ = io.WriteString(w, `type: user
 listeners:
-  - name: web
+  - name: __primary
     guest_port: 80
     flow: tcp
     protocol: http
@@ -1186,29 +1143,14 @@ func TestLeadership_FollowerStopsApp(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, csrf := setupTestAdminSession(t, srv)
 
-	// Install a simple app via API
-	payload := `name: blog
-type: user
-listeners:
-  - name: web
-    guest_port: 80
-    flow: tcp
-    protocol: http
-    auth:
-      rules:
-        - path: "/"
-          type: prefix
-          strategy: public
-services:
-  main:
-    image: docker.io/library/nginx:alpine
-    bind_ports: [80]
-x-piccolo:
-  mode: service
-`
+	// RFC 20260130: all apps with listeners must use __primary marker
+	payload := `{
+		"app_definition": "type: user\nlisteners:\n  - name: __primary\n    guest_port: 80\n    flow: tcp\n    protocol: http\n    auth:\n      rules:\n        - path: \"/\"\n          type: prefix\n          strategy: public\nservices:\n  main:\n    image: docker.io/library/nginx:alpine\n    bind_ports: [80]\nx-piccolo:\n  mode: service\n",
+		"inputs": {"__app_address__": "blog"}
+	}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/apps", strings.NewReader(payload))
-	req.Header.Set("Content-Type", "application/x-yaml")
+	req.Header.Set("Content-Type", "application/json")
 	attachAuth(req, sessionCookie, csrf)
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -1446,6 +1388,19 @@ func (m *GinMockContainerManager) PullImage(ctx context.Context, runtime contain
 	return nil
 }
 
+func (m *GinMockContainerManager) PullImageWithProgress(ctx context.Context, runtime container.PodmanRuntime, image string, callback container.ImagePullCallback) error {
+	_ = runtime
+	_ = image
+	if callback != nil {
+		callback(container.ImagePullReport{
+			Image:          image,
+			OverallPercent: 100,
+			Phase:          "complete",
+		})
+	}
+	return nil
+}
+
 func (m *GinMockContainerManager) ResetStorage(ctx context.Context, runtime container.PodmanRuntime) error {
 	_ = ctx
 	_ = runtime
@@ -1624,20 +1579,16 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
 
-	// Manually inject a service
-	// We can't use Reconcile easily because we don't have a backing app.
-	// But we can use AllocateForApp if we mock it, OR just manually register an app first.
-	// Let's use Install() for consistency
+	// RFC 20260130: listener name is the app identity
 	appDef := &api.AppDefinition{
-		Name:      "urltest",
 		Type:      "user",
-		Listeners: []api.AppListener{{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}},
+		Listeners: []api.AppListener{{Name: "urltest", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
 		Services: map[string]api.AppService{
 			"main": {Image: "alpine", BindPorts: []int{80}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	_, err := server.appManager.Install(context.Background(), appDef, "")
+	_, err := server.appManager.Install(context.Background(), appDef)
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}

@@ -220,9 +220,12 @@ type BackupTarget struct {
 
 // AppDefinition represents an app.yaml definition file
 type AppDefinition struct {
-	Name  string `yaml:"name" json:"name"`
-	Image string `yaml:"image,omitempty" json:"image,omitempty"`
-	Type  string `yaml:"type,omitempty" json:"type,omitempty"` // "system" or "user"
+	// WorkspaceName is required when listeners is empty (workspace mode without network services).
+	// Mutually exclusive with listeners - if listeners is non-empty, WorkspaceName must be empty.
+	// RFC 20260130: Unified App Identity Model
+	WorkspaceName string `yaml:"workspace_name,omitempty" json:"workspace_name,omitempty"`
+	Image         string `yaml:"image,omitempty" json:"image,omitempty"`
+	Type          string `yaml:"type,omitempty" json:"type,omitempty"` // "system" or "user"
 	// Inputs definition for dynamic configuration
 	Inputs map[string]AppInput `yaml:"inputs,omitempty" json:"inputs,omitempty"`
 	// Compose-style multi-container apps (service mode only)
@@ -247,7 +250,7 @@ type AppListener struct {
 	GuestPort   int                     `yaml:"guest_port" json:"guest_port"`
 	Flow        ListenerFlow            `yaml:"flow,omitempty" json:"flow,omitempty"`
 	Protocol    ListenerProtocol        `yaml:"protocol,omitempty" json:"protocol,omitempty"`
-	Primary     bool                    `yaml:"primary,omitempty" json:"primary,omitempty"` // Marks this as the primary HTTP/WS listener for host-based routing
+	Primary     bool                    `yaml:"primary,omitempty" json:"primary,omitempty"` // Set programmatically when __primary is substituted. RFC 20260130.
 	Middleware  []AppProtocolMiddleware `yaml:"protocol_middleware,omitempty" json:"protocol_middleware,omitempty"`
 	RemotePorts []int                   `yaml:"remote_ports,omitempty" json:"remote_ports,omitempty"`
 	Auth        *ListenerAuth           `yaml:"auth,omitempty" json:"auth,omitempty"`
