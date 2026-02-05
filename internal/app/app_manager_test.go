@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -285,8 +286,8 @@ func TestAppManager_Install(t *testing.T) {
 		t.Errorf("Expected first instance ID 'testapp', got %s", app.InstanceID)
 	}
 
-	if app.Status != "running" {
-		t.Errorf("Expected app status 'running', got %s", app.Status)
+	if app.Status != StatusRunning {
+		t.Errorf("Expected app status %q, got %s", StatusRunning, app.Status)
 	}
 
 	// Verify containers were created (network anchor + main service)
@@ -680,8 +681,8 @@ func TestAppManager_StartStop(t *testing.T) {
 		t.Fatalf("Failed to get app: %v", err)
 	}
 
-	if app.Status != "running" {
-		t.Errorf("Expected status 'running', got %s", app.Status)
+	if app.Status != StatusRunning {
+		t.Errorf("Expected status %q, got %s", StatusRunning, app.Status)
 	}
 
 	// Stop the app
@@ -707,8 +708,8 @@ func TestAppManager_StartStop(t *testing.T) {
 		t.Fatalf("Failed to get app: %v", err)
 	}
 
-	if app.Status != "stopped" {
-		t.Errorf("Expected status 'stopped', got %s", app.Status)
+	if app.Status != StatusStopped {
+		t.Errorf("Expected status %q, got %s", StatusStopped, app.Status)
 	}
 
 	// Test start/stop nonexistent app should fail
@@ -796,115 +797,6 @@ func TestAppManager_Uninstall(t *testing.T) {
 	}
 }
 
-// TestAppManager_EnableDisable tests systemctl-style enable/disable functionality
-func TestAppManager_EnableDisable(t *testing.T) {
-	// Create temporary directory for test
-	tempDir, err := os.MkdirTemp("", "fs_manager_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	// Create filesystem manager with mock container manager
-	mockContainer := NewMockContainerManager()
-	manager, err := NewAppManager(mockContainer, tempDir)
-	if err != nil {
-		t.Fatalf("Failed to create AppManager: %v", err)
-	}
-	allowHostStorage(t, manager)
-	manager.ForceLockState(false)
-
-	ctx := context.Background()
-
-	// Install an app
-	appDef := &api.AppDefinition{
-		Type:      "user",
-		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
-		Services: map[string]api.AppService{
-			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
-		},
-		Extensions: map[string]interface{}{"mode": "service"},
-	}
-	_, err = manager.Install(ctx, appDef)
-	if err != nil {
-		t.Fatalf("Failed to install app: %v", err)
-	}
-
-	// Initially app should not be enabled
-	enabled, err := manager.IsEnabled(ctx, "testapp")
-	if err != nil {
-		t.Fatalf("Failed to check if app is enabled: %v", err)
-	}
-
-	if enabled {
-		t.Error("App should not be enabled initially")
-	}
-
-	// Enable the app
-	err = manager.Enable(ctx, "testapp")
-	if err != nil {
-		t.Fatalf("Failed to enable app: %v", err)
-	}
-
-	// Verify app is now enabled
-	enabled, err = manager.IsEnabled(ctx, "testapp")
-	if err != nil {
-		t.Fatalf("Failed to check if app is enabled: %v", err)
-	}
-
-	if !enabled {
-		t.Error("App should be enabled after Enable()")
-	}
-
-	// Verify symlink was created
-	enabledPath := filepath.Join(tempDir, EnabledDir, "testapp")
-	if _, err := os.Lstat(enabledPath); err != nil {
-		t.Errorf("Enabled symlink was not created: %v", err)
-	}
-
-	// List enabled apps
-	enabledApps, err := manager.ListEnabled(ctx)
-	if err != nil {
-		t.Fatalf("Failed to list enabled apps: %v", err)
-	}
-
-	if len(enabledApps) != 1 || enabledApps[0] != "testapp" {
-		t.Errorf("Expected ['testapp'], got %v", enabledApps)
-	}
-
-	// Disable the app
-	err = manager.Disable(ctx, "testapp")
-	if err != nil {
-		t.Fatalf("Failed to disable app: %v", err)
-	}
-
-	// Verify app is now disabled
-	enabled, err = manager.IsEnabled(ctx, "testapp")
-	if err != nil {
-		t.Fatalf("Failed to check if app is enabled: %v", err)
-	}
-
-	if enabled {
-		t.Error("App should be disabled after Disable()")
-	}
-
-	// Verify symlink was removed
-	if _, err := os.Lstat(enabledPath); !os.IsNotExist(err) {
-		t.Error("Enabled symlink was not removed")
-	}
-
-	// Test enable/disable nonexistent app should fail
-	err = manager.Enable(ctx, "nonexistent")
-	if err == nil {
-		t.Error("Expected error when enabling nonexistent app")
-	}
-
-	err = manager.Disable(ctx, "nonexistent")
-	if err == nil {
-		t.Error("Expected error when disabling nonexistent app")
-	}
-}
-
 // TestAppManager_PersistenceAcrossRestarts tests that state persists across manager restarts
 func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 	// Create temporary directory for test
@@ -944,11 +836,6 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 	_, err = manager1.Install(ctx, appDef)
 	if err != nil {
 		t.Fatalf("Failed to install app: %v", err)
-	}
-
-	err = manager1.Enable(ctx, "persistentapp")
-	if err != nil {
-		t.Fatalf("Failed to enable app: %v", err)
 	}
 
 	err = manager1.Start(ctx, "persistentapp")
@@ -997,8 +884,14 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 		t.Errorf("Expected image 'nginx:alpine', got %s", app2.Image())
 	}
 
-	if app2.Status != "running" {
-		t.Errorf("Expected status 'running', got %s", app2.Status)
+	// After restart, enabled apps show StatusStarting until reconciler confirms StatusRunning
+	if app2.Status != StatusStarting {
+		t.Errorf("Expected status %q after restart (before reconcile), got %s", StatusStarting, app2.Status)
+	}
+
+	// Verify Enabled flag persisted
+	if !app2.Enabled {
+		t.Error("Enabled state was not preserved across restart")
 	}
 
 	if app2.Definition.Services["main"].Environment["TEST_VAR"] != "persistent-value" {
@@ -1007,16 +900,6 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 
 	if !app2.CreatedAt.Equal(installTime) {
 		t.Errorf("Created time not preserved across restart")
-	}
-
-	// Verify enabled state persisted
-	enabled, err := manager2.IsEnabled(ctx, "persistentapp")
-	if err != nil {
-		t.Fatalf("Failed to check enabled state: %v", err)
-	}
-
-	if !enabled {
-		t.Error("Enabled state was not preserved across restart")
 	}
 }
 
@@ -1110,8 +993,8 @@ func TestAppManager_ReconcileOnceStartsDesiredRunningApps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if inst.Status != "running" {
-		t.Fatalf("expected status running after reconcile, got %s", inst.Status)
+	if inst.Status != StatusRunning {
+		t.Fatalf("expected status %q after reconcile, got %s", StatusRunning, inst.Status)
 	}
 	if inst.PrimaryContainerID() == "" {
 		t.Fatalf("expected container id after reconcile")
@@ -1154,18 +1037,19 @@ func TestAppManager_ReconcileOnceStopsDesiredStoppedApps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("state: %v", err)
 	}
-	// Force desired stopped without stopping the container to simulate drift.
-	if err := state.UpdateAppStatus("demo", "stopped"); err != nil {
-		t.Fatalf("update status: %v", err)
+	// Force desired stopped (Enabled=false) without stopping the container to simulate drift.
+	if err := state.UpdateAppEnabled("demo", false); err != nil {
+		t.Fatalf("update enabled: %v", err)
 	}
+	mgr.setObservedStatus("demo", StatusStopped)
 
 	mgr.ReconcileOnce(context.Background())
 	inst, err := mgr.Get(context.Background(), "demo")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if inst.Status != "stopped" {
-		t.Fatalf("expected status stopped, got %s", inst.Status)
+	if inst.Status != StatusStopped {
+		t.Fatalf("expected status %q, got %s", StatusStopped, inst.Status)
 	}
 	if c := mock.containers[inst.PrimaryContainerID()]; c == nil || c.Status != "stopped" {
 		t.Fatalf("expected container to be stopped after reconcile")
@@ -1204,7 +1088,9 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	// Simulate follower transition: stop container without changing app status.
+	// Simulate follower transition: stop container.
+	// The stopForFollowerTransition helper stops containers without updating observed status,
+	// since the caller (leadership handler) typically updates status separately.
 	if err := mgr.stopForFollowerTransition(context.Background(), "demo"); err != nil {
 		t.Fatalf("follower stop: %v", err)
 	}
@@ -1213,9 +1099,8 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if inst.Status != "running" {
-		t.Fatalf("expected status to remain running, got %s", inst.Status)
-	}
+	// After stopForFollowerTransition, observed status may still be "running" (not updated yet).
+	// The key check is that the container is stopped.
 	if c := mock.containers[inst.PrimaryContainerID()]; c == nil || c.Status != "stopped" {
 		t.Fatalf("expected container to be stopped after follower transition")
 	}
@@ -1225,13 +1110,20 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 	mgr.leadershipState[cluster.ResourceForApp("demo")] = cluster.RoleFollower
 	mgr.leadershipMu.Unlock()
 
+	// Run reconcile - it will see containers stopped and set observed status to "stopped".
+	// Per the ideology: observed status reflects local container state.
 	mgr.ReconcileOnce(context.Background())
 	updated, err := mgr.Get(context.Background(), "demo")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if updated.Status != "running" {
-		t.Fatalf("expected status to remain running, got %s", updated.Status)
+	// Observed status reflects local state: container is stopped on this machine.
+	if updated.Status != StatusStopped {
+		t.Fatalf("expected observed status stopped, got %s", updated.Status)
+	}
+	// Enabled remains true - user intent is preserved for when this node becomes leader.
+	if !updated.Enabled {
+		t.Fatalf("expected Enabled to remain true")
 	}
 	if c := mock.containers[updated.PrimaryContainerID()]; c == nil || c.Status != "stopped" {
 		t.Fatalf("expected container to remain stopped on follower after reconcile")
@@ -1274,7 +1166,7 @@ func TestAppManager_ReconcileOnceResolvesStaleContainerID(t *testing.T) {
 		t.Fatalf("state: %v", err)
 	}
 	stale := generateMockContainerID(9)
-	if err := state.UpdateAppRuntime("demo", inst.Status, stale); err != nil {
+	if err := state.UpdateAppRuntime("demo", stale); err != nil {
 		t.Fatalf("update runtime: %v", err)
 	}
 
@@ -1326,8 +1218,8 @@ func TestAppManager_StopAllApps_Basic(t *testing.T) {
 		t.Fatalf("expected 3 apps, got %d", len(apps))
 	}
 	for _, app := range apps {
-		if app.Status != "running" {
-			t.Fatalf("expected app %s to be running, got %s", app.InstanceID, app.Status)
+		if app.Status != StatusRunning {
+			t.Fatalf("expected app %s to be %q, got %s", app.InstanceID, StatusRunning, app.Status)
 		}
 	}
 
@@ -1392,11 +1284,11 @@ func TestAppManager_StopAllApps_SkipsNonRunningApps(t *testing.T) {
 	// Verify states
 	runningApp, _ := mgr.Get(ctx, "runningapp")
 	stoppedApp, _ := mgr.Get(ctx, "stoppedapp")
-	if runningApp.Status != "running" {
-		t.Fatalf("expected runningapp to be running")
+	if runningApp.Status != StatusRunning {
+		t.Fatalf("expected runningapp to be %q", StatusRunning)
 	}
-	if stoppedApp.Status != "stopped" {
-		t.Fatalf("expected stoppedapp to be stopped")
+	if stoppedApp.Status != StatusStopped {
+		t.Fatalf("expected stoppedapp to be %q", StatusStopped)
 	}
 
 	// Call StopAllApps - should only stop the running app
@@ -1628,5 +1520,76 @@ func TestAppManager_StopAllApps_StateManagerNotInitialized(t *testing.T) {
 	// Call StopAllApps - should return nil (skip gracefully)
 	if err := mgr.StopAllApps(context.Background()); err != nil {
 		t.Fatalf("StopAllApps with nil state manager should succeed, got: %v", err)
+	}
+}
+
+// TestAppManager_MetadataMigration tests that legacy metadata.json with Status field
+// is properly migrated to the new Enabled field.
+func TestAppManager_MetadataMigration(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	paths.SetRootForTest(tempDir)
+	t.Cleanup(func() { paths.SetRootForTest("") })
+
+	appsDir := filepath.Join(tempDir, AppsDir)
+	_ = os.MkdirAll(appsDir, 0o755)
+	cacheDir := filepath.Join(tempDir, CacheDir)
+	_ = os.MkdirAll(cacheDir, 0o755)
+
+	// Write legacy metadata.json with Status field (no Enabled field)
+	for _, tc := range []struct {
+		instanceID      string
+		legacyStatus    string
+		expectedEnabled bool
+	}{
+		{"runningapp", "running", true},
+		{"stoppedapp", "stopped", false},
+		{"startingapp", "starting", true},
+		{"errorapp", "error", true},
+	} {
+		appDir := filepath.Join(appsDir, tc.instanceID)
+		_ = os.MkdirAll(appDir, 0o755)
+
+		// Write minimal valid app.yaml
+		appYAML := "listeners:\n  - name: __primary\n    guest_port: 80\nservices:\n  main:\n    image: alpine:latest\n    bind_ports: [80]\nx-piccolo:\n  mode: service\n"
+		_ = os.WriteFile(filepath.Join(appDir, "app.yaml"), []byte(appYAML), 0o644)
+
+		// Write legacy metadata.json (has "status", no "enabled")
+		legacyMeta := map[string]interface{}{
+			"instance_id": tc.instanceID,
+			"status":      tc.legacyStatus,
+			"created_at":  time.Now(),
+			"updated_at":  time.Now(),
+		}
+		data, _ := json.MarshalIndent(legacyMeta, "", "  ")
+		_ = os.WriteFile(filepath.Join(appDir, "metadata.json"), data, 0o644)
+	}
+
+	// Create state manager which triggers migration via loadCache
+	stateMgr, err := NewFilesystemStateManager(tempDir)
+	if err != nil {
+		t.Fatalf("NewFilesystemStateManager: %v", err)
+	}
+
+	for _, tc := range []struct {
+		instanceID      string
+		expectedEnabled bool
+	}{
+		{"runningapp", true},
+		{"stoppedapp", false},
+		{"startingapp", true},
+		{"errorapp", true},
+	} {
+		app, exists := stateMgr.GetApp(tc.instanceID)
+		if !exists {
+			t.Fatalf("expected app %s to exist after migration", tc.instanceID)
+		}
+		if app.Enabled != tc.expectedEnabled {
+			t.Errorf("app %s: expected Enabled=%v, got %v", tc.instanceID, tc.expectedEnabled, app.Enabled)
+		}
+		// Status should not be populated from disk (it's an observed-only field now)
+		if app.Status != "" {
+			t.Errorf("app %s: expected Status empty from disk, got %q", tc.instanceID, app.Status)
+		}
 	}
 }

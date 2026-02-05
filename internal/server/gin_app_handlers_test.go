@@ -1195,8 +1195,14 @@ started:
 					continue
 				}
 				app, _ := srv.appManager.Get(context.Background(), "blog")
-				if app.Status == "stopped" {
-					t.Fatalf("expected desired status to remain running after follower transition, got %v", app.Status)
+				// Per intent vs observed state ideology:
+				// - Status reflects local container state (stopped on this machine)
+				// - Enabled reflects user intent (remains true for restart when becoming leader)
+				if app.Status != "stopped" {
+					t.Fatalf("expected observed status to be stopped after follower transition, got %v", app.Status)
+				}
+				if !app.Enabled {
+					t.Fatalf("expected Enabled intent to remain true after follower transition")
 				}
 				return
 			}

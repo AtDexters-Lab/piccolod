@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -54,7 +53,7 @@ func setupTestAppManager(t *testing.T, existingApps map[string]*api.AppDefinitio
 			}
 			inst := &AppInstance{
 				InstanceID: id,
-				Status:     "running",
+				Enabled:    true,
 				CreatedAt:  time.Now(),
 				UpdatedAt:  time.Now(),
 				Definition: def,
@@ -62,11 +61,6 @@ func setupTestAppManager(t *testing.T, existingApps map[string]*api.AppDefinitio
 			if err := state.StoreApp(inst); err != nil {
 				t.Fatalf("StoreApp(%s): %v", id, err)
 			}
-			// Also enable the app (create symlink in enabled dir).
-			enabledDir := filepath.Join(tempDir, EnabledDir)
-			_ = os.MkdirAll(enabledDir, 0o755)
-			appDir := filepath.Join(tempDir, AppsDir, id)
-			_ = os.Symlink(appDir, filepath.Join(enabledDir, id))
 		}
 	}
 

@@ -12,6 +12,32 @@ import (
 	"piccolod/internal/container"
 )
 
+// App status constants represent the observed runtime state of an application.
+//
+// Design: Intent vs Observed State
+//
+// This package separates two concepts:
+//
+//  1. Intent (Enabled bool) - Persisted in metadata.json. Answers: "Should this app run?"
+//     - Enabled=true: User wants the app running (will auto-start on boot/leader election)
+//     - Enabled=false: User explicitly stopped the app (stays stopped)
+//
+//  2. Observed Status (in-memory map) - Never persisted. Answers: "What is the app doing now?"
+//     - Reflects local container state on this machine
+//     - Published via event bus for real-time UI updates
+//     - Returned in API responses
+//
+// Reconciliation logic:
+// The reconciler starts/stops containers based on BOTH Enabled AND leadership:
+//   - desiredRunning = Enabled && (isLeaderForApp)
+// This ensures containers only run on the leader node while preserving user intent across failovers.
+const (
+	StatusRunning  = "running"  // Containers are running and healthy
+	StatusStopped  = "stopped"  // Containers are stopped locally (Enabled may still be true on follower nodes)
+	StatusStarting = "starting" // Containers are being started or recovering
+	StatusError    = "error"    // Startup failed after escalation threshold
+)
+
 // ContainerManager describes the container runtime operations required by the app manager.
 type ContainerManager interface {
 	CreateContainer(ctx context.Context, runtime container.PodmanRuntime, spec container.ContainerCreateSpec) (string, error)
@@ -50,7 +76,8 @@ type ContainerManager interface {
 // Definition contains the full app manifest (image, type, listeners, extensions, etc).
 type AppInstance struct {
 	InstanceID string `json:"instance_id"`
-	Status     string `json:"status"`
+	Enabled    bool   `json:"enabled"`
+	Status     string `json:"status"` // observed runtime status, not persisted
 	// Container runtime metadata.
 	PrimaryService  string            `json:"primary_service,omitempty"`
 	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`

@@ -331,7 +331,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	now := time.Now()
 	return &AppInstance{
 		InstanceID:      instanceID,
-		Status:          "running",
+		Enabled:         true,
 		PrimaryService:  primary,
 		NetworkAnchorID: anchorID,
 		Containers:      containers,
