@@ -297,6 +297,7 @@ type ServiceOIDCClient struct {
 // AppService defines a single container within a compose-style app (service mode).
 type AppService struct {
 	Image       string             `yaml:"image" json:"image"`
+	Init        string             `yaml:"init,omitempty" json:"init,omitempty"`
 	After       []string           `yaml:"after,omitempty" json:"after,omitempty"`
 	BindPorts   []int              `yaml:"bind_ports" json:"bind_ports"`
 	Environment map[string]string  `yaml:"environment,omitempty" json:"environment,omitempty"`

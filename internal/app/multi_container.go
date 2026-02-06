@@ -130,31 +130,37 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		spec.WorkingDir = opts.workspaceMeta.ImageConfig.WorkingDir
 		spec.User = opts.workspaceMeta.ImageConfig.User
 
-		// Wrap entrypoint with boot.sh
-		originalCmd := opts.workspaceMeta.ImageConfig.BuildOriginalCommand()
-		spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-		spec.Command = originalCmd
-		spec.UseInit = true
+		if svc.Init == "image" {
+			// Image manages its own init (e.g., s6-overlay). Let it be PID 1.
+			spec.Entrypoint = opts.workspaceMeta.ImageConfig.Entrypoint
+			spec.Command = opts.workspaceMeta.ImageConfig.Cmd
+		} else {
+			// Default: Piccolo manages init via catatonit + boot.sh wrapper
+			originalCmd := opts.workspaceMeta.ImageConfig.BuildOriginalCommand()
+			spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+			spec.Command = originalCmd
+			spec.UseInit = true
 
-		// Ensure workspace assets (boot.sh, piccolo-startup) exist on host filesystem
-		if err := EnsureWorkspaceAssets(); err != nil {
-			return container.ContainerCreateSpec{}, fmt.Errorf("failed to ensure workspace assets: %w", err)
+			// Ensure workspace assets (boot.sh, piccolo-startup) exist on host filesystem
+			if err := EnsureWorkspaceAssets(); err != nil {
+				return container.ContainerCreateSpec{}, fmt.Errorf("failed to ensure workspace assets: %w", err)
+			}
+
+			// Mount boot.sh as read-only into the container
+			// Use :z for SELinux shared label (required for rootless podman on SELinux systems)
+			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
+				Host:      BootShHostPath(),
+				Container: "/piccolo/boot.sh",
+				Options:   "ro,z",
+			})
+
+			// Mount piccolo-startup helper to /usr/local/bin (which is in PATH by default)
+			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
+				Host:      PiccoloStartupHostPath(),
+				Container: "/usr/local/bin/piccolo-startup",
+				Options:   "ro,z",
+			})
 		}
-
-		// Mount boot.sh as read-only into the container
-		// Use :z for SELinux shared label (required for rootless podman on SELinux systems)
-		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-			Host:      BootShHostPath(),
-			Container: "/piccolo/boot.sh",
-			Options:   "ro,z",
-		})
-
-		// Mount piccolo-startup helper to /usr/local/bin (which is in PATH by default)
-		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-			Host:      PiccoloStartupHostPath(),
-			Container: "/usr/local/bin/piccolo-startup",
-			Options:   "ro,z",
-		})
 
 		// Mount a writable config directory for user startup hooks (start.sh)
 		// This directory is persistent and writable by the container user.

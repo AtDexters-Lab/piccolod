@@ -1080,10 +1080,15 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 			spec.WorkingDir = workspaceMeta.ImageConfig.WorkingDir
 			spec.User = workspaceMeta.ImageConfig.User
 
-			// Use boot.sh entrypoint with original command
-			originalCmd := workspaceMeta.ImageConfig.BuildOriginalCommand()
-			spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-			spec.Command = originalCmd
+			if primarySvcInit(def) == "image" {
+				// Image manages its own init — set entrypoint/cmd from image config directly
+				spec.Entrypoint = workspaceMeta.ImageConfig.Entrypoint
+				spec.Command = workspaceMeta.ImageConfig.Cmd
+			} else {
+				originalCmd := workspaceMeta.ImageConfig.BuildOriginalCommand()
+				spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+				spec.Command = originalCmd
+			}
 		}
 
 		cid, err := m.containerManager.CreateContainer(ctx, runtime, spec)
@@ -1985,10 +1990,14 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			spec.WorkingDir = meta.ImageConfig.WorkingDir
 			spec.User = meta.ImageConfig.User
 
-			// Use entrypoint from saved metadata
-			originalCmd := meta.ImageConfig.BuildOriginalCommand()
-			spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-			spec.Command = originalCmd
+			if primarySvcInit(&newDef) == "image" {
+				spec.Entrypoint = meta.ImageConfig.Entrypoint
+				spec.Command = meta.ImageConfig.Cmd
+			} else {
+				originalCmd := meta.ImageConfig.BuildOriginalCommand()
+				spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+				spec.Command = originalCmd
+			}
 
 			newCID, err = m.containerManager.CreateContainer(ctx, runtime, spec)
 		}
@@ -2023,8 +2032,13 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			rbSpec.Environment = mergeEnvMaps(parseEnvSlice(meta.ImageConfig.Env), rbSpec.Environment)
 			rbSpec.WorkingDir = meta.ImageConfig.WorkingDir
 			rbSpec.User = meta.ImageConfig.User
-			rbSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-			rbSpec.Command = meta.ImageConfig.BuildOriginalCommand()
+			if primarySvcInit(curDef) == "image" {
+				rbSpec.Entrypoint = meta.ImageConfig.Entrypoint
+				rbSpec.Command = meta.ImageConfig.Cmd
+			} else {
+				rbSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+				rbSpec.Command = meta.ImageConfig.BuildOriginalCommand()
+			}
 
 			// 3. Create old container
 			rbCID, rbErr := m.containerManager.CreateContainer(ctx, runtime, rbSpec)
@@ -2316,6 +2330,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	}
 	def := appDef
 	var oidcClient *api.ServiceOIDCClient
+	var svcInit string
 	if piccoloModeFromExtensions(appDef.Extensions) == ModeWorkspace && appDef.Services != nil {
 		primary := primaryServiceFor(appDef, nil)
 		if primary == "" {
@@ -2326,6 +2341,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 			return container.ContainerCreateSpec{}, fmt.Errorf("primary service '%s' not found", primary)
 		}
 		oidcClient = svc.OIDCClient
+		svcInit = svc.Init
 		derived := *appDef
 		derived.Image = svc.Image
 		derived.Environment = svc.Environment
@@ -2383,33 +2399,37 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	// Workspace mode: enable init and mount boot.sh wrapper
 	mode := piccoloModeFromExtensions(appDef.Extensions)
 	if mode == ModeWorkspace {
-		// Use --init for proper PID 1 signal handling and zombie reaping
-		spec.UseInit = true
+		if svcInit == "image" {
+			// Image manages its own init (e.g., s6-overlay). No --init or boot.sh.
+		} else {
+			// Default: Piccolo manages init via catatonit + boot.sh wrapper
+			spec.UseInit = true
 
-		// Ensure workspace assets exist on host filesystem
-		if err := EnsureWorkspaceAssets(); err != nil {
-			return spec, fmt.Errorf("failed to ensure workspace assets: %w", err)
+			// Ensure workspace assets exist on host filesystem
+			if err := EnsureWorkspaceAssets(); err != nil {
+				return spec, fmt.Errorf("failed to ensure workspace assets: %w", err)
+			}
+
+			// Mount boot.sh as read-only into the container
+			// Use :z for SELinux shared label (required for rootless podman on SELinux systems)
+			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
+				Host:      BootShHostPath(),
+				Container: "/piccolo/boot.sh",
+				Options:   "ro,z",
+			})
+
+			// Mount piccolo-startup helper to /usr/local/bin (which is in PATH by default)
+			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
+				Host:      PiccoloStartupHostPath(),
+				Container: "/usr/local/bin/piccolo-startup",
+				Options:   "ro,z",
+			})
 		}
-
-		// Mount boot.sh as read-only into the container
-		// Use :z for SELinux shared label (required for rootless podman on SELinux systems)
-		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-			Host:      BootShHostPath(),
-			Container: "/piccolo/boot.sh",
-			Options:   "ro,z",
-		})
-
-		// Mount piccolo-startup helper to /usr/local/bin (which is in PATH by default)
-		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-			Host:      PiccoloStartupHostPath(),
-			Container: "/usr/local/bin/piccolo-startup",
-			Options:   "ro,z",
-		})
 
 		// Mount a writable config directory for user startup hooks (start.sh)
 		// This directory is persistent and writable by the container user
 		configDir := filepath.Join(layout.DataDir, "piccolo-config")
-		if err := os.MkdirAll(configDir, 0o777); err != nil {
+		if err := os.MkdirAll(configDir, 0o755); err != nil {
 			return spec, fmt.Errorf("failed to create piccolo config dir: %w", err)
 		}
 		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
@@ -2468,6 +2488,19 @@ func (m *AppManager) applyOIDCClientInjection(spec *container.ContainerCreateSpe
 			log.Printf("WARN: failed to resolve host gateway for piccolo.local: %v", err)
 		}
 	}
+}
+
+// primarySvcInit returns the Init field of the primary service for the given definition.
+// Returns "" if no primary service or services map is nil.
+func primarySvcInit(def *api.AppDefinition) string {
+	if def == nil || def.Services == nil {
+		return ""
+	}
+	primary := primaryServiceFor(def, nil)
+	if svc, ok := def.Services[primary]; ok {
+		return svc.Init
+	}
+	return ""
 }
 
 // buildOriginalCommand constructs the original container command from image config.
