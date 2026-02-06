@@ -143,6 +143,7 @@ type BootMode string
 const (
     BootModeInternal BootMode = "internal"  // Booted from internal disk (sata, nvme, ata)
     BootModeUSB      BootMode = "usb"       // Booted from USB drive
+    BootModeUnknown  BootMode = "unknown"   // Ambiguous transport (virtio, iSCSI, some RAID)
 )
 
 func DetectBootMode(ctx context.Context) (BootMode, error) {
@@ -156,16 +157,27 @@ func DetectBootMode(ctx context.Context) (BootMode, error) {
     disk := getParentDisk(rootDev)  // e.g., /dev/sda
 
     // Use lsblk to get transport type (more reliable than /sys/block/*/removable)
-    // TRAN values: usb, sata, nvme, ata, etc.
+    // TRAN values: usb, sata, nvme, ata, mmc, etc.
     transport, err := getTransportType(ctx, disk)
     if err != nil {
         return "", err
     }
 
-    if transport == "usb" {
+    switch transport {
+    case "usb":
         return BootModeUSB, nil
+    case "sata", "nvme", "ata", "mmc":
+        // mmc = eMMC / SD card (e.g., Raspberry Pi) — treated as internal storage
+        // because on devices where eMMC/SD is the primary boot medium, it is
+        // functionally equivalent to internal storage.
+        return BootModeInternal, nil
+    default:
+        // Empty or unrecognized transport (virtio, iSCSI, some RAID controllers).
+        // Treated as unknown — follows the onboarding flow so the user confirms
+        // before any partition writes occur. This is safer than auto-running disk
+        // prep on an ambiguous device.
+        return BootModeUnknown, nil
     }
-    return BootModeInternal, nil
 }
 
 func getTransportType(ctx context.Context, disk string) (string, error) {
@@ -174,17 +186,7 @@ func getTransportType(ctx context.Context, disk string) (string, error) {
     if err != nil {
         return "", fmt.Errorf("failed to get transport type: %w", err)
     }
-    transport := strings.TrimSpace(string(output))
-
-    // Fallback: empty TRAN can happen with virtio (VMs) or some RAID controllers
-    if transport == "" {
-        // Log warning and assume internal boot (safer default)
-        slog.Warn("lsblk returned empty transport type, assuming internal boot",
-            "disk", disk)
-        return "internal", nil  // Treat as internal, not USB
-    }
-
-    return transport, nil
+    return strings.TrimSpace(string(output)), nil
 }
 ```
 
@@ -195,7 +197,16 @@ func getTransportType(ctx context.Context, disk string) (string, error) {
 | `/sys/block/*/removable` | USB HDDs/SSDs report `0` (non-removable) |
 | `lsblk -o TRAN` | Reliably shows `usb` for all USB-connected devices |
 
-**Fallback behavior:** If `lsblk` returns an empty transport type (can happen with virtio in VMs or some RAID controllers), assume internal boot. This is the safer default - incorrectly treating a USB boot as internal just skips the onboarding UI, whereas incorrectly treating internal as USB would show unnecessary prompts.
+**Transport classification:**
+
+| TRAN value | Boot mode | Rationale |
+|------------|-----------|-----------|
+| `usb` | USB | USB-connected device; show onboarding flow |
+| `sata`, `nvme`, `ata` | Internal | Standard internal storage transports |
+| `mmc` | Internal | eMMC/SD (RPi primary boot medium); functionally internal |
+| Empty or unrecognized | Unknown | Ambiguous (virtio, iSCSI, some RAID); show onboarding flow so user confirms before partition writes |
+
+**Unknown mode behavior:** `BootModeUnknown` follows the same flow as `BootModeUSB` — it shows the onboarding UI and requires explicit user confirmation before any disk prep runs. This is safer than auto-running partition writes on ambiguous hardware. VM users (the primary case for empty TRAN) are expected to be hands-on and will simply click "Try Piccolo" to proceed.
 
 ### 4.2 Boot Flow by Mode
 
@@ -214,13 +225,18 @@ func getTransportType(ctx context.Context, disk string) (string, error) {
 │       │               ├── YES → RunDiskPrep() → Continue            │
 │       │               └── NO  → Continue                            │
 │       │                                                             │
-│       └── USB BOOT ─────────────────────────────────────────────→   │
+│       ├── USB BOOT ─────────────────────────────────────────────→   │
+│       │       │                                                     │
+│       │       └── IsFirstBoot()?                                    │
+│       │               ├── YES → ShowOnboardingFlow()                │
+│       │               │           ├── "Install to Disk" → InstallToDisk() │
+│       │               │           └── "Try Piccolo" → RunDiskPrep()    │
+│       │               └── NO  → Continue (already set up)           │
+│       │                                                             │
+│       └── UNKNOWN BOOT ─────────────────────────────────────────→   │
 │               │                                                     │
-│               └── IsFirstBoot()?                                    │
-│                       ├── YES → ShowOnboardingFlow()                │
-│                       │           ├── "Install to Disk" → InstallToDisk() │
-│                       │           └── "Try Piccolo" → RunDiskPrep()    │
-│                       └── NO  → Continue (already set up)           │
+│               └── Same as USB BOOT (onboarding flow required)       │
+│                   No disk prep until user explicitly confirms        │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -479,7 +495,22 @@ func (p *Preparer) getLastPartitionEnd(ctx context.Context, disk string) (sector
 | 2 | Root btrfs | KIWI |
 | 3+ | `/piccolo-data` | piccolod (detected dynamically) |
 
-### 5.6 Idempotent Operations
+### 5.6 Partition Device Path Helper
+
+Linux block device naming varies by transport: `/dev/sda3` (SCSI/SATA), `/dev/nvme0n1p3` (NVMe), `/dev/mmcblk0p3` (eMMC/SD). The rule is: if the disk path ends with a digit, a `p` separator is inserted before the partition number.
+
+```go
+// partitionDevicePath returns the device node for a partition on a disk.
+// Handles all naming conventions: sda→sda3, nvme0n1→nvme0n1p3, mmcblk0→mmcblk0p3.
+func partitionDevicePath(disk string, slot int) string {
+    if disk[len(disk)-1] >= '0' && disk[len(disk)-1] <= '9' {
+        return fmt.Sprintf("%sp%d", disk, slot) // nvme, mmcblk, loop
+    }
+    return fmt.Sprintf("%s%d", disk, slot) // sda, vda
+}
+```
+
+### 5.7 Idempotent Operations
 
 All disk prep operations must be idempotent to support repeated execution on every boot.
 
@@ -522,18 +553,24 @@ func (p *Preparer) getRootPartitionStart(ctx context.Context, disk, rootDev stri
 
 // reloadPartitionTable attempts partprobe, falling back to partx --add
 // for kernels that refuse a full partition table re-read on a busy root disk.
-func (p *Preparer) reloadPartitionTable(ctx context.Context, disk string) error {
+// The slot parameter narrows the partx fallback to the specific partition that
+// was just created, avoiding unnecessary re-reads of other partition entries.
+func (p *Preparer) reloadPartitionTable(ctx context.Context, disk string, slot int) error {
     // Try partprobe first (standard, reloads entire table)
     if err := p.runner.Run(ctx, "partprobe", disk); err == nil {
         return nil
     }
 
-    p.logger.Warn("partprobe failed on busy disk, trying partx --add fallback", "disk", disk)
+    p.logger.Warn("partprobe failed on busy disk, trying partx --add fallback",
+        "disk", disk, "slot", slot)
 
     // Fallback: partx --add scans for new partitions without a full re-read.
-    // This works even when the kernel refuses to re-read the table of a mounted disk.
-    if err := p.runner.Run(ctx, "partx", "--add", "--nr", ":-1", disk); err != nil {
-        return fmt.Errorf("both partprobe and partx --add failed: %w", err)
+    // Narrow to the exact slot that was just created (--nr N:N) rather than
+    // scanning all partitions (--nr :-1), which risks confusing the kernel
+    // if other partition entries are in flux.
+    slotStr := fmt.Sprintf("%d:%d", slot, slot)
+    if err := p.runner.Run(ctx, "partx", "--add", "--nr", slotStr, disk); err != nil {
+        return fmt.Errorf("both partprobe and partx --add failed for slot %d: %w", slot, err)
     }
 
     return nil
@@ -609,6 +646,12 @@ func (p *Preparer) CreateDataPartition(ctx context.Context) error {
     rootTargetSectors := (int64(layout.RootGB) * 1024 * 1024 * 1024) / sectorSize
     startSector := rootStartSector + rootTargetSectors
 
+    // Align to 1 MiB boundary (2048 sectors for 512-byte, 256 for 4096-byte).
+    // sgdisk aligns partitions by default; we must match to avoid the boundary
+    // shifting silently and weakening the growpart bound.
+    alignSectors := int64(1024 * 1024 / sectorSize) // 1 MiB in sectors
+    startSector = ((startSector + alignSectors - 1) / alignSectors) * alignSectors
+
     slot, err := p.findNextPartitionSlot(ctx, disk)
     if err != nil {
         return err
@@ -628,17 +671,14 @@ func (p *Preparer) CreateDataPartition(ctx context.Context) error {
     // Reload partition table — MUST succeed.
     // If the kernel doesn't see the new data partition, growpart on root
     // will expand into unbounded free space, defeating the boundary mechanism.
-    if err := p.reloadPartitionTable(ctx, disk); err != nil {
+    if err := p.reloadPartitionTable(ctx, disk, slot); err != nil {
         return fmt.Errorf("kernel cannot see new data partition (boundary unsafe): %w", err)
     }
 
     // CRITICAL: Verify the kernel actually registered the new partition.
     // partprobe/partx returning success does not guarantee the device node exists.
     // If we proceed to growpart without this check, root could expand unbounded.
-    partDev := fmt.Sprintf("%s%d", disk, slot) // e.g., /dev/sda3
-    if strings.Contains(disk, "nvme") || strings.Contains(disk, "loop") {
-        partDev = fmt.Sprintf("%sp%d", disk, slot) // e.g., /dev/nvme0n1p3
-    }
+    partDev := partitionDevicePath(disk, slot)
     for attempt := 0; attempt < 10; attempt++ {
         if _, err := os.Stat(partDev); err == nil {
             break // Kernel sees the partition
@@ -918,13 +958,21 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
     // If none succeeded, the ephemeral keyfile is about to be zeroed
     // and the LUKS device would become permanently locked.
     if !keyfileStored && !adminRecoveryOK && !mnemonicRecoveryOK {
-        // CRITICAL: Do NOT clean up the ephemeral keyfile — it is the ONLY way
-        // to unlock this device. Leave it in /run/piccolo/ so an operator can
-        // manually recover (e.g., cryptsetup luksAddKey) before rebooting.
+        // All three persistent unlock paths failed. The LUKS device has been
+        // formatted but has no durable keyslot — it will become permanently
+        // locked after reboot (the ephemeral keyfile lives in tmpfs).
+        //
+        // Recovery: this is a REFLASH scenario. The user must re-flash the
+        // OS image and start fresh. No user data has been written to the LUKS
+        // device at this point (it was just formatted), so nothing is lost.
+        //
+        // We still preserve the ephemeral keyfile so the current boot session
+        // can continue diagnostics, but do NOT guide the user toward manual
+        // cryptsetup commands (Piccolo has no SSH access by design).
         keyfileCleanedUp = true // prevent deferred cleanup
         return fmt.Errorf("LUKS formatted but no persistent unlock path: " +
             "keyfile storage, admin recovery, and mnemonic recovery all failed; " +
-            "ephemeral keyfile preserved at %s — add a keyslot manually before rebooting", keyfilePath)
+            "recovery requires re-flashing the OS image and restarting setup")
     }
 
     if !keyfileStored {
@@ -1522,6 +1570,8 @@ Install to Disk is a **v1 requirement** (see product acceptance criteria in `org
 **Implementation note (expected approach):**
 - Use `btrfs send | btrfs receive` to sync the live root filesystem to the target disk (matching the PRD), then apply the same disk-prep posture on the target disk (root sizing + `/piccolo-data` creation + LUKS2 init).
 
+**Failure and retry:** Install to Disk writes to the internal disk only — it does not modify the boot USB. If the install fails (power loss, I/O error), the USB boot environment remains fully functional. On retry, the installer must detect partial writes on the target disk (e.g., GPT present but no valid btrfs, or btrfs present but incomplete snapshot) and offer to wipe and restart rather than attempting to resume from an unknown state.
+
 ## 10. Component Changes
 
 ### 10.1 New Package: `internal/storage`
@@ -1559,6 +1609,27 @@ func (m *Manager) OnRecoveryMnemonicRotated(ctx context.Context, oldMnemonicKey,
 ```
 
 ### 10.2 New Package: `internal/storage/diskprep`
+
+**`CommandRunner` interface (shared across storage packages):**
+
+All CLI operations (`sgdisk`, `cryptsetup`, `btrfs`, etc.) are routed through a `CommandRunner` interface to enable unit testing with mock commands. The interface mirrors the existing `commandRunner` in `internal/persistence/file_volume_manager.go`.
+
+```go
+// CommandRunner abstracts CLI execution for testability.
+// Production: wraps exec.CommandContext.
+// Tests: returns canned outputs / errors per command.
+type CommandRunner interface {
+    // Run executes a command with the given arguments and optional stdin.
+    // Returns the combined stdout/stderr output and any error.
+    Run(ctx context.Context, name string, args ...string) error
+
+    // RunWithOutput executes a command and returns stdout.
+    RunWithOutput(ctx context.Context, name string, args ...string) ([]byte, error)
+
+    // RunWithStdin executes a command with stdin data (e.g., keyfile piping).
+    RunWithStdin(ctx context.Context, stdin []byte, name string, args ...string) error
+}
+```
 
 ```go
 package diskprep
@@ -1609,11 +1680,13 @@ func NewGinServer() (*GinServer, error) {
     // Check disk state
     diskState, _ := storageMgr.GetDiskState(ctx)
 
-    if bootMode == storage.BootModeUSB && !diskState.SetupComplete {
-        // USB boot, first time - need onboarding
-        // Register onboarding endpoints, wait for user choice
+    if (bootMode == storage.BootModeUSB || bootMode == storage.BootModeUnknown) && !diskState.SetupComplete {
+        // USB or unknown boot, first time — need onboarding.
+        // BootModeUnknown follows the same flow as USB: show the onboarding UI
+        // and require explicit user confirmation before any partition writes.
+        // Register onboarding endpoints, wait for user choice.
         // Do NOT start disk prep until user chooses "Try Piccolo"
-        // ("Install to Disk" targets internal disk, not the boot USB)
+        // ("Install to Disk" targets internal disk, not the boot device)
     }
 
     // PHASE 1: Boot-time partitioning (background, non-blocking)
@@ -1648,6 +1721,11 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
     // Generate recovery mnemonic at setup time so all three LUKS keyslots
     // can be enrolled during InitializeDataVolume. The mnemonic words are
     // returned to the user in the setup response for safekeeping.
+    //
+    // NOTE: crypt.Manager.GenerateRecoveryKey currently returns ([]string, error).
+    // This RFC requires it to also return the raw mnemonic key material ([]byte)
+    // so it can be passed to InitializeDataVolume for LUKS keyslot 2 enrollment.
+    // The API change: GenerateRecoveryKey(display bool) → (words []string, key []byte, err error)
     mnemonicWords, mnemonicKey, err := s.crypto.GenerateRecoveryKey(false)
     if err != nil {
         // handle error
@@ -1791,7 +1869,7 @@ The canonical `InitializeLUKS` in §6.3 is the authoritative implementation. Key
 
 1. **`luksFormat` is atomic** — either succeeds or the device is unchanged. If it fails, the caller can retry safely.
 2. **Keyfile is persisted first** (before recovery keyslots) — this is the primary unlock path and has the highest success probability.
-3. **"At least one persistent unlock path" invariant** — if the pool keyfile, admin recovery keyslot, and mnemonic recovery keyslot all fail to persist, the function skips ephemeral keyfile cleanup and returns an error. The keyfile remains at `/run/piccolo/piccolo_data_pool_key` (tmpfs — survives until reboot) so an operator can manually `cryptsetup luksAddKey` before rebooting.
+3. **"At least one persistent unlock path" invariant** — if the pool keyfile, admin recovery keyslot, and mnemonic recovery keyslot all fail to persist, the function skips ephemeral keyfile cleanup and returns an error. This is a **reflash scenario**: the user must re-flash the OS image and start fresh. No user data has been written at this point (the LUKS device was just formatted). The ephemeral keyfile remains in tmpfs for the current boot session's diagnostics only.
 4. **Partial keyslot failure is non-fatal** — if only one or two of the three unlock paths succeed, the system continues with degraded recovery options and logs warnings.
 
 ### 12.3 Emergency Mode
@@ -2019,3 +2097,4 @@ This ensures tools are installed as dependencies of piccolod rather than relying
 - 2026-02-06: Second parallel review fixes. Fixed: (17) pool keyfile now included in PCV exports (node-scoped data for restore workflows); updated §6.2 and §7.1 classification; (18) Argon2 derivation params + random salts now persisted per device at `crypto/luks-kdf-params/<uuid>.json` — fixes correctness risk where CPU count changes would produce different passphrases; added §6.4.1 KDF parameter persistence; (19) split endpoint allowlist into pre-unlock vs emergency mode tables — crypto endpoints blocked in emergency since disk prep must succeed first; (20) per-node room concept documented for cluster-mode PCV.
 - 2026-02-06: Third review pass. Blocking fixes: (21) Argon2 thread cap at 8 for portability; (22) Argon2 memory 512 MiB to match crypt.Manager; (23) hardcoded path replaced with `paths.CoreRoot()`; (24) keyslot 0 uses pbkdf2 (high-entropy keyfile, argon2 adds no value); (25) kernel partition verification loop after partprobe; (26) mnemonic always enrolled at setup, added `OnRecoveryMnemonicRotated` hook. Significant fixes: (27) emergency middleware path matching rewritten (old `/` prefix matched all paths); (28) specified `rekeySlotViaPoolKeyfile` implementation; (29) mapper collision check before `cryptsetup open`; (30) `CommandRunner` interface note for testability; (31) no-fstab design rationale documented; (32) 32-byte salt rationale (RFC 9106 §4). Suggestions: (33) GPT partition label `piccolo-data`; (34) btrfs filesystem label; (35) audit events section added (§14).
 - 2026-02-06: Cross-review validation. Fixed: (36) ephemeral keyfile cleanup is now conditional — skipped on all-three-failed path so operator can recover; (37) USB onboarding guard prevents async partitioning before user chooses "Try Piccolo"; (38) renamed "Try Live" → "Try Piccolo" throughout to match PRD and acceptance features.
+- 2026-02-06: Fourth review pass (combined assessment). Fixes: (39) three-mode boot detection — added `BootModeUnknown` for ambiguous transports (virtio, iSCSI), follows USB onboarding flow; (40) `partitionDevicePath()` helper for mmcblk/nvme/loop naming; (41) 1 MiB sector alignment for data partition start; (42) LUKS all-paths-failed is now a reflash scenario (no SSH, no manual cryptsetup); (43) `reloadPartitionTable` narrowed to specific slot (`partx --nr N:N`); (44) `CommandRunner` interface definition added to §10.2; (45) gin_server pseudocode handles `BootModeUnknown`; (46) `GenerateRecoveryKey` API change noted (returns key material); (47) Install to Disk failure/retry handling documented.
