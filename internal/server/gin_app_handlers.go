@@ -85,20 +85,22 @@ func (s *GinServer) buildSystemContext() map[string]interface{} {
 
 // resolveSystemDefaults renders {{ .System.* }} expressions in input default values
 // so the UI displays concrete values instead of raw template strings.
+// Only defaults containing ".System." are resolved; other template expressions
+// (e.g. {{ .Inputs.* }}) are left untouched to avoid corrupting non-system defaults.
 func resolveSystemDefaults(inputs map[string]api.AppInput, systemCtx map[string]interface{}) {
 	data := map[string]interface{}{"System": systemCtx}
 	for name, input := range inputs {
 		defaultStr, ok := input.Default.(string)
-		if !ok || !strings.Contains(defaultStr, "{{") {
+		if !ok || !strings.Contains(defaultStr, ".System.") {
 			continue
 		}
-		tmpl, err := template.New("default").Option("missingkey=zero").Parse(defaultStr)
+		tmpl, err := template.New("default").Option("missingkey=error").Parse(defaultStr)
 		if err != nil {
 			continue
 		}
 		var buf bytes.Buffer
 		if err := tmpl.Execute(&buf, data); err != nil {
-			continue
+			continue // template references non-system keys — leave as-is
 		}
 		input.Default = buf.String()
 		inputs[name] = input
