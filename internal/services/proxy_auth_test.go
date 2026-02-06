@@ -28,94 +28,196 @@ func TestShouldPartitionCookies(t *testing.T) {
 			expect: false,
 		},
 		{
-			name: "HTTPS host-based app access (should partition)",
+			name: "HTTPS host-based app access in iframe (should partition)",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
+				return r
+			},
+			expect: true,
+		},
+		{
+			name: "HTTPS host-based app in top-level navigation (no partition)",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "document")
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "HTTPS host-based XHR (no partition, not iframe dest)",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/api/data", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "empty")
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "HTTPS host-based without Sec-Fetch-Dest (no partition)",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "homebox-piccolo-xyz.local"
 				return r
 			},
-			expect: true,
+			expect: false,
 		},
 		{
-			name: "HTTPS port-based access (same-site, no partition)",
+			name: "HTTPS port-based access in iframe (same-site, no partition)",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://piccolo-xyz.local:8080/", nil)
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "piccolo-xyz.local:8080"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
 				return r
 			},
 			expect: false,
 		},
 		{
-			name: "HTTPS portal hostname (no partition)",
+			name: "HTTPS portal hostname in iframe (no partition)",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://piccolo-xyz.local/", nil)
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
 				return r
 			},
 			expect: false,
 		},
 		{
-			name: "HTTPS piccolo.local (no partition)",
+			name: "HTTPS piccolo.local in iframe (no partition)",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://piccolo.local/", nil)
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "piccolo.local"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
 				return r
 			},
 			expect: false,
 		},
 		{
-			name: "HTTPS localhost (no partition)",
+			name: "HTTPS localhost in iframe (no partition)",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://localhost/", nil)
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "localhost"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
 				return r
 			},
 			expect: false,
 		},
 		{
-			name: "HTTPS IP address (no partition)",
+			name: "HTTPS IP address in iframe (no partition)",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://192.168.1.100/", nil)
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "192.168.1.100"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
 				return r
 			},
 			expect: false,
 		},
 		{
-			name: "TLS via hint (host-based app)",
+			name: "TLS via hint (host-based app, iframe)",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "http://homebox-piccolo-xyz.local/", nil)
 				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
 				r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, connectionHint{isTLS: true}))
 				return r
 			},
 			expect: true,
 		},
 		{
-			name: "HTTPS remote subdomain (same-site, no partition)",
+			name: "HTTPS remote subdomain in iframe (same-site, no partition)",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://homebox.example.com/", nil)
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "homebox.example.com"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
 				return r
 			},
 			expect: false,
 		},
 		{
-			name: "HTTPS remote with port (same-site, no partition)",
+			name: "HTTPS remote with port in iframe (same-site, no partition)",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://blog.my-site.com/", nil)
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "blog.my-site.com"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
 				return r
 			},
 			expect: false,
+		},
+		{
+			name: "HTTPS XHR with embedded marker cookie (should partition)",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/api/data", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "empty")
+				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				return r
+			},
+			expect: true,
+		},
+		{
+			name: "XHR with marker but no TLS (false)",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "http://homebox-piccolo-xyz.local/api/data", nil)
+				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "empty")
+				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "XHR with marker but port-based (false)",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://piccolo-xyz.local:8080/api/data", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "piccolo-xyz.local:8080"
+				r.Header.Set("Sec-Fetch-Dest", "empty")
+				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "XHR with marker but non-.local host (false)",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox.example.com/api/data", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "homebox.example.com"
+				r.Header.Set("Sec-Fetch-Dest", "empty")
+				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "XHR with marker in middle of Cookie header (true)",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/api/data", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "empty")
+				r.AddCookie(&http.Cookie{Name: "session", Value: "abc"})
+				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				r.AddCookie(&http.Cookie{Name: "other", Value: "xyz"})
+				return r
+			},
+			expect: true,
 		},
 	}
 
@@ -289,14 +391,209 @@ func TestWithProxyContext_PartitionCookies(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
 
 	// partition=true
-	r2 := withProxyContext(r, "homebox", "homebox-piccolo-xyz.local", false, true)
+	r2 := withProxyContext(r, "homebox", "homebox-piccolo-xyz.local", false, true, false)
 	if !proxyContextPartitionCookies(r2.Context()) {
 		t.Error("expected partitionCookies=true in context")
 	}
 
 	// partition=false
-	r3 := withProxyContext(r, "homebox", "piccolo-xyz.local", true, false)
+	r3 := withProxyContext(r, "homebox", "piccolo-xyz.local", true, false, false)
 	if proxyContextPartitionCookies(r3.Context()) {
 		t.Error("expected partitionCookies=false in context")
+	}
+}
+
+func TestWithProxyContext_NeedsMarker(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+
+	r2 := withProxyContext(r, "homebox", "homebox-piccolo-xyz.local", false, true, true)
+	if !proxyContextNeedsMarker(r2.Context()) {
+		t.Error("expected needsMarker=true in context")
+	}
+
+	r3 := withProxyContext(r, "homebox", "homebox-piccolo-xyz.local", false, true, false)
+	if proxyContextNeedsMarker(r3.Context()) {
+		t.Error("expected needsMarker=false in context")
+	}
+}
+
+func TestHasEmbeddedMarker(t *testing.T) {
+	tests := []struct {
+		name   string
+		setup  func() *http.Request
+		expect bool
+	}{
+		{
+			name:   "nil request",
+			setup:  func() *http.Request { return nil },
+			expect: false,
+		},
+		{
+			name: "no cookies",
+			setup: func() *http.Request {
+				return httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+			},
+			expect: false,
+		},
+		{
+			name: "marker present",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				return r
+			},
+			expect: true,
+		},
+		{
+			name: "marker in middle of cookie header",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+				r.AddCookie(&http.Cookie{Name: "session", Value: "abc"})
+				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				r.AddCookie(&http.Cookie{Name: "other", Value: "xyz"})
+				return r
+			},
+			expect: true,
+		},
+		{
+			name: "different piccolo cookie (not marker)",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+				r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "abc"})
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "marker with wrong value",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "wrong"})
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "marker with empty value",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: ""})
+				return r
+			},
+			expect: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasEmbeddedMarker(tt.setup())
+			if got != tt.expect {
+				t.Errorf("hasEmbeddedMarker() = %v, want %v", got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestNeedsEmbeddedMarker(t *testing.T) {
+	tests := []struct {
+		name   string
+		setup  func() *http.Request
+		expect bool
+	}{
+		{
+			name:   "nil request",
+			setup:  func() *http.Request { return nil },
+			expect: false,
+		},
+		{
+			name: "iframe + CHIPS eligible → true",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
+				return r
+			},
+			expect: true,
+		},
+		{
+			name: "document dest → false",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "document")
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "XHR with marker cookie → false (not iframe dest)",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/api/data", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "empty")
+				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "iframe + no TLS → false",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "http://homebox-piccolo-xyz.local/", nil)
+				r.Host = "homebox-piccolo-xyz.local"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "iframe + port-based → false",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://piccolo-xyz.local:8080/", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "piccolo-xyz.local:8080"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
+				return r
+			},
+			expect: false,
+		},
+		{
+			name: "iframe + non-.local host → false",
+			setup: func() *http.Request {
+				r := httptest.NewRequest(http.MethodGet, "https://homebox.example.com/", nil)
+				r.TLS = &tls.ConnectionState{}
+				r.Host = "homebox.example.com"
+				r.Header.Set("Sec-Fetch-Dest", "iframe")
+				return r
+			},
+			expect: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := needsEmbeddedMarker(tt.setup())
+			if got != tt.expect {
+				t.Errorf("needsEmbeddedMarker() = %v, want %v", got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestEmbeddedMarkerSetCookie(t *testing.T) {
+	sc := embeddedMarkerSetCookie()
+	required := []string{
+		embeddedCookieName + "=1",
+		"Path=/",
+		"HttpOnly",
+		"Secure",
+		"SameSite=None",
+		"Partitioned",
+	}
+	for _, want := range required {
+		if !strings.Contains(sc, want) {
+			t.Errorf("embeddedMarkerSetCookie() = %q, missing %q", sc, want)
+		}
 	}
 }

@@ -53,6 +53,11 @@ type AppManager struct {
 	lockOverride     *bool
 	mountVerifier    func(string) error
 
+	// In-memory observed status: derived from container state during reconciliation.
+	// Published via event bus and returned in API responses. Never persisted.
+	observedStatus   map[string]string
+	observedStatusMu sync.RWMutex
+
 	// Workspace disk manager for container-independent persistence
 	workspaceDiskMgr      *workspacedisk.DefaultManager
 	workspacePathResolver *workspacePathResolver
@@ -170,6 +175,7 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		leadershipState:       make(map[string]cluster.Role),
 		lockReader:            lockReader,
 		mountVerifier:         defaultMountVerifier,
+		observedStatus:        make(map[string]string),
 		workspacePathResolver: pathResolver,
 		workspaceImageMounter: imageMounter,
 	}
@@ -268,27 +274,36 @@ func (m *AppManager) publishAppStatusChanged(instanceID, status, prevStatus stri
 	})
 }
 
-// updateStatusWithEvent updates the app status and publishes an event if the status changed.
+// setObservedStatus updates the in-memory observed status for an app.
+func (m *AppManager) setObservedStatus(instanceID, status string) {
+	m.observedStatusMu.Lock()
+	m.observedStatus[instanceID] = status
+	m.observedStatusMu.Unlock()
+}
+
+// getObservedStatus returns the in-memory observed status for an app.
+func (m *AppManager) getObservedStatus(instanceID string) string {
+	m.observedStatusMu.RLock()
+	defer m.observedStatusMu.RUnlock()
+	return m.observedStatus[instanceID]
+}
+
+// deleteObservedStatus removes the in-memory observed status for an app.
+func (m *AppManager) deleteObservedStatus(instanceID string) {
+	m.observedStatusMu.Lock()
+	delete(m.observedStatus, instanceID)
+	m.observedStatusMu.Unlock()
+}
+
+// updateStatusWithEvent updates the in-memory observed status and publishes an event if the status changed.
 // This should be called within the appropriate lock context (reconcileMu for reconciler paths,
 // request-scoped for lifecycle operations).
-func (m *AppManager) updateStatusWithEvent(state *FilesystemStateManager, instanceID, newStatus string) error {
-	// Get previous status before updating
-	app, exists := state.GetApp(instanceID)
-	prevStatus := ""
-	if exists && app != nil {
-		prevStatus = app.Status
-	}
-
-	// Update status
-	if err := state.UpdateAppStatus(instanceID, newStatus); err != nil {
-		return err
-	}
-
-	// Publish event if status actually changed
+func (m *AppManager) updateStatusWithEvent(instanceID, newStatus string) {
+	prevStatus := m.getObservedStatus(instanceID)
+	m.setObservedStatus(instanceID, newStatus)
 	if prevStatus != newStatus {
 		m.publishAppStatusChanged(instanceID, newStatus, prevStatus)
 	}
-	return nil
 }
 
 func (m *AppManager) emitProgress(ctx context.Context, taskType, instanceID, phase string, progress int, message string, complete bool, opErr error) {
@@ -496,7 +511,8 @@ func (m *AppManager) StopAllApps(ctx context.Context) error {
 	var runningApps []*AppInstance
 	var stoppedApps []*AppInstance
 	for _, app := range apps {
-		if app.Status == "running" || app.Status == "starting" {
+		observed := m.getObservedStatus(app.InstanceID)
+		if observed == StatusRunning || observed == StatusStarting {
 			runningApps = append(runningApps, app)
 		} else {
 			stoppedApps = append(stoppedApps, app)
@@ -688,6 +704,17 @@ func (m *AppManager) ensureStateManager() (*FilesystemStateManager, error) {
 		return nil, err
 	}
 	m.stateManager = stateMgr
+
+	// Initialize observed status for all apps on boot.
+	// Enabled apps start as StatusStarting until the reconciler confirms StatusRunning.
+	for _, app := range stateMgr.ListApps() {
+		if app.Enabled {
+			m.setObservedStatus(app.InstanceID, StatusStarting)
+		} else {
+			m.setObservedStatus(app.InstanceID, StatusStopped)
+		}
+	}
+
 	return stateMgr, nil
 }
 
@@ -711,6 +738,9 @@ func (m *AppManager) handleLeadershipChange(ctx context.Context, change events.L
 		if change.Role == cluster.RoleFollower {
 			if err := m.stopForFollowerTransition(ctx, appName); err != nil {
 				log.Printf("WARN: follower transition stop app %s failed: %v", appName, err)
+			} else {
+				// Update observed status immediately so API/UI reflects stopped state.
+				m.updateStatusWithEvent(appName, StatusStopped)
 			}
 		}
 		if reg := m.currentRouter(); reg != nil {
@@ -896,8 +926,8 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 		if publishCID == "" {
 			continue
 		}
-		// Respect desired state: stopped apps should not have proxies restored.
-		if app.Status == "stopped" {
+		// Respect desired state: disabled apps should not have proxies restored.
+		if !app.Enabled {
 			if m.serviceManager != nil {
 				m.serviceManager.RemoveApp(app.InstanceID)
 			}
@@ -944,9 +974,9 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 
 // ReconcileOnce ensures Podman observed state converges to Piccolo desired state.
 //
-// Desired state is derived from app metadata:
-// - status == "stopped" => desired stopped
-// - any other status     => desired running
+// Desired state is derived from the persisted Enabled flag:
+// - Enabled == false => desired stopped
+// - Enabled == true  => desired running
 func (m *AppManager) ReconcileOnce(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -980,7 +1010,7 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 }
 
 func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance) error {
-	desiredRunning := appInst.Status != "stopped"
+	desiredRunning := appInst.Enabled
 	if m.LastObservedRole(cluster.ResourceForApp(appInst.InstanceID)) == cluster.RoleFollower {
 		desiredRunning = false
 	}
@@ -1064,7 +1094,8 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 				return fmt.Errorf("failed to start container: %w", err)
 			}
 			appInst.SetPrimaryContainerID(cid)
-			_ = state.UpdateAppRuntime(appInst.InstanceID, "running", cid)
+			_ = state.UpdateAppRuntime(appInst.InstanceID, cid)
+			m.setObservedStatus(appInst.InstanceID, StatusRunning)
 			m.serviceManager.SetAppContainerID(appInst.InstanceID, cid)
 			return nil
 		}
@@ -1075,7 +1106,7 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 			// Discard speculative port allocation; ensureServicesForRunningApp will restore actual ports.
 			m.serviceManager.RemoveApp(appInst.InstanceID)
 			appInst.SetPrimaryContainerID(nameErr.ID)
-			_ = state.UpdateAppRuntime(appInst.InstanceID, appInst.Status, nameErr.ID)
+			_ = state.UpdateAppRuntime(appInst.InstanceID, nameErr.ID)
 			return nil
 		}
 
@@ -1331,7 +1362,9 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		return nil, fmt.Errorf("failed to store app: %w", err)
 	}
 
-	// Emit "installed" event
+	// Set observed status and populate the returned instance for API callers.
+	m.setObservedStatus(instanceID, StatusRunning)
+	app.Status = StatusRunning
 	m.publishAppStatusChanged(instanceID, "installed", "")
 
 	cleanupServices = false
@@ -1345,27 +1378,45 @@ func (m *AppManager) Upsert(ctx context.Context, appDef *api.AppDefinition) (*Ap
 	return m.Install(ctx, appDef)
 }
 
-// List returns all installed applications
+// List returns all installed applications.
+// Returns shallow copies of cached instances to avoid data races when setting Status.
 func (m *AppManager) List(ctx context.Context) ([]*AppInstance, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return nil, err
 	}
-	return state.ListApps(), nil
+	cached := state.ListApps()
+	// Return shallow copies to avoid mutating cached instances (data race on Status field).
+	apps := make([]*AppInstance, len(cached))
+	for i, app := range cached {
+		copy := *app
+		copy.Status = m.getObservedStatus(app.InstanceID)
+		if copy.Status == "" {
+			copy.Status = StatusStopped
+		}
+		apps[i] = &copy
+	}
+	return apps, nil
 }
 
 // Get returns a specific application instance by instanceID.
+// Returns a shallow copy of the cached instance to avoid data races when setting Status.
 func (m *AppManager) Get(ctx context.Context, instanceID string) (*AppInstance, error) {
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return nil, err
 	}
-	app, exists := state.GetApp(instanceID)
+	cached, exists := state.GetApp(instanceID)
 	if !exists {
 		return nil, fmt.Errorf("app instance not found: %s", instanceID)
 	}
-
-	return app, nil
+	// Return shallow copy to avoid mutating cached instance (data race on Status field).
+	app := *cached
+	app.Status = m.getObservedStatus(instanceID)
+	if app.Status == "" {
+		app.Status = StatusStopped
+	}
+	return &app, nil
 }
 
 // GetAppDefinition returns the full definition (app.yaml content) for an installed app instance.
@@ -1668,70 +1719,12 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 		return fmt.Errorf("failed to remove app from storage: %w", err)
 	}
 
-	// Emit "uninstalled" event (prevStatus was the app's last status before removal)
-	m.publishAppStatusChanged(instanceID, "uninstalled", app.Status)
+	// Clean up observed status and emit "uninstalled" event
+	prevStatus := m.getObservedStatus(instanceID)
+	m.deleteObservedStatus(instanceID)
+	m.publishAppStatusChanged(instanceID, "uninstalled", prevStatus)
 
 	return nil
-}
-
-// Enable enables an application instance (systemctl-style) by instanceID.
-func (m *AppManager) Enable(ctx context.Context, instanceID string) error {
-	if err := m.ensureUnlocked(); err != nil {
-		return err
-	}
-	if err := m.ensureKernelLeader(); err != nil {
-		return err
-	}
-	state, err := m.ensureStateManager()
-	if err != nil {
-		return err
-	}
-	if _, exists := state.GetApp(instanceID); !exists {
-		return fmt.Errorf("app instance not found: %s", instanceID)
-	}
-
-	return state.EnableApp(instanceID)
-}
-
-// Disable disables an application instance (systemctl-style) by instanceID.
-func (m *AppManager) Disable(ctx context.Context, instanceID string) error {
-	if err := m.ensureUnlocked(); err != nil {
-		return err
-	}
-	if err := m.ensureKernelLeader(); err != nil {
-		return err
-	}
-	state, err := m.ensureStateManager()
-	if err != nil {
-		return err
-	}
-	if _, exists := state.GetApp(instanceID); !exists {
-		return fmt.Errorf("app instance not found: %s", instanceID)
-	}
-
-	return state.DisableApp(instanceID)
-}
-
-// IsEnabled checks if an application instance is enabled by instanceID.
-func (m *AppManager) IsEnabled(ctx context.Context, instanceID string) (bool, error) {
-	state, err := m.ensureStateManager()
-	if err != nil {
-		return false, err
-	}
-	if _, exists := state.GetApp(instanceID); !exists {
-		return false, fmt.Errorf("app instance not found: %s", instanceID)
-	}
-
-	return state.IsAppEnabled(instanceID), nil
-}
-
-// ListEnabled returns instanceIDs of all enabled app instances.
-func (m *AppManager) ListEnabled(ctx context.Context) ([]string, error) {
-	state, err := m.ensureStateManager()
-	if err != nil {
-		return nil, err
-	}
-	return state.ListEnabledApps()
 }
 
 // UpdateImage updates an app instance's container image tag and recreates the container preserving services.
@@ -1843,11 +1836,6 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	// Update instance with new definition and persist
 	appInst.Definition = &newDef
 	appInst.SetPrimaryContainerID(newCID)
-	if startErr != nil {
-		appInst.Status = "error"
-	} else {
-		appInst.Status = "running"
-	}
 	appInst.UpdatedAt = time.Now()
 	// Must use StoreApp to persist the updated Definition (app.yaml with new image)
 	if err := state.StoreApp(appInst); err != nil {
@@ -1856,8 +1844,10 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 		return fmt.Errorf("store app: %w", err)
 	}
 	if startErr != nil {
+		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("start container: %w", startErr)
 	}
+	m.setObservedStatus(instanceID, StatusRunning)
 	return nil
 }
 
@@ -2011,7 +2001,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			rbResult, _, rbErr := m.serviceManager.Reconcile(instanceID, curDef.Listeners)
 			if rbErr != nil {
 				log.Printf("ERROR: update listeners %s: port rollback failed: %v", instanceID, rbErr)
-				appInst.Status = "error"
+				m.setObservedStatus(instanceID, StatusError)
 				appInst.SetPrimaryContainerID("")
 				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (ports): %v", err, rbErr)
@@ -2021,7 +2011,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			rbSpec, rbErr := m.appDefToContainerSpec(curDef, rbResult.Endpoints, layout, instanceID)
 			if rbErr != nil {
 				log.Printf("ERROR: update listeners %s: spec rollback failed: %v", instanceID, rbErr)
-				appInst.Status = "error"
+				m.setObservedStatus(instanceID, StatusError)
 				appInst.SetPrimaryContainerID("")
 				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (spec): %v", err, rbErr)
@@ -2040,7 +2030,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			rbCID, rbErr := m.containerManager.CreateContainer(ctx, runtime, rbSpec)
 			if rbErr != nil {
 				log.Printf("ERROR: update listeners %s: container rollback failed: %v", instanceID, rbErr)
-				appInst.Status = "error"
+				m.setObservedStatus(instanceID, StatusError)
 				appInst.SetPrimaryContainerID("")
 				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (create): %v", err, rbErr)
@@ -2049,7 +2039,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			// 4. Start old container
 			if rbErr := m.containerManager.StartContainer(ctx, runtime, rbCID); rbErr != nil {
 				log.Printf("ERROR: update listeners %s: start rollback failed: %v", instanceID, rbErr)
-				appInst.Status = "error"
+				m.setObservedStatus(instanceID, StatusError)
 				appInst.SetPrimaryContainerID(rbCID) // It exists but failed to start
 				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (start): %v", err, rbErr)
@@ -2061,7 +2051,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				m.serviceManager.SetAppContainerID(instanceID, rbCID)
 			}
 			appInst.SetPrimaryContainerID(rbCID)
-			appInst.Status = "running"
+			m.setObservedStatus(instanceID, StatusRunning)
 			// Save the restored state to ensure persistence of new CID
 			if saveErr := state.StoreApp(appInst); saveErr != nil {
 				log.Printf("WARN: update listeners %s: failed to save rollback state: %v", instanceID, saveErr)
@@ -2080,10 +2070,10 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		// Start container automatically
 		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseStarting, 80, "Starting container", false, nil)
 		if err := m.containerManager.StartContainer(ctx, runtime, newCID); err != nil {
-			appInst.Status = "error"
+			m.setObservedStatus(instanceID, StatusError)
 			log.Printf("WARN: update listeners %s: failed to start new container: %v", instanceID, err)
 		} else {
-			appInst.Status = "running"
+			m.setObservedStatus(instanceID, StatusRunning)
 		}
 	}
 
@@ -2169,11 +2159,6 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	// Update instance with previous definition and persist
 	appInst.Definition = prevDef
 	appInst.SetPrimaryContainerID(newCID)
-	if startErr != nil {
-		appInst.Status = "error"
-	} else {
-		appInst.Status = "running"
-	}
 	appInst.UpdatedAt = time.Now()
 	if err := state.StoreApp(appInst); err != nil {
 		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
@@ -2181,8 +2166,10 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 		return fmt.Errorf("store app: %w", err)
 	}
 	if startErr != nil {
+		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("start container: %w", startErr)
 	}
+	m.setObservedStatus(instanceID, StatusRunning)
 	return nil
 }
 
@@ -2523,8 +2510,8 @@ func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, ser
 	if !exists {
 		return nil, fmt.Errorf("app instance not found: %s", instanceID)
 	}
-	if appInst.Status != "running" {
-		return nil, fmt.Errorf("app %s is not running (status: %s)", instanceID, appInst.Status)
+	if observed := m.getObservedStatus(instanceID); observed != StatusRunning {
+		return nil, fmt.Errorf("app %s is not running (status: %s)", instanceID, observed)
 	}
 
 	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)

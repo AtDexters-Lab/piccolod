@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import '../../theme/piccolo_theme.dart';
+import '../../core/config/core_config.dart';
 import '../../core/services/app_service.dart';
 import '../../core/models/app_models.dart';
 import '../../core/utils/task_id.dart';
+import '../../shared/widgets/app_icon.dart';
 import '../../shared/widgets/task_progress_panel.dart';
 import 'dynamic_install_wizard.dart';
 
@@ -492,27 +494,16 @@ x-piccolo:
         ),
         child: Column(
           children: [
-            if (item.icon != null && item.icon!.isNotEmpty)
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: Image.network(
-                  item.icon!,
-                  width: 32,
-                  height: 32,
-                  fit: BoxFit.contain,
-                  errorBuilder: (context, error, stackTrace) => const Icon(
-                    Icons.terminal,
-                    size: 32,
-                    color: PiccoloTheme.cobalt600,
-                  ),
-                ),
-              )
-            else
-              const Icon(
-                Icons.terminal,
-                size: 32,
-                color: PiccoloTheme.cobalt600,
-              ),
+            AppIcon(
+              proxyUrl: (item.icon ?? '').isNotEmpty
+                  ? CoreConfig.catalogIconUrl(item.name)
+                  : null,
+              originalIconUrl: item.icon,
+              size: 32,
+              borderRadius: 8,
+              fallbackIcon: Icons.terminal,
+              fallbackBackgroundColor: Colors.transparent,
+            ),
             const SizedBox(height: 8),
             Text(
               item.name.replaceFirst('workspace-', '').toUpperCase(),

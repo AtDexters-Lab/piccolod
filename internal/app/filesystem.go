@@ -14,17 +14,15 @@ import (
 )
 
 const (
-	AppsDir    = "apps"
-	EnabledDir = "enabled"
-	CacheDir   = "cache"
+	AppsDir  = "apps"
+	CacheDir = "cache"
 )
 
 // FilesystemStateManager manages app state using filesystem as source of truth
 type FilesystemStateManager struct {
-	stateDir   string
-	appsDir    string
-	enabledDir string
-	cacheDir   string
+	stateDir string
+	appsDir  string
+	cacheDir string
 
 	// In-memory cache for performance
 	cache   map[string]*AppInstance
@@ -35,11 +33,9 @@ type FilesystemStateManager struct {
 }
 
 // AppMetadata represents runtime metadata stored separately from app.yaml.
-// Note: The actual enabled state is tracked via symlinks in the enabled/ directory,
-// not in this struct. See EnableApp/DisableApp/IsAppEnabled methods.
 type AppMetadata struct {
 	InstanceID string `json:"instance_id"`
-	Status     string `json:"status"` // "created", "running", "stopped", "error"
+	Enabled    *bool  `json:"enabled,omitempty"` // pointer for migration detection from legacy Status field
 	// Container runtime metadata.
 	PrimaryService  string            `json:"primary_service,omitempty"`
 	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`
@@ -50,6 +46,8 @@ type AppMetadata struct {
 	// Used for icon lookup and update tracking.
 	CatalogSource string `json:"catalog_source,omitempty"`
 }
+
+func boolPtr(b bool) *bool { return &b }
 
 // NewFilesystemStateManager creates a new filesystem state manager
 func NewFilesystemStateManager(stateDir string) (*FilesystemStateManager, error) {
@@ -66,11 +64,10 @@ func NewFilesystemStateManager(stateDir string) (*FilesystemStateManager, error)
 	}
 
 	fsm := &FilesystemStateManager{
-		stateDir:   stateDir,
-		appsDir:    filepath.Join(stateDir, AppsDir),
-		enabledDir: filepath.Join(stateDir, EnabledDir),
-		cacheDir:   filepath.Join(stateDir, CacheDir),
-		cache:      make(map[string]*AppInstance),
+		stateDir: stateDir,
+		appsDir:  filepath.Join(stateDir, AppsDir),
+		cacheDir: filepath.Join(stateDir, CacheDir),
+		cache:    make(map[string]*AppInstance),
 	}
 
 	// Create directory structure
@@ -88,7 +85,7 @@ func NewFilesystemStateManager(stateDir string) (*FilesystemStateManager, error)
 
 // initDirectories creates the required directory structure
 func (fsm *FilesystemStateManager) initDirectories() error {
-	dirs := []string{fsm.appsDir, fsm.enabledDir, fsm.cacheDir}
+	dirs := []string{fsm.appsDir, fsm.cacheDir}
 
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -153,22 +150,35 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 		return nil, fmt.Errorf("failed to read metadata.json: %w", err)
 	}
 
-	var metadata AppMetadata
-	if err := json.Unmarshal(metadataData, &metadata); err != nil {
+	// Use a migration struct that can read both old (Status) and new (Enabled) formats.
+	var raw struct {
+		AppMetadata
+		Status string `json:"status"` // legacy field for migration
+	}
+	if err := json.Unmarshal(metadataData, &raw); err != nil {
 		return nil, fmt.Errorf("failed to parse metadata.json: %w", err)
+	}
+
+	// Determine Enabled value with migration from legacy Status field.
+	enabled := true // default
+	if raw.Enabled != nil {
+		enabled = *raw.Enabled
+	} else if raw.Status != "" {
+		// Legacy migration: derive Enabled from old Status field
+		enabled = raw.Status != "stopped"
 	}
 
 	// Create AppInstance with embedded definition
 	app := &AppInstance{
-		InstanceID:      metadata.InstanceID,
-		Status:          metadata.Status,
-		PrimaryService:  metadata.PrimaryService,
-		NetworkAnchorID: metadata.NetworkAnchorID,
-		Containers:      metadata.Containers,
-		CreatedAt:       metadata.CreatedAt,
-		UpdatedAt:       metadata.UpdatedAt,
+		InstanceID:      raw.InstanceID,
+		Enabled:         enabled,
+		PrimaryService:  raw.PrimaryService,
+		NetworkAnchorID: raw.NetworkAnchorID,
+		Containers:      raw.Containers,
+		CreatedAt:       raw.CreatedAt,
+		UpdatedAt:       raw.UpdatedAt,
 		Definition:      appDef,
-		CatalogSource:   metadata.CatalogSource,
+		CatalogSource:   raw.CatalogSource,
 	}
 
 	// Fallback: if InstanceID is empty in metadata, use directory name
@@ -263,7 +273,7 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 	// Store metadata.json with runtime fields (atomic write)
 	metadata := AppMetadata{
 		InstanceID:      app.InstanceID,
-		Status:          app.Status,
+		Enabled:         boolPtr(app.Enabled),
 		PrimaryService:  app.PrimaryService,
 		NetworkAnchorID: app.NetworkAnchorID,
 		Containers:      app.Containers,
@@ -290,10 +300,10 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 	return nil
 }
 
-// UpdateAppRuntime updates app runtime metadata (status and container ID) and persists metadata.json.
+// UpdateAppRuntime updates app runtime metadata (container ID) and persists metadata.json.
 // The instanceID parameter is the unique instance identifier.
 // The containerID parameter updates the primary service container ID via SetPrimaryContainerID().
-func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containerID string) error {
+func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, containerID string) error {
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
 
@@ -304,13 +314,11 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 		fsm.cacheMu.Unlock()
 		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
-	if status != "" {
-		app.Status = status
-	}
 	if containerID != "" {
 		app.SetPrimaryContainerID(containerID)
 	}
 	app.UpdatedAt = time.Now()
+	enabled := app.Enabled
 	createdAt := app.CreatedAt
 	primaryService := app.PrimaryService
 	networkAnchorID := app.NetworkAnchorID
@@ -324,7 +332,7 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 
 	metadata := AppMetadata{
 		InstanceID:      instanceID,
-		Status:          app.Status,
+		Enabled:         boolPtr(enabled),
 		PrimaryService:  primaryService,
 		NetworkAnchorID: networkAnchorID,
 		Containers:      containers,
@@ -346,7 +354,7 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, status, containe
 }
 
 // StoreAppMetadata persists only the runtime metadata (metadata.json) without touching app.yaml.
-// Use this for runtime state changes like container IDs, status updates, etc.
+// Use this for runtime state changes like container IDs, enabled state, etc.
 // This is more efficient than StoreApp when the app definition hasn't changed.
 func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 	fsm.fsMu.Lock()
@@ -361,7 +369,7 @@ func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 
 	metadata := AppMetadata{
 		InstanceID:      app.InstanceID,
-		Status:          app.Status,
+		Enabled:         boolPtr(app.Enabled),
 		PrimaryService:  app.PrimaryService,
 		NetworkAnchorID: app.NetworkAnchorID,
 		Containers:      app.Containers,
@@ -388,10 +396,19 @@ func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 	return nil
 }
 
-// UpdateAppStatus updates just the app status and updated timestamp.
+// UpdateAppEnabled updates the app's Enabled flag and persists it.
 // The instanceID parameter is the unique instance identifier.
-func (fsm *FilesystemStateManager) UpdateAppStatus(instanceID, status string) error {
-	return fsm.UpdateAppRuntime(instanceID, status, "")
+func (fsm *FilesystemStateManager) UpdateAppEnabled(instanceID string, enabled bool) error {
+	fsm.cacheMu.Lock()
+	app, exists := fsm.cache[instanceID]
+	if !exists {
+		fsm.cacheMu.Unlock()
+		return fmt.Errorf("app instance not found: %s", instanceID)
+	}
+	app.Enabled = enabled
+	app.UpdatedAt = time.Now()
+	fsm.cacheMu.Unlock()
+	return fsm.StoreAppMetadata(app)
 }
 
 // GetApp retrieves an app instance from cache by instance ID (fast access).
@@ -441,10 +458,6 @@ func (fsm *FilesystemStateManager) RemoveApp(instanceID string) error {
 		return fmt.Errorf("failed to remove app directory: %w", err)
 	}
 
-	// Remove enabled symlink if it exists
-	enabledPath := filepath.Join(fsm.enabledDir, instanceID)
-	_ = os.Remove(enabledPath) // Ignore error if symlink doesn't exist
-
 	// Remove from cache
 	fsm.cacheMu.Lock()
 	delete(fsm.cache, instanceID)
@@ -453,71 +466,3 @@ func (fsm *FilesystemStateManager) RemoveApp(instanceID string) error {
 	return nil
 }
 
-// EnableApp creates a symlink to enable app instance (systemctl-style).
-// The instanceID parameter is the unique instance identifier.
-func (fsm *FilesystemStateManager) EnableApp(instanceID string) error {
-	fsm.fsMu.Lock()
-	defer fsm.fsMu.Unlock()
-
-	appDir := filepath.Join(fsm.appsDir, instanceID)
-	enabledPath := filepath.Join(fsm.enabledDir, instanceID)
-
-	// Check if app instance exists
-	if _, err := os.Stat(appDir); err != nil {
-		return fmt.Errorf("app instance not found: %s", instanceID)
-	}
-
-	// Create symlink (relative path for portability)
-	relativePath := filepath.Join("..", AppsDir, instanceID)
-	if err := os.Symlink(relativePath, enabledPath); err != nil {
-		if os.IsExist(err) {
-			return nil // Already enabled
-		}
-		return fmt.Errorf("failed to create symlink: %w", err)
-	}
-
-	return nil
-}
-
-// DisableApp removes the symlink to disable app instance.
-// The instanceID parameter is the unique instance identifier.
-func (fsm *FilesystemStateManager) DisableApp(instanceID string) error {
-	fsm.fsMu.Lock()
-	defer fsm.fsMu.Unlock()
-
-	enabledPath := filepath.Join(fsm.enabledDir, instanceID)
-	if err := os.Remove(enabledPath); err != nil {
-		if os.IsNotExist(err) {
-			return nil // Already disabled
-		}
-		return fmt.Errorf("failed to remove symlink: %w", err)
-	}
-
-	return nil
-}
-
-// IsAppEnabled checks if app instance is enabled (symlink exists).
-// The instanceID parameter is the unique instance identifier.
-func (fsm *FilesystemStateManager) IsAppEnabled(instanceID string) bool {
-	enabledPath := filepath.Join(fsm.enabledDir, instanceID)
-	_, err := os.Lstat(enabledPath)
-	return err == nil
-}
-
-// ListEnabledApps returns instance IDs of all enabled app instances.
-func (fsm *FilesystemStateManager) ListEnabledApps() ([]string, error) {
-	entries, err := os.ReadDir(fsm.enabledDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read enabled directory: %w", err)
-	}
-
-	var enabled []string
-	for _, entry := range entries {
-		// Only count symlinks
-		if entry.Type()&os.ModeSymlink != 0 {
-			enabled = append(enabled, entry.Name())
-		}
-	}
-
-	return enabled, nil
-}

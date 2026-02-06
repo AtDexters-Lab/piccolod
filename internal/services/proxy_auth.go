@@ -13,18 +13,21 @@ type proxyAppIDContextKey struct{}
 type proxyAppHostContextKey struct{}
 type proxyCookieRewriteContextKey struct{}
 type proxyPartitionCookiesContextKey struct{}
+type proxyNeedsMarkerContextKey struct{}
 
 // Cookie names for Piccolo sessions and OIDC flows
 const (
 	sessionCookieName   = "piccolo_session"
 	oidcStateCookieName = "piccolo_oidc_state"
 	nonceCookieName     = "piccolo_nonce"
+	embeddedCookieName  = "piccolo_embedded"
 )
 
 var piccoloCookieNames = map[string]struct{}{
 	sessionCookieName:   {},
 	oidcStateCookieName: {},
 	nonceCookieName:     {},
+	embeddedCookieName:  {},
 }
 
 func isPiccoloCookieName(name string) bool {
@@ -108,7 +111,7 @@ func portalAccessDeniedURL(portalOrigin, nextAbs string) string {
 	return strings.TrimSuffix(portalOrigin, "/") + "/access-denied?next=" + next
 }
 
-func withProxyContext(r *http.Request, appID, appHost string, rewriteCookies, partitionCookies bool) *http.Request {
+func withProxyContext(r *http.Request, appID, appHost string, rewriteCookies, partitionCookies, needsMarker bool) *http.Request {
 	if r == nil {
 		return nil
 	}
@@ -117,6 +120,7 @@ func withProxyContext(r *http.Request, appID, appHost string, rewriteCookies, pa
 	ctx = context.WithValue(ctx, proxyAppHostContextKey{}, appHost)
 	ctx = context.WithValue(ctx, proxyCookieRewriteContextKey{}, rewriteCookies)
 	ctx = context.WithValue(ctx, proxyPartitionCookiesContextKey{}, partitionCookies)
+	ctx = context.WithValue(ctx, proxyNeedsMarkerContextKey{}, needsMarker)
 	return r.WithContext(ctx)
 }
 
@@ -145,6 +149,16 @@ func proxyContextPartitionCookies(ctx context.Context) bool {
 		return false
 	}
 	if v, ok := ctx.Value(proxyPartitionCookiesContextKey{}).(bool); ok {
+		return v
+	}
+	return false
+}
+
+func proxyContextNeedsMarker(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	if v, ok := ctx.Value(proxyNeedsMarkerContextKey{}).(bool); ok {
 		return v
 	}
 	return false
@@ -343,15 +357,10 @@ func setCookieDomain(setCookie string) (string, bool) {
 	return "", false
 }
 
-// shouldPartitionCookies returns true when CHIPS (Partitioned) attributes should
-// be applied to Set-Cookie headers. This targets host-based HTTPS LAN access where
-// the app iframe is cross-site relative to the portal (e.g., homebox-piccolo-xyz.local
-// embedded by piccolo-xyz.local). Remote mode apps (blog.example.com) are same-site
-// with the portal and don't need partitioning.
-func shouldPartitionCookies(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
+// chipsEligible returns true when the request's host/TLS context is eligible for
+// CHIPS Partitioned cookies. This checks TLS, non-port-based, .local hostname,
+// and non-rewrite-eligible — everything except the iframe/marker detection.
+func chipsEligible(r *http.Request) bool {
 	if !RequestArrivedViaTLS(r) {
 		return false
 	}
@@ -364,6 +373,75 @@ func shouldPartitionCookies(r *http.Request) bool {
 		return false
 	}
 	return !shouldRewriteLegacyCookies(r.Host)
+}
+
+// shouldPartitionCookies returns true when CHIPS (Partitioned) attributes should
+// be applied to Set-Cookie headers. This targets host-based HTTPS LAN access where
+// the app iframe is cross-site relative to the portal (e.g., homebox-piccolo-xyz.local
+// embedded by piccolo-xyz.local). Remote mode apps (blog.example.com) are same-site
+// with the portal and don't need partitioning.
+//
+// CHIPS is only meaningful in cross-site (iframe) contexts. Top-level navigations
+// (new tab) must use standard SameSite=Lax cookies — applying Partitioned there
+// causes browsers to reject or mishandle the cookie, leading to OIDC redirect loops.
+//
+// The initial iframe load is detected via Sec-Fetch-Dest: iframe. Subsequent XHR/fetch
+// requests from within the iframe carry the piccolo_embedded marker cookie (itself
+// Partitioned, so absent in top-level tabs) to propagate the iframe context.
+func shouldPartitionCookies(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	dest := strings.ToLower(r.Header.Get("Sec-Fetch-Dest"))
+	if dest != "iframe" && !hasEmbeddedMarker(r) {
+		return false
+	}
+	return chipsEligible(r)
+}
+
+// needsEmbeddedMarker returns true only for the initial iframe navigation load
+// where the marker cookie should be set. Subsequent XHR/fetch requests already
+// carry the marker and don't need it re-set.
+func needsEmbeddedMarker(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if strings.ToLower(r.Header.Get("Sec-Fetch-Dest")) != "iframe" {
+		return false
+	}
+	return chipsEligible(r)
+}
+
+// hasEmbeddedMarker checks if the request carries the piccolo_embedded marker cookie.
+// The marker is Partitioned, so it's only present in the iframe's cookie partition
+// and absent in top-level tab requests.
+func hasEmbeddedMarker(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	c, err := r.Cookie(embeddedCookieName)
+	return err == nil && c != nil && c.Value == "1"
+}
+
+// embeddedMarkerCookie returns the marker cookie as an *http.Cookie struct.
+// Use this for http.SetCookie; embeddedMarkerSetCookie returns the raw header.
+func embeddedMarkerCookie() *http.Cookie {
+	return &http.Cookie{
+		Name:        embeddedCookieName,
+		Value:       "1",
+		Path:        "/",
+		HttpOnly:    true,
+		Secure:      true,
+		SameSite:    http.SameSiteNoneMode,
+		Partitioned: true,
+	}
+}
+
+// embeddedMarkerSetCookie returns a raw Set-Cookie header value for the embedded
+// marker cookie. Session-scoped (no Max-Age/Expires), Partitioned, SameSite=None,
+// Secure, HttpOnly.
+func embeddedMarkerSetCookie() string {
+	return embeddedCookieName + "=1; Path=/; HttpOnly; Secure; SameSite=None; Partitioned"
 }
 
 // hasCookieAttribute checks if a raw Set-Cookie header string contains

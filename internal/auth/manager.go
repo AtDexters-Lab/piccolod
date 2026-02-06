@@ -582,29 +582,3 @@ func (s *SessionStore) FindByParent(parentID string) []*Session {
 // timeNow is a small indirection for tests
 var timeNow = func() time.Time { return time.Now() }
 
-// CanonicalOrigin computes the canonical origin from a request per RFC 20260122 §6.2.
-// Origin format: scheme://host[:port] with default ports omitted.
-// This function does NOT trust X-Forwarded-Proto by default (set trustForwardedProto explicitly).
-func CanonicalOrigin(scheme, host string, port int, trustForwardedProto bool, forwardedProto string) string {
-	// Determine scheme
-	if trustForwardedProto && forwardedProto == "https" {
-		scheme = "https"
-	}
-	if scheme == "" {
-		scheme = "http"
-	}
-
-	// Normalize host
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	if host == "" {
-		return ""
-	}
-
-	// Handle default ports
-	isDefaultPort := (scheme == "http" && port == 80) || (scheme == "https" && port == 443) || port == 0
-	if isDefaultPort {
-		return scheme + "://" + host
-	}
-
-	return fmt.Sprintf("%s://%s:%d", scheme, host, port)
-}

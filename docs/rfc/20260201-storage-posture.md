@@ -3,7 +3,9 @@
 - **Status:** Draft
 - **Date:** 2026-02-01
 - **Authors:** Engineering Team
-- **Related:** `org-context/03_engineering/storage_architecture.md`
+- **Related:**
+  - `org-context/03_engineering/storage_architecture.md`
+  - `docs/rfc/20260202-storage-v2-foundation.md`
 
 ## 1. Summary
 
@@ -17,6 +19,17 @@ Piccolod must:
 5. **LUKS2 encrypt** `/piccolo-data` with pool keyfile
 6. **Create btrfs** on `/piccolo-data`
 7. **Handle USB boot** with onboarding flow (Install to Disk / Try Live)
+
+### 1.1 Relationship to `20260202-storage-v2-foundation.md`
+This RFC specifies the **physical disk posture** and first-boot disk preparation required to make the two-root model real on target OS images:
+- partition and filesystem sizing,
+- creation and mounting of `/piccolo-data` as a LUKS2 + btrfs pool,
+- NOCOW posture on churn-heavy directories.
+
+`docs/rfc/20260202-storage-v2-foundation.md` specifies the **daemon-level storage contracts** that consume this posture:
+- `PICCOLO_CORE_ROOT`/`PICCOLO_DATA_ROOT` env vars (defaults `/piccolo-core`/`/piccolo-data`),
+- logical directory layout and mountpoint contracts,
+- control-plane persistence placement and PCV export publishing/replication.
 
 ## 2. Context
 
@@ -57,7 +70,18 @@ Per the storage architecture document:
 - **LUKS2 encryption** for `/piccolo-data` - at-rest encryption for user data
 - **Minimal image** - enables fast dd to any size disk, including USB drives
 
-### 2.4 USB Boot Scenario
+### 2.4 Configuration and path roots
+`piccolod` uses two path roots:
+- `PICCOLO_CORE_ROOT` (default `/piccolo-core`)
+- `PICCOLO_DATA_ROOT` (default `/piccolo-data`)
+
+On production images, these defaults are used and should be treated as the canonical mountpoints. The environment variables primarily exist to support development/test harnesses and non-standard environments.
+
+> **Note on code examples:** Pseudocode throughout this RFC uses the default paths (`/piccolo-core`, `/piccolo-data`) for brevity. Implementations **must** resolve all paths through `paths.CoreRoot()` / `paths.DataRoot()` (see Foundation RFC §6.1) to support non-default environments.
+
+### 2.5 USB Boot Scenario
+
+> **Contract note:** "Try Live" is an **evaluation-only** mode. When booting from USB, both `/piccolo-core` and `/piccolo-data` reside on the USB boot device itself. This is an explicit exception to the production storage contract (architecture doc §3.1) where `/piccolo-core` lives on internal storage and USB devices are added only to `/piccolo-data`. V1 includes an **Install to Disk** flow that can either start fresh or **carry over current state** from "Try Live"; however, "Try Live" remains an evaluation posture (USB is not a supported long-term storage medium).
 
 The minimal image can be dd'd to a USB drive and booted:
 
@@ -70,12 +94,16 @@ The minimal image can be dd'd to a USB drive and booted:
 │       │                                                             │
 │       └── Piccolod detects USB boot                                 │
 │               │                                                     │
-│               └── Shows onboarding choice:                          │
+│               └── Scan for internal (non-USB) disks                 │
 │                       │                                             │
-│                       ├── "Install to Disk"                         │
-│                       │       └── (Future RFC: btrfs send to disk)  │
+│                       ├── Internal disk found:                      │
+│                       │       └── Shows two options:                │
+│                       │               ├── "Install to Disk"         │
+│                       │               │     └── (V1: Fresh → Carry over → Dry run) │
+│                       │               └── "Try Live"                │
 │                       │                                             │
-│                       └── "Try Live"                                │
+│                       └── No internal disk (e.g., RPi, USB-only):  │
+│                               └── "Try Live" only                   │
 │                               └── Expand USB partitions             │
 │                               └── Create persistent /piccolo-data   │
 │                               └── Continue with normal setup        │
@@ -91,14 +119,15 @@ The minimal image can be dd'd to a USB drive and booted:
 - **Disk partitioning**: Expand root to ~20GB, create `/piccolo-data` partition
 - **Subvolume verification**: Verify `/piccolo-core` subvolume exists (OS creates it)
 - **LUKS2 encryption**: Pool keyfile for `/piccolo-data`
+- **Install to Disk (v1, phased)**: Install from live USB onto internal disk (fresh start and carry-over paths)
 - **USB boot support**: Show onboarding flow, support "Try Live" mode
 - **Persistent USB storage**: "Try Live" creates real partitions on USB
 - **Degraded mode**: System operates if USB storage (expansion) fails
+- **Two-root contract**: Treat `/piccolo-core` (fixed) and `/piccolo-data` (expandable) as distinct roots, matching `docs/rfc/20260202-storage-v2-foundation.md`.
 
 ### 3.2 Non-Goals
 
-- **"Install to Disk" implementation**: Deferred to future RFC (btrfs send)
-- **Migration from existing systems**: Fresh installs only
+- **Migration from pre-v2 installs**: Fresh installs only
 - **JuiceFS/BadgerDB integration**: Future work
 - **Cluster mode**: Future work
 
@@ -187,7 +216,7 @@ func getTransportType(ctx context.Context, disk string) (string, error) {
 │               │                                                     │
 │               └── IsFirstBoot()?                                    │
 │                       ├── YES → ShowOnboardingFlow()                │
-│                       │           ├── "Install to Disk" → Defer     │
+│                       │           ├── "Install to Disk" → InstallToDisk() │
 │                       │           └── "Try Live" → RunDiskPrep()    │
 │                       └── NO  → Continue (already set up)           │
 │                                                                     │
@@ -195,6 +224,22 @@ func getTransportType(ctx context.Context, disk string) (string, error) {
 ```
 
 ## 5. Disk Preparation Sequence
+
+### 5.0 Partition Table Preconditions
+
+Phase 1 disk preparation assumes the following preconditions are met by the OS image (`piccolo-os`):
+
+| Precondition | Expected | Checked by |
+|---|---|---|
+| Partition table type | GPT | `sgdisk -p` (fails on MBR) |
+| ESP partition | Slot 1, FAT32, ~512MB | KIWI image build |
+| Root partition | Slot 2, btrfs, MicroOS snapshots | KIWI image build |
+| Root filesystem | btrfs with `/piccolo-core` subvolume | `btrfs subvolume show /piccolo-core` |
+| No stacking layers | No dm-crypt, LVM, or MD-RAID on the boot disk | `lsblk -ndo TYPE` (expect `disk`/`part` only) |
+
+If any precondition is violated, `PreparePartitioning` enters Emergency Mode (§12.3) with a diagnostic message identifying which check failed.
+
+**Why GPT:** `sgdisk` operates exclusively on GPT tables. MBR disks are not supported and would fail at the partition creation step. All piccolo-os images use GPT.
 
 ### 5.1 Overview
 
@@ -221,25 +266,32 @@ func (m *StorageManager) GetDiskState(ctx context.Context) (*DiskState, error)
 
 Disk preparation is split into two phases to avoid deadlock (server must start before user can provide admin password):
 
-#### Phase 1: Boot-time Partitioning (Before Server Starts)
+#### Phase 1: Boot-time Partitioning (Background, Non-Blocking)
 
-Runs synchronously during `NewGinServer()`, before HTTP server is available.
+Phase 1 runs **in the background** after the HTTP server starts. The portal is available immediately and shows a "Preparing storage..." indicator while disk prep is in progress. This ensures the PRD time-to-portal target (≤60 seconds) is met regardless of disk prep duration.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                 PHASE 1: BOOT-TIME PARTITIONING                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
+│  Server starts → portal available (shows "Preparing storage..."     │
+│  if disk prep is in progress)                                       │
+│                                                                     │
+│  Background goroutine:                                              │
+│                                                                     │
 │  1. Verify /piccolo-core btrfs subvolume exists                     │
 │       │                                                             │
 │       ├── btrfs subvolume show /piccolo-core                        │
 │       └── If missing → enter Emergency Mode (see Section 12.3)      │
 │                                                                     │
-│  2. Create /piccolo-data partition (at 20GB offset)                 │
+│  2. Create /piccolo-data partition (at root target offset)          │
 │       │   (MUST happen before root expansion to bound growpart)     │
 │       │                                                             │
+│       ├── Determine root target size via §5.4 sizing rules          │
+│       │   (20GB on normal disks; proportional 70% on small disks)   │
 │       ├── Detect next free partition slot (see 5.5)                 │
-│       ├── Calculate: start = 20GB (in sectors), end = disk_end      │
+│       ├── Calculate: start = rootTargetGB (in sectors), end = disk  │
 │       ├── sgdisk -n $slot:$start:0 -t $slot:8309 /dev/sdX           │
 │       └── partprobe /dev/sdX                                        │
 │                                                                     │
@@ -249,14 +301,16 @@ Runs synchronously during `NewGinServer()`, before HTTP server is available.
 │       └── btrfs filesystem resize max /var                          │
 │           (use /var - writable mount on same btrfs filesystem)      │
 │                                                                     │
-│  Result: Server starts, portal available                            │
+│  Result: Phase 1 complete → portal transitions to normal state      │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+**Phase 1 ↔ Phase 2 sequencing:** Phase 2 (LUKS init / unlock) cannot proceed until Phase 1 completes. If the user provides their admin password before Phase 1 finishes, the Phase 2 handler blocks on the Phase 1 completion signal (a `sync.WaitGroup` or channel) and the portal shows "Finalizing storage preparation...". This is expected to be rare — disk prep is typically fast (seconds) and the user must navigate the onboarding UI first.
+
 **Why this order?**
 - `growpart` expands a partition to fill all contiguous free space
-- By creating `/piccolo-data` at the 20GB mark first, it acts as a boundary
+- By creating `/piccolo-data` at the root target offset first (20GB on normal disks, proportional on small disks per §5.4), it acts as a boundary
 - `growpart` on root will expand only up to where `/piccolo-data` starts
 
 #### Phase 2: Post-Auth Initialization (After Admin Password Setup)
@@ -303,7 +357,7 @@ On subsequent boots, both phases are still executed but operations are idempoten
 Phase 1 (Boot-time):
   1. Check disk state
   2. Verify /piccolo-core exists → Emergency Mode if missing
-  3. If /piccolo-data partition missing → create at 20GB offset
+  3. If /piccolo-data partition missing → create at root target offset (§5.4)
   4. If root not expanded → expand (bounded by data partition)
   → Server starts
 
@@ -320,22 +374,37 @@ Phase 2 (After unlock via portal):
 
 ```go
 const (
-    RootTargetSizeGB   = 20   // Target size for root partition
+    // RootTargetSizeGB is the target root partition size. openSUSE MicroOS
+    // recommends a maximum of 20GB for the root filesystem (server variant);
+    // this leaves room for OS snapshots while bounding growpart so the
+    // remainder of the disk is available for /piccolo-data.
+    RootTargetSizeGB   = 20   // MicroOS recommended max for root (server)
     MinDataPartitionGB = 5    // Minimum size for /piccolo-data
+    ESPSizeGB          = 1    // Conservative estimate for ESP (~512MB, rounded up)
 )
 
 func calculatePartitionLayout(diskSizeGB int) (*PartitionLayout, error) {
-    if diskSizeGB < RootTargetSizeGB + MinDataPartitionGB {
-        // Small disk (e.g., 16GB USB) - use proportional split
-        rootSize := diskSizeGB * 70 / 100  // 70% for root
-        dataSize := diskSizeGB - rootSize
+    // Usable space excludes the ESP partition
+    usableGB := diskSizeGB - ESPSizeGB
+
+    if usableGB < RootTargetSizeGB + MinDataPartitionGB {
+        // Small disk (e.g., 16GB USB) - use proportional split of usable space
+        rootSize := usableGB * 70 / 100  // 70% for root
+        dataSize := usableGB - rootSize
+        if dataSize < MinDataPartitionGB {
+            // Minimum: ESP (1GB) + enough usable space so 30% >= MinDataPartitionGB
+            // With 70/30 split, need ceil(MinDataPartitionGB / 0.3) usable ≈ 17GB, so ~18GB total.
+            minDisk := ESPSizeGB + (MinDataPartitionGB * 100 / 30) + 1
+            return nil, fmt.Errorf("disk too small: %dGB total, need at least %dGB",
+                diskSizeGB, minDisk)
+        }
         return &PartitionLayout{RootGB: rootSize, DataGB: dataSize}, nil
     }
 
     // Normal disk - root gets 20GB, data gets the rest
     return &PartitionLayout{
         RootGB: RootTargetSizeGB,
-        DataGB: diskSizeGB - RootTargetSizeGB,
+        DataGB: usableGB - RootTargetSizeGB,
     }, nil
 }
 ```
@@ -408,13 +477,75 @@ func (p *Preparer) getLastPartitionEnd(ctx context.Context, disk string) (sector
 
 All disk prep operations must be idempotent to support repeated execution on every boot.
 
-**Important:** Data partition MUST be created before root expansion (see Section 5.2).
+**Important:** Data partition MUST be created before root expansion (see Section 5.2). Both operations use `calculatePartitionLayout` (§5.4) for disk-size-aware sizing.
 
 ```go
 const (
     RootTargetSizeGB   = 20
     MinDataPartitionGB = 5
 )
+
+// getRootPartitionStart returns the start sector of the root partition
+// using sfdisk JSON output. This is needed to compute the data partition
+// start relative to where root actually begins (after the ESP).
+func (p *Preparer) getRootPartitionStart(ctx context.Context, disk, rootDev string) (int64, error) {
+    output, err := exec.CommandContext(ctx, "sfdisk", "-J", disk).Output()
+    if err != nil {
+        return 0, fmt.Errorf("sfdisk failed: %w", err)
+    }
+
+    var table struct {
+        PartitionTable struct {
+            Partitions []struct {
+                Node  string `json:"node"`
+                Start int64  `json:"start"`
+            } `json:"partitions"`
+        } `json:"partitiontable"`
+    }
+    if err := json.Unmarshal(output, &table); err != nil {
+        return 0, fmt.Errorf("failed to parse sfdisk output: %w", err)
+    }
+
+    for _, p := range table.PartitionTable.Partitions {
+        if p.Node == rootDev {
+            return p.Start, nil
+        }
+    }
+    return 0, fmt.Errorf("root partition %s not found in partition table", rootDev)
+}
+
+// reloadPartitionTable attempts partprobe, falling back to partx --add
+// for kernels that refuse a full partition table re-read on a busy root disk.
+func (p *Preparer) reloadPartitionTable(ctx context.Context, disk string) error {
+    // Try partprobe first (standard, reloads entire table)
+    if err := p.runner.Run(ctx, "partprobe", disk); err == nil {
+        return nil
+    }
+
+    p.logger.Warn("partprobe failed on busy disk, trying partx --add fallback", "disk", disk)
+
+    // Fallback: partx --add scans for new partitions without a full re-read.
+    // This works even when the kernel refuses to re-read the table of a mounted disk.
+    if err := p.runner.Run(ctx, "partx", "--add", "--nr", ":-1", disk); err != nil {
+        return fmt.Errorf("both partprobe and partx --add failed: %w", err)
+    }
+
+    return nil
+}
+
+// getDiskSizeGB returns the total disk size in GB
+func (p *Preparer) getDiskSizeGB(ctx context.Context, disk string) (int, error) {
+    // lsblk -ndo SIZE -b /dev/sdX → size in bytes
+    output, err := exec.CommandContext(ctx, "lsblk", "-ndo", "SIZE", "-b", disk).Output()
+    if err != nil {
+        return 0, fmt.Errorf("failed to get disk size: %w", err)
+    }
+    sizeBytes, err := strconv.ParseInt(strings.TrimSpace(string(output)), 10, 64)
+    if err != nil {
+        return 0, fmt.Errorf("failed to parse disk size: %w", err)
+    }
+    return int(sizeBytes / (1024 * 1024 * 1024)), nil
+}
 
 // getSectorSize queries the logical sector size of a disk
 // Modern NVMe drives may use 4096-byte sectors instead of 512
@@ -431,8 +562,8 @@ func (p *Preparer) getSectorSize(ctx context.Context, disk string) (int64, error
     return size, nil
 }
 
-// CreateDataPartition creates /piccolo-data at the 20GB offset
-// MUST be called BEFORE ExpandRootPartition to bound growpart
+// CreateDataPartition creates /piccolo-data partition using the sizing rules from §5.4.
+// MUST be called BEFORE ExpandRootPartition to bound growpart.
 func (p *Preparer) CreateDataPartition(ctx context.Context) error {
     state, err := p.GetPartitionState(ctx)
     if err != nil {
@@ -448,19 +579,36 @@ func (p *Preparer) CreateDataPartition(ctx context.Context) error {
     rootDev, _ := getRootDevice(ctx)
     disk := getParentDisk(rootDev)
 
+    // Determine disk size and apply sizing rules (§5.4)
+    diskSizeGB, err := p.getDiskSizeGB(ctx, disk)
+    if err != nil {
+        return fmt.Errorf("failed to get disk size: %w", err)
+    }
+
+    layout, err := calculatePartitionLayout(diskSizeGB)
+    if err != nil {
+        return fmt.Errorf("failed to calculate partition layout: %w", err)
+    }
+
     // Query actual sector size (512 for SATA, possibly 4096 for NVMe)
     sectorSize, _ := p.getSectorSize(ctx, disk)
 
-    // Calculate start sector at 20GB mark
-    // This leaves room for ~20GB root and puts data partition at end
-    startSector := (RootTargetSizeGB * 1024 * 1024 * 1024) / sectorSize
+    // Compute data partition start relative to root partition's actual start.
+    // The root partition starts after the ESP, so we use its real start sector
+    // plus the target root size to position the data partition correctly.
+    rootStartSector, err := p.getRootPartitionStart(ctx, disk, rootDev)
+    if err != nil {
+        return fmt.Errorf("failed to get root partition start: %w", err)
+    }
+    rootTargetSectors := (int64(layout.RootGB) * 1024 * 1024 * 1024) / sectorSize
+    startSector := rootStartSector + rootTargetSectors
 
     slot, err := p.findNextPartitionSlot(ctx, disk)
     if err != nil {
         return err
     }
 
-    // Create partition: start at 20GB, extend to end of disk (0 = end)
+    // Create partition: start after root allocation, extend to end of disk (0 = end)
     // Type 8309 = Linux LUKS
     if err := p.runner.Run(ctx, "sgdisk",
         "-n", fmt.Sprintf("%d:%d:0", slot, startSector),
@@ -470,24 +618,41 @@ func (p *Preparer) CreateDataPartition(ctx context.Context) error {
         return fmt.Errorf("sgdisk failed: %w", err)
     }
 
-    // Reload partition table
-    if err := p.runner.Run(ctx, "partprobe", disk); err != nil {
-        p.logger.Warn("partprobe failed, may need reboot", "error", err)
+    // Reload partition table — MUST succeed.
+    // If the kernel doesn't see the new data partition, growpart on root
+    // will expand into unbounded free space, defeating the boundary mechanism.
+    if err := p.reloadPartitionTable(ctx, disk); err != nil {
+        return fmt.Errorf("kernel cannot see new data partition (boundary unsafe): %w", err)
     }
 
     p.logger.Info("data partition created",
         "disk", disk,
         "slot", slot,
-        "start_sector", startSector)
+        "start_sector", startSector,
+        "root_target_gb", layout.RootGB,
+        "data_target_gb", layout.DataGB,
+        "disk_size_gb", diskSizeGB)
     return nil
 }
 
-// ExpandRootPartition expands root up to the data partition boundary
-// MUST be called AFTER CreateDataPartition
+// ExpandRootPartition expands root up to the data partition boundary.
+// MUST be called AFTER CreateDataPartition.
+// The target size depends on disk size (see §5.4): 20GB on normal disks,
+// proportional (70%) on small disks.
 func (p *Preparer) ExpandRootPartition(ctx context.Context) error {
     rootDev, _ := getRootDevice(ctx)
     disk := getParentDisk(rootDev)
     partNum := getPartitionNumber(rootDev)  // e.g., 2
+
+    // Determine target root size using same sizing rules as CreateDataPartition
+    diskSizeGB, err := p.getDiskSizeGB(ctx, disk)
+    if err != nil {
+        return fmt.Errorf("failed to get disk size: %w", err)
+    }
+    layout, err := calculatePartitionLayout(diskSizeGB)
+    if err != nil {
+        return fmt.Errorf("failed to calculate partition layout: %w", err)
+    }
 
     // Check current partition size
     currentSizeBytes, err := p.getPartitionSize(ctx, rootDev)
@@ -497,10 +662,10 @@ func (p *Preparer) ExpandRootPartition(ctx context.Context) error {
     currentSizeGB := currentSizeBytes / (1024 * 1024 * 1024)
 
     // Skip if already at or above target size
-    if currentSizeGB >= RootTargetSizeGB {
+    if currentSizeGB >= int64(layout.RootGB) {
         p.logger.Info("root partition already at target size, skipping expansion",
             "current_gb", currentSizeGB,
-            "target_gb", RootTargetSizeGB)
+            "target_gb", layout.RootGB)
         return nil
     }
 
@@ -515,9 +680,12 @@ func (p *Preparer) ExpandRootPartition(ctx context.Context) error {
         return fmt.Errorf("growpart failed: %w", err)
     }
 
-    // Notify kernel of partition table change after growpart
+    // Notify kernel of partition table change after growpart.
+    // Non-fatal: growpart already triggers BLKRRPART ioctl internally to
+    // re-read the partition table. partprobe is a belt-and-suspenders call;
+    // if it fails, the kernel has already seen the expanded partition via growpart.
     if err := p.runner.Run(ctx, "partprobe", disk); err != nil {
-        p.logger.Warn("partprobe failed after root expansion", "error", err)
+        p.logger.Warn("partprobe failed after root expansion (growpart already updated kernel)", "error", err)
     }
 
     // Expand btrfs filesystem to use new partition space
@@ -531,6 +699,20 @@ func (p *Preparer) ExpandRootPartition(ctx context.Context) error {
 }
 ```
 
+### 5.7 Power Failure Recovery (Phase 1)
+
+All Phase 1 operations are designed to be crash-safe and self-healing on the next boot:
+
+| Failure Point | State After Crash | Recovery on Next Boot |
+|---|---|---|
+| During `sgdisk` (GPT write) | GPT may have inconsistent primary/secondary tables. `sgdisk` writes the secondary GPT first, then the primary. Most tools (including the kernel) prefer the primary table. | `sgdisk` and `sfdisk` can recover from primary/secondary mismatch. On next boot, `GetPartitionState` re-reads the table. If the data partition was not created, it is retried. |
+| After `sgdisk`, before `partprobe` | GPT is valid on disk but kernel has not re-read it. | Next boot re-reads the full partition table from scratch — no `partprobe` needed. |
+| After data partition created, before `growpart` | Data partition exists, root is still minimal (~2GB). | `ExpandRootPartition` detects root is below target size and runs `growpart`, bounded by the existing data partition. |
+| After `growpart`, before `btrfs resize` | Root partition is expanded but btrfs filesystem is smaller than the partition. | `btrfs filesystem resize max /var` detects the gap and extends the filesystem. This is a safe, idempotent online operation. |
+| After `btrfs resize` | Phase 1 complete. | No action needed — state checks confirm everything is done. |
+
+**Key invariant:** Because each step checks current state before acting (idempotent), any partial completion is automatically resumed on the next boot. No rollback is required or attempted.
+
 ## 6. LUKS2 Encryption
 
 ### 6.1 Key Hierarchy
@@ -542,26 +724,49 @@ func (p *Preparer) ExpandRootPartition(ctx context.Context) error {
 │                                                                     │
 │  Admin Password                                                     │
 │       │                                                             │
-│       ├──→ Derives KEK (Argon2id)                                   │
+│       ├──→ Derives KEK (Argon2id + salt from keyset.json)           │
 │       │         │                                                   │
-│       │         └──→ Decrypts control-plane                         │
+│       │         └──→ Unseals SDEK from keyset.json                  │
 │       │                    │                                        │
-│       │                    └──→ Contains pool-keyfile.enc           │
-│       │                              │                              │
-│       │                              └──→ Unwraps pool_key          │
-│       │                                          │                  │
-│       │                                          └──→ LUKS Keyslot 0│
+│       │                    ├──→ Unwraps gocryptfs passphrase        │
+│       │                    │    (from volumes/control-plane/        │
+│       │                    │     piccolo.volume.json)               │
+│       │                    │         └──→ Mounts control-plane      │
+│       │                    │                                        │
+│       │                    └──→ Unwraps piccolo_data_pool_key.enc   │
+│       │                         (from crypto/)                      │
+│       │                              └──→ LUKS Keyslot 0            │
 │       │                                                             │
-│       └──→ LUKS Keyslot 1 (Recovery)                                │
-│            Admin password → device-specific passphrase              │
+│       ├──→ LUKS Keyslot 1 (Admin Password Recovery)                 │
+│       │    Admin password → Argon2id(password, device UUID)         │
+│       │                                                             │
+│  Recovery Mnemonic (24-word)                                        │
+│       │                                                             │
+│       └──→ Derives KEK → Unseals SDEK → Unwraps pool keyfile       │
+│            → LUKS Keyslot 0 (same keyfile, same path as above)     │
+│                                                                     │
+│       └──→ LUKS Keyslot 2 (Mnemonic Recovery)                      │
+│            Mnemonic → Argon2id(mnemonic-derived, device UUID)       │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+**Three LUKS keyslots per device:**
+| Keyslot | Key Source | Purpose |
+|---------|-----------|---------|
+| 0 | Pool keyfile (unwrapped from SDEK via admin password or recovery mnemonic) | Primary unlock path — used on every boot |
+| 1 | Argon2id(admin password, device UUID) | Offline recovery when control plane is unavailable |
+| 2 | Argon2id(mnemonic-derived key, device UUID) | Recovery when admin password is lost — user unlocks with 24-word mnemonic |
+
+**Why three keyslots:** The recovery mnemonic can already unlock the control plane (via `crypt.Manager.UnlockWithRecoveryKey`), which provides the pool keyfile for keyslot 0. Keyslot 2 provides a direct unlock path for `/piccolo-data` when the control plane itself is damaged or unavailable, ensuring the mnemonic is a complete recovery mechanism independent of `/piccolo-core` state.
+
 ### 6.2 Pool Keyfile Management
 
 ```go
-// Stored in control plane: /piccolo-core/control-plane/luks/pool-keyfile.enc
+// Stored at /piccolo-core/crypto/piccolo_data_pool_key.enc
+// This is OUTSIDE gocryptfs (always readable once SDEK is available), device-local,
+// and NOT included in PCV exports. The pool keyfile is specific to the physical
+// LUKS devices attached to this node.
 type PoolKeyfile struct {
     Version   int       `json:"version"`
     KeyData   []byte    `json:"key_data"`   // 64-byte random keyfile (encrypted with SDEK)
@@ -585,10 +790,10 @@ func GeneratePoolKeyfile() ([]byte, error) {
 - Never persisted to disk - plaintext secrets exist only in RAM
 - Created by piccolod at startup: `os.MkdirAll("/run/piccolo", 0700)`
 
-The **encrypted** pool keyfile is stored persistently at `/piccolo-core/control-plane/luks/pool-keyfile.enc`. The `/run/piccolo/` path is only used transiently during `cryptsetup` operations.
+The **encrypted** pool keyfile is stored persistently at `/piccolo-core/crypto/piccolo_data_pool_key.enc`. The `/run/piccolo/` path is only used transiently during `cryptsetup` operations.
 
 ```go
-func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPassword string) error {
+func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPassword string, mnemonicKey []byte) error {
     // 0. Ensure ephemeral secrets directory exists (tmpfs, cleared on reboot)
     if err := os.MkdirAll("/run/piccolo", 0700); err != nil {
         return fmt.Errorf("failed to create ephemeral secrets dir: %w", err)
@@ -601,7 +806,7 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
     }
 
     // 2. Write keyfile to temp location (memory-backed tmpfs, never persisted)
-    keyfilePath := "/run/piccolo/pool-keyfile"
+    keyfilePath := "/run/piccolo/piccolo_data_pool_key"
     if err := os.WriteFile(keyfilePath, keyfile, 0600); err != nil {
         return err
     }
@@ -609,31 +814,75 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
     defer secureZero(keyfile)
 
     // 3. LUKS format with keyfile (keyslot 0)
-    // --batch-mode prevents interactive confirmation prompts
+    // Pin cipher parameters explicitly for reproducibility across OS versions.
     if err := m.runner.Run(ctx, "cryptsetup", "luksFormat",
         "--type", "luks2",
         "--batch-mode",
+        "--cipher", "aes-xts-plain64",
+        "--key-size", "512",
+        "--hash", "sha512",
+        "--pbkdf", "argon2id",
         "--key-file", keyfilePath,
         device); err != nil {
         return err
     }
 
-    // 4. Add recovery keyslot (keyslot 1)
-    deviceUUID, _ := m.getLUKSUUID(ctx, device)
-    recoveryPass := DeriveRecoveryPassphrase(adminPassword, deviceUUID)
-    if err := m.addRecoveryKeyslot(ctx, device, keyfilePath, recoveryPass); err != nil {
-        return err
+    // At this point the ONLY unlock path is the ephemeral keyfile in memory.
+    // We MUST persist at least one durable unlock path before allowing cleanup.
+    // Order: store keyfile first (primary path), then add recovery keyslots (secondary).
+    keyfileStored := false
+    adminRecoveryOK := false
+    mnemonicRecoveryOK := false
+
+    // 4. Store pool keyfile in control plane (crypto/) — PRIMARY unlock path
+    if err := m.crypto.StorePoolKeyfile(ctx, keyfile); err != nil {
+        m.logger.Error("failed to store pool keyfile", "error", err)
+    } else {
+        keyfileStored = true
     }
 
-    // 5. Backup LUKS header to control plane (for disaster recovery)
+    // 5. Add admin-password recovery keyslot (keyslot 1)
+    deviceUUID, _ := m.getLUKSUUID(ctx, device)
+    recoveryPass := DeriveRecoveryPassphrase(adminPassword, deviceUUID)
+    if err := m.addKeyslot(ctx, device, keyfilePath, recoveryPass, 1); err != nil {
+        m.logger.Error("failed to add admin recovery keyslot", "error", err)
+    } else {
+        adminRecoveryOK = true
+    }
+
+    // 6. Add mnemonic recovery keyslot (keyslot 2)
+    if mnemonicKey != nil {
+        mnemonicPass := DeriveMnemonicRecoveryPassphrase(mnemonicKey, deviceUUID)
+        if err := m.addKeyslot(ctx, device, keyfilePath, mnemonicPass, 2); err != nil {
+            m.logger.Error("failed to add mnemonic recovery keyslot", "error", err)
+        } else {
+            mnemonicRecoveryOK = true
+        }
+    }
+
+    // SAFETY: At least one persistent unlock path must exist.
+    // If none succeeded, the ephemeral keyfile is about to be zeroed
+    // and the LUKS device would become permanently locked.
+    if !keyfileStored && !adminRecoveryOK && !mnemonicRecoveryOK {
+        return fmt.Errorf("LUKS formatted but no persistent unlock path: " +
+            "keyfile storage, admin recovery, and mnemonic recovery all failed; " +
+            "device may require manual recovery with the pool keyfile before reboot")
+    }
+
+    if !keyfileStored {
+        m.logger.Warn("pool keyfile not stored; recovery keyslots are the only unlock path")
+    }
+    if !adminRecoveryOK {
+        m.logger.Warn("admin recovery keyslot not added", "device", device)
+    }
+    if !mnemonicRecoveryOK {
+        m.logger.Warn("mnemonic recovery keyslot not added", "device", device)
+    }
+
+    // 7. Backup LUKS header to control plane (for disaster recovery)
     if err := m.backupLUKSHeader(ctx, device, deviceUUID); err != nil {
         m.logger.Warn("failed to backup LUKS header", "error", err)
         // Non-fatal: system can operate without header backup
-    }
-
-    // 6. Store encrypted keyfile in control plane
-    if err := m.crypto.StorePoolKeyfile(ctx, keyfile); err != nil {
-        return err
     }
 
     return nil
@@ -644,48 +893,78 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
 
 ```go
 func DeriveRecoveryPassphrase(adminPassword, deviceUUID string) []byte {
-    salt := []byte("piccolo-luks-recovery:" + deviceUUID)
+    // Versioned salt prefix: if derivation params ever change, bump the version
+    // to avoid producing incompatible passphrases on existing devices.
+    salt := []byte("piccolo-luks-recovery:v1:" + deviceUUID)
+    // Thread count aligns with crypt.Manager's Argon2 configuration:
+    // use all available cores minus one (minimum 1) to avoid starving
+    // the main goroutine during key derivation.
+    threads := uint8(max(1, runtime.NumCPU()-1))
     return argon2.IDKey(
         []byte(adminPassword),
         salt,
         3,        // time
         64*1024,  // memory (64MB)
-        4,        // threads
+        threads,  // threads (dynamic, CPU-based)
         32,       // key length
     )
 }
 
-func (m *StorageManager) addRecoveryKeyslot(ctx context.Context, device string, keyfilePath string, recoveryPass []byte) error {
-    // Write recovery passphrase to temp file (tmpfs)
-    recoveryPath := "/run/piccolo/recovery-passphrase"
-    if err := os.WriteFile(recoveryPath, recoveryPass, 0600); err != nil {
-        return fmt.Errorf("failed to write recovery passphrase: %w", err)
-    }
-    defer os.Remove(recoveryPath)
-    defer secureZero(recoveryPass)
+// DeriveMnemonicRecoveryPassphrase derives a LUKS passphrase from the
+// mnemonic-derived key material. This provides a direct unlock path for
+// /piccolo-data when the admin password is lost — the user enters their
+// 24-word recovery mnemonic, which yields mnemonicKey via crypt.Manager,
+// and this function derives the device-specific LUKS passphrase.
+func DeriveMnemonicRecoveryPassphrase(mnemonicKey []byte, deviceUUID string) []byte {
+    salt := []byte("piccolo-luks-mnemonic-recovery:v1:" + deviceUUID)
+    threads := uint8(max(1, runtime.NumCPU()-1))
+    return argon2.IDKey(
+        mnemonicKey,
+        salt,
+        3,        // time
+        64*1024,  // memory (64MB)
+        threads,  // threads (dynamic, CPU-based)
+        32,       // key length
+    )
+}
 
-    // Add recovery keyslot (keyslot 1) using pool keyfile as existing key
-    // cryptsetup luksAddKey --key-file <pool-keyfile> --key-slot 1 <device> <recovery-passphrase-file>
+// addKeyslot adds a new LUKS keyslot using the pool keyfile as the existing key.
+func (m *StorageManager) addKeyslot(ctx context.Context, device string, keyfilePath string, passphrase []byte, slot int) error {
+    // Write passphrase to temp file (tmpfs)
+    passPath := fmt.Sprintf("/run/piccolo/keyslot-%d-passphrase", slot)
+    if err := os.WriteFile(passPath, passphrase, 0600); err != nil {
+        return fmt.Errorf("failed to write keyslot passphrase: %w", err)
+    }
+    defer os.Remove(passPath)
+    defer secureZero(passphrase)
+
     if err := m.runner.Run(ctx, "cryptsetup", "luksAddKey",
         "--key-file", keyfilePath,
-        "--key-slot", "1",
+        "--key-slot", fmt.Sprintf("%d", slot),
         device,
-        recoveryPath,
+        passPath,
     ); err != nil {
-        return fmt.Errorf("failed to add recovery keyslot: %w", err)
+        return fmt.Errorf("failed to add keyslot %d: %w", slot, err)
     }
 
     return nil
 }
 
+// secureZero overwrites a byte slice with zeros. runtime.KeepAlive prevents
+// the Go compiler from optimizing away the dead stores.
 func secureZero(b []byte) {
     for i := range b {
         b[i] = 0
     }
+    runtime.KeepAlive(b)
 }
 ```
 
 ### 6.5 Admin Password Rotation Hook
+
+Password rotation must update LUKS keyslot 1 (admin-derived) on all pool devices. Keyslot 2 (mnemonic-derived) is unaffected by password rotation since it is derived from the recovery mnemonic, which does not change when the password changes.
+
+**Atomicity requirement:** Keyslot updates MUST use `cryptsetup luksChangeKey` (not `luksRemoveKey` + `luksAddKey`) to perform an atomic in-place replacement. This ensures there is never a window where the recovery keyslot is absent.
 
 ```go
 func (m *StorageManager) OnAdminPasswordRotated(ctx context.Context, oldPass, newPass string) error {
@@ -694,25 +973,129 @@ func (m *StorageManager) OnAdminPasswordRotated(ctx context.Context, oldPass, ne
         return err
     }
 
+    // Track rotation progress so we can resume after a crash.
+    progressPath := "/piccolo-core/crypto/luks-rotation-progress.json"
+    progress := &RotationProgress{
+        StartedAt: time.Now(),
+        Total:     len(devices),
+        Completed: []string{},
+    }
+    if err := writeJSON(progressPath, progress); err != nil {
+        return fmt.Errorf("failed to write rotation progress: %w", err)
+    }
+
     for _, dev := range devices {
         oldRecovery := DeriveRecoveryPassphrase(oldPass, dev.UUID)
         newRecovery := DeriveRecoveryPassphrase(newPass, dev.UUID)
-        if err := m.updateLUKSKeyslot(ctx, dev.Path, 1, oldRecovery, newRecovery); err != nil {
-            return fmt.Errorf("failed to update keyslot for %s: %w", dev.UUID, err)
+
+        // cryptsetup luksChangeKey atomically replaces keyslot 1
+        if err := m.changeLUKSKeyslot(ctx, dev.Path, 1, oldRecovery, newRecovery); err != nil {
+            return fmt.Errorf("failed to rotate keyslot 1 for %s: %w", dev.UUID, err)
         }
+
+        // Re-backup LUKS header after keyslot change
+        if err := m.backupLUKSHeader(ctx, dev.Path, dev.UUID); err != nil {
+            m.logger.Warn("failed to re-backup LUKS header after rotation", "device", dev.UUID, "error", err)
+        }
+
+        progress.Completed = append(progress.Completed, dev.UUID)
+        _ = writeJSON(progressPath, progress)
     }
+
+    // Rotation complete — remove progress file
+    os.Remove(progressPath)
+    return nil
+}
+
+// changeLUKSKeyslot atomically replaces a keyslot using cryptsetup luksChangeKey.
+func (m *StorageManager) changeLUKSKeyslot(ctx context.Context, device string, slot int, oldPass, newPass []byte) error {
+    oldPath := fmt.Sprintf("/run/piccolo/rotation-old-%d", slot)
+    newPath := fmt.Sprintf("/run/piccolo/rotation-new-%d", slot)
+
+    if err := os.WriteFile(oldPath, oldPass, 0600); err != nil {
+        return err
+    }
+    defer os.Remove(oldPath)
+    if err := os.WriteFile(newPath, newPass, 0600); err != nil {
+        return err
+    }
+    defer os.Remove(newPath)
+
+    // luksChangeKey atomically replaces the passphrase for the given keyslot
+    return m.runner.Run(ctx, "cryptsetup", "luksChangeKey",
+        "--key-file", oldPath,
+        "--key-slot", fmt.Sprintf("%d", slot),
+        device,
+        newPath,
+    )
+}
+```
+
+#### 6.5.1 Crash Recovery for Partial Rotation
+
+If `piccolod` crashes during password rotation, a `luks-rotation-progress.json` file will exist on next boot. Recovery is triggered during Phase 2 (after the user provides the new password to unlock):
+
+```go
+func (m *StorageManager) resumeRotationIfNeeded(ctx context.Context, currentPass string) error {
+    progressPath := "/piccolo-core/crypto/luks-rotation-progress.json"
+    progress, err := readJSON[RotationProgress](progressPath)
+    if errors.Is(err, os.ErrNotExist) {
+        return nil  // No rotation in progress
+    }
+    if err != nil {
+        return fmt.Errorf("failed to read rotation progress: %w", err)
+    }
+
+    m.logger.Warn("resuming interrupted LUKS keyslot rotation",
+        "completed", len(progress.Completed), "total", progress.Total)
+
+    devices, _ := m.listDataPoolDevices(ctx)
+    completed := toSet(progress.Completed)
+
+    for _, dev := range devices {
+        if completed[dev.UUID] {
+            continue  // Already rotated
+        }
+
+        // The device may have the old or new passphrase. Try both:
+        // - Derive "new" from currentPass (the password the user just provided)
+        // - Try luksChangeKey with currentPass-derived as both old and new (no-op if already rotated)
+        // - If that fails, the device still has an older passphrase — try common
+        //   recovery strategies (the pool keyfile via keyslot 0 is always available
+        //   since it is unaffected by password rotation).
+        newRecovery := DeriveRecoveryPassphrase(currentPass, dev.UUID)
+        err := m.changeLUKSKeyslot(ctx, dev.Path, 1, newRecovery, newRecovery)
+        if err != nil {
+            // Keyslot 1 still has the old passphrase — we don't have the old password,
+            // but we can kill and re-add the keyslot using the pool keyfile (keyslot 0).
+            m.logger.Warn("re-creating keyslot 1 via pool keyfile", "device", dev.UUID)
+            if err := m.rekeySlotViaPoolKeyfile(ctx, dev.Path, 1, newRecovery); err != nil {
+                return fmt.Errorf("failed to recover keyslot 1 for %s: %w", dev.UUID, err)
+            }
+        }
+
+        progress.Completed = append(progress.Completed, dev.UUID)
+        _ = writeJSON(progressPath, progress)
+    }
+
+    os.Remove(progressPath)
+    m.logger.Info("LUKS keyslot rotation recovery complete")
     return nil
 }
 ```
+
+**Note:** `resumeRotationIfNeeded` is called during Phase 2 unlock, after the user has provided the (current/new) admin password and the pool keyfile is available in memory. The pool keyfile (keyslot 0) serves as the stable "escape hatch" for re-creating any recovery keyslot.
 
 ### 6.6 LUKS Header Backup and Recovery
 
 The LUKS header contains critical metadata (keyslots, encryption parameters). If corrupted, data is unrecoverable. We backup headers to the control plane for disaster recovery.
 
 ```go
-// Stored at: /piccolo-core/control-plane/luks/headers/<device-uuid>.bin
+// Stored at: /piccolo-core/crypto/luks-header-backups/<device-uuid>.bin
+// Header backups live under crypto/ alongside other device-local key material.
+// This path is always writable (outside gocryptfs) and not replicated to peers.
 func (m *StorageManager) backupLUKSHeader(ctx context.Context, device, deviceUUID string) error {
-    backupDir := "/piccolo-core/control-plane/luks/headers"
+    backupDir := "/piccolo-core/crypto/luks-header-backups"
     if err := os.MkdirAll(backupDir, 0700); err != nil {
         return err
     }
@@ -731,7 +1114,7 @@ func (m *StorageManager) backupLUKSHeader(ctx context.Context, device, deviceUUI
 
 // Recovery: restore header then unlock with admin password
 func (m *StorageManager) restoreLUKSHeader(ctx context.Context, device, deviceUUID string) error {
-    backupPath := filepath.Join("/piccolo-core/control-plane/luks/headers", deviceUUID+".bin")
+    backupPath := filepath.Join("/piccolo-core/crypto/luks-header-backups", deviceUUID+".bin")
 
     if err := m.runner.Run(ctx, "cryptsetup", "luksHeaderRestore",
         device,
@@ -746,9 +1129,10 @@ func (m *StorageManager) restoreLUKSHeader(ctx context.Context, device, deviceUU
 ```
 
 **Recovery Model:**
-1. If LUKS header corrupts but control plane is intact → restore header from backup → unlock with pool keyfile
-2. If control plane is unavailable but LUKS header intact → unlock with admin password via recovery keyslot
-3. If both header AND control plane are lost → data is unrecoverable (by design - encryption works)
+1. If LUKS header corrupts but control plane is intact → restore header from backup → unlock with pool keyfile (keyslot 0)
+2. If control plane is unavailable but LUKS header intact → unlock with admin password via keyslot 1, or recovery mnemonic via keyslot 2
+3. If admin password is lost → recovery mnemonic unlocks control plane (via `crypt.Manager`) to get pool keyfile for keyslot 0, or directly via keyslot 2
+4. If both header AND control plane are lost → data is unrecoverable (by design — encryption works)
 
 **Header Backup Updates:**
 - Initial backup after `luksFormat`
@@ -758,23 +1142,46 @@ func (m *StorageManager) restoreLUKSHeader(ctx context.Context, device, deviceUU
 
 ### 7.1 `/piccolo-core` (Btrfs Subvolume on Root)
 
+The control plane is a gocryptfs-encrypted volume that follows the **same mount contract** as all other volumes (architecture doc §13): its mountpoint lives inside `/piccolo-core/mounts/`, is immutable (`chattr +i`, mode `0555`) when unmounted, and is only writable when the gocryptfs FUSE mount is active.
+
+Key material and volume metadata required for the unlock chain must live **outside** the gocryptfs mount (always readable). See Foundation RFC §8.1 for the full unlock chain.
+
+**Unlock chain:**
+1. `crypto/keyset.json` (always readable) → admin password + Argon2id → KEK → unseal SDEK
+2. SDEK → unwrap gocryptfs passphrase from `volumes/control-plane/piccolo.volume.json` → mount gocryptfs at `mounts/control-plane/`
+3. SDEK → unwrap `crypto/piccolo_data_pool_key.enc` → unlock LUKS `/piccolo-data`
+
 ```
 /piccolo-core/
-├── control-plane/            # encrypted control plane store
-│   ├── crypto/keyset.json    # SDEK (encrypted)
-│   └── luks/
-│       ├── pool-keyfile.enc  # LUKS pool keyfile (encrypted with SDEK)
-│       └── headers/          # LUKS header backups for disaster recovery
-│           └── <device-uuid>.bin
-├── recovery/                 # control-plane snapshots
+├── crypto/                   # key material (OUTSIDE gocryptfs, always readable, device-local)
+│   ├── keyset.json           # SDEK sealed with KEK (needed to start unlock)
+│   ├── piccolo_data_pool_key.enc  # LUKS pool keyfile wrapped with SDEK
+│   └── luks-header-backups/  # LUKS header backups (device-specific)
+│       └── <device-uuid>.bin
+├── ciphertext/
+│   └── control-plane/        # btrfs subvolume: gocryptfs ciphertext (durable encrypted payload; PCV export source)
+│       ├── gocryptfs.conf    # gocryptfs master key (encrypted with volume passphrase)
+│       └── ...               # encrypted file data
+├── volumes/
+│   └── control-plane/
+│       └── piccolo.volume.json  # volume metadata incl. wrapped gocryptfs passphrase
+├── mounts/                   # volume mountpoints (immutable when unmounted)
+│   ├── control-plane/        # gocryptfs plaintext view (control.db + CP state)
+│   └── <vol-id>/             # app volume mountpoints
+├── recovery/                 # PCV exports (portable, replicated to peers)
 │   ├── current.enc
+│   ├── current.json
 │   ├── history/
 │   └── staging/
-├── mounts/                   # volume mountpoints
-│   └── <vol-id>/
-├── network-bootstrap/        # TPM-sealed enrollment (future)
+├── network-bootstrap/        # pre-unlock remote/bootstrap state (TPM-sealed later)
 └── clusterdb/etcd/           # etcd data (future, cluster mode)
 ```
+
+**Directory classification:**
+- **Portable (replicated):** `recovery/` — PCV exports for peer replication and orchestrator backup.
+- **Device-local (not replicated):** `crypto/` (keyset, pool keyfile, LUKS headers), `network-bootstrap/`, `ciphertext/`, `volumes/`.
+
+**Note:** “Device-local” here means these directories are not replicated *as live state*. The portable PCV export under `recovery/` is the mechanism for portability/replication.
 
 ### 7.2 `/piccolo-data` (LUKS2 + Btrfs Partition)
 
@@ -831,7 +1238,7 @@ const (
     OnboardingComplete    OnboardingState = "complete"     // Setup complete
 )
 
-// Stored in /piccolo-core/control-plane/onboarding.json
+// Stored in /piccolo-core/network-bootstrap/onboarding.json
 type OnboardingConfig struct {
     BootMode    BootMode        `json:"boot_mode"`
     State       OnboardingState `json:"state"`
@@ -848,16 +1255,36 @@ type OnboardingStatus struct {
     Required   bool            `json:"required"`
     BootMode   BootMode        `json:"boot_mode"`
     State      OnboardingState `json:"state"`
-    Options    []string        `json:"options,omitempty"` // ["install_disk", "try_live"]
+    Options    []string        `json:"options,omitempty"` // dynamic: see below
 }
 
 // POST /api/v1/system/onboarding
 type OnboardingChoice struct {
     Choice string `json:"choice"` // "install_disk" or "try_live"
 }
+
+// buildOnboardingOptions determines available options based on hardware.
+// "Install to Disk" is only offered when a non-boot internal disk is detected.
+// On devices with no internal disk (e.g., Raspberry Pi booting from SD/USB),
+// only "Try Live" is available.
+func buildOnboardingOptions(ctx context.Context, bootDisk string) []string {
+    internalDisks := discoverInternalDisks(ctx, bootDisk)
+    if len(internalDisks) > 0 {
+        return []string{"install_disk", "try_live"}
+    }
+    return []string{"try_live"}
+}
+
+// discoverInternalDisks finds non-USB block devices that are not the boot disk.
+func discoverInternalDisks(ctx context.Context, excludeDisk string) []string {
+    // lsblk -ndo NAME,TRAN,TYPE — filter for type "disk", TRAN != "usb", NAME != excludeDisk
+    // ...
+}
 ```
 
-### 9.3 "Try Live" Flow
+### 9.3 "Try Live" Flow (Evaluation-Only)
+
+> **Note:** "Try Live" runs the full storage posture on the boot USB. This is an evaluation-only mode — see §2.5 for contract implications.
 
 When user selects "Try Live":
 
@@ -899,17 +1326,28 @@ func (p *Preparer) ValidateUSBPartitioning(ctx context.Context, disk string) err
 }
 ```
 
-### 9.4 "Install to Disk" Flow (Deferred)
+### 9.4 "Install to Disk" Flow (v1, phased)
 
-This RFC does NOT implement "Install to Disk". When selected:
+Install to Disk is a **v1 requirement** (see product acceptance criteria in `org-context/02_product/acceptance_features/install_to_disk_x86.feature`). This RFC does not fully specify UI/UX, but it defines the storage posture contracts the installer must satisfy.
 
-1. Return error indicating feature not yet available
-2. Or: Show message directing user to use piccolo-os installer
+**Core contract (always true):**
+- Target disk ends up in the production two-root posture:
+  - `/piccolo-core` on internal root btrfs (fixed)
+  - `/piccolo-data` on an internal LUKS2 + btrfs partition (expandable pool)
+- After reboot, the installed system must boot from the internal disk and continue with normal setup/unlock flows.
 
-Future RFC will implement:
-- Detect internal disk
-- btrfs send/receive from USB to internal
-- Reboot into internal disk
+**Phased implementation plan (all within v1 scope):**
+1. **Fresh start**
+   - Wipe + install to internal disk.
+   - Reboot into the installed system and run first-run setup.
+2. **Carry over current state**
+   - Copy the live system state (admin, apps, configuration) from USB to the internal install target.
+   - Reboot and resume with the migrated state.
+3. **Dry-run simulation**
+   - Compute and present the full plan (target disk, partitions/filesystems, estimated time, and what will be erased) without writing to disk.
+
+**Implementation note (expected approach):**
+- Use `btrfs send | btrfs receive` to sync the live root filesystem to the target disk (matching the PRD), then apply the same disk-prep posture on the target disk (root sizing + `/piccolo-data` creation + LUKS2 init).
 
 ## 10. Component Changes
 
@@ -928,10 +1366,12 @@ type Manager struct {
     emergencyErr error        // Error that caused emergency mode
 }
 
-// Phase 1: Boot-time operations (called before server starts)
+// Phase 1: Boot-time operations (runs in background after server starts)
 func (m *Manager) DetectBootMode(ctx context.Context) (BootMode, error)
 func (m *Manager) GetDiskState(ctx context.Context) (*DiskState, error)
-func (m *Manager) PreparePartitioning(ctx context.Context) error  // Phase 1: partition prep
+func (m *Manager) StartPartitioningAsync(ctx context.Context)     // Phase 1: launches background goroutine
+func (m *Manager) WaitForPhase1(ctx context.Context) error        // Blocks until Phase 1 completes
+func (m *Manager) IsPhase1Complete() bool                         // Non-blocking check
 func (m *Manager) IsEmergencyMode() bool
 func (m *Manager) EmergencyError() error
 
@@ -1000,21 +1440,21 @@ func NewGinServer() (*GinServer, error) {
         // Register onboarding endpoints, wait for user choice
     }
 
-    // PHASE 1: Boot-time partitioning (non-blocking, no password needed)
+    // PHASE 1: Boot-time partitioning (background, non-blocking)
+    // The server starts immediately — the portal shows "Preparing storage..."
+    // while disk prep runs in a background goroutine.
     if needsDiskPrep(diskState) {
-        if err := storageMgr.PreparePartitioning(ctx); err != nil {
-            // Don't crash - enter emergency mode
-            storageMgr.logger.Error("partitioning failed, entering emergency mode", "error", err)
-            // Server will start in emergency mode (see Section 12.3)
-        }
+        storageMgr.StartPartitioningAsync(ctx) // sets storageMgr.phase1Done channel on completion
     }
 
-    // Server starts here - portal becomes available
+    // Server starts here - portal becomes available immediately
+    // Portal shows "Preparing storage..." until Phase 1 completes
     // ...
 
     // PHASE 2 happens later, triggered by API:
     // - POST /api/v1/crypto/setup (first boot) → storageMgr.InitializeDataVolume(ctx, password)
     // - POST /api/v1/crypto/unlock (subsequent) → storageMgr.Unlock(ctx, password)
+    // Phase 2 handlers block on Phase 1 completion before proceeding.
 }
 
 // In crypto handlers:
@@ -1157,39 +1597,12 @@ func (p *Preparer) CreateDataPartition(ctx context.Context) error {
 
 ### 12.2 LUKS Initialization Failures
 
-```go
-func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPassword string) error {
-    // LUKS format is atomic - either succeeds or device is unchanged
+The canonical `InitializeLUKS` in §6.3 is the authoritative implementation. Key error handling properties:
 
-    // Generate keyfile first
-    keyfile, err := GeneratePoolKeyfile()
-    if err != nil {
-        return err
-    }
-
-    // Format LUKS
-    if err := m.luksFormat(ctx, device, keyfile); err != nil {
-        // Device unchanged, can retry
-        return fmt.Errorf("LUKS format failed: %w", err)
-    }
-
-    // Add recovery keyslot
-    if err := m.addRecoveryKeyslot(ctx, device, keyfile, adminPassword); err != nil {
-        // LUKS formatted but no recovery keyslot
-        // This is recoverable - can add keyslot later
-        m.logger.Error("failed to add recovery keyslot", "error", err)
-    }
-
-    // Store keyfile in control plane
-    if err := m.crypto.StorePoolKeyfile(ctx, keyfile); err != nil {
-        // Critical failure - LUKS exists but keyfile not stored
-        // Recovery: user must use admin password via recovery keyslot
-        return fmt.Errorf("failed to store keyfile: %w (use admin password to recover)", err)
-    }
-
-    return nil
-}
-```
+1. **`luksFormat` is atomic** — either succeeds or the device is unchanged. If it fails, the caller can retry safely.
+2. **Keyfile is persisted first** (before recovery keyslots) — this is the primary unlock path and has the highest success probability.
+3. **"At least one persistent unlock path" invariant** — if the pool keyfile, admin recovery keyslot, and mnemonic recovery keyslot all fail to persist, the function returns an error. The LUKS device exists but may become permanently locked on reboot. The error message instructs the operator to preserve the ephemeral keyfile in `/run/piccolo/` before rebooting.
+4. **Partial keyslot failure is non-fatal** — if only one or two of the three unlock paths succeed, the system continues with degraded recovery options and logs warnings.
 
 ### 12.3 Emergency Mode
 
@@ -1238,6 +1651,21 @@ func (m *Manager) enterEmergencyMode(err error, reason string) {
 2. **Portal shows error page** - User sees "Storage Initialization Failed" with details
 3. **Most APIs disabled** - Only diagnostic and recovery endpoints work
 4. **No crash loop** - System stays up for debugging
+
+**Pre-unlock / emergency endpoint allowlist:**
+
+These endpoints are available before admin unlock and during emergency mode. All other API paths are blocked until the control plane is unlocked and `/piccolo-data` is mounted.
+
+| Endpoint | Purpose | Available |
+|---|---|---|
+| `/` (portal shell) | Serves the Flutter Web UI (locked/onboarding/emergency states) | Always |
+| `/api/v1/system/health` | Health check for load balancers and monitoring | Always |
+| `/api/v1/system/emergency` | Emergency mode diagnostics | Emergency only |
+| `/api/v1/system/onboarding` | USB boot onboarding flow | Pre-unlock (USB boot) |
+| `/api/v1/crypto/setup` | First-run admin password setup | Pre-unlock (first boot) |
+| `/api/v1/crypto/unlock` | Unlock control plane + `/piccolo-data` | Pre-unlock (subsequent boots) |
+
+**Note:** Device discovery (mDNS/`piccolo.local`) is handled at the OS level by Avahi, not by piccolod endpoints.
 
 ```go
 // Emergency mode middleware
@@ -1314,18 +1742,19 @@ On fresh piccolo-os image:
   - Note: Default mode provides confidentiality only, not integrity/authentication
   - Integrity protection would require dm-integrity or authenticated modes (future consideration)
 - Temp keyfile written to tmpfs (/run), never to disk
-- LUKS header backed up to control plane for disaster recovery
+- LUKS header backed up to control plane for disaster recovery (device-local only; not part of PCV exports)
 
 ## 15. Future Work
 
 Out of scope for this RFC:
 
-1. **"Install to Disk"** - btrfs send from USB to internal disk
-2. **USB device hotplug** - detecting and adding USB storage expansion
+1. **USB storage expansion management** - hotplug detection and adding/removing devices to the `/piccolo-data` pool
+2. **Adopt disk ("Use as-is") flows** - mounting and incorporating existing disks without formatting
 3. **JuiceFS integration** - per-volume filesystems
 4. **Cluster mode** - etcd placement
-5. **Network bootstrap** - TPM enrollment
+5. **Network-bootstrap hardening** - TPM enrollment and sealing
 6. **Degraded mode UI** - surfacing pool status
+7. **LUKS2 authenticated encryption** - `dm-integrity` or AEAD modes for tamper detection on physically accessible devices
 
 ## 16. Required System Tools
 
@@ -1338,6 +1767,7 @@ The following CLI tools are required and must be declared as **RPM dependencies*
 | `sfdisk` | util-linux | Partition boundary queries (JSON output) |
 | `growpart` | growpart (or cloud-utils-growpart) | Expanding root partition |
 | `partprobe` | parted | Reloading partition table |
+| `partx` | util-linux | Reloading/adding partition entries when full re-read is refused |
 | `cryptsetup` | cryptsetup | LUKS2 formatting, key management |
 | `mkfs.btrfs` | btrfs-progs | Filesystem creation |
 | `btrfs` | btrfs-progs | Subvolume operations, filesystem resize |
@@ -1361,5 +1791,11 @@ This ensures tools are installed as dependencies of piccolod rather than relying
 
 - `org-context/03_engineering/storage_architecture.md`
 - `piccolo-os/kiwi/microos-ots/piccolo-os.kiwi`
-- `internal/persistence/file_volume_manager.go`
+- `docs/rfc/20260202-storage-v2-foundation.md`
+- `internal/persistence/file_volume_manager.go` (legacy persistence v1; will be replaced in v2)
 - `internal/crypt/manager.go`
+
+## Implementation Notes & Status
+- 2026-02-01: Drafted. No code changes landed yet.
+- 2026-02-04: Review pass. Fixed: (1) canonical InitializeLUKS with defensive "at least one unlock path" check and keyfile-first ordering; (2) added LUKS keyslot 2 for 24-word recovery mnemonic; (3) pinned LUKS cipher parameters; (4) added power failure recovery table for Phase 1; (5) fixed secureZero with runtime.KeepAlive; (6) added password rotation crash recovery logic; (7) specified luksChangeKey for atomic keyslot replacement; (8) fixed small disk error message formula; (9) "Install to Disk" hidden when no internal disk detected; (10) clarified pool key placement as outside gocryptfs, device-local.
+- 2026-02-04: Parallel review fixes. Fixed: (11) `.ciphertext/` → `ciphertext/` (removed dot prefix to match existing codebase); (12) Argon2 thread count now dynamic (`max(1, runtime.NumCPU()-1)`) to align with crypt.Manager; (13) Phase 1 disk prep now runs in background after server starts (portal available immediately, shows "Preparing storage..."); (14) added §5.0 partition table preconditions; (15) added 20GB root rationale (MicroOS recommended max); (16) added pre-unlock endpoint allowlist table.

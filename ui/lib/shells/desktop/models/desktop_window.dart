@@ -5,6 +5,7 @@ class DesktopWindow {
   final String title;
   final IconData icon;
   final String? iconUrl; // Optional network image icon (takes precedence over icon)
+  final String? originalIconUrl; // Original catalog icon URL for SVG detection
   final Widget child;
   final List<Widget>? actions; // Custom title bar actions
   Offset position;
@@ -23,6 +24,7 @@ class DesktopWindow {
     required this.title,
     required this.icon,
     this.iconUrl,
+    this.originalIconUrl,
     required this.child,
     required this.position,
     required this.size,

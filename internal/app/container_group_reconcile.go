@@ -59,9 +59,7 @@ func (m *AppManager) handleStartupFailure(state *FilesystemStateManager, appInst
 	if err := state.StoreAppMetadata(appInst); err != nil {
 		log.Printf("WARN: handleStartupFailure %s: failed to persist state: %v", appInst.InstanceID, err)
 	}
-	if err := m.updateStatusWithEvent(state, appInst.InstanceID, status); err != nil {
-		log.Printf("WARN: handleStartupFailure %s: failed to emit status event: %v", appInst.InstanceID, err)
-	}
+	m.updateStatusWithEvent(appInst.InstanceID, status)
 	return status
 }
 
@@ -101,10 +99,9 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 	// Emit "starting" status if we're about to start containers (RFC 20260125).
 	// This ensures UI shows the "Starting..." banner during reconciliation-triggered starts.
-	if desiredRunning && appInst.Status != "running" && appInst.Status != "starting" {
-		if err := m.updateStatusWithEvent(state, appInst.InstanceID, "starting"); err != nil {
-			log.Printf("WARN: reconcile %s: failed to persist starting status: %v", appInst.InstanceID, err)
-		}
+	observed := m.getObservedStatus(appInst.InstanceID)
+	if desiredRunning && observed != StatusRunning && observed != StatusStarting {
+		m.updateStatusWithEvent(appInst.InstanceID, StatusStarting)
 	}
 
 	mode := piccoloModeFromExtensions(def.Extensions)
@@ -164,6 +161,8 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			if m.serviceManager != nil {
 				m.serviceManager.RemoveApp(appInst.InstanceID)
 			}
+			// Observed status reflects local container state - containers are stopped on this machine.
+			m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
 			return nil
 		}
 
@@ -177,12 +176,14 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	}
 
 	// If we don't desire running (stopped app or follower), stop all containers and remove proxies
-	// but do not change persisted desired state (status field).
+	// but do not change persisted desired state (Enabled field).
 	if !desiredRunning {
 		_ = m.stopContainersForMultiApp(ctx, appInst, def, runtime)
 		if m.serviceManager != nil {
 			m.serviceManager.RemoveApp(appInst.InstanceID)
 		}
+		// Observed status reflects local container state - containers are stopped on this machine.
+		m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
 		return nil
 	}
 
@@ -338,16 +339,12 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		}
 	}
 
-	if appInst.Status != "running" {
-		// Reset startup failure tracking and update status in a single persistence operation.
-		prevStatus := appInst.Status
+	if m.getObservedStatus(appInst.InstanceID) != StatusRunning {
 		resetStartupTracking(appInst)
-		appInst.Status = "running"
-		appInst.UpdatedAt = time.Now()
 		if err := state.StoreAppMetadata(appInst); err != nil {
-			log.Printf("WARN: reconcile %s: failed to persist running status: %v", appInst.InstanceID, err)
+			log.Printf("WARN: reconcile %s: failed to persist startup tracking reset: %v", appInst.InstanceID, err)
 		}
-		m.publishAppStatusChanged(appInst.InstanceID, "running", prevStatus)
+		m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
 	}
 
 	// Restore endpoints/proxies and ensure published ports match our expected allocations.
@@ -409,8 +406,8 @@ func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *F
 			appInst.PrimaryService = newInst.PrimaryService
 			appInst.NetworkAnchorID = newInst.NetworkAnchorID
 			appInst.Containers = newInst.Containers
-			appInst.Status = "running"
 			resetStartupTracking(appInst)
+			m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
 			if err := state.StoreAppMetadata(appInst); err != nil {
 				log.Printf("WARN: reconcile app %s: failed to persist recovered state: %v", appInst.InstanceID, err)
 			}

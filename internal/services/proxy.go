@@ -463,6 +463,13 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				resp.Header.Add("Set-Cookie", sc)
 			}
 		}
+
+		// Set embedded marker cookie on initial iframe loads so subsequent
+		// XHR/fetch from within the iframe can propagate CHIPS context.
+		if proxyContextNeedsMarker(resp.Request.Context()) {
+			resp.Header.Add("Set-Cookie", embeddedMarkerSetCookie())
+		}
+
 		return nil
 	}
 
@@ -674,8 +681,9 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		// for LAN port-based isolation.
 		rewriteCookies := shouldRewriteLegacyCookies(r.Host)
 		partitionCookies := shouldPartitionCookies(r)
+		needsMarker := needsEmbeddedMarker(r)
 		stripAndRewriteRequestCookies(r, ep.App, rewriteCookies)
-		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies, partitionCookies)
+		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies, partitionCookies, needsMarker)
 
 		applyForwardHeaders(r, ep)
 
@@ -727,10 +735,29 @@ func (p *ProxyManager) securityHeaders(next http.Handler) http.Handler {
 		ip := net.ParseIP(remoteIp)
 		if ip != nil && (ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate()) {
 			host, _ := splitHostPortValue(r.Host)
-			// Avoid adding raw IP hosts to CSP (e.g., 127.0.0.1) to keep policy tight.
-			if host != "" && net.ParseIP(host) == nil {
-				host = host + ":*"
-				csp += " https://" + host + " http://" + host
+			if host != "" {
+				if net.ParseIP(host) == nil {
+					// Hostname-based access: add wildcard-port entries.
+					host = host + ":*"
+					csp += " https://" + host + " http://" + host
+				} else {
+					// IP-based LAN access: validate via LocalAddrContextKey to prevent
+					// Host header spoofing, then allow the portal IP as frame ancestor.
+					// Skip loopback — already covered by http://localhost:* in base CSP.
+					hostIP := net.ParseIP(host)
+					if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && hostIP != nil {
+						if localHost, _, err := net.SplitHostPort(localAddr.String()); err == nil {
+							if localIP := net.ParseIP(localHost); localIP != nil && !localIP.IsLoopback() && localIP.Equal(hostIP) {
+								// Bracket IPv6 for valid URI syntax in CSP source expressions.
+								cspHost := host
+								if hostIP.To4() == nil {
+									cspHost = "[" + host + "]"
+								}
+								csp += " http://" + cspHost + ":* https://" + cspHost + ":*"
+							}
+						}
+					}
+				}
 			}
 		}
 

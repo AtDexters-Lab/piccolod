@@ -77,7 +77,7 @@ func TestReconcileMultiContainer_StopsServicesWhenAnchorMissingAndDesiredStopped
 	now := time.Now()
 	appInst := &AppInstance{
 		InstanceID:      "demo",
-		Status:          "running",
+		Status:          StatusRunning,
 		PrimaryService:  "main",
 		NetworkAnchorID: "", // missing anchor (manual deletion or partial failure)
 		Containers: map[string]string{

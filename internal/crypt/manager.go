@@ -11,11 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 
+	"github.com/cosmos/go-bip39"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -349,8 +351,7 @@ func (m *Manager) RewrapUnlocked(newPassword string) error {
 	return fsutil.AtomicWriteFile(m.path, nb, 0o600)
 }
 
-// Recovery key management
-var wordlist = []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey", "xray", "yankee", "zulu"}
+// Recovery key management using BIP39 (256-bit entropy, 24 words).
 
 func (m *Manager) GenerateRecoveryKey(force bool) ([]string, error) {
 	m.mu.Lock()
@@ -377,22 +378,16 @@ func (m *Manager) GenerateRecoveryKey(force bool) ([]string, error) {
 	} else {
 		return nil, errors.New("unlock required")
 	}
-	// Generate 24-word mnemonic
-	words := make([]string, 24)
-	rb := make([]byte, 24)
-	if _, err := rand.Read(rb); err != nil {
-		return nil, err
+	// Generate BIP39 mnemonic (256-bit entropy → 24 words)
+	entropy, err := bip39.NewEntropy(256)
+	if err != nil {
+		return nil, fmt.Errorf("entropy generation failed: %w", err)
 	}
-	for i := 0; i < 24; i++ {
-		words[i] = wordlist[int(rb[i])%len(wordlist)]
+	mnemonic, err := bip39.NewMnemonic(entropy)
+	if err != nil {
+		return nil, fmt.Errorf("mnemonic generation failed: %w", err)
 	}
-	mnemonic := ""
-	for i, w := range words {
-		if i > 0 {
-			mnemonic += " "
-		}
-		mnemonic += w
-	}
+	words := strings.Split(mnemonic, " ")
 	// Derive RK key from mnemonic with new salt
 	rkSalt := make([]byte, 16)
 	if _, err := rand.Read(rkSalt); err != nil {
@@ -449,29 +444,27 @@ func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) (
 	if err != nil {
 		return nil, errors.New("invalid password")
 	}
-	// generate words and seal pt under RK
-	words := make([]string, 24)
-	rb := make([]byte, 24)
-	if _, err := rand.Read(rb); err != nil {
+	// Generate BIP39 mnemonic (256-bit entropy → 24 words)
+	entropy, err := bip39.NewEntropy(256)
+	if err != nil {
+		return nil, fmt.Errorf("entropy generation failed: %w", err)
+	}
+	mnemonic, err := bip39.NewMnemonic(entropy)
+	if err != nil {
+		return nil, fmt.Errorf("mnemonic generation failed: %w", err)
+	}
+	words := strings.Split(mnemonic, " ")
+	rkSalt := make([]byte, 16)
+	if _, err := rand.Read(rkSalt); err != nil {
 		return nil, err
 	}
-	for i := 0; i < 24; i++ {
-		words[i] = wordlist[int(rb[i])%len(wordlist)]
-	}
-	mnemonic := ""
-	for i, w := range words {
-		if i > 0 {
-			mnemonic += " "
-		}
-		mnemonic += w
-	}
-	rkSalt := make([]byte, 16)
-	_, _ = rand.Read(rkSalt)
 	rkKey := m.deriveKey(mnemonic, rkSalt, st.KDF)
 	block2, _ := aes.NewCipher(rkKey)
 	aead2, _ := cipher.NewGCM(block2)
 	rkNonce := make([]byte, aead2.NonceSize())
-	_, _ = rand.Read(rkNonce)
+	if _, err := rand.Read(rkNonce); err != nil {
+		return nil, err
+	}
 	rkCT := aead2.Seal(nil, rkNonce, pt, nil)
 	st.RKSalt = base64.RawStdEncoding.EncodeToString(rkSalt)
 	st.RKNonce = base64.RawStdEncoding.EncodeToString(rkNonce)
@@ -498,15 +491,9 @@ func (m *Manager) HasRecoveryKey() bool {
 }
 
 func (m *Manager) UnlockWithRecoveryKey(words []string) error {
-	if len(words) == 0 {
-		return errors.New("recovery_key required")
-	}
-	mn := ""
-	for i, w := range words {
-		if i > 0 {
-			mn += " "
-		}
-		mn += w
+	mn := strings.Join(words, " ")
+	if !bip39.IsMnemonicValid(mn) {
+		return errors.New("invalid recovery key")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

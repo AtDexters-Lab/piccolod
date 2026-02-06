@@ -62,7 +62,7 @@ func TestAppManager_LogsForService_MultiContainer(t *testing.T) {
 	now := time.Now()
 	appInst := &AppInstance{
 		InstanceID:      "demo",
-		Status:          "running",
+		Status:          StatusRunning,
 		PrimaryService:  "main",
 		NetworkAnchorID: "netns",
 		Containers: map[string]string{

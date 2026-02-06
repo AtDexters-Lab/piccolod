@@ -391,13 +391,19 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		return
 	}
 
-	// Workspace apps: handle workspace_name identity
-	if looseDef.WorkspaceName != "" && len(looseDef.Listeners) == 0 {
+	// Workspace apps: handle workspace_name identity.
+	// This block fires when the app has no listeners AND either:
+	//   - the template already contains workspace_name (custom Docker Hub flow), or
+	//   - the user supplied __app_address__ via inputs (catalog flow where
+	//     PrepareSmartDefaults injected the synthetic input).
+	appAddr, _ := userInputs["__app_address__"].(string)
+	appAddr = strings.TrimSpace(appAddr)
+	if len(looseDef.Listeners) == 0 && (looseDef.WorkspaceName != "" || appAddr != "") {
 		wsName := looseDef.WorkspaceName // default: template's workspace_name (custom Docker Hub flow)
 
 		// Catalog flow: substitute __app_address__ into workspace_name
-		if appAddress, ok := userInputs["__app_address__"].(string); ok && strings.TrimSpace(appAddress) != "" {
-			wsName = strings.TrimSpace(appAddress)
+		if appAddr != "" {
+			wsName = appAddr
 		}
 
 		// Validate and check collision (both flows)
@@ -837,6 +843,35 @@ func (s *GinServer) handleGinCatalogCategories(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"categories": cats})
+}
+
+// handleGinCatalogIcon handles GET /api/v1/catalog/:name/icon - proxy and cache app icons
+func (s *GinServer) handleGinCatalogIcon(c *gin.Context) {
+	if s.catalogManager == nil {
+		writeGinError(c, http.StatusInternalServerError, "Catalog manager not initialized")
+		return
+	}
+
+	name := c.Param("name")
+	result, err := s.catalogManager.GetIconByName(c.Request.Context(), name)
+	if err != nil {
+		if errors.Is(err, catalog.ErrIconNotFound) || errors.Is(err, catalog.ErrNoIconURL) {
+			writeGinError(c, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, catalog.ErrSSRFBlocked) {
+			writeGinError(c, http.StatusForbidden, "icon URL blocked for security reasons")
+			return
+		}
+		writeGinError(c, http.StatusBadGateway, "failed to fetch icon")
+		return
+	}
+
+	// Set cache and security headers
+	c.Header("Cache-Control", "public, max-age=86400")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+	c.Data(http.StatusOK, result.ContentType, result.Data)
 }
 
 func handleAppManagerError(c *gin.Context, err error, action string) bool {

@@ -2,9 +2,12 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -26,6 +29,11 @@ const (
 	CacheDuration    = 15 * time.Minute
 	DefaultPageSize  = 20
 	MaxPageSize      = 100
+
+	// Icon caching constants
+	IconCacheDuration = 24 * time.Hour
+	IconMaxSize       = 1 << 20 // 1MB
+	IconFetchTimeout  = 10 * time.Second
 )
 
 type Manager struct {
@@ -33,10 +41,36 @@ type Manager struct {
 	cacheDir   string
 	httpClient *http.Client
 
+	// SSRF-safe HTTP client for fetching external icon URLs
+	iconHTTPClient *http.Client
+
 	cacheMu     sync.RWMutex
 	cachedApps  []api.CatalogItem
 	lastUpdated time.Time
 }
+
+// IconResult contains the fetched icon data and content type.
+type IconResult struct {
+	Data        []byte
+	ContentType string
+}
+
+// iconMeta stores metadata for cached icons on disk.
+type iconMeta struct {
+	ContentType string    `json:"content_type"`
+	FetchedAt   time.Time `json:"fetched_at"`
+}
+
+// SSRF protection errors
+var (
+	ErrSSRFBlocked     = errors.New("SSRF: blocked private/loopback/link-local IP")
+	ErrIconNotFound    = errors.New("icon not found for app")
+	ErrNoIconURL       = errors.New("app has no icon URL")
+	ErrInvalidIconURL  = errors.New("invalid icon URL")
+	ErrIconTooLarge    = errors.New("icon exceeds maximum size")
+	ErrInvalidMIMEType = errors.New("invalid MIME type for icon")
+	ErrInvalidAppName  = errors.New("invalid app name for cache")
+)
 
 type FilterOptions struct {
 	Query         string
@@ -57,13 +91,115 @@ func NewManager(repoURL, cacheDir string) *Manager {
 		if err := os.MkdirAll(cacheDir, 0755); err != nil {
 			log.Printf("WARN: failed to create catalog cache dir %s: %v", cacheDir, err)
 		}
+		// Create icons subdirectory
+		if err := os.MkdirAll(filepath.Join(cacheDir, "icons"), 0755); err != nil {
+			log.Printf("WARN: failed to create icons cache dir: %v", err)
+		}
 	}
 
 	return &Manager{
-		repoURL:    repoURL,
-		cacheDir:   cacheDir,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		repoURL:        repoURL,
+		cacheDir:       cacheDir,
+		httpClient:     &http.Client{Timeout: 10 * time.Second},
+		iconHTTPClient: newSSRFSafeClient(),
 	}
+}
+
+// newSSRFSafeClient creates an HTTP client with SSRF protection.
+// It blocks connections to private, loopback, and link-local IP addresses.
+func newSSRFSafeClient() *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   IconFetchTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return ssrfSafeDialContext(ctx, dialer, network, addr)
+		},
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	return &http.Client{
+		Timeout:   IconFetchTimeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("stopped after 3 redirects")
+			}
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return fmt.Errorf("blocked redirect to non-HTTP scheme: %s", req.URL.Scheme)
+			}
+			return nil
+		},
+	}
+}
+
+// ssrfSafeDialContext resolves DNS and blocks private/loopback/link-local IPs.
+// It dials validated IPs directly to prevent DNS rebinding (TOCTOU) attacks,
+// and tries all safe IPs in order for Happy Eyeballs-like fallback on dual-stack networks.
+func ssrfSafeDialContext(ctx context.Context, dialer *net.Dialer, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve DNS first to check the actual IPs
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate all IPs — reject immediately if any resolve to blocked ranges
+	var safeIPs []net.IP
+	for _, ip := range ips {
+		if isBlockedIP(ip.IP) {
+			return nil, fmt.Errorf("%w: %s resolved to %s", ErrSSRFBlocked, host, ip.IP)
+		}
+		safeIPs = append(safeIPs, ip.IP)
+	}
+
+	if len(safeIPs) == 0 {
+		return nil, fmt.Errorf("no IP addresses found for %s", host)
+	}
+
+	// Try each safe IP in order (handles dual-stack fallback when IPv6 is unreachable)
+	var lastErr error
+	for _, ip := range safeIPs {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// isBlockedIP checks if an IP should be blocked for SSRF protection.
+func isBlockedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	// Block loopback (127.0.0.0/8, ::1)
+	if ip.IsLoopback() {
+		return true
+	}
+	// Block private addresses (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7)
+	if ip.IsPrivate() {
+		return true
+	}
+	// Block link-local (169.254.0.0/16, fe80::/10)
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	// Block unspecified (0.0.0.0, ::)
+	if ip.IsUnspecified() {
+		return true
+	}
+	return false
 }
 
 // ensureCache checks if cache is valid, otherwise refreshes it.
@@ -384,4 +520,207 @@ func containsTag(tags []string, query string) bool {
 		}
 	}
 	return false
+}
+
+// GetIconByName fetches and caches the icon for a catalog app.
+// Returns the icon data and content type, using disk cache with 24h TTL.
+func (m *Manager) GetIconByName(ctx context.Context, appName string) (*IconResult, error) {
+	if err := m.ensureCache(ctx, false); err != nil {
+		m.cacheMu.RLock()
+		if len(m.cachedApps) == 0 {
+			m.cacheMu.RUnlock()
+			return nil, err
+		}
+		m.cacheMu.RUnlock()
+		log.Printf("WARN: serving stale catalog for icon lookup due to fetch error: %v", err)
+	}
+
+	// Find the app in catalog
+	m.cacheMu.RLock()
+	var iconURL string
+	var found bool
+	for _, app := range m.cachedApps {
+		if strings.EqualFold(app.Name, appName) {
+			iconURL = app.Icon
+			found = true
+			break
+		}
+	}
+	m.cacheMu.RUnlock()
+
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrIconNotFound, appName)
+	}
+
+	if iconURL == "" {
+		return nil, fmt.Errorf("%w: %s", ErrNoIconURL, appName)
+	}
+
+	// Normalize app name for cache key (catalog lookup is case-insensitive)
+	cacheKey := strings.ToLower(appName)
+
+	// Check disk cache
+	if m.cacheDir != "" {
+		if result, err := m.loadIconFromDisk(cacheKey); err == nil {
+			return result, nil
+		}
+	}
+
+	// Validate URL
+	if !strings.HasPrefix(iconURL, "http://") && !strings.HasPrefix(iconURL, "https://") {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidIconURL, iconURL)
+	}
+
+	// Fetch icon with SSRF-safe client
+	req, err := http.NewRequestWithContext(ctx, "GET", iconURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create icon request: %w", err)
+	}
+
+	resp, err := m.iconHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch icon: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("icon fetch failed: status %d", resp.StatusCode)
+	}
+
+	// Validate Content-Type with allowlist
+	contentType := resp.Header.Get("Content-Type")
+	// Extract base MIME type without parameters (e.g., "image/png; charset=utf-8" -> "image/png")
+	baseMIME := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	allowedTypes := map[string]bool{
+		"image/png":     true,
+		"image/jpeg":    true,
+		"image/gif":     true,
+		"image/webp":    true,
+		"image/svg+xml": true,
+		"image/x-icon":  true,
+		"image/vnd.microsoft.icon": true,
+	}
+	if !allowedTypes[baseMIME] {
+		return nil, fmt.Errorf("%w: got %s", ErrInvalidMIMEType, contentType)
+	}
+
+	// Read with size limit
+	data, err := io.ReadAll(io.LimitReader(resp.Body, IconMaxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read icon body: %w", err)
+	}
+	if len(data) > IconMaxSize {
+		return nil, ErrIconTooLarge
+	}
+
+	result := &IconResult{
+		Data:        data,
+		ContentType: baseMIME,
+	}
+
+	// Save to disk cache
+	if m.cacheDir != "" {
+		if err := m.saveIconToDisk(cacheKey, result); err != nil {
+			log.Printf("WARN: failed to cache icon for %s: %v", cacheKey, err)
+		}
+	}
+
+	return result, nil
+}
+
+// sanitizeAppNameForCache validates the app name is safe to use as a filename.
+// Prevents path traversal attacks via malicious app names.
+func sanitizeAppNameForCache(appName string) (string, error) {
+	// Only allow alphanumeric, hyphen, underscore, and period (for things like "my.app")
+	// Must not start with a period (hidden files) or contain path separators
+	if appName == "" {
+		return "", ErrInvalidAppName
+	}
+	for _, r := range appName {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.') {
+			return "", fmt.Errorf("%w: contains disallowed character", ErrInvalidAppName)
+		}
+	}
+	if appName[0] == '.' {
+		return "", fmt.Errorf("%w: cannot start with period", ErrInvalidAppName)
+	}
+	if strings.Contains(appName, "..") {
+		return "", fmt.Errorf("%w: cannot contain '..'", ErrInvalidAppName)
+	}
+	return appName, nil
+}
+
+// loadIconFromDisk loads a cached icon from disk if valid (< 24h old).
+func (m *Manager) loadIconFromDisk(appName string) (*IconResult, error) {
+	if m.cacheDir == "" {
+		return nil, fmt.Errorf("no cache dir")
+	}
+
+	safeName, err := sanitizeAppNameForCache(appName)
+	if err != nil {
+		return nil, err
+	}
+
+	metaPath := filepath.Join(m.cacheDir, "icons", safeName+".meta")
+	dataPath := filepath.Join(m.cacheDir, "icons", safeName+".bin")
+
+	// Read metadata
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var meta iconMeta
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		return nil, err
+	}
+
+	// Check TTL
+	if time.Since(meta.FetchedAt) > IconCacheDuration {
+		return nil, fmt.Errorf("cache expired")
+	}
+
+	// Read icon data
+	data, err := os.ReadFile(dataPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return &IconResult{
+		Data:        data,
+		ContentType: meta.ContentType,
+	}, nil
+}
+
+// saveIconToDisk saves an icon and its metadata to disk cache.
+func (m *Manager) saveIconToDisk(appName string, result *IconResult) error {
+	if m.cacheDir == "" {
+		return fmt.Errorf("no cache dir")
+	}
+
+	safeName, err := sanitizeAppNameForCache(appName)
+	if err != nil {
+		return err
+	}
+
+	metaPath := filepath.Join(m.cacheDir, "icons", safeName+".meta")
+	dataPath := filepath.Join(m.cacheDir, "icons", safeName+".bin")
+
+	// Write icon data
+	if err := fsutil.AtomicWriteFile(dataPath, result.Data, 0644); err != nil {
+		return err
+	}
+
+	// Write metadata
+	meta := iconMeta{
+		ContentType: result.ContentType,
+		FetchedAt:   time.Now(),
+	}
+	metaData, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+
+	return fsutil.AtomicWriteFile(metaPath, metaData, 0644)
 }

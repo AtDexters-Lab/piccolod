@@ -597,9 +597,10 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 				}
 				return s.userManager.IsAppAllowed(ctx, userID, appName)
 			},
-			// RFC 20260122 §6.2: Trust X-Forwarded-Proto because Piccolo's TLS mux
-			// terminates TLS and sets this header for downstream handlers.
-			TrustForwardedProto: true,
+			// X-Forwarded-Proto is NOT trusted anywhere: the TLS mux terminates
+			// TLS and forwards cleartext HTTP via io.Copy — it never injects
+			// HTTP headers. TLS is detected via RequestArrivedViaTLS
+			// (r.TLS + proxy hints).
 		})
 	}
 
@@ -835,19 +836,33 @@ func (s *GinServer) portalOriginForRequest(r *http.Request) string {
 	case "http":
 		portalPort = envPort
 	case "https":
-		// In a common "https reverse proxy → piccolod:80" setup, X-Forwarded-Proto indicates https
-		// while piccolod listens on 80; do not append :80 to the external origin.
+		// When the request arrived over TLS (r.TLS or secureContextKeyInstance), the scheme
+		// is https. PORT typically reflects the HTTP listener (e.g. 80); do not
+		// append :80 to an https origin.
 		if envPort != 80 {
 			portalPort = envPort
 		}
 	}
 
 	host := ""
-	if s.mdnsManager != nil {
+	// Honor access mode: if the request arrived via IP, use that IP as the portal
+	// host instead of the mDNS hostname. Validate via LocalAddrContextKey to ensure
+	// the claimed Host IP matches the actual interface that received the connection.
+	reqHost := canonicalHost(r.Host)
+	if reqIP := net.ParseIP(reqHost); reqIP != nil && !reqIP.IsLoopback() {
+		if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+			if localHost, _, err := net.SplitHostPort(localAddr.String()); err == nil {
+				if localIP := net.ParseIP(localHost); localIP != nil && localIP.Equal(reqIP) {
+					host = reqHost
+				}
+			}
+		}
+	}
+	if host == "" && s.mdnsManager != nil {
 		host = strings.TrimSpace(s.mdnsManager.Hostname())
 	}
 	if host == "" {
-		host = canonicalHost(r.Host)
+		host = reqHost
 	}
 	if host == "" {
 		host = getPreferredOutboundIP()
@@ -857,6 +872,10 @@ func (s *GinServer) portalOriginForRequest(r *http.Request) string {
 	}
 	if portalPort != 0 && portalPort != defaultPort {
 		host = net.JoinHostPort(host, strconv.Itoa(portalPort))
+	} else if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		// Bracket bare IPv6 for valid URI syntax when port is omitted (default port).
+		// net.JoinHostPort handles this in the non-default-port branch above.
+		host = "[" + host + "]"
 	}
 	return scheme + "://" + host
 }
@@ -965,6 +984,10 @@ func (s *GinServer) setupGinRoutes() {
 
 		// CA certificate download (public - needed before login for HTTPS setup)
 		v1.GET("/system/ca.crt", s.handleCADownload)
+
+		// Icon proxy (public, read-only - icons are public catalog metadata;
+		// unauthenticated so Image.network/SvgPicture.network work cross-origin in dev)
+		v1.GET("/catalog/:name/icon", s.handleGinCatalogIcon)
 
 		// All other API endpoints require session + CSRF
 		authed := v1.Group("/")
@@ -1075,6 +1098,7 @@ func (s *GinServer) setupGinRoutes() {
 		admin.GET("/catalog/categories", s.handleGinCatalogCategories)
 		admin.GET("/catalog/:name/template", s.handleGinCatalogTemplate)
 		admin.GET("/catalog/:name/configure", s.handleGinCatalogConfigure)
+		// Icon proxy is registered below outside admin group (public, read-only)
 
 		// Services list (Needs filtering)
 		authed.GET("/services", s.handleGinServicesAll)
@@ -1213,7 +1237,18 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 			lanBase := s.mdnsManager.Hostname()
 			// RFC 20260122 §4.4: Use 2-level mDNS format with hyphen separator
 			lanHostname := hostnamepkg.DeriveLANHostname(ep.DerivedHostLabel, lanBase)
-			lanHostURL := fmt.Sprintf("%s://%s", scheme, lanHostname)
+			// Honor request scheme: host-based URLs route through the :443 TLS mux
+			// when the portal is on HTTPS, so return https:// directly instead of
+			// forcing every frontend consumer to upgrade the scheme.
+			lanScheme := scheme
+			if s.isSecureRequest(c.Request) && (scheme == "http" || scheme == "ws") {
+				if scheme == "http" {
+					lanScheme = "https"
+				} else {
+					lanScheme = "wss"
+				}
+			}
+			lanHostURL := fmt.Sprintf("%s://%s", lanScheme, lanHostname)
 			result["lan_host_url"] = lanHostURL
 		}
 
@@ -1246,14 +1281,11 @@ func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoin
 	r := c.Request
 
 	// Suppress local URLs only for nexus/TLS-mux proxied requests (remote access).
-	// These are identified by the secureContextKey set in the secure loopback handler,
-	// or by the X-Forwarded-Proto header set by the TLS mux.
+	// Identified by secureContextKey set in the secure loopback handler.
 	// Internal HTTPS requests (r.TLS != nil from :443 listener) are still LAN requests
 	// and should receive local URLs so the UI can offer new-tab fallback.
+	// X-Forwarded-Proto is NOT trusted (spoofable by any client).
 	if r.Context().Value(secureContextKeyInstance) != nil {
-		return nil
-	}
-	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
 		return nil
 	}
 
@@ -2056,22 +2088,30 @@ func (s *GinServer) httpsRedirectMiddleware() gin.HandlerFunc {
 }
 
 // isRemoteSecureRequest returns true only for requests arriving through the
-// nexus/remote TLS path (secureContextKey) or an HTTPS reverse proxy
-// (X-Forwarded-Proto). Internal HTTPS (LAN :443) is NOT included because
-// those requests should not receive remote-only headers such as HSTS.
+// nexus/remote TLS path (secureContextKey). Internal HTTPS (LAN :443) is NOT
+// included because those requests should not receive remote-only headers such
+// as HSTS.
+//
+// X-Forwarded-Proto is NOT trusted here — the TLS mux terminates TLS and
+// forwards cleartext HTTP via io.Copy without injecting HTTP headers. Remote
+// portal traffic goes through the secure loopback which sets
+// secureContextKeyInstance. Trusting X-Forwarded-Proto would let any LAN
+// client spoof a remote-secure context.
 func (s *GinServer) isRemoteSecureRequest(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
-	if r.Context().Value(secureContextKeyInstance) != nil {
-		return true
-	}
-	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		return true
-	}
-	return false
+	return r.Context().Value(secureContextKeyInstance) != nil
 }
 
+// isSecureRequest returns true for requests that arrived over a secure channel:
+// direct TLS (:443) or the TLS mux secure loopback (secureContextKey).
+//
+// X-Forwarded-Proto is NOT trusted — the TLS mux terminates TLS and forwards
+// cleartext HTTP via io.Copy without injecting HTTP headers. All legitimate
+// secure paths are covered by r.TLS (LAN HTTPS) and secureContextKeyInstance
+// (TLS mux → secure loopback). Trusting the header would let any client
+// bypass the HTTPS redirect.
 func (s *GinServer) isSecureRequest(r *http.Request) bool {
 	if r == nil {
 		return false
@@ -2079,13 +2119,7 @@ func (s *GinServer) isSecureRequest(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	if v := r.Context().Value(secureContextKeyInstance); v != nil {
-		return true
-	}
-	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		return true
-	}
-	return false
+	return r.Context().Value(secureContextKeyInstance) != nil
 }
 
 func canonicalHost(v string) string {

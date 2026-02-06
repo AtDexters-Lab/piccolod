@@ -35,7 +35,7 @@ func TestStoreAppMetadata(t *testing.T) {
 		// Store metadata
 		appInst := &AppInstance{
 			InstanceID:      instanceID,
-			Status:          "running",
+			Enabled:         true,
 			NetworkAnchorID: "anchor123",
 			Containers:      map[string]string{"main": "container456"},
 			CreatedAt:       time.Now(),
@@ -74,7 +74,7 @@ func TestStoreAppMetadata(t *testing.T) {
 
 		appInst := &AppInstance{
 			InstanceID:      instanceID,
-			Status:          "stopped",
+			Enabled:         false,
 			NetworkAnchorID: "anchor789",
 			CreatedAt:       time.Now(),
 			UpdatedAt:       time.Now(),
@@ -92,8 +92,8 @@ func TestStoreAppMetadata(t *testing.T) {
 		if !exists {
 			t.Error("app not found in cache after StoreAppMetadata")
 		}
-		if cached.Status != "stopped" {
-			t.Errorf("cached status mismatch: got %q, want %q", cached.Status, "stopped")
+		if cached.Enabled != false {
+			t.Errorf("cached Enabled mismatch: got %v, want false", cached.Enabled)
 		}
 		if cached.NetworkAnchorID != "anchor789" {
 			t.Errorf("cached NetworkAnchorID mismatch: got %q, want %q", cached.NetworkAnchorID, "anchor789")

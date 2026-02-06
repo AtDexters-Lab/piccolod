@@ -1,11 +1,13 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import '../../../core/config/core_config.dart';
 import '../../../core/models/app_models.dart';
 import '../../../core/models/app_status_event.dart';
 import '../../../features/apps/app_detail_view.dart';
 import '../../../features/apps/app_launcher.dart';
 import '../../../shared/widgets/action_progress_dialog.dart';
+import '../../../shared/widgets/app_icon.dart';
 import '../../../shared/widgets/uninstall_confirmation_dialog.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../desktop_controller.dart';
@@ -19,13 +21,24 @@ class Stage extends StatefulWidget {
   State<Stage> createState() => _StageState();
 }
 
+/// Cached icon data for an app.
+class _CachedIcon {
+  /// The proxy URL to load the icon from.
+  final String proxyUrl;
+
+  /// The original icon URL from the catalog (for SVG detection).
+  final String? originalUrl;
+
+  _CachedIcon({required this.proxyUrl, this.originalUrl});
+}
+
 class _StageState extends State<Stage> {
   List<App> _apps = [];
   bool _isLoading = true;
   String? _error;
 
-  // Icon cache: maps app name to icon URL
-  final Map<String, String?> _iconCache = {};
+  // Icon cache: maps app name/catalogSource to cached icon data
+  final Map<String, _CachedIcon?> _iconCache = {};
 
   // Track previous auth state to detect changes
   bool _wasAuthenticated = false;
@@ -159,10 +172,17 @@ class _StageState extends State<Stage> {
       );
       if (!mounted) return;
 
-      // Build icon map from catalog items
+      // Build icon cache from catalog items using proxy URLs
       for (final item in catalog.apps) {
         if (catalogKeys.contains(item.name)) {
-          _iconCache[item.name] = item.icon;
+          if (item.icon != null && item.icon!.isNotEmpty) {
+            _iconCache[item.name] = _CachedIcon(
+              proxyUrl: CoreConfig.catalogIconUrl(item.name),
+              originalUrl: item.icon,
+            );
+          } else {
+            _iconCache[item.name] = null;
+          }
         }
       }
 
@@ -179,7 +199,7 @@ class _StageState extends State<Stage> {
     }
   }
 
-  String? _getAppIconUrl(App app) {
+  _CachedIcon? _getAppIcon(App app) {
     // Use catalogSource for icon lookup if available, otherwise fall back to name
     final key = app.catalogSource.isNotEmpty ? app.catalogSource : app.name;
     return _iconCache[key];
@@ -210,13 +230,15 @@ class _StageState extends State<Stage> {
         orElse: () => services.first,
       );
 
+      final cachedIcon = _getAppIcon(app);
       AppLauncher.healthGatedOpen(
         context: context,
         controller: widget.controller,
         appService: widget.controller.appService,
         app: app,
         service: primary,
-        iconUrl: _getAppIconUrl(app),
+        iconUrl: cachedIcon?.proxyUrl,
+        originalIconUrl: cachedIcon?.originalUrl,
       );
     } else {
       // Stopped app: open detail view
@@ -226,7 +248,7 @@ class _StageState extends State<Stage> {
 
   void _openSettings(App app, {int initialTab = 0}) {
     final windowId = "app-detail-${app.name}";
-    final iconUrl = _getAppIconUrl(app);
+    final cachedIcon = _getAppIcon(app);
     if (widget.controller.isAppOpen(windowId)) {
       widget.controller.focusWindow(windowId);
     } else {
@@ -239,9 +261,11 @@ class _StageState extends State<Stage> {
           appService: widget.controller.appService,
           desktopController: widget.controller,
           initialTab: initialTab,
-          iconUrl: iconUrl,
+          iconUrl: cachedIcon?.proxyUrl,
+          originalIconUrl: cachedIcon?.originalUrl,
         ),
-        iconUrl: iconUrl,
+        iconUrl: cachedIcon?.proxyUrl,
+        originalIconUrl: cachedIcon?.originalUrl,
       );
     }
   }
@@ -540,13 +564,17 @@ class _StageState extends State<Stage> {
           runSpacing: 24,
           children: [
             // App tiles
-            ..._apps.map((app) => _AppTile(
-                  app: app,
-                  iconUrl: _getAppIconUrl(app),
-                  onTap: () => _openApp(app),
-                  onSecondaryTap: (position) =>
-                      _showContextMenu(context, app, position),
-                )),
+            ..._apps.map((app) {
+              final cachedIcon = _getAppIcon(app);
+              return _AppTile(
+                app: app,
+                iconUrl: cachedIcon?.proxyUrl,
+                originalIconUrl: cachedIcon?.originalUrl,
+                onTap: () => _openApp(app),
+                onSecondaryTap: (position) =>
+                    _showContextMenu(context, app, position),
+              );
+            }),
             // Add tile
             _AddTile(onTap: () => widget.controller.openAppStore()),
           ],
@@ -559,12 +587,14 @@ class _StageState extends State<Stage> {
 class _AppTile extends StatefulWidget {
   final App app;
   final String? iconUrl;
+  final String? originalIconUrl;
   final VoidCallback onTap;
   final void Function(Offset position) onSecondaryTap;
 
   const _AppTile({
     required this.app,
     this.iconUrl,
+    this.originalIconUrl,
     required this.onTap,
     required this.onSecondaryTap,
   });
@@ -623,40 +653,18 @@ class _AppTileState extends State<_AppTile> {
                   ),
                   child: Stack(
                     children: [
-                      // App icon (network image or first letter fallback)
+                      // App icon using AppIcon widget with SVG support
                       Center(
-                        child: widget.iconUrl != null &&
-                                widget.iconUrl!.isNotEmpty
-                            ? ClipRRect(
-                                borderRadius: BorderRadius.circular(12),
-                                child: Image.network(
-                                  widget.iconUrl!,
-                                  width: 48,
-                                  height: 48,
-                                  fit: BoxFit.cover,
-                                  errorBuilder: (context, error, stackTrace) => Text(
-                                    widget.app.displayTitle.isNotEmpty
-                                        ? widget.app.displayTitle[0]
-                                            .toUpperCase()
-                                        : '?',
-                                    style: const TextStyle(
-                                      fontSize: 28,
-                                      fontWeight: FontWeight.bold,
-                                      color: PiccoloTheme.cobalt600,
-                                    ),
-                                  ),
-                                ),
-                              )
-                            : Text(
-                                widget.app.displayTitle.isNotEmpty
-                                    ? widget.app.displayTitle[0].toUpperCase()
-                                    : '?',
-                                style: const TextStyle(
-                                  fontSize: 28,
-                                  fontWeight: FontWeight.bold,
-                                  color: PiccoloTheme.cobalt600,
-                                ),
-                              ),
+                        child: AppIcon(
+                          proxyUrl: widget.iconUrl,
+                          originalIconUrl: widget.originalIconUrl,
+                          size: 48,
+                          borderRadius: 12,
+                          fallbackText: widget.app.displayTitle.isNotEmpty
+                              ? widget.app.displayTitle[0]
+                              : '?',
+                          fallbackBackgroundColor: Colors.transparent,
+                        ),
                       ),
                       // Status dot
                       Positioned(
