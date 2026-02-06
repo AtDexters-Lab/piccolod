@@ -147,6 +147,18 @@ const (
 )
 
 func DetectBootMode(ctx context.Context) (BootMode, error) {
+    // CI/QA override: allows unattended provisioning in VM/container environments
+    // where lsblk TRAN is empty (virtio) and the onboarding UI cannot be clicked.
+    // Not for production use — the env var is only respected in test/CI images.
+    if override := os.Getenv("PICCOLO_BOOT_MODE_OVERRIDE"); override != "" {
+        switch BootMode(override) {
+        case BootModeInternal, BootModeUSB, BootModeUnknown:
+            return BootMode(override), nil
+        default:
+            return "", fmt.Errorf("invalid PICCOLO_BOOT_MODE_OVERRIDE value: %q", override)
+        }
+    }
+
     // Get root device
     rootDev, err := getRootDevice(ctx)  // e.g., /dev/sda2
     if err != nil {
@@ -207,6 +219,8 @@ func getTransportType(ctx context.Context, disk string) (string, error) {
 | Empty or unrecognized | Unknown | Ambiguous (virtio, iSCSI, some RAID); show onboarding flow so user confirms before partition writes |
 
 **Unknown mode behavior:** `BootModeUnknown` follows the same flow as `BootModeUSB` — it shows the onboarding UI and requires explicit user confirmation before any disk prep runs. This is safer than auto-running partition writes on ambiguous hardware. VM users (the primary case for empty TRAN) are expected to be hands-on and will simply click "Try Piccolo" to proceed.
+
+**CI/QA override:** Set `PICCOLO_BOOT_MODE_OVERRIDE=internal` (or `usb`/`unknown`) to bypass `lsblk` transport detection. This enables unattended provisioning in VM/container CI environments where `TRAN` is empty and the onboarding UI cannot be clicked. The env var is checked first in `DetectBootMode`; if set, it short-circuits all detection logic. Not intended for production use.
 
 ### 4.2 Boot Flow by Mode
 
@@ -587,7 +601,12 @@ func (p *Preparer) getDiskSizeGB(ctx context.Context, disk string) (int, error) 
     if err != nil {
         return 0, fmt.Errorf("failed to parse disk size: %w", err)
     }
-    return int(sizeBytes / (1024 * 1024 * 1024)), nil
+    // Ceiling division: a 20.1 GB disk must report 21 GB, not 20 GB, to ensure
+    // calculatePartitionLayout sees enough space for both root and data partitions.
+    // Floor division would silently lose the fractional GB and could push a
+    // borderline disk below the MinDataPartitionGB threshold.
+    const gib = int64(1024 * 1024 * 1024)
+    return int((sizeBytes + gib - 1) / gib), nil
 }
 
 // getSectorSize queries the logical sector size of a disk
@@ -923,8 +942,15 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
         keyfileStored = true
     }
 
-    // 5. Generate and persist KDF params for this device
-    deviceUUID, _ := m.getLUKSUUID(ctx, device)
+    // 5. Generate and persist KDF params for this device.
+    // getLUKSUUID MUST succeed — the UUID is used as the salt anchor for all
+    // recovery keyslot derivations. If it fails, the device was not actually
+    // formatted (or the header is unreadable), and continuing would produce
+    // non-recoverable keyslots.
+    deviceUUID, err := m.getLUKSUUID(ctx, device)
+    if err != nil {
+        return fmt.Errorf("failed to read LUKS UUID after format: %w", err)
+    }
     kdfParams, err := NewLUKSKDFParams(deviceUUID)
     if err != nil {
         return fmt.Errorf("failed to generate KDF params: %w", err)
@@ -1120,10 +1146,27 @@ When the user rotates their recovery mnemonic (via `POST /api/v1/crypto/recovery
 ```go
 // OnRecoveryMnemonicRotated updates keyslot 2 on all /piccolo-data LUKS devices
 // when the user generates a new recovery mnemonic.
-func (m *StorageManager) OnRecoveryMnemonicRotated(ctx context.Context, oldMnemonicKey, newMnemonicKey []byte) error {
+// Uses crypt.Manager.WithMnemonicKey() callbacks (old + new) so raw key material
+// stays inside the crypto module scope — matching the WithSDEK pattern.
+//
+// Crash recovery: tracks progress via mnemonic-rotation-progress.json, matching
+// the password rotation pattern in §6.6.1. On crash, resumeMnemonicRotationIfNeeded
+// uses the pool keyfile (keyslot 0) to re-create keyslot 2.
+func (m *StorageManager) OnRecoveryMnemonicRotated(ctx context.Context) error {
     devices, err := m.listDataPoolDevices(ctx)
     if err != nil {
         return err
+    }
+
+    // Track rotation progress for crash recovery (matching §6.6 pattern)
+    progressPath := paths.CoreJoin("crypto", "mnemonic-rotation-progress.json")
+    progress := &RotationProgress{
+        StartedAt: time.Now(),
+        Total:     len(devices),
+        Completed: []string{},
+    }
+    if err := writeJSON(progressPath, progress); err != nil {
+        return fmt.Errorf("failed to write mnemonic rotation progress: %w", err)
     }
 
     for _, dev := range devices {
@@ -1131,8 +1174,21 @@ func (m *StorageManager) OnRecoveryMnemonicRotated(ctx context.Context, oldMnemo
         if err != nil {
             return fmt.Errorf("failed to read KDF params for %s: %w", dev.UUID, err)
         }
-        oldPass := DeriveMnemonicRecoveryPassphrase(oldMnemonicKey, params)
-        newPass := DeriveMnemonicRecoveryPassphrase(newMnemonicKey, params)
+
+        // Derive old and new passphrases via callbacks
+        var oldPass, newPass []byte
+        if err := m.crypto.WithOldMnemonicKey(func(oldKey []byte) error {
+            oldPass = DeriveMnemonicRecoveryPassphrase(oldKey, params)
+            return nil
+        }); err != nil {
+            return fmt.Errorf("failed to derive old mnemonic passphrase: %w", err)
+        }
+        if err := m.crypto.WithMnemonicKey(func(newKey []byte) error {
+            newPass = DeriveMnemonicRecoveryPassphrase(newKey, params)
+            return nil
+        }); err != nil {
+            return fmt.Errorf("failed to derive new mnemonic passphrase: %w", err)
+        }
 
         if err := m.changeLUKSKeyslot(ctx, dev.Path, 2, oldPass, newPass); err != nil {
             return fmt.Errorf("failed to rotate keyslot 2 for %s: %w", dev.UUID, err)
@@ -1142,7 +1198,64 @@ func (m *StorageManager) OnRecoveryMnemonicRotated(ctx context.Context, oldMnemo
             m.logger.Warn("failed to re-backup LUKS header after mnemonic rotation",
                 "device", dev.UUID, "error", err)
         }
+
+        progress.Completed = append(progress.Completed, dev.UUID)
+        _ = writeJSON(progressPath, progress)
     }
+
+    os.Remove(progressPath)
+    return nil
+}
+```
+
+#### 6.5.1 Crash Recovery for Mnemonic Rotation
+
+If `piccolod` crashes during mnemonic rotation, a `mnemonic-rotation-progress.json` file will exist on next boot. Recovery uses the pool keyfile (keyslot 0) to re-create keyslot 2, matching the password rotation crash recovery pattern in §6.6.1.
+
+```go
+func (m *StorageManager) resumeMnemonicRotationIfNeeded(ctx context.Context) error {
+    progressPath := paths.CoreJoin("crypto", "mnemonic-rotation-progress.json")
+    progress, err := readJSON[RotationProgress](progressPath)
+    if errors.Is(err, os.ErrNotExist) {
+        return nil  // No rotation in progress
+    }
+    if err != nil {
+        return fmt.Errorf("failed to read mnemonic rotation progress: %w", err)
+    }
+
+    m.logger.Warn("resuming interrupted mnemonic keyslot rotation",
+        "completed", len(progress.Completed), "total", progress.Total)
+
+    devices, _ := m.listDataPoolDevices(ctx)
+    completed := toSet(progress.Completed)
+
+    for _, dev := range devices {
+        if completed[dev.UUID] {
+            continue  // Already rotated
+        }
+
+        // Re-create keyslot 2 using the pool keyfile (always available after unlock)
+        // and the current (new) mnemonic key via callback.
+        params, _ := readJSON[LUKSKDFParams](kdfParamsPath(dev.UUID))
+        var newPass []byte
+        if err := m.crypto.WithMnemonicKey(func(key []byte) error {
+            newPass = DeriveMnemonicRecoveryPassphrase(key, params)
+            return nil
+        }); err != nil {
+            return fmt.Errorf("failed to derive mnemonic passphrase for recovery: %w", err)
+        }
+
+        m.logger.Warn("re-creating keyslot 2 via pool keyfile", "device", dev.UUID)
+        if err := m.rekeySlotViaPoolKeyfile(ctx, dev.Path, 2, newPass); err != nil {
+            return fmt.Errorf("failed to recover keyslot 2 for %s: %w", dev.UUID, err)
+        }
+
+        progress.Completed = append(progress.Completed, dev.UUID)
+        _ = writeJSON(progressPath, progress)
+    }
+
+    os.Remove(progressPath)
+    m.logger.Info("mnemonic keyslot rotation recovery complete")
     return nil
 }
 ```
@@ -1599,20 +1712,24 @@ func (m *Manager) IsEmergencyMode() bool
 func (m *Manager) EmergencyError() error
 
 // Phase 2: Post-auth operations (called from API handlers)
-func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string, mnemonicKey []byte) error  // Phase 2: LUKS + mount
+func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string) error  // Phase 2: LUKS + mount
 func (m *Manager) Unlock(ctx context.Context, adminPassword string) error  // Subsequent boots
 func (m *Manager) Lock(ctx context.Context) error
 
 // Lifecycle hooks
 func (m *Manager) OnAdminPasswordRotated(ctx context.Context, oldPass, newPass string) error
-func (m *Manager) OnRecoveryMnemonicRotated(ctx context.Context, oldMnemonicKey, newMnemonicKey []byte) error
+func (m *Manager) OnRecoveryMnemonicRotated(ctx context.Context) error  // Uses crypt.Manager.WithMnemonicKey callback
 ```
 
 ### 10.2 New Package: `internal/storage/diskprep`
 
 **`CommandRunner` interface (shared across storage packages):**
 
-All CLI operations (`sgdisk`, `cryptsetup`, `btrfs`, etc.) are routed through a `CommandRunner` interface to enable unit testing with mock commands. The interface mirrors the existing `commandRunner` in `internal/persistence/file_volume_manager.go`.
+All CLI operations (`sgdisk`, `cryptsetup`, `btrfs`, etc.) are routed through a `CommandRunner` interface to enable unit testing with mock commands.
+
+**Consolidation note:** The existing `commandRunner` in `internal/persistence/file_volume_manager.go` has signature `Run(ctx, name, []string, []byte)` (args as slice, optional stdin). This new interface uses variadic args and splits stdin into a separate method (`RunWithStdin`). During implementation, the legacy interface should be migrated to the new one so both storage and persistence share a single `CommandRunner` definition (likely in a shared `internal/exec` or `internal/runner` package).
+
+**`secureZero` consolidation:** The `secureZero` helper in §6.3 duplicates `zeroBytes` in `internal/crypt/manager.go`. During implementation, consolidate into a single shared utility (e.g., `internal/crypto/zero.go`) used by both packages.
 
 ```go
 // CommandRunner abstracts CLI execution for testability.
@@ -1722,18 +1839,19 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
     // can be enrolled during InitializeDataVolume. The mnemonic words are
     // returned to the user in the setup response for safekeeping.
     //
-    // NOTE: crypt.Manager.GenerateRecoveryKey currently returns ([]string, error).
-    // This RFC requires it to also return the raw mnemonic key material ([]byte)
-    // so it can be passed to InitializeDataVolume for LUKS keyslot 2 enrollment.
-    // The API change: GenerateRecoveryKey(display bool) → (words []string, key []byte, err error)
-    mnemonicWords, mnemonicKey, err := s.crypto.GenerateRecoveryKey(false)
+    // NOTE: Raw mnemonic key material must NOT cross API handler boundaries.
+    // Instead of returning raw bytes, crypt.Manager exposes a callback-based
+    // API matching the existing WithSDEK pattern: the crypto module controls
+    // the key's lifetime and zeroing.
+    mnemonicWords, err := s.crypto.GenerateRecoveryKey(false)
     if err != nil {
         // handle error
     }
 
     // PHASE 2: Initialize /piccolo-data (LUKS + btrfs + mount)
-    // mnemonicKey is passed so keyslot 2 is enrolled immediately.
-    if err := s.storageMgr.InitializeDataVolume(ctx, password, mnemonicKey); err != nil {
+    // Mnemonic keyslot enrollment uses crypt.Manager.WithMnemonicKey() callback
+    // so raw key material stays inside the crypto module scope.
+    if err := s.storageMgr.InitializeDataVolume(ctx, password); err != nil {
         // handle error - could be retried
     }
 
@@ -1773,8 +1891,18 @@ func (p *Preparer) GetPartitionState(ctx context.Context) (*PartitionState, erro
         UnallocatedGB:  calculateUnallocated(disk, partitions),
     }
 
-    // Check root size
-    state.RootNeedsExpansion = state.RootPartition.SizeGB < RootTargetSizeGB
+    // Check root size using the same sizing rules as CreateDataPartition (§5.4).
+    // Using calculatePartitionLayout instead of the fixed RootTargetSizeGB constant
+    // ensures consistency on small disks where root gets a proportional 70% share.
+    diskSizeGB, err := p.getDiskSizeGB(ctx, disk)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get disk size: %w", err)
+    }
+    layout, err := calculatePartitionLayout(diskSizeGB)
+    if err != nil {
+        return nil, fmt.Errorf("failed to calculate partition layout: %w", err)
+    }
+    state.RootNeedsExpansion = state.RootPartition.SizeGB < layout.RootGB
 
     // Find data partition by LUKS type code (8309) or label
     state.DataPartition = findPartitionByTypeCode(partitions, "8309")
@@ -1884,6 +2012,13 @@ type EmergencyState struct {
 }
 
 func (m *Manager) PreparePartitioning(ctx context.Context) error {
+    // Phase 1 timeout: disk prep should complete in seconds on healthy hardware.
+    // A 5-minute timeout catches hung I/O (dead disk, stuck partition table lock)
+    // rather than blocking the phase1Done channel indefinitely while the user
+    // waits on the portal.
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+    defer cancel()
+
     // 1. Verify /piccolo-core exists
     if err := m.diskPrep.VerifyPiccoloCoreExists(ctx); err != nil {
         m.enterEmergencyMode(err, "OS image is broken: /piccolo-core subvolume missing")
@@ -2098,3 +2233,4 @@ This ensures tools are installed as dependencies of piccolod rather than relying
 - 2026-02-06: Third review pass. Blocking fixes: (21) Argon2 thread cap at 8 for portability; (22) Argon2 memory 512 MiB to match crypt.Manager; (23) hardcoded path replaced with `paths.CoreRoot()`; (24) keyslot 0 uses pbkdf2 (high-entropy keyfile, argon2 adds no value); (25) kernel partition verification loop after partprobe; (26) mnemonic always enrolled at setup, added `OnRecoveryMnemonicRotated` hook. Significant fixes: (27) emergency middleware path matching rewritten (old `/` prefix matched all paths); (28) specified `rekeySlotViaPoolKeyfile` implementation; (29) mapper collision check before `cryptsetup open`; (30) `CommandRunner` interface note for testability; (31) no-fstab design rationale documented; (32) 32-byte salt rationale (RFC 9106 §4). Suggestions: (33) GPT partition label `piccolo-data`; (34) btrfs filesystem label; (35) audit events section added (§14).
 - 2026-02-06: Cross-review validation. Fixed: (36) ephemeral keyfile cleanup is now conditional — skipped on all-three-failed path so operator can recover; (37) USB onboarding guard prevents async partitioning before user chooses "Try Piccolo"; (38) renamed "Try Live" → "Try Piccolo" throughout to match PRD and acceptance features.
 - 2026-02-06: Fourth review pass (combined assessment). Fixes: (39) three-mode boot detection — added `BootModeUnknown` for ambiguous transports (virtio, iSCSI), follows USB onboarding flow; (40) `partitionDevicePath()` helper for mmcblk/nvme/loop naming; (41) 1 MiB sector alignment for data partition start; (42) LUKS all-paths-failed is now a reflash scenario (no SSH, no manual cryptsetup); (43) `reloadPartitionTable` narrowed to specific slot (`partx --nr N:N`); (44) `CommandRunner` interface definition added to §10.2; (45) gin_server pseudocode handles `BootModeUnknown`; (46) `GenerateRecoveryKey` API change noted (returns key material); (47) Install to Disk failure/retry handling documented.
+- 2026-02-07: Fifth review pass (combined assessment). Fixes: (48) `GetPartitionState` root expansion check now uses `calculatePartitionLayout` instead of fixed `RootTargetSizeGB` — ensures consistency on small disks with proportional 70% split; (49) `PICCOLO_BOOT_MODE_OVERRIDE` env var for CI/QA unattended provisioning in VMs; (50) `getLUKSUUID` error handling changed from silent discard to fail-fast — UUID is the KDF salt anchor; (51) `getDiskSizeGB` uses ceiling division to avoid under-counting fractional GBs; (52) Phase 1 `PreparePartitioning` now wraps context with 5-minute timeout; (53) mnemonic rotation (`OnRecoveryMnemonicRotated`) updated to callback-based pattern matching `WithSDEK`/`WithMnemonicKey`, with crash recovery progress tracking (§6.5.1) matching password rotation pattern; (54) `CommandRunner` interface consolidation note — legacy `commandRunner` in `file_volume_manager.go` should be migrated to shared definition; (55) `secureZero`/`zeroBytes` consolidation note added to §10.2.

@@ -221,7 +221,10 @@ This is performed by `piccolod` during control-plane setup (PR 2 in §11). Witho
 #### Consistency boundary
 Since gocryptfs writes to the ciphertext directory are not atomic at the directory level, copying `ciphertext/control-plane/` while the mount is active could produce a corrupt snapshot. To ensure consistency:
 
-- **Flush FUSE writes before snapshot:** When the control plane is mounted (unlocked), gocryptfs writes flow through FUSE and may be buffered in the kernel page cache before reaching the btrfs ciphertext directory. Call `syncfs()` on a file descriptor opened on `ciphertext/control-plane/` before taking the snapshot to ensure all in-flight FUSE writes are durable on the btrfs subvolume. When locked (no FUSE mount active), `syncfs()` is still safe (no-op for the subvolume) and keeps the code path unconditional.
+- **Flush FUSE writes before snapshot (two-step):** When the control plane is mounted (unlocked), gocryptfs buffers writes in its userspace FUSE process before they reach the btrfs ciphertext directory. A single `syncfs()` on the ciphertext directory only flushes btrfs-level pages — it does **not** force FUSE-buffered writes through. The correct flush sequence is:
+  1. `syncfs()` on a file descriptor opened on the **plaintext mount** (`mounts/control-plane/`) — this forces the gocryptfs FUSE layer to push all buffered writes down to the ciphertext directory.
+  2. `syncfs()` on a file descriptor opened on the **ciphertext subvolume** (`ciphertext/control-plane/`) — this flushes btrfs dirty pages to disk.
+  When locked (no FUSE mount active), only step 2 is needed — there are no FUSE buffers to flush. The implementation should check mount state and conditionally perform step 1.
 
 - **Always use a btrfs snapshot** of `ciphertext/control-plane/` as the artifact source, regardless of whether the control plane is locked or unlocked. Since `/piccolo-core` is btrfs and `ciphertext/control-plane` is a dedicated subvolume, `btrfs subvolume snapshot -r` produces an atomic, read-only point-in-time copy. The snapshot is created in `recovery/staging/<unique-id>/`, archived into `current.enc`, then the staging snapshot is deleted via `btrfs subvolume delete`.
 
@@ -246,7 +249,7 @@ Using snapshots unconditionally (even when locked) keeps the publish pipeline si
 A new PCV export is published when **any** of the following conditions are met:
 - **On startup (dirty-check):** When the PCV publisher starts, it compares the current `ciphertext/control-plane/` subvolume generation (via `btrfs subvolume show`) against the generation recorded in `current.json`. If the subvolume has changed since the last successful publish (or if no `current.enc` exists), an immediate publish is triggered. This catches mutations that occurred while the publisher was not running (e.g., crash between a control-plane write and the debounce-triggered publish).
 - **On mutation:** a control-plane write occurs (e.g. app install/uninstall, volume creation, key rotation). Publishing uses **trailing-edge debounce**: the 30-second timer resets on each new `TopicControlStoreCommit` event, and the publish fires 30 seconds after the *last* write in a burst. This avoids publishing intermediate states during rapid sequences (e.g., bulk app install) while ensuring the final state is captured promptly.
-- **Periodic:** every 6 hours if no mutation-triggered publish has occurred, to ensure a reasonably fresh artifact is always available.
+- **Periodic:** every 6 hours if no mutation-triggered publish has occurred, to ensure a reasonably fresh artifact is always available. **Locked-state optimization:** When the control plane is locked (no FUSE mount = no writes possible), the periodic timer skips publishing if the current `ciphertext/control-plane/` subvolume generation matches the `source_subvol_generation` in `current.json` — the ciphertext is immutable while locked, so re-publishing would produce identical archives. The periodic cadence is a Foundation default; configurability is deferred to a future milestone.
 - **On demand:** via `POST /api/v1/system/pcv/publish` (endpoint name TBD; for orchestrator-driven or manual workflows).
 
 **Latch pattern:** The publisher maintains a boolean latch (`dirty`) that is set on every `TopicControlStoreCommit` event and cleared after a successful publish. The debounce timer only runs while the latch is set. This prevents redundant publishes when the periodic timer fires but no mutations have occurred since the last publish.
@@ -278,11 +281,15 @@ Minimum JSON schema (v1):
   "created_at": "2026-02-02T18:04:05Z",
   "sha256": "<hex sha256 of the .enc payload>",
   "size_bytes": 1234567,
-  "source_node_id": "node-abc123"
+  "source_node_id": "node-abc123",
+  "source_subvol_generation": 42,
+  "source_subvol_uuid": "a1b2c3d4-..."
 }
 ```
 
-**Generation ID (`gen`) ordering:** The `gen` field is `<UTC timestamp>-<6-digit monotonic counter>` (e.g., `2026-02-02T18:04:05Z-000001`). The counter increments per publish and resets on daemon restart. Lexicographic ordering of `gen` values produces chronological ordering.
+**Subvolume provenance fields:** `source_subvol_generation` and `source_subvol_uuid` record the btrfs subvolume generation and UUID of `ciphertext/control-plane/` at snapshot time (obtained via `btrfs subvolume show`). These are required for the startup dirty-check (§8.2 trigger policy) which compares the current subvolume generation against the value in the manifest to detect unpublished mutations.
+
+**Generation ID (`gen`) ordering:** The `gen` field is `<UTC timestamp>-<6-digit monotonic counter>` (e.g., `2026-02-02T18:04:05Z-000001`). The counter increments per publish. On daemon restart, the counter initializes to `previous_counter + 1` (read from `current.json`), not to 1 — this prevents duplicate gen IDs when the daemon restarts rapidly. If no `current.json` exists, the counter starts at 1. Lexicographic ordering of `gen` values produces chronological ordering.
 
 **Clock-skew handling:** On startup (and before each publish), the publisher reads the previous `current.json`'s `gen` and verifies the new `gen` is strictly greater (lexicographic). If the system clock has gone backward (e.g., NTP correction), the publisher reuses the *timestamp portion* from the previous `gen` and increments only the counter suffix. This ensures monotonicity without waiting for the clock to catch up. Example: if previous gen is `2026-02-02T18:04:05Z-000003` and current UTC is `2026-02-02T18:03:00Z` (clock went back), the new gen becomes `2026-02-02T18:04:05Z-000004`.
 
@@ -354,6 +361,8 @@ This RFC does not prescribe the full restore UX or automation — it only ensure
 
 **Authenticity model:** PCV exports use AES-GCM authenticated encryption (via gocryptfs). A PCV that can be successfully decrypted with the user's admin password or recovery mnemonic is authentic — no separate signature or HMAC is needed. AES-GCM's authentication tag ensures both integrity (no tampering) and authenticity (only someone with the correct password could have produced valid ciphertext). A corrupted or tampered PCV will fail at the gocryptfs mount step with an authentication error.
 
+**Anti-rollback (Foundation non-goal):** This model does not protect against replaying an older-but-valid PCV bundle. An attacker (or operator error) with write access to `/piccolo-core/recovery/` could replace `current.enc` with a stale export — adding a local monotonic counter file does not help since the same attacker can replace it. For Foundation (single-node), the threat model does not justify additional complexity: an attacker with root access to `/piccolo-core` can already do worse (read SDEK from memory, modify ciphertext directly). The `/piccolo-data/system-objects/control-plane-backups/` redundant copy provides an opportunistic cross-check (if a newer generation exists there, something is off). True anti-rollback requires an external trust anchor — the Piccolo Orchestrator (signed generation attestation) or cluster peer consensus — and will be specified in the cluster RFC (Milestone C).
+
 **Import procedure (programmatic contract):**
 1. Verify the PCV archive's SHA-256 matches the accompanying manifest (`current.json`).
 2. Extract the archive into a staging area.
@@ -363,9 +372,9 @@ This RFC does not prescribe the full restore UX or automation — it only ensure
 6. If unlock succeeds → import is valid, proceed with normal startup.
 7. If unlock fails → report error, do not modify existing state.
 
-**Conflict handling:** If a control plane already exists on the device, the import replaces it entirely. The previous control plane's `ciphertext/control-plane/` subvolume is renamed (e.g., `ciphertext/control-plane.bak.<timestamp>`) before extraction, and deleted after successful unlock of the imported PCV. If unlock fails, the backup is restored.
+**Conflict handling:** If a control plane already exists on the device, the import replaces it entirely. The previous control plane's `ciphertext/control-plane/` subvolume is renamed (e.g., `ciphertext/control-plane.bak.<timestamp>`) before extraction, and deleted after successful unlock of the imported PCV. If unlock fails, the backup is restored. **Stale backup cleanup:** Before creating a new `.bak` subvolume, the import procedure deletes any existing `ciphertext/control-plane.bak.*` subvolumes from previous failed import attempts (via `btrfs subvolume delete`). This prevents accumulation from repeated failures.
 
-**Implementation timeline:** The full PCV import implementation (portal UX, API endpoint, conflict handling) is deferred to post-Foundation. For Foundation, the contract and round-trip invariant (export → import → unlock succeeds) must be validated via integration tests, but the user-facing import flow is not required.
+**Implementation timeline:** Foundation includes a **minimal programmatic import endpoint** (`POST /api/v1/system/pcv/import`) that accepts a `.pcv` upload, verifies SHA-256 against the accompanying manifest, extracts to staging, handles conflict (backup existing control plane), and attempts unlock. This endpoint is API-only (no portal UX) and satisfies both the round-trip integration test requirement and the product acceptance criterion for PCV import (`backup_and_restore.feature`). The full portal-driven import UX, test-restore drill, and conflict resolution UI are deferred to post-Foundation.
 
 **Round-trip test requirement:** An integration test must verify: create control plane → write known state → export PCV → wipe `/piccolo-core` → import PCV → unlock → verify known state is intact. This test validates the export format, btrfs subvolume reconstruction, and the authenticity model end-to-end.
 
@@ -404,6 +413,7 @@ Scope (high-level):
 - Implement the directory layout and path resolution contract.
 - Replace the "bootstrap volume" concept with `network-bootstrap` on `/piccolo-core`.
 - Implement control-plane storage using the distributed layout under `/piccolo-core` (`ciphertext/control-plane/`, `crypto/`, `volumes/control-plane/`, `mounts/control-plane/` — see §5.1) and PCV exports under `/piccolo-core/recovery/`.
+- Implement a minimal PCV import endpoint (`POST /api/v1/system/pcv/import`) — API-only, no portal UX. Validates SHA-256, extracts to staging, handles existing control plane conflict, attempts unlock. Required for round-trip integration test and product acceptance.
 - Implement `/piccolo-data` pool mount orchestration (initially: mount detection + layout creation; then LUKS2 integration).
 
 ### 10.2 Milestone B — App volumes v2 (single-node)
@@ -432,13 +442,15 @@ This section intentionally outlines a layered implementation approach (reviewabl
    - Anchor control-plane material under the distributed layout in §5.1: `crypto/`, `ciphertext/control-plane/`, `volumes/control-plane/`, `mounts/control-plane/`.
    - Create `ciphertext/control-plane/` as a btrfs subvolume during first-run initialization (required for PCV export snapshots — see §8.2).
    - Ensure no control-plane writes occur outside `/piccolo-core`.
-   - **Volume ID migration:** The existing codebase uses `"control"` as the volume ID (e.g., in `internal/persistence/service.go` `ensureCoreVolumes()`). This RFC standardizes on `"control-plane"` to match the architecture doc. PR 2 must update all volume ID references from `"control"` to `"control-plane"` (constants, path construction, volume metadata). Since there are no active deployments, no runtime migration logic is needed — this is a code-only rename.
+   - **Volume ID migration:** The existing codebase uses `"control"` as the volume ID (e.g., in `internal/persistence/service.go` `ensureCoreVolumes()`). This RFC standardizes on `"control-plane"` to match the architecture doc. PR 2 must update all volume ID references from `"control"` to `"control-plane"` (constants, path construction, volume metadata). Since there are no active deployments, no runtime migration logic is needed — this is a code-only rename. **Note:** `VolumeClassControl` (value `"control"` in `internal/persistence/interfaces.go`) is a volume *class*, not an ID — it stays as-is. Only volume *ID* strings change.
+   - **`crypt.Manager` path migration (high-risk):** `crypt.NewManager()` in `internal/crypt/manager.go` currently defaults to `paths.Root()` when constructing its keyset path (`filepath.Join(stateDir, "crypto", "keyset.json")`). This must change to `paths.CoreRoot()`. Since the crypto manager is the root of the unlock chain, this is a high-priority change in PR 2 — verify keyset resolution is correct before any other control-plane path migration.
 3. **Network-bootstrap**
    - Replace the current “bootstrap volume” usage in remote config/certs with `/piccolo-core/network-bootstrap/`.
    - Preserve “remote before unlock” semantics via TPM-sealed state later.
-4. **PCV exports**
+4. **PCV exports + minimal import**
    - Implement `recovery/current.enc` publish pipeline and bounded history.
-   - Define the PCV export manifest schema and hashing.
+   - Define the PCV export manifest schema and hashing (including `source_subvol_generation` and `source_subvol_uuid`).
+   - Implement minimal `POST /api/v1/system/pcv/import` endpoint (API-only, no portal UX) with SHA-256 verification, staging extraction, conflict handling, and unlock attempt. Required for round-trip integration test.
 5. **`/piccolo-data` bring-up scaffolding**
    - Mount detection + directory creation.
    - NOCOW posture enforcement.
@@ -454,7 +466,8 @@ This section intentionally outlines a layered implementation approach (reviewabl
 - Remote config/bootstrap state is readable pre-unlock via `/piccolo-core/network-bootstrap/`.
 - Control plane material is stored under the §5.1 layout (`crypto/`, `ciphertext/control-plane/`, `volumes/control-plane/`, `mounts/control-plane/`) and can be unlocked using the admin password.
 - `ciphertext/control-plane/` is a btrfs subvolume (required for consistent PCV snapshots).
-- `piccolod` publishes PCV exports to `/piccolo-core/recovery/current.enc` atomically (readers never observe a partial file), with a valid `current.json` manifest (sha256 matches payload, size_bytes is correct), and maintains bounded history (≤ 5 generations in `history/`).
+- `piccolod` publishes PCV exports to `/piccolo-core/recovery/current.enc` atomically (readers never observe a partial file), with a valid `current.json` manifest (sha256 matches payload, size_bytes is correct, `source_subvol_generation` and `source_subvol_uuid` populated), and maintains bounded history (≤ 5 generations in `history/`).
+- PCV import via `POST /api/v1/system/pcv/import` accepts a `.pcv` upload, verifies integrity, extracts to staging, and attempts unlock. Round-trip integration test passes: create control plane → write state → export → wipe → import → unlock → verify state.
 - After unlock, `/piccolo-data` is mounted (or a clear actionable error is surfaced), the directory layout is created, and NOCOW posture is enforced where required.
 
 ## 13) Risks and mitigations
@@ -472,6 +485,7 @@ The existing `ExportManager` interface (`RunControlPlane`, `RunFullData`, `Impor
 - Remove all callers (API handlers, supervisor hooks) that reference `ExportManager`.
 - Remove associated tests.
 - The `Service` struct in `internal/persistence/service.go` drops its `ExportManager` field.
+- **Delete `runExportWithLock`** from `internal/persistence/service.go` — the old export flow locks/unlocks the control plane during export. The new PCV publisher uses btrfs snapshots and must NOT lock the control plane. These approaches are architecturally incompatible; do not wire the new publisher through the old lock pattern.
 - Delete `BootstrapStore` and `BootstrapVolume` interfaces from `internal/persistence/interfaces.go` (replaced by direct filesystem access to `/piccolo-core/network-bootstrap/`).
 - Remove the bootstrap volume concept from `VolumeManager` — the control plane is the only gocryptfs volume; network-bootstrap is a plain directory.
 - Remove associated bootstrap volume initialization logic from `service.go`'s `ensureCoreVolumes()`.
@@ -484,7 +498,7 @@ The existing `ExportManager` interface (`RunControlPlane`, `RunFullData`, `Impor
 **Integration point for mutation-triggered publishes:**
 The PCV publisher subscribes to `TopicControlStoreCommit` events (from the existing event bus) with a trailing-edge 30-second debounce (see below). The periodic 6-hour publish runs on a separate timer. Both feed into the same single-flight publish pipeline.
 
-`TopicControlStoreCommit` is emitted by the persistence layer (`internal/persistence/`) after any durable write to the control-plane store (e.g., app state change, volume metadata update, key rotation, settings change). It signals that the on-disk ciphertext has changed and a new PCV export should be queued. The event payload includes a monotonic sequence number for ordering.
+`TopicControlStoreCommit` is emitted by the persistence layer (`internal/persistence/`) after any durable write to the control-plane store (e.g., app state change, volume metadata update, key rotation, settings change). It signals that the on-disk ciphertext has changed and a new PCV export should be queued. The event payload's existing `Revision uint64` field (SQLite data_version, already monotonic) serves as the sequence number for ordering — no new event schema fields are needed.
 
 **New event bus topics:**
 - `TopicPCVExportPublished` — emitted after a successful publish (payload: generation ID, sha256).
@@ -511,7 +525,7 @@ The `Makefile` targets (`make run`, `make run-fresh`) will be updated to:
 - Optionally create a btrfs loopback for `.run-state/core` (with a `make setup-dev-btrfs` helper).
 - If btrfs is not available (detected via `stat -f -c %T`), PCV export tests that require snapshots are skipped with a clear message.
 
-**Dev/test fallback (non-btrfs):** For developers who cannot easily set up a btrfs loopback (e.g., macOS with Docker, CI without btrfs), the PCV publisher should support a **copy-based fallback** that uses `cp -a` instead of `btrfs subvolume snapshot`. This fallback is NOT crash-consistent and MUST NOT be used in production. It is gated behind an explicit env var (`PICCOLO_DEV_NO_BTRFS=1`) and logs a prominent warning on every publish. The fallback enables development and basic testing of the PCV pipeline without requiring btrfs infrastructure.
+**Dev/test fallback (non-btrfs):** For developers who cannot easily set up a btrfs loopback (e.g., macOS with Docker, CI without btrfs), the PCV publisher should support a **copy-based fallback** that uses `cp -a` instead of `btrfs subvolume snapshot`. This fallback is NOT crash-consistent and MUST NOT be used in production. It is gated behind an explicit env var (`PICCOLO_DEV_NO_BTRFS=1`) and logs a prominent warning on every publish. **FUSE safety:** When the control plane is mounted (unlocked), the fallback must perform the two-step `syncfs` flush (§8.2 consistency boundary, step 1: plaintext mount, step 2: ciphertext dir) before `cp -a` to avoid torn copies caused by in-flight gocryptfs writes. Without this, developers will see sporadic test failures that are hard to diagnose. The fallback enables development and basic testing of the PCV pipeline without requiring btrfs infrastructure.
 
 ### 15.2 Test harness
 
@@ -539,3 +553,4 @@ Convenience helper for tests that need both roots:
 - 2026-02-06: Second parallel review fixes. Fixed: (12) resolved pool key PCV inclusion contradiction — pool key IS included in PCV (node-scoped data), updated §4.1 and directory classification; (13) added per-node room concept in §8.2.2 for cluster-mode PCV scoping; (14) added `crypto/luks-kdf-params/` to PCV payload and directory layout; (15) fixed stale open question path `/piccolo-core/control-plane/` → `mounts/control-plane/`.
 - 2026-02-06: Third review pass. Blocking fixes: (16) PCV restore must create `ciphertext/control-plane/` as btrfs subvolume before extraction (§8.4); (17) `TopicControlStoreCommit` definition and payload clarified (§14); (18) always use btrfs snapshot for PCV export (no conditional locked/unlocked path). Significant fixes: (19) trailing-edge 30s debounce semantics specified; (20) staging snapshot cleanup uses `btrfs subvolume delete`; (21) gen ordering semantics documented (lexicographic = chronological, clock-skew handling); (22) PCV size guard added (100 MiB default); (23) ExportManager removal checklist expanded; (24) `source_node_id` added to manifest schema. Suggestions: (25) supervisor registration for PCV publisher; (26) fsutil reuse note; (27) directory permissions documented (0700); (28) `SetRootsForTest` convenience helper.
 - 2026-02-06: Fourth review pass (combined assessment). Blocking/critical fixes: (29) added `syncfs()` flush before btrfs snapshot to capture in-flight FUSE writes; (30) PCV import contract specified (§8.4.1) with authenticity model (AES-GCM decryptability = authenticity), conflict handling, and round-trip test requirement; (31) generation ID clock-skew handling specified — reuse previous timestamp when clock goes backward. Significant fixes: (32) TPM adapter model documented in §7.3 — all devices get remote reachability via software emulation on non-TPM; (33) `control` → `control-plane` volume ID migration noted in PR 2; (34) `BootstrapStore`/`BootstrapVolume` added to ExportManager removal checklist; (35) `PICCOLO_STATE_DIR` migration sequencing specified (additive first, fail-fast guard last); (36) startup dirty-check + latch pattern for PCV publisher; (37) `source_node_id` resolution when locked (cache + fallback); (38) dev/test btrfs fallback (`PICCOLO_DEV_NO_BTRFS=1`, copy-based, not crash-consistent); (39) pool keyfile rotation documented as non-goal (§16).
+- 2026-02-07: Fifth review pass (multi-reviewer synthesis). Blocking fixes: (40) `syncfs()` flush corrected to two-step — flush plaintext FUSE mount first, then ciphertext subvolume (single `syncfs` on ciphertext misses FUSE-buffered writes); (41) added `source_subvol_generation` and `source_subvol_uuid` to manifest schema (required for startup dirty-check implementation). Significant fixes: (42) gen counter initializes to `previous_counter + 1` on restart, not 1 (prevents duplicate gen IDs on rapid restart); (43) locked-state periodic publish now skips if subvolume generation unchanged (avoids redundant identical archives); (44) anti-rollback explicitly documented as Foundation non-goal with threat model rationale — real trust anchors are orchestrator/cluster peers (future); (45) minimal PCV import endpoint (`POST /api/v1/system/pcv/import`) added to Foundation scope (API-only, no portal UX) for round-trip test and product acceptance; (46) `runExportWithLock` added to ExportManager removal checklist (architecturally incompatible with snapshot-based pipeline); (47) `crypt.Manager` path migration from `paths.Root()` to `paths.CoreRoot()` called out as high-risk in PR 2; (48) `VolumeClassControl` disambiguation — class constant stays `"control"`, only volume ID strings change to `"control-plane"`; (49) `TopicControlStoreCommit.Revision` confirmed as the monotonic sequence number (no new event schema field needed); (50) import `.bak` subvolume cleanup added (delete stale `.bak.*` before new import); (51) dev fallback `cp -a` must perform two-step syncfs when unlocked to avoid torn copies.
