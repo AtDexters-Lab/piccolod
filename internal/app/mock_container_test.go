@@ -10,12 +10,14 @@ import (
 )
 
 type MockContainerManager struct {
-	containers  map[string]*mockContainer
-	nextID      int
-	createError error
-	startError  error
-	stopError   error
-	removeError error
+	containers     map[string]*mockContainer
+	nextID         int
+	createError    error
+	startError     error
+	stopError      error
+	removeError    error
+	removedImages  []string
+	removeImageErr error
 }
 
 type mockContainer struct {
@@ -247,9 +249,8 @@ func (m *MockContainerManager) ImageExists(ctx context.Context, runtime containe
 func (m *MockContainerManager) RemoveImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) error {
 	_ = ctx
 	_ = runtime
-	_ = imageName
-	// Mock: just succeed
-	return nil
+	m.removedImages = append(m.removedImages, imageName)
+	return m.removeImageErr
 }
 
 func (m *MockContainerManager) InspectImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) (*container.ImageConfig, error) {

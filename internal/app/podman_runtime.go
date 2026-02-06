@@ -73,3 +73,49 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 		StorageOpts:   []string{fmt.Sprintf("mount_program=%s", fuseOverlayfs)},
 	}, nil
 }
+
+// podmanImageRuntime returns a shared PodmanRuntime for workspace base image operations
+// (pull, inspect, exists, mount, unmount, remove). Unlike podmanRuntimeForApp, this uses
+// a shared root with overlay driver, providing:
+//   - Layer deduplication: overlay stores thin diffs, not VFS cumulative copies
+//   - Persistent metadata: shared root survives app install/uninstall cycles
+//   - Cross-app sharing: 10 apps with the same Debian base = 1 copy of each layer
+//
+// The shared root lives outside encrypted volumes because base images are public data.
+// Container operations (create, start, stop) continue to use per-app VFS runtimes.
+// Result is cached via sync.Once.
+func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
+	m.imageRuntimeOnce.Do(func() {
+		root := paths.Join("podman", "image-root")
+		if err := ensureDir(root, 0o700); err != nil {
+			m.imageRuntimeErr = fmt.Errorf("app manager: ensure image runtime root: %w", err)
+			return
+		}
+
+		runRootBase := os.Getenv("PICCOLO_PODMAN_RUNROOT_BASE")
+		var runRoot string
+		if runRootBase != "" {
+			runRoot = filepath.Join(filepath.Clean(runRootBase), "image-root")
+		} else {
+			runRoot = paths.Join("run", "podman", "image-root")
+		}
+		if err := ensureDir(runRoot, 0o700); err != nil {
+			m.imageRuntimeErr = fmt.Errorf("app manager: ensure image runtime runroot: %w", err)
+			return
+		}
+
+		fuseOverlayfs, err := exec.LookPath("fuse-overlayfs")
+		if err != nil {
+			m.imageRuntimeErr = fmt.Errorf("app manager: fuse-overlayfs not found: %w", err)
+			return
+		}
+
+		m.imageRuntimeVal = container.PodmanRuntime{
+			Root:          root,
+			RunRoot:       runRoot,
+			StorageDriver: "overlay",
+			StorageOpts:   []string{fmt.Sprintf("mount_program=%s", fuseOverlayfs)},
+		}
+	})
+	return m.imageRuntimeVal, m.imageRuntimeErr
+}

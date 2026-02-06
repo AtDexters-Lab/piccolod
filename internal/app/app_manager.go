@@ -63,6 +63,12 @@ type AppManager struct {
 	workspacePathResolver *workspacePathResolver
 	workspaceImageMounter *workspacedisk.PodmanImageMounter
 
+	// Shared image runtime for workspace base images (overlay driver, shared root).
+	// Cached via sync.Once to avoid repeated LookPath + ensureDir calls.
+	imageRuntimeOnce sync.Once
+	imageRuntimeVal  container.PodmanRuntime
+	imageRuntimeErr  error
+
 	// Internal CA path for OIDC trust
 	internalCAPath string
 }
@@ -116,40 +122,33 @@ func mergeEnvMaps(base, override map[string]string) map[string]string {
 }
 
 // workspaceRuntimeResolver implements workspacedisk.RuntimeResolver
-// by looking up podman runtime configuration for app instances.
+// by returning the shared image runtime args for podman image mount/unmount.
+// Workspace base images live in the shared image runtime (overlay, shared root),
+// so image mount operations must use those args to find the image.
 type workspaceRuntimeResolver struct {
 	am *AppManager
 }
 
 func (r *workspaceRuntimeResolver) GetRuntimeArgs(ctx context.Context, instanceID string) ([]string, error) {
-	// Ensure the volume is available (this might trigger attachment)
-	layout, err := r.am.ensureAppVolumeLayout(ctx, instanceID)
+	// Use the shared image runtime for image mount/unmount operations.
+	// The instanceID is not used — the image runtime is shared across all apps.
+	rt, err := r.am.podmanImageRuntime()
 	if err != nil {
-		return nil, fmt.Errorf("ensure volume layout: %w", err)
-	}
-
-	// Get the podman runtime configuration
-	// Use ModeWorkspace since this resolver is specifically for workspace terminal access
-	runtime, err := r.am.podmanRuntimeForApp(instanceID, layout, ModeWorkspace)
-	if err != nil {
-		return nil, fmt.Errorf("get runtime: %w", err)
+		return nil, fmt.Errorf("get image runtime: %w", err)
 	}
 
 	// Convert configuration to command-line arguments
 	args := []string{}
-	if runtime.Root != "" {
-		args = append(args, "--root", runtime.Root)
+	if rt.Root != "" {
+		args = append(args, "--root", rt.Root)
 	}
-	if runtime.RunRoot != "" {
-		args = append(args, "--runroot", runtime.RunRoot)
+	if rt.RunRoot != "" {
+		args = append(args, "--runroot", rt.RunRoot)
 	}
-	if runtime.Imagestore != "" {
-		args = append(args, "--imagestore", runtime.Imagestore)
+	if rt.StorageDriver != "" {
+		args = append(args, "--storage-driver", rt.StorageDriver)
 	}
-	if runtime.StorageDriver != "" {
-		args = append(args, "--storage-driver", runtime.StorageDriver)
-	}
-	for _, opt := range runtime.StorageOpts {
+	for _, opt := range rt.StorageOpts {
 		args = append(args, "--storage-opt", opt)
 	}
 
@@ -215,6 +214,14 @@ func (m *AppManager) SetMountVerifier(fn func(string) error) {
 	m.stateInitMu.Lock()
 	m.mountVerifier = fn
 	m.stateInitMu.Unlock()
+}
+
+// SetImageRuntimeForTest overrides the shared image runtime. Intended for tests
+// where fuse-overlayfs is not available.
+func (m *AppManager) SetImageRuntimeForTest(rt container.PodmanRuntime) {
+	m.imageRuntimeOnce.Do(func() {}) // exhaust the Once
+	m.imageRuntimeVal = rt
+	m.imageRuntimeErr = nil
 }
 
 // SetEventBus configures the event bus for publishing app status change events.
@@ -1684,6 +1691,12 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 		return err
 	}
 
+	// Prune orphaned images from the shared image runtime (workspace mode only).
+	// Service mode images live in per-app roots and the shared imagestore, not the image runtime.
+	if piccoloModeFromExtensions(def.Extensions) == ModeWorkspace {
+		m.pruneOrphanedImages(ctx, state, def, instanceID)
+	}
+
 	// If purging, reset podman storage BEFORE unmounting the volume.
 	// This allows podman to properly clean its metadata files (db.sql, locks, etc.)
 	// which live inside the encrypted volume.
@@ -1730,6 +1743,77 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 	m.publishAppStatusChanged(instanceID, "uninstalled", prevStatus)
 
 	return nil
+}
+
+// collectReferencedImages returns the set of images still referenced by installed
+// workspace apps, excluding the app being uninstalled. Always includes the network
+// anchor image. Only workspace-mode apps are considered because the image runtime
+// only stores workspace base images — service-mode images live in per-app roots
+// and are not affected by workspace image pruning.
+func (m *AppManager) collectReferencedImages(state *FilesystemStateManager, excludeInstanceID string) map[string]bool {
+	referenced := map[string]bool{
+		networkAnchorImage(): true,
+	}
+	for _, app := range state.ListApps() {
+		if app.InstanceID == excludeInstanceID {
+			continue
+		}
+		def, err := state.GetAppDefinition(app.InstanceID)
+		if err != nil {
+			// Cannot determine what images this app references — abort all pruning
+			// to avoid accidentally removing images that may still be in use.
+			log.Printf("WARN: image prune: cannot read definition for %s, aborting prune: %v", app.InstanceID, err)
+			return nil
+		}
+		if def.Services == nil {
+			continue
+		}
+		// Only workspace-mode apps use the shared image runtime.
+		if piccoloModeFromExtensions(def.Extensions) != ModeWorkspace {
+			continue
+		}
+		for _, svc := range def.Services {
+			if svc.Image != "" {
+				referenced[svc.Image] = true
+			}
+		}
+	}
+	return referenced
+}
+
+// pruneOrphanedImages removes workspace base images from the shared image runtime
+// that are no longer referenced by any installed app. Best-effort: failures are logged
+// but never fatal to uninstall. Only targets the image runtime — service mode images
+// in per-app roots and the shared imagestore are not affected.
+func (m *AppManager) pruneOrphanedImages(ctx context.Context, state *FilesystemStateManager, def *api.AppDefinition, excludeInstanceID string) {
+	if def == nil || def.Services == nil {
+		return
+	}
+
+	imageRuntime, err := m.podmanImageRuntime()
+	if err != nil {
+		log.Printf("WARN: image prune: cannot get image runtime: %v", err)
+		return
+	}
+
+	referenced := m.collectReferencedImages(state, excludeInstanceID)
+	if referenced == nil {
+		return // Aborted due to unreadable app definitions
+	}
+
+	for svcName, svc := range def.Services {
+		if svc.Image == "" {
+			continue
+		}
+		if referenced[svc.Image] {
+			continue
+		}
+		if err := m.containerManager.RemoveImage(ctx, imageRuntime, svc.Image); err != nil {
+			log.Printf("WARN: image prune: failed to remove %s (service %s): %v", svc.Image, svcName, err)
+		} else {
+			log.Printf("INFO: image prune: removed orphaned image %s (service %s)", svc.Image, svcName)
+		}
+	}
 }
 
 // UpdateImage updates an app instance's container image tag and recreates the container preserving services.
