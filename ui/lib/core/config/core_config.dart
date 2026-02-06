@@ -26,4 +26,14 @@ class CoreConfig {
     // Fallback for weird schemes or bare domains
     return 'ws://$apiBaseUrl';
   }
+
+  /// Returns the proxy URL for fetching a catalog app's icon.
+  ///
+  /// The icon proxy endpoint provides SSRF protection and caching.
+  /// Example: `catalogIconUrl('nextcloud')` returns `/api/v1/catalog/nextcloud/icon`
+  /// (or `http://localhost:8080/api/v1/catalog/nextcloud/icon` in dev).
+  static String catalogIconUrl(String appName) {
+    final base = apiBaseUrl.endsWith('/') ? apiBaseUrl.substring(0, apiBaseUrl.length - 1) : apiBaseUrl;
+    return '$base/api/v1/catalog/${Uri.encodeComponent(appName)}/icon';
+  }
 }

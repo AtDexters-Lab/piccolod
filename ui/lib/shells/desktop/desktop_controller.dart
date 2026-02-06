@@ -196,6 +196,7 @@ class DesktopController extends ChangeNotifier {
     List<Widget>? actions,
     bool requiresInterceptor = true,
     String? iconUrl,
+    String? originalIconUrl,
   }) {
     final existingIndex = _windows.indexWhere((w) => w.id == appId);
 
@@ -264,6 +265,7 @@ class DesktopController extends ChangeNotifier {
       title: title,
       icon: icon,
       iconUrl: iconUrl,
+      originalIconUrl: originalIconUrl,
       child: content,
       position: Offset(x, y),
       size: targetSize,

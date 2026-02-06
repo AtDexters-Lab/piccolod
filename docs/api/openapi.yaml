@@ -819,6 +819,26 @@ paths:
                   categories:
                     type: array
                     items: { type: string }
+  /catalog/{name}/icon:
+    get:
+      summary: Proxy and cache a catalog app's icon
+      security: []
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Icon image data
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        '404': { description: App or icon not found }
+        '403': { description: Icon URL blocked (SSRF) }
+        '502': { description: Failed to fetch icon }
   /catalog/{name}/template:
     get:
       summary: Get example app.yaml for a catalog item

@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import '../../core/config/core_config.dart';
 import '../../core/models/app_models.dart';
 import '../../core/services/app_service.dart';
+import '../../shared/widgets/app_icon.dart';
 import '../../theme/piccolo_theme.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'custom_install_wizard.dart';
@@ -135,7 +137,10 @@ class _StoreTabState extends State<StoreTab> {
 
     if (!mounted) return;
 
-    final iconUrl = item.icon;
+    final proxyIconUrl = (item.icon ?? '').isNotEmpty
+        ? CoreConfig.catalogIconUrl(item.name)
+        : null;
+    final originalIconUrl = item.icon;
 
     if (schema.isNotEmpty) {
       showDialog(
@@ -148,7 +153,7 @@ class _StoreTabState extends State<StoreTab> {
           schema: schema,
           onSuccess: (appName) {
             Navigator.of(context).pop(); // Close Wizard
-            _openAppDetail(appName, iconUrl: iconUrl);
+            _openAppDetail(appName, iconUrl: proxyIconUrl, originalIconUrl: originalIconUrl);
           },
         ),
       );
@@ -161,14 +166,14 @@ class _StoreTabState extends State<StoreTab> {
           initialYaml: yaml!,
           onSuccess: (appName) {
             Navigator.of(context).pop(); // Close Wizard
-            _openAppDetail(appName, iconUrl: iconUrl);
+            _openAppDetail(appName, iconUrl: proxyIconUrl, originalIconUrl: originalIconUrl);
           },
         ),
       );
     }
   }
 
-  void _openAppDetail(String appName, {String? iconUrl}) {
+  void _openAppDetail(String appName, {String? iconUrl, String? originalIconUrl}) {
     widget.desktopController.notifyAppsChanged();
     widget.desktopController.openApp(
       "app-detail-$appName",
@@ -179,8 +184,10 @@ class _StoreTabState extends State<StoreTab> {
         appService: widget.appService,
         desktopController: widget.desktopController,
         iconUrl: iconUrl,
+        originalIconUrl: originalIconUrl,
       ),
       iconUrl: iconUrl,
+      originalIconUrl: originalIconUrl,
     );
   }
 
@@ -294,22 +301,14 @@ class _CatalogCard extends StatelessWidget {
             // Header
             Row(
               children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    color: PiccoloTheme.mist,
-                    borderRadius: BorderRadius.circular(12),
-                    image: (item.icon != null && item.icon!.isNotEmpty)
-                        ? DecorationImage(
-                            image: NetworkImage(item.icon!),
-                            fit: BoxFit.cover,
-                          )
-                        : null,
-                  ),
-                  child: (item.icon == null || item.icon!.isEmpty)
-                      ? const Icon(Icons.apps, color: PiccoloTheme.inkMuted)
+                AppIcon(
+                  proxyUrl: (item.icon ?? '').isNotEmpty
+                      ? CoreConfig.catalogIconUrl(item.name)
                       : null,
+                  originalIconUrl: item.icon,
+                  size: 48,
+                  borderRadius: 12,
+                  fallbackIcon: Icons.apps,
                 ),
                 const SizedBox(width: 12),
                 Expanded(

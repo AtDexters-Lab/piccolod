@@ -8,6 +8,7 @@ import '../../../core/models/network_models.dart';
 import '../../../core/services/api_client.dart';
 import '../../../core/services/network_service.dart';
 import '../../../core/services/websocket_connection.dart';
+import '../../../shared/widgets/app_icon.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../desktop_controller.dart';
 import '../models/desktop_window.dart';
@@ -385,15 +386,13 @@ class _RunningWindowItem extends StatelessWidget {
 
   Widget _buildIcon(Color color) {
     if (window.iconUrl != null && window.iconUrl!.isNotEmpty) {
-      return ClipRRect(
-        borderRadius: BorderRadius.circular(8),
-        child: Image.network(
-          window.iconUrl!,
-          width: 28,
-          height: 28,
-          fit: BoxFit.cover,
-          errorBuilder: (context, error, stackTrace) => Icon(window.icon, color: color, size: 28),
-        ),
+      return AppIcon(
+        proxyUrl: window.iconUrl,
+        originalIconUrl: window.originalIconUrl,
+        size: 28,
+        borderRadius: 8,
+        fallbackIcon: window.icon,
+        fallbackBackgroundColor: Colors.transparent,
       );
     }
     return Icon(window.icon, color: color, size: 28);

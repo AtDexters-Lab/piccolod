@@ -845,6 +845,35 @@ func (s *GinServer) handleGinCatalogCategories(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"categories": cats})
 }
 
+// handleGinCatalogIcon handles GET /api/v1/catalog/:name/icon - proxy and cache app icons
+func (s *GinServer) handleGinCatalogIcon(c *gin.Context) {
+	if s.catalogManager == nil {
+		writeGinError(c, http.StatusInternalServerError, "Catalog manager not initialized")
+		return
+	}
+
+	name := c.Param("name")
+	result, err := s.catalogManager.GetIconByName(c.Request.Context(), name)
+	if err != nil {
+		if errors.Is(err, catalog.ErrIconNotFound) || errors.Is(err, catalog.ErrNoIconURL) {
+			writeGinError(c, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, catalog.ErrSSRFBlocked) {
+			writeGinError(c, http.StatusForbidden, "icon URL blocked for security reasons")
+			return
+		}
+		writeGinError(c, http.StatusBadGateway, "failed to fetch icon")
+		return
+	}
+
+	// Set cache and security headers
+	c.Header("Cache-Control", "public, max-age=86400")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
+	c.Data(http.StatusOK, result.ContentType, result.Data)
+}
+
 func handleAppManagerError(c *gin.Context, err error, action string) bool {
 	if errors.Is(err, app.ErrLocked) {
 		msg := fmt.Sprintf("Unable to %s while storage is locked. Unlock Piccolo to continue.", action)

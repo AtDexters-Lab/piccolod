@@ -7,6 +7,7 @@ import '../../core/models/app_models.dart';
 import '../../core/models/listener_health.dart';
 import '../../core/services/app_service.dart';
 import '../../core/utils/task_id.dart';
+import '../../shared/widgets/app_icon.dart';
 import '../../shared/widgets/health_badge.dart';
 import '../../shared/widgets/log_stream_viewer.dart';
 import '../../shared/widgets/task_progress_panel.dart';
@@ -28,6 +29,7 @@ class AppDetailView extends StatefulWidget {
   final DesktopController desktopController;
   final int initialTab;
   final String? iconUrl;
+  final String? originalIconUrl;
 
   const AppDetailView({
     super.key,
@@ -36,6 +38,7 @@ class AppDetailView extends StatefulWidget {
     required this.desktopController,
     this.initialTab = 0,
     this.iconUrl,
+    this.originalIconUrl,
   });
 
   @override
@@ -344,36 +347,16 @@ class _AppDetailViewState extends State<AppDetailView>
               borderRadius: BorderRadius.circular(16),
             ),
             child: Center(
-              child: widget.iconUrl != null && widget.iconUrl!.isNotEmpty
-                  ? ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: Image.network(
-                        widget.iconUrl!,
-                        width: 64,
-                        height: 64,
-                        fit: BoxFit.cover,
-                        errorBuilder: (context, error, stackTrace) => Text(
-                          _app!.displayTitle.isNotEmpty
-                              ? _app!.displayTitle[0].toUpperCase()
-                              : '?',
-                          style: const TextStyle(
-                            fontSize: 32,
-                            fontWeight: FontWeight.bold,
-                            color: PiccoloTheme.cobalt600,
-                          ),
-                        ),
-                      ),
-                    )
-                  : Text(
-                      _app!.displayTitle.isNotEmpty
-                          ? _app!.displayTitle[0].toUpperCase()
-                          : '?',
-                      style: const TextStyle(
-                        fontSize: 32,
-                        fontWeight: FontWeight.bold,
-                        color: PiccoloTheme.cobalt600,
-                      ),
-                    ),
+              child: AppIcon(
+                proxyUrl: widget.iconUrl,
+                originalIconUrl: widget.originalIconUrl,
+                size: 64,
+                borderRadius: 12,
+                fallbackText: _app!.displayTitle.isNotEmpty
+                    ? _app!.displayTitle[0]
+                    : '?',
+                fallbackBackgroundColor: Colors.transparent,
+              ),
             ),
           ),
           const SizedBox(width: 24),

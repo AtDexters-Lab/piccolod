@@ -985,6 +985,10 @@ func (s *GinServer) setupGinRoutes() {
 		// CA certificate download (public - needed before login for HTTPS setup)
 		v1.GET("/system/ca.crt", s.handleCADownload)
 
+		// Icon proxy (public, read-only - icons are public catalog metadata;
+		// unauthenticated so Image.network/SvgPicture.network work cross-origin in dev)
+		v1.GET("/catalog/:name/icon", s.handleGinCatalogIcon)
+
 		// All other API endpoints require session + CSRF
 		authed := v1.Group("/")
 		authed.Use(s.requireSession())
@@ -1094,6 +1098,7 @@ func (s *GinServer) setupGinRoutes() {
 		admin.GET("/catalog/categories", s.handleGinCatalogCategories)
 		admin.GET("/catalog/:name/template", s.handleGinCatalogTemplate)
 		admin.GET("/catalog/:name/configure", s.handleGinCatalogConfigure)
+		// Icon proxy is registered below outside admin group (public, read-only)
 
 		// Services list (Needs filtering)
 		authed.GET("/services", s.handleGinServicesAll)
