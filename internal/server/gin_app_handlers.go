@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -20,6 +21,25 @@ import (
 	"piccolod/internal/remote"
 	"piccolod/internal/services"
 )
+
+// detectHostTimezone returns the host's IANA timezone (e.g. "America/New_York").
+// Falls back to "Etc/UTC" if detection fails.
+func detectHostTimezone() string {
+	// Try /etc/localtime symlink (most Linux distros)
+	if target, err := filepath.EvalSymlinks("/etc/localtime"); err == nil {
+		const prefix = "/usr/share/zoneinfo/"
+		if idx := strings.Index(target, prefix); idx != -1 {
+			return target[idx+len(prefix):]
+		}
+	}
+	// Try /etc/timezone (Debian/Ubuntu)
+	if data, err := os.ReadFile("/etc/timezone"); err == nil {
+		if tz := strings.TrimSpace(string(data)); tz != "" {
+			return tz
+		}
+	}
+	return "Etc/UTC"
+}
 
 func determineScheme(flow api.ListenerFlow, protocol api.ListenerProtocol) string {
 	switch protocol {
@@ -287,6 +307,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	systemContext := map[string]interface{}{
 		"Domain":       "local",
 		"Architecture": runtime.GOARCH,
+		"Timezone":     detectHostTimezone(),
 	}
 	if s.remoteManager != nil {
 		status := s.remoteManager.Status()
