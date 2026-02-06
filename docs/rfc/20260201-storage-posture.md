@@ -79,6 +79,8 @@ On production images, these defaults are used and should be treated as the canon
 
 > **Note on code examples:** Pseudocode throughout this RFC uses the default paths (`/piccolo-core`, `/piccolo-data`) for brevity. Implementations **must** resolve all paths through `paths.CoreRoot()` / `paths.DataRoot()` (see Foundation RFC §6.1) to support non-default environments.
 
+> **Note on CLI calls:** Some pseudocode uses `exec.CommandContext` directly for brevity. All implementations **must** route CLI calls through a `CommandRunner` interface (see §10.2) for testability — this allows unit tests to mock all disk/LUKS operations without real devices.
+
 ### 2.5 USB Boot Scenario
 
 > **Contract note:** "Try Live" is an **evaluation-only** mode. When booting from USB, both `/piccolo-core` and `/piccolo-data` reside on the USB boot device itself. This is an explicit exception to the production storage contract (architecture doc §3.1) where `/piccolo-core` lives on internal storage and USB devices are added only to `/piccolo-data`. V1 includes an **Install to Disk** flow that can either start fresh or **carry over current state** from "Try Live"; however, "Try Live" remains an evaluation posture (USB is not a supported long-term storage medium).
@@ -334,7 +336,7 @@ Runs when user provides admin password via `POST /api/v1/crypto/setup`.
 │                                                                     │
 │  5. Create btrfs on LUKS device                                     │
 │       │                                                             │
-│       ├── mkfs.btrfs /dev/mapper/piccolo_data_pool_0                │
+│       ├── mkfs.btrfs -L piccolo-data /dev/mapper/piccolo_data_pool_0 │
 │       ├── mkdir -p /piccolo-data                                    │
 │       └── mount /dev/mapper/piccolo_data_pool_0 /piccolo-data       │
 │                                                                     │
@@ -348,6 +350,10 @@ Runs when user provides admin password via `POST /api/v1/crypto/setup`.
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Mapper naming and collision handling:** The dm-crypt mapper name for each pool device follows the pattern `piccolo_data_pool_<index>` (e.g., `piccolo_data_pool_0`). Before calling `cryptsetup open`, the implementation must check whether `/dev/mapper/piccolo_data_pool_<index>` already exists (stale mapper from a crash or unclean shutdown). If it does, attempt `cryptsetup close` first; if that fails (device busy), the volume is already open and can be mounted directly.
+
+**No `/etc/fstab` entry for `/piccolo-data`:** The data volume is intentionally **not** added to fstab. Mounting is orchestrated by piccolod after admin unlock (Phase 2). Adding an fstab entry would cause systemd to attempt mounting at boot before the LUKS device is open, producing confusing mount failures. piccolod's state machine manages the full lifecycle (detect → partition → format → open → mount → unmount → close).
 
 ### 5.3 Subsequent Boot Sequence
 
@@ -609,10 +615,11 @@ func (p *Preparer) CreateDataPartition(ctx context.Context) error {
     }
 
     // Create partition: start after root allocation, extend to end of disk (0 = end)
-    // Type 8309 = Linux LUKS
+    // Type 8309 = Linux LUKS; label "piccolo-data" for identification by tools/humans.
     if err := p.runner.Run(ctx, "sgdisk",
         "-n", fmt.Sprintf("%d:%d:0", slot, startSector),
         "-t", fmt.Sprintf("%d:8309", slot),
+        "-c", fmt.Sprintf("%d:piccolo-data", slot),
         disk,
     ); err != nil {
         return fmt.Errorf("sgdisk failed: %w", err)
@@ -623,6 +630,23 @@ func (p *Preparer) CreateDataPartition(ctx context.Context) error {
     // will expand into unbounded free space, defeating the boundary mechanism.
     if err := p.reloadPartitionTable(ctx, disk); err != nil {
         return fmt.Errorf("kernel cannot see new data partition (boundary unsafe): %w", err)
+    }
+
+    // CRITICAL: Verify the kernel actually registered the new partition.
+    // partprobe/partx returning success does not guarantee the device node exists.
+    // If we proceed to growpart without this check, root could expand unbounded.
+    partDev := fmt.Sprintf("%s%d", disk, slot) // e.g., /dev/sda3
+    if strings.Contains(disk, "nvme") || strings.Contains(disk, "loop") {
+        partDev = fmt.Sprintf("%sp%d", disk, slot) // e.g., /dev/nvme0n1p3
+    }
+    for attempt := 0; attempt < 10; attempt++ {
+        if _, err := os.Stat(partDev); err == nil {
+            break // Kernel sees the partition
+        }
+        if attempt == 9 {
+            return fmt.Errorf("kernel did not register partition %s after reload (boundary unsafe)", partDev)
+        }
+        time.Sleep(200 * time.Millisecond)
     }
 
     p.logger.Info("data partition created",
@@ -738,7 +762,7 @@ All Phase 1 operations are designed to be crash-safe and self-healing on the nex
 │       │                              └──→ LUKS Keyslot 0            │
 │       │                                                             │
 │       ├──→ LUKS Keyslot 1 (Admin Password Recovery)                 │
-│       │    Admin password → Argon2id(password, device UUID)         │
+│       │    Admin password → Argon2id(password, persisted salt+params)│
 │       │                                                             │
 │  Recovery Mnemonic (24-word)                                        │
 │       │                                                             │
@@ -746,7 +770,7 @@ All Phase 1 operations are designed to be crash-safe and self-healing on the nex
 │            → LUKS Keyslot 0 (same keyfile, same path as above)     │
 │                                                                     │
 │       └──→ LUKS Keyslot 2 (Mnemonic Recovery)                      │
-│            Mnemonic → Argon2id(mnemonic-derived, device UUID)       │
+│            Mnemonic → Argon2id(mnemonic-derived, persisted salt+params)│
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -755,8 +779,8 @@ All Phase 1 operations are designed to be crash-safe and self-healing on the nex
 | Keyslot | Key Source | Purpose |
 |---------|-----------|---------|
 | 0 | Pool keyfile (unwrapped from SDEK via admin password or recovery mnemonic) | Primary unlock path — used on every boot |
-| 1 | Argon2id(admin password, device UUID) | Offline recovery when control plane is unavailable |
-| 2 | Argon2id(mnemonic-derived key, device UUID) | Recovery when admin password is lost — user unlocks with 24-word mnemonic |
+| 1 | Argon2id(admin password, persisted salt + params) | Offline recovery when control plane is unavailable |
+| 2 | Argon2id(mnemonic-derived key, persisted salt + params) | Recovery when admin password is lost — user unlocks with 24-word mnemonic |
 
 **Why three keyslots:** The recovery mnemonic can already unlock the control plane (via `crypt.Manager.UnlockWithRecoveryKey`), which provides the pool keyfile for keyslot 0. Keyslot 2 provides a direct unlock path for `/piccolo-data` when the control plane itself is damaged or unavailable, ensuring the mnemonic is a complete recovery mechanism independent of `/piccolo-core` state.
 
@@ -764,9 +788,11 @@ All Phase 1 operations are designed to be crash-safe and self-healing on the nex
 
 ```go
 // Stored at /piccolo-core/crypto/piccolo_data_pool_key.enc
-// This is OUTSIDE gocryptfs (always readable once SDEK is available), device-local,
-// and NOT included in PCV exports. The pool keyfile is specific to the physical
-// LUKS devices attached to this node.
+// This is OUTSIDE gocryptfs (always readable once SDEK is available).
+// The pool keyfile is node-scoped (specific to the LUKS devices on this node)
+// but IS included in PCV exports so that restore workflows can unlock
+// existing /piccolo-data partitions. See Foundation RFC §8.2.2 for the
+// per-node room concept within PCV.
 type PoolKeyfile struct {
     Version   int       `json:"version"`
     KeyData   []byte    `json:"key_data"`   // 64-byte random keyfile (encrypted with SDEK)
@@ -793,6 +819,10 @@ func GeneratePoolKeyfile() ([]byte, error) {
 The **encrypted** pool keyfile is stored persistently at `/piccolo-core/crypto/piccolo_data_pool_key.enc`. The `/run/piccolo/` path is only used transiently during `cryptsetup` operations.
 
 ```go
+// InitializeLUKS formats a LUKS2 device and enrolls all three keyslots.
+// The recovery mnemonic is generated during POST /api/v1/crypto/setup (the same
+// endpoint that triggers this call), so mnemonicKey is always available at init time.
+// For recovery key rotation after setup, see AddMnemonicKeyslot below.
 func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPassword string, mnemonicKey []byte) error {
     // 0. Ensure ephemeral secrets directory exists (tmpfs, cleared on reboot)
     if err := os.MkdirAll("/run/piccolo", 0700); err != nil {
@@ -815,13 +845,18 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
 
     // 3. LUKS format with keyfile (keyslot 0)
     // Pin cipher parameters explicitly for reproducibility across OS versions.
+    // Keyslot 0 uses a 64-byte random keyfile (max entropy) — pbkdf2 with
+    // minimal iterations is sufficient. Memory-hard KDF adds no security value
+    // for high-entropy key material and would add ~1-2s to every boot unlock.
+    // Keyslots 1 and 2 (password/mnemonic-derived) use argon2id via addKeyslot.
     if err := m.runner.Run(ctx, "cryptsetup", "luksFormat",
         "--type", "luks2",
         "--batch-mode",
         "--cipher", "aes-xts-plain64",
         "--key-size", "512",
         "--hash", "sha512",
-        "--pbkdf", "argon2id",
+        "--pbkdf", "pbkdf2",
+        "--pbkdf-force-iterations", "1000",
         "--key-file", keyfilePath,
         device); err != nil {
         return err
@@ -841,23 +876,35 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
         keyfileStored = true
     }
 
-    // 5. Add admin-password recovery keyslot (keyslot 1)
+    // 5. Generate and persist KDF params for this device
     deviceUUID, _ := m.getLUKSUUID(ctx, device)
-    recoveryPass := DeriveRecoveryPassphrase(adminPassword, deviceUUID)
+    kdfParams, err := NewLUKSKDFParams(deviceUUID)
+    if err != nil {
+        return fmt.Errorf("failed to generate KDF params: %w", err)
+    }
+    if err := os.MkdirAll(filepath.Dir(kdfParamsPath(deviceUUID)), 0700); err != nil {
+        return fmt.Errorf("failed to create KDF params dir: %w", err)
+    }
+    if err := writeJSON(kdfParamsPath(deviceUUID), kdfParams); err != nil {
+        return fmt.Errorf("failed to persist KDF params: %w", err)
+    }
+
+    // 6. Add admin-password recovery keyslot (keyslot 1)
+    recoveryPass := DeriveRecoveryPassphrase(adminPassword, kdfParams)
     if err := m.addKeyslot(ctx, device, keyfilePath, recoveryPass, 1); err != nil {
         m.logger.Error("failed to add admin recovery keyslot", "error", err)
     } else {
         adminRecoveryOK = true
     }
 
-    // 6. Add mnemonic recovery keyslot (keyslot 2)
-    if mnemonicKey != nil {
-        mnemonicPass := DeriveMnemonicRecoveryPassphrase(mnemonicKey, deviceUUID)
-        if err := m.addKeyslot(ctx, device, keyfilePath, mnemonicPass, 2); err != nil {
-            m.logger.Error("failed to add mnemonic recovery keyslot", "error", err)
-        } else {
-            mnemonicRecoveryOK = true
-        }
+    // 7. Add mnemonic recovery keyslot (keyslot 2)
+    // mnemonicKey is always provided — the recovery mnemonic is generated during
+    // the same crypto/setup call that triggers InitializeLUKS.
+    mnemonicPass := DeriveMnemonicRecoveryPassphrase(mnemonicKey, kdfParams)
+    if err := m.addKeyslot(ctx, device, keyfilePath, mnemonicPass, 2); err != nil {
+        m.logger.Error("failed to add mnemonic recovery keyslot", "error", err)
+    } else {
+        mnemonicRecoveryOK = true
     }
 
     // SAFETY: At least one persistent unlock path must exist.
@@ -879,7 +926,7 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
         m.logger.Warn("mnemonic recovery keyslot not added", "device", device)
     }
 
-    // 7. Backup LUKS header to control plane (for disaster recovery)
+    // 8. Backup LUKS header to control plane (for disaster recovery)
     if err := m.backupLUKSHeader(ctx, device, deviceUUID); err != nil {
         m.logger.Warn("failed to backup LUKS header", "error", err)
         // Non-fatal: system can operate without header backup
@@ -891,22 +938,71 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
 
 ### 6.4 Recovery Keyslot
 
+#### 6.4.1 KDF Parameter Persistence
+
+Argon2id output is a function of all parameters including parallelism (`threads`). To allow dynamic, CPU-appropriate thread counts without risking unlock failures if the CPU count changes (cgroups, VM resize, BIOS settings), all derivation parameters and salts are persisted per LUKS device.
+
 ```go
-func DeriveRecoveryPassphrase(adminPassword, deviceUUID string) []byte {
-    // Versioned salt prefix: if derivation params ever change, bump the version
-    // to avoid producing incompatible passphrases on existing devices.
-    salt := []byte("piccolo-luks-recovery:v1:" + deviceUUID)
-    // Thread count aligns with crypt.Manager's Argon2 configuration:
-    // use all available cores minus one (minimum 1) to avoid starving
-    // the main goroutine during key derivation.
-    threads := uint8(max(1, runtime.NumCPU()-1))
+// Stored at /piccolo-core/crypto/luks-kdf-params/<device-uuid>.json
+// This file is OUTSIDE gocryptfs (always readable), included in PCV exports
+// (node-scoped data), and required for re-deriving recovery passphrases.
+type LUKSKDFParams struct {
+    Version       int    `json:"version"`        // Schema version (1)
+    DeviceUUID    string `json:"device_uuid"`     // LUKS device UUID
+    Argon2Time    uint32 `json:"argon2_time"`     // Argon2id time parameter
+    Argon2Memory  uint32 `json:"argon2_memory"`   // Argon2id memory (KiB)
+    Argon2Threads uint8  `json:"argon2_threads"`  // Argon2id parallelism
+    KeyLength     uint32 `json:"key_length"`      // Derived key length (bytes)
+    SaltAdmin     []byte `json:"salt_admin"`      // Random 32-byte salt for admin passphrase
+    SaltMnemonic  []byte `json:"salt_mnemonic"`   // Random 32-byte salt for mnemonic passphrase
+    CreatedAt     string `json:"created_at"`      // ISO 8601
+}
+
+// NewLUKSKDFParams generates params for a new device. Called once during
+// InitializeLUKS; the result is persisted and re-read on every derivation.
+func NewLUKSKDFParams(deviceUUID string) (*LUKSKDFParams, error) {
+    // 32 bytes = 256 bits of entropy, matching Argon2 recommendation (RFC 9106 §4)
+    // and LUKS2's internal salt length.
+    saltAdmin := make([]byte, 32)
+    saltMnemonic := make([]byte, 32)
+    if _, err := rand.Read(saltAdmin); err != nil {
+        return nil, fmt.Errorf("failed to generate admin salt: %w", err)
+    }
+    if _, err := rand.Read(saltMnemonic); err != nil {
+        return nil, fmt.Errorf("failed to generate mnemonic salt: %w", err)
+    }
+
+    return &LUKSKDFParams{
+        Version:       1,
+        DeviceUUID:    deviceUUID,
+        Argon2Time:    3,
+        Argon2Memory:  512 * 1024, // 512 MiB — matches crypt.Manager's SDEK derivation hardness
+        Argon2Threads: uint8(min(8, max(1, runtime.NumCPU()-1))), // Cap at 8 for portability (PCV restore to smaller hardware)
+        KeyLength:     32,
+        SaltAdmin:     saltAdmin,
+        SaltMnemonic:  saltMnemonic,
+        CreatedAt:     time.Now().UTC().Format(time.RFC3339),
+    }, nil
+}
+
+func kdfParamsPath(deviceUUID string) string {
+    return filepath.Join(paths.CoreRoot(), "crypto/luks-kdf-params", deviceUUID+".json")
+}
+```
+
+#### 6.4.2 Passphrase Derivation
+
+```go
+// DeriveRecoveryPassphrase derives the admin-password LUKS recovery passphrase
+// using persisted KDF params. The params file MUST exist (created during InitializeLUKS).
+func DeriveRecoveryPassphrase(adminPassword string, params *LUKSKDFParams) []byte {
     return argon2.IDKey(
         []byte(adminPassword),
-        salt,
-        3,        // time
-        64*1024,  // memory (64MB)
-        threads,  // threads (dynamic, CPU-based)
-        32,       // key length
+        params.SaltAdmin,
+        params.Argon2Time,
+        params.Argon2Memory,
+        params.Argon2Threads,
+        params.KeyLength,
     )
 }
 
@@ -915,16 +1011,14 @@ func DeriveRecoveryPassphrase(adminPassword, deviceUUID string) []byte {
 // /piccolo-data when the admin password is lost — the user enters their
 // 24-word recovery mnemonic, which yields mnemonicKey via crypt.Manager,
 // and this function derives the device-specific LUKS passphrase.
-func DeriveMnemonicRecoveryPassphrase(mnemonicKey []byte, deviceUUID string) []byte {
-    salt := []byte("piccolo-luks-mnemonic-recovery:v1:" + deviceUUID)
-    threads := uint8(max(1, runtime.NumCPU()-1))
+func DeriveMnemonicRecoveryPassphrase(mnemonicKey []byte, params *LUKSKDFParams) []byte {
     return argon2.IDKey(
         mnemonicKey,
-        salt,
-        3,        // time
-        64*1024,  // memory (64MB)
-        threads,  // threads (dynamic, CPU-based)
-        32,       // key length
+        params.SaltMnemonic,
+        params.Argon2Time,
+        params.Argon2Memory,
+        params.Argon2Threads,
+        params.KeyLength,
     )
 }
 
@@ -960,7 +1054,41 @@ func secureZero(b []byte) {
 }
 ```
 
-### 6.5 Admin Password Rotation Hook
+### 6.5 Recovery Mnemonic Rotation Hook
+
+When the user rotates their recovery mnemonic (via `POST /api/v1/crypto/recovery-key/generate`), keyslot 2 must be updated on all pool devices. This uses `luksChangeKey` for atomic replacement, matching the password rotation pattern.
+
+```go
+// OnRecoveryMnemonicRotated updates keyslot 2 on all /piccolo-data LUKS devices
+// when the user generates a new recovery mnemonic.
+func (m *StorageManager) OnRecoveryMnemonicRotated(ctx context.Context, oldMnemonicKey, newMnemonicKey []byte) error {
+    devices, err := m.listDataPoolDevices(ctx)
+    if err != nil {
+        return err
+    }
+
+    for _, dev := range devices {
+        params, err := readJSON[LUKSKDFParams](kdfParamsPath(dev.UUID))
+        if err != nil {
+            return fmt.Errorf("failed to read KDF params for %s: %w", dev.UUID, err)
+        }
+        oldPass := DeriveMnemonicRecoveryPassphrase(oldMnemonicKey, params)
+        newPass := DeriveMnemonicRecoveryPassphrase(newMnemonicKey, params)
+
+        if err := m.changeLUKSKeyslot(ctx, dev.Path, 2, oldPass, newPass); err != nil {
+            return fmt.Errorf("failed to rotate keyslot 2 for %s: %w", dev.UUID, err)
+        }
+
+        if err := m.backupLUKSHeader(ctx, dev.Path, dev.UUID); err != nil {
+            m.logger.Warn("failed to re-backup LUKS header after mnemonic rotation",
+                "device", dev.UUID, "error", err)
+        }
+    }
+    return nil
+}
+```
+
+### 6.6 Admin Password Rotation Hook
 
 Password rotation must update LUKS keyslot 1 (admin-derived) on all pool devices. Keyslot 2 (mnemonic-derived) is unaffected by password rotation since it is derived from the recovery mnemonic, which does not change when the password changes.
 
@@ -985,8 +1113,12 @@ func (m *StorageManager) OnAdminPasswordRotated(ctx context.Context, oldPass, ne
     }
 
     for _, dev := range devices {
-        oldRecovery := DeriveRecoveryPassphrase(oldPass, dev.UUID)
-        newRecovery := DeriveRecoveryPassphrase(newPass, dev.UUID)
+        params, err := readJSON[LUKSKDFParams](kdfParamsPath(dev.UUID))
+        if err != nil {
+            return fmt.Errorf("failed to read KDF params for %s: %w", dev.UUID, err)
+        }
+        oldRecovery := DeriveRecoveryPassphrase(oldPass, params)
+        newRecovery := DeriveRecoveryPassphrase(newPass, params)
 
         // cryptsetup luksChangeKey atomically replaces keyslot 1
         if err := m.changeLUKSKeyslot(ctx, dev.Path, 1, oldRecovery, newRecovery); err != nil {
@@ -1031,7 +1163,7 @@ func (m *StorageManager) changeLUKSKeyslot(ctx context.Context, device string, s
 }
 ```
 
-#### 6.5.1 Crash Recovery for Partial Rotation
+#### 6.6.1 Crash Recovery for Partial Rotation
 
 If `piccolod` crashes during password rotation, a `luks-rotation-progress.json` file will exist on next boot. Recovery is triggered during Phase 2 (after the user provides the new password to unlock):
 
@@ -1063,7 +1195,8 @@ func (m *StorageManager) resumeRotationIfNeeded(ctx context.Context, currentPass
         // - If that fails, the device still has an older passphrase — try common
         //   recovery strategies (the pool keyfile via keyslot 0 is always available
         //   since it is unaffected by password rotation).
-        newRecovery := DeriveRecoveryPassphrase(currentPass, dev.UUID)
+        params, _ := readJSON[LUKSKDFParams](kdfParamsPath(dev.UUID))
+        newRecovery := DeriveRecoveryPassphrase(currentPass, params)
         err := m.changeLUKSKeyslot(ctx, dev.Path, 1, newRecovery, newRecovery)
         if err != nil {
             // Keyslot 1 still has the old passphrase — we don't have the old password,
@@ -1086,7 +1219,34 @@ func (m *StorageManager) resumeRotationIfNeeded(ctx context.Context, currentPass
 
 **Note:** `resumeRotationIfNeeded` is called during Phase 2 unlock, after the user has provided the (current/new) admin password and the pool keyfile is available in memory. The pool keyfile (keyslot 0) serves as the stable "escape hatch" for re-creating any recovery keyslot.
 
-### 6.6 LUKS Header Backup and Recovery
+```go
+// rekeySlotViaPoolKeyfile replaces a keyslot using the pool keyfile (keyslot 0)
+// as the existing key. Used during crash recovery when the old passphrase is
+// unknown — the pool keyfile is always available after unlock.
+func (m *StorageManager) rekeySlotViaPoolKeyfile(ctx context.Context, device string, slot int, newPass []byte) error {
+    keyfilePath := "/run/piccolo/piccolo_data_pool_key"
+    // Pool keyfile is already materialized in tmpfs during Phase 2 unlock.
+
+    // Remove old keyslot
+    if err := m.runner.Run(ctx, "cryptsetup", "luksKillSlot",
+        "--key-file", keyfilePath,
+        "--batch-mode",
+        device,
+        fmt.Sprintf("%d", slot),
+    ); err != nil {
+        return fmt.Errorf("failed to kill keyslot %d: %w", slot, err)
+    }
+
+    // Re-add with new passphrase
+    if err := m.addKeyslot(ctx, device, keyfilePath, newPass, slot); err != nil {
+        return fmt.Errorf("failed to re-add keyslot %d: %w", slot, err)
+    }
+
+    return nil
+}
+```
+
+### 6.7 LUKS Header Backup and Recovery
 
 The LUKS header contains critical metadata (keyslots, encryption parameters). If corrupted, data is unrecoverable. We backup headers to the control plane for disaster recovery.
 
@@ -1153,10 +1313,12 @@ Key material and volume metadata required for the unlock chain must live **outsi
 
 ```
 /piccolo-core/
-├── crypto/                   # key material (OUTSIDE gocryptfs, always readable, device-local)
+├── crypto/                   # key material (OUTSIDE gocryptfs, always readable)
 │   ├── keyset.json           # SDEK sealed with KEK (needed to start unlock)
 │   ├── piccolo_data_pool_key.enc  # LUKS pool keyfile wrapped with SDEK
-│   └── luks-header-backups/  # LUKS header backups (device-specific)
+│   ├── luks-kdf-params/      # Argon2 derivation params per LUKS device (node-scoped, in PCV)
+│   │   └── <device-uuid>.json
+│   └── luks-header-backups/  # LUKS header backups (device-specific, NOT in PCV)
 │       └── <device-uuid>.bin
 ├── ciphertext/
 │   └── control-plane/        # btrfs subvolume: gocryptfs ciphertext (durable encrypted payload; PCV export source)
@@ -1179,7 +1341,7 @@ Key material and volume metadata required for the unlock chain must live **outsi
 
 **Directory classification:**
 - **Portable (replicated):** `recovery/` — PCV exports for peer replication and orchestrator backup.
-- **Device-local (not replicated):** `crypto/` (keyset, pool keyfile, LUKS headers), `network-bootstrap/`, `ciphertext/`, `volumes/`.
+- **Device-local (not replicated as live state):** `crypto/`, `network-bootstrap/`, `ciphertext/`, `volumes/`. Note: some `crypto/` contents (keyset, pool keyfile, KDF params) are included in PCV exports as node-scoped data for restore workflows; LUKS header backups are excluded.
 
 **Note:** “Device-local” here means these directories are not replicated *as live state*. The portable PCV export under `recovery/` is the mechanism for portability/replication.
 
@@ -1376,12 +1538,13 @@ func (m *Manager) IsEmergencyMode() bool
 func (m *Manager) EmergencyError() error
 
 // Phase 2: Post-auth operations (called from API handlers)
-func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string) error  // Phase 2: LUKS + mount
+func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string, mnemonicKey []byte) error  // Phase 2: LUKS + mount
 func (m *Manager) Unlock(ctx context.Context, adminPassword string) error  // Subsequent boots
 func (m *Manager) Lock(ctx context.Context) error
 
 // Lifecycle hooks
 func (m *Manager) OnAdminPasswordRotated(ctx context.Context, oldPass, newPass string) error
+func (m *Manager) OnRecoveryMnemonicRotated(ctx context.Context, oldMnemonicKey, newMnemonicKey []byte) error
 ```
 
 ### 10.2 New Package: `internal/storage/diskprep`
@@ -1466,10 +1629,21 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
         // handle error
     }
 
+    // Generate recovery mnemonic at setup time so all three LUKS keyslots
+    // can be enrolled during InitializeDataVolume. The mnemonic words are
+    // returned to the user in the setup response for safekeeping.
+    mnemonicWords, mnemonicKey, err := s.crypto.GenerateRecoveryKey(false)
+    if err != nil {
+        // handle error
+    }
+
     // PHASE 2: Initialize /piccolo-data (LUKS + btrfs + mount)
-    if err := s.storageMgr.InitializeDataVolume(ctx, password); err != nil {
+    // mnemonicKey is passed so keyslot 2 is enrolled immediately.
+    if err := s.storageMgr.InitializeDataVolume(ctx, password, mnemonicKey); err != nil {
         // handle error - could be retried
     }
+
+    // Return mnemonicWords in response for user to save
 }
 
 func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
@@ -1652,38 +1826,55 @@ func (m *Manager) enterEmergencyMode(err error, reason string) {
 3. **Most APIs disabled** - Only diagnostic and recovery endpoints work
 4. **No crash loop** - System stays up for debugging
 
-**Pre-unlock / emergency endpoint allowlist:**
+**Endpoint availability by system state:**
 
-These endpoints are available before admin unlock and during emergency mode. All other API paths are blocked until the control plane is unlocked and `/piccolo-data` is mounted.
+Pre-unlock and emergency mode are distinct states with different endpoint allowlists. Pre-unlock is the normal state before the user provides their admin password; emergency mode is entered when Phase 1 disk prep fails.
 
-| Endpoint | Purpose | Available |
-|---|---|---|
-| `/` (portal shell) | Serves the Flutter Web UI (locked/onboarding/emergency states) | Always |
-| `/api/v1/system/health` | Health check for load balancers and monitoring | Always |
-| `/api/v1/system/emergency` | Emergency mode diagnostics | Emergency only |
-| `/api/v1/system/onboarding` | USB boot onboarding flow | Pre-unlock (USB boot) |
-| `/api/v1/crypto/setup` | First-run admin password setup | Pre-unlock (first boot) |
-| `/api/v1/crypto/unlock` | Unlock control plane + `/piccolo-data` | Pre-unlock (subsequent boots) |
+**Pre-unlock (normal — before admin password):**
+
+| Endpoint | Purpose |
+|---|---|
+| `/` (portal shell) | Serves the Flutter Web UI (locked/onboarding states) |
+| `/api/v1/system/health` | Health check for load balancers and monitoring |
+| `/api/v1/system/onboarding` | USB boot onboarding flow |
+| `/api/v1/crypto/setup` | First-run admin password setup |
+| `/api/v1/crypto/unlock` | Unlock control plane + `/piccolo-data` |
+
+**Emergency mode (storage failure — Phase 1 failed):**
+
+| Endpoint | Purpose |
+|---|---|
+| `/` (portal shell) | Shows "Storage Initialization Failed" error UI |
+| `/api/v1/system/health` | Health check (reports degraded) |
+| `/api/v1/system/emergency` | Emergency mode diagnostics and recovery actions |
+
+Crypto endpoints (`/api/v1/crypto/setup`, `/api/v1/crypto/unlock`) are **blocked in emergency mode** because disk prep must succeed before LUKS initialization or unlock can proceed. The portal error UI directs the user to resolve the underlying storage issue (or contact support) rather than attempting unlock.
 
 **Note:** Device discovery (mDNS/`piccolo.local`) is handled at the OS level by Avahi, not by piccolod endpoints.
 
 ```go
-// Emergency mode middleware
+// Emergency mode middleware — blocks all endpoints except diagnostics.
+// This is separate from the pre-unlock middleware which allows crypto endpoints.
 func (s *GinServer) emergencyModeMiddleware() gin.HandlerFunc {
     return func(c *gin.Context) {
         if s.storageMgr.IsEmergencyMode() {
-            // Allow only diagnostic endpoints
-            allowed := []string{
-                "/api/v1/system/health",
-                "/api/v1/system/emergency",
-                "/",  // Portal (shows error UI)
+            path := c.Request.URL.Path
+
+            // Allow API diagnostics endpoints
+            if strings.HasPrefix(path, "/api/v1/system/health") ||
+                strings.HasPrefix(path, "/api/v1/system/emergency") {
+                c.Next()
+                return
             }
-            for _, prefix := range allowed {
-                if strings.HasPrefix(c.Request.URL.Path, prefix) {
-                    c.Next()
-                    return
-                }
+
+            // Allow portal static assets (non-API paths serve the Flutter Web UI,
+            // which shows the emergency error page)
+            if !strings.HasPrefix(path, "/api/") {
+                c.Next()
+                return
             }
+
+            // Block all other API endpoints
             c.JSON(http.StatusServiceUnavailable, gin.H{
                 "error":   "storage_emergency",
                 "message": s.storageMgr.EmergencyError().Error(),
@@ -1733,18 +1924,29 @@ On fresh piccolo-os image:
 3. Select "Try Live" - verify USB gets partitioned
 4. Reboot - verify state persists
 
-## 14. Security Considerations
+## 14. Audit Events
+
+Key storage operations should emit events to the audit log (via `internal/events/`):
+- `storage.phase1.completed` — Phase 1 disk prep finished (partitioning + root expansion)
+- `storage.phase1.emergency` — Phase 1 entered emergency mode (includes reason)
+- `storage.luks.initialized` — LUKS2 device formatted and keyslots enrolled
+- `storage.luks.unlocked` / `storage.luks.locked` — data volume unlock/lock
+- `storage.luks.keyslot_rotated` — password or mnemonic keyslot updated (slot number, device UUID)
+- `storage.data.mounted` / `storage.data.unmounted` — data volume mount lifecycle
+
+## 15. Security Considerations
 
 - Pool keyfile only in memory after unlock
 - Keyfile encrypted with SDEK in control plane
-- Recovery keyslot uses Argon2id with device-specific salt
+- Recovery keyslots use Argon2id with random per-device salts (persisted in `luks-kdf-params/`)
 - LUKS2 provides at-rest encryption (AES-XTS-plain64 by default)
   - Note: Default mode provides confidentiality only, not integrity/authentication
   - Integrity protection would require dm-integrity or authenticated modes (future consideration)
 - Temp keyfile written to tmpfs (/run), never to disk
-- LUKS header backed up to control plane for disaster recovery (device-local only; not part of PCV exports)
+- LUKS header backed up to control plane for disaster recovery (device-specific; excluded from PCV exports)
+- KDF params and pool keyfile included in PCV exports (node-scoped data for restore workflows)
 
-## 15. Future Work
+## 16. Future Work
 
 Out of scope for this RFC:
 
@@ -1756,7 +1958,7 @@ Out of scope for this RFC:
 6. **Degraded mode UI** - surfacing pool status
 7. **LUKS2 authenticated encryption** - `dm-integrity` or AEAD modes for tamper detection on physically accessible devices
 
-## 16. Required System Tools
+## 17. Required System Tools
 
 The following CLI tools are required and must be declared as **RPM dependencies** in the piccolod spec file:
 
@@ -1787,7 +1989,7 @@ Requires: e2fsprogs
 
 This ensures tools are installed as dependencies of piccolod rather than relying on base image contents.
 
-## 17. References
+## 18. References
 
 - `org-context/03_engineering/storage_architecture.md`
 - `piccolo-os/kiwi/microos-ots/piccolo-os.kiwi`
@@ -1799,3 +2001,5 @@ This ensures tools are installed as dependencies of piccolod rather than relying
 - 2026-02-01: Drafted. No code changes landed yet.
 - 2026-02-04: Review pass. Fixed: (1) canonical InitializeLUKS with defensive "at least one unlock path" check and keyfile-first ordering; (2) added LUKS keyslot 2 for 24-word recovery mnemonic; (3) pinned LUKS cipher parameters; (4) added power failure recovery table for Phase 1; (5) fixed secureZero with runtime.KeepAlive; (6) added password rotation crash recovery logic; (7) specified luksChangeKey for atomic keyslot replacement; (8) fixed small disk error message formula; (9) "Install to Disk" hidden when no internal disk detected; (10) clarified pool key placement as outside gocryptfs, device-local.
 - 2026-02-04: Parallel review fixes. Fixed: (11) `.ciphertext/` → `ciphertext/` (removed dot prefix to match existing codebase); (12) Argon2 thread count now dynamic (`max(1, runtime.NumCPU()-1)`) to align with crypt.Manager; (13) Phase 1 disk prep now runs in background after server starts (portal available immediately, shows "Preparing storage..."); (14) added §5.0 partition table preconditions; (15) added 20GB root rationale (MicroOS recommended max); (16) added pre-unlock endpoint allowlist table.
+- 2026-02-06: Second parallel review fixes. Fixed: (17) pool keyfile now included in PCV exports (node-scoped data for restore workflows); updated §6.2 and §7.1 classification; (18) Argon2 derivation params + random salts now persisted per device at `crypto/luks-kdf-params/<uuid>.json` — fixes correctness risk where CPU count changes would produce different passphrases; added §6.4.1 KDF parameter persistence; (19) split endpoint allowlist into pre-unlock vs emergency mode tables — crypto endpoints blocked in emergency since disk prep must succeed first; (20) per-node room concept documented for cluster-mode PCV.
+- 2026-02-06: Third review pass. Blocking fixes: (21) Argon2 thread cap at 8 for portability; (22) Argon2 memory 512 MiB to match crypt.Manager; (23) hardcoded path replaced with `paths.CoreRoot()`; (24) keyslot 0 uses pbkdf2 (high-entropy keyfile, argon2 adds no value); (25) kernel partition verification loop after partprobe; (26) mnemonic always enrolled at setup, added `OnRecoveryMnemonicRotated` hook. Significant fixes: (27) emergency middleware path matching rewritten (old `/` prefix matched all paths); (28) specified `rekeySlotViaPoolKeyfile` implementation; (29) mapper collision check before `cryptsetup open`; (30) `CommandRunner` interface note for testability; (31) no-fstab design rationale documented; (32) 32-byte salt rationale (RFC 9106 §4). Suggestions: (33) GPT partition label `piccolo-data`; (34) btrfs filesystem label; (35) audit events section added (§14).
