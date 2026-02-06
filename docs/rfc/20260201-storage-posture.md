@@ -18,7 +18,7 @@ Piccolod must:
 4. **Create `/piccolo-data` partition** from remaining disk space
 5. **LUKS2 encrypt** `/piccolo-data` with pool keyfile
 6. **Create btrfs** on `/piccolo-data`
-7. **Handle USB boot** with onboarding flow (Install to Disk / Try Live)
+7. **Handle USB boot** with onboarding flow (Install to Disk / Try Piccolo)
 
 ### 1.1 Relationship to `20260202-storage-v2-foundation.md`
 This RFC specifies the **physical disk posture** and first-boot disk preparation required to make the two-root model real on target OS images:
@@ -83,7 +83,7 @@ On production images, these defaults are used and should be treated as the canon
 
 ### 2.5 USB Boot Scenario
 
-> **Contract note:** "Try Live" is an **evaluation-only** mode. When booting from USB, both `/piccolo-core` and `/piccolo-data` reside on the USB boot device itself. This is an explicit exception to the production storage contract (architecture doc §3.1) where `/piccolo-core` lives on internal storage and USB devices are added only to `/piccolo-data`. V1 includes an **Install to Disk** flow that can either start fresh or **carry over current state** from "Try Live"; however, "Try Live" remains an evaluation posture (USB is not a supported long-term storage medium).
+> **Contract note:** "Try Piccolo" is an **evaluation-only** mode. When booting from USB, both `/piccolo-core` and `/piccolo-data` reside on the USB boot device itself. This is an explicit exception to the production storage contract (architecture doc §3.1) where `/piccolo-core` lives on internal storage and USB devices are added only to `/piccolo-data`. V1 includes an **Install to Disk** flow that can either start fresh or **carry over current state** from "Try Piccolo"; however, "Try Piccolo" remains an evaluation posture (USB is not a supported long-term storage medium).
 
 The minimal image can be dd'd to a USB drive and booted:
 
@@ -102,10 +102,10 @@ The minimal image can be dd'd to a USB drive and booted:
 │                       │       └── Shows two options:                │
 │                       │               ├── "Install to Disk"         │
 │                       │               │     └── (V1: Fresh → Carry over → Dry run) │
-│                       │               └── "Try Live"                │
+│                       │               └── "Try Piccolo"                │
 │                       │                                             │
 │                       └── No internal disk (e.g., RPi, USB-only):  │
-│                               └── "Try Live" only                   │
+│                               └── "Try Piccolo" only                   │
 │                               └── Expand USB partitions             │
 │                               └── Create persistent /piccolo-data   │
 │                               └── Continue with normal setup        │
@@ -122,8 +122,8 @@ The minimal image can be dd'd to a USB drive and booted:
 - **Subvolume verification**: Verify `/piccolo-core` subvolume exists (OS creates it)
 - **LUKS2 encryption**: Pool keyfile for `/piccolo-data`
 - **Install to Disk (v1, phased)**: Install from live USB onto internal disk (fresh start and carry-over paths)
-- **USB boot support**: Show onboarding flow, support "Try Live" mode
-- **Persistent USB storage**: "Try Live" creates real partitions on USB
+- **USB boot support**: Show onboarding flow, support "Try Piccolo" mode
+- **Persistent USB storage**: "Try Piccolo" creates real partitions on USB
 - **Degraded mode**: System operates if USB storage (expansion) fails
 - **Two-root contract**: Treat `/piccolo-core` (fixed) and `/piccolo-data` (expandable) as distinct roots, matching `docs/rfc/20260202-storage-v2-foundation.md`.
 
@@ -219,7 +219,7 @@ func getTransportType(ctx context.Context, disk string) (string, error) {
 │               └── IsFirstBoot()?                                    │
 │                       ├── YES → ShowOnboardingFlow()                │
 │                       │           ├── "Install to Disk" → InstallToDisk() │
-│                       │           └── "Try Live" → RunDiskPrep()    │
+│                       │           └── "Try Piccolo" → RunDiskPrep()    │
 │                       └── NO  → Continue (already set up)           │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -840,8 +840,15 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
     if err := os.WriteFile(keyfilePath, keyfile, 0600); err != nil {
         return err
     }
-    defer os.Remove(keyfilePath)
-    defer secureZero(keyfile)
+    keyfileCleanedUp := false
+    cleanupKeyfile := func() {
+        if !keyfileCleanedUp {
+            os.Remove(keyfilePath)
+            secureZero(keyfile)
+            keyfileCleanedUp = true
+        }
+    }
+    defer cleanupKeyfile()
 
     // 3. LUKS format with keyfile (keyslot 0)
     // Pin cipher parameters explicitly for reproducibility across OS versions.
@@ -911,9 +918,13 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
     // If none succeeded, the ephemeral keyfile is about to be zeroed
     // and the LUKS device would become permanently locked.
     if !keyfileStored && !adminRecoveryOK && !mnemonicRecoveryOK {
+        // CRITICAL: Do NOT clean up the ephemeral keyfile — it is the ONLY way
+        // to unlock this device. Leave it in /run/piccolo/ so an operator can
+        // manually recover (e.g., cryptsetup luksAddKey) before rebooting.
+        keyfileCleanedUp = true // prevent deferred cleanup
         return fmt.Errorf("LUKS formatted but no persistent unlock path: " +
             "keyfile storage, admin recovery, and mnemonic recovery all failed; " +
-            "device may require manual recovery with the pool keyfile before reboot")
+            "ephemeral keyfile preserved at %s — add a keyslot manually before rebooting", keyfilePath)
     }
 
     if !keyfileStored {
@@ -1396,7 +1407,7 @@ type OnboardingState string
 const (
     OnboardingPending     OnboardingState = "pending"      // Waiting for user choice
     OnboardingInstallDisk OnboardingState = "install_disk" // User chose install
-    OnboardingTryLive     OnboardingState = "try_live"     // User chose try live
+    OnboardingTryPiccolo     OnboardingState = "try_piccolo"     // User chose try live
     OnboardingComplete    OnboardingState = "complete"     // Setup complete
 )
 
@@ -1422,19 +1433,19 @@ type OnboardingStatus struct {
 
 // POST /api/v1/system/onboarding
 type OnboardingChoice struct {
-    Choice string `json:"choice"` // "install_disk" or "try_live"
+    Choice string `json:"choice"` // "install_disk" or "try_piccolo"
 }
 
 // buildOnboardingOptions determines available options based on hardware.
 // "Install to Disk" is only offered when a non-boot internal disk is detected.
 // On devices with no internal disk (e.g., Raspberry Pi booting from SD/USB),
-// only "Try Live" is available.
+// only "Try Piccolo" is available.
 func buildOnboardingOptions(ctx context.Context, bootDisk string) []string {
     internalDisks := discoverInternalDisks(ctx, bootDisk)
     if len(internalDisks) > 0 {
-        return []string{"install_disk", "try_live"}
+        return []string{"install_disk", "try_piccolo"}
     }
-    return []string{"try_live"}
+    return []string{"try_piccolo"}
 }
 
 // discoverInternalDisks finds non-USB block devices that are not the boot disk.
@@ -1444,20 +1455,20 @@ func discoverInternalDisks(ctx context.Context, excludeDisk string) []string {
 }
 ```
 
-### 9.3 "Try Live" Flow (Evaluation-Only)
+### 9.3 "Try Piccolo" Flow (Evaluation-Only)
 
-> **Note:** "Try Live" runs the full storage posture on the boot USB. This is an evaluation-only mode — see §2.5 for contract implications.
+> **Note:** "Try Piccolo" runs the full storage posture on the boot USB. This is an evaluation-only mode — see §2.5 for contract implications.
 
-When user selects "Try Live":
+When user selects "Try Piccolo":
 
-1. Mark onboarding state as `try_live`
+1. Mark onboarding state as `try_piccolo`
 2. Run full disk prep on USB drive
 3. Continue with normal admin password setup
 4. Mark onboarding as `complete`
 
 **USB Partitioning Safety:**
 
-The "Try Live" flow partitions the active boot USB device. This is safe because:
+The "Try Piccolo" flow partitions the active boot USB device. This is safe because:
 
 1. **Data partition created first**: `/piccolo-data` is created at the 20GB offset before root expansion, which bounds `growpart` (see Section 5.2).
 
@@ -1601,12 +1612,17 @@ func NewGinServer() (*GinServer, error) {
     if bootMode == storage.BootModeUSB && !diskState.SetupComplete {
         // USB boot, first time - need onboarding
         // Register onboarding endpoints, wait for user choice
+        // Do NOT start disk prep until user chooses "Try Piccolo"
+        // ("Install to Disk" targets internal disk, not the boot USB)
     }
 
     // PHASE 1: Boot-time partitioning (background, non-blocking)
     // The server starts immediately — the portal shows "Preparing storage..."
     // while disk prep runs in a background goroutine.
-    if needsDiskPrep(diskState) {
+    // IMPORTANT: For USB first-boot, disk prep is deferred until after the user
+    // selects "Try Piccolo" via POST /api/v1/system/onboarding. The onboarding
+    // handler calls StartPartitioningAsync after recording the user's choice.
+    if needsDiskPrep(diskState) && !pendingUSBOnboarding {
         storageMgr.StartPartitioningAsync(ctx) // sets storageMgr.phase1Done channel on completion
     }
 
@@ -1775,7 +1791,7 @@ The canonical `InitializeLUKS` in §6.3 is the authoritative implementation. Key
 
 1. **`luksFormat` is atomic** — either succeeds or the device is unchanged. If it fails, the caller can retry safely.
 2. **Keyfile is persisted first** (before recovery keyslots) — this is the primary unlock path and has the highest success probability.
-3. **"At least one persistent unlock path" invariant** — if the pool keyfile, admin recovery keyslot, and mnemonic recovery keyslot all fail to persist, the function returns an error. The LUKS device exists but may become permanently locked on reboot. The error message instructs the operator to preserve the ephemeral keyfile in `/run/piccolo/` before rebooting.
+3. **"At least one persistent unlock path" invariant** — if the pool keyfile, admin recovery keyslot, and mnemonic recovery keyslot all fail to persist, the function skips ephemeral keyfile cleanup and returns an error. The keyfile remains at `/run/piccolo/piccolo_data_pool_key` (tmpfs — survives until reboot) so an operator can manually `cryptsetup luksAddKey` before rebooting.
 4. **Partial keyslot failure is non-fatal** — if only one or two of the three unlock paths succeed, the system continues with degraded recovery options and logs warnings.
 
 ### 12.3 Emergency Mode
@@ -1921,7 +1937,7 @@ On fresh piccolo-os image:
 
 1. Boot from internal - verify disk prep
 2. Boot from USB - verify onboarding flow
-3. Select "Try Live" - verify USB gets partitioned
+3. Select "Try Piccolo" - verify USB gets partitioned
 4. Reboot - verify state persists
 
 ## 14. Audit Events
@@ -1951,12 +1967,11 @@ Key storage operations should emit events to the audit log (via `internal/events
 Out of scope for this RFC:
 
 1. **USB storage expansion management** - hotplug detection and adding/removing devices to the `/piccolo-data` pool
-2. **Adopt disk ("Use as-is") flows** - mounting and incorporating existing disks without formatting
-3. **JuiceFS integration** - per-volume filesystems
-4. **Cluster mode** - etcd placement
-5. **Network-bootstrap hardening** - TPM enrollment and sealing
-6. **Degraded mode UI** - surfacing pool status
-7. **LUKS2 authenticated encryption** - `dm-integrity` or AEAD modes for tamper detection on physically accessible devices
+2. **JuiceFS integration** - per-volume filesystems
+3. **Cluster mode** - etcd placement
+4. **Network-bootstrap hardening** - TPM enrollment and sealing
+5. **Degraded mode UI** - surfacing pool status
+6. **LUKS2 authenticated encryption** - `dm-integrity` or AEAD modes for tamper detection on physically accessible devices
 
 ## 17. Required System Tools
 
@@ -2003,3 +2018,4 @@ This ensures tools are installed as dependencies of piccolod rather than relying
 - 2026-02-04: Parallel review fixes. Fixed: (11) `.ciphertext/` → `ciphertext/` (removed dot prefix to match existing codebase); (12) Argon2 thread count now dynamic (`max(1, runtime.NumCPU()-1)`) to align with crypt.Manager; (13) Phase 1 disk prep now runs in background after server starts (portal available immediately, shows "Preparing storage..."); (14) added §5.0 partition table preconditions; (15) added 20GB root rationale (MicroOS recommended max); (16) added pre-unlock endpoint allowlist table.
 - 2026-02-06: Second parallel review fixes. Fixed: (17) pool keyfile now included in PCV exports (node-scoped data for restore workflows); updated §6.2 and §7.1 classification; (18) Argon2 derivation params + random salts now persisted per device at `crypto/luks-kdf-params/<uuid>.json` — fixes correctness risk where CPU count changes would produce different passphrases; added §6.4.1 KDF parameter persistence; (19) split endpoint allowlist into pre-unlock vs emergency mode tables — crypto endpoints blocked in emergency since disk prep must succeed first; (20) per-node room concept documented for cluster-mode PCV.
 - 2026-02-06: Third review pass. Blocking fixes: (21) Argon2 thread cap at 8 for portability; (22) Argon2 memory 512 MiB to match crypt.Manager; (23) hardcoded path replaced with `paths.CoreRoot()`; (24) keyslot 0 uses pbkdf2 (high-entropy keyfile, argon2 adds no value); (25) kernel partition verification loop after partprobe; (26) mnemonic always enrolled at setup, added `OnRecoveryMnemonicRotated` hook. Significant fixes: (27) emergency middleware path matching rewritten (old `/` prefix matched all paths); (28) specified `rekeySlotViaPoolKeyfile` implementation; (29) mapper collision check before `cryptsetup open`; (30) `CommandRunner` interface note for testability; (31) no-fstab design rationale documented; (32) 32-byte salt rationale (RFC 9106 §4). Suggestions: (33) GPT partition label `piccolo-data`; (34) btrfs filesystem label; (35) audit events section added (§14).
+- 2026-02-06: Cross-review validation. Fixed: (36) ephemeral keyfile cleanup is now conditional — skipped on all-three-failed path so operator can recover; (37) USB onboarding guard prevents async partitioning before user chooses "Try Piccolo"; (38) renamed "Try Live" → "Try Piccolo" throughout to match PRD and acceptance features.
