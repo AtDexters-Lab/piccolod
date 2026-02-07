@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -14,22 +15,25 @@ import (
 	"piccolod/internal/state/paths"
 )
 
-// cleanupStaleFUSEMounts unmounts all fuse-overlayfs mounts under the state directory.
+// fuseMount represents a FUSE mount entry from /proc/mounts.
+type fuseMount struct {
+	path   string
+	fstype string
+}
+
+// cleanupStaleFUSEMounts unmounts all FUSE mounts under the state directory.
 // Called once at startup before the first reconcile tick.
 //
-// After a service restart, systemd kills fuse-overlayfs daemon processes in the
-// unit's cgroup, leaving stale FUSE mount entries in the kernel mount table.
-// Accessing these stale mounts returns ENOTCONN ("Transport endpoint is not connected").
-// Critically, stat(2)/fstatat(2) succeeds on stale FUSE mountpoints (kernel returns
-// cached VFS attributes), so os.Stat is not a reliable liveness probe — only statx(2)
-// and actual I/O (readdir, open) fail.
+// After a service restart, systemd kills FUSE daemon processes (fuse-overlayfs,
+// gocryptfs, etc.) in the unit's cgroup, leaving stale FUSE mount entries in the
+// kernel mount table. Accessing these stale mounts returns ENOTCONN ("Transport
+// endpoint is not connected"). Critically, stat(2)/fstatat(2) succeeds on stale
+// FUSE mountpoints (kernel returns cached VFS attributes), so os.Stat is not a
+// reliable liveness probe — only statx(2) and actual I/O (readdir, open) fail.
 //
-// This affects the podman image-root overlay driver's merged directories, which are
-// used as lowerdir for workspace disk overlays. The stale mounts cause all workspace
-// apps to fail with "cannot read lower dirs: Transport endpoint is not connected".
-//
-// Strategy: scan /proc/mounts for fuse-overlayfs entries under the state dir and
-// lazy-unmount them all. Safe because no containers are running at startup.
+// Strategy: scan /proc/mounts for all fuse.* entries under the state dir and
+// lazy-unmount them in reverse order (submounts before parents). Safe because
+// no containers are running at startup.
 func cleanupStaleFUSEMounts(ctx context.Context) {
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
@@ -43,20 +47,24 @@ func cleanupStaleFUSEMounts(ctx context.Context) {
 		return
 	}
 
-	log.Printf("INFO: fuse repair: found %d stale fuse-overlayfs mount(s), cleaning up", len(mounts))
+	// Reverse so submounts (which appear later in /proc/mounts) are unmounted
+	// before their parent mounts.
+	slices.Reverse(mounts)
+
+	log.Printf("INFO: fuse repair: found %d stale FUSE mount(s), cleaning up", len(mounts))
 	for _, mp := range mounts {
-		if lazyUnmount(ctx, mp) {
-			log.Printf("INFO: fuse repair: unmounted %s", mp)
+		if lazyUnmount(ctx, mp.path) {
+			log.Printf("INFO: fuse repair: unmounted %s at %s", mp.fstype, mp.path)
 		} else {
-			log.Printf("WARN: fuse repair: failed to unmount %s", mp)
+			log.Printf("WARN: fuse repair: failed to unmount %s at %s", mp.fstype, mp.path)
 		}
 	}
 }
 
-// parseFUSEMounts reads mount entries and returns all fuse.fuse-overlayfs
-// mountpoints whose path falls under the given prefix.
-func parseFUSEMounts(r io.Reader, prefix string) []string {
-	var mounts []string
+// parseFUSEMounts reads mount entries and returns all fuse.* mountpoints
+// whose path falls under the given prefix.
+func parseFUSEMounts(r io.Reader, prefix string) []fuseMount {
+	var mounts []fuseMount
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -66,13 +74,13 @@ func parseFUSEMounts(r io.Reader, prefix string) []string {
 		mountpoint := fields[1]
 		fstype := fields[2]
 
-		if fstype != "fuse.fuse-overlayfs" {
+		if !strings.HasPrefix(fstype, "fuse.") {
 			continue
 		}
 		if !strings.HasPrefix(mountpoint, prefix+"/") && mountpoint != prefix {
 			continue
 		}
-		mounts = append(mounts, mountpoint)
+		mounts = append(mounts, fuseMount{path: mountpoint, fstype: fstype})
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("WARN: fuse repair: error reading mount entries: %v", err)

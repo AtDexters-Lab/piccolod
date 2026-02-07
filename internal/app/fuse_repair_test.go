@@ -10,7 +10,7 @@ func TestParseFUSEMounts(t *testing.T) {
 		name   string
 		input  string
 		prefix string
-		want   []string
+		want   []fuseMount
 	}{
 		{
 			name:   "empty",
@@ -36,7 +36,7 @@ proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
 			name: "single_image_root_overlay",
 			input: `fuse-overlayfs /var/lib/piccolod/podman/image-root/overlay/610fd6c/merged fuse.fuse-overlayfs rw,nosuid,nodev,relatime 0 0`,
 			prefix: "/var/lib/piccolod",
-			want:   []string{"/var/lib/piccolod/podman/image-root/overlay/610fd6c/merged"},
+			want:   []fuseMount{{path: "/var/lib/piccolod/podman/image-root/overlay/610fd6c/merged", fstype: "fuse.fuse-overlayfs"}},
 		},
 		{
 			name: "multiple_stale_mounts",
@@ -44,10 +44,10 @@ proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
 fuse-overlayfs /var/lib/piccolod/podman/image-root/overlay/bbb/merged fuse.fuse-overlayfs rw 0 0
 fuse-overlayfs /var/lib/piccolod/mounts/app-d1/disk/workspace/merged fuse.fuse-overlayfs rw 0 0`,
 			prefix: "/var/lib/piccolod",
-			want: []string{
-				"/var/lib/piccolod/podman/image-root/overlay/aaa/merged",
-				"/var/lib/piccolod/podman/image-root/overlay/bbb/merged",
-				"/var/lib/piccolod/mounts/app-d1/disk/workspace/merged",
+			want: []fuseMount{
+				{path: "/var/lib/piccolod/podman/image-root/overlay/aaa/merged", fstype: "fuse.fuse-overlayfs"},
+				{path: "/var/lib/piccolod/podman/image-root/overlay/bbb/merged", fstype: "fuse.fuse-overlayfs"},
+				{path: "/var/lib/piccolod/mounts/app-d1/disk/workspace/merged", fstype: "fuse.fuse-overlayfs"},
 			},
 		},
 		{
@@ -57,11 +57,34 @@ fuse-overlayfs /var/lib/piccolod/podman/image-root/overlay/abc/merged fuse.fuse-
 /dev/sda1 /var/lib/piccolod ext4 rw 0 0
 fuse-overlayfs /other/path fuse.fuse-overlayfs rw 0 0`,
 			prefix: "/var/lib/piccolod",
-			want:   []string{"/var/lib/piccolod/podman/image-root/overlay/abc/merged"},
+			want:   []fuseMount{{path: "/var/lib/piccolod/podman/image-root/overlay/abc/merged", fstype: "fuse.fuse-overlayfs"}},
 		},
 		{
 			name: "prefix_not_directory_boundary",
 			input: `fuse-overlayfs /var/lib/piccolod-other/overlay/abc/merged fuse.fuse-overlayfs rw 0 0`,
+			prefix: "/var/lib/piccolod",
+			want:   nil,
+		},
+		{
+			name:   "gocryptfs_mount_under_prefix",
+			input:  `gocryptfs /var/lib/piccolod/mounts/app-d1 fuse.gocryptfs rw,nosuid,nodev,relatime 0 0`,
+			prefix: "/var/lib/piccolod",
+			want:   []fuseMount{{path: "/var/lib/piccolod/mounts/app-d1", fstype: "fuse.gocryptfs"}},
+		},
+		{
+			name: "mixed_fuse_types",
+			input: `gocryptfs /var/lib/piccolod/mounts/app-d1 fuse.gocryptfs rw 0 0
+fuse-overlayfs /var/lib/piccolod/mounts/app-d1/disk/workspace/merged fuse.fuse-overlayfs rw 0 0
+sshfs /home/user/remote fuse.sshfs rw 0 0`,
+			prefix: "/var/lib/piccolod",
+			want: []fuseMount{
+				{path: "/var/lib/piccolod/mounts/app-d1", fstype: "fuse.gocryptfs"},
+				{path: "/var/lib/piccolod/mounts/app-d1/disk/workspace/merged", fstype: "fuse.fuse-overlayfs"},
+			},
+		},
+		{
+			name:   "gocryptfs_outside_prefix",
+			input:  `gocryptfs /home/user/encrypted fuse.gocryptfs rw 0 0`,
 			prefix: "/var/lib/piccolod",
 			want:   nil,
 		},
@@ -75,7 +98,7 @@ fuse-overlayfs /other/path fuse.fuse-overlayfs rw 0 0`,
 			}
 			for i := range got {
 				if got[i] != tt.want[i] {
-					t.Errorf("mount[%d] = %q, want %q", i, got[i], tt.want[i])
+					t.Errorf("mount[%d] = %+v, want %+v", i, got[i], tt.want[i])
 				}
 			}
 		})
