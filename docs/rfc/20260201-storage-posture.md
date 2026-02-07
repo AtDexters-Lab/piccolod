@@ -632,6 +632,11 @@ func (p *Preparer) getSectorSize(ctx context.Context, disk string) (int64, error
 
 // CreateDataPartition creates /piccolo-data partition using the sizing rules from §5.4.
 // MUST be called BEFORE ExpandRootPartition to bound growpart.
+//
+// Single-disk constraint (Foundation): Phase 1 disk prep operates exclusively on
+// the boot disk. GetPartitionState only examines the boot disk's partition table.
+// Multi-disk pool expansion (adding USB or additional internal disks to the
+// /piccolo-data btrfs pool) is future work (§16).
 func (p *Preparer) CreateDataPartition(ctx context.Context) error {
     state, err := p.GetPartitionState(ctx)
     if err != nil {
@@ -1107,7 +1112,10 @@ func (m *StorageManager) Unlock(ctx context.Context, adminPassword string) error
         // Mapper already exists — device may already be open
         if m.isMapperActive(ctx, mapperPath) {
             m.logger.Info("LUKS device already open", "mapper", mapperName)
-            return nil // Already unlocked
+            // LUKS is open but btrfs may not be mounted (crash between LUKS open
+            // and mount). Run postUnlock which checks mount state, ensures
+            // directories, applies NOCOW, and resumes interrupted rotations.
+            return m.postUnlock(ctx, adminPassword)
         }
         // Stale mapper — close it before re-opening
         _ = m.runner.Run(ctx, "cryptsetup", "close", mapperName)
@@ -1196,7 +1204,12 @@ func (m *StorageManager) unlockWithAdminPassword(ctx context.Context, device, ma
 
     params, err := readJSON[LUKSKDFParams](kdfParamsPath(deviceUUID))
     if err != nil {
-        return fmt.Errorf("failed to read KDF params: %w", err)
+        // KDF params missing or corrupt — keyslot 1 cannot be derived.
+        // Recovery: import a PCV backup to restore KDF params, or use
+        // keyslot 0 (pool keyfile) or keyslot 2 (recovery mnemonic).
+        return fmt.Errorf("failed to read KDF params for device %s — "+
+            "admin password keyslot 1 unavailable; import a PCV backup to "+
+            "restore KDF params, or unlock via recovery mnemonic: %w", deviceUUID, err)
     }
 
     passphrase := DeriveRecoveryPassphrase(adminPassword, params)
@@ -1214,13 +1227,19 @@ func (m *StorageManager) unlockWithAdminPassword(ctx context.Context, device, ma
         device, mapperName)
 }
 
-// postUnlock performs post-unlock operations: mount btrfs, resume interrupted
-// rotations, and ensure directory layout.
+// postUnlock performs post-unlock operations: mount btrfs (if not already mounted),
+// resume interrupted rotations, and ensure directory layout.
+// Safe to call when LUKS is open but btrfs may or may not be mounted (e.g., crash
+// recovery where mapper was active but mount did not complete).
 func (m *StorageManager) postUnlock(ctx context.Context, adminPassword string) error {
-    // Mount btrfs
+    // Mount btrfs (skip if already mounted)
     mapperPath := "/dev/mapper/" + m.dataPoolMapperName(0)
-    if err := m.runner.Run(ctx, "mount", mapperPath, paths.DataRoot()); err != nil {
-        return fmt.Errorf("failed to mount /piccolo-data: %w", err)
+    if !m.isMounted(paths.DataRoot()) {
+        if err := m.runner.Run(ctx, "mount", mapperPath, paths.DataRoot()); err != nil {
+            return fmt.Errorf("failed to mount /piccolo-data: %w", err)
+        }
+    } else {
+        m.logger.Info("btrfs already mounted at " + paths.DataRoot())
     }
 
     // Resume any interrupted keyslot rotations (§6.6.1)
@@ -1524,6 +1543,8 @@ Password rotation must update LUKS keyslot 1 (admin-derived) on all pool devices
 
 **Atomicity requirement:** Keyslot updates MUST use `cryptsetup luksChangeKey` (not `luksRemoveKey` + `luksAddKey`) to perform an atomic in-place replacement. This ensures there is never a window where the recovery keyslot is absent.
 
+**Failure UX:** The password change API reports success as soon as the control-plane `keyset.json` is updated — LUKS keyslot rotation proceeds asynchronously. If `luksChangeKey` fails for a device (e.g., transient I/O error), the failure is logged and retried on a timer (every 5 minutes) until all devices are rotated. No user-facing signal is surfaced; the rotation progress file provides crash-resume semantics across retries. During the window where keyslot 1 has a stale passphrase, keyslot 0 (pool keyfile) and keyslot 2 (mnemonic) remain functional for unlock.
+
 ```go
 func (m *StorageManager) OnAdminPasswordRotated(ctx context.Context, oldPass, newPass string) error {
     devices, err := m.listDataPoolDevices(ctx)
@@ -1685,7 +1706,7 @@ The LUKS header contains critical metadata (keyslots, encryption parameters). If
 // Header backups live under crypto/ alongside other device-local key material.
 // This path is always writable (outside gocryptfs) and not replicated to peers.
 func (m *StorageManager) backupLUKSHeader(ctx context.Context, device, deviceUUID string) error {
-    backupDir := "/piccolo-core/crypto/luks-header-backups"
+    backupDir := paths.CoreJoin("crypto", "luks-header-backups")
     if err := os.MkdirAll(backupDir, 0700); err != nil {
         return err
     }
@@ -1704,7 +1725,7 @@ func (m *StorageManager) backupLUKSHeader(ctx context.Context, device, deviceUUI
 
 // Recovery: restore header then unlock with admin password
 func (m *StorageManager) restoreLUKSHeader(ctx context.Context, device, deviceUUID string) error {
-    backupPath := filepath.Join("/piccolo-core/crypto/luks-header-backups", deviceUUID+".bin")
+    backupPath := filepath.Join(paths.CoreJoin("crypto", "luks-header-backups"), deviceUUID+".bin")
 
     if err := m.runner.Run(ctx, "cryptsetup", "luksHeaderRestore",
         device,
@@ -1727,6 +1748,55 @@ func (m *StorageManager) restoreLUKSHeader(ctx context.Context, device, deviceUU
 **Header Backup Updates:**
 - Initial backup after `luksFormat`
 - Re-backup after any keyslot changes (password rotation)
+
+### 6.8 Lock (graceful shutdown of `/piccolo-data`)
+
+`Lock` is the inverse of `Unlock`. It is called during graceful shutdown, OS updates (pre-reboot), and the portal "lock device" action.
+
+```go
+// Lock gracefully tears down /piccolo-data. Callers must ensure all services
+// using /piccolo-data have been stopped before calling Lock (the supervisor
+// coordinates this via its Stop ordering).
+//
+// Sequencing:
+//   1. Coordinate with PCV publisher: if the dirty latch is set, the publisher
+//      performs a flush-publish before we proceed (see Foundation RFC §14, Stop).
+//   2. Unmount btrfs at paths.DataRoot(). Fails if any process still has open
+//      file handles — caller must ensure services are stopped first.
+//   3. Close the LUKS mapper via `cryptsetup close <mapperName>`.
+//   4. Clear the cached pool keyfile from memory (secureZero).
+//   5. Emit TopicStorageLocked so the portal can transition to "locked" state.
+//
+// If unmount fails (EBUSY), Lock returns an error and does NOT close LUKS.
+// The caller should investigate open handles (lsof/fuser) before retrying.
+func (m *StorageManager) Lock(ctx context.Context) error {
+    mapperName := m.dataPoolMapperName(0)
+
+    // Step 1: PCV flush is handled by the supervisor's Stop ordering —
+    // the PCV publisher's Stop runs before StorageManager's Lock.
+
+    // Step 2: Unmount btrfs
+    if err := m.runner.Run(ctx, "umount", paths.DataRoot()); err != nil {
+        return fmt.Errorf("failed to unmount %s: %w (check for open file handles)", paths.DataRoot(), err)
+    }
+
+    // Step 3: Close LUKS
+    if err := m.runner.Run(ctx, "cryptsetup", "close", mapperName); err != nil {
+        return fmt.Errorf("failed to close LUKS mapper %s: %w", mapperName, err)
+    }
+
+    // Step 4: Clear cached keyfile
+    if m.cachedKeyfile != nil {
+        secureZero(m.cachedKeyfile)
+        m.cachedKeyfile = nil
+    }
+
+    m.logger.Info("storage locked", "mapper", mapperName)
+    return nil
+}
+```
+
+**Supervisor integration:** The supervisor's Stop phase runs components in reverse registration order. The PCV publisher must be registered **after** `StorageManager` so that it stops **before** Lock is called, ensuring its flush-publish completes while btrfs is still mounted.
 
 ## 7. Directory Structure
 
@@ -1920,7 +1990,7 @@ func (p *Preparer) ValidateUSBPartitioning(ctx context.Context, disk string) err
 
 ### 9.4 "Install to Disk" Flow (v1, phased)
 
-Install to Disk is a **v1 requirement** (see product acceptance criteria in `org-context/02_product/acceptance_features/install_to_disk_x86.feature`). This RFC does not fully specify UI/UX, but it defines the storage posture contracts the installer must satisfy.
+Install to Disk is a **v1 requirement** (see product acceptance criteria in `org-context/02_product/acceptance_features/install_to_disk_x86.feature`). The full specification will be provided in a **dedicated companion RFC** (`docs/rfc/20260203-install-to-disk.md`). This section defines only the storage posture contracts that the installer must satisfy.
 
 **Core contract (always true):**
 - Target disk ends up in the production two-root posture:
@@ -1942,6 +2012,14 @@ Install to Disk is a **v1 requirement** (see product acceptance criteria in `org
 - Use `btrfs send | btrfs receive` to sync the live root filesystem to the target disk (matching the PRD), then apply the same disk-prep posture on the target disk (root sizing + `/piccolo-data` creation + LUKS2 init).
 
 **Failure and retry:** Install to Disk writes to the internal disk only — it does not modify the boot USB. If the install fails (power loss, I/O error), the USB boot environment remains fully functional. On retry, the installer must detect partial writes on the target disk (e.g., GPT present but no valid btrfs, or btrfs present but incomplete snapshot) and offer to wipe and restart rather than attempting to resume from an unknown state.
+
+**Deferred to companion RFC:** The following areas require detailed specification and will be covered in `docs/rfc/20260203-install-to-disk.md`:
+- ESP creation and UEFI boot entry setup on the target disk
+- LUKS2 setup on the target disk (re-key or copy pool keyfile)
+- Control-plane crypto material migration strategy
+- Handling pre-existing `/piccolo-data` LUKS on the target disk
+- Progress reporting, cancellation semantics, and timeout handling
+- Carry-over state validation (integrity check before reboot)
 
 ## 10. Component Changes
 
@@ -1972,6 +2050,9 @@ func (m *Manager) EmergencyError() error
 // Phase 2: Post-auth operations (called from API handlers)
 func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string) error  // Phase 2: LUKS + mount
 func (m *Manager) Unlock(ctx context.Context, adminPassword string) error  // Subsequent boots
+func (m *Manager) Lock(ctx context.Context) error
+
+// Lock: graceful shutdown of /piccolo-data (see §6.8)
 func (m *Manager) Lock(ctx context.Context) error
 
 // Lifecycle hooks
@@ -2535,6 +2616,7 @@ Key storage operations should emit events to the audit log (via `internal/events
 - Temp keyfile written to tmpfs (/run), never to disk
 - LUKS header backed up to control plane for disaster recovery (device-specific; excluded from PCV exports)
 - KDF params and pool keyfile included in PCV exports (node-scoped data for restore workflows)
+- **GC residual key material (known limitation):** Go's garbage collector may copy heap objects during compaction, leaving residual copies of key material (pool keyfile, derived passphrases) in freed memory even after `secureZero` is called. This is acceptable for Piccolo's threat model because: (1) key material is short-lived — read or derived at unlock time, passed to `cryptsetup`, and immediately zeroed, (2) physical access to the device already provides access to the LUKS header and disk, making memory residue a secondary concern, (3) the primary remote threat (container escape with root) can read `/proc/<pid>/mem` regardless of memory protection libraries like `memguard`. Libraries such as `memguard` (mlock + guard pages) add complexity without meaningful mitigation given these constraints. No action needed for Foundation; revisit if the threat model changes (e.g., multi-tenant workloads).
 
 ## 16. Future Work
 

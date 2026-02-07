@@ -256,6 +256,8 @@ A new PCV export is published when **any** of the following conditions are met:
 
 **Latch pattern:** The publisher maintains a boolean latch (`dirty`) that is set on every `TopicControlStoreCommit` event and cleared after a successful publish. The debounce timer only runs while the latch is set. This prevents redundant publishes when the periodic timer fires but no mutations have occurred since the last publish.
 
+**Event bus drop safety:** The event bus drops events when a subscriber's channel buffer is full (`select { default: }`). During a long publish, the publisher is not reading from the channel, so burst events accumulate in the buffer and any overflow is silently dropped. However, this is safe because: (1) events that fit in the buffer persist until read — they are not drained by anything else, so the publisher will find them after the publish completes, (2) even a single buffered event sets the dirty latch and triggers a re-publish of the **current** subvolume state, which captures all mutations regardless of which specific events were dropped, and (3) the only scenario where all events are lost is if the buffer was already completely full before the burst, which indicates a liveness bug rather than a drop-semantics issue. A channel buffer size of 8–16 is sufficient for Foundation.
+
 #### Retention policy (Foundation defaults)
 - **`current.enc`:** always the latest published PCV export.
 - **`history/`:** retain the most recent **5 generations**. Older exports are deleted after a successful publish. The retention count should be configurable via a control-plane setting in future milestones.
@@ -267,6 +269,9 @@ Before finalizing a publish, the publisher checks the archive size against a con
 - If staging or atomic rename fails, the previous `current.enc` remains intact (no partial overwrites).
 - Publish failures are logged and surfaced via the health endpoint. They do not block normal operation.
 - The next trigger (mutation or periodic) will retry.
+
+#### `/piccolo-core` space monitoring
+The `/api/v1/system/health` response MUST include a `piccolo_core_free_bytes` field reporting available space on the `/piccolo-core` partition. The portal displays a warning when free space drops below 50 MiB. This surfaces space pressure before it causes silent write failures in the control plane or PCV publisher.
 
 To avoid implicit knowledge, the PCV export must be accompanied by a small metadata manifest that is replicated and backed up together with the payload.
 
@@ -296,6 +301,8 @@ Minimum JSON schema (v1):
 **Clock-skew handling:** On startup (and before each publish), the publisher reads the previous `current.json`'s `gen` and verifies the new `gen` is strictly greater (lexicographic). If the system clock has gone backward (e.g., NTP correction), the publisher reuses the *timestamp portion* from the previous `gen` and increments only the counter suffix. This ensures monotonicity without waiting for the clock to catch up. Example: if previous gen is `2026-02-02T18:04:05Z-000003` and current UTC is `2026-02-02T18:03:00Z` (clock went back), the new gen becomes `2026-02-02T18:04:05Z-000004`.
 
 **`source_node_id`:** Identifies which node produced this PCV export. For Foundation (single-node), this is the device's stable node ID (generated at first boot and stored in the control plane). In cluster mode, this field enables peers to attribute PCV exports to their source.
+
+**Generation:** The node ID is derived from stable hardware identifiers: `SHA-256(machine-id || DMI board serial)`, truncated to 16 hex characters. This makes the ID deterministic for a given physical device — the same hardware produces the same node ID even after a full OS reinstall, which allows the orchestrator to correlate PCV exports from a replaced/reimaged node with its previous identity. The `machine-id` comes from `/etc/machine-id` (systemd) and the DMI serial from `/sys/class/dmi/id/board_serial`. If either source is unavailable (e.g., VM without DMI), fall back to `machine-id` alone. The derived ID is computed at first boot and persisted in the control plane (`node-id.json`) so subsequent reads do not re-derive.
 
 **Resolution when locked:** The node ID is generated at first boot and stored in the control plane (inside gocryptfs). Since PCV exports can be produced while locked (from the ciphertext snapshot), the publisher must cache the `source_node_id` in memory after the first successful unlock. If the publisher starts while locked (e.g., periodic publish before admin unlock), `source_node_id` falls back to reading the previous `current.json`'s value. On a brand-new device (no previous PCV, still locked), the field is set to an empty string and updated on the first post-unlock publish.
 
@@ -376,6 +383,8 @@ PCV import is a **recovery/bootstrap operation**, not a routine operational acti
 If a functional, unlockable control plane exists, the import endpoint returns `409 Conflict` with the message: "Import is only available during setup or recovery. The existing control plane must be absent or structurally corrupted."
 
 **Rationale:** Every legitimate import scenario starts with a missing or broken control plane (fresh install, device replacement, corruption recovery). Allowing import when a working control plane exists would enable accidental or malicious rollback to stale state. This precondition eliminates the rollback attack surface through the import endpoint entirely.
+
+**Network restriction:** PCV import MUST be rejected for requests arriving over the Nexus tunnel. Only LAN-origin requests are permitted. Since the import endpoint is unauthenticated (no control plane = no auth), restricting to LAN keeps the attack surface within the local trust boundary. The check should inspect the request origin (e.g., source IP or tunnel-injected header) and return `403 Forbidden` for tunnel-routed requests.
 
 **Portal integration:** The portal surfaces PCV import in exactly two places:
 1. **Setup screen** (no control plane exists): alongside "Set up as new," the user can choose "Restore from backup" to upload a `.pcv` file.
@@ -540,6 +549,8 @@ The PCV publisher subscribes to `TopicControlStoreCommit` events (from the exist
 
 This reuses the existing event rather than adding a new topic, keeping the PCV publisher's subscription simple.
 
+**Integration pattern (callback):** `crypt.Manager` does not depend on the event bus. Instead, it accepts an optional `OnKeyMaterialChanged func()` callback during construction. The server wiring layer (`gin_server.go` or startup code) provides a callback that emits `TopicControlStoreCommit`. `StorageManager` follows the same pattern — its `OnAdminPasswordRotated` and `OnRecoveryMnemonicRotated` methods emit directly since `StorageManager` already has event bus access. This keeps `crypt.Manager` independent of the events package.
+
 **New event bus topics:**
 - `TopicPCVExportPublished` — emitted after a successful publish (payload: generation ID, sha256).
 - `TopicPCVExportFailed` — emitted on publish failure (payload: error details). The health endpoint aggregates these for the portal.
@@ -564,10 +575,11 @@ mkdir -p .run-state/core
 sudo mount -o loop /tmp/piccolo-dev-core.img .run-state/core
 ```
 
-The `Makefile` targets (`make run`, `make run-fresh`) will be updated to:
+The `Makefile` targets (`make run`, `make run-fresh`) will be updated **in PR 1 (Paths + env vars)** to:
 - Create `PICCOLO_CORE_ROOT=.run-state/core` and `PICCOLO_DATA_ROOT=.run-state/data` instead of `PICCOLO_STATE_DIR=.run-state`.
+- Activate `PICCOLO_DEV_NO_BTRFS=1` by default for non-btrfs dev environments (detected via `stat -f -c %T`).
 - Optionally create a btrfs loopback for `.run-state/core` (with a `make setup-dev-btrfs` helper).
-- If btrfs is not available (detected via `stat -f -c %T`), PCV export tests that require snapshots are skipped with a clear message.
+- If btrfs is not available, PCV export tests that require snapshots are skipped with a clear message.
 
 **Dev/test fallback (non-btrfs):** For developers who cannot easily set up a btrfs loopback (e.g., macOS with Docker, CI without btrfs), the PCV publisher should support a **copy-based fallback** that uses `cp -a` instead of `btrfs subvolume snapshot`. This fallback is NOT crash-consistent and MUST NOT be used in production. It is gated behind an explicit env var (`PICCOLO_DEV_NO_BTRFS=1`) **and a sentinel file** (`/etc/piccolo-test-image`), matching the `PICCOLO_BOOT_MODE_OVERRIDE` pattern in Posture RFC §4.1. If the sentinel file does not exist, the env var is ignored and the fallback is not activated — this prevents accidental use on production hardware. The fallback logs a prominent warning on every publish. **FUSE safety:** When the control plane is mounted (unlocked), the fallback must perform the two-step `syncfs` flush (§8.2 consistency boundary, step 1: plaintext mount, step 2: ciphertext dir) before `cp -a` to avoid torn copies caused by in-flight gocryptfs writes. Without this, developers will see sporadic test failures that are hard to diagnose. The fallback enables development and basic testing of the PCV pipeline without requiring btrfs infrastructure.
 
