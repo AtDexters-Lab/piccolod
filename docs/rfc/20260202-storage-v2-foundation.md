@@ -139,8 +139,10 @@ All path resolution must go through `internal/state/paths` (or the successor pac
 The existing `paths.Root()` resolves to `PICCOLO_STATE_DIR`. In PR 1 ("Paths + env vars"), refactor to:
 - `paths.CoreRoot()` → resolves `PICCOLO_CORE_ROOT` (default `/piccolo-core`)
 - `paths.DataRoot()` → resolves `PICCOLO_DATA_ROOT` (default `/piccolo-data`)
-- Deprecate and remove `paths.Root()` / `paths.Join()`
-- Update all callers: e.g. `paths.NetworkBootstrapDir()` becomes `filepath.Join(paths.CoreRoot(), "network-bootstrap")`
+- `paths.CoreJoin(parts ...string)` → `filepath.Join(paths.CoreRoot(), parts...)` (convenience wrapper)
+- `paths.DataJoin(parts ...string)` → `filepath.Join(paths.DataRoot(), parts...)` (convenience wrapper)
+- Deprecate and remove `paths.Root()` / `paths.Join()` and all existing convenience helpers (`ControlDir()`, `CryptoDir()`, `ExportsDir()`, `BootstrapDir()`, `VolumesDir()`, `NetworkBootstrapDir()`) — callers migrate to `CoreJoin()`/`DataJoin()`
+- Update all callers: e.g. `paths.NetworkBootstrapDir()` becomes `paths.CoreJoin("network-bootstrap")`
 
 **Migration note:** `NetworkBootstrapDir()` is already used by `internal/server/gin_server.go` for the internal CA. Ensure this path resolves correctly under `CoreRoot()` before removing `PICCOLO_STATE_DIR` to avoid breaking HTTPS pre-unlock.
 
@@ -359,22 +361,44 @@ This RFC does not prescribe the full restore UX or automation — it only ensure
 
 #### 8.4.1 PCV import contract
 
-**Authenticity model:** PCV exports use AES-GCM authenticated encryption (via gocryptfs). A PCV that can be successfully decrypted with the user's admin password or recovery mnemonic is authentic — no separate signature or HMAC is needed. AES-GCM's authentication tag ensures both integrity (no tampering) and authenticity (only someone with the correct password could have produced valid ciphertext). A corrupted or tampered PCV will fail at the gocryptfs mount step with an authentication error.
+**Integrity and key-possession model:** PCV exports use AES-GCM authenticated encryption (via gocryptfs). A PCV that can be successfully decrypted with the user's admin password or recovery mnemonic is verified as integrity-intact and produced by someone with the correct key material — no separate signature or HMAC is needed. AES-GCM's authentication tag ensures integrity (no tampering) and key-possession proof (only someone with the correct password could have produced valid ciphertext). A corrupted or tampered PCV will fail at the gocryptfs mount step with an authentication error. Note: this does **not** constitute anti-replay protection — a stale-but-valid PCV will pass all checks (see anti-rollback discussion below).
 
 **Anti-rollback (Foundation non-goal):** This model does not protect against replaying an older-but-valid PCV bundle. An attacker (or operator error) with write access to `/piccolo-core/recovery/` could replace `current.enc` with a stale export — adding a local monotonic counter file does not help since the same attacker can replace it. For Foundation (single-node), the threat model does not justify additional complexity: an attacker with root access to `/piccolo-core` can already do worse (read SDEK from memory, modify ciphertext directly). The `/piccolo-data/system-objects/control-plane-backups/` redundant copy provides an opportunistic cross-check (if a newer generation exists there, something is off). True anti-rollback requires an external trust anchor — the Piccolo Orchestrator (signed generation attestation) or cluster peer consensus — and will be specified in the cluster RFC (Milestone C).
 
+**Import precondition — no functional control plane:**
+
+PCV import is a **recovery/bootstrap operation**, not a routine operational action. It is only available when **no functional control plane exists** on the device:
+
+- `ciphertext/control-plane/` subvolume absent, OR
+- `crypto/keyset.json` absent, OR
+- Unlock was attempted and failed with a **structural error** (gocryptfs mount failure, corrupt ciphertext — as distinct from wrong password)
+
+If a functional, unlockable control plane exists, the import endpoint returns `409 Conflict` with the message: "Import is only available during setup or recovery. The existing control plane must be absent or structurally corrupted."
+
+**Rationale:** Every legitimate import scenario starts with a missing or broken control plane (fresh install, device replacement, corruption recovery). Allowing import when a working control plane exists would enable accidental or malicious rollback to stale state. This precondition eliminates the rollback attack surface through the import endpoint entirely.
+
+**Portal integration:** The portal surfaces PCV import in exactly two places:
+1. **Setup screen** (no control plane exists): alongside "Set up as new," the user can choose "Restore from backup" to upload a `.pcv` file.
+2. **Unlock failure recovery** (structural corruption): after repeated unlock failures due to structural errors (not wrong password), the portal offers "Restore from backup" as an escape hatch.
+
+Import is **never visible** in the operational portal (dashboard, settings). PCV **export/download** IS visible in the operational portal so users can grab their PCV for safekeeping.
+
 **Import procedure (programmatic contract):**
-1. Verify the PCV archive's SHA-256 matches the accompanying manifest (`current.json`).
-2. Extract the archive into a staging area.
-3. Ensure `ciphertext/control-plane/` is a btrfs subvolume (create if needed, or replace existing).
-4. Move extracted contents into the `/piccolo-core` layout (atomic where possible).
-5. Attempt unlock with the user-provided secret (admin password or recovery mnemonic).
-6. If unlock succeeds → import is valid, proceed with normal startup.
-7. If unlock fails → report error, do not modify existing state.
+1. Verify precondition: no functional control plane exists (see above). Return 409 if violated.
+2. Verify the PCV archive's SHA-256 matches the accompanying manifest (`current.json`).
+3. Extract the archive into a staging area.
+4. Ensure `ciphertext/control-plane/` is a btrfs subvolume (create if needed, or replace existing).
+5. Move extracted contents into the `/piccolo-core` layout (atomic where possible).
+6. Attempt unlock with the user-provided secret (admin password or recovery mnemonic).
+7. If unlock succeeds → import is valid, proceed with normal startup.
+8. If unlock fails → report error, do not modify existing state.
 
-**Conflict handling:** If a control plane already exists on the device, the import replaces it entirely. The previous control plane's `ciphertext/control-plane/` subvolume is renamed (e.g., `ciphertext/control-plane.bak.<timestamp>`) before extraction, and deleted after successful unlock of the imported PCV. If unlock fails, the backup is restored. **Stale backup cleanup:** Before creating a new `.bak` subvolume, the import procedure deletes any existing `ciphertext/control-plane.bak.*` subvolumes from previous failed import attempts (via `btrfs subvolume delete`). This prevents accumulation from repeated failures.
+**Conflict handling:** If a structurally-corrupt control plane exists on the device (import precondition met via structural failure), the import replaces it. The previous control plane's `ciphertext/control-plane/` subvolume is renamed (e.g., `ciphertext/control-plane.bak.<timestamp>`) before extraction, and deleted after successful unlock of the imported PCV. If unlock fails, the backup is restored. **Stale backup cleanup:** Before creating a new `.bak` subvolume, the import procedure deletes any existing `ciphertext/control-plane.bak.*` subvolumes from previous failed import attempts (via `btrfs subvolume delete`). This prevents accumulation from repeated failures.
 
-**Implementation timeline:** Foundation includes a **minimal programmatic import endpoint** (`POST /api/v1/system/pcv/import`) that accepts a `.pcv` upload, verifies SHA-256 against the accompanying manifest, extracts to staging, handles conflict (backup existing control plane), and attempts unlock. This endpoint is API-only (no portal UX) and satisfies both the round-trip integration test requirement and the product acceptance criterion for PCV import (`backup_and_restore.feature`). The full portal-driven import UX, test-restore drill, and conflict resolution UI are deferred to post-Foundation.
+**Implementation timeline:** Foundation includes:
+- **API endpoint** (`POST /api/v1/system/pcv/import`) with precondition check, SHA-256 verification, staging extraction, conflict handling, and unlock attempt. Required for round-trip integration test and product acceptance.
+- **Minimal portal UX**: "Restore from backup" option on the setup screen (upload `.pcv` file) and as an escape hatch after structural unlock failures. PCV export/download button in the operational portal.
+- **Deferred to post-Foundation**: test-restore drill, PCV export schedule configurability, and full conflict resolution UI.
 
 **Round-trip test requirement:** An integration test must verify: create control plane → write known state → export PCV → wipe `/piccolo-core` → import PCV → unlock → verify known state is intact. This test validates the export format, btrfs subvolume reconstruction, and the authenticity model end-to-end.
 
@@ -413,7 +437,8 @@ Scope (high-level):
 - Implement the directory layout and path resolution contract.
 - Replace the "bootstrap volume" concept with `network-bootstrap` on `/piccolo-core`.
 - Implement control-plane storage using the distributed layout under `/piccolo-core` (`ciphertext/control-plane/`, `crypto/`, `volumes/control-plane/`, `mounts/control-plane/` — see §5.1) and PCV exports under `/piccolo-core/recovery/`.
-- Implement a minimal PCV import endpoint (`POST /api/v1/system/pcv/import`) — API-only, no portal UX. Validates SHA-256, extracts to staging, handles existing control plane conflict, attempts unlock. Required for round-trip integration test and product acceptance.
+- Implement PCV import endpoint (`POST /api/v1/system/pcv/import`) gated on "no functional control plane" precondition (§8.4.1). Validates SHA-256, extracts to staging, handles conflict, attempts unlock. Required for round-trip integration test and product acceptance.
+- Implement minimal portal UX for PCV: "Restore from backup" on setup screen and after structural unlock failures; export/download button in operational portal. Deferred: schedule configurability, test-restore drill.
 - Implement `/piccolo-data` pool mount orchestration (initially: mount detection + layout creation; then LUKS2 integration).
 
 ### 10.2 Milestone B — App volumes v2 (single-node)
@@ -450,7 +475,8 @@ This section intentionally outlines a layered implementation approach (reviewabl
 4. **PCV exports + minimal import**
    - Implement `recovery/current.enc` publish pipeline and bounded history.
    - Define the PCV export manifest schema and hashing (including `source_subvol_generation` and `source_subvol_uuid`).
-   - Implement minimal `POST /api/v1/system/pcv/import` endpoint (API-only, no portal UX) with SHA-256 verification, staging extraction, conflict handling, and unlock attempt. Required for round-trip integration test.
+   - Implement `POST /api/v1/system/pcv/import` endpoint gated on "no functional control plane" precondition (§8.4.1), with SHA-256 verification, staging extraction, conflict handling, and unlock attempt. Required for round-trip integration test.
+   - Implement minimal portal UX for PCV import: "Restore from backup" on setup screen (when no CP exists) and as an escape hatch after structural unlock failures. Export/download button in operational portal.
 5. **`/piccolo-data` bring-up scaffolding**
    - Mount detection + directory creation.
    - NOCOW posture enforcement.
@@ -467,7 +493,8 @@ This section intentionally outlines a layered implementation approach (reviewabl
 - Control plane material is stored under the §5.1 layout (`crypto/`, `ciphertext/control-plane/`, `volumes/control-plane/`, `mounts/control-plane/`) and can be unlocked using the admin password.
 - `ciphertext/control-plane/` is a btrfs subvolume (required for consistent PCV snapshots).
 - `piccolod` publishes PCV exports to `/piccolo-core/recovery/current.enc` atomically (readers never observe a partial file), with a valid `current.json` manifest (sha256 matches payload, size_bytes is correct, `source_subvol_generation` and `source_subvol_uuid` populated), and maintains bounded history (≤ 5 generations in `history/`).
-- PCV import via `POST /api/v1/system/pcv/import` accepts a `.pcv` upload, verifies integrity, extracts to staging, and attempts unlock. Round-trip integration test passes: create control plane → write state → export → wipe → import → unlock → verify state.
+- PCV import via `POST /api/v1/system/pcv/import` is gated on "no functional control plane" precondition (returns 409 when a working control plane exists). Accepts a `.pcv` upload, verifies integrity, extracts to staging, and attempts unlock. Round-trip integration test passes: create control plane → write state → export → wipe → import → unlock → verify state.
+- Portal surfaces "Restore from backup" on the setup screen (when no control plane exists) and as an escape hatch after structural unlock failures. Portal surfaces PCV export/download in the operational portal.
 - After unlock, `/piccolo-data` is mounted (or a clear actionable error is surfaced), the directory layout is created, and NOCOW posture is enforced where required.
 
 ## 13) Risks and mitigations
@@ -482,7 +509,9 @@ The existing `ExportManager` interface (`RunControlPlane`, `RunFullData`, `Impor
 **Removal checklist:**
 - Delete `ExportManager` interface from `internal/persistence/interfaces.go`.
 - Delete `fileExportManager` implementation (and any related types/helpers).
-- Remove all callers (API handlers, supervisor hooks) that reference `ExportManager`.
+- Remove all callers (API handlers, supervisor hooks) that reference `ExportManager`:
+  - Delete `CommandRunControlExport` and `CommandRunFullExport` constants, `RunControlExportCommand` / `RunFullExportCommand` types, and `handleRunControlExport()` / `handleRunFullExport()` handlers from `internal/persistence/commands.go`.
+  - Remove the command registrations that wire these handlers into the command bus.
 - Remove associated tests.
 - The `Service` struct in `internal/persistence/service.go` drops its `ExportManager` field.
 - **Delete `runExportWithLock`** from `internal/persistence/service.go` — the old export flow locks/unlocks the control plane during export. The new PCV publisher uses btrfs snapshots and must NOT lock the control plane. These approaches are architecturally incompatible; do not wire the new publisher through the old lock pattern.
@@ -504,7 +533,11 @@ The PCV publisher subscribes to `TopicControlStoreCommit` events (from the exist
 - `TopicPCVExportPublished` — emitted after a successful publish (payload: generation ID, sha256).
 - `TopicPCVExportFailed` — emitted on publish failure (payload: error details). The health endpoint aggregates these for the portal.
 
-**Supervisor registration:** The PCV publisher registers as a supervisor component (`internal/runtime/supervisor/`) with a `Start`/`Stop` lifecycle. `Start` cleans up leftover staging snapshots and begins listening for `TopicControlStoreCommit` events and the periodic timer. `Stop` cancels pending debounce timers, waits for any in-flight publish to complete (with a timeout), and unsubscribes from the event bus.
+**Supervisor registration (dormant-start model):** The PCV publisher registers as a supervisor component (`internal/runtime/supervisor/`) with a `Start`/`Stop` lifecycle. It uses a **dormant-start model** to handle the first-boot chicken-and-egg (supervisor starts before the control plane subvolume exists):
+
+- **`Start`:** The publisher enters **dormant state**. It subscribes to `TopicControlStoreCommit` events but does not run the startup dirty-check or periodic timer. Events received in dormant state are silently discarded (no subvolume to snapshot).
+- **`Activate`:** Called by the persistence layer after confirming `ciphertext/control-plane/` subvolume exists (either on startup after verifying the subvolume, or after `crypto/setup` creates it for the first time). On activation: clean up leftover staging snapshots, run the startup dirty-check, start the periodic timer, and begin processing queued events. Subsequent `TopicControlStoreCommit` events trigger the normal debounce pipeline.
+- **`Stop`:** If the dirty latch is set (pending mutation not yet published), trigger an **immediate flush-publish** before stopping — this ensures the last mutation before shutdown is captured. Then wait for any in-flight publish to complete (with a timeout) and unsubscribe from the event bus. This prevents silent data loss when the system is gracefully locked or shut down.
 
 ## 15) Development environment
 
@@ -553,4 +586,5 @@ Convenience helper for tests that need both roots:
 - 2026-02-06: Second parallel review fixes. Fixed: (12) resolved pool key PCV inclusion contradiction — pool key IS included in PCV (node-scoped data), updated §4.1 and directory classification; (13) added per-node room concept in §8.2.2 for cluster-mode PCV scoping; (14) added `crypto/luks-kdf-params/` to PCV payload and directory layout; (15) fixed stale open question path `/piccolo-core/control-plane/` → `mounts/control-plane/`.
 - 2026-02-06: Third review pass. Blocking fixes: (16) PCV restore must create `ciphertext/control-plane/` as btrfs subvolume before extraction (§8.4); (17) `TopicControlStoreCommit` definition and payload clarified (§14); (18) always use btrfs snapshot for PCV export (no conditional locked/unlocked path). Significant fixes: (19) trailing-edge 30s debounce semantics specified; (20) staging snapshot cleanup uses `btrfs subvolume delete`; (21) gen ordering semantics documented (lexicographic = chronological, clock-skew handling); (22) PCV size guard added (100 MiB default); (23) ExportManager removal checklist expanded; (24) `source_node_id` added to manifest schema. Suggestions: (25) supervisor registration for PCV publisher; (26) fsutil reuse note; (27) directory permissions documented (0700); (28) `SetRootsForTest` convenience helper.
 - 2026-02-06: Fourth review pass (combined assessment). Blocking/critical fixes: (29) added `syncfs()` flush before btrfs snapshot to capture in-flight FUSE writes; (30) PCV import contract specified (§8.4.1) with authenticity model (AES-GCM decryptability = authenticity), conflict handling, and round-trip test requirement; (31) generation ID clock-skew handling specified — reuse previous timestamp when clock goes backward. Significant fixes: (32) TPM adapter model documented in §7.3 — all devices get remote reachability via software emulation on non-TPM; (33) `control` → `control-plane` volume ID migration noted in PR 2; (34) `BootstrapStore`/`BootstrapVolume` added to ExportManager removal checklist; (35) `PICCOLO_STATE_DIR` migration sequencing specified (additive first, fail-fast guard last); (36) startup dirty-check + latch pattern for PCV publisher; (37) `source_node_id` resolution when locked (cache + fallback); (38) dev/test btrfs fallback (`PICCOLO_DEV_NO_BTRFS=1`, copy-based, not crash-consistent); (39) pool keyfile rotation documented as non-goal (§16).
+- 2026-02-07: Sixth review pass (amendment decisions). Fixes: (52) `paths.CoreJoin()`/`paths.DataJoin()` convenience wrappers added to §6.1 path package, enumerated all legacy helpers to remove; (53) PCV import contract rewritten — gated on "no functional control plane" precondition (setup/recovery only), eliminates rollback risk entirely; (54) portal UX added for import: "Restore from backup" on setup screen + unlock failure escape hatch; (55) authenticity language softened to "integrity-intact and key-possession-proven" with explicit anti-replay caveat; (56) PCV publisher supervisor changed to dormant-start model (dormant → activate → stop with flush) to handle first-boot chicken-and-egg; (57) §11 PR 4 and §12 acceptance criteria updated to match new import scope; (58) ExportManager removal checklist expanded with `commands.go` handlers (`CommandRunControlExport`, `CommandRunFullExport`, `handleRunControlExport`, `handleRunFullExport`).
 - 2026-02-07: Fifth review pass (multi-reviewer synthesis). Blocking fixes: (40) `syncfs()` flush corrected to two-step — flush plaintext FUSE mount first, then ciphertext subvolume (single `syncfs` on ciphertext misses FUSE-buffered writes); (41) added `source_subvol_generation` and `source_subvol_uuid` to manifest schema (required for startup dirty-check implementation). Significant fixes: (42) gen counter initializes to `previous_counter + 1` on restart, not 1 (prevents duplicate gen IDs on rapid restart); (43) locked-state periodic publish now skips if subvolume generation unchanged (avoids redundant identical archives); (44) anti-rollback explicitly documented as Foundation non-goal with threat model rationale — real trust anchors are orchestrator/cluster peers (future); (45) minimal PCV import endpoint (`POST /api/v1/system/pcv/import`) added to Foundation scope (API-only, no portal UX) for round-trip test and product acceptance; (46) `runExportWithLock` added to ExportManager removal checklist (architecturally incompatible with snapshot-based pipeline); (47) `crypt.Manager` path migration from `paths.Root()` to `paths.CoreRoot()` called out as high-risk in PR 2; (48) `VolumeClassControl` disambiguation — class constant stays `"control"`, only volume ID strings change to `"control-plane"`; (49) `TopicControlStoreCommit.Revision` confirmed as the monotonic sequence number (no new event schema field needed); (50) import `.bak` subvolume cleanup added (delete stale `.bak.*` before new import); (51) dev fallback `cp -a` must perform two-step syncfs when unlocked to avoid torn copies.

@@ -150,7 +150,13 @@ func DetectBootMode(ctx context.Context) (BootMode, error) {
     // CI/QA override: allows unattended provisioning in VM/container environments
     // where lsblk TRAN is empty (virtio) and the onboarding UI cannot be clicked.
     // Not for production use — the env var is only respected in test/CI images.
+    // Sentinel file gate: the override is only honored on test/CI images.
+    // The sentinel file is created by the test image build, never by production images.
     if override := os.Getenv("PICCOLO_BOOT_MODE_OVERRIDE"); override != "" {
+        if _, err := os.Stat("/etc/piccolo-test-image"); err != nil {
+            return "", fmt.Errorf("PICCOLO_BOOT_MODE_OVERRIDE is set but /etc/piccolo-test-image does not exist; " +
+                "this override is only supported on test/CI images")
+        }
         switch BootMode(override) {
         case BootModeInternal, BootModeUSB, BootModeUnknown:
             return BootMode(override), nil
@@ -220,7 +226,7 @@ func getTransportType(ctx context.Context, disk string) (string, error) {
 
 **Unknown mode behavior:** `BootModeUnknown` follows the same flow as `BootModeUSB` — it shows the onboarding UI and requires explicit user confirmation before any disk prep runs. This is safer than auto-running partition writes on ambiguous hardware. VM users (the primary case for empty TRAN) are expected to be hands-on and will simply click "Try Piccolo" to proceed.
 
-**CI/QA override:** Set `PICCOLO_BOOT_MODE_OVERRIDE=internal` (or `usb`/`unknown`) to bypass `lsblk` transport detection. This enables unattended provisioning in VM/container CI environments where `TRAN` is empty and the onboarding UI cannot be clicked. The env var is checked first in `DetectBootMode`; if set, it short-circuits all detection logic. Not intended for production use.
+**CI/QA override:** Set `PICCOLO_BOOT_MODE_OVERRIDE=internal` (or `usb`/`unknown`) to bypass `lsblk` transport detection. This enables unattended provisioning in VM/container CI environments where `TRAN` is empty and the onboarding UI cannot be clicked. The override is **gated on a sentinel file** (`/etc/piccolo-test-image`) that is created only by test/CI image builds — if the sentinel file does not exist, the override is rejected with a startup error. This prevents accidental or malicious use on production hardware.
 
 ### 4.2 Boot Flow by Mode
 
@@ -1274,7 +1280,7 @@ func (m *StorageManager) OnAdminPasswordRotated(ctx context.Context, oldPass, ne
     }
 
     // Track rotation progress so we can resume after a crash.
-    progressPath := "/piccolo-core/crypto/luks-rotation-progress.json"
+    progressPath := paths.CoreJoin("crypto", "luks-rotation-progress.json")
     progress := &RotationProgress{
         StartedAt: time.Now(),
         Total:     len(devices),
@@ -1341,7 +1347,7 @@ If `piccolod` crashes during password rotation, a `luks-rotation-progress.json` 
 
 ```go
 func (m *StorageManager) resumeRotationIfNeeded(ctx context.Context, currentPass string) error {
-    progressPath := "/piccolo-core/crypto/luks-rotation-progress.json"
+    progressPath := paths.CoreJoin("crypto", "luks-rotation-progress.json")
     progress, err := readJSON[RotationProgress](progressPath)
     if errors.Is(err, os.ErrNotExist) {
         return nil  // No rotation in progress
@@ -1947,15 +1953,16 @@ Piccolod verifies it exists; if missing, enters Emergency Mode (see Section 12.3
 
 ```go
 func (p *Preparer) VerifyPiccoloCoreExists(ctx context.Context) error {
+    coreRoot := paths.CoreRoot()
+
     // Check if /piccolo-core is a btrfs subvolume
-    _, err := p.runner.Run(ctx, "btrfs", "subvolume", "show", "/piccolo-core")
-    if err != nil {
-        return fmt.Errorf("/piccolo-core subvolume missing - OS image is broken")
+    if err := p.runner.Run(ctx, "btrfs", "subvolume", "show", coreRoot); err != nil {
+        return fmt.Errorf("%s subvolume missing - OS image is broken", coreRoot)
     }
 
     // Verify it's mounted and writable
-    if err := unix.Access("/piccolo-core", unix.W_OK); err != nil {
-        return fmt.Errorf("/piccolo-core is not writable: %w", err)
+    if err := unix.Access(coreRoot, unix.W_OK); err != nil {
+        return fmt.Errorf("%s is not writable: %w", coreRoot, err)
     }
 
     return nil
@@ -2002,14 +2009,30 @@ The canonical `InitializeLUKS` in §6.3 is the authoritative implementation. Key
 
 ### 12.3 Emergency Mode
 
-If Phase 1 (boot-time partitioning) fails, the system enters Emergency Mode instead of crash-looping:
+If Phase 1 (boot-time partitioning) fails, the system enters Emergency Mode instead of crash-looping. Emergency mode is **differentiated** based on the failure cause and whether the system was previously set up:
 
 ```go
+type EmergencyLevel string
+
+const (
+    // EmergencyHard: fatal — crypto endpoints blocked, system cannot operate.
+    // Caused by: missing /piccolo-core subvolume, or first-boot partition failure.
+    EmergencyHard EmergencyLevel = "hard"
+
+    // EmergencySoft: degraded — crypto endpoints allowed, system may still unlock.
+    // Caused by: transient partition/expansion failure on a previously-set-up device.
+    EmergencySoft EmergencyLevel = "soft"
+)
+
 type EmergencyState struct {
-    Active  bool   `json:"active"`
-    Reason  string `json:"reason"`
-    Details string `json:"details"`
+    Active  bool           `json:"active"`
+    Level   EmergencyLevel `json:"level"`
+    Reason  string         `json:"reason"`
+    Details string         `json:"details"`
 }
+
+const phase1MaxRetries = 3
+const phase1RetryBackoff = 2 * time.Second
 
 func (m *Manager) PreparePartitioning(ctx context.Context) error {
     // Phase 1 timeout: disk prep should complete in seconds on healthy hardware.
@@ -2019,45 +2042,89 @@ func (m *Manager) PreparePartitioning(ctx context.Context) error {
     ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
     defer cancel()
 
-    // 1. Verify /piccolo-core exists
+    // 1. Verify /piccolo-core exists — no retries (deterministic: image is broken or not)
     if err := m.diskPrep.VerifyPiccoloCoreExists(ctx); err != nil {
-        m.enterEmergencyMode(err, "OS image is broken: /piccolo-core subvolume missing")
+        m.enterEmergencyMode(EmergencyHard, err, "OS image is broken: /piccolo-core subvolume missing")
         return err
     }
 
-    // 2. Create data partition FIRST (bounds growpart)
-    if err := m.diskPrep.CreateDataPartition(ctx); err != nil {
-        m.enterEmergencyMode(err, "Failed to create /piccolo-data partition")
+    // Determine if the system was previously set up (onboarding completed).
+    // This controls whether partition failures are hard (first boot — can't proceed)
+    // or soft (subsequent boot — may still unlock existing storage).
+    previouslySetUp := m.isOnboardingComplete()
+
+    // 2. Create data partition FIRST (bounds growpart) — retry up to 3 times
+    if err := m.retryPhase1Op(ctx, "CreateDataPartition", m.diskPrep.CreateDataPartition); err != nil {
+        level := EmergencyHard
+        if previouslySetUp {
+            level = EmergencySoft // Existing LUKS may still be unlockable
+        }
+        m.enterEmergencyMode(level, err, "Failed to create /piccolo-data partition")
         return err
     }
 
-    // 3. Expand root partition (bounded by data partition created above)
-    if err := m.diskPrep.ExpandRootPartition(ctx); err != nil {
-        m.enterEmergencyMode(err, "Failed to expand root partition")
+    // 3. Expand root partition (bounded by data partition created above) — retry up to 3 times
+    if err := m.retryPhase1Op(ctx, "ExpandRootPartition", m.diskPrep.ExpandRootPartition); err != nil {
+        // Root expansion failure is always soft — system can function with smaller root
+        m.enterEmergencyMode(EmergencySoft, err, "Failed to expand root partition")
         return err
     }
 
     return nil
 }
 
-func (m *Manager) enterEmergencyMode(err error, reason string) {
+// retryPhase1Op retries a Phase 1 operation up to phase1MaxRetries times with
+// backoff. Transient failures (flaky USB probe, busy partition table lock) often
+// succeed on retry.
+func (m *Manager) retryPhase1Op(ctx context.Context, name string, op func(context.Context) error) error {
+    var lastErr error
+    for attempt := 1; attempt <= phase1MaxRetries; attempt++ {
+        lastErr = op(ctx)
+        if lastErr == nil {
+            return nil
+        }
+        if attempt < phase1MaxRetries {
+            m.logger.Warn("phase 1 operation failed, retrying",
+                "op", name, "attempt", attempt, "error", lastErr)
+            select {
+            case <-time.After(phase1RetryBackoff):
+            case <-ctx.Done():
+                return ctx.Err()
+            }
+        }
+    }
+    return fmt.Errorf("%s failed after %d attempts: %w", name, phase1MaxRetries, lastErr)
+}
+
+func (m *Manager) enterEmergencyMode(level EmergencyLevel, err error, reason string) {
     m.emergency = true
+    m.emergencyLevel = level
     m.emergencyErr = err
     m.emergencyReason = reason
-    m.logger.Error("entering emergency mode", "reason", reason, "error", err)
+    m.logger.Error("entering emergency mode", "level", level, "reason", reason, "error", err)
+}
+
+// isOnboardingComplete checks whether the system was previously set up
+// by reading the persisted onboarding state in /piccolo-core/network-bootstrap/onboarding.json.
+func (m *Manager) isOnboardingComplete() bool {
+    cfg, err := readJSON[OnboardingConfig](paths.CoreJoin("network-bootstrap", "onboarding.json"))
+    if err != nil {
+        return false // No onboarding file = never set up
+    }
+    return cfg.State == OnboardingComplete
 }
 ```
 
 **Emergency Mode Behavior:**
 
 1. **Server still starts** - HTTP server becomes available
-2. **Portal shows error page** - User sees "Storage Initialization Failed" with details
-3. **Most APIs disabled** - Only diagnostic and recovery endpoints work
+2. **Portal shows error state** - User sees degraded status with details
+3. **Endpoint availability depends on emergency level** (see below)
 4. **No crash loop** - System stays up for debugging
 
 **Endpoint availability by system state:**
 
-Pre-unlock and emergency mode are distinct states with different endpoint allowlists. Pre-unlock is the normal state before the user provides their admin password; emergency mode is entered when Phase 1 disk prep fails.
+Pre-unlock, hard emergency, and soft emergency are distinct states with different endpoint allowlists.
 
 **Pre-unlock (normal — before admin password):**
 
@@ -2069,7 +2136,7 @@ Pre-unlock and emergency mode are distinct states with different endpoint allowl
 | `/api/v1/crypto/setup` | First-run admin password setup |
 | `/api/v1/crypto/unlock` | Unlock control plane + `/piccolo-data` |
 
-**Emergency mode (storage failure — Phase 1 failed):**
+**Hard emergency (fatal storage failure — first boot or missing `/piccolo-core`):**
 
 | Endpoint | Purpose |
 |---|---|
@@ -2077,48 +2144,70 @@ Pre-unlock and emergency mode are distinct states with different endpoint allowl
 | `/api/v1/system/health` | Health check (reports degraded) |
 | `/api/v1/system/emergency` | Emergency mode diagnostics and recovery actions |
 
-Crypto endpoints (`/api/v1/crypto/setup`, `/api/v1/crypto/unlock`) are **blocked in emergency mode** because disk prep must succeed before LUKS initialization or unlock can proceed. The portal error UI directs the user to resolve the underlying storage issue (or contact support) rather than attempting unlock.
+Crypto endpoints are **blocked in hard emergency** because disk prep must succeed on first boot before LUKS initialization or unlock can proceed.
+
+**Soft emergency (transient failure — previously set up device):**
+
+| Endpoint | Purpose |
+|---|---|
+| `/` (portal shell) | Shows degraded storage warning with unlock available |
+| `/api/v1/system/health` | Health check (reports degraded) |
+| `/api/v1/system/emergency` | Emergency mode diagnostics and recovery actions |
+| `/api/v1/crypto/unlock` | Unlock control plane + existing `/piccolo-data` |
+
+Crypto **unlock** is **allowed in soft emergency** because the system was previously set up and the existing LUKS device may still be unlockable. Crypto **setup** is blocked (setup requires successful disk prep). The portal prominently warns about the storage degradation while allowing the user to unlock and access their data.
 
 **Note:** Device discovery (mDNS/`piccolo.local`) is handled at the OS level by Avahi, not by piccolod endpoints.
 
 ```go
-// Emergency mode middleware — blocks all endpoints except diagnostics.
-// This is separate from the pre-unlock middleware which allows crypto endpoints.
+// Emergency mode middleware — blocks endpoints based on emergency level.
 func (s *GinServer) emergencyModeMiddleware() gin.HandlerFunc {
     return func(c *gin.Context) {
-        if s.storageMgr.IsEmergencyMode() {
-            path := c.Request.URL.Path
-
-            // Allow API diagnostics endpoints
-            if strings.HasPrefix(path, "/api/v1/system/health") ||
-                strings.HasPrefix(path, "/api/v1/system/emergency") {
-                c.Next()
-                return
-            }
-
-            // Allow portal static assets (non-API paths serve the Flutter Web UI,
-            // which shows the emergency error page)
-            if !strings.HasPrefix(path, "/api/") {
-                c.Next()
-                return
-            }
-
-            // Block all other API endpoints
-            c.JSON(http.StatusServiceUnavailable, gin.H{
-                "error":   "storage_emergency",
-                "message": s.storageMgr.EmergencyError().Error(),
-            })
-            c.Abort()
+        if !s.storageMgr.IsEmergencyMode() {
+            c.Next()
+            return
         }
+
+        path := c.Request.URL.Path
+
+        // Allow API diagnostics endpoints (all emergency levels)
+        if strings.HasPrefix(path, "/api/v1/system/health") ||
+            strings.HasPrefix(path, "/api/v1/system/emergency") {
+            c.Next()
+            return
+        }
+
+        // Allow portal static assets (non-API paths serve the Flutter Web UI)
+        if !strings.HasPrefix(path, "/api/") {
+            c.Next()
+            return
+        }
+
+        // Soft emergency: allow crypto/unlock (existing storage may be unlockable)
+        if s.storageMgr.EmergencyLevel() == EmergencySoft {
+            if strings.HasPrefix(path, "/api/v1/crypto/unlock") {
+                c.Next()
+                return
+            }
+        }
+
+        // Block all other API endpoints
+        c.JSON(http.StatusServiceUnavailable, gin.H{
+            "error":   "storage_emergency",
+            "level":   string(s.storageMgr.EmergencyLevel()),
+            "message": s.storageMgr.EmergencyError().Error(),
+        })
+        c.Abort()
     }
 }
 
 // GET /api/v1/system/emergency
 type EmergencyStatus struct {
-    Active  bool   `json:"active"`
-    Reason  string `json:"reason"`
-    Error   string `json:"error"`
-    Actions []string `json:"actions"`  // Suggested recovery actions
+    Active  bool           `json:"active"`
+    Level   EmergencyLevel `json:"level"`   // "hard" or "soft"
+    Reason  string         `json:"reason"`
+    Error   string         `json:"error"`
+    Actions []string       `json:"actions"` // Suggested recovery actions
 }
 ```
 
@@ -2185,6 +2274,8 @@ Out of scope for this RFC:
 4. **Network-bootstrap hardening** - TPM enrollment and sealing
 5. **Degraded mode UI** - surfacing pool status
 6. **LUKS2 authenticated encryption** - `dm-integrity` or AEAD modes for tamper detection on physically accessible devices
+7. **In-place encryption of existing data** - the `storage_and_encryption.feature` "Encrypt existing data in place" scenario is not applicable to the two-root architecture: `/piccolo-data` is LUKS2-encrypted from first boot, so there is no unencrypted user data to migrate. If a future migration path from pre-v2 installs is needed, it would be handled by a one-shot importer (see Foundation RFC §9).
+8. **Stolen lock / remote kill switch** - the `storage_and_encryption.feature` "Stolen lock prevents access" scenario requires orchestrator integration (a remote flag that blocks local unlock). This depends on the Piccolo Orchestrator and will be specified in the cluster/orchestrator RFC.
 
 ## 17. Required System Tools
 
@@ -2233,4 +2324,5 @@ This ensures tools are installed as dependencies of piccolod rather than relying
 - 2026-02-06: Third review pass. Blocking fixes: (21) Argon2 thread cap at 8 for portability; (22) Argon2 memory 512 MiB to match crypt.Manager; (23) hardcoded path replaced with `paths.CoreRoot()`; (24) keyslot 0 uses pbkdf2 (high-entropy keyfile, argon2 adds no value); (25) kernel partition verification loop after partprobe; (26) mnemonic always enrolled at setup, added `OnRecoveryMnemonicRotated` hook. Significant fixes: (27) emergency middleware path matching rewritten (old `/` prefix matched all paths); (28) specified `rekeySlotViaPoolKeyfile` implementation; (29) mapper collision check before `cryptsetup open`; (30) `CommandRunner` interface note for testability; (31) no-fstab design rationale documented; (32) 32-byte salt rationale (RFC 9106 §4). Suggestions: (33) GPT partition label `piccolo-data`; (34) btrfs filesystem label; (35) audit events section added (§14).
 - 2026-02-06: Cross-review validation. Fixed: (36) ephemeral keyfile cleanup is now conditional — skipped on all-three-failed path so operator can recover; (37) USB onboarding guard prevents async partitioning before user chooses "Try Piccolo"; (38) renamed "Try Live" → "Try Piccolo" throughout to match PRD and acceptance features.
 - 2026-02-06: Fourth review pass (combined assessment). Fixes: (39) three-mode boot detection — added `BootModeUnknown` for ambiguous transports (virtio, iSCSI), follows USB onboarding flow; (40) `partitionDevicePath()` helper for mmcblk/nvme/loop naming; (41) 1 MiB sector alignment for data partition start; (42) LUKS all-paths-failed is now a reflash scenario (no SSH, no manual cryptsetup); (43) `reloadPartitionTable` narrowed to specific slot (`partx --nr N:N`); (44) `CommandRunner` interface definition added to §10.2; (45) gin_server pseudocode handles `BootModeUnknown`; (46) `GenerateRecoveryKey` API change noted (returns key material); (47) Install to Disk failure/retry handling documented.
+- 2026-02-07: Sixth review pass (amendment decisions). Fixes: (56) `PICCOLO_BOOT_MODE_OVERRIDE` gated behind sentinel file `/etc/piccolo-test-image` — prevents misuse on production images; (57) emergency mode rewritten as differentiated hard/soft levels — soft emergency allows crypto unlock on previously-set-up devices where LUKS may still work; (58) Phase 1 retries added (3 attempts, 2s backoff) before entering emergency; (59) hardcoded paths fixed: `"/piccolo-core/crypto/luks-rotation-progress.json"` → `paths.CoreJoin(...)` in `OnAdminPasswordRotated` and `resumeRotationIfNeeded`; `"/piccolo-core"` → `paths.CoreRoot()` in `VerifyPiccoloCoreExists`; (60) future work items added: in-place encryption not applicable (two-root design), stolen lock deferred to orchestrator RFC.
 - 2026-02-07: Fifth review pass (combined assessment). Fixes: (48) `GetPartitionState` root expansion check now uses `calculatePartitionLayout` instead of fixed `RootTargetSizeGB` — ensures consistency on small disks with proportional 70% split; (49) `PICCOLO_BOOT_MODE_OVERRIDE` env var for CI/QA unattended provisioning in VMs; (50) `getLUKSUUID` error handling changed from silent discard to fail-fast — UUID is the KDF salt anchor; (51) `getDiskSizeGB` uses ceiling division to avoid under-counting fractional GBs; (52) Phase 1 `PreparePartitioning` now wraps context with 5-minute timeout; (53) mnemonic rotation (`OnRecoveryMnemonicRotated`) updated to callback-based pattern matching `WithSDEK`/`WithMnemonicKey`, with crash recovery progress tracking (§6.5.1) matching password rotation pattern; (54) `CommandRunner` interface consolidation note — legacy `commandRunner` in `file_volume_manager.go` should be migrated to shared definition; (55) `secureZero`/`zeroBytes` consolidation note added to §10.2.
