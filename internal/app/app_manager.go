@@ -63,7 +63,7 @@ type AppManager struct {
 	workspacePathResolver *workspacePathResolver
 	workspaceImageMounter *workspacedisk.PodmanImageMounter
 
-	// Shared image runtime for workspace base images (overlay driver, shared root).
+	// Shared image runtime for base images across all app types (overlay driver, shared root + imagestore).
 	// Cached via sync.Once to avoid repeated LookPath + ensureDir calls.
 	imageRuntimeOnce sync.Once
 	imageRuntimeVal  container.PodmanRuntime
@@ -142,6 +142,9 @@ func (r *workspaceRuntimeResolver) GetRuntimeArgs(ctx context.Context, instanceI
 	}
 	for _, opt := range rt.StorageOpts {
 		args = append(args, "--storage-opt", opt)
+	}
+	if rt.Imagestore != "" {
+		args = append(args, "--imagestore", rt.Imagestore)
 	}
 
 	return args, nil
@@ -1682,11 +1685,10 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 		return err
 	}
 
-	// Prune orphaned images from the shared image runtime (workspace mode only).
-	// Service mode images live in per-app roots and the shared imagestore, not the image runtime.
-	if piccoloModeFromExtensions(def.Extensions) == ModeWorkspace {
-		m.pruneOrphanedImages(ctx, state, def, instanceID)
-	}
+	// Prune orphaned images from the shared imagestore.
+	// Both service and workspace images share the same imagestore,
+	// so pruning runs for all app types.
+	m.pruneOrphanedImages(ctx, state, def, instanceID)
 
 	// Reset podman storage BEFORE unmounting the volume.
 	// This allows podman to properly clean its metadata files (db.sql, locks, etc.)
@@ -1725,10 +1727,9 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 }
 
 // collectReferencedImages returns the set of images still referenced by installed
-// workspace apps, excluding the app being uninstalled. Always includes the network
-// anchor image. Only workspace-mode apps are considered because the image runtime
-// only stores workspace base images — service-mode images live in per-app roots
-// and are not affected by workspace image pruning.
+// apps, excluding the app being uninstalled. Always includes the network anchor
+// image. All app types are considered because both service and workspace images
+// share the same imagestore.
 func (m *AppManager) collectReferencedImages(state *FilesystemStateManager, excludeInstanceID string) map[string]bool {
 	referenced := map[string]bool{
 		networkAnchorImage(): true,
@@ -1747,10 +1748,6 @@ func (m *AppManager) collectReferencedImages(state *FilesystemStateManager, excl
 		if def.Services == nil {
 			continue
 		}
-		// Only workspace-mode apps use the shared image runtime.
-		if piccoloModeFromExtensions(def.Extensions) != ModeWorkspace {
-			continue
-		}
 		for _, svc := range def.Services {
 			if svc.Image != "" {
 				referenced[svc.Image] = true
@@ -1760,10 +1757,9 @@ func (m *AppManager) collectReferencedImages(state *FilesystemStateManager, excl
 	return referenced
 }
 
-// pruneOrphanedImages removes workspace base images from the shared image runtime
-// that are no longer referenced by any installed app. Best-effort: failures are logged
-// but never fatal to uninstall. Only targets the image runtime — service mode images
-// in per-app roots and the shared imagestore are not affected.
+// pruneOrphanedImages removes images from the shared imagestore that are no longer
+// referenced by any installed app. Best-effort: failures are logged but never fatal
+// to uninstall.
 func (m *AppManager) pruneOrphanedImages(ctx context.Context, state *FilesystemStateManager, def *api.AppDefinition, excludeInstanceID string) {
 	if def == nil || def.Services == nil {
 		return

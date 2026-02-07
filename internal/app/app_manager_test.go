@@ -1615,13 +1615,13 @@ func TestUninstall_ImagePruning(t *testing.T) {
 		mgr.SetImageRuntimeForTest(container.PodmanRuntime{
 			Root:          filepath.Join(tempDir, "podman", "image-root"),
 			RunRoot:       filepath.Join(tempDir, "run", "podman", "image-root"),
+			Imagestore:    filepath.Join(tempDir, "podman", "imagestore"),
 			StorageDriver: "overlay",
 		})
 		return mgr, mock, tempDir
 	}
 
-	// Install apps in service mode (which works without workspace disk setup),
-	// then patch the stored definition to workspace mode so pruning triggers on uninstall.
+	// Install apps in service mode (works without workspace disk setup).
 	installApp := func(t *testing.T, mgr *AppManager, name, image string) {
 		t.Helper()
 		def := &api.AppDefinition{
@@ -1659,8 +1659,6 @@ func TestUninstall_ImagePruning(t *testing.T) {
 
 		installApp(t, mgr, "appa", "nginx:latest")
 		installApp(t, mgr, "appb", "postgres:16")
-		patchToWorkspaceMode(t, mgr, "appa")
-		patchToWorkspaceMode(t, mgr, "appb")
 
 		if err := mgr.Uninstall(ctx, "appb"); err != nil {
 			t.Fatalf("uninstall: %v", err)
@@ -1682,9 +1680,10 @@ func TestUninstall_ImagePruning(t *testing.T) {
 		mgr, mock, _ := makeManager(t)
 		ctx := context.Background()
 
+		// Install two apps with the same image — one service, one workspace.
+		// Shared imagestore means both modes are considered for image references.
 		installApp(t, mgr, "appa", "debian:bookworm")
 		installApp(t, mgr, "appb", "debian:bookworm")
-		patchToWorkspaceMode(t, mgr, "appa")
 		patchToWorkspaceMode(t, mgr, "appb")
 
 		if err := mgr.Uninstall(ctx, "appb"); err != nil {
@@ -1694,7 +1693,7 @@ func TestUninstall_ImagePruning(t *testing.T) {
 		// debian:bookworm should NOT be pruned (appa still uses it)
 		for _, img := range mock.removedImages {
 			if img == "debian:bookworm" {
-				t.Errorf("debian:bookworm should not be pruned (still referenced by appa)")
+				t.Errorf("debian:bookworm should not be pruned (still referenced by service-mode appa)")
 			}
 		}
 	})
@@ -1704,7 +1703,6 @@ func TestUninstall_ImagePruning(t *testing.T) {
 		ctx := context.Background()
 
 		installApp(t, mgr, "appa", "redis:7")
-		patchToWorkspaceMode(t, mgr, "appa")
 
 		// Inject RemoveImage failure
 		mock.removeImageErr = errors.New("mock remove error")
@@ -1726,19 +1724,25 @@ func TestUninstall_ImagePruning(t *testing.T) {
 		}
 	})
 
-	t.Run("skips_pruning_for_service_mode", func(t *testing.T) {
+	t.Run("prunes_images_for_service_mode", func(t *testing.T) {
 		mgr, mock, _ := makeManager(t)
 		ctx := context.Background()
 
-		// Install as service mode (no patching) — pruning should NOT fire
+		// Service mode uninstall should prune unreferenced images from the shared imagestore
 		installApp(t, mgr, "appa", "redis:7")
 
 		if err := mgr.Uninstall(ctx, "appa"); err != nil {
 			t.Fatalf("uninstall: %v", err)
 		}
 
-		if len(mock.removedImages) > 0 {
-			t.Errorf("service mode uninstall should not prune images, removedImages=%v", mock.removedImages)
+		found := false
+		for _, img := range mock.removedImages {
+			if img == "redis:7" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected redis:7 to be pruned on service mode uninstall, removedImages=%v", mock.removedImages)
 		}
 	})
 }
@@ -1755,11 +1759,13 @@ func TestPodmanImageRuntime(t *testing.T) {
 		t.Fatalf("NewAppManager: %v", err)
 	}
 
-	// Inject a test image runtime
+	// Inject a test image runtime with shared imagestore
 	expectedRoot := filepath.Join(tempDir, "podman", "image-root")
+	expectedImagestore := filepath.Join(tempDir, "podman", "imagestore")
 	mgr.SetImageRuntimeForTest(container.PodmanRuntime{
 		Root:          expectedRoot,
 		RunRoot:       filepath.Join(tempDir, "run", "podman", "image-root"),
+		Imagestore:    expectedImagestore,
 		StorageDriver: "overlay",
 		StorageOpts:   []string{"mount_program=/usr/bin/fuse-overlayfs"},
 	})
@@ -1775,7 +1781,7 @@ func TestPodmanImageRuntime(t *testing.T) {
 	if rt.StorageDriver != "overlay" {
 		t.Errorf("StorageDriver: got %q, want overlay", rt.StorageDriver)
 	}
-	if rt.Imagestore != "" {
-		t.Errorf("Imagestore should be empty, got %q", rt.Imagestore)
+	if rt.Imagestore != expectedImagestore {
+		t.Errorf("Imagestore: got %q, want %q", rt.Imagestore, expectedImagestore)
 	}
 }

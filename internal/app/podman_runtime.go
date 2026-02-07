@@ -11,8 +11,8 @@ import (
 )
 
 // podmanRuntimeForApp returns a runtime configured for a specific app instance.
-// Each app instance has fully isolated podman storage within its encrypted volume.
-// This avoids cross-reference issues with shared imagestores.
+// Each app instance has an isolated podman Root (container metadata, RW layers) within
+// its encrypted volume, while images are stored in the shared imagestore for deduplication.
 // The instanceID parameter is the unique instance identifier.
 // The mode parameter controls storage driver selection:
 //   - ModeService: uses overlay driver with fuse-overlayfs (image-based containers)
@@ -74,15 +74,17 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 	}, nil
 }
 
-// podmanImageRuntime returns a shared PodmanRuntime for workspace base image operations
-// (pull, inspect, exists, mount, unmount, remove). Unlike podmanRuntimeForApp, this uses
-// a shared root with overlay driver, providing:
+// podmanImageRuntime returns a shared PodmanRuntime for base image operations across
+// all app types (pull, inspect, exists, mount, unmount, remove). Unlike podmanRuntimeForApp,
+// this uses a shared root with overlay driver, providing:
 //   - Layer deduplication: overlay stores thin diffs, not VFS cumulative copies
 //   - Persistent metadata: shared root survives app install/uninstall cycles
 //   - Cross-app sharing: 10 apps with the same Debian base = 1 copy of each layer
 //
-// The shared root lives outside encrypted volumes because base images are public data.
-// Container operations (create, start, stop) continue to use per-app VFS runtimes.
+// Images are stored in the shared imagestore (same store used by per-app runtimes).
+// The root (image-root) is a lightweight podman metadata directory (c/storage db, locks);
+// actual image layers and metadata live in the imagestore.
+// Container operations (create, start, stop) continue to use per-app runtimes.
 // Result is cached via sync.Once.
 func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
 	m.imageRuntimeOnce.Do(func() {
@@ -104,6 +106,12 @@ func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
 			return
 		}
 
+		imagestore := paths.Join("podman", "imagestore")
+		if err := ensureDir(imagestore, 0o700); err != nil {
+			m.imageRuntimeErr = fmt.Errorf("app manager: ensure image runtime imagestore: %w", err)
+			return
+		}
+
 		fuseOverlayfs, err := exec.LookPath("fuse-overlayfs")
 		if err != nil {
 			m.imageRuntimeErr = fmt.Errorf("app manager: fuse-overlayfs not found: %w", err)
@@ -113,6 +121,7 @@ func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
 		m.imageRuntimeVal = container.PodmanRuntime{
 			Root:          root,
 			RunRoot:       runRoot,
+			Imagestore:    imagestore,
 			StorageDriver: "overlay",
 			StorageOpts:   []string{fmt.Sprintf("mount_program=%s", fuseOverlayfs)},
 		}
