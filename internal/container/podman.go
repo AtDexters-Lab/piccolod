@@ -584,7 +584,7 @@ func (p *PodmanCLI) StartContainer(ctx context.Context, runtime PodmanRuntime, c
 // Uses a 30-second timeout to allow containers to gracefully shutdown.
 func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, containerID string) error {
 	if !isValidContainerID(containerID) {
-		return fmt.Errorf("invalid container ID format: %s", containerID)
+		return &ContainerNotFoundError{Ref: containerID}
 	}
 
 	args, err := buildPodmanArgs(runtime, []string{"stop", "--time", "30", containerID})
@@ -595,7 +595,14 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		return fmt.Errorf("podman stop failed: %w, output: %s", err, string(output))
+		outStr := string(output)
+		// Detect "no such container" errors and return typed error.
+		// Use case-insensitive matching for robustness across Podman versions.
+		lower := strings.ToLower(outStr)
+		if strings.Contains(lower, "no such container") || strings.Contains(lower, "no container with") {
+			return &ContainerNotFoundError{Ref: containerID}
+		}
+		return fmt.Errorf("podman stop failed: %w, output: %s", err, outStr)
 	}
 
 	return nil
@@ -605,7 +612,7 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 // Returns ContainerNotFoundError if the container does not exist.
 func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, containerID string) error {
 	if !isValidContainerID(containerID) {
-		return fmt.Errorf("invalid container ID format: %s", containerID)
+		return &ContainerNotFoundError{Ref: containerID}
 	}
 
 	args, err := buildPodmanArgs(runtime, []string{"rm", containerID})

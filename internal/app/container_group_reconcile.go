@@ -68,12 +68,14 @@ func (m *AppManager) handleStartupFailure(state *FilesystemStateManager, appInst
 func (m *AppManager) recoverStaleAnchor(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, reason string) error {
 	log.Printf("INFO: reconcile app %s: %s", appInst.InstanceID, reason)
 
-	// Stop and remove with error logging
-	if stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime); stopErr != nil {
-		log.Printf("WARN: reconcile app %s: stop during stale anchor recovery failed: %v", appInst.InstanceID, stopErr)
+	// Stop and remove with strict error handling.
+	// If stop/remove fails (e.g. unkillable zombie), abort recreation to avoid
+	// duplicate container conflicts or resource leaks.
+	if err := m.stopContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
+		return fmt.Errorf("stop failed during recovery: %w", err)
 	}
-	if removeErr := m.removeContainersForMultiApp(ctx, appInst, def, runtime); removeErr != nil {
-		log.Printf("WARN: reconcile app %s: remove during stale anchor recovery failed: %v", appInst.InstanceID, removeErr)
+	if err := m.removeContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
+		return fmt.Errorf("remove failed during recovery: %w", err)
 	}
 	m.serviceManager.RemoveApp(appInst.InstanceID)
 
@@ -156,8 +158,10 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 	if anchorID == "" || !anchorState.Exists {
 		if !desiredRunning {
-			// Stop all service containers even if the network anchor is missing (e.g., manually removed).
-			_ = m.stopContainersForMultiApp(ctx, appInst, def, runtime)
+			// Best-effort cleanup; errors don't block the desired stopped state.
+			if stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime); stopErr != nil {
+				log.Printf("WARN: reconcile app %s: best-effort stop failed: %v", appInst.InstanceID, stopErr)
+			}
 			if m.serviceManager != nil {
 				m.serviceManager.RemoveApp(appInst.InstanceID)
 			}
@@ -168,8 +172,13 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 		// The anchor is missing but we desire the app running. Stop and remove all service containers
 		// so we can recreate the entire group (anchor + services) deterministically.
-		_ = m.stopContainersForMultiApp(ctx, appInst, def, runtime)
-		_ = m.removeContainersForMultiApp(ctx, appInst, def, runtime)
+		// Best-effort cleanup before recreation; errors logged but don't block.
+		if stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime); stopErr != nil {
+			log.Printf("WARN: reconcile app %s: pre-recreate stop failed: %v", appInst.InstanceID, stopErr)
+		}
+		if removeErr := m.removeContainersForMultiApp(ctx, appInst, def, runtime); removeErr != nil {
+			log.Printf("WARN: reconcile app %s: pre-recreate remove failed: %v", appInst.InstanceID, removeErr)
+		}
 		m.serviceManager.RemoveApp(appInst.InstanceID)
 
 		return m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime)
@@ -178,7 +187,10 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	// If we don't desire running (stopped app or follower), stop all containers and remove proxies
 	// but do not change persisted desired state (Enabled field).
 	if !desiredRunning {
-		_ = m.stopContainersForMultiApp(ctx, appInst, def, runtime)
+		// Best-effort cleanup; errors don't block the desired stopped state.
+		if stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime); stopErr != nil {
+			log.Printf("WARN: reconcile app %s: best-effort stop failed: %v", appInst.InstanceID, stopErr)
+		}
 		if m.serviceManager != nil {
 			m.serviceManager.RemoveApp(appInst.InstanceID)
 		}
@@ -193,8 +205,12 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			// If anchor has stale netns, recreate the entire container group
 			var staleErr *container.StaleNetworkNamespaceError
 			if errors.As(err, &staleErr) {
-				return m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-					"anchor has stale network namespace, recreating container group")
+				if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
+					"anchor has stale network namespace, recreating container group"); recoverErr != nil {
+					m.handleStartupFailure(state, appInst)
+					return recoverErr
+				}
+				return nil
 			}
 			m.handleStartupFailure(state, appInst)
 			return fmt.Errorf("failed to start network anchor: %w", err)
@@ -314,8 +330,12 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 						// If anchor is stale (detected during service creation), recreate the whole group
 						var anchorStaleErr *container.StaleNetworkNamespaceError
 						if errors.As(createErr, &anchorStaleErr) {
-							return m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-								fmt.Sprintf("anchor found stale during service '%s' recreation, recreating group", svcName))
+							if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
+								fmt.Sprintf("anchor found stale during service '%s' recreation, recreating group", svcName)); recoverErr != nil {
+								m.handleStartupFailure(state, appInst)
+								return recoverErr
+							}
+							return nil
 						}
 
 						// Use existing escalation mechanism for retry limiting
@@ -354,8 +374,13 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	if err := m.ensurePodmanPublishes(ctx, def, appInst.InstanceID, anchorID, runtime); err != nil {
 		if errors.Is(err, container.ErrPortReconciliationRequired) {
 			log.Printf("INFO: reconcile app %s: port bindings mismatch, recreating containers", appInst.InstanceID)
-			_ = m.stopContainersForMultiApp(ctx, appInst, def, runtime)
-			_ = m.removeContainersForMultiApp(ctx, appInst, def, runtime)
+			// Best-effort cleanup before port-reconciliation recreation; errors logged but don't block.
+			if stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime); stopErr != nil {
+				log.Printf("WARN: reconcile app %s: port-reconcile stop failed: %v", appInst.InstanceID, stopErr)
+			}
+			if removeErr := m.removeContainersForMultiApp(ctx, appInst, def, runtime); removeErr != nil {
+				log.Printf("WARN: reconcile app %s: port-reconcile remove failed: %v", appInst.InstanceID, removeErr)
+			}
 			m.serviceManager.RemoveApp(appInst.InstanceID)
 			return m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime)
 		}
@@ -525,15 +550,27 @@ func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime
 func (m *AppManager) stopContainersForMultiApp(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, runtime container.PodmanRuntime) error {
 	primary := primaryServiceFor(def, appInst)
 	order, _ := serviceStartOrder(def.Services)
+	var errs []error
+
 	for i := len(order) - 1; i >= 0; i-- {
 		svcName := order[i]
 		stored := strings.TrimSpace(appInst.Containers[svcName])
 		if stored != "" {
-			_ = m.containerManager.StopContainer(ctx, runtime, stored)
+			if err := m.containerManager.StopContainer(ctx, runtime, stored); err != nil {
+				var notFound *container.ContainerNotFoundError
+				if !errors.As(err, &notFound) {
+					errs = append(errs, fmt.Errorf("stop %s: %w", svcName, err))
+				}
+			}
 		}
 		name := containerNameForService(appInst.InstanceID, svcName, primary)
 		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" && id != stored {
-			_ = m.containerManager.StopContainer(ctx, runtime, id)
+			if err := m.containerManager.StopContainer(ctx, runtime, id); err != nil {
+				var notFound *container.ContainerNotFoundError
+				if !errors.As(err, &notFound) {
+					errs = append(errs, fmt.Errorf("stop %s (resolved): %w", svcName, err))
+				}
+			}
 		}
 	}
 	anchorID := strings.TrimSpace(appInst.NetworkAnchorID)
@@ -543,23 +580,40 @@ func (m *AppManager) stopContainersForMultiApp(ctx context.Context, appInst *App
 		}
 	}
 	if anchorID != "" {
-		_ = m.containerManager.StopContainer(ctx, runtime, anchorID)
+		if err := m.containerManager.StopContainer(ctx, runtime, anchorID); err != nil {
+			var notFound *container.ContainerNotFoundError
+			if !errors.As(err, &notFound) {
+				errs = append(errs, fmt.Errorf("stop anchor: %w", err))
+			}
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (m *AppManager) removeContainersForMultiApp(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, runtime container.PodmanRuntime) error {
 	primary := primaryServiceFor(def, appInst)
 	order, _ := serviceStartOrder(def.Services)
+	var errs []error
+
 	for i := len(order) - 1; i >= 0; i-- {
 		svcName := order[i]
 		stored := strings.TrimSpace(appInst.Containers[svcName])
 		if stored != "" {
-			_ = m.containerManager.RemoveContainer(ctx, runtime, stored)
+			if err := m.containerManager.RemoveContainer(ctx, runtime, stored); err != nil {
+				var notFound *container.ContainerNotFoundError
+				if !errors.As(err, &notFound) {
+					errs = append(errs, fmt.Errorf("remove %s: %w", svcName, err))
+				}
+			}
 		}
 		name := containerNameForService(appInst.InstanceID, svcName, primary)
 		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" && id != stored {
-			_ = m.containerManager.RemoveContainer(ctx, runtime, id)
+			if err := m.containerManager.RemoveContainer(ctx, runtime, id); err != nil {
+				var notFound *container.ContainerNotFoundError
+				if !errors.As(err, &notFound) {
+					errs = append(errs, fmt.Errorf("remove %s (resolved): %w", svcName, err))
+				}
+			}
 		}
 	}
 	anchorID := strings.TrimSpace(appInst.NetworkAnchorID)
@@ -569,7 +623,12 @@ func (m *AppManager) removeContainersForMultiApp(ctx context.Context, appInst *A
 		}
 	}
 	if anchorID != "" {
-		_ = m.containerManager.RemoveContainer(ctx, runtime, anchorID)
+		if err := m.containerManager.RemoveContainer(ctx, runtime, anchorID); err != nil {
+			var notFound *container.ContainerNotFoundError
+			if !errors.As(err, &notFound) {
+				errs = append(errs, fmt.Errorf("remove anchor: %w", err))
+			}
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
