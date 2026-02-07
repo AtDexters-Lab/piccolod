@@ -65,9 +65,10 @@ func (m *AppManager) flushAndReloadNetavarkRules(ctx context.Context) {
 	}
 }
 
-// flushNetavarkTable runs `nft flush table ip netavark` to wipe all netavark rules.
-// All failures are non-fatal: missing nft binary, missing table, and flush errors
-// are logged and ignored since reloading running containers still provides value.
+// flushNetavarkTable flushes all netavark nftables rules across all table families.
+// Netavark may use "inet" (newer) or "ip"/"ip6" (older) table families depending
+// on version. We try all three; missing tables are treated as benign.
+// All failures are non-fatal since reloading running containers still provides value.
 func flushNetavarkTable(ctx context.Context) {
 	nftPath, err := exec.LookPath("nft")
 	if err != nil {
@@ -75,19 +76,25 @@ func flushNetavarkTable(ctx context.Context) {
 		return
 	}
 
-	cmd := exec.CommandContext(ctx, nftPath, "flush", "table", "ip", "netavark")
+	// Try all table families — netavark version determines which exists.
+	for _, family := range []string{"inet", "ip", "ip6"} {
+		flushNftTable(ctx, nftPath, family, "netavark")
+	}
+}
+
+// flushNftTable flushes a single nftables table. Missing tables are logged at INFO
+// level; other failures are logged as warnings.
+func flushNftTable(ctx context.Context, nftPath, family, table string) {
+	cmd := exec.CommandContext(ctx, nftPath, "flush", "table", family, table)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outStr := strings.ToLower(string(output))
-		// Table not found means clean slate — not an error.
 		if strings.Contains(outStr, "no such file or directory") ||
 			(strings.Contains(outStr, "table") && strings.Contains(outStr, "does not exist")) {
-			log.Printf("INFO: netavark nftables table not found, nothing to flush")
 			return
 		}
-		log.Printf("WARN: nft flush table ip netavark failed: %s", strings.TrimSpace(string(output)))
+		log.Printf("WARN: nft flush table %s %s failed: %s", family, table, strings.TrimSpace(string(output)))
 		return
 	}
-
-	log.Printf("INFO: flushed netavark nftables table")
+	log.Printf("INFO: flushed netavark nftables table %s %s", family, table)
 }
