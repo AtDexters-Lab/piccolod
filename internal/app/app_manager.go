@@ -86,14 +86,6 @@ type LockStateReader interface {
 
 const maxInstallPortRetries = 5
 
-// workspaceSnapshotImage returns the local image name used to store workspace snapshots.
-// Snapshots are committed when a workspace app is uninstalled without purge, preserving
-// container filesystem changes for restoration on reinstall.
-// The instanceID parameter is the unique instance identifier.
-func workspaceSnapshotImage(instanceID string) string {
-	return fmt.Sprintf("localhost/%s:snapshot", instanceID)
-}
-
 // parseEnvSlice converts OCI-style env slice (KEY=VALUE) to a map.
 // If duplicate keys exist, the last value wins.
 func parseEnvSlice(envSlice []string) map[string]string {
@@ -1627,25 +1619,15 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 	return m.stopContainerGroup(ctx, state, app, def, layout, runtime)
 }
 
-// Uninstall removes an application instance completely by instanceID.
+// Uninstall removes an application instance completely by instanceID,
+// including all container data, encrypted volumes, and podman state.
 func (m *AppManager) Uninstall(ctx context.Context, instanceID string) error {
-	if err := m.ensureUnlocked(); err != nil {
-		return err
-	}
-	if err := m.ensureKernelLeader(); err != nil {
-		return err
-	}
-	return m.UninstallWithOptions(ctx, instanceID, false)
-}
-
-// UninstallWithOptions removes an application instance; when purge is true, also deletes app data directories.
-func (m *AppManager) UninstallWithOptions(ctx context.Context, instanceID string, purge bool) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-	return m.uninstallLocked(ctx, instanceID, purge)
+	return m.uninstallLocked(ctx, instanceID)
 }
 
-func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, purge bool) (err error) {
+func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (err error) {
 	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseStopping, 0, "Stopping app", false, nil)
 	defer func() {
 		if err != nil {
@@ -1697,39 +1679,27 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 		m.pruneOrphanedImages(ctx, state, def, instanceID)
 	}
 
-	// If purging, reset podman storage BEFORE unmounting the volume.
+	// Reset podman storage BEFORE unmounting the volume.
 	// This allows podman to properly clean its metadata files (db.sql, locks, etc.)
 	// which live inside the encrypted volume.
-	if purge {
-		m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseCleaningVolumes, 80, "Purging app data", false, nil)
-		if err := m.containerManager.ResetStorage(ctx, runtime); err != nil {
-			log.Printf("WARN: podman storage reset for %s failed: %v", instanceID, err)
-		}
+	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseCleaningVolumes, 80, "Purging app data", false, nil)
+	if err := m.containerManager.ResetStorage(ctx, runtime); err != nil {
+		log.Printf("WARN: podman storage reset for %s failed: %v", instanceID, err)
 	}
 
-	// Detach (unmount) the encrypted volume even without purge.
-	// This prevents data access until reinstall while preserving the data.
+	// Destroy the volume (detaches, then removes ciphertext, metadata, mount directory)
 	volID := appVolumeID(instanceID)
 	volumes := m.currentVolumeManager()
-	if volumes != nil {
-		req := persistence.VolumeRequest{ID: volID, Class: persistence.VolumeClassApplication}
-		if handle, err := volumes.EnsureVolume(ctx, req); err == nil {
-			if detachErr := volumes.Detach(ctx, handle); detachErr != nil {
-				log.Printf("WARN: failed to detach volume %s: %v", volID, detachErr)
-			}
-		}
+	if volumes == nil {
+		return fmt.Errorf("volume manager not available")
+	}
+	if err := volumes.DestroyVolume(ctx, volID); err != nil {
+		return fmt.Errorf("failed to purge app data: %w", err)
 	}
 
-	// If purging, destroy the volume (ciphertext, metadata, mount directory)
-	if purge {
-		if err := m.volumeManager.DestroyVolume(ctx, volID); err != nil {
-			return fmt.Errorf("failed to purge app data: %w", err)
-		}
-
-		// Remove podman runRoot which lives outside the encrypted volume
-		if err := os.RemoveAll(runtime.RunRoot); err != nil {
-			log.Printf("WARN: failed to remove podman runRoot %s: %v", runtime.RunRoot, err)
-		}
+	// Remove podman runRoot which lives outside the encrypted volume
+	if err := os.RemoveAll(runtime.RunRoot); err != nil {
+		log.Printf("WARN: failed to remove podman runRoot %s: %v", runtime.RunRoot, err)
 	}
 
 	// Remove from filesystem and cache (state only)

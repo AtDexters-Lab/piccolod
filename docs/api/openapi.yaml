@@ -85,9 +85,6 @@ paths:
           name: name
           required: true
           schema: { type: string }
-        - in: query
-          name: purge
-          schema: { type: boolean }
       responses:
         '200': { description: OK }
   /apps/{name}/start:

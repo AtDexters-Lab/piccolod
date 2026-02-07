@@ -31,7 +31,7 @@ const (
 	ModeService PiccoloMode = "service"
 
 	// ModeWorkspace indicates a persistent workspace mode.
-	// Container filesystem changes are preserved via snapshots across reinstalls (without purge).
+	// Container filesystem is backed by a persistent workspace disk.
 	ModeWorkspace PiccoloMode = "workspace"
 
 	// ModeUnknown indicates the mode could not be determined.

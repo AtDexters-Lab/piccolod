@@ -19,7 +19,6 @@ const (
 	taskPhaseRecreatingContainer = "recreating_container"
 	taskPhaseRegisteringServices = "registering_services"
 	taskPhaseRemovingContainer   = "removing_container"
-	taskPhaseSnapshotting        = "snapshotting"
 	taskPhaseStarting            = "starting"
 	taskPhaseStopping            = "stopping"
 	taskPhaseUpdatingServices    = "updating_services"

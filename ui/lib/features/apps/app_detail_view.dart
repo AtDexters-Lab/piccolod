@@ -197,19 +197,18 @@ class _AppDetailViewState extends State<AppDetailView>
   }
 
   void _confirmUninstall() async {
-    final result = await UninstallConfirmationDialog.show(
+    final confirmed = await UninstallConfirmationDialog.show(
       context,
       appDisplayTitle: _app?.displayTitle ?? widget.appId,
     );
 
-    if (result == null || !result.confirmed) return;
+    if (confirmed != true) return;
 
     final ok = await _handleActionWithProgress(
       taskType: 'uninstall_app',
       refreshOnSuccess: false,
       action: (taskId) => widget.appService.uninstallApp(
         widget.appId,
-        purge: result.purgeData,
         taskId: taskId,
       ),
     );

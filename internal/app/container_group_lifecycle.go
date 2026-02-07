@@ -226,7 +226,7 @@ func (m *AppManager) stopContainerGroupWithOpts(ctx context.Context, state *File
 
 // uninstallContainerGroup removes a container group (network anchor + service containers).
 // This is the unified uninstall path for both service and workspace modes.
-// Note: This does not handle purge or state removal - those are handled by the caller.
+// Note: This does not handle volume destruction or state removal - those are handled by the caller.
 func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
 	if appInst == nil || def == nil {
 		return fmt.Errorf("uninstall: app definition required")

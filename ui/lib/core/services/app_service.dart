@@ -162,13 +162,10 @@ class AppService {
 
   Future<void> uninstallApp(
     String name, {
-    bool purge = false,
     String? taskId,
   }) async {
-    // Query params not supported in delete? ApiClient.delete supports body.
-    // Need to append query to path.
     await _client.delete(
-      '/api/v1/apps/$name?purge=$purge',
+      '/api/v1/apps/$name',
       headers: _taskHeaders(taskId),
     );
   }

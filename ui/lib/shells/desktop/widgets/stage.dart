@@ -294,19 +294,18 @@ class _StageState extends State<Stage> {
   }
 
   void _confirmUninstall(App app) async {
-    final result = await UninstallConfirmationDialog.show(
+    final confirmed = await UninstallConfirmationDialog.show(
       context,
       appDisplayTitle: app.displayTitle,
     );
 
-    if (result != null && result.confirmed) {
+    if (confirmed == true) {
       final ok = await runWithProgressDialog(
         context: context,
         title: 'Uninstalling App',
         taskType: 'uninstall_app',
         action: (taskId) => widget.controller.appService.uninstallApp(
           app.name,
-          purge: result.purgeData,
           taskId: taskId,
         ),
       );

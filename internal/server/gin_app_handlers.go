@@ -545,7 +545,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		if err := clientMgr.CreateClient(installCtx, oidcClientID, oidcClientSecret, appInstance.InstanceID); err != nil {
 			log.Printf("ERROR: failed to persist OIDC client for %s: %v. Rolling back install.", appInstance.InstanceID, err)
 			// Rollback: uninstall the app
-			if rbErr := s.appManager.UninstallWithOptions(installCtx, appInstance.InstanceID, true); rbErr != nil {
+			if rbErr := s.appManager.Uninstall(installCtx, appInstance.InstanceID); rbErr != nil {
 				log.Printf("CRITICAL: failed to rollback uninstall for %s: %v", appInstance.InstanceID, rbErr)
 			}
 			writeGinError(c, http.StatusInternalServerError, "Failed to register OIDC client: "+err.Error())
@@ -775,12 +775,6 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 // handleGinAppUninstall handles DELETE /api/v1/apps/:name - Uninstall app completely
 func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	appName := c.Param("name")
-	// Optional purge=true to delete app data
-	purge := false
-	switch c.Query("purge") {
-	case "1", "true", "yes", "on":
-		purge = true
-	}
 
 	// Capture current remote hosts to clean up after uninstall.
 	var hostsToRemove map[string]struct{}
@@ -794,7 +788,7 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	}
 
 	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
-	err := s.appManager.UninstallWithOptions(ctx, appName, purge)
+	err := s.appManager.Uninstall(ctx, appName)
 	if err != nil {
 		if handleAppManagerError(c, err, "uninstall app") {
 			return
@@ -820,11 +814,7 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 		}
 	}
 
-	if purge {
-		writeGinSuccess(c, nil, "App '"+appName+"' uninstalled and data purged successfully")
-	} else {
-		writeGinSuccess(c, nil, "App '"+appName+"' uninstalled successfully")
-	}
+	writeGinSuccess(c, nil, "App '"+appName+"' uninstalled successfully")
 }
 
 // handleGinAppStart handles POST /api/v1/apps/:name/start - Start app container
