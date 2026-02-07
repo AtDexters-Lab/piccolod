@@ -67,6 +67,8 @@ type ContainerManager interface {
 	InspectImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) (*container.ImageConfig, error)
 	// SearchRegistry searches for images in container registries.
 	SearchRegistry(ctx context.Context, runtime container.PodmanRuntime, query string, limit int) ([]container.ImageSearchResult, error)
+	// NetworkReload tears down and re-creates network configuration for a running container.
+	NetworkReload(ctx context.Context, runtime container.PodmanRuntime, containerNameOrID string) error
 	// ExecShellCmd returns an exec.Cmd for running a shell inside a container.
 	ExecShellCmd(runtime container.PodmanRuntime, containerID string) (*exec.Cmd, error)
 }

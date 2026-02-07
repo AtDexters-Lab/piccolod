@@ -1037,6 +1037,37 @@ func (p *PodmanCLI) UpdatePublishRemove(ctx context.Context, runtime PodmanRunti
 	return ErrDynamicPortUpdateNotSupported
 }
 
+// NetworkReload tears down and re-creates network configuration (nftables rules,
+// interfaces) for a running container. Treats "container not running" as non-fatal.
+func (p *PodmanCLI) NetworkReload(ctx context.Context, runtime PodmanRuntime, containerNameOrID string) error {
+	if containerNameOrID == "" {
+		return fmt.Errorf("container name or ID required")
+	}
+	// Accept both container IDs and names; validate whichever format applies.
+	if !isValidContainerID(containerNameOrID) {
+		if err := ValidateContainerName(containerNameOrID); err != nil {
+			return fmt.Errorf("invalid container reference: %w", err)
+		}
+	}
+
+	args, err := buildPodmanArgs(runtime, []string{"network", "reload", containerNameOrID})
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		outStr := strings.ToLower(string(output))
+		// Treat "not running" as non-fatal — container may have been stopped between check and reload
+		if strings.Contains(outStr, "not running") || strings.Contains(outStr, "is not running") {
+			log.Printf("INFO: network reload skipped for %s: container not running", containerNameOrID)
+			return nil
+		}
+		return fmt.Errorf("podman network reload failed: %w, output: %s", err, string(output))
+	}
+	return nil
+}
+
 // ResetStorage cleans up container references for this runtime's storage.
 // Only removes containers, does NOT touch the shared imagestore.
 func (p *PodmanCLI) ResetStorage(ctx context.Context, runtime PodmanRuntime) error {

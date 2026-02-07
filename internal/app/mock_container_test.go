@@ -10,14 +10,16 @@ import (
 )
 
 type MockContainerManager struct {
-	containers     map[string]*mockContainer
-	nextID         int
-	createError    error
-	startError     error
-	stopError      error
-	removeError    error
-	removedImages  []string
-	removeImageErr error
+	containers         map[string]*mockContainer
+	nextID             int
+	createError        error
+	startError         error
+	stopError          error
+	removeError        error
+	removedImages      []string
+	removeImageErr     error
+	reloadedContainers []string
+	reloadErr          error
 }
 
 type mockContainer struct {
@@ -274,6 +276,16 @@ func (m *MockContainerManager) SearchRegistry(ctx context.Context, runtime conta
 	return []container.ImageSearchResult{
 		{Index: "docker.io", Name: "library/" + query, Description: "Mock image", Stars: 100, Official: "[OK]"},
 	}, nil
+}
+
+func (m *MockContainerManager) NetworkReload(ctx context.Context, runtime container.PodmanRuntime, containerNameOrID string) error {
+	_ = ctx
+	_ = runtime
+	if m.reloadErr != nil {
+		return m.reloadErr
+	}
+	m.reloadedContainers = append(m.reloadedContainers, containerNameOrID)
+	return nil
 }
 
 func (m *MockContainerManager) ExecShellCmd(runtime container.PodmanRuntime, containerID string) (*exec.Cmd, error) {

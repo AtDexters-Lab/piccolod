@@ -457,6 +457,15 @@ func (m *AppManager) StartBackground() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
+		// Flush stale FUSE mounts left by fuse-overlayfs daemons killed during
+		// previous service shutdown (systemd cgroup cleanup). Must run before
+		// reconcile to prevent workspace disk mount failures.
+		cleanupStaleFUSEMounts(ctx)
+
+		// Flush stale netavark nftables rules before the first reconcile.
+		// This clears DNAT rules left by containers removed in previous sessions.
+		m.flushAndReloadNetavarkRules(ctx)
+
 		m.ReconcileOnce(ctx)
 		for {
 			select {

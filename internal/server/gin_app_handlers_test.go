@@ -1573,6 +1573,13 @@ func (m *GinMockContainerManager) SearchRegistry(ctx context.Context, runtime co
 	}, nil
 }
 
+func (m *GinMockContainerManager) NetworkReload(ctx context.Context, runtime container.PodmanRuntime, containerNameOrID string) error {
+	_ = ctx
+	_ = runtime
+	_ = containerNameOrID
+	return nil
+}
+
 func (m *GinMockContainerManager) ExecShellCmd(runtime container.PodmanRuntime, containerID string) (*exec.Cmd, error) {
 	_ = runtime
 	// Mock: return a simple echo command for testing purposes

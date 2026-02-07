@@ -362,6 +362,56 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		log.Printf("WARN: reconcile app %s: publish reconcile failed: %v", appInst.InstanceID, err)
 	}
 
+	// Detect stale DNAT rules: if the existing backend health check (15s interval,
+	// 3-failure debounce) reports unhealthy while containers are confirmed running,
+	// the nftables DNAT is likely routing to a dead IP from a previous container.
+	// Recreate the affected app with new host-bind ports.
+	//
+	// Guards against infinite recreation loops for genuinely unhealthy apps:
+	//   - 2-minute cooldown after last update (covers startup + health debounce)
+	//   - Reuses startup failure escalation: after startupEscalateAfterAttempts
+	//     consecutive repairs, status escalates to "error" and stops retrying
+	if eps, err := m.serviceManager.GetByApp(appInst.InstanceID); err == nil {
+		anyUnhealthy := false
+		for _, ep := range eps {
+			endpointKey := ep.App + "/" + ep.Name
+			healthy, _ := m.serviceManager.GetBackendHealth(endpointKey)
+			if !healthy {
+				anyUnhealthy = true
+				break
+			}
+		}
+		if anyUnhealthy {
+			if time.Since(appInst.UpdatedAt) < 2*time.Minute {
+				log.Printf("WARN: reconcile app %s: backend unhealthy but recently updated, deferring DNAT repair",
+					appInst.InstanceID)
+			} else if shouldEscalateToError(appInst) {
+				log.Printf("WARN: reconcile app %s: backend unhealthy after %d DNAT repair attempts, escalating to error",
+					appInst.InstanceID, appInst.StartupAttempts)
+				m.handleStartupFailure(state, appInst)
+			} else {
+				log.Printf("INFO: reconcile app %s: backend unhealthy with running containers, likely stale DNAT — recreating with new ports (attempt %d)",
+					appInst.InstanceID, appInst.StartupAttempts+1)
+				m.handleStartupFailure(state, appInst)
+				// Preserve the startup attempt counter across recreation.
+				// recreateMissingMultiContainer resets it on success, but for DNAT repair
+				// we need to accumulate attempts so the escalation threshold works.
+				savedAttempts := appInst.StartupAttempts
+				savedFirstFailure := appInst.FirstStartupFailureAt
+				err := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
+					"stale DNAT rules detected: backend unhealthy with running containers")
+				if err == nil {
+					appInst.StartupAttempts = savedAttempts
+					appInst.FirstStartupFailureAt = savedFirstFailure
+					if storeErr := state.StoreAppMetadata(appInst); storeErr != nil {
+						log.Printf("WARN: reconcile app %s: failed to persist DNAT repair tracking: %v", appInst.InstanceID, storeErr)
+					}
+				}
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
