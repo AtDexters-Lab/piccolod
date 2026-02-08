@@ -53,10 +53,9 @@ func TestPersistenceStateDirHasNoPlaintextArtifacts(t *testing.T) {
 	}
 
 	stateDir := t.TempDir()
-	t.Setenv("PICCOLO_STATE_DIR", stateDir)
 	t.Setenv("PICCOLO_GOCRYPTFS_PATH", gocryptfsPath)
 	t.Setenv("PICCOLO_FUSERMOUNT_PATH", fusermountPath)
-	paths.SetRootForTest(stateDir)
+	paths.SetCoreRootForTest(t, stateDir)
 
 	password := "audit-passphrase"
 	cryptoMgr, err := crypt.NewManager(stateDir)
@@ -85,7 +84,7 @@ func TestPersistenceStateDirHasNoPlaintextArtifacts(t *testing.T) {
 
 	ctx := context.Background()
 	controlHandle, err := mod.Volumes().EnsureVolume(ctx, VolumeRequest{
-		ID:          "control",
+		ID:          "control-plane",
 		Class:       VolumeClassControl,
 		ClusterMode: ClusterModeStateful,
 	})

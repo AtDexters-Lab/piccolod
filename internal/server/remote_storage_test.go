@@ -38,12 +38,6 @@ func prepareBootstrapMount(t *testing.T, dir string) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir mount: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".cipher"), []byte("/ciphertext/bootstrap"), 0o600); err != nil {
-		t.Fatalf("write cipher sentinel: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".mode"), []byte("rw"), 0o600); err != nil {
-		t.Fatalf("write mode sentinel: %v", err)
-	}
 }
 
 func TestBootstrapRemoteStorage_LoadFromFile(t *testing.T) {
@@ -196,7 +190,8 @@ func TestBootstrapRemoteStorage_SaveRepoLocked(t *testing.T) {
 }
 
 func TestBootstrapRemoteStorage_SaveMountNotReady(t *testing.T) {
-	dir := t.TempDir()
+	// Use a nonexistent subdirectory so isMounted() returns false.
+	dir := filepath.Join(t.TempDir(), "nonexistent")
 	repo := &stubRemoteRepo{}
 	storage := newBootstrapRemoteStorage(repo, dir)
 	cfg := remote.Config{Endpoint: "wss://nexus.example.com/connect"}
@@ -210,7 +205,8 @@ func TestBootstrapRemoteStorage_SaveMountNotReady(t *testing.T) {
 }
 
 func TestBootstrapRemoteStorage_LoadMountNotReady(t *testing.T) {
-	dir := t.TempDir()
+	// Use a nonexistent subdirectory so isMounted() returns false.
+	dir := filepath.Join(t.TempDir(), "nonexistent")
 	storage := newBootstrapRemoteStorage(nil, dir)
 
 	if _, err := storage.Load(context.Background()); !errors.Is(err, remote.ErrLocked) {

@@ -1,8 +1,13 @@
 package crypt
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"piccolod/internal/state/paths"
 )
 
 func TestManager_RewrapUnlocked(t *testing.T) {
@@ -118,5 +123,194 @@ func TestManager_UnlockWithRecoveryKey_Validation(t *testing.T) {
 	// Test: correct mnemonic works
 	if err := m.UnlockWithRecoveryKey(words); err != nil {
 		t.Fatalf("expected correct mnemonic to unlock: %v", err)
+	}
+}
+
+func TestManager_EncryptDecrypt(t *testing.T) {
+	dir := t.TempDir()
+	m, err := NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := m.Setup("secret"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := m.Unlock("secret"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+
+	plaintext := []byte("hello, pool keyfile data!")
+	ct, err := m.Encrypt(plaintext)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	if bytes.Equal(ct, plaintext) {
+		t.Fatal("ciphertext should differ from plaintext")
+	}
+
+	pt, err := m.Decrypt(ct)
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if !bytes.Equal(pt, plaintext) {
+		t.Fatalf("decrypted = %q, want %q", pt, plaintext)
+	}
+}
+
+func TestManager_EncryptDecrypt_Locked(t *testing.T) {
+	dir := t.TempDir()
+	m, err := NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := m.Setup("secret"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	// Don't unlock — should fail.
+	if _, err := m.Encrypt([]byte("test")); err == nil {
+		t.Fatal("expected error when locked")
+	}
+	if _, err := m.Decrypt([]byte("test")); err == nil {
+		t.Fatal("expected error when locked")
+	}
+}
+
+func TestManager_PoolKeyfile_Roundtrip(t *testing.T) {
+	core, _ := paths.SetRootsForTest(t)
+	cryptoDir := filepath.Join(core, "crypto")
+	if err := os.MkdirAll(cryptoDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := NewManager(core)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := m.Setup("secret"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := m.Unlock("secret"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+
+	// Generate and store a pool keyfile.
+	kf, err := GeneratePoolKeyfile()
+	if err != nil {
+		t.Fatalf("GeneratePoolKeyfile: %v", err)
+	}
+	if len(kf.KeyData) != poolKeyfileSize {
+		t.Fatalf("keyfile size = %d, want %d", len(kf.KeyData), poolKeyfileSize)
+	}
+
+	if err := m.StorePoolKeyfile(kf.KeyData); err != nil {
+		t.Fatalf("StorePoolKeyfile: %v", err)
+	}
+
+	// Unwrap and verify.
+	got, err := m.UnwrapPoolKeyfile()
+	if err != nil {
+		t.Fatalf("UnwrapPoolKeyfile: %v", err)
+	}
+	if !bytes.Equal(got, kf.KeyData) {
+		t.Fatal("unwrapped keyfile does not match original")
+	}
+}
+
+func TestManager_PoolKeyfileAt_CustomPath(t *testing.T) {
+	dir := t.TempDir()
+	m, err := NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := m.Setup("secret"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := m.Unlock("secret"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+
+	kf, err := GeneratePoolKeyfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	customPath := filepath.Join(dir, "custom_key.enc")
+	if err := m.StorePoolKeyfileAt(kf.KeyData, customPath); err != nil {
+		t.Fatalf("StorePoolKeyfileAt: %v", err)
+	}
+
+	got, err := m.UnwrapPoolKeyfileFrom(customPath)
+	if err != nil {
+		t.Fatalf("UnwrapPoolKeyfileFrom: %v", err)
+	}
+	if !bytes.Equal(got, kf.KeyData) {
+		t.Fatal("unwrapped keyfile does not match original")
+	}
+}
+
+func TestManager_MnemonicKeyCallbacks(t *testing.T) {
+	dir := t.TempDir()
+	m, err := NewManager(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Without callback set, should error.
+	if err := m.WithMnemonicKey(func(key []byte) error { return nil }); err == nil {
+		t.Fatal("expected error when callback not set")
+	}
+	if err := m.WithOldMnemonicKey(func(key []byte) error { return nil }); err == nil {
+		t.Fatal("expected error when callback not set")
+	}
+
+	// Set callbacks.
+	testKey := []byte("test-mnemonic-derived-key")
+	m.SetMnemonicKeyCallback(func(fn func([]byte) error) error {
+		return fn(testKey)
+	})
+	m.SetOldMnemonicKeyCallback(func(fn func([]byte) error) error {
+		return fn([]byte("old-key"))
+	})
+
+	var received []byte
+	err = m.WithMnemonicKey(func(key []byte) error {
+		received = make([]byte, len(key))
+		copy(received, key)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithMnemonicKey: %v", err)
+	}
+	if !bytes.Equal(received, testKey) {
+		t.Fatalf("received key = %q, want %q", received, testKey)
+	}
+}
+
+func TestManager_OnKeyMaterialChanged(t *testing.T) {
+	dir := t.TempDir()
+	m, err := NewManager(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	m.OnKeyMaterialChanged = func() { called = true }
+	m.notifyKeyMaterialChanged()
+	if !called {
+		t.Error("OnKeyMaterialChanged callback not called")
+	}
+}
+
+func TestGeneratePoolKeyfile_UniqueKeys(t *testing.T) {
+	kf1, err := GeneratePoolKeyfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kf2, err := GeneratePoolKeyfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(kf1.KeyData, kf2.KeyData) {
+		t.Error("expected different keys from two GeneratePoolKeyfile calls")
 	}
 }

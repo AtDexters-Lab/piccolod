@@ -93,11 +93,10 @@ func allowHostStorage(t *testing.T, m *AppManager) {
 		_ = os.RemoveAll(runtimeDir)
 	})
 	if m.stateBaseDir != "" {
-		t.Setenv("PICCOLO_STATE_DIR", m.stateBaseDir)
 		shortRunroot := filepath.Join(os.TempDir(), "piccolo-podman-runroot")
 		_ = os.MkdirAll(shortRunroot, 0o755)
 		t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", shortRunroot)
-		paths.SetRootForTest(m.stateBaseDir)
+		paths.SetCoreRootForTest(t, m.stateBaseDir)
 		m.SetVolumeManager(&stubVolumeManager{root: m.stateBaseDir})
 	}
 	m.SetMountVerifier(func(string) error { return nil })
@@ -137,19 +136,7 @@ func TestAppManager_LazyStateInitialization(t *testing.T) {
 
 func TestAppManager_DefaultStateDirWhenEmpty(t *testing.T) {
 	tempDir := t.TempDir()
-	prev, had := os.LookupEnv("PICCOLO_STATE_DIR")
-	if err := os.Setenv("PICCOLO_STATE_DIR", tempDir); err != nil {
-		t.Fatalf("set env: %v", err)
-	}
-	paths.SetRootForTest(tempDir)
-	t.Cleanup(func() {
-		if had {
-			_ = os.Setenv("PICCOLO_STATE_DIR", prev)
-		} else {
-			_ = os.Unsetenv("PICCOLO_STATE_DIR")
-		}
-		paths.SetRootForTest("")
-	})
+	paths.SetCoreRootForTest(t, tempDir)
 
 	mock := NewMockContainerManager()
 	manager, err := NewAppManager(mock, "")
@@ -1529,8 +1516,7 @@ func TestAppManager_StopAllApps_StateManagerNotInitialized(t *testing.T) {
 func TestAppManager_MetadataMigration(t *testing.T) {
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
-	paths.SetRootForTest(tempDir)
-	t.Cleanup(func() { paths.SetRootForTest("") })
+	paths.SetCoreRootForTest(t, tempDir)
 
 	appsDir := filepath.Join(tempDir, AppsDir)
 	_ = os.MkdirAll(appsDir, 0o755)
@@ -1601,8 +1587,7 @@ func TestUninstall_ImagePruning(t *testing.T) {
 	makeManager := func(t *testing.T) (*AppManager, *MockContainerManager, string) {
 		t.Helper()
 		tempDir := t.TempDir()
-		paths.SetRootForTest(tempDir)
-		t.Cleanup(func() { paths.SetRootForTest("") })
+		paths.SetCoreRootForTest(t, tempDir)
 
 		mock := NewMockContainerManager()
 		mgr, err := NewAppManager(mock, tempDir)
@@ -1750,8 +1735,7 @@ func TestUninstall_ImagePruning(t *testing.T) {
 func TestPodmanImageRuntime(t *testing.T) {
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
-	paths.SetRootForTest(tempDir)
-	t.Cleanup(func() { paths.SetRootForTest("") })
+	paths.SetCoreRootForTest(t, tempDir)
 
 	mock := NewMockContainerManager()
 	mgr, err := NewAppManager(mock, tempDir)

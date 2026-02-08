@@ -223,7 +223,7 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 		now = func() time.Time { return time.Now().UTC() }
 	}
 	if baseDir == "" {
-		baseDir = paths.Root()
+		baseDir = paths.CoreRoot()
 	}
 	m := &Manager{
 		storage:        storage,
@@ -312,7 +312,7 @@ type fileStorage struct {
 
 func newFileStorage(baseDir string) (*fileStorage, error) {
 	if baseDir == "" {
-		baseDir = paths.Root()
+		baseDir = paths.CoreRoot()
 	}
 	dir := filepath.Join(baseDir, "remote")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

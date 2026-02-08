@@ -33,6 +33,7 @@ import (
 	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/runtime/commands"
 	"piccolod/internal/services"
+	"piccolod/internal/state/paths"
 )
 
 func requireMountBypassAllowed(t *testing.T) {
@@ -842,102 +843,6 @@ func TestInvalidRoutes(t *testing.T) {
 	}
 }
 
-func TestHandlePersistenceControlExport(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	tempDir := t.TempDir()
-
-	server := createGinTestServer(t, tempDir)
-	sessionCookie, csrfToken := setupTestAdminSession(t, server)
-
-	artifactPath := filepath.Join(tempDir, "exports", "control", "control-plane.pcv")
-	server.dispatcher = commands.NewDispatcher()
-	server.dispatcher.Register(persistence.CommandRunControlExport, commands.HandlerFunc(func(ctx context.Context, cmd commands.Command) (commands.Response, error) {
-		if _, ok := cmd.(persistence.RunControlExportCommand); !ok {
-			t.Fatalf("unexpected command type: %T", cmd)
-		}
-		return persistence.ExportArtifact{Path: artifactPath, Kind: persistence.ExportKindControlOnly}, nil
-	}))
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest(http.MethodPost, "/api/v1/exports/control", nil)
-	attachAuth(req, sessionCookie, csrfToken)
-	server.router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
-	}
-
-	var resp struct {
-		Data struct {
-			Artifact struct {
-				Path string `json:"path"`
-				Kind string `json:"kind"`
-			} `json:"artifact"`
-		} `json:"data"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if resp.Data.Artifact.Path != artifactPath {
-		t.Fatalf("expected artifact path %q, got %q", artifactPath, resp.Data.Artifact.Path)
-	}
-	if resp.Data.Artifact.Kind != string(persistence.ExportKindControlOnly) {
-		t.Fatalf("unexpected artifact kind %q", resp.Data.Artifact.Kind)
-	}
-	if resp.Message == "" {
-		t.Fatalf("expected success message")
-	}
-}
-
-func TestHandlePersistenceFullExport(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	tempDir := t.TempDir()
-
-	server := createGinTestServer(t, tempDir)
-	sessionCookie, csrfToken := setupTestAdminSession(t, server)
-
-	controlArtifact := filepath.Join(tempDir, "exports", "full", "full-data.pcv")
-	server.dispatcher = commands.NewDispatcher()
-	server.dispatcher.Register(persistence.CommandRunFullExport, commands.HandlerFunc(func(ctx context.Context, cmd commands.Command) (commands.Response, error) {
-		if _, ok := cmd.(persistence.RunFullExportCommand); !ok {
-			t.Fatalf("unexpected command type: %T", cmd)
-		}
-		return persistence.ExportArtifact{Path: controlArtifact, Kind: persistence.ExportKindFullData}, nil
-	}))
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest(http.MethodPost, "/api/v1/exports/full", nil)
-	attachAuth(req, sessionCookie, csrfToken)
-	server.router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
-	}
-
-	var resp struct {
-		Data struct {
-			Artifact struct {
-				Path string `json:"path"`
-				Kind string `json:"kind"`
-			} `json:"artifact"`
-		} `json:"data"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if resp.Data.Artifact.Path != controlArtifact {
-		t.Fatalf("expected artifact path %q, got %q", controlArtifact, resp.Data.Artifact.Path)
-	}
-	if resp.Data.Artifact.Kind != string(persistence.ExportKindFullData) {
-		t.Fatalf("unexpected artifact kind %q", resp.Data.Artifact.Kind)
-	}
-	if resp.Message == "" {
-		t.Fatalf("expected success message")
-	}
-}
-
 type stubTestVolumeManager struct {
 	root string
 }
@@ -984,7 +889,7 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	t.Helper()
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
-	t.Setenv("PICCOLO_STATE_DIR", tempDir)
+	paths.SetCoreRootForTest(t, tempDir)
 	t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(tempDir, "run", "podman"))
 	ensureTestControlMetadata(t, tempDir)
 	// Create mock container manager for app manager

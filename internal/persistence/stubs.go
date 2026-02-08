@@ -15,16 +15,6 @@ var (
 	ErrVolumeMetadataCorrupted = errors.New("persistence: volume metadata corrupted")
 )
 
-// Bootstrap -----------------------------------------------------------------
-
-type noopBootstrapStore struct{}
-
-func newNoopBootstrapStore() *noopBootstrapStore { return &noopBootstrapStore{} }
-
-func (n *noopBootstrapStore) Mount(ctx context.Context) error   { return nil }
-func (n *noopBootstrapStore) Rebuild(ctx context.Context) error { return nil }
-func (n *noopBootstrapStore) IsMounted() bool                   { return false }
-
 // Control -------------------------------------------------------------------
 
 type noopControlStore struct {
@@ -126,28 +116,6 @@ func (n *noopDeviceManager) Observe() (<-chan DeviceEvent, error) {
 	ch := make(chan DeviceEvent)
 	close(ch)
 	return ch, nil
-}
-
-// Exports -------------------------------------------------------------------
-
-type noopExportManager struct{}
-
-func newNoopExportManager() *noopExportManager { return &noopExportManager{} }
-
-func (n *noopExportManager) RunControlPlane(ctx context.Context) (ExportArtifact, error) {
-	return ExportArtifact{Kind: ExportKindControlOnly}, ErrNotImplemented
-}
-
-func (n *noopExportManager) RunFullData(ctx context.Context) (ExportArtifact, error) {
-	return ExportArtifact{Kind: ExportKindFullData}, ErrNotImplemented
-}
-
-func (n *noopExportManager) ImportControlPlane(ctx context.Context, artifact ExportArtifact, opts ImportOptions) error {
-	return ErrNotImplemented
-}
-
-func (n *noopExportManager) ImportFullData(ctx context.Context, artifact ExportArtifact, opts ImportOptions) error {
-	return ErrNotImplemented
 }
 
 // Storage adapter -----------------------------------------------------------

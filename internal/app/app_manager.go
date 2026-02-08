@@ -154,7 +154,7 @@ func (r *workspaceRuntimeResolver) GetRuntimeArgs(ctx context.Context, instanceI
 func NewAppManagerWithServices(containerManager ContainerManager, stateDir string, serviceManager *services.ServiceManager, lockReader LockStateReader) (*AppManager, error) {
 	base := stateDir
 	if strings.TrimSpace(base) == "" {
-		base = paths.Root()
+		base = paths.CoreRoot()
 	}
 	base = filepath.Clean(base)
 
@@ -230,7 +230,7 @@ func (m *AppManager) SetEventBus(bus *events.Bus) {
 func (m *AppManager) SetStateBaseDir(dir string) {
 	base := dir
 	if strings.TrimSpace(base) == "" {
-		base = paths.Root()
+		base = paths.CoreRoot()
 	}
 	clean := filepath.Clean(base)
 	m.stateInitMu.Lock()

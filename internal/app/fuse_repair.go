@@ -42,7 +42,7 @@ func cleanupStaleFUSEMounts(ctx context.Context) {
 	}
 	defer f.Close()
 
-	mounts := parseFUSEMounts(f, paths.Root())
+	mounts := parseFUSEMounts(f, paths.CoreRoot())
 	if len(mounts) == 0 {
 		return
 	}

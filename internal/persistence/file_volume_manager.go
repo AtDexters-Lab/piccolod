@@ -133,7 +133,7 @@ func (p *execMountProcess) Pid() int {
 	return p.cmd.Process.Pid
 }
 
-// FileVolumeManager orchestrates gocryptfs-backed volumes rooted in PICCOLO_STATE_DIR.
+// fileVolumeManager orchestrates gocryptfs-backed volumes rooted in PICCOLO_CORE_ROOT.
 type fileVolumeManager struct {
 	root           string
 	crypto         *crypt.Manager
@@ -189,7 +189,7 @@ const (
 
 func newFileVolumeManager(root string, crypto *crypt.Manager, bus *events.Bus) *fileVolumeManager {
 	if root == "" {
-		root = paths.Root()
+		root = paths.CoreRoot()
 	}
 	bypass := os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") == "1"
 	waiter := waitForMountReady
@@ -282,7 +282,7 @@ func (f *fileVolumeManager) getOrCreateEntry(id string) *volumeEntry {
 }
 
 func shouldGuardMountDir(volumeID string) bool {
-	// Guard all mount points under PICCOLO_STATE_DIR/mounts to prevent accidental
+	// Guard all mount points under PICCOLO_CORE_ROOT/mounts to prevent accidental
 	// plaintext writes to an unmounted directory where an encrypted volume is expected.
 	return volumeID != ""
 }

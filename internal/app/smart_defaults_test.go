@@ -20,9 +20,7 @@ func setupTestAppManager(t *testing.T, existingApps map[string]*api.AppDefinitio
 	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") != "1" {
 		t.Skip("set PICCOLO_ALLOW_UNMOUNTED_TESTS=1 to run without mounted volumes")
 	}
-	t.Setenv("PICCOLO_STATE_DIR", tempDir)
-	paths.SetRootForTest(tempDir)
-	t.Cleanup(func() { paths.SetRootForTest("") })
+	paths.SetCoreRootForTest(t, tempDir)
 
 	mock := NewMockContainerManager()
 	mgr, err := NewAppManager(mock, tempDir)

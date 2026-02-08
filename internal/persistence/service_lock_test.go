@@ -15,13 +15,13 @@ func TestModuleSetLockStateIgnoresStaleCipherMarker(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
-	mountDir := filepath.Join(root, "mounts", "control")
+	mountDir := filepath.Join(root, "mounts", "control-plane")
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
 		t.Fatalf("mkdir mount dir: %v", err)
 	}
 	// Simulate a stale marker that survives an unclean shutdown even though the
 	// FUSE mount is already gone.
-	if err := os.WriteFile(filepath.Join(mountDir, ".cipher"), []byte("/ciphertext/control"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(mountDir, ".cipher"), []byte("/ciphertext/control-plane"), 0o600); err != nil {
 		t.Fatalf("write cipher marker: %v", err)
 	}
 
@@ -34,41 +34,11 @@ func TestModuleSetLockStateIgnoresStaleCipherMarker(t *testing.T) {
 	mod := &Module{
 		control:       ctrl,
 		volumes:       vol,
-		controlHandle: VolumeHandle{ID: "control", MountDir: mountDir},
+		controlHandle: VolumeHandle{ID: "control-plane", MountDir: mountDir},
 	}
 
 	if err := mod.setLockState(context.Background(), true); err != nil {
 		t.Fatalf("setLockState should tolerate stale marker: %v", err)
-	}
-}
-
-func TestModuleRunExportWithLockRestoresState(t *testing.T) {
-	mod := &Module{
-		control:       &stubLockableControl{},
-		volumes:       &stubVolumeManager{},
-		controlHandle: VolumeHandle{ID: "control"},
-	}
-	mod.lockState = false
-
-	artifact, err := mod.runExportWithLock(context.Background(), false, func(ctx context.Context) (ExportArtifact, error) {
-		ctrl := mod.control.(*stubLockableControl)
-		if !ctrl.locked {
-			t.Fatalf("expected control store locked during export")
-		}
-		return ExportArtifact{Path: "/tmp/control.pcv", Kind: ExportKindControlOnly}, nil
-	})
-	if err != nil {
-		t.Fatalf("runExportWithLock returned error: %v", err)
-	}
-	ctrl := mod.control.(*stubLockableControl)
-	if ctrl.locked {
-		t.Fatalf("expected control store unlocked after export")
-	}
-	if mod.ControlLocked() {
-		t.Fatalf("module lock state not restored")
-	}
-	if artifact.Kind != ExportKindControlOnly {
-		t.Fatalf("unexpected artifact kind %s", artifact.Kind)
 	}
 }
 

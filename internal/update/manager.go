@@ -84,7 +84,7 @@ func WithClock(fn func() time.Time) Option { return func(m *microOSBackend) { m.
 // WithTimeout overrides the transactional-update timeout.
 func WithTimeout(d time.Duration) Option { return func(m *microOSBackend) { m.timeout = d } }
 
-// WithStateDir overrides the persistent state directory (default PICCOLO_STATE_DIR/update).
+// WithStateDir overrides the persistent state directory (default PICCOLO_CORE_ROOT/update).
 func WithStateDir(dir string) Option {
 	return func(m *microOSBackend) {
 		m.statePath = filepath.Join(dir, defaultStateSubdir, defaultStateFilename)
@@ -153,7 +153,7 @@ func newMicroOSBackend(opts ...Option) (*microOSBackend, error) {
 		clock:      time.Now,
 		timeout:    timeout,
 		runtimeDir: defaultRuntimeDir,
-		statePath:  filepath.Join(paths.Root(), defaultStateSubdir, defaultStateFilename),
+		statePath:  filepath.Join(paths.CoreRoot(), defaultStateSubdir, defaultStateFilename),
 		readFile:   os.ReadFile,
 	}
 	for _, opt := range opts {

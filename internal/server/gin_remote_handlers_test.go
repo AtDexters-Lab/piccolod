@@ -482,9 +482,7 @@ func TestRemote_PortalHostnamePersistsAndAppCertQueued(t *testing.T) {
 	t.Setenv("PICCOLO_DISABLE_MDNS", "1")
 
 	tempDir := t.TempDir()
-	t.Setenv("PICCOLO_STATE_DIR", tempDir)
-	paths.SetRootForTest(tempDir)
-	t.Cleanup(func() { paths.SetRootForTest("") })
+	paths.SetCoreRootForTest(t, tempDir)
 	srv := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
 

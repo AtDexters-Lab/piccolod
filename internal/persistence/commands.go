@@ -2,18 +2,14 @@ package persistence
 
 import (
 	"context"
-	"errors"
-	"log"
 
 	"piccolod/internal/runtime/commands"
 )
 
 const (
-	CommandEnsureVolume     = "persistence.ensure_volume"
-	CommandAttachVolume     = "persistence.attach_volume"
-	CommandRecordLockState  = "persistence.record_lock_state"
-	CommandRunControlExport = "persistence.run_control_export"
-	CommandRunFullExport    = "persistence.run_full_export"
+	CommandEnsureVolume    = "persistence.ensure_volume"
+	CommandAttachVolume    = "persistence.attach_volume"
+	CommandRecordLockState = "persistence.record_lock_state"
 )
 
 // EnsureVolumeCommand requests creation (or retrieval) of a volume matching
@@ -44,16 +40,6 @@ type RecordLockStateCommand struct {
 }
 
 func (c RecordLockStateCommand) Name() string { return CommandRecordLockState }
-
-// RunControlExportCommand triggers a control-plane-only PCV export.
-type RunControlExportCommand struct{}
-
-func (c RunControlExportCommand) Name() string { return CommandRunControlExport }
-
-// RunFullExportCommand triggers a full-data export.
-type RunFullExportCommand struct{}
-
-func (c RunFullExportCommand) Name() string { return CommandRunFullExport }
 
 func (m *Module) handleEnsureVolume(ctx context.Context, cmd commands.Command) (commands.Response, error) {
 	request, ok := cmd.(EnsureVolumeCommand)
@@ -90,38 +76,3 @@ func (m *Module) handleRecordLockState(ctx context.Context, cmd commands.Command
 	return nil, nil
 }
 
-func (m *Module) handleRunControlExport(ctx context.Context, cmd commands.Command) (commands.Response, error) {
-	if _, ok := cmd.(RunControlExportCommand); !ok {
-		return nil, ErrInvalidCommand
-	}
-	artifact, err := m.runExportWithLock(ctx, false, m.exports.RunControlPlane)
-	if err != nil {
-		return nil, err
-	}
-	if artifact.Kind == "" {
-		artifact.Kind = ExportKindControlOnly
-	}
-	if artifact.Path == "" {
-		log.Printf("WARN: export artifact missing path; ExportManager should supply absolute path")
-		return nil, errors.New("persistence: export artifact missing path")
-	}
-	return artifact, nil
-}
-
-func (m *Module) handleRunFullExport(ctx context.Context, cmd commands.Command) (commands.Response, error) {
-	if _, ok := cmd.(RunFullExportCommand); !ok {
-		return nil, ErrInvalidCommand
-	}
-	artifact, err := m.runExportWithLock(ctx, true, m.exports.RunFullData)
-	if err != nil {
-		return nil, err
-	}
-	if artifact.Kind == "" {
-		artifact.Kind = ExportKindFullData
-	}
-	if artifact.Path == "" {
-		log.Printf("WARN: full export artifact missing path; ExportManager should supply absolute path")
-		return nil, errors.New("persistence: full export artifact missing path")
-	}
-	return artifact, nil
-}
