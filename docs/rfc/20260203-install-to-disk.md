@@ -147,7 +147,7 @@ type PlannedPartition struct {
 ```
 
 The simulation:
-1. Validates the target disk (size, not the boot disk, accessible).
+1. Validates the target disk (size, not the boot disk, accessible, **not currently mounted**). The installer verifies no partitions on the target disk are mounted (via `findmnt --source <dev>*` or `/proc/mounts` scan) and no dm-crypt mappers are open on the target. Running `sgdisk --zap-all` on a mounted disk would cause data corruption. If any partition is in use, the endpoint returns an error instructing the user to unmount first.
 2. Computes the partition layout using `calculatePartitionLayout()` from Posture RFC §5.4.
 3. Identifies the active btrfs snapshot on the USB to determine transfer size.
 4. Lists all existing partitions on the target (for the erase warning).
@@ -185,7 +185,12 @@ func (inst *Installer) prepareTargetDisk(ctx context.Context, target string) err
         return fmt.Errorf("target disk too small: %w", err)
     }
 
-    sectorSize, _ := inst.getSectorSize(ctx, target)
+    sectorSize, sectorErr := inst.getSectorSize(ctx, target)
+    if sectorErr != nil {
+        // All three partition boundaries depend on sector size; a wrong default
+        // would silently misalign the layout. Fail hard rather than guess.
+        return fmt.Errorf("cannot determine sector size for %s: %w", target, sectorErr)
+    }
 
     // 3. Create ESP (partition 1)
     // ESP starts at 1MiB (standard alignment), size ~512MB
@@ -453,6 +458,40 @@ func (inst *Installer) applyPostSyncFixups(ctx context.Context, target string) e
         inst.runner.Run(ctx, "grub2-editenv", grubenvPath, "unset", "saved_entry")
     }
 
+    // 4. Regenerate initrd to embed the target's root UUID.
+    // The copied initrd was built by dracut with the USB's root partition UUID.
+    // On MicroOS, dracut may bake the root device UUID into the initrd (depending
+    // on the dracut modules used). The kernel command line `root=UUID=` in grub.cfg
+    // (updated above) should take precedence, but some dracut configurations also
+    // embed a compiled-in default. Regenerating via chroot + dracut --force ensures
+    // the initrd references the correct target root UUID regardless of dracut config.
+    chrootTarget := filepath.Join(targetRootMount, "@")
+
+    // Bind-mount /dev, /proc, /sys into chroot for dracut.
+    // NOTE: /boot must be accessible inside chrootTarget. On MicroOS, /boot is
+    // part of the root subvolume (@), so it is already present. If a future
+    // layout uses a separate /boot partition, bind-mount it here as well.
+    for _, mount := range []string{"/dev", "/proc", "/sys"} {
+        dst := filepath.Join(chrootTarget, mount)
+        if err := inst.runner.Run(ctx, "mount", "--bind", mount, dst); err != nil {
+            return fmt.Errorf("failed to bind-mount %s for chroot: %w", mount, err)
+        }
+        defer inst.runner.Run(ctx, "umount", "-l", dst)
+    }
+
+    // Regenerate initrd for all installed kernels
+    if err := inst.runner.Run(ctx, "chroot", chrootTarget,
+        "dracut", "--force", "--regenerate-all"); err != nil {
+        return fmt.Errorf("failed to regenerate initrd on target: %w", err)
+    }
+
+    // Copy the regenerated initrd to the target ESP (MicroOS stores kernel+initrd
+    // in both /boot and the ESP; dracut updates /boot, we sync to ESP)
+    if err := inst.syncKernelToESP(ctx, chrootTarget, targetESPMount); err != nil {
+        inst.logger.Warn("failed to sync regenerated initrd to ESP — "+
+            "target may boot with stale initrd if ESP copy is used", "error", err)
+    }
+
     return nil
 }
 
@@ -665,7 +704,7 @@ func (inst *Installer) copyCiphertextSubvolume(ctx context.Context, src, dst str
 
 **What is copied:**
 - `crypto/keyset.json` — SDEK sealed with KEK (same admin password works on target)
-- `crypto/piccolo_data_pool_key.enc` — overwritten in Phase 10 with the target's new pool keyfile
+- `crypto/piccolo_data_pool_key.enc` — overwritten in Phase 10 with the target's new pool keyfile. **Partial failure note:** If the pipeline fails between Phase 5 and Phase 10 (e.g., LUKS init fails in Phase 7), the target's `/piccolo-core/crypto/piccolo_data_pool_key.enc` contains the USB's pool keyfile, which cannot unlock the target's LUKS device. Recovery: the error handler offers "wipe and restart" (§11) which clears the target's `/piccolo-core` and retries from scratch
 - `ciphertext/control-plane/` — full gocryptfs ciphertext (as btrfs subvolume on target)
 - `volumes/control-plane/piccolo.volume.json` — wrapped gocryptfs passphrase
 - `recovery/` — PCV exports (will be re-published post-install)
@@ -727,6 +766,8 @@ func (inst *Installer) initializeTargetLUKS(ctx context.Context, target string, 
         "--hash", "sha512",
         "--pbkdf", "pbkdf2",
         "--pbkdf-force-iterations", "1000",
+        "--label", "piccolo-data",
+        "--key-slot", "0",
         "--key-file", keyfilePath,
         dataDev); err != nil {
         return fmt.Errorf("LUKS format failed: %w", err)
@@ -999,7 +1040,21 @@ No LUKS setup during installation. The target disk's partition 3 is left as raw 
 
 This avoids duplicating LUKS initialization logic in the installer.
 
-**Compatibility with Posture RFC first-boot detection:** The installer creates partition 3 with GPT type code `8309` (Linux LUKS) and label `piccolo-data`. On the target's first boot, the Posture RFC's `GetPartitionState()` (§11.1) finds the data partition by type code `8309` or label. Since the partition already exists, `CreateDataPartition()` is a no-op ("data partition already exists, skipping creation"). Since root is already at its target size (created by the installer at the §5.4 layout), `ExpandRootPartition()` is also a no-op. Phase 1 completes with no writes. Phase 2 detects "LUKS header missing" and runs `InitializeLUKS()`. This interaction is safe because the Posture RFC's `findNextPartitionSlot()` only creates a new partition when none exists — it does not create a duplicate.
+**Posture RFC state machine trace (fresh-start first boot):**
+
+The target's first boot proceeds through the Posture RFC's state machine as follows:
+
+| Step | Posture RFC Function | State Input | Result |
+|------|---------------------|-------------|--------|
+| 1 | `DetectBootMode()` | Boot disk transport = `sata`/`nvme` | `BootModeInternal` — skip onboarding |
+| 2 | `GetPartitionState()` | Partition 3 exists, type `8309`, label `piccolo-data` | `{DataPartitionExists: true, DataPartitionLUKS: false}` |
+| 3 | `ExpandRootPartition()` | Root already at target size (installer-created) | No-op |
+| 4 | `CreateDataPartition()` | Partition 3 already exists | No-op — `findNextPartitionSlot()` sees existing partition |
+| 5 | Phase 1 complete | No writes performed | Channel signaled for Phase 2 |
+| 6 | `detectOrphanedLUKSHeader()` | No LUKS header, no pool keyfile | Returns `false` — not an orphan |
+| 7 | Phase 2 (after admin password) | `!state.DataPartitionLUKS` | Calls `InitializeLUKS()` per §6.3 |
+
+The `{DataPartitionExists: true, DataPartitionLUKS: false}` state is explicitly handled by the Posture RFC Phase 2 logic: a data partition without a LUKS header triggers `InitializeLUKS()` (which is the normal first-boot LUKS setup path). The `findDataPartitionDevice()` function (Posture RFC §6.3a) scans the boot disk for GPT type code `8309` + label `piccolo-data`, which matches the installer-created partition 3.
 
 ### 9.2 Carry Over
 
@@ -1290,11 +1345,20 @@ Or if after Phase 3:
 
 Per PRD: "Preserve/emit device identity so the installed system is recognized post-reboot."
 
-### 14.1 Fresh Start
+### 14.1 `/etc/machine-id` Handling
+
+The `machine-id` is synced from USB to the installed system as part of the `btrfs send/receive` root sync. It is **intentionally kept identical** — regenerating it would change the node ID derivation (`SHA-256(machine-id || DMI board serial)`) and create a mismatch with any carried-over `node-id.json`.
+
+**Implication:** After Install to Disk, the USB and internal disk share the same `machine-id`. The USB **should not be booted on the same hardware** after installation. Booting both environments with the same `machine-id` on the same machine can cause systemd journal corruption and mDNS/Avahi identity conflicts. This is acceptable because:
+- The Install to Disk flow sets the UEFI boot order to prefer the internal disk.
+- The USB's primary purpose is evaluation ("Try Piccolo"); after installing to disk, it is no longer needed on that hardware.
+- The USB can still be used on different hardware (different DMI serial produces a different node ID even with the same `machine-id`).
+
+### 14.2 Fresh Start
 
 The installed system generates a new node ID on first boot (Foundation RFC §8.2.1 — `SHA-256(machine-id || DMI board serial)`). Since the `machine-id` is part of the synced OS and the DMI serial comes from the hardware, the node ID is deterministic for the physical device.
 
-### 14.2 Carry Over
+### 14.3 Carry Over
 
 The carried-over control plane contains the `node-id.json` (generated during the USB "Try Piccolo" session). This node ID was derived from the USB boot's `machine-id` and the physical hardware's DMI serial.
 
@@ -1530,7 +1594,7 @@ Requires: efibootmgr
 Requires: dosfstools
 ```
 
-Note: `grub2` and `coreutils` are already present in the base MicroOS image and do not need explicit RPM dependencies.
+Note: `grub2`, `coreutils`, `dracut`, and `snapper` are already present in the base MicroOS image and do not need explicit RPM dependencies. `dracut` is used in Phase 4 (`dracut --force --regenerate-all` inside chroot) and `snapper` in Phase 3 (`snapper setup-quota`).
 
 ## 20. Open Questions
 
@@ -1540,4 +1604,5 @@ Note: `grub2` and `coreutils` are already present in the base MicroOS image and 
 
 ## Implementation Notes & Status
 - 2026-02-07: Initial draft. Covers all areas deferred by Posture RFC §9.4.
+- 2026-02-08: Second review pass. Blocking fixes: (10) Phase 4 now regenerates initrd via `chroot` + `dracut --force --regenerate-all` — the USB's initrd may have the USB root UUID baked in by dracut; without regeneration the target would fail to boot; (11) `/etc/machine-id` intentionally kept identical across USB and installed system — regenerating would break node ID derivation for carry-over; documented that USB should not be booted on same hardware after install; (12) added explicit Posture RFC state machine trace for fresh-start first boot — confirms `{DataPartitionExists: true, DataPartitionLUKS: false}` is handled correctly by Phase 2 `InitializeLUKS()`; (13) documented stale USB pool keyfile on carry-over partial failure (Phase 5-10 gap) — recovery is wipe-and-restart. Significant fixes: (14) target disk validation now checks for mounted partitions and open dm-crypt mappers before `sgdisk --zap-all`.
 - 2026-02-07: First review pass fixes. Blocking fixes: (1) admin password and mnemonic key availability for carry-over mode specified (§6.0, §13.3); (2) KDF params double-generation bug fixed — params generated once in Phase 7, passed to Phase 10 via installer state; (3) USB-specific crypto artifacts (KDF params, header backups) excluded from Phase 5 copy; (4) fresh-start partition detection compatibility with Posture RFC documented (§9.1). Significant fixes: (5) timeout handling added (§10.4) with per-phase and global timeouts; (6) MicroOS/snapper compatibility resolved — grubenv reset, snapper resumes numbering automatically; (7) GRUB config fixup expanded to replace both root and ESP UUIDs; (8) service quiescence before carry-over sync (§6.0a); (9) onboarding state transitions documented (§6 Phase 11 note).

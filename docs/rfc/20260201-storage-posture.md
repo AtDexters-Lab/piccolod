@@ -537,10 +537,7 @@ All disk prep operations must be idempotent to support repeated execution on eve
 **Important:** Data partition MUST be created before root expansion (see Section 5.2). Both operations use `calculatePartitionLayout` (§5.4) for disk-size-aware sizing.
 
 ```go
-const (
-    RootTargetSizeGB   = 20
-    MinDataPartitionGB = 5
-)
+// Constants RootTargetSizeGB and MinDataPartitionGB are defined in §5.4.
 
 // getRootPartitionStart returns the start sector of the root partition
 // using sfdisk JSON output. This is needed to compute the data partition
@@ -793,7 +790,7 @@ func (p *Preparer) ExpandRootPartition(ctx context.Context) error {
 }
 ```
 
-### 5.7 Power Failure Recovery (Phase 1)
+### 5.8 Power Failure Recovery (Phase 1)
 
 All Phase 1 operations are designed to be crash-safe and self-healing on the next boot:
 
@@ -896,7 +893,7 @@ The pool keyfile is the cross-RFC bridge between this RFC (which generates and c
 // per-node room concept within PCV.
 type PoolKeyfile struct {
     Version   int       `json:"version"`
-    KeyData   []byte    `json:"key_data"`   // 64-byte random keyfile (encrypted with SDEK)
+    KeyData   []byte    `json:"key_data"`   // SDEK-encrypted ciphertext of the 64-byte random keyfile (base64-encoded in JSON wire format)
     CreatedAt time.Time `json:"created_at"`
 }
 
@@ -915,6 +912,11 @@ func GeneratePoolKeyfile() ([]byte, error) {
 // This method is on crypt.Manager (crypto module owns the encryption).
 // Path: /piccolo-core/crypto/piccolo_data_pool_key.enc
 func (cm *crypt.Manager) StorePoolKeyfile(ctx context.Context, rawKey []byte) error
+
+// StorePoolKeyfileAt encrypts the raw keyfile with SDEK and persists it to
+// a caller-specified path. Used by the installer to write the pool keyfile
+// into the target disk's /piccolo-core layout rather than the running system.
+func (cm *crypt.Manager) StorePoolKeyfileAt(ctx context.Context, rawKey []byte, destPath string) error
 
 // UnwrapPoolKeyfile reads and decrypts the pool keyfile using the in-memory SDEK.
 // Returns the raw 64-byte key material. Caller must secureZero after use.
@@ -952,6 +954,7 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
     if err := os.WriteFile(keyfilePath, keyfile, 0600); err != nil {
         return err
     }
+    keyfileStored := false
     keyfileCleanedUp := false
     cleanupKeyfile := func() {
         if !keyfileCleanedUp {
@@ -971,11 +974,13 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
     if err := m.runner.Run(ctx, "cryptsetup", "luksFormat",
         "--type", "luks2",
         "--batch-mode",
+        "--label", "piccolo-data",
         "--cipher", "aes-xts-plain64",
         "--key-size", "512",
         "--hash", "sha512",
         "--pbkdf", "pbkdf2",
         "--pbkdf-force-iterations", "1000",
+        "--key-slot", "0",
         "--key-file", keyfilePath,
         device); err != nil {
         return err
@@ -993,6 +998,15 @@ func (m *StorageManager) InitializeLUKS(ctx context.Context, device, adminPasswo
     // every subsequent boot. Without it, the device can only unlock via password
     // (keyslot 1) or mnemonic (keyslot 2), degrading the automated boot experience.
     // Failing here halts LUKS init — the user must fix the core root before proceeding.
+    //
+    // CRASH GAP: If the process crashes between step 3 (luksFormat) and this step,
+    // the LUKS device has a valid header but the pool keyfile only existed in
+    // ephemeral tmpfs (now gone). On next boot, GetPartitionState() sees a LUKS
+    // header and attempts unlock, which fails because no key material is available.
+    // Recovery: InitializeLUKS checks for this state ("LUKS header exists but
+    // pool keyfile absent") and wipes the LUKS header via luksErase before retrying
+    // from scratch — no user data has been written yet, so this is safe.
+    // See detectOrphanedLUKSHeader() below.
     if err := m.crypto.StorePoolKeyfile(ctx, keyfile); err != nil {
         cleanupKeyfile()
         return fmt.Errorf("failed to store pool keyfile (primary unlock path): %w — "+
@@ -1078,6 +1092,28 @@ LUKS header corruption recovery → restore from backup + retry
 Hard failure → emergency mode
 ```
 
+#### Orphaned LUKS Header Detection
+
+If `InitializeLUKS` crashes between `luksFormat` (step 3) and `StorePoolKeyfile` (step 4), the LUKS device has a valid header but no persisted key material. This state is detected during Phase 2 boot sequencing:
+
+```go
+// detectOrphanedLUKSHeader returns true if the data partition has a LUKS header
+// but the pool keyfile is absent from /piccolo-core/crypto/. This indicates a
+// crash during InitializeLUKS after luksFormat but before StorePoolKeyfile.
+// Recovery: wipe the LUKS header (no data was written) and retry InitializeLUKS.
+func (m *StorageManager) detectOrphanedLUKSHeader(ctx context.Context) bool {
+    state, err := m.diskPrep.GetPartitionState(ctx)
+    if err != nil || !state.DataPartitionExists || !state.DataPartitionLUKS {
+        return false
+    }
+    poolKeyPath := paths.CoreJoin("crypto", "piccolo_data_pool_key.enc")
+    _, err = os.Stat(poolKeyPath)
+    return errors.Is(err, os.ErrNotExist)
+}
+```
+
+When detected, Phase 2 calls `cryptsetup luksErase --batch-mode <device>` to wipe the orphaned header and proceeds with `InitializeLUKS` as if no header existed. This is safe because no filesystem or user data has been written to the LUKS device at this point.
+
 #### Unlock Implementation
 
 ```go
@@ -1094,6 +1130,14 @@ Hard failure → emergency mode
 //   2. Caller calls this method to unlock /piccolo-data
 //   3. On success, caller mounts btrfs, ensures directory layout, applies NOCOW
 //   4. Caller resumes services that require /piccolo-data
+// findDataPartitionDevice locates the /piccolo-data partition on the boot disk.
+// It scans the boot disk's partitions for one matching BOTH:
+//   - GPT type code 8309 (Linux LUKS), AND
+//   - partition label "piccolo-data"
+// Requiring both signals avoids misidentifying a manually-created LUKS partition.
+// If no match is found, falls back to type code 8309 alone (covers pre-label images).
+// Returns the device path (e.g., /dev/sda3 or /dev/nvme0n1p3).
+
 func (m *StorageManager) Unlock(ctx context.Context, adminPassword string) error {
     device, err := m.findDataPartitionDevice(ctx)
     if err != nil {
@@ -1513,13 +1557,25 @@ func (m *StorageManager) resumeMnemonicRotationIfNeeded(ctx context.Context) err
 
         // Re-create keyslot 2 using the pool keyfile (always available after unlock)
         // and the current (new) mnemonic key via callback.
+        //
+        // NOTE: After a daemon restart, the mnemonic key is NOT in memory
+        // (it is only held transiently during the rotation API call). If
+        // WithMnemonicKey returns ErrNotInitialized, we defer keyslot 2
+        // recovery — the user must re-provide the mnemonic via the portal
+        // to complete the rotation. This is non-fatal: keyslot 0 (pool
+        // keyfile) remains functional for all automated unlocks.
         params, _ := readJSON[LUKSKDFParams](kdfParamsPath(dev.UUID))
         var newPass []byte
         if err := m.crypto.WithMnemonicKey(func(key []byte) error {
             newPass = DeriveMnemonicRecoveryPassphrase(key, params)
             return nil
         }); err != nil {
-            return fmt.Errorf("failed to derive mnemonic passphrase for recovery: %w", err)
+            m.logger.Warn("mnemonic key not available in memory — deferring keyslot 2 recovery; "+
+                "user must re-provide mnemonic via portal to complete rotation",
+                "device", dev.UUID, "error", err)
+            // Leave progress file in place so recovery is reattempted when
+            // the mnemonic is next provided.
+            return nil
         }
 
         m.logger.Warn("re-creating keyslot 2 via pool keyfile", "device", dev.UUID)
@@ -1648,8 +1704,15 @@ func (m *StorageManager) resumeRotationIfNeeded(ctx context.Context, currentPass
         //   since it is unaffected by password rotation).
         params, _ := readJSON[LUKSKDFParams](kdfParamsPath(dev.UUID))
         newRecovery := DeriveRecoveryPassphrase(currentPass, params)
-        err := m.changeLUKSKeyslot(ctx, dev.Path, 1, newRecovery, newRecovery)
-        if err != nil {
+
+        // Test whether keyslot 1 already has the new passphrase (rotation
+        // completed for this device before the crash). Use --test-passphrase
+        // to probe without rewriting the keyslot — luksChangeKey with
+        // identical old/new is unreliable as a no-op (rewrites anti-forensic
+        // data, stales header backups, and may be rejected by some cryptsetup
+        // versions).
+        alreadyRotated := m.testLUKSPassphrase(ctx, dev.Path, 1, newRecovery)
+        if !alreadyRotated {
             // Keyslot 1 still has the old passphrase — we don't have the old password,
             // but we can kill and re-add the keyslot using the pool keyfile (keyslot 0).
             m.logger.Warn("re-creating keyslot 1 via pool keyfile", "device", dev.UUID)
@@ -1671,12 +1734,44 @@ func (m *StorageManager) resumeRotationIfNeeded(ctx context.Context, currentPass
 **Note:** `resumeRotationIfNeeded` is called during Phase 2 unlock, after the user has provided the (current/new) admin password and the pool keyfile is available in memory. The pool keyfile (keyslot 0) serves as the stable "escape hatch" for re-creating any recovery keyslot.
 
 ```go
+// testLUKSPassphrase checks whether a passphrase opens a specific keyslot
+// without modifying the device. Returns true if the passphrase is valid.
+func (m *StorageManager) testLUKSPassphrase(ctx context.Context, device string, slot int, passphrase []byte) bool {
+    passPath := "/run/piccolo/test-passphrase"
+    if err := os.WriteFile(passPath, passphrase, 0600); err != nil {
+        return false
+    }
+    defer os.Remove(passPath)
+
+    err := m.runner.Run(ctx, "cryptsetup", "open",
+        "--test-passphrase",
+        "--key-file", passPath,
+        "--key-slot", fmt.Sprintf("%d", slot),
+        device)
+    return err == nil
+}
+
 // rekeySlotViaPoolKeyfile replaces a keyslot using the pool keyfile (keyslot 0)
 // as the existing key. Used during crash recovery when the old passphrase is
 // unknown — the pool keyfile is always available after unlock.
+//
+// This function independently materializes the pool keyfile to tmpfs rather
+// than assuming a prior caller left it there. The unlock path's keyfile is
+// cleaned up via defer before postUnlock runs, so rekeySlotViaPoolKeyfile
+// must not depend on that transient file.
 func (m *StorageManager) rekeySlotViaPoolKeyfile(ctx context.Context, device string, slot int, newPass []byte) error {
-    keyfilePath := "/run/piccolo/piccolo_data_pool_key"
-    // Pool keyfile is already materialized in tmpfs during Phase 2 unlock.
+    // Independently unwrap and materialize the pool keyfile.
+    rawKey, err := m.crypto.UnwrapPoolKeyfile(ctx)
+    if err != nil {
+        return fmt.Errorf("failed to unwrap pool keyfile for rekey: %w", err)
+    }
+    defer secureZero(rawKey)
+
+    keyfilePath := "/run/piccolo/piccolo_data_pool_key_rekey"
+    if err := os.WriteFile(keyfilePath, rawKey, 0600); err != nil {
+        return fmt.Errorf("failed to write pool keyfile to tmpfs for rekey: %w", err)
+    }
+    defer os.Remove(keyfilePath)
 
     // Remove old keyslot
     if err := m.runner.Run(ctx, "cryptsetup", "luksKillSlot",
@@ -1736,6 +1831,35 @@ func (m *StorageManager) restoreLUKSHeader(ctx context.Context, device, deviceUU
     }
 
     return nil
+}
+
+// restoreLUKSHeaderByDevice restores a LUKS header backup when the UUID is
+// unreadable from the on-disk header. It scans the backup directory for a
+// single candidate matching the device path (there should be exactly one pool
+// device per Piccolo system).
+func (m *StorageManager) restoreLUKSHeaderByDevice(ctx context.Context, device string) error {
+    backupDir := paths.CoreJoin("crypto", "luks-header-backups")
+    entries, err := os.ReadDir(backupDir)
+    if err != nil {
+        return fmt.Errorf("cannot list header backups: %w", err)
+    }
+    if len(entries) == 0 {
+        return fmt.Errorf("no LUKS header backups found in %s", backupDir)
+    }
+    // Single-device assumption: pick the only .bin backup.
+    var backupPath string
+    for _, e := range entries {
+        if filepath.Ext(e.Name()) == ".bin" {
+            if backupPath != "" {
+                return fmt.Errorf("multiple header backups found; cannot determine which belongs to %s", device)
+            }
+            backupPath = filepath.Join(backupDir, e.Name())
+        }
+    }
+    if backupPath == "" {
+        return fmt.Errorf("no .bin header backup found in %s", backupDir)
+    }
+    return m.restoreLUKSHeader(ctx, device, strings.TrimSuffix(filepath.Base(backupPath), ".bin"))
 }
 ```
 
@@ -1869,8 +1993,8 @@ Set `chattr +C` **before files are created**:
 ```go
 func (d *DiskPreparer) SetNOCOWAttributes(ctx context.Context) error {
     nocowDirs := []string{
-        "/piccolo-data/node",
-        "/piccolo-data/federation",
+        paths.DataJoin("node"),
+        paths.DataJoin("federation"),
         // Per-volume dirs set when volume is created
     }
 
@@ -2050,8 +2174,6 @@ func (m *Manager) EmergencyError() error
 // Phase 2: Post-auth operations (called from API handlers)
 func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string) error  // Phase 2: LUKS + mount
 func (m *Manager) Unlock(ctx context.Context, adminPassword string) error  // Subsequent boots
-func (m *Manager) Lock(ctx context.Context) error
-
 // Lock: graceful shutdown of /piccolo-data (see §6.8)
 func (m *Manager) Lock(ctx context.Context) error
 
@@ -2681,3 +2803,5 @@ This ensures tools are installed as dependencies of piccolod rather than relying
 - 2026-02-07: Sixth review pass (amendment decisions). Fixes: (56) `PICCOLO_BOOT_MODE_OVERRIDE` gated behind sentinel file `/etc/piccolo-test-image` — prevents misuse on production images; (57) emergency mode rewritten as differentiated hard/soft levels — soft emergency allows crypto unlock on previously-set-up devices where LUKS may still work; (58) Phase 1 retries added (3 attempts, 2s backoff) before entering emergency; (59) hardcoded paths fixed: `"/piccolo-core/crypto/luks-rotation-progress.json"` → `paths.CoreJoin(...)` in `OnAdminPasswordRotated` and `resumeRotationIfNeeded`; `"/piccolo-core"` → `paths.CoreRoot()` in `VerifyPiccoloCoreExists`; (60) future work items added: in-place encryption not applicable (two-root design), stolen lock deferred to orchestrator RFC.
 - 2026-02-07: Seventh review pass (critical decision amendments). Fixes: (61) `isOnboardingComplete()` replaced with `isPreviouslySetUp()` using dual-signal detection — checks both onboarding.json AND LUKS header existence; hard emergency only when both signals say "never set up" (D3); (62) pool keyfile storage failure in `InitializeLUKS` is now fatal — halts LUKS init instead of warn-only, since the pool keyfile is the primary unlock path for every subsequent boot (D4); (63) full `Unlock()` specification added as §6.3a — keyslot attempt order (pool keyfile → admin password → header recovery → mnemonic), error taxonomy per keyslot failure, LUKS header corruption detection and recovery, integration with Foundation RFC Phase 2 sequencing (D5); (64) pool keyfile wire format fully specified in §6.2.1 — encoding (base64 JSON), length (64 bytes), permissions (0600), generation method (CSPRNG), encryption (SDEK-wrapped), `StorePoolKeyfile`/`UnwrapPoolKeyfile` API contract; Foundation RFC references this section (D6).
 - 2026-02-07: Fifth review pass (combined assessment). Fixes: (48) `GetPartitionState` root expansion check now uses `calculatePartitionLayout` instead of fixed `RootTargetSizeGB` — ensures consistency on small disks with proportional 70% split; (49) `PICCOLO_BOOT_MODE_OVERRIDE` env var for CI/QA unattended provisioning in VMs; (50) `getLUKSUUID` error handling changed from silent discard to fail-fast — UUID is the KDF salt anchor; (51) `getDiskSizeGB` uses ceiling division to avoid under-counting fractional GBs; (52) Phase 1 `PreparePartitioning` now wraps context with 5-minute timeout; (53) mnemonic rotation (`OnRecoveryMnemonicRotated`) updated to callback-based pattern matching `WithSDEK`/`WithMnemonicKey`, with crash recovery progress tracking (§6.5.1) matching password rotation pattern; (54) `CommandRunner` interface consolidation note — legacy `commandRunner` in `file_volume_manager.go` should be migrated to shared definition; (55) `secureZero`/`zeroBytes` consolidation note added to §10.2.
+- 2026-02-08: Eighth review pass. Blocking fixes: (65) `rekeySlotViaPoolKeyfile` now independently materializes the pool keyfile via `UnwrapPoolKeyfile` instead of assuming a prior caller left it in tmpfs — the unlock path's keyfile is cleaned up via defer before `postUnlock` runs; (66) password rotation crash recovery now uses `testLUKSPassphrase` (`cryptsetup open --test-passphrase`) to probe keyslot state instead of `luksChangeKey` with identical old/new passphrase — avoids unreliable no-op behavior and stale header backups. Significant fixes: (67) added `detectOrphanedLUKSHeader` for crash gap between `luksFormat` and `StorePoolKeyfile` — wipes orphaned LUKS header and retries `InitializeLUKS`; (68) mnemonic rotation crash recovery now handles daemon-restart case where mnemonic key is not in memory — defers recovery with warning instead of failing, leaves progress file for retry; (69) hardcoded paths in `SetNOCOWAttributes` replaced with `paths.DataJoin()`; (70) `findDataPartitionDevice` behavior specified — scans boot disk for GPT type code 8309 + label "piccolo-data"; (71) `luksFormat` now uses `--label piccolo-data` and `--key-slot 0` explicitly.
+- 2026-02-08: Ninth review pass. Should-fix items: (72) removed duplicate `RootTargetSizeGB`/`MinDataPartitionGB` constants in §5.7 (reference §5.4 instead); (73) `KeyData` field comment clarified as SDEK-encrypted ciphertext; (74) `keyfileStored` variable declared in `InitializeLUKS`; (75) `restoreLUKSHeaderByDevice` defined for UUID-unreadable header recovery; (76) `StorePoolKeyfileAt` variant added to `crypt.Manager` API; (77) duplicate §5.7 renumbered to §5.8; (78) duplicate `Lock` method declaration removed; (79) Implementation Notes reordered chronologically.
