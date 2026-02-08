@@ -59,7 +59,7 @@ Constructs `podman create` arguments. Currently passes `--memory` and `--cpus` f
 
 ### 4.7 Networking (`internal/app/netavark_repair.go`)
 
-`flushAndReloadNetavarkRules()` runs at startup to clean stale nftables DNAT rules left by netavark (rootful Podman's network backend). It calls `nft flush table` and `podman network reload`. This is rootful-specific — rootless Podman uses `pasta`/`slirp4netns` instead of netavark.
+`flushAndReloadNetavarkRules()` runs at startup to clean stale nftables DNAT rules left by netavark (rootful Podman's network backend). It calls `nft delete table` and `podman network reload`. This is rootful-specific — rootless Podman uses `pasta`/`slirp4netns` instead of netavark.
 
 ### 4.8 Workspace fuse-overlayfs (`internal/app/workspacedisk/mount.go:156`)
 
@@ -101,7 +101,7 @@ Only Podman CLI commands switch to `piccolo-runtime`. Everything else remains ro
 | `podman image mount/unmount` (workspace) | root | Overlay driver requires root for image mount (see 4.9); mounted paths accessible to `piccolo-runtime` via `-allow_other` on underlying FUSE mounts |
 | `podman create/start/stop/rm/pull/...` | piccolo-runtime | Container lifecycle — the security boundary |
 | `podman exec` (terminal sessions) | piccolo-runtime | Runs inside container namespace |
-| `nft flush` (netavark repair) | root | nftables management (conditional, see 5.12) |
+| `nft delete` (netavark repair) | root | nftables management (conditional, see 5.12) |
 
 ### 5.3 Credential resolution at initialization
 
@@ -395,7 +395,7 @@ Switching from rootful to rootless Podman changes the networking backend:
 **`127.0.0.1` port binding**: The existing pattern `--publish 127.0.0.1:<host>:<guest>` continues to work under rootless+pasta. The port is bound on the host's loopback interface by `pasta`, and piccolod's reverse proxy connects to it as before. No change needed in `buildCreateArgs()` or `internal/services/`.
 
 **Netavark repair becomes conditional**: `flushAndReloadNetavarkRules()` in `internal/app/netavark_repair.go` is rootful-specific. Under rootless mode:
-- The `nft flush table netavark` step is a no-op (the table won't exist).
+- The `nft delete table netavark` step is a no-op (the table won't exist).
 - `podman network reload` has no equivalent behavior under pasta.
 
 The function should be skipped when running in rootless mode:

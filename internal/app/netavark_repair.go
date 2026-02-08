@@ -15,13 +15,18 @@ import (
 // rule, the stale rule sits higher in the chain and matches first, causing 502s.
 //
 // Strategy:
-//  1. Flush the entire netavark nftables table (wipes all rules).
+//  1. Delete the entire netavark nftables table (removes all chains and rules).
+//     We must use "delete table" rather than "flush table" because flush preserves
+//     empty chain structures. Netavark's idempotency checks see the existing chains
+//     and skip recreating per-network masquerade rules, breaking outbound container
+//     connectivity.
 //  2. Reload network configuration for every running network anchor so their
-//     rules are recreated fresh.
+//     rules are recreated fresh (netavark recreates the table and all chains from
+//     scratch since they no longer exist).
 func (m *AppManager) flushAndReloadNetavarkRules(ctx context.Context) {
-	// Step 1: Flush the netavark nftables table.
+	// Step 1: Delete the netavark nftables table.
 	// All failures are logged internally and treated as non-fatal.
-	flushNetavarkTable(ctx)
+	deleteNetavarkTable(ctx)
 
 	// Step 2: Reload network for all running anchors.
 	// Use ensureStateManager to initialize state if needed (first call at startup).
@@ -65,27 +70,31 @@ func (m *AppManager) flushAndReloadNetavarkRules(ctx context.Context) {
 	}
 }
 
-// flushNetavarkTable flushes all netavark nftables rules across all table families.
+// deleteNetavarkTable deletes all netavark nftables tables across all table families.
 // Netavark may use "inet" (newer) or "ip"/"ip6" (older) table families depending
 // on version. We try all three; missing tables are treated as benign.
 // All failures are non-fatal since reloading running containers still provides value.
-func flushNetavarkTable(ctx context.Context) {
+//
+// We use "delete table" (not "flush table") because flush preserves empty chain
+// structures that poison netavark's idempotency checks, preventing it from
+// recreating per-network masquerade rules on subsequent container operations.
+func deleteNetavarkTable(ctx context.Context) {
 	nftPath, err := exec.LookPath("nft")
 	if err != nil {
-		log.Printf("INFO: nft binary not found, skipping netavark flush (no nftables = no stale rules)")
+		log.Printf("INFO: nft binary not found, skipping netavark cleanup (no nftables = no stale rules)")
 		return
 	}
 
 	// Try all table families — netavark version determines which exists.
 	for _, family := range []string{"inet", "ip", "ip6"} {
-		flushNftTable(ctx, nftPath, family, "netavark")
+		deleteNftTable(ctx, nftPath, family, "netavark")
 	}
 }
 
-// flushNftTable flushes a single nftables table. Missing tables are logged at INFO
+// deleteNftTable deletes a single nftables table. Missing tables are logged at INFO
 // level; other failures are logged as warnings.
-func flushNftTable(ctx context.Context, nftPath, family, table string) {
-	cmd := exec.CommandContext(ctx, nftPath, "flush", "table", family, table)
+func deleteNftTable(ctx context.Context, nftPath, family, table string) {
+	cmd := exec.CommandContext(ctx, nftPath, "delete", "table", family, table)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outStr := strings.ToLower(string(output))
@@ -93,8 +102,8 @@ func flushNftTable(ctx context.Context, nftPath, family, table string) {
 			(strings.Contains(outStr, "table") && strings.Contains(outStr, "does not exist")) {
 			return
 		}
-		log.Printf("WARN: nft flush table %s %s failed: %s", family, table, strings.TrimSpace(string(output)))
+		log.Printf("WARN: nft delete table %s %s failed: %s", family, table, strings.TrimSpace(string(output)))
 		return
 	}
-	log.Printf("INFO: flushed netavark nftables table %s %s", family, table)
+	log.Printf("INFO: deleted netavark nftables table %s %s", family, table)
 }
