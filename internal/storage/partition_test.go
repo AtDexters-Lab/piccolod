@@ -121,9 +121,10 @@ func TestGetRootDevice_StripsBtrfsSubvolume(t *testing.T) {
 	}
 }
 
-func TestParseSfdiskJSON(t *testing.T) {
+func TestParseSfdiskJSON_GPT(t *testing.T) {
 	data := SfdiskOutput{}
 	data.PartitionTable.SectorSize = 512
+	data.PartitionTable.Label = PartitionTableGPT
 	data.PartitionTable.Partitions = []SfdiskPartition{
 		{Node: "/dev/sda1", Start: 2048, Size: 1048576, Type: "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"},
 		{Node: "/dev/sda2", Start: 1050624, Size: 41943040, Type: "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709"},
@@ -140,8 +141,55 @@ func TestParseSfdiskJSON(t *testing.T) {
 	if got.PartitionTable.SectorSize != 512 {
 		t.Errorf("SectorSize = %d, want 512", got.PartitionTable.SectorSize)
 	}
+	if got.PartitionTable.Label != PartitionTableGPT {
+		t.Errorf("Label = %q, want %q", got.PartitionTable.Label, PartitionTableGPT)
+	}
+	if !got.IsGPT() {
+		t.Error("IsGPT() = false, want true")
+	}
+	if got.IsMBR() {
+		t.Error("IsMBR() = true, want false")
+	}
 	if got.PartitionTable.Partitions[1].Node != "/dev/sda2" {
 		t.Errorf("second partition node = %q, want /dev/sda2", got.PartitionTable.Partitions[1].Node)
+	}
+}
+
+func TestParseSfdiskJSON_MBR(t *testing.T) {
+	// Real sfdisk -J output from an RPi MBR disk
+	raw := []byte(`{
+		"partitiontable": {
+			"label": "dos",
+			"sectorsize": 512,
+			"partitions": [
+				{"node": "/dev/mmcblk0p1", "start": 8192, "size": 524288, "type": "c"},
+				{"node": "/dev/mmcblk0p2", "start": 532480, "size": 4194304, "type": "83"}
+			]
+		}
+	}`)
+
+	got, err := ParseSfdiskJSON(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.PartitionTable.Label != PartitionTableMBR {
+		t.Errorf("Label = %q, want %q", got.PartitionTable.Label, PartitionTableMBR)
+	}
+	if !got.IsMBR() {
+		t.Error("IsMBR() = false, want true")
+	}
+	if got.IsGPT() {
+		t.Error("IsGPT() = true, want false")
+	}
+	if len(got.PartitionTable.Partitions) != 2 {
+		t.Fatalf("expected 2 partitions, got %d", len(got.PartitionTable.Partitions))
+	}
+	// MBR type codes are hex strings, not GUIDs
+	if got.PartitionTable.Partitions[0].Type != "c" {
+		t.Errorf("partition 1 type = %q, want \"c\" (FAT32 LBA)", got.PartitionTable.Partitions[0].Type)
+	}
+	if got.PartitionTable.Partitions[1].Type != "83" {
+		t.Errorf("partition 2 type = %q, want \"83\" (Linux)", got.PartitionTable.Partitions[1].Type)
 	}
 }
 

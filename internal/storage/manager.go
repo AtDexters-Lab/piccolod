@@ -341,6 +341,12 @@ func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string
 		return fmt.Errorf("unlock after init: %w", err)
 	}
 
+	// Create btrfs filesystem on the freshly initialized LUKS container.
+	mapperPath := luks.MapperPath(0)
+	if err := m.run.Run(ctx, "mkfs.btrfs", "-L", "piccolo-data", mapperPath); err != nil {
+		return fmt.Errorf("mkfs.btrfs on data pool: %w", err)
+	}
+
 	if err := m.luksPool.MountDataPool(ctx); err != nil {
 		return fmt.Errorf("mount data pool: %w", err)
 	}

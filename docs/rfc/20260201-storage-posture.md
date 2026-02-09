@@ -269,15 +269,15 @@ Phase 1 disk preparation assumes the following preconditions are met by the OS i
 
 | Precondition | Expected | Checked by |
 |---|---|---|
-| Partition table type | GPT | `sgdisk -p` (fails on MBR) |
-| ESP partition | Slot 1, FAT32, ~512MB | KIWI image build |
-| Root partition | Slot 2, btrfs, MicroOS snapshots | KIWI image build |
+| Partition table type | GPT or MBR (dos) | `sfdisk -J` label field; dispatches to `sgdisk` (GPT) or `sfdisk -N` (MBR) |
+| Boot partition | Slot 1, FAT32 (ESP on GPT, type 0xC on MBR) | OS image build |
+| Root partition | Slot 2, btrfs, MicroOS snapshots | OS image build |
 | Root filesystem | btrfs with `/piccolo-core` subvolume | `btrfs subvolume show /piccolo-core` |
 | No stacking layers | No dm-crypt, LVM, or MD-RAID on the boot disk | `lsblk -ndo TYPE` (expect `disk`/`part` only) |
 
 If any precondition is violated, `PreparePartitioning` enters Emergency Mode (§12.3) with a diagnostic message identifying which check failed.
 
-**Why GPT:** `sgdisk` operates exclusively on GPT tables. MBR disks are not supported and would fail at the partition creation step. All piccolo-os images use GPT.
+**GPT and MBR support:** `CreateDataPartition` reads the partition table label via `sfdisk -J` and dispatches to the appropriate tool: `sgdisk` for GPT disks (includes backup GPT repair via `sgdisk -e`) or `sfdisk -N` for MBR disks. MBR support is required because the RPi 4 bootrom cannot reliably boot from GPT on SD cards. MBR is limited to 4 primary partitions (boot + root + data fits within this limit). Extended/logical MBR partitions are not supported.
 
 ### 5.1 Overview
 

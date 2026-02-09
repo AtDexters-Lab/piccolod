@@ -124,13 +124,28 @@ func isDigits(s string) bool {
 	return true
 }
 
+// PartitionTableType represents the partition table label from sfdisk.
+type PartitionTableType string
+
+const (
+	PartitionTableGPT PartitionTableType = "gpt"
+	PartitionTableMBR PartitionTableType = "dos"
+)
+
 // SfdiskOutput represents the JSON output of sfdisk -J.
 type SfdiskOutput struct {
 	PartitionTable struct {
-		SectorSize int              `json:"sectorsize"`
-		Partitions []SfdiskPartition `json:"partitions"`
+		SectorSize int                `json:"sectorsize"`
+		Label      PartitionTableType `json:"label"`
+		Partitions []SfdiskPartition  `json:"partitions"`
 	} `json:"partitiontable"`
 }
+
+// IsGPT returns true if the partition table is GPT.
+func (s SfdiskOutput) IsGPT() bool { return s.PartitionTable.Label == PartitionTableGPT }
+
+// IsMBR returns true if the partition table is MBR (dos).
+func (s SfdiskOutput) IsMBR() bool { return s.PartitionTable.Label == PartitionTableMBR }
 
 // SfdiskPartition is a single partition entry from sfdisk -J.
 type SfdiskPartition struct {
