@@ -3,6 +3,7 @@ package luks
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -100,16 +101,42 @@ func TestPoolManager_isMapperActive(t *testing.T) {
 }
 
 func TestPoolManager_DetectOrphanedLUKSHeader(t *testing.T) {
-	core, _ := paths.SetRootsForTest(t)
-	_ = core
+	t.Run("LUKS_header_no_keyfile", func(t *testing.T) {
+		paths.SetRootsForTest(t)
+		// cryptsetup isLuks succeeds (device has LUKS header), no pool keyfile → orphaned.
+		run := &fakeRunner{}
+		mgr := NewPoolManager(run, nil)
+		if !mgr.DetectOrphanedLUKSHeader("/dev/sda4") {
+			t.Error("expected orphaned when LUKS header exists but no pool keyfile")
+		}
+	})
 
-	run := &fakeRunner{}
-	mgr := NewPoolManager(run, nil)
+	t.Run("no_LUKS_header", func(t *testing.T) {
+		paths.SetRootsForTest(t)
+		// cryptsetup isLuks fails (fresh partition, no LUKS) → NOT orphaned.
+		run := &fakeRunner{
+			errs: map[string]error{
+				"cryptsetup isLuks /dev/sda4": fmt.Errorf("exit status 1"),
+			},
+		}
+		mgr := NewPoolManager(run, nil)
+		if mgr.DetectOrphanedLUKSHeader("/dev/sda4") {
+			t.Error("expected not orphaned when no LUKS header on device")
+		}
+	})
 
-	// No pool keyfile → orphaned.
-	if !mgr.DetectOrphanedLUKSHeader("/dev/sda3") {
-		t.Error("expected orphaned header when no pool keyfile")
-	}
+	t.Run("LUKS_header_with_keyfile", func(t *testing.T) {
+		core, _ := paths.SetRootsForTest(t)
+		// Create pool keyfile → healthy state, NOT orphaned.
+		cryptoDir := core + "/crypto"
+		_ = os.MkdirAll(cryptoDir, 0o700)
+		_ = os.WriteFile(cryptoDir+"/piccolo_data_pool_key.enc", []byte("key"), 0o600)
+		run := &fakeRunner{} // isLuks succeeds (has LUKS header)
+		mgr := NewPoolManager(run, nil)
+		if mgr.DetectOrphanedLUKSHeader("/dev/sda4") {
+			t.Error("expected not orphaned when LUKS header and keyfile both exist")
+		}
+	})
 }
 
 func TestContains(t *testing.T) {

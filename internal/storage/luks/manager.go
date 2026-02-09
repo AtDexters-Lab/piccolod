@@ -316,7 +316,14 @@ func (m *PoolManager) TestPassphrase(ctx context.Context, device string, slot in
 }
 
 // DetectOrphanedLUKSHeader checks if a device has a LUKS header but no pool keyfile.
+// An orphan means a previous init wrote the LUKS header but crashed before persisting
+// the pool keyfile. A fresh partition (no LUKS header) is NOT orphaned.
 func (m *PoolManager) DetectOrphanedLUKSHeader(device string) bool {
+	// Must have a LUKS header on the device.
+	if err := m.run.Run(context.Background(), "cryptsetup", "isLuks", device); err != nil {
+		return false // no LUKS header → not orphaned
+	}
+	// LUKS header exists but no pool keyfile → orphaned.
 	poolKeyPath := paths.CoreJoin("crypto", "piccolo_data_pool_key.enc")
 	_, err := os.Stat(poolKeyPath)
 	return errors.Is(err, os.ErrNotExist)

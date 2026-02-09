@@ -2,7 +2,7 @@
 # dev-vm-test.sh — Run e2e observation tests against a running Piccolo OS VM.
 #
 # Usage:
-#   ./scripts/dev-vm-test.sh <IP>              # run all stages
+#   ./scripts/dev-vm-test.sh <IP>              # run all stages (VM stays running)
 #   ./scripts/dev-vm-test.sh <IP> boot         # stage 1: boot & phase 1
 #   ./scripts/dev-vm-test.sh <IP> pre-setup    # stage 2: pre-setup gating
 #   ./scripts/dev-vm-test.sh <IP> setup        # stage 3: first-run setup (creates password!)
@@ -10,6 +10,8 @@
 #   ./scripts/dev-vm-test.sh <IP> pcv          # stage 5: PCV mutation & export
 #   ./scripts/dev-vm-test.sh <IP> reboot       # stage 6: reboot & unlock cycle
 #   ./scripts/dev-vm-test.sh <IP> edge         # stage 7: edge cases
+#   ./scripts/dev-vm-test.sh <IP> vdi          # stage 8: VDI post-mortem (powers off VM!)
+#   ./scripts/dev-vm-test.sh <IP> full         # all stages including VDI (powers off VM!)
 set -euo pipefail
 
 IP="${1:?Usage: $0 <VM_IP> [stage]}"
@@ -192,6 +194,14 @@ stage_setup() {
   emerg=$(api "/api/v1/system/emergency")
   check "3.6" "Emergency still false" "$emerg" '"emergency":false'
 
+  # LUKS init is async — retry up to 30s
+  for i in $(seq 1 30); do
+    health=$(api "/api/v1/health/detail")
+    echo "$health" | grep -qF '"LUKS initialized and mounted"' && break
+    sleep 1
+  done
+  check "3.7" "LUKS data volume initialized" "$health" '"LUKS initialized and mounted"'
+
   echo -e "\n  ${CYAN}Raw health post-setup:${NC}"
   apij "/api/v1/health/detail"
   echo -e "\n  ${CYAN}Raw crypto status:${NC}"
@@ -350,6 +360,14 @@ stage_reboot() {
   ready=$(api "/api/v1/health/ready")
   check "6.9" "Health ready after unlock" "$ready" '"ready":true'
 
+  # LUKS unlock+mount is async — retry up to 30s
+  for i in $(seq 1 30); do
+    health=$(api "/api/v1/health/detail")
+    echo "$health" | grep -qF '"LUKS unlocked and mounted"' && break
+    sleep 1
+  done
+  check "6.10" "LUKS data volume mounted" "$health" '"LUKS unlocked and mounted"'
+
   echo -e "\n  ${CYAN}Raw health post-reboot-unlock:${NC}"
   apij "/api/v1/health/detail"
 }
@@ -381,6 +399,123 @@ stage_edge() {
 }
 
 # ─────────────────────────────────────────────────────────
+# Stage 8: VDI Post-Mortem
+# ─────────────────────────────────────────────────────────
+stage_vdi() {
+  echo -e "\n${CYAN}═══ Stage 8: VDI Post-Mortem ═══${NC}"
+
+  local VM_STATE="/tmp/claude/piccolo-e2e/vm-name"
+  local VDI_WORK="/tmp/claude/piccolo-e2e/piccolo-os.vdi"
+  local NBD_DEV="/dev/nbd0"
+  local BASE_PART_COUNT=3  # ESP(p1) + BIOS(p2) + root(p3)
+  local nbd_connected=0
+
+  if [[ ! -f "$VM_STATE" ]]; then
+    skip "8.x" "VDI post-mortem" "No VM state file (manual VM?)"
+    return
+  fi
+
+  # Cache sudo credentials upfront — avoids repeated prompts during NBD/cryptsetup calls.
+  sudo -v
+
+  local VM_NAME
+  VM_NAME=$(cat "$VM_STATE")
+
+  # Cleanup trap — disconnects NBD on any failure, signal, or early return.
+  # Uses ${var:-0} because EXIT trap may fire outside function scope where locals are gone.
+  cleanup_nbd() {
+    if [[ ${nbd_connected:-0} -eq 1 ]]; then
+      sudo qemu-nbd --disconnect "${NBD_DEV:-/dev/nbd0}" 2>/dev/null || true
+      nbd_connected=0
+    fi
+  }
+  trap cleanup_nbd RETURN INT TERM EXIT
+
+  # --- 8.1: Power off VM and wait for full stop ---
+  echo -e "  ${CYAN}INFO${NC} Powering off VM: $VM_NAME"
+  VBoxManage controlvm "$VM_NAME" poweroff 2>/dev/null || true
+
+  local vm_stopped=0
+  for i in $(seq 1 30); do
+    local state
+    state=$(VBoxManage showvminfo "$VM_NAME" --machinereadable 2>/dev/null \
+      | grep '^VMState=' | cut -d'"' -f2)
+    if [[ "$state" == "poweroff" || "$state" == "aborted" ]]; then
+      vm_stopped=1
+      break
+    fi
+    sleep 1
+  done
+  sleep 2  # Grace period for VBox to release file locks
+
+  if [[ $vm_stopped -eq 1 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [8.1] VM powered off"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [8.1] VM did not stop within 30s"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+
+  # --- 8.2: Mount VDI via NBD ---
+  sudo modprobe nbd max_part=16
+  sudo qemu-nbd --disconnect "$NBD_DEV" 2>/dev/null || true
+  if sudo qemu-nbd --connect="$NBD_DEV" "$VDI_WORK"; then
+    nbd_connected=1
+    sleep 1
+    echo -e "  ${GREEN}PASS${NC} [8.2] VDI mounted via NBD"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [8.2] Failed to mount VDI via NBD"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+
+  # --- 8.3: Check data partition exists ---
+  local sfdisk_json data_node
+  sfdisk_json=$(sudo sfdisk -J "$NBD_DEV" 2>/dev/null)
+  data_node=$(echo "$sfdisk_json" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    parts = data['partitiontable']['partitions']
+    if len(parts) <= $BASE_PART_COUNT:
+        print('ERROR: only ' + str(len(parts)) + ' partitions found')
+        sys.exit(0)
+    last = max(parts, key=lambda p: p.get('start', 0))
+    node = last.get('node', '')
+    if not node:
+        print('ERROR: no node in partition data')
+        sys.exit(0)
+    print(node)
+except (KeyError, ValueError, IndexError) as e:
+    print(f'ERROR: {e}')
+    sys.exit(0)
+" 2>/dev/null)
+
+  if [[ -n "$data_node" && "$data_node" != ERROR* ]]; then
+    echo -e "  ${GREEN}PASS${NC} [8.3] Data partition exists: $data_node"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [8.3] Data partition not found (expected >$BASE_PART_COUNT partitions)"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+
+  # --- 8.4: Verify LUKS2 header on data partition ---
+  local luks_output luks_exit=0
+  luks_output=$(sudo cryptsetup isLuks --type luks2 "$data_node" 2>&1) || luks_exit=$?
+  if [[ $luks_exit -eq 0 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [8.4] Data partition has LUKS2 header"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [8.4] Data partition missing LUKS2 header (exit $luks_exit)"
+    echo -e "       output: $luks_output"
+    ((FAIL_COUNT++)) || true
+  fi
+}
+
+# ─────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────
 mkdir -p "$(dirname "$COOKIE_JAR")"
@@ -393,7 +528,13 @@ case "$STAGE" in
   pcv)        stage_pcv ;;
   reboot)     stage_reboot ;;
   edge)       stage_edge ;;
-  all)
+  vdi)        stage_vdi ;;
+  full)
+    stage_boot; stage_pre_setup; stage_setup; stage_post_setup
+    stage_pcv; stage_reboot; stage_edge
+    stage_vdi    # last — powers off VM
+    ;;
+  all)         # stages 1-7, VM remains running
     stage_boot
     stage_pre_setup
     stage_setup
@@ -404,7 +545,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid stages: boot pre-setup setup post-setup pcv reboot edge all"
+    echo "Valid stages: boot pre-setup setup post-setup pcv reboot edge vdi full all"
     exit 1
     ;;
 esac
