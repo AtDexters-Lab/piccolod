@@ -584,7 +584,7 @@ func (p *PodmanCLI) StartContainer(ctx context.Context, runtime PodmanRuntime, c
 // Uses a 30-second timeout to allow containers to gracefully shutdown.
 func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, containerID string) error {
 	if !isValidContainerID(containerID) {
-		return fmt.Errorf("invalid container ID format: %s", containerID)
+		return &ContainerNotFoundError{Ref: containerID}
 	}
 
 	args, err := buildPodmanArgs(runtime, []string{"stop", "--time", "30", containerID})
@@ -595,7 +595,14 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		return fmt.Errorf("podman stop failed: %w, output: %s", err, string(output))
+		outStr := string(output)
+		// Detect "no such container" errors and return typed error.
+		// Use case-insensitive matching for robustness across Podman versions.
+		lower := strings.ToLower(outStr)
+		if strings.Contains(lower, "no such container") || strings.Contains(lower, "no container with") {
+			return &ContainerNotFoundError{Ref: containerID}
+		}
+		return fmt.Errorf("podman stop failed: %w, output: %s", err, outStr)
 	}
 
 	return nil
@@ -605,7 +612,7 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 // Returns ContainerNotFoundError if the container does not exist.
 func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, containerID string) error {
 	if !isValidContainerID(containerID) {
-		return fmt.Errorf("invalid container ID format: %s", containerID)
+		return &ContainerNotFoundError{Ref: containerID}
 	}
 
 	args, err := buildPodmanArgs(runtime, []string{"rm", containerID})
@@ -1035,6 +1042,37 @@ func (p *PodmanCLI) UpdatePublishAdd(ctx context.Context, runtime PodmanRuntime,
 // This function returns ErrDynamicPortUpdateNotSupported. Port changes require container recreation.
 func (p *PodmanCLI) UpdatePublishRemove(ctx context.Context, runtime PodmanRuntime, containerID string, hostBind, guestPort int) error {
 	return ErrDynamicPortUpdateNotSupported
+}
+
+// NetworkReload tears down and re-creates network configuration (nftables rules,
+// interfaces) for a running container. Treats "container not running" as non-fatal.
+func (p *PodmanCLI) NetworkReload(ctx context.Context, runtime PodmanRuntime, containerNameOrID string) error {
+	if containerNameOrID == "" {
+		return fmt.Errorf("container name or ID required")
+	}
+	// Accept both container IDs and names; validate whichever format applies.
+	if !isValidContainerID(containerNameOrID) {
+		if err := ValidateContainerName(containerNameOrID); err != nil {
+			return fmt.Errorf("invalid container reference: %w", err)
+		}
+	}
+
+	args, err := buildPodmanArgs(runtime, []string{"network", "reload", containerNameOrID})
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		outStr := strings.ToLower(string(output))
+		// Treat "not running" as non-fatal — container may have been stopped between check and reload
+		if strings.Contains(outStr, "not running") || strings.Contains(outStr, "is not running") {
+			log.Printf("INFO: network reload skipped for %s: container not running", containerNameOrID)
+			return nil
+		}
+		return fmt.Errorf("podman network reload failed: %w, output: %s", err, string(output))
+	}
+	return nil
 }
 
 // ResetStorage cleans up container references for this runtime's storage.

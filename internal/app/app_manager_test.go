@@ -13,6 +13,7 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/cluster"
+	"piccolod/internal/container"
 	"piccolod/internal/events"
 	"piccolod/internal/persistence"
 	"piccolod/internal/router"
@@ -92,11 +93,10 @@ func allowHostStorage(t *testing.T, m *AppManager) {
 		_ = os.RemoveAll(runtimeDir)
 	})
 	if m.stateBaseDir != "" {
-		t.Setenv("PICCOLO_STATE_DIR", m.stateBaseDir)
 		shortRunroot := filepath.Join(os.TempDir(), "piccolo-podman-runroot")
 		_ = os.MkdirAll(shortRunroot, 0o755)
 		t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", shortRunroot)
-		paths.SetRootForTest(m.stateBaseDir)
+		paths.SetCoreRootForTest(t, m.stateBaseDir)
 		m.SetVolumeManager(&stubVolumeManager{root: m.stateBaseDir})
 	}
 	m.SetMountVerifier(func(string) error { return nil })
@@ -136,19 +136,7 @@ func TestAppManager_LazyStateInitialization(t *testing.T) {
 
 func TestAppManager_DefaultStateDirWhenEmpty(t *testing.T) {
 	tempDir := t.TempDir()
-	prev, had := os.LookupEnv("PICCOLO_STATE_DIR")
-	if err := os.Setenv("PICCOLO_STATE_DIR", tempDir); err != nil {
-		t.Fatalf("set env: %v", err)
-	}
-	paths.SetRootForTest(tempDir)
-	t.Cleanup(func() {
-		if had {
-			_ = os.Setenv("PICCOLO_STATE_DIR", prev)
-		} else {
-			_ = os.Unsetenv("PICCOLO_STATE_DIR")
-		}
-		paths.SetRootForTest("")
-	})
+	paths.SetCoreRootForTest(t, tempDir)
 
 	mock := NewMockContainerManager()
 	manager, err := NewAppManager(mock, "")
@@ -1528,8 +1516,7 @@ func TestAppManager_StopAllApps_StateManagerNotInitialized(t *testing.T) {
 func TestAppManager_MetadataMigration(t *testing.T) {
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
-	paths.SetRootForTest(tempDir)
-	t.Cleanup(func() { paths.SetRootForTest("") })
+	paths.SetCoreRootForTest(t, tempDir)
 
 	appsDir := filepath.Join(tempDir, AppsDir)
 	_ = os.MkdirAll(appsDir, 0o755)
@@ -1591,5 +1578,194 @@ func TestAppManager_MetadataMigration(t *testing.T) {
 		if app.Status != "" {
 			t.Errorf("app %s: expected Status empty from disk, got %q", tc.instanceID, app.Status)
 		}
+	}
+}
+
+func TestUninstall_ImagePruning(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+
+	makeManager := func(t *testing.T) (*AppManager, *MockContainerManager, string) {
+		t.Helper()
+		tempDir := t.TempDir()
+		paths.SetCoreRootForTest(t, tempDir)
+
+		mock := NewMockContainerManager()
+		mgr, err := NewAppManager(mock, tempDir)
+		if err != nil {
+			t.Fatalf("NewAppManager: %v", err)
+		}
+		allowHostStorage(t, mgr)
+		mgr.ForceLockState(false)
+		// Inject a test image runtime so tests don't need fuse-overlayfs
+		mgr.SetImageRuntimeForTest(container.PodmanRuntime{
+			Root:          filepath.Join(tempDir, "podman", "image-root"),
+			RunRoot:       filepath.Join(tempDir, "run", "podman", "image-root"),
+			Imagestore:    filepath.Join(tempDir, "podman", "imagestore"),
+			StorageDriver: "overlay",
+		})
+		return mgr, mock, tempDir
+	}
+
+	// Install apps in service mode (works without workspace disk setup).
+	installApp := func(t *testing.T, mgr *AppManager, name, image string) {
+		t.Helper()
+		def := &api.AppDefinition{
+			Type:      "user",
+			Listeners: []api.AppListener{{Name: name, GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
+			Services: map[string]api.AppService{
+				"main": {Image: image, BindPorts: []int{80}},
+			},
+			Extensions: map[string]interface{}{"mode": "service"},
+		}
+		if _, err := mgr.Install(context.Background(), def); err != nil {
+			t.Fatalf("install %s: %v", name, err)
+		}
+	}
+
+	patchToWorkspaceMode := func(t *testing.T, mgr *AppManager, instanceID string) {
+		t.Helper()
+		state, err := mgr.ensureStateManager()
+		if err != nil {
+			t.Fatalf("ensureStateManager: %v", err)
+		}
+		app, ok := state.GetApp(instanceID)
+		if !ok {
+			t.Fatalf("app %s not found", instanceID)
+		}
+		app.Definition.Extensions["mode"] = "workspace"
+		if err := state.StoreApp(app); err != nil {
+			t.Fatalf("StoreApp: %v", err)
+		}
+	}
+
+	t.Run("prunes_orphaned_images", func(t *testing.T) {
+		mgr, mock, _ := makeManager(t)
+		ctx := context.Background()
+
+		installApp(t, mgr, "appa", "nginx:latest")
+		installApp(t, mgr, "appb", "postgres:16")
+
+		if err := mgr.Uninstall(ctx, "appb"); err != nil {
+			t.Fatalf("uninstall: %v", err)
+		}
+
+		// postgres:16 should be pruned (only appb used it)
+		found := false
+		for _, img := range mock.removedImages {
+			if img == "postgres:16" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected postgres:16 to be pruned, removedImages=%v", mock.removedImages)
+		}
+	})
+
+	t.Run("keeps_shared_images", func(t *testing.T) {
+		mgr, mock, _ := makeManager(t)
+		ctx := context.Background()
+
+		// Install two apps with the same image — one service, one workspace.
+		// Shared imagestore means both modes are considered for image references.
+		installApp(t, mgr, "appa", "debian:bookworm")
+		installApp(t, mgr, "appb", "debian:bookworm")
+		patchToWorkspaceMode(t, mgr, "appb")
+
+		if err := mgr.Uninstall(ctx, "appb"); err != nil {
+			t.Fatalf("uninstall: %v", err)
+		}
+
+		// debian:bookworm should NOT be pruned (appa still uses it)
+		for _, img := range mock.removedImages {
+			if img == "debian:bookworm" {
+				t.Errorf("debian:bookworm should not be pruned (still referenced by service-mode appa)")
+			}
+		}
+	})
+
+	t.Run("prune_failure_nonfatal", func(t *testing.T) {
+		mgr, mock, _ := makeManager(t)
+		ctx := context.Background()
+
+		installApp(t, mgr, "appa", "redis:7")
+
+		// Inject RemoveImage failure
+		mock.removeImageErr = errors.New("mock remove error")
+
+		// Uninstall should succeed despite RemoveImage failure
+		if err := mgr.Uninstall(ctx, "appa"); err != nil {
+			t.Fatalf("uninstall should succeed despite prune error: %v", err)
+		}
+
+		// Verify RemoveImage was attempted
+		found := false
+		for _, img := range mock.removedImages {
+			if img == "redis:7" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected RemoveImage to be called for redis:7, removedImages=%v", mock.removedImages)
+		}
+	})
+
+	t.Run("prunes_images_for_service_mode", func(t *testing.T) {
+		mgr, mock, _ := makeManager(t)
+		ctx := context.Background()
+
+		// Service mode uninstall should prune unreferenced images from the shared imagestore
+		installApp(t, mgr, "appa", "redis:7")
+
+		if err := mgr.Uninstall(ctx, "appa"); err != nil {
+			t.Fatalf("uninstall: %v", err)
+		}
+
+		found := false
+		for _, img := range mock.removedImages {
+			if img == "redis:7" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected redis:7 to be pruned on service mode uninstall, removedImages=%v", mock.removedImages)
+		}
+	})
+}
+
+func TestPodmanImageRuntime(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManager(mock, tempDir)
+	if err != nil {
+		t.Fatalf("NewAppManager: %v", err)
+	}
+
+	// Inject a test image runtime with shared imagestore
+	expectedRoot := filepath.Join(tempDir, "podman", "image-root")
+	expectedImagestore := filepath.Join(tempDir, "podman", "imagestore")
+	mgr.SetImageRuntimeForTest(container.PodmanRuntime{
+		Root:          expectedRoot,
+		RunRoot:       filepath.Join(tempDir, "run", "podman", "image-root"),
+		Imagestore:    expectedImagestore,
+		StorageDriver: "overlay",
+		StorageOpts:   []string{"mount_program=/usr/bin/fuse-overlayfs"},
+	})
+
+	rt, err := mgr.podmanImageRuntime()
+	if err != nil {
+		t.Fatalf("podmanImageRuntime: %v", err)
+	}
+
+	if rt.Root != expectedRoot {
+		t.Errorf("Root: got %q, want %q", rt.Root, expectedRoot)
+	}
+	if rt.StorageDriver != "overlay" {
+		t.Errorf("StorageDriver: got %q, want overlay", rt.StorageDriver)
+	}
+	if rt.Imagestore != expectedImagestore {
+		t.Errorf("Imagestore: got %q, want %q", rt.Imagestore, expectedImagestore)
 	}
 }

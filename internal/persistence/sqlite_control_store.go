@@ -109,17 +109,17 @@ func newSQLiteControlStore(stateDir string, kp keyProvider) (*sqliteControlStore
 	}
 	base := stateDir
 	if base == "" {
-		base = paths.Root()
+		base = paths.CoreRoot()
 	}
-	cipherDir := filepath.Join(base, "ciphertext", "control")
+	cipherDir := filepath.Join(base, "ciphertext", "control-plane")
 	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
 		return nil, err
 	}
-	mountDir := filepath.Join(base, "mounts", "control")
+	mountDir := filepath.Join(base, "mounts", "control-plane")
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
 		return nil, err
 	}
-	metaDir := filepath.Join(base, "volumes", "control")
+	metaDir := filepath.Join(base, "volumes", "control-plane")
 	if err := os.MkdirAll(metaDir, 0o700); err != nil {
 		return nil, err
 	}

@@ -205,3 +205,99 @@ x-piccolo:
 		t.Fatalf("expected unsupported-field rejection, got %q", err.Error())
 	}
 }
+
+func TestValidateAppDefinition_InitImageAccepted_WorkspaceMode(t *testing.T) {
+	app := &api.AppDefinition{
+		WorkspaceName: "debian",
+		Type:          "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "lscr.io/linuxserver/webtop:debian-kde", Init: "image", BindPorts: []int{3000}},
+		},
+		Listeners: []api.AppListener{
+			{Name: "__primary", GuestPort: 3000, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
+		},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	SetDefaults(app)
+	if err := ValidateAppDefinition(app); err != nil {
+		t.Fatalf("expected valid workspace app with init:image, got error: %v", err)
+	}
+}
+
+func TestValidateAppDefinition_InitImageRejected_ServiceMode(t *testing.T) {
+	app := &api.AppDefinition{
+		Type: "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", Init: "image", BindPorts: []int{8080}},
+		},
+		Listeners: []api.AppListener{
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+
+	SetDefaults(app)
+	if err := ValidateAppDefinition(app); err == nil {
+		t.Fatalf("expected error for init:image in service mode, got none")
+	}
+}
+
+func TestValidateAppDefinition_InitInvalidValue(t *testing.T) {
+	app := &api.AppDefinition{
+		WorkspaceName: "demo",
+		Type:          "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", Init: "custom", BindPorts: []int{}},
+		},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	SetDefaults(app)
+	if err := ValidateAppDefinition(app); err == nil {
+		t.Fatalf("expected error for init:custom, got none")
+	}
+}
+
+func TestValidateAppDefinition_InitOmitted_DefaultBehavior(t *testing.T) {
+	app := &api.AppDefinition{
+		WorkspaceName: "demo",
+		Type:          "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{}},
+		},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+
+	SetDefaults(app)
+	if err := ValidateAppDefinition(app); err != nil {
+		t.Fatalf("expected valid app with init omitted, got error: %v", err)
+	}
+}
+
+func TestParseAppDefinition_InitFieldAllowedInYAML(t *testing.T) {
+	manifest := `
+type: user
+workspace_name: debian
+services:
+  main:
+    image: lscr.io/linuxserver/webtop:debian-kde
+    init: image
+    bind_ports: [3000]
+listeners:
+  - name: __primary
+    guest_port: 3000
+    protocol: http
+    flow: tcp
+x-piccolo:
+  mode: workspace
+`
+
+	def, err := ParseAppDefinition([]byte(manifest))
+	if err != nil {
+		t.Fatalf("expected valid YAML with init field, got error: %v", err)
+	}
+	if svc, ok := def.Services["main"]; !ok || svc.Init != "image" {
+		t.Fatalf("expected init:image on main service, got %+v", def.Services["main"])
+	}
+}

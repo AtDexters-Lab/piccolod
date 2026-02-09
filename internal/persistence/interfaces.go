@@ -9,24 +9,14 @@ import (
 
 // Service defines the entry point for persistence-related capabilities.
 type Service interface {
-	Bootstrap() BootstrapStore
 	Control() ControlStore
 	Volumes() VolumeManager
 	Devices() DeviceManager
-	Exports() ExportManager
 	StorageAdapter() StorageAdapter
 	Consensus() ConsensusManager
-	BootstrapVolume() VolumeHandle
 	ControlVolume() VolumeHandle
 	// Shutdown terminates background tasks and detaches mounted volumes.
 	Shutdown(ctx context.Context) error
-}
-
-// BootstrapStore manages the device-local bootstrap shard lifecycle.
-type BootstrapStore interface {
-	Mount(ctx context.Context) error
-	Rebuild(ctx context.Context) error
-	IsMounted() bool
 }
 
 // ControlStore exposes repositories backed by the control-plane dataset.
@@ -58,14 +48,6 @@ type VolumeManager interface {
 type DeviceManager interface {
 	List(ctx context.Context) ([]PhysicalDevice, error)
 	Observe() (<-chan DeviceEvent, error)
-}
-
-// ExportManager coordinates PCV and full-data export/import flows.
-type ExportManager interface {
-	RunControlPlane(ctx context.Context) (ExportArtifact, error)
-	RunFullData(ctx context.Context) (ExportArtifact, error)
-	ImportControlPlane(ctx context.Context, artifact ExportArtifact, opts ImportOptions) error
-	ImportFullData(ctx context.Context, artifact ExportArtifact, opts ImportOptions) error
 }
 
 // StorageAdapter provides low-level access to the storage backend (e.g., AionFS).
@@ -169,7 +151,6 @@ type AttachOptions struct {
 type VolumeClass string
 
 const (
-	VolumeClassBootstrap   VolumeClass = "bootstrap"
 	VolumeClassControl     VolumeClass = "control"
 	VolumeClassApplication VolumeClass = "application"
 )
@@ -207,22 +188,6 @@ const (
 	DeviceEventRemoved DeviceEventType = "removed"
 	DeviceEventUpdated DeviceEventType = "updated"
 )
-
-type ExportArtifact struct {
-	Path string
-	Kind ExportKind
-}
-
-type ExportKind string
-
-const (
-	ExportKindControlOnly ExportKind = "control_only"
-	ExportKindFullData    ExportKind = "full_data"
-)
-
-type ImportOptions struct {
-	Force bool
-}
 
 type RemoteConfig struct {
 	Payload []byte

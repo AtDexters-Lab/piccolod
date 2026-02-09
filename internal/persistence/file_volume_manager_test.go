@@ -732,7 +732,7 @@ func TestFileVolumeManagerReconcileHandlesLockedCrypto(t *testing.T) {
 	waiter := func(string, time.Duration) error { return nil }
 	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, waiter)
 
-	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "bootstrap", Class: VolumeClassBootstrap})
+	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "test-volume", Class: VolumeClassControl})
 	if err != nil {
 		t.Fatalf("EnsureVolume: %v", err)
 	}

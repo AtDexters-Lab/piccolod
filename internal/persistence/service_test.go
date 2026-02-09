@@ -27,10 +27,7 @@ func TestModuleEnsureCoreVolumesIgnoresReconcileErrors(t *testing.T) {
 	if err := mod.ensureCoreVolumes(context.Background()); err != nil {
 		t.Fatalf("ensureCoreVolumes: %v", err)
 	}
-	if mod.bootstrapHandle.ID != "bootstrap" {
-		t.Fatalf("expected bootstrap volume handle, got %q", mod.bootstrapHandle.ID)
-	}
-	if mod.controlHandle.ID != "control" {
-		t.Fatalf("expected control volume handle, got %q", mod.controlHandle.ID)
+	if mod.controlHandle.ID != "control-plane" {
+		t.Fatalf("expected control-plane volume handle, got %q", mod.controlHandle.ID)
 	}
 }

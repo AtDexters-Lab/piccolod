@@ -11,8 +11,8 @@ import (
 )
 
 // podmanRuntimeForApp returns a runtime configured for a specific app instance.
-// Each app instance has fully isolated podman storage within its encrypted volume.
-// This avoids cross-reference issues with shared imagestores.
+// Each app instance has an isolated podman Root (container metadata, RW layers) within
+// its encrypted volume, while images are stored in the shared imagestore for deduplication.
 // The instanceID parameter is the unique instance identifier.
 // The mode parameter controls storage driver selection:
 //   - ModeService: uses overlay driver with fuse-overlayfs (image-based containers)
@@ -28,7 +28,7 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 	if runRootBase != "" {
 		runRoot = filepath.Join(filepath.Clean(runRootBase), volID)
 	} else {
-		runRoot = paths.Join("run", "podman", volID)
+		runRoot = paths.CoreJoin("run", "podman", volID)
 	}
 	if err := ensureDir(runRoot, 0o700); err != nil {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: ensure podman runroot: %w", err)
@@ -42,7 +42,7 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 	// Note: Base images stored here are NOT encrypted. User data (container RW layer)
 	// remains encrypted in the per-app --root.
 	// Future: Support per-app private imagestore for custom apps requiring full encryption.
-	imagestore := paths.Join("podman", "imagestore")
+	imagestore := paths.CoreJoin("podman", "imagestore")
 	if err := ensureDir(imagestore, 0o700); err != nil {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: ensure podman imagestore: %w", err)
 	}
@@ -72,4 +72,59 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 		StorageDriver: "overlay",
 		StorageOpts:   []string{fmt.Sprintf("mount_program=%s", fuseOverlayfs)},
 	}, nil
+}
+
+// podmanImageRuntime returns a shared PodmanRuntime for base image operations across
+// all app types (pull, inspect, exists, mount, unmount, remove). Unlike podmanRuntimeForApp,
+// this uses a shared root with overlay driver, providing:
+//   - Layer deduplication: overlay stores thin diffs, not VFS cumulative copies
+//   - Persistent metadata: shared root survives app install/uninstall cycles
+//   - Cross-app sharing: 10 apps with the same Debian base = 1 copy of each layer
+//
+// Images are stored in the shared imagestore (same store used by per-app runtimes).
+// The root (image-root) is a lightweight podman metadata directory (c/storage db, locks);
+// actual image layers and metadata live in the imagestore.
+// Container operations (create, start, stop) continue to use per-app runtimes.
+// Result is cached via sync.Once.
+func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
+	m.imageRuntimeOnce.Do(func() {
+		root := paths.CoreJoin("podman", "image-root")
+		if err := ensureDir(root, 0o700); err != nil {
+			m.imageRuntimeErr = fmt.Errorf("app manager: ensure image runtime root: %w", err)
+			return
+		}
+
+		runRootBase := os.Getenv("PICCOLO_PODMAN_RUNROOT_BASE")
+		var runRoot string
+		if runRootBase != "" {
+			runRoot = filepath.Join(filepath.Clean(runRootBase), "image-root")
+		} else {
+			runRoot = paths.CoreJoin("run", "podman", "image-root")
+		}
+		if err := ensureDir(runRoot, 0o700); err != nil {
+			m.imageRuntimeErr = fmt.Errorf("app manager: ensure image runtime runroot: %w", err)
+			return
+		}
+
+		imagestore := paths.CoreJoin("podman", "imagestore")
+		if err := ensureDir(imagestore, 0o700); err != nil {
+			m.imageRuntimeErr = fmt.Errorf("app manager: ensure image runtime imagestore: %w", err)
+			return
+		}
+
+		fuseOverlayfs, err := exec.LookPath("fuse-overlayfs")
+		if err != nil {
+			m.imageRuntimeErr = fmt.Errorf("app manager: fuse-overlayfs not found: %w", err)
+			return
+		}
+
+		m.imageRuntimeVal = container.PodmanRuntime{
+			Root:          root,
+			RunRoot:       runRoot,
+			Imagestore:    imagestore,
+			StorageDriver: "overlay",
+			StorageOpts:   []string{fmt.Sprintf("mount_program=%s", fuseOverlayfs)},
+		}
+	})
+	return m.imageRuntimeVal, m.imageRuntimeErr
 }

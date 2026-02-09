@@ -411,6 +411,12 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 			return
 		}
 	}
+	// Rotate LUKS admin password keyslot (best-effort).
+	if s.storageMgr != nil {
+		if err := s.storageMgr.OnAdminPasswordRotated(c.Request.Context(), body.OldPassword, body.NewPassword); err != nil {
+			log.Printf("WARN: LUKS password rotation: %v", err)
+		}
+	}
 	update := persistence.AuthStalenessUpdate{
 		PasswordStale:   boolPtr(false),
 		PasswordStaleAt: timePtr(time.Time{}),

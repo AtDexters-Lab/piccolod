@@ -63,6 +63,12 @@ type AppManager struct {
 	workspacePathResolver *workspacePathResolver
 	workspaceImageMounter *workspacedisk.PodmanImageMounter
 
+	// Shared image runtime for base images across all app types (overlay driver, shared root + imagestore).
+	// Cached via sync.Once to avoid repeated LookPath + ensureDir calls.
+	imageRuntimeOnce sync.Once
+	imageRuntimeVal  container.PodmanRuntime
+	imageRuntimeErr  error
+
 	// Internal CA path for OIDC trust
 	internalCAPath string
 }
@@ -79,14 +85,6 @@ type LockStateReader interface {
 }
 
 const maxInstallPortRetries = 5
-
-// workspaceSnapshotImage returns the local image name used to store workspace snapshots.
-// Snapshots are committed when a workspace app is uninstalled without purge, preserving
-// container filesystem changes for restoration on reinstall.
-// The instanceID parameter is the unique instance identifier.
-func workspaceSnapshotImage(instanceID string) string {
-	return fmt.Sprintf("localhost/%s:snapshot", instanceID)
-}
 
 // parseEnvSlice converts OCI-style env slice (KEY=VALUE) to a map.
 // If duplicate keys exist, the last value wins.
@@ -116,41 +114,37 @@ func mergeEnvMaps(base, override map[string]string) map[string]string {
 }
 
 // workspaceRuntimeResolver implements workspacedisk.RuntimeResolver
-// by looking up podman runtime configuration for app instances.
+// by returning the shared image runtime args for podman image mount/unmount.
+// Workspace base images live in the shared image runtime (overlay, shared root),
+// so image mount operations must use those args to find the image.
 type workspaceRuntimeResolver struct {
 	am *AppManager
 }
 
 func (r *workspaceRuntimeResolver) GetRuntimeArgs(ctx context.Context, instanceID string) ([]string, error) {
-	// Ensure the volume is available (this might trigger attachment)
-	layout, err := r.am.ensureAppVolumeLayout(ctx, instanceID)
+	// Use the shared image runtime for image mount/unmount operations.
+	// The instanceID is not used — the image runtime is shared across all apps.
+	rt, err := r.am.podmanImageRuntime()
 	if err != nil {
-		return nil, fmt.Errorf("ensure volume layout: %w", err)
-	}
-
-	// Get the podman runtime configuration
-	// Use ModeWorkspace since this resolver is specifically for workspace terminal access
-	runtime, err := r.am.podmanRuntimeForApp(instanceID, layout, ModeWorkspace)
-	if err != nil {
-		return nil, fmt.Errorf("get runtime: %w", err)
+		return nil, fmt.Errorf("get image runtime: %w", err)
 	}
 
 	// Convert configuration to command-line arguments
 	args := []string{}
-	if runtime.Root != "" {
-		args = append(args, "--root", runtime.Root)
+	if rt.Root != "" {
+		args = append(args, "--root", rt.Root)
 	}
-	if runtime.RunRoot != "" {
-		args = append(args, "--runroot", runtime.RunRoot)
+	if rt.RunRoot != "" {
+		args = append(args, "--runroot", rt.RunRoot)
 	}
-	if runtime.Imagestore != "" {
-		args = append(args, "--imagestore", runtime.Imagestore)
+	if rt.StorageDriver != "" {
+		args = append(args, "--storage-driver", rt.StorageDriver)
 	}
-	if runtime.StorageDriver != "" {
-		args = append(args, "--storage-driver", runtime.StorageDriver)
-	}
-	for _, opt := range runtime.StorageOpts {
+	for _, opt := range rt.StorageOpts {
 		args = append(args, "--storage-opt", opt)
+	}
+	if rt.Imagestore != "" {
+		args = append(args, "--imagestore", rt.Imagestore)
 	}
 
 	return args, nil
@@ -160,7 +154,7 @@ func (r *workspaceRuntimeResolver) GetRuntimeArgs(ctx context.Context, instanceI
 func NewAppManagerWithServices(containerManager ContainerManager, stateDir string, serviceManager *services.ServiceManager, lockReader LockStateReader) (*AppManager, error) {
 	base := stateDir
 	if strings.TrimSpace(base) == "" {
-		base = paths.Root()
+		base = paths.CoreRoot()
 	}
 	base = filepath.Clean(base)
 
@@ -217,6 +211,14 @@ func (m *AppManager) SetMountVerifier(fn func(string) error) {
 	m.stateInitMu.Unlock()
 }
 
+// SetImageRuntimeForTest overrides the shared image runtime. Intended for tests
+// where fuse-overlayfs is not available.
+func (m *AppManager) SetImageRuntimeForTest(rt container.PodmanRuntime) {
+	m.imageRuntimeOnce.Do(func() {}) // exhaust the Once
+	m.imageRuntimeVal = rt
+	m.imageRuntimeErr = nil
+}
+
 // SetEventBus configures the event bus for publishing app status change events.
 func (m *AppManager) SetEventBus(bus *events.Bus) {
 	m.stateMu.Lock()
@@ -228,7 +230,7 @@ func (m *AppManager) SetEventBus(bus *events.Bus) {
 func (m *AppManager) SetStateBaseDir(dir string) {
 	base := dir
 	if strings.TrimSpace(base) == "" {
-		base = paths.Root()
+		base = paths.CoreRoot()
 	}
 	clean := filepath.Clean(base)
 	m.stateInitMu.Lock()
@@ -457,6 +459,15 @@ func (m *AppManager) StartBackground() {
 		defer m.reconcileWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+
+		// Flush stale FUSE mounts left by fuse-overlayfs daemons killed during
+		// previous service shutdown (systemd cgroup cleanup). Must run before
+		// reconcile to prevent workspace disk mount failures.
+		cleanupStaleFUSEMounts(ctx)
+
+		// Flush stale netavark nftables rules before the first reconcile.
+		// This clears DNAT rules left by containers removed in previous sessions.
+		m.flushAndReloadNetavarkRules(ctx)
 
 		m.ReconcileOnce(ctx)
 		for {
@@ -1080,10 +1091,15 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 			spec.WorkingDir = workspaceMeta.ImageConfig.WorkingDir
 			spec.User = workspaceMeta.ImageConfig.User
 
-			// Use boot.sh entrypoint with original command
-			originalCmd := workspaceMeta.ImageConfig.BuildOriginalCommand()
-			spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-			spec.Command = originalCmd
+			if primarySvcInit(def) == "image" {
+				// Image manages its own init — set entrypoint/cmd from image config directly
+				spec.Entrypoint = workspaceMeta.ImageConfig.Entrypoint
+				spec.Command = workspaceMeta.ImageConfig.Cmd
+			} else {
+				originalCmd := workspaceMeta.ImageConfig.BuildOriginalCommand()
+				spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+				spec.Command = originalCmd
+			}
 		}
 
 		cid, err := m.containerManager.CreateContainer(ctx, runtime, spec)
@@ -1615,25 +1631,15 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 	return m.stopContainerGroup(ctx, state, app, def, layout, runtime)
 }
 
-// Uninstall removes an application instance completely by instanceID.
+// Uninstall removes an application instance completely by instanceID,
+// including all container data, encrypted volumes, and podman state.
 func (m *AppManager) Uninstall(ctx context.Context, instanceID string) error {
-	if err := m.ensureUnlocked(); err != nil {
-		return err
-	}
-	if err := m.ensureKernelLeader(); err != nil {
-		return err
-	}
-	return m.UninstallWithOptions(ctx, instanceID, false)
-}
-
-// UninstallWithOptions removes an application instance; when purge is true, also deletes app data directories.
-func (m *AppManager) UninstallWithOptions(ctx context.Context, instanceID string, purge bool) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-	return m.uninstallLocked(ctx, instanceID, purge)
+	return m.uninstallLocked(ctx, instanceID)
 }
 
-func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, purge bool) (err error) {
+func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (err error) {
 	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseStopping, 0, "Stopping app", false, nil)
 	defer func() {
 		if err != nil {
@@ -1679,39 +1685,32 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 		return err
 	}
 
-	// If purging, reset podman storage BEFORE unmounting the volume.
+	// Prune orphaned images from the shared imagestore.
+	// Both service and workspace images share the same imagestore,
+	// so pruning runs for all app types.
+	m.pruneOrphanedImages(ctx, state, def, instanceID)
+
+	// Reset podman storage BEFORE unmounting the volume.
 	// This allows podman to properly clean its metadata files (db.sql, locks, etc.)
 	// which live inside the encrypted volume.
-	if purge {
-		m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseCleaningVolumes, 80, "Purging app data", false, nil)
-		if err := m.containerManager.ResetStorage(ctx, runtime); err != nil {
-			log.Printf("WARN: podman storage reset for %s failed: %v", instanceID, err)
-		}
+	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseCleaningVolumes, 80, "Purging app data", false, nil)
+	if err := m.containerManager.ResetStorage(ctx, runtime); err != nil {
+		log.Printf("WARN: podman storage reset for %s failed: %v", instanceID, err)
 	}
 
-	// Detach (unmount) the encrypted volume even without purge.
-	// This prevents data access until reinstall while preserving the data.
+	// Destroy the volume (detaches, then removes ciphertext, metadata, mount directory)
 	volID := appVolumeID(instanceID)
 	volumes := m.currentVolumeManager()
-	if volumes != nil {
-		req := persistence.VolumeRequest{ID: volID, Class: persistence.VolumeClassApplication}
-		if handle, err := volumes.EnsureVolume(ctx, req); err == nil {
-			if detachErr := volumes.Detach(ctx, handle); detachErr != nil {
-				log.Printf("WARN: failed to detach volume %s: %v", volID, detachErr)
-			}
-		}
+	if volumes == nil {
+		return fmt.Errorf("volume manager not available")
+	}
+	if err := volumes.DestroyVolume(ctx, volID); err != nil {
+		return fmt.Errorf("failed to purge app data: %w", err)
 	}
 
-	// If purging, destroy the volume (ciphertext, metadata, mount directory)
-	if purge {
-		if err := m.volumeManager.DestroyVolume(ctx, volID); err != nil {
-			return fmt.Errorf("failed to purge app data: %w", err)
-		}
-
-		// Remove podman runRoot which lives outside the encrypted volume
-		if err := os.RemoveAll(runtime.RunRoot); err != nil {
-			log.Printf("WARN: failed to remove podman runRoot %s: %v", runtime.RunRoot, err)
-		}
+	// Remove podman runRoot which lives outside the encrypted volume
+	if err := os.RemoveAll(runtime.RunRoot); err != nil {
+		log.Printf("WARN: failed to remove podman runRoot %s: %v", runtime.RunRoot, err)
 	}
 
 	// Remove from filesystem and cache (state only)
@@ -1725,6 +1724,71 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string, pur
 	m.publishAppStatusChanged(instanceID, "uninstalled", prevStatus)
 
 	return nil
+}
+
+// collectReferencedImages returns the set of images still referenced by installed
+// apps, excluding the app being uninstalled. Always includes the network anchor
+// image. All app types are considered because both service and workspace images
+// share the same imagestore.
+func (m *AppManager) collectReferencedImages(state *FilesystemStateManager, excludeInstanceID string) map[string]bool {
+	referenced := map[string]bool{
+		networkAnchorImage(): true,
+	}
+	for _, app := range state.ListApps() {
+		if app.InstanceID == excludeInstanceID {
+			continue
+		}
+		def, err := state.GetAppDefinition(app.InstanceID)
+		if err != nil {
+			// Cannot determine what images this app references — abort all pruning
+			// to avoid accidentally removing images that may still be in use.
+			log.Printf("WARN: image prune: cannot read definition for %s, aborting prune: %v", app.InstanceID, err)
+			return nil
+		}
+		if def.Services == nil {
+			continue
+		}
+		for _, svc := range def.Services {
+			if svc.Image != "" {
+				referenced[svc.Image] = true
+			}
+		}
+	}
+	return referenced
+}
+
+// pruneOrphanedImages removes images from the shared imagestore that are no longer
+// referenced by any installed app. Best-effort: failures are logged but never fatal
+// to uninstall.
+func (m *AppManager) pruneOrphanedImages(ctx context.Context, state *FilesystemStateManager, def *api.AppDefinition, excludeInstanceID string) {
+	if def == nil || def.Services == nil {
+		return
+	}
+
+	imageRuntime, err := m.podmanImageRuntime()
+	if err != nil {
+		log.Printf("WARN: image prune: cannot get image runtime: %v", err)
+		return
+	}
+
+	referenced := m.collectReferencedImages(state, excludeInstanceID)
+	if referenced == nil {
+		return // Aborted due to unreadable app definitions
+	}
+
+	for svcName, svc := range def.Services {
+		if svc.Image == "" {
+			continue
+		}
+		if referenced[svc.Image] {
+			continue
+		}
+		if err := m.containerManager.RemoveImage(ctx, imageRuntime, svc.Image); err != nil {
+			log.Printf("WARN: image prune: failed to remove %s (service %s): %v", svc.Image, svcName, err)
+		} else {
+			log.Printf("INFO: image prune: removed orphaned image %s (service %s)", svc.Image, svcName)
+		}
+	}
 }
 
 // UpdateImage updates an app instance's container image tag and recreates the container preserving services.
@@ -1985,10 +2049,14 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			spec.WorkingDir = meta.ImageConfig.WorkingDir
 			spec.User = meta.ImageConfig.User
 
-			// Use entrypoint from saved metadata
-			originalCmd := meta.ImageConfig.BuildOriginalCommand()
-			spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-			spec.Command = originalCmd
+			if primarySvcInit(&newDef) == "image" {
+				spec.Entrypoint = meta.ImageConfig.Entrypoint
+				spec.Command = meta.ImageConfig.Cmd
+			} else {
+				originalCmd := meta.ImageConfig.BuildOriginalCommand()
+				spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+				spec.Command = originalCmd
+			}
 
 			newCID, err = m.containerManager.CreateContainer(ctx, runtime, spec)
 		}
@@ -2023,8 +2091,13 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			rbSpec.Environment = mergeEnvMaps(parseEnvSlice(meta.ImageConfig.Env), rbSpec.Environment)
 			rbSpec.WorkingDir = meta.ImageConfig.WorkingDir
 			rbSpec.User = meta.ImageConfig.User
-			rbSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-			rbSpec.Command = meta.ImageConfig.BuildOriginalCommand()
+			if primarySvcInit(curDef) == "image" {
+				rbSpec.Entrypoint = meta.ImageConfig.Entrypoint
+				rbSpec.Command = meta.ImageConfig.Cmd
+			} else {
+				rbSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+				rbSpec.Command = meta.ImageConfig.BuildOriginalCommand()
+			}
 
 			// 3. Create old container
 			rbCID, rbErr := m.containerManager.CreateContainer(ctx, runtime, rbSpec)
@@ -2316,6 +2389,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	}
 	def := appDef
 	var oidcClient *api.ServiceOIDCClient
+	var svcInit string
 	if piccoloModeFromExtensions(appDef.Extensions) == ModeWorkspace && appDef.Services != nil {
 		primary := primaryServiceFor(appDef, nil)
 		if primary == "" {
@@ -2326,6 +2400,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 			return container.ContainerCreateSpec{}, fmt.Errorf("primary service '%s' not found", primary)
 		}
 		oidcClient = svc.OIDCClient
+		svcInit = svc.Init
 		derived := *appDef
 		derived.Image = svc.Image
 		derived.Environment = svc.Environment
@@ -2383,33 +2458,37 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	// Workspace mode: enable init and mount boot.sh wrapper
 	mode := piccoloModeFromExtensions(appDef.Extensions)
 	if mode == ModeWorkspace {
-		// Use --init for proper PID 1 signal handling and zombie reaping
-		spec.UseInit = true
+		if svcInit == "image" {
+			// Image manages its own init (e.g., s6-overlay). No --init or boot.sh.
+		} else {
+			// Default: Piccolo manages init via catatonit + boot.sh wrapper
+			spec.UseInit = true
 
-		// Ensure workspace assets exist on host filesystem
-		if err := EnsureWorkspaceAssets(); err != nil {
-			return spec, fmt.Errorf("failed to ensure workspace assets: %w", err)
+			// Ensure workspace assets exist on host filesystem
+			if err := EnsureWorkspaceAssets(); err != nil {
+				return spec, fmt.Errorf("failed to ensure workspace assets: %w", err)
+			}
+
+			// Mount boot.sh as read-only into the container
+			// Use :z for SELinux shared label (required for rootless podman on SELinux systems)
+			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
+				Host:      BootShHostPath(),
+				Container: "/piccolo/boot.sh",
+				Options:   "ro,z",
+			})
+
+			// Mount piccolo-startup helper to /usr/local/bin (which is in PATH by default)
+			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
+				Host:      PiccoloStartupHostPath(),
+				Container: "/usr/local/bin/piccolo-startup",
+				Options:   "ro,z",
+			})
 		}
-
-		// Mount boot.sh as read-only into the container
-		// Use :z for SELinux shared label (required for rootless podman on SELinux systems)
-		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-			Host:      BootShHostPath(),
-			Container: "/piccolo/boot.sh",
-			Options:   "ro,z",
-		})
-
-		// Mount piccolo-startup helper to /usr/local/bin (which is in PATH by default)
-		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-			Host:      PiccoloStartupHostPath(),
-			Container: "/usr/local/bin/piccolo-startup",
-			Options:   "ro,z",
-		})
 
 		// Mount a writable config directory for user startup hooks (start.sh)
 		// This directory is persistent and writable by the container user
 		configDir := filepath.Join(layout.DataDir, "piccolo-config")
-		if err := os.MkdirAll(configDir, 0o777); err != nil {
+		if err := os.MkdirAll(configDir, 0o755); err != nil {
 			return spec, fmt.Errorf("failed to create piccolo config dir: %w", err)
 		}
 		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
@@ -2468,6 +2547,19 @@ func (m *AppManager) applyOIDCClientInjection(spec *container.ContainerCreateSpe
 			log.Printf("WARN: failed to resolve host gateway for piccolo.local: %v", err)
 		}
 	}
+}
+
+// primarySvcInit returns the Init field of the primary service for the given definition.
+// Returns "" if no primary service or services map is nil.
+func primarySvcInit(def *api.AppDefinition) string {
+	if def == nil || def.Services == nil {
+		return ""
+	}
+	primary := primaryServiceFor(def, nil)
+	if svc, ok := def.Services[primary]; ok {
+		return svc.Init
+	}
+	return ""
 }
 
 // buildOriginalCommand constructs the original container command from image config.

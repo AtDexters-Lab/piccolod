@@ -133,7 +133,7 @@ func (p *execMountProcess) Pid() int {
 	return p.cmd.Process.Pid
 }
 
-// FileVolumeManager orchestrates gocryptfs-backed volumes rooted in PICCOLO_STATE_DIR.
+// fileVolumeManager orchestrates gocryptfs-backed volumes rooted in PICCOLO_CORE_ROOT.
 type fileVolumeManager struct {
 	root           string
 	crypto         *crypt.Manager
@@ -189,7 +189,7 @@ const (
 
 func newFileVolumeManager(root string, crypto *crypt.Manager, bus *events.Bus) *fileVolumeManager {
 	if root == "" {
-		root = paths.Root()
+		root = paths.CoreRoot()
 	}
 	bypass := os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") == "1"
 	waiter := waitForMountReady
@@ -282,7 +282,7 @@ func (f *fileVolumeManager) getOrCreateEntry(id string) *volumeEntry {
 }
 
 func shouldGuardMountDir(volumeID string) bool {
-	// Guard all mount points under PICCOLO_STATE_DIR/mounts to prevent accidental
+	// Guard all mount points under PICCOLO_CORE_ROOT/mounts to prevent accidental
 	// plaintext writes to an unmounted directory where an encrypted volume is expected.
 	return volumeID != ""
 }
@@ -423,16 +423,23 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 		return f.recordVolumeState(handle.ID, volumeStateMounted, volumeStateMounted, opts.Role, nil)
 	}
 
-	// Adoption: If the volume is already mounted (e.g. survived a restart), we adopt it.
-	// We verify it is accessible to avoid adopting a broken mount.
+	// Defense-in-depth: if a mount already exists (stale mount missed by startup cleanup),
+	// clean it up before creating a fresh mount to prevent double-stacking.
+	// isMountPoint reads /proc/self/mountinfo (procfs text, no FUSE round-trip) —
+	// reliable even on stale FUSE mounts, unlike os.Stat which returns cached VFS attributes.
 	if mounted, err := isMountPoint(handle.MountDir); err == nil && mounted {
-		if _, err := os.Stat(handle.MountDir); err == nil {
-			f.mu.Lock()
-			entry.role = opts.Role
-			// We assume metadata was valid when it was originally mounted.
-			entry.metadataReady = true
-			f.mu.Unlock()
-			return f.recordVolumeState(handle.ID, volumeStateMounted, volumeStateMounted, opts.Role, nil)
+		log.Printf("WARN: volume %s: clearing pre-existing mount at %s (should not happen if startup cleanup ran)", handle.ID, handle.MountDir)
+		if detachErr := f.Detach(ctx, handle); detachErr != nil {
+			log.Printf("WARN: volume %s: detach failed: %v", handle.ID, detachErr)
+		} else if shouldGuardMountDir(handle.ID) {
+			// Detach applies immutable flag via reprotectMountDir; clear it for fresh mount.
+			// Only unprotect if Detach succeeded (mount is gone), otherwise we'd modify
+			// the mounted filesystem's root rather than the underlying mountpoint directory.
+			_ = unprotectMountDir(handle.MountDir)
+		}
+		// Post-condition: verify mount was actually cleared.
+		if still, _ := isMountPoint(handle.MountDir); still {
+			return fmt.Errorf("attach: cannot clear pre-existing mount at %s", handle.MountDir)
 		}
 	}
 
@@ -830,13 +837,28 @@ func (f *fileVolumeManager) reconcileVolumeState(ctx context.Context, entry *vol
 		return err
 	}
 	if mounted {
-		if _, err := os.Stat(entry.handle.MountDir); err != nil {
-			if errors.Is(err, syscall.ENOTCONN) {
-				_ = f.recordVolumeState(entry.handle.ID, state.Desired, volumeStateError, parseVolumeRole(state.Role), fmt.Errorf("broken mount detected: %w", err))
+		// Probe mount liveness via readdir. getdents64(2) forces a FUSE round-trip
+		// that fails with ENOTCONN on stale mounts. os.Stat (stat(2)) is unreliable
+		// because the kernel returns cached VFS attributes for stale FUSE mountpoints.
+		var probeErr error
+		if dir, err := os.Open(entry.handle.MountDir); err != nil {
+			probeErr = err
+		} else {
+			_, probeErr = dir.Readdirnames(1)
+			dir.Close()
+			if errors.Is(probeErr, io.EOF) {
+				probeErr = nil // Empty directory — mount is live
+			}
+		}
+		if probeErr != nil {
+			if errors.Is(probeErr, syscall.ENOTCONN) {
+				_ = f.recordVolumeState(entry.handle.ID, state.Desired, volumeStateError, parseVolumeRole(state.Role), fmt.Errorf("broken mount detected: %w", probeErr))
 				if detachErr := f.Detach(ctx, entry.handle); detachErr != nil {
 					return fmt.Errorf("broken mount detected for %s, detach failed: %w", entry.handle.ID, detachErr)
 				}
 				mounted = false
+			} else {
+				log.Printf("WARN: volume %s: mount liveness probe failed: %v", entry.handle.ID, probeErr)
 			}
 		}
 	}

@@ -1,15 +1,19 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"text/template"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,6 +24,88 @@ import (
 	"piccolod/internal/remote"
 	"piccolod/internal/services"
 )
+
+var (
+	cachedHostTimezone string
+	hostTimezoneOnce   sync.Once
+)
+
+// detectHostTimezone returns the host's IANA timezone (e.g. "America/New_York").
+// Result is cached for the process lifetime. Falls back to "Etc/UTC" if detection fails.
+func detectHostTimezone() string {
+	hostTimezoneOnce.Do(func() {
+		cachedHostTimezone = probeHostTimezone()
+	})
+	return cachedHostTimezone
+}
+
+func probeHostTimezone() string {
+	// Try /etc/localtime symlink (most Linux distros)
+	if target, err := filepath.EvalSymlinks("/etc/localtime"); err == nil {
+		const prefix = "/usr/share/zoneinfo/"
+		if idx := strings.Index(target, prefix); idx != -1 {
+			if tz := target[idx+len(prefix):]; isValidTimezone(tz) {
+				return tz
+			}
+		}
+	}
+	// Try /etc/timezone (Debian/Ubuntu)
+	if data, err := os.ReadFile("/etc/timezone"); err == nil {
+		if tz := strings.TrimSpace(string(data)); tz != "" && isValidTimezone(tz) {
+			return tz
+		}
+	}
+	// Try TZ environment variable
+	if tz := os.Getenv("TZ"); tz != "" && isValidTimezone(tz) {
+		return tz
+	}
+	return "Etc/UTC"
+}
+
+func isValidTimezone(tz string) bool {
+	_, err := time.LoadLocation(tz)
+	return err == nil
+}
+
+// buildSystemContext returns the template context for {{ .System.* }} variables.
+func (s *GinServer) buildSystemContext() map[string]interface{} {
+	ctx := map[string]interface{}{
+		"Domain":       "local",
+		"Architecture": runtime.GOARCH,
+		"Timezone":     detectHostTimezone(),
+	}
+	if s.remoteManager != nil {
+		status := s.remoteManager.Status()
+		if status.Enabled && strings.TrimSpace(status.PortalHostname) != "" {
+			ctx["Domain"] = strings.TrimSuffix(strings.TrimSpace(status.PortalHostname), ".")
+		}
+	}
+	return ctx
+}
+
+// resolveSystemDefaults renders {{ .System.* }} expressions in input default values
+// so the UI displays concrete values instead of raw template strings.
+// Only defaults containing ".System." are resolved; other template expressions
+// (e.g. {{ .Inputs.* }}) are left untouched to avoid corrupting non-system defaults.
+func resolveSystemDefaults(inputs map[string]api.AppInput, systemCtx map[string]interface{}) {
+	data := map[string]interface{}{"System": systemCtx}
+	for name, input := range inputs {
+		defaultStr, ok := input.Default.(string)
+		if !ok || !strings.Contains(defaultStr, ".System.") {
+			continue
+		}
+		tmpl, err := template.New("default").Option("missingkey=error").Parse(defaultStr)
+		if err != nil {
+			continue
+		}
+		var buf bytes.Buffer
+		if err := tmpl.Execute(&buf, data); err != nil {
+			continue // template references non-system keys — leave as-is
+		}
+		input.Default = buf.String()
+		inputs[name] = input
+	}
+}
 
 func determineScheme(flow api.ListenerFlow, protocol api.ListenerProtocol) string {
 	switch protocol {
@@ -239,6 +325,10 @@ func (s *GinServer) handleGinCatalogConfigure(c *gin.Context) {
 		// Continue anyway, just without smarts
 	}
 
+	// Resolve {{ .System.* }} expressions in input defaults so the UI shows
+	// concrete values (e.g. "America/New_York") instead of raw template strings.
+	resolveSystemDefaults(def.Inputs, s.buildSystemContext())
+
 	writeGinSuccess(c, def.Inputs, "Configuration schema prepared")
 }
 
@@ -283,18 +373,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		yamlData = body
 	}
 
-	// Construct system context
-	systemContext := map[string]interface{}{
-		"Domain":       "local",
-		"Architecture": runtime.GOARCH,
-	}
-	if s.remoteManager != nil {
-		status := s.remoteManager.Status()
-		if status.Enabled && strings.TrimSpace(status.PortalHostname) != "" {
-			// RFC 20260114: remote base is the portal hostname apex.
-			systemContext["Domain"] = strings.TrimSuffix(strings.TrimSpace(status.PortalHostname), ".")
-		}
-	}
+	systemContext := s.buildSystemContext()
 
 	// Check for service-level oidc_client in loose schema to pre-generate credentials.
 	// We do this before rendering so we can inject the credentials into the template.
@@ -466,7 +545,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		if err := clientMgr.CreateClient(installCtx, oidcClientID, oidcClientSecret, appInstance.InstanceID); err != nil {
 			log.Printf("ERROR: failed to persist OIDC client for %s: %v. Rolling back install.", appInstance.InstanceID, err)
 			// Rollback: uninstall the app
-			if rbErr := s.appManager.UninstallWithOptions(installCtx, appInstance.InstanceID, true); rbErr != nil {
+			if rbErr := s.appManager.Uninstall(installCtx, appInstance.InstanceID); rbErr != nil {
 				log.Printf("CRITICAL: failed to rollback uninstall for %s: %v", appInstance.InstanceID, rbErr)
 			}
 			writeGinError(c, http.StatusInternalServerError, "Failed to register OIDC client: "+err.Error())
@@ -696,12 +775,6 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 // handleGinAppUninstall handles DELETE /api/v1/apps/:name - Uninstall app completely
 func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	appName := c.Param("name")
-	// Optional purge=true to delete app data
-	purge := false
-	switch c.Query("purge") {
-	case "1", "true", "yes", "on":
-		purge = true
-	}
 
 	// Capture current remote hosts to clean up after uninstall.
 	var hostsToRemove map[string]struct{}
@@ -715,7 +788,7 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	}
 
 	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
-	err := s.appManager.UninstallWithOptions(ctx, appName, purge)
+	err := s.appManager.Uninstall(ctx, appName)
 	if err != nil {
 		if handleAppManagerError(c, err, "uninstall app") {
 			return
@@ -741,11 +814,7 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 		}
 	}
 
-	if purge {
-		writeGinSuccess(c, nil, "App '"+appName+"' uninstalled and data purged successfully")
-	} else {
-		writeGinSuccess(c, nil, "App '"+appName+"' uninstalled successfully")
-	}
+	writeGinSuccess(c, nil, "App '"+appName+"' uninstalled successfully")
 }
 
 // handleGinAppStart handles POST /api/v1/apps/:name/start - Start app container

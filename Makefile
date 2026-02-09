@@ -42,16 +42,17 @@ build-release: ui server-release
 # --- Run targets ---
 run: build ## Build (non-demo) and run piccolod locally
 	@echo "==> Running piccolod on http://localhost:$(RUN_PORT) (state dir: $(RUN_STATE_DIR))"
-	mkdir -p "$(RUN_STATE_DIR)"
-	sudo -E PORT=$(RUN_PORT) PICCOLO_STATE_DIR="$(RUN_STATE_DIR)" ./piccolod
+	mkdir -p "$(RUN_STATE_DIR)/core" "$(RUN_STATE_DIR)/data"
+	sudo -E PORT=$(RUN_PORT) PICCOLO_CORE_ROOT="$(RUN_STATE_DIR)/core" PICCOLO_DATA_ROOT="$(RUN_STATE_DIR)/data" ./piccolod
 
 run-fresh: build ## Build and run piccolod with a temporary state dir
 	@echo "==> Running piccolod on http://localhost:$(RUN_PORT) with a fresh ephemeral state dir"
 	@set -euo pipefail; tmpdir="$$(mktemp -d)"; \
-	  echo "   state dir $$tmpdir"; \
+	  mkdir -p "$$tmpdir/core" "$$tmpdir/data"; \
+	  echo "   core=$$tmpdir/core data=$$tmpdir/data"; \
 	  cleanup() { sleep 2; rm -rf "$$tmpdir"; }; \
 	  trap cleanup EXIT; \
-	  sudo -E PORT=$(RUN_PORT) PICCOLO_STATE_DIR="$$tmpdir" ./piccolod
+	  sudo -E PORT=$(RUN_PORT) PICCOLO_CORE_ROOT="$$tmpdir/core" PICCOLO_DATA_ROOT="$$tmpdir/data" ./piccolod
 
 release: clean deps typegen ## Produce a clean release build (non-demo)
 	$(MAKE) build DEMO=0
@@ -87,7 +88,8 @@ service: ## Build and install/update piccolod systemd service
 	@echo 'Group=root' >> piccolod.service
 	@echo 'ExecStart=/usr/local/bin/piccolod' >> piccolod.service
 	@echo 'Environment="PORT=$(RUN_PORT)"' >> piccolod.service
-	@echo 'Environment="PICCOLO_STATE_DIR=/var/lib/piccolod"' >> piccolod.service
+	@echo 'Environment="PICCOLO_CORE_ROOT=/piccolo-core"' >> piccolod.service
+	@echo 'Environment="PICCOLO_DATA_ROOT=/piccolo-data"' >> piccolod.service
 	@echo 'Restart=always' >> piccolod.service
 	@echo 'RestartSec=5' >> piccolod.service
 	@echo 'TimeoutStopSec=120' >> piccolod.service

@@ -31,7 +31,7 @@ const (
 	ModeService PiccoloMode = "service"
 
 	// ModeWorkspace indicates a persistent workspace mode.
-	// Container filesystem changes are preserved via snapshots across reinstalls (without purge).
+	// Container filesystem is backed by a persistent workspace disk.
 	ModeWorkspace PiccoloMode = "workspace"
 
 	// ModeUnknown indicates the mode could not be determined.
@@ -154,6 +154,7 @@ func validateRawServicesBlocks(root *yaml.Node) error {
 
 	allowedServiceKeys := map[string]struct{}{
 		"image":       {},
+		"init":        {},
 		"after":       {},
 		"bind_ports":  {},
 		"environment": {},
@@ -499,6 +500,11 @@ func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
 		if app.Resources != nil {
 			return fmt.Errorf("resources must be specified per-service under services for service mode apps")
 		}
+		for name, svc := range app.Services {
+			if svc.Init == "image" {
+				return fmt.Errorf("services.%s.init: 'image' is only valid for workspace mode apps", name)
+			}
+		}
 
 		primary := strings.TrimSpace(app.PrimaryService)
 		if primary == "" {
@@ -568,6 +574,9 @@ func validateServices(services map[string]api.AppService, primary string, listen
 		}
 		if strings.TrimSpace(svc.Image) == "" {
 			return fmt.Errorf("services.%s.image is required", name)
+		}
+		if svc.Init != "" && svc.Init != "image" {
+			return fmt.Errorf("services.%s.init must be 'image' or omitted, got '%s'", name, svc.Init)
 		}
 		// bind_ports is required (may be empty) so Piccolo can validate shared port namespace collisions.
 		if svc.BindPorts == nil {

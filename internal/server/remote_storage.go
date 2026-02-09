@@ -23,7 +23,7 @@ type bootstrapRemoteStorage struct {
 
 func newBootstrapRemoteStorage(repo persistence.RemoteRepo, baseDir string) remote.Storage {
 	if baseDir == "" {
-		baseDir = paths.Root()
+		baseDir = paths.CoreRoot()
 	}
 	return &bootstrapRemoteStorage{
 		repo: repo,
@@ -128,8 +128,9 @@ func (s *bootstrapRemoteStorage) isMounted() bool {
 	if s == nil || strings.TrimSpace(s.root) == "" {
 		return false
 	}
-	if _, err := os.Stat(filepath.Join(s.root, ".cipher")); err != nil {
+	info, err := os.Stat(s.root)
+	if err != nil {
 		return false
 	}
-	return true
+	return info.IsDir()
 }

@@ -52,7 +52,7 @@ func boolPtr(b bool) *bool { return &b }
 // NewFilesystemStateManager creates a new filesystem state manager
 func NewFilesystemStateManager(stateDir string) (*FilesystemStateManager, error) {
 	if stateDir == "" {
-		stateDir = paths.Root()
+		stateDir = paths.CoreRoot()
 	}
 
 	info, err := os.Stat(stateDir)

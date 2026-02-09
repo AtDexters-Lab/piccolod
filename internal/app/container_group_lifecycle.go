@@ -202,8 +202,8 @@ func (m *AppManager) stopContainerGroupWithOpts(ctx context.Context, state *File
 	// This is good practice but not strictly required since we remount on start.
 	if mode == ModeWorkspace {
 		if err := m.unmountWorkspaceDisk(ctx, appInst.InstanceID, layout); err != nil {
-			// Log but don't fail - the data is safe, mount will be cleaned up on next start
-			log.Printf("WARN: stop %s: failed to unmount workspace disk: %v", appInst.InstanceID, err)
+			log.Printf("WARN: stop %s: workspace unmount failed, forcing lazy unmount: %v", appInst.InstanceID, err)
+			m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
 		}
 	}
 
@@ -226,7 +226,7 @@ func (m *AppManager) stopContainerGroupWithOpts(ctx context.Context, state *File
 
 // uninstallContainerGroup removes a container group (network anchor + service containers).
 // This is the unified uninstall path for both service and workspace modes.
-// Note: This does not handle purge or state removal - those are handled by the caller.
+// Note: This does not handle volume destruction or state removal - those are handled by the caller.
 func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
 	if appInst == nil || def == nil {
 		return fmt.Errorf("uninstall: app definition required")
@@ -265,7 +265,8 @@ func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppIn
 	// For workspace mode apps, unmount the workspace disk overlay.
 	if mode == ModeWorkspace {
 		if err := m.unmountWorkspaceDisk(ctx, appInst.InstanceID, layout); err != nil {
-			log.Printf("WARN: workspace %s: failed to unmount workspace disk: %v", appInst.InstanceID, err)
+			log.Printf("WARN: workspace %s: unmount failed, forcing lazy unmount: %v", appInst.InstanceID, err)
+			m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
 		} else {
 			log.Printf("INFO: workspace %s: unmounted workspace disk (data preserved)", appInst.InstanceID)
 		}

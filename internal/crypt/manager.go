@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 
+	"piccolod/internal/cryptoutil"
 	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 
@@ -46,6 +48,18 @@ type Manager struct {
 	mu     sync.RWMutex
 	sdek   []byte // plaintext SDEK when unlocked
 	inited bool
+
+	// OnKeyMaterialChanged is called when any key material (password, recovery,
+	// pool keyfile) changes. Used by server integration to emit events.
+	OnKeyMaterialChanged func()
+
+	// mnemonicKeyFn supplies the current recovery mnemonic key for LUKS
+	// keyslot rotation. Set by server after recovery key generation.
+	mnemonicKeyFn func(fn func([]byte) error) error
+
+	// oldMnemonicKeyFn supplies the previous recovery mnemonic key during
+	// mnemonic rotation (used to remove old LUKS keyslot).
+	oldMnemonicKeyFn func(fn func([]byte) error) error
 }
 
 var (
@@ -55,7 +69,7 @@ var (
 
 func NewManager(stateDir string) (*Manager, error) {
 	if stateDir == "" {
-		stateDir = paths.Root()
+		stateDir = paths.CoreRoot()
 	}
 	dir := filepath.Join(stateDir, "crypto")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -103,7 +117,7 @@ func (m *Manager) WithSDEK(fn func([]byte) error) error {
 	buf := make([]byte, len(m.sdek))
 	copy(buf, m.sdek)
 	m.mu.RUnlock()
-	defer zeroBytes(buf)
+	defer cryptoutil.SecureZero(buf)
 	return fn(buf)
 }
 
@@ -215,17 +229,8 @@ func (m *Manager) Unlock(password string) error {
 func (m *Manager) Lock() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Zero sdek
-	for i := range m.sdek {
-		m.sdek[i] = 0
-	}
+	cryptoutil.SecureZero(m.sdek)
 	m.sdek = nil
-}
-
-func zeroBytes(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
 }
 
 func selectCryptoParallelism() int {
@@ -523,4 +528,103 @@ func (m *Manager) UnlockWithRecoveryKey(words []string) error {
 	}
 	m.sdek = pt
 	return nil
+}
+
+// Encrypt encrypts plaintext using AES-GCM with the SDEK.
+// Returns ErrLocked if the manager is locked.
+func (m *Manager) Encrypt(plaintext []byte) ([]byte, error) {
+	var ct []byte
+	err := m.WithSDEK(func(sdek []byte) error {
+		block, err := aes.NewCipher(sdek)
+		if err != nil {
+			return err
+		}
+		aead, err := cipher.NewGCM(block)
+		if err != nil {
+			return err
+		}
+		nonce := make([]byte, aead.NonceSize())
+		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+			return err
+		}
+		// Prepend nonce to ciphertext.
+		ct = aead.Seal(nonce, nonce, plaintext, nil)
+		return nil
+	})
+	return ct, err
+}
+
+// Decrypt decrypts ciphertext that was encrypted by Encrypt.
+// Returns ErrLocked if the manager is locked.
+func (m *Manager) Decrypt(ciphertext []byte) ([]byte, error) {
+	var pt []byte
+	err := m.WithSDEK(func(sdek []byte) error {
+		block, err := aes.NewCipher(sdek)
+		if err != nil {
+			return err
+		}
+		aead, err := cipher.NewGCM(block)
+		if err != nil {
+			return err
+		}
+		if len(ciphertext) < aead.NonceSize() {
+			return errors.New("ciphertext too short")
+		}
+		nonce := ciphertext[:aead.NonceSize()]
+		ct := ciphertext[aead.NonceSize():]
+		var decErr error
+		pt, decErr = aead.Open(nil, nonce, ct, nil)
+		return decErr
+	})
+	return pt, err
+}
+
+// SetMnemonicKeyCallback sets the callback used to access the current recovery
+// mnemonic key material for LUKS keyslot operations.
+func (m *Manager) SetMnemonicKeyCallback(fn func(func([]byte) error) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mnemonicKeyFn = fn
+}
+
+// SetOldMnemonicKeyCallback sets the callback used to access the previous recovery
+// mnemonic key material during mnemonic rotation.
+func (m *Manager) SetOldMnemonicKeyCallback(fn func(func([]byte) error) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.oldMnemonicKeyFn = fn
+}
+
+// WithMnemonicKey invokes fn with the current recovery mnemonic key material.
+func (m *Manager) WithMnemonicKey(fn func([]byte) error) error {
+	m.mu.RLock()
+	cb := m.mnemonicKeyFn
+	m.mu.RUnlock()
+	if cb == nil {
+		return errors.New("mnemonic key callback not set")
+	}
+	return cb(fn)
+}
+
+// WithOldMnemonicKey invokes fn with the previous recovery mnemonic key material.
+func (m *Manager) WithOldMnemonicKey(fn func([]byte) error) error {
+	m.mu.RLock()
+	cb := m.oldMnemonicKeyFn
+	m.mu.RUnlock()
+	if cb == nil {
+		return errors.New("old mnemonic key callback not set")
+	}
+	return cb(fn)
+}
+
+// notifyKeyMaterialChanged fires the OnKeyMaterialChanged callback if set.
+func (m *Manager) notifyKeyMaterialChanged() {
+	if m.OnKeyMaterialChanged != nil {
+		m.OnKeyMaterialChanged()
+	}
+}
+
+// readFileBytes reads an entire file into memory.
+func readFileBytes(path string) ([]byte, error) {
+	return os.ReadFile(path)
 }

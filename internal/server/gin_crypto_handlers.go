@@ -95,7 +95,20 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		}
 	}
 
-	// 6. Create session for the admin user
+	// 6. Initialize LUKS data volume (best-effort — failure is logged but doesn't
+	// block setup since gocryptfs is the primary concern).
+	if s.storageMgr != nil {
+		if err := s.storageMgr.InitializeDataVolume(ctx, body.Password, nil); err != nil {
+			log.Printf("WARN: initialize data volume during setup: %v", err)
+		}
+	}
+
+	// 7. Activate PCV publisher (ciphertext subvolume now exists after setup).
+	if s.pcvPublisher != nil {
+		s.pcvPublisher.Activate()
+	}
+
+	// 8. Create session for the admin user
 	userID := ""
 	if s.userManager != nil {
 		if u, err := s.userManager.GetByUsername(ctx, "admin"); err == nil {
@@ -136,6 +149,16 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 		log.Printf("WARN: failed to propagate unlock state: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
 		return
+	}
+	// Unlock LUKS data volume (best-effort — gocryptfs unlock is the critical path).
+	if s.storageMgr != nil {
+		if err := s.storageMgr.UnlockDataVolume(c.Request.Context(), password); err != nil {
+			log.Printf("WARN: unlock data volume: %v", err)
+		}
+	}
+	// Activate PCV publisher (ciphertext subvolume exists on previously-set-up devices).
+	if s.pcvPublisher != nil {
+		s.pcvPublisher.Activate()
 	}
 	// Best-effort: verify admin credentials and create a session automatically.
 	ctx := c.Request.Context()
@@ -297,6 +320,12 @@ func (s *GinServer) handleCryptoLock(c *gin.Context) {
 	if !s.cryptoManager.IsInitialized() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "not initialized"})
 		return
+	}
+	// Lock LUKS data volume before crypto lock (best-effort).
+	if s.storageMgr != nil {
+		if err := s.storageMgr.LockDataVolume(c.Request.Context()); err != nil {
+			log.Printf("WARN: lock data volume: %v", err)
+		}
 	}
 	s.cryptoManager.Lock()
 	if err := s.notifyPersistenceLockState(c.Request.Context(), true); err != nil {

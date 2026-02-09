@@ -446,7 +446,7 @@ func TestSQLiteControlStoreAuthStalenessPersists(t *testing.T) {
 
 func prepareControlCipherDir(t *testing.T, root string) {
 	t.Helper()
-	cipherDir := filepath.Join(root, "ciphertext", "control")
+	cipherDir := filepath.Join(root, "ciphertext", "control-plane")
 	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
 		t.Fatalf("mkdir ciphertext: %v", err)
 	}
@@ -455,7 +455,7 @@ func prepareControlCipherDir(t *testing.T, root string) {
 	}
 	
 	// Metadata now lives in volumes/<id>
-	stateDir := filepath.Join(root, "volumes", "control")
+	stateDir := filepath.Join(root, "volumes", "control-plane")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		t.Fatalf("mkdir stateDir: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestSQLiteControlStoreMigratesLegacyMetadata(t *testing.T) {
 	key, _ := hex.DecodeString("7f1c8a6c3b5d7e91aabbccddeeff00112233445566778899aabbccddeeff0011")
 
 	// Setup legacy state: metadata in cipherDir
-	cipherDir := filepath.Join(dir, "ciphertext", "control")
+	cipherDir := filepath.Join(dir, "ciphertext", "control-plane")
 	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
 		t.Fatalf("mkdir ciphertext: %v", err)
 	}
@@ -502,7 +502,7 @@ func TestSQLiteControlStoreMigratesLegacyMetadata(t *testing.T) {
 	}
 
 	// Ensure new location is empty
-	stateDir := filepath.Join(dir, "volumes", "control")
+	stateDir := filepath.Join(dir, "volumes", "control-plane")
 	newPath := filepath.Join(stateDir, controlVolumeMetadataName)
 
 	store, err := newSQLiteControlStore(dir, staticKeyProvider{key: key})

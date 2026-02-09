@@ -30,14 +30,18 @@ import (
 	hostnamepkg "piccolod/internal/hostname"
 	"piccolod/internal/mdns"
 	"piccolod/internal/oidc"
+	"piccolod/internal/pcv"
 	"piccolod/internal/persistence"
 	"piccolod/internal/remote"
 	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/router"
+	"piccolod/internal/runner"
 	"piccolod/internal/runtime/commands"
 	"piccolod/internal/runtime/supervisor"
 	"piccolod/internal/services"
 	"piccolod/internal/state/paths"
+	"piccolod/internal/storage"
+	"piccolod/internal/storage/diskprep"
 	"piccolod/internal/update"
 
 	"github.com/coreos/go-systemd/v22/daemon"
@@ -102,6 +106,9 @@ type GinServer struct {
 
 	// Crypto manager for lock/unlock of app data volumes
 	cryptoManager  *crypt.Manager
+	storageMgr     *storage.Manager
+	pcvPublisher   *pcv.Publisher
+	pcvImporter    *pcv.Importer
 	healthTracker  *health.Tracker
 	updateManager  osUpdateManager
 	catalogManager *catalog.Manager
@@ -362,12 +369,30 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	sup := supervisor.New()
 	dispatch := commands.NewDispatcher()
 	consensusMgr := consensus.NewStub(leadershipReg, eventsBus)
-	stateDir := paths.Root()
+	stateDir := paths.CoreRoot()
 	cmgr, err := crypt.NewManager(stateDir)
 	if err != nil {
 		return nil, fmt.Errorf("crypto manager init: %w", err)
 	}
 	healthTracker := health.NewTracker()
+
+	// Wire key material changed callback to emit control store commit event.
+	// This signals the PCV publisher (Phase 7) to re-snapshot after key rotations.
+	cmgr.OnKeyMaterialChanged = func() {
+		eventsBus.Publish(events.Event{
+			Topic:   events.TopicControlStoreCommit,
+			Payload: events.ControlStoreCommit{Revision: 0},
+		})
+	}
+
+	// Initialize storage manager for disk preparation and LUKS lifecycle.
+	execRunner := runner.ExecRunner{}
+	diskPreparer := diskprep.NewPreparer(execRunner)
+	storageMgr := storage.NewManager(diskPreparer, eventsBus, execRunner, cmgr)
+
+	// Initialize PCV publisher and importer.
+	pcvPub := pcv.NewPublisher(eventsBus, execRunner)
+	pcvImp := pcv.NewImporter(execRunner)
 
 	// Initialize app manager with filesystem state management
 	svcMgr := services.NewServiceManager()
@@ -449,6 +474,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		supervisor:     sup,
 		dispatcher:     dispatch,
 		cryptoManager:  cmgr,
+		storageMgr:     storageMgr,
+		pcvPublisher:   pcvPub,
+		pcvImporter:    pcvImp,
 		healthTracker:  healthTracker,
 		catalogManager: catalogMgr,
 	}
@@ -463,6 +491,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	}
 	healthTracker.Setf("remote", health.LevelWarn, "remote manager initializing")
 	healthTracker.Setf("persistence", health.LevelWarn, "control store locked")
+	healthTracker.Setf("storage", health.LevelWarn, "storage awaiting disk preparation")
 	healthTracker.Setf("update", health.LevelWarn, "update manager initializing")
 
 	if !mdnsDisabled {
@@ -489,12 +518,17 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		return nil
 	}))
 
+	s.supervisor.Register(storageMgr)
+	// pcvPub must be registered after storageMgr: supervisor stops in reverse
+	// order, so pcvPub flushes before storage locks.
+	s.supervisor.Register(pcvPub)
 	s.supervisor.Register(supervisor.NewComponent("consensus", consensusMgr.Start, consensusMgr.Stop))
 	s.supervisor.Register(newLeadershipObserver(eventsBus))
 	s.observeLockState(eventsBus)
 	s.observeLeadership(eventsBus)
 	s.observeRemoteConfig(eventsBus)
 	s.observeProxyOIDCClients(eventsBus)
+	s.observeStorageEvents(eventsBus)
 
 	for _, opt := range opts {
 		opt(s)
@@ -604,17 +638,17 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		})
 	}
 
-	// Remote manager
-	bootstrapDir := persist.BootstrapVolume().MountDir
-	if strings.TrimSpace(bootstrapDir) == "" {
-		return nil, fmt.Errorf("bootstrap volume mount unavailable")
+	// Remote manager — uses network-bootstrap dir on the core filesystem.
+	networkBootstrapDir := paths.CoreJoin("network-bootstrap")
+	if err := os.MkdirAll(networkBootstrapDir, 0o700); err != nil {
+		return nil, fmt.Errorf("ensure network-bootstrap dir: %w", err)
 	}
-	remoteStorage := newBootstrapRemoteStorage(persist.Control().Remote(), bootstrapDir)
+	remoteStorage := newBootstrapRemoteStorage(persist.Control().Remote(), networkBootstrapDir)
 	var rm *remote.Manager
 	if remoteStorage != nil {
-		rm, err = remote.NewManagerWithStorage(remoteStorage, bootstrapDir)
+		rm, err = remote.NewManagerWithStorage(remoteStorage, networkBootstrapDir)
 	} else {
-		rm, err = remote.NewManager(bootstrapDir)
+		rm, err = remote.NewManager(networkBootstrapDir)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("remote manager init: %w", err)
@@ -719,6 +753,19 @@ func (s *GinServer) Start() error {
 
 	if err := s.supervisor.Start(context.Background()); err != nil {
 		return fmt.Errorf("failed to start runtime components: %w", err)
+	}
+
+	// Detect boot mode and start disk preparation for internal boots.
+	if s.storageMgr != nil {
+		bootMode, err := storage.DetectBootMode(context.Background(), runner.ExecRunner{})
+		if err != nil {
+			log.Printf("WARN: boot mode detection failed (skipping disk prep): %v", err)
+		} else if bootMode == storage.BootModeInternal {
+			log.Printf("INFO: internal boot detected; starting disk preparation")
+			s.storageMgr.StartPartitioningAsync(context.Background())
+		} else {
+			log.Printf("INFO: boot mode is %s; deferring disk preparation to onboarding", bootMode)
+		}
 	}
 
 	s.startSecureLoopback()
@@ -946,6 +993,9 @@ func (s *GinServer) setupGinRoutes() {
 	r.GET("/oauth/logout", s.handleOIDCLogout)
 	r.POST("/oauth/logout", s.handleOIDCLogout)
 
+	// Emergency middleware: block most API access when storage is in emergency mode.
+	r.Use(s.emergencyMiddleware())
+
 	// API v1 group
 	v1 := r.Group("/api/v1")
 	{
@@ -970,6 +1020,12 @@ func (s *GinServer) setupGinRoutes() {
 		v1.GET("/health/live", s.handleHealthLive)
 		v1.GET("/health/ready", s.handleGinReadinessCheck)
 		v1.GET("/health/detail", s.handleHealthDetail)
+
+		// Storage emergency status (public)
+		v1.GET("/system/emergency", s.handleEmergencyStatus)
+
+		// PCV import (public — used during setup/recovery when no auth exists)
+		v1.POST("/system/pcv/import", s.handlePCVImport)
 
 		// Allow unlocking without a session to break the initial lock/setup cycle.
 		// Crypto: expose status/setup/unlock publicly to break circular dependency with sessions.
@@ -1056,9 +1112,9 @@ func (s *GinServer) setupGinRoutes() {
 			remote.POST("/nexus-guide/verify", s.handleRemoteGuideVerify)
 		}
 
-		// Persistence exports (Admin only)
-		admin.POST("/exports/control", s.requireUnlocked(), s.handlePersistenceControlExport)
-		admin.POST("/exports/full", s.requireUnlocked(), s.handlePersistenceFullExport)
+		// PCV export/import (Admin only)
+		admin.POST("/system/pcv/publish", s.requireUnlocked(), s.handlePCVPublish)
+		admin.GET("/system/pcv/export", s.requireUnlocked(), s.handlePCVExport)
 
 		// Auth-only endpoints (Accessible to all logged-in users)
 		authed.POST("/auth/logout", s.handleAuthLogout)
@@ -1325,49 +1381,6 @@ func (s *GinServer) remoteServiceHostname(status *remote.Status, ep services.Ser
 	return services.RemoteServiceHostname(ep.DerivedHostLabel, base)
 }
 
-func (s *GinServer) handlePersistenceControlExport(c *gin.Context) {
-	if s.dispatcher == nil {
-		writeGinError(c, http.StatusInternalServerError, "command dispatcher not available")
-		return
-	}
-	resp, err := s.dispatcher.Dispatch(c.Request.Context(), persistence.RunControlExportCommand{})
-	if err != nil {
-		if errors.Is(err, persistence.ErrNotImplemented) {
-			writeGinError(c, http.StatusNotImplemented, "control-plane export not implemented yet")
-		} else {
-			writeGinError(c, http.StatusInternalServerError, "failed to start control export: "+err.Error())
-		}
-		return
-	}
-	artifact, ok := resp.(persistence.ExportArtifact)
-	if !ok {
-		writeGinError(c, http.StatusInternalServerError, "unexpected response from persistence")
-		return
-	}
-	writeGinSuccess(c, gin.H{"artifact": artifact}, "control-plane export started")
-}
-
-func (s *GinServer) handlePersistenceFullExport(c *gin.Context) {
-	if s.dispatcher == nil {
-		writeGinError(c, http.StatusInternalServerError, "command dispatcher not available")
-		return
-	}
-	resp, err := s.dispatcher.Dispatch(c.Request.Context(), persistence.RunFullExportCommand{})
-	if err != nil {
-		if errors.Is(err, persistence.ErrNotImplemented) {
-			writeGinError(c, http.StatusNotImplemented, "full export not implemented yet")
-		} else {
-			writeGinError(c, http.StatusInternalServerError, "failed to start full export: "+err.Error())
-		}
-		return
-	}
-	artifact, ok := resp.(persistence.ExportArtifact)
-	if !ok {
-		writeGinError(c, http.StatusInternalServerError, "unexpected response from persistence")
-		return
-	}
-	writeGinSuccess(c, gin.H{"artifact": artifact}, "full export started")
-}
 
 func (s *GinServer) handleGinVersion(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
@@ -1478,7 +1491,7 @@ func (s *GinServer) ensureInternalCA() error {
 		return nil
 	}
 
-	caDir := paths.NetworkBootstrapDir()
+	caDir := paths.CoreJoin("network-bootstrap")
 	ca, err := pki.NewInternalCA(caDir)
 	if err != nil {
 		return fmt.Errorf("internal CA init: %w", err)

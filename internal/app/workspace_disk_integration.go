@@ -368,11 +368,19 @@ func (m *AppManager) prepareServiceStorage(
 
 	if !diskInitialized {
 		// New install: pull base image with progress and initialize workspace disk.
+		// Use the shared image runtime (overlay driver, shared root) for workspace
+		// base images. This provides layer deduplication across apps and persistent
+		// metadata that survives app uninstall/reinstall cycles.
+		imageRuntime, err := m.podmanImageRuntime()
+		if err != nil {
+			return nil, fmt.Errorf("get image runtime: %w", err)
+		}
+
 		// Pull is best-effort to preserve offline resilience — if the image is
 		// already cached locally, a pull failure (network down, registry issue)
 		// should not block installation. The subsequent InspectImage call is the
 		// hard gate: if the image isn't available at all, it will fail there.
-		pullErr := m.pullImageWithProgress(ctx, runtime, svc.Image, instanceID, svcName, progressRange)
+		pullErr := m.pullImageWithProgress(ctx, imageRuntime, svc.Image, instanceID, svcName, progressRange)
 		if pullErr != nil {
 			log.Printf("WARN: install %s: image pull failed, will attempt to use cached image: %v", instanceID, pullErr)
 		}
@@ -380,7 +388,7 @@ func (m *AppManager) prepareServiceStorage(
 		// Get image config for workspace disk metadata.
 		// If the pull failed and the image isn't cached either, surface both
 		// the pull error (root cause) and the inspect error (symptom).
-		imgConfig, err := m.containerManager.InspectImage(ctx, runtime, svc.Image)
+		imgConfig, err := m.containerManager.InspectImage(ctx, imageRuntime, svc.Image)
 		if err != nil {
 			if pullErr != nil {
 				return nil, fmt.Errorf("image %s unavailable: pull failed: %v, and image not cached locally: %w", svc.Image, pullErr, err)
@@ -468,15 +476,20 @@ func (m *AppManager) ensureWorkspaceDiskMounted(ctx context.Context, instanceID 
 		return "", fmt.Errorf("get workspace metadata: %w", err)
 	}
 
-	// Use ModeWorkspace (vfs) consistently for workspace apps.
-	// Layer deduplication happens via the shared imagestore, not the driver choice.
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, ModeWorkspace)
+	// Use the shared image runtime (overlay driver, shared root) for base image operations.
+	// This provides layer deduplication and persistent metadata across app lifecycles.
+	//
+	// Migration note: workspace apps installed before the image runtime existed have their
+	// base images in the old per-app VFS root + shared imagestore. On first start after
+	// upgrade, ImageExists will return false and PullImage will re-pull from the registry.
+	// This requires network access for the first post-upgrade start only.
+	imageRuntime, err := m.podmanImageRuntime()
 	if err != nil {
-		return "", fmt.Errorf("get podman runtime: %w", err)
+		return "", fmt.Errorf("get image runtime: %w", err)
 	}
 
 	// Check if the base image exists locally, pull if not
-	exists, err := m.containerManager.ImageExists(ctx, runtime, meta.BaseImageDigest)
+	exists, err := m.containerManager.ImageExists(ctx, imageRuntime, meta.BaseImageDigest)
 	if err != nil {
 		log.Printf("WARN: workspace %s: failed to check base image existence: %v", instanceID, err)
 	}
@@ -485,12 +498,12 @@ func (m *AppManager) ensureWorkspaceDiskMounted(ctx context.Context, instanceID 
 		log.Printf("INFO: workspace %s: base image not found locally, pulling %s", instanceID, meta.BaseImageDigest)
 
 		// Try to pull by digest first
-		if err := m.containerManager.PullImage(ctx, runtime, meta.BaseImageDigest); err != nil {
+		if err := m.containerManager.PullImage(ctx, imageRuntime, meta.BaseImageDigest); err != nil {
 			// If digest pull fails, try the original reference as fallback
 			// (some registries don't support pulling by digest directly)
 			log.Printf("WARN: workspace %s: pull by digest failed, trying reference %s: %v",
 				instanceID, meta.BaseImageRef, err)
-			if err := m.containerManager.PullImage(ctx, runtime, meta.BaseImageRef); err != nil {
+			if err := m.containerManager.PullImage(ctx, imageRuntime, meta.BaseImageRef); err != nil {
 				return "", fmt.Errorf("failed to pull base image: %w", err)
 			}
 		}

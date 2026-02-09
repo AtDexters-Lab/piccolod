@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
 	"testing"
 	"time"
 
+	"piccolod/internal/state/paths"
 	"piccolod/internal/update"
 )
 
@@ -30,17 +30,11 @@ func (m *blockingUpdateManager) Watch(ctx context.Context) error {
 
 func TestServerStartup_WithBlockingWatchdog(t *testing.T) {
 	// Setup temp state dir
-	tmpDir, err := os.MkdirTemp("", "piccolo-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	os.Setenv("PICCOLO_STATE_DIR", tmpDir)
-	defer os.Unsetenv("PICCOLO_STATE_DIR")
+	tmpDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tmpDir)
 
 	// Set a random port to avoid conflicts
-	os.Setenv("PORT", "0")
-	defer os.Unsetenv("PORT")
+	t.Setenv("PORT", "0")
 
 	// Initialize server with the blocking update manager
 	srv, err := NewGinServer(
@@ -56,7 +50,7 @@ func TestServerStartup_WithBlockingWatchdog(t *testing.T) {
 	// But we can check s.securePort or try to force a port.
 	// Let's force a port for testing to simplify connectivity check.
 	testPort := "18085"
-	os.Setenv("PORT", testPort)
+	t.Setenv("PORT", testPort)
 
 	// Start server in background
 	errCh := make(chan error, 1)

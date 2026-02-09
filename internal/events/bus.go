@@ -13,9 +13,8 @@ type Topic string
 const (
 	TopicLockStateChanged        Topic = "lock_state_changed"
 	TopicLeadershipRoleChanged   Topic = "leadership_role_changed"
-	TopicDeviceEvent             Topic = "device_event"
-	TopicExportResult            Topic = "export_result"
-	TopicControlHealth           Topic = "control_health"
+	TopicDeviceEvent   Topic = "device_event"
+	TopicControlHealth Topic = "control_health"
 	TopicControlStoreCommit      Topic = "control_store_commit"
 	TopicRemoteConfigChanged     Topic = "remote_config_changed"
 	TopicVolumeStateChanged      Topic = "volume_state_changed"
@@ -31,6 +30,17 @@ const (
 
 	// App status events
 	TopicAppStatusChanged Topic = "app_status_changed" // Emitted by app manager on status change
+
+	// Storage events
+	TopicStoragePhase1Complete  Topic = "storage_phase1_complete"  // Phase 1 disk prep finished
+	TopicStorageEmergency       Topic = "storage_emergency"        // Storage entered emergency mode
+	TopicStorageLUKSInitialized Topic = "storage_luks_initialized" // LUKS data volume initialized
+	TopicStorageLUKSUnlocked    Topic = "storage_luks_unlocked"    // LUKS data volume unlocked
+	TopicStorageLocked          Topic = "storage_locked"            // Storage locked (LUKS closed)
+
+	// PCV export events
+	TopicPCVExportPublished Topic = "pcv_export_published" // PCV archive published successfully
+	TopicPCVExportFailed    Topic = "pcv_export_failed"    // PCV archive publish failed
 )
 
 // Event represents a message broadcast on the event bus.
@@ -128,6 +138,18 @@ type CertHealthStatus struct {
 	RecoveryETA *time.Time `json:"recovery_eta,omitempty"`
 }
 
+// StoragePhase1Complete is emitted when Phase 1 disk preparation finishes.
+type StoragePhase1Complete struct {
+	Success bool
+	Error   string // non-empty on failure
+}
+
+// StorageEmergencyEvent is emitted when storage enters emergency mode.
+type StorageEmergencyEvent struct {
+	Level string // "hard" or "soft"
+	Error string
+}
+
 // AppStatusChangedEvent is emitted when an app's status changes.
 // Status values: installed, uninstalled, running, stopped, error, starting
 type AppStatusChangedEvent struct {
@@ -135,6 +157,18 @@ type AppStatusChangedEvent struct {
 	Status     string    `json:"status"`
 	PrevStatus string    `json:"prev_status,omitempty"`
 	Timestamp  time.Time `json:"timestamp"`
+}
+
+// PCVExportPublished is emitted after a PCV archive is published successfully.
+type PCVExportPublished struct {
+	Generation string // generation ID (e.g. "20260202T180405Z-000001")
+	SHA256     string // hex-encoded SHA-256 of the archive
+	SizeBytes  int64
+}
+
+// PCVExportFailed is emitted when a PCV publish fails.
+type PCVExportFailed struct {
+	Error string
 }
 
 // Bus is a simple pub/sub dispatcher for intra-process events.

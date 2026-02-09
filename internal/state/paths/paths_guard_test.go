@@ -8,12 +8,11 @@ import (
 	"testing"
 )
 
-func TestNoHardcodedStateDir(t *testing.T) {
+func TestNoHardcodedCoreRoot(t *testing.T) {
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatalf("unable to determine caller path")
 	}
-	// Walk all Go files under src/l1/piccolod
 	root := filepath.Join(filepath.Dir(file), "..", "..", "..")
 	allowed := map[string]struct{}{
 		filepath.Clean(filepath.Join(root, "internal", "state", "paths", "paths.go")): {},
@@ -36,8 +35,8 @@ func TestNoHardcodedStateDir(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if strings.Contains(string(data), defaultRoot) {
-			t.Fatalf("hard-coded state dir %q found in %s", defaultRoot, path)
+		if strings.Contains(string(data), defaultCoreRoot) {
+			t.Fatalf("hard-coded core root %q found in %s", defaultCoreRoot, path)
 		}
 		return nil
 	})
@@ -45,7 +44,3 @@ func TestNoHardcodedStateDir(t *testing.T) {
 		t.Fatalf("walk failed: %v", err)
 	}
 }
-
-// TODO(persistence): Extend this guard (or add a companion test) to ensure
-// storage-bearing modules do not call os.WriteFile/os.OpenFile directly once
-// remote manager and others migrate to the persistence volume APIs.

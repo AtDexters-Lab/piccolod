@@ -117,6 +117,16 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		log.Printf("INFO: install %s: repaired corrupted podman storage before pull", instanceID)
 	}
 
+	// Also validate the shared image runtime storage (shared imagestore across all app types).
+	// All image pulls target the shared imagestore, so corruption there affects all modes.
+	if imageRuntime, err := m.podmanImageRuntime(); err == nil {
+		if repaired, vErr := m.containerManager.ValidateAndRepairStorage(ctx, imageRuntime); vErr != nil {
+			log.Printf("WARN: install %s: image runtime storage validation error: %v", instanceID, vErr)
+		} else if repaired {
+			log.Printf("INFO: install %s: repaired image runtime storage before pull", instanceID)
+		}
+	}
+
 	// Prepare storage for each service (pull images or init workspace disks)
 	// Progress range 15-55% is divided equally among images
 	const pullProgressMin = 15

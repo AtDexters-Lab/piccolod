@@ -29,7 +29,7 @@ type FileCertProvider struct {
 // base is empty, or at the provided base otherwise.
 func NewFileCertProvider(base string) *FileCertProvider {
 	if strings.TrimSpace(base) == "" {
-		base = filepath.Join(paths.ControlDir(), "remote", "certs")
+		base = filepath.Join(paths.CoreJoin("mounts", "control-plane"), "remote", "certs")
 	}
 	return &FileCertProvider{base: base, cache: make(map[string]*tls.Certificate)}
 }

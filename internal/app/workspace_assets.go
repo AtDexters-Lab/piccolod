@@ -21,13 +21,13 @@ var (
 // BootShHostPath returns the host filesystem path where boot.sh is stored.
 // This path is bind-mounted into workspace containers as /piccolo/boot.sh.
 func BootShHostPath() string {
-	return paths.Join("assets", "boot.sh")
+	return paths.CoreJoin("assets", "boot.sh")
 }
 
 // PiccoloStartupHostPath returns the host filesystem path where piccolo-startup is stored.
 // This path is bind-mounted into workspace containers as /piccolo/bin/piccolo-startup.
 func PiccoloStartupHostPath() string {
-	return paths.Join("assets", "piccolo-startup")
+	return paths.CoreJoin("assets", "piccolo-startup")
 }
 
 // EnsureBootShAsset ensures the boot.sh wrapper script exists on the host filesystem.
