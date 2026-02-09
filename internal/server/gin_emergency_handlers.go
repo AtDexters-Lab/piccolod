@@ -85,6 +85,8 @@ func isEmergencyAllowed(path string) bool {
 		"/api/v1/auth/initialized",
 		"/api/v1/auth/login",
 		"/api/v1/crypto/status",
+		// Network peers — gateway UI needs peer discovery to redirect to the correct device.
+		"/api/v1/network/peers",
 		"/version",
 	}
 	for _, prefix := range allowed {

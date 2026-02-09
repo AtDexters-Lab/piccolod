@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/os_update.dart';
+import 'package:piccolo_os/core/services/network_service.dart';
 import 'package:piccolo_os/core/models/session.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
@@ -36,6 +37,9 @@ class SettingsController extends ChangeNotifier {
   RemoteStatus? _remoteStatus;
   RemoteStatus? get remoteStatus => _remoteStatus;
 
+  String? _specificHostname;
+  String? get specificHostname => _specificHostname;
+
   // Navigation
   int _selectedIndex = 0;
   int get selectedIndex => _selectedIndex;
@@ -60,7 +64,8 @@ class SettingsController extends ChangeNotifier {
       case 2: // Users
         // Users tab has its own controller
         break;
-      case 3: // Security — no data fetch needed
+      case 3: // Security
+        await fetchSpecificHostname();
         break;
       case 4: // System
         await fetchOSUpdate();
@@ -148,6 +153,19 @@ class SettingsController extends ChangeNotifier {
       _error = e.toString();
     } finally {
       if (!_disposed) _setLoading(false);
+    }
+  }
+
+  Future<void> fetchSpecificHostname() async {
+    if (_disposed) return;
+    try {
+      final peers = await NetworkService(ApiClient()).getPeers();
+      if (_disposed) return;
+      final h = peers.self?.specificHostname;
+      _specificHostname = (h != null && h.isNotEmpty) ? h : null;
+      notifyListeners();
+    } catch (_) {
+      // Non-critical — UI falls back to generic text
     }
   }
 

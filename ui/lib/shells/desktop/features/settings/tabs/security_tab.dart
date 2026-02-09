@@ -52,8 +52,11 @@ class _LANSecurityCard extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           Text(
-            "Access this portal securely via https://piccolo.local. "
-            "To avoid browser warnings, download and trust the CA certificate.",
+            controller.specificHostname != null
+                ? "Access this portal securely via https://${controller.specificHostname}. "
+                  "To avoid browser warnings, download and trust the CA certificate."
+                : "Access this portal securely via HTTPS using your device-specific hostname. "
+                  "To avoid browser warnings, download and trust the CA certificate.",
             style: PiccoloTheme.textTheme.labelSmall,
           ),
           const SizedBox(height: 16),
