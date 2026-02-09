@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:web/web.dart' as web;
 import '../../../../core/services/api_client.dart';
@@ -13,7 +14,8 @@ enum SetupState {
   login, // Unlocked but needs session
   forgotPassword, // Reset password flow
   complete, // Done, go to desktop
-  error, // API error
+  error, // API error (connectivity)
+  systemError, // LUKS / system failure
 }
 
 class SetupController extends ChangeNotifier {
@@ -100,6 +102,14 @@ class SetupController extends ChangeNotifier {
       _state = SetupState.loading;
       notifyListeners();
 
+      // Check emergency status first — other endpoints may be degraded.
+      final emergency = await _api.get('/api/v1/system/emergency');
+      if (emergency['emergency'] == true) {
+        _error = emergency['error'] as String? ?? 'Storage emergency mode';
+        _state = SetupState.systemError;
+        return;
+      }
+
       final status = await _api.get('/api/v1/crypto/status');
       // Expect: {"initialized": bool, "locked": bool}
 
@@ -150,6 +160,38 @@ class SetupController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Checks if an API exception represents a storage system error.
+  /// Covers LUKS data volume failures (500) and emergency middleware blocks (503).
+  bool _isStorageSystemError(ApiException e) {
+    // LUKS data volume failure (HTTP 500).
+    // Coupled to backend error message prefixes in gin_crypto_handlers.go.
+    // False negatives degrade to generic error UI.
+    if (e.statusCode == 500 &&
+        (e.message.contains('data volume initialization failed:') ||
+            e.message.contains('data volume unlock failed:'))) {
+      return true;
+    }
+    // Storage emergency mode (HTTP 503 from emergency middleware).
+    if (e.statusCode == 503 && e.message.contains('storage emergency')) {
+      return true;
+    }
+    return false;
+  }
+
+  /// Extract a human-readable error from a JSON error response body.
+  /// Prefers "message" (more descriptive, used by emergency middleware),
+  /// falls back to "error" (LUKS handlers), then to the raw body.
+  String _extractServerError(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map) {
+        if (decoded['message'] is String) return decoded['message'];
+        if (decoded['error'] is String) return decoded['error'];
+      }
+    } catch (_) {}
+    return body;
+  }
+
   Future<bool> submitCredentials(String password) async {
     try {
       _state = SetupState.finishing;
@@ -187,6 +229,16 @@ class SetupController extends ChangeNotifier {
       } else {
         throw Exception("Failed to generate recovery key");
       }
+    } on ApiException catch (e) {
+      if (_isStorageSystemError(e)) {
+        _error = _extractServerError(e.message);
+        _state = SetupState.systemError;
+      } else {
+        _error = e.toString();
+        _state = SetupState.credentials;
+      }
+      notifyListeners();
+      return false;
     } catch (e) {
       _error = e.toString();
       _state = SetupState.credentials;
@@ -229,6 +281,15 @@ class SetupController extends ChangeNotifier {
 
       notifyListeners();
       return true;
+    } on ApiException catch (e) {
+      if (_isStorageSystemError(e)) {
+        _error = _extractServerError(e.message);
+        _state = SetupState.systemError;
+      } else {
+        _error = e.toString();
+      }
+      notifyListeners();
+      return false;
     } catch (e) {
       _error = e.toString();
       notifyListeners();

@@ -113,11 +113,12 @@ class _SetupWizardState extends State<SetupWizard> {
                                 duration: const Duration(milliseconds: 300),
                                 child: _buildStepContent(state),
                               ),
-                              // Other devices panel (shown in all states except loading/finishing)
+                              // Other devices panel (shown in all states except loading/finishing/system error)
                               if (state != SetupState.loading &&
                                   state != SetupState.finishing &&
                                   state != SetupState.recovery &&
-                                  state != SetupState.security)
+                                  state != SetupState.security &&
+                                  state != SetupState.systemError)
                                 const _OtherDevicesPanel(),
                             ],
                           ),
@@ -154,6 +155,8 @@ class _SetupWizardState extends State<SetupWizard> {
         return "Reset Password";
       case SetupState.error:
         return "Connection Error";
+      case SetupState.systemError:
+        return "System Error";
       default:
         return "";
     }
@@ -220,6 +223,11 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.error:
         return _ErrorStep(
           error: _controller.error ?? "Unknown error",
+          onRetry: _controller.retry,
+        );
+      case SetupState.systemError:
+        return _SystemErrorStep(
+          error: _controller.error ?? "Unknown system error",
           onRetry: _controller.retry,
         );
       default:
@@ -1143,6 +1151,107 @@ class _ForgotPasswordStepState extends State<_ForgotPasswordStep> {
                     : const Text("Reset Password"),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SystemErrorStep extends StatefulWidget {
+  final String error;
+  final VoidCallback onRetry;
+  const _SystemErrorStep({required this.error, required this.onRetry});
+  @override
+  State<_SystemErrorStep> createState() => _SystemErrorStepState();
+}
+
+class _SystemErrorStepState extends State<_SystemErrorStep> {
+  bool _downloading = false;
+
+  Future<void> _downloadLog() async {
+    setState(() => _downloading = true);
+    try {
+      final response = await ApiClient().get('/api/v1/system/diagnostic-log');
+      if (response is! String) {
+        debugPrint('WARNING: diagnostic-log returned ${response.runtimeType}, expected String');
+      }
+      downloadTextFile(
+        response is String ? response : response?.toString() ?? '',
+        'piccolod-diagnostic.log',
+      );
+    } catch (e) {
+      debugPrint('Diagnostic log download failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Failed to download log: ${e.toString()}"),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _downloading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.warning_amber_rounded, color: PiccoloTheme.critical, size: 48),
+          const SizedBox(height: 12),
+          Text(
+            "Storage operation failed",
+            style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            "This is a system error. Download the diagnostic log and contact support.",
+            style: TextStyle(color: PiccoloTheme.inkMuted, fontSize: 13),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 12),
+          ExpansionTile(
+            tilePadding: EdgeInsets.zero,
+            childrenPadding: EdgeInsets.zero,
+            title: const Text("Details", style: TextStyle(fontSize: 13)),
+            children: [
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 120),
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: SelectionArea(
+                    child: Text(
+                      widget.error,
+                      style: const TextStyle(fontSize: 12, color: PiccoloTheme.inkMuted),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          OutlinedButton.icon(
+            onPressed: _downloading ? null : _downloadLog,
+            icon: const Icon(Icons.download, size: 16),
+            label: Text(_downloading ? "Downloading..." : "Download Diagnostic Log"),
+            style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.ink),
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            onPressed: widget.onRetry,
+            icon: const Icon(Icons.refresh),
+            label: const Text("Retry"),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: PiccoloTheme.mist,
+              foregroundColor: PiccoloTheme.ink,
+              elevation: 0,
+            ),
           ),
         ],
       ),
