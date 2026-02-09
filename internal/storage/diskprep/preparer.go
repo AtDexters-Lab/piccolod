@@ -80,6 +80,7 @@ func (p *Preparer) GetPartitionState(ctx context.Context) (*storage.PartitionSta
 		}
 	}
 	totalSectors, _ := p.getDiskSectors(ctx, disk)
+	totalSectors = totalSectors * 512 / int64(sectorSize) // blockdev --getsz always returns 512-byte sectors
 	if totalSectors > lastEndSector {
 		state.UnallocatedGB = int((totalSectors - lastEndSector) * int64(sectorSize) / (1 << 30))
 	}
@@ -101,17 +102,13 @@ func (p *Preparer) VerifyPiccoloCoreExists(ctx context.Context, corePath string)
 	return err == nil && info.IsDir()
 }
 
-// findNextPartitionSlot finds the first unused GPT slot (1-128).
-func (p *Preparer) findNextPartitionSlot(ctx context.Context, disk string) (int, error) {
-	sfdisk, err := p.readSfdisk(ctx, disk)
-	if err != nil {
-		return 0, err
-	}
-	return FindNextSlot(sfdisk), nil
-}
-
-// FindNextSlot finds the first unused GPT partition slot from sfdisk output.
+// FindNextSlot finds the first unused partition slot from sfdisk output.
+// GPT allows up to 128 slots; MBR allows 4 primary slots.
 func FindNextSlot(sfdisk storage.SfdiskOutput) int {
+	maxSlots := 128
+	if sfdisk.IsMBR() {
+		maxSlots = 4
+	}
 	used := make(map[int]bool)
 	for _, part := range sfdisk.PartitionTable.Partitions {
 		slot := extractSlotNumber(part.Node)
@@ -119,7 +116,7 @@ func FindNextSlot(sfdisk storage.SfdiskOutput) int {
 			used[slot] = true
 		}
 	}
-	for slot := 1; slot <= 128; slot++ {
+	for slot := 1; slot <= maxSlots; slot++ {
 		if !used[slot] {
 			return slot
 		}
@@ -202,19 +199,22 @@ func (p *Preparer) readSfdisk(ctx context.Context, disk string) (storage.SfdiskO
 }
 
 // findDataPartition looks for a data partition by LUKS type code or LUKS header.
+// On GPT, the LUKS type GUID provides a fast path. On MBR, there is no distinct
+// LUKS type code (both root and data use 0x83), so we go straight to header probing.
 func (p *Preparer) findDataPartition(ctx context.Context, disk string, sfdisk storage.SfdiskOutput) (node string, slot int) {
-	// Linux LUKS partition type GUID
-	const luksTypeGUID = "CA7D7CCB-63ED-4C53-861C-1742536059CC"
-
-	for _, part := range sfdisk.PartitionTable.Partitions {
-		if part.Node == "" {
-			continue
-		}
-		if strings.EqualFold(part.Type, luksTypeGUID) {
-			return part.Node, extractSlotNumber(part.Node)
+	// GPT fast path: Linux LUKS partition type GUID
+	if sfdisk.IsGPT() {
+		const luksTypeGUID = "CA7D7CCB-63ED-4C53-861C-1742536059CC"
+		for _, part := range sfdisk.PartitionTable.Partitions {
+			if part.Node == "" {
+				continue
+			}
+			if strings.EqualFold(part.Type, luksTypeGUID) {
+				return part.Node, extractSlotNumber(part.Node)
+			}
 		}
 	}
-	// Fallback: probe each non-root partition for LUKS header
+	// MBR + GPT fallback: probe each non-root partition for LUKS header
 	rootDev, _ := p.getRootDevice(ctx)
 	for _, part := range sfdisk.PartitionTable.Partitions {
 		if part.Node == "" || part.Node == rootDev {
@@ -245,26 +245,23 @@ func extractSlotNumber(node string) int {
 	return n
 }
 
-// sfdiskPartitionJSON is used for JSON marshaling in tests.
-type sfdiskPartitionJSON struct {
-	Node  string `json:"node"`
-	Start int64  `json:"start"`
-	Size  int64  `json:"size"`
-	Type  string `json:"type"`
-	Name  string `json:"name,omitempty"`
-}
-
 // BuildSfdiskJSON builds sfdisk -J compatible JSON for testing.
-func BuildSfdiskJSON(sectorSize int, partitions []storage.SfdiskPartition) []byte {
+// If label is empty, defaults to "gpt" for backwards compatibility.
+func BuildSfdiskJSON(sectorSize int, label string, partitions []storage.SfdiskPartition) []byte {
+	if label == "" {
+		label = "gpt"
+	}
 	type table struct {
-		SectorSize int                      `json:"sectorsize"`
-		Partitions []storage.SfdiskPartition `json:"partitions"`
+		SectorSize int                        `json:"sectorsize"`
+		Label      storage.PartitionTableType `json:"label"`
+		Partitions []storage.SfdiskPartition  `json:"partitions"`
 	}
 	data, _ := json.Marshal(struct {
 		PartitionTable table `json:"partitiontable"`
 	}{
 		PartitionTable: table{
 			SectorSize: sectorSize,
+			Label:      storage.PartitionTableType(label),
 			Partitions: partitions,
 		},
 	})
@@ -273,28 +270,18 @@ func BuildSfdiskJSON(sectorSize int, partitions []storage.SfdiskPartition) []byt
 
 // CreateDataPartition creates a new Linux LUKS partition using the remaining disk space.
 // The data partition is created BEFORE root expansion so it acts as a boundary for growpart.
+// Dispatches to GPT (sgdisk) or MBR (sfdisk) based on the partition table label.
 func (p *Preparer) CreateDataPartition(ctx context.Context, disk string) (string, int, error) {
-	// Repair GPT: when the OS image is written to a larger disk, the backup GPT
-	// header remains at the old end-of-disk position. sgdisk refuses to operate
-	// until this is fixed. sgdisk -e moves the backup structures to the correct
-	// position and is safe to run idempotently.
-	if err := p.run.Run(ctx, "sgdisk", "-e", disk); err != nil {
-		log.Printf("WARN: sgdisk -e (GPT repair) failed: %v (continuing)", err)
-	}
-
-	slot, err := p.findNextPartitionSlot(ctx, disk)
-	if err != nil {
-		return "", 0, fmt.Errorf("find free slot: %w", err)
-	}
-	if slot == 0 {
-		return "", 0, fmt.Errorf("no free GPT partition slot on %s", disk)
-	}
-
-	// Compute the start sector: after the root partition's target end.
 	sfdisk, err := p.readSfdisk(ctx, disk)
 	if err != nil {
 		return "", 0, fmt.Errorf("read partition table: %w", err)
 	}
+
+	slot := FindNextSlot(sfdisk)
+	if slot == 0 {
+		return "", 0, fmt.Errorf("no free partition slot on %s", disk)
+	}
+
 	diskSizeGB, err := p.getDiskSizeGB(ctx, disk)
 	if err != nil {
 		return "", 0, fmt.Errorf("disk size: %w", err)
@@ -309,8 +296,23 @@ func (p *Preparer) CreateDataPartition(ctx context.Context, disk string) (string
 		sectorSize = 512
 	}
 
+	if sfdisk.IsMBR() {
+		return p.createDataPartitionMBR(ctx, disk, sfdisk, layout, sectorSize, slot)
+	}
+	return p.createDataPartitionGPT(ctx, disk, sfdisk, layout, sectorSize, slot)
+}
+
+// createDataPartitionGPT creates the data partition on a GPT disk using sgdisk.
+func (p *Preparer) createDataPartitionGPT(ctx context.Context, disk string, sfdisk storage.SfdiskOutput, layout storage.PartitionLayout, sectorSize, slot int) (string, int, error) {
+	// Repair GPT: when the OS image is written to a larger disk, the backup GPT
+	// header remains at the old end-of-disk position. sgdisk refuses to operate
+	// until this is fixed. sgdisk -e moves the backup structures to the correct
+	// position and is safe to run idempotently.
+	if err := p.run.Run(ctx, "sgdisk", "-e", disk); err != nil {
+		log.Printf("WARN: sgdisk -e (GPT repair) failed: %v (continuing)", err)
+	}
+
 	// Start sector: root target size (in sectors) from the ESP end.
-	// We use the root target in bytes / sector size.
 	startSector := int64(layout.RootGB+storage.ESPSizeGB) * (1 << 30) / int64(sectorSize)
 
 	slotStr := strconv.Itoa(slot)
@@ -327,14 +329,70 @@ func (p *Preparer) CreateDataPartition(ctx context.Context, disk string) (string
 		return "", 0, fmt.Errorf("sgdisk create partition: %w", err)
 	}
 
+	return p.waitForPartition(ctx, disk, slot)
+}
+
+// createDataPartitionMBR creates the data partition on an MBR disk using sfdisk.
+func (p *Preparer) createDataPartitionMBR(ctx context.Context, disk string, sfdisk storage.SfdiskOutput, layout storage.PartitionLayout, sectorSize, slot int) (string, int, error) {
+	rootDev, err := p.getRootDevice(ctx)
+	if err != nil {
+		return "", 0, fmt.Errorf("detect root device: %w", err)
+	}
+
+	// Find root partition start sector from sfdisk output.
+	var rootStart int64
+	var foundRoot bool
+	for _, part := range sfdisk.PartitionTable.Partitions {
+		if part.Node == rootDev {
+			rootStart = part.Start
+			foundRoot = true
+			break
+		}
+	}
+	if !foundRoot {
+		return "", 0, fmt.Errorf("root partition %s not found in partition table", rootDev)
+	}
+
+	// Data partition starts after root's TARGET size (not its current small image size),
+	// because growpart uses the data partition as a boundary.
+	rootTargetEnd := rootStart + int64(layout.RootGB)*(1<<30)/int64(sectorSize)
+
+	// Also consider actual end of all partitions (safety: never overlap).
+	var lastEnd int64
+	for _, part := range sfdisk.PartitionTable.Partitions {
+		if end := part.Start + part.Size; end > lastEnd {
+			lastEnd = end
+		}
+	}
+
+	startSector := max(rootTargetEnd, lastEnd)
+
+	// Align to 1 MiB boundary.
+	sectorsPerMiB := int64(1<<20) / int64(sectorSize)
+	startSector = ((startSector + sectorsPerMiB - 1) / sectorsPerMiB) * sectorsPerMiB
+
+	// sfdisk -N <slot> writes to a specific partition slot.
+	// Type 83 = Linux. No size → uses remaining disk space.
+	stdin := []byte(fmt.Sprintf("start=%d, type=83\n", startSector))
+	slotStr := strconv.Itoa(slot)
+
+	if err := p.run.RunWithStdin(ctx, stdin, "sfdisk", "-N", slotStr, disk); err != nil {
+		return "", 0, fmt.Errorf("sfdisk create partition: %w", err)
+	}
+
+	return p.waitForPartition(ctx, disk, slot)
+}
+
+// waitForPartition reloads the partition table and waits for the kernel to
+// register the new partition device node (up to ~2 seconds).
+func (p *Preparer) waitForPartition(ctx context.Context, disk string, slot int) (string, int, error) {
 	if err := p.reloadPartitionTable(ctx, disk); err != nil {
 		return "", 0, fmt.Errorf("reload partition table: %w", err)
 	}
 
 	partDev := storage.PartitionDevicePath(disk, slot)
 
-	// Verify kernel registered the new partition (up to ~2 seconds).
-	for attempt := 0; attempt < 10; attempt++ {
+	for attempt := range 10 {
 		if _, err := os.Stat(partDev); err == nil {
 			log.Printf("data partition created: %s (slot %d)", partDev, slot)
 			return partDev, slot, nil
@@ -348,7 +406,7 @@ func (p *Preparer) CreateDataPartition(ctx context.Context, disk string) (string
 			return "", 0, ctx.Err()
 		}
 	}
-	return partDev, slot, nil
+	panic("unreachable")
 }
 
 // ExpandRootPartition expands the root partition and filesystem to fill
