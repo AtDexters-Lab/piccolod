@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"strings"
 
 	"piccolod/internal/crypt"
@@ -315,17 +316,41 @@ func (m *PoolManager) TestPassphrase(ctx context.Context, device string, slot in
 		device) == nil
 }
 
+// HasLUKSHeader checks if the device has a valid LUKS header.
+// Returns (true, nil) if LUKS header exists, (false, nil) if not,
+// or (false, err) if the check itself failed (missing binary, I/O error).
+func (m *PoolManager) HasLUKSHeader(ctx context.Context, device string) (bool, error) {
+	err := m.run.Run(ctx, "cryptsetup", "isLuks", device)
+	if err == nil {
+		return true, nil
+	}
+	// cryptsetup isLuks returns exit code 1 for non-LUKS devices.
+	// Only treat that specific case as "no header". Any other error
+	// (I/O, permission, missing binary) must be propagated to prevent
+	// callers from mistakenly falling back to luksFormat.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("cryptsetup isLuks: %w", err)
+}
+
 // DetectOrphanedLUKSHeader checks if a device has a LUKS header but no pool keyfile.
 // An orphan means a previous init wrote the LUKS header but crashed before persisting
 // the pool keyfile. A fresh partition (no LUKS header) is NOT orphaned.
-func (m *PoolManager) DetectOrphanedLUKSHeader(device string) bool {
-	// Must have a LUKS header on the device.
-	if err := m.run.Run(context.Background(), "cryptsetup", "isLuks", device); err != nil {
+// Returns false on any error from the header check (fail-safe).
+func (m *PoolManager) DetectOrphanedLUKSHeader(ctx context.Context, device string) bool {
+	hasHeader, err := m.HasLUKSHeader(ctx, device)
+	if err != nil {
+		log.Printf("WARN: HasLUKSHeader check failed for %s: %v", device, err)
+		return false // fail-safe: don't treat as orphaned on error
+	}
+	if !hasHeader {
 		return false // no LUKS header → not orphaned
 	}
 	// LUKS header exists but no pool keyfile → orphaned.
 	poolKeyPath := paths.CoreJoin("crypto", "piccolo_data_pool_key.enc")
-	_, err := os.Stat(poolKeyPath)
+	_, err = os.Stat(poolKeyPath)
 	return errors.Is(err, os.ErrNotExist)
 }
 

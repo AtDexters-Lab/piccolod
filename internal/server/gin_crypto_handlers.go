@@ -12,6 +12,7 @@ import (
 
 	"piccolod/internal/auth"
 	"piccolod/internal/events"
+	"piccolod/internal/health"
 	"piccolod/internal/persistence"
 )
 
@@ -95,15 +96,22 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		}
 	}
 
-	// 6. Initialize LUKS data volume (best-effort — failure is logged but doesn't
-	// block setup since gocryptfs is the primary concern).
+	// 6. Initialize LUKS data volume (mandatory — RFC §7.2, §12).
+	// Capture error but defer failure until after session creation (step 8),
+	// mirroring handleCryptoUnlock's pattern. This ensures the user gets a
+	// portal session even on LUKS failure, enabling retry/recovery from the UI.
+	var luksErr error
 	if s.storageMgr != nil {
 		if err := s.storageMgr.InitializeDataVolume(ctx, body.Password, nil); err != nil {
-			log.Printf("WARN: initialize data volume during setup: %v", err)
+			log.Printf("ERROR: data volume initialization failed: %v", err)
+			luksErr = err
+			if s.healthTracker != nil {
+				s.healthTracker.Setf("storage", health.LevelError, "data volume initialization failed")
+			}
 		}
 	}
 
-	// 7. Activate PCV publisher (ciphertext subvolume now exists after setup).
+	// 7. Activate PCV publisher (depends on gocryptfs, not LUKS — safe even on LUKS failure).
 	if s.pcvPublisher != nil {
 		s.pcvPublisher.Activate()
 	}
@@ -119,6 +127,14 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	boundOrigin := s.computeCanonicalOrigin(c)
 	sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, 3600)
 	s.setSessionCookie(c, sess.ID, time.Hour)
+
+	// Fail after session creation so the user has portal access for recovery.
+	if luksErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "data volume initialization failed: " + luksErr.Error(),
+		})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
@@ -150,13 +166,18 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
 		return
 	}
-	// Unlock LUKS data volume (best-effort — gocryptfs unlock is the critical path).
+	// Unlock LUKS data volume (mandatory — RFC §7.2, §12).
+	var luksErr error
 	if s.storageMgr != nil {
 		if err := s.storageMgr.UnlockDataVolume(c.Request.Context(), password); err != nil {
-			log.Printf("WARN: unlock data volume: %v", err)
+			log.Printf("ERROR: data volume unlock failed: %v", err)
+			luksErr = err
+			if s.healthTracker != nil {
+				s.healthTracker.Setf("storage", health.LevelError, "data volume unlock failed")
+			}
 		}
 	}
-	// Activate PCV publisher (ciphertext subvolume exists on previously-set-up devices).
+	// Activate PCV publisher (always — depends on gocryptfs, not LUKS).
 	if s.pcvPublisher != nil {
 		s.pcvPublisher.Activate()
 	}
@@ -188,6 +209,13 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 				s.setSessionCookie(c, sess.ID, time.Hour)
 			}
 		}
+	}
+	// Fail if LUKS unlock failed (after session is created for portal recovery access).
+	if luksErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "data volume unlock failed: " + luksErr.Error(),
+		})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }

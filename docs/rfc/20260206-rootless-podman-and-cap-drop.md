@@ -168,7 +168,7 @@ func applyRuntimeCredential(cmd *exec.Cmd, rt PodmanRuntime, extraEnv ...string)
 ```
 
 Key design decisions:
-- **Minimal env, not `os.Environ()`** — prevents leaking root-process variables (`PICCOLO_STATE_DIR`, `DBUS_SESSION_BUS_ADDRESS`, etc.) into rootless subprocesses. `CONTAINERS_CONF`, `CONTAINERS_REGISTRIES_CONF`, and `CONTAINERS_STORAGE_CONF` are intentionally omitted — Podman's defaults for the rootless user (`$HOME/.config/containers/`) are correct.
+- **Minimal env, not `os.Environ()`** — prevents leaking root-process variables (`PICCOLO_CORE_ROOT`, `DBUS_SESSION_BUS_ADDRESS`, etc.) into rootless subprocesses. `CONTAINERS_CONF`, `CONTAINERS_REGISTRIES_CONF`, and `CONTAINERS_STORAGE_CONF` are intentionally omitted — Podman's defaults for the rootless user (`$HOME/.config/containers/`) are correct.
 - **`extraEnv` parameter** — allows methods to inject additional variables (e.g., `TERM=xterm-256color` for terminal sessions) without overwriting the credential-aware environment.
 - **Merges into existing `SysProcAttr`** — preserves fields like `Setsid` set by PTY code. Sets `Credential` without replacing the struct.
 - **Must be called last** — enforced by convention; no method may set `cmd.Env` or `cmd.SysProcAttr.Credential` after this call.
@@ -237,9 +237,9 @@ This runs in `podmanRuntimeForApp()` and `podmanImageRuntime()` after `ensureDir
 
 Affected directories:
 - Per-app `--root` (inside encrypted volume)
-- Per-app `--runroot` (under `$PICCOLO_STATE_DIR/run/podman/`)
-- Shared `--imagestore` (under `$PICCOLO_STATE_DIR/podman/imagestore`)
-- Image root (under `$PICCOLO_STATE_DIR/podman/image-root`)
+- Per-app `--runroot` (under `$PICCOLO_CORE_ROOT/run/podman/`)
+- Shared `--imagestore` (under `$PICCOLO_CORE_ROOT/podman/imagestore`)
+- Image root (under `$PICCOLO_CORE_ROOT/podman/image-root`)
 
 **Performance**: The recursive chown must be guarded by an ownership check to avoid traversing large directory trees on every startup. The implementation must stat the root directory first and skip if already owned by `piccolo-runtime`:
 

@@ -321,12 +321,11 @@ func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string
 
 	device := m.DataDevice()
 	if device == "" {
-		log.Printf("WARN: no data partition discovered; skipping LUKS initialization")
-		return nil
+		return fmt.Errorf("no data partition discovered during phase 1")
 	}
 
 	// Check for orphaned LUKS header from a crashed previous init.
-	if m.luksPool.DetectOrphanedLUKSHeader(device) {
+	if m.luksPool.DetectOrphanedLUKSHeader(ctx, device) {
 		log.Printf("WARN: orphaned LUKS header detected; wiping before re-init")
 		if err := m.luksPool.WipeLUKSHeader(ctx, device); err != nil {
 			return fmt.Errorf("wipe orphaned LUKS header: %w", err)
@@ -373,9 +372,26 @@ func (m *Manager) UnlockDataVolume(ctx context.Context, adminPassword string) er
 		return nil
 	}
 
+	// Block until Phase 1 completes — dataDevice is set at end of Phase 1.
+	if err := m.WaitForPhase1(ctx); err != nil {
+		return fmt.Errorf("wait for phase 1: %w", err)
+	}
+
 	device := m.DataDevice()
 	if device == "" {
-		return nil
+		return fmt.Errorf("no data partition discovered during phase 1")
+	}
+
+	// Recovery: if no LUKS header, previous setup's init failed before format.
+	// Fall back to full initialization (Posture RFC §5.3).
+	// nil mnemonicKey: slot 2 is enrolled separately when recovery key is generated.
+	hasHeader, headerErr := m.luksPool.HasLUKSHeader(ctx, device)
+	if headerErr != nil {
+		return fmt.Errorf("check LUKS header on %s: %w", device, headerErr)
+	}
+	if !hasHeader {
+		log.Printf("WARN: no LUKS header on %s — falling back to initialization", device)
+		return m.InitializeDataVolume(ctx, adminPassword, nil)
 	}
 
 	if err := m.luksPool.Unlock(ctx, device, adminPassword); err != nil {

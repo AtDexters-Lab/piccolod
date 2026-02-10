@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"piccolod/internal/events"
 	"piccolod/internal/state/paths"
+	"piccolod/internal/storage/luks"
 )
 
 // fakeDiskPreparer implements DiskPreparer for testing.
@@ -378,6 +381,166 @@ func TestManager_IsPreviouslySetUp_LUKSHeader(t *testing.T) {
 	if !mgr.isPreviouslySetUp(context.Background()) {
 		t.Error("expected true when LUKS header found")
 	}
+}
+
+func TestManager_InitializeDataVolume_NoDevice_ReturnsError(t *testing.T) {
+	paths.SetRootsForTest(t)
+
+	bus := events.NewBus()
+	defer bus.Close()
+
+	prep := &fakeDiskPreparer{coreExists: true}
+	run := &fakeCommandRunner{}
+
+	mgr := &Manager{
+		diskPrep:   prep,
+		bus:        bus,
+		run:        run,
+		luksPool:   luks.NewPoolManager(run, nil),
+		phase1Done: make(chan struct{}),
+	}
+	// Simulate phase 1 complete with no data device.
+	close(mgr.phase1Done)
+	mgr.phase1Complete = true
+
+	err := mgr.InitializeDataVolume(context.Background(), "password", nil)
+	if err == nil {
+		t.Fatal("expected error when device is empty")
+	}
+	if !strings.Contains(err.Error(), "no data partition discovered") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestManager_UnlockDataVolume_NoDevice_ReturnsError(t *testing.T) {
+	paths.SetRootsForTest(t)
+
+	bus := events.NewBus()
+	defer bus.Close()
+
+	prep := &fakeDiskPreparer{coreExists: true}
+	run := &fakeCommandRunner{}
+
+	mgr := &Manager{
+		diskPrep:   prep,
+		bus:        bus,
+		run:        run,
+		luksPool:   luks.NewPoolManager(run, nil),
+		phase1Done: make(chan struct{}),
+	}
+	close(mgr.phase1Done)
+	mgr.phase1Complete = true
+
+	err := mgr.UnlockDataVolume(context.Background(), "password")
+	if err == nil {
+		t.Fatal("expected error when device is empty")
+	}
+	if !strings.Contains(err.Error(), "no data partition discovered") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestManager_UnlockDataVolume_NoLUKSHeader_FallsBackToInit(t *testing.T) {
+	paths.SetRootsForTest(t)
+
+	bus := events.NewBus()
+	defer bus.Close()
+
+	// fakeCommandRunner that fails isLuks (no header) and fails luksFormat
+	// to confirm that the fallback path was entered.
+	run := &fakeCommandRunner{
+		errs: map[string]error{
+			"cryptsetup isLuks /dev/sda3": exitCode1(),
+			// InitializeDataVolume will try luksFormat which will fail —
+			// that's fine, we just need to confirm the fallback was invoked.
+			"cryptsetup luksFormat --type luks2 --batch-mode --label piccolo-data --cipher aes-xts-plain64 --key-size 512 --hash sha256 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file /run/piccolo/piccolo_data_pool_key /dev/sda3": fmt.Errorf("simulated"),
+		},
+	}
+
+	mgr := &Manager{
+		diskPrep:   &fakeDiskPreparer{coreExists: true},
+		bus:        bus,
+		run:        run,
+		luksPool:   luks.NewPoolManager(run, nil),
+		phase1Done: make(chan struct{}),
+		dataDevice: "/dev/sda3",
+	}
+	close(mgr.phase1Done)
+	mgr.phase1Complete = true
+
+	err := mgr.UnlockDataVolume(context.Background(), "password")
+	// Should error from the init path (generate pool keyfile fails or luksFormat fails),
+	// not from unlock.
+	if err == nil {
+		t.Fatal("expected error from fallback init path")
+	}
+	// Confirm it went through the HasLUKSHeader check (isLuks call).
+	found := false
+	for _, call := range run.calls {
+		if strings.Contains(call, "isLuks") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected HasLUKSHeader (isLuks) call in fallback path")
+	}
+}
+
+// exitCode1 returns an *exec.ExitError with exit code 1.
+func exitCode1() *exec.ExitError {
+	err := exec.Command("sh", "-c", "exit 1").Run()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return exitErr
+	}
+	panic("expected *exec.ExitError")
+}
+
+// fakeCommandRunner implements runner.CommandRunner for storage manager tests.
+type fakeCommandRunner struct {
+	errs  map[string]error
+	calls []string
+}
+
+func (f *fakeCommandRunner) Run(ctx context.Context, name string, args ...string) error {
+	key := name
+	for _, a := range args {
+		key += " " + a
+	}
+	f.calls = append(f.calls, key)
+	if f.errs != nil {
+		if err, ok := f.errs[key]; ok {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *fakeCommandRunner) RunWithOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
+	key := name
+	for _, a := range args {
+		key += " " + a
+	}
+	f.calls = append(f.calls, key)
+	if f.errs != nil {
+		if err, ok := f.errs[key]; ok {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+func (f *fakeCommandRunner) RunWithStdin(ctx context.Context, stdin []byte, name string, args ...string) error {
+	key := name
+	for _, a := range args {
+		key += " " + a
+	}
+	f.calls = append(f.calls, key)
+	if f.errs != nil {
+		if err, ok := f.errs[key]; ok {
+			return err
+		}
+	}
+	return nil
 }
 
 // fakeDiskPreparerFunc allows per-method overrides for more flexible test scenarios.

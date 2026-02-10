@@ -1024,6 +1024,11 @@ func (s *GinServer) setupGinRoutes() {
 		// Storage emergency status (public)
 		v1.GET("/system/emergency", s.handleEmergencyStatus)
 
+		// Diagnostic log download (public, LAN-only, gated by health state)
+		lanDiag := v1.Group("/")
+		lanDiag.Use(s.allowLANOnly())
+		lanDiag.GET("/system/diagnostic-log", s.handleDiagnosticLog)
+
 		// PCV import (public — used during setup/recovery when no auth exists)
 		v1.POST("/system/pcv/import", s.handlePCVImport)
 

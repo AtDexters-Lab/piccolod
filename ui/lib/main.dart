@@ -37,6 +37,11 @@ Future<bool> _tryUpgradeToHttps() async {
   // and HTTPS+IP can't embed apps in iframes anyway.
   if (_isIpAddress(host)) return false;
 
+  // Skip the floating gateway hostname — any device can serve piccolo.local
+  // via leader election, each with its own CA. HTTPS upgrade would cause TLS
+  // errors when leadership changes. Device-specific hostnames still upgrade.
+  if (host == 'piccolo.local') return false;
+
   // Probe HTTPS using no-cors mode (cross-origin safe).
   // A non-throwing fetch means TLS succeeded → CA is trusted.
   try {
