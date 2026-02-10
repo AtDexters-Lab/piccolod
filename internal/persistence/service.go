@@ -46,6 +46,7 @@ type Module struct {
 	commitMu           sync.Mutex
 	lastCommitRevision uint64
 	pollCancel         context.CancelFunc
+	lockOpMu           sync.Mutex
 	lockStateMu        sync.RWMutex
 	lockState          bool
 	healthMu           sync.Mutex
@@ -250,6 +251,9 @@ func (m *Module) Consensus() ConsensusManager {
 }
 
 func (m *Module) setLockState(ctx context.Context, locked bool) error {
+	m.lockOpMu.Lock()
+	defer m.lockOpMu.Unlock()
+
 	store, ok := m.control.(lockableControlStore)
 	if !ok {
 		if locked {
@@ -268,6 +272,12 @@ func (m *Module) setLockState(ctx context.Context, locked bool) error {
 		m.lockStateMu.Lock()
 		m.lockState = true
 		m.lockStateMu.Unlock()
+		return nil
+	}
+	// Already unlocked — no-op under serialization.
+	// Safe to read lockState without lockStateMu: lockOpMu serializes all writers,
+	// and lockStateMu only exists for ControlLocked() readers on a separate path.
+	if !m.lockState {
 		return nil
 	}
 	if err := m.attachControlVolume(ctx); err != nil {
@@ -510,6 +520,44 @@ func (m *Module) startControlHealthMonitor() {
 }
 
 func (m *Module) controlHealthLoop(ctx context.Context, rep healthReporter, interval time.Duration) {
+	const maxRestarts = 3
+	for attempt := 0; attempt <= maxRestarts; attempt++ {
+		if attempt > 0 {
+			// Check context before logging to avoid spurious restart warnings
+			// during normal shutdown.
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			log.Printf("WARN: control health monitor restarting (attempt %d/%d)", attempt, maxRestarts)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(attempt) * 30 * time.Second):
+			}
+		}
+		m.runControlHealthLoop(ctx, rep, interval)
+	}
+	log.Printf("CRITICAL: control health monitor exhausted restarts, stopping permanently")
+}
+
+func (m *Module) runControlHealthLoop(ctx context.Context, rep healthReporter, interval time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("CRITICAL: control health monitor panic: %v", r)
+			if m.events != nil {
+				m.events.Publish(events.Event{
+					Topic: events.TopicControlHealth,
+					Payload: ControlHealthReport{
+						Status:    ControlHealthStatusError,
+						Message:   fmt.Sprintf("health monitor crashed: %v", r),
+						CheckedAt: time.Now().UTC(),
+					},
+				})
+			}
+		}
+	}()
 	m.runControlHealth(rep)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

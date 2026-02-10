@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -146,4 +148,75 @@ func (s *stubVolumeManager) RoleStream(id string) (<-chan VolumeRole, error) {
 	ch := make(chan VolumeRole)
 	close(ch)
 	return ch, nil
+}
+
+func TestSetLockState_idempotent(t *testing.T) {
+	t.Parallel()
+
+	var attachCount atomic.Int32
+	vol := &stubVolumeManager{}
+	vol.onAttach = func(context.Context, VolumeHandle, AttachOptions) error {
+		attachCount.Add(1)
+		return nil
+	}
+	ctrl := &stubLockableControl{}
+
+	mod := &Module{
+		control:       ctrl,
+		volumes:       vol,
+		controlHandle: VolumeHandle{ID: "control-plane", MountDir: t.TempDir()},
+		lockState:     true,
+	}
+
+	// First unlock should attach.
+	if err := mod.setLockState(context.Background(), false); err != nil {
+		t.Fatalf("first unlock: %v", err)
+	}
+	if got := attachCount.Load(); got != 1 {
+		t.Fatalf("expected 1 attach, got %d", got)
+	}
+
+	// Second unlock should be a no-op (idempotent).
+	if err := mod.setLockState(context.Background(), false); err != nil {
+		t.Fatalf("second unlock: %v", err)
+	}
+	if got := attachCount.Load(); got != 1 {
+		t.Fatalf("expected still 1 attach after idempotent unlock, got %d", got)
+	}
+}
+
+func TestSetLockState_concurrent(t *testing.T) {
+	t.Parallel()
+
+	var attachCount atomic.Int32
+	vol := &stubVolumeManager{}
+	vol.onAttach = func(context.Context, VolumeHandle, AttachOptions) error {
+		attachCount.Add(1)
+		// Simulate work to widen the race window.
+		time.Sleep(10 * time.Millisecond)
+		return nil
+	}
+	ctrl := &stubLockableControl{}
+
+	mod := &Module{
+		control:       ctrl,
+		volumes:       vol,
+		controlHandle: VolumeHandle{ID: "control-plane", MountDir: t.TempDir()},
+		lockState:     true,
+	}
+
+	const goroutines = 10
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			_ = mod.setLockState(context.Background(), false)
+		}()
+	}
+	wg.Wait()
+
+	if got := attachCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 attach from concurrent unlocks, got %d", got)
+	}
 }

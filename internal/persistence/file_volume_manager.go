@@ -159,6 +159,7 @@ type volumeEntry struct {
 	role          VolumeRole
 	process       mountProcess
 	metaMu        sync.Mutex
+	mountMu       sync.Mutex
 }
 
 type volumeMetadata struct {
@@ -356,7 +357,21 @@ func (f *fileVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 		return VolumeHandle{}, fmt.Errorf("ensure volume %s ciphertext: %w", req.ID, err)
 	}
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
-		return VolumeHandle{}, fmt.Errorf("ensure volume %s mount: %w", req.ID, err)
+		// MkdirAll can fail on a stale FUSE inode left by a previous crash.
+		// If the path is still a mountpoint, lazy-unmount and retry.
+		if mounted, mErr := isMountPoint(mountDir); mErr == nil && mounted {
+			log.Printf("WARN: volume %s: stale mount at %s during init, cleaning up", req.ID, mountDir)
+			if fErr := f.runner.Run(ctx, f.fusermountPath, []string{"-uz", mountDir}, nil); fErr != nil {
+				log.Printf("WARN: volume %s: fusermount cleanup failed: %v", req.ID, fErr)
+			}
+			if shouldGuardMountDir(req.ID) {
+				_ = unprotectMountDir(mountDir)
+			}
+			err = os.MkdirAll(mountDir, 0o700)
+		}
+		if err != nil {
+			return VolumeHandle{}, fmt.Errorf("ensure volume %s mount: %w", req.ID, err)
+		}
 	}
 	if shouldGuardMountDir(req.ID) && !f.bypassMount {
 		if mounted, err := isMountPoint(mountDir); err == nil && !mounted {
@@ -389,6 +404,37 @@ func (f *fileVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 	}
 	if opts.Role == VolumeRoleLeader && checker != nil && !checker(handle.ID, opts.Role) {
 		return fmt.Errorf("attach: leadership not granted for volume %s", handle.ID)
+	}
+
+	// Serialize mount operations for this volume to ensure idempotency.
+	entry.mountMu.Lock()
+	defer entry.mountMu.Unlock()
+
+	// Volume already mounted by this process — return early.
+	// Defense-in-depth below handles stale mounts from previous processes only.
+	// We probe the Wait channel to detect a gocryptfs process that died without
+	// an explicit Detach (awaitProcessExit only runs during Detach).
+	if alive := func() bool {
+		f.mu.RLock()
+		p := entry.process
+		f.mu.RUnlock()
+		if p == nil {
+			return false
+		}
+		select {
+		case <-p.Wait():
+			// Process exited unexpectedly — clear and fall through to re-mount.
+			f.mu.Lock()
+			if entry.process == p {
+				entry.process = nil
+			}
+			f.mu.Unlock()
+			return false
+		default:
+			return true
+		}
+	}(); alive {
+		return nil
 	}
 
 	if err := os.MkdirAll(handle.MountDir, 0o700); err != nil {

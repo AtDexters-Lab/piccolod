@@ -218,6 +218,11 @@ func TestFileVolumeManagerAttachRoles(t *testing.T) {
 		t.Fatalf("unexpected leader args: %+v", launcher.calls[0].args)
 	}
 
+	// Detach before re-attaching with a different role. Without this,
+	// Attach correctly short-circuits (entry.process != nil idempotency).
+	if err := mgr.Detach(context.Background(), h); err != nil {
+		t.Fatalf("detach before follower: %v", err)
+	}
 	launcher.calls = launcher.calls[:0]
 	if err := mgr.Attach(context.Background(), h, AttachOptions{Role: VolumeRoleFollower}); err != nil {
 		t.Fatalf("attach follower: %v", err)
@@ -231,6 +236,35 @@ func TestFileVolumeManagerAttachRoles(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(h.MountDir, ".mode")); err != nil || string(data) != "ro" {
 		t.Fatalf("expected mode ro, got %v %q", err, string(data))
+	}
+}
+
+func TestFileVolumeManagerAttachIdempotent(t *testing.T) {
+	root := t.TempDir()
+	cryptoMgr := newUnlockedCrypto(t, root)
+	runner := &fakeRunner{}
+	launcher := &fakeMountLauncher{}
+	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
+
+	h, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "idem", Class: VolumeClassApplication})
+	if err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+
+	if err := mgr.Attach(context.Background(), h, AttachOptions{Role: VolumeRoleLeader}); err != nil {
+		t.Fatalf("first attach: %v", err)
+	}
+	if len(launcher.calls) != 1 {
+		t.Fatalf("expected 1 launch, got %d", len(launcher.calls))
+	}
+
+	// Second attach with same role should be idempotent (entry.process != nil).
+	launcher.calls = launcher.calls[:0]
+	if err := mgr.Attach(context.Background(), h, AttachOptions{Role: VolumeRoleLeader}); err != nil {
+		t.Fatalf("second attach (idempotent): %v", err)
+	}
+	if len(launcher.calls) != 0 {
+		t.Fatalf("expected no launch on idempotent attach, got %d", len(launcher.calls))
 	}
 }
 

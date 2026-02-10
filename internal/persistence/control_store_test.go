@@ -133,6 +133,9 @@ func TestSQLiteControlStoreLifecycle(t *testing.T) {
 		t.Fatalf("unexpected revision/checksum: rev=%d checksum=%q", rev, checksum)
 	}
 
+	// Close the first store to release the exclusive lock before restart.
+	store.Close(context.Background())
+
 	// Rehydrate via a new store to simulate restart.
 	store2, err := newSQLiteControlStore(dir, staticKeyProvider{key: key})
 	if err != nil {
@@ -310,6 +313,30 @@ func TestSQLiteControlStoreQuickCheckLocked(t *testing.T) {
 	}
 }
 
+func TestSQLiteControlStoreLockingModeExclusive(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	key, _ := hex.DecodeString("7f1c8a6c3b5d7e91aabbccddeeff00112233445566778899aabbccddeeff0011")
+	prepareControlCipherDir(t, dir)
+
+	store, err := newSQLiteControlStore(dir, staticKeyProvider{key: key})
+	if err != nil {
+		t.Fatalf("newSQLiteControlStore: %v", err)
+	}
+	defer store.Close(context.Background())
+	if err := store.Unlock(context.Background()); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+
+	var mode string
+	if err := store.db.QueryRow(`PRAGMA locking_mode`).Scan(&mode); err != nil {
+		t.Fatalf("query locking_mode: %v", err)
+	}
+	if mode != "exclusive" {
+		t.Fatalf("expected locking_mode=exclusive, got %q", mode)
+	}
+}
+
 func TestSQLiteControlStoreCheckpointInvoked(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
@@ -424,6 +451,9 @@ func TestSQLiteControlStoreAuthStalenessPersists(t *testing.T) {
 		t.Fatalf("stale timestamps should remain, got %+v", st)
 	}
 
+	// Close the first store to release the exclusive lock before restart.
+	store.Close(context.Background())
+
 	store2, err := newSQLiteControlStore(dir, staticKeyProvider{key: key})
 	if err != nil {
 		t.Fatalf("newSQLiteControlStore restart: %v", err)
@@ -453,7 +483,14 @@ func prepareControlCipherDir(t *testing.T, root string) {
 	if err := os.WriteFile(filepath.Join(cipherDir, gocryptfsConfigName), []byte("stub"), 0o600); err != nil {
 		t.Fatalf("write gocryptfs.conf: %v", err)
 	}
-	
+
+	// Mount directory — production code creates this via EnsureVolume,
+	// but unit tests use the store directly.
+	mountDir := filepath.Join(root, "mounts", "control-plane")
+	if err := os.MkdirAll(mountDir, 0o700); err != nil {
+		t.Fatalf("mkdir mountDir: %v", err)
+	}
+
 	// Metadata now lives in volumes/<id>
 	stateDir := filepath.Join(root, "volumes", "control-plane")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
@@ -499,6 +536,13 @@ func TestSQLiteControlStoreMigratesLegacyMetadata(t *testing.T) {
 	legacyPath := filepath.Join(cipherDir, controlVolumeMetadataName)
 	if err := os.WriteFile(legacyPath, data, 0o600); err != nil {
 		t.Fatalf("write legacy metadata: %v", err)
+	}
+
+	// Mount directory — production code creates this via EnsureVolume,
+	// but unit tests use the store directly.
+	mountDir := filepath.Join(dir, "mounts", "control-plane")
+	if err := os.MkdirAll(mountDir, 0o700); err != nil {
+		t.Fatalf("mkdir mountDir: %v", err)
 	}
 
 	// Ensure new location is empty

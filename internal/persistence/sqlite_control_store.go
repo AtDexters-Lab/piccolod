@@ -116,9 +116,8 @@ func newSQLiteControlStore(stateDir string, kp keyProvider) (*sqliteControlStore
 		return nil, err
 	}
 	mountDir := filepath.Join(base, "mounts", "control-plane")
-	if err := os.MkdirAll(mountDir, 0o700); err != nil {
-		return nil, err
-	}
+	// mountDir is created later by EnsureVolume — not here — to avoid
+	// MkdirAll failing on a stale FUSE inode from a previous crash.
 	metaDir := filepath.Join(base, "volumes", "control-plane")
 	if err := os.MkdirAll(metaDir, 0o700); err != nil {
 		return nil, err
@@ -147,6 +146,12 @@ func configureSQLite(db *sql.DB, readOnly bool) error {
 			return fmt.Errorf("set query_only: %w", err)
 		}
 		return nil
+	}
+	// EXCLUSIVE locking stores the WAL index in heap memory instead of
+	// memory-mapping a .db-shm file. If the FUSE mount disappears, SQLite
+	// returns SQLITE_IOERR (catchable) instead of SIGBUS from stale mmap pages.
+	if _, err := db.Exec(`PRAGMA locking_mode=EXCLUSIVE;`); err != nil {
+		return fmt.Errorf("set locking mode: %w", err)
 	}
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
 		return fmt.Errorf("set journal mode: %w", err)
@@ -930,6 +935,9 @@ func (s *sqliteControlStore) openDB() error {
 		db.Close()
 		return err
 	}
+	// EXCLUSIVE locking in WAL mode restricts access to the single connection
+	// that set the PRAGMA. Prevent the pool from opening unusable connections.
+	db.SetMaxOpenConns(1)
 	if !s.readOnly {
 		if err := applyMigrations(db); err != nil {
 			db.Close()
