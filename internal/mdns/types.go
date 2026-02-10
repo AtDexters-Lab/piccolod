@@ -163,4 +163,7 @@ type Manager struct {
 	announceDebounceTimer *time.Timer
 	announcePending       bool
 
+	// Failed interface setup tracking (prevents log spam from repeated failures)
+	failedSetups map[string]time.Time
+
 }

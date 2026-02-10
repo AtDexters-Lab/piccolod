@@ -355,6 +355,10 @@ func (m *Manager) createIPv6Socket(iface *net.Interface) (*net.UDPConn, error) {
 	return conn, nil
 }
 
+// failedSetupCooldown is how long to wait before retrying a failed interface setup.
+// Short enough to recover promptly after DHCP/SLAAC assigns an address (3 polling cycles).
+const failedSetupCooldown = 30 * time.Second
+
 // networkMonitor continuously monitors network interface changes
 func (m *Manager) networkMonitor() {
 	defer m.wg.Done()
@@ -388,6 +392,7 @@ func (m *Manager) checkInterfaceChanges() {
 	defer m.mutex.Unlock()
 
 	seenInterfaces := make(map[string]bool)
+	needsAnnounce := false
 
 	// Check each interface
 	for _, iface := range interfaces {
@@ -417,8 +422,24 @@ func (m *Manager) checkInterfaceChanges() {
 			if ifaceCopy.Flags&net.FlagMulticast == 0 || isVirtualInterface(ifaceCopy.Name) {
 				continue
 			}
+
+			// Check if recently failed — avoid log spam from repeated failures
+			if lastAttempt, failed := m.failedSetups[ifaceCopy.Name]; failed {
+				if time.Since(lastAttempt) < failedSetupCooldown {
+					continue
+				}
+				log.Printf("DEBUG: Retrying previously failed interface %s (cooldown expired)", ifaceCopy.Name)
+				delete(m.failedSetups, ifaceCopy.Name)
+			}
+
 			log.Printf("INFO: New interface detected: %s", ifaceCopy.Name)
-			m.setupInterface(&ifaceCopy)
+			if err := m.setupInterface(&ifaceCopy); err != nil {
+				log.Printf("WARN: Failed to setup new interface %s: %v", ifaceCopy.Name, err)
+				m.failedSetups[ifaceCopy.Name] = time.Now()
+			} else {
+				delete(m.failedSetups, ifaceCopy.Name)
+				needsAnnounce = true
+			}
 		}
 	}
 
@@ -434,6 +455,24 @@ func (m *Manager) checkInterfaceChanges() {
 			}
 			delete(m.interfaces, name)
 		}
+	}
+
+	// Clean up failedSetups for interfaces that disappeared
+	for name := range m.failedSetups {
+		if !seenInterfaces[name] {
+			delete(m.failedSetups, name)
+		}
+	}
+
+	// Announce on new interface join so device is immediately visible
+	if needsAnnounce {
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.sendServiceAnnouncement()
+			m.sendMultiInterfaceAnnouncements()
+			m.sendPeerDiscoveryQuery()
+		}()
 	}
 }
 

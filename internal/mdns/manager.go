@@ -87,6 +87,9 @@ func NewManager() *Manager {
 		// Service endpoint observation
 		appHostLabels: make(map[string][]string),
 
+		// Failed interface setup tracking
+		failedSetups: make(map[string]time.Time),
+
 		// Gateway leadership
 		specificHostname: specificName + ".local",
 		gatewayLeader:    NewGatewayLeader(machineID),

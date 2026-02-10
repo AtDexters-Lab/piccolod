@@ -3,6 +3,7 @@ package mdns
 import (
 	"net"
 	"testing"
+	"time"
 )
 
 func TestDiscoverInterfaces_RealNetwork(t *testing.T) {
@@ -249,6 +250,280 @@ func TestInterfaceResponder_Goroutine(t *testing.T) {
 	}()
 
 	manager.wg.Wait()
+}
+
+func TestCheckInterfaceChanges_FailedSetupCooldown(t *testing.T) {
+	// Setup: stub network with wlan0 that has no addresses (will fail setupInterface)
+	env := stubNetworkEnv{
+		interfaces: []net.Interface{
+			{Index: 1, MTU: 1500, Name: "eth0", Flags: net.FlagUp | net.FlagMulticast},
+			{Index: 2, MTU: 1500, Name: "wlan0", Flags: net.FlagUp | net.FlagMulticast},
+		},
+		addrMap: map[string][]net.Addr{
+			"eth0": {&net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)}},
+			// wlan0 deliberately has no addresses → setupInterface will fail
+		},
+	}
+	installStubNetworkEnv(t, env)
+
+	manager := NewManager()
+	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	manager.ipv6SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { manager.Stop() })
+
+	// First call: discovers eth0 (success) and wlan0 (fails, recorded in failedSetups)
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	_, eth0Exists := manager.interfaces["eth0"]
+	_, wlan0Exists := manager.interfaces["wlan0"]
+	failedTime, wlan0Failed := manager.failedSetups["wlan0"]
+	manager.mutex.RUnlock()
+
+	if !eth0Exists {
+		t.Fatal("eth0 should be in interfaces")
+	}
+	if wlan0Exists {
+		t.Fatal("wlan0 should NOT be in interfaces (setup should have failed)")
+	}
+	if !wlan0Failed {
+		t.Fatal("wlan0 should be in failedSetups")
+	}
+	if time.Since(failedTime) > time.Second {
+		t.Fatal("failedSetups timestamp should be recent")
+	}
+
+	// Second call: wlan0 should be skipped (still in cooldown)
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	failedTime2, wlan0StillFailed := manager.failedSetups["wlan0"]
+	manager.mutex.RUnlock()
+
+	if !wlan0StillFailed {
+		t.Fatal("wlan0 should still be in failedSetups after second check")
+	}
+	if failedTime2 != failedTime {
+		t.Fatal("failedSetups timestamp should not change during cooldown (setup not re-attempted)")
+	}
+}
+
+func TestCheckInterfaceChanges_FailedSetupRetryAfterCooldown(t *testing.T) {
+	env := stubNetworkEnv{
+		interfaces: []net.Interface{
+			{Index: 2, MTU: 1500, Name: "wlan0", Flags: net.FlagUp | net.FlagMulticast},
+		},
+		addrMap: map[string][]net.Addr{
+			// wlan0 has no addresses → fails
+		},
+	}
+	installStubNetworkEnv(t, env)
+
+	manager := NewManager()
+	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	manager.ipv6SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { manager.Stop() })
+
+	// First call: wlan0 fails
+	manager.checkInterfaceChanges()
+
+	// Backdate the failure timestamp to simulate cooldown expiry
+	manager.mutex.Lock()
+	manager.failedSetups["wlan0"] = time.Now().Add(-failedSetupCooldown - time.Second)
+	manager.mutex.Unlock()
+
+	// Second call: cooldown expired, should retry (and fail again with new timestamp)
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	failedTime, exists := manager.failedSetups["wlan0"]
+	manager.mutex.RUnlock()
+
+	if !exists {
+		t.Fatal("wlan0 should still be in failedSetups after retry failure")
+	}
+	if time.Since(failedTime) > time.Second {
+		t.Fatal("failedSetups timestamp should be updated after retry")
+	}
+}
+
+func TestCheckInterfaceChanges_FailedSetupCleanupOnDisappear(t *testing.T) {
+	env := stubNetworkEnv{
+		interfaces: []net.Interface{
+			{Index: 2, MTU: 1500, Name: "wlan0", Flags: net.FlagUp | net.FlagMulticast},
+		},
+		addrMap: map[string][]net.Addr{},
+	}
+	installStubNetworkEnv(t, env)
+
+	manager := NewManager()
+	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	manager.ipv6SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { manager.Stop() })
+
+	// First call: wlan0 fails
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	_, exists := manager.failedSetups["wlan0"]
+	manager.mutex.RUnlock()
+	if !exists {
+		t.Fatal("wlan0 should be in failedSetups")
+	}
+
+	// Now wlan0 disappears from the system
+	interfaceFuncsMu.Lock()
+	listNetworkInterfaces = func() ([]net.Interface, error) {
+		return nil, nil
+	}
+	interfaceFuncsMu.Unlock()
+
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	_, stillExists := manager.failedSetups["wlan0"]
+	manager.mutex.RUnlock()
+	if stillExists {
+		t.Fatal("wlan0 should be cleaned from failedSetups when interface disappears")
+	}
+}
+
+func TestCheckInterfaceChanges_SuccessAfterFailure(t *testing.T) {
+	setupCallCount := 0
+
+	env := stubNetworkEnv{
+		interfaces: []net.Interface{
+			{Index: 2, MTU: 1500, Name: "wlan0", Flags: net.FlagUp | net.FlagMulticast},
+		},
+		addrMap: map[string][]net.Addr{
+			// Initially empty — wlan0 will fail
+		},
+	}
+	installStubNetworkEnv(t, env)
+
+	manager := NewManager()
+	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		setupCallCount++
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	manager.ipv6SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { manager.Stop() })
+
+	// First call: wlan0 fails (no addresses)
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	_, inFailed := manager.failedSetups["wlan0"]
+	manager.mutex.RUnlock()
+	if !inFailed {
+		t.Fatal("wlan0 should be in failedSetups")
+	}
+
+	// Backdate cooldown and give wlan0 an address
+	manager.mutex.Lock()
+	manager.failedSetups["wlan0"] = time.Now().Add(-failedSetupCooldown - time.Second)
+	manager.mutex.Unlock()
+
+	interfaceFuncsMu.Lock()
+	interfaceAddrs = func(iface *net.Interface) ([]net.Addr, error) {
+		return []net.Addr{
+			&net.IPNet{IP: net.ParseIP("192.168.1.20"), Mask: net.CIDRMask(24, 32)},
+		}, nil
+	}
+	interfaceFuncsMu.Unlock()
+
+	// Second call: cooldown expired, wlan0 now has address → succeeds
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	_, stillInFailed := manager.failedSetups["wlan0"]
+	_, inInterfaces := manager.interfaces["wlan0"]
+	manager.mutex.RUnlock()
+
+	if stillInFailed {
+		t.Fatal("wlan0 should be removed from failedSetups after successful setup")
+	}
+	if !inInterfaces {
+		t.Fatal("wlan0 should be in interfaces after successful setup")
+	}
+}
+
+func TestCheckInterfaceChanges_AnnouncesOnNewInterface(t *testing.T) {
+	// Start with eth0, then add wlan0 — verify announcement goroutine is launched
+	env := stubNetworkEnv{
+		interfaces: []net.Interface{
+			{Index: 1, MTU: 1500, Name: "eth0", Flags: net.FlagUp | net.FlagMulticast},
+		},
+		addrMap: map[string][]net.Addr{
+			"eth0": {&net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)}},
+		},
+	}
+	installStubNetworkEnv(t, env)
+
+	manager := NewManager()
+	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	manager.ipv6SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { manager.Stop() })
+
+	// Initial discovery
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	_, eth0Exists := manager.interfaces["eth0"]
+	manager.mutex.RUnlock()
+	if !eth0Exists {
+		t.Fatal("eth0 should be discovered")
+	}
+
+	// Now add wlan0 to the stub network
+	interfaceFuncsMu.Lock()
+	listNetworkInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{
+			{Index: 1, MTU: 1500, Name: "eth0", Flags: net.FlagUp | net.FlagMulticast},
+			{Index: 2, MTU: 1500, Name: "wlan0", Flags: net.FlagUp | net.FlagMulticast},
+		}, nil
+	}
+	interfaceAddrs = func(iface *net.Interface) ([]net.Addr, error) {
+		switch iface.Name {
+		case "eth0":
+			return []net.Addr{&net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)}}, nil
+		case "wlan0":
+			return []net.Addr{&net.IPNet{IP: net.ParseIP("192.168.1.20"), Mask: net.CIDRMask(24, 32)}}, nil
+		}
+		return nil, nil
+	}
+	interfaceFuncsMu.Unlock()
+
+	// This should discover wlan0 and launch announcement goroutine
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	_, wlan0Exists := manager.interfaces["wlan0"]
+	manager.mutex.RUnlock()
+	if !wlan0Exists {
+		t.Fatal("wlan0 should be discovered and set up")
+	}
+
+	// The announcement goroutine is wg-tracked and completes during manager.Stop().
+	// The wlan0 addition to m.interfaces (the key assertion) is synchronous.
 }
 
 func TestIsVirtualInterface(t *testing.T) {
