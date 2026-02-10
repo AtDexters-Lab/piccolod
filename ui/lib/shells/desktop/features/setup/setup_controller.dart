@@ -105,9 +105,15 @@ class SetupController extends ChangeNotifier {
       // Check emergency status first — other endpoints may be degraded.
       final emergency = await _api.get('/api/v1/system/emergency');
       if (emergency['emergency'] == true) {
-        _error = emergency['error'] as String? ?? 'Storage emergency mode';
-        _state = SetupState.systemError;
-        return;
+        final level = emergency['level'] as String?;
+        if (level != 'soft') {
+          // Hard emergency: irrecoverable, show system error.
+          _error = emergency['error'] as String? ?? 'Storage emergency mode';
+          _state = SetupState.systemError;
+          return;
+        }
+        // Soft emergency: device was previously set up. Fall through to
+        // crypto/status check so the user can reach the unlock screen.
       }
 
       final status = await _api.get('/api/v1/crypto/status');

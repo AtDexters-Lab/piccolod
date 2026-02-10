@@ -2,8 +2,10 @@ package diskprep
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +13,18 @@ import (
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage"
 )
+
+// makeExitError runs a trivial shell command that exits with the given code
+// and returns the resulting *exec.ExitError. Used by tests that need a real
+// ExitError to satisfy errors.As checks in production code (e.g. hasFilesystem).
+func makeExitError(code int) *exec.ExitError {
+	err := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code)).Run()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr
+	}
+	panic(fmt.Sprintf("expected *exec.ExitError for exit code %d, got %T: %v", code, err, err))
+}
 
 // fakeRunner is a test double for runner.CommandRunner.
 type fakeRunner struct {
@@ -344,16 +358,16 @@ func TestCreateDataPartition_MBR(t *testing.T) {
 		}
 	}
 
-	// Verify sfdisk -N 3 was called
+	// Verify sfdisk --force --no-reread -N 3 was called
 	found := false
 	for _, c := range calls {
-		if strings.HasPrefix(c, "sfdisk -N 3 /dev/mmcblk0") {
+		if strings.HasPrefix(c, "sfdisk --force --no-reread -N 3 /dev/mmcblk0") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("expected sfdisk -N 3 call, got calls: %v", calls)
+		t.Errorf("expected sfdisk --force --no-reread -N 3 call, got calls: %v", calls)
 	}
 
 	// Verify stdin contains correct start sector and type
@@ -411,9 +425,20 @@ func TestCreateDataPartition_GPT(t *testing.T) {
 		t.Errorf("expected sgdisk -n call for partition creation, got calls: %v", calls)
 	}
 
+	// Verify partx --add --nr 3:3 was called for targeted partition registration
+	foundPartx := false
+	for _, c := range calls {
+		if c == "partx --add --nr 3:3 /dev/sda" {
+			foundPartx = true
+		}
+	}
+	if !foundPartx {
+		t.Errorf("expected partx --add --nr 3:3 call, got calls: %v", calls)
+	}
+
 	// Verify sfdisk -N was NOT called
 	for _, c := range calls {
-		if strings.HasPrefix(c, "sfdisk -N") {
+		if strings.HasPrefix(c, "sfdisk -N") || strings.HasPrefix(c, "sfdisk --force") {
 			t.Errorf("sfdisk -N should not be called on GPT disk, got: %s", c)
 		}
 	}
@@ -449,6 +474,70 @@ func TestFindDataPartition_MBR_SkipsRoot(t *testing.T) {
 	}
 }
 
+func TestFindDataPartition_MBR_PreInitNoLUKS(t *testing.T) {
+	// Data partition created in Phase 1 but not yet LUKS-initialized (reboot
+	// before setup). findDataPartition should still detect it via the MBR
+	// type-83 fallback so Phase 1 doesn't create a duplicate partition.
+	sfdiskJSON := BuildSfdiskJSON(512, "dos", []storage.SfdiskPartition{
+		{Node: "/dev/mmcblk0p1", Start: 8192, Size: 524288, Type: "c"},
+		{Node: "/dev/mmcblk0p2", Start: 532480, Size: 4194304, Type: "83"},
+		{Node: "/dev/mmcblk0p3", Start: 43294720, Size: 24117248, Type: "83"},
+	})
+
+	sfdisk, _ := storage.ParseSfdiskJSON(sfdiskJSON)
+	run := &fakeRunner{
+		outputs: map[string]string{
+			"findmnt -nro SOURCE /": "/dev/mmcblk0p2",
+		},
+		errs: map[string]error{
+			// Neither non-root partition has a LUKS header.
+			"cryptsetup isLuks /dev/mmcblk0p1": fmt.Errorf("exit status 1"),
+			"cryptsetup isLuks /dev/mmcblk0p3": fmt.Errorf("exit status 1"),
+			// p3 is raw (no filesystem signature) — blkid exit code 2.
+			// Must be a real *exec.ExitError so hasFilesystem's errors.As check matches.
+			"blkid -p /dev/mmcblk0p3": makeExitError(2),
+		},
+	}
+	p := NewPreparer(run)
+	node, slot := p.findDataPartition(context.Background(), "/dev/mmcblk0", sfdisk)
+	if node != "/dev/mmcblk0p3" {
+		t.Errorf("findDataPartition node = %q, want /dev/mmcblk0p3", node)
+	}
+	if slot != 3 {
+		t.Errorf("findDataPartition slot = %d, want 3", slot)
+	}
+}
+
+func TestFindDataPartition_MBR_SkipsExistingFilesystem(t *testing.T) {
+	// A non-root type-83 partition with an existing filesystem should NOT be
+	// matched by the MBR fallback to avoid LUKS-formatting user data.
+	sfdiskJSON := BuildSfdiskJSON(512, "dos", []storage.SfdiskPartition{
+		{Node: "/dev/mmcblk0p1", Start: 8192, Size: 524288, Type: "c"},
+		{Node: "/dev/mmcblk0p2", Start: 532480, Size: 4194304, Type: "83"},
+		{Node: "/dev/mmcblk0p3", Start: 43294720, Size: 24117248, Type: "83"},
+	})
+
+	sfdisk, _ := storage.ParseSfdiskJSON(sfdiskJSON)
+	run := &fakeRunner{
+		outputs: map[string]string{
+			"findmnt -nro SOURCE /": "/dev/mmcblk0p2",
+		},
+		errs: map[string]error{
+			"cryptsetup isLuks /dev/mmcblk0p1": fmt.Errorf("exit status 1"),
+			"cryptsetup isLuks /dev/mmcblk0p3": fmt.Errorf("exit status 1"),
+			// p3 has an existing filesystem — blkid exits 0 (no error).
+		},
+	}
+	p := NewPreparer(run)
+	node, slot := p.findDataPartition(context.Background(), "/dev/mmcblk0", sfdisk)
+	if node != "" {
+		t.Errorf("findDataPartition node = %q, want empty (partition has filesystem)", node)
+	}
+	if slot != 0 {
+		t.Errorf("findDataPartition slot = %d, want 0", slot)
+	}
+}
+
 // compositeRunner combines fakeRunner outputs with call recording + stdin capture.
 type compositeRunner struct {
 	fake          *fakeRunner
@@ -472,4 +561,71 @@ func (c *compositeRunner) RunWithStdin(ctx context.Context, stdin []byte, name s
 		*c.stdinCaptures = append(*c.stdinCaptures, append([]byte(nil), stdin...))
 	}
 	return c.fake.RunWithStdin(ctx, stdin, name, args...)
+}
+
+func TestRegisterNewPartition(t *testing.T) {
+	t.Run("partx_add_succeeds", func(t *testing.T) {
+		var calls []string
+		run := &compositeRunner{
+			fake:  &fakeRunner{},
+			calls: &calls,
+		}
+		p := NewPreparer(run)
+		err := p.registerNewPartition(context.Background(), "/dev/sda", 3)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 call, got %d: %v", len(calls), calls)
+		}
+		if calls[0] != "partx --add --nr 3:3 /dev/sda" {
+			t.Errorf("call = %q, want partx --add --nr 3:3 /dev/sda", calls[0])
+		}
+	})
+
+	t.Run("fallback_to_full_reload", func(t *testing.T) {
+		var calls []string
+		run := &compositeRunner{
+			fake: &fakeRunner{
+				errs: map[string]error{
+					"partx --add --nr 3:3 /dev/sda": fmt.Errorf("BLKPG_ADD failed"),
+				},
+			},
+			calls: &calls,
+		}
+		p := NewPreparer(run)
+		err := p.registerNewPartition(context.Background(), "/dev/sda", 3)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Should have called partx --add, then fallen back to partprobe
+		if len(calls) < 2 {
+			t.Fatalf("expected at least 2 calls, got %d: %v", len(calls), calls)
+		}
+		if calls[0] != "partx --add --nr 3:3 /dev/sda" {
+			t.Errorf("first call = %q, want partx --add --nr 3:3 /dev/sda", calls[0])
+		}
+		if calls[1] != "partprobe /dev/sda" {
+			t.Errorf("second call = %q, want partprobe /dev/sda", calls[1])
+		}
+	})
+
+	t.Run("all_methods_fail", func(t *testing.T) {
+		var calls []string
+		run := &compositeRunner{
+			fake: &fakeRunner{
+				errs: map[string]error{
+					"partx --add --nr 3:3 /dev/sda": fmt.Errorf("BLKPG_ADD failed"),
+					"partprobe /dev/sda":           fmt.Errorf("BLKRRPART failed"),
+					"partx -u /dev/sda":            fmt.Errorf("partx -u failed"),
+				},
+			},
+			calls: &calls,
+		}
+		p := NewPreparer(run)
+		err := p.registerNewPartition(context.Background(), "/dev/sda", 3)
+		if err == nil {
+			t.Fatal("expected error when all methods fail")
+		}
+	})
 }

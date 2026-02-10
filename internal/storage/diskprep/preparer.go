@@ -158,6 +158,23 @@ func (p *Preparer) getSectorSize(ctx context.Context, disk string) (int, error) 
 	return strconv.Atoi(strings.TrimSpace(string(out)))
 }
 
+// hasFilesystem checks if a device has any filesystem signature via blkid.
+// Returns true if blkid detects a filesystem (ext4, btrfs, xfs, swap, etc.),
+// false only if blkid explicitly reports no signature (exit code 2).
+// On probe errors (I/O, missing binary) returns true as a fail-safe to avoid
+// misidentifying an existing partition as raw.
+func hasFilesystem(ctx context.Context, run runner.CommandRunner, device string) bool {
+	err := run.Run(ctx, "blkid", "-p", device)
+	if err == nil {
+		return true // blkid found a signature
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
+		return false // exit code 2 = no signature found → raw partition
+	}
+	return true // probe error → fail-safe: assume filesystem exists
+}
+
 // IsLUKS checks if a device has a LUKS header using cryptsetup.
 func IsLUKS(ctx context.Context, run runner.CommandRunner, device string) (bool, error) {
 	err := run.Run(ctx, "cryptsetup", "isLuks", device)
@@ -222,6 +239,22 @@ func (p *Preparer) findDataPartition(ctx context.Context, disk string, sfdisk st
 		}
 		if ok, _ := IsLUKS(ctx, p.run, part.Node); ok {
 			return part.Node, extractSlotNumber(part.Node)
+		}
+	}
+	// MBR last resort: accept a non-root Linux (type 83) partition that is raw
+	// (no filesystem signature). On MBR there is no LUKS-specific type code, so
+	// a data partition created in Phase 1 but not yet LUKS-initialized appears
+	// as plain type 83 with no signature. The hasFilesystem guard prevents
+	// misidentifying a pre-existing ext4/xfs/btrfs partition as the data
+	// partition, which would cause LUKS formatting to destroy its contents.
+	if sfdisk.IsMBR() {
+		for _, part := range sfdisk.PartitionTable.Partitions {
+			if part.Node == "" || part.Node == rootDev {
+				continue
+			}
+			if strings.EqualFold(part.Type, "83") && !hasFilesystem(ctx, p.run, part.Node) {
+				return part.Node, extractSlotNumber(part.Node)
+			}
 		}
 	}
 	return "", 0
@@ -376,7 +409,10 @@ func (p *Preparer) createDataPartitionMBR(ctx context.Context, disk string, sfdi
 	stdin := []byte(fmt.Sprintf("start=%d, type=83\n", startSector))
 	slotStr := strconv.Itoa(slot)
 
-	if err := p.run.RunWithStdin(ctx, stdin, "sfdisk", "-N", slotStr, disk); err != nil {
+	// --force: override "disk in use" check (root is mounted on this disk).
+	// --no-reread: skip sfdisk's internal BLKRRPART (we handle kernel notification
+	// ourselves via registerNewPartition, which uses targeted BLKPG_ADD_PARTITION).
+	if err := p.run.RunWithStdin(ctx, stdin, "sfdisk", "--force", "--no-reread", "-N", slotStr, disk); err != nil {
 		return "", 0, fmt.Errorf("sfdisk create partition: %w", err)
 	}
 
@@ -386,8 +422,8 @@ func (p *Preparer) createDataPartitionMBR(ctx context.Context, disk string, sfdi
 // waitForPartition reloads the partition table and waits for the kernel to
 // register the new partition device node (up to ~2 seconds).
 func (p *Preparer) waitForPartition(ctx context.Context, disk string, slot int) (string, int, error) {
-	if err := p.reloadPartitionTable(ctx, disk); err != nil {
-		return "", 0, fmt.Errorf("reload partition table: %w", err)
+	if err := p.registerNewPartition(ctx, disk, slot); err != nil {
+		return "", 0, fmt.Errorf("register new partition: %w", err)
 	}
 
 	partDev := storage.PartitionDevicePath(disk, slot)
@@ -437,6 +473,18 @@ func (p *Preparer) ExpandRootPartition(ctx context.Context, disk string, rootPar
 	}
 
 	log.Printf("root partition %s expanded", rootPartition)
+	return nil
+}
+
+// registerNewPartition notifies the kernel about a newly created partition.
+// Uses partx --add --nr (BLKPG_ADD_PARTITION ioctl) which works even when
+// other partitions on the disk are mounted. Falls back to full table reload.
+func (p *Preparer) registerNewPartition(ctx context.Context, disk string, slot int) error {
+	slotStr := fmt.Sprintf("%d:%d", slot, slot)
+	if err := p.run.Run(ctx, "partx", "--add", "--nr", slotStr, disk); err != nil {
+		log.Printf("partx --add --nr %s failed (%v), falling back to full table reload", slotStr, err)
+		return p.reloadPartitionTable(ctx, disk)
+	}
 	return nil
 }
 
