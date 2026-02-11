@@ -28,7 +28,7 @@ Every supposed layer of protection failed or is non-functional:
 | health-checker plugin | **Broken** | Checks `/health/live` which always returns HTTP 200 regardless of system state |
 | `/health/ready` endpoint | **Broken** | Always returns HTTP 200 — has a TODO comment acknowledging this (`gin_server.go:1879-1882`) |
 | health-checker → snapper rollback | **Only works post-boot** | Cannot protect against missing kernel/bootloader — device never reaches userspace |
-| GRUB `health_checker_flag` | **Exists but inert on first boot** | GRUB's `05_health_check` can boot `LAST_WORKING_SNAPSHOT` on failure — but no state file exists on first boot, so fallback target is empty |
+| GRUB `health_checker_flag` | **Broken on all platforms** | grubenv lives on read-only btrfs root on both x86 and RPi (`grub2-editenv list` returns empty on both). GRUB's btrfs driver cannot write (`save_env` is a no-op) and cannot read across subvolume boundaries (confirmed via GRUB shell testing). The mechanism is universally non-functional, not just an RPi/first-boot issue. |
 | u-boot boot counting | **Not configured** | No `CONFIG_BOOTCOUNT_LIMIT`, no `altbootcmd`, no fallback snapshot |
 | Pre-commit snapshot validation | **Doesn't exist** | Nothing checks whether a staged snapshot contains critical binaries before setting it as boot default |
 | Timer hygiene | **Absent** | MicroOS server-oriented defaults (`transactional-update.timer`, `btrfs-scrub.timer`, etc.) left enabled on headless SD card devices |
@@ -52,7 +52,8 @@ Every state transition that touches the boot chain must have a safety net. The d
 ## 4. Non-Goals
 
 - Image-based A/B updates (replacing `transactional-update` entirely) — too expensive for pre-beta
-- Custom u-boot builds (Phase 2 — documented here for design continuity, not implemented now)
+- Custom u-boot builds for RPi (Phase 2 — documented here for design continuity, not implemented now)
+- systemd-boot on RPi (u-boot's UEFI emulation is insufficient — see 9.1 for future path)
 - Fixing the zypper solver corruption itself — that's an upstream zypper/libsolv issue; we defend against its consequences
 
 ## 5. Threat Model
@@ -60,7 +61,7 @@ Every state transition that touches the boot chain must have a safety net. The d
 | # | Brick vector | Likelihood | Current defense | Gap |
 |---|---|---|---|---|
 | T1 | Corrupted/gutted snapshot set as boot default | **Confirmed** (the incident) | None | No pre-commit validation |
-| T2 | Missing kernel/initrd in boot snapshot | High (consequence of T1) | GRUB `health_checker_flag` + health-checker | **GRUB mechanism broken** — grubenv is on read-only btrfs root, GRUB's btrfs driver cannot write, `save_env` is a no-op, flag never persists (see 8.1). health-checker runs post-boot; missing kernel = no boot = no health-checker |
+| T2 | Missing kernel/initrd in boot snapshot | High (consequence of T1) | GRUB `health_checker_flag` + health-checker | **GRUB mechanism broken on all platforms** — grubenv is on read-only btrfs root on both x86 and aarch64 (confirmed empty via `grub2-editenv list` on VirtualBox MicroOS and RPi). GRUB's btrfs driver cannot write (`save_env` is a no-op), and cannot read across btrfs subvolume boundaries (confirmed by GRUB shell testing). health-checker runs post-boot; missing kernel = no boot = no health-checker |
 | T3 | Uncontrolled timer storm on first boot | **Confirmed** (the incident) | None | All MicroOS default timers left enabled |
 | T4 | In-snapshot software failure after successful boot | Medium | health-checker | Endpoint always returns 200; rollback never triggers |
 | T5 | Kernel panic / boot hang | Medium | None | No boot counting configured |
@@ -80,13 +81,13 @@ Every state transition that touches the boot chain must have a safety net. The d
 | **Health endpoint 503** | 1 | T4 (in-snapshot software failures, currently limited to LevelError paths — see 7.2a) | T2 (no boot = no endpoint) |
 | **Pre-reboot snapshot validation** | 1 | T1, partial T2 (blocks API-triggered reboot if kernel or critical userspace binaries missing; does NOT check initrd or bootloader on ESP) | Uncontrolled reboots (power cycle, panic, manual `systemctl reboot`) |
 | **health-checker explicit enable** | 1 | Belt-and-suspenders for rollback infra | — |
-| **GRUB grubenv fix** | 2 | T2, T5 (after first successful boot establishes state file) | First boot (no `LAST_WORKING_SNAPSHOT` exists yet) |
+| **systemd-boot + bless-boot (x86/aarch64 PCs)** | 2 | T2, T5 (automatic boot assessment via BLS tries counter on ESP; works on first boot) | RPi (u-boot EBBR lacks EFI variable support needed by systemd-boot) |
+| **U-Boot bootcount (RPi)** | 2 | T2, T5 (bootloader-level fallback including first boot) | T6 (hang without reboot); x86/aarch64 PCs (no u-boot) |
 | **Pre-reboot static analysis** | 2 | T1, T2 (validates systemd unit graph in staged snapshot) | Runtime failures, service-level bugs |
-| **U-Boot bootcount** | 2 | T2, T5 (bootloader-level fallback including first boot) | T6 (hang without reboot) |
 | **Hardware watchdog** | 2 | T5, T6 (reboot on hang) | — |
 | **systemd watchdog** | 2 | T6 (detect piccolod hang) | Kernel-level hangs |
 
-**Honest assessment of Phase 1 coverage:** Phase 1 eliminates the specific trigger of the investigated incident (timer masking prevents the uncontrolled update storm) and adds two independent safety nets: file-existence validation for API-triggered reboots, and a functional health-checker rollback chain for post-boot failures. It materially reduces the likelihood and severity of bricking but does not make it impossible — file-existence checks cover a small set of critical binaries (not initrd, not ESP bootloader), and uncontrolled reboots bypass the API validation gate entirely. Full coverage requires Phase 2 (GRUB grubenv fix + u-boot bootcount + systemd-analyze verify).
+**Honest assessment of Phase 1 coverage:** Phase 1 eliminates the specific trigger of the investigated incident (timer masking prevents the uncontrolled update storm) and adds two independent safety nets: file-existence validation for API-triggered reboots, and a functional health-checker rollback chain for post-boot failures. It materially reduces the likelihood and severity of bricking but does not make it impossible — file-existence checks cover a small set of critical binaries (not initrd, not ESP bootloader), and uncontrolled reboots bypass the API validation gate entirely. Full coverage requires Phase 2, which diverges by platform: systemd-boot with automatic boot assessment for x86/aarch64 PCs, u-boot bootcount for RPi.
 
 ### 6.2 Layered defense flow
 
@@ -101,19 +102,20 @@ piccolod Reboot() ──→ validateStagedSnapshot() ──→ Block if critical
 [Phase 1: Detect after boot]
 health-checker.service ──→ curl /health/ready ──→ 503 on LevelError ──→ snapper rollback
 
-[Phase 2: GRUB boot-level fallback]
-Fix grubenv (see 8.1) ──→ health_checker_flag persists across boots
-health-checker pass ──→ saves LAST_WORKING_SNAPSHOT ──→ GRUB fallback target
+[Phase 2: Boot-level fallback — x86/aarch64 PCs]
+Switch to systemd-boot ──→ BLS entries with tries counter on ESP (FAT32, writable)
+Boot attempt ──→ systemd-boot decrements tries ──→ tries exhausted ──→ fallback to previous entry
+Healthy boot ──→ systemd-bless-boot.service marks entry as good (removes counter)
 
-[Phase 2: Enhanced pre-reboot validation]
+[Phase 2: Boot-level fallback — RPi]
+u-boot ──→ bootcount > bootlimit ──→ altbootcmd ──→ boot fallback snapshot
+
+[Phase 2: Enhanced pre-reboot validation (all platforms)]
 systemd-analyze verify ──→ unit graph validation
 systemd-nspawn --boot  ──→ container boot validation
 
-[Phase 2: Bootloader fallback (all boots including first)]
-u-boot ──→ bootcount > bootlimit ──→ altbootcmd ──→ boot fallback snapshot
-
 [Phase 2: Hang recovery]
-systemd WatchdogSec + bcm2835_wdt ──→ hardware reboot ──→ u-boot bootcount catches it
+systemd WatchdogSec + hardware watchdog ──→ hard reboot ──→ boot assessment catches it
 ```
 
 ## 7. Phase 1: Immediate Changes (Pre-Beta)
@@ -359,10 +361,17 @@ func (m *microOSBackend) Reboot(ctx context.Context) error {
 		return ErrUnsupported
 	}
 	if err := m.validateStagedSnapshot(ctx); err != nil {
+		defaultRaw := m.defaultSnapshot(ctx)
+		defaultID := m.snapperNumberFromID(ctx, defaultRaw)
 		if revertErr := m.revertDefaultSnapshot(ctx); revertErr != nil {
 			return fmt.Errorf("staged snapshot failed validation AND revert failed: %v; revert: %w", err, revertErr)
 		}
-		return fmt.Errorf("staged snapshot failed validation, reverted to active: %w", err)
+		// Remove the corrupt snapshot so it cannot be targeted by future
+		// Rollback() calls or set as boot default through any other path.
+		// Best-effort: if deletion fails, the revert already protects the
+		// next boot, and snapper-cleanup will eventually age it out.
+		m.runner.Run(ctx, "snapper", "delete", defaultID)
+		return fmt.Errorf("staged snapshot failed validation, reverted to active and deleted snapshot %s: %w", defaultID, err)
 	}
 	_, _, _, err := m.runner.Run(ctx, "systemctl", "reboot")
 	return err
@@ -373,12 +382,13 @@ func (m *microOSBackend) Reboot(ctx context.Context) error {
 - It catches snapshots staged by piccolod's own `Apply()` path
 - It catches snapshots set externally (manual `transactional-update`, system timer if somehow unmasked)
 - It runs synchronously, at the moment of truth
+- On validation failure, it **deletes the bad snapshot** — this prevents `Rollback()` or any other path from targeting it. Deletion is best-effort (the revert already protects the next boot).
 
 Note: `Apply()` runs `transactional-update` with `wait=false` (`manager.go:220`), meaning `runTransactionalUpdate` returns after `systemd-run` queues the unit, not after TU completes. Hooking validation in the `runTransactionalUpdate` success path would run before the snapshot exists. `Reboot()` is the correct and only reliable enforcement point.
 
-**Acknowledged gap:** Uncontrolled reboots (power cycle, kernel panic, OOM kill) bypass `Reboot()`. Phase 2 u-boot bootcount addresses this — it operates at the bootloader level and catches all reboot causes.
+**Acknowledged gap:** Uncontrolled reboots (power cycle, kernel panic, OOM kill) bypass `Reboot()`. Phase 2 bootloader-level protection addresses this — systemd-boot boot assessment on x86/aarch64 PCs, u-boot bootcount on RPi.
 
-**Fail-closed deadlock risk:** If `defaultSnapshot()` or `snapperNumberFromID()` fails due to transient command parsing issues (e.g., `btrfs subvolume list` output changes across versions), the API will refuse all reboots. This is the safe direction (blocks reboot rather than allows bad one), but can strand an operator. Mitigation: the existing `handleOSUpdateReboot` handler should accept an optional `force=true` query parameter that bypasses validation. This override must be logged and should be documented as an emergency-only escape hatch.
+**Fail-closed deadlock risk:** If `defaultSnapshot()` or `snapperNumberFromID()` fails due to transient command parsing issues (e.g., `btrfs subvolume list` output changes across versions), the API will refuse all reboots. This is the safe direction (blocks reboot rather than allows bad one), but can strand an operator. Mitigation: the existing `handleOSUpdateReboot` handler should accept an optional `force=true` query parameter that bypasses validation and snapshot deletion. This override must be audit-logged via the Event Bus and should return HTTP 409 Conflict (not 500) when validation fails without force, with structured error details listing the missing components. The override should be documented as an emergency-only escape hatch accessible through the web portal.
 
 ### 7.4 Enable health-checker.service explicitly
 
@@ -398,28 +408,70 @@ Note: The MicroOS preset at `/usr/lib/systemd/system-preset/87-default-MicroOS.p
 
 ## 8. Phase 2: Short-Term (Post-Beta)
 
-### 8.1 Fix GRUB grubenv mechanism
+### 8.1 Switch to systemd-boot (x86/aarch64 PCs)
 
-**Threat covered:** T2, T5 — boot-level fallback after first successful boot.
+**Threat covered:** T2, T5 — automatic boot-level fallback including first boot.
 
-The GRUB `health_checker_flag` mechanism is **completely broken** on Piccolo OS. Investigation confirmed:
+**Platforms:** VirtualBox, SelfInstall (x86_64), and standard aarch64 PCs with native UEFI firmware. **Not RPi** — see 8.2.
 
-1. `/boot/grub2/grubenv` lives on the read-only btrfs root snapshot — GRUB's btrfs driver is read-only, so `save_env` is a no-op
-2. `grub2-editenv` from userspace also fails with "Read-only file system"
-3. `env_block` is never populated (grubenv is 1024 bytes of padding, no variables)
-4. Consequence: `05_health_check` can never trigger GRUB fallback — the flag never persists
+#### Why GRUB grubenv is unfixable
 
-**Fix:** Move grubenv to the EFI System Partition (FAT32, writable by both GRUB and userspace). Ship custom GRUB script overrides for `05_health_check` and `83_health_check_marker` that reference the ESP grubenv path.
+The GRUB `health_checker_flag` mechanism is broken on **all** Piccolo OS platforms (not just RPi, as originally believed). Post-RFC investigation confirmed:
 
-Evidence: `grub2-editenv` failure confirmed in system journal (line 1131 of `artifacts/logs/rpi-first-boot-investigation/full-system-journal.log`). Empty grubenv and non-functional `env_block` confirmed by direct inspection of the RPi SD card's `/boot/grub2/grubenv` and `/boot/writable/` subvolume. GRUB scripts (`05_health_check`, `83_health_check_marker`) inspected at `/etc/grub.d/` on the RPi image.
+1. `/boot/grub2/grubenv` lives on the read-only btrfs root snapshot on both x86 and aarch64 — `grub2-editenv /boot/grub2/grubenv list` returns empty on both VirtualBox MicroOS and RPi
+2. GRUB's btrfs driver is read-only — `save_env` is a silent no-op
+3. GRUB's btrfs driver **cannot read across btrfs subvolume boundaries** — confirmed by GRUB shell testing (`load_env -f /boot/grub2/x86_64-efi/grubenv` returns "not found" despite the file existing). This rules out moving grubenv to the existing writable `boot/grub2/x86_64-efi` subvolume.
+4. GRUB shell testing on the ESP also failed to read grubenv via relative paths — the GRUB-to-ESP path mapping is non-trivial and varies by firmware.
+5. GRUB2-BLS does **not** implement BLS filename-based boot counting (the `+tries` decrement mechanism). GRUB2's `blscfg` module reads BLS entries but does not rename entry files to track boot attempts. This means even with BLS entries on the writable ESP, GRUB2 cannot provide automatic boot assessment.
 
-**First-boot gap:** Even after this fix, the GRUB fallback requires a prior successful health-checker pass (to populate `LAST_WORKING_SNAPSHOT`). First boot has no fallback target. U-boot bootcount (8.2) addresses this.
+The original RFC proposed moving grubenv to the ESP. Investigation showed this is both harder than expected (GRUB path resolution) and insufficient (no BLS boot counting). The correct fix is to replace GRUB with a bootloader that natively supports boot assessment.
 
-### 8.2 U-Boot bootcount
+#### systemd-boot + systemd-bless-boot
 
-For coverage of the first-boot gap at the bootloader level (beyond Phase 1's userspace protections):
+systemd-boot is a lightweight UEFI boot manager that natively implements the [Automatic Boot Assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/) protocol:
 
-**Mechanism:** U-Boot's `CONFIG_BOOTCOUNT_LIMIT` feature increments a `bootcount` variable on each boot. When `bootcount > bootlimit`, U-Boot executes `altbootcmd` instead of `bootcmd`. Unlike the GRUB mechanism, this works even on first boot (the initial image snapshot serves as the fallback target).
+1. `sdbootutil` creates BLS entries with tries counters (e.g., `entry+3.conf` — 3 attempts allowed)
+2. systemd-boot decrements the counter on each boot attempt (renames `+3.conf` → `+2-1.conf`)
+3. If `boot-complete.target` is reached (all health checks pass), `systemd-bless-boot.service` removes the counter entirely ("blesses" the entry)
+4. If tries reach 0, systemd-boot automatically boots the previous blessed entry
+
+All state lives on the ESP (FAT32, writable). No grubenv. No btrfs driver limitations. Works on first boot.
+
+#### Kiwi config changes
+
+**`piccolo-os.kiwi`** — VirtualBox and SelfInstall profiles:
+- Add `sdbootutil` and `systemd-boot` to `<packages type="image">`
+- Increase ESP: add `efipartsize="512"` (kernel + initrd live on ESP with systemd-boot)
+- Remove GRUB-specific btrfs volumes (`boot/grub2/i386-pc`, `boot/grub2/x86_64-efi`)
+
+The existing `disk.sh` already handles the systemd-boot path — when `sdbootutil` is installed and `systemd-boot` is present, it sets `loader_type="systemd-boot"` and runs `sdbootutil install` + `sdbootutil add-all-kernels`. No changes needed to `disk.sh`.
+
+`config.sh` also already handles the sdbootutil path — kernel cmdline goes to `/etc/kernel/cmdline` when sdbootutil is present. No changes needed.
+
+#### Boot assessment integration with health-checker
+
+Configure health-checker to gate `boot-complete.target`:
+- Set `/etc/kernel/tries` to `3` (3 boot attempts before fallback)
+- health-checker.service runs the piccolod health check plugin
+- On success: health-checker triggers `boot-complete.target` → `systemd-bless-boot` blesses the entry
+- On failure: health-checker triggers `snapper rollback` + reboot → tries decremented → after 3 failures, systemd-boot falls back
+
+#### Evidence
+
+- systemd-boot is proven on openSUSE x86_64 (MicroOS QEMU appliance images, Tumbleweed experimental)
+- `sdbootutil` explicitly supports aarch64 (builds available, architecture-specific paths handled in source)
+- openSUSE's `disk.sh` scaffolding for systemd-boot already exists in the Piccolo OS kiwi config
+- GRUB2-BLS is now the default on Tumbleweed (Nov 2025) but does not implement boot counting — only systemd-boot does
+
+### 8.2 U-Boot bootcount (RPi only)
+
+**Threat covered:** T2, T5 — bootloader-level fallback including first boot on RPi.
+
+**Platforms:** RaspberryPi, Rock64 — devices that use u-boot as the first-stage UEFI provider.
+
+**Why RPi can't use systemd-boot:** RPi uses u-boot's EBBR (Embedded Base Boot Requirements) implementation, which is a subset of full UEFI. systemd-boot has historically crashed when chainloaded by u-boot ([systemd#7585](https://github.com/systemd/systemd/issues/7585)), and u-boot's EFI variable support (`LoaderBootCountPath` etc.) is unverified. There are zero confirmed deployments of systemd-boot on RPi with openSUSE. RPi remains on the GRUB2 boot chain; u-boot bootcount provides the boot-level protection that systemd-boot provides on x86/aarch64 PCs.
+
+**Mechanism:** U-Boot's `CONFIG_BOOTCOUNT_LIMIT` feature increments a `bootcount` variable on each boot. When `bootcount > bootlimit`, U-Boot executes `altbootcmd` instead of `bootcmd`. This works even on first boot (the initial image snapshot serves as the fallback target).
 
 **Implementation outline:**
 1. Custom u-boot build for RPi4/5 with `CONFIG_BOOTCOUNT_LIMIT=y` and `CONFIG_BOOTCOUNT_ENV=y`
@@ -427,8 +479,6 @@ For coverage of the first-boot gap at the bootloader level (beyond Phase 1's use
 3. After transactional-update, piccolod uses `fw_setenv` to update snapshot variables
 4. On successful boot (after health-checker passes), clear bootcount via `fw_setenv bootcount 0`
 5. On repeated boot failure (3x), u-boot executes `altbootcmd`
-
-**Migration consideration:** This must coexist with the existing GRUB health-check flow. U-Boot handles pre-GRUB failures (missing kernel binary), while GRUB handles post-kernel failures (bad root snapshot). The two mechanisms operate at different layers and are complementary.
 
 **Dependencies:** Custom u-boot build via OBS, `u-boot-tools` package for `fw_setenv`/`fw_printenv`.
 
@@ -443,7 +493,7 @@ For coverage of the first-boot gap at the bootloader level (beyond Phase 1's use
 3. If piccolod stops notifying (hang, crash), systemd restarts it (`Restart=always`)
 4. systemd also enables the hardware watchdog via `RuntimeWatchdogSec=` in `system.conf`
 5. If the entire system hangs (kernel deadlock, OOM), the hardware watchdog triggers a hard reboot
-6. U-Boot bootcount (8.2) catches the resulting reboot cycle
+6. Boot assessment catches the resulting reboot cycle (systemd-boot on x86/aarch64, u-boot bootcount on RPi)
 
 **Integration with existing code:** piccolod already uses `daemon.SdNotify(false, daemon.SdNotifyReady)` at `gin_server.go:787`. Adding `WATCHDOG=1` notifications requires periodic calls from a goroutine — the health tracker's tick interval is a natural fit.
 
@@ -472,18 +522,17 @@ timeout 30s systemd-nspawn --boot --read-only \
 
 ## 9. Phase 3: Future
 
-### 9.1 GRUB2-BLS + systemd-bless-boot
+### 9.1 systemd-boot on RPi (when u-boot UEFI matures)
 
-When GRUB2-BLS (Boot Loader Specification) is production-ready on aarch64/RPi, the full systemd automatic boot assessment chain becomes available:
+If u-boot's UEFI implementation matures to support the EFI variables required by systemd-boot (`LoaderBootCountPath`, `LoaderEntrySelected`, etc.) and the u-boot → systemd-boot chain is proven on RPi, the RPi platform could migrate from GRUB2 + u-boot bootcount to systemd-boot + systemd-bless-boot — unifying the boot assessment mechanism across all platforms.
 
-1. New snapshots get boot entries with configurable retry counts (`/etc/kernel/tries`)
-2. Bootloader decrements tries on each boot attempt
-3. `systemd-bless-boot.service` waits for `boot-complete.target`
-4. Custom health checks (including piccolod's health-checker plugin) gate `boot-complete.target`
-5. On success, the boot entry is "blessed" (counter removed)
-6. On repeated failure, the bootloader falls back to the previous entry
+**Current blockers:**
+- systemd-boot has historically crashed when chainloaded by u-boot's UEFI emulation ([systemd#7585](https://github.com/systemd/systemd/issues/7585))
+- U-Boot implements EBBR (a UEFI subset); runtime `SetVariable` support for `Loader*` variables is unverified
+- Zero confirmed deployments of systemd-boot on RPi with openSUSE
+- openSUSE labels systemd-boot as experimental; only QEMU images are provided
 
-This would replace the u-boot bootcount mechanism with a more integrated, standard approach. Current status: GRUB2-BLS is default on x86 Tumbleweed since late 2024, but aarch64/RPi support is not yet documented as production-ready.
+**Migration path:** Once these blockers are resolved upstream, the RPi kiwi profile would follow the same pattern as x86/aarch64 PCs (8.1): add `sdbootutil` + `systemd-boot` packages, increase ESP size, remove GRUB-specific volumes. The `disk.sh` and `config.sh` scaffolding already handles this transition.
 
 ## 10. Testing Plan
 
@@ -543,19 +592,27 @@ Phase 1 spans two repositories:
 
 The `piccolod` changes (7.2b, 7.3) ship as a new daemon version. The `piccolo-os` changes (7.1, 7.2c, 7.4) ship as a new `piccolo-os-support` package version. Both should release together for full protection. The health-checker script change (7.2c) is backward-compatible with older piccolod (old endpoint returns 200), so staggered rollout is safe — just not fully protective until both land.
 
+Phase 2 adds kiwi config changes for systemd-boot (x86/aarch64 PC profiles only):
+
+| Item | Repository | Files |
+|---|---|---|
+| 8.1 systemd-boot migration | `piccolo-os` | `kiwi/microos-ots/piccolo-os.kiwi` (VirtualBox, SelfInstall profiles: add sdbootutil/systemd-boot packages, increase efipartsize, remove GRUB volumes) |
+
+Note: `disk.sh` and `config.sh` already handle the systemd-boot path — no changes needed to these scripts.
+
 ## Implementation Notes & Status
 
-| # | Item | Phase | Status |
-|---|------|-------|--------|
-| 7.1 | Mask dangerous timers (spec + config.sh) | 1 | Pending |
-| 7.2b | Health endpoint 503 on LevelError | 1 | Pending |
-| 7.2c | Health-checker script → `/health/ready` | 1 | Pending |
-| 7.3 | Pre-reboot snapshot validation (file-existence checks) | 1 | Pending |
-| 7.4 | Enable health-checker.service | 1 | Pending |
-| 7.3+ | Force-reboot override (`force=true` query param) | 1 | Pending |
-| 8.1 | Fix GRUB grubenv (move to ESP) | 2 | Design only |
-| 8.2 | U-Boot bootcount | 2 | Design only |
-| 8.3 | Hardware/systemd watchdog | 2 | Design only |
-| 8.4 | Pre-reboot static analysis (systemd-analyze verify) | 2 | Design only |
-| 8.5 | Container boot validation (systemd-nspawn) | 2 | Design only |
-| 9.1 | GRUB2-BLS integration | 3 | Future |
+| # | Item | Phase | Platform | Status |
+|---|------|-------|----------|--------|
+| 7.1 | Mask dangerous timers (spec + config.sh) | 1 | All | Pending |
+| 7.2b | Health endpoint 503 on LevelError | 1 | All | Pending |
+| 7.2c | Health-checker script → `/health/ready` | 1 | All | Pending |
+| 7.3 | Pre-reboot snapshot validation (file-existence checks) | 1 | All | Pending |
+| 7.4 | Enable health-checker.service | 1 | All | Pending |
+| 7.3+ | Force-reboot override (`force=true` query param) | 1 | All | Pending |
+| 8.1 | Switch to systemd-boot + systemd-bless-boot | 2 | x86/aarch64 PCs | Design only |
+| 8.2 | U-Boot bootcount | 2 | RPi, Rock64 | Design only |
+| 8.3 | Hardware/systemd watchdog | 2 | All | Design only |
+| 8.4 | Pre-reboot static analysis (systemd-analyze verify) | 2 | All | Design only |
+| 8.5 | Container boot validation (systemd-nspawn) | 2 | All | Design only |
+| 9.1 | systemd-boot on RPi (when u-boot UEFI matures) | 3 | RPi | Future |
