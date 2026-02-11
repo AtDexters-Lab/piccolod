@@ -14,6 +14,9 @@ import (
 
 // Startup failure escalation thresholds (RFC 20260125)
 // After these thresholds, status escalates from "starting" to "error".
+// Tracking is intentionally in-memory only (not in AppMetadata on disk),
+// so counters reset naturally on daemon restart — giving apps a fresh
+// escalation window after the admin fixes the underlying issue.
 const (
 	startupEscalateAfterAttempts = 5
 	startupEscalateAfterDuration = 10 * time.Minute
@@ -101,8 +104,10 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 	// Emit "starting" status if we're about to start containers (RFC 20260125).
 	// This ensures UI shows the "Starting..." banner during reconciliation-triggered starts.
+	// Skip if already escalated to "error" — that status must persist until daemon restart
+	// resets in-memory counters, so the escalation guards below can short-circuit cheaply.
 	observed := m.getObservedStatus(appInst.InstanceID)
-	if desiredRunning && observed != StatusRunning && observed != StatusStarting {
+	if desiredRunning && observed != StatusRunning && observed != StatusStarting && observed != StatusError {
 		m.updateStatusWithEvent(appInst.InstanceID, StatusStarting)
 	}
 
@@ -170,6 +175,25 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			return nil
 		}
 
+		// If startup failures have exceeded escalation thresholds, stop retrying
+		// expensive recreation. This prevents infinite loops when recreation
+		// consistently fails (e.g., storage path mismatch after upgrade).
+		if shouldEscalateToError(appInst) {
+			// Clean up stale containers/proxies once on first escalation,
+			// then skip on subsequent cycles (status already error).
+			if m.getObservedStatus(appInst.InstanceID) != StatusError {
+				if stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime); stopErr != nil {
+					log.Printf("WARN: reconcile app %s: escalation stop failed: %v", appInst.InstanceID, stopErr)
+				}
+				if removeErr := m.removeContainersForMultiApp(ctx, appInst, def, runtime); removeErr != nil {
+					log.Printf("WARN: reconcile app %s: escalation remove failed: %v", appInst.InstanceID, removeErr)
+				}
+				m.serviceManager.RemoveApp(appInst.InstanceID)
+				m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+			}
+			return nil
+		}
+
 		// The anchor is missing but we desire the app running. Stop and remove all service containers
 		// so we can recreate the entire group (anchor + services) deterministically.
 		// Best-effort cleanup before recreation; errors logged but don't block.
@@ -181,7 +205,11 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		}
 		m.serviceManager.RemoveApp(appInst.InstanceID)
 
-		return m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime)
+		if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime); err != nil {
+			m.handleStartupFailure(state, appInst)
+			return err
+		}
+		return nil
 	}
 
 	// If we don't desire running (stopped app or follower), stop all containers and remove proxies
@@ -373,6 +401,12 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	}
 	if err := m.ensurePodmanPublishes(ctx, def, appInst.InstanceID, anchorID, runtime); err != nil {
 		if errors.Is(err, container.ErrPortReconciliationRequired) {
+			if shouldEscalateToError(appInst) {
+				if m.getObservedStatus(appInst.InstanceID) != StatusError {
+					m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+				}
+				return nil
+			}
 			log.Printf("INFO: reconcile app %s: port bindings mismatch, recreating containers", appInst.InstanceID)
 			// Best-effort cleanup before port-reconciliation recreation; errors logged but don't block.
 			if stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime); stopErr != nil {
@@ -382,7 +416,11 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				log.Printf("WARN: reconcile app %s: port-reconcile remove failed: %v", appInst.InstanceID, removeErr)
 			}
 			m.serviceManager.RemoveApp(appInst.InstanceID)
-			return m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime)
+			if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime); err != nil {
+				m.handleStartupFailure(state, appInst)
+				return err
+			}
+			return nil
 		}
 		log.Printf("WARN: reconcile app %s: publish reconcile failed: %v", appInst.InstanceID, err)
 	}
