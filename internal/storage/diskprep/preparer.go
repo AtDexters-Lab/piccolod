@@ -504,6 +504,8 @@ func (p *Preparer) reloadPartitionTable(ctx context.Context, disk string) error 
 func (p *Preparer) EnsureDirectories(ctx context.Context) error {
 	dirs := []string{
 		paths.DataJoin("node"),
+		paths.DataJoin("node", "podman"),
+		paths.DataJoin("node", "cache"),
 		paths.DataJoin("user", "volumes"),
 		paths.DataJoin("federation"),
 		paths.DataJoin("system-objects", "control-plane-backups"),

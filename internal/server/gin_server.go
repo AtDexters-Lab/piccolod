@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -420,6 +419,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		Dispatcher: dispatch,
 		Crypto:     cmgr,
 		StateDir:   stateDir,
+		DataDir:    paths.DataRoot(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to init persistence module: %w", err)
@@ -458,7 +458,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		mdnsMgr.ObserveServiceEndpoints(eventsBus)
 	}
 
-	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), filepath.Join(stateDir, "tmp", "catalog"))
+	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), paths.DataJoin("node", "cache", "catalog"))
 
 	s := &GinServer{
 		appManager:     appMgr,

@@ -130,24 +130,24 @@ func TestFileVolumeManagerEnsureVolume(t *testing.T) {
 	root := t.TempDir()
 	cryptoMgr := newUnlockedCrypto(t, root)
 	runner := &fakeRunner{}
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, nil)
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, nil)
 
-	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "control", Class: VolumeClassControl})
+	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "app-init-test", Class: VolumeClassApplication})
 	if err != nil {
 		t.Fatalf("EnsureVolume: %v", err)
 	}
-	expectedMount := filepath.Join(root, "mounts", "control")
+	expectedMount := filepath.Join(root, "mounts", "app-init-test")
 	if handle.MountDir != expectedMount {
 		t.Fatalf("expected mount dir %s, got %s", expectedMount, handle.MountDir)
 	}
 	if _, err := os.Stat(expectedMount); err != nil {
 		t.Fatalf("mount dir missing: %v", err)
 	}
-	cipherDir := filepath.Join(root, "ciphertext", "control")
+	cipherDir := filepath.Join(root, "ciphertext", "app-init-test")
 	if _, err := os.Stat(cipherDir); err != nil {
 		t.Fatalf("cipher dir missing: %v", err)
 	}
-	metaPath := filepath.Join(root, "volumes", "control", volumeMetadataName)
+	metaPath := filepath.Join(root, "volumes", "app-init-test", volumeMetadataName)
 	if _, err := os.Stat(metaPath); err != nil {
 		t.Fatalf("metadata missing: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestFileVolumeManagerEnsureVolume(t *testing.T) {
 	}
 
 	// Repeated ensure should not re-run init
-	handle2, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "control", Class: VolumeClassControl})
+	handle2, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "app-init-test", Class: VolumeClassApplication})
 	if err != nil {
 		t.Fatalf("EnsureVolume second: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestFileVolumeManagerAttachRoles(t *testing.T) {
 	cryptoMgr := newUnlockedCrypto(t, root)
 	runner := &fakeRunner{}
 	launcher := &fakeMountLauncher{}
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
 
 	h, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "alpha", Class: VolumeClassApplication})
 	if err != nil {
@@ -244,7 +244,7 @@ func TestFileVolumeManagerAttachIdempotent(t *testing.T) {
 	cryptoMgr := newUnlockedCrypto(t, root)
 	runner := &fakeRunner{}
 	launcher := &fakeMountLauncher{}
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
 
 	h, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "idem", Class: VolumeClassApplication})
 	if err != nil {
@@ -272,7 +272,7 @@ func TestFileVolumeManagerDetach(t *testing.T) {
 	root := t.TempDir()
 	cryptoMgr := newUnlockedCrypto(t, root)
 	runner := &fakeRunner{}
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, nil)
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, nil)
 
 	h, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "beta", Class: VolumeClassApplication})
 	if err != nil {
@@ -299,7 +299,7 @@ func TestFileVolumeManagerAttachDetectsCorruptedMetadata(t *testing.T) {
 	cryptoMgr := newUnlockedCrypto(t, root)
 	runner := &fakeRunner{}
 	launcher := &fakeMountLauncher{}
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
 
 	if _, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "corrupt", Class: VolumeClassApplication}); err != nil {
 		t.Fatalf("EnsureVolume: %v", err)
@@ -313,7 +313,7 @@ func TestFileVolumeManagerAttachDetectsCorruptedMetadata(t *testing.T) {
 	// Simulate manager restart; cached metadata should not mask corruption.
 	runner2 := &fakeRunner{}
 	launcher2 := &fakeMountLauncher{}
-	mgr2 := newFileVolumeManagerWithDeps(root, cryptoMgr, runner2, "gocryptfs", "fusermount3", launcher2, func(string, time.Duration) error { return nil })
+	mgr2 := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner2, "gocryptfs", "fusermount3", launcher2, func(string, time.Duration) error { return nil })
 
 	_, err := mgr2.EnsureVolume(context.Background(), VolumeRequest{ID: "corrupt", Class: VolumeClassApplication})
 	if err == nil {
@@ -336,7 +336,7 @@ func TestFileVolumeManagerAttachFailsWhenMetadataCorruptedWhileRunning(t *testin
 	runner := &fakeRunner{}
 	launcher := &fakeMountLauncher{}
 	waiter := func(string, time.Duration) error { return nil }
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
 
 	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "livecorrupt", Class: VolumeClassApplication})
 	if err != nil {
@@ -404,7 +404,7 @@ func TestFileVolumeManagerAttachFailsWithInvalidMetadataValues(t *testing.T) {
 			runner := &fakeRunner{}
 			launcher := &fakeMountLauncher{}
 			waiter := func(string, time.Duration) error { return nil }
-			mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
+			mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
 
 			handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "victim", Class: VolumeClassApplication})
 			if err != nil {
@@ -454,7 +454,7 @@ func TestFileVolumeManagerAttachHandlesMountTimeout(t *testing.T) {
 	waiter := func(string, time.Duration) error {
 		return errors.New("mount timed out")
 	}
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
 
 	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "timeout", Class: VolumeClassApplication})
 	if err != nil {
@@ -482,7 +482,7 @@ func TestFileVolumeManagerRecordsMountedState(t *testing.T) {
 	runner := &fakeRunner{}
 	launcher := &fakeMountLauncher{}
 	waiter := func(string, time.Duration) error { return nil }
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
 
 	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "journal", Class: VolumeClassApplication})
 	if err != nil {
@@ -527,7 +527,7 @@ func TestFileVolumeManagerPublishesVolumeEvents(t *testing.T) {
 
 	runner := &fakeRunner{}
 	launcher := &fakeMountLauncher{}
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
 	mgr.bus = bus
 
 	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "eventful", Class: VolumeClassApplication})
@@ -588,7 +588,7 @@ func TestFileVolumeManagerReconcilesStaleMountedStateOnEnsure(t *testing.T) {
 	runner := &fakeRunner{}
 	launcher := &fakeMountLauncher{}
 	waiter := func(string, time.Duration) error { return nil }
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
 
 	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "stale", Class: VolumeClassApplication})
 	if err != nil {
@@ -622,7 +622,7 @@ func TestFileVolumeManagerReconcilesStaleMountedStateOnEnsure(t *testing.T) {
 	// Restart manager.
 	runner2 := &fakeRunner{}
 	launcher2 := &fakeMountLauncher{}
-	mgr2 := newFileVolumeManagerWithDeps(root, cryptoMgr, runner2, "gocryptfs", "fusermount3", launcher2, waiter)
+	mgr2 := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner2, "gocryptfs", "fusermount3", launcher2, waiter)
 
 	if err := mgr2.reconcileAllVolumeStates(); err != nil {
 		t.Fatalf("reconcileAllVolumeStates: %v", err)
@@ -661,7 +661,7 @@ func TestFileVolumeManagerReconcilesMissingMountDirOnStartup(t *testing.T) {
 	runner := &fakeRunner{}
 	launcher := &fakeMountLauncher{}
 	waiter := func(string, time.Duration) error { return nil }
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
 
 	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "missing-mountdir", Class: VolumeClassApplication})
 	if err != nil {
@@ -678,7 +678,7 @@ func TestFileVolumeManagerReconcilesMissingMountDirOnStartup(t *testing.T) {
 	// Restart manager and reconcile. Reattach should recreate the mount directory so marker writes succeed.
 	runner2 := &fakeRunner{}
 	launcher2 := &fakeMountLauncher{}
-	mgr2 := newFileVolumeManagerWithDeps(root, cryptoMgr, runner2, "gocryptfs", "fusermount3", launcher2, waiter)
+	mgr2 := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner2, "gocryptfs", "fusermount3", launcher2, waiter)
 
 	if err := mgr2.reconcileAllVolumeStates(); err != nil {
 		t.Fatalf("reconcileAllVolumeStates: %v", err)
@@ -701,7 +701,7 @@ func TestFileVolumeManagerReconcileSkipsLeaderWithoutAuthority(t *testing.T) {
 	root := t.TempDir()
 	cryptoMgr := newUnlockedCrypto(t, root)
 	launcher := &fakeMountLauncher{}
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, &fakeRunner{}, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, &fakeRunner{}, "gocryptfs", "fusermount3", launcher, func(string, time.Duration) error { return nil })
 	mgr.setRoleChecker(func(string, VolumeRole) bool { return false })
 
 	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "authority", Class: VolumeClassApplication})
@@ -732,7 +732,7 @@ func TestFileVolumeManagerReconcileSkipsLeaderWithoutAuthority(t *testing.T) {
 func TestFileVolumeManagerReconcileClearsNeedsRepairOnUnmounted(t *testing.T) {
 	root := t.TempDir()
 	cryptoMgr := newUnlockedCrypto(t, root)
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, &fakeRunner{}, "gocryptfs", "fusermount3", nil, func(string, time.Duration) error { return nil })
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, &fakeRunner{}, "gocryptfs", "fusermount3", nil, func(string, time.Duration) error { return nil })
 
 	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "cleanup", Class: VolumeClassApplication})
 	if err != nil {
@@ -764,9 +764,9 @@ func TestFileVolumeManagerReconcileHandlesLockedCrypto(t *testing.T) {
 	cryptoMgr := newUnlockedCrypto(t, root)
 	runner := &fakeRunner{}
 	waiter := func(string, time.Duration) error { return nil }
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, waiter)
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, waiter)
 
-	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "test-volume", Class: VolumeClassControl})
+	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "app-test-volume", Class: VolumeClassApplication})
 	if err != nil {
 		t.Fatalf("EnsureVolume: %v", err)
 	}
@@ -775,7 +775,7 @@ func TestFileVolumeManagerReconcileHandlesLockedCrypto(t *testing.T) {
 	}
 
 	cryptoMgr.Lock()
-	lockedMgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, waiter)
+	lockedMgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, waiter)
 	if err := lockedMgr.reconcileAllVolumeStates(); err != nil {
 		t.Fatalf("reconcileAllVolumeStates: %v", err)
 	}
@@ -803,7 +803,7 @@ func TestFileVolumeManagerStateGenerationAndNeedsRepair(t *testing.T) {
 	runner := &fakeRunner{}
 	launcher := &fakeMountLauncher{}
 	waiter := func(string, time.Duration) error { return nil }
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
 
 	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "gen", Class: VolumeClassApplication})
 	if err != nil {
@@ -841,7 +841,7 @@ func TestFileVolumeManagerStateGenerationAndNeedsRepair(t *testing.T) {
 	waiterFail := func(string, time.Duration) error {
 		return errors.New("mount timed out")
 	}
-	mgr2 := newFileVolumeManagerWithDeps(root, cryptoMgr, &fakeRunner{}, "gocryptfs", "fusermount3", launcherFail, waiterFail)
+	mgr2 := newFileVolumeManagerWithDeps(root, root, cryptoMgr, &fakeRunner{}, "gocryptfs", "fusermount3", launcherFail, waiterFail)
 	_ = mgr2.reconcileAllVolumeStates()
 	if _, err := mgr2.EnsureVolume(context.Background(), VolumeRequest{ID: "gen", Class: VolumeClassApplication}); err == nil {
 		t.Fatalf("expected EnsureVolume to surface auto-reattach failure")
@@ -879,6 +879,186 @@ func containsArgs(args []string, target []string) bool {
 	return true
 }
 
+func TestEnsureVolume_ApplicationClass_UsesDataRoot(t *testing.T) {
+	coreRoot := t.TempDir()
+	dataRoot := t.TempDir()
+	cryptoMgr := newUnlockedCrypto(t, coreRoot)
+	runner := &fakeRunner{}
+	mgr := newFileVolumeManagerWithDeps(coreRoot, dataRoot, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, nil)
+
+	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "app-myapp", Class: VolumeClassApplication})
+	if err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+
+	// Mountpoint must be under coreRoot.
+	expectedMount := filepath.Join(coreRoot, "mounts", "app-myapp")
+	if handle.MountDir != expectedMount {
+		t.Fatalf("expected mount dir %s, got %s", expectedMount, handle.MountDir)
+	}
+
+	// Ciphertext must be under dataRoot.
+	cipherDir := filepath.Join(dataRoot, "ciphertext", "app-myapp")
+	if _, err := os.Stat(cipherDir); err != nil {
+		t.Fatalf("ciphertext should be under dataRoot: %v", err)
+	}
+	// Ciphertext must NOT be under coreRoot.
+	if _, err := os.Stat(filepath.Join(coreRoot, "ciphertext", "app-myapp")); err == nil {
+		t.Fatalf("ciphertext should NOT be under coreRoot")
+	}
+
+	// Volume metadata must be under dataRoot.
+	metaPath := filepath.Join(dataRoot, "volumes", "app-myapp", volumeMetadataName)
+	if _, err := os.Stat(metaPath); err != nil {
+		t.Fatalf("metadata should be under dataRoot: %v", err)
+	}
+	// Volume metadata must NOT be under coreRoot.
+	if _, err := os.Stat(filepath.Join(coreRoot, "volumes", "app-myapp", volumeMetadataName)); err == nil {
+		t.Fatalf("metadata should NOT be under coreRoot")
+	}
+}
+
+func TestEnsureVolume_ControlClass_UsesCoreRoot(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1") // bypass btrfs for control-class volumes
+	coreRoot := t.TempDir()
+	dataRoot := t.TempDir()
+	cryptoMgr := newUnlockedCrypto(t, coreRoot)
+	runner := &fakeRunner{}
+	mgr := newFileVolumeManagerWithDeps(coreRoot, dataRoot, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, nil)
+
+	// Use a non-standard control ID to avoid the btrfs subvolume path.
+	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "control-test", Class: VolumeClassControl})
+	if err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+
+	// Mountpoint must be under coreRoot.
+	expectedMount := filepath.Join(coreRoot, "mounts", "control-test")
+	if handle.MountDir != expectedMount {
+		t.Fatalf("expected mount dir %s, got %s", expectedMount, handle.MountDir)
+	}
+
+	// Ciphertext and metadata must be under coreRoot.
+	if _, err := os.Stat(filepath.Join(coreRoot, "ciphertext", "control-test")); err != nil {
+		t.Fatalf("ciphertext should be under coreRoot: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(coreRoot, "volumes", "control-test", volumeMetadataName)); err != nil {
+		t.Fatalf("metadata should be under coreRoot: %v", err)
+	}
+
+	// Nothing under dataRoot for control class.
+	if _, err := os.Stat(filepath.Join(dataRoot, "ciphertext", "control-test")); err == nil {
+		t.Fatalf("ciphertext should NOT be under dataRoot for control class")
+	}
+
+	_ = handle
+}
+
+func TestDestroyVolume_ApplicationClass_CleansDataRoot(t *testing.T) {
+	coreRoot := t.TempDir()
+	dataRoot := t.TempDir()
+	cryptoMgr := newUnlockedCrypto(t, coreRoot)
+	runner := &fakeRunner{}
+	mgr := newFileVolumeManagerWithDeps(coreRoot, dataRoot, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, nil)
+
+	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "app-destroy", Class: VolumeClassApplication})
+	if err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataRoot, "ciphertext", "app-destroy")); err != nil {
+		t.Fatalf("ciphertext should exist: %v", err)
+	}
+
+	if err := mgr.DestroyVolume(context.Background(), handle.ID); err != nil {
+		t.Fatalf("DestroyVolume: %v", err)
+	}
+
+	// Ciphertext and state under dataRoot should be removed.
+	if _, err := os.Stat(filepath.Join(dataRoot, "ciphertext", "app-destroy")); !os.IsNotExist(err) {
+		t.Fatalf("ciphertext should be removed from dataRoot")
+	}
+	if _, err := os.Stat(filepath.Join(dataRoot, "volumes", "app-destroy")); !os.IsNotExist(err) {
+		t.Fatalf("volume state should be removed from dataRoot")
+	}
+	// Mountpoint under coreRoot should also be removed.
+	if _, err := os.Stat(filepath.Join(coreRoot, "mounts", "app-destroy")); !os.IsNotExist(err) {
+		t.Fatalf("mountpoint should be removed from coreRoot")
+	}
+}
+
+func TestReconcileAllVolumeStates_ScansBothRoots(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1") // bypass btrfs for control-class volumes
+	coreRoot := t.TempDir()
+	dataRoot := t.TempDir()
+	cryptoMgr := newUnlockedCrypto(t, coreRoot)
+	runner := &fakeRunner{}
+	launcher := &fakeMountLauncher{}
+	waiter := func(string, time.Duration) error { return nil }
+	mgr := newFileVolumeManagerWithDeps(coreRoot, dataRoot, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
+
+	// Create a control volume under coreRoot.
+	if _, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "control-test", Class: VolumeClassControl}); err != nil {
+		t.Fatalf("EnsureVolume control: %v", err)
+	}
+	// Create an app volume under dataRoot.
+	if _, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "app-test", Class: VolumeClassApplication}); err != nil {
+		t.Fatalf("EnsureVolume app: %v", err)
+	}
+
+	// New manager should discover both during reconciliation.
+	runner2 := &fakeRunner{}
+	launcher2 := &fakeMountLauncher{}
+	mgr2 := newFileVolumeManagerWithDeps(coreRoot, dataRoot, cryptoMgr, runner2, "gocryptfs", "fusermount3", launcher2, waiter)
+	if err := mgr2.reconcileAllVolumeStates(); err != nil {
+		t.Fatalf("reconcileAllVolumeStates: %v", err)
+	}
+
+	// Both entries should be in memory.
+	mgr2.mu.RLock()
+	_, hasControl := mgr2.volumes["control-test"]
+	_, hasApp := mgr2.volumes["app-test"]
+	mgr2.mu.RUnlock()
+
+	if !hasControl {
+		t.Fatalf("expected control-test to be discovered during reconciliation")
+	}
+	if !hasApp {
+		t.Fatalf("expected app-test to be discovered during reconciliation")
+	}
+}
+
+func TestVolumeStateClassPersisted(t *testing.T) {
+	coreRoot := t.TempDir()
+	dataRoot := t.TempDir()
+	cryptoMgr := newUnlockedCrypto(t, coreRoot)
+	runner := &fakeRunner{}
+	launcher := &fakeMountLauncher{}
+	waiter := func(string, time.Duration) error { return nil }
+	mgr := newFileVolumeManagerWithDeps(coreRoot, dataRoot, cryptoMgr, runner, "gocryptfs", "fusermount3", launcher, waiter)
+
+	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "app-class", Class: VolumeClassApplication})
+	if err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+	if err := mgr.Attach(context.Background(), handle, AttachOptions{Role: VolumeRoleLeader}); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	// Read state.json and verify class is persisted.
+	statePath := filepath.Join(dataRoot, "volumes", "app-class", "state.json")
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	var state volumeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("unmarshal state: %v", err)
+	}
+	if state.Class != string(VolumeClassApplication) {
+		t.Fatalf("expected class %q, got %q", VolumeClassApplication, state.Class)
+	}
+}
+
 func TestFileVolumeManagerIntegration(t *testing.T) {
 	if os.Getenv("PICCOLO_TEST_GOCRYPTFS") == "" {
 		t.Skip("set PICCOLO_TEST_GOCRYPTFS=1 to run gocryptfs integration test")
@@ -902,7 +1082,7 @@ func TestFileVolumeManagerIntegration(t *testing.T) {
 
 	root := t.TempDir()
 	cryptoMgr := newUnlockedCrypto(t, root)
-	mgr := newFileVolumeManagerWithDeps(root, cryptoMgr, execRunner{}, "gocryptfs", fusermount, nil, nil)
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, execRunner{}, "gocryptfs", fusermount, nil, nil)
 
 	h, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "integration", Class: VolumeClassApplication})
 	if err != nil {

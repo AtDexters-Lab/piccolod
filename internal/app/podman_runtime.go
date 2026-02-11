@@ -28,7 +28,7 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 	if runRootBase != "" {
 		runRoot = filepath.Join(filepath.Clean(runRootBase), volID)
 	} else {
-		runRoot = paths.CoreJoin("run", "podman", volID)
+		runRoot = filepath.Join("/run/piccolo/podman", volID)
 	}
 	if err := ensureDir(runRoot, 0o700); err != nil {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: ensure podman runroot: %w", err)
@@ -42,7 +42,7 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 	// Note: Base images stored here are NOT encrypted. User data (container RW layer)
 	// remains encrypted in the per-app --root.
 	// Future: Support per-app private imagestore for custom apps requiring full encryption.
-	imagestore := paths.CoreJoin("podman", "imagestore")
+	imagestore := paths.DataJoin("node", "podman", "imagestore")
 	if err := ensureDir(imagestore, 0o700); err != nil {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: ensure podman imagestore: %w", err)
 	}
@@ -88,7 +88,7 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 // Result is cached via sync.Once.
 func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
 	m.imageRuntimeOnce.Do(func() {
-		root := paths.CoreJoin("podman", "image-root")
+		root := paths.DataJoin("node", "podman", "image-root")
 		if err := ensureDir(root, 0o700); err != nil {
 			m.imageRuntimeErr = fmt.Errorf("app manager: ensure image runtime root: %w", err)
 			return
@@ -99,14 +99,14 @@ func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
 		if runRootBase != "" {
 			runRoot = filepath.Join(filepath.Clean(runRootBase), "image-root")
 		} else {
-			runRoot = paths.CoreJoin("run", "podman", "image-root")
+			runRoot = filepath.Join("/run/piccolo/podman", "image-root")
 		}
 		if err := ensureDir(runRoot, 0o700); err != nil {
 			m.imageRuntimeErr = fmt.Errorf("app manager: ensure image runtime runroot: %w", err)
 			return
 		}
 
-		imagestore := paths.CoreJoin("podman", "imagestore")
+		imagestore := paths.DataJoin("node", "podman", "imagestore")
 		if err := ensureDir(imagestore, 0o700); err != nil {
 			m.imageRuntimeErr = fmt.Errorf("app manager: ensure image runtime imagestore: %w", err)
 			return

@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"time"
 
+	"strings"
+
 	"piccolod/internal/crypt"
 	"piccolod/internal/events"
 	"piccolod/internal/fsutil"
@@ -133,9 +135,12 @@ func (p *execMountProcess) Pid() int {
 	return p.cmd.Process.Pid
 }
 
-// fileVolumeManager orchestrates gocryptfs-backed volumes rooted in PICCOLO_CORE_ROOT.
+// fileVolumeManager orchestrates gocryptfs-backed volumes using a two-root
+// layout: coreRoot for control-plane volumes, dataRoot for application volumes.
+// Mountpoints always reside under coreRoot/mounts/ regardless of class.
 type fileVolumeManager struct {
-	root           string
+	coreRoot       string
+	dataRoot       string
 	crypto         *crypt.Manager
 	runner         commandRunner
 	gocryptfsPath  string
@@ -143,7 +148,6 @@ type fileVolumeManager struct {
 	volumes        map[string]*volumeEntry
 	launcher       mountLauncher
 	waitMount      mountWaiter
-	stateRoot      string
 	bus            *events.Bus
 	roleChecker    func(string, VolumeRole) bool
 	bypassMount    bool
@@ -169,6 +173,7 @@ type volumeMetadata struct {
 }
 
 type volumeState struct {
+	Class       string    `json:"class,omitempty"`
 	Desired     string    `json:"desired_state"`
 	Observed    string    `json:"observed_state"`
 	Role        string    `json:"role"`
@@ -188,9 +193,12 @@ const (
 	volumeStateError     = "error"
 )
 
-func newFileVolumeManager(root string, crypto *crypt.Manager, bus *events.Bus) *fileVolumeManager {
-	if root == "" {
-		root = paths.CoreRoot()
+func newFileVolumeManager(coreRoot, dataRoot string, crypto *crypt.Manager, bus *events.Bus) *fileVolumeManager {
+	if coreRoot == "" {
+		coreRoot = paths.CoreRoot()
+	}
+	if dataRoot == "" {
+		dataRoot = paths.DataRoot()
 	}
 	bypass := os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") == "1"
 	waiter := waitForMountReady
@@ -198,7 +206,8 @@ func newFileVolumeManager(root string, crypto *crypt.Manager, bus *events.Bus) *
 		waiter = func(string, time.Duration) error { return nil }
 	}
 	return &fileVolumeManager{
-		root:           root,
+		coreRoot:       coreRoot,
+		dataRoot:       dataRoot,
 		crypto:         crypto,
 		runner:         execRunner{},
 		gocryptfsPath:  defaultGocryptfsBinary(),
@@ -206,7 +215,6 @@ func newFileVolumeManager(root string, crypto *crypt.Manager, bus *events.Bus) *
 		volumes:        make(map[string]*volumeEntry),
 		launcher:       execMountLauncher{},
 		waitMount:      waiter,
-		stateRoot:      filepath.Join(root, "volumes"),
 		bus:            bus,
 		roleChecker:    func(string, VolumeRole) bool { return true },
 		bypassMount:    bypass,
@@ -214,8 +222,8 @@ func newFileVolumeManager(root string, crypto *crypt.Manager, bus *events.Bus) *
 }
 
 // Helper for tests.
-func newFileVolumeManagerWithDeps(root string, crypto *crypt.Manager, runner commandRunner, gocryptfsPath, fusermountPath string, launcher mountLauncher, waiter mountWaiter) *fileVolumeManager {
-	mgr := newFileVolumeManager(root, crypto, nil)
+func newFileVolumeManagerWithDeps(coreRoot, dataRoot string, crypto *crypt.Manager, runner commandRunner, gocryptfsPath, fusermountPath string, launcher mountLauncher, waiter mountWaiter) *fileVolumeManager {
+	mgr := newFileVolumeManager(coreRoot, dataRoot, crypto, nil)
 	if runner != nil {
 		mgr.runner = runner
 	}
@@ -264,19 +272,92 @@ func defaultFusermountBinary() string {
 	return "fusermount3"
 }
 
+// inferVolumeClass returns the expected VolumeClass based on the volume ID convention.
+func inferVolumeClass(id string) VolumeClass {
+	if id == "control-plane" {
+		return VolumeClassControl
+	}
+	if strings.HasPrefix(id, "app-") {
+		return VolumeClassApplication
+	}
+	return VolumeClassControl // safe default
+}
+
+// rootForClass returns the storage root for a given volume class.
+func (f *fileVolumeManager) rootForClass(class VolumeClass) string {
+	if class == VolumeClassApplication {
+		return f.dataRoot
+	}
+	return f.coreRoot
+}
+
+// rootForVolume determines the storage root for a volume by probing both roots
+// for an existing state directory. If neither exists, falls back to ID inference.
+func (f *fileVolumeManager) rootForVolume(id string) string {
+	// When both roots are the same directory (e.g., tests), skip probing.
+	if f.coreRoot == f.dataRoot {
+		return f.coreRoot
+	}
+
+	coreState := filepath.Join(f.coreRoot, "volumes", id, "state.json")
+	dataState := filepath.Join(f.dataRoot, "volumes", id, "state.json")
+	coreExists := fileExists(coreState)
+	dataExists := fileExists(dataState)
+
+	switch {
+	case coreExists && !dataExists:
+		return f.coreRoot
+	case dataExists && !coreExists:
+		return f.dataRoot
+	case coreExists && dataExists:
+		// Should not happen; prefer the root matching ID convention.
+		log.Printf("WARN: volume %s: state.json found under both roots, using ID inference", id)
+		return f.rootForClass(inferVolumeClass(id))
+	default:
+		// New volume — use ID inference.
+		return f.rootForClass(inferVolumeClass(id))
+	}
+}
+
+// volumePaths returns the ciphertext dir, state dir, and mount dir for a volume.
+// Ciphertext and state use rootForVolume (class-based); mount is always coreRoot.
+func (f *fileVolumeManager) volumePaths(id string) (cipherDir, stateDir, mountDir string) {
+	root := f.rootForVolume(id)
+	cipherDir = filepath.Join(root, "ciphertext", id)
+	stateDir = filepath.Join(root, "volumes", id)
+	mountDir = filepath.Join(f.coreRoot, "mounts", id)
+	return
+}
+
+// volumePathsForClass returns paths using an explicit class (for first creation
+// when state.json does not yet exist).
+func (f *fileVolumeManager) volumePathsForClass(id string, class VolumeClass) (cipherDir, stateDir, mountDir string) {
+	root := f.rootForClass(class)
+	cipherDir = filepath.Join(root, "ciphertext", id)
+	stateDir = filepath.Join(root, "volumes", id)
+	mountDir = filepath.Join(f.coreRoot, "mounts", id)
+	return
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func (f *fileVolumeManager) getOrCreateEntry(id string) *volumeEntry {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if entry, ok := f.volumes[id]; ok {
 		return entry
 	}
+	cipherDir, stateDir, mountDir := f.volumePaths(id)
 	entry := &volumeEntry{
 		handle: VolumeHandle{
 			ID:       id,
-			MountDir: filepath.Join(f.root, "mounts", id),
+			MountDir: mountDir,
 		},
-		cipherDir: filepath.Join(f.root, "ciphertext", id),
-		stateDir:  filepath.Join(f.stateRoot, id),
+		cipherDir: cipherDir,
+		stateDir:  stateDir,
 	}
 	f.volumes[id] = entry
 	return entry
@@ -318,6 +399,44 @@ func reprotectMountDir(volumeID, mountDir string) {
 	}
 }
 
+// ensureCipherDir creates the ciphertext directory for a volume. For
+// control-class volumes it attempts btrfs subvolume create to enable atomic
+// snapshots for PCV publishing. Other volumes use a regular directory.
+func (f *fileVolumeManager) ensureCipherDir(class VolumeClass, cipherDir string) error {
+	if _, err := os.Stat(cipherDir); err == nil {
+		return nil // already exists
+	}
+
+	// Ensure parent directory exists.
+	if err := os.MkdirAll(filepath.Dir(cipherDir), 0o700); err != nil {
+		return err
+	}
+
+	if class != VolumeClassControl {
+		return os.MkdirAll(cipherDir, 0o700)
+	}
+
+	// In test/bypass mode, skip btrfs and use a regular directory.
+	if f.bypassMount {
+		return os.MkdirAll(cipherDir, 0o700)
+	}
+
+	// Control-plane: prefer btrfs subvolume for PCV snapshots.
+	cmd := exec.CommandContext(context.Background(), "btrfs", "subvolume", "create", cipherDir)
+	if err := cmd.Run(); err != nil {
+		// Dev fallback: allow regular directory when PICCOLO_DEV_NO_BTRFS=1
+		// AND the test-image sentinel exists.
+		if os.Getenv("PICCOLO_DEV_NO_BTRFS") == "1" {
+			if _, sErr := os.Stat("/etc/piccolo-test-image"); sErr == nil {
+				log.Printf("WARN: btrfs subvolume create %s failed (%v), using regular directory (dev fallback)", cipherDir, err)
+				return os.MkdirAll(cipherDir, 0o700)
+			}
+		}
+		return fmt.Errorf("btrfs subvolume create %s: %w", cipherDir, err)
+	}
+	return nil
+}
+
 func (f *fileVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest) (VolumeHandle, error) {
 	f.mu.Lock()
 	entry, ok := f.volumes[req.ID]
@@ -330,12 +449,12 @@ func (f *fileVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 	}
 	// Hold the lock to prevent concurrent init of the same volume.
 	// Create a placeholder entry so other callers see it immediately.
-	cipherDir := filepath.Join(f.root, "ciphertext", req.ID)
-	mountDir := filepath.Join(f.root, "mounts", req.ID)
+	// Use the explicit class from the request for first-creation path routing.
+	cipherDir, stateDir, mountDir := f.volumePathsForClass(req.ID, req.Class)
 	entry = &volumeEntry{
 		handle:    VolumeHandle{ID: req.ID, MountDir: mountDir},
 		cipherDir: cipherDir,
-		stateDir:  filepath.Join(f.stateRoot, req.ID),
+		stateDir:  stateDir,
 	}
 	f.volumes[req.ID] = entry
 	f.mu.Unlock()
@@ -353,7 +472,7 @@ func (f *fileVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 		}
 	}()
 
-	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
+	if err := f.ensureCipherDir(req.Class, cipherDir); err != nil {
 		return VolumeHandle{}, fmt.Errorf("ensure volume %s ciphertext: %w", req.ID, err)
 	}
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
@@ -590,7 +709,7 @@ func (f *fileVolumeManager) fusermountDetach(ctx context.Context, handle VolumeH
 }
 
 func (f *fileVolumeManager) DestroyVolume(ctx context.Context, id string) error {
-	mountDir := filepath.Join(f.root, "mounts", id)
+	cipherDir, stateDir, mountDir := f.volumePaths(id)
 	handle := VolumeHandle{ID: id, MountDir: mountDir}
 
 	// Acquire the entry's metaMu to serialize against concurrent Attach/ensureMetadata.
@@ -610,13 +729,11 @@ func (f *fileVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 	}
 
 	// 2. Remove Ciphertext
-	cipherDir := filepath.Join(f.root, "ciphertext", id)
 	if err := os.RemoveAll(cipherDir); err != nil {
 		return fmt.Errorf("destroy: remove ciphertext: %w", err)
 	}
 
 	// 3. Remove Metadata/State
-	stateDir := filepath.Join(f.stateRoot, id)
 	if err := os.RemoveAll(stateDir); err != nil {
 		return fmt.Errorf("destroy: remove state: %w", err)
 	}
@@ -809,7 +926,13 @@ func (f *fileVolumeManager) recordVolumeState(volumeID string, desired string, o
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	// Carry forward the persisted class; infer from ID if missing (defense-in-depth).
+	class := prev.Class
+	if class == "" {
+		class = string(inferVolumeClass(volumeID))
+	}
 	state := volumeState{
+		Class:     class,
 		Desired:   desired,
 		Observed:  observed,
 		Role:      string(role),
@@ -837,7 +960,8 @@ func (f *fileVolumeManager) recordVolumeState(volumeID string, desired string, o
 }
 
 func (f *fileVolumeManager) readVolumeState(volumeID string) (volumeState, error) {
-	path := filepath.Join(f.stateRoot, volumeID, "state.json")
+	_, stateDir, _ := f.volumePaths(volumeID)
+	path := filepath.Join(stateDir, "state.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return volumeState{}, err
@@ -955,41 +1079,51 @@ func parseVolumeRole(role string) VolumeRole {
 }
 
 func (f *fileVolumeManager) reconcileAllVolumeStates() error {
-	entries, err := os.ReadDir(f.stateRoot)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		volID := entry.Name()
-		volEntry := f.getOrCreateEntry(volID)
-		if err := f.reconcileVolumeState(context.Background(), volEntry); err != nil {
+	seen := make(map[string]bool)
+
+	// Scan both roots for volume state directories.
+	for _, root := range []string{f.coreRoot, f.dataRoot} {
+		stateRoot := filepath.Join(root, "volumes")
+		entries, err := os.ReadDir(stateRoot)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // dataRoot may not be mounted yet
+			}
 			return err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			volID := entry.Name()
+			if seen[volID] {
+				continue
+			}
+			seen[volID] = true
+			volEntry := f.getOrCreateEntry(volID)
+			if err := f.reconcileVolumeState(context.Background(), volEntry); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 func (f *fileVolumeManager) writeVolumeState(volumeID string, state volumeState) error {
-	dir := filepath.Join(f.stateRoot, volumeID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	_, stateDir, _ := f.volumePaths(volumeID)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(&state, "", "  ")
 	if err != nil {
 		return err
 	}
-	finalPath := filepath.Join(dir, "state.json")
+	finalPath := filepath.Join(stateDir, "state.json")
 	if err := fsutil.AtomicWriteFile(finalPath, data, 0o600); err != nil {
 		return err
 	}
-	// Also sync the parent state root for extra durability
-	return fsutil.SyncDir(f.stateRoot)
+	// Also sync the parent volumes dir for extra durability.
+	return fsutil.SyncDir(filepath.Dir(stateDir))
 }
 
 func (f *fileVolumeManager) sealVolumeKey(ctx context.Context, passphrase []byte) (volumeMetadata, error) {

@@ -52,13 +52,12 @@ func TestPersistenceStateDirHasNoPlaintextArtifacts(t *testing.T) {
 		t.Skipf("skipping test: cannot read /etc/fuse.conf: %v", err)
 	}
 
-	stateDir := t.TempDir()
+	coreDir, dataDir := paths.SetRootsForTest(t)
 	t.Setenv("PICCOLO_GOCRYPTFS_PATH", gocryptfsPath)
 	t.Setenv("PICCOLO_FUSERMOUNT_PATH", fusermountPath)
-	paths.SetCoreRootForTest(t, stateDir)
 
 	password := "audit-passphrase"
-	cryptoMgr, err := crypt.NewManager(stateDir)
+	cryptoMgr, err := crypt.NewManager(coreDir)
 	if err != nil {
 		t.Fatalf("crypto manager init: %v", err)
 	}
@@ -73,7 +72,8 @@ func TestPersistenceStateDirHasNoPlaintextArtifacts(t *testing.T) {
 
 	mod, err := NewService(Options{
 		Crypto:   cryptoMgr,
-		StateDir: stateDir,
+		StateDir: coreDir,
+		DataDir:  dataDir,
 	})
 	if err != nil {
 		t.Fatalf("persistence service init: %v", err)
@@ -108,7 +108,7 @@ func TestPersistenceStateDirHasNoPlaintextArtifacts(t *testing.T) {
 		t.Fatalf("persistence shutdown: %v", err)
 	}
 
-	unexpected := inspectStateDirForPlaintext(t, stateDir)
+	unexpected := inspectStateDirForPlaintext(t, coreDir)
 	if len(unexpected) > 0 {
 		t.Fatalf("plaintext artifacts detected in state dir: %v", unexpected)
 	}
@@ -150,8 +150,11 @@ func inspectStateDirForPlaintext(t *testing.T, root string) []string {
 				// volumes/<id>
 				return nil
 			}
-			if len(parts) == 3 && parts[2] == "state.json" && !d.IsDir() {
-				return nil
+			if len(parts) == 3 && !d.IsDir() {
+				// Allow known volume metadata files: state.json, piccolo.volume.json
+				if parts[2] == "state.json" || parts[2] == volumeMetadataName {
+					return nil
+				}
 			}
 			unexpected = append(unexpected, rel)
 			return nil

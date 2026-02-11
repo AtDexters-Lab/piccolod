@@ -29,6 +29,7 @@ type Options struct {
 	Dispatcher     *commands.Dispatcher
 	Crypto         *crypt.Manager
 	StateDir       string
+	DataDir        string
 }
 
 // Module implements the Service interface using pluggable sub-components.
@@ -106,7 +107,11 @@ func NewService(opts Options) (*Module, error) {
 		if mod.crypto == nil {
 			return nil, ErrCryptoUnavailable
 		}
-		mod.volumes = newFileVolumeManager(mod.stateDir, mod.crypto, mod.events)
+		dataDir := opts.DataDir
+		if dataDir == "" {
+			dataDir = paths.DataRoot()
+		}
+		mod.volumes = newFileVolumeManager(mod.stateDir, dataDir, mod.crypto, mod.events)
 	}
 	if fm, ok := mod.volumes.(*fileVolumeManager); ok {
 		if fm.bus == nil {

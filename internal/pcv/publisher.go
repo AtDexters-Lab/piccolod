@@ -707,6 +707,7 @@ func (p *Publisher) getSubvolInfo(ctx context.Context, dir string) (gen uint64, 
 	}
 	out, err := p.run.RunWithOutput(ctx, "btrfs", "subvolume", "show", dir)
 	if err != nil {
+		log.Printf("WARN: pcv publisher: btrfs subvolume show %s failed: %v (PCV dirty-check will not work; snapshots will use cp -a fallback)", dir, err)
 		return 0, ""
 	}
 	for _, line := range strings.Split(string(out), "\n") {

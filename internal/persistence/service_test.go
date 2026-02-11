@@ -11,7 +11,7 @@ func TestModuleEnsureCoreVolumesIgnoresReconcileErrors(t *testing.T) {
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 
 	root := t.TempDir()
-	mgr := newFileVolumeManager(root, nil, nil)
+	mgr := newFileVolumeManager(root, root, nil, nil)
 
 	// Seed a corrupted state file so reconcileAllVolumeStates() fails. ensureCoreVolumes
 	// should still continue and bring up core volumes so piccolod can start.
