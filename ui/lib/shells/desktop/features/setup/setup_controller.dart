@@ -239,10 +239,9 @@ class SetupController extends ChangeNotifier {
         body: {'choice': 'try_piccolo'},
       );
 
-      // Disk prep started on backend. Proceed to normal first-run setup.
-      _isFirstSetupFlow = true;
-      _state = SetupState.welcome;
-      notifyListeners();
+      // Disk prep started on backend. Re-check system status to determine the
+      // correct next step: welcome (new system) or unlock (previously set up).
+      await _checkStatus();
     } catch (e) {
       _error = e.toString();
       _state = SetupState.onboarding;

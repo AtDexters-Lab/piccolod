@@ -784,8 +784,20 @@ func (s *GinServer) Start() error {
 			log.Printf("INFO: returning USB user (state=%s); starting disk preparation", s.onboardingMgr.State())
 			s.storageMgr.StartPartitioningAsync(context.Background())
 		default:
-			log.Printf("INFO: boot mode is %s, onboarding state is %s; deferring disk preparation to onboarding",
-				s.onboardingMgr.BootMode(), s.onboardingMgr.State())
+			// USB/unknown boot with state=pending. Check if the system was
+			// previously set up (e.g. disk moved between controllers). If so,
+			// auto-advance onboarding to try_piccolo and start partitioning
+			// so the user sees the unlock screen instead of onboarding.
+			if s.storageMgr.IsPreviouslySetUp(context.Background()) {
+				log.Printf("INFO: previously set up system detected on %s boot; auto-advancing onboarding", s.onboardingMgr.BootMode())
+				if err := s.onboardingMgr.Choose(onboarding.StateTryPiccolo); err != nil {
+					log.Printf("WARN: failed to auto-advance onboarding: %v", err)
+				}
+				s.storageMgr.StartPartitioningAsync(context.Background())
+			} else {
+				log.Printf("INFO: boot mode is %s, onboarding state is %s; deferring disk preparation to onboarding",
+					s.onboardingMgr.BootMode(), s.onboardingMgr.State())
+			}
 		}
 	}
 
