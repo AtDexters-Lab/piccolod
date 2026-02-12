@@ -14,11 +14,16 @@ class TaskProgressPanel extends StatefulWidget {
   final String taskType;
   final VoidCallback? onComplete;
 
+  /// Optional URL path override for the WebSocket progress stream.
+  /// Defaults to `/api/v1/events/progress/stream`.
+  final String? urlPath;
+
   const TaskProgressPanel({
     super.key,
     required this.taskId,
     required this.taskType,
     this.onComplete,
+    this.urlPath,
   });
 
   @override
@@ -97,7 +102,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
           _history.add(evt);
         }
       });
-      if (evt.isComplete) {
+      if (evt.isComplete && (evt.error == null || evt.error!.isEmpty)) {
         widget.onComplete?.call();
       }
     });
@@ -119,7 +124,8 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
 
   String _buildUrl(String taskId) {
     final encoded = Uri.encodeQueryComponent(taskId);
-    final path = '/api/v1/events/progress/stream?task_id=$encoded';
+    final basePath = widget.urlPath ?? '/api/v1/events/progress/stream';
+    final path = '$basePath?task_id=$encoded';
 
     final devBase = CoreConfig.wsBaseUrl;
     if (devBase.isNotEmpty) {

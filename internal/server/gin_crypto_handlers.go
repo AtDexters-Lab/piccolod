@@ -128,6 +128,14 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, 3600)
 	s.setSessionCookie(c, sess.ID, time.Hour)
 
+	// Mark onboarding as complete (try_piccolo → complete).
+	// Best-effort: failure here doesn't block setup since LUKS header serves as fallback signal.
+	if s.onboardingMgr != nil {
+		if err := s.onboardingMgr.Complete(); err != nil {
+			log.Printf("WARN: onboarding complete: %v", err)
+		}
+	}
+
 	// Fail after session creation so the user has portal access for recovery.
 	if luksErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{

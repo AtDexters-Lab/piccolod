@@ -87,6 +87,9 @@ func isEmergencyAllowed(path string) bool {
 		"/api/v1/crypto/status",
 		// Network peers — gateway UI needs peer discovery to redirect to the correct device.
 		"/api/v1/network/peers",
+		// Onboarding endpoints — needed to make the initial USB boot choice.
+		"/api/v1/system/onboarding",
+		"/api/v1/storage/disks",
 		"/version",
 	}
 	for _, prefix := range allowed {

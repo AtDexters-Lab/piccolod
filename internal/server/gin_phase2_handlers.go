@@ -104,12 +104,6 @@ func (s *GinServer) handleRemoteStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, st)
 }
 
-// handleStorageDisks lists physical disks (read-only); returns an empty list if unknown.
-func (s *GinServer) handleStorageDisks(c *gin.Context) {
-	// Placeholder: storage manager not yet implemented; return empty list.
-	c.JSON(http.StatusOK, gin.H{"disks": []gin.H{}})
-}
-
 // handleOSUpdateReboot triggers a system reboot.
 func (s *GinServer) handleOSUpdateReboot(c *gin.Context) {
 	if s.updateManager == nil {
