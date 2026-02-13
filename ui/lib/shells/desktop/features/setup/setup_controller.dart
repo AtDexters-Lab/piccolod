@@ -142,6 +142,15 @@ class SetupController extends ChangeNotifier {
         _state = SetupState.installComplete;
         return;
       }
+      // If install is in progress, reconnect to the progress stream.
+      if (onboarding['state'] == 'install_disk') {
+        final activeTaskId = onboarding['install_task_id'] as String?;
+        if (activeTaskId != null && activeTaskId.isNotEmpty) {
+          _installTaskId = activeTaskId;
+          _state = SetupState.installDisk;
+          return;
+        }
+      }
 
       final status = await _api.get('/api/v1/crypto/status');
       // Expect: {"initialized": bool, "locked": bool}

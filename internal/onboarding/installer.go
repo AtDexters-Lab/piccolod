@@ -44,6 +44,7 @@ type Installer struct {
 	onboardingMgr  *Manager
 	mu             sync.Mutex
 	running        bool
+	activeTaskID   string
 }
 
 // NewInstaller creates a new Install to Disk installer.
@@ -64,12 +65,14 @@ func (inst *Installer) Install(ctx context.Context, targetDisk, imageURL, taskID
 		return fmt.Errorf("install already in progress")
 	}
 	inst.running = true
+	inst.activeTaskID = taskID
 	inst.mu.Unlock()
 
 	go func() {
 		defer func() {
 			inst.mu.Lock()
 			inst.running = false
+			inst.activeTaskID = ""
 			inst.mu.Unlock()
 		}()
 		if err := inst.runPipeline(ctx, targetDisk, imageURL, taskID); err != nil {
@@ -79,6 +82,13 @@ func (inst *Installer) Install(ctx context.Context, targetDisk, imageURL, taskID
 	}()
 
 	return nil
+}
+
+// ActiveTaskID returns the task ID of the currently running install, or "" if idle.
+func (inst *Installer) ActiveTaskID() string {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	return inst.activeTaskID
 }
 
 // resolveImageURL determines the OBS image URL based on architecture and board.

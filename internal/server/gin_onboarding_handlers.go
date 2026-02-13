@@ -24,7 +24,13 @@ func (s *GinServer) handleOnboardingStatus(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(http.StatusOK, s.onboardingMgr.StatusResponse())
+	resp := s.onboardingMgr.StatusResponse()
+	if s.installer != nil {
+		if taskID := s.installer.ActiveTaskID(); taskID != "" {
+			resp["install_task_id"] = taskID
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // handleOnboardingChoice processes the user's onboarding choice.
