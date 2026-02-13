@@ -67,6 +67,7 @@ type osUpdateManager interface {
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
 	Reboot(context.Context) error
+	PowerOff(context.Context) error
 	Watch(context.Context) error
 }
 

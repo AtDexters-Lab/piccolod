@@ -218,6 +218,7 @@ class _SetupWizardState extends State<SetupWizard> {
         return _InstallCompleteStep(
           onReboot: _controller.rebootAfterInstall,
           error: _controller.error,
+          bootOrderConfigured: _controller.bootOrderConfigured,
         );
       case SetupState.welcome:
         return _WelcomeStep(onNext: _controller.startSetup);
@@ -362,8 +363,13 @@ class _FinishingStep extends StatelessWidget {
 class _InstallCompleteStep extends StatefulWidget {
   final Future<void> Function() onReboot;
   final String? error;
+  final bool bootOrderConfigured;
 
-  const _InstallCompleteStep({required this.onReboot, this.error});
+  const _InstallCompleteStep({
+    required this.onReboot,
+    this.error,
+    this.bootOrderConfigured = false,
+  });
 
   @override
   State<_InstallCompleteStep> createState() => _InstallCompleteStepState();
@@ -374,6 +380,12 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
 
   @override
   Widget build(BuildContext context) {
+    final subtitle = widget.bootOrderConfigured
+        ? "Your device will reboot into the internal disk. You can remove the USB drive at any time."
+        : "Remove the USB drive after the device powers off, then power it back on.";
+    final buttonLabel = widget.bootOrderConfigured ? "Reboot Now" : "Power Off";
+    final buttonIcon = widget.bootOrderConfigured ? Icons.restart_alt : Icons.power_settings_new;
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
       child: Column(
@@ -393,9 +405,9 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 8),
-          const Text(
-            "Remove the USB drive and reboot to start using Piccolo from the internal disk.",
-            style: TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
+          Text(
+            subtitle,
+            style: const TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
             textAlign: TextAlign.center,
           ),
           if (widget.error != null) ...[
@@ -435,8 +447,8 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
                       strokeWidth: 2,
                     ),
                   )
-                : const Icon(Icons.restart_alt),
-            label: Text(_isRebooting ? "Rebooting..." : "Reboot Now"),
+                : Icon(buttonIcon),
+            label: Text(_isRebooting ? "Shutting down..." : buttonLabel),
             style: ElevatedButton.styleFrom(
               backgroundColor: PiccoloTheme.cobalt600,
               foregroundColor: Colors.white,

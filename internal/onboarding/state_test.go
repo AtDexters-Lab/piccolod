@@ -224,6 +224,75 @@ func TestMarkInstallDone_WrongState(t *testing.T) {
 	}
 }
 
+func TestResetInstallFlags(t *testing.T) {
+	setupTestDir(t)
+	m := NewManager(storage.BootModeUSB)
+	if err := m.Choose(StateInstallDisk); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a completed install with boot order configured.
+	if err := m.MarkInstallDone(); err != nil {
+		t.Fatal(err)
+	}
+	m.MarkBootOrderConfigured()
+
+	if !m.InstallDone() || !m.BootOrderConfigured() {
+		t.Fatal("precondition: flags should be true before reset")
+	}
+
+	if err := m.ResetInstallFlags(); err != nil {
+		t.Fatalf("ResetInstallFlags() unexpected error: %v", err)
+	}
+	if m.InstallDone() {
+		t.Error("expected InstallDone to be false after reset")
+	}
+	if m.BootOrderConfigured() {
+		t.Error("expected BootOrderConfigured to be false after reset")
+	}
+
+	// Verify persistence: reload from disk and check flags are cleared.
+	m2 := NewManager(storage.BootModeUSB)
+	// Boot recovery will kick in (install_disk + !InstallDone → pending),
+	// but we can verify the flags are false on the reloaded config.
+	if m2.InstallDone() {
+		t.Error("expected InstallDone false after reload")
+	}
+	if m2.BootOrderConfigured() {
+		t.Error("expected BootOrderConfigured false after reload")
+	}
+}
+
+func TestResetInstallFlags_WrongState(t *testing.T) {
+	setupTestDir(t)
+	m := NewManager(storage.BootModeUSB)
+	if err := m.ResetInstallFlags(); err == nil {
+		t.Error("ResetInstallFlags() from pending expected error, got nil")
+	}
+}
+
+func TestNewManager_BootRecoveryClearsBootOrderConfigured(t *testing.T) {
+	dir := setupTestDir(t)
+	// install_disk with InstallDone=false but BootOrderConfigured=true
+	// (efibootmgr succeeded before interruption).
+	cfg := OnboardingConfig{
+		State:               StateInstallDisk,
+		InstallDone:         false,
+		BootOrderConfigured: true,
+	}
+	data, _ := json.Marshal(cfg)
+	if err := os.WriteFile(filepath.Join(dir, "network-bootstrap", "onboarding.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManager(storage.BootModeUSB)
+	if m.State() != StatePending {
+		t.Errorf("expected pending after boot recovery, got %s", m.State())
+	}
+	if m.BootOrderConfigured() {
+		t.Error("expected BootOrderConfigured to be false after boot recovery")
+	}
+}
+
 func TestPersistence_RoundTrip(t *testing.T) {
 	setupTestDir(t)
 	m := NewManager(storage.BootModeUSB)

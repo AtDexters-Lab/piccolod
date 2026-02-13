@@ -25,10 +25,11 @@ const (
 
 // OnboardingConfig is the persisted onboarding state.
 type OnboardingConfig struct {
-	State       OnboardingState `json:"state"`
-	BootMode    string          `json:"boot_mode,omitempty"`
-	InstallDone bool            `json:"install_done,omitempty"`
-	UpdatedAt   string          `json:"updated_at,omitempty"`
+	State                OnboardingState `json:"state"`
+	BootMode             string          `json:"boot_mode,omitempty"`
+	InstallDone          bool            `json:"install_done,omitempty"`
+	BootOrderConfigured  bool            `json:"boot_order_configured,omitempty"`
+	UpdatedAt            string          `json:"updated_at,omitempty"`
 }
 
 // Manager manages the onboarding state machine.
@@ -74,6 +75,7 @@ func NewManager(bootMode storage.BootMode) *Manager {
 		log.Printf("INFO: onboarding state is install_disk with InstallDone=false; resetting to pending (boot recovery)")
 		cfg.State = StatePending
 		cfg.InstallDone = false
+		cfg.BootOrderConfigured = false
 	}
 
 	cfg.BootMode = string(bootMode)
@@ -115,6 +117,13 @@ func (m *Manager) InstallDone() bool {
 	return m.config.InstallDone
 }
 
+// BootOrderConfigured returns true when efibootmgr successfully set the boot order.
+func (m *Manager) BootOrderConfigured() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.config.BootOrderConfigured
+}
+
 // Choose validates a state transition and persists it.
 func (m *Manager) Choose(choice OnboardingState) error {
 	m.mu.Lock()
@@ -125,6 +134,29 @@ func (m *Manager) Choose(choice OnboardingState) error {
 	}
 
 	m.config.State = choice
+	// Reset install-specific flags when starting a new install so stale
+	// values from a previous attempt don't affect the new one.
+	if choice == StateInstallDisk {
+		m.config.InstallDone = false
+		m.config.BootOrderConfigured = false
+	}
+	m.config.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return m.persistLocked()
+}
+
+// ResetInstallFlags clears install-specific flags and persists. Called when
+// retrying an install that is already in install_disk state (where Choose()
+// would be a no-op since the state transition is a self-loop).
+func (m *Manager) ResetInstallFlags() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.config.State != StateInstallDisk {
+		return fmt.Errorf("cannot reset install flags: state is %q, expected %q", m.config.State, StateInstallDisk)
+	}
+
+	m.config.InstallDone = false
+	m.config.BootOrderConfigured = false
 	m.config.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	return m.persistLocked()
 }
@@ -141,6 +173,19 @@ func (m *Manager) MarkInstallDone() error {
 	m.config.InstallDone = true
 	m.config.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	return m.persistLocked()
+}
+
+// MarkBootOrderConfigured records that efibootmgr successfully set the
+// internal disk as the first boot entry. Persisted so the UI can show
+// the appropriate reboot instructions even after a page reload.
+func (m *Manager) MarkBootOrderConfigured() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.config.BootOrderConfigured = true
+	m.config.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := m.persistLocked(); err != nil {
+		log.Printf("WARN: failed to persist boot_order_configured: %v", err)
+	}
 }
 
 // Complete transitions try_piccolo → complete.
@@ -162,10 +207,11 @@ func (m *Manager) StatusResponse() map[string]any {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return map[string]any{
-		"state":        string(m.config.State),
-		"boot_mode":    m.config.BootMode,
-		"required":     m.isRequiredLocked(),
-		"install_done": m.config.InstallDone,
+		"state":                  string(m.config.State),
+		"boot_mode":              m.config.BootMode,
+		"required":               m.isRequiredLocked(),
+		"install_done":           m.config.InstallDone,
+		"boot_order_configured":  m.config.BootOrderConfigured,
 	}
 }
 

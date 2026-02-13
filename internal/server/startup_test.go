@@ -21,6 +21,7 @@ func (m *blockingUpdateManager) Status(ctx context.Context) (update.Status, erro
 func (m *blockingUpdateManager) Apply(ctx context.Context) error                     { return nil }
 func (m *blockingUpdateManager) Rollback(ctx context.Context, targetID string) error { return nil }
 func (m *blockingUpdateManager) Reboot(ctx context.Context) error                    { return nil }
+func (m *blockingUpdateManager) PowerOff(ctx context.Context) error                  { return nil }
 
 // Watch blocks until context is cancelled, simulating the real infinite loop.
 func (m *blockingUpdateManager) Watch(ctx context.Context) error {

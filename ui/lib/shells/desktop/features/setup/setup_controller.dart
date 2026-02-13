@@ -53,6 +53,9 @@ class SetupController extends ChangeNotifier {
   String? _bootMode;
   String? get bootMode => _bootMode;
 
+  bool _bootOrderConfigured = false;
+  bool get bootOrderConfigured => _bootOrderConfigured;
+
   final ApiClient _api = ApiClient();
 
   SetupController() {
@@ -132,6 +135,7 @@ class SetupController extends ChangeNotifier {
       // Check onboarding status — USB boot may require onboarding choice.
       final onboarding = await _api.get('/api/v1/system/onboarding');
       _bootMode = onboarding['boot_mode'] as String?;
+      _bootOrderConfigured = onboarding['boot_order_configured'] == true;
       if (onboarding['required'] == true) {
         _state = SetupState.onboarding;
         return;
@@ -312,7 +316,14 @@ class SetupController extends ChangeNotifier {
   }
 
   /// Called when install progress reaches 100% / isComplete.
-  void onInstallComplete() {
+  /// Fetches fresh onboarding status to get boot_order_configured.
+  Future<void> onInstallComplete() async {
+    try {
+      final onboarding = await _api.get('/api/v1/system/onboarding');
+      _bootOrderConfigured = onboarding['boot_order_configured'] == true;
+    } catch (_) {
+      // Non-fatal; default false shows the safer "Power Off" path.
+    }
     _state = SetupState.installComplete;
     notifyListeners();
   }

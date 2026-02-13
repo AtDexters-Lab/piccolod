@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strings"
 
@@ -152,6 +153,7 @@ func (s *GinServer) handleInstallToDisk(c *gin.Context) {
 	}
 
 	// Transition to install_disk if not already there (covers both onboarding and Settings paths).
+	// Choose() resets install flags as part of the transition.
 	if state != onboarding.StateInstallDisk {
 		if err := s.onboardingMgr.Choose(onboarding.StateInstallDisk); err != nil {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -168,6 +170,15 @@ func (s *GinServer) handleInstallToDisk(c *gin.Context) {
 	if err := s.installer.Install(context.Background(), req.TargetDisk, "", req.TaskID); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
+	}
+
+	// On retry (already in install_disk), reset stale flags from the previous
+	// attempt. Done after Install() succeeds to avoid clearing flags of an
+	// active install when a duplicate request is rejected.
+	if state == onboarding.StateInstallDisk {
+		if err := s.onboardingMgr.ResetInstallFlags(); err != nil {
+			log.Printf("WARN: failed to reset install flags on retry: %v", err)
+		}
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
@@ -189,7 +200,9 @@ func (s *GinServer) handleInstallProgressStream(c *gin.Context) {
 	s.handleGinTaskProgressStream(c)
 }
 
-// handleOnboardingReboot triggers a system reboot after Install to Disk.
+// handleOnboardingReboot triggers a system reboot (or power off) after Install to Disk.
+// If efibootmgr configured the boot order, reboot is safe (internal disk boots first).
+// Otherwise, power off so the user can remove the USB drive before powering on.
 // POST /api/v1/system/reboot
 func (s *GinServer) handleOnboardingReboot(c *gin.Context) {
 	if s.onboardingMgr == nil {
@@ -210,12 +223,19 @@ func (s *GinServer) handleOnboardingReboot(c *gin.Context) {
 		return
 	}
 
-	if err := s.updateManager.Reboot(context.Background()); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "reboot failed: " + err.Error()})
-		return
+	if s.onboardingMgr.BootOrderConfigured() {
+		if err := s.updateManager.Reboot(context.Background()); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "reboot failed: " + err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "reboot initiated"})
+	} else {
+		if err := s.updateManager.PowerOff(context.Background()); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "power off failed: " + err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "power off initiated"})
 	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "reboot initiated"})
 }
 
 // isSessionAdmin checks if the current request has an active admin session.

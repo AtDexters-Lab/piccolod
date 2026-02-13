@@ -179,11 +179,16 @@ func (inst *Installer) runPipeline(ctx context.Context, targetDisk, imageURL, ta
 
 	// Phase: Boot config
 	inst.report(taskID, "Configuring boot order", 96, "Setting up efibootmgr", false)
+	bootOrderOK := false
 	if err := inst.configureBootOrder(ctx, targetDisk); err != nil {
 		log.Printf("WARN: efibootmgr failed (non-fatal): %v", err)
 		inst.report(taskID, "Configuring boot order", 97,
-			"Boot order configuration failed — change boot order in BIOS manually", false)
+			"Boot order configuration failed — you may need to change boot order in BIOS", false)
 	} else {
+		bootOrderOK = true
+		if inst.onboardingMgr != nil {
+			inst.onboardingMgr.MarkBootOrderConfigured()
+		}
 		inst.report(taskID, "Configuring boot order", 98, "Boot order configured", false)
 	}
 
@@ -194,7 +199,11 @@ func (inst *Installer) runPipeline(ctx context.Context, targetDisk, imageURL, ta
 		}
 	}
 
-	inst.report(taskID, "Complete", 100, "Installation complete. Remove the USB drive and reboot.", true)
+	completeMsg := "Installation complete — reboot to start using Piccolo from the internal disk."
+	if !bootOrderOK {
+		completeMsg = "Installation complete — power off the device, remove the USB drive, then turn it back on."
+	}
+	inst.report(taskID, "Complete", 100, completeMsg, true)
 	return nil
 }
 

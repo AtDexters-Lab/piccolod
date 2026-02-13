@@ -54,6 +54,7 @@ type osBackend interface {
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
 	Reboot(context.Context) error
+	PowerOff(context.Context) error
 	Watch(context.Context) error
 }
 
@@ -132,6 +133,11 @@ func (m *Manager) Rollback(ctx context.Context, targetID string) error {
 // Reboot triggers a system reboot.
 func (m *Manager) Reboot(ctx context.Context) error {
 	return m.backend.Reboot(ctx)
+}
+
+// PowerOff triggers a system power off.
+func (m *Manager) PowerOff(ctx context.Context) error {
+	return m.backend.PowerOff(ctx)
 }
 
 // Watch starts a background monitoring loop to detect and recover from update failures.
@@ -250,6 +256,15 @@ func (m *microOSBackend) Reboot(ctx context.Context) error {
 	// We use the runner to execute reboot. Note that this will likely terminate the API server
 	// before the command returns or shortly after.
 	_, _, _, err := m.runner.Run(ctx, "systemctl", "reboot")
+	return err
+}
+
+// PowerOff triggers systemctl poweroff.
+func (m *microOSBackend) PowerOff(ctx context.Context) error {
+	if !m.supported {
+		return ErrUnsupported
+	}
+	_, _, _, err := m.runner.Run(ctx, "systemctl", "poweroff")
 	return err
 }
 
