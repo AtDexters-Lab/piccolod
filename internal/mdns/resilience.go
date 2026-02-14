@@ -1,9 +1,12 @@
 package mdns
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math"
+	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -272,4 +275,75 @@ func (m *Manager) healthMonitorLoop() {
 			m.performHealthCheck()
 		}
 	}
+}
+
+// isClosedConnError returns true if the error indicates a closed network connection.
+func isClosedConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection")
+}
+
+// recoverClosedConnection asynchronously recovers an interface whose connections
+// have been closed (e.g., by a network reset). The staleState parameter ensures
+// recovery only runs once per stale state — concurrent callers detecting the same
+// dead connections will no-op via pointer comparison.
+func (m *Manager) recoverClosedConnection(name string, staleState *InterfaceState) {
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+
+		m.mutex.Lock()
+		if m.stopped.Load() {
+			m.mutex.Unlock()
+			return
+		}
+		current, exists := m.interfaces[name]
+		if !exists || current != staleState {
+			// Already recovered by another goroutine, or interface removed.
+			m.mutex.Unlock()
+			return
+		}
+
+		// Prevent rapid recovery loops: if we recovered this interface recently,
+		// defer to the health monitor which uses exponential backoff.
+		if lastRecovery, ok := m.recoveryCooldowns[name]; ok && time.Since(lastRecovery) < 30*time.Second {
+			staleState.Active = false
+			m.mutex.Unlock()
+			return
+		}
+		m.recoveryCooldowns[name] = time.Now()
+
+		log.Printf("RESILIENCE: Recovering closed connection on interface %s", name)
+
+		// Close old connections. Do NOT set to nil — the responder goroutine reads
+		// these pointers without holding the mutex, so nilling would race with its
+		// nil-check and cause a panic. Close() is sufficient: the responder's next
+		// ReadFromUDP will return "use of closed network connection" and exit.
+		if staleState.IPv4Conn != nil {
+			staleState.IPv4Conn.Close()
+		}
+		if staleState.IPv6Conn != nil {
+			staleState.IPv6Conn.Close()
+		}
+
+		recovered := false
+		if err := m.setupInterface(staleState.Interface); err != nil {
+			// Mark inactive and record failure so health monitor retries with backoff.
+			staleState.Active = false
+			m.markInterfaceFailure(staleState, fmt.Errorf("closed connection recovery failed: %w", err))
+			log.Printf("RESILIENCE: Failed to recover interface %s, will retry via health monitor: %v", name, err)
+		} else {
+			log.Printf("RESILIENCE: Successfully recovered interface %s", name)
+			recovered = true
+		}
+		m.mutex.Unlock()
+
+		if recovered && !m.stopped.Load() {
+			m.sendMultiInterfaceAnnouncements()
+			m.sendServiceAnnouncement()
+			m.sendPeerDiscoveryQuery()
+		}
+	}()
 }

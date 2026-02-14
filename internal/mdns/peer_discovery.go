@@ -45,6 +45,7 @@ func (m *Manager) sendPeerDiscoveryQuery() {
 	m.mutex.RLock()
 	snapshots := make([]struct {
 		name     string
+		state    *InterfaceState
 		ipv4Conn *net.UDPConn
 		ipv6Conn *net.UDPConn
 		active   bool
@@ -56,11 +57,13 @@ func (m *Manager) sendPeerDiscoveryQuery() {
 		}
 		snapshots = append(snapshots, struct {
 			name     string
+			state    *InterfaceState
 			ipv4Conn *net.UDPConn
 			ipv6Conn *net.UDPConn
 			active   bool
 		}{
 			name:     name,
+			state:    state,
 			ipv4Conn: state.IPv4Conn,
 			ipv6Conn: state.IPv6Conn,
 			active:   state.Active,
@@ -94,6 +97,8 @@ func (m *Manager) sendPeerDiscoveryQuery() {
 			}
 			if _, err := snap.ipv4Conn.WriteToUDP(data, multicastAddr); err == nil {
 				log.Printf("DEBUG: [%s-IPv4] Sent peer discovery query for %s", snap.name, serviceFQDN)
+			} else if isClosedConnError(err) {
+				m.recoverClosedConnection(snap.name, snap.state)
 			}
 		}
 
@@ -105,6 +110,8 @@ func (m *Manager) sendPeerDiscoveryQuery() {
 			}
 			if _, err := snap.ipv6Conn.WriteToUDP(data, multicastAddr); err == nil {
 				log.Printf("DEBUG: [%s-IPv6] Sent peer discovery query for %s", snap.name, serviceFQDN)
+			} else if isClosedConnError(err) {
+				m.recoverClosedConnection(snap.name, snap.state)
 			}
 		}
 	}
