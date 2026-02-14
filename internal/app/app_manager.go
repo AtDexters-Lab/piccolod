@@ -489,7 +489,17 @@ func (m *AppManager) StopBackground() {
 	if cancel != nil {
 		cancel()
 	}
-	m.reconcileWG.Wait()
+	done := make(chan struct{})
+	go func() {
+		m.reconcileWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("INFO: Background reconciliation stopped cleanly")
+	case <-time.After(15 * time.Second):
+		log.Printf("WARN: StopBackground timed out after 15s waiting for reconcile goroutine")
+	}
 }
 
 // StopAllApps stops all running applications and detaches their volumes.

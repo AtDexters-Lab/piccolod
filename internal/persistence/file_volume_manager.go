@@ -36,6 +36,7 @@ type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, name string, args []string, stdin []byte) error {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 5 * time.Second
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}

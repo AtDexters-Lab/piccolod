@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -192,6 +193,7 @@ func (s *GinServer) handleGinSystemLogStream(c *gin.Context) {
 		"--no-pager",
 		"-o", "short-iso",
 	)
+	cmd.WaitDelay = 5 * time.Second
 	stream, err := startCommandStream(ctx, cmd, cancel)
 	if err != nil {
 		writeGinError(c, http.StatusInternalServerError, "Failed to start journald stream: "+err.Error())
