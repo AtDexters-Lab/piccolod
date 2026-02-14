@@ -131,7 +131,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, 3600)
 	s.setSessionCookie(c, sess.ID, time.Hour)
 
-	// Mark onboarding as complete (try_piccolo → complete).
+	// Mark onboarding as complete (accepts try_piccolo, pending, or already-complete).
 	// Best-effort: failure here doesn't block setup since LUKS header serves as fallback signal.
 	if s.onboardingMgr != nil {
 		if err := s.onboardingMgr.Complete(); err != nil {

@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"os/exec"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -21,13 +22,15 @@ func (s *GinServer) handleDiagnosticLog(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	out, err := exec.CommandContext(ctx, "journalctl",
+	cmd := exec.CommandContext(ctx, "journalctl",
 		"-u", "piccolod.service",
 		"-b",
 		"--no-pager",
 		"--lines=10000",
 		"-o", "short-iso",
-	).Output()
+	)
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.Output()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read journal"})
 		return

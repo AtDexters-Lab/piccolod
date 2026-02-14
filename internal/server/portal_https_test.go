@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -27,7 +28,7 @@ func TestRemotePortalOverTLSEmitsHSTS(t *testing.T) {
 	defer srv.tlsMux.Stop()
 
 	srv.startSecureLoopback()
-	t.Cleanup(srv.stopSecureLoopback)
+	t.Cleanup(func() { srv.stopSecureLoopback(context.Background()) })
 
 	const host = "portal.example.com"
 

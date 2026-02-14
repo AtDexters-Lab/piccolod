@@ -89,6 +89,7 @@ type GinServer struct {
 	routeManager   *router.Manager
 	tlsMux         *services.TlsMux
 	remoteResolver *serviceRemoteResolver
+	httpSrv        *http.Server
 
 	secureSrv      *http.Server
 	secureListener net.Listener
@@ -824,11 +825,20 @@ func (s *GinServer) Start() error {
 		log.Printf("INFO: Notified systemd that service is ready")
 	}
 
-	return s.router.Run(":" + port)
+	s.httpSrv = &http.Server{
+		Addr:    ":" + port,
+		Handler: s.router,
+	}
+	if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
-// Stop gracefully shuts down the server and all its components.
-// The context is used for timeout control during shutdown.
+// Stop gracefully shuts down the server and all its components using a
+// three-phase approach: FENCE (close listeners), DRAIN (stop apps/work),
+// CLEANUP (unmount volumes).
+// The context is used for overall timeout control during shutdown.
 func (s *GinServer) Stop(ctx context.Context) error {
 	log.Printf("INFO: Beginning graceful shutdown...")
 
@@ -839,42 +849,54 @@ func (s *GinServer) Stop(ctx context.Context) error {
 		log.Printf("INFO: Notified systemd that service is stopping")
 	}
 
-	// 1. Stop accepting new requests (handled by caller stopping the listener)
-
-	// 2. Stop app manager background tasks and all running apps
-	if s.appManager != nil {
-		s.appManager.StopRuntimeEvents()
-		if err := s.appManager.StopAllApps(ctx); err != nil {
-			log.Printf("WARN: Failed to stop all apps cleanly: %v", err)
+	// ── Phase 1: FENCE (5s) ─────────────────────────────────────────────
+	// Close all listeners to stop accepting new connections and drain in-flight requests.
+	log.Printf("INFO: Phase 1/3: FENCE — closing listeners")
+	fenceCtx, fenceCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer fenceCancel()
+	if s.httpSrv != nil {
+		if err := s.httpSrv.Shutdown(fenceCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("WARN: HTTP server shutdown: %v", err)
 		}
 	}
-
-	// 3. Stop cert refresh subscription and internal listeners
+	s.stopSecureLoopback(fenceCtx)
+	s.stopInternalHTTPSListener(fenceCtx)
 	if s.certRefreshUnsub != nil {
 		s.certRefreshUnsub()
 		s.certRefreshUnsub = nil
 	}
-	s.stopSecureLoopback()
-	s.stopInternalHTTPSListener()
+	log.Printf("INFO: Phase 1/3: FENCE complete")
 
-	// 4. Stop OIDC provider's background goroutines
+	// ── Phase 2: DRAIN (60s) ────────────────────────────────────────────
+	// Stop app event observers, reconciliation, containers, and detach app volumes.
+	log.Printf("INFO: Phase 2/3: DRAIN — stopping apps and background work")
+	drainCtx, drainCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer drainCancel()
+	if s.appManager != nil {
+		s.appManager.StopRuntimeEvents()
+		if err := s.appManager.StopAllApps(drainCtx); err != nil {
+			log.Printf("WARN: Failed to stop all apps cleanly: %v", err)
+		}
+	}
 	s.oidcProviderMu.Lock()
 	if s.oidcProvider != nil {
 		s.oidcProvider.Storage().Close()
 	}
 	s.oidcProviderMu.Unlock()
+	log.Printf("INFO: Phase 2/3: DRAIN complete")
 
-	// 5. Stop supervisor-managed components
+	// ── Phase 3: CLEANUP ────────────────────────────────────────────────
+	// Stop supervisor components (mDNS goodbye, services) and unmount gocryptfs.
+	log.Printf("INFO: Phase 3/3: CLEANUP — supervisor stop and volume unmount")
 	if err := s.supervisor.Stop(ctx); err != nil {
 		log.Printf("WARN: Failed to stop components cleanly: %v", err)
 	}
-
-	// 6. Shutdown persistence (detach control and bootstrap volumes) - AFTER apps stopped
 	if s.persistence != nil {
 		if err := s.persistence.Shutdown(ctx); err != nil {
 			log.Printf("WARN: Failed to shutdown persistence cleanly: %v", err)
 		}
 	}
+	log.Printf("INFO: Phase 3/3: CLEANUP complete")
 
 	log.Printf("INFO: Graceful shutdown completed")
 	return nil
@@ -1172,6 +1194,9 @@ func (s *GinServer) setupGinRoutes() {
 		authed.POST("/auth/staleness/ack", s.handleAuthStalenessAck)
 		authed.GET("/auth/csrf", s.handleAuthCSRF)
 		authed.POST("/oauth/resume", s.handleOIDCResume)
+
+		// UI telemetry (Admin only)
+		admin.POST("/telemetry/log", s.handleTelemetryLog)
 
 		// Debug terminal (Admin only)
 		admin.GET("/terminal", s.handleTerminal)
@@ -1999,12 +2024,10 @@ func (s *GinServer) startSecureLoopback() {
 	log.Printf("INFO: Secure loopback portal listening on 127.0.0.1:%d", s.securePort)
 }
 
-func (s *GinServer) stopSecureLoopback() {
+func (s *GinServer) stopSecureLoopback(ctx context.Context) {
 	if s == nil || s.secureSrv == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	if err := s.secureSrv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("WARN: secure loopback shutdown failed: %v", err)
 	}
@@ -2099,12 +2122,10 @@ func (s *GinServer) refreshServerCertSANs() {
 	}
 }
 
-func (s *GinServer) stopInternalHTTPSListener() {
+func (s *GinServer) stopInternalHTTPSListener(ctx context.Context) {
 	if s == nil || s.internalSrv == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	if err := s.internalSrv.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("WARN: Internal HTTPS listener shutdown failed: %v", err)
 	}

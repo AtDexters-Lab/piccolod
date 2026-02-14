@@ -650,15 +650,12 @@ func (p *Publisher) loadPreviousManifest() {
 }
 
 // createSnapshot creates a btrfs read-only snapshot, falling back to cp -a
-// when the source is not a btrfs subvolume (e.g., first boot before explicit
-// subvolume creation, or non-btrfs filesystems in dev mode).
+// when the source is not a btrfs subvolume (e.g., non-btrfs filesystems in
+// dev mode).
 //
-// Production fallback rationale: on first boot, ciphertext/control-plane/ is a
-// regular directory (not yet a btrfs subvolume) because the subvolume is created
-// during InitializeDataVolume. The two-step syncfs flush (plaintext mount then
-// ciphertext subvol) performed before this call ensures write ordering, making
-// cp -a safe for this narrow window. Once the subvolume exists, all subsequent
-// snapshots use btrfs atomic snapshots.
+// The ciphertext/control-plane/ directory is created as a btrfs subvolume by
+// ensureCipherDir (via EnsureVolume) during service init. The cp -a fallback
+// exists for dev/test environments that lack btrfs.
 func (p *Publisher) createSnapshot(ctx context.Context, src, dst string) error {
 	if p.useDevFallback() {
 		log.Printf("WARN: pcv publisher: using cp -a fallback (non-btrfs dev mode)")

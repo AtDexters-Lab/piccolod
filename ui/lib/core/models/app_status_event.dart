@@ -3,12 +3,14 @@ class AppStatusEvent {
   final String app;
   final String status;
   final String? prevStatus;
+  final String? message;
   final String? timestamp;
 
   const AppStatusEvent({
     required this.app,
     required this.status,
     this.prevStatus,
+    this.message,
     this.timestamp,
   });
 
@@ -17,6 +19,7 @@ class AppStatusEvent {
       app: (json['app'] ?? '').toString(),
       status: (json['status'] ?? '').toString(),
       prevStatus: json['prev_status']?.toString(),
+      message: json['message']?.toString(),
       timestamp: json['timestamp']?.toString(),
     );
   }

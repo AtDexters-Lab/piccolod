@@ -188,13 +188,20 @@ func (m *Manager) MarkBootOrderConfigured() {
 	}
 }
 
-// Complete transitions try_piccolo → complete.
+// Complete marks onboarding as done. Accepts try_piccolo (normal USB flow)
+// and pending (internal boot where the wizard is never shown). Idempotent
+// when already complete.
 func (m *Manager) Complete() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.config.State != StateTryPiccolo {
-		return fmt.Errorf("cannot complete: state is %q, expected %q", m.config.State, StateTryPiccolo)
+	switch m.config.State {
+	case StateTryPiccolo, StatePending:
+		// valid transitions
+	case StateComplete:
+		return nil // idempotent
+	default:
+		return fmt.Errorf("cannot complete: state is %q", m.config.State)
 	}
 
 	m.config.State = StateComplete
@@ -223,7 +230,10 @@ func (m *Manager) isRequiredLocked() bool {
 	return m.config.State == StatePending
 }
 
-// validateTransition checks if a state transition is valid.
+// validateTransition checks if a state transition is valid for Choose().
+// Note: pending → complete is intentionally excluded here. The Complete()
+// method handles that transition directly for internal-boot scenarios where
+// the onboarding wizard is never shown.
 func (m *Manager) validateTransition(from, to OnboardingState) error {
 	switch {
 	case from == StatePending && to == StateTryPiccolo:

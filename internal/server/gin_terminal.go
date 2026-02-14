@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -48,7 +49,8 @@ func (s *GinServer) handleTerminal(c *gin.Context) {
 
 	log.Println("DEBUG: handleTerminal - WebSocket upgraded successfully")
 
-	cmd := exec.Command(getShell())
+	cmd := exec.CommandContext(c.Request.Context(), getShell())
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
 	session, err := NewPTYSession(conn, cmd)

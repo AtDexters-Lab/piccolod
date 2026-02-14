@@ -511,6 +511,30 @@ func prepareControlCipherDir(t *testing.T, root string) {
 	}
 }
 
+func TestNewSQLiteControlStore_NoCipherDirCreated(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := hex.DecodeString("7f1c8a6c3b5d7e91aabbccddeeff00112233445566778899aabbccddeeff0011")
+
+	store, err := newSQLiteControlStore(dir, staticKeyProvider{key: key})
+	if err != nil {
+		t.Fatalf("newSQLiteControlStore: %v", err)
+	}
+	defer store.Close(context.Background())
+
+	// The constructor must NOT create the ciphertext directory; it is created
+	// later by ensureCipherDir (via EnsureVolume) as a btrfs subvolume.
+	cipherDir := filepath.Join(dir, "ciphertext", "control-plane")
+	if _, err := os.Stat(cipherDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected cipherDir to not exist after construction, stat err: %v", err)
+	}
+
+	// metaDir should still be created by the constructor.
+	metaDir := filepath.Join(dir, "volumes", "control-plane")
+	if _, err := os.Stat(metaDir); err != nil {
+		t.Fatalf("expected metaDir to exist after construction: %v", err)
+	}
+}
+
 func TestSQLiteControlStoreMigratesLegacyMetadata(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")

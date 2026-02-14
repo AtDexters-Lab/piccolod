@@ -156,10 +156,12 @@ func (ca *InternalCA) load() error {
 		return fmt.Errorf("parse certificate: %w", err)
 	}
 
-	// Check if certificate is still valid
-	now := time.Now()
-	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
-		return errors.New("certificate expired or not yet valid")
+	// Check if certificate has expired. We intentionally skip the NotBefore
+	// check because this is a self-signed internal CA we generated ourselves,
+	// and embedded devices (e.g. RPi) without an RTC can boot with a clock
+	// earlier than when the cert was created, causing spurious regeneration.
+	if time.Now().After(cert.NotAfter) {
+		return errors.New("certificate expired")
 	}
 
 	// Load private key

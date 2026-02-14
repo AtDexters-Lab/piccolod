@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../theme/piccolo_theme.dart';
 import '../../core/models/app_models.dart';
+import '../../core/models/app_status_event.dart';
 import '../../core/models/listener_health.dart';
 import '../../core/services/app_service.dart';
 import '../../core/utils/task_id.dart';
@@ -59,7 +60,8 @@ class _AppDetailViewState extends State<AppDetailView>
   // Action states
   bool _isActionLoading = false;
 
-  // Health stream (via unified EventStreamClient)
+  // SSE streams (via unified EventStreamClient)
+  StreamSubscription<AppStatusEvent>? _statusSub;
   StreamSubscription<ListenerHealthEvent>? _healthSub;
   ListenerHealth? _primaryHealth;
 
@@ -72,10 +74,24 @@ class _AppDetailViewState extends State<AppDetailView>
       initialIndex: widget.initialTab.clamp(0, 3),
     );
     _loadData();
+    _connectStatusStream();
     _connectHealthStream();
   }
 
   String? _primaryListenerName;
+
+  void _connectStatusStream() {
+    final client = widget.desktopController.eventStreamClient;
+    if (client == null) return;
+
+    _statusSub = client.appStatusEvents.listen((event) {
+      if (!mounted) return;
+      if (event.app != widget.appId) return;
+      setState(() {
+        _app = _app?.copyWithStatus(event.status, statusMessage: event.message ?? '');
+      });
+    });
+  }
 
   void _connectHealthStream() {
     final client = widget.desktopController.eventStreamClient;
@@ -98,6 +114,7 @@ class _AppDetailViewState extends State<AppDetailView>
 
   @override
   void dispose() {
+    _statusSub?.cancel();
     _healthSub?.cancel();
     _tabController.dispose();
     super.dispose();
@@ -282,6 +299,10 @@ class _AppDetailViewState extends State<AppDetailView>
         // Starting status banner
         if (_app!.isStarting)
           _buildStartingBanner(),
+
+        // Error status banner
+        if (_app!.isError)
+          _buildErrorBanner(),
 
         // Health banner
         if (_primaryHealth != null && !_primaryHealth!.isOk)
@@ -828,7 +849,52 @@ class _AppDetailViewState extends State<AppDetailView>
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  'The app is initializing. Check logs if startup takes too long.',
+                  _app!.statusMessage.isNotEmpty
+                      ? _app!.statusMessage
+                      : 'The app is initializing. Check logs if startup takes too long.',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: PiccoloTheme.inkMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          TextButton.icon(
+            onPressed: () => _tabController.animateTo(AppDetailView.tabLogs),
+            icon: const Icon(Icons.article_outlined, size: 16),
+            label: const Text('View Logs'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildErrorBanner() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      color: PiccoloTheme.critical.withValues(alpha: 0.1),
+      child: Row(
+        children: [
+          Icon(
+            Icons.error_outline,
+            color: PiccoloTheme.critical,
+            size: 20,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'App failed to start',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _app!.statusMessage.isNotEmpty
+                      ? _app!.statusMessage
+                      : 'The app failed to start. Check logs or try restarting.',
                   style: TextStyle(
                     fontSize: 12,
                     color: PiccoloTheme.inkMuted,

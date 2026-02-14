@@ -287,6 +287,328 @@ func TestLeadershipState_String(t *testing.T) {
 	}
 }
 
+func TestGatewayLeader_ReEvalStartsWhenDeferred(t *testing.T) {
+	leader := NewGatewayLeader("def456")
+
+	peers := []DiscoveredPeer{
+		{MachineID: "abc123", LastSeen: time.Now()},
+	}
+	leader.SetPeersFunc(func() []DiscoveredPeer { return peers })
+	leader.SetLeadershipChangeCallback(func(isLeader bool) {})
+
+	leader.Start()
+	time.Sleep(LeadershipClaimDelay + 100*time.Millisecond)
+
+	if leader.State() != LeadershipDeferred {
+		t.Fatalf("expected state LeadershipDeferred, got %v", leader.State())
+	}
+
+	leader.mu.RLock()
+	active := leader.reEvalActive
+	leader.mu.RUnlock()
+
+	if !active {
+		t.Error("expected re-eval timer to be active when deferred")
+	}
+
+	leader.Stop()
+}
+
+func TestGatewayLeader_ReEvalStopsWhenClaimed(t *testing.T) {
+	leader := NewGatewayLeader("def456")
+
+	peers := []DiscoveredPeer{
+		{MachineID: "abc123", LastSeen: time.Now()},
+	}
+	var peersLock sync.Mutex
+	leader.SetPeersFunc(func() []DiscoveredPeer {
+		peersLock.Lock()
+		defer peersLock.Unlock()
+		return peers
+	})
+
+	var wg sync.WaitGroup
+	leader.SetLeadershipChangeCallback(func(isLeader bool) {
+		if isLeader {
+			wg.Done()
+		}
+	})
+
+	leader.Start()
+	time.Sleep(LeadershipClaimDelay + 100*time.Millisecond)
+
+	if leader.State() != LeadershipDeferred {
+		t.Fatalf("expected state LeadershipDeferred, got %v", leader.State())
+	}
+
+	// Remove the lower-ID peer and trigger goodbye to claim
+	peersLock.Lock()
+	peers = nil
+	peersLock.Unlock()
+
+	wg.Add(1)
+	leader.OnPeerGoodbye("abc123")
+	wg.Wait()
+
+	if leader.State() != LeadershipClaimed {
+		t.Fatalf("expected state LeadershipClaimed, got %v", leader.State())
+	}
+
+	leader.mu.RLock()
+	active := leader.reEvalActive
+	leader.mu.RUnlock()
+
+	if active {
+		t.Error("expected re-eval timer to be stopped when claimed")
+	}
+
+	leader.Stop()
+}
+
+func TestGatewayLeader_DeferredUsesProbeTimeout(t *testing.T) {
+	leader := NewGatewayLeader("def456")
+
+	// Peer last seen 35s ago — beyond LeaderProbeTimeout (30s) but within PeerOnlineThreshold (180s)
+	peers := []DiscoveredPeer{
+		{MachineID: "abc123", LastSeen: time.Now().Add(-35 * time.Second)},
+	}
+	leader.SetPeersFunc(func() []DiscoveredPeer { return peers })
+
+	// Force state to Deferred first
+	leader.Start()
+
+	// Manually set state to deferred (simulating prior discovery of this peer)
+	leader.mu.Lock()
+	if leader.claimTimer != nil {
+		leader.claimTimer.Stop()
+		leader.claimTimer = nil
+	}
+	leader.state = LeadershipDeferred
+	leader.mu.Unlock()
+
+	// Now evaluate — with Deferred state, 35s stale peer should exceed LeaderProbeTimeout
+	leader.mu.Lock()
+	shouldLead := leader.shouldBeLeaderLocked()
+	leader.mu.Unlock()
+
+	if !shouldLead {
+		t.Error("expected shouldBeLeader=true when deferred and peer exceeds LeaderProbeTimeout")
+	}
+
+	leader.Stop()
+}
+
+func TestGatewayLeader_LeaderUsesOnlineThreshold(t *testing.T) {
+	leader := NewGatewayLeader("def456")
+
+	// Peer last seen 35s ago — beyond LeaderProbeTimeout but within PeerOnlineThreshold
+	peers := []DiscoveredPeer{
+		{MachineID: "abc123", LastSeen: time.Now().Add(-35 * time.Second)},
+	}
+	leader.SetPeersFunc(func() []DiscoveredPeer { return peers })
+	leader.SetLeadershipChangeCallback(func(isLeader bool) {})
+
+	// Force state to Claimed
+	leader.mu.Lock()
+	leader.state = LeadershipClaimed
+	leader.mu.Unlock()
+
+	// With Claimed state, PeerOnlineThreshold (180s) is used — 35s is still "online"
+	leader.mu.Lock()
+	shouldLead := leader.shouldBeLeaderLocked()
+	leader.mu.Unlock()
+
+	if shouldLead {
+		t.Error("expected shouldBeLeader=false when leader and peer is within PeerOnlineThreshold")
+	}
+
+	leader.Stop()
+}
+
+func TestGatewayLeader_ReEvalClaimsOnLeaderTimeout(t *testing.T) {
+	leader := NewGatewayLeader("def456")
+
+	peers := []DiscoveredPeer{
+		{MachineID: "abc123", LastSeen: time.Now()},
+	}
+	var peersLock sync.Mutex
+	leader.SetPeersFunc(func() []DiscoveredPeer {
+		peersLock.Lock()
+		defer peersLock.Unlock()
+		result := make([]DiscoveredPeer, len(peers))
+		copy(result, peers)
+		return result
+	})
+
+	var wg sync.WaitGroup
+	leader.SetLeadershipChangeCallback(func(isLeader bool) {
+		if isLeader {
+			wg.Done()
+		}
+	})
+
+	leader.Start()
+	time.Sleep(LeadershipClaimDelay + 100*time.Millisecond)
+
+	if leader.State() != LeadershipDeferred {
+		t.Fatalf("expected state LeadershipDeferred, got %v", leader.State())
+	}
+
+	// Simulate leader going stale by updating LastSeen to exceed LeaderProbeTimeout
+	peersLock.Lock()
+	peers[0].LastSeen = time.Now().Add(-LeaderProbeTimeout - time.Second)
+	peersLock.Unlock()
+
+	// Trigger re-evaluation manually (instead of waiting for the 10s ticker)
+	wg.Add(1)
+	leader.evaluateLeadership()
+	wg.Wait()
+
+	if leader.State() != LeadershipClaimed {
+		t.Errorf("expected to claim leadership when leader timed out, got %v", leader.State())
+	}
+
+	leader.Stop()
+}
+
+func TestGatewayLeader_ReEvalNoFalsePositive(t *testing.T) {
+	leader := NewGatewayLeader("def456")
+
+	// Peer is fresh
+	peers := []DiscoveredPeer{
+		{MachineID: "abc123", LastSeen: time.Now()},
+	}
+	leader.SetPeersFunc(func() []DiscoveredPeer { return peers })
+	leader.SetLeadershipChangeCallback(func(isLeader bool) {})
+
+	leader.Start()
+	time.Sleep(LeadershipClaimDelay + 100*time.Millisecond)
+
+	if leader.State() != LeadershipDeferred {
+		t.Fatalf("expected state LeadershipDeferred, got %v", leader.State())
+	}
+
+	// Trigger re-evaluation — peer is fresh, should stay deferred
+	leader.evaluateLeadership()
+	time.Sleep(50 * time.Millisecond)
+
+	if leader.State() != LeadershipDeferred {
+		t.Errorf("expected to remain deferred when leader is fresh, got %v", leader.State())
+	}
+
+	leader.Stop()
+}
+
+func TestGatewayLeader_ReEvalRestartsAfterYield(t *testing.T) {
+	leader := NewGatewayLeader("def456")
+	leader.SetPeersFunc(func() []DiscoveredPeer { return nil })
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	leader.SetLeadershipChangeCallback(func(isLeader bool) {
+		wg.Done()
+	})
+
+	leader.Start()
+	wg.Wait() // Wait to become leader
+
+	if leader.State() != LeadershipClaimed {
+		t.Fatalf("expected state LeadershipClaimed, got %v", leader.State())
+	}
+
+	leader.mu.RLock()
+	active := leader.reEvalActive
+	leader.mu.RUnlock()
+	if active {
+		t.Error("expected re-eval to not be active when claimed")
+	}
+
+	// Yield to a lower ID peer
+	wg.Add(1)
+	leader.OnPeerDiscovered(DiscoveredPeer{MachineID: "abc123", LastSeen: time.Now()})
+	wg.Wait() // Wait for yield callback
+
+	if leader.State() != LeadershipDeferred {
+		t.Fatalf("expected state LeadershipDeferred after yield, got %v", leader.State())
+	}
+
+	leader.mu.RLock()
+	active = leader.reEvalActive
+	leader.mu.RUnlock()
+	if !active {
+		t.Error("expected re-eval to restart after yielding to deferred")
+	}
+
+	leader.Stop()
+}
+
+func TestGatewayLeader_ReEvalCleanupOnStop(t *testing.T) {
+	// Verify no goroutine leaks after multiple start/stop cycles
+	for i := 0; i < 5; i++ {
+		leader := NewGatewayLeader("def456")
+
+		peers := []DiscoveredPeer{
+			{MachineID: "abc123", LastSeen: time.Now()},
+		}
+		leader.SetPeersFunc(func() []DiscoveredPeer { return peers })
+		leader.SetLeadershipChangeCallback(func(isLeader bool) {})
+
+		leader.Start()
+		time.Sleep(LeadershipClaimDelay + 100*time.Millisecond)
+
+		leader.mu.RLock()
+		active := leader.reEvalActive
+		leader.mu.RUnlock()
+
+		if !active {
+			t.Errorf("iteration %d: expected re-eval active before stop", i)
+		}
+
+		leader.Stop()
+
+		leader.mu.RLock()
+		active = leader.reEvalActive
+		ch := leader.reEvalStopCh
+		leader.mu.RUnlock()
+
+		if active {
+			t.Errorf("iteration %d: expected re-eval inactive after stop", i)
+		}
+		if ch != nil {
+			t.Errorf("iteration %d: expected reEvalStopCh nil after stop", i)
+		}
+	}
+}
+
+func TestGatewayLeader_NoReEvalWhenClaimedDirectly(t *testing.T) {
+	// Unknown → Claimed (no peers) → re-eval should not be running
+	leader := NewGatewayLeader("abc123")
+	leader.SetPeersFunc(func() []DiscoveredPeer { return nil })
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	leader.SetLeadershipChangeCallback(func(isLeader bool) {
+		wg.Done()
+	})
+
+	leader.Start()
+	wg.Wait()
+
+	if leader.State() != LeadershipClaimed {
+		t.Fatalf("expected state LeadershipClaimed, got %v", leader.State())
+	}
+
+	leader.mu.RLock()
+	active := leader.reEvalActive
+	leader.mu.RUnlock()
+
+	if active {
+		t.Error("expected re-eval to not be active when claimed directly from unknown")
+	}
+
+	leader.Stop()
+}
+
 func TestGatewayLeader_ConcurrentPeerDiscovery(t *testing.T) {
 	// Test that concurrent OnPeerDiscovered calls with different machine IDs
 	// are handled correctly under mutex contention

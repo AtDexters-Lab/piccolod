@@ -496,6 +496,7 @@ func (m *AppManager) ensureWorkspaceDiskMounted(ctx context.Context, instanceID 
 
 	if !exists {
 		log.Printf("INFO: workspace %s: base image not found locally, pulling %s", instanceID, meta.BaseImageDigest)
+		m.setObservedStatusMessage(instanceID, "Re-pulling base image")
 
 		// Try to pull by digest first
 		if err := m.containerManager.PullImage(ctx, imageRuntime, meta.BaseImageDigest); err != nil {

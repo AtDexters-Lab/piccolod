@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"time"
 )
 
 // CommandRunner abstracts external command execution for testability.
@@ -24,17 +25,21 @@ type ExecRunner struct{}
 
 func (ExecRunner) Run(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
 func (ExecRunner) RunWithOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 5 * time.Second
+	return cmd.CombinedOutput()
 }
 
 func (ExecRunner) RunWithStdin(ctx context.Context, stdin []byte, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 5 * time.Second
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}

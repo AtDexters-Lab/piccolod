@@ -241,8 +241,7 @@ func (m *Manager) serviceAnnouncer() {
 		}
 	}
 
-	// Periodic announcements at 20% of TTL (75 min * 0.2 = 15 min)
-	// We use 60 seconds to match the peer discovery interval
+	// Periodic announcements at 60s by default; leader increases to 10s for fast failover.
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
@@ -250,6 +249,8 @@ func (m *Manager) serviceAnnouncer() {
 		select {
 		case <-m.stopCh:
 			return
+		case interval := <-m.serviceIntervalCh:
+			ticker.Reset(interval)
 		case <-ticker.C:
 			m.sendServiceAnnouncement()
 		}

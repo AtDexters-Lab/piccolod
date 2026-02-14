@@ -26,7 +26,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 	}
 
 	// Update status to starting immediately so UI reflects progress
-	m.updateStatusWithEvent(appInst.InstanceID, StatusStarting)
+	m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusStarting, "Starting containers")
 
 	mode := piccoloModeFromExtensions(def.Extensions)
 

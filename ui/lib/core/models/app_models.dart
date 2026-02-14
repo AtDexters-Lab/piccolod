@@ -14,6 +14,7 @@ class App {
   final Map<String, dynamic> definition;
   final ListenerHealth? primaryListenerHealth;
   final String catalogSource; // Tracks which catalog item this app was installed from
+  final String statusMessage; // Transient status context (e.g., "Re-pulling base image")
 
   App({
     required this.id,
@@ -22,6 +23,7 @@ class App {
     required this.type,
     this.mode = '',
     required this.status,
+    this.statusMessage = '',
     this.volumes = const [],
     this.environment = const {},
     this.containerId,
@@ -114,6 +116,7 @@ class App {
       type: type,
       mode: mode,
       status: json['status'] ?? 'unknown',
+      statusMessage: (json['status_message'] ?? '').toString(),
       volumes: volumes,
       environment: environment,
       containerId: json['container_id'],
@@ -151,8 +154,8 @@ class App {
   /// the primary listener name (service mode) or workspace_name (workspace mode).
   String get displayTitle => name;
 
-  /// Returns a copy of this App with a new status value.
-  App copyWithStatus(String newStatus) {
+  /// Returns a copy of this App with a new status value and optional message.
+  App copyWithStatus(String newStatus, {String? statusMessage}) {
     return App(
       id: id,
       name: name,
@@ -160,6 +163,7 @@ class App {
       type: type,
       mode: mode,
       status: newStatus,
+      statusMessage: statusMessage ?? '',
       volumes: volumes,
       environment: environment,
       containerId: containerId,
