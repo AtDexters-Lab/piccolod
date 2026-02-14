@@ -26,6 +26,7 @@ import (
 	pki "piccolod/internal/crypto"
 	"piccolod/internal/events"
 	"piccolod/internal/health"
+	"piccolod/internal/onboarding"
 	hostnamepkg "piccolod/internal/hostname"
 	"piccolod/internal/mdns"
 	"piccolod/internal/oidc"
@@ -66,6 +67,7 @@ type osUpdateManager interface {
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
 	Reboot(context.Context) error
+	PowerOff(context.Context) error
 	Watch(context.Context) error
 }
 
@@ -136,6 +138,11 @@ type GinServer struct {
 
 	reloadersMu     sync.RWMutex
 	unlockReloaders []unlockReloader
+
+	// Onboarding and Install to Disk
+	onboardingMgr *onboarding.Manager
+	installer     *onboarding.Installer
+	execRunner    runner.CommandRunner
 }
 
 type secureContextKey struct{}
@@ -389,6 +396,15 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	diskPreparer := diskprep.NewPreparer(execRunner)
 	storageMgr := storage.NewManager(diskPreparer, eventsBus, execRunner, cmgr)
 
+	// Initialize onboarding manager (detects boot mode for USB onboarding flow).
+	bootMode, bootErr := storage.DetectBootMode(context.Background(), execRunner)
+	if bootErr != nil {
+		log.Printf("WARN: boot mode detection failed during init: %v", bootErr)
+		bootMode = storage.BootModeUnknown
+	}
+	onboardingMgr := onboarding.NewManager(bootMode)
+	installer := onboarding.NewInstaller(execRunner, events.NewBusProgressReporter(eventsBus), onboardingMgr)
+
 	// Initialize PCV publisher and importer.
 	pcvPub := pcv.NewPublisher(eventsBus, execRunner)
 	pcvImp := pcv.NewImporter(execRunner)
@@ -479,6 +495,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		pcvImporter:    pcvImp,
 		healthTracker:  healthTracker,
 		catalogManager: catalogMgr,
+		onboardingMgr:  onboardingMgr,
+		installer:      installer,
+		execRunner:     execRunner,
 	}
 	// Seed baseline health statuses
 	healthTracker.Setf("http", health.LevelOK, "HTTP server initialized")
@@ -755,16 +774,31 @@ func (s *GinServer) Start() error {
 		return fmt.Errorf("failed to start runtime components: %w", err)
 	}
 
-	// Detect boot mode and start disk preparation for internal boots.
-	if s.storageMgr != nil {
-		bootMode, err := storage.DetectBootMode(context.Background(), runner.ExecRunner{})
-		if err != nil {
-			log.Printf("WARN: boot mode detection failed (skipping disk prep): %v", err)
-		} else if bootMode == storage.BootModeInternal {
+	// Start disk preparation based on boot mode and onboarding state.
+	if s.storageMgr != nil && s.onboardingMgr != nil {
+		switch {
+		case s.onboardingMgr.BootMode() == storage.BootModeInternal:
 			log.Printf("INFO: internal boot detected; starting disk preparation")
 			s.storageMgr.StartPartitioningAsync(context.Background())
-		} else {
-			log.Printf("INFO: boot mode is %s; deferring disk preparation to onboarding", bootMode)
+		case s.onboardingMgr.State() == onboarding.StateTryPiccolo ||
+			s.onboardingMgr.State() == onboarding.StateComplete:
+			log.Printf("INFO: returning USB user (state=%s); starting disk preparation", s.onboardingMgr.State())
+			s.storageMgr.StartPartitioningAsync(context.Background())
+		default:
+			// USB/unknown boot with state=pending. Check if the system was
+			// previously set up (e.g. disk moved between controllers). If so,
+			// auto-advance onboarding to try_piccolo and start partitioning
+			// so the user sees the unlock screen instead of onboarding.
+			if s.storageMgr.IsPreviouslySetUp(context.Background()) {
+				log.Printf("INFO: previously set up system detected on %s boot; auto-advancing onboarding", s.onboardingMgr.BootMode())
+				if err := s.onboardingMgr.Choose(onboarding.StateTryPiccolo); err != nil {
+					log.Printf("WARN: failed to auto-advance onboarding: %v", err)
+				}
+				s.storageMgr.StartPartitioningAsync(context.Background())
+			} else {
+				log.Printf("INFO: boot mode is %s, onboarding state is %s; deferring disk preparation to onboarding",
+					s.onboardingMgr.BootMode(), s.onboardingMgr.State())
+			}
 		}
 	}
 
@@ -1014,9 +1048,20 @@ func (s *GinServer) setupGinRoutes() {
 		v1.GET("/auth/validate-next", s.handleAuthValidateNext)
 		v1.POST("/auth/login", s.handleAuthLogin)
 
+		// Onboarding endpoints (public, no auth — needed pre-setup)
+		v1.GET("/system/onboarding", s.handleOnboardingStatus)
+		v1.POST("/system/onboarding", s.handleOnboardingChoice)
+		v1.GET("/storage/disks", s.handleOnboardingDisks)
+		v1.GET("/system/install-progress/stream", s.handleInstallProgressStream)
+
+		// Install to Disk and reboot (LAN-only + conditional auth in handlers)
+		lanInstall := v1.Group("/")
+		lanInstall.Use(s.allowLANOnly())
+		lanInstall.POST("/system/install-to-disk", s.handleInstallToDisk)
+		lanInstall.POST("/system/reboot", s.handleOnboardingReboot)
+
 		// Selected read-only status endpoints remain public
 		v1.GET("/remote/status", s.handleRemoteStatus)
-		v1.GET("/storage/disks", s.handleStorageDisks)
 		v1.GET("/health/live", s.handleHealthLive)
 		v1.GET("/health/ready", s.handleGinReadinessCheck)
 		v1.GET("/health/detail", s.handleHealthDetail)

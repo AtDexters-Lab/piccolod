@@ -6,6 +6,7 @@
 - **Related:**
   - `org-context/03_engineering/storage_architecture.md`
   - `docs/rfc/20260202-storage-v2-foundation.md`
+  - `docs/rfc/20260211-usb-onboarding-and-install-to-disk.md` (USB onboarding + install pipeline)
 
 ## 1. Summary
 
@@ -83,7 +84,7 @@ On production images, these defaults are used and should be treated as the canon
 
 ### 2.5 USB Boot Scenario
 
-> **Contract note:** "Try Piccolo" is an **evaluation-only** mode. When booting from USB, both `/piccolo-core` and `/piccolo-data` reside on the USB boot device itself. This is an explicit exception to the production storage contract (architecture doc §3.1) where `/piccolo-core` lives on internal storage and USB devices are added only to `/piccolo-data`. V1 includes an **Install to Disk** flow that can either start fresh or **carry over current state** from "Try Piccolo"; however, "Try Piccolo" remains an evaluation posture (USB is not a supported long-term storage medium).
+> **Contract note:** "Try Piccolo" is an **evaluation-only** mode. When booting from USB, both `/piccolo-core` and `/piccolo-data` reside on the USB boot device itself. This is an explicit exception to the production storage contract (architecture doc §3.1) where `/piccolo-core` lives on internal storage and USB devices are added only to `/piccolo-data`. V1 includes an **Install to Disk** flow that writes a fresh OBS image to an internal disk (see companion RFC `docs/rfc/20260211-usb-onboarding-and-install-to-disk.md`). Carry-over of state from "Try Piccolo" is deferred to a future version; users can export/import PCV manually. "Try Piccolo" remains an evaluation posture (USB is not a supported long-term storage medium).
 
 The minimal image can be dd'd to a USB drive and booted:
 
@@ -101,7 +102,7 @@ The minimal image can be dd'd to a USB drive and booted:
 │                       ├── Internal disk found:                      │
 │                       │       └── Shows two options:                │
 │                       │               ├── "Install to Disk"         │
-│                       │               │     └── (V1: Fresh → Carry over → Dry run) │
+│                       │               │     └── (V1: Fresh start via OBS image download + dd) │
 │                       │               └── "Try Piccolo"                │
 │                       │                                             │
 │                       └── No internal disk (e.g., RPi, USB-only):  │
@@ -121,7 +122,7 @@ The minimal image can be dd'd to a USB drive and booted:
 - **Disk partitioning**: Expand root to ~20GB, create `/piccolo-data` partition
 - **Subvolume verification**: Verify `/piccolo-core` subvolume exists (OS creates it)
 - **LUKS2 encryption**: Pool keyfile for `/piccolo-data`
-- **Install to Disk (v1, phased)**: Install from live USB onto internal disk (fresh start and carry-over paths)
+- **Install to Disk (v1)**: Install from live USB onto internal disk (download OBS image + dd; fresh start only in v1)
 - **USB boot support**: Show onboarding flow, support "Try Piccolo" mode
 - **Persistent USB storage**: "Try Piccolo" creates real partitions on USB
 - **Degraded mode**: System operates if USB storage (expansion) fails
@@ -2112,38 +2113,31 @@ func (p *Preparer) ValidateUSBPartitioning(ctx context.Context, disk string) err
 }
 ```
 
-### 9.4 "Install to Disk" Flow (v1, phased)
+### 9.4 "Install to Disk" Flow (v1)
 
-Install to Disk is a **v1 requirement** (see product acceptance criteria in `org-context/02_product/acceptance_features/install_to_disk_x86.feature`). The full specification will be provided in a **dedicated companion RFC** (`docs/rfc/20260203-install-to-disk.md`). This section defines only the storage posture contracts that the installer must satisfy.
+Install to Disk is a **v1 requirement** (see product acceptance criteria in `org-context/02_product/acceptance_features/install_to_disk_x86.feature`). The full specification is provided in the **companion RFC** (`docs/rfc/20260211-usb-onboarding-and-install-to-disk.md`). This section defines only the storage posture contracts that the installer must satisfy.
 
-**Core contract (always true):**
-- Target disk ends up in the production two-root posture:
-  - `/piccolo-core` on internal root btrfs (fixed)
-  - `/piccolo-data` on an internal LUKS2 + btrfs partition (expandable pool)
-- After reboot, the installed system must boot from the internal disk and continue with normal setup/unlock flows.
+**Core contract (two-phase):**
 
-**Phased implementation plan (all within v1 scope):**
+After dd, the target disk is bootable but in a pre-prep state (ESP + minimal root with `/piccolo-core` subvolume). After the first boot from internal disk, Phase 1 disk prep runs automatically: root expansion to ~20GB and `/piccolo-data` LUKS2 + btrfs creation, bringing the disk to the production two-root posture. The installed system then proceeds through normal first-run setup (admin password → Phase 2 LUKS init → unlock).
+
+**v1 scope — fresh start only:**
 1. **Fresh start**
-   - Wipe + install to internal disk.
+   - Download the official piccolo-os `.raw.xz` image from OBS and stream it to the target disk via `xzcat | dd`. The OBS image already contains the correct partition table, ESP, bootloader, btrfs subvolume layout, and fstab — this eliminates all partitioning, subvolume, bootloader, and fstab fixup complexity.
    - Reboot into the installed system and run first-run setup.
-2. **Carry over current state**
-   - Copy the live system state (admin, apps, configuration) from USB to the internal install target.
-   - Reboot and resume with the migrated state.
-3. **Dry-run simulation**
-   - Compute and present the full plan (target disk, partitions/filesystems, estimated time, and what will be erased) without writing to disk.
 
-**Implementation note (expected approach):**
-- Use `btrfs send | btrfs receive` to sync the live root filesystem to the target disk (matching the PRD), then apply the same disk-prep posture on the target disk (root sizing + `/piccolo-data` creation + LUKS2 init).
+**Deferred from v1:** Carry-over of state from "Try Piccolo" and dry-run simulation are deferred to a future version.
 
-**Failure and retry:** Install to Disk writes to the internal disk only — it does not modify the boot USB. If the install fails (power loss, I/O error), the USB boot environment remains fully functional. On retry, the installer must detect partial writes on the target disk (e.g., GPT present but no valid btrfs, or btrfs present but incomplete snapshot) and offer to wipe and restart rather than attempting to resume from an unknown state.
+**Failure and retry:** Install to Disk downloads and writes to the internal disk only — it does not modify the boot USB. If the install fails, the USB boot environment remains functional. The `install_disk` onboarding state auto-resets to `pending` on next boot (when `InstallDone == false`), allowing retry.
 
-**Deferred to companion RFC:** The following areas require detailed specification and will be covered in `docs/rfc/20260203-install-to-disk.md`:
-- ESP creation and UEFI boot entry setup on the target disk
-- LUKS2 setup on the target disk (re-key or copy pool keyfile)
-- Control-plane crypto material migration strategy
-- Handling pre-existing `/piccolo-data` LUKS on the target disk
-- Progress reporting, cancellation semantics, and timeout handling
-- Carry-over state validation (integrity check before reboot)
+**Companion RFC covers:**
+- Image URL resolution and architecture/board detection
+- Download integrity verification (SHA-256)
+- Install pipeline phases and progress reporting
+- `efibootmgr` boot order configuration
+- PCV publish before dd (best-effort state preservation)
+- Error handling and retry semantics
+- Onboarding state machine and API endpoints
 
 ## 10. Component Changes
 
@@ -2805,3 +2799,4 @@ This ensures tools are installed as dependencies of piccolod rather than relying
 - 2026-02-07: Fifth review pass (combined assessment). Fixes: (48) `GetPartitionState` root expansion check now uses `calculatePartitionLayout` instead of fixed `RootTargetSizeGB` — ensures consistency on small disks with proportional 70% split; (49) `PICCOLO_BOOT_MODE_OVERRIDE` env var for CI/QA unattended provisioning in VMs; (50) `getLUKSUUID` error handling changed from silent discard to fail-fast — UUID is the KDF salt anchor; (51) `getDiskSizeGB` uses ceiling division to avoid under-counting fractional GBs; (52) Phase 1 `PreparePartitioning` now wraps context with 5-minute timeout; (53) mnemonic rotation (`OnRecoveryMnemonicRotated`) updated to callback-based pattern matching `WithSDEK`/`WithMnemonicKey`, with crash recovery progress tracking (§6.5.1) matching password rotation pattern; (54) `CommandRunner` interface consolidation note — legacy `commandRunner` in `file_volume_manager.go` should be migrated to shared definition; (55) `secureZero`/`zeroBytes` consolidation note added to §10.2.
 - 2026-02-08: Eighth review pass. Blocking fixes: (65) `rekeySlotViaPoolKeyfile` now independently materializes the pool keyfile via `UnwrapPoolKeyfile` instead of assuming a prior caller left it in tmpfs — the unlock path's keyfile is cleaned up via defer before `postUnlock` runs; (66) password rotation crash recovery now uses `testLUKSPassphrase` (`cryptsetup open --test-passphrase`) to probe keyslot state instead of `luksChangeKey` with identical old/new passphrase — avoids unreliable no-op behavior and stale header backups. Significant fixes: (67) added `detectOrphanedLUKSHeader` for crash gap between `luksFormat` and `StorePoolKeyfile` — wipes orphaned LUKS header and retries `InitializeLUKS`; (68) mnemonic rotation crash recovery now handles daemon-restart case where mnemonic key is not in memory — defers recovery with warning instead of failing, leaves progress file for retry; (69) hardcoded paths in `SetNOCOWAttributes` replaced with `paths.DataJoin()`; (70) `findDataPartitionDevice` behavior specified — scans boot disk for GPT type code 8309 + label "piccolo-data"; (71) `luksFormat` now uses `--label piccolo-data` and `--key-slot 0` explicitly.
 - 2026-02-08: Ninth review pass. Should-fix items: (72) removed duplicate `RootTargetSizeGB`/`MinDataPartitionGB` constants in §5.7 (reference §5.4 instead); (73) `KeyData` field comment clarified as SDEK-encrypted ciphertext; (74) `keyfileStored` variable declared in `InitializeLUKS`; (75) `restoreLUKSHeaderByDevice` defined for UUID-unreadable header recovery; (76) `StorePoolKeyfileAt` variant added to `crypt.Manager` API; (77) duplicate §5.7 renumbered to §5.8; (78) duplicate `Lock` method declaration removed; (79) Implementation Notes reordered chronologically.
+- 2026-02-11: §2.5, §3.1, §9.4 updated — Install to Disk approach changed from btrfs send/receive to OBS image download + dd. Companion RFC updated from 20260203 to 20260211. Carry-over and dry-run deferred from v1 scope. Related header updated.

@@ -334,7 +334,7 @@ func TestManager_IsPreviouslySetUp_NoSignals(t *testing.T) {
 	}
 
 	mgr := NewManager(prep, bus, nil, nil)
-	if mgr.isPreviouslySetUp(context.Background()) {
+	if mgr.IsPreviouslySetUp(context.Background()) {
 		t.Error("expected false when no signals present")
 	}
 }
@@ -359,7 +359,7 @@ func TestManager_IsPreviouslySetUp_OnboardingComplete(t *testing.T) {
 	}
 
 	mgr := NewManager(prep, bus, nil, nil)
-	if !mgr.isPreviouslySetUp(context.Background()) {
+	if !mgr.IsPreviouslySetUp(context.Background()) {
 		t.Error("expected true when onboarding.json is complete")
 	}
 }
@@ -378,7 +378,7 @@ func TestManager_IsPreviouslySetUp_LUKSHeader(t *testing.T) {
 	}
 
 	mgr := NewManager(prep, bus, nil, nil)
-	if !mgr.isPreviouslySetUp(context.Background()) {
+	if !mgr.IsPreviouslySetUp(context.Background()) {
 		t.Error("expected true when LUKS header found")
 	}
 }

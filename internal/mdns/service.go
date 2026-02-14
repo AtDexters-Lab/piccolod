@@ -198,6 +198,9 @@ func (m *Manager) sendServiceAnnouncementWithTTL(ttl uint32) {
 				}
 			} else {
 				log.Printf("WARN: [%s-IPv4] Failed to send service announcement: %v", snap.name, err)
+				if isClosedConnError(err) {
+					m.recoverClosedConnection(snap.name, snap.state)
+				}
 			}
 		}
 
@@ -215,6 +218,9 @@ func (m *Manager) sendServiceAnnouncementWithTTL(ttl uint32) {
 				}
 			} else {
 				log.Printf("WARN: [%s-IPv6] Failed to send service announcement: %v", snap.name, err)
+				if isClosedConnError(err) {
+					m.recoverClosedConnection(snap.name, snap.state)
+				}
 			}
 		}
 	}

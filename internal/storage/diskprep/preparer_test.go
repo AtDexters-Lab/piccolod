@@ -387,61 +387,113 @@ func TestCreateDataPartition_MBR(t *testing.T) {
 }
 
 func TestCreateDataPartition_GPT(t *testing.T) {
-	sfdiskJSON := BuildSfdiskJSON(512, "gpt", []storage.SfdiskPartition{
-		{Node: "/dev/sda1", Start: 2048, Size: 1048576, Type: "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"},
-		{Node: "/dev/sda2", Start: 1050624, Size: 41943040, Type: "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709"},
+	t.Run("512MB_ESP", func(t *testing.T) {
+		// 512MB ESP (p1) + 20GB root (p2) on 120GB GPT disk.
+		sfdiskJSON := BuildSfdiskJSON(512, "gpt", []storage.SfdiskPartition{
+			{Node: "/dev/sda1", Start: 2048, Size: 1048576, Type: "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"},
+			{Node: "/dev/sda2", Start: 1050624, Size: 41943040, Type: "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709"},
+		})
+
+		var calls []string
+		run := &fakeRunner{
+			outputs: map[string]string{
+				"findmnt -nro SOURCE /":     "/dev/sda2",
+				"sfdisk -J /dev/sda":        string(sfdiskJSON),
+				"lsblk -bndo SIZE /dev/sda": "128849018880", // 120GB
+			},
+		}
+		compositeRun := &compositeRunner{
+			fake:  run,
+			calls: &calls,
+		}
+
+		p := NewPreparer(compositeRun)
+		_, _, _ = p.CreateDataPartition(context.Background(), "/dev/sda")
+
+		// Verify sgdisk -e (GPT repair) was called
+		foundRepair := false
+		for _, c := range calls {
+			if c == "sgdisk -e /dev/sda" {
+				foundRepair = true
+			}
+		}
+		if !foundRepair {
+			t.Errorf("expected sgdisk -e call for GPT repair, got calls: %v", calls)
+		}
+
+		// Root starts at 1050624, target root = 20GB = 41943040 sectors.
+		// rootTargetEnd = 1050624 + 41943040 = 42993664. lastEnd = 1050624 + 41943040 = 42993664.
+		// max = 42993664. Already 1 MiB aligned (42993664 % 2048 == 0).
+		expectedCreate := "sgdisk -n 3:42993664:0 -t 3:8309 -c 3:piccolo-data /dev/sda"
+		foundCreate := false
+		for _, c := range calls {
+			if c == expectedCreate {
+				foundCreate = true
+			}
+		}
+		if !foundCreate {
+			t.Errorf("expected sgdisk call %q, got calls: %v", expectedCreate, calls)
+		}
+
+		// Verify partx --add --nr 3:3 was called for targeted partition registration
+		foundPartx := false
+		for _, c := range calls {
+			if c == "partx --add --nr 3:3 /dev/sda" {
+				foundPartx = true
+			}
+		}
+		if !foundPartx {
+			t.Errorf("expected partx --add --nr 3:3 call, got calls: %v", calls)
+		}
+
+		// Verify sfdisk -N was NOT called
+		for _, c := range calls {
+			if strings.HasPrefix(c, "sfdisk -N") || strings.HasPrefix(c, "sfdisk --force") {
+				t.Errorf("sfdisk -N should not be called on GPT disk, got: %s", c)
+			}
+		}
 	})
 
-	var calls []string
-	run := &fakeRunner{
-		outputs: map[string]string{
-			"sfdisk -J /dev/sda":        string(sfdiskJSON),
-			"lsblk -bndo SIZE /dev/sda": "128849018880", // 120GB
-		},
-	}
-	compositeRun := &compositeRunner{
-		fake:  run,
-		calls: &calls,
-	}
+	t.Run("1GB_ESP_tumbleweed_layout", func(t *testing.T) {
+		// Reproduces the Tumbleweed layout that triggered the original bug:
+		// 1GB ESP (p1) + 20GB root (p2) on 32GB disk.
+		// Old code computed start = (20+1)*2097152 = 44040192, which fell inside
+		// sda2 (ends at 2099200+41943040-1 = 44042239). sgdisk refused with exit 4.
+		sfdiskJSON := BuildSfdiskJSON(512, "gpt", []storage.SfdiskPartition{
+			{Node: "/dev/sda1", Start: 2048, Size: 2097152, Type: "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"},
+			{Node: "/dev/sda2", Start: 2099200, Size: 41943040, Type: "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709"},
+		})
 
-	p := NewPreparer(compositeRun)
-	_, _, _ = p.CreateDataPartition(context.Background(), "/dev/sda")
+		var calls []string
+		run := &fakeRunner{
+			outputs: map[string]string{
+				"findmnt -nro SOURCE /":     "/dev/sda2",
+				"sfdisk -J /dev/sda":        string(sfdiskJSON),
+				"lsblk -bndo SIZE /dev/sda": "34359738368", // 32GB
+			},
+		}
+		compositeRun := &compositeRunner{
+			fake:  run,
+			calls: &calls,
+		}
 
-	// Verify sgdisk -e (GPT repair) was called
-	foundRepair := false
-	foundCreate := false
-	for _, c := range calls {
-		if c == "sgdisk -e /dev/sda" {
-			foundRepair = true
-		}
-		if strings.HasPrefix(c, "sgdisk -n 3:") {
-			foundCreate = true
-		}
-	}
-	if !foundRepair {
-		t.Errorf("expected sgdisk -e call for GPT repair, got calls: %v", calls)
-	}
-	if !foundCreate {
-		t.Errorf("expected sgdisk -n call for partition creation, got calls: %v", calls)
-	}
+		p := NewPreparer(compositeRun)
+		_, _, _ = p.CreateDataPartition(context.Background(), "/dev/sda")
 
-	// Verify partx --add --nr 3:3 was called for targeted partition registration
-	foundPartx := false
-	for _, c := range calls {
-		if c == "partx --add --nr 3:3 /dev/sda" {
-			foundPartx = true
+		// Root starts at 2099200, target root = 20GB = 41943040 sectors.
+		// rootTargetEnd = 2099200 + 41943040 = 44042240. lastEnd = same.
+		// max = 44042240. Already 1 MiB aligned (44042240 % 2048 == 0).
+		expectedCreate := "sgdisk -n 3:44042240:0 -t 3:8309 -c 3:piccolo-data /dev/sda"
+		foundCreate := false
+		for _, c := range calls {
+			if c == expectedCreate {
+				foundCreate = true
+			}
 		}
-	}
-	if !foundPartx {
-		t.Errorf("expected partx --add --nr 3:3 call, got calls: %v", calls)
-	}
-
-	// Verify sfdisk -N was NOT called
-	for _, c := range calls {
-		if strings.HasPrefix(c, "sfdisk -N") || strings.HasPrefix(c, "sfdisk --force") {
-			t.Errorf("sfdisk -N should not be called on GPT disk, got: %s", c)
+		if !foundCreate {
+			t.Errorf("expected sgdisk call %q, got calls: %v", expectedCreate, calls)
 		}
-	}
+	})
 }
 
 func TestFindDataPartition_MBR_SkipsRoot(t *testing.T) {

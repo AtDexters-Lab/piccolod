@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import '../../../../../core/services/api_client.dart';
 import '../../../../../theme/piccolo_theme.dart';
 import '../../../../../core/models/os_update.dart';
 import '../../../../../shared/widgets/log_stream_viewer.dart';
+import '../../../../../shared/widgets/task_progress_panel.dart';
 import '../settings_controller.dart';
 
 class SystemTab extends StatelessWidget {
@@ -97,6 +99,8 @@ class SystemTab extends StatelessWidget {
             ),
           ],
 
+          const SizedBox(height: 48),
+          const _InstallToDiskCard(),
           const SizedBox(height: 48),
           Text("Update Logs", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
           const SizedBox(height: 16),
@@ -277,6 +281,393 @@ class _InfoRow extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Install to Disk card shown only when running from USB.
+/// Checks onboarding endpoint to determine visibility.
+class _InstallToDiskCard extends StatefulWidget {
+  const _InstallToDiskCard();
+
+  @override
+  State<_InstallToDiskCard> createState() => _InstallToDiskCardState();
+}
+
+class _InstallToDiskCardState extends State<_InstallToDiskCard> {
+  final ApiClient _api = ApiClient();
+  bool _isUSBBoot = false;
+  bool _loaded = false;
+  bool _showInstallFlow = false;
+
+  // Install flow state
+  List<Map<String, dynamic>> _disks = [];
+  String? _selectedDisk;
+  String? _taskId;
+  String? _error;
+  bool _isInstalling = false;
+  bool _installComplete = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkBootMode();
+  }
+
+  Future<void> _checkBootMode() async {
+    try {
+      final onboarding = await _api.get('/api/v1/system/onboarding');
+      final bootMode = onboarding['boot_mode'] as String?;
+      final state = onboarding['state'] as String?;
+      if (mounted) {
+        setState(() {
+          _isUSBBoot = bootMode == 'usb' &&
+              (state == 'try_piccolo' || state == 'complete');
+          _loaded = true;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => _loaded = true);
+    }
+  }
+
+  Future<void> _fetchDisks() async {
+    try {
+      final response = await _api.get('/api/v1/storage/disks');
+      final rawDisks = response['disks'] as List? ?? [];
+      setState(() {
+        _disks = rawDisks.cast<Map<String, dynamic>>();
+        _showInstallFlow = true;
+        _error = null;
+      });
+    } catch (e) {
+      setState(() => _error = e.toString());
+    }
+  }
+
+  Future<void> _startInstall() async {
+    if (_selectedDisk == null) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text("Confirm Installation"),
+        content: Text(
+          "All data on $_selectedDisk will be erased. "
+          "Running apps will be stopped. App configurations will be preserved "
+          "if you restore from backup after install.\n\n"
+          "This action cannot be undone.",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Cancel"),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.critical),
+            child: const Text("Erase and Install"),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      _isInstalling = true;
+      _error = null;
+    });
+
+    try {
+      await _api.fetchCsrfToken();
+      final taskId = 'install-${DateTime.now().millisecondsSinceEpoch}';
+      await _api.post('/api/v1/system/install-to-disk', body: {
+        'target_disk': _selectedDisk,
+        'confirm_data_loss': true,
+        'task_id': taskId,
+      });
+      setState(() => _taskId = taskId);
+    } catch (e) {
+      setState(() {
+        _isInstalling = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_loaded || !_isUSBBoot) return const SizedBox.shrink();
+
+    if (_installComplete) {
+      return _buildCompleteView();
+    }
+    if (_taskId != null) {
+      return _buildProgressView();
+    }
+    if (_showInstallFlow) {
+      return _buildDiskSelectionView();
+    }
+    return _buildPromptView();
+  }
+
+  Widget _buildPromptView() {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: PiccoloTheme.mist),
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: const Icon(Icons.save_alt, color: PiccoloTheme.cobalt600, size: 24),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("Install to Disk",
+                    style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 4),
+                Text(
+                  "Running from USB. Install Piccolo to an internal disk for permanent use.",
+                  style: PiccoloTheme.textTheme.labelSmall,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 16),
+          ElevatedButton(
+            onPressed: _fetchDisks,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: PiccoloTheme.cobalt600,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text("Install"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDiskSelectionView() {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: PiccoloTheme.mist),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text("Install to Disk",
+              style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          const Text(
+            "Select an internal disk. All data on the selected disk will be erased.",
+            style: TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
+          ),
+          const SizedBox(height: 16),
+          if (_error != null) ...[
+            Container(
+              padding: const EdgeInsets.all(12),
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: PiccoloTheme.critical.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(_error!,
+                  style: const TextStyle(fontSize: 13, color: PiccoloTheme.critical)),
+            ),
+          ],
+          if (_disks.isEmpty)
+            const Center(
+              child: Padding(
+                padding: EdgeInsets.all(24),
+                child: Text("No internal disks found.",
+                    style: TextStyle(color: PiccoloTheme.inkMuted)),
+              ),
+            )
+          else
+            for (final disk in _disks)
+              _SettingsDiskTile(
+                device: disk['device'] as String? ?? '',
+                model: disk['model'] as String? ?? 'Unknown',
+                sizeGb: disk['size_gb'] as int? ?? 0,
+                transport: disk['transport'] as String? ?? '',
+                isSelected: _selectedDisk == disk['device'],
+                onTap: _isInstalling
+                    ? null
+                    : () => setState(() => _selectedDisk = disk['device'] as String?),
+              ),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(
+                onPressed: () => setState(() => _showInstallFlow = false),
+                child: const Text("Cancel"),
+              ),
+              const SizedBox(width: 12),
+              ElevatedButton(
+                onPressed: (_selectedDisk != null && !_isInstalling) ? _startInstall : null,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: PiccoloTheme.cobalt600,
+                  foregroundColor: Colors.white,
+                ),
+                child: _isInstalling
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                      )
+                    : const Text("Install"),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildProgressView() {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: PiccoloTheme.mist),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text("Installing Piccolo",
+              style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          const Text(
+            "Do not power off or disconnect the device.",
+            style: TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
+          ),
+          const SizedBox(height: 16),
+          TaskProgressPanel(
+            taskId: _taskId!,
+            taskType: "Installation",
+            urlPath: '/api/v1/system/install-progress/stream',
+            onComplete: () => setState(() => _installComplete = true),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCompleteView() {
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: PiccoloTheme.mist),
+      ),
+      child: Column(
+        children: [
+          const Icon(Icons.check_circle_outline, color: PiccoloTheme.success, size: 48),
+          const SizedBox(height: 16),
+          Text("Piccolo has been installed",
+              style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          const Text(
+            "Remove the USB drive and reboot to start using Piccolo from the internal disk.",
+            style: TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 24),
+          ElevatedButton.icon(
+            onPressed: () async {
+              try {
+                await _api.fetchCsrfToken();
+                await _api.post('/api/v1/system/reboot');
+              } catch (_) {}
+            },
+            icon: const Icon(Icons.restart_alt),
+            label: const Text("Reboot Now"),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: PiccoloTheme.cobalt600,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SettingsDiskTile extends StatelessWidget {
+  final String device;
+  final String model;
+  final int sizeGb;
+  final String transport;
+  final bool isSelected;
+  final VoidCallback? onTap;
+
+  const _SettingsDiskTile({
+    required this.device,
+    required this.model,
+    required this.sizeGb,
+    required this.transport,
+    required this.isSelected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: isSelected
+                  ? PiccoloTheme.cobalt600
+                  : PiccoloTheme.ink.withValues(alpha: 0.1),
+              width: isSelected ? 2 : 1,
+            ),
+            color: isSelected ? PiccoloTheme.cobalt600.withValues(alpha: 0.04) : null,
+          ),
+          child: Row(
+            children: [
+              Radio<bool>(
+                value: true,
+                groupValue: isSelected ? true : null,
+                onChanged: onTap != null ? (_) => onTap!() : null,
+                activeColor: PiccoloTheme.cobalt600,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '${model.isNotEmpty ? model : device} (${sizeGb >= 1000 ? "${(sizeGb / 1000).toStringAsFixed(1)} TB" : "$sizeGb GB"} ${transport.toUpperCase()})',
+                  style: const TextStyle(fontSize: 14),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

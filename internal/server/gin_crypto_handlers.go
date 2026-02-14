@@ -58,7 +58,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		return
 	}
 
-	// 3. Unlock crypto and notify persistence (required for SQLite access)
+	// 3. Unlock crypto
 	if err := s.cryptoManager.Unlock(body.Password); err != nil {
 		log.Printf("ERROR: crypto unlock after setup failed: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to unlock after setup"})
@@ -66,13 +66,31 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+
+	// 4. Initialize LUKS data volume BEFORE notifying persistence, so that
+	// /piccolo-data is mounted before the app-manager reconcile loop
+	// starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
+	// Capture error but defer failure until after session creation,
+	// so the user gets a portal session for recovery on LUKS failure.
+	var luksErr error
+	if s.storageMgr != nil {
+		if err := s.storageMgr.InitializeDataVolume(ctx, body.Password, nil); err != nil {
+			log.Printf("ERROR: data volume initialization failed: %v", err)
+			luksErr = err
+			if s.healthTracker != nil {
+				s.healthTracker.Setf("storage", health.LevelError, "data volume initialization failed")
+			}
+		}
+	}
+
+	// 5. Notify persistence (mounts control-plane gocryptfs, enables SQLite)
 	if err := s.notifyPersistenceLockState(ctx, false); err != nil {
 		log.Printf("WARN: failed to propagate unlock state: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
 		return
 	}
 
-	// 4. Setup auth manager (mandatory - not best-effort)
+	// 6. Setup auth manager (mandatory — needs SQLite from step 5)
 	if s.authManager != nil {
 		if err := s.authManager.Setup(ctx, body.Password); err != nil {
 			log.Printf("ERROR: auth manager setup failed: %v", err)
@@ -81,7 +99,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		}
 	}
 
-	// 5. Create admin user in SQLite (mandatory - not best-effort)
+	// 7. Create admin user in SQLite (mandatory — needs SQLite from step 5)
 	if s.userManager != nil {
 		adminInput := auth.CreateUserInput{
 			Username: "admin",
@@ -96,27 +114,12 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		}
 	}
 
-	// 6. Initialize LUKS data volume (mandatory — RFC §7.2, §12).
-	// Capture error but defer failure until after session creation (step 8),
-	// mirroring handleCryptoUnlock's pattern. This ensures the user gets a
-	// portal session even on LUKS failure, enabling retry/recovery from the UI.
-	var luksErr error
-	if s.storageMgr != nil {
-		if err := s.storageMgr.InitializeDataVolume(ctx, body.Password, nil); err != nil {
-			log.Printf("ERROR: data volume initialization failed: %v", err)
-			luksErr = err
-			if s.healthTracker != nil {
-				s.healthTracker.Setf("storage", health.LevelError, "data volume initialization failed")
-			}
-		}
-	}
-
-	// 7. Activate PCV publisher (depends on gocryptfs, not LUKS — safe even on LUKS failure).
+	// 8. Activate PCV publisher (depends on gocryptfs, not LUKS — safe even on LUKS failure).
 	if s.pcvPublisher != nil {
 		s.pcvPublisher.Activate()
 	}
 
-	// 8. Create session for the admin user
+	// 9. Create session for the admin user
 	userID := ""
 	if s.userManager != nil {
 		if u, err := s.userManager.GetByUsername(ctx, "admin"); err == nil {
@@ -127,6 +130,14 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	boundOrigin := s.computeCanonicalOrigin(c)
 	sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, 3600)
 	s.setSessionCookie(c, sess.ID, time.Hour)
+
+	// Mark onboarding as complete (try_piccolo → complete).
+	// Best-effort: failure here doesn't block setup since LUKS header serves as fallback signal.
+	if s.onboardingMgr != nil {
+		if err := s.onboardingMgr.Complete(); err != nil {
+			log.Printf("WARN: onboarding complete: %v", err)
+		}
+	}
 
 	// Fail after session creation so the user has portal access for recovery.
 	if luksErr != nil {
@@ -161,12 +172,9 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
-	if err := s.notifyPersistenceLockState(c.Request.Context(), false); err != nil {
-		log.Printf("WARN: failed to propagate unlock state: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
-		return
-	}
-	// Unlock LUKS data volume (mandatory — RFC §7.2, §12).
+	// Unlock LUKS data volume BEFORE notifying persistence, so that
+	// /piccolo-data is mounted before the app-manager reconcile loop
+	// starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
 	var luksErr error
 	if s.storageMgr != nil {
 		if err := s.storageMgr.UnlockDataVolume(c.Request.Context(), password); err != nil {
@@ -176,6 +184,11 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 				s.healthTracker.Setf("storage", health.LevelError, "data volume unlock failed")
 			}
 		}
+	}
+	if err := s.notifyPersistenceLockState(c.Request.Context(), false); err != nil {
+		log.Printf("WARN: failed to propagate unlock state: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
+		return
 	}
 	// Activate PCV publisher (always — depends on gocryptfs, not LUKS).
 	if s.pcvPublisher != nil {

@@ -5,6 +5,9 @@ import '../../../../core/services/api_client.dart';
 
 enum SetupState {
   loading, // Checking status
+  onboarding, // USB boot: Try Piccolo / Install to Disk choice
+  installDisk, // Disk selection + download + write progress
+  installComplete, // Reboot prompt after successful install
   welcome, // First run intro
   credentials, // Set password
   recovery, // Recovery key
@@ -39,6 +42,19 @@ class SetupController extends ChangeNotifier {
 
   // Redirect target after login (for proxy-driven login flow)
   String? _nextUrl;
+
+  // Onboarding / Install state
+  List<Map<String, dynamic>> _disks = [];
+  List<Map<String, dynamic>> get disks => _disks;
+
+  String? _installTaskId;
+  String? get installTaskId => _installTaskId;
+
+  String? _bootMode;
+  String? get bootMode => _bootMode;
+
+  bool _bootOrderConfigured = false;
+  bool get bootOrderConfigured => _bootOrderConfigured;
 
   final ApiClient _api = ApiClient();
 
@@ -114,6 +130,30 @@ class SetupController extends ChangeNotifier {
         }
         // Soft emergency: device was previously set up. Fall through to
         // crypto/status check so the user can reach the unlock screen.
+      }
+
+      // Check onboarding status — USB boot may require onboarding choice.
+      final onboarding = await _api.get('/api/v1/system/onboarding');
+      _bootMode = onboarding['boot_mode'] as String?;
+      _bootOrderConfigured = onboarding['boot_order_configured'] == true;
+      if (onboarding['required'] == true) {
+        _state = SetupState.onboarding;
+        return;
+      }
+      // If install completed, show reboot prompt.
+      if (onboarding['state'] == 'install_disk' &&
+          onboarding['install_done'] == true) {
+        _state = SetupState.installComplete;
+        return;
+      }
+      // If install is in progress, reconnect to the progress stream.
+      if (onboarding['state'] == 'install_disk') {
+        final activeTaskId = onboarding['install_task_id'] as String?;
+        if (activeTaskId != null && activeTaskId.isNotEmpty) {
+          _installTaskId = activeTaskId;
+          _state = SetupState.installDisk;
+          return;
+        }
       }
 
       final status = await _api.get('/api/v1/crypto/status');
@@ -197,6 +237,119 @@ class SetupController extends ChangeNotifier {
     } catch (_) {}
     return body;
   }
+
+  // --- Onboarding methods ---
+
+  /// User chose "Try Piccolo" — persist choice and trigger disk prep.
+  Future<void> chooseTryPiccolo() async {
+    try {
+      _state = SetupState.finishing;
+      _error = null;
+      notifyListeners();
+
+      await _api.post(
+        '/api/v1/system/onboarding',
+        body: {'choice': 'try_piccolo'},
+      );
+
+      // Disk prep started on backend. Re-check system status to determine the
+      // correct next step: welcome (new system) or unlock (previously set up).
+      await _checkStatus();
+    } catch (e) {
+      _error = e.toString();
+      _state = SetupState.onboarding;
+      notifyListeners();
+    }
+  }
+
+  /// User chose "Install to Disk" — fetch disks and transition.
+  Future<void> chooseInstallDisk() async {
+    try {
+      _state = SetupState.loading;
+      _error = null;
+      notifyListeners();
+
+      await fetchDisks();
+      _state = SetupState.installDisk;
+      notifyListeners();
+    } catch (e) {
+      _error = e.toString();
+      _state = SetupState.onboarding;
+      notifyListeners();
+    }
+  }
+
+  /// Fetch available internal disks for install target selection.
+  Future<void> fetchDisks() async {
+    final response = await _api.get('/api/v1/storage/disks');
+    final rawDisks = response['disks'] as List? ?? [];
+    _disks = rawDisks.cast<Map<String, dynamic>>();
+    notifyListeners();
+  }
+
+  /// Start the install-to-disk pipeline.
+  Future<bool> startInstall(String targetDisk) async {
+    try {
+      _error = null;
+      final taskId =
+          'install-${DateTime.now().millisecondsSinceEpoch}';
+      _installTaskId = taskId;
+      notifyListeners();
+
+      await _api.post('/api/v1/system/install-to-disk', body: {
+        'target_disk': targetDisk,
+        'confirm_data_loss': true,
+        'task_id': taskId,
+      });
+      return true;
+    } on ApiException catch (e) {
+      _installTaskId = null;
+      _error = _extractServerError(e.message);
+      notifyListeners();
+      return false;
+    } catch (e) {
+      _installTaskId = null;
+      _error = e.toString();
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// Called when install progress reaches 100% / isComplete.
+  /// Fetches fresh onboarding status to get boot_order_configured.
+  Future<void> onInstallComplete() async {
+    try {
+      final onboarding = await _api.get('/api/v1/system/onboarding');
+      _bootOrderConfigured = onboarding['boot_order_configured'] == true;
+    } catch (_) {
+      // Non-fatal; default false shows the safer "Power Off" path.
+    }
+    _state = SetupState.installComplete;
+    notifyListeners();
+  }
+
+  /// Reboot the device after a successful install.
+  Future<void> rebootAfterInstall() async {
+    try {
+      _state = SetupState.finishing;
+      notifyListeners();
+      await _api.post('/api/v1/system/reboot');
+    } catch (e) {
+      _error = e.toString();
+      _state = SetupState.installComplete;
+      notifyListeners();
+    }
+  }
+
+  /// Go back to onboarding choice from install disk view.
+  void backToOnboarding() {
+    _state = SetupState.onboarding;
+    _error = null;
+    _installTaskId = null;
+    notifyListeners();
+  }
+
+  // --- Credentials / Setup flow ---
 
   Future<bool> submitCredentials(String password) async {
     try {

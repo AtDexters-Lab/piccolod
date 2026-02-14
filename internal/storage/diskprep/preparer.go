@@ -191,6 +191,12 @@ func IsLUKS(ctx context.Context, run runner.CommandRunner, device string) (bool,
 }
 
 // getRootDevice returns the block device backing /.
+//
+// Limitation: on LUKS/LVM systems findmnt returns the mapped device
+// (e.g. /dev/mapper/root) which won't match physical partition nodes in
+// sfdisk output. Piccolo OS does not use LUKS/LVM for root, so this is
+// acceptable. If that changes, resolve the mapper device to its physical
+// partition here (e.g. via lsblk -ndo PKNAME).
 func (p *Preparer) getRootDevice(ctx context.Context) (string, error) {
 	out, err := p.run.RunWithOutput(ctx, "findmnt", "-nro", "SOURCE", "/")
 	if err != nil {
@@ -335,6 +341,50 @@ func (p *Preparer) CreateDataPartition(ctx context.Context, disk string) (string
 	return p.createDataPartitionGPT(ctx, disk, sfdisk, layout, sectorSize, slot)
 }
 
+// computeDataStartSector determines where the data partition should begin.
+// It finds the root partition's actual start from the partition table, computes
+// where the root's target size ends, and ensures we never overlap any existing
+// partition. The result is 1 MiB aligned.
+func (p *Preparer) computeDataStartSector(ctx context.Context, sfdisk storage.SfdiskOutput, layout storage.PartitionLayout, sectorSize int) (int64, error) {
+	rootDev, err := p.getRootDevice(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("detect root device: %w", err)
+	}
+
+	var rootStart int64
+	var foundRoot bool
+	for _, part := range sfdisk.PartitionTable.Partitions {
+		if part.Node == rootDev {
+			rootStart = part.Start
+			foundRoot = true
+			break
+		}
+	}
+	if !foundRoot {
+		return 0, fmt.Errorf("root partition %s not found in partition table", rootDev)
+	}
+
+	// Data partition starts after root's TARGET size (not its current image size),
+	// because growpart uses the data partition as a boundary.
+	rootTargetEnd := rootStart + int64(layout.RootGB)*(1<<30)/int64(sectorSize)
+
+	// Also consider actual end of all partitions (safety: never overlap).
+	var lastEnd int64
+	for _, part := range sfdisk.PartitionTable.Partitions {
+		if end := part.Start + part.Size; end > lastEnd {
+			lastEnd = end
+		}
+	}
+
+	startSector := max(rootTargetEnd, lastEnd)
+
+	// Align to 1 MiB boundary.
+	sectorsPerMiB := int64(1<<20) / int64(sectorSize)
+	startSector = ((startSector + sectorsPerMiB - 1) / sectorsPerMiB) * sectorsPerMiB
+
+	return startSector, nil
+}
+
 // createDataPartitionGPT creates the data partition on a GPT disk using sgdisk.
 func (p *Preparer) createDataPartitionGPT(ctx context.Context, disk string, sfdisk storage.SfdiskOutput, layout storage.PartitionLayout, sectorSize, slot int) (string, int, error) {
 	// Repair GPT: when the OS image is written to a larger disk, the backup GPT
@@ -345,8 +395,10 @@ func (p *Preparer) createDataPartitionGPT(ctx context.Context, disk string, sfdi
 		log.Printf("WARN: sgdisk -e (GPT repair) failed: %v (continuing)", err)
 	}
 
-	// Start sector: root target size (in sectors) from the ESP end.
-	startSector := int64(layout.RootGB+storage.ESPSizeGB) * (1 << 30) / int64(sectorSize)
+	startSector, err := p.computeDataStartSector(ctx, sfdisk, layout, sectorSize)
+	if err != nil {
+		return "", 0, err
+	}
 
 	slotStr := strconv.Itoa(slot)
 	startStr := strconv.FormatInt(startSector, 10)
@@ -367,42 +419,10 @@ func (p *Preparer) createDataPartitionGPT(ctx context.Context, disk string, sfdi
 
 // createDataPartitionMBR creates the data partition on an MBR disk using sfdisk.
 func (p *Preparer) createDataPartitionMBR(ctx context.Context, disk string, sfdisk storage.SfdiskOutput, layout storage.PartitionLayout, sectorSize, slot int) (string, int, error) {
-	rootDev, err := p.getRootDevice(ctx)
+	startSector, err := p.computeDataStartSector(ctx, sfdisk, layout, sectorSize)
 	if err != nil {
-		return "", 0, fmt.Errorf("detect root device: %w", err)
+		return "", 0, err
 	}
-
-	// Find root partition start sector from sfdisk output.
-	var rootStart int64
-	var foundRoot bool
-	for _, part := range sfdisk.PartitionTable.Partitions {
-		if part.Node == rootDev {
-			rootStart = part.Start
-			foundRoot = true
-			break
-		}
-	}
-	if !foundRoot {
-		return "", 0, fmt.Errorf("root partition %s not found in partition table", rootDev)
-	}
-
-	// Data partition starts after root's TARGET size (not its current small image size),
-	// because growpart uses the data partition as a boundary.
-	rootTargetEnd := rootStart + int64(layout.RootGB)*(1<<30)/int64(sectorSize)
-
-	// Also consider actual end of all partitions (safety: never overlap).
-	var lastEnd int64
-	for _, part := range sfdisk.PartitionTable.Partitions {
-		if end := part.Start + part.Size; end > lastEnd {
-			lastEnd = end
-		}
-	}
-
-	startSector := max(rootTargetEnd, lastEnd)
-
-	// Align to 1 MiB boundary.
-	sectorsPerMiB := int64(1<<20) / int64(sectorSize)
-	startSector = ((startSector + sectorsPerMiB - 1) / sectorsPerMiB) * sectorsPerMiB
 
 	// sfdisk -N <slot> writes to a specific partition slot.
 	// Type 83 = Linux. No size → uses remaining disk space.

@@ -6,6 +6,8 @@ import '../../../../core/services/api_client.dart';
 import '../../../../core/services/network_service.dart';
 import '../../../../core/utils/downloader/downloader.dart';
 import '../../../../shared/widgets/password_set_form.dart';
+import 'install_disk_step.dart';
+import 'onboarding_step.dart';
 import 'setup_controller.dart';
 
 class SetupWizard extends StatefulWidget {
@@ -55,7 +57,10 @@ class _SetupWizardState extends State<SetupWizard> {
                     state == SetupState.credentials ||
                     state == SetupState.finishing ||
                     state == SetupState.recovery ||
-                    state == SetupState.security);
+                    state == SetupState.security) &&
+                state != SetupState.onboarding &&
+                state != SetupState.installDisk &&
+                state != SetupState.installComplete;
 
             return Container(
               color: Colors.black.withValues(alpha: 0.5),
@@ -118,7 +123,9 @@ class _SetupWizardState extends State<SetupWizard> {
                                   state != SetupState.finishing &&
                                   state != SetupState.recovery &&
                                   state != SetupState.security &&
-                                  state != SetupState.systemError)
+                                  state != SetupState.systemError &&
+                                  state != SetupState.installDisk &&
+                                  state != SetupState.installComplete)
                                 const _OtherDevicesPanel(),
                             ],
                           ),
@@ -137,6 +144,12 @@ class _SetupWizardState extends State<SetupWizard> {
 
   String _getTitleForState(SetupState state) {
     switch (state) {
+      case SetupState.onboarding:
+        return "Get Started";
+      case SetupState.installDisk:
+        return "Install to Disk";
+      case SetupState.installComplete:
+        return "Installation Complete";
       case SetupState.welcome:
         return "Welcome";
       case SetupState.credentials:
@@ -184,6 +197,28 @@ class _SetupWizardState extends State<SetupWizard> {
         return const Padding(
           padding: EdgeInsets.all(48.0),
           child: CircularProgressIndicator(color: PiccoloTheme.cobalt600),
+        );
+      case SetupState.onboarding:
+        return OnboardingStep(
+          onTryPiccolo: _controller.chooseTryPiccolo,
+          onInstallDisk: _controller.chooseInstallDisk,
+          error: _controller.error,
+        );
+      case SetupState.installDisk:
+        return InstallDiskStep(
+          disks: _controller.disks,
+          onStartInstall: _controller.startInstall,
+          onBack: _controller.backToOnboarding,
+          onInstallComplete: _controller.onInstallComplete,
+          taskId: _controller.installTaskId,
+          error: _controller.error,
+          onRefreshDisks: _controller.fetchDisks,
+        );
+      case SetupState.installComplete:
+        return _InstallCompleteStep(
+          onReboot: _controller.rebootAfterInstall,
+          error: _controller.error,
+          bootOrderConfigured: _controller.bootOrderConfigured,
         );
       case SetupState.welcome:
         return _WelcomeStep(onNext: _controller.startSetup);
@@ -318,6 +353,110 @@ class _FinishingStep extends StatelessWidget {
             "This usually takes a few seconds.",
             style: PiccoloTheme.textTheme.labelSmall,
             textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _InstallCompleteStep extends StatefulWidget {
+  final Future<void> Function() onReboot;
+  final String? error;
+  final bool bootOrderConfigured;
+
+  const _InstallCompleteStep({
+    required this.onReboot,
+    this.error,
+    this.bootOrderConfigured = false,
+  });
+
+  @override
+  State<_InstallCompleteStep> createState() => _InstallCompleteStepState();
+}
+
+class _InstallCompleteStepState extends State<_InstallCompleteStep> {
+  bool _isRebooting = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final subtitle = widget.bootOrderConfigured
+        ? "Your device will reboot into the internal disk. You can remove the USB drive at any time."
+        : "Remove the USB drive after the device powers off, then power it back on.";
+    final buttonLabel = widget.bootOrderConfigured ? "Reboot Now" : "Power Off";
+    final buttonIcon = widget.bootOrderConfigured ? Icons.restart_alt : Icons.power_settings_new;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(
+            Icons.check_circle_outline,
+            color: PiccoloTheme.success,
+            size: 48,
+          ),
+          const SizedBox(height: 16),
+          Text(
+            "Piccolo has been installed",
+            style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            subtitle,
+            style: const TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
+            textAlign: TextAlign.center,
+          ),
+          if (widget.error != null) ...[
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: PiccoloTheme.critical.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: PiccoloTheme.critical.withValues(alpha: 0.2),
+                ),
+              ),
+              child: Text(
+                widget.error!,
+                style: PiccoloTheme.textTheme.labelMedium?.copyWith(
+                  color: PiccoloTheme.critical,
+                ),
+              ),
+            ),
+          ],
+          const SizedBox(height: 32),
+          ElevatedButton.icon(
+            onPressed: _isRebooting
+                ? null
+                : () async {
+                    setState(() => _isRebooting = true);
+                    await widget.onReboot();
+                    if (mounted) setState(() => _isRebooting = false);
+                  },
+            icon: _isRebooting
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      color: Colors.white,
+                      strokeWidth: 2,
+                    ),
+                  )
+                : Icon(buttonIcon),
+            label: Text(_isRebooting ? "Shutting down..." : buttonLabel),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: PiccoloTheme.cobalt600,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
           ),
         ],
       ),

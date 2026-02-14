@@ -1,7 +1,6 @@
 package mdns
 
 import (
-	"errors"
 	"log"
 	"net"
 	"strings"
@@ -72,8 +71,8 @@ func (m *Manager) ipv4Responder(state *InterfaceState, interfaceName string) {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				if strings.Contains(err.Error(), "use of closed network connection") {
-					// Connection closed - likely during shutdown
+				if isClosedConnError(err) {
+					m.recoverClosedConnection(interfaceName, state)
 					return
 				}
 				log.Printf("WARN: IPv4 mDNS read error on %s: %v", interfaceName, err)
@@ -120,8 +119,8 @@ func (m *Manager) ipv6Responder(state *InterfaceState, interfaceName string) {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				if strings.Contains(err.Error(), "use of closed network connection") {
-					// Connection closed - likely during shutdown
+				if isClosedConnError(err) {
+					m.recoverClosedConnection(interfaceName, state)
 					return
 				}
 				log.Printf("WARN: IPv6 mDNS read error on %s: %v", interfaceName, err)
@@ -487,7 +486,11 @@ func (m *Manager) sendIPv4Announcement(name string, state *InterfaceState, conn 
 				name, strings.TrimSuffix(fqdn, "."), ip.String())
 		} else {
 			log.Printf("WARN: Failed to send IPv4 announcement on %s: %v", name, err)
-			m.markInterfaceFailureSnapshot(name, state, err)
+			if isClosedConnError(err) {
+				m.recoverClosedConnection(name, state)
+			} else {
+				m.markInterfaceFailureSnapshot(name, state, err)
+			}
 		}
 	}
 }
@@ -521,7 +524,11 @@ func (m *Manager) sendIPv6Announcement(name string, state *InterfaceState, conn 
 				name, strings.TrimSuffix(fqdn, "."), ip.String())
 		} else {
 			log.Printf("WARN: Failed to send IPv6 announcement on %s: %v", name, err)
-			m.markInterfaceFailureSnapshot(name, state, err)
+			if isClosedConnError(err) {
+				m.recoverClosedConnection(name, state)
+			} else {
+				m.markInterfaceFailureSnapshot(name, state, err)
+			}
 		}
 	}
 }
@@ -530,7 +537,7 @@ func (m *Manager) markInterfaceFailureSnapshot(name string, state *InterfaceStat
 	if state == nil || err == nil {
 		return
 	}
-	if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+	if isClosedConnError(err) {
 		return
 	}
 	if m.stopped.Load() {

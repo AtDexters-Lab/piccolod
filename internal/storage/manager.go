@@ -264,7 +264,7 @@ func (m *Manager) retryPhase1Op(ctx context.Context, name string, op func(contex
 
 // classifyFailure determines whether a Phase 1 failure should be hard or soft emergency.
 func (m *Manager) classifyFailure(ctx context.Context) EmergencyLevel {
-	if m.isPreviouslySetUp(ctx) {
+	if m.IsPreviouslySetUp(ctx) {
 		return EmergencySoft
 	}
 	return EmergencyHard
@@ -275,10 +275,10 @@ type onboardingState struct {
 	State string `json:"state"`
 }
 
-// isPreviouslySetUp uses a dual-signal check to determine if the device
+// IsPreviouslySetUp uses a dual-signal check to determine if the device
 // was previously set up. If EITHER signal is present, we treat the device
 // as previously set up (soft emergency on failure, not hard).
-func (m *Manager) isPreviouslySetUp(ctx context.Context) bool {
+func (m *Manager) IsPreviouslySetUp(ctx context.Context) bool {
 	// Signal 1: onboarding.json records explicit setup completion.
 	onboardingPath := paths.CoreJoin("network-bootstrap", "onboarding.json")
 	data, err := os.ReadFile(onboardingPath)

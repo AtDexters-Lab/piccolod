@@ -1,6 +1,10 @@
 # RFC: Install to Disk (x86_64 Live USB → Internal Disk)
 
-- **Status:** Draft
+> **Status: SUPERSEDED** — This RFC described a btrfs send/receive approach for Install to Disk.
+> It has been superseded by `docs/rfc/20260211-usb-onboarding-and-install-to-disk.md` which uses
+> a simpler OBS image download + dd approach. This document is retained for historical reference.
+
+- **Status:** Superseded
 - **Date:** 2026-02-07
 - **Authors:** Engineering Team
 - **Related:**

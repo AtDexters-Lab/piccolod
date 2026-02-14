@@ -457,10 +457,15 @@ func (m *Manager) checkInterfaceChanges() {
 		}
 	}
 
-	// Clean up failedSetups for interfaces that disappeared
+	// Clean up failedSetups and recoveryCooldowns for interfaces that disappeared
 	for name := range m.failedSetups {
 		if !seenInterfaces[name] {
 			delete(m.failedSetups, name)
+		}
+	}
+	for name := range m.recoveryCooldowns {
+		if !seenInterfaces[name] {
+			delete(m.recoveryCooldowns, name)
 		}
 	}
 

@@ -166,4 +166,6 @@ type Manager struct {
 	// Failed interface setup tracking (prevents log spam from repeated failures)
 	failedSetups map[string]time.Time
 
+	// Recovery cooldown tracking (prevents rapid recovery loops)
+	recoveryCooldowns map[string]time.Time
 }

@@ -41,6 +41,9 @@ const (
 	// PCV export events
 	TopicPCVExportPublished Topic = "pcv_export_published" // PCV archive published successfully
 	TopicPCVExportFailed    Topic = "pcv_export_failed"    // PCV archive publish failed
+
+	// Onboarding events
+	TopicOnboardingStateChanged Topic = "onboarding_state_changed" // Emitted when onboarding state changes
 )
 
 // Event represents a message broadcast on the event bus.
@@ -169,6 +172,13 @@ type PCVExportPublished struct {
 // PCVExportFailed is emitted when a PCV publish fails.
 type PCVExportFailed struct {
 	Error string
+}
+
+// OnboardingStateChangedEvent is emitted when the onboarding state transitions.
+type OnboardingStateChangedEvent struct {
+	State         string `json:"state"`
+	PreviousState string `json:"previous_state"`
+	BootMode      string `json:"boot_mode"`
 }
 
 // Bus is a simple pub/sub dispatcher for intra-process events.

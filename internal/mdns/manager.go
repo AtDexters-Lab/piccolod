@@ -90,6 +90,9 @@ func NewManager() *Manager {
 		// Failed interface setup tracking
 		failedSetups: make(map[string]time.Time),
 
+		// Recovery cooldown tracking
+		recoveryCooldowns: make(map[string]time.Time),
+
 		// Gateway leadership
 		specificHostname: specificName + ".local",
 		gatewayLeader:    NewGatewayLeader(machineID),
