@@ -112,9 +112,10 @@ func newSQLiteControlStore(stateDir string, kp keyProvider) (*sqliteControlStore
 		base = paths.CoreRoot()
 	}
 	cipherDir := filepath.Join(base, "ciphertext", "control-plane")
-	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
-		return nil, err
-	}
+	// cipherDir is created later by ensureCipherDir (via EnsureVolume) which
+	// creates a btrfs subvolume for PCV snapshots. Creating it here as a
+	// regular directory would prevent ensureCipherDir's early-exit check from
+	// upgrading it to a subvolume.
 	mountDir := filepath.Join(base, "mounts", "control-plane")
 	// mountDir is created later by EnsureVolume — not here — to avoid
 	// MkdirAll failing on a stale FUSE inode from a previous crash.
