@@ -159,6 +159,7 @@ type AppStatusChangedEvent struct {
 	App        string    `json:"app"`
 	Status     string    `json:"status"`
 	PrevStatus string    `json:"prev_status,omitempty"`
+	Message    string    `json:"message,omitempty"`
 	Timestamp  time.Time `json:"timestamp"`
 }
 

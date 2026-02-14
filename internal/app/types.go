@@ -77,9 +77,10 @@ type ContainerManager interface {
 // InstanceID is the unique key derived from the primary listener name or workspace_name (RFC 20260130).
 // Definition contains the full app manifest (image, type, listeners, extensions, etc).
 type AppInstance struct {
-	InstanceID string `json:"instance_id"`
-	Enabled    bool   `json:"enabled"`
-	Status     string `json:"status"` // observed runtime status, not persisted
+	InstanceID    string `json:"instance_id"`
+	Enabled       bool   `json:"enabled"`
+	Status        string `json:"status"`                          // observed runtime status, not persisted
+	StatusMessage string `json:"status_message,omitempty"`        // transient status context for UI, not persisted
 	// Container runtime metadata.
 	PrimaryService  string            `json:"primary_service,omitempty"`
 	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`

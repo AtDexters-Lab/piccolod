@@ -272,6 +272,7 @@ func (s *GinServer) sendInitialAppStatus(isAppAllowed func(string) bool, sendJSO
 			Payload: events.AppStatusChangedEvent{
 				App:       app.InstanceID,
 				Status:    app.Status,
+				Message:   app.StatusMessage,
 				Timestamp: time.Now(),
 			},
 		})

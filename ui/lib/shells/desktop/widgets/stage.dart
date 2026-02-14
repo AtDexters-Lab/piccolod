@@ -82,7 +82,7 @@ class _StageState extends State<Stage> {
     final index = _apps.indexWhere((a) => a.name == event.app);
     if (index != -1) {
       setState(() {
-        _apps[index] = _apps[index].copyWithStatus(event.status);
+        _apps[index] = _apps[index].copyWithStatus(event.status, statusMessage: event.message ?? '');
       });
     }
   }

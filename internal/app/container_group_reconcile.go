@@ -20,6 +20,7 @@ import (
 const (
 	startupEscalateAfterAttempts = 5
 	startupEscalateAfterDuration = 10 * time.Minute
+	msgStartupFailed             = "Startup failed after repeated attempts"
 )
 
 // shouldEscalateToError checks if startup failures have exceeded escalation thresholds.
@@ -57,12 +58,19 @@ func resetStartupTracking(app *AppInstance) {
 
 // handleStartupFailure records a startup failure, persists state, and emits the appropriate status event.
 // Returns the computed status ("starting" or "error" if escalated).
+// When escalating to "error", sets a user-facing message. When remaining in "starting",
+// preserves whatever message was set by the caller (e.g., "Containers not found, recreating").
 func (m *AppManager) handleStartupFailure(state *FilesystemStateManager, appInst *AppInstance) string {
 	status := recordStartupFailure(appInst)
 	if err := state.StoreAppMetadata(appInst); err != nil {
 		log.Printf("WARN: handleStartupFailure %s: failed to persist state: %v", appInst.InstanceID, err)
 	}
-	m.updateStatusWithEvent(appInst.InstanceID, status)
+	if status == StatusError {
+		m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusError, msgStartupFailed)
+	} else {
+		// Keep the existing message (set by caller) — only update status.
+		m.updateStatusPreservingMessageWithEvent(appInst.InstanceID, status)
+	}
 	return status
 }
 
@@ -189,7 +197,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 					log.Printf("WARN: reconcile app %s: escalation remove failed: %v", appInst.InstanceID, removeErr)
 				}
 				m.serviceManager.RemoveApp(appInst.InstanceID)
-				m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+				m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusError, msgStartupFailed)
 			}
 			return nil
 		}
@@ -205,6 +213,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		}
 		m.serviceManager.RemoveApp(appInst.InstanceID)
 
+		m.setObservedStatusMessage(appInst.InstanceID, "Containers not found, recreating")
 		if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime); err != nil {
 			m.handleStartupFailure(state, appInst)
 			return err
@@ -233,6 +242,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			// If anchor has stale netns, recreate the entire container group
 			var staleErr *container.StaleNetworkNamespaceError
 			if errors.As(err, &staleErr) {
+				m.setObservedStatusMessage(appInst.InstanceID, "Stale network detected, recreating")
 				if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
 					"anchor has stale network namespace, recreating container group"); recoverErr != nil {
 					m.handleStartupFailure(state, appInst)
@@ -289,6 +299,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		}
 
 		if cid == "" || !st.Exists {
+			m.setObservedStatusMessage(appInst.InstanceID, fmt.Sprintf("Recreating service '%s'", svcName))
 			opts := serviceContainerOptions{
 				layout:     layout,
 				appDef:     def,
@@ -326,6 +337,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				var staleErr *container.StaleNetworkNamespaceError
 				if errors.As(err, &staleErr) {
 					log.Printf("INFO: reconcile app %s: service '%s' has stale network namespace, recreating container", appInst.InstanceID, svcName)
+					m.setObservedStatusMessage(appInst.InstanceID, "Stale network detected, recreating")
 
 					// Remove the stale container (with error logging)
 					if removeErr := m.containerManager.RemoveContainer(ctx, runtime, cid); removeErr != nil {
@@ -393,6 +405,10 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			log.Printf("WARN: reconcile %s: failed to persist startup tracking reset: %v", appInst.InstanceID, err)
 		}
 		m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
+	} else {
+		// Clear any transient message from in-place recovery (e.g. single service recreation)
+		// when the app was already running and no status transition occurred.
+		m.setObservedStatusMessage(appInst.InstanceID, "")
 	}
 
 	// Restore endpoints/proxies and ensure published ports match our expected allocations.
@@ -403,11 +419,12 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		if errors.Is(err, container.ErrPortReconciliationRequired) {
 			if shouldEscalateToError(appInst) {
 				if m.getObservedStatus(appInst.InstanceID) != StatusError {
-					m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+					m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusError, msgStartupFailed)
 				}
 				return nil
 			}
 			log.Printf("INFO: reconcile app %s: port bindings mismatch, recreating containers", appInst.InstanceID)
+			m.setObservedStatusMessage(appInst.InstanceID, "Port mismatch, recreating containers")
 			// Best-effort cleanup before port-reconciliation recreation; errors logged but don't block.
 			if stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime); stopErr != nil {
 				log.Printf("WARN: reconcile app %s: port-reconcile stop failed: %v", appInst.InstanceID, stopErr)
@@ -455,6 +472,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			} else {
 				log.Printf("INFO: reconcile app %s: backend unhealthy with running containers, likely stale DNAT — recreating with new ports (attempt %d)",
 					appInst.InstanceID, appInst.StartupAttempts+1)
+				m.setObservedStatusMessage(appInst.InstanceID, "Repairing stale network routes")
 				m.handleStartupFailure(state, appInst)
 				// Preserve the startup attempt counter across recreation.
 				// recreateMissingMultiContainer resets it on success, but for DNAT repair

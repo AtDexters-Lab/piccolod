@@ -55,8 +55,9 @@ type AppManager struct {
 
 	// In-memory observed status: derived from container state during reconciliation.
 	// Published via event bus and returned in API responses. Never persisted.
-	observedStatus   map[string]string
-	observedStatusMu sync.RWMutex
+	observedStatus        map[string]string
+	observedStatusMessage map[string]string // transient status message for UI context
+	observedStatusMu      sync.RWMutex
 
 	// Workspace disk manager for container-independent persistence
 	workspaceDiskMgr      *workspacedisk.DefaultManager
@@ -170,6 +171,7 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		lockReader:            lockReader,
 		mountVerifier:         defaultMountVerifier,
 		observedStatus:        make(map[string]string),
+		observedStatusMessage: make(map[string]string),
 		workspacePathResolver: pathResolver,
 		workspaceImageMounter: imageMounter,
 	}
@@ -260,7 +262,7 @@ func (m *AppManager) currentEventBus() *events.Bus {
 }
 
 // publishAppStatusChanged emits an app status changed event if the event bus is configured.
-func (m *AppManager) publishAppStatusChanged(instanceID, status, prevStatus string) {
+func (m *AppManager) publishAppStatusChanged(instanceID, status, prevStatus, message string) {
 	bus := m.currentEventBus()
 	if bus == nil {
 		return
@@ -271,15 +273,19 @@ func (m *AppManager) publishAppStatusChanged(instanceID, status, prevStatus stri
 			App:        instanceID,
 			Status:     status,
 			PrevStatus: prevStatus,
+			Message:    message,
 			Timestamp:  time.Now(),
 		},
 	})
 }
 
 // setObservedStatus updates the in-memory observed status for an app.
+// Also clears the transient status message to prevent stale messages
+// from persisting across status transitions.
 func (m *AppManager) setObservedStatus(instanceID, status string) {
 	m.observedStatusMu.Lock()
 	m.observedStatus[instanceID] = status
+	m.observedStatusMessage[instanceID] = ""
 	m.observedStatusMu.Unlock()
 }
 
@@ -294,17 +300,60 @@ func (m *AppManager) getObservedStatus(instanceID string) string {
 func (m *AppManager) deleteObservedStatus(instanceID string) {
 	m.observedStatusMu.Lock()
 	delete(m.observedStatus, instanceID)
+	delete(m.observedStatusMessage, instanceID)
 	m.observedStatusMu.Unlock()
 }
 
+// setObservedStatusMessage sets a transient status message and publishes an event if the message changed.
+func (m *AppManager) setObservedStatusMessage(instanceID, message string) {
+	m.observedStatusMu.Lock()
+	prevMessage := m.observedStatusMessage[instanceID]
+	m.observedStatusMessage[instanceID] = message
+	status := m.observedStatus[instanceID]
+	m.observedStatusMu.Unlock()
+	if prevMessage != message {
+		m.publishAppStatusChanged(instanceID, status, status, message)
+	}
+}
+
+// getObservedStatusAndMessage atomically reads both status and message for an app.
+func (m *AppManager) getObservedStatusAndMessage(instanceID string) (status, message string) {
+	m.observedStatusMu.RLock()
+	defer m.observedStatusMu.RUnlock()
+	return m.observedStatus[instanceID], m.observedStatusMessage[instanceID]
+}
+
 // updateStatusWithEvent updates the in-memory observed status and publishes an event if the status changed.
-// This should be called within the appropriate lock context (reconcileMu for reconciler paths,
-// request-scoped for lifecycle operations).
+// Clears any transient status message. This should be called within the appropriate lock context
+// (reconcileMu for reconciler paths, request-scoped for lifecycle operations).
 func (m *AppManager) updateStatusWithEvent(instanceID, newStatus string) {
-	prevStatus := m.getObservedStatus(instanceID)
-	m.setObservedStatus(instanceID, newStatus)
+	m.updateStatusAndMessageWithEvent(instanceID, newStatus, "")
+}
+
+// updateStatusAndMessageWithEvent atomically sets both status and message, then publishes an event
+// if either the status or message changed. This ensures intra-status message updates (e.g., "Starting
+// containers" -> "Re-pulling base image" while status remains "starting") are pushed to SSE clients.
+func (m *AppManager) updateStatusAndMessageWithEvent(instanceID, newStatus, message string) {
+	m.observedStatusMu.Lock()
+	prevStatus := m.observedStatus[instanceID]
+	prevMessage := m.observedStatusMessage[instanceID]
+	m.observedStatus[instanceID] = newStatus
+	m.observedStatusMessage[instanceID] = message
+	m.observedStatusMu.Unlock()
+	if prevStatus != newStatus || prevMessage != message {
+		m.publishAppStatusChanged(instanceID, newStatus, prevStatus, message)
+	}
+}
+
+// updateStatusPreservingMessageWithEvent updates the status without changing the existing message.
+func (m *AppManager) updateStatusPreservingMessageWithEvent(instanceID, newStatus string) {
+	m.observedStatusMu.Lock()
+	prevStatus := m.observedStatus[instanceID]
+	m.observedStatus[instanceID] = newStatus
+	msg := m.observedStatusMessage[instanceID]
+	m.observedStatusMu.Unlock()
 	if prevStatus != newStatus {
-		m.publishAppStatusChanged(instanceID, newStatus, prevStatus)
+		m.publishAppStatusChanged(instanceID, newStatus, prevStatus, msg)
 	}
 }
 
@@ -1388,10 +1437,13 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		return nil, fmt.Errorf("failed to store app: %w", err)
 	}
 
-	// Set observed status and populate the returned instance for API callers.
-	m.setObservedStatus(instanceID, StatusRunning)
+	// Atomically set observed status and clear any transient message, then populate for API callers.
+	m.observedStatusMu.Lock()
+	m.observedStatus[instanceID] = StatusRunning
+	m.observedStatusMessage[instanceID] = ""
+	m.observedStatusMu.Unlock()
 	app.Status = StatusRunning
-	m.publishAppStatusChanged(instanceID, "installed", "")
+	m.publishAppStatusChanged(instanceID, "installed", "", "")
 
 	cleanupServices = false
 	return app, nil
@@ -1416,7 +1468,7 @@ func (m *AppManager) List(ctx context.Context) ([]*AppInstance, error) {
 	apps := make([]*AppInstance, len(cached))
 	for i, app := range cached {
 		copy := *app
-		copy.Status = m.getObservedStatus(app.InstanceID)
+		copy.Status, copy.StatusMessage = m.getObservedStatusAndMessage(app.InstanceID)
 		if copy.Status == "" {
 			copy.Status = StatusStopped
 		}
@@ -1438,7 +1490,7 @@ func (m *AppManager) Get(ctx context.Context, instanceID string) (*AppInstance, 
 	}
 	// Return shallow copy to avoid mutating cached instance (data race on Status field).
 	app := *cached
-	app.Status = m.getObservedStatus(instanceID)
+	app.Status, app.StatusMessage = m.getObservedStatusAndMessage(instanceID)
 	if app.Status == "" {
 		app.Status = StatusStopped
 	}
@@ -1731,7 +1783,7 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 	// Clean up observed status and emit "uninstalled" event
 	prevStatus := m.getObservedStatus(instanceID)
 	m.deleteObservedStatus(instanceID)
-	m.publishAppStatusChanged(instanceID, "uninstalled", prevStatus)
+	m.publishAppStatusChanged(instanceID, "uninstalled", prevStatus, "")
 
 	return nil
 }
