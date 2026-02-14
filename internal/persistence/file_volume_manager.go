@@ -888,6 +888,18 @@ func (f *fileVolumeManager) ensureMetadata(ctx context.Context, entry *volumeEnt
 		return nil
 	}
 
+	// Defense-in-depth: refuse re-init if the cipher directory already contains
+	// gocryptfs state. This prevents data loss from a race where metadata is
+	// temporarily unreadable (e.g. unmounted data volume) but gocryptfs artifacts
+	// exist from a prior initialization.
+	// See: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md
+	for _, artifact := range []string{"gocryptfs.conf", "gocryptfs.diriv"} {
+		p := filepath.Join(entry.cipherDir, artifact)
+		if _, statErr := os.Stat(p); statErr == nil {
+			return fmt.Errorf("%s exists in %s but volume metadata is missing — refusing re-init to prevent data loss", artifact, entry.cipherDir)
+		}
+	}
+
 	passphrase, err := generatePassphrase()
 	if err != nil {
 		return err

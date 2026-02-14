@@ -13,6 +13,7 @@ import (
 	authpkg "piccolod/internal/auth"
 	"piccolod/internal/crypt"
 	"piccolod/internal/events"
+	"piccolod/internal/health"
 	"piccolod/internal/persistence"
 )
 
@@ -247,7 +248,17 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 				}
 				return
 			}
-			// Unlock successful
+			// Unlock successful — mount LUKS data volume before notifying
+			// persistence, so /piccolo-data is available when the app-manager
+			// reconcile loop starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
+			if s.storageMgr != nil {
+				if err := s.storageMgr.UnlockDataVolume(ctx, body.Password); err != nil {
+					log.Printf("ERROR: auth login data volume unlock failed: %v", err)
+					if s.healthTracker != nil {
+						s.healthTracker.Setf("storage", health.LevelError, "data volume unlock failed")
+					}
+				}
+			}
 			if notifyErr := s.notifyPersistenceLockState(ctx, false); notifyErr != nil {
 				log.Printf("WARN: auth login persistence unlock failed: %v", notifyErr)
 			}

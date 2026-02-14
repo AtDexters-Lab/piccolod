@@ -178,8 +178,8 @@ Store a copy of `gocryptfs.conf` alongside the volume metadata in the state dire
 
 ## Remediation Status
 
-- [ ] Primary fix: reorder `handleCryptoUnlock` and `handleCryptoSetup` — not yet implemented
-- [ ] Fix `handleAuthLogin`: add missing `UnlockDataVolume` call and reorder — not yet implemented
-- [ ] Assess `handleCryptoResetPassword` transient unlock window — not yet implemented
-- [ ] Defense-in-depth: gocryptfs artifact existence check in `ensureMetadata` — not yet implemented
-- [ ] Test coverage: add test for race scenario — not yet implemented
+- [x] Primary fix: reorder `handleCryptoUnlock` and `handleCryptoSetup` — LUKS before notify
+- [x] Fix `handleAuthLogin`: add missing `UnlockDataVolume` call before notify
+- [x] Defense-in-depth: gocryptfs artifact existence check in `ensureMetadata`
+- [ ] Assess `handleCryptoResetPassword` transient unlock window — deferred (low risk, guarded by defense-in-depth)
+- [ ] Test coverage: add test for race scenario
