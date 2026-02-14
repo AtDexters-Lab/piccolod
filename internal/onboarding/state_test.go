@@ -194,11 +194,47 @@ func TestComplete(t *testing.T) {
 	}
 }
 
+func TestComplete_FromPending(t *testing.T) {
+	setupTestDir(t)
+	m := NewManager(storage.BootModeUSB)
+	if err := m.Complete(); err != nil {
+		t.Fatalf("Complete() from pending unexpected error: %v", err)
+	}
+	if m.State() != StateComplete {
+		t.Errorf("state = %s, want complete", m.State())
+	}
+	// Verify persistence: reload from disk.
+	m2 := NewManager(storage.BootModeUSB)
+	if m2.State() != StateComplete {
+		t.Errorf("reloaded state = %s, want complete", m2.State())
+	}
+}
+
+func TestComplete_Idempotent(t *testing.T) {
+	setupTestDir(t)
+	m := NewManager(storage.BootModeUSB)
+	if err := m.Choose(StateTryPiccolo); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Complete(); err != nil {
+		t.Fatalf("Complete() first call: %v", err)
+	}
+	if err := m.Complete(); err != nil {
+		t.Fatalf("Complete() second call (idempotent) unexpected error: %v", err)
+	}
+	if m.State() != StateComplete {
+		t.Errorf("state = %s, want complete", m.State())
+	}
+}
+
 func TestComplete_WrongState(t *testing.T) {
 	setupTestDir(t)
 	m := NewManager(storage.BootModeUSB)
+	if err := m.Choose(StateInstallDisk); err != nil {
+		t.Fatal(err)
+	}
 	if err := m.Complete(); err == nil {
-		t.Error("Complete() from pending expected error, got nil")
+		t.Error("Complete() from install_disk expected error, got nil")
 	}
 }
 
