@@ -15,6 +15,18 @@ const (
 	// Matches the existing stale threshold (3x 60s discovery interval).
 	PeerOnlineThreshold = 180 * time.Second
 
+	// LeaderHeartbeatInterval is the service announcement frequency when this device is leader.
+	// Faster than the default 60s to allow followers to detect leader absence quickly.
+	LeaderHeartbeatInterval = 10 * time.Second
+
+	// LeaderProbeTimeout is the time a deferred peer waits before considering the leader gone.
+	// 3 missed heartbeats at LeaderHeartbeatInterval.
+	LeaderProbeTimeout = 3 * LeaderHeartbeatInterval
+
+	// ReEvalInterval is how often a deferred peer re-evaluates leadership.
+	// Matches the leader heartbeat so we check once per expected heartbeat.
+	ReEvalInterval = LeaderHeartbeatInterval
+
 	// GatewayHostname is the gateway domain that the leader serves.
 	GatewayHostname = "piccolo.local"
 )
@@ -54,9 +66,16 @@ type GatewayLeader struct {
 	claimTimer    *time.Timer
 	stopCh        chan struct{}
 	stopped       bool
+	wg            sync.WaitGroup
+
+	// Re-evaluation timer for deferred peers
+	reEvalActive bool
+	reEvalStopCh chan struct{}
 
 	// getPeers returns a copy of online peers for leadership evaluation.
 	// This is set by the Manager during initialization.
+	// LOCK ORDERING: This function may acquire PeerRegistry.mu. Callers
+	// holding GatewayLeader.mu must ensure no reverse ordering exists.
 	getPeers func() []DiscoveredPeer
 
 	// onLeadershipChange is called when leadership state changes.
@@ -113,12 +132,14 @@ func (g *GatewayLeader) Start() {
 // Stop cancels any pending claim and stops the leader.
 func (g *GatewayLeader) Stop() {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 
 	if g.stopped {
+		g.mu.Unlock()
 		return
 	}
 	g.stopped = true
+
+	g.stopReEvalLocked()
 	close(g.stopCh)
 
 	if g.claimTimer != nil {
@@ -131,6 +152,11 @@ func (g *GatewayLeader) Stop() {
 		g.state = LeadershipUnknown
 		log.Printf("INFO: Gateway leader stopped, yielding leadership")
 	}
+
+	g.mu.Unlock()
+
+	// Wait for reEvalLoop goroutine to exit (outside lock since it acquires g.mu)
+	g.wg.Wait()
 }
 
 // OnPeerDiscovered is called when a new peer is discovered.
@@ -150,6 +176,7 @@ func (g *GatewayLeader) OnPeerDiscovered(peer DiscoveredPeer) {
 			g.claimTimer = nil
 		}
 		g.state = LeadershipDeferred
+		g.startReEvalLocked()
 		log.Printf("INFO: Gateway leader deferring to peer %s (lower ID than %s)", peer.MachineID, g.selfMachineID)
 		return
 	}
@@ -173,8 +200,13 @@ func (g *GatewayLeader) OnPeerGoodbye(machineID string) {
 	// If we're deferred and lost a peer, re-evaluate immediately
 	if g.state == LeadershipDeferred {
 		log.Printf("INFO: Gateway leader re-evaluating after peer %s goodbye", machineID)
-		// Schedule immediate evaluation (async to avoid lock contention)
-		go g.evaluateLeadership()
+		// Schedule immediate evaluation (async to avoid lock contention).
+		// Tracked by WaitGroup so Stop() waits for completion.
+		g.wg.Add(1)
+		go func() {
+			defer g.wg.Done()
+			g.evaluateLeadership()
+		}()
 	}
 }
 
@@ -202,8 +234,10 @@ func (g *GatewayLeader) evaluateLeadership() {
 		g.yieldLeadershipLocked()
 	} else if !shouldLead && g.state == LeadershipUnknown {
 		g.state = LeadershipDeferred
+		g.startReEvalLocked()
 		log.Printf("INFO: Gateway leader deferred (found peer with lower ID)")
 	}
+	// !shouldLead && state == LeadershipDeferred: no change needed, re-eval continues
 }
 
 // shouldBeLeaderLocked returns true if we should be the gateway leader.
@@ -218,9 +252,16 @@ func (g *GatewayLeader) shouldBeLeaderLocked() bool {
 	peers := g.getPeers()
 	now := time.Now()
 
+	// When deferred (actively monitoring a known leader), use the aggressive
+	// probe timeout. Otherwise use the conservative online threshold.
+	threshold := PeerOnlineThreshold
+	if g.state == LeadershipDeferred {
+		threshold = LeaderProbeTimeout
+	}
+
 	for _, p := range peers {
 		// Only consider online peers
-		if now.Sub(p.LastSeen) >= PeerOnlineThreshold {
+		if now.Sub(p.LastSeen) >= threshold {
 			continue
 		}
 		if p.MachineID < g.selfMachineID {
@@ -234,6 +275,7 @@ func (g *GatewayLeader) shouldBeLeaderLocked() bool {
 // claimLeadershipLocked claims gateway leadership.
 // Must be called with lock held.
 func (g *GatewayLeader) claimLeadershipLocked() {
+	g.stopReEvalLocked()
 	g.state = LeadershipClaimed
 	log.Printf("INFO: Gateway leader claimed by %s", g.selfMachineID)
 
@@ -248,12 +290,57 @@ func (g *GatewayLeader) claimLeadershipLocked() {
 // Must be called with lock held.
 func (g *GatewayLeader) yieldLeadershipLocked() {
 	g.state = LeadershipDeferred
+	g.startReEvalLocked()
 	log.Printf("INFO: Gateway leader yielded by %s", g.selfMachineID)
 
 	if g.onLeadershipChange != nil {
 		// Call callback outside lock to avoid deadlock
 		callback := g.onLeadershipChange
 		go callback(false)
+	}
+}
+
+// startReEvalLocked starts the periodic re-evaluation timer for deferred peers.
+// Must be called with lock held.
+func (g *GatewayLeader) startReEvalLocked() {
+	if g.reEvalActive {
+		return
+	}
+	g.reEvalActive = true
+	g.reEvalStopCh = make(chan struct{})
+	log.Printf("INFO: Starting leader re-evaluation timer (self: %s)", g.selfMachineID)
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		g.reEvalLoop(g.reEvalStopCh)
+	}()
+}
+
+// stopReEvalLocked stops the periodic re-evaluation timer.
+// Must be called with lock held.
+func (g *GatewayLeader) stopReEvalLocked() {
+	if !g.reEvalActive || g.reEvalStopCh == nil {
+		return
+	}
+	close(g.reEvalStopCh)
+	g.reEvalStopCh = nil
+	g.reEvalActive = false
+	log.Printf("INFO: Stopped leader re-evaluation timer (self: %s)", g.selfMachineID)
+}
+
+// reEvalLoop periodically calls evaluateLeadership until stopped.
+func (g *GatewayLeader) reEvalLoop(stopCh chan struct{}) {
+	ticker := time.NewTicker(ReEvalInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-g.stopCh:
+			return
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			g.evaluateLeadership()
+		}
 	}
 }
 

@@ -145,7 +145,8 @@ type Manager struct {
 
 	// Gateway leadership
 	gatewayLeader    *GatewayLeader
-	specificHostname string // Always "piccolo-<machineId>.local"
+	specificHostname string            // Always "piccolo-<machineId>.local"
+	serviceIntervalCh chan time.Duration // Signals service announcer to change interval
 
 	// Socket factories (overrideable for tests)
 	ipv4SocketFactory func(*net.Interface) (*net.UDPConn, error)

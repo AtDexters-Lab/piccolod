@@ -2,6 +2,7 @@ build
 .cache
 .gocache
 node_modules
+.claude
 
 # Piccolod artifacts (relative to repo root)
 /piccolod

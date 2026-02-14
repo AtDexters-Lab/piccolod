@@ -94,8 +94,9 @@ func NewManager() *Manager {
 		recoveryCooldowns: make(map[string]time.Time),
 
 		// Gateway leadership
-		specificHostname: specificName + ".local",
-		gatewayLeader:    NewGatewayLeader(machineID),
+		specificHostname:  specificName + ".local",
+		gatewayLeader:     NewGatewayLeader(machineID),
+		serviceIntervalCh: make(chan time.Duration, 1),
 	}
 
 	// Initialize service metadata
@@ -109,13 +110,24 @@ func NewManager() *Manager {
 		return manager.peerRegistry.List()
 	})
 
-	// Wire leadership change callback to update advertised hostnames
+	// Wire leadership change callback to update advertised hostnames and announcement interval
 	manager.gatewayLeader.SetLeadershipChangeCallback(func(isLeader bool) {
 		if isLeader {
 			manager.names.AddGatewayHostname()
 		} else {
 			manager.names.RemoveGatewayHostname()
 		}
+		// Adjust service announcement interval: fast when leader, normal otherwise.
+		// Drain-then-send ensures the latest value always wins.
+		interval := 60 * time.Second
+		if isLeader {
+			interval = LeaderHeartbeatInterval
+		}
+		select {
+		case <-manager.serviceIntervalCh:
+		default:
+		}
+		manager.serviceIntervalCh <- interval
 		// Re-announce with updated hostnames
 		if manager.started.Load() {
 			manager.sendMultiInterfaceAnnouncements()
