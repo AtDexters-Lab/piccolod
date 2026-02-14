@@ -1195,6 +1195,9 @@ func (s *GinServer) setupGinRoutes() {
 		authed.GET("/auth/csrf", s.handleAuthCSRF)
 		authed.POST("/oauth/resume", s.handleOIDCResume)
 
+		// UI telemetry (Admin only)
+		admin.POST("/telemetry/log", s.handleTelemetryLog)
+
 		// Debug terminal (Admin only)
 		admin.GET("/terminal", s.handleTerminal)
 
