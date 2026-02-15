@@ -75,6 +75,29 @@ class SystemTab extends StatelessWidget {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
+                            Text("Diagnostic Log", style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 4),
+                            Text(
+                              "Download a redacted system log for bug reporting.",
+                              style: PiccoloTheme.textTheme.labelSmall,
+                            ),
+                          ],
+                        ),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: controller.downloadDiagnosticLog,
+                        icon: const Icon(Icons.download, size: 18),
+                        label: const Text("Download"),
+                      ),
+                    ],
+                  ),
+                  const Divider(height: 32),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
                             Text("Rollback System", style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold)),
                             const SizedBox(height: 4),
                             Text(

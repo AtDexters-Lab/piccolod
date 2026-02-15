@@ -3,6 +3,7 @@ import 'package:piccolo_os/core/models/os_update.dart';
 import 'package:piccolo_os/core/services/network_service.dart';
 import 'package:piccolo_os/core/models/session.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
+import 'package:piccolo_os/core/config/core_config.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/utils/downloader/downloader.dart' as downloader;
 
@@ -215,6 +216,13 @@ class SettingsController extends ChangeNotifier {
      }
   }
   
+  void downloadDiagnosticLog() {
+    downloader.downloadFromUrl(
+      '${CoreConfig.apiBaseUrl}/api/v1/system/admin/diagnostic-log',
+      'piccolod-diagnostic.log',
+    );
+  }
+
   Future<void> downloadCACertificate() async {
     try {
       final response = await ApiClient().get('/api/v1/system/ca.crt');

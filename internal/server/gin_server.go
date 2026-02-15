@@ -1166,6 +1166,9 @@ func (s *GinServer) setupGinRoutes() {
 		// System logs (Admin only)
 		admin.GET("/system/logs/stream", s.handleGinSystemLogStream)
 
+		// Diagnostic log download (Admin only, always available)
+		admin.GET("/system/admin/diagnostic-log", s.handleAdminDiagnosticLog)
+
 		// Task progress (Admin only?) - Maybe standard user needs to see progress of their own actions?
 		// But they can't trigger actions. So Admin only is safe.
 		// Actually, let's allow it for now as it's harmless read-only.
