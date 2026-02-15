@@ -43,6 +43,11 @@ type ServiceManager struct {
 
 	// Health aggregator cancellation
 	healthAggregatorCancel func()
+
+	// App status tracking for health check suppression
+	appTransient    map[string]time.Time // app ID → time entered transient state
+	appTransientMu  sync.RWMutex
+	appStatusCancel func() // unsubscribe from app status events
 }
 
 // LockStateReader exposes the control lock state for services.
@@ -63,6 +68,7 @@ func NewServiceManager() *ServiceManager {
 		containerIDs:  make(map[string]string),
 		leadership:    make(map[string]cluster.Role),
 		backendHealth: NewBackendHealthState(),
+		appTransient:  make(map[string]time.Time),
 	}
 }
 
@@ -114,9 +120,10 @@ func (m *ServiceManager) SetEventBus(bus *events.Bus) {
 	m.eventBus = bus
 	m.eventsMu.Unlock()
 
-	// Start health aggregator if event bus is available
+	// Start health aggregator and app status tracker if event bus is available
 	if bus != nil {
 		m.startHealthAggregator()
+		m.startAppStatusTracker()
 	}
 }
 
@@ -248,6 +255,10 @@ func (m *ServiceManager) stopEventObservers() {
 	if m.eventCancel != nil {
 		m.eventCancel()
 		m.eventCancel = nil
+	}
+	if m.appStatusCancel != nil {
+		m.appStatusCancel()
+		m.appStatusCancel = nil
 	}
 	m.eventsMu.Unlock()
 }
@@ -632,12 +643,65 @@ func (m *ServiceManager) Stop() {
 	m.StopAll()
 }
 
+// startAppStatusTracker subscribes to TopicAppStatusChanged events and tracks
+// which apps are in transient states (starting). Health checks are suppressed
+// for these apps to avoid false "unhealthy" reports.
+func (m *ServiceManager) startAppStatusTracker() {
+	m.eventsMu.Lock()
+	bus := m.eventBus
+	m.eventsMu.Unlock()
+	if bus == nil {
+		return
+	}
+
+	ch, cancel := bus.SubscribeWithCancel(events.TopicAppStatusChanged, 64)
+	m.eventsMu.Lock()
+	if m.appStatusCancel != nil {
+		m.appStatusCancel()
+	}
+	m.appStatusCancel = cancel
+	m.eventsMu.Unlock()
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		for evt := range ch {
+			payload, ok := evt.Payload.(events.AppStatusChangedEvent)
+			if !ok {
+				continue
+			}
+			m.appTransientMu.Lock()
+			switch payload.Status {
+			case "starting":
+				m.appTransient[payload.App] = time.Now()
+			default:
+				delete(m.appTransient, payload.App)
+			}
+			m.appTransientMu.Unlock()
+		}
+	}()
+}
+
 func (m *ServiceManager) checkBackends() {
 	// Snapshot under lock
 	snap := m.snapshotRegistry()
 
 	// TCP connectivity check per endpoint with debouncing
-	for _, mapp := range snap {
+	now := time.Now()
+	for appName, mapp := range snap {
+		// Skip health checks for apps in transient states (starting).
+		// Safety valve: auto-expire entries older than 5 minutes to handle
+		// dropped events from the lossy event bus.
+		m.appTransientMu.Lock()
+		if since, ok := m.appTransient[appName]; ok {
+			if now.Sub(since) > 5*time.Minute {
+				delete(m.appTransient, appName)
+			} else {
+				m.appTransientMu.Unlock()
+				continue
+			}
+		}
+		m.appTransientMu.Unlock()
 		for _, ep := range mapp {
 			addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(ep.HostBind))
 			conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
@@ -1084,6 +1148,11 @@ func (m *ServiceManager) RemoveApp(appName string) {
 		delete(m.registry, appName)
 	}
 	delete(m.containerIDs, appName)
+
+	// Clean up transient state for removed app
+	m.appTransientMu.Lock()
+	delete(m.appTransient, appName)
+	m.appTransientMu.Unlock()
 
 	// Publish endpoint changes (non-blocking)
 	if len(removed) > 0 {

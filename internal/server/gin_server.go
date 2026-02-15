@@ -544,6 +544,13 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.supervisor.Register(pcvPub)
 	s.supervisor.Register(supervisor.NewComponent("consensus", consensusMgr.Start, consensusMgr.Stop))
 	s.supervisor.Register(newLeadershipObserver(eventsBus))
+	s.supervisor.Register(supervisor.NewComponent("catalog", func(ctx context.Context) error {
+		catalogMgr.ObserveLockState(eventsBus)
+		return nil
+	}, func(ctx context.Context) error {
+		catalogMgr.Stop()
+		return nil
+	}))
 	s.observeLockState(eventsBus)
 	s.observeLeadership(eventsBus)
 	s.observeRemoteConfig(eventsBus)
@@ -826,8 +833,9 @@ func (s *GinServer) Start() error {
 	}
 
 	s.httpSrv = &http.Server{
-		Addr:    ":" + port,
-		Handler: s.router,
+		Addr:     ":" + port,
+		Handler:  s.router,
+		ErrorLog: newFilteredErrorLogger(),
 	}
 	if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -2008,6 +2016,7 @@ func (s *GinServer) initSecureLoopback() error {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
+		ErrorLog:     newFilteredErrorLogger(),
 	}
 	return nil
 }
@@ -2065,6 +2074,7 @@ func (s *GinServer) startInternalHTTPSListener() {
 		Addr:      addr,
 		Handler:   s.router,
 		TLSConfig: tlsCfg,
+		ErrorLog:  newFilteredErrorLogger(),
 	}
 
 	go func() {

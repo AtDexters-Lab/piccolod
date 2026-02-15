@@ -1,6 +1,7 @@
 package mdns
 
 import (
+	"errors"
 	"log"
 	"net"
 	"strings"
@@ -193,8 +194,12 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 
 	// Only validate queries - skip validation for responses
 	if err := m.validateDNSMessage(&msg); err != nil {
-		atomic.AddUint64(&state.ErrorCount, 1)
-		log.Printf("SECURITY: [%s] Invalid DNS query from %s: %v", state.Interface.Name, clientAddr.IP, err)
+		if errors.Is(err, errNonLocalQuery) {
+			log.Printf("DEBUG: [%s] Ignored non-local query from %s: %v", state.Interface.Name, clientAddr.IP, err)
+		} else {
+			atomic.AddUint64(&state.ErrorCount, 1)
+			log.Printf("SECURITY: [%s] Invalid DNS query from %s: %v", state.Interface.Name, clientAddr.IP, err)
+		}
 		return
 	}
 

@@ -12,7 +12,18 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"piccolod/internal/events"
 )
+
+func newTestBus() *events.Bus { return events.NewBus() }
+
+func unlockEvent() events.Event {
+	return events.Event{
+		Topic:   events.TopicLockStateChanged,
+		Payload: events.LockStateChanged{Locked: false},
+	}
+}
 
 func TestIsBlockedIP(t *testing.T) {
 	tests := []struct {
@@ -437,6 +448,131 @@ func TestSSRFBlocked_Loopback(t *testing.T) {
 	}
 	if !errors.Is(err, ErrSSRFBlocked) {
 		t.Fatalf("expected ErrSSRFBlocked, got: %v", err)
+	}
+}
+
+func TestEnsureCacheDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "catalog")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &Manager{cacheDir: cacheDir, lifecycleCtx: ctx, lifecycleStop: cancel, iconSemaphore: make(chan struct{}, 3)}
+
+	// First call: creates dirs
+	if err := m.EnsureCacheDir(); err != nil {
+		t.Fatalf("EnsureCacheDir() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "icons")); err != nil {
+		t.Fatalf("icons dir not created: %v", err)
+	}
+
+	// Second call: idempotent (no-op)
+	if err := m.EnsureCacheDir(); err != nil {
+		t.Fatalf("second EnsureCacheDir() error = %v", err)
+	}
+}
+
+func TestEnsureCacheDir_EmptyCacheDir(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &Manager{cacheDir: "", lifecycleCtx: ctx, lifecycleStop: cancel, iconSemaphore: make(chan struct{}, 3)}
+	if err := m.EnsureCacheDir(); err != nil {
+		t.Fatalf("EnsureCacheDir() on empty cacheDir should be nil, got %v", err)
+	}
+}
+
+func TestObserveLockState_CreatesDirOnUnlock(t *testing.T) {
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "catalog")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &Manager{
+		cacheDir:       cacheDir,
+		repoURL:        "http://127.0.0.1:1", // unreachable, index refresh will fail
+		httpClient:     &http.Client{Timeout: 100 * time.Millisecond},
+		iconHTTPClient: &http.Client{Timeout: 100 * time.Millisecond},
+		lifecycleCtx:   ctx,
+		lifecycleStop:  cancel,
+		iconSemaphore:  make(chan struct{}, 3),
+	}
+
+	bus := newTestBus()
+	m.ObserveLockState(bus)
+	defer m.Stop()
+
+	// Publish unlock event
+	bus.Publish(unlockEvent())
+
+	// Wait for the goroutine to process
+	time.Sleep(200 * time.Millisecond)
+
+	if _, err := os.Stat(filepath.Join(cacheDir, "icons")); err != nil {
+		t.Fatalf("cache dir not created after unlock: %v", err)
+	}
+}
+
+func TestGetIconByName_ConcurrencySemaphore(t *testing.T) {
+	var inFlight int32
+	var maxInFlight int32
+	pngData := []byte{0x89, 'P', 'N', 'G'}
+
+	var iconServerURL string
+	iconServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := atomic.AddInt32(&inFlight, 1)
+		defer atomic.AddInt32(&inFlight, -1)
+		// Track max concurrent
+		for {
+			old := atomic.LoadInt32(&maxInFlight)
+			if cur <= old || atomic.CompareAndSwapInt32(&maxInFlight, old, cur) {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond) // slow server
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(pngData)
+	}))
+	defer iconServer.Close()
+	iconServerURL = iconServer.URL
+
+	// Build catalog with 8 apps
+	var apps strings.Builder
+	apps.WriteString("apps:\n")
+	for i := 0; i < 8; i++ {
+		apps.WriteString("  - name: app" + string(rune('a'+i)) + "\n")
+		apps.WriteString("    icon: " + iconServerURL + "/icon.png\n")
+		apps.WriteString("    description: test\n")
+	}
+
+	catalogServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-yaml")
+		w.Write([]byte(apps.String()))
+	}))
+	defer catalogServer.Close()
+
+	tmpDir := t.TempDir()
+	m := NewManager(catalogServer.URL, tmpDir)
+	m.iconHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
+	// Launch 8 concurrent icon fetches
+	ctx := context.Background()
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		name := "app" + string(rune('a'+i))
+		go func() {
+			_, err := m.GetIconByName(ctx, name)
+			errs <- err
+		}()
+	}
+	for i := 0; i < 8; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("GetIconByName error: %v", err)
+		}
+	}
+
+	got := atomic.LoadInt32(&maxInFlight)
+	if got > int32(MaxConcurrentIconFetches) {
+		t.Errorf("max in-flight = %d, want <= %d", got, MaxConcurrentIconFetches)
 	}
 }
 

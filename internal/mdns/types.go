@@ -7,6 +7,12 @@ import (
 	"time"
 )
 
+// failedSetupInfo tracks retry state for interfaces that failed setup.
+type failedSetupInfo struct {
+	LastAttempt time.Time
+	Attempts    int
+}
+
 // InterfaceState tracks the state of a network interface for mDNS
 type InterfaceState struct {
 	Interface *net.Interface
@@ -165,7 +171,7 @@ type Manager struct {
 	announcePending       bool
 
 	// Failed interface setup tracking (prevents log spam from repeated failures)
-	failedSetups map[string]time.Time
+	failedSetups map[string]*failedSetupInfo
 
 	// Recovery cooldown tracking (prevents rapid recovery loops)
 	recoveryCooldowns map[string]time.Time

@@ -281,7 +281,7 @@ func TestCheckInterfaceChanges_FailedSetupCooldown(t *testing.T) {
 	manager.mutex.RLock()
 	_, eth0Exists := manager.interfaces["eth0"]
 	_, wlan0Exists := manager.interfaces["wlan0"]
-	failedTime, wlan0Failed := manager.failedSetups["wlan0"]
+	failedInfo, wlan0Failed := manager.failedSetups["wlan0"]
 	manager.mutex.RUnlock()
 
 	if !eth0Exists {
@@ -293,7 +293,7 @@ func TestCheckInterfaceChanges_FailedSetupCooldown(t *testing.T) {
 	if !wlan0Failed {
 		t.Fatal("wlan0 should be in failedSetups")
 	}
-	if time.Since(failedTime) > time.Second {
+	if time.Since(failedInfo.LastAttempt) > time.Second {
 		t.Fatal("failedSetups timestamp should be recent")
 	}
 
@@ -301,13 +301,13 @@ func TestCheckInterfaceChanges_FailedSetupCooldown(t *testing.T) {
 	manager.checkInterfaceChanges()
 
 	manager.mutex.RLock()
-	failedTime2, wlan0StillFailed := manager.failedSetups["wlan0"]
+	failedInfo2, wlan0StillFailed := manager.failedSetups["wlan0"]
 	manager.mutex.RUnlock()
 
 	if !wlan0StillFailed {
 		t.Fatal("wlan0 should still be in failedSetups after second check")
 	}
-	if failedTime2 != failedTime {
+	if failedInfo2.LastAttempt != failedInfo.LastAttempt {
 		t.Fatal("failedSetups timestamp should not change during cooldown (setup not re-attempted)")
 	}
 }
@@ -337,21 +337,27 @@ func TestCheckInterfaceChanges_FailedSetupRetryAfterCooldown(t *testing.T) {
 
 	// Backdate the failure timestamp to simulate cooldown expiry
 	manager.mutex.Lock()
-	manager.failedSetups["wlan0"] = time.Now().Add(-failedSetupCooldown - time.Second)
+	manager.failedSetups["wlan0"] = &failedSetupInfo{
+		LastAttempt: time.Now().Add(-failedSetupInitialCooldown - time.Second),
+		Attempts:    0,
+	}
 	manager.mutex.Unlock()
 
 	// Second call: cooldown expired, should retry (and fail again with new timestamp)
 	manager.checkInterfaceChanges()
 
 	manager.mutex.RLock()
-	failedTime, exists := manager.failedSetups["wlan0"]
+	info, exists := manager.failedSetups["wlan0"]
 	manager.mutex.RUnlock()
 
 	if !exists {
 		t.Fatal("wlan0 should still be in failedSetups after retry failure")
 	}
-	if time.Since(failedTime) > time.Second {
+	if time.Since(info.LastAttempt) > time.Second {
 		t.Fatal("failedSetups timestamp should be updated after retry")
+	}
+	if info.Attempts != 1 {
+		t.Fatalf("failedSetups attempts should be 1 after retry, got %d", info.Attempts)
 	}
 }
 
@@ -435,7 +441,10 @@ func TestCheckInterfaceChanges_SuccessAfterFailure(t *testing.T) {
 
 	// Backdate cooldown and give wlan0 an address
 	manager.mutex.Lock()
-	manager.failedSetups["wlan0"] = time.Now().Add(-failedSetupCooldown - time.Second)
+	manager.failedSetups["wlan0"] = &failedSetupInfo{
+		LastAttempt: time.Now().Add(-failedSetupInitialCooldown - time.Second),
+		Attempts:    0,
+	}
 	manager.mutex.Unlock()
 
 	interfaceFuncsMu.Lock()
@@ -524,6 +533,26 @@ func TestCheckInterfaceChanges_AnnouncesOnNewInterface(t *testing.T) {
 
 	// The announcement goroutine is wg-tracked and completes during manager.Stop().
 	// The wlan0 addition to m.interfaces (the key assertion) is synchronous.
+}
+
+func TestFailedSetupBackoff(t *testing.T) {
+	tests := []struct {
+		attempts int
+		expected time.Duration
+	}{
+		{0, 30 * time.Second},
+		{1, 60 * time.Second},
+		{2, 120 * time.Second},
+		{3, 240 * time.Second},
+		{4, 5 * time.Minute},
+		{100, 5 * time.Minute},
+	}
+	for _, tt := range tests {
+		got := failedSetupBackoff(tt.attempts)
+		if got != tt.expected {
+			t.Errorf("failedSetupBackoff(%d) = %v, want %v", tt.attempts, got, tt.expected)
+		}
+	}
 }
 
 func TestIsVirtualInterface(t *testing.T) {

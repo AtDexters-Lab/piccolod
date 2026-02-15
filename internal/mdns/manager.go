@@ -88,7 +88,7 @@ func NewManager() *Manager {
 		appHostLabels: make(map[string][]string),
 
 		// Failed interface setup tracking
-		failedSetups: make(map[string]time.Time),
+		failedSetups: make(map[string]*failedSetupInfo),
 
 		// Recovery cooldown tracking
 		recoveryCooldowns: make(map[string]time.Time),

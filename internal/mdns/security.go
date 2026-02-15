@@ -1,12 +1,17 @@
 package mdns
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
 
 	"github.com/miekg/dns"
 )
+
+// errNonLocalQuery is a sentinel error for queries targeting non-.local domains.
+// These are benign (router noise) and should not increment error counters.
+var errNonLocalQuery = errors.New("non-local query")
 
 // validatePacket performs security validation on incoming packets
 func (m *Manager) validatePacket(data []byte) error {
@@ -63,7 +68,7 @@ func (m *Manager) validateDNSMessage(msg *dns.Msg) error {
 
 		// Validate hostname - must be in .local domain for mDNS
 		if !strings.HasSuffix(q.Name, ".local.") {
-			return fmt.Errorf("non-local query: %s", q.Name)
+			return fmt.Errorf("%w: %s", errNonLocalQuery, q.Name)
 		}
 
 		if len(q.Name) > 253 { // DNS name length limit
