@@ -69,28 +69,7 @@ class SystemTab extends StatelessWidget {
                   _InfoRow("Current Version", update.currentVersion),
                   _InfoRow("Last Checked", _formatDate(update.lastChecked)),
                   const Divider(height: 32),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text("Diagnostic Log", style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold)),
-                            const SizedBox(height: 4),
-                            Text(
-                              "Download a redacted system log for bug reporting.",
-                              style: PiccoloTheme.textTheme.labelSmall,
-                            ),
-                          ],
-                        ),
-                      ),
-                      OutlinedButton.icon(
-                        onPressed: controller.downloadDiagnosticLog,
-                        icon: const Icon(Icons.download, size: 18),
-                        label: const Text("Download"),
-                      ),
-                    ],
-                  ),
+                  _DiagnosticLogSection(controller: controller),
                   const Divider(height: 32),
                   Row(
                     children: [
@@ -632,6 +611,158 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _DiagnosticLogSection extends StatefulWidget {
+  final SettingsController controller;
+
+  const _DiagnosticLogSection({required this.controller});
+
+  @override
+  State<_DiagnosticLogSection> createState() => _DiagnosticLogSectionState();
+}
+
+class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
+  late DateTime _from;
+  late DateTime _to;
+
+  @override
+  void initState() {
+    super.initState();
+    final now = DateTime.now();
+    _to = DateTime(now.year, now.month, now.day);
+    // 2-day difference = 3 inclusive calendar dates, matching backend's diagnosticDefaultDays=3
+    _from = _to.subtract(const Duration(days: 2));
+  }
+
+  Future<void> _pickDate({required bool isFrom}) async {
+    final now = DateTime.now();
+    final initial = isFrom ? _from : _to;
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: now.subtract(const Duration(days: 90)),
+      lastDate: now,
+    );
+    if (picked == null || !mounted) return;
+
+    setState(() {
+      if (isFrom) {
+        _from = picked;
+        // Clamp: if from is after to, move to forward
+        if (_from.isAfter(_to)) _to = _from;
+        // Clamp: max 7 inclusive calendar days = 6-day difference
+        if (_to.difference(_from).inDays > 6) {
+          _to = _from.add(const Duration(days: 6));
+        }
+      } else {
+        _to = picked;
+        // Clamp: if to is before from, move from back
+        if (_to.isBefore(_from)) _from = _to;
+        // Clamp: max 7 inclusive calendar days = 6-day difference
+        if (_to.difference(_from).inDays > 6) {
+          _from = _to.subtract(const Duration(days: 6));
+        }
+      }
+    });
+  }
+
+  String _formatDate(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("Diagnostic Log",
+                      style: PiccoloTheme.textTheme.bodyMedium
+                          ?.copyWith(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  Text(
+                    "Download a redacted system log for bug reporting.",
+                    style: PiccoloTheme.textTheme.labelSmall,
+                  ),
+                ],
+              ),
+            ),
+            OutlinedButton.icon(
+              onPressed: () => widget.controller
+                  .downloadDiagnosticLog(from: _from, to: _to),
+              icon: const Icon(Icons.download, size: 18),
+              label: const Text("Download"),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            _DateChip(
+              label: "From",
+              value: _formatDate(_from),
+              onTap: () => _pickDate(isFrom: true),
+            ),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 8),
+              child: Text("—", style: TextStyle(color: PiccoloTheme.inkMuted)),
+            ),
+            _DateChip(
+              label: "To",
+              value: _formatDate(_to),
+              onTap: () => _pickDate(isFrom: false),
+            ),
+            const SizedBox(width: 8),
+            Text("(max 7 days)", style: PiccoloTheme.textTheme.labelSmall),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+class _DateChip extends StatelessWidget {
+  final String label;
+  final String value;
+  final VoidCallback onTap;
+
+  const _DateChip({
+    required this.label,
+    required this.value,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: PiccoloTheme.ink.withValues(alpha: 0.1)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text("$label: ",
+                style: PiccoloTheme.textTheme.labelSmall),
+            Text(value,
+                style: PiccoloTheme.textTheme.bodyMedium
+                    ?.copyWith(fontWeight: FontWeight.w500)),
+            const SizedBox(width: 4),
+            const Icon(Icons.calendar_today, size: 14, color: PiccoloTheme.inkMuted),
+          ],
+        ),
       ),
     );
   }

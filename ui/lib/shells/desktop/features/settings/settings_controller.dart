@@ -216,11 +216,19 @@ class SettingsController extends ChangeNotifier {
      }
   }
   
-  void downloadDiagnosticLog() {
-    downloader.downloadFromUrl(
-      '${CoreConfig.apiBaseUrl}/api/v1/system/admin/diagnostic-log',
-      'piccolod-diagnostic.log',
-    );
+  void downloadDiagnosticLog({DateTime? from, DateTime? to}) {
+    String formatDate(DateTime d) =>
+        '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+    final params = <String, String>{};
+    if (from != null) params['from'] = formatDate(from);
+    if (to != null) params['to'] = formatDate(to);
+
+    final uri = Uri.parse(
+        '${CoreConfig.apiBaseUrl}/api/v1/system/admin/diagnostic-log')
+      .replace(queryParameters: params.isNotEmpty ? params : null);
+
+    downloader.downloadFromUrl(uri.toString(), 'piccolod-diagnostic.log');
   }
 
   Future<void> downloadCACertificate() async {
