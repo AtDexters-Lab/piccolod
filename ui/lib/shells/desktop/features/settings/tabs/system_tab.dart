@@ -628,6 +628,8 @@ class _DiagnosticLogSection extends StatefulWidget {
 class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
   late DateTime _from;
   late DateTime _to;
+  // null = collapsed, true = from picker, false = to picker
+  bool? _activePicker;
 
   @override
   void initState() {
@@ -638,21 +640,17 @@ class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
     _from = _to.subtract(const Duration(days: 2));
   }
 
-  Future<void> _pickDate({required bool isFrom}) async {
-    final now = DateTime.now();
-    final initial = isFrom ? _from : _to;
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: initial,
-      firstDate: now.subtract(const Duration(days: 90)),
-      lastDate: now,
-    );
-    if (picked == null || !mounted) return;
+  void _togglePicker(bool isFrom) {
+    setState(() {
+      _activePicker = (_activePicker == isFrom) ? null : isFrom;
+    });
+  }
 
+  void _onDateSelected(DateTime picked) {
+    final isFrom = _activePicker == true;
     setState(() {
       if (isFrom) {
         _from = picked;
-        // Clamp: if from is after to, move to forward
         if (_from.isAfter(_to)) _to = _from;
         // Clamp: max 7 inclusive calendar days = 6-day difference
         if (_to.difference(_from).inDays > 6) {
@@ -660,21 +658,32 @@ class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
         }
       } else {
         _to = picked;
-        // Clamp: if to is before from, move from back
         if (_to.isBefore(_from)) _from = _to;
         // Clamp: max 7 inclusive calendar days = 6-day difference
         if (_to.difference(_from).inDays > 6) {
           _from = _to.subtract(const Duration(days: 6));
         }
       }
+      _activePicker = null;
     });
   }
 
   String _formatDate(DateTime d) =>
       '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
+  /// Clamp [d] into [earliest..latest] so CalendarDatePicker never asserts.
+  DateTime _clampDate(DateTime d, DateTime earliest, DateTime latest) {
+    if (d.isBefore(earliest)) return earliest;
+    if (d.isAfter(latest)) return latest;
+    return d;
+  }
+
   @override
   Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final firstDate = today.subtract(const Duration(days: 90));
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -709,7 +718,8 @@ class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
             _DateChip(
               label: "From",
               value: _formatDate(_from),
-              onTap: () => _pickDate(isFrom: true),
+              isActive: _activePicker == true,
+              onTap: () => _togglePicker(true),
             ),
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 8),
@@ -718,11 +728,36 @@ class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
             _DateChip(
               label: "To",
               value: _formatDate(_to),
-              onTap: () => _pickDate(isFrom: false),
+              isActive: _activePicker == false,
+              onTap: () => _togglePicker(false),
             ),
             const SizedBox(width: 8),
             Text("(max 7 days)", style: PiccoloTheme.textTheme.labelSmall),
           ],
+        ),
+        AnimatedSize(
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeInOut,
+          alignment: Alignment.topLeft,
+          child: _activePicker != null
+              ? Align(
+                  alignment: Alignment.centerLeft,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 320),
+                    child: CalendarDatePicker(
+                      key: ValueKey(_activePicker),
+                      initialDate: _clampDate(
+                        _activePicker == true ? _from : _to,
+                        firstDate,
+                        today,
+                      ),
+                      firstDate: firstDate,
+                      lastDate: today,
+                      onDateChanged: _onDateSelected,
+                    ),
+                  ),
+                )
+              : const SizedBox.shrink(),
         ),
       ],
     );
@@ -732,11 +767,13 @@ class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
 class _DateChip extends StatelessWidget {
   final String label;
   final String value;
+  final bool isActive;
   final VoidCallback onTap;
 
   const _DateChip({
     required this.label,
     required this.value,
+    required this.isActive,
     required this.onTap,
   });
 
@@ -749,7 +786,14 @@ class _DateChip extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: PiccoloTheme.ink.withValues(alpha: 0.1)),
+          border: Border.all(
+            color: isActive
+                ? PiccoloTheme.cobalt600
+                : PiccoloTheme.ink.withValues(alpha: 0.1),
+          ),
+          color: isActive
+              ? PiccoloTheme.cobalt600.withValues(alpha: 0.05)
+              : null,
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
@@ -760,7 +804,11 @@ class _DateChip extends StatelessWidget {
                 style: PiccoloTheme.textTheme.bodyMedium
                     ?.copyWith(fontWeight: FontWeight.w500)),
             const SizedBox(width: 4),
-            const Icon(Icons.calendar_today, size: 14, color: PiccoloTheme.inkMuted),
+            Icon(
+              isActive ? Icons.expand_less : Icons.calendar_today,
+              size: 14,
+              color: isActive ? PiccoloTheme.cobalt600 : PiccoloTheme.inkMuted,
+            ),
           ],
         ),
       ),
