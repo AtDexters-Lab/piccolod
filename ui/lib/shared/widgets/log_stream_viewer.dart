@@ -4,10 +4,12 @@ import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import '../../core/config/core_config.dart';
+import '../../core/services/error_reporter.dart';
 import '../../core/services/log_stream_backend.dart';
 import '../../core/services/websocket_connection.dart';
 import '../../core/utils/clipboard/clipboard.dart' as clipboard_utils;
 import '../../theme/piccolo_theme.dart';
+import 'render_error_boundary.dart';
 
 class LogStreamViewer extends StatefulWidget {
   final String? appName;
@@ -253,37 +255,49 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
 
   @override
   Widget build(BuildContext context) {
-    // Terminal body with RepaintBoundary for paint isolation
-    final terminalBody = RepaintBoundary(
-      child: Container(
-        color: const Color(0xFF1E1E1E),
-        child: Scrollbar(
-          controller: _scrollController,
-          thumbVisibility: true,
-          child: CallbackShortcuts(
-            bindings: {
-              // Ctrl+Shift+C - explicit copy (Linux terminal convention)
-              const SingleActivator(LogicalKeyboardKey.keyC, control: true, shift: true):
-                  _handleCopyShortcut,
-              // Ctrl+C to copy selected text (Linux/Windows)
-              const SingleActivator(LogicalKeyboardKey.keyC, control: true):
-                  _handleCopyShortcut,
-              // Cmd+C on macOS
-              const SingleActivator(LogicalKeyboardKey.keyC, meta: true):
-                  _handleCopyShortcut,
-            },
-            child: TerminalView(
-              _terminal,
-              controller: _controller,
-              scrollController: _scrollController,
-              textStyle: const TerminalStyle(
-                fontFamily: 'JetBrainsMono',
-                height: 1.2,
+    // Terminal body with RepaintBoundary for paint isolation,
+    // wrapped in RenderErrorBoundary for rendering error recovery.
+    final terminalBody = RenderErrorBoundary(
+      maxRetries: 3,
+      onError: (error) => ErrorReporter().report(
+        type: 'render_error',
+        message: 'Log viewer render error: $error',
+        stack: error is Error ? error.stackTrace?.toString() : null,
+      ),
+      onRetry: _connect,
+      fallbackBuilder: (error, retry) =>
+          RenderErrorFallback(label: 'Log viewer', retry: retry),
+      child: RepaintBoundary(
+        child: Container(
+          color: const Color(0xFF1E1E1E),
+          child: Scrollbar(
+            controller: _scrollController,
+            thumbVisibility: true,
+            child: CallbackShortcuts(
+              bindings: {
+                // Ctrl+Shift+C - explicit copy (Linux terminal convention)
+                const SingleActivator(LogicalKeyboardKey.keyC, control: true, shift: true):
+                    _handleCopyShortcut,
+                // Ctrl+C to copy selected text (Linux/Windows)
+                const SingleActivator(LogicalKeyboardKey.keyC, control: true):
+                    _handleCopyShortcut,
+                // Cmd+C on macOS
+                const SingleActivator(LogicalKeyboardKey.keyC, meta: true):
+                    _handleCopyShortcut,
+              },
+              child: TerminalView(
+                _terminal,
+                controller: _controller,
+                scrollController: _scrollController,
+                textStyle: const TerminalStyle(
+                  fontFamily: 'JetBrainsMono',
+                  height: 1.2,
+                ),
+                padding: const EdgeInsets.all(12.0),
+                autofocus: false,
+                onSecondaryTapDown: (details, cell) =>
+                    _showContextMenu(details.globalPosition),
               ),
-              padding: const EdgeInsets.all(12.0),
-              autofocus: false,
-              onSecondaryTapDown: (details, cell) =>
-                  _showContextMenu(details.globalPosition),
             ),
           ),
         ),
