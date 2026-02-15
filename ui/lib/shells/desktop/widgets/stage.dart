@@ -298,6 +298,7 @@ class _StageState extends State<Stage> {
       context,
       appDisplayTitle: app.displayTitle,
     );
+    if (!mounted) return;
 
     if (confirmed == true) {
       final ok = await runWithProgressDialog(

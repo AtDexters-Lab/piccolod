@@ -652,11 +652,14 @@ class _SettingsDiskTile extends StatelessWidget {
           ),
           child: Row(
             children: [
-              Radio<bool>(
-                value: true,
+              RadioGroup<bool>(
                 groupValue: isSelected ? true : null,
-                onChanged: onTap != null ? (_) => onTap!() : null,
-                activeColor: PiccoloTheme.cobalt600,
+                onChanged: (_) => onTap?.call(),
+                child: Radio<bool>(
+                  value: true,
+                  activeColor: PiccoloTheme.cobalt600,
+                  enabled: onTap != null,
+                ),
               ),
               const SizedBox(width: 8),
               Expanded(

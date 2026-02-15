@@ -170,6 +170,7 @@ class AppLauncher {
       final detail = await appService.getAppDetail(app.name);
       if (!navigator.canPop()) return;
       navigator.pop(); // dismiss loading
+      if (!context.mounted) return;
 
       final health = detail.app.primaryListenerHealth;
       if (health == null) {
@@ -179,7 +180,7 @@ class AppLauncher {
             service.localUrl ??
             '';
         showDialog(
-          context: navigator.context,
+          context: context,
           builder: (_) => LocalFallbackOverlay(
             health: const ListenerHealth(
               status: 'recovering',
@@ -193,7 +194,7 @@ class AppLauncher {
       }
 
       _applyHealthGate(
-        context: navigator.context,
+        context: context,
         controller: controller,
         appService: appService,
         app: app,
@@ -205,13 +206,14 @@ class AppLauncher {
       );
     } catch (_) {
       if (navigator.canPop()) navigator.pop();
+      if (!context.mounted) return;
       // On fetch failure, show overlay rather than risk TLS error
       final fallbackUrl = service.lanFallbackUrl ??
           service.lanHostUrl ??
           service.localUrl ??
           '';
       showDialog(
-        context: navigator.context,
+        context: context,
         builder: (_) => LocalFallbackOverlay(
           health: const ListenerHealth(
             status: 'error',
