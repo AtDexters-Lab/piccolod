@@ -96,6 +96,9 @@ type GinServer struct {
 	secureListener net.Listener
 	securePort     int
 
+	// Precomputed ETags and cache policies for embedded web assets
+	staticCache *staticAssetCache
+
 	// Optional OpenAPI request validation (Phase 0)
 	apiValidator *openAPIValidator
 
@@ -765,6 +768,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	// Rehydrate proxies for containers that survived restarts
 	appMgr.RestoreServices(context.Background())
 
+	s.staticCache = newStaticAssetCache(webassets.FS, "web")
+
 	s.setupGinRoutes()
 	if err := s.initSecureLoopback(); err != nil {
 		return nil, fmt.Errorf("secure loopback init: %w", err)
@@ -1265,6 +1270,10 @@ func (s *GinServer) setupGinRoutes() {
 			fspath := "web" + requestedPath
 			if _, err := fs.Stat(webassets.FS, fspath); err != nil {
 				fspath = "web/entry.html"
+			}
+			if etag := s.staticCache.ETag(fspath); etag != "" {
+				c.Header("Cache-Control", cachePolicy(fspath))
+				c.Header("ETag", etag)
 			}
 			c.FileFromFS(fspath, http.FS(webassets.FS))
 		} else {
