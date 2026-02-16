@@ -159,6 +159,7 @@ type volumeEntry struct {
 	handle        VolumeHandle
 	cipherDir     string
 	stateDir      string
+	class         VolumeClass // set once at creation, never mutated
 	metadata      volumeMetadata
 	metadataReady bool
 	role          VolumeRole
@@ -281,7 +282,7 @@ func inferVolumeClass(id string) VolumeClass {
 	if strings.HasPrefix(id, "app-") {
 		return VolumeClassApplication
 	}
-	return VolumeClassControl // safe default
+	return VolumeClassControl // default: callers must follow naming conventions
 }
 
 // rootForClass returns the storage root for a given volume class.
@@ -359,6 +360,7 @@ func (f *fileVolumeManager) getOrCreateEntry(id string) *volumeEntry {
 		},
 		cipherDir: cipherDir,
 		stateDir:  stateDir,
+		class:     inferVolumeClass(id),
 	}
 	f.volumes[id] = entry
 	return entry
@@ -438,11 +440,67 @@ func (f *fileVolumeManager) ensureCipherDir(class VolumeClass, cipherDir string)
 	return nil
 }
 
+// ensureVolumePrerequisites performs idempotent setup for a volume entry:
+// creates the cipher dir, mount dir (with stale FUSE cleanup), applies the
+// immutable guard, and initializes metadata. Safe to call on every
+// EnsureVolume invocation — each operation early-exits if already done.
+//
+// Concurrency safety: callers hold entry.mountMu to serialize the
+// non-atomic stat-then-create in ensureCipherDir. Fields read from entry
+// (handle, cipherDir, class) are immutable after creation. ensureMetadata
+// serializes via entry.metaMu internally.
+func (f *fileVolumeManager) ensureVolumePrerequisites(ctx context.Context, entry *volumeEntry) error {
+	if err := f.ensureCipherDir(entry.class, entry.cipherDir); err != nil {
+		return fmt.Errorf("ensure volume %s ciphertext: %w", entry.handle.ID, err)
+	}
+	if err := os.MkdirAll(entry.handle.MountDir, 0o700); err != nil {
+		if mounted, mErr := isMountPoint(entry.handle.MountDir); mErr == nil && mounted {
+			log.Printf("WARN: volume %s: stale mount at %s during init, cleaning up", entry.handle.ID, entry.handle.MountDir)
+			if fErr := f.runner.Run(ctx, f.fusermountPath, []string{"-uz", entry.handle.MountDir}, nil); fErr != nil {
+				log.Printf("WARN: volume %s: fusermount cleanup failed: %v", entry.handle.ID, fErr)
+			}
+			if shouldGuardMountDir(entry.handle.ID) {
+				_ = unprotectMountDir(entry.handle.MountDir)
+			}
+			err = os.MkdirAll(entry.handle.MountDir, 0o700)
+		}
+		if err != nil {
+			return fmt.Errorf("ensure volume %s mount: %w", entry.handle.ID, err)
+		}
+	}
+	if shouldGuardMountDir(entry.handle.ID) && !f.bypassMount {
+		if mounted, err := isMountPoint(entry.handle.MountDir); err == nil && !mounted {
+			if err := protectMountDir(entry.handle.MountDir); err != nil {
+				log.Printf("WARN: volume %s: failed to protect mountpoint: %v", entry.handle.ID, err)
+			}
+		}
+	}
+	if err := f.ensureMetadata(ctx, entry); err != nil {
+		if !errors.Is(err, crypt.ErrLocked) && !errors.Is(err, crypt.ErrNotInitialized) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (f *fileVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest) (VolumeHandle, error) {
 	f.mu.Lock()
 	entry, ok := f.volumes[req.ID]
 	if ok {
 		f.mu.Unlock()
+		// Warn-only, not an error: inferVolumeClass (used by getOrCreateEntry)
+		// and req.Class are always consistent for current ID conventions.
+		// Erroring here would break reconcile-then-EnsureVolume flows where
+		// the entry was pre-registered with the inferred class.
+		if entry.class != req.Class && req.Class != "" {
+			log.Printf("WARN: volume %s: class mismatch: entry=%s req=%s", req.ID, entry.class, req.Class)
+		}
+		entry.mountMu.Lock()
+		err := f.ensureVolumePrerequisites(ctx, entry)
+		entry.mountMu.Unlock()
+		if err != nil {
+			return entry.handle, err
+		}
 		if err := f.reconcileVolumeState(ctx, entry); err != nil {
 			return entry.handle, err
 		}
@@ -456,6 +514,7 @@ func (f *fileVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 		handle:    VolumeHandle{ID: req.ID, MountDir: mountDir},
 		cipherDir: cipherDir,
 		stateDir:  stateDir,
+		class:     req.Class,
 	}
 	f.volumes[req.ID] = entry
 	f.mu.Unlock()
@@ -473,38 +532,11 @@ func (f *fileVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 		}
 	}()
 
-	if err := f.ensureCipherDir(req.Class, cipherDir); err != nil {
-		return VolumeHandle{}, fmt.Errorf("ensure volume %s ciphertext: %w", req.ID, err)
-	}
-	if err := os.MkdirAll(mountDir, 0o700); err != nil {
-		// MkdirAll can fail on a stale FUSE inode left by a previous crash.
-		// If the path is still a mountpoint, lazy-unmount and retry.
-		if mounted, mErr := isMountPoint(mountDir); mErr == nil && mounted {
-			log.Printf("WARN: volume %s: stale mount at %s during init, cleaning up", req.ID, mountDir)
-			if fErr := f.runner.Run(ctx, f.fusermountPath, []string{"-uz", mountDir}, nil); fErr != nil {
-				log.Printf("WARN: volume %s: fusermount cleanup failed: %v", req.ID, fErr)
-			}
-			if shouldGuardMountDir(req.ID) {
-				_ = unprotectMountDir(mountDir)
-			}
-			err = os.MkdirAll(mountDir, 0o700)
-		}
-		if err != nil {
-			return VolumeHandle{}, fmt.Errorf("ensure volume %s mount: %w", req.ID, err)
-		}
-	}
-	if shouldGuardMountDir(req.ID) && !f.bypassMount {
-		if mounted, err := isMountPoint(mountDir); err == nil && !mounted {
-			if err := protectMountDir(mountDir); err != nil {
-				log.Printf("WARN: volume %s: failed to protect mountpoint: %v", req.ID, err)
-			}
-		}
-	}
-
-	if err := f.ensureMetadata(ctx, entry); err != nil {
-		if !errors.Is(err, crypt.ErrLocked) && !errors.Is(err, crypt.ErrNotInitialized) {
-			return VolumeHandle{}, err
-		}
+	entry.mountMu.Lock()
+	err := f.ensureVolumePrerequisites(ctx, entry)
+	entry.mountMu.Unlock()
+	if err != nil {
+		return VolumeHandle{}, err
 	}
 
 	initOK = true

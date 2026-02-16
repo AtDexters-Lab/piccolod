@@ -120,9 +120,10 @@ func newSQLiteControlStore(stateDir string, kp keyProvider) (*sqliteControlStore
 	// mountDir is created later by EnsureVolume — not here — to avoid
 	// MkdirAll failing on a stale FUSE inode from a previous crash.
 	metaDir := filepath.Join(base, "volumes", "control-plane")
-	if err := os.MkdirAll(metaDir, 0o700); err != nil {
-		return nil, err
-	}
+	// metaDir is created on-demand by ensureMetadata / writeVolumeState
+	// (via EnsureVolume). Creating it here would cause
+	// reconcileAllVolumeStates to pre-register the control-plane entry,
+	// making EnsureVolume's early-return path skip ensureCipherDir.
 	store := &sqliteControlStore{
 		path:               filepath.Join(mountDir, "control.db"),
 		mountDir:           mountDir,

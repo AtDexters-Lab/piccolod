@@ -34,6 +34,7 @@ func TestServerStartup_WithBlockingWatchdog(t *testing.T) {
 	// Setup temp state dir
 	tmpDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tmpDir)
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1") // bypass btrfs for control-plane cipher dir
 
 	// Set a random port to avoid conflicts
 	t.Setenv("PORT", "0")
