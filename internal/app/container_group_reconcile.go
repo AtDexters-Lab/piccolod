@@ -74,10 +74,41 @@ func (m *AppManager) handleStartupFailure(state *FilesystemStateManager, appInst
 	return status
 }
 
-// recoverStaleAnchor handles recovery when the network anchor has a stale network namespace.
+// recreateServiceContainer removes a broken service container and recreates it with the current anchor.
+// The caller is responsible for logging context and handling failure escalation.
+// On success the new container ID is stored in appInst.Containers and persisted.
+func (m *AppManager) recreateServiceContainer(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, runtime container.PodmanRuntime, oldCID string, opts serviceContainerOptions) error {
+	svcName := opts.svcName
+
+	// Remove the broken container
+	if removeErr := m.containerManager.RemoveContainer(ctx, runtime, oldCID); removeErr != nil {
+		log.Printf("WARN: app %s: remove failed service '%s': %v",
+			appInst.InstanceID, svcName, removeErr)
+	}
+	delete(appInst.Containers, svcName)
+	if err := state.StoreAppMetadata(appInst); err != nil {
+		log.Printf("WARN: app %s: failed to persist deleted container: %v",
+			appInst.InstanceID, err)
+	}
+
+	newCID, createErr := m.createAndStartServiceContainer(ctx, runtime, opts)
+	if createErr != nil {
+		return fmt.Errorf("failed to recreate service '%s': %w", svcName, createErr)
+	}
+
+	appInst.Containers[svcName] = newCID
+	if err := state.StoreAppMetadata(appInst); err != nil {
+		log.Printf("WARN: app %s: failed to persist recreated container: %v",
+			appInst.InstanceID, err)
+	}
+	return nil
+}
+
+// recoverStaleAnchor handles recovery when the network anchor cannot be started.
 // It stops and removes all containers, clears state, and recreates the entire container group.
+// This covers stale runtime state after reboot, dead network namespaces, corrupted containers, etc.
 func (m *AppManager) recoverStaleAnchor(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, reason string) error {
-	log.Printf("INFO: reconcile app %s: %s", appInst.InstanceID, reason)
+	log.Printf("INFO: app %s: %s", appInst.InstanceID, reason)
 
 	// Stop and remove with strict error handling.
 	// If stop/remove fails (e.g. unkillable zombie), abort recreation to avoid
@@ -94,7 +125,7 @@ func (m *AppManager) recoverStaleAnchor(ctx context.Context, state *FilesystemSt
 	appInst.NetworkAnchorID = ""
 	appInst.Containers = nil
 	if err := state.StoreAppMetadata(appInst); err != nil {
-		log.Printf("WARN: reconcile app %s: failed to persist cleared state: %v", appInst.InstanceID, err)
+		log.Printf("WARN: app %s: failed to persist cleared state: %v", appInst.InstanceID, err)
 	}
 
 	return m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime)
@@ -239,19 +270,15 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	// Ensure anchor running.
 	if !anchorState.Running {
 		if err := m.containerManager.StartContainer(ctx, runtime, anchorID); err != nil {
-			// If anchor has stale netns, recreate the entire container group
-			var staleErr *container.StaleNetworkNamespaceError
-			if errors.As(err, &staleErr) {
-				m.setObservedStatusMessage(appInst.InstanceID, "Stale network detected, recreating")
-				if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-					"anchor has stale network namespace, recreating container group"); recoverErr != nil {
-					m.handleStartupFailure(state, appInst)
-					return recoverErr
-				}
-				return nil
+			// Container can't start — remove and recreate the entire group.
+			// Covers all stale state: reboot (wiped /run/), dead netns, corrupted runtime, etc.
+			m.setObservedStatusMessage(appInst.InstanceID, "Container start failed, recreating")
+			if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
+				fmt.Sprintf("anchor start failed (%v), recreating container group", err)); recoverErr != nil {
+				m.handleStartupFailure(state, appInst)
+				return recoverErr
 			}
-			m.handleStartupFailure(state, appInst)
-			return fmt.Errorf("failed to start network anchor: %w", err)
+			return nil
 		}
 	}
 
@@ -333,68 +360,30 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 		if !st.Running {
 			if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
-				// If service has stale netns, remove and recreate with current anchor
-				var staleErr *container.StaleNetworkNamespaceError
-				if errors.As(err, &staleErr) {
-					log.Printf("INFO: reconcile app %s: service '%s' has stale network namespace, recreating container", appInst.InstanceID, svcName)
-					m.setObservedStatusMessage(appInst.InstanceID, "Stale network detected, recreating")
+				log.Printf("INFO: reconcile app %s: service '%s' start failed (%v), recreating",
+					appInst.InstanceID, svcName, err)
+				m.setObservedStatusMessage(appInst.InstanceID, "Service start failed, recreating")
 
-					// Remove the stale container (with error logging)
-					if removeErr := m.containerManager.RemoveContainer(ctx, runtime, cid); removeErr != nil {
-						log.Printf("WARN: reconcile app %s: remove stale service '%s' failed: %v", appInst.InstanceID, svcName, removeErr)
-					}
-					delete(appInst.Containers, svcName)
-					if err := state.StoreAppMetadata(appInst); err != nil {
-						log.Printf("WARN: reconcile app %s: failed to persist deleted container: %v", appInst.InstanceID, err)
-					}
-
-					// Recreate the service container with current anchor
-					opts := serviceContainerOptions{
-						layout:     layout,
-						appDef:     def,
-						instanceID: appInst.InstanceID,
-						primary:    primary,
-						svcName:    svcName,
-						anchorID:   anchorID,
-					}
-					if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
-						opts.mergedRootfs = workspaceInfo.mergedPath
-						opts.workspaceMeta = workspaceInfo.meta
-					} else if mode == ModeWorkspace {
-						m.handleStartupFailure(state, appInst)
-						return fmt.Errorf("workspace mount info unavailable for service '%s' recreation after stale netns", svcName)
-					}
-
-					newCID, createErr := m.createAndStartServiceContainer(ctx, runtime, opts)
-					if createErr != nil {
-						// If anchor is stale (detected during service creation), recreate the whole group
-						var anchorStaleErr *container.StaleNetworkNamespaceError
-						if errors.As(createErr, &anchorStaleErr) {
-							if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-								fmt.Sprintf("anchor found stale during service '%s' recreation, recreating group", svcName)); recoverErr != nil {
-								m.handleStartupFailure(state, appInst)
-								return recoverErr
-							}
-							return nil
-						}
-
-						// Use existing escalation mechanism for retry limiting
-						m.handleStartupFailure(state, appInst)
-						return fmt.Errorf("failed to recreate service '%s' after stale netns: %w", svcName, createErr)
-					}
-
-					if appInst.Containers == nil {
-						appInst.Containers = make(map[string]string)
-					}
-					appInst.Containers[svcName] = newCID
-					if err := state.StoreAppMetadata(appInst); err != nil {
-						log.Printf("WARN: reconcile app %s: failed to persist recreated container ID: %v", appInst.InstanceID, err)
-					}
-					continue
+				opts := serviceContainerOptions{
+					layout:     layout,
+					appDef:     def,
+					instanceID: appInst.InstanceID,
+					primary:    primary,
+					svcName:    svcName,
+					anchorID:   anchorID,
 				}
-
-				m.handleStartupFailure(state, appInst)
-				return fmt.Errorf("failed to start service '%s': %w", svcName, err)
+				if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
+					opts.mergedRootfs = workspaceInfo.mergedPath
+					opts.workspaceMeta = workspaceInfo.meta
+				} else if mode == ModeWorkspace {
+					m.handleStartupFailure(state, appInst)
+					return fmt.Errorf("workspace mount info unavailable for service '%s' recreation", svcName)
+				}
+				if err := m.recreateServiceContainer(ctx, state, appInst, runtime, cid, opts); err != nil {
+					m.handleStartupFailure(state, appInst)
+					return err
+				}
+				continue
 			}
 		}
 	}

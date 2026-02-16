@@ -83,8 +83,15 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 
 	// Start anchor first, then services in order.
 	if err := m.containerManager.StartContainer(ctx, runtime, anchorID); err != nil {
-		m.updateStatusWithEvent(appInst.InstanceID, StatusError)
-		return fmt.Errorf("failed to start network anchor: %w", err)
+		// Start failed — attempt recreation of the entire container group.
+		log.Printf("INFO: start %s: anchor start failed (%v), recreating", appInst.InstanceID, err)
+		if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
+			"anchor start failed during manual start, recreating"); recoverErr != nil {
+			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+			return recoverErr
+		}
+		m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
+		return nil
 	}
 
 	for _, svcName := range startOrder {
@@ -94,8 +101,32 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 			return fmt.Errorf("missing container ID for service '%s'", svcName)
 		}
 		if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
-			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
-			return fmt.Errorf("failed to start service '%s': %w", svcName, err)
+			log.Printf("INFO: start %s: service '%s' start failed (%v), recreating",
+				appInst.InstanceID, svcName, err)
+
+			opts := serviceContainerOptions{
+				layout:     layout,
+				appDef:     def,
+				instanceID: appInst.InstanceID,
+				primary:    primary,
+				svcName:    svcName,
+				anchorID:   anchorID,
+			}
+			if mode == ModeWorkspace {
+				wsInfo := m.getWorkspaceMountInfo(ctx, appInst.InstanceID)
+				if wsInfo != nil && wsInfo.mergedPath != "" && wsInfo.meta != nil {
+					opts.mergedRootfs = wsInfo.mergedPath
+					opts.workspaceMeta = wsInfo.meta
+				} else {
+					m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+					return fmt.Errorf("workspace mount info unavailable for service '%s' recreation", svcName)
+				}
+			}
+			if err := m.recreateServiceContainer(ctx, state, appInst, runtime, cid, opts); err != nil {
+				m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+				return err
+			}
+			continue
 		}
 	}
 
