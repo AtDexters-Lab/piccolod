@@ -631,3 +631,90 @@ func (s *lockingAuthStorage) isLocked() bool {
 	defer s.mu.RUnlock()
 	return s.locked
 }
+
+func TestRequireSession_SlidingSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := authpkg.NewSessionStore()
+
+	srv := &GinServer{sessions: store}
+	router := gin.New()
+	// Dummy authenticated endpoint behind requireSession.
+	router.GET("/test", srv.requireSession(), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	srv.router = router
+
+	t.Run("no_extension_within_first_75pct", func(t *testing.T) {
+		// Create session with full TTL (24h remaining).
+		sess := store.CreatePortalSession("u1", "admin", "admin", "", portalSessionTTL)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/test", nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sess.ID})
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		// No Set-Cookie expected — session is fresh.
+		for _, c := range w.Result().Cookies() {
+			if c.Name == sessionCookieName {
+				t.Fatalf("expected no session cookie renewal, but got one")
+			}
+		}
+	})
+
+	t.Run("extension_after_25pct_consumed", func(t *testing.T) {
+		// Create session, then manually age it so only ~17h remain (<18h threshold).
+		sess := store.CreatePortalSession("u2", "admin", "admin", "", portalSessionTTL)
+		// Set ExpiresAt to now + 17h (below the 75% = 18h threshold).
+		sess.ExpiresAt = time.Now().Unix() + 17*3600
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/test", nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sess.ID})
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		// Set-Cookie expected — session was extended.
+		found := false
+		for _, c := range w.Result().Cookies() {
+			if c.Name == sessionCookieName && c.Value == sess.ID {
+				found = true
+				// Cookie MaxAge should be 24h.
+				if c.MaxAge != int(portalSessionCookieTTL.Seconds()) {
+					t.Fatalf("expected MaxAge=%d, got %d", int(portalSessionCookieTTL.Seconds()), c.MaxAge)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("expected session cookie renewal, but got none")
+		}
+		// Verify ExpiresAt was extended to ~now+24h.
+		updated, ok := store.Get(sess.ID)
+		if !ok {
+			t.Fatal("session should still exist")
+		}
+		expected := time.Now().Unix() + portalSessionTTL
+		if updated.ExpiresAt < expected-5 || updated.ExpiresAt > expected+5 {
+			t.Fatalf("expected ExpiresAt ~%d, got %d", expected, updated.ExpiresAt)
+		}
+	})
+
+	t.Run("expired_session_returns_401", func(t *testing.T) {
+		sess := store.CreatePortalSession("u3", "admin", "admin", "", portalSessionTTL)
+		// Expire the session.
+		sess.ExpiresAt = time.Now().Unix() - 10
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/test", nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sess.ID})
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", w.Code)
+		}
+	})
+}

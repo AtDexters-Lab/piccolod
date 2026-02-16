@@ -20,6 +20,12 @@ import (
 // cookie name as per OpenAPI cookieAuth
 const sessionCookieName = "piccolo_session"
 
+// Portal session lifetimes.
+const (
+	portalSessionTTL       int64         = 24 * 3600                                  // 24 h in seconds (for SessionStore)
+	portalSessionCookieTTL time.Duration = time.Duration(portalSessionTTL) * time.Second // derived to prevent drift
+)
+
 func (s *GinServer) sessionCookieDomain(r *http.Request) string {
 	// RFC 20260122 §6.1: Always use host-only cookies (no Domain attribute).
 	// This simplifies cookie architecture and improves security:
@@ -309,8 +315,8 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 	userRole := string(userInfo.Role)
 	// RFC 20260122 §6.2: Create portal session with origin binding for security
 	boundOrigin := s.computeCanonicalOrigin(c)
-	sess := s.sessions.CreatePortalSession(userID, userInfo.Username, userRole, boundOrigin, 3600) // 1h default
-	s.setSessionCookie(c, sess.ID, time.Hour)
+	sess := s.sessions.CreatePortalSession(userID, userInfo.Username, userRole, boundOrigin, portalSessionTTL)
+	s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
 
 	resp := gin.H{"message": "ok"}
 	if next := strings.TrimSpace(body.Next); next != "" {

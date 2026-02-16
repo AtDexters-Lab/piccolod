@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestManager_SetupAndVerify(t *testing.T) {
@@ -36,6 +37,73 @@ func TestArgon2_HashAndVerify(t *testing.T) {
 	if !verifyArgon2id(ref, "pw123456") {
 		t.Fatalf("verifyArgon2id failed: %s", ref)
 	}
+}
+
+func TestSessionStore_ExtendTTLIfNeeded(t *testing.T) {
+	t.Run("extends_below_threshold", func(t *testing.T) {
+		store := NewSessionStore()
+		sess := store.CreateWithUserInfo("u1", "admin", "admin", 3600)
+		// Age session so remaining (2600s) < threshold (2700s)
+		sess.ExpiresAt = time.Now().Unix() + 2600
+
+		ok := store.ExtendTTLIfNeeded(sess.ID, 3600, 2700)
+		if !ok {
+			t.Fatal("expected ExtendTTLIfNeeded to extend")
+		}
+		got, found := store.Get(sess.ID)
+		if !found {
+			t.Fatal("session should exist after extend")
+		}
+		expected := time.Now().Unix() + 3600
+		if got.ExpiresAt < expected-5 || got.ExpiresAt > expected+5 {
+			t.Fatalf("expected ExpiresAt ~%d, got %d", expected, got.ExpiresAt)
+		}
+	})
+
+	t.Run("no_extend_above_threshold", func(t *testing.T) {
+		store := NewSessionStore()
+		sess := store.CreateWithUserInfo("u1", "admin", "admin", 3600)
+		originalExpiry := sess.ExpiresAt
+
+		// Remaining (~3600s) >= threshold (2700s), should NOT extend.
+		ok := store.ExtendTTLIfNeeded(sess.ID, 7200, 2700)
+		if ok {
+			t.Fatal("expected ExtendTTLIfNeeded to skip extension")
+		}
+		got, found := store.Get(sess.ID)
+		if !found {
+			t.Fatal("session should still exist")
+		}
+		if got.ExpiresAt != originalExpiry {
+			t.Fatalf("ExpiresAt should be unchanged: want %d, got %d", originalExpiry, got.ExpiresAt)
+		}
+	})
+
+	t.Run("not_found", func(t *testing.T) {
+		store := NewSessionStore()
+		if store.ExtendTTLIfNeeded("nonexistent", 3600, 2700) {
+			t.Fatal("expected false for nonexistent ID")
+		}
+	})
+
+	t.Run("expired", func(t *testing.T) {
+		orig := timeNow
+		defer func() { timeNow = orig }()
+
+		store := NewSessionStore()
+		timeNow = func() time.Time { return time.Now() }
+		sess := store.CreateWithUserInfo("u1", "admin", "admin", 10)
+
+		// Advance time past expiry
+		timeNow = func() time.Time { return time.Now().Add(20 * time.Second) }
+
+		if store.ExtendTTLIfNeeded(sess.ID, 3600, 2700) {
+			t.Fatal("expected false for expired session")
+		}
+		if _, found := store.Get(sess.ID); found {
+			t.Fatal("expired session should have been deleted")
+		}
+	})
 }
 
 func TestManager_ChangePasswordWithRecovery(t *testing.T) {

@@ -154,6 +154,8 @@ func (s *GinServer) requireUnlocked() gin.HandlerFunc {
 
 // requireSession ensures a valid portal session cookie is present and not expired.
 // RFC 20260122 §6.2: Validates audience="portal" and origin binding.
+// Implements sliding sessions: extends TTL only when >25% of the lifetime has
+// been consumed to avoid Set-Cookie overhead on every response.
 func (s *GinServer) requireSession() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id, ok := s.getSession(c)
@@ -163,11 +165,19 @@ func (s *GinServer) requireSession() gin.HandlerFunc {
 			return
 		}
 		origin := s.computeCanonicalOrigin(c)
-		if _, ok := s.sessions.ValidatePortalSession(id, origin); !ok {
+		_, ok = s.sessions.ValidatePortalSession(id, origin)
+		if !ok {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			c.Abort()
 			return
 		}
+
+		// Sliding session: extend only when >25% of TTL consumed (threshold = 75%).
+		// ExtendTTLIfNeeded performs the check and write atomically under one lock.
+		if s.sessions.ExtendTTLIfNeeded(id, portalSessionTTL, 3*portalSessionTTL/4) {
+			s.setSessionCookie(c, id, portalSessionCookieTTL)
+		}
+
 		c.Next()
 	}
 }

@@ -52,6 +52,13 @@ class DesktopController extends ChangeNotifier {
     }
   }
 
+  // Re-auth overlay state
+  bool _showReauth = false;
+  bool get showReauth => _showReauth;
+
+  String? _lastKnownUsername;
+  String? get lastKnownUsername => _lastKnownUsername;
+
   // Setup State
   bool _needsSetup = false; // Default to false to avoid flash
   bool get needsSetup => _needsSetup;
@@ -61,6 +68,7 @@ class DesktopController extends ChangeNotifier {
 
   DesktopController() {
     appService = AppService(ApiClient());
+    ApiClient().onAuthRequired = _onAuthRequired;
     _checkSystemStatus();
   }
 
@@ -78,12 +86,16 @@ class DesktopController extends ChangeNotifier {
          try {
            final session = await ApiClient().get('/api/v1/auth/session');
            if (session['authenticated'] != true) {
-             // Not authenticated, but system IS initialized. 
+             // Not authenticated, but system IS initialized.
              // We reuse the Setup Wizard in "Login Mode".
              // The SetupWizard (implemented in features/setup) handles logic to show Login if already setup.
              _needsSetup = true;
            } else {
              _needsSetup = false;
+             // Capture username for re-auth overlay pre-fill.
+             if (session['user'] is String) {
+               _lastKnownUsername = session['user'] as String;
+             }
            }
          } catch (_) {
            // If session check fails, assume we need login
@@ -111,13 +123,41 @@ class DesktopController extends ChangeNotifier {
     _onAuthenticated(isFirstSetup: isFirstSetupFlow);
   }
 
+  void _onAuthRequired() {
+    if (_showReauth) return; // Already showing
+    _showReauth = true;
+    notifyListeners();
+  }
+
+  void onReauthSuccess() {
+    _showReauth = false;
+    // Reconnect event stream after re-auth.
+    _eventStreamClient?.disconnect(clearError: true);
+    _eventStreamClient?.connect();
+    notifyListeners();
+  }
+
+  void onReauthCancel() {
+    _showReauth = false;
+    logout();
+  }
+
   /// Single source of truth for "user is now authenticated" state transition.
   /// Handles event stream connection and optional first-setup welcome.
   void _onAuthenticated({required bool isFirstSetup}) {
     _needsSetup = false;
 
+    // Capture username for re-auth overlay pre-fill (best-effort, fire-and-forget).
+    // Covers the fresh-login path where _checkSystemStatus didn't reach the session check.
+    ApiClient().get('/api/v1/auth/session').then((session) {
+      if (session is Map && session['user'] is String) {
+        _lastKnownUsername = session['user'] as String;
+      }
+    }).catchError((_) {});
+
     // Connect event stream
     _eventStreamClient ??= EventStreamClient();
+    _eventStreamClient!.onAuthFailure = _onAuthRequired;
     _eventStreamClient!.connect();
 
     notifyListeners();
@@ -180,6 +220,10 @@ class DesktopController extends ChangeNotifier {
     _eventStreamClient?.disconnect();
     _eventStreamClient?.dispose();
     _eventStreamClient = null;
+
+    // Clear re-auth state to avoid stale overlay on next login cycle.
+    _showReauth = false;
+    _lastKnownUsername = null;
 
     // Force UI back to SetupWizard (which will detect unauthenticated state and show Login)
     _needsSetup = true;
@@ -445,6 +489,7 @@ class DesktopController extends ChangeNotifier {
 
   @override
   void dispose() {
+    ApiClient().onAuthRequired = null;
     _eventStreamClient?.dispose();
     _eventStreamClient = null;
     super.dispose();

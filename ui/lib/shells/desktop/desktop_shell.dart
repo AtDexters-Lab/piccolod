@@ -6,6 +6,7 @@ import 'widgets/dock.dart';
 import 'widgets/window_frame.dart';
 import 'features/setup/setup_wizard.dart';
 import 'features/access_denied/access_denied_view.dart';
+import '../../shared/widgets/reauth_overlay.dart';
 
 class DesktopShell extends StatefulWidget {
   const DesktopShell({super.key});
@@ -107,6 +108,16 @@ class _DesktopShellState extends State<DesktopShell> {
                           ),
                         ),
                       ),
+                    ),
+                  ),
+
+                // Re-auth overlay — session expired, login required
+                if (_controller.showReauth)
+                  Positioned.fill(
+                    child: ReauthOverlay(
+                      lastKnownUsername: _controller.lastKnownUsername,
+                      onSuccess: _controller.onReauthSuccess,
+                      onCancel: _controller.onReauthCancel,
                     ),
                   ),
               ],
