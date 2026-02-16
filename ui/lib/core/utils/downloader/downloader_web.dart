@@ -15,3 +15,12 @@ void downloadTextFile(String content, String filename) {
 
   web.URL.revokeObjectURL(url);
 }
+
+/// Downloads a file from a URL using the browser's anchor tag.
+/// The browser handles auth cookies automatically for same-origin URLs.
+void downloadFromUrl(String url, String filename) {
+  final anchor = web.document.createElement('a') as web.HTMLAnchorElement;
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+}

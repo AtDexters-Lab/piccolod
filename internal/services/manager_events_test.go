@@ -141,6 +141,151 @@ func TestServiceManagerPublishesEndpointEventsOnRemove(t *testing.T) {
 	}
 }
 
+func TestCheckBackends_SkipsTransientApps(t *testing.T) {
+	mgr := NewServiceManager()
+	bus := events.NewBus()
+	mgr.SetEventBus(bus)
+
+	// Allocate endpoints for an app
+	listeners := []api.AppListener{
+		{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
+	}
+	_, err := mgr.AllocateForApp("myapp", listeners)
+	if err != nil {
+		t.Fatalf("AllocateForApp failed: %v", err)
+	}
+
+	// Mark app as transient (starting)
+	mgr.appTransientMu.Lock()
+	mgr.appTransient["myapp"] = time.Now()
+	mgr.appTransientMu.Unlock()
+
+	// Run checkBackends — should skip myapp, so no health state recorded
+	mgr.checkBackends()
+
+	endpointKey := "myapp/web"
+	isHealthy, _ := mgr.backendHealth.GetHealthState(endpointKey)
+	if !isHealthy {
+		t.Error("transient app should not have unhealthy state recorded")
+	}
+
+	mgr.RemoveApp("myapp")
+}
+
+func TestAppStatusTracker_TransitionToRunning(t *testing.T) {
+	mgr := NewServiceManager()
+	bus := events.NewBus()
+	mgr.SetEventBus(bus)
+
+	// Publish starting event
+	bus.Publish(events.Event{
+		Topic: events.TopicAppStatusChanged,
+		Payload: events.AppStatusChangedEvent{
+			App: "myapp", Status: "starting",
+		},
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	mgr.appTransientMu.RLock()
+	_, isTransient := mgr.appTransient["myapp"]
+	mgr.appTransientMu.RUnlock()
+	if !isTransient {
+		t.Fatal("expected myapp to be transient after starting")
+	}
+
+	// Publish running event
+	bus.Publish(events.Event{
+		Topic: events.TopicAppStatusChanged,
+		Payload: events.AppStatusChangedEvent{
+			App: "myapp", Status: "running",
+		},
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	mgr.appTransientMu.RLock()
+	_, isTransient = mgr.appTransient["myapp"]
+	mgr.appTransientMu.RUnlock()
+	if isTransient {
+		t.Fatal("expected myapp to no longer be transient after running")
+	}
+}
+
+func TestAppStatusTracker_TransitionToError(t *testing.T) {
+	mgr := NewServiceManager()
+	bus := events.NewBus()
+	mgr.SetEventBus(bus)
+
+	bus.Publish(events.Event{
+		Topic: events.TopicAppStatusChanged,
+		Payload: events.AppStatusChangedEvent{
+			App: "myapp", Status: "starting",
+		},
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	mgr.appTransientMu.RLock()
+	_, transient := mgr.appTransient["myapp"]
+	mgr.appTransientMu.RUnlock()
+	if !transient {
+		t.Fatal("expected myapp to be transient after starting")
+	}
+
+	bus.Publish(events.Event{
+		Topic: events.TopicAppStatusChanged,
+		Payload: events.AppStatusChangedEvent{
+			App: "myapp", Status: "error",
+		},
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	mgr.appTransientMu.RLock()
+	_, transient = mgr.appTransient["myapp"]
+	mgr.appTransientMu.RUnlock()
+	if transient {
+		t.Fatal("expected myapp to no longer be transient after error")
+	}
+}
+
+func TestCheckBackends_ResumesAfterTransient(t *testing.T) {
+	mgr := NewServiceManager()
+	bus := events.NewBus()
+	mgr.SetEventBus(bus)
+
+	listeners := []api.AppListener{
+		{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
+	}
+	_, err := mgr.AllocateForApp("myapp", listeners)
+	if err != nil {
+		t.Fatalf("AllocateForApp failed: %v", err)
+	}
+
+	// Mark transient, check backends (should skip)
+	mgr.appTransientMu.Lock()
+	mgr.appTransient["myapp"] = time.Now()
+	mgr.appTransientMu.Unlock()
+
+	mgr.checkBackends()
+
+	// Clear transient, check backends (should resume — backend will be unreachable)
+	mgr.appTransientMu.Lock()
+	delete(mgr.appTransient, "myapp")
+	mgr.appTransientMu.Unlock()
+
+	mgr.checkBackends()
+
+	// After resuming, the health state should have been checked
+	// (it will be unhealthy since nothing is listening, but we only need 1 check recorded)
+	endpointKey := "myapp/web"
+	mgr.backendHealth.mu.RLock()
+	_, seen := mgr.backendHealth.firstSeen[endpointKey]
+	mgr.backendHealth.mu.RUnlock()
+	if !seen {
+		t.Error("expected health check to have been recorded after transient cleared")
+	}
+
+	mgr.RemoveApp("myapp")
+}
+
 func TestServiceManagerPublishesEndpointEventsOnLabelChange(t *testing.T) {
 	mgr := NewServiceManager()
 	bus := events.NewBus()

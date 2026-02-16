@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"piccolod/internal/events"
 	"piccolod/internal/update"
 )
 
@@ -105,15 +106,39 @@ func (s *GinServer) handleRemoteStatus(c *gin.Context) {
 }
 
 // handleOSUpdateReboot triggers a system reboot.
+// Pass ?force=true to bypass snapshot validation (emergency escape hatch).
 func (s *GinServer) handleOSUpdateReboot(c *gin.Context) {
 	if s.updateManager == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "update manager not available"})
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "update manager unavailable"})
 		return
 	}
 
-	// This is a fire-and-forget operation from the client's perspective,
-	// as the server will likely die immediately.
+	force := c.Query("force") == "true"
+
+	if force {
+		if s.events != nil {
+			s.events.Publish(events.Event{
+				Topic: events.TopicAudit,
+				Payload: events.AuditEvent{
+					Kind:   "system.force_reboot",
+					Time:   time.Now().UTC(),
+					Source: c.ClientIP(),
+				},
+			})
+		}
+		if err := s.updateManager.ForceReboot(context.Background()); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to trigger reboot: " + err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "force reboot initiated"})
+		return
+	}
+
 	if err := s.updateManager.Reboot(context.Background()); err != nil {
+		if errors.Is(err, update.ErrSnapshotValidationFailed) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to trigger reboot: " + err.Error()})
 		return
 	}

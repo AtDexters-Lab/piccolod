@@ -1,6 +1,7 @@
 package mdns
 
 import (
+	"errors"
 	"net"
 	"testing"
 
@@ -189,6 +190,9 @@ func TestValidateDNSMessage_NonLocalQuery(t *testing.T) {
 	err := manager.validateDNSMessage(msg)
 	if err == nil {
 		t.Error("Non-.local queries should be rejected")
+	}
+	if !errors.Is(err, errNonLocalQuery) {
+		t.Errorf("expected errNonLocalQuery sentinel, got: %v", err)
 	}
 }
 

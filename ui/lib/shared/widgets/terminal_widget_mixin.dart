@@ -4,8 +4,10 @@ import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
 import '../../core/config/core_config.dart';
+import '../../core/services/error_reporter.dart';
 import '../../core/utils/clipboard/clipboard.dart' as clipboard_utils;
 import '../../shells/desktop/features/terminal/terminal_backend.dart';
+import 'render_error_boundary.dart';
 
 /// Mixin providing common terminal functionality for host and workspace terminals.
 ///
@@ -72,6 +74,13 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
     terminalScrollController.dispose();
     terminalController.dispose();
     terminalBackend?.dispose();
+  }
+
+  /// Dispose the current backend and reconnect with a fresh WebSocket.
+  void reconnectTerminal() {
+    terminalBackend?.dispose();
+    terminalBackend = null;
+    connectTerminal();
   }
 
   String _buildWebSocketUrl(String path) {
@@ -159,44 +168,57 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
   /// Build the terminal view widget with standard styling.
   /// Uses CallbackShortcuts to intercept Ctrl+C before it reaches xterm,
   /// copying selected text or sending SIGINT if no selection.
+  /// Wrapped in [RenderErrorBoundary] to catch paint/layout errors and
+  /// show a recoverable fallback instead of Flutter's red error screen.
   Widget buildTerminalView() {
-    return RepaintBoundary(
-      child: Container(
-        color: const Color(0xFF1E1E1E),
-        child: SizedBox.expand(
-          child: Scrollbar(
-            controller: terminalScrollController,
-            thumbVisibility: true,
-            child: CallbackShortcuts(
-              bindings: {
-                // Ctrl+Shift+C - explicit copy (Linux terminal convention)
-                const SingleActivator(LogicalKeyboardKey.keyC, control: true, shift: true):
-                    copyTerminalSelection,
-                // Ctrl+Shift+V - explicit paste (Linux terminal convention)
-                const SingleActivator(LogicalKeyboardKey.keyV, control: true, shift: true):
-                    pasteToTerminal,
-                // Ctrl+C on Linux/Windows - intercept to handle copy vs SIGINT
-                const SingleActivator(LogicalKeyboardKey.keyC, control: true):
-                    _handleCopyShortcut,
-                // Cmd+C on macOS
-                const SingleActivator(LogicalKeyboardKey.keyC, meta: true):
-                    _handleCopyShortcut,
-                // Cmd+V on macOS
-                const SingleActivator(LogicalKeyboardKey.keyV, meta: true):
-                    pasteToTerminal,
-              },
-              child: TerminalView(
-                terminal,
-                controller: terminalController,
-                scrollController: terminalScrollController,
-                textStyle: const TerminalStyle(
-                  fontFamily: 'JetBrainsMono',
-                  height: 1.2,
+    return RenderErrorBoundary(
+      maxRetries: 3,
+      onError: (error) => ErrorReporter().report(
+        type: 'render_error',
+        message: 'Terminal render error: $error',
+        stack: error is Error ? error.stackTrace?.toString() : null,
+      ),
+      onRetry: reconnectTerminal,
+      fallbackBuilder: (error, retry) =>
+          RenderErrorFallback(label: 'Terminal', retry: retry),
+      child: RepaintBoundary(
+        child: Container(
+          color: const Color(0xFF1E1E1E),
+          child: SizedBox.expand(
+            child: Scrollbar(
+              controller: terminalScrollController,
+              thumbVisibility: true,
+              child: CallbackShortcuts(
+                bindings: {
+                  // Ctrl+Shift+C - explicit copy (Linux terminal convention)
+                  const SingleActivator(LogicalKeyboardKey.keyC, control: true, shift: true):
+                      copyTerminalSelection,
+                  // Ctrl+Shift+V - explicit paste (Linux terminal convention)
+                  const SingleActivator(LogicalKeyboardKey.keyV, control: true, shift: true):
+                      pasteToTerminal,
+                  // Ctrl+C on Linux/Windows - intercept to handle copy vs SIGINT
+                  const SingleActivator(LogicalKeyboardKey.keyC, control: true):
+                      _handleCopyShortcut,
+                  // Cmd+C on macOS
+                  const SingleActivator(LogicalKeyboardKey.keyC, meta: true):
+                      _handleCopyShortcut,
+                  // Cmd+V on macOS
+                  const SingleActivator(LogicalKeyboardKey.keyV, meta: true):
+                      pasteToTerminal,
+                },
+                child: TerminalView(
+                  terminal,
+                  controller: terminalController,
+                  scrollController: terminalScrollController,
+                  textStyle: const TerminalStyle(
+                    fontFamily: 'JetBrainsMono',
+                    height: 1.2,
+                  ),
+                  padding: const EdgeInsets.all(12.0),
+                  autofocus: true,
+                  onSecondaryTapDown: (details, cell) =>
+                      showTerminalContextMenu(context, details.globalPosition),
                 ),
-                padding: const EdgeInsets.all(12.0),
-                autofocus: true,
-                onSecondaryTapDown: (details, cell) =>
-                    showTerminalContextMenu(context, details.globalPosition),
               ),
             ),
           ),
@@ -204,4 +226,5 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
       ),
     );
   }
+
 }

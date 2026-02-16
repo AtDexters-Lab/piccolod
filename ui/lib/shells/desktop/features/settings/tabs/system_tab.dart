@@ -69,6 +69,8 @@ class SystemTab extends StatelessWidget {
                   _InfoRow("Current Version", update.currentVersion),
                   _InfoRow("Last Checked", _formatDate(update.lastChecked)),
                   const Divider(height: 32),
+                  _DiagnosticLogSection(controller: controller),
+                  const Divider(height: 32),
                   Row(
                     children: [
                       Expanded(
@@ -614,6 +616,206 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
   }
 }
 
+class _DiagnosticLogSection extends StatefulWidget {
+  final SettingsController controller;
+
+  const _DiagnosticLogSection({required this.controller});
+
+  @override
+  State<_DiagnosticLogSection> createState() => _DiagnosticLogSectionState();
+}
+
+class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
+  late DateTime _from;
+  late DateTime _to;
+  // null = collapsed, true = from picker, false = to picker
+  bool? _activePicker;
+
+  @override
+  void initState() {
+    super.initState();
+    final now = DateTime.now();
+    _to = DateTime(now.year, now.month, now.day);
+    // 2-day difference = 3 inclusive calendar dates, matching backend's diagnosticDefaultDays=3
+    _from = _to.subtract(const Duration(days: 2));
+  }
+
+  void _togglePicker(bool isFrom) {
+    setState(() {
+      _activePicker = (_activePicker == isFrom) ? null : isFrom;
+    });
+  }
+
+  void _onDateSelected(DateTime picked) {
+    final isFrom = _activePicker == true;
+    setState(() {
+      if (isFrom) {
+        _from = picked;
+        if (_from.isAfter(_to)) _to = _from;
+        // Clamp: max 7 inclusive calendar days = 6-day difference
+        if (_to.difference(_from).inDays > 6) {
+          _to = _from.add(const Duration(days: 6));
+        }
+      } else {
+        _to = picked;
+        if (_to.isBefore(_from)) _from = _to;
+        // Clamp: max 7 inclusive calendar days = 6-day difference
+        if (_to.difference(_from).inDays > 6) {
+          _from = _to.subtract(const Duration(days: 6));
+        }
+      }
+      _activePicker = null;
+    });
+  }
+
+  String _formatDate(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  /// Clamp [d] into [earliest..latest] so CalendarDatePicker never asserts.
+  DateTime _clampDate(DateTime d, DateTime earliest, DateTime latest) {
+    if (d.isBefore(earliest)) return earliest;
+    if (d.isAfter(latest)) return latest;
+    return d;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final firstDate = today.subtract(const Duration(days: 90));
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("Diagnostic Log",
+                      style: PiccoloTheme.textTheme.bodyMedium
+                          ?.copyWith(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  Text(
+                    "Download a redacted system log for bug reporting.",
+                    style: PiccoloTheme.textTheme.labelSmall,
+                  ),
+                ],
+              ),
+            ),
+            OutlinedButton.icon(
+              onPressed: () => widget.controller
+                  .downloadDiagnosticLog(from: _from, to: _to),
+              icon: const Icon(Icons.download, size: 18),
+              label: const Text("Download"),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            _DateChip(
+              label: "From",
+              value: _formatDate(_from),
+              isActive: _activePicker == true,
+              onTap: () => _togglePicker(true),
+            ),
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 8),
+              child: Text("—", style: TextStyle(color: PiccoloTheme.inkMuted)),
+            ),
+            _DateChip(
+              label: "To",
+              value: _formatDate(_to),
+              isActive: _activePicker == false,
+              onTap: () => _togglePicker(false),
+            ),
+            const SizedBox(width: 8),
+            Text("(max 7 days)", style: PiccoloTheme.textTheme.labelSmall),
+          ],
+        ),
+        AnimatedSize(
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeInOut,
+          alignment: Alignment.topLeft,
+          child: _activePicker != null
+              ? Align(
+                  alignment: Alignment.centerLeft,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 320),
+                    child: CalendarDatePicker(
+                      key: ValueKey(_activePicker),
+                      initialDate: _clampDate(
+                        _activePicker == true ? _from : _to,
+                        firstDate,
+                        today,
+                      ),
+                      firstDate: firstDate,
+                      lastDate: today,
+                      onDateChanged: _onDateSelected,
+                    ),
+                  ),
+                )
+              : const SizedBox.shrink(),
+        ),
+      ],
+    );
+  }
+}
+
+class _DateChip extends StatelessWidget {
+  final String label;
+  final String value;
+  final bool isActive;
+  final VoidCallback onTap;
+
+  const _DateChip({
+    required this.label,
+    required this.value,
+    required this.isActive,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: isActive
+                ? PiccoloTheme.cobalt600
+                : PiccoloTheme.ink.withValues(alpha: 0.1),
+          ),
+          color: isActive
+              ? PiccoloTheme.cobalt600.withValues(alpha: 0.05)
+              : null,
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text("$label: ",
+                style: PiccoloTheme.textTheme.labelSmall),
+            Text(value,
+                style: PiccoloTheme.textTheme.bodyMedium
+                    ?.copyWith(fontWeight: FontWeight.w500)),
+            const SizedBox(width: 4),
+            Icon(
+              isActive ? Icons.expand_less : Icons.calendar_today,
+              size: 14,
+              color: isActive ? PiccoloTheme.cobalt600 : PiccoloTheme.inkMuted,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _SettingsDiskTile extends StatelessWidget {
   final String device;
   final String model;
@@ -652,11 +854,14 @@ class _SettingsDiskTile extends StatelessWidget {
           ),
           child: Row(
             children: [
-              Radio<bool>(
-                value: true,
+              RadioGroup<bool>(
                 groupValue: isSelected ? true : null,
-                onChanged: onTap != null ? (_) => onTap!() : null,
-                activeColor: PiccoloTheme.cobalt600,
+                onChanged: (_) => onTap?.call(),
+                child: Radio<bool>(
+                  value: true,
+                  activeColor: PiccoloTheme.cobalt600,
+                  enabled: onTap != null,
+                ),
               ),
               const SizedBox(width: 8),
               Expanded(

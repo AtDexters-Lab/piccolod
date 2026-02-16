@@ -337,7 +337,7 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 	// Validate state and recover stored data
 	state, ok := h.stateStore.Validate(stateID)
 	if !ok {
-		log.Printf("WARN: proxy OIDC: invalid or expired state: %s", stateID)
+		log.Printf("WARN: proxy OIDC: invalid or expired state (len=%d)", len(stateID))
 		writeProxyJSONError(w, http.StatusBadRequest, "invalid_or_expired_state", "INVALID_STATE")
 		return
 	}

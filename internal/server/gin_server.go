@@ -67,6 +67,7 @@ type osUpdateManager interface {
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
 	Reboot(context.Context) error
+	ForceReboot(context.Context) error
 	PowerOff(context.Context) error
 	Watch(context.Context) error
 }
@@ -544,6 +545,13 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.supervisor.Register(pcvPub)
 	s.supervisor.Register(supervisor.NewComponent("consensus", consensusMgr.Start, consensusMgr.Stop))
 	s.supervisor.Register(newLeadershipObserver(eventsBus))
+	s.supervisor.Register(supervisor.NewComponent("catalog", func(ctx context.Context) error {
+		catalogMgr.ObserveLockState(eventsBus)
+		return nil
+	}, func(ctx context.Context) error {
+		catalogMgr.Stop()
+		return nil
+	}))
 	s.observeLockState(eventsBus)
 	s.observeLeadership(eventsBus)
 	s.observeRemoteConfig(eventsBus)
@@ -826,8 +834,9 @@ func (s *GinServer) Start() error {
 	}
 
 	s.httpSrv = &http.Server{
-		Addr:    ":" + port,
-		Handler: s.router,
+		Addr:     ":" + port,
+		Handler:  s.router,
+		ErrorLog: newFilteredErrorLogger(),
 	}
 	if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -1157,6 +1166,9 @@ func (s *GinServer) setupGinRoutes() {
 
 		// System logs (Admin only)
 		admin.GET("/system/logs/stream", s.handleGinSystemLogStream)
+
+		// Diagnostic log download (Admin only, always available)
+		admin.GET("/system/admin/diagnostic-log", s.handleAdminDiagnosticLog)
 
 		// Task progress (Admin only?) - Maybe standard user needs to see progress of their own actions?
 		// But they can't trigger actions. So Admin only is safe.
@@ -1941,15 +1953,16 @@ func (s *GinServer) handleGinReadinessCheck(c *gin.Context) {
 	}
 	required := []string{"persistence", "app-manager", "service-manager"}
 	ready, snapshot := s.healthTracker.Ready(required...)
+	overall := s.healthTracker.Overall()
 	payload := gin.H{
 		"ready":      ready,
-		"status":     s.healthTracker.Overall().String(),
+		"status":     overall.String(),
 		"components": flattenHealth(snapshot),
 	}
-	// TODO(ballast): once the health tracker distinguishes fatal states (e.g. control
-	// store cannot unlock due to corruption), emit 503 here so MicroOS can roll
-	// back automatically. For now we always return 200 to stay compatible with
-	// piccolod-health-check-prod.sh which only inspects the status code.
+	if overall == health.LevelError {
+		c.JSON(http.StatusServiceUnavailable, payload)
+		return
+	}
 	c.JSON(http.StatusOK, payload)
 }
 
@@ -2008,6 +2021,7 @@ func (s *GinServer) initSecureLoopback() error {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
+		ErrorLog:     newFilteredErrorLogger(),
 	}
 	return nil
 }
@@ -2065,6 +2079,7 @@ func (s *GinServer) startInternalHTTPSListener() {
 		Addr:      addr,
 		Handler:   s.router,
 		TLSConfig: tlsCfg,
+		ErrorLog:  newFilteredErrorLogger(),
 	}
 
 	go func() {

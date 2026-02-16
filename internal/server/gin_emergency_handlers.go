@@ -79,6 +79,7 @@ func isEmergencyAllowed(path string) bool {
 		"/api/v1/health/",
 		"/api/v1/system/emergency",
 		"/api/v1/system/diagnostic-log",
+		"/api/v1/system/admin/diagnostic-log",
 		"/api/v1/system/ca.crt",
 		// Auth state endpoints — needed by the portal UI to render the unlock page.
 		"/api/v1/auth/session",

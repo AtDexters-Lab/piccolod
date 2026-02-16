@@ -355,9 +355,24 @@ func (m *Manager) createIPv6Socket(iface *net.Interface) (*net.UDPConn, error) {
 	return conn, nil
 }
 
-// failedSetupCooldown is how long to wait before retrying a failed interface setup.
-// Short enough to recover promptly after DHCP/SLAAC assigns an address (3 polling cycles).
-const failedSetupCooldown = 30 * time.Second
+// failedSetup backoff constants for retrying failed interface setups.
+// Uses exponential backoff: 30s, 60s, 120s, 240s, capped at 5min.
+const (
+	failedSetupInitialCooldown = 30 * time.Second
+	failedSetupMaxCooldown     = 5 * time.Minute
+)
+
+// failedSetupBackoff computes the cooldown duration for a given attempt count.
+func failedSetupBackoff(attempts int) time.Duration {
+	if attempts >= 4 {
+		return failedSetupMaxCooldown // overflow guard
+	}
+	d := failedSetupInitialCooldown << uint(attempts) // 30s, 60s, 120s, 240s
+	if d > failedSetupMaxCooldown {
+		d = failedSetupMaxCooldown
+	}
+	return d
+}
 
 // networkMonitor continuously monitors network interface changes
 func (m *Manager) networkMonitor() {
@@ -424,18 +439,26 @@ func (m *Manager) checkInterfaceChanges() {
 			}
 
 			// Check if recently failed — avoid log spam from repeated failures
-			if lastAttempt, failed := m.failedSetups[ifaceCopy.Name]; failed {
-				if time.Since(lastAttempt) < failedSetupCooldown {
+			if info, failed := m.failedSetups[ifaceCopy.Name]; failed {
+				cooldown := failedSetupBackoff(info.Attempts)
+				if time.Since(info.LastAttempt) < cooldown {
 					continue
 				}
-				log.Printf("DEBUG: Retrying previously failed interface %s (cooldown expired)", ifaceCopy.Name)
-				delete(m.failedSetups, ifaceCopy.Name)
+				log.Printf("DEBUG: Retrying previously failed interface %s (cooldown %v expired, attempt %d)", ifaceCopy.Name, cooldown, info.Attempts+1)
 			}
 
 			log.Printf("INFO: New interface detected: %s", ifaceCopy.Name)
 			if err := m.setupInterface(&ifaceCopy); err != nil {
 				log.Printf("WARN: Failed to setup new interface %s: %v", ifaceCopy.Name, err)
-				m.failedSetups[ifaceCopy.Name] = time.Now()
+				if info, exists := m.failedSetups[ifaceCopy.Name]; exists {
+					info.LastAttempt = time.Now()
+					info.Attempts++
+				} else {
+					m.failedSetups[ifaceCopy.Name] = &failedSetupInfo{
+						LastAttempt: time.Now(),
+						Attempts:    0,
+					}
+				}
 			} else {
 				delete(m.failedSetups, ifaceCopy.Name)
 				needsAnnounce = true

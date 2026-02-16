@@ -8,3 +8,10 @@ void downloadTextFile(String content, String filename) {
     "Download not supported on this platform without external packages.",
   );
 }
+
+/// Stub for URL-based download on non-web platforms.
+void downloadFromUrl(String url, String filename) {
+  debugPrint(
+    "Download not supported on this platform without external packages.",
+  );
+}

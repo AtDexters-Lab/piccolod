@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"piccolod/internal/api"
+	"piccolod/internal/events"
 	"piccolod/internal/fsutil"
 
 	"golang.org/x/mod/semver"
@@ -31,9 +32,13 @@ const (
 	MaxPageSize      = 100
 
 	// Icon caching constants
-	IconCacheDuration = 24 * time.Hour
-	IconMaxSize       = 1 << 20 // 1MB
-	IconFetchTimeout  = 10 * time.Second
+	IconCacheDuration   = 24 * time.Hour
+	IconMaxSize         = 1 << 20 // 1MB
+	IconDialTimeout     = 10 * time.Second // TCP + TLS handshake
+	IconRequestTimeout  = 30 * time.Second // full request lifecycle
+
+	// Concurrency control for external icon fetches
+	MaxConcurrentIconFetches = 3
 )
 
 type Manager struct {
@@ -47,6 +52,18 @@ type Manager struct {
 	cacheMu     sync.RWMutex
 	cachedApps  []api.CatalogItem
 	lastUpdated time.Time
+
+	// Lifecycle fields
+	lifecycleMu   sync.Mutex
+	lifecycleCtx  context.Context
+	lifecycleStop context.CancelFunc
+	wg            sync.WaitGroup
+	iconSemaphore chan struct{} // limits concurrent external icon fetches
+	cacheDirReady bool
+	cacheDirMu    sync.Mutex
+
+	// Event bus subscription cleanup
+	lockStateCancel func()
 }
 
 // IconResult contains the fetched icon data and content type.
@@ -87,29 +104,136 @@ func NewManager(repoURL, cacheDir string) *Manager {
 	// Ensure no trailing slash
 	repoURL = strings.TrimRight(repoURL, "/")
 
-	if cacheDir != "" {
-		if err := os.MkdirAll(cacheDir, 0755); err != nil {
-			log.Printf("WARN: failed to create catalog cache dir %s: %v", cacheDir, err)
-		}
-		// Create icons subdirectory
-		if err := os.MkdirAll(filepath.Join(cacheDir, "icons"), 0755); err != nil {
-			log.Printf("WARN: failed to create icons cache dir: %v", err)
-		}
-	}
-
-	return &Manager{
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &Manager{
 		repoURL:        repoURL,
 		cacheDir:       cacheDir,
 		httpClient:     &http.Client{Timeout: 10 * time.Second},
 		iconHTTPClient: newSSRFSafeClient(),
+		lifecycleCtx:   ctx,
+		lifecycleStop:  cancel,
+		iconSemaphore:  make(chan struct{}, MaxConcurrentIconFetches),
 	}
+
+	// Best-effort cache dir creation at startup; may fail on read-only root.
+	// EnsureCacheDir will retry after unlock.
+	if cacheDir != "" {
+		if err := m.EnsureCacheDir(); err != nil {
+			log.Printf("DEBUG: catalog cache dir not ready at startup: %v", err)
+		}
+	}
+
+	return m
+}
+
+// EnsureCacheDir creates the cache directory and icons subdirectory.
+// It is idempotent: once it succeeds, subsequent calls are no-ops.
+func (m *Manager) EnsureCacheDir() error {
+	if m.cacheDir == "" {
+		return nil
+	}
+	m.cacheDirMu.Lock()
+	defer m.cacheDirMu.Unlock()
+	if m.cacheDirReady {
+		return nil
+	}
+	if err := os.MkdirAll(m.cacheDir, 0755); err != nil {
+		return fmt.Errorf("create catalog cache dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(m.cacheDir, "icons"), 0755); err != nil {
+		return fmt.Errorf("create icons cache dir: %w", err)
+	}
+	m.cacheDirReady = true
+	return nil
+}
+
+// ensureCacheDirOnce is a lazy defense-in-depth call for write paths.
+func (m *Manager) ensureCacheDirOnce() {
+	m.cacheDirMu.Lock()
+	ready := m.cacheDirReady
+	m.cacheDirMu.Unlock()
+	if ready {
+		return
+	}
+	if err := m.EnsureCacheDir(); err != nil {
+		log.Printf("DEBUG: catalog cache dir still not ready: %v", err)
+	}
+}
+
+// ObserveLockState subscribes to lock state events. On unlock, it creates the
+// cache directory and triggers a background catalog index refresh.
+// Safe to call again after Stop (supports supervisor restart cycles).
+func (m *Manager) ObserveLockState(bus *events.Bus) {
+	if bus == nil {
+		return
+	}
+	ch, cancel := bus.SubscribeWithCancel(events.TopicLockStateChanged, 8)
+
+	m.lifecycleMu.Lock()
+	m.lockStateCancel = cancel
+	ctx := m.lifecycleCtx
+	m.lifecycleMu.Unlock()
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		for {
+			select {
+			case evt, ok := <-ch:
+				if !ok {
+					return
+				}
+				payload, ok := evt.Payload.(events.LockStateChanged)
+				if !ok || payload.Locked {
+					continue
+				}
+				// Unlock: ensure cache dirs exist, then pre-warm index
+				if err := m.EnsureCacheDir(); err != nil {
+					log.Printf("WARN: catalog cache dir creation failed on unlock: %v", err)
+					continue
+				}
+				log.Printf("INFO: catalog cache dir ready after unlock; refreshing index")
+				m.wg.Add(1)
+				go func() {
+					defer m.wg.Done()
+					refreshCtx, refreshCancel := context.WithTimeout(ctx, 30*time.Second)
+					defer refreshCancel()
+					if err := m.refreshCache(refreshCtx); err != nil {
+						log.Printf("WARN: catalog index pre-warm failed: %v", err)
+					}
+				}()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// Stop cancels event subscriptions and waits for background goroutines.
+// It is safe to call multiple times. After Stop returns, ObserveLockState
+// may be called again to restart observation (supervisor restart cycle).
+func (m *Manager) Stop() {
+	m.lifecycleMu.Lock()
+	if m.lockStateCancel != nil {
+		m.lockStateCancel()
+		m.lockStateCancel = nil
+	}
+	m.lifecycleStop()
+	m.lifecycleMu.Unlock()
+
+	m.wg.Wait()
+
+	// Reset lifecycle context so ObserveLockState can be called again.
+	m.lifecycleMu.Lock()
+	m.lifecycleCtx, m.lifecycleStop = context.WithCancel(context.Background())
+	m.lifecycleMu.Unlock()
 }
 
 // newSSRFSafeClient creates an HTTP client with SSRF protection.
 // It blocks connections to private, loopback, and link-local IP addresses.
 func newSSRFSafeClient() *http.Client {
 	dialer := &net.Dialer{
-		Timeout:   IconFetchTimeout,
+		Timeout:   IconDialTimeout,
 		KeepAlive: 30 * time.Second,
 	}
 
@@ -124,7 +248,7 @@ func newSSRFSafeClient() *http.Client {
 	}
 
 	return &http.Client{
-		Timeout:   IconFetchTimeout,
+		Timeout:   IconRequestTimeout,
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
@@ -301,6 +425,7 @@ func (m *Manager) refreshCache(ctx context.Context) error {
 
 	// Persist to disk
 	if m.cacheDir != "" {
+		m.ensureCacheDirOnce()
 		path := filepath.Join(m.cacheDir, DefaultIndexFile)
 		if err := fsutil.AtomicWriteFile(path, body, 0644); err != nil {
 			log.Printf("WARN: failed to write catalog cache: %v", err)
@@ -566,6 +691,14 @@ func (m *Manager) GetIconByName(ctx context.Context, appName string) (*IconResul
 		}
 	}
 
+	// Acquire semaphore for external fetch (disk cache hits never block)
+	select {
+	case m.iconSemaphore <- struct{}{}:
+		defer func() { <-m.iconSemaphore }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
 	// Validate URL
 	if !strings.HasPrefix(iconURL, "http://") && !strings.HasPrefix(iconURL, "https://") {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidIconURL, iconURL)
@@ -698,6 +831,7 @@ func (m *Manager) saveIconToDisk(appName string, result *IconResult) error {
 	if m.cacheDir == "" {
 		return fmt.Errorf("no cache dir")
 	}
+	m.ensureCacheDirOnce()
 
 	safeName, err := sanitizeAppNameForCache(appName)
 	if err != nil {
