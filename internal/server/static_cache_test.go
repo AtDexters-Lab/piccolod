@@ -68,7 +68,7 @@ func setupStaticTestRouter() *gin.Engine {
 	cache := newStaticAssetCache(webassets.FS, "web")
 
 	r.NoRoute(func(c *gin.Context) {
-		if c.Request.Method == http.MethodGet {
+		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
 			requestedPath := c.Request.URL.Path
 			if strings.HasPrefix(requestedPath, "/api/") || strings.HasPrefix(requestedPath, "/oauth/") {
 				c.Status(http.StatusNotFound)
@@ -196,5 +196,26 @@ func TestStaticAssetServing_SPAFallback(t *testing.T) {
 	entryETag := cache.ETag("web/entry.html")
 	if etag != entryETag {
 		t.Errorf("SPA fallback ETag %q != entry.html ETag %q", etag, entryETag)
+	}
+}
+
+func TestStaticAssetServing_HEAD(t *testing.T) {
+	r := setupStaticTestRouter()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("HEAD", "/entry.html", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for HEAD, got %d", w.Code)
+	}
+	if w.Header().Get("ETag") == "" {
+		t.Fatal("expected ETag header on HEAD request")
+	}
+	if w.Header().Get("Cache-Control") != "no-cache" {
+		t.Errorf("HEAD Cache-Control = %q, want %q", w.Header().Get("Cache-Control"), "no-cache")
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("expected empty body for HEAD, got %d bytes", w.Body.Len())
 	}
 }

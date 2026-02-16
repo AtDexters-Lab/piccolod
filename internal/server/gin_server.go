@@ -1257,7 +1257,7 @@ func (s *GinServer) setupGinRoutes() {
 
 	// Static file serving for web UI and fallback
 	r.NoRoute(func(c *gin.Context) {
-		if c.Request.Method == http.MethodGet {
+		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
 			requestedPath := c.Request.URL.Path
 			if strings.HasPrefix(requestedPath, "/api/") || strings.HasPrefix(requestedPath, "/oauth/") {
 				c.Status(http.StatusNotFound)
