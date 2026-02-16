@@ -388,25 +388,11 @@ class _AppDetailViewState extends State<AppDetailView>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    Text(
-                      _app!.displayTitle,
-                      style: PiccoloTheme.textTheme.displayLarge?.copyWith(
-                        fontSize: 24,
-                      ),
-                    ),
-                    const Spacer(),
-                    // Uninstall Button (Moved here from AppBar)
-                    IconButton(
-                      icon: const Icon(
-                        PiccoloIcons.delete,
-                        color: PiccoloTheme.critical,
-                      ),
-                      onPressed: _confirmUninstall,
-                      tooltip: "Uninstall",
-                    ),
-                  ],
+                Text(
+                  _app!.displayTitle,
+                  style: PiccoloTheme.textTheme.displayLarge?.copyWith(
+                    fontSize: 24,
+                  ),
                 ),
                 const SizedBox(height: Spacing.sm),
                 Row(
@@ -459,50 +445,66 @@ class _AppDetailViewState extends State<AppDetailView>
           // Actions
           if (_isActionLoading)
             const CircularProgressIndicator()
-          else ...[
-            if (_containers.length > 1) ...[
-              _buildServiceSelector(),
-              const SizedBox(width: Spacing.md),
-            ],
-            if (_app!.isRunning) ...[
-              FilledButton.icon(
-                onPressed: _openTerminal,
-                icon: const Icon(PiccoloIcons.terminal),
-                label: const Text("Terminal"),
-                style: FilledButton.styleFrom(
-                  backgroundColor: PiccoloTheme.cobalt600,
+          else
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_containers.length > 1) ...[
+                  _buildServiceSelector(),
+                  const SizedBox(width: Spacing.md),
+                ],
+                if (_app!.isRunning) ...[
+                  FilledButton.icon(
+                    onPressed: _openTerminal,
+                    icon: const Icon(PiccoloIcons.terminal),
+                    label: const Text("Terminal"),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: PiccoloTheme.cobalt600,
+                    ),
+                  ),
+                  const SizedBox(width: Spacing.md),
+                ],
+                if (_app!.isRunning)
+                  FilledButton.icon(
+                    onPressed: () => _handleActionWithProgress(
+                      taskType: 'stop_app',
+                      action: (taskId) =>
+                          widget.appService.stopApp(_app!.name, taskId: taskId),
+                    ),
+                    icon: const Icon(PiccoloIcons.stop),
+                    label: const Text("Stop"),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: PiccoloTheme.inkMuted,
+                    ),
+                  )
+                else
+                  FilledButton.icon(
+                    onPressed: () => _handleActionWithProgress(
+                      taskType: 'start_app',
+                      action: (taskId) =>
+                          widget.appService.startApp(_app!.name, taskId: taskId),
+                    ),
+                    icon: const Icon(PiccoloIcons.play),
+                    label: const Text("Start"),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: PiccoloTheme.success,
+                    ),
+                  ),
+                const SizedBox(width: Spacing.md),
+                IconButton.outlined(
+                  onPressed: _confirmUninstall,
+                  icon: const Icon(PiccoloIcons.delete, size: 20),
+                  tooltip: "Uninstall",
+                  style: IconButton.styleFrom(
+                    foregroundColor: PiccoloTheme.critical,
+                    side: BorderSide(
+                      color: PiccoloTheme.critical.withValues(alpha: 0.3),
+                    ),
+                  ),
                 ),
-              ),
-              const SizedBox(width: Spacing.md),
-            ],
-            // Start/Stop button
-            if (_app!.isRunning)
-              FilledButton.icon(
-                onPressed: () => _handleActionWithProgress(
-                  taskType: 'stop_app',
-                  action: (taskId) =>
-                      widget.appService.stopApp(_app!.name, taskId: taskId),
-                ),
-                icon: const Icon(PiccoloIcons.stop),
-                label: const Text("Stop"),
-                style: FilledButton.styleFrom(
-                  backgroundColor: PiccoloTheme.inkMuted,
-                ),
-              )
-            else
-              FilledButton.icon(
-                onPressed: () => _handleActionWithProgress(
-                  taskType: 'start_app',
-                  action: (taskId) =>
-                      widget.appService.startApp(_app!.name, taskId: taskId),
-                ),
-                icon: const Icon(PiccoloIcons.play),
-                label: const Text("Start"),
-                style: FilledButton.styleFrom(
-                  backgroundColor: PiccoloTheme.success,
-                ),
-              ),
-          ],
+              ],
+            ),
         ],
       ),
     );

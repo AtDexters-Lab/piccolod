@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../remote_controller.dart';
 import 'remote_certificates_card.dart';
 import 'remote_aliases_card.dart';
@@ -121,6 +122,9 @@ class RemoteDashboard extends StatelessWidget {
             label: "Portal Hostname",
             value: status.portalHostname ?? "Not Configured",
             icon: PiccoloIcons.link,
+            onTap: status.portalHostname != null && status.portalHostname!.isNotEmpty
+                ? () => launchUrl(Uri.parse('https://${status.portalHostname}'))
+                : null,
           ),
         ),
         const SizedBox(width: Spacing.base),
@@ -291,11 +295,18 @@ class _InfoCard extends StatelessWidget {
   final String label;
   final String value;
   final IconData icon;
+  final VoidCallback? onTap;
 
-  const _InfoCard({required this.label, required this.value, required this.icon});
+  const _InfoCard({
+    required this.label,
+    required this.value,
+    required this.icon,
+    this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
+    final isLink = onTap != null;
     return Container(
       padding: const EdgeInsets.all(Spacing.base),
       decoration: BoxDecoration(
@@ -314,7 +325,37 @@ class _InfoCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: Spacing.sm),
-          Text(value, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15), overflow: TextOverflow.ellipsis),
+          if (isLink)
+            MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: onTap,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Flexible(
+                      child: Text(
+                        value,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 15,
+                          color: PiccoloTheme.cobalt600,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: Spacing.xs),
+                    const Icon(PiccoloIcons.openExternal, size: 14, color: PiccoloTheme.cobalt600),
+                  ],
+                ),
+              ),
+            )
+          else
+            Text(
+              value,
+              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
+              overflow: TextOverflow.ellipsis,
+            ),
         ],
       ),
     );
