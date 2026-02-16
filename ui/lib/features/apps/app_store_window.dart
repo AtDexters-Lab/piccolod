@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../theme/piccolo_theme.dart';
+import '../../theme/piccolo_icons.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'store_tab.dart';
 import 'custom_install_wizard.dart';
@@ -89,7 +90,7 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
     widget.desktopController.openApp(
       "app-detail-$appName",
       appName,
-      Icons.settings_applications,
+      PiccoloIcons.settingsApp,
       AppDetailView(
         appId: appName,
         appService: widget.desktopController.appService,
@@ -106,11 +107,11 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
       children: [
         // Header Row 1: Search + Action Buttons
         Container(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+          padding: const EdgeInsets.fromLTRB(Spacing.base, Spacing.md, Spacing.base, Spacing.sm),
           decoration: const BoxDecoration(
             color: PiccoloTheme.porcelain,
             border: Border(
-              bottom: BorderSide(color: Colors.black12),
+              bottom: BorderSide(color: PiccoloTheme.hairline),
             ),
           ),
           child: Row(
@@ -121,13 +122,13 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
                   controller: _searchController,
                   decoration: InputDecoration(
                     hintText: 'Search apps...',
-                    prefixIcon: const Icon(Icons.search, size: 20),
+                    prefixIcon: const Icon(PiccoloIcons.search, size: 20),
                     contentPadding: const EdgeInsets.symmetric(
-                      vertical: 10,
-                      horizontal: 12,
+                      vertical: Spacing.sm,
+                      horizontal: Spacing.md,
                     ),
                     border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: BorderRadius.circular(Radii.sm),
                       borderSide: BorderSide.none,
                     ),
                     filled: true,
@@ -136,35 +137,19 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
                   style: const TextStyle(fontSize: 14),
                 ),
               ),
-              const SizedBox(width: 16),
+              const SizedBox(width: Spacing.base),
               // Create Workspace Button
               OutlinedButton.icon(
                 onPressed: _openCreateWorkspace,
-                icon: const Icon(Icons.terminal, size: 18),
+                icon: const Icon(PiccoloIcons.terminal, size: 18),
                 label: const Text("Create Workspace"),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: PiccoloTheme.ink,
-                  side: const BorderSide(color: Colors.black26),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 12,
-                  ),
-                ),
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: Spacing.sm),
               // Custom App Button
               OutlinedButton.icon(
                 onPressed: _openCustomInstallWizard,
-                icon: const Icon(Icons.add_box_outlined, size: 18),
+                icon: const Icon(PiccoloIcons.addBox, size: 18),
                 label: const Text("Custom App"),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: PiccoloTheme.ink,
-                  side: const BorderSide(color: Colors.black26),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 12,
-                  ),
-                ),
               ),
             ],
           ),
@@ -173,16 +158,16 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
         // Header Row 2: Category Chips (wrapping for mouse-friendly interaction)
         Container(
           width: double.infinity,
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          padding: const EdgeInsets.symmetric(horizontal: Spacing.base, vertical: Spacing.sm),
           decoration: const BoxDecoration(
             color: PiccoloTheme.porcelain,
             border: Border(
-              bottom: BorderSide(color: Colors.black12),
+              bottom: BorderSide(color: PiccoloTheme.hairline),
             ),
           ),
           child: Wrap(
-            spacing: 8,
-            runSpacing: 8,
+            spacing: Spacing.sm,
+            runSpacing: Spacing.sm,
             children: [
               for (final cat in _categories)
                 ChoiceChip(
@@ -199,14 +184,14 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
                         ? FontWeight.bold
                         : FontWeight.normal,
                   ),
-                  backgroundColor: Colors.white,
+                  backgroundColor: PiccoloTheme.porcelain,
                   side: BorderSide(
                     color: cat == _selectedCategory
                         ? PiccoloTheme.cobalt600
-                        : Colors.black26,
+                        : PiccoloTheme.outline,
                   ),
                   shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(20),
+                    borderRadius: BorderRadius.circular(Radii.lg),
                   ),
                 ),
             ],

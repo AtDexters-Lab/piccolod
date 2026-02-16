@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
+import '../../../../../theme/piccolo_icons.dart';
 import '../../../../../theme/piccolo_theme.dart';
+import '../../../../../shared/widgets/info_row.dart';
 import '../../../../../shared/widgets/password_set_form.dart';
+import '../../../../../shared/widgets/piccolo_card.dart';
 import '../settings_controller.dart';
 
 class ProfileTab extends StatelessWidget {
@@ -20,53 +23,32 @@ class ProfileTab extends StatelessWidget {
         _InfoCard(
           title: "Current Session",
           children: [
-            _InfoRow("User", session.user),
-            _InfoRow("Authenticated", session.authenticated.toString()),
+            InfoRow("User", session.user),
+            InfoRow("Authenticated", session.authenticated.toString()),
             if (session.expiresAt != null)
-              _InfoRow("Expires At", session.expiresAt.toString()),
-            _InfoRow("Volumes Locked", session.volumesLocked.toString()),
+              InfoRow("Expires At", session.expiresAt.toString()),
+            InfoRow("Volumes Locked", session.volumesLocked.toString()),
           ],
         ),
         const SizedBox(height: 32),
-        Text("Actions", style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 20)),
+        Text("Actions", style: PiccoloTheme.textTheme.headlineSmall),
         const SizedBox(height: 16),
         Wrap(
           spacing: 16,
           runSpacing: 16,
           children: [
-             ElevatedButton.icon(
+             OutlinedButton.icon(
               onPressed: () => _showChangePasswordDialog(context),
-              icon: const Icon(Icons.lock_reset),
+              icon: const Icon(PiccoloIcons.lockKey),
               label: const Text("Change Password"),
-              style: ButtonStyle(
-                 backgroundColor: WidgetStateProperty.all(Colors.white),
-                 foregroundColor: WidgetStateProperty.all(PiccoloTheme.ink),
-                 elevation: WidgetStateProperty.all(0),
-                 side: WidgetStateProperty.all(const BorderSide(color: PiccoloTheme.mist)),
-                 padding: WidgetStateProperty.all(const EdgeInsets.symmetric(horizontal: 24, vertical: 16)),
-                 overlayColor: WidgetStateProperty.resolveWith((states) {
-                   if (states.contains(WidgetState.hovered)) {
-                     return PiccoloTheme.ink.withValues(alpha: 0.05);
-                   }
-                   return null;
-                 }),
-              ),
             ),
-            ElevatedButton.icon(
-              onPressed: () => controller.logout(onLogout ?? () {}), // This will invalidate session
-              icon: const Icon(Icons.logout),
+            FilledButton.icon(
+              onPressed: () => controller.logout(onLogout ?? () {}),
+              icon: const Icon(PiccoloIcons.logout),
               label: const Text("Logout"),
-              style: ButtonStyle(
-                 backgroundColor: WidgetStateProperty.all(PiccoloTheme.critical.withValues(alpha: 0.1)),
-                 foregroundColor: WidgetStateProperty.all(PiccoloTheme.critical),
-                 elevation: WidgetStateProperty.all(0),
-                 padding: WidgetStateProperty.all(const EdgeInsets.symmetric(horizontal: 24, vertical: 16)),
-                 overlayColor: WidgetStateProperty.resolveWith((states) {
-                   if (states.contains(WidgetState.hovered)) {
-                     return PiccoloTheme.critical.withValues(alpha: 0.2);
-                   }
-                   return null;
-                 }),
+              style: FilledButton.styleFrom(
+                 backgroundColor: PiccoloTheme.critical.withValues(alpha: 0.1),
+                 foregroundColor: PiccoloTheme.critical,
               ),
             ),
           ],
@@ -79,7 +61,7 @@ class ProfileTab extends StatelessWidget {
     final oldController = TextEditingController();
     final newController = TextEditingController();
     final confirmController = TextEditingController();
-    
+
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -97,11 +79,8 @@ class ProfileTab extends StatelessWidget {
                   const SizedBox(height: 24),
                   TextField(
                     controller: oldController,
-                    decoration: InputDecoration(
+                    decoration: const InputDecoration(
                       labelText: "Current Password",
-                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                       filled: true,
-                       fillColor: Colors.white,
                     ),
                     obscureText: true,
                     autofillHints: const [AutofillHints.password],
@@ -163,49 +142,14 @@ class _InfoCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      elevation: 0,
-      color: Colors.white,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(title, style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
-            const Divider(),
-            const SizedBox(height: 16),
-            ...children,
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _InfoRow extends StatelessWidget {
-  final String label;
-  final String value;
-
-  const _InfoRow(this.label, this.value);
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    return PiccoloCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(label, style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted)),
-          const SizedBox(width: 16),
-          Expanded(
-            child: Text(
-              value,
-              style: PiccoloTheme.textTheme.bodyMedium,
-              textAlign: TextAlign.right,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
+          Text(title, style: PiccoloTheme.textTheme.titleMedium),
+          const Divider(),
+          const SizedBox(height: Spacing.base),
+          ...children,
         ],
       ),
     );

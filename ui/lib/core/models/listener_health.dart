@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../theme/piccolo_theme.dart';
+import '../../theme/piccolo_icons.dart';
 
 /// Shared visual mappings for listener health status.
 class ListenerHealthVisuals {
@@ -32,13 +33,13 @@ class ListenerHealthVisuals {
   static IconData iconForStatus(String status) {
     switch (status) {
       case 'degraded':
-        return Icons.warning_amber;
+        return PiccoloIcons.warning;
       case 'recovering':
-        return Icons.hourglass_empty;
+        return PiccoloIcons.hourglass;
       case 'error':
-        return Icons.error_outline;
+        return PiccoloIcons.error;
       default:
-        return Icons.info_outline;
+        return PiccoloIcons.info;
     }
   }
 }

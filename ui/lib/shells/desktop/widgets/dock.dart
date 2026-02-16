@@ -9,6 +9,8 @@ import '../../../core/services/api_client.dart';
 import '../../../core/services/network_service.dart';
 import '../../../core/services/websocket_connection.dart';
 import '../../../shared/widgets/app_icon.dart';
+import '../../../shared/widgets/status_dot.dart';
+import '../../../theme/piccolo_icons.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../desktop_controller.dart';
 import '../models/desktop_window.dart';
@@ -37,18 +39,12 @@ class Dock extends StatelessWidget {
     return PointerInterceptor(
       intercepting: controller.hasVisibleWebWindow,
       child: Container(
-        margin: const EdgeInsets.only(bottom: 12),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        margin: const EdgeInsets.only(bottom: Spacing.md),
+        padding: const EdgeInsets.symmetric(horizontal: Spacing.base, vertical: Spacing.md),
         decoration: BoxDecoration(
           color: PiccoloTheme.porcelain.withValues(alpha: 0.9),
-          borderRadius: BorderRadius.circular(24),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.15),
-              blurRadius: 20,
-              offset: const Offset(0, 8),
-            ),
-          ],
+          borderRadius: BorderRadius.circular(Radii.lg),
+          boxShadow: Elevation.elev3,
           border: Border.all(
             color: Colors.white.withValues(alpha: 0.5),
             width: 1.5,
@@ -59,41 +55,41 @@ class Dock extends StatelessWidget {
           children: [
             // Home button
             DockItem(
-              icon: Icons.home_rounded,
+              icon: PiccoloIcons.home,
               label: "Home",
               onTap: controller.minimizeAllWindows,
             ),
-            const SizedBox(width: 12),
+            const SizedBox(width: Spacing.md),
 
             // Health indicator
             _HealthIndicator(controller: controller),
-            const SizedBox(width: 12),
+            const SizedBox(width: Spacing.md),
 
             // Network peers indicator
             const _NetworkPeersIndicator(),
-            const SizedBox(width: 16),
+            const SizedBox(width: Spacing.base),
 
             _buildSeparator(),
-            const SizedBox(width: 16),
+            const SizedBox(width: Spacing.base),
 
             // Pinned apps
             DockItem(
-              icon: Icons.storefront,
+              icon: PiccoloIcons.store,
               label: "App Store",
               isActive: controller.isAppActive("app-store"),
               isOpen: controller.isAppOpen("app-store"),
               onTap: () => controller.openAppStore(),
             ),
-            const SizedBox(width: 12),
+            const SizedBox(width: Spacing.md),
             DockItem(
-              icon: Icons.settings_rounded,
+              icon: PiccoloIcons.settings,
               label: "Settings",
               isOpen: controller.isAppOpen("settings"),
               isActive: controller.isAppActive("settings"),
               onTap: () => controller.openApp(
                 "settings",
                 "Settings",
-                Icons.settings_rounded,
+                PiccoloIcons.settings,
                 SettingsApp(
                   onLogout: controller.logout,
                   eventStreamClient: controller.eventStreamClient,
@@ -102,16 +98,16 @@ class Dock extends StatelessWidget {
                 initialSize: const Size(1100, 750),
               ),
             ),
-            const SizedBox(width: 12),
+            const SizedBox(width: Spacing.md),
             DockItem(
-              icon: Icons.terminal_rounded,
+              icon: PiccoloIcons.terminal,
               label: "Terminal",
               isOpen: controller.isAppOpen("terminal"),
               isActive: controller.isAppActive("terminal"),
               onTap: () => controller.openApp(
                 "terminal",
                 "Terminal",
-                Icons.terminal_rounded,
+                PiccoloIcons.terminal,
                 TerminalApp(
                   onSessionEnd: () => controller.closeWindow("terminal"),
                 ),
@@ -122,11 +118,11 @@ class Dock extends StatelessWidget {
 
             // Running windows section
             if (runningWindows.isNotEmpty) ...[
-              const SizedBox(width: 16),
+              const SizedBox(width: Spacing.base),
               _buildSeparator(),
-              const SizedBox(width: 16),
+              const SizedBox(width: Spacing.base),
               ...runningWindows.map((window) => Padding(
-                    padding: const EdgeInsets.only(right: 12),
+                    padding: const EdgeInsets.only(right: Spacing.md),
                     child: _RunningWindowItem(
                       window: window,
                       isActive: controller.isAppActive(window.id),
@@ -135,9 +131,9 @@ class Dock extends StatelessWidget {
                   )),
             ],
 
-            const SizedBox(width: 16),
+            const SizedBox(width: Spacing.base),
             _buildSeparator(),
-            const SizedBox(width: 16),
+            const SizedBox(width: Spacing.base),
 
             // Profile button
             _ProfileButton(onLogout: controller.logout),
@@ -220,24 +216,17 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   void _onClientStateChanged() {
     if (!mounted) return;
     final client = widget.controller.eventStreamClient;
-    // Clear stale health data on reconnect; server will send fresh snapshot.
-    // Mark as pending so the UI shows "Offline" until real data arrives,
-    // preventing a brief "Healthy" flash on transient reconnects.
     if (client?.state == WebSocketConnectionState.connected) {
       _healthMap.clear();
       _pendingSnapshot = true;
       _snapshotGrace?.cancel();
       _snapshotGrace = Timer(const Duration(seconds: 3), () {
         if (!mounted) return;
-        // Grace period expired — only clear the pending flag if we actually
-        // received health data. If the map is still empty, keep showing
-        // "Offline" rather than a false "Healthy".
         if (_healthMap.isNotEmpty) {
           setState(() => _pendingSnapshot = false);
         }
       });
     } else {
-      // Disconnected — cancel any pending grace timer.
       _snapshotGrace?.cancel();
       _pendingSnapshot = false;
     }
@@ -249,7 +238,6 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
     setState(() {
       final key = '${event.app}:${event.listener}';
       _healthMap[key] = event.health;
-      // Real health data arrived — no longer pending.
       if (_pendingSnapshot) {
         _pendingSnapshot = false;
         _snapshotGrace?.cancel();
@@ -271,8 +259,6 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
     return client.state == WebSocketConnectionState.connected;
   }
 
-  /// Aggregates health across all listeners to find worst status.
-  /// Priority: error > degraded > recovering > ok
   String get _aggregateStatus {
     if (_healthMap.isEmpty) return 'ok';
 
@@ -344,29 +330,16 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
           color: color.withValues(alpha: 0.1),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(Radii.md),
           border: Border.all(color: color.withValues(alpha: 0.3)),
         ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 8,
-              height: 8,
-              decoration: BoxDecoration(
-                color: color,
-                shape: BoxShape.circle,
-              ),
-            ),
-            const SizedBox(width: 6),
-            Text(
-              _statusLabel,
-              style: PiccoloTheme.textTheme.labelSmall?.copyWith(
-                color: PiccoloTheme.ink,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ],
+        child: StatusDot(
+          color: color,
+          label: _statusLabel,
+          labelStyle: PiccoloTheme.textTheme.labelSmall?.copyWith(
+            color: PiccoloTheme.ink,
+            fontWeight: FontWeight.w500,
+          ),
         ),
       ),
     );
@@ -390,7 +363,7 @@ class _RunningWindowItem extends StatelessWidget {
         proxyUrl: window.iconUrl,
         originalIconUrl: window.originalIconUrl,
         size: 28,
-        borderRadius: 8,
+        borderRadius: Radii.sm,
         fallbackIcon: window.icon,
         fallbackBackgroundColor: Colors.transparent,
       );
@@ -406,29 +379,28 @@ class _RunningWindowItem extends StatelessWidget {
       message: window.title,
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(Radii.md),
         child: Container(
-          padding: const EdgeInsets.all(10),
+          padding: const EdgeInsets.fromLTRB(10, 10, 10, 14),
           decoration: BoxDecoration(
             color: isActive
                 ? PiccoloTheme.cobalt600.withValues(alpha: 0.1)
                 : Colors.transparent,
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(Radii.md),
           ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
+          child: Stack(
+            alignment: Alignment.center,
+            clipBehavior: Clip.none,
             children: [
               _buildIcon(color),
-              const SizedBox(height: 4),
-              // Running indicator dot
-              Container(
-                width: 4,
-                height: 4,
-                decoration: BoxDecoration(
+              // Running indicator dot pinned to bottom
+              Positioned(
+                bottom: -8,
+                child: StatusDot(
                   color: window.isMinimized
                       ? PiccoloTheme.inkMuted.withValues(alpha: 0.5)
                       : PiccoloTheme.ink,
-                  shape: BoxShape.circle,
+                  size: 4,
                 ),
               ),
             ],
@@ -448,17 +420,14 @@ class _ProfileButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return PopupMenuButton<String>(
       offset: const Offset(0, -60),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-      ),
       itemBuilder: (context) => [
-        const PopupMenuItem(
+        PopupMenuItem(
           value: 'logout',
           child: Row(
             children: [
-              Icon(Icons.logout, size: 18, color: PiccoloTheme.ink),
-              SizedBox(width: 12),
-              Text("Log Out"),
+              Icon(PiccoloIcons.logout, size: 18, color: PiccoloTheme.ink),
+              const SizedBox(width: Spacing.md),
+              const Text("Log Out"),
             ],
           ),
         ),
@@ -474,13 +443,13 @@ class _ProfileButton extends StatelessWidget {
           padding: const EdgeInsets.all(6),
           decoration: BoxDecoration(
             color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(Radii.md),
           ),
-          child: const CircleAvatar(
+          child: CircleAvatar(
             radius: 14,
             backgroundColor: PiccoloTheme.cobalt600,
             child: Icon(
-              Icons.person,
+              PiccoloIcons.person,
               size: 18,
               color: Colors.white,
             ),
@@ -515,27 +484,26 @@ class DockItem extends StatelessWidget {
       message: label,
       child: InkWell(
         onTap: onTap ?? () {},
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(Radii.md),
         child: Container(
-          padding: const EdgeInsets.all(10),
+          padding: const EdgeInsets.fromLTRB(10, 10, 10, 14),
           decoration: BoxDecoration(
             color: isActive
                 ? PiccoloTheme.cobalt600.withValues(alpha: 0.1)
                 : Colors.transparent,
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(Radii.md),
           ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
+          child: Stack(
+            alignment: Alignment.center,
+            clipBehavior: Clip.none,
             children: [
               Icon(icon, color: color, size: 28),
-              const SizedBox(height: 4),
-              // "Running" indicator dot
-              Container(
-                width: 4,
-                height: 4,
-                decoration: BoxDecoration(
+              // "Running" indicator dot pinned to bottom
+              Positioned(
+                bottom: -8,
+                child: StatusDot(
                   color: isOpen ? PiccoloTheme.ink : Colors.transparent,
-                  shape: BoxShape.circle,
+                  size: 4,
                 ),
               ),
             ],
@@ -563,7 +531,6 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
   void initState() {
     super.initState();
     _fetchPeers();
-    // Poll every 30 seconds (half of mDNS discovery interval)
     _pollTimer = Timer.periodic(const Duration(seconds: 30), (_) => _fetchPeers());
   }
 
@@ -603,7 +570,6 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
 
   @override
   Widget build(BuildContext context) {
-    // Hide if no peers
     if (_peers.isEmpty) {
       return const SizedBox.shrink();
     }
@@ -612,11 +578,10 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
 
     return PopupMenuButton<DiscoveredPeer>(
       offset: const Offset(0, -80),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       tooltip: "Other Piccolo devices on your network",
       onSelected: (peer) => _openPeerUrl(peer.url),
       itemBuilder: (context) => [
-        const PopupMenuItem(
+        PopupMenuItem(
           enabled: false,
           child: Text(
             "Other Piccolo Devices",
@@ -632,15 +597,10 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
               enabled: peer.online,
               child: Row(
                 children: [
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      color: peer.online ? PiccoloTheme.success : PiccoloTheme.inkMuted,
-                      shape: BoxShape.circle,
-                    ),
+                  StatusDot(
+                    color: peer.online ? PiccoloTheme.success : PiccoloTheme.inkMuted,
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: Spacing.md),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -655,10 +615,7 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
                             peer.online
                                 ? (peer.model ?? peer.ipv4 ?? '')
                                 : '(offline)',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: PiccoloTheme.inkMuted,
-                            ),
+                            style: PiccoloTheme.textTheme.labelSmall,
                           ),
                       ],
                     ),
@@ -671,14 +628,14 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
           color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(Radii.md),
           border: Border.all(color: PiccoloTheme.cobalt600.withValues(alpha: 0.3)),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              Icons.devices,
+              PiccoloIcons.devices,
               size: 16,
               color: PiccoloTheme.cobalt600,
             ),

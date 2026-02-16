@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
+import '../../../../theme/piccolo_icons.dart';
 import '../../../../theme/piccolo_theme.dart';
 import '../../../../core/models/network_models.dart';
 import '../../../../core/services/api_client.dart';
@@ -63,22 +64,22 @@ class _SetupWizardState extends State<SetupWizard> {
                 state != SetupState.installComplete;
 
             return Container(
-              color: Colors.black.withValues(alpha: 0.5),
+              color: PiccoloTheme.scrim,
               child: Center(
                 child: Container(
                   width: dialogWidth,
                   constraints: BoxConstraints(maxHeight: dialogMaxHeight),
                   decoration: BoxDecoration(
                     color: PiccoloTheme.porcelain,
-                    borderRadius: BorderRadius.circular(24),
+                    borderRadius: BorderRadius.circular(Radii.lg),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.2),
+                        color: PiccoloTheme.scrim.withValues(alpha: 0.2),
                         blurRadius: 40,
                         offset: const Offset(0, 20),
                       ),
                     ],
-                    border: Border.all(color: Colors.white, width: 1),
+                    border: Border.all(color: PiccoloTheme.porcelain, width: 1),
                   ),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -115,7 +116,7 @@ class _SetupWizardState extends State<SetupWizard> {
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               AnimatedSwitcher(
-                                duration: const Duration(milliseconds: 300),
+                                duration: Motion.slow,
                                 child: _buildStepContent(state),
                               ),
                               // Other devices panel (shown in all states except loading/finishing/system error)
@@ -309,7 +310,7 @@ class _FirstRunStepper extends StatelessWidget {
                 ? Colors.white
                 : PiccoloTheme.inkMuted,
             child: isCompleted
-                ? const Icon(Icons.check, size: 14)
+                ? const Icon(PiccoloIcons.check, size: 14)
                 : Text("${step + 1}", style: const TextStyle(fontSize: 12)),
           ),
           const SizedBox(height: 6),
@@ -384,7 +385,7 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
         ? "Your device will reboot into the internal disk. You can remove the USB drive at any time."
         : "Remove the USB drive after the device powers off, then power it back on.";
     final buttonLabel = widget.bootOrderConfigured ? "Reboot Now" : "Power Off";
-    final buttonIcon = widget.bootOrderConfigured ? Icons.restart_alt : Icons.power_settings_new;
+    final buttonIcon = widget.bootOrderConfigured ? PiccoloIcons.restart : PiccoloIcons.power;
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
@@ -392,7 +393,7 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
         mainAxisSize: MainAxisSize.min,
         children: [
           const Icon(
-            Icons.check_circle_outline,
+            PiccoloIcons.success,
             color: PiccoloTheme.success,
             size: 48,
           ),
@@ -416,7 +417,7 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: PiccoloTheme.critical.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(Radii.sm),
                 border: Border.all(
                   color: PiccoloTheme.critical.withValues(alpha: 0.2),
                 ),
@@ -430,7 +431,7 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
             ),
           ],
           const SizedBox(height: 32),
-          ElevatedButton.icon(
+          FilledButton.icon(
             onPressed: _isRebooting
                 ? null
                 : () async {
@@ -449,14 +450,6 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
                   )
                 : Icon(buttonIcon),
             label: Text(_isRebooting ? "Shutting down..." : buttonLabel),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: PiccoloTheme.cobalt600,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-            ),
           ),
         ],
       ),
@@ -483,24 +476,15 @@ class _WelcomeStep extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           Text(
-            "Let’s set up your Piccolo.\nCreate an admin password and save a recovery key. Takes about a minute.",
+            "Let's set up your Piccolo.\nCreate an admin password and save a recovery key. Takes about a minute.",
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               color: PiccoloTheme.inkMuted,
             ),
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 40),
-          ElevatedButton(
+          FilledButton(
             onPressed: onNext,
-            style: ElevatedButton.styleFrom(
-              backgroundColor: PiccoloTheme.cobalt600,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-              elevation: 2,
-            ),
             child: const Text("Start setup"),
           ),
         ],
@@ -599,16 +583,8 @@ class _CredentialsStepState extends State<_CredentialsStep> {
               style: TextStyle(color: PiccoloTheme.inkMuted, fontSize: 13),
             ),
             const SizedBox(height: 32),
-            ElevatedButton(
+            FilledButton(
               onPressed: _isSubmitting ? null : _submit,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: PiccoloTheme.cobalt600,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 16),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-              ),
               child: _isSubmitting
                   ? const SizedBox(
                       width: 20,
@@ -671,7 +647,7 @@ class _RecoveryStepState extends State<_RecoveryStep> {
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: PiccoloTheme.mist,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(Radii.sm),
               border: Border.all(
                 color: PiccoloTheme.cobalt600.withValues(alpha: 0.35),
                 width: 1.2,
@@ -681,14 +657,14 @@ class _RecoveryStepState extends State<_RecoveryStep> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Icon(
-                  Icons.info_outline,
+                  PiccoloIcons.info,
                   color: PiccoloTheme.inkMuted,
                   size: 18,
                 ),
                 SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    "Your 24-word recovery key is below. Store it offline; you’ll need it to reset your password.",
+                    "Your 24-word recovery key is below. Store it offline; you'll need it to reset your password.",
                     style: TextStyle(
                       fontSize: 13,
                       color: PiccoloTheme.inkMuted,
@@ -703,7 +679,7 @@ class _RecoveryStepState extends State<_RecoveryStep> {
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
               color: PiccoloTheme.porcelain,
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(Radii.sm),
               border: Border.all(
                 color: PiccoloTheme.ink.withValues(alpha: 0.06),
               ),
@@ -715,8 +691,7 @@ class _RecoveryStepState extends State<_RecoveryStep> {
                 children: [
                   SelectableText(
                     widget.words.join(" "),
-                    style: const TextStyle(
-                      fontFamily: 'monospace',
+                    style: PiccoloTheme.mono.copyWith(
                       fontSize: 16,
                       height: 1.4,
                     ),
@@ -730,7 +705,7 @@ class _RecoveryStepState extends State<_RecoveryStep> {
           // Download button (clipboard copy is unreliable in insecure contexts)
           OutlinedButton.icon(
             onPressed: _downloadKey,
-            icon: const Icon(Icons.download, size: 16),
+            icon: const Icon(PiccoloIcons.download, size: 16),
             label: const Text("Download key"),
             style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.ink),
           ),
@@ -748,7 +723,7 @@ class _RecoveryStepState extends State<_RecoveryStep> {
                 ),
                 Expanded(
                   child: Text(
-                    "I’ve saved this recovery key somewhere safe.",
+                    "I've saved this recovery key somewhere safe.",
                     style: PiccoloTheme.textTheme.bodyMedium,
                   ),
                 ),
@@ -757,16 +732,16 @@ class _RecoveryStepState extends State<_RecoveryStep> {
           ),
 
           const SizedBox(height: 24),
-          ElevatedButton(
+          FilledButton(
             onPressed: _confirmed ? widget.onNext : null,
-            style: ElevatedButton.styleFrom(
+            style: FilledButton.styleFrom(
               backgroundColor: PiccoloTheme.success,
               foregroundColor: Colors.white,
               disabledBackgroundColor: PiccoloTheme.ink.withValues(alpha: 0.1),
               disabledForegroundColor: PiccoloTheme.ink.withValues(alpha: 0.3),
               padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(Radii.sm),
               ),
             ),
             child: const Text("Continue"),
@@ -822,7 +797,7 @@ class _SecurityStepState extends State<_SecurityStep> {
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: PiccoloTheme.mist,
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(Radii.sm),
               border: Border.all(
                 color: PiccoloTheme.cobalt600.withValues(alpha: 0.35),
                 width: 1.2,
@@ -831,7 +806,7 @@ class _SecurityStepState extends State<_SecurityStep> {
             child: const Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Icon(Icons.lock_outline, color: PiccoloTheme.inkMuted, size: 18),
+                Icon(PiccoloIcons.lock, color: PiccoloTheme.inkMuted, size: 18),
                 SizedBox(width: 8),
                 Expanded(
                   child: Text(
@@ -847,19 +822,19 @@ class _SecurityStepState extends State<_SecurityStep> {
           const SizedBox(height: 24),
           OutlinedButton.icon(
             onPressed: _downloading ? null : _downloadCA,
-            icon: const Icon(Icons.download, size: 16),
+            icon: const Icon(PiccoloIcons.download, size: 16),
             label: Text(_downloading ? "Downloading..." : "Download CA Certificate"),
             style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.ink),
           ),
           const SizedBox(height: 24),
-          ElevatedButton(
+          FilledButton(
             onPressed: widget.onNext,
-            style: ElevatedButton.styleFrom(
+            style: FilledButton.styleFrom(
               backgroundColor: PiccoloTheme.success,
               foregroundColor: Colors.white,
               padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
               shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
+                  borderRadius: BorderRadius.circular(Radii.sm)),
             ),
             child: const Text("Finish setup"),
           ),
@@ -920,17 +895,12 @@ class _UnlockStepState extends State<_UnlockStep> {
             autofillHints: const [AutofillHints.password],
             decoration: InputDecoration(
               labelText: "Password",
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-              filled: true,
-              fillColor: Colors.white,
               errorText: _error,
               suffixIcon: IconButton(
                 icon: Icon(
                   _obscureText
-                      ? Icons.visibility_off_outlined
-                      : Icons.visibility_outlined,
+                      ? PiccoloIcons.visibilityOff
+                      : PiccoloIcons.visibility,
                   color: PiccoloTheme.inkMuted,
                 ),
                 onPressed: () => setState(() => _obscureText = !_obscureText),
@@ -946,19 +916,8 @@ class _UnlockStepState extends State<_UnlockStep> {
                 child: const Text("Forgot Password?"),
               ),
               const Spacer(),
-              ElevatedButton(
+              FilledButton(
                 onPressed: _isSubmitting ? null : _submit,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: PiccoloTheme.cobalt600,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 32,
-                    vertical: 16,
-                  ),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
                 child: _isSubmitting
                     ? const SizedBox(
                         width: 20,
@@ -1034,13 +993,8 @@ class _LoginStepState extends State<_LoginStep> {
           TextField(
             controller: _userController,
             autofillHints: const [AutofillHints.username],
-            decoration: InputDecoration(
+            decoration: const InputDecoration(
               labelText: "Username",
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-              filled: true,
-              fillColor: Colors.white,
             ),
           ),
           const SizedBox(height: 16),
@@ -1050,17 +1004,12 @@ class _LoginStepState extends State<_LoginStep> {
             autofillHints: const [AutofillHints.password],
             decoration: InputDecoration(
               labelText: "Password",
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-              filled: true,
-              fillColor: Colors.white,
               errorText: _error,
               suffixIcon: IconButton(
                 icon: Icon(
                   _obscureText
-                      ? Icons.visibility_off_outlined
-                      : Icons.visibility_outlined,
+                      ? PiccoloIcons.visibilityOff
+                      : PiccoloIcons.visibility,
                   color: PiccoloTheme.inkMuted,
                 ),
                 onPressed: () => setState(() => _obscureText = !_obscureText),
@@ -1076,19 +1025,8 @@ class _LoginStepState extends State<_LoginStep> {
                 child: const Text("Forgot Password?"),
               ),
               const Spacer(),
-              ElevatedButton(
+              FilledButton(
                 onPressed: _isSubmitting ? null : _submit,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: PiccoloTheme.cobalt600,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 32,
-                    vertical: 16,
-                  ),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
                 child: _isSubmitting
                     ? const SizedBox(
                         width: 20,
@@ -1212,14 +1150,6 @@ class _ForgotPasswordStepState extends State<_ForgotPasswordStep> {
 
               hintText: "word1 word2 ...",
 
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-
-              filled: true,
-
-              fillColor: Colors.white,
-
               errorText: _keyError,
             ),
           ),
@@ -1260,23 +1190,8 @@ class _ForgotPasswordStepState extends State<_ForgotPasswordStep> {
 
               const SizedBox(width: 16),
 
-              ElevatedButton(
+              FilledButton(
                 onPressed: _isSubmitting ? null : _submit,
-
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: PiccoloTheme.cobalt600,
-
-                  foregroundColor: Colors.white,
-
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 32,
-                    vertical: 16,
-                  ),
-
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
 
                 child: _isSubmitting
                     ? const SizedBox(
@@ -1341,7 +1256,7 @@ class _SystemErrorStepState extends State<_SystemErrorStep> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.warning_amber_rounded, color: PiccoloTheme.critical, size: 48),
+          const Icon(PiccoloIcons.warning, color: PiccoloTheme.critical, size: 48),
           const SizedBox(height: 12),
           Text(
             "Storage operation failed",
@@ -1377,19 +1292,18 @@ class _SystemErrorStepState extends State<_SystemErrorStep> {
           const SizedBox(height: 24),
           OutlinedButton.icon(
             onPressed: _downloading ? null : _downloadLog,
-            icon: const Icon(Icons.download, size: 16),
+            icon: const Icon(PiccoloIcons.download, size: 16),
             label: Text(_downloading ? "Downloading..." : "Download Diagnostic Log"),
             style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.ink),
           ),
           const SizedBox(height: 16),
-          ElevatedButton.icon(
+          FilledButton.icon(
             onPressed: widget.onRetry,
-            icon: const Icon(Icons.refresh),
+            icon: const Icon(PiccoloIcons.refresh),
             label: const Text("Retry"),
-            style: ElevatedButton.styleFrom(
+            style: FilledButton.styleFrom(
               backgroundColor: PiccoloTheme.mist,
               foregroundColor: PiccoloTheme.ink,
-              elevation: 0,
             ),
           ),
         ],
@@ -1412,7 +1326,7 @@ class _ErrorStep extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           const Icon(
-            Icons.wifi_off_outlined,
+            PiccoloIcons.wifiOff,
             color: PiccoloTheme.critical,
             size: 48,
           ),
@@ -1448,14 +1362,13 @@ class _ErrorStep extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 24),
-          ElevatedButton.icon(
+          FilledButton.icon(
             onPressed: onRetry,
-            icon: const Icon(Icons.refresh),
+            icon: const Icon(PiccoloIcons.refresh),
             label: const Text("Retry"),
-            style: ElevatedButton.styleFrom(
+            style: FilledButton.styleFrom(
               backgroundColor: PiccoloTheme.mist,
               foregroundColor: PiccoloTheme.ink,
-              elevation: 0,
             ),
           ),
         ],
@@ -1536,12 +1449,12 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
         tilePadding: const EdgeInsets.symmetric(horizontal: 16),
         childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-          side: BorderSide(color: PiccoloTheme.ink.withValues(alpha: 0.1)),
+          borderRadius: BorderRadius.circular(Radii.md),
+          side: const BorderSide(color: PiccoloTheme.hairline),
         ),
         collapsedShape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-          side: BorderSide(color: PiccoloTheme.ink.withValues(alpha: 0.1)),
+          borderRadius: BorderRadius.circular(Radii.md),
+          side: const BorderSide(color: PiccoloTheme.hairline),
         ),
         backgroundColor: PiccoloTheme.mist.withValues(alpha: 0.5),
         collapsedBackgroundColor: PiccoloTheme.mist.withValues(alpha: 0.3),
@@ -1549,7 +1462,7 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
         title: Row(
           children: [
             Icon(
-              Icons.devices,
+              PiccoloIcons.devices,
               size: 18,
               color: PiccoloTheme.inkMuted,
             ),
@@ -1568,7 +1481,7 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 decoration: BoxDecoration(
                   color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(8),
+                  borderRadius: BorderRadius.circular(Radii.sm),
                 ),
                 child: Text(
                   '${_peers.length}',
@@ -1610,7 +1523,7 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
                   const SizedBox(height: 8),
                   TextButton.icon(
                     onPressed: _fetchPeers,
-                    icon: const Icon(Icons.refresh, size: 16),
+                    icon: const Icon(PiccoloIcons.refresh, size: 16),
                     label: const Text("Retry"),
                   ),
                 ],
@@ -1637,7 +1550,7 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
   Widget _buildPeerTile(DiscoveredPeer peer) {
     return InkWell(
       onTap: peer.online ? () => _openPeerUrl(peer.url) : null,
-      borderRadius: BorderRadius.circular(8),
+      borderRadius: BorderRadius.circular(Radii.sm),
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
         child: Row(
@@ -1676,7 +1589,7 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
             ),
             if (peer.online)
               Icon(
-                Icons.arrow_forward_ios,
+                PiccoloIcons.arrowForwardIos,
                 size: 14,
                 color: PiccoloTheme.inkMuted,
               ),

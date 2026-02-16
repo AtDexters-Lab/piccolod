@@ -17,7 +17,7 @@ class RemoteEventsCard extends StatelessWidget {
 
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.all(Spacing.base),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -32,19 +32,19 @@ class RemoteEventsCard extends StatelessWidget {
                   ),
               ],
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: Spacing.base),
             if (events.isEmpty)
               const Text("No recent activity.", style: TextStyle(color: PiccoloTheme.inkMuted))
             else
               Container(
                 decoration: BoxDecoration(
                   color: PiccoloTheme.mist,
-                  borderRadius: BorderRadius.circular(8),
+                  borderRadius: BorderRadius.circular(Radii.sm),
                 ),
                 child: ListView.separated(
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
-                  padding: const EdgeInsets.all(8),
+                  padding: const EdgeInsets.all(Spacing.sm),
                   itemCount: previewEvents.length,
                   separatorBuilder: (c, i) => const Divider(height: 1),
                   itemBuilder: (context, index) => _buildEventItem(previewEvents[index]),
@@ -84,12 +84,12 @@ class RemoteEventsCard extends StatelessWidget {
     if (event.level == 'error') levelColor = PiccoloTheme.critical;
 
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
+      padding: const EdgeInsets.symmetric(vertical: Spacing.sm),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-           Text(dateFormat.format(event.ts.toLocal()), style: const TextStyle(fontSize: 12, color: PiccoloTheme.inkMuted, fontFamily: 'monospace')),
-           const SizedBox(width: 8),
+           Text(dateFormat.format(event.ts.toLocal()), style: PiccoloTheme.mono.copyWith(color: PiccoloTheme.inkMuted)),
+           const SizedBox(width: Spacing.sm),
            Expanded(
              child: Column(
                crossAxisAlignment: CrossAxisAlignment.start,

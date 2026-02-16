@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'gateway_controller.dart';
 import 'widgets/device_selector.dart';
+import '../../theme/piccolo_icons.dart';
 import '../../theme/piccolo_theme.dart';
 
 /// The gateway shell is displayed when accessing piccolo.local.
@@ -44,9 +45,9 @@ class _GatewayShellState extends State<GatewayShell> {
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
               colors: [
-                Color(0xFF1a1a2e),
-                Color(0xFF16213e),
-                Color(0xFF0f3460),
+                PiccoloTheme.ink,
+                Color(0xFF1A2030),
+                Color(0xFF0F1828),
               ],
             ),
           ),
@@ -55,7 +56,7 @@ class _GatewayShellState extends State<GatewayShell> {
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 480),
                 child: Padding(
-                  padding: const EdgeInsets.all(24),
+                  padding: const EdgeInsets.all(Spacing.lg),
                   child: ListenableBuilder(
                     listenable: _controller,
                     builder: (context, _) {
@@ -82,14 +83,17 @@ class _GatewayShellState extends State<GatewayShell> {
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
         _buildLogo(),
-        const SizedBox(height: 32),
+        const SizedBox(height: Spacing.xl),
         const CircularProgressIndicator(color: Colors.white),
-        const SizedBox(height: 16),
+        const SizedBox(height: Spacing.base),
         Text(
           _controller.redirecting
               ? 'Redirecting to your device...'
               : 'Discovering devices...',
-          style: const TextStyle(color: Colors.white70, fontSize: 14),
+          style: TextStyle(
+            color: Colors.white.withValues(alpha: 0.7),
+            fontSize: 14,
+          ),
         ),
       ],
     );
@@ -100,24 +104,27 @@ class _GatewayShellState extends State<GatewayShell> {
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
         _buildLogo(),
-        const SizedBox(height: 32),
-        Icon(
-          Icons.error_outline,
-          color: Colors.red.shade300,
+        const SizedBox(height: Spacing.xl),
+        const Icon(
+          PiccoloIcons.error,
+          color: PiccoloTheme.critical,
           size: 48,
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: Spacing.base),
         Text(
           _controller.error!,
-          style: const TextStyle(color: Colors.white70, fontSize: 14),
+          style: TextStyle(
+            color: Colors.white.withValues(alpha: 0.7),
+            fontSize: 14,
+          ),
           textAlign: TextAlign.center,
         ),
-        const SizedBox(height: 24),
-        ElevatedButton.icon(
+        const SizedBox(height: Spacing.lg),
+        FilledButton.icon(
           onPressed: _controller.refresh,
-          icon: const Icon(Icons.refresh),
+          icon: const Icon(PiccoloIcons.refresh),
           label: const Text('Retry'),
-          style: ElevatedButton.styleFrom(
+          style: FilledButton.styleFrom(
             backgroundColor: Colors.white.withValues(alpha: 0.1),
             foregroundColor: Colors.white,
           ),
@@ -132,16 +139,16 @@ class _GatewayShellState extends State<GatewayShell> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _buildLogo(),
-        const SizedBox(height: 24),
-        const Text(
+        const SizedBox(height: Spacing.lg),
+        Text(
           'Select a device to continue:',
           style: TextStyle(
-            color: Colors.white70,
+            color: Colors.white.withValues(alpha: 0.7),
             fontSize: 16,
           ),
           textAlign: TextAlign.center,
         ),
-        const SizedBox(height: 24),
+        const SizedBox(height: Spacing.lg),
         Flexible(
           child: DeviceSelector(
             onlinePeers: _controller.onlinePeers,
@@ -151,13 +158,13 @@ class _GatewayShellState extends State<GatewayShell> {
             onDeviceSelectedHttps: _controller.navigateToDeviceHttps,
           ),
         ),
-        const SizedBox(height: 24),
+        const SizedBox(height: Spacing.lg),
         TextButton.icon(
           onPressed: _controller.refresh,
-          icon: const Icon(Icons.refresh, size: 18),
+          icon: const Icon(PiccoloIcons.refresh, size: 18),
           label: const Text('Refresh'),
           style: TextButton.styleFrom(
-            foregroundColor: Colors.white70,
+            foregroundColor: Colors.white.withValues(alpha: 0.7),
           ),
         ),
       ],
@@ -173,15 +180,15 @@ class _GatewayShellState extends State<GatewayShell> {
           height: 64,
           decoration: BoxDecoration(
             color: Colors.white.withValues(alpha: 0.1),
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(Radii.md),
           ),
           child: const Icon(
-            Icons.dns,
+            PiccoloIcons.hardDrives,
             color: Colors.white,
             size: 32,
           ),
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: Spacing.base),
         const Text(
           'Piccolo',
           style: TextStyle(

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../../theme/piccolo_icons.dart';
 import '../../../../theme/piccolo_theme.dart';
 
 class OnboardingStep extends StatefulWidget {
@@ -53,7 +54,7 @@ class _OnboardingStepState extends State<OnboardingStep> {
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: PiccoloTheme.critical.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(Radii.sm),
                 border: Border.all(
                   color: PiccoloTheme.critical.withValues(alpha: 0.2),
                 ),
@@ -68,7 +69,7 @@ class _OnboardingStepState extends State<OnboardingStep> {
             const SizedBox(height: 16),
           ],
           _ChoiceCard(
-            icon: Icons.usb,
+            icon: PiccoloIcons.usb,
             title: "Try Piccolo",
             description:
                 "Run Piccolo from this USB drive. Full functionality, no installation required.",
@@ -76,7 +77,7 @@ class _OnboardingStepState extends State<OnboardingStep> {
           ),
           const SizedBox(height: 12),
           _ChoiceCard(
-            icon: Icons.save_alt,
+            icon: PiccoloIcons.saveToDisk,
             title: "Install to Disk",
             description:
                 "Install Piccolo to an internal disk for permanent use. Requires internet connection.",
@@ -119,15 +120,15 @@ class _ChoiceCard extends StatelessWidget {
     final isEnabled = onTap != null;
 
     return Material(
-      color: Colors.white,
-      borderRadius: BorderRadius.circular(12),
+      color: PiccoloTheme.porcelain,
+      borderRadius: BorderRadius.circular(Radii.sm),
       child: InkWell(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(Radii.sm),
         onTap: onTap,
         child: Container(
           padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(Radii.sm),
             border: Border.all(
               color: isEnabled
                   ? PiccoloTheme.cobalt600.withValues(alpha: 0.3)
@@ -176,7 +177,7 @@ class _ChoiceCard extends StatelessWidget {
                 ),
               ),
               Icon(
-                Icons.arrow_forward_ios,
+                PiccoloIcons.arrowForwardIos,
                 size: 16,
                 color: isEnabled
                     ? PiccoloTheme.inkMuted

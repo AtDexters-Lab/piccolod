@@ -4,6 +4,7 @@ import '../../core/models/app_models.dart';
 import '../../core/services/app_service.dart';
 import '../../shared/widgets/app_icon.dart';
 import '../../theme/piccolo_theme.dart';
+import '../../theme/piccolo_icons.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'custom_install_wizard.dart';
 import 'dynamic_install_wizard.dart';
@@ -178,7 +179,7 @@ class _StoreTabState extends State<StoreTab> {
     widget.desktopController.openApp(
       "app-detail-$appName",
       appName,
-      Icons.settings_applications,
+      PiccoloIcons.settingsApp,
       AppDetailView(
         appId: appName,
         appService: widget.appService,
@@ -207,13 +208,13 @@ class _StoreTabState extends State<StoreTab> {
           mainAxisSize: MainAxisSize.min,
           children: [
             const Icon(
-              Icons.error_outline,
+              PiccoloIcons.error,
               color: PiccoloTheme.critical,
               size: 48,
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: Spacing.base),
             Text(_error!, style: PiccoloTheme.textTheme.bodyMedium),
-            const SizedBox(height: 16),
+            const SizedBox(height: Spacing.base),
             OutlinedButton(
               onPressed: () => _loadCatalog(reset: true),
               child: const Text("Retry"),
@@ -237,15 +238,15 @@ class _StoreTabState extends State<StoreTab> {
     }
 
     return ListView(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(Spacing.lg),
       children: [
         GridView.builder(
           shrinkWrap: true,
           physics: const NeverScrollableScrollPhysics(),
           gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
             maxCrossAxisExtent: 350,
-            mainAxisSpacing: 16,
-            crossAxisSpacing: 16,
+            mainAxisSpacing: Spacing.base,
+            crossAxisSpacing: Spacing.base,
             childAspectRatio: 0.85,
           ),
           itemCount: _items.length,
@@ -259,7 +260,7 @@ class _StoreTabState extends State<StoreTab> {
         ),
         if (_currentPage < _totalPages)
           Padding(
-            padding: const EdgeInsets.symmetric(vertical: 32.0),
+            padding: const EdgeInsets.symmetric(vertical: Spacing.xl),
             child: Center(
               child: OutlinedButton(
                 onPressed: _isLoading ? null : _loadMore,
@@ -290,11 +291,11 @@ class _CatalogCard extends StatelessWidget {
       elevation: 0,
       color: PiccoloTheme.porcelain,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: const BorderSide(color: Colors.black12),
+        borderRadius: BorderRadius.circular(Radii.md),
+        side: const BorderSide(color: PiccoloTheme.hairline),
       ),
       child: Padding(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.all(Spacing.base),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -308,9 +309,9 @@ class _CatalogCard extends StatelessWidget {
                   originalIconUrl: item.icon,
                   size: 48,
                   borderRadius: 12,
-                  fallbackIcon: Icons.apps,
+                  fallbackIcon: PiccoloIcons.apps,
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: Spacing.md),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -323,7 +324,7 @@ class _CatalogCard extends StatelessWidget {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
-                      const SizedBox(height: 4),
+                      const SizedBox(height: Spacing.xs),
                       Text(
                         "${item.category} • v${item.version}",
                         style: PiccoloTheme.textTheme.labelSmall?.copyWith(
@@ -335,7 +336,7 @@ class _CatalogCard extends StatelessWidget {
                 ),
               ],
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: Spacing.md),
             // Description
             Expanded(
               child: Text(
@@ -347,11 +348,11 @@ class _CatalogCard extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
               ),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: Spacing.sm),
             if (item.tags.isNotEmpty)
               Wrap(
-                spacing: 4,
-                runSpacing: 4,
+                spacing: Spacing.xs,
+                runSpacing: Spacing.xs,
                 children: item.tags
                     .take(3)
                     .map(
@@ -361,8 +362,8 @@ class _CatalogCard extends StatelessWidget {
                           vertical: 2,
                         ),
                         decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.05),
-                          borderRadius: BorderRadius.circular(4),
+                          color: PiccoloTheme.overlay,
+                          borderRadius: BorderRadius.circular(Radii.xxs),
                         ),
                         child: Text(
                           tag,
@@ -374,16 +375,12 @@ class _CatalogCard extends StatelessWidget {
                     )
                     .toList(),
               ),
-            const SizedBox(height: 12),
+            const SizedBox(height: Spacing.md),
             // Footer Action
             SizedBox(
               width: double.infinity,
               child: FilledButton(
                 onPressed: onInstall,
-                style: FilledButton.styleFrom(
-                  backgroundColor: PiccoloTheme.cobalt600,
-                  foregroundColor: Colors.white,
-                ),
                 child: const Text("Install"),
               ),
             ),

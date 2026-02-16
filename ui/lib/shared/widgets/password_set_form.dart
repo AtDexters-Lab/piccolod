@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../theme/piccolo_icons.dart';
 import '../../theme/piccolo_theme.dart';
 import 'password_strength_indicator.dart';
 
@@ -82,15 +83,13 @@ class _PasswordSetFormState extends State<PasswordSetForm> {
           autofillHints: const [AutofillHints.newPassword],
           decoration: InputDecoration(
             labelText: widget.passwordLabel,
-            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-            filled: true,
-            fillColor: Colors.white,
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(Radii.sm)),
             errorText: widget.passwordError,
             suffixIcon: IconButton(
               icon: Icon(
                 _obscureText
-                    ? Icons.visibility_off_outlined
-                    : Icons.visibility_outlined,
+                    ? PiccoloIcons.visibilityOff
+                    : PiccoloIcons.visibility,
                 color: PiccoloTheme.inkMuted,
               ),
               onPressed: _toggleVisibility,
@@ -105,16 +104,14 @@ class _PasswordSetFormState extends State<PasswordSetForm> {
           autofillHints: const [AutofillHints.newPassword],
           decoration: InputDecoration(
             labelText: widget.confirmLabel,
-            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-            filled: true,
-            fillColor: Colors.white,
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(Radii.sm)),
             // Prefer widget-provided error, fallback to internal validation error
             errorText: widget.confirmError ?? _internalConfirmError,
             suffixIcon: IconButton(
               icon: Icon(
                 _obscureText
-                    ? Icons.visibility_off_outlined
-                    : Icons.visibility_outlined,
+                    ? PiccoloIcons.visibilityOff
+                    : PiccoloIcons.visibility,
                 color: PiccoloTheme.inkMuted,
               ),
               onPressed: _toggleVisibility,

@@ -269,7 +269,7 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
           RenderErrorFallback(label: 'Log viewer', retry: retry),
       child: RepaintBoundary(
         child: Container(
-          color: const Color(0xFF1E1E1E),
+          color: PiccoloTheme.terminalBg,
           child: Scrollbar(
             controller: _scrollController,
             thumbVisibility: true,
@@ -314,9 +314,9 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
 
         return Container(
           decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: PiccoloTheme.mist),
+            color: PiccoloTheme.porcelain,
+            borderRadius: BorderRadius.circular(Radii.md),
+            border: Border.all(color: PiccoloTheme.hairline),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,

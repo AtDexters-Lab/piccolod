@@ -3,6 +3,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../core/models/app_models.dart';
 import '../../core/models/listener_health.dart';
 import '../../core/services/app_service.dart';
+import '../../theme/piccolo_icons.dart';
 import '../../shells/desktop/desktop_controller.dart';
 import 'app_detail_view.dart';
 import 'widgets/app_web_view.dart';
@@ -29,10 +30,10 @@ class AppLauncher {
         }
         // HTTPS + .local: lanHostUrl is already https:// (backend honors request scheme).
         if (service.lanHostUrl != null) return service.lanHostUrl;
-        // No host-based URL — can't embed HTTP in HTTPS iframe
+        // No host-based URL -- can't embed HTTP in HTTPS iframe
         return null;
       }
-      // HTTP LAN access: port-based URL is same-site with portal → cookies work
+      // HTTP LAN access: port-based URL is same-site with portal -> cookies work
       return service.localUrl ?? service.remoteUrl;
     } else {
       // Remote (HTTPS): remoteUrl works for iframes with Secure cookies
@@ -94,7 +95,7 @@ class AppLauncher {
     final currentHost = Uri.base.host.toLowerCase();
 
     // Local access doesn't need health-gating UNLESS the target URL is remote
-    // (e.g., user clicks "Remote Access" link from local portal — still TLS)
+    // (e.g., user clicks "Remote Access" link from local portal -- still TLS)
     final targetIsRemote = overrideUrl != null &&
         Uri.tryParse(overrideUrl)?.scheme == 'https';
     if (isLocalAccess(currentHost) && !targetIsRemote) {
@@ -112,7 +113,7 @@ class AppLauncher {
 
     // Health-gate remote access
     if (health == null) {
-      // Unknown health — fetch fresh data before deciding
+      // Unknown health -- fetch fresh data before deciding
       _fetchAndGate(
         context: context,
         controller: controller,
@@ -174,7 +175,7 @@ class AppLauncher {
 
       final health = detail.app.primaryListenerHealth;
       if (health == null) {
-        // Still unknown after fetch — show overlay explaining the situation
+        // Still unknown after fetch -- show overlay explaining the situation
         final fallbackUrl = service.lanFallbackUrl ??
             service.lanHostUrl ??
             service.localUrl ??
@@ -237,7 +238,7 @@ class AppLauncher {
     String? iconUrl,
     String? originalIconUrl,
   }) {
-    // RFC §6.1: ok and degraded are usable — only gate recovering/error
+    // RFC 6.1: ok and degraded are usable -- only gate recovering/error
     if (health.isOk || health.isDegraded) {
       openAppWindow(
         controller: controller,
@@ -251,7 +252,7 @@ class AppLauncher {
       return;
     }
 
-    // Recovering or error — show fallback overlay
+    // Recovering or error -- show fallback overlay
     final fallbackUrl =
         service.lanFallbackUrl ?? service.lanHostUrl ?? service.localUrl ?? '';
     showDialog(
@@ -304,7 +305,7 @@ class AppLauncher {
       controller.openApp(
         windowId,
         "Launch failed",
-        Icons.error_outline,
+        PiccoloIcons.error,
         const Center(child: Text("No URL available to launch the app.")),
       );
       return;
@@ -313,7 +314,7 @@ class AppLauncher {
     controller.openApp(
       windowId,
       title,
-      Icons.web_asset,
+      PiccoloIcons.webAsset,
       AppWebView(url: iframeUrl),
       initialSize: const Size(1280, 800),
       requiresInterceptor: false,
@@ -321,12 +322,12 @@ class AppLauncher {
       originalIconUrl: originalIconUrl,
       actions: [
         IconButton(
-          icon: const Icon(Icons.open_in_new, size: 20),
+          icon: const Icon(PiccoloIcons.openExternal, size: 20),
           tooltip: "Open in Browser",
           onPressed: () => launchUrl(Uri.parse(browserUrl!)),
         ),
         IconButton(
-          icon: const Icon(Icons.settings, size: 20),
+          icon: const Icon(PiccoloIcons.settings, size: 20),
           tooltip: "Settings",
           onPressed: () {
             // Check if settings window is already open, if so focus it
@@ -338,7 +339,7 @@ class AppLauncher {
               controller.openApp(
                 settingsId,
                 app.displayTitle,
-                Icons.settings_applications,
+                PiccoloIcons.settingsApp,
                 AppDetailView(
                   appId: app.name,
                   appService: appService,

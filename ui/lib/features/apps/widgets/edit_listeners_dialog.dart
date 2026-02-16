@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../../../../core/models/app_models.dart';
 import '../../../../theme/piccolo_theme.dart';
+import '../../../../theme/piccolo_icons.dart';
 
 class EditListenersDialog extends StatefulWidget {
   final List<AppListener> initialListeners;
@@ -57,15 +58,15 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
         child: Column(
           children: [
             Container(
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(Spacing.md),
               decoration: BoxDecoration(
                 color: PiccoloTheme.mist,
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(Radii.sm),
               ),
               child: const Row(
                 children: [
-                  Icon(Icons.info_outline, size: 16, color: PiccoloTheme.cobalt600),
-                  SizedBox(width: 8),
+                  Icon(PiccoloIcons.info, size: 16, color: PiccoloTheme.cobalt600),
+                  SizedBox(width: Spacing.sm),
                   Expanded(
                     child: Text(
                       "Updating listeners may cause the application container to recreate.",
@@ -78,7 +79,7 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
                 ],
               ),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: Spacing.base),
             Expanded(
               child: Form(
                 key: _formKey,
@@ -96,10 +97,10 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
                 ),
               ),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: Spacing.base),
             OutlinedButton.icon(
               onPressed: _addListener,
-              icon: const Icon(Icons.add),
+              icon: const Icon(PiccoloIcons.add),
               label: const Text("Add Listener"),
             ),
           ],
@@ -138,7 +139,7 @@ class _ListenerRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      padding: const EdgeInsets.symmetric(vertical: Spacing.sm),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -147,7 +148,7 @@ class _ListenerRow extends StatelessWidget {
             child: TextFormField(
               initialValue: listener.name,
               decoration: const InputDecoration(
-                labelText: "Name", 
+                labelText: "Name",
                 isDense: true,
                 border: OutlineInputBorder(),
               ),
@@ -156,13 +157,13 @@ class _ListenerRow extends StatelessWidget {
                   val == null || val.isEmpty ? "Required" : null,
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: Spacing.md),
           Expanded(
             flex: 2,
             child: TextFormField(
               initialValue: listener.guestPort.toString(),
               decoration: const InputDecoration(
-                labelText: "Port", 
+                labelText: "Port",
                 isDense: true,
                 border: OutlineInputBorder(),
               ),
@@ -177,13 +178,13 @@ class _ListenerRow extends StatelessWidget {
               },
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: Spacing.md),
           Expanded(
             flex: 2,
             child: DropdownButtonFormField<String>(
               initialValue: listener.protocol,
               decoration: const InputDecoration(
-                labelText: "Protocol", 
+                labelText: "Protocol",
                 isDense: true,
                 border: OutlineInputBorder(),
               ),
@@ -197,13 +198,13 @@ class _ListenerRow extends StatelessWidget {
               },
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: Spacing.md),
            Expanded(
             flex: 2,
             child: DropdownButtonFormField<String>(
               initialValue: listener.flow,
               decoration: const InputDecoration(
-                labelText: "Flow", 
+                labelText: "Flow",
                 isDense: true,
                 border: OutlineInputBorder(),
               ),
@@ -216,9 +217,9 @@ class _ListenerRow extends StatelessWidget {
               },
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: Spacing.sm),
           IconButton(
-            icon: const Icon(Icons.delete_outline, color: PiccoloTheme.critical),
+            icon: const Icon(PiccoloIcons.delete, color: PiccoloTheme.critical),
             onPressed: onDelete,
             tooltip: "Remove Listener",
           ),

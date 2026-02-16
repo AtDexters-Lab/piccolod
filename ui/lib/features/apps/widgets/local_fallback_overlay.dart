@@ -6,6 +6,7 @@ import '../../../core/services/app_service.dart';
 import '../../../shells/desktop/desktop_controller.dart';
 import '../../../shells/desktop/features/settings/settings_app.dart';
 import '../../../theme/piccolo_theme.dart';
+import '../../../theme/piccolo_icons.dart';
 import '../app_launcher.dart';
 
 class LocalFallbackOverlay extends StatelessWidget {
@@ -38,7 +39,7 @@ class LocalFallbackOverlay extends StatelessWidget {
             ListenerHealthVisuals.iconForStatus(health.status),
             color: ListenerHealthVisuals.colorForStatus(health.status),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: Spacing.md),
           Expanded(
             child: Text(
               'Remote Access Unavailable',
@@ -57,20 +58,20 @@ class LocalFallbackOverlay extends StatelessWidget {
           children: [
             Text(health.reason),
             if (health.recoveryEta != null) ...[
-              const SizedBox(height: 8),
+              const SizedBox(height: Spacing.sm),
               Text(
                 '${health.actionRequired ? 'Next check' : 'Next retry'}: ${health.recoveryEta}',
                 style: PiccoloTheme.textTheme.labelSmall,
               ),
             ],
-            const SizedBox(height: 16),
+            const SizedBox(height: Spacing.base),
             if (isLocalAccess) ...[
-              ElevatedButton.icon(
+              FilledButton.icon(
                 onPressed: () {
                   Navigator.of(context).pop();
                   launchUrl(Uri.parse(lanFallbackUrl));
                 },
-                icon: const Icon(Icons.open_in_new, size: 16),
+                icon: const Icon(PiccoloIcons.openExternal, size: 16),
                 label: const Text('Access Locally'),
               ),
             ] else ...[
@@ -78,10 +79,10 @@ class LocalFallbackOverlay extends StatelessWidget {
                 'Local access available on your home network:',
                 style: PiccoloTheme.textTheme.labelSmall,
               ),
-              const SizedBox(height: 4),
+              const SizedBox(height: Spacing.xs),
               CopyableUrl(url: lanFallbackUrl),
             ],
-            const SizedBox(height: 12),
+            const SizedBox(height: Spacing.md),
             Text(
               'Local access requires being on the same network as your Piccolo device',
               style: PiccoloTheme.textTheme.labelSmall?.copyWith(
@@ -142,7 +143,7 @@ void openOrFocusSettings(DesktopController controller) {
     controller.openApp(
       settingsId,
       'Settings',
-      Icons.settings_rounded,
+      PiccoloIcons.settings,
       SettingsApp(onLogout: controller.logout),
       initialSize: const Size(1100, 750),
     );
@@ -164,16 +165,16 @@ class CopyableUrl extends StatelessWidget {
           const SnackBar(content: Text('URL copied to clipboard')),
         );
       },
-      borderRadius: BorderRadius.circular(4),
+      borderRadius: BorderRadius.circular(Radii.xxs),
       child: Container(
         padding: EdgeInsets.symmetric(
-          horizontal: compact ? 8 : 12,
-          vertical: compact ? 4 : 8,
+          horizontal: compact ? Spacing.sm : Spacing.md,
+          vertical: compact ? Spacing.xs : Spacing.sm,
         ),
         decoration: BoxDecoration(
           color: PiccoloTheme.mist,
-          borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: Colors.black12),
+          borderRadius: BorderRadius.circular(Radii.xxs),
+          border: Border.all(color: PiccoloTheme.hairline),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
@@ -189,9 +190,9 @@ class CopyableUrl extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
               ),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: Spacing.sm),
             Icon(
-              Icons.copy,
+              PiccoloIcons.copy,
               size: compact ? 14 : 16,
               color: PiccoloTheme.inkMuted,
             ),

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 
@@ -13,8 +14,8 @@ class RemotePreflightList extends StatelessWidget {
 
     return Container(
       decoration: BoxDecoration(
-        border: Border.all(color: PiccoloTheme.inkMuted.withValues(alpha: 0.2)),
-        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: PiccoloTheme.hairline),
+        borderRadius: BorderRadius.circular(Radii.sm),
       ),
       child: ListView.separated(
         shrinkWrap: true,
@@ -25,19 +26,19 @@ class RemotePreflightList extends StatelessWidget {
           final check = checks[index];
           IconData icon;
           Color color;
-          
+
           switch(check.status) {
-            case 'pass': 
-              icon = Icons.check_circle; 
+            case 'pass':
+              icon = PiccoloIcons.success;
               color = PiccoloTheme.success;
               break;
             case 'warn':
-              icon = Icons.warning;
+              icon = PiccoloIcons.warning;
               color = PiccoloTheme.warning;
               break;
             case 'fail':
             default:
-              icon = Icons.error;
+              icon = PiccoloIcons.error;
               color = PiccoloTheme.critical;
           }
 
@@ -45,7 +46,7 @@ class RemotePreflightList extends StatelessWidget {
             leading: Icon(icon, color: color),
             title: Text(check.name),
             subtitle: check.detail != null ? Text(check.detail!) : null,
-            trailing: check.status == 'fail' ? const Chip(label: Text("Failed"), backgroundColor: Colors.redAccent, labelStyle: TextStyle(color: Colors.white)) : null,
+            trailing: check.status == 'fail' ? Chip(label: const Text("Failed"), backgroundColor: PiccoloTheme.critical, labelStyle: const TextStyle(color: PiccoloTheme.porcelain)) : null,
           );
         },
       ),

@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
 import '../../../../../core/services/api_client.dart';
+import '../../../../../theme/piccolo_icons.dart';
 import '../../../../../theme/piccolo_theme.dart';
 import '../../../../../core/models/os_update.dart';
+import '../../../../../shared/widgets/info_row.dart';
 import '../../../../../shared/widgets/log_stream_viewer.dart';
+import '../../../../../shared/widgets/piccolo_card.dart';
 import '../../../../../shared/widgets/task_progress_panel.dart';
 import '../settings_controller.dart';
 
@@ -38,9 +41,9 @@ class SystemTab extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text("System Update", style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 28)),
+        Text("System Update", style: PiccoloTheme.textTheme.headlineLarge),
         const SizedBox(height: 32),
-        
+
         if (update != null || isBusy) ...[
           // 1. Hero Status Card
           _UpdateStatusCard(
@@ -49,25 +52,19 @@ class SystemTab extends StatelessWidget {
             onCheck: controller.checkForUpdates,
             onReboot: controller.rebootOS,
           ),
-          
+
           const SizedBox(height: 48),
-          
+
           if (update != null) ...[
             // 2. Advanced / Danger Zone (Only show if we have data)
-            Text("Advanced Options", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+            Text("Advanced Options", style: PiccoloTheme.textTheme.titleMedium),
             const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(24),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: PiccoloTheme.mist),
-              ),
+            PiccoloCard(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _InfoRow("Current Version", update.currentVersion),
-                  _InfoRow("Last Checked", _formatDate(update.lastChecked)),
+                  InfoRow("Current Version", update.currentVersion),
+                  InfoRow("Last Checked", _formatDate(update.lastChecked)),
                   const Divider(height: 32),
                   _DiagnosticLogSection(controller: controller),
                   const Divider(height: 32),
@@ -104,7 +101,7 @@ class SystemTab extends StatelessWidget {
           const SizedBox(height: 48),
           const _InstallToDiskCard(),
           const SizedBox(height: 48),
-          Text("Update Logs", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+          Text("Update Logs", style: PiccoloTheme.textTheme.titleMedium),
           const SizedBox(height: 16),
           LogStreamViewer(
             systemUnit: 'transactional-update',
@@ -169,35 +166,33 @@ class _UpdateStatusCard extends StatelessWidget {
   Widget build(BuildContext context) {
     // Determine State
     bool pendingReboot = update?.pending ?? false;
-    
+
     Color accentColor = PiccoloTheme.success;
-    IconData icon = Icons.check_circle_outline;
+    IconData icon = PiccoloIcons.success;
     String title = "System is up to date";
     String subtitle = update != null ? "Version ${update!.currentVersion}" : "Checking version...";
     Widget? action;
 
     if (isChecking) {
       accentColor = PiccoloTheme.cobalt600;
-      icon = Icons.sync;
+      icon = PiccoloIcons.sync;
       title = "Checking for updates...";
       subtitle = "Please wait.";
       action = const SizedBox(
-        height: 24, 
-        width: 24, 
+        height: 24,
+        width: 24,
         child: CircularProgressIndicator(strokeWidth: 2)
       );
     } else if (pendingReboot) {
       accentColor = PiccoloTheme.cobalt600; // or Info color
-      icon = Icons.system_update;
+      icon = PiccoloIcons.systemUpdate;
       title = "Update Available";
       subtitle = "Version ${update!.availableVersion} is ready to install.";
-      action = ElevatedButton.icon(
+      action = FilledButton.icon(
         onPressed: onReboot,
-        icon: const Icon(Icons.restart_alt),
+        icon: const Icon(PiccoloIcons.restart),
         label: const Text("Restart Now"),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: PiccoloTheme.cobalt600,
-          foregroundColor: Colors.white,
+        style: FilledButton.styleFrom(
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
         ),
       );
@@ -216,15 +211,9 @@ class _UpdateStatusCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(32),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: [
-          BoxShadow(
-            color: PiccoloTheme.ink.withValues(alpha: 0.05),
-            blurRadius: 20,
-            offset: const Offset(0, 10),
-          ),
-        ],
+        color: PiccoloTheme.porcelain,
+        borderRadius: BorderRadius.circular(Radii.lg),
+        boxShadow: Elevation.elev3,
       ),
       child: Row(
         children: [
@@ -234,7 +223,7 @@ class _UpdateStatusCard extends StatelessWidget {
               color: accentColor.withValues(alpha: 0.1),
               shape: BoxShape.circle,
             ),
-            child: isChecking 
+            child: isChecking
               ? SizedBox(width: 32, height: 32, child: CircularProgressIndicator(color: accentColor))
               : Icon(icon, color: accentColor, size: 32),
           ),
@@ -243,7 +232,7 @@ class _UpdateStatusCard extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(title, style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 20)),
+                Text(title, style: PiccoloTheme.textTheme.headlineSmall),
                 const SizedBox(height: 4),
                 Text(subtitle, style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted)),
               ],
@@ -253,35 +242,6 @@ class _UpdateStatusCard extends StatelessWidget {
             const SizedBox(width: 24),
             action,
           ]
-        ],
-      ),
-    );
-  }
-}
-
-class _InfoRow extends StatelessWidget {
-  final String label;
-  final String value;
-
-  const _InfoRow(this.label, this.value);
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted)),
-          const SizedBox(width: 16),
-          Expanded(
-            child: Text(
-              value,
-              style: PiccoloTheme.textTheme.bodyMedium,
-              textAlign: TextAlign.right,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
         ],
       ),
     );
@@ -420,9 +380,9 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
     return Container(
       padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: PiccoloTheme.mist),
+        color: PiccoloTheme.porcelain,
+        borderRadius: BorderRadius.circular(Radii.md),
+        border: Border.all(color: PiccoloTheme.hairline),
       ),
       child: Row(
         children: [
@@ -430,9 +390,9 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(10),
+              borderRadius: BorderRadius.circular(Radii.sm),
             ),
-            child: const Icon(Icons.save_alt, color: PiccoloTheme.cobalt600, size: 24),
+            child: const Icon(PiccoloIcons.saveToDisk, color: PiccoloTheme.cobalt600, size: 24),
           ),
           const SizedBox(width: 16),
           Expanded(
@@ -450,12 +410,8 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
             ),
           ),
           const SizedBox(width: 16),
-          ElevatedButton(
+          FilledButton(
             onPressed: _fetchDisks,
-            style: ElevatedButton.styleFrom(
-              backgroundColor: PiccoloTheme.cobalt600,
-              foregroundColor: Colors.white,
-            ),
             child: const Text("Install"),
           ),
         ],
@@ -467,9 +423,9 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
     return Container(
       padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: PiccoloTheme.mist),
+        color: PiccoloTheme.porcelain,
+        borderRadius: BorderRadius.circular(Radii.md),
+        border: Border.all(color: PiccoloTheme.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -488,7 +444,7 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
               margin: const EdgeInsets.only(bottom: 12),
               decoration: BoxDecoration(
                 color: PiccoloTheme.critical.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(Radii.sm),
               ),
               child: Text(_error!,
                   style: const TextStyle(fontSize: 13, color: PiccoloTheme.critical)),
@@ -523,12 +479,8 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
                 child: const Text("Cancel"),
               ),
               const SizedBox(width: 12),
-              ElevatedButton(
+              FilledButton(
                 onPressed: (_selectedDisk != null && !_isInstalling) ? _startInstall : null,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: PiccoloTheme.cobalt600,
-                  foregroundColor: Colors.white,
-                ),
                 child: _isInstalling
                     ? const SizedBox(
                         width: 20,
@@ -548,9 +500,9 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
     return Container(
       padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: PiccoloTheme.mist),
+        color: PiccoloTheme.porcelain,
+        borderRadius: BorderRadius.circular(Radii.md),
+        border: Border.all(color: PiccoloTheme.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -578,13 +530,13 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
     return Container(
       padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: PiccoloTheme.mist),
+        color: PiccoloTheme.porcelain,
+        borderRadius: BorderRadius.circular(Radii.md),
+        border: Border.all(color: PiccoloTheme.hairline),
       ),
       child: Column(
         children: [
-          const Icon(Icons.check_circle_outline, color: PiccoloTheme.success, size: 48),
+          const Icon(PiccoloIcons.success, color: PiccoloTheme.success, size: 48),
           const SizedBox(height: 16),
           Text("Piccolo has been installed",
               style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600)),
@@ -595,18 +547,16 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 24),
-          ElevatedButton.icon(
+          FilledButton.icon(
             onPressed: () async {
               try {
                 await _api.fetchCsrfToken();
                 await _api.post('/api/v1/system/reboot');
               } catch (_) {}
             },
-            icon: const Icon(Icons.restart_alt),
+            icon: const Icon(PiccoloIcons.restart),
             label: const Text("Reboot Now"),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: PiccoloTheme.cobalt600,
-              foregroundColor: Colors.white,
+            style: FilledButton.styleFrom(
               padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
             ),
           ),
@@ -707,7 +657,7 @@ class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
             OutlinedButton.icon(
               onPressed: () => widget.controller
                   .downloadDiagnosticLog(from: _from, to: _to),
-              icon: const Icon(Icons.download, size: 18),
+              icon: const Icon(PiccoloIcons.download, size: 18),
               label: const Text("Download"),
             ),
           ],
@@ -723,7 +673,7 @@ class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
             ),
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 8),
-              child: Text("—", style: TextStyle(color: PiccoloTheme.inkMuted)),
+              child: Text("\u2014", style: TextStyle(color: PiccoloTheme.inkMuted)),
             ),
             _DateChip(
               label: "To",
@@ -736,7 +686,7 @@ class _DiagnosticLogSectionState extends State<_DiagnosticLogSection> {
           ],
         ),
         AnimatedSize(
-          duration: const Duration(milliseconds: 200),
+          duration: Motion.medium,
           curve: Curves.easeInOut,
           alignment: Alignment.topLeft,
           child: _activePicker != null
@@ -780,12 +730,12 @@ class _DateChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return InkWell(
-      borderRadius: BorderRadius.circular(8),
+      borderRadius: BorderRadius.circular(Radii.sm),
       onTap: onTap,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(Radii.sm),
           border: Border.all(
             color: isActive
                 ? PiccoloTheme.cobalt600
@@ -805,7 +755,7 @@ class _DateChip extends StatelessWidget {
                     ?.copyWith(fontWeight: FontWeight.w500)),
             const SizedBox(width: 4),
             Icon(
-              isActive ? Icons.expand_less : Icons.calendar_today,
+              isActive ? PiccoloIcons.expandLess : PiccoloIcons.calendar,
               size: 14,
               color: isActive ? PiccoloTheme.cobalt600 : PiccoloTheme.inkMuted,
             ),
@@ -838,12 +788,12 @@ class _SettingsDiskTile extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: InkWell(
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(Radii.sm),
         onTap: onTap,
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(8),
+            borderRadius: BorderRadius.circular(Radii.sm),
             border: Border.all(
               color: isSelected
                   ? PiccoloTheme.cobalt600

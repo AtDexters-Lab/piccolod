@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../theme/piccolo_theme.dart';
+import '../../theme/piccolo_icons.dart';
 import '../../core/config/core_config.dart';
 import '../../core/services/app_service.dart';
 import '../../core/models/app_models.dart';
@@ -265,13 +266,13 @@ x-piccolo:
   @override
   Widget build(BuildContext context) {
     return Dialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(Radii.lg)),
       child: Container(
         width: 700,
         height: 600,
         decoration: BoxDecoration(
           color: PiccoloTheme.porcelain,
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(Radii.lg),
         ),
         child: Column(
           children: [
@@ -292,14 +293,14 @@ x-piccolo:
     ];
 
     return Container(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(Spacing.lg),
       decoration: const BoxDecoration(
-        border: Border(bottom: BorderSide(color: Colors.black12)),
+        border: Border(bottom: BorderSide(color: PiccoloTheme.hairline)),
       ),
       child: Row(
         children: [
-          const Icon(Icons.terminal, color: PiccoloTheme.cobalt600, size: 32),
-          const SizedBox(width: 16),
+          const Icon(PiccoloIcons.terminal, color: PiccoloTheme.cobalt600, size: 32),
+          const SizedBox(width: Spacing.base),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -320,7 +321,7 @@ x-piccolo:
             ),
           ),
           IconButton(
-            icon: const Icon(Icons.close),
+            icon: const Icon(PiccoloIcons.close),
             onPressed: _isInstalling ? null : () => Navigator.of(context).pop(),
           ),
         ],
@@ -331,7 +332,7 @@ x-piccolo:
   Widget _buildBody() {
     if (_currentStep == 2 && _taskId != null) {
       return Padding(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.all(Spacing.lg),
         child: TaskProgressPanel(taskId: _taskId!, taskType: 'install_app'),
       );
     }
@@ -345,7 +346,7 @@ x-piccolo:
 
   Widget _buildImageSelectionStep() {
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(Spacing.lg),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -356,15 +357,15 @@ x-piccolo:
               fontWeight: FontWeight.w600,
             ),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: Spacing.base),
           if (_isLoadingCatalog)
             const Center(child: CircularProgressIndicator())
           else if (_catalogWorkspaces.isEmpty)
             Container(
-              padding: const EdgeInsets.all(16),
+              padding: const EdgeInsets.all(Spacing.base),
               decoration: BoxDecoration(
                 color: PiccoloTheme.mist,
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(Radii.sm),
               ),
               child: const Text(
                 'No workspace templates available. Use Docker Hub search below.',
@@ -372,14 +373,14 @@ x-piccolo:
             )
           else
             Wrap(
-              spacing: 12,
-              runSpacing: 12,
+              spacing: Spacing.md,
+              runSpacing: Spacing.md,
               children: _catalogWorkspaces
                   .map((item) => _buildCatalogCard(item))
                   .toList(),
             ),
 
-          const SizedBox(height: 32),
+          const SizedBox(height: Spacing.xl),
 
           // Custom image section
           Text(
@@ -388,33 +389,33 @@ x-piccolo:
               fontWeight: FontWeight.w600,
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: Spacing.sm),
           Text(
             'Search Docker Hub for any container image to use as a workspace base.',
             style: PiccoloTheme.textTheme.bodySmall?.copyWith(
               color: PiccoloTheme.inkMuted,
             ),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: Spacing.base),
           Row(
             children: [
               Expanded(
                 child: TextField(
                   controller: _searchController,
-                  decoration: const InputDecoration(
+                  decoration: InputDecoration(
                     hintText: 'Search for images (e.g., postgres, redis)...',
-                    border: OutlineInputBorder(),
+                    border: const OutlineInputBorder(),
                     filled: true,
-                    fillColor: Colors.white,
-                    contentPadding: EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 12,
+                    fillColor: PiccoloTheme.porcelain,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: Spacing.base,
+                      vertical: Spacing.md,
                     ),
                   ),
                   onSubmitted: (_) => _searchImages(),
                 ),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: Spacing.md),
               FilledButton(
                 onPressed: _isSearching ? null : _searchImages,
                 child: _isSearching
@@ -431,21 +432,21 @@ x-piccolo:
             ],
           ),
           if (_searchResults.isNotEmpty) ...[
-            const SizedBox(height: 16),
+            const SizedBox(height: Spacing.base),
             ..._searchResults.take(10).map(_buildSearchResultTile),
           ],
           if (_error != null)
             Container(
-              margin: const EdgeInsets.only(top: 16),
-              padding: const EdgeInsets.all(12),
+              margin: const EdgeInsets.only(top: Spacing.base),
+              padding: const EdgeInsets.all(Spacing.md),
               decoration: BoxDecoration(
                 color: PiccoloTheme.critical.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(Radii.sm),
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.error_outline, color: PiccoloTheme.critical),
-                  const SizedBox(width: 12),
+                  const Icon(PiccoloIcons.error, color: PiccoloTheme.critical),
+                  const SizedBox(width: Spacing.md),
                   Expanded(
                     child: Text(
                       _error!,
@@ -455,17 +456,17 @@ x-piccolo:
                 ],
               ),
             ),
-          const SizedBox(height: 16),
+          const SizedBox(height: Spacing.base),
           Container(
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(Spacing.md),
             decoration: BoxDecoration(
               color: PiccoloTheme.warning.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(Radii.sm),
             ),
             child: const Row(
               children: [
-                Icon(Icons.info_outline, color: PiccoloTheme.warning),
-                SizedBox(width: 12),
+                Icon(PiccoloIcons.info, color: PiccoloTheme.warning),
+                SizedBox(width: Spacing.md),
                 Expanded(
                   child: Text(
                     "Custom images start with no network listeners. You can add ports via 'Edit Listeners' after creation.",
@@ -483,14 +484,14 @@ x-piccolo:
   Widget _buildCatalogCard(CatalogItem item) {
     return InkWell(
       onTap: () => _installFromCatalog(item),
-      borderRadius: BorderRadius.circular(12),
+      borderRadius: BorderRadius.circular(Radii.md),
       child: Container(
         width: 150,
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(Spacing.base),
         decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.black12),
+          color: PiccoloTheme.porcelain,
+          borderRadius: BorderRadius.circular(Radii.md),
+          border: Border.all(color: PiccoloTheme.hairline),
         ),
         child: Column(
           children: [
@@ -501,10 +502,10 @@ x-piccolo:
               originalIconUrl: item.icon,
               size: 32,
               borderRadius: 8,
-              fallbackIcon: Icons.terminal,
+              fallbackIcon: PiccoloIcons.terminal,
               fallbackBackgroundColor: Colors.transparent,
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: Spacing.sm),
             Text(
               item.name.replaceFirst('workspace-', '').toUpperCase(),
               style: const TextStyle(fontWeight: FontWeight.bold),
@@ -526,7 +527,7 @@ x-piccolo:
   Widget _buildSearchResultTile(ImageSearchResult result) {
     return ListTile(
       leading: Icon(
-        result.official ? Icons.verified : Icons.memory,
+        result.official ? PiccoloIcons.verified : PiccoloIcons.circuitry,
         color: result.official ? PiccoloTheme.success : PiccoloTheme.inkMuted,
       ),
       title: Text(result.name),
@@ -538,8 +539,8 @@ x-piccolo:
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.star, size: 16, color: Colors.amber),
-          const SizedBox(width: 4),
+          const Icon(PiccoloIcons.star, size: 16, color: PiccoloTheme.warning),
+          const SizedBox(width: Spacing.xs),
           Text('${result.stars}'),
         ],
       ),
@@ -549,7 +550,7 @@ x-piccolo:
 
   Widget _buildConfigureStep() {
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(Spacing.lg),
       child: Form(
         key: _formKey,
         child: Column(
@@ -557,20 +558,20 @@ x-piccolo:
           children: [
           // Selected image display
           Container(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(Spacing.base),
             decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.black12),
+              color: PiccoloTheme.porcelain,
+              borderRadius: BorderRadius.circular(Radii.md),
+              border: Border.all(color: PiccoloTheme.hairline),
             ),
             child: Row(
               children: [
                 const Icon(
-                  Icons.memory,
+                  PiccoloIcons.circuitry,
                   size: 32,
                   color: PiccoloTheme.cobalt600,
                 ),
-                const SizedBox(width: 16),
+                const SizedBox(width: Spacing.base),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -596,7 +597,7 @@ x-piccolo:
               ],
             ),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: Spacing.lg),
 
           // Tag input
           Text(
@@ -605,21 +606,21 @@ x-piccolo:
               fontWeight: FontWeight.w600,
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: Spacing.sm),
           TextField(
             controller: _tagController,
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               hintText: 'latest',
-              border: OutlineInputBorder(),
+              border: const OutlineInputBorder(),
               filled: true,
-              fillColor: Colors.white,
-              contentPadding: EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 12,
+              fillColor: PiccoloTheme.porcelain,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: Spacing.base,
+                vertical: Spacing.md,
               ),
             ),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: Spacing.lg),
 
           // RFC 20260130: Workspace name is the identity for workspace mode apps
           Text(
@@ -628,25 +629,25 @@ x-piccolo:
               fontWeight: FontWeight.w600,
             ),
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: Spacing.xs),
           Text(
             'Lowercase letters and numbers only, max 16 characters',
             style: PiccoloTheme.textTheme.labelSmall?.copyWith(
               color: PiccoloTheme.inkMuted,
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: Spacing.sm),
           TextFormField(
             controller: _workspaceNameController,
             autovalidateMode: AutovalidateMode.onUserInteraction,
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               hintText: 'e.g., devserver',
-              border: OutlineInputBorder(),
+              border: const OutlineInputBorder(),
               filled: true,
-              fillColor: Colors.white,
-              contentPadding: EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 12,
+              fillColor: PiccoloTheme.porcelain,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: Spacing.base,
+                vertical: Spacing.md,
               ),
             ),
             validator: (value) {
@@ -667,19 +668,19 @@ x-piccolo:
               return null;
             },
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: Spacing.base),
 
           // Info about ports
           Container(
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(Spacing.md),
             decoration: BoxDecoration(
               color: PiccoloTheme.mist,
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(Radii.sm),
             ),
             child: const Row(
               children: [
-                Icon(Icons.info_outline, color: PiccoloTheme.inkMuted),
-                SizedBox(width: 12),
+                Icon(PiccoloIcons.info, color: PiccoloTheme.inkMuted),
+                SizedBox(width: Spacing.md),
                 Expanded(
                   child: Text(
                     "This workspace will start with no network listeners. You can add ports via 'Edit Listeners' after creation.",
@@ -692,16 +693,16 @@ x-piccolo:
 
           if (_error != null)
             Container(
-              margin: const EdgeInsets.only(top: 16),
-              padding: const EdgeInsets.all(12),
+              margin: const EdgeInsets.only(top: Spacing.base),
+              padding: const EdgeInsets.all(Spacing.md),
               decoration: BoxDecoration(
                 color: PiccoloTheme.critical.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(Radii.sm),
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.error_outline, color: PiccoloTheme.critical),
-                  const SizedBox(width: 12),
+                  const Icon(PiccoloIcons.error, color: PiccoloTheme.critical),
+                  const SizedBox(width: Spacing.md),
                   Expanded(
                     child: Text(
                       _error!,
@@ -719,9 +720,9 @@ x-piccolo:
 
   Widget _buildFooter() {
     return Container(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(Spacing.lg),
       decoration: const BoxDecoration(
-        border: Border(top: BorderSide(color: Colors.black12)),
+        border: Border(top: BorderSide(color: PiccoloTheme.hairline)),
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.end,
@@ -731,7 +732,7 @@ x-piccolo:
               onPressed: () => setState(() => _currentStep = 0),
               child: const Text('Back'),
             ),
-          const SizedBox(width: 16),
+          const SizedBox(width: Spacing.base),
           if (_currentStep < 2)
             FilledButton(
               onPressed: _currentStep == 0
@@ -739,7 +740,6 @@ x-piccolo:
                   : (_isInstalling ? null : _createCustomWorkspace),
               style: FilledButton.styleFrom(
                 backgroundColor: PiccoloTheme.success,
-                foregroundColor: Colors.white,
               ),
               child: _isInstalling
                   ? const SizedBox(

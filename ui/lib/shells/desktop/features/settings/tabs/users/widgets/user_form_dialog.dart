@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/user.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Dialog for creating or editing a user.
@@ -78,11 +79,11 @@ class _UserFormDialogState extends State<UserFormDialog> {
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
                       color: PiccoloTheme.critical.withValues(alpha: 0.1),
-                      borderRadius: BorderRadius.circular(8),
+                      borderRadius: BorderRadius.circular(Radii.sm),
                     ),
                     child: Row(
                       children: [
-                        const Icon(Icons.error_outline,
+                        const Icon(PiccoloIcons.error,
                             color: PiccoloTheme.critical, size: 18),
                         const SizedBox(width: 8),
                         Expanded(
@@ -101,8 +102,7 @@ class _UserFormDialogState extends State<UserFormDialog> {
                   controller: _usernameController,
                   decoration: const InputDecoration(
                     labelText: 'Username',
-                    border: OutlineInputBorder(),
-                    prefixIcon: Icon(Icons.person_outline),
+                    prefixIcon: Icon(PiccoloIcons.person),
                   ),
                   validator: (value) {
                     if (value == null || value.isEmpty) {
@@ -122,8 +122,7 @@ class _UserFormDialogState extends State<UserFormDialog> {
                   controller: _emailController,
                   decoration: const InputDecoration(
                     labelText: 'Email',
-                    border: OutlineInputBorder(),
-                    prefixIcon: Icon(Icons.email_outlined),
+                    prefixIcon: Icon(PiccoloIcons.email),
                   ),
                   keyboardType: TextInputType.emailAddress,
                   validator: (value) {
@@ -144,8 +143,7 @@ class _UserFormDialogState extends State<UserFormDialog> {
                     obscureText: true,
                     decoration: const InputDecoration(
                       labelText: 'Password',
-                      border: OutlineInputBorder(),
-                      prefixIcon: Icon(Icons.lock_outline),
+                      prefixIcon: Icon(PiccoloIcons.lock),
                     ),
                     validator: (value) {
                       if (!isEditing && (value == null || value.length < 8)) {
@@ -160,8 +158,7 @@ class _UserFormDialogState extends State<UserFormDialog> {
                     obscureText: true,
                     decoration: const InputDecoration(
                       labelText: 'Confirm Password',
-                      border: OutlineInputBorder(),
-                      prefixIcon: Icon(Icons.lock_outline),
+                      prefixIcon: Icon(PiccoloIcons.lock),
                     ),
                     validator: (value) {
                       if (!isEditing && value != _passwordController.text) {
@@ -176,8 +173,7 @@ class _UserFormDialogState extends State<UserFormDialog> {
                   initialValue: _selectedRole,
                   decoration: const InputDecoration(
                     labelText: 'Role',
-                    border: OutlineInputBorder(),
-                    prefixIcon: Icon(Icons.admin_panel_settings_outlined),
+                    prefixIcon: Icon(PiccoloIcons.userGear),
                   ),
                   items: const [
                     DropdownMenuItem(
@@ -211,8 +207,7 @@ class _UserFormDialogState extends State<UserFormDialog> {
                     decoration: const InputDecoration(
                       labelText: 'Allowed Apps',
                       hintText: 'app1, app2, app3',
-                      border: OutlineInputBorder(),
-                      prefixIcon: Icon(Icons.apps_outlined),
+                      prefixIcon: Icon(PiccoloIcons.apps),
                     ),
                   ),
                   const SizedBox(height: 4),
@@ -233,12 +228,8 @@ class _UserFormDialogState extends State<UserFormDialog> {
           onPressed: _isLoading ? null : () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),
-        ElevatedButton(
+        FilledButton(
           onPressed: _isLoading ? null : _submit,
-          style: ElevatedButton.styleFrom(
-            backgroundColor: PiccoloTheme.cobalt600,
-            foregroundColor: Colors.white,
-          ),
           child: _isLoading
               ? const SizedBox(
                   width: 20,

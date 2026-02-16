@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../../../core/services/event_stream_client.dart';
+import '../../../../theme/piccolo_icons.dart';
 import '../../../../theme/piccolo_theme.dart';
 import 'settings_controller.dart';
 import 'tabs/profile_tab.dart';
@@ -53,7 +54,7 @@ class _SettingsAppState extends State<SettingsApp> {
               // Sidebar
               Container(
                 width: 250,
-                color: Colors.white, // Or porcelain
+                color: PiccoloTheme.porcelain,
                 child: SingleChildScrollView(
                   child: Column(
                     children: [
@@ -62,38 +63,36 @@ class _SettingsAppState extends State<SettingsApp> {
                         padding: const EdgeInsets.symmetric(horizontal: 24),
                         child: Text(
                           "Settings",
-                          style: PiccoloTheme.textTheme.displayLarge?.copyWith(
-                            fontSize: 24,
-                          ),
+                          style: PiccoloTheme.textTheme.headlineMedium,
                         ),
                       ),
                       const SizedBox(height: 32),
                       _SidebarItem(
-                        icon: Icons.person_outline,
+                        icon: PiccoloIcons.person,
                         label: "Profile",
                         isSelected: _controller.selectedIndex == 0,
                         onTap: () => _controller.selectTab(0),
                       ),
                       _SidebarItem(
-                        icon: Icons.cloud_outlined,
+                        icon: PiccoloIcons.cloud,
                         label: "Remote Access",
                         isSelected: _controller.selectedIndex == 1,
                         onTap: () => _controller.selectTab(1),
                       ),
                       _SidebarItem(
-                        icon: Icons.people_outline,
+                        icon: PiccoloIcons.people,
                         label: "Users",
                         isSelected: _controller.selectedIndex == 2,
                         onTap: () => _controller.selectTab(2),
                       ),
                       _SidebarItem(
-                        icon: Icons.shield_outlined,
+                        icon: PiccoloIcons.shield,
                         label: "Security",
                         isSelected: _controller.selectedIndex == 3,
                         onTap: () => _controller.selectTab(3),
                       ),
                       _SidebarItem(
-                        icon: Icons.dns_outlined,
+                        icon: PiccoloIcons.hardDrives,
                         label: "System",
                         isSelected: _controller.selectedIndex == 4,
                         onTap: () => _controller.selectTab(4),
@@ -137,13 +136,13 @@ class _SettingsAppState extends State<SettingsApp> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.error_outline, color: PiccoloTheme.critical, size: 48),
+            const Icon(PiccoloIcons.error, color: PiccoloTheme.critical, size: 48),
             const SizedBox(height: 16),
             Text("Error loading settings", style: PiccoloTheme.textTheme.bodyLarge),
             const SizedBox(height: 8),
             Text(_controller.error!, style: PiccoloTheme.textTheme.labelSmall),
             const SizedBox(height: 16),
-            ElevatedButton(
+            FilledButton(
               onPressed: () => _controller.selectTab(_controller.selectedIndex),
               child: const Text("Retry"),
             ),

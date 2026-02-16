@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import '../../../core/models/network_models.dart';
+import '../../../theme/piccolo_icons.dart';
+import '../../../theme/piccolo_theme.dart';
 
 /// A widget that displays a list of discovered Piccolo devices.
 ///
@@ -34,19 +36,22 @@ class DeviceSelector extends StatelessWidget {
     ];
 
     if (allDevices.isEmpty) {
-      return const Center(
+      return Center(
         child: Text(
           'No devices found',
-          style: TextStyle(color: Colors.white70, fontSize: 16),
+          style: TextStyle(
+            color: Colors.white.withValues(alpha: 0.7),
+            fontSize: 16,
+          ),
         ),
       );
     }
 
     return ListView.separated(
       shrinkWrap: true,
-      padding: const EdgeInsets.symmetric(vertical: 8),
+      padding: const EdgeInsets.symmetric(vertical: Spacing.sm),
       itemCount: allDevices.length,
-      separatorBuilder: (context, index) => const SizedBox(height: 12),
+      separatorBuilder: (context, index) => const SizedBox(height: Spacing.md),
       itemBuilder: (context, index) {
         final device = allDevices[index];
         if (device is _SelfDevice) {
@@ -121,12 +126,12 @@ class _DeviceCard extends StatelessWidget {
       opacity: online ? 1.0 : 0.5,
       child: Material(
         color: Colors.white.withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(Radii.md),
         child: InkWell(
           onTap: onTap,
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(Radii.md),
           child: Container(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(Spacing.base),
             child: Row(
               children: [
                 // Status indicator
@@ -135,10 +140,12 @@ class _DeviceCard extends StatelessWidget {
                   height: 12,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: online ? Colors.green : Colors.grey,
+                    color: online
+                        ? PiccoloTheme.success
+                        : PiccoloTheme.inkMuted,
                   ),
                 ),
-                const SizedBox(width: 16),
+                const SizedBox(width: Spacing.base),
                 // Device info
                 Expanded(
                   child: Column(
@@ -170,18 +177,18 @@ class _DeviceCard extends StatelessWidget {
                 if (online && onHttpsTap != null) ...[
                   IconButton(
                     onPressed: onHttpsTap,
-                    icon: const Icon(Icons.lock_outline, size: 18),
+                    icon: const Icon(PiccoloIcons.lock, size: 18),
                     tooltip: 'Open via HTTPS',
                     color: Colors.white.withValues(alpha: 0.7),
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
                   ),
-                  const SizedBox(width: 4),
+                  const SizedBox(width: Spacing.xs),
                 ],
                 // Arrow indicator for online devices (HTTP)
                 if (online)
                   Icon(
-                    Icons.arrow_forward_ios,
+                    PiccoloIcons.arrowForwardIos,
                     color: Colors.white.withValues(alpha: 0.5),
                     size: 16,
                   ),

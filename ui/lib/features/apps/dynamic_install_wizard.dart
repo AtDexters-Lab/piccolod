@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../theme/piccolo_theme.dart';
+import '../../theme/piccolo_icons.dart';
 import '../../core/services/app_service.dart';
 import '../../core/utils/task_id.dart';
 import '../../shared/widgets/task_progress_panel.dart';
@@ -86,26 +87,26 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
   @override
   Widget build(BuildContext context) {
     return Dialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(Radii.lg)),
       child: Container(
         width: 600,
         constraints: const BoxConstraints(maxHeight: 700),
         decoration: BoxDecoration(
           color: PiccoloTheme.porcelain,
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(Radii.lg),
         ),
         child: Column(
           children: [
             // Header
             Container(
-              padding: const EdgeInsets.all(24),
+              padding: const EdgeInsets.all(Spacing.lg),
               decoration: const BoxDecoration(
-                border: Border(bottom: BorderSide(color: Colors.black12)),
+                border: Border(bottom: BorderSide(color: PiccoloTheme.hairline)),
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.settings_applications, color: PiccoloTheme.cobalt600, size: 32),
-                  const SizedBox(width: 16),
+                  const Icon(PiccoloIcons.settingsApp, color: PiccoloTheme.cobalt600, size: 32),
+                  const SizedBox(width: Spacing.base),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -122,7 +123,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
                     ),
                   ),
                   IconButton(
-                    icon: const Icon(Icons.close),
+                    icon: const Icon(PiccoloIcons.close),
                     onPressed: _isInstalling ? null : () => Navigator.of(context).pop(),
                   )
                 ],
@@ -133,14 +134,14 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
             Expanded(
               child: _isInstalling && _taskId != null
                   ? Padding(
-                      padding: const EdgeInsets.all(24),
+                      padding: const EdgeInsets.all(Spacing.lg),
                       child: TaskProgressPanel(
                         taskId: _taskId!,
                         taskType: 'install_app',
                       ),
                     )
                   : SingleChildScrollView(
-                      padding: const EdgeInsets.all(24),
+                      padding: const EdgeInsets.all(Spacing.lg),
                       child: Form(
                         key: _formKey,
                         child: Column(
@@ -149,13 +150,13 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
                             if (_error != null)
                               Container(
                                 width: double.infinity,
-                                margin: const EdgeInsets.only(bottom: 24),
-                                padding: const EdgeInsets.all(12),
+                                margin: const EdgeInsets.only(bottom: Spacing.lg),
+                                padding: const EdgeInsets.all(Spacing.md),
                                 color: PiccoloTheme.critical.withValues(alpha: 0.1),
                                 child: Row(
                                   children: [
-                                    const Icon(Icons.error, color: PiccoloTheme.critical, size: 20),
-                                    const SizedBox(height: 12, width: 12),
+                                    const Icon(PiccoloIcons.error, color: PiccoloTheme.critical, size: 20),
+                                    const SizedBox(height: Spacing.md, width: Spacing.md),
                                     Expanded(child: Text(_error!, style: const TextStyle(color: PiccoloTheme.critical))),
                                   ],
                                 ),
@@ -170,9 +171,9 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
 
             // Footer
             Container(
-              padding: const EdgeInsets.all(24),
+              padding: const EdgeInsets.all(Spacing.lg),
               decoration: const BoxDecoration(
-                border: Border(top: BorderSide(color: Colors.black12)),
+                border: Border(top: BorderSide(color: PiccoloTheme.hairline)),
               ),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.end,
@@ -181,12 +182,11 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
                     onPressed: _isInstalling ? null : () => Navigator.of(context).pop(),
                     child: const Text("Cancel"),
                   ),
-                  const SizedBox(width: 16),
+                  const SizedBox(width: Spacing.base),
                   FilledButton(
                     onPressed: _isInstalling ? null : _install,
                     style: FilledButton.styleFrom(
                       backgroundColor: PiccoloTheme.success,
-                      foregroundColor: Colors.white,
                     ),
                     child: _isInstalling
                         ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
@@ -203,7 +203,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
 
   Widget _buildField(String key, dynamic schema) {
     if (schema is! Map) return const SizedBox.shrink();
-    
+
     final label = schema['label'] ?? key;
     final description = schema['description'] ?? '';
     final type = schema['type'] ?? 'string';
@@ -211,16 +211,16 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
     final validation = schema['validation']; // Map {regex: "...", message: "..."}
 
     return Padding(
-      padding: const EdgeInsets.only(bottom: 24.0),
+      padding: const EdgeInsets.only(bottom: Spacing.lg),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(label, style: const TextStyle(fontWeight: FontWeight.bold)),
           if (description.isNotEmpty) ...[
-            const SizedBox(height: 4),
+            const SizedBox(height: Spacing.xs),
             Text(description, style: PiccoloTheme.textTheme.labelMedium?.copyWith(color: PiccoloTheme.inkMuted)),
           ],
-          const SizedBox(height: 8),
+          const SizedBox(height: Spacing.sm),
           _buildInputWidget(key, type, required, validation, schema['generate'] == true),
         ],
       ),
@@ -246,7 +246,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
     }
 
     final isPassword = type == 'password';
-    
+
     return _TextFormFieldWrapper(
       initialValue: _formValues[key]?.toString(),
       isPassword: isPassword,
@@ -312,7 +312,7 @@ class _TextFormFieldWrapperState extends State<_TextFormFieldWrapper> {
     // Ideally we'd call an API, but for now let's just use a simple random string
     final timestamp = DateTime.now().millisecondsSinceEpoch.toRadixString(36);
     final random = (1000 + (DateTime.now().microsecond % 8999)).toString();
-    _controller.text = "gen-$timestamp-$random"; 
+    _controller.text = "gen-$timestamp-$random";
   }
 
   @override
@@ -323,18 +323,18 @@ class _TextFormFieldWrapperState extends State<_TextFormFieldWrapper> {
       decoration: InputDecoration(
         border: const OutlineInputBorder(),
         filled: true,
-        fillColor: Colors.white,
+        fillColor: PiccoloTheme.porcelain,
         suffixIcon: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             if (widget.isPassword)
               IconButton(
-                icon: Icon(_obscureText ? Icons.visibility : Icons.visibility_off),
+                icon: Icon(_obscureText ? PiccoloIcons.visibility : PiccoloIcons.visibilityOff),
                 onPressed: () => setState(() => _obscureText = !_obscureText),
               ),
             if (widget.canGenerate)
                IconButton(
-                 icon: const Icon(Icons.refresh),
+                 icon: const Icon(PiccoloIcons.refresh),
                  tooltip: "Regenerate",
                  onPressed: _generate,
                ),

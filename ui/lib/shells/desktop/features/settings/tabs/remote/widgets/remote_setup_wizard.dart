@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 import '../remote_controller.dart';
 import 'remote_preflight_list.dart';
@@ -57,7 +58,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
       }
     });
   }
-  
+
   @override
   void dispose() {
     _endpointCtrl.dispose();
@@ -71,7 +72,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     return Column(
       children: [
         _buildStepperHeader(),
-        const SizedBox(height: 32),
+        const SizedBox(height: Spacing.xl),
         _buildCurrentStep(),
       ],
     );
@@ -97,10 +98,10 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         children: [
           CircleAvatar(
             backgroundColor: isActive || isCompleted ? PiccoloTheme.cobalt600 : PiccoloTheme.mist,
-            foregroundColor: isActive || isCompleted ? Colors.white : PiccoloTheme.inkMuted,
-            child: isCompleted ? const Icon(Icons.check) : Text("${step + 1}"),
+            foregroundColor: isActive || isCompleted ? PiccoloTheme.porcelain : PiccoloTheme.inkMuted,
+            child: isCompleted ? const Icon(PiccoloIcons.check) : Text("${step + 1}"),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: Spacing.sm),
           Text(
             label,
             style: TextStyle(
@@ -114,7 +115,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
   }
 
   Widget _buildStepSeparator() {
-    return const SizedBox(width: 32, child: Divider());
+    return const SizedBox(width: Spacing.xl, child: Divider());
   }
 
   Widget _buildCurrentStep() {
@@ -137,37 +138,37 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text("Connect to Nexus", style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 24)),
-        const SizedBox(height: 16),
+        Text("Connect to Nexus", style: PiccoloTheme.textTheme.headlineMedium),
+        const SizedBox(height: Spacing.base),
         const Text("To enable remote access, you need a Nexus Relay. You can host your own."),
-        const SizedBox(height: 24),
+        const SizedBox(height: Spacing.lg),
 
         // Requirements
         if (guide.requirements.isNotEmpty) ...[
           Text("Prerequisites", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
+          const SizedBox(height: Spacing.sm),
           ...guide.requirements.map((req) => Padding(
-            padding: const EdgeInsets.only(bottom: 4),
+            padding: const EdgeInsets.only(bottom: Spacing.xs),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Icon(Icons.check_circle_outline, size: 16, color: PiccoloTheme.cobalt600),
-                const SizedBox(width: 8),
+                const Icon(PiccoloIcons.success, size: 16, color: PiccoloTheme.cobalt600),
+                const SizedBox(width: Spacing.sm),
                 Expanded(child: Text(req)),
               ],
             ),
           )),
-          const SizedBox(height: 24),
+          const SizedBox(height: Spacing.lg),
         ],
 
         // Command
         Text("Installation", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
-        const SizedBox(height: 8),
+        const SizedBox(height: Spacing.sm),
         Container(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(Spacing.base),
           decoration: BoxDecoration(
             color: PiccoloTheme.ink,
-            borderRadius: BorderRadius.circular(8),
+            borderRadius: BorderRadius.circular(Radii.sm),
           ),
           width: double.infinity,
           child: Column(
@@ -175,52 +176,52 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
             children: [
               SelectableText(
                 guide.command,
-                style: const TextStyle(fontFamily: 'monospace', color: PiccoloTheme.success, height: 1.5),
+                style: PiccoloTheme.mono.copyWith(color: PiccoloTheme.success, height: 1.5),
               ),
             ],
           ),
         ),
         Padding(
-          padding: const EdgeInsets.only(top: 8),
+          padding: const EdgeInsets.only(top: Spacing.sm),
           child: Text("Run this command on your VPS.", style: PiccoloTheme.textTheme.labelSmall),
         ),
-        const SizedBox(height: 24),
+        const SizedBox(height: Spacing.lg),
 
         // Notes
         if (guide.notes.isNotEmpty) ...[
           Container(
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(Spacing.md),
             decoration: BoxDecoration(
               color: PiccoloTheme.info.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(Radii.sm),
               border: Border.all(color: PiccoloTheme.info.withValues(alpha: 0.3)),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: guide.notes.map((note) => Padding(
-                padding: const EdgeInsets.only(bottom: 4),
+                padding: const EdgeInsets.only(bottom: Spacing.xs),
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Icon(Icons.info_outline, size: 16, color: PiccoloTheme.info),
-                    const SizedBox(width: 8),
+                    const Icon(PiccoloIcons.info, size: 16, color: PiccoloTheme.info),
+                    const SizedBox(width: Spacing.sm),
                     Expanded(child: Text(note, style: const TextStyle(fontSize: 13))),
                   ],
                 ),
               )).toList(),
             ),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: Spacing.lg),
         ],
 
         // Docs Link
         if (guide.docsUrl.isNotEmpty)
            Padding(
-             padding: const EdgeInsets.only(bottom: 24),
+             padding: const EdgeInsets.only(bottom: Spacing.lg),
              child: Row(
                children: [
-                 const Icon(Icons.description_outlined, size: 16, color: PiccoloTheme.inkMuted),
-                 const SizedBox(width: 8),
+                 const Icon(PiccoloIcons.fileText, size: 16, color: PiccoloTheme.inkMuted),
+                 const SizedBox(width: Spacing.sm),
                  Expanded(
                    child: Text.rich(
                      TextSpan(
@@ -248,28 +249,28 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
            ),
 
         const Divider(),
-        const SizedBox(height: 32),
-        
+        const SizedBox(height: Spacing.xl),
+
         Text("Enter Connection Details", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
-        const SizedBox(height: 16),
+        const SizedBox(height: Spacing.base),
         _buildTextField("Nexus Endpoint", _endpointCtrl, hint: "wss://nexus.example.com"),
-        const SizedBox(height: 16),
+        const SizedBox(height: Spacing.base),
         _buildTextField("Portal Hostname", _portalCtrl, hint: "portal.home.example.com"),
         Padding(
-          padding: const EdgeInsets.only(top: 8, bottom: 8),
+          padding: const EdgeInsets.only(top: Spacing.sm, bottom: Spacing.sm),
           child: Text(
             "This is the fully-qualified domain name where this Piccolo device will be accessible remotely. "
             "All app subdomains (e.g., myapp.home.example.com) will be derived from this hostname's parent domain.",
             style: PiccoloTheme.textTheme.labelSmall?.copyWith(color: PiccoloTheme.inkMuted),
           ),
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: Spacing.sm),
         _buildTextField("Device Secret", _secretCtrl, obscureText: true),
 
-        const SizedBox(height: 32),
+        const SizedBox(height: Spacing.xl),
         Align(
           alignment: Alignment.centerRight,
-          child: ElevatedButton(
+          child: FilledButton(
             onPressed: () async {
               if (_endpointCtrl.text.isEmpty || _secretCtrl.text.isEmpty || _portalCtrl.text.isEmpty) {
                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Please fill all fields")));
@@ -303,14 +304,14 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text("Verify & Enable", style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 24)),
-        const SizedBox(height: 16),
+        Text("Verify & Enable", style: PiccoloTheme.textTheme.headlineMedium),
+        const SizedBox(height: Spacing.base),
         const Text("Verifying your environment and connection settings."),
-        const SizedBox(height: 24),
+        const SizedBox(height: Spacing.lg),
 
         if (!widget.controller.isRunningPreflight && widget.controller.preflightChecks.isEmpty)
            Center(
-             child: ElevatedButton(
+             child: FilledButton(
                onPressed: widget.controller.runPreflight,
                child: const Text("Run Checks"),
              ),
@@ -319,11 +320,11 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
            RemotePreflightList(checks: widget.controller.preflightChecks),
            if (!widget.controller.isRunningPreflight)
              Padding(
-               padding: const EdgeInsets.only(top: 16),
+               padding: const EdgeInsets.only(top: Spacing.base),
                child: Center(
                  child: TextButton.icon(
                    onPressed: widget.controller.runPreflight,
-                   icon: const Icon(Icons.refresh),
+                   icon: const Icon(PiccoloIcons.refresh),
                    label: const Text("Re-run Checks"),
                  ),
                ),
@@ -331,12 +332,12 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         ],
 
         if (widget.controller.isRunningPreflight)
-          const Padding(padding: EdgeInsets.only(top: 16), child: Center(child: CircularProgressIndicator())),
+          const Padding(padding: EdgeInsets.only(top: Spacing.base), child: Center(child: CircularProgressIndicator())),
 
         if (widget.controller.isSubmittingConfig)
-          const Padding(padding: EdgeInsets.only(top: 16), child: Center(child: CircularProgressIndicator())),
+          const Padding(padding: EdgeInsets.only(top: Spacing.base), child: Center(child: CircularProgressIndicator())),
 
-        const SizedBox(height: 32),
+        const SizedBox(height: Spacing.xl),
         if (widget.controller.preflightChecks.isNotEmpty &&
             !widget.controller.isRunningPreflight &&
             !widget.controller.isSubmittingConfig)
@@ -347,7 +348,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
                 setState(() => widget.controller.wizardStep = 0);
               }, child: const Text("Back")),
 
-              ElevatedButton(
+              FilledButton(
                 onPressed: allPassed
                     ? () => widget.controller.submitConfiguration()
                     : null, // Disable if any check failed
@@ -358,19 +359,19 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
 
         // Info box about HTTP-01
         if (allPassed) ...[
-          const SizedBox(height: 24),
+          const SizedBox(height: Spacing.lg),
           Container(
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(Spacing.md),
             decoration: BoxDecoration(
               color: PiccoloTheme.info.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(Radii.sm),
               border: Border.all(color: PiccoloTheme.info.withValues(alpha: 0.3)),
             ),
             child: const Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Icon(Icons.info_outline, size: 16, color: PiccoloTheme.info),
-                SizedBox(width: 8),
+                Icon(PiccoloIcons.info, size: 16, color: PiccoloTheme.info),
+                SizedBox(width: Spacing.sm),
                 Expanded(
                   child: Text(
                     "Certificates will be issued using HTTP-01 challenge. "

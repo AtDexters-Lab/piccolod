@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../../theme/piccolo_icons.dart';
 import '../../../../theme/piccolo_theme.dart';
 import '../../../../shared/widgets/task_progress_panel.dart';
 
@@ -72,7 +73,7 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
                 color: PiccoloTheme.critical.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(Radii.sm),
                 border: Border.all(
                   color: PiccoloTheme.critical.withValues(alpha: 0.2),
                 ),
@@ -91,11 +92,11 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
               padding: const EdgeInsets.all(24),
               decoration: BoxDecoration(
                 color: PiccoloTheme.mist,
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(Radii.sm),
               ),
               child: Column(
                 children: [
-                  const Icon(Icons.storage, size: 48, color: PiccoloTheme.inkMuted),
+                  const Icon(PiccoloIcons.storage, size: 48, color: PiccoloTheme.inkMuted),
                   const SizedBox(height: 12),
                   const Text(
                     "No internal disks found",
@@ -114,7 +115,7 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
                     onPressed: () async {
                       await widget.onRefreshDisks();
                     },
-                    icon: const Icon(Icons.refresh, size: 16),
+                    icon: const Icon(PiccoloIcons.refresh, size: 16),
                     label: const Text("Refresh"),
                   ),
                 ],
@@ -143,20 +144,10 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
                 child: const Text("Back"),
               ),
               const Spacer(),
-              ElevatedButton(
+              FilledButton(
                 onPressed: (_selectedDisk != null && !_isInstalling)
                     ? _confirmAndInstall
                     : null,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: PiccoloTheme.cobalt600,
-                  foregroundColor: Colors.white,
-                  disabledBackgroundColor: PiccoloTheme.ink.withValues(alpha: 0.1),
-                  disabledForegroundColor: PiccoloTheme.ink.withValues(alpha: 0.3),
-                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
                 child: _isInstalling
                     ? const SizedBox(
                         width: 20,
@@ -199,14 +190,14 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
                   color: PiccoloTheme.critical.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(8),
+                  borderRadius: BorderRadius.circular(Radii.sm),
                   border: Border.all(
                     color: PiccoloTheme.critical.withValues(alpha: 0.2),
                   ),
                 ),
                 child: const Row(
                   children: [
-                    Icon(Icons.warning_amber_rounded,
+                    Icon(PiccoloIcons.warning,
                         color: PiccoloTheme.critical, size: 20),
                     SizedBox(width: 8),
                     Expanded(
@@ -305,15 +296,15 @@ class _DiskTile extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Material(
-        color: isSelected ? PiccoloTheme.cobalt600.withValues(alpha: 0.06) : Colors.white,
-        borderRadius: BorderRadius.circular(12),
+        color: isSelected ? PiccoloTheme.cobalt600.withValues(alpha: 0.06) : PiccoloTheme.porcelain,
+        borderRadius: BorderRadius.circular(Radii.sm),
         child: InkWell(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(Radii.sm),
           onTap: onTap,
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(Radii.sm),
               border: Border.all(
                 color: isSelected
                     ? PiccoloTheme.cobalt600
@@ -334,7 +325,7 @@ class _DiskTile extends StatelessWidget {
                 ),
                 const SizedBox(width: 8),
                 Icon(
-                  transport == 'nvme' ? Icons.flash_on : Icons.storage,
+                  transport == 'nvme' ? PiccoloIcons.lightning : PiccoloIcons.storage,
                   size: 20,
                   color: PiccoloTheme.inkMuted,
                 ),

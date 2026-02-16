@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import '../remote_controller.dart';
@@ -14,7 +15,7 @@ class RemoteAliasesCard extends StatelessWidget {
 
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.all(Spacing.base),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -23,12 +24,12 @@ class RemoteAliasesCard extends StatelessWidget {
               children: [
                 Text("Aliases", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
                 IconButton(
-                  icon: const Icon(Icons.add),
+                  icon: const Icon(PiccoloIcons.add),
                   onPressed: () => _showAddAliasDialog(context),
                 ),
               ],
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: Spacing.base),
             if (aliases.isEmpty)
               const Text("No aliases configured.", style: TextStyle(color: PiccoloTheme.inkMuted))
             else
@@ -48,11 +49,11 @@ class RemoteAliasesCard extends StatelessWidget {
   Widget _buildAliasItem(BuildContext context, RemoteAlias alias) {
     return ListTile(
       contentPadding: EdgeInsets.zero,
-      leading: const Icon(Icons.link, color: PiccoloTheme.inkMuted),
+      leading: const Icon(PiccoloIcons.link, color: PiccoloTheme.inkMuted),
       title: Text(alias.hostname),
       subtitle: Text("Points to: ${alias.listener}"),
       trailing: IconButton(
-        icon: const Icon(Icons.delete_outline, color: PiccoloTheme.critical),
+        icon: const Icon(PiccoloIcons.delete, color: PiccoloTheme.critical),
         onPressed: () => controller.deleteAlias(alias.id),
       ),
     );
@@ -75,7 +76,7 @@ class RemoteAliasesCard extends StatelessWidget {
                   controller: hostCtrl,
                   decoration: const InputDecoration(labelText: "Public Hostname", hintText: "app.example.com"),
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: Spacing.base),
                 if (controller.services.isEmpty)
                    const Text("No services available to alias.", style: TextStyle(color: PiccoloTheme.warning))
                 else
@@ -98,7 +99,7 @@ class RemoteAliasesCard extends StatelessWidget {
             ),
             actions: [
               TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
-              ElevatedButton(
+              FilledButton(
                 onPressed: () {
                   if (hostCtrl.text.isNotEmpty && selectedListener != null) {
                     controller.addAlias(hostCtrl.text, selectedListener!);

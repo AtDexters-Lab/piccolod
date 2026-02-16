@@ -1,12 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
+import '../../theme/piccolo_icons.dart';
+import '../../theme/piccolo_theme.dart';
 
 /// A generic error boundary that intercepts paint and layout errors from a
 /// child subtree, displaying a fallback UI instead of Flutter's red error screen.
 ///
 /// On retry, cycles a [UniqueKey] on a [KeyedSubtree] to force a full subtree
-/// rebuild — creating fresh Elements, States, and RenderObjects for the child.
+/// rebuild -- creating fresh Elements, States, and RenderObjects for the child.
 ///
 /// Example:
 /// ```dart
@@ -124,24 +126,24 @@ class RenderErrorFallback extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      color: const Color(0xFF1E1E1E),
+      color: PiccoloTheme.terminalBg,
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.warning_amber_rounded, color: Colors.amber, size: 48),
-            const SizedBox(height: 16),
+            const Icon(PiccoloIcons.warning, color: PiccoloTheme.warning, size: 48),
+            const SizedBox(height: Spacing.base),
             Text(
               retry != null
                   ? '$label encountered a rendering error'
                   : '$label unavailable',
               style: const TextStyle(color: Colors.white70, fontSize: 14),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: Spacing.base),
             if (retry != null)
               FilledButton.icon(
                 onPressed: retry,
-                icon: const Icon(Icons.refresh),
+                icon: const Icon(PiccoloIcons.refresh),
                 label: const Text('Reconnect'),
               ),
           ],
@@ -157,12 +159,12 @@ class _RenderPaintErrorCatcher extends RenderProxyBox {
 
   _RenderPaintErrorCatcher({required this.onError});
 
-  // _errorNotified is intentionally never reset — key-cycling in
+  // _errorNotified is intentionally never reset -- key-cycling in
   // _RenderErrorBoundaryState creates a fresh render object on retry.
   void _scheduleErrorNotification(Object error) {
     if (_errorNotified) return;
     _errorNotified = true;
-    // Read onError live at dispatch time rather than capturing early —
+    // Read onError live at dispatch time rather than capturing early --
     // attached check guards liveness, and live read stays current if
     // updateRenderObject swaps the callback between scheduling and dispatch.
     SchedulerBinding.instance.addPostFrameCallback((_) {
@@ -177,7 +179,7 @@ class _RenderPaintErrorCatcher extends RenderProxyBox {
     try {
       super.performLayout();
     } catch (e) {
-      // Use constrain(Size.zero) to get minimum size — always finite,
+      // Use constrain(Size.zero) to get minimum size -- always finite,
       // even if parent provides unbounded constraints (e.g., inside Column).
       size = constraints.constrain(Size.zero);
       _scheduleErrorNotification(e);
@@ -192,7 +194,7 @@ class _RenderPaintErrorCatcher extends RenderProxyBox {
       // Paint a dark fallback rect so the area isn't blank
       context.canvas.drawRect(
         offset & size,
-        Paint()..color = const Color(0xFF1E1E1E),
+        Paint()..color = PiccoloTheme.terminalBg,
       );
       _scheduleErrorNotification(e);
     }

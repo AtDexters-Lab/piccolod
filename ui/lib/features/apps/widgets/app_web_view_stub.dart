@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
+import '../../../theme/piccolo_theme.dart';
+import '../../../theme/piccolo_icons.dart';
 
 class AppWebView extends StatelessWidget {
   final String url;
@@ -12,13 +14,13 @@ class AppWebView extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.web_asset_off, size: 48, color: Colors.grey),
-          const SizedBox(height: 16),
+          const Icon(PiccoloIcons.webAsset, size: 48, color: PiccoloTheme.inkMuted),
+          const SizedBox(height: Spacing.base),
           const Text("In-app browser not supported on Desktop."),
-          const SizedBox(height: 8),
+          const SizedBox(height: Spacing.sm),
           TextButton.icon(
             onPressed: () => launchUrl(Uri.parse(url)),
-            icon: const Icon(Icons.open_in_new),
+            icon: const Icon(PiccoloIcons.openExternal),
             label: const Text("Open in External Browser"),
           ),
         ],

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../core/models/listener_health.dart';
+import '../../theme/piccolo_theme.dart';
 
 class HealthBadge extends StatelessWidget {
   final ListenerHealth? health;
@@ -13,15 +14,15 @@ class HealthBadge extends StatelessWidget {
     return Tooltip(
       message: health!.reason,
       child: Container(
-        padding: const EdgeInsets.all(4),
+        padding: const EdgeInsets.all(Spacing.xs),
         decoration: BoxDecoration(
           color: ListenerHealthVisuals.colorForStatus(health!.status),
-          borderRadius: BorderRadius.circular(4),
+          borderRadius: BorderRadius.circular(Spacing.xs),
         ),
         child: Icon(
           ListenerHealthVisuals.iconForStatus(health!.status),
           size: 16,
-          color: Colors.white,
+          color: PiccoloTheme.porcelain,
         ),
       ),
     );

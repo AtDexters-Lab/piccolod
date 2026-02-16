@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/user.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'users_controller.dart';
 import 'widgets/user_form_dialog.dart';
@@ -56,16 +57,12 @@ class _UsersTabState extends State<UsersTab> {
       children: [
         Text(
           'Users',
-          style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 28),
+          style: PiccoloTheme.textTheme.headlineLarge,
         ),
-        ElevatedButton.icon(
+        FilledButton.icon(
           onPressed: _showAddUserDialog,
-          icon: const Icon(Icons.add),
+          icon: const Icon(PiccoloIcons.add),
           label: const Text('Add User'),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: PiccoloTheme.cobalt600,
-            foregroundColor: Colors.white,
-          ),
         ),
       ],
     );
@@ -76,12 +73,12 @@ class _UsersTabState extends State<UsersTab> {
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: PiccoloTheme.critical.withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(Radii.sm),
         border: Border.all(color: PiccoloTheme.critical),
       ),
       child: Row(
         children: [
-          const Icon(Icons.error_outline, color: PiccoloTheme.critical),
+          const Icon(PiccoloIcons.error, color: PiccoloTheme.critical),
           const SizedBox(width: 12),
           Expanded(
             child: Text(
@@ -105,7 +102,7 @@ class _UsersTabState extends State<UsersTab> {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              Icons.people_outline,
+              PiccoloIcons.people,
               size: 64,
               color: PiccoloTheme.inkMuted.withValues(alpha: 0.5),
             ),
@@ -191,7 +188,7 @@ class _UsersTabState extends State<UsersTab> {
             onPressed: () => Navigator.of(context).pop(),
             child: const Text('Cancel'),
           ),
-          ElevatedButton(
+          FilledButton(
             onPressed: () async {
               final messenger = ScaffoldMessenger.of(context);
               Navigator.of(context).pop();
@@ -208,9 +205,8 @@ class _UsersTabState extends State<UsersTab> {
                 }
               }
             },
-            style: ElevatedButton.styleFrom(
+            style: FilledButton.styleFrom(
               backgroundColor: PiccoloTheme.critical,
-              foregroundColor: Colors.white,
             ),
             child: const Text('Delete'),
           ),
@@ -238,7 +234,6 @@ class _UsersTabState extends State<UsersTab> {
                 obscureText: true,
                 decoration: const InputDecoration(
                   labelText: 'New Password',
-                  border: OutlineInputBorder(),
                 ),
                 validator: (value) {
                   if (value == null || value.length < 8) {
@@ -253,7 +248,6 @@ class _UsersTabState extends State<UsersTab> {
                 obscureText: true,
                 decoration: const InputDecoration(
                   labelText: 'Confirm Password',
-                  border: OutlineInputBorder(),
                 ),
                 validator: (value) {
                   if (value != passwordController.text) {
@@ -270,7 +264,7 @@ class _UsersTabState extends State<UsersTab> {
             onPressed: () => Navigator.of(context).pop(),
             child: const Text('Cancel'),
           ),
-          ElevatedButton(
+          FilledButton(
             onPressed: () async {
               if (formKey.currentState?.validate() ?? false) {
                 Navigator.of(context).pop();
@@ -297,10 +291,6 @@ class _UsersTabState extends State<UsersTab> {
                 }
               }
             },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: PiccoloTheme.cobalt600,
-              foregroundColor: Colors.white,
-            ),
             child: const Text('Set Password'),
           ),
         ],

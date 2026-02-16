@@ -9,6 +9,7 @@ import '../../../features/apps/app_launcher.dart';
 import '../../../shared/widgets/action_progress_dialog.dart';
 import '../../../shared/widgets/app_icon.dart';
 import '../../../shared/widgets/uninstall_confirmation_dialog.dart';
+import '../../../theme/piccolo_icons.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../desktop_controller.dart';
 
@@ -255,7 +256,7 @@ class _StageState extends State<Stage> {
       widget.controller.openApp(
         windowId,
         app.displayTitle,
-        Icons.settings_applications,
+        PiccoloIcons.settingsApp,
         AppDetailView(
           appId: app.name,
           appService: widget.controller.appService,
@@ -332,10 +333,10 @@ class _StageState extends State<Stage> {
         Offset.zero & overlay.size,
       ),
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(Radii.md),
       ),
       color: PiccoloTheme.porcelain,
-      elevation: 8,
+      elevation: 2,
       constraints: const BoxConstraints(minWidth: 180),
       items: [
         PopupMenuItem(
@@ -343,7 +344,7 @@ class _StageState extends State<Stage> {
           height: 44,
           child: Row(
             children: [
-              Icon(Icons.open_in_new, size: 18, color: PiccoloTheme.ink),
+              Icon(PiccoloIcons.openExternal, size: 18, color: PiccoloTheme.ink),
               const SizedBox(width: 12),
               Text('Open', style: TextStyle(color: PiccoloTheme.ink)),
             ],
@@ -354,7 +355,7 @@ class _StageState extends State<Stage> {
           height: 44,
           child: Row(
             children: [
-              Icon(Icons.settings, size: 18, color: PiccoloTheme.ink),
+              Icon(PiccoloIcons.settings, size: 18, color: PiccoloTheme.ink),
               const SizedBox(width: 12),
               Text('Settings', style: TextStyle(color: PiccoloTheme.ink)),
             ],
@@ -365,7 +366,7 @@ class _StageState extends State<Stage> {
           height: 44,
           child: Row(
             children: [
-              Icon(Icons.article_outlined, size: 18, color: PiccoloTheme.ink),
+              Icon(PiccoloIcons.article, size: 18, color: PiccoloTheme.ink),
               const SizedBox(width: 12),
               Text('Logs', style: TextStyle(color: PiccoloTheme.ink)),
             ],
@@ -378,7 +379,7 @@ class _StageState extends State<Stage> {
             height: 44,
             child: Row(
               children: [
-                Icon(Icons.stop, size: 18, color: PiccoloTheme.ink),
+                Icon(PiccoloIcons.stop, size: 18, color: PiccoloTheme.ink),
                 const SizedBox(width: 12),
                 Text('Stop', style: TextStyle(color: PiccoloTheme.ink)),
               ],
@@ -390,7 +391,7 @@ class _StageState extends State<Stage> {
             height: 44,
             child: Row(
               children: [
-                Icon(Icons.play_arrow, size: 18, color: PiccoloTheme.ink),
+                Icon(PiccoloIcons.play, size: 18, color: PiccoloTheme.ink),
                 const SizedBox(width: 12),
                 Text('Start', style: TextStyle(color: PiccoloTheme.ink)),
               ],
@@ -401,7 +402,7 @@ class _StageState extends State<Stage> {
           height: 44,
           child: Row(
             children: [
-              Icon(Icons.delete_outline, size: 18, color: PiccoloTheme.critical),
+              Icon(PiccoloIcons.delete, size: 18, color: PiccoloTheme.critical),
               const SizedBox(width: 12),
               Text(
                 'Uninstall',
@@ -486,7 +487,7 @@ class _StageState extends State<Stage> {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              Icons.error_outline,
+              PiccoloIcons.error,
               size: 48,
               color: Colors.white.withValues(alpha: 0.8),
             ),
@@ -518,7 +519,7 @@ class _StageState extends State<Stage> {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              Icons.apps,
+              PiccoloIcons.apps,
               size: 64,
               color: Colors.white.withValues(alpha: 0.6),
             ),
@@ -542,7 +543,7 @@ class _StageState extends State<Stage> {
             const SizedBox(height: 24),
             FilledButton.icon(
               onPressed: () => widget.controller.openAppStore(),
-              icon: const Icon(Icons.storefront),
+              icon: const Icon(PiccoloIcons.store),
               label: const Text('Open App Store'),
               style: FilledButton.styleFrom(
                 backgroundColor: PiccoloTheme.cobalt600,
@@ -624,7 +625,7 @@ class _AppTileState extends State<_AppTile> {
             widget.onSecondaryTap(details.globalPosition),
         child: AnimatedScale(
           scale: _isHovered ? 1.08 : 1.0,
-          duration: const Duration(milliseconds: 150),
+          duration: Motion.medium,
           curve: Curves.easeOut,
           child: SizedBox(
             width: 100,
@@ -634,7 +635,7 @@ class _AppTileState extends State<_AppTile> {
               children: [
                 // Icon container
                 AnimatedContainer(
-                  duration: const Duration(milliseconds: 150),
+                  duration: Motion.medium,
                   width: 64,
                   height: 64,
                   decoration: BoxDecoration(
@@ -689,8 +690,8 @@ class _AppTileState extends State<_AppTile> {
                   padding:
                       const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                   decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.4),
-                    borderRadius: BorderRadius.circular(8),
+                    color: PiccoloTheme.scrim,
+                    borderRadius: BorderRadius.circular(Radii.sm),
                   ),
                   child: Text(
                     widget.app.displayTitle,
@@ -735,7 +736,7 @@ class _AddTileState extends State<_AddTile> {
         onTap: widget.onTap,
         child: AnimatedScale(
           scale: _isHovered ? 1.08 : 1.0,
-          duration: const Duration(milliseconds: 150),
+          duration: Motion.medium,
           curve: Curves.easeOut,
           child: SizedBox(
             width: 100,
@@ -745,7 +746,7 @@ class _AddTileState extends State<_AddTile> {
               children: [
                 // Icon container
                 AnimatedContainer(
-                  duration: const Duration(milliseconds: 150),
+                  duration: Motion.medium,
                   width: 64,
                   height: 64,
                   decoration: BoxDecoration(
@@ -757,7 +758,7 @@ class _AddTileState extends State<_AddTile> {
                     ),
                   ),
                   child: Icon(
-                    Icons.add,
+                    PiccoloIcons.add,
                     size: 32,
                     color: Colors.white.withValues(alpha: _isHovered ? 1.0 : 0.9),
                   ),
@@ -767,8 +768,8 @@ class _AddTileState extends State<_AddTile> {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                   decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.4),
-                    borderRadius: BorderRadius.circular(8),
+                    color: PiccoloTheme.scrim,
+                    borderRadius: BorderRadius.circular(Radii.sm),
                   ),
                   child: const Text(
                     'App Store',

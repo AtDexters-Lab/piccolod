@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../theme/piccolo_theme.dart';
 import 'desktop_controller.dart';
 import 'widgets/stage.dart';
 import 'widgets/dock.dart';
@@ -96,7 +97,7 @@ class _DesktopShellState extends State<DesktopShell> {
                     child: GestureDetector(
                       onTap: _controller.toggleLauncher, // Close on tap outside
                       child: Container(
-                        color: Colors.black.withValues(alpha: 0.2),
+                        color: PiccoloTheme.scrim.withValues(alpha: 0.2),
                         child: const Center(
                           child: Card(
                             child: Padding(

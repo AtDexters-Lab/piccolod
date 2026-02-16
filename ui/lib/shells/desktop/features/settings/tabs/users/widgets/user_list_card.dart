@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/user.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Card displaying a user in the users list.
@@ -22,9 +23,9 @@ class UserListCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: PiccoloTheme.porcelain),
+        color: PiccoloTheme.porcelain,
+        borderRadius: BorderRadius.circular(Radii.md),
+        border: Border.all(color: PiccoloTheme.hairline),
       ),
       child: Row(
         children: [
@@ -77,7 +78,7 @@ class UserListCard extends StatelessWidget {
                         ),
                         decoration: BoxDecoration(
                           color: PiccoloTheme.mist,
-                          borderRadius: BorderRadius.circular(4),
+                          borderRadius: BorderRadius.circular(Radii.xxs),
                         ),
                         child: Text(
                           app,
@@ -94,7 +95,7 @@ class UserListCard extends StatelessWidget {
           ),
           // Actions
           PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert, color: PiccoloTheme.inkMuted),
+            icon: const Icon(PiccoloIcons.moreVert, color: PiccoloTheme.inkMuted),
             onSelected: (value) {
               switch (value) {
                 case 'edit':
@@ -109,23 +110,23 @@ class UserListCard extends StatelessWidget {
               }
             },
             itemBuilder: (context) => [
-              const PopupMenuItem(
+              PopupMenuItem(
                 value: 'edit',
                 child: Row(
                   children: [
-                    Icon(Icons.edit_outlined, size: 18),
-                    SizedBox(width: 8),
-                    Text('Edit'),
+                    Icon(PiccoloIcons.edit, size: 18),
+                    const SizedBox(width: 8),
+                    const Text('Edit'),
                   ],
                 ),
               ),
-              const PopupMenuItem(
+              PopupMenuItem(
                 value: 'password',
                 child: Row(
                   children: [
-                    Icon(Icons.lock_outline, size: 18),
-                    SizedBox(width: 8),
-                    Text('Set Password'),
+                    Icon(PiccoloIcons.lock, size: 18),
+                    const SizedBox(width: 8),
+                    const Text('Set Password'),
                   ],
                 ),
               ),
@@ -134,7 +135,7 @@ class UserListCard extends StatelessWidget {
                 value: 'delete',
                 child: Row(
                   children: [
-                    Icon(Icons.delete_outline,
+                    Icon(PiccoloIcons.delete,
                         size: 18, color: PiccoloTheme.critical),
                     const SizedBox(width: 8),
                     Text('Delete',

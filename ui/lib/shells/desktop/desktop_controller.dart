@@ -3,6 +3,7 @@ import 'models/desktop_window.dart';
 import '../../core/services/api_client.dart';
 import '../../core/services/app_service.dart';
 import '../../core/services/event_stream_client.dart';
+import '../../theme/piccolo_icons.dart';
 import '../../features/apps/app_store_window.dart';
 
 /// Manages the state of the Desktop Shell.
@@ -124,7 +125,7 @@ class DesktopController extends ChangeNotifier {
       openApp(
         "welcome",
         "Welcome",
-        Icons.waving_hand,
+        PiccoloIcons.handWaving,
         const Center(child: Text("Welcome to Piccolo OS!")),
       );
     }
@@ -137,7 +138,7 @@ class DesktopController extends ChangeNotifier {
       openApp(
         "app-store",
         "App Store",
-        Icons.storefront,
+        PiccoloIcons.store,
         AppStoreWindow(desktopController: this),
         initialSize: const Size(900, 650),
       );
