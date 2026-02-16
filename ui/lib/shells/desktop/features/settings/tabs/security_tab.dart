@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../../../shared/widgets/ca_import_guide.dart';
 import '../../../../../theme/piccolo_icons.dart';
 import '../../../../../theme/piccolo_theme.dart';
 import '../settings_controller.dart';
@@ -15,10 +16,10 @@ class SecurityTab extends StatelessWidget {
       children: [
         Text("Security",
             style: PiccoloTheme.textTheme.headlineLarge),
-        const SizedBox(height: 32),
+        const SizedBox(height: Spacing.xl),
         Text("HTTPS on LAN",
             style: PiccoloTheme.textTheme.titleMedium),
-        const SizedBox(height: 16),
+        const SizedBox(height: Spacing.base),
         _LANSecurityCard(controller: controller),
       ],
     );
@@ -32,7 +33,7 @@ class _LANSecurityCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(Spacing.lg),
       decoration: BoxDecoration(
         color: PiccoloTheme.porcelain,
         borderRadius: BorderRadius.circular(Radii.md),
@@ -44,12 +45,12 @@ class _LANSecurityCard extends StatelessWidget {
           Row(
             children: [
               Icon(PiccoloIcons.lock, color: PiccoloTheme.success, size: 20),
-              const SizedBox(width: 8),
+              const SizedBox(width: Spacing.sm),
               Text("HTTPS on LAN",
                 style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold)),
             ],
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: Spacing.sm),
           Text(
             controller.specificHostname != null
                 ? "Access this portal securely via https://${controller.specificHostname}. "
@@ -58,12 +59,14 @@ class _LANSecurityCard extends StatelessWidget {
                   "To avoid browser warnings, download and trust the CA certificate.",
             style: PiccoloTheme.textTheme.labelSmall,
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: Spacing.base),
           OutlinedButton.icon(
             icon: const Icon(PiccoloIcons.download, size: 18),
             label: const Text("Download CA Certificate"),
             onPressed: () => controller.downloadCACertificate(),
           ),
+          const SizedBox(height: Spacing.lg),
+          const CaImportGuide(),
         ],
       ),
     );

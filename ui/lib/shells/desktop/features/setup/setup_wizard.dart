@@ -6,6 +6,7 @@ import '../../../../core/models/network_models.dart';
 import '../../../../core/services/api_client.dart';
 import '../../../../core/services/network_service.dart';
 import '../../../../core/utils/downloader/downloader.dart';
+import '../../../../shared/widgets/ca_import_guide.dart';
 import '../../../../shared/widgets/password_set_form.dart';
 import 'install_disk_step.dart';
 import 'onboarding_step.dart';
@@ -819,14 +820,16 @@ class _SecurityStepState extends State<_SecurityStep> {
               ],
             ),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: Spacing.lg),
           OutlinedButton.icon(
             onPressed: _downloading ? null : _downloadCA,
             icon: const Icon(PiccoloIcons.download, size: 16),
             label: Text(_downloading ? "Downloading..." : "Download CA Certificate"),
             style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.ink),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: Spacing.lg),
+          const CaImportGuide(),
+          const SizedBox(height: Spacing.lg),
           FilledButton(
             onPressed: widget.onNext,
             style: FilledButton.styleFrom(
