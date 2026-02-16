@@ -5,6 +5,8 @@ import '../../core/services/app_service.dart';
 import '../../core/services/event_stream_client.dart';
 import '../../theme/piccolo_icons.dart';
 import '../../features/apps/app_store_window.dart';
+import 'features/settings/settings_app.dart';
+import 'features/welcome/welcome_screen.dart';
 
 /// Manages the state of the Desktop Shell.
 ///
@@ -121,16 +123,38 @@ class DesktopController extends ChangeNotifier {
     notifyListeners();
 
     if (isFirstSetup) {
-      // Open a welcome window only after first device setup.
       openApp(
         "welcome",
         "Welcome",
         PiccoloIcons.handWaving,
-        const Center(child: Text("Welcome to Piccolo OS!")),
+        WelcomeScreen(controller: this),
+        initialSize: const Size(640, 420),
       );
     }
   }
   
+  /// Opens (or focuses) the Settings window.
+  ///
+  /// [initialTab] is only applied when opening a new window; if Settings is
+  /// already open the existing window is focused on its current tab.
+  void openSettings({int initialTab = 0}) {
+    if (isAppOpen("settings")) {
+      focusWindow("settings");
+    } else {
+      openApp(
+        "settings",
+        "Settings",
+        PiccoloIcons.settings,
+        SettingsApp(
+          initialTab: initialTab,
+          onLogout: logout,
+          eventStreamClient: eventStreamClient,
+        ),
+        initialSize: const Size(1100, 750),
+      );
+    }
+  }
+
   void openAppStore() {
     if (isAppOpen("app-store")) {
       focusWindow("app-store");

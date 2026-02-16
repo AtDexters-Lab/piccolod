@@ -5,6 +5,7 @@ import '../../../core/services/app_service.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../../../theme/piccolo_icons.dart';
 import '../../../shells/desktop/desktop_controller.dart';
+import '../../../shells/desktop/features/settings/settings_app.dart';
 import '../app_launcher.dart';
 import 'local_fallback_overlay.dart';
 
@@ -177,7 +178,7 @@ class _AppDetailHealthBannerState extends State<AppDetailHealthBanner> {
       );
       return;
     }
-    openOrFocusSettings(controller);
+    controller.openSettings(initialTab: SettingsTab.remoteAccess);
   }
 
   Future<void> _retryNow(String? certId) async {

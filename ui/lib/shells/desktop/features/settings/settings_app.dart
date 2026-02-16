@@ -9,11 +9,22 @@ import 'tabs/security_tab.dart';
 import 'tabs/system_tab.dart';
 import 'tabs/users/users_tab.dart';
 
+/// Named indices for the Settings sidebar tabs.
+class SettingsTab {
+  SettingsTab._();
+  static const int profile = 0;
+  static const int remoteAccess = 1;
+  static const int users = 2;
+  static const int security = 3;
+  static const int system = 4;
+}
+
 class SettingsApp extends StatefulWidget {
   final VoidCallback? onLogout;
   final EventStreamClient? eventStreamClient;
+  final int initialTab;
 
-  const SettingsApp({super.key, this.onLogout, this.eventStreamClient});
+  const SettingsApp({super.key, this.onLogout, this.eventStreamClient, this.initialTab = 0});
 
   @override
   State<SettingsApp> createState() => _SettingsAppState();
@@ -26,7 +37,7 @@ class _SettingsAppState extends State<SettingsApp> {
   void initState() {
     super.initState();
     _controller.onSessionExpired = widget.onLogout;
-    _controller.selectTab(0); // Load initial data
+    _controller.selectTab(widget.initialTab);
   }
 
   @override

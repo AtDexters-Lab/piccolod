@@ -115,7 +115,7 @@ class LocalFallbackOverlay extends StatelessWidget {
     final controller = desktopController;
     if (controller == null) return;
     Navigator.of(context).pop();
-    openOrFocusSettings(controller);
+    controller.openSettings(initialTab: SettingsTab.remoteAccess);
   }
 
   Future<void> _retryNow(BuildContext context) async {
@@ -132,21 +132,6 @@ class LocalFallbackOverlay extends StatelessWidget {
         SnackBar(content: Text('Retry failed: $e')),
       );
     }
-  }
-}
-
-void openOrFocusSettings(DesktopController controller) {
-  const settingsId = 'settings';
-  if (controller.isAppOpen(settingsId)) {
-    controller.focusWindow(settingsId);
-  } else {
-    controller.openApp(
-      settingsId,
-      'Settings',
-      PiccoloIcons.settings,
-      SettingsApp(onLogout: controller.logout),
-      initialSize: const Size(1100, 750),
-    );
   }
 }
 

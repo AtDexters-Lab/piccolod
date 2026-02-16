@@ -15,7 +15,6 @@ import '../../../theme/piccolo_theme.dart';
 import '../desktop_controller.dart';
 import '../models/desktop_window.dart';
 
-import '../features/settings/settings_app.dart';
 import '../features/terminal/terminal_view.dart';
 
 class Dock extends StatelessWidget {
@@ -86,17 +85,7 @@ class Dock extends StatelessWidget {
               label: "Settings",
               isOpen: controller.isAppOpen("settings"),
               isActive: controller.isAppActive("settings"),
-              onTap: () => controller.openApp(
-                "settings",
-                "Settings",
-                PiccoloIcons.settings,
-                SettingsApp(
-                  onLogout: controller.logout,
-                  eventStreamClient: controller.eventStreamClient,
-                ),
-                screenSize: screenSize,
-                initialSize: const Size(1100, 750),
-              ),
+              onTap: controller.openSettings,
             ),
             const SizedBox(width: Spacing.md),
             DockItem(
