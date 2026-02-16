@@ -67,6 +67,7 @@ type osUpdateManager interface {
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
 	Reboot(context.Context) error
+	ForceReboot(context.Context) error
 	PowerOff(context.Context) error
 	Watch(context.Context) error
 }
@@ -1952,15 +1953,16 @@ func (s *GinServer) handleGinReadinessCheck(c *gin.Context) {
 	}
 	required := []string{"persistence", "app-manager", "service-manager"}
 	ready, snapshot := s.healthTracker.Ready(required...)
+	overall := s.healthTracker.Overall()
 	payload := gin.H{
 		"ready":      ready,
-		"status":     s.healthTracker.Overall().String(),
+		"status":     overall.String(),
 		"components": flattenHealth(snapshot),
 	}
-	// TODO(ballast): once the health tracker distinguishes fatal states (e.g. control
-	// store cannot unlock due to corruption), emit 503 here so MicroOS can roll
-	// back automatically. For now we always return 200 to stay compatible with
-	// piccolod-health-check-prod.sh which only inspects the status code.
+	if overall == health.LevelError {
+		c.JSON(http.StatusServiceUnavailable, payload)
+		return
+	}
 	c.JSON(http.StatusOK, payload)
 }
 

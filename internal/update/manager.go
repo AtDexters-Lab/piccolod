@@ -27,10 +27,11 @@ const (
 )
 
 var (
-	ErrInProgress      = errors.New("transactional-update in progress")
-	ErrUnsupported     = errors.New("transactional-update unsupported on this host")
-	ErrInvalidSnapshot = errors.New("invalid snapshot id")
-	ErrTimeout         = errors.New("transactional-update timed out")
+	ErrInProgress               = errors.New("transactional-update in progress")
+	ErrUnsupported              = errors.New("transactional-update unsupported on this host")
+	ErrInvalidSnapshot          = errors.New("invalid snapshot id")
+	ErrTimeout                  = errors.New("transactional-update timed out")
+	ErrSnapshotValidationFailed = errors.New("staged snapshot missing critical components")
 )
 
 // Status mirrors the public API shape and carries a meta section for richer data.
@@ -54,6 +55,7 @@ type osBackend interface {
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
 	Reboot(context.Context) error
+	ForceReboot(context.Context) error
 	PowerOff(context.Context) error
 	Watch(context.Context) error
 }
@@ -67,6 +69,7 @@ type microOSBackend struct {
 	statePath      string
 	readFile       func(string) ([]byte, error)
 	currentVersion string
+	snapshotsDir   string
 
 	mu              sync.Mutex
 	supported       bool
@@ -110,6 +113,11 @@ func WithCurrentVersion(v string) Option {
 	return func(m *microOSBackend) { m.currentVersion = v }
 }
 
+// WithSnapshotsDir overrides the btrfs snapshots directory (default /.snapshots).
+func WithSnapshotsDir(dir string) Option {
+	return func(m *microOSBackend) { m.snapshotsDir = dir }
+}
+
 // NewManager constructs a Manager with an OS backend (MicroOS today).
 func NewManager(opts ...Option) (*Manager, error) {
 	b, err := newMicroOSBackend(opts...)
@@ -130,9 +138,14 @@ func (m *Manager) Rollback(ctx context.Context, targetID string) error {
 	return m.backend.Rollback(ctx, targetID)
 }
 
-// Reboot triggers a system reboot.
+// Reboot validates the staged snapshot and triggers a system reboot.
 func (m *Manager) Reboot(ctx context.Context) error {
 	return m.backend.Reboot(ctx)
+}
+
+// ForceReboot triggers a system reboot without snapshot validation.
+func (m *Manager) ForceReboot(ctx context.Context) error {
+	return m.backend.ForceReboot(ctx)
 }
 
 // PowerOff triggers a system power off.
@@ -155,12 +168,13 @@ func newMicroOSBackend(opts ...Option) (*microOSBackend, error) {
 	}
 
 	m := &microOSBackend{
-		runner:     execRunner{},
-		clock:      time.Now,
-		timeout:    timeout,
-		runtimeDir: defaultRuntimeDir,
-		statePath:  filepath.Join(paths.CoreRoot(), defaultStateSubdir, defaultStateFilename),
-		readFile:   os.ReadFile,
+		runner:       execRunner{},
+		clock:        time.Now,
+		timeout:      timeout,
+		runtimeDir:   defaultRuntimeDir,
+		statePath:    filepath.Join(paths.CoreRoot(), defaultStateSubdir, defaultStateFilename),
+		readFile:     os.ReadFile,
+		snapshotsDir: "/.snapshots",
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -248,13 +262,45 @@ func (m *microOSBackend) Rollback(ctx context.Context, targetID string) error {
 	return m.runTransactionalUpdate(ctx, []string{"transactional-update", "--non-interactive", "rollback", targetID}, "rollback", targetID, false)
 }
 
-// Reboot triggers systemctl reboot.
+// Reboot validates the staged snapshot (if any) and triggers systemctl reboot.
+// If validation fails, the bad snapshot is reverted and deleted before returning an error.
 func (m *microOSBackend) Reboot(ctx context.Context) error {
 	if !m.supported {
 		return ErrUnsupported
 	}
-	// We use the runner to execute reboot. Note that this will likely terminate the API server
-	// before the command returns or shortly after.
+
+	defaultID, err := m.validateStagedSnapshot(ctx)
+	if err != nil {
+		// Only run destructive cleanup (revert+delete) for confirmed content
+		// failures. Lookup/probe errors block reboot but don't touch snapshots.
+		if !errors.Is(err, ErrSnapshotValidationFailed) {
+			return err
+		}
+
+		// Revert to active snapshot — only delete if revert succeeds,
+		// otherwise we'd leave boot default pointing at a deleted snapshot.
+		if revertErr := m.revertDefaultSnapshot(ctx); revertErr != nil {
+			return fmt.Errorf("validation failed AND revert failed (revert: %v): %w", revertErr, err)
+		}
+
+		// Best-effort delete the bad snapshot (safe: default already reverted)
+		if defaultID != "" {
+			_, _, _, _ = m.runner.Run(ctx, "snapper", "delete", defaultID)
+		}
+
+		return err
+	}
+
+	_, _, _, err = m.runner.Run(ctx, "systemctl", "reboot")
+	return err
+}
+
+// ForceReboot triggers systemctl reboot without snapshot validation.
+// Intended as an emergency escape hatch.
+func (m *microOSBackend) ForceReboot(ctx context.Context) error {
+	if !m.supported {
+		return ErrUnsupported
+	}
 	_, _, _, err := m.runner.Run(ctx, "systemctl", "reboot")
 	return err
 }
@@ -281,17 +327,48 @@ func (m *microOSBackend) Watch(ctx context.Context) error {
 		// Small delay to let system settle
 		time.Sleep(10 * time.Second)
 		m.checkAndRecover(ctx)
+		m.watchSnapshots(ctx)
 	}()
 
-	ticker := time.NewTicker(15 * time.Minute)
-	defer ticker.Stop()
+	recoveryTicker := time.NewTicker(15 * time.Minute)
+	defer recoveryTicker.Stop()
+
+	snapshotTicker := time.NewTicker(2 * time.Minute)
+	defer snapshotTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-recoveryTicker.C:
 			m.checkAndRecover(ctx)
+		case <-snapshotTicker.C:
+			m.watchSnapshots(ctx)
+		}
+	}
+}
+
+// watchSnapshots validates any staged snapshot and auto-reverts if it's missing
+// critical components. Silent operation — consistent with checkAndRecover pattern.
+// Delegates to validateStagedSnapshot which handles the no-staged-snapshot case.
+func (m *microOSBackend) watchSnapshots(ctx context.Context) {
+	if m.isInProgress(ctx) {
+		return
+	}
+
+	defaultID, err := m.validateStagedSnapshot(ctx)
+	if err != nil {
+		// Only cleanup for confirmed content failures, not lookup errors
+		if !errors.Is(err, ErrSnapshotValidationFailed) {
+			return
+		}
+
+		if revertErr := m.revertDefaultSnapshot(ctx); revertErr != nil {
+			return
+		}
+		// Best-effort delete the bad snapshot
+		if defaultID != "" {
+			_, _, _, _ = m.runner.Run(ctx, "snapper", "delete", defaultID)
 		}
 	}
 }
@@ -350,6 +427,78 @@ func (m *microOSBackend) checkAndRecover(ctx context.Context) {
 	// We use "auto-fallback" as the action name to distinguish from user actions.
 	// This will update state.json, preventing a retry loop on the next tick (step 5).
 	_ = m.runTransactionalUpdate(ctx, cmd, "auto-fallback", "", false)
+}
+
+// validateStagedSnapshot checks that the default (staged) snapshot contains
+// critical system binaries. Returns the resolved default snapshot ID and nil
+// if no staged snapshot exists or if the snapshot looks healthy. Returns an
+// error wrapping ErrSnapshotValidationFailed only when actual content validation
+// fails (missing binaries). Lookup/probe failures return a plain error to
+// prevent callers from running destructive cleanup (revert+delete) on what may
+// be a healthy snapshot. Callers should use the returned defaultID for cleanup
+// instead of re-resolving it (avoids TOCTOU races).
+func (m *microOSBackend) validateStagedSnapshot(ctx context.Context) (string, error) {
+	activeID, _ := m.activeSnapshot(ctx)
+	rawDefaultID := m.defaultSnapshot(ctx)
+	if rawDefaultID == "" {
+		return "", fmt.Errorf("cannot determine default snapshot")
+	}
+	defaultID := m.snapperNumberFromID(ctx, rawDefaultID)
+
+	// No staged snapshot — nothing to validate
+	if defaultID == activeID {
+		return defaultID, nil
+	}
+
+	snapshotRoot := filepath.Join(m.snapshotsDir, defaultID, "snapshot")
+
+	// Critical binaries that must exist
+	criticalPaths := []string{
+		"usr/lib/systemd/systemd",
+		"usr/sbin/cryptsetup",
+		"usr/sbin/ip",
+	}
+	var missing []string
+	for _, p := range criticalPaths {
+		if _, err := os.Stat(filepath.Join(snapshotRoot, p)); err != nil {
+			missing = append(missing, p)
+		}
+	}
+
+	// At least one kernel image must exist
+	kernelGlobs := []string{
+		filepath.Join(snapshotRoot, "usr/lib/modules/*/vmlinuz"),
+		filepath.Join(snapshotRoot, "usr/lib/modules/*/Image"),
+	}
+	hasKernel := false
+	for _, pattern := range kernelGlobs {
+		if matches, err := filepath.Glob(pattern); err == nil && len(matches) > 0 {
+			hasKernel = true
+			break
+		}
+	}
+	if !hasKernel {
+		missing = append(missing, "usr/lib/modules/*/vmlinuz|Image")
+	}
+
+	if len(missing) > 0 {
+		return defaultID, fmt.Errorf("staged snapshot %s missing critical components %v: %w", defaultID, missing, ErrSnapshotValidationFailed)
+	}
+	return defaultID, nil
+}
+
+// revertDefaultSnapshot sets the active snapshot as the btrfs default,
+// effectively un-staging a bad pending snapshot.
+func (m *microOSBackend) revertDefaultSnapshot(ctx context.Context) error {
+	activeID, _ := m.activeSnapshot(ctx)
+	if activeID == "" {
+		return fmt.Errorf("cannot determine active snapshot for revert")
+	}
+	_, _, code, err := m.runner.Run(ctx, "snapper", "modify", "--default", activeID)
+	if err != nil || code != 0 {
+		return fmt.Errorf("snapper modify --default %s failed (code %d): %w", activeID, code, err)
+	}
+	return nil
 }
 
 // ---- internals ----
@@ -447,7 +596,7 @@ func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
 		meta["piccolod_active"] = activePiccolo
 	}
 	if stagedID != "" {
-		stagedRoot := filepath.Join("/.snapshots", stagedID, "snapshot")
+		stagedRoot := filepath.Join(m.snapshotsDir, stagedID, "snapshot")
 		if stagedPiccolo := m.queryRPM(ctx, "piccolod", stagedRoot); stagedPiccolo != "" && stagedPiccolo != activePiccolo {
 			meta["piccolod_staged"] = stagedPiccolo
 		}
@@ -493,7 +642,7 @@ func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
 			availableVersion = stagedV.(string)
 		} else if activePiccolo == "" {
 			// Fallback path: if no RPM, check staged OS version
-			stagedRoot := filepath.Join("/.snapshots", stagedID, "snapshot")
+			stagedRoot := filepath.Join(m.snapshotsDir, stagedID, "snapshot")
 			if vStaged := m.getOSReleaseVersion(stagedRoot); vStaged != "" {
 				availableVersion = vStaged
 			} else {
