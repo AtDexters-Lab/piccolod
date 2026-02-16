@@ -21,7 +21,8 @@ type fuseMount struct {
 	fstype string
 }
 
-// cleanupStaleFUSEMounts unmounts all FUSE mounts under the state directory.
+// cleanupStaleFUSEMounts unmounts all FUSE mounts under piccolo-managed
+// directories (core root, podman runroot, and image graphroot).
 // Called once at startup before the first reconcile tick.
 //
 // After a service restart, systemd kills FUSE daemon processes (fuse-overlayfs,
@@ -42,7 +43,11 @@ func cleanupStaleFUSEMounts(ctx context.Context) {
 	}
 	defer f.Close()
 
-	mounts := parseFUSEMounts(f, paths.CoreRoot())
+	mounts := parseFUSEMounts(f,
+		paths.CoreRoot(),                               // gocryptfs, per-app graphroot overlays, workspace overlays
+		podmanRunRootBase(),                             // ALL runRoot overlays (image-root + per-app vol-ids)
+		paths.DataJoin("node", "podman", "image-root"),  // image graphroot overlays
+	)
 	if len(mounts) == 0 {
 		return
 	}
@@ -62,8 +67,8 @@ func cleanupStaleFUSEMounts(ctx context.Context) {
 }
 
 // parseFUSEMounts reads mount entries and returns all fuse.* mountpoints
-// whose path falls under the given prefix.
-func parseFUSEMounts(r io.Reader, prefix string) []fuseMount {
+// whose path falls under any of the given prefixes.
+func parseFUSEMounts(r io.Reader, prefixes ...string) []fuseMount {
 	var mounts []fuseMount
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
@@ -77,7 +82,14 @@ func parseFUSEMounts(r io.Reader, prefix string) []fuseMount {
 		if !strings.HasPrefix(fstype, "fuse.") {
 			continue
 		}
-		if !strings.HasPrefix(mountpoint, prefix+"/") && mountpoint != prefix {
+		matched := false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(mountpoint, prefix+"/") || mountpoint == prefix {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			continue
 		}
 		mounts = append(mounts, fuseMount{path: mountpoint, fstype: fstype})

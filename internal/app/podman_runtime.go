@@ -10,6 +10,15 @@ import (
 	"piccolod/internal/state/paths"
 )
 
+// podmanRunRootBase returns the base directory for podman runtime state.
+// Per-app and image runtimes create subdirectories under this path.
+func podmanRunRootBase() string {
+	if base := os.Getenv("PICCOLO_PODMAN_RUNROOT_BASE"); base != "" {
+		return filepath.Clean(base)
+	}
+	return "/run/piccolo/podman"
+}
+
 // podmanRuntimeForApp returns a runtime configured for a specific app instance.
 // Each app instance has an isolated podman Root (container metadata, RW layers) within
 // its encrypted volume, while images are stored in the shared imagestore for deduplication.
@@ -23,13 +32,7 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 		volID = appVolumeID(instanceID)
 	}
 
-	runRootBase := os.Getenv("PICCOLO_PODMAN_RUNROOT_BASE")
-	runRoot := ""
-	if runRootBase != "" {
-		runRoot = filepath.Join(filepath.Clean(runRootBase), volID)
-	} else {
-		runRoot = filepath.Join("/run/piccolo/podman", volID)
-	}
+	runRoot := filepath.Join(podmanRunRootBase(), volID)
 	if err := ensureDir(runRoot, 0o700); err != nil {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: ensure podman runroot: %w", err)
 	}
@@ -94,13 +97,7 @@ func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
 			return
 		}
 
-		runRootBase := os.Getenv("PICCOLO_PODMAN_RUNROOT_BASE")
-		var runRoot string
-		if runRootBase != "" {
-			runRoot = filepath.Join(filepath.Clean(runRootBase), "image-root")
-		} else {
-			runRoot = filepath.Join("/run/piccolo/podman", "image-root")
-		}
+		runRoot := filepath.Join(podmanRunRootBase(), "image-root")
 		if err := ensureDir(runRoot, 0o700); err != nil {
 			m.imageRuntimeErr = fmt.Errorf("app manager: ensure image runtime runroot: %w", err)
 			return
