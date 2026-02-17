@@ -7,6 +7,7 @@ import '../../core/config/core_config.dart';
 import '../../core/services/error_reporter.dart';
 import '../../core/utils/clipboard/clipboard.dart' as clipboard_utils;
 import '../../shells/desktop/features/terminal/terminal_backend.dart';
+import '../../theme/piccolo_theme.dart';
 import 'render_error_boundary.dart';
 
 /// Mixin providing common terminal functionality for host and workspace terminals.
@@ -183,7 +184,7 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
           RenderErrorFallback(label: 'Terminal', retry: retry),
       child: RepaintBoundary(
         child: Container(
-          color: const Color(0xFF1E1E1E),
+          color: PiccoloTheme.terminalBg,
           child: SizedBox.expand(
             child: Scrollbar(
               controller: terminalScrollController,
@@ -214,7 +215,7 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
                     fontFamily: 'JetBrainsMono',
                     height: 1.2,
                   ),
-                  padding: const EdgeInsets.all(12.0),
+                  padding: const EdgeInsets.all(Spacing.md),
                   autofocus: true,
                   onSecondaryTapDown: (details, cell) =>
                       showTerminalContextMenu(context, details.globalPosition),

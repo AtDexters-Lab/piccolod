@@ -35,7 +35,7 @@ class AppIcon extends StatelessWidget {
     this.proxyUrl,
     this.originalIconUrl,
     this.size = 48,
-    this.borderRadius = 12,
+    this.borderRadius = Radii.md,
     this.fallbackText = '?',
     this.fallbackIcon,
     this.fallbackBackgroundColor,
@@ -66,7 +66,7 @@ class AppIcon extends StatelessWidget {
         child: Container(
           width: size,
           height: size,
-          color: Colors.white,
+          color: PiccoloTheme.porcelain,
           padding: EdgeInsets.all(padding),
           child: SvgPicture.network(
             proxyUrl!,
@@ -86,7 +86,7 @@ class AppIcon extends StatelessWidget {
       child: Container(
         width: size,
         height: size,
-        color: Colors.white,
+        color: PiccoloTheme.porcelain,
         padding: EdgeInsets.all(padding),
         child: Image.network(
           proxyUrl!,

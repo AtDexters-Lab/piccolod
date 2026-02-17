@@ -579,6 +579,31 @@ func (s *SessionStore) FindByParent(parentID string) []*Session {
 	return result
 }
 
+// ExtendTTL extends a non-expired session's lifetime by the given number of seconds.
+// Returns true if the session was found and extended, false otherwise (missing or expired).
+// ExtendTTLIfNeeded atomically extends the session TTL only when the remaining
+// lifetime drops below threshold seconds. Returns true if the TTL was extended
+// (caller should refresh the cookie). All reads/writes happen under a single
+// lock acquisition to avoid data races on sess.ExpiresAt.
+func (s *SessionStore) ExtendTTLIfNeeded(id string, ttlSeconds, threshold int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok {
+		return false
+	}
+	now := timeNow().Unix()
+	if now > sess.ExpiresAt {
+		delete(s.sessions, id)
+		return false
+	}
+	if sess.ExpiresAt-now >= threshold {
+		return false // Still within fresh window, no extension needed.
+	}
+	sess.ExpiresAt = now + ttlSeconds
+	return true
+}
+
 // timeNow is a small indirection for tests
 var timeNow = func() time.Time { return time.Now() }
 

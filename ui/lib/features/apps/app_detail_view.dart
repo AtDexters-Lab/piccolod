@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../theme/piccolo_theme.dart';
+import '../../theme/piccolo_icons.dart';
 import '../../core/models/app_models.dart';
 import '../../core/models/app_status_event.dart';
 import '../../core/models/listener_health.dart';
@@ -11,6 +12,7 @@ import '../../core/utils/task_id.dart';
 import '../../shared/widgets/app_icon.dart';
 import '../../shared/widgets/health_badge.dart';
 import '../../shared/widgets/log_stream_viewer.dart';
+import '../../shared/widgets/status_banner.dart';
 import '../../shared/widgets/task_progress_panel.dart';
 import '../../shared/widgets/uninstall_confirmation_dialog.dart';
 import '../../shells/desktop/desktop_controller.dart';
@@ -271,7 +273,7 @@ class _AppDetailViewState extends State<AppDetailView>
     widget.desktopController.openApp(
       windowId,
       "${_app!.displayTitle} Terminal",
-      Icons.terminal,
+      PiccoloIcons.terminal,
       WorkspaceTerminal(
         appId: _app!.name,
         serviceName: _selectedService,
@@ -353,8 +355,8 @@ class _AppDetailViewState extends State<AppDetailView>
     if (_app!.isError) statusColor = PiccoloTheme.critical;
 
     return Container(
-      color: Colors.white,
-      padding: const EdgeInsets.all(24.0),
+      color: PiccoloTheme.porcelain,
+      padding: const EdgeInsets.all(Spacing.lg),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -364,7 +366,7 @@ class _AppDetailViewState extends State<AppDetailView>
             height: 80,
             decoration: BoxDecoration(
               color: PiccoloTheme.mist,
-              borderRadius: BorderRadius.circular(16),
+              borderRadius: BorderRadius.circular(Radii.lg),
             ),
             child: Center(
               child: AppIcon(
@@ -379,44 +381,30 @@ class _AppDetailViewState extends State<AppDetailView>
               ),
             ),
           ),
-          const SizedBox(width: 24),
+          const SizedBox(width: Spacing.lg),
 
           // Info
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    Text(
-                      _app!.displayTitle,
-                      style: PiccoloTheme.textTheme.displayLarge?.copyWith(
-                        fontSize: 24,
-                      ),
-                    ),
-                    const Spacer(),
-                    // Uninstall Button (Moved here from AppBar)
-                    IconButton(
-                      icon: const Icon(
-                        Icons.delete_outline,
-                        color: PiccoloTheme.critical,
-                      ),
-                      onPressed: _confirmUninstall,
-                      tooltip: "Uninstall",
-                    ),
-                  ],
+                Text(
+                  _app!.displayTitle,
+                  style: PiccoloTheme.textTheme.displayLarge?.copyWith(
+                    fontSize: 24,
+                  ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: Spacing.sm),
                 Row(
                   children: [
                     Container(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
+                        horizontal: Spacing.sm,
+                        vertical: Spacing.xs,
                       ),
                       decoration: BoxDecoration(
                         color: statusColor.withValues(alpha: 0.1),
-                        borderRadius: BorderRadius.circular(12),
+                        borderRadius: BorderRadius.circular(Radii.md),
                       ),
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
@@ -441,7 +429,7 @@ class _AppDetailViewState extends State<AppDetailView>
                         ],
                       ),
                     ),
-                    const SizedBox(width: 16),
+                    const SizedBox(width: Spacing.base),
                     Text(
                       "Image: ${_app!.image}",
                       style: PiccoloTheme.textTheme.labelSmall,
@@ -452,55 +440,71 @@ class _AppDetailViewState extends State<AppDetailView>
             ),
           ),
 
-          const SizedBox(width: 24),
+          const SizedBox(width: Spacing.lg),
 
           // Actions
           if (_isActionLoading)
             const CircularProgressIndicator()
-          else ...[
-            if (_containers.length > 1) ...[
-              _buildServiceSelector(),
-              const SizedBox(width: 12),
-            ],
-            if (_app!.isRunning) ...[
-              FilledButton.icon(
-                onPressed: _openTerminal,
-                icon: const Icon(Icons.terminal),
-                label: const Text("Terminal"),
-                style: FilledButton.styleFrom(
-                  backgroundColor: PiccoloTheme.cobalt600,
+          else
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_containers.length > 1) ...[
+                  _buildServiceSelector(),
+                  const SizedBox(width: Spacing.md),
+                ],
+                if (_app!.isRunning) ...[
+                  FilledButton.icon(
+                    onPressed: _openTerminal,
+                    icon: const Icon(PiccoloIcons.terminal),
+                    label: const Text("Terminal"),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: PiccoloTheme.cobalt600,
+                    ),
+                  ),
+                  const SizedBox(width: Spacing.md),
+                ],
+                if (_app!.isRunning)
+                  FilledButton.icon(
+                    onPressed: () => _handleActionWithProgress(
+                      taskType: 'stop_app',
+                      action: (taskId) =>
+                          widget.appService.stopApp(_app!.name, taskId: taskId),
+                    ),
+                    icon: const Icon(PiccoloIcons.stop),
+                    label: const Text("Stop"),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: PiccoloTheme.inkMuted,
+                    ),
+                  )
+                else
+                  FilledButton.icon(
+                    onPressed: () => _handleActionWithProgress(
+                      taskType: 'start_app',
+                      action: (taskId) =>
+                          widget.appService.startApp(_app!.name, taskId: taskId),
+                    ),
+                    icon: const Icon(PiccoloIcons.play),
+                    label: const Text("Start"),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: PiccoloTheme.success,
+                    ),
+                  ),
+                const SizedBox(width: Spacing.md),
+                IconButton.outlined(
+                  onPressed: _confirmUninstall,
+                  icon: const Icon(PiccoloIcons.delete, size: 20),
+                  tooltip: "Uninstall",
+                  style: IconButton.styleFrom(
+                    foregroundColor: PiccoloTheme.critical,
+                    side: BorderSide(
+                      color: PiccoloTheme.critical.withValues(alpha: 0.3),
+                    ),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 12),
-            ],
-            // Start/Stop button
-            if (_app!.isRunning)
-              FilledButton.icon(
-                onPressed: () => _handleActionWithProgress(
-                  taskType: 'stop_app',
-                  action: (taskId) =>
-                      widget.appService.stopApp(_app!.name, taskId: taskId),
-                ),
-                icon: const Icon(Icons.stop),
-                label: const Text("Stop"),
-                style: FilledButton.styleFrom(
-                  backgroundColor: PiccoloTheme.inkMuted,
-                ),
-              )
-            else
-              FilledButton.icon(
-                onPressed: () => _handleActionWithProgress(
-                  taskType: 'start_app',
-                  action: (taskId) =>
-                      widget.appService.startApp(_app!.name, taskId: taskId),
-                ),
-                icon: const Icon(Icons.play_arrow),
-                label: const Text("Start"),
-                style: FilledButton.styleFrom(
-                  backgroundColor: PiccoloTheme.success,
-                ),
-              ),
-          ],
+              ],
+            ),
         ],
       ),
     );
@@ -543,7 +547,7 @@ class _AppDetailViewState extends State<AppDetailView>
 
   Widget _buildOverviewTab() {
     return ListView(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(Spacing.lg),
       children: [
         _buildSectionTitle("Storage Volumes"),
         if (_app!.volumes.isEmpty)
@@ -552,7 +556,7 @@ class _AppDetailViewState extends State<AppDetailView>
           ..._app!.volumes.map(
             (v) => Card(
               child: ListTile(
-                leading: const Icon(Icons.storage),
+                leading: const Icon(PiccoloIcons.storage),
                 title: Text(v.containerPath),
                 subtitle: Text("Host: ${v.hostPath}"),
                 trailing: Text(v.sizeLimit),
@@ -560,7 +564,7 @@ class _AppDetailViewState extends State<AppDetailView>
             ),
           ),
 
-        const SizedBox(height: 24),
+        const SizedBox(height: Spacing.lg),
         _buildSectionTitle(
           _containers.length > 1 && (_selectedService?.isNotEmpty ?? false)
               ? "Environment Variables (${_selectedService!})"
@@ -570,11 +574,11 @@ class _AppDetailViewState extends State<AppDetailView>
           const Text("No environment variables.")
         else
           Container(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(Spacing.base),
             decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.black12),
+              color: PiccoloTheme.porcelain,
+              borderRadius: BorderRadius.circular(Radii.sm),
+              border: Border.all(color: PiccoloTheme.hairline),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -583,7 +587,7 @@ class _AppDetailViewState extends State<AppDetailView>
                   .entries
                   .map(
                     (e) => Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      padding: const EdgeInsets.symmetric(vertical: Spacing.xs),
                       child: Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
@@ -622,22 +626,22 @@ class _AppDetailViewState extends State<AppDetailView>
     final content = _listeners.isEmpty
         ? const Center(child: Text("No network services exposed."))
         : ListView(
-            padding: const EdgeInsets.all(24),
+            padding: const EdgeInsets.all(Spacing.lg),
             children: _listeners
                 .map(
                   (svc) => Card(
                     child: Padding(
-                      padding: const EdgeInsets.all(16.0),
+                      padding: const EdgeInsets.all(Spacing.base),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Row(
                             children: [
                               const Icon(
-                                Icons.router,
+                                PiccoloIcons.router,
                                 color: PiccoloTheme.cobalt600,
                               ),
-                              const SizedBox(width: 12),
+                              const SizedBox(width: Spacing.md),
                               Text(
                                 svc.name,
                                 style: const TextStyle(
@@ -646,19 +650,19 @@ class _AppDetailViewState extends State<AppDetailView>
                                 ),
                               ),
                               if (svc.health != null && !svc.health!.isOk) ...[
-                                const SizedBox(width: 8),
+                                const SizedBox(width: Spacing.sm),
                                 HealthBadge(health: svc.health),
                               ],
                               const Spacer(),
                               Container(
                                 padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
+                                  horizontal: Spacing.sm,
                                   vertical: 2,
                                 ),
                                 decoration: BoxDecoration(
                                   color: PiccoloTheme.mist,
-                                  borderRadius: BorderRadius.circular(4),
-                                  border: Border.all(color: Colors.black12),
+                                  borderRadius: BorderRadius.circular(Radii.xxs),
+                                  border: Border.all(color: PiccoloTheme.hairline),
                                 ),
                                 child: Text(
                                   svc.protocol.toUpperCase(),
@@ -667,7 +671,7 @@ class _AppDetailViewState extends State<AppDetailView>
                               ),
                             ],
                           ),
-                          const Divider(height: 24),
+                          const Divider(height: Spacing.lg),
                           _buildNetworkRow("Internal Port", "${svc.guestPort}"),
                           if (svc.lanHostUrl != null)
                             Builder(builder: (_) {
@@ -683,7 +687,7 @@ class _AppDetailViewState extends State<AppDetailView>
                                 "LAN Access",
                                 url,
                                 onTap: () => launchUrl(Uri.parse(url)),
-                                icon: Icons.open_in_new,
+                                icon: PiccoloIcons.openExternal,
                                 tooltip: "Opens in new tab",
                               );
                             }),
@@ -699,7 +703,7 @@ class _AppDetailViewState extends State<AppDetailView>
                                 app: _app!,
                                 service: svc,
                               ),
-                              icon: Icons.web_asset,
+                              icon: PiccoloIcons.webAsset,
                               tooltip: "Opens in app window",
                             ),
                           if (svc.remoteUrl != null)
@@ -718,7 +722,7 @@ class _AppDetailViewState extends State<AppDetailView>
                                     ? _primaryHealth
                                     : null,
                               ),
-                              icon: Icons.web_asset,
+                              icon: PiccoloIcons.webAsset,
                               tooltip: "Opens in app window",
                             ),
                         ],
@@ -733,13 +737,13 @@ class _AppDetailViewState extends State<AppDetailView>
       children: [
         if (_app!.isWorkspace)
           Padding(
-            padding: const EdgeInsets.fromLTRB(24, 24, 24, 0),
+            padding: const EdgeInsets.fromLTRB(Spacing.lg, Spacing.lg, Spacing.lg, 0),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
                 OutlinedButton.icon(
                   onPressed: _showEditListenersDialog,
-                  icon: const Icon(Icons.edit, size: 16),
+                  icon: const Icon(PiccoloIcons.edit, size: 16),
                   label: const Text("Edit Listeners"),
                 ),
               ],
@@ -754,13 +758,13 @@ class _AppDetailViewState extends State<AppDetailView>
     // Ideally this would show the original YAML, but the API doesn't return it yet.
     // We can just show a JSON dump of the App object for now.
     return Padding(
-      padding: const EdgeInsets.all(24.0),
+      padding: const EdgeInsets.all(Spacing.lg),
       child: Container(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(Spacing.base),
         decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: Colors.black12),
+          color: PiccoloTheme.porcelain,
+          borderRadius: BorderRadius.circular(Radii.sm),
+          border: Border.all(color: PiccoloTheme.hairline),
         ),
         child: SelectableText(
           "App ID: ${_app!.id}\n"
@@ -774,7 +778,7 @@ class _AppDetailViewState extends State<AppDetailView>
 
   Widget _buildLogsTab() {
     return Padding(
-      padding: const EdgeInsets.all(24.0),
+      padding: const EdgeInsets.all(Spacing.lg),
       child: LogStreamViewer(
         appName: _app!.name,
         serviceName: _selectedService,
@@ -803,11 +807,11 @@ class _AppDetailViewState extends State<AppDetailView>
     }
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: Spacing.md, vertical: Spacing.xs),
       decoration: BoxDecoration(
         color: PiccoloTheme.mist,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.black12),
+        borderRadius: BorderRadius.circular(Radii.sm),
+        border: Border.all(color: PiccoloTheme.hairline),
       ),
       child: DropdownButtonHideUnderline(
         child: DropdownButton<String>(
@@ -828,94 +832,39 @@ class _AppDetailViewState extends State<AppDetailView>
   }
 
   Widget _buildStartingBanner() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      color: PiccoloTheme.warning.withValues(alpha: 0.1),
-      child: Row(
-        children: [
-          Icon(
-            Icons.hourglass_empty,
-            color: PiccoloTheme.warning,
-            size: 20,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'App is starting...',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  _app!.statusMessage.isNotEmpty
-                      ? _app!.statusMessage
-                      : 'The app is initializing. Check logs if startup takes too long.',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: PiccoloTheme.inkMuted,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          TextButton.icon(
-            onPressed: () => _tabController.animateTo(AppDetailView.tabLogs),
-            icon: const Icon(Icons.article_outlined, size: 16),
-            label: const Text('View Logs'),
-          ),
-        ],
+    return StatusBanner(
+      severity: BannerSeverity.warning,
+      icon: PiccoloIcons.hourglass,
+      title: 'App is starting...',
+      message: _app!.statusMessage.isNotEmpty
+          ? _app!.statusMessage
+          : 'The app is initializing. Check logs if startup takes too long.',
+      action: TextButton.icon(
+        onPressed: () => _tabController.animateTo(AppDetailView.tabLogs),
+        icon: const Icon(PiccoloIcons.article, size: 16),
+        label: const Text('View Logs'),
       ),
     );
   }
 
   Widget _buildErrorBanner() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      color: PiccoloTheme.critical.withValues(alpha: 0.1),
-      child: Row(
-        children: [
-          Icon(
-            Icons.error_outline,
-            color: PiccoloTheme.critical,
-            size: 20,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'App failed to start',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  _app!.statusMessage.isNotEmpty
-                      ? _app!.statusMessage
-                      : 'The app failed to start. Check logs or try restarting.',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: PiccoloTheme.inkMuted,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          TextButton.icon(
-            onPressed: () => _tabController.animateTo(AppDetailView.tabLogs),
-            icon: const Icon(Icons.article_outlined, size: 16),
-            label: const Text('View Logs'),
-          ),
-        ],
+    return StatusBanner(
+      severity: BannerSeverity.error,
+      title: 'App failed to start',
+      message: _app!.statusMessage.isNotEmpty
+          ? _app!.statusMessage
+          : 'The app failed to start. Check logs or try restarting.',
+      action: TextButton.icon(
+        onPressed: () => _tabController.animateTo(AppDetailView.tabLogs),
+        icon: const Icon(PiccoloIcons.article, size: 16),
+        label: const Text('View Logs'),
       ),
     );
   }
 
   Widget _buildSectionTitle(String title) {
     return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.only(bottom: Spacing.md),
       child: Text(
         title,
         style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
@@ -927,7 +876,7 @@ class _AppDetailViewState extends State<AppDetailView>
 
   Widget _buildNetworkRow(String label, String value) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.symmetric(vertical: Spacing.xs),
       child: Row(
         children: [
           SizedBox(
@@ -956,7 +905,7 @@ class _AppDetailViewState extends State<AppDetailView>
     String? tooltip,
   }) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.symmetric(vertical: Spacing.xs),
       child: Row(
         children: [
           SizedBox(
@@ -969,7 +918,7 @@ class _AppDetailViewState extends State<AppDetailView>
           Expanded(
             child: InkWell(
               onTap: onTap,
-              borderRadius: BorderRadius.circular(4),
+              borderRadius: BorderRadius.circular(Radii.xxs),
               child: Padding(
                 padding: const EdgeInsets.symmetric(vertical: 2),
                 child: Row(

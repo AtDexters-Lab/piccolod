@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import '../remote_controller.dart';
@@ -14,7 +15,7 @@ class RemoteCertificatesCard extends StatelessWidget {
 
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.all(Spacing.base),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -24,7 +25,7 @@ class RemoteCertificatesCard extends StatelessWidget {
                 Text("Certificates", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
               ],
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: Spacing.base),
             if (certs.isEmpty)
               const Text("No certificates issued yet.", style: TextStyle(color: PiccoloTheme.inkMuted))
             else
@@ -49,29 +50,29 @@ class RemoteCertificatesCard extends StatelessWidget {
     String actionLabel = "Renew";
 
     if (cert.status == 'error') {
-      icon = Icons.error_outline;
+      icon = PiccoloIcons.error;
       iconColor = PiccoloTheme.critical;
       subtitle = cert.failureReason ?? "Unknown error";
       subtitleColor = PiccoloTheme.critical;
       actionLabel = "Retry";
     } else if (cert.status == 'pending') {
-      icon = Icons.hourglass_empty;
+      icon = PiccoloIcons.hourglass;
       iconColor = PiccoloTheme.warning;
       subtitle = "Issuance in progress...";
       subtitleColor = PiccoloTheme.inkMuted;
     } else {
-      icon = Icons.verified_user;
+      icon = PiccoloIcons.shieldCheck;
       iconColor = PiccoloTheme.cobalt600;
       final expires = cert.expiresAt;
       final isExpiring = expires != null && expires.difference(DateTime.now()).inDays < 7;
       subtitle = expires != null ? "Expires: ${expires.toLocal().toString().split(' ')[0]}" : "No expiry";
       subtitleColor = isExpiring ? PiccoloTheme.warning : PiccoloTheme.inkMuted;
     }
-    
+
     return Row(
       children: [
         Icon(icon, color: iconColor),
-        const SizedBox(width: 16),
+        const SizedBox(width: Spacing.base),
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,

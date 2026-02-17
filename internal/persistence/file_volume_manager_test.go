@@ -1121,3 +1121,108 @@ func TestFileVolumeManagerIntegration(t *testing.T) {
 		t.Fatalf("Detach: %v", err)
 	}
 }
+
+func TestEnsureVolume_IdempotentOnReentry(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	root := t.TempDir()
+	cryptoMgr := newUnlockedCrypto(t, root)
+	runner := &fakeRunner{}
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, nil)
+
+	// Pre-register entry via getOrCreateEntry (simulates reconcileAllVolumeStates discovery).
+	_ = mgr.getOrCreateEntry("app-reentry")
+
+	// EnsureVolume should still create cipher dir and mount dir despite the entry already existing.
+	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "app-reentry", Class: VolumeClassApplication})
+	if err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+
+	cipherDir := filepath.Join(root, "ciphertext", "app-reentry")
+	if _, err := os.Stat(cipherDir); err != nil {
+		t.Fatalf("expected cipher dir to be created despite pre-registration: %v", err)
+	}
+	if _, err := os.Stat(handle.MountDir); err != nil {
+		t.Fatalf("expected mount dir to be created despite pre-registration: %v", err)
+	}
+}
+
+func TestEnsureVolume_CipherDirRestoredAfterDeletion(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	root := t.TempDir()
+	cryptoMgr := newUnlockedCrypto(t, root)
+	runner := &fakeRunner{}
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, nil)
+
+	handle, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "app-restore", Class: VolumeClassApplication})
+	if err != nil {
+		t.Fatalf("EnsureVolume first: %v", err)
+	}
+
+	cipherDir := filepath.Join(root, "ciphertext", "app-restore")
+	if _, err := os.Stat(cipherDir); err != nil {
+		t.Fatalf("cipher dir should exist after first EnsureVolume: %v", err)
+	}
+
+	// Simulate cipher dir deletion (e.g. accidental cleanup).
+	if err := os.RemoveAll(cipherDir); err != nil {
+		t.Fatalf("remove cipher dir: %v", err)
+	}
+
+	// Second EnsureVolume should recreate the cipher dir structure.
+	// Note: gocryptfs artifacts (conf/diriv) are not regenerated — full
+	// functional recovery requires a separate re-init or restore flow.
+	handle2, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "app-restore", Class: VolumeClassApplication})
+	if err != nil {
+		t.Fatalf("EnsureVolume second: %v", err)
+	}
+	if handle2.MountDir != handle.MountDir {
+		t.Fatalf("expected same mount dir, got %s vs %s", handle2.MountDir, handle.MountDir)
+	}
+	if _, err := os.Stat(cipherDir); err != nil {
+		t.Fatalf("expected cipher dir recreated after deletion: %v", err)
+	}
+
+	// Metadata should still be valid after cipher-dir recreation.
+	metaPath := filepath.Join(root, "volumes", "app-restore", "piccolo.volume.json")
+	if _, err := os.Stat(metaPath); err != nil {
+		t.Fatalf("expected volume metadata to exist after recreation: %v", err)
+	}
+}
+
+func TestEnsureVolume_ControlPlane_CipherDirCreatedDespitePreRegistration(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	root := t.TempDir()
+	cryptoMgr := newUnlockedCrypto(t, root)
+	runner := &fakeRunner{}
+	mgr := newFileVolumeManagerWithDeps(root, root, cryptoMgr, runner, "gocryptfs", "fusermount3", nil, nil)
+
+	// Reproduce the exact boot-time bug: manually create volumes/control-plane/
+	// (simulating what the old constructor did), then reconcile to pre-register.
+	metaDir := filepath.Join(root, "volumes", "control-plane")
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatalf("mkdir metaDir: %v", err)
+	}
+	if err := mgr.reconcileAllVolumeStates(); err != nil {
+		t.Fatalf("reconcileAllVolumeStates: %v", err)
+	}
+
+	// Verify entry is pre-registered.
+	mgr.mu.RLock()
+	_, preRegistered := mgr.volumes["control-plane"]
+	mgr.mu.RUnlock()
+	if !preRegistered {
+		t.Fatalf("expected control-plane to be pre-registered by reconcile")
+	}
+
+	// EnsureVolume must create the cipher dir despite early-return path.
+	_, err := mgr.EnsureVolume(context.Background(), VolumeRequest{ID: "control-plane", Class: VolumeClassControl})
+	if err != nil {
+		t.Fatalf("EnsureVolume: %v", err)
+	}
+
+	cipherDir := filepath.Join(root, "ciphertext", "control-plane")
+	if _, err := os.Stat(cipherDir); err != nil {
+		t.Fatalf("expected cipher dir to be created despite pre-registration: %v", err)
+	}
+}

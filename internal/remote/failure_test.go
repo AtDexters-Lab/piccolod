@@ -1,7 +1,11 @@
 package remote
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"net"
+	"net/url"
 	"testing"
 	"time"
 
@@ -26,6 +30,36 @@ func TestClassifyFailure(t *testing.T) {
 			err:       errors.New("something went wrong"),
 			wantClass: FailureClassTransient,
 			wantCode:  "cert_unknown_error",
+		},
+		{
+			name:      "net.OpError (non-ACME network error)",
+			err:       &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")},
+			wantClass: FailureClassTransient,
+			wantCode:  "cert_connection_failed",
+		},
+		{
+			name:      "url.Error (HTTP transport failure)",
+			err:       &url.Error{Op: "Get", URL: "https://acme-v02.api.letsencrypt.org", Err: errors.New("dial tcp: i/o timeout")},
+			wantClass: FailureClassTransient,
+			wantCode:  "cert_connection_failed",
+		},
+		{
+			name:      "wrapped context.DeadlineExceeded",
+			err:       fmt.Errorf("acme request failed: %w", context.DeadlineExceeded),
+			wantClass: FailureClassTransient,
+			wantCode:  "cert_connection_failed",
+		},
+		{
+			name:      "connection refused string fallback",
+			err:       errors.New("post https://acme.example.com: connection refused"),
+			wantClass: FailureClassTransient,
+			wantCode:  "cert_connection_failed",
+		},
+		{
+			name:      "no such host string fallback",
+			err:       errors.New("lookup acme-v02.api.letsencrypt.org: no such host"),
+			wantClass: FailureClassTransient,
+			wantCode:  "cert_connection_failed",
 		},
 		{
 			name: "rate limited problem details",
@@ -275,6 +309,88 @@ func TestParseRetryAfter(t *testing.T) {
 			}
 			if tt.wantFunc != nil && !tt.wantFunc(got) {
 				t.Errorf("parseRetryAfter() = %v, failed validation", got)
+			}
+		})
+	}
+}
+
+func TestIsNetworkError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "generic error",
+			err:  errors.New("something went wrong"),
+			want: false,
+		},
+		{
+			name: "net.OpError",
+			err:  &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")},
+			want: true,
+		},
+		{
+			name: "net.DNSError",
+			err:  &net.DNSError{Err: "no such host", Name: "example.com"},
+			want: true,
+		},
+		{
+			name: "url.Error",
+			err:  &url.Error{Op: "Get", URL: "https://example.com", Err: errors.New("EOF")},
+			want: true,
+		},
+		{
+			name: "context.DeadlineExceeded",
+			err:  context.DeadlineExceeded,
+			want: true,
+		},
+		{
+			name: "wrapped context.DeadlineExceeded",
+			err:  fmt.Errorf("request failed: %w", context.DeadlineExceeded),
+			want: true,
+		},
+		{
+			name: "context.Canceled (shutdown, not network error)",
+			err:  context.Canceled,
+			want: false,
+		},
+		{
+			name: "wrapped context.Canceled",
+			err:  fmt.Errorf("request failed: %w", context.Canceled),
+			want: false,
+		},
+		{
+			name: "connection refused string",
+			err:  errors.New("dial tcp 1.2.3.4:443: connection refused"),
+			want: true,
+		},
+		{
+			name: "no such host string",
+			err:  errors.New("lookup acme.example.com: no such host"),
+			want: true,
+		},
+		{
+			name: "i/o timeout string",
+			err:  errors.New("read tcp 1.2.3.4:443: i/o timeout"),
+			want: true,
+		},
+		{
+			name: "ACME ProblemDetails (not a network error)",
+			err:  &legoacme.ProblemDetails{Type: "urn:ietf:params:acme:error:dns"},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isNetworkError(tt.err); got != tt.want {
+				t.Errorf("isNetworkError() = %v, want %v", got, tt.want)
 			}
 		})
 	}

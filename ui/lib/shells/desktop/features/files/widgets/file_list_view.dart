@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../../../theme/piccolo_icons.dart';
 import '../../../../../theme/piccolo_theme.dart';
 import '../file_system_entry.dart';
 
@@ -18,14 +19,14 @@ class FileListView extends StatelessWidget {
       builder: (context, constraints) {
         // Responsive Grid: 120px wide items
         final int crossAxisCount = (constraints.maxWidth / 120).floor();
-        
+
         return GridView.builder(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(Spacing.base),
           gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
             crossAxisCount: crossAxisCount > 0 ? crossAxisCount : 1,
             childAspectRatio: 0.85,
-            crossAxisSpacing: 16,
-            mainAxisSpacing: 16,
+            crossAxisSpacing: Spacing.base,
+            mainAxisSpacing: Spacing.base,
           ),
           itemCount: entries.length,
           itemBuilder: (context, index) {
@@ -60,26 +61,26 @@ class _FileItemState extends State<_FileItem> {
         // Double tap to open/navigate
         onDoubleTap: widget.onTap,
         // Single tap just selects (visual feedback for now)
-        onTap: () {}, 
+        onTap: () {},
         child: Container(
           decoration: BoxDecoration(
             color: _isHovered
                 ? PiccoloTheme.cobalt600.withValues(alpha: 0.1)
                 : Colors.transparent,
-            borderRadius: BorderRadius.circular(8),
+            borderRadius: BorderRadius.circular(Radii.sm),
           ),
-          padding: const EdgeInsets.all(12),
+          padding: const EdgeInsets.all(Spacing.md),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Icon(
-                widget.entry.isDirectory ? Icons.folder : Icons.insert_drive_file,
+                widget.entry.isDirectory ? PiccoloIcons.folder : PiccoloIcons.file,
                 size: 48,
                 color: widget.entry.isDirectory
                     ? PiccoloTheme.cobalt500
                     : PiccoloTheme.inkMuted,
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: Spacing.md),
               Text(
                 widget.entry.name,
                 textAlign: TextAlign.center,

@@ -687,7 +687,9 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 
 		applyForwardHeaders(r, ep)
 
-		rp.ServeHTTP(w, r)
+		gzw := newGzipResponseWriter(w, r)
+		defer gzw.Close()
+		rp.ServeHTTP(gzw, r)
 	}))
 
 	// Apply common middleware chain

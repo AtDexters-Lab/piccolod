@@ -178,18 +178,18 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
     final latest = _latest;
     final title = latest?.message.isNotEmpty == true
         ? latest!.message
-        : 'Working…';
+        : 'Working...';
     final progress = latest?.progress ?? -1;
     final isIndeterminate = progress < 0;
     final error = latest?.error;
     final subtasks = _subtasksFromMetadata(latest?.metadata);
 
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(Spacing.base),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: PiccoloTheme.mist),
+        color: PiccoloTheme.porcelain,
+        borderRadius: BorderRadius.circular(Radii.md),
+        border: Border.all(color: PiccoloTheme.hairline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -204,10 +204,10 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
                   shape: BoxShape.circle,
                 ),
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: Spacing.sm),
               Expanded(
                 child: Text(
-                  '${widget.taskType} • ${_statusText()}',
+                  '${widget.taskType} - ${_statusText()}',
                   style: PiccoloTheme.textTheme.labelMedium?.copyWith(
                     color: PiccoloTheme.inkMuted,
                   ),
@@ -215,20 +215,20 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
               ),
             ],
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: Spacing.md),
           Text(
             title,
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               fontWeight: FontWeight.w600,
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: Spacing.md),
           if (error != null && error.isNotEmpty) ...[
             Container(
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(Spacing.md),
               decoration: BoxDecoration(
                 color: PiccoloTheme.critical.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(Radii.sm),
                 border: Border.all(
                   color: PiccoloTheme.critical.withValues(alpha: 0.2),
                 ),
@@ -240,7 +240,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
                 ),
               ),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: Spacing.md),
           ],
           LinearProgressIndicator(
             value: isIndeterminate ? null : (progress / 100.0),
@@ -248,7 +248,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
             color: PiccoloTheme.cobalt600,
             backgroundColor: PiccoloTheme.mist,
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: Spacing.md),
           ExpansionTile(
             tilePadding: EdgeInsets.zero,
             childrenPadding: EdgeInsets.zero,
@@ -261,7 +261,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
             children: [
               if (subtasks.isNotEmpty) ...[
                 Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.only(bottom: Spacing.sm),
                   child: Text(
                     'Containers',
                     style: PiccoloTheme.textTheme.labelMedium?.copyWith(
@@ -271,7 +271,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
                 ),
                 for (final st in subtasks)
                   Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
+                    padding: const EdgeInsets.only(bottom: Spacing.sm),
                     child: Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
@@ -284,7 +284,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
                             ),
                           ),
                         ),
-                        const SizedBox(width: 8),
+                        const SizedBox(width: Spacing.sm),
                         Expanded(
                           child: Text(
                             st.message,
@@ -292,7 +292,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
                           ),
                         ),
                         if (st.progress >= 0) ...[
-                          const SizedBox(width: 8),
+                          const SizedBox(width: Spacing.sm),
                           Text(
                             '${st.progress}%',
                             style: PiccoloTheme.textTheme.labelSmall?.copyWith(
@@ -303,11 +303,11 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
                       ],
                     ),
                   ),
-                const Divider(height: 24),
+                const Divider(height: Spacing.lg),
               ],
               for (final evt in _history)
                 Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.only(bottom: Spacing.sm),
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -320,7 +320,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
                           ),
                         ),
                       ),
-                      const SizedBox(width: 8),
+                      const SizedBox(width: Spacing.sm),
                       Expanded(
                         child: Text(
                           evt.message,
@@ -349,4 +349,3 @@ class _ProgressSubtask {
     required this.progress,
   });
 }
-

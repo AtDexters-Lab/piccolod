@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../../theme/piccolo_icons.dart';
 import '../../../../theme/piccolo_theme.dart';
 import 'files_controller.dart';
 import 'widgets/path_bar.dart';
@@ -47,10 +48,10 @@ class _FilesAppState extends State<FilesApp> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.error_outline, color: PiccoloTheme.critical, size: 48),
-            const SizedBox(height: 16),
+            const Icon(PiccoloIcons.error, color: PiccoloTheme.critical, size: 48),
+            const SizedBox(height: Spacing.base),
             Text("Error", style: PiccoloTheme.textTheme.bodyLarge),
-            const SizedBox(height: 8),
+            const SizedBox(height: Spacing.sm),
             Text(_controller.error!, style: PiccoloTheme.textTheme.labelSmall),
           ],
         ),
@@ -62,8 +63,8 @@ class _FilesAppState extends State<FilesApp> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.folder_open, color: PiccoloTheme.ink.withValues(alpha: 0.2), size: 64),
-            const SizedBox(height: 16),
+            Icon(PiccoloIcons.folderOpen, color: PiccoloTheme.ink.withValues(alpha: 0.2), size: 64),
+            const SizedBox(height: Spacing.base),
             Text("Folder is empty", style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted)),
           ],
         ),

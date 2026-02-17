@@ -10,16 +10,17 @@ import (
 )
 
 type MockContainerManager struct {
-	containers         map[string]*mockContainer
-	nextID             int
-	createError        error
-	startError         error
-	stopError          error
-	removeError        error
-	removedImages      []string
-	removeImageErr     error
-	reloadedContainers []string
-	reloadErr          error
+	containers              map[string]*mockContainer
+	nextID                  int
+	createError             error
+	startError              error
+	startErrorForContainer  map[string]error // per-container start errors (checked before global startError)
+	stopError               error
+	removeError             error
+	removedImages           []string
+	removeImageErr          error
+	reloadedContainers      []string
+	reloadErr               error
 }
 
 type mockContainer struct {
@@ -48,6 +49,9 @@ func (m *MockContainerManager) CreateContainer(ctx context.Context, runtime cont
 
 func (m *MockContainerManager) StartContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
 	_ = runtime
+	if err, ok := m.startErrorForContainer[containerID]; ok {
+		return err
+	}
 	if m.startError != nil {
 		return m.startError
 	}

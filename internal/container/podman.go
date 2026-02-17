@@ -131,47 +131,6 @@ func (e *PortInUseError) Unwrap() error {
 	return e.Err
 }
 
-// StaleNetworkNamespaceError indicates the container references a network
-// namespace that no longer exists (typically after a reboot when the process
-// that owned the namespace is gone).
-type StaleNetworkNamespaceError struct {
-	ContainerID string
-	Output      string
-	Err         error
-}
-
-func (e *StaleNetworkNamespaceError) Error() string {
-	return fmt.Sprintf("container %s has stale network namespace reference: %v", e.ContainerID, e.Err)
-}
-
-func (e *StaleNetworkNamespaceError) Unwrap() error {
-	return e.Err
-}
-
-// isStaleNetworkNamespaceError checks if podman output indicates a stale netns.
-// Detects two patterns:
-//   - runc: "namespace path: lstat /proc/723206/ns/net: no such file or directory"
-//   - netavark: "netavark: open container netns: open /run/netns/netns-XXX: ... No such file or directory"
-func isStaleNetworkNamespaceError(output string) bool {
-	lower := strings.ToLower(output)
-
-	// Pattern 1: runc fails to find process namespace path
-	if strings.Contains(lower, "namespace path") &&
-		strings.Contains(lower, "ns/net") &&
-		strings.Contains(lower, "no such file or directory") {
-		return true
-	}
-
-	// Pattern 2: netavark fails to open named network namespace
-	if strings.Contains(lower, "netavark") &&
-		strings.Contains(lower, "netns") &&
-		strings.Contains(lower, "no such file or directory") {
-		return true
-	}
-
-	return false
-}
-
 // ValidateContainerName validates container/image names for security
 func ValidateContainerName(name string) error {
 	if name == "" {
@@ -535,14 +494,6 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 				return "", &NameInUseError{Name: spec.Name, ID: match[1]}
 			}
 		}
-		// Check for stale network namespace (e.g., --network=container:STALE_ID)
-		if isStaleNetworkNamespaceError(outStr) {
-			return "", &StaleNetworkNamespaceError{
-				ContainerID: spec.Name, // Use name since container wasn't created
-				Output:      outStr,
-				Err:         fmt.Errorf("podman create failed: %w", err),
-			}
-		}
 		return "", fmt.Errorf("podman create failed: %w, output: %s", err, outStr)
 	}
 
@@ -573,16 +524,7 @@ func (p *PodmanCLI) StartContainer(ctx context.Context, runtime PodmanRuntime, c
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		outStr := string(output)
-		// Check for stale network namespace before returning generic error
-		if isStaleNetworkNamespaceError(outStr) {
-			return &StaleNetworkNamespaceError{
-				ContainerID: containerID,
-				Output:      outStr,
-				Err:         fmt.Errorf("podman start failed: %w", err),
-			}
-		}
-		return fmt.Errorf("podman start failed: %w, output: %s", err, outStr)
+		return fmt.Errorf("podman start failed: %w, output: %s", err, string(output))
 	}
 
 	return nil

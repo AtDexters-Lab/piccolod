@@ -96,6 +96,9 @@ type GinServer struct {
 	secureListener net.Listener
 	securePort     int
 
+	// Precomputed ETags and cache policies for embedded web assets
+	staticCache *staticAssetCache
+
 	// Optional OpenAPI request validation (Phase 0)
 	apiValidator *openAPIValidator
 
@@ -684,6 +687,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.remoteManager = rm
 	s.registerUnlockReloader(rm)
 	rm.SetEventsBus(eventsBus)
+	s.observeRemoteCertQueuing(eventsBus)
 
 	// Wire remote status provider for health aggregation (RFC 20260125)
 	if rm != nil && svcMgr != nil {
@@ -764,6 +768,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Rehydrate proxies for containers that survived restarts
 	appMgr.RestoreServices(context.Background())
+
+	s.staticCache = newStaticAssetCache(webassets.FS, "web")
 
 	s.setupGinRoutes()
 	if err := s.initSecureLoopback(); err != nil {
@@ -1252,7 +1258,7 @@ func (s *GinServer) setupGinRoutes() {
 
 	// Static file serving for web UI and fallback
 	r.NoRoute(func(c *gin.Context) {
-		if c.Request.Method == http.MethodGet {
+		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
 			requestedPath := c.Request.URL.Path
 			if strings.HasPrefix(requestedPath, "/api/") || strings.HasPrefix(requestedPath, "/oauth/") {
 				c.Status(http.StatusNotFound)
@@ -1265,6 +1271,10 @@ func (s *GinServer) setupGinRoutes() {
 			fspath := "web" + requestedPath
 			if _, err := fs.Stat(webassets.FS, fspath); err != nil {
 				fspath = "web/entry.html"
+			}
+			if etag := s.staticCache.ETag(fspath); etag != "" {
+				c.Header("Cache-Control", cachePolicy(fspath))
+				c.Header("ETag", etag)
 			}
 			c.FileFromFS(fspath, http.FS(webassets.FS))
 		} else {
@@ -1821,6 +1831,77 @@ func (s *GinServer) observeRemoteConfig(bus *events.Bus) {
 			s.applyRemoteRuntimeFromStatus(status)
 		}
 	}()
+}
+
+// observeRemoteCertQueuing subscribes to endpoint and remote config changes to
+// queue per-host certificate issuance for HTTP-01 mode. This ensures certs are
+// created for endpoints added at startup (RestoreFromPodman) or after remote is
+// reconfigured, closing the gap where requeueOutstandingIssuances can only
+// requeue existing cert entries.
+func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
+	if bus == nil {
+		return
+	}
+	endpointsCh := bus.Subscribe(events.TopicServiceEndpointsChanged, 16)
+	remoteCfgCh := bus.Subscribe(events.TopicRemoteConfigChanged, 16)
+
+	go func() {
+		for evt := range endpointsCh {
+			payload, ok := evt.Payload.(events.ServiceEndpointsChanged)
+			if !ok || len(payload.Added) == 0 {
+				continue
+			}
+			rm := s.remoteManager
+			if rm == nil {
+				continue
+			}
+			status := rm.Status()
+			if !status.Enabled || !strings.EqualFold(status.Solver, "http-01") {
+				continue
+			}
+			base := remoteBaseHostname(&status)
+			if base == "" {
+				continue
+			}
+			for _, ep := range payload.Added {
+				if ep.DerivedHostLabel == "" {
+					continue
+				}
+				rm.QueueHostnameCertificate(ep.DerivedHostLabel + "." + base)
+			}
+		}
+	}()
+
+	go func() {
+		for evt := range remoteCfgCh {
+			status, ok := evt.Payload.(remote.Status)
+			if !ok || !status.Enabled || !strings.EqualFold(status.Solver, "http-01") {
+				continue
+			}
+			rm := s.remoteManager
+			sm := s.serviceManager
+			if rm == nil || sm == nil {
+				continue
+			}
+			base := remoteBaseHostname(&status)
+			if base == "" {
+				continue
+			}
+			queueEndpointHostCerts(rm, sm.GetAll(), base)
+		}
+	}()
+}
+
+// queueEndpointHostCerts queues per-host certificate issuance for all endpoints
+// with a DerivedHostLabel. Used by observeRemoteCertQueuing and handleRemoteConfigure.
+func queueEndpointHostCerts(rm *remote.Manager, endpoints []services.ServiceEndpoint, base string) {
+	if rm == nil || base == "" {
+		return
+	}
+	hosts := remoteHostsForEndpoints(endpoints, base)
+	for h := range hosts {
+		rm.QueueHostnameCertificate(h)
+	}
 }
 
 // observeProxyOIDCClients auto-registers proxy OIDC clients for apps whose

@@ -31,6 +31,10 @@ class EventStreamClient extends ChangeNotifier {
   final StreamController<Map<String, dynamic>> _certificateController =
       StreamController.broadcast();
 
+  /// Called when a reconnect attempt indicates an auth failure (e.g. session expired).
+  /// Set by the shell to trigger the re-auth overlay for passive WebSocket-only failures.
+  VoidCallback? onAuthFailure;
+
   bool _isDisposed = false;
 
   /// Stream of app status change events.
@@ -84,6 +88,21 @@ class EventStreamClient extends ChangeNotifier {
       _subscription?.cancel();
       _subscription = null;
     }
+
+    // Detect auth failures on reconnect (WebSocket upgrade rejected with 401).
+    // Browser WebSocket error messages are not standardized; string matching is
+    // the best heuristic available. False negatives are acceptable — the HTTP
+    // 401 interceptor in ApiClient is the primary re-auth trigger.
+    if (_connection.state == WebSocketConnectionState.error &&
+        onAuthFailure != null) {
+      final err = _connection.lastError ?? '';
+      if (err.contains('401') || err.contains('Unauthorized')) {
+        // Stop reconnect attempts — session is expired, not a transient failure.
+        _connection.disconnect();
+        onAuthFailure!();
+      }
+    }
+
     // Re-subscribe when reconnected
     if (_connection.state == WebSocketConnectionState.connected &&
         _subscription == null &&

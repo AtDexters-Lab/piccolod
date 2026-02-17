@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../../../theme/piccolo_icons.dart';
 import '../../../../../theme/piccolo_theme.dart';
 import '../files_controller.dart';
 
@@ -11,39 +12,39 @@ class PathBar extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       height: 56,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+      padding: const EdgeInsets.symmetric(horizontal: Spacing.base),
       decoration: BoxDecoration(
-        color: Colors.white,
-        border: Border(bottom: BorderSide(color: PiccoloTheme.mist)),
+        color: PiccoloTheme.porcelain,
+        border: Border(bottom: BorderSide(color: PiccoloTheme.hairline)),
       ),
       child: Row(
         children: [
           // Navigation Controls
           IconButton(
-            icon: const Icon(Icons.arrow_back),
+            icon: const Icon(PiccoloIcons.arrowBack),
             onPressed: controller.canGoBack ? controller.goBack : null,
             splashRadius: 20,
           ),
           IconButton(
-            icon: const Icon(Icons.arrow_forward),
+            icon: const Icon(PiccoloIcons.arrowForward),
             onPressed: controller.canGoForward ? controller.goForward : null,
             splashRadius: 20,
           ),
           IconButton(
-            icon: const Icon(Icons.arrow_upward),
+            icon: const Icon(PiccoloIcons.arrowUp),
             onPressed: controller.currentPath != '/' ? controller.goUp : null,
             splashRadius: 20,
           ),
-          const SizedBox(width: 16),
-          
+          const SizedBox(width: Spacing.base),
+
           // Address Bar
           Expanded(
             child: Container(
               height: 36,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
+              padding: const EdgeInsets.symmetric(horizontal: Spacing.md),
               decoration: BoxDecoration(
                 color: PiccoloTheme.mist,
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(Radii.sm),
               ),
               alignment: Alignment.centerLeft,
               child: Text(

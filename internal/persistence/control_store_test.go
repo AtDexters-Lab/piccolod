@@ -528,10 +528,13 @@ func TestNewSQLiteControlStore_NoCipherDirCreated(t *testing.T) {
 		t.Fatalf("expected cipherDir to not exist after construction, stat err: %v", err)
 	}
 
-	// metaDir should still be created by the constructor.
+	// metaDir must NOT be created by the constructor — it is created on-demand
+	// by ensureMetadata / writeVolumeState. Pre-creating it causes
+	// reconcileAllVolumeStates to pre-register the entry, making EnsureVolume
+	// skip ensureCipherDir (the original bug).
 	metaDir := filepath.Join(dir, "volumes", "control-plane")
-	if _, err := os.Stat(metaDir); err != nil {
-		t.Fatalf("expected metaDir to exist after construction: %v", err)
+	if _, err := os.Stat(metaDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected metaDir to not exist after construction, stat err: %v", err)
 	}
 }
 

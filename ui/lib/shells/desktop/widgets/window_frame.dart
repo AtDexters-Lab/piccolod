@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:pointer_interceptor/pointer_interceptor.dart';
+import '../../../theme/piccolo_icons.dart';
 import '../../../theme/piccolo_theme.dart';
 import '../models/desktop_window.dart';
 import 'window_activity.dart';
@@ -46,7 +47,7 @@ class _WindowFrameState extends State<WindowFrame>
     super.initState();
     _entryController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 200),
+      duration: Motion.slow,
     );
 
     _entryController.addStatusListener((status) {
@@ -114,29 +115,18 @@ class _WindowFrameState extends State<WindowFrame>
               children: [
                 // Main Window Content
               AnimatedContainer(
-                duration: const Duration(milliseconds: 200),
+                duration: Motion.slow,
                 curve: Curves.easeOutCubic,
                 width: widget.window.size.width,
                 height: widget.window.size.height,
                 decoration: BoxDecoration(
                   color: PiccoloTheme.porcelain,
                   borderRadius: BorderRadius.circular(
-                    widget.window.isMaximized ? 0 : 14,
+                    widget.window.isMaximized ? 0 : Radii.md,
                   ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: const Color(0xFF0E1322).withValues(alpha: 0.12),
-                      blurRadius: 20,
-                      offset: const Offset(0, 8),
-                    ),
-                    BoxShadow(
-                      color: const Color(0xFF0E1322).withValues(alpha: 0.08),
-                      blurRadius: 6,
-                      offset: const Offset(0, 2),
-                    ),
-                  ],
+                  boxShadow: Elevation.elev3,
                   border: Border.all(
-                    color: PiccoloTheme.ink.withValues(alpha: 0.08),
+                    color: PiccoloTheme.hairline,
                     width: 1,
                   ),
                 ),
@@ -157,7 +147,7 @@ class _WindowFrameState extends State<WindowFrame>
                             color: Colors.transparent,
                             borderRadius: BorderRadius.vertical(
                               top: Radius.circular(
-                                widget.window.isMaximized ? 0 : 14,
+                                widget.window.isMaximized ? 0 : Radii.md,
                               ),
                             ),
                           ),
@@ -167,23 +157,23 @@ class _WindowFrameState extends State<WindowFrame>
                               // Traffic Lights
                               _WindowCaptionButton(
                                 color: PiccoloTheme.critical,
-                                icon: Icons.close,
+                                icon: PiccoloIcons.close,
                                 isHoveringWindow: _isHoveringHeader,
                                 onTap: widget.onClose,
                               ),
-                              const SizedBox(width: 8),
+                              const SizedBox(width: Spacing.sm),
                               _WindowCaptionButton(
                                 color: PiccoloTheme.warning,
-                                icon: Icons.remove,
+                                icon: PiccoloIcons.minimize,
                                 isHoveringWindow: _isHoveringHeader,
                                 onTap: widget.onMinimize,
                               ),
-                              const SizedBox(width: 8),
+                              const SizedBox(width: Spacing.sm),
                               _WindowCaptionButton(
                                 color: PiccoloTheme.success,
                                 icon: widget.window.isMaximized
-                                    ? Icons.filter_none
-                                    : Icons.crop_square,
+                                    ? PiccoloIcons.restore
+                                    : PiccoloIcons.maximize,
                                 isHoveringWindow: _isHoveringHeader,
                                 onTap: widget.onMaximize,
                               ),
@@ -226,7 +216,7 @@ class _WindowFrameState extends State<WindowFrame>
                       child: ClipRRect(
                         borderRadius: BorderRadius.vertical(
                           bottom: Radius.circular(
-                            widget.window.isMaximized ? 0 : 14,
+                            widget.window.isMaximized ? 0 : Radii.md,
                           ),
                         ),
                         child: widget.window.child,
@@ -264,7 +254,7 @@ class _WindowFrameState extends State<WindowFrame>
                             height: 6,
                             margin: const EdgeInsets.all(4),
                             decoration: BoxDecoration(
-                              color: PiccoloTheme.ink.withValues(alpha: 0.2),
+                              color: PiccoloTheme.outline,
                               borderRadius: const BorderRadius.only(
                                 topLeft: Radius.circular(4),
                               ),
@@ -332,7 +322,7 @@ class _WindowCaptionButtonState extends State<_WindowCaptionButton> {
             ),
             child: Center(
               child: AnimatedOpacity(
-                duration: const Duration(milliseconds: 100),
+                duration: Motion.fast,
                 opacity: showIcon ? 1.0 : 0.0,
                 child: Icon(
                   widget.icon,

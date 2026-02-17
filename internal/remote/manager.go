@@ -261,6 +261,10 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 	if m.cfg == nil {
 		m.cfg = &Config{}
 	}
+	if m.cfg.Enabled {
+		log.Printf("remote: loaded existing config (solver=%s, managed=%v, portal=%s, certs=%d)",
+			m.cfg.Solver, m.cfg.Managed, m.cfg.PortalHostname, len(m.cfg.Certificates))
+	}
 	m.updateACMEConfig(m.cfg)
 	m.requeueOutstandingIssuances()
 	return m, nil
@@ -395,6 +399,10 @@ func (m *Manager) reloadFromStorage() error {
 	snap := extractAdapterSnapshot(&cfg)
 	m.cfgMu.Unlock()
 	m.needsReload.Store(false)
+	if cfg.Enabled {
+		log.Printf("remote: reloaded config (solver=%s, managed=%v, portal=%s, certs=%d)",
+			cfg.Solver, cfg.Managed, cfg.PortalHostname, len(cfg.Certificates))
+	}
 	m.applyAdapterState(snap)
 	m.updateACMEConfig(&cfg)
 	m.publishConfigChanged()
@@ -593,6 +601,8 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 		return err
 	}
 
+	log.Printf("remote: configured (solver=http-01, portal=%s)", portalHost)
+
 	// Queue issuance jobs after releasing lock (enqueueIssuance acquires its own lock)
 	// User-managed mode only issues portal cert (no wildcard - HTTP-01 doesn't support it)
 	m.enqueueIssuance("portal", []string{portalHost}, portalHost)
@@ -678,6 +688,8 @@ func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
 	if err := m.save(cfg); err != nil {
 		return err
 	}
+
+	log.Printf("remote: configured (solver=dns-01, managed=true, portal=%s)", portalHost)
 
 	// Queue issuance jobs after releasing lock (enqueueIssuance acquires its own lock)
 	m.enqueueIssuance("portal", []string{portalHost}, portalHost)
@@ -1167,6 +1179,9 @@ func (m *Manager) scanAndQueueRenewals() {
 	m.cfgMu.RUnlock()
 
 	// Enqueue jobs outside of lock
+	if len(jobs) > 0 {
+		log.Printf("remote: scheduler queuing %d certificate renewal(s)", len(jobs))
+	}
 	for _, job := range jobs {
 		m.enqueueIssuance(job.id, job.domains, job.cn)
 	}
@@ -1246,6 +1261,9 @@ func (m *Manager) requeueOutstandingIssuances() {
 	m.cfgMu.RUnlock()
 
 	// Process jobs outside of lock
+	if len(jobs) > 0 {
+		log.Printf("remote: requeuing %d outstanding certificate issuance(s)", len(jobs))
+	}
 	for _, job := range jobs {
 		if job.isPending {
 			m.queueIssuanceJob(job.id, job.domains, job.cn, true)
@@ -1311,6 +1329,7 @@ func (m *Manager) QueueHostnameCertificate(hostname string) {
 	if h == "" {
 		return
 	}
+	log.Printf("remote: queuing per-host certificate: %s", h)
 	m.enqueueIssuance("host:"+h, []string{h}, h)
 }
 
@@ -1345,6 +1364,8 @@ func (m *Manager) enqueueIssuanceWithForce(id string, domains []string, commonNa
 	m.ensureCertPending(cfg, id, domains, now)
 	// save() releases cfgMu.Lock()
 	_ = m.save(cfg)
+
+	log.Printf("remote: queuing certificate issuance: %s (domains=%v)", id, domains)
 	m.queueIssuanceJob(id, domains, commonName, force)
 }
 
@@ -1433,6 +1454,8 @@ func (m *Manager) processIssuance(job issuanceJob) {
 	if m == nil || m.acmeMgr == nil || job.commonName == "" {
 		return
 	}
+
+	log.Printf("remote: issuing certificate %s (cn=%s, domains=%v)", job.id, job.commonName, job.domains)
 
 	// Record attempt under lock (no max attempts - indefinite retry per RFC 20260125)
 	m.cfgMu.Lock()
@@ -1537,6 +1560,7 @@ func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, no
 }
 
 func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
+	log.Printf("remote: certificate %s → ok (expires %s)", id, expiresAt.Format(time.RFC3339))
 	now := m.now()
 	next := now.Add(60 * 24 * time.Hour)
 
@@ -1583,6 +1607,7 @@ func (m *Manager) updateCertFailure(id string, reason string) {
 func (m *Manager) updateCertFailureWithError(id string, reason string, err error) {
 	now := m.now()
 	class, code := classifyFailure(err)
+	log.Printf("WARN: remote: certificate %s → error (class=%s, code=%s): %s", id, class, code, reason)
 
 	// Modify certificate under lock to prevent races with scheduler reads
 	m.cfgMu.Lock()

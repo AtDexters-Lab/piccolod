@@ -18,11 +18,10 @@ class PasswordStrengthIndicator extends StatelessWidget {
   }
 
   Color _getColor(int score) {
-    if (score <= 1) return Colors.red;
-    if (score <= 2) return Colors.orange;
-    if (score <= 3) return Colors.amber;
-    if (score <= 4) return Colors.lightGreen;
-    return Colors.green;
+    if (score <= 1) return PiccoloTheme.critical;
+    if (score <= 2) return PiccoloTheme.warning;
+    if (score <= 3) return PiccoloTheme.warning;
+    return PiccoloTheme.success;
   }
 
   String _getLabel(int score) {
@@ -38,7 +37,7 @@ class PasswordStrengthIndicator extends StatelessWidget {
     final strength = _calculateStrength(password);
 
     return Padding(
-      padding: const EdgeInsets.only(top: 8.0, bottom: 4.0),
+      padding: const EdgeInsets.only(top: Spacing.sm, bottom: Spacing.xs),
       child: Row(
         children: [
           Expanded(
@@ -46,7 +45,7 @@ class PasswordStrengthIndicator extends StatelessWidget {
               children: List.generate(5, (index) {
                 return Expanded(
                   child: Container(
-                    margin: const EdgeInsets.only(right: 4),
+                    margin: const EdgeInsets.only(right: Spacing.xs),
                     height: 4,
                     decoration: BoxDecoration(
                       color: index < strength
@@ -59,7 +58,7 @@ class PasswordStrengthIndicator extends StatelessWidget {
               }),
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: Spacing.md),
           Text(
             _getLabel(strength),
             style: TextStyle(

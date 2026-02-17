@@ -128,8 +128,8 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	}
 	// RFC 20260122 §6.2: Create portal session with origin binding
 	boundOrigin := s.computeCanonicalOrigin(c)
-	sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, 3600)
-	s.setSessionCookie(c, sess.ID, time.Hour)
+	sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, portalSessionTTL)
+	s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
 
 	// Mark onboarding as complete (accepts try_piccolo, pending, or already-complete).
 	// Best-effort: failure here doesn't block setup since LUKS header serves as fallback signal.
@@ -218,8 +218,8 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 				}
 				// RFC 20260122 §6.2: Create portal session with origin binding
 				boundOrigin := s.computeCanonicalOrigin(c)
-				sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, 3600)
-				s.setSessionCookie(c, sess.ID, time.Hour)
+				sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, portalSessionTTL)
+				s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
 			}
 		}
 	}

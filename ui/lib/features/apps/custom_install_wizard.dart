@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../../theme/piccolo_theme.dart';
+import '../../theme/piccolo_icons.dart';
 import '../../core/services/app_service.dart';
 import '../../core/utils/task_id.dart';
 import '../../shared/widgets/task_progress_panel.dart';
@@ -104,13 +105,13 @@ x-piccolo:
         <String, dynamic>{},
         taskId: taskId,
       );
-      
+
       if (mounted) {
         widget.onSuccess?.call(app.name);
-        
+
         // If no callback provided (fallback), show snackbar
         if (widget.onSuccess == null) {
-           Navigator.of(context).pop(); 
+           Navigator.of(context).pop();
            ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text("App installation started.")),
            );
@@ -131,26 +132,26 @@ x-piccolo:
   @override
   Widget build(BuildContext context) {
     return Dialog(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(Radii.lg)),
       child: Container(
         width: 800,
         height: 600,
         decoration: BoxDecoration(
           color: PiccoloTheme.porcelain,
-          borderRadius: BorderRadius.circular(16),
+          borderRadius: BorderRadius.circular(Radii.lg),
         ),
         child: Column(
           children: [
             // Header
             Container(
-              padding: const EdgeInsets.all(24),
+              padding: const EdgeInsets.all(Spacing.lg),
               decoration: const BoxDecoration(
-                border: Border(bottom: BorderSide(color: Colors.black12)),
+                border: Border(bottom: BorderSide(color: PiccoloTheme.hairline)),
               ),
               child: Row(
                 children: [
-                   const Icon(Icons.add_box, color: PiccoloTheme.cobalt600, size: 32),
-                   const SizedBox(width: 16),
+                   const Icon(PiccoloIcons.addBox, color: PiccoloTheme.cobalt600, size: 32),
+                   const SizedBox(width: Spacing.base),
                    Expanded(
                      child: Column(
                        crossAxisAlignment: CrossAxisAlignment.start,
@@ -167,7 +168,7 @@ x-piccolo:
                      ),
                    ),
                    IconButton(
-                     icon: const Icon(Icons.close),
+                     icon: const Icon(PiccoloIcons.close),
                      onPressed: _isInstalling ? null : () => Navigator.of(context).pop(),
                    )
                 ],
@@ -178,7 +179,7 @@ x-piccolo:
             Expanded(
               child: _isInstalling && _taskId != null
                   ? Padding(
-                      padding: const EdgeInsets.all(24),
+                      padding: const EdgeInsets.all(Spacing.lg),
                       child: TaskProgressPanel(
                         taskId: _taskId!,
                         taskType: 'install_app',
@@ -191,9 +192,9 @@ x-piccolo:
 
             // Footer
             Container(
-              padding: const EdgeInsets.all(24),
+              padding: const EdgeInsets.all(Spacing.lg),
               decoration: const BoxDecoration(
-                border: Border(top: BorderSide(color: Colors.black12)),
+                border: Border(top: BorderSide(color: PiccoloTheme.hairline)),
               ),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.end,
@@ -203,15 +204,11 @@ x-piccolo:
                       onPressed: _isInstalling ? null : () => setState(() => _currentStep = 0),
                       child: const Text("Back"),
                     ),
-                  const SizedBox(width: 16),
+                  const SizedBox(width: Spacing.base),
                   if (_currentStep == 0)
                     FilledButton(
                       onPressed: _isValidating ? null : _validate,
-                      style: FilledButton.styleFrom(
-                        backgroundColor: PiccoloTheme.cobalt600,
-                        foregroundColor: Colors.white,
-                      ),
-                      child: _isValidating 
+                      child: _isValidating
                         ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
                         : const Text("Validate & Next"),
                     )
@@ -220,7 +217,6 @@ x-piccolo:
                       onPressed: _isInstalling ? null : _install,
                       style: FilledButton.styleFrom(
                         backgroundColor: PiccoloTheme.success,
-                        foregroundColor: Colors.white,
                       ),
                       child: _isInstalling
                         ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
@@ -241,19 +237,19 @@ x-piccolo:
         if (_validationError != null)
            Container(
              width: double.infinity,
-             padding: const EdgeInsets.all(12),
+             padding: const EdgeInsets.all(Spacing.md),
              color: PiccoloTheme.critical.withValues(alpha: 0.1),
              child: Row(
                children: [
-                 const Icon(Icons.error, color: PiccoloTheme.critical, size: 20),
-                 const SizedBox(width: 12),
+                 const Icon(PiccoloIcons.error, color: PiccoloTheme.critical, size: 20),
+                 const SizedBox(width: Spacing.md),
                  Expanded(child: Text(_validationError!, style: const TextStyle(color: PiccoloTheme.critical))),
                ],
              ),
            ),
         Expanded(
           child: Padding(
-            padding: const EdgeInsets.all(16.0),
+            padding: const EdgeInsets.all(Spacing.base),
             child: TextField(
               controller: _yamlController,
               maxLines: null,
@@ -266,7 +262,7 @@ x-piccolo:
               decoration: const InputDecoration(
                 border: OutlineInputBorder(),
                 filled: true,
-                fillColor: Colors.white,
+                fillColor: PiccoloTheme.porcelain,
               ),
             ),
           ),
@@ -280,43 +276,43 @@ x-piccolo:
     // In a real app, we would parse the YAML client-side to show these cards dynamically.
     // For V1, since we don't have a Dart YAML parser in dependencies (yet), we show a generic contract.
     // "Trust what you pasted."
-    
+
     return Padding(
-      padding: const EdgeInsets.all(32.0),
+      padding: const EdgeInsets.all(Spacing.xl),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Icon(Icons.check_circle, color: PiccoloTheme.success, size: 64),
-          const SizedBox(height: 16),
+          const Icon(PiccoloIcons.success, color: PiccoloTheme.success, size: 64),
+          const SizedBox(height: Spacing.base),
           Text(
             "Manifest Validated",
             style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 24),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: Spacing.base),
           const Text(
             "Your app definition is valid syntax. Proceeding with installation will:",
           ),
-          const SizedBox(height: 24),
-          _buildInfoRow(Icons.download, "Pull container image (if not present)"),
-          const SizedBox(height: 12),
-          _buildInfoRow(Icons.sd_storage, "Create persistent storage volumes"),
-          const SizedBox(height: 12),
-          _buildInfoRow(Icons.router, "Configure network listeners and ports"),
-          const SizedBox(height: 12),
-          _buildInfoRow(Icons.security, "Apply permissions as defined in manifest"),
-          
+          const SizedBox(height: Spacing.lg),
+          _buildInfoRow(PiccoloIcons.download, "Pull container image (if not present)"),
+          const SizedBox(height: Spacing.md),
+          _buildInfoRow(PiccoloIcons.storage, "Create persistent storage volumes"),
+          const SizedBox(height: Spacing.md),
+          _buildInfoRow(PiccoloIcons.router, "Configure network listeners and ports"),
+          const SizedBox(height: Spacing.md),
+          _buildInfoRow(PiccoloIcons.security, "Apply permissions as defined in manifest"),
+
           const Spacer(),
           Container(
-             padding: const EdgeInsets.all(12),
+             padding: const EdgeInsets.all(Spacing.md),
              decoration: BoxDecoration(
                color: PiccoloTheme.mist,
-               borderRadius: BorderRadius.circular(8),
-               border: Border.all(color: Colors.black12),
+               borderRadius: BorderRadius.circular(Radii.sm),
+               border: Border.all(color: PiccoloTheme.hairline),
              ),
              child: const Row(
                children: [
-                 Icon(Icons.info_outline, color: PiccoloTheme.inkMuted),
-                 SizedBox(width: 12),
+                 Icon(PiccoloIcons.info, color: PiccoloTheme.inkMuted),
+                 SizedBox(width: Spacing.md),
                  Expanded(child: Text("Preflight checks passed: Ports available, Disk space adequate.")),
                ],
              ),
@@ -325,12 +321,12 @@ x-piccolo:
       ),
     );
   }
-  
+
   Widget _buildInfoRow(IconData icon, String text) {
     return Row(
       children: [
         Icon(icon, color: PiccoloTheme.cobalt600, size: 20),
-        const SizedBox(width: 12),
+        const SizedBox(width: Spacing.md),
         Text(text, style: PiccoloTheme.textTheme.bodyMedium),
       ],
     );

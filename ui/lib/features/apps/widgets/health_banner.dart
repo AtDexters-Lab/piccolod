@@ -3,7 +3,9 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../../core/models/listener_health.dart';
 import '../../../core/services/app_service.dart';
 import '../../../theme/piccolo_theme.dart';
+import '../../../theme/piccolo_icons.dart';
 import '../../../shells/desktop/desktop_controller.dart';
+import '../../../shells/desktop/features/settings/settings_app.dart';
 import '../app_launcher.dart';
 import 'local_fallback_overlay.dart';
 
@@ -53,7 +55,7 @@ class _AppDetailHealthBannerState extends State<AppDetailHealthBanner> {
     if (health.isOk) return const SizedBox.shrink();
 
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(Spacing.base),
       color: ListenerHealthVisuals.backgroundForStatus(health.status),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -66,7 +68,7 @@ class _AppDetailHealthBannerState extends State<AppDetailHealthBanner> {
                 color: ListenerHealthVisuals.colorForStatus(health.status),
                 size: 20,
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: Spacing.md),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -82,7 +84,7 @@ class _AppDetailHealthBannerState extends State<AppDetailHealthBanner> {
                         style: PiccoloTheme.textTheme.labelSmall,
                       ),
                     ],
-                    const SizedBox(height: 4),
+                    const SizedBox(height: Spacing.xs),
                     if (health.actionRequired)
                       Text(
                         'Action required - check Remote Access settings.',
@@ -131,13 +133,13 @@ class _AppDetailHealthBannerState extends State<AppDetailHealthBanner> {
           ),
           // Collapsible details
           if (health.details != null && health.details!.isNotEmpty) ...[
-            const SizedBox(height: 8),
+            const SizedBox(height: Spacing.sm),
             GestureDetector(
               onTap: () => setState(() => _showDetails = !_showDetails),
               child: Row(
                 children: [
                   Icon(
-                    _showDetails ? Icons.expand_less : Icons.expand_more,
+                    _showDetails ? PiccoloIcons.expandLess : PiccoloIcons.expandMore,
                     size: 16,
                     color: PiccoloTheme.cobalt600,
                   ),
@@ -153,7 +155,7 @@ class _AppDetailHealthBannerState extends State<AppDetailHealthBanner> {
             ),
             if (_showDetails)
               Padding(
-                padding: const EdgeInsets.only(top: 8),
+                padding: const EdgeInsets.only(top: Spacing.sm),
                 child: Text(
                   health.details!,
                   style: const TextStyle(
@@ -176,7 +178,7 @@ class _AppDetailHealthBannerState extends State<AppDetailHealthBanner> {
       );
       return;
     }
-    openOrFocusSettings(controller);
+    controller.openSettings(initialTab: SettingsTab.remoteAccess);
   }
 
   Future<void> _retryNow(String? certId) async {
