@@ -1,8 +1,11 @@
 package remote
 
 import (
+	"context"
 	"errors"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -59,6 +62,11 @@ func classifyFailure(err error) (FailureClass, string) {
 	// Check for ACME ProblemDetails
 	var pd *legoacme.ProblemDetails
 	if !errors.As(err, &pd) {
+		// Not an ACME ProblemDetails — check for network-level errors
+		// that should use the connection-failure escalation path.
+		if isNetworkError(err) {
+			return FailureClassTransient, "cert_connection_failed"
+		}
 		return FailureClassTransient, "cert_unknown_error"
 	}
 
@@ -165,6 +173,35 @@ func parseRetryAfter(err error) *time.Time {
 		return &t
 	}
 	return nil
+}
+
+// isNetworkError checks whether err represents a network-level failure
+// (DNS resolution, TCP connect, TLS handshake, HTTP transport) that should
+// be classified as cert_connection_failed for proper escalation.
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Exclude shutdown cancellations — not a network failure.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true // covers *net.OpError, *net.DNSError, timeouts
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true // transport-level failures from http.Client
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// String fallback for wrapped errors without proper types
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "i/o timeout")
 }
 
 // ReasonForCode returns human-readable reason for any health/failure code.

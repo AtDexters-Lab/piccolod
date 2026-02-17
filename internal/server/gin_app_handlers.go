@@ -132,10 +132,7 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 		return
 	}
 	status := s.remoteManager.Status()
-	if !status.Enabled {
-		return
-	}
-	if !strings.EqualFold(status.Solver, "http-01") {
+	if !status.Enabled || !strings.EqualFold(status.Solver, "http-01") {
 		return
 	}
 	base := remoteBaseHostname(&status)
@@ -147,19 +144,7 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 		log.Printf("WARN: remote: queue certificates for app %s: %v", appName, err)
 		return
 	}
-	hosts := map[string]struct{}{}
-	for _, ep := range endpoints {
-		// Only queue certs for HTTP/WS listeners that have host-based routing
-		// DerivedHostLabel is empty for raw/tls listeners (per RFC 20260114)
-		if ep.DerivedHostLabel == "" {
-			continue
-		}
-		host := ep.DerivedHostLabel + "." + base
-		hosts[host] = struct{}{}
-	}
-	for h := range hosts {
-		s.remoteManager.QueueHostnameCertificate(h)
-	}
+	queueEndpointHostCerts(s.remoteManager, endpoints, base)
 }
 
 func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, base string) map[string]struct{} {

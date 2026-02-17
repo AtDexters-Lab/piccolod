@@ -64,21 +64,9 @@ func (s *GinServer) handleRemoteConfigure(c *gin.Context) {
 	}
 	s.refreshRemoteRuntime()
 	// User-managed mode uses HTTP-01 (wildcard unsupported), proactively issue per-listener certs
-	if strings.TrimSpace(req.PortalHostname) != "" && s.remoteManager != nil {
+	if strings.TrimSpace(req.PortalHostname) != "" && s.remoteManager != nil && s.serviceManager != nil {
 		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(req.PortalHostname)), ".")
-		hosts := map[string]struct{}{}
-		for _, ep := range s.serviceManager.GetAll() {
-			// Only queue certs for HTTP/WS listeners that have host-based routing
-			// DerivedHostLabel is empty for raw/tls listeners (per RFC 20260114)
-			if ep.DerivedHostLabel == "" {
-				continue
-			}
-			host := ep.DerivedHostLabel + "." + base
-			hosts[host] = struct{}{}
-		}
-		for h := range hosts {
-			s.remoteManager.QueueHostnameCertificate(h)
-		}
+		queueEndpointHostCerts(s.remoteManager, s.serviceManager.GetAll(), base)
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "remote configured"})
 }

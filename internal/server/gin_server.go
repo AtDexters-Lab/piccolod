@@ -687,6 +687,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.remoteManager = rm
 	s.registerUnlockReloader(rm)
 	rm.SetEventsBus(eventsBus)
+	s.observeRemoteCertQueuing(eventsBus)
 
 	// Wire remote status provider for health aggregation (RFC 20260125)
 	if rm != nil && svcMgr != nil {
@@ -1830,6 +1831,77 @@ func (s *GinServer) observeRemoteConfig(bus *events.Bus) {
 			s.applyRemoteRuntimeFromStatus(status)
 		}
 	}()
+}
+
+// observeRemoteCertQueuing subscribes to endpoint and remote config changes to
+// queue per-host certificate issuance for HTTP-01 mode. This ensures certs are
+// created for endpoints added at startup (RestoreFromPodman) or after remote is
+// reconfigured, closing the gap where requeueOutstandingIssuances can only
+// requeue existing cert entries.
+func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
+	if bus == nil {
+		return
+	}
+	endpointsCh := bus.Subscribe(events.TopicServiceEndpointsChanged, 16)
+	remoteCfgCh := bus.Subscribe(events.TopicRemoteConfigChanged, 16)
+
+	go func() {
+		for evt := range endpointsCh {
+			payload, ok := evt.Payload.(events.ServiceEndpointsChanged)
+			if !ok || len(payload.Added) == 0 {
+				continue
+			}
+			rm := s.remoteManager
+			if rm == nil {
+				continue
+			}
+			status := rm.Status()
+			if !status.Enabled || !strings.EqualFold(status.Solver, "http-01") {
+				continue
+			}
+			base := remoteBaseHostname(&status)
+			if base == "" {
+				continue
+			}
+			for _, ep := range payload.Added {
+				if ep.DerivedHostLabel == "" {
+					continue
+				}
+				rm.QueueHostnameCertificate(ep.DerivedHostLabel + "." + base)
+			}
+		}
+	}()
+
+	go func() {
+		for evt := range remoteCfgCh {
+			status, ok := evt.Payload.(remote.Status)
+			if !ok || !status.Enabled || !strings.EqualFold(status.Solver, "http-01") {
+				continue
+			}
+			rm := s.remoteManager
+			sm := s.serviceManager
+			if rm == nil || sm == nil {
+				continue
+			}
+			base := remoteBaseHostname(&status)
+			if base == "" {
+				continue
+			}
+			queueEndpointHostCerts(rm, sm.GetAll(), base)
+		}
+	}()
+}
+
+// queueEndpointHostCerts queues per-host certificate issuance for all endpoints
+// with a DerivedHostLabel. Used by observeRemoteCertQueuing and handleRemoteConfigure.
+func queueEndpointHostCerts(rm *remote.Manager, endpoints []services.ServiceEndpoint, base string) {
+	if rm == nil || base == "" {
+		return
+	}
+	hosts := remoteHostsForEndpoints(endpoints, base)
+	for h := range hosts {
+		rm.QueueHostnameCertificate(h)
+	}
 }
 
 // observeProxyOIDCClients auto-registers proxy OIDC clients for apps whose
