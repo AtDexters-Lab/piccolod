@@ -356,6 +356,50 @@ func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 	}
 }
 
+func TestEnqueueIssuanceRespectsRetryAt(t *testing.T) {
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	now := time.Unix(1000, 0)
+	retryAt := now.Add(1 * time.Hour)
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(now))
+
+	// Seed a cert in error state with RetryAt in the future (e.g., rate_limited).
+	m.cfgMu.Lock()
+	cfg := m.currentConfig()
+	cfg.PortalHostname = "portal.example.com"
+	cfg.Certificates = []Certificate{{
+		ID:           "host:app.portal.example.com",
+		Domains:      []string{"app.portal.example.com"},
+		Status:       "error",
+		FailureClass: FailureClassRateLimited,
+		FailureCode:  "cert_rate_limited",
+		RetryAt:      &retryAt,
+	}}
+	if err := m.save(cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// enqueueIssuance (non-forced) should skip because RetryAt is in the future.
+	m.enqueueIssuance("host:app.portal.example.com", []string{"app.portal.example.com"}, "app.portal.example.com")
+
+	// Cert should still be "error" — not reset to "pending".
+	for _, c := range m.ListCertificates() {
+		if c.ID == "host:app.portal.example.com" {
+			if c.Status != "error" {
+				t.Fatalf("expected cert to stay in error state, got %q", c.Status)
+			}
+			if c.RetryAt == nil || !c.RetryAt.Equal(retryAt) {
+				t.Fatalf("expected RetryAt preserved, got %v", c.RetryAt)
+			}
+			return
+		}
+	}
+	t.Fatal("cert not found")
+}
+
 func TestRemoveAliasRemovesCertificateEntry(t *testing.T) {
 	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
 	dir := t.TempDir()

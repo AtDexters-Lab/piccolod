@@ -603,9 +603,11 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 
 	log.Printf("remote: configured (solver=http-01, portal=%s)", portalHost)
 
-	// Queue issuance jobs after releasing lock (enqueueIssuance acquires its own lock)
+	// Queue issuance jobs after releasing lock (enqueueIssuanceWithForce acquires its own lock).
+	// Force=true because defaultCertificates seeds optimistic "ok" entries; without force the
+	// duplicate guard would skip issuance since NextRenewal is in the future.
 	// User-managed mode only issues portal cert (no wildcard - HTTP-01 doesn't support it)
-	m.enqueueIssuance("portal", []string{portalHost}, portalHost)
+	m.enqueueIssuanceWithForce("portal", []string{portalHost}, portalHost, true)
 	return nil
 }
 
@@ -691,13 +693,15 @@ func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
 
 	log.Printf("remote: configured (solver=dns-01, managed=true, portal=%s)", portalHost)
 
-	// Queue issuance jobs after releasing lock (enqueueIssuance acquires its own lock)
-	m.enqueueIssuance("portal", []string{portalHost}, portalHost)
+	// Queue issuance jobs after releasing lock (enqueueIssuanceWithForce acquires its own lock).
+	// Force=true because defaultCertificates seeds optimistic "ok" entries; without force the
+	// duplicate guard would skip issuance since NextRenewal is in the future.
+	m.enqueueIssuanceWithForce("portal", []string{portalHost}, portalHost, true)
 	// Managed mode supports wildcard via DNS-01
 	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portalHost)), ".")
 	if base != "" {
 		cn := "*." + base
-		m.enqueueIssuance("wildcard", []string{cn, base}, cn)
+		m.enqueueIssuanceWithForce("wildcard", []string{cn, base}, cn, true)
 	}
 	return nil
 }
@@ -1354,13 +1358,30 @@ func (m *Manager) enqueueIssuanceWithForce(id string, domains []string, commonNa
 	m.cfgMu.Lock()
 	cfg := m.currentConfigLocked()
 	// Skip duplicate unless forced.
+	now := m.now()
 	for _, c := range cfg.Certificates {
-		if c.ID == id && strings.EqualFold(c.Status, "pending") && !force {
+		if c.ID != id || force {
+			continue
+		}
+		// Already queued for issuance.
+		if strings.EqualFold(c.Status, "pending") {
+			m.cfgMu.Unlock()
+			return
+		}
+		// Already issued and not yet due for renewal.
+		// Also honor the 24h-before-expiry safety net from scanAndQueueRenewals.
+		if strings.EqualFold(c.Status, "ok") && c.NextRenewal != nil && now.Before(*c.NextRenewal) &&
+			(c.ExpiresAt == nil || !now.Add(24*time.Hour).After(*c.ExpiresAt)) {
+			m.cfgMu.Unlock()
+			return
+		}
+		// Failed with backoff timer still active (e.g., rate_limited) — respect RetryAt.
+		// Without this, save() → TopicRemoteConfigChanged → re-enqueue creates an infinite loop.
+		if c.RetryAt != nil && now.Before(*c.RetryAt) {
 			m.cfgMu.Unlock()
 			return
 		}
 	}
-	now := m.now()
 	m.ensureCertPending(cfg, id, domains, now)
 	// save() releases cfgMu.Lock()
 	_ = m.save(cfg)
