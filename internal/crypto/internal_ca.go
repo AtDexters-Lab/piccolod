@@ -344,9 +344,15 @@ func (ca *InternalCA) EnsureServerCertificateForHosts(hostnames []string) (bool,
 		}
 	}
 
-	// Generate new certificate with all hostnames
+	// Generate new certificate with all hostnames.
+	// Use the first caller-provided hostname as CN (typically the machine-specific
+	// hostname like piccolo-abc123.local), not the sorted order.
+	cn := "piccolo.local"
+	if len(hostnames) > 0 {
+		cn = hostnames[0]
+	}
 	certPEM, keyPEM, err := ca.IssueCertificate(
-		"piccolo.local",
+		cn,
 		requested,
 		365*24*time.Hour, // 1 year
 	)

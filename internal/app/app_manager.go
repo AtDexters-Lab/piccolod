@@ -72,6 +72,9 @@ type AppManager struct {
 
 	// Internal CA path for OIDC trust
 	internalCAPath string
+
+	// OIDC hostname for container --add-host entries (machine-specific, e.g. "piccolo-abc123.local")
+	oidcHostname string
 }
 
 var (
@@ -174,6 +177,7 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		observedStatusMessage: make(map[string]string),
 		workspacePathResolver: pathResolver,
 		workspaceImageMounter: imageMounter,
+		oidcHostname:          "piccolo.local",
 	}
 
 	// Wire up runtime resolver and disk manager
@@ -199,10 +203,18 @@ func (m *AppManager) SetProgressReporter(r events.ProgressReporter) {
 }
 
 // SetInternalCAPath configures the path to the internal CA certificate on the host.
-// This certificate is mounted into containers to enable trust for piccolo.local.
+// This certificate is mounted into containers to enable OIDC back-channel trust.
 func (m *AppManager) SetInternalCAPath(path string) {
 	m.stateMu.Lock()
 	m.internalCAPath = path
+	m.stateMu.Unlock()
+}
+
+// SetOIDCHostname configures the machine-specific hostname used for OIDC
+// back-channel --add-host entries in containers (e.g. "piccolo-abc123.local").
+func (m *AppManager) SetOIDCHostname(hostname string) {
+	m.stateMu.Lock()
+	m.oidcHostname = hostname
 	m.stateMu.Unlock()
 }
 
@@ -2586,6 +2598,7 @@ func (m *AppManager) applyOIDCClientInjection(spec *container.ContainerCreateSpe
 	// Mount Piccolo Internal CA for OIDC back-channel trust.
 	m.stateMu.RLock()
 	caHostPath := m.internalCAPath
+	oidcHost := m.oidcHostname
 	m.stateMu.RUnlock()
 	if caHostPath == "" {
 		return
@@ -2603,10 +2616,10 @@ func (m *AppManager) applyOIDCClientInjection(spec *container.ContainerCreateSpe
 	// Containers using NetworkMode "container:<id>" share the network namespace
 	// and podman doesn't allow extra hosts in that case.
 	if !strings.HasPrefix(spec.NetworkMode, "container:") {
-		if hostEntry, err := container.HostGatewayEntry(); err == nil {
-			spec.ExtraHosts = append(spec.ExtraHosts, hostEntry)
+		if entries, err := container.HostGatewayEntries(oidcHost); err == nil {
+			spec.ExtraHosts = append(spec.ExtraHosts, entries...)
 		} else {
-			log.Printf("WARN: failed to resolve host gateway for piccolo.local: %v", err)
+			log.Printf("WARN: failed to resolve host gateway for OIDC hostname %s: %v", oidcHost, err)
 		}
 	}
 }

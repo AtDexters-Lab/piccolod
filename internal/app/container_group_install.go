@@ -195,10 +195,13 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	for _, ep := range endpoints {
 		anchorSpec.Ports = append(anchorSpec.Ports, container.PortMapping{Host: ep.HostBind, Container: ep.GuestPort})
 	}
-	// Add host gateway entry to the anchor (which owns the network namespace).
+	// Add host gateway entries to the anchor (which owns the network namespace).
 	// Service containers share this namespace and inherit the /etc/hosts entries.
-	if hostEntry, err := container.HostGatewayEntry(); err == nil {
-		anchorSpec.ExtraHosts = append(anchorSpec.ExtraHosts, hostEntry)
+	m.stateMu.RLock()
+	oidcHost := m.oidcHostname
+	m.stateMu.RUnlock()
+	if entries, err := container.HostGatewayEntries(oidcHost); err == nil {
+		anchorSpec.ExtraHosts = append(anchorSpec.ExtraHosts, entries...)
 	}
 	if err := container.ValidateContainerSpec(anchorSpec); err != nil {
 		return nil, fmt.Errorf("invalid network anchor spec: %w", err)

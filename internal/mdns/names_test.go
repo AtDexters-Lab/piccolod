@@ -155,6 +155,81 @@ func TestOnChange_Deregister(t *testing.T) {
 	}
 }
 
+func TestTLSHostnames(t *testing.T) {
+	t.Run("excludes_gateway_hostname", func(t *testing.T) {
+		reg := newNameRegistry("piccolo-abc123", "piccolo-abc123")
+		reg.SetAliases([]string{"immich"})
+		reg.AddGatewayHostname()
+
+		tlsHosts := reg.TLSHostnames()
+		allHosts := reg.Hostnames()
+
+		// piccolo.local must not appear in TLS hostnames
+		if contains(tlsHosts, "piccolo.local") {
+			t.Fatalf("TLSHostnames() should exclude piccolo.local, got %v", tlsHosts)
+		}
+		// but it should be in Hostnames()
+		if !contains(allHosts, "piccolo.local") {
+			t.Fatalf("Hostnames() should include piccolo.local when gateway enabled, got %v", allHosts)
+		}
+		// other hostnames still present
+		if !contains(tlsHosts, "piccolo-abc123.local") {
+			t.Fatalf("TLSHostnames() should include base hostname, got %v", tlsHosts)
+		}
+		if !contains(tlsHosts, "immich-piccolo-abc123.local") {
+			t.Fatalf("TLSHostnames() should include alias hostname, got %v", tlsHosts)
+		}
+	})
+
+	t.Run("baseName_is_piccolo_with_gateway", func(t *testing.T) {
+		// When baseName == "piccolo", piccolo.local appears once (deduped in rebuild).
+		// TLSHostnames() must still exclude it.
+		reg := newNameRegistry("piccolo", "piccolo-abc123")
+		reg.AddGatewayHostname()
+
+		tlsHosts := reg.TLSHostnames()
+
+		if contains(tlsHosts, "piccolo.local") {
+			t.Fatalf("TLSHostnames() should exclude piccolo.local even when it's the base, got %v", tlsHosts)
+		}
+		if !contains(tlsHosts, "piccolo-abc123.local") {
+			t.Fatalf("TLSHostnames() should include specific hostname, got %v", tlsHosts)
+		}
+	})
+
+	t.Run("gateway_disabled_matches_hostnames", func(t *testing.T) {
+		reg := newNameRegistry("piccolo-abc123", "piccolo-abc123")
+		reg.SetAliases([]string{"immich"})
+
+		tlsHosts := reg.TLSHostnames()
+		allHosts := reg.Hostnames()
+
+		if len(tlsHosts) != len(allHosts) {
+			t.Fatalf("without gateway, TLSHostnames() and Hostnames() should have same count: TLS=%v All=%v", tlsHosts, allHosts)
+		}
+		// Same set of hostnames (order may differ — TLS puts specific hostname first)
+		for _, h := range allHosts {
+			if !contains(tlsHosts, h) {
+				t.Fatalf("TLSHostnames() missing %q from Hostnames(): TLS=%v All=%v", h, tlsHosts, allHosts)
+			}
+		}
+	})
+
+	t.Run("specific_hostname_first", func(t *testing.T) {
+		reg := newNameRegistry("piccolo-abc123", "piccolo-abc123")
+		reg.SetAliases([]string{"immich"})
+		reg.AddGatewayHostname()
+
+		tlsHosts := reg.TLSHostnames()
+		if len(tlsHosts) == 0 {
+			t.Fatal("TLSHostnames() should not be empty")
+		}
+		if tlsHosts[0] != "piccolo-abc123.local" {
+			t.Fatalf("TLSHostnames()[0] should be machine-specific hostname, got %q (all: %v)", tlsHosts[0], tlsHosts)
+		}
+	})
+}
+
 func contains(list []string, target string) bool {
 	for _, item := range list {
 		if strings.EqualFold(item, target) {
