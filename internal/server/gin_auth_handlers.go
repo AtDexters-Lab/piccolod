@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net"
@@ -257,24 +258,27 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 			// Unlock successful — mount LUKS data volume before notifying
 			// persistence, so /piccolo-data is available when the app-manager
 			// reconcile loop starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
+			// Use a background context so long-running ops survive client disconnect.
+			unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer unlockCancel()
 			if s.storageMgr != nil {
-				if err := s.storageMgr.UnlockDataVolume(ctx, body.Password); err != nil {
+				if err := s.storageMgr.UnlockDataVolume(unlockCtx, body.Password); err != nil {
 					log.Printf("ERROR: auth login data volume unlock failed: %v", err)
 					if s.healthTracker != nil {
 						s.healthTracker.Setf("storage", health.LevelError, "data volume unlock failed")
 					}
 				}
 			}
-			if notifyErr := s.notifyPersistenceLockState(ctx, false); notifyErr != nil {
+			if notifyErr := s.notifyPersistenceLockState(unlockCtx, false); notifyErr != nil {
 				log.Printf("WARN: auth login persistence unlock failed: %v", notifyErr)
 			}
 
-			// Retry verification after unlock
+			// Retry verification after unlock (use unlockCtx — gin ctx may be cancelled if client disconnected).
 			if s.userManager != nil {
-				userInfo, err = s.userManager.Verify(ctx, username, body.Password)
+				userInfo, err = s.userManager.Verify(unlockCtx, username, body.Password)
 			} else if s.authManager != nil {
 				// Fallback retry with legacy auth manager
-				ok, verifyErr := s.authManager.Verify(ctx, username, body.Password)
+				ok, verifyErr := s.authManager.Verify(unlockCtx, username, body.Password)
 				if verifyErr != nil {
 					err = verifyErr
 				} else if !ok {

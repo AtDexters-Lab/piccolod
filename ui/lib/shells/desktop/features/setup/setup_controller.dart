@@ -156,6 +156,21 @@ class SetupController extends ChangeNotifier {
           _state = SetupState.installDisk;
           return;
         }
+        // Install failed or abandoned — no active task, not done.
+        if (_bootMode != 'internal') {
+          // USB boot: revert to onboarding so user can retry.
+          try {
+            await _api.post('/api/v1/system/onboarding', body: {'choice': 'pending'});
+            _state = SetupState.onboarding;
+            return;
+          } on Object catch (e) {
+            debugPrint('Revert to onboarding failed: $e');
+            _error = 'Installation failed. Please reboot to try again.';
+            _state = SetupState.error;
+            return;
+          }
+        }
+        // Internal boot: fall through to normal crypto/auth flow.
       }
 
       final status = await _api.get('/api/v1/crypto/status') as Map<String, dynamic>;
@@ -361,28 +376,14 @@ class SetupController extends ChangeNotifier {
 
       const timeout = Duration(seconds: 120);
 
-      // 1. Initialize Crypto
+      // 1. Initialize Crypto (also unlocks, sets up auth, creates admin user, creates session)
       await _api.post('/api/v1/crypto/setup', body: {'password': password})
           .timeout(timeout);
 
-      // 2. Unlock (to get session and auth)
-      await _api.post('/api/v1/crypto/unlock', body: {'password': password})
-          .timeout(timeout);
-
-      // 3. Check if Auth is initialized
-      final authState = await _api.get('/api/v1/auth/initialized')
-          .timeout(timeout) as Map<String, dynamic>;
-
-      if (authState['initialized'] != true) {
-        // 3b. Initialize Auth (create admin account) if not already done
-        await _api.post('/api/v1/auth/setup', body: {'password': password})
-            .timeout(timeout);
-      }
-
-      // 4. Fetch CSRF Token
+      // 2. Fetch CSRF Token
       await _api.fetchCsrfToken().timeout(timeout);
 
-      // 5. Generate Recovery Key
+      // 3. Generate Recovery Key
       final recoveryData = await _api.post(
         '/api/v1/crypto/recovery-key/generate',
         body: {'password': password},

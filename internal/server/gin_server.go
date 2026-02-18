@@ -110,6 +110,9 @@ type GinServer struct {
 	loginFailures int
 	resetFailures int
 
+	// Serializes concurrent /crypto/setup requests to prevent parallel LUKS init.
+	setupMu sync.Mutex
+
 	// Crypto manager for lock/unlock of app data volumes
 	cryptoManager  *crypt.Manager
 	storageMgr     *storage.Manager

@@ -58,7 +58,20 @@ func (s *GinServer) handleOnboardingChoice(c *gin.Context) {
 	}
 
 	choice := onboarding.OnboardingState(req.Choice)
+	state := s.onboardingMgr.State()
 	switch choice {
+	case onboarding.StatePending:
+		if s.installer != nil && s.installer.ActiveTaskID() != "" {
+			c.JSON(http.StatusConflict, gin.H{"error": "cannot revert while install is in progress"})
+			return
+		}
+		if err := s.onboardingMgr.RevertToPending(); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		s.publishOnboardingEvent(string(state), string(choice))
+		c.JSON(http.StatusOK, gin.H{"state": "pending", "message": "Reverted to onboarding"})
+
 	case onboarding.StateTryPiccolo:
 		if err := s.onboardingMgr.Choose(choice); err != nil {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -85,7 +98,7 @@ func (s *GinServer) handleOnboardingChoice(c *gin.Context) {
 		})
 
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid choice: must be try_piccolo or install_disk"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid choice: must be pending, try_piccolo, or install_disk"})
 	}
 }
 

@@ -1,11 +1,8 @@
 package onboarding
 
 import (
-	"fmt"
 	"strings"
 	"testing"
-
-	"piccolod/internal/events"
 )
 
 func TestResolveImageURL_Default(t *testing.T) {
@@ -75,102 +72,18 @@ func TestSplitDiskAndPart(t *testing.T) {
 	}
 }
 
-func TestDDProgressParser(t *testing.T) {
-	// Just ensure it doesn't panic and accepts dd-style output.
-	parser := &ddProgressParser{
-		taskID:        "install-test",
-		reporter:      &Installer{},
-		estimatedSize: 4 * 1024 * 1024 * 1024, // 4 GiB estimated
+func TestDDStderrSink(t *testing.T) {
+	sink := ddStderrSink{}
+	data := []byte("1073741824 bytes (1.1 GB, 1.0 GiB) copied, 5.0 s, 215 MB/s\r")
+	n, err := sink.Write(data)
+	if err != nil {
+		t.Errorf("Write error: %v", err)
 	}
-
-	lines := []string{
-		"4194304 bytes (4.2 MB, 4.0 MiB) copied, 0.01 s, 419 MB/s\r",
-		"1073741824 bytes (1.1 GB, 1.0 GiB) copied, 5.0 s, 215 MB/s\r",
-		"some other output\n",
-	}
-	for _, line := range lines {
-		n, err := parser.Write([]byte(line))
-		if err != nil {
-			t.Errorf("Write error: %v", err)
-		}
-		if n != len(line) {
-			t.Errorf("Write returned %d, expected %d", n, len(line))
-		}
+	if n != len(data) {
+		t.Errorf("Write returned %d, expected %d", n, len(data))
 	}
 }
 
-func TestDDProgressParser_Interpolation(t *testing.T) {
-	// Verify progress interpolation within 71-91% range.
-	var lastPct int
-	reporter := &mockProgressReporter{}
-	inst := &Installer{reporter: reporter}
-
-	estimated := int64(4 * 1024 * 1024 * 1024) // 4 GiB
-	parser := &ddProgressParser{
-		taskID:        "install-test",
-		reporter:      inst,
-		estimatedSize: estimated,
-	}
-
-	tests := []struct {
-		bytes   int64
-		wantMin int
-		wantMax int
-	}{
-		{0, 71, 71},                        // 0% → 71
-		{1 * 1024 * 1024 * 1024, 75, 76},   // 25% → ~76
-		{2 * 1024 * 1024 * 1024, 80, 82},   // 50% → ~81
-		{3 * 1024 * 1024 * 1024, 85, 87},   // 75% → ~86
-		{4 * 1024 * 1024 * 1024, 91, 91},   // 100% → 91
-		{5 * 1024 * 1024 * 1024, 91, 91},   // >100% capped → 91
-	}
-
-	for _, tt := range tests {
-		reporter.lastProgress = -1
-		line := fmt.Sprintf("%d bytes (0 B) copied, 1.0 s, 0 B/s\r", tt.bytes)
-		parser.Write([]byte(line))
-		lastPct = reporter.lastProgress
-		if tt.bytes == 0 {
-			// 0 bytes line doesn't match since fields[0] would be "0"
-			// which parses fine, so check it
-			if lastPct < tt.wantMin || lastPct > tt.wantMax {
-				t.Errorf("bytes=%d: progress=%d, want [%d, %d]", tt.bytes, lastPct, tt.wantMin, tt.wantMax)
-			}
-		} else if lastPct < tt.wantMin || lastPct > tt.wantMax {
-			t.Errorf("bytes=%d: progress=%d, want [%d, %d]", tt.bytes, lastPct, tt.wantMin, tt.wantMax)
-		}
-	}
-}
-
-func TestDDProgressParser_NoEstimate(t *testing.T) {
-	// Without estimatedSize, progress should stay at 71.
-	reporter := &mockProgressReporter{}
-	inst := &Installer{reporter: reporter}
-
-	parser := &ddProgressParser{
-		taskID:        "install-test",
-		reporter:      inst,
-		estimatedSize: 0,
-	}
-
-	parser.Write([]byte("1073741824 bytes (1.1 GB, 1.0 GiB) copied, 5.0 s, 215 MB/s\r"))
-	if reporter.lastProgress != 71 {
-		t.Errorf("expected progress 71 with no estimate, got %d", reporter.lastProgress)
-	}
-}
-
-// mockProgressReporter captures the last reported progress.
-type mockProgressReporter struct {
-	lastProgress int
-	lastPhase    string
-	events       []events.TaskProgressEvent
-}
-
-func (m *mockProgressReporter) Report(evt events.TaskProgressEvent) {
-	m.lastProgress = evt.Progress
-	m.lastPhase = evt.Phase
-	m.events = append(m.events, evt)
-}
 
 func TestNewInstaller(t *testing.T) {
 	inst := NewInstaller(nil, nil, nil)
