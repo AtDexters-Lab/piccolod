@@ -1,10 +1,13 @@
-import '../services/api_client.dart';
-import '../models/app_models.dart';
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:piccolo_os/core/models/app_models.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
 
 class AppService {
-  final ApiClient _client;
 
   AppService(this._client);
+  final ApiClient _client;
 
   Map<String, String>? _taskHeaders(String? taskId) {
     if (taskId == null || taskId.isEmpty) return null;
@@ -44,8 +47,8 @@ class AppService {
     Map<String, dynamic> json;
     if (data is Map<String, dynamic>) {
       // Check if wrapped in "data"
-      if (data.containsKey('data') && data['data'] is Map) {
-        json = data['data'];
+      if (data.containsKey('data') && data['data'] is Map<dynamic, dynamic>) {
+        json = Map<String, dynamic>.from(data['data'] as Map<dynamic, dynamic>);
       } else {
         json = data;
       }
@@ -67,15 +70,16 @@ class AppService {
     final data = await _client.get('/api/v1/catalog/categories');
     // Expected: { categories: ["CMS", "Database"] } or { data: { categories: [...] } }
 
-    List<dynamic> list = [];
-    if (data is Map) {
-      if (data['data'] != null && data['data']['categories'] != null) {
-        list = data['data']['categories'];
-      } else if (data['categories'] != null) {
-        list = data['categories'];
+    var list = <dynamic>[];
+    if (data is Map<dynamic, dynamic>) {
+      final dataWrapper = data['data'];
+      if (dataWrapper is Map<dynamic, dynamic> && dataWrapper['categories'] is List<dynamic>) {
+        list = dataWrapper['categories'] as List<dynamic>;
+      } else if (data['categories'] is List<dynamic>) {
+        list = data['categories'] as List<dynamic>;
       }
     }
-    return list.cast<String>();
+    return list.whereType<String>().toList();
   }
 
   Future<String?> getCatalogTemplate(String name) async {
@@ -88,33 +92,37 @@ class AppService {
   Future<List<App>> getApps() async {
     final data = await _client.get('/api/v1/apps');
     // Expected: { data: [...] }
-    final List<dynamic> list = data['data'] ?? [];
-    return list.map((e) => App.fromJson(e)).toList();
+    final rawData = (data as Map<String, dynamic>)['data'];
+    final list = rawData is List ? rawData : <dynamic>[];
+    return list
+        .whereType<Map<dynamic, dynamic>>()
+        .map((e) => App.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
   }
 
   Future<AppDetail> getAppDetail(String name) async {
     final data = await _client.get('/api/v1/apps/$name');
     // Expected: { data: { app: {...}, listeners: [...], containers: [...] } }
 
-    final payload = (data is Map) ? data['data'] : null;
-    final json = payload is Map
+    final payload = (data is Map<dynamic, dynamic>) ? data['data'] : null;
+    final json = payload is Map<dynamic, dynamic>
         ? Map<String, dynamic>.from(payload)
         : <String, dynamic>{};
 
     final appJson = json['app'];
     final app = App.fromJson(
-      appJson is Map ? Map<String, dynamic>.from(appJson) : <String, dynamic>{},
+      appJson is Map<dynamic, dynamic> ? Map<String, dynamic>.from(appJson) : <String, dynamic>{},
     );
 
     final rawListeners = json['listeners'] ?? json['services'];
-    final listeners = (rawListeners is List ? rawListeners : const [])
-        .whereType<Map>()
+    final listeners = (rawListeners is List<dynamic> ? rawListeners : const <dynamic>[])
+        .whereType<Map<dynamic, dynamic>>()
         .map((e) => ServiceEndpoint.fromJson(Map<String, dynamic>.from(e)))
         .toList();
 
     final rawContainers = json['containers'];
-    final containers = (rawContainers is List ? rawContainers : const [])
-        .whereType<Map>()
+    final containers = (rawContainers is List<dynamic> ? rawContainers : const <dynamic>[])
+        .whereType<Map<dynamic, dynamic>>()
         .map((e) => AppContainerStatus.fromJson(Map<String, dynamic>.from(e)))
         .toList();
 
@@ -125,7 +133,7 @@ class AppService {
     try {
       final detail = await getAppDetail(name);
       return detail.listeners;
-    } catch (_) {
+    } on Exception catch (_) {
       return [];
     }
   }
@@ -181,13 +189,13 @@ class AppService {
       );
 
       // Expected: { data: { valid: true }, message: "valid" }
-      final valid = data['data']?['valid'] ?? false;
+      final dataMap = (data as Map<String, dynamic>)['data'];
+      final valid = (dataMap is Map<dynamic, dynamic> ? (dataMap['valid'] as bool?) : null) ?? false;
       return AppValidationResult(valid: valid);
-    } catch (e) {
-      if (e is ApiException) {
-        // Validation error often comes as 400 with details
-        return AppValidationResult(valid: false, error: e.message);
-      }
+    } on ApiException catch (e) {
+      // Validation error often comes as 400 with details
+      return AppValidationResult(valid: false, error: e.message);
+    } on Exception catch (e) {
       return AppValidationResult(valid: false, error: e.toString());
     }
   }
@@ -201,13 +209,16 @@ class AppService {
     );
 
     // Expected: { data: {App}, message: ... }
-    return App.fromJson(data['data']);
+    return App.fromJson(
+      Map<String, dynamic>.from((data as Map<String, dynamic>)['data'] as Map),
+    );
   }
 
   Future<Map<String, dynamic>> getCatalogConfigure(String name) async {
     final data = await _client.get('/api/v1/catalog/$name/configure');
     // Expected: { data: { inputName: { type:..., default:..., ... } } }
-    return Map<String, dynamic>.from(data['data'] ?? {});
+    final rawData = (data as Map<String, dynamic>)['data'];
+    return rawData is Map<dynamic, dynamic> ? Map<String, dynamic>.from(rawData) : <String, dynamic>{};
   }
 
   Future<App> installAppWithInputs(
@@ -229,7 +240,36 @@ class AppService {
       body: body,
       headers: _taskHeaders(taskId),
     );
-    return App.fromJson(data['data']);
+    return App.fromJson(
+      Map<String, dynamic>.from((data as Map<String, dynamic>)['data'] as Map),
+    );
+  }
+
+  /// Fire-and-forget install: sends the install POST with a short timeout.
+  /// Validation errors (4xx) return within the timeout and propagate.
+  /// For long installs, the timeout fires silently — the backend continues
+  /// on its 30-min background context, and the client tracks progress via WebSocket.
+  Future<void> initiateInstall(
+    String yamlContent,
+    Map<String, dynamic> inputs, {
+    String? taskId,
+    String? catalogSource,
+  }) async {
+    final body = <String, dynamic>{
+      'app_definition': yamlContent,
+      'inputs': inputs,
+    };
+    if (catalogSource != null && catalogSource.isNotEmpty) {
+      body['catalog_source'] = catalogSource;
+    }
+    try {
+      await _client
+          .post('/api/v1/apps', body: body, headers: _taskHeaders(taskId))
+          .timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      // Expected for non-cached installs. Backend continues in background.
+      debugPrint('initiateInstall: POST timed out (expected for long installs)');
+    }
   }
 
   // --- Certificate Management ---
@@ -258,8 +298,8 @@ class AppService {
     // Expected: { data: { images: [...], query: "..." } }
     Map<String, dynamic> response;
     if (data is Map<String, dynamic>) {
-      if (data.containsKey('data') && data['data'] is Map) {
-        response = data['data'];
+      if (data.containsKey('data') && data['data'] is Map<dynamic, dynamic>) {
+        response = Map<String, dynamic>.from(data['data'] as Map<dynamic, dynamic>);
       } else {
         response = data;
       }
@@ -267,7 +307,10 @@ class AppService {
       return [];
     }
 
-    final List<dynamic> images = response['images'] ?? [];
-    return images.map((e) => ImageSearchResult.fromJson(e)).toList();
+    final images = (response['images'] as List<dynamic>?) ?? <dynamic>[];
+    return images
+        .whereType<Map<dynamic, dynamic>>()
+        .map((e) => ImageSearchResult.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
   }
 }

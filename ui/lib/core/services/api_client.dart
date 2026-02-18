@@ -1,14 +1,19 @@
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
-import 'http_client_factory.dart'; // Import the factory
-import '../config/core_config.dart';
+import 'package:piccolo_os/core/config/core_config.dart';
+import 'package:piccolo_os/core/services/http_client_factory.dart'; // Import the factory
 
 class ApiClient {
+  factory ApiClient() => _instance;
+
+  ApiClient._internal() : _baseUrl = CoreConfig.apiBaseUrl {
+    _client = createHttpClient(); // Use the factory
+  }
   // Singleton instance
   static final ApiClient _instance = ApiClient._internal();
-  factory ApiClient() => _instance;
 
   late final http.Client _client;
   final String _baseUrl;
@@ -30,10 +35,6 @@ class ApiClient {
     '/api/v1/crypto/setup',
     '/api/v1/crypto/unlock',
   };
-
-  ApiClient._internal() : _baseUrl = CoreConfig.apiBaseUrl {
-    _client = createHttpClient(); // Use the factory
-  }
 
   /// Helper to construct the full URI.
   Uri _buildUri(String path, [Map<String, dynamic>? queryParameters]) {
@@ -61,17 +62,17 @@ class ApiClient {
     try {
       final response = await get('/api/v1/auth/csrf');
       if (response is Map && response.containsKey('token')) {
-        _csrfToken = response['token'];
+        _csrfToken = response['token'] as String?;
       }
-    } catch (e) {
-      debugPrint("Failed to fetch CSRF token: $e");
+    } on Object catch (e) {
+      debugPrint('Failed to fetch CSRF token: $e');
       // Don't rethrow, just proceed. Some endpoints might not need it.
     }
   }
 
   /// Called by the re-auth overlay after login succeeds or is cancelled.
   /// Guarded against double-completion (e.g. timeout racing with user action).
-  void completeReauth(bool success) {
+  void completeReauth({required bool success}) {
     if (_reauthCompleter != null && !_reauthCompleter!.isCompleted) {
       _reauthCompleter!.complete(success);
     }
@@ -105,7 +106,7 @@ class ApiClient {
       final success = await completer.future.timeout(
         const Duration(minutes: 5),
         onTimeout: () {
-          completeReauth(false);
+          completeReauth(success: false);
           return false;
         },
       );
@@ -246,7 +247,7 @@ class ApiClient {
       if (response.body.isEmpty) return null;
       try {
         return jsonDecode(response.body);
-      } catch (_) {
+      } on FormatException catch (_) {
         return response.body;
       }
     } else {
@@ -256,10 +257,10 @@ class ApiClient {
 }
 
 class ApiException implements Exception {
-  final int statusCode;
-  final String message;
 
   ApiException(this.statusCode, this.message);
+  final int statusCode;
+  final String message;
 
   @override
   String toString() => 'ApiException($statusCode): $message';

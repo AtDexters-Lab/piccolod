@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
-import '../../../../theme/piccolo_icons.dart';
-import '../../../../theme/piccolo_theme.dart';
-import 'files_controller.dart';
-import 'widgets/path_bar.dart';
-import 'widgets/file_list_view.dart';
+import 'package:piccolo_os/shells/desktop/features/files/files_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/files/widgets/file_list_view.dart';
+import 'package:piccolo_os/shells/desktop/features/files/widgets/path_bar.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class FilesApp extends StatefulWidget {
   const FilesApp({super.key});
@@ -50,7 +50,7 @@ class _FilesAppState extends State<FilesApp> {
           children: [
             const Icon(PiccoloIcons.error, color: PiccoloTheme.critical, size: 48),
             const SizedBox(height: Spacing.base),
-            Text("Error", style: PiccoloTheme.textTheme.bodyLarge),
+            Text('Error', style: PiccoloTheme.textTheme.bodyLarge),
             const SizedBox(height: Spacing.sm),
             Text(_controller.error!, style: PiccoloTheme.textTheme.labelSmall),
           ],
@@ -65,7 +65,7 @@ class _FilesAppState extends State<FilesApp> {
           children: [
             Icon(PiccoloIcons.folderOpen, color: PiccoloTheme.ink.withValues(alpha: 0.2), size: 64),
             const SizedBox(height: Spacing.base),
-            Text("Folder is empty", style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted)),
+            Text('Folder is empty', style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted)),
           ],
         ),
       );

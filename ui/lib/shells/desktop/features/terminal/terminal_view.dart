@@ -1,14 +1,14 @@
 import 'package:flutter/material.dart';
 
-import '../../../../shared/widgets/terminal_widget_mixin.dart';
+import 'package:piccolo_os/shared/widgets/terminal_widget_mixin.dart';
 
 /// Host terminal app widget.
 /// Connects to the host system's shell via /api/v1/terminal WebSocket.
 class TerminalApp extends StatefulWidget {
-  /// Optional callback when terminal session ends normally (e.g., Ctrl+D).
-  final void Function()? onSessionEnd;
 
   const TerminalApp({super.key, this.onSessionEnd});
+  /// Optional callback when terminal session ends normally (e.g., Ctrl+D).
+  final void Function()? onSessionEnd;
 
   @override
   State<TerminalApp> createState() => _TerminalAppState();

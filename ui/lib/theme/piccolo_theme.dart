@@ -369,7 +369,7 @@ class PiccoloTheme {
         color: porcelain,
       ),
 
-      tabBarTheme: TabBarThemeData(
+      tabBarTheme: const TabBarThemeData(
         labelColor: cobalt600,
         unselectedLabelColor: inkMuted,
         indicatorColor: cobalt600,

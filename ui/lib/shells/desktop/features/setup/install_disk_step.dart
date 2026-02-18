@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
-import '../../../../theme/piccolo_icons.dart';
-import '../../../../theme/piccolo_theme.dart';
-import '../../../../shared/widgets/task_progress_panel.dart';
+import 'package:piccolo_os/shared/widgets/task_progress_panel.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Multi-phase Install to Disk flow:
 /// 1. Disk selection
@@ -9,6 +9,12 @@ import '../../../../shared/widgets/task_progress_panel.dart';
 /// 3. Progress (download + write via TaskProgressPanel)
 /// 4. Complete → reboot prompt (handled by parent via installComplete state)
 class InstallDiskStep extends StatefulWidget {
+
+  const InstallDiskStep({
+    required this.disks, required this.onStartInstall, required this.onBack, required this.onInstallComplete, required this.onRefreshDisks, super.key,
+    this.taskId,
+    this.error,
+  });
   final List<Map<String, dynamic>> disks;
   final Future<bool> Function(String targetDisk) onStartInstall;
   final VoidCallback onBack;
@@ -16,17 +22,6 @@ class InstallDiskStep extends StatefulWidget {
   final String? taskId;
   final String? error;
   final Future<void> Function() onRefreshDisks;
-
-  const InstallDiskStep({
-    super.key,
-    required this.disks,
-    required this.onStartInstall,
-    required this.onBack,
-    required this.onInstallComplete,
-    required this.onRefreshDisks,
-    this.taskId,
-    this.error,
-  });
 
   @override
   State<InstallDiskStep> createState() => _InstallDiskStepState();
@@ -55,15 +50,15 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Text(
-            "Select a disk",
+            'Select a disk',
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               fontWeight: FontWeight.bold,
             ),
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 8),
-          Text(
-            "Choose an internal disk to install Piccolo. All data on the selected disk will be erased.",
+          const Text(
+            'Choose an internal disk to install Piccolo. All data on the selected disk will be erased.',
             style: TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
             textAlign: TextAlign.center,
           ),
@@ -99,7 +94,7 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
                   const Icon(PiccoloIcons.storage, size: 48, color: PiccoloTheme.inkMuted),
                   const SizedBox(height: 12),
                   const Text(
-                    "No internal disks found",
+                    'No internal disks found',
                     style: TextStyle(
                       fontWeight: FontWeight.w600,
                       color: PiccoloTheme.inkMuted,
@@ -107,7 +102,7 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
                   ),
                   const SizedBox(height: 4),
                   const Text(
-                    "Connect an internal disk and try again.",
+                    'Connect an internal disk and try again.',
                     style: TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
                   ),
                   const SizedBox(height: 16),
@@ -116,7 +111,7 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
                       await widget.onRefreshDisks();
                     },
                     icon: const Icon(PiccoloIcons.refresh, size: 16),
-                    label: const Text("Refresh"),
+                    label: const Text('Refresh'),
                   ),
                 ],
               ),
@@ -141,7 +136,7 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
             children: [
               TextButton(
                 onPressed: _isInstalling ? null : widget.onBack,
-                child: const Text("Back"),
+                child: const Text('Back'),
               ),
               const Spacer(),
               FilledButton(
@@ -157,7 +152,7 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
                           strokeWidth: 2,
                         ),
                       )
-                    : const Text("Install"),
+                    : const Text('Install'),
               ),
             ],
           ),
@@ -180,7 +175,7 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
-        title: const Text("Confirm Installation"),
+        title: const Text('Confirm Installation'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -202,7 +197,7 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
                     SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        "This disk contains data that will be permanently destroyed.",
+                        'This disk contains data that will be permanently destroyed.',
                         style: TextStyle(fontSize: 13, color: PiccoloTheme.critical),
                       ),
                     ),
@@ -212,20 +207,20 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
               const SizedBox(height: 16),
             ],
             Text(
-              "All data on $model ($_selectedDisk) will be erased. "
-              "This action cannot be undone.",
+              'All data on $model ($_selectedDisk) will be erased. '
+              'This action cannot be undone.',
             ),
           ],
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
-            child: const Text("Cancel"),
+            child: const Text('Cancel'),
           ),
           FilledButton(
             onPressed: () => Navigator.pop(context, true),
             style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.critical),
-            child: const Text("Erase and Install"),
+            child: const Text('Erase and Install'),
           ),
         ],
       ),
@@ -247,24 +242,28 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
         mainAxisSize: MainAxisSize.min,
         children: [
           Text(
-            "Installing Piccolo",
+            'Installing Piccolo',
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               fontWeight: FontWeight.bold,
             ),
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 8),
-          Text(
-            "Do not power off or disconnect the device.",
+          const Text(
+            'Do not power off or disconnect the device.',
             style: TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 20),
           TaskProgressPanel(
             taskId: widget.taskId!,
-            taskType: "Installation",
+            taskType: 'Installation',
             urlPath: '/api/v1/system/install-progress/stream',
-            onComplete: widget.onInstallComplete,
+            onComplete: (evt) {
+              if (evt.error == null || evt.error!.isEmpty) {
+                widget.onInstallComplete();
+              }
+            },
           ),
         ],
       ),
@@ -273,13 +272,6 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
 }
 
 class _DiskTile extends StatelessWidget {
-  final String device;
-  final String model;
-  final int sizeGb;
-  final String transport;
-  final bool hasData;
-  final bool isSelected;
-  final VoidCallback? onTap;
 
   const _DiskTile({
     required this.device,
@@ -290,6 +282,13 @@ class _DiskTile extends StatelessWidget {
     required this.isSelected,
     required this.onTap,
   });
+  final String device;
+  final String model;
+  final int sizeGb;
+  final String transport;
+  final bool hasData;
+  final bool isSelected;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -343,7 +342,7 @@ class _DiskTile extends StatelessWidget {
                       ),
                       Text(
                         '${_formatSize(sizeGb)} ${transport.toUpperCase()} $device',
-                        style: TextStyle(
+                        style: const TextStyle(
                           fontSize: 12,
                           color: PiccoloTheme.inkMuted,
                         ),
@@ -359,7 +358,7 @@ class _DiskTile extends StatelessWidget {
                       borderRadius: BorderRadius.circular(6),
                     ),
                     child: const Text(
-                      "Has data",
+                      'Has data',
                       style: TextStyle(
                         fontSize: 11,
                         color: PiccoloTheme.critical,

@@ -1,13 +1,15 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import 'package:piccolo_os/theme/piccolo_theme.dart';
-import 'package:piccolo_os/core/models/remote_models.dart';
-import '../remote_controller.dart';
 import 'package:intl/intl.dart';
+import 'package:piccolo_os/core/models/remote_models.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class RemoteEventsCard extends StatelessWidget {
-  final RemoteController controller;
 
-  const RemoteEventsCard({super.key, required this.controller});
+  const RemoteEventsCard({required this.controller, super.key});
+  final RemoteController controller;
 
   @override
   Widget build(BuildContext context) {
@@ -24,17 +26,17 @@ class RemoteEventsCard extends StatelessWidget {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text("Activity Log", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+                Text('Activity Log', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
                 if (events.length > 5)
                   TextButton(
                     onPressed: () => _showFullLogDialog(context),
-                    child: const Text("View All"),
+                    child: const Text('View All'),
                   ),
               ],
             ),
             const SizedBox(height: Spacing.base),
             if (events.isEmpty)
-              const Text("No recent activity.", style: TextStyle(color: PiccoloTheme.inkMuted))
+              const Text('No recent activity.', style: TextStyle(color: PiccoloTheme.inkMuted))
             else
               Container(
                 decoration: BoxDecoration(
@@ -57,10 +59,10 @@ class RemoteEventsCard extends StatelessWidget {
   }
 
   void _showFullLogDialog(BuildContext context) {
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text("Activity Log"),
+        title: const Text('Activity Log'),
         content: SizedBox(
           width: 500,
           height: 400,
@@ -71,15 +73,15 @@ class RemoteEventsCard extends StatelessWidget {
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Close")),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close')),
         ],
       ),
-    );
+    ));
   }
 
   Widget _buildEventItem(RemoteEvent event) {
     final dateFormat = DateFormat('MM/dd HH:mm:ss');
-    Color levelColor = PiccoloTheme.ink;
+    var levelColor = PiccoloTheme.ink;
     if (event.level == 'warn') levelColor = PiccoloTheme.warning;
     if (event.level == 'error') levelColor = PiccoloTheme.critical;
 
@@ -98,7 +100,7 @@ class RemoteEventsCard extends StatelessWidget {
                  if (event.nextStep != null)
                    Padding(
                      padding: const EdgeInsets.only(top: 2),
-                     child: Text("Tip: ${event.nextStep}", style: const TextStyle(fontSize: 12, color: PiccoloTheme.info, fontStyle: FontStyle.italic)),
+                     child: Text('Tip: ${event.nextStep}', style: const TextStyle(fontSize: 12, color: PiccoloTheme.info, fontStyle: FontStyle.italic)),
                    ),
                ],
              ),

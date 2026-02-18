@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
-import '../../core/models/listener_health.dart';
-import '../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/core/models/listener_health.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class HealthBadge extends StatelessWidget {
-  final ListenerHealth? health;
 
-  const HealthBadge({super.key, required this.health});
+  const HealthBadge({required this.health, super.key});
+  final ListenerHealth? health;
 
   @override
   Widget build(BuildContext context) {

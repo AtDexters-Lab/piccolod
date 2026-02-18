@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_theme.dart';
-import 'desktop_controller.dart';
-import 'widgets/stage.dart';
-import 'widgets/dock.dart';
-import 'widgets/window_frame.dart';
-import 'features/setup/setup_wizard.dart';
-import 'features/access_denied/access_denied_view.dart';
-import '../../shared/widgets/reauth_overlay.dart';
+import 'package:piccolo_os/shared/widgets/reauth_overlay.dart';
+import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/access_denied/access_denied_view.dart';
+import 'package:piccolo_os/shells/desktop/features/setup/setup_wizard.dart';
+import 'package:piccolo_os/shells/desktop/widgets/dock.dart';
+import 'package:piccolo_os/shells/desktop/widgets/stage.dart';
+import 'package:piccolo_os/shells/desktop/widgets/window_frame.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class DesktopShell extends StatefulWidget {
   const DesktopShell({super.key});
@@ -97,13 +97,13 @@ class _DesktopShellState extends State<DesktopShell> {
                   Positioned.fill(
                     child: GestureDetector(
                       onTap: _controller.toggleLauncher, // Close on tap outside
-                      child: Container(
+                      child: ColoredBox(
                         color: PiccoloTheme.scrim.withValues(alpha: 0.2),
                         child: const Center(
                           child: Card(
                             child: Padding(
-                              padding: EdgeInsets.all(32.0),
-                              child: Text("App Launcher Overlay"),
+                              padding: EdgeInsets.all(32),
+                              child: Text('App Launcher Overlay'),
                             ),
                           ),
                         ),

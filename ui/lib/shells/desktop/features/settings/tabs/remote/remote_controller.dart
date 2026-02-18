@@ -1,13 +1,19 @@
 import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/core/models/service_endpoint.dart';
-import 'package:piccolo_os/core/services/remote_service.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/event_stream_client.dart';
+import 'package:piccolo_os/core/services/remote_service.dart';
 
 class RemoteController extends ChangeNotifier {
+
+  RemoteController({EventStreamClient? eventStreamClient})
+      : _sharedEventStream = eventStreamClient {
+    _init();
+  }
   final RemoteService _service = RemoteService();
   bool _disposed = false;
   bool _isPolling = false;
@@ -38,13 +44,8 @@ class RemoteController extends ChangeNotifier {
   // Ephemeral configuration state for the wizard (not yet persisted to backend)
   final Map<String, dynamic> _pendingConfig = {};
 
-  RemoteController({EventStreamClient? eventStreamClient})
-      : _sharedEventStream = eventStreamClient {
-    _init();
-  }
-
   void _init() {
-    refresh();
+    unawaited(refresh());
     _connectEventStream();
   }
 
@@ -55,26 +56,26 @@ class RemoteController extends ChangeNotifier {
       client = _sharedEventStream;
     } else {
       _ownedEventStream = EventStreamClient();
-      client = _ownedEventStream!;
-      client.connect();
+      client = _ownedEventStream!
+        ..connect();
     }
 
     // Subscribe to remote config changes
     _remoteConfigSub = client.remoteConfigEvents.listen((_) {
-      if (!_disposed) _pollStatus();
+      if (!_disposed) unawaited(_pollStatus());
     });
 
     // Subscribe to certificate status changes
     _certificateSub = client.certificateEvents.listen((_) {
-      if (!_disposed) _pollStatus();
+      if (!_disposed) unawaited(_pollStatus());
     });
   }
 
   @override
   void dispose() {
     _disposed = true;
-    _remoteConfigSub?.cancel();
-    _certificateSub?.cancel();
+    unawaited(_remoteConfigSub?.cancel());
+    unawaited(_certificateSub?.cancel());
     // Only dispose the event stream if we own it
     _ownedEventStream?.dispose();
     super.dispose();
@@ -99,13 +100,13 @@ class RemoteController extends ChangeNotifier {
   Future<void> _pollStatus() async {
     if (_disposed || _isPolling) return;
     _isPolling = true;
-    
+
     try {
       status = await _service.getStatus();
       error = null;
       isLocked = false;
       await _fetchLists();
-    } catch (e) {
+    } on Object catch (e) {
       if (e is ApiException && e.statusCode == 423) {
         isLocked = true;
         error = null;
@@ -127,8 +128,8 @@ class RemoteController extends ChangeNotifier {
     try {
       aliases = await _service.getAliases();
       certificates = await _service.getCertificates();
-    } catch (e) {
-      debugPrint("Failed to fetch lists: $e");
+    } on Object catch (e) {
+      debugPrint('Failed to fetch lists: $e');
     }
   }
 
@@ -136,8 +137,8 @@ class RemoteController extends ChangeNotifier {
     if (_disposed) return;
     try {
       services = await _service.getServices();
-    } catch (e) {
-      debugPrint("Failed to fetch services: $e");
+    } on Object catch (e) {
+      debugPrint('Failed to fetch services: $e');
     }
   }
 
@@ -145,8 +146,8 @@ class RemoteController extends ChangeNotifier {
     if (_disposed) return;
     try {
       events = await _service.getEvents();
-    } catch (e) {
-      debugPrint("Failed to fetch remote events: $e");
+    } on Object catch (e) {
+      debugPrint('Failed to fetch remote events: $e');
     }
   }
 
@@ -166,9 +167,9 @@ class RemoteController extends ChangeNotifier {
       guideInfo = await _service.getNexusGuide();
       if (_disposed) return;
       notifyListeners();
-    } catch (e) {
+    } on Object catch (e) {
       if (_disposed) return;
-      error = "Failed to load Nexus guide: $e";
+      error = 'Failed to load Nexus guide: $e';
       notifyListeners();
     }
   }
@@ -190,9 +191,9 @@ class RemoteController extends ChangeNotifier {
 
       wizardStep = 1; // Move to preflight
       notifyListeners();
-    } catch (e) {
+    } on Object catch (e) {
       if (_disposed) return;
-      error = "Failed to verify guide: $e";
+      error = 'Failed to verify guide: $e';
       notifyListeners();
     }
   }
@@ -205,14 +206,14 @@ class RemoteController extends ChangeNotifier {
       // Otherwise (re-running on active) pass null/empty
       Map<String, dynamic>? configPayload;
       if (_pendingConfig.isNotEmpty && wizardStep > 0) {
-        configPayload = Map.from(_pendingConfig);
+        configPayload = Map<String, dynamic>.from(_pendingConfig);
       }
 
       preflightChecks = await _service.runPreflight(configPayload);
       if (_disposed) return;
-    } catch (e) {
+    } on Object catch (e) {
       if (_disposed) return;
-      error = "Preflight failed: $e";
+      error = 'Preflight failed: $e';
     } finally {
       if (!_disposed) {
         isRunningPreflight = false;
@@ -236,9 +237,9 @@ class RemoteController extends ChangeNotifier {
       await refresh();
       if (_disposed) return;
       wizardStep = 0;
-    } catch (e) {
+    } on Object catch (e) {
       if (_disposed) return;
-      error = "Configuration failed: $e";
+      error = 'Configuration failed: $e';
     } finally {
       if (!_disposed) {
         isSubmittingConfig = false;
@@ -255,9 +256,9 @@ class RemoteController extends ChangeNotifier {
       if (_disposed) return;
       wizardStep = 0;
       await refresh();
-    } catch (e) {
+    } on Object catch (e) {
       if (_disposed) return;
-      error = "Failed to disable remote access: $e";
+      error = 'Failed to disable remote access: $e';
       notifyListeners();
     }
   }
@@ -267,9 +268,9 @@ class RemoteController extends ChangeNotifier {
       final secret = await _service.rotateCredentials();
       if (_disposed) return null;
       return secret;
-    } catch (e) {
+    } on Object catch (e) {
       if (_disposed) return null;
-      error = "Failed to rotate credentials: $e";
+      error = 'Failed to rotate credentials: $e';
       notifyListeners();
       return null;
     }
@@ -280,9 +281,9 @@ class RemoteController extends ChangeNotifier {
       await _service.renewCertificate(id);
       if (_disposed) return;
       await refresh();
-    } catch (e) {
+    } on Object catch (e) {
       if (_disposed) return;
-      error = "Failed to renew certificate: $e";
+      error = 'Failed to renew certificate: $e';
       notifyListeners();
     }
   }
@@ -292,9 +293,9 @@ class RemoteController extends ChangeNotifier {
       await _service.addAlias(hostname, listener);
       if (_disposed) return;
       await refresh();
-    } catch (e) {
+    } on Object catch (e) {
       if (_disposed) return;
-      error = "Failed to add alias: $e";
+      error = 'Failed to add alias: $e';
       notifyListeners();
     }
   }
@@ -304,9 +305,9 @@ class RemoteController extends ChangeNotifier {
       await _service.removeAlias(id);
       if (_disposed) return;
       await refresh();
-    } catch (e) {
+    } on Object catch (e) {
       if (_disposed) return;
-      error = "Failed to delete alias: $e";
+      error = 'Failed to delete alias: $e';
       notifyListeners();
     }
   }

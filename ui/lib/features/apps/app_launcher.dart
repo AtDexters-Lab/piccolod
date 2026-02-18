@@ -1,13 +1,15 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/app_models.dart';
+import 'package:piccolo_os/core/models/listener_health.dart';
+import 'package:piccolo_os/core/services/app_service.dart';
+import 'package:piccolo_os/features/apps/app_detail_view.dart';
+import 'package:piccolo_os/features/apps/widgets/app_web_view.dart';
+import 'package:piccolo_os/features/apps/widgets/local_fallback_overlay.dart';
+import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:url_launcher/url_launcher.dart';
-import '../../core/models/app_models.dart';
-import '../../core/models/listener_health.dart';
-import '../../core/services/app_service.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../shells/desktop/desktop_controller.dart';
-import 'app_detail_view.dart';
-import 'widgets/app_web_view.dart';
-import 'widgets/local_fallback_overlay.dart';
 
 class AppLauncher {
   /// URL for embedding in an iframe. Prefers port-based (localUrl) on HTTP
@@ -114,7 +116,7 @@ class AppLauncher {
     // Health-gate remote access
     if (health == null) {
       // Unknown health -- fetch fresh data before deciding
-      _fetchAndGate(
+      unawaited(_fetchAndGate(
         context: context,
         controller: controller,
         appService: appService,
@@ -123,7 +125,7 @@ class AppLauncher {
         overrideUrl: overrideUrl,
         iconUrl: iconUrl,
         originalIconUrl: originalIconUrl,
-      );
+      ));
       return;
     }
 
@@ -151,7 +153,7 @@ class AppLauncher {
     String? originalIconUrl,
   }) async {
     // Show a brief loading dialog while we fetch health
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (_) => const AlertDialog(
@@ -163,7 +165,7 @@ class AppLauncher {
           ],
         ),
       ),
-    );
+    ));
 
     final navigator = Navigator.of(context);
 
@@ -180,7 +182,7 @@ class AppLauncher {
             service.lanHostUrl ??
             service.localUrl ??
             '';
-        showDialog(
+        unawaited(showDialog<void>(
           context: context,
           builder: (_) => LocalFallbackOverlay(
             health: const ListenerHealth(
@@ -190,7 +192,7 @@ class AppLauncher {
             appName: app.displayTitle,
             lanFallbackUrl: fallbackUrl,
           ),
-        );
+        ));
         return;
       }
 
@@ -205,7 +207,7 @@ class AppLauncher {
         iconUrl: iconUrl,
         originalIconUrl: originalIconUrl,
       );
-    } catch (_) {
+    } on Object catch (_) {
       if (navigator.canPop()) navigator.pop();
       if (!context.mounted) return;
       // On fetch failure, show overlay rather than risk TLS error
@@ -213,7 +215,7 @@ class AppLauncher {
           service.lanHostUrl ??
           service.localUrl ??
           '';
-      showDialog(
+      unawaited(showDialog<void>(
         context: context,
         builder: (_) => LocalFallbackOverlay(
           health: const ListenerHealth(
@@ -223,7 +225,7 @@ class AppLauncher {
           appName: app.displayTitle,
           lanFallbackUrl: fallbackUrl,
         ),
-      );
+      ));
     }
   }
 
@@ -255,7 +257,7 @@ class AppLauncher {
     // Recovering or error -- show fallback overlay
     final fallbackUrl =
         service.lanFallbackUrl ?? service.lanHostUrl ?? service.localUrl ?? '';
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       builder: (_) => LocalFallbackOverlay(
         health: health,
@@ -265,7 +267,7 @@ class AppLauncher {
         desktopController: controller,
         actionableCertId: _actionableCertId(health),
       ),
-    );
+    ));
   }
 
   static String? _actionableCertId(ListenerHealth health) {
@@ -291,22 +293,22 @@ class AppLauncher {
   }) {
     final iframeUrl = _iframeUrl(service, overrideUrl: overrideUrl);
     final browserUrl = _browserUrl(service) ?? iframeUrl;
-    final windowId = "app-window-${app.name}-${service.name}-$iframeUrl";
-    final title = "${app.displayTitle} (${service.name})";
+    final windowId = 'app-window-${app.name}-${service.name}-$iframeUrl';
+    final title = '${app.displayTitle} (${service.name})';
 
     if (iframeUrl == null || iframeUrl.isEmpty) {
       // Iframe embedding unavailable (e.g., mixed content on HTTPS portal).
       // Fall back to opening in a new browser tab if a URL exists.
       if (browserUrl != null && browserUrl.isNotEmpty) {
-        launchUrl(Uri.parse(browserUrl));
+        unawaited(launchUrl(Uri.parse(browserUrl)));
         return;
       }
       // No URL available at all
       controller.openApp(
         windowId,
-        "Launch failed",
+        'Launch failed',
         PiccoloIcons.error,
-        const Center(child: Text("No URL available to launch the app.")),
+        const Center(child: Text('No URL available to launch the app.')),
       );
       return;
     }
@@ -323,15 +325,15 @@ class AppLauncher {
       actions: [
         IconButton(
           icon: const Icon(PiccoloIcons.openExternal, size: 20),
-          tooltip: "Open in Browser",
+          tooltip: 'Open in Browser',
           onPressed: () => launchUrl(Uri.parse(browserUrl!)),
         ),
         IconButton(
           icon: const Icon(PiccoloIcons.settings, size: 20),
-          tooltip: "Settings",
+          tooltip: 'Settings',
           onPressed: () {
             // Check if settings window is already open, if so focus it
-            final settingsId = "app-detail-${app.name}";
+            final settingsId = 'app-detail-${app.name}';
             if (controller.isAppOpen(settingsId)) {
               controller.focusWindow(settingsId);
             } else {

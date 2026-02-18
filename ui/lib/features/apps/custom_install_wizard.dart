@@ -1,21 +1,21 @@
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_theme.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../core/services/app_service.dart';
-import '../../core/utils/task_id.dart';
-import '../../shared/widgets/task_progress_panel.dart';
+import 'package:piccolo_os/core/models/task_progress.dart';
+import 'package:piccolo_os/core/services/app_service.dart';
+import 'package:piccolo_os/core/utils/task_id.dart';
+import 'package:piccolo_os/shared/widgets/task_progress_panel.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class CustomInstallWizard extends StatefulWidget {
-  final AppService appService;
-  final String? initialYaml;
-  final Function(String appName)? onSuccess;
 
   const CustomInstallWizard({
-    super.key,
-    required this.appService,
+    required this.appService, super.key,
     this.initialYaml,
     this.onSuccess,
   });
+  final AppService appService;
+  final String? initialYaml;
+  final void Function(String appName)? onSuccess;
 
   @override
   State<CustomInstallWizard> createState() => _CustomInstallWizardState();
@@ -44,7 +44,7 @@ class _CustomInstallWizardState extends State<CustomInstallWizard> {
 
   // RFC 20260130: use __primary marker for primary listener
   // The __primary marker will be substituted with the __app_address__ input during installation
-  static const String _defaultTemplate = '''
+  static const String _defaultTemplate = r'''
 type: user
 inputs:
   __app_address__:
@@ -52,7 +52,7 @@ inputs:
     label: "App Address"
     required: true
     validation:
-      regex: "^[a-z][a-z0-9]{0,15}\$"
+      regex: "^[a-z][a-z0-9]{0,15}$"
       message: "Lowercase letters and numbers only; max 16 chars"
 listeners:
   - name: __primary
@@ -100,33 +100,36 @@ x-piccolo:
     });
 
     try {
-      final app = await widget.appService.installAppWithInputs(
+      await widget.appService.initiateInstall(
         _yamlController.text,
         <String, dynamic>{},
         taskId: taskId,
       );
-
-      if (mounted) {
-        widget.onSuccess?.call(app.name);
-
-        // If no callback provided (fallback), show snackbar
-        if (widget.onSuccess == null) {
-           Navigator.of(context).pop();
-           ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text("App installation started.")),
-           );
-        }
-      }
-    } catch (e) {
+    } on Object catch (e) {
       if (mounted) {
         setState(() {
           _isInstalling = false;
           _taskId = null;
-          _validationError = "Install failed: $e";
-          _currentStep = 0; // Go back to edit
+          _validationError = 'Install failed: $e';
+          _currentStep = 0;
         });
       }
     }
+  }
+
+  void _onInstallComplete(TaskProgressEvent event) {
+    if (!mounted) return;
+    if (event.error != null && event.error!.isNotEmpty) {
+      setState(() {
+        _isInstalling = false;
+        _taskId = null;
+        _validationError = 'Install failed: ${event.error}';
+        _currentStep = 0;
+      });
+      return;
+    }
+    final appName = event.instanceId ?? '';
+    widget.onSuccess?.call(appName.isNotEmpty ? appName : 'app');
   }
 
   @override
@@ -157,11 +160,11 @@ x-piccolo:
                        crossAxisAlignment: CrossAxisAlignment.start,
                        children: [
                          Text(
-                           "Install App",
+                           'Install App',
                            style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold),
                          ),
                          Text(
-                           _currentStep == 0 ? "Step 1: Define Manifest" : "Step 2: Review & Install",
+                           _currentStep == 0 ? 'Step 1: Define Manifest' : 'Step 2: Review & Install',
                            style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
                          ),
                        ],
@@ -183,6 +186,7 @@ x-piccolo:
                       child: TaskProgressPanel(
                         taskId: _taskId!,
                         taskType: 'install_app',
+                        onComplete: _onInstallComplete,
                       ),
                     )
                   : _currentStep == 0
@@ -202,7 +206,7 @@ x-piccolo:
                   if (_currentStep == 1)
                     TextButton(
                       onPressed: _isInstalling ? null : () => setState(() => _currentStep = 0),
-                      child: const Text("Back"),
+                      child: const Text('Back'),
                     ),
                   const SizedBox(width: Spacing.base),
                   if (_currentStep == 0)
@@ -210,7 +214,7 @@ x-piccolo:
                       onPressed: _isValidating ? null : _validate,
                       child: _isValidating
                         ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                        : const Text("Validate & Next"),
+                        : const Text('Validate & Next'),
                     )
                   else
                      FilledButton(
@@ -220,7 +224,7 @@ x-piccolo:
                       ),
                       child: _isInstalling
                         ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                        : const Text("Install App"),
+                        : const Text('Install App'),
                     ),
                 ],
               ),
@@ -285,21 +289,21 @@ x-piccolo:
           const Icon(PiccoloIcons.success, color: PiccoloTheme.success, size: 64),
           const SizedBox(height: Spacing.base),
           Text(
-            "Manifest Validated",
+            'Manifest Validated',
             style: PiccoloTheme.textTheme.displayLarge?.copyWith(fontSize: 24),
           ),
           const SizedBox(height: Spacing.base),
           const Text(
-            "Your app definition is valid syntax. Proceeding with installation will:",
+            'Your app definition is valid syntax. Proceeding with installation will:',
           ),
           const SizedBox(height: Spacing.lg),
-          _buildInfoRow(PiccoloIcons.download, "Pull container image (if not present)"),
+          _buildInfoRow(PiccoloIcons.download, 'Pull container image (if not present)'),
           const SizedBox(height: Spacing.md),
-          _buildInfoRow(PiccoloIcons.storage, "Create persistent storage volumes"),
+          _buildInfoRow(PiccoloIcons.storage, 'Create persistent storage volumes'),
           const SizedBox(height: Spacing.md),
-          _buildInfoRow(PiccoloIcons.router, "Configure network listeners and ports"),
+          _buildInfoRow(PiccoloIcons.router, 'Configure network listeners and ports'),
           const SizedBox(height: Spacing.md),
-          _buildInfoRow(PiccoloIcons.security, "Apply permissions as defined in manifest"),
+          _buildInfoRow(PiccoloIcons.security, 'Apply permissions as defined in manifest'),
 
           const Spacer(),
           Container(
@@ -313,7 +317,7 @@ x-piccolo:
                children: [
                  Icon(PiccoloIcons.info, color: PiccoloTheme.inkMuted),
                  SizedBox(width: Spacing.md),
-                 Expanded(child: Text("Preflight checks passed: Ports available, Disk space adequate.")),
+                 Expanded(child: Text('Preflight checks passed: Ports available, Disk space adequate.')),
                ],
              ),
           ),

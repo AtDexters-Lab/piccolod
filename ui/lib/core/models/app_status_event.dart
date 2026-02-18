@@ -1,10 +1,5 @@
 /// Event emitted when an app's status changes.
 class AppStatusEvent {
-  final String app;
-  final String status;
-  final String? prevStatus;
-  final String? message;
-  final String? timestamp;
 
   const AppStatusEvent({
     required this.app,
@@ -23,6 +18,11 @@ class AppStatusEvent {
       timestamp: json['timestamp']?.toString(),
     );
   }
+  final String app;
+  final String status;
+  final String? prevStatus;
+  final String? message;
+  final String? timestamp;
 
   /// Status values
   static const statusInstalled = 'installed';

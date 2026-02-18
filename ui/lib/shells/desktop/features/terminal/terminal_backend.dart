@@ -1,23 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:piccolo_os/core/services/websocket_connection.dart';
 import 'package:xterm/xterm.dart';
 
-import '../../../../core/services/websocket_connection.dart';
-
 class PiccoloTerminalBackend {
-  final Terminal terminal;
-  final String url;
-  final void Function()? onSessionEnd;
-
-  late final WebSocketConnection _connection;
-  late final void Function() _connectionListener;
-
-  StreamSubscription? _subscription;
-  Timer? _resizeDebounce;
-
-  WebSocketConnectionState _lastState = WebSocketConnectionState.disconnected;
-  String? _lastErrorShown;
 
   PiccoloTerminalBackend(this.terminal, this.url, {this.onSessionEnd}) {
     _connection = WebSocketConnection(
@@ -32,6 +19,18 @@ class PiccoloTerminalBackend {
     _connectionListener = _handleConnectionUpdate;
     _connection.addListener(_connectionListener);
   }
+  final Terminal terminal;
+  final String url;
+  final void Function()? onSessionEnd;
+
+  late final WebSocketConnection _connection;
+  late final void Function() _connectionListener;
+
+  StreamSubscription<dynamic>? _subscription;
+  Timer? _resizeDebounce;
+
+  WebSocketConnectionState _lastState = WebSocketConnectionState.disconnected;
+  String? _lastErrorShown;
 
   void init() {
     _subscription = _connection.messages.listen(_handleMessage);
@@ -71,7 +70,7 @@ class PiccoloTerminalBackend {
     if (message is! String) return;
 
     try {
-      final Map<String, dynamic> payload = jsonDecode(message);
+      final payload = jsonDecode(message) as Map<String, dynamic>;
       final type = payload['type'];
 
       if (type == 'stdout') {
@@ -80,7 +79,7 @@ class PiccoloTerminalBackend {
         final text = utf8.decode(bytes);
         terminal.write(text);
       }
-    } catch (_) {
+    } on Object catch (_) {
       // Ignore malformed messages to avoid spamming the terminal.
     }
   }
@@ -111,11 +110,11 @@ class PiccoloTerminalBackend {
 
   void dispose() {
     _resizeDebounce?.cancel();
-    _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
 
-    _connection.removeListener(_connectionListener);
-    _connection.dispose();
+    _connection
+      ..removeListener(_connectionListener)
+      ..dispose();
   }
 }
-

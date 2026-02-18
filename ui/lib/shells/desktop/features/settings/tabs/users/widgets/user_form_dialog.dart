@@ -5,6 +5,11 @@ import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Dialog for creating or editing a user.
 class UserFormDialog extends StatefulWidget {
+
+  const UserFormDialog({
+    required this.onSave, super.key,
+    this.user,
+  });
   final User? user;
   final Future<void> Function(
     String username,
@@ -13,12 +18,6 @@ class UserFormDialog extends StatefulWidget {
     String role,
     List<String> allowedApps,
   ) onSave;
-
-  const UserFormDialog({
-    super.key,
-    this.user,
-    required this.onSave,
-  });
 
   @override
   State<UserFormDialog> createState() => _UserFormDialogState();
@@ -275,7 +274,7 @@ class _UserFormDialogState extends State<UserFormDialog> {
       if (mounted) {
         Navigator.of(context).pop();
       }
-    } catch (e) {
+    } on Object catch (e) {
       if (mounted) {
         setState(() {
           _error = e.toString();

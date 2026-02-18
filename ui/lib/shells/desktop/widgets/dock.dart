@@ -1,26 +1,25 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/listener_health.dart';
+import 'package:piccolo_os/core/models/network_models.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
+import 'package:piccolo_os/core/services/network_service.dart';
+import 'package:piccolo_os/core/services/websocket_connection.dart';
+import 'package:piccolo_os/shared/widgets/app_icon.dart';
+import 'package:piccolo_os/shared/widgets/status_dot.dart';
+import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/terminal/terminal_view.dart';
+import 'package:piccolo_os/shells/desktop/models/desktop_window.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:pointer_interceptor/pointer_interceptor.dart';
 import 'package:url_launcher/url_launcher.dart';
-import '../../../core/models/listener_health.dart';
-import '../../../core/models/network_models.dart';
-import '../../../core/services/api_client.dart';
-import '../../../core/services/network_service.dart';
-import '../../../core/services/websocket_connection.dart';
-import '../../../shared/widgets/app_icon.dart';
-import '../../../shared/widgets/status_dot.dart';
-import '../../../theme/piccolo_icons.dart';
-import '../../../theme/piccolo_theme.dart';
-import '../desktop_controller.dart';
-import '../models/desktop_window.dart';
-
-import '../features/terminal/terminal_view.dart';
 
 class Dock extends StatelessWidget {
-  final DesktopController controller;
 
-  const Dock({super.key, required this.controller});
+  const Dock({required this.controller, super.key});
+  final DesktopController controller;
 
   // IDs of pinned apps that shouldn't appear in running windows section
   static const Set<String> _pinnedAppIds = {'app-store', 'settings', 'terminal'};
@@ -55,7 +54,7 @@ class Dock extends StatelessWidget {
             // Home button
             DockItem(
               icon: PiccoloIcons.home,
-              label: "Home",
+              label: 'Home',
               onTap: controller.minimizeAllWindows,
             ),
             const SizedBox(width: Spacing.md),
@@ -74,31 +73,31 @@ class Dock extends StatelessWidget {
             // Pinned apps
             DockItem(
               icon: PiccoloIcons.store,
-              label: "App Store",
-              isActive: controller.isAppActive("app-store"),
-              isOpen: controller.isAppOpen("app-store"),
-              onTap: () => controller.openAppStore(),
+              label: 'App Store',
+              isActive: controller.isAppActive('app-store'),
+              isOpen: controller.isAppOpen('app-store'),
+              onTap: controller.openAppStore,
             ),
             const SizedBox(width: Spacing.md),
             DockItem(
               icon: PiccoloIcons.settings,
-              label: "Settings",
-              isOpen: controller.isAppOpen("settings"),
-              isActive: controller.isAppActive("settings"),
+              label: 'Settings',
+              isOpen: controller.isAppOpen('settings'),
+              isActive: controller.isAppActive('settings'),
               onTap: controller.openSettings,
             ),
             const SizedBox(width: Spacing.md),
             DockItem(
               icon: PiccoloIcons.terminal,
-              label: "Terminal",
-              isOpen: controller.isAppOpen("terminal"),
-              isActive: controller.isAppActive("terminal"),
+              label: 'Terminal',
+              isOpen: controller.isAppOpen('terminal'),
+              isActive: controller.isAppActive('terminal'),
               onTap: () => controller.openApp(
-                "terminal",
-                "Terminal",
+                'terminal',
+                'Terminal',
                 PiccoloIcons.terminal,
                 TerminalApp(
-                  onSessionEnd: () => controller.closeWindow("terminal"),
+                  onSessionEnd: () => controller.closeWindow('terminal'),
                 ),
                 screenSize: screenSize,
                 initialSize: const Size(850, 550),
@@ -142,9 +141,9 @@ class Dock extends StatelessWidget {
 }
 
 class _HealthIndicator extends StatefulWidget {
-  final DesktopController controller;
 
   const _HealthIndicator({required this.controller});
+  final DesktopController controller;
 
   @override
   State<_HealthIndicator> createState() => _HealthIndicatorState();
@@ -197,7 +196,7 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   }
 
   void _unsubscribeFromClient() {
-    _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
     widget.controller.eventStreamClient?.removeListener(_onClientStateChanged);
   }
@@ -251,9 +250,9 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   String get _aggregateStatus {
     if (_healthMap.isEmpty) return 'ok';
 
-    bool hasError = false;
-    bool hasDegraded = false;
-    bool hasRecovering = false;
+    var hasError = false;
+    var hasDegraded = false;
+    var hasRecovering = false;
 
     for (final health in _healthMap.values) {
       if (health.isError) hasError = true;
@@ -336,15 +335,15 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
 }
 
 class _RunningWindowItem extends StatelessWidget {
-  final DesktopWindow window;
-  final bool isActive;
-  final VoidCallback onTap;
 
   const _RunningWindowItem({
     required this.window,
     required this.isActive,
     required this.onTap,
   });
+  final DesktopWindow window;
+  final bool isActive;
+  final VoidCallback onTap;
 
   Widget _buildIcon(Color color) {
     if (window.iconUrl != null && window.iconUrl!.isNotEmpty) {
@@ -401,22 +400,22 @@ class _RunningWindowItem extends StatelessWidget {
 }
 
 class _ProfileButton extends StatelessWidget {
-  final VoidCallback onLogout;
 
   const _ProfileButton({required this.onLogout});
+  final VoidCallback onLogout;
 
   @override
   Widget build(BuildContext context) {
     return PopupMenuButton<String>(
       offset: const Offset(0, -60),
       itemBuilder: (context) => [
-        PopupMenuItem(
+        const PopupMenuItem(
           value: 'logout',
           child: Row(
             children: [
               Icon(PiccoloIcons.logout, size: 18, color: PiccoloTheme.ink),
-              const SizedBox(width: Spacing.md),
-              const Text("Log Out"),
+              SizedBox(width: Spacing.md),
+              Text('Log Out'),
             ],
           ),
         ),
@@ -427,14 +426,14 @@ class _ProfileButton extends StatelessWidget {
         }
       },
       child: Tooltip(
-        message: "Profile",
+        message: 'Profile',
         child: Container(
           padding: const EdgeInsets.all(6),
           decoration: BoxDecoration(
             color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
             borderRadius: BorderRadius.circular(Radii.md),
           ),
-          child: CircleAvatar(
+          child: const CircleAvatar(
             radius: 14,
             backgroundColor: PiccoloTheme.cobalt600,
             child: Icon(
@@ -450,20 +449,18 @@ class _ProfileButton extends StatelessWidget {
 }
 
 class DockItem extends StatelessWidget {
+
+  const DockItem({
+    required this.icon, required this.label, super.key,
+    this.isOpen = false,
+    this.isActive = false,
+    this.onTap,
+  });
   final IconData icon;
   final String label;
   final bool isOpen;
   final bool isActive;
   final VoidCallback? onTap;
-
-  const DockItem({
-    super.key,
-    required this.icon,
-    required this.label,
-    this.isOpen = false,
-    this.isActive = false,
-    this.onTap,
-  });
 
   @override
   Widget build(BuildContext context) {
@@ -519,8 +516,8 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
   @override
   void initState() {
     super.initState();
-    _fetchPeers();
-    _pollTimer = Timer.periodic(const Duration(seconds: 30), (_) => _fetchPeers());
+    unawaited(_fetchPeers());
+    _pollTimer = Timer.periodic(const Duration(seconds: 30), (_) => unawaited(_fetchPeers()));
   }
 
   @override
@@ -541,7 +538,7 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
           _isLoading = false;
         });
       }
-    } catch (e) {
+    } on Object catch (_) {
       if (mounted) {
         setState(() {
           _isLoading = false;
@@ -567,13 +564,13 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
 
     return PopupMenuButton<DiscoveredPeer>(
       offset: const Offset(0, -80),
-      tooltip: "Other Piccolo devices on your network",
+      tooltip: 'Other Piccolo devices on your network',
       onSelected: (peer) => _openPeerUrl(peer.url),
       itemBuilder: (context) => [
-        PopupMenuItem(
+        const PopupMenuItem(
           enabled: false,
           child: Text(
-            "Other Piccolo Devices",
+            'Other Piccolo Devices',
             style: TextStyle(
               fontWeight: FontWeight.w600,
               color: PiccoloTheme.ink,
@@ -623,7 +620,7 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
+            const Icon(
               PiccoloIcons.devices,
               size: 16,
               color: PiccoloTheme.cobalt600,

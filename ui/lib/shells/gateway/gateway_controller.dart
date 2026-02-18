@@ -1,10 +1,10 @@
 import 'dart:js_interop';
 
 import 'package:flutter/foundation.dart';
+import 'package:piccolo_os/core/models/network_models.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
+import 'package:piccolo_os/core/services/network_service.dart';
 import 'package:web/web.dart' as web;
-import '../../core/models/network_models.dart';
-import '../../core/services/api_client.dart';
-import '../../core/services/network_service.dart';
 
 /// Controller for the gateway shell that handles device discovery and navigation.
 ///
@@ -12,6 +12,9 @@ import '../../core/services/network_service.dart';
 /// is the gateway leader. It displays a device selector for multi-device LANs
 /// or auto-redirects for single-device LANs.
 class GatewayController extends ChangeNotifier {
+
+  GatewayController({NetworkService? networkService})
+      : _networkService = networkService ?? NetworkService(ApiClient());
   final NetworkService _networkService;
 
   List<DiscoveredPeer> _peers = [];
@@ -19,9 +22,6 @@ class GatewayController extends ChangeNotifier {
   bool _isLoading = true;
   String? _error;
   bool _redirecting = false;
-
-  GatewayController({NetworkService? networkService})
-      : _networkService = networkService ?? NetworkService(ApiClient());
 
   List<DiscoveredPeer> get peers => _peers;
   NetworkSelf? get self => _self;
@@ -56,7 +56,7 @@ class GatewayController extends ChangeNotifier {
 
       _isLoading = false;
       notifyListeners();
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('GatewayController.initialize error: $e');
       _error = 'Could not discover devices';
       _isLoading = false;
@@ -115,7 +115,7 @@ class GatewayController extends ChangeNotifier {
       // In no-cors mode, a successful response has type "opaque" with status 0.
       // Any non-throwing result means TLS succeeded (CA is trusted).
       return response.type == 'opaque' || response.ok;
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('GatewayController._probeHttps failed for $hostname: $e');
       return false;
     }

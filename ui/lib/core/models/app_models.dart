@@ -1,28 +1,14 @@
-import 'app_status_event.dart';
-import 'listener_health.dart';
+import 'package:piccolo_os/core/models/app_status_event.dart';
+import 'package:piccolo_os/core/models/listener_health.dart';
 
 class App {
-  final String id;
-  final String name;
-  final String image;
-  final String type;
-  final String mode;
-  final String status;
-  final List<AppVolume> volumes;
-  final Map<String, String> environment;
-  final String? containerId;
-  final Map<String, dynamic> definition;
-  final ListenerHealth? primaryListenerHealth;
-  final String catalogSource; // Tracks which catalog item this app was installed from
-  final String statusMessage; // Transient status context (e.g., "Re-pulling base image")
 
   App({
     required this.id,
     required this.name,
     required this.image,
     required this.type,
-    this.mode = '',
-    required this.status,
+    required this.status, this.mode = '',
     this.statusMessage = '',
     this.volumes = const [],
     this.environment = const {},
@@ -43,32 +29,36 @@ class App {
         : <String, dynamic>{};
 
     // Image, type, environment come from definition (fallback to primary service)
-    final services = def['services'] is Map ? Map.from(def['services']) : null;
-    String primaryService = (def['primary_service'] ?? '').toString();
+    final rawServices = def['services'];
+    final services = rawServices is Map
+        ? Map<String, dynamic>.from(rawServices)
+        : null;
+    var primaryService = (def['primary_service'] ?? '').toString();
     if (primaryService.isEmpty) {
       primaryService = 'main';
     }
-    Map? primarySvc;
+    Map<String, dynamic>? primarySvc;
     if (services != null) {
       final svc = services[primaryService];
       if (svc is Map) {
-        primarySvc = svc;
+        primarySvc = Map<String, dynamic>.from(svc);
       } else if (services.length == 1) {
         final only = services.values.first;
         if (only is Map) {
-          primarySvc = only;
+          primarySvc = Map<String, dynamic>.from(only);
         }
       }
     }
 
-    String image = (def['image'] ?? json['image'] ?? '').toString();
+    var image = (def['image'] ?? json['image'] ?? '').toString();
     if (image.isEmpty && primarySvc != null) {
       image = (primarySvc['image'] ?? '').toString();
     }
     final type = (def['type'] ?? json['type'] ?? 'user').toString();
-    Map<String, String> environment = Map<String, String>.from(
-      def['environment'] ?? json['environment'] ?? {},
-    );
+    final rawEnvSource = def['environment'] ?? json['environment'];
+    var environment = rawEnvSource is Map
+        ? rawEnvSource.map((k, v) => MapEntry(k.toString(), v.toString()))
+        : <String, String>{};
     if (environment.isEmpty && primarySvc != null) {
       final rawEnv = primarySvc['environment'];
       if (rawEnv is Map) {
@@ -77,8 +67,11 @@ class App {
     }
 
     // Mode comes from x-piccolo extensions in definition
-    String mode = '';
-    final extensions = def['x-piccolo'] as Map<String, dynamic>?;
+    var mode = '';
+    final rawExtensions = def['x-piccolo'];
+    final extensions = rawExtensions is Map
+        ? Map<String, dynamic>.from(rawExtensions)
+        : null;
     if (extensions != null) {
       mode = (extensions['mode'] ?? '').toString();
     } else {
@@ -87,17 +80,25 @@ class App {
     }
 
     // Volumes come from definition.storage.volumes
-    List<AppVolume> volumes = [];
-    final storage = def['storage'] as Map<String, dynamic>?;
+    var volumes = <AppVolume>[];
+    final rawStorage = def['storage'];
+    final storage = rawStorage is Map
+        ? Map<String, dynamic>.from(rawStorage)
+        : null;
     if (storage != null) {
-      final volumeList = storage['volumes'] as List<dynamic>?;
+      final rawVolumeList = storage['volumes'];
+      final volumeList = rawVolumeList is List<dynamic> ? rawVolumeList : null;
       if (volumeList != null) {
-        volumes = volumeList.map((e) => AppVolume.fromJson(e)).toList();
+        volumes = volumeList
+            .whereType<Map<dynamic, dynamic>>()
+            .map((e) => AppVolume.fromJson(Map<String, dynamic>.from(e)))
+            .toList();
       }
-    } else if (json['volumes'] != null) {
+    } else if (json['volumes'] is List<dynamic>) {
       // Fallback for backward compatibility
       volumes = (json['volumes'] as List<dynamic>)
-          .map((e) => AppVolume.fromJson(e))
+          .whereType<Map<dynamic, dynamic>>()
+          .map((e) => AppVolume.fromJson(Map<String, dynamic>.from(e)))
           .toList();
     }
 
@@ -115,16 +116,29 @@ class App {
       image: image,
       type: type,
       mode: mode,
-      status: json['status'] ?? 'unknown',
+      status: (json['status'] as String?) ?? 'unknown',
       statusMessage: (json['status_message'] ?? '').toString(),
       volumes: volumes,
       environment: environment,
-      containerId: json['container_id'],
+      containerId: json['container_id'] as String?,
       definition: def,
       primaryListenerHealth: primaryHealth,
       catalogSource: catalogSource,
     );
   }
+  final String id;
+  final String name;
+  final String image;
+  final String type;
+  final String mode;
+  final String status;
+  final List<AppVolume> volumes;
+  final Map<String, String> environment;
+  final String? containerId;
+  final Map<String, dynamic> definition;
+  final ListenerHealth? primaryListenerHealth;
+  final String catalogSource; // Tracks which catalog item this app was installed from
+  final String statusMessage; // Transient status context (e.g., "Re-pulling base image")
 
   bool get isRunning => status.toLowerCase() == AppStatusEvent.statusRunning;
   bool get isStopped =>
@@ -175,21 +189,18 @@ class App {
 }
 
 class AppDetail {
-  final App app;
-  final List<ServiceEndpoint> listeners;
-  final List<AppContainerStatus> containers;
 
   const AppDetail({
     required this.app,
     this.listeners = const [],
     this.containers = const [],
   });
+  final App app;
+  final List<ServiceEndpoint> listeners;
+  final List<AppContainerStatus> containers;
 }
 
 class AppContainerStatus {
-  final String service;
-  final String containerId;
-  final bool running;
 
   const AppContainerStatus({
     required this.service,
@@ -204,12 +215,12 @@ class AppContainerStatus {
       running: json['running'] == true,
     );
   }
+  final String service;
+  final String containerId;
+  final bool running;
 }
 
 class AppVolume {
-  final String containerPath;
-  final String hostPath;
-  final String sizeLimit;
 
   AppVolume({
     required this.containerPath,
@@ -219,20 +230,17 @@ class AppVolume {
 
   factory AppVolume.fromJson(Map<String, dynamic> json) {
     return AppVolume(
-      containerPath: json['container'] ?? '',
-      hostPath: json['host'] ?? '',
-      sizeLimit: json['size_limit'] ?? '',
+      containerPath: (json['container'] as String?) ?? '',
+      hostPath: (json['host'] as String?) ?? '',
+      sizeLimit: (json['size_limit'] as String?) ?? '',
     );
   }
+  final String containerPath;
+  final String hostPath;
+  final String sizeLimit;
 }
 
 class AppListener {
-  final String name;
-  final int guestPort;
-  final String flow;
-  final String protocol;
-  final List<int> remotePorts;
-  final List<dynamic> middleware;
 
   AppListener({
     required this.name,
@@ -253,6 +261,12 @@ class AppListener {
       middleware: ep.middleware,
     );
   }
+  final String name;
+  final int guestPort;
+  final String flow;
+  final String protocol;
+  final List<int> remotePorts;
+  final List<dynamic> middleware;
 
   Map<String, dynamic> toJson() {
     return {
@@ -267,6 +281,51 @@ class AppListener {
 }
 
 class ServiceEndpoint {
+
+  ServiceEndpoint({
+    required this.app,
+    required this.name,
+    required this.guestPort,
+    required this.hostPort,
+    required this.publicPort,
+    required this.flow, required this.protocol, this.remotePorts = const [],
+    this.remoteHost,
+    this.localUrl,
+    this.lanHostUrl,
+    this.lanFallbackUrl,
+    this.lanPortUrl,
+    this.primary = false,
+    this.health,
+    this.middleware = const [],
+  });
+
+  factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
+    final rawHealth = json['health'];
+    final endpointHealth = rawHealth is Map
+        ? ListenerHealth.fromJson(Map<String, dynamic>.from(rawHealth))
+        : null;
+
+    return ServiceEndpoint(
+      app: (json['app'] as String?) ?? '',
+      name: (json['name'] as String?) ?? '',
+      guestPort: (json['guest_port'] as int?) ?? 0,
+      hostPort: (json['host_port'] as int?) ?? 0,
+      publicPort: (json['public_port'] as int?) ?? 0,
+      remotePorts: json['remote_ports'] is List
+          ? (json['remote_ports'] as List).whereType<int>().toList()
+          : [],
+      remoteHost: json['remote_host'] as String?,
+      flow: (json['flow'] as String?) ?? 'tcp',
+      protocol: (json['protocol'] as String?) ?? 'raw',
+      localUrl: json['local_url'] as String?,
+      lanHostUrl: json['lan_host_url'] as String?,
+      lanFallbackUrl: json['lan_fallback_url'] as String?,
+      lanPortUrl: json['lan_port_url'] as String?,
+      primary: json['primary'] == true,
+      health: endpointHealth,
+      middleware: (json['middleware'] as List<dynamic>?) ?? [],
+    );
+  }
   final String app;
   final String name;
   final int guestPort;
@@ -284,51 +343,6 @@ class ServiceEndpoint {
   final ListenerHealth? health;
   final List<dynamic> middleware;
 
-  ServiceEndpoint({
-    required this.app,
-    required this.name,
-    required this.guestPort,
-    required this.hostPort,
-    required this.publicPort,
-    this.remotePorts = const [],
-    this.remoteHost,
-    required this.flow,
-    required this.protocol,
-    this.localUrl,
-    this.lanHostUrl,
-    this.lanFallbackUrl,
-    this.lanPortUrl,
-    this.primary = false,
-    this.health,
-    this.middleware = const [],
-  });
-
-  factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
-    final rawHealth = json['health'];
-    final endpointHealth = rawHealth is Map
-        ? ListenerHealth.fromJson(Map<String, dynamic>.from(rawHealth))
-        : null;
-
-    return ServiceEndpoint(
-      app: json['app'] ?? '',
-      name: json['name'] ?? '',
-      guestPort: json['guest_port'] ?? 0,
-      hostPort: json['host_port'] ?? 0,
-      publicPort: json['public_port'] ?? 0,
-      remotePorts: (json['remote_ports'] as List<dynamic>?)?.cast<int>() ?? [],
-      remoteHost: json['remote_host'],
-      flow: json['flow'] ?? 'tcp',
-      protocol: json['protocol'] ?? 'raw',
-      localUrl: json['local_url'],
-      lanHostUrl: json['lan_host_url'],
-      lanFallbackUrl: json['lan_fallback_url'],
-      lanPortUrl: json['lan_port_url'],
-      primary: json['primary'] == true,
-      health: endpointHealth,
-      middleware: json['middleware'] ?? [],
-    );
-  }
-
   // Helper to get the Remote URL (if enabled)
   String? get remoteUrl {
     if (remoteHost == null || remoteHost!.isEmpty) return null;
@@ -337,16 +351,6 @@ class ServiceEndpoint {
 }
 
 class CatalogItem {
-  final String name;
-  final String description;
-  final String? icon;
-  final String version;
-  final String category;
-  final String? compatibility;
-  final String? maintainer;
-  final List<String> tags;
-  final String? sourceUrl;
-  final String? template; // Optional inline YAML snippet
 
   CatalogItem({
     required this.name,
@@ -363,26 +367,31 @@ class CatalogItem {
 
   factory CatalogItem.fromJson(Map<String, dynamic> json) {
     return CatalogItem(
-      name: json['name'] ?? '',
-      description: json['description'] ?? '',
-      icon: json['icon'],
-      version: json['version'] ?? '',
-      category: json['category'] ?? 'Uncategorized',
-      compatibility: json['compatibility'],
-      maintainer: json['maintainer'],
-      tags: (json['tags'] as List<dynamic>?)?.cast<String>() ?? [],
-      sourceUrl: json['source_url'],
-      template: json['template'],
+      name: (json['name'] as String?) ?? '',
+      description: (json['description'] as String?) ?? '',
+      icon: json['icon'] as String?,
+      version: (json['version'] as String?) ?? '',
+      category: (json['category'] as String?) ?? 'Uncategorized',
+      compatibility: json['compatibility'] as String?,
+      maintainer: json['maintainer'] as String?,
+      tags: (json['tags'] as List<dynamic>?)?.whereType<String>().toList() ?? [],
+      sourceUrl: json['source_url'] as String?,
+      template: json['template'] as String?,
     );
   }
+  final String name;
+  final String description;
+  final String? icon;
+  final String version;
+  final String category;
+  final String? compatibility;
+  final String? maintainer;
+  final List<String> tags;
+  final String? sourceUrl;
+  final String? template; // Optional inline YAML snippet
 }
 
 class CatalogResponse {
-  final List<CatalogItem> apps;
-  final int page;
-  final int pageSize;
-  final int total;
-  final int totalPages;
 
   CatalogResponse({
     required this.apps,
@@ -396,20 +405,24 @@ class CatalogResponse {
     return CatalogResponse(
       apps:
           (json['apps'] as List<dynamic>?)
-              ?.map((e) => CatalogItem.fromJson(e))
+              ?.whereType<Map<dynamic, dynamic>>()
+              .map((e) => CatalogItem.fromJson(Map<String, dynamic>.from(e)))
               .toList() ??
           [],
-      page: json['page'] ?? 1,
-      pageSize: json['page_size'] ?? 20,
-      total: json['total'] ?? 0,
-      totalPages: json['total_pages'] ?? 0,
+      page: (json['page'] as int?) ?? 1,
+      pageSize: (json['page_size'] as int?) ?? 20,
+      total: (json['total'] as int?) ?? 0,
+      totalPages: (json['total_pages'] as int?) ?? 0,
     );
   }
+  final List<CatalogItem> apps;
+  final int page;
+  final int pageSize;
+  final int total;
+  final int totalPages;
 }
 
 class AppValidationResult {
-  final bool valid;
-  final String? error;
 
   AppValidationResult({required this.valid, this.error});
 
@@ -417,20 +430,17 @@ class AppValidationResult {
     // Some validation endpoints might return a 400 with 'error' field in body
     // or 200 with { "valid": true/false }
     return AppValidationResult(
-      valid: json['valid'] ?? false,
+      valid: (json['valid'] as bool?) ?? false,
       error:
-          json['error'], // If backend returns error detail in 200 OK structure
+          json['error'] as String?, // If backend returns error detail in 200 OK structure
     );
   }
+  final bool valid;
+  final String? error;
 }
 
 /// Represents a container image search result from Docker Hub or other registries.
 class ImageSearchResult {
-  final String name;
-  final String description;
-  final int stars;
-  final bool official;
-  final String index;
 
   ImageSearchResult({
     required this.name,
@@ -442,13 +452,18 @@ class ImageSearchResult {
 
   factory ImageSearchResult.fromJson(Map<String, dynamic> json) {
     return ImageSearchResult(
-      name: json['name'] ?? '',
-      description: json['description'] ?? '',
-      stars: json['stars'] ?? 0,
-      official: json['official'] ?? false,
-      index: json['index'] ?? 'docker.io',
+      name: (json['name'] as String?) ?? '',
+      description: (json['description'] as String?) ?? '',
+      stars: (json['stars'] as int?) ?? 0,
+      official: (json['official'] as bool?) ?? false,
+      index: (json['index'] as String?) ?? 'docker.io',
     );
   }
+  final String name;
+  final String description;
+  final int stars;
+  final bool official;
+  final String index;
 
   /// Returns the full image name including registry index.
   String get fullName {

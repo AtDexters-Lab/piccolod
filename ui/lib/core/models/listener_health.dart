@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_theme.dart';
-import '../../theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Shared visual mappings for listener health status.
 class ListenerHealthVisuals {
@@ -45,16 +45,6 @@ class ListenerHealthVisuals {
 }
 
 class ListenerHealth {
-  final String status;
-  final String reasonCode;
-  final String reason;
-  final String? details;
-  final String? recoveryEta;
-  final bool recoverable;
-  final bool actionRequired;
-  final Map<String, CertHealthStatus>? certStatuses;
-  final String? lastChecked;
-  final String? lastOk;
 
   const ListenerHealth({
     required this.status,
@@ -96,6 +86,16 @@ class ListenerHealth {
       lastOk: json['last_ok']?.toString(),
     );
   }
+  final String status;
+  final String reasonCode;
+  final String reason;
+  final String? details;
+  final String? recoveryEta;
+  final bool recoverable;
+  final bool actionRequired;
+  final Map<String, CertHealthStatus>? certStatuses;
+  final String? lastChecked;
+  final String? lastOk;
 
   bool get isOk => status == 'ok';
   bool get isRecovering => status == 'recovering';
@@ -104,9 +104,6 @@ class ListenerHealth {
 }
 
 class CertHealthStatus {
-  final String status;
-  final String reasonCode;
-  final String? recoveryEta;
 
   const CertHealthStatus({
     required this.status,
@@ -121,13 +118,12 @@ class CertHealthStatus {
       recoveryEta: json['recovery_eta']?.toString(),
     );
   }
+  final String status;
+  final String reasonCode;
+  final String? recoveryEta;
 }
 
 class ListenerHealthEvent {
-  final String app;
-  final String listener;
-  final ListenerHealth health;
-  final String? timestamp;
 
   const ListenerHealthEvent({
     required this.app,
@@ -141,11 +137,15 @@ class ListenerHealthEvent {
       app: (json['app'] ?? '').toString(),
       listener: (json['listener'] ?? '').toString(),
       health: ListenerHealth.fromJson(
-        json['health'] is Map
-            ? Map<String, dynamic>.from(json['health'])
+        json['health'] is Map<dynamic, dynamic>
+            ? Map<String, dynamic>.from(json['health'] as Map<dynamic, dynamic>)
             : <String, dynamic>{},
       ),
       timestamp: json['timestamp']?.toString(),
     );
   }
+  final String app;
+  final String listener;
+  final ListenerHealth health;
+  final String? timestamp;
 }

@@ -10,4 +10,3 @@ String generateTaskId() {
   }
   return buf.toString();
 }
-

@@ -1,16 +1,17 @@
 import 'dart:async';
-import 'package:flutter/material.dart';
+
 import 'package:flutter/gestures.dart';
-import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter/material.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_preflight_list.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
-import '../remote_controller.dart';
-import 'remote_preflight_list.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class RemoteSetupWizard extends StatefulWidget {
-  final RemoteController controller;
 
-  const RemoteSetupWizard({super.key, required this.controller});
+  const RemoteSetupWizard({required this.controller, super.key});
+  final RemoteController controller;
 
   @override
   State<RemoteSetupWizard> createState() => _RemoteSetupWizardState();
@@ -47,14 +48,14 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     }
 
     // Load guide info
-    widget.controller.loadNexusGuide();
+    unawaited(widget.controller.loadNexusGuide());
   }
 
   void _autoRunPreflight() {
     // 1-second delay for "heads up" then run
     Timer(const Duration(seconds: 1), () {
       if (mounted && !widget.controller.isRunningPreflight && widget.controller.preflightChecks.isEmpty) {
-        widget.controller.runPreflight();
+        unawaited(widget.controller.runPreflight());
       }
     });
   }
@@ -81,9 +82,9 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
   Widget _buildStepperHeader() {
     return Row(
       children: [
-        _buildStepIndicator(0, "Connect"),
+        _buildStepIndicator(0, 'Connect'),
         _buildStepSeparator(),
-        _buildStepIndicator(1, "Verify & Enable"),
+        _buildStepIndicator(1, 'Verify & Enable'),
       ],
     );
   }
@@ -99,7 +100,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
           CircleAvatar(
             backgroundColor: isActive || isCompleted ? PiccoloTheme.cobalt600 : PiccoloTheme.mist,
             foregroundColor: isActive || isCompleted ? PiccoloTheme.porcelain : PiccoloTheme.inkMuted,
-            child: isCompleted ? const Icon(PiccoloIcons.check) : Text("${step + 1}"),
+            child: isCompleted ? const Icon(PiccoloIcons.check) : Text('${step + 1}'),
           ),
           const SizedBox(height: Spacing.sm),
           Text(
@@ -125,7 +126,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
       case 1:
         return _buildStep1Preflight();
       default:
-        return const Text("Unknown step");
+        return const Text('Unknown step');
     }
   }
 
@@ -138,14 +139,14 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text("Connect to Nexus", style: PiccoloTheme.textTheme.headlineMedium),
+        Text('Connect to Nexus', style: PiccoloTheme.textTheme.headlineMedium),
         const SizedBox(height: Spacing.base),
-        const Text("To enable remote access, you need a Nexus Relay. You can host your own."),
+        const Text('To enable remote access, you need a Nexus Relay. You can host your own.'),
         const SizedBox(height: Spacing.lg),
 
         // Requirements
         if (guide.requirements.isNotEmpty) ...[
-          Text("Prerequisites", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+          Text('Prerequisites', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
           const SizedBox(height: Spacing.sm),
           ...guide.requirements.map((req) => Padding(
             padding: const EdgeInsets.only(bottom: Spacing.xs),
@@ -162,7 +163,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         ],
 
         // Command
-        Text("Installation", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+        Text('Installation', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
         const SizedBox(height: Spacing.sm),
         Container(
           padding: const EdgeInsets.all(Spacing.base),
@@ -183,7 +184,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         ),
         Padding(
           padding: const EdgeInsets.only(top: Spacing.sm),
-          child: Text("Run this command on your VPS.", style: PiccoloTheme.textTheme.labelSmall),
+          child: Text('Run this command on your VPS.', style: PiccoloTheme.textTheme.labelSmall),
         ),
         const SizedBox(height: Spacing.lg),
 
@@ -227,7 +228,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
                      TextSpan(
                        children: [
                          const TextSpan(
-                           text: "Documentation: ",
+                           text: 'Documentation: ',
                            style: TextStyle(color: PiccoloTheme.inkMuted, fontSize: 12),
                          ),
                          TextSpan(
@@ -251,21 +252,21 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         const Divider(),
         const SizedBox(height: Spacing.xl),
 
-        Text("Enter Connection Details", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+        Text('Enter Connection Details', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
         const SizedBox(height: Spacing.base),
-        _buildTextField("Nexus Endpoint", _endpointCtrl, hint: "wss://nexus.example.com"),
+        _buildTextField('Nexus Endpoint', _endpointCtrl, hint: 'wss://nexus.example.com'),
         const SizedBox(height: Spacing.base),
-        _buildTextField("Portal Hostname", _portalCtrl, hint: "portal.home.example.com"),
+        _buildTextField('Portal Hostname', _portalCtrl, hint: 'portal.home.example.com'),
         Padding(
           padding: const EdgeInsets.only(top: Spacing.sm, bottom: Spacing.sm),
           child: Text(
-            "This is the fully-qualified domain name where this Piccolo device will be accessible remotely. "
+            'This is the fully-qualified domain name where this Piccolo device will be accessible remotely. '
             "All app subdomains (e.g., myapp.home.example.com) will be derived from this hostname's parent domain.",
             style: PiccoloTheme.textTheme.labelSmall?.copyWith(color: PiccoloTheme.inkMuted),
           ),
         ),
         const SizedBox(height: Spacing.sm),
-        _buildTextField("Device Secret", _secretCtrl, obscureText: true),
+        _buildTextField('Device Secret', _secretCtrl, obscureText: true),
 
         const SizedBox(height: Spacing.xl),
         Align(
@@ -273,11 +274,11 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
           child: FilledButton(
             onPressed: () async {
               if (_endpointCtrl.text.isEmpty || _secretCtrl.text.isEmpty || _portalCtrl.text.isEmpty) {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Please fill all fields")));
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please fill all fields')));
                 return;
               }
               if (!_portalCtrl.text.contains('.')) {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Portal hostname must be a fully-qualified domain (e.g., portal.home.example.com)")));
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Portal hostname must be a fully-qualified domain (e.g., portal.home.example.com)')));
                 return;
               }
               await widget.controller.verifyNexusGuide(
@@ -288,7 +289,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
               // Auto-run preflight after transition
               _autoRunPreflight();
             },
-            child: const Text("Next: Run Preflight"),
+            child: const Text('Next: Run Preflight'),
           ),
         ),
       ],
@@ -298,22 +299,22 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
   // --- Step 1: Preflight & Enable ---
 
   Widget _buildStep1Preflight() {
-    final bool allPassed = widget.controller.preflightChecks.isNotEmpty &&
+    final allPassed = widget.controller.preflightChecks.isNotEmpty &&
         !widget.controller.preflightChecks.any((c) => c.status == 'fail');
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text("Verify & Enable", style: PiccoloTheme.textTheme.headlineMedium),
+        Text('Verify & Enable', style: PiccoloTheme.textTheme.headlineMedium),
         const SizedBox(height: Spacing.base),
-        const Text("Verifying your environment and connection settings."),
+        const Text('Verifying your environment and connection settings.'),
         const SizedBox(height: Spacing.lg),
 
         if (!widget.controller.isRunningPreflight && widget.controller.preflightChecks.isEmpty)
            Center(
              child: FilledButton(
                onPressed: widget.controller.runPreflight,
-               child: const Text("Run Checks"),
+               child: const Text('Run Checks'),
              ),
            )
         else ...[
@@ -325,7 +326,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
                  child: TextButton.icon(
                    onPressed: widget.controller.runPreflight,
                    icon: const Icon(PiccoloIcons.refresh),
-                   label: const Text("Re-run Checks"),
+                   label: const Text('Re-run Checks'),
                  ),
                ),
              ),
@@ -346,13 +347,13 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
             children: [
               TextButton(onPressed: () {
                 setState(() => widget.controller.wizardStep = 0);
-              }, child: const Text("Back")),
+              }, child: const Text('Back')),
 
               FilledButton(
                 onPressed: allPassed
                     ? () => widget.controller.submitConfiguration()
                     : null, // Disable if any check failed
-                child: const Text("Enable Remote Access"),
+                child: const Text('Enable Remote Access'),
               ),
             ],
           ),
@@ -374,8 +375,8 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
                 SizedBox(width: Spacing.sm),
                 Expanded(
                   child: Text(
-                    "Certificates will be issued using HTTP-01 challenge. "
-                    "Each app will receive its own certificate automatically.",
+                    'Certificates will be issued using HTTP-01 challenge. '
+                    'Each app will receive its own certificate automatically.',
                     style: TextStyle(fontSize: 13),
                   ),
                 ),
@@ -387,7 +388,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     );
   }
 
-  Widget _buildTextField(String label, TextEditingController ctrl, {String? hint, bool obscureText = false, Function(String)? onChanged}) {
+  Widget _buildTextField(String label, TextEditingController ctrl, {String? hint, bool obscureText = false, void Function(String)? onChanged}) {
     return TextField(
       controller: ctrl,
       obscureText: obscureText,

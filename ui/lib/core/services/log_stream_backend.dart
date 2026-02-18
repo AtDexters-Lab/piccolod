@@ -2,19 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:piccolo_os/core/services/websocket_connection.dart';
 import 'package:xterm/xterm.dart';
 
-import 'websocket_connection.dart';
-
 class LogStreamBackend extends ChangeNotifier {
-  final Terminal terminal;
-  final WebSocketConnection _connection;
-  late final VoidCallback _connectionListener;
-
-  StreamSubscription? _subscription;
-
-  WebSocketConnectionState get state => _connection.state;
-  String? get lastError => _connection.lastError;
 
   LogStreamBackend(this.terminal, String url)
       : _connection = WebSocketConnection(
@@ -25,9 +16,17 @@ class LogStreamBackend extends ChangeNotifier {
             );
           },
         ) {
-    _connectionListener = () => notifyListeners();
+    _connectionListener = notifyListeners;
     _connection.addListener(_connectionListener);
   }
+  final Terminal terminal;
+  final WebSocketConnection _connection;
+  late final VoidCallback _connectionListener;
+
+  StreamSubscription<dynamic>? _subscription;
+
+  WebSocketConnectionState get state => _connection.state;
+  String? get lastError => _connection.lastError;
 
   void connect() {
     if (_subscription != null) {
@@ -38,7 +37,7 @@ class LogStreamBackend extends ChangeNotifier {
   }
 
   void disconnect({bool clearError = false}) {
-    _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
     _connection.disconnect(clearError: clearError);
   }
@@ -62,7 +61,7 @@ class LogStreamBackend extends ChangeNotifier {
       final bytes = base64.decode(encoded);
       final text = utf8.decode(bytes, allowMalformed: true);
       terminal.write(_normalizeNewlines(text));
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('Log stream decode error: $e');
     }
   }
@@ -77,10 +76,11 @@ class LogStreamBackend extends ChangeNotifier {
 
   @override
   void dispose() {
-    _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
-    _connection.removeListener(_connectionListener);
-    _connection.dispose();
+    _connection
+      ..removeListener(_connectionListener)
+      ..dispose();
     super.dispose();
   }
 }

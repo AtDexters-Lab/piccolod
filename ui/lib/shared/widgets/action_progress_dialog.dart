@@ -1,8 +1,8 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'task_progress_panel.dart';
-import '../../core/utils/task_id.dart';
+import 'package:piccolo_os/core/utils/task_id.dart';
+import 'package:piccolo_os/shared/widgets/task_progress_panel.dart';
 
 /// Runs an async action with a progress dialog overlay.
 ///
@@ -20,7 +20,7 @@ Future<bool> runWithProgressDialog({
   final taskId = generateTaskId();
   final progressDone = Completer<void>();
 
-  showDialog(
+  unawaited(showDialog<void>(
     context: context,
     barrierDismissible: false,
     builder: (context) => AlertDialog(
@@ -30,13 +30,13 @@ Future<bool> runWithProgressDialog({
         child: TaskProgressPanel(
           taskId: taskId,
           taskType: taskType,
-          onComplete: () {
+          onComplete: (_) {
             if (!progressDone.isCompleted) progressDone.complete();
           },
         ),
       ),
     ),
-  );
+  ));
 
   final navigator = Navigator.of(context);
   final messenger = ScaffoldMessenger.of(context);
@@ -48,7 +48,7 @@ Future<bool> runWithProgressDialog({
       const Duration(seconds: 2),
       onTimeout: () {},
     );
-  } catch (e) {
+  } on Object catch (e) {
     error = e;
   } finally {
     if (navigator.canPop()) {

@@ -9,6 +9,15 @@ typedef ReconnectScheduledCallback = void Function(Duration delay);
 typedef SessionEndCallback = void Function();
 
 class WebSocketConnection extends ChangeNotifier {
+
+  WebSocketConnection(
+    this.url, {
+    this.autoReconnect = true,
+    this.initialReconnectDelay = const Duration(seconds: 2),
+    this.maxReconnectDelay = const Duration(seconds: 30),
+    this.onReconnectScheduled,
+    this.onSessionEnd,
+  }) : _reconnectDelay = initialReconnectDelay;
   final String url;
   final bool autoReconnect;
   final Duration initialReconnectDelay;
@@ -17,7 +26,7 @@ class WebSocketConnection extends ChangeNotifier {
   final SessionEndCallback? onSessionEnd;
 
   WebSocketChannel? _channel;
-  StreamSubscription? _subscription;
+  StreamSubscription<dynamic>? _subscription;
   final StreamController<dynamic> _messagesController =
       StreamController<dynamic>.broadcast();
 
@@ -35,15 +44,6 @@ class WebSocketConnection extends ChangeNotifier {
   String? get lastError => _lastError;
 
   Stream<dynamic> get messages => _messagesController.stream;
-
-  WebSocketConnection(
-    this.url, {
-    this.autoReconnect = true,
-    this.initialReconnectDelay = const Duration(seconds: 2),
-    this.maxReconnectDelay = const Duration(seconds: 30),
-    this.onReconnectScheduled,
-    this.onSessionEnd,
-  }) : _reconnectDelay = initialReconnectDelay;
 
   void connect() {
     if (_isDisposed || _isConnecting) return;
@@ -79,14 +79,14 @@ class WebSocketConnection extends ChangeNotifier {
             onSessionEnd?.call();
           }
         },
-        onError: (error) =>
-            _handleDisconnect('Connection error: $error', shouldReconnect: true),
+        onError: (Object error) =>
+            _handleDisconnect('Connection error: $error'),
       );
       _reconnectDelay = initialReconnectDelay;
       _lastError = null;
       _setState(WebSocketConnectionState.connected);
-    } catch (e) {
-      _handleDisconnect('Failed to connect: $e', shouldReconnect: true);
+    } on Object catch (e) {
+      _handleDisconnect('Failed to connect: $e');
     } finally {
       _isConnecting = false;
     }
@@ -99,10 +99,10 @@ class WebSocketConnection extends ChangeNotifier {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
 
-    _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
 
-    _channel?.sink.close();
+    unawaited(_channel?.sink.close());
     _channel = null;
 
     if (clearError) {
@@ -118,10 +118,10 @@ class WebSocketConnection extends ChangeNotifier {
   void _handleDisconnect(String reason, {bool shouldReconnect = true}) {
     if (_isDisposed) return;
 
-    _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
 
-    _channel?.sink.close();
+    unawaited(_channel?.sink.close());
     _channel = null;
 
     _lastError = reason;
@@ -147,7 +147,7 @@ class WebSocketConnection extends ChangeNotifier {
       initialReconnectDelay.inSeconds,
       maxReconnectDelay.inSeconds,
     );
-    _reconnectDelay = Duration(seconds: nextSeconds.toInt());
+    _reconnectDelay = Duration(seconds: nextSeconds);
   }
 
   void _setState(WebSocketConnectionState state) {
@@ -160,7 +160,7 @@ class WebSocketConnection extends ChangeNotifier {
   void dispose() {
     _isDisposed = true;
     disconnect(clearError: true);
-    _messagesController.close();
+    unawaited(_messagesController.close());
     super.dispose();
   }
 }

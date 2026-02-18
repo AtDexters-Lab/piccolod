@@ -1,11 +1,17 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/shells/desktop/models/desktop_window.dart';
+import 'package:piccolo_os/shells/desktop/widgets/window_activity.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:pointer_interceptor/pointer_interceptor.dart';
-import '../../../theme/piccolo_icons.dart';
-import '../../../theme/piccolo_theme.dart';
-import '../models/desktop_window.dart';
-import 'window_activity.dart';
 
 class WindowFrame extends StatefulWidget {
+
+  const WindowFrame({
+    required this.window, required this.isClosing, required this.isActive, required this.onClose, required this.onMinimize, required this.onMaximize, required this.onTap, required this.onDrag, required this.onResize, required this.onAnimationComplete, super.key,
+  });
   final DesktopWindow window;
   final bool isClosing; // Primitive for accurate didUpdateWidget comparison
   final bool isActive;
@@ -13,23 +19,9 @@ class WindowFrame extends StatefulWidget {
   final VoidCallback onMinimize;
   final VoidCallback onMaximize;
   final VoidCallback onTap;
-  final Function(Offset) onDrag;
-  final Function(Size) onResize;
+  final void Function(Offset) onDrag;
+  final void Function(Size) onResize;
   final VoidCallback onAnimationComplete;
-
-  const WindowFrame({
-    super.key,
-    required this.window,
-    required this.isClosing,
-    required this.isActive,
-    required this.onClose,
-    required this.onMinimize,
-    required this.onMaximize,
-    required this.onTap,
-    required this.onDrag,
-    required this.onResize,
-    required this.onAnimationComplete,
-  });
 
   @override
   State<WindowFrame> createState() => _WindowFrameState();
@@ -59,15 +51,15 @@ class _WindowFrameState extends State<WindowFrame>
 
     _scaleAnimation = Tween<double>(
       begin: 0.9,
-      end: 1.0,
+      end: 1,
     ).animate(CurvedAnimation(parent: _entryController, curve: Curves.easeOut));
     _opacityAnimation = Tween<double>(
-      begin: 0.0,
-      end: 1.0,
+      begin: 0,
+      end: 1,
     ).animate(CurvedAnimation(parent: _entryController, curve: Curves.easeOut));
 
     // Start open animation
-    _entryController.forward();
+    unawaited(_entryController.forward());
   }
 
   @override
@@ -75,7 +67,7 @@ class _WindowFrameState extends State<WindowFrame>
     super.didUpdateWidget(oldWidget);
     // Compare primitives to detect state change correctly
     if (widget.isClosing && !oldWidget.isClosing) {
-      _entryController.reverse();
+      unawaited(_entryController.reverse());
     }
   }
 
@@ -127,7 +119,6 @@ class _WindowFrameState extends State<WindowFrame>
                   boxShadow: Elevation.elev3,
                   border: Border.all(
                     color: PiccoloTheme.hairline,
-                    width: 1,
                   ),
                 ),
                 child: Column(
@@ -253,9 +244,9 @@ class _WindowFrameState extends State<WindowFrame>
                             width: 6,
                             height: 6,
                             margin: const EdgeInsets.all(4),
-                            decoration: BoxDecoration(
+                            decoration: const BoxDecoration(
                               color: PiccoloTheme.outline,
-                              borderRadius: const BorderRadius.only(
+                              borderRadius: BorderRadius.only(
                                 topLeft: Radius.circular(4),
                               ),
                             ),
@@ -278,10 +269,6 @@ class _WindowFrameState extends State<WindowFrame>
 }
 
 class _WindowCaptionButton extends StatefulWidget {
-  final Color color;
-  final IconData icon;
-  final bool isHoveringWindow;
-  final VoidCallback? onTap;
 
   const _WindowCaptionButton({
     required this.color,
@@ -289,6 +276,10 @@ class _WindowCaptionButton extends StatefulWidget {
     required this.isHoveringWindow,
     this.onTap,
   });
+  final Color color;
+  final IconData icon;
+  final bool isHoveringWindow;
+  final VoidCallback? onTap;
 
   @override
   State<_WindowCaptionButton> createState() => _WindowCaptionButtonState();

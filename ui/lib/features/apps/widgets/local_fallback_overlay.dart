@@ -1,31 +1,30 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:piccolo_os/core/models/listener_health.dart';
+import 'package:piccolo_os/core/services/app_service.dart';
+import 'package:piccolo_os/features/apps/app_launcher.dart';
+import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/settings_app.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:url_launcher/url_launcher.dart';
-import '../../../core/models/listener_health.dart';
-import '../../../core/services/app_service.dart';
-import '../../../shells/desktop/desktop_controller.dart';
-import '../../../shells/desktop/features/settings/settings_app.dart';
-import '../../../theme/piccolo_theme.dart';
-import '../../../theme/piccolo_icons.dart';
-import '../app_launcher.dart';
 
 class LocalFallbackOverlay extends StatelessWidget {
+
+  const LocalFallbackOverlay({
+    required this.health, required this.appName, required this.lanFallbackUrl, super.key,
+    this.appService,
+    this.desktopController,
+    this.actionableCertId,
+  });
   final ListenerHealth health;
   final String appName;
   final String lanFallbackUrl;
   final AppService? appService;
   final DesktopController? desktopController;
   final String? actionableCertId;
-
-  const LocalFallbackOverlay({
-    super.key,
-    required this.health,
-    required this.appName,
-    required this.lanFallbackUrl,
-    this.appService,
-    this.desktopController,
-    this.actionableCertId,
-  });
 
   bool get isLocalAccess =>
       AppLauncher.isLocalAccess(Uri.base.host.toLowerCase());
@@ -69,7 +68,7 @@ class LocalFallbackOverlay extends StatelessWidget {
               FilledButton.icon(
                 onPressed: () {
                   Navigator.of(context).pop();
-                  launchUrl(Uri.parse(lanFallbackUrl));
+                  unawaited(launchUrl(Uri.parse(lanFallbackUrl)));
                 },
                 icon: const Icon(PiccoloIcons.openExternal, size: 16),
                 label: const Text('Access Locally'),
@@ -126,7 +125,7 @@ class LocalFallbackOverlay extends StatelessWidget {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Retry queued')),
       );
-    } catch (e) {
+    } on Object catch (e) {
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Retry failed: $e')),
@@ -136,16 +135,16 @@ class LocalFallbackOverlay extends StatelessWidget {
 }
 
 class CopyableUrl extends StatelessWidget {
+
+  const CopyableUrl({required this.url, super.key, this.compact = false});
   final String url;
   final bool compact;
-
-  const CopyableUrl({super.key, required this.url, this.compact = false});
 
   @override
   Widget build(BuildContext context) {
     return InkWell(
       onTap: () {
-        Clipboard.setData(ClipboardData(text: url));
+        unawaited(Clipboard.setData(ClipboardData(text: url)));
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('URL copied to clipboard')),
         );

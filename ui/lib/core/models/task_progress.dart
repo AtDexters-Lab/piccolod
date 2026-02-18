@@ -1,14 +1,4 @@
 class TaskProgressEvent {
-  final String taskId;
-  final String taskType;
-  final String? instanceId;
-  final String phase;
-  final int progress;
-  final String message;
-  final bool isComplete;
-  final String? error;
-  final DateTime? timestamp;
-  final Map<String, dynamic>? metadata;
 
   const TaskProgressEvent({
     required this.taskId,
@@ -25,22 +15,32 @@ class TaskProgressEvent {
 
   factory TaskProgressEvent.fromJson(Map<String, dynamic> json) {
     return TaskProgressEvent(
-      taskId: json['task_id'] ?? '',
-      taskType: json['task_type'] ?? '',
-      instanceId: json['instance_id'],
-      phase: json['phase'] ?? '',
-      progress: json['progress'] is int ? json['progress'] : -1,
-      message: json['message'] ?? '',
+      taskId: (json['task_id'] as String?) ?? '',
+      taskType: (json['task_type'] as String?) ?? '',
+      instanceId: json['instance_id'] as String?,
+      phase: (json['phase'] as String?) ?? '',
+      progress: json['progress'] is int ? json['progress'] as int : -1,
+      message: (json['message'] as String?) ?? '',
       isComplete: json['is_complete'] == true,
-      error: json['error'],
+      error: json['error'] as String?,
       timestamp: json['timestamp'] != null
-          ? DateTime.tryParse(json['timestamp'])
+          ? DateTime.tryParse(json['timestamp'] as String)
           : null,
       metadata: json['metadata'] is Map
-          ? Map<String, dynamic>.from(json['metadata'])
+          ? Map<String, dynamic>.from(json['metadata'] as Map)
           : null,
     );
   }
+  final String taskId;
+  final String taskType;
+  final String? instanceId;
+  final String phase;
+  final int progress;
+  final String message;
+  final bool isComplete;
+  final String? error;
+  final DateTime? timestamp;
+  final Map<String, dynamic>? metadata;
 
   /// Parses image pull progress from metadata when phase is 'pulling_image'.
   ImagePullProgress? get imagePullProgress {
@@ -51,14 +51,6 @@ class TaskProgressEvent {
 
 /// Progress information for an image pull operation.
 class ImagePullProgress {
-  final String? service;
-  final String? image;
-  final String? pullPhase;
-  final int overallPercent;
-  final int totalBytes;
-  final int downloadedBytes;
-  final List<LayerProgress> layers;
-  final bool cached;
 
   const ImagePullProgress({
     this.service,
@@ -93,6 +85,14 @@ class ImagePullProgress {
       cached: metadata['cached'] == true,
     );
   }
+  final String? service;
+  final String? image;
+  final String? pullPhase;
+  final int overallPercent;
+  final int totalBytes;
+  final int downloadedBytes;
+  final List<LayerProgress> layers;
+  final bool cached;
 
   /// Returns a human-readable string for the downloaded/total bytes.
   String get progressText {
@@ -120,10 +120,6 @@ class ImagePullProgress {
 
 /// Progress information for a single layer being pulled.
 class LayerProgress {
-  final String layerId;
-  final String status;
-  final int bytesCurrent;
-  final int bytesTotal;
 
   const LayerProgress({
     required this.layerId,
@@ -140,6 +136,10 @@ class LayerProgress {
       bytesTotal: _parseInt(map['bytes_total']),
     );
   }
+  final String layerId;
+  final String status;
+  final int bytesCurrent;
+  final int bytesTotal;
 
   /// Returns a short display ID (first 12 chars of the hash).
   String get shortId {
@@ -163,4 +163,3 @@ class LayerProgress {
     return 0;
   }
 }
-

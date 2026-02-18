@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:web/web.dart' as web;
-import '../../../../core/services/api_client.dart';
 
 enum SetupState {
   loading, // Checking status
@@ -22,6 +24,12 @@ enum SetupState {
 }
 
 class SetupController extends ChangeNotifier {
+
+  SetupController() {
+    _parseAuthRequestFromUrl();
+    _parseNextFromUrl();
+    unawaited(_checkStatus());
+  }
   SetupState _state = SetupState.loading;
   SetupState get state => _state;
 
@@ -58,12 +66,6 @@ class SetupController extends ChangeNotifier {
 
   final ApiClient _api = ApiClient();
 
-  SetupController() {
-    _parseAuthRequestFromUrl();
-    _parseNextFromUrl();
-    _checkStatus();
-  }
-
   /// Parse auth request ID from URL query parameters (for OIDC SSO flow)
   void _parseAuthRequestFromUrl() {
     try {
@@ -73,7 +75,7 @@ class SetupController extends ChangeNotifier {
       if (_authRequestId != null) {
         debugPrint('OIDC auth request detected: $_authRequestId');
       }
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('Failed to parse URL: $e');
     }
   }
@@ -85,7 +87,7 @@ class SetupController extends ChangeNotifier {
       if (_nextUrl != null && _nextUrl!.isNotEmpty) {
         debugPrint('Login redirect target detected: $_nextUrl');
       }
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('Failed to parse next URL: $e');
     }
   }
@@ -106,7 +108,7 @@ class SetupController extends ChangeNotifier {
           return true;
         }
       }
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('Next URL validation failed: $e');
     }
 
@@ -119,7 +121,7 @@ class SetupController extends ChangeNotifier {
       notifyListeners();
 
       // Check emergency status first — other endpoints may be degraded.
-      final emergency = await _api.get('/api/v1/system/emergency');
+      final emergency = await _api.get('/api/v1/system/emergency') as Map<String, dynamic>;
       if (emergency['emergency'] == true) {
         final level = emergency['level'] as String?;
         if (level != 'soft') {
@@ -133,7 +135,7 @@ class SetupController extends ChangeNotifier {
       }
 
       // Check onboarding status — USB boot may require onboarding choice.
-      final onboarding = await _api.get('/api/v1/system/onboarding');
+      final onboarding = await _api.get('/api/v1/system/onboarding') as Map<String, dynamic>;
       _bootMode = onboarding['boot_mode'] as String?;
       _bootOrderConfigured = onboarding['boot_order_configured'] == true;
       if (onboarding['required'] == true) {
@@ -156,7 +158,7 @@ class SetupController extends ChangeNotifier {
         }
       }
 
-      final status = await _api.get('/api/v1/crypto/status');
+      final status = await _api.get('/api/v1/crypto/status') as Map<String, dynamic>;
       // Expect: {"initialized": bool, "locked": bool}
 
       final initialized = status['initialized'] == true;
@@ -167,7 +169,7 @@ class SetupController extends ChangeNotifier {
           _state = SetupState.unlock;
         } else {
           // Already unlocked. Check session.
-          final session = await _api.get('/api/v1/auth/session');
+          final session = await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
           if (session['authenticated'] == true) {
             await _api.fetchCsrfToken();
 
@@ -193,7 +195,7 @@ class SetupController extends ChangeNotifier {
         // Not initialized, start setup
         _state = SetupState.welcome;
       }
-    } catch (e) {
+    } on Object catch (e) {
       _error = e.toString();
       _state = SetupState.error;
     } finally {
@@ -231,10 +233,10 @@ class SetupController extends ChangeNotifier {
     try {
       final decoded = jsonDecode(body);
       if (decoded is Map) {
-        if (decoded['message'] is String) return decoded['message'];
-        if (decoded['error'] is String) return decoded['error'];
+        if (decoded['message'] is String) return decoded['message'] as String;
+        if (decoded['error'] is String) return decoded['error'] as String;
       }
-    } catch (_) {}
+    } on Object catch (_) {}
     return body;
   }
 
@@ -255,7 +257,7 @@ class SetupController extends ChangeNotifier {
       // Disk prep started on backend. Re-check system status to determine the
       // correct next step: welcome (new system) or unlock (previously set up).
       await _checkStatus();
-    } catch (e) {
+    } on Object catch (e) {
       _error = e.toString();
       _state = SetupState.onboarding;
       notifyListeners();
@@ -272,7 +274,7 @@ class SetupController extends ChangeNotifier {
       await fetchDisks();
       _state = SetupState.installDisk;
       notifyListeners();
-    } catch (e) {
+    } on Object catch (e) {
       _error = e.toString();
       _state = SetupState.onboarding;
       notifyListeners();
@@ -281,8 +283,8 @@ class SetupController extends ChangeNotifier {
 
   /// Fetch available internal disks for install target selection.
   Future<void> fetchDisks() async {
-    final response = await _api.get('/api/v1/storage/disks');
-    final rawDisks = response['disks'] as List? ?? [];
+    final response = await _api.get('/api/v1/storage/disks') as Map<String, dynamic>;
+    final rawDisks = response['disks'] as List<dynamic>? ?? <dynamic>[];
     _disks = rawDisks.cast<Map<String, dynamic>>();
     notifyListeners();
   }
@@ -307,7 +309,7 @@ class SetupController extends ChangeNotifier {
       _error = _extractServerError(e.message);
       notifyListeners();
       return false;
-    } catch (e) {
+    } on Object catch (e) {
       _installTaskId = null;
       _error = e.toString();
       notifyListeners();
@@ -319,9 +321,9 @@ class SetupController extends ChangeNotifier {
   /// Fetches fresh onboarding status to get boot_order_configured.
   Future<void> onInstallComplete() async {
     try {
-      final onboarding = await _api.get('/api/v1/system/onboarding');
+      final onboarding = await _api.get('/api/v1/system/onboarding') as Map<String, dynamic>;
       _bootOrderConfigured = onboarding['boot_order_configured'] == true;
-    } catch (_) {
+    } on Object catch (_) {
       // Non-fatal; default false shows the safer "Power Off" path.
     }
     _state = SetupState.installComplete;
@@ -334,7 +336,7 @@ class SetupController extends ChangeNotifier {
       _state = SetupState.finishing;
       notifyListeners();
       await _api.post('/api/v1/system/reboot');
-    } catch (e) {
+    } on Object catch (e) {
       _error = e.toString();
       _state = SetupState.installComplete;
       notifyListeners();
@@ -357,37 +359,48 @@ class SetupController extends ChangeNotifier {
       _error = null;
       notifyListeners();
 
+      const timeout = Duration(seconds: 120);
+
       // 1. Initialize Crypto
-      await _api.post('/api/v1/crypto/setup', body: {'password': password});
+      await _api.post('/api/v1/crypto/setup', body: {'password': password})
+          .timeout(timeout);
 
       // 2. Unlock (to get session and auth)
-      await _api.post('/api/v1/crypto/unlock', body: {'password': password});
+      await _api.post('/api/v1/crypto/unlock', body: {'password': password})
+          .timeout(timeout);
 
       // 3. Check if Auth is initialized
-      final authState = await _api.get('/api/v1/auth/initialized');
+      final authState = await _api.get('/api/v1/auth/initialized')
+          .timeout(timeout) as Map<String, dynamic>;
 
       if (authState['initialized'] != true) {
         // 3b. Initialize Auth (create admin account) if not already done
-        await _api.post('/api/v1/auth/setup', body: {'password': password});
+        await _api.post('/api/v1/auth/setup', body: {'password': password})
+            .timeout(timeout);
       }
 
       // 4. Fetch CSRF Token
-      await _api.fetchCsrfToken();
+      await _api.fetchCsrfToken().timeout(timeout);
 
       // 5. Generate Recovery Key
       final recoveryData = await _api.post(
         '/api/v1/crypto/recovery-key/generate',
         body: {'password': password},
-      );
+      ).timeout(timeout) as Map<String, dynamic>?;
 
       if (recoveryData != null && recoveryData['words'] != null) {
-        _recoveryWords = List<String>.from(recoveryData['words']);
+        _recoveryWords = List<String>.from(recoveryData['words'] as Iterable<dynamic>);
         _state = SetupState.recovery;
         notifyListeners();
         return true;
       } else {
-        throw Exception("Failed to generate recovery key");
+        throw Exception('Failed to generate recovery key');
       }
+    } on TimeoutException {
+      _error = 'Setup timed out. Please check your connection and try again.';
+      _state = SetupState.credentials;
+      notifyListeners();
+      return false;
     } on ApiException catch (e) {
       if (_isStorageSystemError(e)) {
         _error = _extractServerError(e.message);
@@ -398,7 +411,7 @@ class SetupController extends ChangeNotifier {
       }
       notifyListeners();
       return false;
-    } catch (e) {
+    } on Object catch (e) {
       _error = e.toString();
       _state = SetupState.credentials;
       notifyListeners();
@@ -415,7 +428,7 @@ class SetupController extends ChangeNotifier {
       // Actually, handleCryptoUnlock does try to create a session.
       // Let's check session status to be sure.
 
-      final session = await _api.get('/api/v1/auth/session');
+      final session = await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
       if (session['authenticated'] == true) {
         await _api.fetchCsrfToken();
 
@@ -449,7 +462,7 @@ class SetupController extends ChangeNotifier {
       }
       notifyListeners();
       return false;
-    } catch (e) {
+    } on Object catch (e) {
       _error = e.toString();
       notifyListeners();
       return false;
@@ -485,7 +498,7 @@ class SetupController extends ChangeNotifier {
       _state = SetupState.complete;
       notifyListeners();
       return true;
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('Login failed: $e');
       _error = e.toString();
       notifyListeners();
@@ -503,7 +516,7 @@ class SetupController extends ChangeNotifier {
       final response = await _api.post(
         '/api/v1/oauth/resume',
         body: {'auth_request_id': _authRequestId},
-      );
+      ) as Map<String, dynamic>;
 
       // The backend returns {data: {redirect_url: "..."}, message: "..."}
       final data = response['data'] as Map<String, dynamic>?;
@@ -517,7 +530,7 @@ class SetupController extends ChangeNotifier {
         _state = SetupState.complete;
         notifyListeners();
       }
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('OIDC resume failed: $e');
       _error = 'Failed to complete SSO login: $e';
       // On error, still go to desktop (the OIDC flow failed but user is logged in)
@@ -534,7 +547,7 @@ class SetupController extends ChangeNotifier {
 
   void cancelRecovery() {
     // Check status again to decide where to go (unlock or login)
-    _checkStatus();
+    unawaited(_checkStatus());
   }
 
   Future<bool> resetPassword(String recoveryKey, String newPassword) async {
@@ -551,7 +564,7 @@ class SetupController extends ChangeNotifier {
       // For now, rely on the UI transition.
       notifyListeners();
       return true;
-    } catch (e) {
+    } on Object catch (e) {
       _error = e.toString();
       notifyListeners();
       return false;
@@ -570,6 +583,6 @@ class SetupController extends ChangeNotifier {
 
   void retry() {
     _error = null;
-    _checkStatus();
+    unawaited(_checkStatus());
   }
 }

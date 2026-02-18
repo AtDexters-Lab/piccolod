@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Severity level for [StatusBanner].
 enum BannerSeverity { info, warning, error }
@@ -8,20 +8,18 @@ enum BannerSeverity { info, warning, error }
 /// Inline status banner replacing the various `_buildStartingBanner`,
 /// `_buildErrorBanner`, etc. patterns across the codebase.
 class StatusBanner extends StatelessWidget {
+
+  const StatusBanner({
+    required this.severity, required this.title, super.key,
+    this.message,
+    this.action,
+    this.icon,
+  });
   final BannerSeverity severity;
   final String title;
   final String? message;
   final Widget? action;
   final IconData? icon;
-
-  const StatusBanner({
-    super.key,
-    required this.severity,
-    required this.title,
-    this.message,
-    this.action,
-    this.icon,
-  });
 
   Color get _accent {
     switch (severity) {

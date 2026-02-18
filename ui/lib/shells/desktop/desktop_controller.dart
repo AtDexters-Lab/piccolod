@@ -1,12 +1,14 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import 'models/desktop_window.dart';
-import '../../core/services/api_client.dart';
-import '../../core/services/app_service.dart';
-import '../../core/services/event_stream_client.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../features/apps/app_store_window.dart';
-import 'features/settings/settings_app.dart';
-import 'features/welcome/welcome_screen.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
+import 'package:piccolo_os/core/services/app_service.dart';
+import 'package:piccolo_os/core/services/event_stream_client.dart';
+import 'package:piccolo_os/features/apps/app_store_window.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/settings_app.dart';
+import 'package:piccolo_os/shells/desktop/features/welcome/welcome_screen.dart';
+import 'package:piccolo_os/shells/desktop/models/desktop_window.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
 
 /// Manages the state of the Desktop Shell.
 ///
@@ -15,12 +17,18 @@ import 'features/welcome/welcome_screen.dart';
 /// - Active windows (z-index orchestration).
 /// - Global overlays (Search, Notifications).
 class DesktopController extends ChangeNotifier {
+
+  DesktopController() {
+    appService = AppService(ApiClient());
+    ApiClient().onAuthRequired = _onAuthRequired;
+    unawaited(_checkSystemStatus());
+  }
   // Window positioning constants
-  static const double kTopMargin = 8.0;
-  static const double kDockAreaHeight = 120.0; // ~90px dock + padding
-  static const double kBottomReserve = 100.0; // Space for dock when maximized
-  static const double kMinVisibleWidth = 50.0;
-  static const double kMinVisibleHeight = 30.0; // Title bar visibility
+  static const double kTopMargin = 8;
+  static const double kDockAreaHeight = 120; // ~90px dock + padding
+  static const double kBottomReserve = 100; // Space for dock when maximized
+  static const double kMinVisibleWidth = 50;
+  static const double kMinVisibleHeight = 30; // Title bar visibility
 
   bool _isLauncherOpen = false;
   bool get isLauncherOpen => _isLauncherOpen;
@@ -66,25 +74,19 @@ class DesktopController extends ChangeNotifier {
   bool _isInitializing = true;
   bool get isInitializing => _isInitializing;
 
-  DesktopController() {
-    appService = AppService(ApiClient());
-    ApiClient().onAuthRequired = _onAuthRequired;
-    _checkSystemStatus();
-  }
-
   Future<void> _checkSystemStatus() async {
     try {
       // Check if admin setup is complete
       final response = await ApiClient().get('/api/v1/auth/initialized');
       // response is { "initialized": boolean }
-      final initialized = response['initialized'] == true;
-      
+      final initialized = (response as Map<String, dynamic>)['initialized'] == true;
+
       if (!initialized) {
         _needsSetup = true;
       } else {
         // If initialized, check if we have a valid session (are we logged in?)
          try {
-           final session = await ApiClient().get('/api/v1/auth/session');
+           final session = await ApiClient().get('/api/v1/auth/session') as Map<String, dynamic>;
            if (session['authenticated'] != true) {
              // Not authenticated, but system IS initialized.
              // We reuse the Setup Wizard in "Login Mode".
@@ -97,13 +99,13 @@ class DesktopController extends ChangeNotifier {
                _lastKnownUsername = session['user'] as String;
              }
            }
-         } catch (_) {
+         } on Object catch (_) {
            // If session check fails, assume we need login
            _needsSetup = true;
          }
       }
-    } catch (e) {
-      debugPrint("System status check failed: $e");
+    } on Object catch (e) {
+      debugPrint('System status check failed: $e');
       // If backend is down or unreachable, what do we do?
       // For now, assume we might need setup/login to be safe.
       _needsSetup = true;
@@ -119,6 +121,8 @@ class DesktopController extends ChangeNotifier {
   }
 
   /// Called from SetupWizard when login/setup completes.
+  // Positional bool required to match SetupWizard `void Function(bool)` callback.
+  // ignore: avoid_positional_boolean_parameters
   void completeSetup(bool isFirstSetupFlow) {
     _onAuthenticated(isFirstSetup: isFirstSetupFlow);
   }
@@ -132,14 +136,15 @@ class DesktopController extends ChangeNotifier {
   void onReauthSuccess() {
     _showReauth = false;
     // Reconnect event stream after re-auth.
-    _eventStreamClient?.disconnect(clearError: true);
-    _eventStreamClient?.connect();
+    _eventStreamClient
+      ?..disconnect(clearError: true)
+      ..connect();
     notifyListeners();
   }
 
   void onReauthCancel() {
     _showReauth = false;
-    logout();
+    unawaited(logout());
   }
 
   /// Single source of truth for "user is now authenticated" state transition.
@@ -149,11 +154,11 @@ class DesktopController extends ChangeNotifier {
 
     // Capture username for re-auth overlay pre-fill (best-effort, fire-and-forget).
     // Covers the fresh-login path where _checkSystemStatus didn't reach the session check.
-    ApiClient().get('/api/v1/auth/session').then((session) {
+    unawaited(ApiClient().get('/api/v1/auth/session').then((session) {
       if (session is Map && session['user'] is String) {
         _lastKnownUsername = session['user'] as String;
       }
-    }).catchError((_) {});
+    }).catchError((_) {}));
 
     // Connect event stream
     _eventStreamClient ??= EventStreamClient();
@@ -164,26 +169,26 @@ class DesktopController extends ChangeNotifier {
 
     if (isFirstSetup) {
       openApp(
-        "welcome",
-        "Welcome",
+        'welcome',
+        'Welcome',
         PiccoloIcons.handWaving,
         WelcomeScreen(controller: this),
         initialSize: const Size(640, 420),
       );
     }
   }
-  
+
   /// Opens (or focuses) the Settings window.
   ///
   /// [initialTab] is only applied when opening a new window; if Settings is
   /// already open the existing window is focused on its current tab.
   void openSettings({int initialTab = 0}) {
-    if (isAppOpen("settings")) {
-      focusWindow("settings");
+    if (isAppOpen('settings')) {
+      focusWindow('settings');
     } else {
       openApp(
-        "settings",
-        "Settings",
+        'settings',
+        'Settings',
         PiccoloIcons.settings,
         SettingsApp(
           initialTab: initialTab,
@@ -196,12 +201,12 @@ class DesktopController extends ChangeNotifier {
   }
 
   void openAppStore() {
-    if (isAppOpen("app-store")) {
-      focusWindow("app-store");
+    if (isAppOpen('app-store')) {
+      focusWindow('app-store');
     } else {
       openApp(
-        "app-store",
-        "App Store",
+        'app-store',
+        'App Store',
         PiccoloIcons.store,
         AppStoreWindow(desktopController: this),
         initialSize: const Size(900, 650),
@@ -209,11 +214,11 @@ class DesktopController extends ChangeNotifier {
     }
   }
 
-  void logout() async {
+  Future<void> logout() async {
     try {
       await ApiClient().post('/api/v1/auth/logout');
-    } catch (e) {
-      debugPrint("Logout failed: $e");
+    } on Object catch (e) {
+      debugPrint('Logout failed: $e');
     }
 
     // Disconnect event stream
@@ -286,13 +291,13 @@ class DesktopController extends ChangeNotifier {
 
     // 1. Determine Target Size
     // Use provided initialSize or a sensible default (1024x700)
-    Size targetSize = initialSize ?? const Size(1024, 700);
+    var targetSize = initialSize ?? const Size(1024, 700);
 
     // 2. Clamp to Screen Size (Safety)
     if (screenSize != null) {
       // Ensure window isn't larger than the screen (minus dock area)
-      final double maxWidth = screenSize.width;
-      final double maxHeight = screenSize.height - kDockAreaHeight;
+      final maxWidth = screenSize.width;
+      final maxHeight = screenSize.height - kDockAreaHeight;
 
       if (targetSize.width > maxWidth) {
         targetSize = Size(maxWidth, targetSize.height);
@@ -303,11 +308,12 @@ class DesktopController extends ChangeNotifier {
     }
 
     // 3. Calculate Position (Smart Center)
-    double x, y;
+    double x;
+    double y;
 
     if (screenSize != null) {
       // Available height for centering
-      final double availableHeight = screenSize.height - kTopMargin - kDockAreaHeight;
+      final availableHeight = screenSize.height - kTopMargin - kDockAreaHeight;
 
       // Clamp height to available space to ensure dock visibility
       if (targetSize.height > availableHeight) {
@@ -366,9 +372,9 @@ class DesktopController extends ChangeNotifier {
   void focusWindow(String id) {
     final index = _windows.indexWhere((w) => w.id == id);
     if (index != -1) {
-      final window = _windows.removeAt(index);
-      // Ensure it's visible
-      window.isMinimized = false;
+      final window = _windows.removeAt(index)
+        // Ensure it's visible
+        ..isMinimized = false;
       _windows.add(window); // Move to end (top of stack)
       notifyListeners();
     }
@@ -383,7 +389,7 @@ class DesktopController extends ChangeNotifier {
   }
 
   void minimizeAllWindows() {
-    bool changed = false;
+    var changed = false;
     for (final window in List.of(_windows)) {
       if (!window.isMinimized) {
         window.isMinimized = true;
@@ -400,24 +406,26 @@ class DesktopController extends ChangeNotifier {
       // Restore
       if (window.preMaximizePosition != null &&
           window.preMaximizeSize != null) {
-        window.position = window.preMaximizePosition!;
-        window.size = window.preMaximizeSize!;
+        window
+          ..position = window.preMaximizePosition!
+          ..size = window.preMaximizeSize!;
       }
       window.isMaximized = false;
     } else {
       // Maximize
       // Save state
-      window.preMaximizePosition = window.position;
-      window.preMaximizeSize = window.size;
+      window
+        ..preMaximizePosition = window.position
+        ..preMaximizeSize = window.size
 
-      // Apply max dimensions with space for dock at bottom
-      window.position = Offset.zero;
-      window.size = Size(
-        availableSpace.width,
-        availableSpace.height - kBottomReserve,
-      );
+        // Apply max dimensions with space for dock at bottom
+        ..position = Offset.zero
+        ..size = Size(
+          availableSpace.width,
+          availableSpace.height - kBottomReserve,
+        )
 
-      window.isMaximized = true;
+        ..isMaximized = true;
 
       // Also bring to front
       focusWindow(id);
@@ -434,8 +442,8 @@ class DesktopController extends ChangeNotifier {
     // Let's lock it for now.
     if (window.isMaximized) return;
 
-    double x = newPosition.dx;
-    double y = newPosition.dy;
+    var x = newPosition.dx;
+    var y = newPosition.dy;
 
     // 1. Top Constraint: Cannot go above the top margin
     if (y < kTopMargin) {
@@ -464,16 +472,16 @@ class DesktopController extends ChangeNotifier {
 
     if (window.isMaximized) return;
 
-    const double minWidth = 300.0;
-    const double minHeight = 200.0;
+    const minWidth = 300.0;
+    const minHeight = 200.0;
 
     // Calculate maximum allowed dimensions based on current position
     // This ensures the bottom-right corner never leaves the screen
-    final double maxWidth = screenSize.width - window.position.dx;
-    final double maxHeight = screenSize.height - window.position.dy;
+    final maxWidth = screenSize.width - window.position.dx;
+    final maxHeight = screenSize.height - window.position.dy;
 
-    double w = newSize.width;
-    double h = newSize.height;
+    var w = newSize.width;
+    var h = newSize.height;
 
     // 1. Clamp to Minimums
     if (w < minWidth) w = minWidth;

@@ -1,6 +1,19 @@
 import 'package:flutter/material.dart';
 
 class DesktopWindow {
+
+  DesktopWindow({
+    required this.id,
+    required this.title,
+    required this.icon,
+    required this.child, required this.position, required this.size, this.iconUrl,
+    this.originalIconUrl,
+    this.actions,
+    this.isMinimized = false,
+    this.isMaximized = false,
+    this.isClosing = false,
+    this.requiresInterceptor = true,
+  });
   final String id;
   final String title;
   final IconData icon;
@@ -18,20 +31,4 @@ class DesktopWindow {
   // Restore state
   Offset? preMaximizePosition;
   Size? preMaximizeSize;
-
-  DesktopWindow({
-    required this.id,
-    required this.title,
-    required this.icon,
-    this.iconUrl,
-    this.originalIconUrl,
-    required this.child,
-    required this.position,
-    required this.size,
-    this.actions,
-    this.isMinimized = false,
-    this.isMaximized = false,
-    this.isClosing = false,
-    this.requiresInterceptor = true,
-  });
 }

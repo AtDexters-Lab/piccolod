@@ -1,9 +1,4 @@
 class FileSystemEntry {
-  final String name;
-  final String path;
-  final bool isDirectory;
-  final int size;
-  final DateTime modified;
 
   const FileSystemEntry({
     required this.name,
@@ -12,4 +7,9 @@ class FileSystemEntry {
     required this.size,
     required this.modified,
   });
+  final String name;
+  final String path;
+  final bool isDirectory;
+  final int size;
+  final DateTime modified;
 }

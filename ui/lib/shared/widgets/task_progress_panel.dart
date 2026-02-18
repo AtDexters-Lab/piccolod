@@ -3,28 +3,26 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
-import '../../core/config/core_config.dart';
-import '../../core/models/task_progress.dart';
-import '../../core/services/task_progress_client.dart';
-import '../../core/services/websocket_connection.dart';
-import '../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/core/config/core_config.dart';
+import 'package:piccolo_os/core/models/task_progress.dart';
+import 'package:piccolo_os/core/services/task_progress_client.dart';
+import 'package:piccolo_os/core/services/websocket_connection.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class TaskProgressPanel extends StatefulWidget {
+
+  const TaskProgressPanel({
+    required this.taskId, required this.taskType, super.key,
+    this.onComplete,
+    this.urlPath,
+  });
   final String taskId;
   final String taskType;
-  final VoidCallback? onComplete;
+  final void Function(TaskProgressEvent event)? onComplete;
 
   /// Optional URL path override for the WebSocket progress stream.
   /// Defaults to `/api/v1/events/progress/stream`.
   final String? urlPath;
-
-  const TaskProgressPanel({
-    super.key,
-    required this.taskId,
-    required this.taskType,
-    this.onComplete,
-    this.urlPath,
-  });
 
   @override
   State<TaskProgressPanel> createState() => _TaskProgressPanelState();
@@ -32,7 +30,7 @@ class TaskProgressPanel extends StatefulWidget {
 
 class _TaskProgressPanelState extends State<TaskProgressPanel> {
   TaskProgressClient? _client;
-  StreamSubscription? _sub;
+  StreamSubscription<dynamic>? _sub;
 
   final List<TaskProgressEvent> _history = [];
   TaskProgressEvent? _latest;
@@ -102,15 +100,15 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
           _history.add(evt);
         }
       });
-      if (evt.isComplete && (evt.error == null || evt.error!.isEmpty)) {
-        widget.onComplete?.call();
+      if (evt.isComplete) {
+        widget.onComplete?.call(evt);
       }
     });
     _client!.connect();
   }
 
   void _disconnect() {
-    _sub?.cancel();
+    unawaited(_sub?.cancel());
     _sub = null;
     _client?.removeListener(_onClientUpdate);
     _client?.dispose();
@@ -176,7 +174,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
   @override
   Widget build(BuildContext context) {
     final latest = _latest;
-    final title = latest?.message.isNotEmpty == true
+    final title = latest?.message.isNotEmpty ?? false
         ? latest!.message
         : 'Working...';
     final progress = latest?.progress ?? -1;
@@ -339,13 +337,13 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
 }
 
 class _ProgressSubtask {
-  final String name;
-  final String message;
-  final int progress;
 
   const _ProgressSubtask({
     required this.name,
     required this.message,
     required this.progress,
   });
+  final String name;
+  final String message;
+  final int progress;
 }

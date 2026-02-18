@@ -1,16 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import '../../../../../theme/piccolo_icons.dart';
-import '../../../../../theme/piccolo_theme.dart';
-import '../../../../../shared/widgets/info_row.dart';
-import '../../../../../shared/widgets/password_set_form.dart';
-import '../../../../../shared/widgets/piccolo_card.dart';
-import '../settings_controller.dart';
+import 'package:piccolo_os/shared/widgets/info_row.dart';
+import 'package:piccolo_os/shared/widgets/password_set_form.dart';
+import 'package:piccolo_os/shared/widgets/piccolo_card.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/settings_controller.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class ProfileTab extends StatelessWidget {
+
+  const ProfileTab({required this.controller, super.key, this.onLogout});
   final SettingsController controller;
   final VoidCallback? onLogout;
-
-  const ProfileTab({super.key, required this.controller, this.onLogout});
 
   @override
   Widget build(BuildContext context) {
@@ -21,17 +23,17 @@ class ProfileTab extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _InfoCard(
-          title: "Current Session",
+          title: 'Current Session',
           children: [
-            InfoRow("User", session.user),
-            InfoRow("Authenticated", session.authenticated.toString()),
+            InfoRow('User', session.user),
+            InfoRow('Authenticated', session.authenticated.toString()),
             if (session.expiresAt != null)
-              InfoRow("Expires At", session.expiresAt.toString()),
-            InfoRow("Volumes Locked", session.volumesLocked.toString()),
+              InfoRow('Expires At', session.expiresAt.toString()),
+            InfoRow('Volumes Locked', session.volumesLocked.toString()),
           ],
         ),
         const SizedBox(height: 32),
-        Text("Actions", style: PiccoloTheme.textTheme.headlineSmall),
+        Text('Actions', style: PiccoloTheme.textTheme.headlineSmall),
         const SizedBox(height: 16),
         Wrap(
           spacing: 16,
@@ -40,12 +42,12 @@ class ProfileTab extends StatelessWidget {
              OutlinedButton.icon(
               onPressed: () => _showChangePasswordDialog(context),
               icon: const Icon(PiccoloIcons.lockKey),
-              label: const Text("Change Password"),
+              label: const Text('Change Password'),
             ),
             FilledButton.icon(
               onPressed: () => controller.logout(onLogout ?? () {}),
               icon: const Icon(PiccoloIcons.logout),
-              label: const Text("Logout"),
+              label: const Text('Logout'),
               style: FilledButton.styleFrom(
                  backgroundColor: PiccoloTheme.critical.withValues(alpha: 0.1),
                  foregroundColor: PiccoloTheme.critical,
@@ -62,10 +64,10 @@ class ProfileTab extends StatelessWidget {
     final newController = TextEditingController();
     final confirmController = TextEditingController();
 
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text("Change Password"),
+        title: const Text('Change Password'),
         // Make it scrollable in case keyboard covers it
         content: SingleChildScrollView(
           child: SizedBox(
@@ -75,12 +77,12 @@ class ProfileTab extends StatelessWidget {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text("Enter your current password and a new secure password."),
+                  const Text('Enter your current password and a new secure password.'),
                   const SizedBox(height: 24),
                   TextField(
                     controller: oldController,
                     decoration: const InputDecoration(
-                      labelText: "Current Password",
+                      labelText: 'Current Password',
                     ),
                     obscureText: true,
                     autofillHints: const [AutofillHints.password],
@@ -89,8 +91,8 @@ class ProfileTab extends StatelessWidget {
                   PasswordSetForm(
                     passwordController: newController,
                     confirmController: confirmController,
-                    passwordLabel: "New Password",
-                    confirmLabel: "Confirm New Password",
+                    passwordLabel: 'New Password',
+                    confirmLabel: 'Confirm New Password',
                   ),
                 ],
               ),
@@ -98,7 +100,7 @@ class ProfileTab extends StatelessWidget {
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
           FilledButton(
             onPressed: () async {
               // Basic validation guard
@@ -115,30 +117,30 @@ class ProfileTab extends StatelessWidget {
                 if (context.mounted) {
                   Navigator.pop(context);
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text("Password changed successfully")),
+                    const SnackBar(content: Text('Password changed successfully')),
                   );
                 }
-              } catch (e) {
+              } on Object catch (e) {
                  if (context.mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text("Error: $e"), backgroundColor: PiccoloTheme.critical),
+                      SnackBar(content: Text('Error: $e'), backgroundColor: PiccoloTheme.critical),
                     );
                  }
               }
             },
-            child: const Text("Change"),
+            child: const Text('Change'),
           ),
         ],
       ),
-    );
+    ));
   }
 }
 
 class _InfoCard extends StatelessWidget {
-  final String title;
-  final List<Widget> children;
 
   const _InfoCard({required this.title, required this.children});
+  final String title;
+  final List<Widget> children;
 
   @override
   Widget build(BuildContext context) {

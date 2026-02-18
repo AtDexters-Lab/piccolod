@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Unified content card used throughout the Piccolo UI.
 ///
@@ -7,18 +7,17 @@ import '../../theme/piccolo_theme.dart';
 /// consistent surface: porcelain background, hairline border, configurable
 /// border radius and padding.
 class PiccoloCard extends StatelessWidget {
-  final Widget child;
-  final EdgeInsetsGeometry? padding;
-  final List<BoxShadow>? boxShadow;
-  final double? borderRadius;
 
   const PiccoloCard({
-    super.key,
-    required this.child,
+    required this.child, super.key,
     this.padding,
     this.boxShadow,
     this.borderRadius,
   });
+  final Widget child;
+  final EdgeInsetsGeometry? padding;
+  final List<BoxShadow>? boxShadow;
+  final double? borderRadius;
 
   @override
   Widget build(BuildContext context) {
