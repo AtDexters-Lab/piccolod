@@ -1,7 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import 'file_system_entry.dart';
+import 'package:piccolo_os/shells/desktop/features/files/file_system_entry.dart';
 
 class FilesController extends ChangeNotifier {
+
+  FilesController() {
+    unawaited(_loadPath('/'));
+  }
   String _currentPath = '/';
   String get currentPath => _currentPath;
 
@@ -23,10 +29,6 @@ class FilesController extends ChangeNotifier {
 
   bool _disposed = false;
 
-  FilesController() {
-    _loadPath('/');
-  }
-
   @override
   void dispose() {
     _disposed = true;
@@ -43,20 +45,20 @@ class FilesController extends ChangeNotifier {
     
     _history.add(path);
     _historyIndex++;
-    _loadPath(path);
+    unawaited(_loadPath(path));
   }
 
   void goBack() {
     if (canGoBack) {
       _historyIndex--;
-      _loadPath(_history[_historyIndex]);
+      unawaited(_loadPath(_history[_historyIndex]));
     }
   }
 
   void goForward() {
     if (canGoForward) {
       _historyIndex++;
-      _loadPath(_history[_historyIndex]);
+      unawaited(_loadPath(_history[_historyIndex]));
     }
   }
 
@@ -82,7 +84,7 @@ class FilesController extends ChangeNotifier {
     notifyListeners();
 
     // Simulate network delay
-    await Future.delayed(const Duration(milliseconds: 300));
+    await Future<void>.delayed(const Duration(milliseconds: 300));
     if (_disposed) return;
 
     try {
@@ -93,8 +95,8 @@ class FilesController extends ChangeNotifier {
         if (!a.isDirectory && b.isDirectory) return 1;
         return a.name.compareTo(b.name);
       });
-    } catch (e) {
-      _error = "Failed to load directory: $path";
+    } on Object catch (e) {
+      _error = 'Failed to load directory: $path ($e)';
     } finally {
       if (!_disposed) {
         _isLoading = false;

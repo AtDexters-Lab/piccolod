@@ -1,18 +1,16 @@
 import 'package:flutter/material.dart';
-import '../../../../theme/piccolo_icons.dart';
-import '../../../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class OnboardingStep extends StatefulWidget {
+
+  const OnboardingStep({
+    required this.onTryPiccolo, required this.onInstallDisk, super.key,
+    this.error,
+  });
   final Future<void> Function() onTryPiccolo;
   final Future<void> Function() onInstallDisk;
   final String? error;
-
-  const OnboardingStep({
-    super.key,
-    required this.onTryPiccolo,
-    required this.onInstallDisk,
-    this.error,
-  });
 
   @override
   State<OnboardingStep> createState() => _OnboardingStepState();
@@ -36,13 +34,13 @@ class _OnboardingStepState extends State<OnboardingStep> {
         mainAxisSize: MainAxisSize.min,
         children: [
           Text(
-            "Welcome to Piccolo",
+            'Welcome to Piccolo',
             style: PiccoloTheme.textTheme.displayLarge,
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 8),
           Text(
-            "How would you like to use this device?",
+            'How would you like to use this device?',
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               color: PiccoloTheme.inkMuted,
             ),
@@ -70,17 +68,17 @@ class _OnboardingStepState extends State<OnboardingStep> {
           ],
           _ChoiceCard(
             icon: PiccoloIcons.usb,
-            title: "Try Piccolo",
+            title: 'Try Piccolo',
             description:
-                "Run Piccolo from this USB drive. Full functionality, no installation required.",
+                'Run Piccolo from this USB drive. Full functionality, no installation required.',
             onTap: _isLoading ? null : () => _handleChoice(widget.onTryPiccolo),
           ),
           const SizedBox(height: 12),
           _ChoiceCard(
             icon: PiccoloIcons.saveToDisk,
-            title: "Install to Disk",
+            title: 'Install to Disk',
             description:
-                "Install Piccolo to an internal disk for permanent use. Requires internet connection.",
+                'Install Piccolo to an internal disk for permanent use. Requires internet connection.',
             onTap: _isLoading
                 ? null
                 : () => _handleChoice(widget.onInstallDisk),
@@ -103,10 +101,6 @@ class _OnboardingStepState extends State<OnboardingStep> {
 }
 
 class _ChoiceCard extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String description;
-  final VoidCallback? onTap;
 
   const _ChoiceCard({
     required this.icon,
@@ -114,6 +108,10 @@ class _ChoiceCard extends StatelessWidget {
     required this.description,
     required this.onTap,
   });
+  final IconData icon;
+  final String title;
+  final String description;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -168,7 +166,7 @@ class _ChoiceCard extends StatelessWidget {
                     const SizedBox(height: 4),
                     Text(
                       description,
-                      style: TextStyle(
+                      style: const TextStyle(
                         fontSize: 13,
                         color: PiccoloTheme.inkMuted,
                       ),

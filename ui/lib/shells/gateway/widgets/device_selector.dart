@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
-import '../../../core/models/network_models.dart';
-import '../../../theme/piccolo_icons.dart';
-import '../../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/core/models/network_models.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// A widget that displays a list of discovered Piccolo devices.
 ///
@@ -9,20 +9,16 @@ import '../../../theme/piccolo_theme.dart';
 /// Online devices can be clicked to navigate to them.
 /// Offline devices are shown with reduced opacity and disabled.
 class DeviceSelector extends StatelessWidget {
+
+  const DeviceSelector({
+    required this.onlinePeers, required this.offlinePeers, required this.self, required this.onDeviceSelected, super.key,
+    this.onDeviceSelectedHttps,
+  });
   final List<DiscoveredPeer> onlinePeers;
   final List<DiscoveredPeer> offlinePeers;
   final NetworkSelf? self;
   final void Function(DiscoveredPeer) onDeviceSelected;
   final void Function(DiscoveredPeer)? onDeviceSelectedHttps;
-
-  const DeviceSelector({
-    super.key,
-    required this.onlinePeers,
-    required this.offlinePeers,
-    required this.self,
-    required this.onDeviceSelected,
-    this.onDeviceSelectedHttps,
-  });
 
   @override
   Widget build(BuildContext context) {
@@ -62,7 +58,6 @@ class DeviceSelector extends StatelessWidget {
           final selfPeer = DiscoveredPeer(
             hostname: specificHost,
             machineId: device.self.machineId,
-            online: true,
           );
           return _DeviceCard(
             displayName: device.self.displayName,
@@ -93,23 +88,17 @@ class DeviceSelector extends StatelessWidget {
 }
 
 class _SelfDevice {
-  final NetworkSelf self;
   _SelfDevice({required this.self});
+  final NetworkSelf self;
 }
 
 class _PeerDevice {
+  _PeerDevice({required this.peer, required this.online});
   final DiscoveredPeer peer;
   final bool online;
-  _PeerDevice({required this.peer, required this.online});
 }
 
 class _DeviceCard extends StatelessWidget {
-  final String displayName;
-  final String subtitle;
-  final String? ipAddress;
-  final bool online;
-  final VoidCallback? onTap;
-  final VoidCallback? onHttpsTap;
 
   const _DeviceCard({
     required this.displayName,
@@ -119,6 +108,12 @@ class _DeviceCard extends StatelessWidget {
     required this.onTap,
     this.onHttpsTap,
   });
+  final String displayName;
+  final String subtitle;
+  final String? ipAddress;
+  final bool online;
+  final VoidCallback? onTap;
+  final VoidCallback? onHttpsTap;
 
   @override
   Widget build(BuildContext context) {

@@ -124,6 +124,24 @@ func (m *Manager) BootOrderConfigured() bool {
 	return m.config.BootOrderConfigured
 }
 
+// RevertToPending resets the state machine from install_disk back to pending.
+// This is the runtime equivalent of boot recovery (lines 72-79) but callable
+// while the server is running. Only allowed when install hasn't completed
+// (InstallDone=false), so a successful install can't be accidentally reverted.
+func (m *Manager) RevertToPending() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.config.State != StateInstallDisk || m.config.InstallDone {
+		return fmt.Errorf("revert only allowed from install_disk with InstallDone=false")
+	}
+	m.config.State = StatePending
+	m.config.InstallDone = false
+	m.config.BootOrderConfigured = false
+	m.config.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return m.persistLocked()
+}
+
 // Choose validates a state transition and persists it.
 func (m *Manager) Choose(choice OnboardingState) error {
 	m.mu.Lock()

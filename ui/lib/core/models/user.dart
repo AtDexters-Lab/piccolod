@@ -1,12 +1,5 @@
 /// User represents a user in the Piccolo system.
 class User {
-  final String id;
-  final String username;
-  final String email;
-  final String role;
-  final List<String> allowedApps;
-  final DateTime createdAt;
-  final DateTime updatedAt;
 
   User({
     required this.id,
@@ -20,19 +13,26 @@ class User {
 
   factory User.fromJson(Map<String, dynamic> json) {
     return User(
-      id: json['id'] ?? '',
-      username: json['username'] ?? '',
-      email: json['email'] ?? '',
-      role: json['role'] ?? 'standard',
-      allowedApps: List<String>.from(json['allowed_apps'] ?? []),
+      id: (json['id'] as String?) ?? '',
+      username: (json['username'] as String?) ?? '',
+      email: (json['email'] as String?) ?? '',
+      role: (json['role'] as String?) ?? 'standard',
+      allowedApps: (json['allowed_apps'] as List<dynamic>?)?.whereType<String>().toList() ?? [],
       createdAt: json['created_at'] != null
-          ? DateTime.parse(json['created_at'])
+          ? DateTime.parse(json['created_at'] as String)
           : DateTime.now(),
       updatedAt: json['updated_at'] != null
-          ? DateTime.parse(json['updated_at'])
+          ? DateTime.parse(json['updated_at'] as String)
           : DateTime.now(),
     );
   }
+  final String id;
+  final String username;
+  final String email;
+  final String role;
+  final List<String> allowedApps;
+  final DateTime createdAt;
+  final DateTime updatedAt;
 
   Map<String, dynamic> toJson() {
     return {

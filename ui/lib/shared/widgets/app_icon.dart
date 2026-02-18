@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_svg/flutter_svg.dart';
-import '../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// A widget that displays an app icon, supporting both raster images and SVGs.
 ///
@@ -8,6 +8,17 @@ import '../../theme/piccolo_theme.dart';
 /// which provides SSRF protection and caching. SVG detection is based on the
 /// original icon URL's file extension.
 class AppIcon extends StatelessWidget {
+
+  const AppIcon({
+    super.key,
+    this.proxyUrl,
+    this.originalIconUrl,
+    this.size = 48,
+    this.borderRadius = Radii.md,
+    this.fallbackText = '?',
+    this.fallbackIcon,
+    this.fallbackBackgroundColor,
+  });
   /// The proxy URL to load the icon from (e.g., '/api/v1/catalog/nextcloud/icon').
   final String? proxyUrl;
 
@@ -29,17 +40,6 @@ class AppIcon extends StatelessWidget {
 
   /// Background color for the fallback container.
   final Color? fallbackBackgroundColor;
-
-  const AppIcon({
-    super.key,
-    this.proxyUrl,
-    this.originalIconUrl,
-    this.size = 48,
-    this.borderRadius = Radii.md,
-    this.fallbackText = '?',
-    this.fallbackIcon,
-    this.fallbackBackgroundColor,
-  });
 
   /// Returns true if the original icon URL indicates an SVG file.
   bool get _isSvg {
@@ -72,7 +72,6 @@ class AppIcon extends StatelessWidget {
             proxyUrl!,
             width: innerSize,
             height: innerSize,
-            fit: BoxFit.contain,
             placeholderBuilder: (context) => _buildLoadingPlaceholder(),
             errorBuilder: (context, error, stackTrace) => _buildFallback(),
           ),

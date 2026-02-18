@@ -1,8 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import 'gateway_controller.dart';
-import 'widgets/device_selector.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/shells/gateway/gateway_controller.dart';
+import 'package:piccolo_os/shells/gateway/widgets/device_selector.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// The gateway shell is displayed when accessing piccolo.local.
 ///
@@ -23,7 +25,7 @@ class _GatewayShellState extends State<GatewayShell> {
   void initState() {
     super.initState();
     _controller = GatewayController();
-    _controller.initialize();
+    unawaited(_controller.initialize());
   }
 
   @override

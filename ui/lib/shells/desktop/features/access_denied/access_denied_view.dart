@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:web/web.dart' as web;
-import '../../../../core/services/api_client.dart';
 
 class AccessDeniedView extends StatefulWidget {
-  final String? next;
 
   const AccessDeniedView({super.key, this.next});
+  final String? next;
 
   @override
   State<AccessDeniedView> createState() => _AccessDeniedViewState();
@@ -32,7 +32,7 @@ class _AccessDeniedViewState extends State<AccessDeniedView> {
           return;
         }
       }
-    } catch (_) {
+    } on Object catch (_) {
       // Ignore; stay on the page.
     } finally {
       if (mounted) setState(() => _validating = false);
@@ -80,7 +80,7 @@ class _AccessDeniedViewState extends State<AccessDeniedView> {
                     const SizedBox(width: 12),
                     OutlinedButton(
                       onPressed: _validating ? null : _retry,
-                      child: Text(_validating ? 'Checking…' : 'Retry'),
+                      child: Text(_validating ? 'Checking\u2026' : 'Retry'),
                     ),
                   ],
                 ),
@@ -92,4 +92,3 @@ class _AccessDeniedViewState extends State<AccessDeniedView> {
     );
   }
 }
-

@@ -1,18 +1,21 @@
-import 'api_client.dart';
-import '../models/remote_models.dart';
-import '../models/service_endpoint.dart';
+import 'package:piccolo_os/core/models/remote_models.dart';
+import 'package:piccolo_os/core/models/service_endpoint.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
 
 class RemoteService {
   final ApiClient _api = ApiClient();
 
   Future<List<ServiceEndpoint>> getServices() async {
-    final response = await _api.get('/api/v1/services');
-    final List<dynamic> list = response['services'] ?? [];
-    return list.map((e) => ServiceEndpoint.fromJson(e)).toList();
+    final response = await _api.get('/api/v1/services') as Map<String, dynamic>;
+    final list = (response['services'] as List<dynamic>?) ?? <dynamic>[];
+    return list
+        .whereType<Map<dynamic, dynamic>>()
+        .map((e) => ServiceEndpoint.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
   }
 
   Future<RemoteStatus> getStatus() async {
-    final response = await _api.get('/api/v1/remote/status');
+    final response = await _api.get('/api/v1/remote/status') as Map<String, dynamic>;
     return RemoteStatus.fromJson(response);
   }
 
@@ -25,27 +28,33 @@ class RemoteService {
   }
 
   Future<String> rotateCredentials() async {
-    final response = await _api.post('/api/v1/remote/rotate');
-    return response['device_secret'] ?? '';
+    final response = await _api.post('/api/v1/remote/rotate') as Map<String, dynamic>;
+    return (response['device_secret'] as String?) ?? '';
   }
 
   Future<List<RemotePreflightCheck>> runPreflight([Map<String, dynamic>? config]) async {
-    final response = await _api.post('/api/v1/remote/preflight', body: config);
-    final List<dynamic> checks = response['checks'] ?? [];
-    return checks.map((e) => RemotePreflightCheck.fromJson(e)).toList();
+    final response = await _api.post('/api/v1/remote/preflight', body: config) as Map<String, dynamic>;
+    final checks = (response['checks'] as List<dynamic>?) ?? <dynamic>[];
+    return checks
+        .whereType<Map<dynamic, dynamic>>()
+        .map((e) => RemotePreflightCheck.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
   }
 
   Future<List<RemoteAlias>> getAliases() async {
-    final response = await _api.get('/api/v1/remote/aliases');
-    final List<dynamic> list = response['aliases'] ?? [];
-    return list.map((e) => RemoteAlias.fromJson(e)).toList();
+    final response = await _api.get('/api/v1/remote/aliases') as Map<String, dynamic>;
+    final list = (response['aliases'] as List<dynamic>?) ?? <dynamic>[];
+    return list
+        .whereType<Map<dynamic, dynamic>>()
+        .map((e) => RemoteAlias.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
   }
 
   Future<RemoteAlias> addAlias(String hostname, String listener) async {
     final response = await _api.post('/api/v1/remote/aliases', body: {
       'hostname': hostname,
       'listener': listener,
-    });
+    }) as Map<String, dynamic>;
     return RemoteAlias.fromJson(response);
   }
 
@@ -54,9 +63,12 @@ class RemoteService {
   }
 
   Future<List<RemoteCertificate>> getCertificates() async {
-    final response = await _api.get('/api/v1/remote/certificates');
-    final List<dynamic> list = response['certificates'] ?? [];
-    return list.map((e) => RemoteCertificate.fromJson(e)).toList();
+    final response = await _api.get('/api/v1/remote/certificates') as Map<String, dynamic>;
+    final list = (response['certificates'] as List<dynamic>?) ?? <dynamic>[];
+    return list
+        .whereType<Map<dynamic, dynamic>>()
+        .map((e) => RemoteCertificate.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
   }
 
   Future<void> renewCertificate(String id) async {
@@ -64,13 +76,16 @@ class RemoteService {
   }
 
   Future<List<RemoteEvent>> getEvents() async {
-    final response = await _api.get('/api/v1/remote/events');
-    final List<dynamic> list = response['events'] ?? [];
-    return list.map((e) => RemoteEvent.fromJson(e)).toList();
+    final response = await _api.get('/api/v1/remote/events') as Map<String, dynamic>;
+    final list = (response['events'] as List<dynamic>?) ?? <dynamic>[];
+    return list
+        .whereType<Map<dynamic, dynamic>>()
+        .map((e) => RemoteEvent.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
   }
 
   Future<RemoteGuideInfo> getNexusGuide() async {
-    final response = await _api.get('/api/v1/remote/nexus-guide');
+    final response = await _api.get('/api/v1/remote/nexus-guide') as Map<String, dynamic>;
     return RemoteGuideInfo.fromJson(response);
   }
 

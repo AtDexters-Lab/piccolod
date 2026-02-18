@@ -439,7 +439,7 @@ type AppAuthInjection struct {
 
 // AuthTemplateContext provides auth-related values for app manifest templating.
 type AuthTemplateContext struct {
-	// Issuer is the OIDC issuer URL (e.g., "https://piccolo.local")
+	// Issuer is the OIDC issuer URL (e.g., "https://piccolo-<machineId>.local")
 	Issuer string
 
 	// ClientID is the dynamically registered OIDC client ID for this app

@@ -1,18 +1,18 @@
 import 'package:flutter/material.dart';
-import '../../../../shared/piccolo_wordmark.dart';
-import '../../../../theme/piccolo_icons.dart';
-import '../../../../theme/piccolo_theme.dart';
-import '../../desktop_controller.dart';
-import '../settings/settings_app.dart';
+import 'package:piccolo_os/shared/piccolo_wordmark.dart';
+import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/settings_app.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Post-setup welcome screen shown as a desktop window after first boot.
 ///
 /// Displays the Piccolo wordmark, a welcome tagline, and quick-start
 /// action cards that open core apps.
 class WelcomeScreen extends StatelessWidget {
-  final DesktopController controller;
 
-  const WelcomeScreen({super.key, required this.controller});
+  const WelcomeScreen({required this.controller, super.key});
+  final DesktopController controller;
 
   @override
   Widget build(BuildContext context) {
@@ -27,7 +27,7 @@ class WelcomeScreen extends StatelessWidget {
               const PiccoloWordmark(height: 32, color: PiccoloTheme.ink),
               const SizedBox(height: Spacing.lg),
               Text(
-                "Hello, and welcome to your personal\ncorner of the internet.",
+                'Hello, and welcome to your personal\ncorner of the internet.',
                 style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
                   color: PiccoloTheme.inkMuted,
                 ),
@@ -41,22 +41,22 @@ class WelcomeScreen extends StatelessWidget {
                 children: [
                   _ActionCard(
                     icon: PiccoloIcons.store,
-                    title: "Browse Apps",
-                    subtitle: "Install your first app\nfrom the store",
+                    title: 'Browse Apps',
+                    subtitle: 'Install your first app\nfrom the store',
                     onTap: controller.openAppStore,
                   ),
                   _ActionCard(
                     icon: PiccoloIcons.cloud,
-                    title: "Access Anywhere",
-                    subtitle: "Connect to your\nPiccolo remotely",
+                    title: 'Access Anywhere',
+                    subtitle: 'Connect to your\nPiccolo remotely',
                     onTap: () => controller.openSettings(
                       initialTab: SettingsTab.remoteAccess,
                     ),
                   ),
                   _ActionCard(
                     icon: PiccoloIcons.settings,
-                    title: "Explore Settings",
-                    subtitle: "Users, network, and\nsystem preferences",
+                    title: 'Explore Settings',
+                    subtitle: 'Users, network, and\nsystem preferences',
                     onTap: controller.openSettings,
                   ),
                 ],
@@ -70,10 +70,6 @@ class WelcomeScreen extends StatelessWidget {
 }
 
 class _ActionCard extends StatefulWidget {
-  final IconData icon;
-  final String title;
-  final String subtitle;
-  final VoidCallback onTap;
 
   const _ActionCard({
     required this.icon,
@@ -81,6 +77,10 @@ class _ActionCard extends StatefulWidget {
     required this.subtitle,
     required this.onTap,
   });
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
 
   @override
   State<_ActionCard> createState() => _ActionCardState();

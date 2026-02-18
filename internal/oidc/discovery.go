@@ -8,7 +8,7 @@ import (
 
 // DiscoveryConfig configures the dynamic discovery endpoint.
 type DiscoveryConfig struct {
-	// StableIssuer is the canonical issuer (e.g., "https://piccolo.local")
+	// StableIssuer is the canonical issuer (e.g., "https://piccolo-<machineId>.local")
 	StableIssuer string
 
 	// IsRemoteActive returns true if remote/WAN access is enabled
@@ -63,9 +63,9 @@ type OpenIDConfiguration struct {
 
 // ServeHTTP handles the discovery request.
 func (h *DiscoveryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// RFC 3.1: Issuer is ALWAYS the stable issuer (e.g., "https://piccolo.local").
+	// Issuer is the machine-specific issuer (e.g., "https://piccolo-<machineId>.local").
 	// Only the authorization_endpoint varies based on LAN/WAN state.
-	// All back-channel endpoints (token, jwks, userinfo) use the stable issuer.
+	// All back-channel endpoints (token, jwks, userinfo) use the issuer.
 	issuer := h.config.StableIssuer
 
 	// Determine the authorization endpoint based on remote state (front-channel)

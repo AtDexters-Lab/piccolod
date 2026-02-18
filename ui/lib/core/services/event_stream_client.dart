@@ -3,10 +3,10 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
-import '../config/core_config.dart';
-import '../models/app_status_event.dart';
-import '../models/listener_health.dart';
-import 'websocket_connection.dart';
+import 'package:piccolo_os/core/config/core_config.dart';
+import 'package:piccolo_os/core/models/app_status_event.dart';
+import 'package:piccolo_os/core/models/listener_health.dart';
+import 'package:piccolo_os/core/services/websocket_connection.dart';
 
 /// Unified event stream client that multiplexes multiple event types
 /// over a single WebSocket connection.
@@ -17,19 +17,25 @@ import 'websocket_connection.dart';
 /// - remote_config: Remote access configuration changes (admin only)
 /// - certificate: Certificate status changes (admin only)
 class EventStreamClient extends ChangeNotifier {
+
+  /// Creates an EventStreamClient that subscribes to all event topics.
+  EventStreamClient() : _connection = WebSocketConnection(_buildUrl()) {
+    _connectionListener = _onConnectionStateChanged;
+    _connection.addListener(_connectionListener);
+  }
   final WebSocketConnection _connection;
   late final VoidCallback _connectionListener;
 
-  StreamSubscription? _subscription;
+  StreamSubscription<dynamic>? _subscription;
 
   final StreamController<AppStatusEvent> _appStatusController =
-      StreamController.broadcast();
+      StreamController<AppStatusEvent>.broadcast();
   final StreamController<ListenerHealthEvent> _healthController =
-      StreamController.broadcast();
+      StreamController<ListenerHealthEvent>.broadcast();
   final StreamController<Map<String, dynamic>> _remoteConfigController =
-      StreamController.broadcast();
+      StreamController<Map<String, dynamic>>.broadcast();
   final StreamController<Map<String, dynamic>> _certificateController =
-      StreamController.broadcast();
+      StreamController<Map<String, dynamic>>.broadcast();
 
   /// Called when a reconnect attempt indicates an auth failure (e.g. session expired).
   /// Set by the shell to trigger the re-auth overlay for passive WebSocket-only failures.
@@ -52,12 +58,6 @@ class EventStreamClient extends ChangeNotifier {
       _certificateController.stream;
 
   WebSocketConnectionState get state => _connection.state;
-
-  /// Creates an EventStreamClient that subscribes to all event topics.
-  EventStreamClient() : _connection = WebSocketConnection(_buildUrl()) {
-    _connectionListener = _onConnectionStateChanged;
-    _connection.addListener(_connectionListener);
-  }
 
   static String _buildUrl() {
     // Subscribe to all topics
@@ -85,7 +85,7 @@ class EventStreamClient extends ChangeNotifier {
     // When disconnected/error, cancel subscription for re-subscribe on reconnect
     if (_connection.state == WebSocketConnectionState.disconnected ||
         _connection.state == WebSocketConnectionState.error) {
-      _subscription?.cancel();
+      unawaited(_subscription?.cancel());
       _subscription = null;
     }
 
@@ -120,7 +120,7 @@ class EventStreamClient extends ChangeNotifier {
 
   void disconnect({bool clearError = false}) {
     if (_isDisposed) return;
-    _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
     _connection.disconnect(clearError: clearError);
   }
@@ -143,18 +143,14 @@ class EventStreamClient extends ChangeNotifier {
       switch (type) {
         case 'app_status':
           _appStatusController.add(AppStatusEvent.fromJson(payload));
-          break;
         case 'listener_health':
           _healthController.add(ListenerHealthEvent.fromJson(payload));
-          break;
         case 'remote_config':
           _remoteConfigController.add(payload);
-          break;
         case 'certificate':
           _certificateController.add(payload);
-          break;
       }
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('Event stream decode error: $e');
     }
   }
@@ -162,14 +158,15 @@ class EventStreamClient extends ChangeNotifier {
   @override
   void dispose() {
     _isDisposed = true;
-    _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
-    _connection.removeListener(_connectionListener);
-    _connection.dispose();
-    _appStatusController.close();
-    _healthController.close();
-    _remoteConfigController.close();
-    _certificateController.close();
+    _connection
+      ..removeListener(_connectionListener)
+      ..dispose();
+    unawaited(_appStatusController.close());
+    unawaited(_healthController.close());
+    unawaited(_remoteConfigController.close());
+    unawaited(_certificateController.close());
     super.dispose();
   }
 }

@@ -1,10 +1,10 @@
-import '../services/api_client.dart';
-import '../models/network_models.dart';
+import 'package:piccolo_os/core/models/network_models.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
 
 class NetworkService {
-  final ApiClient _client;
 
   NetworkService(this._client);
+  final ApiClient _client;
 
   /// Fetches discovered Piccolo peers on the LAN.
   /// Returns empty list if accessed remotely (via Nexus proxy).

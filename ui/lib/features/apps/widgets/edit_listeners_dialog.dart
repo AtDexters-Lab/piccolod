@@ -1,17 +1,15 @@
 import 'package:flutter/material.dart';
-import '../../../../core/models/app_models.dart';
-import '../../../../theme/piccolo_theme.dart';
-import '../../../../theme/piccolo_icons.dart';
+import 'package:piccolo_os/core/models/app_models.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class EditListenersDialog extends StatefulWidget {
-  final List<AppListener> initialListeners;
-  final Function(List<AppListener>) onSave;
 
   const EditListenersDialog({
-    super.key,
-    required this.initialListeners,
-    required this.onSave,
+    required this.initialListeners, required this.onSave, super.key,
   });
+  final List<AppListener> initialListeners;
+  final void Function(List<AppListener>) onSave;
 
   @override
   State<EditListenersDialog> createState() => _EditListenersDialogState();
@@ -51,7 +49,7 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text("Edit Listeners"),
+      title: const Text('Edit Listeners'),
       content: SizedBox(
         width: 700,
         height: 500,
@@ -69,7 +67,7 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
                   SizedBox(width: Spacing.sm),
                   Expanded(
                     child: Text(
-                      "Updating listeners may cause the application container to recreate.",
+                      'Updating listeners may cause the application container to recreate.',
                       style: TextStyle(
                         color: PiccoloTheme.inkMuted,
                         fontSize: 13,
@@ -101,7 +99,7 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
             OutlinedButton.icon(
               onPressed: _addListener,
               icon: const Icon(PiccoloIcons.add),
-              label: const Text("Add Listener"),
+              label: const Text('Add Listener'),
             ),
           ],
         ),
@@ -109,7 +107,7 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text("Cancel"),
+          child: const Text('Cancel'),
         ),
         FilledButton(
           onPressed: () {
@@ -118,7 +116,7 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
               Navigator.of(context).pop();
             }
           },
-          child: const Text("Save Changes"),
+          child: const Text('Save Changes'),
         ),
       ],
     );
@@ -126,15 +124,15 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
 }
 
 class _ListenerRow extends StatelessWidget {
-  final AppListener listener;
-  final VoidCallback onDelete;
-  final ValueChanged<AppListener> onChange;
 
   const _ListenerRow({
     required this.listener,
     required this.onDelete,
     required this.onChange,
   });
+  final AppListener listener;
+  final VoidCallback onDelete;
+  final ValueChanged<AppListener> onChange;
 
   @override
   Widget build(BuildContext context) {
@@ -148,13 +146,13 @@ class _ListenerRow extends StatelessWidget {
             child: TextFormField(
               initialValue: listener.name,
               decoration: const InputDecoration(
-                labelText: "Name",
+                labelText: 'Name',
                 isDense: true,
                 border: OutlineInputBorder(),
               ),
               onChanged: (val) => onChange(_copyWith(name: val)),
               validator: (val) =>
-                  val == null || val.isEmpty ? "Required" : null,
+                  val == null || val.isEmpty ? 'Required' : null,
             ),
           ),
           const SizedBox(width: Spacing.md),
@@ -163,7 +161,7 @@ class _ListenerRow extends StatelessWidget {
             child: TextFormField(
               initialValue: listener.guestPort.toString(),
               decoration: const InputDecoration(
-                labelText: "Port",
+                labelText: 'Port',
                 isDense: true,
                 border: OutlineInputBorder(),
               ),
@@ -174,7 +172,7 @@ class _ListenerRow extends StatelessWidget {
               },
               validator: (val) {
                 final p = int.tryParse(val ?? '');
-                return p == null || p <= 0 || p > 65535 ? "Invalid" : null;
+                return p == null || p <= 0 || p > 65535 ? 'Invalid' : null;
               },
             ),
           ),
@@ -184,14 +182,14 @@ class _ListenerRow extends StatelessWidget {
             child: DropdownButtonFormField<String>(
               initialValue: listener.protocol,
               decoration: const InputDecoration(
-                labelText: "Protocol",
+                labelText: 'Protocol',
                 isDense: true,
                 border: OutlineInputBorder(),
               ),
               items: const [
-                DropdownMenuItem(value: "raw", child: Text("Raw (TCP/UDP)")),
-                DropdownMenuItem(value: "http", child: Text("HTTP")),
-                DropdownMenuItem(value: "websocket", child: Text("WebSocket")),
+                DropdownMenuItem(value: 'raw', child: Text('Raw (TCP/UDP)')),
+                DropdownMenuItem(value: 'http', child: Text('HTTP')),
+                DropdownMenuItem(value: 'websocket', child: Text('WebSocket')),
               ],
               onChanged: (val) {
                 if (val != null) onChange(_copyWith(protocol: val));
@@ -204,13 +202,13 @@ class _ListenerRow extends StatelessWidget {
             child: DropdownButtonFormField<String>(
               initialValue: listener.flow,
               decoration: const InputDecoration(
-                labelText: "Flow",
+                labelText: 'Flow',
                 isDense: true,
                 border: OutlineInputBorder(),
               ),
               items: const [
-                DropdownMenuItem(value: "tcp", child: Text("TCP")),
-                DropdownMenuItem(value: "tls", child: Text("TLS")),
+                DropdownMenuItem(value: 'tcp', child: Text('TCP')),
+                DropdownMenuItem(value: 'tls', child: Text('TLS')),
               ],
               onChanged: (val) {
                 if (val != null) onChange(_copyWith(flow: val));
@@ -221,7 +219,7 @@ class _ListenerRow extends StatelessWidget {
           IconButton(
             icon: const Icon(PiccoloIcons.delete, color: PiccoloTheme.critical),
             onPressed: onDelete,
-            tooltip: "Remove Listener",
+            tooltip: 'Remove Listener',
           ),
         ],
       ),

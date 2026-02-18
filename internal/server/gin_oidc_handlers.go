@@ -28,9 +28,14 @@ func (s *GinServer) getOIDCClientManager() *oidc.ClientManager {
 	return oidc.NewClientManager(repo)
 }
 
-// stableIssuer is the constant OIDC issuer URL.
-// All OIDC operations use HTTPS for the back-channel; HTTP is not supported.
-const stableIssuer = "https://piccolo.local"
+// oidcIssuer returns the OIDC issuer URL using the machine-specific hostname.
+// Falls back to piccolo.local when mDNS is disabled.
+func (s *GinServer) oidcIssuer() string {
+	if s.mdnsManager != nil {
+		return "https://" + s.mdnsManager.SpecificHostname()
+	}
+	return "https://piccolo.local"
+}
 
 type requestedRedirectURIKey struct{}
 
@@ -58,9 +63,8 @@ func (s *GinServer) initOIDCProvider() (*oidc.Provider, error) {
 	}
 	control := s.persistence.Control()
 
-	// Config - issuer is always https://piccolo.local
 	cfg := oidc.ProviderConfig{
-		Issuer:          stableIssuer,
+		Issuer:          s.oidcIssuer(),
 		Users:           control.Users(),
 		Clients:         control.OIDCClients(),
 		Keys:            control.OIDCKeys(),
@@ -273,7 +277,7 @@ func getLocalMachineIPs() []string {
 func (s *GinServer) handleOIDCDiscovery(c *gin.Context) {
 	// Custom discovery handler that is "Split-Horizon" aware
 	cfg := oidc.DiscoveryConfig{
-		StableIssuer: stableIssuer,
+		StableIssuer: s.oidcIssuer(),
 		IsRemoteActive: func() bool {
 			if s.remoteManager == nil {
 				return false

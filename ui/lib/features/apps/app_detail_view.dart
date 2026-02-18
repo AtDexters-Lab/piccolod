@@ -1,27 +1,34 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/app_models.dart';
+import 'package:piccolo_os/core/models/app_status_event.dart';
+import 'package:piccolo_os/core/models/listener_health.dart';
+import 'package:piccolo_os/core/services/app_service.dart';
+import 'package:piccolo_os/core/utils/task_id.dart';
+import 'package:piccolo_os/features/apps/app_launcher.dart';
+import 'package:piccolo_os/features/apps/widgets/edit_listeners_dialog.dart';
+import 'package:piccolo_os/features/apps/widgets/health_banner.dart';
+import 'package:piccolo_os/features/apps/workspace_terminal.dart';
+import 'package:piccolo_os/shared/widgets/app_icon.dart';
+import 'package:piccolo_os/shared/widgets/health_badge.dart';
+import 'package:piccolo_os/shared/widgets/log_stream_viewer.dart';
+import 'package:piccolo_os/shared/widgets/status_banner.dart';
+import 'package:piccolo_os/shared/widgets/task_progress_panel.dart';
+import 'package:piccolo_os/shared/widgets/uninstall_confirmation_dialog.dart';
+import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:url_launcher/url_launcher.dart';
-import '../../theme/piccolo_theme.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../core/models/app_models.dart';
-import '../../core/models/app_status_event.dart';
-import '../../core/models/listener_health.dart';
-import '../../core/services/app_service.dart';
-import '../../core/utils/task_id.dart';
-import '../../shared/widgets/app_icon.dart';
-import '../../shared/widgets/health_badge.dart';
-import '../../shared/widgets/log_stream_viewer.dart';
-import '../../shared/widgets/status_banner.dart';
-import '../../shared/widgets/task_progress_panel.dart';
-import '../../shared/widgets/uninstall_confirmation_dialog.dart';
-import '../../shells/desktop/desktop_controller.dart';
-import 'app_launcher.dart';
-import 'widgets/edit_listeners_dialog.dart';
-import 'widgets/health_banner.dart';
-import 'workspace_terminal.dart';
 
 class AppDetailView extends StatefulWidget {
+
+  const AppDetailView({
+    required this.appId, required this.appService, required this.desktopController, super.key,
+    this.initialTab = 0,
+    this.iconUrl,
+    this.originalIconUrl,
+  });
   static const int tabOverview = 0;
   static const int tabNetwork = 1;
   static const int tabConfiguration = 2;
@@ -33,16 +40,6 @@ class AppDetailView extends StatefulWidget {
   final int initialTab;
   final String? iconUrl;
   final String? originalIconUrl;
-
-  const AppDetailView({
-    super.key,
-    required this.appId,
-    required this.appService,
-    required this.desktopController,
-    this.initialTab = 0,
-    this.iconUrl,
-    this.originalIconUrl,
-  });
 
   @override
   State<AppDetailView> createState() => _AppDetailViewState();
@@ -75,7 +72,7 @@ class _AppDetailViewState extends State<AppDetailView>
       vsync: this,
       initialIndex: widget.initialTab.clamp(0, 3),
     );
-    _loadData();
+    unawaited(_loadData());
     _connectStatusStream();
     _connectHealthStream();
   }
@@ -116,8 +113,8 @@ class _AppDetailViewState extends State<AppDetailView>
 
   @override
   void dispose() {
-    _statusSub?.cancel();
-    _healthSub?.cancel();
+    unawaited(_statusSub?.cancel());
+    unawaited(_healthSub?.cancel());
     _tabController.dispose();
     super.dispose();
   }
@@ -146,7 +143,7 @@ class _AppDetailViewState extends State<AppDetailView>
         );
         _isLoading = false;
       });
-    } catch (e) {
+    } on Object catch (e) {
       if (!mounted) return;
       setState(() {
         _error = e.toString();
@@ -165,7 +162,7 @@ class _AppDetailViewState extends State<AppDetailView>
     final taskId = generateTaskId();
     final progressDone = Completer<void>();
 
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
@@ -175,13 +172,13 @@ class _AppDetailViewState extends State<AppDetailView>
           child: TaskProgressPanel(
             taskId: taskId,
             taskType: taskType,
-            onComplete: () {
+            onComplete: (_) {
               if (!progressDone.isCompleted) progressDone.complete();
             },
           ),
         ),
       ),
-    );
+    ));
 
     setState(() => _isActionLoading = true);
     Object? actionError;
@@ -191,7 +188,7 @@ class _AppDetailViewState extends State<AppDetailView>
         const Duration(seconds: 2),
         onTimeout: () {},
       );
-    } catch (e) {
+    } on Object catch (e) {
       actionError = e;
     } finally {
       if (mounted) setState(() => _isActionLoading = false);
@@ -203,7 +200,7 @@ class _AppDetailViewState extends State<AppDetailView>
     if (actionError != null && mounted) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text("Action failed: $actionError")));
+      ).showSnackBar(SnackBar(content: Text('Action failed: $actionError')));
       return false;
     }
 
@@ -215,7 +212,7 @@ class _AppDetailViewState extends State<AppDetailView>
     return true;
   }
 
-  void _confirmUninstall() async {
+  Future<void> _confirmUninstall() async {
     final confirmed = await UninstallConfirmationDialog.show(
       context,
       appDisplayTitle: _app?.displayTitle ?? widget.appId,
@@ -245,10 +242,10 @@ class _AppDetailViewState extends State<AppDetailView>
 
     // Convert current services to AppListener list
     final initialListeners = _listeners
-        .map((s) => AppListener.fromServiceEndpoint(s))
+        .map(AppListener.fromServiceEndpoint)
         .toList();
 
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       builder: (context) => EditListenersDialog(
         initialListeners: initialListeners,
@@ -263,16 +260,16 @@ class _AppDetailViewState extends State<AppDetailView>
           );
         },
       ),
-    );
+    ));
   }
 
   void _openTerminal() {
     if (_app == null) return;
 
-    final windowId = "terminal-${_app!.name}";
+    final windowId = 'terminal-${_app!.name}';
     widget.desktopController.openApp(
       windowId,
-      "${_app!.displayTitle} Terminal",
+      '${_app!.displayTitle} Terminal',
       PiccoloIcons.terminal,
       WorkspaceTerminal(
         appId: _app!.name,
@@ -290,8 +287,8 @@ class _AppDetailViewState extends State<AppDetailView>
 
   Widget _buildBody() {
     if (_isLoading) return const Center(child: CircularProgressIndicator());
-    if (_error != null) return Center(child: Text("Error: $_error"));
-    if (_app == null) return const Center(child: Text("App uninstalled."));
+    if (_error != null) return Center(child: Text('Error: $_error'));
+    if (_app == null) return const Center(child: Text('App uninstalled.'));
 
     return Column(
       children: [
@@ -322,16 +319,16 @@ class _AppDetailViewState extends State<AppDetailView>
           unselectedLabelColor: PiccoloTheme.inkMuted,
           indicatorColor: PiccoloTheme.cobalt600,
           tabs: const [
-            Tab(text: "Overview"),
-            Tab(text: "Network"),
-            Tab(text: "Configuration"),
-            Tab(text: "Logs"),
+            Tab(text: 'Overview'),
+            Tab(text: 'Network'),
+            Tab(text: 'Configuration'),
+            Tab(text: 'Logs'),
           ],
         ),
 
         // Content
         Expanded(
-          child: Container(
+          child: ColoredBox(
             color: PiccoloTheme.mist,
             child: TabBarView(
               controller: _tabController,
@@ -349,7 +346,7 @@ class _AppDetailViewState extends State<AppDetailView>
   }
 
   Widget _buildHeader() {
-    Color statusColor = PiccoloTheme.inkMuted;
+    var statusColor = PiccoloTheme.inkMuted;
     if (_app!.isRunning) statusColor = PiccoloTheme.success;
     if (_app!.isStarting) statusColor = PiccoloTheme.warning;
     if (_app!.isError) statusColor = PiccoloTheme.critical;
@@ -431,7 +428,7 @@ class _AppDetailViewState extends State<AppDetailView>
                     ),
                     const SizedBox(width: Spacing.base),
                     Text(
-                      "Image: ${_app!.image}",
+                      'Image: ${_app!.image}',
                       style: PiccoloTheme.textTheme.labelSmall,
                     ),
                   ],
@@ -447,7 +444,6 @@ class _AppDetailViewState extends State<AppDetailView>
             const CircularProgressIndicator()
           else
             Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
               mainAxisSize: MainAxisSize.min,
               children: [
                 if (_containers.length > 1) ...[
@@ -458,7 +454,7 @@ class _AppDetailViewState extends State<AppDetailView>
                   FilledButton.icon(
                     onPressed: _openTerminal,
                     icon: const Icon(PiccoloIcons.terminal),
-                    label: const Text("Terminal"),
+                    label: const Text('Terminal'),
                     style: FilledButton.styleFrom(
                       backgroundColor: PiccoloTheme.cobalt600,
                     ),
@@ -473,7 +469,7 @@ class _AppDetailViewState extends State<AppDetailView>
                           widget.appService.stopApp(_app!.name, taskId: taskId),
                     ),
                     icon: const Icon(PiccoloIcons.stop),
-                    label: const Text("Stop"),
+                    label: const Text('Stop'),
                     style: FilledButton.styleFrom(
                       backgroundColor: PiccoloTheme.inkMuted,
                     ),
@@ -486,7 +482,7 @@ class _AppDetailViewState extends State<AppDetailView>
                           widget.appService.startApp(_app!.name, taskId: taskId),
                     ),
                     icon: const Icon(PiccoloIcons.play),
-                    label: const Text("Start"),
+                    label: const Text('Start'),
                     style: FilledButton.styleFrom(
                       backgroundColor: PiccoloTheme.success,
                     ),
@@ -495,7 +491,7 @@ class _AppDetailViewState extends State<AppDetailView>
                 IconButton.outlined(
                   onPressed: _confirmUninstall,
                   icon: const Icon(PiccoloIcons.delete, size: 20),
-                  tooltip: "Uninstall",
+                  tooltip: 'Uninstall',
                   style: IconButton.styleFrom(
                     foregroundColor: PiccoloTheme.critical,
                     side: BorderSide(
@@ -549,16 +545,16 @@ class _AppDetailViewState extends State<AppDetailView>
     return ListView(
       padding: const EdgeInsets.all(Spacing.lg),
       children: [
-        _buildSectionTitle("Storage Volumes"),
+        _buildSectionTitle('Storage Volumes'),
         if (_app!.volumes.isEmpty)
-          const Text("No persistent volumes configured.")
+          const Text('No persistent volumes configured.')
         else
           ..._app!.volumes.map(
             (v) => Card(
               child: ListTile(
                 leading: const Icon(PiccoloIcons.storage),
                 title: Text(v.containerPath),
-                subtitle: Text("Host: ${v.hostPath}"),
+                subtitle: Text('Host: ${v.hostPath}'),
                 trailing: Text(v.sizeLimit),
               ),
             ),
@@ -567,11 +563,11 @@ class _AppDetailViewState extends State<AppDetailView>
         const SizedBox(height: Spacing.lg),
         _buildSectionTitle(
           _containers.length > 1 && (_selectedService?.isNotEmpty ?? false)
-              ? "Environment Variables (${_selectedService!})"
-              : "Environment Variables",
+              ? 'Environment Variables (${_selectedService!})'
+              : 'Environment Variables',
         ),
         if (_app!.environmentForService(_selectedService).isEmpty)
-          const Text("No environment variables.")
+          const Text('No environment variables.')
         else
           Container(
             padding: const EdgeInsets.all(Spacing.base),
@@ -624,7 +620,7 @@ class _AppDetailViewState extends State<AppDetailView>
 
   Widget _buildNetworkTab() {
     final content = _listeners.isEmpty
-        ? const Center(child: Text("No network services exposed."))
+        ? const Center(child: Text('No network services exposed.'))
         : ListView(
             padding: const EdgeInsets.all(Spacing.lg),
             children: _listeners
@@ -672,7 +668,7 @@ class _AppDetailViewState extends State<AppDetailView>
                             ],
                           ),
                           const Divider(height: Spacing.lg),
-                          _buildNetworkRow("Internal Port", "${svc.guestPort}"),
+                          _buildNetworkRow('Internal Port', '${svc.guestPort}'),
                           if (svc.lanHostUrl != null)
                             Builder(builder: (_) {
                               final host = Uri.base.host.toLowerCase();
@@ -684,19 +680,19 @@ class _AppDetailViewState extends State<AppDetailView>
                                   ? (svc.localUrl ?? svc.lanHostUrl!)
                                   : svc.lanHostUrl!;
                               return _buildNetworkLinkRow(
-                                "LAN Access",
+                                'LAN Access',
                                 url,
                                 onTap: () => launchUrl(Uri.parse(url)),
                                 icon: PiccoloIcons.openExternal,
-                                tooltip: "Opens in new tab",
+                                tooltip: 'Opens in new tab',
                               );
                             }),
                           if (svc.localUrl != null)
                             _buildNetworkLinkRow(
                               svc.lanHostUrl != null
-                                  ? "LAN Fallback"
-                                  : "LAN Access",
-                              "${svc.localUrl} (Port ${svc.publicPort})",
+                                  ? 'LAN Fallback'
+                                  : 'LAN Access',
+                              '${svc.localUrl} (Port ${svc.publicPort})',
                               onTap: () => AppLauncher.openAppWindow(
                                 controller: widget.desktopController,
                                 appService: widget.appService,
@@ -704,11 +700,11 @@ class _AppDetailViewState extends State<AppDetailView>
                                 service: svc,
                               ),
                               icon: PiccoloIcons.webAsset,
-                              tooltip: "Opens in app window",
+                              tooltip: 'Opens in app window',
                             ),
                           if (svc.remoteUrl != null)
                             _buildNetworkLinkRow(
-                              "Remote Access",
+                              'Remote Access',
                               svc.remoteUrl!,
                               onTap: () => AppLauncher.healthGatedOpen(
                                 context: context,
@@ -716,14 +712,14 @@ class _AppDetailViewState extends State<AppDetailView>
                                 appService: widget.appService,
                                 app: _app!,
                                 service: svc,
-                                overrideUrl: svc.remoteUrl!,
+                                overrideUrl: svc.remoteUrl,
                                 // Only override with live stream health for primary listener
                                 healthOverride: svc.name == _primaryListenerName
                                     ? _primaryHealth
                                     : null,
                               ),
                               icon: PiccoloIcons.webAsset,
-                              tooltip: "Opens in app window",
+                              tooltip: 'Opens in app window',
                             ),
                         ],
                       ),
@@ -744,7 +740,7 @@ class _AppDetailViewState extends State<AppDetailView>
                 OutlinedButton.icon(
                   onPressed: _showEditListenersDialog,
                   icon: const Icon(PiccoloIcons.edit, size: 16),
-                  label: const Text("Edit Listeners"),
+                  label: const Text('Edit Listeners'),
                 ),
               ],
             ),
@@ -767,9 +763,9 @@ class _AppDetailViewState extends State<AppDetailView>
           border: Border.all(color: PiccoloTheme.hairline),
         ),
         child: SelectableText(
-          "App ID: ${_app!.id}\n"
-          "Type: ${_app!.type}\n"
-          "Container ID: ${_app!.containerId}\n",
+          'App ID: ${_app!.id}\n'
+          'Type: ${_app!.type}\n'
+          'Container ID: ${_app!.containerId}\n',
           style: const TextStyle(fontFamily: 'JetBrainsMono'),
         ),
       ),
@@ -782,7 +778,6 @@ class _AppDetailViewState extends State<AppDetailView>
       child: LogStreamViewer(
         appName: _app!.name,
         serviceName: _selectedService,
-        tailLines: 200,
       ),
     );
   }

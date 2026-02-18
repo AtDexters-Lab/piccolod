@@ -1,15 +1,15 @@
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Key-value row used in settings info cards and profile panels.
 ///
 /// Replaces the duplicated `_InfoRow` widgets in `profile_tab.dart`
 /// and `system_tab.dart`.
 class InfoRow extends StatelessWidget {
-  final String label;
-  final String value;
 
   const InfoRow(this.label, this.value, {super.key});
+  final String label;
+  final String value;
 
   @override
   Widget build(BuildContext context) {

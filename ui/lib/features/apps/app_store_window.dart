@@ -1,16 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_theme.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../shells/desktop/desktop_controller.dart';
-import 'store_tab.dart';
-import 'custom_install_wizard.dart';
-import 'create_workspace_wizard.dart';
-import 'app_detail_view.dart';
+import 'package:piccolo_os/features/apps/app_detail_view.dart';
+import 'package:piccolo_os/features/apps/create_workspace_wizard.dart';
+import 'package:piccolo_os/features/apps/custom_install_wizard.dart';
+import 'package:piccolo_os/features/apps/store_tab.dart';
+import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class AppStoreWindow extends StatefulWidget {
-  final DesktopController desktopController;
 
-  const AppStoreWindow({super.key, required this.desktopController});
+  const AppStoreWindow({required this.desktopController, super.key});
+  final DesktopController desktopController;
 
   @override
   State<AppStoreWindow> createState() => _AppStoreWindowState();
@@ -18,7 +20,7 @@ class AppStoreWindow extends StatefulWidget {
 
 class _AppStoreWindowState extends State<AppStoreWindow> {
   final TextEditingController _searchController = TextEditingController();
-  String _searchQuery = "";
+  String _searchQuery = '';
 
   // Category state (managed here, passed to StoreTab)
   List<String> _categories = ['All'];
@@ -32,7 +34,7 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
         _searchQuery = _searchController.text;
       });
     });
-    _loadCategories();
+    unawaited(_loadCategories());
   }
 
   @override
@@ -48,8 +50,8 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
       setState(() {
         _categories = ['All', ...cats];
       });
-    } catch (e) {
-      debugPrint("Failed to load categories: $e");
+    } on Object catch (e) {
+      debugPrint('Failed to load categories: $e');
     }
   }
 
@@ -61,7 +63,7 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
   }
 
   void _openCustomInstallWizard() {
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (context) => CustomInstallWizard(
@@ -71,24 +73,24 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
           _openAppDetail(appName);
         },
       ),
-    );
+    ));
   }
 
   void _openCreateWorkspace() {
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (context) => CreateWorkspaceWizard(
         appService: widget.desktopController.appService,
         onSuccess: () {},
       ),
-    );
+    ));
   }
 
   void _openAppDetail(String appName, {String? iconUrl}) {
     widget.desktopController.notifyAppsChanged();
     widget.desktopController.openApp(
-      "app-detail-$appName",
+      'app-detail-$appName',
       appName,
       PiccoloIcons.settingsApp,
       AppDetailView(
@@ -142,14 +144,14 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
               OutlinedButton.icon(
                 onPressed: _openCreateWorkspace,
                 icon: const Icon(PiccoloIcons.terminal, size: 18),
-                label: const Text("Create Workspace"),
+                label: const Text('Create Workspace'),
               ),
               const SizedBox(width: Spacing.sm),
               // Custom App Button
               OutlinedButton.icon(
                 onPressed: _openCustomInstallWizard,
                 icon: const Icon(PiccoloIcons.addBox, size: 18),
-                label: const Text("Custom App"),
+                label: const Text('Custom App'),
               ),
             ],
           ),

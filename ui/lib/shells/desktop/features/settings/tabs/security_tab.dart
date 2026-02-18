@@ -1,23 +1,23 @@
 import 'package:flutter/material.dart';
-import '../../../../../shared/widgets/ca_import_guide.dart';
-import '../../../../../theme/piccolo_icons.dart';
-import '../../../../../theme/piccolo_theme.dart';
-import '../settings_controller.dart';
+import 'package:piccolo_os/shared/widgets/ca_import_guide.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/settings_controller.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class SecurityTab extends StatelessWidget {
-  final SettingsController controller;
 
-  const SecurityTab({super.key, required this.controller});
+  const SecurityTab({required this.controller, super.key});
+  final SettingsController controller;
 
   @override
   Widget build(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text("Security",
+        Text('Security',
             style: PiccoloTheme.textTheme.headlineLarge),
         const SizedBox(height: Spacing.xl),
-        Text("HTTPS on LAN",
+        Text('HTTPS on LAN',
             style: PiccoloTheme.textTheme.titleMedium),
         const SizedBox(height: Spacing.base),
         _LANSecurityCard(controller: controller),
@@ -27,8 +27,8 @@ class SecurityTab extends StatelessWidget {
 }
 
 class _LANSecurityCard extends StatelessWidget {
-  final SettingsController controller;
   const _LANSecurityCard({required this.controller});
+  final SettingsController controller;
 
   @override
   Widget build(BuildContext context) {
@@ -44,26 +44,26 @@ class _LANSecurityCard extends StatelessWidget {
         children: [
           Row(
             children: [
-              Icon(PiccoloIcons.lock, color: PiccoloTheme.success, size: 20),
+              const Icon(PiccoloIcons.lock, color: PiccoloTheme.success, size: 20),
               const SizedBox(width: Spacing.sm),
-              Text("HTTPS on LAN",
+              Text('HTTPS on LAN',
                 style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold)),
             ],
           ),
           const SizedBox(height: Spacing.sm),
           Text(
             controller.specificHostname != null
-                ? "Access this portal securely via https://${controller.specificHostname}. "
-                  "To avoid browser warnings, download and trust the CA certificate."
-                : "Access this portal securely via HTTPS using your device-specific hostname. "
-                  "To avoid browser warnings, download and trust the CA certificate.",
+                ? 'Access this portal securely via https://${controller.specificHostname}. '
+                  'To avoid browser warnings, download and trust the CA certificate.'
+                : 'Access this portal securely via HTTPS using your device-specific hostname. '
+                  'To avoid browser warnings, download and trust the CA certificate.',
             style: PiccoloTheme.textTheme.labelSmall,
           ),
           const SizedBox(height: Spacing.base),
           OutlinedButton.icon(
             icon: const Icon(PiccoloIcons.download, size: 18),
-            label: const Text("Download CA Certificate"),
-            onPressed: () => controller.downloadCACertificate(),
+            label: const Text('Download CA Certificate'),
+            onPressed: controller.downloadCACertificate,
           ),
           const SizedBox(height: Spacing.lg),
           const CaImportGuide(),

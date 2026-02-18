@@ -1,13 +1,13 @@
 import 'package:flutter/material.dart';
-import '../../../../core/services/event_stream_client.dart';
-import '../../../../theme/piccolo_icons.dart';
-import '../../../../theme/piccolo_theme.dart';
-import 'settings_controller.dart';
-import 'tabs/profile_tab.dart';
-import 'tabs/remote/remote_tab.dart';
-import 'tabs/security_tab.dart';
-import 'tabs/system_tab.dart';
-import 'tabs/users/users_tab.dart';
+import 'package:piccolo_os/core/services/event_stream_client.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/settings_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/profile_tab.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_tab.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/security_tab.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/system_tab.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/users/users_tab.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Named indices for the Settings sidebar tabs.
 class SettingsTab {
@@ -20,11 +20,11 @@ class SettingsTab {
 }
 
 class SettingsApp extends StatefulWidget {
+
+  const SettingsApp({super.key, this.onLogout, this.eventStreamClient, this.initialTab = 0});
   final VoidCallback? onLogout;
   final EventStreamClient? eventStreamClient;
   final int initialTab;
-
-  const SettingsApp({super.key, this.onLogout, this.eventStreamClient, this.initialTab = 0});
 
   @override
   State<SettingsApp> createState() => _SettingsAppState();
@@ -73,38 +73,38 @@ class _SettingsAppState extends State<SettingsApp> {
                       Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 24),
                         child: Text(
-                          "Settings",
+                          'Settings',
                           style: PiccoloTheme.textTheme.headlineMedium,
                         ),
                       ),
                       const SizedBox(height: 32),
                       _SidebarItem(
                         icon: PiccoloIcons.person,
-                        label: "Profile",
+                        label: 'Profile',
                         isSelected: _controller.selectedIndex == 0,
                         onTap: () => _controller.selectTab(0),
                       ),
                       _SidebarItem(
                         icon: PiccoloIcons.cloud,
-                        label: "Remote Access",
+                        label: 'Remote Access',
                         isSelected: _controller.selectedIndex == 1,
                         onTap: () => _controller.selectTab(1),
                       ),
                       _SidebarItem(
                         icon: PiccoloIcons.people,
-                        label: "Users",
+                        label: 'Users',
                         isSelected: _controller.selectedIndex == 2,
                         onTap: () => _controller.selectTab(2),
                       ),
                       _SidebarItem(
                         icon: PiccoloIcons.shield,
-                        label: "Security",
+                        label: 'Security',
                         isSelected: _controller.selectedIndex == 3,
                         onTap: () => _controller.selectTab(3),
                       ),
                       _SidebarItem(
                         icon: PiccoloIcons.hardDrives,
-                        label: "System",
+                        label: 'System',
                         isSelected: _controller.selectedIndex == 4,
                         onTap: () => _controller.selectTab(4),
                       ),
@@ -117,7 +117,7 @@ class _SettingsAppState extends State<SettingsApp> {
                 child: LayoutBuilder(
                   builder: (context, constraints) {
                     return SingleChildScrollView(
-                      padding: const EdgeInsets.all(32.0),
+                      padding: const EdgeInsets.all(32),
                       child: ConstrainedBox(
                         constraints: BoxConstraints(
                           minHeight: constraints.maxHeight > 64
@@ -149,13 +149,13 @@ class _SettingsAppState extends State<SettingsApp> {
           children: [
             const Icon(PiccoloIcons.error, color: PiccoloTheme.critical, size: 48),
             const SizedBox(height: 16),
-            Text("Error loading settings", style: PiccoloTheme.textTheme.bodyLarge),
+            Text('Error loading settings', style: PiccoloTheme.textTheme.bodyLarge),
             const SizedBox(height: 8),
             Text(_controller.error!, style: PiccoloTheme.textTheme.labelSmall),
             const SizedBox(height: 16),
             FilledButton(
               onPressed: () => _controller.selectTab(_controller.selectedIndex),
-              child: const Text("Retry"),
+              child: const Text('Retry'),
             ),
           ],
         ),
@@ -183,10 +183,6 @@ class _SettingsAppState extends State<SettingsApp> {
 }
 
 class _SidebarItem extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final bool isSelected;
-  final VoidCallback onTap;
 
   const _SidebarItem({
     required this.icon,
@@ -194,6 +190,10 @@ class _SidebarItem extends StatelessWidget {
     required this.isSelected,
     required this.onTap,
   });
+  final IconData icon;
+  final String label;
+  final bool isSelected;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {

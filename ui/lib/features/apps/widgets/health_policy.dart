@@ -7,10 +7,6 @@ enum ListenerHealthAction {
 }
 
 class ListenerHealthPolicy {
-  final ListenerHealthAction cardAction;
-  final ListenerHealthAction detailAction;
-  final bool offerLocalFallback;
-  final String? fallbackMessage;
 
   const ListenerHealthPolicy({
     required this.cardAction,
@@ -18,6 +14,10 @@ class ListenerHealthPolicy {
     this.offerLocalFallback = false,
     this.fallbackMessage,
   });
+  final ListenerHealthAction cardAction;
+  final ListenerHealthAction detailAction;
+  final bool offerLocalFallback;
+  final String? fallbackMessage;
 }
 
 const Map<String, ListenerHealthPolicy> healthPolicies = {

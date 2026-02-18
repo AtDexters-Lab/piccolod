@@ -3,16 +3,21 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
-import '../models/task_progress.dart';
-import 'websocket_connection.dart';
+import 'package:piccolo_os/core/models/task_progress.dart';
+import 'package:piccolo_os/core/services/websocket_connection.dart';
 
 class TaskProgressClient extends ChangeNotifier {
+
+  TaskProgressClient(String url) : _connection = WebSocketConnection(url) {
+    _connectionListener = notifyListeners;
+    _connection.addListener(_connectionListener);
+  }
   final WebSocketConnection _connection;
   late final VoidCallback _connectionListener;
 
-  StreamSubscription? _subscription;
+  StreamSubscription<dynamic>? _subscription;
   final StreamController<TaskProgressEvent> _eventsController =
-      StreamController.broadcast();
+      StreamController<TaskProgressEvent>.broadcast();
 
   bool _isDisposed = false;
   bool _isComplete = false;
@@ -21,11 +26,6 @@ class TaskProgressClient extends ChangeNotifier {
 
   WebSocketConnectionState get state => _connection.state;
   String? get lastError => _connection.lastError;
-
-  TaskProgressClient(String url) : _connection = WebSocketConnection(url) {
-    _connectionListener = () => notifyListeners();
-    _connection.addListener(_connectionListener);
-  }
 
   void connect() {
     if (_isDisposed || _isComplete) return;
@@ -38,7 +38,7 @@ class TaskProgressClient extends ChangeNotifier {
 
   void disconnect({bool clearError = false}) {
     if (_isDisposed) return;
-    _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
     _connection.disconnect(clearError: clearError);
   }
@@ -66,7 +66,7 @@ class TaskProgressClient extends ChangeNotifier {
         _isComplete = true;
         disconnect();
       }
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('Task progress decode error: $e');
     }
   }
@@ -74,11 +74,12 @@ class TaskProgressClient extends ChangeNotifier {
   @override
   void dispose() {
     _isDisposed = true;
-    _subscription?.cancel();
+    unawaited(_subscription?.cancel());
     _subscription = null;
-    _connection.removeListener(_connectionListener);
-    _connection.dispose();
-    _eventsController.close();
+    _connection
+      ..removeListener(_connectionListener)
+      ..dispose();
+    unawaited(_eventsController.close());
     super.dispose();
   }
 }

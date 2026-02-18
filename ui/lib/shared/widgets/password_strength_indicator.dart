@@ -1,18 +1,18 @@
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class PasswordStrengthIndicator extends StatelessWidget {
+
+  const PasswordStrengthIndicator({required this.password, super.key});
   final String password;
 
-  const PasswordStrengthIndicator({super.key, required this.password});
-
   int _calculateStrength(String pass) {
-    int score = 0;
+    var score = 0;
     if (pass.isEmpty) return 0;
     if (pass.length >= 8) score++;
     if (pass.length >= 12) score++;
-    if (pass.contains(RegExp(r'[A-Z]'))) score++;
-    if (pass.contains(RegExp(r'[0-9]'))) score++;
+    if (pass.contains(RegExp('[A-Z]'))) score++;
+    if (pass.contains(RegExp('[0-9]'))) score++;
     if (pass.contains(RegExp(r'[!@#$%^&*(),.?":{}|<>]'))) score++;
     return score;
   }
@@ -25,10 +25,10 @@ class PasswordStrengthIndicator extends StatelessWidget {
   }
 
   String _getLabel(int score) {
-    if (score <= 1) return "Very weak";
-    if (score <= 2) return "Weak";
-    if (score <= 3) return "Moderate";
-    return "Strong";
+    if (score <= 1) return 'Very weak';
+    if (score <= 2) return 'Weak';
+    if (score <= 3) return 'Moderate';
+    return 'Strong';
   }
 
   @override

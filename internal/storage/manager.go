@@ -51,6 +51,7 @@ type Manager struct {
 	mu             sync.RWMutex
 	phase1Complete bool
 	phase1Err      error
+	phase1Started  bool // set to true on first StartPartitioningAsync call
 	emergency      EmergencyLevel
 	emergencyErr   error
 	dataDevice     string // discovered during Phase 1
@@ -95,13 +96,28 @@ func (m *Manager) Stop(ctx context.Context) error {
 }
 
 // StartPartitioningAsync launches Phase 1 disk preparation in the background.
-// The goroutine is cancelled when Stop() is called.
+// Idempotent: subsequent calls after the first are no-ops, preventing the
+// stale-cancel race where a second call would overwrite phase1Cancel and
+// orphan the first goroutine. The goroutine is cancelled when Stop() is called.
 func (m *Manager) StartPartitioningAsync(ctx context.Context) {
-	ctx, cancel := context.WithCancel(ctx)
 	m.mu.Lock()
+	if m.phase1Started {
+		m.mu.Unlock()
+		return
+	}
+	m.phase1Started = true
+	ctx, cancel := context.WithCancel(ctx)
 	m.phase1Cancel = cancel
 	m.mu.Unlock()
 	go m.runPhase1(ctx)
+}
+
+// EnsurePhase1 starts Phase 1 if not already started and waits for completion.
+// Callers use this instead of raw WaitForPhase1 to handle the case where
+// Phase 1 hasn't been started yet (e.g. install_disk path skips try_piccolo).
+func (m *Manager) EnsurePhase1(ctx context.Context) error {
+	m.StartPartitioningAsync(context.Background())
+	return m.WaitForPhase1(ctx)
 }
 
 // WaitForPhase1 blocks until Phase 1 completes or ctx is cancelled.
@@ -315,7 +331,7 @@ func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string
 		return nil
 	}
 
-	if err := m.WaitForPhase1(ctx); err != nil {
+	if err := m.EnsurePhase1(ctx); err != nil {
 		return fmt.Errorf("wait for phase 1: %w", err)
 	}
 
@@ -373,7 +389,7 @@ func (m *Manager) UnlockDataVolume(ctx context.Context, adminPassword string) er
 	}
 
 	// Block until Phase 1 completes — dataDevice is set at end of Phase 1.
-	if err := m.WaitForPhase1(ctx); err != nil {
+	if err := m.EnsurePhase1(ctx); err != nil {
 		return fmt.Errorf("wait for phase 1: %w", err)
 	}
 

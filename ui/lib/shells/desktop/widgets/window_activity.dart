@@ -4,13 +4,11 @@ import 'package:flutter/material.dart';
 /// This allows widgets like WebViews to self-manage their interactivity
 /// (e.g., disabling pointer events when the window is in the background).
 class WindowActivity extends InheritedWidget {
-  final bool isActive;
 
   const WindowActivity({
-    super.key,
-    required this.isActive,
-    required super.child,
+    required this.isActive, required super.child, super.key,
   });
+  final bool isActive;
 
   static bool isWindowActive(BuildContext context) {
     final activity = context.dependOnInheritedWidgetOfExactType<WindowActivity>();

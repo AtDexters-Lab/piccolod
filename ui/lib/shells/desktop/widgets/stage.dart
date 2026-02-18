@@ -1,22 +1,22 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import '../../../core/config/core_config.dart';
-import '../../../core/models/app_models.dart';
-import '../../../core/models/app_status_event.dart';
-import '../../../features/apps/app_detail_view.dart';
-import '../../../features/apps/app_launcher.dart';
-import '../../../shared/widgets/action_progress_dialog.dart';
-import '../../../shared/widgets/app_icon.dart';
-import '../../../shared/widgets/uninstall_confirmation_dialog.dart';
-import '../../../theme/piccolo_icons.dart';
-import '../../../theme/piccolo_theme.dart';
-import '../desktop_controller.dart';
+import 'package:piccolo_os/core/config/core_config.dart';
+import 'package:piccolo_os/core/models/app_models.dart';
+import 'package:piccolo_os/core/models/app_status_event.dart';
+import 'package:piccolo_os/features/apps/app_detail_view.dart';
+import 'package:piccolo_os/features/apps/app_launcher.dart';
+import 'package:piccolo_os/shared/widgets/action_progress_dialog.dart';
+import 'package:piccolo_os/shared/widgets/app_icon.dart';
+import 'package:piccolo_os/shared/widgets/uninstall_confirmation_dialog.dart';
+import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class Stage extends StatefulWidget {
-  final DesktopController controller;
 
-  const Stage({super.key, required this.controller});
+  const Stage({required this.controller, super.key});
+  final DesktopController controller;
 
   @override
   State<Stage> createState() => _StageState();
@@ -24,13 +24,13 @@ class Stage extends StatefulWidget {
 
 /// Cached icon data for an app.
 class _CachedIcon {
+
+  _CachedIcon({required this.proxyUrl, this.originalUrl});
   /// The proxy URL to load the icon from.
   final String proxyUrl;
 
   /// The original icon URL from the catalog (for SVG detection).
   final String? originalUrl;
-
-  _CachedIcon({required this.proxyUrl, this.originalUrl});
 }
 
 class _StageState extends State<Stage> {
@@ -57,13 +57,13 @@ class _StageState extends State<Stage> {
     widget.controller.addListener(_onControllerChanged);
     _wasAuthenticated = _isAuthenticated;
     if (_isAuthenticated) {
-      _loadApps();
+      unawaited(_loadApps());
       _subscribeToEvents();
     }
   }
 
   void _subscribeToEvents() {
-    _eventSubscription?.cancel();
+    unawaited(_eventSubscription?.cancel());
     final client = widget.controller.eventStreamClient;
     if (client != null) {
       _eventSubscription = client.appStatusEvents.listen(_handleAppStatusEvent);
@@ -75,7 +75,7 @@ class _StageState extends State<Stage> {
 
     // For install/uninstall events, reload the full list
     if (event.isInstalled || event.isUninstalled) {
-      _loadApps();
+      unawaited(_loadApps());
       return;
     }
 
@@ -93,11 +93,11 @@ class _StageState extends State<Stage> {
     final nowAuthenticated = _isAuthenticated;
     if (!_wasAuthenticated && nowAuthenticated) {
       // Just became authenticated - load apps and subscribe to events
-      _loadApps();
+      unawaited(_loadApps());
       _subscribeToEvents();
     } else if (_wasAuthenticated && !nowAuthenticated) {
       // Just logged out - cancel subscription and clear apps
-      _eventSubscription?.cancel();
+      unawaited(_eventSubscription?.cancel());
       _eventSubscription = null;
       setState(() {
         _apps = [];
@@ -111,7 +111,7 @@ class _StageState extends State<Stage> {
 
   @override
   void dispose() {
-    _eventSubscription?.cancel();
+    unawaited(_eventSubscription?.cancel());
     widget.controller.removeAppChangeListener(_loadApps);
     widget.controller.removeListener(_onControllerChanged);
     super.dispose();
@@ -143,8 +143,8 @@ class _StageState extends State<Stage> {
       });
 
       // Load icons from catalog for apps that don't have cached icons
-      _loadAppIcons(apps);
-    } catch (e) {
+      unawaited(_loadAppIcons(apps));
+    } on Object catch (e) {
       if (!mounted) return;
       setState(() {
         _error = e.toString();
@@ -195,7 +195,7 @@ class _StageState extends State<Stage> {
       }
 
       if (mounted) setState(() {});
-    } catch (e) {
+    } on Object catch (e) {
       debugPrint('Failed to load app icons: $e');
     }
   }
@@ -206,7 +206,7 @@ class _StageState extends State<Stage> {
     return _iconCache[key];
   }
 
-  void _openApp(App app) async {
+  Future<void> _openApp(App app) async {
     if (app.isRunning) {
       // Running app: try to open via AppLauncher with health-gating
       final services = await widget.controller.appService.getAppServices(app.name);
@@ -248,7 +248,7 @@ class _StageState extends State<Stage> {
   }
 
   void _openSettings(App app, {int initialTab = 0}) {
-    final windowId = "app-detail-${app.name}";
+    final windowId = 'app-detail-${app.name}';
     final cachedIcon = _getAppIcon(app);
     if (widget.controller.isAppOpen(windowId)) {
       widget.controller.focusWindow(windowId);
@@ -294,14 +294,14 @@ class _StageState extends State<Stage> {
     widget.controller.notifyAppsChanged();
   }
 
-  void _confirmUninstall(App app) async {
+  Future<void> _confirmUninstall(App app) async {
     final confirmed = await UninstallConfirmationDialog.show(
       context,
       appDisplayTitle: app.displayTitle,
     );
     if (!mounted) return;
 
-    if (confirmed == true) {
+    if (confirmed ?? false) {
       final ok = await runWithProgressDialog(
         context: context,
         title: 'Uninstalling App',
@@ -313,7 +313,7 @@ class _StageState extends State<Stage> {
       );
 
       if (ok) {
-        final windowId = "app-detail-${app.name}";
+        final windowId = 'app-detail-${app.name}';
         if (widget.controller.isAppOpen(windowId)) {
           widget.controller.closeWindow(windowId);
         }
@@ -323,10 +323,10 @@ class _StageState extends State<Stage> {
   }
 
   void _showContextMenu(BuildContext context, App app, Offset position) {
-    final RenderBox overlay =
-        Overlay.of(context).context.findRenderObject() as RenderBox;
+    final overlay =
+        Overlay.of(context).context.findRenderObject()! as RenderBox;
 
-    showMenu<String>(
+    unawaited(showMenu<String>(
       context: context,
       position: RelativeRect.fromRect(
         position & const Size(40, 40),
@@ -339,71 +339,71 @@ class _StageState extends State<Stage> {
       elevation: 2,
       constraints: const BoxConstraints(minWidth: 180),
       items: [
-        PopupMenuItem(
+        const PopupMenuItem(
           value: 'open',
           height: 44,
           child: Row(
             children: [
               Icon(PiccoloIcons.openExternal, size: 18, color: PiccoloTheme.ink),
-              const SizedBox(width: 12),
+              SizedBox(width: 12),
               Text('Open', style: TextStyle(color: PiccoloTheme.ink)),
             ],
           ),
         ),
-        PopupMenuItem(
+        const PopupMenuItem(
           value: 'settings',
           height: 44,
           child: Row(
             children: [
               Icon(PiccoloIcons.settings, size: 18, color: PiccoloTheme.ink),
-              const SizedBox(width: 12),
+              SizedBox(width: 12),
               Text('Settings', style: TextStyle(color: PiccoloTheme.ink)),
             ],
           ),
         ),
-        PopupMenuItem(
+        const PopupMenuItem(
           value: 'logs',
           height: 44,
           child: Row(
             children: [
               Icon(PiccoloIcons.article, size: 18, color: PiccoloTheme.ink),
-              const SizedBox(width: 12),
+              SizedBox(width: 12),
               Text('Logs', style: TextStyle(color: PiccoloTheme.ink)),
             ],
           ),
         ),
         const PopupMenuDivider(height: 8),
         if (app.isRunning)
-          PopupMenuItem(
+          const PopupMenuItem(
             value: 'stop',
             height: 44,
             child: Row(
               children: [
                 Icon(PiccoloIcons.stop, size: 18, color: PiccoloTheme.ink),
-                const SizedBox(width: 12),
+                SizedBox(width: 12),
                 Text('Stop', style: TextStyle(color: PiccoloTheme.ink)),
               ],
             ),
           )
         else
-          PopupMenuItem(
+          const PopupMenuItem(
             value: 'start',
             height: 44,
             child: Row(
               children: [
                 Icon(PiccoloIcons.play, size: 18, color: PiccoloTheme.ink),
-                const SizedBox(width: 12),
+                SizedBox(width: 12),
                 Text('Start', style: TextStyle(color: PiccoloTheme.ink)),
               ],
             ),
           ),
-        PopupMenuItem(
+        const PopupMenuItem(
           value: 'uninstall',
           height: 44,
           child: Row(
             children: [
               Icon(PiccoloIcons.delete, size: 18, color: PiccoloTheme.critical),
-              const SizedBox(width: 12),
+              SizedBox(width: 12),
               Text(
                 'Uninstall',
                 style: TextStyle(color: PiccoloTheme.critical),
@@ -416,25 +416,19 @@ class _StageState extends State<Stage> {
       if (value == null) return;
       switch (value) {
         case 'open':
-          _openApp(app);
-          break;
+          unawaited(_openApp(app));
         case 'settings':
           _openSettings(app);
-          break;
         case 'logs':
           _openSettings(app, initialTab: AppDetailView.tabLogs);
-          break;
         case 'start':
-          _startApp(app);
-          break;
+          unawaited(_startApp(app));
         case 'stop':
-          _stopApp(app);
-          break;
+          unawaited(_stopApp(app));
         case 'uninstall':
-          _confirmUninstall(app);
-          break;
+          unawaited(_confirmUninstall(app));
       }
-    });
+    }));
   }
 
   @override
@@ -586,19 +580,17 @@ class _StageState extends State<Stage> {
 }
 
 class _AppTile extends StatefulWidget {
+
+  const _AppTile({
+    required this.app,
+    required this.onTap, required this.onSecondaryTap, this.iconUrl,
+    this.originalIconUrl,
+  });
   final App app;
   final String? iconUrl;
   final String? originalIconUrl;
   final VoidCallback onTap;
   final void Function(Offset position) onSecondaryTap;
-
-  const _AppTile({
-    required this.app,
-    this.iconUrl,
-    this.originalIconUrl,
-    required this.onTap,
-    required this.onSecondaryTap,
-  });
 
   @override
   State<_AppTile> createState() => _AppTileState();
@@ -659,7 +651,6 @@ class _AppTileState extends State<_AppTile> {
                         child: AppIcon(
                           proxyUrl: widget.iconUrl,
                           originalIconUrl: widget.originalIconUrl,
-                          size: 48,
                           borderRadius: 12,
                           fallbackText: widget.app.displayTitle.isNotEmpty
                               ? widget.app.displayTitle[0]
@@ -715,9 +706,9 @@ class _AppTileState extends State<_AppTile> {
 }
 
 class _AddTile extends StatefulWidget {
-  final VoidCallback onTap;
 
   const _AddTile({required this.onTap});
+  final VoidCallback onTap;
 
   @override
   State<_AddTile> createState() => _AddTileState();

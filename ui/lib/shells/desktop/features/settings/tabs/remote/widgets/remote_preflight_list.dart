@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
-import 'package:piccolo_os/core/models/remote_models.dart';
 
 class RemotePreflightList extends StatelessWidget {
-  final List<RemotePreflightCheck> checks;
 
-  const RemotePreflightList({super.key, required this.checks});
+  const RemotePreflightList({required this.checks, super.key});
+  final List<RemotePreflightCheck> checks;
 
   @override
   Widget build(BuildContext context) {
@@ -31,11 +31,9 @@ class RemotePreflightList extends StatelessWidget {
             case 'pass':
               icon = PiccoloIcons.success;
               color = PiccoloTheme.success;
-              break;
             case 'warn':
               icon = PiccoloIcons.warning;
               color = PiccoloTheme.warning;
-              break;
             case 'fail':
             default:
               icon = PiccoloIcons.error;
@@ -46,7 +44,7 @@ class RemotePreflightList extends StatelessWidget {
             leading: Icon(icon, color: color),
             title: Text(check.name),
             subtitle: check.detail != null ? Text(check.detail!) : null,
-            trailing: check.status == 'fail' ? Chip(label: const Text("Failed"), backgroundColor: PiccoloTheme.critical, labelStyle: const TextStyle(color: PiccoloTheme.porcelain)) : null,
+            trailing: check.status == 'fail' ? const Chip(label: Text('Failed'), backgroundColor: PiccoloTheme.critical, labelStyle: TextStyle(color: PiccoloTheme.porcelain)) : null,
           );
         },
       ),

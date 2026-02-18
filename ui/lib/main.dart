@@ -3,11 +3,11 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:piccolo_os/core/services/error_reporter.dart';
+import 'package:piccolo_os/shells/desktop/desktop_shell.dart';
+import 'package:piccolo_os/shells/gateway/gateway_shell.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:web/web.dart' as web;
-import 'core/services/error_reporter.dart';
-import 'shells/desktop/desktop_shell.dart';
-import 'shells/gateway/gateway_shell.dart';
-import 'theme/piccolo_theme.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,8 +18,8 @@ void main() async {
   // Determine if this is a gateway access (piccolo.local)
   final isGateway = _isGatewayAccess();
 
-  final reporter = ErrorReporter();
-  reporter.initialize(route: isGateway ? 'gateway' : 'desktop');
+  final reporter = ErrorReporter()
+    ..initialize(route: isGateway ? 'gateway' : 'desktop');
 
   // 1. Flutter framework errors (layout, rendering, build)
   FlutterError.onError = (details) {
@@ -77,7 +77,7 @@ void _registerWebErrorListeners(ErrorReporter reporter) {
 }
 
 void _registerJankDetector(ErrorReporter reporter) {
-  SchedulerBinding.instance.addTimingsCallback((List<FrameTiming> timings) {
+  SchedulerBinding.instance.addTimingsCallback((timings) {
     for (final timing in timings) {
       final ms = timing.totalSpan.inMilliseconds;
       if (ms > 100) {
@@ -128,7 +128,7 @@ Future<bool> _tryUpgradeToHttps() async {
       web.window.location.replace(httpsUrl);
       return true;
     }
-  } catch (_) {
+  } on Object catch (_) {
     // HTTPS unavailable or CA not trusted — continue on HTTP
   }
 

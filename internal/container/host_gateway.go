@@ -10,15 +10,12 @@ func GetHostGatewayIP() (string, error) {
 	return "host-gateway", nil
 }
 
-// HostGatewayEntry returns a HostEntry for piccolo.local pointing to the host.
-func HostGatewayEntry() (HostEntry, error) {
+// HostGatewayEntries returns a HostEntry for the given OIDC hostname pointing
+// to the host machine, enabling container OIDC back-channel communication.
+func HostGatewayEntries(oidcHostname string) ([]HostEntry, error) {
 	ip, err := GetHostGatewayIP()
 	if err != nil {
-		return HostEntry{}, err
+		return nil, err
 	}
-
-	return HostEntry{
-		Hostname: "piccolo.local",
-		IP:       ip,
-	}, nil
+	return []HostEntry{{Hostname: oidcHostname, IP: ip}}, nil
 }

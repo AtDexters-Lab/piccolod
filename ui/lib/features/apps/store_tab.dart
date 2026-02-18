@@ -1,30 +1,28 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import '../../core/config/core_config.dart';
-import '../../core/models/app_models.dart';
-import '../../core/services/app_service.dart';
-import '../../shared/widgets/app_icon.dart';
-import '../../theme/piccolo_theme.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../shells/desktop/desktop_controller.dart';
-import 'custom_install_wizard.dart';
-import 'dynamic_install_wizard.dart';
-import 'app_detail_view.dart';
+import 'package:piccolo_os/core/config/core_config.dart';
+import 'package:piccolo_os/core/models/app_models.dart';
+import 'package:piccolo_os/core/services/app_service.dart';
+import 'package:piccolo_os/features/apps/app_detail_view.dart';
+import 'package:piccolo_os/features/apps/custom_install_wizard.dart';
+import 'package:piccolo_os/features/apps/dynamic_install_wizard.dart';
+import 'package:piccolo_os/shared/widgets/app_icon.dart';
+import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class StoreTab extends StatefulWidget {
+
+  const StoreTab({
+    required this.appService, required this.searchQuery, required this.desktopController, required this.selectedCategory, super.key,
+  });
   final AppService appService;
   final String searchQuery;
   final DesktopController desktopController;
 
   // Category filter (managed by parent)
   final String selectedCategory;
-
-  const StoreTab({
-    super.key,
-    required this.appService,
-    required this.searchQuery,
-    required this.desktopController,
-    required this.selectedCategory,
-  });
 
   @override
   State<StoreTab> createState() => _StoreTabState();
@@ -40,7 +38,7 @@ class _StoreTabState extends State<StoreTab> {
   @override
   void initState() {
     super.initState();
-    _loadCatalog();
+    unawaited(_loadCatalog());
   }
 
   @override
@@ -48,7 +46,7 @@ class _StoreTabState extends State<StoreTab> {
     super.didUpdateWidget(oldWidget);
     if (widget.searchQuery != oldWidget.searchQuery ||
         widget.selectedCategory != oldWidget.selectedCategory) {
-      _loadCatalog(reset: true);
+      unawaited(_loadCatalog(reset: true));
     }
   }
 
@@ -72,7 +70,6 @@ class _StoreTabState extends State<StoreTab> {
     try {
       final response = await widget.appService.getCatalog(
         page: pageToFetch,
-        pageSize: 20,
         query: widget.searchQuery,
         category: widget.selectedCategory == 'All'
             ? null
@@ -85,7 +82,7 @@ class _StoreTabState extends State<StoreTab> {
         } else {
           // Avoid duplicates if any
           final existingIds = _items.map((e) => e.name).toSet();
-          for (var app in response.apps) {
+          for (final app in response.apps) {
             if (!existingIds.contains(app.name)) {
               _items.add(app);
             }
@@ -95,7 +92,7 @@ class _StoreTabState extends State<StoreTab> {
         _totalPages = response.totalPages;
         _isLoading = false;
       });
-    } catch (e) {
+    } on Object catch (e) {
       if (!mounted) return;
       setState(() {
         _error = e.toString();
@@ -106,20 +103,20 @@ class _StoreTabState extends State<StoreTab> {
 
   void _loadMore() {
     if (_currentPage < _totalPages && !_isLoading) {
-      _loadCatalog(targetPage: _currentPage + 1);
+      unawaited(_loadCatalog(targetPage: _currentPage + 1));
     }
   }
 
-  void _installFromTemplate(CatalogItem item) async {
-    String? yaml = item.template;
+  Future<void> _installFromTemplate(CatalogItem item) async {
+    var yaml = item.template;
 
     if (yaml == null || yaml.isEmpty) {
       try {
         yaml = await widget.appService.getCatalogTemplate(item.name);
-      } catch (e) {
+      } on Object catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Failed to load template: $e")),
+            SnackBar(content: Text('Failed to load template: $e')),
           );
         }
         return;
@@ -129,11 +126,11 @@ class _StoreTabState extends State<StoreTab> {
     if (yaml == null) return;
 
     // Fetch configuration schema
-    Map<String, dynamic> schema = {};
+    var schema = <String, dynamic>{};
     try {
       schema = await widget.appService.getCatalogConfigure(item.name);
-    } catch (e) {
-      debugPrint("Failed to load config schema (falling back to raw yaml): $e");
+    } on Object catch (e) {
+      debugPrint('Failed to load config schema (falling back to raw yaml): $e');
     }
 
     if (!mounted) return;
@@ -144,7 +141,7 @@ class _StoreTabState extends State<StoreTab> {
     final originalIconUrl = item.icon;
 
     if (schema.isNotEmpty) {
-      showDialog(
+      unawaited(showDialog<void>(
         context: context,
         barrierDismissible: false,
         builder: (context) => DynamicInstallWizard(
@@ -157,27 +154,27 @@ class _StoreTabState extends State<StoreTab> {
             _openAppDetail(appName, iconUrl: proxyIconUrl, originalIconUrl: originalIconUrl);
           },
         ),
-      );
+      ));
     } else {
-      showDialog(
+      unawaited(showDialog<void>(
         context: context,
         barrierDismissible: false,
         builder: (context) => CustomInstallWizard(
           appService: widget.appService,
-          initialYaml: yaml!,
+          initialYaml: yaml,
           onSuccess: (appName) {
             Navigator.of(context).pop(); // Close Wizard
             _openAppDetail(appName, iconUrl: proxyIconUrl, originalIconUrl: originalIconUrl);
           },
         ),
-      );
+      ));
     }
   }
 
   void _openAppDetail(String appName, {String? iconUrl, String? originalIconUrl}) {
     widget.desktopController.notifyAppsChanged();
     widget.desktopController.openApp(
-      "app-detail-$appName",
+      'app-detail-$appName',
       appName,
       PiccoloIcons.settingsApp,
       AppDetailView(
@@ -217,7 +214,7 @@ class _StoreTabState extends State<StoreTab> {
             const SizedBox(height: Spacing.base),
             OutlinedButton(
               onPressed: () => _loadCatalog(reset: true),
-              child: const Text("Retry"),
+              child: const Text('Retry'),
             ),
           ],
         ),
@@ -228,8 +225,8 @@ class _StoreTabState extends State<StoreTab> {
       return Center(
         child: Text(
           widget.searchQuery.isEmpty
-              ? "No apps found in this category."
-              : "No matching apps found.",
+              ? 'No apps found in this category.'
+              : 'No matching apps found.',
           style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
             color: PiccoloTheme.inkMuted,
           ),
@@ -270,7 +267,7 @@ class _StoreTabState extends State<StoreTab> {
                         height: 20,
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
-                    : const Text("Load More"),
+                    : const Text('Load More'),
               ),
             ),
           ),
@@ -280,10 +277,10 @@ class _StoreTabState extends State<StoreTab> {
 }
 
 class _CatalogCard extends StatelessWidget {
-  final CatalogItem item;
-  final VoidCallback onInstall;
 
   const _CatalogCard({required this.item, required this.onInstall});
+  final CatalogItem item;
+  final VoidCallback onInstall;
 
   @override
   Widget build(BuildContext context) {
@@ -307,7 +304,6 @@ class _CatalogCard extends StatelessWidget {
                       ? CoreConfig.catalogIconUrl(item.name)
                       : null,
                   originalIconUrl: item.icon,
-                  size: 48,
                   borderRadius: 12,
                   fallbackIcon: PiccoloIcons.apps,
                 ),
@@ -326,7 +322,7 @@ class _CatalogCard extends StatelessWidget {
                       ),
                       const SizedBox(height: Spacing.xs),
                       Text(
-                        "${item.category} • v${item.version}",
+                        '${item.category} • v${item.version}',
                         style: PiccoloTheme.textTheme.labelSmall?.copyWith(
                           color: PiccoloTheme.inkMuted,
                         ),
@@ -381,7 +377,7 @@ class _CatalogCard extends StatelessWidget {
               width: double.infinity,
               child: FilledButton(
                 onPressed: onInstall,
-                child: const Text("Install"),
+                child: const Text('Install'),
               ),
             ),
           ],

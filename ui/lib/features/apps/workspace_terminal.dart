@@ -1,10 +1,16 @@
 import 'package:flutter/material.dart';
 
-import '../../shared/widgets/terminal_widget_mixin.dart';
+import 'package:piccolo_os/shared/widgets/terminal_widget_mixin.dart';
 
 /// Workspace terminal widget.
 /// Connects to a workspace container's shell via /api/v1/apps/:appId/terminal WebSocket.
 class WorkspaceTerminal extends StatefulWidget {
+
+  const WorkspaceTerminal({
+    required this.appId, super.key,
+    this.serviceName,
+    this.onSessionEnd,
+  });
   /// The app instance ID (name) to connect to.
   final String appId;
 
@@ -14,13 +20,6 @@ class WorkspaceTerminal extends StatefulWidget {
 
   /// Optional callback when terminal session ends normally (e.g., Ctrl+D).
   final void Function()? onSessionEnd;
-
-  const WorkspaceTerminal({
-    super.key,
-    required this.appId,
-    this.serviceName,
-    this.onSessionEnd,
-  });
 
   @override
   State<WorkspaceTerminal> createState() => _WorkspaceTerminalState();

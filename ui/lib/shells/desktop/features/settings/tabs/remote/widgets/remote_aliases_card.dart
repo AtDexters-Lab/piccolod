@@ -1,13 +1,15 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/remote_models.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
-import 'package:piccolo_os/core/models/remote_models.dart';
-import '../remote_controller.dart';
 
 class RemoteAliasesCard extends StatelessWidget {
-  final RemoteController controller;
 
-  const RemoteAliasesCard({super.key, required this.controller});
+  const RemoteAliasesCard({required this.controller, super.key});
+  final RemoteController controller;
 
   @override
   Widget build(BuildContext context) {
@@ -22,7 +24,7 @@ class RemoteAliasesCard extends StatelessWidget {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text("Aliases", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+                Text('Aliases', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
                 IconButton(
                   icon: const Icon(PiccoloIcons.add),
                   onPressed: () => _showAddAliasDialog(context),
@@ -31,7 +33,7 @@ class RemoteAliasesCard extends StatelessWidget {
             ),
             const SizedBox(height: Spacing.base),
             if (aliases.isEmpty)
-              const Text("No aliases configured.", style: TextStyle(color: PiccoloTheme.inkMuted))
+              const Text('No aliases configured.', style: TextStyle(color: PiccoloTheme.inkMuted))
             else
               ListView.separated(
                 shrinkWrap: true,
@@ -51,7 +53,7 @@ class RemoteAliasesCard extends StatelessWidget {
       contentPadding: EdgeInsets.zero,
       leading: const Icon(PiccoloIcons.link, color: PiccoloTheme.inkMuted),
       title: Text(alias.hostname),
-      subtitle: Text("Points to: ${alias.listener}"),
+      subtitle: Text('Points to: ${alias.listener}'),
       trailing: IconButton(
         icon: const Icon(PiccoloIcons.delete, color: PiccoloTheme.critical),
         onPressed: () => controller.deleteAlias(alias.id),
@@ -63,30 +65,30 @@ class RemoteAliasesCard extends StatelessWidget {
     final hostCtrl = TextEditingController();
     String? selectedListener;
 
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setState) {
           return AlertDialog(
-            title: const Text("Add Alias"),
+            title: const Text('Add Alias'),
             content: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
                 TextField(
                   controller: hostCtrl,
-                  decoration: const InputDecoration(labelText: "Public Hostname", hintText: "app.example.com"),
+                  decoration: const InputDecoration(labelText: 'Public Hostname', hintText: 'app.example.com'),
                 ),
                 const SizedBox(height: Spacing.base),
                 if (controller.services.isEmpty)
-                   const Text("No services available to alias.", style: TextStyle(color: PiccoloTheme.warning))
+                   const Text('No services available to alias.', style: TextStyle(color: PiccoloTheme.warning))
                 else
                   DropdownButtonFormField<String>(
-                    decoration: const InputDecoration(labelText: "Internal Service"),
+                    decoration: const InputDecoration(labelText: 'Internal Service'),
                     initialValue: selectedListener,
                     items: controller.services.map((s) {
                       return DropdownMenuItem(
                         value: s.name,
-                        child: Text("${s.name} (${s.publicPort})"),
+                        child: Text('${s.name} (${s.publicPort})'),
                       );
                     }).toList(),
                     onChanged: (val) {
@@ -98,20 +100,20 @@ class RemoteAliasesCard extends StatelessWidget {
               ],
             ),
             actions: [
-              TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
+              TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
               FilledButton(
                 onPressed: () {
                   if (hostCtrl.text.isNotEmpty && selectedListener != null) {
-                    controller.addAlias(hostCtrl.text, selectedListener!);
+                    unawaited(controller.addAlias(hostCtrl.text, selectedListener!));
                     Navigator.pop(context);
                   }
                 },
-                child: const Text("Add"),
+                child: const Text('Add'),
               ),
             ],
           );
         },
       ),
-    );
+    ));
   }
 }

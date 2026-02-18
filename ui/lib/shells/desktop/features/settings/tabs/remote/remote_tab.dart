@@ -1,15 +1,17 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/services/event_stream_client.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_dashboard.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_setup_wizard.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
-import 'remote_controller.dart';
-import 'widgets/remote_dashboard.dart';
-import 'widgets/remote_setup_wizard.dart';
 
 class RemoteTab extends StatefulWidget {
-  final EventStreamClient? eventStreamClient;
 
   const RemoteTab({super.key, this.eventStreamClient});
+  final EventStreamClient? eventStreamClient;
 
   @override
   State<RemoteTab> createState() => _RemoteTabState();
@@ -47,7 +49,7 @@ class _RemoteTabState extends State<RemoteTab> {
                 const Icon(PiccoloIcons.cloudOff, size: 48, color: PiccoloTheme.inkMuted),
                 const SizedBox(height: Spacing.base),
                 Text(
-                  "Remote Access Unavailable",
+                  'Remote Access Unavailable',
                   style: PiccoloTheme.textTheme.bodyLarge,
                 ),
                 Text(
@@ -57,7 +59,7 @@ class _RemoteTabState extends State<RemoteTab> {
                 const SizedBox(height: Spacing.base),
                 FilledButton(
                   onPressed: _controller.refresh,
-                  child: const Text("Retry"),
+                  child: const Text('Retry'),
                 ),
               ],
             ),
@@ -73,12 +75,12 @@ class _RemoteTabState extends State<RemoteTab> {
                  const Icon(PiccoloIcons.lock, size: 48, color: PiccoloTheme.warning),
                  const SizedBox(height: Spacing.base),
                  Text(
-                   "Storage Locked",
+                   'Storage Locked',
                    style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold),
                  ),
                  const SizedBox(height: Spacing.sm),
                  Text(
-                   "The secure storage volume is locked. You must unlock it to manage remote access keys.",
+                   'The secure storage volume is locked. You must unlock it to manage remote access keys.',
                    textAlign: TextAlign.center,
                    style: PiccoloTheme.textTheme.bodyMedium,
                  ),
@@ -96,7 +98,7 @@ class _RemoteTabState extends State<RemoteTab> {
               children: [
                 CircularProgressIndicator(),
                 SizedBox(height: Spacing.base),
-                Text("Applying Configuration...", style: TextStyle(color: PiccoloTheme.inkMuted)),
+                Text('Applying Configuration...', style: TextStyle(color: PiccoloTheme.inkMuted)),
               ],
             ),
           );
@@ -140,7 +142,7 @@ class _RemoteTabState extends State<RemoteTab> {
                       onPressed: () {
                          // We need a way to clear the error.
                          // Ideally controller should have clearError() but for now we can just trigger a refresh which clears it.
-                         _controller.refresh();
+                         unawaited(_controller.refresh());
                       },
                     ),
                   ],

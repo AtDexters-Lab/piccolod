@@ -4,18 +4,17 @@ import 'package:flutter/material.dart';
 ///
 /// Used for health indicators, online/offline dots, and app status badges.
 class StatusDot extends StatelessWidget {
-  final Color color;
-  final double size;
-  final String? label;
-  final TextStyle? labelStyle;
 
   const StatusDot({
-    super.key,
-    required this.color,
+    required this.color, super.key,
     this.size = 8,
     this.label,
     this.labelStyle,
   });
+  final Color color;
+  final double size;
+  final String? label;
+  final TextStyle? labelStyle;
 
   @override
   Widget build(BuildContext context) {

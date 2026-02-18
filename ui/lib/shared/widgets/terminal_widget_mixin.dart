@@ -1,14 +1,15 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:piccolo_os/core/config/core_config.dart';
+import 'package:piccolo_os/core/services/error_reporter.dart';
+import 'package:piccolo_os/core/utils/clipboard/clipboard.dart' as clipboard_utils;
+import 'package:piccolo_os/shared/widgets/render_error_boundary.dart';
+import 'package:piccolo_os/shells/desktop/features/terminal/terminal_backend.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:xterm/xterm.dart';
-
-import '../../core/config/core_config.dart';
-import '../../core/services/error_reporter.dart';
-import '../../core/utils/clipboard/clipboard.dart' as clipboard_utils;
-import '../../shells/desktop/features/terminal/terminal_backend.dart';
-import '../../theme/piccolo_theme.dart';
-import 'render_error_boundary.dart';
 
 /// Mixin providing common terminal functionality for host and workspace terminals.
 ///
@@ -106,7 +107,7 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
     final text = terminal.buffer.getText(selection);
     try {
       await clipboard_utils.copyText(text);
-    } catch (e) {
+    } on Object catch (_) {
       terminal.write(_clipboardHint);
     }
   }
@@ -126,7 +127,7 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
   /// Handle Ctrl+C shortcut: copy if selection exists, otherwise let terminal handle (SIGINT).
   void _handleCopyShortcut() {
     if (terminalController.selection != null) {
-      copyTerminalSelection();
+      unawaited(copyTerminalSelection());
     } else {
       // No selection - send Ctrl+C to terminal (SIGINT)
       terminal.keyInput(TerminalKey.keyC, ctrl: true);
@@ -157,10 +158,8 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
     switch (choice) {
       case 'copy':
         await copyTerminalSelection();
-        break;
       case 'paste':
         await pasteToTerminal();
-        break;
       default:
         break;
     }
@@ -173,7 +172,6 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
   /// show a recoverable fallback instead of Flutter's red error screen.
   Widget buildTerminalView() {
     return RenderErrorBoundary(
-      maxRetries: 3,
       onError: (error) => ErrorReporter().report(
         type: 'render_error',
         message: 'Terminal render error: $error',
@@ -183,7 +181,7 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
       fallbackBuilder: (error, retry) =>
           RenderErrorFallback(label: 'Terminal', retry: retry),
       child: RepaintBoundary(
-        child: Container(
+        child: ColoredBox(
           color: PiccoloTheme.terminalBg,
           child: SizedBox.expand(
             child: Scrollbar(
@@ -213,7 +211,6 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
                   scrollController: terminalScrollController,
                   textStyle: const TerminalStyle(
                     fontFamily: 'JetBrainsMono',
-                    height: 1.2,
                   ),
                   padding: const EdgeInsets.all(Spacing.md),
                   autofocus: true,

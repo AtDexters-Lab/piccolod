@@ -1,10 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/user.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/users/users_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/users/widgets/user_form_dialog.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/users/widgets/user_list_card.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
-import 'users_controller.dart';
-import 'widgets/user_form_dialog.dart';
-import 'widgets/user_list_card.dart';
 
 /// Tab for managing users in the Settings app.
 class UsersTab extends StatefulWidget {
@@ -20,7 +22,7 @@ class _UsersTabState extends State<UsersTab> {
   @override
   void initState() {
     super.initState();
-    _controller.loadUsers();
+    unawaited(_controller.loadUsers());
   }
 
   @override
@@ -141,7 +143,7 @@ class _UsersTabState extends State<UsersTab> {
   }
 
   void _showAddUserDialog() {
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       builder: (context) => UserFormDialog(
         onSave: (username, email, password, role, allowedApps) async {
@@ -154,11 +156,11 @@ class _UsersTabState extends State<UsersTab> {
           );
         },
       ),
-    );
+    ));
   }
 
   void _showEditUserDialog(User user) {
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       builder: (context) => UserFormDialog(
         user: user,
@@ -172,11 +174,11 @@ class _UsersTabState extends State<UsersTab> {
           );
         },
       ),
-    );
+    ));
   }
 
   void _showDeleteConfirmation(User user) {
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Delete User'),
@@ -194,7 +196,7 @@ class _UsersTabState extends State<UsersTab> {
               Navigator.of(context).pop();
               try {
                 await _controller.deleteUser(user.id);
-              } catch (e) {
+              } on Object catch (e) {
                 if (mounted) {
                   messenger.showSnackBar(
                     SnackBar(
@@ -212,7 +214,7 @@ class _UsersTabState extends State<UsersTab> {
           ),
         ],
       ),
-    );
+    ));
   }
 
   void _showSetPasswordDialog(User user) {
@@ -220,7 +222,7 @@ class _UsersTabState extends State<UsersTab> {
     final confirmController = TextEditingController();
     final formKey = GlobalKey<FormState>();
 
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text('Set Password for ${user.username}'),
@@ -280,7 +282,7 @@ class _UsersTabState extends State<UsersTab> {
                       backgroundColor: PiccoloTheme.success,
                     ),
                   );
-                } catch (e) {
+                } on Object catch (e) {
                   if (!context.mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
@@ -295,6 +297,6 @@ class _UsersTabState extends State<UsersTab> {
           ),
         ],
       ),
-    );
+    ));
   }
 }

@@ -402,6 +402,7 @@ func TestManager_InitializeDataVolume_NoDevice_ReturnsError(t *testing.T) {
 	// Simulate phase 1 complete with no data device.
 	close(mgr.phase1Done)
 	mgr.phase1Complete = true
+	mgr.phase1Started = true
 
 	err := mgr.InitializeDataVolume(context.Background(), "password", nil)
 	if err == nil {
@@ -430,6 +431,7 @@ func TestManager_UnlockDataVolume_NoDevice_ReturnsError(t *testing.T) {
 	}
 	close(mgr.phase1Done)
 	mgr.phase1Complete = true
+	mgr.phase1Started = true
 
 	err := mgr.UnlockDataVolume(context.Background(), "password")
 	if err == nil {
@@ -467,6 +469,7 @@ func TestManager_UnlockDataVolume_NoLUKSHeader_FallsBackToInit(t *testing.T) {
 	}
 	close(mgr.phase1Done)
 	mgr.phase1Complete = true
+	mgr.phase1Started = true
 
 	err := mgr.UnlockDataVolume(context.Background(), "password")
 	// Should error from the init path (generate pool keyfile fails or luksFormat fails),
@@ -493,6 +496,63 @@ func exitCode1() *exec.ExitError {
 		return exitErr
 	}
 	panic("expected *exec.ExitError")
+}
+
+func TestStartPartitioningAsync_Idempotent(t *testing.T) {
+	paths.SetRootsForTest(t)
+
+	bus := events.NewBus()
+	defer bus.Close()
+
+	startCount := 0
+	prep := &fakeDiskPreparerFunc{
+		verifyCoreExists: func(ctx context.Context, p string) bool { return true },
+		getPartitionState: func(ctx context.Context) (*PartitionState, error) {
+			startCount++
+			return &PartitionState{
+				Disk:          "/dev/sda",
+				RootPartition: "/dev/sda2",
+				DataPartition: "/dev/sda3",
+			}, nil
+		},
+	}
+
+	mgr := NewManager(prep, bus, nil, nil)
+	mgr.StartPartitioningAsync(context.Background())
+	mgr.StartPartitioningAsync(context.Background()) // second call should be no-op
+
+	if err := mgr.WaitForPhase1(context.Background()); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+
+	if startCount != 1 {
+		t.Errorf("expected 1 Phase 1 run, got %d", startCount)
+	}
+}
+
+func TestEnsurePhase1_StartsIfNotStarted(t *testing.T) {
+	paths.SetRootsForTest(t)
+
+	bus := events.NewBus()
+	defer bus.Close()
+
+	prep := &fakeDiskPreparer{
+		coreExists: true,
+		partitionState: &PartitionState{
+			Disk:          "/dev/sda",
+			RootPartition: "/dev/sda2",
+			DataPartition: "/dev/sda3",
+		},
+	}
+
+	mgr := NewManager(prep, bus, nil, nil)
+	// Don't call StartPartitioningAsync — EnsurePhase1 should start it.
+	if err := mgr.EnsurePhase1(context.Background()); err != nil {
+		t.Fatalf("EnsurePhase1() unexpected error: %v", err)
+	}
+	if !mgr.IsPhase1Complete() {
+		t.Error("expected phase 1 complete after EnsurePhase1")
+	}
 }
 
 // fakeCommandRunner implements runner.CommandRunner for storage manager tests.

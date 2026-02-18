@@ -1,23 +1,21 @@
 import 'package:flutter/material.dart';
-import '../../core/services/api_client.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Compact re-authentication overlay displayed when the portal session expires.
 ///
 /// Renders a scrim + centered card with username (pre-filled) and password fields.
 /// "Log In" re-authenticates inline; "Log Out" cancels and triggers a full logout.
 class ReauthOverlay extends StatefulWidget {
+
+  const ReauthOverlay({
+    required this.onSuccess, required this.onCancel, super.key,
+    this.lastKnownUsername,
+  });
   final String? lastKnownUsername;
   final VoidCallback onSuccess;
   final VoidCallback onCancel;
-
-  const ReauthOverlay({
-    super.key,
-    this.lastKnownUsername,
-    required this.onSuccess,
-    required this.onCancel,
-  });
 
   @override
   State<ReauthOverlay> createState() => _ReauthOverlayState();
@@ -64,7 +62,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
         'password': password,
       });
       await ApiClient().fetchCsrfToken();
-      ApiClient().completeReauth(true);
+      ApiClient().completeReauth(success: true);
       widget.onSuccess();
     } on ApiException catch (e) {
       setState(() {
@@ -73,7 +71,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
             ? 'Invalid credentials'
             : 'Login failed (${e.statusCode})';
       });
-    } catch (e) {
+    } on Object catch (_) {
       setState(() {
         _isLoading = false;
         _error = 'Connection error';
@@ -103,7 +101,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
             // Header
             Row(
               children: [
-                Icon(PiccoloIcons.lock,
+                const Icon(PiccoloIcons.lock,
                     size: 20, color: PiccoloTheme.inkMuted),
                 const SizedBox(width: 8),
                 Text('Session Expired', style: theme.titleMedium),
@@ -173,7 +171,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
                   onPressed: _isLoading
                       ? null
                       : () {
-                          ApiClient().completeReauth(false);
+                          ApiClient().completeReauth(success: false);
                           widget.onCancel();
                         },
                   child: const Text('Log Out'),

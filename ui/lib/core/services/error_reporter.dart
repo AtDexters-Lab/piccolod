@@ -1,15 +1,14 @@
 import 'dart:async';
 
+import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:web/web.dart' as web;
-
-import 'api_client.dart';
 
 /// Captures UI errors, deduplicates them in-memory, and batch-posts
 /// to the backend telemetry endpoint for systemd journal logging.
 class ErrorReporter {
-  static final ErrorReporter _instance = ErrorReporter._internal();
   factory ErrorReporter() => _instance;
   ErrorReporter._internal();
+  static final ErrorReporter _instance = ErrorReporter._internal();
 
   static const _maxBufferSize = 50;
   static const _maxFingerprintLen = 128;
@@ -33,7 +32,7 @@ class ErrorReporter {
     _initialized = true;
     _route = route;
     _startFlushTimer();
-    _fetchVersion();
+    unawaited(_fetchVersion());
   }
 
   /// Report an error or event for telemetry.
@@ -65,9 +64,9 @@ class ErrorReporter {
       }
 
       if (_buffer.length >= _flushThreshold) {
-        _flush();
+        unawaited(_flush());
       }
-    } catch (_) {
+    } on Object catch (_) {
       // Reporter must never throw
     }
   }
@@ -108,7 +107,7 @@ class ErrorReporter {
         } else {
           _consecutiveFailures = 0;
         }
-      } catch (_) {
+      } on Object catch (_) {
         // On failure, merge entries back into buffer
         for (final entry in entries.entries) {
           if (_buffer.containsKey(entry.key)) {
@@ -122,7 +121,7 @@ class ErrorReporter {
           _startFlushTimer(); // Switch to backoff interval
         }
       }
-    } catch (_) {
+    } on Object catch (_) {
       // Reporter must never throw
     } finally {
       _flushing = false;
@@ -133,9 +132,9 @@ class ErrorReporter {
     try {
       final response = await ApiClient().get('/version');
       if (response is Map && response.containsKey('version')) {
-        _version = response['version'] as String;
+        _version = (response['version'] as String?) ?? 'unknown';
       }
-    } catch (_) {
+    } on Object catch (_) {
       // Keep default 'unknown'
     }
   }
@@ -157,21 +156,18 @@ class ErrorReporter {
 }
 
 class _ErrorRecord {
+
+  _ErrorRecord({
+    required this.type,
+    required this.message,
+    required this.route, required this.count, required this.ts, this.stack,
+  });
   final String type;
   final String message;
   final String? stack;
   final String route;
   final String ts;
   int count;
-
-  _ErrorRecord({
-    required this.type,
-    required this.message,
-    this.stack,
-    required this.route,
-    required this.count,
-    required this.ts,
-  });
 
   Map<String, dynamic> toJson() => {
         'type': type,

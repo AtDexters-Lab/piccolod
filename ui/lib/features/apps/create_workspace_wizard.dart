@@ -1,13 +1,16 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_theme.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../core/config/core_config.dart';
-import '../../core/services/app_service.dart';
-import '../../core/models/app_models.dart';
-import '../../core/utils/task_id.dart';
-import '../../shared/widgets/app_icon.dart';
-import '../../shared/widgets/task_progress_panel.dart';
-import 'dynamic_install_wizard.dart';
+import 'package:piccolo_os/core/config/core_config.dart';
+import 'package:piccolo_os/core/models/app_models.dart';
+import 'package:piccolo_os/core/models/task_progress.dart';
+import 'package:piccolo_os/core/services/app_service.dart';
+import 'package:piccolo_os/core/utils/task_id.dart';
+import 'package:piccolo_os/features/apps/dynamic_install_wizard.dart';
+import 'package:piccolo_os/shared/widgets/app_icon.dart';
+import 'package:piccolo_os/shared/widgets/task_progress_panel.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Wizard dialog for creating a new Workspace container.
 ///
@@ -17,14 +20,13 @@ import 'dynamic_install_wizard.dart';
 /// 2. Configure the workspace (for catalog: use DynamicInstallWizard; for custom: inline config)
 /// 3. Watch the installation progress
 class CreateWorkspaceWizard extends StatefulWidget {
-  final AppService appService;
-  final VoidCallback? onSuccess;
 
   const CreateWorkspaceWizard({
-    super.key,
-    required this.appService,
+    required this.appService, super.key,
     this.onSuccess,
   });
+  final AppService appService;
+  final VoidCallback? onSuccess;
 
   @override
   State<CreateWorkspaceWizard> createState() => _CreateWorkspaceWizardState();
@@ -61,7 +63,7 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
   @override
   void initState() {
     super.initState();
-    _loadCatalogWorkspaces();
+    unawaited(_loadCatalogWorkspaces());
   }
 
   @override
@@ -76,14 +78,13 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
     try {
       final response = await widget.appService.getCatalog(
         category: 'Workspace',
-        pageSize: 20,
       );
       if (!mounted) return;
       setState(() {
         _catalogWorkspaces = response.apps;
         _isLoadingCatalog = false;
       });
-    } catch (e) {
+    } on Object catch (e) {
       if (!mounted) return;
       setState(() {
         _isLoadingCatalog = false;
@@ -108,7 +109,7 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
         _searchResults = results;
         _isSearching = false;
       });
-    } catch (e) {
+    } on Object catch (e) {
       setState(() {
         _error = e.toString();
         _isSearching = false;
@@ -116,21 +117,21 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
     }
   }
 
-  void _installFromCatalog(CatalogItem item) async {
+  Future<void> _installFromCatalog(CatalogItem item) async {
     // Capture references before any async operations or navigation changes
     final appService = widget.appService;
     final onSuccess = widget.onSuccess;
     final navigator = Navigator.of(context);
 
     // Fetch template and schema before closing this wizard
-    String? yaml = item.template;
+    var yaml = item.template;
     if (yaml == null || yaml.isEmpty) {
       try {
         yaml = await appService.getCatalogTemplate(item.name);
-      } catch (e) {
+      } on Object catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Failed to load template: $e")),
+            SnackBar(content: Text('Failed to load template: $e')),
           );
         }
         return;
@@ -140,16 +141,16 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
     if (yaml == null || !mounted) return;
 
     // Fetch configuration schema
-    Map<String, dynamic> schema = {};
+    var schema = <String, dynamic>{};
     try {
       schema = await appService.getCatalogConfigure(item.name);
-    } catch (e) {
-      debugPrint("Failed to load config schema: $e");
+    } on Object catch (e) {
+      debugPrint('Failed to load config schema: $e');
     }
 
     if (!mounted) return;
     // Show DynamicInstallWizard first (while context is still valid), then pop this wizard.
-    showDialog<bool>(
+    unawaited(showDialog<bool>(
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) => DynamicInstallWizard(
@@ -166,7 +167,7 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
       if ((done ?? false) && mounted) {
         navigator.pop();
       }
-    });
+    }));
   }
 
   void _selectCustomImage(String image, String displayName) {
@@ -193,7 +194,7 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
       name = name.split(':').first;
     }
     // Remove underscores and hyphens (RFC 20260130 constraints)
-    name = name.toLowerCase().replaceAll(RegExp(r'[_-]'), '');
+    name = name.toLowerCase().replaceAll(RegExp('[_-]'), '');
     // Truncate to 16 chars max
     if (name.length > 16) {
       name = name.substring(0, 16);
@@ -244,23 +245,35 @@ x-piccolo:
     try {
       final yaml = _generateWorkspaceManifest(image);
 
-      await widget.appService.installAppWithInputs(
+      await widget.appService.initiateInstall(
         yaml,
         {},
         taskId: taskId,
       );
-
+    } on Object catch (e) {
       if (mounted) {
-        widget.onSuccess?.call();
+        setState(() {
+          _isInstalling = false;
+          _taskId = null;
+          _error = e.toString();
+          _currentStep = 1;
+        });
       }
-    } catch (e) {
+    }
+  }
+
+  void _onInstallComplete(TaskProgressEvent event) {
+    if (!mounted) return;
+    if (event.error != null && event.error!.isNotEmpty) {
       setState(() {
         _isInstalling = false;
         _taskId = null;
-        _error = e.toString();
+        _error = event.error;
         _currentStep = 1;
       });
+      return;
     }
+    widget.onSuccess?.call();
   }
 
   @override
@@ -333,7 +346,11 @@ x-piccolo:
     if (_currentStep == 2 && _taskId != null) {
       return Padding(
         padding: const EdgeInsets.all(Spacing.lg),
-        child: TaskProgressPanel(taskId: _taskId!, taskType: 'install_app'),
+        child: TaskProgressPanel(
+          taskId: _taskId!,
+          taskType: 'install_app',
+          onComplete: _onInstallComplete,
+        ),
       );
     }
 
@@ -376,7 +393,7 @@ x-piccolo:
               spacing: Spacing.md,
               runSpacing: Spacing.md,
               children: _catalogWorkspaces
-                  .map((item) => _buildCatalogCard(item))
+                  .map(_buildCatalogCard)
                   .toList(),
             ),
 
@@ -402,12 +419,12 @@ x-piccolo:
               Expanded(
                 child: TextField(
                   controller: _searchController,
-                  decoration: InputDecoration(
+                  decoration: const InputDecoration(
                     hintText: 'Search for images (e.g., postgres, redis)...',
-                    border: const OutlineInputBorder(),
+                    border: OutlineInputBorder(),
                     filled: true,
                     fillColor: PiccoloTheme.porcelain,
-                    contentPadding: const EdgeInsets.symmetric(
+                    contentPadding: EdgeInsets.symmetric(
                       horizontal: Spacing.base,
                       vertical: Spacing.md,
                     ),
@@ -576,7 +593,7 @@ x-piccolo:
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
+                      const Text(
                         'Selected Image',
                         style: TextStyle(
                           color: PiccoloTheme.inkMuted,
@@ -609,12 +626,12 @@ x-piccolo:
           const SizedBox(height: Spacing.sm),
           TextField(
             controller: _tagController,
-            decoration: InputDecoration(
+            decoration: const InputDecoration(
               hintText: 'latest',
-              border: const OutlineInputBorder(),
+              border: OutlineInputBorder(),
               filled: true,
               fillColor: PiccoloTheme.porcelain,
-              contentPadding: const EdgeInsets.symmetric(
+              contentPadding: EdgeInsets.symmetric(
                 horizontal: Spacing.base,
                 vertical: Spacing.md,
               ),
@@ -640,12 +657,12 @@ x-piccolo:
           TextFormField(
             controller: _workspaceNameController,
             autovalidateMode: AutovalidateMode.onUserInteraction,
-            decoration: InputDecoration(
+            decoration: const InputDecoration(
               hintText: 'e.g., devserver',
-              border: const OutlineInputBorder(),
+              border: OutlineInputBorder(),
               filled: true,
               fillColor: PiccoloTheme.porcelain,
-              contentPadding: const EdgeInsets.symmetric(
+              contentPadding: EdgeInsets.symmetric(
                 horizontal: Spacing.base,
                 vertical: Spacing.md,
               ),
@@ -660,7 +677,7 @@ x-piccolo:
                 if (value.length > 16) {
                   return 'Maximum 16 characters allowed';
                 }
-                if (!RegExp(r'^[a-z]').hasMatch(value)) {
+                if (!RegExp('^[a-z]').hasMatch(value)) {
                   return 'Must start with a lowercase letter';
                 }
                 return 'Only lowercase letters and numbers allowed';

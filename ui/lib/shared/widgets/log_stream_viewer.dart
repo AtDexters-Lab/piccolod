@@ -1,23 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:piccolo_os/core/config/core_config.dart';
+import 'package:piccolo_os/core/services/error_reporter.dart';
+import 'package:piccolo_os/core/services/log_stream_backend.dart';
+import 'package:piccolo_os/core/services/websocket_connection.dart';
+import 'package:piccolo_os/core/utils/clipboard/clipboard.dart' as clipboard_utils;
+import 'package:piccolo_os/shared/widgets/render_error_boundary.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:xterm/xterm.dart';
 
-import '../../core/config/core_config.dart';
-import '../../core/services/error_reporter.dart';
-import '../../core/services/log_stream_backend.dart';
-import '../../core/services/websocket_connection.dart';
-import '../../core/utils/clipboard/clipboard.dart' as clipboard_utils;
-import '../../theme/piccolo_theme.dart';
-import 'render_error_boundary.dart';
-
 class LogStreamViewer extends StatefulWidget {
-  final String? appName;
-  final String? systemUnit;
-  final String? serviceName;
-  final int tailLines;
-  final double? height;
-  final bool autoConnect;
 
   const LogStreamViewer({
     super.key,
@@ -31,6 +26,12 @@ class LogStreamViewer extends StatefulWidget {
          (appName == null) != (systemUnit == null),
          'Provide exactly one of appName or systemUnit',
        );
+  final String? appName;
+  final String? systemUnit;
+  final String? serviceName;
+  final int tailLines;
+  final double? height;
+  final bool autoConnect;
 
   @override
   State<LogStreamViewer> createState() => _LogStreamViewerState();
@@ -215,7 +216,7 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
     final text = _terminal.buffer.getText(selection);
     try {
       await clipboard_utils.copyText(text);
-    } catch (e) {
+    } on Object catch (_) {
       // Clipboard unavailable - silently fail for log viewer
     }
   }
@@ -224,7 +225,7 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
   /// Log viewer is read-only so no SIGINT handling needed.
   void _handleCopyShortcut() {
     if (_controller.selection != null) {
-      _copySelection();
+      unawaited(_copySelection());
     }
   }
 
@@ -258,7 +259,6 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
     // Terminal body with RepaintBoundary for paint isolation,
     // wrapped in RenderErrorBoundary for rendering error recovery.
     final terminalBody = RenderErrorBoundary(
-      maxRetries: 3,
       onError: (error) => ErrorReporter().report(
         type: 'render_error',
         message: 'Log viewer render error: $error',
@@ -268,7 +268,7 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
       fallbackBuilder: (error, retry) =>
           RenderErrorFallback(label: 'Log viewer', retry: retry),
       child: RepaintBoundary(
-        child: Container(
+        child: ColoredBox(
           color: PiccoloTheme.terminalBg,
           child: Scrollbar(
             controller: _scrollController,
@@ -291,10 +291,8 @@ class _LogStreamViewerState extends State<LogStreamViewer> {
                 scrollController: _scrollController,
                 textStyle: const TerminalStyle(
                   fontFamily: 'JetBrainsMono',
-                  height: 1.2,
                 ),
-                padding: const EdgeInsets.all(12.0),
-                autofocus: false,
+                padding: const EdgeInsets.all(12),
                 onSecondaryTapDown: (details, cell) =>
                     _showContextMenu(details.globalPosition),
               ),

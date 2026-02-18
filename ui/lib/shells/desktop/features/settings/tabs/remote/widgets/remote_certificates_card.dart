@@ -1,13 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/remote_models.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
-import 'package:piccolo_os/core/models/remote_models.dart';
-import '../remote_controller.dart';
 
 class RemoteCertificatesCard extends StatelessWidget {
-  final RemoteController controller;
 
-  const RemoteCertificatesCard({super.key, required this.controller});
+  const RemoteCertificatesCard({required this.controller, super.key});
+  final RemoteController controller;
 
   @override
   Widget build(BuildContext context) {
@@ -22,12 +22,12 @@ class RemoteCertificatesCard extends StatelessWidget {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text("Certificates", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+                Text('Certificates', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
               ],
             ),
             const SizedBox(height: Spacing.base),
             if (certs.isEmpty)
-              const Text("No certificates issued yet.", style: TextStyle(color: PiccoloTheme.inkMuted))
+              const Text('No certificates issued yet.', style: TextStyle(color: PiccoloTheme.inkMuted))
             else
               ListView.separated(
                 shrinkWrap: true,
@@ -47,25 +47,25 @@ class RemoteCertificatesCard extends StatelessWidget {
     Color iconColor;
     String subtitle;
     Color subtitleColor;
-    String actionLabel = "Renew";
+    var actionLabel = 'Renew';
 
     if (cert.status == 'error') {
       icon = PiccoloIcons.error;
       iconColor = PiccoloTheme.critical;
-      subtitle = cert.failureReason ?? "Unknown error";
+      subtitle = cert.failureReason ?? 'Unknown error';
       subtitleColor = PiccoloTheme.critical;
-      actionLabel = "Retry";
+      actionLabel = 'Retry';
     } else if (cert.status == 'pending') {
       icon = PiccoloIcons.hourglass;
       iconColor = PiccoloTheme.warning;
-      subtitle = "Issuance in progress...";
+      subtitle = 'Issuance in progress...';
       subtitleColor = PiccoloTheme.inkMuted;
     } else {
       icon = PiccoloIcons.shieldCheck;
       iconColor = PiccoloTheme.cobalt600;
       final expires = cert.expiresAt;
       final isExpiring = expires != null && expires.difference(DateTime.now()).inDays < 7;
-      subtitle = expires != null ? "Expires: ${expires.toLocal().toString().split(' ')[0]}" : "No expiry";
+      subtitle = expires != null ? "Expires: ${expires.toLocal().toString().split(' ')[0]}" : 'No expiry';
       subtitleColor = isExpiring ? PiccoloTheme.warning : PiccoloTheme.inkMuted;
     }
 
@@ -77,7 +77,7 @@ class RemoteCertificatesCard extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(cert.domains.join(", "), style: const TextStyle(fontWeight: FontWeight.bold)),
+              Text(cert.domains.join(', '), style: const TextStyle(fontWeight: FontWeight.bold)),
               Text(
                 subtitle,
                 style: TextStyle(

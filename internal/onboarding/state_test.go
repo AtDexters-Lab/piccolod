@@ -329,6 +329,69 @@ func TestNewManager_BootRecoveryClearsBootOrderConfigured(t *testing.T) {
 	}
 }
 
+func TestRevertToPending(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		setupTestDir(t)
+		m := NewManager(storage.BootModeUSB)
+		if err := m.Choose(StateInstallDisk); err != nil {
+			t.Fatal(err)
+		}
+		// InstallDone is false by default after Choose(install_disk).
+		if err := m.RevertToPending(); err != nil {
+			t.Fatalf("RevertToPending() unexpected error: %v", err)
+		}
+		if m.State() != StatePending {
+			t.Errorf("state = %s, want pending", m.State())
+		}
+		if m.InstallDone() {
+			t.Error("expected InstallDone false after revert")
+		}
+		if m.BootOrderConfigured() {
+			t.Error("expected BootOrderConfigured false after revert")
+		}
+		// Verify persistence.
+		m2 := NewManager(storage.BootModeUSB)
+		if m2.State() != StatePending {
+			t.Errorf("reloaded state = %s, want pending", m2.State())
+		}
+	})
+
+	t.Run("blocked_when_install_done", func(t *testing.T) {
+		setupTestDir(t)
+		m := NewManager(storage.BootModeUSB)
+		if err := m.Choose(StateInstallDisk); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.MarkInstallDone(); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.RevertToPending(); err == nil {
+			t.Error("RevertToPending() expected error when InstallDone=true, got nil")
+		}
+	})
+
+	t.Run("blocked_from_wrong_state", func(t *testing.T) {
+		states := []struct {
+			name  string
+			setup func(*Manager)
+		}{
+			{"pending", func(m *Manager) {}},
+			{"try_piccolo", func(m *Manager) { m.Choose(StateTryPiccolo) }},
+			{"complete", func(m *Manager) { m.Choose(StateTryPiccolo); m.Complete() }},
+		}
+		for _, tt := range states {
+			t.Run(tt.name, func(t *testing.T) {
+				setupTestDir(t)
+				m := NewManager(storage.BootModeUSB)
+				tt.setup(m)
+				if err := m.RevertToPending(); err == nil {
+					t.Errorf("RevertToPending() from %s expected error, got nil", tt.name)
+				}
+			})
+		}
+	})
+}
+
 func TestPersistence_RoundTrip(t *testing.T) {
 	setupTestDir(t)
 	m := NewManager(storage.BootModeUSB)

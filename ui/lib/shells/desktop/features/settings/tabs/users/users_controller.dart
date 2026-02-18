@@ -40,10 +40,10 @@ class UsersController extends ChangeNotifier {
       final response = await ApiClient().get('/api/v1/users');
       if (_disposed) return;
 
-      final List<dynamic> usersList = response['users'] ?? [];
-      _users = usersList.map((json) => User.fromJson(json)).toList();
+      final usersList = (response as Map<String, dynamic>)['users'] as List<dynamic>? ?? <dynamic>[];
+      _users = usersList.map((json) => User.fromJson(json as Map<String, dynamic>)).toList();
       _error = null;
-    } catch (e) {
+    } on Object catch (e) {
       if (_disposed) return;
       _error = e.toString();
     } finally {

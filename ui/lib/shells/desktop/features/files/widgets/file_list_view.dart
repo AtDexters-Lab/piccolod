@@ -1,24 +1,22 @@
 import 'package:flutter/material.dart';
-import '../../../../../theme/piccolo_icons.dart';
-import '../../../../../theme/piccolo_theme.dart';
-import '../file_system_entry.dart';
+import 'package:piccolo_os/shells/desktop/features/files/file_system_entry.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class FileListView extends StatelessWidget {
-  final List<FileSystemEntry> entries;
-  final Function(FileSystemEntry) onEntryTap;
 
   const FileListView({
-    super.key,
-    required this.entries,
-    required this.onEntryTap,
+    required this.entries, required this.onEntryTap, super.key,
   });
+  final List<FileSystemEntry> entries;
+  final void Function(FileSystemEntry) onEntryTap;
 
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
         // Responsive Grid: 120px wide items
-        final int crossAxisCount = (constraints.maxWidth / 120).floor();
+        final crossAxisCount = (constraints.maxWidth / 120).floor();
 
         return GridView.builder(
           padding: const EdgeInsets.all(Spacing.base),
@@ -40,10 +38,10 @@ class FileListView extends StatelessWidget {
 }
 
 class _FileItem extends StatefulWidget {
-  final FileSystemEntry entry;
-  final VoidCallback onTap;
 
   const _FileItem({required this.entry, required this.onTap});
+  final FileSystemEntry entry;
+  final VoidCallback onTap;
 
   @override
   State<_FileItem> createState() => _FileItemState();

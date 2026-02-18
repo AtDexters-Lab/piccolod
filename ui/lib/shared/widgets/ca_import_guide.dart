@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_theme.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Compact per-browser instructions for importing the Piccolo CA certificate.
 ///
@@ -25,7 +25,6 @@ class CaImportGuide extends StatelessWidget {
     ),
     _BrowserEntry(
       name: 'Safari',
-      url: null,
       steps: 'Double-click the file \u2192 Trust in Keychain Access',
     ),
   ];
@@ -75,8 +74,8 @@ class CaImportGuide extends StatelessWidget {
 }
 
 class _BrowserEntry {
+  const _BrowserEntry({required this.name, required this.steps, this.url});
   final String name;
   final String? url;
   final String steps;
-  const _BrowserEntry({required this.name, this.url, required this.steps});
 }

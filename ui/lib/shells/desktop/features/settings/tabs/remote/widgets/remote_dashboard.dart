@@ -1,16 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_aliases_card.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_certificates_card.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_events_card.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:url_launcher/url_launcher.dart';
-import '../remote_controller.dart';
-import 'remote_certificates_card.dart';
-import 'remote_aliases_card.dart';
-import 'remote_events_card.dart';
 
 class RemoteDashboard extends StatelessWidget {
-  final RemoteController controller;
 
-  const RemoteDashboard({super.key, required this.controller});
+  const RemoteDashboard({required this.controller, super.key});
+  final RemoteController controller;
 
   @override
   Widget build(BuildContext context) {
@@ -42,18 +44,18 @@ class RemoteDashboard extends StatelessWidget {
 
   Widget _buildHeader(BuildContext context) {
     final status = controller.status!;
-    Color statusColor = PiccoloTheme.success;
-    String statusText = "Active";
-    IconData statusIcon = PiccoloIcons.success;
+    var statusColor = PiccoloTheme.success;
+    var statusText = 'Active';
+    var statusIcon = PiccoloIcons.success;
 
     if (status.state == 'error' || status.warnings.isNotEmpty) {
       statusColor = PiccoloTheme.warning;
-      statusText = "Degraded";
+      statusText = 'Degraded';
       statusIcon = PiccoloIcons.warning;
     }
     if (status.state == 'error') {
       statusColor = PiccoloTheme.critical;
-      statusText = "Error";
+      statusText = 'Error';
       statusIcon = PiccoloIcons.error;
     }
 
@@ -63,7 +65,7 @@ class RemoteDashboard extends StatelessWidget {
         Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text("Remote Access", style: PiccoloTheme.textTheme.headlineMedium),
+            Text('Remote Access', style: PiccoloTheme.textTheme.headlineMedium),
             const SizedBox(height: Spacing.sm),
             Row(
               children: [
@@ -74,7 +76,7 @@ class RemoteDashboard extends StatelessWidget {
                   const SizedBox(width: Spacing.base),
                   const Icon(PiccoloIcons.gauge, size: 16, color: PiccoloTheme.inkMuted),
                   const SizedBox(width: Spacing.xs),
-                  Text("${status.latencyMs}ms latency", style: PiccoloTheme.textTheme.labelSmall),
+                  Text('${status.latencyMs}ms latency', style: PiccoloTheme.textTheme.labelSmall),
                 ],
               ],
             ),
@@ -83,7 +85,7 @@ class RemoteDashboard extends StatelessWidget {
         FilledButton.icon(
           onPressed: controller.refresh,
           icon: const Icon(PiccoloIcons.refresh),
-          label: const Text("Refresh"),
+          label: const Text('Refresh'),
         ),
       ],
     );
@@ -119,8 +121,8 @@ class RemoteDashboard extends StatelessWidget {
       children: [
         Expanded(
           child: _InfoCard(
-            label: "Portal Hostname",
-            value: status.portalHostname ?? "Not Configured",
+            label: 'Portal Hostname',
+            value: status.portalHostname ?? 'Not Configured',
             icon: PiccoloIcons.link,
             onTap: status.portalHostname != null && status.portalHostname!.isNotEmpty
                 ? () => launchUrl(Uri.parse('https://${status.portalHostname}'))
@@ -130,8 +132,8 @@ class RemoteDashboard extends StatelessWidget {
         const SizedBox(width: Spacing.base),
         Expanded(
           child: _InfoCard(
-            label: "Nexus Relay",
-            value: status.endpoint ?? "Unknown",
+            label: 'Nexus Relay',
+            value: status.endpoint ?? 'Unknown',
             icon: PiccoloIcons.router,
           ),
         ),
@@ -143,7 +145,7 @@ class RemoteDashboard extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text("Danger Zone", style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold, color: PiccoloTheme.critical)),
+        Text('Danger Zone', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold, color: PiccoloTheme.critical)),
         const SizedBox(height: Spacing.base),
         Container(
           padding: const EdgeInsets.all(Spacing.base),
@@ -157,15 +159,15 @@ class RemoteDashboard extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text("Disable Remote Access", style: TextStyle(fontWeight: FontWeight.bold)),
-                    Text("This will immediately stop external access to your device.", style: PiccoloTheme.textTheme.labelSmall),
+                    const Text('Disable Remote Access', style: TextStyle(fontWeight: FontWeight.bold)),
+                    Text('This will immediately stop external access to your device.', style: PiccoloTheme.textTheme.labelSmall),
                   ],
                 ),
               ),
               OutlinedButton(
                 onPressed: () => _confirmDisable(context),
                 style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.critical),
-                child: const Text("Disable"),
+                child: const Text('Disable'),
               ),
             ],
           ),
@@ -183,14 +185,14 @@ class RemoteDashboard extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text("Rotate Device Secret", style: TextStyle(fontWeight: FontWeight.bold)),
-                    Text("Invalidates the current authentication token with the Nexus relay.", style: PiccoloTheme.textTheme.labelSmall),
+                    const Text('Rotate Device Secret', style: TextStyle(fontWeight: FontWeight.bold)),
+                    Text('Invalidates the current authentication token with the Nexus relay.', style: PiccoloTheme.textTheme.labelSmall),
                   ],
                 ),
               ),
               OutlinedButton(
                 onPressed: () => _confirmRotate(context),
-                child: const Text("Rotate Secret"),
+                child: const Text('Rotate Secret'),
               ),
             ],
           ),
@@ -200,13 +202,13 @@ class RemoteDashboard extends StatelessWidget {
   }
 
   void _confirmDisable(BuildContext parentContext) {
-    showDialog(
+    unawaited(showDialog<void>(
       context: parentContext,
       builder: (dialogContext) => AlertDialog(
-        title: const Text("Disable Remote Access?"),
-        content: const Text("You will lose access to this dashboard from the internet. You must be on the local network to re-enable it."),
+        title: const Text('Disable Remote Access?'),
+        content: const Text('You will lose access to this dashboard from the internet. You must be on the local network to re-enable it.'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text("Cancel")),
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
           FilledButton(
             style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.critical),
             onPressed: () async {
@@ -214,24 +216,24 @@ class RemoteDashboard extends StatelessWidget {
               Navigator.pop(dialogContext);
               await controller.disableRemote();
               messenger.showSnackBar(
-                const SnackBar(content: Text("Remote access disabled")),
+                const SnackBar(content: Text('Remote access disabled')),
               );
             },
-            child: const Text("Disable"),
+            child: const Text('Disable'),
           ),
         ],
       ),
-    );
+    ));
   }
 
   void _confirmRotate(BuildContext parentContext) {
-    showDialog(
+    unawaited(showDialog<void>(
       context: parentContext,
       builder: (dialogContext) => AlertDialog(
-        title: const Text("Rotate Credentials?"),
-        content: const Text("This will briefly disconnect the tunnel. Ensure your configuration is backed up."),
+        title: const Text('Rotate Credentials?'),
+        content: const Text('This will briefly disconnect the tunnel. Ensure your configuration is backed up.'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text("Cancel")),
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
           FilledButton(
             onPressed: () async {
               Navigator.pop(dialogContext); // Close confirm dialog
@@ -240,25 +242,25 @@ class RemoteDashboard extends StatelessWidget {
                 _showSecretDialog(parentContext, secret, onDismiss: controller.refresh);
               }
             },
-            child: const Text("Rotate"),
+            child: const Text('Rotate'),
           ),
         ],
       ),
-    );
+    ));
   }
 
   void _showSecretDialog(BuildContext context, String secret, {VoidCallback? onDismiss}) {
-    showDialog(
+    unawaited(showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
-        title: const Text("New Device Secret"),
+        title: const Text('New Device Secret'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              "Credentials rotated successfully. You must update your Nexus Relay with this new secret to reconnect.",
+              'Credentials rotated successfully. You must update your Nexus Relay with this new secret to reconnect.',
               style: TextStyle(color: PiccoloTheme.ink),
             ),
             const SizedBox(height: Spacing.base),
@@ -283,19 +285,15 @@ class RemoteDashboard extends StatelessWidget {
               Navigator.pop(context);
               onDismiss?.call();
             },
-            child: const Text("Done"),
+            child: const Text('Done'),
           ),
         ],
       ),
-    );
+    ));
   }
 }
 
 class _InfoCard extends StatelessWidget {
-  final String label;
-  final String value;
-  final IconData icon;
-  final VoidCallback? onTap;
 
   const _InfoCard({
     required this.label,
@@ -303,6 +301,10 @@ class _InfoCard extends StatelessWidget {
     required this.icon,
     this.onTap,
   });
+  final String label;
+  final String value;
+  final IconData icon;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {

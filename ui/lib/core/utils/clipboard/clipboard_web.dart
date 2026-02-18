@@ -8,19 +8,19 @@ Future<void> copyText(String text) async {
   try {
     await clipboard.writeText(text).toDart;
     return;
-  } catch (e) {
+  } on Object catch (_) {
     // Fall through to legacy method
   }
 
   // 2. Legacy Fallback (Non-Secure Contexts like http://piccolo.local)
   final body = web.document.body;
   if (body == null) {
-    throw Exception("Document body is null, cannot use legacy copy");
+    throw Exception('Document body is null, cannot use legacy copy');
   }
 
   final textArea =
-      web.document.createElement('textarea') as web.HTMLTextAreaElement;
-  textArea.value = text;
+      web.document.createElement('textarea') as web.HTMLTextAreaElement
+    ..value = text;
 
   // Ensure it's not visible but part of the DOM
   textArea.style
@@ -29,13 +29,14 @@ Future<void> copyText(String text) async {
     ..top = '0';
 
   body.appendChild(textArea);
-  textArea.focus();
-  textArea.select();
+  textArea
+    ..focus()
+    ..select();
 
   try {
     final successful = web.document.execCommand('copy');
     if (!successful) {
-      throw Exception("execCommand copy failed");
+      throw Exception('execCommand copy failed');
     }
   } finally {
     body.removeChild(textArea);

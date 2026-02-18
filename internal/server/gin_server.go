@@ -110,6 +110,9 @@ type GinServer struct {
 	loginFailures int
 	resetFailures int
 
+	// Serializes concurrent /crypto/setup requests to prevent parallel LUKS init.
+	setupMu sync.Mutex
+
 	// Crypto manager for lock/unlock of app data volumes
 	cryptoManager  *crypt.Manager
 	storageMgr     *storage.Manager
@@ -1600,6 +1603,9 @@ func (s *GinServer) ensureInternalCA() error {
 	s.internalCA = ca
 	if s.appManager != nil {
 		s.appManager.SetInternalCAPath(ca.CertPath())
+		if s.mdnsManager != nil {
+			s.appManager.SetOIDCHostname(s.mdnsManager.SpecificHostname())
+		}
 	}
 
 	log.Printf("INFO: internal CA initialized from %s", caDir)
@@ -2203,7 +2209,10 @@ func (s *GinServer) refreshServerCertSANs() {
 	if s.internalCA == nil || s.mdnsManager == nil {
 		return
 	}
-	hostnames := s.mdnsManager.Hostnames()
+	hostnames := s.mdnsManager.TLSHostnames()
+	if len(hostnames) == 0 {
+		return
+	}
 	changed, err := s.internalCA.EnsureServerCertificateForHosts(hostnames)
 	if err != nil {
 		log.Printf("WARN: cert SAN refresh: %v", err)

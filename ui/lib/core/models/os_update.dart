@@ -1,10 +1,4 @@
 class OSUpdate {
-  final String currentVersion;
-  final String availableVersion;
-  final bool pending;
-  final bool requiresReboot;
-  final DateTime lastChecked;
-  final int rpmUpdatesAvailable;
 
   OSUpdate({
     required this.currentVersion,
@@ -16,18 +10,25 @@ class OSUpdate {
   });
 
   factory OSUpdate.fromJson(Map<String, dynamic> json) {
-    int rpm = 0;
-    if (json['meta'] != null && json['meta'] is Map) {
-      rpm = json['meta']['rpm_updates_available'] ?? 0;
+    var rpm = 0;
+    final meta = json['meta'];
+    if (meta != null && meta is Map) {
+      rpm = (meta['rpm_updates_available'] as int?) ?? 0;
     }
 
     return OSUpdate(
-      currentVersion: json['current_version'] ?? '',
-      availableVersion: json['available_version'] ?? '',
-      pending: json['pending'] ?? false,
-      requiresReboot: json['requires_reboot'] ?? false,
-      lastChecked: DateTime.parse(json['last_checked'] ?? DateTime.now().toIso8601String()),
+      currentVersion: (json['current_version'] as String?) ?? '',
+      availableVersion: (json['available_version'] as String?) ?? '',
+      pending: (json['pending'] as bool?) ?? false,
+      requiresReboot: (json['requires_reboot'] as bool?) ?? false,
+      lastChecked: DateTime.parse((json['last_checked'] as String?) ?? DateTime.now().toIso8601String()),
       rpmUpdatesAvailable: rpm,
     );
   }
+  final String currentVersion;
+  final String availableVersion;
+  final bool pending;
+  final bool requiresReboot;
+  final DateTime lastChecked;
+  final int rpmUpdatesAvailable;
 }

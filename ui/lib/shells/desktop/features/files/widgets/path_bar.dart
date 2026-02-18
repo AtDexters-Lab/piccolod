@@ -1,19 +1,19 @@
 import 'package:flutter/material.dart';
-import '../../../../../theme/piccolo_icons.dart';
-import '../../../../../theme/piccolo_theme.dart';
-import '../files_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/files/files_controller.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class PathBar extends StatelessWidget {
-  final FilesController controller;
 
-  const PathBar({super.key, required this.controller});
+  const PathBar({required this.controller, super.key});
+  final FilesController controller;
 
   @override
   Widget build(BuildContext context) {
     return Container(
       height: 56,
       padding: const EdgeInsets.symmetric(horizontal: Spacing.base),
-      decoration: BoxDecoration(
+      decoration: const BoxDecoration(
         color: PiccoloTheme.porcelain,
         border: Border(bottom: BorderSide(color: PiccoloTheme.hairline)),
       ),

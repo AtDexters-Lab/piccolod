@@ -61,7 +61,7 @@ func (r *NameRegistry) Names() []string {
 }
 
 // Hostnames returns all advertised hostnames without trailing dots.
-// Suitable for TLS certificate SANs.
+// For TLS certificate SANs, use TLSHostnames() instead.
 func (r *NameRegistry) Hostnames() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -69,6 +69,35 @@ func (r *NameRegistry) Hostnames() []string {
 	for _, fqdn := range r.snapshot {
 		host := strings.TrimSuffix(fqdn, ".")
 		out = append(out, host)
+	}
+	return out
+}
+
+// TLSHostnames returns advertised hostnames excluding the gateway hostname
+// (piccolo.local), which floats between nodes and is never served over TLS.
+// The machine-specific hostname is always returned first for use as cert CN.
+func (r *NameRegistry) TLSHostnames() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	gatewayFQDN := "piccolo." + localTLD + "."
+	specificFQDN := ""
+	if r.specificName != "" {
+		specificFQDN = r.specificName + "." + localTLD + "."
+	}
+	out := make([]string, 0, len(r.snapshot))
+	for _, fqdn := range r.snapshot {
+		if fqdn == gatewayFQDN {
+			continue
+		}
+		// Skip specific hostname here; it's prepended below.
+		if fqdn == specificFQDN {
+			continue
+		}
+		out = append(out, strings.TrimSuffix(fqdn, "."))
+	}
+	// Prepend machine-specific hostname so it's used as the cert CN.
+	if specificFQDN != "" {
+		out = append([]string{strings.TrimSuffix(specificFQDN, ".")}, out...)
 	}
 	return out
 }

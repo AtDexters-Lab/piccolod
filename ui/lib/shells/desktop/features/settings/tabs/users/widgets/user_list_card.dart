@@ -5,18 +5,14 @@ import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Card displaying a user in the users list.
 class UserListCard extends StatelessWidget {
+
+  const UserListCard({
+    required this.user, required this.onEdit, required this.onDelete, required this.onSetPassword, super.key,
+  });
   final User user;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
   final VoidCallback onSetPassword;
-
-  const UserListCard({
-    super.key,
-    required this.user,
-    required this.onEdit,
-    required this.onDelete,
-    required this.onSetPassword,
-  });
 
   @override
   Widget build(BuildContext context) {
@@ -100,44 +96,41 @@ class UserListCard extends StatelessWidget {
               switch (value) {
                 case 'edit':
                   onEdit();
-                  break;
                 case 'password':
                   onSetPassword();
-                  break;
                 case 'delete':
                   onDelete();
-                  break;
               }
             },
             itemBuilder: (context) => [
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'edit',
                 child: Row(
                   children: [
                     Icon(PiccoloIcons.edit, size: 18),
-                    const SizedBox(width: 8),
-                    const Text('Edit'),
+                    SizedBox(width: 8),
+                    Text('Edit'),
                   ],
                 ),
               ),
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'password',
                 child: Row(
                   children: [
                     Icon(PiccoloIcons.lock, size: 18),
-                    const SizedBox(width: 8),
-                    const Text('Set Password'),
+                    SizedBox(width: 8),
+                    Text('Set Password'),
                   ],
                 ),
               ),
               const PopupMenuDivider(),
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'delete',
                 child: Row(
                   children: [
                     Icon(PiccoloIcons.delete,
                         size: 18, color: PiccoloTheme.critical),
-                    const SizedBox(width: 8),
+                    SizedBox(width: 8),
                     Text('Delete',
                         style: TextStyle(color: PiccoloTheme.critical)),
                   ],
@@ -152,9 +145,9 @@ class UserListCard extends StatelessWidget {
 }
 
 class _RoleBadge extends StatelessWidget {
-  final String role;
 
   const _RoleBadge({required this.role});
+  final String role;
 
   @override
   Widget build(BuildContext context) {

@@ -1,14 +1,15 @@
 import 'dart:async';
 import 'dart:ui_web' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:piccolo_os/shells/desktop/widgets/window_activity.dart';
 import 'package:web/web.dart' as web;
-import '../../../shells/desktop/widgets/window_activity.dart';
 
 class AppWebView extends StatefulWidget {
-  final String url;
   
-  const AppWebView({super.key, required this.url});
+  const AppWebView({required this.url, super.key});
+  final String url;
 
   @override
   State<AppWebView> createState() => _AppWebViewState();
@@ -33,8 +34,8 @@ class _AppWebViewState extends State<AppWebView> {
     ui.platformViewRegistry.registerViewFactory(
       viewType,
       (int viewId) {
-        final iframe = web.HTMLIFrameElement();
-        iframe.src = widget.url;
+        final iframe = web.HTMLIFrameElement()
+          ..src = widget.url;
         iframe.style.border = 'none';
         iframe.style.width = '100%';
         iframe.style.height = '100%';
@@ -79,7 +80,7 @@ class _AppWebViewState extends State<AppWebView> {
     final isRouteCurrent = route?.isCurrent ?? true;
 
     // 3. Hit Test Probe (Overlap/Z-Index Logic)
-    bool isTopLevel = false;
+    var isTopLevel = false;
     
     // We only probe if other checks pass, to save resources
     if (isWindowActive && isRouteCurrent) {
@@ -126,10 +127,8 @@ class _AppWebViewState extends State<AppWebView> {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
+    return SizedBox.expand(
       key: _key,
-      width: double.infinity,
-      height: double.infinity,
       child: HtmlElementView(viewType: viewType),
     );
   }

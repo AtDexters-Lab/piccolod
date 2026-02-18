@@ -380,9 +380,8 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 				return
 			}
 
-			// Inject Auth context for templating.
-			// Issuer is always https://piccolo.local for internal back-channel communication.
-			issuer := "https://piccolo.local"
+			// Inject Auth context for templating (machine-specific issuer for back-channel).
+			issuer := s.oidcIssuer()
 
 			systemContext["Auth"] = map[string]string{
 				"Issuer":       issuer,

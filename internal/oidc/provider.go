@@ -22,7 +22,7 @@ type Provider struct {
 
 // ProviderConfig configures the OIDC provider.
 type ProviderConfig struct {
-	// Issuer is the stable issuer URL (e.g., "https://piccolo.local")
+	// Issuer is the machine-specific issuer URL (e.g., "https://piccolo-<machineId>.local")
 	Issuer string
 
 	// Storage repositories
@@ -78,8 +78,7 @@ func NewProvider(ctx context.Context, cfg ProviderConfig) (*Provider, error) {
 		DeviceAuthorization:      op.DeviceAuthorizationConfig{},
 	}
 
-	// Create the provider with stable issuer.
-	// RFC 3.1: The issuer is ALWAYS the configured stable issuer (e.g., "https://piccolo.local").
+	// Create the provider with machine-specific issuer.
 	// Tokens are minted with this issuer regardless of how the request arrives.
 	// The dynamic authorization_endpoint is handled by our custom DiscoveryHandler.
 	issuerFactory := func(insecure bool) (op.IssuerFromRequest, error) {

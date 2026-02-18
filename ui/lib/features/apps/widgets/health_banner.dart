@@ -1,27 +1,24 @@
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/listener_health.dart';
+import 'package:piccolo_os/core/services/app_service.dart';
+import 'package:piccolo_os/features/apps/app_launcher.dart';
+import 'package:piccolo_os/features/apps/widgets/local_fallback_overlay.dart';
+import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/settings_app.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:url_launcher/url_launcher.dart';
-import '../../../core/models/listener_health.dart';
-import '../../../core/services/app_service.dart';
-import '../../../theme/piccolo_theme.dart';
-import '../../../theme/piccolo_icons.dart';
-import '../../../shells/desktop/desktop_controller.dart';
-import '../../../shells/desktop/features/settings/settings_app.dart';
-import '../app_launcher.dart';
-import 'local_fallback_overlay.dart';
 
 class AppDetailHealthBanner extends StatefulWidget {
+
+  const AppDetailHealthBanner({
+    required this.health, required this.lanFallbackUrl, required this.appService, super.key,
+    this.desktopController,
+  });
   final ListenerHealth health;
   final String lanFallbackUrl;
   final AppService appService;
   final DesktopController? desktopController;
-
-  const AppDetailHealthBanner({
-    super.key,
-    required this.health,
-    required this.lanFallbackUrl,
-    required this.appService,
-    this.desktopController,
-  });
 
   @override
   State<AppDetailHealthBanner> createState() => _AppDetailHealthBannerState();
@@ -86,7 +83,7 @@ class _AppDetailHealthBannerState extends State<AppDetailHealthBanner> {
                     ],
                     const SizedBox(height: Spacing.xs),
                     if (health.actionRequired)
-                      Text(
+                      const Text(
                         'Action required - check Remote Access settings.',
                         style: TextStyle(
                           fontSize: 12,
@@ -94,7 +91,7 @@ class _AppDetailHealthBannerState extends State<AppDetailHealthBanner> {
                         ),
                       )
                     else
-                      Text(
+                      const Text(
                         'No action needed - the system is working on it.',
                         style: TextStyle(
                           fontSize: 12,
@@ -189,7 +186,7 @@ class _AppDetailHealthBannerState extends State<AppDetailHealthBanner> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Retry queued')),
       );
-    } catch (e) {
+    } on Object catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Retry failed: $e')),

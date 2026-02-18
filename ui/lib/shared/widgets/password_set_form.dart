@@ -1,9 +1,18 @@
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../theme/piccolo_theme.dart';
-import 'password_strength_indicator.dart';
+import 'package:piccolo_os/shared/widgets/password_strength_indicator.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class PasswordSetForm extends StatefulWidget {
+
+  const PasswordSetForm({
+    required this.passwordController, required this.confirmController, super.key,
+    this.passwordLabel = 'Password',
+    this.confirmLabel = 'Confirm Password',
+    this.passwordError,
+    this.confirmError,
+    this.onSubmitted,
+  });
   final TextEditingController passwordController;
   final TextEditingController confirmController;
   final String passwordLabel;
@@ -11,17 +20,6 @@ class PasswordSetForm extends StatefulWidget {
   final String? passwordError;
   final String? confirmError;
   final VoidCallback? onSubmitted;
-
-  const PasswordSetForm({
-    super.key,
-    required this.passwordController,
-    required this.confirmController,
-    this.passwordLabel = "Password",
-    this.confirmLabel = "Confirm Password",
-    this.passwordError,
-    this.confirmError,
-    this.onSubmitted,
-  });
 
   @override
   State<PasswordSetForm> createState() => _PasswordSetFormState();
@@ -52,7 +50,7 @@ class _PasswordSetFormState extends State<PasswordSetForm> {
 
     String? error;
     if (confirm.isNotEmpty && password != confirm) {
-      error = "Passwords do not match";
+      error = 'Passwords do not match';
     }
 
     if (mounted && _internalConfirmError != error) {

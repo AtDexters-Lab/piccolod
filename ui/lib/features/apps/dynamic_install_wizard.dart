@@ -1,25 +1,22 @@
 import 'package:flutter/material.dart';
-import '../../theme/piccolo_theme.dart';
-import '../../theme/piccolo_icons.dart';
-import '../../core/services/app_service.dart';
-import '../../core/utils/task_id.dart';
-import '../../shared/widgets/task_progress_panel.dart';
+import 'package:piccolo_os/core/models/task_progress.dart';
+import 'package:piccolo_os/core/services/app_service.dart';
+import 'package:piccolo_os/core/utils/task_id.dart';
+import 'package:piccolo_os/shared/widgets/task_progress_panel.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class DynamicInstallWizard extends StatefulWidget {
+
+  const DynamicInstallWizard({
+    required this.appService, required this.appName, required this.yamlContent, required this.schema, super.key,
+    this.onSuccess,
+  });
   final AppService appService;
   final String appName;
   final String yamlContent;
   final Map<String, dynamic> schema; // The 'inputs' map from backend
-  final Function(String appName)? onSuccess;
-
-  const DynamicInstallWizard({
-    super.key,
-    required this.appService,
-    required this.appName,
-    required this.yamlContent,
-    required this.schema,
-    this.onSuccess,
-  });
+  final void Function(String appName)? onSuccess;
 
   @override
   State<DynamicInstallWizard> createState() => _DynamicInstallWizardState();
@@ -60,20 +57,13 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
     });
 
     try {
-      final app = await widget.appService.installAppWithInputs(
+      await widget.appService.initiateInstall(
         widget.yamlContent,
         _formValues,
         taskId: taskId,
-        catalogSource: widget.appName, // Track which catalog item this was installed from
+        catalogSource: widget.appName,
       );
-
-      if (mounted) {
-        widget.onSuccess?.call(app.name);
-        if (widget.onSuccess == null) {
-          Navigator.of(context).pop();
-        }
-      }
-    } catch (e) {
+    } on Object catch (e) {
       if (mounted) {
         setState(() {
           _isInstalling = false;
@@ -82,6 +72,20 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
         });
       }
     }
+  }
+
+  void _onInstallComplete(TaskProgressEvent event) {
+    if (!mounted) return;
+    if (event.error != null && event.error!.isNotEmpty) {
+      setState(() {
+        _isInstalling = false;
+        _taskId = null;
+        _error = event.error;
+      });
+      return;
+    }
+    final appName = event.instanceId ?? '';
+    widget.onSuccess?.call(appName.isNotEmpty ? appName : widget.appName);
   }
 
   @override
@@ -112,11 +116,11 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          "Configure ${widget.appName}",
+                          'Configure ${widget.appName}',
                           style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold),
                         ),
                         Text(
-                          "Customize settings before installation",
+                          'Customize settings before installation',
                           style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
                         ),
                       ],
@@ -138,6 +142,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
                       child: TaskProgressPanel(
                         taskId: _taskId!,
                         taskType: 'install_app',
+                        onComplete: _onInstallComplete,
                       ),
                     )
                   : SingleChildScrollView(
@@ -180,7 +185,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
                 children: [
                   TextButton(
                     onPressed: _isInstalling ? null : () => Navigator.of(context).pop(),
-                    child: const Text("Cancel"),
+                    child: const Text('Cancel'),
                   ),
                   const SizedBox(width: Spacing.base),
                   FilledButton(
@@ -190,7 +195,7 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
                     ),
                     child: _isInstalling
                         ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                        : const Text("Install App"),
+                        : const Text('Install App'),
                   ),
                 ],
               ),
@@ -204,11 +209,11 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
   Widget _buildField(String key, dynamic schema) {
     if (schema is! Map) return const SizedBox.shrink();
 
-    final label = schema['label'] ?? key;
-    final description = schema['description'] ?? '';
-    final type = schema['type'] ?? 'string';
-    final required = schema['required'] ?? false;
-    final validation = schema['validation']; // Map {regex: "...", message: "..."}
+    final label = (schema['label'] as String?) ?? key;
+    final description = (schema['description'] as String?) ?? '';
+    final type = (schema['type'] as String?) ?? 'string';
+    final required = (schema['required'] as bool?) ?? false;
+    final validation = schema['validation'] as Map<String, dynamic>?; // Map {regex: "...", message: "..."}
 
     return Padding(
       padding: const EdgeInsets.only(bottom: Spacing.lg),
@@ -227,14 +232,14 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
     );
   }
 
-  Widget _buildInputWidget(String key, String type, bool required, dynamic validation, bool canGenerate) {
+  Widget _buildInputWidget(String key, String type, bool required, Map<String, dynamic>? validation, bool canGenerate) {
     if (type == 'boolean') {
       return FormField<bool>(
         initialValue: _formValues[key] == true,
         builder: (state) {
           return SwitchListTile(
-            title: Text(state.value == true ? "Enabled" : "Disabled"),
-            value: state.value == true,
+            title: Text(state.value ?? false ? 'Enabled' : 'Disabled'),
+            value: state.value ?? false,
             onChanged: (val) {
               state.didChange(val);
               _formValues[key] = val;
@@ -254,15 +259,15 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
       onSaved: (val) => _formValues[key] = val,
       validator: (val) {
         if (required && (val == null || val.isEmpty)) {
-          return "This field is required";
+          return 'This field is required';
         }
-        if (validation is Map && validation['regex'] != null && val != null && val.isNotEmpty) {
+        if (validation != null && validation['regex'] != null && val != null && val.isNotEmpty) {
            try {
-             final reg = RegExp(validation['regex']);
+             final reg = RegExp(validation['regex'] as String);
              if (!reg.hasMatch(val)) {
-               return validation['message'] ?? "Invalid format";
+               return (validation['message'] as String?) ?? 'Invalid format';
              }
-           } catch (_) {}
+           } on Object catch (_) {}
         }
         return null;
       },
@@ -271,19 +276,17 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
 }
 
 class _TextFormFieldWrapper extends StatefulWidget {
+
+  const _TextFormFieldWrapper({
+    required this.isPassword, required this.canGenerate, this.initialValue,
+    this.onSaved,
+    this.validator,
+  });
   final String? initialValue;
   final bool isPassword;
   final bool canGenerate;
   final FormFieldSetter<String>? onSaved;
   final FormFieldValidator<String>? validator;
-
-  const _TextFormFieldWrapper({
-    this.initialValue,
-    required this.isPassword,
-    required this.canGenerate,
-    this.onSaved,
-    this.validator,
-  });
 
   @override
   State<_TextFormFieldWrapper> createState() => _TextFormFieldWrapperState();
@@ -312,7 +315,7 @@ class _TextFormFieldWrapperState extends State<_TextFormFieldWrapper> {
     // Ideally we'd call an API, but for now let's just use a simple random string
     final timestamp = DateTime.now().millisecondsSinceEpoch.toRadixString(36);
     final random = (1000 + (DateTime.now().microsecond % 8999)).toString();
-    _controller.text = "gen-$timestamp-$random";
+    _controller.text = 'gen-$timestamp-$random';
   }
 
   @override
@@ -335,7 +338,7 @@ class _TextFormFieldWrapperState extends State<_TextFormFieldWrapper> {
             if (widget.canGenerate)
                IconButton(
                  icon: const Icon(PiccoloIcons.refresh),
-                 tooltip: "Regenerate",
+                 tooltip: 'Regenerate',
                  onPressed: _generate,
                ),
           ],
