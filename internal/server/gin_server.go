@@ -756,12 +756,18 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	rm.SetNexusAdapter(nexusAdapter)
 	remote.RegisterHandlers(dispatch, rm)
 	s.healthTracker.Setf("remote", health.LevelOK, "remote manager ready")
+	// Init secure loopback before refreshing remote runtime so that securePort
+	// is known when resolvePortalPort() configures the TLS mux upstream target.
+	if err := s.initSecureLoopback(); err != nil {
+		return nil, fmt.Errorf("secure loopback init: %w", err)
+	}
 	s.refreshRemoteRuntime()
 
 	// Update manager (MicroOS transactional-update)
 	if s.updateManager == nil {
 		um, err := update.NewManager(update.WithCurrentVersion(s.version))
 		if err != nil {
+			s.stopSecureLoopback(context.Background())
 			return nil, fmt.Errorf("update manager init: %w", err)
 		}
 		s.updateManager = um
@@ -785,9 +791,6 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.staticCache = newStaticAssetCache(webassets.FS, "web")
 
 	s.setupGinRoutes()
-	if err := s.initSecureLoopback(); err != nil {
-		return nil, fmt.Errorf("secure loopback init: %w", err)
-	}
 	return s, nil
 }
 
@@ -2296,7 +2299,7 @@ func (s *GinServer) httpsRedirectMiddleware() gin.HandlerFunc {
 			return
 		}
 		target := "https://" + host + c.Request.URL.RequestURI()
-		c.Redirect(http.StatusMovedPermanently, target)
+		c.Redirect(http.StatusTemporaryRedirect, target)
 		c.Abort()
 	}
 }
