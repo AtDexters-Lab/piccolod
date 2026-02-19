@@ -8,16 +8,19 @@ import (
 	"strings"
 )
 
-// bootstrapFiles are Flutter Web files that must always revalidate.
-// These are entry points and service worker scripts that reference
-// other assets without cache-busting query params.
-var bootstrapFiles = map[string]struct{}{
-	"entry.html":               {},
-	"flutter_service_worker.js": {},
-	"flutter_bootstrap.js":     {},
-	"flutter.js":               {},
-	"version.json":             {},
-	"manifest.json":            {},
+// noCacheExtensions are file extensions for code and data assets that must
+// revalidate on every request (Cache-Control: no-cache). ETags ensure
+// revalidation is cheap (304 when unchanged). This prevents stale JS/WASM
+// from persisting across binary updates.
+var noCacheExtensions = map[string]struct{}{
+	".html": {},
+	".js":   {},
+	".mjs":  {},
+	".css":  {},
+	".wasm": {},
+	".json": {},
+	".bin":  {},
+	".map":  {},
 }
 
 // staticAssetCache precomputes ETags for embedded static assets at startup.
@@ -51,11 +54,12 @@ func (c *staticAssetCache) ETag(fspath string) string {
 }
 
 // cachePolicy returns the Cache-Control value for a static asset path.
-// Bootstrap-critical files get "no-cache" (must revalidate every time).
-// All other files get "public, max-age=86400" (24h cache).
+// Code/data files (JS, WASM, JSON, HTML, BIN) get "no-cache" so they
+// always revalidate via ETag. Static assets (fonts, images, shaders)
+// get "public, max-age=86400" (24h).
 func cachePolicy(fspath string) string {
-	base := path.Base(fspath)
-	if _, ok := bootstrapFiles[strings.ToLower(base)]; ok {
+	ext := strings.ToLower(path.Ext(fspath))
+	if _, ok := noCacheExtensions[ext]; ok {
 		return "no-cache"
 	}
 	return "public, max-age=86400"

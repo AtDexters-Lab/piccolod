@@ -1,14 +1,17 @@
 import 'dart:async';
+import 'dart:js_interop';
 
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/app_service.dart';
 import 'package:piccolo_os/core/services/event_stream_client.dart';
+import 'package:piccolo_os/core/utils/https_probe.dart';
 import 'package:piccolo_os/features/apps/app_store_window.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/settings_app.dart';
 import 'package:piccolo_os/shells/desktop/features/welcome/welcome_screen.dart';
 import 'package:piccolo_os/shells/desktop/models/desktop_window.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:web/web.dart' as web;
 
 /// Manages the state of the Desktop Shell.
 ///
@@ -23,6 +26,10 @@ class DesktopController extends ChangeNotifier {
     ApiClient().onAuthRequired = _onAuthRequired;
     unawaited(_checkSystemStatus());
   }
+  // Query param used to preserve the welcome screen across HTTPS redirects.
+  // Intentionally client-only and spoofable — worst case is a harmless re-show.
+  static const _kWelcomeParam = 'welcome';
+
   // Window positioning constants
   static const double kTopMargin = 8;
   static const double kDockAreaHeight = 120; // ~90px dock + padding
@@ -113,7 +120,11 @@ class DesktopController extends ChangeNotifier {
       _isInitializing = false;
       // If already authenticated (returning user with valid session), transition to authenticated state
       if (!_needsSetup) {
-        _onAuthenticated(isFirstSetup: false);
+        final showWelcome = Uri.base.queryParameters[_kWelcomeParam] == '1';
+        if (showWelcome) {
+          _clearWelcomeParam();
+        }
+        _onAuthenticated(isFirstSetup: showWelcome);
       } else {
         notifyListeners();
       }
@@ -168,14 +179,39 @@ class DesktopController extends ChangeNotifier {
     notifyListeners();
 
     if (isFirstSetup) {
-      openApp(
-        'welcome',
-        'Welcome',
-        PiccoloIcons.handWaving,
-        WelcomeScreen(controller: this),
-        initialSize: const Size(640, 420),
-      );
+      unawaited(_showWelcomeOrUpgrade());
     }
+  }
+
+  Future<void> _showWelcomeOrUpgrade() async {
+    if (await probeHttpsAvailable()) {
+      // Redirect to HTTPS, preserving existing query params + adding welcome flag
+      final uri = Uri.base;
+      final params = Map<String, String>.from(uri.queryParameters)
+        ..[_kWelcomeParam] = '1';
+      final httpsUri = uri.replace(scheme: 'https', queryParameters: params);
+      web.window.location.replace(httpsUri.toString());
+      return;
+    }
+    // HTTPS unavailable — show welcome directly
+    openApp(
+      'welcome',
+      'Welcome',
+      PiccoloIcons.handWaving,
+      WelcomeScreen(controller: this),
+      initialSize: const Size(640, 420),
+    );
+  }
+
+  void _clearWelcomeParam() {
+    final params = Map<String, String>.from(Uri.base.queryParameters)
+      ..remove(_kWelcomeParam);
+    // Use query: '' when empty — queryParameters: null would preserve the
+    // original query string (Dart Uri.replace semantics).
+    final cleanUri = params.isEmpty
+        ? Uri.base.replace(query: '')
+        : Uri.base.replace(queryParameters: params);
+    web.window.history.replaceState(JSObject(), '', cleanUri.toString());
   }
 
   /// Opens (or focuses) the Settings window.

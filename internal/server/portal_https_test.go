@@ -106,8 +106,8 @@ func TestRemotePortalHTTPRedirectsToHTTPS(t *testing.T) {
 
 	srv.router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusMovedPermanently {
-		t.Fatalf("expected 301 redirect, got %d", w.Code)
+	if w.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expected 307 redirect, got %d", w.Code)
 	}
 	if loc := w.Header().Get("Location"); loc != "https://"+host+"/" {
 		t.Fatalf("expected Location https://%s/, got %q", host, loc)

@@ -212,13 +212,44 @@ func (s *GinServer) handleGinSystemLogStream(c *gin.Context) {
 }
 
 func (s *GinServer) streamBytesToWebsocket(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, stream io.ReadCloser) {
-	done := make(chan struct{})
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+
+	var wsMu sync.Mutex
+
+	readDone := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(readDone)
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				cancel()
 				_ = stream.Close()
+				return
+			}
+		}
+	}()
+
+	// Ping loop to keep proxies from killing idle connections
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		ticker := time.NewTicker(wsPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				wsMu.Lock()
+				conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+				err := conn.WriteMessage(websocket.PingMessage, nil)
+				wsMu.Unlock()
+				if err != nil {
+					cancel()
+					_ = stream.Close()
+					return
+				}
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -229,7 +260,11 @@ func (s *GinServer) streamBytesToWebsocket(ctx context.Context, cancel context.C
 		n, err := stream.Read(buf)
 		if n > 0 {
 			encoded := base64.StdEncoding.EncodeToString(buf[:n])
-			if err2 := conn.WriteJSON(terminalMessage{Type: "stdout", Data: encoded}); err2 != nil {
+			wsMu.Lock()
+			conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			err2 := conn.WriteJSON(terminalMessage{Type: "stdout", Data: encoded})
+			wsMu.Unlock()
+			if err2 != nil {
 				cancel()
 				_ = stream.Close()
 				break
@@ -242,5 +277,6 @@ func (s *GinServer) streamBytesToWebsocket(ctx context.Context, cancel context.C
 		}
 	}
 	_ = conn.Close()
-	<-done
+	<-readDone
+	<-pingDone
 }

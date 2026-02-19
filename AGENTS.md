@@ -4,7 +4,7 @@ This repository contains `piccolod`, the control-plane daemon and embedded web p
 
 **Tech Stack:**
 - Backend: Go (1.24+) with Gin web framework
-- Frontend: Flutter Web (WASM) embedded in the binary
+- Frontend: Flutter Web embedded in the binary
 - Containers: Podman (rootless)
 
 ## Project Structure & Modules

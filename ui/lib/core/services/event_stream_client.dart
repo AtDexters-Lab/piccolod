@@ -133,8 +133,6 @@ class EventStreamClient extends ChangeNotifier {
       if (decoded is! Map<String, dynamic>) return;
 
       final type = decoded['type'];
-      if (type == 'keepalive') return;
-
       final payload = decoded['payload'];
       if (payload is! Map<String, dynamic>) return;
 

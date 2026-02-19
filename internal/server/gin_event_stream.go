@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 
 	"piccolod/internal/events"
 	"piccolod/internal/services"
@@ -47,7 +48,8 @@ type streamMessage struct {
 //	{ "type": "listener_health", "payload": ListenerHealthEvent }
 //	{ "type": "remote_config", "payload": remote.Status }
 //	{ "type": "certificate", "payload": CertificateChangedEvent }
-//	{ "type": "keepalive" }
+//
+// Keep-alive uses WebSocket Ping frames (not application-level messages).
 //
 // On connect, sends initial snapshot for subscribed topics.
 // Access control: standard users only receive events for their allowed apps.
@@ -92,6 +94,14 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 	}
 	defer conn.Close()
 
+	// Set up WebSocket keep-alive: Pong responses extend the read deadline;
+	// if no Pong arrives within wsPongWait the read pump exits and tears down.
+	// The initial read deadline is deferred until after snapshots are sent (below)
+	// so that slow snapshot delivery doesn't eat into the pong window.
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	defer cancel()
 
@@ -99,7 +109,14 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 	sendJSON := func(v any) error {
 		wsSendMu.Lock()
 		defer wsSendMu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
 		return conn.WriteJSON(v)
+	}
+	sendPing := func() error {
+		wsSendMu.Lock()
+		defer wsSendMu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+		return conn.WriteMessage(websocket.PingMessage, nil)
 	}
 
 	// Build access control helper for non-admin users
@@ -183,13 +200,18 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 		}(sub.topic, sub.ch)
 	}
 
-	keepalive := time.NewTicker(15 * time.Second)
+	// Start the read deadline now that snapshots are sent and pings will begin.
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+
+	keepalive := time.NewTicker(wsPingInterval)
 	defer keepalive.Stop()
 
 	for {
 		select {
 		case <-keepalive.C:
-			_ = sendJSON(streamMessage{Type: "keepalive"})
+			if err := sendPing(); err != nil {
+				cancel()
+			}
 
 		case <-ctx.Done():
 			_ = conn.Close()

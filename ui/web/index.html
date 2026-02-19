@@ -18,12 +18,12 @@
 
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="A new Flutter project.">
+  <meta name="description" content="Piccolo OS admin portal.">
 
   <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="piccolo_os">
+  <meta name="apple-mobile-web-app-title" content="Piccolo">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
 
   <!-- Favicon -->
@@ -144,6 +144,11 @@
   </div>
 
   <script>
+    // Register PWA service worker.
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(function (e) { console.warn('SW:', e); });
+    }
+
     // Remove the preloader once Flutter renders the first frame.
     window.addEventListener('flutter-first-frame', function () {
       var loader = document.getElementById('preloader');

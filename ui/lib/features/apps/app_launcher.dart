@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/listener_health.dart';
 import 'package:piccolo_os/core/services/app_service.dart';
+import 'package:piccolo_os/core/utils/https_probe.dart' as net_utils;
 import 'package:piccolo_os/features/apps/app_detail_view.dart';
 import 'package:piccolo_os/features/apps/widgets/app_web_view.dart';
 import 'package:piccolo_os/features/apps/widgets/local_fallback_overlay.dart';
@@ -70,13 +71,7 @@ class AppLauncher {
     return host == 'localhost';
   }
 
-  static bool isIpAddress(String host) {
-    // IPv4: digits and dots
-    if (RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(host)) return true;
-    // IPv6: contains colon (may be bracketed)
-    if (host.contains(':')) return true;
-    return false;
-  }
+  static bool isIpAddress(String host) => net_utils.isIpAddress(host);
 
   /// Health-gates remote URL navigation. If the app's listener health is not
   /// ok, shows a LocalFallbackOverlay instead of navigating to a potentially

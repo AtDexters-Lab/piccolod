@@ -39,16 +39,26 @@ func TestCachePolicy(t *testing.T) {
 		path   string
 		expect string
 	}{
+		// Code/data files: must revalidate
 		{"web/entry.html", "no-cache"},
-		{"web/flutter_service_worker.js", "no-cache"},
 		{"web/flutter_bootstrap.js", "no-cache"},
 		{"web/flutter.js", "no-cache"},
+		{"web/main.dart.js", "no-cache"},
+		{"web/sw.js", "no-cache"},
 		{"web/version.json", "no-cache"},
 		{"web/manifest.json", "no-cache"},
-		{"web/main.dart.js", "public, max-age=86400"},
+		{"web/assets/FontManifest.json", "no-cache"},
+		{"web/assets/AssetManifest.bin", "no-cache"},
+		{"web/assets/AssetManifest.bin.json", "no-cache"}, // path.Ext → ".json"
+		{"web/canvaskit/canvaskit.js", "no-cache"},
+		{"web/some/style.css", "no-cache"},
+		{"web/canvaskit/canvaskit.wasm", "no-cache"},
+		// Static assets: long cache
 		{"web/favicon.png", "public, max-age=86400"},
-		{"web/assets/FontManifest.json", "public, max-age=86400"},
-		{"web/canvaskit/canvaskit.wasm", "public, max-age=86400"},
+		{"web/assets/assets/piccolo.svg", "public, max-age=86400"},
+		{"web/assets/assets/fonts/Inter/Inter-Regular.ttf", "public, max-age=86400"},
+		{"web/assets/fonts/MaterialIcons-Regular.otf", "public, max-age=86400"},
+		{"web/assets/shaders/ink_sparkle.frag", "public, max-age=86400"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {

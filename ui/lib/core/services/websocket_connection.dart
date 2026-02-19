@@ -67,15 +67,17 @@ class WebSocketConnection extends ChangeNotifier {
           if (!_isDisposed) _messagesController.add(message);
         },
         onDone: () {
-          // Check close code: 1000 = normal closure (e.g., shell exited via Ctrl+D)
+          // Check close code:
+          // 1000 = normal closure (shell exited via Ctrl+D)
+          // 4000 = detached by another client attaching to the same session
           final closeCode = _channel?.closeCode;
           final isNormalClosure = closeCode == 1000;
+          final isDetached = closeCode == 4000;
           _handleDisconnect(
-            'Connection closed',
-            shouldReconnect: !isNormalClosure,
+            isDetached ? 'Detached by another client' : 'Connection closed',
+            shouldReconnect: !isNormalClosure && !isDetached,
           );
-          // Notify listener that session ended normally (for window close)
-          if (isNormalClosure) {
+          if (isNormalClosure || isDetached) {
             onSessionEnd?.call();
           }
         },

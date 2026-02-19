@@ -34,6 +34,8 @@ import (
 	"piccolod/internal/runtime/commands"
 	"piccolod/internal/services"
 	"piccolod/internal/state/paths"
+
+	webassets "piccolod"
 )
 
 func requireMountBypassAllowed(t *testing.T) {
@@ -1027,6 +1029,7 @@ x-piccolo:
 	rm.SetEventsBus(eventsBus)
 
 	// Setup Gin routes
+	server.staticCache = newStaticAssetCache(webassets.FS, "web")
 	server.setupGinRoutes()
 	if err := server.initSecureLoopback(); err != nil {
 		t.Fatalf("secure loopback init: %v", err)
