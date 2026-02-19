@@ -1,12 +1,12 @@
 {
-    "name": "piccolo_os",
-    "short_name": "piccolo_os",
+    "name": "Piccolo",
+    "short_name": "Piccolo",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
-    "orientation": "portrait-primary",
+    "background_color": "#F4F6FB",
+    "theme_color": "#2F5AF3",
+    "description": "Piccolo OS admin portal.",
+    "orientation": "any",
     "prefer_related_applications": false,
     "icons": [
         {

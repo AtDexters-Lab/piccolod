@@ -24,6 +24,12 @@ ui: deps ## Build UI to ./web
 	mkdir -p web
 	cp -r $(UI_DIR)/build/web/* web/
 	mv web/index.html web/entry.html
+	@echo "==> Post-processing service worker"
+	rm -f web/flutter_service_worker.js
+	sed -i '/_flutter\.loader\.load/,/});$$/c\_flutter.loader.load({});' web/flutter_bootstrap.js
+	@grep -q '_flutter.loader.load({});' web/flutter_bootstrap.js || \
+		(echo "ERROR: flutter_bootstrap.js post-processing failed" && exit 1)
+	sed -i 's/__CACHE_VERSION__/$(VERSION)/g' web/sw.js
 
 server: ## Build piccolod with embedded ./web
 	@echo "==> Building piccolod (version=$(VERSION))"
