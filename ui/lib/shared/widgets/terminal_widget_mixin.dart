@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:piccolo_os/core/config/core_config.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/error_reporter.dart';
 import 'package:piccolo_os/core/utils/clipboard/clipboard.dart' as clipboard_utils;
 import 'package:piccolo_os/shared/widgets/render_error_boundary.dart';
@@ -13,41 +14,29 @@ import 'package:xterm/xterm.dart';
 
 /// Mixin providing common terminal functionality for host and workspace terminals.
 ///
-/// Usage:
-/// ```dart
-/// class _MyTerminalState extends State<MyTerminal> with TerminalWidgetMixin {
-///   @override
-///   String getTerminalPath() => '/api/v1/terminal';
-///
-///   @override
-///   void initState() {
-///     super.initState();
-///     initTerminal();
-///     WidgetsBinding.instance.addPostFrameCallback((_) => connectTerminal());
-///   }
-///
-///   @override
-///   void dispose() {
-///     disposeTerminal();
-///     super.dispose();
-///   }
-///
-///   @override
-///   Widget build(BuildContext context) => buildTerminalView();
-/// }
-/// ```
+/// Supports persistent terminal sessions: a server-side PTY is created via REST,
+/// then a WebSocket attaches to it. If the connection drops, reconnecting
+/// reattaches to the same living PTY with scrollback replay.
 mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
   late final Terminal terminal;
   late final TerminalController terminalController;
   late final ScrollController terminalScrollController;
   PiccoloTerminalBackend? terminalBackend;
 
+  /// Tracks the server-side persistent session ID.
+  /// Null means no session exists yet (will be created on connect).
+  String? _terminalSessionId;
+
   static const _clipboardHint =
       '\r\n\x1b[33mClipboard unavailable. Browsers block copy/paste on insecure origins.\x1b[0m\r\n';
 
-  /// Subclasses must implement this to provide the WebSocket endpoint path.
-  /// Example: '/api/v1/terminal' or '/api/v1/apps/myapp/terminal'
-  String getTerminalPath();
+  /// Returns the REST path for creating a new persistent session.
+  /// Example: '/api/v1/terminal/sessions'
+  String getSessionCreatePath();
+
+  /// Returns the WebSocket path for attaching to an existing session.
+  /// Example: '/api/v1/terminal/sessions/$sessionId/attach'
+  String getSessionAttachPath(String sessionId);
 
   /// Optional callback when terminal session ends normally (e.g., Ctrl+D).
   /// Subclasses can override to close window/navigate away.
@@ -60,13 +49,43 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
     terminalScrollController = ScrollController();
   }
 
-  /// Connect to the WebSocket terminal. Call in postFrameCallback.
-  void connectTerminal() {
-    final url = _buildWebSocketUrl(getTerminalPath());
+  /// Connect to the WebSocket terminal. Creates a persistent session if needed.
+  Future<void> connectTerminal() async {
+    // Create a new server-side session if we don't have one
+    if (_terminalSessionId == null) {
+      try {
+        final result = await ApiClient().post(getSessionCreatePath());
+        // Guard against widget disposal during async gap
+        if (!mounted) return;
+        if (result is Map && result.containsKey('id')) {
+          _terminalSessionId = result['id'] as String;
+        } else {
+          terminal.write('\r\n\x1b[31mFailed to create terminal session\x1b[0m\r\n');
+          return;
+        }
+      } on Object catch (e) {
+        if (!mounted) return;
+        terminal.write('\r\n\x1b[31mFailed to create terminal session: $e\x1b[0m\r\n');
+        return;
+      }
+    }
+
+    if (!mounted) return;
+
+    final url = _buildWebSocketUrl(getSessionAttachPath(_terminalSessionId!));
     terminalBackend = PiccoloTerminalBackend(
       terminal,
       url,
-      onSessionEnd: getOnSessionEnd(),
+      onSessionEnd: () {
+        // Shell exited — clear session ID so next connect creates a fresh one
+        _terminalSessionId = null;
+        getOnSessionEnd()?.call();
+      },
+      onSessionLost: () {
+        // Session is dead (expired/reaped) — clear ID and reconnect with backoff
+        _terminalSessionId = null;
+        Future<void>.delayed(const Duration(seconds: 2), reconnectTerminal);
+      },
     );
     terminalBackend!.init();
   }
@@ -80,9 +99,10 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
 
   /// Dispose the current backend and reconnect with a fresh WebSocket.
   void reconnectTerminal() {
+    if (!mounted) return;
     terminalBackend?.dispose();
     terminalBackend = null;
-    connectTerminal();
+    unawaited(connectTerminal());
   }
 
   String _buildWebSocketUrl(String path) {

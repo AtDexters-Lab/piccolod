@@ -39,6 +39,7 @@ import (
 	"piccolod/internal/runtime/commands"
 	"piccolod/internal/runtime/supervisor"
 	"piccolod/internal/services"
+	"piccolod/internal/terminal"
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage"
 	"piccolod/internal/storage/diskprep"
@@ -151,6 +152,9 @@ type GinServer struct {
 	onboardingMgr *onboarding.Manager
 	installer     *onboarding.Installer
 	execRunner    runner.CommandRunner
+
+	// Persistent terminal sessions
+	terminalManager *terminal.Manager
 }
 
 type secureContextKey struct{}
@@ -507,6 +511,10 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		installer:      installer,
 		execRunner:     execRunner,
 	}
+	// Initialize persistent terminal session manager
+	s.terminalManager = terminal.NewManager()
+	s.terminalManager.SetEventBus(eventsBus)
+
 	// Seed baseline health statuses
 	healthTracker.Setf("http", health.LevelOK, "HTTP server initialized")
 	healthTracker.Setf("app-manager", health.LevelWarn, "app manager gated by lock state")
@@ -536,6 +544,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		s.serviceManager.Stop()
 		return nil
 	}))
+
+	s.supervisor.Register(s.terminalManager)
 
 	s.supervisor.Register(supervisor.NewComponent("app-manager", func(ctx context.Context) error {
 		s.appManager.StartBackground()
@@ -1168,6 +1178,12 @@ func (s *GinServer) setupGinRoutes() {
 			apps.POST("/:name/start", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppStart)
 			apps.POST("/:name/stop", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppStop)
 			apps.GET("/:name/terminal", s.requireAdmin(), s.handleWorkspaceTerminal)
+
+			// Persistent container terminal sessions (Admin only)
+			apps.POST("/:name/terminal/sessions", s.requireAdmin(), s.handleCreateWorkspaceTerminalSession)
+			apps.GET("/:name/terminal/sessions", s.requireAdmin(), s.handleListWorkspaceTerminalSessions)
+			apps.DELETE("/:name/terminal/sessions/:id", s.requireAdmin(), s.handleDeleteWorkspaceTerminalSession)
+			apps.GET("/:name/terminal/sessions/:id/attach", s.requireAdmin(), s.handleAttachWorkspaceTerminalSession)
 		}
 
 		// Image search (Admin only)
@@ -1219,8 +1235,17 @@ func (s *GinServer) setupGinRoutes() {
 		// UI telemetry (Admin only)
 		admin.POST("/telemetry/log", s.handleTelemetryLog)
 
-		// Debug terminal (Admin only)
+		// Debug terminal (Admin only) — legacy ephemeral endpoint
 		admin.GET("/terminal", s.handleTerminal)
+
+		// Persistent terminal sessions (Admin only)
+		termSessions := admin.Group("/terminal/sessions")
+		{
+			termSessions.POST("", s.handleCreateHostTerminalSession)
+			termSessions.GET("", s.handleListHostTerminalSessions)
+			termSessions.DELETE("/:id", s.handleDeleteHostTerminalSession)
+			termSessions.GET("/:id/attach", s.handleAttachHostTerminalSession)
+		}
 
 		// OS updates (Admin only)
 		updates := admin.Group("/updates/os")

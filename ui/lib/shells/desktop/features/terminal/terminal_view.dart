@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:piccolo_os/shared/widgets/terminal_widget_mixin.dart';
 
 /// Host terminal app widget.
-/// Connects to the host system's shell via /api/v1/terminal WebSocket.
+/// Connects to the host system's shell via persistent terminal sessions.
 class TerminalApp extends StatefulWidget {
 
   const TerminalApp({super.key, this.onSessionEnd});
@@ -16,7 +16,11 @@ class TerminalApp extends StatefulWidget {
 
 class _TerminalAppState extends State<TerminalApp> with TerminalWidgetMixin {
   @override
-  String getTerminalPath() => '/api/v1/terminal';
+  String getSessionCreatePath() => '/api/v1/terminal/sessions';
+
+  @override
+  String getSessionAttachPath(String sessionId) =>
+      '/api/v1/terminal/sessions/$sessionId/attach';
 
   @override
   void Function()? getOnSessionEnd() => widget.onSessionEnd;

@@ -6,7 +6,12 @@ import 'package:xterm/xterm.dart';
 
 class PiccoloTerminalBackend {
 
-  PiccoloTerminalBackend(this.terminal, this.url, {this.onSessionEnd}) {
+  PiccoloTerminalBackend(
+    this.terminal,
+    this.url, {
+    this.onSessionEnd,
+    this.onSessionLost,
+  }) {
     _connection = WebSocketConnection(
       url,
       onReconnectScheduled: (delay) {
@@ -22,6 +27,7 @@ class PiccoloTerminalBackend {
   final Terminal terminal;
   final String url;
   final void Function()? onSessionEnd;
+  final void Function()? onSessionLost;
 
   late final WebSocketConnection _connection;
   late final void Function() _connectionListener;
@@ -31,6 +37,10 @@ class PiccoloTerminalBackend {
 
   WebSocketConnectionState _lastState = WebSocketConnectionState.disconnected;
   String? _lastErrorShown;
+
+  /// Tracks consecutive connection failures to detect dead sessions.
+  int _consecutiveFailures = 0;
+  static const _maxFailuresBeforeSessionLost = 3;
 
   void init() {
     _subscription = _connection.messages.listen(_handleMessage);
@@ -52,12 +62,20 @@ class PiccoloTerminalBackend {
     _lastState = state;
 
     if (state == WebSocketConnectionState.connected) {
+      _consecutiveFailures = 0;
       _lastErrorShown = null;
       _sendResize(terminal.viewWidth, terminal.viewHeight);
       return;
     }
 
     if (state == WebSocketConnectionState.error) {
+      _consecutiveFailures++;
+      if (_consecutiveFailures >= _maxFailuresBeforeSessionLost &&
+          onSessionLost != null) {
+        // Session is likely dead — trigger fresh session creation
+        onSessionLost!();
+        return;
+      }
       final err = _connection.lastError;
       if (err != null && err.isNotEmpty && err != _lastErrorShown) {
         terminal.write('\r\n\x1b[31m$err\x1b[0m\r\n');
