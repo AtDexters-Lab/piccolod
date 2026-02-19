@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 
 	"piccolod/internal/events"
 )
@@ -30,6 +31,11 @@ func (s *GinServer) handleGinTaskProgressStream(c *gin.Context) {
 	}
 	defer conn.Close()
 
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	defer cancel()
 
@@ -37,7 +43,14 @@ func (s *GinServer) handleGinTaskProgressStream(c *gin.Context) {
 	sendJSON := func(v any) error {
 		wsSendMu.Lock()
 		defer wsSendMu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
 		return conn.WriteJSON(v)
+	}
+	sendPing := func() error {
+		wsSendMu.Lock()
+		defer wsSendMu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+		return conn.WriteMessage(websocket.PingMessage, nil)
 	}
 
 	if s.progress != nil {
@@ -63,13 +76,15 @@ func (s *GinServer) handleGinTaskProgressStream(c *gin.Context) {
 		}
 	}()
 
-	keepalive := time.NewTicker(15 * time.Second)
+	keepalive := time.NewTicker(wsPingInterval)
 	defer keepalive.Stop()
 
 	for {
 		select {
 		case <-keepalive.C:
-			_ = sendJSON(progressMessage{Type: "keepalive"})
+			if err := sendPing(); err != nil {
+				cancel()
+			}
 		case <-ctx.Done():
 			_ = conn.Close()
 			<-readDone

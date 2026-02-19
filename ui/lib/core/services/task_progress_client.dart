@@ -51,7 +51,6 @@ class TaskProgressClient extends ChangeNotifier {
       if (decoded is! Map<String, dynamic>) return;
 
       final type = decoded['type'];
-      if (type == 'keepalive') return;
       if (type != 'task_progress') return;
 
       final payload = decoded['payload'];
