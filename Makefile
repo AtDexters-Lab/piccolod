@@ -17,7 +17,7 @@ deps: ## Install UI dependencies
 
 # --- Build steps ---
 ui: deps ## Build UI to ./web
-	@echo "==> Building UI (Flutter with WASM)"
+	@echo "==> Building UI (Flutter)"
 	cd $(UI_DIR) && flutter build web --release --base-href "/"
 	@echo "==> Copying artifacts to ./web"
 	rm -rf web/*
