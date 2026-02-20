@@ -137,6 +137,19 @@ func (r *PeerRegistry) Count() int {
 	return len(r.peers)
 }
 
+// RemovePeer removes a specific peer by machine ID.
+// Returns true if the peer existed and was removed.
+func (r *PeerRegistry) RemovePeer(machineID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	_, exists := r.peers[machineID]
+	if exists {
+		delete(r.peers, machineID)
+	}
+	return exists
+}
+
 // RemoveStale removes peers not seen since the given cutoff time.
 // Returns the number of removed peers.
 func (r *PeerRegistry) RemoveStale(cutoff time.Time) int {

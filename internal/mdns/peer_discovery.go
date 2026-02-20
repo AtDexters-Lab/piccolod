@@ -139,8 +139,12 @@ func (m *Manager) handlePeerDiscoveryResponse(msg *dns.Msg, clientAddr *net.UDPA
 	// Map from instance FQDN to partial peer info
 	instances := make(map[string]*peerInfo)
 
-	// First pass: collect PTR records pointing to instances
+	// First pass: collect PTR records pointing to instances.
+	// Skip TTL=0 (goodbye) records — those are handled by checkForGoodbyeAnnouncements.
 	for _, rr := range msg.Answer {
+		if rr.Header().Ttl == 0 {
+			continue
+		}
 		if ptr, ok := rr.(*dns.PTR); ok {
 			if strings.EqualFold(ptr.Hdr.Name, serviceFQDN) {
 				instanceFQDN := normalizeFQDN(ptr.Ptr)
@@ -157,6 +161,9 @@ func (m *Manager) handlePeerDiscoveryResponse(msg *dns.Msg, clientAddr *net.UDPA
 	// (could be a response to our direct query)
 	if len(instances) == 0 {
 		for _, rr := range msg.Answer {
+			if rr.Header().Ttl == 0 {
+				continue
+			}
 			switch r := rr.(type) {
 			case *dns.SRV, *dns.TXT:
 				name := normalizeFQDN(rr.Header().Name)
@@ -171,10 +178,14 @@ func (m *Manager) handlePeerDiscoveryResponse(msg *dns.Msg, clientAddr *net.UDPA
 		}
 	}
 
-	// Second pass: collect SRV, TXT, and address records
+	// Second pass: collect SRV, TXT, and address records.
+	// Skip TTL=0 records to prevent goodbye records from re-adding peers.
 	allRecords := append(append([]dns.RR{}, msg.Answer...), msg.Extra...)
 
 	for _, rr := range allRecords {
+		if rr.Header().Ttl == 0 {
+			continue
+		}
 		name := normalizeFQDN(rr.Header().Name)
 
 		switch r := rr.(type) {
@@ -311,13 +322,23 @@ func (m *Manager) cleanupStalePeers() {
 }
 
 // handlePeerGoodbye processes a goodbye announcement (TTL=0) from a peer.
-// This triggers immediate leadership re-evaluation for faster handoff.
+// It removes the peer from the registry and triggers immediate leadership re-evaluation.
 func (m *Manager) handlePeerGoodbye(machineID string) {
 	if machineID == "" || machineID == m.machineID {
 		return
 	}
 
-	log.Printf("DISCOVERY: Peer goodbye received - ID: %s", machineID)
+	// Remove peer from registry before notifying leader. The leader's
+	// OnPeerGoodbye spawns a goroutine that reads the registry via
+	// getPeers() → List(), so removal must complete first.
+	removed := m.peerRegistry.RemovePeer(machineID)
+	if !removed {
+		// Unknown peer — no registry entry to remove and no reason to
+		// trigger a leadership re-evaluation.
+		return
+	}
+
+	log.Printf("DISCOVERY: Peer goodbye received - ID: %s (removed from registry)", machineID)
 
 	// Notify gateway leader for immediate leadership re-evaluation
 	if m.gatewayLeader != nil {
@@ -333,6 +354,10 @@ func (m *Manager) checkForGoodbyeAnnouncements(msg *dns.Msg) {
 	}
 
 	serviceFQDN := m.ServiceFQDN()
+
+	// Track machine IDs already processed to deduplicate when both TXT and
+	// PTR goodbye records for the same peer appear in a single message.
+	processed := make(map[string]struct{})
 
 	// Check all answer records for TTL=0 (goodbye)
 	for _, rr := range msg.Answer {
@@ -351,7 +376,10 @@ func (m *Manager) checkForGoodbyeAnnouncements(msg *dns.Msg) {
 			// Parse TXT to get machine ID
 			metadata := parseTXTRecord(txt.Txt)
 			if metadata != nil && metadata.MachineID != "" && metadata.MachineID != m.machineID {
-				m.handlePeerGoodbye(metadata.MachineID)
+				if _, seen := processed[metadata.MachineID]; !seen {
+					processed[metadata.MachineID] = struct{}{}
+					m.handlePeerGoodbye(metadata.MachineID)
+				}
 			}
 		}
 
@@ -377,10 +405,11 @@ func (m *Manager) checkForGoodbyeAnnouncements(msg *dns.Msg) {
 
 			// Try to find the peer by hostname and trigger goodbye
 			if peer, found := m.GetPeerByHostname(hostname); found {
-				log.Printf("DISCOVERY: PTR goodbye for instance %s (machine ID: %s)", instanceFQDN, peer.MachineID)
-				m.handlePeerGoodbye(peer.MachineID)
-			} else {
-				log.Printf("DISCOVERY: PTR goodbye for unknown instance: %s", instanceFQDN)
+				if _, seen := processed[peer.MachineID]; !seen {
+					processed[peer.MachineID] = struct{}{}
+					log.Printf("DISCOVERY: PTR goodbye for instance %s (machine ID: %s)", instanceFQDN, peer.MachineID)
+					m.handlePeerGoodbye(peer.MachineID)
+				}
 			}
 		}
 	}
