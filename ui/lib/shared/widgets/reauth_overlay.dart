@@ -3,9 +3,10 @@ import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
-/// Compact re-authentication overlay displayed when the portal session expires.
+/// Re-authentication overlay displayed when the portal session expires.
 ///
-/// Renders a scrim + centered card with username (pre-filled) and password fields.
+/// Renders a scrim + centered dialog (matching the SetupWizard chrome) with
+/// username (pre-filled) and password fields.
 /// "Log In" re-authenticates inline; "Log Out" cancels and triggers a full logout.
 class ReauthOverlay extends StatefulWidget {
 
@@ -81,119 +82,118 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context).textTheme;
-
-    return Container(
+    return ColoredBox(
       color: PiccoloTheme.scrim,
-      alignment: Alignment.center,
-      child: Container(
-        width: 380,
-        padding: const EdgeInsets.all(28),
-        decoration: BoxDecoration(
-          color: PiccoloTheme.porcelain,
-          borderRadius: BorderRadius.circular(Radii.lg),
-          boxShadow: Elevation.elev4,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Header
-            Row(
-              children: [
-                const Icon(PiccoloIcons.lock,
-                    size: 20, color: PiccoloTheme.inkMuted),
-                const SizedBox(width: 8),
-                Text('Session Expired', style: theme.titleMedium),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'Your session has expired. Log in again to continue.',
-              style: theme.bodySmall
-                  ?.copyWith(color: PiccoloTheme.inkMuted),
-            ),
-            const SizedBox(height: 20),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final dialogWidth =
+              (constraints.maxWidth * 0.9).clamp(360.0, 480.0);
 
-            // Username
-            TextField(
-              controller: _usernameController,
-              decoration: const InputDecoration(
-                labelText: 'Username',
-                isDense: true,
-              ),
-              textInputAction: TextInputAction.next,
-              enabled: !_isLoading,
-            ),
-            const SizedBox(height: 12),
-
-            // Password
-            TextField(
-              controller: _passwordController,
-              obscureText: _obscurePassword,
-              decoration: InputDecoration(
-                labelText: 'Password',
-                isDense: true,
-                suffixIcon: IconButton(
-                  icon: Icon(
-                    _obscurePassword
-                        ? PiccoloIcons.visibility
-                        : PiccoloIcons.visibilityOff,
-                    size: 18,
+          return Center(
+            child: Container(
+              width: dialogWidth,
+              decoration: BoxDecoration(
+                color: PiccoloTheme.porcelain,
+                borderRadius: BorderRadius.circular(Radii.lg),
+                boxShadow: [
+                  BoxShadow(
+                    color: PiccoloTheme.scrim.withValues(alpha: 0.2),
+                    blurRadius: 40,
+                    offset: const Offset(0, 20),
                   ),
-                  onPressed: () =>
-                      setState(() => _obscurePassword = !_obscurePassword),
-                ),
+                ],
+                border: Border.all(color: PiccoloTheme.porcelain),
               ),
-              textInputAction: TextInputAction.done,
-              onSubmitted: _isLoading ? null : (_) => _submit(),
-              enabled: !_isLoading,
-            ),
-            const SizedBox(height: 8),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Header
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 24, 24, 16),
+                    child: Text(
+                      'Session Expired',
+                      style: PiccoloTheme.textTheme.bodyMedium
+                          ?.copyWith(color: PiccoloTheme.inkMuted),
+                    ),
+                  ),
 
-            // Error
-            if (_error != null) ...[
-              Text(
-                _error!,
-                style: theme.bodySmall
-                    ?.copyWith(color: PiccoloTheme.critical),
-              ),
-              const SizedBox(height: 8),
-            ],
-
-            const SizedBox(height: 12),
-
-            // Actions
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                TextButton(
-                  onPressed: _isLoading
-                      ? null
-                      : () {
-                          ApiClient().completeReauth(success: false);
-                          widget.onCancel();
-                        },
-                  child: const Text('Log Out'),
-                ),
-                const SizedBox(width: 8),
-                FilledButton(
-                  onPressed: _isLoading ? null : _submit,
-                  child: _isLoading
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
+                  // Form
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        TextField(
+                          controller: _usernameController,
+                          autofillHints: const [AutofillHints.username],
+                          decoration: const InputDecoration(
+                            labelText: 'Username',
                           ),
-                        )
-                      : const Text('Log In'),
-                ),
-              ],
+                          textInputAction: TextInputAction.next,
+                          enabled: !_isLoading,
+                        ),
+                        const SizedBox(height: 16),
+                        TextField(
+                          controller: _passwordController,
+                          obscureText: _obscurePassword,
+                          autofillHints: const [AutofillHints.password],
+                          decoration: InputDecoration(
+                            labelText: 'Password',
+                            errorText: _error,
+                            suffixIcon: IconButton(
+                              icon: Icon(
+                                _obscurePassword
+                                    ? PiccoloIcons.visibilityOff
+                                    : PiccoloIcons.visibility,
+                                color: PiccoloTheme.inkMuted,
+                              ),
+                              onPressed: () => setState(
+                                () => _obscurePassword = !_obscurePassword,
+                              ),
+                            ),
+                          ),
+                          textInputAction: TextInputAction.done,
+                          onSubmitted: _isLoading ? null : (_) => _submit(),
+                          enabled: !_isLoading,
+                        ),
+                        const SizedBox(height: 24),
+                        Row(
+                          children: [
+                            TextButton(
+                              onPressed: _isLoading
+                                  ? null
+                                  : () {
+                                      ApiClient()
+                                          .completeReauth(success: false);
+                                      widget.onCancel();
+                                    },
+                              child: const Text('Log Out'),
+                            ),
+                            const Spacer(),
+                            FilledButton(
+                              onPressed: _isLoading ? null : _submit,
+                              child: _isLoading
+                                  ? const SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white,
+                                      ),
+                                    )
+                                  : const Text('Log In'),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }
