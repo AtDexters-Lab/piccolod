@@ -152,7 +152,6 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 	startTime := time.Now()
 	defer func() {
 		if time.Since(startTime) > m.securityConfig.QueryTimeout {
-			// Don't log timeout warnings for self-responses (common during conflict probing)
 			if !m.isSelfResponse(clientAddr.IP) {
 				log.Printf("SECURITY: Query timeout from %s", clientAddr.IP)
 			}
@@ -184,10 +183,9 @@ func (m *Manager) handleDualStackQuery(data []byte, clientAddr *net.UDPAddr, sta
 	// Track total queries (after successful parse)
 	atomic.AddUint64(&m.securityMetrics.TotalQueries, 1)
 
-	// Handle responses (for conflict detection and peer discovery) BEFORE query validation
+	// Handle responses (for peer discovery) BEFORE query validation
 	// Responses legitimately have answers without questions (RFC 6762)
 	if msg.Response {
-		m.handleConflictDetection(&msg, clientAddr)
 		m.handlePeerDiscoveryResponse(&msg, clientAddr)
 		return
 	}

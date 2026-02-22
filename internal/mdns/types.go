@@ -83,25 +83,6 @@ type HealthMonitor struct {
 	mutex            sync.RWMutex
 }
 
-// ConflictDetector manages DNS name conflicts and resolution
-type ConflictDetector struct {
-	ConflictDetected   bool
-	ConflictingSources map[string]ConflictingHost
-	LastConflictCheck  time.Time
-	ResolutionAttempts uint64
-	CurrentSuffix      string
-	mutex              sync.RWMutex
-}
-
-// ConflictingHost represents a host that conflicts with our name
-type ConflictingHost struct {
-	IP         net.IP
-	FirstSeen  time.Time
-	LastSeen   time.Time
-	QueryCount uint64
-	MachineID  string // Derived from responses if available
-}
-
 // QueryProcessor manages concurrent query processing with limits
 type QueryProcessor struct {
 	semaphore   chan struct{}
@@ -138,9 +119,6 @@ type Manager struct {
 	// Resilience components
 	resilienceConfig *ResilienceConfig
 	healthMonitor    *HealthMonitor
-
-	// Conflict detection and resolution
-	conflictDetector *ConflictDetector
 
 	// Peer discovery
 	peerRegistry    *PeerRegistry

@@ -66,11 +66,6 @@ func TestNewManager(t *testing.T) {
 		t.Error("healthMonitor should be initialized")
 	}
 
-	// Test conflict detection initialization
-	if manager.conflictDetector == nil {
-		t.Error("conflictDetector should be initialized")
-	}
-
 	// Test collections initialization
 	if manager.interfaces == nil {
 		t.Error("interfaces map should be initialized")
@@ -170,36 +165,6 @@ func TestManagerHealthMonitorDefaults(t *testing.T) {
 
 	if monitor.RecoveryAttempts != 0 {
 		t.Errorf("RecoveryAttempts = %v, want %v", monitor.RecoveryAttempts, 0)
-	}
-}
-
-func TestManagerConflictDetectorDefaults(t *testing.T) {
-	manager := NewManager()
-
-	detector := manager.conflictDetector
-
-	if detector.ConflictDetected {
-		t.Error("ConflictDetected should be false initially")
-	}
-
-	if detector.ConflictingSources == nil {
-		t.Error("ConflictingSources map should be initialized")
-	}
-
-	if len(detector.ConflictingSources) != 0 {
-		t.Error("ConflictingSources map should be empty initially")
-	}
-
-	if !assertTimestamp(detector.LastConflictCheck, time.Second) {
-		t.Error("LastConflictCheck should be recent")
-	}
-
-	if detector.ResolutionAttempts != 0 {
-		t.Errorf("ResolutionAttempts = %v, want %v", detector.ResolutionAttempts, 0)
-	}
-
-	if detector.CurrentSuffix != "" {
-		t.Errorf("CurrentSuffix = %v, want empty string", detector.CurrentSuffix)
 	}
 }
 

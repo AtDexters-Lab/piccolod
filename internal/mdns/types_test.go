@@ -1,7 +1,6 @@
 package mdns
 
 import (
-	"net"
 	"testing"
 	"time"
 )
@@ -163,31 +162,6 @@ func TestResilienceConfig(t *testing.T) {
 				t.Errorf("Invalid %s: %v", tt.field, value)
 			}
 		})
-	}
-}
-
-func TestConflictingHost(t *testing.T) {
-	ip := net.ParseIP("192.168.1.50")
-	now := time.Now()
-
-	host := ConflictingHost{
-		IP:         ip,
-		FirstSeen:  now,
-		LastSeen:   now,
-		QueryCount: 3,
-		MachineID:  "test-machine-123",
-	}
-
-	if !host.IP.Equal(ip) {
-		t.Errorf("IP = %v, want %v", host.IP, ip)
-	}
-
-	if host.QueryCount != 3 {
-		t.Errorf("QueryCount = %v, want %v", host.QueryCount, 3)
-	}
-
-	if host.MachineID != "test-machine-123" {
-		t.Errorf("MachineID = %v, want %v", host.MachineID, "test-machine-123")
 	}
 }
 

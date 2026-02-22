@@ -36,7 +36,7 @@ type DiscoveredPeer struct {
 	IPv6          net.IP    // IPv6 address if available
 	MachineID     string    // abc123 (6 hex chars)
 	Model         string    // "Raspberry Pi 4 Model B"
-	PreferredName string    // "piccolo" (before conflict resolution)
+	PreferredName string    // "piccolo"
 	Version       string    // "0.1.0"
 	BootTime      time.Time // Current uptime start
 	FirstSeen     time.Time

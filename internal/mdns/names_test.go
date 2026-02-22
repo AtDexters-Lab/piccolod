@@ -37,7 +37,7 @@ func TestNameRegistrySpecificHostnameAlwaysPublished(t *testing.T) {
 		t.Fatalf("specific hostname should always be published, got %v", names)
 	}
 
-	// After conflict resolution, baseName changes but specific stays
+	// After SetBaseName, specific hostname still published
 	reg.SetBaseName("piccolo-abc123")
 	names = reg.Names()
 
