@@ -18,8 +18,8 @@ const defaultBaseName = "piccolo"
 // NewManager creates a new mDNS manager
 func NewManager() *Manager {
 	machineID := getMachineID()
-	// Use specific name (piccolo-<machineId>) as base to avoid piccolo.local conflicts.
-	// Gateway leader will add piccolo.local separately via AddGatewayHostname().
+	// Use specific name (piccolo-<machineId>) as base; gateway leader adds
+	// piccolo.local separately via AddGatewayHostname().
 	specificName := "piccolo-" + machineID
 	baseName := sanitizeBaseName(specificName)
 
@@ -55,7 +55,7 @@ func NewManager() *Manager {
 		stopCh:     make(chan struct{}),
 		baseName:   baseName,
 		machineID:  machineID,
-		finalName:  baseName, // Will be updated if conflicts detected
+		finalName:  baseName,
 		names:      newNameRegistry(baseName, specificName),
 
 		// Security components
@@ -71,12 +71,6 @@ func NewManager() *Manager {
 			OverallHealth:   1.0,
 			InterfaceHealth: make(map[string]float64),
 			LastHealthCheck: time.Now(),
-		},
-
-		// Conflict detection
-		conflictDetector: &ConflictDetector{
-			ConflictingSources: make(map[string]ConflictingHost),
-			LastConflictCheck:  time.Now(),
 		},
 
 		// Peer discovery
@@ -190,35 +184,19 @@ func (m *Manager) Start() error {
 	m.wg.Add(1)
 	go m.peerDiscoveryLoop()
 
-	// Launch probing and conflict monitoring in background to avoid blocking startup
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.mutex.RLock()
+	interfaceCount := len(m.interfaces)
+	m.mutex.RUnlock()
 
-		// Perform initial conflict detection
-		if err := m.probeNameAvailability(); err != nil {
-			log.Printf("ERROR: conflict detection failed: %v", err)
-			return
-		}
+	serviceName := m.currentServiceName()
 
-		// Start conflict monitoring routine
-		m.wg.Add(1)
-		go m.conflictMonitor()
+	log.Printf("INFO: Secured dual-stack mDNS server started - advertising %s.local on %d interfaces",
+		serviceName, interfaceCount)
+	log.Printf("INFO: Security limits - %d concurrent queries, %d max packet size",
+		m.securityConfig.MaxConcurrentQueries, m.securityConfig.MaxPacketSize)
 
-		m.mutex.RLock()
-		interfaceCount := len(m.interfaces)
-		m.mutex.RUnlock()
-
-		serviceName := m.currentServiceName()
-
-		log.Printf("INFO: Secured dual-stack mDNS server started - advertising %s.local on %d interfaces",
-			serviceName, interfaceCount)
-		log.Printf("INFO: Security limits - %d concurrent queries, %d max packet size",
-			m.securityConfig.MaxConcurrentQueries, m.securityConfig.MaxPacketSize)
-
-		// Log service metadata
-		m.logServiceMetadata()
-	}()
+	// Log service metadata
+	m.logServiceMetadata()
 
 	return nil
 }
@@ -347,7 +325,7 @@ func (m *Manager) currentServiceName() string {
 	return m.names.BaseName()
 }
 
-// Hostname returns the full mDNS hostname (e.g., "piccolo.local" or "piccolo-abc123.local").
+// Hostname returns the full mDNS hostname (e.g., "piccolo-abc123.local").
 func (m *Manager) Hostname() string {
 	if m.names == nil {
 		m.mutex.RLock()
@@ -693,9 +671,27 @@ func sanitizeBaseName(name string) string {
 	return normalized
 }
 
-func (m *Manager) setFinalNameLocked(name string) {
-	m.finalName = name
-	if m.names != nil {
-		m.names.SetBaseName(name)
+// isSelfResponse checks if an IP address belongs to any of the local interfaces.
+func (m *Manager) isSelfResponse(addr net.IP) bool {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	for _, state := range m.interfaces {
+		if !state.Active {
+			continue
+		}
+		addrs, err := state.Interface.Addrs()
+		if err != nil {
+			log.Printf("ERROR: Failed to get addresses for interface %s: %v", state.Interface.Name, err)
+			continue
+		}
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok {
+				if ipnet.IP.Equal(addr) {
+					return true
+				}
+			}
+		}
 	}
+	return false
 }

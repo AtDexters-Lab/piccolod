@@ -16,8 +16,8 @@ const localTLD = "local"
 // NameRegistry tracks the base hostname and per-app alias labels.
 type NameRegistry struct {
 	mu              sync.RWMutex
-	baseName        string            // Current base name (may be "piccolo" or "piccolo-<machineId>" after conflict)
-	specificName    string            // Always "piccolo-<machineId>" - published regardless of conflict state
+	baseName        string            // Current base name (e.g., "piccolo-<machineId>")
+	specificName    string            // Always "piccolo-<machineId>" - published unconditionally
 	aliases         map[string]struct{}
 	fqdns           map[string]struct{}
 	snapshot        []string
@@ -194,12 +194,12 @@ func (r *NameRegistry) rebuildLocked() {
 	fqdns := make(map[string]struct{}, capacity)
 	snapshot := make([]string, 0, capacity)
 
-	// Primary hostname based on conflict state (may be "piccolo" or "piccolo-<machineId>")
+	// Primary hostname
 	baseFQDN := r.baseName + "." + localTLD + "."
 	fqdns[baseFQDN] = struct{}{}
 	snapshot = append(snapshot, baseFQDN)
 
-	// Specific hostname: always publish piccolo-<machineId>.local regardless of conflict state
+	// Specific hostname: always publish piccolo-<machineId>.local
 	// This ensures the device is always reachable via its unique hostname
 	if r.specificName != "" && r.specificName != r.baseName {
 		specificFQDN := r.specificName + "." + localTLD + "."
