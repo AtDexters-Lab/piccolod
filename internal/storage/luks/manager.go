@@ -194,7 +194,7 @@ func (m *PoolManager) MountDataPool(ctx context.Context) error {
 	mapperPath := MapperPath(0)
 	dataRoot := paths.DataRoot()
 
-	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
+	if err := os.MkdirAll(dataRoot, 0o711); err != nil {
 		return fmt.Errorf("create mount point: %w", err)
 	}
 

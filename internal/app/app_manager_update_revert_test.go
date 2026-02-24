@@ -9,6 +9,7 @@ import (
 )
 
 func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "fs_update_revert")
 	if err != nil {
 		t.Fatal(err)
@@ -52,6 +53,7 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 }
 
 func TestAppManager_Logs(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "fs_logs")
 	if err != nil {
 		t.Fatal(err)

@@ -73,7 +73,7 @@ func NewLUKSKDFParams(deviceUUID string) (*LUKSKDFParams, error) {
 		Version:       1,
 		DeviceUUID:    deviceUUID,
 		Argon2Time:    3,
-		Argon2Memory:  512 * 1024, // 512 MiB
+		Argon2Memory:  cryptoutil.SelectKDFMemoryKiB(),
 		Argon2Threads: uint8(threads),
 		KeyLength:     32,
 		SaltAdmin:     saltAdmin,

@@ -16,7 +16,7 @@ VDI_PRISTINE="$WORK_DIR/piccolo-os-pristine.vdi"
 VDI_WORK="$WORK_DIR/piccolo-os.vdi"
 MNT="$WORK_DIR/mnt"
 TEMPLATE="piccolo-template"
-DISK_SIZE_MB=24576  # 24 GB
+DISK_SIZE_MB=28672  # 28 GB
 VM_STATE_FILE="$WORK_DIR/vm-name"
 NBD_DEV="/dev/nbd0"
 
@@ -70,7 +70,7 @@ fi
 # --- Step 2: Build piccolod ---
 echo "==> Building piccolod"
 cd "$PROJECT_DIR"
-make server
+make build
 
 # --- Step 3: Fresh copy of VDI ---
 echo "==> Creating fresh VDI copy"

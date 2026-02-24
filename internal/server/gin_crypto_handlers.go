@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -143,6 +145,14 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		case <-handlerDone:
 		}
 	}()
+
+	// Release KDF memory before LUKS initialization — the Argon2id key
+	// derivation above may have allocated hundreds of MiBs that Go's GC
+	// hasn't returned to the OS yet. cryptsetup spawns its own Argon2id,
+	// and the combined footprint can OOM a 2 GB device.
+	log.Printf("INFO: releasing KDF memory before storage initialization")
+	runtime.GC()
+	debug.FreeOSMemory()
 
 	// 5. Initialize LUKS data volume BEFORE notifying persistence, so that
 	// /piccolo-data is mounted before the app-manager reconcile loop
@@ -284,6 +294,11 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 		case <-handlerDone:
 		}
 	}()
+
+	// Release KDF memory before LUKS unlock — same rationale as setup handler.
+	log.Printf("INFO: releasing KDF memory before storage unlock")
+	runtime.GC()
+	debug.FreeOSMemory()
 
 	// Unlock LUKS data volume BEFORE notifying persistence, so that
 	// /piccolo-data is mounted before the app-manager reconcile loop

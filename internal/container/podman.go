@@ -63,6 +63,92 @@ type PodmanRuntime struct {
 	Imagestore    string
 	StorageDriver string
 	StorageOpts   []string
+
+	// AdditionalImageStores lists read-only image stores that podman should
+	// overlay on top of the primary store. Unlike Imagestore (read-write),
+	// additional stores are never written to by podman. Used by per-app
+	// runtimes to share a common imagestore owned by piccolo-runtime.
+	// When set, a storage.conf is generated in Root and referenced via
+	// CONTAINERS_STORAGE_CONF env var.
+	AdditionalImageStores []string
+
+	// Credential, when non-nil, causes all podman commands to run as the
+	// specified user (rootless mode). When nil, commands inherit the parent
+	// process credentials (rootful fallback).
+	Credential *syscall.Credential
+	// HomeDir is the home directory of the runtime user, used to set HOME
+	// in the minimal environment for rootless execution.
+	HomeDir string
+}
+
+// FuseOverlayfsWrapperPath is the path to the wrapper script that strips
+// SELinux context= from overlay mount options before calling fuse-overlayfs.
+const FuseOverlayfsWrapperPath = "/run/piccolo/podman/fuse-overlayfs-wrapper.sh"
+
+// EnsureFuseOverlayfsWrapper creates a wrapper script for fuse-overlayfs that
+// strips SELinux context= mount options. Podman passes SELinux labels
+// (context="...") as overlay mount data, but fuse-overlayfs doesn't understand
+// them and the commas inside the label value (e.g., s0:c337,c527) break its
+// option parser. The parent directory must already exist.
+func EnsureFuseOverlayfsWrapper() error {
+	const content = `#!/bin/sh
+# Strip SELinux context= from overlay mount options for fuse-overlayfs.
+# Podman passes context="system_u:object_r:container_file_t:s0:cXXX,cYYY" as
+# mount data; the commas inside the label break fuse-overlayfs option parsing.
+opts=$(printf '%s' "$2" | sed 's/,context="[^"]*"//g;s/context="[^"]*",//g;s/context="[^"]*"//g')
+exec /usr/bin/fuse-overlayfs "$1" "$opts" "$3"
+`
+	existing, err := os.ReadFile(FuseOverlayfsWrapperPath)
+	if err == nil && string(existing) == content {
+		return nil
+	}
+	if err := os.WriteFile(FuseOverlayfsWrapperPath, []byte(content), 0o755); err != nil {
+		return fmt.Errorf("write fuse-overlayfs wrapper: %w", err)
+	}
+	log.Printf("INFO: created fuse-overlayfs wrapper at %s", FuseOverlayfsWrapperPath)
+	return nil
+}
+
+// ensureAdditionalStoresConf generates a storage.conf in podmanRoot that
+// configures ALL storage settings: graphroot, runroot, driver, driver options,
+// and additionalimagestores for read-only image access.
+//
+// When this conf is used (via CONTAINERS_STORAGE_CONF), Podman CLI flags like
+// --root, --runroot, --storage-driver, --storage-opt MUST NOT be passed,
+// because CLI storage flags can cause Podman to reinitialize storage options
+// from scratch, dropping additionalimagestores from the config.
+//
+// The file is only written when its content would change (idempotent).
+func ensureAdditionalStoresConf(rt PodmanRuntime) (string, error) {
+	confPath := filepath.Join(rt.Root, "storage.conf")
+
+	// Build quoted store list for TOML array.
+	quoted := make([]string, len(rt.AdditionalImageStores))
+	for i, s := range rt.AdditionalImageStores {
+		quoted[i] = fmt.Sprintf("%q", s)
+	}
+	content := fmt.Sprintf("[storage]\ndriver = %q\ngraphroot = %q\nrunroot = %q\n\n[storage.options]\nadditionalimagestores = [%s]\n",
+		rt.StorageDriver, rt.Root, rt.RunRoot, strings.Join(quoted, ", "))
+
+	// For overlay driver, configure fuse-overlayfs as the mount program.
+	// Per-app graphroots reside on gocryptfs (FUSE). Kernel overlay cannot
+	// mount on FUSE from within a user namespace (EACCES), but fuse-overlayfs
+	// handles this correctly as a userspace overlay implementation.
+	if rt.StorageDriver == "overlay" {
+		content += fmt.Sprintf("\n[storage.options.overlay]\nmount_program = %q\n", FuseOverlayfsWrapperPath)
+	}
+
+	// Only write if content changed.
+	existing, err := os.ReadFile(confPath)
+	if err == nil && string(existing) == content {
+		return confPath, nil
+	}
+
+	if err := os.WriteFile(confPath, []byte(content), 0o644); err != nil {
+		return "", fmt.Errorf("write storage.conf: %w", err)
+	}
+	log.Printf("INFO: ensureAdditionalStoresConf: wrote %s:\n%s", confPath, content)
+	return confPath, nil
 }
 
 // ContainerState captures minimal observed container state.
@@ -99,10 +185,66 @@ var portInUseRe = regexp.MustCompile(`:(\d+): bind: address already in use`)
 
 const podmanWaitDelay = 5 * time.Second
 
-func podmanCmd(ctx context.Context, args ...string) *exec.Cmd {
+func podmanCmd(ctx context.Context, rt PodmanRuntime, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "podman", args...)
 	cmd.WaitDelay = podmanWaitDelay
+	ApplyRuntimeCredential(cmd, rt)
 	return cmd
+}
+
+// proxyEnvVars returns proxy-related environment variables from the current
+// process, preserving registry access through HTTP proxies.
+// ProxyEnvVars returns proxy environment variables (HTTP_PROXY, HTTPS_PROXY, etc.)
+// from the current process environment. Used to pass proxy settings into
+// rootless subprocesses that get a minimal env instead of os.Environ().
+func ProxyEnvVars() []string {
+	var envs []string
+	for _, key := range []string{
+		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "no_proxy",
+	} {
+		if v := os.Getenv(key); v != "" {
+			envs = append(envs, fmt.Sprintf("%s=%s", key, v))
+		}
+	}
+	return envs
+}
+
+// ApplyRuntimeCredential configures cmd to run as the runtime user when
+// rt.Credential is non-nil. It sets a minimal environment (with proxy vars)
+// and SysProcAttr.Credential. When Credential is nil, this is a no-op
+// and the command inherits the parent process environment.
+// extraEnv values are appended to the minimal environment.
+func ApplyRuntimeCredential(cmd *exec.Cmd, rt PodmanRuntime, extraEnv ...string) {
+	if rt.Credential == nil {
+		return
+	}
+	cmd.Env = append([]string{
+		fmt.Sprintf("HOME=%s", rt.HomeDir),
+		fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", rt.Credential.Uid),
+		fmt.Sprintf("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%d/bus", rt.Credential.Uid),
+		fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
+		"LANG=C.UTF-8",
+		"LC_ALL=C",
+	}, extraEnv...)
+	cmd.Env = append(cmd.Env, ProxyEnvVars()...)
+
+	// Set CONTAINERS_STORAGE_CONF for per-app runtimes with additional image stores.
+	// Without this, podman commands look in default storage and can't find containers.
+	if len(rt.AdditionalImageStores) > 0 && rt.Root != "" {
+		confPath, err := ensureAdditionalStoresConf(rt)
+		if err != nil {
+			log.Printf("WARN: failed to generate storage.conf for additional image stores: %v", err)
+		} else {
+			_ = os.Chown(confPath, int(rt.Credential.Uid), int(rt.Credential.Gid))
+			cmd.Env = append(cmd.Env, fmt.Sprintf("CONTAINERS_STORAGE_CONF=%s", confPath))
+		}
+	}
+
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Credential = rt.Credential
 }
 
 func exitCode(err error) (int, bool) {
@@ -263,6 +405,12 @@ type ContainerCreateSpec struct {
 	// Used with --rootfs mode to apply image config since Podman doesn't do it automatically.
 	User string
 
+	// PullPolicy controls image pulling during create: "always", "missing", "never".
+	// Per-app runtimes use "never" because images must be pre-pulled to the shared
+	// imagestore — per-app storage resides on a gocryptfs FUSE mount where rootless
+	// layer extraction (pivot_root inside user namespaces) is not supported.
+	PullPolicy string
+
 	// ExtraHosts adds entries to /etc/hosts (format: "hostname:IP").
 	// Used for OIDC back-channel communication to allow containers to reach piccolo.local.
 	ExtraHosts []HostEntry
@@ -301,12 +449,45 @@ type TmpfsMount struct {
 }
 
 type ResourceLimits struct {
-	Memory string
-	CPU    string
+	Memory      string
+	CPU         string
+	PidsLimit   int
+	NofileLimit int
 }
 
 func buildCreateArgs(spec ContainerCreateSpec) []string {
 	args := []string{"create"}
+
+	// Pull policy: per-app runtimes set "never" to avoid rootless layer extraction
+	// on FUSE-backed storage (gocryptfs). Images must be pre-pulled to the shared
+	// imagestore by the image runtime (piccolo-runtime user).
+	if spec.PullPolicy != "" {
+		args = append(args, "--pull", spec.PullPolicy)
+	}
+
+	// Use k8s-file log driver instead of the system default (journald).
+	// Rootless per-app users don't have systemd user sessions, so journald
+	// logs are inaccessible via `podman logs`. k8s-file stores logs as flat
+	// files in the container's graphroot, which the per-app user owns.
+	args = append(args, "--log-driver=k8s-file")
+
+	// Capability hardening: drop all capabilities and re-add only
+	// the minimal set required for typical container workloads.
+	args = append(args,
+		"--cap-drop=ALL",
+		"--cap-add=CHOWN",
+		"--cap-add=DAC_OVERRIDE",
+		"--cap-add=FOWNER",
+		"--cap-add=FSETID",
+		"--cap-add=SETUID",
+		"--cap-add=SETGID",
+		"--cap-add=NET_BIND_SERVICE",
+		"--cap-add=KILL",
+		"--cap-add=SYS_CHROOT",
+		"--cap-add=SETFCAP",
+		"--cap-add=SETPCAP",
+		"--cap-add=AUDIT_WRITE",
+	)
 
 	// PID 1 init process for proper signal handling and zombie reaping
 	if spec.UseInit {
@@ -351,9 +532,18 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 
 	if spec.Resources.Memory != "" {
 		args = append(args, "--memory", spec.Resources.Memory)
+		// Disable swap limit to avoid "memory.swap.max: no such file or directory"
+		// on kernels without swap accounting (common in VMs).
+		args = append(args, "--memory-swap", "-1")
 	}
 	if spec.Resources.CPU != "" {
 		args = append(args, "--cpus", spec.Resources.CPU)
+	}
+	if spec.Resources.PidsLimit > 0 {
+		args = append(args, "--pids-limit", fmt.Sprintf("%d", spec.Resources.PidsLimit))
+	}
+	if spec.Resources.NofileLimit > 0 {
+		args = append(args, "--ulimit", fmt.Sprintf("nofile=%d:%d", spec.Resources.NofileLimit, spec.Resources.NofileLimit))
 	}
 
 	for key, value := range spec.Environment {
@@ -415,6 +605,17 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 
 func buildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 	out := make([]string, 0, 6+len(runtime.StorageOpts)+len(args))
+
+	// When AdditionalImageStores is set, ALL storage settings (graphroot,
+	// runroot, driver, driver options) are in the storage.conf generated by
+	// ensureAdditionalStoresConf and applied via CONTAINERS_STORAGE_CONF.
+	// CLI storage flags MUST NOT be passed because they can cause Podman to
+	// reinitialize storage options, dropping additionalimagestores.
+	if len(runtime.AdditionalImageStores) > 0 {
+		out = append(out, args...)
+		return out, nil
+	}
+
 	if runtime.Root != "" {
 		if err := ValidatePath(runtime.Root); err != nil {
 			return nil, fmt.Errorf("invalid podman --root path: %w", err)
@@ -440,8 +641,9 @@ func buildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 		out = append(out, "--storage-driver", runtime.StorageDriver)
 	}
 	for _, opt := range runtime.StorageOpts {
-		// Basic validation for options (key=value or key)
-		if !regexp.MustCompile(`^[a-z0-9_]+=[/a-zA-Z0-9._-]+$|^[a-z0-9_]+$`).MatchString(opt) {
+		// Basic validation for options (key=value or key).
+		// Keys can contain dots for driver-scoped options (e.g., overlay.mount_program).
+		if !regexp.MustCompile(`^[a-z0-9_.]+=[/a-zA-Z0-9._-]+$|^[a-z0-9_.]+$`).MatchString(opt) {
 			return nil, fmt.Errorf("invalid storage option: %s", opt)
 		}
 		out = append(out, "--storage-opt", opt)
@@ -470,7 +672,7 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 	if err != nil {
 		return "", err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -520,7 +722,7 @@ func (p *PodmanCLI) StartContainer(ctx context.Context, runtime PodmanRuntime, c
 	if err != nil {
 		return err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -541,7 +743,7 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 	if err != nil {
 		return err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -569,7 +771,7 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 	if err != nil {
 		return err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -596,7 +798,7 @@ func (p *PodmanCLI) ImageExists(ctx context.Context, runtime PodmanRuntime, imag
 	if err != nil {
 		return false, err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	err = cmd.Run()
 	if err == nil {
 		return true, nil
@@ -618,7 +820,7 @@ func (p *PodmanCLI) RemoveImage(ctx context.Context, runtime PodmanRuntime, imag
 	if err != nil {
 		return err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -637,7 +839,7 @@ func (p *PodmanCLI) PullImage(ctx context.Context, runtime PodmanRuntime, image 
 	if err != nil {
 		return err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("podman pull failed: %w, output: %s", err, string(output))
@@ -659,7 +861,7 @@ func (p *PodmanCLI) Logs(ctx context.Context, runtime PodmanRuntime, containerID
 	if err != nil {
 		return nil, err
 	}
-	cmd := podmanCmd(ctx, cmdArgs...)
+	cmd := podmanCmd(ctx, runtime, cmdArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("podman logs failed: %w, output: %s", err, string(output))
@@ -712,7 +914,7 @@ func (p *PodmanCLI) LogsStream(ctx context.Context, runtime PodmanRuntime, conta
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
-	cmd := podmanCmd(runCtx, cmdArgs...)
+	cmd := podmanCmd(runCtx, runtime, cmdArgs...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -766,7 +968,7 @@ func (p *PodmanCLI) containerExists(ctx context.Context, runtime PodmanRuntime, 
 	if err != nil {
 		return false, err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return true, nil
@@ -794,7 +996,7 @@ func (p *PodmanCLI) ResolveContainerIDByName(ctx context.Context, runtime Podman
 	if err != nil {
 		return "", err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -841,7 +1043,7 @@ func (p *PodmanCLI) ListContainersByLabel(ctx context.Context, runtime PodmanRun
 		return nil, err
 	}
 
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("podman ps failed: %w, output: %s", err, string(out))
@@ -894,7 +1096,7 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 	if err != nil {
 		return ContainerState{}, err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -946,7 +1148,7 @@ func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRun
 	if err != nil {
 		return nil, err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("podman port failed: %w", err)
@@ -1011,7 +1213,7 @@ func (p *PodmanCLI) NetworkReload(ctx context.Context, runtime PodmanRuntime, co
 	if err != nil {
 		return err
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		outStr := strings.ToLower(string(output))
@@ -1033,7 +1235,7 @@ func (p *PodmanCLI) ResetStorage(ctx context.Context, runtime PodmanRuntime) err
 	if err != nil {
 		return err
 	}
-	cmd := podmanCmd(ctx, rmArgs...)
+	cmd := podmanCmd(ctx, runtime, rmArgs...)
 	_ = cmd.Run() // Ignore errors - containers may already be gone
 	return nil
 }
@@ -1077,7 +1279,7 @@ func (p *PodmanCLI) ValidateAndRepairStorage(ctx context.Context, runtime Podman
 	if err != nil {
 		return false, fmt.Errorf("build podman args: %w", err)
 	}
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, runErr := cmd.CombinedOutput()
 	if runErr == nil {
 		return false, nil // Storage is healthy
@@ -1287,6 +1489,15 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 		return fmt.Errorf("invalid container name: %w", err)
 	}
 
+	// Validate pull policy
+	if spec.PullPolicy != "" {
+		switch spec.PullPolicy {
+		case "always", "missing", "never":
+		default:
+			return fmt.Errorf("invalid pull policy %q: must be always, missing, or never", spec.PullPolicy)
+		}
+	}
+
 	// Validate image or rootfs (one must be set)
 	if spec.Rootfs != "" {
 		// Rootfs mode: validate the path
@@ -1396,7 +1607,7 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 		return nil, err
 	}
 
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("podman image inspect failed: %w, output: %s", err, string(output))
@@ -1462,8 +1673,7 @@ func (p *PodmanCLI) ExecShellCmd(runtime PodmanRuntime, containerID string) (*ex
 
 	cmd := exec.Command("podman", args...)
 	cmd.WaitDelay = podmanWaitDelay
-	// Preserve existing environment (XDG_RUNTIME_DIR, PATH, etc. needed for rootless podman)
-	cmd.Env = os.Environ()
+	ApplyRuntimeCredential(cmd, runtime, "TERM=xterm-256color")
 	return cmd, nil
 }
 
@@ -1490,7 +1700,7 @@ func (p *PodmanCLI) SearchRegistry(ctx context.Context, runtime PodmanRuntime, q
 		return nil, err
 	}
 
-	cmd := podmanCmd(ctx, args...)
+	cmd := podmanCmd(ctx, runtime, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("podman search failed: %w, output: %s", err, string(output))
@@ -1740,7 +1950,7 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 
 	// If no callback, just use regular pull
 	if callback == nil {
-		cmd := podmanCmd(ctx, args...)
+		cmd := podmanCmd(ctx, runtime, args...)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("podman pull failed: %w, output: %s", err, string(output))
@@ -1749,11 +1959,13 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 	}
 
 	// Use PTY for progress output
+	log.Printf("INFO: PullImageWithProgress: starting podman pull %s (args=%v uid=%v)", image, args, runtime.Credential)
 	cmd := exec.Command("podman", args...)
 	cmd.WaitDelay = podmanWaitDelay
-	// Inherit environment but force C locale to ensure consistent number formatting
-	// (some locales use comma as decimal separator which breaks our parsing)
-	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	// IMPORTANT: applyRuntimeCredential must be called before pty.StartWithSize
+	// because creack/pty v1.1.24 merges Setsid/Setctty into existing SysProcAttr
+	// rather than replacing it, so the Credential we set here is preserved.
+	ApplyRuntimeCredential(cmd, runtime)
 
 	// Start command with PTY using wide terminal to prevent line wrapping
 	// which would break our line-based regex parsing
@@ -1763,6 +1975,7 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 		return fmt.Errorf("failed to start podman pull with pty: %w", err)
 	}
 	defer ptmx.Close()
+	log.Printf("INFO: PullImageWithProgress: podman process started (pid=%d) for %s", cmd.Process.Pid, image)
 
 	// Channel to signal normal completion
 	done := make(chan struct{})
@@ -1784,6 +1997,20 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 			}
 		case <-done:
 			// Normal completion
+		}
+	}()
+
+	// Watchdog: log periodically while pull is in progress
+	watchdog := time.NewTicker(30 * time.Second)
+	go func() {
+		defer watchdog.Stop()
+		for {
+			select {
+			case <-watchdog.C:
+				log.Printf("INFO: PullImageWithProgress: still waiting for podman pull %s (pid=%d)", image, cmd.Process.Pid)
+			case <-done:
+				return
+			}
 		}
 	}()
 
@@ -1849,6 +2076,7 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 	// Wait for command to finish
 	cmdErr = cmd.Wait()
 	close(done)
+	log.Printf("INFO: PullImageWithProgress: podman pull %s finished (err=%v pid=%d)", image, cmdErr, cmd.Process.Pid)
 
 	// Always emit final completion
 	finalReport := parser.report()

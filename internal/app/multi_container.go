@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"piccolod/internal/api"
 	"piccolod/internal/app/workspacedisk"
@@ -89,6 +90,10 @@ type serviceContainerOptions struct {
 	svcName    string
 	anchorID   string
 
+	// Rootless mode: when set, volume dirs are chowned to this UID/GID
+	// and the :U mount option is added for Podman UID remapping.
+	credential *syscall.Credential
+
 	// Workspace mode fields (optional, empty for service mode)
 	mergedRootfs  string                       // Path to mounted workspace disk rootfs
 	workspaceMeta *workspacedisk.WorkspaceMeta // Workspace metadata with image config
@@ -146,33 +151,64 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 				return container.ContainerCreateSpec{}, fmt.Errorf("failed to ensure workspace assets: %w", err)
 			}
 
+			// For rootless mode, copy assets to a per-app-owned directory.
+			// Root-owned bind mounts are inaccessible inside rootless containers
+			// because host UID 0 is unmapped in the container's user namespace.
+			bootShHost := BootShHostPath()
+			startupHost := PiccoloStartupHostPath()
+			if opts.credential != nil {
+				assetDir := filepath.Join(opts.layout.DataDir, "piccolo-assets")
+				if err := os.MkdirAll(assetDir, 0o755); err != nil {
+					return container.ContainerCreateSpec{}, fmt.Errorf("failed to create per-app assets dir: %w", err)
+				}
+				if err := container.ChownIfNeeded(assetDir, int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+					return container.ContainerCreateSpec{}, fmt.Errorf("failed to chown per-app assets dir: %w", err)
+				}
+				if err := copyFileWithOwner(BootShHostPath(), filepath.Join(assetDir, "boot.sh"), int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+					return container.ContainerCreateSpec{}, fmt.Errorf("failed to copy boot.sh to per-app dir: %w", err)
+				}
+				if err := copyFileWithOwner(PiccoloStartupHostPath(), filepath.Join(assetDir, "piccolo-startup"), int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+					return container.ContainerCreateSpec{}, fmt.Errorf("failed to copy piccolo-startup to per-app dir: %w", err)
+				}
+				bootShHost = filepath.Join(assetDir, "boot.sh")
+				startupHost = filepath.Join(assetDir, "piccolo-startup")
+			}
+
 			// Mount boot.sh as read-only into the container
-			// Use :z for SELinux shared label (required for rootless podman on SELinux systems)
 			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-				Host:      BootShHostPath(),
+				Host:      bootShHost,
 				Container: "/piccolo/boot.sh",
-				Options:   "ro,z",
+				Options:   "ro",
 			})
 
 			// Mount piccolo-startup helper to /usr/local/bin (which is in PATH by default)
 			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-				Host:      PiccoloStartupHostPath(),
+				Host:      startupHost,
 				Container: "/usr/local/bin/piccolo-startup",
-				Options:   "ro,z",
+				Options:   "ro",
 			})
 		}
 
 		// Mount a writable config directory for user startup hooks (start.sh)
 		// This directory is persistent and writable by the container user.
-		// Use 0o755 on host; the :U mount option handles UID mapping for rootless containers.
+		// The :U mount option handles UID mapping for rootless containers.
 		configDir := filepath.Join(opts.layout.DataDir, "piccolo-config")
 		if err := os.MkdirAll(configDir, 0o755); err != nil {
 			return container.ContainerCreateSpec{}, fmt.Errorf("failed to create piccolo config dir: %w", err)
 		}
+		if opts.credential != nil {
+			if err := container.ChownIfNeeded(configDir, int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+				return container.ContainerCreateSpec{}, fmt.Errorf("failed to chown piccolo config dir: %w", err)
+			}
+		}
+		configVolOpts := "rw"
+		if opts.credential != nil {
+			configVolOpts = "rw,U"
+		}
 		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
 			Host:      configDir,
 			Container: "/piccolo/config",
-			Options:   "rw,U,z", // U for rootless UID mapping
+			Options:   configVolOpts,
 		})
 	}
 
@@ -182,9 +218,52 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 			CPU:    fmt.Sprintf("%.1f", svc.Resources.Limits.CPU),
 		}
 	}
-	if err := m.applyServiceStorageAndTmpfs(&spec, svc.Storage, opts.layout, opts.appDef.Extensions); err != nil {
+
+	// Resource limit defaults: pids-limit and nofile are always set to prevent
+	// fork bombs and file descriptor exhaustion. Manifest permissions can override.
+	const defaultPidsLimit = 4096
+	const defaultNofileLimit = 65536
+	spec.Resources.PidsLimit = defaultPidsLimit
+	spec.Resources.NofileLimit = defaultNofileLimit
+	if opts.appDef.Permissions != nil && opts.appDef.Permissions.Resources != nil {
+		if opts.appDef.Permissions.Resources.MaxProcesses > 0 {
+			spec.Resources.PidsLimit = opts.appDef.Permissions.Resources.MaxProcesses
+		}
+		if opts.appDef.Permissions.Resources.MaxOpenFiles > 0 {
+			spec.Resources.NofileLimit = opts.appDef.Permissions.Resources.MaxOpenFiles
+		}
+	}
+
+	if err := m.applyServiceStorageAndTmpfs(&spec, svc.Storage, opts.layout, opts.appDef.Extensions, opts.credential); err != nil {
 		return container.ContainerCreateSpec{}, err
 	}
+
+	// In --rootfs mode, two adjustments to tmpfs mounts:
+	// 1. Filter out tmpfs targets that are symlinks in the rootfs. For example,
+	//    /var/run is typically a symlink to /run in many images. Mounting tmpfs
+	//    on a symlink target replaces it with a real mount, breaking init systems
+	//    (e.g., s6-overlay) that expect the symlink.
+	// 2. Add notmpcopyup for remaining tmpfs mounts. crun copies existing rootfs
+	//    contents to the tmpfs before the user namespace is set up, and with
+	//    uidmapping, files owned by non-root image UIDs are inaccessible,
+	//    causing tmpcopyup to fail. These dirs (/run, /tmp) are ephemeral.
+	if spec.Rootfs != "" {
+		filtered := spec.Tmpfs[:0]
+		for _, t := range spec.Tmpfs {
+			target := filepath.Join(spec.Rootfs, t.Container)
+			if info, err := os.Lstat(target); err == nil && info.Mode()&os.ModeSymlink != 0 {
+				continue // Skip: symlink in rootfs, tmpfs would replace it
+			}
+			if t.Options == "" {
+				t.Options = "notmpcopyup"
+			} else {
+				t.Options += ",notmpcopyup"
+			}
+			filtered = append(filtered, t)
+		}
+		spec.Tmpfs = filtered
+	}
+
 	m.applyOIDCClientInjection(&spec, svc.OIDCClient)
 	if err := container.ValidateContainerSpec(spec); err != nil {
 		return container.ContainerCreateSpec{}, fmt.Errorf("invalid service container spec for '%s': %w", opts.svcName, err)
@@ -193,12 +272,21 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 	return spec, nil
 }
 
-func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreateSpec, storage *api.AppStorage, layout appVolumeLayout, extensions map[string]interface{}) error {
+func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreateSpec, storage *api.AppStorage, layout appVolumeLayout, extensions map[string]interface{}, cred *syscall.Credential) error {
 	if spec == nil {
 		return nil
 	}
 	if layout.DataDir == "" {
 		return fmt.Errorf("container spec requires app volume layout")
+	}
+
+	// Rootless volume options: chown dirs to the per-app user and add :U
+	// so Podman remaps ownership into the container's UID namespace.
+	// Without :U, host-root-owned dirs appear as nobody inside the container
+	// and entrypoints that chown/chmod their data dirs fail.
+	volOpts := "rw"
+	if cred != nil {
+		volOpts = "rw,U"
 	}
 
 	mountedPaths := map[string]struct{}{}
@@ -209,10 +297,15 @@ func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreate
 			if err := ensureDir(host, 0o777); err != nil {
 				return fmt.Errorf("ensure persistent volume '%s': %w", volName, err)
 			}
+			if cred != nil {
+				if err := container.ChownIfNeeded(host, int(cred.Uid), int(cred.Gid)); err != nil {
+					return fmt.Errorf("chown persistent volume '%s': %w", volName, err)
+				}
+			}
 			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
 				Host:      host,
 				Container: vol.Container,
-				Options:   "rw,U",
+				Options:   volOpts,
 			})
 			mountedPaths[vol.Container] = struct{}{}
 		}
@@ -246,3 +339,4 @@ func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreate
 
 	return nil
 }
+

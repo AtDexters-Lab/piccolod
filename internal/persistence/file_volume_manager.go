@@ -453,6 +453,16 @@ func (f *fileVolumeManager) ensureVolumePrerequisites(ctx context.Context, entry
 	if err := f.ensureCipherDir(entry.class, entry.cipherDir); err != nil {
 		return fmt.Errorf("ensure volume %s ciphertext: %w", entry.handle.ID, err)
 	}
+	// Ensure the mounts/ parent directory is traversable (0o711) so per-app
+	// users can reach their own mount points without being able to list siblings.
+	// Chmod explicitly since MkdirAll is a no-op on existing directories.
+	mountsParent := filepath.Dir(entry.handle.MountDir)
+	if err := os.MkdirAll(mountsParent, 0o711); err != nil {
+		return fmt.Errorf("ensure volume %s mounts parent: %w", entry.handle.ID, err)
+	}
+	if err := os.Chmod(mountsParent, 0o711); err != nil {
+		return fmt.Errorf("chmod mounts parent for volume %s: %w", entry.handle.ID, err)
+	}
 	if err := os.MkdirAll(entry.handle.MountDir, 0o700); err != nil {
 		if mounted, mErr := isMountPoint(entry.handle.MountDir); mErr == nil && mounted {
 			log.Printf("WARN: volume %s: stale mount at %s during init, cleaning up", entry.handle.ID, entry.handle.MountDir)

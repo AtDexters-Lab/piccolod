@@ -1133,6 +1133,9 @@ func validateNetworkPermissions(network *api.AppNetworkPermissions) error {
 
 // validateResourcePermissions validates resource permission settings
 func validateResourcePermissions(resources *api.AppResourcePermissions) error {
+	if resources.Privileged {
+		return fmt.Errorf("privileged containers are not supported")
+	}
 	if resources.MaxProcesses < 0 {
 		return fmt.Errorf("max_processes must be non-negative")
 	}

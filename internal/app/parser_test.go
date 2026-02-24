@@ -551,6 +551,25 @@ func TestReservedNames(t *testing.T) {
 	}
 }
 
+func TestValidateResourcePermissions_rejects_privileged(t *testing.T) {
+	res := &api.AppResourcePermissions{Privileged: true}
+	err := validateResourcePermissions(res)
+	if err == nil {
+		t.Fatal("expected error for privileged=true, got nil")
+	}
+	if !containsString(err.Error(), "privileged") {
+		t.Errorf("expected error about privileged, got: %v", err)
+	}
+}
+
+func TestValidateResourcePermissions_allows_non_privileged(t *testing.T) {
+	res := &api.AppResourcePermissions{MaxProcesses: 100, MaxOpenFiles: 1024}
+	err := validateResourcePermissions(res)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestMalformedYAML tests handling of malformed YAML
 func TestMalformedYAML(t *testing.T) {
 	malformedYAML := `name: test

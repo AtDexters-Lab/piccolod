@@ -684,9 +684,12 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Remote manager — uses network-bootstrap dir on the core filesystem.
 	networkBootstrapDir := paths.CoreJoin("network-bootstrap")
-	if err := os.MkdirAll(networkBootstrapDir, 0o700); err != nil {
+	if err := os.MkdirAll(networkBootstrapDir, 0o711); err != nil {
 		return nil, fmt.Errorf("ensure network-bootstrap dir: %w", err)
 	}
+	// Widen from 0700 (pre-rootless default) so per-app users can traverse
+	// to reach the internal CA cert that gets bind-mounted into containers.
+	_ = os.Chmod(networkBootstrapDir, 0o711)
 	remoteStorage := newBootstrapRemoteStorage(persist.Control().Remote(), networkBootstrapDir)
 	var rm *remote.Manager
 	if remoteStorage != nil {
@@ -1197,6 +1200,8 @@ func (s *GinServer) setupGinRoutes() {
 
 		// Diagnostic log download (Admin only, always available)
 		admin.GET("/system/admin/diagnostic-log", s.handleAdminDiagnosticLog)
+		admin.GET("/system/network-check", s.handleNetworkCheck)
+		admin.GET("/system/storage-check", s.handleStorageCheck)
 
 		// Task progress (Admin only?) - Maybe standard user needs to see progress of their own actions?
 		// But they can't trigger actions. So Admin only is safe.

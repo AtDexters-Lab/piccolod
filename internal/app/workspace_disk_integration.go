@@ -5,12 +5,70 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
 
 	"piccolod/internal/api"
 	"piccolod/internal/app/workspacedisk"
 	"piccolod/internal/container"
 )
+
+// buildWorkspaceMountOpts creates MountOptions for the workspace overlay.
+// For rootless per-app users, it configures fuse-overlayfs uidmapping/gidmapping
+// to remap the image layer UIDs (stored by piccolo-runtime) to the per-app user's
+// UID space. This makes the overlay match the container's user namespace mapping.
+//
+// The mapping has three entries:
+//  1. Host root (UID 0) → per-app user: for files created by piccolod in the upper layer
+//  2. Image runtime UID → per-app user: for image root files (stored as runtime UID)
+//  3. Image runtime subuids → per-app subuids: for non-root image files
+func buildWorkspaceMountOpts(instanceID string, runtime container.PodmanRuntime, imageRuntime *container.PodmanRuntime) workspacedisk.MountOptions {
+	opts := workspacedisk.MountOptions{SquashUID: -1, SquashGID: -1}
+	if runtime.Credential == nil {
+		return opts
+	}
+
+	appUID := int(runtime.Credential.Uid)
+	appGID := int(runtime.Credential.Gid)
+	username := container.AppUsername(instanceID)
+
+	appSubStart, appSubCount, err := container.LookupSubUIDRange(username)
+	if err != nil {
+		log.Printf("WARN: workspace %s: subuid lookup failed (%v), falling back to squash_to_uid", instanceID, err)
+		opts.SquashUID = appUID
+		opts.SquashGID = appGID
+		return opts
+	}
+
+	// Image layers are stored with the image runtime user's remapped UIDs
+	// (rootless Podman remaps during extraction). We need to map from the
+	// runtime's UID space to the per-app user's UID space.
+	// Format: "disk_uid:overlay_uid:count" entries separated by colons.
+	if imageRuntime != nil && imageRuntime.Credential != nil {
+		rtUID := int(imageRuntime.Credential.Uid)
+		rtGID := int(imageRuntime.Credential.Gid)
+		rtUsername := "piccolo-runtime"
+		rtSubStart, rtSubCount, err := container.LookupSubUIDRange(rtUsername)
+		if err != nil {
+			log.Printf("WARN: workspace %s: runtime subuid lookup failed (%v), falling back to squash_to_uid", instanceID, err)
+			opts.SquashUID = appUID
+			opts.SquashGID = appGID
+			return opts
+		}
+		subCount := rtSubCount
+		if appSubCount < subCount {
+			subCount = appSubCount
+		}
+		// Entry 1: host root (UID 0) → per-app user (for upper layer dirs created by piccolod)
+		// Entry 2: runtime UID → per-app user (image root = stored as runtime UID)
+		// Entry 3: runtime subuids → per-app subuids (image non-root UIDs)
+		opts.UIDMapping = fmt.Sprintf("0:%d:1:%d:%d:1:%d:%d:%d", appUID, rtUID, appUID, rtSubStart, appSubStart, subCount)
+		opts.GIDMapping = fmt.Sprintf("0:%d:1:%d:%d:1:%d:%d:%d", appGID, rtGID, appGID, rtSubStart, appSubStart, subCount)
+	} else {
+		// No image runtime — assume layers have original UIDs (pulled by root).
+		opts.UIDMapping = fmt.Sprintf("0:%d:1:1:%d:%d", appUID, appSubStart, appSubCount)
+		opts.GIDMapping = fmt.Sprintf("0:%d:1:1:%d:%d", appGID, appSubStart, appSubCount)
+	}
+	return opts
+}
 
 // workspacePathResolver implements workspacedisk.WorkspacePathResolver
 // by looking up volume layouts through the AppManager.
@@ -81,8 +139,10 @@ func (m *AppManager) initWorkspaceDisk(
 		return "", fmt.Errorf("initialize workspace disk: %w", err)
 	}
 
-	// Mount the overlay filesystem
-	mergedPath, err = m.workspaceDiskMgr.Mount(ctx, instanceID)
+	// Mount the overlay filesystem with UID mapping for per-app user isolation.
+	imgRt, _ := m.podmanImageRuntime()
+	mountOpts := buildWorkspaceMountOpts(instanceID, runtime, &imgRt)
+	mergedPath, err = m.workspaceDiskMgr.Mount(ctx, instanceID, mountOpts)
 	if err != nil {
 		m.workspacePathResolver.Unregister(instanceID)
 		return "", fmt.Errorf("mount workspace disk: %w", err)
@@ -169,35 +229,23 @@ type imagePullProgressRange struct {
 	Max int // Ending progress percentage
 }
 
-// pullImageWithProgress pulls an image with real-time progress events emitted to the frontend.
-// The progressRange maps the pull progress (0-100%) to the specified percentage range.
-// Always pulls to ensure mutable tags (like "latest") are refreshed.
-func (m *AppManager) pullImageWithProgress(
+// makeImagePullProgressCallback builds a progress callback that maps pull
+// progress (0-100%) into the specified range and emits SSE events to the frontend.
+// The ctx must carry the install task ID (via TaskIDFromContext) for events to be emitted.
+func (m *AppManager) makeImagePullProgressCallback(
 	ctx context.Context,
-	runtime container.PodmanRuntime,
-	image string,
 	instanceID string,
 	svcName string,
+	image string,
 	progressRange imagePullProgressRange,
-) error {
-	// Emit initial progress
-	m.emitProgressWithMetadata(
-		ctx,
-		taskTypeInstallApp,
-		instanceID,
-		taskPhasePullingImage,
-		progressRange.Min,
-		fmt.Sprintf("Pulling image %s", image),
-		false,
-		map[string]any{
-			"service": svcName,
-			"image":   image,
-		},
-		nil,
-	)
+) func(container.ImagePullReport) {
+	// Strip @sha256:... digest from display name — it's noise in the UI.
+	displayImage := image
+	if idx := strings.Index(displayImage, "@sha256:"); idx > 0 {
+		displayImage = displayImage[:idx]
+	}
 
-	// Create progress callback that maps pull progress to our range
-	callback := func(report container.ImagePullReport) {
+	return func(report container.ImagePullReport) {
 		// Map the pull progress (0-100) to our range (Min-Max)
 		var progress int
 		if report.OverallPercent < 0 {
@@ -219,15 +267,14 @@ func (m *AppManager) pullImageWithProgress(
 			})
 		}
 
-		message := fmt.Sprintf("Pulling image %s", image)
+		message := fmt.Sprintf("Pulling image %s", displayImage)
 		if report.Phase == "complete" {
-			message = fmt.Sprintf("Image %s pulled successfully", image)
+			message = fmt.Sprintf("Image %s pulled successfully", displayImage)
 			progress = progressRange.Max
 		} else if report.TotalBytes > 0 {
-			// Format bytes for display
 			downloaded := formatBytes(report.DownloadedBytes)
 			total := formatBytes(report.TotalBytes)
-			message = fmt.Sprintf("Pulling %s: %s / %s", image, downloaded, total)
+			message = fmt.Sprintf("Pulling %s: %s / %s", displayImage, downloaded, total)
 		}
 
 		m.emitProgressWithMetadata(
@@ -250,66 +297,6 @@ func (m *AppManager) pullImageWithProgress(
 			nil,
 		)
 	}
-
-	// Pull image with progress, retrying on transient failures.
-	retryDelays := []time.Duration{2 * time.Second, 5 * time.Second}
-	maxAttempts := len(retryDelays) + 1
-
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		lastErr = m.containerManager.PullImageWithProgress(ctx, runtime, image, callback)
-		if lastErr == nil {
-			return nil
-		}
-
-		// Don't retry on context cancellation or deterministic failures
-		if ctx.Err() != nil {
-			return lastErr
-		}
-		errMsg := strings.ToLower(lastErr.Error())
-		for _, pattern := range []string{
-			"invalid image name",
-			"manifest unknown",
-			"repository does not exist",
-			"unauthorized",
-			"authentication required",
-			"denied:",
-		} {
-			if strings.Contains(errMsg, pattern) {
-				return lastErr
-			}
-		}
-
-		log.Printf("WARN: install %s: image pull attempt %d/%d failed for %s: %v",
-			instanceID, attempt, maxAttempts, image, lastErr)
-
-		if attempt < maxAttempts {
-			delay := retryDelays[attempt-1]
-			m.emitProgressWithMetadata(
-				ctx,
-				taskTypeInstallApp,
-				instanceID,
-				taskPhasePullingImage,
-				progressRange.Min,
-				fmt.Sprintf("Retrying image pull (attempt %d/%d)", attempt+1, maxAttempts),
-				false,
-				map[string]any{
-					"service": svcName,
-					"image":   image,
-					"attempt": attempt + 1,
-				},
-				nil,
-			)
-
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
-
-	return lastErr
 }
 
 // formatBytes formats bytes into a human-readable string.
@@ -349,10 +336,14 @@ func (m *AppManager) prepareServiceStorage(
 	}
 
 	if mode != ModeWorkspace {
-		// Service mode: pull the image with progress tracking (best-effort)
+		// Service mode: pull the image using the shared image runtime (piccolo-runtime).
+		// Per-app users have group-read-only access to the imagestore — pulls must use
+		// the shared runtime which has write access. This is mandatory because per-app
+		// runtimes use --pull=never (FUSE storage can't do rootless layer extraction).
 		if svc.Image != "" {
-			if err := m.pullImageWithProgress(ctx, runtime, svc.Image, instanceID, svcName, progressRange); err != nil {
-				log.Printf("WARN: install %s: image pull failed for service %s: %v", instanceID, svcName, err)
+			callback := m.makeImagePullProgressCallback(ctx, instanceID, svcName, svc.Image, progressRange)
+			if err := m.pullToImagestore(ctx, svc.Image, callback); err != nil {
+				return nil, fmt.Errorf("image pull failed for service %s: %w", svcName, err)
 			}
 		}
 		return nil, nil
@@ -380,7 +371,8 @@ func (m *AppManager) prepareServiceStorage(
 		// already cached locally, a pull failure (network down, registry issue)
 		// should not block installation. The subsequent InspectImage call is the
 		// hard gate: if the image isn't available at all, it will fail there.
-		pullErr := m.pullImageWithProgress(ctx, imageRuntime, svc.Image, instanceID, svcName, progressRange)
+		callback := m.makeImagePullProgressCallback(ctx, instanceID, svcName, svc.Image, progressRange)
+		pullErr := m.pullToImagestore(ctx, svc.Image, callback)
 		if pullErr != nil {
 			log.Printf("WARN: install %s: image pull failed, will attempt to use cached image: %v", instanceID, pullErr)
 		}
@@ -499,19 +491,25 @@ func (m *AppManager) ensureWorkspaceDiskMounted(ctx context.Context, instanceID 
 		m.setObservedStatusMessage(instanceID, "Re-pulling base image")
 
 		// Try to pull by digest first
-		if err := m.containerManager.PullImage(ctx, imageRuntime, meta.BaseImageDigest); err != nil {
+		if err := m.pullToImagestore(ctx, meta.BaseImageDigest, nil); err != nil {
 			// If digest pull fails, try the original reference as fallback
 			// (some registries don't support pulling by digest directly)
 			log.Printf("WARN: workspace %s: pull by digest failed, trying reference %s: %v",
 				instanceID, meta.BaseImageRef, err)
-			if err := m.containerManager.PullImage(ctx, imageRuntime, meta.BaseImageRef); err != nil {
+			if err := m.pullToImagestore(ctx, meta.BaseImageRef, nil); err != nil {
 				return "", fmt.Errorf("failed to pull base image: %w", err)
 			}
 		}
 	}
 
-	// Mount the overlay
-	return m.workspaceDiskMgr.Mount(ctx, instanceID)
+	// Mount the overlay with per-app user UID mapping if available.
+	var rt container.PodmanRuntime
+	if appUser, err := container.ResolveAppUser(instanceID); err == nil && appUser != nil {
+		rt.Credential = appUser.Credential
+	}
+	imgRt, _ := m.podmanImageRuntime()
+	mountOpts := buildWorkspaceMountOpts(instanceID, rt, &imgRt)
+	return m.workspaceDiskMgr.Mount(ctx, instanceID, mountOpts)
 }
 
 // getWorkspaceMountInfo returns workspace mount info for an already-mounted workspace disk.

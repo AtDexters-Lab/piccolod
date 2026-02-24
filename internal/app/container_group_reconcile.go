@@ -334,6 +334,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				primary:    primary,
 				svcName:    svcName,
 				anchorID:   anchorID,
+				credential: runtime.Credential,
 			}
 			if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
 				opts.mergedRootfs = workspaceInfo.mergedPath
@@ -371,6 +372,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 					primary:    primary,
 					svcName:    svcName,
 					anchorID:   anchorID,
+					credential: runtime.Credential,
 				}
 				if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
 					opts.mergedRootfs = workspaceInfo.mergedPath
@@ -559,6 +561,11 @@ func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime
 	spec, err := m.buildServiceContainerSpec(opts)
 	if err != nil {
 		return "", fmt.Errorf("build container spec for service '%s': %w", opts.svcName, err)
+	}
+	// Per-app runtimes must never pull: images are pre-pulled to the shared
+	// imagestore and the per-app FUSE storage can't do rootless layer extraction.
+	if spec.Image != "" {
+		spec.PullPolicy = "never"
 	}
 
 	var cid string

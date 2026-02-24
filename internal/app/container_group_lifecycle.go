@@ -111,6 +111,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 				primary:    primary,
 				svcName:    svcName,
 				anchorID:   anchorID,
+				credential: runtime.Credential,
 			}
 			if mode == ModeWorkspace {
 				wsInfo := m.getWorkspaceMountInfo(ctx, appInst.InstanceID)

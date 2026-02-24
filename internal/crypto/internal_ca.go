@@ -36,9 +36,13 @@ type InternalCA struct {
 // NewInternalCA creates or loads an internal CA from the given directory.
 func NewInternalCA(stateDir string) (*InternalCA, error) {
 	caDir := filepath.Join(stateDir, "certs")
-	if err := os.MkdirAll(caDir, 0o700); err != nil {
+	if err := os.MkdirAll(caDir, 0o711); err != nil {
 		return nil, fmt.Errorf("create CA directory: %w", err)
 	}
+	// Widen from 0700 (pre-rootless default) so per-app users can stat the
+	// CA cert that gets bind-mounted into containers for OIDC trust.
+	// The private key remains protected at 0600.
+	_ = os.Chmod(caDir, 0o711)
 
 	ca := &InternalCA{
 		certPath: filepath.Join(caDir, "internal-ca.crt"),

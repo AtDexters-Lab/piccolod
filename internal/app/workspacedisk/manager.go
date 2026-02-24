@@ -6,10 +6,12 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"piccolod/internal/container"
 )
 
 // Manager handles workspace disk lifecycle operations.
@@ -25,7 +27,7 @@ type Manager interface {
 
 	// Mount mounts the overlay filesystem and returns the merged path.
 	// Idempotent: returns success if already mounted.
-	Mount(ctx context.Context, instanceID string) (mergedPath string, err error)
+	Mount(ctx context.Context, instanceID string, opts MountOptions) (mergedPath string, err error)
 
 	// Unmount unmounts the overlay filesystem.
 	// Idempotent: returns success if not mounted.
@@ -64,6 +66,25 @@ func (o InitOptions) Validate() error {
 		return fmt.Errorf("base_image_digest is required")
 	}
 	return nil
+}
+
+// MountOptions configures the overlay mount.
+type MountOptions struct {
+	// SquashUID, when >= 0, sets fuse-overlayfs squash_to_uid so all files in
+	// the overlay appear owned by this UID. Only used as fallback when
+	// UIDMapping is empty.
+	SquashUID int
+	SquashGID int
+
+	// UIDMapping/GIDMapping configure fuse-overlayfs uidmapping/gidmapping for
+	// proper rootless user namespace support. Format: "disk_uid:overlay_uid:count"
+	// entries separated by colons (fuse-overlayfs convention).
+	// Example: "0:469:1:470:469:1:100000:200000:65536" maps host root (disk 0)
+	// and image runtime UID (disk 470) to per-app user (overlay 469), and
+	// runtime subuids (disk 100000+) to per-app subuids (overlay 200000+).
+	// When set, takes precedence over SquashUID/SquashGID.
+	UIDMapping string
+	GIDMapping string
 }
 
 // Status represents the current state of a workspace disk.
@@ -192,7 +213,7 @@ func (m *DefaultManager) EnsureInitialized(ctx context.Context, instanceID strin
 }
 
 // Mount implements Manager.
-func (m *DefaultManager) Mount(ctx context.Context, instanceID string) (string, error) {
+func (m *DefaultManager) Mount(ctx context.Context, instanceID string, opts MountOptions) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -244,7 +265,7 @@ func (m *DefaultManager) Mount(ctx context.Context, instanceID string) (string, 
 	m.mountedImages[instanceID] = meta.BaseImageDigest
 
 	// Mount overlay
-	if err := MountOverlay(ctx, layout, lowerDir); err != nil {
+	if err := MountOverlay(ctx, layout, lowerDir, opts); err != nil {
 		// Cleanup base image mount on failure
 		_ = m.imageMounter.UnmountImage(ctx, meta.BaseImageDigest, runtimeArgs)
 		delete(m.mountedImages, instanceID)
@@ -354,120 +375,99 @@ func (m *DefaultManager) GetLayout(instanceID string) (Layout, error) {
 }
 
 // PodmanImageMounter implements BaseImageMounter using Podman.
+//
+// Instead of "podman image mount" (which requires "podman unshare" in rootless mode),
+// this uses "podman image inspect" to read the overlay layer diff paths directly from
+// c/storage. These paths can be passed as multiple lowerdirs to fuse-overlayfs, giving
+// the same merged rootfs view without needing a user namespace.
 type PodmanImageMounter struct {
-	mu sync.Mutex
-	// mountCounts tracks reference counts for mounted images
-	// Key is composite: "args|imageRef" to support multiple runtimes/stores
-	mountCounts map[string]int
+	// credential for rootless execution (nil = run as current user)
+	credential *syscall.Credential
+	homeDir    string
 }
 
 // NewPodmanImageMounter creates a new Podman-based image mounter.
-func NewPodmanImageMounter() *PodmanImageMounter {
+// credential and homeDir configure rootless execution; pass nil to run as current user.
+func NewPodmanImageMounter(credential *syscall.Credential, homeDir string) *PodmanImageMounter {
 	return &PodmanImageMounter{
-		mountCounts: make(map[string]int),
+		credential: credential,
+		homeDir:    homeDir,
 	}
 }
 
-func getMountKey(imageRef string, args []string) string {
-	return fmt.Sprintf("%s|%s", strings.Join(args, " "), imageRef)
+// applyCredential configures the exec.Cmd with rootless credential and minimal env.
+// When credential is nil (test mode), inherits the current process environment.
+func (p *PodmanImageMounter) applyCredential(cmd *exec.Cmd) {
+	if p.credential == nil {
+		return // Inherit process environment
+	}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Credential = p.credential
+	cmd.Env = []string{
+		fmt.Sprintf("HOME=%s", p.homeDir),
+		fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", p.credential.Uid),
+		fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
+		"LANG=C.UTF-8",
+		"LC_ALL=C",
+	}
+	cmd.Env = append(cmd.Env, container.ProxyEnvVars()...)
 }
 
 // MountImage implements BaseImageMounter.
+// Returns colon-separated overlay layer diff paths (top layer first) suitable for
+// use as fuse-overlayfs lowerdir. No actual mount is created.
 func (p *PodmanImageMounter) MountImage(ctx context.Context, imageRef string, args []string) (string, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	key := getMountKey(imageRef, args)
-
-	// If already mounted in this runtime context, increment count and return existing path
-	if p.mountCounts[key] > 0 {
-		path, err := p.getImageMountPath(ctx, imageRef, args)
-		if err == nil {
-			p.mountCounts[key]++
-			return path, nil
-		}
-		// Mount path not found despite refcount, reset and remount
-		p.mountCounts[key] = 0
-	}
-
-	cmdArgs := append([]string{}, args...)
-	cmdArgs = append(cmdArgs, "image", "mount", imageRef)
-
-	cmd := exec.CommandContext(ctx, "podman", cmdArgs...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("podman image mount failed: %w: %s", err, string(output))
-	}
-
-	path := filepath.Clean(string(output[:len(output)-1])) // Remove trailing newline
-	if _, err := os.Stat(path); err != nil {
-		return "", fmt.Errorf("mounted path not accessible: %w", err)
-	}
-
-	p.mountCounts[key] = 1
-	return path, nil
+	return p.resolveImageLayers(ctx, imageRef, args)
 }
 
 // UnmountImage implements BaseImageMounter.
+// No-op: we read layer paths via podman image inspect instead of mounting,
+// so there's no podman image mount to undo.
 func (p *PodmanImageMounter) UnmountImage(ctx context.Context, imageRef string, args []string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	key := getMountKey(imageRef, args)
-
-	count := p.mountCounts[key]
-	if count <= 0 {
-		return nil // Not mounted by us in this context
-	}
-
-	count--
-	p.mountCounts[key] = count
-
-	if count > 0 {
-		return nil // Still referenced
-	}
-
-	// Last reference, actually unmount
-	delete(p.mountCounts, key)
-
-	cmdArgs := append([]string{}, args...)
-	cmdArgs = append(cmdArgs, "image", "unmount", imageRef)
-
-	cmd := exec.CommandContext(ctx, "podman", cmdArgs...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// Best effort - log but don't fail
-		log.Printf("WARN: podman image unmount %s failed: %v: %s", imageRef, err, string(output))
-	}
-
 	return nil
 }
 
 // ImageRootfs implements BaseImageMounter.
+// Returns the same colon-separated layer paths as MountImage.
 func (p *PodmanImageMounter) ImageRootfs(ctx context.Context, imageRef string, args []string) (string, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	key := getMountKey(imageRef, args)
-
-	if p.mountCounts[key] <= 0 {
-		return "", fmt.Errorf("image not mounted in this runtime: %s", imageRef)
-	}
-
-	return p.getImageMountPath(ctx, imageRef, args)
+	return p.resolveImageLayers(ctx, imageRef, args)
 }
 
-// getImageMountPath queries podman for the mount path of an image.
-func (p *PodmanImageMounter) getImageMountPath(ctx context.Context, imageRef string, args []string) (string, error) {
-	// We use mount again to get the path (idempotent)
+// resolveImageLayers uses "podman image inspect" to get the overlay layer paths
+// for an image. Returns colon-separated diff paths (top layer first) that can
+// be used directly as fuse-overlayfs lowerdir.
+//
+// This avoids "podman image mount" which requires "podman unshare" in rootless
+// mode — a requirement incompatible with our SysProcAttr.Credential approach
+// (which drops to a rootless user without entering a user namespace).
+func (p *PodmanImageMounter) resolveImageLayers(ctx context.Context, imageRef string, args []string) (string, error) {
 	cmdArgs := append([]string{}, args...)
-	cmdArgs = append(cmdArgs, "image", "mount", imageRef)
+	cmdArgs = append(cmdArgs, "image", "inspect",
+		"--format", "{{.GraphDriver.Data.UpperDir}}:{{.GraphDriver.Data.LowerDir}}",
+		imageRef)
 
 	cmd := exec.CommandContext(ctx, "podman", cmdArgs...)
+	p.applyCredential(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("podman image mount query failed: %w: %s", err, string(output))
+		return "", fmt.Errorf("podman image inspect for layers failed: %w: %s", err, string(output))
 	}
 
-	return filepath.Clean(string(output[:len(output)-1])), nil
+	layerPaths := strings.TrimSpace(string(output))
+	// Remove trailing colon if LowerDir was empty (single-layer image)
+	layerPaths = strings.TrimSuffix(layerPaths, ":")
+
+	if layerPaths == "" {
+		return "", fmt.Errorf("no layer paths found for image: %s", imageRef)
+	}
+
+	// Verify first layer path is accessible
+	firstPath := strings.SplitN(layerPaths, ":", 2)[0]
+	if _, err := os.Stat(firstPath); err != nil {
+		return "", fmt.Errorf("image layer path not accessible (%s): %w", firstPath, err)
+	}
+
+	return layerPaths, nil
 }
