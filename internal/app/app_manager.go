@@ -170,7 +170,7 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 	// Resolve rootless runtime user. All Podman commands run as this user.
 	// The daemon will not start if the piccolo-runtime user does not exist,
 	// unless PICCOLO_ALLOW_UNMOUNTED_TESTS=1 is set (for test environments).
-	runtimeUser, err := container.ResolveRuntimeCredential("piccolo-runtime")
+	runtimeUser, err := container.ResolveRuntimeCredential(container.RuntimeUsername)
 	if err != nil {
 		if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") == "1" {
 			log.Printf("WARN: runtime user resolution failed in test mode, continuing without rootless: %v", err)
@@ -192,9 +192,9 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		// Eagerly fix imagestore permissions if the directory already exists.
 		// Prevents race: per-app users need group-read on imagestore metadata
 		// before the first image pull triggers ensureImagestoreGroupAccess.
-		imagestorePath := paths.DataJoin("node", "podman", "imagestore")
-		if _, statErr := os.Stat(imagestorePath); statErr == nil {
-			if err := ensureImagestoreGroupAccess(imagestorePath, int(runtimeUser.Credential.Uid)); err != nil {
+		imgStore := imagestorePath()
+		if _, statErr := os.Stat(imgStore); statErr == nil {
+			if err := ensureImagestoreGroupAccess(imgStore, int(runtimeUser.Credential.Uid)); err != nil {
 				log.Printf("WARN: eager imagestore group access fix: %v", err)
 			}
 		}
@@ -1147,7 +1147,7 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 			continue
 		}
 		if err := m.reconcileApp(ctx, state, appInst); err != nil {
-			log.Printf("WARN: reconcile app %s: %v", appInst.InstanceID, err)
+			log.Printf("ERROR: reconcile app %s: %v", appInst.InstanceID, err)
 		}
 	}
 }
@@ -1207,7 +1207,7 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 		if err != nil {
 			return fmt.Errorf("allocate service ports: %w", err)
 		}
-		spec, err := m.appDefToContainerSpec(def, endpoints, layout, appInst.InstanceID)
+		spec, err := m.appDefToContainerSpec(def, endpoints, layout, appInst.InstanceID, runtime.Credential)
 		if err != nil {
 			m.serviceManager.RemoveApp(appInst.InstanceID)
 			return err
@@ -2089,7 +2089,7 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
 	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
 	// Create new container with same endpoints
-	spec, err := m.appDefToContainerSpec(&newDef, endpoints, layout, instanceID)
+	spec, err := m.appDefToContainerSpec(&newDef, endpoints, layout, instanceID, runtime.Credential)
 	if err != nil {
 		return fmt.Errorf("build container spec: %w", err)
 	}
@@ -2242,7 +2242,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 
 		// Create new container with updated endpoints and --rootfs mode
 		var newCID string
-		spec, err := m.appDefToContainerSpec(&newDef, result.Endpoints, layout, instanceID)
+		spec, err := m.appDefToContainerSpec(&newDef, result.Endpoints, layout, instanceID, runtime.Credential)
 		if err == nil {
 			// Use --rootfs mode with workspace disk
 			spec.Rootfs = mergedPath
@@ -2280,7 +2280,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			}
 
 			// 2. Rebuild old spec with --rootfs mode
-			rbSpec, rbErr := m.appDefToContainerSpec(curDef, rbResult.Endpoints, layout, instanceID)
+			rbSpec, rbErr := m.appDefToContainerSpec(curDef, rbResult.Endpoints, layout, instanceID, runtime.Credential)
 			if rbErr != nil {
 				log.Printf("ERROR: update listeners %s: spec rollback failed: %v", instanceID, rbErr)
 				m.setObservedStatus(instanceID, StatusError)
@@ -2424,7 +2424,7 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 		}
 	}
 	// Create new container from prev
-	spec, err := m.appDefToContainerSpec(prevDef, endpoints, layout, instanceID)
+	spec, err := m.appDefToContainerSpec(prevDef, endpoints, layout, instanceID, runtime.Credential)
 	if err != nil {
 		return fmt.Errorf("build container spec: %w", err)
 	}
@@ -2590,7 +2590,7 @@ func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, servi
 // appDefToContainerSpec converts an AppDefinition to a ContainerCreateSpec.
 // storage volumes are mapped into the per-app encrypted volume at <mount>/data/<volume-name>.
 // The instanceID parameter is the unique instance identifier used for container naming.
-func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints []services.ServiceEndpoint, layout appVolumeLayout, instanceID string) (container.ContainerCreateSpec, error) {
+func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints []services.ServiceEndpoint, layout appVolumeLayout, instanceID string, credential *syscall.Credential) (container.ContainerCreateSpec, error) {
 	if appDef == nil {
 		return container.ContainerCreateSpec{}, fmt.Errorf("app definition required")
 	}
@@ -2657,10 +2657,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	// Storage mounts:
 	// - storage.persistent -> bind mounts inside <app-volume>/data/<volume-name>
 	// - storage.temporary  -> tmpfs mounts (ephemeral)
-	// TODO: thread runtime credential through for rootless :U volume support.
-	// This legacy path is used by update/revert and should be migrated to the
-	// multi-container serviceContainerOptions pattern.
-	if err := m.applyServiceStorageAndTmpfs(&spec, def.Storage, layout, def.Extensions, nil); err != nil {
+	if err := m.applyServiceStorageAndTmpfs(&spec, def.Storage, layout, def.Extensions, credential); err != nil {
 		return spec, err
 	}
 

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"syscall"
@@ -22,7 +21,7 @@ type RuntimeUser struct {
 // the user does not exist or cannot be resolved — the daemon requires
 // rootless Podman execution and must not start without a valid runtime user.
 func ResolveRuntimeCredential(username string) (*RuntimeUser, error) {
-	u, err := user.Lookup(username)
+	u, err := defaultResolver.LookupUser(username)
 	if err != nil {
 		return nil, fmt.Errorf("runtime user %q not found (rootless Podman requires this user): %w", username, err)
 	}
@@ -37,9 +36,13 @@ func ResolveRuntimeCredential(username string) (*RuntimeUser, error) {
 	}
 
 	// Look up supplementary groups for shared imagestore access (piccolo-apps group).
+	// Supplementary groups are required for per-app users to read the shared imagestore.
+	// Hard error: piccolo-runtime is a local system user — GroupIds should never fail
+	// except on corrupted /etc/group. Failing loudly here is preferable to silent
+	// imagestore permission failures at container start.
 	groupIDs, err := u.GroupIds()
 	if err != nil {
-		log.Printf("WARN: cannot resolve supplementary groups for %q: %v", username, err)
+		return nil, fmt.Errorf("resolve supplementary groups for %q: %w", username, err)
 	}
 	var groups []uint32
 	for _, gidStr := range groupIDs {
@@ -66,6 +69,11 @@ func ResolveRuntimeCredential(username string) (*RuntimeUser, error) {
 // tree is assumed correct (skips the walk). This makes reconciliation O(1) for
 // already-correct ownership. The full walk only runs on first chown or after
 // ownership changes.
+//
+// Concurrency safety: this fast-path is safe because lifecycle operations
+// (install, start, stop, uninstall, reconcile) are serialized per-app via
+// reconcileMu in app_manager.go. No concurrent caller can change ownership
+// between the root stat and the decision to skip the walk.
 func ChownIfNeeded(root string, uid, gid int) error {
 	info, err := os.Stat(root)
 	if err != nil {
@@ -121,6 +129,6 @@ func EnsureXDGRuntimeDir(uid, gid uint32) error {
 func CheckCgroupDelegation(uid uint32) {
 	path := fmt.Sprintf("/sys/fs/cgroup/user.slice/user-%d.slice", uid)
 	if _, err := os.Stat(path); err != nil {
-		log.Printf("WARN: cgroup delegation not found at %s — rootless Podman resource limits may not work. Ensure loginctl linger is enabled for the runtime user.", path)
+		log.Printf("ERROR: cgroup delegation not found at %s — rootless Podman resource limits may not work. Ensure loginctl linger is enabled for the runtime user.", path)
 	}
 }

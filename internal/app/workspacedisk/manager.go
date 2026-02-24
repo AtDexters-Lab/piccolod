@@ -405,13 +405,7 @@ func (p *PodmanImageMounter) applyCredential(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Credential = p.credential
-	cmd.Env = []string{
-		fmt.Sprintf("HOME=%s", p.homeDir),
-		fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", p.credential.Uid),
-		fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
-		"LANG=C.UTF-8",
-		"LC_ALL=C",
-	}
+	cmd.Env = container.MinimalRootlessEnv(p.homeDir, p.credential.Uid)
 	cmd.Env = append(cmd.Env, container.ProxyEnvVars()...)
 }
 

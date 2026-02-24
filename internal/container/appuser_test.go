@@ -1,10 +1,64 @@
 package container
 
 import (
+	"fmt"
 	"os"
+	"os/user"
 	"strings"
+	"syscall"
 	"testing"
 )
+
+// mockResolver implements CredentialResolver for testing.
+type mockResolver struct {
+	users  map[string]*user.User
+	groups map[string]*user.Group
+}
+
+func (m *mockResolver) LookupUser(username string) (*user.User, error) {
+	if u, ok := m.users[username]; ok {
+		return u, nil
+	}
+	return nil, fmt.Errorf("user: unknown user %s", username)
+}
+
+func (m *mockResolver) LookupGroup(groupName string) (*user.Group, error) {
+	if g, ok := m.groups[groupName]; ok {
+		return g, nil
+	}
+	return nil, fmt.Errorf("group: unknown group %s", groupName)
+}
+
+// mockExecutor implements SystemExecutor for testing.
+type mockExecutor struct {
+	// calls records all (command, args) invocations for assertion.
+	calls [][]string
+	// results maps "command arg1 arg2..." to (output, error).
+	results map[string]mockResult
+	// defaultResult is returned when no specific result is configured.
+	defaultResult mockResult
+	// onRun is an optional callback invoked before returning from Run.
+	// Tests use this to simulate side effects (e.g., useradd making a user visible).
+	onRun func(name string, args ...string)
+}
+
+type mockResult struct {
+	output []byte
+	err    error
+}
+
+func (m *mockExecutor) Run(name string, args ...string) ([]byte, error) {
+	call := append([]string{name}, args...)
+	m.calls = append(m.calls, call)
+	if m.onRun != nil {
+		m.onRun(name, args...)
+	}
+	key := strings.Join(call, " ")
+	if r, ok := m.results[key]; ok {
+		return r.output, r.err
+	}
+	return m.defaultResult.output, m.defaultResult.err
+}
 
 func TestAppUsername_short_name(t *testing.T) {
 	got := appUsername("myapp")
@@ -125,12 +179,12 @@ func TestParseSubUIDFile_nonexistent(t *testing.T) {
 }
 
 func TestFindNextSlot_empty(t *testing.T) {
-	start, err := findNextSlot(nil, subUIDBase, subUIDRangeSize)
+	start, err := findNextSlot(nil, SubUIDBase, SubUIDRangeSize)
 	if err != nil {
 		t.Fatalf("findNextSlot: %v", err)
 	}
-	if start != subUIDBase {
-		t.Errorf("expected %d, got %d", subUIDBase, start)
+	if start != SubUIDBase {
+		t.Errorf("expected %d, got %d", SubUIDBase, start)
 	}
 }
 
@@ -139,7 +193,7 @@ func TestFindNextSlot_after_existing(t *testing.T) {
 		{Username: "piccolo-runtime", Start: 100000, Count: 65536},
 		{Username: "pa-app1", Start: 200000, Count: 65536},
 	}
-	start, err := findNextSlot(entries, subUIDBase, subUIDRangeSize)
+	start, err := findNextSlot(entries, SubUIDBase, SubUIDRangeSize)
 	if err != nil {
 		t.Fatalf("findNextSlot: %v", err)
 	}
@@ -157,7 +211,7 @@ func TestFindNextSlot_gap_filling(t *testing.T) {
 		{Username: "piccolo-runtime", Start: 100000, Count: 65536},
 		{Username: "pa-app2", Start: 265536, Count: 65536},
 	}
-	start, err := findNextSlot(entries, subUIDBase, subUIDRangeSize)
+	start, err := findNextSlot(entries, SubUIDBase, SubUIDRangeSize)
 	if err != nil {
 		t.Fatalf("findNextSlot: %v", err)
 	}
@@ -175,7 +229,7 @@ func TestFindNextSlot_unsorted_entries(t *testing.T) {
 		{Username: "pa-app1", Start: 200000, Count: 65536},
 		{Username: "piccolo-runtime", Start: 100000, Count: 65536},
 	}
-	start, err := findNextSlot(entries, subUIDBase, subUIDRangeSize)
+	start, err := findNextSlot(entries, SubUIDBase, SubUIDRangeSize)
 	if err != nil {
 		t.Fatalf("findNextSlot: %v", err)
 	}
@@ -192,12 +246,12 @@ func TestFindNextSlot_no_overlap_below_base(t *testing.T) {
 	entries := []subUIDEntry{
 		{Username: "other-user", Start: 50000, Count: 65536},
 	}
-	start, err := findNextSlot(entries, subUIDBase, subUIDRangeSize)
+	start, err := findNextSlot(entries, SubUIDBase, SubUIDRangeSize)
 	if err != nil {
 		t.Fatalf("findNextSlot: %v", err)
 	}
-	if start != subUIDBase {
-		t.Errorf("expected %d, got %d", subUIDBase, start)
+	if start != SubUIDBase {
+		t.Errorf("expected %d, got %d", SubUIDBase, start)
 	}
 }
 
@@ -213,6 +267,236 @@ func TestResolveAppUser_nonexistent(t *testing.T) {
 	_, err := ResolveAppUser("nonexistent-app-xyz-12345")
 	if err == nil {
 		t.Fatal("ResolveAppUser for nonexistent user should return error")
+	}
+}
+
+func TestResolveRuntimeCredential_with_mock(t *testing.T) {
+	old := defaultResolver
+	defer func() { defaultResolver = old }()
+
+	// NOTE: The mock replaces LookupUser, but u.GroupIds() still hits the OS.
+	// This works because "test-runtime" doesn't exist in /etc/group, so GroupIds()
+	// returns only the primary GID. If full group isolation is needed, add
+	// GroupIds to the CredentialResolver interface.
+	defaultResolver = &mockResolver{
+		users: map[string]*user.User{
+			"test-runtime": {
+				Uid:      "1001",
+				Gid:      "1001",
+				Username: "test-runtime",
+				HomeDir:  "/home/test-runtime",
+			},
+		},
+	}
+
+	ru, err := ResolveRuntimeCredential("test-runtime")
+	if err != nil {
+		t.Fatalf("ResolveRuntimeCredential: %v", err)
+	}
+	if ru.Credential.Uid != 1001 {
+		t.Errorf("expected UID 1001, got %d", ru.Credential.Uid)
+	}
+	if ru.Credential.Gid != 1001 {
+		t.Errorf("expected GID 1001, got %d", ru.Credential.Gid)
+	}
+	if ru.HomeDir != "/home/test-runtime" {
+		t.Errorf("expected HomeDir /home/test-runtime, got %s", ru.HomeDir)
+	}
+}
+
+func TestResolveRuntimeCredential_mock_not_found(t *testing.T) {
+	old := defaultResolver
+	defer func() { defaultResolver = old }()
+
+	defaultResolver = &mockResolver{users: map[string]*user.User{}}
+
+	_, err := ResolveRuntimeCredential("nonexistent")
+	if err == nil {
+		t.Fatal("expected error for nonexistent user")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected 'not found' in error, got: %v", err)
+	}
+}
+
+func TestDestroyAppUser_UID0_guard_with_mock(t *testing.T) {
+	oldResolver := defaultResolver
+	oldExecutor := defaultExecutor
+	defer func() {
+		defaultResolver = oldResolver
+		defaultExecutor = oldExecutor
+	}()
+
+	defaultResolver = &mockResolver{
+		users: map[string]*user.User{
+			"pa-evil": {Uid: "0", Gid: "0", Username: "pa-evil", HomeDir: "/root"},
+		},
+	}
+	exec := &mockExecutor{results: map[string]mockResult{}}
+	defaultExecutor = exec
+
+	err := destroyAppUserByName("pa-evil")
+	if err == nil {
+		t.Fatal("expected error when UID is 0")
+	}
+	if !strings.Contains(err.Error(), "UID is 0") {
+		t.Errorf("expected 'UID is 0' in error, got: %v", err)
+	}
+	// Verify no system commands were executed (no kill/userdel for root).
+	if len(exec.calls) != 0 {
+		t.Errorf("expected no system commands for UID 0, got: %v", exec.calls)
+	}
+}
+
+func TestPodmanRuntime_Validate(t *testing.T) {
+	tests := []struct {
+		name    string
+		rt      PodmanRuntime
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "valid_runtime",
+			rt: PodmanRuntime{
+				Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
+				HomeDir:    "/home/user",
+			},
+			wantErr: false,
+		},
+		{
+			name:    "nil_credential",
+			rt:      PodmanRuntime{HomeDir: "/home/user"},
+			wantErr: true,
+			errMsg:  "Credential is nil",
+		},
+		{
+			name: "uid_zero",
+			rt: PodmanRuntime{
+				Credential: &syscall.Credential{Uid: 0, Gid: 0},
+				HomeDir:    "/root",
+			},
+			wantErr: true,
+			errMsg:  "UID is 0",
+		},
+		{
+			name: "empty_homedir",
+			rt: PodmanRuntime{
+				Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
+			},
+			wantErr: true,
+			errMsg:  "HomeDir is empty",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.rt.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.errMsg != "" && err != nil && !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("expected error containing %q, got: %v", tt.errMsg, err)
+			}
+		})
+	}
+}
+
+func TestProvisionAppUser_useradd_failure_returns_error(t *testing.T) {
+	oldResolver := defaultResolver
+	oldExecutor := defaultExecutor
+	defer func() {
+		defaultResolver = oldResolver
+		defaultExecutor = oldExecutor
+	}()
+
+	// NOTE: hasSubUIDAllocation/allocateSubUIDRange still read the real /etc/subuid.
+	// This test works because the mock username won't appear in /etc/subuid.
+
+	// Mock: user does not exist, group exists.
+	defaultResolver = &mockResolver{
+		users:  map[string]*user.User{},
+		groups: map[string]*user.Group{AppsGroupName: {Name: AppsGroupName, Gid: "2000"}},
+	}
+
+	// Mock: groupadd succeeds, useradd fails.
+	exec := &mockExecutor{
+		results: map[string]mockResult{},
+		defaultResult: mockResult{
+			output: []byte("command failed"),
+			err:    fmt.Errorf("exit status 1"),
+		},
+	}
+	exec.results["groupadd -f "+AppsGroupName] = mockResult{output: nil, err: nil}
+	defaultExecutor = exec
+
+	_, err := ProvisionAppUser("test-fail-app")
+	if err == nil {
+		t.Fatal("expected error from ProvisionAppUser when useradd fails")
+	}
+	if !strings.Contains(err.Error(), "useradd") {
+		t.Errorf("expected 'useradd' in error, got: %v", err)
+	}
+}
+
+func TestProvisionAppUser_usermod_failure_triggers_rollback(t *testing.T) {
+	oldResolver := defaultResolver
+	oldExecutor := defaultExecutor
+	defer func() {
+		defaultResolver = oldResolver
+		defaultExecutor = oldExecutor
+	}()
+
+	// NOTE: hasSubUIDAllocation/allocateSubUIDRange still read the real /etc/subuid.
+	// This test works because the mock username won't appear in /etc/subuid.
+
+	username := appUsername("test-rollback-app")
+
+	// Resolver: user doesn't exist initially, group exists.
+	// The onRun callback makes the user visible after useradd succeeds.
+	resolver := &mockResolver{
+		users:  map[string]*user.User{},
+		groups: map[string]*user.Group{AppsGroupName: {Name: AppsGroupName, Gid: "2000"}},
+	}
+	defaultResolver = resolver
+
+	exec := &mockExecutor{
+		results: map[string]mockResult{},
+		defaultResult: mockResult{
+			output: []byte("command failed"),
+			err:    fmt.Errorf("exit status 1"),
+		},
+	}
+	// groupadd and useradd succeed; usermod (subuid) fails via default.
+	exec.results["groupadd -f "+AppsGroupName] = mockResult{output: nil, err: nil}
+	exec.results[strings.Join([]string{"useradd", "--system", "--shell", "/usr/sbin/nologin",
+		"--create-home", "--groups", AppsGroupName, username}, " ")] = mockResult{output: nil, err: nil}
+	defaultExecutor = exec
+
+	// When useradd runs, make the user visible in the resolver so that
+	// the rollback defer (which checks userExists) can find it.
+	exec.onRun = func(name string, args ...string) {
+		if name == "useradd" {
+			resolver.users[username] = &user.User{
+				Uid: "5000", Gid: "5000", Username: username, HomeDir: "/home/" + username,
+			}
+		}
+	}
+
+	_, err := ProvisionAppUser("test-rollback-app")
+	if err == nil {
+		t.Fatal("expected error from ProvisionAppUser when usermod fails")
+	}
+
+	// The rollback defer should attempt userdel since useradd created the user
+	// (userExists was false) and a subsequent step failed.
+	var foundRollback bool
+	for _, call := range exec.calls {
+		if len(call) >= 3 && call[0] == "userdel" && call[1] == "--remove" && call[2] == username {
+			foundRollback = true
+			break
+		}
+	}
+	if !foundRollback {
+		t.Errorf("expected rollback userdel for %s, calls were: %v", username, exec.calls)
 	}
 }
 

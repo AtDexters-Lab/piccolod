@@ -361,8 +361,8 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 		if !st.Running {
 			if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
-				log.Printf("INFO: reconcile app %s: service '%s' start failed (%v), recreating",
-					appInst.InstanceID, svcName, err)
+				log.Printf("INFO: reconcile app %s: service '%s' (cid=%s) start failed (%v), recreating",
+					appInst.InstanceID, svcName, cid, err)
 				m.setObservedStatusMessage(appInst.InstanceID, "Service start failed, recreating")
 
 				opts := serviceContainerOptions{

@@ -30,12 +30,18 @@ func buildWorkspaceMountOpts(instanceID string, runtime container.PodmanRuntime,
 	appGID := int(runtime.Credential.Gid)
 	username := container.AppUsername(instanceID)
 
-	appSubStart, appSubCount, err := container.LookupSubUIDRange(username)
-	if err != nil {
-		log.Printf("WARN: workspace %s: subuid lookup failed (%v), falling back to squash_to_uid", instanceID, err)
+	// squashFallback sets squash_to_uid/gid as a degraded fallback when
+	// proper UID mapping cannot be constructed (e.g., subuid lookup failure).
+	squashFallback := func(reason string, err error) workspacedisk.MountOptions {
+		log.Printf("WARN: workspace %s: %s (%v), falling back to squash_to_uid", instanceID, reason, err)
 		opts.SquashUID = appUID
 		opts.SquashGID = appGID
 		return opts
+	}
+
+	appSubStart, appSubCount, err := container.LookupSubUIDRange(username)
+	if err != nil {
+		return squashFallback("subuid lookup failed", err)
 	}
 
 	// Image layers are stored with the image runtime user's remapped UIDs
@@ -45,13 +51,10 @@ func buildWorkspaceMountOpts(instanceID string, runtime container.PodmanRuntime,
 	if imageRuntime != nil && imageRuntime.Credential != nil {
 		rtUID := int(imageRuntime.Credential.Uid)
 		rtGID := int(imageRuntime.Credential.Gid)
-		rtUsername := "piccolo-runtime"
+		rtUsername := container.RuntimeUsername
 		rtSubStart, rtSubCount, err := container.LookupSubUIDRange(rtUsername)
 		if err != nil {
-			log.Printf("WARN: workspace %s: runtime subuid lookup failed (%v), falling back to squash_to_uid", instanceID, err)
-			opts.SquashUID = appUID
-			opts.SquashGID = appGID
-			return opts
+			return squashFallback("runtime subuid lookup failed", err)
 		}
 		subCount := rtSubCount
 		if appSubCount < subCount {
@@ -97,6 +100,29 @@ func (r *workspacePathResolver) Unregister(instanceID string) {
 	delete(r.layouts, instanceID)
 }
 
+// withWorkspacePath temporarily registers a workspace path for the duration of
+// a workspace disk operation. Returns a cleanup function that unregisters the path.
+// Usage: defer m.withWorkspacePath(instanceID, layout)()
+func (m *AppManager) withWorkspacePath(instanceID string, layout appVolumeLayout) func() {
+	m.workspacePathResolver.Register(instanceID, layout.WorkspaceDir)
+	return func() { m.workspacePathResolver.Unregister(instanceID) }
+}
+
+// imageConfigToWorkspace converts a container.ImageConfig to workspacedisk.ImageConfig.
+// Returns a zero-value ImageConfig if cfg is nil.
+func imageConfigToWorkspace(cfg *container.ImageConfig) workspacedisk.ImageConfig {
+	if cfg == nil {
+		return workspacedisk.ImageConfig{}
+	}
+	return workspacedisk.ImageConfig{
+		Entrypoint: cfg.Entrypoint,
+		Cmd:        cfg.Cmd,
+		Env:        cfg.Env,
+		WorkingDir: cfg.WorkingDir,
+		User:       cfg.User,
+	}
+}
+
 // initWorkspaceDisk initializes the workspace disk for a workspace mode app.
 // It creates the disk structure, saves metadata, and mounts the overlay.
 // Returns the merged rootfs path for use with --rootfs mode.
@@ -115,23 +141,13 @@ func (m *AppManager) initWorkspaceDisk(
 	// Register the workspace path for this instance
 	m.workspacePathResolver.Register(instanceID, layout.WorkspaceDir)
 
-	// Convert container.ImageConfig to workspacedisk.ImageConfig
-	// We preserve the full image config (entrypoint, cmd, env, workdir, user)
-	// because Podman does not apply image config automatically in --rootfs mode.
-	wsImageConfig := workspacedisk.ImageConfig{}
-	if imgConfig != nil {
-		wsImageConfig.Entrypoint = imgConfig.Entrypoint
-		wsImageConfig.Cmd = imgConfig.Cmd
-		wsImageConfig.Env = imgConfig.Env
-		wsImageConfig.WorkingDir = imgConfig.WorkingDir
-		wsImageConfig.User = imgConfig.User
-	}
-
-	// Initialize the workspace disk
+	// Initialize the workspace disk.
+	// imageConfigToWorkspace preserves the full image config (entrypoint, cmd,
+	// env, workdir, user) because Podman does not apply image config in --rootfs mode.
 	opts := workspacedisk.InitOptions{
 		BaseImageDigest: baseImageDigest,
 		BaseImageRef:    baseImageRef,
-		ImageConfig:     wsImageConfig,
+		ImageConfig:     imageConfigToWorkspace(imgConfig),
 	}
 
 	if err := m.workspaceDiskMgr.EnsureInitialized(ctx, instanceID, opts); err != nil {
@@ -140,7 +156,10 @@ func (m *AppManager) initWorkspaceDisk(
 	}
 
 	// Mount the overlay filesystem with UID mapping for per-app user isolation.
-	imgRt, _ := m.podmanImageRuntime()
+	imgRt, imgRtErr := m.podmanImageRuntime()
+	if imgRtErr != nil {
+		log.Printf("WARN: workspace %s: image runtime unavailable, mount opts will lack runtime UID mapping: %v", instanceID, imgRtErr)
+	}
 	mountOpts := buildWorkspaceMountOpts(instanceID, runtime, &imgRt)
 	mergedPath, err = m.workspaceDiskMgr.Mount(ctx, instanceID, mountOpts)
 	if err != nil {
@@ -177,9 +196,7 @@ func (m *AppManager) cleanupStaleWorkspaceMounts(ctx context.Context, instanceID
 		return
 	}
 
-	// Register path temporarily for cleanup
-	m.workspacePathResolver.Register(instanceID, layout.WorkspaceDir)
-	defer m.workspacePathResolver.Unregister(instanceID)
+	defer m.withWorkspacePath(instanceID, layout)()
 
 	if err := m.workspaceDiskMgr.CleanupStale(ctx, instanceID); err != nil {
 		log.Printf("WARN: workspace %s: stale mount cleanup failed: %v", instanceID, err)
@@ -192,9 +209,7 @@ func (m *AppManager) getWorkspaceDiskMeta(ctx context.Context, instanceID string
 		return nil, fmt.Errorf("workspace disk manager not configured")
 	}
 
-	// Register path temporarily
-	m.workspacePathResolver.Register(instanceID, layout.WorkspaceDir)
-	defer m.workspacePathResolver.Unregister(instanceID)
+	defer m.withWorkspacePath(instanceID, layout)()
 
 	return m.workspaceDiskMgr.GetMeta(ctx, instanceID)
 }
@@ -205,9 +220,7 @@ func (m *AppManager) isWorkspaceDiskInitialized(ctx context.Context, instanceID 
 		return false
 	}
 
-	// Register path temporarily
-	m.workspacePathResolver.Register(instanceID, layout.WorkspaceDir)
-	defer m.workspacePathResolver.Unregister(instanceID)
+	defer m.withWorkspacePath(instanceID, layout)()
 
 	status, err := m.workspaceDiskMgr.Status(ctx, instanceID)
 	if err != nil {
@@ -357,6 +370,7 @@ func (m *AppManager) prepareServiceStorage(
 	// Check if workspace disk is already initialized (reinstall case)
 	diskInitialized := m.isWorkspaceDiskInitialized(ctx, instanceID, layout)
 
+	var mergedPath string
 	if !diskInitialized {
 		// New install: pull base image with progress and initialize workspace disk.
 		// Use the shared image runtime (overlay driver, shared root) for workspace
@@ -400,35 +414,29 @@ func (m *AppManager) prepareServiceStorage(
 		}
 
 		// Initialize and mount workspace disk
-		mergedPath, err := m.initWorkspaceDisk(ctx, instanceID, layout, runtime, imgConfig, baseImageDigest, svc.Image)
+		mp, err := m.initWorkspaceDisk(ctx, instanceID, layout, runtime, imgConfig, baseImageDigest, svc.Image)
 		if err != nil {
 			return nil, fmt.Errorf("init workspace disk: %w", err)
 		}
-
-		// Get metadata for return
-		meta, err := m.getWorkspaceDiskMeta(ctx, instanceID, layout)
+		mergedPath = mp
+	} else {
+		// Reinstall: workspace disk exists, just mount it
+		mp, err := m.ensureWorkspaceDiskMounted(ctx, instanceID, layout)
 		if err != nil {
-			return nil, fmt.Errorf("get workspace metadata: %w", err)
+			return nil, fmt.Errorf("mount workspace disk: %w", err)
 		}
-
-		return &workspaceMountInfo{
-			mergedPath: mergedPath,
-			meta:       meta,
-		}, nil
+		mergedPath = mp
 	}
 
-	// Reinstall: workspace disk exists, just mount it
-	mergedPath, err := m.ensureWorkspaceDiskMounted(ctx, instanceID, layout)
-	if err != nil {
-		return nil, fmt.Errorf("mount workspace disk: %w", err)
-	}
-
+	// Common: retrieve metadata and return mount info.
 	meta, err := m.getWorkspaceDiskMeta(ctx, instanceID, layout)
 	if err != nil {
 		return nil, fmt.Errorf("get workspace metadata: %w", err)
 	}
 
-	log.Printf("INFO: install %s: using existing workspace disk (base=%s)", instanceID, meta.BaseImageRef)
+	if diskInitialized {
+		log.Printf("INFO: install %s: using existing workspace disk (base=%s)", instanceID, meta.BaseImageRef)
+	}
 
 	return &workspaceMountInfo{
 		mergedPath: mergedPath,
@@ -507,7 +515,10 @@ func (m *AppManager) ensureWorkspaceDiskMounted(ctx context.Context, instanceID 
 	if appUser, err := container.ResolveAppUser(instanceID); err == nil && appUser != nil {
 		rt.Credential = appUser.Credential
 	}
-	imgRt, _ := m.podmanImageRuntime()
+	imgRt, imgRtErr := m.podmanImageRuntime()
+	if imgRtErr != nil {
+		log.Printf("WARN: workspace %s: image runtime unavailable, mount opts will lack runtime UID mapping: %v", instanceID, imgRtErr)
+	}
 	mountOpts := buildWorkspaceMountOpts(instanceID, rt, &imgRt)
 	return m.workspaceDiskMgr.Mount(ctx, instanceID, mountOpts)
 }

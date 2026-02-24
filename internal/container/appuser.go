@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
-	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -18,19 +16,6 @@ import (
 )
 
 const (
-	// appUserPrefix is the username prefix for per-app Linux users.
-	appUserPrefix = "pa-"
-
-	// appsGroupName is the shared POSIX group for imagestore access.
-	appsGroupName = "piccolo-apps"
-
-	// subUIDBase is the starting offset for per-app subuid/subgid ranges.
-	// Above piccolo-runtime's 100000:65536.
-	subUIDBase = 200000
-
-	// subUIDRangeSize is the number of subordinate UIDs/GIDs per app user.
-	subUIDRangeSize = 65536
-
 	// maxLinuxUsername is the maximum length of a Linux username.
 	maxLinuxUsername = 32
 )
@@ -51,7 +36,7 @@ type AppUser struct {
 // With 4 bytes (32 bits) of SHA-256, collision probability stays negligible
 // for the expected number of apps (< 1000).
 func appUsername(instanceID string) string {
-	name := appUserPrefix + instanceID
+	name := AppUserPrefix + instanceID
 	if len(name) <= maxLinuxUsername {
 		return name
 	}
@@ -70,10 +55,12 @@ func AppUsername(instanceID string) string {
 // verifies subuid/subgid allocation and returns. On failure after useradd,
 // the user is rolled back (userdel --remove). Serialized via provisionMu to
 // prevent concurrent subuid allocation races.
-func ProvisionAppUser(instanceID string) (*AppUser, error) {
+func ProvisionAppUser(instanceID string) (au *AppUser, err error) {
 	username := appUsername(instanceID)
 
 	// Fast path: user already exists and has subuid allocation.
+	// NOTE: := intentionally shadows named returns (au, err) so the rollback
+	// defer (registered later) does not fire on these early-return success paths.
 	if au, err := resolveAppUser(username); err == nil {
 		if hasSubUIDAllocation(username) {
 			// Ensure the systemd user session is active. After daemon restarts
@@ -96,79 +83,73 @@ func ProvisionAppUser(instanceID string) (*AppUser, error) {
 		return au, nil
 	}
 
-	// Ensure the shared group exists.
-	if err := ensureGroup(appsGroupName); err != nil {
-		return nil, fmt.Errorf("provision app user: ensure group: %w", err)
+	if groupErr := ensureGroup(AppsGroupName); groupErr != nil {
+		return nil, fmt.Errorf("provision user %s: ensure group: %w", username, groupErr)
 	}
 
 	// Create the user if it doesn't exist yet.
 	userExists := false
-	if _, err := user.Lookup(username); err == nil {
+	createdByThisCall := false
+	if _, lookupErr := defaultResolver.LookupUser(username); lookupErr == nil {
 		userExists = true
 	}
 
+	// Roll back user creation on any failure. Only deletes the user if THIS call
+	// created it (not if the user pre-existed or was created by a concurrent call).
+	// Using createdByThisCall instead of !userExists prevents destructive rollback
+	// when a transient LookupUser failure makes an existing user appear absent.
+	defer func() {
+		if err != nil && createdByThisCall {
+			if out, delErr := defaultExecutor.Run("userdel", "--remove", username); delErr != nil {
+				log.Printf("WARN: rollback userdel %s failed: %v: %s", username, delErr, strings.TrimSpace(string(out)))
+			}
+		}
+	}()
+
 	if !userExists {
-		cmd := exec.Command("useradd",
+		out, addErr := defaultExecutor.Run("useradd",
 			"--system",
 			"--shell", "/usr/sbin/nologin",
 			"--create-home",
-			"--groups", appsGroupName,
+			"--groups", AppsGroupName,
 			username,
 		)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		if addErr != nil {
 			// Check if user was created by a concurrent call.
-			if _, lookupErr := user.Lookup(username); lookupErr != nil {
-				return nil, fmt.Errorf("useradd %s: %w: %s", username, err, strings.TrimSpace(string(out)))
+			if _, lookupErr := defaultResolver.LookupUser(username); lookupErr != nil {
+				return nil, fmt.Errorf("provision user %s: useradd: %w: %s", username, addErr, strings.TrimSpace(string(out)))
 			}
+			// Concurrent creation — don't claim ownership for rollback.
+		} else {
+			createdByThisCall = true
 		}
 	}
 
 	// Allocate subuid/subgid range if not already allocated.
 	if !hasSubUIDAllocation(username) {
-		start, err := allocateSubUIDRange(username)
-		if err != nil {
-			if !userExists {
-				if out, delErr := exec.Command("userdel", "--remove", username).CombinedOutput(); delErr != nil {
-					log.Printf("WARN: rollback userdel %s failed: %v: %s", username, delErr, strings.TrimSpace(string(out)))
-				}
-			}
-			return nil, fmt.Errorf("allocate subuid range for %s: %w", username, err)
+		start, allocErr := allocateSubUIDRange(username)
+		if allocErr != nil {
+			return nil, fmt.Errorf("provision user %s: allocate subuid range: %w", username, allocErr)
 		}
 
-		rangeSpec := fmt.Sprintf("%d-%d", start, start+subUIDRangeSize-1)
-		cmd := exec.Command("usermod",
+		rangeSpec := fmt.Sprintf("%d-%d", start, start+SubUIDRangeSize-1)
+		out, modErr := defaultExecutor.Run("usermod",
 			"--add-subuids", rangeSpec,
 			"--add-subgids", rangeSpec,
 			username,
 		)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			if !userExists {
-				if out, delErr := exec.Command("userdel", "--remove", username).CombinedOutput(); delErr != nil {
-					log.Printf("WARN: rollback userdel %s failed: %v: %s", username, delErr, strings.TrimSpace(string(out)))
-				}
-			}
-			return nil, fmt.Errorf("usermod add-subuids for %s: %w: %s", username, err, strings.TrimSpace(string(out)))
+		if modErr != nil {
+			return nil, fmt.Errorf("provision user %s: usermod add-subuids: %w: %s", username, modErr, strings.TrimSpace(string(out)))
 		}
 	}
 
-	// Enable linger for cgroup delegation (idempotent).
-	if err := enableLinger(username); err != nil {
-		if !userExists {
-			if out, delErr := exec.Command("userdel", "--remove", username).CombinedOutput(); delErr != nil {
-					log.Printf("WARN: rollback userdel %s failed: %v: %s", username, delErr, strings.TrimSpace(string(out)))
-				}
-		}
-		return nil, fmt.Errorf("enable linger for %s: %w", username, err)
+	if lingerErr := enableLinger(username); lingerErr != nil {
+		return nil, fmt.Errorf("provision user %s: enable linger: %w", username, lingerErr)
 	}
 
-	au, err := resolveAppUser(username)
+	au, err = resolveAppUser(username)
 	if err != nil {
-		if !userExists {
-			if out, delErr := exec.Command("userdel", "--remove", username).CombinedOutput(); delErr != nil {
-					log.Printf("WARN: rollback userdel %s failed: %v: %s", username, delErr, strings.TrimSpace(string(out)))
-				}
-		}
-		return nil, fmt.Errorf("resolve newly created user %s: %w", username, err)
+		return nil, fmt.Errorf("provision user %s: resolve user: %w", username, err)
 	}
 
 	log.Printf("INFO: provisioned per-app user %s (uid=%d)", username, au.Credential.Uid)
@@ -179,24 +160,38 @@ func ProvisionAppUser(instanceID string) (*AppUser, error) {
 // This kills user processes, disables linger, and removes the user with userdel --remove.
 // Returns nil if the user does not exist.
 func DestroyAppUser(instanceID string) error {
-	username := appUsername(instanceID)
+	return destroyAppUserByName(appUsername(instanceID))
+}
 
-	u, err := user.Lookup(username)
+// destroyAppUserByName removes a per-app Linux user by username.
+// Kills processes, disables linger, runs userdel. Returns nil if user doesn't exist.
+// Refuses to proceed if the UID is 0 or unparseable (protects root).
+func destroyAppUserByName(username string) error {
+	u, err := defaultResolver.LookupUser(username)
 	if err != nil {
 		return nil // User doesn't exist, nothing to do.
 	}
 
-	uid, _ := strconv.ParseUint(u.Uid, 10, 32)
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		log.Printf("ERROR: destroy user %s: failed to parse UID %q: %v — refusing to proceed", username, u.Uid, err)
+		return fmt.Errorf("destroy user %s: unparseable UID %q: %w", username, u.Uid, err)
+	}
+	if uid == 0 {
+		log.Printf("ERROR: destroy user %s: UID is 0 — refusing to destroy to protect root", username)
+		return fmt.Errorf("destroy user %s: UID is 0, refusing to proceed", username)
+	}
+
 	killUserProcesses(username, uint32(uid))
 	disableLinger(username)
 
-	cmd := exec.Command("userdel", "--remove", username)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		// If user was already removed, treat as success.
-		if _, lookupErr := user.Lookup(username); lookupErr != nil {
+	out, delErr := defaultExecutor.Run("userdel", "--remove", username)
+	if delErr != nil {
+		// Post-userdel recovery: if userdel fails but user is already gone, treat as success.
+		if _, lookupErr := defaultResolver.LookupUser(username); lookupErr != nil {
 			return nil
 		}
-		return fmt.Errorf("userdel %s: %w: %s", username, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("destroy user %s: userdel: %w: %s", username, delErr, strings.TrimSpace(string(out)))
 	}
 
 	log.Printf("INFO: destroyed per-app user %s", username)
@@ -256,22 +251,15 @@ func CleanupOrphanAppUsers(knownInstanceIDs map[string]bool) {
 			continue
 		}
 		log.Printf("INFO: cleaning up orphan per-app user %s", username)
-		u, err := user.Lookup(username)
-		if err == nil {
-			uid, _ := strconv.ParseUint(u.Uid, 10, 32)
-			killUserProcesses(username, uint32(uid))
-		}
-		disableLinger(username)
-		cmd := exec.Command("userdel", "--remove", username)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("WARN: failed to remove orphan user %s: %v: %s", username, err, strings.TrimSpace(string(out)))
+		if err := destroyAppUserByName(username); err != nil {
+			log.Printf("WARN: orphan cleanup %s: %v", username, err)
 		}
 	}
 }
 
 // EnsureAppsGroup creates the piccolo-apps shared group if it doesn't exist.
 func EnsureAppsGroup() error {
-	return ensureGroup(appsGroupName)
+	return ensureGroup(AppsGroupName)
 }
 
 // listAppUsers scans /etc/passwd and returns all usernames starting with
@@ -289,7 +277,7 @@ func listAppUsers() ([]string, error) {
 		line := scanner.Text()
 		if idx := strings.Index(line, ":"); idx > 0 {
 			username := line[:idx]
-			if strings.HasPrefix(username, appUserPrefix) {
+			if strings.HasPrefix(username, AppUserPrefix) {
 				users = append(users, username)
 			}
 		}
@@ -300,8 +288,8 @@ func listAppUsers() ([]string, error) {
 // ensureGroup creates a POSIX group if it doesn't already exist.
 // Uses groupadd -f which is idempotent.
 func ensureGroup(name string) error {
-	cmd := exec.Command("groupadd", "-f", name)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := defaultExecutor.Run("groupadd", "-f", name)
+	if err != nil {
 		return fmt.Errorf("groupadd -f %s: %w: %s", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -355,7 +343,7 @@ func parseSubUIDFile(path string) ([]subUIDEntry, error) {
 
 // allocateSubUIDRange finds the next available non-overlapping subuid/subgid slot.
 // Scans both /etc/subuid and /etc/subgid for all existing entries and finds the
-// first gap starting from subUIDBase (200000). Both files are scanned because the
+// first gap starting from SubUIDBase (200000). Both files are scanned because the
 // same range is applied to both, and manual edits could create asymmetry.
 func allocateSubUIDRange(username string) (uint32, error) {
 	uidEntries, err := parseSubUIDFile("/etc/subuid")
@@ -376,7 +364,7 @@ func allocateSubUIDRange(username string) (uint32, error) {
 	}
 
 	allEntries := append(uidEntries, gidEntries...)
-	return findNextSlot(allEntries, subUIDBase, subUIDRangeSize)
+	return findNextSlot(allEntries, SubUIDBase, SubUIDRangeSize)
 }
 
 // findNextSlot finds the first non-overlapping range of the given size starting
@@ -450,8 +438,8 @@ func EnsureCgroupDelegation() error {
 	}
 
 	// Reload systemd to pick up the new drop-in.
-	cmd := exec.Command("systemctl", "daemon-reload")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := defaultExecutor.Run("systemctl", "daemon-reload")
+	if err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 
@@ -463,13 +451,12 @@ func EnsureCgroupDelegation() error {
 // user's systemd session is fully started. The session provides dbus and
 // cgroup delegation that rootless Podman requires.
 func enableLinger(username string) error {
-	cmd := exec.Command("loginctl", "enable-linger", username)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := defaultExecutor.Run("loginctl", "enable-linger", username); err != nil {
 		return fmt.Errorf("loginctl enable-linger %s: %w: %s", username, err, strings.TrimSpace(string(out)))
 	}
 
 	// Resolve UID for the user service name.
-	u, err := user.Lookup(username)
+	u, err := defaultResolver.LookupUser(username)
 	if err != nil {
 		return nil // Linger enabled, just can't verify session.
 	}
@@ -479,8 +466,7 @@ func enableLinger(username string) error {
 	// created users. systemctl start is synchronous and blocks until the
 	// service is active.
 	svcName := fmt.Sprintf("user@%s.service", u.Uid)
-	startCmd := exec.Command("systemctl", "start", svcName)
-	if out, err := startCmd.CombinedOutput(); err != nil {
+	if out, err := defaultExecutor.Run("systemctl", "start", svcName); err != nil {
 		log.Printf("WARN: systemctl start %s failed: %v: %s", svcName, err, strings.TrimSpace(string(out)))
 	}
 
@@ -493,6 +479,9 @@ func enableLinger(username string) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	// Non-fatal: dbus socket is a readiness hint, not a hard requirement.
+	// Rootless Podman may still work if the socket appears shortly after.
+	// Failing provisioning here would cause avoidable failures on slow systems.
 	log.Printf("WARN: dbus socket %s not ready after 5s for user %s — rootless Podman cgroup management may fail", dbusSocket, username)
 	return nil
 }
@@ -517,11 +506,11 @@ func ensureUserSession(username string, uid uint32) {
 func killUserProcesses(username string, uid uint32) {
 	// Stop the systemd user service first (graceful).
 	svcName := fmt.Sprintf("user@%d.service", uid)
-	if out, err := exec.Command("systemctl", "stop", svcName).CombinedOutput(); err != nil {
+	if out, err := defaultExecutor.Run("systemctl", "stop", svcName); err != nil {
 		log.Printf("DEBUG: systemctl stop %s: %v: %s", svcName, err, strings.TrimSpace(string(out)))
 	}
 	// Kill any remaining processes (belt and suspenders).
-	if out, err := exec.Command("loginctl", "kill-user", username).CombinedOutput(); err != nil {
+	if out, err := defaultExecutor.Run("loginctl", "kill-user", username); err != nil {
 		log.Printf("DEBUG: loginctl kill-user %s: %v: %s", username, err, strings.TrimSpace(string(out)))
 	}
 	// Brief pause for process cleanup.
@@ -530,8 +519,7 @@ func killUserProcesses(username string, uid uint32) {
 
 // disableLinger disables systemd linger for the given user. Best-effort.
 func disableLinger(username string) {
-	cmd := exec.Command("loginctl", "disable-linger", username)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := defaultExecutor.Run("loginctl", "disable-linger", username); err != nil {
 		log.Printf("WARN: loginctl disable-linger %s: %v: %s", username, err, strings.TrimSpace(string(out)))
 	}
 }
