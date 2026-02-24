@@ -350,7 +350,7 @@ func TestWrapError(t *testing.T) {
 
 func TestPodmanImageMounter(t *testing.T) {
 	// Test creation
-	mounter := NewPodmanImageMounter()
+	mounter := NewPodmanImageMounter(nil, "")
 	if mounter == nil {
 		t.Fatal("NewPodmanImageMounter() returned nil")
 	}

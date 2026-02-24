@@ -334,6 +334,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				primary:    primary,
 				svcName:    svcName,
 				anchorID:   anchorID,
+				credential: runtime.Credential,
 			}
 			if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
 				opts.mergedRootfs = workspaceInfo.mergedPath
@@ -360,8 +361,8 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 		if !st.Running {
 			if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
-				log.Printf("INFO: reconcile app %s: service '%s' start failed (%v), recreating",
-					appInst.InstanceID, svcName, err)
+				log.Printf("INFO: reconcile app %s: service '%s' (cid=%s) start failed (%v), recreating",
+					appInst.InstanceID, svcName, cid, err)
 				m.setObservedStatusMessage(appInst.InstanceID, "Service start failed, recreating")
 
 				opts := serviceContainerOptions{
@@ -371,6 +372,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 					primary:    primary,
 					svcName:    svcName,
 					anchorID:   anchorID,
+					credential: runtime.Credential,
 				}
 				if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
 					opts.mergedRootfs = workspaceInfo.mergedPath
@@ -559,6 +561,11 @@ func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime
 	spec, err := m.buildServiceContainerSpec(opts)
 	if err != nil {
 		return "", fmt.Errorf("build container spec for service '%s': %w", opts.svcName, err)
+	}
+	// Per-app runtimes must never pull: images are pre-pulled to the shared
+	// imagestore and the per-app FUSE storage can't do rootless layer extraction.
+	if spec.Image != "" {
+		spec.PullPolicy = "never"
 	}
 
 	var cid string

@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -242,6 +245,237 @@ func TestValidateContainerSpec(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildCreateArgs_cap_drop_and_cap_add(t *testing.T) {
+	spec := ContainerCreateSpec{
+		Name:  "testapp",
+		Image: "alpine:latest",
+	}
+	args := buildCreateArgs(spec)
+
+	// Verify --cap-drop=ALL is present
+	found := false
+	for _, arg := range args {
+		if arg == "--cap-drop=ALL" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected --cap-drop=ALL in args")
+	}
+
+	// Verify exactly 12 --cap-add flags are present (no accidental additions)
+	capAddCount := 0
+	for _, arg := range args {
+		if len(arg) > 10 && arg[:10] == "--cap-add=" {
+			capAddCount++
+		}
+	}
+	if capAddCount != 12 {
+		t.Errorf("expected exactly 12 --cap-add flags, got %d", capAddCount)
+	}
+
+	// Verify all 12 --cap-add flags are present
+	expectedCaps := []string{
+		"--cap-add=CHOWN", "--cap-add=DAC_OVERRIDE", "--cap-add=FOWNER",
+		"--cap-add=FSETID", "--cap-add=SETUID", "--cap-add=SETGID",
+		"--cap-add=NET_BIND_SERVICE", "--cap-add=KILL", "--cap-add=SYS_CHROOT",
+		"--cap-add=SETFCAP", "--cap-add=SETPCAP", "--cap-add=AUDIT_WRITE",
+	}
+	for _, expected := range expectedCaps {
+		found := false
+		for _, arg := range args {
+			if arg == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected %s in args", expected)
+		}
+	}
+}
+
+func TestBuildCreateArgs_pids_limit_and_nofile(t *testing.T) {
+	spec := ContainerCreateSpec{
+		Name:  "testapp",
+		Image: "alpine:latest",
+		Resources: ResourceLimits{
+			PidsLimit:   4096,
+			NofileLimit: 65536,
+		},
+	}
+	args := buildCreateArgs(spec)
+
+	// Check --pids-limit
+	foundPids := false
+	for i, arg := range args {
+		if arg == "--pids-limit" && i+1 < len(args) && args[i+1] == "4096" {
+			foundPids = true
+			break
+		}
+	}
+	if !foundPids {
+		t.Errorf("expected --pids-limit 4096 in args, got %v", args)
+	}
+
+	// Check --ulimit nofile
+	foundNofile := false
+	for i, arg := range args {
+		if arg == "--ulimit" && i+1 < len(args) && args[i+1] == "nofile=65536:65536" {
+			foundNofile = true
+			break
+		}
+	}
+	if !foundNofile {
+		t.Errorf("expected --ulimit nofile=65536:65536 in args, got %v", args)
+	}
+}
+
+func TestBuildCreateArgs_pids_limit_zero_omitted(t *testing.T) {
+	spec := ContainerCreateSpec{
+		Name:  "testapp",
+		Image: "alpine:latest",
+	}
+	args := buildCreateArgs(spec)
+
+	for _, arg := range args {
+		if arg == "--pids-limit" {
+			t.Fatal("--pids-limit should not be present when PidsLimit is 0")
+		}
+		if arg == "--ulimit" {
+			t.Fatal("--ulimit should not be present when NofileLimit is 0")
+		}
+	}
+}
+
+func TestApplyRuntimeCredential_nil_credential(t *testing.T) {
+	rt := PodmanRuntime{}
+	cmd := &exec.Cmd{}
+
+	ApplyRuntimeCredential(cmd, rt)
+
+	// No-op: env and SysProcAttr should remain unset
+	if cmd.Env != nil {
+		t.Error("expected nil Env for nil credential")
+	}
+	if cmd.SysProcAttr != nil {
+		t.Error("expected nil SysProcAttr for nil credential")
+	}
+}
+
+func TestApplyRuntimeCredential_with_credential(t *testing.T) {
+	rt := PodmanRuntime{
+		Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
+		HomeDir:    "/home/testuser",
+	}
+	cmd := &exec.Cmd{}
+
+	ApplyRuntimeCredential(cmd, rt, "TERM=xterm-256color")
+
+	// Verify env is set
+	if cmd.Env == nil {
+		t.Fatal("expected non-nil Env")
+	}
+
+	envMap := make(map[string]bool)
+	for _, e := range cmd.Env {
+		envMap[e] = true
+	}
+	if !envMap["HOME=/home/testuser"] {
+		t.Error("expected HOME=/home/testuser in env")
+	}
+	if !envMap["XDG_RUNTIME_DIR=/run/user/1000"] {
+		t.Error("expected XDG_RUNTIME_DIR=/run/user/1000 in env")
+	}
+	if !envMap["LANG=C.UTF-8"] {
+		t.Error("expected LANG=C.UTF-8 in env")
+	}
+	if !envMap["LC_ALL=C"] {
+		t.Error("expected LC_ALL=C in env")
+	}
+	if !envMap["TERM=xterm-256color"] {
+		t.Error("expected TERM=xterm-256color in env (extraEnv)")
+	}
+
+	// Verify SysProcAttr.Credential
+	if cmd.SysProcAttr == nil {
+		t.Fatal("expected non-nil SysProcAttr")
+	}
+	if cmd.SysProcAttr.Credential == nil {
+		t.Fatal("expected non-nil Credential in SysProcAttr")
+	}
+	if cmd.SysProcAttr.Credential.Uid != 1000 {
+		t.Errorf("expected Uid=1000, got %d", cmd.SysProcAttr.Credential.Uid)
+	}
+}
+
+func TestApplyRuntimeCredential_preserves_existing_sysprocattr(t *testing.T) {
+	rt := PodmanRuntime{
+		Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
+		HomeDir:    "/home/testuser",
+	}
+	cmd := &exec.Cmd{
+		SysProcAttr: &syscall.SysProcAttr{Setsid: true},
+	}
+
+	ApplyRuntimeCredential(cmd, rt)
+
+	// Setsid should be preserved
+	if !cmd.SysProcAttr.Setsid {
+		t.Error("expected Setsid to remain true")
+	}
+	if cmd.SysProcAttr.Credential == nil {
+		t.Error("expected Credential to be set")
+	}
+}
+
+func TestPodmanCmd_with_credential(t *testing.T) {
+	rt := PodmanRuntime{
+		Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
+		HomeDir:    "/home/testuser",
+	}
+	cmd := podmanCmd(context.Background(), rt, "images")
+
+	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential == nil {
+		t.Fatal("expected credential to be set on cmd from podmanCmd")
+	}
+	if cmd.SysProcAttr.Credential.Uid != 1000 {
+		t.Errorf("expected Uid=1000, got %d", cmd.SysProcAttr.Credential.Uid)
+	}
+	if cmd.Env == nil {
+		t.Error("expected Env to be set for rootless")
+	}
+}
+
+func TestApplyRuntimeCredential_includes_proxy_env(t *testing.T) {
+	// Set proxy env vars
+	t.Setenv("HTTP_PROXY", "http://proxy:8080")
+	t.Setenv("HTTPS_PROXY", "http://proxy:8443")
+	t.Setenv("NO_PROXY", "localhost")
+
+	rt := PodmanRuntime{
+		Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
+		HomeDir:    "/home/testuser",
+	}
+	cmd := &exec.Cmd{}
+	ApplyRuntimeCredential(cmd, rt)
+
+	envMap := make(map[string]bool)
+	for _, e := range cmd.Env {
+		envMap[e] = true
+	}
+	if !envMap["HTTP_PROXY=http://proxy:8080"] {
+		t.Error("expected HTTP_PROXY in env")
+	}
+	if !envMap["HTTPS_PROXY=http://proxy:8443"] {
+		t.Error("expected HTTPS_PROXY in env")
+	}
+	if !envMap["NO_PROXY=localhost"] {
+		t.Error("expected NO_PROXY in env")
 	}
 }
 
@@ -616,3 +850,55 @@ func TestPullProgressParser_ShouldCallback(t *testing.T) {
 		t.Error("shouldCallback() after waiting should return true")
 	}
 }
+
+func TestEnsureAdditionalStoresConf(t *testing.T) {
+	root := t.TempDir()
+	runRoot := t.TempDir()
+
+	rt := PodmanRuntime{
+		Root:                  root,
+		RunRoot:               runRoot,
+		StorageDriver:         "overlay",
+		AdditionalImageStores: []string{"/data/imagestore"},
+	}
+
+	confPath, err := ensureAdditionalStoresConf(rt)
+	if err != nil {
+		t.Fatalf("ensureAdditionalStoresConf: %v", err)
+	}
+
+	data, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatalf("read conf: %v", err)
+	}
+
+	got := string(data)
+	if !strings.Contains(got, `driver = "overlay"`) {
+		t.Errorf("missing driver in conf:\n%s", got)
+	}
+	if !strings.Contains(got, fmt.Sprintf(`graphroot = %q`, root)) {
+		t.Errorf("missing graphroot in conf:\n%s", got)
+	}
+	if !strings.Contains(got, fmt.Sprintf(`runroot = %q`, runRoot)) {
+		t.Errorf("missing runroot in conf:\n%s", got)
+	}
+	if !strings.Contains(got, `additionalimagestores = ["/data/imagestore"]`) {
+		t.Errorf("missing additionalimagestores in conf:\n%s", got)
+	}
+	if !strings.Contains(got, `[storage.options.overlay]`) {
+		t.Errorf("missing [storage.options.overlay] section in conf:\n%s", got)
+	}
+	if !strings.Contains(got, fmt.Sprintf(`mount_program = %q`, FuseOverlayfsWrapperPath)) {
+		t.Errorf("missing mount_program in conf:\n%s", got)
+	}
+
+	// Idempotent: calling again should not error.
+	confPath2, err := ensureAdditionalStoresConf(rt)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if confPath2 != confPath {
+		t.Errorf("path changed: %q vs %q", confPath, confPath2)
+	}
+}
+

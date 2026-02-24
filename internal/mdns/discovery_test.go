@@ -645,6 +645,177 @@ func TestHandlePeerDiscoveryResponse_InvalidMachineID(t *testing.T) {
 	}
 }
 
+func TestPeerRegistry_RemovePeer(t *testing.T) {
+	t.Run("remove_existing", func(t *testing.T) {
+		registry := newPeerRegistry()
+		registry.UpdatePeer("abc123", func(peer *DiscoveredPeer) {
+			peer.Hostname = "peer.local"
+		})
+
+		removed := registry.RemovePeer("abc123")
+		if !removed {
+			t.Error("expected RemovePeer to return true for existing peer")
+		}
+		if registry.Count() != 0 {
+			t.Errorf("expected 0 peers after removal, got %d", registry.Count())
+		}
+		if _, exists := registry.GetPeer("abc123"); exists {
+			t.Error("peer should not exist after removal")
+		}
+	})
+
+	t.Run("remove_nonexistent", func(t *testing.T) {
+		registry := newPeerRegistry()
+		registry.UpdatePeer("abc123", func(peer *DiscoveredPeer) {
+			peer.Hostname = "peer.local"
+		})
+
+		removed := registry.RemovePeer("zzz999")
+		if removed {
+			t.Error("expected RemovePeer to return false for nonexistent peer")
+		}
+		if registry.Count() != 1 {
+			t.Errorf("expected 1 peer unchanged, got %d", registry.Count())
+		}
+	})
+}
+
+func TestHandlePeerGoodbye_RemovesPeer(t *testing.T) {
+	manager := NewManager()
+
+	// Add a peer to the registry
+	manager.peerRegistry.UpdatePeer("def456", func(peer *DiscoveredPeer) {
+		peer.Hostname = "peer.local"
+	})
+
+	if manager.PeerCount() != 1 {
+		t.Fatalf("expected 1 peer, got %d", manager.PeerCount())
+	}
+
+	// Trigger goodbye
+	manager.handlePeerGoodbye("def456")
+
+	// Peer should be removed from registry
+	if manager.PeerCount() != 0 {
+		t.Errorf("expected 0 peers after goodbye, got %d", manager.PeerCount())
+	}
+}
+
+func TestHandlePeerGoodbye_UnknownPeerIgnored(t *testing.T) {
+	manager := NewManager()
+
+	// Set up a gateway leader to verify it does NOT get notified
+	leader := NewGatewayLeader(manager.MachineID())
+	leader.SetPeersFunc(func() []DiscoveredPeer { return manager.Peers() })
+	var notified bool
+	leader.SetLeadershipChangeCallback(func(isLeader bool) {
+		notified = true
+	})
+	manager.gatewayLeader = leader
+
+	// Trigger goodbye for unknown peer
+	manager.handlePeerGoodbye("zzz999")
+
+	// No peer should be added, no notification should fire
+	if manager.PeerCount() != 0 {
+		t.Errorf("expected 0 peers, got %d", manager.PeerCount())
+	}
+	if notified {
+		t.Error("leader callback should not be called for unknown peer goodbye")
+	}
+}
+
+func TestCheckForGoodbyeAnnouncements_NoDuplicate(t *testing.T) {
+	manager := NewManager()
+
+	peerID := "def456"
+	peerHostname := "piccolo-def456"
+
+	// Add peer to registry
+	manager.peerRegistry.UpdatePeer(peerID, func(peer *DiscoveredPeer) {
+		peer.Hostname = peerHostname
+	})
+
+	serviceFQDN := "_piccolo._tcp.local."
+	instanceFQDN := peerHostname + "." + serviceFQDN
+
+	// Build a message with both TXT and PTR goodbye records (TTL=0)
+	msg := &dns.Msg{}
+	msg.Answer = append(msg.Answer,
+		&dns.TXT{
+			Hdr: dns.RR_Header{Name: instanceFQDN, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 0},
+			Txt: []string{"id=" + peerID, "version=1.0.0"},
+		},
+		&dns.PTR{
+			Hdr: dns.RR_Header{Name: serviceFQDN, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 0},
+			Ptr: instanceFQDN,
+		},
+	)
+
+	manager.checkForGoodbyeAnnouncements(msg)
+
+	// Peer should be removed (by TXT goodbye, first in message order).
+	// The PTR goodbye should be deduplicated — it should not attempt a
+	// second removal for the same machine ID.
+	if manager.PeerCount() != 0 {
+		t.Errorf("expected 0 peers after goodbye, got %d", manager.PeerCount())
+	}
+}
+
+func TestHandlePeerDiscoveryResponse_GoodbyeNotReAdded(t *testing.T) {
+	manager := NewManager()
+
+	peerID := "def456"
+	peerHostname := "piccolo-def456"
+
+	// Add peer to registry (simulating prior discovery)
+	manager.peerRegistry.UpdatePeer(peerID, func(peer *DiscoveredPeer) {
+		peer.Hostname = peerHostname
+	})
+
+	serviceFQDN := "_piccolo._tcp.local."
+	instanceFQDN := peerHostname + "." + serviceFQDN
+	hostFQDN := peerHostname + ".local."
+
+	// Build a full goodbye response with all record types at TTL=0.
+	// This simulates the mDNS message sent when a peer shuts down.
+	msg := &dns.Msg{}
+	msg.Response = true
+	msg.Answer = append(msg.Answer,
+		&dns.PTR{
+			Hdr: dns.RR_Header{Name: serviceFQDN, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 0},
+			Ptr: instanceFQDN,
+		},
+		&dns.SRV{
+			Hdr:    dns.RR_Header{Name: instanceFQDN, Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: 0},
+			Target: hostFQDN,
+			Port:   80,
+		},
+		&dns.TXT{
+			Hdr: dns.RR_Header{Name: instanceFQDN, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 0},
+			Txt: []string{"txtvers=1", "id=" + peerID, "model=Test", "name=" + peerHostname, "version=1.0.0"},
+		},
+	)
+	msg.Extra = append(msg.Extra,
+		&dns.A{
+			Hdr: dns.RR_Header{Name: hostFQDN, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0},
+			A:   net.ParseIP("192.168.1.200"),
+		},
+	)
+
+	clientAddr := &net.UDPAddr{IP: net.ParseIP("192.168.1.200"), Port: 5353}
+	manager.handlePeerDiscoveryResponse(msg, clientAddr)
+
+	// Peer should be removed by goodbye processing and NOT re-added
+	// by the normal record processing path.
+	if manager.PeerCount() != 0 {
+		t.Errorf("expected 0 peers after goodbye response, got %d", manager.PeerCount())
+	}
+	if _, exists := manager.GetPeer(peerID); exists {
+		t.Error("peer should not exist after goodbye response")
+	}
+}
+
 func TestHandlePeerDiscoveryResponse_IgnoresSelf(t *testing.T) {
 	manager := NewManager()
 

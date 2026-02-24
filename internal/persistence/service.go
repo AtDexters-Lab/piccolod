@@ -65,8 +65,13 @@ func NewService(opts Options) (*Module, error) {
 	if stateDir == "" {
 		stateDir = paths.CoreRoot()
 	}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+	if err := os.MkdirAll(stateDir, 0o711); err != nil {
 		return nil, err
+	}
+	// Ensure core root is world-traversable so per-app users can reach their
+	// mount points. MkdirAll is a no-op on existing dirs, so chmod explicitly.
+	if err := os.Chmod(stateDir, 0o711); err != nil {
+		return nil, fmt.Errorf("chmod core root: %w", err)
 	}
 	mod := &Module{
 		control:        opts.Control,

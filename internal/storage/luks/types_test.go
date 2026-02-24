@@ -22,8 +22,8 @@ func TestNewLUKSKDFParams(t *testing.T) {
 	if params.Argon2Time != 3 {
 		t.Errorf("Argon2Time = %d, want 3", params.Argon2Time)
 	}
-	if params.Argon2Memory != 512*1024 {
-		t.Errorf("Argon2Memory = %d, want %d", params.Argon2Memory, 512*1024)
+	if params.Argon2Memory < 128*1024 || params.Argon2Memory > 512*1024 {
+		t.Errorf("Argon2Memory = %d, want [%d, %d]", params.Argon2Memory, 128*1024, 512*1024)
 	}
 	if params.Argon2Threads < 1 || params.Argon2Threads > 8 {
 		t.Errorf("Argon2Threads = %d, want 1-8", params.Argon2Threads)

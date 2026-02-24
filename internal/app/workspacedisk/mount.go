@@ -122,9 +122,11 @@ func isMountedFromMtab(mountpoint string) (bool, error) {
 
 // MountOverlay mounts the overlay filesystem using fuse-overlayfs.
 // It combines lowerDir (base image rootfs) with upperDir (workspace writable layer).
-func MountOverlay(ctx context.Context, layout Layout, lowerDir string) error {
-	// Verify lowerDir exists and is readable
-	if _, err := os.Stat(lowerDir); err != nil {
+// lowerDir may be colon-separated (multiple overlay layers from podman image inspect).
+func MountOverlay(ctx context.Context, layout Layout, lowerDir string, mountOpts MountOptions) error {
+	// Verify first lowerDir path is accessible (lowerDir may be colon-separated)
+	firstPath := strings.SplitN(lowerDir, ":", 2)[0]
+	if _, err := os.Stat(firstPath); err != nil {
 		return fmt.Errorf("lowerdir not accessible: %w", err)
 	}
 
@@ -150,8 +152,35 @@ func MountOverlay(ctx context.Context, layout Layout, lowerDir string) error {
 
 	// Build fuse-overlayfs command
 	// Format: fuse-overlayfs -o lowerdir=...,upperdir=...,workdir=... mountpoint
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
+	// default_permissions makes the kernel enforce permission checks using the
+	// UIDs returned by getattr (after uidmapping/squash) instead of deferring
+	// to fuse-overlayfs's own checks (which use raw disk UIDs). This is
+	// critical for rootless containers: crun needs to create mountpoints
+	// (e.g., /etc/hosts, /piccolo/config) inside the overlay, and with
+	// uidmapping the root directory appears owned by the per-app user,
+	// giving crun owner-match write access.
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s,allow_other,default_permissions",
 		lowerDir, layout.Upper, layout.Work)
+
+	// UID/GID mapping for per-app user isolation. Two modes:
+	//
+	// Preferred: uidmapping/gidmapping — remaps disk UIDs (image layer UIDs
+	// stored by the image runtime user) to overlay UIDs matching the per-app
+	// user's namespace. Format: "disk_uid:overlay_uid:count". Combined with
+	// default_permissions, the kernel uses mapped UIDs for permission checks.
+	//
+	// Fallback: squash_to_uid/gid — flattens all ownership to a single UID.
+	// Simpler but breaks containers that switch to non-root users internally.
+	if mountOpts.UIDMapping != "" {
+		opts += fmt.Sprintf(",uidmapping=%s", mountOpts.UIDMapping)
+	} else if mountOpts.SquashUID >= 0 {
+		opts += fmt.Sprintf(",squash_to_uid=%d", mountOpts.SquashUID)
+	}
+	if mountOpts.GIDMapping != "" {
+		opts += fmt.Sprintf(",gidmapping=%s", mountOpts.GIDMapping)
+	} else if mountOpts.SquashGID >= 0 {
+		opts += fmt.Sprintf(",squash_to_gid=%d", mountOpts.SquashGID)
+	}
 
 	cmd := exec.CommandContext(ctx, fuseOverlayfs, "-o", opts, layout.Merged)
 	output, err := cmd.CombinedOutput()

@@ -164,9 +164,12 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		serviceIdx++
 	}
 
-	// Pull network anchor image (always image-based)
-	if err := m.containerManager.PullImage(ctx, runtime, networkAnchorImage()); err != nil {
-		log.Printf("WARN: install %s: network anchor image pull failed: %v", instanceID, err)
+	// Pull network anchor image using shared image runtime (piccolo-runtime has
+	// write access to the imagestore; per-app users have read-only group access).
+	// This pre-pull is mandatory: per-app runtimes use --pull=never because their
+	// storage is on gocryptfs (FUSE) where rootless layer extraction fails.
+	if err := m.pullToImagestore(ctx, networkAnchorImage(), nil); err != nil {
+		return nil, fmt.Errorf("network anchor image pull failed: %w", err)
 	}
 
 	created := make([]string, 0, 1+len(appDef.Services))
@@ -188,6 +191,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	anchorSpec := container.ContainerCreateSpec{
 		Name:          networkAnchorContainerName(instanceID),
 		Image:         networkAnchorImage(),
+		PullPolicy:    "never", // Pre-pulled above; per-app FUSE storage can't extract layers.
 		NetworkMode:   appNetworkMode(appDef),
 		RestartPolicy: appRestartPolicy(appDef),
 		Labels:        piccoloLabels(instanceID, networkAnchorServiceName, "network_anchor"),
@@ -269,6 +273,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			primary:    primary,
 			svcName:    svcName,
 			anchorID:   anchorID,
+			credential: runtime.Credential,
 		}
 		if info := workspaceInfos[svcName]; info != nil {
 			opts.mergedRootfs = info.mergedPath
@@ -278,6 +283,11 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		if err != nil {
 			cleanup()
 			return nil, err
+		}
+		// Per-app runtimes must never pull: images are pre-pulled to the shared
+		// imagestore and the per-app FUSE storage can't do rootless layer extraction.
+		if spec.Image != "" {
+			spec.PullPolicy = "never"
 		}
 
 		var cid string

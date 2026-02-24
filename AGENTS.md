@@ -107,3 +107,6 @@ Sensitive control plane data uses gocryptfs encryption. Keys managed via `intern
 ## Commit Messages
 - Don't add authoring
 - Should be succinct
+
+## Log parsing helpers
+- for piccolod log parsing, to filter out mDNS noise - `grep -v -e "Announced" -e "PTR record" -e "peer discovery" -e "non-local query" -e "query from" -e "self-response" <log-file>`

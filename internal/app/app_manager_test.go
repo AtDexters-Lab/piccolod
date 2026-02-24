@@ -103,6 +103,7 @@ func allowHostStorage(t *testing.T, m *AppManager) {
 }
 
 func TestAppManager_LazyStateInitialization(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 	mock := NewMockContainerManager()
 	manager, err := NewAppManager(mock, tempDir)
@@ -135,6 +136,7 @@ func TestAppManager_LazyStateInitialization(t *testing.T) {
 }
 
 func TestAppManager_DefaultStateDirWhenEmpty(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tempDir)
 
@@ -157,6 +159,7 @@ func TestAppManager_DefaultStateDirWhenEmpty(t *testing.T) {
 }
 
 func TestAppManager_ListRespectsLockAfterInitialization(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 	mock := NewMockContainerManager()
 	manager, err := NewAppManager(mock, tempDir)
@@ -177,6 +180,7 @@ func TestAppManager_ListRespectsLockAfterInitialization(t *testing.T) {
 }
 
 func TestAppManager_RestoreServicesDefersUntilUnlock(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 	mock := NewMockContainerManager()
 	svcMgr := services.NewServiceManager()
@@ -226,6 +230,7 @@ func TestAppManager_RestoreServicesDefersUntilUnlock(t *testing.T) {
 
 // TestAppManager_Install tests app installation with filesystem persistence
 func TestAppManager_Install(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	// Create temporary directory for test
 	tempDir, err := os.MkdirTemp("", "fs_manager_test")
 	if err != nil {
@@ -329,6 +334,7 @@ func TestAppManager_Install(t *testing.T) {
 }
 
 func TestAppManager_Install_NotLeader(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 	mockContainer := NewMockContainerManager()
 	manager, err := NewAppManager(mockContainer, tempDir)
@@ -376,6 +382,7 @@ func TestAppManager_Install_NotLeader(t *testing.T) {
 }
 
 func TestAppManager_RouterUpdatesOnLeadership(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 	mockContainer := NewMockContainerManager()
 	manager, err := NewAppManager(mockContainer, tempDir)
@@ -417,6 +424,7 @@ func TestAppManager_RouterUpdatesOnLeadership(t *testing.T) {
 
 // TestAppManager_List tests listing apps from filesystem
 func TestAppManager_List(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	// Create temporary directory for test
 	tempDir, err := os.MkdirTemp("", "fs_manager_test")
 	if err != nil {
@@ -499,6 +507,7 @@ func TestAppManager_List(t *testing.T) {
 }
 
 func TestAppManager_RequiresMountedVolume(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 	mock := NewMockContainerManager()
 	manager, err := NewAppManager(mock, tempDir)
@@ -516,6 +525,7 @@ func TestAppManager_RequiresMountedVolume(t *testing.T) {
 
 // TestAppManager_Get tests getting specific app
 func TestAppManager_Get(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	// Create temporary directory for test
 	tempDir, err := os.MkdirTemp("", "fs_manager_test")
 	if err != nil {
@@ -575,6 +585,7 @@ func TestAppManager_Get(t *testing.T) {
 }
 
 func TestAppManagerLeadershipTracking(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 	mockContainer := NewMockContainerManager()
 	manager, err := NewAppManager(mockContainer, tempDir)
@@ -614,6 +625,7 @@ func TestAppManagerLeadershipTracking(t *testing.T) {
 
 // TestAppManager_StartStop tests starting and stopping apps with status updates
 func TestAppManager_StartStop(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	// Create temporary directory for test
 	tempDir, err := os.MkdirTemp("", "fs_manager_test")
 	if err != nil {
@@ -714,6 +726,7 @@ func TestAppManager_StartStop(t *testing.T) {
 
 // TestAppManager_Uninstall tests app uninstallation
 func TestAppManager_Uninstall(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	// Create temporary directory for test
 	tempDir, err := os.MkdirTemp("", "fs_manager_test")
 	if err != nil {
@@ -787,6 +800,7 @@ func TestAppManager_Uninstall(t *testing.T) {
 
 // TestAppManager_PersistenceAcrossRestarts tests that state persists across manager restarts
 func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	// Create temporary directory for test
 	tempDir, err := os.MkdirTemp("", "fs_manager_test")
 	if err != nil {
@@ -892,6 +906,7 @@ func TestAppManager_PersistenceAcrossRestarts(t *testing.T) {
 }
 
 func TestAppManager_BlockedWhenLocked(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	mock := NewMockContainerManager()
 	tempDir := t.TempDir()
 	mgr, err := NewAppManager(mock, tempDir)
@@ -1496,6 +1511,7 @@ func TestAppManager_StopAllApps_NoApps(t *testing.T) {
 
 // TestAppManager_StopAllApps_StateManagerNotInitialized tests StopAllApps when state manager is nil
 func TestAppManager_StopAllApps_StateManagerNotInitialized(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 	mock := NewMockContainerManager()
 	mgr, err := NewAppManager(mock, tempDir)
@@ -1598,9 +1614,8 @@ func TestUninstall_ImagePruning(t *testing.T) {
 		mgr.ForceLockState(false)
 		// Inject a test image runtime so tests don't need fuse-overlayfs
 		mgr.SetImageRuntimeForTest(container.PodmanRuntime{
-			Root:          filepath.Join(tempDir, "podman", "image-root"),
-			RunRoot:       filepath.Join(tempDir, "run", "podman", "image-root"),
-			Imagestore:    filepath.Join(tempDir, "podman", "imagestore"),
+			Root:          filepath.Join(tempDir, "podman", "imagestore"),
+			RunRoot:       filepath.Join(tempDir, "run", "podman", "imagestore"),
 			StorageDriver: "overlay",
 		})
 		return mgr, mock, tempDir
@@ -1743,13 +1758,13 @@ func TestPodmanImageRuntime(t *testing.T) {
 		t.Fatalf("NewAppManager: %v", err)
 	}
 
-	// Inject a test image runtime with shared imagestore
-	expectedRoot := filepath.Join(tempDir, "podman", "image-root")
-	expectedImagestore := filepath.Join(tempDir, "podman", "imagestore")
+	// Inject a test image runtime — the imagestore IS the graphRoot now.
+	// No separate --imagestore flag; per-app runtimes reference this root
+	// via additionalimagestores for read-only access.
+	expectedRoot := filepath.Join(tempDir, "podman", "imagestore")
 	mgr.SetImageRuntimeForTest(container.PodmanRuntime{
 		Root:          expectedRoot,
-		RunRoot:       filepath.Join(tempDir, "run", "podman", "image-root"),
-		Imagestore:    expectedImagestore,
+		RunRoot:       filepath.Join(tempDir, "run", "podman", "imagestore"),
 		StorageDriver: "overlay",
 		StorageOpts:   []string{"mount_program=/usr/bin/fuse-overlayfs"},
 	})
@@ -1765,7 +1780,20 @@ func TestPodmanImageRuntime(t *testing.T) {
 	if rt.StorageDriver != "overlay" {
 		t.Errorf("StorageDriver: got %q, want overlay", rt.StorageDriver)
 	}
-	if rt.Imagestore != expectedImagestore {
-		t.Errorf("Imagestore: got %q, want %q", rt.Imagestore, expectedImagestore)
+	if rt.Imagestore != "" {
+		t.Errorf("Imagestore: got %q, want empty (imagestore IS the root now)", rt.Imagestore)
+	}
+}
+
+func TestAppManager_EnforcesRuntimeUser(t *testing.T) {
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "")
+
+	mock := NewMockContainerManager()
+	_, err := NewAppManager(mock, t.TempDir())
+	if err == nil {
+		t.Fatal("NewAppManager should fail when piccolo-runtime user is missing and test bypass is unset")
+	}
+	if !strings.Contains(err.Error(), "runtime user") {
+		t.Errorf("expected runtime user error, got: %v", err)
 	}
 }

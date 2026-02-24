@@ -135,8 +135,9 @@ func (m *Manager) Setup(password string) error {
 		return errors.New("already initialized")
 	}
 
-	// KDF defaults (hard profile)
-	params := kdfParams{Alg: "argon2id", Time: 3, Memory: 512 * 1024, Threads: uint8(selectCryptoParallelism())}
+	// KDF defaults — memory is capped dynamically based on system RAM to
+	// prevent OOM when cryptsetup spawns its own Argon2id shortly after.
+	params := kdfParams{Alg: "argon2id", Time: 3, Memory: cryptoutil.SelectKDFMemoryKiB(), Threads: uint8(selectCryptoParallelism())}
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
 		return err

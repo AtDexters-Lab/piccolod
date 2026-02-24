@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -39,6 +40,42 @@ func ensureDir(path string, mode os.FileMode) error {
 		return err
 	}
 	return os.Chmod(path, mode)
+}
+
+// copyFileWithOwner copies src to dst, preserving the executable bit, and chowns to uid:gid.
+// The destination is written atomically (write to tmp + rename).
+func copyFileWithOwner(src, dst string, uid, gid int) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	srcInfo, err := in.Stat()
+	if err != nil {
+		return err
+	}
+
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chown(tmp, uid, gid); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 func (m *AppManager) currentVolumeManager() persistence.VolumeManager {
@@ -102,7 +139,7 @@ func (m *AppManager) ensureAppVolumeLayout(ctx context.Context, instanceID strin
 	if err := ensureDir(podmanRoot, 0o700); err != nil {
 		return appVolumeLayout{}, fmt.Errorf("app manager: ensure disk dataset for %s: %w", instanceID, err)
 	}
-	if err := ensureDir(dataDir, 0o755); err != nil {
+	if err := ensureDir(dataDir, 0o750); err != nil {
 		return appVolumeLayout{}, fmt.Errorf("app manager: ensure data dataset for %s: %w", instanceID, err)
 	}
 

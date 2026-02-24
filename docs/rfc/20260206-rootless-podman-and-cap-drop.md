@@ -394,21 +394,7 @@ Switching from rootful to rootless Podman changes the networking backend:
 
 **`127.0.0.1` port binding**: The existing pattern `--publish 127.0.0.1:<host>:<guest>` continues to work under rootless+pasta. The port is bound on the host's loopback interface by `pasta`, and piccolod's reverse proxy connects to it as before. No change needed in `buildCreateArgs()` or `internal/services/`.
 
-**Netavark repair becomes conditional**: `flushAndReloadNetavarkRules()` in `internal/app/netavark_repair.go` is rootful-specific. Under rootless mode:
-- The `nft delete table netavark` step is a no-op (the table won't exist).
-- `podman network reload` has no equivalent behavior under pasta.
-
-The function should be skipped when running in rootless mode:
-
-```go
-func (m *AppManager) flushAndReloadNetavarkRules(ctx context.Context) {
-    if m.runtimeCredential != nil {
-        // Rootless mode: pasta networking, no netavark rules to repair
-        return
-    }
-    // ... existing rootful repair logic
-}
-```
+**Netavark repair removed**: `flushAndReloadNetavarkRules()` and `internal/app/netavark_repair.go` are deleted entirely. Under rootless Podman with pasta networking, netavark is not used — there are no nftables DNAT rules to repair. Since this RFC targets new installations only (no rootful-to-rootless migration), the rootful code path is not needed.
 
 ## 6. Affected Modules
 
@@ -420,38 +406,34 @@ func (m *AppManager) flushAndReloadNetavarkRules(ctx context.Context) {
 | `internal/container/podman.go` (`ContainerCreateSpec`) | Add `PidsLimit`, `NofileLimit` to `ResourceLimits` |
 | `internal/app/podman_runtime.go` | Store resolved `*syscall.Credential` on `AppManager`, populate in all `PodmanRuntime` instances, recursive chown of directories |
 | `internal/app/multi_container.go` | Pass `MaxProcesses`/`MaxOpenFiles` through to `ResourceLimits`, apply defaults when zero |
-| `internal/app/netavark_repair.go` | Skip when rootless (credential non-nil) |
+| `internal/app/netavark_repair.go` | Removed (rootless uses pasta, no netavark) |
 | `internal/app/workspacedisk/mount.go` | Add `allow_other` to fuse-overlayfs mount options |
-| `internal/app/workspacedisk/manager.go` | `PodmanImageMounter` stays rootful; strip env to minimal (no credential switching) |
+| `internal/app/workspacedisk/manager.go` | `PodmanImageMounter` refactored to use `podman image inspect` (runs as piccolo-runtime, no root needed) |
 | `internal/app/parser.go` | Reject `privileged: true` in `validateResourcePermissions()` |
 | OS image build | Create `piccolo-runtime` user, configure `/etc/subuid`, `/etc/subgid`, `loginctl enable-linger` |
 
-## 7. Migration / Rollout
+## 7. Deployment
 
-### 7.1 Existing containers
+This RFC targets **new installations only**. There is no migration path from rootful to rootless — the OS image must be built with all prerequisites in place.
 
-On upgrade, existing containers were created under rootful Podman. They cannot be migrated in-place to rootless — the storage format differs.
+### 7.1 OS image prerequisites
 
-Strategy: **stop, remove, and recreate** all containers on first boot after upgrade. This is acceptable because:
-- Piccolo already handles container recreation (e.g., port changes, image updates).
-- App persistent data lives in bind-mounted volumes outside Podman storage — it is preserved.
-- The Podman `--root` (writable layer) is ephemeral and disposable.
-- The shared `--imagestore` needs to be re-pulled under the new user. This happens automatically during container creation.
+1. `piccolo-runtime` system user with subuid/subgid ranges (100000:65536).
+2. `loginctl enable-linger piccolo-runtime` for cgroup delegation.
+3. `user_allow_other` in `/etc/fuse.conf` for FUSE mount accessibility.
+4. `fuse-overlayfs` installed.
 
-### 7.2 Rollout sequence
+### 7.2 Boot sequence
 
-1. OS image includes `piccolo-runtime` user with subuid/subgid + linger configuration.
-2. On first boot, piccolod resolves `piccolo-runtime` at `AppManager` init and logs the mode.
-3. piccolod creates `/run/user/<uid>` (XDG_RUNTIME_DIR) and verifies cgroup delegation.
-4. `podmanRuntimeForApp()` recursively chowns storage directories to `piccolo-runtime` (skipped if already correct).
-5. App reconciliation loop recreates containers (normal reconciliation path).
-6. If `piccolo-runtime` user does not exist (e.g., development/testing), behaviour falls back to current rootful mode (Credential stays nil, logged at startup).
+1. piccolod resolves `piccolo-runtime` at `AppManager` init — **fails hard** if user is missing.
+2. Creates `/run/user/<uid>` (XDG_RUNTIME_DIR) and verifies cgroup delegation.
+3. Ensures `piccolo-apps` group and cgroup v2 controller delegation.
+4. `podmanRuntimeForApp()` provisions per-app users and ensures directory ownership.
+5. App reconciliation loop creates containers under per-app users.
 
-### 7.3 Development/testing
+### 7.3 Testing
 
-For local development (`make run`), the developer may not have `piccolo-runtime` configured. The fallback (nil Credential) means rootful Podman still works. Developers can optionally create the user for local testing.
-
-**Note**: The rootful-to-rootless transition is one-directional in production. If storage directories have been chowned to `piccolo-runtime`, reverting to rootful mode requires re-chowning back to root. In development, `make run-fresh` (ephemeral state dir) avoids this issue entirely.
+Unit tests use `PICCOLO_ALLOW_UNMOUNTED_TESTS=1` to bypass the runtime user requirement. This is the **only** context where `runtimeUser` is nil — production never runs rootful.
 
 ## 8. Testing
 
@@ -481,6 +463,7 @@ For local development (`make run`), the developer may not have `piccolo-runtime`
 
 These are deferred from this RFC but represent the next hardening steps:
 
+- **Per-app Linux user isolation** — See [RFC 20260220](20260220-per-app-user-isolation.md) which extends this single-user design to provision a unique Linux user per app instance. This ensures container escapes are scoped to a per-app UID rather than the shared `piccolo-runtime` user.
 - **`--security-opt no-new-privileges`** — per-app opt-in for images that don't use setuid-based user switching. Could be a manifest field `permissions.security.no_new_privileges: true`.
 - **`--read-only` root filesystem** — for service-mode containers with explicit tmpfs for `/tmp`, `/run`. Workspace containers would opt out.
 - **Custom seccomp profiles** — per-app or per-mode profiles that restrict the syscall surface beyond Podman's default.
@@ -490,25 +473,23 @@ These are deferred from this RFC but represent the next hardening steps:
 
 | Change | Status | Location |
 |--------|--------|----------|
-| Create `piccolo-runtime` system user + linger | Pending | OS image build |
-| Resolve credential once at `AppManager` init | Pending | `internal/app/podman_runtime.go` |
-| Add `Credential` to `PodmanRuntime` | Pending | `internal/container/podman.go` |
-| Add `applyRuntimeCredential()` helper (minimal env) | Pending | `internal/container/podman.go` |
-| Apply credential in all PodmanCLI methods | Pending | `internal/container/podman.go` |
-| Refactor `ExecShellCmd` env handling | Pending | `internal/container/podman.go` |
-| Refactor `PullImageWithProgress` env handling | Pending | `internal/container/podman.go` |
-| Verify `creack/pty` SysProcAttr interaction | Pending | `internal/container/podman.go` |
-| Recursive chown of storage directories | Pending | `internal/app/podman_runtime.go` |
-| Create XDG_RUNTIME_DIR at startup | Pending | `internal/app/podman_runtime.go` |
-| Verify cgroup delegation at startup | Pending | `internal/app/podman_runtime.go` |
-| Cap-drop=ALL + cap-add in `buildCreateArgs()` | Pending | `internal/container/podman.go` |
-| Reject `privileged: true` | Pending | `internal/app/parser.go` |
-| Wire `PidsLimit`/`NofileLimit` with defaults | Pending | `internal/container/podman.go`, `internal/app/multi_container.go` |
-| Workspace fuse-overlayfs `allow_other` | Pending | `internal/app/workspacedisk/mount.go` |
-| `PodmanImageMounter` stays rootful, strip env | Pending | `internal/app/workspacedisk/manager.go` |
-| Conditional netavark repair | Pending | `internal/app/netavark_repair.go` |
-| Rootful fallback for dev mode | Pending | `internal/app/podman_runtime.go` |
-| Unit tests | Pending | `internal/container/podman_test.go` |
-| Network anchor test | Pending | `internal/app/` |
-| Integration tests | Pending | `internal/app/` |
-| Store app smoke tests | Pending | Manual |
+| Create `piccolo-runtime` system user + linger | Done | OS image build |
+| Resolve credential once at `AppManager` init | Done | `internal/app/app_manager.go` |
+| Add `Credential` to `PodmanRuntime` | Done | `internal/container/podman.go` |
+| Add `applyRuntimeCredential()` helper (minimal env) | Done | `internal/container/podman.go` |
+| Apply credential in all PodmanCLI methods | Done | `internal/container/podman.go` (`podmanCmd`) |
+| Refactor `ExecShellCmd` env handling | Done | `internal/container/podman.go` |
+| Refactor `PullImageWithProgress` env handling | Done | `internal/container/podman.go` |
+| Recursive chown of storage directories | Done | `internal/container/credential.go` (`ChownIfNeeded`) |
+| Create XDG_RUNTIME_DIR at startup | Done | `internal/container/credential.go` (`EnsureXDGRuntimeDir`) |
+| Verify cgroup delegation at startup | Done | `internal/container/credential.go` (`CheckCgroupDelegation`) |
+| Cap-drop=ALL + cap-add in `buildCreateArgs()` | Done | `internal/container/podman.go` |
+| Reject `privileged: true` | Done | `internal/app/parser.go` |
+| Wire `PidsLimit`/`NofileLimit` with defaults | Done | `internal/container/podman.go`, `internal/app/multi_container.go` |
+| Workspace fuse-overlayfs `allow_other` + `squash_to_uid` | Done | `internal/app/workspacedisk/mount.go` |
+| `PodmanImageMounter` uses `podman image inspect` (rootless) | Done | `internal/app/workspacedisk/manager.go` |
+| Remove netavark repair (rootless uses pasta) | Done | `internal/app/netavark_repair.go` deleted |
+| Per-app user provisioning | Done | `internal/container/appuser.go` |
+| Cgroup v2 delegation drop-in | Done | `internal/container/appuser.go` (`EnsureCgroupDelegation`) |
+| Unit tests | Done | `internal/container/podman_test.go`, `internal/container/credential_test.go`, `internal/container/appuser_test.go` |
+| E2E smoke tests (service + workspace) | Done | `scripts/dev-vm-test.sh` |
