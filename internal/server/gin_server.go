@@ -483,6 +483,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			}
 		}
 		mdnsMgr.SetPort(mdnsPort)
+		mdnsMgr.SetEventBus(eventsBus)
 		mdnsMgr.ObserveServiceEndpoints(eventsBus)
 	}
 

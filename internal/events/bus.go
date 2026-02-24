@@ -42,6 +42,9 @@ const (
 	TopicPCVExportPublished Topic = "pcv_export_published" // PCV archive published successfully
 	TopicPCVExportFailed    Topic = "pcv_export_failed"    // PCV archive publish failed
 
+	// Network peer events
+	TopicNetworkPeersChanged Topic = "network_peers_changed" // Emitted by mDNS when peer list changes
+
 	// Onboarding events
 	TopicOnboardingStateChanged Topic = "onboarding_state_changed" // Emitted when onboarding state changes
 )
@@ -173,6 +176,24 @@ type PCVExportPublished struct {
 // PCVExportFailed is emitted when a PCV publish fails.
 type PCVExportFailed struct {
 	Error string
+}
+
+// NetworkPeer represents a discovered peer for event payloads.
+type NetworkPeer struct {
+	Hostname  string `json:"hostname"`
+	MachineID string `json:"machine_id"`
+	IPv4      string `json:"ipv4,omitempty"`
+	IPv6      string `json:"ipv6,omitempty"`
+	Model     string `json:"model,omitempty"`
+	Version   string `json:"version,omitempty"`
+	Online    bool   `json:"online"`
+}
+
+// NetworkPeersChangedEvent is emitted when the network peer list changes.
+// Contains a full snapshot of all known peers.
+type NetworkPeersChangedEvent struct {
+	Peers     []NetworkPeer `json:"peers"`
+	Timestamp time.Time     `json:"timestamp"`
 }
 
 // OnboardingStateChangedEvent is emitted when the onboarding state transitions.

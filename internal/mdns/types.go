@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"piccolod/internal/events"
 )
 
 // failedSetupInfo tracks retry state for interfaces that failed setup.
@@ -147,6 +149,9 @@ type Manager struct {
 	announceDebounceMu    sync.Mutex
 	announceDebounceTimer *time.Timer
 	announcePending       bool
+
+	// Event bus for publishing peer changes
+	eventBus *events.Bus
 
 	// Failed interface setup tracking (prevents log spam from repeated failures)
 	failedSetups map[string]*failedSetupInfo
