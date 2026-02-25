@@ -543,6 +543,13 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
       _unsubscribe();
       client.addListener(_onClientStateChanged);
       _subscription = client.networkPeersEvents.listen(_handlePeersEvent);
+      // Hydrate from cached snapshot — the initial snapshot may have arrived
+      // on the broadcast stream before this widget mounted.
+      final cached = client.lastNetworkPeersEvent;
+      if (cached != null && cached.peers.isNotEmpty) {
+        _peers = cached.peers;
+        if (mounted) setState(() {});
+      }
     }
   }
 

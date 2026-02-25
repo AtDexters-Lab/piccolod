@@ -47,6 +47,12 @@ class EventStreamClient extends ChangeNotifier {
 
   bool _isDisposed = false;
 
+  /// Last received network peers event, cached for late subscribers.
+  /// Broadcast streams drop events when no one is listening; widgets that
+  /// mount after the initial snapshot can read this to hydrate immediately.
+  NetworkPeersEvent? _lastNetworkPeersEvent;
+  NetworkPeersEvent? get lastNetworkPeersEvent => _lastNetworkPeersEvent;
+
   /// Stream of app status change events.
   Stream<AppStatusEvent> get appStatusEvents => _appStatusController.stream;
 
@@ -95,6 +101,7 @@ class EventStreamClient extends ChangeNotifier {
         _connection.state == WebSocketConnectionState.error) {
       unawaited(_subscription?.cancel());
       _subscription = null;
+      _lastNetworkPeersEvent = null;
     }
 
     // Detect auth failures on reconnect (WebSocket upgrade rejected with 401).
@@ -156,7 +163,9 @@ class EventStreamClient extends ChangeNotifier {
         case 'certificate':
           _certificateController.add(payload);
         case 'network_peers':
-          _networkPeersController.add(NetworkPeersEvent.fromJson(payload));
+          final event = NetworkPeersEvent.fromJson(payload);
+          _lastNetworkPeersEvent = event;
+          _networkPeersController.add(event);
       }
     } on Object catch (e) {
       debugPrint('Event stream decode error: $e');
@@ -166,6 +175,7 @@ class EventStreamClient extends ChangeNotifier {
   @override
   void dispose() {
     _isDisposed = true;
+    _lastNetworkPeersEvent = null;
     unawaited(_subscription?.cancel());
     _subscription = null;
     _connection
