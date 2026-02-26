@@ -65,11 +65,6 @@ func (m *PoolManager) OnRecoveryMnemonicRotated(ctx context.Context, device stri
 		return fmt.Errorf("read LUKS UUID: %w", err)
 	}
 
-	params, err := ReadKDFParams(deviceUUID)
-	if err != nil {
-		return fmt.Errorf("read KDF params for %s: %w", deviceUUID, err)
-	}
-
 	progressPath := paths.CoreJoin("crypto", "mnemonic-rotation-progress.json")
 	progress := &RotationProgress{
 		StartedAt: time.Now().UTC(),
@@ -80,12 +75,8 @@ func (m *PoolManager) OnRecoveryMnemonicRotated(ctx context.Context, device stri
 		return fmt.Errorf("write mnemonic rotation progress: %w", err)
 	}
 
-	oldPassphrase := DeriveMnemonicRecoveryPassphrase(oldMnemonicKey, params)
-	newPassphrase := DeriveMnemonicRecoveryPassphrase(newMnemonicKey, params)
-	defer SecureZero(oldPassphrase)
-	defer SecureZero(newPassphrase)
-
-	if err := m.changeLUKSKeyslot(ctx, device, SlotRecoveryMnemonic, oldPassphrase, newPassphrase); err != nil {
+	// Mnemonic keys are already high-entropy — use directly as LUKS passphrases (no KDF).
+	if err := m.changeLUKSKeyslot(ctx, device, SlotRecoveryMnemonic, oldMnemonicKey, newMnemonicKey); err != nil {
 		return fmt.Errorf("rotate keyslot %d: %w", SlotRecoveryMnemonic, err)
 	}
 
@@ -179,16 +170,9 @@ func (m *PoolManager) ResumeMnemonicRotationIfNeeded(ctx context.Context, device
 		return nil
 	}
 
-	params, err := ReadKDFParams(deviceUUID)
-	if err != nil {
-		return fmt.Errorf("read KDF params: %w", err)
-	}
-
-	newPassphrase := DeriveMnemonicRecoveryPassphrase(mnemonicKey, params)
-	defer SecureZero(newPassphrase)
-
+	// Mnemonic key is already high-entropy — use directly as LUKS passphrase (no KDF).
 	log.Printf("WARN: re-creating keyslot %d via pool keyfile", SlotRecoveryMnemonic)
-	if err := m.rekeySlotViaPoolKeyfile(ctx, device, SlotRecoveryMnemonic, newPassphrase); err != nil {
+	if err := m.rekeySlotViaPoolKeyfile(ctx, device, SlotRecoveryMnemonic, mnemonicKey); err != nil {
 		return fmt.Errorf("rekey keyslot %d: %w", SlotRecoveryMnemonic, err)
 	}
 

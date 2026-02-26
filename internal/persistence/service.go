@@ -118,11 +118,8 @@ func NewService(opts Options) (*Module, error) {
 		}
 		mod.volumes = newFileVolumeManager(mod.stateDir, dataDir, mod.crypto, mod.events)
 	}
-	if fm, ok := mod.volumes.(*fileVolumeManager); ok {
-		if fm.bus == nil {
-			fm.bus = mod.events
-		}
-		fm.setRoleChecker(func(volumeID string, role VolumeRole) bool {
+	if rc, ok := mod.volumes.(RoleCheckable); ok {
+		rc.SetRoleChecker(func(volumeID string, role VolumeRole) bool {
 			if role != VolumeRoleLeader {
 				return true
 			}
@@ -134,6 +131,12 @@ func NewService(opts Options) (*Module, error) {
 			}
 			return true
 		})
+	}
+	// Wire event bus for legacy file volume manager.
+	if fm, ok := mod.volumes.(*fileVolumeManager); ok {
+		if fm.bus == nil {
+			fm.bus = mod.events
+		}
 	}
 	if mod.devices == nil {
 		mod.devices = newNoopDeviceManager()
@@ -168,8 +171,8 @@ func (m *Module) ensureCoreVolumes(ctx context.Context) error {
 	if m.volumes == nil {
 		return nil
 	}
-	if fm, ok := m.volumes.(*fileVolumeManager); ok {
-		if err := fm.reconcileAllVolumeStates(); err != nil {
+	if r, ok := m.volumes.(Reconcilable); ok {
+		if err := r.ReconcileAllVolumeStates(); err != nil {
 			return err
 		}
 	}
@@ -367,29 +370,21 @@ func (m *Module) detachVolumeIfMounted(ctx context.Context, handle VolumeHandle)
 	if m.volumes == nil || handle.ID == "" || handle.MountDir == "" {
 		return nil
 	}
-	marker := filepath.Join(handle.MountDir, ".cipher")
 	mounted, err := isMountPoint(handle.MountDir)
 	if err != nil {
 		return err
 	}
 	if !mounted {
-		// The mount disappeared (e.g., after an unclean shutdown) but our
-		// sentinel files remain. Best-effort cleanup so subsequent lock attempts
+		// The mount disappeared (e.g., after an unclean shutdown).
+		// Best-effort cleanup of stale markers so subsequent lock attempts
 		// do not mis-detect a mounted volume.
-		if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		modeMarker := filepath.Join(handle.MountDir, ".mode")
-		if err := os.Remove(modeMarker); err != nil && !os.IsNotExist(err) {
-			return err
+		for _, name := range []string{".cipher", ".mode"} {
+			p := filepath.Join(handle.MountDir, name)
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 		return nil
-	}
-	if _, err := os.Stat(marker); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
 	}
 	return m.volumes.Detach(ctx, handle)
 }

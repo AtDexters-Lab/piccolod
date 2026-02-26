@@ -3,8 +3,6 @@ package persistence
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -242,6 +240,16 @@ func newFileVolumeManagerWithDeps(coreRoot, dataRoot string, crypto *crypt.Manag
 		mgr.waitMount = waiter
 	}
 	return mgr
+}
+
+// SetRoleChecker implements the RoleCheckable interface.
+func (f *fileVolumeManager) SetRoleChecker(fn func(string, VolumeRole) bool) {
+	f.setRoleChecker(fn)
+}
+
+// ReconcileAllVolumeStates implements the Reconcilable interface.
+func (f *fileVolumeManager) ReconcileAllVolumeStates() error {
+	return f.reconcileAllVolumeStates()
 }
 
 func (f *fileVolumeManager) setRoleChecker(fn func(string, VolumeRole) bool) {
@@ -1187,21 +1195,12 @@ func (f *fileVolumeManager) sealVolumeKey(ctx context.Context, passphrase []byte
 	}
 	meta := volumeMetadata{Version: metadataVersion}
 	err := f.crypto.WithSDEK(func(sdek []byte) error {
-		block, err := aes.NewCipher(sdek)
+		wrapped, nonce, err := crypt.SealVolumeKey(sdek, passphrase)
 		if err != nil {
 			return err
 		}
-		aead, err := cipher.NewGCM(block)
-		if err != nil {
-			return err
-		}
-		nonce := make([]byte, aead.NonceSize())
-		if _, err := rand.Read(nonce); err != nil {
-			return err
-		}
-		sealed := aead.Seal(nil, nonce, passphrase, nil)
-		meta.WrappedKey = base64.StdEncoding.EncodeToString(sealed)
-		meta.Nonce = base64.StdEncoding.EncodeToString(nonce)
+		meta.WrappedKey = wrapped
+		meta.Nonce = nonce
 		return nil
 	})
 	if err != nil {
@@ -1216,31 +1215,13 @@ func (f *fileVolumeManager) unwrapVolumeKey(ctx context.Context, meta volumeMeta
 	}
 	var passphrase []byte
 	err := f.crypto.WithSDEK(func(sdek []byte) error {
-		block, err := aes.NewCipher(sdek)
+		key, err := crypt.UnwrapVolumeKey(sdek, meta.WrappedKey, meta.Nonce)
 		if err != nil {
+			// Translate crypt-level error to persistence-level sentinel.
+			if errors.Is(err, crypt.ErrKeyDataCorrupted) {
+				return fmt.Errorf("%w: %v", ErrVolumeMetadataCorrupted, err)
+			}
 			return err
-		}
-		aead, err := cipher.NewGCM(block)
-		if err != nil {
-			return err
-		}
-		nonce, err := base64.StdEncoding.DecodeString(meta.Nonce)
-		if err != nil {
-			return fmt.Errorf("%w: decode nonce: %v", ErrVolumeMetadataCorrupted, err)
-		}
-		if len(nonce) != aead.NonceSize() {
-			return fmt.Errorf("%w: invalid nonce length %d (expected %d)", ErrVolumeMetadataCorrupted, len(nonce), aead.NonceSize())
-		}
-		sealed, err := base64.StdEncoding.DecodeString(meta.WrappedKey)
-		if err != nil {
-			return fmt.Errorf("%w: decode wrapped key: %v", ErrVolumeMetadataCorrupted, err)
-		}
-		if len(sealed) == 0 {
-			return fmt.Errorf("%w: empty wrapped key", ErrVolumeMetadataCorrupted)
-		}
-		key, err := aead.Open(nil, nonce, sealed, nil)
-		if err != nil {
-			return fmt.Errorf("%w: unwrap failed: %v", ErrVolumeMetadataCorrupted, err)
 		}
 		passphrase = key
 		return nil

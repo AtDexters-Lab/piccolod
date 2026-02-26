@@ -34,9 +34,6 @@ func TestNewLUKSKDFParams(t *testing.T) {
 	if len(params.SaltAdmin) != 32 {
 		t.Errorf("SaltAdmin length = %d, want 32", len(params.SaltAdmin))
 	}
-	if len(params.SaltMnemonic) != 32 {
-		t.Errorf("SaltMnemonic length = %d, want 32", len(params.SaltMnemonic))
-	}
 }
 
 func TestNewLUKSKDFParams_UniqueSalts(t *testing.T) {
@@ -82,21 +79,6 @@ func TestDeriveRecoveryPassphrase_DifferentPasswords(t *testing.T) {
 
 	if string(p1) == string(p2) {
 		t.Error("different passwords should produce different outputs")
-	}
-}
-
-func TestDeriveMnemonicRecoveryPassphrase(t *testing.T) {
-	params := &LUKSKDFParams{
-		Argon2Time:    1,
-		Argon2Memory:  64 * 1024,
-		Argon2Threads: 1,
-		KeyLength:     32,
-		SaltMnemonic:  make([]byte, 32),
-	}
-
-	p1 := DeriveMnemonicRecoveryPassphrase([]byte("mnemonic-key"), params)
-	if len(p1) != 32 {
-		t.Errorf("passphrase length = %d, want 32", len(p1))
 	}
 }
 

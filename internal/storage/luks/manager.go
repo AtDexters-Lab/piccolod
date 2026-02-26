@@ -95,9 +95,8 @@ func (m *PoolManager) InitializeLUKS(ctx context.Context, device, adminPassword 
 	// Step 7: Add mnemonic recovery keyslot (slot 2), if key available.
 	// Key may be nil during initial setup; slot is added when recovery key is generated.
 	if mnemonicKey != nil {
-		mnemonicPassphrase := DeriveMnemonicRecoveryPassphrase(mnemonicKey, params)
-		defer SecureZero(mnemonicPassphrase)
-		if err := m.addKeyslot(ctx, device, tmpfsKeyfilePath, mnemonicPassphrase, SlotRecoveryMnemonic); err != nil {
+		// Mnemonic key is already high-entropy — use directly as LUKS passphrase (no KDF).
+		if err := m.addKeyslot(ctx, device, tmpfsKeyfilePath, mnemonicKey, SlotRecoveryMnemonic); err != nil {
 			return fmt.Errorf("add mnemonic keyslot: %w", err)
 		}
 	}

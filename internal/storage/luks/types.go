@@ -46,7 +46,6 @@ type LUKSKDFParams struct {
 	Argon2Threads uint8  `json:"argon2_threads"`
 	KeyLength     uint32 `json:"key_length"`      // bytes
 	SaltAdmin     []byte `json:"salt_admin"`      // 32 bytes
-	SaltMnemonic  []byte `json:"salt_mnemonic"`   // 32 bytes
 	CreatedAt     string `json:"created_at"`
 }
 
@@ -55,10 +54,6 @@ func NewLUKSKDFParams(deviceUUID string) (*LUKSKDFParams, error) {
 	saltAdmin := make([]byte, 32)
 	if _, err := rand.Read(saltAdmin); err != nil {
 		return nil, fmt.Errorf("generate admin salt: %w", err)
-	}
-	saltMnemonic := make([]byte, 32)
-	if _, err := rand.Read(saltMnemonic); err != nil {
-		return nil, fmt.Errorf("generate mnemonic salt: %w", err)
 	}
 
 	threads := runtime.NumCPU() - 1
@@ -77,7 +72,6 @@ func NewLUKSKDFParams(deviceUUID string) (*LUKSKDFParams, error) {
 		Argon2Threads: uint8(threads),
 		KeyLength:     32,
 		SaltAdmin:     saltAdmin,
-		SaltMnemonic:  saltMnemonic,
 		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }
@@ -87,19 +81,6 @@ func DeriveRecoveryPassphrase(adminPassword string, params *LUKSKDFParams) []byt
 	return argon2.IDKey(
 		[]byte(adminPassword),
 		params.SaltAdmin,
-		params.Argon2Time,
-		params.Argon2Memory,
-		params.Argon2Threads,
-		params.KeyLength,
-	)
-}
-
-// DeriveMnemonicRecoveryPassphrase derives the LUKS keyslot 2 passphrase from
-// a mnemonic-derived key.
-func DeriveMnemonicRecoveryPassphrase(mnemonicKey []byte, params *LUKSKDFParams) []byte {
-	return argon2.IDKey(
-		mnemonicKey,
-		params.SaltMnemonic,
 		params.Argon2Time,
 		params.Argon2Memory,
 		params.Argon2Threads,
