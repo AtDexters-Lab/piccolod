@@ -181,7 +181,7 @@ func (s *GinServer) handleNetworkCheck(c *gin.Context) {
 
 // handleStorageCheck: GET /api/v1/system/storage-check
 // Runs a quick podman command to test if storage initialization works for the
-// image runtime. This helps diagnose fuse-overlayfs / overlay driver issues.
+// image runtime. This helps diagnose overlay driver issues.
 func (s *GinServer) handleStorageCheck(c *gin.Context) {
 	if s.appManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "app manager not ready"})

@@ -563,7 +563,7 @@ func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime
 		return "", fmt.Errorf("build container spec for service '%s': %w", opts.svcName, err)
 	}
 	// Per-app runtimes must never pull: images are pre-pulled to the shared
-	// imagestore and the per-app FUSE storage can't do rootless layer extraction.
+	// imagestore and per-app users lack write access to it.
 	if spec.Image != "" {
 		spec.PullPolicy = "never"
 	}

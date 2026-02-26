@@ -69,20 +69,14 @@ func (o InitOptions) Validate() error {
 }
 
 // MountOptions configures the overlay mount.
+//
+// NOTE: UID/GID mapping fields are populated by buildWorkspaceMountOpts but
+// not applied at the kernel overlay mount level. The container's user namespace
+// handles UID translation instead.
 type MountOptions struct {
-	// SquashUID, when >= 0, sets fuse-overlayfs squash_to_uid so all files in
-	// the overlay appear owned by this UID. Only used as fallback when
-	// UIDMapping is empty.
 	SquashUID int
 	SquashGID int
 
-	// UIDMapping/GIDMapping configure fuse-overlayfs uidmapping/gidmapping for
-	// proper rootless user namespace support. Format: "disk_uid:overlay_uid:count"
-	// entries separated by colons (fuse-overlayfs convention).
-	// Example: "0:469:1:470:469:1:100000:200000:65536" maps host root (disk 0)
-	// and image runtime UID (disk 470) to per-app user (overlay 469), and
-	// runtime subuids (disk 100000+) to per-app subuids (overlay 200000+).
-	// When set, takes precedence over SquashUID/SquashGID.
 	UIDMapping string
 	GIDMapping string
 }
@@ -378,8 +372,8 @@ func (m *DefaultManager) GetLayout(instanceID string) (Layout, error) {
 //
 // Instead of "podman image mount" (which requires "podman unshare" in rootless mode),
 // this uses "podman image inspect" to read the overlay layer diff paths directly from
-// c/storage. These paths can be passed as multiple lowerdirs to fuse-overlayfs, giving
-// the same merged rootfs view without needing a user namespace.
+// c/storage. These paths can be passed as multiple lowerdirs to kernel overlayfs,
+// giving the same merged rootfs view without needing a user namespace.
 type PodmanImageMounter struct {
 	// credential for rootless execution (nil = run as current user)
 	credential *syscall.Credential
@@ -411,7 +405,7 @@ func (p *PodmanImageMounter) applyCredential(cmd *exec.Cmd) {
 
 // MountImage implements BaseImageMounter.
 // Returns colon-separated overlay layer diff paths (top layer first) suitable for
-// use as fuse-overlayfs lowerdir. No actual mount is created.
+// use as overlayfs lowerdir. No actual mount is created.
 func (p *PodmanImageMounter) MountImage(ctx context.Context, imageRef string, args []string) (string, error) {
 	return p.resolveImageLayers(ctx, imageRef, args)
 }
@@ -431,7 +425,7 @@ func (p *PodmanImageMounter) ImageRootfs(ctx context.Context, imageRef string, a
 
 // resolveImageLayers uses "podman image inspect" to get the overlay layer paths
 // for an image. Returns colon-separated diff paths (top layer first) that can
-// be used directly as fuse-overlayfs lowerdir.
+// be used directly as overlayfs lowerdir.
 //
 // This avoids "podman image mount" which requires "podman unshare" in rootless
 // mode — a requirement incompatible with our SysProcAttr.Credential approach

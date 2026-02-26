@@ -12,9 +12,9 @@ import (
 )
 
 // buildWorkspaceMountOpts creates MountOptions for the workspace overlay.
-// For rootless per-app users, it configures fuse-overlayfs uidmapping/gidmapping
-// to remap the image layer UIDs (stored by piccolo-runtime) to the per-app user's
-// UID space. This makes the overlay match the container's user namespace mapping.
+// Populates UID/GID mapping fields for per-app user isolation. With kernel
+// overlay, these mappings are not applied at the mount level — the container's
+// user namespace handles UID translation instead.
 //
 // The mapping has three entries:
 //  1. Host root (UID 0) → per-app user: for files created by piccolod in the upper layer
@@ -351,8 +351,7 @@ func (m *AppManager) prepareServiceStorage(
 	if mode != ModeWorkspace {
 		// Service mode: pull the image using the shared image runtime (piccolo-runtime).
 		// Per-app users have group-read-only access to the imagestore — pulls must use
-		// the shared runtime which has write access. This is mandatory because per-app
-		// runtimes use --pull=never (FUSE storage can't do rootless layer extraction).
+		// the shared runtime which has write access.
 		if svc.Image != "" {
 			callback := m.makeImagePullProgressCallback(ctx, instanceID, svcName, svc.Image, progressRange)
 			if err := m.pullToImagestore(ctx, svc.Image, callback); err != nil {

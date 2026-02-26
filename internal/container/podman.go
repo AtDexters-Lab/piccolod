@@ -96,34 +96,6 @@ func (rt PodmanRuntime) Validate() error {
 	return nil
 }
 
-// FuseOverlayfsWrapperPath is the path to the wrapper script that strips
-// SELinux context= from overlay mount options before calling fuse-overlayfs.
-const FuseOverlayfsWrapperPath = "/run/piccolo/podman/fuse-overlayfs-wrapper.sh"
-
-// EnsureFuseOverlayfsWrapper creates a wrapper script for fuse-overlayfs that
-// strips SELinux context= mount options. Podman passes SELinux labels
-// (context="...") as overlay mount data, but fuse-overlayfs doesn't understand
-// them and the commas inside the label value (e.g., s0:c337,c527) break its
-// option parser. The parent directory must already exist.
-func EnsureFuseOverlayfsWrapper() error {
-	const content = `#!/bin/sh
-# Strip SELinux context= from overlay mount options for fuse-overlayfs.
-# Podman passes context="system_u:object_r:container_file_t:s0:cXXX,cYYY" as
-# mount data; the commas inside the label break fuse-overlayfs option parsing.
-opts=$(printf '%s' "$2" | sed 's/,context="[^"]*"//g;s/context="[^"]*",//g;s/context="[^"]*"//g')
-exec /usr/bin/fuse-overlayfs "$1" "$opts" "$3"
-`
-	existing, err := os.ReadFile(FuseOverlayfsWrapperPath)
-	if err == nil && string(existing) == content {
-		return nil
-	}
-	if err := os.WriteFile(FuseOverlayfsWrapperPath, []byte(content), 0o755); err != nil {
-		return fmt.Errorf("write fuse-overlayfs wrapper: %w", err)
-	}
-	log.Printf("INFO: created fuse-overlayfs wrapper at %s", FuseOverlayfsWrapperPath)
-	return nil
-}
-
 // ensureAdditionalStoresConf generates a storage.conf in podmanRoot that
 // configures ALL storage settings: graphroot, runroot, driver, driver options,
 // and additionalimagestores for read-only image access.
@@ -144,14 +116,6 @@ func ensureAdditionalStoresConf(rt PodmanRuntime) (string, error) {
 	}
 	content := fmt.Sprintf("[storage]\ndriver = %q\ngraphroot = %q\nrunroot = %q\n\n[storage.options]\nadditionalimagestores = [%s]\n",
 		rt.StorageDriver, rt.Root, rt.RunRoot, strings.Join(quoted, ", "))
-
-	// For overlay driver, configure fuse-overlayfs as the mount program.
-	// Per-app graphroots reside on gocryptfs (FUSE). Kernel overlay cannot
-	// mount on FUSE from within a user namespace (EACCES), but fuse-overlayfs
-	// handles this correctly as a userspace overlay implementation.
-	if rt.StorageDriver == "overlay" {
-		content += fmt.Sprintf("\n[storage.options.overlay]\nmount_program = %q\n", FuseOverlayfsWrapperPath)
-	}
 
 	// Only write if content changed.
 	existing, err := os.ReadFile(confPath)
@@ -494,8 +458,7 @@ type ContainerCreateSpec struct {
 
 	// PullPolicy controls image pulling during create: "always", "missing", "never".
 	// Per-app runtimes use "never" because images must be pre-pulled to the shared
-	// imagestore — per-app storage resides on a gocryptfs FUSE mount where rootless
-	// layer extraction (pivot_root inside user namespaces) is not supported.
+	// imagestore — per-app users have read-only access and cannot write new layers.
 	PullPolicy string
 
 	// ExtraHosts adds entries to /etc/hosts (format: "hostname:IP").
@@ -545,9 +508,9 @@ type ResourceLimits struct {
 func buildCreateArgs(spec ContainerCreateSpec) []string {
 	args := []string{"create"}
 
-	// Pull policy: per-app runtimes set "never" to avoid rootless layer extraction
-	// on FUSE-backed storage (gocryptfs). Images must be pre-pulled to the shared
-	// imagestore by the image runtime (piccolo-runtime user).
+	// Pull policy: per-app runtimes set "never" because they lack write access
+	// to the shared imagestore. Images must be pre-pulled by the image runtime
+	// (piccolo-runtime user).
 	if spec.PullPolicy != "" {
 		args = append(args, "--pull", spec.PullPolicy)
 	}

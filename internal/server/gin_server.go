@@ -549,6 +549,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.supervisor.Register(s.terminalManager)
 
 	s.supervisor.Register(supervisor.NewComponent("app-manager", func(ctx context.Context) error {
+		if err := container.RequireNativeOverlay(); err != nil {
+			return fmt.Errorf("native overlay check: %w", err)
+		}
 		s.appManager.StartBackground()
 		return nil
 	}, func(ctx context.Context) error {
@@ -921,7 +924,7 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	log.Printf("INFO: Phase 2/3: DRAIN complete")
 
 	// ── Phase 3: CLEANUP ────────────────────────────────────────────────
-	// Stop supervisor components (mDNS goodbye, services) and unmount gocryptfs.
+	// Stop supervisor components (mDNS goodbye, services) and unmount volumes.
 	log.Printf("INFO: Phase 3/3: CLEANUP — supervisor stop and volume unmount")
 	if err := s.supervisor.Stop(ctx); err != nil {
 		log.Printf("WARN: Failed to stop components cleanly: %v", err)

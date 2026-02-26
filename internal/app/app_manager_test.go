@@ -1612,7 +1612,7 @@ func TestUninstall_ImagePruning(t *testing.T) {
 		}
 		allowHostStorage(t, mgr)
 		mgr.ForceLockState(false)
-		// Inject a test image runtime so tests don't need fuse-overlayfs
+		// Inject a test image runtime for unit tests
 		mgr.SetImageRuntimeForTest(container.PodmanRuntime{
 			Root:          filepath.Join(tempDir, "podman", "imagestore"),
 			RunRoot:       filepath.Join(tempDir, "run", "podman", "imagestore"),
@@ -1766,7 +1766,6 @@ func TestPodmanImageRuntime(t *testing.T) {
 		Root:          expectedRoot,
 		RunRoot:       filepath.Join(tempDir, "run", "podman", "imagestore"),
 		StorageDriver: "overlay",
-		StorageOpts:   []string{"mount_program=/usr/bin/fuse-overlayfs"},
 	})
 
 	rt, err := mgr.podmanImageRuntime()

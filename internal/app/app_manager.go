@@ -277,8 +277,7 @@ func (m *AppManager) SetMountVerifier(fn func(string) error) {
 	m.stateInitMu.Unlock()
 }
 
-// SetImageRuntimeForTest overrides the shared image runtime. Intended for tests
-// where fuse-overlayfs is not available.
+// SetImageRuntimeForTest overrides the shared image runtime. Intended for tests.
 func (m *AppManager) SetImageRuntimeForTest(rt container.PodmanRuntime) {
 	m.imageRuntimeOnce.Do(func() {}) // exhaust the Once
 	m.imageRuntimeVal = rt
@@ -573,10 +572,9 @@ func (m *AppManager) StartBackground() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		// Flush stale FUSE mounts left by fuse-overlayfs daemons killed during
-		// previous service shutdown (systemd cgroup cleanup). Must run before
-		// reconcile to prevent workspace disk mount failures.
-		cleanupStaleFUSEMounts(ctx)
+		// Clean up stale overlay mounts left from previous service session.
+		// Must run before reconcile to prevent mount-on-mount failures.
+		cleanupStaleOverlayMounts()
 
 		m.ReconcileOnce(ctx)
 		for {
@@ -613,7 +611,7 @@ func (m *AppManager) StopBackground() {
 
 // StopAllApps stops all running applications and detaches their volumes.
 // This is called during graceful shutdown to ensure containers are stopped
-// before FUSE mounts are unmounted. Apps are stopped in parallel for efficiency.
+// before volumes are unmounted. Apps are stopped in parallel for efficiency.
 func (m *AppManager) StopAllApps(ctx context.Context) error {
 	log.Printf("INFO: Stopping all running apps for graceful shutdown...")
 
@@ -2079,7 +2077,7 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 		return fmt.Errorf("backup app.yaml: %w", err)
 	}
 	// Pull image using shared image runtime (per-app users have read-only imagestore access).
-	// Mandatory: per-app runtimes use --pull=never (FUSE storage can't extract layers).
+	// Mandatory: per-app runtimes use --pull=never since they lack write access to the imagestore.
 	if err := m.pullToImagestore(ctx, newImage, nil); err != nil {
 		return fmt.Errorf("pull image %s: %w", newImage, err)
 	}
@@ -2417,7 +2415,7 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
 	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
 	// Pull using shared image runtime (per-app users have read-only imagestore access).
-	// Mandatory: per-app runtimes use --pull=never (FUSE storage can't extract layers).
+	// Mandatory: per-app runtimes use --pull=never since they lack write access to the imagestore.
 	if prevImage := imageFromDefinition(prevDef); strings.TrimSpace(prevImage) != "" {
 		if err := m.pullToImagestore(ctx, prevImage, nil); err != nil {
 			return fmt.Errorf("pull image %s: %w", prevImage, err)
@@ -2626,7 +2624,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	spec := container.ContainerCreateSpec{
 		Name:        instanceID,
 		Image:       def.Image,
-		PullPolicy:  "never", // Images are pre-pulled to shared imagestore; per-app FUSE storage can't extract layers.
+		PullPolicy:  "never", // Images are pre-pulled to shared imagestore; per-app users lack write access.
 		Environment: def.Environment,
 		Labels:      piccoloLabels(instanceID, labelService, "service"),
 	}

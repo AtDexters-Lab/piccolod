@@ -166,8 +166,8 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 
 	// Pull network anchor image using shared image runtime (piccolo-runtime has
 	// write access to the imagestore; per-app users have read-only group access).
-	// This pre-pull is mandatory: per-app runtimes use --pull=never because their
-	// storage is on gocryptfs (FUSE) where rootless layer extraction fails.
+	// This pre-pull is mandatory: per-app runtimes use --pull=never since they
+	// lack write access to the shared imagestore.
 	if err := m.pullToImagestore(ctx, networkAnchorImage(), nil); err != nil {
 		return nil, fmt.Errorf("network anchor image pull failed: %w", err)
 	}
@@ -191,7 +191,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	anchorSpec := container.ContainerCreateSpec{
 		Name:          networkAnchorContainerName(instanceID),
 		Image:         networkAnchorImage(),
-		PullPolicy:    "never", // Pre-pulled above; per-app FUSE storage can't extract layers.
+		PullPolicy:    "never", // Pre-pulled above; per-app users lack write access to imagestore.
 		NetworkMode:   appNetworkMode(appDef),
 		RestartPolicy: appRestartPolicy(appDef),
 		Labels:        piccoloLabels(instanceID, networkAnchorServiceName, "network_anchor"),
@@ -285,7 +285,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			return nil, err
 		}
 		// Per-app runtimes must never pull: images are pre-pulled to the shared
-		// imagestore and the per-app FUSE storage can't do rootless layer extraction.
+		// imagestore and per-app users lack write access to it.
 		if spec.Image != "" {
 			spec.PullPolicy = "never"
 		}

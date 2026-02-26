@@ -34,15 +34,12 @@ func imagestorePath() string {
 	return paths.PodmanJoin("imagestore")
 }
 
-// ensurePodmanPreamble creates the podman runroot base (world-traversable),
-// ensures the fuse-overlayfs wrapper, and creates a private runroot subdir.
+// ensurePodmanPreamble creates the podman runroot base (world-traversable)
+// and creates a private runroot subdir.
 // Used by both podmanRuntimeForApp and podmanImageRuntime.
 func ensurePodmanPreamble(name string) (string, error) {
 	if err := ensureDir(podmanRunRootBase(), modeReadableDir); err != nil {
 		return "", fmt.Errorf("ensure podman runroot base: %w", err)
-	}
-	if err := container.EnsureFuseOverlayfsWrapper(); err != nil {
-		return "", fmt.Errorf("ensure fuse-overlayfs wrapper: %w", err)
 	}
 	runRoot := filepath.Join(podmanRunRootBase(), name)
 	if err := ensureDir(runRoot, modePrivate); err != nil {
@@ -190,7 +187,7 @@ func (m *AppManager) ensureServiceRoot(instanceID string, cred *syscall.Credenti
 // podmanRuntimeForApp returns a runtime configured for a specific app instance.
 // Each app instance has an isolated podman Root (container metadata, RW layers) within
 // its encrypted volume, while images are stored in the shared imagestore for deduplication.
-// Both service and workspace modes use overlay driver with fuse-overlayfs.
+// Both service and workspace modes use the kernel overlay driver.
 func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayout, mode PiccoloMode) (container.PodmanRuntime, error) {
 	volID := layout.VolumeID
 	if volID == "" {
@@ -229,10 +226,7 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 	cleanStaleDriverStorage(layout.PodmanRoot, staleDriverPrefix)
 	cleanStaleDriverStorage(runRoot, staleDriverPrefix)
 
-	// Both service and workspace modes use overlay driver with fuse-overlayfs.
-	// The per-app graphroot (serviceRoot) lives on the LUKS btrfs volume — NOT
-	// the gocryptfs FUSE mount — because fuse-overlayfs cannot reliably access
-	// workdir paths inside another FUSE mount from a user namespace.
+	// Both service and workspace modes use the kernel overlay driver.
 	// For workspace mode, --rootfs bypasses Podman storage; the overlay driver
 	// here is only for the network anchor and reading the shared imagestore
 	// (whose overlay metadata would be invisible to a VFS primary driver).
@@ -320,11 +314,10 @@ func cleanStaleUIDStorage(dir string, expectedUID int) {
 // podmanImageRuntime returns a shared PodmanRuntime for base image operations across
 // all app types (pull, inspect, exists, mount, unmount, remove).
 //
-// Uses overlay driver with fuse-overlayfs, matching the per-app service-mode
-// runtimes. additionalimagestores requires the same storage driver across all
-// stores. Kernel overlay's metacopy probe fails in user namespaces even on
-// btrfs, so fuse-overlayfs is used via --storage-opt. Overlay provides layer
-// deduplication — 10 apps using the same base image store only 1 copy.
+// Uses the kernel overlay driver, matching the per-app service-mode runtimes.
+// additionalimagestores requires the same storage driver across all stores.
+// Overlay provides layer deduplication — 10 apps using the same base image
+// store only 1 copy.
 //
 // The shared imagestore directory IS the graphRoot (--root) of this runtime.
 // This creates a self-contained containers/storage store that per-app runtimes
@@ -355,9 +348,6 @@ func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
 			Root:          imagestore,
 			RunRoot:       runRoot,
 			StorageDriver: "overlay",
-			// Kernel overlay fails the metacopy probe mount in user namespaces
-			// even on btrfs. Use fuse-overlayfs (via wrapper) for the image runtime too.
-			StorageOpts: []string{"overlay.mount_program=" + container.FuseOverlayfsWrapperPath},
 		}
 
 		if m.runtimeUser != nil {

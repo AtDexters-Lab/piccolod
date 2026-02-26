@@ -885,11 +885,8 @@ func TestEnsureAdditionalStoresConf(t *testing.T) {
 	if !strings.Contains(got, `additionalimagestores = ["/data/imagestore"]`) {
 		t.Errorf("missing additionalimagestores in conf:\n%s", got)
 	}
-	if !strings.Contains(got, `[storage.options.overlay]`) {
-		t.Errorf("missing [storage.options.overlay] section in conf:\n%s", got)
-	}
-	if !strings.Contains(got, fmt.Sprintf(`mount_program = %q`, FuseOverlayfsWrapperPath)) {
-		t.Errorf("missing mount_program in conf:\n%s", got)
+	if strings.Contains(got, "mount_program") {
+		t.Errorf("conf should not contain mount_program (native overlay only):\n%s", got)
 	}
 
 	// Idempotent: calling again should not error.
