@@ -200,7 +200,7 @@ func newFileVolumeManager(coreRoot, dataRoot string, crypto *crypt.Manager, bus 
 		coreRoot = paths.CoreRoot()
 	}
 	if dataRoot == "" {
-		dataRoot = paths.DataRoot()
+		dataRoot = paths.CoreRoot()
 	}
 	bypass := os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") == "1"
 	waiter := waitForMountReady

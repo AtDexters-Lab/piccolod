@@ -10,22 +10,23 @@ import (
 
 const (
 	defaultCoreRoot = "/piccolo-core"
-	defaultDataRoot = "/piccolo-data"
 )
 
 var (
-	coreRoot string
-	dataRoot string
-	once     sync.Once
+	coreRoot   string
+	podmanRoot string
+	once       = &sync.Once{}
 )
 
 func resolveRoots() {
 	if v := os.Getenv("PICCOLO_STATE_DIR"); v != "" {
-		fmt.Fprintf(os.Stderr, "FATAL: PICCOLO_STATE_DIR is no longer supported; use PICCOLO_CORE_ROOT / PICCOLO_DATA_ROOT.\n")
+		fmt.Fprintf(os.Stderr, "FATAL: PICCOLO_STATE_DIR is no longer supported; use PICCOLO_CORE_ROOT.\n")
 		os.Exit(1)
 	}
 	coreRoot = filepath.Clean(envOr("PICCOLO_CORE_ROOT", defaultCoreRoot))
-	dataRoot = filepath.Clean(envOr("PICCOLO_DATA_ROOT", defaultDataRoot))
+	// Derive podman root from core root when not explicitly set,
+	// so that overriding PICCOLO_CORE_ROOT automatically relocates podman storage.
+	podmanRoot = filepath.Clean(envOr("PICCOLO_PODMAN_ROOT", filepath.Join(coreRoot, "podman")))
 }
 
 func envOr(key, fallback string) string {
@@ -41,64 +42,81 @@ func CoreRoot() string {
 	return coreRoot
 }
 
-// DataRoot returns the root of the piccolo-data partition.
-func DataRoot() string {
-	once.Do(resolveRoots)
-	return dataRoot
-}
-
 // CoreJoin resolves a path relative to the core root.
 func CoreJoin(parts ...string) string {
 	all := append([]string{CoreRoot()}, parts...)
 	return filepath.Join(all...)
 }
 
-// DataJoin resolves a path relative to the data root.
-func DataJoin(parts ...string) string {
-	all := append([]string{DataRoot()}, parts...)
+// PodmanRoot returns the mount point of the ephemeral podman shared thin LV.
+// This replaces the old DataJoin("node", "podman", ...) paths.
+func PodmanRoot() string {
+	once.Do(resolveRoots)
+	return podmanRoot
+}
+
+// PodmanJoin resolves a path relative to the podman root.
+func PodmanJoin(parts ...string) string {
+	all := append([]string{PodmanRoot()}, parts...)
 	return filepath.Join(all...)
 }
 
+// MountDir returns the mount point for a volume.
+// All volumes mount under /piccolo-core/mounts/<vol-id>/.
+func MountDir(volumeID string) string {
+	return CoreJoin("mounts", volumeID)
+}
+
+// VolumeMetaDir returns the metadata directory for a volume.
+// All volume metadata lives under /piccolo-core/volumes/<vol-id>/.
+func VolumeMetaDir(volumeID string) string {
+	return CoreJoin("volumes", volumeID)
+}
+
 // SetCoreRootForTest overrides the core root for the duration of a test.
+// Also re-derives podmanRoot so PodmanJoin stays consistent with the new core root.
 func SetCoreRootForTest(t *testing.T, dir string) {
 	t.Helper()
-	prev := coreRoot
+	prevCore := coreRoot
+	prevPodman := podmanRoot
 	prevOnce := once
 	coreRoot = dir
-	once = sync.Once{} // prevent re-resolve from clobbering
-	once.Do(func() {}) // exhaust the once
+	podmanRoot = filepath.Join(dir, "podman")
+	once = &sync.Once{} // prevent re-resolve from clobbering
+	once.Do(func() {})  // exhaust the once
 	t.Cleanup(func() {
-		coreRoot = prev
+		coreRoot = prevCore
+		podmanRoot = prevPodman
 		once = prevOnce
 	})
 }
 
-// SetDataRootForTest overrides the data root for the duration of a test.
-func SetDataRootForTest(t *testing.T, dir string) {
+// SetPodmanRootForTest overrides the podman root for the duration of a test.
+func SetPodmanRootForTest(t *testing.T, dir string) {
 	t.Helper()
-	prev := dataRoot
+	prev := podmanRoot
 	prevOnce := once
-	dataRoot = dir
-	once = sync.Once{}
+	podmanRoot = dir
+	once = &sync.Once{}
 	once.Do(func() {})
 	t.Cleanup(func() {
-		dataRoot = prev
+		podmanRoot = prev
 		once = prevOnce
 	})
 }
 
-// SetRootsForTest creates temp directories for core and data roots and returns their paths.
-func SetRootsForTest(t *testing.T) (core, data string) {
+// SetRootsForTest creates temp directories for core and podman roots and returns their paths.
+func SetRootsForTest(t *testing.T) (core, podman string) {
 	t.Helper()
 	core = filepath.Join(t.TempDir(), "core")
-	data = filepath.Join(t.TempDir(), "data")
+	podman = filepath.Join(t.TempDir(), "podman")
 	if err := os.MkdirAll(core, 0o755); err != nil {
 		t.Fatalf("create test core root: %v", err)
 	}
-	if err := os.MkdirAll(data, 0o755); err != nil {
-		t.Fatalf("create test data root: %v", err)
+	if err := os.MkdirAll(podman, 0o755); err != nil {
+		t.Fatalf("create test podman root: %v", err)
 	}
 	SetCoreRootForTest(t, core)
-	SetDataRootForTest(t, data)
-	return core, data
+	SetPodmanRootForTest(t, podman)
+	return core, podman
 }

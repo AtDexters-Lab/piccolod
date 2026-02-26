@@ -171,16 +171,15 @@ func (m *PoolManager) Unlock(ctx context.Context, device, adminPassword string) 
 	}
 }
 
-// Lock closes a LUKS device: unmount → cryptsetup close → zero cached keys.
-func (m *PoolManager) Lock(ctx context.Context) error {
+// Lock closes a LUKS device: unmount → cryptsetup close.
+// Deprecated: pool-level LUKS is no longer used. Per-volume LUKS handled in M3.
+func (m *PoolManager) Lock(ctx context.Context, mountPoint string) error {
 	mapperName := MapperName(0)
 
-	// Unmount btrfs.
-	if err := m.run.Run(ctx, "umount", paths.DataRoot()); err != nil {
-		return fmt.Errorf("unmount %s: %w", paths.DataRoot(), err)
+	if err := m.run.Run(ctx, "umount", mountPoint); err != nil {
+		return fmt.Errorf("unmount %s: %w", mountPoint, err)
 	}
 
-	// Close LUKS.
 	if err := m.run.Run(ctx, "cryptsetup", "close", mapperName); err != nil {
 		return fmt.Errorf("cryptsetup close %s: %w", mapperName, err)
 	}
@@ -189,23 +188,22 @@ func (m *PoolManager) Lock(ctx context.Context) error {
 	return nil
 }
 
-// MountDataPool mounts the LUKS data pool at the data root.
-func (m *PoolManager) MountDataPool(ctx context.Context) error {
+// MountDataPool mounts a LUKS device at the given mount point.
+// Deprecated: pool-level LUKS is no longer used. Per-volume LUKS handled in M3.
+func (m *PoolManager) MountDataPool(ctx context.Context, mountPoint string) error {
 	mapperPath := MapperPath(0)
-	dataRoot := paths.DataRoot()
 
-	if err := os.MkdirAll(dataRoot, 0o711); err != nil {
+	if err := os.MkdirAll(mountPoint, 0o711); err != nil {
 		return fmt.Errorf("create mount point: %w", err)
 	}
 
-	// Check if already mounted.
-	if m.isMounted(ctx, dataRoot) {
-		log.Printf("data pool already mounted at %s", dataRoot)
+	if m.isMounted(ctx, mountPoint) {
+		log.Printf("data pool already mounted at %s", mountPoint)
 		return nil
 	}
 
-	if err := m.run.Run(ctx, "mount", mapperPath, dataRoot); err != nil {
-		return fmt.Errorf("mount %s at %s: %w", mapperPath, dataRoot, err)
+	if err := m.run.Run(ctx, "mount", mapperPath, mountPoint); err != nil {
+		return fmt.Errorf("mount %s at %s: %w", mapperPath, mountPoint, err)
 	}
 	return nil
 }

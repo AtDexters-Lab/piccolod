@@ -31,7 +31,7 @@ const (
 
 // imagestorePath returns the shared imagestore directory path.
 func imagestorePath() string {
-	return paths.DataJoin("node", "podman", "imagestore")
+	return paths.PodmanJoin("imagestore")
 }
 
 // ensurePodmanPreamble creates the podman runroot base (world-traversable),
@@ -67,10 +67,11 @@ func ensureImagestoreDir() (string, error) {
 	if err := os.MkdirAll(imagestoreParent, modeTraversable); err != nil {
 		return "", fmt.Errorf("ensure imagestore parent: %w", err)
 	}
-	// Best-effort: make parent dirs traversable so per-app users can reach imagestore.
-	// Errors intentionally ignored — downstream operations will surface access failures
-	// with more actionable context than a stray chmod error here.
-	for _, dir := range []string{paths.DataRoot(), paths.DataJoin("node"), imagestoreParent} {
+	// Best-effort: make ancestor dirs traversable so per-app users can reach imagestore.
+	// Walk from core root down to the imagestore parent so rootless podman can traverse
+	// the full path. Errors intentionally ignored — downstream operations will surface
+	// access failures with more actionable context than a stray chmod error here.
+	for _, dir := range []string{filepath.Dir(paths.PodmanRoot()), paths.PodmanRoot()} {
 		_ = os.Chmod(dir, modeTraversable)
 	}
 
@@ -165,7 +166,7 @@ func (m *AppManager) resolveAppCredential(instanceID string, layout appVolumeLay
 // cleans stale UID storage, chowns to the per-app user, and removes stale
 // driver metadata.
 func (m *AppManager) ensureServiceRoot(instanceID string, cred *syscall.Credential) (string, error) {
-	serviceRoot := paths.DataJoin("node", "podman", "apps", instanceID)
+	serviceRoot := paths.PodmanJoin("apps", instanceID)
 	if err := os.MkdirAll(serviceRoot, modePrivate); err != nil {
 		return "", fmt.Errorf("ensure service podman root: %w", err)
 	}
@@ -180,7 +181,7 @@ func (m *AppManager) ensureServiceRoot(instanceID string, cred *syscall.Credenti
 		}
 		// Best-effort: make apps parent dir traversable for other per-app users.
 		// Errors intentionally ignored — same rationale as ensureImagestoreDir.
-		_ = os.Chmod(paths.DataJoin("node", "podman", "apps"), modeTraversable)
+		_ = os.Chmod(paths.PodmanJoin("apps"), modeTraversable)
 	}
 	cleanStaleDriverStorage(serviceRoot, staleDriverPrefix)
 	return serviceRoot, nil

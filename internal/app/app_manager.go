@@ -1571,7 +1571,7 @@ func (m *AppManager) cleanupInstallResources(ctx context.Context, instanceID str
 	// Remove per-app service root (graphroot on data partition).
 	serviceRoot := runtime.Root
 	if serviceRoot == "" {
-		serviceRoot = paths.DataJoin("node", "podman", "apps", instanceID)
+		serviceRoot = paths.PodmanJoin("apps", instanceID)
 	}
 	if err := os.RemoveAll(serviceRoot); err != nil {
 		log.Printf("WARN: install cleanup %s: remove service root: %v", instanceID, err)

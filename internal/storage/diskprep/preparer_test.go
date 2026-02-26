@@ -181,7 +181,7 @@ func TestBuildSfdiskJSON_MBR(t *testing.T) {
 }
 
 func TestEnsureDirectories(t *testing.T) {
-	_, data := paths.SetRootsForTest(t)
+	core, _ := paths.SetRootsForTest(t)
 
 	p := NewPreparer(&fakeRunner{})
 	if err := p.EnsureDirectories(context.Background()); err != nil {
@@ -189,14 +189,19 @@ func TestEnsureDirectories(t *testing.T) {
 	}
 
 	expected := []string{
-		"node",
-		filepath.Join("user", "volumes"),
+		"volumes",
+		"mounts",
+		"cache",
+		filepath.Join("cache", "catalog"),
+		"tiering",
+		"drbd-meta",
+		"recovery",
 		"federation",
 		filepath.Join("system-objects", "control-plane-backups"),
 		filepath.Join("system-objects", "volume-checkpoints"),
 	}
 	for _, rel := range expected {
-		full := filepath.Join(data, rel)
+		full := filepath.Join(core, rel)
 		info, err := os.Stat(full)
 		if err != nil {
 			t.Errorf("expected directory %s to exist: %v", rel, err)
@@ -247,24 +252,6 @@ func TestExpandRootPartition_BadSlot(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for device without partition number")
 	}
-}
-
-func TestSetNOCOWAttributes_NonFatal(t *testing.T) {
-	paths.SetRootsForTest(t)
-
-	// chattr will fail (no real chattr in test), but SetNOCOWAttributes is non-fatal.
-	run := &fakeRunner{
-		errs: map[string]error{
-			"chattr +C " + paths.DataJoin("node"):       fmt.Errorf("chattr failed"),
-			"chattr +C " + paths.DataJoin("federation"): fmt.Errorf("chattr failed"),
-		},
-	}
-
-	p := NewPreparer(run)
-	// Ensure dirs exist first so chattr has targets.
-	_ = p.EnsureDirectories(context.Background())
-	// Should not panic or return error.
-	p.SetNOCOWAttributes(context.Background())
 }
 
 // recordingRunner records Run calls for verifying command sequences.

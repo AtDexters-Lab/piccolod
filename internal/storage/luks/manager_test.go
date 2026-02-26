@@ -76,7 +76,7 @@ func TestPoolManager_Lock(t *testing.T) {
 	run := &fakeRunner{}
 	mgr := NewPoolManager(run, nil)
 
-	if err := mgr.Lock(context.Background()); err != nil {
+	if err := mgr.Lock(context.Background(), "/piccolo-data"); err != nil {
 		t.Fatalf("Lock: %v", err)
 	}
 

@@ -46,7 +46,7 @@ func cleanupStaleFUSEMounts(ctx context.Context) {
 	mounts := parseFUSEMounts(f,
 		paths.CoreRoot(),                               // gocryptfs, per-app graphroot overlays, workspace overlays
 		podmanRunRootBase(),                             // ALL runRoot overlays (image-root + per-app vol-ids)
-		paths.DataJoin("node", "podman", "image-root"),  // image graphroot overlays
+		paths.PodmanJoin("image-root"),                   // image graphroot overlays
 	)
 	if len(mounts) == 0 {
 		return

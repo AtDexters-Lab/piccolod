@@ -255,14 +255,14 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 				}
 				return
 			}
-			// Unlock successful — mount LUKS data volume before notifying
-			// persistence, so /piccolo-data is available when the app-manager
+			// Unlock successful — activate LVM data volume before notifying
+			// persistence, so storage volumes are available when the app-manager
 			// reconcile loop starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
 			// Use a background context so long-running ops survive client disconnect.
 			unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer unlockCancel()
 			if s.storageMgr != nil {
-				if err := s.storageMgr.UnlockDataVolume(unlockCtx, body.Password); err != nil {
+				if err := s.storageMgr.UnlockDataVolume(unlockCtx); err != nil {
 					log.Printf("ERROR: auth login data volume unlock failed: %v", err)
 					if s.healthTracker != nil {
 						s.healthTracker.Setf("storage", health.LevelError, "data volume unlock failed")
@@ -432,12 +432,7 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 			return
 		}
 	}
-	// Rotate LUKS admin password keyslot (best-effort).
-	if s.storageMgr != nil {
-		if err := s.storageMgr.OnAdminPasswordRotated(c.Request.Context(), body.OldPassword, body.NewPassword); err != nil {
-			log.Printf("WARN: LUKS password rotation: %v", err)
-		}
-	}
+	// TODO(M3): per-volume LUKS admin password keyslot rotation.
 	update := persistence.AuthStalenessUpdate{
 		PasswordStale:   boolPtr(false),
 		PasswordStaleAt: timePtr(time.Time{}),

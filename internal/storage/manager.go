@@ -9,11 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"piccolod/internal/crypt"
 	"piccolod/internal/events"
 	"piccolod/internal/runner"
 	"piccolod/internal/state/paths"
-	"piccolod/internal/storage/luks"
+	"piccolod/internal/storage/lvm"
 )
 
 // EmergencyLevel classifies storage failure severity.
@@ -27,6 +26,15 @@ const (
 	phase1MaxRetries   = 3
 	phase1RetryBackoff = 2 * time.Second
 	phase1Timeout      = 5 * time.Minute
+
+	// healthMonitorInterval is the interval for thin pool health checks.
+	healthMonitorInterval = 60 * time.Second
+
+	// podmanSharedLVName is the thin LV for ephemeral shared podman storage.
+	podmanSharedLVName = "podman-shared"
+
+	// podmanSharedLVSize is the initial virtual size for the podman shared LV (50GB).
+	podmanSharedLVSize = 50 * 1024 * 1024 * 1024
 )
 
 // DiskPreparer abstracts disk probing and mutation operations.
@@ -37,16 +45,17 @@ type DiskPreparer interface {
 	CreateDataPartition(ctx context.Context, disk string) (partDev string, slot int, err error)
 	ExpandRootPartition(ctx context.Context, disk string, rootPartition string) error
 	EnsureDirectories(ctx context.Context) error
-	SetNOCOWAttributes(ctx context.Context)
 }
 
 // Manager coordinates boot-time disk preparation and storage lifecycle.
+// In the block-native architecture, the data partition hosts an LVM thin pool
+// directly (no pool-level LUKS). Per-volume encryption is handled in M3.
 type Manager struct {
 	diskPrep DiskPreparer
 	bus      *events.Bus
 	run      runner.CommandRunner
-	crypto   *crypt.Manager
-	luksPool *luks.PoolManager
+	lvmPool  *lvm.PoolManager
+	lvmVols  *lvm.LVManager
 
 	mu             sync.RWMutex
 	phase1Complete bool
@@ -56,26 +65,32 @@ type Manager struct {
 	emergencyErr   error
 	dataDevice     string // discovered during Phase 1
 
-	phase1Done   chan struct{}   // closed when Phase 1 finishes
+	phase1Done   chan struct{}      // closed when Phase 1 finishes
 	phase1Cancel context.CancelFunc // cancels in-flight Phase 1 on Stop
 }
 
-// NewManager creates a storage manager. The runner and crypto args are optional;
-// when nil the LUKS pool manager is not initialized and LUKS facade methods
-// become no-ops (suitable for dev mode or unit tests).
-func NewManager(diskPrep DiskPreparer, bus *events.Bus, run runner.CommandRunner, crypto *crypt.Manager) *Manager {
-	var pool *luks.PoolManager
-	if run != nil && crypto != nil {
-		pool = luks.NewPoolManager(run, crypto)
+// NewManager creates a storage manager.
+func NewManager(diskPrep DiskPreparer, bus *events.Bus, run runner.CommandRunner) *Manager {
+	var pool *lvm.PoolManager
+	var vols *lvm.LVManager
+	if run != nil {
+		cfg := lvm.DefaultThinPoolConfig()
+		pool = lvm.NewPoolManager(run, bus, cfg)
+		vols = lvm.NewLVManager(run, cfg.VGName, cfg.PoolName)
 	}
 	return &Manager{
 		diskPrep:   diskPrep,
 		bus:        bus,
 		run:        run,
-		crypto:     crypto,
-		luksPool:   pool,
+		lvmPool:    pool,
+		lvmVols:    vols,
 		phase1Done: make(chan struct{}),
 	}
+}
+
+// LVMVolumes returns the LV manager for creating per-volume thin LVs.
+func (m *Manager) LVMVolumes() *lvm.LVManager {
+	return m.lvmVols
 }
 
 // Name implements supervisor.Component.
@@ -84,13 +99,17 @@ func (m *Manager) Name() string { return "storage-manager" }
 // Start implements supervisor.Component. No-op; partitioning is triggered explicitly.
 func (m *Manager) Start(ctx context.Context) error { return nil }
 
-// Stop implements supervisor.Component. Cancels any in-flight Phase 1 operation.
+// Stop implements supervisor.Component. Cancels any in-flight Phase 1 operation
+// and stops the thin pool health monitor.
 func (m *Manager) Stop(ctx context.Context) error {
 	m.mu.RLock()
 	cancel := m.phase1Cancel
 	m.mu.RUnlock()
 	if cancel != nil {
 		cancel()
+	}
+	if m.lvmPool != nil {
+		m.lvmPool.StopHealthMonitor()
 	}
 	return nil
 }
@@ -245,11 +264,7 @@ func (m *Manager) preparePartitioning(ctx context.Context) error {
 		}
 	}
 
-	// Directory creation and NOCOW attributes are deferred to Phase 2
-	// (InitializeDataVolume / Unlock) because /piccolo-data is the LUKS mount
-	// point and does not exist until the encrypted volume is opened.
-
-	// Store data device for post-Phase-1 LUKS operations.
+	// Store data device for post-Phase-1 LVM operations.
 	m.mu.Lock()
 	m.dataDevice = state.DataPartition
 	m.mu.Unlock()
@@ -305,11 +320,13 @@ func (m *Manager) IsPreviouslySetUp(ctx context.Context) bool {
 		}
 	}
 
-	// Signal 2: LUKS header found on data partition.
-	if m.diskPrep != nil {
-		state, err := m.diskPrep.GetPartitionState(ctx)
-		if err == nil && state.DataPartition != "" && state.DataPartitionLUKS {
-			log.Printf("WARN: onboarding.json missing/incomplete, but LUKS header found; treating as previously set up")
+	// Signal 2: LVM VG exists on the data partition.
+	if m.lvmPool != nil {
+		exists, err := m.lvmPool.VGExists(ctx)
+		if err != nil {
+			log.Printf("WARN: VGExists check failed: %v; treating as not previously set up", err)
+		} else if exists {
+			log.Printf("WARN: onboarding.json missing/incomplete, but LVM VG found; treating as previously set up")
 			return true
 		}
 	}
@@ -324,10 +341,11 @@ func (m *Manager) DataDevice() string {
 	return m.dataDevice
 }
 
-// InitializeDataVolume formats LUKS on the data partition, unlocks it, mounts
-// the data pool, and ensures the directory layout. Called from crypto setup.
-func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string, mnemonicKey []byte) error {
-	if m.luksPool == nil {
+// InitializeDataVolume creates the LVM VG and thin pool on the raw data
+// partition. No pool-level LUKS — per-volume encryption is handled by M3.
+// Also creates the ephemeral podman shared thin LV with btrfs+zstd.
+func (m *Manager) InitializeDataVolume(ctx context.Context) error {
+	if m.lvmPool == nil {
 		return nil
 	}
 
@@ -340,55 +358,40 @@ func (m *Manager) InitializeDataVolume(ctx context.Context, adminPassword string
 		return fmt.Errorf("no data partition discovered during phase 1")
 	}
 
-	// Check for orphaned LUKS header from a crashed previous init.
-	if m.luksPool.DetectOrphanedLUKSHeader(ctx, device) {
-		log.Printf("WARN: orphaned LUKS header detected; wiping before re-init")
-		if err := m.luksPool.WipeLUKSHeader(ctx, device); err != nil {
-			return fmt.Errorf("wipe orphaned LUKS header: %w", err)
-		}
+	// Create LVM VG + thin pool on the raw partition.
+	if err := m.lvmPool.CreatePool(ctx, device); err != nil {
+		return fmt.Errorf("create LVM pool: %w", err)
 	}
 
-	if err := m.luksPool.InitializeLUKS(ctx, device, adminPassword, mnemonicKey); err != nil {
-		return fmt.Errorf("initialize LUKS: %w", err)
+	// Create the ephemeral podman shared thin LV.
+	if err := m.ensurePodmanSharedLV(ctx); err != nil {
+		return fmt.Errorf("ensure podman shared LV: %w", err)
 	}
 
-	if err := m.luksPool.Unlock(ctx, device, adminPassword); err != nil {
-		return fmt.Errorf("unlock after init: %w", err)
-	}
-
-	// Create btrfs filesystem on the freshly initialized LUKS container.
-	mapperPath := luks.MapperPath(0)
-	if err := m.run.Run(ctx, "mkfs.btrfs", "-L", "piccolo-data", mapperPath); err != nil {
-		return fmt.Errorf("mkfs.btrfs on data pool: %w", err)
-	}
-
-	if err := m.luksPool.MountDataPool(ctx); err != nil {
-		return fmt.Errorf("mount data pool: %w", err)
-	}
-
-	// Create directory layout on the freshly mounted data pool.
+	// Ensure directory layout on the core root.
 	if m.diskPrep != nil {
 		if err := m.diskPrep.EnsureDirectories(ctx); err != nil {
-			log.Printf("WARN: ensure directories after LUKS init: %v", err)
+			log.Printf("WARN: ensure directories after LVM init: %v", err)
 		}
-		m.diskPrep.SetNOCOWAttributes(ctx)
 	}
+
+	// Start thin pool health monitoring.
+	m.lvmPool.StartHealthMonitor(healthMonitorInterval)
 
 	if m.bus != nil {
 		m.bus.Publish(events.Event{Topic: events.TopicStorageLUKSInitialized})
 	}
-	log.Printf("data volume initialized and mounted")
+	log.Printf("storage: LVM thin pool initialized on %s", device)
 	return nil
 }
 
-// UnlockDataVolume unlocks the LUKS data partition, mounts it, ensures
-// directories, and resumes any interrupted keyslot rotations.
-func (m *Manager) UnlockDataVolume(ctx context.Context, adminPassword string) error {
-	if m.luksPool == nil {
+// UnlockDataVolume activates the LVM VG and thin pool. No password needed —
+// there is no pool-level LUKS. Per-volume LUKS handled in M3.
+func (m *Manager) UnlockDataVolume(ctx context.Context) error {
+	if m.lvmPool == nil {
 		return nil
 	}
 
-	// Block until Phase 1 completes — dataDevice is set at end of Phase 1.
 	if err := m.EnsurePhase1(ctx); err != nil {
 		return fmt.Errorf("wait for phase 1: %w", err)
 	}
@@ -398,87 +401,117 @@ func (m *Manager) UnlockDataVolume(ctx context.Context, adminPassword string) er
 		return fmt.Errorf("no data partition discovered during phase 1")
 	}
 
-	// Recovery: if no LUKS header, previous setup's init failed before format.
-	// Fall back to full initialization (Posture RFC §5.3).
-	// nil mnemonicKey: slot 2 is enrolled separately when recovery key is generated.
-	hasHeader, headerErr := m.luksPool.HasLUKSHeader(ctx, device)
-	if headerErr != nil {
-		return fmt.Errorf("check LUKS header on %s: %w", device, headerErr)
+	// Check if the VG exists. If not, fall back to initialization.
+	// Distinguish "VG not found" from transient errors — only fall back
+	// to init on a confirmed absence to avoid destructive pvcreate -f.
+	vgExists, vgErr := m.lvmPool.VGExists(ctx)
+	if vgErr != nil {
+		return fmt.Errorf("check VG existence: %w", vgErr)
 	}
-	if !hasHeader {
-		log.Printf("WARN: no LUKS header on %s — falling back to initialization", device)
-		return m.InitializeDataVolume(ctx, adminPassword, nil)
-	}
-
-	if err := m.luksPool.Unlock(ctx, device, adminPassword); err != nil {
-		return fmt.Errorf("unlock LUKS: %w", err)
+	if !vgExists {
+		log.Printf("WARN: no LVM VG found — falling back to initialization")
+		return m.InitializeDataVolume(ctx)
 	}
 
-	if err := m.luksPool.MountDataPool(ctx); err != nil {
-		return fmt.Errorf("mount data pool: %w", err)
+	// Activate the VG (no password — no pool-level LUKS).
+	if err := m.lvmPool.ActivatePool(ctx); err != nil {
+		return fmt.Errorf("activate LVM pool: %w", err)
 	}
 
-	// Post-unlock housekeeping.
+	// Ensure the podman shared LV exists and is mounted.
+	if err := m.ensurePodmanSharedLV(ctx); err != nil {
+		return fmt.Errorf("ensure podman shared LV: %w", err)
+	}
+
+	// Ensure directory layout.
 	if m.diskPrep != nil {
 		if err := m.diskPrep.EnsureDirectories(ctx); err != nil {
-			log.Printf("WARN: ensure directories after unlock: %v", err)
+			log.Printf("WARN: ensure directories after VG activate: %v", err)
 		}
-		m.diskPrep.SetNOCOWAttributes(ctx)
 	}
 
-	// Resume interrupted keyslot rotations.
-	if err := m.luksPool.ResumePasswordRotationIfNeeded(ctx, device, adminPassword); err != nil {
-		log.Printf("WARN: resume password rotation: %v", err)
-	}
-	// Mnemonic rotation deferred until key is available (nil → logs and returns).
-	if err := m.luksPool.ResumeMnemonicRotationIfNeeded(ctx, device, nil); err != nil {
-		log.Printf("WARN: resume mnemonic rotation: %v", err)
-	}
+	// Start thin pool health monitoring.
+	m.lvmPool.StartHealthMonitor(healthMonitorInterval)
 
 	if m.bus != nil {
 		m.bus.Publish(events.Event{Topic: events.TopicStorageLUKSUnlocked})
 	}
-	log.Printf("data volume unlocked and mounted")
+	log.Printf("storage: LVM VG activated")
 	return nil
 }
 
-// LockDataVolume unmounts and closes the LUKS data partition.
+// LockDataVolume deactivates the LVM VG. Unmounts the podman shared LV first.
 func (m *Manager) LockDataVolume(ctx context.Context) error {
-	if m.luksPool == nil {
+	if m.lvmPool == nil {
 		return nil
 	}
 
-	if err := m.luksPool.Lock(ctx); err != nil {
-		return fmt.Errorf("lock data pool: %w", err)
+	m.lvmPool.StopHealthMonitor()
+
+	// Unmount the podman shared LV.
+	podmanMount := paths.PodmanRoot()
+	if m.isMounted(ctx, podmanMount) {
+		if err := m.run.Run(ctx, "umount", podmanMount); err != nil {
+			log.Printf("WARN: failed to unmount podman shared LV: %v", err)
+		}
+	}
+
+	// Deactivate the VG.
+	if err := m.lvmPool.DeactivatePool(ctx); err != nil {
+		return fmt.Errorf("deactivate LVM pool: %w", err)
 	}
 
 	if m.bus != nil {
 		m.bus.Publish(events.Event{Topic: events.TopicStorageLocked})
 	}
-	log.Printf("data volume locked")
+	log.Printf("storage: LVM VG deactivated")
 	return nil
 }
 
-// OnAdminPasswordRotated rotates the admin password keyslot on the data partition.
-func (m *Manager) OnAdminPasswordRotated(ctx context.Context, oldPass, newPass string) error {
-	if m.luksPool == nil {
+// ensurePodmanSharedLV creates and mounts the ephemeral podman shared thin LV
+// with btrfs+zstd for container image storage.
+func (m *Manager) ensurePodmanSharedLV(ctx context.Context) error {
+	if m.lvmVols == nil {
 		return nil
 	}
-	device := m.DataDevice()
-	if device == "" {
+
+	// Create the thin LV if it doesn't exist.
+	if !m.lvmVols.LVExists(ctx, podmanSharedLVName) {
+		if err := m.lvmVols.CreateThinLV(ctx, podmanSharedLVName, podmanSharedLVSize); err != nil {
+			return fmt.Errorf("create podman shared LV: %w", err)
+		}
+		// Format with btrfs+zstd for container image deduplication.
+		lvPath := m.lvmVols.LVPath(podmanSharedLVName)
+		if err := m.run.Run(ctx, "mkfs.btrfs", "-L", "podman-shared", lvPath); err != nil {
+			return fmt.Errorf("mkfs.btrfs podman shared: %w", err)
+		}
+	}
+
+	// Activate the LV.
+	if err := m.lvmVols.ActivateLV(ctx, podmanSharedLVName); err != nil {
+		return fmt.Errorf("activate podman shared LV: %w", err)
+	}
+
+	// Mount at the podman root.
+	mountDir := paths.PodmanRoot()
+	if err := os.MkdirAll(mountDir, 0o711); err != nil {
+		return fmt.Errorf("create podman mount dir: %w", err)
+	}
+
+	if m.isMounted(ctx, mountDir) {
 		return nil
 	}
-	return m.luksPool.OnAdminPasswordRotated(ctx, device, oldPass, newPass)
+
+	lvPath := m.lvmVols.LVPath(podmanSharedLVName)
+	if err := m.run.Run(ctx, "mount", "-o", "discard=async,compress=zstd", lvPath, mountDir); err != nil {
+		return fmt.Errorf("mount podman shared LV: %w", err)
+	}
+
+	log.Printf("storage: podman shared LV mounted at %s (btrfs+zstd)", mountDir)
+	return nil
 }
 
-// OnRecoveryMnemonicRotated rotates the mnemonic keyslot on the data partition.
-func (m *Manager) OnRecoveryMnemonicRotated(ctx context.Context, oldKey, newKey []byte) error {
-	if m.luksPool == nil {
-		return nil
-	}
-	device := m.DataDevice()
-	if device == "" {
-		return nil
-	}
-	return m.luksPool.OnRecoveryMnemonicRotated(ctx, device, oldKey, newKey)
+// isMounted checks if a path has a mounted filesystem.
+func (m *Manager) isMounted(ctx context.Context, mountPoint string) bool {
+	return m.run.Run(ctx, "mountpoint", "-q", mountPoint) == nil
 }

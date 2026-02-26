@@ -114,7 +114,7 @@ func NewService(opts Options) (*Module, error) {
 		}
 		dataDir := opts.DataDir
 		if dataDir == "" {
-			dataDir = paths.DataRoot()
+			dataDir = paths.CoreRoot()
 		}
 		mod.volumes = newFileVolumeManager(mod.stateDir, dataDir, mod.crypto, mod.events)
 	}

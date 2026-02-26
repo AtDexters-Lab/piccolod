@@ -403,10 +403,10 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		})
 	}
 
-	// Initialize storage manager for disk preparation and LUKS lifecycle.
+	// Initialize storage manager for disk preparation and LVM lifecycle.
 	execRunner := runner.ExecRunner{}
 	diskPreparer := diskprep.NewPreparer(execRunner)
-	storageMgr := storage.NewManager(diskPreparer, eventsBus, execRunner, cmgr)
+	storageMgr := storage.NewManager(diskPreparer, eventsBus, execRunner)
 
 	// Initialize onboarding manager (detects boot mode for USB onboarding flow).
 	bootMode, bootErr := storage.DetectBootMode(context.Background(), execRunner)
@@ -447,7 +447,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		Dispatcher: dispatch,
 		Crypto:     cmgr,
 		StateDir:   stateDir,
-		DataDir:    paths.DataRoot(),
+		DataDir:    paths.CoreRoot(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to init persistence module: %w", err)
@@ -487,7 +487,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		mdnsMgr.ObserveServiceEndpoints(eventsBus)
 	}
 
-	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), paths.DataJoin("node", "cache", "catalog"))
+	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), paths.CoreJoin("cache", "catalog"))
 
 	s := &GinServer{
 		appManager:     appMgr,

@@ -154,14 +154,14 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	runtime.GC()
 	debug.FreeOSMemory()
 
-	// 5. Initialize LUKS data volume BEFORE notifying persistence, so that
-	// /piccolo-data is mounted before the app-manager reconcile loop
+	// 5. Initialize data volume BEFORE notifying persistence, so that
+	// storage volumes are available before the app-manager reconcile loop
 	// starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
 	// Capture error but defer failure until after session creation,
 	// so the user gets a portal session for recovery on LUKS failure.
 	var luksErr error
 	if s.storageMgr != nil {
-		if err := s.storageMgr.InitializeDataVolume(setupCtx, body.Password, nil); err != nil {
+		if err := s.storageMgr.InitializeDataVolume(setupCtx); err != nil {
 			log.Printf("ERROR: data volume initialization failed: %v", err)
 			luksErr = err
 			if s.healthTracker != nil {
@@ -300,12 +300,12 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 	runtime.GC()
 	debug.FreeOSMemory()
 
-	// Unlock LUKS data volume BEFORE notifying persistence, so that
-	// /piccolo-data is mounted before the app-manager reconcile loop
+	// Unlock data volume BEFORE notifying persistence, so that
+	// storage volumes are available before the app-manager reconcile loop
 	// starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
 	var luksErr error
 	if s.storageMgr != nil {
-		if err := s.storageMgr.UnlockDataVolume(unlockCtx, password); err != nil {
+		if err := s.storageMgr.UnlockDataVolume(unlockCtx); err != nil {
 			log.Printf("ERROR: data volume unlock failed: %v", err)
 			luksErr = err
 			if s.healthTracker != nil {
