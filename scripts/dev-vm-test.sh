@@ -7,13 +7,14 @@
 #   ./scripts/dev-vm-test.sh <IP> pre-setup    # stage 2: pre-setup gating
 #   ./scripts/dev-vm-test.sh <IP> setup        # stage 3: first-run setup (creates password!)
 #   ./scripts/dev-vm-test.sh <IP> post-setup   # stage 4: post-setup functional
-#   ./scripts/dev-vm-test.sh <IP> pcv          # stage 5: PCV mutation & export
-#   ./scripts/dev-vm-test.sh <IP> reboot       # stage 6: reboot & unlock cycle
-#   ./scripts/dev-vm-test.sh <IP> edge         # stage 7: edge cases
-#   ./scripts/dev-vm-test.sh <IP> service-app    # stage 8: service app install/verify/uninstall
-#   ./scripts/dev-vm-test.sh <IP> workspace-app  # stage 9: workspace app install/verify/uninstall
+#   ./scripts/dev-vm-test.sh <IP> recovery     # stage 5: recovery key password reset
+#   ./scripts/dev-vm-test.sh <IP> pcv          # stage 6: PCV mutation & export
+#   ./scripts/dev-vm-test.sh <IP> reboot       # stage 7: reboot & unlock cycle
+#   ./scripts/dev-vm-test.sh <IP> edge         # stage 8: edge cases
+#   ./scripts/dev-vm-test.sh <IP> service-app    # stage 9: service app install/verify/uninstall
+#   ./scripts/dev-vm-test.sh <IP> workspace-app  # stage 10: workspace app install/verify/uninstall
 #   ./scripts/dev-vm-test.sh <IP> logs           # download piccolod journal logs
-#   ./scripts/dev-vm-test.sh <IP> vdi            # stage 10: VDI post-mortem (powers off VM!)
+#   ./scripts/dev-vm-test.sh <IP> vdi            # stage 11: VDI post-mortem (powers off VM!)
 #   ./scripts/dev-vm-test.sh <IP> full         # all stages including VDI (powers off VM!)
 set -euo pipefail
 
@@ -283,10 +284,105 @@ stage_post_setup() {
 }
 
 # ─────────────────────────────────────────────────────────
-# Stage 5: PCV Export Pipeline
+# Stage 5: Recovery Key Password Reset
+# ─────────────────────────────────────────────────────────
+stage_recovery() {
+  echo -e "\n${CYAN}═══ Stage 5: Recovery Key Password Reset ═══${NC}"
+  ensure_session
+
+  # 5.1: No recovery key exists yet
+  local rk_status
+  rk_status=$(api "/api/v1/crypto/recovery-key")
+  check "5.1" "No recovery key exists yet" "$rk_status" '"present":false'
+
+  # 5.2: Generate recovery key
+  local gen_resp recovery_key word_count
+  gen_resp=$(post_csrf "/api/v1/crypto/recovery-key/generate")
+  if [[ -z "$gen_resp" ]]; then
+    echo -e "  ${RED}FAIL${NC} [5.2] Recovery key generation failed (empty response)"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+  recovery_key=$(echo "$gen_resp" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('words',[])))" 2>/dev/null)
+  word_count=$(echo "$recovery_key" | wc -w)
+  if [[ "$word_count" -eq 24 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [5.2] Recovery key generated (24 words)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [5.2] Recovery key word count: $word_count (expected 24)"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+
+  # 5.3: Recovery key status shows present
+  rk_status=$(api "/api/v1/crypto/recovery-key")
+  check "5.3" "Recovery key now present" "$rk_status" '"present":true'
+
+  # 5.4: Reset password with recovery key
+  local reset_code
+  reset_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 \
+    -X POST -H "Content-Type: application/json" \
+    -d "{\"recovery_key\":\"$recovery_key\",\"new_password\":\"RecoveryTest-2026!\"}" \
+    "http://$IP/api/v1/crypto/reset-password" 2>/dev/null)
+  check "5.4" "Password reset via recovery key" "$reset_code" "200"
+
+  sleep 2
+
+  # 5.5: Login with new password
+  rm -f "$COOKIE_JAR"
+  local login_code
+  login_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 \
+    -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"username":"admin","password":"RecoveryTest-2026!"}' \
+    "http://$IP/api/v1/auth/login" 2>/dev/null)
+  check "5.5" "Login with new password" "$login_code" "200"
+
+  # 5.6: Session shows staleness flags
+  local session
+  session=$(api "/api/v1/auth/session")
+  check "5.6" "Password staleness flag set" "$session" '"password_stale":true'
+  check "5.6" "Recovery staleness flag set" "$session" '"recovery_stale":true'
+
+  # 5.7: Wrong recovery key rejected
+  local wrong_code
+  wrong_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 \
+    -X POST -H "Content-Type: application/json" \
+    -d '{"recovery_key":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon","new_password":"ShouldFail-2026!"}' \
+    "http://$IP/api/v1/crypto/reset-password" 2>/dev/null)
+  check "5.7" "Wrong recovery key rejected" "$wrong_code" "401"
+
+  # 5.8: Restore original password
+  local restore_code
+  restore_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 \
+    -X POST -H "Content-Type: application/json" \
+    -d "{\"recovery_key\":\"$recovery_key\",\"new_password\":\"$PASS\"}" \
+    "http://$IP/api/v1/crypto/reset-password" 2>/dev/null)
+  if [[ "$restore_code" == "200" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [5.8] Original password restored"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [5.8] Failed to restore original password (HTTP $restore_code)"
+    echo -e "  ${RED}WARNING: Subsequent stages will fail — password is now RecoveryTest-2026!${NC}"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 5.9: Login with restored password
+  rm -f "$COOKIE_JAR"
+  login_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 \
+    -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$PASS\"}" \
+    "http://$IP/api/v1/auth/login" 2>/dev/null)
+  check "5.9" "Login with restored password" "$login_code" "200"
+  ensure_session
+}
+
+# ─────────────────────────────────────────────────────────
+# Stage 6: PCV Export Pipeline
 # ─────────────────────────────────────────────────────────
 stage_pcv() {
-  echo -e "\n${CYAN}═══ Stage 5: PCV Export Pipeline ═══${NC}"
+  echo -e "\n${CYAN}═══ Stage 6: PCV Export Pipeline ═══${NC}"
 
   # Trigger on-demand publish (requires CSRF for POST)
   local token pub_code
@@ -294,7 +390,7 @@ stage_pcv() {
   pub_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 30 \
     -b "$COOKIE_JAR" -X POST -H "X-CSRF-Token: $token" \
     "http://$IP/api/v1/system/pcv/publish" 2>/dev/null)
-  check "5.1" "On-demand PCV publish" "$pub_code" "200"
+  check "6.1" "On-demand PCV publish" "$pub_code" "200"
 
   # Wait for publish to complete
   sleep 5
@@ -304,26 +400,26 @@ stage_pcv() {
   export_code=$(curl -s -o /tmp/claude/piccolo-e2e/pcv-export.enc -w '%{http_code}' \
     --connect-timeout 10 -b "$COOKIE_JAR" \
     "http://$IP/api/v1/system/pcv/export" 2>/dev/null)
-  check "5.2" "PCV export downloadable" "$export_code" "200"
+  check "6.2" "PCV export downloadable" "$export_code" "200"
 
   if [[ -f /tmp/claude/piccolo-e2e/pcv-export.enc ]]; then
     local size
     size=$(stat -c%s /tmp/claude/piccolo-e2e/pcv-export.enc 2>/dev/null || echo 0)
     if [[ "$size" -gt 100 ]]; then
-      echo -e "  ${GREEN}PASS${NC} [5.3] PCV archive has content ($size bytes)"
+      echo -e "  ${GREEN}PASS${NC} [6.3] PCV archive has content ($size bytes)"
       ((PASS_COUNT++)) || true
     else
-      echo -e "  ${RED}FAIL${NC} [5.3] PCV archive too small ($size bytes)"
+      echo -e "  ${RED}FAIL${NC} [6.3] PCV archive too small ($size bytes)"
       ((FAIL_COUNT++)) || true
     fi
 
     # Check it's gzip
     local magic
     magic=$(xxd -l 2 -p /tmp/claude/piccolo-e2e/pcv-export.enc 2>/dev/null || echo "")
-    check "5.4" "PCV archive is gzip" "$magic" "1f8b"
+    check "6.4" "PCV archive is gzip" "$magic" "1f8b"
   else
-    skip "5.3" "PCV archive content" "export file missing"
-    skip "5.4" "PCV archive is gzip" "export file missing"
+    skip "6.3" "PCV archive content" "export file missing"
+    skip "6.4" "PCV archive is gzip" "export file missing"
   fi
 
   # Second publish (verify idempotent)
@@ -332,19 +428,19 @@ stage_pcv() {
   pub2_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 30 \
     -b "$COOKIE_JAR" -X POST -H "X-CSRF-Token: $token" \
     "http://$IP/api/v1/system/pcv/publish" 2>/dev/null)
-  check "5.5" "Second publish succeeds" "$pub2_code" "200"
+  check "6.5" "Second publish succeeds" "$pub2_code" "200"
 }
 
 # ─────────────────────────────────────────────────────────
-# Stage 6: Reboot & Unlock
+# Stage 7: Reboot & Unlock
 # ─────────────────────────────────────────────────────────
 stage_reboot() {
-  echo -e "\n${CYAN}═══ Stage 6: Reboot & Unlock Cycle ═══${NC}"
+  echo -e "\n${CYAN}═══ Stage 7: Reboot & Unlock Cycle ═══${NC}"
 
   # Find VM name
   local VM_STATE="/tmp/claude/piccolo-e2e/vm-name"
   if [[ ! -f "$VM_STATE" ]]; then
-    skip "6.x" "Reboot tests" "No VM state file (manual VM?)"
+    skip "7.x" "Reboot tests" "No VM state file (manual VM?)"
     return
   fi
   local VM_NAME
@@ -368,19 +464,19 @@ stage_reboot() {
   # After reboot: should be initialized + locked
   local crypto
   crypto=$(api "/api/v1/crypto/status")
-  check "6.1" "Crypto initialized after reboot" "$crypto" '"initialized":true'
-  check "6.2" "Crypto locked after reboot" "$crypto" '"locked":true'
+  check "7.1" "Crypto initialized after reboot" "$crypto" '"initialized":true'
+  check "7.2" "Crypto locked after reboot" "$crypto" '"locked":true'
 
   # Phase 1 should be idempotent (no emergency)
   local emerg
   emerg=$(api "/api/v1/system/emergency")
-  check "6.3" "No emergency after reboot" "$emerg" '"emergency":false'
+  check "7.3" "No emergency after reboot" "$emerg" '"emergency":false'
 
   # Health: storage OK, persistence locked
   local health
   health=$(api "/api/v1/health/detail")
-  check "6.4" "Storage OK after reboot" "$health" '"disk preparation complete"'
-  check "6.5" "Persistence locked after reboot" "$health" '"control store locked"'
+  check "7.4" "Storage OK after reboot" "$health" '"disk preparation complete"'
+  check "7.5" "Persistence locked after reboot" "$health" '"control store locked"'
 
   # Unlock
   rm -f "$COOKIE_JAR"
@@ -390,19 +486,19 @@ stage_reboot() {
     -X POST -H "Content-Type: application/json" \
     -d "{\"password\":\"$PASS\"}" \
     "http://$IP/api/v1/crypto/unlock" 2>/dev/null)
-  check "6.6" "Unlock succeeds" "$unlock_code" "200"
+  check "7.6" "Unlock succeeds" "$unlock_code" "200"
 
   sleep 5
 
   crypto=$(api "/api/v1/crypto/status")
-  check "6.7" "Crypto unlocked after unlock" "$crypto" '"locked":false'
+  check "7.7" "Crypto unlocked after unlock" "$crypto" '"locked":false'
 
   health=$(api "/api/v1/health/detail")
-  check_not "6.8" "No errors in health" "$health" '"level": "error"'
+  check_not "7.8" "No errors in health" "$health" '"level": "error"'
 
   local ready
   ready=$(api "/api/v1/health/ready")
-  check "6.9" "Health ready after unlock" "$ready" '"ready":true'
+  check "7.9" "Health ready after unlock" "$ready" '"ready":true'
 
   # LUKS unlock+mount is async — retry up to 30s
   for i in $(seq 1 30); do
@@ -410,17 +506,17 @@ stage_reboot() {
     echo "$health" | grep -qF '"LUKS unlocked and mounted"' && break
     sleep 1
   done
-  check "6.10" "LUKS data volume mounted" "$health" '"LUKS unlocked and mounted"'
+  check "7.10" "LUKS data volume mounted" "$health" '"LUKS unlocked and mounted"'
 
   echo -e "\n  ${CYAN}Raw health post-reboot-unlock:${NC}"
   apij "/api/v1/health/detail"
 }
 
 # ─────────────────────────────────────────────────────────
-# Stage 7: Edge Cases
+# Stage 8: Edge Cases
 # ─────────────────────────────────────────────────────────
 stage_edge() {
-  echo -e "\n${CYAN}═══ Stage 7: Edge Cases ═══${NC}"
+  echo -e "\n${CYAN}═══ Stage 8: Edge Cases ═══${NC}"
 
   # Wrong password rejection
   local wrong_code
@@ -428,18 +524,18 @@ stage_edge() {
     -X POST -H "Content-Type: application/json" \
     -d '{"password":"wrong-password"}' \
     "http://$IP/api/v1/crypto/unlock" 2>/dev/null)
-  check_not "7.1" "Wrong password rejected (not 200)" "$wrong_code" "200"
+  check_not "8.1" "Wrong password rejected (not 200)" "$wrong_code" "200"
 
   # PCV import without body should fail gracefully
   local import_code
   import_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 \
     -X POST "http://$IP/api/v1/system/pcv/import" 2>/dev/null)
-  check_not "7.2" "PCV import without body not 200" "$import_code" "200"
+  check_not "8.2" "PCV import without body not 200" "$import_code" "200"
 
   # Version still works under all conditions
   local ver
   ver=$(api "/version")
-  check "7.3" "Version always accessible" "$ver" '"piccolod"'
+  check "8.3" "Version always accessible" "$ver" '"piccolod"'
 }
 
 # verify_app_http — Verify HTTP traffic reaches a running app's public port.
@@ -493,10 +589,10 @@ except:
 }
 
 # ─────────────────────────────────────────────────────────
-# Stage 8: Service App Install (Vaultwarden — catalog)
+# Stage 9: Service App Install (Vaultwarden — catalog)
 # ─────────────────────────────────────────────────────────
 stage_service_app() {
-  echo -e "\n${CYAN}═══ Stage 8: Service App Install (Vaultwarden) ═══${NC}"
+  echo -e "\n${CYAN}═══ Stage 9: Service App Install (Vaultwarden) ═══${NC}"
   ensure_session
 
   local APP_NAME="vaultwarden"
@@ -507,7 +603,7 @@ stage_service_app() {
   template_yaml=$(api "/api/v1/catalog/vaultwarden/template")
 
   if [[ -z "$template_yaml" ]]; then
-    echo -e "  ${RED}FAIL${NC} [8.0] Failed to fetch vaultwarden catalog template"
+    echo -e "  ${RED}FAIL${NC} [9.0] Failed to fetch vaultwarden catalog template"
     ((FAIL_COUNT++)) || true
     return
   fi
@@ -524,7 +620,7 @@ print(json.dumps({
     'catalog_source': 'vaultwarden'
 }))")
 
-  # --- 8.1: Install app via POST /api/v1/apps ---
+  # --- 9.1: Install app via POST /api/v1/apps ---
   local token
   token=$(csrf)
   local install_raw install_body install_http
@@ -536,147 +632,10 @@ print(json.dumps({
   install_http=$(echo "$install_raw" | tail -1)
 
   if [[ "$install_http" == "201" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [8.1] Service app installed (HTTP 201)"
+    echo -e "  ${GREEN}PASS${NC} [9.1] Service app installed (HTTP 201)"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [8.1] Service app install failed (HTTP $install_http)"
-    echo -e "       response: $(echo "$install_body" | head -5)"
-    ((FAIL_COUNT++)) || true
-    dump_logs "stage8-install-fail"
-    token=$(csrf)
-    curl -sf --connect-timeout 10 --max-time 30 -b "$COOKIE_JAR" \
-      -X DELETE -H "X-CSRF-Token: $token" \
-      "http://$IP/api/v1/apps/$APP_NAME" >/dev/null 2>&1 || true
-    return
-  fi
-
-  # --- 8.2: Poll for running status (up to 120s) ---
-  local app_status=""
-  for i in $(seq 1 60); do
-    app_status=$(api "/api/v1/apps/$APP_NAME" | python3 -c "
-import sys, json
-try:
-    print(json.load(sys.stdin).get('data',{}).get('app',{}).get('status',''))
-except:
-    print('')" 2>/dev/null)
-    [[ "$app_status" == "running" ]] && break
-    sleep 2
-  done
-  if [[ "$app_status" != "running" ]]; then
-    echo -e "  ${RED}FAIL${NC} [8.2] Service app reaches running (got: $app_status)"
-    ((FAIL_COUNT++)) || true
-    dump_logs "stage8-not-running"
-  else
-    echo -e "  ${GREEN}PASS${NC} [8.2] Service app reaches running"
-    ((PASS_COUNT++)) || true
-  fi
-
-  # --- 8.3: Verify container is running ---
-  local detail containers_running
-  detail=$(api "/api/v1/apps/$APP_NAME")
-  containers_running=$(echo "$detail" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    containers = data.get('data',{}).get('containers',[])
-    print(len([c for c in containers if c.get('running')]))
-except:
-    print(0)" 2>/dev/null)
-
-  if [[ "$containers_running" -gt 0 ]]; then
-    echo -e "  ${GREEN}PASS${NC} [8.3] Container running ($containers_running container(s))"
-    ((PASS_COUNT++)) || true
-  else
-    echo -e "  ${RED}FAIL${NC} [8.3] No running containers"
-    ((FAIL_COUNT++)) || true
-  fi
-
-  # --- 8.4: HTTP verification — traffic reaches the container ---
-  verify_app_http "8.4" "$APP_NAME" 5 3
-
-  # --- 8.5: Fetch container logs ---
-  local logs_raw logs_body logs_http
-  logs_raw=$(curl -s -w '\n%{http_code}' --connect-timeout 5 \
-    -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$APP_NAME/logs" 2>/dev/null)
-  logs_body=$(echo "$logs_raw" | sed '$d')
-  logs_http=$(echo "$logs_raw" | tail -1)
-
-  if [[ "$logs_http" == "200" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [8.5] Logs endpoint accessible"
-    ((PASS_COUNT++)) || true
-    echo -e "  ${CYAN}INFO${NC} Last 5 log lines:"
-    echo "$logs_body" | tail -5 | sed 's/^/       /'
-  else
-    echo -e "  ${RED}FAIL${NC} [8.5] Logs endpoint failed (HTTP $logs_http)"
-    ((FAIL_COUNT++)) || true
-  fi
-
-  # --- 8.6: Uninstall app ---
-  token=$(csrf)
-  local uninstall_code
-  uninstall_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 30 --max-time 120 \
-    -b "$COOKIE_JAR" \
-    -X DELETE -H "X-CSRF-Token: $token" \
-    "http://$IP/api/v1/apps/$APP_NAME" 2>/dev/null)
-  check "8.6" "Service app uninstalled" "$uninstall_code" "200"
-
-  # --- 8.7: Verify app is gone ---
-  sleep 3
-  check_http "8.7" "App no longer exists" "GET" "/api/v1/apps/$APP_NAME" "404"
-}
-
-# ─────────────────────────────────────────────────────────
-# Stage 9: Workspace App Install (Code-server — catalog)
-# ─────────────────────────────────────────────────────────
-stage_workspace_app() {
-  echo -e "\n${CYAN}═══ Stage 9: Workspace App Install (Code-server) ═══${NC}"
-  ensure_session
-
-  local APP_NAME="codeserver"
-  local CATALOG_NAME="code-server"
-
-  # Fetch catalog template for code-server (workspace mode app).
-  # Uses default init (boot.sh wrapper) — exercises the exact path that was
-  # broken by the :z lsetxattr issue on per-app users.
-  # The template endpoint returns raw YAML (application/x-yaml), not JSON.
-  local template_yaml
-  template_yaml=$(api "/api/v1/catalog/$CATALOG_NAME/template")
-
-  if [[ -z "$template_yaml" ]]; then
-    echo -e "  ${RED}FAIL${NC} [9.0] Failed to fetch code-server catalog template"
-    ((FAIL_COUNT++)) || true
-    return
-  fi
-  echo -e "  ${CYAN}INFO${NC} Fetched code-server catalog template (${#template_yaml} bytes)"
-
-  # Build JSON payload with catalog_source tracking.
-  # Code-server requires a password input for its login page.
-  local payload
-  payload=$(YAML="$template_yaml" NAME="$APP_NAME" python3 -c "
-import json, os
-print(json.dumps({
-    'app_definition': os.environ['YAML'],
-    'inputs': {'__app_address__': os.environ['NAME'], 'password': 'E2eTest-2026!'},
-    'catalog_source': 'code-server'
-}))")
-
-  # --- 9.1: Install workspace app via POST /api/v1/apps ---
-  # Image pull for code-server (~500MB) can be slow. 10min timeout.
-  local token
-  token=$(csrf)
-  local install_raw install_body install_http
-  install_raw=$(curl -s -w '\n%{http_code}' --connect-timeout 10 --max-time 300 \
-    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
-    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
-    -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null)
-  install_body=$(echo "$install_raw" | sed '$d')
-  install_http=$(echo "$install_raw" | tail -1)
-
-  if [[ "$install_http" == "201" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [9.1] Workspace app installed (HTTP 201)"
-    ((PASS_COUNT++)) || true
-  else
-    echo -e "  ${RED}FAIL${NC} [9.1] Workspace app install failed (HTTP $install_http)"
+    echo -e "  ${RED}FAIL${NC} [9.1] Service app install failed (HTTP $install_http)"
     echo -e "       response: $(echo "$install_body" | head -5)"
     ((FAIL_COUNT++)) || true
     dump_logs "stage9-install-fail"
@@ -700,32 +659,31 @@ except:
     sleep 2
   done
   if [[ "$app_status" != "running" ]]; then
-    echo -e "  ${RED}FAIL${NC} [9.2] Workspace app reaches running (got: $app_status)"
+    echo -e "  ${RED}FAIL${NC} [9.2] Service app reaches running (got: $app_status)"
     ((FAIL_COUNT++)) || true
     dump_logs "stage9-not-running"
   else
-    echo -e "  ${GREEN}PASS${NC} [9.2] Workspace app reaches running"
+    echo -e "  ${GREEN}PASS${NC} [9.2] Service app reaches running"
     ((PASS_COUNT++)) || true
   fi
 
-  # --- 9.3: Verify app detail shows running status ---
-  # Workspace apps use --rootfs mode where container ID tracking differs from
-  # service apps. Check app-level status instead of individual container state.
-  local detail detail_status
+  # --- 9.3: Verify container is running ---
+  local detail containers_running
   detail=$(api "/api/v1/apps/$APP_NAME")
-  detail_status=$(echo "$detail" | python3 -c "
+  containers_running=$(echo "$detail" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
-    print(data.get('data',{}).get('app',{}).get('status',''))
+    containers = data.get('data',{}).get('containers',[])
+    print(len([c for c in containers if c.get('running')]))
 except:
-    print('')" 2>/dev/null)
+    print(0)" 2>/dev/null)
 
-  if [[ "$detail_status" == "running" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [9.3] App detail confirms running"
+  if [[ "$containers_running" -gt 0 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [9.3] Container running ($containers_running container(s))"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [9.3] App detail status: $detail_status (expected running)"
+    echo -e "  ${RED}FAIL${NC} [9.3] No running containers"
     ((FAIL_COUNT++)) || true
   fi
 
@@ -749,14 +707,14 @@ except:
     ((FAIL_COUNT++)) || true
   fi
 
-  # --- 9.6: Uninstall workspace app ---
+  # --- 9.6: Uninstall app ---
   token=$(csrf)
   local uninstall_code
   uninstall_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 30 --max-time 120 \
     -b "$COOKIE_JAR" \
     -X DELETE -H "X-CSRF-Token: $token" \
     "http://$IP/api/v1/apps/$APP_NAME" 2>/dev/null)
-  check "9.6" "Workspace app uninstalled" "$uninstall_code" "200"
+  check "9.6" "Service app uninstalled" "$uninstall_code" "200"
 
   # --- 9.7: Verify app is gone ---
   sleep 3
@@ -764,10 +722,148 @@ except:
 }
 
 # ─────────────────────────────────────────────────────────
-# Stage 10: VDI Post-Mortem
+# Stage 10: Workspace App Install (Code-server — catalog)
+# ─────────────────────────────────────────────────────────
+stage_workspace_app() {
+  echo -e "\n${CYAN}═══ Stage 10: Workspace App Install (Code-server) ═══${NC}"
+  ensure_session
+
+  local APP_NAME="codeserver"
+  local CATALOG_NAME="code-server"
+
+  # Fetch catalog template for code-server (workspace mode app).
+  # Uses default init (boot.sh wrapper) — exercises the exact path that was
+  # broken by the :z lsetxattr issue on per-app users.
+  # The template endpoint returns raw YAML (application/x-yaml), not JSON.
+  local template_yaml
+  template_yaml=$(api "/api/v1/catalog/$CATALOG_NAME/template")
+
+  if [[ -z "$template_yaml" ]]; then
+    echo -e "  ${RED}FAIL${NC} [10.0] Failed to fetch code-server catalog template"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+  echo -e "  ${CYAN}INFO${NC} Fetched code-server catalog template (${#template_yaml} bytes)"
+
+  # Build JSON payload with catalog_source tracking.
+  # Code-server requires a password input for its login page.
+  local payload
+  payload=$(YAML="$template_yaml" NAME="$APP_NAME" python3 -c "
+import json, os
+print(json.dumps({
+    'app_definition': os.environ['YAML'],
+    'inputs': {'__app_address__': os.environ['NAME'], 'password': 'E2eTest-2026!'},
+    'catalog_source': 'code-server'
+}))")
+
+  # --- 10.1: Install workspace app via POST /api/v1/apps ---
+  # Image pull for code-server (~500MB) can be slow. 10min timeout.
+  local token
+  token=$(csrf)
+  local install_raw install_body install_http
+  install_raw=$(curl -s -w '\n%{http_code}' --connect-timeout 10 --max-time 300 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null)
+  install_body=$(echo "$install_raw" | sed '$d')
+  install_http=$(echo "$install_raw" | tail -1)
+
+  if [[ "$install_http" == "201" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [10.1] Workspace app installed (HTTP 201)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [10.1] Workspace app install failed (HTTP $install_http)"
+    echo -e "       response: $(echo "$install_body" | head -5)"
+    ((FAIL_COUNT++)) || true
+    dump_logs "stage10-install-fail"
+    token=$(csrf)
+    curl -sf --connect-timeout 10 --max-time 30 -b "$COOKIE_JAR" \
+      -X DELETE -H "X-CSRF-Token: $token" \
+      "http://$IP/api/v1/apps/$APP_NAME" >/dev/null 2>&1 || true
+    return
+  fi
+
+  # --- 10.2: Poll for running status (up to 120s) ---
+  local app_status=""
+  for i in $(seq 1 60); do
+    app_status=$(api "/api/v1/apps/$APP_NAME" | python3 -c "
+import sys, json
+try:
+    print(json.load(sys.stdin).get('data',{}).get('app',{}).get('status',''))
+except:
+    print('')" 2>/dev/null)
+    [[ "$app_status" == "running" ]] && break
+    sleep 2
+  done
+  if [[ "$app_status" != "running" ]]; then
+    echo -e "  ${RED}FAIL${NC} [10.2] Workspace app reaches running (got: $app_status)"
+    ((FAIL_COUNT++)) || true
+    dump_logs "stage10-not-running"
+  else
+    echo -e "  ${GREEN}PASS${NC} [10.2] Workspace app reaches running"
+    ((PASS_COUNT++)) || true
+  fi
+
+  # --- 10.3: Verify app detail shows running status ---
+  # Workspace apps use --rootfs mode where container ID tracking differs from
+  # service apps. Check app-level status instead of individual container state.
+  local detail detail_status
+  detail=$(api "/api/v1/apps/$APP_NAME")
+  detail_status=$(echo "$detail" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data.get('data',{}).get('app',{}).get('status',''))
+except:
+    print('')" 2>/dev/null)
+
+  if [[ "$detail_status" == "running" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [10.3] App detail confirms running"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [10.3] App detail status: $detail_status (expected running)"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # --- 10.4: HTTP verification — traffic reaches the container ---
+  verify_app_http "10.4" "$APP_NAME" 5 3
+
+  # --- 10.5: Fetch container logs ---
+  local logs_raw logs_body logs_http
+  logs_raw=$(curl -s -w '\n%{http_code}' --connect-timeout 5 \
+    -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$APP_NAME/logs" 2>/dev/null)
+  logs_body=$(echo "$logs_raw" | sed '$d')
+  logs_http=$(echo "$logs_raw" | tail -1)
+
+  if [[ "$logs_http" == "200" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [10.5] Logs endpoint accessible"
+    ((PASS_COUNT++)) || true
+    echo -e "  ${CYAN}INFO${NC} Last 5 log lines:"
+    echo "$logs_body" | tail -5 | sed 's/^/       /'
+  else
+    echo -e "  ${RED}FAIL${NC} [10.5] Logs endpoint failed (HTTP $logs_http)"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # --- 10.6: Uninstall workspace app ---
+  token=$(csrf)
+  local uninstall_code
+  uninstall_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 30 --max-time 120 \
+    -b "$COOKIE_JAR" \
+    -X DELETE -H "X-CSRF-Token: $token" \
+    "http://$IP/api/v1/apps/$APP_NAME" 2>/dev/null)
+  check "10.6" "Workspace app uninstalled" "$uninstall_code" "200"
+
+  # --- 10.7: Verify app is gone ---
+  sleep 3
+  check_http "10.7" "App no longer exists" "GET" "/api/v1/apps/$APP_NAME" "404"
+}
+
+# ─────────────────────────────────────────────────────────
+# Stage 11: VDI Post-Mortem
 # ─────────────────────────────────────────────────────────
 stage_vdi() {
-  echo -e "\n${CYAN}═══ Stage 10: VDI Post-Mortem ═══${NC}"
+  echo -e "\n${CYAN}═══ Stage 11: VDI Post-Mortem ═══${NC}"
 
   local VM_STATE="/tmp/claude/piccolo-e2e/vm-name"
   local VDI_WORK="/tmp/claude/piccolo-e2e/piccolo-os.vdi"
@@ -776,7 +872,7 @@ stage_vdi() {
   local nbd_connected=0
 
   if [[ ! -f "$VM_STATE" ]]; then
-    skip "10.x" "VDI post-mortem" "No VM state file (manual VM?)"
+    skip "11.x" "VDI post-mortem" "No VM state file (manual VM?)"
     return
   fi
 
@@ -796,7 +892,7 @@ stage_vdi() {
   }
   trap cleanup_nbd RETURN INT TERM EXIT
 
-  # --- 10.1: Power off VM and wait for full stop ---
+  # --- 11.1: Power off VM and wait for full stop ---
   echo -e "  ${CYAN}INFO${NC} Powering off VM: $VM_NAME"
   VBoxManage controlvm "$VM_NAME" poweroff 2>/dev/null || true
 
@@ -814,29 +910,29 @@ stage_vdi() {
   sleep 2  # Grace period for VBox to release file locks
 
   if [[ $vm_stopped -eq 1 ]]; then
-    echo -e "  ${GREEN}PASS${NC} [10.1] VM powered off"
+    echo -e "  ${GREEN}PASS${NC} [11.1] VM powered off"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [10.1] VM did not stop within 30s"
+    echo -e "  ${RED}FAIL${NC} [11.1] VM did not stop within 30s"
     ((FAIL_COUNT++)) || true
     return
   fi
 
-  # --- 10.2: Mount VDI via NBD ---
+  # --- 11.2: Mount VDI via NBD ---
   sudo modprobe nbd max_part=16
   sudo qemu-nbd --disconnect "$NBD_DEV" 2>/dev/null || true
   if sudo qemu-nbd --connect="$NBD_DEV" "$VDI_WORK"; then
     nbd_connected=1
     sleep 1
-    echo -e "  ${GREEN}PASS${NC} [10.2] VDI mounted via NBD"
+    echo -e "  ${GREEN}PASS${NC} [11.2] VDI mounted via NBD"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [10.2] Failed to mount VDI via NBD"
+    echo -e "  ${RED}FAIL${NC} [11.2] Failed to mount VDI via NBD"
     ((FAIL_COUNT++)) || true
     return
   fi
 
-  # --- 10.3: Check data partition exists ---
+  # --- 11.3: Check data partition exists ---
   local sfdisk_json data_node
   sfdisk_json=$(sudo sfdisk -J "$NBD_DEV" 2>/dev/null)
   data_node=$(echo "$sfdisk_json" | python3 -c "
@@ -859,22 +955,22 @@ except (KeyError, ValueError, IndexError) as e:
 " 2>/dev/null)
 
   if [[ -n "$data_node" && "$data_node" != ERROR* ]]; then
-    echo -e "  ${GREEN}PASS${NC} [10.3] Data partition exists: $data_node"
+    echo -e "  ${GREEN}PASS${NC} [11.3] Data partition exists: $data_node"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [10.3] Data partition not found (expected >$BASE_PART_COUNT partitions)"
+    echo -e "  ${RED}FAIL${NC} [11.3] Data partition not found (expected >$BASE_PART_COUNT partitions)"
     ((FAIL_COUNT++)) || true
     return
   fi
 
-  # --- 10.4: Verify LUKS2 header on data partition ---
+  # --- 11.4: Verify LUKS2 header on data partition ---
   local luks_output luks_exit=0
   luks_output=$(sudo cryptsetup isLuks --type luks2 "$data_node" 2>&1) || luks_exit=$?
   if [[ $luks_exit -eq 0 ]]; then
-    echo -e "  ${GREEN}PASS${NC} [10.4] Data partition has LUKS2 header"
+    echo -e "  ${GREEN}PASS${NC} [11.4] Data partition has LUKS2 header"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [10.4] Data partition missing LUKS2 header (exit $luks_exit)"
+    echo -e "  ${RED}FAIL${NC} [11.4] Data partition missing LUKS2 header (exit $luks_exit)"
     echo -e "       output: $luks_output"
     ((FAIL_COUNT++)) || true
   fi
@@ -890,6 +986,7 @@ case "$STAGE" in
   pre-setup)   stage_pre_setup ;;
   setup)       stage_setup ;;
   post-setup)  stage_post_setup ;;
+  recovery)    stage_recovery ;;
   pcv)         stage_pcv ;;
   reboot)      stage_reboot ;;
   edge)        stage_edge ;;
@@ -904,14 +1001,15 @@ case "$STAGE" in
   vdi)         stage_vdi ;;
   full)
     stage_boot; stage_pre_setup; stage_setup; stage_post_setup
-    stage_pcv; stage_reboot; stage_edge; stage_service_app; stage_workspace_app
+    stage_recovery; stage_pcv; stage_reboot; stage_edge; stage_service_app; stage_workspace_app
     stage_vdi    # last — powers off VM
     ;;
-  all)         # stages 1-9, VM remains running
+  all)         # stages 1-10, VM remains running
     stage_boot
     stage_pre_setup
     stage_setup
     stage_post_setup
+    stage_recovery
     stage_pcv
     stage_reboot
     stage_edge
@@ -920,7 +1018,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid stages: boot pre-setup setup post-setup pcv reboot edge service-app workspace-app logs vdi full all"
+    echo "Valid stages: boot pre-setup setup post-setup recovery pcv reboot edge service-app workspace-app logs vdi full all"
     exit 1
     ;;
 esac
