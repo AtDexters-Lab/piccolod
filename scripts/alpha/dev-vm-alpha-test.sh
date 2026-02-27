@@ -22,7 +22,13 @@ set -euo pipefail
 
 IP="${1:?Usage: $0 <VM_IP> [stage]}"
 STAGE="${2:-all}"
-PASS="${PICCOLO_TEST_PASS:-PiccoloE2E-Test-2026!}"
+if [[ -n "${PICCOLO_TEST_PASS_FILE:-}" ]] && [[ -f "$PICCOLO_TEST_PASS_FILE" ]]; then
+  PASS=$(tr -d '\n' < "$PICCOLO_TEST_PASS_FILE")
+elif [[ -n "${PICCOLO_TEST_PASS:-}" ]]; then
+  PASS="$PICCOLO_TEST_PASS"
+else
+  PASS='PiccoloE2E-Test-2026!'
+fi
 COOKIE_JAR="/tmp/claude/piccolo-alpha/cookies.txt"
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -45,12 +51,27 @@ vssh() { ssh $SSH_OPTS "root@$IP" "$@"; }
 api()  { curl -sf --connect-timeout 5 -b "$COOKIE_JAR" -c "$COOKIE_JAR" "http://$IP$1" 2>/dev/null; }
 apij() { api "$1" | python3 -m json.tool 2>/dev/null; }
 csrf() { curl -sf --connect-timeout 5 -b "$COOKIE_JAR" "http://$IP/api/v1/auth/csrf" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null; }
-post() { curl -sf --connect-timeout 5 -b "$COOKIE_JAR" -c "$COOKIE_JAR" -X POST -H "Content-Type: application/json" -d "$2" "http://$IP$1" 2>/dev/null; }
+post() {
+  local _body_file; _body_file=$(mktemp /tmp/claude-1000/post-body-XXXXXX)
+  printf '%s' "$2" > "$_body_file"
+  curl -sf --connect-timeout 5 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -d @"$_body_file" "http://$IP$1" 2>/dev/null
+  local _rc=$?; rm -f "$_body_file"; return $_rc
+}
 post_csrf() {
   local token; token=$(csrf)
-  curl -sf --connect-timeout 10 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
-    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
-    ${2:+-d "$2"} "http://$IP$1" 2>/dev/null
+  if [[ -n "${2:-}" ]]; then
+    local _body; _body=$(mktemp /tmp/claude-1000/csrf-body-XXXXXX)
+    printf '%s' "$2" > "$_body"
+    curl -sf --connect-timeout 10 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+      -d @"$_body" "http://$IP$1" 2>/dev/null
+    local _rc=$?; rm -f "$_body"; return $_rc
+  else
+    curl -sf --connect-timeout 10 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+      "http://$IP$1" 2>/dev/null
+  fi
 }
 
 ensure_session() {
@@ -59,14 +80,16 @@ ensure_session() {
     "http://$IP/api/v1/auth/session" 2>/dev/null \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('authenticated',False))" 2>/dev/null)
   [[ "$authed" == "True" ]] && return 0
+  local _body; _body=$(mktemp /tmp/claude-1000/session-body-XXXXXX)
+  printf '{"username":"admin","password":"%s"}' "$PASS" > "$_body"
   curl -sf --connect-timeout 10 -c "$COOKIE_JAR" \
     -X POST -H "Content-Type: application/json" \
-    -d "{\"username\":\"admin\",\"password\":\"$PASS\"}" \
-    "http://$IP/api/v1/auth/login" >/dev/null 2>&1 || true
+    -d @"$_body" "http://$IP/api/v1/auth/login" >/dev/null 2>&1 || true
+  printf '{"password":"%s"}' "$PASS" > "$_body"
   curl -sf --connect-timeout 10 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
     -X POST -H "Content-Type: application/json" \
-    -d "{\"password\":\"$PASS\"}" \
-    "http://$IP/api/v1/crypto/unlock" >/dev/null 2>&1 || true
+    -d @"$_body" "http://$IP/api/v1/crypto/unlock" >/dev/null 2>&1 || true
+  rm -f "$_body"
 }
 
 check() {
@@ -203,13 +226,48 @@ stage_prereq() {
     skip "0.9" "nbd module" "not available (install nbd)"
   fi
 
-  # No FUSE storage packages
-  check_ssh_fail "0.10" "gocryptfs NOT installed" "rpm -q gocryptfs"
-  check_ssh_fail "0.11" "fuse-overlayfs NOT installed" "rpm -q fuse-overlayfs"
+  # FUSE packages — warn if present (dev templates may have them; what matters is piccolod doesn't use them)
+  if vssh "rpm -q gocryptfs" >/dev/null 2>&1; then
+    echo -e "  ${YELLOW}WARN${NC} [0.10] gocryptfs installed (OK on dev template, must not be used)"
+  else
+    echo -e "  ${GREEN}PASS${NC} [0.10] gocryptfs NOT installed"
+    ((PASS_COUNT++)) || true
+  fi
+  if vssh "rpm -q fuse-overlayfs" >/dev/null 2>&1; then
+    echo -e "  ${YELLOW}WARN${NC} [0.11] fuse-overlayfs installed (OK on dev template, must not be used)"
+  else
+    echo -e "  ${GREEN}PASS${NC} [0.11] fuse-overlayfs NOT installed"
+    ((PASS_COUNT++)) || true
+  fi
 
   # Binaries
   check_ssh_ok "0.12" "pvcreate available" "which pvcreate"
   check_ssh_ok "0.13" "cryptsetup available" "which cryptsetup"
+
+  # Rootless podman prerequisites
+  check_ssh "0.14" "newuidmap is setuid" "stat -c '%A' /usr/bin/newuidmap" "s"
+  check_ssh "0.15" "newgidmap is setuid" "stat -c '%A' /usr/bin/newgidmap" "s"
+
+  # File capabilities on newuidmap/newgidmap conflict with setuid. When both
+  # are present, the kernel refuses to raise all capabilities and the write to
+  # /proc/<pid>/uid_map fails with EPERM. Strip file capabilities if present.
+  local uidmap_caps gidmap_caps
+  uidmap_caps=$(vssh "getfattr -n security.capability /usr/bin/newuidmap 2>&1" 2>/dev/null || true)
+  gidmap_caps=$(vssh "getfattr -n security.capability /usr/bin/newgidmap 2>&1" 2>/dev/null || true)
+  if echo "$uidmap_caps" | grep -q "security.capability="; then
+    echo -e "  ${YELLOW}FIX ${NC} [0.16] Removing conflicting file capabilities from newuidmap"
+    vssh "setfattr -x security.capability /usr/bin/newuidmap" 2>/dev/null
+  else
+    echo -e "  ${GREEN}PASS${NC} [0.16] newuidmap has no conflicting file capabilities"
+    ((PASS_COUNT++)) || true
+  fi
+  if echo "$gidmap_caps" | grep -q "security.capability="; then
+    echo -e "  ${YELLOW}FIX ${NC} [0.17] Removing conflicting file capabilities from newgidmap"
+    vssh "setfattr -x security.capability /usr/bin/newgidmap" 2>/dev/null
+  else
+    echo -e "  ${GREEN}PASS${NC} [0.17] newgidmap has no conflicting file capabilities"
+    ((PASS_COUNT++)) || true
+  fi
 }
 
 # ─────────────────────────────────────────────────────────
@@ -277,6 +335,7 @@ stage_setup() {
 # ─────────────────────────────────────────────────────────
 stage_post_setup() {
   echo -e "\n${CYAN}═══ Stage 4: Post-Setup Functional Smoke ═══${NC}"
+  ensure_session
 
   check_http "4.1" "Apps endpoint accessible" "GET" "/api/v1/apps" "200"
 
@@ -300,17 +359,20 @@ stage_storage_inspect() {
   echo -e "  ${CYAN}INFO${NC} Thin pool data usage: ${data_pct}%"
 
   # Control plane
-  check_ssh_ok "5.3" "Control plane LUKS loop exists" "test -f /piccolo-core/volumes/control-plane/control-plane.luks"
+  check_ssh_ok "5.3" "Control plane LUKS loop exists" "test -f /piccolo-core/control-plane.luks"
   check_ssh "5.4" "Control plane mounted as ext4" "mount | grep control-plane" "ext4"
+  check_ssh "5.5" "LUKS mapper active" "cryptsetup status piccolo-loop-control-plane 2>&1" "is active"
+  check_ssh "5.6" "Control plane metadata" "cat /piccolo-core/volumes/control-plane/piccolo.volume.json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"type\",\"\"))'" "luks-loop"
 
-  # No FUSE mounts
-  local fuse_count
-  fuse_count=$(vssh "grep -c fuse /proc/mounts 2>/dev/null" 2>/dev/null || echo "0")
-  if [[ "$fuse_count" == "0" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [5.5] Zero FUSE mounts"
+  # No gocryptfs or other FUSE data mounts (fuse-overlayfs for rootfs overlay is OK)
+  local fuse_data
+  fuse_data=$(vssh 'grep "fuse\." /proc/mounts 2>/dev/null | grep -v fusectl | grep -v fuse-overlayfs || true' 2>/dev/null)
+  if [[ -z "$fuse_data" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [5.7] No FUSE data mounts (gocryptfs etc.)"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [5.5] Found $fuse_count FUSE mounts"
+    echo -e "  ${RED}FAIL${NC} [5.7] Unexpected FUSE data mounts:"
+    echo "$fuse_data" | sed 's/^/       /'
     ((FAIL_COUNT++)) || true
   fi
 
@@ -325,28 +387,60 @@ stage_storage_inspect() {
 }
 
 # ─────────────────────────────────────────────────────────
-# Stage 6: Overlay Verification (SSH)
+# Stage 6: Storage Layer Verification (SSH)
 # ─────────────────────────────────────────────────────────
 stage_overlay_verify() {
-  echo -e "\n${CYAN}═══ Stage 6: Zero-FUSE Overlay Verification (SSH) ═══${NC}"
+  echo -e "\n${CYAN}═══ Stage 6: Storage Layer Verification (SSH) ═══${NC}"
 
-  # No fuse-overlayfs processes
-  check_ssh_fail "6.1" "No fuse-overlayfs processes" "pgrep -c fuse-overlayfs"
-
-  # No mount_program in storage configs
-  local mount_prog
-  mount_prog=$(vssh "grep -r mount_program /etc/containers/ 2>/dev/null || true" 2>/dev/null)
-  if [[ -z "$mount_prog" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [6.2] No mount_program in container storage configs"
+  # Volume I/O is kernel-native — zero FUSE data mounts (gocryptfs/fuse.*)
+  # Note: fuse-overlayfs for container rootfs overlay is expected (per-app
+  # additionalimagestore cross-user access requires it in rootless mode).
+  local fuse_data
+  fuse_data=$(vssh 'grep "fuse\." /proc/mounts 2>/dev/null | grep -v fusectl || true' 2>/dev/null)
+  if [[ -z "$fuse_data" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [6.1] Zero FUSE data mounts (volume I/O is kernel-native)"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [6.2] Found mount_program references:"
-    echo "       $mount_prog"
+    # Check if ALL FUSE mounts are fuse-overlayfs (expected for rootfs overlay)
+    local non_overlay_fuse
+    non_overlay_fuse=$(echo "$fuse_data" | grep -v "fuse-overlayfs" || true)
+    if [[ -z "$non_overlay_fuse" ]]; then
+      echo -e "  ${GREEN}PASS${NC} [6.1] Only fuse-overlayfs (rootfs overlay) — no FUSE data mounts"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [6.1] Unexpected FUSE data mounts:"
+      echo "$non_overlay_fuse" | sed 's/^/       /'
+      ((FAIL_COUNT++)) || true
+    fi
+  fi
+
+  # System-level storage config should NOT have mount_program
+  local sys_mount_prog
+  sys_mount_prog=$(vssh "grep -r mount_program /etc/containers/ 2>/dev/null || true" 2>/dev/null)
+  if [[ -z "$sys_mount_prog" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [6.2] No mount_program in system container configs"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [6.2] Found mount_program in system configs (should only be per-app):"
+    echo "       $sys_mount_prog"
     ((FAIL_COUNT++)) || true
   fi
 
   # Kernel overlay support
   check_ssh "6.3" "Kernel overlay in /proc/filesystems" "cat /proc/filesystems" "overlay"
+
+  # Rootful podman supports idmapped mounts (confirms kernel capability)
+  check_ssh "6.4" "Rootful podman supports shifting" \
+    "podman info --format json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"store\"][\"graphStatus\"][\"Supports shifting\"])'" "true"
+
+  # Volume mounts are ext4 (not FUSE)
+  local vol_mounts
+  vol_mounts=$(vssh "mount | grep '/piccolo-core/mounts/' | head -5" 2>/dev/null || echo "")
+  if [[ -n "$vol_mounts" ]]; then
+    check "6.5" "Volume mounts use ext4" "$vol_mounts" "ext4"
+  else
+    echo -e "  ${CYAN}INFO${NC} [6.5] No app volumes currently mounted (expected before app install)"
+  fi
 }
 
 # ─────────────────────────────────────────────────────────
@@ -461,11 +555,13 @@ except: print('')" 2>/dev/null)
   done
   check "8.2" "App reaches running" "$app_status" "running"
 
-  # Verify overlay mount is kernel native (not FUSE) — SSH check after workspace install
+  # Verify workspace overlay mount uses fuse-overlayfs (cross-user UID squashing).
+  # Volume I/O is kernel-native (LUKS+ext4); fuse-overlayfs handles the rootfs
+  # overlay layer where image runtime UIDs must be squashed to the per-app user.
   local ws_overlay
   ws_overlay=$(vssh "grep 'workspace.*merged' /proc/mounts 2>/dev/null | head -1" 2>/dev/null || echo "")
   if [[ -n "$ws_overlay" ]]; then
-    check "8.3" "Workspace overlay is kernel native" "$ws_overlay" "overlay"
+    check "8.3" "Workspace overlay uses fuse-overlayfs" "$ws_overlay" "fuse-overlayfs"
   else
     skip "8.3" "Workspace overlay check" "no workspace mount found"
   fi
@@ -516,12 +612,14 @@ stage_reboot() {
 
   # Unlock
   rm -f "$COOKIE_JAR"
+  local _body; _body=$(mktemp /tmp/claude-1000/unlock-body-XXXXXX)
+  printf '{"password":"%s"}' "$PASS" > "$_body"
   local unlock_code
   unlock_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 \
     -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
     -X POST -H "Content-Type: application/json" \
-    -d "{\"password\":\"$PASS\"}" \
-    "http://$IP/api/v1/crypto/unlock" 2>/dev/null)
+    -d @"$_body" "http://$IP/api/v1/crypto/unlock" 2>/dev/null)
+  rm -f "$_body"
   check "9.3" "Unlock succeeds" "$unlock_code" "200"
 
   sleep 5
@@ -540,7 +638,7 @@ stage_storage_post() {
   check_ssh_ok "10.2" "Control plane mounted after reboot" "mountpoint -q /piccolo-core/mounts/control-plane/ 2>/dev/null || mount | grep -q control-plane"
 
   local fuse_count
-  fuse_count=$(vssh "grep -c 'fuse\\.fuse-overlayfs' /proc/mounts 2>/dev/null" 2>/dev/null || echo "0")
+  fuse_count=$(vssh 'grep -c "fuse\.fuse-overlayfs" /proc/mounts 2>/dev/null || true' 2>/dev/null | tail -1)
   if [[ "$fuse_count" == "0" ]]; then
     echo -e "  ${GREEN}PASS${NC} [10.3] No stale FUSE overlay mounts"
     ((PASS_COUNT++)) || true

@@ -70,9 +70,10 @@ func (o InitOptions) Validate() error {
 
 // MountOptions configures the overlay mount.
 //
-// NOTE: UID/GID mapping fields are populated by buildWorkspaceMountOpts but
-// not applied at the kernel overlay mount level. The container's user namespace
-// handles UID translation instead.
+// When any UID/GID field is set, fuse-overlayfs is used instead of kernel
+// overlayfs (kernel overlay cannot remap UIDs). SquashUID/GID squashes all
+// file ownership to the specified UID/GID. UIDMapping/GIDMapping provides
+// per-range mapping (colon-separated triplets: "from:to:count:from:to:count").
 type MountOptions struct {
 	SquashUID int
 	SquashGID int

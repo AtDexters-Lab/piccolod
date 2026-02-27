@@ -12,64 +12,26 @@ import (
 )
 
 // buildWorkspaceMountOpts creates MountOptions for the workspace overlay.
-// Populates UID/GID mapping fields for per-app user isolation. With kernel
-// overlay, these mappings are not applied at the mount level — the container's
-// user namespace handles UID translation instead.
-//
-// The mapping has three entries:
-//  1. Host root (UID 0) → per-app user: for files created by piccolod in the upper layer
-//  2. Image runtime UID → per-app user: for image root files (stored as runtime UID)
-//  3. Image runtime subuids → per-app subuids: for non-root image files
-func buildWorkspaceMountOpts(instanceID string, runtime container.PodmanRuntime, imageRuntime *container.PodmanRuntime) workspacedisk.MountOptions {
+// Squashes all file UIDs/GIDs to the per-app user so fuse-overlayfs grants
+// write access through the overlay regardless of the lower layer UIDs.
+func buildWorkspaceMountOpts(runtime container.PodmanRuntime) workspacedisk.MountOptions {
 	opts := workspacedisk.MountOptions{SquashUID: -1, SquashGID: -1}
 	if runtime.Credential == nil {
 		return opts
 	}
 
-	appUID := int(runtime.Credential.Uid)
-	appGID := int(runtime.Credential.Gid)
-	username := container.AppUsername(instanceID)
-
-	// squashFallback sets squash_to_uid/gid as a degraded fallback when
-	// proper UID mapping cannot be constructed (e.g., subuid lookup failure).
-	squashFallback := func(reason string, err error) workspacedisk.MountOptions {
-		log.Printf("WARN: workspace %s: %s (%v), falling back to squash_to_uid", instanceID, reason, err)
-		opts.SquashUID = appUID
-		opts.SquashGID = appGID
-		return opts
-	}
-
-	appSubStart, appSubCount, err := container.LookupSubUIDRange(username)
-	if err != nil {
-		return squashFallback("subuid lookup failed", err)
-	}
-
-	// Image layers are stored with the image runtime user's remapped UIDs
-	// (rootless Podman remaps during extraction). We need to map from the
-	// runtime's UID space to the per-app user's UID space.
-	// Format: "disk_uid:overlay_uid:count" entries separated by colons.
-	if imageRuntime != nil && imageRuntime.Credential != nil {
-		rtUID := int(imageRuntime.Credential.Uid)
-		rtGID := int(imageRuntime.Credential.Gid)
-		rtUsername := container.RuntimeUsername
-		rtSubStart, rtSubCount, err := container.LookupSubUIDRange(rtUsername)
-		if err != nil {
-			return squashFallback("runtime subuid lookup failed", err)
-		}
-		subCount := rtSubCount
-		if appSubCount < subCount {
-			subCount = appSubCount
-		}
-		// Entry 1: host root (UID 0) → per-app user (for upper layer dirs created by piccolod)
-		// Entry 2: runtime UID → per-app user (image root = stored as runtime UID)
-		// Entry 3: runtime subuids → per-app subuids (image non-root UIDs)
-		opts.UIDMapping = fmt.Sprintf("0:%d:1:%d:%d:1:%d:%d:%d", appUID, rtUID, appUID, rtSubStart, appSubStart, subCount)
-		opts.GIDMapping = fmt.Sprintf("0:%d:1:%d:%d:1:%d:%d:%d", appGID, rtGID, appGID, rtSubStart, appSubStart, subCount)
-	} else {
-		// No image runtime — assume layers have original UIDs (pulled by root).
-		opts.UIDMapping = fmt.Sprintf("0:%d:1:1:%d:%d", appUID, appSubStart, appSubCount)
-		opts.GIDMapping = fmt.Sprintf("0:%d:1:1:%d:%d", appGID, appSubStart, appSubCount)
-	}
+	// Squash all file UIDs/GIDs to the per-app user. This makes every file
+	// in the merged overlay appear owned by the per-app user, which the
+	// container's user namespace then maps to UID 0 (root) inside the container.
+	//
+	// The image layers are stored with the image runtime user's remapped UIDs
+	// (rootless Podman extraction). Per-range UID mapping (uidmapping=) would
+	// preserve individual UID distinctions but has edge cases with the overlay
+	// root directory. Squashing is simpler and sufficient: the container's user
+	// namespace provides the real UID isolation, and squashing just ensures the
+	// fuse-overlayfs layer grants write access to the per-app user.
+	opts.SquashUID = int(runtime.Credential.Uid)
+	opts.SquashGID = int(runtime.Credential.Gid)
 	return opts
 }
 
@@ -155,12 +117,8 @@ func (m *AppManager) initWorkspaceDisk(
 		return "", fmt.Errorf("initialize workspace disk: %w", err)
 	}
 
-	// Mount the overlay filesystem with UID mapping for per-app user isolation.
-	imgRt, imgRtErr := m.podmanImageRuntime()
-	if imgRtErr != nil {
-		log.Printf("WARN: workspace %s: image runtime unavailable, mount opts will lack runtime UID mapping: %v", instanceID, imgRtErr)
-	}
-	mountOpts := buildWorkspaceMountOpts(instanceID, runtime, &imgRt)
+	// Mount the overlay filesystem with UID squashing for per-app user isolation.
+	mountOpts := buildWorkspaceMountOpts(runtime)
 	mergedPath, err = m.workspaceDiskMgr.Mount(ctx, instanceID, mountOpts)
 	if err != nil {
 		m.workspacePathResolver.Unregister(instanceID)
@@ -514,11 +472,8 @@ func (m *AppManager) ensureWorkspaceDiskMounted(ctx context.Context, instanceID 
 	if appUser, err := container.ResolveAppUser(instanceID); err == nil && appUser != nil {
 		rt.Credential = appUser.Credential
 	}
-	imgRt, imgRtErr := m.podmanImageRuntime()
-	if imgRtErr != nil {
-		log.Printf("WARN: workspace %s: image runtime unavailable, mount opts will lack runtime UID mapping: %v", instanceID, imgRtErr)
-	}
-	mountOpts := buildWorkspaceMountOpts(instanceID, rt, &imgRt)
+
+	mountOpts := buildWorkspaceMountOpts(rt)
 	return m.workspaceDiskMgr.Mount(ctx, instanceID, mountOpts)
 }
 

@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -118,13 +120,21 @@ func isMountedFromMtab(mountpoint string) (bool, error) {
 	return false, scanner.Err()
 }
 
-// MountOverlay mounts the overlay filesystem using kernel-native overlayfs.
-// It combines lowerDir (base image rootfs) with upperDir (workspace writable layer).
-// lowerDir may be colon-separated (multiple overlay layers from podman image inspect).
+// needsFuseOverlay returns true when UID/GID mapping is required, which
+// kernel overlayfs cannot do — fuse-overlayfs must be used instead.
+func needsFuseOverlay(opts MountOptions) bool {
+	return opts.UIDMapping != "" || opts.GIDMapping != "" || opts.SquashUID >= 0 || opts.SquashGID >= 0
+}
+
+// MountOverlay mounts the overlay filesystem combining lowerDir (base image rootfs)
+// with upperDir (workspace writable layer). lowerDir may be colon-separated
+// (multiple overlay layers from podman image inspect).
 //
-// NOTE: MountOptions.UIDMapping/GIDMapping/SquashUID/SquashGID are accepted but
-// logged as warnings — kernel overlayfs does not support overlay-level UID
-// remapping. UID translation is handled by the container's user namespace.
+// When MountOptions includes UID/GID mapping, fuse-overlayfs is used because
+// kernel overlayfs cannot remap UIDs across users. The image layers in lowerDir
+// are owned by the image runtime user (rootless pull), while the container runs
+// as the per-app user — fuse-overlayfs translates between these UID spaces.
+// When no mapping is needed, kernel-native overlayfs is used.
 func MountOverlay(_ context.Context, layout Layout, lowerDir string, mountOpts MountOptions) error {
 	// Verify first lowerDir path is accessible (lowerDir may be colon-separated)
 	firstPath := strings.SplitN(lowerDir, ":", 2)[0]
@@ -146,8 +156,8 @@ func MountOverlay(_ context.Context, layout Layout, lowerDir string, mountOpts M
 		return ErrAlreadyMounted
 	}
 
-	if mountOpts.UIDMapping != "" || mountOpts.GIDMapping != "" || mountOpts.SquashUID >= 0 || mountOpts.SquashGID >= 0 {
-		log.Printf("WARN: overlay mount %s: UID/GID mapping requested but not supported with kernel overlay; container user namespace handles remapping", layout.Merged)
+	if needsFuseOverlay(mountOpts) {
+		return mountFuseOverlay(layout, lowerDir, mountOpts)
 	}
 
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
@@ -158,6 +168,75 @@ func MountOverlay(_ context.Context, layout Layout, lowerDir string, mountOpts M
 	}
 
 	return nil
+}
+
+// mountFuseOverlay mounts the overlay using fuse-overlayfs with UID/GID mapping.
+// This enables cross-user access: lower layers owned by the image runtime user
+// are remapped to the per-app user's UID space so the container can write
+// through the overlay.
+func mountFuseOverlay(layout Layout, lowerDir string, mountOpts MountOptions) error {
+	fuseOverlayfs, err := exec.LookPath("fuse-overlayfs")
+	if err != nil {
+		return fmt.Errorf("%w: fuse-overlayfs not found (required for cross-user workspace overlay): %v", ErrMountFailed, err)
+	}
+
+	// Build fuse-overlayfs mount options.
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
+		lowerDir, layout.Upper, layout.Work)
+
+	// UID/GID mapping: our internal format is colon-separated triplets
+	// "from:to:count:from:to:count:..." — fuse-overlayfs expects the same
+	// format but as separate -o uidmapping= entries.
+	if mountOpts.UIDMapping != "" {
+		for _, m := range parseMappingTriplets(mountOpts.UIDMapping) {
+			opts += ",uidmapping=" + m
+		}
+	}
+	if mountOpts.GIDMapping != "" {
+		for _, m := range parseMappingTriplets(mountOpts.GIDMapping) {
+			opts += ",gidmapping=" + m
+		}
+	}
+	if mountOpts.SquashUID >= 0 {
+		opts += fmt.Sprintf(",squash_to_uid=%d", mountOpts.SquashUID)
+	}
+	if mountOpts.SquashGID >= 0 {
+		opts += fmt.Sprintf(",squash_to_gid=%d", mountOpts.SquashGID)
+	}
+
+	// allow_other: root-mounted FUSE must allow access by the per-app user
+	// (container process runs as a different host UID).
+	opts += ",allow_other"
+
+	log.Printf("INFO: workspace overlay %s: using fuse-overlayfs for cross-user UID mapping", layout.Merged)
+
+	cmd := exec.Command(fuseOverlayfs, "-o", opts, layout.Merged)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: fuse-overlayfs: %v, output: %s", ErrMountFailed, err, strings.TrimSpace(string(out)))
+	}
+
+	// fuse-overlayfs daemonizes; verify the mount appeared.
+	for i := 0; i < 10; i++ {
+		if ok, _ := isMountedFromMtab(layout.Merged); ok {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	return fmt.Errorf("%w: fuse-overlayfs exited but mount not visible in /proc/mounts", ErrMountFailed)
+}
+
+// parseMappingTriplets splits a colon-separated mapping string like
+// "0:468:1:470:468:1:200000:200200:65536" into triplets like
+// ["0:468:1", "470:468:1", "200000:200200:65536"].
+func parseMappingTriplets(mapping string) []string {
+	parts := strings.Split(mapping, ":")
+	var triplets []string
+	for i := 0; i+2 < len(parts); i += 3 {
+		triplets = append(triplets, parts[i]+":"+parts[i+1]+":"+parts[i+2])
+	}
+	return triplets
 }
 
 // UnmountOverlay unmounts the overlay filesystem.
