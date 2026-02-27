@@ -42,9 +42,19 @@ The FUSE workaround exists because of a fundamental UID range incompatibility in
 
 QEMU/KVM VMs provide persistent rootfs, own UID space, and qcow2 snapshots natively — seemingly a better fit for workspaces. Rejected for one decisive reason:
 
-**GPU sharing on consumer hardware.** Multiple containers share a single NVIDIA GPU simultaneously via CUDA time-slicing (standard since Pascal, no license). VMs require VFIO passthrough (exclusive — one VM per GPU) or NVIDIA vGPU (enterprise GPUs + paid license). Intel iGPU SR-IOV requires out-of-tree `i915-sriov-dkms` kernel module. Containers share iGPU trivially via `/dev/dri/renderD128`.
+**GPU sharing on consumer hardware.** Containers share the host kernel's GPU driver — multiple containers access the same GPU simultaneously via device passthrough (`/dev/dri/renderD128`, `/dev/nvidia0`, `/dev/kfd`), with no special hardware, license, or driver required. This is vendor-agnostic:
 
-For on-device AI agents — where multiple workspace clones need GPU access — VMs are a non-starter on consumer hardware.
+- **NVIDIA:** Multiple containers share via CUDA scheduler. Works on consumer GeForce. No license.
+- **AMD:** Multiple containers share via ROCm/GPU scheduler (`/dev/dri/renderD128` + `/dev/kfd`). Works on consumer RX. No license.
+- **Intel iGPU/Arc:** Multiple containers share via `/dev/dri/renderD128`. No special driver needed.
+
+VMs cannot share GPUs this way because each VM runs its own kernel. VM GPU access requires:
+- **VFIO passthrough:** exclusive — one VM gets the GPU, others get nothing
+- **NVIDIA vGPU:** requires enterprise GPUs (A-series/H-series) + paid license. Not available on consumer GeForce.
+- **AMD SR-IOV:** datacenter MI-series only, not consumer RX GPUs
+- **Intel SR-IOV:** requires out-of-tree `i915-sriov-dkms` kernel module (12th gen+), not mainline
+
+For on-device AI agents — where multiple workspace clones need GPU access for inference or fine-tuning — VMs on consumer hardware cannot share a single GPU. This is the decisive factor.
 
 Additional: ~100MB RAM per VM kernel, TAP/bridge networking complexity, two runtime management paths (podman + QEMU).
 
@@ -408,7 +418,7 @@ Pre-idmap each image lower layer (piccolo-runtime UIDs → per-app UIDs) via `mo
 
 ### 6.2 QEMU/KVM VMs for Workspaces
 
-See §2.3. GPU sharing on consumer hardware is the decisive rejection factor.
+See §2.3. Containers share the host GPU driver across all vendors (NVIDIA, AMD, Intel). VMs require hardware-level partitioning (VFIO exclusive, vendor-specific SR-IOV/vGPU) not available on consumer GPUs.
 
 ### 6.3 dm-vdo Below dm-thin
 
