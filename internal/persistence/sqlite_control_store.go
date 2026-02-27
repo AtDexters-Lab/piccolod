@@ -704,17 +704,20 @@ func (s *sqliteControlStore) ensureWritableLocked() error {
 }
 
 func (s *sqliteControlStore) volumeReady() error {
-	if err := ensureControlVolumePrepared(s.cipherDir, s.metaDir); err != nil {
-		return err
-	}
 	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") != "1" {
 		mounted, err := isMountPoint(s.mountDir)
 		if err != nil {
 			return err
 		}
-		if !mounted {
-			return ErrLocked
+		if mounted {
+			// Volume already mounted (block-native LUKS path or gocryptfs).
+			// Skip gocryptfs-specific config checks — the mount is proof of readiness.
+			return nil
 		}
+	}
+	// Not yet mounted: fall through to gocryptfs prerequisite checks (legacy path).
+	if err := ensureControlVolumePrepared(s.cipherDir, s.metaDir); err != nil {
+		return err
 	}
 	return nil
 }

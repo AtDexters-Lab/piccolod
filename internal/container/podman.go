@@ -105,6 +105,12 @@ func (rt PodmanRuntime) Validate() error {
 // because CLI storage flags can cause Podman to reinitialize storage options
 // from scratch, dropping additionalimagestores from the config.
 //
+// The overlay section uses mount_program + force_mask for cross-user imagestore
+// access. The shared imagestore is owned by piccolo-runtime, while per-app
+// containers run as separate users. Without force_mask, the kernel overlay
+// driver cannot remap UIDs across these users, causing "permission denied"
+// during container rootfs setup. fuse-overlayfs handles this transparently.
+//
 // The file is only written when its content would change (idempotent).
 func ensureAdditionalStoresConf(rt PodmanRuntime) (string, error) {
 	confPath := filepath.Join(rt.Root, "storage.conf")
@@ -114,8 +120,18 @@ func ensureAdditionalStoresConf(rt PodmanRuntime) (string, error) {
 	for i, s := range rt.AdditionalImageStores {
 		quoted[i] = fmt.Sprintf("%q", s)
 	}
-	content := fmt.Sprintf("[storage]\ndriver = %q\ngraphroot = %q\nrunroot = %q\n\n[storage.options]\nadditionalimagestores = [%s]\n",
-		rt.StorageDriver, rt.Root, rt.RunRoot, strings.Join(quoted, ", "))
+
+	// fuse-overlayfs with force_mask="shared" enables cross-user imagestore
+	// access. This is the only remaining FUSE path — volume I/O is fully
+	// kernel-native (LUKS+ext4). The FUSE surface is minimal: container rootfs
+	// overlay is read-mostly and page-cached.
+	overlaySection := ""
+	if fuseOverlayfs, err := exec.LookPath("fuse-overlayfs"); err == nil && rt.Credential != nil {
+		overlaySection = fmt.Sprintf("\n[storage.options.overlay]\nmount_program = %q\nforce_mask = \"shared\"\n", fuseOverlayfs)
+	}
+
+	content := fmt.Sprintf("[storage]\ndriver = %q\ngraphroot = %q\nrunroot = %q\n\n[storage.options]\nadditionalimagestores = [%s]\n%s",
+		rt.StorageDriver, rt.Root, rt.RunRoot, strings.Join(quoted, ", "), overlaySection)
 
 	// Only write if content changed.
 	existing, err := os.ReadFile(confPath)

@@ -139,16 +139,28 @@ func (m *luksVolumeManager) ReconcileAllVolumeStates() error {
 }
 
 // EnsureVolume creates a volume if it doesn't exist, or returns an existing one.
+// On a fresh system (before /crypto/setup), the crypto manager is not initialized.
+// In that case, we return a handle with the expected mount path without creating
+// the volume — the actual creation happens during the setup flow.
 func (m *luksVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest) (VolumeHandle, error) {
+	handle := VolumeHandle{
+		ID:       req.ID,
+		MountDir: paths.MountDir(req.ID),
+	}
+
 	metaDir := paths.VolumeMetaDir(req.ID)
 	metaPath := filepath.Join(metaDir, metadataV2File)
 
 	// Check if volume already exists.
 	if _, err := os.Stat(metaPath); err == nil {
-		return VolumeHandle{
-			ID:       req.ID,
-			MountDir: paths.MountDir(req.ID),
-		}, nil
+		return handle, nil
+	}
+
+	// If crypto is not initialized yet (fresh system before setup), return
+	// a handle without creating the volume. Attach will fail with ErrLocked
+	// until the setup flow creates and initializes the volume.
+	if m.crypto == nil || !m.crypto.IsInitialized() {
+		return handle, nil
 	}
 
 	switch req.Class {
@@ -163,8 +175,13 @@ func (m *luksVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 
 // Attach mounts a volume, making it available for I/O.
 func (m *luksVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opts AttachOptions) error {
-	meta, err := readVolumeMeta(filepath.Join(paths.VolumeMetaDir(handle.ID), metadataV2File))
+	metaPath := filepath.Join(paths.VolumeMetaDir(handle.ID), metadataV2File)
+	meta, err := readVolumeMeta(metaPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// Volume not yet initialized (pre-setup state).
+			return ErrLocked
+		}
 		return fmt.Errorf("read volume metadata: %w", err)
 	}
 
@@ -199,14 +216,20 @@ func (m *luksVolumeManager) Detach(ctx context.Context, handle VolumeHandle) err
 func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error {
 	metaDir := paths.VolumeMetaDir(id)
 	metaPath := filepath.Join(metaDir, metadataV2File)
+	mountDir := paths.MountDir(id)
 
 	meta, err := readVolumeMeta(metaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // already gone
+			// No metadata — clean up any stale mount/metadata dirs.
+			m.cleanupStaleAppState(ctx, id)
+			return nil
 		}
 		return fmt.Errorf("read volume metadata: %w", err)
 	}
+
+	// Detach (unmount + close LUKS + close device stack) before removing.
+	_ = m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir})
 
 	switch meta.Type {
 	case "luks-loop":
@@ -226,10 +249,26 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 	}
 
 	// Remove mount directory.
-	mountDir := paths.MountDir(id)
 	_ = os.RemoveAll(mountDir)
 
 	return nil
+}
+
+// cleanupStaleAppState tears down leftover LUKS mappers, LVs, and dirs for a
+// volume that has no metadata (e.g., partial creation that was interrupted).
+func (m *luksVolumeManager) cleanupStaleAppState(ctx context.Context, id string) {
+	mountDir := paths.MountDir(id)
+	mapper := "piccolo-vol-" + id
+	lvName := "vol-" + id
+
+	// Best-effort teardown: unmount → close LUKS → deactivate LV → remove LV.
+	_ = m.run.Run(ctx, "umount", mountDir)
+	_ = m.run.Run(ctx, "cryptsetup", "close", mapper)
+	if m.lvMgr != nil && m.lvMgr.LVExists(ctx, lvName) {
+		_ = m.lvMgr.RemoveThinLV(ctx, lvName)
+	}
+	_ = os.RemoveAll(paths.VolumeMetaDir(id))
+	_ = os.RemoveAll(mountDir)
 }
 
 // RoleStream returns a channel that emits role changes for a volume.
@@ -309,7 +348,13 @@ func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeReque
 	lvName := "vol-" + req.ID
 	sizeBytes := int64(10 << 30) // 10 GiB default
 
-	// Create thin LV.
+	if m.lvMgr.LVExists(ctx, lvName) {
+		// LV exists from a partial previous attempt. Tear down stale LUKS/mount
+		// state so we can re-format the device cleanly.
+		m.cleanupStaleAppState(ctx, req.ID)
+		// Re-create: remove the old LV and start fresh.
+		_ = m.lvMgr.RemoveThinLV(ctx, lvName)
+	}
 	if err := m.lvMgr.CreateThinLV(ctx, lvName, sizeBytes); err != nil {
 		return VolumeHandle{}, fmt.Errorf("create thin LV: %w", err)
 	}
@@ -417,6 +462,25 @@ func (m *luksVolumeManager) attachAppVolume(ctx context.Context, handle VolumeHa
 
 	// Mount ext4.
 	mountDir := handle.MountDir
+	// Ensure the mounts/ parent directory is traversable (0o711) so per-app
+	// users can reach their own mount points without being able to list siblings.
+	mountsParent := filepath.Dir(mountDir)
+	if err := os.MkdirAll(mountsParent, 0o711); err != nil {
+		m.run.Run(ctx, "cryptsetup", "close", mapper)
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("create mounts parent: %w", err)
+	}
+	if err := os.Chmod(mountsParent, 0o711); err != nil {
+		m.run.Run(ctx, "cryptsetup", "close", mapper)
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("chmod mounts parent: %w", err)
+	}
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
 		m.run.Run(ctx, "cryptsetup", "close", mapper)
 		stack.Close(ctx)
@@ -471,6 +535,12 @@ func (m *luksVolumeManager) detachAppVolume(ctx context.Context, handle VolumeHa
 
 func (m *luksVolumeManager) buildStack(volumeID, lvName string, sizeBytes int64) (*blockdev.DeviceStack, error) {
 	thinDev := blockdev.NewThinLVDevice(m.lvMgr, lvName, sizeBytes)
+
+	// Single-node mode: when NBD/DRBD managers are nil, the stack is just
+	// the thin LV. LUKS is applied directly on the LV device.
+	if m.nbdSrv == nil || m.drbdMgr == nil {
+		return blockdev.NewDeviceStack(volumeID, thinDev)
+	}
 
 	nbdDev := blockdev.NewNBDDevice(
 		m.nbdSrv,

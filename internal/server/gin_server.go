@@ -43,6 +43,8 @@ import (
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage"
 	"piccolod/internal/storage/diskprep"
+	"piccolod/internal/storage/drbd"
+	"piccolod/internal/storage/nbd"
 	"piccolod/internal/update"
 
 	"github.com/coreos/go-systemd/v22/daemon"
@@ -408,6 +410,13 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	diskPreparer := diskprep.NewPreparer(execRunner)
 	storageMgr := storage.NewManager(diskPreparer, eventsBus, execRunner)
 
+	// Initialize NBD server and DRBD resource manager for block-native volume stack.
+	// On single-node deployments (no cluster), these are nil — the volume manager
+	// uses a simplified stack: thin LV → LUKS → ext4 (no NBD/DRBD layers).
+	// TODO: enable when cluster support is wired in.
+	var nbdSrv *nbd.Server
+	var drbdMgr *drbd.ResourceManager
+
 	// Initialize onboarding manager (detects boot mode for USB onboarding flow).
 	bootMode, bootErr := storage.DetectBootMode(context.Background(), execRunner)
 	if bootErr != nil {
@@ -448,6 +457,10 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		Crypto:     cmgr,
 		StateDir:   stateDir,
 		DataDir:    paths.CoreRoot(),
+		Runner:     execRunner,
+		LVMgr:      storageMgr.LVMVolumes(),
+		NBDSrv:     nbdSrv,
+		DRBDMgr:    drbdMgr,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to init persistence module: %w", err)

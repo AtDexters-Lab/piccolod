@@ -69,14 +69,17 @@ func (p *PoolManager) CreatePool(ctx context.Context, device string) error {
 		p.cfg.VGName,
 	}
 
-	// Configure error_if_no_space to fail immediately when full
-	// rather than queueing I/O (which can cause hangs).
-	if p.cfg.ErrorOnFull {
-		args = append(args, "--errorwhenfull", "y")
-	}
-
 	if err := p.run.Run(ctx, "lvcreate", args...); err != nil {
 		return fmt.Errorf("lvcreate thin-pool: %w", err)
+	}
+
+	// Set error_if_no_space post-creation via lvchange (lvcreate rejects
+	// --errorwhenfull for thin pools on some LVM versions).
+	if p.cfg.ErrorOnFull {
+		poolPath := fmt.Sprintf("%s/%s", p.cfg.VGName, p.cfg.PoolName)
+		if err := p.run.Run(ctx, "lvchange", "--errorwhenfull", "y", poolPath); err != nil {
+			log.Printf("WARN: lvchange --errorwhenfull failed for %s: %v", poolPath, err)
+		}
 	}
 
 	log.Printf("LVM thin pool created: %s/%s on %s (%d%% VG)", p.cfg.VGName, p.cfg.PoolName, device, p.cfg.ExtentPct)

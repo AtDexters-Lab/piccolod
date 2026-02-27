@@ -126,9 +126,9 @@ func TestPoolManager_CreatePool(t *testing.T) {
 		t.Fatalf("CreatePool: %v", err)
 	}
 
-	// Verify command sequence: pvcreate → vgcreate → lvcreate
-	if len(run.calls) != 3 {
-		t.Fatalf("expected 3 commands, got %d: %v", len(run.calls), run.calls)
+	// Verify command sequence: pvcreate → vgcreate → lvcreate → lvchange
+	if len(run.calls) != 4 {
+		t.Fatalf("expected 4 commands, got %d: %v", len(run.calls), run.calls)
 	}
 	if !strings.HasPrefix(run.calls[0], "pvcreate") {
 		t.Errorf("first call should be pvcreate, got %q", run.calls[0])
@@ -139,8 +139,8 @@ func TestPoolManager_CreatePool(t *testing.T) {
 	if !strings.Contains(run.calls[2], "lvcreate") {
 		t.Errorf("third call should be lvcreate, got %q", run.calls[2])
 	}
-	if !strings.Contains(run.calls[2], "--errorwhenfull") {
-		t.Error("expected --errorwhenfull in lvcreate args")
+	if !strings.Contains(run.calls[3], "lvchange") || !strings.Contains(run.calls[3], "--errorwhenfull") {
+		t.Errorf("fourth call should be lvchange --errorwhenfull, got %q", run.calls[3])
 	}
 }
 

@@ -13,8 +13,12 @@ import (
 	"piccolod/internal/cluster"
 	"piccolod/internal/crypt"
 	"piccolod/internal/events"
+	"piccolod/internal/runner"
 	"piccolod/internal/runtime/commands"
 	"piccolod/internal/state/paths"
+	"piccolod/internal/storage/drbd"
+	"piccolod/internal/storage/lvm"
+	"piccolod/internal/storage/nbd"
 )
 
 // Options captures construction parameters for the persistence service.
@@ -30,6 +34,12 @@ type Options struct {
 	Crypto         *crypt.Manager
 	StateDir       string
 	DataDir        string
+
+	// Block-native storage dependencies (for luksVolumeManager).
+	Runner  runner.CommandRunner
+	LVMgr   *lvm.LVManager
+	NBDSrv  *nbd.Server
+	DRBDMgr *drbd.ResourceManager
 }
 
 // Module implements the Service interface using pluggable sub-components.
@@ -112,11 +122,18 @@ func NewService(opts Options) (*Module, error) {
 		if mod.crypto == nil {
 			return nil, ErrCryptoUnavailable
 		}
-		dataDir := opts.DataDir
-		if dataDir == "" {
-			dataDir = paths.CoreRoot()
+		run := opts.Runner
+		if run == nil {
+			run = runner.ExecRunner{}
 		}
-		mod.volumes = newFileVolumeManager(mod.stateDir, dataDir, mod.crypto, mod.events)
+		mod.volumes = NewLUKSVolumeManager(LUKSVolumeManagerConfig{
+			Run:     run,
+			Crypto:  mod.crypto,
+			Bus:     mod.events,
+			LVMgr:   opts.LVMgr,
+			NBDSrv:  opts.NBDSrv,
+			DRBDMgr: opts.DRBDMgr,
+		})
 	}
 	if rc, ok := mod.volumes.(RoleCheckable); ok {
 		rc.SetRoleChecker(func(volumeID string, role VolumeRole) bool {
@@ -191,6 +208,15 @@ func (m *Module) attachControlVolume(ctx context.Context) error {
 	}
 	if m.controlHandle.ID == "" {
 		return fmt.Errorf("control volume handle unavailable")
+	}
+	// Re-ensure the control volume: on a fresh system, the initial EnsureVolume
+	// during startup defers creation (crypto not ready). Now that crypto is
+	// initialized and unlocked, this creates the LUKS loop volume if needed.
+	controlReq := VolumeRequest{ID: "control-plane", Class: VolumeClassControl, ClusterMode: ClusterModeStateful}
+	if handle, err := m.volumes.EnsureVolume(ctx, controlReq); err != nil {
+		return fmt.Errorf("ensure control volume: %w", err)
+	} else {
+		m.controlHandle = handle
 	}
 	role := VolumeRoleLeader
 	if m.leadership != nil {
