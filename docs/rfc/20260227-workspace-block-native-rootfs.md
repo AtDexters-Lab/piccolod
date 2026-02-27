@@ -1,329 +1,477 @@
-# RFC: Workspace Block-Native Rootfs — Single-LV Architecture with dm-thin Cloning
+# RFC: Unified Block-Native Rootfs — Golden LV, dm-vdo, Single LUKS Key
 
 **Date:** 2026-02-27
 **Status:** Draft
 **Supersedes:** `20260101-workspace-disk-container-independent.md` (overlay-based workspace persistence)
+**Breaks:** This is a clean break from the current overlay-based rootfs and per-volume LUKS key model. No migration code, no dual-path logic. Existing volumes must be destroyed and recreated.
 
 ## 1. Summary
 
-Replace the overlay-based workspace persistence model (overlayfs upper/lower on a data volume) with a single block device per workspace: a dm-thin LV containing the complete rootfs and user data. Containers mount this directly via `podman create --rootfs`. Workspace cloning is achieved via instant dm-thin snapshots.
+Replace overlay-based container rootfs management (both workspace and service) with a unified golden LV architecture: a flattened OCI image on a dm-thin LV serves as a template, dm-thin snapshots provide per-container rootfs instances, dm-vdo above LUKS provides transparent compression, and idmapped mounts handle UID translation. A single LUKS master key encrypts all volumes.
 
-This eliminates overlay filesystems, FUSE, and UID mapping from the workspace path entirely. The container becomes a thin wrapper around a mounted block device.
+This eliminates overlay filesystems, FUSE, fuse-overlayfs, `additionalimagestore`, and per-app `storage.conf` from the entire stack. Containers become thin wrappers around mounted block devices via `podman create --rootfs`.
 
 ## 2. Motivation
 
 ### 2.1 Current Architecture Pain
 
-The current workspace model (RFC `20260101`) uses overlayfs to layer a writable upper dir on top of shared base image layers:
+Both service and workspace containers use fuse-overlayfs to layer image content with per-app writable state. This was implemented as a workaround during block-native M4 (see testing journal in `20260226-block-native-implementation.md`).
 
 ```
-Image layers (lowerdir, shared, owned by piccolo-runtime UID 470)
-  + Upper dir (on per-app LUKS+ext4 data volume)
+Image layers (lowerdir, owned by piccolo-runtime UID 470)
+  + Upper dir (per-app writable layer)
   + Work dir
-  = Merged rootfs (overlay mount)
+  = fuse-overlayfs merged rootfs
 ```
 
-This works but requires solving cross-user UID ownership at the overlay layer:
+### 2.2 The Cross-User UID Problem
 
-1. **Rootless podman UID mismatch.** Image layers are stored with `piccolo-runtime` (UID 470) rootless-remapped UIDs. Per-app containers run as separate users (UID 468+). Kernel overlayfs cannot translate UIDs across these users.
+The FUSE workaround exists because of a fundamental UID range incompatibility in overlayfs, not merely a rootless podman limitation.
 
-2. **`mount_setattr(MOUNT_ATTR_IDMAP)` blocked by podman.** The kernel supports idmapped overlay mounts (5.19+), but `containers/storage` hardcodes `Supports shifting: false` when `euid != 0`. Per-app podman runs rootless — this path is unreachable regardless of kernel capability.
+**The setup:** `piccolo-runtime` (UID 470, subuid 200000-265535) pulls images. On disk, image layers have piccolo-runtime's remapped UIDs: UID 470 for container root, UID 200033 for www-data, etc. Per-app containers run as separate users (e.g., UID 468, subuid 300000-365535).
 
-3. **fuse-overlayfs as workaround.** Both service and workspace containers use fuse-overlayfs to handle cross-user image access. This reintroduces FUSE to the rootfs path — the thing the block-native stack was designed to eliminate.
+**The constraint:** A kernel overlay with lower layers from piccolo-runtime (UIDs 470, 200000+) and upper from the per-app user (UIDs 468, 300000+) cannot be reconciled through a single `mount_setattr` idmap. The idmap requires non-overlapping source→target ranges. Mapping both `470→468` (from lower) and `468→468` (from upper) produces overlapping targets from different sources. Unmapped UIDs become `nobody`.
 
-4. **Workspace persistence complexity.** The `workspacedisk/` package manages overlay layout, metadata, mount/unmount lifecycle, stale mount cleanup, base image layer resolution via `podman image inspect`, and fuse-overlayfs UID squashing. This is ~500 lines solving a problem that block devices don't have.
+**Two-idmap workaround exists but is complex:** Pre-idmap each lower layer (piccolo-runtime→per-app) before creating the overlay, then both layers share the same UID space. This works on kernel 5.19+ (idmapped overlay lower layers) but requires N per-layer idmapped bind mounts, layer path discovery via `podman image inspect`, and overlay mount lifecycle management.
 
-5. **No cloning capability.** Overlay-based workspaces cannot be cloned without copying the entire upper directory. With on-device AI agents, instant workspace forking (agent experiments in isolation, discards or merges) is a key capability.
+**fuse-overlayfs** solves this in userspace via `squash_to_uid` — arbitrary UID remapping unconstrained by kernel idmap bijectivity. But it's FUSE on the rootfs I/O path.
 
-### 2.2 Why Not VMs?
+**The golden LV approach** eliminates the problem entirely: flatten the image via `podman export | tar x --numeric-owner` to produce files with real UIDs (0, 33, etc.) on ext4. One idmap. No overlay. No UID range conflicts.
 
-QEMU/KVM VMs provide persistent rootfs, own UID space, and qcow2 snapshots natively — seemingly a better fit for workspaces. We evaluated this and rejected it for one decisive reason:
+### 2.3 Why Not VMs?
 
-**GPU sharing on consumer hardware.** Multiple containers can share a single NVIDIA GPU simultaneously via CUDA time-slicing (standard since Pascal architecture, no license required). VMs require VFIO passthrough (exclusive — one VM gets the GPU) or NVIDIA vGPU (requires enterprise GPUs + paid license). On consumer GeForce hardware, which is what piccolo users have, only one VM can access the GPU at a time.
+QEMU/KVM VMs provide persistent rootfs, own UID space, and qcow2 snapshots natively — seemingly a better fit for workspaces. Rejected for one decisive reason:
 
-For on-device AI agents — where multiple workspace clones need GPU access for inference or fine-tuning — this is a non-starter.
+**GPU sharing on consumer hardware.** Multiple containers share a single NVIDIA GPU simultaneously via CUDA time-slicing (standard since Pascal, no license). VMs require VFIO passthrough (exclusive — one VM per GPU) or NVIDIA vGPU (enterprise GPUs + paid license). Intel iGPU SR-IOV requires out-of-tree `i915-sriov-dkms` kernel module. Containers share iGPU trivially via `/dev/dri/renderD128`.
 
-Additional VM disadvantages:
-- ~100MB RAM overhead per VM kernel (significant at 10-20 workspaces on edge hardware)
-- TAP/bridge networking complexity vs container port mapping
-- Out-of-tree kernel modules for Intel iGPU SR-IOV sharing
-- Separate runtime from service mode containers (two management paths)
+For on-device AI agents — where multiple workspace clones need GPU access — VMs are a non-starter on consumer hardware.
 
-### 2.3 Design Goals
+Additional: ~100MB RAM per VM kernel, TAP/bridge networking complexity, two runtime management paths (podman + QEMU).
 
-1. **Zero overlay, zero FUSE** for workspace rootfs I/O
-2. **Instant workspace cloning** via dm-thin snapshots
-3. **Proper multi-UID semantics** preserved (root owns `/etc`, www-data owns `/var/www`)
-4. **Compatible with existing storage stack** (thin LV → NBD → DRBD → LUKS → ext4)
-5. **Service mode unaffected** — podman continues managing service container images
+### 2.4 Design Goals
 
-## 3. Proposed Architecture
+1. **Zero overlay, zero FUSE** for all container rootfs I/O (workspace and service)
+2. **Unified architecture** — one rootfs model for both container modes
+3. **Instant workspace cloning** via dm-thin snapshots for AI agent forking
+4. **Transparent compression** via dm-vdo above LUKS (operates on plaintext)
+5. **Multi-UID semantics preserved** via kernel idmapped mounts (no UID squashing)
+6. **Single LUKS key** — simplified key management, enables golden LV sharing
+7. **Service rootfs read-only** — correctness invariant for cluster (no divergence without DRBD)
+8. **DRBD + NBD always present** for replicated volumes (standalone on single-node)
+9. **No migration, no fallbacks** — clean break, hard fail if kernel features unavailable
 
-### 3.1 Workspace Volume
+## 3. Volume Types
 
-Each workspace gets a single dm-thin LV containing the complete filesystem:
+### 3.1 Golden LV — Template (A)
 
-```
-dm-thin LV (workspace)
-  → LUKS2 (per-volume encryption, same key management as today)
-  → ext4
-  → idmapped mount (mount_setattr from piccolod, running as root)
-  → podman create --rootfs /mnt/workspace-<id>
-```
-
-No overlay. No FUSE. No separate data volume. The rootfs IS the persistent state.
-
-### 3.2 Idmapped Mount
-
-The ext4 filesystem contains files with on-disk UIDs as stored during image flatten (typically UID 0 for root, 33 for www-data, etc.). The container runs in a user namespace where container UID 0 = host UID of the per-app user.
-
-#### 3.2.1 User Namespace Creation
-
-piccolod (running as root with `CAP_SYS_ADMIN` in the init namespace) creates a dedicated user namespace to hold the UID map:
-
-1. `clone3(CLONE_NEWUSER)` — create a child process in a new user namespace
-2. Write the UID/GID map to `/proc/<child>/uid_map` and `/proc/<child>/gid_map`
-3. Open `/proc/<child>/ns/user` → obtain `userns_fd`
-4. Child exits; the userns stays alive as long as the fd (or the idmapped mount referencing it) exists
-
-Writing `uid_map`/`gid_map` from the parent process requires `CAP_SETUID`/`CAP_SETGID` in the parent namespace. piccolod (root) has these. No `newuidmap` binary is needed — direct write from the parent avoids the file-capability + setuid conflicts documented in the alpha testing journal.
-
-**Concrete UID map for a per-app user `pa-code-server` (UID 468, GID 468, subuid range 200000-265535, subgid range 200000-265535):**
-
-The per-app user's primary GID is sourced from `/etc/passwd` (the `Gid` field of `syscall.Credential`). In piccolo's per-app user isolation model (RFC 20260220), each `pa-<app>` user has a dedicated group with the same numeric ID as the UID. The subgid range mirrors the subuid range (allocated from `/etc/subgid`).
+One golden LV per unique OCI image. Contains the flattened image on ext4, compressed by dm-vdo.
 
 ```
-# /proc/<child>/uid_map: "inside_uid  outside_uid  count"
-# Map on-disk UID 0      → host UID 468    (per-app user; container sees UID 0 = root)
-# Map on-disk UID 1-65535 → host UIDs 200000-265534 (subuid range; container sees 1-65535)
+dm-thin LV → LUKS → dm-vdo (compress) → ext4 → flattened image
+```
+
+- Created at first install of an image, shared by all containers using that image
+- Never mounted during normal operation (only during creation and image updates)
+- Not replicated (no NBD, no DRBD) — reconstructable from the OCI image at any time
+- Snapshots provide service rootfs (C) and workspace (B) instances
+
+### 3.2 Workspace (B)
+
+Snapshot of a golden LV. Contains the complete rootfs + user data. Replicated.
+
+```
+dm-thin snapshot of A → NBD → DRBD → LUKS → dm-vdo → ext4 (rw) → idmapped mount → podman --rootfs
+```
+
+- Single LV = rootfs + user data. No separate data volume.
+- Replicated via DRBD (user data on rootfs). NBD always present.
+- Idmapped mount for UID translation (piccolod creates as root)
+- DRBD standalone on single-node, connected in cluster mode
+
+### 3.3 Workspace Clone (B-clone)
+
+Snapshot of an existing workspace B at its current state. For AI agent forking.
+
+```
+dm-thin snapshot of B → NBD → DRBD → LUKS → dm-vdo → ext4 (rw) → idmapped mount → podman --rootfs
+```
+
+- Instant creation (dm-thin metadata operation)
+- Origin and clone run concurrently
+- LUKS UUID change required to avoid collision (§5.4)
+
+### 3.4 Service Rootfs (C)
+
+Read-only snapshot of a golden LV. Provides the immutable base filesystem for service containers.
+
+```
+dm-thin snapshot of A → LUKS → dm-vdo → ext4 (ro)→ idmapped mount → podman --rootfs --read-only
+```
+
+- **ext4 mounted read-only** — correctness invariant. Without DRBD, cluster nodes mount independent snapshots. Read-write would allow silent divergence between nodes.
+- Not replicated (no NBD, no DRBD) — reconstructable from golden LV
+- Writable paths (`/tmp`, `/var/run`, `/dev/shm`) provided as tmpfs by podman
+- Persistent state lives on service data volume (D), bind-mounted into the container
+
+### 3.5 Service Data (D)
+
+Fresh dm-thin LV for service persistent state. Standard full-stack app data volume.
+
+```
+dm-thin LV → NBD → DRBD → LUKS → ext4 (rw)
+```
+
+- No dm-vdo — service data is typically already compressed (JPEG, video, databases) or incompressible. VDO would burn CPU with near-zero savings.
+- Independent volume per service. Replicated via DRBD.
+- Bind-mounted into the service container at app-defined paths
+
+### 3.6 Stack Summary
+
+| Volume | dm-thin | NBD | DRBD | LUKS | dm-vdo | FS | Mode | Replicated |
+|--------|---------|-----|------|------|--------|----|------|------------|
+| A (golden) | LV | — | — | yes | yes (compress) | ext4 | template | No |
+| B (workspace) | snapshot of A | yes | yes | yes | yes (compress) | ext4 rw | live | Yes |
+| B-clone | snapshot of B | yes | yes | yes | yes (compress) | ext4 rw | live | Yes |
+| C (svc rootfs) | snapshot of A | — | — | yes | yes (decompress) | ext4 ro | live | No |
+| D (svc data) | LV | yes | yes | yes | — | ext4 rw | live | Yes |
+| Ephemeral | LV | — | — | — | — | btrfs+zstd | live | No |
+
+## 4. Block Device Stack
+
+### 4.1 dm-vdo Above LUKS
+
+dm-vdo is placed above LUKS in the stack, operating on plaintext data:
+
+```
+thin LV (on disk: encrypted, compressed data)
+  ↑ LUKS decrypts
+plaintext compressed data
+  ↑ dm-vdo decompresses
+plaintext raw data
+  ↑ ext4 filesystem
+```
+
+**Why above LUKS:** VDO below LUKS (or below dm-thin) would see ciphertext. LUKS with `aes-xts-plain64` produces incompressible output. Different master keys per volume (if we had them) would prevent cross-volume dedup entirely. Placing VDO above LUKS means it operates on plaintext — compression ratios of 2-3x on container images (text configs, shared libraries, package metadata).
+
+**Configuration:** Compression enabled, dedup disabled by default. Dedup adds ~1GB RAM per 1TB and SHA-256 overhead per write — marginal benefit for piccolo's volume sizes (1-10 GiB). Within-volume dedup catches some repeated blocks in flattened images, but the ROI doesn't justify the memory cost on edge hardware. Can be enabled per-volume if needed.
+
+**VDO virtual size = physical size** (1:1, no VDO-level overprovisioning). dm-thin is the sole overprovisioning layer. VDO purely provides transparent compression — same virtual size, but fewer blocks actually written to the thin LV.
+
+**TRIM chain:** ext4 `mount -o discard` → VDO frees compressed blocks → VDO passes TRIM to LUKS → DRBD `rs-discard-granularity` → NBD `BLKDISCARD` → dm-thin deallocates. **Critical:** All `cryptsetup open` invocations MUST include `--allow-discards` (per org-context §5.1). Without it, TRIM stops at LUKS and the thin pool fills monotonically — fatal on edge hardware with small storage.
+
+**Applied to:** A (golden LV), B (workspace), B-clone, C (service rootfs). **Not applied to:** D (service data — already-compressed user data), Ephemeral (has btrfs+zstd).
+
+**Kernel requirement:** dm-vdo merged in kernel 6.9. MicroOS Tumbleweed ships 6.x.
+
+### 4.2 Single LUKS Key
+
+All volumes share a single LUKS2 master key. This is a deliberate simplification from the org-context §5.1 per-volume key model.
+
+**Key hierarchy:**
+```
+Admin password → KEK (Argon2id) → SDEK → single LUKS master key (wraps all volumes)
+```
+
+The master key is stored once in the control plane, wrapped by SDEK. Every volume's LUKS header contains the same master key, encrypted by the same keyslot passphrases.
+
+**Keyslots (per LUKS header):**
+- Keyslot 0: master key encrypted by SDEK-derived passphrase (normal boot path)
+- Keyslot 1: master key encrypted by admin-password-derived passphrase (offline recovery)
+- Keyslot 2: master key encrypted by recovery-mnemonic-derived passphrase (password lost)
+
+Since the master key is the same, all keyslots are functionally identical across volumes.
+
+**Volume creation with shared key:**
+- Golden LV (A): `cryptsetup luksFormat --master-key-file <shared-key>`, add keyslots 1 and 2
+- Snapshots (B, C): inherit LUKS header from A. Change UUID only (`cryptsetup luksUUID`)
+- Fresh volumes (D): `cryptsetup luksFormat --master-key-file <shared-key>`, add keyslots
+
+**Threat model analysis:**
+
+| Scenario | Per-volume keys | Single key | Difference |
+|----------|----------------|------------|------------|
+| Physical disk theft | Need admin password | Need admin password | None |
+| Admin password compromised | SDEK unwraps ALL volume keys | Same | None |
+| piccolod process compromised | All mounted plaintext accessible | Same | None |
+| Single key leaked from RAM | One volume exposed | All volumes exposed | Worse |
+| Crypto-shredding on uninstall | Destroy volume key → ciphertext dead | Can't — key alive in other volumes | Worse |
+
+The only practical losses are per-volume crypto-shredding and single-key-leak blast radius. For piccolo's threat model (home device, no SSH/console, physical extraction is primary attack vector):
+- The admin password gates everything regardless of key model
+- If an attacker can extract a LUKS key from RAM, they likely have full process access (→ SDEK → all keys anyway)
+- Crypto-shredding of individual volumes is a nice-to-have, not a hard requirement
+
+**What single key enables:**
+- Golden LV snapshots work for both workspace and service (no master key isolation concern)
+- One key to wrap, store, unwrap, rotate
+- Simpler boot sequence
+- Clone LUKS handling is just UUID change (no re-keying)
+
+**Admin password rotation:** Update keyslot 1 on all volumes. Same effort as per-volume keys (each volume's keyslot 1 must be updated). With single key, could optimize by skipping keyslot updates on reconstructable volumes (A, C) — their keyslots are only needed for offline recovery, and they can be recreated.
+
+### 4.3 DRBD and NBD
+
+**Always present** for replicated volumes (B, D). This aligns with org-context §6.6: "Full stack always built for app data volumes. Idle DRBD + idle NBD: negligible overhead."
+
+- **Single-node:** DRBD runs standalone (`drbdadm disconnect`), NBD serves the volume. One code path.
+- **Cluster mode:** DRBD connected, replicates ciphertext. `drbdadm connect` to enable.
+- **Runtime toggleable:** No stack reconstruction. Replication on/off is `drbdadm connect/disconnect`.
+
+**Not present** for non-replicated volumes (A, C, Ephemeral). These are reconstructable — replication adds overhead with no benefit.
+
+### 4.4 Idmapped Mounts
+
+piccolod (root, `CAP_SYS_ADMIN`) creates a user namespace to hold the UID map and applies it to the ext4 mount via `mount_setattr(MOUNT_ATTR_IDMAP)`.
+
+#### 4.4.1 User Namespace Creation
+
+1. `clone3(CLONE_NEWUSER)` — child process in new user namespace
+2. Write UID/GID maps to `/proc/<child>/uid_map` and `/proc/<child>/gid_map`
+3. Open `/proc/<child>/ns/user` → `userns_fd`
+4. Child exits; userns alive via fd
+
+No `newuidmap` binary needed — piccolod writes maps directly (avoids file-capability + setuid conflicts from alpha testing).
+
+**UID map for per-app user `pa-code-server` (UID 468, subuid 200000-265535):**
+```
+# /proc/<child>/uid_map
+0 468 1           # on-disk root → host per-app user
+1 200000 65535    # on-disk 1-65535 → host subuid range
+
+# /proc/<child>/gid_map (same structure)
 0 468 1
 1 200000 65535
 ```
 
-```
-# /proc/<child>/gid_map: same structure, using per-app GID and subgid range
-0 468 1
-1 200000 65535
-```
-
-The idmap fd lifetime: the `mount_setattr` call copies the idmap from the userns into the mount's internal state. After `mount_setattr` completes, the userns fd can be closed — the idmap is owned by the mount, not the namespace. This means: (a) no long-lived goroutine holding the fd, (b) piccolod restart does not invalidate active idmapped mounts, (c) the mount persists until explicitly unmounted.
-
-#### 3.2.2 Applying the Idmap
+#### 4.4.2 Applying the Idmap
 
 ```go
 fd, _ := unix.OpenTree(unix.AT_FDCWD, mountpoint,
     unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC|unix.AT_RECURSIVE)
 
 unix.MountSetattr(fd, "", unix.AT_EMPTY_PATH, &unix.MountAttr{
-    AttrSet:  unix.MOUNT_ATTR_IDMAP,
+    AttrSet:   unix.MOUNT_ATTR_IDMAP,
     Userns_fd: uint64(usernsFd),
 })
 
 unix.MoveMount(fd, "", unix.AT_FDCWD, targetPath, unix.MOVE_MOUNT_F_EMPTY_PATH)
 ```
 
-The sequence: `open_tree` (detach mount), `mount_setattr` (apply idmap), `move_mount` (attach at target path). This is the standard kernel-recommended pattern for idmapped mounts.
+The `mount_setattr` call copies the idmap into the mount's internal state. After completion, the userns fd can be closed — the idmap is owned by the mount. piccolod restart does not invalidate active idmapped mounts.
 
-#### 3.2.3 Interaction with Rootless Podman User Namespace
+#### 4.4.3 Interaction with Podman User Namespace
 
-**Critical question:** Does rootless podman's user namespace double-map UIDs on top of the kernel idmap?
-
-**Answer: No.** `podman create --rootfs` uses the provided path as-is for the container rootfs. The kernel idmap translates on-disk UIDs to host UIDs at the VFS layer. Podman's user namespace then maps host UIDs to container UIDs. The two mappings compose correctly:
+`podman create --rootfs` uses the provided path as-is. The kernel idmap translates on-disk UIDs to host UIDs at the VFS layer. Podman's user namespace maps host UIDs to container UIDs. The two compose correctly:
 
 ```
-On-disk UID 0
-  → idmap → host UID 468 (per-app user)
-  → podman userns → container UID 0 (per-app user's uid_map: "0 468 1")
+On-disk UID 0 → idmap → host UID 468 → podman userns → container UID 0
 ```
 
-There is no double-mapping because the idmap operates at the VFS layer (before any userspace sees the mount) and the user namespace operates at the process layer (mapping the process's effective UID to kernel UIDs). They are orthogonal translations on different axes.
+No double-mapping — idmap operates at VFS (before userspace), userns at process layer. Orthogonal translations.
 
-**Validation required before Phase 2 implementation:** Run `podman create --rootfs /tmp/test-idmap --userns=auto` against a known idmapped ext4 mount and verify file ownership inside the container. This is a Phase 1 deliverable — the `mount_setattr` integration test.
+This preserves multi-UID semantics: inside the container, `/etc` is owned by root, `/var/www` by www-data. No squashing.
 
-This preserves multi-UID semantics: inside the container, `/etc` is owned by root, `/var/www` by www-data, etc. No squashing.
+#### 4.4.4 No Kernel Fallback
 
-ext4 idmapped mounts are stable since kernel 5.12. piccolod is root — no rootless podman limitation applies. The `containers/storage` `euid != 0` guard is irrelevant because podman never touches the storage layer for `--rootfs`.
+If `mount_setattr` returns `ENOSYS` or `EINVAL`, piccolod fails hard. No fuse-overlayfs fallback. MicroOS ships kernel 6.x (ext4 idmap stable since 5.12, overlay idmap since 5.19). Hard dependency is acceptable for the target platform.
 
-#### 3.2.4 Kernel Fallback
+## 5. Lifecycle
 
-If `mount_setattr` returns `ENOSYS` (kernel < 5.12) or `EINVAL` (unsupported filesystem), fall back to fuse-overlayfs with `squash_to_uid/gid` as implemented today. Detection happens once at startup; the result is cached. Log a clear warning: `"idmapped mount unavailable (kernel too old?), falling back to fuse-overlayfs for workspace rootfs"`.
+### 5.1 Golden LV Creation
 
-### 3.3 Image Flatten
+When a workspace or service is installed and no golden LV exists for the image:
 
-At workspace install time, the OCI image is flattened into the thin LV:
-
-1. Check thin pool capacity — abort if data usage > 85% or metadata usage > 75% (configurable thresholds; metadata exhaustion is harder to recover from than data exhaustion, hence the lower threshold)
-2. `lvcreate --thin` — new thin LV (default 10 GiB, thin-provisioned)
-3. `cryptsetup luksFormat` + `luksOpen` — per-volume LUKS2
-4. `mkfs.ext4` + mount
-5. Write sentinel: `.piccolo_flatten_incomplete` to the mount root
-6. Flatten image (as root, piped from piccolo-runtime's podman):
+1. Check thin pool capacity — abort if data > 85% or metadata > 75%
+2. `lvcreate --thin` — new thin LV (default 10 GiB virtual, thin-provisioned)
+3. `cryptsetup luksFormat --master-key-file <shared-key>` → `luksOpen`
+4. Create dm-vdo target on LUKS plaintext device (compression enabled, dedup disabled)
+5. `mkfs.ext4` on VDO device, mount
+6. Write sentinel: `.piccolo_flatten_incomplete`
+7. Flatten image:
    ```
    cid=$(podman --root <runtime-root> create <image> true)
-   podman --root <runtime-root> export $cid | tar x --numeric-owner -C /mnt/ws-<id>/
+   podman --root <runtime-root> export $cid | tar x --numeric-owner --xattrs --xattrs-include='*' -C /mnt/golden-<id>/
    podman --root <runtime-root> rm $cid
    ```
-   `podman create` and `export` run under `piccolo-runtime` identity (via `SysProcAttr.Credential`, same as existing image operations) to access the shared imagestore. `tar x --numeric-owner` runs as root (piccolod) to preserve original on-disk UIDs (0 for root, 33 for www-data, etc.) without remapping.
-7. `syncfs(mount_fd)` to flush all dirty buffers for the mounted filesystem
-8. Write workspace metadata (`piccolo.volume.json`) via `fsutil.AtomicWriteFile`
-9. Remove `.piccolo_flatten_incomplete` sentinel
+   `podman create/export` run as `piccolo-runtime` to access the shared imagestore. `tar x --numeric-owner` runs as root to preserve original on-disk UIDs (0, 33, etc.). `--xattrs --xattrs-include='*'` preserves extended attributes including `security.capability` (needed for binaries like `ping` with `cap_net_raw`) and SELinux labels.
+8. `syncfs(mount_fd)`
+9. Write golden LV metadata (`piccolo.volume.json`) via `fsutil.AtomicWriteFile`
+10. Remove `.piccolo_flatten_incomplete` sentinel
+11. Unmount ext4, close VDO, close LUKS, deactivate LV
 
-**Ordering note:** metadata is written (step 8) before sentinel removal (step 9). If piccolod crashes between 8 and 9, the next startup sees the sentinel and destroys the volume — conservative but safe. The sentinel is the commit marker, not the metadata file.
+**Partial flatten recovery:** On startup, `ReconcileAllVolumeStates` destroys golden LVs with `.piccolo_flatten_incomplete` present. Sentinel written before extraction, removed after fsync.
 
-The flatten writes the complete merged filesystem tree to ext4. All OCI layers are resolved into a single directory tree. This is a one-time cost during install (~30s for a typical workspace image, dominated by extraction).
+### 5.2 Golden LV Image Update
 
-**Identity for flatten:** `podman create` runs as `piccolo-runtime` (the shared image runtime user that owns the pulled images). `podman export` produces a tar stream with numeric UIDs preserved from the image. `tar x --numeric-owner` writes files with their original UIDs (0 for root, 33 for www-data, etc.) to the ext4 mount. Since piccolod runs as root, it has permission to create files with any UID.
+When a pulled image has a new digest for the same ref:
 
-**Partial flatten recovery:** On startup, `ReconcileAllVolumeStates` checks for workspace LVs with `.piccolo_flatten_incomplete` present. Such volumes are destroyed and their metadata removed. The sentinel is written before extraction begins and removed atomically after fsync, so any interruption (crash, OOM) leaves the sentinel in place.
+1. Create a NEW golden LV for the new digest (§5.1)
+2. For each service using the old golden LV: stop container → destroy old C snapshot → create new C snapshot from new golden LV → restart
+3. Workspaces are NOT affected — B is a diverged snapshot with user data. Users create new workspaces from the updated image if desired.
+4. Once no snapshots reference the old golden LV, garbage collect it (§5.3)
 
-**Storage deduplication across workspaces:** Each workspace from the same base image stores a full copy of the flattened rootfs. For piccolo's target scale (2-5 workspaces), this is acceptable — a typical workspace image is 1-3 GiB, and thin provisioning means unread blocks are not allocated. For higher workspace density, dm-vdo (§4.3) provides transparent cross-volume deduplication as a future optimization. Workspace cloning (§3.4) from an existing workspace, by contrast, deduplicates at the block level via dm-thin CoW — clones share all unchanged blocks with the origin.
+### 5.3 Golden LV Garbage Collection
 
-### 3.4 Workspace Cloning
+On startup and after service/workspace uninstalls, scan for golden LVs with zero active snapshots (no B or C volumes reference it). Destroy: close LUKS + remove VDO + `lvremove` + remove metadata.
+
+### 5.4 Workspace Creation
+
+1. Ensure golden LV exists for the image (create if not — §5.1)
+2. `lvcreate --snapshot --name ws-<id> <vg>/golden-<image-id>` — instant
+3. `lvchange -ay <vg>/ws-<id>` — activate snapshot
+4. `cryptsetup luksUUID --uuid $(uuidgen) /dev/<vg>/ws-<id>` — unique UUID (avoids collision with golden LV and other snapshots). If UUID assignment fails, destroy the snapshot LV immediately (`lvremove`) to prevent two LVs with identical LUKS UUIDs.
+5. Write workspace metadata
+6. Attach: NBD → DRBD (standalone) → `cryptsetup open --allow-discards` → VDO open → `mount -o discard ext4` → idmapped mount
+7. `podman create --rootfs <idmapped-path>`
+
+### 5.5 Workspace Cloning
 
 ```
 lvcreate --snapshot --name ws-<clone-id> <vg>/ws-<origin-id>
 ```
 
-This is a dm-thin metadata operation — instantaneous regardless of workspace size. The clone shares all unchanged blocks with the origin via CoW. Only blocks written by the clone consume new space.
+Instant dm-thin metadata operation. Clone shares all unchanged blocks with origin via CoW.
 
-#### 3.4.1 Clone LUKS Handling
-
-The snapshot copies the LUKS2 header verbatim (same UUID, same key slots). To avoid `cryptsetup` UUID collisions when both origin and clone are open simultaneously, the clone header must be re-keyed and re-UUIDed before first open:
+**Clone LUKS handling (simplified with single key):**
 
 1. `lvcreate --snapshot` — create clone LV
-2. `lvchange -ay <vg>/ws-<clone-id>` — activate clone LV (but do NOT `cryptsetup open` yet)
-3. `cryptsetup luksUUID --uuid $(uuidgen) /dev/<vg>/ws-<clone-id>` — assign a new UUID to the clone header. This modifies only the header on the raw block device; it does not require the LUKS device to be open.
-4. Generate a new random volume key, wrap it with SDEK (same as other per-volume keys)
-5. `cryptsetup luksAddKey /dev/<vg>/ws-<clone-id> <new-keyfile> --key-file <origin-keyfile>` — add new key slot using origin's key for authentication
-6. `cryptsetup luksKillSlot /dev/<vg>/ws-<clone-id> 0` — remove the origin's key slot
-7. Store new wrapped key and nonce in clone's `piccolo.volume.json` metadata
+2. `lvchange -ay <vg>/ws-<clone-id>`
+3. `cryptsetup luksUUID --uuid $(uuidgen) /dev/<vg>/ws-<clone-id>` — unique UUID
 
-After this sequence, the clone has a distinct LUKS UUID and independent key material. If re-keying fails at any step after `lvcreate --snapshot`, the clone LV is immediately destroyed (`lvremove`) to prevent two LVs with identical LUKS headers from existing.
+No re-keying needed — single master key, all volumes share it. Just prevent UUID collision.
 
-The origin's key material is retrieved from the origin's volume metadata (`wrapped_key` + `nonce`), unwrapped via the SDEK (crypto manager), and written to a tmpfs file for the `luksAddKey` call. The tmpfs file is securely zeroed after use (same pattern as existing `writeKeyToTmpfsDir`).
+If UUID assignment fails, destroy the clone LV immediately.
 
-Clone mapper names use the clone's volume ID: `piccolo-vol-ws-<clone-id>`, distinct from the origin's `piccolo-vol-ws-<origin-id>`. No collision.
+**Concurrent operation:** Origin and clone run simultaneously. Different LUKS UUIDs → different mapper names (`piccolo-vol-ws-<origin>` vs `piccolo-vol-ws-<clone>`). dm-thin handles concurrent CoW correctly.
 
-#### 3.4.2 Concurrent Origin + Clone
+**Clone lifecycle:**
+- **Fork:** pool capacity check → `lvcreate --snapshot` → UUID change → metadata → attach → start
+- **Discard:** stop → detach → `lvremove`
+- **Promote:** stop both → swap metadata references → archive/destroy old origin
+- **Origin uninstall with active clones:** permitted — dm-thin snapshots are independent after creation. Clone continues to function. `clone_of` becomes dangling reference (informational only).
 
-Both origin workspace and clone workspace can be mounted and running simultaneously. This is the primary use case for AI agent forking. After re-keying (§3.4.1), the origin and clone are independent LUKS devices with different UUIDs and different mapper names. dm-thin handles concurrent CoW correctly — writes to either device allocate new chunks from the pool without affecting the other.
+### 5.6 Service Rootfs Creation
 
-**dm-thin chunk size consideration:** The pool uses 64k chunks (from `pool.go`). A single LUKS sector write (512 bytes) triggers CoW on a 64k chunk. For write-heavy workloads in a clone (compilation, model fine-tuning), this causes write amplification at the block layer. For read-heavy AI inference workloads, it's negligible. The 64k chunk size is a reasonable default; if write amplification becomes a measured problem, the pool can be recreated with larger chunks (at the cost of less granular space allocation).
+1. Ensure golden LV exists for the image (§5.1)
+2. `lvcreate --snapshot --name svc-rootfs-<id> <vg>/golden-<image-id>`
+3. `cryptsetup luksUUID --uuid $(uuidgen) /dev/<vg>/svc-rootfs-<id>` — if UUID assignment fails, destroy the snapshot LV immediately (`lvremove`)
+4. Write service rootfs metadata
+5. Attach: `cryptsetup open --allow-discards` → VDO open → `mount -o ro,discard ext4` → idmapped mount
+6. `podman create --rootfs <idmapped-path> --read-only`
 
-#### 3.4.3 Clone Lifecycle
+**Writable paths:** Podman provides tmpfs for `/tmp`, `/var/run`, `/dev/shm`. Additional writable mounts configured per-app (bind mounts from data volume D). This is standard read-only root filesystem behavior (same as Kubernetes `readOnlyRootFilesystem: true`).
 
-- **Fork:** check pool capacity (data < 85%, metadata < 75%) → `lvcreate --snapshot` + re-UUID + re-key LUKS + create metadata → instant clone
-- **Discard:** stop container, `cryptsetup close`, `lvremove` → instant cleanup
-- **Promote:** stop both containers, swap metadata volume references, archive or destroy the old origin
-- **Merge:** application-level — rsync specific paths from clone to origin (conflict resolution is the caller's responsibility, not the storage layer's)
-- **Origin uninstall with active clones:** dm-thin snapshots are independent after creation — the clone's data is self-contained (CoW divergence means shared blocks are retained as long as any snapshot references them). Uninstalling the origin while clones exist is permitted. The origin's metadata and LUKS mapper are removed; the clone continues to function. The `clone_of` field in clone metadata becomes a dangling reference (informational only, not load-bearing).
+### 5.7 Replication
 
-`lvm.LVManager` gains a new method: `CreateSnapshot(ctx, originLV, snapshotName) error`.
-
-### 3.5 Replication
-
-Workspace thin LVs use the same replication path as data volumes:
+Workspace (B) and service data (D) volumes use the full replication stack:
 
 ```
-thin LV → NBD → DRBD → LUKS → ext4
+thin LV → NBD → DRBD → LUKS → [VDO] → ext4
 ```
 
-Since there's now one volume per workspace (not rootfs + data), replication is simpler — one DRBD resource covers the entire workspace state.
+One DRBD resource per volume. Since workspaces are now a single LV (not rootfs + data), replication is simpler — one resource covers the entire workspace state.
 
-### 3.6 Service Mode — No Change
+### 5.8 Teardown Sequence
 
-Service mode containers continue using podman's overlay storage driver with the `additionalimagestore` + `mount_program=fuse-overlayfs` configuration from the block-native M4 implementation. Service container rootfs is ephemeral — the overlay approach is the right fit.
+**Workspace / service data (B, D):**
+1. Stop container (`podman stop --timeout 30`, force-kill if needed)
+2. Unmount idmapped bind mount (if applicable). EBUSY → `MNT_DETACH`.
+3. Unmount ext4
+4. Close VDO target (B only)
+5. Close LUKS mapper
+6. DRBD down (if cluster)
+7. NBD disconnect
+8. Deactivate thin LV
 
-The fuse-overlayfs surface in service mode is read-mostly and page-cached. Eliminating it is a future optimization (idmapped overlay mounts from piccolod), not a current priority.
+**Service rootfs (C):**
+1. Stop container
+2. Unmount idmapped bind mount
+3. Unmount ext4 (ro)
+4. Close VDO target
+5. Close LUKS mapper
+6. Deactivate thin LV
 
-## 4. Alternatives Considered
+**Crash recovery and mount discovery:** Idmapped mounts survive piccolod crashes (they are kernel mount state, not process state). On restart, `ReconcileAllVolumeStates` discovers existing mounts by scanning `/proc/self/mountinfo` for active mount entries at known paths (`/piccolo-core/mounts/<vol-id>`). If a mount is already active, the attachment sequence skips the mount steps and reuses it. For partially-attached stacks (e.g., LUKS open but ext4 not mounted, VDO open but LUKS closed), reconciliation tears down to a known-clean state (close all layers) and re-attaches from scratch. The golden LV sentinel check (`.piccolo_flatten_incomplete`) also performs a full teardown of any partially-attached golden LV stack before `lvremove`.
 
-### 4.1 Idmapped Overlay Mounts (Incremental Fix)
+## 6. Alternatives Considered
 
-Use `mount_setattr(MOUNT_ATTR_IDMAP)` on the existing overlay mount to translate UIDs without FUSE. This would eliminate fuse-overlayfs while keeping the overlay architecture.
+### 6.1 Two-Idmap Kernel Overlayfs
 
-**Rejected because:**
-- Solves only the UID problem, not the persistence complexity or cloning capability
-- Overlay idmap support is newer (kernel 5.19) and less tested than ext4 idmap (5.12)
-- Still requires the full `workspacedisk/` overlay machinery
-- Cannot enable workspace cloning (no CoW snapshot of an overlay upper dir)
+Pre-idmap each image lower layer (piccolo-runtime UIDs → per-app UIDs) via `mount_setattr`, then create kernel overlayfs with aligned UID spaces. Technically correct on kernel 5.19+.
 
-### 4.2 QEMU/KVM VMs for Workspaces
+**Not chosen because:**
+- N per-layer idmapped bind mounts per container (5-20 layers typical)
+- Layer path discovery depends on podman storage internals
+- Overlay mount lifecycle management
+- Cannot enable workspace cloning (no CoW snapshot of overlay upper)
+- Golden LV is architecturally cleaner: one flatten, one mount, no overlay
 
-Replace container-based workspaces with lightweight VMs. Persistent rootfs, own UID space, and qcow2 snapshots are all native.
+### 6.2 QEMU/KVM VMs for Workspaces
 
-**Rejected because:**
-- **GPU sharing on consumer hardware is impossible.** VFIO gives exclusive access to one VM. NVIDIA vGPU requires enterprise GPUs + license. Multiple containers share a GPU natively via CUDA time-slicing.
-- ~100MB RAM overhead per VM kernel
-- Requires TAP/bridge networking or vsock, replacing container port mapping
-- Two runtime management paths (podman + QEMU) instead of one
+See §2.3. GPU sharing on consumer hardware is the decisive rejection factor.
 
-### 4.3 dm-vdo Under Thin Pool
+### 6.3 dm-vdo Below dm-thin
 
-Add VDO (Virtual Data Optimizer) under the thin pool for block-level deduplication and compression across all volumes. This would deduplicate identical blocks across different workspace images.
+VDO under the thin pool (`physical → VDO → thin pool → thin LVs`) would apply to all volumes.
 
-**Deferred (not rejected):**
-- ~1GB RAM per 1TB for dedup index — significant on edge hardware
-- CPU overhead on every write (SHA-256 hash + compression)
-- Can be added later as `physical → VDO → thin pool → thin LVs` without changing the workspace architecture
-- Evaluate after measuring real workload patterns on target hardware
+**Rejected:** VDO below dm-thin sees LUKS ciphertext (LUKS is above dm-thin in the stack). `aes-xts-plain64` with different sector IVs produces incompressible output. Compression and dedup provide zero benefit on ciphertext. CPU overhead of SHA-256 hashing on every write with no savings.
 
-### 4.4 OverlayBD (Block-Level Image Layers)
+### 6.4 dm-vdo on Service Data (D)
 
-Use OverlayBD to represent each OCI layer as a block device, stacked via device-mapper. Preserves per-layer sharing across different images.
+**Rejected:** Service data volumes hold user-generated content — media files, databases, application state. This data is typically already compressed (JPEG, video, SQLite) or incompressible (encrypted blobs). VDO would add CPU overhead on every write with near-zero compression benefit.
 
-**Rejected because:**
-- containerd plugin, not podman-native — heavy integration effort
-- Adds block-level layer stacking complexity (what overlayfs does but at a lower level)
-- Piccolo runs a small number of apps — per-layer cross-image dedup has low ROI
+### 6.5 Per-Volume LUKS Keys
 
-## 5. Implementation Plan
+See §4.2 threat model analysis. Per-volume keys provide crypto-shredding and reduced blast radius on key leak, but both scenarios are marginal for piccolo's threat model. The simplification of a single key (enabling golden LV sharing, simpler key management, simpler boot) outweighs the marginal security benefit.
 
-### Phase 1: `mount_setattr` Syscall Support
+### 6.6 OverlayBD
 
-Implement the raw `mount_setattr(2)` wrapper in Go:
-- `internal/fsutil/idmap.go` — syscall wrapper, userns fd creation, UID map construction
-- Unit tests with real mounts (requires root, integration test tag)
-- ~100-150 lines of Go
+containerd plugin for block-level OCI layers. Rejected: not podman-native, heavy integration, low ROI at piccolo's app count.
 
-### Phase 2: Workspace LV Lifecycle
+## 7. Volume Metadata Schema
 
-Replace `workspacedisk/` overlay machinery with thin LV management:
-- Image flatten pipeline (`podman create` + `podman export` + `tar x`)
-- Workspace thin LV creation, LUKS, ext4, idmapped mount
-- `podman create --rootfs` integration
-- Metadata migration (reuse `meta.json` schema, drop overlay-specific fields)
-
-### Phase 3: Workspace Cloning
-
-- `lvcreate --snapshot` for instant clone
-- Clone metadata and LUKS key management
-- API endpoints for clone/discard/promote
-- Integration with AI agent workspace forking
-
-### Phase 4: Cleanup
-
-- Remove `workspacedisk/` overlay machinery (mount.go, layout, stale cleanup)
-- Remove `workspace_disk_integration.go` overlay-specific code
-- Remove fuse-overlayfs dependency for workspace mode
-- Update alpha test suite
-
-## 6. Volume Metadata Schema
-
-### 6.1 New Volume Type
-
-Workspace rootfs LVs use a new metadata type to distinguish them from data volumes:
+### 7.1 Global LUKS Key (in control plane)
 
 ```json
 {
-  "version": 2,
-  "type": "luks-workspace",
-  "wrapped_key": "...",
-  "nonce": "...",
+  "luks_master_key": {
+    "wrapped_key": "base64...",
+    "nonce": "base64...",
+    "key_version": 1
+  }
+}
+```
+
+One entry in the control plane. All volumes reference this key.
+
+### 7.2 Golden LV Metadata
+
+```json
+{
+  "version": 3,
+  "type": "golden",
+  "lv_name": "golden-ubuntu-22.04-abc123",
+  "vg_name": "piccolo-data-vg",
+  "size_bytes": 10737418240,
+  "fs_type": "ext4",
+  "vdo_enabled": true,
+  "base_image_digest": "docker.io/library/ubuntu@sha256:...",
+  "base_image_ref": "ubuntu:22.04"
+}
+```
+
+### 7.3 Workspace Metadata
+
+```json
+{
+  "version": 3,
+  "type": "workspace",
   "lv_name": "ws-code-server-abc123",
   "vg_name": "piccolo-data-vg",
   "size_bytes": 10737418240,
   "fs_type": "ext4",
+  "vdo_enabled": true,
+  "golden_lv": "golden-ubuntu-22.04-abc123",
   "base_image_digest": "docker.io/library/ubuntu@sha256:...",
   "base_image_ref": "ubuntu:22.04",
   "clone_of": "",
@@ -338,110 +486,145 @@ Workspace rootfs LVs use a new metadata type to distinguish them from data volum
 }
 ```
 
-The `idmap` block stores the UID/GID map parameters used to construct the idmapped mount. These are captured at flatten time from the per-app user's `/etc/passwd` and `/etc/subuid`/`/etc/subgid` entries. Storing them in metadata ensures the idmapped mount is reconstructable across piccolod restarts and is stable even if the per-app user's subuid allocation were to change. The image-related fields (`base_image_digest`, `base_image_ref`) reuse the existing `workspacedisk.WorkspaceMeta` / `ImageConfig` types rather than defining parallel structs.
+### 7.4 Service Rootfs Metadata
 
-**LV naming:** Workspace LVs use `ws-<instanceID>` prefix (not `vol-<instanceID>` used by data volumes). Clones use `ws-<cloneID>`. The `clone_of` field references the origin LV name for clone → origin relationships (empty for non-clones).
-
-**New volume class:** `VolumeClassWorkspace` is added to `VolumeRequest`. The `luksVolumeManager.EnsureVolume` dispatcher routes workspace requests to a new `ensureWorkspaceVolume` path that handles flatten, idmap, and workspace-specific metadata.
-
-**Impact on existing code:** `DestroyVolume`, `ReconcileAllVolumeStates`, and `cleanupStaleAppState` gain a `case "luks-workspace"` branch. `cleanupStaleAppState` is updated to also check for `ws-<id>` LV names and `piccolo-vol-ws-<id>` LUKS mapper names (in addition to the existing `vol-<id>` and `piccolo-vol-<id>` patterns). `ReconcileAllVolumeStates` additionally scans for workspace LVs with the `.piccolo_flatten_incomplete` sentinel — these are destroyed even if no metadata file exists, using the `ws-` LV name prefix for identification.
-
-### 6.2 Workspace Manager Interface
-
-A new `WorkspaceBlockManager` interface in `internal/app/workspaceblock/` replaces `workspacedisk.Manager` for the block-native path:
-
-```go
-type WorkspaceBlockManager interface {
-    Flatten(ctx context.Context, instanceID string, opts FlattenOptions) error
-    Mount(ctx context.Context, instanceID string) (rootfsPath string, err error)
-    Unmount(ctx context.Context, instanceID string) error
-    Clone(ctx context.Context, originID, cloneID string) error
-    DestroyClone(ctx context.Context, cloneID string) error
-    Status(ctx context.Context, instanceID string) (Status, error)
+```json
+{
+  "version": 3,
+  "type": "service-rootfs",
+  "lv_name": "svc-rootfs-nextcloud-abc123",
+  "vg_name": "piccolo-data-vg",
+  "fs_type": "ext4",
+  "vdo_enabled": true,
+  "golden_lv": "golden-nextcloud-abc123",
+  "read_only": true,
+  "idmap": {
+    "app_uid": 467,
+    "app_gid": 467,
+    "subuid_start": 265536,
+    "subuid_count": 65535,
+    "subgid_start": 265536,
+    "subgid_count": 65535
+  }
 }
 ```
 
-The old `workspacedisk.Manager` remains as a fallback for the kernel version fallback path (§3.2.4). The `AppManager` selects the implementation at startup based on idmap capability detection.
+### 7.5 Service Data Metadata
 
-## 7. Migration
+```json
+{
+  "version": 3,
+  "type": "service-data",
+  "lv_name": "vol-nextcloud-abc123",
+  "vg_name": "piccolo-data-vg",
+  "size_bytes": 53687091200,
+  "fs_type": "ext4",
+  "vdo_enabled": false
+}
+```
 
-Existing workspace installations (overlay-based) will be migrated on first piccolod upgrade. Migration requires workspace downtime.
+### 7.6 LV Naming Conventions
 
-### 7.1 Detection
+| Volume type | LV name pattern | LUKS mapper pattern |
+|-------------|----------------|---------------------|
+| Golden | `golden-<image-short-id>` | `piccolo-vol-golden-<id>` |
+| Workspace | `ws-<instance-id>` | `piccolo-vol-ws-<id>` |
+| Service rootfs | `svc-rootfs-<instance-id>` | `piccolo-vol-svc-rootfs-<id>` |
+| Service data | `vol-<instance-id>` | `piccolo-vol-<id>` |
+| Ephemeral | `eph-<instance-id>` | N/A (no LUKS) |
 
-On startup, `ReconcileAllVolumeStates` checks each workspace volume's metadata type. Volumes with `"type": "luks-thinlv"` that have a `workspacedisk/` layout (upper/, work/, merged/ subdirs) are candidates for migration.
+## 8. Implementation Plan
 
-### 7.2 Procedure
+### Phase 1: Syscall and VDO Integration
 
-1. Stop workspace container
-2. Check thin pool capacity — abort migration if data usage > 85% or metadata > 75%
-3. Verify base image is locally cached. If not, `podman pull` the image digest from `meta.json`. If pull fails (no network, registry unavailable), defer migration to next startup — the workspace continues on the overlay path.
-4. Create new thin LV (`ws-<instanceID>`), LUKS, ext4
-5. Write `.piccolo_flatten_incomplete` sentinel
-6. **Re-flatten from image** into the new ext4 (same pipeline as §3.3 — `podman export | tar x --numeric-owner`). This ensures on-disk UIDs are the original image UIDs (0, 33, etc.), not the squashed per-app UIDs from the old fuse-overlayfs overlay.
-7. **Copy user modifications** from the old overlay upper dir on top: `rsync -aX --numeric-ids <upper>/ /mnt/ws-<id>/`. The upper dir contains only files the user modified (installed packages, config changes). These files have squashed UIDs (per-app user), so rsync them with `--chown=0:0` to restore root ownership, or more precisely, reverse the squash mapping for known UID ranges. **Simplification:** for most workspaces, user modifications are package installs (owned by root inside container = squashed to per-app UID on disk). Chowning to UID 0 on the new ext4 is correct for these. Files owned by other UIDs inside the container (rare in practice) are best-effort.
-8. `syncfs(mount_fd)`, remove sentinel
-9. Write new `"luks-workspace"` metadata via `fsutil.AtomicWriteFile`
-10. Remove old overlay dirs (upper/, work/, merged/) and old metadata
-11. Start workspace on new block-native path
+- `internal/fsutil/idmap.go` — `mount_setattr` wrapper, userns creation, UID map construction
+- `internal/storage/vdo/` — dm-vdo target create/open/close lifecycle
+- Integration tests (root required): idmapped ext4 mount, VDO create + compress + read
+- ~200 lines of Go
 
-### 7.3 Rollback
+### Phase 2: Golden LV and Workspace Lifecycle
 
-If migration fails at any step after LV creation (steps 4-8), the new LV is destroyed and the old overlay workspace remains functional. The migration is re-attempted on next startup. No data loss in any failure scenario — the old overlay is not touched until step 10, which runs only after the new volume is verified complete.
+- Golden LV manager: create, flatten, update, garbage collect
+- Workspace creation from golden LV snapshot
+- `podman create --rootfs` integration with idmapped mounts
+- Service rootfs creation from golden LV snapshot (read-only mount)
+- Volume metadata schema v3
+- Integration tests: golden LV → snapshot → mount → podman rootfs
 
-### 7.4 Phase 4 Cleanup
+### Phase 3: Workspace Cloning
 
-The old `workspacedisk/` overlay code and fuse-overlayfs dependency are removed only after migration support has shipped in at least one release cycle. This ensures users who upgrade have the migration path available. Phase 4 also removes the kernel fallback path (§3.2.4) — by this point, the minimum kernel requirement includes idmap support.
+- `lvcreate --snapshot` of existing workspace
+- Clone UUID handling
+- API endpoints: clone, discard, promote
+- Integration with AI agent workspace forking
 
-## 8. Risks
+### Phase 4: Cleanup
 
-1. **`mount_setattr` kernel compatibility.** Requires kernel 5.12+ for ext4 idmap. MicroOS (Tumbleweed-based) ships 6.x — no risk for target platform. Fallback: fuse-overlayfs squash (§3.2.4), with detection at startup.
+- Remove `workspacedisk/` overlay machinery (mount.go, layout, stale cleanup)
+- Remove `workspace_disk_integration.go` overlay-specific code
+- Remove fuse-overlayfs dependency entirely
+- Remove `additionalimagestore` configuration
+- Remove per-app `storage.conf` mount_program/force_mask
+- Update alpha test suite
 
-2. **`podman --rootfs` limitations.** podman doesn't apply OCI image config (ENTRYPOINT, CMD, ENV) when using `--rootfs`. We already handle this — `meta.json` stores image config, and container creation applies it explicitly. No new work needed.
+## 9. What This Eliminates
 
-3. **Flatten cost.** Image flatten adds ~30s to workspace install. Acceptable: image pull dominates install time, and this is a one-time cost.
+| Removed | Replaced by |
+|---------|-------------|
+| fuse-overlayfs (both modes) | ext4 + idmapped mount |
+| overlayfs entirely | dm-thin snapshot = writable layer |
+| `additionalimagestore` config | Golden LV (shared image template) |
+| Per-app `storage.conf` with `mount_program` | `podman --rootfs` (bypasses storage driver) |
+| `workspacedisk/` overlay machinery (~500 lines) | dm-thin snapshot + mount (~150 lines) |
+| `workspace_disk_integration.go` overlay code | Golden LV flatten pipeline |
+| UID squashing (`squash_to_uid`) | Kernel idmapped mount (multi-UID preserved) |
+| Separate rootfs + data volume for workspaces | Single LV per workspace |
+| Per-volume LUKS key management | Single shared key |
 
-4. **Thin snapshot LUKS interaction.** Mitigated by re-keying clone LUKS at snapshot time (§3.4.1). Integration test required: verify `cryptsetup luksChangeKey` on a thin snapshot with origin still open.
+## 10. Risks
 
-5. **Thin pool full during flatten.** Mitigated by pre-flatten capacity check (§3.3 step 1). If pool fills during extraction, ext4 returns ENOSPC — the sentinel-based recovery (§3.3) handles this as a partial flatten.
+1. **`mount_setattr` hard dependency.** Kernel 5.12+ for ext4 idmap. MicroOS ships 6.x — no risk for target platform. No fallback by design.
 
-6. **Workspace volume resize.** Initial 10 GiB is thin-provisioned (only used blocks consume pool space). For workspaces needing more (AI model weights, large datasets), expose resize via API: `lvextend` + `resize2fs` (online, no downtime). Not in Phase 2 scope but the architecture supports it.
+2. **`podman --rootfs` limitations.** OCI image config (ENTRYPOINT, CMD, ENV) not applied by `--rootfs`. Already handled — `meta.json` stores image config, container creation applies it explicitly.
 
-## 9. Operational Readiness
+3. **Flatten cost.** ~30s per unique image (one-time). Image pull dominates install time. Subsequent containers from the same image are instant snapshots.
 
-### 9.1 Observability
+4. **dm-vdo maturity.** Merged in kernel 6.9 (in-tree). VDO technology (formerly Permabit) has been in production use since Red Hat acquisition. dm-vdo is the kernel-native successor to the older `kvdo` out-of-tree module.
 
-Log events for all workspace block operations:
-- `INFO: workspace <id>: flatten started (image=<ref>, lv=ws-<id>)`
-- `INFO: workspace <id>: flatten complete (<duration>, <bytes written>)`
-- `INFO: workspace <id>: idmapped mount at <path> (uid_map: 0→<host_uid>, 1-65535→<subuid_start>)`
-- `INFO: workspace <id>: clone <clone-id> created from <origin-id>`
-- `INFO: workspace <clone-id>: re-keying clone LUKS (separating from origin <origin-id>)`
-- `WARN: workspace <id>: mount_setattr unavailable, falling back to fuse-overlayfs`
-- `ERROR: workspace <id>: flatten interrupted, marked for cleanup`
+5. **Single LUKS key blast radius.** Key leak from RAM exposes all volumes. Mitigated: if attacker has RAM access, they have process access → SDEK → all keys anyway. See §4.2.
 
-### 9.2 Error Translation
+6. **Service rootfs writable paths.** Containers expecting to write to rootfs paths not covered by tmpfs/bind mounts will get EROFS. Requires per-image analysis of writable path needs. Standard practice for read-only root filesystem containers.
 
-`mount_setattr` returns generic errno values. Translate to actionable messages:
-- `ENOSYS` → "kernel too old for idmapped mounts (need 5.12+), using fuse-overlayfs fallback"
-- `EINVAL` → "invalid UID map configuration — check subuid allocation for <username>"
+7. **Golden LV storage.** One golden LV per unique image, even if only one container uses it. At ~1-3 GiB per image (compressed by VDO to ~0.5-1 GiB), this is acceptable for piccolo's app count (5-20 apps).
+
+8. **Image update coordination.** Updating a golden LV requires stopping all service containers using it, re-creating snapshots, and restarting. More involved than `podman pull` + restart. Acceptable because image updates are infrequent and the coordination is automatable.
+
+## 11. Operational Readiness
+
+### 11.1 Observability
+
+```
+INFO: golden-lv <id>: flatten started (image=<ref>)
+INFO: golden-lv <id>: flatten complete (<duration>, <raw bytes>, <compressed bytes>, ratio=<X>x)
+INFO: workspace <id>: created from golden-lv <golden-id> (snapshot, instant)
+INFO: workspace <id>: idmapped mount at <path> (uid_map: 0→<host_uid>, 1-65535→<subuid_start>)
+INFO: workspace <id>: clone <clone-id> created (snapshot, instant)
+INFO: service-rootfs <id>: created from golden-lv <golden-id> (snapshot, read-only)
+INFO: service-data <id>: created (fresh thin LV, <size>)
+ERROR: golden-lv <id>: flatten interrupted, marked for cleanup
+ERROR: mount_setattr failed: <errno translation> — piccolod cannot start
+```
+
+### 11.2 Error Translation
+
+- `ENOSYS` → "kernel does not support idmapped mounts (need 5.12+) — cannot proceed"
+- `EINVAL` → "invalid UID map — check subuid allocation for <username>"
 - `EPERM` → "missing CAP_SYS_ADMIN — piccolod must run as root"
 
-### 9.3 Teardown Sequence
+### 11.3 Diagnostics
 
-On workspace stop:
-1. Stop container (`podman stop --timeout 30`)
-2. If container doesn't exit within timeout, force-kill (`podman kill`). The container must be terminated before unmount to avoid writes landing in a detached mount tree.
-3. Unmount the idmapped bind mount (the `move_mount` target path that `--rootfs` sees). If EBUSY, use `MNT_DETACH` (lazy unmount) — same pattern as existing `UnmountOverlay`.
-4. Unmount the underlying ext4 mount (the original mount point before `open_tree`). These are two separate mount records — the idmapped bind mount references the underlying ext4 mount. Both must be unmounted, idmapped first.
-5. Close LUKS mapper (`cryptsetup close piccolo-vol-ws-<id>`)
-6. Deactivate thin LV
-
-This integrates into the existing `detachAppVolume` path in `luksVolumeManager` via the `"luks-workspace"` type branch.
-
-### 9.4 Diagnostics
-
-Expose workspace LV state in the existing storage inspection API:
-- Which workspace LVs exist, their sizes, and clone relationships
-- Active LUKS mappers and mount status
-- Thin pool usage breakdown (workspace vs data volumes)
+Expose via storage inspection API:
+- Golden LV inventory: image ref, digest, compressed size, snapshot count
+- Per-volume: type, LV name, LUKS mapper, VDO stats (compression ratio), mount status
+- Thin pool: data%, metadata%, per-type breakdown (golden, workspace, service-rootfs, service-data, ephemeral)
+- Clone relationships: origin → clone graph
