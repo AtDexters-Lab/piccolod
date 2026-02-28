@@ -10,7 +10,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+PROJECT_DIR="$(dirname $(dirname "$SCRIPT_DIR"))"
+echo $"Project dir: $PROJECT_DIR"
 WORK_DIR="/tmp/claude/piccolo-e2e"
 VDI_PRISTINE="$WORK_DIR/piccolo-os-pristine.vdi"
 VDI_WORK="$WORK_DIR/piccolo-os.vdi"
