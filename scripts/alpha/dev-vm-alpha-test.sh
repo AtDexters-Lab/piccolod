@@ -2,7 +2,7 @@
 # dev-vm-alpha-test.sh — Test stages for block-native storage on a Tumbleweed dev VM.
 #
 # Combines HTTP API tests (same as production) with SSH-based storage inspection
-# stages for verifying the full block device stack: LVM, DRBD, NBD, LUKS, overlay.
+# stages for verifying the full block device stack: LVM, DRBD, NBD, LUKS, VDO, idmap.
 #
 # Usage:
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP>                  # run all stages
@@ -12,7 +12,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> setup            # stage 3: first-run setup
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> post-setup       # stage 4: post-setup smoke
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> storage-inspect  # stage 5: SSH storage inspection
-#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> overlay-verify   # stage 6: zero-FUSE verification
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> rootfs-verify    # stage 6: block-native rootfs verification
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> service-app      # stage 7: service app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> workspace-app    # stage 8: workspace app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> reboot           # stage 9: reboot & unlock cycle
@@ -244,6 +244,10 @@ stage_prereq() {
   check_ssh_ok "0.12" "pvcreate available" "which pvcreate"
   check_ssh_ok "0.13" "cryptsetup available" "which cryptsetup"
 
+  # dm-vdo prerequisites (block-native rootfs)
+  check_ssh_ok "0.18" "vdoformat available" "which vdoformat"
+  check_ssh "0.19" "dm-vdo kernel target available" "dmsetup targets 2>/dev/null" "vdo"
+
   # Rootless podman prerequisites
   check_ssh "0.14" "newuidmap is setuid" "stat -c '%A' /usr/bin/newuidmap" "s"
   check_ssh "0.15" "newgidmap is setuid" "stat -c '%A' /usr/bin/newgidmap" "s"
@@ -364,14 +368,14 @@ stage_storage_inspect() {
   check_ssh "5.5" "LUKS mapper active" "cryptsetup status piccolo-loop-control-plane 2>&1" "is active"
   check_ssh "5.6" "Control plane metadata" "cat /piccolo-core/volumes/control-plane/piccolo.volume.json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"type\",\"\"))'" "luks-loop"
 
-  # No gocryptfs or other FUSE data mounts (fuse-overlayfs for rootfs overlay is OK)
+  # Zero FUSE mounts — block-native rootfs uses ext4 + idmapped mounts, not FUSE
   local fuse_data
-  fuse_data=$(vssh 'grep "fuse\." /proc/mounts 2>/dev/null | grep -v fusectl | grep -v fuse-overlayfs || true' 2>/dev/null)
+  fuse_data=$(vssh 'grep "fuse\." /proc/mounts 2>/dev/null | grep -v fusectl || true' 2>/dev/null)
   if [[ -z "$fuse_data" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [5.7] No FUSE data mounts (gocryptfs etc.)"
+    echo -e "  ${GREEN}PASS${NC} [5.7] Zero FUSE mounts (no gocryptfs, no fuse-overlayfs)"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [5.7] Unexpected FUSE data mounts:"
+    echo -e "  ${RED}FAIL${NC} [5.7] Unexpected FUSE mounts (block-native rootfs should have zero):"
     echo "$fuse_data" | sed 's/^/       /'
     ((FAIL_COUNT++)) || true
   fi
@@ -381,47 +385,38 @@ stage_storage_inspect() {
   drbd_status=$(vssh "drbdadm status 2>/dev/null" 2>/dev/null || echo "no resources")
   echo -e "  ${CYAN}INFO${NC} DRBD status: $(echo "$drbd_status" | head -3)"
 
-  # Raw mount table (informational)
-  echo -e "\n  ${CYAN}Overlay mounts:${NC}"
-  vssh "grep overlay /proc/mounts 2>/dev/null | head -5" 2>/dev/null | sed 's/^/       /' || true
+  # Raw mount table (informational — expect ext4 on dm-vdo, no overlay/FUSE)
+  echo -e "\n  ${CYAN}Block-native rootfs mounts:${NC}"
+  vssh "mount | grep '/piccolo-core/mounts/' 2>/dev/null | head -10" 2>/dev/null | sed 's/^/       /' || true
 }
 
 # ─────────────────────────────────────────────────────────
-# Stage 6: Storage Layer Verification (SSH)
+# Stage 6: Block-Native Rootfs Verification (SSH)
 # ─────────────────────────────────────────────────────────
-stage_overlay_verify() {
-  echo -e "\n${CYAN}═══ Stage 6: Storage Layer Verification (SSH) ═══${NC}"
+stage_rootfs_verify() {
+  echo -e "\n${CYAN}═══ Stage 6: Block-Native Rootfs Verification (SSH) ═══${NC}"
 
-  # Volume I/O is kernel-native — zero FUSE data mounts (gocryptfs/fuse.*)
-  # Note: fuse-overlayfs for container rootfs overlay is expected (per-app
-  # additionalimagestore cross-user access requires it in rootless mode).
+  # Zero FUSE mounts — block-native rootfs eliminates fuse-overlayfs entirely.
+  # All rootfs I/O is kernel-native: ext4 + idmapped mounts via mount_setattr.
   local fuse_data
   fuse_data=$(vssh 'grep "fuse\." /proc/mounts 2>/dev/null | grep -v fusectl || true' 2>/dev/null)
   if [[ -z "$fuse_data" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [6.1] Zero FUSE data mounts (volume I/O is kernel-native)"
+    echo -e "  ${GREEN}PASS${NC} [6.1] Zero FUSE mounts (block-native rootfs — no fuse-overlayfs)"
     ((PASS_COUNT++)) || true
   else
-    # Check if ALL FUSE mounts are fuse-overlayfs (expected for rootfs overlay)
-    local non_overlay_fuse
-    non_overlay_fuse=$(echo "$fuse_data" | grep -v "fuse-overlayfs" || true)
-    if [[ -z "$non_overlay_fuse" ]]; then
-      echo -e "  ${GREEN}PASS${NC} [6.1] Only fuse-overlayfs (rootfs overlay) — no FUSE data mounts"
-      ((PASS_COUNT++)) || true
-    else
-      echo -e "  ${RED}FAIL${NC} [6.1] Unexpected FUSE data mounts:"
-      echo "$non_overlay_fuse" | sed 's/^/       /'
-      ((FAIL_COUNT++)) || true
-    fi
+    echo -e "  ${RED}FAIL${NC} [6.1] Unexpected FUSE mounts (block-native rootfs should have zero):"
+    echo "$fuse_data" | sed 's/^/       /'
+    ((FAIL_COUNT++)) || true
   fi
 
-  # System-level storage config should NOT have mount_program
+  # No mount_program in any container configs (eliminated with fuse-overlayfs)
   local sys_mount_prog
   sys_mount_prog=$(vssh "grep -r mount_program /etc/containers/ 2>/dev/null || true" 2>/dev/null)
   if [[ -z "$sys_mount_prog" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [6.2] No mount_program in system container configs"
+    echo -e "  ${GREEN}PASS${NC} [6.2] No mount_program in container configs"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [6.2] Found mount_program in system configs (should only be per-app):"
+    echo -e "  ${RED}FAIL${NC} [6.2] Found mount_program in container configs:"
     echo "       $sys_mount_prog"
     ((FAIL_COUNT++)) || true
   fi
@@ -441,6 +436,9 @@ stage_overlay_verify() {
   else
     echo -e "  ${CYAN}INFO${NC} [6.5] No app volumes currently mounted (expected before app install)"
   fi
+
+  # dm-vdo kernel target available
+  check_ssh "6.6" "dm-vdo kernel target loaded" "dmsetup targets 2>/dev/null" "vdo"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -493,6 +491,57 @@ except: print('')" 2>/dev/null)
   done
   check "7.2" "App reaches running" "$app_status" "running"
 
+  # Block-native rootfs verification (SSH)
+  # Golden LV: metadata should exist with type "golden"
+  local golden_meta
+  golden_meta=$(vssh 'for f in /piccolo-core/volumes/golden-*/piccolo.volume.json; do cat "$f" 2>/dev/null; break; done' 2>/dev/null || echo "")
+  if [[ -n "$golden_meta" ]]; then
+    check "7.2a" "Golden LV metadata exists" "$golden_meta" '"type":"golden"'
+  else
+    skip "7.2a" "Golden LV metadata" "no golden-* volume metadata found"
+  fi
+
+  # Service rootfs: metadata should exist with type "service-rootfs"
+  local svc_rootfs_meta
+  svc_rootfs_meta=$(vssh 'for f in /piccolo-core/volumes/svc-rootfs-*/piccolo.volume.json; do cat "$f" 2>/dev/null; break; done' 2>/dev/null || echo "")
+  if [[ -n "$svc_rootfs_meta" ]]; then
+    check "7.2b" "Service rootfs metadata type" "$svc_rootfs_meta" '"type":"service-rootfs"'
+    check "7.2c" "Service rootfs read-only flag" "$svc_rootfs_meta" '"read_only":true'
+    check "7.2d" "Service rootfs VDO enabled" "$svc_rootfs_meta" '"vdo_enabled":true'
+  else
+    skip "7.2b" "Service rootfs metadata" "no svc-rootfs-* volume metadata found"
+  fi
+
+  # LUKS mapper active for service rootfs
+  check_ssh "7.2e" "Service rootfs LUKS mapper active" \
+    "dmsetup info --noheadings -c -o name 2>/dev/null | grep 'piccolo-vol-svc-rootfs-' || true" "piccolo-vol-svc-rootfs-"
+
+  # dm-vdo target active for service rootfs
+  check_ssh "7.2f" "Service rootfs VDO target active" \
+    "dmsetup info --noheadings -c -o name 2>/dev/null | grep 'piccolo-vdo-svc-rootfs-' || true" "piccolo-vdo-svc-rootfs-"
+
+  # Idmapped mount exists for service rootfs
+  local svc_idmap
+  svc_idmap=$(vssh "mount | grep 'svc-rootfs.*idmap' || true" 2>/dev/null)
+  if [[ -n "$svc_idmap" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [7.2g] Service rootfs idmapped mount exists"
+    ((PASS_COUNT++)) || true
+  else
+    skip "7.2g" "Service rootfs idmapped mount" "mount entry not found"
+  fi
+
+  # Zero FUSE mounts while app is running
+  local fuse_running
+  fuse_running=$(vssh 'grep "fuse\." /proc/mounts 2>/dev/null | grep -v fusectl || true' 2>/dev/null)
+  if [[ -z "$fuse_running" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [7.2h] Zero FUSE mounts with service app running"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [7.2h] FUSE mounts found with service app running:"
+    echo "$fuse_running" | sed 's/^/       /'
+    ((FAIL_COUNT++)) || true
+  fi
+
   # Uninstall
   token=$(csrf)
   local uninstall_code
@@ -503,6 +552,14 @@ except: print('')" 2>/dev/null)
 
   sleep 3
   check_http "7.4" "App gone" "GET" "/api/v1/apps/$APP_NAME" "404"
+
+  # Post-uninstall: verify rootfs teardown
+  check_not "7.5" "No service rootfs LUKS mapper after uninstall" \
+    "$(vssh 'dmsetup info --noheadings -c -o name 2>/dev/null | grep piccolo-vol-svc-rootfs- || true' 2>/dev/null)" \
+    "piccolo-vol-svc-rootfs-"
+  check_not "7.6" "No service rootfs VDO target after uninstall" \
+    "$(vssh 'dmsetup info --noheadings -c -o name 2>/dev/null | grep piccolo-vdo-svc-rootfs- || true' 2>/dev/null)" \
+    "piccolo-vdo-svc-rootfs-"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -555,15 +612,45 @@ except: print('')" 2>/dev/null)
   done
   check "8.2" "App reaches running" "$app_status" "running"
 
-  # Verify workspace overlay mount uses fuse-overlayfs (cross-user UID squashing).
-  # Volume I/O is kernel-native (LUKS+ext4); fuse-overlayfs handles the rootfs
-  # overlay layer where image runtime UIDs must be squashed to the per-app user.
-  local ws_overlay
-  ws_overlay=$(vssh "grep 'workspace.*merged' /proc/mounts 2>/dev/null | head -1" 2>/dev/null || echo "")
-  if [[ -n "$ws_overlay" ]]; then
-    check "8.3" "Workspace overlay uses fuse-overlayfs" "$ws_overlay" "fuse-overlayfs"
+  # Block-native rootfs verification (SSH)
+  # Workspace rootfs: metadata should exist with type "workspace"
+  local ws_meta
+  ws_meta=$(vssh 'for f in /piccolo-core/volumes/ws-*/piccolo.volume.json; do cat "$f" 2>/dev/null; break; done' 2>/dev/null || echo "")
+  if [[ -n "$ws_meta" ]]; then
+    check "8.3" "Workspace rootfs metadata type" "$ws_meta" '"type":"workspace"'
+    check "8.3a" "Workspace rootfs VDO enabled" "$ws_meta" '"vdo_enabled":true'
   else
-    skip "8.3" "Workspace overlay check" "no workspace mount found"
+    skip "8.3" "Workspace rootfs metadata" "no ws-* volume metadata found"
+  fi
+
+  # LUKS mapper active for workspace
+  check_ssh "8.3b" "Workspace LUKS mapper active" \
+    "dmsetup info --noheadings -c -o name 2>/dev/null | grep 'piccolo-vol-ws-' || true" "piccolo-vol-ws-"
+
+  # dm-vdo target active for workspace
+  check_ssh "8.3c" "Workspace VDO target active" \
+    "dmsetup info --noheadings -c -o name 2>/dev/null | grep 'piccolo-vdo-ws-' || true" "piccolo-vdo-ws-"
+
+  # Idmapped mount exists for workspace
+  local ws_idmap
+  ws_idmap=$(vssh "mount | grep 'ws-.*idmap' || true" 2>/dev/null)
+  if [[ -n "$ws_idmap" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [8.3d] Workspace rootfs idmapped mount exists"
+    ((PASS_COUNT++)) || true
+  else
+    skip "8.3d" "Workspace rootfs idmapped mount" "mount entry not found"
+  fi
+
+  # Zero FUSE mounts while workspace is running
+  local fuse_ws
+  fuse_ws=$(vssh 'grep "fuse\." /proc/mounts 2>/dev/null | grep -v fusectl || true' 2>/dev/null)
+  if [[ -z "$fuse_ws" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [8.3e] Zero FUSE mounts with workspace running"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [8.3e] FUSE mounts found with workspace running:"
+    echo "$fuse_ws" | sed 's/^/       /'
+    ((FAIL_COUNT++)) || true
   fi
 
   # Uninstall
@@ -576,6 +663,24 @@ except: print('')" 2>/dev/null)
 
   sleep 3
   check_http "8.5" "App gone" "GET" "/api/v1/apps/$APP_NAME" "404"
+
+  # Post-uninstall: verify rootfs teardown
+  check_not "8.6" "No workspace LUKS mapper after uninstall" \
+    "$(vssh 'dmsetup info --noheadings -c -o name 2>/dev/null | grep piccolo-vol-ws- || true' 2>/dev/null)" \
+    "piccolo-vol-ws-"
+  check_not "8.7" "No workspace VDO target after uninstall" \
+    "$(vssh 'dmsetup info --noheadings -c -o name 2>/dev/null | grep piccolo-vdo-ws- || true' 2>/dev/null)" \
+    "piccolo-vdo-ws-"
+
+  # Golden LV GC: after uninstalling the only app using this image, golden LV should be cleaned up
+  local golden_after
+  golden_after=$(vssh 'ls /piccolo-core/volumes/golden-*/piccolo.volume.json 2>/dev/null | wc -l' 2>/dev/null || echo "0")
+  if [[ "$golden_after" == "0" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [8.8] Golden LV garbage collected after last consumer uninstalled"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${CYAN}INFO${NC} [8.8] $golden_after golden LV(s) remain (may be shared with other images)"
+  fi
 }
 
 # ─────────────────────────────────────────────────────────
@@ -638,12 +743,12 @@ stage_storage_post() {
   check_ssh_ok "10.2" "Control plane mounted after reboot" "mountpoint -q /piccolo-core/mounts/control-plane/ 2>/dev/null || mount | grep -q control-plane"
 
   local fuse_count
-  fuse_count=$(vssh 'grep -c "fuse\.fuse-overlayfs" /proc/mounts 2>/dev/null || true' 2>/dev/null | tail -1)
+  fuse_count=$(vssh 'grep "fuse\." /proc/mounts 2>/dev/null | grep -cv fusectl || true' 2>/dev/null | tail -1)
   if [[ "$fuse_count" == "0" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [10.3] No stale FUSE overlay mounts"
+    echo -e "  ${GREEN}PASS${NC} [10.3] Zero FUSE mounts after reboot"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [10.3] Found $fuse_count stale FUSE mounts"
+    echo -e "  ${RED}FAIL${NC} [10.3] Found $fuse_count FUSE mounts after reboot (should be zero)"
     ((FAIL_COUNT++)) || true
   fi
 }
@@ -660,7 +765,7 @@ case "$STAGE" in
   setup)           stage_setup ;;
   post-setup)      stage_post_setup ;;
   storage-inspect) stage_storage_inspect ;;
-  overlay-verify)  stage_overlay_verify ;;
+  rootfs-verify)   stage_rootfs_verify ;;
   service-app)     stage_service_app ;;
   workspace-app)   stage_workspace_app ;;
   reboot)          stage_reboot ;;
@@ -673,7 +778,7 @@ case "$STAGE" in
     stage_setup
     stage_post_setup
     stage_storage_inspect
-    stage_overlay_verify
+    stage_rootfs_verify
     stage_service_app
     stage_workspace_app
     stage_reboot
@@ -681,7 +786,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect overlay-verify service-app workspace-app reboot storage-post logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app reboot storage-post logs all"
     exit 1
     ;;
 esac

@@ -45,6 +45,7 @@ import (
 	"piccolod/internal/storage/diskprep"
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/nbd"
+	"piccolod/internal/storage/vdo"
 	"piccolod/internal/update"
 
 	"github.com/coreos/go-systemd/v22/daemon"
@@ -459,8 +460,11 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		DataDir:    paths.CoreRoot(),
 		Runner:     execRunner,
 		LVMgr:      storageMgr.LVMVolumes(),
+		PoolMgr:    storageMgr.LVMPool(),
 		NBDSrv:     nbdSrv,
 		DRBDMgr:    drbdMgr,
+		VDOMgr:     vdo.NewManager(execRunner),
+		FlattenFn:  appMgr.MakeFlattenFn(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to init persistence module: %w", err)
@@ -476,6 +480,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	appMgr.SetStateBaseDir(controlDir)
 	appMgr.SetLockReader(persist)
 	appMgr.SetVolumeManager(persist.Volumes())
+	if rootfs := persist.Rootfs(); rootfs != nil {
+		appMgr.SetRootfsManager(rootfs)
+	}
 	svcMgr.SetLockReader(persist)
 
 	// Set Gin to release mode for production (can be overridden by GIN_MODE env var)
@@ -562,9 +569,6 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.supervisor.Register(s.terminalManager)
 
 	s.supervisor.Register(supervisor.NewComponent("app-manager", func(ctx context.Context) error {
-		if err := container.RequireNativeOverlay(); err != nil {
-			return fmt.Errorf("native overlay check: %w", err)
-		}
 		s.appManager.StartBackground()
 		return nil
 	}, func(ctx context.Context) error {

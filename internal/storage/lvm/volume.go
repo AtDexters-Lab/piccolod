@@ -75,6 +75,25 @@ func (m *LVManager) DeactivateLV(ctx context.Context, name string) error {
 	return nil
 }
 
+// CreateSnapshot creates a thin snapshot of an existing thin LV.
+// The snapshot is created inactive. Caller must ActivateLV() explicitly.
+//
+// Precondition: the thin pool must be active (PoolManager.ActivatePool).
+// The origin LV does NOT need to be active — thin snapshots are metadata ops.
+func (m *LVManager) CreateSnapshot(ctx context.Context, originLV, snapshotName string) error {
+	originPath := fmt.Sprintf("%s/%s", m.vgName, originLV)
+	if err := m.run.Run(ctx, "lvcreate",
+		"--snapshot",
+		"--name", snapshotName,
+		"--setactivationskip", "n",
+		originPath,
+	); err != nil {
+		return fmt.Errorf("lvcreate snapshot %s from %s: %w", snapshotName, originPath, err)
+	}
+	log.Printf("thin snapshot created: %s/%s (origin: %s)", m.vgName, snapshotName, originLV)
+	return nil
+}
+
 // ResizeLV resizes a thin logical volume.
 func (m *LVManager) ResizeLV(ctx context.Context, name string, newSizeBytes int64) error {
 	sizeArg := fmt.Sprintf("%dB", newSizeBytes)

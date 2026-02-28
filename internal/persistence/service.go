@@ -19,6 +19,7 @@ import (
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/lvm"
 	"piccolod/internal/storage/nbd"
+	"piccolod/internal/storage/vdo"
 )
 
 // Options captures construction parameters for the persistence service.
@@ -38,14 +39,20 @@ type Options struct {
 	// Block-native storage dependencies (for luksVolumeManager).
 	Runner  runner.CommandRunner
 	LVMgr   *lvm.LVManager
+	PoolMgr *lvm.PoolManager
 	NBDSrv  *nbd.Server
 	DRBDMgr *drbd.ResourceManager
+
+	// Rootfs dependencies.
+	VDOMgr    *vdo.Manager
+	FlattenFn func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
 }
 
 // Module implements the Service interface using pluggable sub-components.
 type Module struct {
 	control            ControlStore
 	volumes            VolumeManager
+	rootfs             RootfsVolumeManager
 	devices            DeviceManager
 	events             *events.Bus
 	leadership         *cluster.Registry
@@ -126,14 +133,23 @@ func NewService(opts Options) (*Module, error) {
 		if run == nil {
 			run = runner.ExecRunner{}
 		}
-		mod.volumes = NewLUKSVolumeManager(LUKSVolumeManagerConfig{
-			Run:     run,
-			Crypto:  mod.crypto,
-			Bus:     mod.events,
-			LVMgr:   opts.LVMgr,
-			NBDSrv:  opts.NBDSrv,
-			DRBDMgr: opts.DRBDMgr,
+		lvm := NewLUKSVolumeManager(LUKSVolumeManagerConfig{
+			Run:       run,
+			Crypto:    mod.crypto,
+			Bus:       mod.events,
+			LVMgr:     opts.LVMgr,
+			PoolMgr:   opts.PoolMgr,
+			NBDSrv:    opts.NBDSrv,
+			DRBDMgr:   opts.DRBDMgr,
+			VDOMgr:    opts.VDOMgr,
+			FlattenFn: opts.FlattenFn,
 		})
+		mod.volumes = lvm
+		// Only expose rootfs capabilities when all dependencies are available.
+		// Without VDOMgr and FlattenFn, the block-native rootfs path cannot function.
+		if opts.VDOMgr != nil && opts.FlattenFn != nil {
+			mod.rootfs = lvm
+		}
 	}
 	if rc, ok := mod.volumes.(RoleCheckable); ok {
 		rc.SetRoleChecker(func(volumeID string, role VolumeRole) bool {
@@ -275,6 +291,10 @@ func (m *Module) ControlVolume() VolumeHandle {
 
 func (m *Module) Volumes() VolumeManager {
 	return m.volumes
+}
+
+func (m *Module) Rootfs() RootfsVolumeManager {
+	return m.rootfs
 }
 
 func (m *Module) Devices() DeviceManager {

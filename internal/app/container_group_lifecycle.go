@@ -30,13 +30,23 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 
 	mode := piccoloModeFromExtensions(def.Extensions)
 
-	// For workspace mode, ensure workspace disk is mounted before starting containers
-	if mode == ModeWorkspace {
-		m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
-		if _, err := m.ensureWorkspaceDiskMounted(ctx, appInst.InstanceID, layout); err != nil {
+	// Ensure rootfs is attached before starting containers.
+	// ensureRootfsAttached returns (nil, nil) for legacy apps without rootfs volumes.
+	var blockNativeRootfs *rootfsMountInfo
+	rInfo, err := m.ensureRootfsAttached(ctx, appInst.InstanceID, mode)
+	if err != nil {
+		m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+		return fmt.Errorf("failed to attach rootfs: %w", err)
+	}
+	if rInfo != nil {
+		// Block-native path: read image config for the rootfs.
+		imgConfig, cfgErr := m.readImageConfigForRootfsFromInstance(ctx, appInst)
+		if cfgErr != nil {
 			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
-			return fmt.Errorf("failed to mount workspace disk: %w", err)
+			return fmt.Errorf("failed to read rootfs image config: %w", cfgErr)
 		}
+		rInfo.imgConfig = imgConfig
+		blockNativeRootfs = rInfo
 	}
 
 	primary := primaryServiceFor(def, appInst)
@@ -113,15 +123,9 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 				anchorID:   anchorID,
 				credential: runtime.Credential,
 			}
-			if mode == ModeWorkspace {
-				wsInfo := m.getWorkspaceMountInfo(ctx, appInst.InstanceID)
-				if wsInfo != nil && wsInfo.mergedPath != "" && wsInfo.meta != nil {
-					opts.mergedRootfs = wsInfo.mergedPath
-					opts.workspaceMeta = wsInfo.meta
-				} else {
-					m.updateStatusWithEvent(appInst.InstanceID, StatusError)
-					return fmt.Errorf("workspace mount info unavailable for service '%s' recreation", svcName)
-				}
+			if blockNativeRootfs != nil {
+				opts.rootfsHandle = &blockNativeRootfs.handle
+				opts.goldenImgConfig = &blockNativeRootfs.imgConfig
 			}
 			if err := m.recreateServiceContainer(ctx, state, appInst, runtime, cid, opts); err != nil {
 				m.updateStatusWithEvent(appInst.InstanceID, StatusError)
@@ -230,13 +234,9 @@ func (m *AppManager) stopContainerGroupWithOpts(ctx context.Context, state *File
 		}
 	}
 
-	// For workspace mode apps, unmount the overlay on clean stop (RFC §5.6).
-	// This is good practice but not strictly required since we remount on start.
-	if mode == ModeWorkspace {
-		if err := m.unmountWorkspaceDisk(ctx, appInst.InstanceID, layout); err != nil {
-			log.Printf("WARN: stop %s: workspace unmount failed, forcing lazy unmount: %v", appInst.InstanceID, err)
-			m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
-		}
+	// Detach rootfs on clean stop.
+	if m.appHasBlockNativeRootfs(appInst.InstanceID, mode) {
+		m.detachAppRootfs(ctx, appInst.InstanceID, mode)
 	}
 
 	// For explicit user-initiated stops, set Enabled=false and persist.
@@ -294,14 +294,9 @@ func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppIn
 		_ = m.containerManager.StopContainer(ctx, runtime, anchorID)
 	}
 
-	// For workspace mode apps, unmount the workspace disk overlay.
-	if mode == ModeWorkspace {
-		if err := m.unmountWorkspaceDisk(ctx, appInst.InstanceID, layout); err != nil {
-			log.Printf("WARN: workspace %s: unmount failed, forcing lazy unmount: %v", appInst.InstanceID, err)
-			m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
-		} else {
-			log.Printf("INFO: workspace %s: unmounted workspace disk (data preserved)", appInst.InstanceID)
-		}
+	// Detach rootfs before container removal.
+	if m.appHasBlockNativeRootfs(appInst.InstanceID, mode) {
+		m.detachAppRootfs(ctx, appInst.InstanceID, mode)
 	}
 
 	// Remove containers in reverse order.

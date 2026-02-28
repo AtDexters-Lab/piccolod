@@ -21,10 +21,12 @@ import (
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/lvm"
 	"piccolod/internal/storage/nbd"
+	"piccolod/internal/storage/vdo"
 )
 
 const (
 	metadataV2Version = 2
+	metadataV3Version = 3
 	metadataV2File    = "piccolo.volume.json"
 
 	controlPlaneLoopFile = "control-plane.luks"
@@ -54,9 +56,11 @@ type Reconcilable interface {
 	ReconcileAllVolumeStates() error
 }
 
-// luksVolumeManager implements VolumeManager, RoleCheckable, and Reconcilable.
+// luksVolumeManager implements VolumeManager, RootfsVolumeManager,
+// RoleCheckable, and Reconcilable.
 // It dispatches to LUKSLoopVolume for control volumes and DeviceStack + LUKS
-// for application volumes.
+// for application volumes. For rootfs volumes, it manages golden LVs, dm-vdo,
+// and idmapped mounts.
 type luksVolumeManager struct {
 	run      runner.CommandRunner
 	crypto   *crypt.Manager
@@ -65,15 +69,41 @@ type luksVolumeManager struct {
 
 	// Block device stack dependencies.
 	lvMgr   *lvm.LVManager
+	poolMgr *lvm.PoolManager
 	nbdSrv  *nbd.Server
 	drbdMgr *drbd.ResourceManager
+
+	// VDO target lifecycle.
+	vdoMgr *vdo.Manager
 
 	// LUKS loop for control plane.
 	loopVol *LUKSLoopVolume
 
+	// Flatten function: extracts OCI image to a directory and returns image config.
+	// Injected by AppManager wiring.
+	flattenFn func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
+
 	mu          sync.Mutex
 	roleChecker func(string, VolumeRole) bool
 	stacks      map[string]*blockdev.DeviceStack // volumeID → active stack
+
+	// Golden LV management.
+	goldenLVs    map[string]*volumeMetaV3 // imageDigestShort → meta cache
+	goldenMu     map[string]*sync.Mutex   // per-image-digest lock
+	goldenMuLock sync.Mutex               // protects goldenMu map
+
+	// Rootfs mount tracking.
+	rootfsMounts map[string]*rootfsMountState // volumeID → mount state
+}
+
+// rootfsMountState tracks the full device stack for a mounted rootfs volume.
+type rootfsMountState struct {
+	stack      *blockdev.DeviceStack
+	luksMapper string
+	vdoMapper  string
+	vdoEnabled bool
+	mountPath  string
+	idmapPath  string
 }
 
 // LUKSVolumeManagerConfig holds dependencies for the unified volume manager.
@@ -82,22 +112,32 @@ type LUKSVolumeManagerConfig struct {
 	Crypto  *crypt.Manager
 	Bus     *events.Bus
 	LVMgr   *lvm.LVManager
+	PoolMgr *lvm.PoolManager
 	NBDSrv  *nbd.Server
 	DRBDMgr *drbd.ResourceManager
+	VDOMgr  *vdo.Manager
+	// FlattenFn extracts an OCI image to a target directory and returns image config.
+	FlattenFn func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
 }
 
 // NewLUKSVolumeManager creates the unified volume manager.
 func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) *luksVolumeManager {
 	return &luksVolumeManager{
-		run:      cfg.Run,
-		crypto:   cfg.Crypto,
-		bus:      cfg.Bus,
-		tmpfsDir: "/run/piccolo",
-		lvMgr:    cfg.LVMgr,
-		nbdSrv:   cfg.NBDSrv,
-		drbdMgr:  cfg.DRBDMgr,
-		loopVol:  NewLUKSLoopVolume(cfg.Run),
-		stacks:   make(map[string]*blockdev.DeviceStack),
+		run:          cfg.Run,
+		crypto:       cfg.Crypto,
+		bus:          cfg.Bus,
+		tmpfsDir:     "/run/piccolo",
+		lvMgr:        cfg.LVMgr,
+		poolMgr:      cfg.PoolMgr,
+		nbdSrv:       cfg.NBDSrv,
+		drbdMgr:      cfg.DRBDMgr,
+		vdoMgr:       cfg.VDOMgr,
+		flattenFn:    cfg.FlattenFn,
+		loopVol:      NewLUKSLoopVolume(cfg.Run),
+		stacks:       make(map[string]*blockdev.DeviceStack),
+		goldenLVs:    make(map[string]*volumeMetaV3),
+		goldenMu:     make(map[string]*sync.Mutex),
+		rootfsMounts: make(map[string]*rootfsMountState),
 	}
 }
 
@@ -110,7 +150,7 @@ func (m *luksVolumeManager) SetRoleChecker(fn func(string, VolumeRole) bool) {
 }
 
 // ReconcileAllVolumeStates scans persisted volume metadata and validates
-// consistency on startup.
+// consistency on startup. Skips v3 rootfs volumes (handled by ReconcileRootfsStates).
 func (m *luksVolumeManager) ReconcileAllVolumeStates() error {
 	metaBase := paths.CoreJoin("volumes")
 	entries, err := os.ReadDir(metaBase)
@@ -128,11 +168,33 @@ func (m *luksVolumeManager) ReconcileAllVolumeStates() error {
 		volID := e.Name()
 		metaPath := filepath.Join(metaBase, volID, metadataV2File)
 		if _, err := os.Stat(metaPath); os.IsNotExist(err) {
-			continue // no v2 metadata — skip (may be a legacy volume)
+			continue
 		}
-		// Validate metadata is parseable.
-		if _, err := readVolumeMeta(metaPath); err != nil {
+		version, err := readVolumeMetaVersion(metaPath)
+		if err != nil {
 			log.Printf("WARN: volume %s metadata corrupted: %v", volID, err)
+			continue
+		}
+		switch version {
+		case metadataV2Version:
+			if _, err := readVolumeMetaV2(metaPath); err != nil {
+				log.Printf("WARN: volume %s v2 metadata corrupted: %v", volID, err)
+			}
+		case metadataV3Version:
+			meta, err := readVolumeMetaV3(metaPath)
+			if err != nil {
+				log.Printf("WARN: volume %s v3 metadata corrupted: %v", volID, err)
+				continue
+			}
+			// Skip rootfs types — handled by ReconcileRootfsStates.
+			switch meta.Type {
+			case "golden", "workspace", "service-rootfs":
+				continue
+			case "service-data":
+				// Validate parseable, nothing else needed.
+			}
+		default:
+			log.Printf("WARN: volume %s has unsupported metadata version %d", volID, version)
 		}
 	}
 	return nil
@@ -174,41 +236,90 @@ func (m *luksVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 }
 
 // Attach mounts a volume, making it available for I/O.
+// Dispatches based on metadata version: v2 uses per-volume wrapped keys,
+// v3 service-data uses the pool keyfile. v3 rootfs types must use AttachRootfs.
 func (m *luksVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opts AttachOptions) error {
 	metaPath := filepath.Join(paths.VolumeMetaDir(handle.ID), metadataV2File)
-	meta, err := readVolumeMeta(metaPath)
+
+	version, err := readVolumeMetaVersion(metaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Volume not yet initialized (pre-setup state).
 			return ErrLocked
 		}
-		return fmt.Errorf("read volume metadata: %w", err)
+		return fmt.Errorf("read volume metadata version: %w", err)
 	}
 
-	switch meta.Type {
-	case "luks-loop":
-		return m.attachControlVolume(ctx, handle, meta)
-	case "luks-thinlv":
-		return m.attachAppVolume(ctx, handle, meta, opts)
+	switch version {
+	case metadataV2Version:
+		meta, err := readVolumeMetaV2(metaPath)
+		if err != nil {
+			return fmt.Errorf("read v2 metadata: %w", err)
+		}
+		switch meta.Type {
+		case "luks-loop":
+			return m.attachControlVolume(ctx, handle, meta)
+		case "luks-thinlv":
+			return m.attachAppVolume(ctx, handle, meta, opts)
+		default:
+			return fmt.Errorf("unknown v2 volume type: %s", meta.Type)
+		}
+
+	case metadataV3Version:
+		meta, err := readVolumeMetaV3(metaPath)
+		if err != nil {
+			return fmt.Errorf("read v3 metadata: %w", err)
+		}
+		switch meta.Type {
+		case "service-data":
+			return m.attachAppVolumeV3(ctx, handle, meta, opts)
+		case "golden", "workspace", "service-rootfs":
+			return fmt.Errorf("rootfs volume %s (type=%s): use AttachRootfs instead", handle.ID, meta.Type)
+		default:
+			return fmt.Errorf("unknown v3 volume type: %s", meta.Type)
+		}
+
 	default:
-		return fmt.Errorf("unknown volume type: %s", meta.Type)
+		return fmt.Errorf("%w: unsupported version %d", ErrVolumeMetadataCorrupted, version)
 	}
 }
 
 // Detach unmounts a volume and tears down its device stack.
 func (m *luksVolumeManager) Detach(ctx context.Context, handle VolumeHandle) error {
-	meta, err := readVolumeMeta(filepath.Join(paths.VolumeMetaDir(handle.ID), metadataV2File))
+	metaPath := filepath.Join(paths.VolumeMetaDir(handle.ID), metadataV2File)
+	version, err := readVolumeMetaVersion(metaPath)
 	if err != nil {
-		return fmt.Errorf("read volume metadata: %w", err)
+		return fmt.Errorf("read volume metadata version: %w", err)
 	}
 
-	switch meta.Type {
-	case "luks-loop":
-		return m.detachControlVolume(ctx, handle, meta)
-	case "luks-thinlv":
-		return m.detachAppVolume(ctx, handle)
+	switch version {
+	case metadataV2Version:
+		meta, err := readVolumeMetaV2(metaPath)
+		if err != nil {
+			return fmt.Errorf("read v2 metadata: %w", err)
+		}
+		switch meta.Type {
+		case "luks-loop":
+			return m.detachControlVolume(ctx, handle, meta)
+		case "luks-thinlv":
+			return m.detachAppVolume(ctx, handle)
+		default:
+			return fmt.Errorf("unknown v2 volume type: %s", meta.Type)
+		}
+	case metadataV3Version:
+		meta, err := readVolumeMetaV3(metaPath)
+		if err != nil {
+			return fmt.Errorf("read v3 metadata: %w", err)
+		}
+		switch meta.Type {
+		case "service-data":
+			return m.detachAppVolume(ctx, handle)
+		case "golden", "workspace", "service-rootfs":
+			return fmt.Errorf("rootfs volume %s: use DetachRootfs", handle.ID)
+		default:
+			return fmt.Errorf("unknown v3 volume type: %s", meta.Type)
+		}
 	default:
-		return fmt.Errorf("unknown volume type: %s", meta.Type)
+		return fmt.Errorf("%w: unsupported version %d", ErrVolumeMetadataCorrupted, version)
 	}
 }
 
@@ -218,39 +329,58 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 	metaPath := filepath.Join(metaDir, metadataV2File)
 	mountDir := paths.MountDir(id)
 
-	meta, err := readVolumeMeta(metaPath)
+	version, err := readVolumeMetaVersion(metaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// No metadata — clean up any stale mount/metadata dirs.
 			m.cleanupStaleAppState(ctx, id)
 			return nil
 		}
-		return fmt.Errorf("read volume metadata: %w", err)
+		return fmt.Errorf("read volume metadata version: %w", err)
 	}
 
-	// Detach (unmount + close LUKS + close device stack) before removing.
-	_ = m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir})
-
-	switch meta.Type {
-	case "luks-loop":
-		loopFile := paths.CoreJoin(meta.LoopFile)
-		_ = os.Remove(loopFile)
-	case "luks-thinlv":
-		if m.lvMgr != nil && meta.LVName != "" {
-			if err := m.lvMgr.RemoveThinLV(ctx, meta.LVName); err != nil {
-				log.Printf("WARN: remove thin LV %s: %v", meta.LVName, err)
+	switch version {
+	case metadataV2Version:
+		meta, err := readVolumeMetaV2(metaPath)
+		if err != nil {
+			return fmt.Errorf("read v2 metadata: %w", err)
+		}
+		_ = m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir})
+		switch meta.Type {
+		case "luks-loop":
+			_ = os.Remove(paths.CoreJoin(meta.LoopFile))
+		case "luks-thinlv":
+			if m.lvMgr != nil && meta.LVName != "" {
+				if err := m.lvMgr.RemoveThinLV(ctx, meta.LVName); err != nil {
+					log.Printf("WARN: remove thin LV %s: %v", meta.LVName, err)
+				}
 			}
 		}
+
+	case metadataV3Version:
+		meta, err := readVolumeMetaV3(metaPath)
+		if err != nil {
+			return fmt.Errorf("read v3 metadata: %w", err)
+		}
+		switch meta.Type {
+		case "golden", "workspace", "service-rootfs":
+			return m.DestroyRootfs(ctx, id)
+		case "service-data":
+			_ = m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir})
+			if m.lvMgr != nil && meta.LVName != "" {
+				if err := m.lvMgr.RemoveThinLV(ctx, meta.LVName); err != nil {
+					log.Printf("WARN: remove thin LV %s: %v", meta.LVName, err)
+				}
+			}
+		}
+
+	default:
+		return fmt.Errorf("%w: unsupported version %d", ErrVolumeMetadataCorrupted, version)
 	}
 
-	// Remove metadata directory.
 	if err := os.RemoveAll(metaDir); err != nil {
 		return fmt.Errorf("remove metadata dir: %w", err)
 	}
-
-	// Remove mount directory.
 	_ = os.RemoveAll(mountDir)
-
 	return nil
 }
 
@@ -262,8 +392,10 @@ func (m *luksVolumeManager) cleanupStaleAppState(ctx context.Context, id string)
 	lvName := "vol-" + id
 
 	// Best-effort teardown: unmount → close LUKS → deactivate LV → remove LV.
-	_ = m.run.Run(ctx, "umount", mountDir)
-	_ = m.run.Run(ctx, "cryptsetup", "close", mapper)
+	if m.run != nil {
+		_ = m.run.Run(ctx, "umount", mountDir)
+		_ = m.run.Run(ctx, "cryptsetup", "close", mapper)
+	}
 	if m.lvMgr != nil && m.lvMgr.LVExists(ctx, lvName) {
 		_ = m.lvMgr.RemoveThinLV(ctx, lvName)
 	}
@@ -333,6 +465,9 @@ func (m *luksVolumeManager) attachControlVolume(ctx context.Context, handle Volu
 }
 
 func (m *luksVolumeManager) detachControlVolume(ctx context.Context, handle VolumeHandle, meta *volumeMetaV2) error {
+	if m.loopVol == nil {
+		return nil
+	}
 	loopFile := paths.CoreJoin(meta.LoopFile)
 	return m.loopVol.Close(ctx, loopFile, handle.MountDir)
 }
@@ -634,9 +769,196 @@ func (m *luksVolumeManager) luksOpen(ctx context.Context, device, mapper string,
 	)
 }
 
+// luksFormatWithMasterKey formats a LUKS2 device using the single master key.
+// The pool keyfile is set as the keyslot 0 passphrase.
+func (m *luksVolumeManager) luksFormatWithMasterKey(ctx context.Context, device string) error {
+	masterKey, err := m.crypto.EnsureLUKSMasterKey()
+	if err != nil {
+		return fmt.Errorf("get master key: %w", err)
+	}
+	defer cryptoutil.SecureZero(masterKey)
+
+	poolKey, err := m.crypto.UnwrapPoolKeyfile()
+	if err != nil {
+		return fmt.Errorf("unwrap pool keyfile: %w", err)
+	}
+	defer cryptoutil.SecureZero(poolKey)
+
+	masterKeyPath, masterCleanup, err := writeKeyToTmpfsDir(m.tmpfsDir, masterKey)
+	if err != nil {
+		return err
+	}
+	defer masterCleanup()
+
+	poolKeyPath, poolCleanup, err := writeKeyToTmpfsDir(m.tmpfsDir, poolKey)
+	if err != nil {
+		return err
+	}
+	defer poolCleanup()
+
+	return m.run.Run(ctx, "cryptsetup", "luksFormat",
+		"--type", "luks2",
+		"--batch-mode",
+		"--label", "piccolo-vol",
+		"--cipher", "aes-xts-plain64",
+		"--key-size", "512",
+		"--hash", "sha256",
+		"--pbkdf", "pbkdf2",
+		"--pbkdf-force-iterations", "1000",
+		"--master-key-file", masterKeyPath,
+		"--key-file", poolKeyPath,
+		device,
+	)
+}
+
+// luksOpenWithPoolKeyfile opens a LUKS device using the pool keyfile.
+// Used for all v3 volumes (master-key-formatted).
+func (m *luksVolumeManager) luksOpenWithPoolKeyfile(ctx context.Context, device, mapper string) error {
+	poolKey, err := m.crypto.UnwrapPoolKeyfile()
+	if err != nil {
+		return fmt.Errorf("unwrap pool keyfile: %w", err)
+	}
+	defer cryptoutil.SecureZero(poolKey)
+
+	keyPath, cleanup, err := writeKeyToTmpfsDir(m.tmpfsDir, poolKey)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	return m.run.Run(ctx, "cryptsetup", "open",
+		"--type", "luks2",
+		"--allow-discards",
+		"--key-file", keyPath,
+		device, mapper,
+	)
+}
+
+// attachAppVolumeV3 attaches a v3 service-data volume using the pool keyfile.
+func (m *luksVolumeManager) attachAppVolumeV3(ctx context.Context, handle VolumeHandle, meta *volumeMetaV3, opts AttachOptions) error {
+	// Role check.
+	m.mu.Lock()
+	checker := m.roleChecker
+	m.mu.Unlock()
+	if checker != nil && !checker(handle.ID, opts.Role) {
+		return fmt.Errorf("role check failed for %s", handle.ID)
+	}
+
+	stack, err := m.buildStack(handle.ID, meta.LVName, meta.SizeBytes)
+	if err != nil {
+		return fmt.Errorf("build device stack: %w", err)
+	}
+	if err := stack.Open(ctx); err != nil {
+		return fmt.Errorf("open device stack: %w", err)
+	}
+
+	m.mu.Lock()
+	m.stacks[handle.ID] = stack
+	m.mu.Unlock()
+
+	topDev := stack.Top().Path()
+	mapper := "piccolo-vol-" + handle.ID
+	if err := m.luksOpenWithPoolKeyfile(ctx, topDev, mapper); err != nil {
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("luks open: %w", err)
+	}
+
+	mountDir := handle.MountDir
+	mountsParent := filepath.Dir(mountDir)
+	if err := os.MkdirAll(mountsParent, 0o711); err != nil {
+		m.run.Run(ctx, "cryptsetup", "close", mapper)
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("create mounts parent: %w", err)
+	}
+	_ = os.Chmod(mountsParent, 0o711)
+	if err := os.MkdirAll(mountDir, 0o700); err != nil {
+		m.run.Run(ctx, "cryptsetup", "close", mapper)
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("create mount dir: %w", err)
+	}
+
+	mapperPath := "/dev/mapper/" + mapper
+	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", "discard", mapperPath, mountDir); err != nil {
+		m.run.Run(ctx, "cryptsetup", "close", mapper)
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("mount: %w", err)
+	}
+
+	return nil
+}
+
+// --- Metadata v3 ---
+
+// volumeMetaV3 is the on-disk metadata schema for block-native rootfs volumes
+// and v3 service-data volumes using the single LUKS master key.
+type volumeMetaV3 struct {
+	Version         int            `json:"version"`                    // 3
+	Type            string         `json:"type"`                      // golden/workspace/service-rootfs/service-data
+	LVName          string         `json:"lv_name"`
+	VGName          string         `json:"vg_name"`
+	SizeBytes       int64          `json:"size_bytes,omitempty"`
+	FSType          string         `json:"fs_type"`
+	VDOEnabled      bool           `json:"vdo_enabled"`
+	VDOParams       *VDOParamsMeta `json:"vdo_params,omitempty"`
+	ReadOnly        bool           `json:"read_only,omitempty"`
+	BaseImageDigest string         `json:"base_image_digest,omitempty"`
+	BaseImageRef    string         `json:"base_image_ref,omitempty"`
+	GoldenLV        string         `json:"golden_lv,omitempty"`
+	CloneOf         string         `json:"clone_of,omitempty"`
+	IDMap           *IDMapMeta     `json:"idmap,omitempty"`
+	FlattenComplete string         `json:"flatten_complete,omitempty"` // RFC3339 timestamp
+}
+
+// IDMapMeta persists idmap configuration for rootfs volumes.
+type IDMapMeta struct {
+	AppUID      uint32 `json:"app_uid"`
+	AppGID      uint32 `json:"app_gid"`
+	SubUIDStart uint32 `json:"sub_uid_start"`
+	SubUIDCount uint32 `json:"sub_uid_count"`
+	SubGIDStart uint32 `json:"sub_gid_start"`
+	SubGIDCount uint32 `json:"sub_gid_count"`
+}
+
+// VDOParamsMeta persists dm-vdo target parameters from golden LV creation.
+// Snapshots MUST reuse these exact parameters — mismatched params corrupt data.
+type VDOParamsMeta struct {
+	LogicalSizeBytes int64 `json:"logical_size_bytes"`
+	MinIOSize        int   `json:"min_io_size"`
+	BlockMapCacheKB  int   `json:"block_map_cache_kb"`
+	BlockMapEraLen   int   `json:"block_map_era_len"`
+}
+
 // --- Metadata I/O ---
 
-func readVolumeMeta(path string) (*volumeMetaV2, error) {
+// readVolumeMetaVersion reads only the version field from a metadata file.
+func readVolumeMetaVersion(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	var v struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrVolumeMetadataCorrupted, err)
+	}
+	return v.Version, nil
+}
+
+// readVolumeMetaV2 reads v2 metadata.
+func readVolumeMetaV2(path string) (*volumeMetaV2, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -646,12 +968,41 @@ func readVolumeMeta(path string) (*volumeMetaV2, error) {
 		return nil, fmt.Errorf("%w: %v", ErrVolumeMetadataCorrupted, err)
 	}
 	if meta.Version != metadataV2Version {
-		return nil, fmt.Errorf("%w: unsupported version %d", ErrVolumeMetadataCorrupted, meta.Version)
+		return nil, fmt.Errorf("%w: expected v2, got %d", ErrVolumeMetadataCorrupted, meta.Version)
 	}
 	return &meta, nil
 }
 
+// readVolumeMetaV3 reads v3 metadata.
+func readVolumeMetaV3(path string) (*volumeMetaV3, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var meta volumeMetaV3
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrVolumeMetadataCorrupted, err)
+	}
+	if meta.Version != metadataV3Version {
+		return nil, fmt.Errorf("%w: expected v3, got %d", ErrVolumeMetadataCorrupted, meta.Version)
+	}
+	return &meta, nil
+}
+
+// readVolumeMeta reads v2 metadata (backward-compatible reader for existing callers).
+func readVolumeMeta(path string) (*volumeMetaV2, error) {
+	return readVolumeMetaV2(path)
+}
+
 func writeVolumeMeta(path string, meta *volumeMetaV2) error {
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsutil.AtomicWriteFile(path, data, 0o600)
+}
+
+func writeVolumeMetaV3(path string, meta *volumeMetaV3) error {
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err

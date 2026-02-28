@@ -17,7 +17,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"piccolod/internal/api"
-	"piccolod/internal/app/workspacedisk"
 	"piccolod/internal/cluster"
 	"piccolod/internal/container"
 	"piccolod/internal/events"
@@ -60,11 +59,6 @@ type AppManager struct {
 	observedStatusMessage map[string]string // transient status message for UI context
 	observedStatusMu      sync.RWMutex
 
-	// Workspace disk manager for container-independent persistence
-	workspaceDiskMgr      *workspacedisk.DefaultManager
-	workspacePathResolver *workspacePathResolver
-	workspaceImageMounter *workspacedisk.PodmanImageMounter
-
 	// Shared image runtime for base images across all app types (overlay driver, shared root + imagestore).
 	// Cached via sync.Once to avoid repeated LookPath + ensureDir calls.
 	imageRuntimeOnce sync.Once
@@ -84,6 +78,9 @@ type AppManager struct {
 
 	// Per-app user orphan cleanup runs once at first reconciliation.
 	orphanCleanupOnce sync.Once
+
+	// Block-native rootfs volume manager for golden LVs and workspace/service rootfs.
+	rootfsMgr persistence.RootfsVolumeManager
 }
 
 var (
@@ -124,39 +121,6 @@ func mergeEnvMaps(base, override map[string]string) map[string]string {
 		result[k] = v
 	}
 	return result
-}
-
-// workspaceRuntimeResolver implements workspacedisk.RuntimeResolver
-// by returning the shared image runtime args for podman image mount/unmount.
-// Workspace base images live in the shared image runtime (overlay, shared root),
-// so image mount operations must use those args to find the image.
-type workspaceRuntimeResolver struct {
-	am *AppManager
-}
-
-func (r *workspaceRuntimeResolver) GetRuntimeArgs(ctx context.Context, instanceID string) ([]string, error) {
-	// Use the shared image runtime for image mount/unmount operations.
-	// The instanceID is not used — the image runtime is shared across all apps.
-	rt, err := r.am.podmanImageRuntime()
-	if err != nil {
-		return nil, fmt.Errorf("get image runtime: %w", err)
-	}
-
-	// Convert configuration to command-line arguments
-	args := []string{}
-	if rt.Root != "" {
-		args = append(args, "--root", rt.Root)
-	}
-	if rt.RunRoot != "" {
-		args = append(args, "--runroot", rt.RunRoot)
-	}
-	if rt.StorageDriver != "" {
-		args = append(args, "--storage-driver", rt.StorageDriver)
-	}
-	for _, opt := range rt.StorageOpts {
-		args = append(args, "--storage-opt", opt)
-	}
-	return args, nil
 }
 
 // NewAppManagerWithServices creates a new filesystem-based app manager with an injected ServiceManager
@@ -207,16 +171,6 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		}
 	}
 
-	// Initialize workspace disk components
-	pathResolver := newWorkspacePathResolver()
-	var imageMounterCred *syscall.Credential
-	var imageMounterHome string
-	if runtimeUser != nil {
-		imageMounterCred = runtimeUser.Credential
-		imageMounterHome = runtimeUser.HomeDir
-	}
-	imageMounter := workspacedisk.NewPodmanImageMounter(imageMounterCred, imageMounterHome)
-
 	mgr := &AppManager{
 		containerManager:      containerManager,
 		stateBaseDir:          base,
@@ -226,16 +180,9 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		mountVerifier:         defaultMountVerifier,
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
-		workspacePathResolver: pathResolver,
-		workspaceImageMounter: imageMounter,
 		oidcHostname:          "piccolo.local",
 		runtimeUser:           runtimeUser,
 	}
-
-	// Wire up runtime resolver and disk manager
-	runtimeResolver := &workspaceRuntimeResolver{am: mgr}
-	diskMgr := workspacedisk.NewManager(pathResolver, runtimeResolver, imageMounter)
-	mgr.workspaceDiskMgr = diskMgr
 
 	return mgr, nil
 }
@@ -457,6 +404,20 @@ func (m *AppManager) SetVolumeManager(volumes persistence.VolumeManager) {
 	m.stateMu.Unlock()
 }
 
+// SetRootfsManager wires the block-native rootfs volume manager.
+func (m *AppManager) SetRootfsManager(rootfs persistence.RootfsVolumeManager) {
+	m.stateMu.Lock()
+	m.rootfsMgr = rootfs
+	m.stateMu.Unlock()
+}
+
+// currentRootfsManager returns the rootfs volume manager (may be nil if not configured).
+func (m *AppManager) currentRootfsManager() persistence.RootfsVolumeManager {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.rootfsMgr
+}
+
 // ObserveRuntimeEvents subscribes to leadership and lock-state events for logging.
 func (m *AppManager) ObserveRuntimeEvents(bus *events.Bus) {
 	if bus == nil {
@@ -571,10 +532,6 @@ func (m *AppManager) StartBackground() {
 		defer m.reconcileWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-
-		// Clean up stale overlay mounts left from previous service session.
-		// Must run before reconcile to prevent mount-on-mount failures.
-		cleanupStaleOverlayMounts()
 
 		m.ReconcileOnce(ctx)
 		for {
@@ -1180,24 +1137,20 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 		return fmt.Errorf("app manager: service manager not configured")
 	}
 
-	// Check if this is a workspace app that needs --rootfs mode
+	// Ensure rootfs is attached for block-native apps.
 	mode := piccoloModeFromExtensions(def.Extensions)
-	var mergedPath string
-	var workspaceMeta *workspacedisk.WorkspaceMeta
-	if mode == ModeWorkspace {
-		// Mount workspace disk overlay (idempotent)
-		var err error
-		mergedPath, err = m.ensureWorkspaceDiskMounted(ctx, appInst.InstanceID, layout)
-		if err != nil {
-			return fmt.Errorf("failed to mount workspace disk: %w", err)
+	var blockNativeRootfs *rootfsMountInfo
+	rInfo, err := m.ensureRootfsAttached(ctx, appInst.InstanceID, mode)
+	if err != nil {
+		return fmt.Errorf("failed to attach rootfs: %w", err)
+	}
+	if rInfo != nil {
+		imgConfig, cfgErr := m.readImageConfigForRootfsFromInstance(ctx, appInst)
+		if cfgErr != nil {
+			return fmt.Errorf("failed to read rootfs image config: %w", cfgErr)
 		}
-
-		// Get metadata for image config
-		workspaceMeta, err = m.getWorkspaceDiskMeta(ctx, appInst.InstanceID, layout)
-		if err != nil {
-			return fmt.Errorf("failed to get workspace disk metadata: %w", err)
-		}
-		log.Printf("INFO: recreate %s: using workspace disk (base=%s)", appInst.InstanceID, workspaceMeta.BaseImageRef)
+		rInfo.imgConfig = imgConfig
+		blockNativeRootfs = rInfo
 	}
 
 	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
@@ -1211,22 +1164,19 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 			return err
 		}
 
-		// For workspace mode, configure --rootfs and apply image config
-		if mode == ModeWorkspace && mergedPath != "" && workspaceMeta != nil {
-			spec.Rootfs = mergedPath
+		// For block-native rootfs, configure --rootfs and apply image config
+		if blockNativeRootfs != nil {
+			spec.Rootfs = blockNativeRootfs.handle.MountPath
 			spec.Image = ""
-
-			// Apply image config (env, workdir, user) since Podman doesn't do it in --rootfs mode.
-			spec.Environment = mergeEnvMaps(parseEnvSlice(workspaceMeta.ImageConfig.Env), spec.Environment)
-			spec.WorkingDir = workspaceMeta.ImageConfig.WorkingDir
-			spec.User = workspaceMeta.ImageConfig.User
+			spec.Environment = mergeEnvMaps(parseEnvSlice(blockNativeRootfs.imgConfig.Env), spec.Environment)
+			spec.WorkingDir = blockNativeRootfs.imgConfig.WorkingDir
+			spec.User = blockNativeRootfs.imgConfig.User
 
 			if primarySvcInit(def) == "image" {
-				// Image manages its own init — set entrypoint/cmd from image config directly
-				spec.Entrypoint = workspaceMeta.ImageConfig.Entrypoint
-				spec.Command = workspaceMeta.ImageConfig.Cmd
+				spec.Entrypoint = blockNativeRootfs.imgConfig.Entrypoint
+				spec.Command = blockNativeRootfs.imgConfig.Cmd
 			} else {
-				originalCmd := workspaceMeta.ImageConfig.BuildOriginalCommand()
+				originalCmd := buildOriginalCmdFromSlices(blockNativeRootfs.imgConfig.Entrypoint, blockNativeRootfs.imgConfig.Cmd)
 				spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
 				spec.Command = originalCmd
 			}
@@ -1511,10 +1461,10 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 			_ = m.containerManager.StopContainer(ctx, runtime, cid)
 			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
 		}
-		// Cleanup workspace disk if applicable
+		// Cleanup rootfs if applicable
 		mode := piccoloModeFromExtensions(appDef.Extensions)
-		if mode == ModeWorkspace {
-			_ = m.unmountWorkspaceDisk(ctx, instanceID, layout)
+		if m.currentRootfsManager() != nil {
+			m.detachAppRootfs(ctx, instanceID, mode)
 		}
 		m.serviceManager.RemoveApp(instanceID)
 		cleanupServices = false
@@ -1540,6 +1490,11 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 // orphaned volumes, podman state, and per-app users from leaking on install failure.
 func (m *AppManager) cleanupInstallResources(ctx context.Context, instanceID string, runtime container.PodmanRuntime) {
 	log.Printf("INFO: cleaning up resources for failed install: %s", instanceID)
+
+	// Destroy block-native rootfs if it was partially created.
+	// Best-effort: detach + destroy + GC before cleaning up the data volume.
+	m.destroyAppRootfs(ctx, instanceID, ModeService)
+	m.destroyAppRootfs(ctx, instanceID, ModeWorkspace)
 
 	// Reset podman storage before destroying the volume (which unmounts the
 	// encrypted backing store where podman metadata lives).
@@ -1879,6 +1834,10 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 		return err
 	}
 
+	// Destroy block-native rootfs if applicable (before volume destroy).
+	mode := piccoloModeFromExtensions(def.Extensions)
+	m.destroyAppRootfs(ctx, instanceID, mode)
+
 	// Prune orphaned images from the shared imagestore.
 	// Both service and workspace images share the same imagestore,
 	// so pruning runs for all app types.
@@ -2217,8 +2176,8 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 	needsRecreation := containerChange || len(result.Added) > 0 || len(result.Removed) > 0
 
 	if needsRecreation {
-		// With workspace disk, container recreation is always safe - no snapshot needed.
-		// The workspace disk persists independently of the container, so we can simply
+		// With block-native rootfs, container recreation is always safe — the rootfs
+		// persists independently of the container, so we can simply
 		// stop/remove/recreate the container wrapper without data loss.
 		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseRecreatingContainer, 50, "Recreating container", false, nil)
 
@@ -2226,36 +2185,38 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
 		_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
 
-		// Ensure workspace disk is mounted and get the merged path
-		mergedPath, err := m.ensureWorkspaceDiskMounted(ctx, instanceID, layout)
-		if err != nil {
-			return nil, fmt.Errorf("failed to ensure workspace disk mounted: %w", err)
+		// Ensure rootfs is attached and get the mount path.
+		mode := piccoloModeFromExtensions(newDef.Extensions)
+		rInfo, rErr := m.ensureRootfsAttached(ctx, instanceID, mode)
+		if rErr != nil {
+			return nil, fmt.Errorf("failed to attach rootfs: %w", rErr)
 		}
-
-		// Get metadata for entrypoint config
-		meta, err := m.getWorkspaceDiskMeta(ctx, instanceID, layout)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get workspace disk metadata: %w", err)
+		var rootfsHandle *persistence.RootfsHandle
+		var goldenImgConfig *persistence.GoldenImageConfig
+		if rInfo != nil {
+			imgCfg, cfgErr := m.readImageConfigForRootfsFromInstance(ctx, appInst)
+			if cfgErr != nil {
+				return nil, fmt.Errorf("failed to read rootfs image config: %w", cfgErr)
+			}
+			rootfsHandle = &rInfo.handle
+			goldenImgConfig = &imgCfg
 		}
 
 		// Create new container with updated endpoints and --rootfs mode
 		var newCID string
 		spec, err := m.appDefToContainerSpec(&newDef, result.Endpoints, layout, instanceID, runtime.Credential)
-		if err == nil {
-			// Use --rootfs mode with workspace disk
-			spec.Rootfs = mergedPath
+		if err == nil && rootfsHandle != nil && goldenImgConfig != nil {
+			spec.Rootfs = rootfsHandle.MountPath
 			spec.Image = ""
-
-			// Apply image config (env, workdir, user) since Podman doesn't do it in --rootfs mode.
-			spec.Environment = mergeEnvMaps(parseEnvSlice(meta.ImageConfig.Env), spec.Environment)
-			spec.WorkingDir = meta.ImageConfig.WorkingDir
-			spec.User = meta.ImageConfig.User
+			spec.Environment = mergeEnvMaps(parseEnvSlice(goldenImgConfig.Env), spec.Environment)
+			spec.WorkingDir = goldenImgConfig.WorkingDir
+			spec.User = goldenImgConfig.User
 
 			if primarySvcInit(&newDef) == "image" {
-				spec.Entrypoint = meta.ImageConfig.Entrypoint
-				spec.Command = meta.ImageConfig.Cmd
+				spec.Entrypoint = goldenImgConfig.Entrypoint
+				spec.Command = goldenImgConfig.Cmd
 			} else {
-				originalCmd := meta.ImageConfig.BuildOriginalCommand()
+				originalCmd := buildOriginalCmdFromSlices(goldenImgConfig.Entrypoint, goldenImgConfig.Cmd)
 				spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
 				spec.Command = originalCmd
 			}
@@ -2288,17 +2249,19 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			}
 
 			// Use --rootfs mode for rollback too
-			rbSpec.Rootfs = mergedPath
-			rbSpec.Image = ""
-			rbSpec.Environment = mergeEnvMaps(parseEnvSlice(meta.ImageConfig.Env), rbSpec.Environment)
-			rbSpec.WorkingDir = meta.ImageConfig.WorkingDir
-			rbSpec.User = meta.ImageConfig.User
-			if primarySvcInit(curDef) == "image" {
-				rbSpec.Entrypoint = meta.ImageConfig.Entrypoint
-				rbSpec.Command = meta.ImageConfig.Cmd
-			} else {
-				rbSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-				rbSpec.Command = meta.ImageConfig.BuildOriginalCommand()
+			if rootfsHandle != nil && goldenImgConfig != nil {
+				rbSpec.Rootfs = rootfsHandle.MountPath
+				rbSpec.Image = ""
+				rbSpec.Environment = mergeEnvMaps(parseEnvSlice(goldenImgConfig.Env), rbSpec.Environment)
+				rbSpec.WorkingDir = goldenImgConfig.WorkingDir
+				rbSpec.User = goldenImgConfig.User
+				if primarySvcInit(curDef) == "image" {
+					rbSpec.Entrypoint = goldenImgConfig.Entrypoint
+					rbSpec.Command = goldenImgConfig.Cmd
+				} else {
+					rbSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
+					rbSpec.Command = buildOriginalCmdFromSlices(goldenImgConfig.Entrypoint, goldenImgConfig.Cmd)
+				}
 			}
 
 			// 3. Create old container

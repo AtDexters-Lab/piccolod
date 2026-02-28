@@ -152,17 +152,22 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 	mode := piccoloModeFromExtensions(def.Extensions)
 
-	// For workspace mode, ensure workspace disk is mounted before starting containers
-	// and capture the mount info for container recreation.
-	// NOTE: We do NOT call cleanupStaleWorkspaceMounts here because the container
-	// may be actively using the overlay as its rootfs. Stale cleanup is only safe
-	// during startContainerGroup when we know containers aren't running.
-	var workspaceInfo *workspaceMountInfo
-	if mode == ModeWorkspace && desiredRunning {
-		if _, err := m.ensureWorkspaceDiskMounted(ctx, appInst.InstanceID, layout); err != nil {
-			return fmt.Errorf("failed to mount workspace disk: %w", err)
+	// Ensure rootfs is attached / workspace disk mounted before reconciling containers.
+	// ensureRootfsAttached returns (nil, nil) for legacy apps without rootfs volumes.
+	var blockNativeRootfs *rootfsMountInfo
+	if desiredRunning {
+		rInfo, err := m.ensureRootfsAttached(ctx, appInst.InstanceID, mode)
+		if err != nil {
+			return fmt.Errorf("failed to attach rootfs: %w", err)
 		}
-		workspaceInfo = m.getWorkspaceMountInfo(ctx, appInst.InstanceID)
+		if rInfo != nil {
+			imgConfig, cfgErr := m.readImageConfigForRootfsFromInstance(ctx, appInst)
+			if cfgErr != nil {
+				return fmt.Errorf("failed to read rootfs image config: %w", cfgErr)
+			}
+			rInfo.imgConfig = imgConfig
+			blockNativeRootfs = rInfo
+		}
 	}
 
 	primary := primaryServiceFor(def, appInst)
@@ -336,13 +341,9 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				anchorID:   anchorID,
 				credential: runtime.Credential,
 			}
-			if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
-				opts.mergedRootfs = workspaceInfo.mergedPath
-				opts.workspaceMeta = workspaceInfo.meta
-			} else if mode == ModeWorkspace {
-				// Workspace mode requires valid mount info for container recreation
-				m.handleStartupFailure(state, appInst)
-				return fmt.Errorf("workspace mount info unavailable for service '%s' recreation", svcName)
+			if blockNativeRootfs != nil {
+				opts.rootfsHandle = &blockNativeRootfs.handle
+				opts.goldenImgConfig = &blockNativeRootfs.imgConfig
 			}
 			newCID, err := m.createAndStartServiceContainer(ctx, runtime, opts)
 			if err != nil {
@@ -374,12 +375,9 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 					anchorID:   anchorID,
 					credential: runtime.Credential,
 				}
-				if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
-					opts.mergedRootfs = workspaceInfo.mergedPath
-					opts.workspaceMeta = workspaceInfo.meta
-				} else if mode == ModeWorkspace {
-					m.handleStartupFailure(state, appInst)
-					return fmt.Errorf("workspace mount info unavailable for service '%s' recreation", svcName)
+				if blockNativeRootfs != nil {
+					opts.rootfsHandle = &blockNativeRootfs.handle
+					opts.goldenImgConfig = &blockNativeRootfs.imgConfig
 				}
 				if err := m.recreateServiceContainer(ctx, state, appInst, runtime, cid, opts); err != nil {
 					m.handleStartupFailure(state, appInst)

@@ -105,12 +105,6 @@ func (rt PodmanRuntime) Validate() error {
 // because CLI storage flags can cause Podman to reinitialize storage options
 // from scratch, dropping additionalimagestores from the config.
 //
-// The overlay section uses mount_program + force_mask for cross-user imagestore
-// access. The shared imagestore is owned by piccolo-runtime, while per-app
-// containers run as separate users. Without force_mask, the kernel overlay
-// driver cannot remap UIDs across these users, causing "permission denied"
-// during container rootfs setup. fuse-overlayfs handles this transparently.
-//
 // The file is only written when its content would change (idempotent).
 func ensureAdditionalStoresConf(rt PodmanRuntime) (string, error) {
 	confPath := filepath.Join(rt.Root, "storage.conf")
@@ -121,17 +115,8 @@ func ensureAdditionalStoresConf(rt PodmanRuntime) (string, error) {
 		quoted[i] = fmt.Sprintf("%q", s)
 	}
 
-	// fuse-overlayfs with force_mask="shared" enables cross-user imagestore
-	// access. This is the only remaining FUSE path — volume I/O is fully
-	// kernel-native (LUKS+ext4). The FUSE surface is minimal: container rootfs
-	// overlay is read-mostly and page-cached.
-	overlaySection := ""
-	if fuseOverlayfs, err := exec.LookPath("fuse-overlayfs"); err == nil && rt.Credential != nil {
-		overlaySection = fmt.Sprintf("\n[storage.options.overlay]\nmount_program = %q\nforce_mask = \"shared\"\n", fuseOverlayfs)
-	}
-
-	content := fmt.Sprintf("[storage]\ndriver = %q\ngraphroot = %q\nrunroot = %q\n\n[storage.options]\nadditionalimagestores = [%s]\n%s",
-		rt.StorageDriver, rt.Root, rt.RunRoot, strings.Join(quoted, ", "), overlaySection)
+	content := fmt.Sprintf("[storage]\ndriver = %q\ngraphroot = %q\nrunroot = %q\n\n[storage.options]\nadditionalimagestores = [%s]\n",
+		rt.StorageDriver, rt.Root, rt.RunRoot, strings.Join(quoted, ", "))
 
 	// Only write if content changed.
 	existing, err := os.ReadFile(confPath)
@@ -204,7 +189,7 @@ func runPodman(ctx context.Context, rt PodmanRuntime, subcmdArgs []string) ([]by
 	if len(subcmdArgs) == 0 {
 		return nil, fmt.Errorf("runPodman: no subcommand provided")
 	}
-	args, err := buildPodmanArgs(rt, subcmdArgs)
+	args, err := BuildPodmanArgs(rt, subcmdArgs)
 	if err != nil {
 		return nil, err
 	}
@@ -669,7 +654,9 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 	return args
 }
 
-func buildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
+// BuildPodmanArgs builds the CLI arguments for a podman command, prepending
+// storage flags (--root, --runroot, --storage-driver, etc.) derived from runtime.
+func BuildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 	out := make([]string, 0, 6+len(runtime.StorageOpts)+len(args))
 
 	// When AdditionalImageStores is set, ALL storage settings (graphroot,
@@ -734,7 +721,7 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 
 	// Execute command using exec.CommandContext (no shell interpretation)
 	createArgs := buildCreateArgs(spec)
-	args, err := buildPodmanArgs(runtime, createArgs)
+	args, err := BuildPodmanArgs(runtime, createArgs)
 	if err != nil {
 		return "", err
 	}
@@ -792,7 +779,7 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 	if !isValidContainerID(containerID) {
 		return &ContainerNotFoundError{Ref: containerID}
 	}
-	args, err := buildPodmanArgs(runtime, []string{"stop", "--time", "30", containerID})
+	args, err := BuildPodmanArgs(runtime, []string{"stop", "--time", "30", containerID})
 	if err != nil {
 		return err
 	}
@@ -810,7 +797,7 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 	if !isValidContainerID(containerID) {
 		return &ContainerNotFoundError{Ref: containerID}
 	}
-	args, err := buildPodmanArgs(runtime, []string{"rm", containerID})
+	args, err := BuildPodmanArgs(runtime, []string{"rm", containerID})
 	if err != nil {
 		return err
 	}
@@ -828,7 +815,7 @@ func (p *PodmanCLI) ImageExists(ctx context.Context, runtime PodmanRuntime, imag
 		return false, fmt.Errorf("invalid image name: %w", err)
 	}
 
-	args, err := buildPodmanArgs(runtime, []string{"image", "exists", imageName})
+	args, err := BuildPodmanArgs(runtime, []string{"image", "exists", imageName})
 	if err != nil {
 		return false, err
 	}
@@ -915,7 +902,7 @@ func (p *PodmanCLI) LogsStream(ctx context.Context, runtime PodmanRuntime, conta
 		args = append(args, "--timestamps")
 	}
 	args = append(args, containerID)
-	cmdArgs, err := buildPodmanArgs(runtime, args)
+	cmdArgs, err := BuildPodmanArgs(runtime, args)
 	if err != nil {
 		return nil, err
 	}
@@ -971,7 +958,7 @@ func (p *PodmanCLI) LogsStream(ctx context.Context, runtime PodmanRuntime, conta
 }
 
 func (p *PodmanCLI) containerExists(ctx context.Context, runtime PodmanRuntime, containerRef string) (bool, error) {
-	args, err := buildPodmanArgs(runtime, []string{"container", "exists", containerRef})
+	args, err := BuildPodmanArgs(runtime, []string{"container", "exists", containerRef})
 	if err != nil {
 		return false, err
 	}
@@ -999,7 +986,7 @@ func (p *PodmanCLI) ResolveContainerIDByName(ctx context.Context, runtime Podman
 		return "", ErrContainerNotFound(name)
 	}
 
-	args, err := buildPodmanArgs(runtime, []string{"inspect", "--format", "{{.Id}}", name})
+	args, err := BuildPodmanArgs(runtime, []string{"inspect", "--format", "{{.Id}}", name})
 	if err != nil {
 		return "", err
 	}
@@ -1079,7 +1066,7 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 	}
 
 	// Get both running state and PID to detect stale state after reboot
-	args, err := buildPodmanArgs(runtime, []string{"inspect", "--format", "{{.State.Running}}|{{.State.Pid}}", containerID})
+	args, err := BuildPodmanArgs(runtime, []string{"inspect", "--format", "{{.State.Running}}|{{.State.Pid}}", containerID})
 	if err != nil {
 		return ContainerState{}, err
 	}
@@ -1118,7 +1105,7 @@ func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRun
 	if containerID == "" {
 		return nil, fmt.Errorf("container ID required")
 	}
-	args, err := buildPodmanArgs(runtime, []string{"port", containerID})
+	args, err := BuildPodmanArgs(runtime, []string{"port", containerID})
 	if err != nil {
 		return nil, err
 	}
@@ -1200,7 +1187,7 @@ func (p *PodmanCLI) NetworkReload(ctx context.Context, runtime PodmanRuntime, co
 // Only removes containers, does NOT touch the shared imagestore.
 func (p *PodmanCLI) ResetStorage(ctx context.Context, runtime PodmanRuntime) error {
 	// Remove all containers for this runtime (should already be done, but be thorough)
-	args, err := buildPodmanArgs(runtime, []string{"rm", "--all", "--force"})
+	args, err := BuildPodmanArgs(runtime, []string{"rm", "--all", "--force"})
 	if err != nil {
 		return err
 	}
@@ -1244,7 +1231,7 @@ var storagePathKeywords = []string{
 // Returns true if repair was performed.
 func (p *PodmanCLI) ValidateAndRepairStorage(ctx context.Context, runtime PodmanRuntime) (bool, error) {
 	// Quick health check: try listing images
-	args, err := buildPodmanArgs(runtime, []string{"images", "--quiet", "--noheading"})
+	args, err := BuildPodmanArgs(runtime, []string{"images", "--quiet", "--noheading"})
 	if err != nil {
 		return false, fmt.Errorf("build podman args: %w", err)
 	}
@@ -1567,7 +1554,7 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 	}
 
 	// Use podman image inspect to get the full image configuration including digest
-	args, err := buildPodmanArgs(runtime, []string{
+	args, err := BuildPodmanArgs(runtime, []string{
 		"image", "inspect",
 		"--format", `{"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"env":{{json .Config.Env}},"workingDir":{{json .Config.WorkingDir}},"user":{{json .Config.User}},"digest":{{json .Digest}},"repoDigests":{{json .RepoDigests}}}`,
 		imageName,
@@ -1629,7 +1616,7 @@ func (p *PodmanCLI) ExecShellCmd(runtime PodmanRuntime, containerID string) (*ex
 	shellCmd := `if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh; fi`
 
 	// Build podman exec args with proper environment propagation
-	args, err := buildPodmanArgs(runtime, []string{
+	args, err := BuildPodmanArgs(runtime, []string{
 		"exec",
 		"-i", "-t", // Interactive + TTY
 		"-e", "TERM=xterm-256color", // Pass TERM into the container
@@ -1906,7 +1893,7 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 		return fmt.Errorf("invalid image name: %w", err)
 	}
 
-	args, err := buildPodmanArgs(runtime, []string{"pull", image})
+	args, err := BuildPodmanArgs(runtime, []string{"pull", image})
 	if err != nil {
 		return err
 	}

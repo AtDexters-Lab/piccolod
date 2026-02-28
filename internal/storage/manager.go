@@ -93,6 +93,11 @@ func (m *Manager) LVMVolumes() *lvm.LVManager {
 	return m.lvmVols
 }
 
+// LVMPool returns the thin pool manager for capacity checks.
+func (m *Manager) LVMPool() *lvm.PoolManager {
+	return m.lvmPool
+}
+
 // Name implements supervisor.Component.
 func (m *Manager) Name() string { return "storage-manager" }
 

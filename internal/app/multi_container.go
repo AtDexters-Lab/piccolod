@@ -8,8 +8,8 @@ import (
 	"syscall"
 
 	"piccolod/internal/api"
-	"piccolod/internal/app/workspacedisk"
 	"piccolod/internal/container"
+	"piccolod/internal/persistence"
 )
 
 const (
@@ -94,9 +94,20 @@ type serviceContainerOptions struct {
 	// and the :U mount option is added for Podman UID remapping.
 	credential *syscall.Credential
 
-	// Workspace mode fields (optional, empty for service mode)
-	mergedRootfs  string                       // Path to mounted workspace disk rootfs
-	workspaceMeta *workspacedisk.WorkspaceMeta // Workspace metadata with image config
+	// Block-native rootfs fields (optional, used when rootfsMgr is available)
+	rootfsHandle    *persistence.RootfsHandle    // Mounted rootfs from RootfsVolumeManager
+	goldenImgConfig *persistence.GoldenImageConfig // Image config from golden LV
+}
+
+// buildOriginalCmdFromSlices reconstructs the original command from entrypoint and cmd slices.
+func buildOriginalCmdFromSlices(entrypoint, cmd []string) []string {
+	var result []string
+	result = append(result, entrypoint...)
+	result = append(result, cmd...)
+	if len(result) == 0 {
+		result = []string{"/bin/sh"}
+	}
+	return result
 }
 
 // buildServiceContainerSpec builds a container spec for a service container.
@@ -123,37 +134,30 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		Labels:        piccoloLabels(opts.instanceID, opts.svcName, "service"),
 	}
 
-	// Apply workspace mode configuration if provided
-	if opts.workspaceMeta != nil && opts.mergedRootfs != "" {
-		// Use --rootfs mode instead of image
-		spec.Rootfs = opts.mergedRootfs
+	// Apply block-native rootfs configuration (golden LV path) if provided
+	if opts.rootfsHandle != nil && opts.goldenImgConfig != nil {
+		spec.Rootfs = opts.rootfsHandle.MountPath
 		spec.Image = ""
 
 		// Apply image config since Podman doesn't do it in --rootfs mode.
-		// Base image env is merged with manifest env (manifest takes precedence).
-		spec.Environment = mergeEnvMaps(parseEnvSlice(opts.workspaceMeta.ImageConfig.Env), spec.Environment)
-		spec.WorkingDir = opts.workspaceMeta.ImageConfig.WorkingDir
-		spec.User = opts.workspaceMeta.ImageConfig.User
+		spec.Environment = mergeEnvMaps(parseEnvSlice(opts.goldenImgConfig.Env), spec.Environment)
+		spec.WorkingDir = opts.goldenImgConfig.WorkingDir
+		spec.User = opts.goldenImgConfig.User
 
 		if svc.Init == "image" {
-			// Image manages its own init (e.g., s6-overlay). Let it be PID 1.
-			spec.Entrypoint = opts.workspaceMeta.ImageConfig.Entrypoint
-			spec.Command = opts.workspaceMeta.ImageConfig.Cmd
+			spec.Entrypoint = opts.goldenImgConfig.Entrypoint
+			spec.Command = opts.goldenImgConfig.Cmd
 		} else {
 			// Default: Piccolo manages init via catatonit + boot.sh wrapper
-			originalCmd := opts.workspaceMeta.ImageConfig.BuildOriginalCommand()
+			originalCmd := buildOriginalCmdFromSlices(opts.goldenImgConfig.Entrypoint, opts.goldenImgConfig.Cmd)
 			spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
 			spec.Command = originalCmd
 			spec.UseInit = true
 
-			// Ensure workspace assets (boot.sh, piccolo-startup) exist on host filesystem
 			if err := EnsureWorkspaceAssets(); err != nil {
 				return container.ContainerCreateSpec{}, fmt.Errorf("failed to ensure workspace assets: %w", err)
 			}
 
-			// For rootless mode, copy assets to a per-app-owned directory.
-			// Root-owned bind mounts are inaccessible inside rootless containers
-			// because host UID 0 is unmapped in the container's user namespace.
 			bootShHost := BootShHostPath()
 			startupHost := PiccoloStartupHostPath()
 			if opts.credential != nil {
@@ -174,24 +178,14 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 				startupHost = filepath.Join(assetDir, "piccolo-startup")
 			}
 
-			// Mount boot.sh as read-only into the container
 			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-				Host:      bootShHost,
-				Container: "/piccolo/boot.sh",
-				Options:   "ro",
+				Host: bootShHost, Container: "/piccolo/boot.sh", Options: "ro",
 			})
-
-			// Mount piccolo-startup helper to /usr/local/bin (which is in PATH by default)
 			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-				Host:      startupHost,
-				Container: "/usr/local/bin/piccolo-startup",
-				Options:   "ro",
+				Host: startupHost, Container: "/usr/local/bin/piccolo-startup", Options: "ro",
 			})
 		}
 
-		// Mount a writable config directory for user startup hooks (start.sh)
-		// This directory is persistent and writable by the container user.
-		// The :U mount option handles UID mapping for rootless containers.
 		configDir := filepath.Join(opts.layout.DataDir, "piccolo-config")
 		if err := os.MkdirAll(configDir, 0o755); err != nil {
 			return container.ContainerCreateSpec{}, fmt.Errorf("failed to create piccolo config dir: %w", err)
@@ -206,9 +200,7 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 			configVolOpts = "rw,U"
 		}
 		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-			Host:      configDir,
-			Container: "/piccolo/config",
-			Options:   configVolOpts,
+			Host: configDir, Container: "/piccolo/config", Options: configVolOpts,
 		})
 	}
 

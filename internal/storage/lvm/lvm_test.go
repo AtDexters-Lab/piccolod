@@ -485,6 +485,52 @@ func TestLVManager_ListLVs(t *testing.T) {
 	})
 }
 
+func TestLVManager_CreateSnapshot(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		run := &fakeRunner{}
+		mgr := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		if err := mgr.CreateSnapshot(context.Background(), "golden-abc123", "ws-instance1"); err != nil {
+			t.Fatalf("CreateSnapshot: %v", err)
+		}
+		if len(run.calls) != 1 {
+			t.Fatalf("expected 1 call, got %d: %v", len(run.calls), run.calls)
+		}
+		call := run.calls[0]
+		if !strings.Contains(call, "lvcreate") {
+			t.Errorf("expected lvcreate, got %q", call)
+		}
+		if !strings.Contains(call, "--snapshot") {
+			t.Errorf("expected --snapshot flag: %q", call)
+		}
+		if !strings.Contains(call, "--name ws-instance1") {
+			t.Errorf("expected --name ws-instance1: %q", call)
+		}
+		if !strings.Contains(call, "--setactivationskip n") {
+			t.Errorf("expected --setactivationskip n: %q", call)
+		}
+		if !strings.Contains(call, "piccolo-data-vg/golden-abc123") {
+			t.Errorf("expected origin path: %q", call)
+		}
+	})
+
+	t.Run("error", func(t *testing.T) {
+		run := &fakeRunner{
+			errs: map[string]error{
+				buildKey("lvcreate", []string{"--snapshot", "--name", "ws-fail",
+					"--setactivationskip", "n", "piccolo-data-vg/golden-abc"}): fmt.Errorf("insufficient space"),
+			},
+		}
+		mgr := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		err := mgr.CreateSnapshot(context.Background(), "golden-abc", "ws-fail")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "lvcreate snapshot") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
 func TestLVManager_ResizeLV(t *testing.T) {
 	run := &fakeRunner{}
 	mgr := NewLVManager(run, DefaultVGName, DefaultThinPoolName)

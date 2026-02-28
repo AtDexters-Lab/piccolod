@@ -11,7 +11,10 @@ import (
 	"piccolod/internal/state/paths"
 )
 
-const poolKeyfileSize = 64 // 512-bit keyfile for LUKS
+const (
+	poolKeyfileSize  = 64 // 512-bit keyfile for LUKS
+	luksMasterKeySize = 64 // 512-bit master key for LUKS (key-size 512 / 8)
+)
 
 // PoolKeyfile holds a LUKS pool keyfile in encrypted form.
 type PoolKeyfile struct {
@@ -65,6 +68,42 @@ func (m *Manager) StorePoolKeyfileAt(rawKey []byte, destPath string) error {
 // UnwrapPoolKeyfile reads and decrypts the pool keyfile from the default location.
 func (m *Manager) UnwrapPoolKeyfile() ([]byte, error) {
 	return m.UnwrapPoolKeyfileFrom(paths.CoreJoin("crypto", "piccolo_data_pool_key.enc"))
+}
+
+// StoreLUKSMasterKey encrypts a LUKS master key with the SDEK and writes it
+// to the default location under the core root.
+func (m *Manager) StoreLUKSMasterKey(masterKey []byte) error {
+	dest := paths.CoreJoin("crypto", "luks_master_key.enc")
+	return m.StorePoolKeyfileAt(masterKey, dest)
+}
+
+// UnwrapLUKSMasterKey reads and decrypts the LUKS master key from the default location.
+func (m *Manager) UnwrapLUKSMasterKey() ([]byte, error) {
+	return m.UnwrapPoolKeyfileFrom(paths.CoreJoin("crypto", "luks_master_key.enc"))
+}
+
+// EnsureLUKSMasterKey returns the LUKS master key, generating and persisting a new
+// one if it doesn't exist. The returned key is exactly luksMasterKeySize bytes.
+func (m *Manager) EnsureLUKSMasterKey() ([]byte, error) {
+	key, err := m.UnwrapLUKSMasterKey()
+	if err == nil {
+		if len(key) != luksMasterKeySize {
+			cryptoutil.SecureZero(key)
+			return nil, fmt.Errorf("LUKS master key size %d != expected %d", len(key), luksMasterKeySize)
+		}
+		return key, nil
+	}
+
+	// Generate new master key.
+	key = make([]byte, luksMasterKeySize)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("generate LUKS master key: %w", err)
+	}
+	if err := m.StoreLUKSMasterKey(key); err != nil {
+		cryptoutil.SecureZero(key)
+		return nil, fmt.Errorf("store LUKS master key: %w", err)
+	}
+	return key, nil
 }
 
 // UnwrapPoolKeyfileFrom reads and decrypts a pool keyfile from the given path.
