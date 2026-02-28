@@ -1,4 +1,4 @@
-# RFC: Unified Block-Native Rootfs — Golden LV, dm-vdo, Single LUKS Key
+# RFC: Unified Block-Native Rootfs — Golden LV, Single LUKS Key
 
 **Date:** 2026-02-27
 **Status:** Draft
@@ -7,7 +7,7 @@
 
 ## 1. Summary
 
-Replace overlay-based container rootfs management (both workspace and service) with a unified golden LV architecture: a flattened OCI image on a dm-thin LV serves as a template, dm-thin snapshots provide per-container rootfs instances, dm-vdo above LUKS provides transparent compression, and idmapped mounts handle UID translation. A single LUKS master key encrypts all volumes.
+Replace overlay-based container rootfs management (both workspace and service) with a unified golden LV architecture: a flattened OCI image on a dm-thin LV serves as a template, dm-thin snapshots provide per-container rootfs instances, and idmapped mounts handle UID translation. A single LUKS master key encrypts all volumes.
 
 This eliminates overlay filesystems, FUSE, fuse-overlayfs, `additionalimagestore`, and per-app `storage.conf` from the entire stack. Containers become thin wrappers around mounted block devices via `podman create --rootfs`.
 
@@ -63,21 +63,20 @@ Additional: ~100MB RAM per VM kernel, TAP/bridge networking complexity, two runt
 1. **Zero overlay, zero FUSE** for all container rootfs I/O (workspace and service)
 2. **Unified architecture** — one rootfs model for both container modes
 3. **Instant workspace cloning** via dm-thin snapshots for AI agent forking
-4. **Transparent compression** via dm-vdo above LUKS (operates on plaintext)
-5. **Multi-UID semantics preserved** via kernel idmapped mounts (no UID squashing)
-6. **Single LUKS key** — simplified key management, enables golden LV sharing
-7. **Service rootfs read-only** — correctness invariant for cluster (no divergence without DRBD)
-8. **DRBD + NBD always present** for replicated volumes (standalone on single-node)
-9. **No migration, no fallbacks** — clean break, hard fail if kernel features unavailable
+4. **Multi-UID semantics preserved** via kernel idmapped mounts (no UID squashing)
+5. **Single LUKS key** — simplified key management, enables golden LV sharing
+6. **Service rootfs read-only** — correctness invariant for cluster (no divergence without DRBD)
+7. **DRBD + NBD always present** for replicated volumes (standalone on single-node)
+8. **No migration, no fallbacks** — clean break, hard fail if kernel features unavailable
 
 ## 3. Volume Types
 
 ### 3.1 Golden LV — Template (A)
 
-One golden LV per unique OCI image. Contains the flattened image on ext4, compressed by dm-vdo.
+One golden LV per unique OCI image. Contains the flattened image on ext4.
 
 ```
-dm-thin LV → LUKS → dm-vdo (compress) → ext4 → flattened image
+dm-thin LV → LUKS → ext4 → flattened image
 ```
 
 - Created at first install of an image, shared by all containers using that image
@@ -90,7 +89,7 @@ dm-thin LV → LUKS → dm-vdo (compress) → ext4 → flattened image
 Snapshot of a golden LV. Contains the complete rootfs + user data. Replicated.
 
 ```
-dm-thin snapshot of A → NBD → DRBD → LUKS → dm-vdo → ext4 (rw) → idmapped mount → podman --rootfs
+dm-thin snapshot of A → NBD → DRBD → LUKS → ext4 (rw) → idmapped mount → podman --rootfs
 ```
 
 - Single LV = rootfs + user data. No separate data volume.
@@ -103,7 +102,7 @@ dm-thin snapshot of A → NBD → DRBD → LUKS → dm-vdo → ext4 (rw) → idm
 Snapshot of an existing workspace B at its current state. For AI agent forking.
 
 ```
-dm-thin snapshot of B → NBD → DRBD → LUKS → dm-vdo → ext4 (rw) → idmapped mount → podman --rootfs
+dm-thin snapshot of B → NBD → DRBD → LUKS → ext4 (rw) → idmapped mount → podman --rootfs
 ```
 
 - Instant creation (dm-thin metadata operation)
@@ -115,7 +114,7 @@ dm-thin snapshot of B → NBD → DRBD → LUKS → dm-vdo → ext4 (rw) → idm
 Read-only snapshot of a golden LV. Provides the immutable base filesystem for service containers.
 
 ```
-dm-thin snapshot of A → LUKS → dm-vdo → ext4 (ro)→ idmapped mount → podman --rootfs --read-only
+dm-thin snapshot of A → LUKS → ext4 (ro) → idmapped mount → podman --rootfs --read-only
 ```
 
 - **ext4 mounted read-only** — correctness invariant. Without DRBD, cluster nodes mount independent snapshots. Read-write would allow silent divergence between nodes.
@@ -131,47 +130,27 @@ Fresh dm-thin LV for service persistent state. Standard full-stack app data volu
 dm-thin LV → NBD → DRBD → LUKS → ext4 (rw)
 ```
 
-- No dm-vdo — service data is typically already compressed (JPEG, video, databases) or incompressible. VDO would burn CPU with near-zero savings.
 - Independent volume per service. Replicated via DRBD.
 - Bind-mounted into the service container at app-defined paths
 
 ### 3.6 Stack Summary
 
-| Volume | dm-thin | NBD | DRBD | LUKS | dm-vdo | FS | Mode | Replicated |
-|--------|---------|-----|------|------|--------|----|------|------------|
-| A (golden) | LV | — | — | yes | yes (compress) | ext4 | template | No |
-| B (workspace) | snapshot of A | yes | yes | yes | yes (compress) | ext4 rw | live | Yes |
-| B-clone | snapshot of B | yes | yes | yes | yes (compress) | ext4 rw | live | Yes |
-| C (svc rootfs) | snapshot of A | — | — | yes | yes (decompress) | ext4 ro | live | No |
-| D (svc data) | LV | yes | yes | yes | — | ext4 rw | live | Yes |
-| Ephemeral | LV | — | — | — | — | btrfs+zstd | live | No |
+| Volume | dm-thin | NBD | DRBD | LUKS | FS | Mode | Replicated |
+|--------|---------|-----|------|------|----|------|------------|
+| A (golden) | LV | — | — | yes | ext4 | template | No |
+| B (workspace) | snapshot of A | yes | yes | yes | ext4 rw | live | Yes |
+| B-clone | snapshot of B | yes | yes | yes | ext4 rw | live | Yes |
+| C (svc rootfs) | snapshot of A | — | — | yes | ext4 ro | live | No |
+| D (svc data) | LV | yes | yes | yes | ext4 rw | live | Yes |
+| Ephemeral | LV | — | — | — | btrfs+zstd | live | No |
 
 ## 4. Block Device Stack
 
-### 4.1 dm-vdo Above LUKS
+### 4.1 dm-vdo Removed
 
-dm-vdo is placed above LUKS in the stack, operating on plaintext data:
+dm-vdo was originally planned above LUKS for transparent compression. **Removed** because the stacking order required by LUKS (dm-vdo above LUKS, above dm-thin) causes compound write amplification: VDO's allocate-on-write CoW compounds with dm-thin snapshot CoW. Red Hat recommends dm-thin above VDO, but our LUKS requirement forces the opposite order. The compression benefit (5-30 GB at piccolo's scale) doesn't justify the write amplification cost on workspaces, especially given SSD wear on edge hardware.
 
-```
-thin LV (on disk: encrypted, compressed data)
-  ↑ LUKS decrypts
-plaintext compressed data
-  ↑ dm-vdo decompresses
-plaintext raw data
-  ↑ ext4 filesystem
-```
-
-**Why above LUKS:** VDO below LUKS (or below dm-thin) would see ciphertext. LUKS with `aes-xts-plain64` produces incompressible output. Different master keys per volume (if we had them) would prevent cross-volume dedup entirely. Placing VDO above LUKS means it operates on plaintext — compression ratios of 2-3x on container images (text configs, shared libraries, package metadata).
-
-**Configuration:** Compression enabled, dedup disabled by default. Dedup adds ~1GB RAM per 1TB and SHA-256 overhead per write — marginal benefit for piccolo's volume sizes (1-10 GiB). Within-volume dedup catches some repeated blocks in flattened images, but the ROI doesn't justify the memory cost on edge hardware. Can be enabled per-volume if needed.
-
-**VDO virtual size = physical size** (1:1, no VDO-level overprovisioning). dm-thin is the sole overprovisioning layer. VDO purely provides transparent compression — same virtual size, but fewer blocks actually written to the thin LV.
-
-**TRIM chain:** ext4 `mount -o discard` → VDO frees compressed blocks → VDO passes TRIM to LUKS → DRBD `rs-discard-granularity` → NBD `BLKDISCARD` → dm-thin deallocates. **Critical:** All `cryptsetup open` invocations MUST include `--allow-discards` (per org-context §5.1). Without it, TRIM stops at LUKS and the thin pool fills monotonically — fatal on edge hardware with small storage.
-
-**Applied to:** A (golden LV), B (workspace), B-clone, C (service rootfs). **Not applied to:** D (service data — already-compressed user data), Ephemeral (has btrfs+zstd).
-
-**Kernel requirement:** dm-vdo merged in kernel 6.9. MicroOS Tumbleweed ships 6.x.
+**TRIM chain:** ext4 `mount -o discard` → LUKS `--allow-discards` → DRBD `rs-discard-granularity` → NBD `BLKDISCARD` → dm-thin deallocates. **Critical:** All `cryptsetup open` invocations MUST include `--allow-discards`. Without it, TRIM stops at LUKS and the thin pool fills monotonically — fatal on edge hardware with small storage.
 
 ### 4.2 Single LUKS Key
 
@@ -294,20 +273,19 @@ When a workspace or service is installed and no golden LV exists for the image:
 1. Check thin pool capacity — abort if data > 85% or metadata > 75%
 2. `lvcreate --thin` — new thin LV (default 10 GiB virtual, thin-provisioned)
 3. `cryptsetup luksFormat --master-key-file <shared-key>` → `luksOpen`
-4. Create dm-vdo target on LUKS plaintext device (compression enabled, dedup disabled)
-5. `mkfs.ext4` on VDO device, mount
-6. Write sentinel: `.piccolo_flatten_incomplete`
-7. Flatten image:
+4. `mkfs.ext4` on LUKS device, mount
+5. Write sentinel: `.piccolo_flatten_incomplete`
+6. Flatten image:
    ```
    cid=$(podman --root <runtime-root> create <image> true)
    podman --root <runtime-root> export $cid | tar x --numeric-owner --xattrs --xattrs-include='*' -C /mnt/golden-<id>/
    podman --root <runtime-root> rm $cid
    ```
    `podman create/export` run as `piccolo-runtime` to access the shared imagestore. `tar x --numeric-owner` runs as root to preserve original on-disk UIDs (0, 33, etc.). `--xattrs --xattrs-include='*'` preserves extended attributes including `security.capability` (needed for binaries like `ping` with `cap_net_raw`) and SELinux labels.
-8. `syncfs(mount_fd)`
-9. Write golden LV metadata (`piccolo.volume.json`) via `fsutil.AtomicWriteFile`
-10. Remove `.piccolo_flatten_incomplete` sentinel
-11. Unmount ext4, close VDO, close LUKS, deactivate LV
+7. `syncfs(mount_fd)`
+8. Write golden LV metadata (`piccolo.volume.json`) via `fsutil.AtomicWriteFile`
+9. Remove `.piccolo_flatten_incomplete` sentinel
+10. Unmount ext4, close LUKS, deactivate LV
 
 **Partial flatten recovery:** On startup, `ReconcileAllVolumeStates` destroys golden LVs with `.piccolo_flatten_incomplete` present. Sentinel written before extraction, removed after fsync.
 
@@ -322,7 +300,7 @@ When a pulled image has a new digest for the same ref:
 
 ### 5.3 Golden LV Garbage Collection
 
-On startup and after service/workspace uninstalls, scan for golden LVs with zero active snapshots (no B or C volumes reference it). Destroy: close LUKS + remove VDO + `lvremove` + remove metadata.
+On startup and after service/workspace uninstalls, scan for golden LVs with zero active snapshots (no B or C volumes reference it). Destroy: close LUKS + `lvremove` + remove metadata.
 
 ### 5.4 Workspace Creation
 
@@ -331,7 +309,7 @@ On startup and after service/workspace uninstalls, scan for golden LVs with zero
 3. `lvchange -ay <vg>/ws-<id>` — activate snapshot
 4. `cryptsetup luksUUID --uuid $(uuidgen) /dev/<vg>/ws-<id>` — unique UUID (avoids collision with golden LV and other snapshots). If UUID assignment fails, destroy the snapshot LV immediately (`lvremove`) to prevent two LVs with identical LUKS UUIDs.
 5. Write workspace metadata
-6. Attach: NBD → DRBD (standalone) → `cryptsetup open --allow-discards` → VDO open → `mount -o discard ext4` → idmapped mount
+6. Attach: NBD → DRBD (standalone) → `cryptsetup open --allow-discards` → `mount -o discard ext4` → idmapped mount
 7. `podman create --rootfs <idmapped-path>`
 
 ### 5.5 Workspace Cloning
@@ -366,7 +344,7 @@ If UUID assignment fails, destroy the clone LV immediately.
 2. `lvcreate --snapshot --name svc-rootfs-<id> <vg>/golden-<image-id>`
 3. `cryptsetup luksUUID --uuid $(uuidgen) /dev/<vg>/svc-rootfs-<id>` — if UUID assignment fails, destroy the snapshot LV immediately (`lvremove`)
 4. Write service rootfs metadata
-5. Attach: `cryptsetup open --allow-discards` → VDO open → `mount -o ro,discard ext4` → idmapped mount
+5. Attach: `cryptsetup open --allow-discards` → `mount -o ro,discard ext4` → idmapped mount
 6. `podman create --rootfs <idmapped-path> --read-only`
 
 **Writable paths:** Podman provides tmpfs for `/tmp`, `/var/run`, `/dev/shm`. Additional writable mounts configured per-app (bind mounts from data volume D). This is standard read-only root filesystem behavior (same as Kubernetes `readOnlyRootFilesystem: true`).
@@ -376,7 +354,7 @@ If UUID assignment fails, destroy the clone LV immediately.
 Workspace (B) and service data (D) volumes use the full replication stack:
 
 ```
-thin LV → NBD → DRBD → LUKS → [VDO] → ext4
+thin LV → NBD → DRBD → LUKS → ext4
 ```
 
 One DRBD resource per volume. Since workspaces are now a single LV (not rootfs + data), replication is simpler — one resource covers the entire workspace state.
@@ -387,21 +365,19 @@ One DRBD resource per volume. Since workspaces are now a single LV (not rootfs +
 1. Stop container (`podman stop --timeout 30`, force-kill if needed)
 2. Unmount idmapped bind mount (if applicable). EBUSY → `MNT_DETACH`.
 3. Unmount ext4
-4. Close VDO target (B only)
-5. Close LUKS mapper
-6. DRBD down (if cluster)
-7. NBD disconnect
-8. Deactivate thin LV
+4. Close LUKS mapper
+5. DRBD down (if cluster)
+6. NBD disconnect
+7. Deactivate thin LV
 
 **Service rootfs (C):**
 1. Stop container
 2. Unmount idmapped bind mount
 3. Unmount ext4 (ro)
-4. Close VDO target
-5. Close LUKS mapper
-6. Deactivate thin LV
+4. Close LUKS mapper
+5. Deactivate thin LV
 
-**Crash recovery and mount discovery:** Idmapped mounts survive piccolod crashes (they are kernel mount state, not process state). On restart, `ReconcileAllVolumeStates` discovers existing mounts by scanning `/proc/self/mountinfo` for active mount entries at known paths (`/piccolo-core/mounts/<vol-id>`). If a mount is already active, the attachment sequence skips the mount steps and reuses it. For partially-attached stacks (e.g., LUKS open but ext4 not mounted, VDO open but LUKS closed), reconciliation tears down to a known-clean state (close all layers) and re-attaches from scratch. The golden LV sentinel check (`.piccolo_flatten_incomplete`) also performs a full teardown of any partially-attached golden LV stack before `lvremove`.
+**Crash recovery and mount discovery:** Idmapped mounts survive piccolod crashes (they are kernel mount state, not process state). On restart, `ReconcileAllVolumeStates` discovers existing mounts by scanning `/proc/self/mountinfo` for active mount entries at known paths (`/piccolo-core/mounts/<vol-id>`). If a mount is already active, the attachment sequence skips the mount steps and reuses it. For partially-attached stacks (e.g., LUKS open but ext4 not mounted), reconciliation tears down to a known-clean state (close all layers) and re-attaches from scratch. The golden LV sentinel check (`.piccolo_flatten_incomplete`) also performs a full teardown of any partially-attached golden LV stack before `lvremove`.
 
 ## 6. Alternatives Considered
 
@@ -420,21 +396,11 @@ Pre-idmap each image lower layer (piccolo-runtime UIDs → per-app UIDs) via `mo
 
 See §2.3. Containers share the host GPU driver across all vendors (NVIDIA, AMD, Intel). VMs require hardware-level partitioning (VFIO exclusive, vendor-specific SR-IOV/vGPU) not available on consumer GPUs.
 
-### 6.3 dm-vdo Below dm-thin
-
-VDO under the thin pool (`physical → VDO → thin pool → thin LVs`) would apply to all volumes.
-
-**Rejected:** VDO below dm-thin sees LUKS ciphertext (LUKS is above dm-thin in the stack). `aes-xts-plain64` with different sector IVs produces incompressible output. Compression and dedup provide zero benefit on ciphertext. CPU overhead of SHA-256 hashing on every write with no savings.
-
-### 6.4 dm-vdo on Service Data (D)
-
-**Rejected:** Service data volumes hold user-generated content — media files, databases, application state. This data is typically already compressed (JPEG, video, SQLite) or incompressible (encrypted blobs). VDO would add CPU overhead on every write with near-zero compression benefit.
-
-### 6.5 Per-Volume LUKS Keys
+### 6.3 Per-Volume LUKS Keys
 
 See §4.2 threat model analysis. Per-volume keys provide crypto-shredding and reduced blast radius on key leak, but both scenarios are marginal for piccolo's threat model. The simplification of a single key (enabling golden LV sharing, simpler key management, simpler boot) outweighs the marginal security benefit.
 
-### 6.6 OverlayBD
+### 6.4 OverlayBD
 
 containerd plugin for block-level OCI layers. Rejected: not podman-native, heavy integration, low ROI at piccolo's app count.
 
@@ -464,7 +430,7 @@ One entry in the control plane. All volumes reference this key.
   "vg_name": "piccolo-data-vg",
   "size_bytes": 10737418240,
   "fs_type": "ext4",
-  "vdo_enabled": true,
+
   "base_image_digest": "docker.io/library/ubuntu@sha256:...",
   "base_image_ref": "ubuntu:22.04"
 }
@@ -480,7 +446,7 @@ One entry in the control plane. All volumes reference this key.
   "vg_name": "piccolo-data-vg",
   "size_bytes": 10737418240,
   "fs_type": "ext4",
-  "vdo_enabled": true,
+
   "golden_lv": "golden-ubuntu-22.04-abc123",
   "base_image_digest": "docker.io/library/ubuntu@sha256:...",
   "base_image_ref": "ubuntu:22.04",
@@ -505,7 +471,7 @@ One entry in the control plane. All volumes reference this key.
   "lv_name": "svc-rootfs-nextcloud-abc123",
   "vg_name": "piccolo-data-vg",
   "fs_type": "ext4",
-  "vdo_enabled": true,
+
   "golden_lv": "golden-nextcloud-abc123",
   "read_only": true,
   "idmap": {
@@ -529,7 +495,7 @@ One entry in the control plane. All volumes reference this key.
   "vg_name": "piccolo-data-vg",
   "size_bytes": 53687091200,
   "fs_type": "ext4",
-  "vdo_enabled": false
+
 }
 ```
 
@@ -545,12 +511,11 @@ One entry in the control plane. All volumes reference this key.
 
 ## 8. Implementation Plan
 
-### Phase 1: Syscall and VDO Integration
+### Phase 1: Syscall Integration
 
 - `internal/fsutil/idmap.go` — `mount_setattr` wrapper, userns creation, UID map construction
-- `internal/storage/vdo/` — dm-vdo target create/open/close lifecycle
-- Integration tests (root required): idmapped ext4 mount, VDO create + compress + read
-- ~200 lines of Go
+- Integration tests (root required): idmapped ext4 mount
+- ~150 lines of Go
 
 ### Phase 2: Golden LV and Workspace Lifecycle
 
@@ -599,15 +564,13 @@ One entry in the control plane. All volumes reference this key.
 
 3. **Flatten cost.** ~30s per unique image (one-time). Image pull dominates install time. Subsequent containers from the same image are instant snapshots.
 
-4. **dm-vdo maturity.** Merged in kernel 6.9 (in-tree). VDO technology (formerly Permabit) has been in production use since Red Hat acquisition. dm-vdo is the kernel-native successor to the older `kvdo` out-of-tree module.
+4. **Single LUKS key blast radius.** Key leak from RAM exposes all volumes. Mitigated: if attacker has RAM access, they have process access → SDEK → all keys anyway. See §4.2.
 
-5. **Single LUKS key blast radius.** Key leak from RAM exposes all volumes. Mitigated: if attacker has RAM access, they have process access → SDEK → all keys anyway. See §4.2.
+5. **Service rootfs writable paths.** Containers expecting to write to rootfs paths not covered by tmpfs/bind mounts will get EROFS. Requires per-image analysis of writable path needs. Standard practice for read-only root filesystem containers.
 
-6. **Service rootfs writable paths.** Containers expecting to write to rootfs paths not covered by tmpfs/bind mounts will get EROFS. Requires per-image analysis of writable path needs. Standard practice for read-only root filesystem containers.
+6. **Golden LV storage.** One golden LV per unique image, even if only one container uses it. At ~1-3 GiB per image (thin-provisioned), this is acceptable for piccolo's app count (5-20 apps).
 
-7. **Golden LV storage.** One golden LV per unique image, even if only one container uses it. At ~1-3 GiB per image (compressed by VDO to ~0.5-1 GiB), this is acceptable for piccolo's app count (5-20 apps).
-
-8. **Image update coordination.** Updating a golden LV requires stopping all service containers using it, re-creating snapshots, and restarting. More involved than `podman pull` + restart. Acceptable because image updates are infrequent and the coordination is automatable.
+7. **Image update coordination.** Updating a golden LV requires stopping all service containers using it, re-creating snapshots, and restarting. More involved than `podman pull` + restart. Acceptable because image updates are infrequent and the coordination is automatable.
 
 ## 11. Operational Readiness
 
@@ -615,7 +578,7 @@ One entry in the control plane. All volumes reference this key.
 
 ```
 INFO: golden-lv <id>: flatten started (image=<ref>)
-INFO: golden-lv <id>: flatten complete (<duration>, <raw bytes>, <compressed bytes>, ratio=<X>x)
+INFO: golden-lv <id>: flatten complete (<duration>, <bytes>)
 INFO: workspace <id>: created from golden-lv <golden-id> (snapshot, instant)
 INFO: workspace <id>: idmapped mount at <path> (uid_map: 0→<host_uid>, 1-65535→<subuid_start>)
 INFO: workspace <id>: clone <clone-id> created (snapshot, instant)
@@ -635,6 +598,6 @@ ERROR: mount_setattr failed: <errno translation> — piccolod cannot start
 
 Expose via storage inspection API:
 - Golden LV inventory: image ref, digest, compressed size, snapshot count
-- Per-volume: type, LV name, LUKS mapper, VDO stats (compression ratio), mount status
+- Per-volume: type, LV name, LUKS mapper, mount status
 - Thin pool: data%, metadata%, per-type breakdown (golden, workspace, service-rootfs, service-data, ephemeral)
 - Clone relationships: origin → clone graph

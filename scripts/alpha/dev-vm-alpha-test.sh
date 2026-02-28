@@ -2,7 +2,7 @@
 # dev-vm-alpha-test.sh — Test stages for block-native storage on a Tumbleweed dev VM.
 #
 # Combines HTTP API tests (same as production) with SSH-based storage inspection
-# stages for verifying the full block device stack: LVM, DRBD, NBD, LUKS, VDO, idmap.
+# stages for verifying the full block device stack: LVM, DRBD, NBD, LUKS, idmap.
 #
 # Usage:
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP>                  # run all stages
@@ -208,7 +208,7 @@ stage_prereq() {
   check_ssh_ok "0.5" "podman installed" "rpm -q podman"
 
   # Kernel modules
-  check_ssh_ok "0.6" "overlay module loaded" "lsmod | grep -q overlay || grep -q overlay /proc/filesystems"
+  check_ssh_ok "0.6" "overlay module loaded" "modprobe overlay 2>/dev/null; grep -q overlay /proc/filesystems"
   check_ssh_ok "0.7" "dm-thin-pool available" "modprobe dm-thin-pool"
 
   # DRBD and NBD — may not be available yet, just report
@@ -244,33 +244,26 @@ stage_prereq() {
   check_ssh_ok "0.12" "pvcreate available" "which pvcreate"
   check_ssh_ok "0.13" "cryptsetup available" "which cryptsetup"
 
-  # dm-vdo prerequisites (block-native rootfs)
-  check_ssh_ok "0.18" "vdoformat available" "which vdoformat"
-  check_ssh "0.19" "dm-vdo kernel target available" "dmsetup targets 2>/dev/null" "vdo"
-
   # Rootless podman prerequisites
-  check_ssh "0.14" "newuidmap is setuid" "stat -c '%A' /usr/bin/newuidmap" "s"
-  check_ssh "0.15" "newgidmap is setuid" "stat -c '%A' /usr/bin/newgidmap" "s"
+  # newuidmap/newgidmap need setuid for rootless podman user namespace mapping.
+  # File capabilities conflict with setuid on Tumbleweed — strip caps, set suid.
+  local uidmap_perms gidmap_perms
+  uidmap_perms=$(vssh "stat -c '%A' /usr/bin/newuidmap" 2>/dev/null || echo "")
+  gidmap_perms=$(vssh "stat -c '%A' /usr/bin/newgidmap" 2>/dev/null || echo "")
 
-  # File capabilities on newuidmap/newgidmap conflict with setuid. When both
-  # are present, the kernel refuses to raise all capabilities and the write to
-  # /proc/<pid>/uid_map fails with EPERM. Strip file capabilities if present.
-  local uidmap_caps gidmap_caps
-  uidmap_caps=$(vssh "getfattr -n security.capability /usr/bin/newuidmap 2>&1" 2>/dev/null || true)
-  gidmap_caps=$(vssh "getfattr -n security.capability /usr/bin/newgidmap 2>&1" 2>/dev/null || true)
-  if echo "$uidmap_caps" | grep -q "security.capability="; then
-    echo -e "  ${YELLOW}FIX ${NC} [0.16] Removing conflicting file capabilities from newuidmap"
-    vssh "setfattr -x security.capability /usr/bin/newuidmap" 2>/dev/null
-  else
-    echo -e "  ${GREEN}PASS${NC} [0.16] newuidmap has no conflicting file capabilities"
+  if echo "$uidmap_perms" | grep -q "s"; then
+    echo -e "  ${GREEN}PASS${NC} [0.14] newuidmap has setuid"
     ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${YELLOW}FIX ${NC} [0.14] Setting setuid on newuidmap"
+    vssh "setfattr -x security.capability /usr/bin/newuidmap 2>/dev/null; chmod u+s /usr/bin/newuidmap" 2>/dev/null
   fi
-  if echo "$gidmap_caps" | grep -q "security.capability="; then
-    echo -e "  ${YELLOW}FIX ${NC} [0.17] Removing conflicting file capabilities from newgidmap"
-    vssh "setfattr -x security.capability /usr/bin/newgidmap" 2>/dev/null
-  else
-    echo -e "  ${GREEN}PASS${NC} [0.17] newgidmap has no conflicting file capabilities"
+  if echo "$gidmap_perms" | grep -q "s"; then
+    echo -e "  ${GREEN}PASS${NC} [0.15] newgidmap has setuid"
     ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${YELLOW}FIX ${NC} [0.15] Setting setuid on newgidmap"
+    vssh "setfattr -x security.capability /usr/bin/newgidmap 2>/dev/null; chmod u+s /usr/bin/newgidmap" 2>/dev/null
   fi
 }
 
@@ -385,7 +378,7 @@ stage_storage_inspect() {
   drbd_status=$(vssh "drbdadm status 2>/dev/null" 2>/dev/null || echo "no resources")
   echo -e "  ${CYAN}INFO${NC} DRBD status: $(echo "$drbd_status" | head -3)"
 
-  # Raw mount table (informational — expect ext4 on dm-vdo, no overlay/FUSE)
+  # Raw mount table (informational — expect ext4, no overlay/FUSE)
   echo -e "\n  ${CYAN}Block-native rootfs mounts:${NC}"
   vssh "mount | grep '/piccolo-core/mounts/' 2>/dev/null | head -10" 2>/dev/null | sed 's/^/       /' || true
 }
@@ -437,8 +430,6 @@ stage_rootfs_verify() {
     echo -e "  ${CYAN}INFO${NC} [6.5] No app volumes currently mounted (expected before app install)"
   fi
 
-  # dm-vdo kernel target available
-  check_ssh "6.6" "dm-vdo kernel target loaded" "dmsetup targets 2>/dev/null" "vdo"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -507,7 +498,6 @@ except: print('')" 2>/dev/null)
   if [[ -n "$svc_rootfs_meta" ]]; then
     check "7.2b" "Service rootfs metadata type" "$svc_rootfs_meta" '"type":"service-rootfs"'
     check "7.2c" "Service rootfs read-only flag" "$svc_rootfs_meta" '"read_only":true'
-    check "7.2d" "Service rootfs VDO enabled" "$svc_rootfs_meta" '"vdo_enabled":true'
   else
     skip "7.2b" "Service rootfs metadata" "no svc-rootfs-* volume metadata found"
   fi
@@ -515,10 +505,6 @@ except: print('')" 2>/dev/null)
   # LUKS mapper active for service rootfs
   check_ssh "7.2e" "Service rootfs LUKS mapper active" \
     "dmsetup info --noheadings -c -o name 2>/dev/null | grep 'piccolo-vol-svc-rootfs-' || true" "piccolo-vol-svc-rootfs-"
-
-  # dm-vdo target active for service rootfs
-  check_ssh "7.2f" "Service rootfs VDO target active" \
-    "dmsetup info --noheadings -c -o name 2>/dev/null | grep 'piccolo-vdo-svc-rootfs-' || true" "piccolo-vdo-svc-rootfs-"
 
   # Idmapped mount exists for service rootfs
   local svc_idmap
@@ -557,9 +543,6 @@ except: print('')" 2>/dev/null)
   check_not "7.5" "No service rootfs LUKS mapper after uninstall" \
     "$(vssh 'dmsetup info --noheadings -c -o name 2>/dev/null | grep piccolo-vol-svc-rootfs- || true' 2>/dev/null)" \
     "piccolo-vol-svc-rootfs-"
-  check_not "7.6" "No service rootfs VDO target after uninstall" \
-    "$(vssh 'dmsetup info --noheadings -c -o name 2>/dev/null | grep piccolo-vdo-svc-rootfs- || true' 2>/dev/null)" \
-    "piccolo-vdo-svc-rootfs-"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -618,7 +601,6 @@ except: print('')" 2>/dev/null)
   ws_meta=$(vssh 'for f in /piccolo-core/volumes/ws-*/piccolo.volume.json; do cat "$f" 2>/dev/null; break; done' 2>/dev/null || echo "")
   if [[ -n "$ws_meta" ]]; then
     check "8.3" "Workspace rootfs metadata type" "$ws_meta" '"type":"workspace"'
-    check "8.3a" "Workspace rootfs VDO enabled" "$ws_meta" '"vdo_enabled":true'
   else
     skip "8.3" "Workspace rootfs metadata" "no ws-* volume metadata found"
   fi
@@ -626,10 +608,6 @@ except: print('')" 2>/dev/null)
   # LUKS mapper active for workspace
   check_ssh "8.3b" "Workspace LUKS mapper active" \
     "dmsetup info --noheadings -c -o name 2>/dev/null | grep 'piccolo-vol-ws-' || true" "piccolo-vol-ws-"
-
-  # dm-vdo target active for workspace
-  check_ssh "8.3c" "Workspace VDO target active" \
-    "dmsetup info --noheadings -c -o name 2>/dev/null | grep 'piccolo-vdo-ws-' || true" "piccolo-vdo-ws-"
 
   # Idmapped mount exists for workspace
   local ws_idmap
@@ -668,9 +646,6 @@ except: print('')" 2>/dev/null)
   check_not "8.6" "No workspace LUKS mapper after uninstall" \
     "$(vssh 'dmsetup info --noheadings -c -o name 2>/dev/null | grep piccolo-vol-ws- || true' 2>/dev/null)" \
     "piccolo-vol-ws-"
-  check_not "8.7" "No workspace VDO target after uninstall" \
-    "$(vssh 'dmsetup info --noheadings -c -o name 2>/dev/null | grep piccolo-vdo-ws- || true' 2>/dev/null)" \
-    "piccolo-vdo-ws-"
 
   # Golden LV GC: after uninstalling the only app using this image, golden LV should be cleaned up
   local golden_after

@@ -21,7 +21,6 @@ import (
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage/blockdev"
 	"piccolod/internal/storage/lvm"
-	"piccolod/internal/storage/vdo"
 )
 
 const (
@@ -117,14 +116,12 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	sizeBytes := int64(defaultGoldenLVSize)
 
 	mapper := "piccolo-vol-" + goldenID
-	vdoMapper := "piccolo-vdo-" + goldenID
 	mountDir := paths.MountDir(goldenID)
 
 	// Track which layers have been set up for deferred cleanup.
 	var (
 		lvCreated  bool
 		luksOpened bool
-		vdoCreated bool
 		mounted    bool
 		success    bool
 	)
@@ -137,9 +134,6 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 		// activated during flatten, then deactivated.
 		if mounted {
 			m.run.Run(cleanupCtx, "umount", mountDir)
-		}
-		if vdoCreated {
-			m.vdoMgr.Remove(cleanupCtx, vdoMapper)
 		}
 		if luksOpened {
 			m.run.Run(cleanupCtx, "cryptsetup", "close", mapper)
@@ -177,21 +171,8 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 
 	luksPath := "/dev/mapper/" + mapper
 
-	// VDO format + create.
-	if err := m.vdoMgr.Format(ctx, luksPath); err != nil {
-		return "", fmt.Errorf("vdo format golden: %w", err)
-	}
-
-	params := vdo.DefaultTargetParams(sizeBytes)
-	if err := m.vdoMgr.Create(ctx, vdoMapper, luksPath, params); err != nil {
-		return "", fmt.Errorf("vdo create golden: %w", err)
-	}
-	vdoCreated = true
-
-	vdoPath := vdo.DevicePath(vdoMapper)
-
 	// mkfs.ext4.
-	if err := m.run.Run(ctx, "mkfs.ext4", "-F", "-m", "1", vdoPath); err != nil {
+	if err := m.run.Run(ctx, "mkfs.ext4", "-F", "-m", "1", luksPath); err != nil {
 		return "", fmt.Errorf("mkfs golden: %w", err)
 	}
 
@@ -199,7 +180,7 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir golden mount: %w", err)
 	}
-	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", "discard", vdoPath, mountDir); err != nil {
+	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", "discard", luksPath, mountDir); err != nil {
 		return "", fmt.Errorf("mount golden: %w", err)
 	}
 	mounted = true
@@ -246,13 +227,6 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 		VGName:          lvm.DefaultVGName,
 		SizeBytes:       sizeBytes,
 		FSType:          "ext4",
-		VDOEnabled:      true,
-		VDOParams: &VDOParamsMeta{
-			LogicalSizeBytes: params.LogicalSizeBytes,
-			MinIOSize:        params.MinIOSize,
-			BlockMapCacheKB:  params.BlockMapCacheKB,
-			BlockMapEraLen:   params.BlockMapEraLen,
-		},
 		BaseImageDigest: req.ImageDigest,
 		BaseImageRef:    req.ImageRef,
 		FlattenComplete: time.Now().UTC().Format(time.RFC3339),
@@ -310,7 +284,7 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 		return RootfsHandle{}, err
 	}
 
-	// Read golden LV metadata for VDO params.
+	// Read golden LV metadata.
 	goldenMetaPath := filepath.Join(paths.VolumeMetaDir(goldenID), metadataV2File)
 	goldenMeta, err := readVolumeMetaV3(goldenMetaPath)
 	if err != nil {
@@ -351,8 +325,6 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 		VGName:          lvm.DefaultVGName,
 		SizeBytes:       goldenMeta.SizeBytes,
 		FSType:          "ext4",
-		VDOEnabled:      true,
-		VDOParams:       goldenMeta.VDOParams,
 		ReadOnly:        readOnly,
 		BaseImageDigest: goldenMeta.BaseImageDigest,
 		BaseImageRef:    goldenMeta.BaseImageRef,
@@ -434,8 +406,6 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 		VGName:          lvm.DefaultVGName,
 		SizeBytes:       originMeta.SizeBytes,
 		FSType:          "ext4",
-		VDOEnabled:      originMeta.VDOEnabled,
-		VDOParams:       originMeta.VDOParams,
 		BaseImageDigest: originMeta.BaseImageDigest,
 		BaseImageRef:    originMeta.BaseImageRef,
 		GoldenLV:        originMeta.GoldenLV,
@@ -487,7 +457,6 @@ func (m *luksVolumeManager) AttachRootfs(ctx context.Context, volumeID string) (
 func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID string, meta *volumeMetaV3) (RootfsHandle, error) {
 	lvName := meta.LVName
 	mapper := "piccolo-vol-" + volumeID
-	vdoMapper := "piccolo-vdo-" + volumeID
 
 	// Build below-LUKS device stack.
 	var stack *blockdev.DeviceStack
@@ -528,47 +497,25 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 
 	luksPath := "/dev/mapper/" + mapper
 
-	// VDO create (no format needed — superblock from snapshot).
-	if meta.VDOEnabled && meta.VDOParams != nil {
-		vdoParams := vdo.TargetParams{
-			LogicalSizeBytes: meta.VDOParams.LogicalSizeBytes,
-			MinIOSize:        meta.VDOParams.MinIOSize,
-			BlockMapCacheKB:  meta.VDOParams.BlockMapCacheKB,
-			BlockMapEraLen:   meta.VDOParams.BlockMapEraLen,
-		}
-		if err := m.vdoMgr.Create(ctx, vdoMapper, luksPath, vdoParams); err != nil {
-			m.run.Run(ctx, "cryptsetup", "close", mapper)
-			rollback()
-			return RootfsHandle{}, fmt.Errorf("vdo create: %w", err)
-		}
-	}
-
 	// Mount ext4.
 	mountDir := paths.MountDir(volumeID)
 	if err := os.MkdirAll(filepath.Dir(mountDir), 0o711); err != nil {
-		m.teardownVDO(ctx, vdoMapper, meta.VDOEnabled)
 		m.run.Run(ctx, "cryptsetup", "close", mapper)
 		rollback()
 		return RootfsHandle{}, fmt.Errorf("mkdir mounts parent: %w", err)
 	}
 	_ = os.Chmod(filepath.Dir(mountDir), 0o711)
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
-		m.teardownVDO(ctx, vdoMapper, meta.VDOEnabled)
 		m.run.Run(ctx, "cryptsetup", "close", mapper)
 		rollback()
 		return RootfsHandle{}, fmt.Errorf("mkdir mount: %w", err)
 	}
 
-	mountDevice := luksPath
-	if meta.VDOEnabled {
-		mountDevice = vdo.DevicePath(vdoMapper)
-	}
 	mountOpts := "discard"
 	if meta.ReadOnly {
 		mountOpts = "ro,discard"
 	}
-	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", mountOpts, mountDevice, mountDir); err != nil {
-		m.teardownVDO(ctx, vdoMapper, meta.VDOEnabled)
+	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", mountOpts, luksPath, mountDir); err != nil {
 		m.run.Run(ctx, "cryptsetup", "close", mapper)
 		rollback()
 		return RootfsHandle{}, fmt.Errorf("mount: %w", err)
@@ -588,7 +535,6 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		}
 		if err := fsutil.CreateIDMappedMount(mountDir, idmapPath, idmapConfig); err != nil {
 			m.run.Run(ctx, "umount", mountDir)
-			m.teardownVDO(ctx, vdoMapper, meta.VDOEnabled)
 			m.run.Run(ctx, "cryptsetup", "close", mapper)
 			rollback()
 			return RootfsHandle{}, fmt.Errorf("idmap mount: %w", err)
@@ -599,8 +545,6 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 	state := &rootfsMountState{
 		stack:      stack,
 		luksMapper: mapper,
-		vdoMapper:  vdoMapper,
-		vdoEnabled: meta.VDOEnabled && meta.VDOParams != nil,
 		mountPath:  mountDir,
 		idmapPath:  idmapPath,
 	}
@@ -648,11 +592,6 @@ func (m *luksVolumeManager) DetachRootfs(ctx context.Context, volumeID string) e
 		if err2 := m.run.Run(ctx, "umount", "-l", state.mountPath); err2 != nil {
 			errs = append(errs, fmt.Errorf("umount %s: %w", state.mountPath, err2))
 		}
-	}
-
-	// VDO remove (only if VDO was active).
-	if state.vdoEnabled {
-		m.teardownVDO(ctx, state.vdoMapper, true)
 	}
 
 	// LUKS close.
@@ -714,11 +653,9 @@ func (m *luksVolumeManager) DestroyRootfs(ctx context.Context, volumeID string) 
 // destroyGoldenLVUnsafe destroys a golden LV without lock. Called under goldenMu.
 func (m *luksVolumeManager) destroyGoldenLVUnsafe(ctx context.Context, goldenID string) {
 	mapper := "piccolo-vol-" + goldenID
-	vdoMapper := "piccolo-vdo-" + goldenID
 
 	// Best-effort teardown of any active state.
 	m.run.Run(ctx, "umount", paths.MountDir(goldenID))
-	m.vdoMgr.Remove(ctx, vdoMapper)
 	m.run.Run(ctx, "cryptsetup", "close", mapper)
 	m.lvMgr.DeactivateLV(ctx, goldenID)
 	m.lvMgr.RemoveThinLV(ctx, goldenID)
@@ -845,16 +782,6 @@ func (m *luksVolumeManager) ReconcileRootfsStates(ctx context.Context) error {
 
 	// GC golden LVs.
 	return m.GarbageCollectGoldenLVs(ctx)
-}
-
-// teardownVDO removes a VDO target if enabled. Best-effort.
-func (m *luksVolumeManager) teardownVDO(ctx context.Context, vdoMapper string, enabled bool) {
-	if !enabled || vdoMapper == "" || m.vdoMgr == nil {
-		return
-	}
-	if m.vdoMgr.Exists(ctx, vdoMapper) {
-		_ = m.vdoMgr.Remove(ctx, vdoMapper)
-	}
 }
 
 // ReadGoldenImageConfig returns the OCI image config for a golden LV.

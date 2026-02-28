@@ -19,7 +19,6 @@ import (
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/lvm"
 	"piccolod/internal/storage/nbd"
-	"piccolod/internal/storage/vdo"
 )
 
 // Options captures construction parameters for the persistence service.
@@ -44,7 +43,6 @@ type Options struct {
 	DRBDMgr *drbd.ResourceManager
 
 	// Rootfs dependencies.
-	VDOMgr    *vdo.Manager
 	FlattenFn func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
 }
 
@@ -141,13 +139,11 @@ func NewService(opts Options) (*Module, error) {
 			PoolMgr:   opts.PoolMgr,
 			NBDSrv:    opts.NBDSrv,
 			DRBDMgr:   opts.DRBDMgr,
-			VDOMgr:    opts.VDOMgr,
 			FlattenFn: opts.FlattenFn,
 		})
 		mod.volumes = lvm
-		// Only expose rootfs capabilities when all dependencies are available.
-		// Without VDOMgr and FlattenFn, the block-native rootfs path cannot function.
-		if opts.VDOMgr != nil && opts.FlattenFn != nil {
+		// Only expose rootfs capabilities when FlattenFn is available.
+		if opts.FlattenFn != nil {
 			mod.rootfs = lvm
 		}
 	}

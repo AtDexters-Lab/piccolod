@@ -45,7 +45,6 @@ import (
 	"piccolod/internal/storage/diskprep"
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/nbd"
-	"piccolod/internal/storage/vdo"
 	"piccolod/internal/update"
 
 	"github.com/coreos/go-systemd/v22/daemon"
@@ -463,7 +462,6 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		PoolMgr:    storageMgr.LVMPool(),
 		NBDSrv:     nbdSrv,
 		DRBDMgr:    drbdMgr,
-		VDOMgr:     vdo.NewManager(execRunner),
 		FlattenFn:  appMgr.MakeFlattenFn(),
 	})
 	if err != nil {

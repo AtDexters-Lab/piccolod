@@ -21,7 +21,6 @@ import (
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/lvm"
 	"piccolod/internal/storage/nbd"
-	"piccolod/internal/storage/vdo"
 )
 
 const (
@@ -59,8 +58,8 @@ type Reconcilable interface {
 // luksVolumeManager implements VolumeManager, RootfsVolumeManager,
 // RoleCheckable, and Reconcilable.
 // It dispatches to LUKSLoopVolume for control volumes and DeviceStack + LUKS
-// for application volumes. For rootfs volumes, it manages golden LVs, dm-vdo,
-// and idmapped mounts.
+// for application volumes. For rootfs volumes, it manages golden LVs and
+// idmapped mounts.
 type luksVolumeManager struct {
 	run      runner.CommandRunner
 	crypto   *crypt.Manager
@@ -72,9 +71,6 @@ type luksVolumeManager struct {
 	poolMgr *lvm.PoolManager
 	nbdSrv  *nbd.Server
 	drbdMgr *drbd.ResourceManager
-
-	// VDO target lifecycle.
-	vdoMgr *vdo.Manager
 
 	// LUKS loop for control plane.
 	loopVol *LUKSLoopVolume
@@ -100,8 +96,6 @@ type luksVolumeManager struct {
 type rootfsMountState struct {
 	stack      *blockdev.DeviceStack
 	luksMapper string
-	vdoMapper  string
-	vdoEnabled bool
 	mountPath  string
 	idmapPath  string
 }
@@ -115,7 +109,6 @@ type LUKSVolumeManagerConfig struct {
 	PoolMgr *lvm.PoolManager
 	NBDSrv  *nbd.Server
 	DRBDMgr *drbd.ResourceManager
-	VDOMgr  *vdo.Manager
 	// FlattenFn extracts an OCI image to a target directory and returns image config.
 	FlattenFn func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
 }
@@ -131,7 +124,6 @@ func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) *luksVolumeManager {
 		poolMgr:      cfg.PoolMgr,
 		nbdSrv:       cfg.NBDSrv,
 		drbdMgr:      cfg.DRBDMgr,
-		vdoMgr:       cfg.VDOMgr,
 		flattenFn:    cfg.FlattenFn,
 		loopVol:      NewLUKSLoopVolume(cfg.Run),
 		stacks:       make(map[string]*blockdev.DeviceStack),
@@ -909,10 +901,8 @@ type volumeMetaV3 struct {
 	LVName          string         `json:"lv_name"`
 	VGName          string         `json:"vg_name"`
 	SizeBytes       int64          `json:"size_bytes,omitempty"`
-	FSType          string         `json:"fs_type"`
-	VDOEnabled      bool           `json:"vdo_enabled"`
-	VDOParams       *VDOParamsMeta `json:"vdo_params,omitempty"`
-	ReadOnly        bool           `json:"read_only,omitempty"`
+	FSType   string `json:"fs_type"`
+	ReadOnly bool   `json:"read_only,omitempty"`
 	BaseImageDigest string         `json:"base_image_digest,omitempty"`
 	BaseImageRef    string         `json:"base_image_ref,omitempty"`
 	GoldenLV        string         `json:"golden_lv,omitempty"`
@@ -929,15 +919,6 @@ type IDMapMeta struct {
 	SubUIDCount uint32 `json:"sub_uid_count"`
 	SubGIDStart uint32 `json:"sub_gid_start"`
 	SubGIDCount uint32 `json:"sub_gid_count"`
-}
-
-// VDOParamsMeta persists dm-vdo target parameters from golden LV creation.
-// Snapshots MUST reuse these exact parameters — mismatched params corrupt data.
-type VDOParamsMeta struct {
-	LogicalSizeBytes int64 `json:"logical_size_bytes"`
-	MinIOSize        int   `json:"min_io_size"`
-	BlockMapCacheKB  int   `json:"block_map_cache_kb"`
-	BlockMapEraLen   int   `json:"block_map_era_len"`
 }
 
 // --- Metadata I/O ---
