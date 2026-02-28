@@ -487,7 +487,7 @@ except: print('')" 2>/dev/null)
   local golden_meta
   golden_meta=$(vssh 'for f in /piccolo-core/volumes/golden-*/piccolo.volume.json; do cat "$f" 2>/dev/null; break; done' 2>/dev/null || echo "")
   if [[ -n "$golden_meta" ]]; then
-    check "7.2a" "Golden LV metadata exists" "$golden_meta" '"type":"golden"'
+    check "7.2a" "Golden LV metadata exists" "$golden_meta" '"type": "golden"'
   else
     skip "7.2a" "Golden LV metadata" "no golden-* volume metadata found"
   fi
@@ -496,8 +496,8 @@ except: print('')" 2>/dev/null)
   local svc_rootfs_meta
   svc_rootfs_meta=$(vssh 'for f in /piccolo-core/volumes/svc-rootfs-*/piccolo.volume.json; do cat "$f" 2>/dev/null; break; done' 2>/dev/null || echo "")
   if [[ -n "$svc_rootfs_meta" ]]; then
-    check "7.2b" "Service rootfs metadata type" "$svc_rootfs_meta" '"type":"service-rootfs"'
-    check "7.2c" "Service rootfs read-only flag" "$svc_rootfs_meta" '"read_only":true'
+    check "7.2b" "Service rootfs metadata type" "$svc_rootfs_meta" '"type": "service-rootfs"'
+    check "7.2c" "Service rootfs read-only flag" "$svc_rootfs_meta" '"read_only": true'
   else
     skip "7.2b" "Service rootfs metadata" "no svc-rootfs-* volume metadata found"
   fi
@@ -600,7 +600,7 @@ except: print('')" 2>/dev/null)
   local ws_meta
   ws_meta=$(vssh 'for f in /piccolo-core/volumes/ws-*/piccolo.volume.json; do cat "$f" 2>/dev/null; break; done' 2>/dev/null || echo "")
   if [[ -n "$ws_meta" ]]; then
-    check "8.3" "Workspace rootfs metadata type" "$ws_meta" '"type":"workspace"'
+    check "8.3" "Workspace rootfs metadata type" "$ws_meta" '"type": "workspace"'
   else
     skip "8.3" "Workspace rootfs metadata" "no ws-* volume metadata found"
   fi

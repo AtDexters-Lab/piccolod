@@ -770,9 +770,9 @@ func (m *luksVolumeManager) luksFormatWithMasterKey(ctx context.Context, device 
 	}
 	defer cryptoutil.SecureZero(masterKey)
 
-	poolKey, err := m.crypto.UnwrapPoolKeyfile()
+	poolKey, err := m.crypto.EnsurePoolKeyfile()
 	if err != nil {
-		return fmt.Errorf("unwrap pool keyfile: %w", err)
+		return fmt.Errorf("ensure pool keyfile: %w", err)
 	}
 	defer cryptoutil.SecureZero(poolKey)
 
@@ -805,6 +805,8 @@ func (m *luksVolumeManager) luksFormatWithMasterKey(ctx context.Context, device 
 
 // luksOpenWithPoolKeyfile opens a LUKS device using the pool keyfile.
 // Used for all v3 volumes (master-key-formatted).
+// Uses UnwrapPoolKeyfile (not EnsurePoolKeyfile) because the key must already exist:
+// auto-generating on transient errors would overwrite the real key, making volumes inaccessible.
 func (m *luksVolumeManager) luksOpenWithPoolKeyfile(ctx context.Context, device, mapper string) error {
 	poolKey, err := m.crypto.UnwrapPoolKeyfile()
 	if err != nil {

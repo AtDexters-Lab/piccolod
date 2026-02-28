@@ -209,11 +209,11 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		serviceIdx++
 	}
 
-	// Pull network anchor image using shared image runtime (piccolo-runtime has
-	// write access to the imagestore; per-app users have read-only group access).
-	// This pre-pull is mandatory: per-app runtimes use --pull=never since they
-	// lack write access to the shared imagestore.
-	if err := m.pullToImagestore(ctx, networkAnchorImage(), nil); err != nil {
+	// Pull network anchor image directly into the per-app user's graphroot.
+	// We do NOT use additionalimagestores because native overlay in rootless user
+	// namespaces cannot access layers owned by a different user (UIDs unmapped).
+	// The pause image is tiny (~500KB), so per-app duplication is negligible.
+	if err := m.containerManager.PullImage(ctx, runtime, networkAnchorImage()); err != nil {
 		return nil, fmt.Errorf("network anchor image pull failed: %w", err)
 	}
 
@@ -234,10 +234,11 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	anchorSpec := container.ContainerCreateSpec{
 		Name:          networkAnchorContainerName(instanceID),
 		Image:         networkAnchorImage(),
-		PullPolicy:    "never", // Pre-pulled above; per-app users lack write access to imagestore.
+		PullPolicy:    "never", // Pre-pulled to per-app graphroot above.
 		NetworkMode:   appNetworkMode(appDef),
 		RestartPolicy: appRestartPolicy(appDef),
 		Labels:        piccoloLabels(instanceID, networkAnchorServiceName, "network_anchor"),
+		SecurityOpt:   selinuxDisableLabel(), // overlay context= ignored in user namespaces
 	}
 	for _, ep := range endpoints {
 		anchorSpec.Ports = append(anchorSpec.Ports, container.PortMapping{Host: ep.HostBind, Container: ep.GuestPort})
@@ -372,6 +373,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 
 		updateSubtask(svcName, 70, "Starting")
 		if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
+			log.Printf("ERROR: install %s: start service container '%s' (cid=%s) failed: %v", instanceID, svcName, cid, err)
 			updateSubtask(svcName, 70, "Error")
 			emitCreateProgress(fmt.Sprintf("Failed to start container: %s", svcName))
 			cleanup()

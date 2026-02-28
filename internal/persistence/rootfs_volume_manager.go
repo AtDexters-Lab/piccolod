@@ -511,10 +511,12 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		return RootfsHandle{}, fmt.Errorf("mkdir mount: %w", err)
 	}
 
+	// Always mount thin snapshots rw at the host level, even for ReadOnly volumes.
+	// Runc creates bind mount targets (/piccolo, /etc/mtab, etc.) during container
+	// setup before applying --read-only. The thin snapshot provides CoW isolation
+	// from the golden LV; container-level immutability is enforced by podman's
+	// --read-only flag (set via spec.ReadOnly from RootfsHandle.ReadOnly).
 	mountOpts := "discard"
-	if meta.ReadOnly {
-		mountOpts = "ro,discard"
-	}
 	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", mountOpts, luksPath, mountDir); err != nil {
 		m.run.Run(ctx, "cryptsetup", "close", mapper)
 		rollback()

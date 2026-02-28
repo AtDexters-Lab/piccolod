@@ -39,6 +39,15 @@ func containerNameForService(instanceID, serviceName, primaryService string) str
 	return fmt.Sprintf("%s__%s", instanceID, serviceName)
 }
 
+// selinuxDisableLabel returns the security option to disable SELinux labeling.
+// Rootless podman in user namespaces lacks CAP_MAC_ADMIN in the initial namespace,
+// so the overlay mount's context= option is silently ignored. Files retain their
+// host SELinux labels (container_var_lib_t or unlabeled_t on device-mapper),
+// which container_t is not allowed to read. Disabling labeling avoids these denials.
+func selinuxDisableLabel() []string {
+	return []string{"label=disable"}
+}
+
 func primaryServiceFor(def *api.AppDefinition, inst *AppInstance) string {
 	if inst != nil && strings.TrimSpace(inst.PrimaryService) != "" {
 		return inst.PrimaryService
@@ -132,11 +141,13 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		NetworkMode:   fmt.Sprintf("container:%s", opts.anchorID),
 		RestartPolicy: appRestartPolicy(opts.appDef),
 		Labels:        piccoloLabels(opts.instanceID, opts.svcName, "service"),
+		SecurityOpt:   selinuxDisableLabel(), // overlay context= ignored in user namespaces
 	}
 
 	// Apply block-native rootfs configuration (golden LV path) if provided
 	if opts.rootfsHandle != nil && opts.goldenImgConfig != nil {
 		spec.Rootfs = opts.rootfsHandle.MountPath
+		spec.ReadOnly = opts.rootfsHandle.ReadOnly
 		spec.Image = ""
 
 		// Apply image config since Podman doesn't do it in --rootfs mode.
@@ -226,34 +237,17 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		}
 	}
 
-	if err := m.applyServiceStorageAndTmpfs(&spec, svc.Storage, opts.layout, opts.appDef.Extensions, opts.credential); err != nil {
-		return container.ContainerCreateSpec{}, err
-	}
-
-	// In --rootfs mode, two adjustments to tmpfs mounts:
-	// 1. Filter out tmpfs targets that are symlinks in the rootfs. For example,
-	//    /var/run is typically a symlink to /run in many images. Mounting tmpfs
-	//    on a symlink target replaces it with a real mount, breaking init systems
-	//    (e.g., s6-overlay) that expect the symlink.
-	// 2. Add notmpcopyup for remaining tmpfs mounts. crun copies existing rootfs
-	//    contents to the tmpfs before the user namespace is set up, and with
-	//    uidmapping, files owned by non-root image UIDs are inaccessible,
-	//    causing tmpcopyup to fail. These dirs (/run, /tmp) are ephemeral.
-	if spec.Rootfs != "" {
-		filtered := spec.Tmpfs[:0]
-		for _, t := range spec.Tmpfs {
-			target := filepath.Join(spec.Rootfs, t.Container)
-			if info, err := os.Lstat(target); err == nil && info.Mode()&os.ModeSymlink != 0 {
-				continue // Skip: symlink in rootfs, tmpfs would replace it
-			}
-			if t.Options == "" {
-				t.Options = "notmpcopyup"
-			} else {
-				t.Options += ",notmpcopyup"
-			}
-			filtered = append(filtered, t)
+	// In --read-only mode, podman provides tmpfs at /tmp and /run automatically
+	// (--read-only-tmpfs, default true). Skip default tmpfs mounts to avoid
+	// double-mounting, but still apply app-specific tmpfs from storage.temporary.
+	if spec.ReadOnly {
+		if err := m.applyServiceStorageAndTmpfs(&spec, svc.Storage, opts.layout, nil, opts.credential); err != nil {
+			return container.ContainerCreateSpec{}, err
 		}
-		spec.Tmpfs = filtered
+	} else {
+		if err := m.applyServiceStorageAndTmpfs(&spec, svc.Storage, opts.layout, opts.appDef.Extensions, opts.credential); err != nil {
+			return container.ContainerCreateSpec{}, err
+		}
 	}
 
 	m.applyOIDCClientInjection(&spec, svc.OIDCClient)
@@ -307,11 +301,15 @@ func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreate
 	}
 
 	// Canonical tmpfs mounts: honor x-piccolo.tmpfs when present, otherwise defaults.
-	for _, p := range tmpfsMountsFromExtensions(extensions) {
-		if _, ok := mountedPaths[p]; ok {
-			continue
+	// When extensions is nil (read-only mode), skip canonical tmpfs entirely —
+	// podman's --read-only-tmpfs provides /tmp and /run automatically.
+	if extensions != nil {
+		for _, p := range tmpfsMountsFromExtensions(extensions) {
+			if _, ok := mountedPaths[p]; ok {
+				continue
+			}
+			spec.Tmpfs = append(spec.Tmpfs, container.TmpfsMount{Container: p})
 		}
-		spec.Tmpfs = append(spec.Tmpfs, container.TmpfsMount{Container: p})
 	}
 
 	if storage != nil {

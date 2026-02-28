@@ -444,10 +444,14 @@ type ContainerCreateSpec struct {
 	Command    []string // Command arguments appended after image
 
 	// Rootfs mode: when set, uses --rootfs instead of Image.
-	// This is used for workspace disk mode where the rootfs is a pre-mounted overlay.
 	// When Rootfs is set, Image is ignored and the container runs directly from the
 	// specified rootfs path. The caller must ensure the rootfs is properly mounted.
 	Rootfs string
+
+	// ReadOnly makes the container's root filesystem read-only (--read-only).
+	// Podman automatically adds tmpfs at /tmp and /run (--read-only-tmpfs, default true).
+	// Persistent state is provided via bind-mounted volumes.
+	ReadOnly bool
 
 	// WorkingDir sets the working directory inside the container.
 	// Used with --rootfs mode to apply image config since Podman doesn't do it automatically.
@@ -469,6 +473,12 @@ type ContainerCreateSpec struct {
 	// CAMounts contains paths to CA certificates to mount into the container.
 	// Used to trust the internal CA for OIDC HTTPS communication.
 	CAMounts []CAMount
+
+	// SecurityOpt passes --security-opt flags to podman create.
+	// Used to disable SELinux labeling (e.g., "label=disable") for containers
+	// whose overlay layers or rootfs reside on filesystems where SELinux contexts
+	// don't match the standard container_file_t type.
+	SecurityOpt []string
 }
 
 // HostEntry represents an /etc/hosts entry for --add-host.
@@ -634,11 +644,17 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 		args = append(args, "--volume", fmt.Sprintf("%s:%s:ro", ca.HostPath, ca.ContainerPath))
 	}
 
+	// Security options (e.g., SELinux label disable)
+	for _, opt := range spec.SecurityOpt {
+		args = append(args, "--security-opt", opt)
+	}
+
+	// Read-only root filesystem: Podman adds tmpfs at /tmp and /run automatically.
+	if spec.ReadOnly {
+		args = append(args, "--read-only")
+	}
+
 	// Rootfs mode: use --rootfs instead of image reference.
-	// When using --rootfs, Podman runs the container directly from the specified
-	// filesystem path without pulling or resolving an image. This is used for
-	// workspace disk mode where we mount an overlay filesystem combining the base
-	// image with a persistent writable layer.
 	if spec.Rootfs != "" {
 		args = append(args, "--rootfs", spec.Rootfs)
 	} else if spec.Image != "" {
@@ -1456,7 +1472,6 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 
 	// Validate image or rootfs (one must be set)
 	if spec.Rootfs != "" {
-		// Rootfs mode: validate the path
 		if err := ValidatePath(spec.Rootfs); err != nil {
 			return fmt.Errorf("invalid rootfs path: %w", err)
 		}

@@ -3,7 +3,9 @@ package crypt
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"piccolod/internal/cryptoutil"
@@ -84,6 +86,9 @@ func (m *Manager) UnwrapLUKSMasterKey() ([]byte, error) {
 
 // EnsureLUKSMasterKey returns the LUKS master key, generating and persisting a new
 // one if it doesn't exist. The returned key is exactly luksMasterKeySize bytes.
+// Only generates a new key when the keyfile is missing. Other errors (permission,
+// corruption, decrypt failure) are returned immediately to prevent silent key rotation
+// that would make existing LUKS volumes inaccessible.
 func (m *Manager) EnsureLUKSMasterKey() ([]byte, error) {
 	key, err := m.UnwrapLUKSMasterKey()
 	if err == nil {
@@ -92,6 +97,9 @@ func (m *Manager) EnsureLUKSMasterKey() ([]byte, error) {
 			return nil, fmt.Errorf("LUKS master key size %d != expected %d", len(key), luksMasterKeySize)
 		}
 		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("unwrap LUKS master key: %w", err)
 	}
 
 	// Generate new master key.
@@ -102,6 +110,36 @@ func (m *Manager) EnsureLUKSMasterKey() ([]byte, error) {
 	if err := m.StoreLUKSMasterKey(key); err != nil {
 		cryptoutil.SecureZero(key)
 		return nil, fmt.Errorf("store LUKS master key: %w", err)
+	}
+	return key, nil
+}
+
+// EnsurePoolKeyfile returns the pool keyfile, generating and persisting a new
+// one if it doesn't exist. The returned key is exactly poolKeyfileSize bytes.
+// Only generates a new key when the keyfile is missing. Other errors (permission,
+// corruption, decrypt failure) are returned immediately to prevent silent key rotation
+// that would make existing LUKS volumes inaccessible.
+func (m *Manager) EnsurePoolKeyfile() ([]byte, error) {
+	key, err := m.UnwrapPoolKeyfile()
+	if err == nil {
+		if len(key) != poolKeyfileSize {
+			cryptoutil.SecureZero(key)
+			return nil, fmt.Errorf("pool keyfile size %d != expected %d", len(key), poolKeyfileSize)
+		}
+		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("unwrap pool keyfile: %w", err)
+	}
+
+	// Generate new pool keyfile.
+	key = make([]byte, poolKeyfileSize)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("generate pool keyfile: %w", err)
+	}
+	if err := m.StorePoolKeyfile(key); err != nil {
+		cryptoutil.SecureZero(key)
+		return nil, fmt.Errorf("store pool keyfile: %w", err)
 	}
 	return key, nil
 }

@@ -51,12 +51,17 @@ func ensurePodmanPreamble(name string) (string, error) {
 // ensureImagestoreDir creates the shared imagestore directory with correct
 // permissions for per-app user access. Parent directories are made
 // world-traversable (0o711) so per-app users can reach the imagestore,
-// and the directory itself gets setgid + 0750 (piccolo-apps group inherits).
+// and the directory itself gets 0750 (piccolo-apps group readable).
+//
+// IMPORTANT: setgid must NOT be used on the imagestore or its subdirectories.
+// Rootless podman overlay storage fails with "permission denied" on overlay
+// metacopy check when the graphroot has setgid set. The group permission
+// fixup after each pull (ensureImagestoreGroupAccess) handles group ownership.
 //
 // Also pre-creates containers/storage metadata directories and seed files
-// so per-app users don't fail when containers/storage initializes
-// additionalImageStores — without this, the first per-app podman command
-// triggers mkdir/create as the per-app user, which lacks write permission.
+// so per-app users don't fail when containers/storage initializes the shared
+// imagestore — without this, the first per-app podman command triggers
+// mkdir/create as the per-app user, which lacks write permission.
 func ensureImagestoreDir() (string, error) {
 	imagestore := imagestorePath()
 
@@ -72,8 +77,21 @@ func ensureImagestoreDir() (string, error) {
 		_ = os.Chmod(dir, modeTraversable)
 	}
 
-	if err := ensureDir(imagestore, os.ModeSetgid|modeGroupShared); err != nil {
+	if err := ensureDir(imagestore, modeGroupShared); err != nil {
 		return "", fmt.Errorf("ensure imagestore: %w", err)
+	}
+
+	// Strip setgid from existing directories. Templates/clones from
+	// older versions may have setgid set, which breaks rootless overlay.
+	stripSetgidRecursive(imagestore)
+
+	// Remove stale .has-mount-program markers left by prior fuse-overlayfs
+	// configurations. This marker tells podman to require mount_program,
+	// which is no longer used in the block-native architecture.
+	hasMountProgram := filepath.Join(imagestore, "overlay", ".has-mount-program")
+	if _, err := os.Stat(hasMountProgram); err == nil {
+		_ = os.Remove(hasMountProgram)
+		log.Printf("INFO: ensureImagestoreDir: removed stale .has-mount-program marker")
 	}
 
 	// Pre-create containers/storage metadata directories.
@@ -106,6 +124,26 @@ func ensureImagestoreDir() (string, error) {
 	}
 
 	return imagestore, nil
+}
+
+// stripSetgidRecursive removes the setgid bit from all directories under root.
+// Rootless podman overlay mounts fail with EPERM when directories in the
+// graphroot have setgid set — the kernel overlay metacopy check cannot
+// create temporary overlay mounts inside a user namespace on setgid dirs.
+func stripSetgidRecursive(root string) {
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return err
+		}
+		fi, fiErr := d.Info()
+		if fiErr != nil {
+			return nil
+		}
+		if fi.Mode()&os.ModeSetgid != 0 {
+			_ = os.Chmod(path, fi.Mode().Perm())
+		}
+		return nil
+	})
 }
 
 // podmanRunRootBase returns the base directory for podman runtime state.
@@ -203,11 +241,6 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: podman root missing for %s", instanceID)
 	}
 
-	imagestore, err := ensureImagestoreDir()
-	if err != nil {
-		return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
-	}
-
 	// Resolve per-app user for rootless execution isolation.
 	// Provisioning failure is a hard error — silent fallback to the shared user
 	// would violate the zero-fallback promise (RFC 20260206).
@@ -216,37 +249,31 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
 	}
 
-	additionalStores := []string{imagestore}
 	if cred != nil {
-		log.Printf("INFO: podmanRuntimeForApp %s: uid=%d gid=%d root=%s additionalStores=%v",
-			instanceID, cred.Uid, cred.Gid, layout.PodmanRoot, additionalStores)
+		log.Printf("INFO: podmanRuntimeForApp %s: uid=%d gid=%d root=%s",
+			instanceID, cred.Uid, cred.Gid, layout.PodmanRoot)
 	}
 
 	// Clean stale VFS storage from previous runs.
 	cleanStaleDriverStorage(layout.PodmanRoot, staleDriverPrefix)
 	cleanStaleDriverStorage(runRoot, staleDriverPrefix)
 
-	// Both service and workspace modes use the kernel overlay driver.
-	// For workspace mode, --rootfs bypasses Podman storage; the overlay driver
-	// here is only for the network anchor and reading the shared imagestore
-	// (whose overlay metadata would be invisible to a VFS primary driver).
+	// Per-app users store images (network anchor) in their own graphroot.
+	// Service containers use --rootfs from golden LV snapshots, bypassing podman storage.
+	// additionalimagestores is NOT used: native overlay in rootless user namespaces
+	// cannot access layers owned by a different user (UIDs are unmapped inside
+	// the user namespace, causing permission denied on overlay mount).
 	serviceRoot, err := m.ensureServiceRoot(instanceID, cred)
 	if err != nil {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
 	}
 
-	// Fix imagestore permissions before any per-app podman command accesses it.
-	if m.runtimeUser != nil {
-		m.fixImagestoreAccess()
-	}
-
 	return container.PodmanRuntime{
-		Root:                  serviceRoot,
-		RunRoot:               runRoot,
-		AdditionalImageStores: additionalStores,
-		StorageDriver:         "overlay",
-		Credential:            cred,
-		HomeDir:               homeDir,
+		Root:          serviceRoot,
+		RunRoot:       runRoot,
+		StorageDriver: "overlay",
+		Credential:    cred,
+		HomeDir:       homeDir,
 	}, nil
 }
 
@@ -355,6 +382,14 @@ func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
 			rt.HomeDir = m.runtimeUser.HomeDir
 			uid := int(m.runtimeUser.Credential.Uid)
 			gid := int(m.runtimeUser.Credential.Gid)
+
+			// Re-ensure XDG runtime dir: the libpod subtree may have been
+			// created root-owned between daemon init and first imagestore use
+			// (e.g., by overlay compat checks during reconciliation).
+			if err := container.EnsureXDGRuntimeDir(m.runtimeUser.Credential.Uid, m.runtimeUser.Credential.Gid); err != nil {
+				log.Printf("WARN: imagestore runtime: failed to ensure XDG_RUNTIME_DIR: %v", err)
+			}
+
 			if err := container.ChownIfNeeded(runRoot, uid, gid); err != nil {
 				m.imageRuntimeErr = fmt.Errorf("app manager: chown image runtime runroot: %w", err)
 				return
@@ -375,20 +410,37 @@ func (m *AppManager) PodmanImageRuntime() (container.PodmanRuntime, error) {
 	return m.podmanImageRuntime()
 }
 
+// inDiffSubtree returns true if path is a diff/ directory or any descendant of one.
+// The imagestore layout is: <root>/overlay/<hash>/diff/...
+// This detects paths where the relative path from imagestorePath contains "/diff"
+// as a path component after the overlay/<hash>/ prefix.
+func inDiffSubtree(imagestorePath, path string) bool {
+	rel, err := filepath.Rel(imagestorePath, path)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	// Layout: overlay/<hash>/diff/... → parts[2] == "diff"
+	return len(parts) >= 3 && parts[0] == "overlay" && parts[2] == "diff"
+}
+
 // ensureImagestoreGroupAccess sets the shared imagestore ownership to
-// piccolo-runtime:piccolo-apps with setgid, and ensures group-readable
-// permissions on containers/storage metadata so per-app users can read
-// the store via additionalimagestores.
+// piccolo-runtime:piccolo-apps and ensures group-readable permissions on
+// containers/storage metadata so per-app users can read the store.
 //
 // containers/storage creates lock files (images.lock, layers.lock) with
-// mode 0600. Without group-read on these files, per-app users in the
-// piccolo-apps group cannot acquire the shared locks that
-// additionalimagestores requires, causing "image not known" errors.
+// mode 0600. Without group-read on these files, podman commands fail.
 //
-// Layer content directories (overlay/<hash>/diff/) are skipped — their
-// permissions must be preserved as-is because they represent the container
-// filesystem (e.g., /usr/bin must remain world-readable for non-root
-// container processes).
+// For diff/ subtrees (container filesystem content): ownership is fixed
+// but permissions are preserved. Native overlay stores layer contents with
+// original UIDs (root:root); chowning to piccolo-runtime allows podman's
+// storage initialization to traverse layers. Container semantics are preserved
+// because idmapped mounts remap ownership at runtime.
+//
+// IMPORTANT: setgid is NOT used. Rootless podman overlay mounts fail when
+// directories have setgid set (overlay metacopy check EPERM in userns).
+// This function explicitly strips setgid from any directory that has it,
+// and relies on the post-pull walk to fix group ownership on new files.
 //
 // This function must be called after every image pull, not just at startup,
 // because each pull creates new metadata files with restrictive permissions.
@@ -402,18 +454,6 @@ func ensureImagestoreGroupAccess(imagestorePath string, ownerUID int) error {
 		return fmt.Errorf("parse %s GID: %w", container.AppsGroupName, err)
 	}
 
-	info, err := os.Stat(imagestorePath)
-	if err != nil {
-		return fmt.Errorf("stat imagestore: %w", err)
-	}
-
-	// Set setgid on root so new files/dirs inherit the piccolo-apps group.
-	if info.Mode()&os.ModeSetgid == 0 {
-		if err := os.Chmod(imagestorePath, info.Mode().Perm()|os.ModeSetgid); err != nil {
-			return fmt.Errorf("chmod setgid on imagestore root: %w", err)
-		}
-	}
-
 	// Walk and fix ownership + group permissions on metadata entries.
 	// diff/ subtrees are skipped (layer content — preserve original modes).
 	var fixedOwnership, fixedPerms, totalEntries int
@@ -422,10 +462,26 @@ func ensureImagestoreGroupAccess(imagestorePath string, ownerUID int) error {
 			return err
 		}
 
-		// Skip layer content trees — their permissions are part of the
-		// container filesystem and must not be altered.
-		if d.IsDir() && filepath.Base(path) == "diff" {
-			return filepath.SkipDir
+		// For diff/ subtrees: fix ownership but NOT permissions.
+		// Native overlay stores layer contents with original UIDs (root:root);
+		// idmapped mounts remap them at container runtime. Podman's storage
+		// initialization needs to traverse these trees as uid=470 (piccolo-runtime),
+		// so ownership must match. Permissions are container filesystem semantics
+		// and must not be changed (e.g., etc/ssl/private stays 0700).
+		if inDiffSubtree(imagestorePath, path) {
+			fi, fiErr := d.Info()
+			if fiErr == nil {
+				st, ok := fi.Sys().(*syscall.Stat_t)
+				if ok && (int(st.Uid) != ownerUID || int(st.Gid) != gid) {
+					if err := os.Lchown(path, ownerUID, gid); err != nil {
+						log.Printf("WARN: imagestore diff chown %s: %v", path, err)
+					} else {
+						fixedOwnership++
+					}
+				}
+				totalEntries++
+			}
+			return nil
 		}
 
 		fi, err := d.Info()
@@ -460,11 +516,17 @@ func ensureImagestoreGroupAccess(imagestorePath string, ownerUID int) error {
 
 		// Ensure group can access metadata: group-rx on dirs, group-r on files.
 		// This is critical for lock files (created 0600 by containers/storage)
-		// and JSON manifests that additionalimagestores needs to read.
-		perm := fi.Mode().Perm()
+		// and JSON manifests that per-app users need to read.
+		// Also ensure owner write on dirs: containers/storage creates read-only
+		// diff dirs (mode 555) inside temp dirs; the owner must be able to
+		// clean these up. Strip setgid — rootless overlay fails with it.
+		perm := fi.Mode().Perm() // Perm() strips special bits (setgid etc.)
 		if d.IsDir() {
-			if perm&0o050 != 0o050 {
-				_ = os.Chmod(path, perm|0o050)
+			needsGroupRX := perm&0o050 != 0o050
+			needsOwnerW := perm&0o200 == 0
+			hasSetgid := fi.Mode()&os.ModeSetgid != 0
+			if needsGroupRX || needsOwnerW || hasSetgid {
+				_ = os.Chmod(path, perm|0o250)
 				fixedPerms++
 			}
 		} else {
@@ -511,6 +573,10 @@ func (m *AppManager) pullToImagestore(ctx context.Context, image string, onProgr
 				image, report.Phase, report.OverallPercent, report.DownloadedBytes, report.TotalBytes, len(report.Layers))
 		}
 	}
+	// Fix ownership before pull: previous operations (container create/export
+	// during flatten) may have left stale temp dirs with root-owned layer content.
+	// Podman running as uid=470 can't remove them without ownership fix first.
+	m.fixImagestoreAccess()
 	if err := m.containerManager.PullImageWithProgress(ctx, rt, image, onProgress); err != nil {
 		return err
 	}

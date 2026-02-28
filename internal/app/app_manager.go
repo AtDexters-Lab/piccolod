@@ -1167,7 +1167,9 @@ func (m *AppManager) recreateMissingContainer(ctx context.Context, state *Filesy
 		// For block-native rootfs, configure --rootfs and apply image config
 		if blockNativeRootfs != nil {
 			spec.Rootfs = blockNativeRootfs.handle.MountPath
+			spec.ReadOnly = blockNativeRootfs.handle.ReadOnly
 			spec.Image = ""
+			spec.SecurityOpt = selinuxDisableLabel()
 			spec.Environment = mergeEnvMaps(parseEnvSlice(blockNativeRootfs.imgConfig.Env), spec.Environment)
 			spec.WorkingDir = blockNativeRootfs.imgConfig.WorkingDir
 			spec.User = blockNativeRootfs.imgConfig.User
@@ -2207,7 +2209,9 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		spec, err := m.appDefToContainerSpec(&newDef, result.Endpoints, layout, instanceID, runtime.Credential)
 		if err == nil && rootfsHandle != nil && goldenImgConfig != nil {
 			spec.Rootfs = rootfsHandle.MountPath
+			spec.ReadOnly = rootfsHandle.ReadOnly
 			spec.Image = ""
+			spec.SecurityOpt = selinuxDisableLabel()
 			spec.Environment = mergeEnvMaps(parseEnvSlice(goldenImgConfig.Env), spec.Environment)
 			spec.WorkingDir = goldenImgConfig.WorkingDir
 			spec.User = goldenImgConfig.User
@@ -2251,7 +2255,9 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 			// Use --rootfs mode for rollback too
 			if rootfsHandle != nil && goldenImgConfig != nil {
 				rbSpec.Rootfs = rootfsHandle.MountPath
+				rbSpec.ReadOnly = rootfsHandle.ReadOnly
 				rbSpec.Image = ""
+				rbSpec.SecurityOpt = selinuxDisableLabel()
 				rbSpec.Environment = mergeEnvMaps(parseEnvSlice(goldenImgConfig.Env), rbSpec.Environment)
 				rbSpec.WorkingDir = goldenImgConfig.WorkingDir
 				rbSpec.User = goldenImgConfig.User
