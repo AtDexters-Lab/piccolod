@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"piccolod/internal/api"
 	"piccolod/internal/container"
 	"piccolod/internal/persistence"
 )
@@ -110,10 +111,12 @@ type rootfsMountInfo struct {
 // prepareRootfsStorage prepares block-native rootfs for a service container.
 // For ModeService: creates golden LV + service rootfs snapshot (read-only idmapped).
 // For ModeWorkspace: creates golden LV + workspace rootfs snapshot (read-write idmapped).
+// serviceName is used for per-service volume IDs in multi-container apps (empty for workspace).
 func (m *AppManager) prepareRootfsStorage(
 	ctx context.Context,
 	mode PiccoloMode,
 	instanceID string,
+	serviceName string,
 	imageDigest, imageRef string,
 	idmapConfig persistence.IDMapConfig,
 ) (*rootfsMountInfo, error) {
@@ -129,6 +132,7 @@ func (m *AppManager) prepareRootfsStorage(
 	case ModeService:
 		handle, err = rootfs.CreateServiceRootfs(ctx, persistence.ServiceRootfsRequest{
 			InstanceID:  instanceID,
+			ServiceName: serviceName,
 			ImageDigest: imageDigest,
 			ImageRef:    imageRef,
 			IDMap:       idmapConfig,
@@ -300,6 +304,190 @@ func (m *AppManager) destroyAppRootfs(ctx context.Context, instanceID string, mo
 	if err := rootfs.GarbageCollectGoldenLVs(ctx); err != nil {
 		log.Printf("WARN: golden LV GC: %v", err)
 	}
+}
+
+// --- Multi-rootfs functions for multi-container apps ---
+
+// ensureAllServiceRootfsAttached attaches all per-service rootfs volumes.
+// Returns a map of svcName → *rootfsMountInfo, or (nil, nil) if no rootfs exists.
+// For workspace mode, delegates to the single-rootfs path.
+func (m *AppManager) ensureAllServiceRootfsAttached(
+	ctx context.Context,
+	instanceID string,
+	mode PiccoloMode,
+	appDef *api.AppDefinition,
+) (map[string]*rootfsMountInfo, error) {
+	rootfs := m.currentRootfsManager()
+	if rootfs == nil {
+		return nil, nil
+	}
+
+	// Workspace mode: single rootfs unchanged.
+	if mode == ModeWorkspace {
+		rInfo, err := m.ensureRootfsAttached(ctx, instanceID, mode)
+		if err != nil || rInfo == nil {
+			return nil, err
+		}
+		// Read image config from golden LV (required for --rootfs mode containers).
+		if rInfo.handle.GoldenLV != "" {
+			imgCfg, cfgErr := rootfs.ReadGoldenImageConfig(ctx, rInfo.handle.GoldenLV)
+			if cfgErr != nil {
+				return nil, fmt.Errorf("read image config for workspace rootfs: %w", cfgErr)
+			}
+			rInfo.imgConfig = imgCfg
+		}
+		// Return under primary service name.
+		primary := primaryServiceFor(appDef, nil)
+		return map[string]*rootfsMountInfo{primary: rInfo}, nil
+	}
+
+	if appDef == nil || appDef.Services == nil {
+		return nil, nil
+	}
+
+	// Service mode: per-service rootfs.
+	result := make(map[string]*rootfsMountInfo, len(appDef.Services))
+	rollbackAttached := func() {
+		for _, info := range result {
+			if detachErr := rootfs.DetachRootfs(ctx, info.handle.VolumeID); detachErr != nil {
+				log.Printf("WARN: rollback detach rootfs %s: %v", info.handle.VolumeID, detachErr)
+			}
+		}
+	}
+	for svcName, svc := range appDef.Services {
+		if svc.Image == "" {
+			continue
+		}
+		volumeID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
+		if !rootfs.RootfsExists(volumeID) {
+			continue
+		}
+		handle, err := rootfs.AttachRootfs(ctx, volumeID)
+		if err != nil {
+			rollbackAttached()
+			return nil, fmt.Errorf("attach rootfs for service %q: %w", svcName, err)
+		}
+		var imgCfg persistence.GoldenImageConfig
+		if handle.GoldenLV != "" {
+			cfg, cfgErr := rootfs.ReadGoldenImageConfig(ctx, handle.GoldenLV)
+			if cfgErr != nil {
+				rollbackAttached()
+				// Also detach the just-attached volume.
+				_ = rootfs.DetachRootfs(ctx, volumeID)
+				return nil, fmt.Errorf("read image config for service %q: %w", svcName, cfgErr)
+			}
+			imgCfg = cfg
+		}
+		log.Printf("INFO: attached service rootfs %s (mount=%s)", volumeID, handle.MountPath)
+		result[svcName] = &rootfsMountInfo{handle: handle, imgConfig: imgCfg}
+	}
+
+	if len(result) > 0 {
+		return result, nil
+	}
+
+	// Fallback: legacy single-rootfs volume.
+	rInfo, err := m.ensureRootfsAttached(ctx, instanceID, mode)
+	if err != nil || rInfo == nil {
+		return nil, err
+	}
+	// Read image config.
+	imgCfg, cfgErr := m.readImageConfigForRootfsFromInstance(ctx, &AppInstance{
+		InstanceID: instanceID,
+		Definition: appDef,
+	})
+	if cfgErr == nil {
+		rInfo.imgConfig = imgCfg
+	} else {
+		log.Printf("WARN: rootfs %s: failed to read legacy image config: %v", instanceID, cfgErr)
+	}
+	// Apply legacy rootfs to all services with images.
+	for svcName, svc := range appDef.Services {
+		if svc.Image == "" {
+			continue
+		}
+		result[svcName] = rInfo
+	}
+	if len(result) == 0 {
+		return nil, nil
+	}
+	return result, nil
+}
+
+// detachAllServiceRootfs detaches all per-service rootfs volumes. Best-effort.
+func (m *AppManager) detachAllServiceRootfs(ctx context.Context, instanceID string, mode PiccoloMode, appDef *api.AppDefinition) {
+	rootfs := m.currentRootfsManager()
+	if rootfs == nil {
+		return
+	}
+
+	if mode == ModeService && appDef != nil && appDef.Services != nil {
+		for svcName, svc := range appDef.Services {
+			if svc.Image == "" {
+				continue
+			}
+			volumeID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
+			if err := rootfs.DetachRootfs(ctx, volumeID); err != nil {
+				log.Printf("WARN: detach rootfs %s: %v", volumeID, err)
+			}
+		}
+	}
+
+	// Also try legacy single-rootfs.
+	m.detachAppRootfs(ctx, instanceID, mode)
+}
+
+// destroyAllServiceRootfs destroys all per-service rootfs volumes and runs GC.
+func (m *AppManager) destroyAllServiceRootfs(ctx context.Context, instanceID string, mode PiccoloMode, appDef *api.AppDefinition) {
+	rootfs := m.currentRootfsManager()
+	if rootfs == nil {
+		return
+	}
+
+	if mode == ModeService && appDef != nil && appDef.Services != nil {
+		for svcName, svc := range appDef.Services {
+			if svc.Image == "" {
+				continue
+			}
+			volumeID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
+			if err := rootfs.DestroyRootfs(ctx, volumeID); err != nil {
+				log.Printf("WARN: destroy rootfs %s: %v", volumeID, err)
+			}
+		}
+	}
+
+	// Also destroy legacy single-rootfs (includes GC).
+	m.destroyAppRootfs(ctx, instanceID, mode)
+
+	// Explicit GC: destroyAppRootfs runs GC too, but we add an explicit call
+	// so GC is guaranteed even if the legacy fallback is removed in the future.
+	if err := rootfs.GarbageCollectGoldenLVs(ctx); err != nil {
+		log.Printf("WARN: golden LV GC: %v", err)
+	}
+}
+
+// appHasAnyServiceRootfs returns true if any service rootfs exists for the app.
+func (m *AppManager) appHasAnyServiceRootfs(instanceID string, mode PiccoloMode, appDef *api.AppDefinition) bool {
+	rootfs := m.currentRootfsManager()
+	if rootfs == nil {
+		return false
+	}
+
+	// Check per-service volumes.
+	if mode == ModeService && appDef != nil && appDef.Services != nil {
+		for svcName, svc := range appDef.Services {
+			if svc.Image == "" {
+				continue
+			}
+			volumeID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
+			if rootfs.RootfsExists(volumeID) {
+				return true
+			}
+		}
+	}
+
+	// Check legacy single-rootfs.
+	return m.appHasBlockNativeRootfs(instanceID, mode)
 }
 
 // MakeFlattenFn creates the flatten function that extracts an OCI image to a target directory

@@ -30,23 +30,12 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 
 	mode := piccoloModeFromExtensions(def.Extensions)
 
-	// Ensure rootfs is attached before starting containers.
-	// ensureRootfsAttached returns (nil, nil) for legacy apps without rootfs volumes.
-	var blockNativeRootfs *rootfsMountInfo
-	rInfo, err := m.ensureRootfsAttached(ctx, appInst.InstanceID, mode)
+	// Ensure all service rootfs volumes are attached before starting containers.
+	// Returns nil for legacy apps without rootfs volumes.
+	blockNativeRootfsMap, err := m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def)
 	if err != nil {
 		m.updateStatusWithEvent(appInst.InstanceID, StatusError)
 		return fmt.Errorf("failed to attach rootfs: %w", err)
-	}
-	if rInfo != nil {
-		// Block-native path: read image config for the rootfs.
-		imgConfig, cfgErr := m.readImageConfigForRootfsFromInstance(ctx, appInst)
-		if cfgErr != nil {
-			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
-			return fmt.Errorf("failed to read rootfs image config: %w", cfgErr)
-		}
-		rInfo.imgConfig = imgConfig
-		blockNativeRootfs = rInfo
 	}
 
 	primary := primaryServiceFor(def, appInst)
@@ -123,9 +112,9 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 				anchorID:   anchorID,
 				credential: runtime.Credential,
 			}
-			if blockNativeRootfs != nil {
-				opts.rootfsHandle = &blockNativeRootfs.handle
-				opts.goldenImgConfig = &blockNativeRootfs.imgConfig
+			if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
+				opts.rootfsHandle = &svcRootfs.handle
+				opts.goldenImgConfig = &svcRootfs.imgConfig
 			}
 			if err := m.recreateServiceContainer(ctx, state, appInst, runtime, cid, opts); err != nil {
 				m.updateStatusWithEvent(appInst.InstanceID, StatusError)
@@ -235,8 +224,8 @@ func (m *AppManager) stopContainerGroupWithOpts(ctx context.Context, state *File
 	}
 
 	// Detach rootfs on clean stop.
-	if m.appHasBlockNativeRootfs(appInst.InstanceID, mode) {
-		m.detachAppRootfs(ctx, appInst.InstanceID, mode)
+	if m.appHasAnyServiceRootfs(appInst.InstanceID, mode, def) {
+		m.detachAllServiceRootfs(ctx, appInst.InstanceID, mode, def)
 	}
 
 	// For explicit user-initiated stops, set Enabled=false and persist.
@@ -295,8 +284,8 @@ func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppIn
 	}
 
 	// Detach rootfs before container removal.
-	if m.appHasBlockNativeRootfs(appInst.InstanceID, mode) {
-		m.detachAppRootfs(ctx, appInst.InstanceID, mode)
+	if m.appHasAnyServiceRootfs(appInst.InstanceID, mode, def) {
+		m.detachAllServiceRootfs(ctx, appInst.InstanceID, mode, def)
 	}
 
 	// Remove containers in reverse order.

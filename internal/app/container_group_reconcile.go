@@ -152,21 +152,14 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 	mode := piccoloModeFromExtensions(def.Extensions)
 
-	// Ensure rootfs is attached / workspace disk mounted before reconciling containers.
-	// ensureRootfsAttached returns (nil, nil) for legacy apps without rootfs volumes.
-	var blockNativeRootfs *rootfsMountInfo
+	// Ensure all service rootfs volumes are attached before reconciling containers.
+	// Returns nil for legacy apps without rootfs volumes.
+	var blockNativeRootfsMap map[string]*rootfsMountInfo
 	if desiredRunning {
-		rInfo, err := m.ensureRootfsAttached(ctx, appInst.InstanceID, mode)
-		if err != nil {
-			return fmt.Errorf("failed to attach rootfs: %w", err)
-		}
-		if rInfo != nil {
-			imgConfig, cfgErr := m.readImageConfigForRootfsFromInstance(ctx, appInst)
-			if cfgErr != nil {
-				return fmt.Errorf("failed to read rootfs image config: %w", cfgErr)
-			}
-			rInfo.imgConfig = imgConfig
-			blockNativeRootfs = rInfo
+		var rootfsErr error
+		blockNativeRootfsMap, rootfsErr = m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def)
+		if rootfsErr != nil {
+			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
 		}
 	}
 
@@ -341,9 +334,9 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				anchorID:   anchorID,
 				credential: runtime.Credential,
 			}
-			if blockNativeRootfs != nil {
-				opts.rootfsHandle = &blockNativeRootfs.handle
-				opts.goldenImgConfig = &blockNativeRootfs.imgConfig
+			if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
+				opts.rootfsHandle = &svcRootfs.handle
+				opts.goldenImgConfig = &svcRootfs.imgConfig
 			}
 			newCID, err := m.createAndStartServiceContainer(ctx, runtime, opts)
 			if err != nil {
@@ -375,9 +368,9 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 					anchorID:   anchorID,
 					credential: runtime.Credential,
 				}
-				if blockNativeRootfs != nil {
-					opts.rootfsHandle = &blockNativeRootfs.handle
-					opts.goldenImgConfig = &blockNativeRootfs.imgConfig
+				if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
+					opts.rootfsHandle = &svcRootfs.handle
+					opts.goldenImgConfig = &svcRootfs.imgConfig
 				}
 				if err := m.recreateServiceContainer(ctx, state, appInst, runtime, cid, opts); err != nil {
 					m.handleStartupFailure(state, appInst)

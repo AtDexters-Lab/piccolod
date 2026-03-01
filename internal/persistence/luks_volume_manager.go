@@ -100,6 +100,7 @@ type rootfsMountState struct {
 	luksMapper string
 	mountPath  string
 	idmapPath  string
+	goldenLV   string
 }
 
 // LUKSVolumeManagerConfig holds dependencies for the unified volume manager.

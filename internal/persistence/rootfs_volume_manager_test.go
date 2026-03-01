@@ -1,6 +1,52 @@
 package persistence
 
-import "testing"
+import (
+	"testing"
+)
+
+func TestServiceRootfsVolumeID(t *testing.T) {
+	tests := []struct {
+		name        string
+		instanceID  string
+		serviceName string
+		want        string
+	}{
+		{
+			name:        "empty_service_name_returns_legacy",
+			instanceID:  "myapp-123",
+			serviceName: "",
+			want:        "svc-rootfs-myapp-123",
+		},
+		{
+			name:        "single_service",
+			instanceID:  "myapp-123",
+			serviceName: "web",
+			want:        "svc-rootfs-myapp-123--web",
+		},
+		{
+			name:        "postgres_service",
+			instanceID:  "nextcloud-456",
+			serviceName: "postgres",
+			want:        "svc-rootfs-nextcloud-456--postgres",
+		},
+		{
+			name:        "service_with_hyphens",
+			instanceID:  "app-1",
+			serviceName: "my-service",
+			want:        "svc-rootfs-app-1--my-service",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ServiceRootfsVolumeID(tt.instanceID, tt.serviceName)
+			if got != tt.want {
+				t.Errorf("ServiceRootfsVolumeID(%q, %q) = %q, want %q",
+					tt.instanceID, tt.serviceName, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestGoldenLVSizeForImage(t *testing.T) {
 	tests := []struct {

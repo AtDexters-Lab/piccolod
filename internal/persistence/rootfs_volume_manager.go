@@ -32,7 +32,20 @@ const (
 	defaultGoldenLVSize  = 10 << 30 // 10 GiB
 
 	btrfsRootfsMountOpts = "compress=zstd:1,discard=async,noatime"
+
+	// svcRootfsDelimiter separates instanceID from serviceName in per-service
+	// rootfs volume IDs. Service names (YAML map keys) don't contain "--".
+	svcRootfsDelimiter = "--"
 )
+
+// ServiceRootfsVolumeID returns the volume ID for a service rootfs.
+// When serviceName is empty, returns the legacy single-rootfs ID.
+func ServiceRootfsVolumeID(instanceID, serviceName string) string {
+	if serviceName == "" {
+		return svcRootfsLVPrefix + instanceID
+	}
+	return svcRootfsLVPrefix + instanceID + svcRootfsDelimiter + serviceName
+}
 
 // goldenLVSizeForImage returns the right-sized LV allocation for a given
 // uncompressed image size. Uses max(1.5x, image + 1 GiB) with a 256 MiB
@@ -306,7 +319,7 @@ func (m *luksVolumeManager) CreateServiceRootfs(ctx context.Context, req Service
 		return RootfsHandle{}, err
 	}
 
-	volumeID := svcRootfsLVPrefix + req.InstanceID
+	volumeID := ServiceRootfsVolumeID(req.InstanceID, req.ServiceName)
 	return m.createRootfsFromGolden(ctx, goldenID, volumeID, "service-rootfs", true, &req.IDMap)
 }
 
@@ -472,7 +485,7 @@ func (m *luksVolumeManager) AttachRootfs(ctx context.Context, volumeID string) (
 		if mountPath == "" {
 			mountPath = state.mountPath
 		}
-		return RootfsHandle{VolumeID: volumeID, MountPath: mountPath}, nil
+		return RootfsHandle{VolumeID: volumeID, MountPath: mountPath, GoldenLV: state.goldenLV}, nil
 	}
 	m.mu.Unlock()
 
@@ -589,6 +602,7 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		luksMapper: mapper,
 		mountPath:  mountDir,
 		idmapPath:  idmapPath,
+		goldenLV:   meta.GoldenLV,
 	}
 	m.mu.Lock()
 	m.rootfsMounts[volumeID] = state
@@ -604,6 +618,7 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		VolumeID:  volumeID,
 		MountPath: resultPath,
 		ReadOnly:  meta.ReadOnly,
+		GoldenLV:  meta.GoldenLV,
 	}, nil
 }
 

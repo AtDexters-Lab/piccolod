@@ -138,32 +138,49 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		pullRangePerService = (pullProgressMax - pullProgressMin) / numServices
 	}
 
-	// Block-native rootfs path: use RootfsVolumeManager when available.
-	var blockNativeRootfs *rootfsMountInfo
+	// Block-native rootfs path: prepare per-service rootfs from golden LV snapshots.
+	blockNativeRootfsMap := make(map[string]*rootfsMountInfo)
 	useBlockNative := m.currentRootfsManager() != nil
+
+	// Build IDMap config once (shared across all services — same per-app user).
+	var idmap persistence.IDMapConfig
+	if useBlockNative && runtime.Credential != nil {
+		idmap = persistence.IDMapConfig{
+			AppUID: runtime.Credential.Uid,
+			AppGID: runtime.Credential.Gid,
+		}
+		username := container.AppUsername(instanceID)
+		if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
+			idmap.SubUIDStart = subStart
+			idmap.SubUIDCount = subCount
+			idmap.SubGIDStart = subStart // same range for GID
+			idmap.SubGIDCount = subCount
+		} else {
+			log.Printf("WARN: install %s: subuid lookup failed for %s: %v", instanceID, username, lookupErr)
+		}
+	}
 
 	serviceIdx := 0
 	for svcName := range appDef.Services {
+		svc := appDef.Services[svcName]
+
 		// Calculate progress range for this service
 		progressRange := imagePullProgressRange{
 			Min: pullProgressMin + (serviceIdx * pullRangePerService),
 			Max: pullProgressMin + ((serviceIdx + 1) * pullRangePerService),
 		}
-		// Ensure last service gets the full remaining range
 		if serviceIdx == numServices-1 {
 			progressRange.Max = pullProgressMax
 		}
 
-		if useBlockNative && blockNativeRootfs == nil {
-			// Block-native: prepare rootfs from golden LV snapshot.
-			svc := appDef.Services[svcName]
-			if svc.Image != "" {
-				// Pull image first (needed for golden LV flatten).
-				callback := m.makeImagePullProgressCallback(ctx, instanceID, svcName, svc.Image, progressRange)
-				if pullErr := m.pullToImagestore(ctx, svc.Image, callback); pullErr != nil {
-					log.Printf("WARN: install %s: image pull failed: %v", instanceID, pullErr)
-				}
+		if svc.Image != "" {
+			// Pull image to shared imagestore (needed for golden LV flatten).
+			callback := m.makeImagePullProgressCallback(ctx, instanceID, svcName, svc.Image, progressRange)
+			if pullErr := m.pullToImagestore(ctx, svc.Image, callback); pullErr != nil {
+				log.Printf("WARN: install %s: image pull failed for %s: %v", instanceID, svcName, pullErr)
+			}
 
+			if useBlockNative {
 				// Get image digest.
 				imageRuntime, err := m.podmanImageRuntime()
 				if err != nil {
@@ -180,30 +197,11 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 					imageDigest = imgConfig.Digest
 				}
 
-				// Build IDMap config from per-app user credentials and subuid/subgid ranges.
-				var idmap persistence.IDMapConfig
-				if runtime.Credential != nil {
-					idmap = persistence.IDMapConfig{
-						AppUID: runtime.Credential.Uid,
-						AppGID: runtime.Credential.Gid,
-					}
-					// Look up subuid/subgid range for the per-app user.
-					username := container.AppUsername(instanceID)
-					if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
-						idmap.SubUIDStart = subStart
-						idmap.SubUIDCount = subCount
-						idmap.SubGIDStart = subStart // same range for GID
-						idmap.SubGIDCount = subCount
-					} else {
-						log.Printf("WARN: install %s: subuid lookup failed for %s: %v", instanceID, username, lookupErr)
-					}
-				}
-
-				rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, imageDigest, svc.Image, idmap)
+				rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, imageDigest, svc.Image, idmap)
 				if err != nil {
 					return nil, fmt.Errorf("prepare rootfs for service '%s': %w", svcName, err)
 				}
-				blockNativeRootfs = rInfo
+				blockNativeRootfsMap[svcName] = rInfo
 			}
 		}
 		serviceIdx++
@@ -225,8 +223,8 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
 		}
 		// Cleanup rootfs on failure.
-		if blockNativeRootfs != nil {
-			m.detachAppRootfs(ctx, instanceID, mode)
+		if len(blockNativeRootfsMap) > 0 {
+			m.detachAllServiceRootfs(ctx, instanceID, mode, appDef)
 		}
 	}
 
@@ -319,9 +317,9 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			anchorID:   anchorID,
 			credential: runtime.Credential,
 		}
-		if blockNativeRootfs != nil {
-			opts.rootfsHandle = &blockNativeRootfs.handle
-			opts.goldenImgConfig = &blockNativeRootfs.imgConfig
+		if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
+			opts.rootfsHandle = &svcRootfs.handle
+			opts.goldenImgConfig = &svcRootfs.imgConfig
 		}
 		spec, err := m.buildServiceContainerSpec(opts)
 		if err != nil {

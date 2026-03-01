@@ -1132,103 +1132,6 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 	return m.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, desiredRunning)
 }
 
-func (m *AppManager) recreateMissingContainer(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
-	if m.serviceManager == nil {
-		return fmt.Errorf("app manager: service manager not configured")
-	}
-
-	// Ensure rootfs is attached for block-native apps.
-	mode := piccoloModeFromExtensions(def.Extensions)
-	var blockNativeRootfs *rootfsMountInfo
-	rInfo, err := m.ensureRootfsAttached(ctx, appInst.InstanceID, mode)
-	if err != nil {
-		return fmt.Errorf("failed to attach rootfs: %w", err)
-	}
-	if rInfo != nil {
-		imgConfig, cfgErr := m.readImageConfigForRootfsFromInstance(ctx, appInst)
-		if cfgErr != nil {
-			return fmt.Errorf("failed to read rootfs image config: %w", cfgErr)
-		}
-		rInfo.imgConfig = imgConfig
-		blockNativeRootfs = rInfo
-	}
-
-	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
-		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners)
-		if err != nil {
-			return fmt.Errorf("allocate service ports: %w", err)
-		}
-		spec, err := m.appDefToContainerSpec(def, endpoints, layout, appInst.InstanceID, runtime.Credential)
-		if err != nil {
-			m.serviceManager.RemoveApp(appInst.InstanceID)
-			return err
-		}
-
-		// For block-native rootfs, configure --rootfs and apply image config
-		if blockNativeRootfs != nil {
-			spec.Rootfs = blockNativeRootfs.handle.MountPath
-			spec.ReadOnly = blockNativeRootfs.handle.ReadOnly
-			spec.Image = ""
-			spec.SecurityOpt = selinuxDisableLabel()
-			spec.Environment = mergeEnvMaps(parseEnvSlice(blockNativeRootfs.imgConfig.Env), spec.Environment)
-			spec.WorkingDir = blockNativeRootfs.imgConfig.WorkingDir
-			spec.User = blockNativeRootfs.imgConfig.User
-
-			if primarySvcInit(def) == "image" {
-				spec.Entrypoint = blockNativeRootfs.imgConfig.Entrypoint
-				spec.Command = blockNativeRootfs.imgConfig.Cmd
-			} else {
-				originalCmd := buildOriginalCmdFromSlices(blockNativeRootfs.imgConfig.Entrypoint, blockNativeRootfs.imgConfig.Cmd)
-				spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-				spec.Command = originalCmd
-			}
-		}
-
-		cid, err := m.containerManager.CreateContainer(ctx, runtime, spec)
-		if err == nil {
-			if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
-				_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
-				m.serviceManager.RemoveApp(appInst.InstanceID)
-				return fmt.Errorf("failed to start container: %w", err)
-			}
-			appInst.SetPrimaryContainerID(cid)
-			_ = state.UpdateAppRuntime(appInst.InstanceID, cid)
-			m.setObservedStatus(appInst.InstanceID, StatusRunning)
-			m.serviceManager.SetAppContainerID(appInst.InstanceID, cid)
-			return nil
-		}
-
-		var nameErr *container.NameInUseError
-		if errors.As(err, &nameErr) {
-			log.Printf("INFO: recreate app %s: adopted existing container %s", appInst.InstanceID, nameErr.ID)
-			// Discard speculative port allocation; ensureServicesForRunningApp will restore actual ports.
-			m.serviceManager.RemoveApp(appInst.InstanceID)
-			appInst.SetPrimaryContainerID(nameErr.ID)
-			_ = state.UpdateAppRuntime(appInst.InstanceID, nameErr.ID)
-			return nil
-		}
-
-		var portErr *container.PortInUseError
-		if errors.As(err, &portErr) {
-			log.Printf("WARN: recreate app %s: host port conflict port=%d attempt=%d", appInst.InstanceID, portErr.Port, attempt)
-			if portErr.Port > 0 {
-				_ = m.serviceManager.ReserveHostPort(portErr.Port)
-			} else {
-				for _, ep := range endpoints {
-					_ = m.serviceManager.ReserveHostPort(ep.HostBind)
-				}
-			}
-			m.serviceManager.RemoveApp(appInst.InstanceID)
-			continue
-		}
-
-		m.serviceManager.RemoveApp(appInst.InstanceID)
-		return err
-	}
-
-	return fmt.Errorf("failed to recreate %s: exhausted host-port retries", appInst.InstanceID)
-}
-
 func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.AppDefinition, instanceID, containerID string, runtime container.PodmanRuntime) error {
 	if m.serviceManager == nil {
 		return nil
@@ -1404,7 +1307,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	if err != nil {
 		// Volume was created but runtime setup failed. Clean up the volume and
 		// any partially-created resources (per-app user, runroot).
-		m.cleanupInstallResources(ctx, instanceID, container.PodmanRuntime{})
+		m.cleanupInstallResources(ctx, instanceID, container.PodmanRuntime{}, appDef)
 		return nil, err
 	}
 
@@ -1413,7 +1316,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	cleanupResources := true
 	defer func() {
 		if cleanupResources {
-			m.cleanupInstallResources(ctx, instanceID, runtime)
+			m.cleanupInstallResources(ctx, instanceID, runtime, appDef)
 		}
 	}()
 
@@ -1466,7 +1369,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		// Cleanup rootfs if applicable
 		mode := piccoloModeFromExtensions(appDef.Extensions)
 		if m.currentRootfsManager() != nil {
-			m.detachAppRootfs(ctx, instanceID, mode)
+			m.detachAllServiceRootfs(ctx, instanceID, mode, appDef)
 		}
 		m.serviceManager.RemoveApp(instanceID)
 		cleanupServices = false
@@ -1490,13 +1393,13 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 // cleanupInstallResources performs best-effort cleanup of resources created during
 // a failed install. This mirrors the cleanup sequence in uninstallLocked to prevent
 // orphaned volumes, podman state, and per-app users from leaking on install failure.
-func (m *AppManager) cleanupInstallResources(ctx context.Context, instanceID string, runtime container.PodmanRuntime) {
+func (m *AppManager) cleanupInstallResources(ctx context.Context, instanceID string, runtime container.PodmanRuntime, appDef *api.AppDefinition) {
 	log.Printf("INFO: cleaning up resources for failed install: %s", instanceID)
 
 	// Destroy block-native rootfs if it was partially created.
 	// Best-effort: detach + destroy + GC before cleaning up the data volume.
-	m.destroyAppRootfs(ctx, instanceID, ModeService)
-	m.destroyAppRootfs(ctx, instanceID, ModeWorkspace)
+	m.destroyAllServiceRootfs(ctx, instanceID, ModeService, appDef)
+	m.destroyAllServiceRootfs(ctx, instanceID, ModeWorkspace, nil)
 
 	// Reset podman storage before destroying the volume (which unmounts the
 	// encrypted backing store where podman metadata lives).
@@ -1838,7 +1741,7 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 
 	// Destroy block-native rootfs if applicable (before volume destroy).
 	mode := piccoloModeFromExtensions(def.Extensions)
-	m.destroyAppRootfs(ctx, instanceID, mode)
+	m.destroyAllServiceRootfs(ctx, instanceID, mode, def)
 
 	// Prune orphaned images from the shared imagestore.
 	// Both service and workspace images share the same imagestore,
@@ -2189,19 +2092,16 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 
 		// Ensure rootfs is attached and get the mount path.
 		mode := piccoloModeFromExtensions(newDef.Extensions)
-		rInfo, rErr := m.ensureRootfsAttached(ctx, instanceID, mode)
+		blockNativeRootfsMap, rErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, &newDef)
 		if rErr != nil {
 			return nil, fmt.Errorf("failed to attach rootfs: %w", rErr)
 		}
 		var rootfsHandle *persistence.RootfsHandle
 		var goldenImgConfig *persistence.GoldenImageConfig
-		if rInfo != nil {
-			imgCfg, cfgErr := m.readImageConfigForRootfsFromInstance(ctx, appInst)
-			if cfgErr != nil {
-				return nil, fmt.Errorf("failed to read rootfs image config: %w", cfgErr)
-			}
+		primarySvc := primaryServiceFor(&newDef, appInst)
+		if rInfo, ok := blockNativeRootfsMap[primarySvc]; ok {
 			rootfsHandle = &rInfo.handle
-			goldenImgConfig = &imgCfg
+			goldenImgConfig = &rInfo.imgConfig
 		}
 
 		// Create new container with updated endpoints and --rootfs mode

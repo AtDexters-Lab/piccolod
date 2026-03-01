@@ -94,6 +94,7 @@ type WorkspaceRootfsRequest struct {
 // ServiceRootfsRequest describes a service rootfs creation request.
 type ServiceRootfsRequest struct {
 	InstanceID  string
+	ServiceName string // per-service rootfs; empty = legacy single-rootfs
 	ImageDigest string
 	ImageRef    string
 	IDMap       IDMapConfig
@@ -104,6 +105,7 @@ type RootfsHandle struct {
 	VolumeID  string
 	MountPath string
 	ReadOnly  bool
+	GoldenLV  string // golden LV this rootfs was snapshotted from (populated during attach)
 }
 
 // IDMapConfig re-exports the fsutil IDMapConfig for use by callers.
