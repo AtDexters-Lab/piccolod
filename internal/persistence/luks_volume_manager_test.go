@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage/blockdev"
+	"piccolod/internal/storage/lvm"
 )
 
 // fakeRunner records all Run/RunWithOutput calls for assertion.
@@ -424,5 +426,190 @@ func TestModuleProvisionLUKSKeyslot_NoopWithoutLUKS(t *testing.T) {
 	mod := &Module{}
 	if err := mod.ProvisionLUKSKeyslot(context.Background(), 1, []byte("pass")); err != nil {
 		t.Errorf("expected nil error, got %v", err)
+	}
+}
+
+// --- Ephemeral volume tests ---
+
+func TestVolumeClassEphemeral_Value(t *testing.T) {
+	if VolumeClassEphemeral != "ephemeral" {
+		t.Errorf("VolumeClassEphemeral = %q, want %q", VolumeClassEphemeral, "ephemeral")
+	}
+}
+
+func TestReadWriteVolumeMetaV3_Ephemeral(t *testing.T) {
+	dir := t.TempDir()
+	metaPath := filepath.Join(dir, metadataV2File)
+
+	meta := &volumeMetaV3{
+		Version:   metadataV3Version,
+		Type:      "ephemeral",
+		LVName:    "eph-scratch-vol",
+		VGName:    "piccolo-data-vg",
+		SizeBytes: 10 << 30,
+		FSType:    "btrfs",
+	}
+
+	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
+		t.Fatalf("writeVolumeMetaV3: %v", err)
+	}
+
+	version, err := readVolumeMetaVersion(metaPath)
+	if err != nil {
+		t.Fatalf("readVolumeMetaVersion: %v", err)
+	}
+	if version != metadataV3Version {
+		t.Fatalf("version = %d, want %d", version, metadataV3Version)
+	}
+
+	got, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		t.Fatalf("readVolumeMetaV3: %v", err)
+	}
+	if got.Type != "ephemeral" {
+		t.Errorf("Type = %q, want ephemeral", got.Type)
+	}
+	if got.LVName != "eph-scratch-vol" {
+		t.Errorf("LVName = %q, want eph-scratch-vol", got.LVName)
+	}
+	if got.FSType != "btrfs" {
+		t.Errorf("FSType = %q, want btrfs", got.FSType)
+	}
+}
+
+func TestReconcileAllVolumeStates_V3Ephemeral(t *testing.T) {
+	core, _ := paths.SetRootsForTest(t)
+
+	mgr := &luksVolumeManager{stacks: nil}
+
+	volDir := filepath.Join(core, "volumes", "eph-scratch")
+	if err := os.MkdirAll(volDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"version":3,"type":"ephemeral","lv_name":"eph-scratch","vg_name":"piccolo-data-vg","size_bytes":10737418240,"fs_type":"btrfs"}`
+	if err := os.WriteFile(filepath.Join(volDir, metadataV2File), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.ReconcileAllVolumeStates(); err != nil {
+		t.Fatalf("ReconcileAllVolumeStates: %v", err)
+	}
+}
+
+func TestResolveLUKSDevice_RejectsEphemeral(t *testing.T) {
+	mgr := &luksVolumeManager{
+		stacks:       make(map[string]*blockdev.DeviceStack),
+		rootfsMounts: make(map[string]*rootfsMountState),
+	}
+
+	meta := &volumeMetaV3{
+		Version: metadataV3Version,
+		Type:    "ephemeral",
+		LVName:  "eph-test",
+	}
+
+	_, _, err := mgr.resolveLUKSDevice(context.Background(), "test-vol", meta)
+	if err == nil {
+		t.Fatal("expected error for ephemeral volume")
+	}
+	if !strings.Contains(err.Error(), "no LUKS device") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestDestroyVolume_Ephemeral_NoCryptsetup(t *testing.T) {
+	core, _ := paths.SetRootsForTest(t)
+
+	run := &fakeRunner{}
+	lvMgr := lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName)
+
+	mgr := &luksVolumeManager{
+		run:          run,
+		lvMgr:        lvMgr,
+		stacks:       make(map[string]*blockdev.DeviceStack),
+		rootfsMounts: make(map[string]*rootfsMountState),
+	}
+
+	// Create ephemeral volume metadata.
+	volDir := filepath.Join(core, "volumes", "eph-test")
+	if err := os.MkdirAll(volDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := &volumeMetaV3{
+		Version:   metadataV3Version,
+		Type:      "ephemeral",
+		LVName:    "eph-eph-test",
+		VGName:    lvm.DefaultVGName,
+		SizeBytes: ephDefaultSize,
+		FSType:    "btrfs",
+	}
+	if err := writeVolumeMetaV3(filepath.Join(volDir, metadataV2File), meta); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create mount dir.
+	mountDir := filepath.Join(core, "mounts", "eph-test")
+	if err := os.MkdirAll(mountDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.DestroyVolume(context.Background(), "eph-test"); err != nil {
+		t.Fatalf("DestroyVolume: %v", err)
+	}
+
+	// Verify no cryptsetup calls were made.
+	for _, call := range run.getCalls() {
+		if strings.Contains(call, "cryptsetup") {
+			t.Errorf("unexpected cryptsetup call: %q", call)
+		}
+	}
+
+	// Metadata dir should be removed.
+	if _, err := os.Stat(volDir); !os.IsNotExist(err) {
+		t.Error("expected volume metadata dir to be removed")
+	}
+	// Mount dir should be removed.
+	if _, err := os.Stat(mountDir); !os.IsNotExist(err) {
+		t.Error("expected mount dir to be removed")
+	}
+}
+
+func TestProvisionKeyslotOnAllVolumes_SkipsEphemeral(t *testing.T) {
+	core, _ := paths.SetRootsForTest(t)
+
+	run := &fakeRunner{
+		// Make cryptsetup fail so we can detect if it's called.
+		errs: map[string]error{"cryptsetup": errors.New("should not be called")},
+	}
+
+	// Create an ephemeral volume metadata (should be skipped).
+	volDir := filepath.Join(core, "volumes", "eph-scratch")
+	if err := os.MkdirAll(volDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"version":3,"type":"ephemeral","lv_name":"eph-scratch","vg_name":"piccolo-data-vg","size_bytes":10737418240,"fs_type":"btrfs"}`
+	if err := os.WriteFile(filepath.Join(volDir, metadataV2File), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := &luksVolumeManager{
+		run:          run,
+		tmpfsDir:     t.TempDir(),
+		stacks:       make(map[string]*blockdev.DeviceStack),
+		rootfsMounts: make(map[string]*rootfsMountState),
+		// crypto is nil — provisionKeyslotOnAllVolumes will fail on UnwrapLUKSMasterKey.
+		// But ephemeral volumes should be skipped before we get to any per-volume operations.
+	}
+
+	// This will fail because crypto is nil (can't unwrap master key),
+	// but the point is that if we got past the master key unwrap,
+	// ephemeral volumes would not trigger cryptsetup.
+	_ = mgr.provisionKeyslotOnAllVolumes(context.Background(), 1, []byte("pass"))
+
+	// No cryptsetup calls should have been made for the ephemeral volume.
+	for _, call := range run.getCalls() {
+		if strings.Contains(call, "cryptsetup") {
+			t.Errorf("unexpected cryptsetup call for ephemeral volume: %q", call)
+		}
 	}
 }

@@ -30,6 +30,9 @@ const (
 
 	controlPlaneLoopFile = "control-plane.luks"
 	controlPlaneSize     = 256 << 20 // 256 MiB
+
+	ephLVPrefix    = "eph-"
+	ephDefaultSize = 10 << 30 // 10 GiB
 )
 
 // volumeMetaV2 is the on-disk metadata schema for block-native volumes.
@@ -59,7 +62,8 @@ type Reconcilable interface {
 // RoleCheckable, and Reconcilable.
 // It dispatches to LUKSLoopVolume for control volumes and DeviceStack + LUKS
 // for application volumes. For rootfs volumes, it manages golden LVs and
-// idmapped mounts.
+// idmapped mounts. For ephemeral volumes, it manages unencrypted thin LVs
+// with btrfs+zstd.
 type luksVolumeManager struct {
 	run      runner.CommandRunner
 	crypto   *crypt.Manager
@@ -188,7 +192,7 @@ func (m *luksVolumeManager) ReconcileAllVolumeStates() error {
 			switch meta.Type {
 			case "golden", "workspace", "service-rootfs":
 				continue
-			case "service-data":
+			case "service-data", "ephemeral":
 				// Validate parseable, nothing else needed.
 			}
 		default:
@@ -214,6 +218,11 @@ func (m *luksVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 	// Check if volume already exists.
 	if _, err := os.Stat(metaPath); err == nil {
 		return handle, nil
+	}
+
+	// Ephemeral volumes bypass the crypto gate — no LUKS, no crypto dependency.
+	if req.Class == VolumeClassEphemeral {
+		return m.ensureEphemeralVolume(ctx, req)
 	}
 
 	// If crypto is not initialized yet (fresh system before setup), return
@@ -270,6 +279,8 @@ func (m *luksVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 		switch meta.Type {
 		case "service-data":
 			return m.attachAppVolumeV3(ctx, handle, meta, opts)
+		case "ephemeral":
+			return m.attachEphemeralVolume(ctx, handle, meta)
 		case "golden", "workspace", "service-rootfs":
 			return fmt.Errorf("rootfs volume %s (type=%s): use AttachRootfs instead", handle.ID, meta.Type)
 		default:
@@ -311,6 +322,8 @@ func (m *luksVolumeManager) Detach(ctx context.Context, handle VolumeHandle) err
 		switch meta.Type {
 		case "service-data":
 			return m.detachAppVolume(ctx, handle)
+		case "ephemeral":
+			return m.detachEphemeralVolume(ctx, handle)
 		case "golden", "workspace", "service-rootfs":
 			return fmt.Errorf("rootfs volume %s: use DetachRootfs", handle.ID)
 		default:
@@ -331,6 +344,7 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 	if err != nil {
 		if os.IsNotExist(err) {
 			m.cleanupStaleAppState(ctx, id)
+			m.cleanupStaleEphemeralState(ctx, id)
 			return nil
 		}
 		return fmt.Errorf("read volume metadata version: %w", err)
@@ -367,6 +381,14 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 			if m.lvMgr != nil && meta.LVName != "" {
 				if err := m.lvMgr.RemoveThinLV(ctx, meta.LVName); err != nil {
 					log.Printf("WARN: remove thin LV %s: %v", meta.LVName, err)
+				}
+			}
+		case "ephemeral":
+			// Detach dispatches to detachEphemeralVolume (no LUKS close).
+			_ = m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir})
+			if m.lvMgr != nil && meta.LVName != "" {
+				if err := m.lvMgr.RemoveThinLV(ctx, meta.LVName); err != nil {
+					log.Printf("WARN: remove ephemeral thin LV %s: %v", meta.LVName, err)
 				}
 			}
 		}
@@ -655,6 +677,164 @@ func (m *luksVolumeManager) detachAppVolume(ctx context.Context, handle VolumeHa
 	return nil
 }
 
+// --- Ephemeral volume (unencrypted thin LV + btrfs) ---
+
+func (m *luksVolumeManager) ensureEphemeralVolume(ctx context.Context, req VolumeRequest) (VolumeHandle, error) {
+	handle := VolumeHandle{
+		ID:       req.ID,
+		MountDir: paths.MountDir(req.ID),
+	}
+
+	if err := m.checkThinPoolCapacity(ctx); err != nil {
+		return VolumeHandle{}, err
+	}
+
+	metaDir := paths.VolumeMetaDir(req.ID)
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		return VolumeHandle{}, fmt.Errorf("create meta dir: %w", err)
+	}
+
+	lvName := ephLVPrefix + req.ID
+
+	if m.lvMgr.LVExists(ctx, lvName) {
+		m.cleanupStaleEphemeralState(ctx, req.ID)
+	}
+	if err := m.lvMgr.CreateThinLV(ctx, lvName, ephDefaultSize); err != nil {
+		return VolumeHandle{}, fmt.Errorf("create ephemeral thin LV: %w", err)
+	}
+
+	// Build single-element stack (ThinLV only — no NBD/DRBD/LUKS).
+	thinDev := blockdev.NewThinLVDevice(m.lvMgr, lvName, ephDefaultSize)
+	stack, err := blockdev.NewDeviceStack(req.ID, thinDev)
+	if err != nil {
+		return VolumeHandle{}, fmt.Errorf("build ephemeral device stack: %w", err)
+	}
+	if err := stack.Open(ctx); err != nil {
+		return VolumeHandle{}, fmt.Errorf("open ephemeral device stack: %w", err)
+	}
+	defer stack.Close(ctx)
+
+	if err := m.run.Run(ctx, "mkfs.btrfs", "-f", stack.Top().Path()); err != nil {
+		return VolumeHandle{}, fmt.Errorf("mkfs.btrfs: %w", err)
+	}
+
+	meta := &volumeMetaV3{
+		Version:   metadataV3Version,
+		Type:      "ephemeral",
+		LVName:    lvName,
+		VGName:    lvm.DefaultVGName,
+		SizeBytes: ephDefaultSize,
+		FSType:    "btrfs",
+	}
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), meta); err != nil {
+		return VolumeHandle{}, fmt.Errorf("write metadata: %w", err)
+	}
+
+	log.Printf("INFO: created ephemeral volume %s (LV=%s)", req.ID, lvName)
+	return handle, nil
+}
+
+func (m *luksVolumeManager) attachEphemeralVolume(ctx context.Context, handle VolumeHandle, meta *volumeMetaV3) error {
+	// Idempotent: if already attached, skip.
+	m.mu.Lock()
+	_, exists := m.stacks[handle.ID]
+	m.mu.Unlock()
+	if exists {
+		return nil
+	}
+
+	thinDev := blockdev.NewThinLVDevice(m.lvMgr, meta.LVName, meta.SizeBytes)
+	stack, err := blockdev.NewDeviceStack(handle.ID, thinDev)
+	if err != nil {
+		return fmt.Errorf("build ephemeral device stack: %w", err)
+	}
+	if err := stack.Open(ctx); err != nil {
+		return fmt.Errorf("open ephemeral device stack: %w", err)
+	}
+
+	m.mu.Lock()
+	m.stacks[handle.ID] = stack
+	m.mu.Unlock()
+
+	mountDir := handle.MountDir
+	mountsParent := filepath.Dir(mountDir)
+	if err := os.MkdirAll(mountsParent, 0o711); err != nil {
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("create mounts parent: %w", err)
+	}
+	if err := os.Chmod(mountsParent, 0o711); err != nil {
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("chmod mounts parent: %w", err)
+	}
+	if err := os.MkdirAll(mountDir, 0o700); err != nil {
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("create mount dir: %w", err)
+	}
+
+	if err := m.run.Run(ctx, "mount", "-t", "btrfs", "-o", btrfsRootfsMountOpts, stack.Top().Path(), mountDir); err != nil {
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("mount: %w", err)
+	}
+
+	return nil
+}
+
+func (m *luksVolumeManager) detachEphemeralVolume(ctx context.Context, handle VolumeHandle) error {
+	// Unmount with lazy fallback on EBUSY.
+	if err := m.run.Run(ctx, "umount", handle.MountDir); err != nil {
+		if lazyErr := m.run.Run(ctx, "umount", "-l", handle.MountDir); lazyErr != nil {
+			return fmt.Errorf("umount %s: %w (lazy also failed: %v)", handle.MountDir, err, lazyErr)
+		}
+	}
+
+	// Close device stack.
+	m.mu.Lock()
+	stack := m.stacks[handle.ID]
+	delete(m.stacks, handle.ID)
+	m.mu.Unlock()
+
+	if stack != nil {
+		if err := stack.Close(ctx); err != nil {
+			return fmt.Errorf("close device stack: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// cleanupStaleEphemeralState tears down leftover mounts, LVs, and dirs for an
+// ephemeral volume that has no metadata (e.g., partial creation that was interrupted).
+func (m *luksVolumeManager) cleanupStaleEphemeralState(ctx context.Context, id string) {
+	mountDir := paths.MountDir(id)
+	lvName := ephLVPrefix + id
+
+	if m.run != nil {
+		_ = m.run.Run(ctx, "umount", mountDir)
+	}
+	if m.lvMgr != nil {
+		_ = m.lvMgr.DeactivateLV(ctx, lvName)
+		if m.lvMgr.LVExists(ctx, lvName) {
+			if err := m.lvMgr.RemoveThinLV(ctx, lvName); err != nil {
+				log.Printf("WARN: cleanup stale ephemeral LV %s: %v", lvName, err)
+			}
+		}
+	}
+	_ = os.RemoveAll(paths.VolumeMetaDir(id))
+	_ = os.RemoveAll(mountDir)
+}
+
 // --- Helpers ---
 
 func (m *luksVolumeManager) buildStack(volumeID, lvName string, sizeBytes int64) (*blockdev.DeviceStack, error) {
@@ -844,6 +1024,10 @@ func (m *luksVolumeManager) provisionKeyslotOnAllVolumes(ctx context.Context, sl
 		if err != nil {
 			continue
 		}
+		// Ephemeral volumes have no LUKS container — skip keyslot provisioning.
+		if meta.Type == "ephemeral" {
+			continue
+		}
 
 		if err := m.provisionKeyslotOnVolume(ctx, volID, meta, slot, passphrase, masterKey); err != nil {
 			log.Printf("WARN: keyslot %d failed for %s: %v", slot, volID, err)
@@ -870,6 +1054,9 @@ func (m *luksVolumeManager) resolveLUKSDevice(ctx context.Context, volID string,
 	noop := func() {}
 
 	switch meta.Type {
+	case "ephemeral":
+		return "", noop, fmt.Errorf("ephemeral volumes have no LUKS device")
+
 	case "golden", "workspace", "service-rootfs":
 		// Rootfs types: LUKS sits directly on the LV (no DRBD in stack).
 		// NOTE: if workspace replication via DRBD is added, this must
@@ -1035,7 +1222,7 @@ func (m *luksVolumeManager) attachAppVolumeV3(ctx context.Context, handle Volume
 // and v3 service-data volumes using the single LUKS master key.
 type volumeMetaV3 struct {
 	Version         int            `json:"version"`                    // 3
-	Type            string         `json:"type"`                      // golden/workspace/service-rootfs/service-data
+	Type            string         `json:"type"`                      // golden/workspace/service-rootfs/service-data/ephemeral
 	LVName          string         `json:"lv_name"`
 	VGName          string         `json:"vg_name"`
 	SizeBytes       int64          `json:"size_bytes,omitempty"`

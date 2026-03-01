@@ -239,6 +239,7 @@ type VolumeClass string
 const (
 	VolumeClassControl     VolumeClass = "control"
 	VolumeClassApplication VolumeClass = "application"
+	VolumeClassEphemeral   VolumeClass = "ephemeral"
 )
 
 type ClusterMode string
