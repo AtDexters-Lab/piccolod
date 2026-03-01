@@ -269,6 +269,7 @@ func (m *MockContainerManager) InspectImage(ctx context.Context, runtime contain
 		Cmd:         []string{"/bin/sh"},
 		Digest:      "sha256:mockdigest",
 		RepoDigests: []string{"docker.io/library/mock-image@sha256:mockdigest"},
+		Size:        500 << 20,
 	}, nil
 }
 

@@ -462,7 +462,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		PoolMgr:    storageMgr.LVMPool(),
 		NBDSrv:     nbdSrv,
 		DRBDMgr:    drbdMgr,
-		FlattenFn:  appMgr.MakeFlattenFn(),
+		FlattenFn:   appMgr.MakeFlattenFn(),
+		ImageSizeFn: appMgr.MakeImageSizeFn(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to init persistence module: %w", err)

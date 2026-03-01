@@ -28,7 +28,7 @@ type IDMapConfig struct {
 // The mount translates on-disk UIDs/GIDs according to the IDMapConfig,
 // allowing containers to access files owned by different UIDs.
 //
-// Requires CAP_SYS_ADMIN and kernel >= 5.12.
+// Requires CAP_SYS_ADMIN and kernel >= 5.15 (btrfs idmap support).
 func CreateIDMappedMount(source, target string, config IDMapConfig) error {
 	usernsFd, err := createUserNamespace(config)
 	if err != nil {

@@ -30,7 +30,30 @@ const (
 	flattenSentinelFile  = ".piccolo_flatten_incomplete"
 	imageConfigFile      = "image-config.json"
 	defaultGoldenLVSize  = 10 << 30 // 10 GiB
+
+	btrfsRootfsMountOpts = "compress=zstd:1,discard=async,noatime"
 )
+
+// goldenLVSizeForImage returns the right-sized LV allocation for a given
+// uncompressed image size. Uses max(1.5x, image + 1 GiB) with a 256 MiB
+// floor (btrfs minimum for DUP metadata is ~109 MiB).
+func goldenLVSizeForImage(imageSizeBytes int64) int64 {
+	if imageSizeBytes <= 0 {
+		return defaultGoldenLVSize
+	}
+	oneGiB := int64(1 << 30)
+	minSize := int64(256 << 20)
+	sizeA := imageSizeBytes + imageSizeBytes/2 // 1.5x
+	sizeB := imageSizeBytes + oneGiB           // + 1 GiB
+	result := sizeA
+	if sizeB > result {
+		result = sizeB
+	}
+	if result < minSize {
+		result = minSize
+	}
+	return result
+}
 
 // ShortDigest returns the first 12 hex chars of the SHA-256 of a digest string.
 // Used for golden LV naming.
@@ -114,6 +137,15 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 
 	lvName := goldenID
 	sizeBytes := int64(defaultGoldenLVSize)
+	if m.imageSizeFn != nil {
+		if imgSize, err := m.imageSizeFn(ctx, req.ImageRef); err == nil && imgSize > 0 {
+			sizeBytes = goldenLVSizeForImage(imgSize)
+		} else if err != nil {
+			log.Printf("WARN: imageSizeFn failed for %s, using default LV size: %v", req.ImageRef, err)
+		} else if imgSize <= 0 {
+			log.Printf("WARN: imageSizeFn returned non-positive size %d for %s, using default LV size", imgSize, req.ImageRef)
+		}
+	}
 
 	mapper := "piccolo-vol-" + goldenID
 	mountDir := paths.MountDir(goldenID)
@@ -171,8 +203,8 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 
 	luksPath := "/dev/mapper/" + mapper
 
-	// mkfs.ext4.
-	if err := m.run.Run(ctx, "mkfs.ext4", "-F", "-m", "1", luksPath); err != nil {
+	// mkfs.btrfs.
+	if err := m.run.Run(ctx, "mkfs.btrfs", "-f", luksPath); err != nil {
 		return "", fmt.Errorf("mkfs golden: %w", err)
 	}
 
@@ -180,7 +212,7 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir golden mount: %w", err)
 	}
-	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", "discard", luksPath, mountDir); err != nil {
+	if err := m.run.Run(ctx, "mount", "-t", "btrfs", "-o", btrfsRootfsMountOpts, luksPath, mountDir); err != nil {
 		return "", fmt.Errorf("mount golden: %w", err)
 	}
 	mounted = true
@@ -226,7 +258,7 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 		LVName:          lvName,
 		VGName:          lvm.DefaultVGName,
 		SizeBytes:       sizeBytes,
-		FSType:          "ext4",
+		FSType:          "btrfs",
 		BaseImageDigest: req.ImageDigest,
 		BaseImageRef:    req.ImageRef,
 		FlattenComplete: time.Now().UTC().Format(time.RFC3339),
@@ -246,7 +278,7 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	m.goldenLVs[digestShort] = meta
 	m.mu.Unlock()
 
-	log.Printf("golden LV created: %s (image=%s)", goldenID, req.ImageRef)
+	log.Printf("golden LV created: %s (image=%s, digest=%s, size=%d)", goldenID, req.ImageRef, req.ImageDigest, sizeBytes)
 	return goldenID, nil
 }
 
@@ -324,7 +356,7 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 		LVName:          snapshotName,
 		VGName:          lvm.DefaultVGName,
 		SizeBytes:       goldenMeta.SizeBytes,
-		FSType:          "ext4",
+		FSType:          "btrfs",
 		ReadOnly:        readOnly,
 		BaseImageDigest: goldenMeta.BaseImageDigest,
 		BaseImageRef:    goldenMeta.BaseImageRef,
@@ -405,7 +437,7 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 		LVName:          cloneVolumeID,
 		VGName:          lvm.DefaultVGName,
 		SizeBytes:       originMeta.SizeBytes,
-		FSType:          "ext4",
+		FSType:          "btrfs",
 		BaseImageDigest: originMeta.BaseImageDigest,
 		BaseImageRef:    originMeta.BaseImageRef,
 		GoldenLV:        originMeta.GoldenLV,
@@ -497,7 +529,7 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 
 	luksPath := "/dev/mapper/" + mapper
 
-	// Mount ext4.
+	// Mount btrfs.
 	mountDir := paths.MountDir(volumeID)
 	if err := os.MkdirAll(filepath.Dir(mountDir), 0o711); err != nil {
 		m.run.Run(ctx, "cryptsetup", "close", mapper)
@@ -511,13 +543,21 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		return RootfsHandle{}, fmt.Errorf("mkdir mount: %w", err)
 	}
 
-	// Always mount thin snapshots rw at the host level, even for ReadOnly volumes.
-	// Runc creates bind mount targets (/piccolo, /etc/mtab, etc.) during container
-	// setup before applying --read-only. The thin snapshot provides CoW isolation
-	// from the golden LV; container-level immutability is enforced by podman's
-	// --read-only flag (set via spec.ReadOnly from RootfsHandle.ReadOnly).
-	mountOpts := "discard"
-	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", mountOpts, luksPath, mountDir); err != nil {
+	if meta.FSType != "" && meta.FSType != "btrfs" {
+		m.run.Run(ctx, "cryptsetup", "close", mapper)
+		rollback()
+		return RootfsHandle{}, fmt.Errorf("unsupported rootfs FSType %q (expected btrfs); destroy and recreate the volume", meta.FSType)
+	}
+
+	// Mount btrfs rootfs. Service rootfs: host-level read-only. The flattened image
+	// from podman export contains all OCI bind mount targets (/etc/resolv.conf,
+	// /etc/hostname, /etc/hosts, /etc/mtab) — runc bind-mounts over existing paths,
+	// it does not need to create them. Workspaces: read-write for user data.
+	mountOpts := btrfsRootfsMountOpts
+	if meta.ReadOnly {
+		mountOpts = "ro," + mountOpts
+	}
+	if err := m.run.Run(ctx, "mount", "-t", "btrfs", "-o", mountOpts, luksPath, mountDir); err != nil {
 		m.run.Run(ctx, "cryptsetup", "close", mapper)
 		rollback()
 		return RootfsHandle{}, fmt.Errorf("mount: %w", err)
@@ -589,7 +629,7 @@ func (m *luksVolumeManager) DetachRootfs(ctx context.Context, volumeID string) e
 		}
 	}
 
-	// Unmount ext4.
+	// Unmount btrfs.
 	if err := m.run.Run(ctx, "umount", state.mountPath); err != nil {
 		if err2 := m.run.Run(ctx, "umount", "-l", state.mountPath); err2 != nil {
 			errs = append(errs, fmt.Errorf("umount %s: %w", state.mountPath, err2))

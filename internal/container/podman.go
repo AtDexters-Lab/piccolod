@@ -1556,6 +1556,7 @@ type ImageConfig struct {
 	User        string
 	Digest      string   // Canonical digest (e.g., "sha256:abc123...")
 	RepoDigests []string // List of canonical references (e.g., "docker.io/library/ubuntu@sha256:...")
+	Size        int64    // Uncompressed image size in bytes
 }
 
 // InspectImage retrieves the configuration of a container image.
@@ -1571,7 +1572,7 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 	// Use podman image inspect to get the full image configuration including digest
 	args, err := BuildPodmanArgs(runtime, []string{
 		"image", "inspect",
-		"--format", `{"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"env":{{json .Config.Env}},"workingDir":{{json .Config.WorkingDir}},"user":{{json .Config.User}},"digest":{{json .Digest}},"repoDigests":{{json .RepoDigests}}}`,
+		"--format", `{"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"env":{{json .Config.Env}},"workingDir":{{json .Config.WorkingDir}},"user":{{json .Config.User}},"digest":{{json .Digest}},"repoDigests":{{json .RepoDigests}},"size":{{json .Size}}}`,
 		imageName,
 	})
 	if err != nil {
@@ -1593,6 +1594,7 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 		User        string   `json:"user"`
 		Digest      string   `json:"digest"`
 		RepoDigests []string `json:"repoDigests"`
+		Size        int64    `json:"size"`
 	}
 	if err := json.Unmarshal(output, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse image config: %w, output: %s", err, string(output))
@@ -1606,6 +1608,7 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 		User:        result.User,
 		Digest:      result.Digest,
 		RepoDigests: result.RepoDigests,
+		Size:        result.Size,
 	}, nil
 }
 

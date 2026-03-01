@@ -1468,6 +1468,7 @@ func (m *GinMockContainerManager) InspectImage(ctx context.Context, runtime cont
 		Cmd:         []string{"/bin/sh"},
 		Digest:      "sha256:mockdigest",
 		RepoDigests: []string{imageName + "@sha256:mockdigest"},
+		Size:        500 << 20,
 	}, nil
 }
 

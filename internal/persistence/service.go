@@ -43,7 +43,8 @@ type Options struct {
 	DRBDMgr *drbd.ResourceManager
 
 	// Rootfs dependencies.
-	FlattenFn func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
+	FlattenFn   func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
+	ImageSizeFn func(ctx context.Context, imageRef string) (int64, error)
 }
 
 // Module implements the Service interface using pluggable sub-components.
@@ -139,7 +140,8 @@ func NewService(opts Options) (*Module, error) {
 			PoolMgr:   opts.PoolMgr,
 			NBDSrv:    opts.NBDSrv,
 			DRBDMgr:   opts.DRBDMgr,
-			FlattenFn: opts.FlattenFn,
+			FlattenFn:   opts.FlattenFn,
+			ImageSizeFn: opts.ImageSizeFn,
 		})
 		mod.volumes = lvm
 		// Only expose rootfs capabilities when FlattenFn is available.

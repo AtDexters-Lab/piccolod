@@ -78,6 +78,8 @@ type luksVolumeManager struct {
 	// Flatten function: extracts OCI image to a directory and returns image config.
 	// Injected by AppManager wiring.
 	flattenFn func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
+	// ImageSizeFn returns the uncompressed image size in bytes for right-sizing golden LVs.
+	imageSizeFn func(ctx context.Context, imageRef string) (int64, error)
 
 	mu          sync.Mutex
 	roleChecker func(string, VolumeRole) bool
@@ -111,6 +113,8 @@ type LUKSVolumeManagerConfig struct {
 	DRBDMgr *drbd.ResourceManager
 	// FlattenFn extracts an OCI image to a target directory and returns image config.
 	FlattenFn func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
+	// ImageSizeFn returns the uncompressed image size in bytes for right-sizing golden LVs.
+	ImageSizeFn func(ctx context.Context, imageRef string) (int64, error)
 }
 
 // NewLUKSVolumeManager creates the unified volume manager.
@@ -125,6 +129,7 @@ func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) *luksVolumeManager {
 		nbdSrv:       cfg.NBDSrv,
 		drbdMgr:      cfg.DRBDMgr,
 		flattenFn:    cfg.FlattenFn,
+		imageSizeFn:  cfg.ImageSizeFn,
 		loopVol:      NewLUKSLoopVolume(cfg.Run),
 		stacks:       make(map[string]*blockdev.DeviceStack),
 		goldenLVs:    make(map[string]*volumeMetaV3),

@@ -355,6 +355,29 @@ func (m *AppManager) MakeFlattenFn() func(ctx context.Context, imageRef, targetD
 	}
 }
 
+// MakeImageSizeFn creates a function that returns the uncompressed image size.
+// It performs a best-effort pull first (priming the cache for the subsequent flatten),
+// then inspects the image to get its size.
+func (m *AppManager) MakeImageSizeFn() func(ctx context.Context, imageRef string) (int64, error) {
+	return func(ctx context.Context, imageRef string) (int64, error) {
+		rt, err := m.podmanImageRuntime()
+		if err != nil {
+			return 0, fmt.Errorf("image runtime: %w", err)
+		}
+
+		// Best-effort pull — primes cache so flattenFn's pull is a no-op.
+		if pullErr := m.pullToImagestore(ctx, imageRef, nil); pullErr != nil {
+			log.Printf("WARN: imageSizeFn: image pull failed, will attempt with cached: %v", pullErr)
+		}
+
+		imgConfig, err := m.containerManager.InspectImage(ctx, rt, imageRef)
+		if err != nil {
+			return 0, fmt.Errorf("inspect image %s: %w", imageRef, err)
+		}
+		return imgConfig.Size, nil
+	}
+}
+
 // flattenExportToDir pipes `podman export` to `tar x` for image flattening.
 func (m *AppManager) flattenExportToDir(ctx context.Context, rt container.PodmanRuntime, cid, targetDir string) error {
 	pr, pw := io.Pipe()
