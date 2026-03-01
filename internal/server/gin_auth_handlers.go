@@ -13,6 +13,7 @@ import (
 
 	authpkg "piccolod/internal/auth"
 	"piccolod/internal/crypt"
+	"piccolod/internal/cryptoutil"
 	"piccolod/internal/events"
 	"piccolod/internal/health"
 	"piccolod/internal/persistence"
@@ -432,9 +433,17 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 			return
 		}
 	}
-	// TODO: rotate LUKS keyslot 1 (admin-password-derived) on all volumes once
-	// keyslot provisioning is implemented. Currently only keyslot 0 (pool keyfile)
-	// exists, which is SDEK-wrapped — the Rewrap above covers the chain.
+	// Rotate LUKS keyslot 1 (admin-password passphrase) on all volumes.
+	// Only for admin — keyslot 1 is the admin disk-encryption passphrase.
+	if sess, ok := s.sessions.Get(id); ok && (sess.Role == "admin" || sess.User == "admin") {
+		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
+			passBytes := []byte(body.NewPassword)
+			if err := kp.ProvisionLUKSKeyslot(c.Request.Context(), 1, passBytes); err != nil {
+				log.Printf("WARN: LUKS keyslot 1 rotation: %v", err)
+			}
+			cryptoutil.SecureZero(passBytes)
+		}
+	}
 	update := persistence.AuthStalenessUpdate{
 		PasswordStale:   boolPtr(false),
 		PasswordStaleAt: timePtr(time.Time{}),

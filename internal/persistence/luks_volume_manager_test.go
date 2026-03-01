@@ -4,10 +4,56 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"piccolod/internal/state/paths"
+	"piccolod/internal/storage/blockdev"
 )
+
+// fakeRunner records all Run/RunWithOutput calls for assertion.
+type fakeRunner struct {
+	mu    sync.Mutex
+	calls []string
+	errs  map[string]error
+}
+
+func (f *fakeRunner) Run(_ context.Context, name string, args ...string) error {
+	key := name + " " + strings.Join(args, " ")
+	f.mu.Lock()
+	f.calls = append(f.calls, key)
+	err := f.errs[key]
+	if err == nil {
+		err = f.errs[name]
+	}
+	f.mu.Unlock()
+	return err
+}
+
+func (f *fakeRunner) RunWithOutput(_ context.Context, name string, args ...string) ([]byte, error) {
+	key := name + " " + strings.Join(args, " ")
+	f.mu.Lock()
+	f.calls = append(f.calls, key)
+	err := f.errs[key]
+	if err == nil {
+		err = f.errs[name]
+	}
+	f.mu.Unlock()
+	return nil, err
+}
+
+func (f *fakeRunner) RunWithStdin(_ context.Context, _ []byte, name string, args ...string) error {
+	return f.Run(context.Background(), name, args...)
+}
+
+func (f *fakeRunner) getCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
 
 func TestLUKSVolumeManager_ImplementsInterfaces(t *testing.T) {
 	// Compile-time interface checks.
@@ -304,5 +350,79 @@ func TestReadVolumeMeta_WrongVersion(t *testing.T) {
 	_, err := readVolumeMeta(metaPath)
 	if err == nil {
 		t.Fatal("expected error for wrong version")
+	}
+}
+
+func TestLuksSetKeyslot_CallsAddKey(t *testing.T) {
+	run := &fakeRunner{}
+	tmpfs := t.TempDir()
+	mgr := &luksVolumeManager{run: run, tmpfsDir: tmpfs}
+
+	masterKey := []byte("master-key-64-bytes-padding-here-0123456789abcdef0123456789abcdef")
+	passphrase := []byte("admin-password")
+
+	if err := mgr.luksSetKeyslot(context.Background(), "/dev/fake", 1, passphrase, masterKey); err != nil {
+		t.Fatalf("luksSetKeyslot: %v", err)
+	}
+
+	calls := run.getCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %d: %v", len(calls), calls)
+	}
+	if !strings.Contains(calls[0], "cryptsetup luksAddKey") {
+		t.Errorf("expected luksAddKey, got %q", calls[0])
+	}
+	if !strings.Contains(calls[0], "--key-slot 1") {
+		t.Errorf("expected --key-slot 1, got %q", calls[0])
+	}
+	if !strings.Contains(calls[0], "/dev/fake") {
+		t.Errorf("expected device /dev/fake, got %q", calls[0])
+	}
+
+	// Verify tmpfs files are cleaned up (key material must not persist).
+	entries, _ := os.ReadDir(tmpfs)
+	if len(entries) != 0 {
+		t.Errorf("expected tmpfs dir to be clean, found %d files", len(entries))
+	}
+}
+
+func TestProvisionKeyslotOnAllVolumes_RejectsInvalidSlot(t *testing.T) {
+	mgr := &luksVolumeManager{
+		stacks: make(map[string]*blockdev.DeviceStack),
+	}
+
+	if err := mgr.provisionKeyslotOnAllVolumes(context.Background(), 0, []byte("pass")); err == nil {
+		t.Error("expected error for slot 0")
+	}
+	if err := mgr.provisionKeyslotOnAllVolumes(context.Background(), 3, []byte("pass")); err == nil {
+		t.Error("expected error for slot 3")
+	}
+}
+
+func TestProvisionKeyslotOnAllVolumes_FailsWithNilCrypto(t *testing.T) {
+	paths.SetRootsForTest(t)
+
+	run := &fakeRunner{}
+	mgr := &luksVolumeManager{
+		run:      run,
+		tmpfsDir: t.TempDir(),
+		stacks:   make(map[string]*blockdev.DeviceStack),
+	}
+
+	err := mgr.provisionKeyslotOnAllVolumes(context.Background(), 1, []byte("pass"))
+	if err == nil {
+		t.Fatal("expected error (no crypto manager)")
+	}
+	// No cryptsetup calls should have been made.
+	if calls := run.getCalls(); len(calls) != 0 {
+		t.Errorf("expected 0 calls, got %d: %v", len(calls), calls)
+	}
+}
+
+func TestModuleProvisionLUKSKeyslot_NoopWithoutLUKS(t *testing.T) {
+	// Module with nil volume manager should be a no-op.
+	mod := &Module{}
+	if err := mod.ProvisionLUKSKeyslot(context.Background(), 1, []byte("pass")); err != nil {
+		t.Errorf("expected nil error, got %v", err)
 	}
 }

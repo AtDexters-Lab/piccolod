@@ -120,6 +120,14 @@ type GoldenImageConfig struct {
 	Labels     map[string]string `json:"labels,omitempty"`
 }
 
+// KeyslotProvisioner provisions LUKS keyslots on all v3 volumes.
+// Implemented by Module when backed by luksVolumeManager.
+type KeyslotProvisioner interface {
+	// ProvisionLUKSKeyslot adds or replaces a passphrase on the given LUKS
+	// keyslot across all v3 volumes. Slot 1 = admin password, slot 2 = recovery mnemonic.
+	ProvisionLUKSKeyslot(ctx context.Context, slot int, passphrase []byte) error
+}
+
 // DeviceManager discovers and manages physical storage devices.
 type DeviceManager interface {
 	List(ctx context.Context) ([]PhysicalDevice, error)

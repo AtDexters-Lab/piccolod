@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"piccolod/internal/auth"
+	"piccolod/internal/cryptoutil"
 	"piccolod/internal/events"
 	"piccolod/internal/health"
 	"piccolod/internal/persistence"
@@ -167,6 +168,17 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 			if s.healthTracker != nil {
 				s.healthTracker.Setf("storage", health.LevelError, "data volume initialization failed")
 			}
+		}
+	}
+
+	// 5b. Provision LUKS keyslot 1 (admin password) on all v3 volumes.
+	if luksErr == nil {
+		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
+			passBytes := []byte(body.Password)
+			if err := kp.ProvisionLUKSKeyslot(setupCtx, 1, passBytes); err != nil {
+				log.Printf("WARN: LUKS keyslot 1 provisioning during setup: %v", err)
+			}
+			cryptoutil.SecureZero(passBytes)
 		}
 	}
 
@@ -442,6 +454,15 @@ func (s *GinServer) handleCryptoResetPassword(c *gin.Context) {
 		return
 	}
 
+	// Rotate LUKS keyslot 1 (admin-password passphrase) on all volumes.
+	if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
+		passBytes := []byte(newPassword)
+		if err := kp.ProvisionLUKSKeyslot(ctx, 1, passBytes); err != nil {
+			log.Printf("WARN: LUKS keyslot 1 rotation during reset: %v", err)
+		}
+		cryptoutil.SecureZero(passBytes)
+	}
+
 	now := time.Now().UTC()
 	update := persistence.AuthStalenessUpdate{
 		PasswordStale:   boolPtr(true),
@@ -544,6 +565,23 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	// Provision LUKS keyslot 2 (recovery-mnemonic passphrase) on all volumes.
+	// Only possible when unlocked — SDEK must be cached to unwrap master key.
+	// When locked, the mnemonic still works for app-level recovery (wrapped in
+	// state file) but won't be usable for direct disk-level cryptsetup open
+	// until the next unlocked recovery-key rotation.
+	if !s.cryptoManager.IsLocked() {
+		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
+			mnemonic := strings.Join(words, " ")
+			mnemonicBytes := []byte(mnemonic)
+			if err := kp.ProvisionLUKSKeyslot(c.Request.Context(), 2, mnemonicBytes); err != nil {
+				log.Printf("WARN: LUKS keyslot 2 provisioning: %v", err)
+			}
+			cryptoutil.SecureZero(mnemonicBytes)
+		}
+	} else {
+		log.Printf("INFO: LUKS keyslot 2 provisioning deferred (system locked)")
 	}
 	if err := s.applyStalenessUpdate(c.Request.Context(), persistence.AuthStalenessUpdate{
 		RecoveryStale:   boolPtr(false),

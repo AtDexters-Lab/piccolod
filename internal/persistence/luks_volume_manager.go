@@ -803,6 +803,159 @@ func (m *luksVolumeManager) luksOpenWithPoolKeyfile(ctx context.Context, device,
 	)
 }
 
+// --- LUKS keyslot provisioning ---
+
+// provisionKeyslotOnAllVolumes iterates all v3 volumes and adds (or replaces)
+// a passphrase on the given LUKS keyslot. Volumes that fail are logged and
+// collected; the caller gets a joined error.
+func (m *luksVolumeManager) provisionKeyslotOnAllVolumes(ctx context.Context, slot int, passphrase []byte) error {
+	if slot < 1 || slot > 2 {
+		return fmt.Errorf("invalid keyslot %d: only slots 1 and 2 are provisionable", slot)
+	}
+
+	masterKey, err := m.crypto.UnwrapLUKSMasterKey()
+	if err != nil {
+		return fmt.Errorf("unwrap master key: %w", err)
+	}
+	defer cryptoutil.SecureZero(masterKey)
+
+	metaBase := paths.CoreJoin("volumes")
+	entries, err := os.ReadDir(metaBase)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read volumes dir: %w", err)
+	}
+
+	var errs []error
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		volID := e.Name()
+		metaPath := filepath.Join(metaBase, volID, metadataV2File)
+		version, _ := readVolumeMetaVersion(metaPath)
+		if version != metadataV3Version {
+			continue
+		}
+		meta, err := readVolumeMetaV3(metaPath)
+		if err != nil {
+			continue
+		}
+
+		if err := m.provisionKeyslotOnVolume(ctx, volID, meta, slot, passphrase, masterKey); err != nil {
+			log.Printf("WARN: keyslot %d failed for %s: %v", slot, volID, err)
+			errs = append(errs, fmt.Errorf("%s: %w", volID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// provisionKeyslotOnVolume adds a passphrase to a specific keyslot on one volume.
+func (m *luksVolumeManager) provisionKeyslotOnVolume(ctx context.Context, volID string, meta *volumeMetaV3, slot int, passphrase, masterKey []byte) error {
+	device, cleanup, err := m.resolveLUKSDevice(ctx, volID, meta)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	return m.luksSetKeyslot(ctx, device, slot, passphrase, masterKey)
+}
+
+// resolveLUKSDevice returns the block device path for a volume's LUKS container.
+// For already-active volumes, uses the existing device. For inactive volumes,
+// activates the underlying device and returns a cleanup function.
+func (m *luksVolumeManager) resolveLUKSDevice(ctx context.Context, volID string, meta *volumeMetaV3) (string, func(), error) {
+	noop := func() {}
+
+	switch meta.Type {
+	case "golden", "workspace", "service-rootfs":
+		// Rootfs types: LUKS sits directly on the LV (no DRBD in stack).
+		// NOTE: if workspace replication via DRBD is added, this must
+		// resolve through the device stack instead of the raw LV.
+		m.mu.Lock()
+		state := m.rootfsMounts[volID]
+		m.mu.Unlock()
+		if state != nil {
+			return m.lvMgr.LVPath(meta.LVName), noop, nil
+		}
+		if err := m.lvMgr.ActivateLV(ctx, meta.LVName); err != nil {
+			return "", nil, fmt.Errorf("activate LV %s: %w", meta.LVName, err)
+		}
+		return m.lvMgr.LVPath(meta.LVName), func() {
+			m.lvMgr.DeactivateLV(ctx, meta.LVName)
+		}, nil
+
+	case "service-data":
+		// Service-data: LUKS sits on top of the device stack.
+		m.mu.Lock()
+		stack := m.stacks[volID]
+		m.mu.Unlock()
+		if stack != nil {
+			return stack.Top().Path(), noop, nil
+		}
+		tmpStack, err := m.buildStack(volID, meta.LVName, meta.SizeBytes)
+		if err != nil {
+			return "", nil, fmt.Errorf("build stack: %w", err)
+		}
+		if err := tmpStack.Open(ctx); err != nil {
+			return "", nil, fmt.Errorf("open stack: %w", err)
+		}
+		return tmpStack.Top().Path(), func() { tmpStack.Close(ctx) }, nil
+
+	default:
+		return "", nil, fmt.Errorf("unsupported volume type: %s", meta.Type)
+	}
+}
+
+// luksSetKeyslot adds a passphrase to a specific LUKS keyslot, using the master
+// key for authentication. If the slot is already occupied, it is killed first.
+func (m *luksVolumeManager) luksSetKeyslot(ctx context.Context, device string, slot int, passphrase, masterKey []byte) error {
+	masterKeyPath, mkCleanup, err := writeKeyToTmpfsDir(m.tmpfsDir, masterKey)
+	if err != nil {
+		return err
+	}
+	defer mkCleanup()
+
+	passphrasePath, ppCleanup, err := writeKeyToTmpfsDir(m.tmpfsDir, passphrase)
+	if err != nil {
+		return err
+	}
+	defer ppCleanup()
+
+	slotStr := fmt.Sprintf("%d", slot)
+
+	// Try adding directly; if the slot is occupied, kill and retry.
+	err = m.run.Run(ctx, "cryptsetup", "luksAddKey",
+		"--master-key-file", masterKeyPath,
+		"--key-slot", slotStr,
+		"--batch-mode",
+		device,
+		passphrasePath,
+	)
+	if err == nil {
+		return nil
+	}
+
+	// Slot may be occupied. Kill and retry. Log the original error for diagnostics.
+	log.Printf("luksAddKey slot %s on %s failed (will retry): %v", slotStr, device, err)
+	if killErr := m.run.Run(ctx, "cryptsetup", "luksKillSlot",
+		"--master-key-file", masterKeyPath,
+		"--batch-mode",
+		device,
+		slotStr,
+	); killErr != nil {
+		log.Printf("luksKillSlot %s on %s: %v", slotStr, device, killErr)
+	}
+	return m.run.Run(ctx, "cryptsetup", "luksAddKey",
+		"--master-key-file", masterKeyPath,
+		"--key-slot", slotStr,
+		"--batch-mode",
+		device,
+		passphrasePath,
+	)
+}
+
 // attachAppVolumeV3 attaches a v3 service-data volume using the pool keyfile.
 func (m *luksVolumeManager) attachAppVolumeV3(ctx context.Context, handle VolumeHandle, meta *volumeMetaV3, opts AttachOptions) error {
 	// Role check.

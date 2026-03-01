@@ -301,6 +301,16 @@ func (m *Module) Consensus() ConsensusManager {
 	return m.consensus
 }
 
+// ProvisionLUKSKeyslot adds or replaces a passphrase on the given LUKS keyslot
+// across all v3 volumes. No-op if the volume manager is not LUKS-based.
+func (m *Module) ProvisionLUKSKeyslot(ctx context.Context, slot int, passphrase []byte) error {
+	lvm, ok := m.volumes.(*luksVolumeManager)
+	if !ok {
+		return nil
+	}
+	return lvm.provisionKeyslotOnAllVolumes(ctx, slot, passphrase)
+}
+
 func (m *Module) setLockState(ctx context.Context, locked bool) error {
 	m.lockOpMu.Lock()
 	defer m.lockOpMu.Unlock()
