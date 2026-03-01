@@ -86,6 +86,7 @@ func (v *LUKSLoopVolume) Init(ctx context.Context, loopFile string, sizeBytes in
 	// Open, mkfs, close.
 	if err := v.run.Run(ctx, "cryptsetup", "open",
 		"--type", "luks2",
+		"--allow-discards",
 		"--key-file", keyPath,
 		loopDev, mapper,
 	); err != nil {
@@ -124,6 +125,7 @@ func (v *LUKSLoopVolume) Open(ctx context.Context, loopFile string, keyMaterial 
 
 	if err := v.run.Run(ctx, "cryptsetup", "open",
 		"--type", "luks2",
+		"--allow-discards",
 		"--key-file", keyPath,
 		loopDev, mapper,
 	); err != nil {

@@ -19,6 +19,9 @@ var configTemplate = template.Must(template.New("drbd").Parse(`resource {{.Name}
     options {
         auto-promote yes;
     }
+    disk {
+        rs-discard-granularity 65536; /* 64 KiB — matches dm-thin chunk size */
+    }
     on {{.Hostname}} {
         node-id {{.NodeID}};
         disk {{.BackingDevice}};

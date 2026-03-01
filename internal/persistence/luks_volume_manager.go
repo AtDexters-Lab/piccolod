@@ -491,7 +491,7 @@ func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeReque
 		return VolumeHandle{}, fmt.Errorf("create thin LV: %w", err)
 	}
 
-	// Build and open the device stack to get the DRBD device path.
+	// Build and open the device stack to get the top device path.
 	stack, err := m.buildStack(req.ID, lvName, sizeBytes)
 	if err != nil {
 		return VolumeHandle{}, fmt.Errorf("build device stack: %w", err)
@@ -501,22 +501,15 @@ func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeReque
 	}
 	defer stack.Close(ctx)
 
-	// Generate a random key and wrap it with SDEK.
-	keyMaterial, wrappedKey, nonce, err := m.generateWrappedKey(ctx)
-	if err != nil {
-		return VolumeHandle{}, err
-	}
-	defer cryptoutil.SecureZero(keyMaterial)
-
-	// LUKS format on the top device (DRBD).
+	// LUKS format with the shared master key (pool keyfile as passphrase).
 	topDev := stack.Top().Path()
-	mapper := "piccolo-vol-" + req.ID
-	if err := m.luksFormat(ctx, topDev, keyMaterial); err != nil {
+	if err := m.luksFormatWithMasterKey(ctx, topDev); err != nil {
 		return VolumeHandle{}, fmt.Errorf("luks format: %w", err)
 	}
 
 	// Open LUKS, mkfs, close.
-	if err := m.luksOpen(ctx, topDev, mapper, keyMaterial); err != nil {
+	mapper := "piccolo-vol-" + req.ID
+	if err := m.luksOpenWithPoolKeyfile(ctx, topDev, mapper); err != nil {
 		return VolumeHandle{}, fmt.Errorf("luks open for mkfs: %w", err)
 	}
 	mapperPath := "/dev/mapper/" + mapper
@@ -526,18 +519,16 @@ func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeReque
 		return VolumeHandle{}, fmt.Errorf("mkfs.ext4: %w", mkfsErr)
 	}
 
-	// Persist metadata.
-	meta := &volumeMetaV2{
-		Version:    metadataV2Version,
-		Type:       "luks-thinlv",
-		WrappedKey: wrappedKey,
-		Nonce:      nonce,
-		LVName:     lvName,
-		VGName:     lvm.DefaultVGName,
-		SizeBytes:  sizeBytes,
-		FSType:     "ext4",
+	// Persist v3 metadata.
+	meta := &volumeMetaV3{
+		Version:   metadataV3Version,
+		Type:      "service-data",
+		LVName:    lvName,
+		VGName:    lvm.DefaultVGName,
+		SizeBytes: sizeBytes,
+		FSType:    "ext4",
 	}
-	if err := writeVolumeMeta(filepath.Join(metaDir, metadataV2File), meta); err != nil {
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), meta); err != nil {
 		return VolumeHandle{}, fmt.Errorf("write metadata: %w", err)
 	}
 
@@ -730,27 +721,6 @@ func (m *luksVolumeManager) unwrapKey(ctx context.Context, wrappedKey, nonce str
 	return key, err
 }
 
-func (m *luksVolumeManager) luksFormat(ctx context.Context, device string, keyMaterial []byte) error {
-	keyPath, cleanup, err := writeKeyToTmpfsDir(m.tmpfsDir, keyMaterial)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	return m.run.Run(ctx, "cryptsetup", "luksFormat",
-		"--type", "luks2",
-		"--batch-mode",
-		"--label", "piccolo-vol",
-		"--cipher", "aes-xts-plain64",
-		"--key-size", "512",
-		"--hash", "sha256",
-		"--pbkdf", "pbkdf2",
-		"--pbkdf-force-iterations", "1000",
-		"--key-file", keyPath,
-		device,
-	)
-}
-
 func (m *luksVolumeManager) luksOpen(ctx context.Context, device, mapper string, keyMaterial []byte) error {
 	keyPath, cleanup, err := writeKeyToTmpfsDir(m.tmpfsDir, keyMaterial)
 	if err != nil {
@@ -875,7 +845,14 @@ func (m *luksVolumeManager) attachAppVolumeV3(ctx context.Context, handle Volume
 		m.mu.Unlock()
 		return fmt.Errorf("create mounts parent: %w", err)
 	}
-	_ = os.Chmod(mountsParent, 0o711)
+	if err := os.Chmod(mountsParent, 0o711); err != nil {
+		m.run.Run(ctx, "cryptsetup", "close", mapper)
+		stack.Close(ctx)
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("chmod mounts parent: %w", err)
+	}
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
 		m.run.Run(ctx, "cryptsetup", "close", mapper)
 		stack.Close(ctx)

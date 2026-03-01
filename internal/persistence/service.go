@@ -163,12 +163,6 @@ func NewService(opts Options) (*Module, error) {
 			return true
 		})
 	}
-	// Wire event bus for legacy file volume manager.
-	if fm, ok := mod.volumes.(*fileVolumeManager); ok {
-		if fm.bus == nil {
-			fm.bus = mod.events
-		}
-	}
 	if mod.devices == nil {
 		mod.devices = newNoopDeviceManager()
 	}
@@ -349,41 +343,6 @@ func (m *Module) setLockState(ctx context.Context, locked bool) error {
 	m.lockState = false
 	m.lockStateMu.Unlock()
 	return nil
-}
-
-// SwapControl allows wiring a real control store after construction.
-func (m *Module) SwapControl(store ControlStore) {
-	if store != nil {
-		m.control = store
-	}
-}
-
-// SwapVolumes allows wiring a real volume manager after construction.
-func (m *Module) SwapVolumes(manager VolumeManager) {
-	if manager != nil {
-		m.volumes = manager
-	}
-}
-
-// SwapDevices allows wiring a real device manager after construction.
-func (m *Module) SwapDevices(manager DeviceManager) {
-	if manager != nil {
-		m.devices = manager
-	}
-}
-
-// SwapStorageAdapter allows wiring a real storage adapter after construction.
-func (m *Module) SwapStorageAdapter(adapter StorageAdapter) {
-	if adapter != nil {
-		m.storage = adapter
-	}
-}
-
-// SwapConsensus allows wiring a real consensus manager after construction.
-func (m *Module) SwapConsensus(manager ConsensusManager) {
-	if manager != nil {
-		m.consensus = manager
-	}
 }
 
 // Shutdown terminates sub-components that require cleanup.

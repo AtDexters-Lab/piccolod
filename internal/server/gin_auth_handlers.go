@@ -432,7 +432,9 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 			return
 		}
 	}
-	// TODO(M3): per-volume LUKS admin password keyslot rotation.
+	// TODO: rotate LUKS keyslot 1 (admin-password-derived) on all volumes once
+	// keyslot provisioning is implemented. Currently only keyslot 0 (pool keyfile)
+	// exists, which is SDEK-wrapped — the Rewrap above covers the chain.
 	update := persistence.AuthStalenessUpdate{
 		PasswordStale:   boolPtr(false),
 		PasswordStaleAt: timePtr(time.Time{}),

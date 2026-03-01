@@ -213,6 +213,71 @@ func TestReadWriteVolumeMeta(t *testing.T) {
 	}
 }
 
+func TestReadWriteVolumeMetaV3_ServiceData(t *testing.T) {
+	dir := t.TempDir()
+	metaPath := filepath.Join(dir, metadataV2File)
+
+	meta := &volumeMetaV3{
+		Version:   metadataV3Version,
+		Type:      "service-data",
+		LVName:    "vol-app-nextcloud",
+		VGName:    "piccolo-data-vg",
+		SizeBytes: 10 << 30,
+		FSType:    "ext4",
+	}
+
+	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
+		t.Fatalf("writeVolumeMetaV3: %v", err)
+	}
+
+	// Verify version dispatch.
+	version, err := readVolumeMetaVersion(metaPath)
+	if err != nil {
+		t.Fatalf("readVolumeMetaVersion: %v", err)
+	}
+	if version != metadataV3Version {
+		t.Fatalf("version = %d, want %d", version, metadataV3Version)
+	}
+
+	got, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		t.Fatalf("readVolumeMetaV3: %v", err)
+	}
+
+	if got.Type != "service-data" {
+		t.Errorf("Type = %q, want service-data", got.Type)
+	}
+	if got.LVName != "vol-app-nextcloud" {
+		t.Errorf("LVName = %q, want vol-app-nextcloud", got.LVName)
+	}
+	if got.SizeBytes != 10<<30 {
+		t.Errorf("SizeBytes = %d", got.SizeBytes)
+	}
+	if got.FSType != "ext4" {
+		t.Errorf("FSType = %q, want ext4", got.FSType)
+	}
+}
+
+func TestReconcileAllVolumeStates_V3ServiceData(t *testing.T) {
+	core, _ := paths.SetRootsForTest(t)
+
+	mgr := &luksVolumeManager{stacks: nil}
+
+	// Create a v3 service-data volume metadata.
+	volDir := filepath.Join(core, "volumes", "app-nextcloud")
+	if err := os.MkdirAll(volDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"version":3,"type":"service-data","lv_name":"vol-app-nextcloud","vg_name":"piccolo-data-vg","size_bytes":10737418240,"fs_type":"ext4"}`
+	if err := os.WriteFile(filepath.Join(volDir, metadataV2File), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.ReconcileAllVolumeStates(); err != nil {
+		t.Fatalf("ReconcileAllVolumeStates: %v", err)
+	}
+}
+
 func TestReadVolumeMeta_InvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	metaPath := filepath.Join(dir, metadataV2File)

@@ -262,6 +262,9 @@ func TestResourceOps_WriteConfig(t *testing.T) {
 	if !strings.Contains(content, "auto-promote yes") {
 		t.Error("config missing auto-promote")
 	}
+	if !strings.Contains(content, "rs-discard-granularity 65536") {
+		t.Error("config missing rs-discard-granularity")
+	}
 	if !strings.Contains(content, "disk /dev/nbd0") {
 		t.Error("config missing backing device")
 	}
