@@ -1,15 +1,16 @@
-# RFC: Unified Block-Native Rootfs — Golden LV, Single LUKS Key
+# RFC: Unified Block-Native Rootfs — Golden LV, btrfs+zstd, Single LUKS Key
 
 **Date:** 2026-02-27
+**Updated:** 2026-03-01
 **Status:** Draft
 **Supersedes:** `20260101-workspace-disk-container-independent.md` (overlay-based workspace persistence)
 **Breaks:** This is a clean break from the current overlay-based rootfs and per-volume LUKS key model. No migration code, no dual-path logic. Existing volumes must be destroyed and recreated.
 
 ## 1. Summary
 
-Replace overlay-based container rootfs management (both workspace and service) with a unified golden LV architecture: a flattened OCI image on a dm-thin LV serves as a template, dm-thin snapshots provide per-container rootfs instances, and idmapped mounts handle UID translation. A single LUKS master key encrypts all volumes.
+Replace overlay-based container rootfs management (both workspace and service) with a unified golden LV architecture: a flattened OCI image on a dm-thin LV serves as a template, dm-thin snapshots provide per-container rootfs instances, and idmapped mounts handle UID translation. btrfs with zstd compression provides 2-3x storage reduction on all rootfs volumes. A single LUKS master key encrypts all volumes.
 
-This eliminates overlay filesystems, FUSE, fuse-overlayfs, `additionalimagestore`, and per-app `storage.conf` from the entire stack. Containers become thin wrappers around mounted block devices via `podman create --rootfs`.
+This eliminates overlay filesystems, FUSE, fuse-overlayfs, `additionalimagestore`, per-app `storage.conf`, and dm-vdo from the entire stack. Containers become thin wrappers around mounted block devices via `podman create --rootfs`.
 
 ## 2. Motivation
 
@@ -36,7 +37,7 @@ The FUSE workaround exists because of a fundamental UID range incompatibility in
 
 **fuse-overlayfs** solves this in userspace via `squash_to_uid` — arbitrary UID remapping unconstrained by kernel idmap bijectivity. But it's FUSE on the rootfs I/O path.
 
-**The golden LV approach** eliminates the problem entirely: flatten the image via `podman export | tar x --numeric-owner` to produce files with real UIDs (0, 33, etc.) on ext4. One idmap. No overlay. No UID range conflicts.
+**The golden LV approach** eliminates the problem entirely: flatten the image via `podman export | tar x --numeric-owner` to produce files with real UIDs (0, 33, etc.) on btrfs. One idmap. No overlay. No UID range conflicts.
 
 ### 2.3 Why Not VMs?
 
@@ -65,21 +66,23 @@ Additional: ~100MB RAM per VM kernel, TAP/bridge networking complexity, two runt
 3. **Instant workspace cloning** via dm-thin snapshots for AI agent forking
 4. **Multi-UID semantics preserved** via kernel idmapped mounts (no UID squashing)
 5. **Single LUKS key** — simplified key management, enables golden LV sharing
-6. **Service rootfs read-only** — correctness invariant for cluster (no divergence without DRBD)
+6. **Service rootfs always read-only** — unconditional correctness invariant for cluster (no divergence without DRBD, not configurable per-app)
 7. **DRBD + NBD always present** for replicated volumes (standalone on single-node)
-8. **No migration, no fallbacks** — clean break, hard fail if kernel features unavailable
+8. **Transparent compression** — btrfs+zstd on all rootfs volumes (A, B, C) for 2-3x storage reduction
+9. **No migration, no fallbacks** — clean break, hard fail if kernel features unavailable
 
 ## 3. Volume Types
 
 ### 3.1 Golden LV — Template (A)
 
-One golden LV per unique OCI image. Contains the flattened image on ext4.
+One golden LV per unique OCI image **digest**. Contains the flattened image on btrfs+zstd. Right-sized to actual image content (not a fixed size).
 
 ```
-dm-thin LV → LUKS → ext4 → flattened image
+dm-thin LV → LUKS → btrfs+zstd → flattened image
 ```
 
-- Created at first install of an image, shared by all containers using that image
+- Created at first install of an image, shared by all containers using that image digest
+- Multi-container service apps create multiple golden LVs (one per container image). Sidecar images (postgres, redis) shared across apps using the same digest.
 - Never mounted during normal operation (only during creation and image updates)
 - Not replicated (no NBD, no DRBD) — reconstructable from the OCI image at any time
 - Snapshots provide service rootfs (C) and workspace (B) instances
@@ -89,7 +92,7 @@ dm-thin LV → LUKS → ext4 → flattened image
 Snapshot of a golden LV. Contains the complete rootfs + user data. Replicated.
 
 ```
-dm-thin snapshot of A → NBD → DRBD → LUKS → ext4 (rw) → idmapped mount → podman --rootfs
+dm-thin snapshot of A → NBD → DRBD → LUKS → btrfs+zstd (rw) → idmapped mount → podman --rootfs
 ```
 
 - Single LV = rootfs + user data. No separate data volume.
@@ -102,7 +105,7 @@ dm-thin snapshot of A → NBD → DRBD → LUKS → ext4 (rw) → idmapped mount
 Snapshot of an existing workspace B at its current state. For AI agent forking.
 
 ```
-dm-thin snapshot of B → NBD → DRBD → LUKS → ext4 (rw) → idmapped mount → podman --rootfs
+dm-thin snapshot of B → NBD → DRBD → LUKS → btrfs+zstd (rw) → idmapped mount → podman --rootfs
 ```
 
 - Instant creation (dm-thin metadata operation)
@@ -114,13 +117,17 @@ dm-thin snapshot of B → NBD → DRBD → LUKS → ext4 (rw) → idmapped mount
 Read-only snapshot of a golden LV. Provides the immutable base filesystem for service containers.
 
 ```
-dm-thin snapshot of A → LUKS → ext4 (ro) → idmapped mount → podman --rootfs --read-only
+dm-thin snapshot of A → LUKS → btrfs+zstd (ro) → idmapped mount → podman --rootfs --read-only
 ```
 
-- **ext4 mounted read-only** — correctness invariant. Without DRBD, cluster nodes mount independent snapshots. Read-write would allow silent divergence between nodes.
+- **Always read-only** — unconditional correctness invariant, not configurable per-app. Without DRBD, cluster nodes mount independent snapshots. Read-write would allow silent divergence between nodes.
 - Not replicated (no NBD, no DRBD) — reconstructable from golden LV
-- Writable paths (`/tmp`, `/var/run`, `/dev/shm`) provided as tmpfs by podman
-- Persistent state lives on service data volume (D), bind-mounted into the container
+- Writable paths provided via:
+  - **tmpfs:** `/tmp`, `/run`, `/var/run`, `/var/tmp`, `/dev/shm` (podman defaults + app manifest `x-piccolo.tmpfs`)
+  - **Per-app tmpfs:** `~/.cache`, app-specific temp dirs (via `storage.temporary` in app manifest)
+  - **Persistent bind mounts:** from service data volume (D) at app-defined paths (via `storage.persistent` in app manifest)
+  - **Environment:** `PYTHONDONTWRITEBYTECODE=1` for Python apps (via `environment` in app manifest)
+- Apps that cannot function within this model (read-only rootfs + tmpfs + persistent bind mounts) are unsupported in service mode. Analysis of the top 50 self-hosted apps shows 53% work cleanly, 34% work with per-app writable mount configuration, and 13% are fundamentally incompatible (see §10 Risk 5).
 
 ### 3.5 Service Data (D)
 
@@ -137,20 +144,28 @@ dm-thin LV → NBD → DRBD → LUKS → ext4 (rw)
 
 | Volume | dm-thin | NBD | DRBD | LUKS | FS | Mode | Replicated |
 |--------|---------|-----|------|------|----|------|------------|
-| A (golden) | LV | — | — | yes | ext4 | template | No |
-| B (workspace) | snapshot of A | yes | yes | yes | ext4 rw | live | Yes |
-| B-clone | snapshot of B | yes | yes | yes | ext4 rw | live | Yes |
-| C (svc rootfs) | snapshot of A | — | — | yes | ext4 ro | live | No |
+| A (golden) | LV | — | — | yes | btrfs+zstd | template | No |
+| B (workspace) | snapshot of A | yes | yes | yes | btrfs+zstd rw | live | Yes |
+| B-clone | snapshot of B | yes | yes | yes | btrfs+zstd rw | live | Yes |
+| C (svc rootfs) | snapshot of A | — | — | yes | btrfs+zstd ro | live | No |
 | D (svc data) | LV | yes | yes | yes | ext4 rw | live | Yes |
 | Ephemeral | LV | — | — | — | btrfs+zstd | live | No |
 
 ## 4. Block Device Stack
 
-### 4.1 dm-vdo Removed
+### 4.1 Compression Strategy: btrfs+zstd (replaces dm-vdo)
 
-dm-vdo was originally planned above LUKS for transparent compression. **Removed** because the stacking order required by LUKS (dm-vdo above LUKS, above dm-thin) causes compound write amplification: VDO's allocate-on-write CoW compounds with dm-thin snapshot CoW. Red Hat recommends dm-thin above VDO, but our LUKS requirement forces the opposite order. The compression benefit (5-30 GB at piccolo's scale) doesn't justify the write amplification cost on workspaces, especially given SSD wear on edge hardware.
+dm-vdo was originally planned above LUKS for transparent compression. **Removed** because the stacking order required by LUKS (dm-vdo above LUKS, above dm-thin) causes compound write amplification: VDO's allocate-on-write CoW compounds with dm-thin snapshot CoW. Red Hat recommends dm-thin above VDO, but our LUKS requirement forces the opposite order. The compression benefit doesn't justify the 4-5x write amplification cost on workspaces, especially given SSD wear on edge hardware.
 
-**TRIM chain:** ext4 `mount -o discard` → LUKS `--allow-discards` → DRBD `rs-discard-granularity` → NBD `BLKDISCARD` → dm-thin deallocates. **Critical:** All `cryptsetup open` invocations MUST include `--allow-discards`. Without it, TRIM stops at LUKS and the thin pool fills monotonically — fatal on edge hardware with small storage.
+**Replacement: btrfs with zstd compression.** Filesystem-level compression without a separate dm target. Analysis of the top 50 self-hosted container images shows cross-image OCI layer deduplication saves only 2.7% (380 MB across 52 images, 581 layers), while filesystem compression saves 2-3x. Compression is the far more valuable optimization, and btrfs delivers it transparently:
+
+- **Read-only volumes (A, C):** zero CoW penalty. Compression is pure storage savings with no write amplification.
+- **Read-write volumes (B):** btrfs CoW on random writes adds ~1.3x write amplification — far less than VDO's 4-5x. Acceptable trade-off for 2-3x storage reduction. Per-file opt-out available via `chattr +C` for write-heavy paths if needed.
+- **Service data (D):** stays ext4. Application databases and data files don't benefit predictably from compression, and btrfs CoW is undesirable for database workloads.
+
+**Compression level: `zstd:1` everywhere.** Level 1 is ~2x faster than level 3 on writes with only ~5% less compression ratio. On NVMe-backed edge hardware, CPU overhead from higher compression levels can bottleneck I/O. Since all volume types (A, B, C) share the same golden LV as origin, a single compression level avoids mixed-level snapshots. Level 1 is the right trade-off: fast enough for workspace interactive writes, sufficient compression for storage reduction.
+
+**TRIM chain:** btrfs `mount -o discard=async` → LUKS `--allow-discards` → DRBD `rs-discard-granularity` → NBD `BLKDISCARD` → dm-thin deallocates. btrfs `discard=async` batches discards for better performance than synchronous discard. **Critical:** All `cryptsetup open` invocations MUST include `--allow-discards`. Without it, TRIM stops at LUKS and the thin pool fills monotonically — fatal on edge hardware with small storage.
 
 ### 4.2 Single LUKS Key
 
@@ -210,7 +225,7 @@ The only practical losses are per-volume crypto-shredding and single-key-leak bl
 
 ### 4.4 Idmapped Mounts
 
-piccolod (root, `CAP_SYS_ADMIN`) creates a user namespace to hold the UID map and applies it to the ext4 mount via `mount_setattr(MOUNT_ATTR_IDMAP)`.
+piccolod (root, `CAP_SYS_ADMIN`) creates a user namespace to hold the UID map and applies it to the btrfs mount via `mount_setattr(MOUNT_ATTR_IDMAP)`.
 
 #### 4.4.1 User Namespace Creation
 
@@ -262,18 +277,18 @@ This preserves multi-UID semantics: inside the container, `/etc` is owned by roo
 
 #### 4.4.4 No Kernel Fallback
 
-If `mount_setattr` returns `ENOSYS` or `EINVAL`, piccolod fails hard. No fuse-overlayfs fallback. MicroOS ships kernel 6.x (ext4 idmap stable since 5.12, overlay idmap since 5.19). Hard dependency is acceptable for the target platform.
+If `mount_setattr` returns `ENOSYS` or `EINVAL`, piccolod fails hard. No fuse-overlayfs fallback. MicroOS ships kernel 6.x (btrfs idmap stable since 5.15, overlay idmap since 5.19). Hard dependency is acceptable for the target platform.
 
 ## 5. Lifecycle
 
 ### 5.1 Golden LV Creation
 
-When a workspace or service is installed and no golden LV exists for the image:
+When a workspace or service is installed and no golden LV exists for the image digest:
 
 1. Check thin pool capacity — abort if data > 85% or metadata > 75%
-2. `lvcreate --thin` — new thin LV (default 10 GiB virtual, thin-provisioned)
+2. `lvcreate --thin` — new thin LV, right-sized to `max(image_size × 1.5, image_size + 1 GiB)`, thin-provisioned. Image size determined from `podman image inspect --format '{{.Size}}'` after pull (uncompressed virtual size). This intentionally over-allocates virtual size relative to on-disk usage after btrfs+zstd compression — the formula provides a safe upper bound. Since the LV is thin-provisioned, virtual over-allocation does not consume pool data space; only actual written blocks count against the thin pool. Right-sizing reduces DRBD sync bandwidth and thin pool waste compared to a fixed 10 GiB allocation.
 3. `cryptsetup luksFormat --master-key-file <shared-key>` → `luksOpen`
-4. `mkfs.ext4` on LUKS device, mount
+4. `mkfs.btrfs -f` on LUKS device, mount with `-o compress=zstd:1,discard=async,noatime`
 5. Write sentinel: `.piccolo_flatten_incomplete`
 6. Flatten image:
    ```
@@ -285,7 +300,7 @@ When a workspace or service is installed and no golden LV exists for the image:
 7. `syncfs(mount_fd)`
 8. Write golden LV metadata (`piccolo.volume.json`) via `fsutil.AtomicWriteFile`
 9. Remove `.piccolo_flatten_incomplete` sentinel
-10. Unmount ext4, close LUKS, deactivate LV
+10. Unmount btrfs, close LUKS, deactivate LV
 
 **Partial flatten recovery:** On startup, `ReconcileAllVolumeStates` destroys golden LVs with `.piccolo_flatten_incomplete` present. Sentinel written before extraction, removed after fsync.
 
@@ -293,10 +308,12 @@ When a workspace or service is installed and no golden LV exists for the image:
 
 When a pulled image has a new digest for the same ref:
 
-1. Create a NEW golden LV for the new digest (§5.1)
-2. For each service using the old golden LV: stop container → destroy old C snapshot → create new C snapshot from new golden LV → restart
+1. Create a NEW golden LV for the new digest (§5.1) — happens in background while existing containers continue running
+2. Stop affected containers, destroy old C snapshots, create new C snapshots from new golden LV, restart
 3. Workspaces are NOT affected — B is a diverged snapshot with user data. Users create new workspaces from the updated image if desired.
 4. Once no snapshots reference the old golden LV, garbage collect it (§5.3)
+
+**Multi-container service apps:** When multiple container images update in a multi-container service (e.g., app + postgres sidecar), new golden LVs are created in the background for all updated images while the pod runs. The pod stops once for snapshot rotation: each container's C snapshot is destroyed and re-created from its new golden LV, then the pod restarts. If a snapshot re-creation fails mid-way, the pod restarts with a mix of old and new snapshots — manual rollback available but not automatic. Atomic all-or-nothing across multiple images is not provided.
 
 ### 5.3 Golden LV Garbage Collection
 
@@ -309,7 +326,7 @@ On startup and after service/workspace uninstalls, scan for golden LVs with zero
 3. `lvchange -ay <vg>/ws-<id>` — activate snapshot
 4. `cryptsetup luksUUID --uuid $(uuidgen) /dev/<vg>/ws-<id>` — unique UUID (avoids collision with golden LV and other snapshots). If UUID assignment fails, destroy the snapshot LV immediately (`lvremove`) to prevent two LVs with identical LUKS UUIDs.
 5. Write workspace metadata
-6. Attach: NBD → DRBD (standalone) → `cryptsetup open --allow-discards` → `mount -o discard ext4` → idmapped mount
+6. Attach: NBD → DRBD (standalone) → `cryptsetup open --allow-discards` → `mount -o compress=zstd:1,discard=async,noatime` → idmapped mount
 7. `podman create --rootfs <idmapped-path>`
 
 ### 5.5 Workspace Cloning
@@ -344,27 +361,43 @@ If UUID assignment fails, destroy the clone LV immediately.
 2. `lvcreate --snapshot --name svc-rootfs-<id> <vg>/golden-<image-id>`
 3. `cryptsetup luksUUID --uuid $(uuidgen) /dev/<vg>/svc-rootfs-<id>` — if UUID assignment fails, destroy the snapshot LV immediately (`lvremove`)
 4. Write service rootfs metadata
-5. Attach: `cryptsetup open --allow-discards` → `mount -o ro,discard ext4` → idmapped mount
+5. Attach: `cryptsetup open --allow-discards` → `mount -o ro,compress=zstd:1,discard=async,noatime` → idmapped mount
 6. `podman create --rootfs <idmapped-path> --read-only`
 
-**Writable paths:** Podman provides tmpfs for `/tmp`, `/var/run`, `/dev/shm`. Additional writable mounts configured per-app (bind mounts from data volume D). This is standard read-only root filesystem behavior (same as Kubernetes `readOnlyRootFilesystem: true`).
+**Host-level read-only mount:** The btrfs mount is truly ro at the host level (not just container-level `--read-only`). This works because the flattened image from `podman export` already contains all standard OCI runtime bind mount targets (`/etc/resolv.conf`, `/etc/hostname`, `/etc/hosts`, `/etc/mtab`). Runc/crun bind-mounts over these existing paths — it does not need to create them. The `/piccolo` bind mount directory (for `boot.sh`, config) is workspace-only; workspaces (B) mount rw.
+
+**Writable paths:** Podman provides tmpfs for `/tmp`, `/var/run`, `/dev/shm`. Additional writable mounts configured per-app via the app manifest: `x-piccolo.tmpfs` for additional tmpfs paths, `storage.temporary` for ephemeral writable dirs, `storage.persistent` for durable bind mounts from data volume (D), and `environment` for runtime flags like `PYTHONDONTWRITEBYTECODE=1`. This is standard read-only root filesystem behavior (same as Kubernetes `readOnlyRootFilesystem: true`).
 
 ### 5.7 Replication
 
 Workspace (B) and service data (D) volumes use the full replication stack:
 
 ```
-thin LV → NBD → DRBD → LUKS → ext4
+thin LV → NBD → DRBD → LUKS → btrfs+zstd (B) or ext4 (D)
 ```
 
 One DRBD resource per volume. Since workspaces are now a single LV (not rootfs + data), replication is simpler — one resource covers the entire workspace state.
+
+#### 5.7.1 DRBD Skip-Sync for Workspaces
+
+When a workspace is created on a two-node cluster, the peer must have an identical starting point to avoid a full initial sync of the entire LV.
+
+**Optimization:** Block-copy the golden LV's thin LV data to the peer once per unique image digest. When creating a workspace snapshot on both nodes from byte-identical golden LVs, the initial snapshot content is byte-identical. DRBD can skip the initial sync:
+
+1. Block-copy the golden LV to the peer (once per unique image digest). The primary node streams the golden LV's LUKS ciphertext via a temporary NBD export; the peer writes it to a local thin LV of the same size. This ensures byte-identical golden LVs on both nodes.
+2. Create workspace snapshot on both nodes from their respective local golden LVs
+3. `drbdadm new-current-uuid --clear-bitmap <resource>` — tells DRBD both sides are identical, skip initial sync
+
+**Why block-copy, not independent reconstruction:** Two independent `mkfs.btrfs` + `tar x` operations on separate nodes will NOT produce byte-identical LVs. btrfs generates random filesystem UUIDs, non-deterministic metadata block allocation, and compression-dependent extent placement. `--clear-bitmap` with diverged content causes silent data corruption — DRBD will not detect the mismatch. Block-copy is the only safe path for skip-sync.
+
+**Bandwidth reduction:** Without skip-sync, every workspace creation triggers a full DRBD sync of `LV_size` bytes. With skip-sync, only the golden LV needs to be shipped once per unique image. For N workspaces from the same image: sync cost drops from `N × LV_size` to `1 × image_size`. At typical scale (3-5 workspaces per image, 2-5 unique images), this is ~8x bandwidth reduction.
 
 ### 5.8 Teardown Sequence
 
 **Workspace / service data (B, D):**
 1. Stop container (`podman stop --timeout 30`, force-kill if needed)
 2. Unmount idmapped bind mount (if applicable). EBUSY → `MNT_DETACH`.
-3. Unmount ext4
+3. Unmount btrfs (B) or ext4 (D)
 4. Close LUKS mapper
 5. DRBD down (if cluster)
 6. NBD disconnect
@@ -373,11 +406,11 @@ One DRBD resource per volume. Since workspaces are now a single LV (not rootfs +
 **Service rootfs (C):**
 1. Stop container
 2. Unmount idmapped bind mount
-3. Unmount ext4 (ro)
+3. Unmount btrfs (ro)
 4. Close LUKS mapper
 5. Deactivate thin LV
 
-**Crash recovery and mount discovery:** Idmapped mounts survive piccolod crashes (they are kernel mount state, not process state). On restart, `ReconcileAllVolumeStates` discovers existing mounts by scanning `/proc/self/mountinfo` for active mount entries at known paths (`/piccolo-core/mounts/<vol-id>`). If a mount is already active, the attachment sequence skips the mount steps and reuses it. For partially-attached stacks (e.g., LUKS open but ext4 not mounted), reconciliation tears down to a known-clean state (close all layers) and re-attaches from scratch. The golden LV sentinel check (`.piccolo_flatten_incomplete`) also performs a full teardown of any partially-attached golden LV stack before `lvremove`.
+**Crash recovery and mount discovery:** Idmapped mounts survive piccolod crashes (they are kernel mount state, not process state). On restart, `ReconcileAllVolumeStates` discovers existing mounts by scanning `/proc/self/mountinfo` for active mount entries at known paths (`/piccolo-core/mounts/<vol-id>`). If a mount is already active, the attachment sequence skips the mount steps and reuses it. For partially-attached stacks (e.g., LUKS open but btrfs not mounted), reconciliation tears down to a known-clean state (close all layers) and re-attaches from scratch. The golden LV sentinel check (`.piccolo_flatten_incomplete`) also performs a full teardown of any partially-attached golden LV stack before `lvremove`.
 
 ## 6. Alternatives Considered
 
@@ -404,6 +437,16 @@ See §4.2 threat model analysis. Per-volume keys provide crypto-shredding and re
 
 containerd plugin for block-level OCI layers. Rejected: not podman-native, heavy integration, low ROI at piccolo's app count.
 
+### 6.5 Podman Native Storage for Services
+
+Considered using standard podman overlay storage for service containers, keeping the golden LV architecture only for workspaces. This would preserve OCI layer deduplication across images.
+
+**Not chosen because:** Analysis of the top 50 self-hosted container images (52 images, 581 layers) shows cross-image OCI layer deduplication saves only 2.7% — 380 MB out of 13.63 GB. Meanwhile, podman stores pulled images uncompressed on disk, while btrfs+zstd compresses 2-3x. The unified golden LV + btrfs architecture saves far more storage than layer dedup, and eliminates a separate code path for service rootfs management.
+
+### 6.6 dm-vdo for Compression
+
+See §4.1. VDO's allocate-on-write CoW compounds with dm-thin snapshot CoW, causing 4-5x write amplification on workspaces. btrfs+zstd delivers the same compression benefit at the filesystem level with ~1.3x write amplification (and zero for read-only volumes).
+
 ## 7. Volume Metadata Schema
 
 ### 7.1 Global LUKS Key (in control plane)
@@ -428,13 +471,15 @@ One entry in the control plane. All volumes reference this key.
   "type": "golden",
   "lv_name": "golden-ubuntu-22.04-abc123",
   "vg_name": "piccolo-data-vg",
-  "size_bytes": 10737418240,
-  "fs_type": "ext4",
+  "size_bytes": 2147483648,
+  "fs_type": "btrfs",
 
   "base_image_digest": "docker.io/library/ubuntu@sha256:...",
   "base_image_ref": "ubuntu:22.04"
 }
 ```
+
+`size_bytes` is right-sized per §5.1 step 2. Reflects actual image size + headroom, not a fixed allocation.
 
 ### 7.3 Workspace Metadata
 
@@ -444,8 +489,8 @@ One entry in the control plane. All volumes reference this key.
   "type": "workspace",
   "lv_name": "ws-code-server-abc123",
   "vg_name": "piccolo-data-vg",
-  "size_bytes": 10737418240,
-  "fs_type": "ext4",
+  "size_bytes": 2147483648,
+  "fs_type": "btrfs",
 
   "golden_lv": "golden-ubuntu-22.04-abc123",
   "base_image_digest": "docker.io/library/ubuntu@sha256:...",
@@ -470,7 +515,7 @@ One entry in the control plane. All volumes reference this key.
   "type": "service-rootfs",
   "lv_name": "svc-rootfs-nextcloud-abc123",
   "vg_name": "piccolo-data-vg",
-  "fs_type": "ext4",
+  "fs_type": "btrfs",
 
   "golden_lv": "golden-nextcloud-abc123",
   "read_only": true,
@@ -514,11 +559,13 @@ One entry in the control plane. All volumes reference this key.
 ### Phase 1: Syscall Integration
 
 - `internal/fsutil/idmap.go` — `mount_setattr` wrapper, userns creation, UID map construction
-- Integration tests (root required): idmapped ext4 mount
+- Integration tests (root required): idmapped btrfs mount
 - ~150 lines of Go
 
 ### Phase 2: Golden LV and Workspace Lifecycle
 
+- Migrate `rootfs_volume_manager.go` from ext4 to btrfs+zstd: `mkfs.ext4` → `mkfs.btrfs`, mount options → `compress=zstd:1,discard=async,noatime`, service rootfs mount → host-level ro
+- Update `idmap.go` kernel version comment: 5.12 → 5.15 (btrfs idmap)
 - Golden LV manager: create, flatten, update, garbage collect
 - Workspace creation from golden LV snapshot
 - `podman create --rootfs` integration with idmapped mounts
@@ -540,14 +587,16 @@ One entry in the control plane. All volumes reference this key.
 - Remove fuse-overlayfs dependency entirely
 - Remove `additionalimagestore` configuration
 - Remove per-app `storage.conf` mount_program/force_mask
+- Remove dm-vdo package (`internal/storage/vdo/`)
 - Update alpha test suite
 
 ## 9. What This Eliminates
 
 | Removed | Replaced by |
 |---------|-------------|
-| fuse-overlayfs (both modes) | ext4 + idmapped mount |
+| fuse-overlayfs (both modes) | btrfs + idmapped mount |
 | overlayfs entirely | dm-thin snapshot = writable layer |
+| dm-vdo (compression) | btrfs+zstd (filesystem-level compression) |
 | `additionalimagestore` config | Golden LV (shared image template) |
 | Per-app `storage.conf` with `mount_program` | `podman --rootfs` (bypasses storage driver) |
 | `workspacedisk/` overlay machinery (~500 lines) | dm-thin snapshot + mount (~150 lines) |
@@ -558,7 +607,7 @@ One entry in the control plane. All volumes reference this key.
 
 ## 10. Risks
 
-1. **`mount_setattr` hard dependency.** Kernel 5.12+ for ext4 idmap. MicroOS ships 6.x — no risk for target platform. No fallback by design.
+1. **`mount_setattr` hard dependency.** Kernel 5.15+ for btrfs idmap. MicroOS ships 6.x — no risk for target platform. No fallback by design.
 
 2. **`podman --rootfs` limitations.** OCI image config (ENTRYPOINT, CMD, ENV) not applied by `--rootfs`. Already handled — `meta.json` stores image config, container creation applies it explicitly.
 
@@ -566,22 +615,25 @@ One entry in the control plane. All volumes reference this key.
 
 4. **Single LUKS key blast radius.** Key leak from RAM exposes all volumes. Mitigated: if attacker has RAM access, they have process access → SDEK → all keys anyway. See §4.2.
 
-5. **Service rootfs writable paths.** Containers expecting to write to rootfs paths not covered by tmpfs/bind mounts will get EROFS. Requires per-image analysis of writable path needs. Standard practice for read-only root filesystem containers.
+5. **Service rootfs read-only compatibility.** Read-only rootfs is unconditional — no per-app opt-out. Analysis of the top 50 self-hosted container images: 25 apps (53%) work cleanly with read-only rootfs + tmpfs + data volume. 16 apps (34%) need per-app writable mount configuration in the app manifest (additional tmpfs paths, persistent bind mounts from D at specific rootfs locations, environment variables). 6 apps (13%) are fundamentally incompatible (Nextcloud, BookStack, Home Assistant, Pi-hole, Dockge, Hoarder) — these are either replaceable (AdGuard Home over Pi-hole), solvable by bind-mounting writable subtrees from D (Nextcloud's entrypoint populates an empty `/var/www/html` from `/usr/src/nextcloud/`), or can run as workspaces if users require them. This is a deliberate trade-off: unconditional read-only rootfs eliminates a code branch and preserves the cluster correctness invariant (§2.4 goal 6).
 
-6. **Golden LV storage.** One golden LV per unique image, even if only one container uses it. At ~1-3 GiB per image (thin-provisioned), this is acceptable for piccolo's app count (5-20 apps).
+6. **Golden LV storage.** One golden LV per unique image digest. With btrfs+zstd compression, typical images occupy 0.3-1.5 GiB (compressed, thin-provisioned). Right-sizing (§5.1) avoids over-allocation. Acceptable for piccolo's app count (5-20 apps, fewer unique image digests due to sidecar sharing).
 
 7. **Image update coordination.** Updating a golden LV requires stopping all service containers using it, re-creating snapshots, and restarting. More involved than `podman pull` + restart. Acceptable because image updates are infrequent and the coordination is automatable.
+
+8. **btrfs CoW write amplification on workspaces.** btrfs CoW on random writes adds ~1.3x write amplification compared to ext4. This is a deliberate trade-off: 2-3x storage reduction from compression outweighs the modest write amplification. VDO's alternative was 4-5x — btrfs is far better. For write-heavy paths (databases, build caches), per-file opt-out is available via `chattr +C` (disables CoW and compression for that file). Read-only volumes (A, C) have zero CoW penalty.
 
 ## 11. Operational Readiness
 
 ### 11.1 Observability
 
 ```
-INFO: golden-lv <id>: flatten started (image=<ref>)
-INFO: golden-lv <id>: flatten complete (<duration>, <bytes>)
+INFO: golden-lv <id>: flatten started (image=<ref>, digest=<digest>)
+INFO: golden-lv <id>: flatten complete (<duration>, <bytes> raw, <bytes> compressed)
 INFO: workspace <id>: created from golden-lv <golden-id> (snapshot, instant)
 INFO: workspace <id>: idmapped mount at <path> (uid_map: 0→<host_uid>, 1-65535→<subuid_start>)
 INFO: workspace <id>: clone <clone-id> created (snapshot, instant)
+INFO: workspace <id>: DRBD skip-sync — golden LV already on peer
 INFO: service-rootfs <id>: created from golden-lv <golden-id> (snapshot, read-only)
 INFO: service-data <id>: created (fresh thin LV, <size>)
 ERROR: golden-lv <id>: flatten interrupted, marked for cleanup
@@ -590,7 +642,7 @@ ERROR: mount_setattr failed: <errno translation> — piccolod cannot start
 
 ### 11.2 Error Translation
 
-- `ENOSYS` → "kernel does not support idmapped mounts (need 5.12+) — cannot proceed"
+- `ENOSYS` → "kernel does not support idmapped mounts (need 5.15+) — cannot proceed"
 - `EINVAL` → "invalid UID map — check subuid allocation for <username>"
 - `EPERM` → "missing CAP_SYS_ADMIN — piccolod must run as root"
 
@@ -598,6 +650,7 @@ ERROR: mount_setattr failed: <errno translation> — piccolod cannot start
 
 Expose via storage inspection API:
 - Golden LV inventory: image ref, digest, compressed size, snapshot count
-- Per-volume: type, LV name, LUKS mapper, mount status
+- Per-volume: type, LV name, LUKS mapper, mount status, fs type
 - Thin pool: data%, metadata%, per-type breakdown (golden, workspace, service-rootfs, service-data, ephemeral)
 - Clone relationships: origin → clone graph
+- Compression ratio: per-volume btrfs compression stats (`btrfs filesystem df`)
