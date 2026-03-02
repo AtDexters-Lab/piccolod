@@ -1758,9 +1758,8 @@ func TestPodmanImageRuntime(t *testing.T) {
 		t.Fatalf("NewAppManager: %v", err)
 	}
 
-	// Inject a test image runtime — the imagestore IS the graphRoot now.
-	// No separate --imagestore flag; per-app runtimes reference this root
-	// via additionalimagestores for read-only access.
+	// Inject a test image runtime — the imagestore IS the graphRoot.
+	// Used for golden LV image preparation.
 	expectedRoot := filepath.Join(tempDir, "podman", "imagestore")
 	mgr.SetImageRuntimeForTest(container.PodmanRuntime{
 		Root:          expectedRoot,

@@ -218,8 +218,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 
 	// Pull network anchor image directly into the per-app user's graphroot.
-	// We do NOT use additionalimagestores because native overlay in rootless user
-	// namespaces cannot access layers owned by a different user (UIDs unmapped).
 	// The pause image is tiny (~500KB), so per-app duplication is negligible.
 	if err := m.containerManager.PullImage(ctx, runtime, networkAnchorImage()); err != nil {
 		return nil, fmt.Errorf("network anchor image pull failed: %w", err)

@@ -260,9 +260,6 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 
 	// Per-app users store images (network anchor) in their own graphroot.
 	// Service containers use --rootfs from golden LV snapshots, bypassing podman storage.
-	// additionalimagestores is NOT used: native overlay in rootless user namespaces
-	// cannot access layers owned by a different user (UIDs are unmapped inside
-	// the user namespace, causing permission denied on overlay mount).
 	serviceRoot, err := m.ensureServiceRoot(instanceID, cred)
 	if err != nil {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
@@ -341,15 +338,12 @@ func cleanStaleUIDStorage(dir string, expectedUID int) {
 // podmanImageRuntime returns a shared PodmanRuntime for base image operations across
 // all app types (pull, inspect, exists, mount, unmount, remove).
 //
-// Uses the kernel overlay driver, matching the per-app service-mode runtimes.
-// additionalimagestores requires the same storage driver across all stores.
-// Overlay provides layer deduplication — 10 apps using the same base image
-// store only 1 copy.
+// Uses the kernel overlay driver. Overlay provides layer deduplication —
+// 10 apps using the same base image store only 1 copy.
 //
 // The shared imagestore directory IS the graphRoot (--root) of this runtime.
-// This creates a self-contained containers/storage store that per-app runtimes
-// reference via additionalimagestores for read-only access.
-// Container operations (create, start, stop) continue to use per-app runtimes.
+// Golden LV images are prepared here and then snapshotted per-app via LVM.
+// Container operations (create, start, stop) use per-app runtimes.
 // Result is cached via sync.Once.
 func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
 	m.imageRuntimeOnce.Do(func() {
@@ -359,8 +353,8 @@ func (m *AppManager) podmanImageRuntime() (container.PodmanRuntime, error) {
 			return
 		}
 
-		// The imagestore IS the graphRoot — a single self-contained store that
-		// per-app runtimes access via additionalimagestores.
+		// The imagestore IS the graphRoot — a single self-contained store used
+		// for golden LV image preparation.
 		imagestore, err := ensureImagestoreDir()
 		if err != nil {
 			m.imageRuntimeErr = fmt.Errorf("app manager: image runtime: %w", err)
@@ -559,7 +553,7 @@ func (m *AppManager) fixImagestoreAccess() {
 }
 
 // pullToImagestore pulls an image to the shared imagestore and fixes
-// group permissions so per-app users can read it via additionalimagestores.
+// group permissions for golden LV preparation.
 // If onProgress is non-nil, it receives real-time pull progress reports;
 // otherwise a default logging callback is used.
 func (m *AppManager) pullToImagestore(ctx context.Context, image string, onProgress func(container.ImagePullReport)) error {

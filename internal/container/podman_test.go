@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -851,51 +850,4 @@ func TestPullProgressParser_ShouldCallback(t *testing.T) {
 	}
 }
 
-func TestEnsureAdditionalStoresConf(t *testing.T) {
-	root := t.TempDir()
-	runRoot := t.TempDir()
-
-	rt := PodmanRuntime{
-		Root:                  root,
-		RunRoot:               runRoot,
-		StorageDriver:         "overlay",
-		AdditionalImageStores: []string{"/data/imagestore"},
-	}
-
-	confPath, err := ensureAdditionalStoresConf(rt)
-	if err != nil {
-		t.Fatalf("ensureAdditionalStoresConf: %v", err)
-	}
-
-	data, err := os.ReadFile(confPath)
-	if err != nil {
-		t.Fatalf("read conf: %v", err)
-	}
-
-	got := string(data)
-	if !strings.Contains(got, `driver = "overlay"`) {
-		t.Errorf("missing driver in conf:\n%s", got)
-	}
-	if !strings.Contains(got, fmt.Sprintf(`graphroot = %q`, root)) {
-		t.Errorf("missing graphroot in conf:\n%s", got)
-	}
-	if !strings.Contains(got, fmt.Sprintf(`runroot = %q`, runRoot)) {
-		t.Errorf("missing runroot in conf:\n%s", got)
-	}
-	if !strings.Contains(got, `additionalimagestores = ["/data/imagestore"]`) {
-		t.Errorf("missing additionalimagestores in conf:\n%s", got)
-	}
-	if strings.Contains(got, "mount_program") {
-		t.Errorf("conf should not contain mount_program (native overlay only):\n%s", got)
-	}
-
-	// Idempotent: calling again should not error.
-	confPath2, err := ensureAdditionalStoresConf(rt)
-	if err != nil {
-		t.Fatalf("second call: %v", err)
-	}
-	if confPath2 != confPath {
-		t.Errorf("path changed: %q vs %q", confPath, confPath2)
-	}
-}
 
