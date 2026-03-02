@@ -70,6 +70,7 @@ Additional: ~100MB RAM per VM kernel, TAP/bridge networking complexity, two runt
 7. **DRBD + NBD always present** for replicated volumes (standalone on single-node)
 8. **Transparent compression** — btrfs+zstd on all rootfs volumes (A, B, C) for 2-3x storage reduction
 9. **No migration, no fallbacks** — clean break, hard fail if kernel features unavailable
+10. **Self-healing integrity** — NBD hash verification + cold tier recall detects and corrects block corruption transparently
 
 ## 3. Volume Types
 
@@ -84,7 +85,7 @@ dm-thin LV → LUKS → btrfs+zstd → flattened image
 - Created at first install of an image, shared by all containers using that image digest
 - Multi-container service apps create multiple golden LVs (one per container image). Sidecar images (postgres, redis) shared across apps using the same digest.
 - Never mounted during normal operation (only during creation and image updates)
-- Not replicated (no NBD, no DRBD) — reconstructable from the OCI image at any time
+- Not replicated via DRBD (no NBD, no DRBD in normal stack). Cold-tiered as an opaque binary blob after creation (§4.5). Reconstructable from cold-tiered copy; re-pull + re-flatten is the last-resort fallback but produces a non-byte-identical LV.
 - Snapshots provide service rootfs (C) and workspace (B) instances
 
 ### 3.2 Workspace (B)
@@ -185,10 +186,18 @@ The master key is stored once in the control plane, wrapped by SDEK. Every volum
 
 Since the master key is the same, all keyslots are functionally identical across volumes.
 
+**Cipher mode: `aes-xts-plain64` (encryption only, no AEAD).** LUKS AEAD (`--integrity`) adds dm-integrity underneath for per-sector authentication tags. This is removed because:
+
+- **btrfs volumes (A, B, C):** btrfs already checksums every data and metadata block (crc32c). dm-integrity is redundant — double integrity checking with ~10-20% write overhead and ~3% storage overhead for tags.
+- **ext4 volumes (D):** dm-integrity would detect corruption but cannot correct it — there's no local redundant copy. The only recovery path (DRBD peer or cold tier) is the same whether corruption is detected by dm-integrity or by application-level checksums (PostgreSQL page checksums, SQLite WAL checksums).
+- **NBD integrity verification (§4.6)** replaces LUKS AEAD with a strictly better model: detection via hash verification + automatic correction via cold tier recall. LUKS AEAD only detects (`EIO`); NBD self-heals.
+
+All `cryptsetup luksFormat` commands use `--cipher aes-xts-plain64 --key-size 512` (256-bit AES in XTS mode). No `--integrity` flag.
+
 **Volume creation with shared key:**
-- Golden LV (A): `cryptsetup luksFormat --master-key-file <shared-key>`, add keyslots 1 and 2
+- Golden LV (A): `cryptsetup luksFormat --cipher aes-xts-plain64 --key-size 512 --master-key-file <shared-key>`, add keyslots 1 and 2
 - Snapshots (B, C): inherit LUKS header from A. Change UUID only (`cryptsetup luksUUID`)
-- Fresh volumes (D): `cryptsetup luksFormat --master-key-file <shared-key>`, add keyslots
+- Fresh volumes (D): `cryptsetup luksFormat --cipher aes-xts-plain64 --key-size 512 --master-key-file <shared-key>`, add keyslots
 
 **Threat model analysis:**
 
@@ -278,6 +287,70 @@ This preserves multi-UID semantics: inside the container, `/etc` is owned by roo
 #### 4.4.4 No Kernel Fallback
 
 If `mount_setattr` returns `ENOSYS` or `EINVAL`, piccolod fails hard. No fuse-overlayfs fallback. MicroOS ships kernel 6.x (btrfs idmap stable since 5.15, overlay idmap since 5.19). Hard dependency is acceptable for the target platform.
+
+### 4.5 Golden LV Cold Tiering
+
+Golden LVs are **non-reproducible binary artifacts**. Two independent `mkfs.btrfs` + `tar x` operations on the same OCI image will NOT produce byte-identical LVs — btrfs generates random filesystem UUIDs, non-deterministic metadata block allocation, and compression-dependent extent placement (see §5.7.1). This has two consequences:
+
+1. **Disaster recovery requires the original golden LV bytes.** Workspace snapshots (B) are dm-thin snapshots that share unmodified blocks with their golden LV origin. Recovering a workspace from cold tier requires applying the cold-tiered delta onto a byte-identical golden LV base. A re-pulled and re-flattened golden LV has different block layout — applying the old delta on a new base corrupts the filesystem.
+
+2. **Self-sovereignty.** If an upstream registry goes down, rate-limits, or removes an image, the cold-tiered golden LV is the sovereign copy of the app's rootfs. Without it, a disk failure + registry outage = unrecoverable app with no fallback.
+
+**Mechanism:** After golden LV creation (§5.1), the golden LV is cold-tiered as a one-time opaque blob upload, keyed by image digest. This is NOT via NBD/DRBD — golden LVs have no NBD or DRBD in their stack. It is a separate fire-and-forget block-copy to cold storage:
+
+1. Golden LV creation completes (§5.1 steps 1-10)
+2. Reactivate LV, stream raw LUKS ciphertext blocks to cold storage
+3. Cold storage stores blob keyed by `<image-digest>:<golden-lv-size>`
+4. Deactivate LV. Done — no ongoing replication.
+
+**Properties:**
+- Immutable after creation — write once, never modified. Ideal cold tier candidate.
+- Small — compressed image size, typically 0.3-1.5 GiB per unique image digest.
+- Shared — one golden LV per unique digest serves all workspaces and services using that image.
+- Recall is rare — only needed on disk failure recovery or peer node provisioning (§5.7.1).
+
+**Interaction with §5.7.1 (DRBD skip-sync):** The golden LV block-copy to the peer node and the golden LV cold-tier upload are the same operation conceptually — shipping the opaque blob to a different destination. In a two-node cluster, the golden LV is shipped to both the peer and cold storage.
+
+### 4.6 NBD Integrity Verification
+
+NBD provides read-time block integrity verification with automatic self-healing via cold tier recall. This replaces LUKS AEAD (§4.2) with a strictly better model: detection + correction instead of detection-only.
+
+**How it works:**
+
+```
+Write path:
+  App writes block X → NBD stores locally (dm-thin)
+                      → NBD computes hash(X), stores in hash index
+                      → NBD async-ships block X to cold tier
+
+Read path:
+  App reads block X → NBD reads from local dm-thin
+                    → NBD verifies hash(X) against stored hash
+                    → Match: serve block
+                    → Mismatch: recall block from cold tier, repair local copy, serve correct data
+```
+
+**Hash function:** xxhash64 — ~10 GB/s on modern CPUs, negligible compared to NVMe latency. 8 bytes per 4K block = ~20 MiB hash index per 10 GiB volume. Not cryptographic (not adversarial threat model — this detects bit rot, not tampering; LUKS encryption handles confidentiality).
+
+**Why NBD is the right layer:**
+
+| Layer | Detects corruption | Corrects corruption |
+|-------|-------------------|-------------------|
+| btrfs checksums | Yes | No (single disk, no RAID) |
+| LUKS AEAD | Yes (returns `EIO`) | No |
+| NBD hash + cold recall | Yes | **Yes** (transparent recall) |
+
+NBD is the only layer with access to both the local data AND an alternative source (cold tier). btrfs detects but can't fix. LUKS AEAD detects but can't fix. NBD detects AND fixes.
+
+**Verification modes:**
+- **Every read** — safest, catches corruption immediately. Hash verification adds ~100ns per 4K block (xxhash64). Acceptable for interactive workloads.
+- **Background scrub** — periodic full scan of all local blocks against hash index. Catches latent corruption before it's accessed. Runs during idle periods.
+
+**Correction window:** Between write and cold-tier-ship, a corrupted block is detectable (hash mismatch) but not correctable — the cold tier doesn't have a copy yet. During this window, NBD behavior matches LUKS AEAD (returns `EIO`). Once the block is cold-tiered, self-healing activates.
+
+**Applies to:** All volumes with NBD in the stack — B (workspace), D (service data). This fills the ext4 integrity gap on D volumes: ext4 has no native data checksumming, and LUKS AEAD is removed (§4.2). NBD integrity verification provides the safety net.
+
+**Does not apply to:** A (golden), C (service rootfs), Ephemeral — these have no NBD. A and C rely on btrfs checksums for detection; correction is via re-creation from cold-tiered golden LV (A) or re-snapshot from golden LV (C).
 
 ## 5. Lifecycle
 
@@ -447,6 +520,16 @@ Considered using standard podman overlay storage for service containers, keeping
 
 See §4.1. VDO's allocate-on-write CoW compounds with dm-thin snapshot CoW, causing 4-5x write amplification on workspaces. btrfs+zstd delivers the same compression benefit at the filesystem level with ~1.3x write amplification (and zero for read-only volumes).
 
+### 6.7 LUKS AEAD for Integrity
+
+Considered using LUKS2 with `--integrity` (dm-integrity) for per-sector authentication tags on all volumes.
+
+**Not chosen because:**
+- **Redundant with btrfs (A/B/C):** btrfs checksums every data and metadata block natively. dm-integrity adds a second integrity layer with ~10-20% write overhead and ~3% storage overhead for authentication tags. No additional detection capability.
+- **Detection without correction (D):** On ext4 volumes, dm-integrity detects corruption (`EIO`) but cannot correct it — no local redundant copy. Recovery requires DRBD peer resync or cold tier recall regardless.
+- **NBD integrity is strictly better (§4.6):** Provides the same detection (hash mismatch) plus automatic correction (cold tier recall). Self-healing instead of `EIO`. Applies to all NBD-backed volumes (B, D).
+- **Overhead:** dm-integrity requires a journal region per volume, adds a dm layer to the stack, and imposes write amplification from journaled tag updates.
+
 ## 7. Volume Metadata Schema
 
 ### 7.1 Global LUKS Key (in control plane)
@@ -604,6 +687,7 @@ One entry in the control plane. All volumes reference this key.
 | UID squashing (`squash_to_uid`) | Kernel idmapped mount (multi-UID preserved) |
 | Separate rootfs + data volume for workspaces | Single LV per workspace |
 | Per-volume LUKS key management | Single shared key |
+| LUKS AEAD / dm-integrity | btrfs checksums (A/B/C) + NBD integrity verification (B/D) |
 
 ## 10. Risks
 
@@ -623,6 +707,10 @@ One entry in the control plane. All volumes reference this key.
 
 8. **btrfs CoW write amplification on workspaces.** btrfs CoW on random writes adds ~1.3x write amplification compared to ext4. This is a deliberate trade-off: 2-3x storage reduction from compression outweighs the modest write amplification. VDO's alternative was 4-5x — btrfs is far better. For write-heavy paths (databases, build caches), per-file opt-out is available via `chattr +C` (disables CoW and compression for that file). Read-only volumes (A, C) have zero CoW penalty.
 
+9. **NBD integrity verification cold tier dependency.** Self-healing only works for blocks that have been cold-tiered. Between write and cold-tier-ship, corruption is detectable (hash mismatch → `EIO`) but not correctable — same as LUKS AEAD behavior. The correction window depends on cold-tier upload latency and bandwidth. Hash index adds ~20 MiB memory per 10 GiB volume and ~100ns read-path latency (xxhash64). Acceptable for piccolo's scale.
+
+10. **Golden LV cold tier as bootstrap dependency.** Workspace disaster recovery depends on recalling the golden LV from cold storage before workspace deltas can be applied. If cold storage is unreachable, workspace recovery is blocked. Mitigated: in two-node clusters, the peer has a block-copied golden LV (§5.7.1) as an alternative source. Single-node without cold tier access falls back to re-pull + re-flatten (creates new workspaces, does not recover existing workspace data).
+
 ## 11. Operational Readiness
 
 ### 11.1 Observability
@@ -636,6 +724,13 @@ INFO: workspace <id>: clone <clone-id> created (snapshot, instant)
 INFO: workspace <id>: DRBD skip-sync — golden LV already on peer
 INFO: service-rootfs <id>: created from golden-lv <golden-id> (snapshot, read-only)
 INFO: service-data <id>: created (fresh thin LV, <size>)
+INFO: nbd <vol-id>: integrity check passed (block <offset>)
+WARN: nbd <vol-id>: hash mismatch at block <offset> — recalling from cold tier
+INFO: nbd <vol-id>: block <offset> recalled and repaired from cold tier
+WARN: nbd <vol-id>: hash mismatch at block <offset> — cold tier unavailable, returning EIO
+INFO: nbd <vol-id>: background scrub complete (<n> blocks verified, <m> repaired)
+INFO: golden-lv <id>: cold-tier upload started (<size>)
+INFO: golden-lv <id>: cold-tier upload complete (<duration>)
 ERROR: golden-lv <id>: flatten interrupted, marked for cleanup
 ERROR: mount_setattr failed: <errno translation> — piccolod cannot start
 ```
@@ -654,3 +749,5 @@ Expose via storage inspection API:
 - Thin pool: data%, metadata%, per-type breakdown (golden, workspace, service-rootfs, service-data, ephemeral)
 - Clone relationships: origin → clone graph
 - Compression ratio: per-volume btrfs compression stats (`btrfs filesystem df`)
+- NBD integrity: hash index size, last scrub timestamp, blocks repaired since boot
+- Golden LV cold tier: per-digest upload status (pending, uploaded, recalled), cold tier size
