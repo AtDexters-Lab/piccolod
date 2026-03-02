@@ -415,7 +415,8 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 }
 
 // CloneWorkspace creates a clone of an existing workspace.
-func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneID string) (RootfsHandle, error) {
+// When idmap is non-nil, it overrides the origin's IDMap in the clone metadata.
+func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneID string, idmap *IDMapConfig) (RootfsHandle, error) {
 	if err := m.checkThinPoolCapacity(ctx); err != nil {
 		return RootfsHandle{}, err
 	}
@@ -467,6 +468,17 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 		CloneOf:         originVolumeID,
 		IDMap:           originMeta.IDMap,
 	}
+	// Override IDMap when the clone belongs to a different per-app user.
+	if idmap != nil {
+		meta.IDMap = &IDMapMeta{
+			AppUID:      idmap.AppUID,
+			AppGID:      idmap.AppGID,
+			SubUIDStart: idmap.SubUIDStart,
+			SubUIDCount: idmap.SubUIDCount,
+			SubGIDStart: idmap.SubGIDStart,
+			SubGIDCount: idmap.SubGIDCount,
+		}
+	}
 	metaPath := filepath.Join(metaDir, metadataV2File)
 	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
 		m.lvMgr.DeactivateLV(ctx, cloneVolumeID)
@@ -483,6 +495,35 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 	}
 
 	return handle, nil
+}
+
+// ListClones returns volume IDs of clones created from the given origin volume.
+func (m *luksVolumeManager) ListClones(ctx context.Context, originVolumeID string) ([]string, error) {
+	metaBase := paths.CoreJoin("volumes")
+	entries, err := os.ReadDir(metaBase)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read volumes dir: %w", err)
+	}
+
+	var clones []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		volID := e.Name()
+		metaPath := filepath.Join(metaBase, volID, metadataV2File)
+		meta, err := readVolumeMetaV3(metaPath)
+		if err != nil {
+			continue
+		}
+		if meta.CloneOf == originVolumeID {
+			clones = append(clones, volID)
+		}
+	}
+	return clones, nil
 }
 
 // AttachRootfs activates and mounts an existing rootfs volume.

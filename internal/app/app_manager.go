@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1335,7 +1336,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	// Unified install path: all apps (service and workspace) use container groups.
 	// Storage preparation (image pull vs workspace disk) is handled inside installContainerGroup.
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseCreatingContainer, 60, "Creating containers", false, nil)
-	app, err := m.installContainerGroup(ctx, appDef, instanceID, layout, runtime, endpoints)
+	app, err := m.installContainerGroup(ctx, appDef, instanceID, layout, runtime, endpoints, nil)
 	if err != nil {
 		var portErr *container.PortInUseError
 		if errors.As(err, &portErr) {
@@ -1446,6 +1447,250 @@ func (m *AppManager) cleanupInstallResources(ctx context.Context, instanceID str
 // This method now always creates a new instance (no update behavior).
 func (m *AppManager) Upsert(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
 	return m.Install(ctx, appDef)
+}
+
+// CloneWorkspace creates a clone of an existing workspace app.
+// The clone is a fully independent AppInstance with its own containers, volumes, and per-app user.
+// The origin must be a workspace-mode app and must be stopped.
+// After cloning, both origin and clone are (re-)started automatically.
+func (m *AppManager) CloneWorkspace(ctx context.Context, originID, cloneID string) (*AppInstance, error) {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	return m.cloneWorkspaceLocked(ctx, originID, cloneID)
+}
+
+func (m *AppManager) cloneWorkspaceLocked(ctx context.Context, originID, cloneID string) (*AppInstance, error) {
+	if err := m.ensureUnlocked(); err != nil {
+		return nil, err
+	}
+	if err := m.ensureKernelLeader(); err != nil {
+		return nil, err
+	}
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate origin exists.
+	_, exists := state.GetApp(originID)
+	if !exists {
+		return nil, fmt.Errorf("clone %s from %s: origin not found", cloneID, originID)
+	}
+	originDef, err := state.GetAppDefinition(originID)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: load origin definition: %w", cloneID, originID, err)
+	}
+
+	// Validate origin is workspace mode.
+	mode := piccoloModeFromExtensions(originDef.Extensions)
+	if mode != ModeWorkspace {
+		return nil, fmt.Errorf("clone %s from %s: not a workspace app", cloneID, originID)
+	}
+
+	// Validate origin is stopped.
+	observed := m.getObservedStatus(originID)
+	if observed == StatusRunning || observed == StatusStarting {
+		return nil, fmt.Errorf("clone %s from %s: origin must be stopped", cloneID, originID)
+	}
+
+	// Validate clone name.
+	if err := ValidateInstanceID(cloneID); err != nil {
+		return nil, fmt.Errorf("clone %s from %s: invalid name: %w", cloneID, originID, err)
+	}
+	existingIDs := state.ListInstanceIDs()
+	if err := ValidatePrimaryNameAvailable(cloneID, existingIDs); err != nil {
+		return nil, fmt.Errorf("clone %s from %s: %w", cloneID, originID, err)
+	}
+
+	// Set up clone's volume layout and per-app user.
+	layout, err := m.ensureAppVolumeLayout(ctx, cloneID)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: volume layout: %w", cloneID, originID, err)
+	}
+	runtime, err := m.podmanRuntimeForApp(cloneID, layout, ModeWorkspace)
+	if err != nil {
+		m.cleanupInstallResources(ctx, cloneID, container.PodmanRuntime{}, originDef)
+		return nil, fmt.Errorf("clone %s from %s: podman runtime: %w", cloneID, originID, err)
+	}
+
+	// Deferred cleanup: resources, rootfs, services, and containers are cleaned
+	// up on failure. Each flag is cleared as ownership transfers to the next step.
+	cleanupResources := true
+	cleanupRootfs := false
+	cleanupServices := false
+	var rootfsVolumeID string
+	defer func() {
+		if cleanupServices {
+			m.serviceManager.RemoveApp(cloneID)
+		}
+		if cleanupRootfs {
+			rootfsMgr := m.currentRootfsManager()
+			if rootfsMgr != nil {
+				rootfsMgr.DetachRootfs(ctx, rootfsVolumeID)
+				rootfsMgr.DestroyRootfs(ctx, rootfsVolumeID)
+			}
+		}
+		if cleanupResources {
+			m.cleanupInstallResources(ctx, cloneID, runtime, originDef)
+		}
+	}()
+
+	// Build IDMap config from clone's per-app user.
+	var idmapPtr *persistence.IDMapConfig
+	if runtime.Credential != nil {
+		idmap := persistence.IDMapConfig{
+			AppUID: runtime.Credential.Uid,
+			AppGID: runtime.Credential.Gid,
+		}
+		username := container.AppUsername(cloneID)
+		if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
+			idmap.SubUIDStart = subStart
+			idmap.SubUIDCount = subCount
+			idmap.SubGIDStart = subStart
+			idmap.SubGIDCount = subCount
+		} else {
+			log.Printf("WARN: clone %s: subuid lookup failed for %s: %v", cloneID, username, lookupErr)
+		}
+		idmapPtr = &idmap
+	}
+
+	// Clone rootfs: thin LV snapshot with clone's IDMap.
+	rootfsMgr := m.currentRootfsManager()
+	if rootfsMgr == nil {
+		return nil, fmt.Errorf("clone %s from %s: rootfs manager not available", cloneID, originID)
+	}
+
+	handle, err := rootfsMgr.CloneWorkspace(ctx, originID, cloneID, idmapPtr)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: snapshot: %w", cloneID, originID, err)
+	}
+	rootfsVolumeID = handle.VolumeID
+	cleanupRootfs = true
+
+	// Read golden image config from clone's rootfs.
+	goldenID := handle.GoldenLV
+	imgConfig, err := rootfsMgr.ReadGoldenImageConfig(ctx, goldenID)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: read golden image config: %w", cloneID, originID, err)
+	}
+
+	// Deep-copy the origin AppDefinition for the clone.
+	defJSON, err := json.Marshal(originDef)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: marshal definition: %w", cloneID, originID, err)
+	}
+	var cloneDef api.AppDefinition
+	if err := json.Unmarshal(defJSON, &cloneDef); err != nil {
+		return nil, fmt.Errorf("clone %s from %s: unmarshal definition: %w", cloneID, originID, err)
+	}
+
+	// Update clone definition: workspace_name and primary listener name.
+	cloneDef.WorkspaceName = cloneID
+	for i := range cloneDef.Listeners {
+		if cloneDef.Listeners[i].Primary {
+			cloneDef.Listeners[i].Name = cloneID
+			break
+		}
+	}
+
+	// Build prebuiltRootfs map for installContainerGroup.
+	primary := primaryServiceFor(&cloneDef, nil)
+	prebuiltRootfs := map[string]*rootfsMountInfo{
+		primary: {
+			handle:    handle,
+			imgConfig: imgConfig,
+		},
+	}
+
+	// Allocate services for the clone.
+	endpoints, err := m.serviceManager.AllocateForApp(cloneID, cloneDef.Listeners)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: allocate ports: %w", cloneID, originID, err)
+	}
+	cleanupServices = true
+
+	// Install the clone's container group with prebuilt rootfs.
+	cloneInst, err := m.installContainerGroup(ctx, &cloneDef, cloneID, layout, runtime, endpoints, prebuiltRootfs)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: install containers: %w", cloneID, originID, err)
+	}
+
+	// Set clone provenance.
+	cloneInst.ClonedFrom = originID
+
+	// Persist clone state.
+	if err := state.StoreApp(cloneInst); err != nil {
+		// Cleanup containers created by installContainerGroup.
+		if cloneInst.NetworkAnchorID != "" {
+			_ = m.containerManager.StopContainer(ctx, runtime, cloneInst.NetworkAnchorID)
+			_ = m.containerManager.RemoveContainer(ctx, runtime, cloneInst.NetworkAnchorID)
+		}
+		for _, cid := range cloneInst.Containers {
+			_ = m.containerManager.StopContainer(ctx, runtime, cid)
+			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
+		}
+		return nil, fmt.Errorf("clone %s from %s: persist state: %w", cloneID, originID, err)
+	}
+
+	// Success — disable deferred cleanup.
+	cleanupResources = false
+	cleanupRootfs = false
+	cleanupServices = false
+
+	// Set clone status to running.
+	m.observedStatusMu.Lock()
+	m.observedStatus[cloneID] = StatusRunning
+	m.observedStatusMessage[cloneID] = ""
+	m.observedStatusMu.Unlock()
+	cloneInst.Status = StatusRunning
+	m.publishAppStatusChanged(cloneID, "installed", "", "")
+
+	// Restart origin (best-effort).
+	if restartErr := m.startLocked(ctx, originID); restartErr != nil {
+		log.Printf("WARN: clone %s: failed to restart origin %s: %v", cloneID, originID, restartErr)
+	}
+
+	return cloneInst, nil
+}
+
+// ListWorkspaceClones returns all apps that were cloned from the given origin.
+func (m *AppManager) ListWorkspaceClones(ctx context.Context, originID string) ([]*AppInstance, error) {
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate origin exists.
+	if _, exists := state.GetApp(originID); !exists {
+		return nil, fmt.Errorf("app instance not found: %s", originID)
+	}
+
+	rootfsMgr := m.currentRootfsManager()
+	if rootfsMgr == nil {
+		return nil, nil
+	}
+	originVolumeID := "ws-" + originID
+	cloneVolumeIDs, err := rootfsMgr.ListClones(ctx, originVolumeID)
+	if err != nil {
+		return nil, fmt.Errorf("list clones for %s: %w", originID, err)
+	}
+
+	var clones []*AppInstance
+	for _, volID := range cloneVolumeIDs {
+		// Strip "ws-" prefix to get instanceID.
+		instanceID := strings.TrimPrefix(volID, "ws-")
+		cached, exists := state.GetApp(instanceID)
+		if !exists {
+			continue
+		}
+		clone := *cached
+		clone.Status, clone.StatusMessage = m.getObservedStatusAndMessage(instanceID)
+		if clone.Status == "" {
+			clone.Status = StatusStopped
+		}
+		clones = append(clones, &clone)
+	}
+	return clones, nil
 }
 
 // List returns all installed applications.

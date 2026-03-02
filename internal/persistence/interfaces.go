@@ -56,7 +56,10 @@ type RootfsVolumeManager interface {
 	// CreateServiceRootfs creates a read-only service rootfs from a golden LV snapshot.
 	CreateServiceRootfs(ctx context.Context, req ServiceRootfsRequest) (RootfsHandle, error)
 	// CloneWorkspace creates a clone of an existing workspace.
-	CloneWorkspace(ctx context.Context, originID, cloneID string) (RootfsHandle, error)
+	// When idmap is non-nil, it overrides the origin's IDMap in the clone metadata.
+	CloneWorkspace(ctx context.Context, originID, cloneID string, idmap *IDMapConfig) (RootfsHandle, error)
+	// ListClones returns volume IDs of clones created from the given origin volume.
+	ListClones(ctx context.Context, originVolumeID string) ([]string, error)
 	// AttachRootfs activates and mounts an existing rootfs volume.
 	AttachRootfs(ctx context.Context, volumeID string) (RootfsHandle, error)
 	// DetachRootfs unmounts and deactivates a rootfs volume.

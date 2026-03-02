@@ -1,7 +1,13 @@
 package persistence
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"sort"
 	"testing"
+
+	"piccolod/internal/state/paths"
 )
 
 func TestServiceRootfsVolumeID(t *testing.T) {
@@ -139,5 +145,111 @@ func TestGoldenLVSizeForImage(t *testing.T) {
 				t.Errorf("goldenLVSizeForImage(%d) = %d, want %d", tt.imageSizeBytes, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestListClones(t *testing.T) {
+	tmpDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tmpDir)
+
+	volDir := filepath.Join(tmpDir, "volumes")
+	originVolumeID := "ws-origin"
+
+	// Create origin metadata.
+	originMeta := &volumeMetaV3{
+		Version: metadataV3Version,
+		Type:    "workspace",
+		LVName:  originVolumeID,
+		VGName:  "piccolo",
+		FSType:  "btrfs",
+	}
+	originDir := filepath.Join(volDir, originVolumeID)
+	if err := os.MkdirAll(originDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(originDir, metadataV2File), originMeta); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create two clones.
+	for _, cloneID := range []string{"ws-clone1", "ws-clone2"} {
+		cloneMeta := &volumeMetaV3{
+			Version: metadataV3Version,
+			Type:    "workspace",
+			LVName:  cloneID,
+			VGName:  "piccolo",
+			FSType:  "btrfs",
+			CloneOf: originVolumeID,
+		}
+		cloneDir := filepath.Join(volDir, cloneID)
+		if err := os.MkdirAll(cloneDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeVolumeMetaV3(filepath.Join(cloneDir, metadataV2File), cloneMeta); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Create an unrelated volume (should not be returned).
+	otherMeta := &volumeMetaV3{
+		Version: metadataV3Version,
+		Type:    "workspace",
+		LVName:  "ws-other",
+		VGName:  "piccolo",
+		FSType:  "btrfs",
+	}
+	otherDir := filepath.Join(volDir, "ws-other")
+	if err := os.MkdirAll(otherDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(otherDir, metadataV2File), otherMeta); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := &luksVolumeManager{stacks: nil}
+	clones, err := mgr.ListClones(context.Background(), originVolumeID)
+	if err != nil {
+		t.Fatalf("ListClones: %v", err)
+	}
+
+	sort.Strings(clones)
+	if len(clones) != 2 {
+		t.Fatalf("expected 2 clones, got %d: %v", len(clones), clones)
+	}
+	if clones[0] != "ws-clone1" || clones[1] != "ws-clone2" {
+		t.Fatalf("unexpected clones: %v", clones)
+	}
+}
+
+func TestListClones_NoClones(t *testing.T) {
+	tmpDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tmpDir)
+
+	volDir := filepath.Join(tmpDir, "volumes")
+	originVolumeID := "ws-solo"
+
+	// Create origin with no clones.
+	originMeta := &volumeMetaV3{
+		Version: metadataV3Version,
+		Type:    "workspace",
+		LVName:  originVolumeID,
+		VGName:  "piccolo",
+		FSType:  "btrfs",
+	}
+	originDir := filepath.Join(volDir, originVolumeID)
+	if err := os.MkdirAll(originDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(originDir, metadataV2File), originMeta); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := &luksVolumeManager{stacks: nil}
+	clones, err := mgr.ListClones(context.Background(), originVolumeID)
+	if err != nil {
+		t.Fatalf("ListClones: %v", err)
+	}
+	if len(clones) != 0 {
+		t.Fatalf("expected 0 clones, got %d: %v", len(clones), clones)
 	}
 }

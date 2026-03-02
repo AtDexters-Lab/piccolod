@@ -17,7 +17,8 @@ import (
 // This is the unified install path for both service and workspace modes.
 // For workspace mode, it prepares workspace disks and uses --rootfs mode.
 // For service mode, it uses standard image-based containers.
-func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint) (*AppInstance, error) {
+// When prebuiltRootfs is non-nil, services with entries skip image pull + rootfs creation (used by clone).
+func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint, prebuiltRootfs map[string]*rootfsMountInfo) (*AppInstance, error) {
 	if m.serviceManager == nil {
 		return nil, fmt.Errorf("app manager: service manager not configured")
 	}
@@ -162,6 +163,15 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 
 	serviceIdx := 0
 	for svcName := range appDef.Services {
+		// Skip storage prep for services with prebuilt rootfs (clone path).
+		if prebuiltRootfs != nil {
+			if rInfo, ok := prebuiltRootfs[svcName]; ok {
+				blockNativeRootfsMap[svcName] = rInfo
+				serviceIdx++
+				continue
+			}
+		}
+
 		svc := appDef.Services[svcName]
 
 		// Calculate progress range for this service

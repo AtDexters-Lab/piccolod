@@ -511,7 +511,7 @@ func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *F
 			return fmt.Errorf("allocate service ports: %w", err)
 		}
 
-		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, layout, runtime, endpoints)
+		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, layout, runtime, endpoints, nil)
 		if err == nil {
 			// Preserve timestamps and reset failure tracking after successful recovery.
 			newInst.CreatedAt = appInst.CreatedAt

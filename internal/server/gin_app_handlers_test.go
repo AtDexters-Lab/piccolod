@@ -1565,3 +1565,60 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 		t.Fatalf("expected containers list in response: %#v", data)
 	}
 }
+
+func TestHandleGinAppClone_MissingName(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrf := setupTestAdminSession(t, srv)
+
+	tests := []struct {
+		name           string
+		body           string
+		expectedStatus int
+	}{
+		{"empty body", `{}`, http.StatusBadRequest},
+		{"blank name", `{"name":""}`, http.StatusBadRequest},
+		{"whitespace name", `{"name":"  "}`, http.StatusBadRequest},
+		{"invalid json", `{bad`, http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest(http.MethodPost, "/api/v1/apps/origin/clone", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			attachAuth(req, sessionCookie, csrf)
+			srv.router.ServeHTTP(w, req)
+			if w.Code != tt.expectedStatus {
+				t.Errorf("status=%d, want %d; body=%s", w.Code, tt.expectedStatus, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandleGinAppClone_OriginNotFound(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrf := setupTestAdminSession(t, srv)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/apps/noexist/clone", strings.NewReader(`{"name":"myclone"}`))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrf)
+	srv.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status=%d, want %d; body=%s", w.Code, http.StatusNotFound, w.Body.String())
+	}
+}
+
+func TestHandleGinAppListClones_OriginNotFound(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, _ := setupTestAdminSession(t, srv)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/apps/noexist/clones", nil)
+	attachAuth(req, sessionCookie, "")
+	srv.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status=%d, want %d; body=%s", w.Code, http.StatusNotFound, w.Body.String())
+	}
+}

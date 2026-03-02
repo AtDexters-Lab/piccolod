@@ -48,6 +48,8 @@ type AppMetadata struct {
 	// ActiveRootfs tracks the active rootfs volume ID per service (RFC 20260302).
 	// nil = legacy install (use ServiceRootfsVolumeID without digest).
 	ActiveRootfs map[string]string `json:"active_rootfs,omitempty"`
+	// ClonedFrom tracks the origin instance ID this app was cloned from.
+	ClonedFrom string `json:"cloned_from,omitempty"`
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -183,6 +185,7 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 		Definition:      appDef,
 		CatalogSource:   raw.CatalogSource,
 		ActiveRootfs:    raw.ActiveRootfs,
+		ClonedFrom:      raw.ClonedFrom,
 	}
 
 	// Fallback: if InstanceID is empty in metadata, use directory name
@@ -285,6 +288,7 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 		UpdatedAt:       app.UpdatedAt,
 		CatalogSource:   app.CatalogSource,
 		ActiveRootfs:    app.ActiveRootfs,
+		ClonedFrom:      app.ClonedFrom,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -330,6 +334,7 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, containerID stri
 	containers := app.Containers
 	catalogSource := app.CatalogSource
 	activeRootfs := app.ActiveRootfs
+	clonedFrom := app.ClonedFrom
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem
@@ -346,6 +351,7 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, containerID stri
 		UpdatedAt:       app.UpdatedAt,
 		CatalogSource:   catalogSource,
 		ActiveRootfs:    activeRootfs,
+		ClonedFrom:      clonedFrom,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -384,6 +390,7 @@ func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 		UpdatedAt:       app.UpdatedAt,
 		CatalogSource:   app.CatalogSource,
 		ActiveRootfs:    app.ActiveRootfs,
+		ClonedFrom:      app.ClonedFrom,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")

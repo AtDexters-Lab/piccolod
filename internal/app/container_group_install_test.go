@@ -60,7 +60,7 @@ func TestInstallMultiContainer_PrunesZombiesBeforeCreate(t *testing.T) {
 
 	_, err = mgr.installContainerGroup(ctx, def, "demo", layout, runtime, []services.ServiceEndpoint{
 		{App: "demo", Name: "demo", GuestPort: 8080, HostBind: 18080, PublicPort: 28080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("installContainerGroup: %v", err)
 	}

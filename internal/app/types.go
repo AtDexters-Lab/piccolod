@@ -98,6 +98,9 @@ type AppInstance struct {
 	// Updated during image update to point to the new versioned rootfs.
 	ActiveRootfs map[string]string `json:"active_rootfs,omitempty"`
 
+	// ClonedFrom tracks the origin instance ID this app was cloned from (RFC 20260302).
+	ClonedFrom string `json:"cloned_from,omitempty"`
+
 	// Startup failure tracking for escalation (RFC 20260125)
 	// After StartupEscalateAfterAttempts consecutive failures OR StartupEscalateAfterDuration,
 	// status escalates from "starting" to "error".
