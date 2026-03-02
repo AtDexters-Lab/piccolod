@@ -48,6 +48,48 @@ func TestServiceRootfsVolumeID(t *testing.T) {
 	}
 }
 
+func TestVersionedServiceRootfsVolumeID(t *testing.T) {
+	tests := []struct {
+		name        string
+		instanceID  string
+		serviceName string
+		shortDigest string
+		want        string
+	}{
+		{
+			name:        "single_service_with_digest",
+			instanceID:  "myapp",
+			serviceName: "web",
+			shortDigest: "a1b2c3d4e5f6",
+			want:        "svc-rootfs-myapp--web--a1b2c3d4e5f6",
+		},
+		{
+			name:        "legacy_service_empty_name",
+			instanceID:  "myapp",
+			serviceName: "",
+			shortDigest: "abc123",
+			want:        "svc-rootfs-myapp--abc123",
+		},
+		{
+			name:        "long_instance_and_service",
+			instanceID:  "my-home-assistant-app",
+			serviceName: "core-service",
+			shortDigest: "deadbeef1234",
+			want:        "svc-rootfs-my-home-assistant-app--core-service--deadbeef1234",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := VersionedServiceRootfsVolumeID(tt.instanceID, tt.serviceName, tt.shortDigest)
+			if got != tt.want {
+				t.Errorf("VersionedServiceRootfsVolumeID(%q, %q, %q) = %q, want %q",
+					tt.instanceID, tt.serviceName, tt.shortDigest, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGoldenLVSizeForImage(t *testing.T) {
 	tests := []struct {
 		name          string

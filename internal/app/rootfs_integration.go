@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/container"
 	"piccolod/internal/persistence"
+	"piccolod/internal/state/paths"
 )
 
 // imagePullProgressRange defines the progress percentage range for an image pull.
@@ -311,11 +313,13 @@ func (m *AppManager) destroyAppRootfs(ctx context.Context, instanceID string, mo
 // ensureAllServiceRootfsAttached attaches all per-service rootfs volumes.
 // Returns a map of svcName → *rootfsMountInfo, or (nil, nil) if no rootfs exists.
 // For workspace mode, delegates to the single-rootfs path.
+// When appInst is non-nil and has ActiveRootfs set, uses the versioned volume IDs.
 func (m *AppManager) ensureAllServiceRootfsAttached(
 	ctx context.Context,
 	instanceID string,
 	mode PiccoloMode,
 	appDef *api.AppDefinition,
+	appInst *AppInstance,
 ) (map[string]*rootfsMountInfo, error) {
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
@@ -358,7 +362,14 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 		if svc.Image == "" {
 			continue
 		}
-		volumeID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
+		// Use ActiveRootfs (versioned) if available, otherwise legacy ID.
+		volumeID := ""
+		if appInst != nil && appInst.ActiveRootfs != nil {
+			volumeID = appInst.ActiveRootfs[svcName]
+		}
+		if volumeID == "" {
+			volumeID = persistence.ServiceRootfsVolumeID(instanceID, svcName)
+		}
 		if !rootfs.RootfsExists(volumeID) {
 			continue
 		}
@@ -415,7 +426,7 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 }
 
 // detachAllServiceRootfs detaches all per-service rootfs volumes. Best-effort.
-func (m *AppManager) detachAllServiceRootfs(ctx context.Context, instanceID string, mode PiccoloMode, appDef *api.AppDefinition) {
+func (m *AppManager) detachAllServiceRootfs(ctx context.Context, instanceID string, mode PiccoloMode, appDef *api.AppDefinition, appInst *AppInstance) {
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
 		return
@@ -426,7 +437,14 @@ func (m *AppManager) detachAllServiceRootfs(ctx context.Context, instanceID stri
 			if svc.Image == "" {
 				continue
 			}
-			volumeID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
+			// Use ActiveRootfs (versioned) if available, otherwise legacy ID.
+			volumeID := ""
+			if appInst != nil && appInst.ActiveRootfs != nil {
+				volumeID = appInst.ActiveRootfs[svcName]
+			}
+			if volumeID == "" {
+				volumeID = persistence.ServiceRootfsVolumeID(instanceID, svcName)
+			}
 			if err := rootfs.DetachRootfs(ctx, volumeID); err != nil {
 				log.Printf("WARN: detach rootfs %s: %v", volumeID, err)
 			}
@@ -438,6 +456,8 @@ func (m *AppManager) detachAllServiceRootfs(ctx context.Context, instanceID stri
 }
 
 // destroyAllServiceRootfs destroys all per-service rootfs volumes and runs GC.
+// Scans for both legacy (no digest) and versioned (with digest) rootfs volumes
+// to ensure complete cleanup on uninstall.
 func (m *AppManager) destroyAllServiceRootfs(ctx context.Context, instanceID string, mode PiccoloMode, appDef *api.AppDefinition) {
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
@@ -445,13 +465,25 @@ func (m *AppManager) destroyAllServiceRootfs(ctx context.Context, instanceID str
 	}
 
 	if mode == ModeService && appDef != nil && appDef.Services != nil {
+		// Scan metadata directory for ALL rootfs volumes matching each service prefix.
+		// This catches both legacy (svc-rootfs-id--svcName) and versioned
+		// (svc-rootfs-id--svcName--digest) volumes from image updates.
+		metaBase := paths.CoreJoin("volumes")
+		entries, readErr := os.ReadDir(metaBase)
+		if readErr != nil {
+			log.Printf("WARN: scan rootfs volumes: %v", readErr)
+		}
 		for svcName, svc := range appDef.Services {
 			if svc.Image == "" {
 				continue
 			}
-			volumeID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
-			if err := rootfs.DestroyRootfs(ctx, volumeID); err != nil {
-				log.Printf("WARN: destroy rootfs %s: %v", volumeID, err)
+			prefix := persistence.ServiceRootfsVolumeID(instanceID, svcName)
+			for _, e := range entries {
+				if e.IsDir() && (e.Name() == prefix || strings.HasPrefix(e.Name(), prefix+"--")) {
+					if err := rootfs.DestroyRootfs(ctx, e.Name()); err != nil {
+						log.Printf("WARN: destroy rootfs %s: %v", e.Name(), err)
+					}
+				}
 			}
 		}
 	}
@@ -467,17 +499,23 @@ func (m *AppManager) destroyAllServiceRootfs(ctx context.Context, instanceID str
 }
 
 // appHasAnyServiceRootfs returns true if any service rootfs exists for the app.
-func (m *AppManager) appHasAnyServiceRootfs(instanceID string, mode PiccoloMode, appDef *api.AppDefinition) bool {
+func (m *AppManager) appHasAnyServiceRootfs(instanceID string, mode PiccoloMode, appDef *api.AppDefinition, appInst *AppInstance) bool {
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
 		return false
 	}
 
-	// Check per-service volumes.
+	// Check per-service volumes (versioned first, then legacy).
 	if mode == ModeService && appDef != nil && appDef.Services != nil {
 		for svcName, svc := range appDef.Services {
 			if svc.Image == "" {
 				continue
+			}
+			// Check ActiveRootfs (versioned) first.
+			if appInst != nil && appInst.ActiveRootfs != nil {
+				if vid := appInst.ActiveRootfs[svcName]; vid != "" && rootfs.RootfsExists(vid) {
+					return true
+				}
 			}
 			volumeID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
 			if rootfs.RootfsExists(volumeID) {

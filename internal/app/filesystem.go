@@ -45,6 +45,9 @@ type AppMetadata struct {
 	// CatalogSource tracks the catalog item name this app was installed from.
 	// Used for icon lookup and update tracking.
 	CatalogSource string `json:"catalog_source,omitempty"`
+	// ActiveRootfs tracks the active rootfs volume ID per service (RFC 20260302).
+	// nil = legacy install (use ServiceRootfsVolumeID without digest).
+	ActiveRootfs map[string]string `json:"active_rootfs,omitempty"`
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -179,6 +182,7 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 		UpdatedAt:       raw.UpdatedAt,
 		Definition:      appDef,
 		CatalogSource:   raw.CatalogSource,
+		ActiveRootfs:    raw.ActiveRootfs,
 	}
 
 	// Fallback: if InstanceID is empty in metadata, use directory name
@@ -280,6 +284,7 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 		CreatedAt:       app.CreatedAt,
 		UpdatedAt:       app.UpdatedAt,
 		CatalogSource:   app.CatalogSource,
+		ActiveRootfs:    app.ActiveRootfs,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -324,6 +329,7 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, containerID stri
 	networkAnchorID := app.NetworkAnchorID
 	containers := app.Containers
 	catalogSource := app.CatalogSource
+	activeRootfs := app.ActiveRootfs
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem
@@ -339,6 +345,7 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, containerID stri
 		CreatedAt:       createdAt,
 		UpdatedAt:       app.UpdatedAt,
 		CatalogSource:   catalogSource,
+		ActiveRootfs:    activeRootfs,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -376,6 +383,7 @@ func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 		CreatedAt:       app.CreatedAt,
 		UpdatedAt:       app.UpdatedAt,
 		CatalogSource:   app.CatalogSource,
+		ActiveRootfs:    app.ActiveRootfs,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")

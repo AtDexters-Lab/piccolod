@@ -47,6 +47,13 @@ func ServiceRootfsVolumeID(instanceID, serviceName string) string {
 	return svcRootfsLVPrefix + instanceID + svcRootfsDelimiter + serviceName
 }
 
+// VersionedServiceRootfsVolumeID returns a digest-qualified volume ID.
+// Used during image updates to create rootfs alongside the original (RFC 20260302).
+func VersionedServiceRootfsVolumeID(instanceID, serviceName, shortDigest string) string {
+	base := ServiceRootfsVolumeID(instanceID, serviceName)
+	return base + svcRootfsDelimiter + shortDigest
+}
+
 // goldenLVSizeForImage returns the right-sized LV allocation for a given
 // uncompressed image size. Uses max(1.5x, image + 1 GiB) with a 256 MiB
 // floor (btrfs minimum for DUP metadata is ~109 MiB).
@@ -319,7 +326,10 @@ func (m *luksVolumeManager) CreateServiceRootfs(ctx context.Context, req Service
 		return RootfsHandle{}, err
 	}
 
-	volumeID := ServiceRootfsVolumeID(req.InstanceID, req.ServiceName)
+	volumeID := req.VolumeID
+	if volumeID == "" {
+		volumeID = ServiceRootfsVolumeID(req.InstanceID, req.ServiceName)
+	}
 	return m.createRootfsFromGolden(ctx, goldenID, volumeID, "service-rootfs", true, &req.IDMap)
 }
 

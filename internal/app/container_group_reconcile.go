@@ -157,7 +157,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	var blockNativeRootfsMap map[string]*rootfsMountInfo
 	if desiredRunning {
 		var rootfsErr error
-		blockNativeRootfsMap, rootfsErr = m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def)
+		blockNativeRootfsMap, rootfsErr = m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
 		if rootfsErr != nil {
 			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
 		}

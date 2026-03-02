@@ -224,7 +224,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		}
 		// Cleanup rootfs on failure.
 		if len(blockNativeRootfsMap) > 0 {
-			m.detachAllServiceRootfs(ctx, instanceID, mode, appDef)
+			m.detachAllServiceRootfs(ctx, instanceID, mode, appDef, nil)
 		}
 	}
 

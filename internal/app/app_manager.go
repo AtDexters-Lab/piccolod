@@ -1369,7 +1369,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		// Cleanup rootfs if applicable
 		mode := piccoloModeFromExtensions(appDef.Extensions)
 		if m.currentRootfsManager() != nil {
-			m.detachAllServiceRootfs(ctx, instanceID, mode, appDef)
+			m.detachAllServiceRootfs(ctx, instanceID, mode, appDef, nil)
 		}
 		m.serviceManager.RemoveApp(instanceID)
 		cleanupServices = false
@@ -1889,68 +1889,77 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	if err != nil {
 		return fmt.Errorf("failed to read current app.yaml: %w", err)
 	}
-	if piccoloModeFromExtensions(curDef.Extensions) == ModeService {
-		return fmt.Errorf("cannot update image for service-mode apps; update per-service images in the manifest and reinstall")
-	}
 
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(curDef.Extensions))
-	if err != nil {
-		return err
-	}
-
-	// Workspace mode apps cannot have their image updated because the workspace disk
-	// overlay is the persistence mechanism. Changing the base image would require
-	// "rebasing" the overlay which is complex and out of scope (see RFC non-goals).
-	// Users who want a new base image should uninstall and reinstall the workspace.
 	mode := piccoloModeFromExtensions(curDef.Extensions)
 	if mode == ModeWorkspace {
 		return fmt.Errorf("cannot update image for workspace apps: workspace persistence is tied to the base image; uninstall and reinstall to use a different base image")
 	}
 
-	// Compute new image
-	newImage := curDef.Image
-	if tag != nil {
-		// Replace tag portion if present, or append
-		img := curDef.Image
-		// Split on ':' but be careful with registry includes ':'
-		// Strategy: if '@' digest present, ignore; else change last ':' segment after last '/'
-		if i := strings.LastIndex(img, "/"); i >= 0 {
-			repo := img[:i+1]
-			rest := img[i+1:]
-			if j := strings.LastIndex(rest, ":"); j >= 0 {
-				newImage = repo + rest[:j] + ":" + *tag
-			} else {
-				newImage = repo + rest + ":" + *tag
-			}
-		} else {
-			if j := strings.LastIndex(img, ":"); j >= 0 {
-				newImage = img[:j] + ":" + *tag
-			} else {
-				newImage = img + ":" + *tag
-			}
+	// Determine the primary service for image reference.
+	primary := primaryServiceFor(curDef, appInst)
+
+	if mode == ModeService && len(curDef.Services) != 1 {
+		return fmt.Errorf("cannot update image for multi-service apps; update per-service images in the manifest and reinstall")
+	}
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	if err != nil {
+		return err
+	}
+
+	// Compute new image — for service-mode, derive from service image (not top-level).
+	var baseImage string
+	if mode == ModeService && primary != "" {
+		if svc, ok := curDef.Services[primary]; ok && svc.Image != "" {
+			baseImage = svc.Image
 		}
 	}
-	// Prepare new def
+	if baseImage == "" {
+		baseImage = curDef.Image
+	}
+
+	newImage := baseImage
+	if tag != nil {
+		newImage = replaceImageTag(baseImage, *tag)
+	}
+
+	// Prepare new definition (deep-copy Services map to avoid mutating curDef).
 	newDef := *curDef
-	newDef.Image = newImage
-	// Backup current YAML and validate new
+	if curDef.Services != nil {
+		newDef.Services = make(map[string]api.AppService, len(curDef.Services))
+		for k, v := range curDef.Services {
+			newDef.Services[k] = v
+		}
+	}
+	if mode == ModeService && primary != "" {
+		svc := newDef.Services[primary]
+		svc.Image = newImage
+		newDef.Services[primary] = svc
+	} else {
+		newDef.Image = newImage
+	}
+
 	if err := ValidateAppDefinition(&newDef); err != nil {
 		return fmt.Errorf("invalid new app definition: %w", err)
 	}
 	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
 		return fmt.Errorf("backup app.yaml: %w", err)
 	}
+
 	// Pull image using shared image runtime (per-app users have read-only imagestore access).
-	// Mandatory: per-app runtimes use --pull=never since they lack write access to the imagestore.
 	if err := m.pullToImagestore(ctx, newImage, nil); err != nil {
 		return fmt.Errorf("pull image %s: %w", newImage, err)
 	}
-	// Preserve endpoints
+
+	// Service-mode: transactional rootfs update (RFC 20260302 Phase 1).
+	if mode == ModeService {
+		return m.updateServiceModeImage(ctx, state, appInst, &newDef, layout, runtime, primary, newImage)
+	}
+
+	// Legacy workspace/classic path (unchanged).
 	endpoints, _ := m.serviceManager.GetByApp(instanceID)
-	// Stop and remove old container
 	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
 	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
-	// Create new container with same endpoints
 	spec, err := m.appDefToContainerSpec(&newDef, endpoints, layout, instanceID, runtime.Credential)
 	if err != nil {
 		return fmt.Errorf("build container spec: %w", err)
@@ -1963,11 +1972,9 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 		m.serviceManager.SetAppContainerID(instanceID, newCID)
 	}
 	startErr := m.containerManager.StartContainer(ctx, runtime, newCID)
-	// Update instance with new definition and persist
 	appInst.Definition = &newDef
 	appInst.SetPrimaryContainerID(newCID)
 	appInst.UpdatedAt = time.Now()
-	// Must use StoreApp to persist the updated Definition (app.yaml with new image)
 	if err := state.StoreApp(appInst); err != nil {
 		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
 		_ = m.containerManager.RemoveContainer(ctx, runtime, newCID)
@@ -1978,6 +1985,184 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 		return fmt.Errorf("start container: %w", startErr)
 	}
 	m.setObservedStatus(instanceID, StatusRunning)
+	return nil
+}
+
+// replaceImageTag replaces the tag portion of an image reference.
+// Handles digest-pinned references (e.g. "image@sha256:abc") by stripping the digest.
+func replaceImageTag(img, newTag string) string {
+	// Strip digest suffix if present (e.g. "nginx@sha256:abc123..." → "nginx").
+	if at := strings.Index(img, "@"); at >= 0 {
+		img = img[:at]
+	}
+	if i := strings.LastIndex(img, "/"); i >= 0 {
+		repo := img[:i+1]
+		rest := img[i+1:]
+		if j := strings.LastIndex(rest, ":"); j >= 0 {
+			return repo + rest[:j] + ":" + newTag
+		}
+		return repo + rest + ":" + newTag
+	}
+	if j := strings.LastIndex(img, ":"); j >= 0 {
+		return img[:j] + ":" + newTag
+	}
+	return img + ":" + newTag
+}
+
+// updateServiceModeImage performs a transactional rootfs update for service-mode apps (RFC 20260302).
+// New rootfs is created alongside old (versioned by image digest). Old rootfs is retained for rollback.
+func (m *AppManager) updateServiceModeImage(
+	ctx context.Context,
+	state *FilesystemStateManager,
+	appInst *AppInstance,
+	newDef *api.AppDefinition,
+	layout appVolumeLayout,
+	runtime container.PodmanRuntime,
+	primary string,
+	newImage string,
+) error {
+	instanceID := appInst.InstanceID
+	rootfs := m.currentRootfsManager()
+	if rootfs == nil {
+		return fmt.Errorf("rootfs volume manager not configured")
+	}
+
+	// 1. Inspect new image to get digest.
+	imageRuntime, err := m.podmanImageRuntime()
+	if err != nil {
+		return fmt.Errorf("get image runtime: %w", err)
+	}
+	imgConfig, err := m.containerManager.InspectImage(ctx, imageRuntime, newImage)
+	if err != nil {
+		return fmt.Errorf("inspect image %s: %w", newImage, err)
+	}
+	newDigest := ""
+	if len(imgConfig.RepoDigests) > 0 {
+		newDigest = imgConfig.RepoDigests[0]
+	} else {
+		newDigest = imgConfig.Digest
+	}
+
+	// 2. Compute versioned volume ID.
+	shortDigest := persistence.ShortDigest(newDigest)
+	newVolumeID := persistence.VersionedServiceRootfsVolumeID(instanceID, primary, shortDigest)
+
+	// 3. Build IDMap config.
+	var idmap persistence.IDMapConfig
+	if runtime.Credential != nil {
+		idmap = persistence.IDMapConfig{
+			AppUID: runtime.Credential.Uid,
+			AppGID: runtime.Credential.Gid,
+		}
+		username := container.AppUsername(instanceID)
+		if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
+			idmap.SubUIDStart = subStart
+			idmap.SubUIDCount = subCount
+			idmap.SubGIDStart = subStart
+			idmap.SubGIDCount = subCount
+		} else {
+			log.Printf("WARN: update %s: subuid lookup failed for %s: %v", instanceID, username, lookupErr)
+		}
+	}
+
+	// 4. Create new rootfs (idempotent: skip if already exists from a retry).
+	var rootfsHandle persistence.RootfsHandle
+	if rootfs.RootfsExists(newVolumeID) {
+		log.Printf("INFO: update %s: rootfs %s already exists, attaching", instanceID, newVolumeID)
+		rootfsHandle, err = rootfs.AttachRootfs(ctx, newVolumeID)
+		if err != nil {
+			return fmt.Errorf("attach existing rootfs %s: %w", newVolumeID, err)
+		}
+	} else {
+		rootfsHandle, err = rootfs.CreateServiceRootfs(ctx, persistence.ServiceRootfsRequest{
+			InstanceID:  instanceID,
+			ServiceName: primary,
+			ImageDigest: newDigest,
+			ImageRef:    newImage,
+			IDMap:       idmap,
+			VolumeID:    newVolumeID,
+		})
+		if err != nil {
+			return fmt.Errorf("create new rootfs: %w", err)
+		}
+	}
+
+	// Read image config from golden LV.
+	goldenImgConfig, err := m.readImageConfigForRootfs(ctx, rootfs, newDigest)
+	if err != nil {
+		log.Printf("WARN: update %s: failed to read image config: %v", instanceID, err)
+		goldenImgConfig = persistence.GoldenImageConfig{}
+	}
+
+	// 5. Stop old container (anchor stays running).
+	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
+
+	// 6. Detach old rootfs (best-effort).
+	oldVolumeID := ""
+	if appInst.ActiveRootfs != nil {
+		oldVolumeID = appInst.ActiveRootfs[primary]
+	}
+	if oldVolumeID == "" {
+		oldVolumeID = persistence.ServiceRootfsVolumeID(instanceID, primary)
+	}
+	_ = rootfs.DetachRootfs(ctx, oldVolumeID)
+
+	// 7. Remove old container.
+	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
+
+	// 8. Resolve anchor ID.
+	anchorID := appInst.NetworkAnchorID
+	if anchorID == "" {
+		if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, networkAnchorContainerName(instanceID)); resolveErr == nil {
+			anchorID = id
+		}
+	}
+
+	// 9. Create + start new container.
+	newCID, err := m.createAndStartServiceContainer(ctx, runtime, serviceContainerOptions{
+		layout:          layout,
+		appDef:          newDef,
+		instanceID:      instanceID,
+		primary:         primary,
+		svcName:         primary,
+		anchorID:        anchorID,
+		credential:      runtime.Credential,
+		rootfsHandle:    &rootfsHandle,
+		goldenImgConfig: &goldenImgConfig,
+	})
+	if err != nil {
+		// Detach the new rootfs to leave the system in a clean state.
+		// The rootfs volume is preserved (not destroyed) for debugging.
+		// Recovery: old rootfs still exists. ActiveRootfs was NOT updated (step 10 not reached),
+		// so the reconciler will try to attach the old (legacy or previous versioned) volume ID.
+		// Manual recovery: revert app.yaml and restart, or reinstall.
+		_ = rootfs.DetachRootfs(ctx, newVolumeID)
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("create updated container: %w", err)
+	}
+
+	// 10. Update state.
+	appInst.Definition = newDef
+	appInst.SetPrimaryContainerID(newCID)
+	if appInst.ActiveRootfs == nil {
+		appInst.ActiveRootfs = make(map[string]string)
+	}
+	appInst.ActiveRootfs[primary] = newVolumeID
+	appInst.UpdatedAt = time.Now()
+	if err := state.StoreApp(appInst); err != nil {
+		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
+		_ = m.containerManager.RemoveContainer(ctx, runtime, newCID)
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("store app: %w", err)
+	}
+
+	// 11. Re-set service manager container ID.
+	if anchorID != "" {
+		m.serviceManager.SetAppContainerID(instanceID, anchorID)
+	}
+
+	m.setObservedStatus(instanceID, StatusRunning)
+	log.Printf("INFO: update %s: image updated to %s (rootfs=%s)", instanceID, newImage, newVolumeID)
 	return nil
 }
 
@@ -2092,7 +2277,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 
 		// Ensure rootfs is attached and get the mount path.
 		mode := piccoloModeFromExtensions(newDef.Extensions)
-		blockNativeRootfsMap, rErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, &newDef)
+		blockNativeRootfsMap, rErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, &newDef, appInst)
 		if rErr != nil {
 			return nil, fmt.Errorf("failed to attach rootfs: %w", rErr)
 		}

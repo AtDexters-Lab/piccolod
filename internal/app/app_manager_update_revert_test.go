@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"piccolod/internal/api"
@@ -40,10 +41,15 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 	}
 	instanceID := inst.InstanceID
 
-	// UpdateImage is not supported for service-mode apps (multi-container only).
+	// UpdateImage for single-service service-mode apps requires a rootfs manager.
+	// Without one, it returns an error about rootfs not being configured.
 	tag := "3.19"
-	if err := mgr.UpdateImage(ctx, instanceID, &tag); err == nil {
-		t.Fatalf("expected update image to fail for service-mode apps")
+	err = mgr.UpdateImage(ctx, instanceID, &tag)
+	if err == nil {
+		t.Fatalf("expected update image to fail without rootfs manager")
+	}
+	if !strings.Contains(err.Error(), "rootfs volume manager not configured") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// Revert is also not supported for service-mode apps.

@@ -98,6 +98,7 @@ type ServiceRootfsRequest struct {
 	ImageDigest string
 	ImageRef    string
 	IDMap       IDMapConfig
+	VolumeID    string // optional: override derived volume ID (for versioned updates, RFC 20260302)
 }
 
 // RootfsHandle is a reference to a mounted rootfs volume.
