@@ -85,7 +85,7 @@ dm-thin LV → LUKS → btrfs+zstd → flattened image
 - Created at first install of an image, shared by all containers using that image digest
 - Multi-container service apps create multiple golden LVs (one per container image). Sidecar images (postgres, redis) shared across apps using the same digest.
 - Never mounted during normal operation (only during creation and image updates)
-- Not replicated via DRBD (no NBD, no DRBD in normal stack). Cold-tiered as an opaque binary blob after creation (§4.5). Reconstructable from cold-tiered copy; re-pull + re-flatten is the last-resort fallback but produces a non-byte-identical LV.
+- Not replicated via DRBD (no NBD, no DRBD in normal stack). Durability strategy depends on usage: workspace golden LVs are cold-tiered as opaque block blobs (byte-identical recovery required); service golden LVs rely on OCI image cache at the orchestrator (re-flatten produces different blocks but C has no deltas). See §4.5.
 - Snapshots provide service rootfs (C) and workspace (B) instances
 
 ### 3.2 Workspace (B)
@@ -288,15 +288,15 @@ This preserves multi-UID semantics: inside the container, `/etc` is owned by roo
 
 If `mount_setattr` returns `ENOSYS` or `EINVAL`, piccolod fails hard. No fuse-overlayfs fallback. MicroOS ships kernel 6.x (btrfs idmap stable since 5.15, overlay idmap since 5.19). Hard dependency is acceptable for the target platform.
 
-### 4.5 Golden LV Cold Tiering
+### 4.5 Golden LV Durability and Self-Sovereignty
 
-Golden LVs are **non-reproducible binary artifacts**. Two independent `mkfs.btrfs` + `tar x` operations on the same OCI image will NOT produce byte-identical LVs — btrfs generates random filesystem UUIDs, non-deterministic metadata block allocation, and compression-dependent extent placement (see §5.7.1). This has two consequences:
+Golden LVs are **non-reproducible binary artifacts**. Two independent `mkfs.btrfs` + `tar x` operations on the same OCI image will NOT produce byte-identical LVs — btrfs generates random filesystem UUIDs, non-deterministic metadata block allocation, and compression-dependent extent placement (see §5.7.1). The durability strategy differs based on whether the golden LV backs workspaces or services:
 
-1. **Disaster recovery requires the original golden LV bytes.** Workspace snapshots (B) are dm-thin snapshots that share unmodified blocks with their golden LV origin. Recovering a workspace from cold tier requires applying the cold-tiered delta onto a byte-identical golden LV base. A re-pulled and re-flattened golden LV has different block layout — applying the old delta on a new base corrupts the filesystem.
+#### 4.5.1 Workspace Golden LVs — Cold-Tier LV Blocks
 
-2. **Self-sovereignty.** If an upstream registry goes down, rate-limits, or removes an image, the cold-tiered golden LV is the sovereign copy of the app's rootfs. Without it, a disk failure + registry outage = unrecoverable app with no fallback.
+Workspace snapshots (B) are dm-thin snapshots that share unmodified blocks with their golden LV origin. Cold-tiered workspace deltas are meaningless without the exact golden LV bytes as base — a re-pulled and re-flattened golden LV has different block layout, and applying old deltas on a new base corrupts the filesystem.
 
-**Mechanism:** After golden LV creation (§5.1), the golden LV is cold-tiered as a one-time opaque blob upload, keyed by image digest. This is NOT via NBD/DRBD — golden LVs have no NBD or DRBD in their stack. It is a separate fire-and-forget block-copy to cold storage:
+**Therefore, workspace golden LVs must be cold-tiered as opaque binary blobs** to device-level cold storage (PSFN shards):
 
 1. Golden LV creation completes (§5.1 steps 1-10)
 2. Reactivate LV, stream raw LUKS ciphertext blocks to cold storage
@@ -306,10 +306,42 @@ Golden LVs are **non-reproducible binary artifacts**. Two independent `mkfs.btrf
 **Properties:**
 - Immutable after creation — write once, never modified. Ideal cold tier candidate.
 - Small — compressed image size, typically 0.3-1.5 GiB per unique image digest.
-- Shared — one golden LV per unique digest serves all workspaces and services using that image.
+- Device-specific — contains btrfs UUIDs and metadata layout unique to this device's creation run.
 - Recall is rare — only needed on disk failure recovery or peer node provisioning (§5.7.1).
 
-**Interaction with §5.7.1 (DRBD skip-sync):** The golden LV block-copy to the peer node and the golden LV cold-tier upload are the same operation conceptually — shipping the opaque blob to a different destination. In a two-node cluster, the golden LV is shipped to both the peer and cold storage.
+#### 4.5.2 Service Golden LVs — OCI Image Cache at Orchestrator
+
+Service rootfs snapshots (C) are read-only, not replicated, and have no cold-tiered deltas. If the disk dies, C is gone, but recovery does NOT require the original golden LV bytes — any re-flatten of the same image works:
+
+1. Re-pull image from registry (or orchestrator cache)
+2. Re-flatten to new golden LV (different blocks — doesn't matter)
+3. Create new C snapshot
+4. Service data (D) recovered from DRBD peer or cold tier
+5. Service running — no data loss
+
+Block-level cold tiering of service golden LVs is unnecessary. However, **self-sovereignty requires registry independence**: if the upstream registry goes down, rate-limits, or removes an image, the service becomes unrecoverable without a cached copy of the OCI image.
+
+**Solution: cache OCI images at the orchestrator (Namekserver),** not golden LV blocks:
+
+- **Universal** — the same OCI image serves every device in the federation. Golden LVs are device-specific (btrfs UUIDs, thin pool geometry). One cached image benefits all devices.
+- **Smaller** — OCI images are compressed tar layers with no btrfs metadata overhead. More storage-efficient than golden LV block blobs.
+- **Natural fit** — Namekserver already tracks which apps are installed on which devices. Caching their images is an extension of app lifecycle management.
+- **Earlier in bootstrap chain** — Namekserver is reachable with device enrollment alone (before device cold tier shards are accessible, which requires control plane to locate).
+
+**Recovery with registry down:**
+1. Fetch OCI image from Namekserver cache → re-flatten → recover service rootfs
+2. Service data (D) from DRBD peer or cold tier
+
+#### 4.5.3 Summary
+
+| Golden LV type | Block parity required | Durability mechanism | Storage location |
+|----------------|----------------------|---------------------|-----------------|
+| Workspace (backs B) | Yes — delta base | Cold-tier LV blocks | Device cold tier (PSFN shards) |
+| Service (backs C) | No — C is disposable | Cache OCI image | Orchestrator (Namekserver) |
+
+Both paths provide self-sovereignty (independence from upstream registries). The distinction is that workspace golden LVs are device-specific artifacts tied to block-level recovery, while service golden LVs are reconstructable from the universal OCI image.
+
+**Interaction with §5.7.1 (DRBD skip-sync):** The workspace golden LV block-copy to the peer node and the cold-tier upload are the same operation conceptually — shipping the opaque blob to a different destination. In a two-node cluster, the golden LV is shipped to both the peer and cold storage.
 
 ### 4.6 NBD Integrity Verification
 
@@ -709,7 +741,7 @@ One entry in the control plane. All volumes reference this key.
 
 9. **NBD integrity verification cold tier dependency.** Self-healing only works for blocks that have been cold-tiered. Between write and cold-tier-ship, corruption is detectable (hash mismatch → `EIO`) but not correctable — same as LUKS AEAD behavior. The correction window depends on cold-tier upload latency and bandwidth. Hash index adds ~20 MiB memory per 10 GiB volume and ~100ns read-path latency (xxhash64). Acceptable for piccolo's scale.
 
-10. **Golden LV cold tier as bootstrap dependency.** Workspace disaster recovery depends on recalling the golden LV from cold storage before workspace deltas can be applied. If cold storage is unreachable, workspace recovery is blocked. Mitigated: in two-node clusters, the peer has a block-copied golden LV (§5.7.1) as an alternative source. Single-node without cold tier access falls back to re-pull + re-flatten (creates new workspaces, does not recover existing workspace data).
+10. **Golden LV cold tier as bootstrap dependency.** Workspace disaster recovery depends on recalling the golden LV block blob from device cold tier before workspace deltas can be applied. If cold storage is unreachable, workspace recovery is blocked. Mitigated: in two-node clusters, the peer has a block-copied golden LV (§5.7.1) as an alternative source. Single-node without cold tier access falls back to re-pull + re-flatten (creates new workspaces, does not recover existing workspace data). Service recovery has a weaker dependency — the orchestrator (Namekserver) OCI image cache must be reachable, but this is available earlier in the bootstrap chain than device cold tier.
 
 ## 11. Operational Readiness
 
