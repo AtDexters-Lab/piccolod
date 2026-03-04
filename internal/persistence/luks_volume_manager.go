@@ -1315,3 +1315,87 @@ func writeVolumeMetaV3(path string, meta *volumeMetaV3) error {
 	}
 	return fsutil.AtomicWriteFile(path, data, 0o600)
 }
+
+// --- Data volume snapshot and rollback (RFC 20260302 Phases 2-3) ---
+
+// SnapshotDataVolume creates a thin LV snapshot of an app's data volume.
+// The origin LV name is derived deterministically: "vol-app-" + instanceID.
+// LVM thin snapshots are metadata-only operations — safe while origin is active/mounted.
+func (m *luksVolumeManager) SnapshotDataVolume(ctx context.Context, instanceID, snapshotLVName string) error {
+	originLV := "vol-app-" + instanceID
+	if err := m.lvMgr.CreateSnapshot(ctx, originLV, snapshotLVName); err != nil {
+		return fmt.Errorf("snapshot data volume %s as %s: %w", originLV, snapshotLVName, err)
+	}
+	return nil
+}
+
+// DestroyDataSnapshot removes a data volume snapshot LV.
+func (m *luksVolumeManager) DestroyDataSnapshot(ctx context.Context, snapshotLVName string) error {
+	// Deactivate before removal (may already be inactive).
+	_ = m.lvMgr.DeactivateLV(ctx, snapshotLVName)
+	if err := m.lvMgr.RemoveThinLV(ctx, snapshotLVName); err != nil {
+		return fmt.Errorf("destroy data snapshot %s: %w", snapshotLVName, err)
+	}
+	return nil
+}
+
+// RollbackDataVolume performs a LUKS-aware LV rename swap with full detach/attach cycle.
+//
+// Sequence:
+//  1. Detach data volume (unmount ext4, cryptsetup close, close device stack)
+//  2. Rename active LV → failedLVName
+//  3. Rename snapshotLVName → active LV name
+//  4. Attach data volume (open stack, LUKS open, mount ext4)
+//
+// Returns (renamesCommitted, snapshotPromoted, error):
+//   - (false, false, err): failed before LV renames (detach or first rename failed), no LV state change
+//   - (true, false, err):  active→failed rename committed, but snapshot→active failed (partial state)
+//   - (true, true, nil):   fully succeeded (both renames + re-attach)
+//   - (true, true, err):   both renames committed but re-attach failed; caller must update tuple state
+//
+// The volume handle ID stays the same — only the underlying LV changes.
+// All containers must be stopped before calling this method.
+func (m *luksVolumeManager) RollbackDataVolume(ctx context.Context, instanceID, snapshotLVName, failedLVName string) (bool, bool, error) {
+	volumeID := "app-" + instanceID
+	handle := VolumeHandle{ID: volumeID, MountDir: paths.MountDir(volumeID)}
+
+	// 1. Full teardown: unmount + LUKS close + device stack close.
+	if err := m.Detach(ctx, handle); err != nil {
+		return false, false, fmt.Errorf("detach data volume before rollback: %w", err)
+	}
+
+	// 2. Rename active → failed.
+	activeLV := "vol-app-" + instanceID
+	if err := m.lvMgr.RenameLV(ctx, activeLV, failedLVName); err != nil {
+		// Attempt recovery: re-attach original.
+		_ = m.Attach(ctx, handle, AttachOptions{Role: VolumeRoleLeader})
+		return false, false, fmt.Errorf("rename active LV to failed: %w", err)
+	}
+
+	// 3. Rename snapshot → active.
+	if err := m.lvMgr.RenameLV(ctx, snapshotLVName, activeLV); err != nil {
+		// Attempt recovery: reverse step 2 and re-attach.
+		if reverseErr := m.lvMgr.RenameLV(ctx, failedLVName, activeLV); reverseErr != nil {
+			// Reverse rename also failed — active LV is now named failedLVName,
+			// snapshot LV still named snapshotLVName. Neither is named activeLV.
+			log.Printf("ERROR: rollback data volume %s: reverse rename also failed: %v", instanceID, reverseErr)
+			return true, false, fmt.Errorf("promote snapshot LV (reverse rename also failed): %w", err)
+		}
+		if attachErr := m.Attach(ctx, handle, AttachOptions{Role: VolumeRoleLeader}); attachErr != nil {
+			log.Printf("WARN: rollback data volume %s: reverse rename succeeded but re-attach failed: %v", instanceID, attachErr)
+			return false, false, fmt.Errorf("promote snapshot LV (re-attach after reversal failed): %w", err)
+		}
+		return false, false, fmt.Errorf("promote snapshot LV: %w", err)
+	}
+
+	// Both renames succeeded — LV swap is committed.
+
+	// 4. Re-attach (opens the promoted LV through full LUKS + mount stack).
+	if err := m.Attach(ctx, handle, AttachOptions{Role: VolumeRoleLeader}); err != nil {
+		log.Printf("WARN: rollback data volume %s: LV renames succeeded but re-attach failed: %v", instanceID, err)
+		return true, true, fmt.Errorf("re-attach data volume after rollback: %w", err)
+	}
+
+	log.Printf("INFO: rollback data volume for %s: %s → %s (failed: %s)", instanceID, snapshotLVName, activeLV, failedLVName)
+	return true, true, nil
+}

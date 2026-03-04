@@ -2143,10 +2143,6 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	// Determine the primary service for image reference.
 	primary := primaryServiceFor(curDef, appInst)
 
-	if mode == ModeService && len(curDef.Services) != 1 {
-		return fmt.Errorf("cannot update image for multi-service apps; update per-service images in the manifest and reinstall")
-	}
-
 	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return err
@@ -2196,9 +2192,10 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 		return fmt.Errorf("pull image %s: %w", newImage, err)
 	}
 
-	// Service-mode: transactional rootfs update (RFC 20260302 Phase 1).
+	// Service-mode: transactional rootfs update (RFC 20260302).
 	if mode == ModeService {
-		return m.updateServiceModeImage(ctx, state, appInst, &newDef, layout, runtime, primary, newImage)
+		updatedImages := map[string]string{primary: newImage}
+		return m.updateServiceModeImage(ctx, state, appInst, &newDef, layout, runtime, updatedImages)
 	}
 
 	// Legacy workspace/classic path (unchanged).
@@ -2254,8 +2251,28 @@ func replaceImageTag(img, newTag string) string {
 	return img + ":" + newTag
 }
 
+// dataVolumeSnapshotter is a narrow interface for data volume snapshot operations.
+// Satisfied by luksVolumeManager via type assertion on m.volumeManager.
+type dataVolumeSnapshotter interface {
+	SnapshotDataVolume(ctx context.Context, instanceID, snapshotLVName string) error
+	DestroyDataSnapshot(ctx context.Context, snapshotLVName string) error
+}
+
+// dataVolumeRollbacker is a narrow interface for data volume rollback operations.
+// Satisfied by luksVolumeManager via type assertion on m.volumeManager.
+type dataVolumeRollbacker interface {
+	// RollbackDataVolume performs a LUKS-aware LV rename swap with full detach/attach cycle.
+	// Returns (renamesCommitted, snapshotPromoted, error):
+	//   (false, false, err) — failed before LV renames, no LV state change
+	//   (true, false, err)  — active→failed rename committed, but snapshot→active failed
+	//   (true, true, nil)   — fully succeeded (both renames + re-attach)
+	//   (true, true, err)   — both renames committed but re-attach failed
+	RollbackDataVolume(ctx context.Context, instanceID string, snapshotLVName, failedLVName string) (renamesCommitted, snapshotPromoted bool, err error)
+}
+
 // updateServiceModeImage performs a transactional rootfs update for service-mode apps (RFC 20260302).
-// New rootfs is created alongside old (versioned by image digest). Old rootfs is retained for rollback.
+// Handles multi-container apps: changed services get new rootfs, unchanged services reuse existing.
+// All containers (including anchor) are stopped, snapshotted, removed, and recreated.
 func (m *AppManager) updateServiceModeImage(
 	ctx context.Context,
 	state *FilesystemStateManager,
@@ -2263,36 +2280,55 @@ func (m *AppManager) updateServiceModeImage(
 	newDef *api.AppDefinition,
 	layout appVolumeLayout,
 	runtime container.PodmanRuntime,
-	primary string,
-	newImage string,
+	updatedImages map[string]string, // svcName → newImage (only changed services)
 ) error {
 	instanceID := appInst.InstanceID
+	curDef := appInst.Definition
+	primary := primaryServiceFor(newDef, appInst)
+	mode := piccoloModeFromExtensions(newDef.Extensions)
+
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
 		return fmt.Errorf("rootfs volume manager not configured")
 	}
 
-	// 1. Inspect new image to get digest.
 	imageRuntime, err := m.podmanImageRuntime()
 	if err != nil {
 		return fmt.Errorf("get image runtime: %w", err)
 	}
-	imgConfig, err := m.containerManager.InspectImage(ctx, imageRuntime, newImage)
-	if err != nil {
-		return fmt.Errorf("inspect image %s: %w", newImage, err)
+
+	// 1. For each changed service: inspect image → get digest → compute versioned volume ID.
+	type changedService struct {
+		svcName    string
+		newImage   string
+		digest     string
+		volumeID   string
+		handle     persistence.RootfsHandle
+		imgConfig  persistence.GoldenImageConfig
 	}
-	newDigest := ""
-	if len(imgConfig.RepoDigests) > 0 {
-		newDigest = imgConfig.RepoDigests[0]
-	} else {
-		newDigest = imgConfig.Digest
+	changed := make([]changedService, 0, len(updatedImages))
+	for svcName, newImage := range updatedImages {
+		imgConfig, inspErr := m.containerManager.InspectImage(ctx, imageRuntime, newImage)
+		if inspErr != nil {
+			return fmt.Errorf("inspect image %s (service %s): %w", newImage, svcName, inspErr)
+		}
+		digest := ""
+		if len(imgConfig.RepoDigests) > 0 {
+			digest = imgConfig.RepoDigests[0]
+		} else {
+			digest = imgConfig.Digest
+		}
+		shortDigest := persistence.ShortDigest(digest)
+		volID := persistence.VersionedServiceRootfsVolumeID(instanceID, svcName, shortDigest)
+		changed = append(changed, changedService{
+			svcName:  svcName,
+			newImage: newImage,
+			digest:   digest,
+			volumeID: volID,
+		})
 	}
 
-	// 2. Compute versioned volume ID.
-	shortDigest := persistence.ShortDigest(newDigest)
-	newVolumeID := persistence.VersionedServiceRootfsVolumeID(instanceID, primary, shortDigest)
-
-	// 3. Build IDMap config.
+	// 2. Build IDMap config (once, shared across all services).
 	var idmap persistence.IDMapConfig
 	if runtime.Credential != nil {
 		idmap = persistence.IDMapConfig{
@@ -2310,104 +2346,491 @@ func (m *AppManager) updateServiceModeImage(
 		}
 	}
 
-	// 4. Create new rootfs (idempotent: skip if already exists from a retry).
-	var rootfsHandle persistence.RootfsHandle
-	if rootfs.RootfsExists(newVolumeID) {
-		log.Printf("INFO: update %s: rootfs %s already exists, attaching", instanceID, newVolumeID)
-		rootfsHandle, err = rootfs.AttachRootfs(ctx, newVolumeID)
-		if err != nil {
-			return fmt.Errorf("attach existing rootfs %s: %w", newVolumeID, err)
-		}
-	} else {
-		rootfsHandle, err = rootfs.CreateServiceRootfs(ctx, persistence.ServiceRootfsRequest{
-			InstanceID:  instanceID,
-			ServiceName: primary,
-			ImageDigest: newDigest,
-			ImageRef:    newImage,
-			IDMap:       idmap,
-			VolumeID:    newVolumeID,
-		})
-		if err != nil {
-			return fmt.Errorf("create new rootfs: %w", err)
+	// 3. For each changed service: create new rootfs (idempotent, while still running).
+	for i := range changed {
+		cs := &changed[i]
+		if rootfs.RootfsExists(cs.volumeID) {
+			log.Printf("INFO: update %s: rootfs %s already exists, attaching", instanceID, cs.volumeID)
+			cs.handle, err = rootfs.AttachRootfs(ctx, cs.volumeID)
+			if err != nil {
+				return fmt.Errorf("attach existing rootfs %s: %w", cs.volumeID, err)
+			}
+		} else {
+			cs.handle, err = rootfs.CreateServiceRootfs(ctx, persistence.ServiceRootfsRequest{
+				InstanceID:  instanceID,
+				ServiceName: cs.svcName,
+				ImageDigest: cs.digest,
+				ImageRef:    cs.newImage,
+				IDMap:       idmap,
+				VolumeID:    cs.volumeID,
+			})
+			if err != nil {
+				return fmt.Errorf("create rootfs for service %s: %w", cs.svcName, err)
+			}
 		}
 	}
 
-	// Read image config from golden LV.
-	goldenImgConfig, err := m.readImageConfigForRootfs(ctx, rootfs, newDigest)
+	// 4. Read image config from golden LV for each changed service.
+	for i := range changed {
+		cs := &changed[i]
+		goldenCfg, cfgErr := m.readImageConfigForRootfs(ctx, rootfs, cs.digest)
+		if cfgErr != nil {
+			log.Printf("WARN: update %s: failed to read image config for %s: %v", instanceID, cs.svcName, cfgErr)
+		} else {
+			cs.imgConfig = goldenCfg
+		}
+	}
+
+	// 5. Stop ALL containers (services in reverse dep order, then anchor).
+	if err := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
+		log.Printf("WARN: update %s: stop containers: %v", instanceID, err)
+	}
+
+	// 6. Tuple snapshot: capture pre-update state for rollback.
+	tupleState, snapshotOK := m.snapshotTupleBeforeUpdate(ctx, state, appInst, primary)
+	if !snapshotOK {
+		log.Printf("WARN: update %s: proceeding without rollback capability", instanceID)
+	}
+
+	// 7. Remove ALL containers (services + anchor).
+	if err := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
+		log.Printf("WARN: update %s: remove containers: %v", instanceID, err)
+	}
+
+	// 8. Recreate ALL containers (anchor + services in start order).
+	// Build rootfs map: changed services use new rootfs, unchanged use existing.
+	changedMap := make(map[string]*rootfsMountInfo, len(changed))
+	for i := range changed {
+		cs := &changed[i]
+		changedMap[cs.svcName] = &rootfsMountInfo{handle: cs.handle, imgConfig: cs.imgConfig}
+	}
+
+	// Attach unchanged service rootfs volumes.
+	unchangedRootfs, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, newDef, appInst)
 	if err != nil {
-		log.Printf("WARN: update %s: failed to read image config: %v", instanceID, err)
-		goldenImgConfig = persistence.GoldenImageConfig{}
-	}
-
-	// 5. Stop old container (anchor stays running).
-	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
-
-	// 6. Detach old rootfs (best-effort).
-	oldVolumeID := ""
-	if appInst.ActiveRootfs != nil {
-		oldVolumeID = appInst.ActiveRootfs[primary]
-	}
-	if oldVolumeID == "" {
-		oldVolumeID = persistence.ServiceRootfsVolumeID(instanceID, primary)
-	}
-	_ = rootfs.DetachRootfs(ctx, oldVolumeID)
-
-	// 7. Remove old container.
-	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
-
-	// 8. Resolve anchor ID.
-	anchorID := appInst.NetworkAnchorID
-	if anchorID == "" {
-		if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, networkAnchorContainerName(instanceID)); resolveErr == nil {
-			anchorID = id
+		// Unchanged rootfs attach failed — abort to prevent metadata/rootfs mismatch.
+		// Detach new rootfs volumes; reconciler handles recovery using old definition.
+		for _, cs := range changed {
+			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
 		}
-	}
-
-	// 9. Create + start new container.
-	newCID, err := m.createAndStartServiceContainer(ctx, runtime, serviceContainerOptions{
-		layout:          layout,
-		appDef:          newDef,
-		instanceID:      instanceID,
-		primary:         primary,
-		svcName:         primary,
-		anchorID:        anchorID,
-		credential:      runtime.Credential,
-		rootfsHandle:    &rootfsHandle,
-		goldenImgConfig: &goldenImgConfig,
-	})
-	if err != nil {
-		// Detach the new rootfs to leave the system in a clean state.
-		// The rootfs volume is preserved (not destroyed) for debugging.
-		// Recovery: old rootfs still exists. ActiveRootfs was NOT updated (step 10 not reached),
-		// so the reconciler will try to attach the old (legacy or previous versioned) volume ID.
-		// Manual recovery: revert app.yaml and restart, or reinstall.
-		_ = rootfs.DetachRootfs(ctx, newVolumeID)
 		m.setObservedStatus(instanceID, StatusError)
-		return fmt.Errorf("create updated container: %w", err)
+		return fmt.Errorf("update %s: attach unchanged rootfs: %w", instanceID, err)
 	}
 
-	// 10. Update state.
-	appInst.Definition = newDef
-	appInst.SetPrimaryContainerID(newCID)
+	// Merge: changed services override unchanged.
+	prebuiltRootfs := make(map[string]*rootfsMountInfo, len(newDef.Services))
+	for svcName, info := range unchangedRootfs {
+		prebuiltRootfs[svcName] = info
+	}
+	for svcName, info := range changedMap {
+		prebuiltRootfs[svcName] = info
+	}
+
+	// Get current service endpoints (ports should not change during update).
+	endpoints, _ := m.serviceManager.GetByApp(instanceID)
+	if len(endpoints) == 0 {
+		// Fallback: if service registry lost (e.g., error escalation), allocate fresh endpoints.
+		var allocErr error
+		endpoints, allocErr = m.serviceManager.AllocateForApp(instanceID, newDef.Listeners)
+		if allocErr != nil {
+			return fmt.Errorf("update %s: allocate endpoints: %w", instanceID, allocErr)
+		}
+	}
+	result, err := m.installContainerGroup(ctx, newDef, instanceID, layout, runtime, endpoints, prebuiltRootfs)
+	if err != nil {
+		// Detach new rootfs volumes, leave old ones for recovery.
+		for _, cs := range changed {
+			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
+		}
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("recreate containers after update: %w", err)
+	}
+
+	// 9. Update state: ActiveRootfs for changed services, definition, container IDs.
 	if appInst.ActiveRootfs == nil {
 		appInst.ActiveRootfs = make(map[string]string)
 	}
-	appInst.ActiveRootfs[primary] = newVolumeID
+	for _, cs := range changed {
+		appInst.ActiveRootfs[cs.svcName] = cs.volumeID
+	}
+	appInst.Definition = newDef
+	appInst.PrimaryService = result.PrimaryService
+	appInst.NetworkAnchorID = result.NetworkAnchorID
+	appInst.Containers = result.Containers
 	appInst.UpdatedAt = time.Now()
 	if err := state.StoreApp(appInst); err != nil {
-		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
-		_ = m.containerManager.RemoveContainer(ctx, runtime, newCID)
+		// Best-effort cleanup: remove containers created by installContainerGroup
+		// to prevent unmanaged containers running with stale on-disk metadata.
+		if rmErr := m.removeContainersForMultiApp(ctx, result, newDef, runtime); rmErr != nil {
+			log.Printf("WARN: update %s: cleanup after persist failure: %v", instanceID, rmErr)
+		}
+		for _, cs := range changed {
+			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
+		}
 		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("store app: %w", err)
 	}
 
-	// 11. Re-set service manager container ID.
-	if anchorID != "" {
-		m.serviceManager.SetAppContainerID(instanceID, anchorID)
+	// 10. Post-update: record new active generation (only when snapshot exists for rollback).
+	if tupleState != nil && snapshotOK {
+		m.recordPostUpdateGeneration(state, appInst, tupleState)
 	}
 
 	m.setObservedStatus(instanceID, StatusRunning)
-	log.Printf("INFO: update %s: image updated to %s (rootfs=%s)", instanceID, newImage, newVolumeID)
+	log.Printf("INFO: update %s: image updated for %d service(s)", instanceID, len(changed))
+	return nil
+}
+
+// snapshotTupleBeforeUpdate captures pre-update state for rollback (RFC 20260302 Phase 2).
+// Returns the TupleState and whether the snapshot was successfully created.
+// On failure, the update proceeds in degraded mode (no rollback capability).
+func (m *AppManager) snapshotTupleBeforeUpdate(
+	ctx context.Context, state *FilesystemStateManager,
+	appInst *AppInstance, primary string,
+) (tupleState *TupleState, snapshotOK bool) {
+	instanceID := appInst.InstanceID
+
+	// Load or create TupleState.
+	ts, err := state.LoadTupleState(instanceID)
+	if err != nil {
+		log.Printf("WARN: update %s: load tuple state: %v", instanceID, err)
+		return nil, false
+	}
+	if ts == nil {
+		ts = &TupleState{
+			InstanceID:    instanceID,
+			NextGenNumber: 1,
+		}
+	}
+
+	// Always create a fresh snapshot — even if a previous snapshot exists for the same rootfs state.
+	// The data volume may have accumulated writes since the last snapshot, so reusing an old one
+	// would lose data on rollback (e.g., update retry after partial failure).
+
+	// Allocate generation ID.
+	genID := ts.AllocateGenerationID()
+	// Extract generation number from ID for LV naming.
+	genNumber := ts.NextGenNumber - 1
+
+	// Capture current rootfs state.
+	rootfsVolIDs := make(map[string]string)
+	if appInst.ActiveRootfs != nil {
+		for k, v := range appInst.ActiveRootfs {
+			rootfsVolIDs[k] = v
+		}
+	} else if primary != "" {
+		// Legacy fallback.
+		rootfsVolIDs[primary] = persistence.ServiceRootfsVolumeID(instanceID, primary)
+	}
+
+	// Snapshot data volume.
+	snapshotLVName := DataSnapshotLVName(instanceID, genNumber)
+	dataSnapshotName := ""
+	if snapshotter, ok := m.currentVolumeManager().(dataVolumeSnapshotter); ok {
+		if snapErr := snapshotter.SnapshotDataVolume(ctx, instanceID, snapshotLVName); snapErr != nil {
+			log.Printf("WARN: update %s: data snapshot failed: %v", instanceID, snapErr)
+		} else {
+			dataSnapshotName = snapshotLVName
+			snapshotOK = true
+			log.Printf("INFO: update %s: data snapshot created: %s", instanceID, snapshotLVName)
+		}
+	} else {
+		log.Printf("WARN: update %s: volume manager does not support snapshots", instanceID)
+	}
+
+	// Only create a rollback-capable snapshot generation if the data snapshot succeeded.
+	// Without a data snapshot, rootfs-only rollback would run old rootfs against new data.
+	if dataSnapshotName == "" {
+		log.Printf("WARN: update %s: no data snapshot — update proceeds without rollback capability", instanceID)
+		return ts, false
+	}
+
+	// Deprecate existing active and snapshot generations.
+	// Only the new snapshot (with data snapshot LV) is a valid rollback target.
+	now := time.Now()
+	for i := range ts.Generations {
+		g := &ts.Generations[i]
+		if g.Status == TupleStatusActive || g.Status == TupleStatusSnapshot {
+			g.Status = TupleStatusDeprecated
+			g.DeprecatedAt = &now
+		}
+	}
+
+	// Append new snapshot generation.
+	ts.Generations = append(ts.Generations, TupleGeneration{
+		ID:           genID,
+		RootfsVolIDs: rootfsVolIDs,
+		DataSnapshot: dataSnapshotName,
+		CreatedAt:    time.Now(),
+		Status:       TupleStatusSnapshot,
+	})
+
+	// Persist.
+	if storeErr := state.StoreTupleState(instanceID, ts); storeErr != nil {
+		log.Printf("WARN: update %s: persist tuple state: %v", instanceID, storeErr)
+		// Clean up the orphaned snapshot LV since it won't be tracked in metadata.
+		if dataSnapshotName != "" {
+			if cleanupSnap, ok := m.currentVolumeManager().(dataVolumeSnapshotter); ok {
+				if destroyErr := cleanupSnap.DestroyDataSnapshot(ctx, dataSnapshotName); destroyErr != nil {
+					log.Printf("WARN: update %s: cleanup orphaned snapshot %s: %v", instanceID, dataSnapshotName, destroyErr)
+				}
+			}
+		}
+		snapshotOK = false
+	}
+
+	return ts, snapshotOK
+}
+
+// recordPostUpdateGeneration records the new active generation after a successful update.
+func (m *AppManager) recordPostUpdateGeneration(state *FilesystemStateManager, appInst *AppInstance, ts *TupleState) {
+	genID := ts.AllocateGenerationID()
+
+	rootfsVolIDs := make(map[string]string)
+	if appInst.ActiveRootfs != nil {
+		for k, v := range appInst.ActiveRootfs {
+			rootfsVolIDs[k] = v
+		}
+	}
+
+	ts.Generations = append(ts.Generations, TupleGeneration{
+		ID:           genID,
+		RootfsVolIDs: rootfsVolIDs,
+		CreatedAt:    time.Now(),
+		Status:       TupleStatusActive,
+	})
+	ts.CurrentGeneration = genID
+
+	if err := state.StoreTupleState(appInst.InstanceID, ts); err != nil {
+		log.Printf("WARN: update %s: persist post-update generation: %v", appInst.InstanceID, err)
+	}
+}
+
+// mapsEqual compares two string maps for equality.
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// RollbackToSnapshot rolls back an app to its latest snapshot generation (RFC 20260302 Phase 3).
+// This is the exported entry point — acquires reconcileMu.
+func (m *AppManager) RollbackToSnapshot(ctx context.Context, instanceID string) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+
+	if err := m.ensureUnlocked(); err != nil {
+		return err
+	}
+	if err := m.ensureKernelLeader(); err != nil {
+		return err
+	}
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return err
+	}
+	appInst, exists := state.GetApp(instanceID)
+	if !exists {
+		return fmt.Errorf("app instance not found: %s", instanceID)
+	}
+	return m.rollbackToSnapshotLocked(ctx, state, appInst)
+}
+
+// rollbackToSnapshotLocked performs the rollback. Caller holds reconcileMu.
+func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance) error {
+	instanceID := appInst.InstanceID
+
+	ts, err := state.LoadTupleState(instanceID)
+	if err != nil {
+		return fmt.Errorf("load tuple state: %w", err)
+	}
+	if ts == nil {
+		return fmt.Errorf("no tuple state for %s: rollback not available", instanceID)
+	}
+	snap := ts.LatestSnapshot()
+	if snap == nil {
+		return fmt.Errorf("no snapshot available for rollback")
+	}
+
+	curDef, err := state.GetAppDefinition(instanceID)
+	if err != nil {
+		return fmt.Errorf("read app definition: %w", err)
+	}
+	mode := piccoloModeFromExtensions(curDef.Extensions)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	if err != nil {
+		return err
+	}
+
+	// 1. Stop ALL containers.
+	if err := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
+		log.Printf("WARN: rollback %s: stop containers: %v", instanceID, err)
+	}
+
+	// 2. Rollback data volume if snapshot has one.
+	dataVolumeOK := true
+	snapshotCanPromote := true // false only in partial-rename case
+	if snap.DataSnapshot != "" {
+		rollbacker, ok := m.currentVolumeManager().(dataVolumeRollbacker)
+		if !ok {
+			return fmt.Errorf("volume manager does not support rollback")
+		}
+		// Compute failed LV name from the active generation.
+		activeGen := ts.ActiveGeneration()
+		failedGenNumber := ts.NextGenNumber - 1
+		if activeGen != nil {
+			if n, _ := fmt.Sscanf(activeGen.ID, "gen-%d", &failedGenNumber); n != 1 {
+				log.Printf("WARN: rollback %s: could not parse gen number from %q, using fallback %d",
+					instanceID, activeGen.ID, failedGenNumber)
+			}
+		}
+		failedLVName := FailedDataLVName(instanceID, failedGenNumber)
+
+		renamesCommitted, snapshotPromoted, rollbackErr := rollbacker.RollbackDataVolume(ctx, instanceID, snap.DataSnapshot, failedLVName)
+		if rollbackErr != nil && !renamesCommitted {
+			// Pre-swap failure (detach or rename). No LV state change — safe to abort.
+			// Containers were stopped in step 1 but no LV state changed, so the reconciler
+			// will detect stopped containers and restart them on the next pass.
+			log.Printf("ERROR: rollback %s: data volume rollback failed (no LV change): %v", instanceID, rollbackErr)
+			return fmt.Errorf("data volume rollback: %w", rollbackErr)
+		}
+		if rollbackErr != nil {
+			log.Printf("ERROR: rollback %s: LV rename(s) committed but incomplete: %v", instanceID, rollbackErr)
+			dataVolumeOK = false
+		}
+		if !snapshotPromoted {
+			// Partial rename: active→failed succeeded but snapshot→active failed.
+			// Snapshot LV still exists under its original name — do NOT mark as promoted.
+			snapshotCanPromote = false
+		}
+
+		// Record failed LV name for GC tracking.
+		if renamesCommitted {
+			if activeGen != nil {
+				activeGen.FailedLVName = failedLVName
+			} else {
+				// No active generation (update failed before recordPostUpdateGeneration).
+				// Create a tracking entry so GC can clean the orphaned LV.
+				failedNow := time.Now()
+				ts.Generations = append(ts.Generations, TupleGeneration{
+					ID:           fmt.Sprintf("gen-failed-%d", failedGenNumber),
+					Status:       TupleStatusFailed,
+					FailedLVName: failedLVName,
+					FailedAt:     &failedNow,
+					CreatedAt:    failedNow,
+				})
+			}
+		}
+	}
+
+	// Re-resolve snap pointer — the append above may have reallocated the slice.
+	snap = ts.LatestSnapshot()
+	if snap == nil {
+		// Should not happen — snapshot was validated above. Defensive check.
+		return fmt.Errorf("rollback %s: snapshot generation lost after slice mutation", instanceID)
+	}
+
+	// 3. Update generation statuses EARLY — LV renames are committed at this point
+	// and tuple state must reflect reality even if container creation is skipped.
+	if active := ts.ActiveGeneration(); active != nil {
+		active.Status = TupleStatusFailed
+		failedNow := time.Now()
+		active.FailedAt = &failedNow
+	}
+	if snapshotCanPromote {
+		snap.Status = TupleStatusActive
+		snap.DataSnapshot = "" // promoted — no longer a snapshot LV
+		ts.CurrentGeneration = snap.ID
+	}
+
+	// 4. Swap ActiveRootfs to snapshot generation's rootfs.
+	appInst.ActiveRootfs = make(map[string]string, len(snap.RootfsVolIDs))
+	for k, v := range snap.RootfsVolIDs {
+		appInst.ActiveRootfs[k] = v
+	}
+	appInst.UpdatedAt = time.Now()
+
+	// 5. Persist state BEFORE container creation — ensures metadata matches LV reality
+	// even if subsequent steps fail.
+	if err := state.StoreTupleState(instanceID, ts); err != nil {
+		log.Printf("WARN: rollback %s: persist tuple state: %v", instanceID, err)
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("store app state during rollback: %w", err)
+	}
+
+	// 6. If data volume attach failed, remove old containers and clear container state.
+	// Reconciler will retry mount + container recreation using updated ActiveRootfs.
+	if !dataVolumeOK {
+		if err := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
+			log.Printf("WARN: rollback %s: remove containers after attach failure: %v", instanceID, err)
+		}
+		appInst.NetworkAnchorID = ""
+		appInst.Containers = nil
+		_ = state.StoreAppMetadata(appInst)
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("rollback %s: data volume not mounted (LV renames committed, reconciler will retry)", instanceID)
+	}
+
+	// 7. Capture endpoints for port reuse (keep service registry intact for proxies).
+	endpoints, _ := m.serviceManager.GetByApp(instanceID)
+
+	// 8. Remove ALL containers (but preserve service registry — proxies stay running).
+	if err := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
+		log.Printf("WARN: rollback %s: remove containers: %v", instanceID, err)
+	}
+
+	// If no endpoints exist (e.g., after error escalation), allocate fresh ones.
+	if len(endpoints) == 0 {
+		var allocErr error
+		endpoints, allocErr = m.serviceManager.AllocateForApp(instanceID, curDef.Listeners)
+		if allocErr != nil {
+			return fmt.Errorf("rollback %s: allocate endpoints: %w", instanceID, allocErr)
+		}
+	}
+
+	// 9. Attach snapshot rootfs and recreate containers.
+	rootfs := m.currentRootfsManager()
+	var prebuiltRootfs map[string]*rootfsMountInfo
+	if rootfs != nil {
+		prebuiltRootfs, err = m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, curDef, appInst)
+		if err != nil {
+			// Rootfs attach failed — cannot create containers with correct snapshot rootfs.
+			// State is already persisted and consistent. Reconciler will retry.
+			m.setObservedStatus(instanceID, StatusError)
+			return fmt.Errorf("rollback %s: attach snapshot rootfs: %w", instanceID, err)
+		}
+	}
+	result, err := m.installContainerGroup(ctx, curDef, instanceID, layout, runtime, endpoints, prebuiltRootfs)
+	if err != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("recreate containers after rollback: %w", err)
+	}
+
+	// 10. Update container IDs and persist final state.
+	appInst.NetworkAnchorID = result.NetworkAnchorID
+	appInst.Containers = result.Containers
+	appInst.PrimaryService = result.PrimaryService
+	appInst.UpdatedAt = time.Now()
+
+	if err := state.StoreApp(appInst); err != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("store app after rollback: %w", err)
+	}
+
+	m.setObservedStatus(instanceID, StatusRunning)
+	log.Printf("INFO: rollback %s: rolled back to generation %s", instanceID, snap.ID)
 	return nil
 }
 

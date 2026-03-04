@@ -79,9 +79,9 @@ func TestUpdateImage_WorkspaceMode_Blocked(t *testing.T) {
 	}
 }
 
-func TestUpdateImage_MultiServiceMode_Blocked(t *testing.T) {
+func TestUpdateImage_MultiServiceMode_RequiresRootfs(t *testing.T) {
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
-	tmp, err := os.MkdirTemp("", "update_multi_blocked")
+	tmp, err := os.MkdirTemp("", "update_multi_rootfs")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,12 +111,13 @@ func TestUpdateImage_MultiServiceMode_Blocked(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 
+	// Multi-service update now proceeds (not blocked), but requires rootfs manager.
 	tag := "1.26"
 	err = mgr.UpdateImage(ctx, inst.InstanceID, &tag)
 	if err == nil {
-		t.Fatal("expected error for multi-service update")
+		t.Fatal("expected error: rootfs manager not configured in unit test")
 	}
-	if !strings.Contains(err.Error(), "multi-service") {
+	if !strings.Contains(err.Error(), "rootfs") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

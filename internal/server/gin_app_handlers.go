@@ -853,6 +853,31 @@ func (s *GinServer) handleGinAppStop(c *gin.Context) {
 	writeGinSuccess(c, nil, "App '"+appName+"' stopped successfully")
 }
 
+// handleGinAppRollback handles POST /api/v1/apps/:name/rollback - Rollback to previous snapshot
+func (s *GinServer) handleGinAppRollback(c *gin.Context) {
+	appName := c.Param("name")
+
+	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	err := s.appManager.RollbackToSnapshot(ctx, appName)
+	if err != nil {
+		if handleAppManagerError(c, err, "rollback app") {
+			return
+		}
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "not found"):
+			writeGinError(c, http.StatusNotFound, errMsg)
+		case strings.Contains(errMsg, "no snapshot available") || strings.Contains(errMsg, "no tuple state"):
+			writeGinError(c, http.StatusConflict, "No snapshot available for rollback")
+		default:
+			writeGinError(c, http.StatusInternalServerError, "Rollback failed: "+errMsg)
+		}
+		return
+	}
+
+	writeGinSuccess(c, nil, "App '"+appName+"' rolled back successfully")
+}
+
 // handleGinAppClone handles POST /api/v1/apps/:name/clone - Clone a workspace app
 func (s *GinServer) handleGinAppClone(c *gin.Context) {
 	originName := c.Param("name")

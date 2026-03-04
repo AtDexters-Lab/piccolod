@@ -152,6 +152,18 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 	mode := piccoloModeFromExtensions(def.Extensions)
 
+	// Recover from partially-completed rollbacks (crash between LV rename steps).
+	if err := m.reconcilePartialRollback(ctx, state, appInst.InstanceID); err != nil {
+		log.Printf("WARN: reconcile app %s: partial rollback recovery: %v", appInst.InstanceID, err)
+	}
+
+	// Tuple health: auto-rollback (StatusError from previous pass) and auto-deprecation (24h healthy).
+	// Must run before container state checks so auto-rollback triggers before container recreation attempts.
+	// Only for running apps — stopped/follower apps should not trigger rollback or deprecation.
+	if desiredRunning {
+		m.checkTupleHealth(ctx, state, appInst)
+	}
+
 	// Ensure all service rootfs volumes are attached before reconciling containers.
 	// Returns nil for legacy apps without rootfs volumes.
 	var blockNativeRootfsMap map[string]*rootfsMountInfo
@@ -393,6 +405,10 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		m.setObservedStatusMessage(appInst.InstanceID, "")
 	}
 
+	// Mark active generation as healthy now that reconciler confirmed all containers running.
+	// Must be after container verification (above), not in checkTupleHealth (which runs before).
+	m.markTupleHealthy(state, appInst.InstanceID)
+
 	// Restore endpoints/proxies and ensure published ports match our expected allocations.
 	if err := m.ensureServicesForRunningApp(ctx, def, appInst.InstanceID, anchorID, runtime); err != nil {
 		log.Printf("WARN: reconcile app %s: restore services failed: %v", appInst.InstanceID, err)
@@ -422,6 +438,11 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			return nil
 		}
 		log.Printf("WARN: reconcile app %s: publish reconcile failed: %v", appInst.InstanceID, err)
+	}
+
+	// Tuple GC: remove expired deprecated and failed generations (daily).
+	if gcErr := m.garbageCollectGenerations(ctx, state, appInst.InstanceID); gcErr != nil {
+		log.Printf("WARN: reconcile app %s: tuple GC: %v", appInst.InstanceID, gcErr)
 	}
 
 	// Detect stale DNAT rules: if the existing backend health check (15s interval,

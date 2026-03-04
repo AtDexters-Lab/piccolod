@@ -105,6 +105,15 @@ func (m *LVManager) ResizeLV(ctx context.Context, name string, newSizeBytes int6
 	return nil
 }
 
+// RenameLV renames a thin logical volume.
+func (m *LVManager) RenameLV(ctx context.Context, oldName, newName string) error {
+	if err := m.run.Run(ctx, "lvrename", m.vgName, oldName, newName); err != nil {
+		return fmt.Errorf("lvrename %s/%s → %s: %w", m.vgName, oldName, newName, err)
+	}
+	log.Printf("thin LV renamed: %s/%s → %s", m.vgName, oldName, newName)
+	return nil
+}
+
 // LVExists checks if a thin LV exists.
 func (m *LVManager) LVExists(ctx context.Context, name string) bool {
 	lvPath := fmt.Sprintf("%s/%s", m.vgName, name)

@@ -542,6 +542,45 @@ func TestLVManager_ResizeLV(t *testing.T) {
 	}
 }
 
+func TestLVManager_RenameLV(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		run := &fakeRunner{}
+		mgr := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		if err := mgr.RenameLV(context.Background(), "vol-old", "vol-new"); err != nil {
+			t.Fatalf("RenameLV: %v", err)
+		}
+		if len(run.calls) != 1 {
+			t.Fatalf("expected 1 call, got %d: %v", len(run.calls), run.calls)
+		}
+		call := run.calls[0]
+		if !strings.Contains(call, "lvrename") {
+			t.Errorf("expected lvrename, got %q", call)
+		}
+		if !strings.Contains(call, DefaultVGName) {
+			t.Errorf("expected VG name in args: %q", call)
+		}
+		if !strings.Contains(call, "vol-old") || !strings.Contains(call, "vol-new") {
+			t.Errorf("expected old and new names in args: %q", call)
+		}
+	})
+
+	t.Run("error", func(t *testing.T) {
+		run := &fakeRunner{
+			errs: map[string]error{
+				buildKey("lvrename", []string{DefaultVGName, "vol-old", "vol-new"}): fmt.Errorf("LV locked"),
+			},
+		}
+		mgr := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		err := mgr.RenameLV(context.Background(), "vol-old", "vol-new")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "lvrename") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
 // --- Types tests ---
 
 func TestThresholdLevel(t *testing.T) {
