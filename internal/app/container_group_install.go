@@ -14,9 +14,8 @@ import (
 )
 
 // installContainerGroup installs an app as a container group (network anchor + service containers).
-// This is the unified install path for both service and workspace modes.
-// For workspace mode, it prepares workspace disks and uses --rootfs mode.
-// For service mode, it uses standard image-based containers.
+// All containers use --rootfs from golden LV snapshots (block-native architecture).
+// For workspace mode, workspace disks are prepared via golden LVs.
 // When prebuiltRootfs is non-nil, services with entries skip image pull + rootfs creation (used by clone).
 func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint, prebuiltRootfs map[string]*rootfsMountInfo) (*AppInstance, error) {
 	if m.serviceManager == nil {
@@ -119,16 +118,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		log.Printf("INFO: install %s: repaired corrupted podman storage before pull", instanceID)
 	}
 
-	// Also validate the shared image runtime storage (shared imagestore across all app types).
-	// All image pulls target the shared imagestore, so corruption there affects all modes.
-	if imageRuntime, err := m.podmanImageRuntime(); err == nil {
-		if repaired, vErr := m.containerManager.ValidateAndRepairStorage(ctx, imageRuntime); vErr != nil {
-			log.Printf("WARN: install %s: image runtime storage validation error: %v", instanceID, vErr)
-		} else if repaired {
-			log.Printf("INFO: install %s: repaired image runtime storage before pull", instanceID)
-		}
-	}
-
 	// Prepare storage for each service (pull images or init workspace disks)
 	// Progress range 15-55% is divided equally among images
 	const pullProgressMin = 15
@@ -139,13 +128,15 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		pullRangePerService = (pullProgressMax - pullProgressMin) / numServices
 	}
 
-	// Block-native rootfs path: prepare per-service rootfs from golden LV snapshots.
+	// Block-native rootfs: prepare per-service rootfs from golden LV snapshots.
+	if m.currentRootfsManager() == nil {
+		return nil, fmt.Errorf("rootfs volume manager not configured")
+	}
 	blockNativeRootfsMap := make(map[string]*rootfsMountInfo)
-	useBlockNative := m.currentRootfsManager() != nil
 
 	// Build IDMap config once (shared across all services — same per-app user).
 	var idmap persistence.IDMapConfig
-	if useBlockNative && runtime.Credential != nil {
+	if runtime.Credential != nil {
 		idmap = persistence.IDMapConfig{
 			AppUID: runtime.Credential.Uid,
 			AppGID: runtime.Credential.Gid,
@@ -184,43 +175,71 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		}
 
 		if svc.Image != "" {
-			// Pull image to shared imagestore (needed for golden LV flatten).
+			// Pull to ephemeral runtime for digest, then prepare rootfs
+			// (EnsureGoldenLV handles flatten internally).
+			ephRT, ephCleanup, ephErr := newEphemeralFlattenRuntime(m.runtimeUser)
+			if ephErr != nil {
+				return nil, fmt.Errorf("create ephemeral runtime: %w", ephErr)
+			}
 			callback := m.makeImagePullProgressCallback(ctx, instanceID, svcName, svc.Image, progressRange)
-			if pullErr := m.pullToImagestore(ctx, svc.Image, callback); pullErr != nil {
-				log.Printf("WARN: install %s: image pull failed for %s: %v", instanceID, svcName, pullErr)
+			if pullErr := m.containerManager.PullImageWithProgress(ctx, ephRT, svc.Image, callback); pullErr != nil {
+				ephCleanup()
+				return nil, fmt.Errorf("pull image %s: %w", svc.Image, pullErr)
+			}
+			imgConfig, inspErr := m.containerManager.InspectImage(ctx, ephRT, svc.Image)
+			ephCleanup()
+			if inspErr != nil {
+				return nil, fmt.Errorf("inspect image %s: %w", svc.Image, inspErr)
+			}
+			imageDigest := ""
+			if len(imgConfig.RepoDigests) > 0 {
+				imageDigest = imgConfig.RepoDigests[0]
+			} else {
+				imageDigest = imgConfig.Digest
 			}
 
-			if useBlockNative {
-				// Get image digest.
-				imageRuntime, err := m.podmanImageRuntime()
-				if err != nil {
-					return nil, fmt.Errorf("get image runtime: %w", err)
-				}
-				imgConfig, err := m.containerManager.InspectImage(ctx, imageRuntime, svc.Image)
-				if err != nil {
-					return nil, fmt.Errorf("inspect image %s: %w", svc.Image, err)
-				}
-				imageDigest := ""
-				if len(imgConfig.RepoDigests) > 0 {
-					imageDigest = imgConfig.RepoDigests[0]
-				} else {
-					imageDigest = imgConfig.Digest
-				}
-
-				rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, imageDigest, svc.Image, idmap)
-				if err != nil {
-					return nil, fmt.Errorf("prepare rootfs for service '%s': %w", svcName, err)
-				}
-				blockNativeRootfsMap[svcName] = rInfo
+			rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, imageDigest, svc.Image, idmap)
+			if err != nil {
+				return nil, fmt.Errorf("prepare rootfs for service '%s': %w", svcName, err)
 			}
+			blockNativeRootfsMap[svcName] = rInfo
 		}
 		serviceIdx++
 	}
 
-	// Pull network anchor image directly into the per-app user's graphroot.
-	// The pause image is tiny (~500KB), so per-app duplication is negligible.
-	if err := m.containerManager.PullImage(ctx, runtime, networkAnchorImage()); err != nil {
-		return nil, fmt.Errorf("network anchor image pull failed: %w", err)
+	// Prepare network anchor rootfs via golden LV pipeline.
+	// Anchor always uses ModeService regardless of app mode — it's a service container.
+	// Skip if the caller already provides an attached anchor rootfs (e.g., image update path).
+	if prebuiltRootfs != nil {
+		if rInfo, ok := prebuiltRootfs[networkAnchorServiceName]; ok {
+			blockNativeRootfsMap[networkAnchorServiceName] = rInfo
+		}
+	}
+	if _, ok := blockNativeRootfsMap[networkAnchorServiceName]; !ok {
+		ephRT, ephCleanup, ephErr := newEphemeralFlattenRuntime(m.runtimeUser)
+		if ephErr != nil {
+			return nil, fmt.Errorf("create ephemeral runtime for anchor: %w", ephErr)
+		}
+		if pullErr := m.containerManager.PullImage(ctx, ephRT, networkAnchorImage()); pullErr != nil {
+			ephCleanup()
+			return nil, fmt.Errorf("pull anchor image: %w", pullErr)
+		}
+		imgConfig, inspErr := m.containerManager.InspectImage(ctx, ephRT, networkAnchorImage())
+		ephCleanup()
+		if inspErr != nil {
+			return nil, fmt.Errorf("inspect anchor image: %w", inspErr)
+		}
+		anchorDigest := ""
+		if len(imgConfig.RepoDigests) > 0 {
+			anchorDigest = imgConfig.RepoDigests[0]
+		} else {
+			anchorDigest = imgConfig.Digest
+		}
+		rInfo, err := m.prepareRootfsStorage(ctx, ModeService, instanceID, networkAnchorServiceName, anchorDigest, networkAnchorImage(), idmap)
+		if err != nil {
+			return nil, fmt.Errorf("prepare rootfs for network anchor: %w", err)
+		}
+		blockNativeRootfsMap[networkAnchorServiceName] = rInfo
 	}
 
 	created := make([]string, 0, 1+len(appDef.Services))
@@ -230,22 +249,33 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			_ = m.containerManager.StopContainer(ctx, runtime, cid)
 			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
 		}
-		// Cleanup rootfs on failure.
-		if len(blockNativeRootfsMap) > 0 {
-			m.detachAllServiceRootfs(ctx, instanceID, mode, appDef, nil)
+		// Detach only locally-created rootfs volumes, not prebuilt ones
+		// (the caller owns those handles and is responsible for their lifecycle).
+		if rootfs := m.currentRootfsManager(); rootfs != nil {
+			for svcName, rInfo := range blockNativeRootfsMap {
+				if prebuiltRootfs != nil {
+					if _, isPrebuilt := prebuiltRootfs[svcName]; isPrebuilt {
+						continue
+					}
+				}
+				volID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
+				_ = rootfs.DetachRootfs(ctx, volID)
+				_ = rInfo // suppress unused warning
+			}
 		}
 	}
 
 	// 1) Create + start the network anchor (owns published ports + shared netns).
 	anchorSpec := container.ContainerCreateSpec{
 		Name:          networkAnchorContainerName(instanceID),
-		Image:         networkAnchorImage(),
-		PullPolicy:    "never", // Pre-pulled to per-app graphroot above.
 		NetworkMode:   appNetworkMode(appDef),
 		RestartPolicy: appRestartPolicy(appDef),
 		Labels:        piccoloLabels(instanceID, networkAnchorServiceName, "network_anchor"),
 		SecurityOpt:   selinuxDisableLabel(), // overlay context= ignored in user namespaces
 	}
+	anchorRootfs := blockNativeRootfsMap[networkAnchorServiceName]
+	anchorSpec.Rootfs = anchorRootfs.handle.MountPath
+	anchorSpec.ReadOnly = anchorRootfs.handle.ReadOnly
 	for _, ep := range endpoints {
 		anchorSpec.Ports = append(anchorSpec.Ports, container.PortMapping{Host: ep.HostBind, Container: ep.GuestPort})
 	}
@@ -334,8 +364,8 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			cleanup()
 			return nil, err
 		}
-		// Per-app runtimes must never pull: images are pre-pulled to the shared
-		// imagestore and per-app users lack write access to it.
+		// Per-app runtimes must never pull: service containers use --rootfs
+		// from golden LV snapshots.
 		if spec.Image != "" {
 			spec.PullPolicy = "never"
 		}

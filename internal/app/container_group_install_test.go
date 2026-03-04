@@ -10,11 +10,10 @@ import (
 )
 
 func TestInstallMultiContainer_PrunesZombiesBeforeCreate(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tempDir)
+	mgr, err := NewAppManagerForTest(mock, tempDir)
 	if err != nil {
 		t.Fatalf("NewAppManager: %v", err)
 	}

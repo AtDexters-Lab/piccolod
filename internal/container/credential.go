@@ -35,11 +35,9 @@ func ResolveRuntimeCredential(username string) (*RuntimeUser, error) {
 		return nil, fmt.Errorf("invalid GID for runtime user %q: %w", username, err)
 	}
 
-	// Look up supplementary groups for shared imagestore access (piccolo-apps group).
-	// Supplementary groups are required for per-app users to read the shared imagestore.
+	// Look up supplementary groups.
 	// Hard error: piccolo-runtime is a local system user — GroupIds should never fail
-	// except on corrupted /etc/group. Failing loudly here is preferable to silent
-	// imagestore permission failures at container start.
+	// except on corrupted /etc/group.
 	groupIDs, err := u.GroupIds()
 	if err != nil {
 		return nil, fmt.Errorf("resolve supplementary groups for %q: %w", username, err)

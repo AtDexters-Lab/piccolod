@@ -10,7 +10,6 @@ import (
 )
 
 func TestCloneWorkspace_OriginNotFound(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "clone_not_found")
 	if err != nil {
 		t.Fatal(err)
@@ -18,7 +17,7 @@ func TestCloneWorkspace_OriginNotFound(t *testing.T) {
 	defer os.RemoveAll(tmp)
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tmp)
+	mgr, err := NewAppManagerForTest(mock, tmp)
 	if err != nil {
 		t.Fatalf("new app manager: %v", err)
 	}
@@ -35,7 +34,6 @@ func TestCloneWorkspace_OriginNotFound(t *testing.T) {
 }
 
 func TestCloneWorkspace_OriginNotWorkspace(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "clone_not_ws")
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +41,7 @@ func TestCloneWorkspace_OriginNotWorkspace(t *testing.T) {
 	defer os.RemoveAll(tmp)
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tmp)
+	mgr, err := NewAppManagerForTest(mock, tmp)
 	if err != nil {
 		t.Fatalf("new app manager: %v", err)
 	}
@@ -81,7 +79,6 @@ func TestCloneWorkspace_OriginNotWorkspace(t *testing.T) {
 }
 
 func TestCloneWorkspace_OriginRunning(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "clone_running")
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +86,7 @@ func TestCloneWorkspace_OriginRunning(t *testing.T) {
 	defer os.RemoveAll(tmp)
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tmp)
+	mgr, err := NewAppManagerForTest(mock, tmp)
 	if err != nil {
 		t.Fatalf("new app manager: %v", err)
 	}
@@ -125,7 +122,6 @@ func TestCloneWorkspace_OriginRunning(t *testing.T) {
 }
 
 func TestCloneWorkspace_InvalidCloneName(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "clone_badname")
 	if err != nil {
 		t.Fatal(err)
@@ -133,7 +129,7 @@ func TestCloneWorkspace_InvalidCloneName(t *testing.T) {
 	defer os.RemoveAll(tmp)
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tmp)
+	mgr, err := NewAppManagerForTest(mock, tmp)
 	if err != nil {
 		t.Fatalf("new app manager: %v", err)
 	}
@@ -173,7 +169,6 @@ func TestCloneWorkspace_InvalidCloneName(t *testing.T) {
 }
 
 func TestCloneWorkspace_CloneNameCollision(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "clone_collision")
 	if err != nil {
 		t.Fatal(err)
@@ -181,7 +176,7 @@ func TestCloneWorkspace_CloneNameCollision(t *testing.T) {
 	defer os.RemoveAll(tmp)
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tmp)
+	mgr, err := NewAppManagerForTest(mock, tmp)
 	if err != nil {
 		t.Fatalf("new app manager: %v", err)
 	}
@@ -223,7 +218,6 @@ func TestCloneWorkspace_CloneNameCollision(t *testing.T) {
 }
 
 func TestCloneWorkspace_LockedState(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "clone_locked")
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +225,7 @@ func TestCloneWorkspace_LockedState(t *testing.T) {
 	defer os.RemoveAll(tmp)
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tmp)
+	mgr, err := NewAppManagerForTest(mock, tmp)
 	if err != nil {
 		t.Fatalf("new app manager: %v", err)
 	}

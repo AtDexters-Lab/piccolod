@@ -99,8 +99,9 @@ type serviceContainerOptions struct {
 	svcName    string
 	anchorID   string
 
-	// Rootless mode: when set, volume dirs are chowned to this UID/GID
-	// and the :U mount option is added for Podman UID remapping.
+	// Per-app credential for rootless isolation. Always non-nil — volume dirs
+	// are chowned to this UID/GID and the :U mount option is added for
+	// Podman UID remapping.
 	credential *syscall.Credential
 
 	// Block-native rootfs fields (optional, used when rootfsMgr is available)
@@ -169,25 +170,21 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 				return container.ContainerCreateSpec{}, fmt.Errorf("failed to ensure workspace assets: %w", err)
 			}
 
-			bootShHost := BootShHostPath()
-			startupHost := PiccoloStartupHostPath()
-			if opts.credential != nil {
-				assetDir := filepath.Join(opts.layout.DataDir, "piccolo-assets")
-				if err := os.MkdirAll(assetDir, 0o755); err != nil {
-					return container.ContainerCreateSpec{}, fmt.Errorf("failed to create per-app assets dir: %w", err)
-				}
-				if err := container.ChownIfNeeded(assetDir, int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
-					return container.ContainerCreateSpec{}, fmt.Errorf("failed to chown per-app assets dir: %w", err)
-				}
-				if err := copyFileWithOwner(BootShHostPath(), filepath.Join(assetDir, "boot.sh"), int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
-					return container.ContainerCreateSpec{}, fmt.Errorf("failed to copy boot.sh to per-app dir: %w", err)
-				}
-				if err := copyFileWithOwner(PiccoloStartupHostPath(), filepath.Join(assetDir, "piccolo-startup"), int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
-					return container.ContainerCreateSpec{}, fmt.Errorf("failed to copy piccolo-startup to per-app dir: %w", err)
-				}
-				bootShHost = filepath.Join(assetDir, "boot.sh")
-				startupHost = filepath.Join(assetDir, "piccolo-startup")
+			assetDir := filepath.Join(opts.layout.DataDir, "piccolo-assets")
+			if err := os.MkdirAll(assetDir, 0o755); err != nil {
+				return container.ContainerCreateSpec{}, fmt.Errorf("failed to create per-app assets dir: %w", err)
 			}
+			if err := container.ChownIfNeeded(assetDir, int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+				return container.ContainerCreateSpec{}, fmt.Errorf("failed to chown per-app assets dir: %w", err)
+			}
+			if err := copyFileWithOwner(BootShHostPath(), filepath.Join(assetDir, "boot.sh"), int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+				return container.ContainerCreateSpec{}, fmt.Errorf("failed to copy boot.sh to per-app dir: %w", err)
+			}
+			if err := copyFileWithOwner(PiccoloStartupHostPath(), filepath.Join(assetDir, "piccolo-startup"), int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+				return container.ContainerCreateSpec{}, fmt.Errorf("failed to copy piccolo-startup to per-app dir: %w", err)
+			}
+			bootShHost := filepath.Join(assetDir, "boot.sh")
+			startupHost := filepath.Join(assetDir, "piccolo-startup")
 
 			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
 				Host: bootShHost, Container: "/piccolo/boot.sh", Options: "ro",
@@ -201,17 +198,11 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		if err := os.MkdirAll(configDir, 0o755); err != nil {
 			return container.ContainerCreateSpec{}, fmt.Errorf("failed to create piccolo config dir: %w", err)
 		}
-		if opts.credential != nil {
-			if err := container.ChownIfNeeded(configDir, int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
-				return container.ContainerCreateSpec{}, fmt.Errorf("failed to chown piccolo config dir: %w", err)
-			}
-		}
-		configVolOpts := "rw"
-		if opts.credential != nil {
-			configVolOpts = "rw,U"
+		if err := container.ChownIfNeeded(configDir, int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+			return container.ContainerCreateSpec{}, fmt.Errorf("failed to chown piccolo config dir: %w", err)
 		}
 		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-			Host: configDir, Container: "/piccolo/config", Options: configVolOpts,
+			Host: configDir, Container: "/piccolo/config", Options: "rw,U",
 		})
 	}
 
@@ -266,14 +257,10 @@ func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreate
 		return fmt.Errorf("container spec requires app volume layout")
 	}
 
-	// Rootless volume options: chown dirs to the per-app user and add :U
-	// so Podman remaps ownership into the container's UID namespace.
-	// Without :U, host-root-owned dirs appear as nobody inside the container
-	// and entrypoints that chown/chmod their data dirs fail.
-	volOpts := "rw"
-	if cred != nil {
-		volOpts = "rw,U"
-	}
+	// Rootless volume options: :U so Podman remaps ownership into the
+	// container's UID namespace. Without :U, host-root-owned dirs appear
+	// as nobody inside the container.
+	volOpts := "rw,U"
 
 	mountedPaths := map[string]struct{}{}
 
@@ -283,10 +270,8 @@ func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreate
 			if err := ensureDir(host, 0o777); err != nil {
 				return fmt.Errorf("ensure persistent volume '%s': %w", volName, err)
 			}
-			if cred != nil {
-				if err := container.ChownIfNeeded(host, int(cred.Uid), int(cred.Gid)); err != nil {
-					return fmt.Errorf("chown persistent volume '%s': %w", volName, err)
-				}
+			if err := container.ChownIfNeeded(host, int(cred.Uid), int(cred.Gid)); err != nil {
+				return fmt.Errorf("chown persistent volume '%s': %w", volName, err)
 			}
 			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
 				Host:      host,

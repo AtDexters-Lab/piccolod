@@ -83,10 +83,6 @@ func ProvisionAppUser(instanceID string) (au *AppUser, err error) {
 		return au, nil
 	}
 
-	if groupErr := ensureGroup(AppsGroupName); groupErr != nil {
-		return nil, fmt.Errorf("provision user %s: ensure group: %w", username, groupErr)
-	}
-
 	// Create the user if it doesn't exist yet.
 	userExists := false
 	createdByThisCall := false
@@ -111,7 +107,6 @@ func ProvisionAppUser(instanceID string) (au *AppUser, err error) {
 			"--system",
 			"--shell", "/usr/sbin/nologin",
 			"--create-home",
-			"--groups", AppsGroupName,
 			username,
 		)
 		if addErr != nil {
@@ -255,11 +250,6 @@ func CleanupOrphanAppUsers(knownInstanceIDs map[string]bool) {
 			log.Printf("WARN: orphan cleanup %s: %v", username, err)
 		}
 	}
-}
-
-// EnsureAppsGroup creates the piccolo-apps shared group if it doesn't exist.
-func EnsureAppsGroup() error {
-	return ensureGroup(AppsGroupName)
 }
 
 // listAppUsers scans /etc/passwd and returns all usernames starting with

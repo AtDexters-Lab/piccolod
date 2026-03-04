@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-27
 **Updated:** 2026-03-01
-**Status:** Draft
+**Status:** Superseded — folded into `org-context/03_engineering/storage_architecture_block_native.md`
 **Supersedes:** `20260101-workspace-disk-container-independent.md` (overlay-based workspace persistence)
 **Breaks:** This is a clean break from the current overlay-based rootfs and per-volume LUKS key model. No migration code, no dual-path logic. Existing volumes must be destroyed and recreated.
 

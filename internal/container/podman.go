@@ -56,11 +56,9 @@ type PodmanCLI struct{}
 //
 // RunRoot configures where Podman stores runtime state (typically under /run or XDG_RUNTIME_DIR).
 //
-// Imagestore optionally splits image storage out of Root into a shared image store.
 type PodmanRuntime struct {
 	Root          string
 	RunRoot       string
-	Imagestore    string
 	StorageDriver string
 	StorageOpts   []string
 
@@ -407,8 +405,8 @@ type ContainerCreateSpec struct {
 	User string
 
 	// PullPolicy controls image pulling during create: "always", "missing", "never".
-	// Per-app runtimes use "never" because images must be pre-pulled to the shared
-	// imagestore — per-app users have read-only access and cannot write new layers.
+	// Per-app runtimes use "never" because service containers use --rootfs from
+	// golden LV snapshots and do not pull images.
 	PullPolicy string
 
 	// ExtraHosts adds entries to /etc/hosts (format: "hostname:IP").
@@ -464,9 +462,8 @@ type ResourceLimits struct {
 func buildCreateArgs(spec ContainerCreateSpec) []string {
 	args := []string{"create"}
 
-	// Pull policy: per-app runtimes set "never" because they lack write access
-	// to the shared imagestore. Images must be pre-pulled by the image runtime
-	// (piccolo-runtime user).
+	// Pull policy: per-app runtimes set "never" because service containers
+	// use --rootfs from golden LV snapshots and do not pull images.
 	if spec.PullPolicy != "" {
 		args = append(args, "--pull", spec.PullPolicy)
 	}
@@ -631,12 +628,6 @@ func BuildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 			return nil, fmt.Errorf("invalid podman --runroot path: %w", err)
 		}
 		out = append(out, "--runroot", runtime.RunRoot)
-	}
-	if runtime.Imagestore != "" {
-		if err := ValidatePath(runtime.Imagestore); err != nil {
-			return nil, fmt.Errorf("invalid podman --imagestore path: %w", err)
-		}
-		out = append(out, "--imagestore", runtime.Imagestore)
 	}
 	if runtime.StorageDriver != "" {
 		if !regexp.MustCompile(`^[a-z0-9]+$`).MatchString(runtime.StorageDriver) {
@@ -1135,7 +1126,6 @@ func (p *PodmanCLI) NetworkReload(ctx context.Context, runtime PodmanRuntime, co
 }
 
 // ResetStorage cleans up container references for this runtime's storage.
-// Only removes containers, does NOT touch the shared imagestore.
 func (p *PodmanCLI) ResetStorage(ctx context.Context, runtime PodmanRuntime) error {
 	// Remove all containers for this runtime (should already be done, but be thorough)
 	args, err := BuildPodmanArgs(runtime, []string{"rm", "--all", "--force"})
@@ -1171,15 +1161,13 @@ var storagePathKeywords = []string{
 	"overlay",
 	"layer",
 	"diff/",
-	"imagestore",
 }
 
 // ValidateAndRepairStorage checks if the podman overlay storage for a runtime is healthy.
-// If corruption is detected (e.g., from a previous killed image pull), it cleans up the
-// per-app overlay directories and removes dangling entries from the shared imagestore.
-// Only repairs when the error output matches known corruption patterns; other failures
-// (missing binary, permission denied, context timeout) are returned as errors.
-// Returns true if repair was performed.
+// If corruption is detected (e.g., from a previous killed container operation), it cleans
+// up the per-app overlay directories. Only repairs when the error output matches known
+// corruption patterns; other failures (missing binary, permission denied, context timeout)
+// are returned as errors. Returns true if repair was performed.
 func (p *PodmanCLI) ValidateAndRepairStorage(ctx context.Context, runtime PodmanRuntime) (bool, error) {
 	// Quick health check: try listing images
 	args, err := BuildPodmanArgs(runtime, []string{"images", "--quiet", "--noheading"})
@@ -1246,132 +1234,10 @@ func (p *PodmanCLI) ValidateAndRepairStorage(ctx context.Context, runtime Podman
 		}
 	}
 
-	// Phase 2: Clean dangling entries from the shared imagestore.
-	// When a pull is killed, the imagestore may retain layer references that point
-	// to the per-app overlay directory. These dangling references cause subsequent
-	// pulls to fail with "readlink .../diff: no such file or directory".
-	if runtime.Imagestore != "" && runtime.Root != "" {
-		cleaned, cleanErr := cleanDanglingImagestoreEntries(runtime.Imagestore, runtime.Root)
-		if cleanErr != nil {
-			log.Printf("WARN: imagestore cleanup failed: %v", cleanErr)
-		}
-		if cleaned {
-			repaired = true
-		}
-	}
-
 	if repaired {
 		log.Printf("INFO: podman storage repair completed for root=%s", runtime.Root)
 	}
 	return repaired, nil
-}
-
-// isUnderPath checks if resolved is a path under (or equal to) the given root directory.
-// Uses proper path-prefix matching to avoid substring false positives
-// (e.g., /apps/app1 should not match /apps/app10).
-func isUnderPath(resolved, root string) bool {
-	// Exact match
-	if resolved == root {
-		return true
-	}
-	// Proper prefix with path separator boundary
-	prefix := root + string(os.PathSeparator)
-	return strings.HasPrefix(resolved, prefix)
-}
-
-// cleanDanglingImagestoreEntries removes entries from the shared imagestore's overlay
-// directory that reference the given per-app root and are dangling (target doesn't exist).
-// Returns true if any entries were actually removed.
-func cleanDanglingImagestoreEntries(imagestore, appRoot string) (bool, error) {
-	appRoot = filepath.Clean(appRoot)
-	overlayDir := filepath.Join(imagestore, "overlay")
-	if _, err := os.Stat(overlayDir); err != nil {
-		if os.IsNotExist(err) {
-			return false, nil // No overlay dir in imagestore, nothing to clean
-		}
-		return false, fmt.Errorf("stat imagestore overlay dir: %w", err)
-	}
-
-	cleaned := false
-
-	// Walk the imagestore overlay/l/ directory for dangling symlinks.
-	// Each entry in l/ is a symlink (short ID) pointing to ../<layer-id>/diff.
-	linkDir := filepath.Join(overlayDir, "l")
-	if entries, err := os.ReadDir(linkDir); err == nil {
-		for _, entry := range entries {
-			linkPath := filepath.Join(linkDir, entry.Name())
-			target, err := os.Readlink(linkPath)
-			if err != nil {
-				continue
-			}
-			// Resolve relative symlink targets
-			resolved := target
-			if !filepath.IsAbs(target) {
-				resolved = filepath.Join(linkDir, target)
-			}
-			resolved = filepath.Clean(resolved)
-			// Check if target is under the per-app root and is dangling
-			if isUnderPath(resolved, appRoot) {
-				if _, statErr := os.Stat(resolved); os.IsNotExist(statErr) {
-					if rmErr := os.Remove(linkPath); rmErr == nil {
-						log.Printf("INFO: removed dangling imagestore link: %s -> %s", linkPath, target)
-						cleaned = true
-					}
-				}
-			}
-		}
-	}
-
-	// Walk imagestore overlay/ for layer directories whose content references the per-app root.
-	// In containers/storage overlay layout, overlay/<layer-id>/link is a regular file
-	// containing the short link name (not a symlink). We read it to find the corresponding
-	// l/<short-id> symlink and check if that symlink's target references the per-app root.
-	entries, err := os.ReadDir(overlayDir)
-	if err != nil {
-		return cleaned, fmt.Errorf("read imagestore overlay dir: %w", err)
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "l" {
-			continue
-		}
-		layerDir := filepath.Join(overlayDir, entry.Name())
-		linkFile := filepath.Join(layerDir, "link")
-
-		// Read the link file (regular file containing the short ID)
-		shortIDBytes, readErr := os.ReadFile(linkFile)
-		if readErr != nil {
-			continue
-		}
-		shortID := strings.TrimSpace(string(shortIDBytes))
-		if shortID == "" {
-			continue
-		}
-
-		// Check the corresponding l/<short-id> symlink
-		lSymlink := filepath.Join(linkDir, shortID)
-		target, linkErr := os.Readlink(lSymlink)
-		if linkErr != nil {
-			continue
-		}
-		resolved := target
-		if !filepath.IsAbs(target) {
-			resolved = filepath.Join(linkDir, target)
-		}
-		resolved = filepath.Clean(resolved)
-
-		// If the symlink target is under the per-app root and dangling, remove both
-		if isUnderPath(resolved, appRoot) {
-			if _, statErr := os.Stat(resolved); os.IsNotExist(statErr) {
-				_ = os.Remove(lSymlink)
-				if rmErr := os.RemoveAll(layerDir); rmErr == nil {
-					log.Printf("INFO: removed dangling imagestore layer: %s (link=%s)", layerDir, shortID)
-					cleaned = true
-				}
-			}
-		}
-	}
-
-	return cleaned, nil
 }
 
 // isValidContainerID validates container ID format

@@ -24,9 +24,9 @@ func resolveRoots() {
 		os.Exit(1)
 	}
 	coreRoot = filepath.Clean(envOr("PICCOLO_CORE_ROOT", defaultCoreRoot))
-	// Derive podman root from core root when not explicitly set,
-	// so that overriding PICCOLO_CORE_ROOT automatically relocates podman storage.
-	podmanRoot = filepath.Clean(envOr("PICCOLO_PODMAN_ROOT", filepath.Join(coreRoot, "podman")))
+	// Per-app graphroots live on tmpfs — no persistent storage needed since
+	// service containers use --rootfs from golden LV snapshots.
+	podmanRoot = filepath.Clean(envOr("PICCOLO_PODMAN_ROOT", "/run/piccolo/podman"))
 }
 
 func envOr(key, fallback string) string {
@@ -48,8 +48,9 @@ func CoreJoin(parts ...string) string {
 	return filepath.Join(all...)
 }
 
-// PodmanRoot returns the mount point of the ephemeral podman shared thin LV.
-// This replaces the old DataJoin("node", "podman", ...) paths.
+// PodmanRoot returns the base directory for per-app podman graphroots (tmpfs).
+// Per-app graphroots store only podman metadata (no images) — service containers
+// use --rootfs from golden LV snapshots.
 func PodmanRoot() string {
 	once.Do(resolveRoots)
 	return podmanRoot
@@ -74,7 +75,8 @@ func VolumeMetaDir(volumeID string) string {
 }
 
 // SetCoreRootForTest overrides the core root for the duration of a test.
-// Also re-derives podmanRoot so PodmanJoin stays consistent with the new core root.
+// Also sets podmanRoot to a subdir of dir for convenience (tests that need
+// independent control should call SetPodmanRootForTest separately).
 func SetCoreRootForTest(t *testing.T, dir string) {
 	t.Helper()
 	prevCore := coreRoot

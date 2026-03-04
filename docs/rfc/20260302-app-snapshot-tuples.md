@@ -1,7 +1,7 @@
 # RFC: App Snapshot Tuples — Atomic Snapshots, Updates, and Replication
 
 **Date:** 2026-03-02
-**Status:** Draft
+**Status:** Superseded — folded into `org-context/03_engineering/storage_architecture_block_native.md`
 **Depends on:** `20260227-workspace-block-native-rootfs.md` (golden LV architecture)
 
 ## 1. Summary

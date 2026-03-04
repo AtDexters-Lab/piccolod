@@ -31,7 +31,6 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 	mode := piccoloModeFromExtensions(def.Extensions)
 
 	// Ensure all service rootfs volumes are attached before starting containers.
-	// Returns nil for legacy apps without rootfs volumes.
 	blockNativeRootfsMap, err := m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
 	if err != nil {
 		m.updateStatusWithEvent(appInst.InstanceID, StatusError)
@@ -85,7 +84,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		// Start failed — attempt recreation of the entire container group.
 		log.Printf("INFO: start %s: anchor start failed (%v), recreating", appInst.InstanceID, err)
 		if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-			"anchor start failed during manual start, recreating"); recoverErr != nil {
+			"anchor start failed during manual start, recreating", blockNativeRootfsMap); recoverErr != nil {
 			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
 			return recoverErr
 		}

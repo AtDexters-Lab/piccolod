@@ -180,8 +180,8 @@ func (s *GinServer) handleNetworkCheck(c *gin.Context) {
 }
 
 // handleStorageCheck: GET /api/v1/system/storage-check
-// Runs a quick podman command to test if storage initialization works for the
-// image runtime. This helps diagnose overlay driver issues.
+// Runs a quick podman command to test if overlay storage initialization works.
+// Creates an ephemeral podman root and runs `podman images` against it.
 func (s *GinServer) handleStorageCheck(c *gin.Context) {
 	if s.appManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "app manager not ready"})
@@ -199,38 +199,36 @@ func (s *GinServer) handleStorageCheck(c *gin.Context) {
 		Latency string `json:"latency,omitempty"`
 	}
 
-	// Test: list images using image runtime (quick storage init check)
+	// Test: create ephemeral runtime to verify overlay storage works.
 	start := time.Now()
-	imageRT, err := s.appManager.PodmanImageRuntime()
+	ephRT, cleanup, err := s.appManager.DiagnosticEphemeralRuntime()
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"checks": []checkResult{
-			{Name: "image_runtime_init", Error: err.Error()},
+			{Name: "ephemeral_runtime_init", Error: err.Error()},
 		}})
 		return
 	}
+	defer cleanup()
 
 	results := make([]checkResult, 0, 2)
 	results = append(results, checkResult{
-		Name:    "image_runtime_init",
+		Name:    "ephemeral_runtime_init",
 		OK:      true,
-		Output:  fmt.Sprintf("root=%s driver=%s", imageRT.Root, imageRT.StorageDriver),
+		Output:  fmt.Sprintf("root=%s driver=%s", ephRT.Root, ephRT.StorageDriver),
 		Latency: time.Since(start).Round(time.Millisecond).String(),
 	})
 
-	// Test: run "podman images" with the image runtime to probe storage
+	// Test: run "podman images" with the ephemeral runtime to probe storage
 	start2 := time.Now()
 	imagesArgs := []string{
-		"--root", imageRT.Root,
-		"--runroot", imageRT.RunRoot,
-		"--storage-driver", imageRT.StorageDriver,
-	}
-	for _, opt := range imageRT.StorageOpts {
-		imagesArgs = append(imagesArgs, "--storage-opt", opt)
+		"--root", ephRT.Root,
+		"--runroot", ephRT.RunRoot,
+		"--storage-driver", ephRT.StorageDriver,
 	}
 	imagesArgs = append(imagesArgs, "images", "--format", "{{.Repository}}:{{.Tag}}")
 
 	cmd := exec.CommandContext(ctx, "podman", imagesArgs...)
-	container.ApplyRuntimeCredential(cmd, imageRT)
+	container.ApplyRuntimeCredential(cmd, ephRT)
 	out, cmdErr := cmd.CombinedOutput()
 	r := checkResult{
 		Name:    "podman_images",

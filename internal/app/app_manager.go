@@ -60,12 +60,6 @@ type AppManager struct {
 	observedStatusMessage map[string]string // transient status message for UI context
 	observedStatusMu      sync.RWMutex
 
-	// Shared image runtime for base images across all app types (overlay driver, shared root + imagestore).
-	// Cached via sync.Once to avoid repeated LookPath + ensureDir calls.
-	imageRuntimeOnce sync.Once
-	imageRuntimeVal  container.PodmanRuntime
-	imageRuntimeErr  error
-
 	// Internal CA path for OIDC trust
 	internalCAPath string
 
@@ -73,9 +67,12 @@ type AppManager struct {
 	oidcHostname string
 
 	// runtimeUser holds the resolved rootless runtime user credentials.
-	// Required for production — the daemon refuses to start without this user.
-	// Only nil in test environments (PICCOLO_ALLOW_UNMOUNTED_TESTS=1).
-	runtimeUser *container.RuntimeUser
+	// Required unconditionally — per-app isolation is a security invariant.
+	runtimeUser container.RuntimeUser
+
+	// credentialResolver overrides per-app user provisioning for tests.
+	// When non-nil, resolveAppCredential returns this instead of calling ProvisionAppUser.
+	credentialResolver func(instanceID string) (*syscall.Credential, string, error)
 
 	// Per-app user orphan cleanup runs once at first reconciliation.
 	orphanCleanupOnce sync.Once
@@ -133,44 +130,26 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 	base = filepath.Clean(base)
 
 	// Resolve rootless runtime user. All Podman commands run as this user.
-	// The daemon will not start if the piccolo-runtime user does not exist,
-	// unless PICCOLO_ALLOW_UNMOUNTED_TESTS=1 is set (for test environments).
+	// Per-app isolation is unconditional — the daemon refuses to start without this user.
 	runtimeUser, err := container.ResolveRuntimeCredential(container.RuntimeUsername)
 	if err != nil {
-		if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") == "1" {
-			log.Printf("WARN: runtime user resolution failed in test mode, continuing without rootless: %v", err)
-		} else {
-			return nil, fmt.Errorf("app manager: %w", err)
-		}
+		return nil, fmt.Errorf("app manager: %w", err)
 	}
-	if runtimeUser != nil {
-		if err := container.EnsureXDGRuntimeDir(runtimeUser.Credential.Uid, runtimeUser.Credential.Gid); err != nil {
-			return nil, fmt.Errorf("app manager: failed to create XDG_RUNTIME_DIR for rootless Podman: %w", err)
-		}
-		container.CheckCgroupDelegation(runtimeUser.Credential.Uid)
 
-		// Ensure the shared group for imagestore access exists.
-		if err := container.EnsureAppsGroup(); err != nil {
-			log.Printf("WARN: failed to ensure piccolo-apps group: %v", err)
-		}
-
-		// Eagerly fix imagestore permissions if the directory already exists.
-		// Prevents race: per-app users need group-read on imagestore metadata
-		// before the first image pull triggers ensureImagestoreGroupAccess.
-		imgStore := imagestorePath()
-		if _, statErr := os.Stat(imgStore); statErr == nil {
-			if err := ensureImagestoreGroupAccess(imgStore, int(runtimeUser.Credential.Uid)); err != nil {
-				log.Printf("WARN: eager imagestore group access fix: %v", err)
-			}
-		}
-
-		// Ensure cgroup v2 controllers are delegated to user sessions.
-		// Must run before ProvisionAppUser so new user@.service instances
-		// start with memory/cpu/pids/io controllers available.
-		if err := container.EnsureCgroupDelegation(); err != nil {
-			log.Printf("WARN: failed to ensure cgroup delegation: %v", err)
-		}
+	if err := container.EnsureXDGRuntimeDir(runtimeUser.Credential.Uid, runtimeUser.Credential.Gid); err != nil {
+		return nil, fmt.Errorf("app manager: failed to create XDG_RUNTIME_DIR for rootless Podman: %w", err)
 	}
+	container.CheckCgroupDelegation(runtimeUser.Credential.Uid)
+
+	// Ensure cgroup v2 controllers are delegated to user sessions.
+	// Must run before ProvisionAppUser so new user@.service instances
+	// start with memory/cpu/pids/io controllers available.
+	if err := container.EnsureCgroupDelegation(); err != nil {
+		log.Printf("WARN: failed to ensure cgroup delegation: %v", err)
+	}
+
+	// Clean up orphaned flatten tmpdirs from prior crashes.
+	cleanStaleFlattenDirs()
 
 	mgr := &AppManager{
 		containerManager:      containerManager,
@@ -182,7 +161,7 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
 		oidcHostname:          "piccolo.local",
-		runtimeUser:           runtimeUser,
+		runtimeUser:           *runtimeUser,
 	}
 
 	return mgr, nil
@@ -225,11 +204,10 @@ func (m *AppManager) SetMountVerifier(fn func(string) error) {
 	m.stateInitMu.Unlock()
 }
 
-// SetImageRuntimeForTest overrides the shared image runtime. Intended for tests.
-func (m *AppManager) SetImageRuntimeForTest(rt container.PodmanRuntime) {
-	m.imageRuntimeOnce.Do(func() {}) // exhaust the Once
-	m.imageRuntimeVal = rt
-	m.imageRuntimeErr = nil
+// DiagnosticEphemeralRuntime creates a short-lived podman runtime for storage
+// diagnostics. The caller must invoke cleanup() when done.
+func (m *AppManager) DiagnosticEphemeralRuntime() (container.PodmanRuntime, func(), error) {
+	return newEphemeralFlattenRuntime(m.runtimeUser)
 }
 
 // SetEventBus configures the event bus for publishing app status change events.
@@ -994,6 +972,84 @@ func NewAppManager(containerManager ContainerManager, stateDir string) (*AppMana
 	return NewAppManagerWithServices(containerManager, stateDir, svc, nil)
 }
 
+// testMountVerifier is a permissive mount verifier for unit tests.
+// It only checks that the path exists as a directory — no mount check.
+func testMountVerifier(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return ErrVolumeUnavailable
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("app manager: state base %s is not a directory", path)
+	}
+	return nil
+}
+
+// NewAppManagerForTest creates an AppManager with a synthetic credential for unit tests.
+// Skips EnsureXDGRuntimeDir and CheckCgroupDelegation —
+// avoids syscall side effects in CI. Uses a permissive mount verifier.
+func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*AppManager, error) {
+	base := stateDir
+	if strings.TrimSpace(base) == "" {
+		base = paths.CoreRoot()
+	}
+	base = filepath.Clean(base)
+	// Use the current process uid/gid so ChownIfNeeded sees files as correctly
+	// owned and skips the lchown call (which requires root).
+	testCred := &syscall.Credential{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
+	testHome := "/tmp"
+	svc := services.NewServiceManager()
+	return &AppManager{
+		containerManager: containerManager,
+		stateBaseDir:     base,
+		serviceManager:   svc,
+		leadershipState:  make(map[string]cluster.Role),
+		mountVerifier:    testMountVerifier,
+		observedStatus:   make(map[string]string),
+		observedStatusMessage: make(map[string]string),
+		oidcHostname: "piccolo.local",
+		runtimeUser: container.RuntimeUser{
+			Credential: testCred,
+			HomeDir:    testHome,
+		},
+		credentialResolver: func(string) (*syscall.Credential, string, error) {
+			return testCred, testHome, nil
+		},
+	}, nil
+}
+
+// NewAppManagerForTestWithServices is like NewAppManagerForTest but with an injected ServiceManager.
+func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDir string, serviceManager *services.ServiceManager, lockReader LockStateReader) (*AppManager, error) {
+	base := stateDir
+	if strings.TrimSpace(base) == "" {
+		base = paths.CoreRoot()
+	}
+	base = filepath.Clean(base)
+	testCred := &syscall.Credential{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
+	testHome := "/tmp"
+	return &AppManager{
+		containerManager: containerManager,
+		stateBaseDir:     base,
+		serviceManager:   serviceManager,
+		leadershipState:  make(map[string]cluster.Role),
+		lockReader:       lockReader,
+		mountVerifier:    testMountVerifier,
+		observedStatus:   make(map[string]string),
+		observedStatusMessage: make(map[string]string),
+		oidcHostname: "piccolo.local",
+		runtimeUser: container.RuntimeUser{
+			Credential: testCred,
+			HomeDir:    testHome,
+		},
+		credentialResolver: func(string) (*syscall.Credential, string, error) {
+			return testCred, testHome, nil
+		},
+	}, nil
+}
+
 // RestoreServices rebuilds service proxies for running apps based on current container port bindings.
 func (m *AppManager) RestoreServices(ctx context.Context) {
 	state, err := m.ensureStateManager()
@@ -1084,15 +1140,13 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 
 	// Clean up orphaned per-app users on first reconciliation.
 	m.orphanCleanupOnce.Do(func() {
-		if m.runtimeUser != nil {
-			knownIDs := make(map[string]bool)
-			for _, app := range state.ListApps() {
-				if app != nil {
-					knownIDs[app.InstanceID] = true
-				}
+		knownIDs := make(map[string]bool)
+		for _, app := range state.ListApps() {
+			if app != nil {
+				knownIDs[app.InstanceID] = true
 			}
-			container.CleanupOrphanAppUsers(knownIDs)
 		}
+		container.CleanupOrphanAppUsers(knownIDs)
 	})
 
 	for _, appInst := range state.ListApps() {
@@ -1367,11 +1421,9 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 			_ = m.containerManager.StopContainer(ctx, runtime, cid)
 			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
 		}
-		// Cleanup rootfs if applicable
+		// Cleanup rootfs.
 		mode := piccoloModeFromExtensions(appDef.Extensions)
-		if m.currentRootfsManager() != nil {
-			m.detachAllServiceRootfs(ctx, instanceID, mode, appDef, nil)
-		}
+		m.detachAllServiceRootfs(ctx, instanceID, mode, appDef, nil)
 		m.serviceManager.RemoveApp(instanceID)
 		cleanupServices = false
 		// cleanupResources runs via defer: destroys volume, runroot, per-app user
@@ -1988,11 +2040,6 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 	mode := piccoloModeFromExtensions(def.Extensions)
 	m.destroyAllServiceRootfs(ctx, instanceID, mode, def)
 
-	// Prune orphaned images from the shared imagestore.
-	// Both service and workspace images share the same imagestore,
-	// so pruning runs for all app types.
-	m.pruneOrphanedImages(ctx, state, def, instanceID)
-
 	// Reset podman storage BEFORE unmounting the volume.
 	// This allows podman to properly clean its metadata files (db.sql, locks, etc.)
 	// which live inside the encrypted volume.
@@ -2032,71 +2079,6 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 	m.publishAppStatusChanged(instanceID, "uninstalled", prevStatus, "")
 
 	return nil
-}
-
-// collectReferencedImages returns the set of images still referenced by installed
-// apps, excluding the app being uninstalled. Always includes the network anchor
-// image. All app types are considered because both service and workspace images
-// share the same imagestore.
-func (m *AppManager) collectReferencedImages(state *FilesystemStateManager, excludeInstanceID string) map[string]bool {
-	referenced := map[string]bool{
-		networkAnchorImage(): true,
-	}
-	for _, app := range state.ListApps() {
-		if app.InstanceID == excludeInstanceID {
-			continue
-		}
-		def, err := state.GetAppDefinition(app.InstanceID)
-		if err != nil {
-			// Cannot determine what images this app references — abort all pruning
-			// to avoid accidentally removing images that may still be in use.
-			log.Printf("WARN: image prune: cannot read definition for %s, aborting prune: %v", app.InstanceID, err)
-			return nil
-		}
-		if def.Services == nil {
-			continue
-		}
-		for _, svc := range def.Services {
-			if svc.Image != "" {
-				referenced[svc.Image] = true
-			}
-		}
-	}
-	return referenced
-}
-
-// pruneOrphanedImages removes images from the shared imagestore that are no longer
-// referenced by any installed app. Best-effort: failures are logged but never fatal
-// to uninstall.
-func (m *AppManager) pruneOrphanedImages(ctx context.Context, state *FilesystemStateManager, def *api.AppDefinition, excludeInstanceID string) {
-	if def == nil || def.Services == nil {
-		return
-	}
-
-	imageRuntime, err := m.podmanImageRuntime()
-	if err != nil {
-		log.Printf("WARN: image prune: cannot get image runtime: %v", err)
-		return
-	}
-
-	referenced := m.collectReferencedImages(state, excludeInstanceID)
-	if referenced == nil {
-		return // Aborted due to unreadable app definitions
-	}
-
-	for svcName, svc := range def.Services {
-		if svc.Image == "" {
-			continue
-		}
-		if referenced[svc.Image] {
-			continue
-		}
-		if err := m.containerManager.RemoveImage(ctx, imageRuntime, svc.Image); err != nil {
-			log.Printf("WARN: image prune: failed to remove %s (service %s): %v", svc.Image, svcName, err)
-		} else {
-			log.Printf("INFO: image prune: removed orphaned image %s (service %s)", svc.Image, svcName)
-		}
-	}
 }
 
 // UpdateImage updates an app instance's container image tag and recreates the container preserving services.
@@ -2187,18 +2169,18 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 		return fmt.Errorf("backup app.yaml: %w", err)
 	}
 
-	// Pull image using shared image runtime (per-app users have read-only imagestore access).
-	if err := m.pullToImagestore(ctx, newImage, nil); err != nil {
-		return fmt.Errorf("pull image %s: %w", newImage, err)
-	}
-
 	// Service-mode: transactional rootfs update (RFC 20260302).
+	// Image pull happens inside EnsureGoldenLV via flattenFn/imageSizeFn (ephemeral runtime).
 	if mode == ModeService {
 		updatedImages := map[string]string{primary: newImage}
 		return m.updateServiceModeImage(ctx, state, appInst, &newDef, layout, runtime, updatedImages)
 	}
 
-	// Legacy workspace/classic path (unchanged).
+	// Legacy workspace/classic path: pull directly into per-app runtime.
+	if err := m.containerManager.PullImage(ctx, runtime, newImage); err != nil {
+		return fmt.Errorf("pull image %s: %w", newImage, err)
+	}
+
 	endpoints, _ := m.serviceManager.GetByApp(instanceID)
 	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
 	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
@@ -2292,12 +2274,14 @@ func (m *AppManager) updateServiceModeImage(
 		return fmt.Errorf("rootfs volume manager not configured")
 	}
 
-	imageRuntime, err := m.podmanImageRuntime()
-	if err != nil {
-		return fmt.Errorf("get image runtime: %w", err)
+	// Create ephemeral runtime for image pull + inspect (digest derivation).
+	ephRT, ephCleanup, ephErr := newEphemeralFlattenRuntime(m.runtimeUser)
+	if ephErr != nil {
+		return fmt.Errorf("create ephemeral runtime: %w", ephErr)
 	}
+	defer ephCleanup()
 
-	// 1. For each changed service: inspect image → get digest → compute versioned volume ID.
+	// 1. For each changed service: pull + inspect image → get digest → compute versioned volume ID.
 	type changedService struct {
 		svcName    string
 		newImage   string
@@ -2308,7 +2292,10 @@ func (m *AppManager) updateServiceModeImage(
 	}
 	changed := make([]changedService, 0, len(updatedImages))
 	for svcName, newImage := range updatedImages {
-		imgConfig, inspErr := m.containerManager.InspectImage(ctx, imageRuntime, newImage)
+		if pullErr := m.containerManager.PullImage(ctx, ephRT, newImage); pullErr != nil {
+			return fmt.Errorf("pull image %s (service %s): %w", newImage, svcName, pullErr)
+		}
+		imgConfig, inspErr := m.containerManager.InspectImage(ctx, ephRT, newImage)
 		if inspErr != nil {
 			return fmt.Errorf("inspect image %s (service %s): %w", newImage, svcName, inspErr)
 		}
@@ -2347,6 +2334,7 @@ func (m *AppManager) updateServiceModeImage(
 	}
 
 	// 3. For each changed service: create new rootfs (idempotent, while still running).
+	var err error
 	for i := range changed {
 		cs := &changed[i]
 		if rootfs.RootfsExists(cs.volumeID) {
@@ -3136,10 +3124,10 @@ func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error 
 	// Stop and remove current container
 	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
 	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
-	// Pull using shared image runtime (per-app users have read-only imagestore access).
-	// Mandatory: per-app runtimes use --pull=never since they lack write access to the imagestore.
+	// Pull image directly into per-app runtime (legacy workspace/classic path only —
+	// revert is not supported for service-mode, guarded above).
 	if prevImage := imageFromDefinition(prevDef); strings.TrimSpace(prevImage) != "" {
-		if err := m.pullToImagestore(ctx, prevImage, nil); err != nil {
+		if err := m.containerManager.PullImage(ctx, runtime, prevImage); err != nil {
 			return fmt.Errorf("pull image %s: %w", prevImage, err)
 		}
 	}
@@ -3346,7 +3334,7 @@ func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints 
 	spec := container.ContainerCreateSpec{
 		Name:        instanceID,
 		Image:       def.Image,
-		PullPolicy:  "never", // Images are pre-pulled to shared imagestore; per-app users lack write access.
+		PullPolicy:  "never", // Service containers use --rootfs from golden LV snapshots.
 		Environment: def.Environment,
 		Labels:      piccoloLabels(instanceID, labelService, "service"),
 	}

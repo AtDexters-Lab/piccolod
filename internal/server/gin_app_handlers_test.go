@@ -886,6 +886,53 @@ func (s *stubTestVolumeManager) RoleStream(id string) (<-chan persistence.Volume
 	return ch, nil
 }
 
+// stubTestRootfsManager provides a minimal RootfsVolumeManager for server tests.
+type stubTestRootfsManager struct {
+	root string
+}
+
+func (s *stubTestRootfsManager) EnsureGoldenLV(_ context.Context, _ persistence.GoldenLVRequest) (string, error) {
+	return "golden-test", nil
+}
+func (s *stubTestRootfsManager) CreateWorkspaceFromGolden(_ context.Context, req persistence.WorkspaceRootfsRequest) (persistence.RootfsHandle, error) {
+	mp := filepath.Join(s.root, "rootfs", req.InstanceID)
+	_ = os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{MountPath: mp}, nil
+}
+func (s *stubTestRootfsManager) CreateServiceRootfs(_ context.Context, req persistence.ServiceRootfsRequest) (persistence.RootfsHandle, error) {
+	vid := req.VolumeID
+	if vid == "" {
+		vid = persistence.ServiceRootfsVolumeID(req.InstanceID, req.ServiceName)
+	}
+	mp := filepath.Join(s.root, "rootfs", vid)
+	_ = os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{MountPath: mp, ReadOnly: true}, nil
+}
+func (s *stubTestRootfsManager) CloneWorkspace(_ context.Context, _, cloneID string, _ *persistence.IDMapConfig) (persistence.RootfsHandle, error) {
+	mp := filepath.Join(s.root, "rootfs", cloneID)
+	_ = os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{MountPath: mp}, nil
+}
+func (s *stubTestRootfsManager) ListClones(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
+func (s *stubTestRootfsManager) AttachRootfs(_ context.Context, volumeID string) (persistence.RootfsHandle, error) {
+	mp := filepath.Join(s.root, "rootfs", volumeID)
+	_ = os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{MountPath: mp, ReadOnly: true}, nil
+}
+func (s *stubTestRootfsManager) DetachRootfs(_ context.Context, _ string) error              { return nil }
+func (s *stubTestRootfsManager) DestroyRootfs(_ context.Context, _ string) error             { return nil }
+func (s *stubTestRootfsManager) GarbageCollectGoldenLVs(_ context.Context) error             { return nil }
+func (s *stubTestRootfsManager) ReconcileRootfsStates(_ context.Context) error               { return nil }
+func (s *stubTestRootfsManager) ReadGoldenImageConfig(_ context.Context, _ string) (persistence.GoldenImageConfig, error) {
+	return persistence.GoldenImageConfig{Entrypoint: []string{"/bin/sh"}}, nil
+}
+func (s *stubTestRootfsManager) RootfsVolumeID(mode, instanceID string) string {
+	return "rootfs-" + instanceID
+}
+func (s *stubTestRootfsManager) RootfsExists(_ string) bool { return true }
+
 // createGinTestServer creates a Gin test server instance with filesystem state management
 func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	t.Helper()
@@ -903,13 +950,19 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 
 	// Create filesystem app manager with service manager
 	svcMgr := services.NewServiceManager()
-	appMgr, err := app.NewAppManagerWithServices(mockContainer, tempDir, svcMgr, nil)
+	appMgr, err := app.NewAppManagerForTestWithServices(mockContainer, tempDir, svcMgr, nil)
 	if err != nil {
 		t.Fatalf("Failed to create app manager: %v", err)
 	}
 	requireMountBypassAllowed(t)
 	appMgr.SetMountVerifier(func(string) error { return nil })
 	appMgr.SetVolumeManager(&stubTestVolumeManager{root: tempDir})
+	appMgr.SetRootfsManager(&stubTestRootfsManager{root: tempDir})
+	// Create dummy workspace assets required by block-native install flow.
+	assetsDir := filepath.Join(tempDir, "assets")
+	_ = os.MkdirAll(assetsDir, 0o755)
+	_ = os.WriteFile(filepath.Join(assetsDir, "boot.sh"), []byte("#!/bin/sh\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(assetsDir, "piccolo-startup"), []byte("#!/bin/sh\n"), 0o755)
 	eventsBus := events.NewBus()
 	appMgr.ObserveRuntimeEvents(eventsBus)
 	eventsBus.Publish(events.Event{Topic: events.TopicLockStateChanged, Payload: events.LockStateChanged{Locked: false}})

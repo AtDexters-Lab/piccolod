@@ -37,7 +37,6 @@ func TestReplaceImageTag(t *testing.T) {
 }
 
 func TestUpdateImage_WorkspaceMode_Blocked(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "update_ws_blocked")
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +44,7 @@ func TestUpdateImage_WorkspaceMode_Blocked(t *testing.T) {
 	defer os.RemoveAll(tmp)
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tmp)
+	mgr, err := NewAppManagerForTest(mock, tmp)
 	if err != nil {
 		t.Fatalf("new app manager: %v", err)
 	}
@@ -79,20 +78,21 @@ func TestUpdateImage_WorkspaceMode_Blocked(t *testing.T) {
 	}
 }
 
-func TestUpdateImage_MultiServiceMode_RequiresRootfs(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
-	tmp, err := os.MkdirTemp("", "update_multi_rootfs")
+func TestInstall_MultiServiceMode_RequiresRootfs(t *testing.T) {
+	tmp, err := os.MkdirTemp("", "install_multi_rootfs")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmp)
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tmp)
+	mgr, err := NewAppManagerForTest(mock, tmp)
 	if err != nil {
 		t.Fatalf("new app manager: %v", err)
 	}
 	allowHostStorage(t, mgr)
+	// Clear rootfs manager to test the "not configured" error path.
+	mgr.SetRootfsManager(nil)
 	mgr.ForceLockState(false)
 	ctx := context.Background()
 
@@ -106,16 +106,10 @@ func TestUpdateImage_MultiServiceMode_RequiresRootfs(t *testing.T) {
 		},
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
-	inst, err := mgr.Install(ctx, def)
-	if err != nil {
-		t.Fatalf("install: %v", err)
-	}
-
-	// Multi-service update now proceeds (not blocked), but requires rootfs manager.
-	tag := "1.26"
-	err = mgr.UpdateImage(ctx, inst.InstanceID, &tag)
+	// Install requires rootfs volume manager (block-native architecture).
+	_, err = mgr.Install(ctx, def)
 	if err == nil {
-		t.Fatal("expected error: rootfs manager not configured in unit test")
+		t.Fatal("expected error: rootfs manager not configured")
 	}
 	if !strings.Contains(err.Error(), "rootfs") {
 		t.Fatalf("unexpected error: %v", err)

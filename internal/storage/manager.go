@@ -30,11 +30,6 @@ const (
 	// healthMonitorInterval is the interval for thin pool health checks.
 	healthMonitorInterval = 60 * time.Second
 
-	// podmanSharedLVName is the thin LV for ephemeral shared podman storage.
-	podmanSharedLVName = "podman-shared"
-
-	// podmanSharedLVSize is the initial virtual size for the podman shared LV (50GB).
-	podmanSharedLVSize = 50 * 1024 * 1024 * 1024
 )
 
 // DiskPreparer abstracts disk probing and mutation operations.
@@ -368,11 +363,6 @@ func (m *Manager) InitializeDataVolume(ctx context.Context) error {
 		return fmt.Errorf("create LVM pool: %w", err)
 	}
 
-	// Create the ephemeral podman shared thin LV.
-	if err := m.ensurePodmanSharedLV(ctx); err != nil {
-		return fmt.Errorf("ensure podman shared LV: %w", err)
-	}
-
 	// Ensure directory layout on the core root.
 	if m.diskPrep != nil {
 		if err := m.diskPrep.EnsureDirectories(ctx); err != nil {
@@ -423,11 +413,6 @@ func (m *Manager) UnlockDataVolume(ctx context.Context) error {
 		return fmt.Errorf("activate LVM pool: %w", err)
 	}
 
-	// Ensure the podman shared LV exists and is mounted.
-	if err := m.ensurePodmanSharedLV(ctx); err != nil {
-		return fmt.Errorf("ensure podman shared LV: %w", err)
-	}
-
 	// Ensure directory layout.
 	if m.diskPrep != nil {
 		if err := m.diskPrep.EnsureDirectories(ctx); err != nil {
@@ -445,21 +430,13 @@ func (m *Manager) UnlockDataVolume(ctx context.Context) error {
 	return nil
 }
 
-// LockDataVolume deactivates the LVM VG. Unmounts the podman shared LV first.
+// LockDataVolume deactivates the LVM VG.
 func (m *Manager) LockDataVolume(ctx context.Context) error {
 	if m.lvmPool == nil {
 		return nil
 	}
 
 	m.lvmPool.StopHealthMonitor()
-
-	// Unmount the podman shared LV.
-	podmanMount := paths.PodmanRoot()
-	if m.isMounted(ctx, podmanMount) {
-		if err := m.run.Run(ctx, "umount", podmanMount); err != nil {
-			log.Printf("WARN: failed to unmount podman shared LV: %v", err)
-		}
-	}
 
 	// Deactivate the VG.
 	if err := m.lvmPool.DeactivatePool(ctx); err != nil {
@@ -473,50 +450,3 @@ func (m *Manager) LockDataVolume(ctx context.Context) error {
 	return nil
 }
 
-// ensurePodmanSharedLV creates and mounts the ephemeral podman shared thin LV
-// with btrfs+zstd for container image storage.
-func (m *Manager) ensurePodmanSharedLV(ctx context.Context) error {
-	if m.lvmVols == nil {
-		return nil
-	}
-
-	// Create the thin LV if it doesn't exist.
-	if !m.lvmVols.LVExists(ctx, podmanSharedLVName) {
-		if err := m.lvmVols.CreateThinLV(ctx, podmanSharedLVName, podmanSharedLVSize); err != nil {
-			return fmt.Errorf("create podman shared LV: %w", err)
-		}
-		// Format with btrfs+zstd for container image deduplication.
-		lvPath := m.lvmVols.LVPath(podmanSharedLVName)
-		if err := m.run.Run(ctx, "mkfs.btrfs", "-L", "podman-shared", lvPath); err != nil {
-			return fmt.Errorf("mkfs.btrfs podman shared: %w", err)
-		}
-	}
-
-	// Activate the LV.
-	if err := m.lvmVols.ActivateLV(ctx, podmanSharedLVName); err != nil {
-		return fmt.Errorf("activate podman shared LV: %w", err)
-	}
-
-	// Mount at the podman root.
-	mountDir := paths.PodmanRoot()
-	if err := os.MkdirAll(mountDir, 0o711); err != nil {
-		return fmt.Errorf("create podman mount dir: %w", err)
-	}
-
-	if m.isMounted(ctx, mountDir) {
-		return nil
-	}
-
-	lvPath := m.lvmVols.LVPath(podmanSharedLVName)
-	if err := m.run.Run(ctx, "mount", "-o", "discard=async,compress=zstd", lvPath, mountDir); err != nil {
-		return fmt.Errorf("mount podman shared LV: %w", err)
-	}
-
-	log.Printf("storage: podman shared LV mounted at %s (btrfs+zstd)", mountDir)
-	return nil
-}
-
-// isMounted checks if a path has a mounted filesystem.
-func (m *Manager) isMounted(ctx context.Context, mountPoint string) bool {
-	return m.run.Run(ctx, "mountpoint", "-q", mountPoint) == nil
-}

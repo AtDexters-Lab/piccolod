@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os/user"
 	"testing"
 	"time"
 
+	"piccolod/internal/container"
 	"piccolod/internal/state/paths"
 	"piccolod/internal/update"
 )
@@ -31,6 +33,11 @@ func (m *blockingUpdateManager) Watch(ctx context.Context) error {
 }
 
 func TestServerStartup_WithBlockingWatchdog(t *testing.T) {
+	// Requires piccolo-runtime system user — skip in CI/dev environments.
+	if _, err := user.Lookup(container.RuntimeUsername); err != nil {
+		t.Skipf("skipping: %s user not found", container.RuntimeUsername)
+	}
+
 	// Setup temp state dir
 	tmpDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tmpDir)

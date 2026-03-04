@@ -28,23 +28,35 @@ func TestCoreRoot_EnvOverride(t *testing.T) {
 }
 
 func TestPodmanRoot_Default(t *testing.T) {
+	// PodmanRoot defaults to tmpfs (/run/piccolo/podman), independent of coreRoot.
+	t.Setenv("PICCOLO_PODMAN_ROOT", "")
+	t.Setenv("PICCOLO_CORE_ROOT", "")
 	once = &sync.Once{}
-	once.Do(func() {}) // exhaust
-	coreRoot = defaultCoreRoot
-	podmanRoot = filepath.Join(defaultCoreRoot, "podman")
-	want := filepath.Join(defaultCoreRoot, "podman")
+	once.Do(resolveRoots)
+	want := "/run/piccolo/podman"
 	if got := PodmanRoot(); got != want {
 		t.Fatalf("expected %s, got %s", want, got)
 	}
 }
 
-func TestPodmanRoot_DerivedFromCoreRoot(t *testing.T) {
+func TestPodmanRoot_IndependentFromCoreRoot(t *testing.T) {
+	// Even with a custom PICCOLO_CORE_ROOT, PodmanRoot defaults to tmpfs.
 	t.Setenv("PICCOLO_CORE_ROOT", "/custom/root")
 	t.Setenv("PICCOLO_PODMAN_ROOT", "")
 	once = &sync.Once{}
 	once.Do(resolveRoots)
-	if got := PodmanRoot(); got != "/custom/root/podman" {
-		t.Fatalf("expected /custom/root/podman, got %s", got)
+	want := "/run/piccolo/podman"
+	if got := PodmanRoot(); got != want {
+		t.Fatalf("expected %s, got %s", want, got)
+	}
+}
+
+func TestPodmanRoot_EnvOverride(t *testing.T) {
+	t.Setenv("PICCOLO_PODMAN_ROOT", "/custom/podman")
+	once = &sync.Once{}
+	once.Do(resolveRoots)
+	if got := PodmanRoot(); got != "/custom/podman" {
+		t.Fatalf("expected /custom/podman, got %s", got)
 	}
 }
 

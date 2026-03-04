@@ -172,40 +172,6 @@ func (m *AppManager) readImageConfigForRootfs(ctx context.Context, rootfs persis
 	return rootfs.ReadGoldenImageConfig(ctx, goldenID)
 }
 
-// readImageConfigForRootfsFromInstance reads the golden image config for an existing app instance.
-// It inspects the primary service image to derive the golden LV ID.
-func (m *AppManager) readImageConfigForRootfsFromInstance(ctx context.Context, appInst *AppInstance) (persistence.GoldenImageConfig, error) {
-	rootfs := m.currentRootfsManager()
-	if rootfs == nil {
-		return persistence.GoldenImageConfig{}, fmt.Errorf("rootfs volume manager not configured")
-	}
-	if appInst == nil || appInst.Definition == nil || appInst.Definition.Services == nil {
-		return persistence.GoldenImageConfig{}, fmt.Errorf("app instance has no definition")
-	}
-	// Find the first service with an image to derive the golden LV ID.
-	for _, svc := range appInst.Definition.Services {
-		if svc.Image == "" {
-			continue
-		}
-		// Inspect the image to get the digest (needed for golden LV ID derivation).
-		imageRuntime, err := m.podmanImageRuntime()
-		if err != nil {
-			return persistence.GoldenImageConfig{}, fmt.Errorf("get image runtime: %w", err)
-		}
-		imgConfig, err := m.containerManager.InspectImage(ctx, imageRuntime, svc.Image)
-		if err != nil {
-			return persistence.GoldenImageConfig{}, fmt.Errorf("inspect image %s: %w", svc.Image, err)
-		}
-		imageDigest := ""
-		if len(imgConfig.RepoDigests) > 0 {
-			imageDigest = imgConfig.RepoDigests[0]
-		} else {
-			imageDigest = imgConfig.Digest
-		}
-		return m.readImageConfigForRootfs(ctx, rootfs, imageDigest)
-	}
-	return persistence.GoldenImageConfig{}, fmt.Errorf("no service with image found in definition")
-}
 
 // ensureRootfsAttached ensures a rootfs volume is attached.
 // Returns (nil, nil) if the volume doesn't exist — the app was installed
@@ -326,7 +292,7 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 		return nil, nil
 	}
 
-	// Workspace mode: single rootfs unchanged.
+	// Workspace mode: single rootfs for the primary service + anchor rootfs.
 	if mode == ModeWorkspace {
 		rInfo, err := m.ensureRootfsAttached(ctx, instanceID, mode)
 		if err != nil || rInfo == nil {
@@ -340,17 +306,34 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 			}
 			rInfo.imgConfig = imgCfg
 		}
-		// Return under primary service name.
 		primary := primaryServiceFor(appDef, nil)
-		return map[string]*rootfsMountInfo{primary: rInfo}, nil
+		result := map[string]*rootfsMountInfo{primary: rInfo}
+
+		// Also attach anchor rootfs (all multi-container apps have one).
+		anchorVolID := ""
+		if appInst != nil && appInst.ActiveRootfs != nil {
+			anchorVolID = appInst.ActiveRootfs[networkAnchorServiceName]
+		}
+		if anchorVolID == "" {
+			anchorVolID = persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName)
+		}
+		if rootfs.RootfsExists(anchorVolID) {
+			handle, aErr := rootfs.AttachRootfs(ctx, anchorVolID)
+			if aErr != nil {
+				return nil, fmt.Errorf("attach rootfs for network anchor: %w", aErr)
+			}
+			log.Printf("INFO: attached anchor rootfs %s (mount=%s)", anchorVolID, handle.MountPath)
+			result[networkAnchorServiceName] = &rootfsMountInfo{handle: handle}
+		}
+		return result, nil
 	}
 
 	if appDef == nil || appDef.Services == nil {
 		return nil, nil
 	}
 
-	// Service mode: per-service rootfs.
-	result := make(map[string]*rootfsMountInfo, len(appDef.Services))
+	// Service mode: per-service rootfs + network anchor rootfs.
+	result := make(map[string]*rootfsMountInfo, len(appDef.Services)+1)
 	rollbackAttached := func() {
 		for _, info := range result {
 			if detachErr := rootfs.DetachRootfs(ctx, info.handle.VolumeID); detachErr != nil {
@@ -358,6 +341,24 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 			}
 		}
 	}
+
+	// Attach network anchor rootfs (not in appDef.Services — synthetic container).
+	anchorVolID := ""
+	if appInst != nil && appInst.ActiveRootfs != nil {
+		anchorVolID = appInst.ActiveRootfs[networkAnchorServiceName]
+	}
+	if anchorVolID == "" {
+		anchorVolID = persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName)
+	}
+	if rootfs.RootfsExists(anchorVolID) {
+		handle, err := rootfs.AttachRootfs(ctx, anchorVolID)
+		if err != nil {
+			return nil, fmt.Errorf("attach rootfs for network anchor: %w", err)
+		}
+		log.Printf("INFO: attached anchor rootfs %s (mount=%s)", anchorVolID, handle.MountPath)
+		result[networkAnchorServiceName] = &rootfsMountInfo{handle: handle}
+	}
+
 	for svcName, svc := range appDef.Services {
 		if svc.Image == "" {
 			continue
@@ -402,15 +403,14 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 	if err != nil || rInfo == nil {
 		return nil, err
 	}
-	// Read image config.
-	imgCfg, cfgErr := m.readImageConfigForRootfsFromInstance(ctx, &AppInstance{
-		InstanceID: instanceID,
-		Definition: appDef,
-	})
-	if cfgErr == nil {
-		rInfo.imgConfig = imgCfg
-	} else {
-		log.Printf("WARN: rootfs %s: failed to read legacy image config: %v", instanceID, cfgErr)
+	// Read image config directly from golden LV (no imagestore needed).
+	if rInfo.handle.GoldenLV != "" {
+		imgCfg, cfgErr := rootfs.ReadGoldenImageConfig(ctx, rInfo.handle.GoldenLV)
+		if cfgErr == nil {
+			rInfo.imgConfig = imgCfg
+		} else {
+			log.Printf("WARN: rootfs %s: failed to read legacy image config: %v", instanceID, cfgErr)
+		}
 	}
 	// Apply legacy rootfs to all services with images.
 	for svcName, svc := range appDef.Services {
@@ -432,6 +432,21 @@ func (m *AppManager) detachAllServiceRootfs(ctx context.Context, instanceID stri
 		return
 	}
 
+	// Detach network anchor rootfs (all multi-container apps have an anchor).
+	if appDef != nil && appDef.Services != nil {
+		anchorVolID := ""
+		if appInst != nil && appInst.ActiveRootfs != nil {
+			anchorVolID = appInst.ActiveRootfs[networkAnchorServiceName]
+		}
+		if anchorVolID == "" {
+			anchorVolID = persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName)
+		}
+		if err := rootfs.DetachRootfs(ctx, anchorVolID); err != nil {
+			log.Printf("WARN: detach anchor rootfs %s: %v", anchorVolID, err)
+		}
+	}
+
+	// Detach per-service rootfs volumes (service mode only — workspace uses single rootfs).
 	if mode == ModeService && appDef != nil && appDef.Services != nil {
 		for svcName, svc := range appDef.Services {
 			if svc.Image == "" {
@@ -464,20 +479,27 @@ func (m *AppManager) destroyAllServiceRootfs(ctx context.Context, instanceID str
 		return
 	}
 
-	if mode == ModeService && appDef != nil && appDef.Services != nil {
+	if appDef != nil && appDef.Services != nil {
 		// Scan metadata directory for ALL rootfs volumes matching each service prefix.
 		// This catches both legacy (svc-rootfs-id--svcName) and versioned
 		// (svc-rootfs-id--svcName--digest) volumes from image updates.
+		// Not gated on mode — all multi-container apps have an anchor rootfs.
 		metaBase := paths.CoreJoin("volumes")
 		entries, readErr := os.ReadDir(metaBase)
 		if readErr != nil {
 			log.Printf("WARN: scan rootfs volumes: %v", readErr)
 		}
+
+		// Collect all prefixes: anchor + services.
+		prefixes := make([]string, 0, len(appDef.Services)+1)
+		prefixes = append(prefixes, persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName))
 		for svcName, svc := range appDef.Services {
 			if svc.Image == "" {
 				continue
 			}
-			prefix := persistence.ServiceRootfsVolumeID(instanceID, svcName)
+			prefixes = append(prefixes, persistence.ServiceRootfsVolumeID(instanceID, svcName))
+		}
+		for _, prefix := range prefixes {
 			for _, e := range entries {
 				if e.IsDir() && (e.Name() == prefix || strings.HasPrefix(e.Name(), prefix+"--")) {
 					if err := rootfs.DestroyRootfs(ctx, e.Name()); err != nil {
@@ -505,6 +527,19 @@ func (m *AppManager) appHasAnyServiceRootfs(instanceID string, mode PiccoloMode,
 		return false
 	}
 
+	// Check anchor rootfs (all multi-container apps have an anchor).
+	if appDef != nil && appDef.Services != nil {
+		anchorVolID := persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName)
+		if appInst != nil && appInst.ActiveRootfs != nil {
+			if vid := appInst.ActiveRootfs[networkAnchorServiceName]; vid != "" {
+				anchorVolID = vid
+			}
+		}
+		if rootfs.RootfsExists(anchorVolID) {
+			return true
+		}
+	}
+
 	// Check per-service volumes (versioned first, then legacy).
 	if mode == ModeService && appDef != nil && appDef.Services != nil {
 		for svcName, svc := range appDef.Services {
@@ -530,18 +565,20 @@ func (m *AppManager) appHasAnyServiceRootfs(instanceID string, mode PiccoloMode,
 
 // MakeFlattenFn creates the flatten function that extracts an OCI image to a target directory
 // and returns its OCI config. Injected into the persistence layer during service construction.
+// Uses an ephemeral podman runtime per flatten — no persistent imagestore.
 func (m *AppManager) MakeFlattenFn() func(ctx context.Context, imageRef, targetDir string) (persistence.GoldenImageConfig, error) {
 	return func(ctx context.Context, imageRef, targetDir string) (persistence.GoldenImageConfig, error) {
 		var cfg persistence.GoldenImageConfig
 
-		rt, err := m.podmanImageRuntime()
-		if err != nil {
-			return cfg, fmt.Errorf("image runtime: %w", err)
+		rt, cleanup, rtErr := newEphemeralFlattenRuntime(m.runtimeUser)
+		if rtErr != nil {
+			return cfg, fmt.Errorf("ephemeral runtime: %w", rtErr)
 		}
+		defer cleanup()
 
-		// Pull the image (best-effort for offline resilience).
-		if pullErr := m.pullToImagestore(ctx, imageRef, nil); pullErr != nil {
-			log.Printf("WARN: flatten: image pull failed, will attempt with cached: %v", pullErr)
+		// Pull the image into ephemeral runtime.
+		if err := m.containerManager.PullImage(ctx, rt, imageRef); err != nil {
+			return cfg, fmt.Errorf("pull image %s: %w", imageRef, err)
 		}
 
 		// Extract image config.
@@ -582,18 +619,17 @@ func (m *AppManager) MakeFlattenFn() func(ctx context.Context, imageRef, targetD
 }
 
 // MakeImageSizeFn creates a function that returns the uncompressed image size.
-// It performs a best-effort pull first (priming the cache for the subsequent flatten),
-// then inspects the image to get its size.
+// Uses an ephemeral podman runtime — no persistent imagestore.
 func (m *AppManager) MakeImageSizeFn() func(ctx context.Context, imageRef string) (int64, error) {
 	return func(ctx context.Context, imageRef string) (int64, error) {
-		rt, err := m.podmanImageRuntime()
-		if err != nil {
-			return 0, fmt.Errorf("image runtime: %w", err)
+		rt, cleanup, rtErr := newEphemeralFlattenRuntime(m.runtimeUser)
+		if rtErr != nil {
+			return 0, fmt.Errorf("ephemeral runtime: %w", rtErr)
 		}
+		defer cleanup()
 
-		// Best-effort pull — primes cache so flattenFn's pull is a no-op.
-		if pullErr := m.pullToImagestore(ctx, imageRef, nil); pullErr != nil {
-			log.Printf("WARN: imageSizeFn: image pull failed, will attempt with cached: %v", pullErr)
+		if err := m.containerManager.PullImage(ctx, rt, imageRef); err != nil {
+			return 0, fmt.Errorf("pull image %s: %w", imageRef, err)
 		}
 
 		imgConfig, err := m.containerManager.InspectImage(ctx, rt, imageRef)

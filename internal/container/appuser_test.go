@@ -411,13 +411,13 @@ func TestProvisionAppUser_useradd_failure_returns_error(t *testing.T) {
 	// NOTE: hasSubUIDAllocation/allocateSubUIDRange still read the real /etc/subuid.
 	// This test works because the mock username won't appear in /etc/subuid.
 
-	// Mock: user does not exist, group exists.
+	// Mock: user does not exist.
 	defaultResolver = &mockResolver{
 		users:  map[string]*user.User{},
-		groups: map[string]*user.Group{AppsGroupName: {Name: AppsGroupName, Gid: "2000"}},
+		groups: map[string]*user.Group{},
 	}
 
-	// Mock: groupadd succeeds, useradd fails.
+	// Mock: useradd fails.
 	exec := &mockExecutor{
 		results: map[string]mockResult{},
 		defaultResult: mockResult{
@@ -425,7 +425,6 @@ func TestProvisionAppUser_useradd_failure_returns_error(t *testing.T) {
 			err:    fmt.Errorf("exit status 1"),
 		},
 	}
-	exec.results["groupadd -f "+AppsGroupName] = mockResult{output: nil, err: nil}
 	defaultExecutor = exec
 
 	_, err := ProvisionAppUser("test-fail-app")
@@ -450,11 +449,11 @@ func TestProvisionAppUser_usermod_failure_triggers_rollback(t *testing.T) {
 
 	username := appUsername("test-rollback-app")
 
-	// Resolver: user doesn't exist initially, group exists.
+	// Resolver: user doesn't exist initially.
 	// The onRun callback makes the user visible after useradd succeeds.
 	resolver := &mockResolver{
 		users:  map[string]*user.User{},
-		groups: map[string]*user.Group{AppsGroupName: {Name: AppsGroupName, Gid: "2000"}},
+		groups: map[string]*user.Group{},
 	}
 	defaultResolver = resolver
 
@@ -465,10 +464,9 @@ func TestProvisionAppUser_usermod_failure_triggers_rollback(t *testing.T) {
 			err:    fmt.Errorf("exit status 1"),
 		},
 	}
-	// groupadd and useradd succeed; usermod (subuid) fails via default.
-	exec.results["groupadd -f "+AppsGroupName] = mockResult{output: nil, err: nil}
+	// useradd succeeds; usermod (subuid) fails via default.
 	exec.results[strings.Join([]string{"useradd", "--system", "--shell", "/usr/sbin/nologin",
-		"--create-home", "--groups", AppsGroupName, username}, " ")] = mockResult{output: nil, err: nil}
+		"--create-home", username}, " ")] = mockResult{output: nil, err: nil}
 	defaultExecutor = exec
 
 	// When useradd runs, make the user visible in the resolver so that
