@@ -2,7 +2,6 @@ package persistence
 
 import (
 	"log"
-	"os"
 	"path/filepath"
 
 	"piccolod/internal/state/paths"
@@ -29,22 +28,14 @@ type VolumeDiagnostic struct {
 // view. No crypto material is exposed. Read-only — races with concurrent
 // volume creation/deletion are benign for a diagnostic snapshot.
 func (m *luksVolumeManager) ScanAllVolumes() ([]VolumeDiagnostic, error) {
-	metaBase := paths.CoreJoin("volumes")
-	entries, err := os.ReadDir(metaBase)
+	volIDs, err := listVolumeIDs()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
 
 	var result []VolumeDiagnostic
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		volID := e.Name()
-		metaPath := filepath.Join(metaBase, volID, metadataV2File)
+	for _, volID := range volIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
 
 		version, err := readVolumeMetaVersion(metaPath)
 		if err != nil {

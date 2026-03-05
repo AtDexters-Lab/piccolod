@@ -79,7 +79,7 @@ func TestDetectBootMode_InvalidOverride(t *testing.T) {
 func TestDetectBootMode_WithFakeRunner(t *testing.T) {
 	t.Setenv("PICCOLO_BOOT_MODE_OVERRIDE", "")
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"findmnt -nro SOURCE /": "/dev/sda2",
 			"lsblk -ndo TRAN /dev/sda": "sata",
 		},
@@ -96,7 +96,7 @@ func TestDetectBootMode_WithFakeRunner(t *testing.T) {
 func TestDetectBootMode_USBTransport(t *testing.T) {
 	t.Setenv("PICCOLO_BOOT_MODE_OVERRIDE", "")
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"findmnt -nro SOURCE /": "/dev/sdb1",
 			"lsblk -ndo TRAN /dev/sdb": "usb",
 		},
@@ -113,7 +113,7 @@ func TestDetectBootMode_USBTransport(t *testing.T) {
 func TestDetectBootMode_NVMe(t *testing.T) {
 	t.Setenv("PICCOLO_BOOT_MODE_OVERRIDE", "")
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"findmnt -nro SOURCE /":       "/dev/nvme0n1p2",
 			"lsblk -ndo TRAN /dev/nvme0n1": "nvme",
 		},

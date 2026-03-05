@@ -6,56 +6,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage/blockdev"
 	"piccolod/internal/storage/lvm"
+	"piccolod/internal/testutil"
 )
 
-// fakeRunner records all Run/RunWithOutput calls for assertion.
-type fakeRunner struct {
-	mu    sync.Mutex
-	calls []string
-	errs  map[string]error
-}
-
-func (f *fakeRunner) Run(_ context.Context, name string, args ...string) error {
-	key := name + " " + strings.Join(args, " ")
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	err := f.errs[key]
-	if err == nil {
-		err = f.errs[name]
-	}
-	f.mu.Unlock()
-	return err
-}
-
-func (f *fakeRunner) RunWithOutput(_ context.Context, name string, args ...string) ([]byte, error) {
-	key := name + " " + strings.Join(args, " ")
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	err := f.errs[key]
-	if err == nil {
-		err = f.errs[name]
-	}
-	f.mu.Unlock()
-	return nil, err
-}
-
-func (f *fakeRunner) RunWithStdin(_ context.Context, _ []byte, name string, args ...string) error {
-	return f.Run(context.Background(), name, args...)
-}
-
-func (f *fakeRunner) getCalls() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]string, len(f.calls))
-	copy(out, f.calls)
-	return out
-}
+type fakeRunner = testutil.FakeRunner
 
 func TestLUKSVolumeManager_ImplementsInterfaces(t *testing.T) {
 	// Compile-time interface checks.
@@ -367,7 +326,7 @@ func TestLuksSetKeyslot_CallsAddKey(t *testing.T) {
 		t.Fatalf("luksSetKeyslot: %v", err)
 	}
 
-	calls := run.getCalls()
+	calls := run.GetCalls()
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 call, got %d: %v", len(calls), calls)
 	}
@@ -416,7 +375,7 @@ func TestProvisionKeyslotOnAllVolumes_FailsWithNilCrypto(t *testing.T) {
 		t.Fatal("expected error (no crypto manager)")
 	}
 	// No cryptsetup calls should have been made.
-	if calls := run.getCalls(); len(calls) != 0 {
+	if calls := run.GetCalls(); len(calls) != 0 {
 		t.Errorf("expected 0 calls, got %d: %v", len(calls), calls)
 	}
 }
@@ -558,7 +517,7 @@ func TestDestroyVolume_Ephemeral_NoCryptsetup(t *testing.T) {
 	}
 
 	// Verify no cryptsetup calls were made.
-	for _, call := range run.getCalls() {
+	for _, call := range run.GetCalls() {
 		if strings.Contains(call, "cryptsetup") {
 			t.Errorf("unexpected cryptsetup call: %q", call)
 		}
@@ -579,7 +538,7 @@ func TestProvisionKeyslotOnAllVolumes_SkipsEphemeral(t *testing.T) {
 
 	run := &fakeRunner{
 		// Make cryptsetup fail so we can detect if it's called.
-		errs: map[string]error{"cryptsetup": errors.New("should not be called")},
+		Errs: map[string]error{"cryptsetup": errors.New("should not be called")},
 	}
 
 	// Create an ephemeral volume metadata (should be skipped).
@@ -607,7 +566,7 @@ func TestProvisionKeyslotOnAllVolumes_SkipsEphemeral(t *testing.T) {
 	_ = mgr.provisionKeyslotOnAllVolumes(context.Background(), 1, []byte("pass"))
 
 	// No cryptsetup calls should have been made for the ephemeral volume.
-	for _, call := range run.getCalls() {
+	for _, call := range run.GetCalls() {
 		if strings.Contains(call, "cryptsetup") {
 			t.Errorf("unexpected cryptsetup call for ephemeral volume: %q", call)
 		}

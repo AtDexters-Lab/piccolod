@@ -436,10 +436,6 @@ func TestAppManager_List(t *testing.T) {
 	}
 	allowHostStorage(t, manager)
 	manager.ForceLockState(false)
-	manager.ForceLockState(false)
-	manager.ForceLockState(false)
-	manager.ForceLockState(false)
-	manager.ForceLockState(false)
 
 	ctx := context.Background()
 
@@ -534,10 +530,6 @@ func TestAppManager_Get(t *testing.T) {
 		t.Fatalf("Failed to create AppManager: %v", err)
 	}
 	allowHostStorage(t, manager)
-	manager.ForceLockState(false)
-	manager.ForceLockState(false)
-	manager.ForceLockState(false)
-	manager.ForceLockState(false)
 	manager.ForceLockState(false)
 
 	ctx := context.Background()

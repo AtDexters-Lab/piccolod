@@ -114,6 +114,15 @@ var (
 
 	// Label keys: allow dotted namespaces (e.g. io.piccolo.instance) with conservative characters.
 	labelKeyPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
+
+	// Storage driver name: lowercase alphanumeric only.
+	storageDriverPattern = regexp.MustCompile(`^[a-z0-9]+$`)
+
+	// Storage option: key=value or bare key with dotted namespaces.
+	storageOptPattern = regexp.MustCompile(`^[a-z0-9_.]+=[/a-zA-Z0-9._-]+$|^[a-z0-9_.]+$`)
+
+	// Container name-in-use error: extract the conflicting container ID.
+	nameInUseIDPattern = regexp.MustCompile(`already in use by ([a-f0-9]{12,64})`)
 )
 
 var portInUseRe = regexp.MustCompile(`:(\d+): bind: address already in use`)
@@ -194,10 +203,10 @@ func podmanInspectError(label string, err error) error {
 	return fmt.Errorf("podman inspect (%s) failed: %w", label, err)
 }
 
-// MinimalRootlessEnv returns the minimal environment variables needed for
+// minimalRootlessEnv returns the minimal environment variables needed for
 // rootless podman execution. This is the canonical set used by both
 // ApplyRuntimeCredential and workspacedisk's PodmanImageMounter.
-func MinimalRootlessEnv(homeDir string, uid uint32) []string {
+func minimalRootlessEnv(homeDir string, uid uint32) []string {
 	return []string{
 		fmt.Sprintf("HOME=%s", homeDir),
 		fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", uid),
@@ -233,7 +242,7 @@ func ApplyRuntimeCredential(cmd *exec.Cmd, rt PodmanRuntime, extraEnv ...string)
 	if rt.Credential == nil {
 		return
 	}
-	cmd.Env = append(MinimalRootlessEnv(rt.HomeDir, rt.Credential.Uid), extraEnv...)
+	cmd.Env = append(minimalRootlessEnv(rt.HomeDir, rt.Credential.Uid), extraEnv...)
 	cmd.Env = append(cmd.Env, ProxyEnvVars()...)
 
 	if cmd.SysProcAttr == nil {
@@ -640,7 +649,7 @@ func BuildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 		out = append(out, "--runroot", runtime.RunRoot)
 	}
 	if runtime.StorageDriver != "" {
-		if !regexp.MustCompile(`^[a-z0-9]+$`).MatchString(runtime.StorageDriver) {
+		if !storageDriverPattern.MatchString(runtime.StorageDriver) {
 			return nil, fmt.Errorf("invalid storage driver name")
 		}
 		out = append(out, "--storage-driver", runtime.StorageDriver)
@@ -648,7 +657,7 @@ func BuildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 	for _, opt := range runtime.StorageOpts {
 		// Basic validation for options (key=value or key).
 		// Keys can contain dots for driver-scoped options (e.g., overlay.mount_program).
-		if !regexp.MustCompile(`^[a-z0-9_.]+=[/a-zA-Z0-9._-]+$|^[a-z0-9_.]+$`).MatchString(opt) {
+		if !storageOptPattern.MatchString(opt) {
 			return nil, fmt.Errorf("invalid storage option: %s", opt)
 		}
 		out = append(out, "--storage-opt", opt)
@@ -696,8 +705,7 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 			// Error: ... name "code-server" is already in use by <id>. ...
 			// Simple regex to find the ID?
 			// The ID is usually 64 chars hex.
-			re := regexp.MustCompile(`already in use by ([a-f0-9]{12,64})`)
-			if match := re.FindStringSubmatch(outStr); len(match) == 2 {
+			if match := nameInUseIDPattern.FindStringSubmatch(outStr); len(match) == 2 {
 				return "", &NameInUseError{Name: spec.Name, ID: match[1]}
 			}
 		}
@@ -1545,8 +1553,6 @@ var (
 	// Matches: "Copying blob sha256:abc123 skipped: already exists"
 	pullExistsRe = regexp.MustCompile(`Copying blob ([a-zA-Z0-9:]+)\s+skipped.*exists`)
 
-	// Matches: "Getting image source signatures" or "Copying config sha256:..."
-	pullPhaseRe = regexp.MustCompile(`^(Getting image|Copying config|Writing manifest)`)
 )
 
 // parseLine processes a single line of podman pull output.
@@ -1705,13 +1711,6 @@ func (p *pullProgressParser) shouldCallback() bool {
 	}
 	p.lastCB = time.Now()
 	return true
-}
-
-// markCallbackSent marks the current time as the last callback time.
-func (p *pullProgressParser) markCallbackSent() {
-	p.mu.Lock()
-	p.lastCB = time.Now()
-	p.mu.Unlock()
 }
 
 // PullImageWithProgress pulls an image with real-time progress callbacks.

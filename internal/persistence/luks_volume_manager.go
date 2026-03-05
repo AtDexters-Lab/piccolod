@@ -156,21 +156,13 @@ func (m *luksVolumeManager) SetRoleChecker(fn func(string, VolumeRole) bool) {
 // ReconcileAllVolumeStates scans persisted volume metadata and validates
 // consistency on startup. Skips v3 rootfs volumes (handled by ReconcileRootfsStates).
 func (m *luksVolumeManager) ReconcileAllVolumeStates() error {
-	metaBase := paths.CoreJoin("volumes")
-	entries, err := os.ReadDir(metaBase)
+	volIDs, err := listVolumeIDs()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read volumes dir: %w", err)
+		return err
 	}
 
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		volID := e.Name()
-		metaPath := filepath.Join(metaBase, volID, metadataV2File)
+	for _, volID := range volIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
 		if _, err := os.Stat(metaPath); os.IsNotExist(err) {
 			continue
 		}
@@ -564,6 +556,20 @@ func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeReque
 }
 
 func (m *luksVolumeManager) attachAppVolume(ctx context.Context, handle VolumeHandle, meta *volumeMetaV2, opts AttachOptions) error {
+	return m.attachAppVolumeCommon(ctx, handle, meta.LVName, meta.SizeBytes, opts,
+		func(topDev, mapper string) error {
+			keyMaterial, err := m.unwrapKey(ctx, meta.WrappedKey, meta.Nonce)
+			if err != nil {
+				return err
+			}
+			defer cryptoutil.SecureZero(keyMaterial)
+			return m.luksOpen(ctx, topDev, mapper, keyMaterial)
+		})
+}
+
+// attachAppVolumeCommon is the shared attach path for v2 and v3 app volumes.
+// The luksOpenFn closure handles LUKS opening with the appropriate key material.
+func (m *luksVolumeManager) attachAppVolumeCommon(ctx context.Context, handle VolumeHandle, lvName string, sizeBytes int64, opts AttachOptions, luksOpenFn func(topDev, mapper string) error) error {
 	// Role check.
 	m.mu.Lock()
 	checker := m.roleChecker
@@ -573,7 +579,7 @@ func (m *luksVolumeManager) attachAppVolume(ctx context.Context, handle VolumeHa
 	}
 
 	// Build and open the device stack.
-	stack, err := m.buildStack(handle.ID, meta.LVName, meta.SizeBytes)
+	stack, err := m.buildStack(handle.ID, lvName, sizeBytes)
 	if err != nil {
 		return fmt.Errorf("build device stack: %w", err)
 	}
@@ -586,27 +592,29 @@ func (m *luksVolumeManager) attachAppVolume(ctx context.Context, handle VolumeHa
 	m.stacks[handle.ID] = stack
 	m.mu.Unlock()
 
-	// Unwrap volume key.
-	keyMaterial, err := m.unwrapKey(ctx, meta.WrappedKey, meta.Nonce)
-	if err != nil {
+	// Rollback on failure: close LUKS mapper (if opened), close stack, remove tracking.
+	mapper := "piccolo-vol-" + handle.ID
+	var openedMapper string
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		if openedMapper != "" {
+			m.run.Run(ctx, "cryptsetup", "close", openedMapper)
+		}
 		stack.Close(ctx)
 		m.mu.Lock()
 		delete(m.stacks, handle.ID)
 		m.mu.Unlock()
-		return err
-	}
-	defer cryptoutil.SecureZero(keyMaterial)
+	}()
 
 	// LUKS open.
 	topDev := stack.Top().Path()
-	mapper := "piccolo-vol-" + handle.ID
-	if err := m.luksOpen(ctx, topDev, mapper, keyMaterial); err != nil {
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
+	if err := luksOpenFn(topDev, mapper); err != nil {
 		return fmt.Errorf("luks open: %w", err)
 	}
+	openedMapper = mapper
 
 	// Mount ext4.
 	mountDir := handle.MountDir
@@ -614,40 +622,21 @@ func (m *luksVolumeManager) attachAppVolume(ctx context.Context, handle VolumeHa
 	// users can reach their own mount points without being able to list siblings.
 	mountsParent := filepath.Dir(mountDir)
 	if err := os.MkdirAll(mountsParent, 0o711); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
 		return fmt.Errorf("create mounts parent: %w", err)
 	}
 	if err := os.Chmod(mountsParent, 0o711); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
 		return fmt.Errorf("chmod mounts parent: %w", err)
 	}
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
 		return fmt.Errorf("create mount dir: %w", err)
 	}
 
 	mapperPath := "/dev/mapper/" + mapper
 	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", "discard", mapperPath, mountDir); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
 		return fmt.Errorf("mount: %w", err)
 	}
 
+	success = true
 	return nil
 }
 
@@ -758,38 +747,33 @@ func (m *luksVolumeManager) attachEphemeralVolume(ctx context.Context, handle Vo
 	m.stacks[handle.ID] = stack
 	m.mu.Unlock()
 
+	success := false
+	defer func() {
+		if !success {
+			stack.Close(ctx)
+			m.mu.Lock()
+			delete(m.stacks, handle.ID)
+			m.mu.Unlock()
+		}
+	}()
+
 	mountDir := handle.MountDir
 	mountsParent := filepath.Dir(mountDir)
 	if err := os.MkdirAll(mountsParent, 0o711); err != nil {
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
 		return fmt.Errorf("create mounts parent: %w", err)
 	}
 	if err := os.Chmod(mountsParent, 0o711); err != nil {
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
 		return fmt.Errorf("chmod mounts parent: %w", err)
 	}
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
 		return fmt.Errorf("create mount dir: %w", err)
 	}
 
 	if err := m.run.Run(ctx, "mount", "-t", "btrfs", "-o", btrfsRootfsMountOpts, stack.Top().Path(), mountDir); err != nil {
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
 		return fmt.Errorf("mount: %w", err)
 	}
 
+	success = true
 	return nil
 }
 
@@ -1002,22 +986,14 @@ func (m *luksVolumeManager) provisionKeyslotOnAllVolumes(ctx context.Context, sl
 	}
 	defer cryptoutil.SecureZero(masterKey)
 
-	metaBase := paths.CoreJoin("volumes")
-	entries, err := os.ReadDir(metaBase)
+	volIDs, err := listVolumeIDs()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read volumes dir: %w", err)
+		return err
 	}
 
 	var errs []error
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		volID := e.Name()
-		metaPath := filepath.Join(metaBase, volID, metadataV2File)
+	for _, volID := range volIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
 		version, _ := readVolumeMetaVersion(metaPath)
 		if version != metadataV3Version {
 			continue
@@ -1148,74 +1124,10 @@ func (m *luksVolumeManager) luksSetKeyslot(ctx context.Context, device string, s
 
 // attachAppVolumeV3 attaches a v3 service-data volume using the pool keyfile.
 func (m *luksVolumeManager) attachAppVolumeV3(ctx context.Context, handle VolumeHandle, meta *volumeMetaV3, opts AttachOptions) error {
-	// Role check.
-	m.mu.Lock()
-	checker := m.roleChecker
-	m.mu.Unlock()
-	if checker != nil && !checker(handle.ID, opts.Role) {
-		return fmt.Errorf("role check failed for %s", handle.ID)
-	}
-
-	stack, err := m.buildStack(handle.ID, meta.LVName, meta.SizeBytes)
-	if err != nil {
-		return fmt.Errorf("build device stack: %w", err)
-	}
-	if err := stack.Open(ctx); err != nil {
-		return fmt.Errorf("open device stack: %w", err)
-	}
-
-	m.mu.Lock()
-	m.stacks[handle.ID] = stack
-	m.mu.Unlock()
-
-	topDev := stack.Top().Path()
-	mapper := "piccolo-vol-" + handle.ID
-	if err := m.luksOpenWithPoolKeyfile(ctx, topDev, mapper); err != nil {
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
-		return fmt.Errorf("luks open: %w", err)
-	}
-
-	mountDir := handle.MountDir
-	mountsParent := filepath.Dir(mountDir)
-	if err := os.MkdirAll(mountsParent, 0o711); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
-		return fmt.Errorf("create mounts parent: %w", err)
-	}
-	if err := os.Chmod(mountsParent, 0o711); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
-		return fmt.Errorf("chmod mounts parent: %w", err)
-	}
-	if err := os.MkdirAll(mountDir, 0o700); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
-		return fmt.Errorf("create mount dir: %w", err)
-	}
-
-	mapperPath := "/dev/mapper/" + mapper
-	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", "discard", mapperPath, mountDir); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
-		return fmt.Errorf("mount: %w", err)
-	}
-
-	return nil
+	return m.attachAppVolumeCommon(ctx, handle, meta.LVName, meta.SizeBytes, opts,
+		func(topDev, mapper string) error {
+			return m.luksOpenWithPoolKeyfile(ctx, topDev, mapper)
+		})
 }
 
 // --- Metadata v3 ---
@@ -1249,6 +1161,28 @@ type IDMapMeta struct {
 }
 
 // --- Metadata I/O ---
+
+// listVolumeIDs returns subdirectory names under the volumes metadata base
+// directory. Each subdirectory name corresponds to a volume ID.
+// Returns nil, nil if the directory does not exist.
+func listVolumeIDs() ([]string, error) {
+	metaBase := paths.CoreJoin("volumes")
+	entries, err := os.ReadDir(metaBase)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read volumes dir: %w", err)
+	}
+	var ids []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		ids = append(ids, e.Name())
+	}
+	return ids, nil
+}
 
 // readVolumeMetaVersion reads only the version field from a metadata file.
 func readVolumeMetaVersion(path string) (int, error) {

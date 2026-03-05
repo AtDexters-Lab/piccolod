@@ -579,27 +579,7 @@ func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime
 		spec.PullPolicy = "never"
 	}
 
-	var cid string
-	for i := 0; i < 2; i++ {
-		cid, err = m.containerManager.CreateContainer(ctx, runtime, spec)
-		if err == nil {
-			break
-		}
-		zombieID := ""
-		var nameErr *container.NameInUseError
-		if errors.As(err, &nameErr) {
-			zombieID = nameErr.ID
-		} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, spec.Name); resolveErr == nil {
-			zombieID = id
-		}
-		if zombieID != "" {
-			log.Printf("INFO: recreate %s: removing zombie container %s (service=%s)", opts.instanceID, zombieID, opts.svcName)
-			_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
-			_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
-			continue
-		}
-		break
-	}
+	cid, err := m.createContainerWithRetry(ctx, runtime, spec, fmt.Sprintf("recreate %s service=%s", opts.instanceID, opts.svcName))
 	if err != nil {
 		return "", fmt.Errorf("create service container '%s': %w", opts.svcName, err)
 	}
@@ -608,6 +588,41 @@ func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime
 		return "", fmt.Errorf("start service container '%s': %w", opts.svcName, err)
 	}
 	return cid, nil
+}
+
+// createContainerWithRetry attempts to create a container, retrying once if the
+// failure is due to a zombie container with the same name. PortInUseError is
+// returned immediately without retry.
+func (m *AppManager) createContainerWithRetry(ctx context.Context, runtime container.PodmanRuntime, spec container.ContainerCreateSpec, logPrefix string) (string, error) {
+	var cid string
+	var err error
+	for i := 0; i < 2; i++ {
+		cid, err = m.containerManager.CreateContainer(ctx, runtime, spec)
+		if err == nil {
+			return cid, nil
+		}
+
+		var portErr *container.PortInUseError
+		if errors.As(err, &portErr) {
+			return "", err
+		}
+
+		zombieID := ""
+		var nameErr *container.NameInUseError
+		if errors.As(err, &nameErr) {
+			zombieID = nameErr.ID
+		} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, spec.Name); resolveErr == nil {
+			zombieID = id
+		}
+		if zombieID != "" {
+			log.Printf("INFO: %s: removing zombie container %s", logPrefix, zombieID)
+			_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
+			_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
+			continue
+		}
+		break
+	}
+	return "", err
 }
 
 func (m *AppManager) stopContainersForMultiApp(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, runtime container.PodmanRuntime) error {

@@ -5,78 +5,16 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"piccolod/internal/events"
+	"piccolod/internal/testutil"
 )
 
-// fakeRunner records all Run/RunWithOutput calls and returns preconfigured outputs/errors.
-type fakeRunner struct {
-	mu      sync.Mutex
-	outputs map[string]string
-	errs    map[string]error
-	calls   []string
-}
+type fakeRunner = testutil.FakeRunner
 
-func buildKey(name string, args []string) string {
-	parts := append([]string{name}, args...)
-	return strings.Join(parts, " ")
-}
-
-func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) error {
-	key := buildKey(name, args)
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	f.mu.Unlock()
-	if f.errs != nil {
-		if err, ok := f.errs[key]; ok {
-			return err
-		}
-	}
-	return nil
-}
-
-func (f *fakeRunner) RunWithOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
-	key := buildKey(name, args)
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	f.mu.Unlock()
-	if f.errs != nil {
-		if err, ok := f.errs[key]; ok {
-			return nil, err
-		}
-	}
-	if f.outputs != nil {
-		if out, ok := f.outputs[key]; ok {
-			return []byte(out), nil
-		}
-	}
-	return nil, nil
-}
-
-func (f *fakeRunner) RunWithStdin(ctx context.Context, stdin []byte, name string, args ...string) error {
-	key := buildKey(name, args)
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	f.mu.Unlock()
-	if f.errs != nil {
-		if err, ok := f.errs[key]; ok {
-			return err
-		}
-	}
-	return nil
-}
-
-// getCalls returns a copy of the calls slice (thread-safe).
-func (f *fakeRunner) getCalls() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	cp := make([]string, len(f.calls))
-	copy(cp, f.calls)
-	return cp
-}
+var buildKey = testutil.BuildKey
 
 // exitError returns an *exec.ExitError with the given exit code.
 func exitError(code int) *exec.ExitError {
@@ -127,26 +65,27 @@ func TestPoolManager_CreatePool(t *testing.T) {
 	}
 
 	// Verify command sequence: pvcreate → vgcreate → lvcreate → lvchange
-	if len(run.calls) != 4 {
-		t.Fatalf("expected 4 commands, got %d: %v", len(run.calls), run.calls)
+	calls := run.GetCalls()
+	if len(calls) != 4 {
+		t.Fatalf("expected 4 commands, got %d: %v", len(calls), calls)
 	}
-	if !strings.HasPrefix(run.calls[0], "pvcreate") {
-		t.Errorf("first call should be pvcreate, got %q", run.calls[0])
+	if !strings.HasPrefix(calls[0], "pvcreate") {
+		t.Errorf("first call should be pvcreate, got %q", calls[0])
 	}
-	if !strings.HasPrefix(run.calls[1], "vgcreate") {
-		t.Errorf("second call should be vgcreate, got %q", run.calls[1])
+	if !strings.HasPrefix(calls[1], "vgcreate") {
+		t.Errorf("second call should be vgcreate, got %q", calls[1])
 	}
-	if !strings.Contains(run.calls[2], "lvcreate") {
-		t.Errorf("third call should be lvcreate, got %q", run.calls[2])
+	if !strings.Contains(calls[2], "lvcreate") {
+		t.Errorf("third call should be lvcreate, got %q", calls[2])
 	}
-	if !strings.Contains(run.calls[3], "lvchange") || !strings.Contains(run.calls[3], "--errorwhenfull") {
-		t.Errorf("fourth call should be lvchange --errorwhenfull, got %q", run.calls[3])
+	if !strings.Contains(calls[3], "lvchange") || !strings.Contains(calls[3], "--errorwhenfull") {
+		t.Errorf("fourth call should be lvchange --errorwhenfull, got %q", calls[3])
 	}
 }
 
 func TestPoolManager_CreatePool_PvcreateError(t *testing.T) {
 	run := &fakeRunner{
-		errs: map[string]error{
+		Errs: map[string]error{
 			"pvcreate -f /dev/sda3": fmt.Errorf("device busy"),
 		},
 	}
@@ -166,8 +105,9 @@ func TestPoolManager_ActivatePool(t *testing.T) {
 	if err := mgr.ActivatePool(context.Background()); err != nil {
 		t.Fatalf("ActivatePool: %v", err)
 	}
-	if len(run.calls) != 1 || !strings.Contains(run.calls[0], "vgchange -ay") {
-		t.Errorf("expected vgchange -ay call, got: %v", run.calls)
+	calls := run.GetCalls()
+	if len(calls) != 1 || !strings.Contains(calls[0], "vgchange -ay") {
+		t.Errorf("expected vgchange -ay call, got: %v", calls)
 	}
 }
 
@@ -177,15 +117,16 @@ func TestPoolManager_DeactivatePool(t *testing.T) {
 	if err := mgr.DeactivatePool(context.Background()); err != nil {
 		t.Fatalf("DeactivatePool: %v", err)
 	}
-	if len(run.calls) != 1 || !strings.Contains(run.calls[0], "vgchange -an") {
-		t.Errorf("expected vgchange -an call, got: %v", run.calls)
+	calls := run.GetCalls()
+	if len(calls) != 1 || !strings.Contains(calls[0], "vgchange -an") {
+		t.Errorf("expected vgchange -an call, got: %v", calls)
 	}
 }
 
 func TestPoolManager_PoolStatus(t *testing.T) {
 	t.Run("valid_output", func(t *testing.T) {
 		run := &fakeRunner{
-			outputs: map[string]string{
+			Outputs: map[string]string{
 				buildKey("lvs", []string{"--noheadings", "--nosuffix", "--units", "b",
 					"-o", "data_percent,metadata_percent,lv_size",
 					"piccolo-data-vg/thinpool"}): "  42.5   10.2   107374182400\n",
@@ -209,7 +150,7 @@ func TestPoolManager_PoolStatus(t *testing.T) {
 
 	t.Run("parse_error", func(t *testing.T) {
 		run := &fakeRunner{
-			outputs: map[string]string{
+			Outputs: map[string]string{
 				buildKey("lvs", []string{"--noheadings", "--nosuffix", "--units", "b",
 					"-o", "data_percent,metadata_percent,lv_size",
 					"piccolo-data-vg/thinpool"}): "  notanumber   10.2   107374182400\n",
@@ -227,7 +168,7 @@ func TestPoolManager_PoolStatus(t *testing.T) {
 
 	t.Run("too_few_fields", func(t *testing.T) {
 		run := &fakeRunner{
-			outputs: map[string]string{
+			Outputs: map[string]string{
 				buildKey("lvs", []string{"--noheadings", "--nosuffix", "--units", "b",
 					"-o", "data_percent,metadata_percent,lv_size",
 					"piccolo-data-vg/thinpool"}): "  42.5\n",
@@ -256,7 +197,7 @@ func TestPoolManager_VGExists(t *testing.T) {
 
 	t.Run("not_found", func(t *testing.T) {
 		run := &fakeRunner{
-			errs: map[string]error{
+			Errs: map[string]error{
 				buildKey("vgs", []string{"--noheadings", "piccolo-data-vg"}): exitError(5),
 			},
 		}
@@ -272,7 +213,7 @@ func TestPoolManager_VGExists(t *testing.T) {
 
 	t.Run("transient_error", func(t *testing.T) {
 		run := &fakeRunner{
-			errs: map[string]error{
+			Errs: map[string]error{
 				buildKey("vgs", []string{"--noheadings", "piccolo-data-vg"}): fmt.Errorf("I/O timeout"),
 			},
 		}
@@ -289,7 +230,7 @@ func TestPoolManager_VGExists(t *testing.T) {
 
 func TestPoolManager_HealthMonitor_StartStop(t *testing.T) {
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			buildKey("lvs", []string{"--noheadings", "--nosuffix", "--units", "b",
 				"-o", "data_percent,metadata_percent,lv_size",
 				"piccolo-data-vg/thinpool"}): "  50.0   5.0   107374182400\n",
@@ -311,7 +252,7 @@ func TestPoolManager_HealthMonitor_StartStop(t *testing.T) {
 
 	// Verify lvs was called at least once.
 	found := false
-	for _, call := range run.getCalls() {
+	for _, call := range run.GetCalls() {
 		if strings.Contains(call, "lvs") {
 			found = true
 			break
@@ -324,7 +265,7 @@ func TestPoolManager_HealthMonitor_StartStop(t *testing.T) {
 
 func TestPoolManager_HealthMonitor_ThresholdEvent(t *testing.T) {
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			buildKey("lvs", []string{"--noheadings", "--nosuffix", "--units", "b",
 				"-o", "data_percent,metadata_percent,lv_size",
 				"piccolo-data-vg/thinpool"}): "  85.0   5.0   107374182400\n",
@@ -359,14 +300,15 @@ func TestLVManager_CreateThinLV(t *testing.T) {
 	if err := mgr.CreateThinLV(context.Background(), "vol-test", 10*1024*1024*1024); err != nil {
 		t.Fatalf("CreateThinLV: %v", err)
 	}
-	if len(run.calls) != 1 {
-		t.Fatalf("expected 1 command, got %d", len(run.calls))
+	calls := run.GetCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 command, got %d", len(calls))
 	}
-	if !strings.Contains(run.calls[0], "lvcreate") {
-		t.Errorf("expected lvcreate, got %q", run.calls[0])
+	if !strings.Contains(calls[0], "lvcreate") {
+		t.Errorf("expected lvcreate, got %q", calls[0])
 	}
-	if !strings.Contains(run.calls[0], "vol-test") {
-		t.Errorf("expected vol-test in args, got %q", run.calls[0])
+	if !strings.Contains(calls[0], "vol-test") {
+		t.Errorf("expected vol-test in args, got %q", calls[0])
 	}
 }
 
@@ -378,7 +320,7 @@ func TestLVManager_CreateThinLV_aligns_to_sector(t *testing.T) {
 	if err := mgr.CreateThinLV(context.Background(), "golden-test", 1319306057); err != nil {
 		t.Fatalf("CreateThinLV: %v", err)
 	}
-	call := run.calls[0]
+	call := run.GetCalls()[0]
 	// Must be aligned: 1319306057 → ceil to 512 → 1319306240
 	if !strings.Contains(call, "1319306240B") {
 		t.Errorf("expected aligned size 1319306240B in lvcreate args, got %q", call)
@@ -414,8 +356,8 @@ func TestLVManager_RemoveThinLV(t *testing.T) {
 	if err := mgr.RemoveThinLV(context.Background(), "vol-test"); err != nil {
 		t.Fatalf("RemoveThinLV: %v", err)
 	}
-	if !strings.Contains(run.calls[0], "lvremove -f") {
-		t.Errorf("expected lvremove -f, got %q", run.calls[0])
+	if calls := run.GetCalls(); !strings.Contains(calls[0], "lvremove -f") {
+		t.Errorf("expected lvremove -f, got %q", calls[0])
 	}
 }
 
@@ -426,15 +368,17 @@ func TestLVManager_ActivateDeactivate(t *testing.T) {
 	if err := mgr.ActivateLV(context.Background(), "vol-test"); err != nil {
 		t.Fatalf("ActivateLV: %v", err)
 	}
-	if !strings.Contains(run.calls[0], "lvchange -ay") {
-		t.Errorf("expected lvchange -ay, got %q", run.calls[0])
+	calls := run.GetCalls()
+	if !strings.Contains(calls[0], "lvchange -ay") {
+		t.Errorf("expected lvchange -ay, got %q", calls[0])
 	}
 
 	if err := mgr.DeactivateLV(context.Background(), "vol-test"); err != nil {
 		t.Fatalf("DeactivateLV: %v", err)
 	}
-	if !strings.Contains(run.calls[1], "lvchange -an") {
-		t.Errorf("expected lvchange -an, got %q", run.calls[1])
+	calls = run.GetCalls()
+	if !strings.Contains(calls[1], "lvchange -an") {
+		t.Errorf("expected lvchange -an, got %q", calls[1])
 	}
 }
 
@@ -449,7 +393,7 @@ func TestLVManager_LVExists(t *testing.T) {
 
 	t.Run("not_exists", func(t *testing.T) {
 		run := &fakeRunner{
-			errs: map[string]error{
+			Errs: map[string]error{
 				buildKey("lvs", []string{"--noheadings", "piccolo-data-vg/vol-test"}): fmt.Errorf("not found"),
 			},
 		}
@@ -472,7 +416,7 @@ func TestLVManager_LVPath(t *testing.T) {
 func TestLVManager_ListLVs(t *testing.T) {
 	t.Run("mixed_pools", func(t *testing.T) {
 		run := &fakeRunner{
-			outputs: map[string]string{
+			Outputs: map[string]string{
 				buildKey("lvs", []string{"--noheadings", "--nosuffix", "--units", "b",
 					"-o", "lv_name,lv_size,lv_attr,pool_lv",
 					"piccolo-data-vg"}): strings.Join([]string{
@@ -505,7 +449,7 @@ func TestLVManager_ListLVs(t *testing.T) {
 
 	t.Run("empty_output", func(t *testing.T) {
 		run := &fakeRunner{
-			outputs: map[string]string{
+			Outputs: map[string]string{
 				buildKey("lvs", []string{"--noheadings", "--nosuffix", "--units", "b",
 					"-o", "lv_name,lv_size,lv_attr,pool_lv",
 					"piccolo-data-vg"}): "",
@@ -529,10 +473,11 @@ func TestLVManager_CreateSnapshot(t *testing.T) {
 		if err := mgr.CreateSnapshot(context.Background(), "golden-abc123", "ws-instance1"); err != nil {
 			t.Fatalf("CreateSnapshot: %v", err)
 		}
-		if len(run.calls) != 1 {
-			t.Fatalf("expected 1 call, got %d: %v", len(run.calls), run.calls)
+		calls := run.GetCalls()
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 call, got %d: %v", len(calls), calls)
 		}
-		call := run.calls[0]
+		call := calls[0]
 		if !strings.Contains(call, "lvcreate") {
 			t.Errorf("expected lvcreate, got %q", call)
 		}
@@ -552,7 +497,7 @@ func TestLVManager_CreateSnapshot(t *testing.T) {
 
 	t.Run("error", func(t *testing.T) {
 		run := &fakeRunner{
-			errs: map[string]error{
+			Errs: map[string]error{
 				buildKey("lvcreate", []string{"--snapshot", "--name", "ws-fail",
 					"--setactivationskip", "n", "piccolo-data-vg/golden-abc"}): fmt.Errorf("insufficient space"),
 			},
@@ -574,8 +519,8 @@ func TestLVManager_ResizeLV(t *testing.T) {
 	if err := mgr.ResizeLV(context.Background(), "vol-test", 20*1024*1024*1024); err != nil {
 		t.Fatalf("ResizeLV: %v", err)
 	}
-	if !strings.Contains(run.calls[0], "lvresize") {
-		t.Errorf("expected lvresize, got %q", run.calls[0])
+	if calls := run.GetCalls(); !strings.Contains(calls[0], "lvresize") {
+		t.Errorf("expected lvresize, got %q", calls[0])
 	}
 }
 
@@ -586,10 +531,11 @@ func TestLVManager_RenameLV(t *testing.T) {
 		if err := mgr.RenameLV(context.Background(), "vol-old", "vol-new"); err != nil {
 			t.Fatalf("RenameLV: %v", err)
 		}
-		if len(run.calls) != 1 {
-			t.Fatalf("expected 1 call, got %d: %v", len(run.calls), run.calls)
+		calls := run.GetCalls()
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 call, got %d: %v", len(calls), calls)
 		}
-		call := run.calls[0]
+		call := calls[0]
 		if !strings.Contains(call, "lvrename") {
 			t.Errorf("expected lvrename, got %q", call)
 		}
@@ -603,7 +549,7 @@ func TestLVManager_RenameLV(t *testing.T) {
 
 	t.Run("error", func(t *testing.T) {
 		run := &fakeRunner{
-			errs: map[string]error{
+			Errs: map[string]error{
 				buildKey("lvrename", []string{DefaultVGName, "vol-old", "vol-new"}): fmt.Errorf("LV locked"),
 			},
 		}

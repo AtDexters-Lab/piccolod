@@ -2,6 +2,7 @@ package crypt
 
 import (
 	"bytes"
+	"crypto/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,15 +195,12 @@ func TestManager_PoolKeyfile_Roundtrip(t *testing.T) {
 	}
 
 	// Generate and store a pool keyfile.
-	kf, err := GeneratePoolKeyfile()
-	if err != nil {
-		t.Fatalf("GeneratePoolKeyfile: %v", err)
-	}
-	if len(kf.KeyData) != poolKeyfileSize {
-		t.Fatalf("keyfile size = %d, want %d", len(kf.KeyData), poolKeyfileSize)
+	rawKey := make([]byte, poolKeyfileSize)
+	if _, err := rand.Read(rawKey); err != nil {
+		t.Fatalf("generate key: %v", err)
 	}
 
-	if err := m.StorePoolKeyfile(kf.KeyData); err != nil {
+	if err := m.StorePoolKeyfile(rawKey); err != nil {
 		t.Fatalf("StorePoolKeyfile: %v", err)
 	}
 
@@ -211,7 +209,7 @@ func TestManager_PoolKeyfile_Roundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UnwrapPoolKeyfile: %v", err)
 	}
-	if !bytes.Equal(got, kf.KeyData) {
+	if !bytes.Equal(got, rawKey) {
 		t.Fatal("unwrapped keyfile does not match original")
 	}
 }
@@ -229,13 +227,13 @@ func TestManager_PoolKeyfileAt_CustomPath(t *testing.T) {
 		t.Fatalf("Unlock: %v", err)
 	}
 
-	kf, err := GeneratePoolKeyfile()
-	if err != nil {
+	rawKey := make([]byte, poolKeyfileSize)
+	if _, err := rand.Read(rawKey); err != nil {
 		t.Fatal(err)
 	}
 
 	customPath := filepath.Join(dir, "custom_key.enc")
-	if err := m.StorePoolKeyfileAt(kf.KeyData, customPath); err != nil {
+	if err := m.StorePoolKeyfileAt(rawKey, customPath); err != nil {
 		t.Fatalf("StorePoolKeyfileAt: %v", err)
 	}
 
@@ -243,7 +241,7 @@ func TestManager_PoolKeyfileAt_CustomPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UnwrapPoolKeyfileFrom: %v", err)
 	}
-	if !bytes.Equal(got, kf.KeyData) {
+	if !bytes.Equal(got, rawKey) {
 		t.Fatal("unwrapped keyfile does not match original")
 	}
 }
@@ -301,16 +299,16 @@ func TestManager_OnKeyMaterialChanged(t *testing.T) {
 	}
 }
 
-func TestGeneratePoolKeyfile_UniqueKeys(t *testing.T) {
-	kf1, err := GeneratePoolKeyfile()
-	if err != nil {
+func TestRandomKeyMaterial_UniqueKeys(t *testing.T) {
+	k1 := make([]byte, poolKeyfileSize)
+	k2 := make([]byte, poolKeyfileSize)
+	if _, err := rand.Read(k1); err != nil {
 		t.Fatal(err)
 	}
-	kf2, err := GeneratePoolKeyfile()
-	if err != nil {
+	if _, err := rand.Read(k2); err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Equal(kf1.KeyData, kf2.KeyData) {
-		t.Error("expected different keys from two GeneratePoolKeyfile calls")
+	if bytes.Equal(k1, k2) {
+		t.Error("expected different keys from two rand.Read calls")
 	}
 }

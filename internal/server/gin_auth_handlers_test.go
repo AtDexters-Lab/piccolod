@@ -24,11 +24,7 @@ import (
 func setupAuthTestServer(t *testing.T) *GinServer {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	tempDir, err := os.MkdirTemp("", "auth_test")
-	if err != nil {
-		t.Fatalf("tempdir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(tempDir) })
+	tempDir := t.TempDir()
 
 	// Reuse createGinTestServer to get a minimal server/router
 	srv := createGinTestServer(t, tempDir)

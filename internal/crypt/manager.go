@@ -1,8 +1,6 @@
 package crypt
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -149,11 +147,7 @@ func (m *Manager) Setup(password string) error {
 	if _, err := rand.Read(sdek); err != nil {
 		return err
 	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return err
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := newAES256GCM(key)
 	if err != nil {
 		return err
 	}
@@ -203,11 +197,7 @@ func (m *Manager) Unlock(password string) error {
 		return err
 	}
 	key := m.deriveKey(password, salt, st.KDF)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return err
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := newAES256GCM(key)
 	if err != nil {
 		return err
 	}
@@ -272,8 +262,7 @@ func (m *Manager) Rewrap(oldPassword, newPassword string) error {
 	}
 	salt, _ := base64.RawStdEncoding.DecodeString(st.Salt)
 	keyOld := m.deriveKey(oldPassword, salt, st.KDF)
-	block, _ := aes.NewCipher(keyOld)
-	aead, _ := cipher.NewGCM(block)
+	aead, _ := newAES256GCM(keyOld)
 	nonce, _ := base64.RawStdEncoding.DecodeString(st.Nonce)
 	ct, _ := base64.RawStdEncoding.DecodeString(st.SDEK)
 	pt, err := aead.Open(nil, nonce, ct, nil)
@@ -286,8 +275,7 @@ func (m *Manager) Rewrap(oldPassword, newPassword string) error {
 		return err
 	}
 	keyNew := m.deriveKey(newPassword, newSalt, st.KDF)
-	block2, _ := aes.NewCipher(keyNew)
-	aead2, _ := cipher.NewGCM(block2)
+	aead2, _ := newAES256GCM(keyNew)
 	newNonce := make([]byte, aead2.NonceSize())
 	if _, err := rand.Read(newNonce); err != nil {
 		return err
@@ -334,11 +322,7 @@ func (m *Manager) RewrapUnlocked(newPassword string) error {
 		return err
 	}
 	keyNew := m.deriveKey(newPassword, newSalt, st.KDF)
-	block, err := aes.NewCipher(keyNew)
-	if err != nil {
-		return err
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := newAES256GCM(keyNew)
 	if err != nil {
 		return err
 	}
@@ -401,8 +385,7 @@ func (m *Manager) GenerateRecoveryKey(force bool) ([]string, error) {
 	}
 	rkParams := st.KDF
 	rkKey := m.deriveKey(mnemonic, rkSalt, rkParams)
-	block, _ := aes.NewCipher(rkKey)
-	aead, _ := cipher.NewGCM(block)
+	aead, _ := newAES256GCM(rkKey)
 	rkNonce := make([]byte, aead.NonceSize())
 	if _, err := rand.Read(rkNonce); err != nil {
 		return nil, err
@@ -442,8 +425,7 @@ func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) (
 	}
 	salt, _ := base64.RawStdEncoding.DecodeString(st.Salt)
 	key := m.deriveKey(password, salt, st.KDF)
-	block, _ := aes.NewCipher(key)
-	aead, _ := cipher.NewGCM(block)
+	aead, _ := newAES256GCM(key)
 	nonce, _ := base64.RawStdEncoding.DecodeString(st.Nonce)
 	ct, _ := base64.RawStdEncoding.DecodeString(st.SDEK)
 	pt, err := aead.Open(nil, nonce, ct, nil)
@@ -465,8 +447,7 @@ func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) (
 		return nil, err
 	}
 	rkKey := m.deriveKey(mnemonic, rkSalt, st.KDF)
-	block2, _ := aes.NewCipher(rkKey)
-	aead2, _ := cipher.NewGCM(block2)
+	aead2, _ := newAES256GCM(rkKey)
 	rkNonce := make([]byte, aead2.NonceSize())
 	if _, err := rand.Read(rkNonce); err != nil {
 		return nil, err
@@ -519,8 +500,7 @@ func (m *Manager) UnlockWithRecoveryKey(words []string) error {
 	}
 	rkSalt, _ := base64.RawStdEncoding.DecodeString(st.RKSalt)
 	rkKey := m.deriveKey(mn, rkSalt, st.KDF)
-	block, _ := aes.NewCipher(rkKey)
-	aead, _ := cipher.NewGCM(block)
+	aead, _ := newAES256GCM(rkKey)
 	rkNonce, _ := base64.RawStdEncoding.DecodeString(st.RKNonce)
 	rkCT, _ := base64.RawStdEncoding.DecodeString(st.SDEKRK)
 	pt, err := aead.Open(nil, rkNonce, rkCT, nil)
@@ -536,11 +516,7 @@ func (m *Manager) UnlockWithRecoveryKey(words []string) error {
 func (m *Manager) Encrypt(plaintext []byte) ([]byte, error) {
 	var ct []byte
 	err := m.WithSDEK(func(sdek []byte) error {
-		block, err := aes.NewCipher(sdek)
-		if err != nil {
-			return err
-		}
-		aead, err := cipher.NewGCM(block)
+		aead, err := newAES256GCM(sdek)
 		if err != nil {
 			return err
 		}
@@ -560,11 +536,7 @@ func (m *Manager) Encrypt(plaintext []byte) ([]byte, error) {
 func (m *Manager) Decrypt(ciphertext []byte) ([]byte, error) {
 	var pt []byte
 	err := m.WithSDEK(func(sdek []byte) error {
-		block, err := aes.NewCipher(sdek)
-		if err != nil {
-			return err
-		}
-		aead, err := cipher.NewGCM(block)
+		aead, err := newAES256GCM(sdek)
 		if err != nil {
 			return err
 		}

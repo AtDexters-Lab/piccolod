@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -260,7 +259,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		// Detach only locally-created rootfs volumes, not prebuilt ones
 		// (the caller owns those handles and is responsible for their lifecycle).
 		if rootfs := m.currentRootfsManager(); rootfs != nil {
-			for svcName, rInfo := range blockNativeRootfsMap {
+			for svcName := range blockNativeRootfsMap {
 				if prebuiltRootfs != nil {
 					if _, isPrebuilt := prebuiltRootfs[svcName]; isPrebuilt {
 						continue
@@ -268,7 +267,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 				}
 				volID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
 				_ = rootfs.DetachRootfs(ctx, volID)
-				_ = rInfo // suppress unused warning
 			}
 		}
 	}
@@ -305,41 +303,14 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		return nil, fmt.Errorf("invalid network anchor spec: %w", err)
 	}
 
-	var anchorID string
 	updateSubtask(networkAnchorServiceName, 10, "Creating")
 	emitCreateProgress(fmt.Sprintf("Creating container (1/%d): network", totalContainers))
-	for i := 0; i < 2; i++ {
-		anchorID, err = m.containerManager.CreateContainer(ctx, runtime, anchorSpec)
-		if err == nil {
-			updateSubtask(networkAnchorServiceName, 50, "Created")
-			break
-		}
-
-		// If PortInUse, let the caller retry allocation.
-		var portErr *container.PortInUseError
-		if errors.As(err, &portErr) {
-			break
-		}
-
-		// Cleanup zombies by deterministic name.
-		zombieID := ""
-		var nameErr *container.NameInUseError
-		if errors.As(err, &nameErr) {
-			zombieID = nameErr.ID
-		} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, anchorSpec.Name); resolveErr == nil {
-			zombieID = id
-		}
-		if zombieID != "" {
-			log.Printf("INFO: install %s: removing zombie container %s (network anchor)", instanceID, zombieID)
-			_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
-			_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
-			continue
-		}
-		break
-	}
+	anchorID, err := m.createContainerWithRetry(ctx, runtime, anchorSpec,
+		fmt.Sprintf("install %s network-anchor", instanceID))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create network anchor: %w", err)
 	}
+	updateSubtask(networkAnchorServiceName, 50, "Created")
 	created = append(created, anchorID)
 
 	updateSubtask(networkAnchorServiceName, 70, "Starting")
@@ -384,41 +355,15 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			spec.PullPolicy = "never"
 		}
 
-		var cid string
-		for i := 0; i < 2; i++ {
-			cid, err = m.containerManager.CreateContainer(ctx, runtime, spec)
-			if err == nil {
-				updateSubtask(svcName, 50, "Created")
-				break
-			}
-
-			// PortInUse should not happen for service containers (no publishes).
-			var portErr *container.PortInUseError
-			if errors.As(err, &portErr) {
-				break
-			}
-
-			zombieID := ""
-			var nameErr *container.NameInUseError
-			if errors.As(err, &nameErr) {
-				zombieID = nameErr.ID
-			} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, spec.Name); resolveErr == nil {
-				zombieID = id
-			}
-			if zombieID != "" {
-				log.Printf("INFO: install %s: removing zombie container %s (service=%s)", instanceID, zombieID, svcName)
-				_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
-				_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
-				continue
-			}
-			break
-		}
+		cid, err := m.createContainerWithRetry(ctx, runtime, spec,
+			fmt.Sprintf("install %s service=%s", instanceID, svcName))
 		if err != nil {
 			updateSubtask(svcName, 50, "Error")
 			emitCreateProgress(fmt.Sprintf("Failed to create container: %s", svcName))
 			cleanup()
 			return nil, fmt.Errorf("failed to create service container '%s': %w", svcName, err)
 		}
+		updateSubtask(svcName, 50, "Created")
 		created = append(created, cid)
 
 		updateSubtask(svcName, 70, "Starting")

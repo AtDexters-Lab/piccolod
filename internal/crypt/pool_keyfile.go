@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"time"
 
 	"piccolod/internal/cryptoutil"
 	"piccolod/internal/fsutil"
@@ -17,26 +16,6 @@ const (
 	poolKeyfileSize  = 64 // 512-bit keyfile for LUKS
 	luksMasterKeySize = 64 // 512-bit master key for LUKS (key-size 512 / 8)
 )
-
-// PoolKeyfile holds a LUKS pool keyfile in encrypted form.
-type PoolKeyfile struct {
-	Version   int       `json:"version"`
-	KeyData   []byte    `json:"key_data"` // plaintext key material
-	CreatedAt time.Time `json:"created_at"`
-}
-
-// GeneratePoolKeyfile creates a new random pool keyfile.
-func GeneratePoolKeyfile() (*PoolKeyfile, error) {
-	key := make([]byte, poolKeyfileSize)
-	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("generate pool keyfile: %w", err)
-	}
-	return &PoolKeyfile{
-		Version:   1,
-		KeyData:   key,
-		CreatedAt: time.Now().UTC(),
-	}, nil
-}
 
 // StorePoolKeyfile encrypts a pool keyfile with the SDEK and writes it to the
 // default location under the core root.
@@ -84,64 +63,44 @@ func (m *Manager) UnwrapLUKSMasterKey() ([]byte, error) {
 	return m.UnwrapPoolKeyfileFrom(paths.CoreJoin("crypto", "luks_master_key.enc"))
 }
 
-// EnsureLUKSMasterKey returns the LUKS master key, generating and persisting a new
-// one if it doesn't exist. The returned key is exactly luksMasterKeySize bytes.
-// Only generates a new key when the keyfile is missing. Other errors (permission,
-// corruption, decrypt failure) are returned immediately to prevent silent key rotation
-// that would make existing LUKS volumes inaccessible.
-func (m *Manager) EnsureLUKSMasterKey() ([]byte, error) {
-	key, err := m.UnwrapLUKSMasterKey()
+// ensureKeyMaterial returns key material of the given size, generating and persisting
+// a new key if it doesn't exist. Only generates when the keyfile is missing. Other
+// errors (permission, corruption, decrypt failure) are returned immediately to prevent
+// silent key rotation that would make existing LUKS volumes inaccessible.
+func (m *Manager) ensureKeyMaterial(size int, unwrap func() ([]byte, error), store func([]byte) error, label string) ([]byte, error) {
+	key, err := unwrap()
 	if err == nil {
-		if len(key) != luksMasterKeySize {
+		if len(key) != size {
 			cryptoutil.SecureZero(key)
-			return nil, fmt.Errorf("LUKS master key size %d != expected %d", len(key), luksMasterKeySize)
+			return nil, fmt.Errorf("%s size %d != expected %d", label, len(key), size)
 		}
 		return key, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("unwrap LUKS master key: %w", err)
+		return nil, fmt.Errorf("unwrap %s: %w", label, err)
 	}
 
-	// Generate new master key.
-	key = make([]byte, luksMasterKeySize)
+	key = make([]byte, size)
 	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("generate LUKS master key: %w", err)
+		return nil, fmt.Errorf("generate %s: %w", label, err)
 	}
-	if err := m.StoreLUKSMasterKey(key); err != nil {
+	if err := store(key); err != nil {
 		cryptoutil.SecureZero(key)
-		return nil, fmt.Errorf("store LUKS master key: %w", err)
+		return nil, fmt.Errorf("store %s: %w", label, err)
 	}
 	return key, nil
 }
 
-// EnsurePoolKeyfile returns the pool keyfile, generating and persisting a new
-// one if it doesn't exist. The returned key is exactly poolKeyfileSize bytes.
-// Only generates a new key when the keyfile is missing. Other errors (permission,
-// corruption, decrypt failure) are returned immediately to prevent silent key rotation
-// that would make existing LUKS volumes inaccessible.
-func (m *Manager) EnsurePoolKeyfile() ([]byte, error) {
-	key, err := m.UnwrapPoolKeyfile()
-	if err == nil {
-		if len(key) != poolKeyfileSize {
-			cryptoutil.SecureZero(key)
-			return nil, fmt.Errorf("pool keyfile size %d != expected %d", len(key), poolKeyfileSize)
-		}
-		return key, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("unwrap pool keyfile: %w", err)
-	}
+// EnsureLUKSMasterKey returns the LUKS master key, generating and persisting a new
+// one if it doesn't exist.
+func (m *Manager) EnsureLUKSMasterKey() ([]byte, error) {
+	return m.ensureKeyMaterial(luksMasterKeySize, m.UnwrapLUKSMasterKey, m.StoreLUKSMasterKey, "LUKS master key")
+}
 
-	// Generate new pool keyfile.
-	key = make([]byte, poolKeyfileSize)
-	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("generate pool keyfile: %w", err)
-	}
-	if err := m.StorePoolKeyfile(key); err != nil {
-		cryptoutil.SecureZero(key)
-		return nil, fmt.Errorf("store pool keyfile: %w", err)
-	}
-	return key, nil
+// EnsurePoolKeyfile returns the pool keyfile, generating and persisting a new
+// one if it doesn't exist.
+func (m *Manager) EnsurePoolKeyfile() ([]byte, error) {
+	return m.ensureKeyMaterial(poolKeyfileSize, m.UnwrapPoolKeyfile, m.StorePoolKeyfile, "pool keyfile")
 }
 
 // UnwrapPoolKeyfileFrom reads and decrypts a pool keyfile from the given path.

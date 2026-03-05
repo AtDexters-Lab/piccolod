@@ -12,6 +12,7 @@ import (
 
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage"
+	"piccolod/internal/testutil"
 )
 
 // makeExitError runs a trivial shell command that exits with the given code
@@ -26,51 +27,9 @@ func makeExitError(code int) *exec.ExitError {
 	panic(fmt.Sprintf("expected *exec.ExitError for exit code %d, got %T: %v", code, err, err))
 }
 
-// fakeRunner is a test double for runner.CommandRunner.
-type fakeRunner struct {
-	outputs map[string]string
-	errs    map[string]error
-}
+type fakeRunner = testutil.FakeRunner
 
-func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) error {
-	key := buildKey(name, args)
-	if f.errs != nil {
-		if err, ok := f.errs[key]; ok {
-			return err
-		}
-	}
-	return nil
-}
-
-func (f *fakeRunner) RunWithOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
-	key := buildKey(name, args)
-	if f.errs != nil {
-		if err, ok := f.errs[key]; ok {
-			return nil, err
-		}
-	}
-	if f.outputs != nil {
-		if out, ok := f.outputs[key]; ok {
-			return []byte(out), nil
-		}
-	}
-	return nil, fmt.Errorf("fakeRunner: no output for %q", key)
-}
-
-func (f *fakeRunner) RunWithStdin(ctx context.Context, stdin []byte, name string, args ...string) error {
-	key := buildKey(name, args)
-	if f.errs != nil {
-		if err, ok := f.errs[key]; ok {
-			return err
-		}
-	}
-	return nil
-}
-
-func buildKey(name string, args []string) string {
-	parts := append([]string{name}, args...)
-	return strings.Join(parts, " ")
-}
+var buildKey = testutil.BuildKey
 
 func TestFindNextSlot_TwoPartitions(t *testing.T) {
 	sfdisk := storage.SfdiskOutput{}
@@ -317,7 +276,7 @@ func TestCreateDataPartition_MBR(t *testing.T) {
 	var calls []string
 	var stdinCaptures [][]byte
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"findmnt -nro SOURCE /":         "/dev/mmcblk0p2",
 			"sfdisk -J /dev/mmcblk0":        string(sfdiskJSON),
 			"lsblk -bndo SIZE /dev/mmcblk0": "34359738368", // 32GB
@@ -383,7 +342,7 @@ func TestCreateDataPartition_GPT(t *testing.T) {
 
 		var calls []string
 		run := &fakeRunner{
-			outputs: map[string]string{
+			Outputs: map[string]string{
 				"findmnt -nro SOURCE /":     "/dev/sda2",
 				"sfdisk -J /dev/sda":        string(sfdiskJSON),
 				"lsblk -bndo SIZE /dev/sda": "128849018880", // 120GB
@@ -453,7 +412,7 @@ func TestCreateDataPartition_GPT(t *testing.T) {
 
 		var calls []string
 		run := &fakeRunner{
-			outputs: map[string]string{
+			Outputs: map[string]string{
 				"findmnt -nro SOURCE /":     "/dev/sda2",
 				"sfdisk -J /dev/sda":        string(sfdiskJSON),
 				"lsblk -bndo SIZE /dev/sda": "34359738368", // 32GB
@@ -494,10 +453,10 @@ func TestFindDataPartition_MBR_SkipsRoot(t *testing.T) {
 
 	sfdisk, _ := storage.ParseSfdiskJSON(sfdiskJSON)
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"findmnt -nro SOURCE /": "/dev/mmcblk0p2",
 		},
-		errs: map[string]error{
+		Errs: map[string]error{
 			// p1 (boot) is not LUKS
 			"cryptsetup isLuks /dev/mmcblk0p1": fmt.Errorf("exit status 1"),
 			// p3 (data) IS LUKS — but we simulate it succeeding (nil error = LUKS)
@@ -525,10 +484,10 @@ func TestFindDataPartition_MBR_PreInitNoLUKS(t *testing.T) {
 
 	sfdisk, _ := storage.ParseSfdiskJSON(sfdiskJSON)
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"findmnt -nro SOURCE /": "/dev/mmcblk0p2",
 		},
-		errs: map[string]error{
+		Errs: map[string]error{
 			// Neither non-root partition has a LUKS header.
 			"cryptsetup isLuks /dev/mmcblk0p1": fmt.Errorf("exit status 1"),
 			"cryptsetup isLuks /dev/mmcblk0p3": fmt.Errorf("exit status 1"),
@@ -558,10 +517,10 @@ func TestFindDataPartition_MBR_SkipsExistingFilesystem(t *testing.T) {
 
 	sfdisk, _ := storage.ParseSfdiskJSON(sfdiskJSON)
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"findmnt -nro SOURCE /": "/dev/mmcblk0p2",
 		},
-		errs: map[string]error{
+		Errs: map[string]error{
 			"cryptsetup isLuks /dev/mmcblk0p1": fmt.Errorf("exit status 1"),
 			"cryptsetup isLuks /dev/mmcblk0p3": fmt.Errorf("exit status 1"),
 			// p3 has an existing filesystem — blkid exits 0 (no error).
@@ -626,7 +585,7 @@ func TestRegisterNewPartition(t *testing.T) {
 		var calls []string
 		run := &compositeRunner{
 			fake: &fakeRunner{
-				errs: map[string]error{
+				Errs: map[string]error{
 					"partx --add --nr 3:3 /dev/sda": fmt.Errorf("BLKPG_ADD failed"),
 				},
 			},
@@ -653,7 +612,7 @@ func TestRegisterNewPartition(t *testing.T) {
 		var calls []string
 		run := &compositeRunner{
 			fake: &fakeRunner{
-				errs: map[string]error{
+				Errs: map[string]error{
 					"partx --add --nr 3:3 /dev/sda": fmt.Errorf("BLKPG_ADD failed"),
 					"partprobe /dev/sda":           fmt.Errorf("BLKRRPART failed"),
 					"partx -u /dev/sda":            fmt.Errorf("partx -u failed"),

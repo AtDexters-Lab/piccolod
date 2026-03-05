@@ -67,12 +67,7 @@ func ensureTestControlMetadata(t *testing.T, root string) {
 func TestGinAppAPI_Install(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server with Gin
 	server := createGinTestServer(t, tempDir)
@@ -284,12 +279,7 @@ func TestGinAppAPI_CheckInstance(t *testing.T) {
 func TestGinAppAPI_List(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server
 	server := createGinTestServer(t, tempDir)
@@ -330,8 +320,7 @@ func TestGinAppAPI_List(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
-	if err != nil {
+	if _, err := server.appManager.Install(context.Background(), appDef); err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
@@ -449,12 +438,7 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 func TestGinAppAPI_GetApp(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server and install an app
 	server := createGinTestServer(t, tempDir)
@@ -470,8 +454,7 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
-	if err != nil {
+	if _, err := server.appManager.Install(context.Background(), appDef); err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
@@ -526,12 +509,7 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 func TestGinAppAPI_AppActions(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server and install an app
 	server := createGinTestServer(t, tempDir)
@@ -547,8 +525,7 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
-	if err != nil {
+	if _, err := server.appManager.Install(context.Background(), appDef); err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
@@ -624,12 +601,7 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 func TestGinAppAPI_FullLifecycle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server
 	server := createGinTestServer(t, tempDir)
@@ -731,12 +703,7 @@ func TestGinAppAPI_FullLifecycle(t *testing.T) {
 func TestGinAppAPI_Uninstall(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server and install an app
 	server := createGinTestServer(t, tempDir)
@@ -752,8 +719,7 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
-	if err != nil {
+	if _, err := server.appManager.Install(context.Background(), appDef); err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
@@ -801,12 +767,7 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 func TestInvalidRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)

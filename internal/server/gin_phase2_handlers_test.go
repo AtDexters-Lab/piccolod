@@ -4,18 +4,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"piccolod/internal/remote"
 	"testing"
 )
 
 func setupBasicServer(t *testing.T) *GinServer {
 	t.Helper()
-	tempDir, err := os.MkdirTemp("", "phase2")
-	if err != nil {
-		t.Fatalf("tempdir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(tempDir) })
+	tempDir := t.TempDir()
 	srv := createGinTestServer(t, tempDir)
 	if srv.remoteManager == nil {
 		rm, err := remote.NewManager(tempDir)

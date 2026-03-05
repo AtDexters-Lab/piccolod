@@ -4,58 +4,12 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
+
+	"piccolod/internal/testutil"
 )
 
-// fakeRunner records all Run/RunWithOutput calls and returns preconfigured outputs/errors.
-type fakeRunner struct {
-	mu      sync.Mutex
-	outputs map[string]string
-	errs    map[string]error
-	calls   []string
-}
-
-func (f *fakeRunner) Run(_ context.Context, name string, args ...string) error {
-	key := name + " " + strings.Join(args, " ")
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	err := f.errs[name]
-	// Check for more specific key match.
-	if e, ok := f.errs[key]; ok {
-		err = e
-	}
-	f.mu.Unlock()
-	return err
-}
-
-func (f *fakeRunner) RunWithOutput(_ context.Context, name string, args ...string) ([]byte, error) {
-	key := name + " " + strings.Join(args, " ")
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	out := f.outputs[key]
-	if out == "" {
-		out = f.outputs[name]
-	}
-	err := f.errs[name]
-	if e, ok := f.errs[key]; ok {
-		err = e
-	}
-	f.mu.Unlock()
-	return []byte(out), err
-}
-
-func (f *fakeRunner) RunWithStdin(_ context.Context, _ []byte, name string, args ...string) error {
-	return f.Run(context.Background(), name, args...)
-}
-
-func (f *fakeRunner) getCalls() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]string, len(f.calls))
-	copy(out, f.calls)
-	return out
-}
+type fakeRunner = testutil.FakeRunner
 
 func TestNewServer_DefaultConfig(t *testing.T) {
 	run := &fakeRunner{}
@@ -68,7 +22,7 @@ func TestNewServer_DefaultConfig(t *testing.T) {
 func TestServer_StartSession_DuplicateRejects(t *testing.T) {
 	run := &fakeRunner{
 		// nbd-client -c /dev/nbd0 fails (device is free)
-		errs: map[string]error{
+		Errs: map[string]error{
 			"nbd-client -c /dev/nbd0": fmt.Errorf("not connected"),
 		},
 	}
@@ -117,7 +71,7 @@ func TestServer_AllocateNBDDevice_AllBusy(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	calls := run.getCalls()
+	calls := run.GetCalls()
 	if len(calls) != 16 {
 		t.Errorf("expected 16 nbd-client -c calls (nbd0..nbd15), got %d", len(calls))
 	}
@@ -126,7 +80,7 @@ func TestServer_AllocateNBDDevice_AllBusy(t *testing.T) {
 func TestServer_AllocateNBDDevice_FindsFree(t *testing.T) {
 	// nbd0 and nbd1 are busy, nbd2 is free.
 	run := &fakeRunner{
-		errs: map[string]error{
+		Errs: map[string]error{
 			"nbd-client -c /dev/nbd2": fmt.Errorf("not connected"),
 		},
 	}

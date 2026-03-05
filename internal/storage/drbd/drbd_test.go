@@ -6,57 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
+
+	"piccolod/internal/testutil"
 )
 
-// fakeRunner records all Run/RunWithOutput calls.
-type fakeRunner struct {
-	mu      sync.Mutex
-	outputs map[string]string
-	errs    map[string]error
-	calls   []string
-}
-
-func (f *fakeRunner) Run(_ context.Context, name string, args ...string) error {
-	key := name + " " + strings.Join(args, " ")
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	err := f.errs[key]
-	if err == nil {
-		err = f.errs[name]
-	}
-	f.mu.Unlock()
-	return err
-}
-
-func (f *fakeRunner) RunWithOutput(_ context.Context, name string, args ...string) ([]byte, error) {
-	key := name + " " + strings.Join(args, " ")
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	out := f.outputs[key]
-	if out == "" {
-		out = f.outputs[name]
-	}
-	err := f.errs[key]
-	if err == nil {
-		err = f.errs[name]
-	}
-	f.mu.Unlock()
-	return []byte(out), err
-}
-
-func (f *fakeRunner) RunWithStdin(_ context.Context, _ []byte, name string, args ...string) error {
-	return f.Run(context.Background(), name, args...)
-}
-
-func (f *fakeRunner) getCalls() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]string, len(f.calls))
-	copy(out, f.calls)
-	return out
-}
+type fakeRunner = testutil.FakeRunner
 
 func TestNewResourceManager_DefaultMetaDir(t *testing.T) {
 	mgr := NewResourceManager(&fakeRunner{}, "")
@@ -79,7 +34,7 @@ func TestResourceManager_EnsureAvailable(t *testing.T) {
 		if err := mgr.EnsureAvailable(context.Background()); err != nil {
 			t.Fatalf("EnsureAvailable: %v", err)
 		}
-		calls := run.getCalls()
+		calls := run.GetCalls()
 		if len(calls) != 3 {
 			t.Fatalf("expected 3 calls, got %d", len(calls))
 		}
@@ -96,7 +51,7 @@ func TestResourceManager_EnsureAvailable(t *testing.T) {
 
 	t.Run("no_kernel_module", func(t *testing.T) {
 		run := &fakeRunner{
-			errs: map[string]error{
+			Errs: map[string]error{
 				"modprobe drbd": fmt.Errorf("module not found"),
 			},
 		}
@@ -112,7 +67,7 @@ func TestResourceManager_EnsureAvailable(t *testing.T) {
 
 	t.Run("no_drbdadm", func(t *testing.T) {
 		run := &fakeRunner{
-			errs: map[string]error{
+			Errs: map[string]error{
 				"drbdadm --version": fmt.Errorf("not found"),
 			},
 		}
@@ -129,7 +84,7 @@ func TestResourceManager_EnsureAvailable(t *testing.T) {
 
 func TestResourceManager_DRBDVersion(t *testing.T) {
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"drbdadm --version": "DRBDADM_VERSION=9.27.0\nDRBDSETUP_VERSION=9.27.0\n",
 		},
 	}
@@ -145,7 +100,7 @@ func TestResourceManager_DRBDVersion(t *testing.T) {
 
 func TestResourceManager_ResourceStatus(t *testing.T) {
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"drbdsetup": "vol-abc role:Primary disk:UpToDate\n  peer connection:StandAlone\n",
 		},
 	}
@@ -170,7 +125,7 @@ func TestResourceManager_ResourceStatus(t *testing.T) {
 
 func TestResourceManager_ResourceStatus_DefaultConnection(t *testing.T) {
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"drbdsetup": "vol-abc role:Primary disk:UpToDate\n",
 		},
 	}
@@ -187,7 +142,7 @@ func TestResourceManager_ResourceStatus_DefaultConnection(t *testing.T) {
 
 func TestResourceManager_ListResources(t *testing.T) {
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"drbdadm sh-resources": "vol-abc\nvol-def\n",
 		},
 	}
@@ -206,7 +161,7 @@ func TestResourceManager_ListResources(t *testing.T) {
 
 func TestResourceManager_ListResources_Empty(t *testing.T) {
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"drbdadm sh-resources": "",
 		},
 	}
@@ -301,7 +256,7 @@ func TestResourceOps_Up(t *testing.T) {
 		t.Fatalf("Up: %v", err)
 	}
 
-	calls := run.getCalls()
+	calls := run.GetCalls()
 	if len(calls) != 2 {
 		t.Fatalf("expected 2 calls (up + primary), got %d", len(calls))
 	}
@@ -322,7 +277,7 @@ func TestResourceOps_Down(t *testing.T) {
 		t.Fatalf("Down: %v", err)
 	}
 
-	calls := run.getCalls()
+	calls := run.GetCalls()
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 call, got %d", len(calls))
 	}
@@ -341,7 +296,7 @@ func TestResourceOps_CreateMetadata(t *testing.T) {
 		t.Fatalf("CreateMetadata: %v", err)
 	}
 
-	calls := run.getCalls()
+	calls := run.GetCalls()
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 call, got %d", len(calls))
 	}

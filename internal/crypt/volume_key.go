@@ -12,14 +12,29 @@ import (
 // ErrKeyDataCorrupted indicates stored key material is corrupted or tampered with.
 var ErrKeyDataCorrupted = errors.New("crypt: key data corrupted")
 
+// newAES256GCM constructs an AES-256-GCM AEAD from a 32-byte key.
+//
+// This is a shared construction helper only. It does NOT imply that call sites
+// use the same wire format — two distinct crypto envelopes exist in this package:
+//
+//   - SealVolumeKey/UnwrapVolumeKey: per-volume keys stored as separate base64 fields
+//     (base64.StdEncoding, nonce and ciphertext as independent strings).
+//   - Manager.Encrypt/Decrypt: pool keyfile and master key stored as nonce-prepended
+//     ciphertext (raw bytes, base64.RawStdEncoding in the outer JSON envelope).
+//
+// Callers are responsible for their own encoding and nonce management.
+func newAES256GCM(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
 // SealVolumeKey wraps plaintext key material using AES-256-GCM with the given SDEK.
 // Returns base64-encoded wrapped ciphertext and nonce.
 func SealVolumeKey(sdek, plaintext []byte) (wrappedKey, nonce string, err error) {
-	block, err := aes.NewCipher(sdek)
-	if err != nil {
-		return "", "", fmt.Errorf("seal volume key: %w", err)
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := newAES256GCM(sdek)
 	if err != nil {
 		return "", "", fmt.Errorf("seal volume key: %w", err)
 	}
@@ -36,11 +51,7 @@ func SealVolumeKey(sdek, plaintext []byte) (wrappedKey, nonce string, err error)
 // UnwrapVolumeKey decrypts a wrapped key using AES-256-GCM with the given SDEK.
 // wrappedKey and nonce are base64-encoded strings as returned by SealVolumeKey.
 func UnwrapVolumeKey(sdek []byte, wrappedKey, nonce string) ([]byte, error) {
-	block, err := aes.NewCipher(sdek)
-	if err != nil {
-		return nil, fmt.Errorf("unwrap volume key: %w", err)
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := newAES256GCM(sdek)
 	if err != nil {
 		return nil, fmt.Errorf("unwrap volume key: %w", err)
 	}

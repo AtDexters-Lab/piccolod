@@ -506,22 +506,14 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 
 // ListClones returns volume IDs of clones created from the given origin volume.
 func (m *luksVolumeManager) ListClones(ctx context.Context, originVolumeID string) ([]string, error) {
-	metaBase := paths.CoreJoin("volumes")
-	entries, err := os.ReadDir(metaBase)
+	volIDs, err := listVolumeIDs()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("read volumes dir: %w", err)
+		return nil, err
 	}
 
 	var clones []string
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		volID := e.Name()
-		metaPath := filepath.Join(metaBase, volID, metadataV2File)
+	for _, volID := range volIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
 		meta, err := readVolumeMetaV3(metaPath)
 		if err != nil {
 			continue
@@ -584,39 +576,45 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		return RootfsHandle{}, fmt.Errorf("open stack: %w", err)
 	}
 
-	// Rollback helper.
-	rollback := func() {
+	// Rollback on failure: close resources in reverse order.
+	var openedMapper string
+	var mountedDir string
+	success := false
+	defer func() {
+		if success {
+			return
+		}
 		rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		if mountedDir != "" {
+			m.run.Run(rctx, "umount", mountedDir)
+		}
+		if openedMapper != "" {
+			m.run.Run(rctx, "cryptsetup", "close", openedMapper)
+		}
 		stack.Close(rctx)
-	}
+	}()
 
 	// LUKS open.
 	topDev := stack.Top().Path()
 	if err := m.luksOpenWithPoolKeyfile(ctx, topDev, mapper); err != nil {
-		rollback()
 		return RootfsHandle{}, fmt.Errorf("luks open: %w", err)
 	}
+	openedMapper = mapper
 
 	luksPath := "/dev/mapper/" + mapper
 
 	// Mount btrfs.
 	mountDir := paths.MountDir(volumeID)
 	if err := os.MkdirAll(filepath.Dir(mountDir), 0o711); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		rollback()
 		return RootfsHandle{}, fmt.Errorf("mkdir mounts parent: %w", err)
 	}
 	_ = os.Chmod(filepath.Dir(mountDir), 0o711)
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		rollback()
 		return RootfsHandle{}, fmt.Errorf("mkdir mount: %w", err)
 	}
 
 	if meta.FSType != "" && meta.FSType != "btrfs" {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		rollback()
 		return RootfsHandle{}, fmt.Errorf("unsupported rootfs FSType %q (expected btrfs); destroy and recreate the volume", meta.FSType)
 	}
 
@@ -629,10 +627,9 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		mountOpts = "ro," + mountOpts
 	}
 	if err := m.run.Run(ctx, "mount", "-t", "btrfs", "-o", mountOpts, luksPath, mountDir); err != nil {
-		m.run.Run(ctx, "cryptsetup", "close", mapper)
-		rollback()
 		return RootfsHandle{}, fmt.Errorf("mount: %w", err)
 	}
+	mountedDir = mountDir
 
 	// Idmapped mount.
 	var idmapPath string
@@ -647,9 +644,6 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 			SubGIDCount: meta.IDMap.SubGIDCount,
 		}
 		if err := fsutil.CreateIDMappedMount(mountDir, idmapPath, idmapConfig); err != nil {
-			m.run.Run(ctx, "umount", mountDir)
-			m.run.Run(ctx, "cryptsetup", "close", mapper)
-			rollback()
 			return RootfsHandle{}, fmt.Errorf("idmap mount: %w", err)
 		}
 	}
@@ -666,6 +660,8 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 	m.rootfsMounts[volumeID] = state
 	m.stacks[volumeID] = stack
 	m.mu.Unlock()
+
+	success = true
 
 	resultPath := mountDir
 	if idmapPath != "" {
@@ -780,25 +776,17 @@ func (m *luksVolumeManager) destroyGoldenLVUnsafe(ctx context.Context, goldenID 
 
 // GarbageCollectGoldenLVs removes golden LVs with no remaining references.
 func (m *luksVolumeManager) GarbageCollectGoldenLVs(ctx context.Context) error {
-	metaBase := paths.CoreJoin("volumes")
-	entries, err := os.ReadDir(metaBase)
+	volIDs, err := listVolumeIDs()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read volumes dir: %w", err)
+		return err
 	}
 
 	// Collect all golden LVs and their references.
 	goldenIDs := make(map[string]bool)
 	referencedGoldens := make(map[string]bool)
 
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		volID := e.Name()
-		metaPath := filepath.Join(metaBase, volID, metadataV2File)
+	for _, volID := range volIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
 		version, err := readVolumeMetaVersion(metaPath)
 		if err != nil {
 			continue
@@ -843,21 +831,13 @@ func (m *luksVolumeManager) GarbageCollectGoldenLVs(ctx context.Context) error {
 
 // ReconcileRootfsStates validates rootfs volumes on startup.
 func (m *luksVolumeManager) ReconcileRootfsStates(ctx context.Context) error {
-	metaBase := paths.CoreJoin("volumes")
-	entries, err := os.ReadDir(metaBase)
+	volIDs, err := listVolumeIDs()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("read volumes dir: %w", err)
+		return err
 	}
 
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		volID := e.Name()
-		metaPath := filepath.Join(metaBase, volID, metadataV2File)
+	for _, volID := range volIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
 		version, err := readVolumeMetaVersion(metaPath)
 		if err != nil {
 			continue

@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
+
+	"piccolod/internal/testutil"
 )
 
 func TestMapperName(t *testing.T) {
@@ -32,59 +33,13 @@ func TestMapperNameForLoop(t *testing.T) {
 	}
 }
 
-// loopFakeRunner records commands and provides configurable outputs/errors.
-type loopFakeRunner struct {
-	mu      sync.Mutex
-	calls   []string
-	outputs map[string]string
-	errs    map[string]error
-}
-
-func (f *loopFakeRunner) Run(_ context.Context, name string, args ...string) error {
-	key := name + " " + strings.Join(args, " ")
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	err := f.errs[key]
-	if err == nil {
-		err = f.errs[name]
-	}
-	f.mu.Unlock()
-	return err
-}
-
-func (f *loopFakeRunner) RunWithOutput(_ context.Context, name string, args ...string) ([]byte, error) {
-	key := name + " " + strings.Join(args, " ")
-	f.mu.Lock()
-	f.calls = append(f.calls, key)
-	out := f.outputs[key]
-	if out == "" {
-		out = f.outputs[name]
-	}
-	err := f.errs[key]
-	if err == nil {
-		err = f.errs[name]
-	}
-	f.mu.Unlock()
-	return []byte(out), err
-}
-
-func (f *loopFakeRunner) RunWithStdin(_ context.Context, _ []byte, name string, args ...string) error {
-	return f.Run(context.Background(), name, args...)
-}
-
-func (f *loopFakeRunner) getCalls() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]string, len(f.calls))
-	copy(out, f.calls)
-	return out
-}
+type loopFakeRunner = testutil.FakeRunner
 
 func TestLUKSLoopVolume_Init_Commands(t *testing.T) {
 	tmpDir := t.TempDir()
 	loopFile := tmpDir + "/test.luks"
 	run := &loopFakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"losetup": "/dev/loop0\n",
 		},
 	}
@@ -95,7 +50,7 @@ func TestLUKSLoopVolume_Init_Commands(t *testing.T) {
 		t.Fatalf("Init: %v", err)
 	}
 
-	calls := run.getCalls()
+	calls := run.GetCalls()
 
 	// Verify key commands in order.
 	expected := []string{
@@ -131,10 +86,10 @@ func TestLUKSLoopVolume_Init_LuksFormatError(t *testing.T) {
 	tmpDir := t.TempDir()
 	loopFile := tmpDir + "/test.luks"
 	run := &loopFakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"losetup": "/dev/loop0\n",
 		},
-		errs: map[string]error{
+		Errs: map[string]error{
 			"cryptsetup": fmt.Errorf("format failed"),
 		},
 	}
@@ -154,7 +109,7 @@ func TestLUKSLoopVolume_Open_Commands(t *testing.T) {
 	loopFile := tmpDir + "/test.luks"
 	mountDir := tmpDir + "/mnt"
 	run := &loopFakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"losetup": "/dev/loop1\n",
 		},
 	}
@@ -165,7 +120,7 @@ func TestLUKSLoopVolume_Open_Commands(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	calls := run.getCalls()
+	calls := run.GetCalls()
 	expected := []string{
 		"losetup --find",
 		"cryptsetup open",
@@ -185,10 +140,10 @@ func TestLUKSLoopVolume_Open_CryptsetupError_Rollback(t *testing.T) {
 	tmpDir := t.TempDir()
 	loopFile := tmpDir + "/test.luks"
 	run := &loopFakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"losetup": "/dev/loop0\n",
 		},
-		errs: map[string]error{
+		Errs: map[string]error{
 			"cryptsetup": fmt.Errorf("open failed"),
 		},
 	}
@@ -200,7 +155,7 @@ func TestLUKSLoopVolume_Open_CryptsetupError_Rollback(t *testing.T) {
 	}
 
 	// Should have attempted losetup detach on failure.
-	calls := run.getCalls()
+	calls := run.GetCalls()
 	var hasDetach bool
 	for _, c := range calls {
 		if strings.Contains(c, "losetup -d") {
@@ -217,7 +172,7 @@ func TestLUKSLoopVolume_Close_Commands(t *testing.T) {
 	loopFile := tmpDir + "/test.luks"
 	mountDir := tmpDir + "/mnt"
 	run := &loopFakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"losetup": "/dev/loop2: [65025]:131104 (" + loopFile + ")\n",
 		},
 	}
@@ -228,7 +183,7 @@ func TestLUKSLoopVolume_Close_Commands(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	calls := run.getCalls()
+	calls := run.GetCalls()
 	expected := []string{
 		"losetup -j", // find loop
 		"umount",
@@ -255,7 +210,7 @@ func TestLUKSLoopVolume_Close_NoLoopDevice(t *testing.T) {
 	loopFile := tmpDir + "/test.luks"
 	mountDir := tmpDir + "/mnt"
 	run := &loopFakeRunner{
-		errs: map[string]error{
+		Errs: map[string]error{
 			"losetup": fmt.Errorf("not found"),
 		},
 	}
@@ -267,7 +222,7 @@ func TestLUKSLoopVolume_Close_NoLoopDevice(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	calls := run.getCalls()
+	calls := run.GetCalls()
 	var hasDetach bool
 	for _, c := range calls {
 		if strings.Contains(c, "losetup -d") {

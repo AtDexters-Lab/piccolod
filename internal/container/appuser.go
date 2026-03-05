@@ -275,16 +275,6 @@ func listAppUsers() ([]string, error) {
 	return users, scanner.Err()
 }
 
-// ensureGroup creates a POSIX group if it doesn't already exist.
-// Uses groupadd -f which is idempotent.
-func ensureGroup(name string) error {
-	out, err := defaultExecutor.Run("groupadd", "-f", name)
-	if err != nil {
-		return fmt.Errorf("groupadd -f %s: %w: %s", name, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
 // subUIDEntry represents a single entry in /etc/subuid or /etc/subgid.
 type subUIDEntry struct {
 	Username string
