@@ -67,12 +67,7 @@ func ensureTestControlMetadata(t *testing.T, root string) {
 func TestGinAppAPI_Install(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server with Gin
 	server := createGinTestServer(t, tempDir)
@@ -284,12 +279,7 @@ func TestGinAppAPI_CheckInstance(t *testing.T) {
 func TestGinAppAPI_List(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server
 	server := createGinTestServer(t, tempDir)
@@ -330,8 +320,7 @@ func TestGinAppAPI_List(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
-	if err != nil {
+	if _, err := server.appManager.Install(context.Background(), appDef); err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
@@ -449,12 +438,7 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 func TestGinAppAPI_GetApp(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server and install an app
 	server := createGinTestServer(t, tempDir)
@@ -470,8 +454,7 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
-	if err != nil {
+	if _, err := server.appManager.Install(context.Background(), appDef); err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
@@ -526,12 +509,7 @@ func TestGinAppAPI_GetApp(t *testing.T) {
 func TestGinAppAPI_AppActions(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server and install an app
 	server := createGinTestServer(t, tempDir)
@@ -547,8 +525,7 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
-	if err != nil {
+	if _, err := server.appManager.Install(context.Background(), appDef); err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
@@ -624,12 +601,7 @@ func TestGinAppAPI_AppActions(t *testing.T) {
 func TestGinAppAPI_FullLifecycle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server
 	server := createGinTestServer(t, tempDir)
@@ -731,12 +703,7 @@ func TestGinAppAPI_FullLifecycle(t *testing.T) {
 func TestGinAppAPI_Uninstall(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create test server and install an app
 	server := createGinTestServer(t, tempDir)
@@ -752,8 +719,7 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 		Extensions: map[string]interface{}{"mode": "service"},
 	}
 
-	_, err = server.appManager.Install(context.Background(), appDef)
-	if err != nil {
+	if _, err := server.appManager.Install(context.Background(), appDef); err != nil {
 		t.Fatalf("Failed to install app: %v", err)
 	}
 
@@ -801,12 +767,7 @@ func TestGinAppAPI_Uninstall(t *testing.T) {
 func TestInvalidRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// Create temporary directory for filesystem state
-	tempDir, err := os.MkdirTemp("", "gin_app_api_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	server := createGinTestServer(t, tempDir)
 	sessionCookie, csrfToken := setupTestAdminSession(t, server)
@@ -886,6 +847,53 @@ func (s *stubTestVolumeManager) RoleStream(id string) (<-chan persistence.Volume
 	return ch, nil
 }
 
+// stubTestRootfsManager provides a minimal RootfsVolumeManager for server tests.
+type stubTestRootfsManager struct {
+	root string
+}
+
+func (s *stubTestRootfsManager) EnsureGoldenLV(_ context.Context, _ persistence.GoldenLVRequest) (string, error) {
+	return "golden-test", nil
+}
+func (s *stubTestRootfsManager) CreateWorkspaceFromGolden(_ context.Context, req persistence.WorkspaceRootfsRequest) (persistence.RootfsHandle, error) {
+	mp := filepath.Join(s.root, "rootfs", req.InstanceID)
+	_ = os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{MountPath: mp}, nil
+}
+func (s *stubTestRootfsManager) CreateServiceRootfs(_ context.Context, req persistence.ServiceRootfsRequest) (persistence.RootfsHandle, error) {
+	vid := req.VolumeID
+	if vid == "" {
+		vid = persistence.ServiceRootfsVolumeID(req.InstanceID, req.ServiceName)
+	}
+	mp := filepath.Join(s.root, "rootfs", vid)
+	_ = os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{MountPath: mp, ReadOnly: true}, nil
+}
+func (s *stubTestRootfsManager) CloneWorkspace(_ context.Context, _, cloneID string, _ *persistence.IDMapConfig) (persistence.RootfsHandle, error) {
+	mp := filepath.Join(s.root, "rootfs", cloneID)
+	_ = os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{MountPath: mp}, nil
+}
+func (s *stubTestRootfsManager) ListClones(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
+func (s *stubTestRootfsManager) AttachRootfs(_ context.Context, volumeID string) (persistence.RootfsHandle, error) {
+	mp := filepath.Join(s.root, "rootfs", volumeID)
+	_ = os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{MountPath: mp, ReadOnly: true}, nil
+}
+func (s *stubTestRootfsManager) DetachRootfs(_ context.Context, _ string) error              { return nil }
+func (s *stubTestRootfsManager) DestroyRootfs(_ context.Context, _ string) error             { return nil }
+func (s *stubTestRootfsManager) GarbageCollectGoldenLVs(_ context.Context) error             { return nil }
+func (s *stubTestRootfsManager) ReconcileRootfsStates(_ context.Context) error               { return nil }
+func (s *stubTestRootfsManager) ReadGoldenImageConfig(_ context.Context, _ string) (persistence.GoldenImageConfig, error) {
+	return persistence.GoldenImageConfig{Entrypoint: []string{"/bin/sh"}}, nil
+}
+func (s *stubTestRootfsManager) RootfsVolumeID(mode, instanceID string) string {
+	return "rootfs-" + instanceID
+}
+func (s *stubTestRootfsManager) RootfsExists(_ string) bool { return true }
+
 // createGinTestServer creates a Gin test server instance with filesystem state management
 func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	t.Helper()
@@ -903,13 +911,19 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 
 	// Create filesystem app manager with service manager
 	svcMgr := services.NewServiceManager()
-	appMgr, err := app.NewAppManagerWithServices(mockContainer, tempDir, svcMgr, nil)
+	appMgr, err := app.NewAppManagerForTestWithServices(mockContainer, tempDir, svcMgr, nil)
 	if err != nil {
 		t.Fatalf("Failed to create app manager: %v", err)
 	}
 	requireMountBypassAllowed(t)
 	appMgr.SetMountVerifier(func(string) error { return nil })
 	appMgr.SetVolumeManager(&stubTestVolumeManager{root: tempDir})
+	appMgr.SetRootfsManager(&stubTestRootfsManager{root: tempDir})
+	// Create dummy workspace assets required by block-native install flow.
+	assetsDir := filepath.Join(tempDir, "assets")
+	_ = os.MkdirAll(assetsDir, 0o755)
+	_ = os.WriteFile(filepath.Join(assetsDir, "boot.sh"), []byte("#!/bin/sh\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(assetsDir, "piccolo-startup"), []byte("#!/bin/sh\n"), 0o755)
 	eventsBus := events.NewBus()
 	appMgr.ObserveRuntimeEvents(eventsBus)
 	eventsBus.Publish(events.Event{Topic: events.TopicLockStateChanged, Payload: events.LockStateChanged{Locked: false}})
@@ -1468,6 +1482,7 @@ func (m *GinMockContainerManager) InspectImage(ctx context.Context, runtime cont
 		Cmd:         []string{"/bin/sh"},
 		Digest:      "sha256:mockdigest",
 		RepoDigests: []string{imageName + "@sha256:mockdigest"},
+		Size:        500 << 20,
 	}, nil
 }
 
@@ -1562,5 +1577,62 @@ func TestServicesLocalURLGeneration(t *testing.T) {
 	}
 	if containers, ok := data["containers"].([]interface{}); !ok || len(containers) == 0 {
 		t.Fatalf("expected containers list in response: %#v", data)
+	}
+}
+
+func TestHandleGinAppClone_MissingName(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrf := setupTestAdminSession(t, srv)
+
+	tests := []struct {
+		name           string
+		body           string
+		expectedStatus int
+	}{
+		{"empty body", `{}`, http.StatusBadRequest},
+		{"blank name", `{"name":""}`, http.StatusBadRequest},
+		{"whitespace name", `{"name":"  "}`, http.StatusBadRequest},
+		{"invalid json", `{bad`, http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest(http.MethodPost, "/api/v1/apps/origin/clone", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			attachAuth(req, sessionCookie, csrf)
+			srv.router.ServeHTTP(w, req)
+			if w.Code != tt.expectedStatus {
+				t.Errorf("status=%d, want %d; body=%s", w.Code, tt.expectedStatus, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandleGinAppClone_OriginNotFound(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrf := setupTestAdminSession(t, srv)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/apps/noexist/clone", strings.NewReader(`{"name":"myclone"}`))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrf)
+	srv.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status=%d, want %d; body=%s", w.Code, http.StatusNotFound, w.Body.String())
+	}
+}
+
+func TestHandleGinAppListClones_OriginNotFound(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, _ := setupTestAdminSession(t, srv)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/apps/noexist/clones", nil)
+	attachAuth(req, sessionCookie, "")
+	srv.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status=%d, want %d; body=%s", w.Code, http.StatusNotFound, w.Body.String())
 	}
 }

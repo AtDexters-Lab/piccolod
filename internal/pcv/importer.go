@@ -74,10 +74,10 @@ func (imp *Importer) Import(ctx context.Context, archivePath, expectedSHA256 str
 		return fmt.Errorf("extract archive: %w", err)
 	}
 
-	// Back up existing corrupt ciphertext if present.
-	cpDir := filepath.Join(coreRoot, "ciphertext", "control-plane")
-	if _, err := os.Stat(cpDir); err == nil {
-		if err := imp.backupCorruptCP(ctx, coreRoot, cpDir); err != nil {
+	// Back up existing corrupt control plane loop file if present.
+	loopFile := filepath.Join(coreRoot, "control-plane.luks")
+	if _, err := os.Stat(loopFile); err == nil {
+		if err := imp.backupCorruptLoopFile(loopFile); err != nil {
 			return fmt.Errorf("backup corrupt control plane: %w", err)
 		}
 	}
@@ -87,16 +87,15 @@ func (imp *Importer) Import(ctx context.Context, archivePath, expectedSHA256 str
 }
 
 // hasFunctionalControlPlane checks if a working control plane exists.
-// Returns true if keyset.json exists AND ciphertext/control-plane/ has content.
+// Returns true if keyset.json exists AND the LUKS loop file is present.
 func (imp *Importer) hasFunctionalControlPlane(coreRoot string) bool {
 	keysetPath := filepath.Join(coreRoot, "crypto", "keyset.json")
 	if _, err := os.Stat(keysetPath); err != nil {
 		return false
 	}
 
-	cpDir := filepath.Join(coreRoot, "ciphertext", "control-plane")
-	entries, err := os.ReadDir(cpDir)
-	if err != nil || len(entries) == 0 {
+	loopFile := filepath.Join(coreRoot, "control-plane.luks")
+	if _, err := os.Stat(loopFile); err != nil {
 		return false
 	}
 
@@ -195,24 +194,19 @@ func (imp *Importer) extractArchive(ctx context.Context, archivePath, stagingDir
 	return nil
 }
 
-// backupCorruptCP renames existing ciphertext/control-plane/ to .bak.<pid>.
-func (imp *Importer) backupCorruptCP(ctx context.Context, coreRoot, cpDir string) error {
+// backupCorruptLoopFile renames an existing control plane loop file to .bak.<pid>.
+func (imp *Importer) backupCorruptLoopFile(loopFile string) error {
+	dir := filepath.Dir(loopFile)
 	// Clean up old backups first.
-	cipherDir := filepath.Dir(cpDir)
-	entries, _ := os.ReadDir(cipherDir)
+	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "control-plane.bak.") {
-			old := filepath.Join(cipherDir, e.Name())
-			if imp.run != nil {
-				_ = imp.run.Run(ctx, "btrfs", "subvolume", "delete", old)
-			}
-			os.RemoveAll(old)
+		if strings.HasPrefix(e.Name(), "control-plane.luks.bak.") {
+			os.Remove(filepath.Join(dir, e.Name()))
 		}
 	}
 
-	backupName := fmt.Sprintf("control-plane.bak.%d", os.Getpid())
-	backupPath := filepath.Join(cipherDir, backupName)
-	return os.Rename(cpDir, backupPath)
+	backupName := fmt.Sprintf("control-plane.luks.bak.%d", os.Getpid())
+	return os.Rename(loopFile, filepath.Join(dir, backupName))
 }
 
 // applyStaging moves staged files from the import staging area to the live layout.

@@ -36,14 +36,13 @@ const (
 
 // Manifest describes a published PCV archive.
 type Manifest struct {
-	Version              int    `json:"version"`
-	Gen                  string `json:"gen"`
-	CreatedAt            string `json:"created_at"`
-	SHA256               string `json:"sha256"`
-	SizeBytes            int64  `json:"size_bytes"`
-	SourceNodeID         string `json:"source_node_id"`
-	SourceSubvolGen      uint64 `json:"source_subvol_generation"`
-	SourceSubvolUUID     string `json:"source_subvol_uuid"`
+	Version         int    `json:"version"`
+	Gen             string `json:"gen"`
+	CreatedAt       string `json:"created_at"`
+	SHA256          string `json:"sha256"`
+	SizeBytes       int64  `json:"size_bytes"`
+	SourceNodeID    string `json:"source_node_id"`
+	SourceModTimeNs int64  `json:"source_mod_time_ns"`
 }
 
 // Publisher manages PCV export lifecycle. It implements the supervisor.Component
@@ -135,7 +134,7 @@ func (p *Publisher) Stop(ctx context.Context) error {
 }
 
 // Activate transitions the publisher from dormant to operational.
-// Called after confirming ciphertext/control-plane/ subvolume exists.
+// Called after confirming the control plane volume is available.
 func (p *Publisher) Activate() {
 	p.mu.Lock()
 	if p.active {
@@ -331,7 +330,8 @@ func (p *Publisher) doPublish(ctx context.Context) error {
 	defer cancel()
 
 	coreRoot := paths.CoreRoot()
-	ciphertextDir := filepath.Join(coreRoot, "ciphertext", "control-plane")
+	loopFile := filepath.Join(coreRoot, "control-plane.luks")
+	mountDir := paths.MountDir("control-plane")
 	recoveryDir := filepath.Join(coreRoot, "recovery")
 	stagingDir := filepath.Join(recoveryDir, "staging")
 	historyDir := filepath.Join(recoveryDir, "history")
@@ -343,24 +343,22 @@ func (p *Publisher) doPublish(ctx context.Context) error {
 		return p.publishFailed(fmt.Errorf("create history dir: %w", err))
 	}
 
-	// Step 1: Two-step syncfs flush.
-	_ = fsutil.SyncDir(filepath.Join(coreRoot, "mounts", "control-plane"))
-	_ = fsutil.SyncDir(ciphertextDir)
+	// Step 1: Sync the control plane mount to flush pending writes.
+	_ = fsutil.SyncDir(mountDir)
 
-	// Step 2: Create btrfs snapshot (or cp -a fallback).
-	snapshotID := fmt.Sprintf("pcv-%d", time.Now().UnixNano())
-	snapshotDir := filepath.Join(stagingDir, snapshotID)
-	defer p.removeSnapshot(snapshotDir)
+	// Step 2: Copy loop file under fsfreeze for crash consistency.
+	snapshotFile := filepath.Join(stagingDir, fmt.Sprintf("pcv-%d.luks", time.Now().UnixNano()))
+	defer os.Remove(snapshotFile)
 
-	if err := p.createSnapshot(pubCtx, ciphertextDir, snapshotDir); err != nil {
-		return p.publishFailed(fmt.Errorf("create snapshot: %w", err))
+	if err := p.createLoopSnapshot(pubCtx, loopFile, snapshotFile, mountDir); err != nil {
+		return p.publishFailed(fmt.Errorf("create loop snapshot: %w", err))
 	}
 
-	// Step 3: Get subvolume provenance.
-	subvolGen, subvolUUID := p.getSubvolInfo(pubCtx, ciphertextDir)
+	// Step 3: Get loop file provenance (modification time).
+	sourceModTime := p.getLoopFileModTime(loopFile)
 
 	// Step 4: Build tar.gz archive.
-	tmpArchive, archiveSize, archiveHash, err := p.buildArchive(pubCtx, coreRoot, snapshotDir)
+	tmpArchive, archiveSize, archiveHash, err := p.buildArchive(pubCtx, coreRoot, snapshotFile)
 	if err != nil {
 		return p.publishFailed(fmt.Errorf("build archive: %w", err))
 	}
@@ -380,14 +378,13 @@ func (p *Publisher) doPublish(ctx context.Context) error {
 	p.mu.Unlock()
 
 	manifest := Manifest{
-		Version:          manifestVersion,
-		Gen:              gen,
-		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
-		SHA256:           archiveHash,
-		SizeBytes:        archiveSize,
-		SourceNodeID:     nodeID,
-		SourceSubvolGen:  subvolGen,
-		SourceSubvolUUID: subvolUUID,
+		Version:         manifestVersion,
+		Gen:             gen,
+		CreatedAt:       time.Now().UTC().Format(time.RFC3339),
+		SHA256:          archiveHash,
+		SizeBytes:       archiveSize,
+		SourceNodeID:    nodeID,
+		SourceModTimeNs: sourceModTime,
 	}
 
 	// Step 7: Atomic publish archive.
@@ -444,9 +441,10 @@ func (p *Publisher) publishFailed(err error) error {
 	return err
 }
 
-// buildArchive creates a gzip tar archive containing the ciphertext snapshot
-// and essential crypto files. Returns the temp path, size, and hex SHA-256.
-func (p *Publisher) buildArchive(ctx context.Context, coreRoot, snapshotDir string) (tmpPath string, size int64, hash string, err error) {
+// buildArchive creates a gzip tar archive containing the LUKS loop file
+// snapshot and essential crypto files. Returns the temp path, size, and
+// hex SHA-256.
+func (p *Publisher) buildArchive(ctx context.Context, coreRoot, snapshotFile string) (tmpPath string, size int64, hash string, err error) {
 	tmpFile, err := os.CreateTemp(filepath.Join(coreRoot, "recovery", "staging"), "pcv-archive-*.tmp")
 	if err != nil {
 		return "", 0, "", err
@@ -468,11 +466,11 @@ func (p *Publisher) buildArchive(ctx context.Context, coreRoot, snapshotDir stri
 
 	modTime := time.Now().UTC().Round(time.Second)
 
-	// Add ciphertext from snapshot.
-	if err := p.addDirToTar(ctx, tw, snapshotDir, "ciphertext/control-plane", modTime); err != nil {
+	// Add the LUKS loop file from the frozen snapshot.
+	if err := p.addFileToTar(tw, snapshotFile, "control-plane.luks", modTime); err != nil {
 		tw.Close()
 		gw.Close()
-		return "", 0, "", fmt.Errorf("add ciphertext: %w", err)
+		return "", 0, "", fmt.Errorf("add loop file: %w", err)
 	}
 
 	// Add essential crypto and volume metadata files.
@@ -609,16 +607,18 @@ func (p *Publisher) nextGeneration() string {
 	return candidate
 }
 
-// needsStartupPublish checks whether the current subvolume generation differs
-// from the manifest, indicating unpublished mutations.
+// needsStartupPublish checks whether the loop file has been modified since
+// the last publish, indicating unpublished mutations. Uses file mtime which
+// may have coarser resolution on some filesystems; worst case is a redundant
+// publish (never data loss).
 func (p *Publisher) needsStartupPublish() bool {
 	manifest, err := p.readManifest()
 	if err != nil {
 		return true // no manifest = needs publish
 	}
-	ciphertextDir := filepath.Join(paths.CoreRoot(), "ciphertext", "control-plane")
-	currentGen, _ := p.getSubvolInfo(context.Background(), ciphertextDir)
-	return currentGen != manifest.SourceSubvolGen
+	loopFile := filepath.Join(paths.CoreRoot(), "control-plane.luks")
+	currentModTime := p.getLoopFileModTime(loopFile)
+	return currentModTime != manifest.SourceModTimeNs
 }
 
 func (p *Publisher) readManifest() (*Manifest, error) {
@@ -649,74 +649,51 @@ func (p *Publisher) loadPreviousManifest() {
 	}
 }
 
-// createSnapshot creates a btrfs read-only snapshot, falling back to cp -a
-// when the source is not a btrfs subvolume (e.g., non-btrfs filesystems in
-// dev mode).
-//
-// The ciphertext/control-plane/ directory is created as a btrfs subvolume by
-// ensureCipherDir (via EnsureVolume) during service init. The cp -a fallback
-// exists for dev/test environments that lack btrfs.
-func (p *Publisher) createSnapshot(ctx context.Context, src, dst string) error {
-	if p.useDevFallback() {
-		log.Printf("WARN: pcv publisher: using cp -a fallback (non-btrfs dev mode)")
-		return p.run.Run(ctx, "cp", "-a", src, dst)
+// createLoopSnapshot copies the LUKS loop file to a staging location for
+// archiving. In production, it freezes the mounted ext4 filesystem first
+// (via fsfreeze) to ensure crash consistency. In dev/test mode, it skips
+// the freeze since there is no real mount.
+func (p *Publisher) createLoopSnapshot(ctx context.Context, loopFile, snapshotFile, mountDir string) error {
+	if !p.devFallback {
+		// Only freeze if the filesystem is currently mounted. During flush-on-lock,
+		// the control-plane may already be unmounted — the loop file is quiescent
+		// and safe to copy without a freeze.
+		if err := p.run.Run(ctx, "mountpoint", "-q", mountDir); err == nil {
+			if err := p.run.Run(ctx, "fsfreeze", "--freeze", mountDir); err != nil {
+				return fmt.Errorf("fsfreeze --freeze: %w", err)
+			}
+			// Use context.Background for unfreeze — if the parent context is
+			// cancelled mid-copy, the filesystem must still be unfrozen.
+			defer p.run.Run(context.Background(), "fsfreeze", "--unfreeze", mountDir)
+		}
 	}
-	if err := p.run.Run(ctx, "btrfs", "subvolume", "snapshot", "-r", src, dst); err != nil {
-		log.Printf("WARN: pcv publisher: btrfs snapshot failed (%v), falling back to cp -a", err)
-		return p.run.Run(ctx, "cp", "-a", src, dst)
-	}
-	return nil
-}
 
-func (p *Publisher) removeSnapshot(dir string) {
-	if dir == "" {
-		return
-	}
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if p.useDevFallback() {
-		os.RemoveAll(dir)
-		return
-	}
-	if err := p.run.Run(ctx, "btrfs", "subvolume", "delete", dir); err != nil {
-		// Fallback for non-subvolume directories (e.g., after failed snapshot).
-		os.RemoveAll(dir)
-	}
-}
-
-func (p *Publisher) useDevFallback() bool {
-	if p.devFallback {
-		return true
-	}
-	if os.Getenv("PICCOLO_DEV_NO_BTRFS") != "1" {
-		return false
-	}
-	_, err := os.Stat("/etc/piccolo-test-image")
-	return err == nil
-}
-
-func (p *Publisher) getSubvolInfo(ctx context.Context, dir string) (gen uint64, uuid string) {
-	if p.run == nil {
-		return 0, ""
-	}
-	out, err := p.run.RunWithOutput(ctx, "btrfs", "subvolume", "show", dir)
+	in, err := os.Open(loopFile)
 	if err != nil {
-		log.Printf("WARN: pcv publisher: btrfs subvolume show %s failed: %v (PCV dirty-check will not work; snapshots will use cp -a fallback)", dir, err)
-		return 0, ""
+		return fmt.Errorf("open loop file: %w", err)
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Generation:") {
-			fmt.Sscanf(strings.TrimPrefix(line, "Generation:"), "%d", &gen)
-		}
-		if strings.HasPrefix(line, "UUID:") {
-			uuid = strings.TrimSpace(strings.TrimPrefix(line, "UUID:"))
-		}
+	defer in.Close()
+
+	out, err := os.OpenFile(snapshotFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("create snapshot file: %w", err)
 	}
-	return gen, uuid
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("copy loop file: %w", err)
+	}
+	return out.Sync()
+}
+
+// getLoopFileModTime returns the modification time of the loop file in
+// nanoseconds since epoch. Used for dirty-checking between publishes.
+func (p *Publisher) getLoopFileModTime(loopFile string) int64 {
+	info, err := os.Stat(loopFile)
+	if err != nil {
+		return 0
+	}
+	return info.ModTime().UnixNano()
 }
 
 func (p *Publisher) cleanupStaging() {
@@ -729,7 +706,7 @@ func (p *Publisher) cleanupStaging() {
 		if strings.HasPrefix(e.Name(), "pcv-") {
 			path := filepath.Join(stagingDir, e.Name())
 			log.Printf("pcv publisher: cleaning up stale staging entry %s", e.Name())
-			p.removeSnapshot(path)
+			os.Remove(path)
 		}
 	}
 }

@@ -10,11 +10,10 @@ import (
 )
 
 func TestInstallMultiContainer_PrunesZombiesBeforeCreate(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tempDir)
+	mgr, err := NewAppManagerForTest(mock, tempDir)
 	if err != nil {
 		t.Fatalf("NewAppManager: %v", err)
 	}
@@ -60,7 +59,7 @@ func TestInstallMultiContainer_PrunesZombiesBeforeCreate(t *testing.T) {
 
 	_, err = mgr.installContainerGroup(ctx, def, "demo", layout, runtime, []services.ServiceEndpoint{
 		{App: "demo", Name: "demo", GuestPort: 8080, HostBind: 18080, PublicPort: 28080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("installContainerGroup: %v", err)
 	}

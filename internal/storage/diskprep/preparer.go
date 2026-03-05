@@ -520,16 +520,21 @@ func (p *Preparer) reloadPartitionTable(ctx context.Context, disk string) error 
 	return nil
 }
 
-// EnsureDirectories creates the required directory tree on the data root.
+// EnsureDirectories creates the required directory tree under the core root.
+// In the block-native architecture, the data partition no longer has a filesystem;
+// all directories live under the core root or on per-volume mounts.
 func (p *Preparer) EnsureDirectories(ctx context.Context) error {
 	dirs := []string{
-		paths.DataJoin("node"),
-		paths.DataJoin("node", "podman"),
-		paths.DataJoin("node", "cache"),
-		paths.DataJoin("user", "volumes"),
-		paths.DataJoin("federation"),
-		paths.DataJoin("system-objects", "control-plane-backups"),
-		paths.DataJoin("system-objects", "volume-checkpoints"),
+		paths.CoreJoin("volumes"),
+		paths.CoreJoin("mounts"),
+		paths.CoreJoin("cache"),
+		paths.CoreJoin("cache", "catalog"),
+		paths.CoreJoin("tiering"),
+		paths.CoreJoin("drbd-meta"),
+		paths.CoreJoin("recovery"),
+		paths.CoreJoin("federation"),
+		paths.CoreJoin("system-objects", "control-plane-backups"),
+		paths.CoreJoin("system-objects", "volume-checkpoints"),
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -537,19 +542,4 @@ func (p *Preparer) EnsureDirectories(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-// SetNOCOWAttributes sets the NOCOW attribute on directories that benefit
-// from disabling btrfs copy-on-write (high-churn, disposable data).
-// Failures are logged but not fatal.
-func (p *Preparer) SetNOCOWAttributes(ctx context.Context) {
-	nocowDirs := []string{
-		paths.DataJoin("node"),
-		paths.DataJoin("federation"),
-	}
-	for _, dir := range nocowDirs {
-		if err := p.run.Run(ctx, "chattr", "+C", dir); err != nil {
-			log.Printf("WARN: failed to set NOCOW on %s: %v", dir, err)
-		}
-	}
 }

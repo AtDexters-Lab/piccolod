@@ -15,26 +15,18 @@ import (
 	"piccolod/internal/state/paths"
 )
 
-// stubRunner records commands without executing them. For snapshot creation
-// it copies the directory tree using os operations.
+// stubRunner records commands without executing them.
 type stubRunner struct {
 	commands [][]string
 }
 
 func (r *stubRunner) Run(ctx context.Context, name string, args ...string) error {
 	r.commands = append(r.commands, append([]string{name}, args...))
-	// Simulate cp -a for dev fallback.
-	if name == "cp" && len(args) >= 3 && args[0] == "-a" {
-		return copyDir(args[1], args[2])
-	}
 	return nil
 }
 
 func (r *stubRunner) RunWithOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
 	r.commands = append(r.commands, append([]string{name}, args...))
-	if name == "btrfs" && len(args) >= 2 && args[0] == "subvolume" && args[1] == "show" {
-		return []byte("Generation:\t\t42\nUUID:\t\t\tabc-123\n"), nil
-	}
 	return nil, nil
 }
 
@@ -43,31 +35,12 @@ func (r *stubRunner) RunWithStdin(ctx context.Context, stdin []byte, name string
 	return nil
 }
 
-func copyDir(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(src, path)
-		target := filepath.Join(dst, rel)
-		if info.IsDir() {
-			return os.MkdirAll(target, info.Mode())
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(target, data, info.Mode())
-	})
-}
-
 func setupTestCoreRoot(t *testing.T) string {
 	t.Helper()
 	coreRoot := t.TempDir()
 	paths.SetCoreRootForTest(t, coreRoot)
 
 	dirs := []string{
-		"ciphertext/control-plane",
 		"crypto",
 		"volumes/control-plane",
 		"mounts/control-plane",
@@ -79,10 +52,10 @@ func setupTestCoreRoot(t *testing.T) string {
 		}
 	}
 
-	// Write sample ciphertext.
+	// Write a dummy LUKS loop file (simulates the encrypted control plane).
 	if err := os.WriteFile(
-		filepath.Join(coreRoot, "ciphertext", "control-plane", "gocryptfs.conf"),
-		[]byte("encrypted-config"), 0o600,
+		filepath.Join(coreRoot, "control-plane.luks"),
+		[]byte("LUKS-test-data-placeholder"), 0o600,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -258,11 +231,11 @@ func TestPublisher_StopFlush(t *testing.T) {
 func TestPublisher_SizeGuard(t *testing.T) {
 	pub, coreRoot := newTestPublisher(t)
 
-	// Write a large random (incompressible) file to trigger size guard.
+	// Write a large random (incompressible) loop file to trigger size guard.
 	largeData := make([]byte, maxPCVSize+1)
 	rand.Read(largeData)
 	if err := os.WriteFile(
-		filepath.Join(coreRoot, "ciphertext", "control-plane", "large.db"),
+		filepath.Join(coreRoot, "control-plane.luks"),
 		largeData, 0o600,
 	); err != nil {
 		t.Fatal(err)

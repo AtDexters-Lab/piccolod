@@ -152,7 +152,7 @@ func inspectStateDirForPlaintext(t *testing.T, root string) []string {
 			}
 			if len(parts) == 3 && !d.IsDir() {
 				// Allow known volume metadata files: state.json, piccolo.volume.json
-				if parts[2] == "state.json" || parts[2] == volumeMetadataName {
+				if parts[2] == "state.json" || parts[2] == metadataV2File {
 					return nil
 				}
 			}

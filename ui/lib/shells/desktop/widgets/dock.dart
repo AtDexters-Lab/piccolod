@@ -3,9 +3,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/listener_health.dart';
 import 'package:piccolo_os/core/models/network_models.dart';
-import 'package:piccolo_os/core/services/api_client.dart';
-import 'package:piccolo_os/core/services/network_service.dart';
 import 'package:piccolo_os/core/services/websocket_connection.dart';
+import 'package:piccolo_os/features/apps/app_launcher.dart';
 import 'package:piccolo_os/shared/widgets/app_icon.dart';
 import 'package:piccolo_os/shared/widgets/status_dot.dart';
 import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
@@ -63,8 +62,9 @@ class Dock extends StatelessWidget {
             _HealthIndicator(controller: controller),
             const SizedBox(width: Spacing.md),
 
-            // Network peers indicator
-            const _NetworkPeersIndicator(),
+            // Network peers indicator (hidden on remote access)
+            if (AppLauncher.isLocalAccess(Uri.base.host.toLowerCase()))
+              _NetworkPeersIndicator(controller: controller),
             const SizedBox(width: Spacing.base),
 
             _buildSeparator(),
@@ -501,50 +501,85 @@ class DockItem extends StatelessWidget {
 }
 
 class _NetworkPeersIndicator extends StatefulWidget {
-  const _NetworkPeersIndicator();
+  const _NetworkPeersIndicator({required this.controller});
+  final DesktopController controller;
 
   @override
   State<_NetworkPeersIndicator> createState() => _NetworkPeersIndicatorState();
 }
 
 class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
-  final NetworkService _networkService = NetworkService(ApiClient());
   List<DiscoveredPeer> _peers = [];
-  Timer? _pollTimer;
-  bool _isLoading = false;
+  StreamSubscription<NetworkPeersEvent>? _subscription;
 
   @override
   void initState() {
     super.initState();
-    unawaited(_fetchPeers());
-    _pollTimer = Timer.periodic(const Duration(seconds: 30), (_) => unawaited(_fetchPeers()));
+    widget.controller.addListener(_onControllerChanged);
+    _subscribeToEvents();
+  }
+
+  @override
+  void didUpdateWidget(covariant _NetworkPeersIndicator oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_onControllerChanged);
+      widget.controller.addListener(_onControllerChanged);
+      _unsubscribe();
+      _subscribeToEvents();
+    }
+  }
+
+  void _onControllerChanged() {
+    final client = widget.controller.eventStreamClient;
+    if (client != null && _subscription == null) {
+      _subscribeToEvents();
+    }
+  }
+
+  void _subscribeToEvents() {
+    final client = widget.controller.eventStreamClient;
+    if (client != null) {
+      _unsubscribe();
+      client.addListener(_onClientStateChanged);
+      _subscription = client.networkPeersEvents.listen(_handlePeersEvent);
+      // Hydrate from cached snapshot — the initial snapshot may have arrived
+      // on the broadcast stream before this widget mounted.
+      final cached = client.lastNetworkPeersEvent;
+      if (cached != null && cached.peers.isNotEmpty) {
+        _peers = cached.peers;
+        if (mounted) setState(() {});
+      }
+    }
+  }
+
+  void _unsubscribe() {
+    unawaited(_subscription?.cancel());
+    _subscription = null;
+    widget.controller.eventStreamClient?.removeListener(_onClientStateChanged);
+  }
+
+  void _onClientStateChanged() {
+    if (!mounted) return;
+    final client = widget.controller.eventStreamClient;
+    if (client?.state == WebSocketConnectionState.connected) {
+      // Clear stale data; fresh snapshot arrives from server
+      setState(() => _peers = []);
+    }
+  }
+
+  void _handlePeersEvent(NetworkPeersEvent event) {
+    if (!mounted) return;
+    setState(() {
+      _peers = event.peers;
+    });
   }
 
   @override
   void dispose() {
-    _pollTimer?.cancel();
+    widget.controller.removeListener(_onControllerChanged);
+    _unsubscribe();
     super.dispose();
-  }
-
-  Future<void> _fetchPeers() async {
-    if (_isLoading) return;
-    _isLoading = true;
-
-    try {
-      final response = await _networkService.getPeers();
-      if (mounted) {
-        setState(() {
-          _peers = response.peers;
-          _isLoading = false;
-        });
-      }
-    } on Object catch (_) {
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-        });
-      }
-    }
   }
 
   Future<void> _openPeerUrl(String url) async {

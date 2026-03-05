@@ -10,10 +10,6 @@ const (
 	// The full username is pa-<instanceID> (truncated + hashed if too long).
 	AppUserPrefix = "pa-"
 
-	// AppsGroupName is the shared POSIX group that grants per-app users
-	// read access to the shared imagestore.
-	AppsGroupName = "piccolo-apps"
-
 	// SubUIDBase is the starting offset for per-app subuid/subgid ranges.
 	// Above piccolo-runtime's 100000:65536.
 	SubUIDBase = uint32(200000)

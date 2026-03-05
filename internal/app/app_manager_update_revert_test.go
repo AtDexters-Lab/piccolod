@@ -9,7 +9,6 @@ import (
 )
 
 func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "fs_update_revert")
 	if err != nil {
 		t.Fatal(err)
@@ -17,7 +16,7 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 	defer os.RemoveAll(tmp)
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tmp)
+	mgr, err := NewAppManagerForTest(mock, tmp)
 	if err != nil {
 		t.Fatalf("fs manager: %v", err)
 	}
@@ -40,27 +39,37 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 	}
 	instanceID := inst.InstanceID
 
-	// UpdateImage is not supported for service-mode apps (multi-container only).
+	// UpdateImage for service-mode apps uses the block-native rootfs pipeline.
 	tag := "3.19"
-	if err := mgr.UpdateImage(ctx, instanceID, &tag); err == nil {
-		t.Fatalf("expected update image to fail for service-mode apps")
+	err = mgr.UpdateImage(ctx, instanceID, &tag)
+	if err != nil {
+		t.Fatalf("update image: %v", err)
 	}
 
-	// Revert is also not supported for service-mode apps.
+	// Verify the definition was updated with the new image tag.
+	state, _ := mgr.ensureStateManager()
+	updatedDef, err := state.GetAppDefinition(instanceID)
+	if err != nil {
+		t.Fatalf("get app def: %v", err)
+	}
+	if svc, ok := updatedDef.Services["main"]; !ok || svc.Image != "alpine:3.19" {
+		t.Fatalf("expected service image alpine:3.19, got %v", updatedDef.Services)
+	}
+
+	// Revert is not supported for service-mode apps.
 	if err := mgr.Revert(ctx, instanceID); err == nil {
 		t.Fatalf("expected revert to fail for service-mode apps")
 	}
 }
 
 func TestAppManager_Logs(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tmp, err := os.MkdirTemp("", "fs_logs")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmp)
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tmp)
+	mgr, err := NewAppManagerForTest(mock, tmp)
 	if err != nil {
 		t.Fatalf("fs manager: %v", err)
 	}

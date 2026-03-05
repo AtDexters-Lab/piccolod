@@ -28,6 +28,9 @@ func TestNoHardcodedCoreRoot(t *testing.T) {
 		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
+		if strings.HasSuffix(path, "_test.go") {
+			return nil // test fixtures may use example paths
+		}
 		if _, ok := allowed[filepath.Clean(path)]; ok {
 			return nil
 		}

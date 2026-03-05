@@ -5,12 +5,14 @@ import (
 	"time"
 
 	"piccolod/internal/cluster"
+	"piccolod/internal/fsutil"
 )
 
 // Service defines the entry point for persistence-related capabilities.
 type Service interface {
 	Control() ControlStore
 	Volumes() VolumeManager
+	Rootfs() RootfsVolumeManager
 	Devices() DeviceManager
 	StorageAdapter() StorageAdapter
 	Consensus() ConsensusManager
@@ -42,6 +44,100 @@ type VolumeManager interface {
 	Detach(ctx context.Context, handle VolumeHandle) error
 	DestroyVolume(ctx context.Context, id string) error
 	RoleStream(volumeID string) (<-chan VolumeRole, error)
+}
+
+// RootfsVolumeManager manages block-native rootfs volumes — golden LVs,
+// workspace snapshots, and service rootfs instances with idmapped mounts.
+type RootfsVolumeManager interface {
+	// EnsureGoldenLV creates or reuses a golden LV for the given image.
+	EnsureGoldenLV(ctx context.Context, req GoldenLVRequest) (string, error)
+	// CreateWorkspaceFromGolden creates a workspace rootfs from a golden LV snapshot.
+	CreateWorkspaceFromGolden(ctx context.Context, req WorkspaceRootfsRequest) (RootfsHandle, error)
+	// CreateServiceRootfs creates a read-only service rootfs from a golden LV snapshot.
+	CreateServiceRootfs(ctx context.Context, req ServiceRootfsRequest) (RootfsHandle, error)
+	// CloneWorkspace creates a clone of an existing workspace.
+	// When idmap is non-nil, it overrides the origin's IDMap in the clone metadata.
+	CloneWorkspace(ctx context.Context, originID, cloneID string, idmap *IDMapConfig) (RootfsHandle, error)
+	// ListClones returns volume IDs of clones created from the given origin volume.
+	ListClones(ctx context.Context, originVolumeID string) ([]string, error)
+	// AttachRootfs activates and mounts an existing rootfs volume.
+	AttachRootfs(ctx context.Context, volumeID string) (RootfsHandle, error)
+	// DetachRootfs unmounts and deactivates a rootfs volume.
+	DetachRootfs(ctx context.Context, volumeID string) error
+	// DestroyRootfs permanently removes a rootfs volume.
+	DestroyRootfs(ctx context.Context, volumeID string) error
+	// GarbageCollectGoldenLVs removes golden LVs with no remaining references.
+	GarbageCollectGoldenLVs(ctx context.Context) error
+	// ReconcileRootfsStates validates rootfs volumes on startup.
+	ReconcileRootfsStates(ctx context.Context) error
+	// ReadGoldenImageConfig returns the OCI image config stored alongside a golden LV.
+	// The goldenID is the golden LV name (e.g., "golden-abc123").
+	ReadGoldenImageConfig(ctx context.Context, goldenID string) (GoldenImageConfig, error)
+	// RootfsVolumeID returns the rootfs volume ID for a given instance and mode.
+	RootfsVolumeID(mode string, instanceID string) string
+	// RootfsExists checks if rootfs volume metadata exists on disk for a given volume ID.
+	// Used to distinguish apps installed with block-native rootfs from legacy apps.
+	RootfsExists(volumeID string) bool
+}
+
+// GoldenLVRequest describes the image for a golden LV.
+type GoldenLVRequest struct {
+	ImageDigest   string
+	ImageRef      string
+	ImageSizeHint int64  // uncompressed image size; when > 0, skips imageSizeFn pull
+	PrePulledDir  string // when non-empty, podman root dir with the image already pulled — flattenFn reuses it
+}
+
+// WorkspaceRootfsRequest describes a workspace rootfs creation request.
+type WorkspaceRootfsRequest struct {
+	InstanceID    string
+	ImageDigest   string
+	ImageRef      string
+	IDMap         IDMapConfig
+	ImageSizeHint int64  // uncompressed image size; when > 0, skips imageSizeFn pull
+	PrePulledDir  string // podman root dir with image already pulled
+}
+
+// ServiceRootfsRequest describes a service rootfs creation request.
+type ServiceRootfsRequest struct {
+	InstanceID    string
+	ServiceName   string // per-service rootfs; empty = legacy single-rootfs
+	ImageDigest   string
+	ImageRef      string
+	IDMap         IDMapConfig
+	VolumeID      string // optional: override derived volume ID (for versioned updates, RFC 20260302)
+	ImageSizeHint int64  // uncompressed image size; when > 0, skips imageSizeFn pull
+	PrePulledDir  string // podman root dir with image already pulled
+}
+
+// RootfsHandle is a reference to a mounted rootfs volume.
+type RootfsHandle struct {
+	VolumeID  string
+	MountPath string
+	ReadOnly  bool
+	GoldenLV  string // golden LV this rootfs was snapshotted from (populated during attach)
+}
+
+// IDMapConfig re-exports the fsutil IDMapConfig for use by callers.
+type IDMapConfig = fsutil.IDMapConfig
+
+// GoldenImageConfig holds OCI image config extracted during golden LV creation.
+// Used to populate ContainerCreateSpec when --rootfs bypasses podman's image layer.
+type GoldenImageConfig struct {
+	Entrypoint []string          `json:"entrypoint,omitempty"`
+	Cmd        []string          `json:"cmd,omitempty"`
+	Env        []string          `json:"env,omitempty"`
+	User       string            `json:"user,omitempty"`
+	WorkingDir string            `json:"working_dir,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
+}
+
+// KeyslotProvisioner provisions LUKS keyslots on all v3 volumes.
+// Implemented by Module when backed by luksVolumeManager.
+type KeyslotProvisioner interface {
+	// ProvisionLUKSKeyslot adds or replaces a passphrase on the given LUKS
+	// keyslot across all v3 volumes. Slot 1 = admin password, slot 2 = recovery mnemonic.
+	ProvisionLUKSKeyslot(ctx context.Context, slot int, passphrase []byte) error
 }
 
 // DeviceManager discovers and manages physical storage devices.
@@ -153,6 +249,7 @@ type VolumeClass string
 const (
 	VolumeClassControl     VolumeClass = "control"
 	VolumeClassApplication VolumeClass = "application"
+	VolumeClassEphemeral   VolumeClass = "ephemeral"
 )
 
 type ClusterMode string

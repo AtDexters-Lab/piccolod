@@ -35,11 +35,9 @@ func ResolveRuntimeCredential(username string) (*RuntimeUser, error) {
 		return nil, fmt.Errorf("invalid GID for runtime user %q: %w", username, err)
 	}
 
-	// Look up supplementary groups for shared imagestore access (piccolo-apps group).
-	// Supplementary groups are required for per-app users to read the shared imagestore.
+	// Look up supplementary groups.
 	// Hard error: piccolo-runtime is a local system user — GroupIds should never fail
-	// except on corrupted /etc/group. Failing loudly here is preferable to silent
-	// imagestore permission failures at container start.
+	// except on corrupted /etc/group.
 	groupIDs, err := u.GroupIds()
 	if err != nil {
 		return nil, fmt.Errorf("resolve supplementary groups for %q: %w", username, err)
@@ -108,6 +106,12 @@ func ChownIfNeeded(root string, uid, gid int) error {
 
 // EnsureXDGRuntimeDir creates /run/user/<uid> with mode 0700 and correct ownership.
 // This directory is required by rootless Podman for runtime state.
+//
+// Also fixes ownership of the libpod subdirectory if it exists and is root-owned.
+// Podman creates /run/user/<uid>/libpod/tmp for alive files and lock state.
+// If a root-level podman process (e.g., overlay compat check) creates this tree
+// before the rootless user runs podman, the rootless process gets EPERM on chmod
+// (sticky bit). Chowning the subtree on startup prevents this race.
 func EnsureXDGRuntimeDir(uid, gid uint32) error {
 	dir := fmt.Sprintf("/run/user/%d", uid)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -119,6 +123,12 @@ func EnsureXDGRuntimeDir(uid, gid uint32) error {
 	}
 	if err := os.Chown(dir, int(uid), int(gid)); err != nil {
 		return fmt.Errorf("chown XDG_RUNTIME_DIR %s: %w", dir, err)
+	}
+
+	// Fix root-owned libpod subtree if present.
+	libpodDir := filepath.Join(dir, "libpod")
+	if err := ChownIfNeeded(libpodDir, int(uid), int(gid)); err != nil {
+		log.Printf("WARN: chown libpod dir %s: %v", libpodDir, err)
 	}
 	return nil
 }

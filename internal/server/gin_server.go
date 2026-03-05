@@ -43,6 +43,8 @@ import (
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage"
 	"piccolod/internal/storage/diskprep"
+	"piccolod/internal/storage/drbd"
+	"piccolod/internal/storage/nbd"
 	"piccolod/internal/update"
 
 	"github.com/coreos/go-systemd/v22/daemon"
@@ -403,10 +405,17 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		})
 	}
 
-	// Initialize storage manager for disk preparation and LUKS lifecycle.
+	// Initialize storage manager for disk preparation and LVM lifecycle.
 	execRunner := runner.ExecRunner{}
 	diskPreparer := diskprep.NewPreparer(execRunner)
-	storageMgr := storage.NewManager(diskPreparer, eventsBus, execRunner, cmgr)
+	storageMgr := storage.NewManager(diskPreparer, eventsBus, execRunner)
+
+	// Initialize NBD server and DRBD resource manager for block-native volume stack.
+	// On single-node deployments (no cluster), these are nil — the volume manager
+	// uses a simplified stack: thin LV → LUKS → ext4 (no NBD/DRBD layers).
+	// TODO: enable when cluster support is wired in.
+	var nbdSrv *nbd.Server
+	var drbdMgr *drbd.ResourceManager
 
 	// Initialize onboarding manager (detects boot mode for USB onboarding flow).
 	bootMode, bootErr := storage.DetectBootMode(context.Background(), execRunner)
@@ -447,7 +456,14 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		Dispatcher: dispatch,
 		Crypto:     cmgr,
 		StateDir:   stateDir,
-		DataDir:    paths.DataRoot(),
+		DataDir:    paths.CoreRoot(),
+		Runner:     execRunner,
+		LVMgr:      storageMgr.LVMVolumes(),
+		PoolMgr:    storageMgr.LVMPool(),
+		NBDSrv:     nbdSrv,
+		DRBDMgr:    drbdMgr,
+		FlattenFn:   appMgr.MakeFlattenFn(),
+		ImageSizeFn: appMgr.MakeImageSizeFn(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to init persistence module: %w", err)
@@ -463,6 +479,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	appMgr.SetStateBaseDir(controlDir)
 	appMgr.SetLockReader(persist)
 	appMgr.SetVolumeManager(persist.Volumes())
+	if rootfs := persist.Rootfs(); rootfs != nil {
+		appMgr.SetRootfsManager(rootfs)
+	}
 	svcMgr.SetLockReader(persist)
 
 	// Set Gin to release mode for production (can be overridden by GIN_MODE env var)
@@ -483,10 +502,11 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			}
 		}
 		mdnsMgr.SetPort(mdnsPort)
+		mdnsMgr.SetEventBus(eventsBus)
 		mdnsMgr.ObserveServiceEndpoints(eventsBus)
 	}
 
-	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), paths.DataJoin("node", "cache", "catalog"))
+	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), paths.CoreJoin("cache", "catalog"))
 
 	s := &GinServer{
 		appManager:     appMgr,
@@ -920,7 +940,7 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	log.Printf("INFO: Phase 2/3: DRAIN complete")
 
 	// ── Phase 3: CLEANUP ────────────────────────────────────────────────
-	// Stop supervisor components (mDNS goodbye, services) and unmount gocryptfs.
+	// Stop supervisor components (mDNS goodbye, services) and unmount volumes.
 	log.Printf("INFO: Phase 3/3: CLEANUP — supervisor stop and volume unmount")
 	if err := s.supervisor.Stop(ctx); err != nil {
 		log.Printf("WARN: Failed to stop components cleanly: %v", err)
@@ -1183,6 +1203,9 @@ func (s *GinServer) setupGinRoutes() {
 			apps.PATCH("/:name/listeners", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUpdateListeners)
 			apps.POST("/:name/start", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppStart)
 			apps.POST("/:name/stop", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppStop)
+			apps.POST("/:name/rollback", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppRollback)
+			apps.POST("/:name/clone", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppClone)
+			apps.GET("/:name/clones", s.requireAdmin(), s.handleGinAppListClones)
 			apps.GET("/:name/terminal", s.requireAdmin(), s.handleWorkspaceTerminal)
 
 			// Persistent container terminal sessions (Admin only)
@@ -1202,6 +1225,7 @@ func (s *GinServer) setupGinRoutes() {
 		admin.GET("/system/admin/diagnostic-log", s.handleAdminDiagnosticLog)
 		admin.GET("/system/network-check", s.handleNetworkCheck)
 		admin.GET("/system/storage-check", s.handleStorageCheck)
+		admin.GET("/system/storage-diagnostics", s.handleStorageDiagnostics)
 
 		// Task progress (Admin only?) - Maybe standard user needs to see progress of their own actions?
 		// But they can't trigger actions. So Admin only is safe.

@@ -3,16 +3,16 @@ package paths
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
 func TestCoreRoot_Default(t *testing.T) {
 	t.Setenv("PICCOLO_CORE_ROOT", "")
-	t.Setenv("PICCOLO_DATA_ROOT", "")
 	t.Setenv("PICCOLO_STATE_DIR", "")
+	once = &sync.Once{}
 	once.Do(func() {}) // exhaust
 	coreRoot = defaultCoreRoot
-	dataRoot = defaultDataRoot
 	if got := CoreRoot(); got != defaultCoreRoot {
 		t.Fatalf("expected %s, got %s", defaultCoreRoot, got)
 	}
@@ -27,12 +27,36 @@ func TestCoreRoot_EnvOverride(t *testing.T) {
 	}
 }
 
-func TestDataRoot_EnvOverride(t *testing.T) {
-	dir := t.TempDir()
-	dataDir := filepath.Join(dir, "data")
-	SetDataRootForTest(t, dataDir)
-	if got := DataRoot(); got != dataDir {
-		t.Fatalf("expected %s, got %s", dataDir, got)
+func TestPodmanRoot_Default(t *testing.T) {
+	// PodmanRoot defaults to tmpfs (/run/piccolo/podman), independent of coreRoot.
+	t.Setenv("PICCOLO_PODMAN_ROOT", "")
+	t.Setenv("PICCOLO_CORE_ROOT", "")
+	once = &sync.Once{}
+	once.Do(resolveRoots)
+	want := "/run/piccolo/podman"
+	if got := PodmanRoot(); got != want {
+		t.Fatalf("expected %s, got %s", want, got)
+	}
+}
+
+func TestPodmanRoot_IndependentFromCoreRoot(t *testing.T) {
+	// Even with a custom PICCOLO_CORE_ROOT, PodmanRoot defaults to tmpfs.
+	t.Setenv("PICCOLO_CORE_ROOT", "/custom/root")
+	t.Setenv("PICCOLO_PODMAN_ROOT", "")
+	once = &sync.Once{}
+	once.Do(resolveRoots)
+	want := "/run/piccolo/podman"
+	if got := PodmanRoot(); got != want {
+		t.Fatalf("expected %s, got %s", want, got)
+	}
+}
+
+func TestPodmanRoot_EnvOverride(t *testing.T) {
+	t.Setenv("PICCOLO_PODMAN_ROOT", "/custom/podman")
+	once = &sync.Once{}
+	once.Do(resolveRoots)
+	if got := PodmanRoot(); got != "/custom/podman" {
+		t.Fatalf("expected /custom/podman, got %s", got)
 	}
 }
 
@@ -46,28 +70,48 @@ func TestCoreJoin(t *testing.T) {
 	}
 }
 
-func TestDataJoin(t *testing.T) {
+func TestPodmanJoin(t *testing.T) {
 	dir := t.TempDir()
-	SetDataRootForTest(t, dir)
-	got := DataJoin("pool", "data")
-	want := filepath.Join(dir, "pool", "data")
+	SetPodmanRootForTest(t, dir)
+	got := PodmanJoin("imagestore")
+	want := filepath.Join(dir, "imagestore")
 	if got != want {
-		t.Fatalf("DataJoin: got %s, want %s", got, want)
+		t.Fatalf("PodmanJoin: got %s, want %s", got, want)
+	}
+}
+
+func TestMountDir(t *testing.T) {
+	dir := t.TempDir()
+	SetCoreRootForTest(t, dir)
+	got := MountDir("app-abc123")
+	want := filepath.Join(dir, "mounts", "app-abc123")
+	if got != want {
+		t.Fatalf("MountDir: got %s, want %s", got, want)
+	}
+}
+
+func TestVolumeMetaDir(t *testing.T) {
+	dir := t.TempDir()
+	SetCoreRootForTest(t, dir)
+	got := VolumeMetaDir("control-plane")
+	want := filepath.Join(dir, "volumes", "control-plane")
+	if got != want {
+		t.Fatalf("VolumeMetaDir: got %s, want %s", got, want)
 	}
 }
 
 func TestSetRootsForTest(t *testing.T) {
-	core, data := SetRootsForTest(t)
+	core, podman := SetRootsForTest(t)
 	if CoreRoot() != core {
 		t.Fatalf("CoreRoot mismatch: got %s, want %s", CoreRoot(), core)
 	}
-	if DataRoot() != data {
-		t.Fatalf("DataRoot mismatch: got %s, want %s", DataRoot(), data)
+	if PodmanRoot() != podman {
+		t.Fatalf("PodmanRoot mismatch: got %s, want %s", PodmanRoot(), podman)
 	}
 	if _, err := os.Stat(core); err != nil {
 		t.Fatalf("core dir not created: %v", err)
 	}
-	if _, err := os.Stat(data); err != nil {
-		t.Fatalf("data dir not created: %v", err)
+	if _, err := os.Stat(podman); err != nil {
+		t.Fatalf("podman dir not created: %v", err)
 	}
 }

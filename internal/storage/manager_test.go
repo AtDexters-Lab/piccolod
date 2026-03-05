@@ -8,13 +8,23 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"piccolod/internal/events"
 	"piccolod/internal/state/paths"
-	"piccolod/internal/storage/luks"
+	"piccolod/internal/storage/lvm"
 )
+
+// exitError returns an *exec.ExitError with the given exit code.
+func exitError(code int) *exec.ExitError {
+	err := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code)).Run()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return exitErr
+	}
+	panic(fmt.Sprintf("expected *exec.ExitError for exit code %d, got %T", code, err))
+}
 
 // fakeDiskPreparer implements DiskPreparer for testing.
 type fakeDiskPreparer struct {
@@ -53,8 +63,6 @@ func (f *fakeDiskPreparer) EnsureDirectories(ctx context.Context) error {
 	return f.ensureDirsErr
 }
 
-func (f *fakeDiskPreparer) SetNOCOWAttributes(ctx context.Context) {}
-
 func TestManager_Phase1_Success(t *testing.T) {
 	core, _ := paths.SetRootsForTest(t)
 
@@ -71,7 +79,7 @@ func TestManager_Phase1_Success(t *testing.T) {
 		},
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 
 	// Core dir must exist for VerifyPiccoloCoreExists.
 	_ = core
@@ -114,7 +122,7 @@ func TestManager_Phase1_MissingCore_HardEmergency(t *testing.T) {
 		},
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 	mgr.StartPartitioningAsync(context.Background())
 
 	err := mgr.WaitForPhase1(context.Background())
@@ -158,7 +166,7 @@ func TestManager_Phase1_FailWithOnboarding_SoftEmergency(t *testing.T) {
 		partitionStateErr: fmt.Errorf("simulated disk probe failure"),
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 	mgr.StartPartitioningAsync(context.Background())
 
 	err := mgr.WaitForPhase1(context.Background())
@@ -171,31 +179,22 @@ func TestManager_Phase1_FailWithOnboarding_SoftEmergency(t *testing.T) {
 	}
 }
 
-func TestManager_Phase1_FailWithLUKS_SoftEmergency(t *testing.T) {
+func TestManager_Phase1_FailWithVG_SoftEmergency(t *testing.T) {
 	paths.SetRootsForTest(t)
 
 	bus := events.NewBus()
 	defer bus.Close()
 
-	// First GetPartitionState call (from preparePartitioning) fails.
-	// Second GetPartitionState call (from isPreviouslySetUp) returns LUKS data.
-	callCount := 0
+	// Phase 1 fails, but VG exists → soft emergency (previously set up).
+	run := &fakeCommandRunner{} // vgs succeeds (no error configured)
 	prep := &fakeDiskPreparerFunc{
 		verifyCoreExists: func(ctx context.Context, p string) bool { return true },
 		getPartitionState: func(ctx context.Context) (*PartitionState, error) {
-			callCount++
-			if callCount == 1 {
-				return nil, fmt.Errorf("simulated disk probe failure")
-			}
-			// Second call (from isPreviouslySetUp): return state with LUKS.
-			return &PartitionState{
-				DataPartition:     "/dev/sda3",
-				DataPartitionLUKS: true,
-			}, nil
+			return nil, fmt.Errorf("simulated disk probe failure")
 		},
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, run)
 	mgr.StartPartitioningAsync(context.Background())
 
 	err := mgr.WaitForPhase1(context.Background())
@@ -204,7 +203,7 @@ func TestManager_Phase1_FailWithLUKS_SoftEmergency(t *testing.T) {
 	}
 
 	if mgr.GetEmergencyLevel() != EmergencySoft {
-		t.Errorf("expected soft emergency (LUKS signal), got %q", mgr.GetEmergencyLevel())
+		t.Errorf("expected soft emergency (VG signal), got %q", mgr.GetEmergencyLevel())
 	}
 }
 
@@ -225,7 +224,7 @@ func TestManager_Phase1_CreatePartition(t *testing.T) {
 		createPartitionSlot: 3,
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 	mgr.StartPartitioningAsync(context.Background())
 
 	if err := mgr.WaitForPhase1(context.Background()); err != nil {
@@ -252,7 +251,7 @@ func TestManager_Phase1_ExpandRoot(t *testing.T) {
 		},
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 	mgr.StartPartitioningAsync(context.Background())
 
 	if err := mgr.WaitForPhase1(context.Background()); err != nil {
@@ -288,10 +287,9 @@ func TestManager_Phase1_RetryOnFailure(t *testing.T) {
 			return nil
 		},
 		ensureDirs: func(ctx context.Context) error { return nil },
-		setNOCOW:   func(ctx context.Context) {},
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 	// Use a background context — retries use phase1RetryBackoff (2s) but
 	// we override nothing, so this test may take ~4 seconds.
 	mgr.StartPartitioningAsync(context.Background())
@@ -311,7 +309,7 @@ func TestManager_WaitForPhase1_ContextCancelled(t *testing.T) {
 	defer bus.Close()
 
 	prep := &fakeDiskPreparer{coreExists: true}
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 	// Don't start Phase 1 — wait should cancel.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -333,7 +331,7 @@ func TestManager_IsPreviouslySetUp_NoSignals(t *testing.T) {
 		partitionState: &PartitionState{},
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 	if mgr.IsPreviouslySetUp(context.Background()) {
 		t.Error("expected false when no signals present")
 	}
@@ -358,28 +356,27 @@ func TestManager_IsPreviouslySetUp_OnboardingComplete(t *testing.T) {
 		partitionState: &PartitionState{},
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 	if !mgr.IsPreviouslySetUp(context.Background()) {
 		t.Error("expected true when onboarding.json is complete")
 	}
 }
 
-func TestManager_IsPreviouslySetUp_LUKSHeader(t *testing.T) {
+func TestManager_IsPreviouslySetUp_VGExists(t *testing.T) {
 	paths.SetRootsForTest(t)
 
 	bus := events.NewBus()
 	defer bus.Close()
 
+	// vgs succeeds → VG exists → previously set up.
+	run := &fakeCommandRunner{}
 	prep := &fakeDiskPreparer{
-		partitionState: &PartitionState{
-			DataPartition:     "/dev/sda3",
-			DataPartitionLUKS: true,
-		},
+		partitionState: &PartitionState{},
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, run)
 	if !mgr.IsPreviouslySetUp(context.Background()) {
-		t.Error("expected true when LUKS header found")
+		t.Error("expected true when VG exists")
 	}
 }
 
@@ -392,11 +389,13 @@ func TestManager_InitializeDataVolume_NoDevice_ReturnsError(t *testing.T) {
 	prep := &fakeDiskPreparer{coreExists: true}
 	run := &fakeCommandRunner{}
 
+	cfg := lvm.DefaultThinPoolConfig()
 	mgr := &Manager{
 		diskPrep:   prep,
 		bus:        bus,
 		run:        run,
-		luksPool:   luks.NewPoolManager(run, nil),
+		lvmPool:    lvm.NewPoolManager(run, bus, cfg),
+		lvmVols:    lvm.NewLVManager(run, cfg.VGName, cfg.PoolName),
 		phase1Done: make(chan struct{}),
 	}
 	// Simulate phase 1 complete with no data device.
@@ -404,7 +403,7 @@ func TestManager_InitializeDataVolume_NoDevice_ReturnsError(t *testing.T) {
 	mgr.phase1Complete = true
 	mgr.phase1Started = true
 
-	err := mgr.InitializeDataVolume(context.Background(), "password", nil)
+	err := mgr.InitializeDataVolume(context.Background())
 	if err == nil {
 		t.Fatal("expected error when device is empty")
 	}
@@ -422,18 +421,20 @@ func TestManager_UnlockDataVolume_NoDevice_ReturnsError(t *testing.T) {
 	prep := &fakeDiskPreparer{coreExists: true}
 	run := &fakeCommandRunner{}
 
+	cfg := lvm.DefaultThinPoolConfig()
 	mgr := &Manager{
 		diskPrep:   prep,
 		bus:        bus,
 		run:        run,
-		luksPool:   luks.NewPoolManager(run, nil),
+		lvmPool:    lvm.NewPoolManager(run, bus, cfg),
+		lvmVols:    lvm.NewLVManager(run, cfg.VGName, cfg.PoolName),
 		phase1Done: make(chan struct{}),
 	}
 	close(mgr.phase1Done)
 	mgr.phase1Complete = true
 	mgr.phase1Started = true
 
-	err := mgr.UnlockDataVolume(context.Background(), "password")
+	err := mgr.UnlockDataVolume(context.Background())
 	if err == nil {
 		t.Fatal("expected error when device is empty")
 	}
@@ -442,28 +443,28 @@ func TestManager_UnlockDataVolume_NoDevice_ReturnsError(t *testing.T) {
 	}
 }
 
-func TestManager_UnlockDataVolume_NoLUKSHeader_FallsBackToInit(t *testing.T) {
+func TestManager_UnlockDataVolume_NoVG_FallsBackToInit(t *testing.T) {
 	paths.SetRootsForTest(t)
 
 	bus := events.NewBus()
 	defer bus.Close()
 
-	// fakeCommandRunner that fails isLuks (no header) and fails luksFormat
-	// to confirm that the fallback path was entered.
+	// fakeCommandRunner where vgs exits 5 (VG not found) and pvcreate fails
+	// to confirm the fallback to InitializeDataVolume was entered.
 	run := &fakeCommandRunner{
 		errs: map[string]error{
-			"cryptsetup isLuks /dev/sda3": exitCode1(),
-			// InitializeDataVolume will try luksFormat which will fail —
-			// that's fine, we just need to confirm the fallback was invoked.
-			"cryptsetup luksFormat --type luks2 --batch-mode --label piccolo-data --cipher aes-xts-plain64 --key-size 512 --hash sha256 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 --key-file /run/piccolo/piccolo_data_pool_key /dev/sda3": fmt.Errorf("simulated"),
+			"vgs --noheadings piccolo-data-vg": exitError(5), // exit code 5 = VG not found
+			"pvcreate -f /dev/sda3":            fmt.Errorf("simulated pvcreate failure"),
 		},
 	}
 
+	cfg := lvm.DefaultThinPoolConfig()
 	mgr := &Manager{
 		diskPrep:   &fakeDiskPreparer{coreExists: true},
 		bus:        bus,
 		run:        run,
-		luksPool:   luks.NewPoolManager(run, nil),
+		lvmPool:    lvm.NewPoolManager(run, bus, cfg),
+		lvmVols:    lvm.NewLVManager(run, cfg.VGName, cfg.PoolName),
 		phase1Done: make(chan struct{}),
 		dataDevice: "/dev/sda3",
 	}
@@ -471,31 +472,71 @@ func TestManager_UnlockDataVolume_NoLUKSHeader_FallsBackToInit(t *testing.T) {
 	mgr.phase1Complete = true
 	mgr.phase1Started = true
 
-	err := mgr.UnlockDataVolume(context.Background(), "password")
-	// Should error from the init path (generate pool keyfile fails or luksFormat fails),
-	// not from unlock.
+	err := mgr.UnlockDataVolume(context.Background())
+	// Should error from the init path (pvcreate fails).
 	if err == nil {
 		t.Fatal("expected error from fallback init path")
 	}
-	// Confirm it went through the HasLUKSHeader check (isLuks call).
-	found := false
+	// Confirm it went through the VGExists check and then pvcreate.
+	foundVgs := false
+	foundPvcreate := false
 	for _, call := range run.calls {
-		if strings.Contains(call, "isLuks") {
-			found = true
+		if strings.Contains(call, "vgs") {
+			foundVgs = true
+		}
+		if strings.Contains(call, "pvcreate") {
+			foundPvcreate = true
 		}
 	}
-	if !found {
-		t.Error("expected HasLUKSHeader (isLuks) call in fallback path")
+	if !foundVgs {
+		t.Error("expected vgs call for VGExists check")
+	}
+	if !foundPvcreate {
+		t.Error("expected pvcreate call from fallback init path")
 	}
 }
 
-// exitCode1 returns an *exec.ExitError with exit code 1.
-func exitCode1() *exec.ExitError {
-	err := exec.Command("sh", "-c", "exit 1").Run()
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		return exitErr
+func TestManager_UnlockDataVolume_TransientVGError_NoFallback(t *testing.T) {
+	paths.SetRootsForTest(t)
+
+	bus := events.NewBus()
+	defer bus.Close()
+
+	// fakeCommandRunner where vgs fails with a transient error (not exit code 5).
+	// UnlockDataVolume must NOT fall back to destructive InitializeDataVolume.
+	run := &fakeCommandRunner{
+		errs: map[string]error{
+			"vgs --noheadings piccolo-data-vg": fmt.Errorf("I/O error"),
+		},
 	}
-	panic("expected *exec.ExitError")
+
+	cfg := lvm.DefaultThinPoolConfig()
+	mgr := &Manager{
+		diskPrep:   &fakeDiskPreparer{coreExists: true},
+		bus:        bus,
+		run:        run,
+		lvmPool:    lvm.NewPoolManager(run, bus, cfg),
+		lvmVols:    lvm.NewLVManager(run, cfg.VGName, cfg.PoolName),
+		phase1Done: make(chan struct{}),
+		dataDevice: "/dev/sda3",
+	}
+	close(mgr.phase1Done)
+	mgr.phase1Complete = true
+	mgr.phase1Started = true
+
+	err := mgr.UnlockDataVolume(context.Background())
+	if err == nil {
+		t.Fatal("expected error from transient VG check failure")
+	}
+	if !strings.Contains(err.Error(), "check VG existence") {
+		t.Errorf("expected VG existence check error, got: %v", err)
+	}
+	// Verify pvcreate was NOT called (no destructive fallback).
+	for _, call := range run.calls {
+		if strings.Contains(call, "pvcreate") {
+			t.Errorf("pvcreate should NOT be called on transient VG error, but got: %s", call)
+		}
+	}
 }
 
 func TestStartPartitioningAsync_Idempotent(t *testing.T) {
@@ -517,7 +558,7 @@ func TestStartPartitioningAsync_Idempotent(t *testing.T) {
 		},
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 	mgr.StartPartitioningAsync(context.Background())
 	mgr.StartPartitioningAsync(context.Background()) // second call should be no-op
 
@@ -545,7 +586,7 @@ func TestEnsurePhase1_StartsIfNotStarted(t *testing.T) {
 		},
 	}
 
-	mgr := NewManager(prep, bus, nil, nil)
+	mgr := NewManager(prep, bus, nil)
 	// Don't call StartPartitioningAsync — EnsurePhase1 should start it.
 	if err := mgr.EnsurePhase1(context.Background()); err != nil {
 		t.Fatalf("EnsurePhase1() unexpected error: %v", err)
@@ -557,6 +598,7 @@ func TestEnsurePhase1_StartsIfNotStarted(t *testing.T) {
 
 // fakeCommandRunner implements runner.CommandRunner for storage manager tests.
 type fakeCommandRunner struct {
+	mu    sync.Mutex
 	errs  map[string]error
 	calls []string
 }
@@ -566,7 +608,9 @@ func (f *fakeCommandRunner) Run(ctx context.Context, name string, args ...string
 	for _, a := range args {
 		key += " " + a
 	}
+	f.mu.Lock()
 	f.calls = append(f.calls, key)
+	f.mu.Unlock()
 	if f.errs != nil {
 		if err, ok := f.errs[key]; ok {
 			return err
@@ -580,7 +624,9 @@ func (f *fakeCommandRunner) RunWithOutput(ctx context.Context, name string, args
 	for _, a := range args {
 		key += " " + a
 	}
+	f.mu.Lock()
 	f.calls = append(f.calls, key)
+	f.mu.Unlock()
 	if f.errs != nil {
 		if err, ok := f.errs[key]; ok {
 			return nil, err
@@ -594,13 +640,24 @@ func (f *fakeCommandRunner) RunWithStdin(ctx context.Context, stdin []byte, name
 	for _, a := range args {
 		key += " " + a
 	}
+	f.mu.Lock()
 	f.calls = append(f.calls, key)
+	f.mu.Unlock()
 	if f.errs != nil {
 		if err, ok := f.errs[key]; ok {
 			return err
 		}
 	}
 	return nil
+}
+
+// getCalls returns a copy of the calls slice (thread-safe).
+func (f *fakeCommandRunner) getCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := make([]string, len(f.calls))
+	copy(cp, f.calls)
+	return cp
 }
 
 // fakeDiskPreparerFunc allows per-method overrides for more flexible test scenarios.
@@ -610,7 +667,6 @@ type fakeDiskPreparerFunc struct {
 	createPartition   func(ctx context.Context, disk string) (string, int, error)
 	expandRoot        func(ctx context.Context, disk string, rootPartition string) error
 	ensureDirs        func(ctx context.Context) error
-	setNOCOW          func(ctx context.Context)
 }
 
 func (f *fakeDiskPreparerFunc) VerifyPiccoloCoreExists(ctx context.Context, corePath string) bool {
@@ -646,10 +702,4 @@ func (f *fakeDiskPreparerFunc) EnsureDirectories(ctx context.Context) error {
 		return f.ensureDirs(ctx)
 	}
 	return nil
-}
-
-func (f *fakeDiskPreparerFunc) SetNOCOWAttributes(ctx context.Context) {
-	if f.setNOCOW != nil {
-		f.setNOCOW(ctx)
-	}
 }

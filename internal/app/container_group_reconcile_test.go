@@ -11,11 +11,10 @@ import (
 )
 
 func TestReconcileMultiContainer_StopsServicesWhenAnchorMissingAndDesiredStopped(t *testing.T) {
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tempDir)
+	mgr, err := NewAppManagerForTest(mock, tempDir)
 	if err != nil {
 		t.Fatalf("NewAppManager: %v", err)
 	}
@@ -111,11 +110,10 @@ func TestReconcileMultiContainer_StopsServicesWhenAnchorMissingAndDesiredStopped
 // Returns the manager, mock, state manager, app definition, layout, and runtime.
 func newReconcileTestEnv(t *testing.T) (*AppManager, *MockContainerManager, *FilesystemStateManager, *api.AppDefinition, appVolumeLayout, container.PodmanRuntime) {
 	t.Helper()
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	tempDir := t.TempDir()
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tempDir)
+	mgr, err := NewAppManagerForTest(mock, tempDir)
 	if err != nil {
 		t.Fatalf("NewAppManager: %v", err)
 	}

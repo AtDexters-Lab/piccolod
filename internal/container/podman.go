@@ -56,21 +56,11 @@ type PodmanCLI struct{}
 //
 // RunRoot configures where Podman stores runtime state (typically under /run or XDG_RUNTIME_DIR).
 //
-// Imagestore optionally splits image storage out of Root into a shared image store.
 type PodmanRuntime struct {
 	Root          string
 	RunRoot       string
-	Imagestore    string
 	StorageDriver string
 	StorageOpts   []string
-
-	// AdditionalImageStores lists read-only image stores that podman should
-	// overlay on top of the primary store. Unlike Imagestore (read-write),
-	// additional stores are never written to by podman. Used by per-app
-	// runtimes to share a common imagestore owned by piccolo-runtime.
-	// When set, a storage.conf is generated in Root and referenced via
-	// CONTAINERS_STORAGE_CONF env var.
-	AdditionalImageStores []string
 
 	// Credential, when non-nil, causes all podman commands to run as the
 	// specified user (rootless mode). When nil, commands inherit the parent
@@ -94,76 +84,6 @@ func (rt PodmanRuntime) Validate() error {
 		return errors.New("PodmanRuntime: HomeDir is empty")
 	}
 	return nil
-}
-
-// FuseOverlayfsWrapperPath is the path to the wrapper script that strips
-// SELinux context= from overlay mount options before calling fuse-overlayfs.
-const FuseOverlayfsWrapperPath = "/run/piccolo/podman/fuse-overlayfs-wrapper.sh"
-
-// EnsureFuseOverlayfsWrapper creates a wrapper script for fuse-overlayfs that
-// strips SELinux context= mount options. Podman passes SELinux labels
-// (context="...") as overlay mount data, but fuse-overlayfs doesn't understand
-// them and the commas inside the label value (e.g., s0:c337,c527) break its
-// option parser. The parent directory must already exist.
-func EnsureFuseOverlayfsWrapper() error {
-	const content = `#!/bin/sh
-# Strip SELinux context= from overlay mount options for fuse-overlayfs.
-# Podman passes context="system_u:object_r:container_file_t:s0:cXXX,cYYY" as
-# mount data; the commas inside the label break fuse-overlayfs option parsing.
-opts=$(printf '%s' "$2" | sed 's/,context="[^"]*"//g;s/context="[^"]*",//g;s/context="[^"]*"//g')
-exec /usr/bin/fuse-overlayfs "$1" "$opts" "$3"
-`
-	existing, err := os.ReadFile(FuseOverlayfsWrapperPath)
-	if err == nil && string(existing) == content {
-		return nil
-	}
-	if err := os.WriteFile(FuseOverlayfsWrapperPath, []byte(content), 0o755); err != nil {
-		return fmt.Errorf("write fuse-overlayfs wrapper: %w", err)
-	}
-	log.Printf("INFO: created fuse-overlayfs wrapper at %s", FuseOverlayfsWrapperPath)
-	return nil
-}
-
-// ensureAdditionalStoresConf generates a storage.conf in podmanRoot that
-// configures ALL storage settings: graphroot, runroot, driver, driver options,
-// and additionalimagestores for read-only image access.
-//
-// When this conf is used (via CONTAINERS_STORAGE_CONF), Podman CLI flags like
-// --root, --runroot, --storage-driver, --storage-opt MUST NOT be passed,
-// because CLI storage flags can cause Podman to reinitialize storage options
-// from scratch, dropping additionalimagestores from the config.
-//
-// The file is only written when its content would change (idempotent).
-func ensureAdditionalStoresConf(rt PodmanRuntime) (string, error) {
-	confPath := filepath.Join(rt.Root, "storage.conf")
-
-	// Build quoted store list for TOML array.
-	quoted := make([]string, len(rt.AdditionalImageStores))
-	for i, s := range rt.AdditionalImageStores {
-		quoted[i] = fmt.Sprintf("%q", s)
-	}
-	content := fmt.Sprintf("[storage]\ndriver = %q\ngraphroot = %q\nrunroot = %q\n\n[storage.options]\nadditionalimagestores = [%s]\n",
-		rt.StorageDriver, rt.Root, rt.RunRoot, strings.Join(quoted, ", "))
-
-	// For overlay driver, configure fuse-overlayfs as the mount program.
-	// Per-app graphroots reside on gocryptfs (FUSE). Kernel overlay cannot
-	// mount on FUSE from within a user namespace (EACCES), but fuse-overlayfs
-	// handles this correctly as a userspace overlay implementation.
-	if rt.StorageDriver == "overlay" {
-		content += fmt.Sprintf("\n[storage.options.overlay]\nmount_program = %q\n", FuseOverlayfsWrapperPath)
-	}
-
-	// Only write if content changed.
-	existing, err := os.ReadFile(confPath)
-	if err == nil && string(existing) == content {
-		return confPath, nil
-	}
-
-	if err := os.WriteFile(confPath, []byte(content), 0o644); err != nil {
-		return "", fmt.Errorf("write storage.conf: %w", err)
-	}
-	log.Printf("INFO: ensureAdditionalStoresConf: wrote %s:\n%s", confPath, content)
-	return confPath, nil
 }
 
 // ContainerState captures minimal observed container state.
@@ -194,6 +114,15 @@ var (
 
 	// Label keys: allow dotted namespaces (e.g. io.piccolo.instance) with conservative characters.
 	labelKeyPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
+
+	// Storage driver name: lowercase alphanumeric only.
+	storageDriverPattern = regexp.MustCompile(`^[a-z0-9]+$`)
+
+	// Storage option: key=value or bare key with dotted namespaces.
+	storageOptPattern = regexp.MustCompile(`^[a-z0-9_.]+=[/a-zA-Z0-9._-]+$|^[a-z0-9_.]+$`)
+
+	// Container name-in-use error: extract the conflicting container ID.
+	nameInUseIDPattern = regexp.MustCompile(`already in use by ([a-f0-9]{12,64})`)
 )
 
 var portInUseRe = regexp.MustCompile(`:(\d+): bind: address already in use`)
@@ -224,7 +153,7 @@ func runPodman(ctx context.Context, rt PodmanRuntime, subcmdArgs []string) ([]by
 	if len(subcmdArgs) == 0 {
 		return nil, fmt.Errorf("runPodman: no subcommand provided")
 	}
-	args, err := buildPodmanArgs(rt, subcmdArgs)
+	args, err := BuildPodmanArgs(rt, subcmdArgs)
 	if err != nil {
 		return nil, err
 	}
@@ -274,10 +203,10 @@ func podmanInspectError(label string, err error) error {
 	return fmt.Errorf("podman inspect (%s) failed: %w", label, err)
 }
 
-// MinimalRootlessEnv returns the minimal environment variables needed for
+// minimalRootlessEnv returns the minimal environment variables needed for
 // rootless podman execution. This is the canonical set used by both
 // ApplyRuntimeCredential and workspacedisk's PodmanImageMounter.
-func MinimalRootlessEnv(homeDir string, uid uint32) []string {
+func minimalRootlessEnv(homeDir string, uid uint32) []string {
 	return []string{
 		fmt.Sprintf("HOME=%s", homeDir),
 		fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", uid),
@@ -313,20 +242,8 @@ func ApplyRuntimeCredential(cmd *exec.Cmd, rt PodmanRuntime, extraEnv ...string)
 	if rt.Credential == nil {
 		return
 	}
-	cmd.Env = append(MinimalRootlessEnv(rt.HomeDir, rt.Credential.Uid), extraEnv...)
+	cmd.Env = append(minimalRootlessEnv(rt.HomeDir, rt.Credential.Uid), extraEnv...)
 	cmd.Env = append(cmd.Env, ProxyEnvVars()...)
-
-	// Set CONTAINERS_STORAGE_CONF for per-app runtimes with additional image stores.
-	// Without this, podman commands look in default storage and can't find containers.
-	if len(rt.AdditionalImageStores) > 0 && rt.Root != "" {
-		confPath, err := ensureAdditionalStoresConf(rt)
-		if err != nil {
-			log.Printf("WARN: failed to generate storage.conf for additional image stores: %v", err)
-		} else {
-			_ = os.Chown(confPath, int(rt.Credential.Uid), int(rt.Credential.Gid))
-			cmd.Env = append(cmd.Env, fmt.Sprintf("CONTAINERS_STORAGE_CONF=%s", confPath))
-		}
-	}
 
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -479,10 +396,19 @@ type ContainerCreateSpec struct {
 	Command    []string // Command arguments appended after image
 
 	// Rootfs mode: when set, uses --rootfs instead of Image.
-	// This is used for workspace disk mode where the rootfs is a pre-mounted overlay.
 	// When Rootfs is set, Image is ignored and the container runs directly from the
 	// specified rootfs path. The caller must ensure the rootfs is properly mounted.
 	Rootfs string
+
+	// RootfsOverlay appends ":O" to the --rootfs path, making podman create an
+	// overlay writable layer on top of the rootfs. Required for read-only rootfs
+	// where the container runtime needs to create /etc/hosts, /etc/hostname, etc.
+	RootfsOverlay bool
+
+	// ReadOnly makes the container's root filesystem read-only (--read-only).
+	// Podman automatically adds tmpfs at /tmp and /run (--read-only-tmpfs, default true).
+	// Persistent state is provided via bind-mounted volumes.
+	ReadOnly bool
 
 	// WorkingDir sets the working directory inside the container.
 	// Used with --rootfs mode to apply image config since Podman doesn't do it automatically.
@@ -493,9 +419,8 @@ type ContainerCreateSpec struct {
 	User string
 
 	// PullPolicy controls image pulling during create: "always", "missing", "never".
-	// Per-app runtimes use "never" because images must be pre-pulled to the shared
-	// imagestore — per-app storage resides on a gocryptfs FUSE mount where rootless
-	// layer extraction (pivot_root inside user namespaces) is not supported.
+	// Per-app runtimes use "never" because service containers use --rootfs from
+	// golden LV snapshots and do not pull images.
 	PullPolicy string
 
 	// ExtraHosts adds entries to /etc/hosts (format: "hostname:IP").
@@ -505,6 +430,12 @@ type ContainerCreateSpec struct {
 	// CAMounts contains paths to CA certificates to mount into the container.
 	// Used to trust the internal CA for OIDC HTTPS communication.
 	CAMounts []CAMount
+
+	// SecurityOpt passes --security-opt flags to podman create.
+	// Used to disable SELinux labeling (e.g., "label=disable") for containers
+	// whose overlay layers or rootfs reside on filesystems where SELinux contexts
+	// don't match the standard container_file_t type.
+	SecurityOpt []string
 }
 
 // HostEntry represents an /etc/hosts entry for --add-host.
@@ -545,9 +476,8 @@ type ResourceLimits struct {
 func buildCreateArgs(spec ContainerCreateSpec) []string {
 	args := []string{"create"}
 
-	// Pull policy: per-app runtimes set "never" to avoid rootless layer extraction
-	// on FUSE-backed storage (gocryptfs). Images must be pre-pulled to the shared
-	// imagestore by the image runtime (piccolo-runtime user).
+	// Pull policy: per-app runtimes set "never" because service containers
+	// use --rootfs from golden LV snapshots and do not pull images.
 	if spec.PullPolicy != "" {
 		args = append(args, "--pull", spec.PullPolicy)
 	}
@@ -670,13 +600,24 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 		args = append(args, "--volume", fmt.Sprintf("%s:%s:ro", ca.HostPath, ca.ContainerPath))
 	}
 
+	// Security options (e.g., SELinux label disable)
+	for _, opt := range spec.SecurityOpt {
+		args = append(args, "--security-opt", opt)
+	}
+
+	// Read-only root filesystem: Podman adds tmpfs at /tmp and /run automatically.
+	if spec.ReadOnly {
+		args = append(args, "--read-only")
+	}
+
 	// Rootfs mode: use --rootfs instead of image reference.
-	// When using --rootfs, Podman runs the container directly from the specified
-	// filesystem path without pulling or resolving an image. This is used for
-	// workspace disk mode where we mount an overlay filesystem combining the base
-	// image with a persistent writable layer.
+	// :O suffix creates an overlay writable layer (required for read-only rootfs).
 	if spec.Rootfs != "" {
-		args = append(args, "--rootfs", spec.Rootfs)
+		rootfsArg := spec.Rootfs
+		if spec.RootfsOverlay {
+			rootfsArg += ":O"
+		}
+		args = append(args, "--rootfs", rootfsArg)
 	} else if spec.Image != "" {
 		args = append(args, spec.Image)
 	}
@@ -690,18 +631,10 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 	return args
 }
 
-func buildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
+// BuildPodmanArgs builds the CLI arguments for a podman command, prepending
+// storage flags (--root, --runroot, --storage-driver, etc.) derived from runtime.
+func BuildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 	out := make([]string, 0, 6+len(runtime.StorageOpts)+len(args))
-
-	// When AdditionalImageStores is set, ALL storage settings (graphroot,
-	// runroot, driver, driver options) are in the storage.conf generated by
-	// ensureAdditionalStoresConf and applied via CONTAINERS_STORAGE_CONF.
-	// CLI storage flags MUST NOT be passed because they can cause Podman to
-	// reinitialize storage options, dropping additionalimagestores.
-	if len(runtime.AdditionalImageStores) > 0 {
-		out = append(out, args...)
-		return out, nil
-	}
 
 	if runtime.Root != "" {
 		if err := ValidatePath(runtime.Root); err != nil {
@@ -715,14 +648,8 @@ func buildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 		}
 		out = append(out, "--runroot", runtime.RunRoot)
 	}
-	if runtime.Imagestore != "" {
-		if err := ValidatePath(runtime.Imagestore); err != nil {
-			return nil, fmt.Errorf("invalid podman --imagestore path: %w", err)
-		}
-		out = append(out, "--imagestore", runtime.Imagestore)
-	}
 	if runtime.StorageDriver != "" {
-		if !regexp.MustCompile(`^[a-z0-9]+$`).MatchString(runtime.StorageDriver) {
+		if !storageDriverPattern.MatchString(runtime.StorageDriver) {
 			return nil, fmt.Errorf("invalid storage driver name")
 		}
 		out = append(out, "--storage-driver", runtime.StorageDriver)
@@ -730,7 +657,7 @@ func buildPodmanArgs(runtime PodmanRuntime, args []string) ([]string, error) {
 	for _, opt := range runtime.StorageOpts {
 		// Basic validation for options (key=value or key).
 		// Keys can contain dots for driver-scoped options (e.g., overlay.mount_program).
-		if !regexp.MustCompile(`^[a-z0-9_.]+=[/a-zA-Z0-9._-]+$|^[a-z0-9_.]+$`).MatchString(opt) {
+		if !storageOptPattern.MatchString(opt) {
 			return nil, fmt.Errorf("invalid storage option: %s", opt)
 		}
 		out = append(out, "--storage-opt", opt)
@@ -755,7 +682,7 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 
 	// Execute command using exec.CommandContext (no shell interpretation)
 	createArgs := buildCreateArgs(spec)
-	args, err := buildPodmanArgs(runtime, createArgs)
+	args, err := BuildPodmanArgs(runtime, createArgs)
 	if err != nil {
 		return "", err
 	}
@@ -778,8 +705,7 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 			// Error: ... name "code-server" is already in use by <id>. ...
 			// Simple regex to find the ID?
 			// The ID is usually 64 chars hex.
-			re := regexp.MustCompile(`already in use by ([a-f0-9]{12,64})`)
-			if match := re.FindStringSubmatch(outStr); len(match) == 2 {
+			if match := nameInUseIDPattern.FindStringSubmatch(outStr); len(match) == 2 {
 				return "", &NameInUseError{Name: spec.Name, ID: match[1]}
 			}
 		}
@@ -813,7 +739,7 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 	if !isValidContainerID(containerID) {
 		return &ContainerNotFoundError{Ref: containerID}
 	}
-	args, err := buildPodmanArgs(runtime, []string{"stop", "--time", "30", containerID})
+	args, err := BuildPodmanArgs(runtime, []string{"stop", "--time", "30", containerID})
 	if err != nil {
 		return err
 	}
@@ -831,7 +757,7 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 	if !isValidContainerID(containerID) {
 		return &ContainerNotFoundError{Ref: containerID}
 	}
-	args, err := buildPodmanArgs(runtime, []string{"rm", containerID})
+	args, err := BuildPodmanArgs(runtime, []string{"rm", containerID})
 	if err != nil {
 		return err
 	}
@@ -849,7 +775,7 @@ func (p *PodmanCLI) ImageExists(ctx context.Context, runtime PodmanRuntime, imag
 		return false, fmt.Errorf("invalid image name: %w", err)
 	}
 
-	args, err := buildPodmanArgs(runtime, []string{"image", "exists", imageName})
+	args, err := BuildPodmanArgs(runtime, []string{"image", "exists", imageName})
 	if err != nil {
 		return false, err
 	}
@@ -936,7 +862,7 @@ func (p *PodmanCLI) LogsStream(ctx context.Context, runtime PodmanRuntime, conta
 		args = append(args, "--timestamps")
 	}
 	args = append(args, containerID)
-	cmdArgs, err := buildPodmanArgs(runtime, args)
+	cmdArgs, err := BuildPodmanArgs(runtime, args)
 	if err != nil {
 		return nil, err
 	}
@@ -992,7 +918,7 @@ func (p *PodmanCLI) LogsStream(ctx context.Context, runtime PodmanRuntime, conta
 }
 
 func (p *PodmanCLI) containerExists(ctx context.Context, runtime PodmanRuntime, containerRef string) (bool, error) {
-	args, err := buildPodmanArgs(runtime, []string{"container", "exists", containerRef})
+	args, err := BuildPodmanArgs(runtime, []string{"container", "exists", containerRef})
 	if err != nil {
 		return false, err
 	}
@@ -1020,7 +946,7 @@ func (p *PodmanCLI) ResolveContainerIDByName(ctx context.Context, runtime Podman
 		return "", ErrContainerNotFound(name)
 	}
 
-	args, err := buildPodmanArgs(runtime, []string{"inspect", "--format", "{{.Id}}", name})
+	args, err := BuildPodmanArgs(runtime, []string{"inspect", "--format", "{{.Id}}", name})
 	if err != nil {
 		return "", err
 	}
@@ -1100,7 +1026,7 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 	}
 
 	// Get both running state and PID to detect stale state after reboot
-	args, err := buildPodmanArgs(runtime, []string{"inspect", "--format", "{{.State.Running}}|{{.State.Pid}}", containerID})
+	args, err := BuildPodmanArgs(runtime, []string{"inspect", "--format", "{{.State.Running}}|{{.State.Pid}}", containerID})
 	if err != nil {
 		return ContainerState{}, err
 	}
@@ -1139,7 +1065,7 @@ func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRun
 	if containerID == "" {
 		return nil, fmt.Errorf("container ID required")
 	}
-	args, err := buildPodmanArgs(runtime, []string{"port", containerID})
+	args, err := BuildPodmanArgs(runtime, []string{"port", containerID})
 	if err != nil {
 		return nil, err
 	}
@@ -1218,10 +1144,9 @@ func (p *PodmanCLI) NetworkReload(ctx context.Context, runtime PodmanRuntime, co
 }
 
 // ResetStorage cleans up container references for this runtime's storage.
-// Only removes containers, does NOT touch the shared imagestore.
 func (p *PodmanCLI) ResetStorage(ctx context.Context, runtime PodmanRuntime) error {
 	// Remove all containers for this runtime (should already be done, but be thorough)
-	args, err := buildPodmanArgs(runtime, []string{"rm", "--all", "--force"})
+	args, err := BuildPodmanArgs(runtime, []string{"rm", "--all", "--force"})
 	if err != nil {
 		return err
 	}
@@ -1254,18 +1179,16 @@ var storagePathKeywords = []string{
 	"overlay",
 	"layer",
 	"diff/",
-	"imagestore",
 }
 
 // ValidateAndRepairStorage checks if the podman overlay storage for a runtime is healthy.
-// If corruption is detected (e.g., from a previous killed image pull), it cleans up the
-// per-app overlay directories and removes dangling entries from the shared imagestore.
-// Only repairs when the error output matches known corruption patterns; other failures
-// (missing binary, permission denied, context timeout) are returned as errors.
-// Returns true if repair was performed.
+// If corruption is detected (e.g., from a previous killed container operation), it cleans
+// up the per-app overlay directories. Only repairs when the error output matches known
+// corruption patterns; other failures (missing binary, permission denied, context timeout)
+// are returned as errors. Returns true if repair was performed.
 func (p *PodmanCLI) ValidateAndRepairStorage(ctx context.Context, runtime PodmanRuntime) (bool, error) {
 	// Quick health check: try listing images
-	args, err := buildPodmanArgs(runtime, []string{"images", "--quiet", "--noheading"})
+	args, err := BuildPodmanArgs(runtime, []string{"images", "--quiet", "--noheading"})
 	if err != nil {
 		return false, fmt.Errorf("build podman args: %w", err)
 	}
@@ -1329,132 +1252,10 @@ func (p *PodmanCLI) ValidateAndRepairStorage(ctx context.Context, runtime Podman
 		}
 	}
 
-	// Phase 2: Clean dangling entries from the shared imagestore.
-	// When a pull is killed, the imagestore may retain layer references that point
-	// to the per-app overlay directory. These dangling references cause subsequent
-	// pulls to fail with "readlink .../diff: no such file or directory".
-	if runtime.Imagestore != "" && runtime.Root != "" {
-		cleaned, cleanErr := cleanDanglingImagestoreEntries(runtime.Imagestore, runtime.Root)
-		if cleanErr != nil {
-			log.Printf("WARN: imagestore cleanup failed: %v", cleanErr)
-		}
-		if cleaned {
-			repaired = true
-		}
-	}
-
 	if repaired {
 		log.Printf("INFO: podman storage repair completed for root=%s", runtime.Root)
 	}
 	return repaired, nil
-}
-
-// isUnderPath checks if resolved is a path under (or equal to) the given root directory.
-// Uses proper path-prefix matching to avoid substring false positives
-// (e.g., /apps/app1 should not match /apps/app10).
-func isUnderPath(resolved, root string) bool {
-	// Exact match
-	if resolved == root {
-		return true
-	}
-	// Proper prefix with path separator boundary
-	prefix := root + string(os.PathSeparator)
-	return strings.HasPrefix(resolved, prefix)
-}
-
-// cleanDanglingImagestoreEntries removes entries from the shared imagestore's overlay
-// directory that reference the given per-app root and are dangling (target doesn't exist).
-// Returns true if any entries were actually removed.
-func cleanDanglingImagestoreEntries(imagestore, appRoot string) (bool, error) {
-	appRoot = filepath.Clean(appRoot)
-	overlayDir := filepath.Join(imagestore, "overlay")
-	if _, err := os.Stat(overlayDir); err != nil {
-		if os.IsNotExist(err) {
-			return false, nil // No overlay dir in imagestore, nothing to clean
-		}
-		return false, fmt.Errorf("stat imagestore overlay dir: %w", err)
-	}
-
-	cleaned := false
-
-	// Walk the imagestore overlay/l/ directory for dangling symlinks.
-	// Each entry in l/ is a symlink (short ID) pointing to ../<layer-id>/diff.
-	linkDir := filepath.Join(overlayDir, "l")
-	if entries, err := os.ReadDir(linkDir); err == nil {
-		for _, entry := range entries {
-			linkPath := filepath.Join(linkDir, entry.Name())
-			target, err := os.Readlink(linkPath)
-			if err != nil {
-				continue
-			}
-			// Resolve relative symlink targets
-			resolved := target
-			if !filepath.IsAbs(target) {
-				resolved = filepath.Join(linkDir, target)
-			}
-			resolved = filepath.Clean(resolved)
-			// Check if target is under the per-app root and is dangling
-			if isUnderPath(resolved, appRoot) {
-				if _, statErr := os.Stat(resolved); os.IsNotExist(statErr) {
-					if rmErr := os.Remove(linkPath); rmErr == nil {
-						log.Printf("INFO: removed dangling imagestore link: %s -> %s", linkPath, target)
-						cleaned = true
-					}
-				}
-			}
-		}
-	}
-
-	// Walk imagestore overlay/ for layer directories whose content references the per-app root.
-	// In containers/storage overlay layout, overlay/<layer-id>/link is a regular file
-	// containing the short link name (not a symlink). We read it to find the corresponding
-	// l/<short-id> symlink and check if that symlink's target references the per-app root.
-	entries, err := os.ReadDir(overlayDir)
-	if err != nil {
-		return cleaned, fmt.Errorf("read imagestore overlay dir: %w", err)
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == "l" {
-			continue
-		}
-		layerDir := filepath.Join(overlayDir, entry.Name())
-		linkFile := filepath.Join(layerDir, "link")
-
-		// Read the link file (regular file containing the short ID)
-		shortIDBytes, readErr := os.ReadFile(linkFile)
-		if readErr != nil {
-			continue
-		}
-		shortID := strings.TrimSpace(string(shortIDBytes))
-		if shortID == "" {
-			continue
-		}
-
-		// Check the corresponding l/<short-id> symlink
-		lSymlink := filepath.Join(linkDir, shortID)
-		target, linkErr := os.Readlink(lSymlink)
-		if linkErr != nil {
-			continue
-		}
-		resolved := target
-		if !filepath.IsAbs(target) {
-			resolved = filepath.Join(linkDir, target)
-		}
-		resolved = filepath.Clean(resolved)
-
-		// If the symlink target is under the per-app root and dangling, remove both
-		if isUnderPath(resolved, appRoot) {
-			if _, statErr := os.Stat(resolved); os.IsNotExist(statErr) {
-				_ = os.Remove(lSymlink)
-				if rmErr := os.RemoveAll(layerDir); rmErr == nil {
-					log.Printf("INFO: removed dangling imagestore layer: %s (link=%s)", layerDir, shortID)
-					cleaned = true
-				}
-			}
-		}
-	}
-
-	return cleaned, nil
 }
 
 // isValidContainerID validates container ID format
@@ -1490,7 +1291,6 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 
 	// Validate image or rootfs (one must be set)
 	if spec.Rootfs != "" {
-		// Rootfs mode: validate the path
 		if err := ValidatePath(spec.Rootfs); err != nil {
 			return fmt.Errorf("invalid rootfs path: %w", err)
 		}
@@ -1575,6 +1375,7 @@ type ImageConfig struct {
 	User        string
 	Digest      string   // Canonical digest (e.g., "sha256:abc123...")
 	RepoDigests []string // List of canonical references (e.g., "docker.io/library/ubuntu@sha256:...")
+	Size        int64    // Uncompressed image size in bytes
 }
 
 // InspectImage retrieves the configuration of a container image.
@@ -1588,9 +1389,9 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 	}
 
 	// Use podman image inspect to get the full image configuration including digest
-	args, err := buildPodmanArgs(runtime, []string{
+	args, err := BuildPodmanArgs(runtime, []string{
 		"image", "inspect",
-		"--format", `{"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"env":{{json .Config.Env}},"workingDir":{{json .Config.WorkingDir}},"user":{{json .Config.User}},"digest":{{json .Digest}},"repoDigests":{{json .RepoDigests}}}`,
+		"--format", `{"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"env":{{json .Config.Env}},"workingDir":{{json .Config.WorkingDir}},"user":{{json .Config.User}},"digest":{{json .Digest}},"repoDigests":{{json .RepoDigests}},"size":{{json .Size}}}`,
 		imageName,
 	})
 	if err != nil {
@@ -1612,6 +1413,7 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 		User        string   `json:"user"`
 		Digest      string   `json:"digest"`
 		RepoDigests []string `json:"repoDigests"`
+		Size        int64    `json:"size"`
 	}
 	if err := json.Unmarshal(output, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse image config: %w, output: %s", err, string(output))
@@ -1625,6 +1427,7 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 		User:        result.User,
 		Digest:      result.Digest,
 		RepoDigests: result.RepoDigests,
+		Size:        result.Size,
 	}, nil
 }
 
@@ -1650,7 +1453,7 @@ func (p *PodmanCLI) ExecShellCmd(runtime PodmanRuntime, containerID string) (*ex
 	shellCmd := `if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh; fi`
 
 	// Build podman exec args with proper environment propagation
-	args, err := buildPodmanArgs(runtime, []string{
+	args, err := BuildPodmanArgs(runtime, []string{
 		"exec",
 		"-i", "-t", // Interactive + TTY
 		"-e", "TERM=xterm-256color", // Pass TERM into the container
@@ -1750,8 +1553,6 @@ var (
 	// Matches: "Copying blob sha256:abc123 skipped: already exists"
 	pullExistsRe = regexp.MustCompile(`Copying blob ([a-zA-Z0-9:]+)\s+skipped.*exists`)
 
-	// Matches: "Getting image source signatures" or "Copying config sha256:..."
-	pullPhaseRe = regexp.MustCompile(`^(Getting image|Copying config|Writing manifest)`)
 )
 
 // parseLine processes a single line of podman pull output.
@@ -1912,13 +1713,6 @@ func (p *pullProgressParser) shouldCallback() bool {
 	return true
 }
 
-// markCallbackSent marks the current time as the last callback time.
-func (p *pullProgressParser) markCallbackSent() {
-	p.mu.Lock()
-	p.lastCB = time.Now()
-	p.mu.Unlock()
-}
-
 // PullImageWithProgress pulls an image with real-time progress callbacks.
 // Uses a PTY to get progress output from podman, which only outputs progress bars when running in a TTY.
 // If callback is nil, behaves like PullImage without progress.
@@ -1927,7 +1721,7 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 		return fmt.Errorf("invalid image name: %w", err)
 	}
 
-	args, err := buildPodmanArgs(runtime, []string{"pull", image})
+	args, err := BuildPodmanArgs(runtime, []string{"pull", image})
 	if err != nil {
 		return err
 	}
@@ -2007,6 +1801,33 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 		Phase:          "pulling",
 	})
 
+	// Capture recent PTY output lines for diagnostics on failure.
+	const tailSize = 10
+	var tailLines [tailSize]string
+	var tailIdx int
+	var tailMu sync.Mutex
+	appendTail := func(line string) {
+		tailMu.Lock()
+		tailLines[tailIdx%tailSize] = line
+		tailIdx++
+		tailMu.Unlock()
+	}
+	getTail := func() string {
+		tailMu.Lock()
+		defer tailMu.Unlock()
+		var lines []string
+		start := 0
+		if tailIdx > tailSize {
+			start = tailIdx - tailSize
+		}
+		for i := start; i < tailIdx; i++ {
+			if l := tailLines[i%tailSize]; l != "" {
+				lines = append(lines, l)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+
 	// Read PTY output and parse progress
 	go func() {
 		buf := make([]byte, 4096)
@@ -2031,6 +1852,7 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 					line := lineBuf.String()
 					if line != "" {
 						parser.parseLine(line)
+						appendTail(line)
 					}
 					lineBuf.Reset()
 				} else if ch == '\n' {
@@ -2038,6 +1860,7 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 					line := lineBuf.String()
 					if line != "" {
 						parser.parseLine(line)
+						appendTail(line)
 					}
 					lineBuf.Reset()
 				} else {
@@ -2053,7 +1876,9 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 
 		// Process any remaining data
 		if lineBuf.Len() > 0 {
-			parser.parseLine(lineBuf.String())
+			line := lineBuf.String()
+			parser.parseLine(line)
+			appendTail(line)
 		}
 	}()
 
@@ -2074,6 +1899,10 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 		// Check if it was due to context cancellation
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		tail := getTail()
+		if tail != "" {
+			log.Printf("WARN: PullImageWithProgress: podman pull %s output tail:\n%s", image, tail)
 		}
 		return fmt.Errorf("podman pull failed: %w", cmdErr)
 	}

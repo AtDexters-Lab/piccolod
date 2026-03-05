@@ -45,6 +45,11 @@ type AppMetadata struct {
 	// CatalogSource tracks the catalog item name this app was installed from.
 	// Used for icon lookup and update tracking.
 	CatalogSource string `json:"catalog_source,omitempty"`
+	// ActiveRootfs tracks the active rootfs volume ID per service (RFC 20260302).
+	// nil = legacy install (use ServiceRootfsVolumeID without digest).
+	ActiveRootfs map[string]string `json:"active_rootfs,omitempty"`
+	// ClonedFrom tracks the origin instance ID this app was cloned from.
+	ClonedFrom string `json:"cloned_from,omitempty"`
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -179,6 +184,8 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 		UpdatedAt:       raw.UpdatedAt,
 		Definition:      appDef,
 		CatalogSource:   raw.CatalogSource,
+		ActiveRootfs:    raw.ActiveRootfs,
+		ClonedFrom:      raw.ClonedFrom,
 	}
 
 	// Fallback: if InstanceID is empty in metadata, use directory name
@@ -280,6 +287,8 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 		CreatedAt:       app.CreatedAt,
 		UpdatedAt:       app.UpdatedAt,
 		CatalogSource:   app.CatalogSource,
+		ActiveRootfs:    app.ActiveRootfs,
+		ClonedFrom:      app.ClonedFrom,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -324,6 +333,8 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, containerID stri
 	networkAnchorID := app.NetworkAnchorID
 	containers := app.Containers
 	catalogSource := app.CatalogSource
+	activeRootfs := app.ActiveRootfs
+	clonedFrom := app.ClonedFrom
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem
@@ -339,6 +350,8 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, containerID stri
 		CreatedAt:       createdAt,
 		UpdatedAt:       app.UpdatedAt,
 		CatalogSource:   catalogSource,
+		ActiveRootfs:    activeRootfs,
+		ClonedFrom:      clonedFrom,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -376,6 +389,8 @@ func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 		CreatedAt:       app.CreatedAt,
 		UpdatedAt:       app.UpdatedAt,
 		CatalogSource:   app.CatalogSource,
+		ActiveRootfs:    app.ActiveRootfs,
+		ClonedFrom:      app.ClonedFrom,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -444,6 +459,52 @@ func (fsm *FilesystemStateManager) ListApps() []*AppInstance {
 	}
 
 	return apps
+}
+
+const generationsFile = "generations.json"
+
+// LoadTupleState reads the tuple generation state for an app instance.
+// Returns nil, nil if no generations.json exists (app has never been updated).
+func (fsm *FilesystemStateManager) LoadTupleState(instanceID string) (*TupleState, error) {
+	fsm.fsMu.Lock()
+	defer fsm.fsMu.Unlock()
+
+	genPath := filepath.Join(fsm.appsDir, instanceID, generationsFile)
+	data, err := os.ReadFile(genPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read generations.json: %w", err)
+	}
+
+	var ts TupleState
+	if err := json.Unmarshal(data, &ts); err != nil {
+		return nil, fmt.Errorf("parse generations.json: %w", err)
+	}
+	return &ts, nil
+}
+
+// StoreTupleState writes the tuple generation state for an app instance atomically.
+func (fsm *FilesystemStateManager) StoreTupleState(instanceID string, state *TupleState) error {
+	fsm.fsMu.Lock()
+	defer fsm.fsMu.Unlock()
+
+	appDir := filepath.Join(fsm.appsDir, instanceID)
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		return fmt.Errorf("create app directory: %w", err)
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("serialize generations: %w", err)
+	}
+
+	genPath := filepath.Join(appDir, generationsFile)
+	if err := fsutil.AtomicWriteFile(genPath, data, 0644); err != nil {
+		return fmt.Errorf("write generations.json: %w", err)
+	}
+	return nil
 }
 
 // RemoveApp removes an app instance from both filesystem and cache.

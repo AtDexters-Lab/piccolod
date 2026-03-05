@@ -13,6 +13,7 @@ import (
 
 	authpkg "piccolod/internal/auth"
 	"piccolod/internal/crypt"
+	"piccolod/internal/cryptoutil"
 	"piccolod/internal/events"
 	"piccolod/internal/health"
 	"piccolod/internal/persistence"
@@ -255,14 +256,14 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 				}
 				return
 			}
-			// Unlock successful — mount LUKS data volume before notifying
-			// persistence, so /piccolo-data is available when the app-manager
+			// Unlock successful — activate LVM data volume before notifying
+			// persistence, so storage volumes are available when the app-manager
 			// reconcile loop starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
 			// Use a background context so long-running ops survive client disconnect.
 			unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer unlockCancel()
 			if s.storageMgr != nil {
-				if err := s.storageMgr.UnlockDataVolume(unlockCtx, body.Password); err != nil {
+				if err := s.storageMgr.UnlockDataVolume(unlockCtx); err != nil {
 					log.Printf("ERROR: auth login data volume unlock failed: %v", err)
 					if s.healthTracker != nil {
 						s.healthTracker.Setf("storage", health.LevelError, "data volume unlock failed")
@@ -432,10 +433,15 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 			return
 		}
 	}
-	// Rotate LUKS admin password keyslot (best-effort).
-	if s.storageMgr != nil {
-		if err := s.storageMgr.OnAdminPasswordRotated(c.Request.Context(), body.OldPassword, body.NewPassword); err != nil {
-			log.Printf("WARN: LUKS password rotation: %v", err)
+	// Rotate LUKS keyslot 1 (admin-password passphrase) on all volumes.
+	// Only for admin — keyslot 1 is the admin disk-encryption passphrase.
+	if sess, ok := s.sessions.Get(id); ok && (sess.Role == "admin" || sess.User == "admin") {
+		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
+			passBytes := []byte(body.NewPassword)
+			if err := kp.ProvisionLUKSKeyslot(c.Request.Context(), 1, passBytes); err != nil {
+				log.Printf("WARN: LUKS keyslot 1 rotation: %v", err)
+			}
+			cryptoutil.SecureZero(passBytes)
 		}
 	}
 	update := persistence.AuthStalenessUpdate{

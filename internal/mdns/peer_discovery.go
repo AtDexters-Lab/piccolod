@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"piccolod/internal/events"
 )
 
 const (
@@ -249,6 +251,17 @@ func (m *Manager) processDiscoveredInstance(info *peerInfo, fallbackIP net.IP) {
 
 	machineID := info.metadata.MachineID
 
+	// Snapshot key fields before update to detect metadata changes
+	var oldHostname, oldModel, oldVersion string
+	var oldIPv4, oldIPv6 net.IP
+	if existing, ok := m.peerRegistry.GetPeer(machineID); ok {
+		oldHostname = existing.Hostname
+		oldModel = existing.Model
+		oldVersion = existing.Version
+		oldIPv4 = existing.IPv4
+		oldIPv6 = existing.IPv6
+	}
+
 	isNew := m.peerRegistry.UpdatePeer(machineID, func(peer *DiscoveredPeer) {
 		if info.hostname != "" {
 			peer.Hostname = info.hostname
@@ -286,6 +299,16 @@ func (m *Manager) processDiscoveredInstance(info *peerInfo, fallbackIP net.IP) {
 		if m.gatewayLeader != nil {
 			m.gatewayLeader.OnPeerDiscovered(peer)
 		}
+
+		m.publishPeersChanged()
+	} else {
+		// Publish if metadata changed (not just LastSeen heartbeat)
+		updated, _ := m.peerRegistry.GetPeer(machineID)
+		if updated.Hostname != oldHostname || updated.Model != oldModel ||
+			updated.Version != oldVersion || !updated.IPv4.Equal(oldIPv4) ||
+			!updated.IPv6.Equal(oldIPv6) {
+			m.publishPeersChanged()
+		}
 	}
 }
 
@@ -318,6 +341,8 @@ func (m *Manager) cleanupStalePeers() {
 				m.gatewayLeader.OnPeerTimeout(machineID)
 			}
 		}
+
+		m.publishPeersChanged()
 	}
 }
 
@@ -344,6 +369,54 @@ func (m *Manager) handlePeerGoodbye(machineID string) {
 	if m.gatewayLeader != nil {
 		m.gatewayLeader.OnPeerGoodbye(machineID)
 	}
+
+	m.publishPeersChanged()
+}
+
+// SnapshotPeersForEvent returns the current peer list formatted for event payloads.
+func (m *Manager) SnapshotPeersForEvent() events.NetworkPeersChangedEvent {
+	now := time.Now()
+	if m.peerRegistry == nil {
+		return events.NetworkPeersChangedEvent{Peers: []events.NetworkPeer{}, Timestamp: now}
+	}
+
+	discovered := m.peerRegistry.List()
+	staleThreshold := now.Add(-PeerOnlineThreshold)
+
+	peers := make([]events.NetworkPeer, 0, len(discovered))
+	for _, p := range discovered {
+		hostname := p.Hostname
+		if !strings.HasSuffix(hostname, ".local") {
+			hostname += ".local"
+		}
+		np := events.NetworkPeer{
+			Hostname:  hostname,
+			MachineID: p.MachineID,
+			Model:     p.Model,
+			Version:   p.Version,
+			Online:    p.LastSeen.After(staleThreshold),
+		}
+		if p.IPv4 != nil {
+			np.IPv4 = p.IPv4.String()
+		}
+		if p.IPv6 != nil {
+			np.IPv6 = p.IPv6.String()
+		}
+		peers = append(peers, np)
+	}
+
+	return events.NetworkPeersChangedEvent{Peers: peers, Timestamp: now}
+}
+
+// publishPeersChanged publishes the current peer list to the event bus.
+func (m *Manager) publishPeersChanged() {
+	if m.eventBus == nil {
+		return
+	}
+	m.eventBus.Publish(events.Event{
+		Topic:   events.TopicNetworkPeersChanged,
+		Payload: m.SnapshotPeersForEvent(),
+	})
 }
 
 // checkForGoodbyeAnnouncements scans mDNS response for TTL=0 records indicating peer departure.

@@ -853,6 +853,90 @@ func (s *GinServer) handleGinAppStop(c *gin.Context) {
 	writeGinSuccess(c, nil, "App '"+appName+"' stopped successfully")
 }
 
+// handleGinAppRollback handles POST /api/v1/apps/:name/rollback - Rollback to previous snapshot
+func (s *GinServer) handleGinAppRollback(c *gin.Context) {
+	appName := c.Param("name")
+
+	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	err := s.appManager.RollbackToSnapshot(ctx, appName)
+	if err != nil {
+		if handleAppManagerError(c, err, "rollback app") {
+			return
+		}
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "not found"):
+			writeGinError(c, http.StatusNotFound, errMsg)
+		case strings.Contains(errMsg, "no snapshot available") || strings.Contains(errMsg, "no tuple state"):
+			writeGinError(c, http.StatusConflict, "No snapshot available for rollback")
+		default:
+			writeGinError(c, http.StatusInternalServerError, "Rollback failed: "+errMsg)
+		}
+		return
+	}
+
+	writeGinSuccess(c, nil, "App '"+appName+"' rolled back successfully")
+}
+
+// handleGinAppClone handles POST /api/v1/apps/:name/clone - Clone a workspace app
+func (s *GinServer) handleGinAppClone(c *gin.Context) {
+	originName := c.Param("name")
+
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		writeGinError(c, http.StatusBadRequest, "Request body must include 'name' for the clone")
+		return
+	}
+	cloneName := strings.TrimSpace(body.Name)
+
+	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	inst, err := s.appManager.CloneWorkspace(ctx, originName, cloneName)
+	if err != nil {
+		if handleAppManagerError(c, err, "clone workspace") {
+			return
+		}
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "not found"):
+			writeGinError(c, http.StatusNotFound, errMsg)
+		case strings.Contains(errMsg, "not a workspace"):
+			writeGinError(c, http.StatusBadRequest, errMsg)
+		case strings.Contains(errMsg, "must be stopped"):
+			writeGinError(c, http.StatusConflict, errMsg)
+		case strings.Contains(errMsg, "already exists") || strings.Contains(errMsg, "invalid name"):
+			writeGinError(c, http.StatusBadRequest, errMsg)
+		default:
+			writeGinError(c, http.StatusInternalServerError, "Failed to clone workspace: "+errMsg)
+		}
+		return
+	}
+
+	c.JSON(http.StatusCreated, GinAppResponse{Data: inst, Message: "Workspace cloned"})
+}
+
+// handleGinAppListClones handles GET /api/v1/apps/:name/clones - List workspace clones
+func (s *GinServer) handleGinAppListClones(c *gin.Context) {
+	originName := c.Param("name")
+
+	clones, err := s.appManager.ListWorkspaceClones(c.Request.Context(), originName)
+	if err != nil {
+		if handleAppManagerError(c, err, "list clones") {
+			return
+		}
+		if strings.Contains(err.Error(), "not found") {
+			writeGinError(c, http.StatusNotFound, err.Error())
+			return
+		}
+		writeGinError(c, http.StatusInternalServerError, "Failed to list clones: "+err.Error())
+		return
+	}
+
+	msg := fmt.Sprintf("Found %d clones", len(clones))
+	writeGinSuccess(c, clones, msg)
+}
+
 // handleGinCatalog handles GET /api/v1/catalog - returns curated catalog.
 func (s *GinServer) handleGinCatalog(c *gin.Context) {
 	if s.catalogManager == nil {

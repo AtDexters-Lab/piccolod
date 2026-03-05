@@ -108,7 +108,7 @@ func TestGetParentDisk(t *testing.T) {
 
 func TestGetRootDevice_StripsBtrfsSubvolume(t *testing.T) {
 	run := &fakeRunner{
-		outputs: map[string]string{
+		Outputs: map[string]string{
 			"findmnt -nro SOURCE /": "/dev/sda2[/rootfs]",
 		},
 	}

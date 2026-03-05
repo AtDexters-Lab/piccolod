@@ -59,11 +59,11 @@ func TestImporter_ImportSuccess(t *testing.T) {
 	// Create minimal core structure (no existing control plane).
 	os.MkdirAll(filepath.Join(coreRoot, "recovery", "import-staging"), 0o700)
 
-	// Create archive with ciphertext and crypto files.
+	// Create archive with LUKS loop file and crypto files.
 	archivePath := filepath.Join(t.TempDir(), "test.pcv")
 	createTestPCVArchive(t, archivePath, map[string][]byte{
-		"ciphertext/control-plane/gocryptfs.conf": []byte("encrypted-config"),
-		"crypto/keyset.json":                      []byte(`{"sdek":"sealed"}`),
+		"control-plane.luks":                        []byte("LUKS-encrypted-data"),
+		"crypto/keyset.json":                        []byte(`{"sdek":"sealed"}`),
 		"volumes/control-plane/piccolo.volume.json": []byte(`{"pass":"wrapped"}`),
 	})
 
@@ -74,13 +74,13 @@ func TestImporter_ImportSuccess(t *testing.T) {
 		t.Fatalf("Import: %v", err)
 	}
 
-	// Verify files were extracted to live layout.
-	data, err := os.ReadFile(filepath.Join(coreRoot, "ciphertext", "control-plane", "gocryptfs.conf"))
+	// Verify LUKS loop file was extracted.
+	data, err := os.ReadFile(filepath.Join(coreRoot, "control-plane.luks"))
 	if err != nil {
-		t.Fatalf("ciphertext file missing: %v", err)
+		t.Fatalf("loop file missing: %v", err)
 	}
-	if string(data) != "encrypted-config" {
-		t.Errorf("ciphertext content = %q", data)
+	if string(data) != "LUKS-encrypted-data" {
+		t.Errorf("loop file content = %q", data)
 	}
 
 	data, err = os.ReadFile(filepath.Join(coreRoot, "crypto", "keyset.json"))
@@ -96,11 +96,10 @@ func TestImporter_RejectsFunctionalControlPlane(t *testing.T) {
 	coreRoot := t.TempDir()
 	paths.SetCoreRootForTest(t, coreRoot)
 
-	// Create a functional control plane.
-	os.MkdirAll(filepath.Join(coreRoot, "ciphertext", "control-plane"), 0o700)
-	os.WriteFile(filepath.Join(coreRoot, "ciphertext", "control-plane", "gocryptfs.conf"), []byte("data"), 0o600)
+	// Create a functional control plane (keyset + loop file).
 	os.MkdirAll(filepath.Join(coreRoot, "crypto"), 0o700)
 	os.WriteFile(filepath.Join(coreRoot, "crypto", "keyset.json"), []byte("key"), 0o600)
+	os.WriteFile(filepath.Join(coreRoot, "control-plane.luks"), []byte("encrypted"), 0o600)
 
 	archivePath := filepath.Join(t.TempDir(), "test.pcv")
 	createTestPCVArchive(t, archivePath, map[string][]byte{
@@ -157,20 +156,18 @@ func TestImporter_PathTraversalRejected(t *testing.T) {
 	}
 }
 
-func TestImporter_BackupsCorruptCP(t *testing.T) {
+func TestImporter_BackupsCorruptLoopFile(t *testing.T) {
 	coreRoot := t.TempDir()
 	paths.SetCoreRootForTest(t, coreRoot)
 
-	// Create a corrupt control plane (keyset missing but ciphertext exists).
-	cpDir := filepath.Join(coreRoot, "ciphertext", "control-plane")
-	os.MkdirAll(cpDir, 0o700)
-	os.WriteFile(filepath.Join(cpDir, "corrupt.db"), []byte("corrupt"), 0o600)
+	// Create a corrupt control plane (keyset missing but loop file exists).
+	os.WriteFile(filepath.Join(coreRoot, "control-plane.luks"), []byte("corrupt"), 0o600)
 	os.MkdirAll(filepath.Join(coreRoot, "recovery", "import-staging"), 0o700)
 
 	archivePath := filepath.Join(t.TempDir(), "test.pcv")
 	createTestPCVArchive(t, archivePath, map[string][]byte{
-		"ciphertext/control-plane/gocryptfs.conf": []byte("fresh"),
-		"crypto/keyset.json":                      []byte("key"),
+		"control-plane.luks": []byte("fresh-encrypted-data"),
+		"crypto/keyset.json": []byte("key"),
 	})
 
 	imp := NewImporter(&stubRunner{})
@@ -179,21 +176,21 @@ func TestImporter_BackupsCorruptCP(t *testing.T) {
 		t.Fatalf("Import: %v", err)
 	}
 
-	// Verify old CP was backed up.
-	entries, _ := os.ReadDir(filepath.Join(coreRoot, "ciphertext"))
+	// Verify old loop file was backed up.
+	entries, _ := os.ReadDir(coreRoot)
 	bakFound := false
 	for _, e := range entries {
-		if len(e.Name()) > len("control-plane.bak.") && e.Name()[:len("control-plane.bak.")] == "control-plane.bak." {
+		if len(e.Name()) > len("control-plane.luks.bak.") && e.Name()[:len("control-plane.luks.bak.")] == "control-plane.luks.bak." {
 			bakFound = true
 		}
 	}
 	if !bakFound {
-		t.Error("expected backup of corrupt control plane")
+		t.Error("expected backup of corrupt loop file")
 	}
 
 	// Verify new content applied.
-	data, _ := os.ReadFile(filepath.Join(coreRoot, "ciphertext", "control-plane", "gocryptfs.conf"))
-	if string(data) != "fresh" {
+	data, _ := os.ReadFile(filepath.Join(coreRoot, "control-plane.luks"))
+	if string(data) != "fresh-encrypted-data" {
 		t.Errorf("expected fresh content, got %q", data)
 	}
 }

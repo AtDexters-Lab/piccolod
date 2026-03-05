@@ -83,10 +83,6 @@ func ProvisionAppUser(instanceID string) (au *AppUser, err error) {
 		return au, nil
 	}
 
-	if groupErr := ensureGroup(AppsGroupName); groupErr != nil {
-		return nil, fmt.Errorf("provision user %s: ensure group: %w", username, groupErr)
-	}
-
 	// Create the user if it doesn't exist yet.
 	userExists := false
 	createdByThisCall := false
@@ -111,7 +107,6 @@ func ProvisionAppUser(instanceID string) (au *AppUser, err error) {
 			"--system",
 			"--shell", "/usr/sbin/nologin",
 			"--create-home",
-			"--groups", AppsGroupName,
 			username,
 		)
 		if addErr != nil {
@@ -257,11 +252,6 @@ func CleanupOrphanAppUsers(knownInstanceIDs map[string]bool) {
 	}
 }
 
-// EnsureAppsGroup creates the piccolo-apps shared group if it doesn't exist.
-func EnsureAppsGroup() error {
-	return ensureGroup(AppsGroupName)
-}
-
 // listAppUsers scans /etc/passwd and returns all usernames starting with
 // the per-app prefix "pa-".
 func listAppUsers() ([]string, error) {
@@ -283,16 +273,6 @@ func listAppUsers() ([]string, error) {
 		}
 	}
 	return users, scanner.Err()
-}
-
-// ensureGroup creates a POSIX group if it doesn't already exist.
-// Uses groupadd -f which is idempotent.
-func ensureGroup(name string) error {
-	out, err := defaultExecutor.Run("groupadd", "-f", name)
-	if err != nil {
-		return fmt.Errorf("groupadd -f %s: %w: %s", name, err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }
 
 // subUIDEntry represents a single entry in /etc/subuid or /etc/subgid.

@@ -561,6 +561,10 @@ func validateServiceName(name string) error {
 	if !appNameRegex.MatchString(name) {
 		return fmt.Errorf("service name '%s' must contain only lowercase letters, numbers, and hyphens, and must start with a letter", name)
 	}
+	// Reject "--" which is used as the per-service rootfs volume ID delimiter.
+	if strings.Contains(name, "--") {
+		return fmt.Errorf("service name '%s' must not contain consecutive hyphens", name)
+	}
 	return nil
 }
 

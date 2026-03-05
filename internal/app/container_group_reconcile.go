@@ -107,7 +107,7 @@ func (m *AppManager) recreateServiceContainer(ctx context.Context, state *Filesy
 // recoverStaleAnchor handles recovery when the network anchor cannot be started.
 // It stops and removes all containers, clears state, and recreates the entire container group.
 // This covers stale runtime state after reboot, dead network namespaces, corrupted containers, etc.
-func (m *AppManager) recoverStaleAnchor(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, reason string) error {
+func (m *AppManager) recoverStaleAnchor(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, reason string, prebuiltRootfs map[string]*rootfsMountInfo) error {
 	log.Printf("INFO: app %s: %s", appInst.InstanceID, reason)
 
 	// Stop and remove with strict error handling.
@@ -128,7 +128,7 @@ func (m *AppManager) recoverStaleAnchor(ctx context.Context, state *FilesystemSt
 		log.Printf("WARN: app %s: failed to persist cleared state: %v", appInst.InstanceID, err)
 	}
 
-	return m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime)
+	return m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime, prebuiltRootfs)
 }
 
 // reconcileContainerGroup reconciles a container group (network anchor + service containers).
@@ -152,17 +152,26 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 	mode := piccoloModeFromExtensions(def.Extensions)
 
-	// For workspace mode, ensure workspace disk is mounted before starting containers
-	// and capture the mount info for container recreation.
-	// NOTE: We do NOT call cleanupStaleWorkspaceMounts here because the container
-	// may be actively using the overlay as its rootfs. Stale cleanup is only safe
-	// during startContainerGroup when we know containers aren't running.
-	var workspaceInfo *workspaceMountInfo
-	if mode == ModeWorkspace && desiredRunning {
-		if _, err := m.ensureWorkspaceDiskMounted(ctx, appInst.InstanceID, layout); err != nil {
-			return fmt.Errorf("failed to mount workspace disk: %w", err)
+	// Recover from partially-completed rollbacks (crash between LV rename steps).
+	if err := m.reconcilePartialRollback(ctx, state, appInst.InstanceID); err != nil {
+		log.Printf("WARN: reconcile app %s: partial rollback recovery: %v", appInst.InstanceID, err)
+	}
+
+	// Tuple health: auto-rollback (StatusError from previous pass) and auto-deprecation (24h healthy).
+	// Must run before container state checks so auto-rollback triggers before container recreation attempts.
+	// Only for running apps — stopped/follower apps should not trigger rollback or deprecation.
+	if desiredRunning {
+		m.checkTupleHealth(ctx, state, appInst)
+	}
+
+	// Ensure all service rootfs volumes are attached before reconciling containers.
+	var blockNativeRootfsMap map[string]*rootfsMountInfo
+	if desiredRunning {
+		var rootfsErr error
+		blockNativeRootfsMap, rootfsErr = m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
+		if rootfsErr != nil {
+			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
 		}
-		workspaceInfo = m.getWorkspaceMountInfo(ctx, appInst.InstanceID)
 	}
 
 	primary := primaryServiceFor(def, appInst)
@@ -245,7 +254,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		m.serviceManager.RemoveApp(appInst.InstanceID)
 
 		m.setObservedStatusMessage(appInst.InstanceID, "Containers not found, recreating")
-		if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime); err != nil {
+		if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime, blockNativeRootfsMap); err != nil {
 			m.handleStartupFailure(state, appInst)
 			return err
 		}
@@ -274,7 +283,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			// Covers all stale state: reboot (wiped /run/), dead netns, corrupted runtime, etc.
 			m.setObservedStatusMessage(appInst.InstanceID, "Container start failed, recreating")
 			if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-				fmt.Sprintf("anchor start failed (%v), recreating container group", err)); recoverErr != nil {
+				fmt.Sprintf("anchor start failed (%v), recreating container group", err), blockNativeRootfsMap); recoverErr != nil {
 				m.handleStartupFailure(state, appInst)
 				return recoverErr
 			}
@@ -336,13 +345,9 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				anchorID:   anchorID,
 				credential: runtime.Credential,
 			}
-			if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
-				opts.mergedRootfs = workspaceInfo.mergedPath
-				opts.workspaceMeta = workspaceInfo.meta
-			} else if mode == ModeWorkspace {
-				// Workspace mode requires valid mount info for container recreation
-				m.handleStartupFailure(state, appInst)
-				return fmt.Errorf("workspace mount info unavailable for service '%s' recreation", svcName)
+			if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
+				opts.rootfsHandle = &svcRootfs.handle
+				opts.goldenImgConfig = &svcRootfs.imgConfig
 			}
 			newCID, err := m.createAndStartServiceContainer(ctx, runtime, opts)
 			if err != nil {
@@ -374,12 +379,9 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 					anchorID:   anchorID,
 					credential: runtime.Credential,
 				}
-				if workspaceInfo != nil && workspaceInfo.mergedPath != "" && workspaceInfo.meta != nil {
-					opts.mergedRootfs = workspaceInfo.mergedPath
-					opts.workspaceMeta = workspaceInfo.meta
-				} else if mode == ModeWorkspace {
-					m.handleStartupFailure(state, appInst)
-					return fmt.Errorf("workspace mount info unavailable for service '%s' recreation", svcName)
+				if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
+					opts.rootfsHandle = &svcRootfs.handle
+					opts.goldenImgConfig = &svcRootfs.imgConfig
 				}
 				if err := m.recreateServiceContainer(ctx, state, appInst, runtime, cid, opts); err != nil {
 					m.handleStartupFailure(state, appInst)
@@ -401,6 +403,10 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		// when the app was already running and no status transition occurred.
 		m.setObservedStatusMessage(appInst.InstanceID, "")
 	}
+
+	// Mark active generation as healthy now that reconciler confirmed all containers running.
+	// Must be after container verification (above), not in checkTupleHealth (which runs before).
+	m.markTupleHealthy(state, appInst.InstanceID)
 
 	// Restore endpoints/proxies and ensure published ports match our expected allocations.
 	if err := m.ensureServicesForRunningApp(ctx, def, appInst.InstanceID, anchorID, runtime); err != nil {
@@ -424,13 +430,18 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				log.Printf("WARN: reconcile app %s: port-reconcile remove failed: %v", appInst.InstanceID, removeErr)
 			}
 			m.serviceManager.RemoveApp(appInst.InstanceID)
-			if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime); err != nil {
+			if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime, blockNativeRootfsMap); err != nil {
 				m.handleStartupFailure(state, appInst)
 				return err
 			}
 			return nil
 		}
 		log.Printf("WARN: reconcile app %s: publish reconcile failed: %v", appInst.InstanceID, err)
+	}
+
+	// Tuple GC: remove expired deprecated and failed generations (daily).
+	if gcErr := m.garbageCollectGenerations(ctx, state, appInst.InstanceID); gcErr != nil {
+		log.Printf("WARN: reconcile app %s: tuple GC: %v", appInst.InstanceID, gcErr)
 	}
 
 	// Detect stale DNAT rules: if the existing backend health check (15s interval,
@@ -471,7 +482,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				savedAttempts := appInst.StartupAttempts
 				savedFirstFailure := appInst.FirstStartupFailureAt
 				err := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-					"stale DNAT rules detected: backend unhealthy with running containers")
+					"stale DNAT rules detected: backend unhealthy with running containers", blockNativeRootfsMap)
 				if err == nil {
 					appInst.StartupAttempts = savedAttempts
 					appInst.FirstStartupFailureAt = savedFirstFailure
@@ -512,7 +523,7 @@ func (m *AppManager) pruneMultiContainerZombies(ctx context.Context, runtime con
 	}
 }
 
-func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
+func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, prebuiltRootfs map[string]*rootfsMountInfo) error {
 	// Allocate endpoints and recreate the group (anchor + services).
 	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
 		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners)
@@ -520,7 +531,7 @@ func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *F
 			return fmt.Errorf("allocate service ports: %w", err)
 		}
 
-		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, layout, runtime, endpoints)
+		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, layout, runtime, endpoints, prebuiltRootfs)
 		if err == nil {
 			// Preserve timestamps and reset failure tracking after successful recovery.
 			newInst.CreatedAt = appInst.CreatedAt
@@ -562,33 +573,13 @@ func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime
 	if err != nil {
 		return "", fmt.Errorf("build container spec for service '%s': %w", opts.svcName, err)
 	}
-	// Per-app runtimes must never pull: images are pre-pulled to the shared
-	// imagestore and the per-app FUSE storage can't do rootless layer extraction.
+	// Per-app runtimes must never pull: service containers use --rootfs
+	// from golden LV snapshots.
 	if spec.Image != "" {
 		spec.PullPolicy = "never"
 	}
 
-	var cid string
-	for i := 0; i < 2; i++ {
-		cid, err = m.containerManager.CreateContainer(ctx, runtime, spec)
-		if err == nil {
-			break
-		}
-		zombieID := ""
-		var nameErr *container.NameInUseError
-		if errors.As(err, &nameErr) {
-			zombieID = nameErr.ID
-		} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, spec.Name); resolveErr == nil {
-			zombieID = id
-		}
-		if zombieID != "" {
-			log.Printf("INFO: recreate %s: removing zombie container %s (service=%s)", opts.instanceID, zombieID, opts.svcName)
-			_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
-			_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
-			continue
-		}
-		break
-	}
+	cid, err := m.createContainerWithRetry(ctx, runtime, spec, fmt.Sprintf("recreate %s service=%s", opts.instanceID, opts.svcName))
 	if err != nil {
 		return "", fmt.Errorf("create service container '%s': %w", opts.svcName, err)
 	}
@@ -597,6 +588,41 @@ func (m *AppManager) createAndStartServiceContainer(ctx context.Context, runtime
 		return "", fmt.Errorf("start service container '%s': %w", opts.svcName, err)
 	}
 	return cid, nil
+}
+
+// createContainerWithRetry attempts to create a container, retrying once if the
+// failure is due to a zombie container with the same name. PortInUseError is
+// returned immediately without retry.
+func (m *AppManager) createContainerWithRetry(ctx context.Context, runtime container.PodmanRuntime, spec container.ContainerCreateSpec, logPrefix string) (string, error) {
+	var cid string
+	var err error
+	for i := 0; i < 2; i++ {
+		cid, err = m.containerManager.CreateContainer(ctx, runtime, spec)
+		if err == nil {
+			return cid, nil
+		}
+
+		var portErr *container.PortInUseError
+		if errors.As(err, &portErr) {
+			return "", err
+		}
+
+		zombieID := ""
+		var nameErr *container.NameInUseError
+		if errors.As(err, &nameErr) {
+			zombieID = nameErr.ID
+		} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, spec.Name); resolveErr == nil {
+			zombieID = id
+		}
+		if zombieID != "" {
+			log.Printf("INFO: %s: removing zombie container %s", logPrefix, zombieID)
+			_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
+			_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
+			continue
+		}
+		break
+	}
+	return "", err
 }
 
 func (m *AppManager) stopContainersForMultiApp(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, runtime container.PodmanRuntime) error {

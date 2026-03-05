@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 
@@ -17,13 +16,11 @@ func setupTestAppManager(t *testing.T, existingApps map[string]*api.AppDefinitio
 	t.Helper()
 	tempDir := t.TempDir()
 
-	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") != "1" {
-		t.Skip("set PICCOLO_ALLOW_UNMOUNTED_TESTS=1 to run without mounted volumes")
-	}
 	paths.SetCoreRootForTest(t, tempDir)
 
 	mock := NewMockContainerManager()
-	mgr, err := NewAppManager(mock, tempDir)
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+	mgr, err := NewAppManagerForTest(mock, tempDir)
 	if err != nil {
 		t.Fatalf("NewAppManager: %v", err)
 	}

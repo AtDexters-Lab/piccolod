@@ -30,13 +30,11 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 
 	mode := piccoloModeFromExtensions(def.Extensions)
 
-	// For workspace mode, ensure workspace disk is mounted before starting containers
-	if mode == ModeWorkspace {
-		m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
-		if _, err := m.ensureWorkspaceDiskMounted(ctx, appInst.InstanceID, layout); err != nil {
-			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
-			return fmt.Errorf("failed to mount workspace disk: %w", err)
-		}
+	// Ensure all service rootfs volumes are attached before starting containers.
+	blockNativeRootfsMap, err := m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
+	if err != nil {
+		m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+		return fmt.Errorf("failed to attach rootfs: %w", err)
 	}
 
 	primary := primaryServiceFor(def, appInst)
@@ -86,7 +84,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		// Start failed — attempt recreation of the entire container group.
 		log.Printf("INFO: start %s: anchor start failed (%v), recreating", appInst.InstanceID, err)
 		if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-			"anchor start failed during manual start, recreating"); recoverErr != nil {
+			"anchor start failed during manual start, recreating", blockNativeRootfsMap); recoverErr != nil {
 			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
 			return recoverErr
 		}
@@ -113,15 +111,9 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 				anchorID:   anchorID,
 				credential: runtime.Credential,
 			}
-			if mode == ModeWorkspace {
-				wsInfo := m.getWorkspaceMountInfo(ctx, appInst.InstanceID)
-				if wsInfo != nil && wsInfo.mergedPath != "" && wsInfo.meta != nil {
-					opts.mergedRootfs = wsInfo.mergedPath
-					opts.workspaceMeta = wsInfo.meta
-				} else {
-					m.updateStatusWithEvent(appInst.InstanceID, StatusError)
-					return fmt.Errorf("workspace mount info unavailable for service '%s' recreation", svcName)
-				}
+			if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
+				opts.rootfsHandle = &svcRootfs.handle
+				opts.goldenImgConfig = &svcRootfs.imgConfig
 			}
 			if err := m.recreateServiceContainer(ctx, state, appInst, runtime, cid, opts); err != nil {
 				m.updateStatusWithEvent(appInst.InstanceID, StatusError)
@@ -230,13 +222,9 @@ func (m *AppManager) stopContainerGroupWithOpts(ctx context.Context, state *File
 		}
 	}
 
-	// For workspace mode apps, unmount the overlay on clean stop (RFC §5.6).
-	// This is good practice but not strictly required since we remount on start.
-	if mode == ModeWorkspace {
-		if err := m.unmountWorkspaceDisk(ctx, appInst.InstanceID, layout); err != nil {
-			log.Printf("WARN: stop %s: workspace unmount failed, forcing lazy unmount: %v", appInst.InstanceID, err)
-			m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
-		}
+	// Detach rootfs on clean stop.
+	if m.appHasAnyServiceRootfs(appInst.InstanceID, mode, def, appInst) {
+		m.detachAllServiceRootfs(ctx, appInst.InstanceID, mode, def, appInst)
 	}
 
 	// For explicit user-initiated stops, set Enabled=false and persist.
@@ -294,14 +282,9 @@ func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppIn
 		_ = m.containerManager.StopContainer(ctx, runtime, anchorID)
 	}
 
-	// For workspace mode apps, unmount the workspace disk overlay.
-	if mode == ModeWorkspace {
-		if err := m.unmountWorkspaceDisk(ctx, appInst.InstanceID, layout); err != nil {
-			log.Printf("WARN: workspace %s: unmount failed, forcing lazy unmount: %v", appInst.InstanceID, err)
-			m.cleanupStaleWorkspaceMounts(ctx, appInst.InstanceID, layout)
-		} else {
-			log.Printf("INFO: workspace %s: unmounted workspace disk (data preserved)", appInst.InstanceID)
-		}
+	// Detach rootfs before container removal.
+	if m.appHasAnyServiceRootfs(appInst.InstanceID, mode, def, appInst) {
+		m.detachAllServiceRootfs(ctx, appInst.InstanceID, mode, def, appInst)
 	}
 
 	// Remove containers in reverse order.

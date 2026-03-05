@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ const (
 	topicListenerHealth = "listener_health"
 	topicRemoteConfig   = "remote_config"
 	topicCertificate    = "certificate"
+	topicNetworkPeers   = "network_peers"
 )
 
 var supportedTopics = map[string]events.Topic{
@@ -27,6 +29,7 @@ var supportedTopics = map[string]events.Topic{
 	topicListenerHealth: events.TopicListenerHealthChanged,
 	topicRemoteConfig:   events.TopicRemoteConfigChanged,
 	topicCertificate:    events.TopicCertificateChanged,
+	topicNetworkPeers:   events.TopicNetworkPeersChanged,
 }
 
 type streamMessage struct {
@@ -39,8 +42,9 @@ type streamMessage struct {
 //
 // Query parameters:
 //   - topics: (optional) comma-separated list of topics to subscribe to.
-//     Supported: app_status, listener_health, remote_config, certificate
+//     Supported: app_status, listener_health, remote_config, certificate, network_peers
 //     If omitted, subscribes to all topics.
+//     network_peers is automatically stripped for remote clients (via Nexus proxy).
 //
 // WebSocket message format:
 //
@@ -48,6 +52,7 @@ type streamMessage struct {
 //	{ "type": "listener_health", "payload": ListenerHealthEvent }
 //	{ "type": "remote_config", "payload": remote.Status }
 //	{ "type": "certificate", "payload": CertificateChangedEvent }
+//	{ "type": "network_peers", "payload": NetworkPeersChangedEvent }
 //
 // Keep-alive uses WebSocket Ping frames (not application-level messages).
 //
@@ -72,10 +77,21 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 			}
 			// Ignore unknown topics (per reviewer suggestion: log warning)
 		}
-		if len(requestedTopics) == 0 {
-			writeGinError(c, http.StatusBadRequest, "No valid topics specified")
-			return
-		}
+	}
+
+	// LAN-only guard: remote clients arrive via the Nexus reverse proxy which
+	// binds to loopback, so loopback RemoteAddr implies remote access.
+	// Strip network_peers since peer data is LAN-only.
+	// Fail-closed: if we can't parse RemoteAddr, assume remote and strip.
+	if host, _, err := net.SplitHostPort(c.Request.RemoteAddr); err != nil {
+		delete(requestedTopics, topicNetworkPeers)
+	} else if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		delete(requestedTopics, topicNetworkPeers)
+	}
+
+	if len(requestedTopics) == 0 {
+		writeGinError(c, http.StatusBadRequest, "No valid topics specified")
+		return
 	}
 
 	// Validate session BEFORE WebSocket upgrade (so we can return proper HTTP errors)
@@ -177,6 +193,9 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 	if requestedTopics[topicRemoteConfig] && isAdmin {
 		s.sendInitialRemoteConfig(sendJSON)
 	}
+	if requestedTopics[topicNetworkPeers] {
+		s.sendInitialNetworkPeers(sendJSON)
+	}
 	// Certificate topic doesn't need initial snapshot (included in remote_config)
 
 	// Merge all subscription channels
@@ -270,6 +289,13 @@ func (s *GinServer) processEvent(topic string, evt events.Event, isAppAllowed fu
 			return nil
 		}
 		return &streamMessage{Type: topicCertificate, Payload: payload}
+
+	case topicNetworkPeers:
+		payload, ok := evt.Payload.(events.NetworkPeersChangedEvent)
+		if !ok {
+			return nil
+		}
+		return &streamMessage{Type: topicNetworkPeers, Payload: payload}
 	}
 	return nil
 }
@@ -334,6 +360,17 @@ func (s *GinServer) sendInitialRemoteConfig(sendJSON func(any) error) {
 	_ = sendJSON(streamMessage{
 		Type:    topicRemoteConfig,
 		Payload: status,
+	})
+}
+
+// sendInitialNetworkPeers sends the current peer list snapshot.
+func (s *GinServer) sendInitialNetworkPeers(sendJSON func(any) error) {
+	if s.mdnsManager == nil {
+		return
+	}
+	_ = sendJSON(streamMessage{
+		Type:    topicNetworkPeers,
+		Payload: s.mdnsManager.SnapshotPeersForEvent(),
 	})
 }
 

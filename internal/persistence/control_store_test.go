@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -497,15 +496,7 @@ func prepareControlCipherDir(t *testing.T, root string) {
 		t.Fatalf("mkdir stateDir: %v", err)
 	}
 
-	meta := volumeMetadata{
-		Version:    metadataVersion,
-		WrappedKey: "stub",
-		Nonce:      base64.RawStdEncoding.EncodeToString([]byte("nonce")),
-	}
-	data, err := json.Marshal(&meta)
-	if err != nil {
-		t.Fatalf("marshal metadata: %v", err)
-	}
+	data := []byte(`{"version":1,"wrapped_key":"stub","nonce":"` + base64.RawStdEncoding.EncodeToString([]byte("nonce")) + `"}`)
 	if err := os.WriteFile(filepath.Join(stateDir, controlVolumeMetadataName), data, 0o600); err != nil {
 		t.Fatalf("write metadata: %v", err)
 	}
@@ -551,15 +542,7 @@ func TestSQLiteControlStoreMigratesLegacyMetadata(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cipherDir, gocryptfsConfigName), []byte("stub"), 0o600); err != nil {
 		t.Fatalf("write gocryptfs.conf: %v", err)
 	}
-	meta := volumeMetadata{
-		Version:    metadataVersion,
-		WrappedKey: "stub",
-		Nonce:      base64.RawStdEncoding.EncodeToString([]byte("nonce")),
-	}
-	data, err := json.Marshal(&meta)
-	if err != nil {
-		t.Fatalf("marshal metadata: %v", err)
-	}
+	data := []byte(`{"version":1,"wrapped_key":"stub","nonce":"` + base64.RawStdEncoding.EncodeToString([]byte("nonce")) + `"}`)
 	legacyPath := filepath.Join(cipherDir, controlVolumeMetadataName)
 	if err := os.WriteFile(legacyPath, data, 0o600); err != nil {
 		t.Fatalf("write legacy metadata: %v", err)

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,7 +18,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"piccolod/internal/api"
-	"piccolod/internal/app/workspacedisk"
 	"piccolod/internal/cluster"
 	"piccolod/internal/container"
 	"piccolod/internal/events"
@@ -60,17 +60,6 @@ type AppManager struct {
 	observedStatusMessage map[string]string // transient status message for UI context
 	observedStatusMu      sync.RWMutex
 
-	// Workspace disk manager for container-independent persistence
-	workspaceDiskMgr      *workspacedisk.DefaultManager
-	workspacePathResolver *workspacePathResolver
-	workspaceImageMounter *workspacedisk.PodmanImageMounter
-
-	// Shared image runtime for base images across all app types (overlay driver, shared root + imagestore).
-	// Cached via sync.Once to avoid repeated LookPath + ensureDir calls.
-	imageRuntimeOnce sync.Once
-	imageRuntimeVal  container.PodmanRuntime
-	imageRuntimeErr  error
-
 	// Internal CA path for OIDC trust
 	internalCAPath string
 
@@ -78,12 +67,18 @@ type AppManager struct {
 	oidcHostname string
 
 	// runtimeUser holds the resolved rootless runtime user credentials.
-	// Required for production — the daemon refuses to start without this user.
-	// Only nil in test environments (PICCOLO_ALLOW_UNMOUNTED_TESTS=1).
-	runtimeUser *container.RuntimeUser
+	// Required unconditionally — per-app isolation is a security invariant.
+	runtimeUser container.RuntimeUser
+
+	// credentialResolver overrides per-app user provisioning for tests.
+	// When non-nil, resolveAppCredential returns this instead of calling ProvisionAppUser.
+	credentialResolver func(instanceID string) (*syscall.Credential, string, error)
 
 	// Per-app user orphan cleanup runs once at first reconciliation.
 	orphanCleanupOnce sync.Once
+
+	// Block-native rootfs volume manager for golden LVs and workspace/service rootfs.
+	rootfsMgr persistence.RootfsVolumeManager
 }
 
 var (
@@ -126,39 +121,6 @@ func mergeEnvMaps(base, override map[string]string) map[string]string {
 	return result
 }
 
-// workspaceRuntimeResolver implements workspacedisk.RuntimeResolver
-// by returning the shared image runtime args for podman image mount/unmount.
-// Workspace base images live in the shared image runtime (overlay, shared root),
-// so image mount operations must use those args to find the image.
-type workspaceRuntimeResolver struct {
-	am *AppManager
-}
-
-func (r *workspaceRuntimeResolver) GetRuntimeArgs(ctx context.Context, instanceID string) ([]string, error) {
-	// Use the shared image runtime for image mount/unmount operations.
-	// The instanceID is not used — the image runtime is shared across all apps.
-	rt, err := r.am.podmanImageRuntime()
-	if err != nil {
-		return nil, fmt.Errorf("get image runtime: %w", err)
-	}
-
-	// Convert configuration to command-line arguments
-	args := []string{}
-	if rt.Root != "" {
-		args = append(args, "--root", rt.Root)
-	}
-	if rt.RunRoot != "" {
-		args = append(args, "--runroot", rt.RunRoot)
-	}
-	if rt.StorageDriver != "" {
-		args = append(args, "--storage-driver", rt.StorageDriver)
-	}
-	for _, opt := range rt.StorageOpts {
-		args = append(args, "--storage-opt", opt)
-	}
-	return args, nil
-}
-
 // NewAppManagerWithServices creates a new filesystem-based app manager with an injected ServiceManager
 func NewAppManagerWithServices(containerManager ContainerManager, stateDir string, serviceManager *services.ServiceManager, lockReader LockStateReader) (*AppManager, error) {
 	base := stateDir
@@ -168,54 +130,26 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 	base = filepath.Clean(base)
 
 	// Resolve rootless runtime user. All Podman commands run as this user.
-	// The daemon will not start if the piccolo-runtime user does not exist,
-	// unless PICCOLO_ALLOW_UNMOUNTED_TESTS=1 is set (for test environments).
+	// Per-app isolation is unconditional — the daemon refuses to start without this user.
 	runtimeUser, err := container.ResolveRuntimeCredential(container.RuntimeUsername)
 	if err != nil {
-		if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") == "1" {
-			log.Printf("WARN: runtime user resolution failed in test mode, continuing without rootless: %v", err)
-		} else {
-			return nil, fmt.Errorf("app manager: %w", err)
-		}
-	}
-	if runtimeUser != nil {
-		if err := container.EnsureXDGRuntimeDir(runtimeUser.Credential.Uid, runtimeUser.Credential.Gid); err != nil {
-			return nil, fmt.Errorf("app manager: failed to create XDG_RUNTIME_DIR for rootless Podman: %w", err)
-		}
-		container.CheckCgroupDelegation(runtimeUser.Credential.Uid)
-
-		// Ensure the shared group for imagestore access exists.
-		if err := container.EnsureAppsGroup(); err != nil {
-			log.Printf("WARN: failed to ensure piccolo-apps group: %v", err)
-		}
-
-		// Eagerly fix imagestore permissions if the directory already exists.
-		// Prevents race: per-app users need group-read on imagestore metadata
-		// before the first image pull triggers ensureImagestoreGroupAccess.
-		imgStore := imagestorePath()
-		if _, statErr := os.Stat(imgStore); statErr == nil {
-			if err := ensureImagestoreGroupAccess(imgStore, int(runtimeUser.Credential.Uid)); err != nil {
-				log.Printf("WARN: eager imagestore group access fix: %v", err)
-			}
-		}
-
-		// Ensure cgroup v2 controllers are delegated to user sessions.
-		// Must run before ProvisionAppUser so new user@.service instances
-		// start with memory/cpu/pids/io controllers available.
-		if err := container.EnsureCgroupDelegation(); err != nil {
-			log.Printf("WARN: failed to ensure cgroup delegation: %v", err)
-		}
+		return nil, fmt.Errorf("app manager: %w", err)
 	}
 
-	// Initialize workspace disk components
-	pathResolver := newWorkspacePathResolver()
-	var imageMounterCred *syscall.Credential
-	var imageMounterHome string
-	if runtimeUser != nil {
-		imageMounterCred = runtimeUser.Credential
-		imageMounterHome = runtimeUser.HomeDir
+	if err := container.EnsureXDGRuntimeDir(runtimeUser.Credential.Uid, runtimeUser.Credential.Gid); err != nil {
+		return nil, fmt.Errorf("app manager: failed to create XDG_RUNTIME_DIR for rootless Podman: %w", err)
 	}
-	imageMounter := workspacedisk.NewPodmanImageMounter(imageMounterCred, imageMounterHome)
+	container.CheckCgroupDelegation(runtimeUser.Credential.Uid)
+
+	// Ensure cgroup v2 controllers are delegated to user sessions.
+	// Must run before ProvisionAppUser so new user@.service instances
+	// start with memory/cpu/pids/io controllers available.
+	if err := container.EnsureCgroupDelegation(); err != nil {
+		log.Printf("WARN: failed to ensure cgroup delegation: %v", err)
+	}
+
+	// Clean up orphaned flatten tmpdirs from prior crashes.
+	cleanStaleFlattenDirs()
 
 	mgr := &AppManager{
 		containerManager:      containerManager,
@@ -226,16 +160,9 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		mountVerifier:         defaultMountVerifier,
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
-		workspacePathResolver: pathResolver,
-		workspaceImageMounter: imageMounter,
 		oidcHostname:          "piccolo.local",
-		runtimeUser:           runtimeUser,
+		runtimeUser:           *runtimeUser,
 	}
-
-	// Wire up runtime resolver and disk manager
-	runtimeResolver := &workspaceRuntimeResolver{am: mgr}
-	diskMgr := workspacedisk.NewManager(pathResolver, runtimeResolver, imageMounter)
-	mgr.workspaceDiskMgr = diskMgr
 
 	return mgr, nil
 }
@@ -277,12 +204,10 @@ func (m *AppManager) SetMountVerifier(fn func(string) error) {
 	m.stateInitMu.Unlock()
 }
 
-// SetImageRuntimeForTest overrides the shared image runtime. Intended for tests
-// where fuse-overlayfs is not available.
-func (m *AppManager) SetImageRuntimeForTest(rt container.PodmanRuntime) {
-	m.imageRuntimeOnce.Do(func() {}) // exhaust the Once
-	m.imageRuntimeVal = rt
-	m.imageRuntimeErr = nil
+// DiagnosticEphemeralRuntime creates a short-lived podman runtime for storage
+// diagnostics. The caller must invoke cleanup() when done.
+func (m *AppManager) DiagnosticEphemeralRuntime() (container.PodmanRuntime, func(), error) {
+	return newEphemeralFlattenRuntime(m.runtimeUser)
 }
 
 // SetEventBus configures the event bus for publishing app status change events.
@@ -458,6 +383,20 @@ func (m *AppManager) SetVolumeManager(volumes persistence.VolumeManager) {
 	m.stateMu.Unlock()
 }
 
+// SetRootfsManager wires the block-native rootfs volume manager.
+func (m *AppManager) SetRootfsManager(rootfs persistence.RootfsVolumeManager) {
+	m.stateMu.Lock()
+	m.rootfsMgr = rootfs
+	m.stateMu.Unlock()
+}
+
+// currentRootfsManager returns the rootfs volume manager (may be nil if not configured).
+func (m *AppManager) currentRootfsManager() persistence.RootfsVolumeManager {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.rootfsMgr
+}
+
 // ObserveRuntimeEvents subscribes to leadership and lock-state events for logging.
 func (m *AppManager) ObserveRuntimeEvents(bus *events.Bus) {
 	if bus == nil {
@@ -573,11 +512,6 @@ func (m *AppManager) StartBackground() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		// Flush stale FUSE mounts left by fuse-overlayfs daemons killed during
-		// previous service shutdown (systemd cgroup cleanup). Must run before
-		// reconcile to prevent workspace disk mount failures.
-		cleanupStaleFUSEMounts(ctx)
-
 		m.ReconcileOnce(ctx)
 		for {
 			select {
@@ -613,7 +547,7 @@ func (m *AppManager) StopBackground() {
 
 // StopAllApps stops all running applications and detaches their volumes.
 // This is called during graceful shutdown to ensure containers are stopped
-// before FUSE mounts are unmounted. Apps are stopped in parallel for efficiency.
+// before volumes are unmounted. Apps are stopped in parallel for efficiency.
 func (m *AppManager) StopAllApps(ctx context.Context) error {
 	log.Printf("INFO: Stopping all running apps for graceful shutdown...")
 
@@ -1038,6 +972,84 @@ func NewAppManager(containerManager ContainerManager, stateDir string) (*AppMana
 	return NewAppManagerWithServices(containerManager, stateDir, svc, nil)
 }
 
+// testMountVerifier is a permissive mount verifier for unit tests.
+// It only checks that the path exists as a directory — no mount check.
+func testMountVerifier(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return ErrVolumeUnavailable
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("app manager: state base %s is not a directory", path)
+	}
+	return nil
+}
+
+// NewAppManagerForTest creates an AppManager with a synthetic credential for unit tests.
+// Skips EnsureXDGRuntimeDir and CheckCgroupDelegation —
+// avoids syscall side effects in CI. Uses a permissive mount verifier.
+func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*AppManager, error) {
+	base := stateDir
+	if strings.TrimSpace(base) == "" {
+		base = paths.CoreRoot()
+	}
+	base = filepath.Clean(base)
+	// Use the current process uid/gid so ChownIfNeeded sees files as correctly
+	// owned and skips the lchown call (which requires root).
+	testCred := &syscall.Credential{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
+	testHome := "/tmp"
+	svc := services.NewServiceManager()
+	return &AppManager{
+		containerManager: containerManager,
+		stateBaseDir:     base,
+		serviceManager:   svc,
+		leadershipState:  make(map[string]cluster.Role),
+		mountVerifier:    testMountVerifier,
+		observedStatus:   make(map[string]string),
+		observedStatusMessage: make(map[string]string),
+		oidcHostname: "piccolo.local",
+		runtimeUser: container.RuntimeUser{
+			Credential: testCred,
+			HomeDir:    testHome,
+		},
+		credentialResolver: func(string) (*syscall.Credential, string, error) {
+			return testCred, testHome, nil
+		},
+	}, nil
+}
+
+// NewAppManagerForTestWithServices is like NewAppManagerForTest but with an injected ServiceManager.
+func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDir string, serviceManager *services.ServiceManager, lockReader LockStateReader) (*AppManager, error) {
+	base := stateDir
+	if strings.TrimSpace(base) == "" {
+		base = paths.CoreRoot()
+	}
+	base = filepath.Clean(base)
+	testCred := &syscall.Credential{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
+	testHome := "/tmp"
+	return &AppManager{
+		containerManager: containerManager,
+		stateBaseDir:     base,
+		serviceManager:   serviceManager,
+		leadershipState:  make(map[string]cluster.Role),
+		lockReader:       lockReader,
+		mountVerifier:    testMountVerifier,
+		observedStatus:   make(map[string]string),
+		observedStatusMessage: make(map[string]string),
+		oidcHostname: "piccolo.local",
+		runtimeUser: container.RuntimeUser{
+			Credential: testCred,
+			HomeDir:    testHome,
+		},
+		credentialResolver: func(string) (*syscall.Credential, string, error) {
+			return testCred, testHome, nil
+		},
+	}, nil
+}
+
 // RestoreServices rebuilds service proxies for running apps based on current container port bindings.
 func (m *AppManager) RestoreServices(ctx context.Context) {
 	state, err := m.ensureStateManager()
@@ -1128,15 +1140,13 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 
 	// Clean up orphaned per-app users on first reconciliation.
 	m.orphanCleanupOnce.Do(func() {
-		if m.runtimeUser != nil {
-			knownIDs := make(map[string]bool)
-			for _, app := range state.ListApps() {
-				if app != nil {
-					knownIDs[app.InstanceID] = true
-				}
+		knownIDs := make(map[string]bool)
+		for _, app := range state.ListApps() {
+			if app != nil {
+				knownIDs[app.InstanceID] = true
 			}
-			container.CleanupOrphanAppUsers(knownIDs)
 		}
+		container.CleanupOrphanAppUsers(knownIDs)
 	})
 
 	for _, appInst := range state.ListApps() {
@@ -1175,108 +1185,6 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 
 	// Unified reconcile path: all apps (service and workspace) use container groups.
 	return m.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, desiredRunning)
-}
-
-func (m *AppManager) recreateMissingContainer(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
-	if m.serviceManager == nil {
-		return fmt.Errorf("app manager: service manager not configured")
-	}
-
-	// Check if this is a workspace app that needs --rootfs mode
-	mode := piccoloModeFromExtensions(def.Extensions)
-	var mergedPath string
-	var workspaceMeta *workspacedisk.WorkspaceMeta
-	if mode == ModeWorkspace {
-		// Mount workspace disk overlay (idempotent)
-		var err error
-		mergedPath, err = m.ensureWorkspaceDiskMounted(ctx, appInst.InstanceID, layout)
-		if err != nil {
-			return fmt.Errorf("failed to mount workspace disk: %w", err)
-		}
-
-		// Get metadata for image config
-		workspaceMeta, err = m.getWorkspaceDiskMeta(ctx, appInst.InstanceID, layout)
-		if err != nil {
-			return fmt.Errorf("failed to get workspace disk metadata: %w", err)
-		}
-		log.Printf("INFO: recreate %s: using workspace disk (base=%s)", appInst.InstanceID, workspaceMeta.BaseImageRef)
-	}
-
-	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
-		endpoints, err := m.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners)
-		if err != nil {
-			return fmt.Errorf("allocate service ports: %w", err)
-		}
-		spec, err := m.appDefToContainerSpec(def, endpoints, layout, appInst.InstanceID, runtime.Credential)
-		if err != nil {
-			m.serviceManager.RemoveApp(appInst.InstanceID)
-			return err
-		}
-
-		// For workspace mode, configure --rootfs and apply image config
-		if mode == ModeWorkspace && mergedPath != "" && workspaceMeta != nil {
-			spec.Rootfs = mergedPath
-			spec.Image = ""
-
-			// Apply image config (env, workdir, user) since Podman doesn't do it in --rootfs mode.
-			spec.Environment = mergeEnvMaps(parseEnvSlice(workspaceMeta.ImageConfig.Env), spec.Environment)
-			spec.WorkingDir = workspaceMeta.ImageConfig.WorkingDir
-			spec.User = workspaceMeta.ImageConfig.User
-
-			if primarySvcInit(def) == "image" {
-				// Image manages its own init — set entrypoint/cmd from image config directly
-				spec.Entrypoint = workspaceMeta.ImageConfig.Entrypoint
-				spec.Command = workspaceMeta.ImageConfig.Cmd
-			} else {
-				originalCmd := workspaceMeta.ImageConfig.BuildOriginalCommand()
-				spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-				spec.Command = originalCmd
-			}
-		}
-
-		cid, err := m.containerManager.CreateContainer(ctx, runtime, spec)
-		if err == nil {
-			if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
-				_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
-				m.serviceManager.RemoveApp(appInst.InstanceID)
-				return fmt.Errorf("failed to start container: %w", err)
-			}
-			appInst.SetPrimaryContainerID(cid)
-			_ = state.UpdateAppRuntime(appInst.InstanceID, cid)
-			m.setObservedStatus(appInst.InstanceID, StatusRunning)
-			m.serviceManager.SetAppContainerID(appInst.InstanceID, cid)
-			return nil
-		}
-
-		var nameErr *container.NameInUseError
-		if errors.As(err, &nameErr) {
-			log.Printf("INFO: recreate app %s: adopted existing container %s", appInst.InstanceID, nameErr.ID)
-			// Discard speculative port allocation; ensureServicesForRunningApp will restore actual ports.
-			m.serviceManager.RemoveApp(appInst.InstanceID)
-			appInst.SetPrimaryContainerID(nameErr.ID)
-			_ = state.UpdateAppRuntime(appInst.InstanceID, nameErr.ID)
-			return nil
-		}
-
-		var portErr *container.PortInUseError
-		if errors.As(err, &portErr) {
-			log.Printf("WARN: recreate app %s: host port conflict port=%d attempt=%d", appInst.InstanceID, portErr.Port, attempt)
-			if portErr.Port > 0 {
-				_ = m.serviceManager.ReserveHostPort(portErr.Port)
-			} else {
-				for _, ep := range endpoints {
-					_ = m.serviceManager.ReserveHostPort(ep.HostBind)
-				}
-			}
-			m.serviceManager.RemoveApp(appInst.InstanceID)
-			continue
-		}
-
-		m.serviceManager.RemoveApp(appInst.InstanceID)
-		return err
-	}
-
-	return fmt.Errorf("failed to recreate %s: exhausted host-port retries", appInst.InstanceID)
 }
 
 func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.AppDefinition, instanceID, containerID string, runtime container.PodmanRuntime) error {
@@ -1454,7 +1362,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	if err != nil {
 		// Volume was created but runtime setup failed. Clean up the volume and
 		// any partially-created resources (per-app user, runroot).
-		m.cleanupInstallResources(ctx, instanceID, container.PodmanRuntime{})
+		m.cleanupInstallResources(ctx, instanceID, container.PodmanRuntime{}, appDef)
 		return nil, err
 	}
 
@@ -1463,7 +1371,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	cleanupResources := true
 	defer func() {
 		if cleanupResources {
-			m.cleanupInstallResources(ctx, instanceID, runtime)
+			m.cleanupInstallResources(ctx, instanceID, runtime, appDef)
 		}
 	}()
 
@@ -1482,7 +1390,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	// Unified install path: all apps (service and workspace) use container groups.
 	// Storage preparation (image pull vs workspace disk) is handled inside installContainerGroup.
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseCreatingContainer, 60, "Creating containers", false, nil)
-	app, err := m.installContainerGroup(ctx, appDef, instanceID, layout, runtime, endpoints)
+	app, err := m.installContainerGroup(ctx, appDef, instanceID, layout, runtime, endpoints, nil)
 	if err != nil {
 		var portErr *container.PortInUseError
 		if errors.As(err, &portErr) {
@@ -1499,6 +1407,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 			}
 			return m.installWithRetries(ctx, state, appDef, instanceID, attempt+1)
 		}
+		log.Printf("ERROR: install %s: %v", instanceID, err)
 		return nil, err // cleanupResources runs via defer
 	}
 
@@ -1513,11 +1422,9 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 			_ = m.containerManager.StopContainer(ctx, runtime, cid)
 			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
 		}
-		// Cleanup workspace disk if applicable
+		// Cleanup rootfs.
 		mode := piccoloModeFromExtensions(appDef.Extensions)
-		if mode == ModeWorkspace {
-			_ = m.unmountWorkspaceDisk(ctx, instanceID, layout)
-		}
+		m.detachAllServiceRootfs(ctx, instanceID, mode, appDef, nil)
 		m.serviceManager.RemoveApp(instanceID)
 		cleanupServices = false
 		// cleanupResources runs via defer: destroys volume, runroot, per-app user
@@ -1540,8 +1447,13 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 // cleanupInstallResources performs best-effort cleanup of resources created during
 // a failed install. This mirrors the cleanup sequence in uninstallLocked to prevent
 // orphaned volumes, podman state, and per-app users from leaking on install failure.
-func (m *AppManager) cleanupInstallResources(ctx context.Context, instanceID string, runtime container.PodmanRuntime) {
+func (m *AppManager) cleanupInstallResources(ctx context.Context, instanceID string, runtime container.PodmanRuntime, appDef *api.AppDefinition) {
 	log.Printf("INFO: cleaning up resources for failed install: %s", instanceID)
+
+	// Destroy block-native rootfs if it was partially created.
+	// Best-effort: detach + destroy + GC before cleaning up the data volume.
+	m.destroyAllServiceRootfs(ctx, instanceID, ModeService, appDef)
+	m.destroyAllServiceRootfs(ctx, instanceID, ModeWorkspace, nil)
 
 	// Reset podman storage before destroying the volume (which unmounts the
 	// encrypted backing store where podman metadata lives).
@@ -1571,7 +1483,7 @@ func (m *AppManager) cleanupInstallResources(ctx context.Context, instanceID str
 	// Remove per-app service root (graphroot on data partition).
 	serviceRoot := runtime.Root
 	if serviceRoot == "" {
-		serviceRoot = paths.DataJoin("node", "podman", "apps", instanceID)
+		serviceRoot = paths.PodmanJoin("apps", instanceID)
 	}
 	if err := os.RemoveAll(serviceRoot); err != nil {
 		log.Printf("WARN: install cleanup %s: remove service root: %v", instanceID, err)
@@ -1588,6 +1500,250 @@ func (m *AppManager) cleanupInstallResources(ctx context.Context, instanceID str
 // This method now always creates a new instance (no update behavior).
 func (m *AppManager) Upsert(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
 	return m.Install(ctx, appDef)
+}
+
+// CloneWorkspace creates a clone of an existing workspace app.
+// The clone is a fully independent AppInstance with its own containers, volumes, and per-app user.
+// The origin must be a workspace-mode app and must be stopped.
+// After cloning, both origin and clone are (re-)started automatically.
+func (m *AppManager) CloneWorkspace(ctx context.Context, originID, cloneID string) (*AppInstance, error) {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	return m.cloneWorkspaceLocked(ctx, originID, cloneID)
+}
+
+func (m *AppManager) cloneWorkspaceLocked(ctx context.Context, originID, cloneID string) (*AppInstance, error) {
+	if err := m.ensureUnlocked(); err != nil {
+		return nil, err
+	}
+	if err := m.ensureKernelLeader(); err != nil {
+		return nil, err
+	}
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate origin exists.
+	_, exists := state.GetApp(originID)
+	if !exists {
+		return nil, fmt.Errorf("clone %s from %s: origin not found", cloneID, originID)
+	}
+	originDef, err := state.GetAppDefinition(originID)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: load origin definition: %w", cloneID, originID, err)
+	}
+
+	// Validate origin is workspace mode.
+	mode := piccoloModeFromExtensions(originDef.Extensions)
+	if mode != ModeWorkspace {
+		return nil, fmt.Errorf("clone %s from %s: not a workspace app", cloneID, originID)
+	}
+
+	// Validate origin is stopped.
+	observed := m.getObservedStatus(originID)
+	if observed == StatusRunning || observed == StatusStarting {
+		return nil, fmt.Errorf("clone %s from %s: origin must be stopped", cloneID, originID)
+	}
+
+	// Validate clone name.
+	if err := ValidateInstanceID(cloneID); err != nil {
+		return nil, fmt.Errorf("clone %s from %s: invalid name: %w", cloneID, originID, err)
+	}
+	existingIDs := state.ListInstanceIDs()
+	if err := ValidatePrimaryNameAvailable(cloneID, existingIDs); err != nil {
+		return nil, fmt.Errorf("clone %s from %s: %w", cloneID, originID, err)
+	}
+
+	// Set up clone's volume layout and per-app user.
+	layout, err := m.ensureAppVolumeLayout(ctx, cloneID)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: volume layout: %w", cloneID, originID, err)
+	}
+	runtime, err := m.podmanRuntimeForApp(cloneID, layout, ModeWorkspace)
+	if err != nil {
+		m.cleanupInstallResources(ctx, cloneID, container.PodmanRuntime{}, originDef)
+		return nil, fmt.Errorf("clone %s from %s: podman runtime: %w", cloneID, originID, err)
+	}
+
+	// Deferred cleanup: resources, rootfs, services, and containers are cleaned
+	// up on failure. Each flag is cleared as ownership transfers to the next step.
+	cleanupResources := true
+	cleanupRootfs := false
+	cleanupServices := false
+	var rootfsVolumeID string
+	defer func() {
+		if cleanupServices {
+			m.serviceManager.RemoveApp(cloneID)
+		}
+		if cleanupRootfs {
+			rootfsMgr := m.currentRootfsManager()
+			if rootfsMgr != nil {
+				rootfsMgr.DetachRootfs(ctx, rootfsVolumeID)
+				rootfsMgr.DestroyRootfs(ctx, rootfsVolumeID)
+			}
+		}
+		if cleanupResources {
+			m.cleanupInstallResources(ctx, cloneID, runtime, originDef)
+		}
+	}()
+
+	// Build IDMap config from clone's per-app user.
+	var idmapPtr *persistence.IDMapConfig
+	if runtime.Credential != nil {
+		idmap := persistence.IDMapConfig{
+			AppUID: runtime.Credential.Uid,
+			AppGID: runtime.Credential.Gid,
+		}
+		username := container.AppUsername(cloneID)
+		if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
+			idmap.SubUIDStart = subStart
+			idmap.SubUIDCount = subCount
+			idmap.SubGIDStart = subStart
+			idmap.SubGIDCount = subCount
+		} else {
+			log.Printf("WARN: clone %s: subuid lookup failed for %s: %v", cloneID, username, lookupErr)
+		}
+		idmapPtr = &idmap
+	}
+
+	// Clone rootfs: thin LV snapshot with clone's IDMap.
+	rootfsMgr := m.currentRootfsManager()
+	if rootfsMgr == nil {
+		return nil, fmt.Errorf("clone %s from %s: rootfs manager not available", cloneID, originID)
+	}
+
+	handle, err := rootfsMgr.CloneWorkspace(ctx, originID, cloneID, idmapPtr)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: snapshot: %w", cloneID, originID, err)
+	}
+	rootfsVolumeID = handle.VolumeID
+	cleanupRootfs = true
+
+	// Read golden image config from clone's rootfs.
+	goldenID := handle.GoldenLV
+	imgConfig, err := rootfsMgr.ReadGoldenImageConfig(ctx, goldenID)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: read golden image config: %w", cloneID, originID, err)
+	}
+
+	// Deep-copy the origin AppDefinition for the clone.
+	defJSON, err := json.Marshal(originDef)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: marshal definition: %w", cloneID, originID, err)
+	}
+	var cloneDef api.AppDefinition
+	if err := json.Unmarshal(defJSON, &cloneDef); err != nil {
+		return nil, fmt.Errorf("clone %s from %s: unmarshal definition: %w", cloneID, originID, err)
+	}
+
+	// Update clone definition: workspace_name and primary listener name.
+	cloneDef.WorkspaceName = cloneID
+	for i := range cloneDef.Listeners {
+		if cloneDef.Listeners[i].Primary {
+			cloneDef.Listeners[i].Name = cloneID
+			break
+		}
+	}
+
+	// Build prebuiltRootfs map for installContainerGroup.
+	primary := primaryServiceFor(&cloneDef, nil)
+	prebuiltRootfs := map[string]*rootfsMountInfo{
+		primary: {
+			handle:    handle,
+			imgConfig: imgConfig,
+		},
+	}
+
+	// Allocate services for the clone.
+	endpoints, err := m.serviceManager.AllocateForApp(cloneID, cloneDef.Listeners)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: allocate ports: %w", cloneID, originID, err)
+	}
+	cleanupServices = true
+
+	// Install the clone's container group with prebuilt rootfs.
+	cloneInst, err := m.installContainerGroup(ctx, &cloneDef, cloneID, layout, runtime, endpoints, prebuiltRootfs)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: install containers: %w", cloneID, originID, err)
+	}
+
+	// Set clone provenance.
+	cloneInst.ClonedFrom = originID
+
+	// Persist clone state.
+	if err := state.StoreApp(cloneInst); err != nil {
+		// Cleanup containers created by installContainerGroup.
+		if cloneInst.NetworkAnchorID != "" {
+			_ = m.containerManager.StopContainer(ctx, runtime, cloneInst.NetworkAnchorID)
+			_ = m.containerManager.RemoveContainer(ctx, runtime, cloneInst.NetworkAnchorID)
+		}
+		for _, cid := range cloneInst.Containers {
+			_ = m.containerManager.StopContainer(ctx, runtime, cid)
+			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
+		}
+		return nil, fmt.Errorf("clone %s from %s: persist state: %w", cloneID, originID, err)
+	}
+
+	// Success — disable deferred cleanup.
+	cleanupResources = false
+	cleanupRootfs = false
+	cleanupServices = false
+
+	// Set clone status to running.
+	m.observedStatusMu.Lock()
+	m.observedStatus[cloneID] = StatusRunning
+	m.observedStatusMessage[cloneID] = ""
+	m.observedStatusMu.Unlock()
+	cloneInst.Status = StatusRunning
+	m.publishAppStatusChanged(cloneID, "installed", "", "")
+
+	// Restart origin (best-effort).
+	if restartErr := m.startLocked(ctx, originID); restartErr != nil {
+		log.Printf("WARN: clone %s: failed to restart origin %s: %v", cloneID, originID, restartErr)
+	}
+
+	return cloneInst, nil
+}
+
+// ListWorkspaceClones returns all apps that were cloned from the given origin.
+func (m *AppManager) ListWorkspaceClones(ctx context.Context, originID string) ([]*AppInstance, error) {
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate origin exists.
+	if _, exists := state.GetApp(originID); !exists {
+		return nil, fmt.Errorf("app instance not found: %s", originID)
+	}
+
+	rootfsMgr := m.currentRootfsManager()
+	if rootfsMgr == nil {
+		return nil, nil
+	}
+	originVolumeID := "ws-" + originID
+	cloneVolumeIDs, err := rootfsMgr.ListClones(ctx, originVolumeID)
+	if err != nil {
+		return nil, fmt.Errorf("list clones for %s: %w", originID, err)
+	}
+
+	var clones []*AppInstance
+	for _, volID := range cloneVolumeIDs {
+		// Strip "ws-" prefix to get instanceID.
+		instanceID := strings.TrimPrefix(volID, "ws-")
+		cached, exists := state.GetApp(instanceID)
+		if !exists {
+			continue
+		}
+		clone := *cached
+		clone.Status, clone.StatusMessage = m.getObservedStatusAndMessage(instanceID)
+		if clone.Status == "" {
+			clone.Status = StatusStopped
+		}
+		clones = append(clones, &clone)
+	}
+	return clones, nil
 }
 
 // List returns all installed applications.
@@ -1881,10 +2037,9 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 		return err
 	}
 
-	// Prune orphaned images from the shared imagestore.
-	// Both service and workspace images share the same imagestore,
-	// so pruning runs for all app types.
-	m.pruneOrphanedImages(ctx, state, def, instanceID)
+	// Destroy block-native rootfs if applicable (before volume destroy).
+	mode := piccoloModeFromExtensions(def.Extensions)
+	m.destroyAllServiceRootfs(ctx, instanceID, mode, def)
 
 	// Reset podman storage BEFORE unmounting the volume.
 	// This allows podman to properly clean its metadata files (db.sql, locks, etc.)
@@ -1927,71 +2082,6 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 	return nil
 }
 
-// collectReferencedImages returns the set of images still referenced by installed
-// apps, excluding the app being uninstalled. Always includes the network anchor
-// image. All app types are considered because both service and workspace images
-// share the same imagestore.
-func (m *AppManager) collectReferencedImages(state *FilesystemStateManager, excludeInstanceID string) map[string]bool {
-	referenced := map[string]bool{
-		networkAnchorImage(): true,
-	}
-	for _, app := range state.ListApps() {
-		if app.InstanceID == excludeInstanceID {
-			continue
-		}
-		def, err := state.GetAppDefinition(app.InstanceID)
-		if err != nil {
-			// Cannot determine what images this app references — abort all pruning
-			// to avoid accidentally removing images that may still be in use.
-			log.Printf("WARN: image prune: cannot read definition for %s, aborting prune: %v", app.InstanceID, err)
-			return nil
-		}
-		if def.Services == nil {
-			continue
-		}
-		for _, svc := range def.Services {
-			if svc.Image != "" {
-				referenced[svc.Image] = true
-			}
-		}
-	}
-	return referenced
-}
-
-// pruneOrphanedImages removes images from the shared imagestore that are no longer
-// referenced by any installed app. Best-effort: failures are logged but never fatal
-// to uninstall.
-func (m *AppManager) pruneOrphanedImages(ctx context.Context, state *FilesystemStateManager, def *api.AppDefinition, excludeInstanceID string) {
-	if def == nil || def.Services == nil {
-		return
-	}
-
-	imageRuntime, err := m.podmanImageRuntime()
-	if err != nil {
-		log.Printf("WARN: image prune: cannot get image runtime: %v", err)
-		return
-	}
-
-	referenced := m.collectReferencedImages(state, excludeInstanceID)
-	if referenced == nil {
-		return // Aborted due to unreadable app definitions
-	}
-
-	for svcName, svc := range def.Services {
-		if svc.Image == "" {
-			continue
-		}
-		if referenced[svc.Image] {
-			continue
-		}
-		if err := m.containerManager.RemoveImage(ctx, imageRuntime, svc.Image); err != nil {
-			log.Printf("WARN: image prune: failed to remove %s (service %s): %v", svc.Image, svcName, err)
-		} else {
-			log.Printf("INFO: image prune: removed orphaned image %s (service %s)", svc.Image, svcName)
-		}
-	}
-}
-
 // UpdateImage updates an app instance's container image tag and recreates the container preserving services.
 func (m *AppManager) UpdateImage(ctx context.Context, instanceID string, tag *string) error {
 	m.reconcileMu.Lock()
@@ -2027,95 +2117,682 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	if err != nil {
 		return fmt.Errorf("failed to read current app.yaml: %w", err)
 	}
-	if piccoloModeFromExtensions(curDef.Extensions) == ModeService {
-		return fmt.Errorf("cannot update image for service-mode apps; update per-service images in the manifest and reinstall")
-	}
 
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(curDef.Extensions))
-	if err != nil {
-		return err
-	}
-
-	// Workspace mode apps cannot have their image updated because the workspace disk
-	// overlay is the persistence mechanism. Changing the base image would require
-	// "rebasing" the overlay which is complex and out of scope (see RFC non-goals).
-	// Users who want a new base image should uninstall and reinstall the workspace.
 	mode := piccoloModeFromExtensions(curDef.Extensions)
 	if mode == ModeWorkspace {
 		return fmt.Errorf("cannot update image for workspace apps: workspace persistence is tied to the base image; uninstall and reinstall to use a different base image")
 	}
 
-	// Compute new image
-	newImage := curDef.Image
-	if tag != nil {
-		// Replace tag portion if present, or append
-		img := curDef.Image
-		// Split on ':' but be careful with registry includes ':'
-		// Strategy: if '@' digest present, ignore; else change last ':' segment after last '/'
-		if i := strings.LastIndex(img, "/"); i >= 0 {
-			repo := img[:i+1]
-			rest := img[i+1:]
-			if j := strings.LastIndex(rest, ":"); j >= 0 {
-				newImage = repo + rest[:j] + ":" + *tag
-			} else {
-				newImage = repo + rest + ":" + *tag
-			}
-		} else {
-			if j := strings.LastIndex(img, ":"); j >= 0 {
-				newImage = img[:j] + ":" + *tag
-			} else {
-				newImage = img + ":" + *tag
-			}
+	// Determine the primary service for image reference.
+	primary := primaryServiceFor(curDef, appInst)
+
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	if err != nil {
+		return err
+	}
+
+	// Compute new image — for service-mode, derive from service image (not top-level).
+	var baseImage string
+	if mode == ModeService && primary != "" {
+		if svc, ok := curDef.Services[primary]; ok && svc.Image != "" {
+			baseImage = svc.Image
 		}
 	}
-	// Prepare new def
+	if baseImage == "" {
+		baseImage = curDef.Image
+	}
+
+	newImage := baseImage
+	if tag != nil {
+		newImage = replaceImageTag(baseImage, *tag)
+	}
+
+	// Prepare new definition (deep-copy Services map to avoid mutating curDef).
 	newDef := *curDef
-	newDef.Image = newImage
-	// Backup current YAML and validate new
+	if curDef.Services != nil {
+		newDef.Services = make(map[string]api.AppService, len(curDef.Services))
+		for k, v := range curDef.Services {
+			newDef.Services[k] = v
+		}
+	}
+	if mode == ModeService && primary != "" {
+		svc := newDef.Services[primary]
+		svc.Image = newImage
+		newDef.Services[primary] = svc
+	} else {
+		newDef.Image = newImage
+	}
+
 	if err := ValidateAppDefinition(&newDef); err != nil {
 		return fmt.Errorf("invalid new app definition: %w", err)
 	}
 	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
 		return fmt.Errorf("backup app.yaml: %w", err)
 	}
-	// Pull image using shared image runtime (per-app users have read-only imagestore access).
-	// Mandatory: per-app runtimes use --pull=never (FUSE storage can't extract layers).
-	if err := m.pullToImagestore(ctx, newImage, nil); err != nil {
-		return fmt.Errorf("pull image %s: %w", newImage, err)
+
+	// Service-mode: transactional rootfs update (RFC 20260302).
+	// Image pull happens inside EnsureGoldenLV via flattenFn/imageSizeFn (ephemeral runtime).
+	if mode == ModeService {
+		updatedImages := map[string]string{primary: newImage}
+		return m.updateServiceModeImage(ctx, state, appInst, &newDef, layout, runtime, updatedImages)
 	}
-	// Preserve endpoints
+
+	// Workspace mode is rejected above; service mode dispatches to updateServiceModeImage.
+	// No other modes exist in block-native.
+	return fmt.Errorf("image update not supported for mode %q", mode)
+}
+
+// replaceImageTag replaces the tag portion of an image reference.
+// Handles digest-pinned references (e.g. "image@sha256:abc") by stripping the digest.
+func replaceImageTag(img, newTag string) string {
+	// Strip digest suffix if present (e.g. "nginx@sha256:abc123..." → "nginx").
+	if at := strings.Index(img, "@"); at >= 0 {
+		img = img[:at]
+	}
+	if i := strings.LastIndex(img, "/"); i >= 0 {
+		repo := img[:i+1]
+		rest := img[i+1:]
+		if j := strings.LastIndex(rest, ":"); j >= 0 {
+			return repo + rest[:j] + ":" + newTag
+		}
+		return repo + rest + ":" + newTag
+	}
+	if j := strings.LastIndex(img, ":"); j >= 0 {
+		return img[:j] + ":" + newTag
+	}
+	return img + ":" + newTag
+}
+
+// dataVolumeSnapshotter is a narrow interface for data volume snapshot operations.
+// Satisfied by luksVolumeManager via type assertion on m.volumeManager.
+type dataVolumeSnapshotter interface {
+	SnapshotDataVolume(ctx context.Context, instanceID, snapshotLVName string) error
+	DestroyDataSnapshot(ctx context.Context, snapshotLVName string) error
+}
+
+// dataVolumeRollbacker is a narrow interface for data volume rollback operations.
+// Satisfied by luksVolumeManager via type assertion on m.volumeManager.
+type dataVolumeRollbacker interface {
+	// RollbackDataVolume performs a LUKS-aware LV rename swap with full detach/attach cycle.
+	// Returns (renamesCommitted, snapshotPromoted, error):
+	//   (false, false, err) — failed before LV renames, no LV state change
+	//   (true, false, err)  — active→failed rename committed, but snapshot→active failed
+	//   (true, true, nil)   — fully succeeded (both renames + re-attach)
+	//   (true, true, err)   — both renames committed but re-attach failed
+	RollbackDataVolume(ctx context.Context, instanceID string, snapshotLVName, failedLVName string) (renamesCommitted, snapshotPromoted bool, err error)
+}
+
+// updateServiceModeImage performs a transactional rootfs update for service-mode apps (RFC 20260302).
+// Handles multi-container apps: changed services get new rootfs, unchanged services reuse existing.
+// All containers (including anchor) are stopped, snapshotted, removed, and recreated.
+func (m *AppManager) updateServiceModeImage(
+	ctx context.Context,
+	state *FilesystemStateManager,
+	appInst *AppInstance,
+	newDef *api.AppDefinition,
+	layout appVolumeLayout,
+	runtime container.PodmanRuntime,
+	updatedImages map[string]string, // svcName → newImage (only changed services)
+) error {
+	instanceID := appInst.InstanceID
+	curDef := appInst.Definition
+	primary := primaryServiceFor(newDef, appInst)
+	mode := piccoloModeFromExtensions(newDef.Extensions)
+
+	rootfs := m.currentRootfsManager()
+	if rootfs == nil {
+		return fmt.Errorf("rootfs volume manager not configured")
+	}
+
+	// Create ephemeral runtime for image pull + inspect (digest derivation).
+	ephRT, ephCleanup, ephErr := newEphemeralFlattenRuntime(m.runtimeUser)
+	if ephErr != nil {
+		return fmt.Errorf("create ephemeral runtime: %w", ephErr)
+	}
+	defer ephCleanup()
+
+	// 1. For each changed service: pull + inspect image → get digest → compute versioned volume ID.
+	type changedService struct {
+		svcName       string
+		newImage      string
+		digest        string
+		volumeID      string
+		imageSizeHint int64
+		handle        persistence.RootfsHandle
+		imgConfig     persistence.GoldenImageConfig
+	}
+	changed := make([]changedService, 0, len(updatedImages))
+	for svcName, newImage := range updatedImages {
+		if pullErr := m.containerManager.PullImage(ctx, ephRT, newImage); pullErr != nil {
+			return fmt.Errorf("pull image %s (service %s): %w", newImage, svcName, pullErr)
+		}
+		imgConfig, inspErr := m.containerManager.InspectImage(ctx, ephRT, newImage)
+		if inspErr != nil {
+			return fmt.Errorf("inspect image %s (service %s): %w", newImage, svcName, inspErr)
+		}
+		digest := ""
+		if len(imgConfig.RepoDigests) > 0 {
+			digest = imgConfig.RepoDigests[0]
+		} else {
+			digest = imgConfig.Digest
+		}
+		shortDigest := persistence.ShortDigest(digest)
+		volID := persistence.VersionedServiceRootfsVolumeID(instanceID, svcName, shortDigest)
+		changed = append(changed, changedService{
+			svcName:       svcName,
+			newImage:      newImage,
+			digest:        digest,
+			volumeID:      volID,
+			imageSizeHint: imgConfig.Size,
+		})
+	}
+
+	// 2. Build IDMap config (once, shared across all services).
+	var idmap persistence.IDMapConfig
+	if runtime.Credential != nil {
+		idmap = persistence.IDMapConfig{
+			AppUID: runtime.Credential.Uid,
+			AppGID: runtime.Credential.Gid,
+		}
+		username := container.AppUsername(instanceID)
+		if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
+			idmap.SubUIDStart = subStart
+			idmap.SubUIDCount = subCount
+			idmap.SubGIDStart = subStart
+			idmap.SubGIDCount = subCount
+		} else {
+			log.Printf("WARN: update %s: subuid lookup failed for %s: %v", instanceID, username, lookupErr)
+		}
+	}
+
+	// 3. For each changed service: create new rootfs (idempotent, while still running).
+	var err error
+	for i := range changed {
+		cs := &changed[i]
+		if rootfs.RootfsExists(cs.volumeID) {
+			log.Printf("INFO: update %s: rootfs %s already exists, attaching", instanceID, cs.volumeID)
+			cs.handle, err = rootfs.AttachRootfs(ctx, cs.volumeID)
+			if err != nil {
+				return fmt.Errorf("attach existing rootfs %s: %w", cs.volumeID, err)
+			}
+		} else {
+			cs.handle, err = rootfs.CreateServiceRootfs(ctx, persistence.ServiceRootfsRequest{
+				InstanceID:    instanceID,
+				ServiceName:   cs.svcName,
+				ImageDigest:   cs.digest,
+				ImageRef:      cs.newImage,
+				IDMap:         idmap,
+				VolumeID:      cs.volumeID,
+				ImageSizeHint: cs.imageSizeHint,
+				PrePulledDir:  filepath.Dir(ephRT.Root),
+			})
+			if err != nil {
+				return fmt.Errorf("create rootfs for service %s: %w", cs.svcName, err)
+			}
+		}
+	}
+
+	// 4. Read image config from golden LV for each changed service.
+	for i := range changed {
+		cs := &changed[i]
+		goldenCfg, cfgErr := m.readImageConfigForRootfs(ctx, rootfs, cs.digest)
+		if cfgErr != nil {
+			log.Printf("WARN: update %s: failed to read image config for %s: %v", instanceID, cs.svcName, cfgErr)
+		} else {
+			cs.imgConfig = goldenCfg
+		}
+	}
+
+	// 5. Stop ALL containers (services in reverse dep order, then anchor).
+	if err := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
+		log.Printf("WARN: update %s: stop containers: %v", instanceID, err)
+	}
+
+	// 6. Tuple snapshot: capture pre-update state for rollback.
+	tupleState, snapshotOK := m.snapshotTupleBeforeUpdate(ctx, state, appInst, primary)
+	if !snapshotOK {
+		log.Printf("WARN: update %s: proceeding without rollback capability", instanceID)
+	}
+
+	// 7. Remove ALL containers (services + anchor).
+	if err := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
+		log.Printf("WARN: update %s: remove containers: %v", instanceID, err)
+	}
+
+	// 8. Recreate ALL containers (anchor + services in start order).
+	// Build rootfs map: changed services use new rootfs, unchanged use existing.
+	changedMap := make(map[string]*rootfsMountInfo, len(changed))
+	for i := range changed {
+		cs := &changed[i]
+		changedMap[cs.svcName] = &rootfsMountInfo{handle: cs.handle, imgConfig: cs.imgConfig}
+	}
+
+	// Attach unchanged service rootfs volumes.
+	unchangedRootfs, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, newDef, appInst)
+	if err != nil {
+		// Unchanged rootfs attach failed — abort to prevent metadata/rootfs mismatch.
+		// Detach new rootfs volumes; reconciler handles recovery using old definition.
+		for _, cs := range changed {
+			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
+		}
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("update %s: attach unchanged rootfs: %w", instanceID, err)
+	}
+
+	// Merge: changed services override unchanged.
+	prebuiltRootfs := make(map[string]*rootfsMountInfo, len(newDef.Services))
+	for svcName, info := range unchangedRootfs {
+		prebuiltRootfs[svcName] = info
+	}
+	for svcName, info := range changedMap {
+		prebuiltRootfs[svcName] = info
+	}
+
+	// Get current service endpoints (ports should not change during update).
 	endpoints, _ := m.serviceManager.GetByApp(instanceID)
-	// Stop and remove old container
-	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
-	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
-	// Create new container with same endpoints
-	spec, err := m.appDefToContainerSpec(&newDef, endpoints, layout, instanceID, runtime.Credential)
+	if len(endpoints) == 0 {
+		// Fallback: if service registry lost (e.g., error escalation), allocate fresh endpoints.
+		var allocErr error
+		endpoints, allocErr = m.serviceManager.AllocateForApp(instanceID, newDef.Listeners)
+		if allocErr != nil {
+			return fmt.Errorf("update %s: allocate endpoints: %w", instanceID, allocErr)
+		}
+	}
+	result, err := m.installContainerGroup(ctx, newDef, instanceID, layout, runtime, endpoints, prebuiltRootfs)
 	if err != nil {
-		return fmt.Errorf("build container spec: %w", err)
+		// Detach new rootfs volumes, leave old ones for recovery.
+		for _, cs := range changed {
+			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
+		}
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("recreate containers after update: %w", err)
 	}
-	newCID, err := m.containerManager.CreateContainer(ctx, runtime, spec)
-	if err != nil {
-		return fmt.Errorf("create container: %w", err)
+
+	// 9. Update state: ActiveRootfs for changed services, definition, container IDs.
+	if appInst.ActiveRootfs == nil {
+		appInst.ActiveRootfs = make(map[string]string)
 	}
-	if m.serviceManager != nil {
-		m.serviceManager.SetAppContainerID(instanceID, newCID)
+	for _, cs := range changed {
+		appInst.ActiveRootfs[cs.svcName] = cs.volumeID
 	}
-	startErr := m.containerManager.StartContainer(ctx, runtime, newCID)
-	// Update instance with new definition and persist
-	appInst.Definition = &newDef
-	appInst.SetPrimaryContainerID(newCID)
+	appInst.Definition = newDef
+	appInst.PrimaryService = result.PrimaryService
+	appInst.NetworkAnchorID = result.NetworkAnchorID
+	appInst.Containers = result.Containers
 	appInst.UpdatedAt = time.Now()
-	// Must use StoreApp to persist the updated Definition (app.yaml with new image)
 	if err := state.StoreApp(appInst); err != nil {
-		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
-		_ = m.containerManager.RemoveContainer(ctx, runtime, newCID)
+		// Best-effort cleanup: remove containers created by installContainerGroup
+		// to prevent unmanaged containers running with stale on-disk metadata.
+		if rmErr := m.removeContainersForMultiApp(ctx, result, newDef, runtime); rmErr != nil {
+			log.Printf("WARN: update %s: cleanup after persist failure: %v", instanceID, rmErr)
+		}
+		for _, cs := range changed {
+			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
+		}
+		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("store app: %w", err)
 	}
-	if startErr != nil {
-		m.setObservedStatus(instanceID, StatusError)
-		return fmt.Errorf("start container: %w", startErr)
+
+	// 10. Post-update: record new active generation (only when snapshot exists for rollback).
+	if tupleState != nil && snapshotOK {
+		m.recordPostUpdateGeneration(state, appInst, tupleState)
 	}
+
 	m.setObservedStatus(instanceID, StatusRunning)
+	log.Printf("INFO: update %s: image updated for %d service(s)", instanceID, len(changed))
+	return nil
+}
+
+// snapshotTupleBeforeUpdate captures pre-update state for rollback (RFC 20260302 Phase 2).
+// Returns the TupleState and whether the snapshot was successfully created.
+// On failure, the update proceeds in degraded mode (no rollback capability).
+func (m *AppManager) snapshotTupleBeforeUpdate(
+	ctx context.Context, state *FilesystemStateManager,
+	appInst *AppInstance, primary string,
+) (tupleState *TupleState, snapshotOK bool) {
+	instanceID := appInst.InstanceID
+
+	// Load or create TupleState.
+	ts, err := state.LoadTupleState(instanceID)
+	if err != nil {
+		log.Printf("WARN: update %s: load tuple state: %v", instanceID, err)
+		return nil, false
+	}
+	if ts == nil {
+		ts = &TupleState{
+			InstanceID:    instanceID,
+			NextGenNumber: 1,
+		}
+	}
+
+	// Always create a fresh snapshot — even if a previous snapshot exists for the same rootfs state.
+	// The data volume may have accumulated writes since the last snapshot, so reusing an old one
+	// would lose data on rollback (e.g., update retry after partial failure).
+
+	// Allocate generation ID.
+	genID := ts.AllocateGenerationID()
+	// Extract generation number from ID for LV naming.
+	genNumber := ts.NextGenNumber - 1
+
+	// Capture current rootfs state.
+	rootfsVolIDs := make(map[string]string)
+	if appInst.ActiveRootfs != nil {
+		for k, v := range appInst.ActiveRootfs {
+			rootfsVolIDs[k] = v
+		}
+	} else if primary != "" {
+		// Legacy fallback.
+		rootfsVolIDs[primary] = persistence.ServiceRootfsVolumeID(instanceID, primary)
+	}
+
+	// Snapshot data volume.
+	snapshotLVName := DataSnapshotLVName(instanceID, genNumber)
+	dataSnapshotName := ""
+	if snapshotter, ok := m.currentVolumeManager().(dataVolumeSnapshotter); ok {
+		if snapErr := snapshotter.SnapshotDataVolume(ctx, instanceID, snapshotLVName); snapErr != nil {
+			log.Printf("WARN: update %s: data snapshot failed: %v", instanceID, snapErr)
+		} else {
+			dataSnapshotName = snapshotLVName
+			snapshotOK = true
+			log.Printf("INFO: update %s: data snapshot created: %s", instanceID, snapshotLVName)
+		}
+	} else {
+		log.Printf("WARN: update %s: volume manager does not support snapshots", instanceID)
+	}
+
+	// Only create a rollback-capable snapshot generation if the data snapshot succeeded.
+	// Without a data snapshot, rootfs-only rollback would run old rootfs against new data.
+	if dataSnapshotName == "" {
+		log.Printf("WARN: update %s: no data snapshot — update proceeds without rollback capability", instanceID)
+		return ts, false
+	}
+
+	// Deprecate existing active and snapshot generations.
+	// Only the new snapshot (with data snapshot LV) is a valid rollback target.
+	now := time.Now()
+	for i := range ts.Generations {
+		g := &ts.Generations[i]
+		if g.Status == TupleStatusActive || g.Status == TupleStatusSnapshot {
+			g.Status = TupleStatusDeprecated
+			g.DeprecatedAt = &now
+		}
+	}
+
+	// Append new snapshot generation.
+	ts.Generations = append(ts.Generations, TupleGeneration{
+		ID:           genID,
+		RootfsVolIDs: rootfsVolIDs,
+		DataSnapshot: dataSnapshotName,
+		CreatedAt:    time.Now(),
+		Status:       TupleStatusSnapshot,
+	})
+
+	// Persist.
+	if storeErr := state.StoreTupleState(instanceID, ts); storeErr != nil {
+		log.Printf("WARN: update %s: persist tuple state: %v", instanceID, storeErr)
+		// Clean up the orphaned snapshot LV since it won't be tracked in metadata.
+		if dataSnapshotName != "" {
+			if cleanupSnap, ok := m.currentVolumeManager().(dataVolumeSnapshotter); ok {
+				if destroyErr := cleanupSnap.DestroyDataSnapshot(ctx, dataSnapshotName); destroyErr != nil {
+					log.Printf("WARN: update %s: cleanup orphaned snapshot %s: %v", instanceID, dataSnapshotName, destroyErr)
+				}
+			}
+		}
+		snapshotOK = false
+	}
+
+	return ts, snapshotOK
+}
+
+// recordPostUpdateGeneration records the new active generation after a successful update.
+func (m *AppManager) recordPostUpdateGeneration(state *FilesystemStateManager, appInst *AppInstance, ts *TupleState) {
+	genID := ts.AllocateGenerationID()
+
+	rootfsVolIDs := make(map[string]string)
+	if appInst.ActiveRootfs != nil {
+		for k, v := range appInst.ActiveRootfs {
+			rootfsVolIDs[k] = v
+		}
+	}
+
+	ts.Generations = append(ts.Generations, TupleGeneration{
+		ID:           genID,
+		RootfsVolIDs: rootfsVolIDs,
+		CreatedAt:    time.Now(),
+		Status:       TupleStatusActive,
+	})
+	ts.CurrentGeneration = genID
+
+	if err := state.StoreTupleState(appInst.InstanceID, ts); err != nil {
+		log.Printf("WARN: update %s: persist post-update generation: %v", appInst.InstanceID, err)
+	}
+}
+
+// mapsEqual compares two string maps for equality.
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// RollbackToSnapshot rolls back an app to its latest snapshot generation (RFC 20260302 Phase 3).
+// This is the exported entry point — acquires reconcileMu.
+func (m *AppManager) RollbackToSnapshot(ctx context.Context, instanceID string) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+
+	if err := m.ensureUnlocked(); err != nil {
+		return err
+	}
+	if err := m.ensureKernelLeader(); err != nil {
+		return err
+	}
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return err
+	}
+	appInst, exists := state.GetApp(instanceID)
+	if !exists {
+		return fmt.Errorf("app instance not found: %s", instanceID)
+	}
+	return m.rollbackToSnapshotLocked(ctx, state, appInst)
+}
+
+// rollbackToSnapshotLocked performs the rollback. Caller holds reconcileMu.
+func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance) error {
+	instanceID := appInst.InstanceID
+
+	ts, err := state.LoadTupleState(instanceID)
+	if err != nil {
+		return fmt.Errorf("load tuple state: %w", err)
+	}
+	if ts == nil {
+		return fmt.Errorf("no tuple state for %s: rollback not available", instanceID)
+	}
+	snap := ts.LatestSnapshot()
+	if snap == nil {
+		return fmt.Errorf("no snapshot available for rollback")
+	}
+
+	curDef, err := state.GetAppDefinition(instanceID)
+	if err != nil {
+		return fmt.Errorf("read app definition: %w", err)
+	}
+	mode := piccoloModeFromExtensions(curDef.Extensions)
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	if err != nil {
+		return err
+	}
+
+	// 1. Stop ALL containers.
+	if err := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
+		log.Printf("WARN: rollback %s: stop containers: %v", instanceID, err)
+	}
+
+	// 2. Rollback data volume if snapshot has one.
+	dataVolumeOK := true
+	snapshotCanPromote := true // false only in partial-rename case
+	if snap.DataSnapshot != "" {
+		rollbacker, ok := m.currentVolumeManager().(dataVolumeRollbacker)
+		if !ok {
+			return fmt.Errorf("volume manager does not support rollback")
+		}
+		// Compute failed LV name from the active generation.
+		activeGen := ts.ActiveGeneration()
+		failedGenNumber := ts.NextGenNumber - 1
+		if activeGen != nil {
+			if n, _ := fmt.Sscanf(activeGen.ID, "gen-%d", &failedGenNumber); n != 1 {
+				log.Printf("WARN: rollback %s: could not parse gen number from %q, using fallback %d",
+					instanceID, activeGen.ID, failedGenNumber)
+			}
+		}
+		failedLVName := FailedDataLVName(instanceID, failedGenNumber)
+
+		renamesCommitted, snapshotPromoted, rollbackErr := rollbacker.RollbackDataVolume(ctx, instanceID, snap.DataSnapshot, failedLVName)
+		if rollbackErr != nil && !renamesCommitted {
+			// Pre-swap failure (detach or rename). No LV state change — safe to abort.
+			// Containers were stopped in step 1 but no LV state changed, so the reconciler
+			// will detect stopped containers and restart them on the next pass.
+			log.Printf("ERROR: rollback %s: data volume rollback failed (no LV change): %v", instanceID, rollbackErr)
+			return fmt.Errorf("data volume rollback: %w", rollbackErr)
+		}
+		if rollbackErr != nil {
+			log.Printf("ERROR: rollback %s: LV rename(s) committed but incomplete: %v", instanceID, rollbackErr)
+			dataVolumeOK = false
+		}
+		if !snapshotPromoted {
+			// Partial rename: active→failed succeeded but snapshot→active failed.
+			// Snapshot LV still exists under its original name — do NOT mark as promoted.
+			snapshotCanPromote = false
+		}
+
+		// Record failed LV name for GC tracking.
+		if renamesCommitted {
+			if activeGen != nil {
+				activeGen.FailedLVName = failedLVName
+			} else {
+				// No active generation (update failed before recordPostUpdateGeneration).
+				// Create a tracking entry so GC can clean the orphaned LV.
+				failedNow := time.Now()
+				ts.Generations = append(ts.Generations, TupleGeneration{
+					ID:           fmt.Sprintf("gen-failed-%d", failedGenNumber),
+					Status:       TupleStatusFailed,
+					FailedLVName: failedLVName,
+					FailedAt:     &failedNow,
+					CreatedAt:    failedNow,
+				})
+			}
+		}
+	}
+
+	// Re-resolve snap pointer — the append above may have reallocated the slice.
+	snap = ts.LatestSnapshot()
+	if snap == nil {
+		// Should not happen — snapshot was validated above. Defensive check.
+		return fmt.Errorf("rollback %s: snapshot generation lost after slice mutation", instanceID)
+	}
+
+	// 3. Update generation statuses EARLY — LV renames are committed at this point
+	// and tuple state must reflect reality even if container creation is skipped.
+	if active := ts.ActiveGeneration(); active != nil {
+		active.Status = TupleStatusFailed
+		failedNow := time.Now()
+		active.FailedAt = &failedNow
+	}
+	if snapshotCanPromote {
+		snap.Status = TupleStatusActive
+		snap.DataSnapshot = "" // promoted — no longer a snapshot LV
+		ts.CurrentGeneration = snap.ID
+	}
+
+	// 4. Swap ActiveRootfs to snapshot generation's rootfs.
+	appInst.ActiveRootfs = make(map[string]string, len(snap.RootfsVolIDs))
+	for k, v := range snap.RootfsVolIDs {
+		appInst.ActiveRootfs[k] = v
+	}
+	appInst.UpdatedAt = time.Now()
+
+	// 5. Persist state BEFORE container creation — ensures metadata matches LV reality
+	// even if subsequent steps fail.
+	if err := state.StoreTupleState(instanceID, ts); err != nil {
+		log.Printf("WARN: rollback %s: persist tuple state: %v", instanceID, err)
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("store app state during rollback: %w", err)
+	}
+
+	// 6. If data volume attach failed, remove old containers and clear container state.
+	// Reconciler will retry mount + container recreation using updated ActiveRootfs.
+	if !dataVolumeOK {
+		if err := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
+			log.Printf("WARN: rollback %s: remove containers after attach failure: %v", instanceID, err)
+		}
+		appInst.NetworkAnchorID = ""
+		appInst.Containers = nil
+		_ = state.StoreAppMetadata(appInst)
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("rollback %s: data volume not mounted (LV renames committed, reconciler will retry)", instanceID)
+	}
+
+	// 7. Capture endpoints for port reuse (keep service registry intact for proxies).
+	endpoints, _ := m.serviceManager.GetByApp(instanceID)
+
+	// 8. Remove ALL containers (but preserve service registry — proxies stay running).
+	if err := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
+		log.Printf("WARN: rollback %s: remove containers: %v", instanceID, err)
+	}
+
+	// If no endpoints exist (e.g., after error escalation), allocate fresh ones.
+	if len(endpoints) == 0 {
+		var allocErr error
+		endpoints, allocErr = m.serviceManager.AllocateForApp(instanceID, curDef.Listeners)
+		if allocErr != nil {
+			return fmt.Errorf("rollback %s: allocate endpoints: %w", instanceID, allocErr)
+		}
+	}
+
+	// 9. Attach snapshot rootfs and recreate containers.
+	rootfs := m.currentRootfsManager()
+	var prebuiltRootfs map[string]*rootfsMountInfo
+	if rootfs != nil {
+		prebuiltRootfs, err = m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, curDef, appInst)
+		if err != nil {
+			// Rootfs attach failed — cannot create containers with correct snapshot rootfs.
+			// State is already persisted and consistent. Reconciler will retry.
+			m.setObservedStatus(instanceID, StatusError)
+			return fmt.Errorf("rollback %s: attach snapshot rootfs: %w", instanceID, err)
+		}
+	}
+	result, err := m.installContainerGroup(ctx, curDef, instanceID, layout, runtime, endpoints, prebuiltRootfs)
+	if err != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("recreate containers after rollback: %w", err)
+	}
+
+	// 10. Update container IDs and persist final state.
+	appInst.NetworkAnchorID = result.NetworkAnchorID
+	appInst.Containers = result.Containers
+	appInst.PrimaryService = result.PrimaryService
+	appInst.UpdatedAt = time.Now()
+
+	if err := state.StoreApp(appInst); err != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("store app after rollback: %w", err)
+	}
+
+	m.setObservedStatus(instanceID, StatusRunning)
+	log.Printf("INFO: rollback %s: rolled back to generation %s", instanceID, snap.ID)
 	return nil
 }
 
@@ -2219,238 +2896,99 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 	needsRecreation := containerChange || len(result.Added) > 0 || len(result.Removed) > 0
 
 	if needsRecreation {
-		// With workspace disk, container recreation is always safe - no snapshot needed.
-		// The workspace disk persists independently of the container, so we can simply
+		// With block-native rootfs, container recreation is always safe — the rootfs
+		// persists independently of the container, so we can simply
 		// stop/remove/recreate the container wrapper without data loss.
-		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseRecreatingContainer, 50, "Recreating container", false, nil)
+		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseRecreatingContainer, 50, "Recreating containers", false, nil)
 
-		// Stop and remove old container
-		_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
-		_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
-
-		// Ensure workspace disk is mounted and get the merged path
-		mergedPath, err := m.ensureWorkspaceDiskMounted(ctx, instanceID, layout)
-		if err != nil {
-			return nil, fmt.Errorf("failed to ensure workspace disk mounted: %w", err)
+		// Stop and remove ALL containers (services + anchor).
+		if stopErr := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); stopErr != nil {
+			log.Printf("WARN: update listeners %s: stop containers: %v", instanceID, stopErr)
+		}
+		if rmErr := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); rmErr != nil {
+			log.Printf("WARN: update listeners %s: remove containers: %v", instanceID, rmErr)
 		}
 
-		// Get metadata for entrypoint config
-		meta, err := m.getWorkspaceDiskMeta(ctx, instanceID, layout)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get workspace disk metadata: %w", err)
-		}
-
-		// Create new container with updated endpoints and --rootfs mode
-		var newCID string
-		spec, err := m.appDefToContainerSpec(&newDef, result.Endpoints, layout, instanceID, runtime.Credential)
-		if err == nil {
-			// Use --rootfs mode with workspace disk
-			spec.Rootfs = mergedPath
-			spec.Image = ""
-
-			// Apply image config (env, workdir, user) since Podman doesn't do it in --rootfs mode.
-			spec.Environment = mergeEnvMaps(parseEnvSlice(meta.ImageConfig.Env), spec.Environment)
-			spec.WorkingDir = meta.ImageConfig.WorkingDir
-			spec.User = meta.ImageConfig.User
-
-			if primarySvcInit(&newDef) == "image" {
-				spec.Entrypoint = meta.ImageConfig.Entrypoint
-				spec.Command = meta.ImageConfig.Cmd
-			} else {
-				originalCmd := meta.ImageConfig.BuildOriginalCommand()
-				spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-				spec.Command = originalCmd
-			}
-
-			newCID, err = m.containerManager.CreateContainer(ctx, runtime, spec)
-		}
-
-		if err != nil {
-			// Attempt rollback - with workspace disk this is simpler since data is safe
-			log.Printf("WARN: update listeners %s: creation failed: %v. Rolling back...", instanceID, err)
-
-			// 1. Revert ports
+		// rollbackContainers restores old ports and recreates containers with the old definition.
+		rollbackContainers := func(cause error) (*api.AppDefinition, error) {
+			log.Printf("WARN: update listeners %s: rolling back after: %v", instanceID, cause)
 			rbResult, _, rbErr := m.serviceManager.Reconcile(instanceID, curDef.Listeners)
 			if rbErr != nil {
 				log.Printf("ERROR: update listeners %s: port rollback failed: %v", instanceID, rbErr)
 				m.setObservedStatus(instanceID, StatusError)
-				appInst.SetPrimaryContainerID("")
 				_ = state.StoreApp(appInst)
-				return nil, fmt.Errorf("update failed: %w; rollback failed (ports): %v", err, rbErr)
+				return nil, fmt.Errorf("update failed: %w; rollback failed (ports): %v", cause, rbErr)
 			}
-
-			// 2. Rebuild old spec with --rootfs mode
-			rbSpec, rbErr := m.appDefToContainerSpec(curDef, rbResult.Endpoints, layout, instanceID, runtime.Credential)
-			if rbErr != nil {
-				log.Printf("ERROR: update listeners %s: spec rollback failed: %v", instanceID, rbErr)
+			rbRootfs, rbRootfsErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, curDef, appInst)
+			if rbRootfsErr != nil {
 				m.setObservedStatus(instanceID, StatusError)
-				appInst.SetPrimaryContainerID("")
 				_ = state.StoreApp(appInst)
-				return nil, fmt.Errorf("update failed: %w; rollback failed (spec): %v", err, rbErr)
+				return nil, fmt.Errorf("update failed: %w; rollback failed (rootfs): %v", cause, rbRootfsErr)
 			}
-
-			// Use --rootfs mode for rollback too
-			rbSpec.Rootfs = mergedPath
-			rbSpec.Image = ""
-			rbSpec.Environment = mergeEnvMaps(parseEnvSlice(meta.ImageConfig.Env), rbSpec.Environment)
-			rbSpec.WorkingDir = meta.ImageConfig.WorkingDir
-			rbSpec.User = meta.ImageConfig.User
-			if primarySvcInit(curDef) == "image" {
-				rbSpec.Entrypoint = meta.ImageConfig.Entrypoint
-				rbSpec.Command = meta.ImageConfig.Cmd
-			} else {
-				rbSpec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
-				rbSpec.Command = meta.ImageConfig.BuildOriginalCommand()
-			}
-
-			// 3. Create old container
-			rbCID, rbErr := m.containerManager.CreateContainer(ctx, runtime, rbSpec)
-			if rbErr != nil {
-				log.Printf("ERROR: update listeners %s: container rollback failed: %v", instanceID, rbErr)
+			rbInst, rbInstErr := m.installContainerGroup(ctx, curDef, instanceID, layout, runtime, rbResult.Endpoints, rbRootfs)
+			if rbInstErr != nil {
 				m.setObservedStatus(instanceID, StatusError)
-				appInst.SetPrimaryContainerID("")
 				_ = state.StoreApp(appInst)
-				return nil, fmt.Errorf("update failed: %w; rollback failed (create): %v", err, rbErr)
+				return nil, fmt.Errorf("update failed: %w; rollback failed (install): %v", cause, rbInstErr)
 			}
-
-			// 4. Start old container
-			if rbErr := m.containerManager.StartContainer(ctx, runtime, rbCID); rbErr != nil {
-				log.Printf("ERROR: update listeners %s: start rollback failed: %v", instanceID, rbErr)
-				m.setObservedStatus(instanceID, StatusError)
-				appInst.SetPrimaryContainerID(rbCID) // It exists but failed to start
-				_ = state.StoreApp(appInst)
-				return nil, fmt.Errorf("update failed: %w; rollback failed (start): %v", err, rbErr)
-			}
-
-			// Rollback successful
-			log.Printf("INFO: update listeners %s: rollback successful", instanceID)
-			if m.serviceManager != nil {
-				m.serviceManager.SetAppContainerID(instanceID, rbCID)
-			}
-			appInst.SetPrimaryContainerID(rbCID)
+			appInst.Definition = curDef
+			appInst.PrimaryService = rbInst.PrimaryService
+			appInst.NetworkAnchorID = rbInst.NetworkAnchorID
+			appInst.Containers = rbInst.Containers
 			m.setObservedStatus(instanceID, StatusRunning)
-			// Save the restored state to ensure persistence of new CID
 			if saveErr := state.StoreApp(appInst); saveErr != nil {
 				log.Printf("WARN: update listeners %s: failed to save rollback state: %v", instanceID, saveErr)
 			}
-
-			return nil, fmt.Errorf("update failed: %w (rolled back to previous state)", err)
+			return nil, fmt.Errorf("update failed: %w (rolled back to previous state)", cause)
 		}
 
-		if m.serviceManager != nil {
-			m.serviceManager.SetAppContainerID(instanceID, newCID)
+		// Attach all service rootfs volumes (idempotent — returns cached handle if mounted).
+		prebuiltRootfs, rErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, &newDef, appInst)
+		if rErr != nil {
+			return rollbackContainers(fmt.Errorf("attach rootfs: %w", rErr))
 		}
 
-		// Update instance
-		appInst.SetPrimaryContainerID(newCID)
-
-		// Start container automatically
-		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseStarting, 80, "Starting container", false, nil)
-		if err := m.containerManager.StartContainer(ctx, runtime, newCID); err != nil {
-			m.setObservedStatus(instanceID, StatusError)
-			log.Printf("WARN: update listeners %s: failed to start new container: %v", instanceID, err)
-		} else {
-			m.setObservedStatus(instanceID, StatusRunning)
+		// Recreate the entire container group (anchor + services) with updated endpoints.
+		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseStarting, 70, "Starting containers", false, nil)
+		newInst, installErr := m.installContainerGroup(ctx, &newDef, instanceID, layout, runtime, result.Endpoints, prebuiltRootfs)
+		if installErr != nil {
+			return rollbackContainers(fmt.Errorf("recreate containers: %w", installErr))
 		}
+
+		// Update instance with new container group state.
+		appInst.PrimaryService = newInst.PrimaryService
+		appInst.NetworkAnchorID = newInst.NetworkAnchorID
+		appInst.Containers = newInst.Containers
+		m.setObservedStatus(instanceID, StatusRunning)
 	}
 
 	m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseFinalizing, 90, "Saving configuration", false, nil)
 	appInst.UpdatedAt = time.Now()
 	appInst.Definition = &newDef
 	if err := state.StoreApp(appInst); err != nil {
+		// Cleanup containers created by installContainerGroup to prevent orphans.
+		if needsRecreation {
+			if rmErr := m.removeContainersForMultiApp(ctx, appInst, &newDef, runtime); rmErr != nil {
+				log.Printf("WARN: update listeners %s: cleanup after persist failure: %v", instanceID, rmErr)
+			}
+			m.setObservedStatus(instanceID, StatusError)
+		}
 		return nil, fmt.Errorf("store app: %w", err)
 	}
 
 	return &newDef, nil
 }
 
-// Revert reverts an app instance to the previous app.yaml (if available) and recreates container.
+// Revert is a no-op stub. Legacy revert is superseded by tuple-based rollback
+// (RollbackToSnapshot). Returns an error unconditionally.
 func (m *AppManager) Revert(ctx context.Context, instanceID string) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 	return m.revertLocked(ctx, instanceID)
 }
 
-func (m *AppManager) revertLocked(ctx context.Context, instanceID string) error {
-	if err := m.ensureUnlocked(); err != nil {
-		return err
-	}
-	if m.serviceManager == nil {
-		return fmt.Errorf("app manager: service manager not configured")
-	}
-	state, err := m.ensureStateManager()
-	if err != nil {
-		return err
-	}
-	appInst, exists := state.GetApp(instanceID)
-	if !exists {
-		return fmt.Errorf("app instance not found: %s", instanceID)
-	}
-	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
-	if err != nil {
-		return err
-	}
-
-	// Read previous def
-	prevDef, err := state.GetPreviousAppDefinition(instanceID)
-	if err != nil {
-		return fmt.Errorf("no previous version to revert to: %w", err)
-	}
-	if piccoloModeFromExtensions(prevDef.Extensions) == ModeService {
-		return fmt.Errorf("revert is not supported for service-mode apps")
-	}
-	if appInst.Definition != nil && piccoloModeFromExtensions(appInst.Definition.Extensions) == ModeService {
-		return fmt.Errorf("revert is not supported for service-mode apps")
-	}
-
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(prevDef.Extensions))
-	if err != nil {
-		return err
-	}
-	// Backup current before writing previous
-	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
-		return fmt.Errorf("backup current: %w", err)
-	}
-	// Preserve endpoints
-	endpoints, _ := m.serviceManager.GetByApp(instanceID)
-	// Stop and remove current container
-	_ = m.containerManager.StopContainer(ctx, runtime, appInst.PrimaryContainerID())
-	_ = m.containerManager.RemoveContainer(ctx, runtime, appInst.PrimaryContainerID())
-	// Pull using shared image runtime (per-app users have read-only imagestore access).
-	// Mandatory: per-app runtimes use --pull=never (FUSE storage can't extract layers).
-	if prevImage := imageFromDefinition(prevDef); strings.TrimSpace(prevImage) != "" {
-		if err := m.pullToImagestore(ctx, prevImage, nil); err != nil {
-			return fmt.Errorf("pull image %s: %w", prevImage, err)
-		}
-	}
-	// Create new container from prev
-	spec, err := m.appDefToContainerSpec(prevDef, endpoints, layout, instanceID, runtime.Credential)
-	if err != nil {
-		return fmt.Errorf("build container spec: %w", err)
-	}
-	newCID, err := m.containerManager.CreateContainer(ctx, runtime, spec)
-	if err != nil {
-		return fmt.Errorf("create container: %w", err)
-	}
-	if m.serviceManager != nil {
-		m.serviceManager.SetAppContainerID(instanceID, newCID)
-	}
-	startErr := m.containerManager.StartContainer(ctx, runtime, newCID)
-	// Update instance with previous definition and persist
-	appInst.Definition = prevDef
-	appInst.SetPrimaryContainerID(newCID)
-	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst); err != nil {
-		_ = m.containerManager.StopContainer(ctx, runtime, newCID)
-		_ = m.containerManager.RemoveContainer(ctx, runtime, newCID)
-		return fmt.Errorf("store app: %w", err)
-	}
-	if startErr != nil {
-		m.setObservedStatus(instanceID, StatusError)
-		return fmt.Errorf("start container: %w", startErr)
-	}
-	m.setObservedStatus(instanceID, StatusRunning)
-	return nil
+func (m *AppManager) revertLocked(_ context.Context, _ string) error {
+	return fmt.Errorf("revert not supported: use rollback for service apps")
 }
 
 // Logs fetches recent container logs for an app instance by instanceID.
@@ -2585,132 +3123,6 @@ func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, servi
 		return nil, fmt.Errorf("container not found for service '%s'", target)
 	}
 	return m.containerManager.LogsStream(ctx, runtime, cid, lines, timestamps)
-}
-
-// appDefToContainerSpec converts an AppDefinition to a ContainerCreateSpec.
-// storage volumes are mapped into the per-app encrypted volume at <mount>/data/<volume-name>.
-// The instanceID parameter is the unique instance identifier used for container naming.
-func (m *AppManager) appDefToContainerSpec(appDef *api.AppDefinition, endpoints []services.ServiceEndpoint, layout appVolumeLayout, instanceID string, credential *syscall.Credential) (container.ContainerCreateSpec, error) {
-	if appDef == nil {
-		return container.ContainerCreateSpec{}, fmt.Errorf("app definition required")
-	}
-	def := appDef
-	var oidcClient *api.ServiceOIDCClient
-	var svcInit string
-	if piccoloModeFromExtensions(appDef.Extensions) == ModeWorkspace && appDef.Services != nil {
-		primary := primaryServiceFor(appDef, nil)
-		if primary == "" {
-			return container.ContainerCreateSpec{}, fmt.Errorf("workspace app requires primary service")
-		}
-		svc, ok := appDef.Services[primary]
-		if !ok {
-			return container.ContainerCreateSpec{}, fmt.Errorf("primary service '%s' not found", primary)
-		}
-		oidcClient = svc.OIDCClient
-		svcInit = svc.Init
-		derived := *appDef
-		derived.Image = svc.Image
-		derived.Environment = svc.Environment
-		derived.Storage = svc.Storage
-		derived.Resources = svc.Resources
-		def = &derived
-	}
-
-	labelService := defaultPrimaryServiceName
-	if def.Services != nil {
-		if primary := primaryServiceFor(def, nil); strings.TrimSpace(primary) != "" {
-			labelService = primary
-		}
-	}
-
-	spec := container.ContainerCreateSpec{
-		Name:        instanceID,
-		Image:       def.Image,
-		PullPolicy:  "never", // Images are pre-pulled to shared imagestore; per-app FUSE storage can't extract layers.
-		Environment: def.Environment,
-		Labels:      piccoloLabels(instanceID, labelService, "service"),
-	}
-
-	// Convert listeners to port mappings using allocated endpoints
-	for _, ep := range endpoints {
-		spec.Ports = append(spec.Ports, container.PortMapping{
-			Host:      ep.HostBind,
-			Container: ep.GuestPort,
-		})
-	}
-
-	// Convert resources if present
-	if def.Resources != nil && def.Resources.Limits != nil {
-		spec.Resources = container.ResourceLimits{
-			Memory: def.Resources.Limits.Memory,
-			CPU:    fmt.Sprintf("%.1f", def.Resources.Limits.CPU),
-		}
-	}
-
-	// Set network mode based on permissions
-	if def.Permissions != nil && def.Permissions.Network != nil {
-		if def.Permissions.Network.Internet == "deny" {
-			spec.NetworkMode = "none"
-		}
-	}
-
-	// Storage mounts:
-	// - storage.persistent -> bind mounts inside <app-volume>/data/<volume-name>
-	// - storage.temporary  -> tmpfs mounts (ephemeral)
-	if err := m.applyServiceStorageAndTmpfs(&spec, def.Storage, layout, def.Extensions, credential); err != nil {
-		return spec, err
-	}
-
-	m.applyOIDCClientInjection(&spec, oidcClient)
-
-	// Workspace mode: enable init and mount boot.sh wrapper
-	mode := piccoloModeFromExtensions(appDef.Extensions)
-	if mode == ModeWorkspace {
-		if svcInit == "image" {
-			// Image manages its own init (e.g., s6-overlay). No --init or boot.sh.
-		} else {
-			// Default: Piccolo manages init via catatonit + boot.sh wrapper
-			spec.UseInit = true
-
-			// Ensure workspace assets exist on host filesystem
-			if err := EnsureWorkspaceAssets(); err != nil {
-				return spec, fmt.Errorf("failed to ensure workspace assets: %w", err)
-			}
-
-			// Mount boot.sh as read-only into the container
-			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-				Host:      BootShHostPath(),
-				Container: "/piccolo/boot.sh",
-				Options:   "ro",
-			})
-
-			// Mount piccolo-startup helper to /usr/local/bin (which is in PATH by default)
-			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-				Host:      PiccoloStartupHostPath(),
-				Container: "/usr/local/bin/piccolo-startup",
-				Options:   "ro",
-			})
-		}
-
-		// Mount a writable config directory for user startup hooks (start.sh)
-		// This directory is persistent and writable by the container user
-		configDir := filepath.Join(layout.DataDir, "piccolo-config")
-		if err := os.MkdirAll(configDir, 0o755); err != nil {
-			return spec, fmt.Errorf("failed to create piccolo config dir: %w", err)
-		}
-		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
-			Host:      configDir,
-			Container: "/piccolo/config",
-			Options:   "rw",
-		})
-	}
-
-	// Validate the container spec
-	if err := container.ValidateContainerSpec(spec); err != nil {
-		return spec, fmt.Errorf("invalid container spec: %w", err)
-	}
-
-	return spec, nil
 }
 
 func (m *AppManager) applyOIDCClientInjection(spec *container.ContainerCreateSpec, oidcClient *api.ServiceOIDCClient) {

@@ -40,6 +40,27 @@ class DiscoveredPeer {
   String get displayName => formatHostnameDisplayName(hostname);
 }
 
+/// Event received via WebSocket when the peer list changes.
+class NetworkPeersEvent {
+
+  NetworkPeersEvent({required this.peers, required this.timestamp});
+
+  factory NetworkPeersEvent.fromJson(Map<String, dynamic> json) {
+    return NetworkPeersEvent(
+      peers: (json['peers'] as List<dynamic>?)
+              ?.whereType<Map<dynamic, dynamic>>()
+              .map((e) => DiscoveredPeer.fromJson(Map<String, dynamic>.from(e)))
+              .toList() ??
+          [],
+      timestamp: json['timestamp'] != null
+          ? DateTime.parse(json['timestamp'] as String)
+          : DateTime.now(),
+    );
+  }
+  final List<DiscoveredPeer> peers;
+  final DateTime timestamp;
+}
+
 class NetworkPeersResponse {
 
   NetworkPeersResponse({required this.peers, this.self});

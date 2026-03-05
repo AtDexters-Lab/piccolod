@@ -453,6 +453,11 @@ func (m *Manager) GoodbyeAliases(labels []string) {
 	}
 }
 
+// SetEventBus sets the event bus used to publish peer change events.
+func (m *Manager) SetEventBus(bus *events.Bus) {
+	m.eventBus = bus
+}
+
 // ObserveServiceEndpoints subscribes to service endpoint changes and updates mDNS aliases.
 func (m *Manager) ObserveServiceEndpoints(bus *events.Bus) {
 	if bus == nil {

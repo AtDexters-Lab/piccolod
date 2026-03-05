@@ -2,11 +2,15 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os/exec"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"piccolod/internal/container"
+	"piccolod/internal/persistence"
 )
 
 type MockContainerManager struct {
@@ -269,6 +273,7 @@ func (m *MockContainerManager) InspectImage(ctx context.Context, runtime contain
 		Cmd:         []string{"/bin/sh"},
 		Digest:      "sha256:mockdigest",
 		RepoDigests: []string{"docker.io/library/mock-image@sha256:mockdigest"},
+		Size:        500 << 20,
 	}, nil
 }
 
@@ -301,4 +306,76 @@ func (m *MockContainerManager) ExecShellCmd(runtime container.PodmanRuntime, con
 
 func generateMockContainerID(id int) string {
 	return "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd" + string(rune('0'+id%10))
+}
+
+// stubRootfsManager is a minimal RootfsVolumeManager for unit tests.
+// It creates real temp directories so mount paths resolve for container specs.
+type stubRootfsManager struct {
+	baseDir string // temp dir for mock mount points
+}
+
+func newStubRootfsManager(baseDir string) *stubRootfsManager {
+	return &stubRootfsManager{baseDir: baseDir}
+}
+
+func (s *stubRootfsManager) EnsureGoldenLV(_ context.Context, req persistence.GoldenLVRequest) (string, error) {
+	id := fmt.Sprintf("golden-%s", sanitize(req.ImageDigest))
+	return id, nil
+}
+
+func (s *stubRootfsManager) CreateWorkspaceFromGolden(_ context.Context, req persistence.WorkspaceRootfsRequest) (persistence.RootfsHandle, error) {
+	volID := fmt.Sprintf("ws-%s", req.InstanceID)
+	mp := filepath.Join(s.baseDir, "rootfs", volID)
+	os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{VolumeID: volID, MountPath: mp, ReadOnly: false}, nil
+}
+
+func (s *stubRootfsManager) CreateServiceRootfs(_ context.Context, req persistence.ServiceRootfsRequest) (persistence.RootfsHandle, error) {
+	volID := req.VolumeID
+	if volID == "" {
+		volID = fmt.Sprintf("svc-rootfs-%s--%s", req.InstanceID, req.ServiceName)
+	}
+	mp := filepath.Join(s.baseDir, "rootfs", volID)
+	os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{VolumeID: volID, MountPath: mp, ReadOnly: true}, nil
+}
+
+func (s *stubRootfsManager) CloneWorkspace(_ context.Context, originID, cloneID string, _ *persistence.IDMapConfig) (persistence.RootfsHandle, error) {
+	mp := filepath.Join(s.baseDir, "rootfs", cloneID)
+	os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{VolumeID: cloneID, MountPath: mp}, nil
+}
+
+func (s *stubRootfsManager) ListClones(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
+
+func (s *stubRootfsManager) AttachRootfs(_ context.Context, volumeID string) (persistence.RootfsHandle, error) {
+	mp := filepath.Join(s.baseDir, "rootfs", volumeID)
+	os.MkdirAll(mp, 0o755)
+	return persistence.RootfsHandle{VolumeID: volumeID, MountPath: mp, ReadOnly: true}, nil
+}
+
+func (s *stubRootfsManager) DetachRootfs(_ context.Context, _ string) error { return nil }
+func (s *stubRootfsManager) DestroyRootfs(_ context.Context, _ string) error { return nil }
+func (s *stubRootfsManager) GarbageCollectGoldenLVs(_ context.Context) error { return nil }
+func (s *stubRootfsManager) ReconcileRootfsStates(_ context.Context) error   { return nil }
+
+func (s *stubRootfsManager) ReadGoldenImageConfig(_ context.Context, _ string) (persistence.GoldenImageConfig, error) {
+	return persistence.GoldenImageConfig{
+		Cmd: []string{"/bin/sh"},
+	}, nil
+}
+
+func (s *stubRootfsManager) RootfsVolumeID(mode, instanceID string) string {
+	return fmt.Sprintf("%s-%s", mode, instanceID)
+}
+
+func (s *stubRootfsManager) RootfsExists(_ string) bool { return true }
+
+func sanitize(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
 }

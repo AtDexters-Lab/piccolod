@@ -2,21 +2,22 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"time"
 
 	"piccolod/internal/api"
 	"piccolod/internal/container"
+	"piccolod/internal/persistence"
 	"piccolod/internal/services"
 )
 
 // installContainerGroup installs an app as a container group (network anchor + service containers).
-// This is the unified install path for both service and workspace modes.
-// For workspace mode, it prepares workspace disks and uses --rootfs mode.
-// For service mode, it uses standard image-based containers.
-func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint) (*AppInstance, error) {
+// All containers use --rootfs from golden LV snapshots (block-native architecture).
+// For workspace mode, workspace disks are prepared via golden LVs.
+// When prebuiltRootfs is non-nil, services with entries skip image pull + rootfs creation (used by clone).
+func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint, prebuiltRootfs map[string]*rootfsMountInfo) (*AppInstance, error) {
 	if m.serviceManager == nil {
 		return nil, fmt.Errorf("app manager: service manager not configured")
 	}
@@ -117,16 +118,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		log.Printf("INFO: install %s: repaired corrupted podman storage before pull", instanceID)
 	}
 
-	// Also validate the shared image runtime storage (shared imagestore across all app types).
-	// All image pulls target the shared imagestore, so corruption there affects all modes.
-	if imageRuntime, err := m.podmanImageRuntime(); err == nil {
-		if repaired, vErr := m.containerManager.ValidateAndRepairStorage(ctx, imageRuntime); vErr != nil {
-			log.Printf("WARN: install %s: image runtime storage validation error: %v", instanceID, vErr)
-		} else if repaired {
-			log.Printf("INFO: install %s: repaired image runtime storage before pull", instanceID)
-		}
-	}
-
 	// Prepare storage for each service (pull images or init workspace disks)
 	// Progress range 15-55% is divided equally among images
 	const pullProgressMin = 15
@@ -137,39 +128,125 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		pullRangePerService = (pullProgressMax - pullProgressMin) / numServices
 	}
 
-	workspaceInfos := make(map[string]*workspaceMountInfo, len(appDef.Services))
+	// Block-native rootfs: prepare per-service rootfs from golden LV snapshots.
+	if m.currentRootfsManager() == nil {
+		return nil, fmt.Errorf("rootfs volume manager not configured")
+	}
+	blockNativeRootfsMap := make(map[string]*rootfsMountInfo)
+
+	// Build IDMap config once (shared across all services — same per-app user).
+	var idmap persistence.IDMapConfig
+	if runtime.Credential != nil {
+		idmap = persistence.IDMapConfig{
+			AppUID: runtime.Credential.Uid,
+			AppGID: runtime.Credential.Gid,
+		}
+		username := container.AppUsername(instanceID)
+		if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
+			idmap.SubUIDStart = subStart
+			idmap.SubUIDCount = subCount
+			idmap.SubGIDStart = subStart // same range for GID
+			idmap.SubGIDCount = subCount
+		} else {
+			log.Printf("WARN: install %s: subuid lookup failed for %s: %v", instanceID, username, lookupErr)
+		}
+	}
+
 	serviceIdx := 0
 	for svcName := range appDef.Services {
+		// Skip storage prep for services with prebuilt rootfs (clone path).
+		if prebuiltRootfs != nil {
+			if rInfo, ok := prebuiltRootfs[svcName]; ok {
+				blockNativeRootfsMap[svcName] = rInfo
+				serviceIdx++
+				continue
+			}
+		}
+
+		svc := appDef.Services[svcName]
+
 		// Calculate progress range for this service
 		progressRange := imagePullProgressRange{
 			Min: pullProgressMin + (serviceIdx * pullRangePerService),
 			Max: pullProgressMin + ((serviceIdx + 1) * pullRangePerService),
 		}
-		// Ensure last service gets the full remaining range
 		if serviceIdx == numServices-1 {
 			progressRange.Max = pullProgressMax
 		}
 
-		info, err := m.prepareServiceStorage(ctx, mode, svcName, appDef, instanceID, layout, runtime, progressRange)
-		if err != nil {
-			// Cleanup any workspace disks already initialized
-			if mode == ModeWorkspace {
-				if unmountErr := m.unmountWorkspaceDisk(ctx, instanceID, layout); unmountErr != nil {
-					log.Printf("WARN: install %s: cleanup unmount failed: %v", instanceID, unmountErr)
-				}
+		if svc.Image != "" {
+			// Pull to ephemeral runtime for digest, then prepare rootfs.
+			// The same ephemeral runtime is reused by flattenFn inside EnsureGoldenLV,
+			// avoiding a redundant second pull of the same image.
+			ephRT, ephCleanup, ephErr := newEphemeralFlattenRuntime(m.runtimeUser)
+			if ephErr != nil {
+				return nil, fmt.Errorf("create ephemeral runtime: %w", ephErr)
 			}
-			return nil, fmt.Errorf("prepare storage for service '%s': %w", svcName, err)
+			callback := m.makeImagePullProgressCallback(ctx, instanceID, svcName, svc.Image, progressRange)
+			if pullErr := m.containerManager.PullImageWithProgress(ctx, ephRT, svc.Image, callback); pullErr != nil {
+				ephCleanup()
+				return nil, fmt.Errorf("pull image %s: %w", svc.Image, pullErr)
+			}
+			imgConfig, inspErr := m.containerManager.InspectImage(ctx, ephRT, svc.Image)
+			if inspErr != nil {
+				ephCleanup()
+				return nil, fmt.Errorf("inspect image %s: %w", svc.Image, inspErr)
+			}
+			imageDigest := ""
+			if len(imgConfig.RepoDigests) > 0 {
+				imageDigest = imgConfig.RepoDigests[0]
+			} else {
+				imageDigest = imgConfig.Digest
+			}
+
+			// Pass the pre-pulled runtime's root dir so flattenFn skips pulling again.
+			// ephRT.Root is "<base>/root" — pass the parent (base) dir.
+			prePulledDir := filepath.Dir(ephRT.Root)
+			rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, imageDigest, svc.Image, idmap, imgConfig.Size, prePulledDir)
+			ephCleanup()
+			if err != nil {
+				return nil, fmt.Errorf("prepare rootfs for service '%s': %w", svcName, err)
+			}
+			blockNativeRootfsMap[svcName] = rInfo
 		}
-		workspaceInfos[svcName] = info
 		serviceIdx++
 	}
 
-	// Pull network anchor image using shared image runtime (piccolo-runtime has
-	// write access to the imagestore; per-app users have read-only group access).
-	// This pre-pull is mandatory: per-app runtimes use --pull=never because their
-	// storage is on gocryptfs (FUSE) where rootless layer extraction fails.
-	if err := m.pullToImagestore(ctx, networkAnchorImage(), nil); err != nil {
-		return nil, fmt.Errorf("network anchor image pull failed: %w", err)
+	// Prepare network anchor rootfs via golden LV pipeline.
+	// Anchor always uses ModeService regardless of app mode — it's a service container.
+	// Skip if the caller already provides an attached anchor rootfs (e.g., image update path).
+	if prebuiltRootfs != nil {
+		if rInfo, ok := prebuiltRootfs[networkAnchorServiceName]; ok {
+			blockNativeRootfsMap[networkAnchorServiceName] = rInfo
+		}
+	}
+	if _, ok := blockNativeRootfsMap[networkAnchorServiceName]; !ok {
+		ephRT, ephCleanup, ephErr := newEphemeralFlattenRuntime(m.runtimeUser)
+		if ephErr != nil {
+			return nil, fmt.Errorf("create ephemeral runtime for anchor: %w", ephErr)
+		}
+		if pullErr := m.containerManager.PullImage(ctx, ephRT, networkAnchorImage()); pullErr != nil {
+			ephCleanup()
+			return nil, fmt.Errorf("pull anchor image: %w", pullErr)
+		}
+		imgConfig, inspErr := m.containerManager.InspectImage(ctx, ephRT, networkAnchorImage())
+		if inspErr != nil {
+			ephCleanup()
+			return nil, fmt.Errorf("inspect anchor image: %w", inspErr)
+		}
+		anchorDigest := ""
+		if len(imgConfig.RepoDigests) > 0 {
+			anchorDigest = imgConfig.RepoDigests[0]
+		} else {
+			anchorDigest = imgConfig.Digest
+		}
+		anchorPrePulledDir := filepath.Dir(ephRT.Root)
+		rInfo, err := m.prepareRootfsStorage(ctx, ModeService, instanceID, networkAnchorServiceName, anchorDigest, networkAnchorImage(), idmap, imgConfig.Size, anchorPrePulledDir)
+		ephCleanup()
+		if err != nil {
+			return nil, fmt.Errorf("prepare rootfs for network anchor: %w", err)
+		}
+		blockNativeRootfsMap[networkAnchorServiceName] = rInfo
 	}
 
 	created := make([]string, 0, 1+len(appDef.Services))
@@ -179,10 +256,17 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			_ = m.containerManager.StopContainer(ctx, runtime, cid)
 			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
 		}
-		// Cleanup workspace disk on failure
-		if mode == ModeWorkspace {
-			if unmountErr := m.unmountWorkspaceDisk(ctx, instanceID, layout); unmountErr != nil {
-				log.Printf("WARN: install %s: cleanup unmount failed: %v", instanceID, unmountErr)
+		// Detach only locally-created rootfs volumes, not prebuilt ones
+		// (the caller owns those handles and is responsible for their lifecycle).
+		if rootfs := m.currentRootfsManager(); rootfs != nil {
+			for svcName := range blockNativeRootfsMap {
+				if prebuiltRootfs != nil {
+					if _, isPrebuilt := prebuiltRootfs[svcName]; isPrebuilt {
+						continue
+					}
+				}
+				volID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
+				_ = rootfs.DetachRootfs(ctx, volID)
 			}
 		}
 	}
@@ -190,12 +274,20 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	// 1) Create + start the network anchor (owns published ports + shared netns).
 	anchorSpec := container.ContainerCreateSpec{
 		Name:          networkAnchorContainerName(instanceID),
-		Image:         networkAnchorImage(),
-		PullPolicy:    "never", // Pre-pulled above; per-app FUSE storage can't extract layers.
 		NetworkMode:   appNetworkMode(appDef),
 		RestartPolicy: appRestartPolicy(appDef),
 		Labels:        piccoloLabels(instanceID, networkAnchorServiceName, "network_anchor"),
+		SecurityOpt:   selinuxDisableLabel(), // overlay context= ignored in user namespaces
 	}
+	anchorRootfs := blockNativeRootfsMap[networkAnchorServiceName]
+	anchorSpec.Rootfs = anchorRootfs.handle.MountPath
+	anchorSpec.RootfsOverlay = anchorRootfs.handle.ReadOnly
+	// Don't set ReadOnly — the :O overlay upper layer must be writable.
+	// The underlying btrfs mount is already read-only; writes go to the ephemeral overlay.
+	// In --rootfs mode, Podman doesn't read image config, so we must supply
+	// entrypoint/cmd from the golden image metadata explicitly.
+	anchorSpec.Entrypoint = anchorRootfs.imgConfig.Entrypoint
+	anchorSpec.Command = anchorRootfs.imgConfig.Cmd
 	for _, ep := range endpoints {
 		anchorSpec.Ports = append(anchorSpec.Ports, container.PortMapping{Host: ep.HostBind, Container: ep.GuestPort})
 	}
@@ -211,41 +303,14 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		return nil, fmt.Errorf("invalid network anchor spec: %w", err)
 	}
 
-	var anchorID string
 	updateSubtask(networkAnchorServiceName, 10, "Creating")
 	emitCreateProgress(fmt.Sprintf("Creating container (1/%d): network", totalContainers))
-	for i := 0; i < 2; i++ {
-		anchorID, err = m.containerManager.CreateContainer(ctx, runtime, anchorSpec)
-		if err == nil {
-			updateSubtask(networkAnchorServiceName, 50, "Created")
-			break
-		}
-
-		// If PortInUse, let the caller retry allocation.
-		var portErr *container.PortInUseError
-		if errors.As(err, &portErr) {
-			break
-		}
-
-		// Cleanup zombies by deterministic name.
-		zombieID := ""
-		var nameErr *container.NameInUseError
-		if errors.As(err, &nameErr) {
-			zombieID = nameErr.ID
-		} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, anchorSpec.Name); resolveErr == nil {
-			zombieID = id
-		}
-		if zombieID != "" {
-			log.Printf("INFO: install %s: removing zombie container %s (network anchor)", instanceID, zombieID)
-			_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
-			_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
-			continue
-		}
-		break
-	}
+	anchorID, err := m.createContainerWithRetry(ctx, runtime, anchorSpec,
+		fmt.Sprintf("install %s network-anchor", instanceID))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create network anchor: %w", err)
 	}
+	updateSubtask(networkAnchorServiceName, 50, "Created")
 	created = append(created, anchorID)
 
 	updateSubtask(networkAnchorServiceName, 70, "Starting")
@@ -275,60 +340,35 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			anchorID:   anchorID,
 			credential: runtime.Credential,
 		}
-		if info := workspaceInfos[svcName]; info != nil {
-			opts.mergedRootfs = info.mergedPath
-			opts.workspaceMeta = info.meta
+		if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
+			opts.rootfsHandle = &svcRootfs.handle
+			opts.goldenImgConfig = &svcRootfs.imgConfig
 		}
 		spec, err := m.buildServiceContainerSpec(opts)
 		if err != nil {
 			cleanup()
 			return nil, err
 		}
-		// Per-app runtimes must never pull: images are pre-pulled to the shared
-		// imagestore and the per-app FUSE storage can't do rootless layer extraction.
+		// Per-app runtimes must never pull: service containers use --rootfs
+		// from golden LV snapshots.
 		if spec.Image != "" {
 			spec.PullPolicy = "never"
 		}
 
-		var cid string
-		for i := 0; i < 2; i++ {
-			cid, err = m.containerManager.CreateContainer(ctx, runtime, spec)
-			if err == nil {
-				updateSubtask(svcName, 50, "Created")
-				break
-			}
-
-			// PortInUse should not happen for service containers (no publishes).
-			var portErr *container.PortInUseError
-			if errors.As(err, &portErr) {
-				break
-			}
-
-			zombieID := ""
-			var nameErr *container.NameInUseError
-			if errors.As(err, &nameErr) {
-				zombieID = nameErr.ID
-			} else if id, resolveErr := m.containerManager.ResolveContainerIDByName(ctx, runtime, spec.Name); resolveErr == nil {
-				zombieID = id
-			}
-			if zombieID != "" {
-				log.Printf("INFO: install %s: removing zombie container %s (service=%s)", instanceID, zombieID, svcName)
-				_ = m.containerManager.StopContainer(ctx, runtime, zombieID)
-				_ = m.containerManager.RemoveContainer(ctx, runtime, zombieID)
-				continue
-			}
-			break
-		}
+		cid, err := m.createContainerWithRetry(ctx, runtime, spec,
+			fmt.Sprintf("install %s service=%s", instanceID, svcName))
 		if err != nil {
 			updateSubtask(svcName, 50, "Error")
 			emitCreateProgress(fmt.Sprintf("Failed to create container: %s", svcName))
 			cleanup()
 			return nil, fmt.Errorf("failed to create service container '%s': %w", svcName, err)
 		}
+		updateSubtask(svcName, 50, "Created")
 		created = append(created, cid)
 
 		updateSubtask(svcName, 70, "Starting")
 		if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
+			log.Printf("ERROR: install %s: start service container '%s' (cid=%s) failed: %v", instanceID, svcName, cid, err)
 			updateSubtask(svcName, 70, "Error")
 			emitCreateProgress(fmt.Sprintf("Failed to start container: %s", svcName))
 			cleanup()

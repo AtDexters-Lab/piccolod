@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:piccolo_os/core/config/core_config.dart';
 import 'package:piccolo_os/core/models/app_status_event.dart';
 import 'package:piccolo_os/core/models/listener_health.dart';
+import 'package:piccolo_os/core/models/network_models.dart';
 import 'package:piccolo_os/core/services/websocket_connection.dart';
 
 /// Unified event stream client that multiplexes multiple event types
@@ -16,6 +17,7 @@ import 'package:piccolo_os/core/services/websocket_connection.dart';
 /// - listener_health: Listener health updates
 /// - remote_config: Remote access configuration changes (admin only)
 /// - certificate: Certificate status changes (admin only)
+/// - network_peers: Network peer discovery updates (LAN-only, stripped by server for remote)
 class EventStreamClient extends ChangeNotifier {
 
   /// Creates an EventStreamClient that subscribes to all event topics.
@@ -36,12 +38,20 @@ class EventStreamClient extends ChangeNotifier {
       StreamController<Map<String, dynamic>>.broadcast();
   final StreamController<Map<String, dynamic>> _certificateController =
       StreamController<Map<String, dynamic>>.broadcast();
+  final StreamController<NetworkPeersEvent> _networkPeersController =
+      StreamController<NetworkPeersEvent>.broadcast();
 
   /// Called when a reconnect attempt indicates an auth failure (e.g. session expired).
   /// Set by the shell to trigger the re-auth overlay for passive WebSocket-only failures.
   VoidCallback? onAuthFailure;
 
   bool _isDisposed = false;
+
+  /// Last received network peers event, cached for late subscribers.
+  /// Broadcast streams drop events when no one is listening; widgets that
+  /// mount after the initial snapshot can read this to hydrate immediately.
+  NetworkPeersEvent? _lastNetworkPeersEvent;
+  NetworkPeersEvent? get lastNetworkPeersEvent => _lastNetworkPeersEvent;
 
   /// Stream of app status change events.
   Stream<AppStatusEvent> get appStatusEvents => _appStatusController.stream;
@@ -56,6 +66,10 @@ class EventStreamClient extends ChangeNotifier {
   /// Stream of certificate events (payload is raw JSON).
   Stream<Map<String, dynamic>> get certificateEvents =>
       _certificateController.stream;
+
+  /// Stream of network peers events.
+  Stream<NetworkPeersEvent> get networkPeersEvents =>
+      _networkPeersController.stream;
 
   WebSocketConnectionState get state => _connection.state;
 
@@ -87,6 +101,7 @@ class EventStreamClient extends ChangeNotifier {
         _connection.state == WebSocketConnectionState.error) {
       unawaited(_subscription?.cancel());
       _subscription = null;
+      _lastNetworkPeersEvent = null;
     }
 
     // Detect auth failures on reconnect (WebSocket upgrade rejected with 401).
@@ -147,6 +162,10 @@ class EventStreamClient extends ChangeNotifier {
           _remoteConfigController.add(payload);
         case 'certificate':
           _certificateController.add(payload);
+        case 'network_peers':
+          final event = NetworkPeersEvent.fromJson(payload);
+          _lastNetworkPeersEvent = event;
+          _networkPeersController.add(event);
       }
     } on Object catch (e) {
       debugPrint('Event stream decode error: $e');
@@ -156,6 +175,7 @@ class EventStreamClient extends ChangeNotifier {
   @override
   void dispose() {
     _isDisposed = true;
+    _lastNetworkPeersEvent = null;
     unawaited(_subscription?.cancel());
     _subscription = null;
     _connection
@@ -165,6 +185,7 @@ class EventStreamClient extends ChangeNotifier {
     unawaited(_healthController.close());
     unawaited(_remoteConfigController.close());
     unawaited(_certificateController.close());
+    unawaited(_networkPeersController.close());
     super.dispose();
   }
 }

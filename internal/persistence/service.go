@@ -13,8 +13,12 @@ import (
 	"piccolod/internal/cluster"
 	"piccolod/internal/crypt"
 	"piccolod/internal/events"
+	"piccolod/internal/runner"
 	"piccolod/internal/runtime/commands"
 	"piccolod/internal/state/paths"
+	"piccolod/internal/storage/drbd"
+	"piccolod/internal/storage/lvm"
+	"piccolod/internal/storage/nbd"
 )
 
 // Options captures construction parameters for the persistence service.
@@ -30,12 +34,24 @@ type Options struct {
 	Crypto         *crypt.Manager
 	StateDir       string
 	DataDir        string
+
+	// Block-native storage dependencies (for luksVolumeManager).
+	Runner  runner.CommandRunner
+	LVMgr   *lvm.LVManager
+	PoolMgr *lvm.PoolManager
+	NBDSrv  *nbd.Server
+	DRBDMgr *drbd.ResourceManager
+
+	// Rootfs dependencies.
+	FlattenFn   func(ctx context.Context, imageRef, targetDir, prePulledDir string) (GoldenImageConfig, error)
+	ImageSizeFn func(ctx context.Context, imageRef string) (int64, error)
 }
 
 // Module implements the Service interface using pluggable sub-components.
 type Module struct {
 	control            ControlStore
 	volumes            VolumeManager
+	rootfs             RootfsVolumeManager
 	devices            DeviceManager
 	events             *events.Bus
 	leadership         *cluster.Registry
@@ -112,17 +128,29 @@ func NewService(opts Options) (*Module, error) {
 		if mod.crypto == nil {
 			return nil, ErrCryptoUnavailable
 		}
-		dataDir := opts.DataDir
-		if dataDir == "" {
-			dataDir = paths.DataRoot()
+		run := opts.Runner
+		if run == nil {
+			run = runner.ExecRunner{}
 		}
-		mod.volumes = newFileVolumeManager(mod.stateDir, dataDir, mod.crypto, mod.events)
+		lvm := NewLUKSVolumeManager(LUKSVolumeManagerConfig{
+			Run:       run,
+			Crypto:    mod.crypto,
+			Bus:       mod.events,
+			LVMgr:     opts.LVMgr,
+			PoolMgr:   opts.PoolMgr,
+			NBDSrv:    opts.NBDSrv,
+			DRBDMgr:   opts.DRBDMgr,
+			FlattenFn:   opts.FlattenFn,
+			ImageSizeFn: opts.ImageSizeFn,
+		})
+		mod.volumes = lvm
+		// Only expose rootfs capabilities when FlattenFn is available.
+		if opts.FlattenFn != nil {
+			mod.rootfs = lvm
+		}
 	}
-	if fm, ok := mod.volumes.(*fileVolumeManager); ok {
-		if fm.bus == nil {
-			fm.bus = mod.events
-		}
-		fm.setRoleChecker(func(volumeID string, role VolumeRole) bool {
+	if rc, ok := mod.volumes.(RoleCheckable); ok {
+		rc.SetRoleChecker(func(volumeID string, role VolumeRole) bool {
 			if role != VolumeRoleLeader {
 				return true
 			}
@@ -168,8 +196,8 @@ func (m *Module) ensureCoreVolumes(ctx context.Context) error {
 	if m.volumes == nil {
 		return nil
 	}
-	if fm, ok := m.volumes.(*fileVolumeManager); ok {
-		if err := fm.reconcileAllVolumeStates(); err != nil {
+	if r, ok := m.volumes.(Reconcilable); ok {
+		if err := r.ReconcileAllVolumeStates(); err != nil {
 			return err
 		}
 	}
@@ -188,6 +216,15 @@ func (m *Module) attachControlVolume(ctx context.Context) error {
 	}
 	if m.controlHandle.ID == "" {
 		return fmt.Errorf("control volume handle unavailable")
+	}
+	// Re-ensure the control volume: on a fresh system, the initial EnsureVolume
+	// during startup defers creation (crypto not ready). Now that crypto is
+	// initialized and unlocked, this creates the LUKS loop volume if needed.
+	controlReq := VolumeRequest{ID: "control-plane", Class: VolumeClassControl, ClusterMode: ClusterModeStateful}
+	if handle, err := m.volumes.EnsureVolume(ctx, controlReq); err != nil {
+		return fmt.Errorf("ensure control volume: %w", err)
+	} else {
+		m.controlHandle = handle
 	}
 	role := VolumeRoleLeader
 	if m.leadership != nil {
@@ -248,6 +285,10 @@ func (m *Module) Volumes() VolumeManager {
 	return m.volumes
 }
 
+func (m *Module) Rootfs() RootfsVolumeManager {
+	return m.rootfs
+}
+
 func (m *Module) Devices() DeviceManager {
 	return m.devices
 }
@@ -258,6 +299,16 @@ func (m *Module) StorageAdapter() StorageAdapter {
 
 func (m *Module) Consensus() ConsensusManager {
 	return m.consensus
+}
+
+// ProvisionLUKSKeyslot adds or replaces a passphrase on the given LUKS keyslot
+// across all v3 volumes. No-op if the volume manager is not LUKS-based.
+func (m *Module) ProvisionLUKSKeyslot(ctx context.Context, slot int, passphrase []byte) error {
+	lvm, ok := m.volumes.(*luksVolumeManager)
+	if !ok {
+		return nil
+	}
+	return lvm.provisionKeyslotOnAllVolumes(ctx, slot, passphrase)
 }
 
 func (m *Module) setLockState(ctx context.Context, locked bool) error {
@@ -304,41 +355,6 @@ func (m *Module) setLockState(ctx context.Context, locked bool) error {
 	return nil
 }
 
-// SwapControl allows wiring a real control store after construction.
-func (m *Module) SwapControl(store ControlStore) {
-	if store != nil {
-		m.control = store
-	}
-}
-
-// SwapVolumes allows wiring a real volume manager after construction.
-func (m *Module) SwapVolumes(manager VolumeManager) {
-	if manager != nil {
-		m.volumes = manager
-	}
-}
-
-// SwapDevices allows wiring a real device manager after construction.
-func (m *Module) SwapDevices(manager DeviceManager) {
-	if manager != nil {
-		m.devices = manager
-	}
-}
-
-// SwapStorageAdapter allows wiring a real storage adapter after construction.
-func (m *Module) SwapStorageAdapter(adapter StorageAdapter) {
-	if adapter != nil {
-		m.storage = adapter
-	}
-}
-
-// SwapConsensus allows wiring a real consensus manager after construction.
-func (m *Module) SwapConsensus(manager ConsensusManager) {
-	if manager != nil {
-		m.consensus = manager
-	}
-}
-
 // Shutdown terminates sub-components that require cleanup.
 func (m *Module) Shutdown(ctx context.Context) error {
 	m.commitMu.Lock()
@@ -367,29 +383,21 @@ func (m *Module) detachVolumeIfMounted(ctx context.Context, handle VolumeHandle)
 	if m.volumes == nil || handle.ID == "" || handle.MountDir == "" {
 		return nil
 	}
-	marker := filepath.Join(handle.MountDir, ".cipher")
 	mounted, err := isMountPoint(handle.MountDir)
 	if err != nil {
 		return err
 	}
 	if !mounted {
-		// The mount disappeared (e.g., after an unclean shutdown) but our
-		// sentinel files remain. Best-effort cleanup so subsequent lock attempts
+		// The mount disappeared (e.g., after an unclean shutdown).
+		// Best-effort cleanup of stale markers so subsequent lock attempts
 		// do not mis-detect a mounted volume.
-		if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		modeMarker := filepath.Join(handle.MountDir, ".mode")
-		if err := os.Remove(modeMarker); err != nil && !os.IsNotExist(err) {
-			return err
+		for _, name := range []string{".cipher", ".mode"} {
+			p := filepath.Join(handle.MountDir, name)
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 		return nil
-	}
-	if _, err := os.Stat(marker); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
 	}
 	return m.volumes.Detach(ctx, handle)
 }
