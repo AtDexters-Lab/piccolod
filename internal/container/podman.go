@@ -391,6 +391,11 @@ type ContainerCreateSpec struct {
 	// specified rootfs path. The caller must ensure the rootfs is properly mounted.
 	Rootfs string
 
+	// RootfsOverlay appends ":O" to the --rootfs path, making podman create an
+	// overlay writable layer on top of the rootfs. Required for read-only rootfs
+	// where the container runtime needs to create /etc/hosts, /etc/hostname, etc.
+	RootfsOverlay bool
+
 	// ReadOnly makes the container's root filesystem read-only (--read-only).
 	// Podman automatically adds tmpfs at /tmp and /run (--read-only-tmpfs, default true).
 	// Persistent state is provided via bind-mounted volumes.
@@ -597,8 +602,13 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 	}
 
 	// Rootfs mode: use --rootfs instead of image reference.
+	// :O suffix creates an overlay writable layer (required for read-only rootfs).
 	if spec.Rootfs != "" {
-		args = append(args, "--rootfs", spec.Rootfs)
+		rootfsArg := spec.Rootfs
+		if spec.RootfsOverlay {
+			rootfsArg += ":O"
+		}
+		args = append(args, "--rootfs", rootfsArg)
 	} else if spec.Image != "" {
 		args = append(args, spec.Image)
 	}
@@ -1792,6 +1802,33 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 		Phase:          "pulling",
 	})
 
+	// Capture recent PTY output lines for diagnostics on failure.
+	const tailSize = 10
+	var tailLines [tailSize]string
+	var tailIdx int
+	var tailMu sync.Mutex
+	appendTail := func(line string) {
+		tailMu.Lock()
+		tailLines[tailIdx%tailSize] = line
+		tailIdx++
+		tailMu.Unlock()
+	}
+	getTail := func() string {
+		tailMu.Lock()
+		defer tailMu.Unlock()
+		var lines []string
+		start := 0
+		if tailIdx > tailSize {
+			start = tailIdx - tailSize
+		}
+		for i := start; i < tailIdx; i++ {
+			if l := tailLines[i%tailSize]; l != "" {
+				lines = append(lines, l)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+
 	// Read PTY output and parse progress
 	go func() {
 		buf := make([]byte, 4096)
@@ -1816,6 +1853,7 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 					line := lineBuf.String()
 					if line != "" {
 						parser.parseLine(line)
+						appendTail(line)
 					}
 					lineBuf.Reset()
 				} else if ch == '\n' {
@@ -1823,6 +1861,7 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 					line := lineBuf.String()
 					if line != "" {
 						parser.parseLine(line)
+						appendTail(line)
 					}
 					lineBuf.Reset()
 				} else {
@@ -1838,7 +1877,9 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 
 		// Process any remaining data
 		if lineBuf.Len() > 0 {
-			parser.parseLine(lineBuf.String())
+			line := lineBuf.String()
+			parser.parseLine(line)
+			appendTail(line)
 		}
 	}()
 
@@ -1859,6 +1900,10 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 		// Check if it was due to context cancellation
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		tail := getTail()
+		if tail != "" {
+			log.Printf("WARN: PullImageWithProgress: podman pull %s output tail:\n%s", image, tail)
 		}
 		return fmt.Errorf("podman pull failed: %w", cmdErr)
 	}

@@ -157,7 +157,10 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 
 	lvName := goldenID
 	sizeBytes := int64(defaultGoldenLVSize)
-	if m.imageSizeFn != nil {
+	if req.ImageSizeHint > 0 {
+		// Caller already inspected the image — skip the separate imageSizeFn pull.
+		sizeBytes = goldenLVSizeForImage(req.ImageSizeHint)
+	} else if m.imageSizeFn != nil {
 		if imgSize, err := m.imageSizeFn(ctx, req.ImageRef); err == nil && imgSize > 0 {
 			sizeBytes = goldenLVSizeForImage(imgSize)
 		} else if err != nil {
@@ -244,7 +247,7 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	}
 
 	// Flatten: extract OCI image to mount point and get image config.
-	imgConfig, err := m.flattenFn(ctx, req.ImageRef, mountDir)
+	imgConfig, err := m.flattenFn(ctx, req.ImageRef, mountDir, req.PrePulledDir)
 	if err != nil {
 		return "", fmt.Errorf("flatten image: %w", err)
 	}
@@ -305,8 +308,10 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 // CreateWorkspaceFromGolden creates a workspace rootfs from a golden LV snapshot.
 func (m *luksVolumeManager) CreateWorkspaceFromGolden(ctx context.Context, req WorkspaceRootfsRequest) (RootfsHandle, error) {
 	goldenID, err := m.EnsureGoldenLV(ctx, GoldenLVRequest{
-		ImageDigest: req.ImageDigest,
-		ImageRef:    req.ImageRef,
+		ImageDigest:   req.ImageDigest,
+		ImageRef:      req.ImageRef,
+		ImageSizeHint: req.ImageSizeHint,
+		PrePulledDir:  req.PrePulledDir,
 	})
 	if err != nil {
 		return RootfsHandle{}, err
@@ -319,8 +324,10 @@ func (m *luksVolumeManager) CreateWorkspaceFromGolden(ctx context.Context, req W
 // CreateServiceRootfs creates a read-only service rootfs from a golden LV snapshot.
 func (m *luksVolumeManager) CreateServiceRootfs(ctx context.Context, req ServiceRootfsRequest) (RootfsHandle, error) {
 	goldenID, err := m.EnsureGoldenLV(ctx, GoldenLVRequest{
-		ImageDigest: req.ImageDigest,
-		ImageRef:    req.ImageRef,
+		ImageDigest:   req.ImageDigest,
+		ImageRef:      req.ImageRef,
+		ImageSizeHint: req.ImageSizeHint,
+		PrePulledDir:  req.PrePulledDir,
 	})
 	if err != nil {
 		return RootfsHandle{}, err

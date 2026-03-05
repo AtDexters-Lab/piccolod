@@ -80,8 +80,9 @@ type luksVolumeManager struct {
 	loopVol *LUKSLoopVolume
 
 	// Flatten function: extracts OCI image to a directory and returns image config.
-	// Injected by AppManager wiring.
-	flattenFn func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
+	// When prePulledDir is non-empty, the image is already pulled in that podman
+	// root directory — the function should skip the pull step and reuse it.
+	flattenFn func(ctx context.Context, imageRef, targetDir, prePulledDir string) (GoldenImageConfig, error)
 	// ImageSizeFn returns the uncompressed image size in bytes for right-sizing golden LVs.
 	imageSizeFn func(ctx context.Context, imageRef string) (int64, error)
 
@@ -117,7 +118,8 @@ type LUKSVolumeManagerConfig struct {
 	NBDSrv  *nbd.Server
 	DRBDMgr *drbd.ResourceManager
 	// FlattenFn extracts an OCI image to a target directory and returns image config.
-	FlattenFn func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
+	// When prePulledDir is non-empty, the image is already pulled there — skip pull.
+	FlattenFn func(ctx context.Context, imageRef, targetDir, prePulledDir string) (GoldenImageConfig, error)
 	// ImageSizeFn returns the uncompressed image size in bytes for right-sizing golden LVs.
 	ImageSizeFn func(ctx context.Context, imageRef string) (int64, error)
 }

@@ -200,6 +200,18 @@ func newEphemeralFlattenRuntime(ru container.RuntimeUser) (container.PodmanRunti
 	return rt, cleanup, nil
 }
 
+// newRuntimeFromDir constructs a PodmanRuntime from an existing flatten directory.
+// Used to reuse a pre-pulled runtime directory for flatten — avoids a redundant image pull.
+func newRuntimeFromDir(baseDir string, ru container.RuntimeUser) container.PodmanRuntime {
+	return container.PodmanRuntime{
+		Root:          filepath.Join(baseDir, "root"),
+		RunRoot:       filepath.Join(baseDir, "run"),
+		StorageDriver: "overlay",
+		Credential:    ru.Credential,
+		HomeDir:       ru.HomeDir,
+	}
+}
+
 // cleanStaleFlattenDirs removes orphaned flatten-* tmpdirs from prior crashes.
 // Called on daemon startup.
 func cleanStaleFlattenDirs() {

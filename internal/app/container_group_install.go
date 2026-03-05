@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"time"
 
 	"piccolod/internal/api"
@@ -175,8 +176,9 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		}
 
 		if svc.Image != "" {
-			// Pull to ephemeral runtime for digest, then prepare rootfs
-			// (EnsureGoldenLV handles flatten internally).
+			// Pull to ephemeral runtime for digest, then prepare rootfs.
+			// The same ephemeral runtime is reused by flattenFn inside EnsureGoldenLV,
+			// avoiding a redundant second pull of the same image.
 			ephRT, ephCleanup, ephErr := newEphemeralFlattenRuntime(m.runtimeUser)
 			if ephErr != nil {
 				return nil, fmt.Errorf("create ephemeral runtime: %w", ephErr)
@@ -187,8 +189,8 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 				return nil, fmt.Errorf("pull image %s: %w", svc.Image, pullErr)
 			}
 			imgConfig, inspErr := m.containerManager.InspectImage(ctx, ephRT, svc.Image)
-			ephCleanup()
 			if inspErr != nil {
+				ephCleanup()
 				return nil, fmt.Errorf("inspect image %s: %w", svc.Image, inspErr)
 			}
 			imageDigest := ""
@@ -198,7 +200,11 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 				imageDigest = imgConfig.Digest
 			}
 
-			rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, imageDigest, svc.Image, idmap)
+			// Pass the pre-pulled runtime's root dir so flattenFn skips pulling again.
+			// ephRT.Root is "<base>/root" — pass the parent (base) dir.
+			prePulledDir := filepath.Dir(ephRT.Root)
+			rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, imageDigest, svc.Image, idmap, imgConfig.Size, prePulledDir)
+			ephCleanup()
 			if err != nil {
 				return nil, fmt.Errorf("prepare rootfs for service '%s': %w", svcName, err)
 			}
@@ -225,8 +231,8 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			return nil, fmt.Errorf("pull anchor image: %w", pullErr)
 		}
 		imgConfig, inspErr := m.containerManager.InspectImage(ctx, ephRT, networkAnchorImage())
-		ephCleanup()
 		if inspErr != nil {
+			ephCleanup()
 			return nil, fmt.Errorf("inspect anchor image: %w", inspErr)
 		}
 		anchorDigest := ""
@@ -235,7 +241,9 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		} else {
 			anchorDigest = imgConfig.Digest
 		}
-		rInfo, err := m.prepareRootfsStorage(ctx, ModeService, instanceID, networkAnchorServiceName, anchorDigest, networkAnchorImage(), idmap)
+		anchorPrePulledDir := filepath.Dir(ephRT.Root)
+		rInfo, err := m.prepareRootfsStorage(ctx, ModeService, instanceID, networkAnchorServiceName, anchorDigest, networkAnchorImage(), idmap, imgConfig.Size, anchorPrePulledDir)
+		ephCleanup()
 		if err != nil {
 			return nil, fmt.Errorf("prepare rootfs for network anchor: %w", err)
 		}
@@ -275,7 +283,13 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 	anchorRootfs := blockNativeRootfsMap[networkAnchorServiceName]
 	anchorSpec.Rootfs = anchorRootfs.handle.MountPath
-	anchorSpec.ReadOnly = anchorRootfs.handle.ReadOnly
+	anchorSpec.RootfsOverlay = anchorRootfs.handle.ReadOnly
+	// Don't set ReadOnly — the :O overlay upper layer must be writable.
+	// The underlying btrfs mount is already read-only; writes go to the ephemeral overlay.
+	// In --rootfs mode, Podman doesn't read image config, so we must supply
+	// entrypoint/cmd from the golden image metadata explicitly.
+	anchorSpec.Entrypoint = anchorRootfs.imgConfig.Entrypoint
+	anchorSpec.Command = anchorRootfs.imgConfig.Cmd
 	for _, ep := range endpoints {
 		anchorSpec.Ports = append(anchorSpec.Ports, container.PortMapping{Host: ep.HostBind, Container: ep.GuestPort})
 	}

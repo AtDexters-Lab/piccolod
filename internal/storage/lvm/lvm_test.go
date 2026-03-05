@@ -370,6 +370,43 @@ func TestLVManager_CreateThinLV(t *testing.T) {
 	}
 }
 
+func TestLVManager_CreateThinLV_aligns_to_sector(t *testing.T) {
+	run := &fakeRunner{}
+	mgr := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+
+	// 1319306057B is the size that triggered the original bug — not a multiple of 512.
+	if err := mgr.CreateThinLV(context.Background(), "golden-test", 1319306057); err != nil {
+		t.Fatalf("CreateThinLV: %v", err)
+	}
+	call := run.calls[0]
+	// Must be aligned: 1319306057 → ceil to 512 → 1319306240
+	if !strings.Contains(call, "1319306240B") {
+		t.Errorf("expected aligned size 1319306240B in lvcreate args, got %q", call)
+	}
+}
+
+func TestAlignToSector(t *testing.T) {
+	tests := []struct {
+		input int64
+		want  int64
+	}{
+		{0, 0},
+		{1, 512},
+		{511, 512},
+		{512, 512},
+		{513, 1024},
+		{1024, 1024},
+		{1319306057, 1319306240}, // the real-world failing case
+		{10 << 30, 10 << 30},    // already aligned (10 GiB)
+	}
+	for _, tt := range tests {
+		got := alignToSector(tt.input)
+		if got != tt.want {
+			t.Errorf("alignToSector(%d) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestLVManager_RemoveThinLV(t *testing.T) {
 	run := &fakeRunner{}
 	mgr := NewLVManager(run, DefaultVGName, DefaultThinPoolName)

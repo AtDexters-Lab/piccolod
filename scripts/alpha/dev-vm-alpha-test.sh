@@ -339,6 +339,18 @@ stage_post_setup() {
   local session
   session=$(api "/api/v1/auth/session")
   check "4.2" "Session valid" "$session" '"authenticated"'
+
+  # Storage diagnostics API
+  check_http "4.3" "Storage diagnostics accessible" "GET" "/api/v1/system/storage-diagnostics" "200"
+  local diag
+  diag=$(apij "/api/v1/system/storage-diagnostics")
+  if [[ -n "$diag" ]]; then
+    check "4.4" "Diagnostics has thin pool" "$diag" '"thin_pool"'
+    check "4.5" "Diagnostics has volumes" "$diag" '"volumes"'
+    check "4.6" "Diagnostics has type summary" "$diag" '"type_summary"'
+  else
+    skip "4.4" "Storage diagnostics" "empty response"
+  fi
 }
 
 # ─────────────────────────────────────────────────────────

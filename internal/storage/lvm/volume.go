@@ -33,7 +33,10 @@ func NewLVManager(run runner.CommandRunner, vgName, poolName string) *LVManager 
 }
 
 // CreateThinLV creates a new thin logical volume.
+// sizeBytes is rounded up to the nearest 512-byte sector boundary
+// (LVM requires sector-aligned --virtualsize values).
 func (m *LVManager) CreateThinLV(ctx context.Context, name string, sizeBytes int64) error {
+	sizeBytes = alignToSector(sizeBytes)
 	sizeArg := fmt.Sprintf("%dB", sizeBytes)
 	if err := m.run.Run(ctx, "lvcreate",
 		"--thin",
@@ -96,6 +99,7 @@ func (m *LVManager) CreateSnapshot(ctx context.Context, originLV, snapshotName s
 
 // ResizeLV resizes a thin logical volume.
 func (m *LVManager) ResizeLV(ctx context.Context, name string, newSizeBytes int64) error {
+	newSizeBytes = alignToSector(newSizeBytes)
 	sizeArg := fmt.Sprintf("%dB", newSizeBytes)
 	lvPath := fmt.Sprintf("%s/%s", m.vgName, name)
 	if err := m.run.Run(ctx, "lvresize", "-L", sizeArg, lvPath); err != nil {
@@ -175,4 +179,13 @@ func (m *LVManager) ListLVs(ctx context.Context) ([]ThinLV, error) {
 		})
 	}
 	return lvs, nil
+}
+
+// alignToSector rounds n up to the nearest 512-byte boundary.
+func alignToSector(n int64) int64 {
+	const sectorSize = 512
+	if n <= 0 {
+		return 0
+	}
+	return (n + sectorSize - 1) &^ (sectorSize - 1)
 }

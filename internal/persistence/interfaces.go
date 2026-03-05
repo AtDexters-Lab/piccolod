@@ -82,26 +82,32 @@ type RootfsVolumeManager interface {
 
 // GoldenLVRequest describes the image for a golden LV.
 type GoldenLVRequest struct {
-	ImageDigest string
-	ImageRef    string
+	ImageDigest   string
+	ImageRef      string
+	ImageSizeHint int64  // uncompressed image size; when > 0, skips imageSizeFn pull
+	PrePulledDir  string // when non-empty, podman root dir with the image already pulled — flattenFn reuses it
 }
 
 // WorkspaceRootfsRequest describes a workspace rootfs creation request.
 type WorkspaceRootfsRequest struct {
-	InstanceID  string
-	ImageDigest string
-	ImageRef    string
-	IDMap       IDMapConfig
+	InstanceID    string
+	ImageDigest   string
+	ImageRef      string
+	IDMap         IDMapConfig
+	ImageSizeHint int64  // uncompressed image size; when > 0, skips imageSizeFn pull
+	PrePulledDir  string // podman root dir with image already pulled
 }
 
 // ServiceRootfsRequest describes a service rootfs creation request.
 type ServiceRootfsRequest struct {
-	InstanceID  string
-	ServiceName string // per-service rootfs; empty = legacy single-rootfs
-	ImageDigest string
-	ImageRef    string
-	IDMap       IDMapConfig
-	VolumeID    string // optional: override derived volume ID (for versioned updates, RFC 20260302)
+	InstanceID    string
+	ServiceName   string // per-service rootfs; empty = legacy single-rootfs
+	ImageDigest   string
+	ImageRef      string
+	IDMap         IDMapConfig
+	VolumeID      string // optional: override derived volume ID (for versioned updates, RFC 20260302)
+	ImageSizeHint int64  // uncompressed image size; when > 0, skips imageSizeFn pull
+	PrePulledDir  string // podman root dir with image already pulled
 }
 
 // RootfsHandle is a reference to a mounted rootfs volume.

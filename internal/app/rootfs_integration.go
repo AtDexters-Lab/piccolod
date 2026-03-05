@@ -114,6 +114,8 @@ type rootfsMountInfo struct {
 // For ModeService: creates golden LV + service rootfs snapshot (read-only idmapped).
 // For ModeWorkspace: creates golden LV + workspace rootfs snapshot (read-write idmapped).
 // serviceName is used for per-service volume IDs in multi-container apps (empty for workspace).
+// imageSizeHint, when > 0, is the uncompressed image size from a prior inspect — avoids a redundant pull.
+// prePulledDir, when non-empty, is a podman root dir where the image is already pulled — flattenFn reuses it.
 func (m *AppManager) prepareRootfsStorage(
 	ctx context.Context,
 	mode PiccoloMode,
@@ -121,6 +123,8 @@ func (m *AppManager) prepareRootfsStorage(
 	serviceName string,
 	imageDigest, imageRef string,
 	idmapConfig persistence.IDMapConfig,
+	imageSizeHint int64,
+	prePulledDir string,
 ) (*rootfsMountInfo, error) {
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
@@ -133,18 +137,22 @@ func (m *AppManager) prepareRootfsStorage(
 	switch mode {
 	case ModeService:
 		handle, err = rootfs.CreateServiceRootfs(ctx, persistence.ServiceRootfsRequest{
-			InstanceID:  instanceID,
-			ServiceName: serviceName,
-			ImageDigest: imageDigest,
-			ImageRef:    imageRef,
-			IDMap:       idmapConfig,
+			InstanceID:    instanceID,
+			ServiceName:   serviceName,
+			ImageDigest:   imageDigest,
+			ImageRef:      imageRef,
+			IDMap:         idmapConfig,
+			ImageSizeHint: imageSizeHint,
+			PrePulledDir:  prePulledDir,
 		})
 	case ModeWorkspace:
 		handle, err = rootfs.CreateWorkspaceFromGolden(ctx, persistence.WorkspaceRootfsRequest{
-			InstanceID:  instanceID,
-			ImageDigest: imageDigest,
-			ImageRef:    imageRef,
-			IDMap:       idmapConfig,
+			InstanceID:    instanceID,
+			ImageDigest:   imageDigest,
+			ImageRef:      imageRef,
+			IDMap:         idmapConfig,
+			ImageSizeHint: imageSizeHint,
+			PrePulledDir:  prePulledDir,
 		})
 	default:
 		return nil, fmt.Errorf("unknown mode %q for rootfs", mode)
@@ -322,8 +330,14 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 			if aErr != nil {
 				return nil, fmt.Errorf("attach rootfs for network anchor: %w", aErr)
 			}
+			var anchorCfg persistence.GoldenImageConfig
+			if handle.GoldenLV != "" {
+				if cfg, cfgErr := rootfs.ReadGoldenImageConfig(ctx, handle.GoldenLV); cfgErr == nil {
+					anchorCfg = cfg
+				}
+			}
 			log.Printf("INFO: attached anchor rootfs %s (mount=%s)", anchorVolID, handle.MountPath)
-			result[networkAnchorServiceName] = &rootfsMountInfo{handle: handle}
+			result[networkAnchorServiceName] = &rootfsMountInfo{handle: handle, imgConfig: anchorCfg}
 		}
 		return result, nil
 	}
@@ -355,8 +369,14 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 		if err != nil {
 			return nil, fmt.Errorf("attach rootfs for network anchor: %w", err)
 		}
+		var anchorCfg persistence.GoldenImageConfig
+		if handle.GoldenLV != "" {
+			if cfg, cfgErr := rootfs.ReadGoldenImageConfig(ctx, handle.GoldenLV); cfgErr == nil {
+				anchorCfg = cfg
+			}
+		}
 		log.Printf("INFO: attached anchor rootfs %s (mount=%s)", anchorVolID, handle.MountPath)
-		result[networkAnchorServiceName] = &rootfsMountInfo{handle: handle}
+		result[networkAnchorServiceName] = &rootfsMountInfo{handle: handle, imgConfig: anchorCfg}
 	}
 
 	for svcName, svc := range appDef.Services {
@@ -565,21 +585,33 @@ func (m *AppManager) appHasAnyServiceRootfs(instanceID string, mode PiccoloMode,
 
 // MakeFlattenFn creates the flatten function that extracts an OCI image to a target directory
 // and returns its OCI config. Injected into the persistence layer during service construction.
-// Uses an ephemeral podman runtime per flatten — no persistent imagestore.
-func (m *AppManager) MakeFlattenFn() func(ctx context.Context, imageRef, targetDir string) (persistence.GoldenImageConfig, error) {
-	return func(ctx context.Context, imageRef, targetDir string) (persistence.GoldenImageConfig, error) {
+// When prePulledDir is non-empty, the image is already pulled in that podman root dir —
+// the function reuses it instead of pulling again (eliminates redundant network round-trip).
+func (m *AppManager) MakeFlattenFn() func(ctx context.Context, imageRef, targetDir, prePulledDir string) (persistence.GoldenImageConfig, error) {
+	return func(ctx context.Context, imageRef, targetDir, prePulledDir string) (persistence.GoldenImageConfig, error) {
 		var cfg persistence.GoldenImageConfig
 
-		rt, cleanup, rtErr := newEphemeralFlattenRuntime(m.runtimeUser)
-		if rtErr != nil {
-			return cfg, fmt.Errorf("ephemeral runtime: %w", rtErr)
+		var rt container.PodmanRuntime
+		var cleanup func()
+
+		if prePulledDir != "" {
+			// Reuse the caller's pre-pulled runtime — image is already there.
+			rt = newRuntimeFromDir(prePulledDir, m.runtimeUser)
+			cleanup = func() {} // caller owns the directory lifecycle
+			log.Printf("INFO: flatten %s: reusing pre-pulled runtime at %s", imageRef, prePulledDir)
+		} else {
+			var rtErr error
+			rt, cleanup, rtErr = newEphemeralFlattenRuntime(m.runtimeUser)
+			if rtErr != nil {
+				return cfg, fmt.Errorf("ephemeral runtime: %w", rtErr)
+			}
+			// Pull the image into ephemeral runtime.
+			if err := m.containerManager.PullImage(ctx, rt, imageRef); err != nil {
+				cleanup()
+				return cfg, fmt.Errorf("pull image %s: %w", imageRef, err)
+			}
 		}
 		defer cleanup()
-
-		// Pull the image into ephemeral runtime.
-		if err := m.containerManager.PullImage(ctx, rt, imageRef); err != nil {
-			return cfg, fmt.Errorf("pull image %s: %w", imageRef, err)
-		}
 
 		// Extract image config.
 		imgConfig, err := m.containerManager.InspectImage(ctx, rt, imageRef)

@@ -43,7 +43,7 @@ type Options struct {
 	DRBDMgr *drbd.ResourceManager
 
 	// Rootfs dependencies.
-	FlattenFn   func(ctx context.Context, imageRef, targetDir string) (GoldenImageConfig, error)
+	FlattenFn   func(ctx context.Context, imageRef, targetDir, prePulledDir string) (GoldenImageConfig, error)
 	ImageSizeFn func(ctx context.Context, imageRef string) (int64, error)
 }
 

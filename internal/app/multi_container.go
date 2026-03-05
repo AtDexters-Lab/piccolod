@@ -148,7 +148,9 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 	// Apply block-native rootfs configuration (golden LV path) if provided
 	if opts.rootfsHandle != nil && opts.goldenImgConfig != nil {
 		spec.Rootfs = opts.rootfsHandle.MountPath
-		spec.ReadOnly = opts.rootfsHandle.ReadOnly
+		spec.RootfsOverlay = opts.rootfsHandle.ReadOnly
+		// Don't set ReadOnly — the :O overlay upper layer must be writable.
+		// The underlying btrfs mount is already read-only; writes go to the ephemeral overlay.
 		spec.Image = ""
 
 		// Apply image config since Podman doesn't do it in --rootfs mode.
