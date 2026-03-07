@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -388,15 +387,6 @@ func (m *Module) detachVolumeIfMounted(ctx context.Context, handle VolumeHandle)
 		return err
 	}
 	if !mounted {
-		// The mount disappeared (e.g., after an unclean shutdown).
-		// Best-effort cleanup of stale markers so subsequent lock attempts
-		// do not mis-detect a mounted volume.
-		for _, name := range []string{".cipher", ".mode"} {
-			p := filepath.Join(handle.MountDir, name)
-			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-		}
 		return nil
 	}
 	return m.volumes.Detach(ctx, handle)

@@ -47,15 +47,12 @@ func requireMountBypassAllowed(t *testing.T) {
 
 func ensureTestControlMetadata(t *testing.T, root string) {
 	t.Helper()
-	cipherDir := filepath.Join(root, "ciphertext", "control")
-	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
-		t.Fatalf("mkdir cipher dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(cipherDir, "gocryptfs.conf"), []byte("stub"), 0o600); err != nil {
-		t.Fatalf("write gocryptfs.conf: %v", err)
+	metaDir := filepath.Join(root, "volumes", "control")
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatalf("mkdir meta dir: %v", err)
 	}
 	meta := `{"version":1,"wrapped_key":"stub","nonce":"stub"}`
-	if err := os.WriteFile(filepath.Join(cipherDir, "piccolo.volume.json"), []byte(meta), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(metaDir, "piccolo.volume.json"), []byte(meta), 0o600); err != nil {
 		t.Fatalf("write volume metadata: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(root, "mounts", "control"), 0o700); err != nil {
