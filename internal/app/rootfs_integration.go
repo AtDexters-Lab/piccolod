@@ -601,7 +601,7 @@ func (m *AppManager) MakeFlattenFn() func(ctx context.Context, imageRef, targetD
 			log.Printf("INFO: flatten %s: reusing pre-pulled runtime at %s", imageRef, prePulledDir)
 		} else {
 			var rtErr error
-			rt, cleanup, rtErr = newEphemeralFlattenRuntime(m.runtimeUser)
+			rt, cleanup, rtErr = m.newFlattenRuntime(ctx)
 			if rtErr != nil {
 				return cfg, fmt.Errorf("ephemeral runtime: %w", rtErr)
 			}
@@ -654,7 +654,7 @@ func (m *AppManager) MakeFlattenFn() func(ctx context.Context, imageRef, targetD
 // Uses an ephemeral podman runtime — no persistent imagestore.
 func (m *AppManager) MakeImageSizeFn() func(ctx context.Context, imageRef string) (int64, error) {
 	return func(ctx context.Context, imageRef string) (int64, error) {
-		rt, cleanup, rtErr := newEphemeralFlattenRuntime(m.runtimeUser)
+		rt, cleanup, rtErr := m.newFlattenRuntime(ctx)
 		if rtErr != nil {
 			return 0, fmt.Errorf("ephemeral runtime: %w", rtErr)
 		}

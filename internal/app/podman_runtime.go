@@ -153,15 +153,15 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 
 // newEphemeralFlattenRuntime creates a temporary podman root for a single
 // flatten operation. The caller must invoke cleanup() when done.
-// Uses CoreJoin("tmp") as base — avoids /tmp tmpfs space constraints on
-// edge devices with large images. Orphaned tmpdirs from crashes are
-// cleaned up on daemon start via cleanStaleFlattenDirs.
-func newEphemeralFlattenRuntime(ru container.RuntimeUser) (container.PodmanRuntime, func(), error) {
-	flattenBase := paths.CoreJoin("tmp")
-	if err := os.MkdirAll(flattenBase, 0o711); err != nil {
+// baseDir is the parent directory for flatten-* temp dirs (typically the
+// scratch volume mount point, or CoreJoin("tmp") as fallback).
+// Orphaned tmpdirs from crashes are cleaned up by the scratch volume's
+// ensureEphemeralVolume recovery path, or by cleanStaleFlattenDirs for legacy dirs.
+func newEphemeralFlattenRuntime(baseDir string, ru container.RuntimeUser) (container.PodmanRuntime, func(), error) {
+	if err := os.MkdirAll(baseDir, 0o711); err != nil {
 		return container.PodmanRuntime{}, nil, fmt.Errorf("ensure flatten base: %w", err)
 	}
-	base, err := os.MkdirTemp(flattenBase, "flatten-*")
+	base, err := os.MkdirTemp(baseDir, "flatten-*")
 	if err != nil {
 		return container.PodmanRuntime{}, nil, fmt.Errorf("create flatten tmpdir: %w", err)
 	}
@@ -212,20 +212,27 @@ func newRuntimeFromDir(baseDir string, ru container.RuntimeUser) container.Podma
 	}
 }
 
-// cleanStaleFlattenDirs removes orphaned flatten-* tmpdirs from prior crashes.
-// Called on daemon startup.
+// cleanStaleFlattenDirs removes orphaned flatten-* tmpdirs from the legacy
+// boot-partition path (CoreJoin("tmp")). Retained for one release to clean up
+// dirs created before flatten moved to the scratch ephemeral volume.
 func cleanStaleFlattenDirs() {
-	flattenBase := paths.CoreJoin("tmp")
-	entries, err := os.ReadDir(flattenBase)
+	cleanStaleDirsIn(paths.CoreJoin("tmp"))
+}
+
+// cleanStaleDirsIn removes orphaned flatten-* subdirectories under dir.
+// Called on daemon startup for legacy path and after scratch volume attach
+// for crash recovery.
+func cleanStaleDirsIn(dir string) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
 		if e.IsDir() && strings.HasPrefix(e.Name(), "flatten-") {
-			target := filepath.Join(flattenBase, e.Name())
-			log.Printf("INFO: cleaning stale flatten tmpdir: %s", target)
+			target := filepath.Join(dir, e.Name())
+			log.Printf("INFO: cleaning stale flatten dir: %s", target)
 			if err := os.RemoveAll(target); err != nil {
-				log.Printf("WARN: failed to clean stale flatten tmpdir %s: %v", target, err)
+				log.Printf("WARN: failed to clean stale flatten dir %s: %v", target, err)
 			}
 		}
 	}

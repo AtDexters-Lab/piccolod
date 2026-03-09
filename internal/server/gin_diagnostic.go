@@ -201,7 +201,7 @@ func (s *GinServer) handleStorageCheck(c *gin.Context) {
 
 	// Test: create ephemeral runtime to verify overlay storage works.
 	start := time.Now()
-	ephRT, cleanup, err := s.appManager.DiagnosticEphemeralRuntime()
+	ephRT, cleanup, err := s.appManager.DiagnosticEphemeralRuntime(ctx)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"checks": []checkResult{
 			{Name: "ephemeral_runtime_init", Error: err.Error()},

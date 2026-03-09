@@ -178,7 +178,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			// Pull to ephemeral runtime for digest, then prepare rootfs.
 			// The same ephemeral runtime is reused by flattenFn inside EnsureGoldenLV,
 			// avoiding a redundant second pull of the same image.
-			ephRT, ephCleanup, ephErr := newEphemeralFlattenRuntime(m.runtimeUser)
+			ephRT, ephCleanup, ephErr := m.newFlattenRuntime(ctx)
 			if ephErr != nil {
 				return nil, fmt.Errorf("create ephemeral runtime: %w", ephErr)
 			}
@@ -221,7 +221,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		}
 	}
 	if _, ok := blockNativeRootfsMap[networkAnchorServiceName]; !ok {
-		ephRT, ephCleanup, ephErr := newEphemeralFlattenRuntime(m.runtimeUser)
+		ephRT, ephCleanup, ephErr := m.newFlattenRuntime(ctx)
 		if ephErr != nil {
 			return nil, fmt.Errorf("create ephemeral runtime for anchor: %w", ephErr)
 		}

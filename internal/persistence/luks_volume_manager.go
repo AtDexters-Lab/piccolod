@@ -32,7 +32,7 @@ const (
 	controlPlaneSize     = 256 << 20 // 256 MiB
 
 	ephLVPrefix    = "eph-"
-	ephDefaultSize = 10 << 30 // 10 GiB
+	ephDefaultSize = 50 << 30 // 50 GiB (thin-provisioned — only written blocks consume physical space)
 )
 
 // volumeMetaV2 is the on-disk metadata schema for block-native volumes.
