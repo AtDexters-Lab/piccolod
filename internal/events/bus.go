@@ -34,9 +34,9 @@ const (
 	// Storage events
 	TopicStoragePhase1Complete  Topic = "storage_phase1_complete"  // Phase 1 disk prep finished
 	TopicStorageEmergency       Topic = "storage_emergency"        // Storage entered emergency mode
-	TopicStorageLUKSInitialized Topic = "storage_luks_initialized" // LUKS data volume initialized
-	TopicStorageLUKSUnlocked    Topic = "storage_luks_unlocked"    // LUKS data volume unlocked
-	TopicStorageLocked          Topic = "storage_locked"            // Storage locked (LUKS closed)
+	TopicStoragePoolInitialized Topic = "storage_pool_initialized" // LVM data pool initialized
+	TopicStoragePoolActivated   Topic = "storage_pool_activated"   // LVM data pool activated
+	TopicStorageLocked          Topic = "storage_locked"            // Storage locked (LVM deactivated)
 
 	// PCV export events
 	TopicPCVExportPublished Topic = "pcv_export_published" // PCV archive published successfully

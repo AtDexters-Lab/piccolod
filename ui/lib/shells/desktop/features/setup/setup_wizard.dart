@@ -6,6 +6,7 @@ import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/network_service.dart';
 import 'package:piccolo_os/core/utils/downloader/downloader.dart';
 import 'package:piccolo_os/shared/widgets/ca_import_guide.dart';
+import 'package:piccolo_os/shared/widgets/diagnostic_log_download.dart';
 import 'package:piccolo_os/shared/widgets/password_set_form.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/install_disk_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/onboarding_step.dart';
@@ -1228,41 +1229,10 @@ class _ForgotPasswordStepState extends State<_ForgotPasswordStep> {
   }
 }
 
-class _SystemErrorStep extends StatefulWidget {
+class _SystemErrorStep extends StatelessWidget {
   const _SystemErrorStep({required this.error, required this.onRetry});
   final String error;
   final VoidCallback onRetry;
-  @override
-  State<_SystemErrorStep> createState() => _SystemErrorStepState();
-}
-
-class _SystemErrorStepState extends State<_SystemErrorStep> {
-  bool _downloading = false;
-
-  Future<void> _downloadLog() async {
-    setState(() => _downloading = true);
-    try {
-      final response = await ApiClient().get('/api/v1/system/diagnostic-log');
-      if (response is! String) {
-        debugPrint('WARNING: diagnostic-log returned ${response.runtimeType}, expected String');
-      }
-      downloadTextFile(
-        response is String ? response : response?.toString() ?? '',
-        'piccolod-diagnostic.log',
-      );
-    } on Object catch (e) {
-      debugPrint('Diagnostic log download failed: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to download log: $e'),
-          ),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _downloading = false);
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -1296,7 +1266,7 @@ class _SystemErrorStepState extends State<_SystemErrorStep> {
                   padding: const EdgeInsets.symmetric(vertical: 8),
                   child: SelectionArea(
                     child: Text(
-                      widget.error,
+                      error,
                       style: const TextStyle(fontSize: 12, color: PiccoloTheme.inkMuted),
                     ),
                   ),
@@ -1305,15 +1275,14 @@ class _SystemErrorStepState extends State<_SystemErrorStep> {
             ],
           ),
           const SizedBox(height: 24),
-          OutlinedButton.icon(
-            onPressed: _downloading ? null : _downloadLog,
-            icon: const Icon(PiccoloIcons.download, size: 16),
-            label: Text(_downloading ? 'Downloading...' : 'Download Diagnostic Log'),
-            style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.ink),
+          const DiagnosticLogDownload(
+            apiPath: '/api/v1/system/diagnostic-log',
+            showTitle: false,
+            showDescription: false,
           ),
           const SizedBox(height: 16),
           FilledButton.icon(
-            onPressed: widget.onRetry,
+            onPressed: onRetry,
             icon: const Icon(PiccoloIcons.refresh),
             label: const Text('Retry'),
             style: FilledButton.styleFrom(

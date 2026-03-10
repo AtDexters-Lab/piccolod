@@ -79,6 +79,11 @@ type AppManager struct {
 
 	// Block-native rootfs volume manager for golden LVs and workspace/service rootfs.
 	rootfsMgr persistence.RootfsVolumeManager
+
+	// Shared scratch ephemeral thin LV for flatten operations.
+	scratchMu       sync.Mutex
+	scratchHandle   persistence.VolumeHandle
+	scratchAttached bool
 }
 
 var (
@@ -92,7 +97,13 @@ type LockStateReader interface {
 	ControlLocked() bool
 }
 
-const maxInstallPortRetries = 5
+const (
+	maxInstallPortRetries = 5
+
+	// scratchFlattenVolumeID is the ephemeral thin LV used as backing store
+	// for flatten operations (image pull → export → golden LV creation).
+	scratchFlattenVolumeID = "scratch-flatten"
+)
 
 // parseEnvSlice converts OCI-style env slice (KEY=VALUE) to a map.
 // If duplicate keys exist, the last value wins.
@@ -206,8 +217,93 @@ func (m *AppManager) SetMountVerifier(fn func(string) error) {
 
 // DiagnosticEphemeralRuntime creates a short-lived podman runtime for storage
 // diagnostics. The caller must invoke cleanup() when done.
-func (m *AppManager) DiagnosticEphemeralRuntime() (container.PodmanRuntime, func(), error) {
-	return newEphemeralFlattenRuntime(m.runtimeUser)
+func (m *AppManager) DiagnosticEphemeralRuntime(ctx context.Context) (container.PodmanRuntime, func(), error) {
+	return m.newFlattenRuntime(ctx)
+}
+
+// ensureScratchVolume lazy-initializes the shared scratch ephemeral thin LV
+// and returns its mount directory. Thread-safe — concurrent callers block
+// until the first initialization completes.
+func (m *AppManager) ensureScratchVolume(ctx context.Context) (string, error) {
+	m.scratchMu.Lock()
+	defer m.scratchMu.Unlock()
+
+	if m.scratchAttached {
+		return m.scratchHandle.MountDir, nil
+	}
+
+	// Read volumeManager under stateMu to avoid a data race with SetVolumeManager.
+	m.stateMu.RLock()
+	vm := m.volumeManager
+	m.stateMu.RUnlock()
+
+	if vm == nil {
+		fallback := paths.CoreJoin("tmp")
+		log.Printf("WARN: volumeManager nil — falling back to %s for flatten scratch", fallback)
+		return fallback, nil
+	}
+
+	handle, err := vm.EnsureVolume(ctx, persistence.VolumeRequest{
+		ID:    scratchFlattenVolumeID,
+		Class: persistence.VolumeClassEphemeral,
+	})
+	if err != nil {
+		return "", fmt.Errorf("ensure scratch volume: %w", err)
+	}
+
+	// After an unclean restart the LV may still be mounted from the previous
+	// process. Detect this and reuse the existing mount to avoid a double-mount
+	// error from attachEphemeralVolume.
+	if mounted, _ := persistence.IsMountPoint(handle.MountDir); mounted {
+		cleanStaleDirsIn(handle.MountDir)
+		m.scratchHandle = handle
+		m.scratchAttached = true
+		log.Printf("INFO: scratch flatten volume already mounted at %s (reusing)", handle.MountDir)
+		return handle.MountDir, nil
+	}
+
+	if err := vm.Attach(ctx, handle, persistence.AttachOptions{}); err != nil {
+		return "", fmt.Errorf("attach scratch volume: %w", err)
+	}
+
+	// Clean up stale flatten-* dirs left by a previous crash. EnsureVolume
+	// may return an existing volume (metadata fast-path), so the filesystem
+	// can carry over orphaned dirs from prior runs.
+	cleanStaleDirsIn(handle.MountDir)
+
+	m.scratchHandle = handle
+	m.scratchAttached = true
+	log.Printf("INFO: scratch flatten volume attached at %s", handle.MountDir)
+	return handle.MountDir, nil
+}
+
+// releaseScratchVolume detaches the shared scratch volume. Best-effort —
+// logs warnings but never fails shutdown. Does not destroy the LV — cleanup
+// and recreation happen lazily on next ensureScratchVolume call.
+func (m *AppManager) releaseScratchVolume(ctx context.Context) {
+	m.scratchMu.Lock()
+	defer m.scratchMu.Unlock()
+
+	if !m.scratchAttached {
+		return
+	}
+
+	if err := m.volumeManager.Detach(ctx, m.scratchHandle); err != nil {
+		log.Printf("WARN: detach scratch volume: %v", err)
+	}
+	m.scratchAttached = false
+	log.Printf("INFO: scratch flatten volume detached")
+}
+
+// newFlattenRuntime creates an ephemeral podman runtime backed by the shared
+// scratch volume. Returns (runtime, cleanup, error). The cleanup function
+// removes only the flatten-* subdirectory, not the shared volume.
+func (m *AppManager) newFlattenRuntime(ctx context.Context) (container.PodmanRuntime, func(), error) {
+	baseDir, err := m.ensureScratchVolume(ctx)
+	if err != nil {
+		return container.PodmanRuntime{}, nil, fmt.Errorf("scratch volume: %w", err)
+	}
+	return newEphemeralFlattenRuntime(baseDir, m.runtimeUser)
 }
 
 // SetEventBus configures the event bus for publishing app status change events.
@@ -550,6 +646,14 @@ func (m *AppManager) StopBackground() {
 // before volumes are unmounted. Apps are stopped in parallel for efficiency.
 func (m *AppManager) StopAllApps(ctx context.Context) error {
 	log.Printf("INFO: Stopping all running apps for graceful shutdown...")
+
+	// Release the shared scratch volume on all exit paths (best-effort).
+	// Uses a fresh context so the unmount runs even if the shutdown ctx expired.
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		m.releaseScratchVolume(releaseCtx)
+	}()
 
 	// First, stop the background reconciliation loop
 	m.StopBackground()
@@ -2245,7 +2349,7 @@ func (m *AppManager) updateServiceModeImage(
 	}
 
 	// Create ephemeral runtime for image pull + inspect (digest derivation).
-	ephRT, ephCleanup, ephErr := newEphemeralFlattenRuntime(m.runtimeUser)
+	ephRT, ephCleanup, ephErr := m.newFlattenRuntime(ctx)
 	if ephErr != nil {
 		return fmt.Errorf("create ephemeral runtime: %w", ephErr)
 	}

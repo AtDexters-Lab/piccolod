@@ -104,7 +104,7 @@ func isEmergencyAllowed(path string) bool {
 
 // isEmergencySoftAllowed returns true for endpoints additionally permitted
 // during soft emergency. Crypto unlock and recovery are allowed because the
-// existing LUKS volume may still be unlockable. Crypto setup is blocked
+// existing data volume may still be activatable. Crypto setup is blocked
 // because it requires successful disk preparation.
 func isEmergencySoftAllowed(path string) bool {
 	allowed := []string{
@@ -128,8 +128,8 @@ func (s *GinServer) observeStorageEvents(bus *events.Bus) {
 
 	phase1Ch := bus.Subscribe(events.TopicStoragePhase1Complete, 4)
 	emergCh := bus.Subscribe(events.TopicStorageEmergency, 4)
-	initCh := bus.Subscribe(events.TopicStorageLUKSInitialized, 4)
-	unlockCh := bus.Subscribe(events.TopicStorageLUKSUnlocked, 4)
+	initCh := bus.Subscribe(events.TopicStoragePoolInitialized, 4)
+	unlockCh := bus.Subscribe(events.TopicStoragePoolActivated, 4)
 	lockCh := bus.Subscribe(events.TopicStorageLocked, 4)
 
 	go func() {
@@ -154,12 +154,12 @@ func (s *GinServer) observeStorageEvents(bus *events.Bus) {
 	}()
 	go func() {
 		for range initCh {
-			s.healthTracker.Setf("storage", health.LevelOK, "LUKS initialized and mounted")
+			s.healthTracker.Setf("storage", health.LevelOK, "storage initialized")
 		}
 	}()
 	go func() {
 		for range unlockCh {
-			s.healthTracker.Setf("storage", health.LevelOK, "LUKS unlocked and mounted")
+			s.healthTracker.Setf("storage", health.LevelOK, "storage activated")
 		}
 	}()
 	go func() {

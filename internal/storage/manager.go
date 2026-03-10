@@ -374,7 +374,7 @@ func (m *Manager) InitializeDataVolume(ctx context.Context) error {
 	m.lvmPool.StartHealthMonitor(healthMonitorInterval)
 
 	if m.bus != nil {
-		m.bus.Publish(events.Event{Topic: events.TopicStorageLUKSInitialized})
+		m.bus.Publish(events.Event{Topic: events.TopicStoragePoolInitialized})
 	}
 	log.Printf("storage: LVM thin pool initialized on %s", device)
 	return nil
@@ -424,7 +424,7 @@ func (m *Manager) UnlockDataVolume(ctx context.Context) error {
 	m.lvmPool.StartHealthMonitor(healthMonitorInterval)
 
 	if m.bus != nil {
-		m.bus.Publish(events.Event{Topic: events.TopicStorageLUKSUnlocked})
+		m.bus.Publish(events.Event{Topic: events.TopicStoragePoolActivated})
 	}
 	log.Printf("storage: LVM VG activated")
 	return nil

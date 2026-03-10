@@ -157,8 +157,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 
 	// 5. Initialize data volume BEFORE notifying persistence, so that
 	// storage volumes are available before the app-manager reconcile loop
-	// starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
-	// Capture error but defer failure until after session creation,
+	// starts. Capture error but defer failure until after session creation,
 	// so the user gets a portal session for recovery on LUKS failure.
 	var luksErr error
 	if s.storageMgr != nil {
@@ -182,7 +181,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		}
 	}
 
-	// 6. Notify persistence (mounts control-plane gocryptfs, enables SQLite)
+	// 6. Notify persistence (mounts control-plane LUKS volume, enables SQLite)
 	if err := s.notifyPersistenceLockState(setupCtx, false); err != nil {
 		log.Printf("WARN: failed to propagate unlock state: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
@@ -233,7 +232,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		}
 	}
 
-	// 9. Activate PCV publisher (depends on gocryptfs, not LUKS — safe even on LUKS failure).
+	// 9. Activate PCV publisher (depends on control-plane mount, safe even on data LUKS failure).
 	if s.pcvPublisher != nil {
 		s.pcvPublisher.Activate()
 	}
@@ -313,8 +312,7 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 	debug.FreeOSMemory()
 
 	// Unlock data volume BEFORE notifying persistence, so that
-	// storage volumes are available before the app-manager reconcile loop
-	// starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
+	// storage volumes are available before the app-manager reconcile loop starts.
 	var luksErr error
 	if s.storageMgr != nil {
 		if err := s.storageMgr.UnlockDataVolume(unlockCtx); err != nil {
@@ -330,7 +328,7 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
 		return
 	}
-	// Activate PCV publisher (always — depends on gocryptfs, not LUKS).
+	// Activate PCV publisher (depends on control-plane mount, safe even on data LUKS failure).
 	if s.pcvPublisher != nil {
 		s.pcvPublisher.Activate()
 	}
