@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"piccolod/internal/health"
 	"piccolod/internal/hostname"
 	"piccolod/internal/services"
 )
@@ -231,6 +232,19 @@ func (s *GinServer) csrfMiddleware() gin.HandlerFunc {
 		token := c.GetHeader("X-CSRF-Token")
 		if token == "" || token != sess.CSRF {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// requireUnhealthy blocks requests unless the system is in error state.
+// Used to gate the unauthenticated emergency diagnostic endpoint.
+func (s *GinServer) requireUnhealthy() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s.healthTracker == nil || s.healthTracker.Overall() < health.LevelError {
+			c.JSON(http.StatusForbidden, gin.H{"error": "system is operational"})
 			c.Abort()
 			return
 		}

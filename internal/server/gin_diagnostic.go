@@ -12,7 +12,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"piccolod/internal/container"
-	"piccolod/internal/health"
 	"piccolod/internal/logutil"
 )
 
@@ -22,44 +21,34 @@ const (
 	diagnosticMaxLines    = 50000
 )
 
-// handleDiagnosticLog: GET /api/v1/system/diagnostic-log
-// Serves redacted piccolod.service journal entries from current boot.
-// Gated: LAN-only (allowLANOnly middleware) + system must be unhealthy.
+// handleDiagnosticLog: GET /api/v1/system/diagnostic-log (emergency)
+//                      GET /api/v1/system/admin/diagnostic-log (admin)
+// Serves redacted full system journal. Auth/health gating done via middleware.
+// Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD narrows to a date range (max 7 days).
+// Default (no params): current boot, 50k line cap.
 func (s *GinServer) handleDiagnosticLog(c *gin.Context) {
-	// Only accessible when system is unhealthy — generic mechanism for any failure.
-	// Fail-closed: if healthTracker is nil, block access.
-	if s.healthTracker == nil || s.healthTracker.Overall() == health.LevelOK {
-		c.JSON(http.StatusForbidden, gin.H{"error": "system is operational"})
-		return
-	}
+	var args []string
 
-	out, err := fetchRedactedJournal(c.Request.Context(), "-b", "--lines=10000")
-	if err != nil {
-		log.Printf("WARN: fetchRedactedJournal: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read journal"})
-		return
+	fromStr, toStr := c.Query("from"), c.Query("to")
+	if fromStr != "" || toStr != "" {
+		since, until, err := parseDiagnosticRange(fromStr, toStr, time.Now())
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		args = append(args,
+			"--since", since.Format("2006-01-02 15:04:05"),
+			"--until", until.Format("2006-01-02 15:04:05"),
+		)
+	} else {
+		args = append(args, "-b")
 	}
-	c.Header("Content-Disposition", "attachment; filename=piccolod-diagnostic.log")
-	c.Data(http.StatusOK, "text/plain; charset=utf-8", out)
-}
+	args = append(args, "--lines", fmt.Sprintf("%d", diagnosticMaxLines))
 
-// handleAdminDiagnosticLog: GET /api/v1/system/admin/diagnostic-log
-// Serves redacted diagnostic log to authenticated admins — always available.
-// Supports optional ?from=YYYY-MM-DD&to=YYYY-MM-DD query params (max 7-day window).
-// Default: last 3 days. Spans across reboots (no -b flag).
-func (s *GinServer) handleAdminDiagnosticLog(c *gin.Context) {
-	now := time.Now()
-	since, until, err := parseDiagnosticRange(c.Query("from"), c.Query("to"), now)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	defer cancel()
 
-	out, err := fetchRedactedJournal(c.Request.Context(),
-		"--since", since.Format("2006-01-02 15:04:05"),
-		"--until", until.Format("2006-01-02 15:04:05"),
-		"--lines", fmt.Sprintf("%d", diagnosticMaxLines),
-	)
+	out, err := fetchRedactedJournal(ctx, args...)
 	if err != nil {
 		log.Printf("WARN: fetchRedactedJournal: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read journal"})
@@ -245,8 +234,9 @@ func (s *GinServer) handleStorageCheck(c *gin.Context) {
 }
 
 // fetchRedactedJournal runs journalctl with the given extra args and applies redaction.
+// Returns full system journal (no unit filter) for comprehensive diagnostics.
 func fetchRedactedJournal(ctx context.Context, extraArgs ...string) ([]byte, error) {
-	args := []string{"-u", "piccolod.service", "--no-pager", "-o", "short-iso"}
+	args := []string{"--no-pager", "-o", "short-iso"}
 	args = append(args, extraArgs...)
 
 	cmd := exec.CommandContext(ctx, "journalctl", args...)

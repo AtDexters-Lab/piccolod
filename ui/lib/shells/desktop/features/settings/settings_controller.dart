@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:piccolo_os/core/config/core_config.dart';
 import 'package:piccolo_os/core/models/os_update.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/core/models/session.dart';
@@ -212,21 +211,6 @@ class SettingsController extends ChangeNotifier {
          notifyListeners();
        }
      }
-  }
-
-  void downloadDiagnosticLog({DateTime? from, DateTime? to}) {
-    String formatDate(DateTime d) =>
-        '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
-
-    final params = <String, String>{};
-    if (from != null) params['from'] = formatDate(from);
-    if (to != null) params['to'] = formatDate(to);
-
-    final uri = Uri.parse(
-        '${CoreConfig.apiBaseUrl}/api/v1/system/admin/diagnostic-log')
-      .replace(queryParameters: params.isNotEmpty ? params : null);
-
-    downloader.downloadFromUrl(uri.toString(), 'piccolod-diagnostic.log');
   }
 
   Future<void> downloadCACertificate() async {
