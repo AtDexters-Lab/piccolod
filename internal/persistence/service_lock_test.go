@@ -13,18 +13,13 @@ import (
 
 var errVolumeNotMounted = errors.New("test: volume not mounted")
 
-func TestModuleSetLockStateIgnoresStaleCipherMarker(t *testing.T) {
+func TestModuleSetLockStateToleratesUnmounted(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
 	mountDir := filepath.Join(root, "mounts", "control-plane")
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
 		t.Fatalf("mkdir mount dir: %v", err)
-	}
-	// Simulate a stale marker that survives an unclean shutdown even though the
-	// FUSE mount is already gone.
-	if err := os.WriteFile(filepath.Join(mountDir, ".cipher"), []byte("/ciphertext/control-plane"), 0o600); err != nil {
-		t.Fatalf("write cipher marker: %v", err)
 	}
 
 	ctrl := &stubLockableControl{}
@@ -40,7 +35,7 @@ func TestModuleSetLockStateIgnoresStaleCipherMarker(t *testing.T) {
 	}
 
 	if err := mod.setLockState(context.Background(), true); err != nil {
-		t.Fatalf("setLockState should tolerate stale marker: %v", err)
+		t.Fatalf("setLockState should tolerate unmounted volume: %v", err)
 	}
 }
 

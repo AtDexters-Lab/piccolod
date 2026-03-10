@@ -258,7 +258,7 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 			}
 			// Unlock successful — activate LVM data volume before notifying
 			// persistence, so storage volumes are available when the app-manager
-			// reconcile loop starts (RCA: docs/rca/20260212-gocryptfs-password-mismatch-on-reboot.md).
+			// reconcile loop starts.
 			// Use a background context so long-running ops survive client disconnect.
 			unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer unlockCancel()

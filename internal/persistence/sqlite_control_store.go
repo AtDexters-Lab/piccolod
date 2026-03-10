@@ -20,7 +20,6 @@ import (
 	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 
-	"piccolod/internal/fsutil"
 	"piccolod/internal/state/paths"
 )
 
@@ -28,7 +27,6 @@ const (
 	sqliteSchemaVersion       = 3 // Incremented for OIDC config
 	controlPayloadVersion     = 1
 	controlVolumeMetadataName = "piccolo.volume.json"
-	gocryptfsConfigName       = "gocryptfs.conf"
 )
 
 const defaultCheckpointInterval = time.Minute
@@ -59,7 +57,6 @@ type sqliteControlStore struct {
 	db                 *sql.DB
 	path               string
 	mountDir           string
-	cipherDir          string
 	metaDir            string
 	keySource          keyProvider
 	loaded             bool
@@ -111,23 +108,15 @@ func newSQLiteControlStore(stateDir string, kp keyProvider) (*sqliteControlStore
 	if base == "" {
 		base = paths.CoreRoot()
 	}
-	cipherDir := filepath.Join(base, "ciphertext", "control-plane")
-	// cipherDir is created later by ensureCipherDir (via EnsureVolume) which
-	// creates a btrfs subvolume for PCV snapshots. Creating it here as a
-	// regular directory would prevent ensureCipherDir's early-exit check from
-	// upgrading it to a subvolume.
 	mountDir := filepath.Join(base, "mounts", "control-plane")
-	// mountDir is created later by EnsureVolume — not here — to avoid
-	// MkdirAll failing on a stale FUSE inode from a previous crash.
 	metaDir := filepath.Join(base, "volumes", "control-plane")
 	// metaDir is created on-demand by ensureMetadata / writeVolumeState
-	// (via EnsureVolume). Creating it here would cause
+	// (via EnsureVolume). Pre-creating it would cause
 	// reconcileAllVolumeStates to pre-register the control-plane entry,
-	// making EnsureVolume's early-return path skip ensureCipherDir.
+	// making EnsureVolume skip ciphertext subvolume creation.
 	store := &sqliteControlStore{
 		path:               filepath.Join(mountDir, "control.db"),
 		mountDir:           mountDir,
-		cipherDir:          cipherDir,
 		metaDir:            metaDir,
 		keySource:          kp,
 		checkpointFn:       defaultCheckpointFn,
@@ -164,40 +153,14 @@ func configureSQLite(db *sql.DB, readOnly bool) error {
 	return nil
 }
 
-func ensureControlVolumePrepared(cipherDir, metaDir string) error {
-	if _, err := os.Stat(filepath.Join(cipherDir, gocryptfsConfigName)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return ErrLocked
-		}
-		return err
-	}
-
+func ensureControlVolumeMetadata(metaDir string) error {
 	metaPath := filepath.Join(metaDir, controlVolumeMetadataName)
-	if _, err := os.Stat(metaPath); err == nil {
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	// Not found in metaDir, check legacy location
-	legacyPath := filepath.Join(cipherDir, controlVolumeMetadataName)
-	data, err := os.ReadFile(legacyPath)
-	if err != nil {
+	if _, err := os.Stat(metaPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return ErrLocked
 		}
 		return err
 	}
-
-	// Found in legacy, migrate
-	if err := os.MkdirAll(metaDir, 0o700); err != nil {
-		return fmt.Errorf("ensure control meta dir: %w", err)
-	}
-	if err := fsutil.AtomicWriteFile(metaPath, data, 0o600); err != nil {
-		return fmt.Errorf("migrate control metadata: %w", err)
-	}
-	_ = os.Remove(legacyPath)
-
 	return nil
 }
 
@@ -710,16 +673,10 @@ func (s *sqliteControlStore) volumeReady() error {
 			return err
 		}
 		if mounted {
-			// Volume already mounted (block-native LUKS path or gocryptfs).
-			// Skip gocryptfs-specific config checks — the mount is proof of readiness.
 			return nil
 		}
 	}
-	// Not yet mounted: fall through to gocryptfs prerequisite checks (legacy path).
-	if err := ensureControlVolumePrepared(s.cipherDir, s.metaDir); err != nil {
-		return err
-	}
-	return nil
+	return ensureControlVolumeMetadata(s.metaDir)
 }
 
 func (s *sqliteControlStore) withWrite(mutator func(tx *sql.Tx) error) error {

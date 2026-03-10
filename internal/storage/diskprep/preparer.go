@@ -85,12 +85,11 @@ func (p *Preparer) GetPartitionState(ctx context.Context) (*storage.PartitionSta
 		state.UnallocatedGB = int((totalSectors - lastEndSector) * int64(sectorSize) / (1 << 30))
 	}
 
-	// Look for data partition (LUKS type code 8309 or LUKS header)
+	// Look for data partition (LUKS type code 8309, LUKS header, or LVM PV)
 	dataNode, dataSlot := p.findDataPartition(ctx, disk, sfdisk)
 	if dataNode != "" {
 		state.DataPartition = dataNode
 		state.DataPartitionSlot = dataSlot
-		state.DataPartitionLUKS, _ = IsLUKS(ctx, p.run, dataNode)
 	}
 
 	return state, nil
@@ -158,8 +157,8 @@ func (p *Preparer) getSectorSize(ctx context.Context, disk string) (int, error) 
 	return strconv.Atoi(strings.TrimSpace(string(out)))
 }
 
-// hasFilesystem checks if a device has any filesystem signature via blkid.
-// Returns true if blkid detects a filesystem (ext4, btrfs, xfs, swap, etc.),
+// hasFilesystem checks if a device has any filesystem or volume signature via blkid.
+// Returns true if blkid detects a signature (ext4, btrfs, xfs, swap, LVM2_member, etc.),
 // false only if blkid explicitly reports no signature (exit code 2).
 // On probe errors (I/O, missing binary) returns true as a fail-safe to avoid
 // misidentifying an existing partition as raw.
@@ -221,7 +220,8 @@ func (p *Preparer) readSfdisk(ctx context.Context, disk string) (storage.SfdiskO
 	return storage.ParseSfdiskJSON(out)
 }
 
-// findDataPartition looks for a data partition by LUKS type code or LUKS header.
+// findDataPartition looks for a data partition by LUKS type code, LUKS header,
+// or LVM PV signature.
 // On GPT, the LUKS type GUID provides a fast path. On MBR, there is no distinct
 // LUKS type code (both root and data use 0x83), so we go straight to header probing.
 func (p *Preparer) findDataPartition(ctx context.Context, disk string, sfdisk storage.SfdiskOutput) (node string, slot int) {
@@ -247,12 +247,24 @@ func (p *Preparer) findDataPartition(ctx context.Context, disk string, sfdisk st
 			return part.Node, extractSlotNumber(part.Node)
 		}
 	}
+	// LVM PV: in block-native mode the data partition hosts LVM directly
+	// (no pool-level LUKS). hasFilesystem() returns true for LVM2_member
+	// signatures, so the MBR last-resort (raw type-83) cannot match — this
+	// tier bridges that gap.
+	for _, part := range sfdisk.PartitionTable.Partitions {
+		if part.Node == "" || part.Node == rootDev {
+			continue
+		}
+		if isLVMPV(ctx, p.run, part.Node) {
+			return part.Node, extractSlotNumber(part.Node)
+		}
+	}
 	// MBR last resort: accept a non-root Linux (type 83) partition that is raw
 	// (no filesystem signature). On MBR there is no LUKS-specific type code, so
-	// a data partition created in Phase 1 but not yet LUKS-initialized appears
-	// as plain type 83 with no signature. The hasFilesystem guard prevents
+	// a data partition created in Phase 1 but not yet initialized appears as
+	// plain type 83 with no signature. The hasFilesystem guard prevents
 	// misidentifying a pre-existing ext4/xfs/btrfs partition as the data
-	// partition, which would cause LUKS formatting to destroy its contents.
+	// partition. LVM PVs are caught by the tier above.
 	if sfdisk.IsMBR() {
 		for _, part := range sfdisk.PartitionTable.Partitions {
 			if part.Node == "" || part.Node == rootDev {
@@ -264,6 +276,15 @@ func (p *Preparer) findDataPartition(ctx context.Context, disk string, sfdisk st
 		}
 	}
 	return "", 0
+}
+
+// isLVMPV checks if a device is an LVM physical volume.
+func isLVMPV(ctx context.Context, run runner.CommandRunner, device string) bool {
+	out, err := run.RunWithOutput(ctx, "blkid", "-p", "-o", "value", "-s", "TYPE", device)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "LVM2_member"
 }
 
 // extractSlotNumber extracts the partition number from a device node.
@@ -307,7 +328,7 @@ func BuildSfdiskJSON(sectorSize int, label string, partitions []storage.SfdiskPa
 	return data
 }
 
-// CreateDataPartition creates a new Linux LUKS partition using the remaining disk space.
+// CreateDataPartition creates a new data partition for the LVM pool using the remaining disk space.
 // The data partition is created BEFORE root expansion so it acts as a boundary for growpart.
 // Dispatches to GPT (sgdisk) or MBR (sfdisk) based on the partition table label.
 func (p *Preparer) CreateDataPartition(ctx context.Context, disk string) (string, int, error) {
@@ -404,7 +425,7 @@ func (p *Preparer) createDataPartitionGPT(ctx context.Context, disk string, sfdi
 	startStr := strconv.FormatInt(startSector, 10)
 
 	// sgdisk: -n slot:start:0 means "start at startSector, extend to end of disk"
-	// -t slot:8309 sets the Linux LUKS partition type GUID
+	// -t slot:8309 sets the LUKS type GUID (partition hosts LVM; per-volume LUKS in M3)
 	// -c slot:piccolo-data sets a human-readable partition label
 	if err := p.run.Run(ctx, "sgdisk",
 		"-n", slotStr+":"+startStr+":0",

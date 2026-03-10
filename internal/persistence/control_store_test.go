@@ -475,13 +475,6 @@ func TestSQLiteControlStoreAuthStalenessPersists(t *testing.T) {
 
 func prepareControlCipherDir(t *testing.T, root string) {
 	t.Helper()
-	cipherDir := filepath.Join(root, "ciphertext", "control-plane")
-	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
-		t.Fatalf("mkdir ciphertext: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(cipherDir, gocryptfsConfigName), []byte("stub"), 0o600); err != nil {
-		t.Fatalf("write gocryptfs.conf: %v", err)
-	}
 
 	// Mount directory — production code creates this via EnsureVolume,
 	// but unit tests use the store directly.
@@ -490,7 +483,7 @@ func prepareControlCipherDir(t *testing.T, root string) {
 		t.Fatalf("mkdir mountDir: %v", err)
 	}
 
-	// Metadata now lives in volumes/<id>
+	// Volume metadata in volumes/<id>
 	stateDir := filepath.Join(root, "volumes", "control-plane")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		t.Fatalf("mkdir stateDir: %v", err)
@@ -502,7 +495,7 @@ func prepareControlCipherDir(t *testing.T, root string) {
 	}
 }
 
-func TestNewSQLiteControlStore_NoCipherDirCreated(t *testing.T) {
+func TestNewSQLiteControlStore_NoMetaDirCreated(t *testing.T) {
 	dir := t.TempDir()
 	key, _ := hex.DecodeString("7f1c8a6c3b5d7e91aabbccddeeff00112233445566778899aabbccddeeff0011")
 
@@ -512,69 +505,13 @@ func TestNewSQLiteControlStore_NoCipherDirCreated(t *testing.T) {
 	}
 	defer store.Close(context.Background())
 
-	// The constructor must NOT create the ciphertext directory; it is created
-	// later by ensureCipherDir (via EnsureVolume) as a btrfs subvolume.
-	cipherDir := filepath.Join(dir, "ciphertext", "control-plane")
-	if _, err := os.Stat(cipherDir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected cipherDir to not exist after construction, stat err: %v", err)
-	}
-
 	// metaDir must NOT be created by the constructor — it is created on-demand
 	// by ensureMetadata / writeVolumeState. Pre-creating it causes
 	// reconcileAllVolumeStates to pre-register the entry, making EnsureVolume
-	// skip ensureCipherDir (the original bug).
+	// skip ciphertext subvolume creation.
 	metaDir := filepath.Join(dir, "volumes", "control-plane")
 	if _, err := os.Stat(metaDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected metaDir to not exist after construction, stat err: %v", err)
 	}
 }
 
-func TestSQLiteControlStoreMigratesLegacyMetadata(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
-	key, _ := hex.DecodeString("7f1c8a6c3b5d7e91aabbccddeeff00112233445566778899aabbccddeeff0011")
-
-	// Setup legacy state: metadata in cipherDir
-	cipherDir := filepath.Join(dir, "ciphertext", "control-plane")
-	if err := os.MkdirAll(cipherDir, 0o700); err != nil {
-		t.Fatalf("mkdir ciphertext: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(cipherDir, gocryptfsConfigName), []byte("stub"), 0o600); err != nil {
-		t.Fatalf("write gocryptfs.conf: %v", err)
-	}
-	data := []byte(`{"version":1,"wrapped_key":"stub","nonce":"` + base64.RawStdEncoding.EncodeToString([]byte("nonce")) + `"}`)
-	legacyPath := filepath.Join(cipherDir, controlVolumeMetadataName)
-	if err := os.WriteFile(legacyPath, data, 0o600); err != nil {
-		t.Fatalf("write legacy metadata: %v", err)
-	}
-
-	// Mount directory — production code creates this via EnsureVolume,
-	// but unit tests use the store directly.
-	mountDir := filepath.Join(dir, "mounts", "control-plane")
-	if err := os.MkdirAll(mountDir, 0o700); err != nil {
-		t.Fatalf("mkdir mountDir: %v", err)
-	}
-
-	// Ensure new location is empty
-	stateDir := filepath.Join(dir, "volumes", "control-plane")
-	newPath := filepath.Join(stateDir, controlVolumeMetadataName)
-
-	store, err := newSQLiteControlStore(dir, staticKeyProvider{key: key})
-	if err != nil {
-		t.Fatalf("newSQLiteControlStore: %v", err)
-	}
-	defer store.Close(context.Background())
-
-	// Unlock should trigger migration
-	if err := store.Unlock(context.Background()); err != nil {
-		t.Fatalf("unlock failed: %v", err)
-	}
-
-	// Verify migration
-	if _, err := os.Stat(newPath); err != nil {
-		t.Fatalf("expected metadata at new path %s: %v", newPath, err)
-	}
-	if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected legacy metadata to be removed from %s", legacyPath)
-	}
-}

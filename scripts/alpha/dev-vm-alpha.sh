@@ -22,7 +22,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WORK_DIR="/tmp/claude/piccolo-alpha"
 VM_STATE_FILE="$WORK_DIR/alpha-vm-name"
 VM_IP_FILE="$WORK_DIR/alpha-vm-ip"
-TEMPLATE="piccolod-dev-template"
+TEMPLATE="piccolod-dev-alpha-template"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
 CMD="${1:-help}"
