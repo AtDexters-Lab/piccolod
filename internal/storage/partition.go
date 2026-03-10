@@ -26,16 +26,6 @@ type PartitionLayout struct {
 	DataGB int
 }
 
-// DiskState summarises the partition-level view of the boot disk.
-type DiskState struct {
-	RootExpanded        bool // Root partition at target size
-	PiccoloCoreExists   bool // Core subvolume present
-	DataPartitionExists bool // piccolo-data partition present
-	DataPartitionSlot   int  // Partition slot number (0 if absent)
-	DataPartitionLUKS bool // Partition has a LUKS header
-	SetupComplete     bool // All of above are true
-}
-
 // PartitionState captures the current state of the boot disk's partitions.
 // Used by diskprep.Preparer and storage.Manager.
 type PartitionState struct {
@@ -45,7 +35,6 @@ type PartitionState struct {
 	RootNeedsExpansion bool  // Root is smaller than the calculated target
 	DataPartition     string // Data partition device (empty if absent)
 	DataPartitionSlot int    // Partition slot (0 if absent)
-	DataPartitionLUKS bool   // Data partition has LUKS header
 	UnallocatedGB     int    // Approximate unallocated space on disk
 }
 

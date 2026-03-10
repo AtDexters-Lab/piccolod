@@ -220,7 +220,7 @@ stage_setup() {
   # If already set up, 409 is expected; if fresh, 200
   echo -e "  ${CYAN}INFO${NC} crypto/setup HTTP $status_code"
 
-  # Wait a moment for async operations (LUKS init, PCV activation)
+  # Wait a moment for async operations (storage init, PCV activation)
   echo -e "  ${CYAN}INFO${NC} Waiting 10s for async operations..."
   sleep 10
 
@@ -232,20 +232,20 @@ stage_setup() {
   local health
   health=$(api "/api/v1/health/detail")
   check "3.4" "Persistence unlocked" "$health" '"control store'
-  # Storage should show LUKS initialized or OK
+  # Storage should show initialized or OK
   check_not "3.5" "No storage emergency" "$health" '"level": "error"'
 
   local emerg
   emerg=$(api "/api/v1/system/emergency")
   check "3.6" "Emergency still false" "$emerg" '"emergency":false'
 
-  # LUKS init is async — retry up to 30s
+  # Storage init is async — retry up to 30s
   for i in $(seq 1 30); do
     health=$(api "/api/v1/health/detail")
-    echo "$health" | grep -qF '"LUKS initialized and mounted"' && break
+    echo "$health" | grep -qF '"storage initialized"' && break
     sleep 1
   done
-  check "3.7" "LUKS data volume initialized" "$health" '"LUKS initialized and mounted"'
+  check "3.7" "Storage pool initialized" "$health" '"storage initialized"'
 
   echo -e "\n  ${CYAN}Raw health post-setup:${NC}"
   apij "/api/v1/health/detail"
@@ -500,13 +500,13 @@ stage_reboot() {
   ready=$(api "/api/v1/health/ready")
   check "7.9" "Health ready after unlock" "$ready" '"ready":true'
 
-  # LUKS unlock+mount is async — retry up to 30s
+  # Storage activation is async — retry up to 30s
   for i in $(seq 1 30); do
     health=$(api "/api/v1/health/detail")
-    echo "$health" | grep -qF '"LUKS unlocked and mounted"' && break
+    echo "$health" | grep -qF '"storage activated"' && break
     sleep 1
   done
-  check "7.10" "LUKS data volume mounted" "$health" '"LUKS unlocked and mounted"'
+  check "7.10" "Storage pool activated" "$health" '"storage activated"'
 
   echo -e "\n  ${CYAN}Raw health post-reboot-unlock:${NC}"
   apij "/api/v1/health/detail"

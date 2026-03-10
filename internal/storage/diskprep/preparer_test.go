@@ -627,3 +627,103 @@ func TestRegisterNewPartition(t *testing.T) {
 		}
 	})
 }
+
+func TestFindDataPartition_MBR_LVMPVDetected(t *testing.T) {
+	// Data partition is an LVM PV (not LUKS, not raw). The LVM tier should detect it.
+	sfdiskJSON := BuildSfdiskJSON(512, "dos", []storage.SfdiskPartition{
+		{Node: "/dev/mmcblk0p1", Start: 8192, Size: 524288, Type: "c"},
+		{Node: "/dev/mmcblk0p2", Start: 532480, Size: 4194304, Type: "83"},
+		{Node: "/dev/mmcblk0p3", Start: 43294720, Size: 24117248, Type: "83"},
+	})
+
+	sfdisk, _ := storage.ParseSfdiskJSON(sfdiskJSON)
+	run := &fakeRunner{
+		Outputs: map[string]string{
+			"findmnt -nro SOURCE /": "/dev/mmcblk0p2",
+			// p3 is an LVM PV
+			"blkid -p -o value -s TYPE /dev/mmcblk0p3": "LVM2_member",
+		},
+		Errs: map[string]error{
+			// Neither non-root partition has a LUKS header.
+			"cryptsetup isLuks /dev/mmcblk0p1": fmt.Errorf("exit status 1"),
+			"cryptsetup isLuks /dev/mmcblk0p3": fmt.Errorf("exit status 1"),
+			// p1 is not LVM
+			"blkid -p -o value -s TYPE /dev/mmcblk0p1": fmt.Errorf("exit status 2"),
+		},
+	}
+	p := NewPreparer(run)
+	node, slot := p.findDataPartition(context.Background(), "/dev/mmcblk0", sfdisk)
+	if node != "/dev/mmcblk0p3" {
+		t.Errorf("findDataPartition node = %q, want /dev/mmcblk0p3", node)
+	}
+	if slot != 3 {
+		t.Errorf("findDataPartition slot = %d, want 3", slot)
+	}
+}
+
+func TestFindDataPartition_MBR_LVMPVSkipsRoot(t *testing.T) {
+	// Ensure the LVM PV check skips the root partition.
+	sfdiskJSON := BuildSfdiskJSON(512, "dos", []storage.SfdiskPartition{
+		{Node: "/dev/mmcblk0p1", Start: 8192, Size: 524288, Type: "c"},
+		{Node: "/dev/mmcblk0p2", Start: 532480, Size: 4194304, Type: "83"},
+	})
+
+	sfdisk, _ := storage.ParseSfdiskJSON(sfdiskJSON)
+	run := &fakeRunner{
+		Outputs: map[string]string{
+			"findmnt -nro SOURCE /": "/dev/mmcblk0p2",
+			// Even if root were an LVM PV, it should be skipped.
+			"blkid -p -o value -s TYPE /dev/mmcblk0p2": "LVM2_member",
+		},
+		Errs: map[string]error{
+			"cryptsetup isLuks /dev/mmcblk0p1": fmt.Errorf("exit status 1"),
+			"blkid -p -o value -s TYPE /dev/mmcblk0p1": fmt.Errorf("exit status 2"),
+		},
+	}
+	p := NewPreparer(run)
+	node, slot := p.findDataPartition(context.Background(), "/dev/mmcblk0", sfdisk)
+	if node != "" {
+		t.Errorf("findDataPartition node = %q, want empty (root should be skipped)", node)
+	}
+	if slot != 0 {
+		t.Errorf("findDataPartition slot = %d, want 0", slot)
+	}
+}
+
+func TestFindDataPartition_GPT_LVMPVDetected(t *testing.T) {
+	// GPT disk with LUKS type GUID but actual content is LVM PV (not LUKS).
+	// The GPT fast path matches the type GUID, but the LUKS header probe fails.
+	// However, in practice the GPT fast path returns on type GUID match alone,
+	// so this tests the scenario where the type GUID doesn't match and the
+	// LVM tier catches it.
+	const linuxTypeGUID = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+	sfdiskJSON := BuildSfdiskJSON(512, "gpt", []storage.SfdiskPartition{
+		{Node: "/dev/sda1", Start: 2048, Size: 1048576, Type: "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"},
+		{Node: "/dev/sda2", Start: 1050624, Size: 41943040, Type: "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709"},
+		{Node: "/dev/sda3", Start: 42993664, Size: 20971520, Type: linuxTypeGUID},
+	})
+
+	sfdisk, _ := storage.ParseSfdiskJSON(sfdiskJSON)
+	run := &fakeRunner{
+		Outputs: map[string]string{
+			"findmnt -nro SOURCE /": "/dev/sda2",
+			// p3 is an LVM PV
+			"blkid -p -o value -s TYPE /dev/sda3": "LVM2_member",
+		},
+		Errs: map[string]error{
+			// No partition has a LUKS header.
+			"cryptsetup isLuks /dev/sda1": fmt.Errorf("exit status 1"),
+			"cryptsetup isLuks /dev/sda3": fmt.Errorf("exit status 1"),
+			// p1 is not LVM
+			"blkid -p -o value -s TYPE /dev/sda1": fmt.Errorf("exit status 2"),
+		},
+	}
+	p := NewPreparer(run)
+	node, slot := p.findDataPartition(context.Background(), "/dev/sda", sfdisk)
+	if node != "/dev/sda3" {
+		t.Errorf("findDataPartition node = %q, want /dev/sda3", node)
+	}
+	if slot != 3 {
+		t.Errorf("findDataPartition slot = %d, want 3", slot)
+	}
+}
