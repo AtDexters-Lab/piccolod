@@ -49,11 +49,12 @@ class RemoteAliasesCard extends StatelessWidget {
   }
 
   Widget _buildAliasItem(BuildContext context, RemoteAlias alias) {
+    final label = alias.listener == '__portal' ? 'Portal' : alias.listener;
     return ListTile(
       contentPadding: EdgeInsets.zero,
       leading: const Icon(PiccoloIcons.link, color: PiccoloTheme.inkMuted),
       title: Text(alias.hostname),
-      subtitle: Text('Points to: ${alias.listener}'),
+      subtitle: Text('Points to: $label'),
       trailing: IconButton(
         icon: const Icon(PiccoloIcons.delete, color: PiccoloTheme.critical),
         onPressed: () => controller.deleteAlias(alias.id),
@@ -64,6 +65,11 @@ class RemoteAliasesCard extends StatelessWidget {
   void _showAddAliasDialog(BuildContext context) {
     final hostCtrl = TextEditingController();
     String? selectedListener;
+
+    // Filter to services with a derived host label (HTTP/WS listeners only).
+    final routableServices = controller.services
+        .where((s) => s.derivedHostLabel != null && s.derivedHostLabel!.isNotEmpty)
+        .toList();
 
     unawaited(showDialog<void>(
       context: context,
@@ -79,24 +85,24 @@ class RemoteAliasesCard extends StatelessWidget {
                   decoration: const InputDecoration(labelText: 'Public Hostname', hintText: 'app.example.com'),
                 ),
                 const SizedBox(height: Spacing.base),
-                if (controller.services.isEmpty)
-                   const Text('No services available to alias.', style: TextStyle(color: PiccoloTheme.warning))
-                else
-                  DropdownButtonFormField<String>(
-                    decoration: const InputDecoration(labelText: 'Internal Service'),
-                    initialValue: selectedListener,
-                    items: controller.services.map((s) {
+                DropdownButtonFormField<String>(
+                  decoration: const InputDecoration(labelText: 'Route To'),
+                  value: selectedListener,
+                  items: [
+                    const DropdownMenuItem(value: '__portal', child: Text('Portal')),
+                    ...routableServices.map((s) {
                       return DropdownMenuItem(
-                        value: s.name,
-                        child: Text('${s.name} (${s.publicPort})'),
+                        value: s.derivedHostLabel,
+                        child: Text('${s.name} (${s.app})'),
                       );
-                    }).toList(),
-                    onChanged: (val) {
-                      setState(() {
-                        selectedListener = val;
-                      });
-                    },
-                  ),
+                    }),
+                  ],
+                  onChanged: (val) {
+                    setState(() {
+                      selectedListener = val;
+                    });
+                  },
+                ),
               ],
             ),
             actions: [

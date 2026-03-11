@@ -224,8 +224,9 @@ func (s *GinServer) buildValidOrigins(endpoints []services.ServiceEndpoint) []va
 			}
 
 			// Alias domains: https://<alias>
+			// Alias.Listener stores DerivedHostLabel, match against ep.DerivedHostLabel.
 			for _, alias := range s.remoteManager.ListAliases() {
-				if alias.Listener == ep.Name && strings.TrimSpace(alias.Hostname) != "" {
+				if alias.Listener == ep.DerivedHostLabel && strings.TrimSpace(alias.Hostname) != "" {
 					origins = append(origins, validOrigin{"https", strings.ToLower(alias.Hostname), 0})
 				}
 			}

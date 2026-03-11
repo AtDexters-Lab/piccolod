@@ -327,10 +327,13 @@ func ResolveCertificatesForListener(ep ServiceEndpoint, remoteEnabled bool, solv
 		}
 	}
 
-	// 3. Add any alias certs for this listener
-	// Current schema: Alias.Listener stores listener name only (e.g., "web"), not "app/listener".
+	// 3. Add any alias certs for this listener.
+	// Alias.Listener stores a DerivedHostLabel or "__portal". Match against ep.DerivedHostLabel.
 	for _, alias := range aliases {
-		if alias.Listener == ep.Name {
+		if alias.Listener == portalHostLabel || alias.Listener == "" {
+			continue // portal aliases use the portal cert, not per-listener
+		}
+		if alias.Listener == ep.DerivedHostLabel {
 			certIDs = append(certIDs, "alias:"+strings.ToLower(alias.Hostname))
 		}
 	}
@@ -344,6 +347,7 @@ func ResolveCertificatesForListener(ep ServiceEndpoint, remoteEnabled bool, solv
 }
 
 // RemoteAlias is a simplified alias type for health derivation.
+// Listener stores a DerivedHostLabel (e.g., "myapp", "home-myapp") or "__portal".
 type RemoteAlias struct {
 	Hostname string
 	Listener string

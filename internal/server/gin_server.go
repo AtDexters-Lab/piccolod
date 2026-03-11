@@ -178,6 +178,7 @@ type serviceRemoteResolver struct {
 	mu         sync.RWMutex
 	domain     string
 	portal     string
+	aliases    map[string]string // hostname → DerivedHostLabel (or nexusclient.PortalHostLabel)
 	port       int
 	tlsMuxPort int
 }
@@ -199,6 +200,14 @@ func (r *serviceRemoteResolver) UpdateConfig(cfg nexusclient.Config) {
 	// App hostnames are <label>.<portal>.
 	r.portal = portal
 	r.domain = portal
+	aliases := make(map[string]string, len(cfg.Aliases))
+	for _, a := range cfg.Aliases {
+		h := strings.TrimSuffix(strings.ToLower(a.Hostname), ".")
+		if h != "" {
+			aliases[h] = a.HostLabel
+		}
+	}
+	r.aliases = aliases
 	r.mu.Unlock()
 }
 
@@ -207,6 +216,7 @@ func (r *serviceRemoteResolver) IsRemoteHostname(host string) bool {
 	r.mu.RLock()
 	portal := r.portal
 	domain := r.domain
+	aliases := r.aliases
 	r.mu.RUnlock()
 	if host == "" {
 		return false
@@ -221,6 +231,9 @@ func (r *serviceRemoteResolver) IsRemoteHostname(host string) bool {
 		if strings.HasSuffix(host, "."+domain) {
 			return true
 		}
+	}
+	if _, ok := aliases[host]; ok {
+		return true
 	}
 	return false
 }
@@ -242,6 +255,7 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 	r.mu.RLock()
 	portal := r.portal
 	domain := r.domain
+	aliases := r.aliases
 	portalPort := r.port
 	tlsMuxPort := r.tlsMuxPort
 	r.mu.RUnlock()
@@ -257,14 +271,45 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 		normPort = 80
 	}
 
-	// Portal host (apex): treat as flow=tcp (device-terminated TLS when not 80)
-	// Per RFC 20260114 Section 5.1 step 1: <base> always routes to portal
+	// Portal host (apex): route to portal port / TLS mux.
+	// Per RFC 20260114 Section 5.1 step 1: <base> always routes to portal.
 	if portal != "" && h == portal {
 		if normPort == 80 {
 			return portalPort, true
 		}
 		if isTLS && tlsMuxPort > 0 {
 			return tlsMuxPort, true
+		}
+		return 0, false
+	}
+
+	// Alias domains: route based on the listener they target.
+	// HostLabel is a DerivedHostLabel (routes to a specific listener) or
+	// PortalHostLabel (routes to the portal).
+	if hostLabel, ok := aliases[h]; ok {
+		if hostLabel == nexusclient.PortalHostLabel || hostLabel == "" {
+			if normPort == 80 {
+				return portalPort, true
+			}
+			if isTLS && tlsMuxPort > 0 {
+				return tlsMuxPort, true
+			}
+			return 0, false
+		}
+		// Listener-specific alias: resolve via ServiceManager.
+		if r.services != nil {
+			if ep, found := r.services.ResolveByHostLabel(hostLabel, normPort); found {
+				if ep.Flow == api.FlowTLS {
+					return ep.PublicPort, true
+				}
+				if normPort == 80 {
+					return ep.PublicPort, true
+				}
+				if isTLS && tlsMuxPort > 0 {
+					return tlsMuxPort, true
+				}
+				return ep.PublicPort, true
+			}
 		}
 		return 0, false
 	}
@@ -304,6 +349,23 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 	}
 
 	return 0, false
+}
+
+// aliasEntriesFromStatus converts remote.Alias slice to nexusclient.AliasEntry slice,
+// normalizing legacy "portal" listener values to the PortalHostLabel sentinel.
+func aliasEntriesFromStatus(aliases []remote.Alias) []nexusclient.AliasEntry {
+	entries := make([]nexusclient.AliasEntry, 0, len(aliases))
+	for _, a := range aliases {
+		hostLabel := a.Listener
+		if hostLabel == "" || hostLabel == "portal" {
+			hostLabel = nexusclient.PortalHostLabel
+		}
+		entries = append(entries, nexusclient.AliasEntry{
+			Hostname:  a.Hostname,
+			HostLabel: hostLabel,
+		})
+	}
+	return entries
 }
 
 // remoteStatusAdapter adapts remote.Manager to services.RemoteStatusProvider.
@@ -646,19 +708,20 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		svcMgr.ProxyManager().SetPortalOriginResolver(s.portalOriginForRequest)
 
 		// RFC 20260112: alias-domain warnings for protected/headers strategies.
-		svcMgr.ProxyManager().SetAliasChecker(func(host, listener string) bool {
+		// The callback receives host and DerivedHostLabel (not listener name).
+		svcMgr.ProxyManager().SetAliasChecker(func(host, hostLabel string) bool {
 			if s == nil || s.remoteManager == nil {
 				return false
 			}
 			h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-			if h == "" || listener == "" {
+			if h == "" || hostLabel == "" {
 				return false
 			}
 			for _, a := range s.remoteManager.ListAliases() {
 				if strings.TrimSpace(a.Hostname) == "" {
 					continue
 				}
-				if a.Listener != listener {
+				if a.Listener != hostLabel {
 					continue
 				}
 				aliasHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(a.Hostname)), ".")
@@ -1431,20 +1494,21 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 	lanPortURL := s.determineLocalURL(c, ep, scheme)
 
 	result := gin.H{
-		"app":          ep.App,
-		"name":         ep.Name,
-		"guest_port":   ep.GuestPort,
-		"host_port":    ep.HostBind,
-		"public_port":  ep.PublicPort,
-		"remote_ports": ep.RemotePorts,
-		"remote_host":  remoteHostValue,
-		"flow":         ep.Flow,
-		"protocol":     ep.Protocol,
-		"primary":      ep.Primary,
-		"middleware":   ep.Middleware,
-		"scheme":       scheme,
-		"local_url":    lanPortURL, // Keep for backward compatibility
-		"lan_port_url": lanPortURL, // New explicit name
+		"app":                ep.App,
+		"name":               ep.Name,
+		"guest_port":         ep.GuestPort,
+		"host_port":          ep.HostBind,
+		"public_port":        ep.PublicPort,
+		"remote_ports":       ep.RemotePorts,
+		"remote_host":        remoteHostValue,
+		"flow":               ep.Flow,
+		"protocol":           ep.Protocol,
+		"primary":            ep.Primary,
+		"derived_host_label": ep.DerivedHostLabel,
+		"middleware":         ep.Middleware,
+		"scheme":             scheme,
+		"local_url":          lanPortURL, // Keep for backward compatibility
+		"lan_port_url":       lanPortURL, // New explicit name
 	}
 
 	// Add host-based URLs only for HTTP/WS listeners (per RFC 20260114)
@@ -1698,11 +1762,25 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 	if s == nil || s.tlsMux == nil {
 		return
 	}
+	// Build alias entries from status — shared between resolver and TlsMux.
+	aliases := aliasEntriesFromStatus(status.Aliases)
+
 	if s.remoteResolver != nil {
 		s.remoteResolver.UpdateConfig(nexusclient.Config{
 			PortalHostname: status.PortalHostname,
+			Aliases:        aliases,
 		})
 	}
+
+	// Push alias map to TlsMux for HTTPS routing.
+	aliasMap := make(map[string]string, len(aliases))
+	for _, a := range aliases {
+		h := strings.TrimSuffix(strings.ToLower(a.Hostname), ".")
+		if h != "" {
+			aliasMap[h] = a.HostLabel
+		}
+	}
+	s.tlsMux.UpdateAliases(aliasMap)
 
 	// Update allowed frame ancestors for app proxies
 	if s.serviceManager != nil {

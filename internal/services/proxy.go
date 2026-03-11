@@ -578,7 +578,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 
 			// RFC 20260112: alias domains are not compatible with protected/headers strategies.
 			// The session cookie cannot be shared across custom domains.
-			if aliasChecker != nil && aliasChecker(normalizeHostNoPort(r.Host), ep.Name) {
+			if aliasChecker != nil && aliasChecker(normalizeHostNoPort(r.Host), ep.DerivedHostLabel) {
 				log.Printf("WARN: alias domain access is not supported for auth strategy=%s (host=%s app=%s listener=%s)", strategy, normalizeHostNoPort(r.Host), ep.App, ep.Name)
 			}
 

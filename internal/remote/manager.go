@@ -772,7 +772,7 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 		return Alias{}, errors.New("hostname required")
 	}
 	if listener == "" {
-		listener = "portal"
+		listener = nexusclient.PortalHostLabel
 	}
 
 	m.cfgMu.Lock()
@@ -914,6 +914,7 @@ type adapterStateSnapshot struct {
 	Endpoint       string
 	DeviceSecret   string
 	PortalHostname string
+	Aliases        []nexusclient.AliasEntry
 	Enabled        bool
 }
 
@@ -921,10 +922,22 @@ func extractAdapterSnapshot(cfg *Config) adapterStateSnapshot {
 	if cfg == nil {
 		return adapterStateSnapshot{}
 	}
+	var aliases []nexusclient.AliasEntry
+	for _, a := range cfg.Aliases {
+		hostLabel := a.Listener
+		if hostLabel == "" || hostLabel == "portal" {
+			hostLabel = nexusclient.PortalHostLabel
+		}
+		aliases = append(aliases, nexusclient.AliasEntry{
+			Hostname:  a.Hostname,
+			HostLabel: hostLabel,
+		})
+	}
 	return adapterStateSnapshot{
 		Endpoint:       cfg.Endpoint,
 		DeviceSecret:   cfg.DeviceSecret,
 		PortalHostname: cfg.PortalHostname,
+		Aliases:        aliases,
 		Enabled:        cfg.Enabled,
 	}
 }
@@ -946,6 +959,7 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 		Endpoint:       snap.Endpoint,
 		DeviceSecret:   snap.DeviceSecret,
 		PortalHostname: snap.PortalHostname,
+		Aliases:        snap.Aliases,
 	}
 	if err := adapter.Configure(adapterCfg); err != nil {
 		log.Printf("WARN: remote: configure nexus adapter failed: %v", err)
