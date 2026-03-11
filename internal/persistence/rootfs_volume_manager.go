@@ -531,11 +531,7 @@ func (m *luksVolumeManager) AttachRootfs(ctx context.Context, volumeID string) (
 	m.mu.Lock()
 	if state, ok := m.rootfsMounts[volumeID]; ok {
 		m.mu.Unlock()
-		mountPath := state.idmapPath
-		if mountPath == "" {
-			mountPath = state.mountPath
-		}
-		return RootfsHandle{VolumeID: volumeID, MountPath: mountPath, GoldenLV: state.goldenLV}, nil
+		return state.handle, nil
 	}
 	m.mu.Unlock()
 
@@ -649,12 +645,24 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 	}
 
 	// Track state.
+	resultPath := mountDir
+	if idmapPath != "" {
+		resultPath = idmapPath
+	}
+
+	handle := RootfsHandle{
+		VolumeID:  volumeID,
+		MountPath: resultPath,
+		ReadOnly:  meta.ReadOnly,
+		GoldenLV:  meta.GoldenLV,
+	}
+
 	state := &rootfsMountState{
 		stack:      stack,
 		luksMapper: mapper,
-		mountPath:  mountDir,
+		rawMountPath: mountDir,
 		idmapPath:  idmapPath,
-		goldenLV:   meta.GoldenLV,
+		handle:     handle,
 	}
 	m.mu.Lock()
 	m.rootfsMounts[volumeID] = state
@@ -663,17 +671,7 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 
 	success = true
 
-	resultPath := mountDir
-	if idmapPath != "" {
-		resultPath = idmapPath
-	}
-
-	return RootfsHandle{
-		VolumeID:  volumeID,
-		MountPath: resultPath,
-		ReadOnly:  meta.ReadOnly,
-		GoldenLV:  meta.GoldenLV,
-	}, nil
+	return handle, nil
 }
 
 // DetachRootfs unmounts and deactivates a rootfs volume.
@@ -699,9 +697,9 @@ func (m *luksVolumeManager) DetachRootfs(ctx context.Context, volumeID string) e
 	}
 
 	// Unmount btrfs.
-	if err := m.run.Run(ctx, "umount", state.mountPath); err != nil {
-		if err2 := m.run.Run(ctx, "umount", "-l", state.mountPath); err2 != nil {
-			errs = append(errs, fmt.Errorf("umount %s: %w", state.mountPath, err2))
+	if err := m.run.Run(ctx, "umount", state.rawMountPath); err != nil {
+		if err2 := m.run.Run(ctx, "umount", "-l", state.rawMountPath); err2 != nil {
+			errs = append(errs, fmt.Errorf("umount %s: %w", state.rawMountPath, err2))
 		}
 	}
 

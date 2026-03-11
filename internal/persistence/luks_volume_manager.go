@@ -103,9 +103,9 @@ type luksVolumeManager struct {
 type rootfsMountState struct {
 	stack      *blockdev.DeviceStack
 	luksMapper string
-	mountPath  string
-	idmapPath  string
-	goldenLV   string
+	rawMountPath string // raw btrfs mount (used for unmount)
+	idmapPath    string // idmapped bind mount (used for unmount)
+	handle     RootfsHandle // caller-facing handle — single source of truth for cached returns
 }
 
 // LUKSVolumeManagerConfig holds dependencies for the unified volume manager.
