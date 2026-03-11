@@ -1228,6 +1228,9 @@ func (s *GinServer) setupGinRoutes() {
 		admin.GET("/system/storage-check", s.handleStorageCheck)
 		admin.GET("/system/storage-diagnostics", s.handleStorageDiagnostics)
 
+		// Active tasks discovery (Admin only)
+		admin.GET("/tasks/active", s.handleActiveTasks)
+
 		// Task progress (Admin only?) - Maybe standard user needs to see progress of their own actions?
 		// But they can't trigger actions. So Admin only is safe.
 		// Actually, let's allow it for now as it's harmless read-only.

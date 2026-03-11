@@ -1,9 +1,7 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
-import 'package:piccolo_os/core/config/core_config.dart';
 import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/task_progress_client.dart';
 import 'package:piccolo_os/core/services/websocket_connection.dart';
@@ -121,26 +119,10 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
   }
 
   String _buildUrl(String taskId) {
-    final encoded = Uri.encodeQueryComponent(taskId);
-    final basePath = widget.urlPath ?? '/api/v1/events/progress/stream';
-    final path = '$basePath?task_id=$encoded';
-
-    final devBase = CoreConfig.wsBaseUrl;
-    if (devBase.isNotEmpty) {
-      final cleanBase = devBase.endsWith('/')
-          ? devBase.substring(0, devBase.length - 1)
-          : devBase;
-      return '$cleanBase$path';
-    }
-
-    if (kIsWeb) {
-      final uri = Uri.base;
-      final scheme = uri.scheme == 'https' ? 'wss' : 'ws';
-      final portPart = (uri.hasPort && uri.port != 0) ? ':${uri.port}' : '';
-      return '$scheme://${uri.host}$portPart$path';
-    }
-
-    return 'ws://127.0.0.1$path';
+    return TaskProgressClient.buildUrl(
+      taskId,
+      basePath: widget.urlPath ?? '/api/v1/events/progress/stream',
+    );
   }
 
   String _statusText() {

@@ -20,6 +20,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/app"
 	"piccolod/internal/app/catalog"
+	"piccolod/internal/events"
 	"piccolod/internal/hostname"
 	"piccolod/internal/remote"
 	"piccolod/internal/services"
@@ -1009,6 +1010,18 @@ func (s *GinServer) handleGinCatalogIcon(c *gin.Context) {
 	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
 	c.Data(http.StatusOK, result.ContentType, result.Data)
+}
+
+// handleActiveTasks handles GET /api/v1/tasks/active - List in-progress tasks
+func (s *GinServer) handleActiveTasks(c *gin.Context) {
+	var tasks []events.TaskProgressEvent
+	if s.progress != nil {
+		tasks = s.progress.ActiveTasks()
+	}
+	if tasks == nil {
+		tasks = []events.TaskProgressEvent{}
+	}
+	writeGinSuccess(c, tasks, fmt.Sprintf("Found %d active tasks", len(tasks)))
 }
 
 func handleAppManagerError(c *gin.Context, err error, action string) bool {
