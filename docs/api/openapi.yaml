@@ -964,6 +964,27 @@ paths:
         '101':
           description: Switching Protocols
 
+  /tasks/active:
+    get:
+      summary: List in-progress tasks
+      description: Returns active (non-complete, non-stale) task progress events.
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Active tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TaskProgressEvent'
+                  message:
+                    type: string
+
   /events/progress/stream:
     get:
       summary: Stream task progress events (WebSocket)
@@ -1459,6 +1480,19 @@ components:
           type: array
           items: { type: string }
         source_url: { type: string, nullable: true }
+    TaskProgressEvent:
+      type: object
+      properties:
+        task_id: { type: string }
+        task_type: { type: string }
+        instance_id: { type: string, nullable: true }
+        phase: { type: string }
+        progress: { type: integer }
+        message: { type: string }
+        metadata: { type: object, nullable: true }
+        is_complete: { type: boolean }
+        error: { type: string, nullable: true }
+        timestamp: { type: string, format: date-time }
   securitySchemes:
     cookieAuth:
       type: apiKey

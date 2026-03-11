@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
+import 'package:piccolo_os/core/config/core_config.dart';
 import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/websocket_connection.dart';
 
@@ -68,6 +69,30 @@ class TaskProgressClient extends ChangeNotifier {
     } on Object catch (e) {
       debugPrint('Task progress decode error: $e');
     }
+  }
+
+  /// Builds a WebSocket URL for the given [taskId] using the standard
+  /// progress stream endpoint.
+  static String buildUrl(String taskId, {String basePath = '/api/v1/events/progress/stream'}) {
+    final encoded = Uri.encodeQueryComponent(taskId);
+    final path = '$basePath?task_id=$encoded';
+
+    final devBase = CoreConfig.wsBaseUrl;
+    if (devBase.isNotEmpty) {
+      final cleanBase = devBase.endsWith('/')
+          ? devBase.substring(0, devBase.length - 1)
+          : devBase;
+      return '$cleanBase$path';
+    }
+
+    if (kIsWeb) {
+      final uri = Uri.base;
+      final scheme = uri.scheme == 'https' ? 'wss' : 'ws';
+      final portPart = (uri.hasPort && uri.port != 0) ? ':${uri.port}' : '';
+      return '$scheme://${uri.host}$portPart$path';
+    }
+
+    return 'ws://127.0.0.1$path';
   }
 
   @override

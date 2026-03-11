@@ -1,9 +1,12 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show setEquals;
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/config/core_config.dart';
 import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/app_status_event.dart';
+import 'package:piccolo_os/core/models/task_progress.dart';
+import 'package:piccolo_os/core/services/task_progress_client.dart';
 import 'package:piccolo_os/features/apps/app_detail_view.dart';
 import 'package:piccolo_os/features/apps/app_launcher.dart';
 import 'package:piccolo_os/shared/widgets/action_progress_dialog.dart';
@@ -35,6 +38,7 @@ class _CachedIcon {
 
 class _StageState extends State<Stage> {
   List<App> _apps = [];
+  List<TaskProgressEvent> _installingTasks = [];
   bool _isLoading = true;
   String? _error;
 
@@ -101,6 +105,7 @@ class _StageState extends State<Stage> {
       _eventSubscription = null;
       setState(() {
         _apps = [];
+        _installingTasks = [];
         _iconCache.clear();
         _isLoading = true;
         _error = null;
@@ -144,6 +149,8 @@ class _StageState extends State<Stage> {
 
       // Load icons from catalog for apps that don't have cached icons
       unawaited(_loadAppIcons(apps));
+      // Discover in-progress installations (non-blocking)
+      unawaited(_checkActiveInstalls());
     } on Object catch (e) {
       if (!mounted) return;
       setState(() {
@@ -198,6 +205,35 @@ class _StageState extends State<Stage> {
     } on Object catch (e) {
       debugPrint('Failed to load app icons: $e');
     }
+  }
+
+  Future<void> _checkActiveInstalls() async {
+    try {
+      final tasks = await widget.controller.appService.getActiveTasks();
+      if (!mounted) return;
+
+      final appIds = _apps.map((a) => a.name).toSet();
+      final installing = tasks
+          .where((t) => t.taskType == 'install_app' && !appIds.contains(t.instanceId))
+          .toList();
+
+      // Skip rebuild if task list hasn't changed
+      final oldIds = _installingTasks.map((t) => t.taskId).toSet();
+      final newIds = installing.map((t) => t.taskId).toSet();
+      if (!setEquals(oldIds, newIds)) {
+        setState(() => _installingTasks = installing);
+      }
+    } on Object catch (e) {
+      debugPrint('Failed to check active installs: $e');
+    }
+  }
+
+  void _onInstallingTaskComplete(TaskProgressEvent task) {
+    if (!mounted) return;
+    setState(() {
+      _installingTasks = _installingTasks.where((t) => t.taskId != task.taskId).toList();
+    });
+    widget.controller.notifyAppsChanged();
   }
 
   _CachedIcon? _getAppIcon(App app) {
@@ -507,7 +543,7 @@ class _StageState extends State<Stage> {
       );
     }
 
-    if (_apps.isEmpty) {
+    if (_apps.isEmpty && _installingTasks.isEmpty) {
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -570,6 +606,12 @@ class _StageState extends State<Stage> {
                     _showContextMenu(context, app, position),
               );
             }),
+            // Installing tiles (ghost tiles for in-progress installs)
+            ..._installingTasks.map((task) => _InstallingAppTile(
+              key: ValueKey('installing-${task.taskId}'),
+              task: task,
+              onComplete: _onInstallingTaskComplete,
+            )),
             // Add tile
             _AddTile(onTap: () => widget.controller.openAppStore()),
           ],
@@ -700,6 +742,135 @@ class _AppTileState extends State<_AppTile> {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _InstallingAppTile extends StatefulWidget {
+
+  const _InstallingAppTile({
+    required this.task,
+    required this.onComplete,
+    super.key,
+  });
+  final TaskProgressEvent task;
+  final void Function(TaskProgressEvent) onComplete;
+
+  @override
+  State<_InstallingAppTile> createState() => _InstallingAppTileState();
+}
+
+class _InstallingAppTileState extends State<_InstallingAppTile>
+    with SingleTickerProviderStateMixin {
+  TaskProgressClient? _client;
+  StreamSubscription<TaskProgressEvent>? _sub;
+  TaskProgressEvent? _latest;
+  late AnimationController _pulseController;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    );
+    unawaited(_pulseController.repeat(reverse: true));
+    _latest = widget.task;
+    _connectWebSocket();
+  }
+
+  void _connectWebSocket() {
+    final url = TaskProgressClient.buildUrl(widget.task.taskId);
+    _client = TaskProgressClient(url)..addListener(_onClientUpdate);
+    _sub = _client!.events.listen((evt) {
+      if (!mounted) return;
+      setState(() => _latest = evt);
+      if (evt.isComplete) {
+        widget.onComplete(evt);
+      }
+    });
+    _client!.connect();
+  }
+
+  void _onClientUpdate() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    unawaited(_sub?.cancel());
+    _client
+      ?..removeListener(_onClientUpdate)
+      ..dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final instanceId = _latest?.instanceId ?? widget.task.instanceId;
+    final label = (instanceId?.isNotEmpty ?? false)
+        ? instanceId!
+        : 'Installing...';
+    final progress = _latest?.progress ?? -1;
+
+    return SizedBox(
+      width: 100,
+      height: 120,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          AnimatedBuilder(
+            animation: _pulseController,
+            builder: (context, child) {
+              final alpha = 0.4 + 0.3 * _pulseController.value;
+              return Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: alpha),
+                    width: 2,
+                  ),
+                ),
+                child: Center(
+                  child: SizedBox(
+                    width: 32,
+                    height: 32,
+                    child: CircularProgressIndicator(
+                      value: progress >= 0 ? progress / 100.0 : null,
+                      strokeWidth: 3,
+                      color: Colors.white.withValues(alpha: 0.9),
+                      backgroundColor: Colors.white.withValues(alpha: 0.2),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: PiccoloTheme.scrim,
+              borderRadius: BorderRadius.circular(Radii.sm),
+            ),
+            child: Text(
+              label,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.7),
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

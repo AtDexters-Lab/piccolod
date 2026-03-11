@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const taskStaleness = 35 * time.Minute
+
 const (
 	TopicTaskProgress Topic = "task_progress"
 )
@@ -44,9 +46,35 @@ func (r *BusProgressReporter) Report(evt TaskProgressEvent) {
 		return
 	}
 	r.mu.Lock()
+	prev, hadPrev := r.last[evt.TaskID]
 	r.last[evt.TaskID] = evt
 	r.mu.Unlock()
 	r.bus.Publish(Event{Topic: TopicTaskProgress, Payload: evt})
+
+	// Schedule eviction only on the first completion report to avoid duplicate timers.
+	if evt.IsComplete && !(hadPrev && prev.IsComplete) {
+		time.AfterFunc(2*time.Minute, func() {
+			r.mu.Lock()
+			delete(r.last, evt.TaskID)
+			r.mu.Unlock()
+		})
+	}
+}
+
+func (r *BusProgressReporter) ActiveTasks() []TaskProgressEvent {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cutoff := time.Now().Add(-taskStaleness)
+	var active []TaskProgressEvent
+	for _, evt := range r.last {
+		if !evt.IsComplete && evt.Timestamp.After(cutoff) {
+			active = append(active, evt)
+		}
+	}
+	return active
 }
 
 func (r *BusProgressReporter) Last(taskID string) (TaskProgressEvent, bool) {

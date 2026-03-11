@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:piccolo_os/core/models/app_models.dart';
+import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 
 class AppService {
@@ -85,6 +86,18 @@ class AppService {
   Future<String?> getCatalogTemplate(String name) async {
     final data = await _client.get('/api/v1/catalog/$name/template');
     return data is String ? data : null;
+  }
+
+  // --- Active Tasks ---
+
+  Future<List<TaskProgressEvent>> getActiveTasks() async {
+    final data = await _client.get('/api/v1/tasks/active');
+    if (data is! Map<String, dynamic>) return [];
+    final list = (data['data'] as List?) ?? [];
+    return list
+        .whereType<Map<String, dynamic>>()
+        .map(TaskProgressEvent.fromJson)
+        .toList();
   }
 
   // --- Installed Apps ---
