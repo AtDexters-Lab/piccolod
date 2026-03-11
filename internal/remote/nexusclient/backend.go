@@ -197,7 +197,7 @@ func buildHostnameList(cfg Config) []string {
 	for _, a := range cfg.Aliases {
 		h := strings.TrimSuffix(strings.ToLower(a.Hostname), ".")
 		if h != "" {
-			hosts = append(hosts, h)
+			hosts = append(hosts, h, "*."+h)
 		}
 	}
 	return hosts

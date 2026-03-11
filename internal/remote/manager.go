@@ -192,6 +192,10 @@ type Manager struct {
 
 	// Wake signal for RetryAt-driven scheduler (RFC 20260125)
 	scheduleWakeCh chan struct{}
+
+	// Tracks the last adapter config key to skip unnecessary stop/start cycles
+	// when only non-adapter fields (certs, events) changed in save().
+	lastAdapterKey string // guarded by adapterMu
 }
 
 func (m *Manager) certDir() string {
@@ -918,6 +922,32 @@ type adapterStateSnapshot struct {
 	Enabled        bool
 }
 
+// adapterConfigKey returns a string that changes only when adapter-relevant
+// fields change (endpoint, secret, portal hostname, aliases). Cert state,
+// events, and other fields are excluded so that save() calls for those
+// operations do not trigger an unnecessary adapter restart.
+func adapterConfigKey(snap adapterStateSnapshot) string {
+	var b strings.Builder
+	b.WriteString(snap.Endpoint)
+	b.WriteByte('\x00')
+	b.WriteString(snap.DeviceSecret)
+	b.WriteByte('\x00')
+	b.WriteString(snap.PortalHostname)
+	b.WriteByte('\x00')
+	if snap.Enabled {
+		b.WriteByte('1')
+	} else {
+		b.WriteByte('0')
+	}
+	for _, a := range snap.Aliases {
+		b.WriteByte('\x00')
+		b.WriteString(a.Hostname)
+		b.WriteByte('\x01')
+		b.WriteString(a.HostLabel)
+	}
+	return b.String()
+}
+
 func extractAdapterSnapshot(cfg *Config) adapterStateSnapshot {
 	if cfg == nil {
 		return adapterStateSnapshot{}
@@ -971,6 +1001,23 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 		return
 	}
 
+	// Only restart the adapter when config that affects the relay registration
+	// (endpoint, secret, portal, aliases) actually changed. Cert-only saves
+	// skip the restart to avoid flapping the relay connection.
+	key := adapterConfigKey(snap)
+	m.adapterMu.Lock()
+	changed := key != m.lastAdapterKey
+	if changed {
+		m.lastAdapterKey = key
+	}
+	m.adapterMu.Unlock()
+
+	if !changed && cancel != nil {
+		// Adapter running with identical config — nothing to do.
+		m.startRenewScheduler()
+		return
+	}
+
 	if cancel != nil {
 		m.stopAdapter()
 	}
@@ -982,12 +1029,22 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 	m.adapterMu.Unlock()
 
 	go func() {
-		if err := adapterRun.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("WARN: remote: nexus adapter exited: %v", err)
+		err := adapterRun.Start(ctx)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("WARN: remote: nexus adapter exited: %v", err)
+			}
+			// Start failed — reset lastAdapterKey so the next save() retries
+			// instead of hitting the !changed fast path permanently.
+			m.adapterMu.Lock()
+			m.lastAdapterKey = ""
+			m.adapterMu.Unlock()
 		}
-		m.adapterMu.Lock()
-		m.adapterCancel = nil
-		m.adapterMu.Unlock()
+		// Do NOT clear m.adapterCancel here — adapter.Start() is non-blocking
+		// (it spawns client.Start in a sub-goroutine and returns immediately).
+		// Clearing here races with subsequent applyAdapterState calls, causing
+		// them to skip stopAdapter() and leaving the old client running with a
+		// stale hostname list. m.adapterCancel is managed by stopAdapter().
 	}()
 	// Ensure renew scheduler is running when remote is active
 	m.startRenewScheduler()
@@ -1033,6 +1090,7 @@ func (m *Manager) stopAdapter() {
 	cancel := m.adapterCancel
 	adapter := m.adapter
 	m.adapterCancel = nil
+	m.lastAdapterKey = "" // reset so next applyAdapterState always restarts
 	m.adapterMu.Unlock()
 
 	if cancel != nil {
