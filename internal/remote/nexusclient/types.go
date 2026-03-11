@@ -2,11 +2,25 @@ package nexusclient
 
 import "context"
 
+// PortalHostLabel is the sentinel value for aliases that target the portal itself
+// rather than a specific app listener. It uses a double-underscore prefix that is
+// prohibited by appNameRegex, making collisions with real DerivedHostLabels impossible.
+const PortalHostLabel = "__portal"
+
+// AliasEntry pairs a public hostname with the DerivedHostLabel of the listener
+// it targets. HostLabel is either a real DerivedHostLabel (e.g., "myapp",
+// "home-myapp") or PortalHostLabel for portal-targeted aliases.
+type AliasEntry struct {
+	Hostname  string
+	HostLabel string
+}
+
 // Config represents the minimum information needed to connect to the nexus proxy.
 type Config struct {
 	Endpoint       string
 	DeviceSecret   string
-	PortalHostname string // Fully-qualified hostname (e.g., portal.home.example.com)
+	PortalHostname string       // Fully-qualified hostname (e.g., portal.home.example.com)
+	Aliases        []AliasEntry // Additional hostnames routed to this device (e.g., custom domains)
 }
 
 // Adapter provides a lifecycle wrapper around the nexus backend client.

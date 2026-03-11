@@ -294,7 +294,7 @@ func TestResolveCertificatesForListener(t *testing.T) {
 			solver:        "dns-01",
 			portalHost:    "example.com",
 			aliases: []RemoteAlias{
-				{Hostname: "custom.com", Listener: "web"},
+				{Hostname: "custom.com", Listener: "myapp"},
 				{Hostname: "other.com", Listener: "api"},
 			},
 			wantCerts:    []string{"wildcard", "alias:custom.com"},

@@ -23,6 +23,10 @@ type portalAwareProvider interface {
 	SetPortalHostname(host string)
 }
 
+// portalHostLabel mirrors nexusclient.PortalHostLabel — the sentinel for portal-targeted aliases.
+// Defined locally to avoid coupling the services package to nexusclient.
+const portalHostLabel = "__portal"
+
 // TlsMux terminates TLS (remote-only) on loopback and forwards HTTP to a local public_port.
 // It does not expose any TLS listener on the LAN.
 type TlsMux struct {
@@ -36,6 +40,9 @@ type TlsMux struct {
 	portalHost string
 	portalPort int
 	domain     string // e.g., example.com (no trailing dot)
+
+	// Alias routing: hostname → DerivedHostLabel (or "__portal")
+	aliases map[string]string
 
 	services *ServiceManager
 	certs    CertProvider
@@ -58,6 +65,14 @@ func (m *TlsMux) UpdateConfig(portalHost, domain string, portalPort int) {
 }
 
 func (m *TlsMux) SetCertProvider(p CertProvider) { m.mu.Lock(); m.certs = p; m.mu.Unlock() }
+
+// UpdateAliases sets the alias hostname→hostLabel mapping for routing.
+// hostLabel is a DerivedHostLabel or "__portal" for portal-targeted aliases.
+func (m *TlsMux) UpdateAliases(aliases map[string]string) {
+	m.mu.Lock()
+	m.aliases = aliases
+	m.mu.Unlock()
+}
 
 // Start binds on 127.0.0.1:0 (ephemeral) unless already running. Returns the selected port.
 func (m *TlsMux) Start() (int, error) {
@@ -219,6 +234,7 @@ func (m *TlsMux) resolveUpstream(host string) int {
 	portal := m.portalHost
 	domain := m.domain
 	portalPort := m.portalPort
+	aliases := m.aliases
 	m.mu.RUnlock()
 
 	if host == "" {
@@ -226,6 +242,18 @@ func (m *TlsMux) resolveUpstream(host string) int {
 	}
 	if host == portal {
 		return portalPort
+	}
+	// Alias domains: route by the listener they target.
+	if hostLabel, ok := aliases[host]; ok {
+		if hostLabel == portalHostLabel || hostLabel == "" {
+			return portalPort
+		}
+		if m.services != nil {
+			if ep, found := m.services.ResolveByHostLabel(hostLabel, 443); found {
+				return ep.PublicPort
+			}
+		}
+		return 0
 	}
 	// <app>.<domain> or <listener>-<app>.<domain> → map to ServiceManager public_port
 	// Per RFC 20260114: use DerivedHostLabel for routing (primary=<app>, others=<listener>-<app>)

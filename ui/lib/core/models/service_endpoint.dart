@@ -9,6 +9,7 @@ class ServiceEndpoint {
     required this.flow, required this.protocol, this.remotePorts = const [],
     this.remoteHost,
     this.localUrl,
+    this.derivedHostLabel,
   });
 
   factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
@@ -25,6 +26,7 @@ class ServiceEndpoint {
       flow: (json['flow'] as String?) ?? '',
       protocol: (json['protocol'] as String?) ?? '',
       localUrl: json['local_url'] as String?,
+      derivedHostLabel: json['derived_host_label'] as String?,
     );
   }
   final String app;
@@ -37,4 +39,5 @@ class ServiceEndpoint {
   final String flow;
   final String protocol;
   final String? localUrl;
+  final String? derivedHostLabel;
 }

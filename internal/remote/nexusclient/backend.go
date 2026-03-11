@@ -194,6 +194,12 @@ func buildHostnameList(cfg Config) []string {
 		// RFC 20260114: remote base is the portal hostname apex; apps are <label>.<base>.
 		hosts = append(hosts, "*."+base)
 	}
+	for _, a := range cfg.Aliases {
+		h := strings.TrimSuffix(strings.ToLower(a.Hostname), ".")
+		if h != "" {
+			hosts = append(hosts, h)
+		}
+	}
 	return hosts
 }
 
