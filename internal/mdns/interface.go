@@ -221,7 +221,7 @@ func (m *Manager) setupInterface(iface *net.Interface) error {
 // createIPv4Socket creates an IPv4 UDP socket bound to a specific interface
 func (m *Manager) createIPv4Socket(iface *net.Interface) (*net.UDPConn, error) {
 	// Create raw socket with SO_REUSEPORT
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, syscall.IPPROTO_UDP)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create IPv4 socket: %w", err)
 	}
@@ -287,7 +287,7 @@ func (m *Manager) createIPv4Socket(iface *net.Interface) (*net.UDPConn, error) {
 // createIPv6Socket creates an IPv6 UDP socket bound to a specific interface
 func (m *Manager) createIPv6Socket(iface *net.Interface) (*net.UDPConn, error) {
 	// Create raw socket with SO_REUSEPORT
-	fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+	fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, syscall.IPPROTO_UDP)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create IPv6 socket: %w", err)
 	}

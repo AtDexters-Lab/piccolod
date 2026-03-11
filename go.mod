@@ -12,9 +12,9 @@ require (
 	github.com/gin-contrib/gzip v1.2.5
 	github.com/go-jose/go-jose/v4 v4.1.3
 	github.com/miekg/dns v1.1.72
-	github.com/zitadel/oidc/v3 v3.45.4
-	golang.org/x/net v0.50.0
-	golang.org/x/sys v0.41.0
+	github.com/zitadel/oidc/v3 v3.45.5
+	golang.org/x/net v0.51.0
+	golang.org/x/sys v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -27,7 +27,7 @@ require (
 	github.com/go-chi/chi/v5 v5.2.5 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/go-openapi/swag/jsonname v0.25.4 // indirect
+	github.com/go-openapi/swag/jsonname v0.25.5 // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/gorilla/securecookie v1.1.2 // indirect
@@ -44,28 +44,28 @@ require (
 	github.com/woodsbury/decimal128 v1.4.0 // indirect
 	github.com/zitadel/logging v0.7.0 // indirect
 	github.com/zitadel/schema v1.3.2 // indirect
+	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
-	go.opentelemetry.io/otel v1.40.0 // indirect
-	go.opentelemetry.io/otel/metric v1.40.0 // indirect
-	go.opentelemetry.io/otel/trace v1.40.0 // indirect
-	golang.org/x/exp v0.0.0-20260212183809-81e46e3db34a // indirect
-	golang.org/x/oauth2 v0.35.0 // indirect
-	modernc.org/libc v1.67.7 // indirect
+	go.opentelemetry.io/otel v1.42.0 // indirect
+	go.opentelemetry.io/otel/metric v1.42.0 // indirect
+	go.opentelemetry.io/otel/trace v1.42.0 // indirect
+	golang.org/x/oauth2 v0.36.0 // indirect
+	modernc.org/libc v1.70.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
 
 require (
-	github.com/AtDexters-Lab/nexus-proxy-backend-client v0.2.4
+	github.com/AtDexters-Lab/nexus-proxy-backend-client v0.2.5
 	github.com/bytedance/sonic v1.15.0 // indirect
 	github.com/bytedance/sonic/loader v0.5.0 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.13 // indirect
 	github.com/getkin/kin-openapi v0.133.0
 	github.com/gin-contrib/sse v1.1.0 // indirect
-	github.com/gin-gonic/gin v1.11.0
-	github.com/go-acme/lego/v4 v4.31.0
-	github.com/go-openapi/jsonpointer v0.22.4 // indirect
+	github.com/gin-gonic/gin v1.12.0
+	github.com/go-acme/lego/v4 v4.32.0
+	github.com/go-openapi/jsonpointer v0.22.5 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
 	github.com/go-playground/validator/v10 v10.30.1 // indirect
@@ -85,12 +85,12 @@ require (
 	github.com/perimeterx/marshmallow v1.1.5 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.1 // indirect
-	golang.org/x/arch v0.24.0 // indirect
+	golang.org/x/arch v0.25.0 // indirect
 	golang.org/x/crypto v0.48.0
-	golang.org/x/mod v0.33.0
-	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/text v0.34.0 // indirect
+	golang.org/x/mod v0.34.0
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/text v0.35.0 // indirect
 	golang.org/x/tools v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	modernc.org/sqlite v1.45.0
+	modernc.org/sqlite v1.46.1
 )
