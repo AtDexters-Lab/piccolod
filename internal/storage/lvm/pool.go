@@ -46,8 +46,20 @@ func NewPoolManager(run runner.CommandRunner, bus *events.Bus, cfg ThinPoolConfi
 }
 
 // CreatePool creates the VG and thin pool on the given device.
-// Steps: pvcreate → vgcreate → lvcreate --type thin-pool
+// Steps: [VG deactivate if leftover] → wipefs → pvcreate → vgcreate → lvcreate --type thin-pool
 func (p *PoolManager) CreatePool(ctx context.Context, device string) error {
+	// Clean leftover signatures (LVM, LUKS, filesystem) from prior installs.
+	// Only deactivate our VG if it actually lives on this device (pvs check),
+	// so we never touch an unrelated VG on another disk.
+	if vg := p.pvVGName(ctx, device); vg == p.cfg.VGName {
+		if err := p.run.Run(ctx, "vgchange", "-an", p.cfg.VGName); err != nil {
+			return fmt.Errorf("deactivate leftover VG %s on %s: %w", p.cfg.VGName, device, err)
+		}
+	}
+	if err := p.run.Run(ctx, "wipefs", "-a", device); err != nil {
+		return fmt.Errorf("wipefs %s: %w", device, err)
+	}
+
 	// Initialize the physical volume.
 	if err := p.run.Run(ctx, "pvcreate", "-f", device); err != nil {
 		return fmt.Errorf("pvcreate %s: %w", device, err)
@@ -138,6 +150,17 @@ func (p *PoolManager) PoolStatus(ctx context.Context) (PoolStats, error) {
 	stats.UsedDataBytes = int64(totalBytes * stats.DataPercent / 100.0)
 
 	return stats, nil
+}
+
+// pvVGName returns the VG name that owns a PV device, or "" if the device
+// is not a PV (or on any error). Used to scope VG deactivation to the
+// target device only.
+func (p *PoolManager) pvVGName(ctx context.Context, device string) string {
+	out, err := p.run.RunWithOutput(ctx, "pvs", "--noheadings", "-o", "vg_name", device)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // VGExists checks if the volume group exists.

@@ -57,35 +57,125 @@ func TestNewPoolManager_PartialConfig(t *testing.T) {
 }
 
 func TestPoolManager_CreatePool(t *testing.T) {
-	run := &fakeRunner{}
-	mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+	t.Run("fresh_device", func(t *testing.T) {
+		// pvs returns error (not a PV) — no deactivation needed.
+		run := &fakeRunner{
+			Errs: map[string]error{
+				buildKey("pvs", []string{"--noheadings", "-o", "vg_name", "/dev/sda3"}): fmt.Errorf("not a PV"),
+			},
+		}
+		mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
 
-	if err := mgr.CreatePool(context.Background(), "/dev/sda3"); err != nil {
-		t.Fatalf("CreatePool: %v", err)
-	}
+		if err := mgr.CreatePool(context.Background(), "/dev/sda3"); err != nil {
+			t.Fatalf("CreatePool: %v", err)
+		}
 
-	// Verify command sequence: pvcreate → vgcreate → lvcreate → lvchange
-	calls := run.GetCalls()
-	if len(calls) != 4 {
-		t.Fatalf("expected 4 commands, got %d: %v", len(calls), calls)
-	}
-	if !strings.HasPrefix(calls[0], "pvcreate") {
-		t.Errorf("first call should be pvcreate, got %q", calls[0])
-	}
-	if !strings.HasPrefix(calls[1], "vgcreate") {
-		t.Errorf("second call should be vgcreate, got %q", calls[1])
-	}
-	if !strings.Contains(calls[2], "lvcreate") {
-		t.Errorf("third call should be lvcreate, got %q", calls[2])
-	}
-	if !strings.Contains(calls[3], "lvchange") || !strings.Contains(calls[3], "--errorwhenfull") {
-		t.Errorf("fourth call should be lvchange --errorwhenfull, got %q", calls[3])
-	}
+		// Verify: pvs → wipefs → pvcreate → vgcreate → lvcreate → lvchange
+		calls := run.GetCalls()
+		if len(calls) != 6 {
+			t.Fatalf("expected 6 commands, got %d: %v", len(calls), calls)
+		}
+		if !strings.HasPrefix(calls[0], "pvs") {
+			t.Errorf("first call should be pvs, got %q", calls[0])
+		}
+		if !strings.HasPrefix(calls[1], "wipefs") {
+			t.Errorf("second call should be wipefs, got %q", calls[1])
+		}
+		if !strings.HasPrefix(calls[2], "pvcreate") {
+			t.Errorf("third call should be pvcreate, got %q", calls[2])
+		}
+		if !strings.HasPrefix(calls[3], "vgcreate") {
+			t.Errorf("fourth call should be vgcreate, got %q", calls[3])
+		}
+		if !strings.Contains(calls[4], "lvcreate") {
+			t.Errorf("fifth call should be lvcreate, got %q", calls[4])
+		}
+		if !strings.Contains(calls[5], "lvchange") || !strings.Contains(calls[5], "--errorwhenfull") {
+			t.Errorf("sixth call should be lvchange --errorwhenfull, got %q", calls[5])
+		}
+	})
+
+	t.Run("leftover_VG_deactivated", func(t *testing.T) {
+		// pvs returns our VG name — deactivate + wipefs + create.
+		run := &fakeRunner{
+			Outputs: map[string]string{
+				buildKey("pvs", []string{"--noheadings", "-o", "vg_name", "/dev/sda3"}): "  piccolo-data-vg\n",
+			},
+		}
+		mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+
+		if err := mgr.CreatePool(context.Background(), "/dev/sda3"); err != nil {
+			t.Fatalf("CreatePool: %v", err)
+		}
+
+		// Verify: pvs → vgchange -an → wipefs → pvcreate → vgcreate → lvcreate → lvchange
+		calls := run.GetCalls()
+		if len(calls) != 7 {
+			t.Fatalf("expected 7 commands, got %d: %v", len(calls), calls)
+		}
+		if !strings.HasPrefix(calls[0], "pvs") {
+			t.Errorf("first call should be pvs, got %q", calls[0])
+		}
+		if !strings.Contains(calls[1], "vgchange -an") {
+			t.Errorf("second call should be vgchange -an, got %q", calls[1])
+		}
+		if !strings.HasPrefix(calls[2], "wipefs") {
+			t.Errorf("third call should be wipefs, got %q", calls[2])
+		}
+	})
+
+	t.Run("leftover_VG_deactivate_fails", func(t *testing.T) {
+		// pvs returns our VG, but deactivation fails (LV open) — must abort.
+		run := &fakeRunner{
+			Outputs: map[string]string{
+				buildKey("pvs", []string{"--noheadings", "-o", "vg_name", "/dev/sda3"}): "  piccolo-data-vg\n",
+			},
+			Errs: map[string]error{
+				buildKey("vgchange", []string{"-an", "piccolo-data-vg"}): fmt.Errorf("LV in use"),
+			},
+		}
+		mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+
+		err := mgr.CreatePool(context.Background(), "/dev/sda3")
+		if err == nil {
+			t.Fatal("expected error when VG deactivation fails")
+		}
+		if !strings.Contains(err.Error(), "deactivate leftover VG") {
+			t.Errorf("error should mention deactivation, got: %v", err)
+		}
+	})
+
+	t.Run("foreign_VG_not_deactivated", func(t *testing.T) {
+		// pvs returns a different VG name — skip deactivation, just wipefs.
+		run := &fakeRunner{
+			Outputs: map[string]string{
+				buildKey("pvs", []string{"--noheadings", "-o", "vg_name", "/dev/sda3"}): "  ubuntu-vg\n",
+			},
+		}
+		mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+
+		if err := mgr.CreatePool(context.Background(), "/dev/sda3"); err != nil {
+			t.Fatalf("CreatePool: %v", err)
+		}
+
+		// No vgchange -an — foreign VG left alone.
+		calls := run.GetCalls()
+		if len(calls) != 6 {
+			t.Fatalf("expected 6 commands, got %d: %v", len(calls), calls)
+		}
+		if !strings.HasPrefix(calls[0], "pvs") {
+			t.Errorf("first call should be pvs, got %q", calls[0])
+		}
+		if !strings.HasPrefix(calls[1], "wipefs") {
+			t.Errorf("second call should be wipefs (no vgchange), got %q", calls[1])
+		}
+	})
 }
 
 func TestPoolManager_CreatePool_PvcreateError(t *testing.T) {
 	run := &fakeRunner{
 		Errs: map[string]error{
+			buildKey("pvs", []string{"--noheadings", "-o", "vg_name", "/dev/sda3"}): fmt.Errorf("not a PV"),
 			"pvcreate -f /dev/sda3": fmt.Errorf("device busy"),
 		},
 	}
@@ -96,6 +186,23 @@ func TestPoolManager_CreatePool_PvcreateError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "pvcreate") {
 		t.Errorf("error should mention pvcreate, got: %v", err)
+	}
+}
+
+func TestPoolManager_CreatePool_WipefsError(t *testing.T) {
+	run := &fakeRunner{
+		Errs: map[string]error{
+			buildKey("pvs", []string{"--noheadings", "-o", "vg_name", "/dev/sda3"}): fmt.Errorf("not a PV"),
+			"wipefs -a /dev/sda3": fmt.Errorf("permission denied"),
+		},
+	}
+	mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+	err := mgr.CreatePool(context.Background(), "/dev/sda3")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "wipefs") {
+		t.Errorf("error should mention wipefs, got: %v", err)
 	}
 }
 
