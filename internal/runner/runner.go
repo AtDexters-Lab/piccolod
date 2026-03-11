@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"time"
@@ -13,7 +14,8 @@ type CommandRunner interface {
 	// Run executes a command, connecting stdout/stderr to os.Stdout/os.Stderr.
 	Run(ctx context.Context, name string, args ...string) error
 
-	// RunWithOutput executes a command and returns its combined stdout/stderr.
+	// RunWithOutput executes a command and returns its stdout.
+	// Stderr is captured separately; on failure it is included in the error.
 	RunWithOutput(ctx context.Context, name string, args ...string) ([]byte, error)
 
 	// RunWithStdin executes a command with the provided bytes piped to stdin.
@@ -34,7 +36,13 @@ func (ExecRunner) Run(ctx context.Context, name string, args ...string) error {
 func (ExecRunner) RunWithOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.WaitDelay = 5 * time.Second
-	return cmd.CombinedOutput()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil && stderr.Len() > 0 {
+		return out, fmt.Errorf("%w: %s", err, bytes.TrimSpace(stderr.Bytes()))
+	}
+	return out, err
 }
 
 func (ExecRunner) RunWithStdin(ctx context.Context, stdin []byte, name string, args ...string) error {

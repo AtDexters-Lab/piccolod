@@ -205,6 +205,19 @@ func TestExpandRootPartition_CallsCorrectCommands(t *testing.T) {
 	}
 }
 
+func TestExpandRootPartition_NOCHANGE_in_error(t *testing.T) {
+	run := &fakeRunner{
+		Errs: map[string]error{
+			"growpart /dev/sda 2": fmt.Errorf("exit status 1: NOCHANGE: partition 2 is size 20971520"),
+		},
+	}
+	p := NewPreparer(run)
+	err := p.ExpandRootPartition(context.Background(), "/dev/sda", "/dev/sda2")
+	if err != nil {
+		t.Fatalf("expected NOCHANGE to be treated as success, got: %v", err)
+	}
+}
+
 func TestExpandRootPartition_BadSlot(t *testing.T) {
 	p := NewPreparer(&fakeRunner{})
 	err := p.ExpandRootPartition(context.Background(), "/dev/sda", "/dev/sda")

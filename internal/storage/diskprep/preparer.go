@@ -496,11 +496,10 @@ func (p *Preparer) ExpandRootPartition(ctx context.Context, disk string, rootPar
 	}
 
 	// growpart expands the partition to fill available space (bounded by next partition).
-	// Use RunWithOutput because growpart emits "NOCHANGE" on stdout/stderr, but
-	// Run() pipes output to os.Stdout — err.Error() only contains "exit status N".
+	// growpart exits non-zero with NOCHANGE when partition is already at max size.
+	// NOCHANGE may appear on stdout or stderr — check both.
 	if out, err := p.run.RunWithOutput(ctx, "growpart", disk, strconv.Itoa(rootSlot)); err != nil {
-		// growpart exits non-zero with NOCHANGE when partition is already at max size.
-		if strings.Contains(string(out), "NOCHANGE") {
+		if strings.Contains(string(out), "NOCHANGE") || strings.Contains(err.Error(), "NOCHANGE") {
 			log.Printf("root partition %s already at maximum size", rootPartition)
 			return nil
 		}
