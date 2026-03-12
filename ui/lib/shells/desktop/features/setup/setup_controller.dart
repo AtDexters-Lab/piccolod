@@ -260,7 +260,7 @@ class SetupController extends ChangeNotifier {
   /// User chose "Try Piccolo" — persist choice and trigger disk prep.
   Future<void> chooseTryPiccolo() async {
     try {
-      _state = SetupState.finishing;
+      _state = SetupState.loading;
       _error = null;
       notifyListeners();
 
@@ -346,15 +346,19 @@ class SetupController extends ChangeNotifier {
   }
 
   /// Reboot the device after a successful install.
+  ///
+  /// Network/connection errors are swallowed: the reboot kills the server, so
+  /// the HTTP call may fail before a response arrives. That is success, not
+  /// failure. Real API errors (409, 500) are re-thrown so the UI can react.
   Future<void> rebootAfterInstall() async {
     try {
-      _state = SetupState.finishing;
-      notifyListeners();
       await _api.post('/api/v1/system/reboot');
-    } on Object catch (e) {
-      _error = e.toString();
-      _state = SetupState.installComplete;
-      notifyListeners();
+    } on ApiException {
+      // Real server error (e.g. 409 "reboot only available after install") —
+      // the device did NOT reboot. Re-throw so the caller can handle it.
+      rethrow;
+    } on Object catch (_) {
+      // Connection reset / timeout — expected during reboot.
     }
   }
 
