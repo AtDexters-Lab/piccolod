@@ -46,6 +46,10 @@ type ServiceManager struct {
 	// Health aggregator cancellation
 	healthAggregatorCancel func()
 
+	// deactivated tracks endpoint metadata cleared by DeactivateApp so that a
+	// subsequent RemoveApp can still emit a permanent removal event for cert cleanup.
+	deactivated map[string][]events.ServiceEndpointInfo
+
 	// App status tracking for health check suppression
 	appTransient    map[string]time.Time // app ID → time entered transient state
 	appTransientMu  sync.RWMutex
@@ -70,6 +74,7 @@ func NewServiceManager() *ServiceManager {
 		containerIDs:  make(map[string]string),
 		leadership:    make(map[string]cluster.Role),
 		backendHealth: NewBackendHealthState(),
+		deactivated:   make(map[string][]events.ServiceEndpointInfo),
 		appTransient:  make(map[string]time.Time),
 	}
 }
@@ -136,37 +141,29 @@ func (m *ServiceManager) SetRemoteStatusProvider(provider RemoteStatusProvider) 
 	m.statusMu.Unlock()
 }
 
-func (m *ServiceManager) publishEndpointsChanged(app string, added, removed []ServiceEndpoint) {
+func (m *ServiceManager) publishEndpointsEvent(evt events.ServiceEndpointsChanged) {
 	m.eventsMu.Lock()
 	bus := m.eventBus
 	m.eventsMu.Unlock()
 	if bus == nil {
 		return
 	}
-	addedInfo := make([]events.ServiceEndpointInfo, len(added))
-	for i, ep := range added {
-		addedInfo[i] = events.ServiceEndpointInfo{
-			App:              ep.App,
-			Name:             ep.Name,
-			DerivedHostLabel: ep.DerivedHostLabel,
-		}
-	}
-	removedInfo := make([]events.ServiceEndpointInfo, len(removed))
-	for i, ep := range removed {
-		removedInfo[i] = events.ServiceEndpointInfo{
-			App:              ep.App,
-			Name:             ep.Name,
-			DerivedHostLabel: ep.DerivedHostLabel,
-		}
-	}
 	bus.Publish(events.Event{
-		Topic: events.TopicServiceEndpointsChanged,
-		Payload: events.ServiceEndpointsChanged{
-			App:     app,
-			Added:   addedInfo,
-			Removed: removedInfo,
-		},
+		Topic:   events.TopicServiceEndpointsChanged,
+		Payload: evt,
 	})
+}
+
+func endpointInfoSlice(eps []ServiceEndpoint) []events.ServiceEndpointInfo {
+	info := make([]events.ServiceEndpointInfo, len(eps))
+	for i, ep := range eps {
+		info[i] = events.ServiceEndpointInfo{
+			App:              ep.App,
+			Name:             ep.Name,
+			DerivedHostLabel: ep.DerivedHostLabel,
+		}
+	}
+	return info
 }
 
 const ACMEHTTPFallbackPort = 5002
@@ -359,7 +356,7 @@ func (m *ServiceManager) ClearLockOverride() {
 // RestoreFromPodman rebuilds proxies for an app using existing host-bind ports.
 func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppListener, hostByGuest map[int]int) ([]ServiceEndpoint, error) {
 	// Stop any existing proxies first
-	m.RemoveApp(appName)
+	m.DeactivateApp(appName)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -398,10 +395,15 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 	if len(registry) > 0 {
 		m.registry[appName] = registry
 	}
+	// App is back — clear any stashed deactivated state.
+	delete(m.deactivated, appName)
 
 	// Publish endpoint changes (non-blocking)
 	if len(endpoints) > 0 {
-		m.publishEndpointsChanged(appName, endpoints, nil)
+		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+			App:   appName,
+			Added: endpointInfoSlice(endpoints),
+		})
 	}
 
 	return endpoints, nil
@@ -437,6 +439,9 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 		m.registry[appName][l.Name] = ep
 	}
 
+	// Clear any stashed deactivated state from prior stop.
+	delete(m.deactivated, appName)
+
 	// Start proxies after registration
 	for _, ep := range endpoints {
 		m.proxyManager.StartListener(ep)
@@ -444,7 +449,10 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 	}
 
 	// Publish endpoint changes (non-blocking)
-	m.publishEndpointsChanged(appName, endpoints, nil)
+	m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+		App:   appName,
+		Added: endpointInfoSlice(endpoints),
+	})
 
 	return endpoints, nil
 }
@@ -1061,9 +1069,14 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 	}
 	result.Endpoints = eps
 
-	// Publish endpoint changes (non-blocking)
+	// Publish endpoint changes (non-blocking). Listener config changes are
+	// permanent — removed endpoints will not come back.
 	if len(result.Added) > 0 || len(result.Removed) > 0 {
-		m.publishEndpointsChanged(appName, result.Added, result.Removed)
+		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+			App:     appName,
+			Added:   endpointInfoSlice(result.Added),
+			Removed: endpointInfoSlice(result.Removed),
+		})
 	}
 
 	return result, containerChange, nil
@@ -1110,8 +1123,19 @@ func authRules(a *api.ListenerAuth) []api.ListenerAuthRule {
 	return a.Rules
 }
 
-// RemoveApp stops and removes all listeners for an app
+// DeactivateApp tears down routing for a temporarily stopped app.
+// The app still exists and endpoints will be restored on start.
+func (m *ServiceManager) DeactivateApp(appName string) {
+	m.removeAppEndpoints(appName, false)
+}
+
+// RemoveApp permanently removes all endpoints for an app (uninstall, failed install).
+// Downstream listeners (e.g., cert cleanup) act on the permanent signal.
 func (m *ServiceManager) RemoveApp(appName string) {
+	m.removeAppEndpoints(appName, true)
+}
+
+func (m *ServiceManager) removeAppEndpoints(appName string, permanent bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var removed []ServiceEndpoint
@@ -1122,7 +1146,6 @@ func (m *ServiceManager) RemoveApp(appName string) {
 			m.proxyManager.StopPort(ep.PublicPort)
 			m.allocator.Release(ep.HostBind, ep.PublicPort)
 			m.notifyUnpublish(ep.PublicPort)
-			// Clean up backend health state for removed endpoint
 			if m.backendHealth != nil {
 				m.backendHealth.RemoveEndpoint(ep.endpointKey())
 			}
@@ -1131,13 +1154,34 @@ func (m *ServiceManager) RemoveApp(appName string) {
 	}
 	delete(m.containerIDs, appName)
 
-	// Clean up transient state for removed app
 	m.appTransientMu.Lock()
 	delete(m.appTransient, appName)
 	m.appTransientMu.Unlock()
 
-	// Publish endpoint changes (non-blocking)
-	if len(removed) > 0 {
-		m.publishEndpointsChanged(appName, nil, removed)
+	info := endpointInfoSlice(removed)
+
+	if !permanent {
+		// Stash endpoint metadata so a subsequent RemoveApp can emit a
+		// permanent Removed event even though the endpoints are already gone.
+		if len(info) > 0 {
+			m.deactivated[appName] = info
+			m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+				App:         appName,
+				Deactivated: info,
+			})
+		}
+	} else {
+		// Include any previously deactivated endpoints that are no longer
+		// in the registry (app was stopped before uninstall).
+		if prev, ok := m.deactivated[appName]; ok {
+			info = append(info, prev...)
+			delete(m.deactivated, appName)
+		}
+		if len(info) > 0 {
+			m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+				App:     appName,
+				Removed: info,
+			})
+		}
 	}
 }

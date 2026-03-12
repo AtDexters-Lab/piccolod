@@ -829,6 +829,12 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if label == "" || !isValidDNSLabel(label) {
 				return
 			}
+			// Only queue a cert if an active service endpoint exists for this label.
+			// Without this check, any TLS connection to *.<base> (bots, scanners,
+			// typos) would trigger real ACME issuance and leave orphaned certs.
+			if _, ok := svcMgr.ResolveByHostLabel(label, 0); !ok {
+				return
+			}
 			rm.QueueHostnameCertificate(h)
 		})
 		tlsMux.SetCertProvider(certProv)
@@ -1589,6 +1595,16 @@ func remoteBaseHostname(status *remote.Status) string {
 	if status == nil || !status.Enabled {
 		return ""
 	}
+	return remotePortalBase(status)
+}
+
+// remotePortalBase extracts the normalized base hostname from PortalHostname
+// without gating on Enabled. Used for cert cleanup where we need the base
+// even if remote access has been disabled.
+func remotePortalBase(status *remote.Status) string {
+	if status == nil {
+		return ""
+	}
 	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(status.PortalHostname)), ".")
 	if base == "" {
 		return ""
@@ -1997,26 +2013,42 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 	go func() {
 		for evt := range endpointsCh {
 			payload, ok := evt.Payload.(events.ServiceEndpointsChanged)
-			if !ok || len(payload.Added) == 0 {
+			if !ok {
 				continue
 			}
 			rm := s.remoteManager
 			if rm == nil {
 				continue
 			}
+
 			status := rm.Status()
-			if !status.Enabled || !strings.EqualFold(status.Solver, "http-01") {
-				continue
-			}
-			base := remoteBaseHostname(&status)
-			if base == "" {
-				continue
-			}
-			for _, ep := range payload.Added {
-				if ep.DerivedHostLabel == "" {
-					continue
+
+			// Queue certs for newly added endpoints.
+			if len(payload.Added) > 0 && status.Enabled && strings.EqualFold(status.Solver, "http-01") {
+				base := remoteBaseHostname(&status)
+				if base != "" {
+					for _, ep := range payload.Added {
+						if ep.DerivedHostLabel == "" {
+							continue
+						}
+						rm.QueueHostnameCertificate(ep.DerivedHostLabel + "." + base)
+					}
 				}
-				rm.QueueHostnameCertificate(ep.DerivedHostLabel + "." + base)
+			}
+
+			// Remove certs for permanently removed endpoints.
+			// Derive base from PortalHostname directly (not gating on Enabled)
+			// so cleanup works even if remote is disabled at removal time.
+			if len(payload.Removed) > 0 {
+				base := remotePortalBase(&status)
+				if base != "" {
+					for _, ep := range payload.Removed {
+						if ep.DerivedHostLabel == "" {
+							continue
+						}
+						rm.RemoveHostnameCertificate(ep.DerivedHostLabel + "." + base)
+					}
+				}
 			}
 		}
 	}()
