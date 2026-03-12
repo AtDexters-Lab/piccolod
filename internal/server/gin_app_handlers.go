@@ -761,17 +761,6 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	appName := c.Param("name")
 
-	// Capture current remote hosts to clean up after uninstall.
-	var hostsToRemove map[string]struct{}
-	if s.remoteManager != nil && s.serviceManager != nil {
-		st := s.remoteManager.Status()
-		if base := remoteBaseHostname(&st); base != "" {
-			if eps, err := s.serviceManager.GetByApp(appName); err == nil {
-				hostsToRemove = remoteHostsForEndpoints(eps, base)
-			}
-		}
-	}
-
 	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
 	err := s.appManager.Uninstall(ctx, appName)
 	if err != nil {
@@ -790,12 +779,6 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	if clientMgr := s.getOIDCClientManager(); clientMgr != nil {
 		if err := clientMgr.DeleteClientsByAppID(ctx, appName); err != nil {
 			log.Printf("WARN: failed to delete OIDC clients for %s: %v", appName, err)
-		}
-	}
-
-	if hostsToRemove != nil && s.remoteManager != nil {
-		for h := range hostsToRemove {
-			s.remoteManager.RemoveHostnameCertificate(h)
 		}
 	}
 

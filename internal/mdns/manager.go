@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -540,9 +541,12 @@ func (m *Manager) StopServiceEndpointsObserver() {
 }
 
 func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsChanged) {
-	// Collect labels to goodbye (from removed endpoints)
+	// Both deactivated and permanently removed endpoints should stop being advertised.
+	inactive := slices.Concat(payload.Deactivated, payload.Removed)
+
+	// Collect labels to goodbye
 	var labelsToGoodbye []string
-	for _, ep := range payload.Removed {
+	for _, ep := range inactive {
 		if ep.DerivedHostLabel != "" {
 			labelsToGoodbye = append(labelsToGoodbye, ep.DerivedHostLabel)
 		}
@@ -561,8 +565,8 @@ func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsC
 	}
 
 	// Build set of labels to remove
-	removeSet := make(map[string]struct{}, len(payload.Removed))
-	for _, ep := range payload.Removed {
+	removeSet := make(map[string]struct{}, len(inactive))
+	for _, ep := range inactive {
 		if ep.DerivedHostLabel != "" {
 			removeSet[ep.DerivedHostLabel] = struct{}{}
 		}

@@ -119,7 +119,7 @@ func (m *AppManager) recoverStaleAnchor(ctx context.Context, state *FilesystemSt
 	if err := m.removeContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
 		return fmt.Errorf("remove failed during recovery: %w", err)
 	}
-	m.serviceManager.RemoveApp(appInst.InstanceID)
+	m.serviceManager.DeactivateApp(appInst.InstanceID)
 
 	// Clear stale IDs from state before recreation
 	appInst.NetworkAnchorID = ""
@@ -216,7 +216,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				log.Printf("WARN: reconcile app %s: best-effort stop failed: %v", appInst.InstanceID, stopErr)
 			}
 			if m.serviceManager != nil {
-				m.serviceManager.RemoveApp(appInst.InstanceID)
+				m.serviceManager.DeactivateApp(appInst.InstanceID)
 			}
 			// Observed status reflects local container state - containers are stopped on this machine.
 			m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
@@ -236,7 +236,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				if removeErr := m.removeContainersForMultiApp(ctx, appInst, def, runtime); removeErr != nil {
 					log.Printf("WARN: reconcile app %s: escalation remove failed: %v", appInst.InstanceID, removeErr)
 				}
-				m.serviceManager.RemoveApp(appInst.InstanceID)
+				m.serviceManager.DeactivateApp(appInst.InstanceID)
 				m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusError, msgStartupFailed)
 			}
 			return nil
@@ -251,7 +251,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		if removeErr := m.removeContainersForMultiApp(ctx, appInst, def, runtime); removeErr != nil {
 			log.Printf("WARN: reconcile app %s: pre-recreate remove failed: %v", appInst.InstanceID, removeErr)
 		}
-		m.serviceManager.RemoveApp(appInst.InstanceID)
+		m.serviceManager.DeactivateApp(appInst.InstanceID)
 
 		m.setObservedStatusMessage(appInst.InstanceID, "Containers not found, recreating")
 		if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime, blockNativeRootfsMap); err != nil {
@@ -269,7 +269,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			log.Printf("WARN: reconcile app %s: best-effort stop failed: %v", appInst.InstanceID, stopErr)
 		}
 		if m.serviceManager != nil {
-			m.serviceManager.RemoveApp(appInst.InstanceID)
+			m.serviceManager.DeactivateApp(appInst.InstanceID)
 		}
 		// Observed status reflects local container state - containers are stopped on this machine.
 		m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
@@ -429,7 +429,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			if removeErr := m.removeContainersForMultiApp(ctx, appInst, def, runtime); removeErr != nil {
 				log.Printf("WARN: reconcile app %s: port-reconcile remove failed: %v", appInst.InstanceID, removeErr)
 			}
-			m.serviceManager.RemoveApp(appInst.InstanceID)
+			m.serviceManager.DeactivateApp(appInst.InstanceID)
 			if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime, blockNativeRootfsMap); err != nil {
 				m.handleStartupFailure(state, appInst)
 				return err
@@ -557,11 +557,11 @@ func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *F
 					_ = m.serviceManager.ReserveHostPort(ep.HostBind)
 				}
 			}
-			m.serviceManager.RemoveApp(appInst.InstanceID)
+			m.serviceManager.DeactivateApp(appInst.InstanceID)
 			continue
 		}
 
-		m.serviceManager.RemoveApp(appInst.InstanceID)
+		m.serviceManager.DeactivateApp(appInst.InstanceID)
 		return err
 	}
 
