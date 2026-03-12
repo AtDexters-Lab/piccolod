@@ -249,6 +249,7 @@ class AppListener {
     this.protocol = 'raw',
     this.remotePorts = const [],
     this.middleware = const [],
+    this.auth,
   });
 
   factory AppListener.fromServiceEndpoint(ServiceEndpoint ep) {
@@ -259,6 +260,7 @@ class AppListener {
       protocol: ep.protocol,
       remotePorts: ep.remotePorts,
       middleware: ep.middleware,
+      auth: ep.auth,
     );
   }
   final String name;
@@ -267,6 +269,7 @@ class AppListener {
   final String protocol;
   final List<int> remotePorts;
   final List<dynamic> middleware;
+  final Map<String, dynamic>? auth;
 
   Map<String, dynamic> toJson() {
     return {
@@ -276,9 +279,34 @@ class AppListener {
       'protocol': protocol,
       'remote_ports': remotePorts,
       'protocol_middleware': middleware,
+      if (auth != null) 'auth': auth,
     };
   }
 }
+
+/// Classifies the access level of a listener based on its auth configuration.
+String classifyAccess(Map<String, dynamic>? auth) {
+  if (auth == null) return 'private';
+  final rules = auth['rules'];
+  if (rules is! List || rules.isEmpty) return 'private';
+  if (rules.length == 1) {
+    final rule = rules[0];
+    if (rule is Map &&
+        rule['path'] == '/' &&
+        rule['type'] == 'prefix') {
+      if (rule['strategy'] == 'public') return 'public';
+      if (rule['strategy'] == 'protected') return 'private';
+    }
+  }
+  return 'custom';
+}
+
+/// Returns the canonical auth payload for a fully-public listener.
+Map<String, dynamic> publicAuthPayload() => {
+  'rules': [
+    {'path': '/', 'type': 'prefix', 'strategy': 'public'},
+  ],
+};
 
 class ServiceEndpoint {
 
@@ -297,6 +325,7 @@ class ServiceEndpoint {
     this.primary = false,
     this.health,
     this.middleware = const [],
+    this.auth,
   });
 
   factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
@@ -324,6 +353,9 @@ class ServiceEndpoint {
       primary: json['primary'] == true,
       health: endpointHealth,
       middleware: (json['middleware'] as List<dynamic>?) ?? [],
+      auth: json['auth'] is Map
+          ? Map<String, dynamic>.from(json['auth'] as Map)
+          : null,
     );
   }
   final String app;
@@ -342,6 +374,7 @@ class ServiceEndpoint {
   final bool primary;
   final ListenerHealth? health;
   final List<dynamic> middleware;
+  final Map<String, dynamic>? auth;
 
   // Helper to get the Remote URL (if enabled)
   String? get remoteUrl {

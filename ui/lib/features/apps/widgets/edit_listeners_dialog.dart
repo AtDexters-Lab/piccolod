@@ -87,6 +87,7 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
                   itemBuilder: (context, index) {
                     final l = _listeners[index];
                     return _ListenerRow(
+                      key: ValueKey('$index-${l.protocol}-${l.flow}-${classifyAccess(l.auth)}'),
                       listener: l,
                       onDelete: () => _removeListener(index),
                       onChange: (updated) => _updateListener(index, updated),
@@ -129,10 +130,15 @@ class _ListenerRow extends StatelessWidget {
     required this.listener,
     required this.onDelete,
     required this.onChange,
+    super.key,
   });
   final AppListener listener;
   final VoidCallback onDelete;
   final ValueChanged<AppListener> onChange;
+
+  bool get _showAccessDropdown =>
+      (listener.protocol == 'http' || listener.protocol == 'websocket') &&
+      listener.flow != 'tls';
 
   @override
   Widget build(BuildContext context) {
@@ -192,7 +198,12 @@ class _ListenerRow extends StatelessWidget {
                 DropdownMenuItem(value: 'websocket', child: Text('WebSocket')),
               ],
               onChanged: (val) {
-                if (val != null) onChange(_copyWith(protocol: val));
+                if (val != null) {
+                  onChange(_copyWith(
+                    protocol: val,
+                    clearAuth: val == 'raw',
+                  ));
+                }
               },
             ),
           ),
@@ -211,10 +222,22 @@ class _ListenerRow extends StatelessWidget {
                 DropdownMenuItem(value: 'tls', child: Text('TLS')),
               ],
               onChanged: (val) {
-                if (val != null) onChange(_copyWith(flow: val));
+                if (val != null) {
+                  onChange(_copyWith(
+                    flow: val,
+                    clearAuth: val == 'tls',
+                  ));
+                }
               },
             ),
           ),
+          if (_showAccessDropdown) ...[
+            const SizedBox(width: Spacing.md),
+            Expanded(
+              flex: 2,
+              child: _buildAccessDropdown(),
+            ),
+          ],
           const SizedBox(width: Spacing.sm),
           IconButton(
             icon: const Icon(PiccoloIcons.delete, color: PiccoloTheme.critical),
@@ -226,11 +249,50 @@ class _ListenerRow extends StatelessWidget {
     );
   }
 
+  Widget _buildAccessDropdown() {
+    final access = classifyAccess(listener.auth);
+    final isCustom = access == 'custom';
+
+    final dropdown = DropdownButtonFormField<String>(
+      initialValue: access,
+      decoration: const InputDecoration(
+        labelText: 'Access',
+        isDense: true,
+        border: OutlineInputBorder(),
+      ),
+      items: [
+        const DropdownMenuItem(value: 'private', child: Text('Private')),
+        const DropdownMenuItem(value: 'public', child: Text('Public')),
+        if (isCustom)
+          const DropdownMenuItem(value: 'custom', child: Text('Custom')),
+      ],
+      onChanged: isCustom
+          ? null
+          : (val) {
+              if (val == 'public') {
+                onChange(_copyWith(auth: publicAuthPayload()));
+              } else if (val == 'private') {
+                onChange(_copyWith(clearAuth: true));
+              }
+            },
+    );
+
+    if (isCustom) {
+      return Tooltip(
+        message: 'This listener has custom path-based auth rules configured via the app definition.',
+        child: dropdown,
+      );
+    }
+    return dropdown;
+  }
+
   AppListener _copyWith({
     String? name,
     int? guestPort,
     String? flow,
     String? protocol,
+    Map<String, dynamic>? auth,
+    bool clearAuth = false,
   }) {
     return AppListener(
       name: name ?? listener.name,
@@ -239,6 +301,7 @@ class _ListenerRow extends StatelessWidget {
       protocol: protocol ?? listener.protocol,
       remotePorts: listener.remotePorts,
       middleware: listener.middleware,
+      auth: clearAuth ? null : (auth ?? listener.auth),
     );
   }
 }

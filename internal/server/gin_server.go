@@ -1511,6 +1511,10 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 		"lan_port_url":       lanPortURL, // New explicit name
 	}
 
+	if ep.Auth != nil {
+		result["auth"] = ep.Auth
+	}
+
 	// Add host-based URLs only for HTTP/WS listeners (per RFC 20260114)
 	if ep.DerivedHostLabel != "" {
 		// LAN host URL: only if mDNS is enabled (mdnsManager is nil when disabled)

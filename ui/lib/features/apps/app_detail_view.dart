@@ -625,7 +625,9 @@ class _AppDetailViewState extends State<AppDetailView>
             padding: const EdgeInsets.all(Spacing.lg),
             children: _listeners
                 .map(
-                  (svc) => Card(
+                  (svc) {
+                    final access = classifyAccess(svc.auth);
+                    return Card(
                     child: Padding(
                       padding: const EdgeInsets.all(Spacing.base),
                       child: Column(
@@ -665,6 +667,10 @@ class _AppDetailViewState extends State<AppDetailView>
                                   style: const TextStyle(fontSize: 12),
                                 ),
                               ),
+                              if (access != 'private') ...[
+                                const SizedBox(width: Spacing.sm),
+                                _buildAccessBadge(access),
+                              ],
                             ],
                           ),
                           const Divider(height: Spacing.lg),
@@ -724,8 +730,8 @@ class _AppDetailViewState extends State<AppDetailView>
                         ],
                       ),
                     ),
-                  ),
-                )
+                  );
+                  })
                 .toList(),
           );
 
@@ -865,6 +871,45 @@ class _AppDetailViewState extends State<AppDetailView>
         style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
           fontWeight: FontWeight.bold,
         ),
+      ),
+    );
+  }
+
+  Widget _buildAccessBadge(String access) {
+    final isPublic = access == 'public';
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: Spacing.sm,
+        vertical: 2,
+      ),
+      decoration: BoxDecoration(
+        color: isPublic
+            ? PiccoloTheme.warning.withValues(alpha: 0.12)
+            : PiccoloTheme.mist,
+        borderRadius: BorderRadius.circular(Radii.xxs),
+        border: Border.all(
+          color: isPublic
+              ? PiccoloTheme.warning.withValues(alpha: 0.4)
+              : PiccoloTheme.hairline,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            isPublic ? PiccoloIcons.router : PiccoloIcons.shield,
+            size: 12,
+            color: isPublic ? PiccoloTheme.warning : PiccoloTheme.inkMuted,
+          ),
+          const SizedBox(width: 4),
+          Text(
+            access.toUpperCase(),
+            style: TextStyle(
+              fontSize: 12,
+              color: isPublic ? PiccoloTheme.warning : PiccoloTheme.inkMuted,
+            ),
+          ),
+        ],
       ),
     );
   }
