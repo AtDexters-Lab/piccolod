@@ -23,7 +23,10 @@ class DesktopController extends ChangeNotifier {
 
   DesktopController() {
     appService = AppService(ApiClient());
-    ApiClient().onAuthRequired = _onAuthRequired;
+    // Don't register onAuthRequired yet — _checkSystemStatus will determine
+    // whether we're in desktop mode (reauth applies) or setup mode (setup
+    // wizard owns auth). Registering eagerly causes stale reauth state when
+    // 401s arrive while the setup wizard is active.
     unawaited(_checkSystemStatus());
   }
   // Query param used to preserve the welcome screen across HTTPS redirects.
@@ -126,6 +129,11 @@ class DesktopController extends ChangeNotifier {
         }
         _onAuthenticated(isFirstSetup: showWelcome);
       } else {
+        // Setup wizard will handle authentication — deactivate the reauth
+        // interceptor so 401s during the setup flow don't trigger the overlay.
+        _showReauth = false;
+        ApiClient().onAuthRequired = null;
+        ApiClient().completeReauth(success: false);
         notifyListeners();
       }
     }
@@ -162,6 +170,17 @@ class DesktopController extends ChangeNotifier {
   /// Handles event stream connection and optional first-setup welcome.
   void _onAuthenticated({required bool isFirstSetup}) {
     _needsSetup = false;
+
+    // Clear any stale re-auth state — the user just completed a full
+    // authentication flow (setup wizard or fresh session check), so any
+    // prior "Session Expired" overlay is obsolete.
+    _showReauth = false;
+    ApiClient().completeReauth(success: true);
+
+    // Activate the reauth interceptor now that the desktop is the active UI.
+    // This is intentionally deferred from the constructor: during setup wizard
+    // mode, 401s should NOT trigger the reauth overlay.
+    ApiClient().onAuthRequired = _onAuthRequired;
 
     // Capture username for re-auth overlay pre-fill (best-effort, fire-and-forget).
     // Covers the fresh-login path where _checkSystemStatus didn't reach the session check.
@@ -262,8 +281,10 @@ class DesktopController extends ChangeNotifier {
     _eventStreamClient?.dispose();
     _eventStreamClient = null;
 
-    // Clear re-auth state to avoid stale overlay on next login cycle.
+    // Deactivate reauth interceptor — setup wizard will own auth now.
     _showReauth = false;
+    ApiClient().onAuthRequired = null;
+    ApiClient().completeReauth(success: false);
     _lastKnownUsername = null;
 
     // Force UI back to SetupWizard (which will detect unauthenticated state and show Login)
@@ -534,6 +555,7 @@ class DesktopController extends ChangeNotifier {
   @override
   void dispose() {
     ApiClient().onAuthRequired = null;
+    ApiClient().completeReauth(success: false);
     _eventStreamClient?.dispose();
     _eventStreamClient = null;
     super.dispose();
