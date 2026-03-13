@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"piccolod/internal/api"
-	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/services"
 )
 
@@ -30,7 +29,9 @@ func TestServiceRemoteResolver(t *testing.T) {
 	}
 	webEndpoint := eps[0]
 
-	resolver.UpdateConfig(nexusclient.Config{PortalHostname: "portal.example.com"})
+	resolver.SetRemoteBases("self-hosted", []remoteBase{
+		{source: "self-hosted", portalHost: "portal.example.com", domain: "portal.example.com"},
+	})
 
 	resolver.SetTlsMuxPort(9090)
 
@@ -65,4 +66,42 @@ func TestServiceRemoteResolver(t *testing.T) {
 	}
 
 	svc.Stop()
+}
+
+func TestPortalHostsStableOrdering(t *testing.T) {
+	resolver := newServiceRemoteResolver(nil)
+
+	// Set namek first, then self-hosted — self-hosted should still come first.
+	resolver.SetRemoteBases("namek", []remoteBase{
+		{source: "namek", portalHost: "slug.test.local", domain: "test.local"},
+	})
+	resolver.SetRemoteBases("self-hosted", []remoteBase{
+		{source: "self-hosted", portalHost: "portal.example.com", domain: "portal.example.com"},
+	})
+
+	hosts := resolver.PortalHosts()
+	if len(hosts) != 2 {
+		t.Fatalf("expected 2 hosts, got %d", len(hosts))
+	}
+	if hosts[0] != "portal.example.com" {
+		t.Errorf("expected self-hosted first, got %q", hosts[0])
+	}
+	if hosts[1] != "slug.test.local" {
+		t.Errorf("expected namek second, got %q", hosts[1])
+	}
+
+	// Re-set self-hosted — order should remain stable.
+	resolver.SetRemoteBases("self-hosted", []remoteBase{
+		{source: "self-hosted", portalHost: "new-portal.example.com", domain: "new-portal.example.com"},
+	})
+	hosts = resolver.PortalHosts()
+	if len(hosts) != 2 {
+		t.Fatalf("expected 2 hosts, got %d", len(hosts))
+	}
+	if hosts[0] != "new-portal.example.com" {
+		t.Errorf("expected updated self-hosted first, got %q", hosts[0])
+	}
+	if hosts[1] != "slug.test.local" {
+		t.Errorf("expected namek second, got %q", hosts[1])
+	}
 }

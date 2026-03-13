@@ -213,21 +213,22 @@ func (s *GinServer) buildValidOrigins(endpoints []services.ServiceEndpoint) []va
 	}
 	localHostname = strings.ToLower(localHostname)
 
-	for _, ep := range endpoints {
-		// Remote: https://<app>.<portal-base>
-		if s.remoteManager != nil {
-			st := s.remoteManager.Status()
-			if st.Enabled && strings.TrimSpace(st.PortalHostname) != "" {
-				if remoteHost := s.remoteServiceHostname(&st, ep); remoteHost != "" {
-					origins = append(origins, validOrigin{"https", strings.ToLower(remoteHost), 0})
-				}
-			}
+	// Collect all remote portal hostnames from the resolver (source-agnostic).
+	portalHosts := s.portalHosts()
 
-			// Alias domains: https://<alias>
-			// Alias.Listener stores DerivedHostLabel, match against ep.DerivedHostLabel.
-			for _, alias := range s.remoteManager.ListAliases() {
-				if alias.Listener == ep.DerivedHostLabel && strings.TrimSpace(alias.Hostname) != "" {
-					origins = append(origins, validOrigin{"https", strings.ToLower(alias.Hostname), 0})
+	for _, ep := range endpoints {
+		// Remote access: https://<app>.<portal> for each known portal hostname
+		for _, portal := range portalHosts {
+			if remoteHost := services.RemoteServiceHostname(ep.DerivedHostLabel, portal); remoteHost != "" {
+				origins = append(origins, validOrigin{"https", strings.ToLower(remoteHost), 0})
+			}
+		}
+
+		// Alias domains: https://<alias>
+		if s.remoteResolver != nil {
+			for aliasHost, hostLabel := range s.remoteResolver.AliasHostLabels() {
+				if hostLabel == ep.DerivedHostLabel {
+					origins = append(origins, validOrigin{"https", aliasHost, 0})
 				}
 			}
 		}
@@ -280,17 +281,23 @@ func (s *GinServer) handleOIDCDiscovery(c *gin.Context) {
 	cfg := oidc.DiscoveryConfig{
 		StableIssuer: s.oidcIssuer(),
 		IsRemoteActive: func() bool {
-			if s.remoteManager == nil {
-				return false
-			}
-			st := s.remoteManager.Status()
-			return st.Enabled && st.PortalHostname != ""
+			return len(s.portalHosts()) > 0
 		},
 		GetPortalHostname: func() string {
-			if s.remoteManager == nil {
-				return ""
+			// Use the request Host to select the matching portal, so the
+			// discovery document advertises the correct authorization_endpoint
+			// when both self-hosted and namek portals are active.
+			if s.remoteResolver != nil {
+				reqHost := canonicalHost(c.Request.Host)
+				if portal := s.remoteResolver.PortalHostForRequest(reqHost); portal != "" {
+					return portal
+				}
 			}
-			return s.remoteManager.Status().PortalHostname
+			// Fallback: first portal (LAN requests or unrecognized host).
+			if hosts := s.portalHosts(); len(hosts) > 0 {
+				return hosts[0]
+			}
+			return ""
 		},
 		GetLocalHostname: func() string {
 			// Use mDNS hostname if available (handles conflicts like "piccolo-abc123.local")

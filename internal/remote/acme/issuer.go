@@ -23,7 +23,6 @@ import (
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
-	"github.com/go-acme/lego/v4/challenge"
 	lego "github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
 	acmepkg "golang.org/x/crypto/acme"
@@ -213,35 +212,44 @@ func (m *Manager) SetOrchestratorClient(client OrchestratorClient) {
 }
 
 func (m *Manager) configureChallenge(cli *lego.Client) error {
-	if m == nil || cli == nil {
-		return errors.New("acme: client unavailable")
-	}
 	m.mu.RLock()
 	solver := m.solver
+	orchClient := m.orchestratorClient
 	m.mu.RUnlock()
-	if strings.EqualFold(solver, "dns-01") {
-		prov, err := m.buildDNSProvider()
-		if err != nil {
-			return err
-		}
-		return cli.Challenge.SetDNS01Provider(prov)
+	return configureChallengeWith(cli, solver, orchClient, m.sink)
+}
+
+// configureChallengeWith sets up the challenge provider on a lego client using explicit params.
+func configureChallengeWith(cli *lego.Client, solver string, orchClient OrchestratorClient, sink ChallengeSink) error {
+	if cli == nil {
+		return errors.New("acme: client unavailable")
 	}
-	prov := &http01Provider{sink: m.sink}
+	if strings.EqualFold(solver, "dns-01") {
+		if orchClient == nil {
+			return errors.New("acme: orchestrator client not configured")
+		}
+		return cli.Challenge.SetDNS01Provider(NewPiccoloProvider(orchClient))
+	}
+	prov := &http01Provider{sink: sink}
 	return cli.Challenge.SetHTTP01Provider(prov)
 }
 
-func (m *Manager) buildDNSProvider() (challenge.Provider, error) {
+// EnsureAccount loads or creates a new ACME account (P-256), accepts TOS.
+// Uses the manager's default solver/orchestratorClient for challenge configuration.
+func (m *Manager) EnsureAccount() (*lego.Client, *account, error) {
 	m.mu.RLock()
-	client := m.orchestratorClient
+	solver := m.solver
+	orchClient := m.orchestratorClient
 	m.mu.RUnlock()
-	if client == nil {
-		return nil, errors.New("acme: orchestrator client not configured")
-	}
-	return NewPiccoloProvider(client), nil
+	return m.ensureAccountWith(solver, orchClient)
 }
 
-// EnsureAccount loads or creates a new ACME account (P-256), accepts TOS.
-func (m *Manager) EnsureAccount() (*lego.Client, *account, error) {
+// EnsureAccountWithSolver loads or creates an ACME account configured with the specified solver.
+func (m *Manager) EnsureAccountWithSolver(solver string, orchClient OrchestratorClient) (*lego.Client, *account, error) {
+	return m.ensureAccountWith(solver, orchClient)
+}
+
+func (m *Manager) ensureAccountWith(solver string, orchClient OrchestratorClient) (*lego.Client, *account, error) {
 	if acc, err := m.loadAccount(); err == nil {
 		if acc != nil && acc.Registration != nil && acc.Registration.URI != "" {
 			if regHost, dirHost := hostFromURL(acc.Registration.URI), hostFromURL(m.directory); regHost != "" && dirHost != "" && !strings.EqualFold(regHost, dirHost) {
@@ -260,7 +268,7 @@ func (m *Manager) EnsureAccount() (*lego.Client, *account, error) {
 			if err != nil {
 				return nil, nil, err
 			}
-			if err := m.configureChallenge(cli); err != nil {
+			if err := configureChallengeWith(cli, solver, orchClient, m.sink); err != nil {
 				return nil, nil, err
 			}
 			if acc.Registration != nil {
@@ -282,7 +290,7 @@ func (m *Manager) EnsureAccount() (*lego.Client, *account, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := m.configureChallenge(cli); err != nil {
+	if err := configureChallengeWith(cli, solver, orchClient, m.sink); err != nil {
 		return nil, nil, err
 	}
 	// New registration with TOS
@@ -300,10 +308,11 @@ func (m *Manager) EnsureAccount() (*lego.Client, *account, error) {
 	return cli, acc, nil
 }
 
-// Issue writes certificate and key files for the given commonName and SANs.
-func (m *Manager) Issue(commonName string, sans []string, outName string, certDir string) (*tls.Certificate, error) {
+// IssueWithSolver issues a certificate using a specific solver and orchestrator client.
+// This enables per-cert solver selection (e.g., DNS-01 for namek, HTTP-01 for self-hosted).
+func (m *Manager) IssueWithSolver(solver string, orchClient OrchestratorClient, commonName string, sans []string, outName string, certDir string) (*tls.Certificate, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		cli, _, err := m.EnsureAccount()
+		cli, _, err := m.EnsureAccountWithSolver(solver, orchClient)
 		if err != nil {
 			return nil, err
 		}
@@ -337,6 +346,16 @@ func (m *Manager) Issue(commonName string, sans []string, outName string, certDi
 		return &pair, nil
 	}
 	return nil, errors.New("acme: failed to obtain certificate after retry")
+}
+
+// Issue writes certificate and key files for the given commonName and SANs.
+// Uses the manager's default solver.
+func (m *Manager) Issue(commonName string, sans []string, outName string, certDir string) (*tls.Certificate, error) {
+	m.mu.RLock()
+	solver := m.solver
+	orchClient := m.orchestratorClient
+	m.mu.RUnlock()
+	return m.IssueWithSolver(solver, orchClient, commonName, sans, outName, certDir)
 }
 
 // http01Provider bridges lego HTTP-01 to our ChallengeSink.

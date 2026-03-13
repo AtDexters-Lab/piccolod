@@ -20,12 +20,25 @@ type CertProvider interface {
 }
 
 type portalAwareProvider interface {
-	SetPortalHostname(host string)
+	SetPortalMappings(source string, mappings []PortalCertMapping)
+}
+
+// PortalCertMapping maps a portal hostname to a cert name for TLS mux portal awareness.
+type PortalCertMapping struct {
+	Hostname string
+	CertName string
 }
 
 // portalHostLabel mirrors nexusclient.PortalHostLabel — the sentinel for portal-targeted aliases.
 // Defined locally to avoid coupling the services package to nexusclient.
 const portalHostLabel = "__portal"
+
+// TlsMuxBase represents a remote base for TLS mux routing (RFC 20260312).
+type TlsMuxBase struct {
+	Source     string // source identifier for targeted removal (e.g., "self-hosted")
+	PortalHost string
+	Domain     string
+}
 
 // TlsMux terminates TLS (remote-only) on loopback and forwards HTTP to a local public_port.
 // It does not expose any TLS listener on the LAN.
@@ -44,6 +57,9 @@ type TlsMux struct {
 	// Alias routing: hostname → DerivedHostLabel (or "__portal")
 	aliases map[string]string
 
+	// Additional remote bases (RFC 20260312)
+	remoteBases []TlsMuxBase
+
 	services *ServiceManager
 	certs    CertProvider
 }
@@ -58,8 +74,10 @@ func (m *TlsMux) UpdateConfig(portalHost, domain string, portalPort int) {
 	m.portalHost = strings.TrimSuffix(strings.ToLower(portalHost), ".")
 	m.domain = strings.TrimSuffix(strings.ToLower(domain), ".")
 	m.portalPort = portalPort
-	if prov, ok := m.certs.(portalAwareProvider); ok {
-		prov.SetPortalHostname(m.portalHost)
+	if prov, ok := m.certs.(portalAwareProvider); ok && m.portalHost != "" {
+		prov.SetPortalMappings("self-hosted", []PortalCertMapping{
+			{Hostname: m.portalHost, CertName: "portal"},
+		})
 	}
 	m.mu.Unlock()
 }
@@ -71,6 +89,19 @@ func (m *TlsMux) SetCertProvider(p CertProvider) { m.mu.Lock(); m.certs = p; m.m
 func (m *TlsMux) UpdateAliases(aliases map[string]string) {
 	m.mu.Lock()
 	m.aliases = aliases
+	m.mu.Unlock()
+}
+
+// SetRemoteBases replaces all remote bases for a given source (RFC 20260312).
+func (m *TlsMux) SetRemoteBases(source string, bases []TlsMuxBase) {
+	m.mu.Lock()
+	var kept []TlsMuxBase
+	for _, b := range m.remoteBases {
+		if b.Source != source {
+			kept = append(kept, b)
+		}
+	}
+	m.remoteBases = append(kept, bases...)
 	m.mu.Unlock()
 }
 
@@ -235,6 +266,7 @@ func (m *TlsMux) resolveUpstream(host string) int {
 	domain := m.domain
 	portalPort := m.portalPort
 	aliases := m.aliases
+	bases := m.remoteBases
 	m.mu.RUnlock()
 
 	if host == "" {
@@ -258,15 +290,36 @@ func (m *TlsMux) resolveUpstream(host string) int {
 	// <app>.<domain> or <listener>-<app>.<domain> → map to ServiceManager public_port
 	// Per RFC 20260114: use DerivedHostLabel for routing (primary=<app>, others=<listener>-<app>)
 	if domain != "" && strings.HasSuffix(host, "."+domain) {
-		label := strings.TrimSuffix(host, "."+domain)
-		if i := strings.Index(label, "."); i != -1 {
-			label = label[:i]
+		if port := m.resolveByDomain(host, domain); port != 0 {
+			return port
 		}
-		if label != "" && m.services != nil {
-			// Use ResolveByHostLabel for RFC 20260114 hostname scheme
-			if ep, ok := m.services.ResolveByHostLabel(label, 443); ok {
-				return ep.PublicPort
+	}
+	// Check additional remote bases (RFC 20260312).
+	// Two passes: exact portal match first, then subdomain — ensures a more-specific
+	// portal hostname is not misclassified as a subdomain of a less-specific base.
+	for _, rb := range bases {
+		if host == rb.PortalHost {
+			return portalPort
+		}
+	}
+	for _, rb := range bases {
+		if rb.Domain != "" && host != rb.PortalHost && strings.HasSuffix(host, "."+rb.Domain) {
+			if port := m.resolveByDomain(host, rb.Domain); port != 0 {
+				return port
 			}
+		}
+	}
+	return 0
+}
+
+func (m *TlsMux) resolveByDomain(host, domain string) int {
+	label := strings.TrimSuffix(host, "."+domain)
+	if i := strings.Index(label, "."); i != -1 {
+		label = label[:i]
+	}
+	if label != "" && m.services != nil {
+		if ep, ok := m.services.ResolveByHostLabel(label, 443); ok {
+			return ep.PublicPort
 		}
 	}
 	return 0

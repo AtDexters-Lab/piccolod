@@ -9,7 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"piccolod/internal/remote"
+	"piccolod/internal/services"
 )
 
 func (s *GinServer) handleAuthValidateNext(c *gin.Context) {
@@ -72,16 +72,6 @@ func (s *GinServer) validateNextURL(raw string) (string, bool) {
 		localHostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s.mdnsManager.Hostname()), "."))
 	}
 
-	remotePortal := ""
-	var remoteStatus *remote.Status
-	if s.remoteManager != nil {
-		st := s.remoteManager.Status()
-		remoteStatus = &st
-		if st.Enabled {
-			remotePortal = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(st.PortalHostname), "."))
-		}
-	}
-
 	allowedPorts := make(map[int]struct{})
 	remoteHosts := make(map[string]struct{})
 	localHosts := make(map[string]struct{})
@@ -90,8 +80,11 @@ func (s *GinServer) validateNextURL(raw string) (string, bool) {
 	if localHostname != "" {
 		localHosts[localHostname] = struct{}{}
 	}
-	if remotePortal != "" {
-		remoteHosts[remotePortal] = struct{}{}
+
+	// Add all remote portal hostnames from the resolver (source-agnostic).
+	portalHosts := s.portalHosts()
+	for _, h := range portalHosts {
+		remoteHosts[strings.ToLower(h)] = struct{}{}
 	}
 
 	if s.serviceManager != nil {
@@ -99,9 +92,10 @@ func (s *GinServer) validateNextURL(raw string) (string, bool) {
 			if ep.PublicPort != 0 {
 				allowedPorts[ep.PublicPort] = struct{}{}
 			}
-			if remoteStatus != nil {
-				if h := s.remoteServiceHostname(remoteStatus, ep); h != "" {
-					remoteHosts[strings.ToLower(h)] = struct{}{}
+			// Derive app hostnames for all portal hosts (source-agnostic).
+			for _, portal := range portalHosts {
+				if remoteHost := services.RemoteServiceHostname(ep.DerivedHostLabel, portal); remoteHost != "" {
+					remoteHosts[strings.ToLower(remoteHost)] = struct{}{}
 				}
 			}
 			// LAN host-based routing (future RFC) - safe allowlist entry even if not enabled yet.
@@ -111,12 +105,9 @@ func (s *GinServer) validateNextURL(raw string) (string, bool) {
 		}
 	}
 
-	if s.remoteManager != nil {
-		for _, alias := range s.remoteManager.ListAliases() {
-			h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(alias.Hostname), "."))
-			if h != "" {
-				aliasHosts[h] = struct{}{}
-			}
+	if s.remoteResolver != nil {
+		for aliasHost := range s.remoteResolver.AliasHostLabels() {
+			aliasHosts[aliasHost] = struct{}{}
 		}
 	}
 

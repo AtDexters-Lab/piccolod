@@ -4,8 +4,6 @@ import (
 	"context"
 	"net/http/httptest"
 	"testing"
-
-	"piccolod/internal/remote"
 )
 
 func TestPortalOriginForRequest_UsesPortalPortNotListenerPort(t *testing.T) {
@@ -70,24 +68,14 @@ func TestPortalOriginForRequest_IgnoresSpoofedXForwardedProto(t *testing.T) {
 }
 
 func TestPortalOriginForRequest_RemoteLoopbackUsesPortalHostname(t *testing.T) {
-	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
 	t.Setenv("PORT", "8080")
 
-	baseDir := t.TempDir()
-	rm, err := remote.NewManager(baseDir)
-	if err != nil {
-		t.Fatalf("remote mgr: %v", err)
-	}
-	t.Cleanup(func() { _ = rm.Close() })
-	if err := rm.Configure(remote.ConfigureRequest{
-		Endpoint:       "wss://nexus.example.com/connect",
-		DeviceSecret:   "secret",
-		PortalHostname: "portal.example.com",
-	}); err != nil {
-		t.Fatalf("configure remote: %v", err)
-	}
+	resolver := newServiceRemoteResolver(nil)
+	resolver.SetRemoteBases("self-hosted", []remoteBase{
+		{source: "self-hosted", portalHost: "portal.example.com", domain: "portal.example.com"},
+	})
 
-	s := &GinServer{remoteManager: rm}
+	s := &GinServer{remoteResolver: resolver}
 	req := httptest.NewRequest("GET", "http://portal.example.com/", nil)
 	req.Host = "portal.example.com"
 	req.RemoteAddr = "127.0.0.1:1234"

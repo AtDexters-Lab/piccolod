@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -64,10 +63,7 @@ func (s *GinServer) handleRemoteConfigure(c *gin.Context) {
 	}
 	s.refreshRemoteRuntime()
 	// User-managed mode uses HTTP-01 (wildcard unsupported), proactively issue per-listener certs
-	if strings.TrimSpace(req.PortalHostname) != "" && s.remoteManager != nil && s.serviceManager != nil {
-		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(req.PortalHostname)), ".")
-		queueEndpointHostCerts(s.remoteManager, s.serviceManager.GetAll(), base)
-	}
+	s.queueAllEndpointCerts()
 	c.JSON(http.StatusOK, gin.H{"message": "remote configured"})
 }
 

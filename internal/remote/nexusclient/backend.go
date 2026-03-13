@@ -19,7 +19,7 @@ type backendClient interface {
 	Stop()
 }
 
-type clientFactory func(backend.ClientBackendConfig, backend.ConnectHandler) (backendClient, error)
+type clientFactory func(backend.ClientBackendConfig, ...backend.Option) (backendClient, error)
 
 type realBackendClient struct {
 	*backend.Client
@@ -37,6 +37,21 @@ const (
 	attestationCacheHandshake     = 5 * time.Second
 )
 
+// BackendAdapterOption configures a BackendAdapter.
+type BackendAdapterOption func(*BackendAdapter)
+
+// WithAdapterTokenProvider injects a custom token provider that replaces HMAC attestation.
+// When set, DeviceSecret is not required in the adapter config.
+func WithAdapterTokenProvider(p backend.TokenProvider) BackendAdapterOption {
+	return func(a *BackendAdapter) { a.tokenProvider = p }
+}
+
+// WithAdapterName sets the backend name used for Nexus registration.
+// Defaults to "piccolo-portal" if not set.
+func WithAdapterName(name string) BackendAdapterOption {
+	return func(a *BackendAdapter) { a.name = name }
+}
+
 // BackendAdapter bridges piccolod with the nexus proxy backend client. It now uses
 // the upstream token provider hook so that every connection attempt receives a
 // freshly minted JWT without custom reconnect loops on our side.
@@ -46,17 +61,20 @@ type BackendAdapter struct {
 	router   *router.Manager
 	resolver RemoteResolver
 
-	factory clientFactory
-	cancel  context.CancelFunc
-	client  backendClient
+	factory       clientFactory
+	cancel        context.CancelFunc
+	client        backendClient
+	tokenProvider backend.TokenProvider // nil = use HMAC from config
+	name          string               // backend name for Nexus registration
 }
 
-func NewBackendAdapter(r *router.Manager, resolver RemoteResolver) *BackendAdapter {
-	return &BackendAdapter{
+func NewBackendAdapter(r *router.Manager, resolver RemoteResolver, opts ...BackendAdapterOption) *BackendAdapter {
+	a := &BackendAdapter{
 		router:   r,
 		resolver: resolver,
-		factory: func(cfg backend.ClientBackendConfig, handler backend.ConnectHandler) (backendClient, error) {
-			client, err := backend.New(cfg, backend.WithConnectHandler(handler))
+		name:     "piccolo-portal",
+		factory: func(cfg backend.ClientBackendConfig, clientOpts ...backend.Option) (backendClient, error) {
+			client, err := backend.New(cfg, clientOpts...)
 			if err != nil {
 				return nil, err
 			}
@@ -65,16 +83,16 @@ func NewBackendAdapter(r *router.Manager, resolver RemoteResolver) *BackendAdapt
 			}, nil
 		},
 	}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a
 }
 
 func (a *BackendAdapter) Configure(cfg Config) error {
 	a.mu.Lock()
 	a.cfg = cfg
 	a.mu.Unlock()
-
-	if updater, ok := a.resolver.(interface{ UpdateConfig(Config) }); ok {
-		updater.UpdateConfig(cfg)
-	}
 	return nil
 }
 
@@ -85,14 +103,14 @@ func (a *BackendAdapter) Start(ctx context.Context) error {
 		return nil
 	}
 	cfg := a.cfg
-	if !configReady(cfg) {
+	if !a.configReady(cfg) {
 		a.mu.Unlock()
 		log.Printf("WARN: nexus adapter start skipped, missing configuration")
 		return nil
 	}
 	hosts := buildHostnameList(cfg)
 	backendCfg := backend.ClientBackendConfig{
-		Name:         "piccolo-portal",
+		Name:         a.name,
 		Hostnames:    hosts,
 		NexusAddress: cfg.Endpoint,
 		Weight:       1,
@@ -112,7 +130,13 @@ func (a *BackendAdapter) Start(ctx context.Context) error {
 	}
 	handler := a.connectHandler()
 
-	client, err := a.factory(backendCfg, handler)
+	var clientOpts []backend.Option
+	clientOpts = append(clientOpts, backend.WithConnectHandler(handler))
+	if a.tokenProvider != nil {
+		clientOpts = append(clientOpts, backend.WithTokenProvider(a.tokenProvider))
+	}
+
+	client, err := a.factory(backendCfg, clientOpts...)
 	if err != nil {
 		a.mu.Unlock()
 		return fmt.Errorf("construct backend client: %w", err)
@@ -203,8 +227,14 @@ func buildHostnameList(cfg Config) []string {
 	return hosts
 }
 
-func configReady(cfg Config) bool {
-	return strings.TrimSpace(cfg.Endpoint) != "" &&
-		strings.TrimSpace(cfg.DeviceSecret) != "" &&
-		strings.TrimSpace(cfg.PortalHostname) != ""
+// configReady checks whether the adapter has enough config to start.
+// When a tokenProvider is set, DeviceSecret is not required.
+func (a *BackendAdapter) configReady(cfg Config) bool {
+	if strings.TrimSpace(cfg.Endpoint) == "" || strings.TrimSpace(cfg.PortalHostname) == "" {
+		return false
+	}
+	if a.tokenProvider == nil && strings.TrimSpace(cfg.DeviceSecret) == "" {
+		return false
+	}
+	return true
 }

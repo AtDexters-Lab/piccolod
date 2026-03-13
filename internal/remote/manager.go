@@ -56,9 +56,6 @@ type Config struct {
 	OrchestratorEndpoint string `json:"orchestrator_endpoint,omitempty"` // Orchestrator API endpoint
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
 
 // Alias represents a remote alias domain attached to a listener.
 type Alias struct {
@@ -71,10 +68,14 @@ type Alias struct {
 }
 
 // Certificate captures basic certificate metadata for the inventory table.
+// For source-tagged certs, Domains is kept fresh by the source's event handler
+// re-enqueuing via EnqueueCertIssuance when hostnames change.
 type Certificate struct {
 	ID            string     `json:"id"`
 	Domains       []string   `json:"domains"`
+	Source        string     `json:"source,omitempty"`    // e.g., "self-hosted", "namek" — for orchClient lookup
 	Solver        string     `json:"solver,omitempty"`
+	CertDir       string     `json:"cert_dir,omitempty"`  // override cert file location
 	Attempts      int        `json:"attempts,omitempty"`
 	LastAttempt   *time.Time `json:"last_attempt,omitempty"`
 	RetryAt       *time.Time `json:"retry_at,omitempty"`
@@ -171,9 +172,6 @@ type Manager struct {
 	dialer        dialer
 	resolver      resolver
 	now           func() time.Time
-	adapter       nexusclient.Adapter
-	adapterMu     sync.Mutex
-	adapterCancel context.CancelFunc
 	challenges    *ChallengeManager
 	acmeMgr       *acme.Manager
 	renewCancel   context.CancelFunc
@@ -193,9 +191,14 @@ type Manager struct {
 	// Wake signal for RetryAt-driven scheduler (RFC 20260125)
 	scheduleWakeCh chan struct{}
 
-	// Tracks the last adapter config key to skip unnecessary stop/start cycles
-	// when only non-adapter fields (certs, events) changed in save().
-	lastAdapterKey string // guarded by adapterMu
+	// Self-hosted adapter (existing behavior)
+	adapterMu     sync.Mutex // protects both self-hosted and namek adapter fields
+	adapter       nexusclient.Adapter
+	adapterCancel context.CancelFunc
+	lastAdapterKey string
+
+	// Source-agnostic orchestrator client registry (RFC 20260312)
+	orchClients map[string]acme.OrchestratorClient // source → orchClient
 }
 
 func (m *Manager) certDir() string {
@@ -274,7 +277,7 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 	return m, nil
 }
 
-// SetNexusAdapter injects the adapter responsible for proxy connectivity.
+// SetNexusAdapter injects the self-hosted adapter responsible for proxy connectivity.
 func (m *Manager) SetNexusAdapter(adapter nexusclient.Adapter) {
 	m.adapterMu.Lock()
 	m.adapter = adapter
@@ -286,10 +289,68 @@ func (m *Manager) SetNexusAdapter(adapter nexusclient.Adapter) {
 	m.applyAdapterState(snap)
 }
 
+
 // SetEventsBus wires the shared event bus so the manager can publish config changes.
 func (m *Manager) SetEventsBus(bus *events.Bus) {
 	m.eventsBus = bus
 	m.publishConfigChanged()
+}
+
+// RegisterOrchClient registers an orchestrator client for a source tag.
+// Used by external sources (e.g., namek) to provide DNS-01 challenge solvers.
+func (m *Manager) RegisterOrchClient(source string, client acme.OrchestratorClient) {
+	m.adapterMu.Lock()
+	if m.orchClients == nil {
+		m.orchClients = make(map[string]acme.OrchestratorClient)
+	}
+	m.orchClients[source] = client
+	m.adapterMu.Unlock()
+}
+
+// UnregisterOrchClient removes the orchestrator client for a source tag.
+func (m *Manager) UnregisterOrchClient(source string) {
+	m.adapterMu.Lock()
+	delete(m.orchClients, source)
+	m.adapterMu.Unlock()
+}
+
+// CertIssuanceRequest is the public API for enqueuing cert issuance from external sources.
+type CertIssuanceRequest struct {
+	ID         string
+	Source     string
+	Solver     string
+	CertDir    string
+	CommonName string
+	Domains    []string
+	Force      bool
+}
+
+// EnqueueCertIssuance enqueues a certificate issuance request from an external source.
+// The source's orchClient must be registered via RegisterOrchClient before calling this.
+func (m *Manager) EnqueueCertIssuance(req CertIssuanceRequest) {
+	if m == nil || m.acmeMgr == nil || req.CommonName == "" {
+		return
+	}
+	var orchClient acme.OrchestratorClient
+	if req.Source != "" {
+		m.adapterMu.Lock()
+		orchClient = m.orchClients[req.Source]
+		m.adapterMu.Unlock()
+	}
+	m.enqueueIssuanceJob(issuanceJob{
+		id:         req.ID,
+		domains:    req.Domains,
+		commonName: req.CommonName,
+		force:      req.Force,
+		source:     req.Source,
+		solver:     req.Solver,
+		orchClient: orchClient,
+		certDir:    req.CertDir,
+	})
+	// Ensure the renew scheduler is running so source-tagged certs get renewed.
+	// For namek-only devices, applyAdapterState (self-hosted path) is never called,
+	// so EnqueueCertIssuance is the only trigger.
+	m.startRenewScheduler()
 }
 
 type netDialer struct{}
@@ -997,7 +1058,14 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 
 	if !snap.Enabled || snap.Endpoint == "" || snap.DeviceSecret == "" || snap.PortalHostname == "" {
 		m.stopAdapter()
-		m.stopRenewScheduler()
+		// Only stop the renew scheduler if no external source has registered an orchClient.
+		// External sources (e.g., namek) share the same scheduler for cert renewals.
+		m.adapterMu.Lock()
+		hasExternalSources := len(m.orchClients) > 0
+		m.adapterMu.Unlock()
+		if !hasExternalSources {
+			m.stopRenewScheduler()
+		}
 		return
 	}
 
@@ -1102,6 +1170,7 @@ func (m *Manager) stopAdapter() {
 		}
 	}
 }
+
 
 // startRenewScheduler starts a background loop to renew certificates when due.
 func (m *Manager) startRenewScheduler() {
@@ -1230,6 +1299,7 @@ func (m *Manager) scanAndQueueRenewals() {
 		id      string
 		domains []string
 		cn      string
+		source  string
 	}
 	var jobs []renewalJob
 	for _, c := range cfg.Certificates {
@@ -1250,7 +1320,7 @@ func (m *Manager) scanAndQueueRenewals() {
 		if !ok {
 			continue
 		}
-		jobs = append(jobs, renewalJob{id: c.ID, domains: domains, cn: cn})
+		jobs = append(jobs, renewalJob{id: c.ID, domains: domains, cn: cn, source: c.Source})
 	}
 	m.cfgMu.RUnlock()
 
@@ -1259,14 +1329,27 @@ func (m *Manager) scanAndQueueRenewals() {
 		log.Printf("remote: scheduler queuing %d certificate renewal(s)", len(jobs))
 	}
 	for _, job := range jobs {
-		m.enqueueIssuance(job.id, job.domains, job.cn)
+		m.enqueueIssuanceJob(issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, source: job.source})
 	}
 }
 
+// desiredDomainsAndCN returns the domains and CN for a certificate, reading the current
+// config for self-hosted certs. Source-tagged certs use stored domains (kept fresh by
+// the source's event handler re-enqueuing via EnqueueCertIssuance when hostnames change).
 func desiredDomainsAndCN(cfg *Config, c Certificate) ([]string, string, bool) {
 	if cfg == nil {
 		return nil, "", false
 	}
+
+	// Source-tagged certs: use stored domains directly (kept fresh by domain freshness guarantee)
+	if c.Source != "" {
+		if len(c.Domains) == 0 {
+			return nil, "", false
+		}
+		cn := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(c.Domains[0])), ".")
+		return append([]string(nil), c.Domains...), cn, true
+	}
+
 	switch c.ID {
 	case "portal":
 		if cfg.PortalHostname == "" {
@@ -1302,16 +1385,22 @@ func desiredDomainsAndCN(cfg *Config, c Certificate) ([]string, string, bool) {
 	return append([]string(nil), c.Domains...), cn, true
 }
 
+// RequeueOutstandingIssuances re-enqueues any pending or expired certs for issuance.
+func (m *Manager) RequeueOutstandingIssuances() { m.requeueOutstandingIssuances() }
+
 func (m *Manager) requeueOutstandingIssuances() {
 	if m == nil {
 		return
 	}
 
 	type requeueJob struct {
-		id       string
-		domains  []string
-		cn       string
-		isPending bool // true = queueIssuanceJob, false = enqueueIssuanceWithForce
+		id        string
+		domains   []string
+		cn        string
+		source    string
+		solver    string
+		certDir   string
+		isPending bool // true = queue directly to worker, false = enqueue with inventory check
 	}
 
 	m.cfgMu.RLock()
@@ -1322,7 +1411,7 @@ func (m *Manager) requeueOutstandingIssuances() {
 		if strings.EqualFold(c.Status, "pending") {
 			domains, cn, ok := desiredDomainsAndCN(cfg, c)
 			if ok {
-				jobs = append(jobs, requeueJob{id: c.ID, domains: domains, cn: cn, isPending: true})
+				jobs = append(jobs, requeueJob{id: c.ID, domains: domains, cn: cn, source: c.Source, solver: c.Solver, certDir: c.CertDir, isPending: true})
 			}
 			continue
 		}
@@ -1330,7 +1419,7 @@ func (m *Manager) requeueOutstandingIssuances() {
 		if strings.EqualFold(c.Status, "error") && c.RetryAt != nil && now.After(*c.RetryAt) {
 			domains, cn, ok := desiredDomainsAndCN(cfg, c)
 			if ok {
-				jobs = append(jobs, requeueJob{id: c.ID, domains: domains, cn: cn, isPending: false})
+				jobs = append(jobs, requeueJob{id: c.ID, domains: domains, cn: cn, source: c.Source, solver: c.Solver, certDir: c.CertDir, isPending: false})
 			}
 		}
 	}
@@ -1341,10 +1430,22 @@ func (m *Manager) requeueOutstandingIssuances() {
 		log.Printf("remote: requeuing %d outstanding certificate issuance(s)", len(jobs))
 	}
 	for _, job := range jobs {
+		ij := issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, force: true, source: job.source, solver: job.solver, certDir: job.certDir}
+		// Resolve orchClient for DNS-01 certs; skip if not yet registered
+		// (e.g., boot timing — the source's event handler will re-enqueue after registration).
+		if strings.EqualFold(job.solver, "dns-01") && job.source != "" {
+			m.adapterMu.Lock()
+			ij.orchClient = m.orchClients[job.source]
+			m.adapterMu.Unlock()
+			if ij.orchClient == nil {
+				log.Printf("INFO: remote: skipping requeue of dns-01 cert %s (orchClient for %q not registered yet)", job.id, job.source)
+				continue
+			}
+		}
 		if job.isPending {
-			m.queueIssuanceJob(job.id, job.domains, job.cn, true)
+			m.queueIssuanceJobToWorker(ij)
 		} else {
-			m.enqueueIssuanceWithForce(job.id, job.domains, job.cn, true)
+			m.enqueueIssuanceJob(ij)
 		}
 	}
 }
@@ -1355,7 +1456,7 @@ func (m *Manager) RenewCertificate(id string) error {
 	cfg := m.currentConfigLocked()
 	// Find target cert and collect info under lock
 	var domains []string
-	var cn string
+	var cn, source, solver, certDir string
 	var found bool
 	var errMsg string
 	for _, c := range cfg.Certificates {
@@ -1363,6 +1464,9 @@ func (m *Manager) RenewCertificate(id string) error {
 			found = true
 			domains = append([]string(nil), c.Domains...)
 			cn = domains[0]
+			source = c.Source
+			solver = c.Solver
+			certDir = c.CertDir
 			if id == "portal" && cfg.PortalHostname != "" {
 				cn = cfg.PortalHostname
 			}
@@ -1394,19 +1498,15 @@ func (m *Manager) RenewCertificate(id string) error {
 	if !found {
 		return errors.New("certificate not found")
 	}
-	m.enqueueIssuanceWithForce(id, domains, cn, true)
-	return nil
-}
-
-// QueueHostnameCertificate requests background issuance for a specific hostname.
-// Useful for per-listener certs when wildcard isn't available/supported.
-func (m *Manager) QueueHostnameCertificate(hostname string) {
-	h := strings.TrimSpace(strings.ToLower(hostname))
-	if h == "" {
-		return
+	job := issuanceJob{id: id, domains: domains, commonName: cn, force: true, source: source, solver: solver, certDir: certDir}
+	// Resolve orchClient for source-tagged certs so the correct solver path is used.
+	if source != "" && strings.EqualFold(solver, "dns-01") {
+		m.adapterMu.Lock()
+		job.orchClient = m.orchClients[source]
+		m.adapterMu.Unlock()
 	}
-	log.Printf("remote: queuing per-host certificate: %s", h)
-	m.enqueueIssuance("host:"+h, []string{h}, h)
+	m.enqueueIssuanceJob(job)
+	return nil
 }
 
 type issuanceJob struct {
@@ -1414,16 +1514,60 @@ type issuanceJob struct {
 	domains    []string
 	commonName string
 	force      bool
+
+	// Per-job metadata (RFC 20260312: source-agnostic cert pipeline)
+	source     string                 // source tag for orchClient lookup during renewal
+	solver     string                 // override solver (e.g., "dns-01" for namek)
+	orchClient acme.OrchestratorClient // override orchestrator client for DNS-01
+	certDir    string                 // override cert output directory
 }
 
 // enqueueIssuance records pending inventory and queues issuance for the worker.
 func (m *Manager) enqueueIssuance(id string, domains []string, commonName string) {
-	m.enqueueIssuanceWithForce(id, domains, commonName, false)
+	m.enqueueIssuanceJob(issuanceJob{id: id, domains: domains, commonName: commonName})
 }
 
 func (m *Manager) enqueueIssuanceWithForce(id string, domains []string, commonName string, force bool) {
-	if m.acmeMgr == nil || commonName == "" {
+	m.enqueueIssuanceJob(issuanceJob{id: id, domains: domains, commonName: commonName, force: force})
+}
+
+// enqueueIssuanceJob is the unified entry point for both self-hosted and namek cert issuance.
+// It checks the inventory for duplicates, marks the cert as pending, and queues the job.
+func (m *Manager) enqueueIssuanceJob(job issuanceJob) {
+	if m.acmeMgr == nil || job.commonName == "" {
 		return
+	}
+
+	// Generic source-based lookup: if the job has a source but no solver/orchClient,
+	// look up the existing cert metadata and orchClient from the registry.
+	if job.solver == "" && job.source != "" {
+		m.cfgMu.RLock()
+		cfg := m.currentConfigLocked()
+		for _, c := range cfg.Certificates {
+			if c.ID == job.id {
+				if c.Solver != "" {
+					job.solver = c.Solver
+				}
+				if c.CertDir != "" && job.certDir == "" {
+					job.certDir = c.CertDir
+				}
+				break
+			}
+		}
+		m.cfgMu.RUnlock()
+
+		// Only DNS-01 certs need an orchestrator client; HTTP-01 uses the default ACME path.
+		if strings.EqualFold(job.solver, "dns-01") {
+			m.adapterMu.Lock()
+			if oc, ok := m.orchClients[job.source]; ok {
+				job.orchClient = oc
+			}
+			m.adapterMu.Unlock()
+			if job.orchClient == nil {
+				log.Printf("INFO: remote: skipping dns-01 cert %s (orchClient for %q not registered)", job.id, job.source)
+				return
+			}
+		}
 	}
 
 	// Check and modify config under lock to prevent races with scheduler reads
@@ -1432,8 +1576,12 @@ func (m *Manager) enqueueIssuanceWithForce(id string, domains []string, commonNa
 	// Skip duplicate unless forced.
 	now := m.now()
 	for _, c := range cfg.Certificates {
-		if c.ID != id || force {
+		if c.ID != job.id || job.force {
 			continue
+		}
+		// Domains changed (e.g., hostname rename) — must reissue regardless of status.
+		if !domainsEqual(c.Domains, job.domains) {
+			break
 		}
 		// Already queued for issuance.
 		if strings.EqualFold(c.Status, "pending") {
@@ -1454,15 +1602,15 @@ func (m *Manager) enqueueIssuanceWithForce(id string, domains []string, commonNa
 			return
 		}
 	}
-	m.ensureCertPending(cfg, id, domains, now)
+	m.ensureCertPending(cfg, job.id, job.domains, now, job.source, job.solver, job.certDir)
 	// save() releases cfgMu.Lock()
 	_ = m.save(cfg)
 
-	log.Printf("remote: queuing certificate issuance: %s (domains=%v)", id, domains)
-	m.queueIssuanceJob(id, domains, commonName, force)
+	log.Printf("remote: queuing certificate issuance: %s (domains=%v, source=%s)", job.id, job.domains, job.source)
+	m.queueIssuanceJobToWorker(job)
 }
 
-func (m *Manager) queueIssuanceJob(id string, domains []string, commonName string, force bool) {
+func (m *Manager) queueIssuanceJobToWorker(job issuanceJob) {
 	if m == nil || m.issueCh == nil {
 		return
 	}
@@ -1470,21 +1618,20 @@ func (m *Manager) queueIssuanceJob(id string, domains []string, commonName strin
 	if m.issueQueued == nil {
 		m.issueQueued = make(map[string]struct{})
 	}
-	if _, ok := m.issueQueued[id]; ok && !force {
+	if _, ok := m.issueQueued[job.id]; ok && !job.force {
 		m.issueMu.Unlock()
 		return
 	}
-	m.issueQueued[id] = struct{}{}
+	m.issueQueued[job.id] = struct{}{}
 	m.issueMu.Unlock()
 
-	job := issuanceJob{id: id, domains: append([]string(nil), domains...), commonName: commonName, force: force}
 	select {
 	case m.issueCh <- job:
 	default:
 		m.issueMu.Lock()
-		delete(m.issueQueued, id)
+		delete(m.issueQueued, job.id)
 		m.issueMu.Unlock()
-		log.Printf("WARN: remote: issuance queue full, dropping job %s", id)
+		log.Printf("WARN: remote: issuance queue full, dropping job %s", job.id)
 	}
 }
 
@@ -1565,7 +1712,10 @@ func (m *Manager) processIssuance(job issuanceJob) {
 	// save() releases cfgMu.Lock()
 	_ = m.save(cfg)
 
-	certDir := m.certDir()
+	certDir := job.certDir
+	if certDir == "" {
+		certDir = m.certDir()
+	}
 	outName := outNameFor(job.id, job.commonName)
 	fakeACME := os.Getenv("PICCOLO_REMOTE_FAKE_ACME") == "1"
 
@@ -1580,9 +1730,17 @@ func (m *Manager) processIssuance(job issuanceJob) {
 	}
 
 	sans := buildSans(job.commonName, job.domains)
-	if _, err := m.acmeMgr.Issue(job.commonName, sans, outName, certDir); err != nil {
-		// Pass the full error for failure classification
-		m.updateCertFailureWithError(job.id, err.Error(), err)
+	var issueErr error
+	if job.solver != "" && job.orchClient != nil {
+		_, issueErr = m.acmeMgr.IssueWithSolver(job.solver, job.orchClient, job.commonName, sans, outName, certDir)
+	} else if strings.EqualFold(job.solver, "dns-01") {
+		// DNS-01 requires an orchClient; fail explicitly rather than falling back to default ACME.
+		issueErr = fmt.Errorf("dns-01 cert %s requires orchClient but none registered for source %q", job.id, job.source)
+	} else {
+		_, issueErr = m.acmeMgr.Issue(job.commonName, sans, outName, certDir)
+	}
+	if issueErr != nil {
+		m.updateCertFailureWithError(job.id, issueErr.Error(), issueErr)
 		return
 	}
 	if exp, ok := readCertExpiry(filepath.Join(certDir, outName+".crt")); ok {
@@ -1611,18 +1769,22 @@ func buildSans(commonName string, domains []string) []string {
 }
 
 func outNameFor(id, cn string) string {
-	// For wildcard we want the actual CN as filename (e.g., *.example.com)
-	if id == "wildcard" {
+	switch id {
+	case "wildcard", "namek-wildcard":
+		// For wildcards we want the actual CN as filename (e.g., *.example.com)
+		return cn
+	case "portal":
+		return "portal"
+	case "namek-portal":
+		// Fixed filename: after a hostname change, the old cert is served until reissuance
+		// completes. This is intentional — no TLS would be worse than a CN mismatch.
+		return "namek-portal"
+	default:
 		return cn
 	}
-	if id == "portal" {
-		return "portal"
-	}
-	// default to sanitized cn
-	return cn
 }
 
-func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, now time.Time) {
+func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, now time.Time, source, solver, certDir string) {
 	found := false
 	for i := range cfg.Certificates {
 		if cfg.Certificates[i].ID == id {
@@ -1633,6 +1795,15 @@ func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, no
 			cfg.Certificates[i].IssuedAt = nil
 			cfg.Certificates[i].ExpiresAt = nil
 			cfg.Certificates[i].NextRenewal = nil
+			if source != "" {
+				cfg.Certificates[i].Source = source
+			}
+			if solver != "" {
+				cfg.Certificates[i].Solver = solver
+			}
+			if certDir != "" {
+				cfg.Certificates[i].CertDir = certDir
+			}
 			found = true
 			break
 		}
@@ -1642,6 +1813,9 @@ func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, no
 			ID:      id,
 			Domains: append([]string(nil), domains...),
 			Status:  "pending",
+			Source:  source,
+			Solver:  solver,
+			CertDir: certDir,
 		})
 	}
 	cfg.Events = append(cfg.Events, Event{
@@ -1650,6 +1824,25 @@ func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, no
 		Source:    "remote",
 		Message:   fmt.Sprintf("Certificate issuance started (%s)", id),
 	})
+}
+
+// domainsEqual reports whether two domain lists contain the same entries (order-insensitive).
+func domainsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, d := range a {
+		counts[strings.ToLower(d)]++
+	}
+	for _, d := range b {
+		k := strings.ToLower(d)
+		if counts[k] <= 0 {
+			return false
+		}
+		counts[k]--
+	}
+	return true
 }
 
 func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {

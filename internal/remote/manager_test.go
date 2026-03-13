@@ -400,6 +400,70 @@ func TestEnqueueIssuanceRespectsRetryAt(t *testing.T) {
 	t.Fatal("cert not found")
 }
 
+func TestDomainsEqual(t *testing.T) {
+	tests := []struct {
+		a, b []string
+		want bool
+	}{
+		{nil, nil, true},
+		{[]string{"a"}, []string{"a"}, true},
+		{[]string{"a", "b"}, []string{"b", "a"}, true},
+		{[]string{"A.com"}, []string{"a.com"}, true},
+		{[]string{"a"}, []string{"b"}, false},
+		{[]string{"a"}, []string{"a", "b"}, false},
+		{nil, []string{"a"}, false},
+		{[]string{"a", "b"}, []string{"a", "a"}, false}, // duplicate in b
+	}
+	for _, tt := range tests {
+		if got := domainsEqual(tt.a, tt.b); got != tt.want {
+			t.Errorf("domainsEqual(%v, %v) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestEnqueueIssuanceReissuesOnDomainChange(t *testing.T) {
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	now := time.Unix(1000, 0)
+	nextRenewal := now.Add(60 * 24 * time.Hour)
+	expires := now.Add(90 * 24 * time.Hour)
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(now))
+
+	// Seed a cert that is "ok" and not yet due for renewal.
+	m.cfgMu.Lock()
+	cfg := m.currentConfig()
+	cfg.PortalHostname = "old.example.com"
+	cfg.Certificates = []Certificate{{
+		ID:          "portal",
+		Domains:     []string{"old.example.com"},
+		Status:      "ok",
+		NextRenewal: &nextRenewal,
+		ExpiresAt:   &expires,
+	}}
+	if err := m.save(cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Enqueue with different domains — should force reissuance despite valid ok status.
+	m.enqueueIssuanceJob(issuanceJob{id: "portal", domains: []string{"new.example.com"}, commonName: "new.example.com"})
+
+	for _, c := range m.ListCertificates() {
+		if c.ID == "portal" {
+			if c.Status != "pending" {
+				t.Fatalf("expected cert to be reset to pending, got %q", c.Status)
+			}
+			if len(c.Domains) != 1 || c.Domains[0] != "new.example.com" {
+				t.Fatalf("expected domains [new.example.com], got %v", c.Domains)
+			}
+			return
+		}
+	}
+	t.Fatal("cert not found")
+}
+
 func TestRemoveAliasRemovesCertificateEntry(t *testing.T) {
 	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
 	dir := t.TempDir()
@@ -438,4 +502,66 @@ func waitForCertEntry(t *testing.T, m *Manager, id string, timeout time.Duration
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func TestEnqueueCertIssuance_SourceMetadataPersisted(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(30, 0)))
+
+	m.EnqueueCertIssuance(CertIssuanceRequest{
+		ID:         "host:app.namek.example.com",
+		Source:     "namek",
+		Solver:     "dns-01",
+		CertDir:    "/tmp/certs",
+		Domains:    []string{"app.namek.example.com"},
+		CommonName: "app.namek.example.com",
+	})
+
+	waitForCertEntry(t, m, "host:app.namek.example.com", 200*time.Millisecond)
+
+	for _, c := range m.ListCertificates() {
+		if c.ID == "host:app.namek.example.com" {
+			if c.Source != "namek" {
+				t.Fatalf("expected source=namek, got %q", c.Source)
+			}
+			if c.Solver != "dns-01" {
+				t.Fatalf("expected solver=dns-01, got %q", c.Solver)
+			}
+			if c.CertDir != "/tmp/certs" {
+				t.Fatalf("expected certDir=/tmp/certs, got %q", c.CertDir)
+			}
+			return
+		}
+	}
+	t.Fatal("cert not found")
+}
+
+func TestOrchClientRegistry(t *testing.T) {
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(40, 0)))
+
+	// Register
+	m.RegisterOrchClient("namek", nil)
+	m.adapterMu.Lock()
+	if _, ok := m.orchClients["namek"]; !ok {
+		t.Fatal("expected namek orchClient to be registered")
+	}
+	m.adapterMu.Unlock()
+
+	// Unregister
+	m.UnregisterOrchClient("namek")
+	m.adapterMu.Lock()
+	if _, ok := m.orchClients["namek"]; ok {
+		t.Fatal("expected namek orchClient to be unregistered")
+	}
+	m.adapterMu.Unlock()
 }

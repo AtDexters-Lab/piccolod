@@ -10,9 +10,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"piccolod/internal/api"
@@ -26,6 +28,7 @@ import (
 	pki "piccolod/internal/crypto"
 	"piccolod/internal/events"
 	"piccolod/internal/health"
+	"piccolod/internal/identity"
 	"piccolod/internal/onboarding"
 	hostnamepkg "piccolod/internal/hostname"
 	"piccolod/internal/mdns"
@@ -40,6 +43,7 @@ import (
 	"piccolod/internal/runtime/supervisor"
 	"piccolod/internal/services"
 	"piccolod/internal/terminal"
+	"piccolod/internal/tpm"
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage"
 	"piccolod/internal/storage/diskprep"
@@ -127,7 +131,7 @@ type GinServer struct {
 
 	// Remote state tracking for OIDC app cache busting
 	remoteStateMu         sync.Mutex
-	remoteStateEnabled    bool
+	remoteStateHosts      string // sorted, joined host list for diff detection
 	oidcRestartTimer      *time.Timer
 	oidcRestartDebounceMs int
 
@@ -157,6 +161,19 @@ type GinServer struct {
 
 	// Persistent terminal sessions
 	terminalManager *terminal.Manager
+
+	// Namek identity service (RFC 20260312)
+	identityService *identity.Service
+	tpmMu           sync.Mutex // protects tpmResult (written by recovery goroutine, read by Stop)
+	tpmResult       *tpm.OpenResult
+	certProvider    *remote.FileCertProvider
+
+	// Namek adapter lifecycle (owned by gin_server, not remote.Manager)
+	namekAdapter       nexusclient.Adapter
+	namekAdapterCancel context.CancelFunc
+	namekLastKey       string
+	namekStopped       atomic.Bool
+	namekMu            sync.Mutex // protects namek adapter fields
 }
 
 type secureContextKey struct{}
@@ -173,14 +190,21 @@ type portPublisherFunc func(int)
 
 func (f portPublisherFunc) Publish(p int) { f(p) }
 
+// remoteBase represents a single remote hostname base for resolution.
+// The resolver maintains a unified list, source-tagged for independent management.
+type remoteBase struct {
+	source     string // source identifier for targeted removal
+	portalHost string // e.g., "portal.home.example.com" or "slug.test.local"
+	domain     string // base domain for app subdomain matching
+}
+
 type serviceRemoteResolver struct {
-	services   *services.ServiceManager
-	mu         sync.RWMutex
-	domain     string
-	portal     string
-	aliases    map[string]string // hostname → DerivedHostLabel (or nexusclient.PortalHostLabel)
-	port       int
-	tlsMuxPort int
+	services    *services.ServiceManager
+	mu          sync.RWMutex
+	aliases     map[string]string // hostname → DerivedHostLabel (or nexusclient.PortalHostLabel)
+	port        int
+	tlsMuxPort  int
+	remoteBases []remoteBase // unified list of all remote bases (RFC 20260312)
 }
 
 func newServiceRemoteResolver(svc *services.ServiceManager) *serviceRemoteResolver {
@@ -193,42 +217,60 @@ func newServiceRemoteResolver(svc *services.ServiceManager) *serviceRemoteResolv
 	return &serviceRemoteResolver{services: svc, port: port}
 }
 
-func (r *serviceRemoteResolver) UpdateConfig(cfg nexusclient.Config) {
+// UpdateAliases sets the alias hostname→hostLabel mapping for routing.
+// hostLabel is a DerivedHostLabel or PortalHostLabel for portal-targeted aliases.
+func (r *serviceRemoteResolver) UpdateAliases(aliases map[string]string) {
 	r.mu.Lock()
-	portal := strings.TrimSuffix(strings.ToLower(cfg.PortalHostname), ".")
-	// RFC 20260114: remote base is the portal hostname apex itself.
-	// App hostnames are <label>.<portal>.
-	r.portal = portal
-	r.domain = portal
-	aliases := make(map[string]string, len(cfg.Aliases))
-	for _, a := range cfg.Aliases {
-		h := strings.TrimSuffix(strings.ToLower(a.Hostname), ".")
-		if h != "" {
-			aliases[h] = a.HostLabel
+	r.aliases = aliases
+	r.mu.Unlock()
+}
+
+// AliasHostLabels returns a snapshot of the current alias hostname→hostLabel map.
+// Safe for concurrent use: UpdateAliases replaces the entire map atomically,
+// so the returned reference remains immutable after this call.
+func (r *serviceRemoteResolver) AliasHostLabels() map[string]string {
+	r.mu.RLock()
+	aliases := r.aliases
+	r.mu.RUnlock()
+	return aliases
+}
+
+// SetRemoteBases replaces all remote bases for a given source, preserving entries from other sources.
+// Self-hosted bases are kept first so PortalHosts()[0] is the user-configured domain when
+// both sources are active. Resolution correctness does not depend on ordering — Resolve and
+// PortalHostForRequest use two-pass specificity matching (exact portal first, then subdomain).
+func (r *serviceRemoteResolver) SetRemoteBases(source string, bases []remoteBase) {
+	r.mu.Lock()
+	var kept []remoteBase
+	for _, b := range r.remoteBases {
+		if b.source != source {
+			kept = append(kept, b)
 		}
 	}
-	r.aliases = aliases
+	// Self-hosted first for stable PortalHosts()[0] ordering.
+	if source == "self-hosted" {
+		r.remoteBases = append(bases, kept...)
+	} else {
+		r.remoteBases = append(kept, bases...)
+	}
 	r.mu.Unlock()
 }
 
 func (r *serviceRemoteResolver) IsRemoteHostname(host string) bool {
 	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	r.mu.RLock()
-	portal := r.portal
-	domain := r.domain
-	aliases := r.aliases
-	r.mu.RUnlock()
 	if host == "" {
 		return false
 	}
-	if portal != "" && host == portal {
-		return true
-	}
-	if domain != "" {
-		if host == domain {
+	r.mu.RLock()
+	aliases := r.aliases
+	bases := r.remoteBases
+	r.mu.RUnlock()
+
+	for _, rb := range bases {
+		if host == rb.portalHost {
 			return true
 		}
-		if strings.HasSuffix(host, "."+domain) {
+		if rb.domain != "" && strings.HasSuffix(host, "."+rb.domain) {
 			return true
 		}
 	}
@@ -239,6 +281,75 @@ func (r *serviceRemoteResolver) IsRemoteHostname(host string) bool {
 }
 
 func (r *serviceRemoteResolver) SetTlsMuxPort(p int) { r.mu.Lock(); r.tlsMuxPort = p; r.mu.Unlock() }
+
+// PortalHostForRequest returns the portal hostname that the given request host belongs to.
+// For "app.slug.test.local" it returns "slug.test.local"; for "portal.example.com" it returns
+// "portal.example.com". Returns "" if the host is not a recognized remote hostname.
+// Only considers active portals (those registered via SetRemoteBases).
+// Exact portal matches are checked before suffix (subdomain) matches to avoid
+// misclassifying a more-specific portal as a subdomain of a less-specific one
+// (e.g., slug.example.com should not match the example.com base).
+func (r *serviceRemoteResolver) PortalHostForRequest(host string) string {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if host == "" {
+		return ""
+	}
+	r.mu.RLock()
+	aliases := r.aliases
+	bases := r.remoteBases
+	r.mu.RUnlock()
+
+	// Pass 1: exact portal match (highest specificity).
+	for _, rb := range bases {
+		if rb.portalHost != "" && host == rb.portalHost {
+			return rb.portalHost
+		}
+	}
+	// Pass 2: subdomain match (longest domain wins to handle nested bases correctly).
+	var bestHost string
+	var bestLen int
+	for _, rb := range bases {
+		if rb.portalHost != "" && rb.domain != "" && strings.HasSuffix(host, "."+rb.domain) {
+			if len(rb.domain) > bestLen {
+				bestHost = rb.portalHost
+				bestLen = len(rb.domain)
+			}
+		}
+	}
+	if bestHost != "" {
+		return bestHost
+	}
+	// Alias domains are registered alongside the self-hosted portal config.
+	// Map them to the first available portal host (aliases are self-hosted only today).
+	if _, ok := aliases[host]; ok && len(bases) > 0 {
+		for _, rb := range bases {
+			if rb.portalHost != "" {
+				return rb.portalHost
+			}
+		}
+	}
+	return ""
+}
+
+// PortalHosts returns all distinct active portal hostnames from remote bases.
+// Only includes portals whose source is currently active (set via SetRemoteBases).
+func (r *serviceRemoteResolver) PortalHosts() []string {
+	r.mu.RLock()
+	bases := r.remoteBases
+	r.mu.RUnlock()
+
+	seen := make(map[string]struct{})
+	var hosts []string
+	for _, rb := range bases {
+		if rb.portalHost != "" {
+			if _, ok := seen[rb.portalHost]; !ok {
+				seen[rb.portalHost] = struct{}{}
+				hosts = append(hosts, rb.portalHost)
+			}
+		}
+	}
+	return hosts
+}
 
 func (r *serviceRemoteResolver) RecordConnectionHint(localPort, sourcePort, remotePort int, isTLS bool) {
 	if r.services == nil || sourcePort <= 0 {
@@ -253,27 +364,60 @@ func (r *serviceRemoteResolver) RecordConnectionHint(localPort, sourcePort, remo
 func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS bool) (int, bool) {
 	h := strings.TrimSuffix(strings.ToLower(hostname), ".")
 	r.mu.RLock()
-	portal := r.portal
-	domain := r.domain
 	aliases := r.aliases
 	portalPort := r.port
 	tlsMuxPort := r.tlsMuxPort
+	bases := r.remoteBases
 	r.mu.RUnlock()
-
-	// Strict RFC 20260114: remote resolution is only valid when the portal hostname (remote base)
-	// is configured. Without it, we do not attempt any hostname/port fallbacks.
-	if portal == "" || domain == "" {
-		return 0, false
-	}
 
 	normPort := remotePort
 	if normPort == acmeHTTPFallbackPort {
 		normPort = 80
 	}
 
-	// Portal host (apex): route to portal port / TLS mux.
-	// Per RFC 20260114 Section 5.1 step 1: <base> always routes to portal.
-	if portal != "" && h == portal {
+	// Check aliases first — they carry per-hostname routing (hostLabel).
+	if aliases != nil {
+		if port, ok := r.resolveAlias(h, aliases, portalPort, tlsMuxPort, normPort, isTLS); ok {
+			return port, true
+		}
+	}
+
+	// Resolve against all remote bases. Use two passes to ensure exact portal
+	// matches take priority over subdomain matches (avoids misrouting when one
+	// portal hostname is a subdomain of another's domain).
+	// Pass 1: exact portal match only.
+	for _, rb := range bases {
+		if rb.portalHost != "" && h == rb.portalHost {
+			if port, ok := r.resolveAgainstBase(h, rb.portalHost, rb.domain, portalPort, tlsMuxPort, normPort, isTLS); ok {
+				return port, true
+			}
+		}
+	}
+	// Pass 2: subdomain matches.
+	for _, rb := range bases {
+		if rb.portalHost == "" || h == rb.portalHost {
+			continue // already checked in pass 1
+		}
+		if port, ok := r.resolveAgainstBase(h, rb.portalHost, rb.domain, portalPort, tlsMuxPort, normPort, isTLS); ok {
+			return port, true
+		}
+	}
+
+	return 0, false
+}
+
+// resolveAlias resolves a hostname against the alias map.
+func (r *serviceRemoteResolver) resolveAlias(
+	h string,
+	aliases map[string]string,
+	portalPort, tlsMuxPort, normPort int,
+	isTLS bool,
+) (int, bool) {
+	hostLabel, ok := aliases[h]
+	if !ok {
+		return 0, false
+	}
+	if hostLabel == nexusclient.PortalHostLabel || hostLabel == "" {
 		if normPort == 80 {
 			return portalPort, true
 		}
@@ -282,59 +426,8 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 		}
 		return 0, false
 	}
-
-	// Alias domains: route based on the listener they target.
-	// HostLabel is a DerivedHostLabel (routes to a specific listener) or
-	// PortalHostLabel (routes to the portal).
-	if hostLabel, ok := aliases[h]; ok {
-		if hostLabel == nexusclient.PortalHostLabel || hostLabel == "" {
-			if normPort == 80 {
-				return portalPort, true
-			}
-			if isTLS && tlsMuxPort > 0 {
-				return tlsMuxPort, true
-			}
-			return 0, false
-		}
-		// Listener-specific alias: resolve via ServiceManager.
-		if r.services != nil {
-			if ep, found := r.services.ResolveByHostLabel(hostLabel, normPort); found {
-				if ep.Flow == api.FlowTLS {
-					return ep.PublicPort, true
-				}
-				if normPort == 80 {
-					return ep.PublicPort, true
-				}
-				if isTLS && tlsMuxPort > 0 {
-					return tlsMuxPort, true
-				}
-				return ep.PublicPort, true
-			}
-		}
-		return 0, false
-	}
-
-	// Extract host label from hostname (RFC 20260114)
-	// Format: <app>.<base> (primary) or <listener>-<app>.<base> (non-primary)
-	hostLabel := ""
-	if domain != "" {
-		suffix := "." + domain
-		if strings.HasSuffix(h, suffix) {
-			label := h[:len(h)-len(suffix)]
-			// Only take the first label (no nested subdomains)
-			if idx := strings.Index(label, "."); idx != -1 {
-				label = label[:idx]
-			}
-			hostLabel = label
-		}
-	} else if idx := strings.Index(h, "."); idx != -1 {
-		hostLabel = h[:idx]
-	}
-
-	// Resolve by host label (RFC 20260114)
-	// This handles both <app>.<base> (primary) and <listener>-<app>.<base> (non-primary)
-	if hostLabel != "" {
-		if ep, ok := r.services.ResolveByHostLabel(hostLabel, normPort); ok {
+	if r.services != nil {
+		if ep, found := r.services.ResolveByHostLabel(hostLabel, normPort); found {
 			if ep.Flow == api.FlowTLS {
 				return ep.PublicPort, true
 			}
@@ -347,25 +440,52 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 			return ep.PublicPort, true
 		}
 	}
-
 	return 0, false
 }
 
-// aliasEntriesFromStatus converts remote.Alias slice to nexusclient.AliasEntry slice,
-// normalizing legacy "portal" listener values to the PortalHostLabel sentinel.
-func aliasEntriesFromStatus(aliases []remote.Alias) []nexusclient.AliasEntry {
-	entries := make([]nexusclient.AliasEntry, 0, len(aliases))
-	for _, a := range aliases {
-		hostLabel := a.Listener
-		if hostLabel == "" || hostLabel == "portal" {
-			hostLabel = nexusclient.PortalHostLabel
+// resolveAgainstBase resolves a hostname against a single portal+domain base.
+func (r *serviceRemoteResolver) resolveAgainstBase(
+	h, portal, domain string,
+	portalPort, tlsMuxPort, normPort int,
+	isTLS bool,
+) (int, bool) {
+	// Portal host (apex): route to portal port / TLS mux.
+	if h == portal {
+		if normPort == 80 {
+			return portalPort, true
 		}
-		entries = append(entries, nexusclient.AliasEntry{
-			Hostname:  a.Hostname,
-			HostLabel: hostLabel,
-		})
+		if isTLS && tlsMuxPort > 0 {
+			return tlsMuxPort, true
+		}
+		return 0, false
 	}
-	return entries
+
+	// Extract host label from <app>.<base> or <listener>-<app>.<base>
+	if domain != "" {
+		suffix := "." + domain
+		if strings.HasSuffix(h, suffix) {
+			label := h[:len(h)-len(suffix)]
+			if idx := strings.Index(label, "."); idx != -1 {
+				label = label[:idx]
+			}
+			if label != "" && r.services != nil {
+				if ep, ok := r.services.ResolveByHostLabel(label, normPort); ok {
+					if ep.Flow == api.FlowTLS {
+						return ep.PublicPort, true
+					}
+					if normPort == 80 {
+						return ep.PublicPort, true
+					}
+					if isTLS && tlsMuxPort > 0 {
+						return tlsMuxPort, true
+					}
+					return ep.PublicPort, true
+				}
+			}
+		}
+	}
+
+	return 0, false
 }
 
 // remoteStatusAdapter adapts remote.Manager to services.RemoteStatusProvider.
@@ -799,20 +919,54 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	if rm != nil && svcMgr != nil {
 		svcMgr.ProxyManager().SetAcmeHandler(rm.HTTPChallengeHandler())
 		certProv := remote.NewFileCertProvider(rm.CertDirectory())
+		// Add network-bootstrap cert dir for namek certs (available pre-unlock)
+		certProv.AddFallbackDir(paths.CoreJoin("network-bootstrap", "remote", "certs"))
+		identitySvcRef := &s.identityService // capture pointer for closure
 		certProv.SetMissingHandler(func(host string) {
 			if rm == nil {
 				return
 			}
+			h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+			if h == "" {
+				return
+			}
+
+			// Namek cert recovery: if the missing cert is for the namek hostname,
+			// force-enqueue the specific cert so even "ok" inventory entries get reissued.
+			if idSvc := *identitySvcRef; idSvc != nil && idSvc.IsEnrolled() && idSvc.IsEnabled() {
+				cfg := idSvc.DeviceConfig()
+				namekHost := cfg.Hostname
+				if custom := cfg.CustomFQDN(); custom != "" {
+					namekHost = custom
+				}
+				namekHost = strings.TrimSuffix(strings.ToLower(namekHost), ".")
+				if namekHost != "" && (h == namekHost || strings.HasSuffix(h, "."+namekHost)) {
+					certDir := paths.CoreJoin("network-bootstrap", "remote", "certs")
+					if h == namekHost {
+						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+							ID: "namek-portal", Source: "namek", Solver: "dns-01",
+							CertDir: certDir, CommonName: namekHost, Domains: []string{namekHost},
+							Force: true,
+						})
+					} else {
+						wildcard := "*." + namekHost
+						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+							ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
+							CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, namekHost},
+							Force: true,
+						})
+					}
+					return
+				}
+			}
+
+			// Self-hosted per-hostname cert recovery (HTTP-01 only)
 			st := rm.Status()
 			if !st.Enabled || !strings.EqualFold(st.Solver, "http-01") {
 				return
 			}
 			base := remoteBaseHostname(&st)
 			if base == "" {
-				return
-			}
-			h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-			if h == "" {
 				return
 			}
 			portal := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(st.PortalHostname)), ".")
@@ -829,10 +983,52 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if label == "" || !isValidDNSLabel(label) {
 				return
 			}
-			rm.QueueHostnameCertificate(h)
+			rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+				ID: "host:" + h, Source: "self-hosted", Solver: "http-01",
+				Domains: []string{h}, CommonName: h,
+			})
 		})
 		tlsMux.SetCertProvider(certProv)
+		s.certProvider = certProv
 	}
+	// TPM and identity service (RFC 20260312: namek-managed remote access)
+	akStateDir := paths.CoreJoin("network-bootstrap", "tpm")
+	swtpmStateDir := paths.CoreJoin("swtpm")
+	_ = os.MkdirAll(akStateDir, 0o700)
+	_ = os.MkdirAll(swtpmStateDir, 0o700)
+
+	var tpmDevice tpm.Device
+	tpmResult, tpmErr := tpm.Open(akStateDir, swtpmStateDir)
+	if tpmErr != nil {
+		log.Printf("WARN: TPM unavailable: %v (identity service will be limited)", tpmErr)
+	} else {
+		tpmDevice = tpmResult.Device
+		s.tpmResult = tpmResult
+	}
+
+	identityConfigPath := paths.CoreJoin("network-bootstrap", "remote", "identity.json")
+	identitySvc := identity.NewService(identityConfigPath, tpmDevice)
+	identitySvc.SetTPMDirs(akStateDir, swtpmStateDir)
+	identitySvc.SetEventsBus(eventsBus)
+	identitySvc.SetTPMReplacedHandler(func(old tpm.Device, newResult *tpm.OpenResult) {
+		// Close the full OpenResult (Device + SwtpmProc) to avoid leaking
+		// swtpm child processes on repeated AK recoveries.
+		s.tpmMu.Lock()
+		oldResult := s.tpmResult
+		s.tpmResult = newResult
+		s.tpmMu.Unlock()
+		if oldResult != nil {
+			oldResult.Close()
+		} else if old != nil {
+			// Fallback: no OpenResult tracked (shouldn't happen), close Device directly.
+			old.Close()
+		}
+	})
+	s.identityService = identitySvc
+
+	s.supervisor.Register(identitySvc)
+
+	// Self-hosted adapter (existing)
 	var nexusAdapter nexusclient.Adapter
 	if os.Getenv("PICCOLO_NEXUS_USE_STUB") == "1" {
 		nexusAdapter = nexusclient.NewStub()
@@ -840,6 +1036,45 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		nexusAdapter = nexusclient.NewBackendAdapter(routeMgr, remoteResolver)
 	}
 	rm.SetNexusAdapter(nexusAdapter)
+
+	// Namek adapter (new, with TPM token provider) — owned by GinServer
+	if os.Getenv("PICCOLO_NEXUS_USE_STUB") != "1" {
+		namekTP := identity.NewNamekTokenProvider(identitySvc.NamekClient, identitySvc.HandleTokenError)
+		s.namekAdapter = nexusclient.NewBackendAdapter(routeMgr, remoteResolver,
+			nexusclient.WithAdapterTokenProvider(namekTP),
+			nexusclient.WithAdapterName("piccolo-namek"),
+		)
+
+		// Register namek orchClient in remote manager's source-agnostic registry
+		namekACME := identity.NewNamekACMEClient(identitySvc.NamekClient)
+		rm.RegisterOrchClient("namek", namekACME)
+
+	}
+
+	// Subscribe to identity events for namek adapter state changes.
+	// TopicIdentityReady fires on boot when an already-enrolled device starts;
+	// TopicIdentityChanged fires on enrollment, enable/disable, hostname change.
+	identityReadyCh := eventsBus.Subscribe(events.TopicIdentityReady, 8)
+	identityChangedCh := eventsBus.Subscribe(events.TopicIdentityChanged, 8)
+	go func() {
+		for {
+			select {
+			case _, ok := <-identityReadyCh:
+				if !ok {
+					identityReadyCh = nil
+				}
+			case _, ok := <-identityChangedCh:
+				if !ok {
+					identityChangedCh = nil
+				}
+			}
+			if identityReadyCh == nil && identityChangedCh == nil {
+				return
+			}
+			s.applyNamekState()
+		}
+	}()
+
 	remote.RegisterHandlers(dispatch, rm)
 	s.healthTracker.Setf("remote", health.LevelOK, "remote manager ready")
 	// Init secure loopback before refreshing remote runtime so that securePort
@@ -959,6 +1194,10 @@ func (s *GinServer) Start() error {
 func (s *GinServer) Stop(ctx context.Context) error {
 	log.Printf("INFO: Beginning graceful shutdown...")
 
+	// Prevent identity event subscriber from racing with shutdown
+	s.namekStopped.Store(true)
+	s.stopNamekAdapter()
+
 	// Notify systemd that we're stopping
 	if sent, err := daemon.SdNotify(false, daemon.SdNotifyStopping); err != nil {
 		log.Printf("WARN: Failed to notify systemd of stopping: %v", err)
@@ -1013,6 +1252,16 @@ func (s *GinServer) Stop(ctx context.Context) error {
 			log.Printf("WARN: Failed to shutdown persistence cleanly: %v", err)
 		}
 	}
+	// Close TPM device (identity service does NOT own TPM lifecycle)
+	s.tpmMu.Lock()
+	tr := s.tpmResult
+	s.tpmResult = nil
+	s.tpmMu.Unlock()
+	if tr != nil {
+		if err := tr.Close(); err != nil {
+			log.Printf("WARN: TPM close: %v", err)
+		}
+	}
 	log.Printf("INFO: Phase 3/3: CLEANUP complete")
 
 	log.Printf("INFO: Graceful shutdown completed")
@@ -1024,13 +1273,14 @@ func (s *GinServer) portalOriginForRequest(r *http.Request) string {
 		return ""
 	}
 
-	// WAN via Nexus proxy: RemoteAddr is loopback.
+	// WAN via Nexus proxy: RemoteAddr is loopback. Use the resolver to map
+	// the request Host to its portal hostname — source-agnostic (works for both
+	// self-hosted and namek traffic without knowing which adapter delivered it).
 	remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
 	if ip := net.ParseIP(remoteHost); ip != nil && ip.IsLoopback() {
-		if s.remoteManager != nil {
-			st := s.remoteManager.Status()
-			if st.Enabled && strings.TrimSpace(st.PortalHostname) != "" {
-				return "https://" + strings.TrimSuffix(strings.TrimSpace(st.PortalHostname), ".")
+		if s.remoteResolver != nil {
+			if portal := s.remoteResolver.PortalHostForRequest(canonicalHost(r.Host)); portal != "" {
+				return "https://" + portal
 			}
 		}
 	}
@@ -1320,6 +1570,9 @@ func (s *GinServer) setupGinRoutes() {
 			remote.POST("/nexus-guide/verify", s.handleRemoteGuideVerify)
 		}
 
+		// Identity / namek endpoints (Admin only)
+		s.registerIdentityRoutes(admin)
+
 		// PCV export/import (Admin only)
 		admin.POST("/system/pcv/publish", s.requireUnlocked(), s.handlePCVPublish)
 		admin.GET("/system/pcv/export", s.requireUnlocked(), s.handlePCVExport)
@@ -1416,11 +1669,7 @@ func (s *GinServer) setupGinRoutes() {
 func (s *GinServer) handleGinServicesAll(c *gin.Context) {
 	eps := s.serviceManager.GetAll()
 	out := make([]gin.H, 0, len(eps))
-	var remoteStatus *remote.Status
-	if s.remoteManager != nil {
-		st := s.remoteManager.Status()
-		remoteStatus = &st
-	}
+	portalHosts := s.portalHosts()
 
 	// Filter for standard users
 	var allowedApps map[string]struct{}
@@ -1444,7 +1693,7 @@ func (s *GinServer) handleGinServicesAll(c *gin.Context) {
 				continue
 			}
 		}
-		out = append(out, s.formatServiceEndpoint(c, ep, remoteStatus))
+		out = append(out, s.formatServiceEndpoint(c, ep, portalHosts))
 	}
 	c.JSON(http.StatusOK, gin.H{"services": out})
 }
@@ -1470,13 +1719,9 @@ func (s *GinServer) handleGinServicesByApp(c *gin.Context) {
 		return
 	}
 	out := make([]gin.H, 0, len(eps))
-	var remoteStatus *remote.Status
-	if s.remoteManager != nil {
-		st := s.remoteManager.Status()
-		remoteStatus = &st
-	}
+	svcPortalHosts := s.portalHosts()
 	for _, ep := range eps {
-		formatted := s.formatServiceEndpoint(c, ep, remoteStatus)
+		formatted := s.formatServiceEndpoint(c, ep, svcPortalHosts)
 		// Add listener health status (RFC 20260125)
 		formatted["health"] = s.computeListenerHealth(ep)
 		out = append(out, formatted)
@@ -1484,8 +1729,8 @@ func (s *GinServer) handleGinServicesByApp(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"services": out})
 }
 
-func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEndpoint, remoteStatus *remote.Status) gin.H {
-	remoteHost := s.remoteServiceHostname(remoteStatus, ep)
+func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEndpoint, portalHosts []string) gin.H {
+	remoteHost := remoteHostForEndpoint(ep, portalHosts)
 	var remoteHostValue interface{}
 	if remoteHost != "" {
 		remoteHostValue = remoteHost
@@ -1583,8 +1828,8 @@ func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoin
 	return &url
 }
 
-// remoteBaseHostname returns the RFC 20260114 remote base hostname (portal hostname apex).
-// It is used as the suffix for all derived remote app hostnames: <label>.<base>.
+// remoteBaseHostname returns the portal hostname from a remote.Status.
+// Used by wiring code and event-driven cert orchestration.
 func remoteBaseHostname(status *remote.Status) string {
 	if status == nil || !status.Enabled {
 		return ""
@@ -1593,21 +1838,21 @@ func remoteBaseHostname(status *remote.Status) string {
 	if base == "" {
 		return ""
 	}
-	// Defensive: remote config should not include ports, but normalize if it does.
 	if h, _, err := net.SplitHostPort(base); err == nil {
 		base = h
 	}
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
 }
 
-func (s *GinServer) remoteServiceHostname(status *remote.Status, ep services.ServiceEndpoint) string {
-	// Use remoteBaseHostname for enhanced validation (port handling, etc.)
-	base := remoteBaseHostname(status)
-	if s == nil || base == "" {
-		return ""
+// remoteHostForEndpoint returns the first matching remote hostname for the given endpoint
+// by checking all active portal hosts. Returns "" if no portal is active.
+func remoteHostForEndpoint(ep services.ServiceEndpoint, portalHosts []string) string {
+	for _, portal := range portalHosts {
+		if h := services.RemoteServiceHostname(ep.DerivedHostLabel, portal); h != "" {
+			return h
+		}
 	}
-	// Delegate to shared implementation (RFC 20260125: avoid logic drift)
-	return services.RemoteServiceHostname(ep.DerivedHostLabel, base)
+	return ""
 }
 
 
@@ -1766,34 +2011,44 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 	if s == nil || s.tlsMux == nil {
 		return
 	}
-	// Build alias entries from status — shared between resolver and TlsMux.
-	aliases := aliasEntriesFromStatus(status.Aliases)
-
-	if s.remoteResolver != nil {
-		s.remoteResolver.UpdateConfig(nexusclient.Config{
-			PortalHostname: status.PortalHostname,
-			Aliases:        aliases,
-		})
+	// Build alias map from status — shared between resolver and TlsMux.
+	aliasMap := make(map[string]string, len(status.Aliases))
+	for _, a := range status.Aliases {
+		h := strings.TrimSuffix(strings.ToLower(a.Hostname), ".")
+		if h == "" {
+			continue
+		}
+		hostLabel := a.Listener
+		if hostLabel == "" || hostLabel == "portal" {
+			hostLabel = nexusclient.PortalHostLabel
+		}
+		aliasMap[h] = hostLabel
 	}
 
-	// Push alias map to TlsMux for HTTPS routing.
-	aliasMap := make(map[string]string, len(aliases))
-	for _, a := range aliases {
-		h := strings.TrimSuffix(strings.ToLower(a.Hostname), ".")
-		if h != "" {
-			aliasMap[h] = a.HostLabel
-		}
+	if s.remoteResolver != nil {
+		s.remoteResolver.UpdateAliases(aliasMap)
 	}
 	s.tlsMux.UpdateAliases(aliasMap)
 
-	// Update allowed frame ancestors for app proxies
-	if s.serviceManager != nil {
-		var ancestors []string
-		if h := strings.TrimSpace(status.PortalHostname); h != "" {
-			ancestors = append(ancestors, h)
+	// Set self-hosted remote bases on resolver and TLS mux
+	if status.Enabled && strings.TrimSpace(status.PortalHostname) != "" {
+		portal := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(status.PortalHostname)), ".")
+		if s.remoteResolver != nil {
+			s.remoteResolver.SetRemoteBases("self-hosted", []remoteBase{
+				{source: "self-hosted", portalHost: portal, domain: portal},
+			})
 		}
-		s.serviceManager.ProxyManager().SetAllowedAncestors(ancestors)
+		s.tlsMux.SetRemoteBases("self-hosted", []services.TlsMuxBase{
+			{Source: "self-hosted", PortalHost: portal, Domain: portal},
+		})
+	} else {
+		if s.remoteResolver != nil {
+			s.remoteResolver.SetRemoteBases("self-hosted", nil)
+		}
+		s.tlsMux.SetRemoteBases("self-hosted", nil)
 	}
+
+	s.recomputeFrameAncestors()
 
 	// RFC 20260114: remote base is the portal hostname apex; app hosts are <label>.<base>.
 	s.tlsMux.UpdateConfig(status.PortalHostname, status.PortalHostname, s.resolvePortalPort())
@@ -1806,20 +2061,245 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 			log.Printf("WARN: TLS mux start failed: %v", err)
 		}
 	} else {
-		s.tlsMux.Stop()
-		if s.remoteResolver != nil {
-			s.remoteResolver.SetTlsMuxPort(0)
+		// Only stop TLS mux if no other remote source needs it (e.g., namek-only setups).
+		hasOtherBases := len(s.portalHosts()) > 0
+		if !hasOtherBases {
+			s.tlsMux.Stop()
+			if s.remoteResolver != nil {
+				s.remoteResolver.SetTlsMuxPort(0)
+			}
 		}
 	}
 
-	// Detect remote state transition and schedule OIDC app restart
+	// Detect remote state transition and schedule OIDC app restart.
+	// Uses the unified portal hosts list so transitions from either source
+	// (self-hosted or namek) trigger a restart.
+	s.detectRemoteTransitionAndRestart()
+}
+
+// applyNamekState consolidates namek adapter lifecycle, routing, cert mappings, and cert
+// issuance into a single method. Called when identity state changes.
+// applyNamekState must only be called from the identity event subscriber goroutine.
+// Concurrent calls would race on adapter lifecycle (namekLastKey, namekAdapterCancel).
+func (s *GinServer) applyNamekState() {
+	if s == nil || s.identityService == nil || s.namekStopped.Load() {
+		return
+	}
+	svc := s.identityService
+	rm := s.remoteManager
+	ready := svc.IsEnrolled() && svc.IsEnabled() && !svc.IsSuspended()
+
+	if !ready {
+		// Stop namek adapter
+		s.stopNamekAdapter()
+		// Unregister orchClient so the renew scheduler stops renewing namek certs.
+		if rm != nil {
+			rm.UnregisterOrchClient("namek")
+		}
+		// Clear all namek state from resolver, TLS mux, cert provider, and frame-ancestors
+		if s.remoteResolver != nil {
+			s.remoteResolver.SetRemoteBases("namek", nil)
+		}
+		if s.tlsMux != nil {
+			s.tlsMux.SetRemoteBases("namek", nil)
+			selfHostedActive := false
+			if rm != nil {
+				st := rm.Status()
+				selfHostedActive = st.Enabled && strings.TrimSpace(st.PortalHostname) != ""
+			}
+			if !selfHostedActive {
+				s.tlsMux.Stop()
+				if s.remoteResolver != nil {
+					s.remoteResolver.SetTlsMuxPort(0)
+				}
+			}
+		}
+		if s.certProvider != nil {
+			s.certProvider.SetPortalMappings("namek", nil)
+		}
+		s.recomputeFrameAncestors()
+		s.detectRemoteTransitionAndRestart()
+		return
+	}
+
+	idCfg := svc.DeviceConfig()
+	if len(idCfg.NexusEndpoints) == 0 {
+		log.Printf("INFO: server: namek enrolled but no nexus endpoints available")
+		return
+	}
+
+	// --- Adapter lifecycle ---
+	endpoint := idCfg.NexusEndpoints[0]
+	hostname := idCfg.Hostname
+	// Prefer custom FQDN when set so routing/certs update immediately
+	// without waiting for the namek server to push the new hostname.
+	if custom := idCfg.CustomFQDN(); custom != "" {
+		hostname = custom
+	}
+
+	var keyBuilder strings.Builder
+	keyBuilder.WriteString(endpoint)
+	keyBuilder.WriteByte('\x00')
+	keyBuilder.WriteString(hostname)
+	keyBuilder.WriteByte('\x00')
+	keyBuilder.WriteString(idCfg.CustomHostname)
+	key := keyBuilder.String()
+
+	s.namekMu.Lock()
+	changed := key != s.namekLastKey
+	if changed {
+		s.namekLastKey = key
+	}
+	cancel := s.namekAdapterCancel
+	adapter := s.namekAdapter
+	s.namekMu.Unlock()
+
+	if adapter != nil {
+		if !changed && cancel != nil {
+			// Adapter running with identical config — skip restart, but still update routing/certs below
+		} else {
+			adapterCfg := nexusclient.Config{
+				Endpoint:       endpoint,
+				PortalHostname: hostname,
+			}
+			if err := adapter.Configure(adapterCfg); err != nil {
+				log.Printf("WARN: server: configure namek adapter: %v", err)
+			}
+
+			if cancel != nil {
+				s.stopNamekAdapter()
+			}
+
+			ctx, newCancel := context.WithCancel(context.Background())
+			s.namekMu.Lock()
+			s.namekAdapterCancel = newCancel
+			s.namekMu.Unlock()
+
+			go func() {
+				if err := adapter.Start(ctx); err != nil {
+					if !errors.Is(err, context.Canceled) {
+						log.Printf("WARN: server: namek adapter exited: %v", err)
+					}
+					s.namekMu.Lock()
+					s.namekLastKey = ""
+					s.namekMu.Unlock()
+				}
+			}()
+			log.Printf("INFO: server: namek adapter started (endpoint=%s, hostname=%s)", endpoint, hostname)
+		}
+	}
+
+	// --- Routing (resolver + TLS mux) ---
+	var resolverBases []remoteBase
+	var muxBases []services.TlsMuxBase
+	if hostname != "" {
+		resolverBases = append(resolverBases, remoteBase{
+			source: "namek", portalHost: hostname, domain: hostname,
+		})
+		muxBases = append(muxBases, services.TlsMuxBase{
+			Source: "namek", PortalHost: hostname, Domain: hostname,
+		})
+	}
+
+	if s.remoteResolver != nil {
+		s.remoteResolver.SetRemoteBases("namek", resolverBases)
+	}
+	if s.tlsMux != nil {
+		s.tlsMux.SetRemoteBases("namek", muxBases)
+		if len(muxBases) > 0 {
+			if port, err := s.tlsMux.Start(); err == nil {
+				if s.remoteResolver != nil {
+					s.remoteResolver.SetTlsMuxPort(port)
+				}
+			} else {
+				log.Printf("WARN: TLS mux start for namek failed: %v", err)
+			}
+		}
+	}
+
+	s.recomputeFrameAncestors()
+
+	// --- Cert provider portal mappings ---
+	if s.certProvider != nil {
+		var mappings []remote.PortalCertMapping
+		if hostname != "" {
+			mappings = append(mappings, remote.PortalCertMapping{
+				Hostname: strings.TrimSuffix(strings.ToLower(hostname), "."),
+				CertName: "namek-portal",
+			})
+		}
+		s.certProvider.SetPortalMappings("namek", mappings)
+	}
+
+	// --- Cert issuance ---
+	if rm != nil && hostname != "" {
+		certDir := paths.CoreJoin("network-bootstrap", "remote", "certs")
+		rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+			ID: "namek-portal", Source: "namek", Solver: "dns-01",
+			CertDir: certDir, CommonName: hostname, Domains: []string{hostname},
+		})
+		wildcard := "*." + hostname
+		rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+			ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
+			CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, hostname},
+		})
+	}
+
+	s.detectRemoteTransitionAndRestart()
+}
+
+// stopNamekAdapter cancels the namek adapter context and stops the adapter.
+func (s *GinServer) stopNamekAdapter() {
+	s.namekMu.Lock()
+	cancel := s.namekAdapterCancel
+	adapter := s.namekAdapter
+	s.namekAdapterCancel = nil
+	s.namekLastKey = ""
+	s.namekMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if adapter != nil {
+		if err := adapter.Stop(context.Background()); err != nil {
+			log.Printf("WARN: server: stopping namek adapter: %v", err)
+		}
+	}
+}
+
+// portalHosts returns the current list of active portal hostnames from the resolver.
+// Returns nil when remoteResolver is not configured. Safe for concurrent use.
+func (s *GinServer) portalHosts() []string {
+	if s.remoteResolver != nil {
+		return s.remoteResolver.PortalHosts()
+	}
+	return nil
+}
+
+// recomputeFrameAncestors rebuilds the CSP frame-ancestors list from all active
+// remote portals, then pushes it to the proxy manager. Source-agnostic: uses the
+// resolver as the single source of truth for active portal hostnames.
+func (s *GinServer) recomputeFrameAncestors() {
+	if s.serviceManager == nil {
+		return
+	}
+	s.serviceManager.ProxyManager().SetAllowedAncestors(s.portalHosts())
+}
+
+// detectRemoteTransitionAndRestart checks whether the set of active portal hosts
+// has changed (enable/disable, hostname rename, custom domain) and schedules an
+// OIDC app restart on any change.
+func (s *GinServer) detectRemoteTransitionAndRestart() {
+	hosts := s.portalHosts()
+	sort.Strings(hosts)
+	nowKey := strings.Join(hosts, ",")
+
 	s.remoteStateMu.Lock()
-	wasEnabled := s.remoteStateEnabled
-	nowEnabled := status.Enabled && strings.TrimSpace(status.PortalHostname) != ""
-	s.remoteStateEnabled = nowEnabled
+	changed := s.remoteStateHosts != nowKey
+	s.remoteStateHosts = nowKey
 	s.remoteStateMu.Unlock()
 
-	if wasEnabled != nowEnabled {
+	if changed {
 		s.scheduleOIDCAppsRestart()
 	}
 }
@@ -1982,18 +2462,19 @@ func (s *GinServer) observeRemoteConfig(bus *events.Bus) {
 	}()
 }
 
-// observeRemoteCertQueuing subscribes to endpoint and remote config changes to
-// queue per-host certificate issuance for HTTP-01 mode. This ensures certs are
-// created for endpoints added at startup (RestoreFromPodman) or after remote is
-// reconfigured, closing the gap where requeueOutstandingIssuances can only
-// requeue existing cert entries.
+// observeRemoteCertQueuing subscribes to endpoint, remote config, and identity
+// changes to queue per-host certificate issuance for HTTP-01 portals. This
+// ensures certs are created for endpoints added at startup (RestoreFromPodman),
+// after remote is reconfigured, or when identity state changes.
 func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 	if bus == nil {
 		return
 	}
 	endpointsCh := bus.Subscribe(events.TopicServiceEndpointsChanged, 16)
 	remoteCfgCh := bus.Subscribe(events.TopicRemoteConfigChanged, 16)
+	identityCh := bus.Subscribe(events.TopicIdentityChanged, 16)
 
+	// Endpoints added: queue per-host certs for added endpoints only.
 	go func() {
 		for evt := range endpointsCh {
 			payload, ok := evt.Payload.(events.ServiceEndpointsChanged)
@@ -2004,52 +2485,67 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 			if rm == nil {
 				continue
 			}
-			status := rm.Status()
-			if !status.Enabled || !strings.EqualFold(status.Solver, "http-01") {
-				continue
-			}
-			base := remoteBaseHostname(&status)
-			if base == "" {
-				continue
-			}
-			for _, ep := range payload.Added {
-				if ep.DerivedHostLabel == "" {
-					continue
+			entries := s.portalCertEntries()
+			for _, entry := range entries {
+				for _, ep := range payload.Added {
+					if ep.DerivedHostLabel == "" {
+						continue
+					}
+					host := services.RemoteServiceHostname(ep.DerivedHostLabel, entry.Hostname)
+					if host == "" {
+						continue
+					}
+					rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+						ID: "host:" + host, Source: entry.Source,
+						Solver: entry.Solver, CertDir: entry.CertDir,
+						Domains: []string{host}, CommonName: host,
+					})
 				}
-				rm.QueueHostnameCertificate(ep.DerivedHostLabel + "." + base)
 			}
 		}
 	}()
 
+	// Remote config or identity changed: re-queue all endpoint certs.
 	go func() {
-		for evt := range remoteCfgCh {
-			status, ok := evt.Payload.(remote.Status)
-			if !ok || !status.Enabled || !strings.EqualFold(status.Solver, "http-01") {
-				continue
-			}
-			rm := s.remoteManager
-			sm := s.serviceManager
-			if rm == nil || sm == nil {
-				continue
-			}
-			base := remoteBaseHostname(&status)
-			if base == "" {
-				continue
-			}
-			queueEndpointHostCerts(rm, sm.GetAll(), base)
+		for range remoteCfgCh {
+			s.queueAllEndpointCerts()
+		}
+	}()
+	go func() {
+		for range identityCh {
+			s.queueAllEndpointCerts()
 		}
 	}()
 }
 
-// queueEndpointHostCerts queues per-host certificate issuance for all endpoints
-// with a DerivedHostLabel. Used by observeRemoteCertQueuing and handleRemoteConfigure.
-func queueEndpointHostCerts(rm *remote.Manager, endpoints []services.ServiceEndpoint, base string) {
-	if rm == nil || base == "" {
+// queueAllEndpointCerts queues per-host certs for all active HTTP-01 portals
+// and all registered endpoints.
+func (s *GinServer) queueAllEndpointCerts() {
+	rm := s.remoteManager
+	sm := s.serviceManager
+	if rm == nil || sm == nil {
 		return
 	}
-	hosts := remoteHostsForEndpoints(endpoints, base)
-	for h := range hosts {
-		rm.QueueHostnameCertificate(h)
+	entries := s.portalCertEntries()
+	if len(entries) == 0 {
+		return
+	}
+	endpoints := sm.GetAll()
+	for _, entry := range entries {
+		for _, ep := range endpoints {
+			if ep.DerivedHostLabel == "" {
+				continue
+			}
+			host := services.RemoteServiceHostname(ep.DerivedHostLabel, entry.Hostname)
+			if host == "" {
+				continue
+			}
+			rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+				ID: "host:" + host, Source: entry.Source,
+				Solver: entry.Solver, CertDir: entry.CertDir,
+				Domains: []string{host}, CommonName: host,
+			})
+		}
 	}
 }
 

@@ -47,6 +47,10 @@ const (
 
 	// Onboarding events
 	TopicOnboardingStateChanged Topic = "onboarding_state_changed" // Emitted when onboarding state changes
+
+	// Identity events (RFC 20260312: namek-managed remote access)
+	TopicIdentityReady   Topic = "identity.ready"   // Emitted when identity service finishes initialization
+	TopicIdentityChanged Topic = "identity.changed" // Emitted on enrollment, enable/disable, hostname change
 )
 
 // Event represents a message broadcast on the event bus.

@@ -75,11 +75,8 @@ func (s *GinServer) buildSystemContext() map[string]interface{} {
 		"Architecture": runtime.GOARCH,
 		"Timezone":     detectHostTimezone(),
 	}
-	if s.remoteManager != nil {
-		status := s.remoteManager.Status()
-		if status.Enabled && strings.TrimSpace(status.PortalHostname) != "" {
-			ctx["Domain"] = strings.TrimSuffix(strings.TrimSpace(status.PortalHostname), ".")
-		}
+	if hosts := s.portalHosts(); len(hosts) > 0 {
+		ctx["Domain"] = hosts[0]
 	}
 	return ctx
 }
@@ -128,16 +125,41 @@ func determineScheme(flow api.ListenerFlow, protocol api.ListenerProtocol) strin
 	}
 }
 
+// portalCertEntry describes a portal hostname and its cert metadata for per-app cert queueing.
+type portalCertEntry struct {
+	Hostname string
+	Source   string
+	Solver   string
+	CertDir  string
+}
+
+// portalCertEntries builds the list of active portals that need per-app certs.
+// DNS-01 portals have wildcard coverage, so only HTTP-01 portals need per-app certs.
+func (s *GinServer) portalCertEntries() []portalCertEntry {
+	var entries []portalCertEntry
+	rm := s.remoteManager
+	if rm != nil {
+		st := rm.Status()
+		if st.Enabled && strings.EqualFold(st.Solver, "http-01") {
+			base := remoteBaseHostname(&st)
+			if base != "" {
+				entries = append(entries, portalCertEntry{
+					Hostname: base, Source: "self-hosted", Solver: "http-01",
+				})
+			}
+		}
+	}
+	// Namek portals use DNS-01 → wildcard coverage → no per-app certs needed.
+	return entries
+}
+
+// queueAppRemoteCertificates queues per-host certs for all HTTP-01 portals.
 func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	if s == nil || s.remoteManager == nil || s.serviceManager == nil {
 		return
 	}
-	status := s.remoteManager.Status()
-	if !status.Enabled || !strings.EqualFold(status.Solver, "http-01") {
-		return
-	}
-	base := remoteBaseHostname(&status)
-	if base == "" {
+	entries := s.portalCertEntries()
+	if len(entries) == 0 {
 		return
 	}
 	endpoints, err := s.serviceManager.GetByApp(appName)
@@ -145,7 +167,22 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 		log.Printf("WARN: remote: queue certificates for app %s: %v", appName, err)
 		return
 	}
-	queueEndpointHostCerts(s.remoteManager, endpoints, base)
+	for _, entry := range entries {
+		for _, ep := range endpoints {
+			if ep.DerivedHostLabel == "" {
+				continue
+			}
+			host := services.RemoteServiceHostname(ep.DerivedHostLabel, entry.Hostname)
+			if host == "" {
+				continue
+			}
+			s.remoteManager.EnqueueCertIssuance(remote.CertIssuanceRequest{
+				ID: "host:" + host, Source: entry.Source,
+				Solver: entry.Solver, CertDir: entry.CertDir,
+				Domains: []string{host}, CommonName: host,
+			})
+		}
+	}
 }
 
 func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, base string) map[string]struct{} {
@@ -618,13 +655,9 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 	// Include listener endpoints inline (keyed as "listeners" to avoid colliding with manifest services).
 	listeners, _ := s.serviceManager.GetByApp(appName)
 	listenerStatus := make([]gin.H, 0, len(listeners))
-	var remoteStatus *remote.Status
-	if s.remoteManager != nil {
-		st := s.remoteManager.Status()
-		remoteStatus = &st
-	}
+	portalHosts := s.portalHosts()
 	for _, ep := range listeners {
-		formatted := s.formatServiceEndpoint(c, ep, remoteStatus)
+		formatted := s.formatServiceEndpoint(c, ep, portalHosts)
 		// Add listener health status (RFC 20260125)
 		formatted["health"] = s.computeListenerHealth(ep)
 		listenerStatus = append(listenerStatus, formatted)
@@ -737,13 +770,9 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 	// Include services inline
 	services, _ := s.serviceManager.GetByApp(appName)
 	serviceStatus := make([]gin.H, 0, len(services))
-	var remoteStatus *remote.Status
-	if s.remoteManager != nil {
-		st := s.remoteManager.Status()
-		remoteStatus = &st
-	}
+	portalHosts := s.portalHosts()
 	for _, ep := range services {
-		serviceStatus = append(serviceStatus, s.formatServiceEndpoint(c, ep, remoteStatus))
+		serviceStatus = append(serviceStatus, s.formatServiceEndpoint(c, ep, portalHosts))
 	}
 
 	resp := gin.H{
@@ -761,6 +790,8 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	appName := c.Param("name")
 
+	// TODO: Move cert cleanup to event-driven pattern — remote manager should
+	// subscribe to app uninstall events instead of being called from the handler.
 	// Capture current remote hosts to clean up after uninstall.
 	var hostsToRemove map[string]struct{}
 	if s.remoteManager != nil && s.serviceManager != nil {

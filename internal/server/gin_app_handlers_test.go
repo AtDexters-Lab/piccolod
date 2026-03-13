@@ -366,7 +366,7 @@ func TestGinAppServices_RemoteHost(t *testing.T) {
 		t.Fatalf("remote status missing portal_hostname: %+v", status)
 	}
 	// Test hostname derivation with proper DerivedHostLabel (per RFC 20260114)
-	if host := srv.remoteServiceHostname(&status, services.ServiceEndpoint{Name: "web", DerivedHostLabel: "testapp"}); host == "" {
+	if host := remoteHostForEndpoint(services.ServiceEndpoint{Name: "web", DerivedHostLabel: "testapp"}, []string{status.PortalHostname}); host == "" {
 		t.Fatalf("remote hostname derivation failed")
 	}
 	srv.refreshRemoteRuntime()

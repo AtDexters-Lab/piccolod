@@ -15,14 +15,21 @@ import (
 	"piccolod/internal/state/paths"
 )
 
+// PortalCertMapping maps a portal hostname to a specific cert name on disk.
+type PortalCertMapping struct {
+	Hostname string // e.g., "slug.test.local"
+	CertName string // cert name on disk
+}
+
 // FileCertProvider loads certificates from an on-disk store under the encrypted
 // control volume. It implements services.CertProvider.
 type FileCertProvider struct {
-	base       string
-	mu         sync.RWMutex
-	cache      map[string]*tls.Certificate
-	portalHost string
-	missing    func(host string)
+	base         string
+	mu           sync.RWMutex
+	cache        map[string]*tls.Certificate
+	missing      func(host string)
+	fallbackDirs []string                       // additional cert directories (e.g., network-bootstrap)
+	portalMaps   map[string]map[string]string   // source → (hostname → certName) for multi-portal cert resolution
 }
 
 // NewFileCertProvider constructs a provider rooted at <control>/remote/certs when
@@ -40,17 +47,22 @@ func (p *FileCertProvider) GetCertificate(host string) (*tls.Certificate, error)
 		return nil, services.ErrNoCert
 	}
 	p.mu.RLock()
-	portal := p.portalHost
+	portalMaps := p.portalMaps
 	p.mu.RUnlock()
-	if portal != "" && host == portal {
-		if cert := p.tryLoad("portal"); cert != nil {
-			p.toCache("portal", cert)
-			return cert, nil
-		}
-		if cert := p.fromCache("portal"); cert != nil {
-			return cert, nil
+
+	// Check portal cert mappings across all sources (multi-portal support)
+	for _, m := range portalMaps {
+		if certName, ok := m[host]; ok {
+			if cert := p.tryLoad(certName); cert != nil {
+				p.toCache(certName, cert)
+				return cert, nil
+			}
+			if cert := p.fromCache(certName); cert != nil {
+				return cert, nil
+			}
 		}
 	}
+
 	// Always prefer fresh load from disk, then fall back to cache.
 	if cert := p.tryLoad(host); cert != nil {
 		p.toCache(host, cert)
@@ -95,13 +107,6 @@ func (p *FileCertProvider) toCache(key string, cert *tls.Certificate) {
 	p.mu.Unlock()
 }
 
-func (p *FileCertProvider) SetPortalHostname(host string) {
-	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	p.mu.Lock()
-	p.portalHost = host
-	p.mu.Unlock()
-}
-
 // SetMissingHandler registers a callback invoked when a cert is requested but not found.
 // The handler is called asynchronously.
 func (p *FileCertProvider) SetMissingHandler(fn func(host string)) {
@@ -110,17 +115,71 @@ func (p *FileCertProvider) SetMissingHandler(fn func(host string)) {
 	p.mu.Unlock()
 }
 
+// AddFallbackDir adds an additional directory to search for certs (e.g., network-bootstrap certs).
+func (p *FileCertProvider) AddFallbackDir(dir string) {
+	if dir == "" {
+		return
+	}
+	p.mu.Lock()
+	// Avoid duplicates
+	for _, d := range p.fallbackDirs {
+		if d == dir {
+			p.mu.Unlock()
+			return
+		}
+	}
+	p.fallbackDirs = append(p.fallbackDirs, dir)
+	p.mu.Unlock()
+}
+
+// SetPortalMappings configures source-tagged hostname→certName mappings for multi-portal cert resolution.
+// Uses copy-on-write to avoid concurrent map read/write with GetCertificate.
+func (p *FileCertProvider) SetPortalMappings(source string, mappings []PortalCertMapping) {
+	m := make(map[string]string, len(mappings))
+	for _, pm := range mappings {
+		m[pm.Hostname] = pm.CertName
+	}
+	p.mu.Lock()
+	newMaps := make(map[string]map[string]string, len(p.portalMaps)+1)
+	for k, v := range p.portalMaps {
+		if k != source {
+			newMaps[k] = v
+		}
+	}
+	if len(m) > 0 {
+		newMaps[source] = m
+	}
+	p.portalMaps = newMaps
+	p.mu.Unlock()
+}
+
 func (p *FileCertProvider) tryLoad(name string) *tls.Certificate {
+	if cert := tryLoadFromDir(p.base, name); cert != nil {
+		return cert
+	}
+	// Check fallback dirs (e.g., network-bootstrap certs)
+	p.mu.RLock()
+	dirs := p.fallbackDirs
+	p.mu.RUnlock()
+	for _, dir := range dirs {
+		if cert := tryLoadFromDir(dir, name); cert != nil {
+			return cert
+		}
+	}
+	return nil
+}
+
+func tryLoadFromDir(dir, name string) *tls.Certificate {
 	// Prefer separate CRT/KEY pair
-	crt := filepath.Join(p.base, name+".crt")
-	key := filepath.Join(p.base, name+".key")
+	crt := filepath.Join(dir, name+".crt")
+	key := filepath.Join(dir, name+".key")
 	if fileExists(crt) && fileExists(key) {
 		if c, err := tls.LoadX509KeyPair(crt, key); err == nil {
 			return &c
 		}
 	}
 	// Fallback to PEM bundle (cert + key in one file)
-	pemPath := filepath.Join(p.base, name+".pem")
+	pemPath := filepath.Join(dir, name+".pem")
 	if fileExists(pemPath) {
 		if c, err := loadPEMBundle(pemPath); err == nil {
 			return c

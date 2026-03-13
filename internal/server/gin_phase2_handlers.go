@@ -11,6 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"piccolod/internal/events"
+	"piccolod/internal/identity"
+	"piccolod/internal/remote"
 	"piccolod/internal/update"
 )
 
@@ -100,9 +102,30 @@ func (s *GinServer) respondUpdateError(c *gin.Context, err error) {
 }
 
 // handleRemoteStatus returns basic remote access status (device-terminated TLS).
+// Merges self-hosted remote status with identity (namek) status at the handler level.
 func (s *GinServer) handleRemoteStatus(c *gin.Context) {
 	st := s.remoteManager.Status()
-	c.JSON(http.StatusOK, st)
+	type mergedStatus struct {
+		remote.Status
+		Namek           *identity.PublicIdentityStatus `json:"namek,omitempty"`
+		AnyRemoteActive bool                           `json:"any_remote_active"`
+	}
+	resp := mergedStatus{Status: st, AnyRemoteActive: st.Enabled}
+	if s.identityService != nil {
+		ids := s.identityService.Status()
+		resp.Namek = ids.Public()
+		if ids.State == "active" {
+			resp.AnyRemoteActive = true
+			// Overlay namek state onto legacy top-level fields so existing Flutter UI
+			// reads the correct state without needing to parse the namek block.
+			if !st.Enabled {
+				resp.Status.Enabled = true
+				resp.Status.State = "active"
+				resp.Status.PortalHostname = ids.Hostname
+			}
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // handleOSUpdateReboot triggers a system reboot.

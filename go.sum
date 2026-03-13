@@ -1,3 +1,5 @@
+github.com/AtDexters-Lab/namek-server v0.1.0 h1:yTpM2JIO4shs/blFEn+Jb6r3K2Xhjuc5R+1Z5PEBJw4=
+github.com/AtDexters-Lab/namek-server v0.1.0/go.mod h1:f833/BEDNZudgzE/8M+ftsJPvqSNxtuWi8H3q6bnkJY=
 github.com/AtDexters-Lab/nexus-proxy-backend-client v0.2.5 h1:cndmxE3YMW/sqlytC9WDfR9H1K2kvAymQ5Ml3A53z4o=
 github.com/AtDexters-Lab/nexus-proxy-backend-client v0.2.5/go.mod h1:HTS899wUgAKulKZY41Lb6In58vT3HiwjZt6ZnRGPUrE=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d h1:licZJFw2RwpHMqeKTCYkitsPqHNxTmd4SNR5r94FGM8=
@@ -75,6 +77,8 @@ github.com/golang/mock v1.6.0 h1:ErTB+efbowRARo13NNdxyJji2egdxLGQhRaY+DUumQc=
 github.com/golang/mock v1.6.0/go.mod h1:p6yTPP+5HYm5mzsMV8JkE6ZKdX+/wYM6Hr+LicevLPs=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
+github.com/google/go-tpm v0.9.8 h1:slArAR9Ft+1ybZu0lBwpSmpwhRXaa85hWtMinMyRAWo=
+github.com/google/go-tpm v0.9.8/go.mod h1:h9jEsEECg7gtLis0upRBQU+GhYVH6jMjrFxI8u6bVUY=
 github.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
 github.com/google/gofuzz v1.2.0 h1:xRy4A+RhZaiKjJ1bPfwQ8sedCA+YS2YcCHW6ec7JMi0=
 github.com/google/gofuzz v1.2.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=

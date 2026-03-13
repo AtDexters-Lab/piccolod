@@ -42,7 +42,7 @@ func TestStartConfiguresAttestation(t *testing.T) {
 	var captured backend.ClientBackendConfig
 	started := make(chan struct{}, 1)
 
-	adapter.factory = func(cfg backend.ClientBackendConfig, handler backend.ConnectHandler) (backendClient, error) {
+	adapter.factory = func(cfg backend.ClientBackendConfig, opts ...backend.Option) (backendClient, error) {
 		captured = cfg
 		return &fakeClient{
 			start: func(context.Context) {
@@ -98,7 +98,7 @@ func TestStartPropagatesFactoryError(t *testing.T) {
 		t.Fatalf("configure: %v", err)
 	}
 
-	adapter.factory = func(cfg backend.ClientBackendConfig, handler backend.ConnectHandler) (backendClient, error) {
+	adapter.factory = func(cfg backend.ClientBackendConfig, opts ...backend.Option) (backendClient, error) {
 		return nil, errors.New("construction failed")
 	}
 
@@ -109,4 +109,32 @@ func TestStartPropagatesFactoryError(t *testing.T) {
 	if !strings.Contains(err.Error(), "construction failed") {
 		t.Fatalf("expected factory error to propagate, got %v", err)
 	}
+}
+
+func TestConfigReady_WithTokenProvider(t *testing.T) {
+	// Without token provider, DeviceSecret is required
+	adapter := NewBackendAdapter(nil, nil)
+	if adapter.configReady(Config{Endpoint: "wss://x", PortalHostname: "x.y"}) {
+		t.Fatal("expected configReady=false without secret and without token provider")
+	}
+
+	// With token provider, DeviceSecret is NOT required
+	tp := &fakeTokenProvider{}
+	adapter = NewBackendAdapter(nil, nil, WithAdapterTokenProvider(tp))
+	if !adapter.configReady(Config{Endpoint: "wss://x", PortalHostname: "x.y"}) {
+		t.Fatal("expected configReady=true with token provider and no secret")
+	}
+}
+
+func TestWithAdapterName(t *testing.T) {
+	adapter := NewBackendAdapter(nil, nil, WithAdapterName("piccolo-namek"))
+	if adapter.name != "piccolo-namek" {
+		t.Fatalf("expected name piccolo-namek, got %s", adapter.name)
+	}
+}
+
+type fakeTokenProvider struct{}
+
+func (f *fakeTokenProvider) IssueToken(ctx context.Context, req backend.TokenRequest) (backend.Token, error) {
+	return backend.Token{Value: "test-token"}, nil
 }

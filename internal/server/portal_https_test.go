@@ -20,7 +20,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"piccolod/internal/remote"
-	"piccolod/internal/remote/nexusclient"
 )
 
 func TestRemotePortalOverTLSEmitsHSTS(t *testing.T) {
@@ -79,7 +78,6 @@ func TestRemotePortalHTTPRedirectsToHTTPS(t *testing.T) {
 
 	runtimeStatus := remote.Status{Enabled: true, PortalHostname: host}
 	srv.applyRemoteRuntimeFromStatus(runtimeStatus)
-	srv.remoteResolver.UpdateConfig(nexusclient.Config{PortalHostname: host})
 
 	deadline := time.Now().Add(200 * time.Millisecond)
 	for !srv.remoteResolver.IsRemoteHostname(host) && time.Now().Before(deadline) {
@@ -122,7 +120,6 @@ func TestLocalHostSkipsHTTPSRedirect(t *testing.T) {
 
 	runtimeStatus := remote.Status{Enabled: true, PortalHostname: host}
 	srv.applyRemoteRuntimeFromStatus(runtimeStatus)
-	srv.remoteResolver.UpdateConfig(nexusclient.Config{PortalHostname: host})
 
 	w := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(w)
