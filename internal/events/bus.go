@@ -100,11 +100,17 @@ type ServiceEndpointInfo struct {
 	DerivedHostLabel string
 }
 
-// ServiceEndpointsChanged announces that service endpoints have been added or removed.
+// ServiceEndpointsChanged announces endpoint lifecycle transitions for an app.
+//   - Added: new endpoints now routable (install, start, restore)
+//   - Deactivated: endpoints temporarily offline (app stop, reconcile rebuild);
+//     downstream should stop routing but preserve associated resources (certs, DNS)
+//   - Removed: endpoints permanently gone (uninstall, failed install, listener config
+//     change); downstream should clean up all associated resources
 type ServiceEndpointsChanged struct {
-	App     string
-	Added   []ServiceEndpointInfo
-	Removed []ServiceEndpointInfo
+	App         string
+	Added       []ServiceEndpointInfo
+	Deactivated []ServiceEndpointInfo
+	Removed     []ServiceEndpointInfo
 }
 
 // CertificateChangedEvent is emitted when a certificate's status changes.

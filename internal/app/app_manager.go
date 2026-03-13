@@ -1175,14 +1175,14 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 		// Respect desired state: disabled apps should not have proxies restored.
 		if !app.Enabled {
 			if m.serviceManager != nil {
-				m.serviceManager.RemoveApp(app.InstanceID)
+				m.serviceManager.DeactivateApp(app.InstanceID)
 			}
 			continue
 		}
 		// Followers should not restore proxies for apps they don't lead.
 		if m.LastObservedRole(cluster.ResourceForApp(app.InstanceID)) == cluster.RoleFollower {
 			if m.serviceManager != nil {
-				m.serviceManager.RemoveApp(app.InstanceID)
+				m.serviceManager.DeactivateApp(app.InstanceID)
 			}
 			continue
 		}
@@ -1207,7 +1207,7 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 			continue
 		}
 		if len(ports) == 0 {
-			m.serviceManager.RemoveApp(app.InstanceID)
+			m.serviceManager.DeactivateApp(app.InstanceID)
 			continue
 		}
 		if _, err := m.serviceManager.RestoreFromPodman(app.InstanceID, def.Listeners, ports); err != nil {
@@ -2031,7 +2031,7 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 		}
 
 		if m.serviceManager != nil {
-			m.serviceManager.RemoveApp(instanceID)
+			m.serviceManager.DeactivateApp(instanceID)
 		}
 		return nil
 	}
@@ -2043,7 +2043,7 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 		}
 	}
 	if m.serviceManager != nil {
-		m.serviceManager.RemoveApp(instanceID)
+		m.serviceManager.DeactivateApp(instanceID)
 	}
 	return nil
 }

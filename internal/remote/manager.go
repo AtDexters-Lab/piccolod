@@ -537,6 +537,11 @@ func (m *Manager) Status() Status {
 		state = "stopped"
 	}
 
+	aliases := cloneAliases(cfg.Aliases)
+	for i := range aliases {
+		aliases[i].Status = aliasCertStatus(cfg, aliases[i])
+	}
+
 	result := Status{
 		Enabled:         cfg.Enabled,
 		State:           state,
@@ -552,7 +557,7 @@ func (m *Manager) Status() Status {
 		Warnings:        warnings,
 		GuideVerifiedAt: cfg.GuideVerifiedAt,
 		Listeners:       buildListeners(cfg),
-		Aliases:         cloneAliases(cfg.Aliases),
+		Aliases:         aliases,
 		Certificates:    cloneCertificates(cfg.Certificates),
 	}
 	m.cfgMu.RUnlock()
@@ -822,10 +827,15 @@ func generateSecureSecret() (string, error) {
 	return fmt.Sprintf("%x", b), nil
 }
 
-// ListAliases returns the current alias inventory.
+// ListAliases returns the current alias inventory with status derived from
+// the corresponding certificate (not the stale Alias.Status field).
 func (m *Manager) ListAliases() []Alias {
 	m.cfgMu.RLock()
-	aliases := cloneAliases(m.currentConfigLocked().Aliases)
+	cfg := m.currentConfigLocked()
+	aliases := cloneAliases(cfg.Aliases)
+	for i := range aliases {
+		aliases[i].Status = aliasCertStatus(cfg, aliases[i])
+	}
 	m.cfgMu.RUnlock()
 	return aliases
 }
@@ -2295,11 +2305,11 @@ func (m *Manager) RunPreflight(candidate *Config) (PreflightResult, error) {
 	// Only check aliases if we are running against active config, or if candidate has them
 	if len(cfg.Aliases) > 0 {
 		status := "pass"
-		detail := "All aliases verified"
+		detail := "All aliases have certificates"
 		for _, alias := range cfg.Aliases {
-			if alias.Status != "active" {
+			if s := aliasCertStatus(cfg, alias); !strings.EqualFold(s, "ok") {
 				status = "warn"
-				detail = "One or more aliases pending verification"
+				detail = fmt.Sprintf("Alias %s certificate %s", alias.Hostname, s)
 				break
 			}
 		}
@@ -2479,6 +2489,19 @@ func buildListeners(cfg *Config) []ListenerSummary {
 	return []ListenerSummary{{Name: "portal", RemoteHost: cfg.PortalHostname}}
 }
 
+// aliasCertStatus derives an alias's health from its certificate.
+// Alias status is determined by the cert with ID "alias:<hostname>", not
+// the Alias.Status field (which was never kept in sync).
+func aliasCertStatus(cfg *Config, alias Alias) string {
+	id := "alias:" + strings.ToLower(alias.Hostname)
+	for _, c := range cfg.Certificates {
+		if c.ID == id {
+			return c.Status // "ok", "pending", "error"
+		}
+	}
+	return "pending"
+}
+
 func computeWarnings(cfg *Config) []string {
 	var warnings []string
 	now := time.Now()
@@ -2489,8 +2512,8 @@ func computeWarnings(cfg *Config) []string {
 		warnings = append(warnings, "Portal hostname missing")
 	}
 	for _, alias := range cfg.Aliases {
-		if alias.Status != "active" {
-			warnings = append(warnings, fmt.Sprintf("Alias %s is %s", alias.Hostname, alias.Status))
+		if s := aliasCertStatus(cfg, alias); !strings.EqualFold(s, "ok") {
+			warnings = append(warnings, fmt.Sprintf("Alias %s certificate %s", alias.Hostname, s))
 		}
 	}
 	hasCertError := false

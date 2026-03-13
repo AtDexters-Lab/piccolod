@@ -239,7 +239,7 @@ func (m *AppManager) stopContainerGroupWithOpts(ctx context.Context, state *File
 	}
 	m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
 	if m.serviceManager != nil {
-		m.serviceManager.RemoveApp(appInst.InstanceID)
+		m.serviceManager.DeactivateApp(appInst.InstanceID)
 	}
 	return nil
 }

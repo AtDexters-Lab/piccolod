@@ -983,6 +983,12 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if label == "" || !isValidDNSLabel(label) {
 				return
 			}
+			// Only queue a cert if an active service endpoint exists for this label.
+			// Without this check, any TLS connection to *.<base> (bots, scanners,
+			// typos) would trigger real ACME issuance and leave orphaned certs.
+			if _, ok := svcMgr.ResolveByHostLabel(label, 0); !ok {
+				return
+			}
 			rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 				ID: "host:" + h, Source: "self-hosted", Solver: "http-01",
 				Domains: []string{h}, CommonName: h,
@@ -1834,6 +1840,16 @@ func remoteBaseHostname(status *remote.Status) string {
 	if status == nil || !status.Enabled {
 		return ""
 	}
+	return remotePortalBase(status)
+}
+
+// remotePortalBase extracts the normalized base hostname from PortalHostname
+// without gating on Enabled. Used for cert cleanup where we need the base
+// even if remote access has been disabled.
+func remotePortalBase(status *remote.Status) string {
+	if status == nil {
+		return ""
+	}
 	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(status.PortalHostname)), ".")
 	if base == "" {
 		return ""
@@ -2478,13 +2494,14 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 	go func() {
 		for evt := range endpointsCh {
 			payload, ok := evt.Payload.(events.ServiceEndpointsChanged)
-			if !ok || len(payload.Added) == 0 {
+			if !ok {
 				continue
 			}
 			rm := s.remoteManager
 			if rm == nil {
 				continue
 			}
+			// Queue certs for newly added endpoints (HTTP-01 portals only).
 			entries := s.portalCertEntries()
 			for _, entry := range entries {
 				for _, ep := range payload.Added {
@@ -2500,6 +2517,22 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 						Solver: entry.Solver, CertDir: entry.CertDir,
 						Domains: []string{host}, CommonName: host,
 					})
+				}
+			}
+
+			// Remove certs for permanently removed endpoints.
+			// Derive base from PortalHostname directly (not gating on Enabled)
+			// so cleanup works even if remote is disabled at removal time.
+			if len(payload.Removed) > 0 {
+				status := rm.Status()
+				base := remotePortalBase(&status)
+				if base != "" {
+					for _, ep := range payload.Removed {
+						if ep.DerivedHostLabel == "" {
+							continue
+						}
+						rm.RemoveHostnameCertificate(ep.DerivedHostLabel + "." + base)
+					}
 				}
 			}
 		}

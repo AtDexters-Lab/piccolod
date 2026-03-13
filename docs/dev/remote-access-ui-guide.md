@@ -183,7 +183,7 @@ Allows exposing other services on custom subdomains.
 | :--- | :--- | :--- |
 | `"Portal hostname missing"` | Remote access is on, but you can't reach the admin panel. | **High Priority Alert.** Prompt user to Configure -> set `portal_hostname`. |
 | `"Certificate renewal due soon"` | Cert expires in < 7 days. | Amber warning badge. "Check Logs" or "Renew Now". |
-| `"Alias ... is pending"` | An alias is waiting for verification/issuance. | Show status badge in the aliases list. |
+| `"Alias <host> certificate pending"` | An alias is waiting for certificate issuance. | Show status badge in the aliases list. |
 
 ---
 

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:js_interop';
 
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/network_models.dart';
@@ -14,6 +15,7 @@ import 'package:piccolo_os/shells/desktop/features/setup/setup_controller.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:web/web.dart' as web;
 
 class SetupWizard extends StatefulWidget {
 
@@ -233,7 +235,6 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.installComplete:
         return _InstallCompleteStep(
           onReboot: _controller.rebootAfterInstall,
-          error: _controller.error,
           bootOrderConfigured: _controller.bootOrderConfigured,
         );
       case SetupState.welcome:
@@ -380,27 +381,147 @@ class _InstallCompleteStep extends StatefulWidget {
 
   const _InstallCompleteStep({
     required this.onReboot,
-    this.error,
     this.bootOrderConfigured = false,
   });
   final Future<void> Function() onReboot;
-  final String? error;
   final bool bootOrderConfigured;
 
   @override
   State<_InstallCompleteStep> createState() => _InstallCompleteStepState();
 }
 
+enum _RebootPhase { idle, rebooting, polling, timedOut }
+
 class _InstallCompleteStepState extends State<_InstallCompleteStep> {
-  bool _isRebooting = false;
+  static const _pollUrl = 'http://piccolo.local/api/v1/health/live';
+  static const _redirectUrl = 'http://piccolo.local';
+  static const _pollInterval = Duration(seconds: 3);
+  static const _pollTimeout = Duration(minutes: 2);
+  static const _initialDelay = Duration(seconds: 5);
+
+  _RebootPhase _phase = _RebootPhase.idle;
+  bool _pollInFlight = false;
+  String? _rebootError;
+  Timer? _pollTimer;
+  Timer? _timeoutTimer;
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    _timeoutTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _rebootAndWait() async {
+    if (_phase != _RebootPhase.idle) return;
+    setState(() {
+      _phase = _RebootPhase.rebooting;
+      _rebootError = null;
+    });
+
+    try {
+      await widget.onReboot();
+    } on Object catch (e) {
+      // Real API error (e.g. 409) — the device did NOT reboot.
+      if (mounted) {
+        setState(() {
+          _phase = _RebootPhase.idle;
+          _rebootError = e.toString();
+        });
+      }
+      return;
+    }
+
+    if (!mounted) return;
+
+    if (widget.bootOrderConfigured) {
+      // Device will reboot to internal disk — poll and redirect.
+      setState(() => _phase = _RebootPhase.polling);
+      // Wait for the device to actually go down before polling.
+      await Future<void>.delayed(_initialDelay);
+      if (!mounted) return;
+      unawaited(_pollDevice());
+      _pollTimer = Timer.periodic(_pollInterval, (_) {
+        unawaited(_pollDevice());
+      });
+      // Give up after _pollTimeout.
+      _timeoutTimer = Timer(_pollTimeout, () {
+        _pollTimer?.cancel();
+        if (mounted) setState(() => _phase = _RebootPhase.timedOut);
+      });
+    }
+    // If !bootOrderConfigured, the device powers off. The button stays
+    // disabled with "Shutting down..." — there's nothing more to do.
+  }
+
+  Future<void> _pollDevice() async {
+    if (_pollInFlight) return;
+    _pollInFlight = true;
+    try {
+      // Use no-cors mode: the page may be served from a different origin
+      // (e.g. a LAN IP or device-specific hostname) than piccolo.local.
+      final init = web.RequestInit(mode: 'no-cors');
+      final response = await web.window
+          .fetch(_pollUrl.toJS, init)
+          .toDart
+          .timeout(const Duration(seconds: 3));
+      // In no-cors mode, a successful response has type "opaque" (status 0).
+      if (response.ok || response.type == 'opaque') {
+        _pollTimer?.cancel();
+        _timeoutTimer?.cancel();
+        if (mounted) {
+          web.window.location.href = _redirectUrl;
+        }
+      }
+    } on Object catch (_) {
+      // Device still rebooting — continue polling.
+    } finally {
+      _pollInFlight = false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
+    if (_phase == _RebootPhase.polling || _phase == _RebootPhase.timedOut) {
+      final timedOut = _phase == _RebootPhase.timedOut;
+      final message = timedOut
+          ? 'Could not reach Piccolo. Check your device and visit\npiccolo.local to continue setup.'
+          : 'Waiting for Piccolo to come back online.\nYou\u2019ll be redirected automatically.';
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(32, 24, 32, 48),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (!timedOut)
+              const CircularProgressIndicator(color: PiccoloTheme.cobalt600)
+            else
+              const Icon(PiccoloIcons.warning, color: PiccoloTheme.warning, size: 48),
+            const SizedBox(height: 24),
+            Text(
+              timedOut ? 'Device unreachable' : 'Rebooting...',
+              style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              message,
+              style: PiccoloTheme.textTheme.labelSmall,
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      );
+    }
+
+    final isRebooting = _phase == _RebootPhase.rebooting;
     final subtitle = widget.bootOrderConfigured
         ? 'Your device will reboot into the internal disk. You can remove the USB drive at any time.'
         : 'Remove the USB drive after the device powers off, then power it back on.';
     final buttonLabel = widget.bootOrderConfigured ? 'Reboot Now' : 'Power Off';
     final buttonIcon = widget.bootOrderConfigured ? PiccoloIcons.restart : PiccoloIcons.power;
+    final activeLabel = widget.bootOrderConfigured ? 'Rebooting...' : 'Shutting down...';
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
@@ -426,7 +547,7 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
             style: const TextStyle(fontSize: 13, color: PiccoloTheme.inkMuted),
             textAlign: TextAlign.center,
           ),
-          if (widget.error != null) ...[
+          if (_rebootError != null) ...[
             const SizedBox(height: 16),
             Container(
               padding: const EdgeInsets.all(12),
@@ -438,7 +559,7 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
                 ),
               ),
               child: Text(
-                widget.error!,
+                _rebootError!,
                 style: PiccoloTheme.textTheme.labelMedium?.copyWith(
                   color: PiccoloTheme.critical,
                 ),
@@ -447,14 +568,8 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
           ],
           const SizedBox(height: 32),
           FilledButton.icon(
-            onPressed: _isRebooting
-                ? null
-                : () async {
-                    setState(() => _isRebooting = true);
-                    await widget.onReboot();
-                    if (mounted) setState(() => _isRebooting = false);
-                  },
-            icon: _isRebooting
+            onPressed: isRebooting ? null : _rebootAndWait,
+            icon: isRebooting
                 ? const SizedBox(
                     width: 20,
                     height: 20,
@@ -464,7 +579,7 @@ class _InstallCompleteStepState extends State<_InstallCompleteStep> {
                     ),
                   )
                 : Icon(buttonIcon),
-            label: Text(_isRebooting ? 'Shutting down...' : buttonLabel),
+            label: Text(isRebooting ? activeLabel : buttonLabel),
           ),
         ],
       ),

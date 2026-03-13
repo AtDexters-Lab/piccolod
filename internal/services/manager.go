@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"slices"
+
 	"piccolod/internal/api"
 	"piccolod/internal/cluster"
 	"piccolod/internal/events"
@@ -44,6 +46,10 @@ type ServiceManager struct {
 	// Health aggregator cancellation
 	healthAggregatorCancel func()
 
+	// deactivated tracks endpoint metadata cleared by DeactivateApp so that a
+	// subsequent RemoveApp can still emit a permanent removal event for cert cleanup.
+	deactivated map[string][]events.ServiceEndpointInfo
+
 	// App status tracking for health check suppression
 	appTransient    map[string]time.Time // app ID → time entered transient state
 	appTransientMu  sync.RWMutex
@@ -68,6 +74,7 @@ func NewServiceManager() *ServiceManager {
 		containerIDs:  make(map[string]string),
 		leadership:    make(map[string]cluster.Role),
 		backendHealth: NewBackendHealthState(),
+		deactivated:   make(map[string][]events.ServiceEndpointInfo),
 		appTransient:  make(map[string]time.Time),
 	}
 }
@@ -134,37 +141,29 @@ func (m *ServiceManager) SetRemoteStatusProvider(provider RemoteStatusProvider) 
 	m.statusMu.Unlock()
 }
 
-func (m *ServiceManager) publishEndpointsChanged(app string, added, removed []ServiceEndpoint) {
+func (m *ServiceManager) publishEndpointsEvent(evt events.ServiceEndpointsChanged) {
 	m.eventsMu.Lock()
 	bus := m.eventBus
 	m.eventsMu.Unlock()
 	if bus == nil {
 		return
 	}
-	addedInfo := make([]events.ServiceEndpointInfo, len(added))
-	for i, ep := range added {
-		addedInfo[i] = events.ServiceEndpointInfo{
-			App:              ep.App,
-			Name:             ep.Name,
-			DerivedHostLabel: ep.DerivedHostLabel,
-		}
-	}
-	removedInfo := make([]events.ServiceEndpointInfo, len(removed))
-	for i, ep := range removed {
-		removedInfo[i] = events.ServiceEndpointInfo{
-			App:              ep.App,
-			Name:             ep.Name,
-			DerivedHostLabel: ep.DerivedHostLabel,
-		}
-	}
 	bus.Publish(events.Event{
-		Topic: events.TopicServiceEndpointsChanged,
-		Payload: events.ServiceEndpointsChanged{
-			App:     app,
-			Added:   addedInfo,
-			Removed: removedInfo,
-		},
+		Topic:   events.TopicServiceEndpointsChanged,
+		Payload: evt,
 	})
+}
+
+func endpointInfoSlice(eps []ServiceEndpoint) []events.ServiceEndpointInfo {
+	info := make([]events.ServiceEndpointInfo, len(eps))
+	for i, ep := range eps {
+		info[i] = events.ServiceEndpointInfo{
+			App:              ep.App,
+			Name:             ep.Name,
+			DerivedHostLabel: ep.DerivedHostLabel,
+		}
+	}
+	return info
 }
 
 const ACMEHTTPFallbackPort = 5002
@@ -183,6 +182,26 @@ func defaultRemotePorts(listener api.AppListener) []int {
 	ports := make([]int, len(listener.RemotePorts))
 	copy(ports, listener.RemotePorts)
 	return ports
+}
+
+// buildEndpoint is the single source of truth for mapping an AppListener +
+// allocated ports into a ServiceEndpoint. All construction sites must use this
+// to avoid field-omission bugs when new fields are added.
+func buildEndpoint(appName string, l api.AppListener, hostBind, publicPort int, isPrimary bool, hostLabel string) ServiceEndpoint {
+	return ServiceEndpoint{
+		App:              appName,
+		Name:             l.Name,
+		GuestPort:        l.GuestPort,
+		HostBind:         hostBind,
+		PublicPort:       publicPort,
+		Flow:             l.Flow,
+		Protocol:         l.Protocol,
+		Primary:          isPrimary,
+		DerivedHostLabel: hostLabel,
+		Middleware:       l.Middleware,
+		RemotePorts:      defaultRemotePorts(l),
+		Auth:             l.Auth,
+	}
 }
 
 // ObserveRuntimeEvents subscribes to leadership and lock-state events for logging.
@@ -337,7 +356,7 @@ func (m *ServiceManager) ClearLockOverride() {
 // RestoreFromPodman rebuilds proxies for an app using existing host-bind ports.
 func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppListener, hostByGuest map[int]int) ([]ServiceEndpoint, error) {
 	// Stop any existing proxies first
-	m.RemoveApp(appName)
+	m.DeactivateApp(appName)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -364,23 +383,9 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 			m.allocator.freeHost(host)
 			return endpoints, err
 		}
-		remotePorts := defaultRemotePorts(l)
 		isPrimary := l.Name == primaryName
 		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
-		ep := ServiceEndpoint{
-			App:              appName,
-			Name:             l.Name,
-			GuestPort:        l.GuestPort,
-			HostBind:         host,
-			PublicPort:       public,
-			Flow:             l.Flow,
-			Protocol:         l.Protocol,
-			Primary:          isPrimary,
-			DerivedHostLabel: hostLabel,
-			Middleware:       l.Middleware,
-			RemotePorts:      remotePorts,
-			Auth:             l.Auth,
-		}
+		ep := buildEndpoint(appName, l, host, public, isPrimary, hostLabel)
 		registry[l.Name] = ep
 		endpoints = append(endpoints, ep)
 		m.proxyManager.StartListener(ep)
@@ -390,10 +395,15 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 	if len(registry) > 0 {
 		m.registry[appName] = registry
 	}
+	// App is back — clear any stashed deactivated state.
+	delete(m.deactivated, appName)
 
 	// Publish endpoint changes (non-blocking)
 	if len(endpoints) > 0 {
-		m.publishEndpointsChanged(appName, endpoints, nil)
+		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+			App:   appName,
+			Added: endpointInfoSlice(endpoints),
+		})
 	}
 
 	return endpoints, nil
@@ -419,29 +429,18 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 		if err != nil {
 			return nil, err
 		}
-		remotePorts := defaultRemotePorts(l)
 		isPrimary := l.Name == primaryName
 		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
-		ep := ServiceEndpoint{
-			App:              appName,
-			Name:             l.Name,
-			GuestPort:        l.GuestPort,
-			HostBind:         hb,
-			PublicPort:       pp,
-			Flow:             l.Flow,
-			Protocol:         l.Protocol,
-			Primary:          isPrimary,
-			DerivedHostLabel: hostLabel,
-			Middleware:       l.Middleware,
-			RemotePorts:      remotePorts,
-			Auth:             l.Auth,
-		}
+		ep := buildEndpoint(appName, l, hb, pp, isPrimary, hostLabel)
 		endpoints = append(endpoints, ep)
 		if _, ok := m.registry[appName]; !ok {
 			m.registry[appName] = make(map[string]ServiceEndpoint)
 		}
 		m.registry[appName][l.Name] = ep
 	}
+
+	// Clear any stashed deactivated state from prior stop.
+	delete(m.deactivated, appName)
 
 	// Start proxies after registration
 	for _, ep := range endpoints {
@@ -450,7 +449,10 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 	}
 
 	// Publish endpoint changes (non-blocking)
-	m.publishEndpointsChanged(appName, endpoints, nil)
+	m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+		App:   appName,
+		Added: endpointInfoSlice(endpoints),
+	})
 
 	return endpoints, nil
 }
@@ -1009,73 +1011,33 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
 
 		if old, ok := existing[l.Name]; ok {
-			// Reuse ports; update config
-			ep := old
-			// Detect guest port change
-			if ep.GuestPort != l.GuestPort {
+			newEp := buildEndpoint(appName, l, old.HostBind, old.PublicPort, isPrimary, hostLabel)
+
+			if old.GuestPort != newEp.GuestPort {
 				containerChange = true
-				result.GuestPortChanged = append(result.GuestPortChanged, struct{ Old, New ServiceEndpoint }{
-					Old: ep,
-					New: ServiceEndpoint{
-						App:              appName,
-						Name:             l.Name,
-						GuestPort:        l.GuestPort,
-						HostBind:         ep.HostBind,
-						PublicPort:       ep.PublicPort,
-						Flow:             l.Flow,
-						Protocol:         l.Protocol,
-						Primary:          isPrimary,
-						DerivedHostLabel: hostLabel,
-						Middleware:       l.Middleware,
-						RemotePorts:      defaultRemotePorts(l),
-					},
-				})
-			}
-			ep.GuestPort = l.GuestPort
-			// Only restart proxy if proxy-related fields changed
-			proxyChanged := ep.Flow != l.Flow || ep.Protocol != l.Protocol || !middlewareEqual(ep.Middleware, l.Middleware)
-			ep.Flow = l.Flow
-			ep.Protocol = l.Protocol
-			ep.Primary = isPrimary
-			oldHostLabel := ep.DerivedHostLabel
-			ep.DerivedHostLabel = hostLabel
-			ep.Middleware = l.Middleware
-			ep.RemotePorts = defaultRemotePorts(l)
-			newMap[l.Name] = ep
-
-			// Detect host label changes for mDNS updates
-			if oldHostLabel != hostLabel {
-				oldEp := old
-				oldEp.DerivedHostLabel = oldHostLabel
-				result.Removed = append(result.Removed, oldEp)
-				result.Added = append(result.Added, ep)
+				result.GuestPortChanged = append(result.GuestPortChanged, struct{ Old, New ServiceEndpoint }{Old: old, New: newEp})
 			}
 
-			if proxyChanged {
-				m.proxyManager.StopPort(ep.PublicPort)
-				m.proxyManager.StartListener(ep)
-				result.ProxyOnlyChanged = append(result.ProxyOnlyChanged, ep)
-				m.notifyPublish(ep.PublicPort)
+			if old.DerivedHostLabel != hostLabel {
+				result.Removed = append(result.Removed, old)
+				result.Added = append(result.Added, newEp)
 			}
+
+			if proxyConfigChanged(old, newEp) {
+				m.proxyManager.StopPort(old.PublicPort)
+				m.proxyManager.StartListener(newEp)
+				result.ProxyOnlyChanged = append(result.ProxyOnlyChanged, newEp)
+				m.notifyPublish(newEp.PublicPort)
+			}
+
+			newMap[l.Name] = newEp
 		} else {
 			// New listener: allocate ports, start proxy, mark container change
 			hb, pp, err := m.allocator.AllocatePair()
 			if err != nil {
 				return ReconcileResult{}, false, err
 			}
-			ep := ServiceEndpoint{
-				App:              appName,
-				Name:             l.Name,
-				GuestPort:        l.GuestPort,
-				HostBind:         hb,
-				PublicPort:       pp,
-				Flow:             l.Flow,
-				Protocol:         l.Protocol,
-				Primary:          isPrimary,
-				DerivedHostLabel: hostLabel,
-				Middleware:       l.Middleware,
-				RemotePorts:      defaultRemotePorts(l),
-			}
+			ep := buildEndpoint(appName, l, hb, pp, isPrimary, hostLabel)
 			newMap[l.Name] = ep
 			m.proxyManager.StartListener(ep)
 			containerChange = true
@@ -1107,9 +1069,14 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 	}
 	result.Endpoints = eps
 
-	// Publish endpoint changes (non-blocking)
+	// Publish endpoint changes (non-blocking). Listener config changes are
+	// permanent — removed endpoints will not come back.
 	if len(result.Added) > 0 || len(result.Removed) > 0 {
-		m.publishEndpointsChanged(appName, result.Added, result.Removed)
+		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+			App:     appName,
+			Added:   endpointInfoSlice(result.Added),
+			Removed: endpointInfoSlice(result.Removed),
+		})
 	}
 
 	return result, containerChange, nil
@@ -1128,8 +1095,47 @@ func middlewareEqual(a, b []api.AppProtocolMiddleware) bool {
 	return true
 }
 
-// RemoveApp stops and removes all listeners for an app
+// proxyConfigChanged returns true when proxy-affecting fields differ between
+// two endpoints. Centralises the restart-decision so new fields are checked
+// in one place.
+func proxyConfigChanged(old, cur ServiceEndpoint) bool {
+	return old.Flow != cur.Flow ||
+		old.Protocol != cur.Protocol ||
+		!middlewareEqual(old.Middleware, cur.Middleware) ||
+		!authEqual(old.Auth, cur.Auth)
+}
+
+// authEqual compares two ListenerAuth pointers for equality.
+// nil and empty-rules are treated as equivalent (both resolve to "protected"
+// for all paths in listenerStrategyForPath).
+// Order-sensitive: rule ordering matters because listenerStrategyForPath uses
+// first-match-wins semantics.
+// ListenerAuthRule is a flat struct of 3 string fields — != works for element
+// comparison. If fields are added to ListenerAuthRule, this must be revisited.
+func authEqual(a, b *api.ListenerAuth) bool {
+	return slices.Equal(authRules(a), authRules(b))
+}
+
+func authRules(a *api.ListenerAuth) []api.ListenerAuthRule {
+	if a == nil {
+		return nil
+	}
+	return a.Rules
+}
+
+// DeactivateApp tears down routing for a temporarily stopped app.
+// The app still exists and endpoints will be restored on start.
+func (m *ServiceManager) DeactivateApp(appName string) {
+	m.removeAppEndpoints(appName, false)
+}
+
+// RemoveApp permanently removes all endpoints for an app (uninstall, failed install).
+// Downstream listeners (e.g., cert cleanup) act on the permanent signal.
 func (m *ServiceManager) RemoveApp(appName string) {
+	m.removeAppEndpoints(appName, true)
+}
+
+func (m *ServiceManager) removeAppEndpoints(appName string, permanent bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var removed []ServiceEndpoint
@@ -1140,7 +1146,6 @@ func (m *ServiceManager) RemoveApp(appName string) {
 			m.proxyManager.StopPort(ep.PublicPort)
 			m.allocator.Release(ep.HostBind, ep.PublicPort)
 			m.notifyUnpublish(ep.PublicPort)
-			// Clean up backend health state for removed endpoint
 			if m.backendHealth != nil {
 				m.backendHealth.RemoveEndpoint(ep.endpointKey())
 			}
@@ -1149,13 +1154,34 @@ func (m *ServiceManager) RemoveApp(appName string) {
 	}
 	delete(m.containerIDs, appName)
 
-	// Clean up transient state for removed app
 	m.appTransientMu.Lock()
 	delete(m.appTransient, appName)
 	m.appTransientMu.Unlock()
 
-	// Publish endpoint changes (non-blocking)
-	if len(removed) > 0 {
-		m.publishEndpointsChanged(appName, nil, removed)
+	info := endpointInfoSlice(removed)
+
+	if !permanent {
+		// Stash endpoint metadata so a subsequent RemoveApp can emit a
+		// permanent Removed event even though the endpoints are already gone.
+		if len(info) > 0 {
+			m.deactivated[appName] = info
+			m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+				App:         appName,
+				Deactivated: info,
+			})
+		}
+	} else {
+		// Include any previously deactivated endpoints that are no longer
+		// in the registry (app was stopped before uninstall).
+		if prev, ok := m.deactivated[appName]; ok {
+			info = append(info, prev...)
+			delete(m.deactivated, appName)
+		}
+		if len(info) > 0 {
+			m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+				App:     appName,
+				Removed: info,
+			})
+		}
 	}
 }
