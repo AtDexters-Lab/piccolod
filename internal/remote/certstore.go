@@ -15,12 +15,6 @@ import (
 	"piccolod/internal/state/paths"
 )
 
-// PortalCertMapping maps a portal hostname to a specific cert name on disk.
-type PortalCertMapping struct {
-	Hostname string // e.g., "slug.test.local"
-	CertName string // cert name on disk
-}
-
 // FileCertProvider loads certificates from an on-disk store under the encrypted
 // control volume. It implements services.CertProvider.
 type FileCertProvider struct {
@@ -134,7 +128,7 @@ func (p *FileCertProvider) AddFallbackDir(dir string) {
 
 // SetPortalMappings configures source-tagged hostname→certName mappings for multi-portal cert resolution.
 // Uses copy-on-write to avoid concurrent map read/write with GetCertificate.
-func (p *FileCertProvider) SetPortalMappings(source string, mappings []PortalCertMapping) {
+func (p *FileCertProvider) SetPortalMappings(source string, mappings []services.PortalCertMapping) {
 	m := make(map[string]string, len(mappings))
 	for _, pm := range mappings {
 		m[pm.Hostname] = pm.CertName

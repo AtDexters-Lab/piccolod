@@ -174,6 +174,7 @@ type GinServer struct {
 	namekLastKey       string
 	namekStopped       atomic.Bool
 	namekMu            sync.Mutex // protects namek adapter fields
+	namekACME          *identity.NamekACMEClient
 }
 
 type secureContextKey struct{}
@@ -393,12 +394,21 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 			}
 		}
 	}
-	// Pass 2: subdomain matches.
-	for _, rb := range bases {
+	// Pass 2: subdomain matches (longest domain wins — consistent with PortalHostForRequest).
+	var bestBase *remoteBase
+	var bestLen int
+	for i := range bases {
+		rb := &bases[i]
 		if rb.portalHost == "" || h == rb.portalHost {
 			continue // already checked in pass 1
 		}
-		if port, ok := r.resolveAgainstBase(h, rb.portalHost, rb.domain, portalPort, tlsMuxPort, normPort, isTLS); ok {
+		if rb.domain != "" && strings.HasSuffix(h, "."+rb.domain) && len(rb.domain) > bestLen {
+			bestBase = rb
+			bestLen = len(rb.domain)
+		}
+	}
+	if bestBase != nil {
+		if port, ok := r.resolveAgainstBase(h, bestBase.portalHost, bestBase.domain, portalPort, tlsMuxPort, normPort, isTLS); ok {
 			return port, true
 		}
 	}
@@ -1052,8 +1062,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		)
 
 		// Register namek orchClient in remote manager's source-agnostic registry
-		namekACME := identity.NewNamekACMEClient(identitySvc.NamekClient)
-		rm.RegisterOrchClient("namek", namekACME)
+		s.namekACME = identity.NewNamekACMEClient(identitySvc.NamekClient)
+		rm.RegisterOrchClient("namek", s.namekACME)
 
 	}
 
@@ -1063,6 +1073,11 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	identityReadyCh := eventsBus.Subscribe(events.TopicIdentityReady, 8)
 	identityChangedCh := eventsBus.Subscribe(events.TopicIdentityChanged, 8)
 	go func() {
+		// Seed with current state to avoid spurious "activated" log on boot.
+		var lastLoggedState string
+		if s.identityService != nil {
+			lastLoggedState = s.identityService.Status().State
+		}
 		for {
 			select {
 			case _, ok := <-identityReadyCh:
@@ -1078,6 +1093,32 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 				return
 			}
 			s.applyNamekState()
+			// Log identity state change to remote activity log (only on actual transitions)
+			if s.remoteManager != nil && s.identityService != nil {
+				ids := s.identityService.Status()
+				if ids.State != lastLoggedState {
+					lastLoggedState = ids.State
+					var msg string
+					switch ids.State {
+					case "active":
+						msg = "Namek remote access activated"
+					case "disabled":
+						msg = "Namek remote access disabled"
+					case "suspended":
+						msg = "Namek identity suspended by server"
+					case "not_enrolled":
+						msg = "Namek identity reset"
+					}
+					if msg != "" {
+						s.remoteManager.AppendEvent(remote.Event{
+							Timestamp: time.Now().UTC(),
+							Level:     "info",
+							Source:    "namek",
+							Message:   msg,
+						})
+					}
+				}
+			}
 		}
 	}()
 
@@ -2093,6 +2134,37 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 	s.detectRemoteTransitionAndRestart()
 }
 
+// clearNamekState tears down namek adapter and clears all namek routing/cert state.
+// Safe to call when namek is not ready or has no endpoints.
+func (s *GinServer) clearNamekState(rm *remote.Manager) {
+	s.stopNamekAdapter()
+	if rm != nil {
+		rm.UnregisterOrchClient("namek")
+	}
+	if s.remoteResolver != nil {
+		s.remoteResolver.SetRemoteBases("namek", nil)
+	}
+	if s.tlsMux != nil {
+		s.tlsMux.SetRemoteBases("namek", nil)
+		selfHostedActive := false
+		if rm != nil {
+			st := rm.Status()
+			selfHostedActive = st.Enabled && strings.TrimSpace(st.PortalHostname) != ""
+		}
+		if !selfHostedActive {
+			s.tlsMux.Stop()
+			if s.remoteResolver != nil {
+				s.remoteResolver.SetTlsMuxPort(0)
+			}
+		}
+	}
+	if s.certProvider != nil {
+		s.certProvider.SetPortalMappings("namek", nil)
+	}
+	s.recomputeFrameAncestors()
+	s.detectRemoteTransitionAndRestart()
+}
+
 // applyNamekState consolidates namek adapter lifecycle, routing, cert mappings, and cert
 // issuance into a single method. Called when identity state changes.
 // applyNamekState must only be called from the identity event subscriber goroutine.
@@ -2106,42 +2178,21 @@ func (s *GinServer) applyNamekState() {
 	ready := svc.IsEnrolled() && svc.IsEnabled() && !svc.IsSuspended()
 
 	if !ready {
-		// Stop namek adapter
-		s.stopNamekAdapter()
-		// Unregister orchClient so the renew scheduler stops renewing namek certs.
-		if rm != nil {
-			rm.UnregisterOrchClient("namek")
-		}
-		// Clear all namek state from resolver, TLS mux, cert provider, and frame-ancestors
-		if s.remoteResolver != nil {
-			s.remoteResolver.SetRemoteBases("namek", nil)
-		}
-		if s.tlsMux != nil {
-			s.tlsMux.SetRemoteBases("namek", nil)
-			selfHostedActive := false
-			if rm != nil {
-				st := rm.Status()
-				selfHostedActive = st.Enabled && strings.TrimSpace(st.PortalHostname) != ""
-			}
-			if !selfHostedActive {
-				s.tlsMux.Stop()
-				if s.remoteResolver != nil {
-					s.remoteResolver.SetTlsMuxPort(0)
-				}
-			}
-		}
-		if s.certProvider != nil {
-			s.certProvider.SetPortalMappings("namek", nil)
-		}
-		s.recomputeFrameAncestors()
-		s.detectRemoteTransitionAndRestart()
+		s.clearNamekState(rm)
 		return
 	}
 
 	idCfg := svc.DeviceConfig()
 	if len(idCfg.NexusEndpoints) == 0 {
 		log.Printf("INFO: server: namek enrolled but no nexus endpoints available")
+		s.clearNamekState(rm)
 		return
+	}
+
+	// Re-register orchClient (may have been unregistered on a prior !ready transition).
+	// Reuse the init-time instance to preserve in-flight ACME challenge state.
+	if rm != nil && s.namekACME != nil {
+		rm.RegisterOrchClient("namek", s.namekACME)
 	}
 
 	// --- Adapter lifecycle ---
@@ -2163,9 +2214,6 @@ func (s *GinServer) applyNamekState() {
 
 	s.namekMu.Lock()
 	changed := key != s.namekLastKey
-	if changed {
-		s.namekLastKey = key
-	}
 	cancel := s.namekAdapterCancel
 	adapter := s.namekAdapter
 	s.namekMu.Unlock()
@@ -2183,24 +2231,33 @@ func (s *GinServer) applyNamekState() {
 			}
 
 			if cancel != nil {
-				s.stopNamekAdapter()
+				s.stopNamekAdapter() // resets namekLastKey to ""
 			}
+
+			// Set namekLastKey AFTER stop (which resets it) to avoid restart-on-every-event.
+			s.namekMu.Lock()
+			s.namekLastKey = key
+			s.namekMu.Unlock()
 
 			ctx, newCancel := context.WithCancel(context.Background())
 			s.namekMu.Lock()
 			s.namekAdapterCancel = newCancel
 			s.namekMu.Unlock()
 
-			go func() {
+			go func(startedKey string) {
 				if err := adapter.Start(ctx); err != nil {
 					if !errors.Is(err, context.Canceled) {
 						log.Printf("WARN: server: namek adapter exited: %v", err)
 					}
+					// Only clear the key if it still matches — a newer applyNamekState
+					// may have already set a different key.
 					s.namekMu.Lock()
-					s.namekLastKey = ""
+					if s.namekLastKey == startedKey {
+						s.namekLastKey = ""
+					}
 					s.namekMu.Unlock()
 				}
-			}()
+			}(key)
 			log.Printf("INFO: server: namek adapter started (endpoint=%s, hostname=%s)", endpoint, hostname)
 		}
 	}
@@ -2237,9 +2294,9 @@ func (s *GinServer) applyNamekState() {
 
 	// --- Cert provider portal mappings ---
 	if s.certProvider != nil {
-		var mappings []remote.PortalCertMapping
+		var mappings []services.PortalCertMapping
 		if hostname != "" {
-			mappings = append(mappings, remote.PortalCertMapping{
+			mappings = append(mappings, services.PortalCertMapping{
 				Hostname: strings.TrimSuffix(strings.ToLower(hostname), "."),
 				CertName: "namek-portal",
 			})
@@ -2249,6 +2306,11 @@ func (s *GinServer) applyNamekState() {
 
 	// --- Cert issuance ---
 	if rm != nil && hostname != "" {
+		// Requeue persisted certs that may have been skipped before orchClient was registered
+		// (e.g., namek per-host certs or certs in error/pending from a prior boot).
+		// Must run BEFORE explicit enqueue to avoid double-queueing the portal/wildcard certs.
+		rm.RequeueOutstandingIssuances()
+
 		certDir := paths.CoreJoin("network-bootstrap", "remote", "certs")
 		rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 			ID: "namek-portal", Source: "namek", Solver: "dns-01",

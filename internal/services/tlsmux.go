@@ -302,11 +302,18 @@ func (m *TlsMux) resolveUpstream(host string) int {
 			return portalPort
 		}
 	}
+	// Longest domain match (consistent with resolver's PortalHostForRequest).
+	var bestDomain string
+	var bestLen int
 	for _, rb := range bases {
-		if rb.Domain != "" && host != rb.PortalHost && strings.HasSuffix(host, "."+rb.Domain) {
-			if port := m.resolveByDomain(host, rb.Domain); port != 0 {
-				return port
-			}
+		if rb.Domain != "" && host != rb.PortalHost && strings.HasSuffix(host, "."+rb.Domain) && len(rb.Domain) > bestLen {
+			bestDomain = rb.Domain
+			bestLen = len(rb.Domain)
+		}
+	}
+	if bestDomain != "" {
+		if port := m.resolveByDomain(host, bestDomain); port != 0 {
+			return port
 		}
 	}
 	return 0

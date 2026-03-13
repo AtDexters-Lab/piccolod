@@ -13,12 +13,30 @@ class RemoteSetupWizard extends StatefulWidget {
   const RemoteSetupWizard({required this.controller, super.key});
   final RemoteController controller;
 
+  /// Opens the self-hosted setup wizard as a dialog.
+  static void show(BuildContext context, RemoteController controller) {
+    unawaited(showDialog<void>(
+      context: context,
+      builder: (context) => Dialog(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 600, maxHeight: 700),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(Radii.md),
+            child: RemoteSetupWizard(controller: controller),
+          ),
+        ),
+      ),
+    ).then((_) {
+      // Reset wizard state on dismiss to avoid stale state on reopen
+      controller.resetWizardState();
+    }));
+  }
+
   @override
   State<RemoteSetupWizard> createState() => _RemoteSetupWizardState();
 }
 
 class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
-  // Step 0: Guide
   final TextEditingController _endpointCtrl = TextEditingController();
   final TextEditingController _portalCtrl = TextEditingController();
   final TextEditingController _secretCtrl = TextEditingController();
@@ -26,33 +44,24 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
   @override
   void initState() {
     super.initState();
-    // Pre-fill from status if available (e.g. resuming)
     final status = widget.controller.status;
     if (status != null) {
       if (status.endpoint != null) _endpointCtrl.text = status.endpoint!;
       if (status.portalHostname != null) _portalCtrl.text = status.portalHostname!;
 
-      // Smart Resume Logic
       if (status.state == 'preflight_required') {
-        // Check if we have the config data in status (re-running on existing config)
-        // vs first-time setup interrupted (config not yet persisted)
         if (status.endpoint != null && status.endpoint!.isNotEmpty) {
           widget.controller.wizardStep = 1;
-          // Seed pending config from status so submitConfiguration has the data
           widget.controller.seedPendingConfigFromStatus();
-          // Auto-run preflight if we are resuming into this state
           _autoRunPreflight();
         }
-        // Otherwise stay on Step 0 - user needs to re-enter config
       }
     }
 
-    // Load guide info
     unawaited(widget.controller.loadNexusGuide());
   }
 
   void _autoRunPreflight() {
-    // 1-second delay for "heads up" then run
     Timer(const Duration(seconds: 1), () {
       if (mounted && !widget.controller.isRunningPreflight && widget.controller.preflightChecks.isEmpty) {
         unawaited(widget.controller.runPreflight());
@@ -70,13 +79,161 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
 
   @override
   Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: widget.controller,
+      builder: (context, _) {
+        return Material(
+          color: PiccoloTheme.porcelain,
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(Spacing.xl),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text('Self-hosted Relay Setup', style: PiccoloTheme.textTheme.headlineMedium),
+                    IconButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      icon: const Icon(PiccoloIcons.close),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: Spacing.lg),
+                _buildStepperHeader(),
+                const SizedBox(height: Spacing.xl),
+                _buildCurrentStep(),
+                // Management actions when self-hosted is already active
+                if (_isSelfHostedActive) ...[
+                  const Divider(height: Spacing.xl * 2),
+                  _buildManagementActions(),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  bool get _isSelfHostedActive {
+    final status = widget.controller.status;
+    return status != null &&
+        status.enabled &&
+        status.portalHostname != null &&
+        status.portalHostname!.isNotEmpty;
+  }
+
+  Widget _buildManagementActions() {
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildStepperHeader(),
-        const SizedBox(height: Spacing.xl),
-        _buildCurrentStep(),
+        Text('Management', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+        const SizedBox(height: Spacing.base),
+        Row(
+          children: [
+            OutlinedButton(
+              onPressed: () => _confirmDisable(context),
+              style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.critical),
+              child: const Text('Disable'),
+            ),
+            const SizedBox(width: Spacing.base),
+            OutlinedButton(
+              onPressed: () => _confirmRotate(context),
+              child: const Text('Rotate Credentials'),
+            ),
+          ],
+        ),
       ],
     );
+  }
+
+  void _confirmDisable(BuildContext parentContext) {
+    unawaited(showDialog<void>(
+      context: parentContext,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Disable Self-hosted Remote Access?'),
+        content: const Text('This will stop the self-hosted relay connection. Managed (Piccolo Cloud) access is unaffected.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.critical),
+            onPressed: () async {
+              Navigator.pop(dialogContext);
+              await widget.controller.disableRemote();
+              if (parentContext.mounted) Navigator.of(parentContext).pop();
+            },
+            child: const Text('Disable'),
+          ),
+        ],
+      ),
+    ));
+  }
+
+  void _confirmRotate(BuildContext parentContext) {
+    unawaited(showDialog<void>(
+      context: parentContext,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Rotate Credentials?'),
+        content: const Text('This will briefly disconnect the tunnel. Ensure your configuration is backed up.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () async {
+              Navigator.pop(dialogContext);
+              final secret = await widget.controller.rotateCredentials();
+              if (secret != null && parentContext.mounted) {
+                _showSecretDialog(parentContext, secret);
+              }
+            },
+            child: const Text('Rotate'),
+          ),
+        ],
+      ),
+    ));
+  }
+
+  void _showSecretDialog(BuildContext context, String secret) {
+    unawaited(showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('New Device Secret'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Credentials rotated successfully. You must update your Nexus Relay with this new secret to reconnect.',
+              style: TextStyle(color: PiccoloTheme.ink),
+            ),
+            const SizedBox(height: Spacing.base),
+            Container(
+              padding: const EdgeInsets.all(Spacing.base),
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: PiccoloTheme.mist,
+                borderRadius: BorderRadius.circular(Radii.sm),
+                border: Border.all(color: PiccoloTheme.cobalt600),
+              ),
+              child: SelectableText(
+                secret,
+                style: PiccoloTheme.mono.copyWith(fontWeight: FontWeight.bold, fontSize: 16),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(context);
+              unawaited(widget.controller.refresh());
+            },
+            child: const Text('Done'),
+          ),
+        ],
+      ),
+    ));
   }
 
   Widget _buildStepperHeader() {
@@ -130,8 +287,6 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     }
   }
 
-  // --- Step 0: Connect (Nexus Guide) ---
-
   Widget _buildStep0Guide() {
     final guide = widget.controller.guideInfo;
     if (guide == null) return const Center(child: CircularProgressIndicator());
@@ -139,12 +294,9 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Connect to Nexus', style: PiccoloTheme.textTheme.headlineMedium),
-        const SizedBox(height: Spacing.base),
-        const Text('To enable remote access, you need a Nexus Relay. You can host your own.'),
+        const Text('To enable self-hosted remote access, you need a Nexus Relay running on your VPS.'),
         const SizedBox(height: Spacing.lg),
 
-        // Requirements
         if (guide.requirements.isNotEmpty) ...[
           Text('Prerequisites', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
           const SizedBox(height: Spacing.sm),
@@ -162,7 +314,6 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
           const SizedBox(height: Spacing.lg),
         ],
 
-        // Command
         Text('Installation', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
         const SizedBox(height: Spacing.sm),
         Container(
@@ -172,14 +323,9 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
             borderRadius: BorderRadius.circular(Radii.sm),
           ),
           width: double.infinity,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SelectableText(
-                guide.command,
-                style: PiccoloTheme.mono.copyWith(color: PiccoloTheme.success, height: 1.5),
-              ),
-            ],
+          child: SelectableText(
+            guide.command,
+            style: PiccoloTheme.mono.copyWith(color: PiccoloTheme.success, height: 1.5),
           ),
         ),
         Padding(
@@ -188,7 +334,6 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
         ),
         const SizedBox(height: Spacing.lg),
 
-        // Notes
         if (guide.notes.isNotEmpty) ...[
           Container(
             padding: const EdgeInsets.all(Spacing.md),
@@ -215,7 +360,6 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
           const SizedBox(height: Spacing.lg),
         ],
 
-        // Docs Link
         if (guide.docsUrl.isNotEmpty)
            Padding(
              padding: const EdgeInsets.only(bottom: Spacing.lg),
@@ -286,7 +430,6 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
                 _portalCtrl.text,
                 _secretCtrl.text,
               );
-              // Auto-run preflight after transition
               _autoRunPreflight();
             },
             child: const Text('Next: Run Preflight'),
@@ -296,8 +439,6 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     );
   }
 
-  // --- Step 1: Preflight & Enable ---
-
   Widget _buildStep1Preflight() {
     final allPassed = widget.controller.preflightChecks.isNotEmpty &&
         !widget.controller.preflightChecks.any((c) => c.status == 'fail');
@@ -305,8 +446,6 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Verify & Enable', style: PiccoloTheme.textTheme.headlineMedium),
-        const SizedBox(height: Spacing.base),
         const Text('Verifying your environment and connection settings.'),
         const SizedBox(height: Spacing.lg),
 
@@ -351,14 +490,18 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
 
               FilledButton(
                 onPressed: allPassed
-                    ? () => widget.controller.submitConfiguration()
-                    : null, // Disable if any check failed
+                    ? () async {
+                        await widget.controller.submitConfiguration();
+                        if (mounted && widget.controller.error == null) {
+                          Navigator.of(context).pop();
+                        }
+                      }
+                    : null,
                 child: const Text('Enable Remote Access'),
               ),
             ],
           ),
 
-        // Info box about HTTP-01
         if (allPassed) ...[
           const SizedBox(height: Spacing.lg),
           Container(
@@ -388,11 +531,10 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     );
   }
 
-  Widget _buildTextField(String label, TextEditingController ctrl, {String? hint, bool obscureText = false, void Function(String)? onChanged}) {
+  Widget _buildTextField(String label, TextEditingController ctrl, {String? hint, bool obscureText = false}) {
     return TextField(
       controller: ctrl,
       obscureText: obscureText,
-      onChanged: onChanged,
       decoration: InputDecoration(
         labelText: label,
         hintText: hint,

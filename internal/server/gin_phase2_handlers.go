@@ -116,13 +116,6 @@ func (s *GinServer) handleRemoteStatus(c *gin.Context) {
 		resp.Namek = ids.Public()
 		if ids.State == "active" {
 			resp.AnyRemoteActive = true
-			// Overlay namek state onto legacy top-level fields so existing Flutter UI
-			// reads the correct state without needing to parse the namek block.
-			if !st.Enabled {
-				resp.Status.Enabled = true
-				resp.Status.State = "active"
-				resp.Status.PortalHostname = ids.Hostname
-			}
 		}
 	}
 	c.JSON(http.StatusOK, resp)

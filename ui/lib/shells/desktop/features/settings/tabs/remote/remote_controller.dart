@@ -2,10 +2,12 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/identity_models.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/core/models/service_endpoint.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/event_stream_client.dart';
+import 'package:piccolo_os/core/services/identity_service.dart';
 import 'package:piccolo_os/core/services/remote_service.dart';
 
 class RemoteController extends ChangeNotifier {
@@ -14,7 +16,8 @@ class RemoteController extends ChangeNotifier {
       : _sharedEventStream = eventStreamClient {
     _init();
   }
-  final RemoteService _service = RemoteService();
+  final RemoteService _remoteService = RemoteService();
+  final IdentityService _identityService = IdentityService();
   bool _disposed = false;
   bool _isPolling = false;
 
@@ -23,12 +26,18 @@ class RemoteController extends ChangeNotifier {
   EventStreamClient? _ownedEventStream;
   StreamSubscription<Map<String, dynamic>>? _remoteConfigSub;
   StreamSubscription<Map<String, dynamic>>? _certificateSub;
+  StreamSubscription<Map<String, dynamic>>? _identitySub;
+
+  // Debounced refresh
+  bool _refreshScheduled = false;
 
   // State
   bool isLoading = true;
   String? error;
   bool isLocked = false;
   RemoteStatus? status;
+  IdentityStatus? identityStatus;
+  List<Portal> portals = [];
   List<RemoteEvent> events = [];
   List<RemoteAlias> aliases = [];
   List<RemoteCertificate> certificates = [];
@@ -44,13 +53,17 @@ class RemoteController extends ChangeNotifier {
   // Ephemeral configuration state for the wizard (not yet persisted to backend)
   final Map<String, dynamic> _pendingConfig = {};
 
+  // Computed properties
+  bool get hasAnyRemoteActive => portals.any((p) => p.state == 'active');
+  bool get isNamekAvailable => identityStatus?.available ?? false;
+  bool get isNamekEnrolled => identityStatus?.enrolled ?? false;
+
   void _init() {
     unawaited(refresh());
     _connectEventStream();
   }
 
   void _connectEventStream() {
-    // Use shared client if provided, otherwise create our own
     EventStreamClient client;
     if (_sharedEventStream != null) {
       client = _sharedEventStream;
@@ -60,15 +73,26 @@ class RemoteController extends ChangeNotifier {
         ..connect();
     }
 
-    // Subscribe to remote config changes
     _remoteConfigSub = client.remoteConfigEvents.listen((_) {
-      if (!_disposed) unawaited(_pollStatus());
+      _scheduleRefresh();
     });
 
-    // Subscribe to certificate status changes
     _certificateSub = client.certificateEvents.listen((_) {
-      if (!_disposed) unawaited(_pollStatus());
+      _scheduleRefresh();
     });
+
+    _identitySub = client.identityEvents.listen((_) {
+      _scheduleRefresh();
+    });
+  }
+
+  void _scheduleRefresh() {
+    if (_refreshScheduled || _disposed) return;
+    _refreshScheduled = true;
+    unawaited(Future.microtask(() async {
+      _refreshScheduled = false;
+      if (!_disposed) await _pollStatus();
+    }));
   }
 
   @override
@@ -76,7 +100,7 @@ class RemoteController extends ChangeNotifier {
     _disposed = true;
     unawaited(_remoteConfigSub?.cancel());
     unawaited(_certificateSub?.cancel());
-    // Only dispose the event stream if we own it
+    unawaited(_identitySub?.cancel());
     _ownedEventStream?.dispose();
     super.dispose();
   }
@@ -102,19 +126,28 @@ class RemoteController extends ChangeNotifier {
     _isPolling = true;
 
     try {
-      status = await _service.getStatus();
+      // Fetch remote status and identity status in parallel
+      late final RemoteStatus remoteResult;
+      await Future.wait([
+        _remoteService.getStatus().then((v) => remoteResult = v),
+        _fetchIdentityStatus(),
+      ]);
+      status = remoteResult;
       error = null;
       isLocked = false;
+      _computePortals();
       await _fetchLists();
     } on Object catch (e) {
       if (e is ApiException && e.statusCode == 423) {
         isLocked = true;
         error = null;
         status = null;
+        portals = [];
       } else {
         error = e.toString();
         isLocked = false;
         status = null;
+        portals = [];
       }
     } finally {
       _isPolling = false;
@@ -123,11 +156,55 @@ class RemoteController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<IdentityStatus?> _fetchIdentityStatus() async {
+    try {
+      final ids = await _identityService.getStatus();
+      identityStatus = ids;
+      return ids;
+    } on Object catch (e) {
+      // 503 = identity service unavailable (no TPM)
+      if (e is ApiException && e.statusCode == 503) {
+        identityStatus = null;
+        return null;
+      }
+      debugPrint('Failed to fetch identity status: $e');
+      return identityStatus; // keep previous value
+    }
+  }
+
+  void _computePortals() {
+    final result = <Portal>[];
+
+    // Namek portal (primary — listed first)
+    final ids = identityStatus;
+    if (ids != null && ids.state == 'active' && ids.nexusEndpoints.isNotEmpty) {
+      result.add(Portal(
+        source: PortalSource.namek,
+        hostname: ids.resolvedHostname ?? '',
+        state: 'active',
+        endpoint: ids.nexusEndpoints.isNotEmpty ? ids.nexusEndpoints.first : null,
+      ));
+    }
+
+    // Self-hosted portal
+    final st = status;
+    if (st != null && st.enabled && st.portalHostname != null && st.portalHostname!.isNotEmpty) {
+      result.add(Portal(
+        source: PortalSource.selfHosted,
+        hostname: st.portalHostname!,
+        state: st.state,
+        endpoint: st.endpoint,
+      ));
+    }
+
+    portals = result;
+  }
+
   Future<void> _fetchLists() async {
     if (_disposed) return;
     try {
-      aliases = await _service.getAliases();
-      certificates = await _service.getCertificates();
+      aliases = await _remoteService.getAliases();
+      certificates = await _remoteService.getCertificates();
     } on Object catch (e) {
       debugPrint('Failed to fetch lists: $e');
     }
@@ -136,7 +213,7 @@ class RemoteController extends ChangeNotifier {
   Future<void> fetchServices() async {
     if (_disposed) return;
     try {
-      services = await _service.getServices();
+      services = await _remoteService.getServices();
     } on Object catch (e) {
       debugPrint('Failed to fetch services: $e');
     }
@@ -145,7 +222,7 @@ class RemoteController extends ChangeNotifier {
   Future<void> _fetchEvents() async {
     if (_disposed) return;
     try {
-      events = await _service.getEvents();
+      events = await _remoteService.getEvents();
     } on Object catch (e) {
       debugPrint('Failed to fetch remote events: $e');
     }
@@ -158,13 +235,11 @@ class RemoteController extends ChangeNotifier {
     if (status == null) return;
     if (status!.endpoint != null) _pendingConfig['endpoint'] = status!.endpoint;
     if (status!.portalHostname != null) _pendingConfig['portal_hostname'] = status!.portalHostname;
-    // Note: device_secret is not returned in status for security reasons
-    // When resuming, the backend will use the existing stored secret
   }
 
   Future<void> loadNexusGuide() async {
     try {
-      guideInfo = await _service.getNexusGuide();
+      guideInfo = await _remoteService.getNexusGuide();
       if (_disposed) return;
       notifyListeners();
     } on Object catch (e) {
@@ -176,20 +251,18 @@ class RemoteController extends ChangeNotifier {
 
   Future<void> verifyNexusGuide(String endpoint, String portal, String secret) async {
     try {
-      // Validate with backend (stateless)
-      await _service.verifyNexusGuide({
+      await _remoteService.verifyNexusGuide({
         'endpoint': endpoint,
         'portal_hostname': portal,
         'jwt_secret': secret,
       });
       if (_disposed) return;
 
-      // Store in memory for subsequent steps
       _pendingConfig['endpoint'] = endpoint;
       _pendingConfig['portal_hostname'] = portal;
       _pendingConfig['device_secret'] = secret;
 
-      wizardStep = 1; // Move to preflight
+      wizardStep = 1;
       notifyListeners();
     } on Object catch (e) {
       if (_disposed) return;
@@ -202,14 +275,12 @@ class RemoteController extends ChangeNotifier {
     isRunningPreflight = true;
     notifyListeners();
     try {
-      // Pass pending config if we are in the wizard flow (step 1)
-      // Otherwise (re-running on active) pass null/empty
       Map<String, dynamic>? configPayload;
       if (_pendingConfig.isNotEmpty && wizardStep > 0) {
         configPayload = Map<String, dynamic>.from(_pendingConfig);
       }
 
-      preflightChecks = await _service.runPreflight(configPayload);
+      preflightChecks = await _remoteService.runPreflight(configPayload);
       if (_disposed) return;
     } on Object catch (e) {
       if (_disposed) return;
@@ -226,12 +297,9 @@ class RemoteController extends ChangeNotifier {
     isSubmittingConfig = true;
     notifyListeners();
     try {
-      // Submit the pending config (endpoint, device_secret, portal_hostname)
-      // HTTP-01 solver is implicit on the backend for user-managed mode
-      await _service.configure(_pendingConfig);
+      await _remoteService.configure(_pendingConfig);
       if (_disposed) return;
 
-      // Clear pending state on success
       _pendingConfig.clear();
 
       await refresh();
@@ -248,11 +316,18 @@ class RemoteController extends ChangeNotifier {
     }
   }
 
-  // --- Management ---
+  /// Resets wizard state to avoid stale state on reopen.
+  void resetWizardState() {
+    wizardStep = 0;
+    _pendingConfig.clear();
+    preflightChecks = [];
+  }
+
+  // --- Self-hosted Management ---
 
   Future<void> disableRemote() async {
     try {
-      await _service.disable();
+      await _remoteService.disable();
       if (_disposed) return;
       wizardStep = 0;
       await refresh();
@@ -265,7 +340,7 @@ class RemoteController extends ChangeNotifier {
 
   Future<String?> rotateCredentials() async {
     try {
-      final secret = await _service.rotateCredentials();
+      final secret = await _remoteService.rotateCredentials();
       if (_disposed) return null;
       return secret;
     } on Object catch (e) {
@@ -278,7 +353,7 @@ class RemoteController extends ChangeNotifier {
 
   Future<void> renewCertificate(String id) async {
     try {
-      await _service.renewCertificate(id);
+      await _remoteService.renewCertificate(id);
       if (_disposed) return;
       await refresh();
     } on Object catch (e) {
@@ -290,7 +365,7 @@ class RemoteController extends ChangeNotifier {
 
   Future<void> addAlias(String hostname, String listener) async {
     try {
-      await _service.addAlias(hostname, listener);
+      await _remoteService.addAlias(hostname, listener);
       if (_disposed) return;
       await refresh();
     } on Object catch (e) {
@@ -302,12 +377,46 @@ class RemoteController extends ChangeNotifier {
 
   Future<void> deleteAlias(String id) async {
     try {
-      await _service.removeAlias(id);
+      await _remoteService.removeAlias(id);
       if (_disposed) return;
       await refresh();
     } on Object catch (e) {
       if (_disposed) return;
       error = 'Failed to delete alias: $e';
+      notifyListeners();
+    }
+  }
+
+  // --- Namek Management ---
+
+  Future<void> enrollNamek() async {
+    await _runIdentityAction('enroll', _identityService.enroll);
+  }
+
+  Future<void> enableNamek() async {
+    await _runIdentityAction('enable namek', _identityService.enable);
+  }
+
+  Future<void> disableNamek() async {
+    await _runIdentityAction('disable namek', _identityService.disable);
+  }
+
+  Future<void> setNamekHostname(String hostname) async {
+    await _runIdentityAction('set hostname', () => _identityService.setHostname(hostname));
+  }
+
+  Future<void> setNamekUrl(String url) async {
+    await _runIdentityAction('set namek URL', () => _identityService.setNamekUrl(url));
+  }
+
+  Future<void> _runIdentityAction(String label, Future<void> Function() action) async {
+    try {
+      await action();
+      if (_disposed) return;
+      await refresh();
+    } on Object catch (e) {
+      if (_disposed) return;
+      error = 'Failed to $label: $e';
       notifyListeners();
     }
   }

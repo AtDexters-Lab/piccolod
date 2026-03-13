@@ -1,13 +1,13 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/namek_management_section.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/portal_list_card.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_aliases_card.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_certificates_card.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_events_card.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_setup_wizard.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 class RemoteDashboard extends StatelessWidget {
 
@@ -16,47 +16,52 @@ class RemoteDashboard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final status = controller.status!;
+    final status = controller.status;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildHeader(context),
         const SizedBox(height: Spacing.lg),
-        if (status.warnings.isNotEmpty) ...[
+        if (status != null && status.warnings.isNotEmpty) ...[
           _buildWarnings(context, status.warnings),
           const SizedBox(height: Spacing.lg),
         ],
-        _buildInfoCards(context),
+        PortalListCard(controller: controller),
+        const SizedBox(height: Spacing.lg),
+        NamekManagementSection(controller: controller),
+        const SizedBox(height: Spacing.lg),
+        _buildSelfHostedSection(context),
         const SizedBox(height: Spacing.lg),
         RemoteCertificatesCard(controller: controller),
         const SizedBox(height: Spacing.lg),
         RemoteAliasesCard(controller: controller),
         const SizedBox(height: Spacing.lg),
-        RemoteEventsCard(controller: controller), // [P2] Added
-        const SizedBox(height: Spacing.xl),
-        const Divider(),
-        const SizedBox(height: Spacing.xl),
-        _buildDangerZone(context),
+        RemoteEventsCard(controller: controller),
       ],
     );
   }
 
   Widget _buildHeader(BuildContext context) {
-    final status = controller.status!;
-    var statusColor = PiccoloTheme.success;
-    var statusText = 'Active';
-    var statusIcon = PiccoloIcons.success;
+    var statusColor = PiccoloTheme.inkMuted;
+    var statusText = 'Inactive';
+    var statusIcon = PiccoloIcons.cloudOff;
 
-    if (status.state == 'error' || status.warnings.isNotEmpty) {
-      statusColor = PiccoloTheme.warning;
-      statusText = 'Degraded';
-      statusIcon = PiccoloIcons.warning;
+    if (controller.hasAnyRemoteActive) {
+      statusColor = PiccoloTheme.success;
+      statusText = 'Active';
+      statusIcon = PiccoloIcons.success;
     }
-    if (status.state == 'error') {
+
+    final status = controller.status;
+    if (status != null && status.state == 'error') {
       statusColor = PiccoloTheme.critical;
       statusText = 'Error';
       statusIcon = PiccoloIcons.error;
+    } else if (status != null && status.warnings.isNotEmpty) {
+      statusColor = PiccoloTheme.warning;
+      statusText = 'Degraded';
+      statusIcon = PiccoloIcons.warning;
     }
 
     return Row(
@@ -72,12 +77,6 @@ class RemoteDashboard extends StatelessWidget {
                 Icon(statusIcon, color: statusColor, size: 20),
                 const SizedBox(width: Spacing.sm),
                 Text(statusText, style: TextStyle(color: statusColor, fontWeight: FontWeight.bold)),
-                if (status.latencyMs != null) ...[
-                  const SizedBox(width: Spacing.base),
-                  const Icon(PiccoloIcons.gauge, size: 16, color: PiccoloTheme.inkMuted),
-                  const SizedBox(width: Spacing.xs),
-                  Text('${status.latencyMs}ms latency', style: PiccoloTheme.textTheme.labelSmall),
-                ],
               ],
             ),
           ],
@@ -115,250 +114,49 @@ class RemoteDashboard extends StatelessWidget {
     );
   }
 
-  Widget _buildInfoCards(BuildContext context) {
-    final status = controller.status!;
-    return Row(
-      children: [
-        Expanded(
-          child: _InfoCard(
-            label: 'Portal Hostname',
-            value: status.portalHostname ?? 'Not Configured',
-            icon: PiccoloIcons.link,
-            onTap: status.portalHostname != null && status.portalHostname!.isNotEmpty
-                ? () => launchUrl(Uri.parse('https://${status.portalHostname}'))
-                : null,
-          ),
-        ),
-        const SizedBox(width: Spacing.base),
-        Expanded(
-          child: _InfoCard(
-            label: 'Nexus Relay',
-            value: status.endpoint ?? 'Unknown',
-            icon: PiccoloIcons.router,
-          ),
-        ),
-      ],
-    );
-  }
+  Widget _buildSelfHostedSection(BuildContext context) {
+    final status = controller.status;
+    final selfHostedActive = status != null &&
+        status.enabled &&
+        status.portalHostname != null &&
+        status.portalHostname!.isNotEmpty;
 
-  Widget _buildDangerZone(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text('Danger Zone', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold, color: PiccoloTheme.critical)),
-        const SizedBox(height: Spacing.base),
-        Container(
-          padding: const EdgeInsets.all(Spacing.base),
-          decoration: BoxDecoration(
-            border: Border.all(color: PiccoloTheme.critical.withValues(alpha: 0.3)),
-            borderRadius: BorderRadius.circular(Radii.sm),
-          ),
-          child: Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Disable Remote Access', style: TextStyle(fontWeight: FontWeight.bold)),
-                    Text('This will immediately stop external access to your device.', style: PiccoloTheme.textTheme.labelSmall),
-                  ],
-                ),
-              ),
-              OutlinedButton(
-                onPressed: () => _confirmDisable(context),
-                style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.critical),
-                child: const Text('Disable'),
-              ),
-            ],
-          ),
+    if (selfHostedActive) {
+      return Container(
+        padding: const EdgeInsets.all(Spacing.base),
+        decoration: BoxDecoration(
+          color: PiccoloTheme.porcelain,
+          borderRadius: BorderRadius.circular(Radii.sm),
+          boxShadow: Elevation.elev1,
         ),
-        const SizedBox(height: Spacing.base),
-        Container(
-          padding: const EdgeInsets.all(Spacing.base),
-          decoration: BoxDecoration(
-            border: Border.all(color: PiccoloTheme.inkMuted.withValues(alpha: 0.3)),
-            borderRadius: BorderRadius.circular(Radii.sm),
-          ),
-          child: Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Rotate Device Secret', style: TextStyle(fontWeight: FontWeight.bold)),
-                    Text('Invalidates the current authentication token with the Nexus relay.', style: PiccoloTheme.textTheme.labelSmall),
-                  ],
-                ),
-              ),
-              OutlinedButton(
-                onPressed: () => _confirmRotate(context),
-                child: const Text('Rotate Secret'),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  void _confirmDisable(BuildContext parentContext) {
-    unawaited(showDialog<void>(
-      context: parentContext,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Disable Remote Access?'),
-        content: const Text('You will lose access to this dashboard from the internet. You must be on the local network to re-enable it.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.critical),
-            onPressed: () async {
-              final messenger = ScaffoldMessenger.of(parentContext);
-              Navigator.pop(dialogContext);
-              await controller.disableRemote();
-              messenger.showSnackBar(
-                const SnackBar(content: Text('Remote access disabled')),
-              );
-            },
-            child: const Text('Disable'),
-          ),
-        ],
-      ),
-    ));
-  }
-
-  void _confirmRotate(BuildContext parentContext) {
-    unawaited(showDialog<void>(
-      context: parentContext,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Rotate Credentials?'),
-        content: const Text('This will briefly disconnect the tunnel. Ensure your configuration is backed up.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
-          FilledButton(
-            onPressed: () async {
-              Navigator.pop(dialogContext); // Close confirm dialog
-              final secret = await controller.rotateCredentials();
-              if (secret != null && parentContext.mounted) {
-                _showSecretDialog(parentContext, secret, onDismiss: controller.refresh);
-              }
-            },
-            child: const Text('Rotate'),
-          ),
-        ],
-      ),
-    ));
-  }
-
-  void _showSecretDialog(BuildContext context, String secret, {VoidCallback? onDismiss}) {
-    unawaited(showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('New Device Secret'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
+        child: Row(
           children: [
-            const Text(
-              'Credentials rotated successfully. You must update your Nexus Relay with this new secret to reconnect.',
-              style: TextStyle(color: PiccoloTheme.ink),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Self-hosted Relay', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: Spacing.xs),
+                  Text('Endpoint: ${status.endpoint ?? "Unknown"}', style: PiccoloTheme.textTheme.labelSmall),
+                  Text('Hostname: ${status.portalHostname}', style: PiccoloTheme.textTheme.labelSmall),
+                ],
+              ),
             ),
-            const SizedBox(height: Spacing.base),
-            Container(
-              padding: const EdgeInsets.all(Spacing.base),
-              width: double.infinity,
-              decoration: BoxDecoration(
-                color: PiccoloTheme.mist,
-                borderRadius: BorderRadius.circular(Radii.sm),
-                border: Border.all(color: PiccoloTheme.cobalt600),
-              ),
-              child: SelectableText(
-                secret,
-                style: PiccoloTheme.mono.copyWith(fontWeight: FontWeight.bold, fontSize: 16),
-              ),
+            OutlinedButton(
+              onPressed: () => RemoteSetupWizard.show(context, controller),
+              child: const Text('Manage'),
             ),
           ],
         ),
-        actions: [
-          FilledButton(
-            onPressed: () {
-              Navigator.pop(context);
-              onDismiss?.call();
-            },
-            child: const Text('Done'),
-          ),
-        ],
-      ),
-    ));
-  }
-}
+      );
+    }
 
-class _InfoCard extends StatelessWidget {
-
-  const _InfoCard({
-    required this.label,
-    required this.value,
-    required this.icon,
-    this.onTap,
-  });
-  final String label;
-  final String value;
-  final IconData icon;
-  final VoidCallback? onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final isLink = onTap != null;
-    return Container(
-      padding: const EdgeInsets.all(Spacing.base),
-      decoration: BoxDecoration(
-        color: PiccoloTheme.porcelain,
-        borderRadius: BorderRadius.circular(Radii.sm),
-        boxShadow: Elevation.elev1,
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(icon, size: 16, color: PiccoloTheme.cobalt600),
-              const SizedBox(width: Spacing.sm),
-              Text(label, style: PiccoloTheme.textTheme.labelSmall),
-            ],
-          ),
-          const SizedBox(height: Spacing.sm),
-          if (isLink)
-            MouseRegion(
-              cursor: SystemMouseCursors.click,
-              child: GestureDetector(
-                onTap: onTap,
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Flexible(
-                      child: Text(
-                        value,
-                        style: const TextStyle(
-                          fontWeight: FontWeight.w600,
-                          fontSize: 15,
-                          color: PiccoloTheme.cobalt600,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    const SizedBox(width: Spacing.xs),
-                    const Icon(PiccoloIcons.openExternal, size: 14, color: PiccoloTheme.cobalt600),
-                  ],
-                ),
-              ),
-            )
-          else
-            Text(
-              value,
-              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
-              overflow: TextOverflow.ellipsis,
-            ),
-        ],
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        onPressed: () => RemoteSetupWizard.show(context, controller),
+        icon: const Icon(PiccoloIcons.router, size: 16),
+        label: const Text('Advanced: Set up your own relay'),
       ),
     );
   }

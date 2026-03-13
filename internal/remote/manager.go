@@ -314,6 +314,19 @@ func (m *Manager) UnregisterOrchClient(source string) {
 	m.adapterMu.Unlock()
 }
 
+// AppendEvent appends an event to the persisted activity log.
+// Safe for concurrent use. Uses the lock-persist-publish pattern.
+func (m *Manager) AppendEvent(evt Event) {
+	if m == nil {
+		return
+	}
+	m.cfgMu.Lock()
+	cfg := m.currentConfigLocked()
+	m.appendEventWithRetention(cfg, evt)
+	// save() releases cfgMu.Lock() and publishes config changed.
+	_ = m.save(cfg)
+}
+
 // CertIssuanceRequest is the public API for enqueuing cert issuance from external sources.
 type CertIssuanceRequest struct {
 	ID         string

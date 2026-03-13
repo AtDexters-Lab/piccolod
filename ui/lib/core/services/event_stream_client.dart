@@ -40,6 +40,8 @@ class EventStreamClient extends ChangeNotifier {
       StreamController<Map<String, dynamic>>.broadcast();
   final StreamController<NetworkPeersEvent> _networkPeersController =
       StreamController<NetworkPeersEvent>.broadcast();
+  final StreamController<Map<String, dynamic>> _identityController =
+      StreamController<Map<String, dynamic>>.broadcast();
 
   /// Called when a reconnect attempt indicates an auth failure (e.g. session expired).
   /// Set by the shell to trigger the re-auth overlay for passive WebSocket-only failures.
@@ -70,6 +72,10 @@ class EventStreamClient extends ChangeNotifier {
   /// Stream of network peers events.
   Stream<NetworkPeersEvent> get networkPeersEvents =>
       _networkPeersController.stream;
+
+  /// Stream of identity status events (payload is raw JSON).
+  Stream<Map<String, dynamic>> get identityEvents =>
+      _identityController.stream;
 
   WebSocketConnectionState get state => _connection.state;
 
@@ -166,6 +172,8 @@ class EventStreamClient extends ChangeNotifier {
           final event = NetworkPeersEvent.fromJson(payload);
           _lastNetworkPeersEvent = event;
           _networkPeersController.add(event);
+        case 'identity':
+          _identityController.add(payload);
       }
     } on Object catch (e) {
       debugPrint('Event stream decode error: $e');
@@ -186,6 +194,7 @@ class EventStreamClient extends ChangeNotifier {
     unawaited(_remoteConfigController.close());
     unawaited(_certificateController.close());
     unawaited(_networkPeersController.close());
+    unawaited(_identityController.close());
     super.dispose();
   }
 }

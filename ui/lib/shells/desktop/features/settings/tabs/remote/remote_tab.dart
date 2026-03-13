@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/services/event_stream_client.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_dashboard.dart';
-import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_setup_wizard.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
@@ -37,7 +36,7 @@ class _RemoteTabState extends State<RemoteTab> {
     return ListenableBuilder(
       listenable: _controller,
       builder: (context, child) {
-        if (_controller.isLoading && _controller.status == null) {
+        if (_controller.isLoading && _controller.status == null && _controller.identityStatus == null) {
           return const Center(child: CircularProgressIndicator());
         }
 
@@ -66,7 +65,7 @@ class _RemoteTabState extends State<RemoteTab> {
           );
         }
 
-        // [P1] Locked UI
+        // Locked UI
         if (_controller.isLocked) {
            return Center(
              child: Column(
@@ -84,7 +83,6 @@ class _RemoteTabState extends State<RemoteTab> {
                    textAlign: TextAlign.center,
                    style: PiccoloTheme.textTheme.bodyMedium,
                  ),
-                 // In a real app, we might have a button to trigger unlock or just tell them to use the main unlock flow.
                ],
              ),
            );
@@ -104,16 +102,8 @@ class _RemoteTabState extends State<RemoteTab> {
           );
         }
 
-        final state = _controller.status?.state ?? 'disabled';
-
-        Widget content;
-
-        // Allow wizard to handle 'provisioning' so user can resume/reset
-        if (state == 'disabled' || state == 'stopped' || state == 'provisioning') {
-           content = RemoteSetupWizard(controller: _controller);
-        } else {
-           content = RemoteDashboard(controller: _controller);
-        }
+        // Always show dashboard — it handles zero-state via portal list card
+        final Widget content = RemoteDashboard(controller: _controller);
 
         if (_controller.error != null) {
           return Column(
@@ -140,8 +130,6 @@ class _RemoteTabState extends State<RemoteTab> {
                     IconButton(
                       icon: const Icon(PiccoloIcons.close, color: PiccoloTheme.critical, size: 20),
                       onPressed: () {
-                         // We need a way to clear the error.
-                         // Ideally controller should have clearError() but for now we can just trigger a refresh which clears it.
                          unawaited(_controller.refresh());
                       },
                     ),

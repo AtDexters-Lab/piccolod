@@ -22,6 +22,7 @@ const (
 	topicRemoteConfig   = "remote_config"
 	topicCertificate    = "certificate"
 	topicNetworkPeers   = "network_peers"
+	topicIdentity       = "identity"
 )
 
 var supportedTopics = map[string]events.Topic{
@@ -30,6 +31,7 @@ var supportedTopics = map[string]events.Topic{
 	topicRemoteConfig:   events.TopicRemoteConfigChanged,
 	topicCertificate:    events.TopicCertificateChanged,
 	topicNetworkPeers:   events.TopicNetworkPeersChanged,
+	topicIdentity:       events.TopicIdentityChanged,
 }
 
 type streamMessage struct {
@@ -42,7 +44,7 @@ type streamMessage struct {
 //
 // Query parameters:
 //   - topics: (optional) comma-separated list of topics to subscribe to.
-//     Supported: app_status, listener_health, remote_config, certificate, network_peers
+//     Supported: app_status, listener_health, remote_config, certificate, network_peers, identity
 //     If omitted, subscribes to all topics.
 //     network_peers is automatically stripped for remote clients (via Nexus proxy).
 //
@@ -53,6 +55,7 @@ type streamMessage struct {
 //	{ "type": "remote_config", "payload": remote.Status }
 //	{ "type": "certificate", "payload": CertificateChangedEvent }
 //	{ "type": "network_peers", "payload": NetworkPeersChangedEvent }
+//	{ "type": "identity", "payload": IdentityStatusPayload }
 //
 // Keep-alive uses WebSocket Ping frames (not application-level messages).
 //
@@ -193,6 +196,9 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 	if requestedTopics[topicRemoteConfig] && isAdmin {
 		s.sendInitialRemoteConfig(sendJSON)
 	}
+	if requestedTopics[topicIdentity] && isAdmin {
+		s.sendInitialIdentityStatus(sendJSON)
+	}
 	if requestedTopics[topicNetworkPeers] {
 		s.sendInitialNetworkPeers(sendJSON)
 	}
@@ -296,6 +302,12 @@ func (s *GinServer) processEvent(topic string, evt events.Event, isAppAllowed fu
 			return nil
 		}
 		return &streamMessage{Type: topicNetworkPeers, Payload: payload}
+
+	case topicIdentity:
+		if !isAdmin {
+			return nil
+		}
+		return s.buildIdentitySnapshot()
 	}
 	return nil
 }
@@ -372,6 +384,26 @@ func (s *GinServer) sendInitialNetworkPeers(sendJSON func(any) error) {
 		Type:    topicNetworkPeers,
 		Payload: s.mdnsManager.SnapshotPeersForEvent(),
 	})
+}
+
+// buildIdentitySnapshot constructs a stream message matching the REST handleIdentityStatus shape.
+func (s *GinServer) buildIdentitySnapshot() *streamMessage {
+	svc := s.identityService
+	if svc == nil {
+		return nil
+	}
+	return &streamMessage{
+		Type:    topicIdentity,
+		Payload: buildIdentityPayload(svc),
+	}
+}
+
+// sendInitialIdentityStatus sends the current identity status snapshot.
+func (s *GinServer) sendInitialIdentityStatus(sendJSON func(any) error) {
+	msg := s.buildIdentitySnapshot()
+	if msg != nil {
+		_ = sendJSON(*msg)
+	}
 }
 
 // toEventsListenerHealth converts services.ListenerHealth to events.ListenerHealth.

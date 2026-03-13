@@ -307,6 +307,7 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 	s.mu.Unlock()
 
 	s.enrolled.Store(false)
+	s.suspended.Store(false)
 
 	if err := saveConfig(s.configPath, cfg); err != nil {
 		return err

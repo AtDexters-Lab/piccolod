@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
+	"piccolod/internal/identity"
 )
 
 func (s *GinServer) registerIdentityRoutes(rg *gin.RouterGroup) {
@@ -27,11 +29,18 @@ func (s *GinServer) handleIdentityStatus(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
 		return
 	}
+	c.JSON(http.StatusOK, buildIdentityPayload(svc))
+}
+
+// buildIdentityPayload constructs the identity status map used by both the
+// REST handler and WebSocket snapshot. Kept in one place to avoid drift.
+func buildIdentityPayload(svc *identity.Service) map[string]any {
 	cfg := svc.DeviceConfig()
-	c.JSON(http.StatusOK, gin.H{
+	return map[string]any{
 		"enabled":         cfg.Enabled,
 		"available":       svc.IsAvailable(),
 		"enrolled":        svc.IsEnrolled(),
+		"suspended":       svc.IsSuspended(),
 		"device_id":       cfg.DeviceID,
 		"hostname":        cfg.Hostname,
 		"base_domain":     cfg.BaseDomain,
@@ -39,7 +48,7 @@ func (s *GinServer) handleIdentityStatus(c *gin.Context) {
 		"identity_class":  cfg.IdentityClass,
 		"nexus_endpoints": cfg.NexusEndpoints,
 		"namek_url":       cfg.NamekURL,
-	})
+	}
 }
 
 func (s *GinServer) handleIdentityEnroll(c *gin.Context) {
@@ -102,11 +111,8 @@ func (s *GinServer) handleIdentitySetHostname(c *gin.Context) {
 		return
 	}
 	req.Hostname = strings.TrimSpace(strings.ToLower(req.Hostname))
-	if req.Hostname == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "hostname is required"})
-		return
-	}
-	if !isValidDNSLabel(req.Hostname) {
+	// Empty hostname clears the custom hostname (reverts to default enrolled hostname).
+	if req.Hostname != "" && !isValidDNSLabel(req.Hostname) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "hostname must be a valid DNS label (lowercase alphanumeric and hyphens, 1-63 chars, no leading/trailing hyphens)"})
 		return
 	}

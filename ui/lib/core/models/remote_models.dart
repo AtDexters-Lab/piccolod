@@ -1,3 +1,19 @@
+enum PortalSource { namek, selfHosted }
+
+class Portal {
+
+  Portal({
+    required this.source,
+    required this.hostname,
+    required this.state,
+    this.endpoint,
+  });
+  final PortalSource source;
+  final String hostname;
+  final String state;
+  final String? endpoint;
+}
+
 class RemoteStatus {
 
   RemoteStatus({
