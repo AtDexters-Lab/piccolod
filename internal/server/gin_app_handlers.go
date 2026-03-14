@@ -148,6 +148,21 @@ func (s *GinServer) portalCertEntries() []portalCertEntry {
 				})
 			}
 		}
+
+		// Alias domains — HTTP-01 per-app certs (source-agnostic: works for both
+		// self-hosted and namek traffic paths). Only include when at least one remote
+		// access path is active (self-hosted enabled or namek active), since HTTP-01
+		// challenges require the domain to be reachable.
+		if st.Enabled || s.namekDomainActive() {
+			for _, a := range rm.ListAliases() {
+				h := normalizeHostname(a.Hostname)
+				if h != "" {
+					entries = append(entries, portalCertEntry{
+						Hostname: h, Source: "alias", Solver: "http-01",
+					})
+				}
+			}
+		}
 	}
 	// Namek portals use DNS-01 → wildcard coverage → no per-app certs needed.
 	return entries
@@ -182,6 +197,23 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 				Domains: []string{host}, CommonName: host,
 			})
 		}
+	}
+}
+
+// removePerAppCertsForBase removes per-app host certs (host:<label>.<base>) for all endpoints.
+// Called when an alias is deleted to clean up orphaned per-app certs.
+func (s *GinServer) removePerAppCertsForBase(base string) {
+	rm := s.remoteManager
+	sm := s.serviceManager
+	if rm == nil || sm == nil || base == "" {
+		return
+	}
+	endpoints := sm.GetAll()
+	for _, ep := range endpoints {
+		if ep.DerivedHostLabel == "" {
+			continue
+		}
+		rm.RemoveHostnameCertificate(ep.DerivedHostLabel + "." + base)
 	}
 }
 

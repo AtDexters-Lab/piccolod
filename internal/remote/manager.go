@@ -59,12 +59,10 @@ type Config struct {
 
 // Alias represents a remote alias domain attached to a listener.
 type Alias struct {
-	ID          string     `json:"id"`
-	Hostname    string     `json:"hostname"`
-	Listener    string     `json:"listener"`
-	Status      string     `json:"status"`
-	LastChecked *time.Time `json:"last_checked,omitempty"`
-	Message     string     `json:"message,omitempty"`
+	ID       string `json:"id"`
+	Hostname string `json:"hostname"`
+	Listener string `json:"listener"`
+	Status   string `json:"status"`
 }
 
 // Certificate captures basic certificate metadata for the inventory table.
@@ -686,11 +684,11 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 
 	log.Printf("remote: configured (solver=http-01, portal=%s)", portalHost)
 
-	// Queue issuance jobs after releasing lock (enqueueIssuanceWithForce acquires its own lock).
+	// Queue issuance jobs after releasing lock (enqueueIssuanceJob acquires its own lock).
 	// Force=true because defaultCertificates seeds optimistic "ok" entries; without force the
 	// duplicate guard would skip issuance since NextRenewal is in the future.
 	// User-managed mode only issues portal cert (no wildcard - HTTP-01 doesn't support it)
-	m.enqueueIssuanceWithForce("portal", []string{portalHost}, portalHost, true)
+	m.enqueueIssuanceJob(issuanceJob{id: "portal", domains: []string{portalHost}, commonName: portalHost, force: true})
 	return nil
 }
 
@@ -776,15 +774,15 @@ func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
 
 	log.Printf("remote: configured (solver=dns-01, managed=true, portal=%s)", portalHost)
 
-	// Queue issuance jobs after releasing lock (enqueueIssuanceWithForce acquires its own lock).
+	// Queue issuance jobs after releasing lock (enqueueIssuanceJob acquires its own lock).
 	// Force=true because defaultCertificates seeds optimistic "ok" entries; without force the
 	// duplicate guard would skip issuance since NextRenewal is in the future.
-	m.enqueueIssuanceWithForce("portal", []string{portalHost}, portalHost, true)
+	m.enqueueIssuanceJob(issuanceJob{id: "portal", domains: []string{portalHost}, commonName: portalHost, force: true})
 	// Managed mode supports wildcard via DNS-01
 	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portalHost)), ".")
 	if base != "" {
 		cn := "*." + base
-		m.enqueueIssuanceWithForce("wildcard", []string{cn, base}, cn, true)
+		m.enqueueIssuanceJob(issuanceJob{id: "wildcard", domains: []string{cn, base}, commonName: cn, force: true})
 	}
 	return nil
 }
@@ -870,7 +868,6 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 		Hostname: hostname,
 		Listener: listener,
 		Status:   "pending",
-		Message:  "Awaiting DNS verification",
 	}
 	cfg.Aliases = append(cfg.Aliases, alias)
 	cfg.Events = append(cfg.Events, Event{
@@ -883,8 +880,14 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 	if err := m.save(cfg); err != nil {
 		return Alias{}, err
 	}
-	// Queue issuance for the alias hostname (listener-specific cert)
-	m.enqueueIssuance("alias:"+strings.ToLower(hostname), []string{strings.ToLower(hostname)}, strings.ToLower(hostname))
+	// Queue issuance for the alias hostname — always HTTP-01 (alias domains use user DNS, not namek PowerDNS)
+	h := strings.ToLower(hostname)
+	m.enqueueIssuanceJob(issuanceJob{
+		id:         "alias:" + h,
+		domains:    []string{h},
+		commonName: h,
+		solver:     "http-01",
+	})
 	return alias, nil
 }
 
@@ -1543,15 +1546,6 @@ type issuanceJob struct {
 	solver     string                 // override solver (e.g., "dns-01" for namek)
 	orchClient acme.OrchestratorClient // override orchestrator client for DNS-01
 	certDir    string                 // override cert output directory
-}
-
-// enqueueIssuance records pending inventory and queues issuance for the worker.
-func (m *Manager) enqueueIssuance(id string, domains []string, commonName string) {
-	m.enqueueIssuanceJob(issuanceJob{id: id, domains: domains, commonName: commonName})
-}
-
-func (m *Manager) enqueueIssuanceWithForce(id string, domains []string, commonName string, force bool) {
-	m.enqueueIssuanceJob(issuanceJob{id: id, domains: domains, commonName: commonName, force: force})
 }
 
 // enqueueIssuanceJob is the unified entry point for both self-hosted and namek cert issuance.

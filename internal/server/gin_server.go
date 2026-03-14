@@ -173,8 +173,11 @@ type GinServer struct {
 	namekAdapterCancel context.CancelFunc
 	namekLastKey       string
 	namekStopped       atomic.Bool
-	namekMu            sync.Mutex // protects namek adapter fields
+	namekMu            sync.RWMutex // protects namek adapter fields + namek domain state
 	namekACME          *identity.NamekACMEClient
+	namekDomainClient  *identity.NamekDomainClient           // domain management client
+	namekDomains       map[string]*namekDomainState           // alias hostname → namek state
+	namekReconcileStop context.CancelFunc                     // cancels in-flight reconciliation
 }
 
 type secureContextKey struct{}
@@ -1065,6 +1068,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		s.namekACME = identity.NewNamekACMEClient(identitySvc.NamekClient)
 		rm.RegisterOrchClient("namek", s.namekACME)
 
+		// Domain management client for alias domain lifecycle with namek
+		s.namekDomainClient = identity.NewNamekDomainClient(identitySvc.NamekClient)
+
 	}
 
 	// Subscribe to identity events for namek adapter state changes.
@@ -1110,12 +1116,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 						msg = "Namek identity reset"
 					}
 					if msg != "" {
-						s.remoteManager.AppendEvent(remote.Event{
-							Timestamp: time.Now().UTC(),
-							Level:     "info",
-							Source:    "namek",
-							Message:   msg,
-						})
+						s.logNamekEvent("info", "%s", msg)
 					}
 				}
 			}
@@ -1244,6 +1245,14 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	// Prevent identity event subscriber from racing with shutdown
 	s.namekStopped.Store(true)
 	s.stopNamekAdapter()
+
+	// Cancel in-flight domain reconciliation to prevent stale network calls during shutdown
+	s.namekMu.Lock()
+	if s.namekReconcileStop != nil {
+		s.namekReconcileStop()
+		s.namekReconcileStop = nil
+	}
+	s.namekMu.Unlock()
 
 	// Notify systemd that we're stopping
 	if sent, err := daemon.SdNotify(false, daemon.SdNotifyStopping); err != nil {
@@ -1610,6 +1619,7 @@ func (s *GinServer) setupGinRoutes() {
 			remote.GET("/aliases", s.handleRemoteAliasesList)
 			remote.POST("/aliases", s.handleRemoteAliasesCreate)
 			remote.DELETE("/aliases/:id", s.handleRemoteAliasesDelete)
+			remote.POST("/aliases/:id/verify-namek", s.handleRemoteAliasesVerifyNamek)
 			remote.GET("/certificates", s.handleRemoteCertificatesList)
 			remote.POST("/certificates/:id/renew", s.handleRemoteCertificateRenew)
 			remote.GET("/events", s.handleRemoteEvents)
@@ -2134,10 +2144,19 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 	s.detectRemoteTransitionAndRestart()
 }
 
-// clearNamekState tears down namek adapter and clears all namek routing/cert state.
+// clearNamekState tears down namek adapter and clears all namek routing/cert/domain state.
 // Safe to call when namek is not ready or has no endpoints.
 func (s *GinServer) clearNamekState(rm *remote.Manager) {
 	s.stopNamekAdapter()
+
+	// Cancel in-flight reconciliation and clear domain state
+	s.namekMu.Lock()
+	if s.namekReconcileStop != nil {
+		s.namekReconcileStop()
+		s.namekReconcileStop = nil
+	}
+	s.namekDomains = nil
+	s.namekMu.Unlock()
 	if rm != nil {
 		rm.UnregisterOrchClient("namek")
 	}
@@ -2322,6 +2341,21 @@ func (s *GinServer) applyNamekState() {
 			CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, hostname},
 		})
 	}
+
+	// --- Namek domain state rebuild ---
+	// Cancel any in-flight reconciliation from a prior applyNamekState() call.
+	s.namekMu.Lock()
+	if s.namekReconcileStop != nil {
+		s.namekReconcileStop()
+	}
+	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
+	s.namekReconcileStop = reconcileCancel
+	s.namekMu.Unlock()
+
+	// Rebuild domain map and reconcile in the background.
+	// All namek domain changes originate from this device (1:1 model).
+	// When multi-device accounts are implemented, periodic sync will be needed.
+	go s.rebuildNamekDomains(reconcileCtx)
 
 	s.detectRemoteTransitionAndRestart()
 }
@@ -2594,6 +2628,19 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 							continue
 						}
 						rm.RemoveHostnameCertificate(ep.DerivedHostLabel + "." + base)
+					}
+				}
+				// Also clean up per-app certs for alias hostnames
+				for _, a := range rm.ListAliases() {
+					aliasBase := normalizeHostname(a.Hostname)
+					if aliasBase == "" {
+						continue
+					}
+					for _, ep := range payload.Removed {
+						if ep.DerivedHostLabel == "" {
+							continue
+						}
+						rm.RemoveHostnameCertificate(ep.DerivedHostLabel + "." + aliasBase)
 					}
 				}
 			}
