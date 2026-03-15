@@ -14,6 +14,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/cluster"
 	"piccolod/internal/events"
+	"piccolod/internal/firewall"
 	"piccolod/internal/hostname"
 )
 
@@ -33,6 +34,7 @@ type ServiceManager struct {
 	leadership     map[string]cluster.Role
 	unpublisher    PortUnpublisher
 	publisher      PortPublisher
+	firewallMgr    firewall.Manager
 	lockReader     LockStateReader
 	lockOverrideMu sync.RWMutex
 	lockOverride   *bool
@@ -121,6 +123,58 @@ func (m *ServiceManager) notifyPublish(port int) {
 	}
 }
 
+// SetFirewallManager wires a firewall manager for opening/closing port claim rules.
+func (m *ServiceManager) SetFirewallManager(fw firewall.Manager) {
+	m.firewallMgr = fw
+}
+
+func (m *ServiceManager) openFirewallClaim(ep ServiceEndpoint) {
+	if ep.PortClaim != nil && m.firewallMgr != nil {
+		if err := m.firewallMgr.OpenPort(firewall.Rule{Port: *ep.PortClaim, Protocol: ep.Flow.TransportProtocol()}); err != nil {
+			log.Printf("ERROR: firewall open port %d: %v", *ep.PortClaim, err)
+		}
+	}
+}
+
+// releaseEndpointPorts releases allocated ports for an endpoint.
+// For port claims, uses protocol-aware release to avoid freeing the sibling protocol.
+func (m *ServiceManager) releaseEndpointPorts(ep ServiceEndpoint) {
+	m.allocator.ReleaseHost(ep.HostBind)
+	if ep.PortClaim != nil {
+		m.allocator.FreePublicProto(ep.PublicPort, ep.Flow.TransportProtocol())
+	} else {
+		m.allocator.ReleasePublic(ep.PublicPort)
+	}
+}
+
+func (m *ServiceManager) closeFirewallClaim(ep ServiceEndpoint) {
+	if ep.PortClaim != nil && m.firewallMgr != nil {
+		if err := m.firewallMgr.ClosePort(firewall.Rule{Port: *ep.PortClaim, Protocol: ep.Flow.TransportProtocol()}); err != nil {
+			log.Printf("ERROR: firewall close port %d: %v", *ep.PortClaim, err)
+		}
+	}
+}
+
+// ActivePortClaims returns all active port claims from the service registry.
+// Implements remote.PortClaimProvider.
+func (m *ServiceManager) ActivePortClaims() []api.PortClaimInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var claims []api.PortClaimInfo
+	for _, mapp := range m.registry {
+		for _, ep := range mapp {
+			if ep.PortClaim != nil {
+				claims = append(claims, api.PortClaimInfo{
+					Port:     *ep.PortClaim,
+					HostBind: ep.HostBind,
+					Protocol: ep.Flow.TransportProtocol(),
+				})
+			}
+		}
+	}
+	return claims
+}
+
 // SetEventBus wires an event bus for publishing endpoint changes and starts the health aggregator.
 func (m *ServiceManager) SetEventBus(bus *events.Bus) {
 	m.eventsMu.Lock()
@@ -201,6 +255,7 @@ func buildEndpoint(appName string, l api.AppListener, hostBind, publicPort int, 
 		Middleware:       l.Middleware,
 		RemotePorts:      defaultRemotePorts(l),
 		Auth:             l.Auth,
+		PortClaim:        l.PortClaim,
 	}
 }
 
@@ -354,7 +409,7 @@ func (m *ServiceManager) ClearLockOverride() {
 }
 
 // RestoreFromPodman rebuilds proxies for an app using existing host-bind ports.
-func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppListener, hostByGuest map[int]int) ([]ServiceEndpoint, error) {
+func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppListener, hostByGuest map[string]int) ([]ServiceEndpoint, error) {
 	// Stop any existing proxies first
 	m.DeactivateApp(appName)
 
@@ -371,14 +426,24 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 
 	registry := make(map[string]ServiceEndpoint)
 	for _, l := range listeners {
-		host, ok := hostByGuest[l.GuestPort]
+		gpKey := fmt.Sprintf("%d/%s", l.GuestPort, l.Flow.TransportProtocol())
+		host, ok := hostByGuest[gpKey]
 		if !ok {
 			continue
 		}
 		if err := m.allocator.ReserveHost(host); err != nil {
 			continue
 		}
-		public, err := m.allocator.AllocatePublic()
+		var public int
+		var err error
+		if l.PortClaim != nil {
+			err = m.allocator.ClaimPublicPort(*l.PortClaim, l.Flow == api.FlowUDP)
+			if err == nil {
+				public = *l.PortClaim
+			}
+		} else {
+			public, err = m.allocator.AllocatePublic()
+		}
 		if err != nil {
 			m.allocator.freeHost(host)
 			return endpoints, err
@@ -388,6 +453,7 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 		ep := buildEndpoint(appName, l, host, public, isPrimary, hostLabel)
 		registry[l.Name] = ep
 		endpoints = append(endpoints, ep)
+		m.openFirewallClaim(ep)
 		m.proxyManager.StartListener(ep)
 		m.notifyPublish(ep.PublicPort)
 	}
@@ -425,7 +491,7 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 	endpoints := make([]ServiceEndpoint, 0, len(listeners))
 
 	for _, l := range listeners {
-		hb, pp, err := m.allocator.AllocatePair()
+		hb, pp, err := m.allocator.AllocateForClaim(l.PortClaim, l.Flow == api.FlowUDP)
 		if err != nil {
 			return nil, err
 		}
@@ -442,8 +508,9 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 	// Clear any stashed deactivated state from prior stop.
 	delete(m.deactivated, appName)
 
-	// Start proxies after registration
+	// Start proxies and open firewall for port claims
 	for _, ep := range endpoints {
+		m.openFirewallClaim(ep)
 		m.proxyManager.StartListener(ep)
 		m.notifyPublish(ep.PublicPort)
 	}
@@ -705,6 +772,11 @@ func (m *ServiceManager) checkBackends() {
 		}
 		m.appTransientMu.Unlock()
 		for _, ep := range mapp {
+			// Skip health checks for UDP endpoints — TCP dial always fails against
+			// a UDP port, which would report permanently unhealthy.
+			if ep.Flow == api.FlowUDP {
+				continue
+			}
 			addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(ep.HostBind))
 			conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 			checkOK := err == nil
@@ -770,6 +842,11 @@ func (m *ServiceManager) emitBackendHealthEvent(ep ServiceEndpoint, result Recor
 			Timestamp: time.Now(),
 		},
 	})
+}
+
+// SnapshotRegistry returns a snapshot of the full endpoint registry.
+func (m *ServiceManager) SnapshotRegistry() map[string]map[string]ServiceEndpoint {
+	return m.snapshotRegistry()
 }
 
 func (m *ServiceManager) snapshotRegistry() map[string]map[string]ServiceEndpoint {
@@ -1011,6 +1088,30 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
 
 		if old, ok := existing[l.Name]; ok {
+			// If port claim changed, treat as remove + add (different public port).
+			if portClaimChanged(old.PortClaim, l.PortClaim) {
+				// Tear down old
+				m.proxyManager.StopEndpoint(old.PublicPort, old.Flow)
+				m.closeFirewallClaim(old)
+				m.releaseEndpointPorts(old)
+				m.notifyUnpublish(old.PublicPort)
+				result.Removed = append(result.Removed, old)
+
+				// Allocate new
+				hb, pp, err := m.allocator.AllocateForClaim(l.PortClaim, l.Flow == api.FlowUDP)
+				if err != nil {
+					return ReconcileResult{}, false, err
+				}
+				newEp := buildEndpoint(appName, l, hb, pp, isPrimary, hostLabel)
+				newMap[l.Name] = newEp
+				m.openFirewallClaim(newEp)
+				m.proxyManager.StartListener(newEp)
+				containerChange = true
+				result.Added = append(result.Added, newEp)
+				m.notifyPublish(newEp.PublicPort)
+				continue
+			}
+
 			newEp := buildEndpoint(appName, l, old.HostBind, old.PublicPort, isPrimary, hostLabel)
 
 			if old.GuestPort != newEp.GuestPort {
@@ -1024,7 +1125,7 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 			}
 
 			if proxyConfigChanged(old, newEp) {
-				m.proxyManager.StopPort(old.PublicPort)
+				m.proxyManager.StopEndpoint(old.PublicPort, old.Flow)
 				m.proxyManager.StartListener(newEp)
 				result.ProxyOnlyChanged = append(result.ProxyOnlyChanged, newEp)
 				m.notifyPublish(newEp.PublicPort)
@@ -1033,12 +1134,13 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 			newMap[l.Name] = newEp
 		} else {
 			// New listener: allocate ports, start proxy, mark container change
-			hb, pp, err := m.allocator.AllocatePair()
+			hb, pp, err := m.allocator.AllocateForClaim(l.PortClaim, l.Flow == api.FlowUDP)
 			if err != nil {
 				return ReconcileResult{}, false, err
 			}
 			ep := buildEndpoint(appName, l, hb, pp, isPrimary, hostLabel)
 			newMap[l.Name] = ep
+			m.openFirewallClaim(ep)
 			m.proxyManager.StartListener(ep)
 			containerChange = true
 			result.Added = append(result.Added, ep)
@@ -1049,7 +1151,8 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 	// Removed listeners
 	for name, ep := range existing {
 		if _, ok := newMap[name]; !ok {
-			m.proxyManager.StopPort(ep.PublicPort)
+			m.proxyManager.StopEndpoint(ep.PublicPort, ep.Flow)
+			m.closeFirewallClaim(ep)
 			containerChange = true
 			result.Removed = append(result.Removed, ep)
 			m.notifyUnpublish(ep.PublicPort)
@@ -1093,6 +1196,17 @@ func middlewareEqual(a, b []api.AppProtocolMiddleware) bool {
 		// Params equality elided for v1
 	}
 	return true
+}
+
+// portClaimChanged returns true if two port claim values differ.
+func portClaimChanged(a, b *int) bool {
+	if a == nil && b == nil {
+		return false
+	}
+	if a == nil || b == nil {
+		return true
+	}
+	return *a != *b
 }
 
 // proxyConfigChanged returns true when proxy-affecting fields differ between
@@ -1143,8 +1257,9 @@ func (m *ServiceManager) removeAppEndpoints(appName string, permanent bool) {
 		removed = make([]ServiceEndpoint, 0, len(mapp))
 		for _, ep := range mapp {
 			removed = append(removed, ep)
-			m.proxyManager.StopPort(ep.PublicPort)
-			m.allocator.Release(ep.HostBind, ep.PublicPort)
+			m.proxyManager.StopEndpoint(ep.PublicPort, ep.Flow)
+			m.closeFirewallClaim(ep)
+			m.releaseEndpointPorts(ep)
 			m.notifyUnpublish(ep.PublicPort)
 			if m.backendHealth != nil {
 				m.backendHealth.RemoveEndpoint(ep.endpointKey())

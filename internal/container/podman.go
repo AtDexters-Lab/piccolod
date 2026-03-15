@@ -453,6 +453,7 @@ type CAMount struct {
 type PortMapping struct {
 	Host      int
 	Container int
+	Protocol  string // "tcp" (default) or "udp"
 }
 
 type VolumeMapping struct {
@@ -527,8 +528,11 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 	}
 
 	for _, port := range spec.Ports {
-		args = append(args, "--publish",
-			fmt.Sprintf("127.0.0.1:%d:%d", port.Host, port.Container))
+		publish := fmt.Sprintf("127.0.0.1:%d:%d", port.Host, port.Container)
+		if port.Protocol == "udp" {
+			publish += "/udp"
+		}
+		args = append(args, "--publish", publish)
 	}
 
 	for _, volume := range spec.Volumes {
@@ -1060,8 +1064,11 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 	return ContainerState{Exists: true, Running: running}, nil
 }
 
-// InspectPublishedPorts returns a map of guest_port -> host_port for a container.
-func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRuntime, containerID string) (map[int]int, error) {
+// InspectPublishedPorts returns a map of "guest_port/proto" -> host_port for a container.
+// Keys are formatted as "80/tcp" or "53/udp" to distinguish protocols. Callers
+// must normalize FlowTLS to "tcp" when building lookup keys since TLS is TCP
+// at the transport layer.
+func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRuntime, containerID string) (map[string]int, error) {
 	if containerID == "" {
 		return nil, fmt.Errorf("container ID required")
 	}
@@ -1075,7 +1082,7 @@ func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRun
 		return nil, fmt.Errorf("podman port failed: %w", err)
 	}
 
-	result := make(map[int]int)
+	result := make(map[string]int)
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -1086,15 +1093,16 @@ func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRun
 		if len(parts) != 2 {
 			continue
 		}
-		left := strings.TrimSpace(parts[0])  // e.g. "80/tcp"
+		left := strings.TrimSpace(parts[0])  // e.g. "80/tcp" or "53/udp"
 		right := strings.TrimSpace(parts[1]) // e.g. "127.0.0.1:15001"
-		guestStr := strings.Split(left, "/")[0]
-		guest, _ := strconv.Atoi(strings.TrimSpace(guestStr))
+		leftParts := strings.Split(left, "/")
+		guestStr := strings.TrimSpace(leftParts[0])
+		guest, _ := strconv.Atoi(guestStr)
 		hostParts := strings.Split(right, ":")
 		hostStr := hostParts[len(hostParts)-1]
 		host, _ := strconv.Atoi(strings.TrimSpace(hostStr))
 		if guest > 0 && host > 0 {
-			result[guest] = host
+			result[left] = host // key is "80/tcp" or "53/udp"
 		}
 	}
 	if err := scanner.Err(); err != nil {

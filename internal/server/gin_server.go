@@ -27,6 +27,7 @@ import (
 	crypt "piccolod/internal/crypt"
 	pki "piccolod/internal/crypto"
 	"piccolod/internal/events"
+	"piccolod/internal/firewall"
 	"piccolod/internal/health"
 	"piccolod/internal/identity"
 	"piccolod/internal/onboarding"
@@ -1055,6 +1056,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		nexusAdapter = nexusclient.NewBackendAdapter(routeMgr, remoteResolver)
 	}
 	rm.SetNexusAdapter(nexusAdapter)
+	svcMgr.SetFirewallManager(firewall.NewFirewalldManager()) // falls back to no-op stub if firewall-cmd absent
+	rm.SetPortClaimProvider(svcMgr)
 
 	// Namek adapter (new, with TPM token provider) — owned by GinServer
 	if os.Getenv("PICCOLO_NEXUS_USE_STUB") != "1" {
@@ -1569,6 +1572,7 @@ func (s *GinServer) setupGinRoutes() {
 			// Admin-only actions
 			apps.POST("", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppInstall)
 			apps.POST("/validate", s.requireAdmin(), s.handleGinAppValidate)
+			apps.POST("/preflight", s.requireAdmin(), s.handleGinAppPreflight)
 			apps.DELETE("/:name", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUninstall)
 			apps.PATCH("/:name/listeners", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUpdateListeners)
 			apps.POST("/:name/start", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppStart)
@@ -1815,6 +1819,9 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 
 	if ep.Auth != nil {
 		result["auth"] = ep.Auth
+	}
+	if ep.PortClaim != nil {
+		result["port_claim"] = *ep.PortClaim
 	}
 
 	// Add host-based URLs only for HTTP/WS listeners (per RFC 20260114)

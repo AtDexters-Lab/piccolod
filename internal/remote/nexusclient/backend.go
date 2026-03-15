@@ -109,15 +109,33 @@ func (a *BackendAdapter) Start(ctx context.Context) error {
 		return nil
 	}
 	hosts := buildHostnameList(cfg)
+
+	// Build port mappings: start with portal defaults, add port claims.
+	portMappings := map[int]backend.PortMapping{
+		443: {Default: "127.0.0.1:443"},
+		80:  {Default: "127.0.0.1:80"},
+	}
+	var tcpPorts []int
+	var udpRoutes []backend.UDPRouteConfig
+	for _, cm := range cfg.ClaimMappings {
+		portMappings[cm.Port] = backend.PortMapping{
+			Default: fmt.Sprintf("127.0.0.1:%d", cm.HostBind),
+		}
+		if cm.Protocol == "udp" {
+			udpRoutes = append(udpRoutes, backend.UDPRouteConfig{Port: cm.Port})
+		} else {
+			tcpPorts = append(tcpPorts, cm.Port)
+		}
+	}
+
 	backendCfg := backend.ClientBackendConfig{
 		Name:         a.name,
 		Hostnames:    hosts,
 		NexusAddress: cfg.Endpoint,
 		Weight:       1,
-		PortMappings: map[int]backend.PortMapping{
-			443: {Default: "127.0.0.1:443"},
-			80:  {Default: "127.0.0.1:80"},
-		},
+		TCPPorts:     tcpPorts,
+		UDPRoutes:    udpRoutes,
+		PortMappings: portMappings,
 		Attestation: backend.AttestationOptions{
 			HMACSecret:                 strings.TrimSpace(cfg.DeviceSecret),
 			TokenTTL:                   attestationTokenTTL,
@@ -190,8 +208,12 @@ func (a *BackendAdapter) connectHandler() backend.ConnectHandler {
 			localPort = req.Port
 		}
 		target := fmt.Sprintf("127.0.0.1:%d", localPort)
+		network := "tcp"
+		if req.Transport == backend.TransportUDP {
+			network = "udp"
+		}
 		var d net.Dialer
-		conn, err := d.DialContext(ctx, "tcp", target)
+		conn, err := d.DialContext(ctx, network, target)
 		if err != nil {
 			return nil, err
 		}

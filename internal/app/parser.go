@@ -750,7 +750,8 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 	}
 
 	names := make(map[string]struct{})
-	guestPorts := make(map[int]string)
+	guestPorts := make(map[string]string) // keyed by "port/transport" (e.g., "53/tcp", "53/udp")
+	portClaims := make(map[string]string) // keyed by "port/flow" for intra-app uniqueness
 	hasPrimaryMarker := false
 
 	for i, l := range listeners {
@@ -770,9 +771,12 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 			hasPrimaryMarker = true
 
 			// Primary listeners must be eligible for host-based routing.
-			// TLS flow and raw protocol don't support host-based routing.
+			// TLS/UDP flow and raw protocol don't support host-based routing.
 			if l.Flow == api.FlowTLS {
 				return fmt.Errorf("primary listener '%s' cannot use flow: tls (not eligible for host routing)", l.Name)
+			}
+			if l.Flow == api.FlowUDP {
+				return fmt.Errorf("primary listener '%s' cannot use flow: udp (not eligible for host routing)", l.Name)
 			}
 			if l.Protocol == api.ListenerProtocolRaw {
 				return fmt.Errorf("primary listener '%s' cannot use protocol: raw (not eligible for host routing)", l.Name)
@@ -797,13 +801,23 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 		if l.GuestPort < 1 || l.GuestPort > 65535 {
 			return fmt.Errorf("listener '%s' guest_port must be between 1 and 65535", l.Name)
 		}
-		if existing, ok := guestPorts[l.GuestPort]; ok {
-			return fmt.Errorf("guest_port %d used by both '%s' and '%s'", l.GuestPort, existing, l.Name)
+		// Uniqueness is per (guest_port, transport). TCP and TLS share the TCP
+		// transport namespace; UDP is separate. This allows DNS-style apps to
+		// declare both TCP 53 and UDP 53 as separate listeners.
+		gpKey := fmt.Sprintf("%d/%s", l.GuestPort, l.Flow.TransportProtocol())
+		if existing, ok := guestPorts[gpKey]; ok {
+			return fmt.Errorf("guest_port %d/%s used by both '%s' and '%s'", l.GuestPort, l.Flow.TransportProtocol(), existing, l.Name)
 		}
-		guestPorts[l.GuestPort] = l.Name
+		guestPorts[gpKey] = l.Name
 
-		if l.Flow != api.FlowTCP && l.Flow != api.FlowTLS {
-			return fmt.Errorf("listener '%s' flow must be 'tcp' or 'tls'", l.Name)
+		if l.Flow != api.FlowTCP && l.Flow != api.FlowTLS && l.Flow != api.FlowUDP {
+			return fmt.Errorf("listener '%s' flow must be 'tcp', 'tls', or 'udp'", l.Name)
+		}
+
+		// UDP is a transport protocol — HTTP and WebSocket are TCP-based and
+		// make no sense over UDP.
+		if l.Flow == api.FlowUDP && (l.Protocol == api.ListenerProtocolHTTP || l.Protocol == api.ListenerProtocolWebsocket) {
+			return fmt.Errorf("listener '%s' flow: udp cannot be used with protocol: %s", l.Name, l.Protocol.String())
 		}
 
 		switch l.Protocol {
@@ -864,6 +878,34 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 					}
 				}
 			}
+		}
+
+		// port_claim validation
+		if l.PortClaim != nil {
+			pc := *l.PortClaim
+			if pc < 1 || pc > 65535 {
+				return fmt.Errorf("listener '%s' port_claim must be between 1 and 65535", l.Name)
+			}
+			// Reserved ports used by the portal and piccolod internals.
+			switch pc {
+			case 80, 443:
+				return fmt.Errorf("listener '%s' port_claim %d is reserved for the portal", l.Name, pc)
+			case 5353:
+				return fmt.Errorf("listener '%s' port_claim %d is reserved for mDNS", l.Name, pc)
+			}
+			// Reject claims in the auto-allocate ranges to prevent collisions.
+			if pc >= 15000 && pc <= 25000 {
+				return fmt.Errorf("listener '%s' port_claim %d conflicts with host-bind range (15000-25000)", l.Name, pc)
+			}
+			if pc >= 35000 && pc <= 45000 {
+				return fmt.Errorf("listener '%s' port_claim %d conflicts with public auto-allocate range (35000-45000)", l.Name, pc)
+			}
+			// Intra-app uniqueness: no two listeners can claim the same (port, transport) pair.
+			claimKey := fmt.Sprintf("%d/%s", pc, l.Flow.TransportProtocol())
+			if existing, ok := portClaims[claimKey]; ok {
+				return fmt.Errorf("port_claim %d/%s used by both '%s' and '%s'", pc, l.Flow.TransportProtocol(), existing, l.Name)
+			}
+			portClaims[claimKey] = l.Name
 		}
 	}
 

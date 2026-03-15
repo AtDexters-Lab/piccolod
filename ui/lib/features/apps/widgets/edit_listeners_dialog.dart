@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
@@ -138,7 +139,9 @@ class _ListenerRow extends StatelessWidget {
 
   bool get _showAccessDropdown =>
       (listener.protocol == 'http' || listener.protocol == 'websocket') &&
-      listener.flow != 'tls';
+      listener.flow == 'tcp';
+
+  bool get _showPortClaim => listener.flow == 'tcp' || listener.flow == 'udp';
 
   @override
   Widget build(BuildContext context) {
@@ -220,12 +223,15 @@ class _ListenerRow extends StatelessWidget {
               items: const [
                 DropdownMenuItem(value: 'tcp', child: Text('TCP')),
                 DropdownMenuItem(value: 'tls', child: Text('TLS')),
+                DropdownMenuItem(value: 'udp', child: Text('UDP')),
               ],
               onChanged: (val) {
                 if (val != null) {
                   onChange(_copyWith(
                     flow: val,
-                    clearAuth: val == 'tls',
+                    clearAuth: val != 'tcp',
+                    clearPortClaim: val == 'tls',
+                    protocol: val == 'udp' ? 'raw' : null,
                   ));
                 }
               },
@@ -236,6 +242,32 @@ class _ListenerRow extends StatelessWidget {
             Expanded(
               flex: 2,
               child: _buildAccessDropdown(),
+            ),
+          ],
+          if (_showPortClaim) ...[
+            const SizedBox(width: Spacing.md),
+            SizedBox(
+              width: 80,
+              child: TextFormField(
+                initialValue: listener.portClaim?.toString() ?? '',
+                decoration: const InputDecoration(
+                  labelText: 'Claim',
+                  hintText: 'Port',
+                  isDense: true,
+                  border: OutlineInputBorder(),
+                ),
+                keyboardType: TextInputType.number,
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                onChanged: (val) {
+                  final port = val.isEmpty ? null : int.tryParse(val);
+                  onChange(_copyWith(portClaim: port, clearPortClaim: val.isEmpty));
+                },
+                validator: (val) {
+                  if (val == null || val.isEmpty) return null; // optional
+                  final p = int.tryParse(val);
+                  return p == null || p <= 0 || p > 65535 ? 'Invalid' : null;
+                },
+              ),
             ),
           ],
           const SizedBox(width: Spacing.sm),
@@ -293,6 +325,8 @@ class _ListenerRow extends StatelessWidget {
     String? protocol,
     Map<String, dynamic>? auth,
     bool clearAuth = false,
+    int? portClaim,
+    bool clearPortClaim = false,
   }) {
     return AppListener(
       name: name ?? listener.name,
@@ -302,6 +336,7 @@ class _ListenerRow extends StatelessWidget {
       remotePorts: listener.remotePorts,
       middleware: listener.middleware,
       auth: clearAuth ? null : (auth ?? listener.auth),
+      portClaim: clearPortClaim ? null : (portClaim ?? listener.portClaim),
     );
   }
 }

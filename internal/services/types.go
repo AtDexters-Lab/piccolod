@@ -10,8 +10,9 @@ type PortRange struct {
 
 // IsEligibleForHostRouting returns true if a listener can have host-based URLs.
 // Only flow:tcp + protocol:http|websocket are eligible per RFC 20260114.
+// FlowTLS and FlowUDP listeners are not eligible for hostname-based routing.
 func IsEligibleForHostRouting(protocol api.ListenerProtocol, flow api.ListenerFlow) bool {
-	if flow == api.FlowTLS {
+	if flow == api.FlowTLS || flow == api.FlowUDP {
 		return false
 	}
 	return protocol == api.ListenerProtocolHTTP || protocol == api.ListenerProtocolWebsocket
@@ -32,6 +33,7 @@ type ServiceEndpoint struct {
 	RemotePorts      []int                       `json:"remote_ports"`
 	LocalURL         string                      `json:"local_url,omitempty"` // Optional pre-calculated LAN URL
 	Auth             *api.ListenerAuth           `json:"auth,omitempty"`
+	PortClaim        *int                        `json:"port_claim,omitempty"` // Well-known port to bind on LAN (and claim on relay)
 }
 
 // endpointKey returns a unique key for an endpoint (app/listener)

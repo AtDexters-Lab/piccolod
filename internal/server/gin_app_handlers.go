@@ -293,42 +293,99 @@ func writeGinSuccess(c *gin.Context, data interface{}, message string) {
 	c.JSON(http.StatusOK, response)
 }
 
-// handleGinAppValidate handles POST /api/v1/apps/validate - Validate app.yaml without installing
-func (s *GinServer) handleGinAppValidate(c *gin.Context) {
+// parseAppDefinitionFromRequest reads and parses an app YAML from the request body.
+// Returns nil and writes an error response if parsing fails.
+func (s *GinServer) parseAppDefinitionFromRequest(c *gin.Context) *api.AppDefinition {
 	contentType := c.GetHeader("Content-Type")
 	if !strings.Contains(contentType, "application/x-yaml") && !strings.Contains(contentType, "text/yaml") && !strings.Contains(contentType, "application/json") {
 		writeGinError(c, http.StatusUnsupportedMediaType, "Content-Type must be application/x-yaml or text/yaml or application/json")
-		return
+		return nil
 	}
 	var yamlData []byte
 	if strings.Contains(contentType, "application/json") {
-		// Accept { app_definition: "...yaml..." }
 		var req struct {
 			AppDefinition string `json:"app_definition"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
 			writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
-			return
+			return nil
 		}
 		yamlData = []byte(req.AppDefinition)
 	} else {
 		body, err := c.GetRawData()
 		if err != nil || len(body) == 0 {
 			writeGinError(c, http.StatusBadRequest, "Request body cannot be empty")
-			return
+			return nil
 		}
 		yamlData = body
 	}
-	if _, err := app.ParseAppDefinition(yamlData); err != nil {
+	def, err := app.ParseAppDefinition(yamlData)
+	if err != nil {
 		var ve *app.ValidationError
 		if errors.As(err, &ve) && ve != nil {
 			writeGinErrorWithKey(c, http.StatusBadRequest, "Invalid app.yaml: "+ve.Message, ve.Code)
-			return
+			return nil
 		}
 		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
+		return nil
+	}
+	return def
+}
+
+// handleGinAppValidate handles POST /api/v1/apps/validate - Validate app.yaml without installing
+func (s *GinServer) handleGinAppValidate(c *gin.Context) {
+	if def := s.parseAppDefinitionFromRequest(c); def != nil {
+		writeGinSuccess(c, gin.H{"valid": true}, "valid")
+	}
+}
+
+// handleGinAppPreflight handles POST /api/v1/apps/preflight - validate manifest and report port claims
+func (s *GinServer) handleGinAppPreflight(c *gin.Context) {
+	def := s.parseAppDefinitionFromRequest(c)
+	if def == nil {
 		return
 	}
-	writeGinSuccess(c, gin.H{"valid": true}, "valid")
+
+	type portClaimDetail struct {
+		Port     int    `json:"port"`
+		Protocol string `json:"protocol"`
+		Listener string `json:"listener"`
+		Flow     string `json:"flow"`
+	}
+	claims := make([]portClaimDetail, 0)
+	conflicts := make([]string, 0)
+
+	// Snapshot the registry once for consistent conflict checks across all listeners.
+	var registry map[string]map[string]services.ServiceEndpoint
+	if s.serviceManager != nil {
+		registry = s.serviceManager.SnapshotRegistry()
+	}
+
+	for _, l := range def.Listeners {
+		if l.PortClaim == nil {
+			continue
+		}
+		claims = append(claims, portClaimDetail{
+			Port:     *l.PortClaim,
+			Protocol: l.Flow.TransportProtocol(),
+			Listener: l.Name,
+			Flow:     l.Flow.String(),
+		})
+		for appName, endpoints := range registry {
+			for _, ep := range endpoints {
+				if ep.PortClaim != nil && *ep.PortClaim == *l.PortClaim && ep.Flow.TransportProtocol() == l.Flow.TransportProtocol() {
+					conflicts = append(conflicts, fmt.Sprintf("%s port %d claimed by app '%s' listener '%s'",
+						l.Flow.TransportProtocol(), *l.PortClaim, appName, ep.Name))
+				}
+			}
+		}
+	}
+
+	writeGinSuccess(c, gin.H{
+		"valid":     true,
+		"claims":    claims,
+		"conflicts": conflicts,
+	}, "preflight")
 }
 
 // handleGinCatalogTemplate handles GET /api/v1/catalog/:name/template - return YAML template for a catalog app

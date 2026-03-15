@@ -1339,22 +1339,23 @@ func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefi
 		return err
 	}
 
-	expected := make(map[int]services.ServiceEndpoint, len(endpoints)) // guest -> endpoint
+	expected := make(map[string]services.ServiceEndpoint, len(endpoints)) // "port/proto" -> endpoint
 	for _, ep := range endpoints {
-		expected[ep.GuestPort] = ep
+		key := fmt.Sprintf("%d/%s", ep.GuestPort, ep.Flow.TransportProtocol())
+		expected[key] = ep
 	}
 
 	// Check if any port reconciliation is needed.
-	for guest, ep := range expected {
-		host, ok := observed[guest]
+	for key, ep := range expected {
+		host, ok := observed[key]
 		if !ok || host != ep.HostBind {
 			// Podman does not support dynamic port binding updates on running containers.
 			// Return error to trigger container recreation.
 			return container.ErrPortReconciliationRequired
 		}
 	}
-	for guest := range observed {
-		if _, ok := expected[guest]; !ok {
+	for key := range observed {
+		if _, ok := expected[key]; !ok {
 			// Extra port exists that shouldn't - needs recreation.
 			return container.ErrPortReconciliationRequired
 		}

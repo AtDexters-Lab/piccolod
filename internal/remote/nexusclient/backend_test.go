@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"piccolod/internal/api"
+
 	backend "github.com/AtDexters-Lab/nexus-proxy-backend-client/client"
 )
 
@@ -130,6 +132,65 @@ func TestWithAdapterName(t *testing.T) {
 	adapter := NewBackendAdapter(nil, nil, WithAdapterName("piccolo-namek"))
 	if adapter.name != "piccolo-namek" {
 		t.Fatalf("expected name piccolo-namek, got %s", adapter.name)
+	}
+}
+
+func TestStartWithPortClaims(t *testing.T) {
+	adapter := NewBackendAdapter(nil, nil)
+	cfg := Config{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		PortalHostname: "portal.example.com",
+		ClaimMappings: []api.PortClaimInfo{
+			{Port: 53, HostBind: 15001, Protocol: "udp"},
+			{Port: 22, HostBind: 15002, Protocol: "tcp"},
+		},
+	}
+	if err := adapter.Configure(cfg); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	var captured backend.ClientBackendConfig
+	adapter.factory = func(cfg backend.ClientBackendConfig, opts ...backend.Option) (backendClient, error) {
+		captured = cfg
+		return &fakeClient{}, nil
+	}
+
+	if err := adapter.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { adapter.Stop(context.Background()) })
+
+	// Verify TCPPorts
+	if len(captured.TCPPorts) != 1 || captured.TCPPorts[0] != 22 {
+		t.Fatalf("expected TCPPorts=[22], got %v", captured.TCPPorts)
+	}
+
+	// Verify UDPRoutes
+	if len(captured.UDPRoutes) != 1 || captured.UDPRoutes[0].Port != 53 {
+		t.Fatalf("expected UDPRoutes=[{53}], got %v", captured.UDPRoutes)
+	}
+
+	// Verify PortMappings include both defaults and claims
+	if _, ok := captured.PortMappings[80]; !ok {
+		t.Fatal("expected default port mapping for 80")
+	}
+	if _, ok := captured.PortMappings[443]; !ok {
+		t.Fatal("expected default port mapping for 443")
+	}
+	pm53, ok := captured.PortMappings[53]
+	if !ok {
+		t.Fatal("expected port mapping for claimed port 53")
+	}
+	if pm53.Default != "127.0.0.1:15001" {
+		t.Fatalf("port 53 mapping = %q, want 127.0.0.1:15001", pm53.Default)
+	}
+	pm22, ok := captured.PortMappings[22]
+	if !ok {
+		t.Fatal("expected port mapping for claimed port 22")
+	}
+	if pm22.Default != "127.0.0.1:15002" {
+		t.Fatalf("port 22 mapping = %q, want 127.0.0.1:15002", pm22.Default)
 	}
 }
 

@@ -10,6 +10,7 @@ class ServiceEndpoint {
     this.remoteHost,
     this.localUrl,
     this.derivedHostLabel,
+    this.portClaim,
   });
 
   factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
@@ -27,6 +28,7 @@ class ServiceEndpoint {
       protocol: (json['protocol'] as String?) ?? '',
       localUrl: json['local_url'] as String?,
       derivedHostLabel: json['derived_host_label'] as String?,
+      portClaim: json['port_claim'] as int?,
     );
   }
   final String app;
@@ -40,4 +42,5 @@ class ServiceEndpoint {
   final String protocol;
   final String? localUrl;
   final String? derivedHostLabel;
+  final int? portClaim;
 }
