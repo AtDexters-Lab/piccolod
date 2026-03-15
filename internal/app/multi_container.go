@@ -1,14 +1,18 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 
+	"gopkg.in/yaml.v3"
+
 	"piccolod/internal/api"
 	"piccolod/internal/container"
+	"piccolod/internal/fsutil"
 	"piccolod/internal/persistence"
 )
 
@@ -206,6 +210,10 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
 			Host: configDir, Container: "/piccolo/config", Options: "rw,U",
 		})
+
+		if err := writeAppConfig(configDir, opts.appDef.AppConfig, int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+			return container.ContainerCreateSpec{}, err
+		}
 	}
 
 	if svc.Resources != nil && svc.Resources.Limits != nil {
@@ -314,6 +322,31 @@ func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreate
 		}
 	}
 
+	return nil
+}
+
+// writeAppConfig materializes the app_config manifest field as /piccolo/config/app.yaml.
+// When appConfig is nil, any existing app.yaml is removed to prevent stale config.
+func writeAppConfig(configDir string, appConfig interface{}, uid, gid int) error {
+	appConfigPath := filepath.Join(configDir, "app.yaml")
+
+	if appConfig == nil {
+		if err := os.Remove(appConfigPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to remove stale app_config: %w", err)
+		}
+		return nil
+	}
+
+	data, err := yaml.Marshal(appConfig)
+	if err != nil {
+		return fmt.Errorf("failed to marshal app_config: %w", err)
+	}
+	if err := fsutil.AtomicWriteFile(appConfigPath, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write app_config: %w", err)
+	}
+	if err := container.ChownIfNeeded(appConfigPath, uid, gid); err != nil {
+		return fmt.Errorf("failed to chown app_config: %w", err)
+	}
 	return nil
 }
 
