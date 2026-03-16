@@ -390,7 +390,7 @@ type ContainerCreateSpec struct {
 	NetworkMode   string
 	RestartPolicy string
 
-	// Workspace mode fields
+	// Entrypoint/command override fields (service native, workspace boot.sh, init:image)
 	UseInit    bool     // If true, adds --init flag for PID 1 safety
 	Entrypoint []string // Custom entrypoint (overrides image default)
 	Command    []string // Command arguments appended after image
@@ -579,7 +579,7 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 		args = append(args, "--restart", spec.RestartPolicy)
 	}
 
-	// Custom entrypoint (for workspace mode boot.sh wrapper)
+	// Custom entrypoint (rootfs mode: workspace boot.sh, service native, init:image)
 	if len(spec.Entrypoint) > 0 {
 		args = append(args, "--entrypoint", spec.Entrypoint[0])
 	}

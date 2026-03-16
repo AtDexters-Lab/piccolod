@@ -97,7 +97,7 @@ func allowHostStorage(t *testing.T, m *AppManager) {
 		m.SetVolumeManager(&stubVolumeManager{root: m.stateBaseDir})
 		m.SetRootfsManager(newStubRootfsManager(m.stateBaseDir))
 		// Create dummy workspace assets so install succeeds (boot.sh is
-		// bind-mounted into every service container).
+		// bind-mounted into workspace containers).
 		assetsDir := filepath.Join(m.stateBaseDir, "assets")
 		_ = os.MkdirAll(assetsDir, 0o755)
 		_ = os.WriteFile(filepath.Join(assetsDir, "boot.sh"), []byte("#!/bin/sh\n"), 0o755)
