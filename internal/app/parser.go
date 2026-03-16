@@ -16,11 +16,50 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	// Safe markers for Go template delimiters during YAML parsing.
+	tplLeftMarker  = "__TPL_L__"
+	tplRightMarker = "__TPL_R__"
+)
+
 var (
 	// Valid app name pattern: lowercase letters, numbers, hyphens
 	// Must start with letter, end with letter or number
 	appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$`)
+
+	// tplExprRegex matches Go template expressions {{ ... }}.
+	// Unquoted {{ }} in YAML is interpreted as a flow mapping, which breaks
+	// yaml.Unmarshal for template expressions like `key: {{ .Inputs.x }}`.
+	// We target complete expressions (not bare {{ or }}) to avoid breaking
+	// legitimate YAML flow mappings like {key: {nested: val}}.
+	tplExprRegex = regexp.MustCompile(`\{\{.*?\}\}`)
 )
+
+// neutralizeTemplates replaces Go template delimiters within {{ ... }} expressions
+// with safe markers so unquoted expressions don't break YAML parsing.
+func neutralizeTemplates(content []byte) []byte {
+	return tplExprRegex.ReplaceAllFunc(content, func(match []byte) []byte {
+		result := bytes.ReplaceAll(match, []byte("{{"), []byte(tplLeftMarker))
+		result = bytes.ReplaceAll(result, []byte("}}"), []byte(tplRightMarker))
+		return result
+	})
+}
+
+// restoreTemplatesInNode walks a yaml.Node tree and restores Go template
+// delimiters from safe markers in all scalar values.
+func restoreTemplatesInNode(node *yaml.Node) {
+	if node == nil {
+		return
+	}
+	if node.Kind == yaml.ScalarNode {
+		node.Value = strings.ReplaceAll(node.Value, tplLeftMarker, "{{")
+		node.Value = strings.ReplaceAll(node.Value, tplRightMarker, "}}")
+		return
+	}
+	for _, child := range node.Content {
+		restoreTemplatesInNode(child)
+	}
+}
 
 // PiccoloMode represents the execution mode for an app as defined in x-piccolo.mode.
 type PiccoloMode string
@@ -194,8 +233,12 @@ func validateRawServicesBlocks(root *yaml.Node) error {
 // ParseAppSchema parses the YAML to extract metadata and inputs without strict validation.
 // This is used to read the manifest before variable substitution.
 func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
+	// Neutralize Go template expressions so unquoted {{ }} (which YAML interprets
+	// as flow mappings) don't break parsing. Restored after parse, before decode.
+	safe := neutralizeTemplates(content)
+
 	var root yaml.Node
-	if err := yaml.Unmarshal(content, &root); err != nil {
+	if err := yaml.Unmarshal(safe, &root); err != nil {
 		return nil, fmt.Errorf("failed to parse YAML: %w", err)
 	}
 	if hasTopLevelKey(&root, "filesystem") {
@@ -211,6 +254,11 @@ func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
 	if err := validateRawListenersNoPrimary(&root); err != nil {
 		return nil, err
 	}
+
+	// Restore template delimiters before decoding so struct fields
+	// (e.g., input defaults with {{ .System.* }}) contain the original template text.
+	restoreTemplatesInNode(&root)
+
 	var app api.AppDefinition
 	if err := root.Decode(&app); err != nil {
 		return nil, fmt.Errorf("failed to parse YAML: %w", err)

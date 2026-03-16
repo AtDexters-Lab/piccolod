@@ -772,3 +772,98 @@ func TestFlowUDP(t *testing.T) {
 		}
 	})
 }
+
+func TestParseAppSchema_UnquotedTemplateExpressions(t *testing.T) {
+	// Unquoted {{ }} in YAML is flow mapping syntax. ParseAppSchema must
+	// handle this for raw template manifests where non-string types (booleans,
+	// numbers) can't be quoted without changing the rendered YAML type.
+	manifest := `
+type: system
+inputs:
+  enabled:
+    type: boolean
+    label: "Enabled"
+    default: true
+  port:
+    type: number
+    label: "Port"
+    default: 8080
+services:
+  main:
+    image: example:latest
+    bind_ports: [8080]
+listeners:
+  - name: __primary
+    guest_port: 8080
+app_config:
+  enabled: {{ .Inputs.enabled }}
+  port: {{ .Inputs.port }}
+  mixed: "prefix-{{ .Inputs.enabled }}-suffix"
+x-piccolo:
+  mode: service
+`
+	def, err := ParseAppSchema([]byte(manifest))
+	if err != nil {
+		t.Fatalf("ParseAppSchema should handle unquoted template expressions: %v", err)
+	}
+	if def.Type != "system" {
+		t.Errorf("expected type 'system', got %q", def.Type)
+	}
+
+	// Verify app_config preserves original template text after round-trip
+	cfg, ok := def.AppConfig.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected app_config to be a map, got %T", def.AppConfig)
+	}
+	if v, _ := cfg["enabled"].(string); v != "{{ .Inputs.enabled }}" {
+		t.Errorf("expected app_config.enabled to be '{{ .Inputs.enabled }}', got %q", v)
+	}
+	if v, _ := cfg["port"].(string); v != "{{ .Inputs.port }}" {
+		t.Errorf("expected app_config.port to be '{{ .Inputs.port }}', got %q", v)
+	}
+	if v, _ := cfg["mixed"].(string); v != "prefix-{{ .Inputs.enabled }}-suffix" {
+		t.Errorf("expected app_config.mixed to preserve template, got %q", v)
+	}
+}
+
+func TestNeutralizeTemplates(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{
+			name:   "unquoted_expression",
+			input:  "key: {{ .Inputs.foo }}",
+			expect: "key: __TPL_L__ .Inputs.foo __TPL_R__",
+		},
+		{
+			name:   "quoted_expression",
+			input:  `key: "{{ .Inputs.foo }}"`,
+			expect: `key: "__TPL_L__ .Inputs.foo __TPL_R__"`,
+		},
+		{
+			name:   "no_templates",
+			input:  "key: value",
+			expect: "key: value",
+		},
+		{
+			name:   "yaml_flow_mapping_preserved",
+			input:  "data: {key: {nested: val}}",
+			expect: "data: {key: {nested: val}}",
+		},
+		{
+			name:   "multiple_on_one_line",
+			input:  "url: {{ .Inputs.host }}:{{ .Inputs.port }}",
+			expect: "url: __TPL_L__ .Inputs.host __TPL_R__:__TPL_L__ .Inputs.port __TPL_R__",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := string(neutralizeTemplates([]byte(tt.input)))
+			if got != tt.expect {
+				t.Errorf("neutralizeTemplates(%q)\n  got:  %q\n  want: %q", tt.input, got, tt.expect)
+			}
+		})
+	}
+}
