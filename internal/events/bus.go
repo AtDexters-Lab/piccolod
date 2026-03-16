@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"piccolod/internal/api"
 	"piccolod/internal/cluster"
 )
 
@@ -98,6 +99,7 @@ type ServiceEndpointInfo struct {
 	App              string
 	Name             string
 	DerivedHostLabel string
+	Flow             api.ListenerFlow
 }
 
 // ServiceEndpointsChanged announces endpoint lifecycle transitions for an app.

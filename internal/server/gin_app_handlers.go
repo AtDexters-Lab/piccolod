@@ -184,8 +184,8 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	}
 	for _, entry := range entries {
 		for _, ep := range endpoints {
-			if ep.DerivedHostLabel == "" {
-				continue
+			if ep.DerivedHostLabel == "" || ep.Flow == api.FlowTLS {
+				continue // flow:tls apps manage their own certificates (RFC 20260316)
 			}
 			host := services.RemoteServiceHostname(ep.DerivedHostLabel, entry.Hostname)
 			if host == "" {
@@ -224,8 +224,8 @@ func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, base string) 
 		return hosts
 	}
 	for _, ep := range endpoints {
-		// Only include HTTP/WS listeners that have host-based routing
-		// DerivedHostLabel is empty for raw/tls listeners (per RFC 20260114)
+		// DerivedHostLabel is empty for raw (flow:tcp) and udp listeners.
+		// flow:tls listeners have a label (for remote routing) but cert removal is benign (no-op).
 		if ep.DerivedHostLabel == "" {
 			continue
 		}

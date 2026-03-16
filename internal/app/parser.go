@@ -305,10 +305,11 @@ func SetDefaults(app *api.AppDefinition) {
 			app.Listeners[i].Flow = api.FlowTCP
 		}
 		if app.Listeners[i].Protocol == api.ListenerProtocolUnknown {
-			// RFC 20260130: Primary listeners require host-based routing, so default to http.
+			// RFC 20260130: flow:tcp primary listeners require host-based routing, so default to http.
+			// flow:tls and flow:udp primary listeners don't require HTTP semantics, so default to raw.
 			// Non-primary listeners default to raw for backward compatibility.
 			isPrimary := app.Listeners[i].Primary || hostname.IsPrimaryMarker(app.Listeners[i].Name)
-			if isPrimary {
+			if isPrimary && app.Listeners[i].Flow == api.FlowTCP {
 				app.Listeners[i].Protocol = api.ListenerProtocolHTTP
 			} else {
 				app.Listeners[i].Protocol = api.ListenerProtocolRaw
@@ -751,7 +752,7 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 
 	names := make(map[string]struct{})
 	guestPorts := make(map[string]string) // keyed by "port/transport" (e.g., "53/tcp", "53/udp")
-	portClaims := make(map[string]string) // keyed by "port/flow" for intra-app uniqueness
+	portClaims := make(map[string]string) // keyed by "port/transport" for intra-app uniqueness
 	hasPrimaryMarker := false
 
 	for i, l := range listeners {
@@ -770,16 +771,11 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 			}
 			hasPrimaryMarker = true
 
-			// Primary listeners must be eligible for host-based routing.
-			// TLS/UDP flow and raw protocol don't support host-based routing.
-			if l.Flow == api.FlowTLS {
-				return fmt.Errorf("primary listener '%s' cannot use flow: tls (not eligible for host routing)", l.Name)
-			}
-			if l.Flow == api.FlowUDP {
-				return fmt.Errorf("primary listener '%s' cannot use flow: udp (not eligible for host routing)", l.Name)
-			}
-			if l.Protocol == api.ListenerProtocolRaw {
-				return fmt.Errorf("primary listener '%s' cannot use protocol: raw (not eligible for host routing)", l.Name)
+			// Primary listeners: flow:tcp + protocol:raw is the only rejected combination
+			// (no HTTP semantics for LAN host-based routing, and no TLS/UDP passthrough path).
+			// flow:tls and flow:udp are allowed as primary per RFC 20260316.
+			if l.Flow == api.FlowTCP && l.Protocol == api.ListenerProtocolRaw {
+				return fmt.Errorf("primary listener '%s' cannot use protocol: raw with flow: tcp (not eligible for host routing)", l.Name)
 			}
 		}
 

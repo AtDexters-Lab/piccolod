@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"piccolod/internal/api"
 )
 
 // ListenerHealthStatus represents the overall health state of a listener.
@@ -304,6 +306,11 @@ func RemoteServiceHostname(derivedHostLabel, portalHostname string) string {
 // - Default remote hostname cert (wildcard or per-host depending on solver)
 // - One or more alias certs (custom domains pointed to this listener)
 func ResolveCertificatesForListener(ep ServiceEndpoint, remoteEnabled bool, solver, portalHostname string, aliases []RemoteAlias) ([]string, bool) {
+	// flow:tls listeners manage their own certificates — skip Piccolo cert resolution (RFC 20260316).
+	if ep.Flow == api.FlowTLS {
+		return nil, false
+	}
+
 	// 1. Remote access disabled → no certificates needed
 	if !remoteEnabled {
 		return nil, false

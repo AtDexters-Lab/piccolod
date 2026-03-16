@@ -138,19 +138,28 @@ func TestResolvePrimaryListener(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "implicit primary - skip tls",
+			name: "implicit primary - tls is eligible",
 			listeners: []api.AppListener{
 				{Name: "secure", Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTLS},
 				{Name: "web", Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTCP},
 			},
-			want:    "web",
+			want:    "secure",
 			wantErr: false,
 		},
 		{
-			name: "no eligible primary",
+			name: "implicit primary - skip raw tcp only",
 			listeners: []api.AppListener{
 				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP},
 				{Name: "secure", Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTLS},
+			},
+			want:    "secure",
+			wantErr: false,
+		},
+		{
+			name: "no eligible primary - all raw tcp",
+			listeners: []api.AppListener{
+				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP},
+				{Name: "tcp2", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP},
 			},
 			want:    "",
 			wantErr: false,
@@ -164,18 +173,35 @@ func TestResolvePrimaryListener(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "primary on tls",
+			name: "primary on tls - allowed",
 			listeners: []api.AppListener{
 				{Name: "secure", Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTLS, Primary: true},
 			},
-			wantErr: true,
+			want:    "secure",
+			wantErr: false,
 		},
 		{
-			name: "primary on raw",
+			name: "primary on udp - allowed",
+			listeners: []api.AppListener{
+				{Name: "dns", Protocol: api.ListenerProtocolRaw, Flow: api.FlowUDP, Primary: true},
+			},
+			want:    "dns",
+			wantErr: false,
+		},
+		{
+			name: "primary on raw tcp - rejected",
 			listeners: []api.AppListener{
 				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP, Primary: true},
 			},
 			wantErr: true,
+		},
+		{
+			name: "implicit primary - udp eligible",
+			listeners: []api.AppListener{
+				{Name: "dns", Protocol: api.ListenerProtocolRaw, Flow: api.FlowUDP},
+			},
+			want:    "dns",
+			wantErr: false,
 		},
 	}
 

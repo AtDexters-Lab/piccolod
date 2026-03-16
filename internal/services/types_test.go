@@ -15,10 +15,11 @@ func TestIsEligibleForHostRouting(t *testing.T) {
 	}{
 		{"http tcp", api.ListenerProtocolHTTP, api.FlowTCP, true},
 		{"websocket tcp", api.ListenerProtocolWebsocket, api.FlowTCP, true},
-		{"http tls", api.ListenerProtocolHTTP, api.FlowTLS, false},
-		{"websocket tls", api.ListenerProtocolWebsocket, api.FlowTLS, false},
+		{"http tls", api.ListenerProtocolHTTP, api.FlowTLS, true},
+		{"websocket tls", api.ListenerProtocolWebsocket, api.FlowTLS, true},
 		{"raw tcp", api.ListenerProtocolRaw, api.FlowTCP, false},
-		{"raw tls", api.ListenerProtocolRaw, api.FlowTLS, false},
+		{"raw tls", api.ListenerProtocolRaw, api.FlowTLS, true},
+		{"raw udp", api.ListenerProtocolRaw, api.FlowUDP, false},
 	}
 
 	for _, tt := range tests {

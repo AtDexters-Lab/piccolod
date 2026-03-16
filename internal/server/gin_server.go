@@ -2608,8 +2608,8 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 			entries := s.portalCertEntries()
 			for _, entry := range entries {
 				for _, ep := range payload.Added {
-					if ep.DerivedHostLabel == "" {
-						continue
+					if ep.DerivedHostLabel == "" || ep.Flow == api.FlowTLS {
+						continue // flow:tls apps manage their own certificates (RFC 20260316)
 					}
 					host := services.RemoteServiceHostname(ep.DerivedHostLabel, entry.Hostname)
 					if host == "" {
@@ -2682,8 +2682,8 @@ func (s *GinServer) queueAllEndpointCerts() {
 	endpoints := sm.GetAll()
 	for _, entry := range entries {
 		for _, ep := range endpoints {
-			if ep.DerivedHostLabel == "" {
-				continue
+			if ep.DerivedHostLabel == "" || ep.Flow == api.FlowTLS {
+				continue // flow:tls apps manage their own certificates (RFC 20260316)
 			}
 			host := services.RemoteServiceHostname(ep.DerivedHostLabel, entry.Hostname)
 			if host == "" {

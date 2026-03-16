@@ -725,12 +725,11 @@ func TestPortClaimValidation(t *testing.T) {
 			errContains: "guest_port 53/tcp used by both",
 		},
 		{
-			name: "reject_udp_primary",
+			name: "allow_udp_primary",
 			app: baseApp([]api.AppListener{
 				{Name: "dns", GuestPort: 53, Flow: api.FlowUDP, Protocol: api.ListenerProtocolRaw, Primary: true, PortClaim: intPtr(53)},
 			}),
-			expectError: true,
-			errContains: "cannot use flow: udp",
+			expectError: false,
 		},
 	}
 

@@ -174,8 +174,9 @@ func CheckCollisions(newLabels []string, existingLabels map[string]string) error
 //
 // Rules:
 // - If a listener has Primary=true, it becomes primary (only one allowed)
-// - Primary=true is not allowed on flow:tls or protocol:raw listeners
-// - If no explicit primary, the first HTTP/WS listener becomes primary
+// - Primary=true is not allowed on flow:tcp + protocol:raw (no host routing)
+// - If no explicit primary, the first eligible listener becomes primary
+//   (any listener except flow:tcp + protocol:raw)
 // - Returns "" if there are no eligible primary listeners
 func ResolvePrimaryListener(listeners []api.AppListener) (string, error) {
 	var explicit string
@@ -184,11 +185,8 @@ func ResolvePrimaryListener(listeners []api.AppListener) (string, error) {
 			if explicit != "" {
 				return "", fmt.Errorf("multiple primary listeners: '%s' and '%s'", explicit, l.Name)
 			}
-			if l.Flow == api.FlowTLS {
-				return "", fmt.Errorf("primary not allowed on flow:tls listener '%s'", l.Name)
-			}
-			if l.Protocol == api.ListenerProtocolRaw {
-				return "", fmt.Errorf("primary not allowed on protocol:raw listener '%s'", l.Name)
+			if l.Flow == api.FlowTCP && l.Protocol == api.ListenerProtocolRaw {
+				return "", fmt.Errorf("primary not allowed on protocol:raw with flow:tcp listener '%s'", l.Name)
 			}
 			explicit = l.Name
 		}
@@ -197,12 +195,14 @@ func ResolvePrimaryListener(listeners []api.AppListener) (string, error) {
 		return explicit, nil
 	}
 
-	// First HTTP/WebSocket listener becomes primary
-	// (flow:tcp + protocol:http|websocket are eligible for host-based routing)
+	// Auto-select: first eligible listener becomes primary.
+	// Skip flow:tcp + protocol:raw (not eligible for host-based routing).
+	// All other combinations are allowed per RFC 20260316.
 	for _, l := range listeners {
-		if l.Flow != api.FlowTLS && (l.Protocol == api.ListenerProtocolHTTP || l.Protocol == api.ListenerProtocolWebsocket) {
-			return l.Name, nil
+		if l.Flow == api.FlowTCP && l.Protocol == api.ListenerProtocolRaw {
+			continue
 		}
+		return l.Name, nil
 	}
 
 	return "", nil // No eligible primary

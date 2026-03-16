@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"piccolod/internal/api"
 	"piccolod/internal/events"
 )
 
@@ -581,9 +582,9 @@ func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsC
 		}
 	}
 
-	// Add new labels
+	// Add new labels (skip flow:tls — not served on LAN host-based, RFC 20260316)
 	for _, ep := range payload.Added {
-		if ep.DerivedHostLabel != "" {
+		if ep.DerivedHostLabel != "" && ep.Flow != api.FlowTLS {
 			merged = append(merged, ep.DerivedHostLabel)
 		}
 	}
