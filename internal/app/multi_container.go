@@ -1,14 +1,18 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 
+	"gopkg.in/yaml.v3"
+
 	"piccolod/internal/api"
 	"piccolod/internal/container"
+	"piccolod/internal/fsutil"
 	"piccolod/internal/persistence"
 )
 
@@ -90,7 +94,7 @@ func appNetworkMode(def *api.AppDefinition) string {
 }
 
 // serviceContainerOptions holds all parameters for building a service container spec.
-// The workspace fields are optional and only used for workspace mode apps.
+// The rootfs fields are optional and used for both workspace and service mode apps.
 type serviceContainerOptions struct {
 	layout     appVolumeLayout
 	appDef     *api.AppDefinition
@@ -121,8 +125,10 @@ func buildOriginalCmdFromSlices(entrypoint, cmd []string) []string {
 }
 
 // buildServiceContainerSpec builds a container spec for a service container.
-// For workspace mode (when workspaceMeta is provided), it configures --rootfs mode
-// and applies the saved image config. For service mode, it uses the service image directly.
+// In rootfs mode (rootfsHandle + goldenImgConfig), the entrypoint strategy depends
+// on x-piccolo.mode: workspace gets boot.sh wrapping, service/unknown gets the
+// image's native entrypoint with --init, and init:image delegates to the image's
+// init system. Without rootfs fields, the service image is used directly.
 func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (container.ContainerCreateSpec, error) {
 	if opts.appDef == nil || opts.appDef.Services == nil {
 		return container.ContainerCreateSpec{}, fmt.Errorf("service container spec requires app definition services")
@@ -158,11 +164,16 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		spec.WorkingDir = opts.goldenImgConfig.WorkingDir
 		spec.User = opts.goldenImgConfig.User
 
+		mode := piccoloModeFromExtensions(opts.appDef.Extensions)
+
 		if svc.Init == "image" {
+			// Workspace-only opt-out: image manages its own init (e.g., s6-overlay).
+			// UseInit intentionally false — image's init system needs to be PID 1.
+			// Parser validation in validateContainerModel prevents this for service mode.
 			spec.Entrypoint = opts.goldenImgConfig.Entrypoint
 			spec.Command = opts.goldenImgConfig.Cmd
-		} else {
-			// Default: Piccolo manages init via catatonit + boot.sh wrapper
+		} else if mode == ModeWorkspace {
+			// Workspace default: boot.sh wrapper + catatonit for keep-alive and hooks.
 			originalCmd := buildOriginalCmdFromSlices(opts.goldenImgConfig.Entrypoint, opts.goldenImgConfig.Cmd)
 			spec.Entrypoint = []string{"/bin/sh", "/piccolo/boot.sh"}
 			spec.Command = originalCmd
@@ -194,6 +205,13 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
 				Host: startupHost, Container: "/usr/local/bin/piccolo-startup", Options: "ro",
 			})
+		} else {
+			// Service mode (+ ModeUnknown as defensive default — boot.sh keep-alive
+			// should only apply when mode is explicitly workspace).
+			// Image's native entrypoint with --init for zombie reaping.
+			spec.Entrypoint = opts.goldenImgConfig.Entrypoint
+			spec.Command = opts.goldenImgConfig.Cmd
+			spec.UseInit = true
 		}
 
 		configDir := filepath.Join(opts.layout.DataDir, "piccolo-config")
@@ -206,6 +224,10 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		spec.Volumes = append(spec.Volumes, container.VolumeMapping{
 			Host: configDir, Container: "/piccolo/config", Options: "rw,U",
 		})
+
+		if err := writeAppConfig(configDir, opts.appDef.AppConfig, int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+			return container.ContainerCreateSpec{}, err
+		}
 	}
 
 	if svc.Resources != nil && svc.Resources.Limits != nil {
@@ -314,6 +336,31 @@ func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreate
 		}
 	}
 
+	return nil
+}
+
+// writeAppConfig materializes the app_config manifest field as /piccolo/config/app.yaml.
+// When appConfig is nil, any existing app.yaml is removed to prevent stale config.
+func writeAppConfig(configDir string, appConfig interface{}, uid, gid int) error {
+	appConfigPath := filepath.Join(configDir, "app.yaml")
+
+	if appConfig == nil {
+		if err := os.Remove(appConfigPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("failed to remove stale app_config: %w", err)
+		}
+		return nil
+	}
+
+	data, err := yaml.Marshal(appConfig)
+	if err != nil {
+		return fmt.Errorf("failed to marshal app_config: %w", err)
+	}
+	if err := fsutil.AtomicWriteFile(appConfigPath, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write app_config: %w", err)
+	}
+	if err := container.ChownIfNeeded(appConfigPath, uid, gid); err != nil {
+		return fmt.Errorf("failed to chown app_config: %w", err)
+	}
 	return nil
 }
 

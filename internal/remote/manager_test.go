@@ -382,8 +382,8 @@ func TestEnqueueIssuanceRespectsRetryAt(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	// enqueueIssuance (non-forced) should skip because RetryAt is in the future.
-	m.enqueueIssuance("host:app.portal.example.com", []string{"app.portal.example.com"}, "app.portal.example.com")
+	// enqueueIssuanceJob (non-forced) should skip because RetryAt is in the future.
+	m.enqueueIssuanceJob(issuanceJob{id: "host:app.portal.example.com", domains: []string{"app.portal.example.com"}, commonName: "app.portal.example.com"})
 
 	// Cert should still be "error" — not reset to "pending".
 	for _, c := range m.ListCertificates() {

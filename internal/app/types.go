@@ -32,10 +32,11 @@ import (
 //   - desiredRunning = Enabled && (isLeaderForApp)
 // This ensures containers only run on the leader node while preserving user intent across failovers.
 const (
-	StatusRunning  = "running"  // Containers are running and healthy
-	StatusStopped  = "stopped"  // Containers are stopped locally (Enabled may still be true on follower nodes)
-	StatusStarting = "starting" // Containers are being started or recovering
-	StatusError    = "error"    // Startup failed after escalation threshold
+	StatusRunning      = "running"      // Containers are running and healthy
+	StatusStopped      = "stopped"      // Containers are stopped locally (Enabled may still be true on follower nodes)
+	StatusStarting     = "starting"     // Containers are being started or recovering
+	StatusError        = "error"        // Startup failed after escalation threshold
+	StatusUninstalling = "uninstalling" // App is being torn down
 )
 
 // ContainerManager describes the container runtime operations required by the app manager.
@@ -52,7 +53,7 @@ type ContainerManager interface {
 	LogsStream(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int, timestamps bool) (io.ReadCloser, error)
 	ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error)
 	InspectContainerState(ctx context.Context, runtime container.PodmanRuntime, containerID string) (container.ContainerState, error)
-	InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[int]int, error)
+	InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[string]int, error)
 	UpdatePublishAdd(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
 	UpdatePublishRemove(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error
 	ResetStorage(ctx context.Context, runtime container.PodmanRuntime) error

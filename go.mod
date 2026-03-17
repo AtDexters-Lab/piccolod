@@ -5,6 +5,7 @@ go 1.25.0
 replace github.com/docker/docker => github.com/moby/moby v26.1.4+incompatible
 
 require (
+	github.com/AtDexters-Lab/namek-server v0.1.2
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/cosmos/go-bip39 v1.0.0
@@ -19,7 +20,6 @@ require (
 )
 
 require (
-	github.com/AtDexters-Lab/namek-server v0.1.0 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.10.0 // indirect
 	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect

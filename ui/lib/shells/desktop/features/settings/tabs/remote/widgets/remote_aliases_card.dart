@@ -87,7 +87,7 @@ class RemoteAliasesCard extends StatelessWidget {
                 const SizedBox(height: Spacing.base),
                 DropdownButtonFormField<String>(
                   decoration: const InputDecoration(labelText: 'Route To'),
-                  value: selectedListener,
+                  initialValue: selectedListener,
                   items: [
                     const DropdownMenuItem(value: '__portal', child: Text('Portal')),
                     ...routableServices.map((s) {

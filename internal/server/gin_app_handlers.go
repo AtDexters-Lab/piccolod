@@ -148,6 +148,21 @@ func (s *GinServer) portalCertEntries() []portalCertEntry {
 				})
 			}
 		}
+
+		// Alias domains — HTTP-01 per-app certs (source-agnostic: works for both
+		// self-hosted and namek traffic paths). Only include when at least one remote
+		// access path is active (self-hosted enabled or namek active), since HTTP-01
+		// challenges require the domain to be reachable.
+		if st.Enabled || s.namekDomainActive() {
+			for _, a := range rm.ListAliases() {
+				h := normalizeHostname(a.Hostname)
+				if h != "" {
+					entries = append(entries, portalCertEntry{
+						Hostname: h, Source: "alias", Solver: "http-01",
+					})
+				}
+			}
+		}
 	}
 	// Namek portals use DNS-01 → wildcard coverage → no per-app certs needed.
 	return entries
@@ -169,8 +184,8 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	}
 	for _, entry := range entries {
 		for _, ep := range endpoints {
-			if ep.DerivedHostLabel == "" {
-				continue
+			if ep.DerivedHostLabel == "" || ep.Flow == api.FlowTLS {
+				continue // flow:tls apps manage their own certificates (RFC 20260316)
 			}
 			host := services.RemoteServiceHostname(ep.DerivedHostLabel, entry.Hostname)
 			if host == "" {
@@ -185,6 +200,23 @@ func (s *GinServer) queueAppRemoteCertificates(appName string) {
 	}
 }
 
+// removePerAppCertsForBase removes per-app host certs (host:<label>.<base>) for all endpoints.
+// Called when an alias is deleted to clean up orphaned per-app certs.
+func (s *GinServer) removePerAppCertsForBase(base string) {
+	rm := s.remoteManager
+	sm := s.serviceManager
+	if rm == nil || sm == nil || base == "" {
+		return
+	}
+	endpoints := sm.GetAll()
+	for _, ep := range endpoints {
+		if ep.DerivedHostLabel == "" {
+			continue
+		}
+		rm.RemoveHostnameCertificate(ep.DerivedHostLabel + "." + base)
+	}
+}
+
 func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, base string) map[string]struct{} {
 	hosts := map[string]struct{}{}
 	base = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
@@ -192,8 +224,8 @@ func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, base string) 
 		return hosts
 	}
 	for _, ep := range endpoints {
-		// Only include HTTP/WS listeners that have host-based routing
-		// DerivedHostLabel is empty for raw/tls listeners (per RFC 20260114)
+		// DerivedHostLabel is empty for raw (flow:tcp) and udp listeners.
+		// flow:tls listeners have a label (for remote routing) but cert removal is benign (no-op).
 		if ep.DerivedHostLabel == "" {
 			continue
 		}
@@ -261,42 +293,99 @@ func writeGinSuccess(c *gin.Context, data interface{}, message string) {
 	c.JSON(http.StatusOK, response)
 }
 
-// handleGinAppValidate handles POST /api/v1/apps/validate - Validate app.yaml without installing
-func (s *GinServer) handleGinAppValidate(c *gin.Context) {
+// parseAppDefinitionFromRequest reads and parses an app YAML from the request body.
+// Returns nil and writes an error response if parsing fails.
+func (s *GinServer) parseAppDefinitionFromRequest(c *gin.Context) *api.AppDefinition {
 	contentType := c.GetHeader("Content-Type")
 	if !strings.Contains(contentType, "application/x-yaml") && !strings.Contains(contentType, "text/yaml") && !strings.Contains(contentType, "application/json") {
 		writeGinError(c, http.StatusUnsupportedMediaType, "Content-Type must be application/x-yaml or text/yaml or application/json")
-		return
+		return nil
 	}
 	var yamlData []byte
 	if strings.Contains(contentType, "application/json") {
-		// Accept { app_definition: "...yaml..." }
 		var req struct {
 			AppDefinition string `json:"app_definition"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
 			writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
-			return
+			return nil
 		}
 		yamlData = []byte(req.AppDefinition)
 	} else {
 		body, err := c.GetRawData()
 		if err != nil || len(body) == 0 {
 			writeGinError(c, http.StatusBadRequest, "Request body cannot be empty")
-			return
+			return nil
 		}
 		yamlData = body
 	}
-	if _, err := app.ParseAppDefinition(yamlData); err != nil {
+	def, err := app.ParseAppDefinition(yamlData)
+	if err != nil {
 		var ve *app.ValidationError
 		if errors.As(err, &ve) && ve != nil {
 			writeGinErrorWithKey(c, http.StatusBadRequest, "Invalid app.yaml: "+ve.Message, ve.Code)
-			return
+			return nil
 		}
 		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
+		return nil
+	}
+	return def
+}
+
+// handleGinAppValidate handles POST /api/v1/apps/validate - Validate app.yaml without installing
+func (s *GinServer) handleGinAppValidate(c *gin.Context) {
+	if def := s.parseAppDefinitionFromRequest(c); def != nil {
+		writeGinSuccess(c, gin.H{"valid": true}, "valid")
+	}
+}
+
+// handleGinAppPreflight handles POST /api/v1/apps/preflight - validate manifest and report port claims
+func (s *GinServer) handleGinAppPreflight(c *gin.Context) {
+	def := s.parseAppDefinitionFromRequest(c)
+	if def == nil {
 		return
 	}
-	writeGinSuccess(c, gin.H{"valid": true}, "valid")
+
+	type portClaimDetail struct {
+		Port     int    `json:"port"`
+		Protocol string `json:"protocol"`
+		Listener string `json:"listener"`
+		Flow     string `json:"flow"`
+	}
+	claims := make([]portClaimDetail, 0)
+	conflicts := make([]string, 0)
+
+	// Snapshot the registry once for consistent conflict checks across all listeners.
+	var registry map[string]map[string]services.ServiceEndpoint
+	if s.serviceManager != nil {
+		registry = s.serviceManager.SnapshotRegistry()
+	}
+
+	for _, l := range def.Listeners {
+		if l.PortClaim == nil {
+			continue
+		}
+		claims = append(claims, portClaimDetail{
+			Port:     *l.PortClaim,
+			Protocol: l.Flow.TransportProtocol(),
+			Listener: l.Name,
+			Flow:     l.Flow.String(),
+		})
+		for appName, endpoints := range registry {
+			for _, ep := range endpoints {
+				if ep.PortClaim != nil && *ep.PortClaim == *l.PortClaim && ep.Flow.TransportProtocol() == l.Flow.TransportProtocol() {
+					conflicts = append(conflicts, fmt.Sprintf("%s port %d claimed by app '%s' listener '%s'",
+						l.Flow.TransportProtocol(), *l.PortClaim, appName, ep.Name))
+				}
+			}
+		}
+	}
+
+	writeGinSuccess(c, gin.H{
+		"valid":     true,
+		"claims":    claims,
+		"conflicts": conflicts,
+	}, "preflight")
 }
 
 // handleGinCatalogTemplate handles GET /api/v1/catalog/:name/template - return YAML template for a catalog app
@@ -1040,6 +1129,10 @@ func handleAppManagerError(c *gin.Context, err error, action string) bool {
 	if errors.Is(err, app.ErrLocked) {
 		msg := fmt.Sprintf("Unable to %s while storage is locked. Unlock Piccolo to continue.", action)
 		writeGinError(c, http.StatusLocked, msg)
+		return true
+	}
+	if errors.Is(err, app.ErrAppUninstalling) {
+		writeGinError(c, http.StatusConflict, "App is being uninstalled")
 		return true
 	}
 	return false

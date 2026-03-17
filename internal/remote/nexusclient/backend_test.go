@@ -3,10 +3,14 @@ package nexusclient
 import (
 	"context"
 	"errors"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"piccolod/internal/api"
+	"piccolod/internal/router"
 
 	backend "github.com/AtDexters-Lab/nexus-proxy-backend-client/client"
 )
@@ -133,8 +137,165 @@ func TestWithAdapterName(t *testing.T) {
 	}
 }
 
+func TestStartWithPortClaims(t *testing.T) {
+	adapter := NewBackendAdapter(nil, nil)
+	cfg := Config{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		PortalHostname: "portal.example.com",
+		ClaimMappings: []api.PortClaimInfo{
+			{Port: 53, HostBind: 15001, Protocol: "udp"},
+			{Port: 22, HostBind: 15002, Protocol: "tcp"},
+		},
+	}
+	if err := adapter.Configure(cfg); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	var captured backend.ClientBackendConfig
+	adapter.factory = func(cfg backend.ClientBackendConfig, opts ...backend.Option) (backendClient, error) {
+		captured = cfg
+		return &fakeClient{}, nil
+	}
+
+	if err := adapter.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { adapter.Stop(context.Background()) })
+
+	// Verify TCPPorts
+	if len(captured.TCPPorts) != 1 || captured.TCPPorts[0] != 22 {
+		t.Fatalf("expected TCPPorts=[22], got %v", captured.TCPPorts)
+	}
+
+	// Verify UDPRoutes
+	if len(captured.UDPRoutes) != 1 || captured.UDPRoutes[0].Port != 53 {
+		t.Fatalf("expected UDPRoutes=[{53}], got %v", captured.UDPRoutes)
+	}
+
+	// Verify PortMappings include both defaults and claims
+	if _, ok := captured.PortMappings[80]; !ok {
+		t.Fatal("expected default port mapping for 80")
+	}
+	if _, ok := captured.PortMappings[443]; !ok {
+		t.Fatal("expected default port mapping for 443")
+	}
+	pm53, ok := captured.PortMappings[53]
+	if !ok {
+		t.Fatal("expected port mapping for claimed port 53")
+	}
+	if pm53.Default != "127.0.0.1:15001" {
+		t.Fatalf("port 53 mapping = %q, want 127.0.0.1:15001", pm53.Default)
+	}
+	pm22, ok := captured.PortMappings[22]
+	if !ok {
+		t.Fatal("expected port mapping for claimed port 22")
+	}
+	if pm22.Default != "127.0.0.1:15002" {
+		t.Fatalf("port 22 mapping = %q, want 127.0.0.1:15002", pm22.Default)
+	}
+}
+
 type fakeTokenProvider struct{}
 
 func (f *fakeTokenProvider) IssueToken(ctx context.Context, req backend.TokenRequest) (backend.Token, error) {
 	return backend.Token{Value: "test-token"}, nil
+}
+
+// mockResolver implements RemoteResolver for connectHandler tests.
+type mockResolver struct {
+	port int
+	ok   bool
+}
+
+func (m *mockResolver) Resolve(hostname string, remotePort int, isTLS bool) (int, bool) {
+	return m.port, m.ok
+}
+
+func TestConnectHandler(t *testing.T) {
+	t.Run("resolver_valid_port", func(t *testing.T) {
+		// Start a real TCP listener so the dial succeeds.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		defer ln.Close()
+		port := ln.Addr().(*net.TCPAddr).Port
+
+		adapter := NewBackendAdapter(nil, &mockResolver{port: port, ok: true})
+		handler := adapter.connectHandler()
+		conn, err := handler(context.Background(), backend.ConnectRequest{
+			Hostname:         "example.com",
+			OriginalHostname: "example.com",
+			Port:             443,
+			IsTLS:            true,
+		})
+		if err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		conn.Close()
+	})
+
+	t.Run("resolver_0_false", func(t *testing.T) {
+		// Both lookups return (0, false) → ErrNoRoute.
+		adapter := NewBackendAdapter(nil, &mockResolver{port: 0, ok: false})
+		handler := adapter.connectHandler()
+		_, err := handler(context.Background(), backend.ConnectRequest{
+			Hostname:         "unknown.com",
+			OriginalHostname: "unknown.com",
+			Port:             443,
+			IsTLS:            true,
+		})
+		if !errors.Is(err, backend.ErrNoRoute) {
+			t.Fatalf("expected ErrNoRoute, got %v", err)
+		}
+	})
+
+	t.Run("resolver_0_true", func(t *testing.T) {
+		// Resolver returns (0, true) — the bug scenario. Must be a fatal error, NOT ErrNoRoute.
+		adapter := NewBackendAdapter(nil, &mockResolver{port: 0, ok: true})
+		handler := adapter.connectHandler()
+		_, err := handler(context.Background(), backend.ConnectRequest{
+			Hostname:         "piccolospace.com",
+			OriginalHostname: "piccolospace.com",
+			Port:             443,
+			IsTLS:            true,
+		})
+		if err == nil {
+			t.Fatal("expected error when resolver returns port 0")
+		}
+		if errors.Is(err, backend.ErrNoRoute) {
+			t.Fatal("port-0 must NOT fall back to ErrNoRoute (would route to wrong cert)")
+		}
+	})
+
+	t.Run("nil_resolver", func(t *testing.T) {
+		adapter := NewBackendAdapter(nil, nil)
+		handler := adapter.connectHandler()
+		_, err := handler(context.Background(), backend.ConnectRequest{
+			Hostname:         "example.com",
+			OriginalHostname: "example.com",
+			Port:             443,
+			IsTLS:            true,
+		})
+		if !errors.Is(err, backend.ErrNoRoute) {
+			t.Fatalf("expected ErrNoRoute for nil resolver, got %v", err)
+		}
+	})
+
+	t.Run("tunnel_mode", func(t *testing.T) {
+		rm := router.NewManager()
+		rm.RegisterAppRoute("myapp", router.ModeTunnel, "leader-1")
+		adapter := NewBackendAdapter(rm, &mockResolver{port: 8080, ok: true})
+		handler := adapter.connectHandler()
+		_, err := handler(context.Background(), backend.ConnectRequest{
+			Hostname:         "myapp",
+			OriginalHostname: "myapp.example.com",
+			Port:             443,
+			IsTLS:            true,
+		})
+		if !errors.Is(err, backend.ErrNoRoute) {
+			t.Fatalf("expected ErrNoRoute in tunnel mode, got %v", err)
+		}
+	})
 }

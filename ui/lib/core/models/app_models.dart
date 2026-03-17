@@ -250,6 +250,7 @@ class AppListener {
     this.remotePorts = const [],
     this.middleware = const [],
     this.auth,
+    this.portClaim,
   });
 
   factory AppListener.fromServiceEndpoint(ServiceEndpoint ep) {
@@ -261,6 +262,7 @@ class AppListener {
       remotePorts: ep.remotePorts,
       middleware: ep.middleware,
       auth: ep.auth,
+      portClaim: ep.portClaim,
     );
   }
   final String name;
@@ -270,6 +272,7 @@ class AppListener {
   final List<int> remotePorts;
   final List<dynamic> middleware;
   final Map<String, dynamic>? auth;
+  final int? portClaim;
 
   Map<String, dynamic> toJson() {
     return {
@@ -280,6 +283,7 @@ class AppListener {
       'remote_ports': remotePorts,
       'protocol_middleware': middleware,
       if (auth != null) 'auth': auth,
+      if (portClaim != null) 'port_claim': portClaim,
     };
   }
 }
@@ -326,6 +330,7 @@ class ServiceEndpoint {
     this.health,
     this.middleware = const [],
     this.auth,
+    this.portClaim,
   });
 
   factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
@@ -356,6 +361,7 @@ class ServiceEndpoint {
       auth: json['auth'] is Map
           ? Map<String, dynamic>.from(json['auth'] as Map)
           : null,
+      portClaim: json['port_claim'] as int?,
     );
   }
   final String app;
@@ -375,6 +381,7 @@ class ServiceEndpoint {
   final ListenerHealth? health;
   final List<dynamic> middleware;
   final Map<String, dynamic>? auth;
+  final int? portClaim;
 
   // Helper to get the Remote URL (if enabled)
   String? get remoteUrl {

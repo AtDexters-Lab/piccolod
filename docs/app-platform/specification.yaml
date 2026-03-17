@@ -196,10 +196,13 @@ services:
 # LISTENERS -------------------------------------------------------------------
 # Listeners are required in service mode. Workspace mode may omit listeners.
 #
-# Each listener defines a public proxy endpoint; piccolod allocates a per-listener public port on the host.
+# Each listener defines a public proxy endpoint; piccolod allocates a per-listener public port on the host
+# (or binds a specific well-known port when `port_claim` is set).
 # - LAN (port-based): http://<host>:<public_port>/...
 # - LAN (host-based; HTTP/WebSocket only, optional): http://<app>.<lan-base>/... and http://<listener>-<app>.<lan-base>/...
+# - LAN (port-claimed): <host>:<port_claim> — bypasses auto-allocation, binds the exact port
 # - Remote/WAN: https://<app>.<remote-base>/... and https://<listener>-<app>.<remote-base>/... (published via Nexus)
+# - Remote (port-claimed, self-managed Nexus only): claimed ports are also registered on the relay
 #
 # Notes:
 # - <lan-base> is the device mDNS hostname (e.g., piccolo.local).
@@ -212,6 +215,13 @@ services:
 # - The `__primary` marker is replaced at install time with the `__app_address__` input value.
 #
 # If remote_ports is omitted, Piccolo defaults to [80, 443].
+#
+# Flow types:
+# - tcp: unencrypted TCP transport (default). Supports all protocols (raw, http, websocket).
+# - tls: TLS passthrough. Piccolo does not terminate TLS; the app handles its own certificates.
+#        Not eligible for host-based routing or auth rules.
+# - udp: raw UDP transport. Cannot use protocol: http or websocket.
+#        Not eligible for host-based routing, auth rules, or certificates.
 listeners:
   # REQUIRED: Listener identifier.
   # Constraints:
@@ -225,9 +235,29 @@ listeners:
   # user-provided `__app_address__` input value during installation.
   - name: __primary
     guest_port: 8080
-    flow: tcp # tcp (default) | tls (passthrough; no HTTP visibility)
+    flow: tcp # tcp (default) | tls (passthrough; no HTTP visibility) | udp (raw UDP transport)
     protocol: http # raw (default) | http | websocket
     remote_ports: [80, 443]
+
+    # Optional: claim a specific well-known port on the LAN instead of auto-allocating
+    # from the 35000-45000 range. When a self-managed Nexus relay is configured, the
+    # port is also claimed on the relay for remote access.
+    #
+    # Constraints:
+    # - Must be 1-65535
+    # - Cannot be 80, 443 (portal), or 5353 (mDNS)
+    # - Cannot overlap host-bind range (15000-25000) or auto-allocate range (35000-45000)
+    # - Works with all flow types (tcp, tls, udp)
+    # - flow: udp cannot use protocol: http or websocket
+    # - Two listeners may share the same guest_port if they use different transport
+    #   protocols (TCP vs UDP), e.g., DNS on both TCP 53 and UDP 53
+    # - Cross-app uniqueness: protocol-aware — one app can claim TCP 53 while
+    #   another claims UDP 53 (separate OS port namespaces)
+    #
+    # The user is shown port claim requirements at install time and must approve.
+    # Firewall rules are opened automatically (runtime-only, re-applied on boot).
+    #
+    # port_claim: 8080
 
     # Optional: ordered protocol middleware pipeline. Reserved for future use.
     # protocol_middleware:
@@ -268,6 +298,22 @@ listeners:
     flow: tcp
     protocol: raw
     remote_ports: [22]
+    # port_claim: 2222  # Optional: expose SSH on a specific LAN port
+
+  # Example: DNS listener with port claims (e.g., Pi-hole)
+  # DNS requires both UDP and TCP on port 53. Two listeners can share the same
+  # guest_port when they use different transport protocols.
+  #
+  # - name: dns
+  #   guest_port: 53
+  #   flow: udp
+  #   protocol: raw
+  #   port_claim: 53
+  # - name: dnstcp
+  #   guest_port: 53
+  #   flow: tcp
+  #   protocol: raw
+  #   port_claim: 53
 
 # HEALTH MONITORING ------------------------------------------------------------
 # Optional: Piccolo can probe an HTTP endpoint through a named listener.

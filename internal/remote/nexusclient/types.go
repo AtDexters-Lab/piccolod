@@ -1,6 +1,10 @@
 package nexusclient
 
-import "context"
+import (
+	"context"
+
+	"piccolod/internal/api"
+)
 
 // PortalHostLabel is the sentinel value for aliases that target the portal itself
 // rather than a specific app listener. It uses a double-underscore prefix that is
@@ -19,8 +23,9 @@ type AliasEntry struct {
 type Config struct {
 	Endpoint       string
 	DeviceSecret   string
-	PortalHostname string       // Fully-qualified hostname (e.g., portal.home.example.com)
-	Aliases        []AliasEntry // Additional hostnames routed to this device (e.g., custom domains)
+	PortalHostname string               // Fully-qualified hostname (e.g., portal.home.example.com)
+	Aliases        []AliasEntry         // Additional hostnames routed to this device (e.g., custom domains)
+	ClaimMappings  []api.PortClaimInfo  // Port claims with local targets; TCP/UDP derived at start time
 }
 
 // Adapter provides a lifecycle wrapper around the nexus backend client.

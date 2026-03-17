@@ -1,6 +1,6 @@
 package identity
 
-const defaultNamekURL = "https://namek.piccolo.cloud"
+const defaultNamekURL = "https://namek.atdexters.com"
 
 // Config holds the persisted identity state for namek-managed remote access.
 // Stored at {coreRoot}/network-bootstrap/remote/identity.json.

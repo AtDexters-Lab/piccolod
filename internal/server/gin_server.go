@@ -27,6 +27,7 @@ import (
 	crypt "piccolod/internal/crypt"
 	pki "piccolod/internal/crypto"
 	"piccolod/internal/events"
+	"piccolod/internal/firewall"
 	"piccolod/internal/health"
 	"piccolod/internal/identity"
 	"piccolod/internal/onboarding"
@@ -173,8 +174,11 @@ type GinServer struct {
 	namekAdapterCancel context.CancelFunc
 	namekLastKey       string
 	namekStopped       atomic.Bool
-	namekMu            sync.Mutex // protects namek adapter fields
+	namekMu            sync.RWMutex // protects namek adapter fields + namek domain state
 	namekACME          *identity.NamekACMEClient
+	namekDomainClient  *identity.NamekDomainClient           // domain management client
+	namekDomains       map[string]*namekDomainState           // alias hostname → namek state
+	namekReconcileStop context.CancelFunc                     // cancels in-flight reconciliation
 }
 
 type secureContextKey struct{}
@@ -428,7 +432,7 @@ func (r *serviceRemoteResolver) resolveAlias(
 		return 0, false
 	}
 	if hostLabel == nexusclient.PortalHostLabel || hostLabel == "" {
-		if normPort == 80 {
+		if normPort == 80 && portalPort > 0 {
 			return portalPort, true
 		}
 		if isTLS && tlsMuxPort > 0 {
@@ -461,7 +465,7 @@ func (r *serviceRemoteResolver) resolveAgainstBase(
 ) (int, bool) {
 	// Portal host (apex): route to portal port / TLS mux.
 	if h == portal {
-		if normPort == 80 {
+		if normPort == 80 && portalPort > 0 {
 			return portalPort, true
 		}
 		if isTLS && tlsMuxPort > 0 {
@@ -917,6 +921,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.registerUnlockReloader(rm)
 	rm.SetEventsBus(eventsBus)
 	s.observeRemoteCertQueuing(eventsBus)
+	s.observeRemotePortClaims(eventsBus)
 
 	// Wire remote status provider for health aggregation (RFC 20260125)
 	if rm != nil && svcMgr != nil {
@@ -1052,6 +1057,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		nexusAdapter = nexusclient.NewBackendAdapter(routeMgr, remoteResolver)
 	}
 	rm.SetNexusAdapter(nexusAdapter)
+	svcMgr.SetFirewallManager(firewall.NewFirewalldManager()) // falls back to no-op stub if firewall-cmd absent
+	rm.SetPortClaimProvider(svcMgr)
 
 	// Namek adapter (new, with TPM token provider) — owned by GinServer
 	if os.Getenv("PICCOLO_NEXUS_USE_STUB") != "1" {
@@ -1064,6 +1071,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		// Register namek orchClient in remote manager's source-agnostic registry
 		s.namekACME = identity.NewNamekACMEClient(identitySvc.NamekClient)
 		rm.RegisterOrchClient("namek", s.namekACME)
+
+		// Domain management client for alias domain lifecycle with namek
+		s.namekDomainClient = identity.NewNamekDomainClient(identitySvc.NamekClient)
 
 	}
 
@@ -1110,12 +1120,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 						msg = "Namek identity reset"
 					}
 					if msg != "" {
-						s.remoteManager.AppendEvent(remote.Event{
-							Timestamp: time.Now().UTC(),
-							Level:     "info",
-							Source:    "namek",
-							Message:   msg,
-						})
+						s.logNamekEvent("info", "%s", msg)
 					}
 				}
 			}
@@ -1150,6 +1155,14 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		// Cancellation is handled by the context passed to Watch
 		return nil
 	}))
+
+	// Register the systemd service-level watchdog. Pings systemd at WatchdogSec/2
+	// to prove piccolod is not stuck (e.g. D-state from btrfs hang). No-op when
+	// WatchdogSec is not set in the service file (dev/test).
+	s.supervisor.Register(supervisor.NewComponent("systemd-watchdog", func(ctx context.Context) error {
+		go s.runWatchdogLoop(ctx)
+		return nil
+	}, nil))
 
 	// (Simplified) No dynamic port publish/unpublish wiring; allow dial to fail gracefully.
 
@@ -1234,6 +1247,37 @@ func (s *GinServer) Start() error {
 	return nil
 }
 
+// runWatchdogLoop pings the systemd service-level watchdog at half the
+// configured WatchdogSec interval. If piccolod gets stuck (e.g. all threads
+// blocked in D-state during a btrfs hang), pings stop and systemd restarts
+// the service. The loop is a no-op when WatchdogSec is not configured.
+func (s *GinServer) runWatchdogLoop(ctx context.Context) {
+	interval, err := daemon.SdWatchdogEnabled(false)
+	if err != nil || interval == 0 {
+		log.Printf("INFO: systemd watchdog not configured, skipping keepalive loop")
+		return
+	}
+	tick := interval / 2
+	if tick <= 0 {
+		tick = interval
+	}
+	log.Printf("INFO: systemd watchdog enabled, pinging every %s (timeout=%s)", tick, interval)
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+	var notifyFailed bool
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := daemon.SdNotify(false, daemon.SdNotifyWatchdog); err != nil && !notifyFailed {
+				log.Printf("WARN: watchdog ping failed (suppressing future errors): %v", err)
+				notifyFailed = true
+			}
+		}
+	}
+}
+
 // Stop gracefully shuts down the server and all its components using a
 // three-phase approach: FENCE (close listeners), DRAIN (stop apps/work),
 // CLEANUP (unmount volumes).
@@ -1244,6 +1288,14 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	// Prevent identity event subscriber from racing with shutdown
 	s.namekStopped.Store(true)
 	s.stopNamekAdapter()
+
+	// Cancel in-flight domain reconciliation to prevent stale network calls during shutdown
+	s.namekMu.Lock()
+	if s.namekReconcileStop != nil {
+		s.namekReconcileStop()
+		s.namekReconcileStop = nil
+	}
+	s.namekMu.Unlock()
 
 	// Notify systemd that we're stopping
 	if sent, err := daemon.SdNotify(false, daemon.SdNotifyStopping); err != nil {
@@ -1560,6 +1612,7 @@ func (s *GinServer) setupGinRoutes() {
 			// Admin-only actions
 			apps.POST("", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppInstall)
 			apps.POST("/validate", s.requireAdmin(), s.handleGinAppValidate)
+			apps.POST("/preflight", s.requireAdmin(), s.handleGinAppPreflight)
 			apps.DELETE("/:name", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUninstall)
 			apps.PATCH("/:name/listeners", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUpdateListeners)
 			apps.POST("/:name/start", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppStart)
@@ -1610,6 +1663,7 @@ func (s *GinServer) setupGinRoutes() {
 			remote.GET("/aliases", s.handleRemoteAliasesList)
 			remote.POST("/aliases", s.handleRemoteAliasesCreate)
 			remote.DELETE("/aliases/:id", s.handleRemoteAliasesDelete)
+			remote.POST("/aliases/:id/verify-namek", s.handleRemoteAliasesVerifyNamek)
 			remote.GET("/certificates", s.handleRemoteCertificatesList)
 			remote.POST("/certificates/:id/renew", s.handleRemoteCertificateRenew)
 			remote.GET("/events", s.handleRemoteEvents)
@@ -1805,6 +1859,9 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 
 	if ep.Auth != nil {
 		result["auth"] = ep.Auth
+	}
+	if ep.PortClaim != nil {
+		result["port_claim"] = *ep.PortClaim
 	}
 
 	// Add host-based URLs only for HTTP/WS listeners (per RFC 20260114)
@@ -2134,10 +2191,19 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 	s.detectRemoteTransitionAndRestart()
 }
 
-// clearNamekState tears down namek adapter and clears all namek routing/cert state.
+// clearNamekState tears down namek adapter and clears all namek routing/cert/domain state.
 // Safe to call when namek is not ready or has no endpoints.
 func (s *GinServer) clearNamekState(rm *remote.Manager) {
 	s.stopNamekAdapter()
+
+	// Cancel in-flight reconciliation and clear domain state
+	s.namekMu.Lock()
+	if s.namekReconcileStop != nil {
+		s.namekReconcileStop()
+		s.namekReconcileStop = nil
+	}
+	s.namekDomains = nil
+	s.namekMu.Unlock()
 	if rm != nil {
 		rm.UnregisterOrchClient("namek")
 	}
@@ -2322,6 +2388,21 @@ func (s *GinServer) applyNamekState() {
 			CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, hostname},
 		})
 	}
+
+	// --- Namek domain state rebuild ---
+	// Cancel any in-flight reconciliation from a prior applyNamekState() call.
+	s.namekMu.Lock()
+	if s.namekReconcileStop != nil {
+		s.namekReconcileStop()
+	}
+	reconcileCtx, reconcileCancel := context.WithCancel(context.Background())
+	s.namekReconcileStop = reconcileCancel
+	s.namekMu.Unlock()
+
+	// Rebuild domain map and reconcile in the background.
+	// All namek domain changes originate from this device (1:1 model).
+	// When multi-device accounts are implemented, periodic sync will be needed.
+	go s.rebuildNamekDomains(reconcileCtx)
 
 	s.detectRemoteTransitionAndRestart()
 }
@@ -2540,6 +2621,22 @@ func (s *GinServer) observeRemoteConfig(bus *events.Bus) {
 	}()
 }
 
+// observeRemotePortClaims subscribes to endpoint changes and refreshes port
+// claim mappings on the remote adapter. This fixes the boot race where
+// RestoreServices hasn't populated claims yet when the adapter first starts,
+// and ensures runtime app install/start/stop propagates claims to the relay.
+func (s *GinServer) observeRemotePortClaims(bus *events.Bus) {
+	if bus == nil || s.remoteManager == nil {
+		return
+	}
+	ch := bus.Subscribe(events.TopicServiceEndpointsChanged, 16)
+	go func() {
+		for range ch {
+			s.remoteManager.RefreshPortClaims()
+		}
+	}()
+}
+
 // observeRemoteCertQueuing subscribes to endpoint, remote config, and identity
 // changes to queue per-host certificate issuance for HTTP-01 portals. This
 // ensures certs are created for endpoints added at startup (RestoreFromPodman),
@@ -2567,8 +2664,8 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 			entries := s.portalCertEntries()
 			for _, entry := range entries {
 				for _, ep := range payload.Added {
-					if ep.DerivedHostLabel == "" {
-						continue
+					if ep.DerivedHostLabel == "" || ep.Flow == api.FlowTLS {
+						continue // flow:tls apps manage their own certificates (RFC 20260316)
 					}
 					host := services.RemoteServiceHostname(ep.DerivedHostLabel, entry.Hostname)
 					if host == "" {
@@ -2594,6 +2691,19 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 							continue
 						}
 						rm.RemoveHostnameCertificate(ep.DerivedHostLabel + "." + base)
+					}
+				}
+				// Also clean up per-app certs for alias hostnames
+				for _, a := range rm.ListAliases() {
+					aliasBase := normalizeHostname(a.Hostname)
+					if aliasBase == "" {
+						continue
+					}
+					for _, ep := range payload.Removed {
+						if ep.DerivedHostLabel == "" {
+							continue
+						}
+						rm.RemoveHostnameCertificate(ep.DerivedHostLabel + "." + aliasBase)
 					}
 				}
 			}
@@ -2628,8 +2738,8 @@ func (s *GinServer) queueAllEndpointCerts() {
 	endpoints := sm.GetAll()
 	for _, entry := range entries {
 		for _, ep := range endpoints {
-			if ep.DerivedHostLabel == "" {
-				continue
+			if ep.DerivedHostLabel == "" || ep.Flow == api.FlowTLS {
+				continue // flow:tls apps manage their own certificates (RFC 20260316)
 			}
 			host := services.RemoteServiceHostname(ep.DerivedHostLabel, entry.Hostname)
 			if host == "" {

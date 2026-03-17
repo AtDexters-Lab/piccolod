@@ -36,16 +36,19 @@ const (
 	FlowUnknown ListenerFlow = iota
 	FlowTCP
 	FlowTLS
+	FlowUDP
 )
 
 var flowToString = map[ListenerFlow]string{
 	FlowTCP: "tcp",
 	FlowTLS: "tls",
+	FlowUDP: "udp",
 }
 
 var flowFromString = map[string]ListenerFlow{
 	"tcp": FlowTCP,
 	"tls": FlowTLS,
+	"udp": FlowUDP,
 }
 
 // String returns the token representation of the flow.
@@ -254,6 +257,24 @@ type AppListener struct {
 	Middleware  []AppProtocolMiddleware `yaml:"protocol_middleware,omitempty" json:"protocol_middleware,omitempty"`
 	RemotePorts []int                   `yaml:"remote_ports,omitempty" json:"remote_ports,omitempty"`
 	Auth        *ListenerAuth           `yaml:"auth,omitempty" json:"auth,omitempty"`
+	PortClaim   *int                    `yaml:"port_claim,omitempty" json:"port_claim,omitempty"`
+}
+
+// TransportProtocol returns the OS-level transport protocol for this flow.
+// FlowTCP and FlowTLS both use TCP at the transport layer; FlowUDP uses UDP.
+func (f ListenerFlow) TransportProtocol() string {
+	if f == FlowUDP {
+		return "udp"
+	}
+	return "tcp"
+}
+
+// PortClaimInfo describes an active port claim for cross-package communication
+// between the service manager and remote manager.
+type PortClaimInfo struct {
+	Port     int
+	HostBind int
+	Protocol string // "tcp" or "udp"
 }
 
 // ListenerAuth configures path-based auth strategies for an HTTP-visible listener.

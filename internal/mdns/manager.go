@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"piccolod/internal/api"
 	"piccolod/internal/events"
 )
 
@@ -531,13 +532,7 @@ func (m *Manager) StopServiceEndpointsObserver() {
 	}
 
 	// Cancel any pending debounced announcement
-	m.announceDebounceMu.Lock()
-	if m.announceDebounceTimer != nil {
-		m.announceDebounceTimer.Stop()
-		m.announceDebounceTimer = nil
-		m.announcePending = false
-	}
-	m.announceDebounceMu.Unlock()
+	m.cancelPendingAnnouncement()
 }
 
 func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsChanged) {
@@ -581,9 +576,9 @@ func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsC
 		}
 	}
 
-	// Add new labels
+	// Add new labels (skip flow:tls — not served on LAN host-based, RFC 20260316)
 	for _, ep := range payload.Added {
-		if ep.DerivedHostLabel != "" {
+		if ep.DerivedHostLabel != "" && ep.Flow != api.FlowTLS {
 			merged = append(merged, ep.DerivedHostLabel)
 		}
 	}
@@ -597,8 +592,29 @@ func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsC
 
 	m.appHostLabelsMu.Unlock()
 
-	// Schedule debounced announcement
-	m.scheduleDebouncedAnnouncement()
+	// When removals are present, flush the NameRegistry update immediately instead of
+	// debouncing — a pending debounce could re-announce the removed alias before the
+	// registry update lands. Mixed events (both additions and removals) also take this
+	// path; additions are already merged into appHostLabels above, so flushDebouncedAnnouncement
+	// will include them.
+	if len(inactive) > 0 {
+		m.cancelPendingAnnouncement()
+		m.flushDebouncedAnnouncement()
+	} else {
+		m.scheduleDebouncedAnnouncement()
+	}
+}
+
+// cancelPendingAnnouncement stops any in-flight debounce timer so its callback
+// will not fire. Safe to call even when no timer is pending.
+func (m *Manager) cancelPendingAnnouncement() {
+	m.announceDebounceMu.Lock()
+	if m.announceDebounceTimer != nil {
+		m.announceDebounceTimer.Stop()
+		m.announceDebounceTimer = nil
+		m.announcePending = false
+	}
+	m.announceDebounceMu.Unlock()
 }
 
 // announcementDebounceDelay is the delay before announcing mDNS changes.

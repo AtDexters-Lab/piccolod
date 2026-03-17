@@ -289,7 +289,11 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	anchorSpec.Entrypoint = anchorRootfs.imgConfig.Entrypoint
 	anchorSpec.Command = anchorRootfs.imgConfig.Cmd
 	for _, ep := range endpoints {
-		anchorSpec.Ports = append(anchorSpec.Ports, container.PortMapping{Host: ep.HostBind, Container: ep.GuestPort})
+		pm := container.PortMapping{Host: ep.HostBind, Container: ep.GuestPort}
+		if ep.Flow == api.FlowUDP {
+			pm.Protocol = "udp"
+		}
+		anchorSpec.Ports = append(anchorSpec.Ports, pm)
 	}
 	// Add host gateway entries to the anchor (which owns the network namespace).
 	// Service containers share this namespace and inherit the /etc/hosts entries.

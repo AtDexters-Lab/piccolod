@@ -13,7 +13,7 @@ type PortAllocator struct {
 	nextHostBind  int
 	nextPublic    int
 	usedHost      map[int]struct{}
-	usedPublic    map[int]struct{}
+	usedPublic    map[string]struct{} // keyed by "port/proto" (e.g., "35001/tcp", "53/udp")
 }
 
 func NewPortAllocator(hostBind, public PortRange) *PortAllocator {
@@ -23,7 +23,7 @@ func NewPortAllocator(hostBind, public PortRange) *PortAllocator {
 		nextHostBind:  hostBind.Start,
 		nextPublic:    public.Start,
 		usedHost:      make(map[int]struct{}),
-		usedPublic:    make(map[int]struct{}),
+		usedPublic:    make(map[string]struct{}),
 	}
 }
 
@@ -32,6 +32,10 @@ func (a *PortAllocator) nextInRange(current int, r PortRange) int {
 		return r.Start
 	}
 	return current
+}
+
+func publicKey(port int, proto string) string {
+	return strconv.Itoa(port) + "/" + proto
 }
 
 func (a *PortAllocator) AllocatePair() (int, int, error) {
@@ -69,14 +73,15 @@ func (a *PortAllocator) allocateHost() (int, error) {
 	}
 }
 
+// allocatePublic auto-allocates a TCP public port from the range.
 func (a *PortAllocator) allocatePublic() (int, error) {
 	pp := a.nextInRange(a.nextPublic, a.publicRange)
 	startPP := pp
 	for {
-		if _, ok := a.usedPublic[pp]; !ok {
-			// Probe OS availability (public ports bind to all interfaces usually)
+		key := publicKey(pp, "tcp")
+		if _, ok := a.usedPublic[key]; !ok {
 			if isPortFree("", pp) {
-				a.usedPublic[pp] = struct{}{}
+				a.usedPublic[key] = struct{}{}
 				if pp >= a.nextPublic {
 					a.nextPublic = pp + 1
 				}
@@ -92,7 +97,19 @@ func (a *PortAllocator) allocatePublic() (int, error) {
 }
 
 func isPortFree(host string, port int) bool {
+	return isPortAvailable(host, port, "tcp")
+}
+
+func isPortAvailable(host string, port int, network string) bool {
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	if network == "udp" {
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			return false
+		}
+		pc.Close()
+		return true
+	}
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return false
@@ -126,7 +143,14 @@ func (a *PortAllocator) freeHost(port int) {
 }
 
 func (a *PortAllocator) freePublic(port int) {
-	delete(a.usedPublic, port)
+	// Auto-allocated ports are always TCP.
+	delete(a.usedPublic, publicKey(port, "tcp"))
+}
+
+// FreePublicProto releases a specific port+protocol combination.
+// Use this for port claims where TCP and UDP are tracked independently.
+func (a *PortAllocator) FreePublicProto(port int, proto string) {
+	delete(a.usedPublic, publicKey(port, proto))
 }
 
 func (a *PortAllocator) Release(host, public int) {
@@ -148,4 +172,51 @@ func (a *PortAllocator) ReleasePublic(port int) {
 	if port > 0 {
 		a.freePublic(port)
 	}
+}
+
+// ClaimPublicPort reserves a specific public port for a port claim.
+// Unlike AllocatePublic, this accepts ports outside the auto-allocate range.
+// Protocol-aware: TCP 53 and UDP 53 are tracked independently, allowing
+// different apps to claim the same port number on different protocols.
+func (a *PortAllocator) ClaimPublicPort(port int, udp bool) error {
+	network := "tcp"
+	if udp {
+		network = "udp"
+	}
+	key := publicKey(port, network)
+	if _, exists := a.usedPublic[key]; exists {
+		return fmt.Errorf("%s port %d already in use", network, port)
+	}
+	if !isPortAvailable("", port, network) {
+		return fmt.Errorf("%s port %d not available on host", network, port)
+	}
+	a.usedPublic[key] = struct{}{}
+	return nil
+}
+
+// AllocateWithClaim allocates a host-bind port from the normal range and claims
+// a specific public port. On claim failure the host-bind port is released.
+func (a *PortAllocator) AllocateWithClaim(claimPort int, udp bool) (int, error) {
+	hb, err := a.allocateHost()
+	if err != nil {
+		return 0, err
+	}
+	if err := a.ClaimPublicPort(claimPort, udp); err != nil {
+		a.freeHost(hb)
+		return 0, fmt.Errorf("claim port %d: %w", claimPort, err)
+	}
+	return hb, nil
+}
+
+// AllocateForClaim allocates ports for a listener, using port claim logic when
+// PortClaim is set, otherwise auto-allocating from the ranges. Returns (hostBind, publicPort, error).
+func (a *PortAllocator) AllocateForClaim(portClaim *int, udp bool) (int, int, error) {
+	if portClaim != nil {
+		hb, err := a.AllocateWithClaim(*portClaim, udp)
+		if err != nil {
+			return 0, 0, err
+		}
+		return hb, *portClaim, nil
+	}
+	return a.AllocatePair()
 }

@@ -350,7 +350,9 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 		if err != nil {
 			return fmt.Errorf("read v2 metadata: %w", err)
 		}
-		_ = m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir})
+		if err := m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir}); err != nil {
+			log.Printf("WARN: detach volume %s during destroy: %v", id, err)
+		}
 		switch meta.Type {
 		case "luks-loop":
 			_ = os.Remove(paths.CoreJoin(meta.LoopFile))
@@ -371,7 +373,9 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 		case "golden", "workspace", "service-rootfs":
 			return m.DestroyRootfs(ctx, id)
 		case "service-data":
-			_ = m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir})
+			if err := m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir}); err != nil {
+				log.Printf("WARN: detach volume %s during destroy: %v", id, err)
+			}
 			if m.lvMgr != nil && meta.LVName != "" {
 				if err := m.lvMgr.RemoveThinLV(ctx, meta.LVName); err != nil {
 					log.Printf("WARN: remove thin LV %s: %v", meta.LVName, err)
@@ -379,7 +383,9 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 			}
 		case "ephemeral":
 			// Detach dispatches to detachEphemeralVolume (no LUKS close).
-			_ = m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir})
+			if err := m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir}); err != nil {
+				log.Printf("WARN: detach ephemeral volume %s during destroy: %v", id, err)
+			}
 			if m.lvMgr != nil && meta.LVName != "" {
 				if err := m.lvMgr.RemoveThinLV(ctx, meta.LVName); err != nil {
 					log.Printf("WARN: remove ephemeral thin LV %s: %v", meta.LVName, err)
@@ -642,30 +648,35 @@ func (m *luksVolumeManager) attachAppVolumeCommon(ctx context.Context, handle Vo
 
 func (m *luksVolumeManager) detachAppVolume(ctx context.Context, handle VolumeHandle) error {
 	mapper := "piccolo-vol-" + handle.ID
+	var errs []error
 
-	// Unmount.
+	// Unmount — if this fails, can't proceed to cryptsetup (device still in use).
 	if err := m.run.Run(ctx, "umount", handle.MountDir); err != nil {
 		return fmt.Errorf("umount %s: %w", handle.MountDir, err)
 	}
 
-	// LUKS close.
+	// LUKS close — if this fails, still try stack.Close to deactivate the
+	// underlying LV/NBD/DRBD layers.
 	if err := m.run.Run(ctx, "cryptsetup", "close", mapper); err != nil {
-		return fmt.Errorf("luks close %s: %w", mapper, err)
+		errs = append(errs, fmt.Errorf("luks close %s: %w", mapper, err))
 	}
 
-	// Close device stack.
+	// Close device stack — only delete from tracking on success.
 	m.mu.Lock()
 	stack := m.stacks[handle.ID]
-	delete(m.stacks, handle.ID)
 	m.mu.Unlock()
 
 	if stack != nil {
 		if err := stack.Close(ctx); err != nil {
-			return fmt.Errorf("close device stack: %w", err)
+			errs = append(errs, fmt.Errorf("close device stack: %w", err))
+		} else {
+			m.mu.Lock()
+			delete(m.stacks, handle.ID)
+			m.mu.Unlock()
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // --- Ephemeral volume (unencrypted thin LV + btrfs) ---
@@ -785,16 +796,20 @@ func (m *luksVolumeManager) detachEphemeralVolume(ctx context.Context, handle Vo
 		}
 	}
 
-	// Close device stack.
+	// Close device stack — only delete from tracking on success.
+	// Unlike detachAppVolume, no error-collection here: ephemeral volumes have no LUKS layer,
+	// so the only dependency chain is umount → stack.Close with no intermediate step to skip.
 	m.mu.Lock()
 	stack := m.stacks[handle.ID]
-	delete(m.stacks, handle.ID)
 	m.mu.Unlock()
 
 	if stack != nil {
 		if err := stack.Close(ctx); err != nil {
 			return fmt.Errorf("close device stack: %w", err)
 		}
+		m.mu.Lock()
+		delete(m.stacks, handle.ID)
+		m.mu.Unlock()
 	}
 
 	return nil

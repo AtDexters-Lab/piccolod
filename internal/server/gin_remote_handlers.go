@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -239,10 +240,25 @@ func (s *GinServer) handleRemotePreflight(c *gin.Context) {
 	})
 }
 
-// handleRemoteAliasesList returns the current alias inventory.
+// aliasResponse extends remote.Alias with optional namek domain state.
+type aliasResponse struct {
+	remote.Alias
+	Namek *namekDomainState `json:"namek,omitempty"`
+}
+
+// handleRemoteAliasesList returns the current alias inventory, joined with namek state.
 func (s *GinServer) handleRemoteAliasesList(c *gin.Context) {
 	aliases := s.remoteManager.ListAliases()
-	c.JSON(http.StatusOK, gin.H{"aliases": aliases})
+	namekStates := s.allNamekDomainStates()
+
+	resp := make([]aliasResponse, len(aliases))
+	for i, a := range aliases {
+		resp[i] = aliasResponse{
+			Alias: a,
+			Namek: namekStates[normalizeHostname(a.Hostname)],
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"aliases": resp})
 }
 
 type remoteAliasRequest struct {
@@ -286,12 +302,36 @@ func (s *GinServer) handleRemoteAliasesCreate(c *gin.Context) {
 		}
 		alias = resp
 	}
-	c.JSON(http.StatusOK, alias)
+
+	// If namek is active, register the alias domain on namek
+	var namekState *namekDomainState
+	if s.namekDomainActive() {
+		ns, err := s.namekRegisterAlias(c.Request.Context(), alias.Hostname)
+		if err != nil {
+			log.Printf("WARN: server: namek register alias %s: %v", alias.Hostname, err)
+		}
+		namekState = ns
+	}
+
+	c.JSON(http.StatusOK, aliasResponse{
+		Alias: alias,
+		Namek: namekState,
+	})
 }
 
 // handleRemoteAliasesDelete removes an alias by ID.
 func (s *GinServer) handleRemoteAliasesDelete(c *gin.Context) {
 	id := c.Param("id")
+
+	// Look up alias hostname before removal (needed for namek cleanup)
+	var hostname string
+	for _, a := range s.remoteManager.ListAliases() {
+		if a.ID == id {
+			hostname = a.Hostname
+			break
+		}
+	}
+
 	if s.dispatcher != nil {
 		if _, err := s.dispatcher.Dispatch(c.Request.Context(), remote.RemoveAliasCommand{ID: id}); err != nil {
 			if errors.Is(err, remote.ErrLocked) {
@@ -311,7 +351,54 @@ func (s *GinServer) handleRemoteAliasesDelete(c *gin.Context) {
 			return
 		}
 	}
+
+	// Best-effort namek cleanup (local alias already removed — don't roll back on failure)
+	if hostname != "" {
+		_ = s.namekDeleteAlias(c.Request.Context(), hostname)
+
+		// Clean up per-app certs for this alias hostname (host:<label>.<alias>).
+		// RemoveAlias already cleans up the alias base cert (alias:<hostname>).
+		s.removePerAppCertsForBase(normalizeHostname(hostname))
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "alias removed"})
+}
+
+// handleRemoteAliasesVerifyNamek triggers CNAME verification on namek for a pending alias.
+// This handler does NOT go through the dispatcher because it only calls the namek API
+// (no local state mutation). The alias already exists in remote.Config.
+func (s *GinServer) handleRemoteAliasesVerifyNamek(c *gin.Context) {
+	id := c.Param("id")
+
+	// Find the alias by ID
+	var found *remote.Alias
+	for _, a := range s.remoteManager.ListAliases() {
+		if a.ID == id {
+			found = &a
+			break
+		}
+	}
+	if found == nil {
+		writeGinError(c, http.StatusNotFound, "alias not found")
+		return
+	}
+
+	if !s.namekDomainActive() {
+		writeGinError(c, http.StatusBadRequest, "namek remote access not active")
+		return
+	}
+
+	state, err := s.namekVerifyAlias(c.Request.Context(), found.Hostname)
+	if err != nil {
+		writeGinError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if state == nil {
+		writeGinError(c, http.StatusBadRequest, "no namek domain state for this alias")
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"namek": state})
 }
 
 // handleRemoteCertificatesList returns certificate metadata.

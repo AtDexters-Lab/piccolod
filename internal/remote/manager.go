@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"piccolod/internal/api"
 	"piccolod/internal/events"
 	"piccolod/internal/fsutil"
 	"piccolod/internal/remote/acme"
@@ -59,12 +60,10 @@ type Config struct {
 
 // Alias represents a remote alias domain attached to a listener.
 type Alias struct {
-	ID          string     `json:"id"`
-	Hostname    string     `json:"hostname"`
-	Listener    string     `json:"listener"`
-	Status      string     `json:"status"`
-	LastChecked *time.Time `json:"last_checked,omitempty"`
-	Message     string     `json:"message,omitempty"`
+	ID       string `json:"id"`
+	Hostname string `json:"hostname"`
+	Listener string `json:"listener"`
+	Status   string `json:"status"`
 }
 
 // Certificate captures basic certificate metadata for the inventory table.
@@ -199,6 +198,9 @@ type Manager struct {
 
 	// Source-agnostic orchestrator client registry (RFC 20260312)
 	orchClients map[string]acme.OrchestratorClient // source → orchClient
+
+	// Port claim provider for Nexus relay registration
+	portClaimProvider PortClaimProvider
 }
 
 func (m *Manager) certDir() string {
@@ -286,6 +288,7 @@ func (m *Manager) SetNexusAdapter(adapter nexusclient.Adapter) {
 	m.cfgMu.RLock()
 	snap := extractAdapterSnapshot(m.cfg)
 	m.cfgMu.RUnlock()
+	snap = m.snapshotWithClaims(snap)
 	m.applyAdapterState(snap)
 }
 
@@ -294,6 +297,32 @@ func (m *Manager) SetNexusAdapter(adapter nexusclient.Adapter) {
 func (m *Manager) SetEventsBus(bus *events.Bus) {
 	m.eventsBus = bus
 	m.publishConfigChanged()
+}
+
+// PortClaimProvider queries active port claims from the service registry.
+type PortClaimProvider interface {
+	ActivePortClaims() []api.PortClaimInfo
+}
+
+// SetPortClaimProvider wires the provider for querying active port claims.
+func (m *Manager) SetPortClaimProvider(p PortClaimProvider) {
+	m.adapterMu.Lock()
+	m.portClaimProvider = p
+	m.adapterMu.Unlock()
+}
+
+// RefreshPortClaims re-evaluates active port claims and applies them to the
+// adapter. Called when service endpoints change (app install/start/stop or
+// post-unlock service restore) so that claim mappings propagate to the relay.
+func (m *Manager) RefreshPortClaims() {
+	if m == nil || m.closed.Load() {
+		return
+	}
+	m.cfgMu.RLock()
+	snap := extractAdapterSnapshot(m.cfg)
+	m.cfgMu.RUnlock()
+	snap = m.snapshotWithClaims(snap)
+	m.applyAdapterState(snap)
 }
 
 // RegisterOrchClient registers an orchestrator client for a source tag.
@@ -452,6 +481,7 @@ func (m *Manager) save(cfg *Config) error {
 	snap := extractAdapterSnapshot(cfg)
 	m.cfgMu.Unlock()
 
+	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
 	m.applyAdapterState(snap)
 	m.updateACMEConfig(cfg)
@@ -476,6 +506,7 @@ func (m *Manager) reloadFromStorage() error {
 	m.cfg = &cfg
 	snap := extractAdapterSnapshot(&cfg)
 	m.cfgMu.Unlock()
+	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
 	if cfg.Enabled {
 		log.Printf("remote: reloaded config (solver=%s, managed=%v, portal=%s, certs=%d)",
@@ -686,11 +717,11 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 
 	log.Printf("remote: configured (solver=http-01, portal=%s)", portalHost)
 
-	// Queue issuance jobs after releasing lock (enqueueIssuanceWithForce acquires its own lock).
+	// Queue issuance jobs after releasing lock (enqueueIssuanceJob acquires its own lock).
 	// Force=true because defaultCertificates seeds optimistic "ok" entries; without force the
 	// duplicate guard would skip issuance since NextRenewal is in the future.
 	// User-managed mode only issues portal cert (no wildcard - HTTP-01 doesn't support it)
-	m.enqueueIssuanceWithForce("portal", []string{portalHost}, portalHost, true)
+	m.enqueueIssuanceJob(issuanceJob{id: "portal", domains: []string{portalHost}, commonName: portalHost, force: true})
 	return nil
 }
 
@@ -776,15 +807,15 @@ func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
 
 	log.Printf("remote: configured (solver=dns-01, managed=true, portal=%s)", portalHost)
 
-	// Queue issuance jobs after releasing lock (enqueueIssuanceWithForce acquires its own lock).
+	// Queue issuance jobs after releasing lock (enqueueIssuanceJob acquires its own lock).
 	// Force=true because defaultCertificates seeds optimistic "ok" entries; without force the
 	// duplicate guard would skip issuance since NextRenewal is in the future.
-	m.enqueueIssuanceWithForce("portal", []string{portalHost}, portalHost, true)
+	m.enqueueIssuanceJob(issuanceJob{id: "portal", domains: []string{portalHost}, commonName: portalHost, force: true})
 	// Managed mode supports wildcard via DNS-01
 	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portalHost)), ".")
 	if base != "" {
 		cn := "*." + base
-		m.enqueueIssuanceWithForce("wildcard", []string{cn, base}, cn, true)
+		m.enqueueIssuanceJob(issuanceJob{id: "wildcard", domains: []string{cn, base}, commonName: cn, force: true})
 	}
 	return nil
 }
@@ -870,7 +901,6 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 		Hostname: hostname,
 		Listener: listener,
 		Status:   "pending",
-		Message:  "Awaiting DNS verification",
 	}
 	cfg.Aliases = append(cfg.Aliases, alias)
 	cfg.Events = append(cfg.Events, Event{
@@ -883,8 +913,14 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 	if err := m.save(cfg); err != nil {
 		return Alias{}, err
 	}
-	// Queue issuance for the alias hostname (listener-specific cert)
-	m.enqueueIssuance("alias:"+strings.ToLower(hostname), []string{strings.ToLower(hostname)}, strings.ToLower(hostname))
+	// Queue issuance for the alias hostname — always HTTP-01 (alias domains use user DNS, not namek PowerDNS)
+	h := strings.ToLower(hostname)
+	m.enqueueIssuanceJob(issuanceJob{
+		id:         "alias:" + h,
+		domains:    []string{h},
+		commonName: h,
+		solver:     "http-01",
+	})
 	return alias, nil
 }
 
@@ -1004,6 +1040,7 @@ type adapterStateSnapshot struct {
 	PortalHostname string
 	Aliases        []nexusclient.AliasEntry
 	Enabled        bool
+	PortClaims     []api.PortClaimInfo // active port claims from service manager
 }
 
 // adapterConfigKey returns a string that changes only when adapter-relevant
@@ -1028,6 +1065,11 @@ func adapterConfigKey(snap adapterStateSnapshot) string {
 		b.WriteString(a.Hostname)
 		b.WriteByte('\x01')
 		b.WriteString(a.HostLabel)
+	}
+	// Include port claims so adapter restarts when claims change.
+	for _, pc := range snap.PortClaims {
+		b.WriteByte('\x00')
+		b.WriteString(fmt.Sprintf("claim:%d/%s->%d", pc.Port, pc.Protocol, pc.HostBind))
 	}
 	return b.String()
 }
@@ -1056,6 +1098,26 @@ func extractAdapterSnapshot(cfg *Config) adapterStateSnapshot {
 	}
 }
 
+// snapshotWithClaims enriches a config snapshot with active port claims
+// from the service manager. Safe to call without holding any lock.
+func (m *Manager) snapshotWithClaims(snap adapterStateSnapshot) adapterStateSnapshot {
+	m.adapterMu.Lock()
+	provider := m.portClaimProvider
+	m.adapterMu.Unlock()
+	if provider != nil {
+		claims := provider.ActivePortClaims()
+		// Sort for stable fingerprinting
+		sort.Slice(claims, func(i, j int) bool {
+			if claims[i].Protocol != claims[j].Protocol {
+				return claims[i].Protocol < claims[j].Protocol
+			}
+			return claims[i].Port < claims[j].Port
+		})
+		snap.PortClaims = claims
+	}
+	return snap
+}
+
 func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 	if m.closed.Load() {
 		return
@@ -1074,6 +1136,7 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 		DeviceSecret:   snap.DeviceSecret,
 		PortalHostname: snap.PortalHostname,
 		Aliases:        snap.Aliases,
+		ClaimMappings:  snap.PortClaims,
 	}
 	if err := adapter.Configure(adapterCfg); err != nil {
 		log.Printf("WARN: remote: configure nexus adapter failed: %v", err)
@@ -1543,15 +1606,6 @@ type issuanceJob struct {
 	solver     string                 // override solver (e.g., "dns-01" for namek)
 	orchClient acme.OrchestratorClient // override orchestrator client for DNS-01
 	certDir    string                 // override cert output directory
-}
-
-// enqueueIssuance records pending inventory and queues issuance for the worker.
-func (m *Manager) enqueueIssuance(id string, domains []string, commonName string) {
-	m.enqueueIssuanceJob(issuanceJob{id: id, domains: domains, commonName: commonName})
-}
-
-func (m *Manager) enqueueIssuanceWithForce(id string, domains []string, commonName string, force bool) {
-	m.enqueueIssuanceJob(issuanceJob{id: id, domains: domains, commonName: commonName, force: force})
 }
 
 // enqueueIssuanceJob is the unified entry point for both self-hosted and namek cert issuance.

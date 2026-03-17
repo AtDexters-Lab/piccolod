@@ -698,7 +698,7 @@ class _AppDetailViewState extends State<AppDetailView>
                               svc.lanHostUrl != null
                                   ? 'LAN Fallback'
                                   : 'LAN Access',
-                              '${svc.localUrl} (Port ${svc.publicPort})',
+                              '${svc.localUrl} (Port ${svc.publicPort}${svc.portClaim != null ? ", claimed" : ""})',
                               onTap: () => AppLauncher.openAppWindow(
                                 controller: widget.desktopController,
                                 appService: widget.appService,

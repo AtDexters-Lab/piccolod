@@ -587,3 +587,283 @@ listeners:
 		t.Errorf("Expected YAML parsing error, got %q", err.Error())
 	}
 }
+
+func TestPortClaimValidation(t *testing.T) {
+	baseApp := func(listeners []api.AppListener) *api.AppDefinition {
+		return &api.AppDefinition{
+			Listeners:  listeners,
+			Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{53}}},
+			Extensions: map[string]interface{}{"mode": "service"},
+		}
+	}
+
+	intPtr := func(v int) *int { return &v }
+
+	tests := []struct {
+		name        string
+		app         *api.AppDefinition
+		expectError bool
+		errContains string
+	}{
+		{
+			name: "valid_tcp_port_claim",
+			app: baseApp([]api.AppListener{
+				{Name: "web", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true, PortClaim: intPtr(8080)},
+			}),
+		},
+		{
+			name: "valid_udp_port_claim",
+			app: baseApp([]api.AppListener{
+				{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "dns", GuestPort: 53, Flow: api.FlowUDP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(53)},
+			}),
+		},
+		{
+			name: "valid_tls_port_claim",
+			app: baseApp([]api.AppListener{
+				{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "secure", GuestPort: 8443, Flow: api.FlowTLS, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(8443)},
+			}),
+		},
+		{
+			name: "reject_reserved_port_80",
+			app: baseApp([]api.AppListener{
+				{Name: "main", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "raw", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(80)},
+			}),
+			expectError: true,
+			errContains: "reserved for the portal",
+		},
+		{
+			name: "reject_reserved_port_443",
+			app: baseApp([]api.AppListener{
+				{Name: "main", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "raw", GuestPort: 8443, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(443)},
+			}),
+			expectError: true,
+			errContains: "reserved for the portal",
+		},
+		{
+			name: "reject_reserved_port_5353",
+			app: baseApp([]api.AppListener{
+				{Name: "main", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "mdns", GuestPort: 5353, Flow: api.FlowUDP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(5353)},
+			}),
+			expectError: true,
+			errContains: "reserved for mDNS",
+		},
+		{
+			name: "reject_host_bind_range",
+			app: baseApp([]api.AppListener{
+				{Name: "main", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "raw", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(20000)},
+			}),
+			expectError: true,
+			errContains: "host-bind range",
+		},
+		{
+			name: "reject_public_range",
+			app: baseApp([]api.AppListener{
+				{Name: "main", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "raw", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(40000)},
+			}),
+			expectError: true,
+			errContains: "auto-allocate range",
+		},
+		{
+			name: "reject_out_of_range",
+			app: baseApp([]api.AppListener{
+				{Name: "main", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "raw", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(0)},
+			}),
+			expectError: true,
+			errContains: "must be between 1 and 65535",
+		},
+		{
+			name: "reject_duplicate_claim_same_transport",
+			app: baseApp([]api.AppListener{
+				{Name: "main", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "raw1", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(8080)},
+				{Name: "raw2", GuestPort: 8081, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(8080)},
+			}),
+			expectError: true,
+			errContains: "port_claim 8080/tcp used by both",
+		},
+		{
+			name: "allow_same_claim_different_transport",
+			app: baseApp([]api.AppListener{
+				{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "dns", GuestPort: 53, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(53)},
+				{Name: "dnsudp", GuestPort: 53, Flow: api.FlowUDP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(53)},
+			}),
+		},
+		{
+			name: "reject_udp_http_protocol",
+			app: baseApp([]api.AppListener{
+				{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "bad", GuestPort: 53, Flow: api.FlowUDP, Protocol: api.ListenerProtocolHTTP, PortClaim: intPtr(53)},
+			}),
+			expectError: true,
+			errContains: "flow: udp cannot be used with protocol",
+		},
+		{
+			name: "allow_same_guest_port_different_transport",
+			app: baseApp([]api.AppListener{
+				{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "dns", GuestPort: 53, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw},
+				{Name: "dnsudp", GuestPort: 53, Flow: api.FlowUDP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(53)},
+			}),
+		},
+		{
+			name: "reject_same_guest_port_same_transport",
+			app: baseApp([]api.AppListener{
+				{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+				{Name: "dns1", GuestPort: 53, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw},
+				{Name: "dns2", GuestPort: 53, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw},
+			}),
+			expectError: true,
+			errContains: "guest_port 53/tcp used by both",
+		},
+		{
+			name: "allow_udp_primary",
+			app: baseApp([]api.AppListener{
+				{Name: "dns", GuestPort: 53, Flow: api.FlowUDP, Protocol: api.ListenerProtocolRaw, Primary: true, PortClaim: intPtr(53)},
+			}),
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			SetDefaults(tt.app)
+			err := ValidateAppDefinition(tt.app)
+			if tt.expectError {
+				if err == nil {
+					t.Fatal("expected error but got none")
+				}
+				if tt.errContains != "" && !containsString(err.Error(), tt.errContains) {
+					t.Errorf("expected error containing %q, got %q", tt.errContains, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestFlowUDP(t *testing.T) {
+	t.Run("transport_protocol", func(t *testing.T) {
+		if api.FlowTCP.TransportProtocol() != "tcp" {
+			t.Fatal("FlowTCP transport should be tcp")
+		}
+		if api.FlowTLS.TransportProtocol() != "tcp" {
+			t.Fatal("FlowTLS transport should be tcp")
+		}
+		if api.FlowUDP.TransportProtocol() != "udp" {
+			t.Fatal("FlowUDP transport should be udp")
+		}
+	})
+
+	t.Run("string_roundtrip", func(t *testing.T) {
+		if api.FlowUDP.String() != "udp" {
+			t.Fatalf("FlowUDP.String() = %q, want udp", api.FlowUDP.String())
+		}
+	})
+}
+
+func TestParseAppSchema_UnquotedTemplateExpressions(t *testing.T) {
+	// Unquoted {{ }} in YAML is flow mapping syntax. ParseAppSchema must
+	// handle this for raw template manifests where non-string types (booleans,
+	// numbers) can't be quoted without changing the rendered YAML type.
+	manifest := `
+type: system
+inputs:
+  enabled:
+    type: boolean
+    label: "Enabled"
+    default: true
+  port:
+    type: number
+    label: "Port"
+    default: 8080
+services:
+  main:
+    image: example:latest
+    bind_ports: [8080]
+listeners:
+  - name: __primary
+    guest_port: 8080
+app_config:
+  enabled: {{ .Inputs.enabled }}
+  port: {{ .Inputs.port }}
+  mixed: "prefix-{{ .Inputs.enabled }}-suffix"
+x-piccolo:
+  mode: service
+`
+	def, err := ParseAppSchema([]byte(manifest))
+	if err != nil {
+		t.Fatalf("ParseAppSchema should handle unquoted template expressions: %v", err)
+	}
+	if def.Type != "system" {
+		t.Errorf("expected type 'system', got %q", def.Type)
+	}
+
+	// Verify app_config preserves original template text after round-trip
+	cfg, ok := def.AppConfig.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected app_config to be a map, got %T", def.AppConfig)
+	}
+	if v, _ := cfg["enabled"].(string); v != "{{ .Inputs.enabled }}" {
+		t.Errorf("expected app_config.enabled to be '{{ .Inputs.enabled }}', got %q", v)
+	}
+	if v, _ := cfg["port"].(string); v != "{{ .Inputs.port }}" {
+		t.Errorf("expected app_config.port to be '{{ .Inputs.port }}', got %q", v)
+	}
+	if v, _ := cfg["mixed"].(string); v != "prefix-{{ .Inputs.enabled }}-suffix" {
+		t.Errorf("expected app_config.mixed to preserve template, got %q", v)
+	}
+}
+
+func TestNeutralizeTemplates(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{
+			name:   "unquoted_expression",
+			input:  "key: {{ .Inputs.foo }}",
+			expect: "key: __TPL_L__ .Inputs.foo __TPL_R__",
+		},
+		{
+			name:   "quoted_expression",
+			input:  `key: "{{ .Inputs.foo }}"`,
+			expect: `key: "__TPL_L__ .Inputs.foo __TPL_R__"`,
+		},
+		{
+			name:   "no_templates",
+			input:  "key: value",
+			expect: "key: value",
+		},
+		{
+			name:   "yaml_flow_mapping_preserved",
+			input:  "data: {key: {nested: val}}",
+			expect: "data: {key: {nested: val}}",
+		},
+		{
+			name:   "multiple_on_one_line",
+			input:  "url: {{ .Inputs.host }}:{{ .Inputs.port }}",
+			expect: "url: __TPL_L__ .Inputs.host __TPL_R__:__TPL_L__ .Inputs.port __TPL_R__",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := string(neutralizeTemplates([]byte(tt.input)))
+			if got != tt.expect {
+				t.Errorf("neutralizeTemplates(%q)\n  got:  %q\n  want: %q", tt.input, got, tt.expect)
+			}
+		})
+	}
+}

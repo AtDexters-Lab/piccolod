@@ -68,7 +68,8 @@ func (l *hintLookup) get() (connectionHint, bool) {
 // ProxyManager manages TCP listeners and proxies traffic based on ServiceEndpoint
 type ProxyManager struct {
 	mu                sync.Mutex
-	listeners         map[int]net.Listener // by public port
+	listeners         map[int]net.Listener     // TCP listeners by public port
+	udpListeners      map[int]*udpProxyState   // UDP listeners by public port
 	hints             map[int]map[int]connectionHint
 	tokenHints        map[string]tokenHintEntry
 	cspFrameAncestors string // pre-calculated CSP header value
@@ -91,6 +92,7 @@ func NewProxyManager() *ProxyManager {
 	// Default safe CSP
 	return &ProxyManager{
 		listeners:         make(map[int]net.Listener),
+		udpListeners:      make(map[int]*udpProxyState),
 		cspFrameAncestors: "frame-ancestors \"self\" http://localhost:* http://*.local:* https://*.local:*",
 	}
 }
@@ -321,8 +323,13 @@ func (p *ProxyManager) SetAllowedAncestors(hosts []string) {
 	p.cspFrameAncestors = fmt.Sprintf("frame-ancestors %s", strings.Join(sources, " "))
 }
 
-// StartListener starts a TCP proxy for the given endpoint
+// StartListener starts a proxy for the given endpoint (TCP or UDP).
 func (p *ProxyManager) StartListener(ep ServiceEndpoint) {
+	if ep.Flow == api.FlowUDP {
+		p.startUDPProxy(ep)
+		return
+	}
+
 	addr := net.JoinHostPort("0.0.0.0", strconv.Itoa(ep.PublicPort))
 	// Avoid double-start
 	p.mu.Lock()
@@ -1078,19 +1085,50 @@ func (p *ProxyManager) StopAll() {
 		delete(p.listeners, port)
 		delete(p.hints, port)
 	}
+	// Collect UDP states under the lock, stop them after releasing to avoid
+	// blocking p.mu during drain (each stop() waits for goroutines).
+	udpStates := make([]*udpProxyState, 0, len(p.udpListeners))
+	for port, state := range p.udpListeners {
+		udpStates = append(udpStates, state)
+		delete(p.udpListeners, port)
+	}
 	p.mu.Unlock()
+	for _, state := range udpStates {
+		state.stop()
+	}
 	p.wg.Wait()
 }
 
-// StopPort stops a specific public listener if running
+// StopPort stops a specific public listener if running (TCP or UDP).
+// For backward compatibility, stops both protocols on the same port.
 func (p *ProxyManager) StopPort(port int) {
+	p.StopEndpoint(port, api.FlowTCP)
+	p.StopEndpoint(port, api.FlowUDP)
+}
+
+// StopEndpoint stops a specific listener by port and flow type.
+// Only stops the matching protocol, leaving the other intact.
+func (p *ProxyManager) StopEndpoint(port int, flow api.ListenerFlow) {
 	p.mu.Lock()
-	if ln, ok := p.listeners[port]; ok {
-		_ = ln.Close()
-		delete(p.listeners, port)
+	if flow != api.FlowUDP {
+		// TCP/TLS listeners are in the TCP map
+		if ln, ok := p.listeners[port]; ok {
+			_ = ln.Close()
+			delete(p.listeners, port)
+		}
+		delete(p.hints, port)
 	}
-	delete(p.hints, port)
+	var udpState *udpProxyState
+	if flow == api.FlowUDP {
+		if state, ok := p.udpListeners[port]; ok {
+			udpState = state
+			delete(p.udpListeners, port)
+		}
+	}
 	p.mu.Unlock()
+	if udpState != nil {
+		udpState.stop()
+	}
 }
 
 // small int→string helper without strconv to keep deps minimal

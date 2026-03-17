@@ -183,16 +183,21 @@ func (m *MockContainerManager) InspectContainerState(ctx context.Context, runtim
 	return container.ContainerState{Exists: true, Running: c.Status == "running"}, nil
 }
 
-func (m *MockContainerManager) InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[int]int, error) {
+func (m *MockContainerManager) InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[string]int, error) {
 	_ = ctx
 	_ = runtime
 	c, ok := m.containers[containerID]
 	if !ok {
 		return nil, container.ErrContainerNotFound(containerID)
 	}
-	out := make(map[int]int, len(c.Spec.Ports))
+	out := make(map[string]int, len(c.Spec.Ports))
 	for _, p := range c.Spec.Ports {
-		out[p.Container] = p.Host
+		proto := p.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		key := fmt.Sprintf("%d/%s", p.Container, proto)
+		out[key] = p.Host
 	}
 	return out, nil
 }

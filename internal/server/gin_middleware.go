@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"piccolod/internal/api"
 	"piccolod/internal/health"
 	"piccolod/internal/hostname"
 	"piccolod/internal/services"
@@ -345,6 +346,14 @@ func (s *GinServer) lanHostRoutingMiddleware() gin.HandlerFunc {
 				"host":  reqHost,
 			})
 			c.Abort()
+			return
+		}
+
+		// flow:tls endpoints are not supported on LAN host-based routing (RFC 20260316).
+		// Users access them via port-based (piccolo.local:<port>) or remote (app.<base>).
+		// flow:udp endpoints never reach here (IsEligibleForHostRouting returns false for UDP).
+		if ep.Flow == api.FlowTLS {
+			c.Next()
 			return
 		}
 
