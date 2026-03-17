@@ -921,6 +921,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.registerUnlockReloader(rm)
 	rm.SetEventsBus(eventsBus)
 	s.observeRemoteCertQueuing(eventsBus)
+	s.observeRemotePortClaims(eventsBus)
 
 	// Wire remote status provider for health aggregation (RFC 20260125)
 	if rm != nil && svcMgr != nil {
@@ -2577,6 +2578,22 @@ func (s *GinServer) observeRemoteConfig(bus *events.Bus) {
 				continue
 			}
 			s.applyRemoteRuntimeFromStatus(status)
+		}
+	}()
+}
+
+// observeRemotePortClaims subscribes to endpoint changes and refreshes port
+// claim mappings on the remote adapter. This fixes the boot race where
+// RestoreServices hasn't populated claims yet when the adapter first starts,
+// and ensures runtime app install/start/stop propagates claims to the relay.
+func (s *GinServer) observeRemotePortClaims(bus *events.Bus) {
+	if bus == nil || s.remoteManager == nil {
+		return
+	}
+	ch := bus.Subscribe(events.TopicServiceEndpointsChanged, 16)
+	go func() {
+		for range ch {
+			s.remoteManager.RefreshPortClaims()
 		}
 	}()
 }

@@ -311,6 +311,20 @@ func (m *Manager) SetPortClaimProvider(p PortClaimProvider) {
 	m.adapterMu.Unlock()
 }
 
+// RefreshPortClaims re-evaluates active port claims and applies them to the
+// adapter. Called when service endpoints change (app install/start/stop or
+// post-unlock service restore) so that claim mappings propagate to the relay.
+func (m *Manager) RefreshPortClaims() {
+	if m == nil || m.closed.Load() {
+		return
+	}
+	m.cfgMu.RLock()
+	snap := extractAdapterSnapshot(m.cfg)
+	m.cfgMu.RUnlock()
+	snap = m.snapshotWithClaims(snap)
+	m.applyAdapterState(snap)
+}
+
 // RegisterOrchClient registers an orchestrator client for a source tag.
 // Used by external sources (e.g., namek) to provide DNS-01 challenge solvers.
 func (m *Manager) RegisterOrchClient(source string, client acme.OrchestratorClient) {
