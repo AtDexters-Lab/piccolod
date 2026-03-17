@@ -194,19 +194,24 @@ func (a *BackendAdapter) connectHandler() backend.ConnectHandler {
 			}
 		}
 
+		if a.resolver == nil {
+			// No resolver configured — fall back to library PortMappings (80/443).
+			return nil, backend.ErrNoRoute
+		}
+
 		localPort := 0
-		if a.resolver != nil {
-			if port, ok := a.resolver.Resolve(req.OriginalHostname, req.Port, req.IsTLS); ok {
-				localPort = port
-			} else if port, ok := a.resolver.Resolve(req.Hostname, req.Port, req.IsTLS); ok {
-				localPort = port
-			} else {
-				return nil, backend.ErrNoRoute
-			}
+		if port, ok := a.resolver.Resolve(req.OriginalHostname, req.Port, req.IsTLS); ok {
+			localPort = port
+		} else if port, ok := a.resolver.Resolve(req.Hostname, req.Port, req.IsTLS); ok {
+			localPort = port
+		} else {
+			return nil, backend.ErrNoRoute
 		}
+
 		if localPort == 0 {
-			localPort = req.Port
+			return nil, fmt.Errorf("resolver returned invalid port 0 for %s:%d", req.Hostname, req.Port)
 		}
+
 		target := fmt.Sprintf("127.0.0.1:%d", localPort)
 		network := "tcp"
 		if req.Transport == backend.TransportUDP {

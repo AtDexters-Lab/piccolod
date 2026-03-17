@@ -432,7 +432,7 @@ func (r *serviceRemoteResolver) resolveAlias(
 		return 0, false
 	}
 	if hostLabel == nexusclient.PortalHostLabel || hostLabel == "" {
-		if normPort == 80 {
+		if normPort == 80 && portalPort > 0 {
 			return portalPort, true
 		}
 		if isTLS && tlsMuxPort > 0 {
@@ -465,7 +465,7 @@ func (r *serviceRemoteResolver) resolveAgainstBase(
 ) (int, bool) {
 	// Portal host (apex): route to portal port / TLS mux.
 	if h == portal {
-		if normPort == 80 {
+		if normPort == 80 && portalPort > 0 {
 			return portalPort, true
 		}
 		if isTLS && tlsMuxPort > 0 {

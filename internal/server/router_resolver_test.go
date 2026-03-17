@@ -68,6 +68,39 @@ func TestServiceRemoteResolver(t *testing.T) {
 	svc.Stop()
 }
 
+func TestResolvePortalPortZero(t *testing.T) {
+	// When portalPort is 0, Resolve must return (0, false) for port-80 requests.
+	// This prevents the connectHandler from receiving a resolved port of 0.
+	svc := services.NewServiceManager()
+	defer svc.Stop()
+	resolver := &serviceRemoteResolver{services: svc, port: 0} // portalPort = 0
+
+	resolver.SetRemoteBases("self-hosted", []remoteBase{
+		{source: "self-hosted", portalHost: "portal.example.com", domain: "portal.example.com"},
+	})
+
+	t.Run("base_portal_port80", func(t *testing.T) {
+		port, ok := resolver.Resolve("portal.example.com", 80, false)
+		if ok && port == 0 {
+			t.Fatal("must not return (0, true) — this causes the wrong cert to be served")
+		}
+		if ok {
+			t.Fatalf("expected no match when portalPort=0, got port=%d", port)
+		}
+	})
+
+	t.Run("alias_portal_port80", func(t *testing.T) {
+		resolver.UpdateAliases(map[string]string{"custom.com": "__portal"})
+		port, ok := resolver.Resolve("custom.com", 80, false)
+		if ok && port == 0 {
+			t.Fatal("must not return (0, true) — this causes the wrong cert to be served")
+		}
+		if ok {
+			t.Fatalf("expected no match when portalPort=0, got port=%d", port)
+		}
+	})
+}
+
 func TestPortalHostsStableOrdering(t *testing.T) {
 	resolver := newServiceRemoteResolver(nil)
 
