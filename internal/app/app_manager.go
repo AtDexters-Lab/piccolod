@@ -90,6 +90,7 @@ var (
 	ErrLocked            = errors.New("app manager: persistence locked")
 	ErrNotLeader         = errors.New("app manager: not leader")
 	ErrVolumeUnavailable = errors.New("app manager: persistence volume not mounted")
+	ErrAppUninstalling   = errors.New("app manager: app is being uninstalled")
 )
 
 // LockStateReader exposes the control lock state.
@@ -2121,6 +2122,21 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
+	// Mark as uninstalling early so concurrent readers (log streams, exec) get a clean rejection
+	// instead of racing against infrastructure teardown. Rollback on failure so the app doesn't
+	// get stuck in "uninstalling" permanently.
+	prevStatus := m.getObservedStatus(instanceID)
+	m.updateStatusWithEvent(instanceID, StatusUninstalling)
+	defer func() {
+		if err != nil {
+			rollback := prevStatus
+			if rollback == "" {
+				rollback = StatusStopped
+			}
+			m.updateStatusWithEvent(instanceID, rollback)
+		}
+	}()
+
 	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return err
@@ -2179,10 +2195,10 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 		return fmt.Errorf("failed to remove app from storage: %w", err)
 	}
 
-	// Clean up observed status and emit "uninstalled" event
-	prevStatus := m.getObservedStatus(instanceID)
+	// Clean up observed status and emit "uninstalled" event.
+	// Status is deterministically StatusUninstalling here (set at entry, no rollback on success).
 	m.deleteObservedStatus(instanceID)
-	m.publishAppStatusChanged(instanceID, "uninstalled", prevStatus, "")
+	m.publishAppStatusChanged(instanceID, "uninstalled", StatusUninstalling, "")
 
 	return nil
 }
@@ -3109,6 +3125,10 @@ func (m *AppManager) LogsStream(ctx context.Context, instanceID string, lines in
 // LogsForService fetches recent container logs for a specific service container in an app instance.
 // If service is empty, defaults to the primary service.
 func (m *AppManager) LogsForService(ctx context.Context, instanceID, service string, lines int) ([]string, error) {
+	// Best-effort guard: uninstall may start between this check and the podman call below.
+	if m.getObservedStatus(instanceID) == StatusUninstalling {
+		return nil, ErrAppUninstalling
+	}
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return nil, err
@@ -3171,6 +3191,10 @@ func (m *AppManager) LogsForService(ctx context.Context, instanceID, service str
 // LogsStreamForService returns a follow-stream of container logs for a specific service container in an app instance.
 // If service is empty, defaults to the primary service.
 func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, service string, lines int, timestamps bool) (io.ReadCloser, error) {
+	// Best-effort guard: uninstall may start between this check and the podman call below.
+	if m.getObservedStatus(instanceID) == StatusUninstalling {
+		return nil, ErrAppUninstalling
+	}
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return nil, err

@@ -1131,6 +1131,10 @@ func handleAppManagerError(c *gin.Context, err error, action string) bool {
 		writeGinError(c, http.StatusLocked, msg)
 		return true
 	}
+	if errors.Is(err, app.ErrAppUninstalling) {
+		writeGinError(c, http.StatusConflict, "App is being uninstalled")
+		return true
+	}
 	return false
 }
 

@@ -32,10 +32,11 @@ import (
 //   - desiredRunning = Enabled && (isLeaderForApp)
 // This ensures containers only run on the leader node while preserving user intent across failovers.
 const (
-	StatusRunning  = "running"  // Containers are running and healthy
-	StatusStopped  = "stopped"  // Containers are stopped locally (Enabled may still be true on follower nodes)
-	StatusStarting = "starting" // Containers are being started or recovering
-	StatusError    = "error"    // Startup failed after escalation threshold
+	StatusRunning      = "running"      // Containers are running and healthy
+	StatusStopped      = "stopped"      // Containers are stopped locally (Enabled may still be true on follower nodes)
+	StatusStarting     = "starting"     // Containers are being started or recovering
+	StatusError        = "error"        // Startup failed after escalation threshold
+	StatusUninstalling = "uninstalling" // App is being torn down
 )
 
 // ContainerManager describes the container runtime operations required by the app manager.
