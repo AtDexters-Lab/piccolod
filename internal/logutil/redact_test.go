@@ -1,6 +1,7 @@
 package logutil
 
 import (
+	"net"
 	"strings"
 	"testing"
 )
@@ -61,6 +62,61 @@ func TestRedact_IPv4(t *testing.T) {
 			input: "version 999.999.999.999 released",
 			want:  "version 999.999.999.999 released",
 		},
+		{
+			name:  "preserves_subnet_mask_24",
+			input: "netmask 255.255.255.0 on eth0",
+			want:  "netmask 255.255.255.0 on eth0",
+		},
+		{
+			name:  "preserves_subnet_mask_16",
+			input: "mask=255.255.0.0",
+			want:  "mask=255.255.0.0",
+		},
+		{
+			name:  "preserves_subnet_mask_25",
+			input: "subnet 255.255.255.128 configured",
+			want:  "subnet 255.255.255.128 configured",
+		},
+		{
+			name:  "preserves_limited_broadcast",
+			input: "broadcast 255.255.255.255",
+			want:  "broadcast 255.255.255.255", // caught by isSubnetMask (/32)
+		},
+		{
+			name:  "preserves_multicast_all_hosts",
+			input: "joined group 224.0.0.1",
+			want:  "joined group 224.0.0.1",
+		},
+		{
+			name:  "preserves_multicast_mdns",
+			input: "mdns on 224.0.0.251:5353",
+			want:  "mdns on 224.0.0.251:5353",
+		},
+		{
+			name:  "preserves_link_local",
+			input: "assigned 169.254.1.50 (DHCP fallback)",
+			want:  "assigned 169.254.1.50 (DHCP fallback)",
+		},
+		{
+			name:  "redacts_rfc1918_class_c",
+			input: "from 192.168.1.1",
+			want:  "from <IPv4>",
+		},
+		{
+			name:  "redacts_rfc1918_class_a",
+			input: "from 10.0.0.1",
+			want:  "from <IPv4>",
+		},
+		{
+			name:  "redacts_rfc1918_class_b",
+			input: "from 172.16.0.1",
+			want:  "from <IPv4>",
+		},
+		{
+			name:  "redacts_non_contiguous_mask",
+			input: "host 255.255.255.1",
+			want:  "host <IPv4>",
+		},
 	}
 
 	for _, tt := range tests {
@@ -85,9 +141,9 @@ func TestRedact_IPv6(t *testing.T) {
 			want:  "client <IPv6> connected",
 		},
 		{
-			name:  "compressed_ipv6",
+			name:  "preserves_link_local_v6",
 			input: "from fe80::1 request",
-			want:  "from <IPv6> request",
+			want:  "from fe80::1 request",
 		},
 		{
 			name:  "compressed_ipv6_multi_group",
@@ -113,6 +169,26 @@ func TestRedact_IPv6(t *testing.T) {
 			name:  "ipv4_mapped_ipv6_redacted",
 			input: "client ::ffff:192.168.1.50 connected",
 			want:  "client <IPv6>:<IPv4> connected",
+		},
+		{
+			name:  "preserves_multicast_all_nodes_v6",
+			input: "joined ff02::1",
+			want:  "joined ff02::1",
+		},
+		{
+			name:  "preserves_multicast_mdns_v6",
+			input: "mdns query to ff02::fb",
+			want:  "mdns query to ff02::fb",
+		},
+		{
+			name:  "preserves_link_local_full_v6",
+			input: "neighbor fe80::1a2b:3c4d:5e6f:7890 reachable",
+			want:  "neighbor fe80::1a2b:3c4d:5e6f:7890 reachable",
+		},
+		{
+			name:  "redacts_global_unicast_v6",
+			input: "from 2001:db8::1",
+			want:  "from <IPv6>",
 		},
 	}
 
@@ -146,6 +222,35 @@ func TestRedact_PreservesLogMetadata(t *testing.T) {
 		if !strings.Contains(got, preserved) {
 			t.Errorf("expected %q to be preserved in output, but it was redacted", preserved)
 		}
+	}
+}
+
+func TestIsSubnetMask(t *testing.T) {
+	tests := []struct {
+		ip   string
+		want bool
+	}{
+		{"255.255.255.0", true},   // /24
+		{"255.255.0.0", true},     // /16
+		{"255.0.0.0", true},       // /8
+		{"255.255.255.128", true}, // /25
+		{"255.255.255.252", true}, // /30
+		{"255.255.255.255", true}, // /32
+		{"128.0.0.0", true},       // /1
+		{"255.255.255.1", false},  // not contiguous
+		{"255.0.255.0", false},    // not contiguous
+		{"0.0.0.0", false},        // excluded (unspecified)
+		{"192.168.1.1", false},    // normal IP
+		{"10.0.0.1", false},       // normal IP
+		{"::1", false},            // IPv6 — function is IPv4-only
+	}
+	for _, tt := range tests {
+		t.Run(tt.ip, func(t *testing.T) {
+			ip := net.ParseIP(tt.ip)
+			if got := isSubnetMask(ip); got != tt.want {
+				t.Errorf("isSubnetMask(%s) = %v, want %v", tt.ip, got, tt.want)
+			}
+		})
 	}
 }
 
