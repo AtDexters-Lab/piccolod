@@ -1156,6 +1156,14 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		return nil
 	}))
 
+	// Register the systemd service-level watchdog. Pings systemd at WatchdogSec/2
+	// to prove piccolod is not stuck (e.g. D-state from btrfs hang). No-op when
+	// WatchdogSec is not set in the service file (dev/test).
+	s.supervisor.Register(supervisor.NewComponent("systemd-watchdog", func(ctx context.Context) error {
+		go s.runWatchdogLoop(ctx)
+		return nil
+	}, nil))
+
 	// (Simplified) No dynamic port publish/unpublish wiring; allow dial to fail gracefully.
 
 	// Rehydrate proxies for containers that survived restarts
@@ -1237,6 +1245,37 @@ func (s *GinServer) Start() error {
 		return err
 	}
 	return nil
+}
+
+// runWatchdogLoop pings the systemd service-level watchdog at half the
+// configured WatchdogSec interval. If piccolod gets stuck (e.g. all threads
+// blocked in D-state during a btrfs hang), pings stop and systemd restarts
+// the service. The loop is a no-op when WatchdogSec is not configured.
+func (s *GinServer) runWatchdogLoop(ctx context.Context) {
+	interval, err := daemon.SdWatchdogEnabled(false)
+	if err != nil || interval == 0 {
+		log.Printf("INFO: systemd watchdog not configured, skipping keepalive loop")
+		return
+	}
+	tick := interval / 2
+	if tick <= 0 {
+		tick = interval
+	}
+	log.Printf("INFO: systemd watchdog enabled, pinging every %s (timeout=%s)", tick, interval)
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+	var notifyFailed bool
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := daemon.SdNotify(false, daemon.SdNotifyWatchdog); err != nil && !notifyFailed {
+				log.Printf("WARN: watchdog ping failed (suppressing future errors): %v", err)
+				notifyFailed = true
+			}
+		}
+	}
 }
 
 // Stop gracefully shuts down the server and all its components using a
