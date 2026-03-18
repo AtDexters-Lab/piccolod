@@ -2,9 +2,12 @@ package app
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"piccolod/internal/api"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TestParseAppDefinition tests parsing of valid app.yaml files
@@ -866,4 +869,89 @@ func TestNeutralizeTemplates(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRenderManifest_ToJSON(t *testing.T) {
+	t.Run("array_input", func(t *testing.T) {
+		manifest := `domains: {{ .Inputs.domain_list | toJSON }}`
+		inputs := map[string]interface{}{
+			"domain_list": []interface{}{".example.com", ".test.org"},
+		}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), `[".example.com",".test.org"]`) {
+			t.Errorf("expected JSON array in output, got:\n%s", rendered)
+		}
+	})
+
+	t.Run("empty_array", func(t *testing.T) {
+		manifest := `domains: {{ .Inputs.list | toJSON }}`
+		inputs := map[string]interface{}{"list": []interface{}{}}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), "domains: []") {
+			t.Errorf("expected empty JSON array, got: %s", rendered)
+		}
+	})
+
+	t.Run("scalar_passthrough", func(t *testing.T) {
+		manifest := `flag: {{ .Inputs.flag | toJSON }}`
+		inputs := map[string]interface{}{"flag": true}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), "flag: true") {
+			t.Errorf("expected boolean, got: %s", rendered)
+		}
+	})
+
+	t.Run("mixed_array_and_scalar", func(t *testing.T) {
+		manifest := `
+app_config:
+  name: "{{ .Inputs.app_name }}"
+  suffixes: {{ .Inputs.suffixes | toJSON }}
+`
+		inputs := map[string]interface{}{
+			"app_name": "myapp",
+			"suffixes": []interface{}{".a.com", ".b.com"},
+		}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		output := string(rendered)
+		if !strings.Contains(output, `name: "myapp"`) {
+			t.Errorf("expected scalar preserved, got:\n%s", output)
+		}
+		if !strings.Contains(output, `[".a.com",".b.com"]`) {
+			t.Errorf("expected JSON array, got:\n%s", output)
+		}
+	})
+
+	t.Run("round_trip_yaml_parse", func(t *testing.T) {
+		manifest := `domains: {{ .Inputs.list | toJSON }}`
+		inputs := map[string]interface{}{
+			"list": []interface{}{"alpha", "beta"},
+		}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var result map[string]interface{}
+		if err := yaml.Unmarshal(rendered, &result); err != nil {
+			t.Fatalf("rendered YAML should parse: %v\nrendered:\n%s", err, rendered)
+		}
+		domains, ok := result["domains"].([]interface{})
+		if !ok {
+			t.Fatalf("expected []interface{}, got %T", result["domains"])
+		}
+		if len(domains) != 2 || domains[0] != "alpha" || domains[1] != "beta" {
+			t.Errorf("unexpected domains: %v", domains)
+		}
+	})
 }

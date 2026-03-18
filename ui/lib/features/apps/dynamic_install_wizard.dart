@@ -40,7 +40,12 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
     // Initialize defaults
     widget.schema.forEach((key, value) {
       if (value is Map && value.containsKey('default')) {
-        _formValues[key] = value['default'];
+        final def = value['default'];
+        if (value['type'] == 'array' && def is List) {
+          _formValues[key] = def.map((e) => e.toString()).toList();
+        } else {
+          _formValues[key] = def;
+        }
       }
     });
   }
@@ -233,6 +238,38 @@ class _DynamicInstallWizardState extends State<DynamicInstallWizard> {
   }
 
   Widget _buildInputWidget(String key, String type, bool required, Map<String, dynamic>? validation, bool canGenerate) {
+    if (type == 'array') {
+      return FormField<List<String>>(
+        initialValue: (_formValues[key] as List<String>?) ?? <String>[],
+        onSaved: (val) => _formValues[key] = val ?? <String>[],
+        validator: (val) {
+          if (required && (val == null || val.isEmpty)) {
+            return 'At least one item is required';
+          }
+          return null;
+        },
+        builder: (state) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _ArrayInputWidget(
+                initialValues: state.value ?? <String>[],
+                onChanged: (values) {
+                  state.didChange(values);
+                  _formValues[key] = values;
+                },
+              ),
+              if (state.hasError)
+                Padding(
+                  padding: const EdgeInsets.only(top: Spacing.xs),
+                  child: Text(state.errorText!, style: const TextStyle(color: PiccoloTheme.critical, fontSize: 12)),
+                ),
+            ],
+          );
+        },
+      );
+    }
+
     if (type == 'boolean') {
       return FormField<bool>(
         initialValue: _formValues[key] == true,
@@ -346,6 +383,104 @@ class _TextFormFieldWrapperState extends State<_TextFormFieldWrapper> {
       ),
       onSaved: widget.onSaved,
       validator: widget.validator,
+    );
+  }
+}
+
+class _ArrayInputWidget extends StatefulWidget {
+
+  const _ArrayInputWidget({required this.initialValues, required this.onChanged});
+  final List<String> initialValues;
+  final ValueChanged<List<String>> onChanged;
+
+  @override
+  State<_ArrayInputWidget> createState() => _ArrayInputWidgetState();
+}
+
+class _ArrayInputWidgetState extends State<_ArrayInputWidget> {
+  late List<TextEditingController> _controllers;
+
+  @override
+  void initState() {
+    super.initState();
+    _controllers = widget.initialValues
+        .map((v) => TextEditingController(text: v))
+        .toList();
+    if (_controllers.isEmpty) {
+      _controllers.add(TextEditingController());
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final c in _controllers) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  void _notify() {
+    widget.onChanged(
+      _controllers.map((c) => c.text).where((s) => s.isNotEmpty).toList(),
+    );
+  }
+
+  void _addItem() {
+    setState(() {
+      _controllers.add(TextEditingController());
+    });
+  }
+
+  void _removeItem(int index) {
+    final controller = _controllers[index];
+    _controllers.removeAt(index);
+    controller.dispose();
+    if (_controllers.isEmpty) {
+      _controllers.add(TextEditingController());
+    }
+    _notify();
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ...List.generate(_controllers.length, (i) => Padding(
+          padding: const EdgeInsets.only(bottom: Spacing.sm),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _controllers[i],
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    filled: true,
+                    fillColor: PiccoloTheme.porcelain,
+                    isDense: true,
+                  ),
+                  onChanged: (_) => _notify(),
+                ),
+              ),
+              const SizedBox(width: Spacing.sm),
+              IconButton(
+                icon: const Icon(PiccoloIcons.delete, size: 18),
+                onPressed: () => _removeItem(i),
+                tooltip: 'Remove',
+                iconSize: 18,
+                padding: const EdgeInsets.all(Spacing.xs),
+                constraints: const BoxConstraints(),
+              ),
+            ],
+          ),
+        )),
+        TextButton.icon(
+          icon: const Icon(PiccoloIcons.add, size: 16),
+          label: const Text('Add item'),
+          onPressed: _addItem,
+        ),
+      ],
     );
   }
 }

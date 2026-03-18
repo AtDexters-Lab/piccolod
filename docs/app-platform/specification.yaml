@@ -98,7 +98,7 @@ inputs:
       regex: "^[a-z][a-z0-9]{0,15}$"
       message: "Only lowercase letters and numbers allowed; must start with a letter; max 16 chars."
   subdomain:
-    type: string # string | boolean | int | password
+    type: string # string | boolean | int | password | array
     label: "Subdomain"
     description: "Used for listener naming and UI (e.g., listener 'metrics' → metrics-<app>.<base> in host-based URLs)"
     default: "dev"
@@ -112,6 +112,12 @@ inputs:
     description: "If generate=true, the backend can pre-fill a strong random value."
     generate: true
     required: true
+  trusted_suffixes:
+    type: array # List of strings. Use {{ .Inputs.trusted_suffixes | toJSON }} in templates.
+    label: "Trusted Suffixes"
+    description: "Domain suffixes for federation. Renders as JSON array in templates."
+    default:
+      - ".example.com"
 
 # Optional: Which service receives all listener traffic (v1 listeners target the primary service).
 # Defaults to "main".

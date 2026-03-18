@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -21,6 +22,17 @@ const (
 	tplLeftMarker  = "__TPL_L__"
 	tplRightMarker = "__TPL_R__"
 )
+
+// manifestFuncMap provides custom template functions for app manifest rendering.
+var manifestFuncMap = template.FuncMap{
+	"toJSON": func(v any) (string, error) {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	},
+}
 
 var (
 	// Valid app name pattern: lowercase letters, numbers, hyphens
@@ -278,7 +290,7 @@ func RenderManifest(rawYaml []byte, userInputs map[string]interface{}, systemCon
 
 	// Parse and Execute Template
 	// Option "missingkey=error" ensures we fail if the manifest references an input we didn't provide
-	tmpl, err := template.New("manifest").Option("missingkey=error").Parse(string(rawYaml))
+	tmpl, err := template.New("manifest").Funcs(manifestFuncMap).Option("missingkey=error").Parse(string(rawYaml))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse manifest template: %w", err)
 	}
