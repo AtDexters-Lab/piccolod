@@ -153,7 +153,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
       context: parentContext,
       builder: (dialogContext) => AlertDialog(
         title: const Text('Disable Self-hosted Remote Access?'),
-        content: const Text('This will stop the self-hosted relay connection. Managed (Piccolo Cloud) access is unaffected.'),
+        content: const Text('This will stop the self-hosted relay connection. Managed (piccolospace) access is unaffected.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
           FilledButton(

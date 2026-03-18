@@ -61,6 +61,7 @@ class PiccoloIcons {
   static const IconData userGear = PhosphorIconsRegular.userGear;
   static const IconData email = PhosphorIconsRegular.envelope;
   static const IconData cloud = PhosphorIconsRegular.cloud;
+  static const IconData planet = PhosphorIconsRegular.planet;
   static const IconData cloudOff = PhosphorIconsRegular.cloudSlash;
   static const IconData devices = PhosphorIconsRegular.devices;
   static const IconData link = PhosphorIconsRegular.link;

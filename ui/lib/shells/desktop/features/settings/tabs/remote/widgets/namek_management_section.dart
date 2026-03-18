@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:piccolo_os/core/models/identity_models.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
@@ -17,11 +18,14 @@ class NamekManagementSection extends StatefulWidget {
 
 class _NamekManagementSectionState extends State<NamekManagementSection> {
   final TextEditingController _hostnameCtrl = TextEditingController();
+  final TextEditingController _urlCtrl = TextEditingController();
   bool _isEditingHostname = false;
+  bool _isEditingUrl = false;
 
   @override
   void dispose() {
     _hostnameCtrl.dispose();
+    _urlCtrl.dispose();
     super.dispose();
   }
 
@@ -44,13 +48,7 @@ class _NamekManagementSectionState extends State<NamekManagementSection> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              const Icon(PiccoloIcons.cloud, size: 20, color: PiccoloTheme.cobalt600),
-              const SizedBox(width: Spacing.sm),
-              Text('Piccolo Cloud', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
-            ],
-          ),
+          _buildHeader(ids),
           const SizedBox(height: Spacing.base),
           _buildContent(ids),
         ],
@@ -58,28 +56,44 @@ class _NamekManagementSectionState extends State<NamekManagementSection> {
     );
   }
 
-  Widget _buildContent(IdentityStatus ids) {
-    final state = ids.state;
+  Widget _buildHeader(IdentityStatus ids) {
+    final isActive = ids.state == 'active';
+    final isDisabled = ids.state == 'disabled';
 
-    switch (state) {
+    return Row(
+      children: [
+        const Icon(PiccoloIcons.planet, size: 20, color: PiccoloTheme.cobalt600),
+        const SizedBox(width: Spacing.sm),
+        Text('piccolospace', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+        const Spacer(),
+        if (isActive || isDisabled)
+          Switch(
+            value: isActive,
+            onChanged: (_) => isActive ? _confirmDisable() : unawaited(widget.controller.enableNamek()),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildContent(IdentityStatus ids) {
+    switch (ids.state) {
       case 'not_enrolled':
-        return _buildNotEnrolled();
+        return _buildNotEnrolled(ids);
       case 'active':
         return _buildActive(ids);
       case 'disabled':
         return _buildDisabled();
       default:
-        // Suspended or unknown
         return _buildSuspended();
     }
   }
 
-  Widget _buildNotEnrolled() {
+  Widget _buildNotEnrolled(IdentityStatus ids) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          'Enroll your device with Piccolo Cloud for managed remote access with automatic DNS and certificates.',
+          'Managed remote access with automatic DNS and certificates.',
           style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
         ),
         const SizedBox(height: Spacing.base),
@@ -87,36 +101,109 @@ class _NamekManagementSectionState extends State<NamekManagementSection> {
           onPressed: widget.controller.enrollNamek,
           child: const Text('Enroll'),
         ),
+        const SizedBox(height: Spacing.base),
+        _buildServerUrl(ids),
+      ],
+    );
+  }
+
+  Widget _buildServerUrl(IdentityStatus ids) {
+    final currentUrl = ids.namekUrl ?? '';
+
+    if (!_isEditingUrl) {
+      return Row(
+        children: [
+          Text('Server: ', style: PiccoloTheme.textTheme.bodySmall?.copyWith(color: PiccoloTheme.inkMuted)),
+          Flexible(
+            child: Text(
+              currentUrl,
+              style: PiccoloTheme.textTheme.bodySmall?.copyWith(color: PiccoloTheme.inkMuted),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          const SizedBox(width: Spacing.sm),
+          TextButton(
+            onPressed: () {
+              _urlCtrl.text = currentUrl;
+              setState(() => _isEditingUrl = true);
+            },
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: Spacing.sm),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            child: const Text('Change'),
+          ),
+        ],
+      );
+    }
+
+    return Row(
+      children: [
+        Expanded(
+          child: TextField(
+            controller: _urlCtrl,
+            decoration: const InputDecoration(
+              labelText: 'Server URL',
+              hintText: 'https://namek.example.com',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+          ),
+        ),
+        const SizedBox(width: Spacing.sm),
+        FilledButton(
+          onPressed: () async {
+            final url = _urlCtrl.text.trim();
+            if (url.isEmpty) return;
+            await widget.controller.setNamekUrl(url);
+            if (mounted && widget.controller.error == null) {
+              setState(() => _isEditingUrl = false);
+            }
+          },
+          child: const Text('Save'),
+        ),
+        const SizedBox(width: Spacing.xs),
+        TextButton(
+          onPressed: () => setState(() => _isEditingUrl = false),
+          child: const Text('Cancel'),
+        ),
       ],
     );
   }
 
   Widget _buildActive(IdentityStatus ids) {
+    final hostname = ids.resolvedHostname;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            const Text('Enabled', style: TextStyle(fontWeight: FontWeight.w600)),
-            const Spacer(),
-            Switch(
-              value: true,
-              onChanged: (_) => _confirmDisable(),
-            ),
-          ],
-        ),
-        const SizedBox(height: Spacing.sm),
-        if (ids.resolvedHostname != null) ...[
+        if (hostname != null) ...[
           Row(
             children: [
-              const Icon(PiccoloIcons.link, size: 14, color: PiccoloTheme.inkMuted),
-              const SizedBox(width: Spacing.xs),
-              Text(ids.resolvedHostname!, style: PiccoloTheme.textTheme.bodyMedium),
+              Expanded(
+                child: SelectableText(
+                  hostname,
+                  style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
+                ),
+              ),
+              IconButton(
+                onPressed: () {
+                  unawaited(Clipboard.setData(ClipboardData(text: hostname)));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Hostname copied'), duration: Duration(seconds: 2)),
+                  );
+                },
+                icon: const Icon(PiccoloIcons.copy, size: 16),
+                tooltip: 'Copy hostname',
+                iconSize: 16,
+                padding: const EdgeInsets.all(Spacing.xs),
+                constraints: const BoxConstraints(),
+              ),
             ],
           ),
-          const SizedBox(height: Spacing.base),
+          const SizedBox(height: Spacing.sm),
         ],
-        // Custom hostname editor
         if (!_isEditingHostname)
           TextButton.icon(
             onPressed: () {
@@ -166,24 +253,9 @@ class _NamekManagementSectionState extends State<NamekManagementSection> {
   }
 
   Widget _buildDisabled() {
-    return Row(
-      children: [
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Currently disabled', style: TextStyle(color: PiccoloTheme.inkMuted)),
-              const SizedBox(height: Spacing.xs),
-              Text('Toggle to re-enable managed remote access.',
-                  style: PiccoloTheme.textTheme.labelSmall),
-            ],
-          ),
-        ),
-        Switch(
-          value: false,
-          onChanged: (_) => unawaited(widget.controller.enableNamek()),
-        ),
-      ],
+    return Text(
+      'Managed remote access is disabled. Toggle to re-enable.',
+      style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
     );
   }
 
@@ -220,7 +292,7 @@ class _NamekManagementSectionState extends State<NamekManagementSection> {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: const Text('Disable Managed Remote Access?'),
-        content: const Text('This will disable Piccolo Cloud remote access. Self-hosted relay connections are unaffected.'),
+        content: const Text('This will disable piccolospace remote access. Self-hosted relay connections are unaffected.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
           FilledButton(
