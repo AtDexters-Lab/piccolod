@@ -113,9 +113,9 @@ inputs:
     generate: true
     required: true
   trusted_suffixes:
-    type: array # List of strings. Use {{ .Inputs.trusted_suffixes | toJSON }} in templates.
+    type: array # List of strings. {{ .Inputs.trusted_suffixes }} auto-renders as JSON array.
     label: "Trusted Suffixes"
-    description: "Domain suffixes for federation. Renders as JSON array in templates."
+    description: "Domain suffixes for federation. Auto-renders as JSON array in templates."
     default:
       - ".example.com"
 

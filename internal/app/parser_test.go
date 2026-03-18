@@ -954,4 +954,23 @@ app_config:
 			t.Errorf("unexpected domains: %v", domains)
 		}
 	})
+
+	t.Run("array_auto_renders_without_toJSON", func(t *testing.T) {
+		manifest := `domains: {{ .Inputs.list }}`
+		inputs := map[string]interface{}{
+			"list": []interface{}{".example.com", ".test.org"},
+		}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), `[".example.com",".test.org"]`) {
+			t.Errorf("expected auto JSON array without | toJSON, got:\n%s", rendered)
+		}
+		// Verify it's valid YAML
+		var result map[string]interface{}
+		if err := yaml.Unmarshal(rendered, &result); err != nil {
+			t.Fatalf("rendered YAML should parse: %v\nrendered:\n%s", err, rendered)
+		}
+	})
 }

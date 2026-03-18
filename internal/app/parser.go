@@ -23,6 +23,20 @@ const (
 	tplRightMarker = "__TPL_R__"
 )
 
+// jsonValue wraps a value so that its String() method produces JSON.
+// Used to make slice/array template inputs render as valid YAML automatically
+// (e.g., {{ .Inputs.list }} → ["a","b"] instead of Go's default [a b]).
+type jsonValue struct{ v any }
+
+func (j jsonValue) String() string {
+	b, _ := json.Marshal(j.v)
+	return string(b)
+}
+
+func (j jsonValue) MarshalJSON() ([]byte, error) {
+	return json.Marshal(j.v)
+}
+
 // manifestFuncMap provides custom template functions for app manifest rendering.
 var manifestFuncMap = template.FuncMap{
 	"toJSON": func(v any) (string, error) {
@@ -32,6 +46,21 @@ var manifestFuncMap = template.FuncMap{
 		}
 		return string(b), nil
 	},
+}
+
+// wrapSliceInputs wraps []interface{} values in jsonValue so that Go templates
+// render them as JSON arrays (valid YAML) instead of Go's fmt.Sprint format.
+// Scalar values (string, bool, number) are left untouched.
+func wrapSliceInputs(inputs map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(inputs))
+	for k, v := range inputs {
+		if _, ok := v.([]interface{}); ok {
+			out[k] = jsonValue{v}
+		} else {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 var (
@@ -282,9 +311,11 @@ func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
 
 // RenderManifest applies user inputs to the app manifest template.
 func RenderManifest(rawYaml []byte, userInputs map[string]interface{}, systemContext map[string]interface{}) ([]byte, error) {
-	// Prepare data for template
+	// Prepare data for template.
+	// wrapSliceInputs ensures array values render as JSON (valid YAML)
+	// without requiring explicit | toJSON in templates.
 	data := map[string]interface{}{
-		"Inputs": userInputs,
+		"Inputs": wrapSliceInputs(userInputs),
 		"System": systemContext,
 	}
 
