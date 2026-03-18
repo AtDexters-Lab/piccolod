@@ -110,11 +110,10 @@ func (a *BackendAdapter) Start(ctx context.Context) error {
 	}
 	hosts := buildHostnameList(cfg)
 
-	// Build port mappings: start with portal defaults, add port claims.
-	portMappings := map[int]backend.PortMapping{
-		443: {Default: "127.0.0.1:443"},
-		80:  {Default: "127.0.0.1:80"},
-	}
+	// Build port mappings from port claims only — ports 80/443 are intentionally
+	// excluded so that unresolved remote tunnel traffic is rejected rather than
+	// falling through to the LAN-only internal HTTPS listener.
+	portMappings := make(map[int]backend.PortMapping, len(cfg.ClaimMappings))
 	var tcpPorts []int
 	var udpRoutes []backend.UDPRouteConfig
 	for _, cm := range cfg.ClaimMappings {
@@ -195,7 +194,7 @@ func (a *BackendAdapter) connectHandler() backend.ConnectHandler {
 		}
 
 		if a.resolver == nil {
-			// No resolver configured — fall back to library PortMappings (80/443).
+			// No resolver configured — reject connection.
 			return nil, backend.ErrNoRoute
 		}
 

@@ -89,6 +89,9 @@ func TestStartConfiguresAttestation(t *testing.T) {
 	if captured.Attestation.ReauthIntervalSeconds != attestationReauthIntervalSec {
 		t.Fatalf("unexpected reauth interval: got %d want %d", captured.Attestation.ReauthIntervalSeconds, attestationReauthIntervalSec)
 	}
+	if len(captured.PortMappings) != 0 {
+		t.Fatalf("expected empty PortMappings with no claims, got %d entries", len(captured.PortMappings))
+	}
 }
 
 func TestStartPropagatesFactoryError(t *testing.T) {
@@ -173,12 +176,13 @@ func TestStartWithPortClaims(t *testing.T) {
 		t.Fatalf("expected UDPRoutes=[{53}], got %v", captured.UDPRoutes)
 	}
 
-	// Verify PortMappings include both defaults and claims
-	if _, ok := captured.PortMappings[80]; !ok {
-		t.Fatal("expected default port mapping for 80")
+	// Verify ports 80/443 are NOT in PortMappings (isolation boundary — remote
+	// tunnel traffic must never fall back to the LAN listener).
+	if _, ok := captured.PortMappings[80]; ok {
+		t.Fatal("port 80 must not have a default mapping (isolation boundary)")
 	}
-	if _, ok := captured.PortMappings[443]; !ok {
-		t.Fatal("expected default port mapping for 443")
+	if _, ok := captured.PortMappings[443]; ok {
+		t.Fatal("port 443 must not have a default mapping (isolation boundary)")
 	}
 	pm53, ok := captured.PortMappings[53]
 	if !ok {
