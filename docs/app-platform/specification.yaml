@@ -13,6 +13,13 @@
 # - The manifest is rendered as a Go template. You can reference:
 #   - Inputs: {{ .Inputs.<name> }}
 #   - System: {{ .System.Domain }}, {{ .System.Architecture }}
+# - Optional inputs (required: false) that the user does not provide are
+#   automatically backfilled before rendering:
+#   - If the input declares a `default`, that value is used.
+#   - Otherwise a type-appropriate zero value is injected:
+#     string/password → "", boolean → false, int → 0, array → [].
+#   - This means {{ .Inputs.optional_field }} is always safe to use.
+#   - Required inputs that are missing will still produce a template error.
 # - If at least one service declares `oidc_client`, Piccolo also provides:
 #   - {{ .System.Auth.Issuer }}
 #   - {{ .System.Auth.ClientID }}

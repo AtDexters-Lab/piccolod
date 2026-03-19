@@ -309,8 +309,62 @@ func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
 	return &app, nil
 }
 
+// backfillInputDefaults ensures every declared optional input has a key in the
+// provided map. For optional inputs (required: false) not provided by the user,
+// it injects the declared default value or a type-appropriate zero value.
+// This prevents missingkey=error panics when templates reference optional inputs.
+func backfillInputDefaults(declared map[string]api.AppInput, provided map[string]interface{}) map[string]interface{} {
+	if len(declared) == 0 {
+		return provided
+	}
+	// Check if any optional input needs backfilling before allocating.
+	needsBackfill := false
+	for name, spec := range declared {
+		if _, exists := provided[name]; !exists && !spec.Required {
+			needsBackfill = true
+			break
+		}
+	}
+	if !needsBackfill {
+		return provided
+	}
+	merged := make(map[string]interface{}, len(provided)+len(declared))
+	for k, v := range provided {
+		merged[k] = v
+	}
+	for name, spec := range declared {
+		if _, exists := merged[name]; exists {
+			continue
+		}
+		if spec.Required {
+			continue // let missingkey=error catch missing required inputs
+		}
+		if spec.Default != nil {
+			merged[name] = spec.Default
+			continue
+		}
+		switch spec.Type {
+		case "boolean":
+			merged[name] = false
+		case "int", "number":
+			merged[name] = float64(0) // float64 matches JSON/YAML number decoding
+		case "array":
+			merged[name] = []interface{}{}
+		default: // string, password
+			merged[name] = ""
+		}
+	}
+	return merged
+}
+
 // RenderManifest applies user inputs to the app manifest template.
 func RenderManifest(rawYaml []byte, userInputs map[string]interface{}, systemContext map[string]interface{}) ([]byte, error) {
+	// Backfill zero values for declared-but-unprovided optional inputs
+	// so templates can use {{ .Inputs.x }} without missingkey=error panics.
+	if schema, err := ParseAppSchema(rawYaml); err == nil && len(schema.Inputs) > 0 {
+		userInputs = backfillInputDefaults(schema.Inputs, userInputs)
+	}
+
 	// Prepare data for template.
 	// wrapSliceInputs ensures array values render as JSON (valid YAML)
 	// without requiring explicit | toJSON in templates.
