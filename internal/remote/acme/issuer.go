@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
+	"github.com/go-acme/lego/v4/challenge/dns01"
 	lego "github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
 	acmepkg "golang.org/x/crypto/acme"
@@ -228,7 +229,14 @@ func configureChallengeWith(cli *lego.Client, solver string, orchClient Orchestr
 		if orchClient == nil {
 			return errors.New("acme: orchestrator client not configured")
 		}
-		return cli.Challenge.SetDNS01Provider(NewPiccoloProvider(orchClient))
+		// Disable authoritative NS propagation check: our orchestrator client
+		// creates the TXT record directly in PowerDNS, so querying authoritative
+		// nameservers for propagation is unnecessary and can fail when cached NS
+		// records point to stale/previous DNS providers.
+		return cli.Challenge.SetDNS01Provider(
+			NewPiccoloProvider(orchClient),
+			dns01.DisableAuthoritativeNssPropagationRequirement(),
+		)
 	}
 	prov := &http01Provider{sink: sink}
 	return cli.Challenge.SetHTTP01Provider(prov)

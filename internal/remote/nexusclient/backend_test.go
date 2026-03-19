@@ -287,6 +287,89 @@ func TestConnectHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("port_claim_tcp", func(t *testing.T) {
+		// Resolver returns ErrNoRoute for port-claim hostnames like "tcp:53".
+		// The handler should fall through to protocol-aware port-claim resolution.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		defer ln.Close()
+		tcpPort := ln.Addr().(*net.TCPAddr).Port
+
+		adapter := NewBackendAdapter(nil, &mockResolver{port: 0, ok: false})
+		adapter.cfg = Config{
+			ClaimMappings: []api.PortClaimInfo{
+				{Port: 53, HostBind: 19999, Protocol: "udp"},
+				{Port: 53, HostBind: tcpPort, Protocol: "tcp"},
+			},
+		}
+		handler := adapter.connectHandler()
+		conn, err := handler(context.Background(), backend.ConnectRequest{
+			Hostname:         "tcp:53",
+			OriginalHostname: "tcp:53",
+			Port:             53,
+			Transport:        backend.TransportTCP,
+		})
+		if err != nil {
+			t.Fatalf("expected TCP port-claim to resolve, got %v", err)
+		}
+		conn.Close()
+	})
+
+	t.Run("port_claim_udp", func(t *testing.T) {
+		// UDP port-claim resolution must return the UDP host-bind, not the TCP one.
+		udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		pc, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		defer pc.Close()
+		udpPort := pc.LocalAddr().(*net.UDPAddr).Port
+
+		adapter := NewBackendAdapter(nil, &mockResolver{port: 0, ok: false})
+		adapter.cfg = Config{
+			ClaimMappings: []api.PortClaimInfo{
+				{Port: 53, HostBind: udpPort, Protocol: "udp"},
+				{Port: 53, HostBind: 19999, Protocol: "tcp"},
+			},
+		}
+		handler := adapter.connectHandler()
+		conn, err := handler(context.Background(), backend.ConnectRequest{
+			Hostname:         "udp:53",
+			OriginalHostname: "udp:53",
+			Port:             53,
+			Transport:        backend.TransportUDP,
+		})
+		if err != nil {
+			t.Fatalf("expected UDP port-claim to resolve, got %v", err)
+		}
+		conn.Close()
+	})
+
+	t.Run("port_claim_no_match", func(t *testing.T) {
+		// No claim exists for the requested port — should return ErrNoRoute.
+		adapter := NewBackendAdapter(nil, &mockResolver{port: 0, ok: false})
+		adapter.cfg = Config{
+			ClaimMappings: []api.PortClaimInfo{
+				{Port: 53, HostBind: 15001, Protocol: "udp"},
+			},
+		}
+		handler := adapter.connectHandler()
+		_, err := handler(context.Background(), backend.ConnectRequest{
+			Hostname:         "tcp:22",
+			OriginalHostname: "tcp:22",
+			Port:             22,
+			Transport:        backend.TransportTCP,
+		})
+		if !errors.Is(err, backend.ErrNoRoute) {
+			t.Fatalf("expected ErrNoRoute for unclaimed port, got %v", err)
+		}
+	})
+
 	t.Run("tunnel_mode", func(t *testing.T) {
 		rm := router.NewManager()
 		rm.RegisterAppRoute("myapp", router.ModeTunnel, "leader-1")

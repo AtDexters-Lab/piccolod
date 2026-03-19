@@ -113,6 +113,11 @@ func (a *BackendAdapter) Start(ctx context.Context) error {
 	// Build port mappings from port claims only — ports 80/443 are intentionally
 	// excluded so that unresolved remote tunnel traffic is rejected rather than
 	// falling through to the LAN-only internal HTTPS listener.
+	//
+	// Note: portMappings is keyed by port number alone (no protocol dimension).
+	// When both TCP and UDP claim the same port, the last entry wins. This is
+	// fine because connectHandler() resolves port claims with protocol awareness
+	// via resolvePortClaim() before the fallback to this map.
 	portMappings := make(map[int]backend.PortMapping, len(cfg.ClaimMappings))
 	var tcpPorts []int
 	var udpRoutes []backend.UDPRouteConfig
@@ -203,6 +208,11 @@ func (a *BackendAdapter) connectHandler() backend.ConnectHandler {
 			localPort = port
 		} else if port, ok := a.resolver.Resolve(req.Hostname, req.Port, req.IsTLS); ok {
 			localPort = port
+		} else if port, ok := a.resolvePortClaim(req.Port, req.Transport); ok {
+			// Port-claim resolution: match by port AND protocol to handle
+			// dual-protocol claims (e.g., DNS with both TCP and UDP on port 53)
+			// that have different host-bind ports per protocol.
+			localPort = port
 		} else {
 			return nil, backend.ErrNoRoute
 		}
@@ -228,6 +238,18 @@ func (a *BackendAdapter) connectHandler() backend.ConnectHandler {
 		}
 		return conn, nil
 	}
+}
+
+// resolvePortClaim matches a port claim by port number and transport protocol.
+func (a *BackendAdapter) resolvePortClaim(port int, transport backend.Transport) (int, bool) {
+	cfg := a.currentConfig()
+	proto := string(transport) // backend.Transport is "tcp" or "udp", matching PortClaimInfo.Protocol
+	for _, cm := range cfg.ClaimMappings {
+		if cm.Port == port && cm.Protocol == proto {
+			return cm.HostBind, true
+		}
+	}
+	return 0, false
 }
 
 func (a *BackendAdapter) currentConfig() Config {
