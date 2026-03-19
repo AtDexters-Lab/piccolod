@@ -1617,6 +1617,7 @@ func (s *GinServer) setupGinRoutes() {
 			apps.PATCH("/:name/listeners", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUpdateListeners)
 			apps.POST("/:name/start", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppStart)
 			apps.POST("/:name/stop", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppStop)
+			apps.POST("/:name/update", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUpdate)
 			apps.POST("/:name/rollback", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppRollback)
 			apps.POST("/:name/clone", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppClone)
 			apps.GET("/:name/clones", s.requireAdmin(), s.handleGinAppListClones)

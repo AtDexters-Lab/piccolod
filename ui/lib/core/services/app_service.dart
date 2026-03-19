@@ -139,7 +139,8 @@ class AppService {
         .map((e) => AppContainerStatus.fromJson(Map<String, dynamic>.from(e)))
         .toList();
 
-    return AppDetail(app: app, listeners: listeners, containers: containers);
+    final snapshotAvailable = json['snapshot_available'] == true;
+    return AppDetail(app: app, listeners: listeners, containers: containers, snapshotAvailable: snapshotAvailable);
   }
 
   Future<List<ServiceEndpoint>> getAppServices(String name) async {
@@ -167,6 +168,28 @@ class AppService {
       body: {},
       headers: _taskHeaders(taskId),
     );
+  }
+
+  Future<void> updateApp(String name, {String? tag, String? taskId}) async {
+    final body = <String, dynamic>{};
+    if (tag != null) body['tag'] = tag;
+    try {
+      await _client
+          .post('/api/v1/apps/$name/update', body: body, headers: _taskHeaders(taskId))
+          .timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      debugPrint('updateApp: POST timed out (expected for image pulls)');
+    }
+  }
+
+  Future<void> rollbackApp(String name, {String? taskId}) async {
+    try {
+      await _client
+          .post('/api/v1/apps/$name/rollback', body: {}, headers: _taskHeaders(taskId))
+          .timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      debugPrint('rollbackApp: POST timed out (expected for slow container stops)');
+    }
   }
 
   Future<void> updateAppListeners(

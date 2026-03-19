@@ -56,6 +56,8 @@ class _AppDetailViewState extends State<AppDetailView>
   bool _isLoading = true;
   String? _error;
 
+  bool _snapshotAvailable = false;
+
   // Action states
   bool _isActionLoading = false;
 
@@ -134,6 +136,7 @@ class _AppDetailViewState extends State<AppDetailView>
         _app = detail.app;
         _listeners = detail.listeners;
         _containers = detail.containers;
+        _snapshotAvailable = detail.snapshotAvailable;
         _primaryHealth = detail.app.primaryListenerHealth;
         // Identify the primary listener name for stream filtering
         _primaryListenerName = _findPrimaryListenerName(detail.listeners);
@@ -210,6 +213,43 @@ class _AppDetailViewState extends State<AppDetailView>
     if (!refreshOnSuccess || !mounted) return true;
     await _loadData();
     return true;
+  }
+
+  Future<void> _handleUpdate() async {
+    await _handleActionWithProgress(
+      taskType: 'update_image',
+      action: (taskId) => widget.appService.updateApp(widget.appId, taskId: taskId),
+    );
+  }
+
+  Future<void> _confirmRollback() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Roll back to previous version?'),
+        content: const Text(
+          'This will restore the app and its data to the state before the last update. Any changes since the update will be lost.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.warning),
+            child: const Text('Roll Back'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    await _handleActionWithProgress(
+      taskType: 'rollback_app',
+      action: (taskId) => widget.appService.rollbackApp(widget.appId, taskId: taskId),
+    );
   }
 
   Future<void> _confirmUninstall() async {
@@ -457,6 +497,31 @@ class _AppDetailViewState extends State<AppDetailView>
                     label: const Text('Terminal'),
                     style: FilledButton.styleFrom(
                       backgroundColor: PiccoloTheme.cobalt600,
+                    ),
+                  ),
+                  const SizedBox(width: Spacing.md),
+                ],
+                if (!_app!.isWorkspace && _app!.isRunning) ...[
+                  FilledButton.icon(
+                    onPressed: _handleUpdate,
+                    icon: const Icon(PiccoloIcons.refresh),
+                    label: const Text('Update'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: PiccoloTheme.cobalt600,
+                    ),
+                  ),
+                  const SizedBox(width: Spacing.md),
+                ],
+                if (_snapshotAvailable && !_app!.isWorkspace) ...[
+                  IconButton.outlined(
+                    onPressed: _confirmRollback,
+                    icon: const Icon(PiccoloIcons.restart, size: 20),
+                    tooltip: 'Roll back to previous version',
+                    style: IconButton.styleFrom(
+                      foregroundColor: PiccoloTheme.warning,
+                      side: BorderSide(
+                        color: PiccoloTheme.warning.withValues(alpha: 0.3),
+                      ),
                     ),
                   ),
                   const SizedBox(width: Spacing.md),
