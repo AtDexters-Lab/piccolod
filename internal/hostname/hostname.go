@@ -19,8 +19,9 @@ import (
 // worst case is 16+1+16+1+16 = 50 chars for the left-most label, under DNS 63-char limit.
 var appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9]{0,15}$`)
 
-// ReservedNames are names that cannot be used as app names, listener names, or workspace names.
-// Per RFC 20260130, all identifiers share the same reserved list.
+// ReservedNames are names that cannot be used as app names, primary listener names, or workspace names.
+// Non-primary listener names are exempt (their derived hostname <listener>-<app> cannot collide).
+// Per RFC 20260130, all identity-level identifiers share the same reserved list.
 // __primary is the magic listener name marker and must not be used as an actual name.
 var ReservedNames = []string{"api", "www", "admin", "root", "system", "piccolo", "piccoloos", "__primary"}
 
@@ -64,12 +65,13 @@ func ValidateAppName(name string) error {
 	return nil
 }
 
-// ValidateListenerName validates a listener name per RFC 20260122 Section 4.3 and RFC 20260130.
-// Same rules as app name: 1-16 chars, [a-z][a-z0-9]*, starts with letter, no hyphens.
+// ValidateListenerNameFormat validates listener name format only (regex + length),
+// without checking against reserved names. Use this for non-primary listeners whose
+// derived hostname <listener>-<app> cannot collide with bare reserved names.
 //
 // Note: The magic marker "__primary" is exempt from this validation during initial parsing.
 // Callers should use IsPrimaryMarker() to check before calling this function.
-func ValidateListenerName(name string) error {
+func ValidateListenerNameFormat(name string) error {
 	if name == "" {
 		return fmt.Errorf("listener name is required")
 	}
@@ -80,6 +82,20 @@ func ValidateListenerName(name string) error {
 
 	if !appNameRegex.MatchString(name) {
 		return fmt.Errorf("listener name must contain only lowercase letters and numbers, and must start with a letter (no hyphens allowed)")
+	}
+
+	return nil
+}
+
+// ValidateListenerName validates a listener name for use as a primary listener.
+// Checks format (regex + length) and rejects reserved names, since a primary
+// listener's name becomes the app identity (e.g., "admin" → "admin-piccolo.local").
+//
+// Note: The magic marker "__primary" is exempt from this validation during initial parsing.
+// Callers should use IsPrimaryMarker() to check before calling this function.
+func ValidateListenerName(name string) error {
+	if err := ValidateListenerNameFormat(name); err != nil {
+		return err
 	}
 
 	for _, r := range ReservedNames {

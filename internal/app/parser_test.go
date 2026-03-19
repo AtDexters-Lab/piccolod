@@ -528,7 +528,7 @@ x-piccolo:
 // TestReservedNames tests that reserved listener names are rejected
 func TestReservedNames(t *testing.T) {
 	// RFC 20260130: Reserved names now apply to listener names
-	reservedNames := []string{"api", "www", "admin", "root", "system", "piccolo"}
+	reservedNames := []string{"api", "www", "admin", "root", "system", "piccolo", "piccoloos"}
 
 	for _, name := range reservedNames {
 		t.Run(name, func(t *testing.T) {
@@ -551,6 +551,59 @@ func TestReservedNames(t *testing.T) {
 				t.Errorf("Expected error about reserved name, got %q", err.Error())
 			}
 		})
+	}
+}
+
+// TestReservedNames_nonprimary_listener_allowed tests that non-primary listeners
+// with reserved names pass validation (their derived hostname <listener>-<app> cannot collide).
+func TestReservedNames_nonprimary_listener_allowed(t *testing.T) {
+	reservedNames := []string{"api", "www", "admin", "root", "system", "piccolo", "piccoloos"}
+
+	for _, name := range reservedNames {
+		t.Run(name, func(t *testing.T) {
+			app := &api.AppDefinition{
+				Listeners: []api.AppListener{
+					{Name: "web", GuestPort: 80, Primary: true},
+					{Name: name, GuestPort: 8080},
+				},
+				Services: map[string]api.AppService{
+					"main": {Image: "nginx:latest", BindPorts: []int{80, 8080}},
+				},
+				Extensions: map[string]interface{}{"mode": "service"},
+			}
+
+			SetDefaults(app)
+			err := ValidateAppDefinition(app)
+
+			if err != nil {
+				t.Fatalf("Non-primary listener with reserved name '%s' should be allowed, got: %v", name, err)
+			}
+		})
+	}
+}
+
+// TestValidateListeners_nonprimary_invalid_format verifies that format validation
+// still applies to non-primary listeners (only reserved name check is relaxed).
+func TestValidateListeners_nonprimary_invalid_format(t *testing.T) {
+	app := &api.AppDefinition{
+		Listeners: []api.AppListener{
+			{Name: "web", GuestPort: 80, Primary: true},
+			{Name: "my-listener", GuestPort: 8080}, // Invalid: contains hyphen
+		},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:latest", BindPorts: []int{80, 8080}},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+
+	SetDefaults(app)
+	err := ValidateAppDefinition(app)
+
+	if err == nil {
+		t.Fatal("expected error for invalid format on non-primary listener, got nil")
+	}
+	if !strings.Contains(err.Error(), "no hyphens allowed") {
+		t.Errorf("expected error about invalid format (no hyphens), got: %v", err)
 	}
 }
 

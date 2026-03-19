@@ -234,7 +234,8 @@ listeners:
   # - 1..16 chars
   # - lowercase letters and numbers only (no hyphens), except `__primary` magic marker
   # - must start with a letter (or `_` for __primary)
-  # - reserved names not allowed: api, www, admin, root, system, piccolo, piccoloos, __primary
+  # - reserved names not allowed on PRIMARY listener: api, www, admin, root, system, piccolo, piccoloos, __primary
+  #   (non-primary listeners are exempt — their derived hostname <listener>-<app> cannot collide)
   # - required for host-based routing (RFC 20260114)
   #
   # Use `__primary` as the name for catalog apps. This marker is replaced with the

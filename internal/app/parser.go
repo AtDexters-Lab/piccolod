@@ -872,8 +872,15 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 
 		// Validate listener name only if not __primary marker
 		if !hostname.IsPrimaryMarker(l.Name) {
-			// Validate listener name per RFC 20260114 (DNS-compliant, no hyphens)
-			if err := hostname.ValidateListenerName(l.Name); err != nil {
+			var err error
+			if isPrimary {
+				// Primary listener name becomes app identity — must not be reserved
+				err = hostname.ValidateListenerName(l.Name)
+			} else {
+				// Non-primary: derived hostname is <listener>-<app>, no collision with bare reserved names
+				err = hostname.ValidateListenerNameFormat(l.Name)
+			}
+			if err != nil {
 				return fmt.Errorf("listener[%d] %w", i, err)
 			}
 		}
