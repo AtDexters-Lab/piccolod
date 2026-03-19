@@ -194,10 +194,12 @@ class AppDetail {
     required this.app,
     this.listeners = const [],
     this.containers = const [],
+    this.snapshotAvailable = false,
   });
   final App app;
   final List<ServiceEndpoint> listeners;
   final List<AppContainerStatus> containers;
+  final bool snapshotAvailable;
 }
 
 class AppContainerStatus {

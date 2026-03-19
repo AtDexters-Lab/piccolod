@@ -756,7 +756,8 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 	if err != nil {
 		log.Printf("WARN: app get %s: container status unavailable: %v", appName, err)
 	}
-	writeGinSuccess(c, gin.H{"app": appInstance, "listeners": listenerStatus, "containers": containerStatus}, "")
+	snapshotAvailable := s.appManager.HasSnapshotAvailable(c.Request.Context(), appName)
+	writeGinSuccess(c, gin.H{"app": appInstance, "listeners": listenerStatus, "containers": containerStatus, "snapshot_available": snapshotAvailable}, "")
 }
 
 // handleGinAppLogs returns recent container logs for an app instance.
@@ -955,12 +956,53 @@ func (s *GinServer) handleGinAppStop(c *gin.Context) {
 	writeGinSuccess(c, nil, "App '"+appName+"' stopped successfully")
 }
 
+// handleGinAppUpdate handles POST /api/v1/apps/:name/update - Update app image.
+// Uses a background context because image pulls can take a long time and must
+// complete even if the HTTP connection times out.
+func (s *GinServer) handleGinAppUpdate(c *gin.Context) {
+	appName := c.Param("name")
+
+	var body struct {
+		Tag *string `json:"tag"`
+	}
+	// Body is optional — nil tag means re-pull current tag.
+	_ = c.ShouldBindJSON(&body)
+
+	updateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	updateCtx = app.WithTaskID(updateCtx, c.GetHeader("X-Piccolo-Task-ID"))
+
+	err := s.appManager.UpdateImage(updateCtx, appName, body.Tag)
+	if err != nil {
+		if handleAppManagerError(c, err, "update app") {
+			return
+		}
+		errMsg := err.Error()
+		switch {
+		case strings.Contains(errMsg, "not found"):
+			writeGinError(c, http.StatusNotFound, errMsg)
+		case strings.Contains(errMsg, "workspace"):
+			writeGinError(c, http.StatusBadRequest, errMsg)
+		default:
+			writeGinError(c, http.StatusInternalServerError, "Update failed: "+errMsg)
+		}
+		return
+	}
+
+	writeGinSuccess(c, nil, "App updated successfully")
+}
+
 // handleGinAppRollback handles POST /api/v1/apps/:name/rollback - Rollback to previous snapshot
+// Uses a background context because rollback involves non-interruptible LV rename
+// operations that must complete even if the HTTP connection drops.
 func (s *GinServer) handleGinAppRollback(c *gin.Context) {
 	appName := c.Param("name")
 
-	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
-	err := s.appManager.RollbackToSnapshot(ctx, appName)
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	rollbackCtx = app.WithTaskID(rollbackCtx, c.GetHeader("X-Piccolo-Task-ID"))
+
+	err := s.appManager.RollbackToSnapshot(rollbackCtx, appName)
 	if err != nil {
 		if handleAppManagerError(c, err, "rollback app") {
 			return
