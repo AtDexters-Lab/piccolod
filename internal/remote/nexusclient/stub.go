@@ -21,7 +21,7 @@ func (s *Stub) Configure(cfg Config) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cfg = cfg
-	log.Printf("INFO: nexus stub configured endpoint=%s portal=%s", cfg.Endpoint, cfg.PortalHostname)
+	log.Printf("INFO: nexus stub configured endpoints=%v portal=%s", cfg.ResolvedEndpoints(), cfg.PortalHostname)
 	return nil
 }
 
@@ -35,7 +35,7 @@ func (s *Stub) Start(ctx context.Context) error {
 	s.running = true
 	s.mu.Unlock()
 
-	log.Printf("INFO: nexus stub starting endpoint=%s", cfg.Endpoint)
+	log.Printf("INFO: nexus stub starting endpoints=%v", cfg.ResolvedEndpoints())
 	<-ctx.Done()
 	return nil
 }

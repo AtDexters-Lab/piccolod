@@ -6,6 +6,7 @@ import (
 	"net"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -113,22 +114,23 @@ func TestStartPropagatesFactoryError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error from start when factory fails")
 	}
-	if !strings.Contains(err.Error(), "construction failed") {
-		t.Fatalf("expected factory error to propagate, got %v", err)
+	if !strings.Contains(err.Error(), "all 1 endpoint(s) failed") {
+		t.Fatalf("expected all-endpoints-failed error, got %v", err)
 	}
 }
 
 func TestConfigReady_WithTokenProvider(t *testing.T) {
 	// Without token provider, DeviceSecret is required
 	adapter := NewBackendAdapter(nil, nil)
-	if adapter.configReady(Config{Endpoint: "wss://x", PortalHostname: "x.y"}) {
+	cfg := Config{Endpoint: "wss://x", PortalHostname: "x.y"}
+	if adapter.configReady(cfg, cfg.ResolvedEndpoints()) {
 		t.Fatal("expected configReady=false without secret and without token provider")
 	}
 
 	// With token provider, DeviceSecret is NOT required
 	tp := &fakeTokenProvider{}
 	adapter = NewBackendAdapter(nil, nil, WithAdapterTokenProvider(tp))
-	if !adapter.configReady(Config{Endpoint: "wss://x", PortalHostname: "x.y"}) {
+	if !adapter.configReady(cfg, cfg.ResolvedEndpoints()) {
 		t.Fatal("expected configReady=true with token provider and no secret")
 	}
 }
@@ -383,6 +385,174 @@ func TestConnectHandler(t *testing.T) {
 		})
 		if !errors.Is(err, backend.ErrNoRoute) {
 			t.Fatalf("expected ErrNoRoute in tunnel mode, got %v", err)
+		}
+	})
+}
+
+func TestStartWithMultipleEndpoints(t *testing.T) {
+	adapter := NewBackendAdapter(nil, nil, WithAdapterTokenProvider(&fakeTokenProvider{}))
+	cfg := Config{
+		Endpoints:      []string{"wss://a/connect", "wss://b/connect"},
+		PortalHostname: "portal.example.com",
+	}
+	if err := adapter.Configure(cfg); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	var captured []backend.ClientBackendConfig
+	var capturedMu sync.Mutex
+	started := make(chan struct{}, 2)
+
+	adapter.factory = func(cfg backend.ClientBackendConfig, opts ...backend.Option) (backendClient, error) {
+		capturedMu.Lock()
+		captured = append(captured, cfg)
+		capturedMu.Unlock()
+		return &fakeClient{
+			start: func(context.Context) { started <- struct{}{} },
+		}, nil
+	}
+
+	if err := adapter.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Wait for both clients to start.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(200 * time.Millisecond):
+			t.Fatalf("expected 2 client starts, only got %d", i)
+		}
+	}
+
+	capturedMu.Lock()
+	defer capturedMu.Unlock()
+	if len(captured) != 2 {
+		t.Fatalf("expected factory called 2 times, got %d", len(captured))
+	}
+
+	addrs := map[string]bool{captured[0].NexusAddress: true, captured[1].NexusAddress: true}
+	if !addrs["wss://a/connect"] || !addrs["wss://b/connect"] {
+		t.Fatalf("unexpected NexusAddresses: %v, %v", captured[0].NexusAddress, captured[1].NexusAddress)
+	}
+
+	// Stop should stop both clients.
+	stopped := 0
+	adapter.mu.Lock()
+	for _, c := range adapter.clients {
+		fc := c.(*fakeClient)
+		fc.stop = func() { stopped++ }
+	}
+	adapter.mu.Unlock()
+
+	if err := adapter.Stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if stopped != 2 {
+		t.Fatalf("expected 2 stops, got %d", stopped)
+	}
+}
+
+func TestStartWithMultipleEndpoints_PartialFailure(t *testing.T) {
+	adapter := NewBackendAdapter(nil, nil, WithAdapterTokenProvider(&fakeTokenProvider{}))
+	cfg := Config{
+		Endpoints:      []string{"wss://a/connect", "wss://b/connect"},
+		PortalHostname: "portal.example.com",
+	}
+	if err := adapter.Configure(cfg); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	started := make(chan struct{}, 1)
+	adapter.factory = func(cfg backend.ClientBackendConfig, opts ...backend.Option) (backendClient, error) {
+		if cfg.NexusAddress == "wss://a/connect" {
+			return nil, errors.New("connection refused")
+		}
+		return &fakeClient{
+			start: func(context.Context) { started <- struct{}{} },
+		}, nil
+	}
+
+	// Should succeed — one endpoint worked.
+	if err := adapter.Start(context.Background()); err != nil {
+		t.Fatalf("expected partial success, got error: %v", err)
+	}
+	t.Cleanup(func() { adapter.Stop(context.Background()) })
+
+	select {
+	case <-started:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected surviving client to start")
+	}
+}
+
+func TestStartWithMultipleEndpoints_AllFail(t *testing.T) {
+	adapter := NewBackendAdapter(nil, nil, WithAdapterTokenProvider(&fakeTokenProvider{}))
+	cfg := Config{
+		Endpoints:      []string{"wss://a/connect", "wss://b/connect"},
+		PortalHostname: "portal.example.com",
+	}
+	if err := adapter.Configure(cfg); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	adapter.factory = func(cfg backend.ClientBackendConfig, opts ...backend.Option) (backendClient, error) {
+		return nil, errors.New("connection refused")
+	}
+
+	err := adapter.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected error when all endpoints fail")
+	}
+	if !strings.Contains(err.Error(), "all 2 endpoint(s) failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("expected underlying errors to be preserved, got: %v", err)
+	}
+}
+
+func TestResolvedEndpoints(t *testing.T) {
+	t.Run("backward_compat_single_endpoint", func(t *testing.T) {
+		cfg := Config{Endpoint: "wss://x/connect"}
+		got := cfg.ResolvedEndpoints()
+		if len(got) != 1 || got[0] != "wss://x/connect" {
+			t.Fatalf("expected [wss://x/connect], got %v", got)
+		}
+	})
+
+	t.Run("endpoints_takes_precedence", func(t *testing.T) {
+		cfg := Config{
+			Endpoint:  "wss://old/connect",
+			Endpoints: []string{"wss://a/connect", "wss://b/connect"},
+		}
+		got := cfg.ResolvedEndpoints()
+		if len(got) != 2 || got[0] != "wss://a/connect" || got[1] != "wss://b/connect" {
+			t.Fatalf("expected Endpoints to take precedence, got %v", got)
+		}
+	})
+
+	t.Run("dedup", func(t *testing.T) {
+		cfg := Config{Endpoints: []string{"a", "a", "b"}}
+		got := cfg.ResolvedEndpoints()
+		if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+			t.Fatalf("expected dedup [a b], got %v", got)
+		}
+	})
+
+	t.Run("trimming", func(t *testing.T) {
+		cfg := Config{Endpoints: []string{"  ", "a", " b "}}
+		got := cfg.ResolvedEndpoints()
+		if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+			t.Fatalf("expected trimmed [a b], got %v", got)
+		}
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		cfg := Config{}
+		got := cfg.ResolvedEndpoints()
+		if len(got) != 0 {
+			t.Fatalf("expected empty, got %v", got)
 		}
 	})
 }

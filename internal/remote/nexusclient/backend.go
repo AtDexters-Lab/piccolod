@@ -2,6 +2,7 @@ package nexusclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -63,7 +64,7 @@ type BackendAdapter struct {
 
 	factory       clientFactory
 	cancel        context.CancelFunc
-	client        backendClient
+	clients       []backendClient
 	tokenProvider backend.TokenProvider // nil = use HMAC from config
 	name          string               // backend name for Nexus registration
 }
@@ -103,7 +104,8 @@ func (a *BackendAdapter) Start(ctx context.Context) error {
 		return nil
 	}
 	cfg := a.cfg
-	if !a.configReady(cfg) {
+	endpoints := cfg.ResolvedEndpoints()
+	if !a.configReady(cfg, endpoints) {
 		a.mu.Unlock()
 		log.Printf("WARN: nexus adapter start skipped, missing configuration")
 		return nil
@@ -132,10 +134,9 @@ func (a *BackendAdapter) Start(ctx context.Context) error {
 		}
 	}
 
-	backendCfg := backend.ClientBackendConfig{
+	baseCfg := backend.ClientBackendConfig{
 		Name:         a.name,
 		Hostnames:    hosts,
-		NexusAddress: cfg.Endpoint,
 		Weight:       1,
 		TCPPorts:     tcpPorts,
 		UDPRoutes:    udpRoutes,
@@ -158,33 +159,52 @@ func (a *BackendAdapter) Start(ctx context.Context) error {
 		clientOpts = append(clientOpts, backend.WithTokenProvider(a.tokenProvider))
 	}
 
-	client, err := a.factory(backendCfg, clientOpts...)
-	if err != nil {
-		a.mu.Unlock()
-		return fmt.Errorf("construct backend client: %w", err)
+	// Create one client per endpoint (best-effort: warn on individual failures).
+	var clients []backendClient
+	var errs []error
+	for _, ep := range endpoints {
+		epCfg := baseCfg
+		epCfg.NexusAddress = ep
+		client, err := a.factory(epCfg, clientOpts...)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("endpoint %q: %w", ep, err))
+			log.Printf("WARN: nexus adapter: failed to construct client for %s: %v", ep, err)
+			continue
+		}
+		clients = append(clients, client)
 	}
+	if len(clients) == 0 {
+		a.mu.Unlock()
+		return fmt.Errorf("construct backend clients: all %d endpoint(s) failed: %w", len(endpoints), errors.Join(errs...))
+	}
+	if len(clients) < len(endpoints) {
+		log.Printf("INFO: nexus adapter: %d/%d endpoint client(s) constructed", len(clients), len(endpoints))
+	}
+
 	runCtx, cancel := context.WithCancel(ctx)
-	a.client = client
+	a.clients = clients
 	a.cancel = cancel
 	a.mu.Unlock()
 
-	go client.Start(runCtx)
+	for _, c := range clients {
+		go c.Start(runCtx)
+	}
 	return nil
 }
 
 func (a *BackendAdapter) Stop(ctx context.Context) error {
 	a.mu.Lock()
 	cancel := a.cancel
-	client := a.client
+	clients := a.clients
 	a.cancel = nil
-	a.client = nil
+	a.clients = nil
 	a.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
-	if client != nil {
-		client.Stop()
+	for _, c := range clients {
+		c.Stop()
 	}
 	return nil
 }
@@ -277,8 +297,8 @@ func buildHostnameList(cfg Config) []string {
 
 // configReady checks whether the adapter has enough config to start.
 // When a tokenProvider is set, DeviceSecret is not required.
-func (a *BackendAdapter) configReady(cfg Config) bool {
-	if strings.TrimSpace(cfg.Endpoint) == "" || strings.TrimSpace(cfg.PortalHostname) == "" {
+func (a *BackendAdapter) configReady(cfg Config, endpoints []string) bool {
+	if len(endpoints) == 0 || strings.TrimSpace(cfg.PortalHostname) == "" {
 		return false
 	}
 	if a.tokenProvider == nil && strings.TrimSpace(cfg.DeviceSecret) == "" {

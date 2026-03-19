@@ -2263,7 +2263,9 @@ func (s *GinServer) applyNamekState() {
 	}
 
 	// --- Adapter lifecycle ---
-	endpoint := idCfg.NexusEndpoints[0]
+	// Use ResolvedEndpoints() for dedup/trim so whitespace-variant duplicates
+	// from the identity service don't trigger unnecessary adapter restarts.
+	endpoints := (nexusclient.Config{Endpoints: idCfg.NexusEndpoints}).ResolvedEndpoints()
 	hostname := idCfg.Hostname
 	// Prefer custom FQDN when set so routing/certs update immediately
 	// without waiting for the namek server to push the new hostname.
@@ -2271,9 +2273,15 @@ func (s *GinServer) applyNamekState() {
 		hostname = custom
 	}
 
+	// Build change-detection key from sorted endpoints + hostname fields.
+	sortedEPs := make([]string, len(endpoints))
+	copy(sortedEPs, endpoints)
+	sort.Strings(sortedEPs)
 	var keyBuilder strings.Builder
-	keyBuilder.WriteString(endpoint)
-	keyBuilder.WriteByte('\x00')
+	for _, ep := range sortedEPs {
+		keyBuilder.WriteString(ep)
+		keyBuilder.WriteByte('\x00')
+	}
 	keyBuilder.WriteString(hostname)
 	keyBuilder.WriteByte('\x00')
 	keyBuilder.WriteString(idCfg.CustomHostname)
@@ -2290,7 +2298,7 @@ func (s *GinServer) applyNamekState() {
 			// Adapter running with identical config — skip restart, but still update routing/certs below
 		} else {
 			adapterCfg := nexusclient.Config{
-				Endpoint:       endpoint,
+				Endpoints:      endpoints,
 				PortalHostname: hostname,
 			}
 			if err := adapter.Configure(adapterCfg); err != nil {
@@ -2325,7 +2333,7 @@ func (s *GinServer) applyNamekState() {
 					s.namekMu.Unlock()
 				}
 			}(key)
-			log.Printf("INFO: server: namek adapter started (endpoint=%s, hostname=%s)", endpoint, hostname)
+			log.Printf("INFO: server: namek adapter started (endpoints=%d, hostname=%s)", len(endpoints), hostname)
 		}
 	}
 
