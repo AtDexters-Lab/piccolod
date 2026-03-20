@@ -48,6 +48,11 @@ type Service struct {
 	// Concurrency guard for recovery: prevents parallel recoverAndReenroll goroutines.
 	recovering atomic.Bool
 
+	// Shutdown lifecycle: stopped prevents new recovery/sync goroutines after Stop(),
+	// recoverWg tracks in-flight recovery so Stop can wait for it.
+	stopped   atomic.Bool
+	recoverWg sync.WaitGroup
+
 	// onTPMReplaced is called when AK recovery replaces the TPM device,
 	// so the owner can update its own reference and close the old one.
 	onTPMReplaced func(old tpm.Device, newResult *tpm.OpenResult)
@@ -116,7 +121,29 @@ func (s *Service) Start(ctx context.Context) error {
 
 // Stop closes the namekclient. Does NOT close TPM — caller owns it.
 func (s *Service) Stop(ctx context.Context) error {
+	// Set stopped under Lock so HandleTokenError's RLock+Add(1) sequence
+	// cannot race with Wait(). Once Lock is released, any concurrent
+	// HandleTokenError will see stopped=true and skip recovery.
+	s.mu.Lock()
+	s.stopped.Store(true)
+	s.mu.Unlock()
+
 	s.stopEndpointSync()
+
+	// Wait for in-flight recovery, but respect the caller's context timeout
+	// so a hung recovery doesn't block the entire shutdown sequence.
+	waitCh := make(chan struct{})
+	go func() {
+		s.recoverWg.Wait()
+		close(waitCh)
+	}()
+	select {
+	case <-waitCh:
+	case <-ctx.Done():
+		log.Printf("WARN: identity: Stop context expired waiting for recovery to finish")
+		return ctx.Err()
+	}
+
 	s.mu.Lock()
 	s.client = nil
 	s.mu.Unlock()
@@ -379,10 +406,23 @@ func (s *Service) HandleTokenError(err error, httpStatus int) {
 	switch httpStatus {
 	case 401:
 		if s.recovering.Load() {
-			return // recovery already in progress
+			return
 		}
+		// RLock synchronizes with Stop()'s Lock: Add(1) completes before
+		// Stop() can call Wait(), preventing a WaitGroup panic.
+		s.mu.RLock()
+		if s.stopped.Load() {
+			s.mu.RUnlock()
+			return
+		}
+		s.recoverWg.Add(1)
+		s.mu.RUnlock()
+
 		log.Printf("WARN: identity: namek auth failed (401), attempting AK recovery and re-enrollment")
-		go s.recoverAndReenroll()
+		go func() {
+			defer s.recoverWg.Done()
+			s.recoverAndReenroll()
+		}()
 	case 403:
 		log.Printf("ERROR: identity: device suspended/revoked by namek (403)")
 		s.suspended.Store(true)
@@ -430,7 +470,8 @@ func (s *Service) recoverAndReenroll() {
 		oldDev.Close()
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 	if _, err := s.Enroll(ctx); err != nil {
 		log.Printf("ERROR: identity: re-enrollment after AK recovery failed: %v", err)
 	}
@@ -472,7 +513,7 @@ func newNamekClient(url string, dev tpm.Device, deviceID string) *namekclient.Cl
 func (s *Service) startEndpointSync() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.syncCancel != nil {
+	if s.stopped.Load() || !s.cfg.Enabled || s.syncCancel != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
