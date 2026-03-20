@@ -9,6 +9,7 @@ import 'package:piccolo_os/core/utils/task_id.dart';
 import 'package:piccolo_os/features/apps/app_launcher.dart';
 import 'package:piccolo_os/features/apps/widgets/edit_listeners_dialog.dart';
 import 'package:piccolo_os/features/apps/widgets/health_banner.dart';
+import 'package:piccolo_os/features/apps/widgets/local_fallback_overlay.dart';
 import 'package:piccolo_os/features/apps/workspace_terminal.dart';
 import 'package:piccolo_os/shared/widgets/app_icon.dart';
 import 'package:piccolo_os/shared/widgets/health_badge.dart';
