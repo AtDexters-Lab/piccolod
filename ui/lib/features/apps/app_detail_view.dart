@@ -773,7 +773,36 @@ class _AppDetailViewState extends State<AppDetailView>
                               icon: PiccoloIcons.webAsset,
                               tooltip: 'Opens in app window',
                             ),
-                          if (svc.remoteUrl != null)
+                          if (svc.remoteUrls.isNotEmpty)
+                            ...svc.remoteUrls.map((url) {
+                              // Only the context-aware URL (matching current portal) can be
+                              // embedded in an iframe — other portals have different cookies/OIDC.
+                              final isCurrentPortal = url == svc.remoteUrl;
+                              return _buildNetworkLinkRow(
+                                'Remote Access',
+                                url,
+                                onTap: isCurrentPortal
+                                    ? () => AppLauncher.healthGatedOpen(
+                                        context: context,
+                                        controller: widget.desktopController,
+                                        appService: widget.appService,
+                                        app: _app!,
+                                        service: svc,
+                                        overrideUrl: url,
+                                        healthOverride: svc.name == _primaryListenerName
+                                            ? _primaryHealth
+                                            : null,
+                                      )
+                                    : () => _healthGatedLaunchUrl(url, svc),
+                                icon: isCurrentPortal
+                                    ? PiccoloIcons.webAsset
+                                    : PiccoloIcons.openExternal,
+                                tooltip: isCurrentPortal
+                                    ? 'Opens in app window'
+                                    : 'Opens in browser',
+                              );
+                            })
+                          else if (svc.remoteUrl != null)
                             _buildNetworkLinkRow(
                               'Remote Access',
                               svc.remoteUrl!,
@@ -784,7 +813,6 @@ class _AppDetailViewState extends State<AppDetailView>
                                 app: _app!,
                                 service: svc,
                                 overrideUrl: svc.remoteUrl,
-                                // Only override with live stream health for primary listener
                                 healthOverride: svc.name == _primaryListenerName
                                     ? _primaryHealth
                                     : null,
@@ -1000,6 +1028,30 @@ class _AppDetailViewState extends State<AppDetailView>
         ],
       ),
     );
+  }
+
+  /// Health-gates a remote URL then opens it in a new browser tab.
+  /// Used for alternate portal URLs that can't be iframe-embedded (cross-site cookies)
+  /// but should still be gated to avoid dumping users into TLS errors.
+  void _healthGatedLaunchUrl(String url, ServiceEndpoint svc) {
+    final health = (svc.name == _primaryListenerName ? _primaryHealth : null)
+        ?? svc.health ?? _app!.primaryListenerHealth;
+    if (health != null && !health.isOk && !health.isDegraded) {
+      final fallbackUrl =
+          svc.lanFallbackUrl ?? svc.lanHostUrl ?? svc.localUrl ?? '';
+      unawaited(showDialog<void>(
+        context: context,
+        builder: (_) => LocalFallbackOverlay(
+          health: health,
+          appName: _app!.displayTitle,
+          lanFallbackUrl: fallbackUrl,
+          appService: widget.appService,
+          desktopController: widget.desktopController,
+        ),
+      ));
+      return;
+    }
+    unawaited(launchUrl(Uri.parse(url)));
   }
 
   Widget _buildNetworkLinkRow(
