@@ -2,31 +2,55 @@ package persistence
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"piccolod/internal/runner"
 )
 
+// cryptsetupExitDeviceExists is the exit code returned by cryptsetup when the
+// mapper device already exists (e.g. from a prior crash or TOCTOU race).
+const cryptsetupExitDeviceExists = 5
+
 // LUKSLoopVolume manages a LUKS2-encrypted loop file. Used for the control
 // plane volume (SQLite + state) which doesn't need the full block device
 // stack (no thin LV, no NBD, no DRBD).
 type LUKSLoopVolume struct {
-	run      runner.CommandRunner
-	tmpfsDir string // directory for ephemeral key material (default: /run/piccolo)
+	run            runner.CommandRunner
+	tmpfsDir       string                              // directory for ephemeral key material (default: /run/piccolo)
+	mapperExists func(mapper string) bool          // checks if /dev/mapper/<mapper> exists
+	isMountPoint func(path string) (bool, error)  // checks if path is a mount point
+}
+
+func defaultMapperExists(mapper string) bool {
+	_, err := os.Stat("/dev/mapper/" + mapper)
+	return err == nil
 }
 
 // NewLUKSLoopVolume creates a LUKS loop volume manager.
 func NewLUKSLoopVolume(run runner.CommandRunner) *LUKSLoopVolume {
-	return &LUKSLoopVolume{run: run, tmpfsDir: "/run/piccolo"}
+	return &LUKSLoopVolume{
+		run:            run,
+		tmpfsDir:       "/run/piccolo",
+		mapperExists:   defaultMapperExists,
+		isMountPoint: isMountPoint,
+	}
 }
 
 // NewLUKSLoopVolumeWithTmpfs creates a LUKS loop volume manager with a custom
 // tmpfs directory. Used in tests where /run is not writable.
 func NewLUKSLoopVolumeWithTmpfs(run runner.CommandRunner, tmpfsDir string) *LUKSLoopVolume {
-	return &LUKSLoopVolume{run: run, tmpfsDir: tmpfsDir}
+	return &LUKSLoopVolume{
+		run:            run,
+		tmpfsDir:       tmpfsDir,
+		mapperExists:   defaultMapperExists,
+		isMountPoint: isMountPoint,
+	}
 }
 
 // mapperName derives a device mapper name from the loop file path.
@@ -41,6 +65,26 @@ func mapperName(loopFile string) string {
 // Creates a sparse file, formats it with LUKS2, and creates an ext4 filesystem.
 // keyMaterial is a raw key (typically 64 bytes) used as the LUKS passphrase.
 func (v *LUKSLoopVolume) Init(ctx context.Context, loopFile string, sizeBytes int64, keyMaterial []byte) error {
+	mapper := mapperName(loopFile)
+
+	// Clean up stale mapper from prior crash — hard error if it can't be removed,
+	// because the loop device cannot be safely reformatted while a mapper holds it.
+	if v.mapperExists(mapper) {
+		log.Printf("stale mapper %s detected during init, closing", mapper)
+		if err := v.run.Run(ctx, "cryptsetup", "close", mapper); err != nil {
+			return fmt.Errorf("close stale mapper %s before reinit: %w", mapper, err)
+		}
+	}
+
+	// Clean up stale loop device from prior crash (best-effort).
+	// Safe to proceed even if detach fails: the mapper (most dangerous holder) is
+	// already closed above, and attachLoop will reuse the existing device.
+	if existing, err := v.findLoop(ctx, loopFile); err == nil && existing != "" {
+		if err := v.detachLoop(ctx, existing); err != nil {
+			log.Printf("stale loop %s detach failed (will reuse): %v", existing, err)
+		}
+	}
+
 	// Ensure parent directory exists.
 	if err := os.MkdirAll(filepath.Dir(loopFile), 0o700); err != nil {
 		return fmt.Errorf("create loop file dir: %w", err)
@@ -64,8 +108,6 @@ func (v *LUKSLoopVolume) Init(ctx context.Context, loopFile string, sizeBytes in
 		return err
 	}
 	defer cleanup()
-
-	mapper := mapperName(loopFile)
 
 	// LUKS format.
 	if err := v.run.Run(ctx, "cryptsetup", "luksFormat",
@@ -108,7 +150,37 @@ func (v *LUKSLoopVolume) Init(ctx context.Context, loopFile string, sizeBytes in
 }
 
 // Open attaches, unlocks, and mounts a LUKS loop volume.
+// Idempotent: if the volume is already open and mounted, returns nil.
+// Recovers from stale state left by a prior crash.
 func (v *LUKSLoopVolume) Open(ctx context.Context, loopFile string, keyMaterial []byte, mountDir string) error {
+	mapper := mapperName(loopFile)
+	mapperPath := "/dev/mapper/" + mapper
+
+	// Fast path: mapper exists and already mounted — idempotent no-op.
+	if v.mapperExists(mapper) {
+		mounted, err := v.isMountPoint(mountDir)
+		if err == nil && mounted {
+			return nil
+		}
+
+		// Mapper exists but not mounted — try to recover by mounting directly.
+		log.Printf("stale mapper %s detected, attempting recovery mount", mapper)
+		if mkdirErr := os.MkdirAll(mountDir, 0o700); mkdirErr == nil {
+			if mountErr := v.run.Run(ctx, "mount", "-t", "ext4", mapperPath, mountDir); mountErr == nil {
+				return nil
+			} else {
+				log.Printf("recovery mount %s on %s failed: %v", mapperPath, mountDir, mountErr)
+			}
+		}
+
+		// Stale mapper — close it and fall through to normal path.
+		log.Printf("stale mapper %s recovery mount failed, closing for fresh open", mapper)
+		if err := v.run.Run(ctx, "cryptsetup", "close", mapper); err != nil {
+			log.Printf("cryptsetup close stale mapper %s failed: %v", mapper, err)
+		}
+	}
+
+	// Normal path: attach loop (idempotent), unlock, mount.
 	loopDev, err := v.attachLoop(ctx, loopFile)
 	if err != nil {
 		return err
@@ -121,16 +193,18 @@ func (v *LUKSLoopVolume) Open(ctx context.Context, loopFile string, keyMaterial 
 	}
 	defer cleanup()
 
-	mapper := mapperName(loopFile)
-
 	if err := v.run.Run(ctx, "cryptsetup", "open",
 		"--type", "luks2",
 		"--allow-discards",
 		"--key-file", keyPath,
 		loopDev, mapper,
 	); err != nil {
-		v.detachLoop(ctx, loopDev)
-		return fmt.Errorf("cryptsetup open: %w", err)
+		// Tolerate exit code 5 (device already exists) — TOCTOU race with mapper check.
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != cryptsetupExitDeviceExists {
+			v.detachLoop(ctx, loopDev)
+			return fmt.Errorf("cryptsetup open: %w", err)
+		}
 	}
 
 	if err := os.MkdirAll(mountDir, 0o700); err != nil {
@@ -139,7 +213,6 @@ func (v *LUKSLoopVolume) Open(ctx context.Context, loopFile string, keyMaterial 
 		return fmt.Errorf("create mount dir: %w", err)
 	}
 
-	mapperPath := "/dev/mapper/" + mapper
 	if err := v.run.Run(ctx, "mount", "-t", "ext4", mapperPath, mountDir); err != nil {
 		v.run.Run(ctx, "cryptsetup", "close", mapper)
 		v.detachLoop(ctx, loopDev)
@@ -150,27 +223,33 @@ func (v *LUKSLoopVolume) Open(ctx context.Context, loopFile string, keyMaterial 
 }
 
 // Close unmounts, locks, and detaches a LUKS loop volume.
+// Continues cleanup on individual step failures and returns all errors joined.
 func (v *LUKSLoopVolume) Close(ctx context.Context, loopFile, mountDir string) error {
 	mapper := mapperName(loopFile)
-
-	// Find the loop device before unmounting.
 	loopDev, _ := v.findLoop(ctx, loopFile)
+	var errs []error
 
+	// Unmount with lazy fallback.
 	if err := v.run.Run(ctx, "umount", mountDir); err != nil {
-		return fmt.Errorf("umount %s: %w", mountDir, err)
-	}
-
-	if err := v.run.Run(ctx, "cryptsetup", "close", mapper); err != nil {
-		return fmt.Errorf("cryptsetup close %s: %w", mapper, err)
-	}
-
-	if loopDev != "" {
-		if err := v.detachLoop(ctx, loopDev); err != nil {
-			return fmt.Errorf("detach loop %s: %w", loopDev, err)
+		log.Printf("umount %s failed, trying lazy unmount", mountDir)
+		if lazyErr := v.run.Run(ctx, "umount", "-l", mountDir); lazyErr != nil {
+			errs = append(errs, fmt.Errorf("umount %s: %w", mountDir, lazyErr))
 		}
 	}
 
-	return nil
+	// Close LUKS — continue even if umount failed.
+	if err := v.run.Run(ctx, "cryptsetup", "close", mapper); err != nil {
+		errs = append(errs, fmt.Errorf("cryptsetup close %s: %w", mapper, err))
+	}
+
+	// Detach loop — continue even if close failed.
+	if loopDev != "" {
+		if err := v.detachLoop(ctx, loopDev); err != nil {
+			errs = append(errs, fmt.Errorf("detach loop %s: %w", loopDev, err))
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // MapperName returns the device mapper name that would be used for a given loop file.
@@ -179,7 +258,11 @@ func MapperNameForLoop(loopFile string) string {
 }
 
 // attachLoop attaches a file to a loop device and returns the device path.
+// Idempotent: reuses an existing loop device if one is already attached.
 func (v *LUKSLoopVolume) attachLoop(ctx context.Context, loopFile string) (string, error) {
+	if existing, err := v.findLoop(ctx, loopFile); err == nil && existing != "" {
+		return existing, nil
+	}
 	out, err := v.run.RunWithOutput(ctx, "losetup", "--find", "--show", loopFile)
 	if err != nil {
 		return "", fmt.Errorf("losetup attach %s: %w", loopFile, err)
