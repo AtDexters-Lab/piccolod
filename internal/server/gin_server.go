@@ -1831,7 +1831,7 @@ func (s *GinServer) handleGinServicesByApp(c *gin.Context) {
 }
 
 func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEndpoint, portalHosts []string) gin.H {
-	remoteHost := remoteHostForEndpoint(ep, portalHosts)
+	remoteHost := s.contextAwareRemoteHost(c, ep, portalHosts)
 	var remoteHostValue interface{}
 	if remoteHost != "" {
 		remoteHostValue = remoteHost
@@ -1886,10 +1886,16 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 			result["lan_host_url"] = lanHostURL
 		}
 
-		// Remote URL: only if remote is enabled
+		// remote_url: context-aware, derived from the portal matching the request's Host header.
+		// Used by the UI for iframe embedding so the app opens on the same nexus the user arrived through.
 		if remoteHost != "" {
-			remoteURL := "https://" + remoteHost
-			result["remote_url"] = remoteURL
+			result["remote_url"] = "https://" + remoteHost
+		}
+
+		// remote_hosts: complete list across all active portals. Used by the network tab
+		// to show every access point. Not context-aware — always returns all portals.
+		if allHosts := allRemoteHostsForEndpoint(ep, portalHosts); len(allHosts) > 0 {
+			result["remote_hosts"] = allHosts
 		}
 	}
 
@@ -1958,6 +1964,23 @@ func remotePortalBase(status *remote.Status) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
 }
 
+// contextAwareRemoteHost returns the remote hostname for the endpoint derived from
+// the portal that matches the current request's Host header. Falls back to the first
+// portal when no match is found (e.g., LAN access).
+func (s *GinServer) contextAwareRemoteHost(c *gin.Context, ep services.ServiceEndpoint, portalHosts []string) string {
+	if ep.DerivedHostLabel == "" || s.remoteResolver == nil {
+		return ""
+	}
+	reqHost := canonicalHost(c.Request.Host)
+	if portal := s.remoteResolver.PortalHostForRequest(reqHost); portal != "" {
+		if h := services.RemoteServiceHostname(ep.DerivedHostLabel, portal); h != "" {
+			return h
+		}
+	}
+	// LAN access or unrecognized host — fall back to first portal
+	return remoteHostForEndpoint(ep, portalHosts)
+}
+
 // remoteHostForEndpoint returns the first matching remote hostname for the given endpoint
 // by checking all active portal hosts. Returns "" if no portal is active.
 func remoteHostForEndpoint(ep services.ServiceEndpoint, portalHosts []string) string {
@@ -1969,6 +1992,19 @@ func remoteHostForEndpoint(ep services.ServiceEndpoint, portalHosts []string) st
 	return ""
 }
 
+// allRemoteHostsForEndpoint returns the remote hostname for every active portal.
+func allRemoteHostsForEndpoint(ep services.ServiceEndpoint, portalHosts []string) []string {
+	if ep.DerivedHostLabel == "" {
+		return nil
+	}
+	var hosts []string
+	for _, portal := range portalHosts {
+		if h := services.RemoteServiceHostname(ep.DerivedHostLabel, portal); h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
+}
 
 func (s *GinServer) handleGinVersion(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{

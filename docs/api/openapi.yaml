@@ -1192,7 +1192,11 @@ components:
         remote_host:
           type: string
           nullable: true
-          description: Fully-qualified hostname published for remote access.
+          description: Context-aware remote hostname matching the requesting portal.
+        remote_hosts:
+          type: array
+          items: { type: string }
+          description: All remote hostnames across all active portals.
         flow: { type: string }
         protocol: { type: string }
         middleware: { type: array, items: { type: object } }
