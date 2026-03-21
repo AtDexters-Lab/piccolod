@@ -946,28 +946,45 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 				return
 			}
 
-			// Namek cert recovery: if the missing cert is for the namek hostname,
+			// Namek cert recovery: if the missing cert is for the slug or custom hostname,
 			// force-enqueue the specific cert so even "ok" inventory entries get reissued.
 			if idSvc := *identitySvcRef; idSvc != nil && idSvc.IsEnrolled() && idSvc.IsEnabled() {
 				cfg := idSvc.DeviceConfig()
-				namekHost := cfg.Hostname
-				if custom := cfg.CustomFQDN(); custom != "" {
-					namekHost = custom
-				}
-				namekHost = strings.TrimSuffix(strings.ToLower(namekHost), ".")
-				if namekHost != "" && (h == namekHost || strings.HasSuffix(h, "."+namekHost)) {
-					certDir := paths.CoreJoin("network-bootstrap", "remote", "certs")
-					if h == namekHost {
+				slugHost := normalizeHostname(cfg.Hostname)
+				customHost := normalizeHostname(cfg.CustomFQDN())
+				certDir := paths.CoreJoin("network-bootstrap", "remote", "certs")
+
+				// Check slug hostname
+				if slugHost != "" && (h == slugHost || strings.HasSuffix(h, "."+slugHost)) {
+					if h == slugHost {
 						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 							ID: "namek-portal", Source: "namek", Solver: "dns-01",
-							CertDir: certDir, CommonName: namekHost, Domains: []string{namekHost},
+							CertDir: certDir, CommonName: slugHost, Domains: []string{slugHost},
 							Force: true,
 						})
 					} else {
-						wildcard := "*." + namekHost
+						wildcard := "*." + slugHost
 						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 							ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
-							CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, namekHost},
+							CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, slugHost},
+							Force: true,
+						})
+					}
+					return
+				}
+				// Check custom hostname
+				if customHost != "" && customHost != slugHost && (h == customHost || strings.HasSuffix(h, "."+customHost)) {
+					if h == customHost {
+						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+							ID: "namek-custom-portal", Source: "namek", Solver: "dns-01",
+							CertDir: certDir, CommonName: customHost, Domains: []string{customHost},
+							Force: true,
+						})
+					} else {
+						wildcard := "*." + customHost
+						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+							ID: "namek-custom-wildcard", Source: "namek", Solver: "dns-01",
+							CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, customHost},
 							Force: true,
 						})
 					}
@@ -2302,12 +2319,9 @@ func (s *GinServer) applyNamekState() {
 	// Use ResolvedEndpoints() for dedup/trim so whitespace-variant duplicates
 	// from the identity service don't trigger unnecessary adapter restarts.
 	endpoints := (nexusclient.Config{Endpoints: idCfg.NexusEndpoints}).ResolvedEndpoints()
-	hostname := idCfg.Hostname
-	// Prefer custom FQDN when set so routing/certs update immediately
-	// without waiting for the namek server to push the new hostname.
-	if custom := idCfg.CustomFQDN(); custom != "" {
-		hostname = custom
-	}
+	slugHostname := idCfg.Hostname
+	customFQDN := idCfg.CustomFQDN()
+	hasCustomHostname := customFQDN != "" && customFQDN != slugHostname
 
 	// Build change-detection key from sorted endpoints + hostname fields.
 	sortedEPs := make([]string, len(endpoints))
@@ -2318,7 +2332,7 @@ func (s *GinServer) applyNamekState() {
 		keyBuilder.WriteString(ep)
 		keyBuilder.WriteByte('\x00')
 	}
-	keyBuilder.WriteString(hostname)
+	keyBuilder.WriteString(slugHostname)
 	keyBuilder.WriteByte('\x00')
 	keyBuilder.WriteString(idCfg.CustomHostname)
 	key := keyBuilder.String()
@@ -2335,7 +2349,16 @@ func (s *GinServer) applyNamekState() {
 		} else {
 			adapterCfg := nexusclient.Config{
 				Endpoints:      endpoints,
-				PortalHostname: hostname,
+				PortalHostname: slugHostname,
+			}
+			// When a custom hostname is active, keep the slug as primary and add
+			// the custom hostname as an alias so buildHostnameList() registers both
+			// [slug, *.slug, custom, *.custom] with the relay.
+			if hasCustomHostname {
+				adapterCfg.Aliases = append(adapterCfg.Aliases, nexusclient.AliasEntry{
+					Hostname:  customFQDN,
+					HostLabel: nexusclient.PortalHostLabel,
+				})
 			}
 			if err := adapter.Configure(adapterCfg); err != nil {
 				log.Printf("WARN: server: configure namek adapter: %v", err)
@@ -2369,19 +2392,29 @@ func (s *GinServer) applyNamekState() {
 					s.namekMu.Unlock()
 				}
 			}(key)
-			log.Printf("INFO: server: namek adapter started (endpoints=%d, hostname=%s)", len(endpoints), hostname)
+			log.Printf("INFO: server: namek adapter started (endpoints=%d, slug=%s, custom=%s)", len(endpoints), slugHostname, customFQDN)
 		}
 	}
 
 	// --- Routing (resolver + TLS mux) ---
+	// The slug hostname is always routable (canonical enrollment identity with
+	// persistent DNS). The custom hostname is additive when set.
 	var resolverBases []remoteBase
 	var muxBases []services.TlsMuxBase
-	if hostname != "" {
+	if slugHostname != "" {
 		resolverBases = append(resolverBases, remoteBase{
-			source: "namek", portalHost: hostname, domain: hostname,
+			source: "namek", portalHost: slugHostname, domain: slugHostname,
 		})
 		muxBases = append(muxBases, services.TlsMuxBase{
-			Source: "namek", PortalHost: hostname, Domain: hostname,
+			Source: "namek", PortalHost: slugHostname, Domain: slugHostname,
+		})
+	}
+	if hasCustomHostname {
+		resolverBases = append(resolverBases, remoteBase{
+			source: "namek", portalHost: customFQDN, domain: customFQDN,
+		})
+		muxBases = append(muxBases, services.TlsMuxBase{
+			Source: "namek", PortalHost: customFQDN, Domain: customFQDN,
 		})
 	}
 
@@ -2406,32 +2439,51 @@ func (s *GinServer) applyNamekState() {
 	// --- Cert provider portal mappings ---
 	if s.certProvider != nil {
 		var mappings []services.PortalCertMapping
-		if hostname != "" {
+		if slugHostname != "" {
 			mappings = append(mappings, services.PortalCertMapping{
-				Hostname: strings.TrimSuffix(strings.ToLower(hostname), "."),
+				Hostname: normalizeHostname(slugHostname),
 				CertName: "namek-portal",
+			})
+		}
+		if hasCustomHostname {
+			mappings = append(mappings, services.PortalCertMapping{
+				Hostname: normalizeHostname(customFQDN),
+				CertName: "namek-custom-portal",
 			})
 		}
 		s.certProvider.SetPortalMappings("namek", mappings)
 	}
 
 	// --- Cert issuance ---
-	if rm != nil && hostname != "" {
+	if rm != nil && slugHostname != "" {
 		// Requeue persisted certs that may have been skipped before orchClient was registered
 		// (e.g., namek per-host certs or certs in error/pending from a prior boot).
 		// Must run BEFORE explicit enqueue to avoid double-queueing the portal/wildcard certs.
 		rm.RequeueOutstandingIssuances()
 
 		certDir := paths.CoreJoin("network-bootstrap", "remote", "certs")
+		// Slug certs (always present — canonical enrollment identity)
 		rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 			ID: "namek-portal", Source: "namek", Solver: "dns-01",
-			CertDir: certDir, CommonName: hostname, Domains: []string{hostname},
+			CertDir: certDir, CommonName: slugHostname, Domains: []string{slugHostname},
 		})
-		wildcard := "*." + hostname
+		slugWildcard := "*." + slugHostname
 		rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 			ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
-			CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, hostname},
+			CertDir: certDir, CommonName: slugWildcard, Domains: []string{slugWildcard, slugHostname},
 		})
+		// Custom hostname certs (additive, separate IDs to avoid overwriting slug certs)
+		if hasCustomHostname {
+			rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+				ID: "namek-custom-portal", Source: "namek", Solver: "dns-01",
+				CertDir: certDir, CommonName: customFQDN, Domains: []string{customFQDN},
+			})
+			customWildcard := "*." + customFQDN
+			rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+				ID: "namek-custom-wildcard", Source: "namek", Solver: "dns-01",
+				CertDir: certDir, CommonName: customWildcard, Domains: []string{customWildcard, customFQDN},
+			})
+		}
 	}
 
 	// --- Namek domain state rebuild ---

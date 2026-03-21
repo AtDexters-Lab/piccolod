@@ -1847,7 +1847,7 @@ func buildSans(commonName string, domains []string) []string {
 
 func outNameFor(id, cn string) string {
 	switch id {
-	case "wildcard", "namek-wildcard":
+	case "wildcard", "namek-wildcard", "namek-custom-wildcard":
 		// For wildcards we want the actual CN as filename (e.g., *.example.com)
 		return cn
 	case "portal":
@@ -1856,6 +1856,8 @@ func outNameFor(id, cn string) string {
 		// Fixed filename: after a hostname change, the old cert is served until reissuance
 		// completes. This is intentional — no TLS would be worse than a CN mismatch.
 		return "namek-portal"
+	case "namek-custom-portal":
+		return "namek-custom-portal"
 	default:
 		return cn
 	}
