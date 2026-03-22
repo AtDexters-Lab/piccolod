@@ -175,15 +175,31 @@ class RemoteController extends ChangeNotifier {
   void _computePortals() {
     final result = <Portal>[];
 
-    // Namek portal (primary — listed first)
+    // Namek portals — both custom and slug hostnames when both are active.
     final ids = identityStatus;
     if (ids != null && ids.state == 'active' && ids.nexusEndpoints.isNotEmpty) {
-      result.add(Portal(
-        source: PortalSource.namek,
-        hostname: ids.resolvedHostname ?? '',
-        state: 'active',
-        endpoint: ids.nexusEndpoints.isNotEmpty ? ids.nexusEndpoints.first : null,
-      ));
+      final customFqdn = ids.resolvedHostname;
+      final slug = ids.hostname;
+      final hasCustom = customFqdn != null && customFqdn != slug;
+
+      // Custom hostname portal (listed first when set)
+      if (hasCustom) {
+        result.add(Portal(
+          source: PortalSource.namek,
+          hostname: customFqdn,
+          state: 'active',
+          endpoint: ids.nexusEndpoints.first,
+        ));
+      }
+      // Slug hostname portal (always present)
+      if (slug != null && slug.isNotEmpty) {
+        result.add(Portal(
+          source: PortalSource.namek,
+          hostname: slug,
+          state: 'active',
+          endpoint: ids.nexusEndpoints.first,
+        ));
+      }
     }
 
     // Self-hosted portal

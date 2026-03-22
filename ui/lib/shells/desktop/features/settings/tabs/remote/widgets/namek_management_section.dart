@@ -123,30 +123,23 @@ class _NamekManagementSectionState extends State<NamekManagementSection> {
   // ── Active ──────────────────────────────────────────────────────────────
 
   Widget _buildActive(IdentityStatus ids) {
-    final hostname = ids.resolvedHostname;
+    final customFqdn = ids.resolvedHostname;
+    final slug = ids.hostname;
+    final hasCustom = customFqdn != null && customFqdn != slug;
+    // Primary display: custom hostname if set, otherwise slug
+    final primaryHostname = hasCustom ? customFqdn : slug;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // Hostname — hero element
-        if (hostname != null)
-          Row(
-            children: [
-              Expanded(
-                child: SelectableText(
-                  hostname,
-                  style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
-                ),
-              ),
-              IconButton(
-                onPressed: () => _copyToClipboard(hostname),
-                icon: const Icon(PiccoloIcons.copy, size: 16),
-                tooltip: 'Copy hostname',
-                iconSize: 16,
-                padding: const EdgeInsets.all(Spacing.xs),
-                constraints: const BoxConstraints(),
-              ),
-            ],
+        // Primary hostname — hero element
+        if (primaryHostname != null)
+          _hostnameRow(primaryHostname),
+        // Slug hostname — secondary, shown when custom is set
+        if (hasCustom && slug != null)
+          Padding(
+            padding: const EdgeInsets.only(top: Spacing.xs),
+            child: _hostnameRow(slug, secondary: true),
           ),
         const SizedBox(height: Spacing.sm),
 
@@ -292,6 +285,29 @@ class _NamekManagementSectionState extends State<NamekManagementSection> {
   }
 
   // ── Shared Widgets ──────────────────────────────────────────────────────
+
+  Widget _hostnameRow(String hostname, {bool secondary = false}) {
+    return Row(
+      children: [
+        Expanded(
+          child: SelectableText(
+            hostname,
+            style: secondary
+                ? PiccoloTheme.textTheme.bodySmall?.copyWith(color: PiccoloTheme.inkMuted)
+                : PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
+          ),
+        ),
+        IconButton(
+          onPressed: () => _copyToClipboard(hostname),
+          icon: const Icon(PiccoloIcons.copy, size: 16),
+          tooltip: 'Copy hostname',
+          iconSize: 16,
+          padding: const EdgeInsets.all(Spacing.xs),
+          constraints: const BoxConstraints(),
+        ),
+      ],
+    );
+  }
 
   Widget _serverUrlLine(IdentityStatus ids) {
     final url = ids.namekUrl ?? '';
