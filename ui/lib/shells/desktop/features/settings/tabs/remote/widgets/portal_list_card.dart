@@ -31,7 +31,7 @@ class PortalListCard extends StatelessWidget {
         children: [
           Text('Portals', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
           const SizedBox(height: Spacing.base),
-          ...portals.map((portal) => _buildPortalRow(context, portal)),
+          ...portals.map((portal) => _PortalRow(key: ValueKey(portal.hostname), portal: portal)),
         ],
       ),
     );
@@ -78,8 +78,22 @@ class PortalListCard extends StatelessWidget {
       ),
     );
   }
+}
 
-  Widget _buildPortalRow(BuildContext context, Portal portal) {
+class _PortalRow extends StatefulWidget {
+  const _PortalRow({required this.portal, super.key});
+  final Portal portal;
+
+  @override
+  State<_PortalRow> createState() => _PortalRowState();
+}
+
+class _PortalRowState extends State<_PortalRow> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final portal = widget.portal;
     final badgeLabel = portal.source == PortalSource.namek ? 'Managed' : 'Self-hosted';
     final badgeColor = portal.source == PortalSource.namek ? PiccoloTheme.cobalt600 : PiccoloTheme.inkMuted;
 
@@ -95,56 +109,82 @@ class PortalListCard extends StatelessWidget {
 
     return Padding(
       padding: const EdgeInsets.only(bottom: Spacing.sm),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            width: 10,
-            height: 10,
-            decoration: BoxDecoration(
-              color: stateColor,
-              shape: BoxShape.circle,
-            ),
-          ),
-          const SizedBox(width: Spacing.sm),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: Spacing.sm, vertical: 2),
-            decoration: BoxDecoration(
-              color: badgeColor.withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(Radii.xs),
-              border: Border.all(color: badgeColor.withValues(alpha: 0.3)),
-            ),
-            child: Text(
-              badgeLabel,
-              style: TextStyle(fontSize: 11, color: badgeColor, fontWeight: FontWeight.w600),
-            ),
-          ),
-          const SizedBox(width: Spacing.sm),
-          Expanded(
-            child: MouseRegion(
-              cursor: portal.hostname.isNotEmpty ? SystemMouseCursors.click : SystemMouseCursors.basic,
-              child: GestureDetector(
-                onTap: portal.hostname.isNotEmpty
-                    ? () => launchUrl(Uri.parse('https://${portal.hostname}'))
-                    : null,
-                child: Text(
-                  portal.hostname.isNotEmpty ? portal.hostname : 'Configuring...',
-                  style: TextStyle(
-                    fontWeight: FontWeight.w600,
-                    color: portal.hostname.isNotEmpty ? PiccoloTheme.cobalt600 : PiccoloTheme.inkMuted,
+          // Main row: status dot + badge + hostname + expand toggle
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: Spacing.xs),
+            child: Row(
+              children: [
+                Container(
+                  width: 10,
+                  height: 10,
+                  decoration: BoxDecoration(
+                    color: stateColor,
+                    shape: BoxShape.circle,
                   ),
-                  overflow: TextOverflow.ellipsis,
                 ),
+                const SizedBox(width: Spacing.sm),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: Spacing.sm, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: badgeColor.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(Radii.xs),
+                    border: Border.all(color: badgeColor.withValues(alpha: 0.3)),
+                  ),
+                  child: Text(
+                    badgeLabel,
+                    style: TextStyle(fontSize: 11, color: badgeColor, fontWeight: FontWeight.w600),
+                  ),
+                ),
+                const SizedBox(width: Spacing.sm),
+                Expanded(
+                  child: MouseRegion(
+                    cursor: portal.hostname.isNotEmpty ? SystemMouseCursors.click : SystemMouseCursors.basic,
+                    child: GestureDetector(
+                      onTap: portal.hostname.isNotEmpty
+                          ? () => launchUrl(Uri.parse('https://${portal.hostname}'))
+                          : null,
+                      child: Text(
+                        portal.hostname.isNotEmpty ? portal.hostname : 'Configuring...',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w600,
+                          color: portal.hostname.isNotEmpty ? PiccoloTheme.cobalt600 : PiccoloTheme.inkMuted,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ),
+                ),
+                if (portal.endpoints.isNotEmpty)
+                  IconButton(
+                    icon: Icon(_expanded ? Icons.expand_less : Icons.expand_more),
+                    iconSize: 18,
+                    color: PiccoloTheme.inkMuted,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onPressed: () => setState(() => _expanded = !_expanded),
+                  ),
+              ],
+            ),
+          ),
+          // Expanded detail: relay endpoints
+          if (_expanded)
+            Padding(
+              padding: const EdgeInsets.only(left: 30, top: Spacing.xs, bottom: Spacing.xs),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: portal.endpoints.map((ep) => Padding(
+                  padding: const EdgeInsets.only(bottom: 2),
+                  child: Text(
+                    ep,
+                    style: PiccoloTheme.textTheme.labelSmall?.copyWith(color: PiccoloTheme.inkMuted),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                )).toList(),
               ),
             ),
-          ),
-          if (portal.endpoint != null) ...[
-            const SizedBox(width: Spacing.sm),
-            Text(
-              portal.endpoint!,
-              style: PiccoloTheme.textTheme.labelSmall?.copyWith(color: PiccoloTheme.inkMuted),
-              overflow: TextOverflow.ellipsis,
-            ),
-          ],
         ],
       ),
     );

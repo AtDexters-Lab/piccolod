@@ -2454,6 +2454,14 @@ func (s *GinServer) applyNamekState() {
 		s.certProvider.SetPortalMappings("namek", mappings)
 	}
 
+	// --- Stale custom cert cleanup ---
+	// Remove orphaned custom cert entries BEFORE requeueing, so
+	// RequeueOutstandingIssuances doesn't re-queue stale jobs.
+	if !hasCustomHostname && rm != nil {
+		rm.RemoveCertificateByID("namek-custom-portal")
+		rm.RemoveCertificateByID("namek-custom-wildcard")
+	}
+
 	// --- Cert issuance ---
 	if rm != nil && slugHostname != "" {
 		// Requeue persisted certs that may have been skipped before orchClient was registered

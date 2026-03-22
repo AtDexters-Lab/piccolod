@@ -135,8 +135,8 @@ class RemoteController extends ChangeNotifier {
       status = remoteResult;
       error = null;
       isLocked = false;
-      _computePortals();
       await _fetchLists();
+      _computePortals();
     } on Object catch (e) {
       if (e is ApiException && e.statusCode == 423) {
         isLocked = true;
@@ -187,8 +187,8 @@ class RemoteController extends ChangeNotifier {
         result.add(Portal(
           source: PortalSource.namek,
           hostname: customFqdn,
-          state: 'active',
-          endpoint: ids.nexusEndpoints.first,
+          state: _namekCertState(isCustom: true),
+          endpoints: ids.nexusEndpoints,
         ));
       }
       // Slug hostname portal (always present)
@@ -196,8 +196,8 @@ class RemoteController extends ChangeNotifier {
         result.add(Portal(
           source: PortalSource.namek,
           hostname: slug,
-          state: 'active',
-          endpoint: ids.nexusEndpoints.first,
+          state: _namekCertState(isCustom: false),
+          endpoints: ids.nexusEndpoints,
         ));
       }
     }
@@ -209,11 +209,27 @@ class RemoteController extends ChangeNotifier {
         source: PortalSource.selfHosted,
         hostname: st.portalHostname!,
         state: st.state,
-        endpoint: st.endpoint,
+        endpoints: st.endpoint != null ? [st.endpoint!] : [],
       ));
     }
 
     portals = result;
+  }
+
+  /// Derives managed portal state from namek certificate health.
+  String _namekCertState({required bool isCustom}) {
+    final certs = status?.certificates;
+    if (certs == null || certs.isEmpty) return 'active';
+    final prefix = isCustom ? 'namek-custom-' : 'namek-';
+    final relevant = certs.where((c) =>
+        c.id.startsWith(prefix) &&
+        (isCustom || !c.id.startsWith('namek-custom-')));
+    final hasError = relevant.any((c) => c.status == 'error');
+    final now = DateTime.now();
+    final hasRetry = relevant.any((c) => c.status == 'error' && c.retryAt != null && c.retryAt!.isAfter(now));
+    if (hasRetry) return 'warning';
+    if (hasError) return 'error';
+    return 'active';
   }
 
   Future<void> _fetchLists() async {
