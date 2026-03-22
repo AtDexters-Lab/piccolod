@@ -954,7 +954,7 @@ func (m *Manager) RemoveAlias(id string) error {
 	// Remove associated certificate entry and files (best-effort).
 	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(removed.Hostname)), ".")
 	if h != "" {
-		m.removeCertificateByID("alias:"+h, h)
+		m.removeCertificateByID("alias:"+h, h, "")
 	}
 	return nil
 }
@@ -966,10 +966,40 @@ func (m *Manager) RemoveHostnameCertificate(hostname string) {
 	if h == "" {
 		return
 	}
-	m.removeCertificateByID("host:"+h, h)
+	m.removeCertificateByID("host:"+h, h, "")
 }
 
-func (m *Manager) removeCertificateByID(id, commonName string) {
+// RemoveCertificateByID removes a certificate entry by ID, cleaning up both
+// the inventory and cert files on disk. No-op if the cert ID is not found.
+func (m *Manager) RemoveCertificateByID(id string) {
+	if m == nil {
+		return
+	}
+	// Look up commonName and certDir from the stored entry before removal.
+	m.cfgMu.RLock()
+	cfg := m.currentConfigLocked()
+	var commonName, certDir string
+	found := false
+	if cfg != nil {
+		for _, c := range cfg.Certificates {
+			if c.ID == id {
+				found = true
+				if len(c.Domains) > 0 {
+					commonName = c.Domains[0]
+				}
+				certDir = c.CertDir
+				break
+			}
+		}
+	}
+	m.cfgMu.RUnlock()
+	if !found {
+		return
+	}
+	m.removeCertificateByID(id, commonName, certDir)
+}
+
+func (m *Manager) removeCertificateByID(id, commonName, certDir string) {
 	if m == nil {
 		return
 	}
@@ -978,7 +1008,7 @@ func (m *Manager) removeCertificateByID(id, commonName string) {
 	cfg := m.currentConfigLocked()
 	if cfg == nil {
 		m.cfgMu.Unlock()
-		m.deleteCertFiles(id, commonName)
+		m.deleteCertFiles(id, commonName, certDir)
 		return
 	}
 	removed := false
@@ -1003,11 +1033,14 @@ func (m *Manager) removeCertificateByID(id, commonName string) {
 	} else {
 		m.cfgMu.Unlock()
 	}
-	m.deleteCertFiles(id, commonName)
+	m.deleteCertFiles(id, commonName, certDir)
 }
 
-func (m *Manager) deleteCertFiles(id, commonName string) {
-	certDir := m.certDir()
+func (m *Manager) deleteCertFiles(id, commonName, overrideCertDir string) {
+	certDir := overrideCertDir
+	if certDir == "" {
+		certDir = m.certDir()
+	}
 	if certDir == "" || commonName == "" {
 		return
 	}
@@ -1847,7 +1880,7 @@ func buildSans(commonName string, domains []string) []string {
 
 func outNameFor(id, cn string) string {
 	switch id {
-	case "wildcard", "namek-wildcard":
+	case "wildcard", "namek-wildcard", "namek-custom-wildcard":
 		// For wildcards we want the actual CN as filename (e.g., *.example.com)
 		return cn
 	case "portal":
@@ -1856,6 +1889,8 @@ func outNameFor(id, cn string) string {
 		// Fixed filename: after a hostname change, the old cert is served until reissuance
 		// completes. This is intentional — no TLS would be worse than a CN mismatch.
 		return "namek-portal"
+	case "namek-custom-portal":
+		return "namek-custom-portal"
 	default:
 		return cn
 	}
@@ -2586,6 +2621,11 @@ func computeWarnings(cfg *Config) []string {
 	hasCertError := false
 	hasRetry := false
 	for _, c := range cfg.Certificates {
+		// Source-tagged certs (e.g., namek) have independent lifecycle and
+		// should not affect the self-hosted portal warning state.
+		if c.Source != "" {
+			continue
+		}
 		if strings.EqualFold(c.Status, "error") {
 			hasCertError = true
 			if c.RetryAt != nil && c.RetryAt.After(now) {

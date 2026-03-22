@@ -49,7 +49,7 @@ func Open(akStateDir string, swtpmStateDir string) (*OpenResult, error) {
 			continue
 		}
 		log.Printf("INFO: tpm: opened hardware TPM at %s", path)
-		return &OpenResult{Device: dev, Kind: "hardware"}, nil
+		return &OpenResult{Device: newSyncDevice(dev), Kind: "hardware"}, nil
 	}
 	if hwErr != nil {
 		return nil, hwErr
@@ -74,7 +74,7 @@ func openSwtpm(ctx context.Context, akStateDir, swtpmStateDir string) (*OpenResu
 		return nil, err
 	}
 	log.Printf("INFO: tpm: opened software TPM (swtpm) from %s", swtpmStateDir)
-	return &OpenResult{Device: dev, Kind: "software", SwtpmProc: proc}, nil
+	return &OpenResult{Device: newSyncDevice(dev), Kind: "software", SwtpmProc: proc}, nil
 }
 
 // Close releases the TPM device and stops swtpm process if running.

@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"piccolod/internal/events"
 	"piccolod/internal/tpm"
@@ -45,9 +48,18 @@ type Service struct {
 	// Concurrency guard for recovery: prevents parallel recoverAndReenroll goroutines.
 	recovering atomic.Bool
 
+	// Shutdown lifecycle: stopped prevents new recovery/sync goroutines after Stop(),
+	// recoverWg tracks in-flight recovery so Stop can wait for it.
+	stopped   atomic.Bool
+	recoverWg sync.WaitGroup
+
 	// onTPMReplaced is called when AK recovery replaces the TPM device,
 	// so the owner can update its own reference and close the old one.
 	onTPMReplaced func(old tpm.Device, newResult *tpm.OpenResult)
+
+	// Endpoint sync loop lifecycle.
+	syncCancel context.CancelFunc
+	syncDone   chan struct{}
 }
 
 // NewService constructs a new identity service.
@@ -100,11 +112,38 @@ func (s *Service) Start(ctx context.Context) error {
 
 	s.available.Store(true)
 	s.publish(events.TopicIdentityReady, nil)
+
+	if cfg.DeviceID != "" {
+		s.startEndpointSync()
+	}
 	return nil
 }
 
 // Stop closes the namekclient. Does NOT close TPM — caller owns it.
 func (s *Service) Stop(ctx context.Context) error {
+	// Set stopped under Lock so HandleTokenError's RLock+Add(1) sequence
+	// cannot race with Wait(). Once Lock is released, any concurrent
+	// HandleTokenError will see stopped=true and skip recovery.
+	s.mu.Lock()
+	s.stopped.Store(true)
+	s.mu.Unlock()
+
+	s.stopEndpointSync()
+
+	// Wait for in-flight recovery, but respect the caller's context timeout
+	// so a hung recovery doesn't block the entire shutdown sequence.
+	waitCh := make(chan struct{})
+	go func() {
+		s.recoverWg.Wait()
+		close(waitCh)
+	}()
+	select {
+	case <-waitCh:
+	case <-ctx.Done():
+		log.Printf("WARN: identity: Stop context expired waiting for recovery to finish")
+		return ctx.Err()
+	}
+
 	s.mu.Lock()
 	s.client = nil
 	s.mu.Unlock()
@@ -241,6 +280,7 @@ func (s *Service) Enroll(ctx context.Context) (*EnrollResult, error) {
 
 	s.enrolled.Store(true)
 	s.suspended.Store(false) // clear suspension on successful enrollment
+	s.startEndpointSync()
 	s.publish(events.TopicIdentityChanged, nil)
 
 	log.Printf("INFO: identity: enrolled (device=%s, hostname=%s, reenrolled=%v)",
@@ -273,6 +313,10 @@ func (s *Service) SetEnabled(ctx context.Context, enabled bool) error {
 		return err
 	}
 
+	if !enabled {
+		s.stopEndpointSync()
+	}
+
 	// Reinitialize client if enabling and it was never created (e.g., started disabled).
 	if needsClient {
 		client := newNamekClient(resolveNamekURL(cfg), s.tpmDev, cfg.DeviceID)
@@ -285,6 +329,10 @@ func (s *Service) SetEnabled(ctx context.Context, enabled bool) error {
 		}
 	}
 
+	if enabled && s.enrolled.Load() {
+		s.startEndpointSync()
+	}
+
 	s.publish(events.TopicIdentityChanged, nil)
 	return nil
 }
@@ -294,6 +342,8 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 	if strings.TrimSpace(url) == "" {
 		return fmt.Errorf("identity: namek URL cannot be empty")
 	}
+	s.stopEndpointSync()
+
 	s.mu.Lock()
 	s.cfg.NamekURL = url
 	s.cfg.DeviceID = ""
@@ -356,10 +406,23 @@ func (s *Service) HandleTokenError(err error, httpStatus int) {
 	switch httpStatus {
 	case 401:
 		if s.recovering.Load() {
-			return // recovery already in progress
+			return
 		}
+		// RLock synchronizes with Stop()'s Lock: Add(1) completes before
+		// Stop() can call Wait(), preventing a WaitGroup panic.
+		s.mu.RLock()
+		if s.stopped.Load() {
+			s.mu.RUnlock()
+			return
+		}
+		s.recoverWg.Add(1)
+		s.mu.RUnlock()
+
 		log.Printf("WARN: identity: namek auth failed (401), attempting AK recovery and re-enrollment")
-		go s.recoverAndReenroll()
+		go func() {
+			defer s.recoverWg.Done()
+			s.recoverAndReenroll()
+		}()
 	case 403:
 		log.Printf("ERROR: identity: device suspended/revoked by namek (403)")
 		s.suspended.Store(true)
@@ -407,7 +470,8 @@ func (s *Service) recoverAndReenroll() {
 		oldDev.Close()
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 	if _, err := s.Enroll(ctx); err != nil {
 		log.Printf("ERROR: identity: re-enrollment after AK recovery failed: %v", err)
 	}
@@ -442,6 +506,137 @@ func newNamekClient(url string, dev tpm.Device, deviceID string) *namekclient.Cl
 		opts = append(opts, namekclient.WithInsecureSkipVerify())
 	}
 	return namekclient.New(url, dev, opts...)
+}
+
+// startEndpointSync launches the background endpoint sync loop.
+// Idempotent: does nothing if already running.
+func (s *Service) startEndpointSync() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped.Load() || !s.cfg.Enabled || s.syncCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.syncCancel = cancel
+	s.syncDone = make(chan struct{})
+	done := s.syncDone
+	go func() {
+		defer close(done)
+		s.endpointSyncLoop(ctx)
+	}()
+}
+
+// stopEndpointSync cancels the sync loop and waits for it to exit.
+func (s *Service) stopEndpointSync() {
+	s.mu.Lock()
+	cancel := s.syncCancel
+	done := s.syncDone
+	s.syncCancel = nil
+	s.syncDone = nil
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func (s *Service) endpointSyncLoop(ctx context.Context) {
+	s.syncEndpointsOnce(ctx)
+
+	ticker := time.NewTicker(endpointSyncInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.syncEndpointsOnce(ctx)
+		}
+	}
+}
+
+func (s *Service) syncEndpointsOnce(ctx context.Context) {
+	if !s.enrolled.Load() || !s.IsEnabled() || s.suspended.Load() || s.recovering.Load() {
+		return
+	}
+
+	s.mu.RLock()
+	client := s.client
+	s.mu.RUnlock()
+	if client == nil {
+		return
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	info, err := client.GetDeviceInfo(callCtx)
+	if err != nil {
+		if status := extractHTTPStatus(err); status == 401 || status == 403 {
+			s.HandleTokenError(err, status)
+		} else {
+			log.Printf("WARN: identity: endpoint sync: %v", err)
+		}
+		return
+	}
+
+	if info.Status == "suspended" {
+		s.suspended.Store(true)
+		s.publish(events.TopicIdentityChanged, nil)
+		log.Printf("WARN: identity: endpoint sync detected device suspension")
+		return
+	}
+
+	// Snapshot local endpoints under lock for comparison.
+	s.mu.RLock()
+	localEndpoints := append([]string(nil), s.cfg.NexusEndpoints...)
+	s.mu.RUnlock()
+
+	if len(info.NexusEndpoints) == 0 && len(localEndpoints) > 0 {
+		log.Printf("WARN: identity: endpoint sync: server returned empty endpoints, skipping update")
+		return
+	}
+
+	remoteSorted := append([]string(nil), info.NexusEndpoints...)
+	localSorted := append([]string(nil), localEndpoints...)
+	sort.Strings(remoteSorted)
+	sort.Strings(localSorted)
+
+	if slices.Equal(remoteSorted, localSorted) {
+		return
+	}
+
+	// Update in-memory first, snapshot fresh config for persistence.
+	s.mu.Lock()
+	s.cfg.NexusEndpoints = info.NexusEndpoints
+	cfgToSave := s.cfg
+	cfgToSave.NexusEndpoints = append([]string(nil), info.NexusEndpoints...)
+	s.mu.Unlock()
+
+	if err := saveConfig(s.configPath, cfgToSave); err != nil {
+		// Rollback in-memory on persist failure.
+		s.mu.Lock()
+		s.cfg.NexusEndpoints = localEndpoints
+		s.mu.Unlock()
+		log.Printf("ERROR: identity: endpoint sync: failed to persist: %v", err)
+		return
+	}
+
+	s.publish(events.TopicIdentityChanged, nil)
+	log.Printf("INFO: identity: endpoint sync: updated nexus endpoints (%d → %d)",
+		len(localEndpoints), len(info.NexusEndpoints))
+}
+
+func endpointSyncInterval() time.Duration {
+	if v := os.Getenv("PICCOLO_ENDPOINT_SYNC_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 5 * time.Minute
 }
 
 // extractBaseDomain strips the first label from an FQDN.

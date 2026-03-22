@@ -9,6 +9,7 @@ import 'package:piccolo_os/core/utils/task_id.dart';
 import 'package:piccolo_os/features/apps/app_launcher.dart';
 import 'package:piccolo_os/features/apps/widgets/edit_listeners_dialog.dart';
 import 'package:piccolo_os/features/apps/widgets/health_banner.dart';
+import 'package:piccolo_os/features/apps/widgets/local_fallback_overlay.dart';
 import 'package:piccolo_os/features/apps/workspace_terminal.dart';
 import 'package:piccolo_os/shared/widgets/app_icon.dart';
 import 'package:piccolo_os/shared/widgets/health_badge.dart';
@@ -55,6 +56,8 @@ class _AppDetailViewState extends State<AppDetailView>
   String? _selectedService;
   bool _isLoading = true;
   String? _error;
+
+  bool _snapshotAvailable = false;
 
   // Action states
   bool _isActionLoading = false;
@@ -134,6 +137,7 @@ class _AppDetailViewState extends State<AppDetailView>
         _app = detail.app;
         _listeners = detail.listeners;
         _containers = detail.containers;
+        _snapshotAvailable = detail.snapshotAvailable;
         _primaryHealth = detail.app.primaryListenerHealth;
         // Identify the primary listener name for stream filtering
         _primaryListenerName = _findPrimaryListenerName(detail.listeners);
@@ -210,6 +214,43 @@ class _AppDetailViewState extends State<AppDetailView>
     if (!refreshOnSuccess || !mounted) return true;
     await _loadData();
     return true;
+  }
+
+  Future<void> _handleUpdate() async {
+    await _handleActionWithProgress(
+      taskType: 'update_image',
+      action: (taskId) => widget.appService.updateApp(widget.appId, taskId: taskId),
+    );
+  }
+
+  Future<void> _confirmRollback() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Roll back to previous version?'),
+        content: const Text(
+          'This will restore the app and its data to the state before the last update. Any changes since the update will be lost.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.warning),
+            child: const Text('Roll Back'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    await _handleActionWithProgress(
+      taskType: 'rollback_app',
+      action: (taskId) => widget.appService.rollbackApp(widget.appId, taskId: taskId),
+    );
   }
 
   Future<void> _confirmUninstall() async {
@@ -461,6 +502,31 @@ class _AppDetailViewState extends State<AppDetailView>
                   ),
                   const SizedBox(width: Spacing.md),
                 ],
+                if (!_app!.isWorkspace && _app!.isRunning) ...[
+                  FilledButton.icon(
+                    onPressed: _handleUpdate,
+                    icon: const Icon(PiccoloIcons.refresh),
+                    label: const Text('Update'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: PiccoloTheme.cobalt600,
+                    ),
+                  ),
+                  const SizedBox(width: Spacing.md),
+                ],
+                if (_snapshotAvailable && !_app!.isWorkspace) ...[
+                  IconButton.outlined(
+                    onPressed: _confirmRollback,
+                    icon: const Icon(PiccoloIcons.restart, size: 20),
+                    tooltip: 'Roll back to previous version',
+                    style: IconButton.styleFrom(
+                      foregroundColor: PiccoloTheme.warning,
+                      side: BorderSide(
+                        color: PiccoloTheme.warning.withValues(alpha: 0.3),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: Spacing.md),
+                ],
                 if (_app!.isRunning)
                   FilledButton.icon(
                     onPressed: () => _handleActionWithProgress(
@@ -708,7 +774,36 @@ class _AppDetailViewState extends State<AppDetailView>
                               icon: PiccoloIcons.webAsset,
                               tooltip: 'Opens in app window',
                             ),
-                          if (svc.remoteUrl != null)
+                          if (svc.remoteUrls.isNotEmpty)
+                            ...svc.remoteUrls.map((url) {
+                              // Only the context-aware URL (matching current portal) can be
+                              // embedded in an iframe — other portals have different cookies/OIDC.
+                              final isCurrentPortal = url == svc.remoteUrl;
+                              return _buildNetworkLinkRow(
+                                'Remote Access',
+                                url,
+                                onTap: isCurrentPortal
+                                    ? () => AppLauncher.healthGatedOpen(
+                                        context: context,
+                                        controller: widget.desktopController,
+                                        appService: widget.appService,
+                                        app: _app!,
+                                        service: svc,
+                                        overrideUrl: url,
+                                        healthOverride: svc.name == _primaryListenerName
+                                            ? _primaryHealth
+                                            : null,
+                                      )
+                                    : () => _healthGatedLaunchUrl(url, svc),
+                                icon: isCurrentPortal
+                                    ? PiccoloIcons.webAsset
+                                    : PiccoloIcons.openExternal,
+                                tooltip: isCurrentPortal
+                                    ? 'Opens in app window'
+                                    : 'Opens in browser',
+                              );
+                            })
+                          else if (svc.remoteUrl != null)
                             _buildNetworkLinkRow(
                               'Remote Access',
                               svc.remoteUrl!,
@@ -719,7 +814,6 @@ class _AppDetailViewState extends State<AppDetailView>
                                 app: _app!,
                                 service: svc,
                                 overrideUrl: svc.remoteUrl,
-                                // Only override with live stream health for primary listener
                                 healthOverride: svc.name == _primaryListenerName
                                     ? _primaryHealth
                                     : null,
@@ -935,6 +1029,30 @@ class _AppDetailViewState extends State<AppDetailView>
         ],
       ),
     );
+  }
+
+  /// Health-gates a remote URL then opens it in a new browser tab.
+  /// Used for alternate portal URLs that can't be iframe-embedded (cross-site cookies)
+  /// but should still be gated to avoid dumping users into TLS errors.
+  void _healthGatedLaunchUrl(String url, ServiceEndpoint svc) {
+    final health = (svc.name == _primaryListenerName ? _primaryHealth : null)
+        ?? svc.health ?? _app!.primaryListenerHealth;
+    if (health != null && !health.isOk && !health.isDegraded) {
+      final fallbackUrl =
+          svc.lanFallbackUrl ?? svc.lanHostUrl ?? svc.localUrl ?? '';
+      unawaited(showDialog<void>(
+        context: context,
+        builder: (_) => LocalFallbackOverlay(
+          health: health,
+          appName: _app!.displayTitle,
+          lanFallbackUrl: fallbackUrl,
+          appService: widget.appService,
+          desktopController: widget.desktopController,
+        ),
+      ));
+      return;
+    }
+    unawaited(launchUrl(Uri.parse(url)));
   }
 
   Widget _buildNetworkLinkRow(

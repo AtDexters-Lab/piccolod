@@ -6,12 +6,12 @@ class Portal {
     required this.source,
     required this.hostname,
     required this.state,
-    this.endpoint,
+    this.endpoints = const [],
   });
   final PortalSource source;
   final String hostname;
   final String state;
-  final String? endpoint;
+  final List<String> endpoints;
 }
 
 class RemoteStatus {
@@ -122,6 +122,7 @@ class RemoteCertificate {
     this.issuedAt,
     this.expiresAt,
     this.nextRenewal,
+    this.retryAt,
     this.status,
     this.failureReason,
   });
@@ -134,6 +135,7 @@ class RemoteCertificate {
       issuedAt: json['issued_at'] != null ? DateTime.parse(json['issued_at'] as String) : null,
       expiresAt: json['expires_at'] != null ? DateTime.parse(json['expires_at'] as String) : null,
       nextRenewal: json['next_renewal'] != null ? DateTime.parse(json['next_renewal'] as String) : null,
+      retryAt: json['retry_at'] != null ? DateTime.parse(json['retry_at'] as String) : null,
       status: json['status'] as String?,
       failureReason: json['failure_reason'] as String?,
     );
@@ -144,6 +146,7 @@ class RemoteCertificate {
   final DateTime? issuedAt;
   final DateTime? expiresAt;
   final DateTime? nextRenewal;
+  final DateTime? retryAt;
   final String? status;
   final String? failureReason;
 }

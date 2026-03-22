@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -21,6 +22,46 @@ const (
 	tplLeftMarker  = "__TPL_L__"
 	tplRightMarker = "__TPL_R__"
 )
+
+// jsonValue wraps a value so that its String() method produces JSON.
+// Used to make slice/array template inputs render as valid YAML automatically
+// (e.g., {{ .Inputs.list }} → ["a","b"] instead of Go's default [a b]).
+type jsonValue struct{ v any }
+
+func (j jsonValue) String() string {
+	b, _ := json.Marshal(j.v)
+	return string(b)
+}
+
+func (j jsonValue) MarshalJSON() ([]byte, error) {
+	return json.Marshal(j.v)
+}
+
+// manifestFuncMap provides custom template functions for app manifest rendering.
+var manifestFuncMap = template.FuncMap{
+	"toJSON": func(v any) (string, error) {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	},
+}
+
+// wrapSliceInputs wraps []interface{} values in jsonValue so that Go templates
+// render them as JSON arrays (valid YAML) instead of Go's fmt.Sprint format.
+// Scalar values (string, bool, number) are left untouched.
+func wrapSliceInputs(inputs map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(inputs))
+	for k, v := range inputs {
+		if _, ok := v.([]interface{}); ok {
+			out[k] = jsonValue{v}
+		} else {
+			out[k] = v
+		}
+	}
+	return out
+}
 
 var (
 	// Valid app name pattern: lowercase letters, numbers, hyphens
@@ -268,17 +309,73 @@ func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
 	return &app, nil
 }
 
+// backfillInputDefaults ensures every declared optional input has a key in the
+// provided map. For optional inputs (required: false) not provided by the user,
+// it injects the declared default value or a type-appropriate zero value.
+// This prevents missingkey=error panics when templates reference optional inputs.
+func backfillInputDefaults(declared map[string]api.AppInput, provided map[string]interface{}) map[string]interface{} {
+	if len(declared) == 0 {
+		return provided
+	}
+	// Check if any optional input needs backfilling before allocating.
+	needsBackfill := false
+	for name, spec := range declared {
+		if _, exists := provided[name]; !exists && !spec.Required {
+			needsBackfill = true
+			break
+		}
+	}
+	if !needsBackfill {
+		return provided
+	}
+	merged := make(map[string]interface{}, len(provided)+len(declared))
+	for k, v := range provided {
+		merged[k] = v
+	}
+	for name, spec := range declared {
+		if _, exists := merged[name]; exists {
+			continue
+		}
+		if spec.Required {
+			continue // let missingkey=error catch missing required inputs
+		}
+		if spec.Default != nil {
+			merged[name] = spec.Default
+			continue
+		}
+		switch spec.Type {
+		case "boolean":
+			merged[name] = false
+		case "int", "number":
+			merged[name] = float64(0) // float64 matches JSON/YAML number decoding
+		case "array":
+			merged[name] = []interface{}{}
+		default: // string, password
+			merged[name] = ""
+		}
+	}
+	return merged
+}
+
 // RenderManifest applies user inputs to the app manifest template.
 func RenderManifest(rawYaml []byte, userInputs map[string]interface{}, systemContext map[string]interface{}) ([]byte, error) {
-	// Prepare data for template
+	// Backfill zero values for declared-but-unprovided optional inputs
+	// so templates can use {{ .Inputs.x }} without missingkey=error panics.
+	if schema, err := ParseAppSchema(rawYaml); err == nil && len(schema.Inputs) > 0 {
+		userInputs = backfillInputDefaults(schema.Inputs, userInputs)
+	}
+
+	// Prepare data for template.
+	// wrapSliceInputs ensures array values render as JSON (valid YAML)
+	// without requiring explicit | toJSON in templates.
 	data := map[string]interface{}{
-		"Inputs": userInputs,
+		"Inputs": wrapSliceInputs(userInputs),
 		"System": systemContext,
 	}
 
 	// Parse and Execute Template
 	// Option "missingkey=error" ensures we fail if the manifest references an input we didn't provide
-	tmpl, err := template.New("manifest").Option("missingkey=error").Parse(string(rawYaml))
+	tmpl, err := template.New("manifest").Funcs(manifestFuncMap).Option("missingkey=error").Parse(string(rawYaml))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse manifest template: %w", err)
 	}
@@ -829,8 +926,15 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 
 		// Validate listener name only if not __primary marker
 		if !hostname.IsPrimaryMarker(l.Name) {
-			// Validate listener name per RFC 20260114 (DNS-compliant, no hyphens)
-			if err := hostname.ValidateListenerName(l.Name); err != nil {
+			var err error
+			if isPrimary {
+				// Primary listener name becomes app identity — must not be reserved
+				err = hostname.ValidateListenerName(l.Name)
+			} else {
+				// Non-primary: derived hostname is <listener>-<app>, no collision with bare reserved names
+				err = hostname.ValidateListenerNameFormat(l.Name)
+			}
+			if err != nil {
 				return fmt.Errorf("listener[%d] %w", i, err)
 			}
 		}

@@ -2,9 +2,12 @@ package app
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"piccolod/internal/api"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TestParseAppDefinition tests parsing of valid app.yaml files
@@ -525,7 +528,7 @@ x-piccolo:
 // TestReservedNames tests that reserved listener names are rejected
 func TestReservedNames(t *testing.T) {
 	// RFC 20260130: Reserved names now apply to listener names
-	reservedNames := []string{"api", "www", "admin", "root", "system", "piccolo"}
+	reservedNames := []string{"api", "www", "admin", "root", "system", "piccolo", "piccoloos"}
 
 	for _, name := range reservedNames {
 		t.Run(name, func(t *testing.T) {
@@ -548,6 +551,59 @@ func TestReservedNames(t *testing.T) {
 				t.Errorf("Expected error about reserved name, got %q", err.Error())
 			}
 		})
+	}
+}
+
+// TestReservedNames_nonprimary_listener_allowed tests that non-primary listeners
+// with reserved names pass validation (their derived hostname <listener>-<app> cannot collide).
+func TestReservedNames_nonprimary_listener_allowed(t *testing.T) {
+	reservedNames := []string{"api", "www", "admin", "root", "system", "piccolo", "piccoloos"}
+
+	for _, name := range reservedNames {
+		t.Run(name, func(t *testing.T) {
+			app := &api.AppDefinition{
+				Listeners: []api.AppListener{
+					{Name: "web", GuestPort: 80, Primary: true},
+					{Name: name, GuestPort: 8080},
+				},
+				Services: map[string]api.AppService{
+					"main": {Image: "nginx:latest", BindPorts: []int{80, 8080}},
+				},
+				Extensions: map[string]interface{}{"mode": "service"},
+			}
+
+			SetDefaults(app)
+			err := ValidateAppDefinition(app)
+
+			if err != nil {
+				t.Fatalf("Non-primary listener with reserved name '%s' should be allowed, got: %v", name, err)
+			}
+		})
+	}
+}
+
+// TestValidateListeners_nonprimary_invalid_format verifies that format validation
+// still applies to non-primary listeners (only reserved name check is relaxed).
+func TestValidateListeners_nonprimary_invalid_format(t *testing.T) {
+	app := &api.AppDefinition{
+		Listeners: []api.AppListener{
+			{Name: "web", GuestPort: 80, Primary: true},
+			{Name: "my-listener", GuestPort: 8080}, // Invalid: contains hyphen
+		},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:latest", BindPorts: []int{80, 8080}},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+
+	SetDefaults(app)
+	err := ValidateAppDefinition(app)
+
+	if err == nil {
+		t.Fatal("expected error for invalid format on non-primary listener, got nil")
+	}
+	if !strings.Contains(err.Error(), "no hyphens allowed") {
+		t.Errorf("expected error about invalid format (no hyphens), got: %v", err)
 	}
 }
 
@@ -866,4 +922,330 @@ func TestNeutralizeTemplates(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRenderManifest_ToJSON(t *testing.T) {
+	t.Run("array_input", func(t *testing.T) {
+		manifest := `domains: {{ .Inputs.domain_list | toJSON }}`
+		inputs := map[string]interface{}{
+			"domain_list": []interface{}{".example.com", ".test.org"},
+		}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), `[".example.com",".test.org"]`) {
+			t.Errorf("expected JSON array in output, got:\n%s", rendered)
+		}
+	})
+
+	t.Run("empty_array", func(t *testing.T) {
+		manifest := `domains: {{ .Inputs.list | toJSON }}`
+		inputs := map[string]interface{}{"list": []interface{}{}}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), "domains: []") {
+			t.Errorf("expected empty JSON array, got: %s", rendered)
+		}
+	})
+
+	t.Run("scalar_passthrough", func(t *testing.T) {
+		manifest := `flag: {{ .Inputs.flag | toJSON }}`
+		inputs := map[string]interface{}{"flag": true}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), "flag: true") {
+			t.Errorf("expected boolean, got: %s", rendered)
+		}
+	})
+
+	t.Run("mixed_array_and_scalar", func(t *testing.T) {
+		manifest := `
+app_config:
+  name: "{{ .Inputs.app_name }}"
+  suffixes: {{ .Inputs.suffixes | toJSON }}
+`
+		inputs := map[string]interface{}{
+			"app_name": "myapp",
+			"suffixes": []interface{}{".a.com", ".b.com"},
+		}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		output := string(rendered)
+		if !strings.Contains(output, `name: "myapp"`) {
+			t.Errorf("expected scalar preserved, got:\n%s", output)
+		}
+		if !strings.Contains(output, `[".a.com",".b.com"]`) {
+			t.Errorf("expected JSON array, got:\n%s", output)
+		}
+	})
+
+	t.Run("round_trip_yaml_parse", func(t *testing.T) {
+		manifest := `domains: {{ .Inputs.list | toJSON }}`
+		inputs := map[string]interface{}{
+			"list": []interface{}{"alpha", "beta"},
+		}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var result map[string]interface{}
+		if err := yaml.Unmarshal(rendered, &result); err != nil {
+			t.Fatalf("rendered YAML should parse: %v\nrendered:\n%s", err, rendered)
+		}
+		domains, ok := result["domains"].([]interface{})
+		if !ok {
+			t.Fatalf("expected []interface{}, got %T", result["domains"])
+		}
+		if len(domains) != 2 || domains[0] != "alpha" || domains[1] != "beta" {
+			t.Errorf("unexpected domains: %v", domains)
+		}
+	})
+
+	t.Run("array_auto_renders_without_toJSON", func(t *testing.T) {
+		manifest := `domains: {{ .Inputs.list }}`
+		inputs := map[string]interface{}{
+			"list": []interface{}{".example.com", ".test.org"},
+		}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), `[".example.com",".test.org"]`) {
+			t.Errorf("expected auto JSON array without | toJSON, got:\n%s", rendered)
+		}
+		// Verify it's valid YAML
+		var result map[string]interface{}
+		if err := yaml.Unmarshal(rendered, &result); err != nil {
+			t.Fatalf("rendered YAML should parse: %v\nrendered:\n%s", err, rendered)
+		}
+	})
+}
+
+func TestRenderManifest_OptionalInputBackfill(t *testing.T) {
+	// Full manifest template with declared inputs and template references.
+	// RenderManifest should backfill optional inputs with zero/default values
+	// so {{ .Inputs.x }} doesn't panic with missingkey=error.
+
+	t.Run("optional_string_gets_zero_value", func(t *testing.T) {
+		manifest := `
+inputs:
+  name:
+    type: string
+    label: "Name"
+    required: true
+  subtitle:
+    type: string
+    label: "Subtitle"
+services:
+  main:
+    image: test:latest
+    bind_ports: [8080]
+x-piccolo:
+  mode: service
+result: "{{ .Inputs.subtitle }}"
+`
+		inputs := map[string]interface{}{"name": "myapp"}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), `result: ""`) {
+			t.Errorf("expected empty string for optional input, got:\n%s", rendered)
+		}
+	})
+
+	t.Run("optional_boolean_gets_false", func(t *testing.T) {
+		manifest := `
+inputs:
+  debug:
+    type: boolean
+    label: "Debug"
+services:
+  main:
+    image: test:latest
+    bind_ports: [8080]
+x-piccolo:
+  mode: service
+debug: {{ .Inputs.debug }}
+`
+		rendered, err := RenderManifest([]byte(manifest), nil, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), "debug: false") {
+			t.Errorf("expected false for optional boolean, got:\n%s", rendered)
+		}
+	})
+
+	t.Run("optional_int_gets_zero", func(t *testing.T) {
+		manifest := `
+inputs:
+  retries:
+    type: int
+    label: "Retries"
+services:
+  main:
+    image: test:latest
+    bind_ports: [8080]
+x-piccolo:
+  mode: service
+retries: {{ .Inputs.retries }}
+`
+		rendered, err := RenderManifest([]byte(manifest), nil, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), "retries: 0") {
+			t.Errorf("expected 0 for optional int, got:\n%s", rendered)
+		}
+	})
+
+	t.Run("optional_array_gets_empty_array", func(t *testing.T) {
+		manifest := `
+inputs:
+  nameservers:
+    type: array
+    label: "Nameservers"
+services:
+  main:
+    image: test:latest
+    bind_ports: [8080]
+x-piccolo:
+  mode: service
+nameservers: {{ .Inputs.nameservers }}
+`
+		rendered, err := RenderManifest([]byte(manifest), nil, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), "nameservers: []") {
+			t.Errorf("expected empty array for optional array, got:\n%s", rendered)
+		}
+	})
+
+	t.Run("optional_with_default_uses_default", func(t *testing.T) {
+		manifest := `
+inputs:
+  region:
+    type: string
+    label: "Region"
+    default: "us-east-1"
+services:
+  main:
+    image: test:latest
+    bind_ports: [8080]
+x-piccolo:
+  mode: service
+region: "{{ .Inputs.region }}"
+`
+		rendered, err := RenderManifest([]byte(manifest), nil, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), `region: "us-east-1"`) {
+			t.Errorf("expected default value, got:\n%s", rendered)
+		}
+	})
+
+	t.Run("required_input_still_errors_when_missing", func(t *testing.T) {
+		manifest := `
+inputs:
+  name:
+    type: string
+    label: "Name"
+    required: true
+services:
+  main:
+    image: test:latest
+    bind_ports: [8080]
+x-piccolo:
+  mode: service
+name: "{{ .Inputs.name }}"
+`
+		_, err := RenderManifest([]byte(manifest), nil, nil)
+		if err == nil {
+			t.Fatal("expected error for missing required input")
+		}
+	})
+
+	t.Run("optional_password_gets_empty_string", func(t *testing.T) {
+		manifest := `
+inputs:
+  secret:
+    type: password
+    label: "Secret"
+services:
+  main:
+    image: test:latest
+    bind_ports: [8080]
+x-piccolo:
+  mode: service
+secret: "{{ .Inputs.secret }}"
+`
+		rendered, err := RenderManifest([]byte(manifest), nil, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), `secret: ""`) {
+			t.Errorf("expected empty string for optional password, got:\n%s", rendered)
+		}
+	})
+
+	t.Run("optional_array_default_renders_as_json", func(t *testing.T) {
+		manifest := `
+inputs:
+  suffixes:
+    type: array
+    label: "Suffixes"
+    default:
+      - ".example.com"
+      - ".test.org"
+services:
+  main:
+    image: test:latest
+    bind_ports: [8080]
+x-piccolo:
+  mode: service
+suffixes: {{ .Inputs.suffixes }}
+`
+		rendered, err := RenderManifest([]byte(manifest), nil, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), `[".example.com",".test.org"]`) {
+			t.Errorf("expected default array as JSON, got:\n%s", rendered)
+		}
+	})
+
+	t.Run("provided_optional_not_overwritten", func(t *testing.T) {
+		manifest := `
+inputs:
+  color:
+    type: string
+    label: "Color"
+    default: "blue"
+services:
+  main:
+    image: test:latest
+    bind_ports: [8080]
+x-piccolo:
+  mode: service
+color: "{{ .Inputs.color }}"
+`
+		inputs := map[string]interface{}{"color": "red"}
+		rendered, err := RenderManifest([]byte(manifest), inputs, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(string(rendered), `color: "red"`) {
+			t.Errorf("expected user-provided value preserved, got:\n%s", rendered)
+		}
+	})
 }

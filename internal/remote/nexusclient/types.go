@@ -2,6 +2,7 @@ package nexusclient
 
 import (
 	"context"
+	"strings"
 
 	"piccolod/internal/api"
 )
@@ -21,11 +22,35 @@ type AliasEntry struct {
 
 // Config represents the minimum information needed to connect to the nexus proxy.
 type Config struct {
-	Endpoint       string
+	Endpoint       string               // Single endpoint (backward compat for self-hosted adapter)
+	Endpoints      []string             // Multiple relay endpoints (namek); takes precedence over Endpoint
 	DeviceSecret   string
 	PortalHostname string               // Fully-qualified hostname (e.g., portal.home.example.com)
 	Aliases        []AliasEntry         // Additional hostnames routed to this device (e.g., custom domains)
 	ClaimMappings  []api.PortClaimInfo  // Port claims with local targets; TCP/UDP derived at start time
+}
+
+// ResolvedEndpoints returns a deduplicated, trimmed list of endpoints.
+// If Endpoints is set, it takes precedence; otherwise Endpoint is wrapped in a slice.
+func (c Config) ResolvedEndpoints() []string {
+	source := c.Endpoints
+	if len(source) == 0 && c.Endpoint != "" {
+		source = []string{c.Endpoint}
+	}
+	seen := make(map[string]struct{}, len(source))
+	var out []string
+	for _, ep := range source {
+		ep = strings.TrimSpace(ep)
+		if ep == "" {
+			continue
+		}
+		if _, dup := seen[ep]; dup {
+			continue
+		}
+		seen[ep] = struct{}{}
+		out = append(out, ep)
+	}
+	return out
 }
 
 // Adapter provides a lifecycle wrapper around the nexus backend client.

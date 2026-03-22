@@ -23,10 +23,20 @@ import (
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
+	"github.com/go-acme/lego/v4/challenge/dns01"
 	lego "github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
 	acmepkg "golang.org/x/crypto/acme"
 )
+
+func init() {
+	// Disable lego's CNAME following for DNS-01 challenges. Our orchestrator
+	// client creates TXT records directly in the authoritative zone. Lego's
+	// CNAME resolution is meant for delegated challenge zones, but wildcard
+	// CNAMEs (e.g. *.domain → relay) cause lego to follow spurious CNAMEs
+	// for challenge FQDNs, placing the TXT record at the wrong domain.
+	_ = os.Setenv("LEGO_DISABLE_CNAME_SUPPORT", "true")
+}
 
 // ChallengeSink exposes Present/CleanUp to publish HTTP-01 tokens.
 type ChallengeSink interface {
@@ -228,7 +238,13 @@ func configureChallengeWith(cli *lego.Client, solver string, orchClient Orchestr
 		if orchClient == nil {
 			return errors.New("acme: orchestrator client not configured")
 		}
-		return cli.Challenge.SetDNS01Provider(NewPiccoloProvider(orchClient))
+		// Disable authoritative NS propagation check: querying authoritative
+		// nameservers is unnecessary when we write directly to PowerDNS and
+		// can fail when cached NS records point to stale providers.
+		return cli.Challenge.SetDNS01Provider(
+			NewPiccoloProvider(orchClient),
+			dns01.DisableAuthoritativeNssPropagationRequirement(),
+		)
 	}
 	prov := &http01Provider{sink: sink}
 	return cli.Challenge.SetHTTP01Provider(prov)

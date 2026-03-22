@@ -2210,7 +2210,16 @@ func (m *AppManager) UpdateImage(ctx context.Context, instanceID string, tag *st
 	return m.updateImageLocked(ctx, instanceID, tag)
 }
 
-func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, tag *string) error {
+func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, tag *string) (err error) {
+	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseValidating, 0, "Validating update", false, nil)
+	defer func() {
+		if err != nil {
+			m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseComplete, 100, "Update failed", true, err)
+		} else {
+			m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseComplete, 100, "Update complete", true, nil)
+		}
+	}()
+
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -2372,6 +2381,8 @@ func (m *AppManager) updateServiceModeImage(
 	}
 	defer ephCleanup()
 
+	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhasePullingImage, 10, "Pulling new image", false, nil)
+
 	// 1. For each changed service: pull + inspect image → get digest → compute versioned volume ID.
 	type changedService struct {
 		svcName       string
@@ -2426,6 +2437,8 @@ func (m *AppManager) updateServiceModeImage(
 		}
 	}
 
+	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseCreatingRootfs, 30, "Creating root filesystem", false, nil)
+
 	// 3. For each changed service: create new rootfs (idempotent, while still running).
 	var err error
 	for i := range changed {
@@ -2464,10 +2477,14 @@ func (m *AppManager) updateServiceModeImage(
 		}
 	}
 
+	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseStopping, 50, "Stopping containers", false, nil)
+
 	// 5. Stop ALL containers (services in reverse dep order, then anchor).
 	if err := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
 		log.Printf("WARN: update %s: stop containers: %v", instanceID, err)
 	}
+
+	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseSnapshotting, 55, "Creating rollback snapshot", false, nil)
 
 	// 6. Tuple snapshot: capture pre-update state for rollback.
 	tupleState, snapshotOK := m.snapshotTupleBeforeUpdate(ctx, state, appInst, primary)
@@ -2475,10 +2492,14 @@ func (m *AppManager) updateServiceModeImage(
 		log.Printf("WARN: update %s: proceeding without rollback capability", instanceID)
 	}
 
+	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseRemovingContainer, 60, "Removing containers", false, nil)
+
 	// 7. Remove ALL containers (services + anchor).
 	if err := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
 		log.Printf("WARN: update %s: remove containers: %v", instanceID, err)
 	}
+
+	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseRecreatingContainer, 70, "Recreating containers", false, nil)
 
 	// 8. Recreate ALL containers (anchor + services in start order).
 	// Build rootfs map: changed services use new rootfs, unchanged use existing.
@@ -2528,6 +2549,8 @@ func (m *AppManager) updateServiceModeImage(
 		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("recreate containers after update: %w", err)
 	}
+
+	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseFinalizing, 90, "Saving state", false, nil)
 
 	// 9. Update state: ActiveRootfs for changed services, definition, container IDs.
 	if appInst.ActiveRootfs == nil {
@@ -2725,9 +2748,30 @@ func (m *AppManager) RollbackToSnapshot(ctx context.Context, instanceID string) 
 	return m.rollbackToSnapshotLocked(ctx, state, appInst)
 }
 
+// HasSnapshotAvailable returns whether a rollback snapshot exists for the given app instance.
+func (m *AppManager) HasSnapshotAvailable(ctx context.Context, instanceID string) bool {
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return false
+	}
+	ts, err := state.LoadTupleState(instanceID)
+	if err != nil || ts == nil {
+		return false
+	}
+	return ts.LatestSnapshot() != nil
+}
+
 // rollbackToSnapshotLocked performs the rollback. Caller holds reconcileMu.
-func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance) error {
+func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance) (err error) {
 	instanceID := appInst.InstanceID
+	m.emitProgress(ctx, taskTypeRollbackApp, instanceID, taskPhaseStopping, 0, "Stopping containers", false, nil)
+	defer func() {
+		if err != nil {
+			m.emitProgress(ctx, taskTypeRollbackApp, instanceID, taskPhaseComplete, 100, "Rollback failed", true, err)
+		} else {
+			m.emitProgress(ctx, taskTypeRollbackApp, instanceID, taskPhaseComplete, 100, "Rollback complete", true, nil)
+		}
+	}()
 
 	ts, err := state.LoadTupleState(instanceID)
 	if err != nil {
@@ -2759,6 +2803,8 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 	if err := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
 		log.Printf("WARN: rollback %s: stop containers: %v", instanceID, err)
 	}
+
+	m.emitProgress(ctx, taskTypeRollbackApp, instanceID, taskPhaseSnapshotting, 30, "Restoring data volume", false, nil)
 
 	// 2. Rollback data volume if snapshot has one.
 	dataVolumeOK := true
@@ -2843,6 +2889,14 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 	}
 	appInst.UpdatedAt = time.Now()
 
+	// Restore pre-update definition (best-effort)
+	if prevDef, defErr := state.GetPreviousAppDefinition(instanceID); defErr == nil {
+		appInst.Definition = prevDef
+		curDef = prevDef // ensure container recreation uses restored definition
+	} else {
+		log.Printf("WARN: rollback %s: no previous definition to restore: %v", instanceID, defErr)
+	}
+
 	// 5. Persist state BEFORE container creation — ensures metadata matches LV reality
 	// even if subsequent steps fail.
 	if err := state.StoreTupleState(instanceID, ts); err != nil {
@@ -2882,6 +2936,8 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 			return fmt.Errorf("rollback %s: allocate endpoints: %w", instanceID, allocErr)
 		}
 	}
+
+	m.emitProgress(ctx, taskTypeRollbackApp, instanceID, taskPhaseRecreatingContainer, 60, "Recreating containers", false, nil)
 
 	// 9. Attach snapshot rootfs and recreate containers.
 	rootfs := m.currentRootfsManager()

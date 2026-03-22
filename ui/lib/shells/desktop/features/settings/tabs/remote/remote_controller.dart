@@ -135,8 +135,8 @@ class RemoteController extends ChangeNotifier {
       status = remoteResult;
       error = null;
       isLocked = false;
-      _computePortals();
       await _fetchLists();
+      _computePortals();
     } on Object catch (e) {
       if (e is ApiException && e.statusCode == 423) {
         isLocked = true;
@@ -175,15 +175,31 @@ class RemoteController extends ChangeNotifier {
   void _computePortals() {
     final result = <Portal>[];
 
-    // Namek portal (primary — listed first)
+    // Namek portals — both custom and slug hostnames when both are active.
     final ids = identityStatus;
     if (ids != null && ids.state == 'active' && ids.nexusEndpoints.isNotEmpty) {
-      result.add(Portal(
-        source: PortalSource.namek,
-        hostname: ids.resolvedHostname ?? '',
-        state: 'active',
-        endpoint: ids.nexusEndpoints.isNotEmpty ? ids.nexusEndpoints.first : null,
-      ));
+      final customFqdn = ids.resolvedHostname;
+      final slug = ids.hostname;
+      final hasCustom = customFqdn != null && customFqdn != slug;
+
+      // Custom hostname portal (listed first when set)
+      if (hasCustom) {
+        result.add(Portal(
+          source: PortalSource.namek,
+          hostname: customFqdn,
+          state: _namekCertState(isCustom: true),
+          endpoints: ids.nexusEndpoints,
+        ));
+      }
+      // Slug hostname portal (always present)
+      if (slug != null && slug.isNotEmpty) {
+        result.add(Portal(
+          source: PortalSource.namek,
+          hostname: slug,
+          state: _namekCertState(isCustom: false),
+          endpoints: ids.nexusEndpoints,
+        ));
+      }
     }
 
     // Self-hosted portal
@@ -193,11 +209,27 @@ class RemoteController extends ChangeNotifier {
         source: PortalSource.selfHosted,
         hostname: st.portalHostname!,
         state: st.state,
-        endpoint: st.endpoint,
+        endpoints: st.endpoint != null ? [st.endpoint!] : [],
       ));
     }
 
     portals = result;
+  }
+
+  /// Derives managed portal state from namek certificate health.
+  String _namekCertState({required bool isCustom}) {
+    final certs = status?.certificates;
+    if (certs == null || certs.isEmpty) return 'active';
+    final prefix = isCustom ? 'namek-custom-' : 'namek-';
+    final relevant = certs.where((c) =>
+        c.id.startsWith(prefix) &&
+        (isCustom || !c.id.startsWith('namek-custom-')));
+    final hasError = relevant.any((c) => c.status == 'error');
+    final now = DateTime.now();
+    final hasRetry = relevant.any((c) => c.status == 'error' && c.retryAt != null && c.retryAt!.isAfter(now));
+    if (hasRetry) return 'warning';
+    if (hasError) return 'error';
+    return 'active';
   }
 
   Future<void> _fetchLists() async {

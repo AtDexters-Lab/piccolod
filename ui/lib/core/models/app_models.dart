@@ -194,10 +194,12 @@ class AppDetail {
     required this.app,
     this.listeners = const [],
     this.containers = const [],
+    this.snapshotAvailable = false,
   });
   final App app;
   final List<ServiceEndpoint> listeners;
   final List<AppContainerStatus> containers;
+  final bool snapshotAvailable;
 }
 
 class AppContainerStatus {
@@ -331,6 +333,7 @@ class ServiceEndpoint {
     this.middleware = const [],
     this.auth,
     this.portClaim,
+    this.remoteHosts = const [],
   });
 
   factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
@@ -362,6 +365,9 @@ class ServiceEndpoint {
           ? Map<String, dynamic>.from(json['auth'] as Map)
           : null,
       portClaim: json['port_claim'] as int?,
+      remoteHosts: json['remote_hosts'] is List
+          ? (json['remote_hosts'] as List).whereType<String>().toList()
+          : [],
     );
   }
   final String app;
@@ -382,12 +388,16 @@ class ServiceEndpoint {
   final List<dynamic> middleware;
   final Map<String, dynamic>? auth;
   final int? portClaim;
+  final List<String> remoteHosts;
 
   // Helper to get the Remote URL (if enabled)
   String? get remoteUrl {
     if (remoteHost == null || remoteHost!.isEmpty) return null;
     return 'https://$remoteHost';
   }
+
+  // All remote URLs across all active portals (derived from remoteHosts, computed once)
+  late final List<String> remoteUrls = remoteHosts.map((h) => 'https://$h').toList();
 }
 
 class CatalogItem {

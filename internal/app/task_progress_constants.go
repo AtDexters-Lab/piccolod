@@ -6,6 +6,8 @@ const (
 	taskTypeStopApp         = "stop_app"
 	taskTypeUninstallApp    = "uninstall_app"
 	taskTypeUpdateListeners = "update_listeners"
+	taskTypeUpdateImage     = "update_image"
+	taskTypeRollbackApp     = "rollback_app"
 )
 
 const (
@@ -23,6 +25,10 @@ const (
 	taskPhaseStopping            = "stopping"
 	taskPhaseUpdatingServices    = "updating_services"
 	taskPhaseValidating          = "validating"
+
+	// Update-specific phases
+	taskPhaseSnapshotting   = "snapshotting"
+	taskPhaseCreatingRootfs = "creating_rootfs"
 
 	// Workspace disk phases
 	taskPhaseMountingWorkspace   = "mounting_workspace"

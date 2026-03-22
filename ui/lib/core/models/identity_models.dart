@@ -58,8 +58,8 @@ class IdentityStatus {
   /// Computed state matching backend's Status().State logic.
   String get state {
     if (suspended) return 'suspended';
-    if (!enrolled) return 'not_enrolled';
     if (!enabled) return 'disabled';
+    if (!enrolled) return 'not_enrolled';
     return 'active';
   }
 }

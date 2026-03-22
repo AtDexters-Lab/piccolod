@@ -72,6 +72,43 @@ func TestValidateListenerName(t *testing.T) {
 	}
 }
 
+func TestValidateListenerNameFormat(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		// Format-valid names (including reserved names — allowed for non-primary)
+		{"valid simple", "web", false},
+		{"valid metrics", "metrics", false},
+		{"reserved api", "api", false},
+		{"reserved admin", "admin", false},
+		{"reserved www", "www", false},
+		{"reserved root", "root", false},
+		{"reserved system", "system", false},
+		{"reserved piccolo", "piccolo", false},
+		{"reserved piccoloos", "piccoloos", false},
+		{"valid single char", "a", false},
+		{"valid max length", "abcdefghij123456", false},
+
+		// Invalid format
+		{"empty", "", true},
+		{"too long", "abcdefghij1234567", true},
+		{"starts with number", "8080", true},
+		{"contains hyphen", "my-listener", true},
+		{"contains uppercase", "MyApp", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateListenerNameFormat(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateListenerNameFormat(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestDeriveHostLabel(t *testing.T) {
 	tests := []struct {
 		name     string
