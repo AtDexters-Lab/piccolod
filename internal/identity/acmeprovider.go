@@ -3,6 +3,7 @@ package identity
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/AtDexters-Lab/namek-server/pkg/namekclient"
@@ -24,10 +25,9 @@ func NewNamekACMEClient(clientFn func() *namekclient.Client) *NamekACMEClient {
 }
 
 // SetTXTRecord creates a DNS-01 ACME challenge via namekclient.
-// The fqdn parameter is not forwarded — namekclient.CreateACMEChallenge infers the
-// target hostname from the device's enrolled identity, creating the TXT record at
-// _acme-challenge.<canonical-hostname>. This works for both portal and wildcard certs
-// since both use the same canonical hostname for ACME validation.
+// The fqdn from lego (e.g. "_acme-challenge.mydevice.example.com.") is stripped to
+// extract the target hostname and forwarded to the server, so the TXT record is created
+// at the correct FQDN for both canonical and custom hostnames.
 // Multiple calls for the same fqdn (e.g., wildcard + base domain) append challenge IDs
 // so all can be cleaned up.
 func (c *NamekACMEClient) SetTXTRecord(ctx context.Context, fqdn, value string) error {
@@ -35,7 +35,8 @@ func (c *NamekACMEClient) SetTXTRecord(ctx context.Context, fqdn, value string) 
 	if nc == nil {
 		return fmt.Errorf("namek client not enrolled")
 	}
-	result, err := nc.CreateACMEChallenge(ctx, value)
+	hostname := extractHostname(fqdn)
+	result, err := nc.CreateACMEChallenge(ctx, value, hostname)
 	if err != nil {
 		return err
 	}
@@ -43,6 +44,17 @@ func (c *NamekACMEClient) SetTXTRecord(ctx context.Context, fqdn, value string) 
 	c.challenges[fqdn] = append(c.challenges[fqdn], result.ID)
 	c.mu.Unlock()
 	return nil
+}
+
+// extractHostname strips the "_acme-challenge." prefix and trailing dot from a
+// lego-provided FQDN, returning the bare hostname for the server. Returns empty
+// string if the prefix is missing (server will default to canonical hostname).
+func extractHostname(fqdn string) string {
+	h, found := strings.CutPrefix(fqdn, "_acme-challenge.")
+	if !found {
+		return ""
+	}
+	return strings.TrimSuffix(h, ".")
 }
 
 func (c *NamekACMEClient) DeleteTXTRecord(ctx context.Context, fqdn string) error {
