@@ -342,8 +342,9 @@ type Session struct {
 	CSRF            string
 	ExpiresAt       int64  // unix seconds
 	Audience        string // RFC 20260122 §6.2: "portal" | "app:<appname>" - binds session to specific context
-	BoundOrigin     string // RFC 20260122 §6.2: Canonical origin (scheme://host[:port]) - prevents cross-origin replay
-	ParentSessionID string // RFC 20260122 §6.3: For app sessions, ID of portal session that authorized this session
+	BoundOrigin         string // RFC 20260122 §6.2: Canonical origin (scheme://host[:port]) - prevents cross-origin replay
+	ParentSessionID     string // RFC 20260122 §6.3: For app sessions, ID of portal session that authorized this session
+	MustRegisterPasskey bool   // Set during bootstrap login over remote — user must register a passkey
 }
 
 type SessionStore struct {
