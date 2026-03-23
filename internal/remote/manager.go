@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptoRand "crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -168,6 +169,7 @@ type PreflightResult struct {
 
 type dialer interface {
 	DialTimeout(network, address string, timeout time.Duration) (net.Conn, error)
+	DialTLS(network, address, serverName string, timeout time.Duration) (net.Conn, error)
 }
 
 type resolver interface {
@@ -424,6 +426,11 @@ func (netDialer) DialTimeout(network, address string, timeout time.Duration) (ne
 	var d net.Dialer
 	d.Timeout = timeout
 	return d.Dial(network, address)
+}
+
+func (netDialer) DialTLS(network, address, serverName string, timeout time.Duration) (net.Conn, error) {
+	d := &net.Dialer{Timeout: timeout}
+	return tls.DialWithDialer(d, network, address, &tls.Config{ServerName: serverName})
 }
 
 type netResolver struct{}
@@ -898,8 +905,18 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	// Assume preflight passed during setup wizard; prevent immediate warning state
 	cfg.LastPreflight = &now
 	// Queue background ACME issuance and surface events/inventory.
-	// User-managed mode only issues portal cert (no wildcard)
+	// User-managed mode only issues portal cert (no wildcard).
+	// HTTP-01 requires the relay tunnel to be up so Let's Encrypt can reach
+	// the device. The adapter starts asynchronously, so we set a near-future
+	// NextRenewal to let the scheduler pick it up after the tunnel connects.
+	// This is persisted, so it survives restarts — unlike an in-memory timer.
 	newCerts := defaultCertificates(cfg, now)
+	deferredRenewal := now.Add(30 * time.Second)
+	for i := range newCerts {
+		if newCerts[i].ID == "portal" {
+			newCerts[i].NextRenewal = &deferredRenewal
+		}
+	}
 	for _, c := range existingCerts {
 		if c.ID == "portal" || c.ID == "wildcard" {
 			continue
@@ -919,12 +936,9 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	}
 
 	log.Printf("remote: configured (solver=http-01, portal=%s)", portalHost)
-
-	// Queue issuance jobs after releasing lock (enqueueIssuanceJob acquires its own lock).
-	// Force=true because defaultCertificates seeds optimistic "ok" entries; without force the
-	// duplicate guard would skip issuance since NextRenewal is in the future.
-	// User-managed mode only issues portal cert (no wildcard - HTTP-01 doesn't support it)
-	m.enqueueIssuanceJob(issuanceJob{id: "portal", domains: []string{portalHost}, commonName: portalHost, force: true})
+	// Wake the scheduler so it re-evaluates with the near-future NextRenewal.
+	// Without this, an already-running scheduler could sleep up to 1 hour.
+	m.notifySchedulerWake()
 	return nil
 }
 
@@ -2730,15 +2744,40 @@ func (m *Manager) checkEndpoint(cfg *Config) PreflightCheck {
 	}
 	address := net.JoinHostPort(host, port)
 	start := time.Now()
-	conn, err := m.dialer.DialTimeout("tcp", address, 5*time.Second)
+
+	var conn net.Conn
+	var err error
+	if endpointUsesTLS(cfg.Endpoint) {
+		conn, err = m.dialer.DialTLS("tcp", address, host, 5*time.Second)
+	} else {
+		conn, err = m.dialer.DialTimeout("tcp", address, 5*time.Second)
+	}
 	if err != nil {
-		return PreflightCheck{Name: "Nexus endpoint reachable", Status: "fail", Detail: err.Error(), NextStep: "Verify firewall and DNS"}
+		nextStep := "Verify firewall and DNS"
+		var hostnameErr x509.HostnameError
+		var certInvalidErr x509.CertificateInvalidError
+		var unknownAuthErr x509.UnknownAuthorityError
+		detail := err.Error()
+		if errors.As(err, &hostnameErr) || errors.As(err, &certInvalidErr) || errors.As(err, &unknownAuthErr) ||
+			strings.Contains(detail, "tls:") || strings.Contains(detail, "x509:") {
+			nextStep = "Verify the relay's TLS certificate matches the endpoint hostname"
+		}
+		return PreflightCheck{Name: "Nexus endpoint reachable", Status: "fail", Detail: detail, NextStep: nextStep}
 	}
 	latency := int(time.Since(start).Milliseconds())
 	_ = conn.Close()
 	cfg.LastHandshake = m.now()
 	cfg.LatencyMS = latency
 	return PreflightCheck{Name: "Nexus endpoint reachable", Status: "pass", Detail: fmt.Sprintf("Latency %d ms", latency)}
+}
+
+// endpointUsesTLS reports whether the endpoint URL implies a TLS connection.
+func endpointUsesTLS(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "wss" || u.Scheme == "https"
 }
 
 func (m *Manager) checkDNS(cfg *Config) (string, string) {

@@ -2,6 +2,7 @@ package remote
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"net"
 	"strings"
@@ -16,13 +17,21 @@ type stubDialer struct {
 	err error
 }
 
-func (s *stubDialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+func (s *stubDialer) dial() (net.Conn, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
 	c1, c2 := net.Pipe()
 	_ = c2.Close()
 	return c1, nil
+}
+
+func (s *stubDialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	return s.dial()
+}
+
+func (s *stubDialer) DialTLS(network, address, serverName string, timeout time.Duration) (net.Conn, error) {
+	return s.dial()
 }
 
 type stubResolver struct {
@@ -316,6 +325,132 @@ func TestConfigure_HTTP01NoWildcard(t *testing.T) {
 		if c.ID == "wildcard" {
 			t.Fatalf("unexpected wildcard certificate in HTTP-01 mode")
 		}
+	}
+}
+
+func TestEndpointUsesTLS(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     bool
+	}{
+		{"wss://relay.example.com:8443/connect", true},
+		{"https://relay.example.com/connect", true},
+		{"ws://relay.example.com:8080/connect", false},
+		{"http://relay.example.com/connect", false},
+		{"", false}, // empty has no scheme
+	}
+	for _, tc := range tests {
+		if got := endpointUsesTLS(tc.endpoint); got != tc.want {
+			t.Errorf("endpointUsesTLS(%q) = %v, want %v", tc.endpoint, got, tc.want)
+		}
+	}
+}
+
+func TestCheckEndpoint_TLSError(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	dial := &stubDialer{err: errors.New("tls: certificate is valid for nxs.other.com, not relay.example.com")}
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, dial, &stubResolver{}, fixedNow(time.Unix(6, 0)))
+
+	cfg := &Config{NexusConfig: NexusConfig{
+		Endpoint:       "wss://relay.example.com:8443/connect",
+		PortalHostname: "portal.example.com",
+		Solver:         "http-01",
+	}}
+
+	check := m.checkEndpoint(cfg)
+	if check.Status != "fail" {
+		t.Fatalf("expected fail, got %s", check.Status)
+	}
+	if check.NextStep != "Verify the relay's TLS certificate matches the endpoint hostname" {
+		t.Fatalf("expected TLS-specific next step, got %q", check.NextStep)
+	}
+}
+
+func TestCheckEndpoint_TypedTLSError(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	dial := &stubDialer{err: x509.HostnameError{
+		Host:        "relay.example.com",
+		Certificate: &x509.Certificate{DNSNames: []string{"nxs.other.com"}},
+	}}
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, dial, &stubResolver{}, fixedNow(time.Unix(6, 0)))
+
+	cfg := &Config{NexusConfig: NexusConfig{
+		Endpoint:       "wss://relay.example.com:8443/connect",
+		PortalHostname: "portal.example.com",
+		Solver:         "http-01",
+	}}
+
+	check := m.checkEndpoint(cfg)
+	if check.Status != "fail" {
+		t.Fatalf("expected fail, got %s", check.Status)
+	}
+	if check.NextStep != "Verify the relay's TLS certificate matches the endpoint hostname" {
+		t.Fatalf("expected TLS-specific next step for typed error, got %q", check.NextStep)
+	}
+}
+
+func TestCheckEndpoint_NonTLSEndpoint(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	dial := &stubDialer{}
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, dial, &stubResolver{}, fixedNow(time.Unix(7, 0)))
+
+	cfg := &Config{NexusConfig: NexusConfig{
+		Endpoint:       "ws://relay.example.com:8080/connect",
+		PortalHostname: "portal.example.com",
+		Solver:         "http-01",
+	}}
+
+	check := m.checkEndpoint(cfg)
+	if check.Status != "pass" {
+		t.Fatalf("expected pass for non-TLS endpoint, got %s: %s", check.Status, check.Detail)
+	}
+}
+
+func TestConfigure_HTTP01DefersIssuance(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(8, 0)))
+
+	if err := m.Configure(ConfigureRequest{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		PortalHostname: "portal.example.com",
+	}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	// Immediately after Configure, the portal cert should still be at its
+	// seeded "ok" status — ACME issuance is deferred, not immediate.
+	var found bool
+	for _, c := range m.ListCertificates() {
+		if c.ID == "portal" {
+			found = true
+			if !strings.EqualFold(c.Status, "ok") {
+				t.Fatalf("portal cert should be 'ok' (seeded) immediately after Configure, got %q (issuance should be deferred)", c.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("portal cert not found after Configure")
 	}
 }
 
