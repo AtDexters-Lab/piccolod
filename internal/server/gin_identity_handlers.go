@@ -36,16 +36,20 @@ func (s *GinServer) handleIdentityStatus(c *gin.Context) {
 // REST handler and WebSocket snapshot. Kept in one place to avoid drift.
 func buildIdentityPayload(svc *identity.Service) map[string]any {
 	cfg := svc.DeviceConfig()
+	status := svc.Status()
 	return map[string]any{
 		"enabled":         cfg.Enabled,
 		"available":       svc.IsAvailable(),
 		"enrolled":        svc.IsEnrolled(),
 		"suspended":       svc.IsSuspended(),
+		"state":           status.State,
 		"device_id":       cfg.DeviceID,
+		"account_id":      cfg.AccountID,
 		"hostname":        cfg.Hostname,
 		"base_domain":     cfg.BaseDomain,
 		"custom_hostname": cfg.CustomHostname,
 		"identity_class":  cfg.IdentityClass,
+		"recovery_status": status.RecoveryStatus,
 		"nexus_endpoints": cfg.NexusEndpoints,
 		"namek_url":       cfg.NamekURL,
 	}

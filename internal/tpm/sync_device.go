@@ -59,6 +59,15 @@ func (d *syncDevice) Quote(nonce string) (string, error) {
 	return d.inner.Quote(nonce)
 }
 
+func (d *syncDevice) QuoteOverData(data []byte) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return "", errDeviceClosed
+	}
+	return d.inner.QuoteOverData(data)
+}
+
 func (d *syncDevice) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()

@@ -8,6 +8,7 @@ type Config struct {
 	Enabled        bool     `json:"enabled"`
 	NamekURL       string   `json:"namek_url"`
 	DeviceID       string   `json:"device_id,omitempty"`
+	AccountID      string   `json:"account_id,omitempty"`
 	Hostname       string   `json:"hostname,omitempty"`          // full FQDN: slug.baseDomain
 	BaseDomain     string   `json:"base_domain,omitempty"`       // extracted from Hostname
 	CustomHostname string   `json:"custom_hostname,omitempty"`   // label only (e.g., "mydevice")
