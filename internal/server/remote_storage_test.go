@@ -40,34 +40,72 @@ func prepareBootstrapMount(t *testing.T, dir string) {
 	}
 }
 
-func TestBootstrapRemoteStorage_LoadFromFile(t *testing.T) {
+func TestBootstrapRemoteStorage_LoadSplitFiles(t *testing.T) {
 	dir := t.TempDir()
 	prepareBootstrapMount(t, dir)
 	storage := newBootstrapRemoteStorage(nil, dir)
 
-	want := remote.Config{Endpoint: "wss://nexus.example.com/connect"}
-	data, _ := json.Marshal(want)
-	path := filepath.Join(dir, "remote", "config.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	remoteDir := filepath.Join(dir, "remote")
+	_ = os.MkdirAll(remoteDir, 0o700)
+
+	nexus := remote.NexusConfig{Endpoint: "wss://nexus.example.com", Enabled: true}
+	certs := remote.CertInventory{Certificates: []remote.Certificate{{ID: "c1", Status: "ok"}}}
+	events := remote.EventLog{Events: []remote.Event{{Level: "info", Message: "hi"}}}
+
+	writeJSON(t, filepath.Join(remoteDir, "nexus.json"), nexus)
+	writeJSON(t, filepath.Join(remoteDir, "certificates.json"), certs)
+	writeJSON(t, filepath.Join(remoteDir, "events.json"), events)
 
 	got, err := storage.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if got.Endpoint != want.Endpoint {
-		t.Fatalf("expected %s, got %s", want.Endpoint, got.Endpoint)
+	if got.Endpoint != nexus.Endpoint {
+		t.Fatalf("expected endpoint %s, got %s", nexus.Endpoint, got.Endpoint)
+	}
+	if !got.Enabled {
+		t.Fatalf("expected enabled=true")
+	}
+	if len(got.Certificates) != 1 || got.Certificates[0].ID != "c1" {
+		t.Fatalf("expected cert c1, got %v", got.Certificates)
+	}
+	if len(got.Events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(got.Events))
+	}
+}
+
+func TestBootstrapRemoteStorage_LoadPartialFiles(t *testing.T) {
+	dir := t.TempDir()
+	prepareBootstrapMount(t, dir)
+	storage := newBootstrapRemoteStorage(nil, dir)
+
+	remoteDir := filepath.Join(dir, "remote")
+	_ = os.MkdirAll(remoteDir, 0o700)
+
+	// Only write nexus.json — certs and events should be zero-valued.
+	nexus := remote.NexusConfig{Endpoint: "wss://test"}
+	writeJSON(t, filepath.Join(remoteDir, "nexus.json"), nexus)
+
+	got, err := storage.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got.Endpoint != "wss://test" {
+		t.Fatalf("expected wss://test, got %s", got.Endpoint)
+	}
+	if len(got.Certificates) != 0 {
+		t.Fatalf("expected 0 certs, got %d", len(got.Certificates))
+	}
+	if len(got.Events) != 0 {
+		t.Fatalf("expected 0 events, got %d", len(got.Events))
 	}
 }
 
 func TestBootstrapRemoteStorage_LoadFallbackRepo(t *testing.T) {
 	dir := t.TempDir()
 	prepareBootstrapMount(t, dir)
-	want := remote.Config{Endpoint: "wss://nexus.example.com/connect"}
+	want := remote.Config{}
+	want.Endpoint = "wss://nexus.example.com/connect"
 	payload, _ := json.Marshal(want)
 	repo := &stubRemoteRepo{cfg: persistence.RemoteConfig{Payload: payload}}
 	storage := newBootstrapRemoteStorage(repo, dir)
@@ -79,124 +117,145 @@ func TestBootstrapRemoteStorage_LoadFallbackRepo(t *testing.T) {
 	if got.Endpoint != want.Endpoint {
 		t.Fatalf("expected %s, got %s", want.Endpoint, got.Endpoint)
 	}
-	// file should now exist
-	if _, err := os.Stat(filepath.Join(dir, "remote", "config.json")); err != nil {
-		t.Fatalf("expected bootstrap file seeded, stat err=%v", err)
+	// Split files should be seeded.
+	if _, err := os.Stat(filepath.Join(dir, "remote", "nexus.json")); err != nil {
+		t.Fatalf("expected nexus.json seeded, stat err=%v", err)
 	}
 }
 
-func TestBootstrapRemoteStorage_LoadCorruptedFileFallsBack(t *testing.T) {
-	dir := t.TempDir()
-	prepareBootstrapMount(t, dir)
-	path := filepath.Join(dir, "remote", "config.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(path, []byte("not-json"), 0o600); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	want := remote.Config{Endpoint: "wss://bootstrap.example.com"}
-	payload, _ := json.Marshal(want)
-	repo := &stubRemoteRepo{cfg: persistence.RemoteConfig{Payload: payload}}
-	storage := newBootstrapRemoteStorage(repo, dir)
-
-	got, err := storage.Load(context.Background())
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if got.Endpoint != want.Endpoint {
-		t.Fatalf("expected %s, got %s", want.Endpoint, got.Endpoint)
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected file reseeded, stat err=%v", err)
-	}
-}
-
-func TestBootstrapRemoteStorage_SaveWritesFileAndRepo(t *testing.T) {
-	dir := t.TempDir()
-	prepareBootstrapMount(t, dir)
-	storage := newBootstrapRemoteStorage(nil, dir)
-	want := remote.Config{Endpoint: "wss://nexus.example.com/connect"}
-
-	if err := storage.Save(context.Background(), want); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	path := filepath.Join(dir, "remote", "config.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read file: %v", err)
-	}
-	var fromFile remote.Config
-	if err := json.Unmarshal(data, &fromFile); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if fromFile.Endpoint != want.Endpoint {
-		t.Fatalf("expected %s, got %s", want.Endpoint, fromFile.Endpoint)
-	}
-}
-
-func TestBootstrapRemoteStorage_SavePersistsRepo(t *testing.T) {
+func TestBootstrapRemoteStorage_SaveNexusWritesFileAndRepo(t *testing.T) {
 	dir := t.TempDir()
 	prepareBootstrapMount(t, dir)
 	repo := &stubRemoteRepo{}
 	storage := newBootstrapRemoteStorage(repo, dir)
-	want := remote.Config{
-		Endpoint:     "wss://nexus.example.com/connect",
-		DeviceSecret: "test-secret",
-	}
 
-	if err := storage.Save(context.Background(), want); err != nil {
+	nexus := remote.NexusConfig{Endpoint: "wss://nexus.example.com/connect", DeviceSecret: "s"}
+	certs := remote.CertInventory{Certificates: []remote.Certificate{{ID: "c1"}}}
+
+	if err := storage.SaveNexus(context.Background(), nexus, certs); err != nil {
 		t.Fatalf("save: %v", err)
 	}
+	// nexus.json should exist.
+	data, err := os.ReadFile(filepath.Join(dir, "remote", "nexus.json"))
+	if err != nil {
+		t.Fatalf("read nexus.json: %v", err)
+	}
+	var fromFile remote.NexusConfig
+	if err := json.Unmarshal(data, &fromFile); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if fromFile.Endpoint != nexus.Endpoint {
+		t.Fatalf("expected %s, got %s", nexus.Endpoint, fromFile.Endpoint)
+	}
+	// Repo should have nexus+certs blob.
 	if repo.saveCalls != 1 {
-		t.Fatalf("expected repo save to be called once, got %d", repo.saveCalls)
+		t.Fatalf("expected 1 repo save, got %d", repo.saveCalls)
 	}
 	var repoCfg remote.Config
 	if err := json.Unmarshal(repo.saved.Payload, &repoCfg); err != nil {
-		t.Fatalf("repo payload invalid json: %v", err)
+		t.Fatalf("repo payload invalid: %v", err)
 	}
-	if repoCfg.Endpoint != want.Endpoint {
-		t.Fatalf("expected repo endpoint %s, got %s", want.Endpoint, repoCfg.Endpoint)
+	if repoCfg.Endpoint != nexus.Endpoint {
+		t.Fatalf("repo endpoint: expected %s, got %s", nexus.Endpoint, repoCfg.Endpoint)
 	}
-
-	path := filepath.Join(dir, "remote", "config.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read file: %v", err)
-	}
-	if string(data) == "" {
-		t.Fatalf("expected bootstrap file to be written")
+	if len(repoCfg.Certificates) != 1 {
+		t.Fatalf("repo certs: expected 1, got %d", len(repoCfg.Certificates))
 	}
 }
 
-func TestBootstrapRemoteStorage_SaveRepoLocked(t *testing.T) {
+func TestBootstrapRemoteStorage_SaveCertsWritesFileAndRepo(t *testing.T) {
+	dir := t.TempDir()
+	prepareBootstrapMount(t, dir)
+	repo := &stubRemoteRepo{}
+	storage := newBootstrapRemoteStorage(repo, dir)
+
+	nexus := remote.NexusConfig{Endpoint: "wss://test"}
+	certs := remote.CertInventory{Certificates: []remote.Certificate{{ID: "c1", Status: "ok"}}}
+
+	if err := storage.SaveCerts(context.Background(), nexus, certs); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "remote", "certificates.json"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var fromFile remote.CertInventory
+	if err := json.Unmarshal(data, &fromFile); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(fromFile.Certificates) != 1 {
+		t.Fatalf("expected 1 cert, got %d", len(fromFile.Certificates))
+	}
+	if repo.saveCalls != 1 {
+		t.Fatalf("expected 1 repo save, got %d", repo.saveCalls)
+	}
+}
+
+func TestBootstrapRemoteStorage_SaveEventsNoRepo(t *testing.T) {
+	dir := t.TempDir()
+	prepareBootstrapMount(t, dir)
+	repo := &stubRemoteRepo{}
+	storage := newBootstrapRemoteStorage(repo, dir)
+
+	events := remote.EventLog{Events: []remote.Event{{Level: "info", Message: "test"}}}
+	if err := storage.SaveEvents(context.Background(), events); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	// events.json should exist.
+	data, err := os.ReadFile(filepath.Join(dir, "remote", "events.json"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var fromFile remote.EventLog
+	if err := json.Unmarshal(data, &fromFile); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(fromFile.Events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(fromFile.Events))
+	}
+	// Repo should NOT be touched.
+	if repo.saveCalls != 0 {
+		t.Fatalf("expected 0 repo saves for events, got %d", repo.saveCalls)
+	}
+}
+
+func TestBootstrapRemoteStorage_SaveEventsNotMounted(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nonexistent")
+	storage := newBootstrapRemoteStorage(nil, dir)
+
+	events := remote.EventLog{Events: []remote.Event{{Level: "info"}}}
+	// Should silently succeed when not mounted (events are best-effort).
+	if err := storage.SaveEvents(context.Background(), events); err != nil {
+		t.Fatalf("expected nil error for unmounted event save, got %v", err)
+	}
+}
+
+func TestBootstrapRemoteStorage_SaveNexusRepoLocked(t *testing.T) {
 	dir := t.TempDir()
 	prepareBootstrapMount(t, dir)
 	repo := &stubRemoteRepo{err: persistence.ErrLocked}
 	storage := newBootstrapRemoteStorage(repo, dir)
-	cfg := remote.Config{Endpoint: "wss://nexus.example.com/connect"}
 
-	err := storage.Save(context.Background(), cfg)
+	nexus := remote.NexusConfig{Endpoint: "wss://test"}
+	certs := remote.CertInventory{}
+	err := storage.SaveNexus(context.Background(), nexus, certs)
 	if !errors.Is(err, remote.ErrLocked) {
 		t.Fatalf("expected remote.ErrLocked, got %v", err)
 	}
-	if repo.saveCalls != 1 {
-		t.Fatalf("expected repo save to be attempted once, got %d", repo.saveCalls)
-	}
-	path := filepath.Join(dir, "remote", "config.json")
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected bootstrap file absent on locked repo, stat err=%v", err)
+	// nexus.json should NOT be written when repo is locked.
+	if _, err := os.Stat(filepath.Join(dir, "remote", "nexus.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected nexus.json absent on locked repo")
 	}
 }
 
-func TestBootstrapRemoteStorage_SaveMountNotReady(t *testing.T) {
-	// Use a nonexistent subdirectory so isMounted() returns false.
+func TestBootstrapRemoteStorage_SaveNexusMountNotReady(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nonexistent")
 	repo := &stubRemoteRepo{}
 	storage := newBootstrapRemoteStorage(repo, dir)
-	cfg := remote.Config{Endpoint: "wss://nexus.example.com/connect"}
 
-	if err := storage.Save(context.Background(), cfg); !errors.Is(err, remote.ErrLocked) {
+	nexus := remote.NexusConfig{Endpoint: "wss://test"}
+	certs := remote.CertInventory{}
+	if err := storage.SaveNexus(context.Background(), nexus, certs); !errors.Is(err, remote.ErrLocked) {
 		t.Fatalf("expected remote.ErrLocked when mount missing, got %v", err)
 	}
 	if repo.saveCalls != 0 {
@@ -205,11 +264,21 @@ func TestBootstrapRemoteStorage_SaveMountNotReady(t *testing.T) {
 }
 
 func TestBootstrapRemoteStorage_LoadMountNotReady(t *testing.T) {
-	// Use a nonexistent subdirectory so isMounted() returns false.
 	dir := filepath.Join(t.TempDir(), "nonexistent")
 	storage := newBootstrapRemoteStorage(nil, dir)
 
 	if _, err := storage.Load(context.Background()); !errors.Is(err, remote.ErrLocked) {
 		t.Fatalf("expected remote.ErrLocked when mount missing, got %v", err)
+	}
+}
+
+func writeJSON(t *testing.T, path string, v any) {
+	t.Helper()
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
 	}
 }

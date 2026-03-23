@@ -212,8 +212,16 @@ func (lockedRemoteStorage) Load(ctx context.Context) (remote.Config, error) {
 	return remote.Config{}, remote.ErrLocked
 }
 
-func (lockedRemoteStorage) Save(ctx context.Context, cfg remote.Config) error {
+func (lockedRemoteStorage) SaveNexus(_ context.Context, _ remote.NexusConfig, _ remote.CertInventory) error {
 	return remote.ErrLocked
+}
+
+func (lockedRemoteStorage) SaveCerts(_ context.Context, _ remote.NexusConfig, _ remote.CertInventory) error {
+	return remote.ErrLocked
+}
+
+func (lockedRemoteStorage) SaveEvents(_ context.Context, _ remote.EventLog) error {
+	return nil // events are best-effort
 }
 
 type toggledRemoteStorage struct {
@@ -235,13 +243,35 @@ func (s *toggledRemoteStorage) Load(ctx context.Context) (remote.Config, error) 
 	return cloneRemoteConfig(s.cfg), nil
 }
 
-func (s *toggledRemoteStorage) Save(ctx context.Context, cfg remote.Config) error {
+func (s *toggledRemoteStorage) SaveNexus(_ context.Context, nexus remote.NexusConfig, certs remote.CertInventory) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.locked {
 		return remote.ErrLocked
 	}
-	s.cfg = cloneRemoteConfig(cfg)
+	s.cfg.NexusConfig = nexus
+	s.cfg.CertInventory = certs
+	return nil
+}
+
+func (s *toggledRemoteStorage) SaveCerts(_ context.Context, nexus remote.NexusConfig, certs remote.CertInventory) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locked {
+		return remote.ErrLocked
+	}
+	s.cfg.NexusConfig = nexus
+	s.cfg.CertInventory = certs
+	return nil
+}
+
+func (s *toggledRemoteStorage) SaveEvents(_ context.Context, events remote.EventLog) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locked {
+		return remote.ErrLocked
+	}
+	s.cfg.EventLog = events
 	return nil
 }
 

@@ -34,27 +34,45 @@ import (
 	"piccolod/internal/state/paths"
 )
 
-// Config holds the persisted remote (Nexus) configuration and runtime state.
-type Config struct {
-	Endpoint       string `json:"endpoint"`
-	DeviceSecret   string `json:"device_secret"`
-	Solver         string `json:"solver"`
-	PortalHostname string `json:"portal_hostname"` // Fully-qualified hostname (e.g., portal.home.example.com)
-	Managed        bool   `json:"managed,omitempty"` // True for piccolospace managed nexus (DNS-01 via orchestrator)
-	Enabled        bool   `json:"enabled"`
-	Issuer          string            `json:"issuer,omitempty"`
-	ExpiresAt       time.Time         `json:"expires_at,omitempty"`
-	NextRenewal     time.Time         `json:"next_renewal,omitempty"`
-	LastHandshake   time.Time         `json:"last_handshake,omitempty"`
-	LatencyMS       int               `json:"latency_ms,omitempty"`
-	GuideVerifiedAt *time.Time        `json:"guide_verified_at,omitempty"`
-	LastPreflight   *time.Time        `json:"last_preflight,omitempty"`
-	Aliases         []Alias           `json:"aliases,omitempty"`
-	Certificates    []Certificate     `json:"certificates,omitempty"`
-	Events          []Event           `json:"events,omitempty"`
+// NexusConfig holds self-hosted nexus credentials, connection state, and aliases.
+// Persisted to nexus.json.
+type NexusConfig struct {
+	Endpoint             string     `json:"endpoint"`
+	DeviceSecret         string     `json:"device_secret"`
+	Solver               string     `json:"solver"`
+	PortalHostname       string     `json:"portal_hostname"`        // Fully-qualified hostname (e.g., portal.home.example.com)
+	Managed              bool       `json:"managed,omitempty"`       // True for piccolospace managed nexus (DNS-01 via orchestrator)
+	Enabled              bool       `json:"enabled"`
+	OrchestratorEndpoint string     `json:"orchestrator_endpoint,omitempty"` // Orchestrator API endpoint
+	Issuer               string     `json:"issuer,omitempty"`
+	ExpiresAt            time.Time  `json:"expires_at,omitempty"`
+	NextRenewal          time.Time  `json:"next_renewal,omitempty"`
+	LastHandshake        time.Time  `json:"last_handshake,omitempty"`
+	LatencyMS            int        `json:"latency_ms,omitempty"`
+	GuideVerifiedAt      *time.Time `json:"guide_verified_at,omitempty"`
+	LastPreflight        *time.Time `json:"last_preflight,omitempty"`
+	Aliases              []Alias    `json:"aliases,omitempty"`
+}
 
-	// Managed mode orchestrator config (not persisted as credentials)
-	OrchestratorEndpoint string `json:"orchestrator_endpoint,omitempty"` // Orchestrator API endpoint
+// CertInventory holds the shared certificate inventory across all sources.
+// Persisted to certificates.json.
+type CertInventory struct {
+	Certificates []Certificate `json:"certificates,omitempty"`
+}
+
+// EventLog holds the activity log for remote operations.
+// Persisted to events.json (bootstrap filesystem only, not encrypted repo).
+type EventLog struct {
+	Events []Event `json:"events,omitempty"`
+}
+
+// Config is the unified in-memory remote configuration.
+// Embedding preserves all existing field access (cfg.Endpoint, cfg.Events, etc.).
+// JSON marshaling produces flat output for backward compatibility.
+type Config struct {
+	NexusConfig
+	CertInventory
+	EventLog
 }
 
 
@@ -159,9 +177,13 @@ type resolver interface {
 
 var ErrLocked = errors.New("remote: storage locked")
 
+// Storage persists remote configuration to durable storage.
+// Callers MUST serialize Save* calls externally (Manager uses cfgMu for this).
 type Storage interface {
 	Load(ctx context.Context) (Config, error)
-	Save(ctx context.Context, cfg Config) error
+	SaveNexus(ctx context.Context, nexus NexusConfig, certs CertInventory) error
+	SaveCerts(ctx context.Context, nexus NexusConfig, certs CertInventory) error
+	SaveEvents(ctx context.Context, events EventLog) error
 }
 
 type Manager struct {
@@ -352,8 +374,7 @@ func (m *Manager) AppendEvent(evt Event) {
 	m.cfgMu.Lock()
 	cfg := m.currentConfigLocked()
 	m.appendEventWithRetention(cfg, evt)
-	// save() releases cfgMu.Lock() and publishes config changed.
-	_ = m.save(cfg)
+	_ = m.saveEvents(cfg)
 }
 
 // CertIssuanceRequest is the public API for enqueuing cert issuance from external sources.
@@ -417,8 +438,36 @@ func (netResolver) LookupCNAME(ctx context.Context, host string) (string, error)
 	return r.LookupCNAME(ctx, host)
 }
 
+// Split-file path helpers shared by all Storage implementations.
+func NexusPath(dir string) string  { return filepath.Join(dir, "nexus.json") }
+func CertsPath(dir string) string  { return filepath.Join(dir, "certificates.json") }
+func EventsPath(dir string) string { return filepath.Join(dir, "events.json") }
+
+// LoadSplitFiles reads the three split files from dir, assembling a Config.
+// Missing files produce zero-value sub-structs. Returns (cfg, true) if at least
+// one file was found, or (zero, false) if none exist.
+func LoadSplitFiles(dir string) (Config, bool) {
+	var cfg Config
+	var found bool
+	if data, err := os.ReadFile(NexusPath(dir)); err == nil {
+		if json.Unmarshal(data, &cfg.NexusConfig) == nil {
+			found = true
+		}
+	}
+	if data, err := os.ReadFile(CertsPath(dir)); err == nil {
+		if json.Unmarshal(data, &cfg.CertInventory) == nil {
+			found = true
+		}
+	}
+	if data, err := os.ReadFile(EventsPath(dir)); err == nil {
+		_ = json.Unmarshal(data, &cfg.EventLog)
+		found = true
+	}
+	return cfg, found
+}
+
 type fileStorage struct {
-	path string
+	dir string
 }
 
 func newFileStorage(baseDir string) (*fileStorage, error) {
@@ -429,52 +478,207 @@ func newFileStorage(baseDir string) (*fileStorage, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &fileStorage{path: filepath.Join(dir, "config.json")}, nil
+	return &fileStorage{dir: dir}, nil
 }
 
-func (s *fileStorage) Load(ctx context.Context) (Config, error) {
-	_ = ctx
-	data, err := os.ReadFile(s.path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return Config{}, nil
-		}
-		return Config{}, err
-	}
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return Config{}, err
-	}
+func (s *fileStorage) Load(_ context.Context) (Config, error) {
+	cfg, _ := LoadSplitFiles(s.dir)
 	return cfg, nil
 }
 
-func (s *fileStorage) Save(ctx context.Context, cfg Config) error {
-	_ = ctx
-	payload, err := json.MarshalIndent(&cfg, "", "  ")
+func (s *fileStorage) SaveNexus(_ context.Context, nexus NexusConfig, _ CertInventory) error {
+	payload, err := json.MarshalIndent(&nexus, "", "  ")
 	if err != nil {
 		return err
 	}
-	return fsutil.AtomicWriteFile(s.path, payload, 0o600)
+	return fsutil.AtomicWriteFile(NexusPath(s.dir), payload, 0o600)
 }
 
-// save persists the config. Caller MUST hold cfgMu.Lock() - this function
-// releases it after storage I/O completes but before post-save hooks.
-func (m *Manager) save(cfg *Config) error {
-	// Caller must hold cfgMu.Lock() when calling this function.
-	// We release it after storage operations complete.
+func (s *fileStorage) SaveCerts(_ context.Context, _ NexusConfig, certs CertInventory) error {
+	payload, err := json.MarshalIndent(&certs, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsutil.AtomicWriteFile(CertsPath(s.dir), payload, 0o600)
+}
+
+func (s *fileStorage) SaveEvents(_ context.Context, events EventLog) error {
+	payload, err := json.MarshalIndent(&events, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsutil.AtomicWriteFile(EventsPath(s.dir), payload, 0o600)
+}
+
+// saveNexus persists nexus config changes.
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Triggers: adapter state + ACME config + config change publish.
+func (m *Manager) saveNexus(cfg *Config) error {
 	if cfg == nil {
 		m.cfgMu.Unlock()
 		return errors.New("config cannot be nil")
 	}
-
-	// Storage save (JSON marshal) happens under lock to prevent races.
 	if m.storage != nil {
-		if err := m.storage.Save(context.Background(), *cfg); err != nil {
+		if err := m.storage.SaveNexus(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
 			m.cfgMu.Unlock()
 			if errors.Is(err, ErrLocked) {
 				m.needsReload.Store(true)
 			}
 			return err
+		}
+	}
+	m.cfg = cfg
+	snap := extractAdapterSnapshot(cfg)
+	m.cfgMu.Unlock()
+
+	snap = m.snapshotWithClaims(snap)
+	m.needsReload.Store(false)
+	m.applyAdapterState(snap)
+	m.updateACMEConfig(cfg)
+	m.publishConfigChanged()
+	return nil
+}
+
+// saveCerts persists certificate inventory changes.
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Triggers: config change publish only (no adapter restart, no ACME reconfig).
+func (m *Manager) saveCerts(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		if err := m.storage.SaveCerts(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+	}
+	m.cfg = cfg
+	m.cfgMu.Unlock()
+
+	m.needsReload.Store(false)
+	m.publishConfigChanged()
+	return nil
+}
+
+// saveEvents persists the event log only.
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Triggers: config change publish only (for UI event stream).
+// No adapter restart, no ACME reconfig.
+func (m *Manager) saveEvents(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		if err := m.storage.SaveEvents(context.Background(), cfg.EventLog); err != nil {
+			log.Printf("WARN: remote: event save failed: %v", err)
+		}
+	}
+	m.cfg = cfg
+	m.cfgMu.Unlock()
+	m.publishConfigChanged()
+	return nil
+}
+
+// saveNexusAndEvents persists nexus config + events.
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Triggers: adapter state + ACME config + config change publish.
+// Events are best-effort — nexus save failure is hard error, event save failure is logged.
+func (m *Manager) saveNexusAndEvents(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		if err := m.storage.SaveNexus(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+		// Event save under lock to avoid data race on the Events slice.
+		if err := m.storage.SaveEvents(context.Background(), cfg.EventLog); err != nil {
+			log.Printf("WARN: remote: event save failed: %v", err)
+		}
+	}
+	m.cfg = cfg
+	snap := extractAdapterSnapshot(cfg)
+	m.cfgMu.Unlock()
+
+	snap = m.snapshotWithClaims(snap)
+	m.needsReload.Store(false)
+	m.applyAdapterState(snap)
+	m.updateACMEConfig(cfg)
+	m.publishConfigChanged()
+	return nil
+}
+
+// saveCertsAndEvents persists certificate inventory + events.
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Triggers: config change publish only (no adapter restart, no ACME reconfig).
+// Events are best-effort.
+func (m *Manager) saveCertsAndEvents(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		if err := m.storage.SaveCerts(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+		// Event save under lock to avoid data race on the Events slice.
+		if err := m.storage.SaveEvents(context.Background(), cfg.EventLog); err != nil {
+			log.Printf("WARN: remote: event save failed: %v", err)
+		}
+	}
+	m.cfg = cfg
+	m.cfgMu.Unlock()
+
+	m.needsReload.Store(false)
+	m.publishConfigChanged()
+	return nil
+}
+
+// saveAll persists all three (nexus + certs + events).
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Used for full config changes (Configure, ConfigureManaged).
+// Triggers: adapter state + ACME config + config change publish.
+func (m *Manager) saveAll(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		// SaveNexus writes repo (nexus+certs blob) + nexus.json.
+		if err := m.storage.SaveNexus(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+		// SaveCerts writes repo again (same blob) + certificates.json.
+		// The duplicate repo write is acceptable here since saveAll is only called
+		// during Configure/ConfigureManaged which are infrequent user actions.
+		if err := m.storage.SaveCerts(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+		// Event save under lock to avoid data race on the Events slice.
+		if err := m.storage.SaveEvents(context.Background(), cfg.EventLog); err != nil {
+			log.Printf("WARN: remote: event save failed: %v", err)
 		}
 	}
 	m.cfg = cfg
@@ -710,8 +914,7 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 		Message:   "Remote configuration saved (user-managed, HTTP-01)",
 		NextStep:  "Run preflight",
 	})
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveAll(cfg); err != nil {
 		return err
 	}
 
@@ -800,8 +1003,7 @@ func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
 		Message:   "Remote configuration saved (managed, DNS-01)",
 		NextStep:  "Run preflight",
 	})
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveAll(cfg); err != nil {
 		return err
 	}
 
@@ -832,8 +1034,7 @@ func (m *Manager) Disable() error {
 		Source:    "remote",
 		Message:   "Remote access disabled",
 	})
-	// save() releases cfgMu.Lock()
-	return m.save(cfg)
+	return m.saveNexusAndEvents(cfg)
 }
 
 // Rotate generates a new secure device secret.
@@ -856,8 +1057,7 @@ func (m *Manager) Rotate() (string, error) {
 		Source:    "remote",
 		Message:   "Remote device secret rotated",
 	})
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveNexusAndEvents(cfg); err != nil {
 		return "", err
 	}
 	return newSecret, nil
@@ -909,8 +1109,7 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 		Source:    "remote",
 		Message:   fmt.Sprintf("Alias %s queued for listener %s", hostname, listener),
 	})
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveNexusAndEvents(cfg); err != nil {
 		return Alias{}, err
 	}
 	// Queue issuance for the alias hostname — always HTTP-01 (alias domains use user DNS, not namek PowerDNS)
@@ -947,8 +1146,7 @@ func (m *Manager) RemoveAlias(id string) error {
 		Source:    "remote",
 		Message:   fmt.Sprintf("Alias %s removed", removed.Hostname),
 	})
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveNexusAndEvents(cfg); err != nil {
 		return err
 	}
 	// Remove associated certificate entry and files (best-effort).
@@ -1028,8 +1226,7 @@ func (m *Manager) removeCertificateByID(id, commonName, certDir string) {
 			Source:    "remote",
 			Message:   fmt.Sprintf("Certificate removed (%s)", id),
 		})
-		// save() releases cfgMu.Lock()
-		_ = m.save(cfg)
+		_ = m.saveCertsAndEvents(cfg)
 	} else {
 		m.cfgMu.Unlock()
 	}
@@ -1713,8 +1910,7 @@ func (m *Manager) enqueueIssuanceJob(job issuanceJob) {
 		}
 	}
 	m.ensureCertPending(cfg, job.id, job.domains, now, job.source, job.solver, job.certDir)
-	// save() releases cfgMu.Lock()
-	_ = m.save(cfg)
+	_ = m.saveCertsAndEvents(cfg)
 
 	log.Printf("remote: queuing certificate issuance: %s (domains=%v, source=%s)", job.id, job.domains, job.source)
 	m.queueIssuanceJobToWorker(job)
@@ -1819,8 +2015,7 @@ func (m *Manager) processIssuance(job issuanceJob) {
 			break
 		}
 	}
-	// save() releases cfgMu.Lock()
-	_ = m.save(cfg)
+	_ = m.saveCerts(cfg)
 
 	certDir := job.certDir
 	if certDir == "" {
@@ -1987,8 +2182,7 @@ func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
 		Message:   fmt.Sprintf("Certificate issuance succeeded (%s)", id),
 		CertID:    id,
 	})
-	// save() releases cfgMu.Lock()
-	_ = m.save(cfg)
+	_ = m.saveCertsAndEvents(cfg)
 
 	// Emit certificate status change event
 	m.publishCertificateChanged(id, "ok", "", "ok")
@@ -2075,8 +2269,7 @@ func (m *Manager) updateCertFailureWithError(id string, reason string, err error
 		NextStep:  nextStepForCode(code),
 		CertID:    id,
 	})
-	// save() releases cfgMu.Lock()
-	_ = m.save(cfg)
+	_ = m.saveCertsAndEvents(cfg)
 
 	// Signal scheduler to re-evaluate wake time
 	m.notifySchedulerWake()
@@ -2428,8 +2621,7 @@ func (m *Manager) RunPreflight(candidate *Config) (PreflightResult, error) {
 			Source:    "remote",
 			Message:   "Preflight completed",
 		})
-		// save() releases cfgMu.Lock()
-		if err := m.save(cfg); err != nil {
+		if err := m.saveNexusAndEvents(cfg); err != nil {
 			return PreflightResult{}, err
 		}
 	}
@@ -2463,7 +2655,7 @@ func (m *Manager) VerifyConnection(info GuideVerification) error {
 
 	// Create a temporary config to reuse checkEndpoint logic
 	tempCfg := &Config{
-		Endpoint: endpoint,
+		NexusConfig: NexusConfig{Endpoint: endpoint},
 	}
 
 	// Perform the check
@@ -2496,8 +2688,7 @@ func (m *Manager) MarkGuideVerified(info GuideVerification) error {
 		Source:    "remote",
 		Message:   "Nexus connection verified",
 	})
-	// save() releases cfgMu.Lock()
-	return m.save(cfg)
+	return m.saveNexusAndEvents(cfg)
 }
 
 // GuideInfo returns static helper information along with verification timestamp.

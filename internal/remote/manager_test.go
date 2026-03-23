@@ -335,8 +335,7 @@ func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 		Status:   "ok",
 		Attempts: 2,
 	}}
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveAll(cfg); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -378,7 +377,7 @@ func TestEnqueueIssuanceRespectsRetryAt(t *testing.T) {
 		FailureCode:  "cert_rate_limited",
 		RetryAt:      &retryAt,
 	}}
-	if err := m.save(cfg); err != nil {
+	if err := m.saveAll(cfg); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -443,7 +442,7 @@ func TestEnqueueIssuanceReissuesOnDomainChange(t *testing.T) {
 		NextRenewal: &nextRenewal,
 		ExpiresAt:   &expires,
 	}}
-	if err := m.save(cfg); err != nil {
+	if err := m.saveAll(cfg); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
