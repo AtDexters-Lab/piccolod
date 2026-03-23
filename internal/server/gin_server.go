@@ -114,6 +114,8 @@ type GinServer struct {
 	authManager *authpkg.Manager
 	sessions    *authpkg.SessionStore
 	userManager *authpkg.UserManager
+	webauthnMgr *authpkg.WebAuthnManager
+	inviteMgr   *authpkg.InviteManager
 	// simple rate-limit counters for login failures
 	loginFailures int
 	resetFailures int
@@ -815,6 +817,10 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.sessions = authpkg.NewSessionStore()
 	s.authRepo = authRepo
 	s.userManager = authpkg.NewUserManager(persist.Control().Users())
+	if os.Getenv("PICCOLO_DISABLE_PASSKEY") != "1" {
+		s.webauthnMgr = authpkg.NewWebAuthnManager(persist.Control().WebAuthnCredentials(), false)
+		s.inviteMgr = authpkg.NewInviteManager(persist.Control().InviteTokens(), s.userManager)
+	}
 
 	// Wire proxy auth dependencies (listener auth rules enforcement happens in services.ProxyManager).
 	if svcMgr != nil {
@@ -1552,6 +1558,16 @@ func (s *GinServer) setupGinRoutes() {
 		v1.GET("/auth/initialized", s.handleAuthInitialized)
 		v1.GET("/auth/validate-next", s.handleAuthValidateNext)
 		v1.POST("/auth/login", s.handleAuthLogin)
+		v1.GET("/auth/login-options", s.handleLoginOptions)
+
+		// Passkey login (public)
+		v1.POST("/auth/passkey/login/begin", s.handlePasskeyLoginBegin)
+		v1.POST("/auth/passkey/login/finish", s.handlePasskeyLoginFinish)
+
+		// Invite (public)
+		v1.GET("/auth/invite/:token", s.handleValidateInvite)
+		v1.POST("/auth/invite/:token/passkey/begin", s.handleInvitePasskeyBegin)
+		v1.POST("/auth/invite/:token/passkey/finish", s.handleInvitePasskeyFinish)
 
 		// Onboarding endpoints (public, no auth — needed pre-setup)
 		v1.GET("/system/onboarding", s.handleOnboardingStatus)
@@ -1703,6 +1719,13 @@ func (s *GinServer) setupGinRoutes() {
 		authed.GET("/auth/csrf", s.handleAuthCSRF)
 		authed.POST("/oauth/resume", s.handleOIDCResume)
 
+		// Passkey management (authenticated)
+		authed.POST("/auth/passkey/register/begin", s.handlePasskeyRegisterBegin)
+		authed.POST("/auth/passkey/register/finish", s.handlePasskeyRegisterFinish)
+		authed.GET("/auth/passkeys", s.handleListPasskeys)
+		authed.DELETE("/auth/passkeys/:id", s.handleDeletePasskey)
+		authed.PATCH("/auth/passkeys/:id", s.handleRenamePasskey)
+
 		// UI telemetry (Admin only)
 		admin.POST("/telemetry/log", s.handleTelemetryLog)
 
@@ -1732,10 +1755,12 @@ func (s *GinServer) setupGinRoutes() {
 		{
 			users.GET("", s.handleListUsers)
 			users.POST("", s.handleCreateUser)
+			users.POST("/invite", s.handleCreateInvite)
 			users.GET("/:id", s.handleGetUser)
 			users.PUT("/:id", s.handleUpdateUser)
 			users.DELETE("/:id", s.handleDeleteUser)
 			users.POST("/:id/password", s.handleSetUserPassword)
+			users.POST("/:id/reinvite", s.handleReinviteUser)
 		}
 
 		// Catalog (read-only) - Allow standard users to view catalog?

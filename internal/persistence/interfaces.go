@@ -32,6 +32,8 @@ type ControlStore interface {
 	OIDCAuthCodes() OIDCAuthCodeRepo
 	OIDCRefreshTokens() OIDCRefreshTokenRepo
 	OIDCConfig() OIDCConfigRepo
+	WebAuthnCredentials() WebAuthnCredentialRepo
+	InviteTokens() InviteTokenRepo
 	Close(ctx context.Context) error
 	Revision(ctx context.Context) (uint64, string, error)
 	QuickCheck(ctx context.Context) (ControlHealthReport, error)
@@ -406,10 +408,62 @@ type OIDCRefreshToken struct {
 	CreatedAt time.Time
 }
 
+// WebAuthn data structures ---------------------------------------------------
+
+// WebAuthnCredential represents a stored WebAuthn credential for a user.
+type WebAuthnCredential struct {
+	ID              string    // base64url-encoded credential ID
+	UserID          string    // FK to users.id
+	PublicKey       []byte    // CBOR-encoded public key
+	AttestationType string    // e.g., "none", "packed"
+	Transports      []string  // e.g., ["internal", "usb"]
+	SignCount       uint32
+	RPID            string    // Relying Party ID this credential is bound to
+	AAGUID          []byte    // Authenticator AAGUID
+	FriendlyName    string    // User-assigned label
+	CreatedAt       time.Time
+	LastUsedAt      time.Time
+}
+
+// InviteToken represents a magic link invite for passwordless user onboarding.
+type InviteToken struct {
+	Token      string
+	UserID     string     // FK to users.id (pre-created passwordless user)
+	CreatedBy  string     // Admin user_id who created the invite
+	ExpiresAt  time.Time
+	ConsumedAt *time.Time // nil until used
+	CreatedAt  time.Time
+}
+
 // OIDCConfigRepo manages OIDC configuration like encryption keys.
 type OIDCConfigRepo interface {
 	// GetEncryptionKey returns the OIDC encryption key, or nil if not set.
 	GetEncryptionKey(ctx context.Context) ([]byte, error)
 	// SetEncryptionKey stores the OIDC encryption key.
 	SetEncryptionKey(ctx context.Context, key []byte) error
+}
+
+// WebAuthnCredentialRepo manages WebAuthn/Passkey credentials.
+type WebAuthnCredentialRepo interface {
+	Create(ctx context.Context, cred WebAuthnCredential) error
+	Get(ctx context.Context, credID string) (WebAuthnCredential, error)
+	ListByUser(ctx context.Context, userID string) ([]WebAuthnCredential, error)
+	ListByUserAndRP(ctx context.Context, userID, rpID string) ([]WebAuthnCredential, error)
+	ListByRP(ctx context.Context, rpID string) ([]WebAuthnCredential, error)
+	UpdateAfterAuth(ctx context.Context, credID string, signCount uint32, lastUsed time.Time) error
+	UpdateFriendlyName(ctx context.Context, credID, name string) error
+	Delete(ctx context.Context, credID string) error
+	DeleteByUser(ctx context.Context, userID string) error
+	CountByUser(ctx context.Context, userID string) (int, error)
+	CountByUserAndRP(ctx context.Context, userID, rpID string) (int, error)
+	CountByUserSplitRP(ctx context.Context, userID, rpID string) (total int, rpCount int, err error)
+}
+
+// InviteTokenRepo manages magic link invite tokens.
+type InviteTokenRepo interface {
+	Create(ctx context.Context, token InviteToken) error
+	Get(ctx context.Context, token string) (InviteToken, error)
+	Consume(ctx context.Context, token string) error
+	DeleteByUser(ctx context.Context, userID string) error
+	DeleteExpired(ctx context.Context) error
 }

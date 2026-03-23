@@ -88,6 +88,14 @@ func (s *stubLockableControl) OIDCConfig() OIDCConfigRepo {
 	return nil
 }
 
+func (s *stubLockableControl) WebAuthnCredentials() WebAuthnCredentialRepo {
+	return nil
+}
+
+func (s *stubLockableControl) InviteTokens() InviteTokenRepo {
+	return nil
+}
+
 func (s *stubLockableControl) Close(context.Context) error {
 	return nil
 }

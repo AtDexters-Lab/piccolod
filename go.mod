@@ -12,6 +12,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/gin-contrib/gzip v1.2.5
 	github.com/go-jose/go-jose/v4 v4.1.3
+	github.com/go-webauthn/webauthn v0.16.1
 	github.com/miekg/dns v1.1.72
 	github.com/zitadel/oidc/v3 v3.45.5
 	golang.org/x/net v0.51.0
@@ -25,10 +26,13 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/go-chi/chi/v5 v5.2.5 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-openapi/swag/jsonname v0.25.5 // indirect
+	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
+	github.com/go-webauthn/x v0.2.2 // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
@@ -44,6 +48,7 @@ require (
 	github.com/rs/cors v1.11.1 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/woodsbury/decimal128 v1.4.0 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
 	github.com/zitadel/logging v0.7.0 // indirect
 	github.com/zitadel/schema v1.3.2 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
@@ -88,7 +93,7 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.1 // indirect
 	golang.org/x/arch v0.25.0 // indirect
-	golang.org/x/crypto v0.48.0
+	golang.org/x/crypto v0.49.0
 	golang.org/x/mod v0.34.0
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/text v0.35.0 // indirect

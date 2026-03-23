@@ -180,6 +180,23 @@ func (s *GinServer) requireSession() gin.HandlerFunc {
 			s.setSessionCookie(c, id, portalSessionCookieTTL)
 		}
 
+		// Enforce MustRegisterPasskey: block all endpoints except passkey
+		// registration and session status until the user registers a passkey.
+		if sess, ok := s.sessions.Get(id); ok && sess.MustRegisterPasskey {
+			path := c.Request.URL.Path
+			if !strings.HasPrefix(path, "/api/v1/auth/passkey/register/") &&
+				!strings.HasPrefix(path, "/api/v1/auth/session") &&
+				!strings.HasPrefix(path, "/api/v1/auth/logout") &&
+				!strings.HasPrefix(path, "/api/v1/auth/csrf") {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error":   "passkey_registration_required",
+					"message": "You must register a passkey before accessing the dashboard.",
+				})
+				c.Abort()
+				return
+			}
+		}
+
 		c.Next()
 	}
 }
