@@ -50,6 +50,9 @@ class PiccoloIcons {
   static const IconData visibility = PhosphorIconsRegular.eye;
   static const IconData visibilityOff = PhosphorIconsRegular.eyeSlash;
 
+  // ---- Auth ----
+  static const IconData fingerprint = PhosphorIconsRegular.fingerprintSimple;
+
   // ---- Objects ----
   static const IconData lock = PhosphorIconsRegular.lock;
   static const IconData lockKey = PhosphorIconsRegular.lockKey;
