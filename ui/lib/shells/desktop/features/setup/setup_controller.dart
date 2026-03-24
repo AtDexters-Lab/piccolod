@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
+import 'package:piccolo_os/core/services/webauthn_service.dart';
 import 'package:web/web.dart' as web;
 
 enum SetupState {
@@ -18,6 +19,8 @@ enum SetupState {
   unlock, // Already initialized, just need password
   login, // Unlocked but needs session
   forgotPassword, // Reset password flow
+  invite, // Invite token flow (passkey registration for invited user)
+  passkeyRequired, // Must register passkey before accessing dashboard
   complete, // Done, go to desktop
   error, // API error (connectivity)
   systemError, // LUKS / system failure
@@ -28,6 +31,7 @@ class SetupController extends ChangeNotifier {
   SetupController() {
     _parseAuthRequestFromUrl();
     _parseNextFromUrl();
+    _parseInviteFromUrl();
     unawaited(_checkStatus());
   }
   SetupState _state = SetupState.loading;
@@ -64,6 +68,13 @@ class SetupController extends ChangeNotifier {
   bool _bootOrderConfigured = false;
   bool get bootOrderConfigured => _bootOrderConfigured;
 
+  // Passkey / invite state
+  List<String>? _loginMethods;
+  List<String>? get loginMethods => _loginMethods;
+
+  String? _inviteToken;
+  String? get inviteToken => _inviteToken;
+
   final ApiClient _api = ApiClient();
 
   /// Parse auth request ID from URL query parameters (for OIDC SSO flow)
@@ -90,6 +101,15 @@ class SetupController extends ChangeNotifier {
     } on Object catch (e) {
       debugPrint('Failed to parse next URL: $e');
     }
+  }
+
+  void _parseInviteFromUrl() {
+    try {
+      final token = Uri.base.queryParameters['invite'];
+      if (token != null && token.isNotEmpty) {
+        _inviteToken = token;
+      }
+    } on Object catch (_) {}
   }
 
   Future<bool> _redirectToNextIfValid() async {
@@ -188,6 +208,12 @@ class SetupController extends ChangeNotifier {
           if (session['authenticated'] == true) {
             await _api.fetchCsrfToken();
 
+            // Bootstrap passkey required?
+            if (session['must_register_passkey'] == true) {
+              _state = SetupState.passkeyRequired;
+              return;
+            }
+
             // If there's an OIDC auth request, complete it immediately
             if (_authRequestId != null) {
               await _completeOidcAuthRequest();
@@ -202,6 +228,8 @@ class SetupController extends ChangeNotifier {
             }
 
             _state = SetupState.complete;
+          } else if (_inviteToken != null) {
+            _state = SetupState.invite;
           } else {
             _state = SetupState.login;
           }
@@ -484,6 +512,14 @@ class SetupController extends ChangeNotifier {
       await _api.fetchCsrfToken();
       debugPrint('Login successful, authRequestId: $_authRequestId');
 
+      // Check if session requires passkey registration (remote bootstrap)
+      final session = await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
+      if (session['must_register_passkey'] == true) {
+        _state = SetupState.passkeyRequired;
+        notifyListeners();
+        return true;
+      }
+
       // Handle OIDC auth request if present (SSO flow)
       if (_authRequestId != null) {
         debugPrint('OIDC flow detected, completing auth request...');
@@ -589,5 +625,138 @@ class SetupController extends ChangeNotifier {
   void retry() {
     _error = null;
     unawaited(_checkStatus());
+  }
+
+  // --- Passkey ---
+
+  Future<void> fetchLoginOptions() async {
+    try {
+      final result = await _api.getLoginOptions();
+      _loginMethods = List<String>.from(result['methods'] as List);
+      notifyListeners();
+    } on Object catch (_) {
+      _loginMethods = ['password'];
+      notifyListeners();
+    }
+  }
+
+  Future<bool> loginWithPasskey() async {
+    _error = null;
+    notifyListeners();
+    try {
+      final beginResult = await _api.beginPasskeyLogin();
+      final sessionId = beginResult['session_id'] as String;
+      final options = beginResult['publicKey'] as Map<String, dynamic>;
+
+      final credential = await WebAuthnService.getCredential(options);
+
+      await _api.finishPasskeyLogin(sessionId, credential);
+      await _api.fetchCsrfToken();
+
+      final session = await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
+      if (session['must_register_passkey'] == true) {
+        _state = SetupState.passkeyRequired;
+        notifyListeners();
+        return true;
+      }
+
+      if (_authRequestId != null) {
+        await _completeOidcAuthRequest();
+        return true;
+      }
+
+      if (_nextUrl != null && _nextUrl!.isNotEmpty) {
+        if (await _redirectToNextIfValid()) {
+          return true;
+        }
+      }
+
+      _state = SetupState.complete;
+      notifyListeners();
+      return true;
+    } on Object catch (e) {
+      _error = _friendlyPasskeyError(e);
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<bool> registerPasskey() async {
+    _error = null;
+    notifyListeners();
+    try {
+      final beginResult = await _api.beginPasskeyRegistration();
+      final sessionId = beginResult['session_id'] as String;
+      final options = beginResult['publicKey'] as Map<String, dynamic>;
+
+      final credential = await WebAuthnService.createCredential(options);
+
+      await _api.finishPasskeyRegistration(sessionId, credential);
+
+      if (_authRequestId != null) {
+        await _completeOidcAuthRequest();
+        return true;
+      }
+      if (_nextUrl != null && _nextUrl!.isNotEmpty) {
+        if (await _redirectToNextIfValid()) {
+          return true;
+        }
+      }
+
+      _state = SetupState.complete;
+      notifyListeners();
+      return true;
+    } on Object catch (e) {
+      _error = _friendlyPasskeyError(e);
+      notifyListeners();
+      return false;
+    }
+  }
+
+  // --- Invite ---
+
+  Future<String?> validateInviteToken() async {
+    if (_inviteToken == null) return null;
+    try {
+      final result = await _api.validateInvite(_inviteToken!);
+      return result['username'] as String?;
+    } on Object catch (_) {
+      return null;
+    }
+  }
+
+  Future<bool> completeInviteRegistration() async {
+    if (_inviteToken == null) return false;
+    _error = null;
+    notifyListeners();
+    try {
+      final beginResult = await _api.beginInvitePasskey(_inviteToken!);
+      final sessionId = beginResult['session_id'] as String;
+      final options = beginResult['publicKey'] as Map<String, dynamic>;
+
+      final credential = await WebAuthnService.createCredential(options);
+
+      await _api.finishInvitePasskey(_inviteToken!, sessionId, credential);
+      await _api.fetchCsrfToken();
+      _inviteToken = null;
+      _state = SetupState.complete;
+      notifyListeners();
+      return true;
+    } on Object catch (e) {
+      _error = _friendlyPasskeyError(e);
+      notifyListeners();
+      return false;
+    }
+  }
+
+  String _friendlyPasskeyError(Object e) {
+    final msg = e.toString();
+    if (msg.contains('NotAllowedError') || msg.contains('cancelled')) {
+      return 'Passkey operation was cancelled.';
+    }
+    if (msg.contains('not found') || msg.contains('expired')) {
+      return 'Session expired. Please try again.';
+    }
+    return 'Passkey error: $msg';
   }
 }

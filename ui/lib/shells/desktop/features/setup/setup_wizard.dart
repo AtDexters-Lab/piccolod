@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/network_models.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/network_service.dart';
+import 'package:piccolo_os/core/services/webauthn_service.dart';
 import 'package:piccolo_os/core/utils/downloader/downloader.dart';
 import 'package:piccolo_os/shared/widgets/ca_import_guide.dart';
 import 'package:piccolo_os/shared/widgets/diagnostic_log_download.dart';
@@ -174,6 +175,10 @@ class _SetupWizardState extends State<SetupWizard> {
         return 'Log In';
       case SetupState.forgotPassword:
         return 'Reset Password';
+      case SetupState.invite:
+        return 'Welcome';
+      case SetupState.passkeyRequired:
+        return 'Passkey Setup';
       case SetupState.error:
         return 'Connection Error';
       case SetupState.systemError:
@@ -202,6 +207,8 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.unlock:
       case SetupState.login:
       case SetupState.forgotPassword:
+      case SetupState.invite:
+      case SetupState.passkeyRequired:
       case SetupState.error:
       case SetupState.systemError:
       case SetupState.complete:
@@ -265,8 +272,14 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.login:
         return _LoginStep(
           onLogin: _controller.login,
+          onLoginWithPasskey: _controller.loginWithPasskey,
           onForgotPassword: _controller.startRecovery,
+          controller: _controller,
         );
+      case SetupState.invite:
+        return _InviteStep(controller: _controller);
+      case SetupState.passkeyRequired:
+        return _PasskeyRequiredStep(controller: _controller);
       case SetupState.forgotPassword:
         return _ForgotPasswordStep(
           onReset: _controller.resetPassword,
@@ -1071,9 +1084,16 @@ class _UnlockStepState extends State<_UnlockStep> {
 
 class _LoginStep extends StatefulWidget {
 
-  const _LoginStep({required this.onLogin, required this.onForgotPassword});
+  const _LoginStep({
+    required this.onLogin,
+    required this.onLoginWithPasskey,
+    required this.onForgotPassword,
+    required this.controller,
+  });
   final Future<bool> Function(String, String) onLogin;
+  final Future<bool> Function() onLoginWithPasskey;
   final VoidCallback onForgotPassword;
+  final SetupController controller;
 
   @override
   State<_LoginStep> createState() => _LoginStepState();
@@ -1087,6 +1107,12 @@ class _LoginStepState extends State<_LoginStep> {
   bool _isSubmitting = false;
   bool _obscureText = true;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(widget.controller.fetchLoginOptions());
+  }
 
   @override
   void dispose() {
@@ -1114,6 +1140,167 @@ class _LoginStepState extends State<_LoginStep> {
     }
   }
 
+  Future<void> _loginWithPasskey() async {
+    setState(() {
+      _isSubmitting = true;
+      _error = null;
+    });
+
+    final success = await widget.onLoginWithPasskey();
+
+    if (mounted && !success) {
+      setState(() {
+        _isSubmitting = false;
+        _error = widget.controller.error;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final methods = widget.controller.loginMethods;
+    final showPasskey = (methods?.contains('passkey') ?? false) && WebAuthnService.isAvailable();
+    final showPassword = methods?.contains('password') ?? true;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (showPasskey) ...[
+            FilledButton.icon(
+              onPressed: _isSubmitting ? null : _loginWithPasskey,
+              icon: const Icon(PiccoloIcons.fingerprint),
+              label: const Text('Sign in with Passkey'),
+            ),
+            if (showPassword) ...[
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  const Expanded(child: Divider()),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: Text('or', style: PiccoloTheme.textTheme.bodySmall?.copyWith(color: PiccoloTheme.inkMuted)),
+                  ),
+                  const Expanded(child: Divider()),
+                ],
+              ),
+              const SizedBox(height: 16),
+            ],
+          ],
+          if (showPassword) ...[
+            TextField(
+              controller: _userController,
+              autofillHints: const [AutofillHints.username],
+              decoration: const InputDecoration(
+                labelText: 'Username',
+              ),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _passController,
+              obscureText: _obscureText,
+              autofillHints: const [AutofillHints.password],
+              decoration: InputDecoration(
+                labelText: 'Password',
+                errorText: _error,
+                suffixIcon: IconButton(
+                  icon: Icon(
+                    _obscureText
+                        ? PiccoloIcons.visibilityOff
+                        : PiccoloIcons.visibility,
+                    color: PiccoloTheme.inkMuted,
+                  ),
+                  onPressed: () => setState(() => _obscureText = !_obscureText),
+                ),
+              ),
+              onSubmitted: (_) => _submit(),
+            ),
+            const SizedBox(height: 24),
+            Row(
+              children: [
+                TextButton(
+                  onPressed: widget.onForgotPassword,
+                  child: const Text('Forgot Password?'),
+                ),
+                const Spacer(),
+                FilledButton(
+                  onPressed: _isSubmitting ? null : _submit,
+                  child: _isSubmitting
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                            color: Colors.white,
+                            strokeWidth: 2,
+                          ),
+                        )
+                      : const Text('Log In'),
+                ),
+              ],
+            ),
+          ] else if (_error != null) ...[
+            Text(_error!, style: const TextStyle(color: PiccoloTheme.critical)),
+          ] else if (!showPasskey && !showPassword) ...[
+            Text(
+              'Passkey sign-in is required but unavailable in this browser context. '
+              'Please access this device over HTTPS to sign in.',
+              style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// --- Invite Step ---
+
+class _InviteStep extends StatefulWidget {
+  const _InviteStep({required this.controller});
+  final SetupController controller;
+
+  @override
+  State<_InviteStep> createState() => _InviteStepState();
+}
+
+class _InviteStepState extends State<_InviteStep> {
+  String? _username;
+  bool _isLoading = true;
+  bool _isRegistering = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_validate());
+  }
+
+  Future<void> _validate() async {
+    final username = await widget.controller.validateInviteToken();
+    if (mounted) {
+      setState(() {
+        _username = username;
+        _isLoading = false;
+        if (username == null) {
+          _error = 'This invite link is invalid or has expired.';
+        }
+      });
+    }
+  }
+
+  Future<void> _register() async {
+    setState(() { _isRegistering = true; _error = null; });
+    final success = await widget.controller.completeInviteRegistration();
+    if (mounted && !success) {
+      setState(() {
+        _isRegistering = false;
+        _error = widget.controller.error;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Padding(
@@ -1122,56 +1309,113 @@ class _LoginStepState extends State<_LoginStep> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          TextField(
-            controller: _userController,
-            autofillHints: const [AutofillHints.username],
-            decoration: const InputDecoration(
-              labelText: 'Username',
+          if (_isLoading)
+            const Center(child: CircularProgressIndicator(color: PiccoloTheme.cobalt600))
+          else if (_error != null && _username == null) ...[
+            Text(_error!, style: const TextStyle(color: PiccoloTheme.critical)),
+          ] else ...[
+            Text(
+              'Welcome, $_username!',
+              style: PiccoloTheme.textTheme.titleMedium,
             ),
-          ),
-          const SizedBox(height: 16),
-          TextField(
-            controller: _passController,
-            obscureText: _obscureText,
-            autofillHints: const [AutofillHints.password],
-            decoration: InputDecoration(
-              labelText: 'Password',
-              errorText: _error,
-              suffixIcon: IconButton(
-                icon: Icon(
-                  _obscureText
-                      ? PiccoloIcons.visibilityOff
-                      : PiccoloIcons.visibility,
-                  color: PiccoloTheme.inkMuted,
-                ),
-                onPressed: () => setState(() => _obscureText = !_obscureText),
+            const SizedBox(height: 8),
+            Text(
+              'Set up your passkey to get started. This will be your fast, phishing-proof sign-in.',
+              style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
+            ),
+            const SizedBox(height: 24),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 16),
+                child: Text(_error!, style: const TextStyle(color: PiccoloTheme.critical)),
               ),
-            ),
-            onSubmitted: (_) => _submit(),
+            if (WebAuthnService.isAvailable())
+              FilledButton.icon(
+                onPressed: _isRegistering ? null : _register,
+                icon: const Icon(PiccoloIcons.fingerprint),
+                label: _isRegistering
+                    ? const SizedBox(
+                        width: 20, height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                      )
+                    : const Text('Create Passkey'),
+              )
+            else
+              Text(
+                'Passkey registration requires HTTPS. Please access this device over a secure connection.',
+                style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+// --- Passkey Required Step ---
+
+class _PasskeyRequiredStep extends StatefulWidget {
+  const _PasskeyRequiredStep({required this.controller});
+  final SetupController controller;
+
+  @override
+  State<_PasskeyRequiredStep> createState() => _PasskeyRequiredStepState();
+}
+
+class _PasskeyRequiredStepState extends State<_PasskeyRequiredStep> {
+  bool _isLoading = false;
+  String? _error;
+
+  Future<void> _register() async {
+    setState(() { _isLoading = true; _error = null; });
+    final success = await widget.controller.registerPasskey();
+    if (mounted && !success) {
+      setState(() {
+        _isLoading = false;
+        _error = widget.controller.error;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            'Set Up Your Passkey',
+            style: PiccoloTheme.textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'A passkey is required for remote access. This is a one-time setup.',
+            style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
           ),
           const SizedBox(height: 24),
-          Row(
-            children: [
-              TextButton(
-                onPressed: widget.onForgotPassword,
-                child: const Text('Forgot Password?'),
-              ),
-              const Spacer(),
-              FilledButton(
-                onPressed: _isSubmitting ? null : _submit,
-                child: _isSubmitting
-                    ? const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(
-                          color: Colors.white,
-                          strokeWidth: 2,
-                        ),
-                      )
-                    : const Text('Log In'),
-              ),
-            ],
-          ),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 16),
+              child: Text(_error!, style: const TextStyle(color: PiccoloTheme.critical)),
+            ),
+          if (WebAuthnService.isAvailable())
+            FilledButton.icon(
+              onPressed: _isLoading ? null : _register,
+              icon: const Icon(PiccoloIcons.fingerprint),
+              label: _isLoading
+                  ? const SizedBox(
+                      width: 20, height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    )
+                  : const Text('Create Passkey'),
+            )
+          else
+            Text(
+              'Passkey registration requires HTTPS. Please access this device over a secure connection.',
+              style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
+            ),
         ],
       ),
     );

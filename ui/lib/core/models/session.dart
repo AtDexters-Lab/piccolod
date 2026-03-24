@@ -3,7 +3,11 @@ class Session {
   Session({
     required this.authenticated,
     required this.user,
-    required this.volumesLocked, required this.passwordStale, required this.recoveryStale, this.expiresAt,
+    required this.volumesLocked, required this.passwordStale, required this.recoveryStale,
+    this.expiresAt,
+    this.hasPasskey = false,
+    this.passkeyCount = 0,
+    this.mustRegisterPasskey = false,
   });
 
   factory Session.fromJson(Map<String, dynamic> json) {
@@ -14,6 +18,9 @@ class Session {
       volumesLocked: (json['volumes_locked'] as bool?) ?? false,
       passwordStale: (json['password_stale'] as bool?) ?? false,
       recoveryStale: (json['recovery_stale'] as bool?) ?? false,
+      hasPasskey: (json['has_passkey'] as bool?) ?? false,
+      passkeyCount: (json['passkey_count'] as int?) ?? 0,
+      mustRegisterPasskey: (json['must_register_passkey'] as bool?) ?? false,
     );
   }
   final bool authenticated;
@@ -22,4 +29,7 @@ class Session {
   final bool volumesLocked;
   final bool passwordStale;
   final bool recoveryStale;
+  final bool hasPasskey;
+  final int passkeyCount;
+  final bool mustRegisterPasskey;
 }
