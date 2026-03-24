@@ -11,6 +11,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 
 	authpkg "piccolod/internal/auth"
+	"piccolod/internal/events"
 	"piccolod/internal/persistence"
 )
 
@@ -56,6 +57,24 @@ func (s *GinServer) getAuthorizedCredential(c *gin.Context, sess *authpkg.Sessio
 		return nil, false
 	}
 	return &cred, true
+}
+
+// --- Audit ---
+
+// publishPasskeyAudit publishes an audit event for passkey/invite operations.
+func (s *GinServer) publishPasskeyAudit(c *gin.Context, kind string, metadata map[string]any) {
+	if s.events == nil {
+		return
+	}
+	s.events.Publish(events.Event{
+		Topic: events.TopicAudit,
+		Payload: events.AuditEvent{
+			Kind:     kind,
+			Time:     time.Now(),
+			Source:   c.ClientIP(),
+			Metadata: metadata,
+		},
+	})
 }
 
 // --- Helpers ---
@@ -208,6 +227,12 @@ func (s *GinServer) handlePasskeyRegisterFinish(c *gin.Context) {
 
 	sess.MustRegisterPasskey = false
 
+	s.publishPasskeyAudit(c, "passkey.registered", map[string]any{
+		"user_id":       sess.UserID,
+		"credential_id": cred.ID,
+		"rp_id":         cred.RPID,
+	})
+
 	c.JSON(http.StatusOK, gin.H{
 		"credential_id": cred.ID,
 		"created_at":    cred.CreatedAt.Format(time.RFC3339),
@@ -220,6 +245,11 @@ func (s *GinServer) handlePasskeyRegisterFinish(c *gin.Context) {
 func (s *GinServer) handlePasskeyLoginBegin(c *gin.Context) {
 	if s.webauthnMgr == nil {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "passkey support not available"})
+		return
+	}
+
+	if !s.passkeyRateLimiter.Allow(c.ClientIP()) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many requests"})
 		return
 	}
 
@@ -249,6 +279,11 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 		return
 	}
 
+	if !s.passkeyRateLimiter.Allow(c.ClientIP()) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many requests"})
+		return
+	}
+
 	sessionID := c.Query("session_id")
 	if sessionID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "session_id required"})
@@ -261,6 +296,8 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 		return
 	}
 
+	rpID := s.getRPID(c)
+
 	userID, err := s.webauthnMgr.FinishAuthentication(
 		c.Request.Context(), sessionID, rpDisplayName, parsedResponse,
 	)
@@ -269,6 +306,11 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "ceremony expired or not found"})
 			return
 		}
+		s.passkeyRateLimiter.RecordFailure(c.ClientIP())
+		s.publishPasskeyAudit(c, "passkey.auth.failure", map[string]any{
+			"rp_id":  rpID,
+			"reason": err.Error(),
+		})
 		log.Printf("WARN: passkey login finish: %v", err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
 		return
@@ -294,6 +336,11 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 	)
 	s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
 	s.resetLoginFailures()
+
+	s.publishPasskeyAudit(c, "passkey.auth.success", map[string]any{
+		"user_id": userInfo.ID,
+		"rp_id":   rpID,
+	})
 
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
@@ -377,6 +424,12 @@ func (s *GinServer) handleDeletePasskey(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete passkey"})
 		return
 	}
+
+	s.publishPasskeyAudit(c, "passkey.deleted", map[string]any{
+		"user_id":       cred.UserID,
+		"credential_id": credID,
+		"deleted_by":    sess.UserID,
+	})
 
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
@@ -473,6 +526,11 @@ func (s *GinServer) handleCreateInvite(c *gin.Context) {
 		return
 	}
 
+	s.publishPasskeyAudit(c, "invite.created", map[string]any{
+		"user_id":    userInfo.ID,
+		"created_by": sess.UserID,
+	})
+
 	c.JSON(http.StatusOK, gin.H{
 		"token":    token,
 		"user_id":  userInfo.ID,
@@ -487,6 +545,11 @@ func (s *GinServer) handleValidateInvite(c *gin.Context) {
 		return
 	}
 
+	if !s.passkeyRateLimiter.Allow(c.ClientIP()) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many requests"})
+		return
+	}
+
 	token := c.Param("token")
 	if token == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "token required"})
@@ -495,6 +558,7 @@ func (s *GinServer) handleValidateInvite(c *gin.Context) {
 
 	username, _, err := s.inviteMgr.ValidateInvite(c.Request.Context(), token)
 	if err != nil {
+		s.passkeyRateLimiter.RecordFailure(c.ClientIP())
 		if respondInviteError(c, err) {
 			return
 		}
@@ -515,6 +579,11 @@ func (s *GinServer) handleInvitePasskeyBegin(c *gin.Context) {
 		return
 	}
 
+	if !s.passkeyRateLimiter.Allow(c.ClientIP()) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many requests"})
+		return
+	}
+
 	if !s.isSecureRequest(c.Request) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "passkey registration requires HTTPS"})
 		return
@@ -531,6 +600,7 @@ func (s *GinServer) handleInvitePasskeyBegin(c *gin.Context) {
 	// Validate the invite first
 	username, userID, err := s.inviteMgr.ValidateInvite(ctx, token)
 	if err != nil {
+		s.passkeyRateLimiter.RecordFailure(c.ClientIP())
 		if respondInviteError(c, err) {
 			return
 		}
@@ -562,6 +632,11 @@ func (s *GinServer) handleInvitePasskeyBegin(c *gin.Context) {
 func (s *GinServer) handleInvitePasskeyFinish(c *gin.Context) {
 	if s.webauthnMgr == nil || s.inviteMgr == nil {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "passkey support not available"})
+		return
+	}
+
+	if !s.passkeyRateLimiter.Allow(c.ClientIP()) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many requests"})
 		return
 	}
 
@@ -633,6 +708,15 @@ func (s *GinServer) handleInvitePasskeyFinish(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup failed"})
 		return
 	}
+
+	s.publishPasskeyAudit(c, "passkey.registered", map[string]any{
+		"user_id":       cred.UserID,
+		"credential_id": cred.ID,
+		"rp_id":         cred.RPID,
+	})
+	s.publishPasskeyAudit(c, "invite.consumed", map[string]any{
+		"user_id": userID,
+	})
 
 	// Create session
 	boundOrigin := s.computeCanonicalOrigin(c)

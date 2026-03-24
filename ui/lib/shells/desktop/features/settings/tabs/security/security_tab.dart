@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/shared/widgets/ca_import_guide.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/settings_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/security/widgets/passkey_list_section.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
@@ -16,6 +17,8 @@ class SecurityTab extends StatelessWidget {
       children: [
         Text('Security',
             style: PiccoloTheme.textTheme.headlineLarge),
+        const SizedBox(height: Spacing.xl),
+        const PasskeyListSection(),
         const SizedBox(height: Spacing.xl),
         Text('HTTPS on LAN',
             style: PiccoloTheme.textTheme.titleMedium),

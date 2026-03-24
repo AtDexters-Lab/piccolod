@@ -1,8 +1,10 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:piccolo_os/core/models/user.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/users/users_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/users/widgets/invite_form_dialog.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/users/widgets/user_form_dialog.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/users/widgets/user_list_card.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
@@ -61,10 +63,20 @@ class _UsersTabState extends State<UsersTab> {
           'Users',
           style: PiccoloTheme.textTheme.headlineLarge,
         ),
-        FilledButton.icon(
-          onPressed: _showAddUserDialog,
-          icon: const Icon(PiccoloIcons.add),
-          label: const Text('Add User'),
+        Row(
+          children: [
+            OutlinedButton.icon(
+              onPressed: _showInviteUserDialog,
+              icon: const Icon(PiccoloIcons.link, size: 18),
+              label: const Text('Invite User'),
+            ),
+            const SizedBox(width: Spacing.sm),
+            FilledButton.icon(
+              onPressed: _showAddUserDialog,
+              icon: const Icon(PiccoloIcons.add),
+              label: const Text('Add User'),
+            ),
+          ],
         ),
       ],
     );
@@ -136,6 +148,9 @@ class _UsersTabState extends State<UsersTab> {
             onEdit: () => _showEditUserDialog(user),
             onDelete: () => _showDeleteConfirmation(user),
             onSetPassword: () => _showSetPasswordDialog(user),
+            onReinvite: !user.isAdmin
+                ? () => _handleReinvite(user)
+                : null,
           ),
         );
       }).toList(),
@@ -157,6 +172,113 @@ class _UsersTabState extends State<UsersTab> {
         },
       ),
     ));
+  }
+
+  void _showInviteUserDialog() {
+    unawaited(showDialog<void>(
+      context: context,
+      builder: (context) => InviteFormDialog(
+        onInvite: (username, email, allowedApps) async {
+          final token = await _controller.createInvite(
+            username: username,
+            email: email,
+            allowedApps: allowedApps,
+          );
+          return token;
+        },
+        onShowInviteLink: _showInviteLinkDialog,
+      ),
+    ));
+  }
+
+  void _showInviteLinkDialog(String token) {
+    final origin = Uri.base.replace(scheme: 'https').origin;
+    final inviteUrl = '$origin/?invite=$token';
+
+    unawaited(showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Invite Created'),
+        content: SizedBox(
+          width: 450,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Share this link with the user to complete their registration:',
+                style: PiccoloTheme.textTheme.bodyMedium,
+              ),
+              const SizedBox(height: Spacing.base),
+              Container(
+                padding: const EdgeInsets.all(Spacing.md),
+                decoration: BoxDecoration(
+                  color: PiccoloTheme.mist,
+                  borderRadius: BorderRadius.circular(Radii.sm),
+                  border: Border.all(color: PiccoloTheme.hairline),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: SelectableText(
+                        inviteUrl,
+                        style: PiccoloTheme.textTheme.bodySmall?.copyWith(
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: Spacing.sm),
+                    IconButton(
+                      icon: const Icon(PiccoloIcons.copy, size: 18),
+                      tooltip: 'Copy to clipboard',
+                      onPressed: () async {
+                        await Clipboard.setData(ClipboardData(text: inviteUrl));
+                        if (!context.mounted) return;
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('Invite link copied to clipboard'),
+                            backgroundColor: PiccoloTheme.success,
+                          ),
+                        );
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: Spacing.base),
+              Text(
+                'The user will register a passkey when they open this link.',
+                style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+                  color: PiccoloTheme.inkMuted,
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Done'),
+          ),
+        ],
+      ),
+    ));
+  }
+
+  Future<void> _handleReinvite(User user) async {
+    try {
+      final token = await _controller.reinviteUser(user.id);
+      if (!mounted || token.isEmpty) return;
+      _showInviteLinkDialog(token);
+    } on Object catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to create invite: $e'),
+          backgroundColor: PiccoloTheme.critical,
+        ),
+      );
+    }
   }
 
   void _showEditUserDialog(User user) {

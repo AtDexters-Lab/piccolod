@@ -74,6 +74,10 @@ class DesktopController extends ChangeNotifier {
   bool _showReauth = false;
   bool get showReauth => _showReauth;
 
+  // Passkey registration prompt — shown when user has no passkey
+  bool _showPasskeyPrompt = false;
+  bool get showPasskeyPrompt => _showPasskeyPrompt;
+
   String? _lastKnownUsername;
   String? get lastKnownUsername => _lastKnownUsername;
 
@@ -161,6 +165,16 @@ class DesktopController extends ChangeNotifier {
     notifyListeners();
   }
 
+  void dismissPasskeyPrompt() {
+    _showPasskeyPrompt = false;
+    notifyListeners();
+  }
+
+  void onPasskeyRegistered() {
+    _showPasskeyPrompt = false;
+    notifyListeners();
+  }
+
   void onReauthCancel() {
     _showReauth = false;
     unawaited(logout());
@@ -182,11 +196,22 @@ class DesktopController extends ChangeNotifier {
     // mode, 401s should NOT trigger the reauth overlay.
     ApiClient().onAuthRequired = _onAuthRequired;
 
-    // Capture username for re-auth overlay pre-fill (best-effort, fire-and-forget).
-    // Covers the fresh-login path where _checkSystemStatus didn't reach the session check.
+    // Capture username and check passkey status (best-effort).
     unawaited(ApiClient().get('/api/v1/auth/session').then((session) {
-      if (session is Map && session['user'] is String) {
-        _lastKnownUsername = session['user'] as String;
+      if (session is Map) {
+        if (session['user'] is String) {
+          _lastKnownUsername = session['user'] as String;
+        }
+        // Prompt to register passkey if user has none for this RP.
+        // Also clear the prompt if the user already has one (handles
+        // session changes, re-login as different user, or registration
+        // completed via Settings).
+        final shouldPrompt = session['has_passkey'] == false &&
+            session['must_register_passkey'] != true;
+        if (_showPasskeyPrompt != shouldPrompt) {
+          _showPasskeyPrompt = shouldPrompt;
+          notifyListeners();
+        }
       }
     }).catchError((_) {}));
 

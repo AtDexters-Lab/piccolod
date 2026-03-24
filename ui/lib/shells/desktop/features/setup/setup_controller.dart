@@ -751,8 +751,14 @@ class SetupController extends ChangeNotifier {
 
   String _friendlyPasskeyError(Object e) {
     final msg = e.toString();
+    if (msg.contains('InvalidStateError') || msg.contains('already registered')) {
+      return 'This authenticator already has a passkey registered. Try a different authenticator or use your existing passkey to sign in.';
+    }
     if (msg.contains('NotAllowedError') || msg.contains('cancelled')) {
-      return 'Passkey operation was cancelled.';
+      return 'Passkey operation was cancelled or timed out. If using a phone, ensure Bluetooth is on and devices are nearby.';
+    }
+    if (msg.contains('NotSupportedError')) {
+      return 'Passkeys are not supported in this browser. Try Chrome, Safari, or Edge.';
     }
     if (msg.contains('not found') || msg.contains('expired')) {
       return 'Session expired. Please try again.';

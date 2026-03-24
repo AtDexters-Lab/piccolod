@@ -84,6 +84,10 @@ func toWebAuthnCredential(c persistence.WebAuthnCredential) webauthn.Credential 
 		PublicKey:       c.PublicKey,
 		AttestationType: c.AttestationType,
 		Transport:       transports,
+		Flags: webauthn.CredentialFlags{
+			BackupEligible: c.BackupEligible,
+			BackupState:    c.BackupState,
+		},
 		Authenticator: webauthn.Authenticator{
 			AAGUID:    c.AAGUID,
 			SignCount: c.SignCount,
@@ -204,6 +208,8 @@ func (m *WebAuthnManager) FinishRegistration(ctx context.Context, sessionID stri
 		RPID:            cs.RPID,
 		AAGUID:          credential.Authenticator.AAGUID,
 		FriendlyName:    "",
+		BackupEligible:  credential.Flags.BackupEligible,
+		BackupState:     credential.Flags.BackupState,
 		CreatedAt:       now,
 		LastUsedAt:      now,
 	}

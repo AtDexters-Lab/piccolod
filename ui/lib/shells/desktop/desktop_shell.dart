@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/shared/widgets/passkey_prompt_overlay.dart';
 import 'package:piccolo_os/shared/widgets/reauth_overlay.dart';
 import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
 import 'package:piccolo_os/shells/desktop/features/access_denied/access_denied_view.dart';
@@ -108,6 +109,15 @@ class _DesktopShellState extends State<DesktopShell> {
                           ),
                         ),
                       ),
+                    ),
+                  ),
+
+                // Passkey registration prompt — shown when user has no passkey
+                if (_controller.showPasskeyPrompt && !_controller.showReauth)
+                  Positioned.fill(
+                    child: PasskeyPromptOverlay(
+                      onRegistered: _controller.onPasskeyRegistered,
+                      onDismiss: _controller.dismissPasskeyPrompt,
                     ),
                   ),
 

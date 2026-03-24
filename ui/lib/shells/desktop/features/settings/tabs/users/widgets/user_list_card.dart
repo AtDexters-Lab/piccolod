@@ -8,11 +8,13 @@ class UserListCard extends StatelessWidget {
 
   const UserListCard({
     required this.user, required this.onEdit, required this.onDelete, required this.onSetPassword, super.key,
+    this.onReinvite,
   });
   final User user;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
   final VoidCallback onSetPassword;
+  final VoidCallback? onReinvite;
 
   @override
   Widget build(BuildContext context) {
@@ -98,6 +100,8 @@ class UserListCard extends StatelessWidget {
                   onEdit();
                 case 'password':
                   onSetPassword();
+                case 'reinvite':
+                  onReinvite?.call();
                 case 'delete':
                   onDelete();
               }
@@ -123,6 +127,17 @@ class UserListCard extends StatelessWidget {
                   ],
                 ),
               ),
+              if (onReinvite != null)
+                const PopupMenuItem(
+                  value: 'reinvite',
+                  child: Row(
+                    children: [
+                      Icon(PiccoloIcons.link, size: 18),
+                      SizedBox(width: 8),
+                      Text('Reinvite'),
+                    ],
+                  ),
+                ),
               const PopupMenuDivider(),
               const PopupMenuItem(
                 value: 'delete',

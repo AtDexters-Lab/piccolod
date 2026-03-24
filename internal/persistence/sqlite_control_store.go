@@ -263,6 +263,8 @@ func applyMigrations(db *sql.DB) error {
 			rp_id TEXT NOT NULL,
 			aaguid BLOB,
 			friendly_name TEXT DEFAULT '',
+			backup_eligible INTEGER NOT NULL DEFAULT 0,
+			backup_state INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
 			last_used_at TEXT NOT NULL
 		);`,
@@ -293,6 +295,9 @@ func applyMigrations(db *sql.DB) error {
 		return err
 	}
 	if err := ensureOIDCSchemaColumns(tx); err != nil {
+		return err
+	}
+	if err := ensureWebAuthnBackupColumns(tx); err != nil {
 		return err
 	}
 	err = tx.Commit()
@@ -357,6 +362,17 @@ func ensureOIDCSchemaColumns(tx *sql.Tx) error {
 	}
 	// Add type to oidc_clients for proxy client detection (RFC 20260122 §5.3)
 	if err := ensureColumn(tx, "oidc_clients", "type", "TEXT NOT NULL DEFAULT 'app'"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureWebAuthnBackupColumns adds backup flags to webauthn_credentials for existing installs.
+func ensureWebAuthnBackupColumns(tx *sql.Tx) error {
+	if err := ensureColumn(tx, "webauthn_credentials", "backup_eligible", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(tx, "webauthn_credentials", "backup_state", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	return nil
@@ -1802,10 +1818,11 @@ func (r *sqliteWebAuthnCredRepo) Create(ctx context.Context, cred WebAuthnCreden
 		transportsJSON = &s
 	}
 	_, err := r.store.db.ExecContext(ctx,
-		`INSERT INTO webauthn_credentials (id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, created_at, last_used_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO webauthn_credentials (id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, backup_eligible, backup_state, created_at, last_used_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		cred.ID, cred.UserID, cred.PublicKey, cred.AttestationType, transportsJSON,
 		cred.SignCount, cred.RPID, cred.AAGUID, cred.FriendlyName,
+		boolToInt(cred.BackupEligible), boolToInt(cred.BackupState),
 		formatTimestamp(cred.CreatedAt), formatTimestamp(cred.LastUsedAt))
 	return err
 }
@@ -1817,7 +1834,7 @@ func (r *sqliteWebAuthnCredRepo) Get(ctx context.Context, credID string) (WebAut
 		return WebAuthnCredential{}, ErrLocked
 	}
 	return r.scanCred(ctx,
-		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, created_at, last_used_at
+		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, backup_eligible, backup_state, created_at, last_used_at
 		 FROM webauthn_credentials WHERE id=?`, credID)
 }
 
@@ -1828,7 +1845,7 @@ func (r *sqliteWebAuthnCredRepo) ListByUser(ctx context.Context, userID string) 
 		return nil, ErrLocked
 	}
 	return r.scanCreds(ctx,
-		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, created_at, last_used_at
+		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, backup_eligible, backup_state, created_at, last_used_at
 		 FROM webauthn_credentials WHERE user_id=? ORDER BY created_at`, userID)
 }
 
@@ -1839,7 +1856,7 @@ func (r *sqliteWebAuthnCredRepo) ListByUserAndRP(ctx context.Context, userID, rp
 		return nil, ErrLocked
 	}
 	return r.scanCreds(ctx,
-		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, created_at, last_used_at
+		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, backup_eligible, backup_state, created_at, last_used_at
 		 FROM webauthn_credentials WHERE user_id=? AND rp_id=? ORDER BY created_at`, userID, rpID)
 }
 
@@ -1850,7 +1867,7 @@ func (r *sqliteWebAuthnCredRepo) ListByRP(ctx context.Context, rpID string) ([]W
 		return nil, ErrLocked
 	}
 	return r.scanCreds(ctx,
-		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, created_at, last_used_at
+		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, backup_eligible, backup_state, created_at, last_used_at
 		 FROM webauthn_credentials WHERE rp_id=? ORDER BY created_at`, rpID)
 }
 
@@ -1862,10 +1879,11 @@ func (r *sqliteWebAuthnCredRepo) scanCred(ctx context.Context, query string, arg
 		createdAt      string
 		lastUsedAt     string
 	)
+	var backupEligible, backupState int
 	err := r.store.db.QueryRowContext(ctx, query, args...).Scan(
 		&cred.ID, &cred.UserID, &cred.PublicKey, &cred.AttestationType,
 		&transportsJSON, &cred.SignCount, &cred.RPID, &aaguid,
-		&cred.FriendlyName, &createdAt, &lastUsedAt)
+		&cred.FriendlyName, &backupEligible, &backupState, &createdAt, &lastUsedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return WebAuthnCredential{}, ErrNotFound
@@ -1878,6 +1896,8 @@ func (r *sqliteWebAuthnCredRepo) scanCred(ctx context.Context, query string, arg
 		}
 	}
 	cred.AAGUID = aaguid
+	cred.BackupEligible = backupEligible != 0
+	cred.BackupState = backupState != 0
 	cred.CreatedAt = parseTimestamp(createdAt)
 	cred.LastUsedAt = parseTimestamp(lastUsedAt)
 	return cred, nil
@@ -1898,10 +1918,11 @@ func (r *sqliteWebAuthnCredRepo) scanCreds(ctx context.Context, query string, ar
 			createdAt      string
 			lastUsedAt     string
 		)
+		var backupEligible, backupState int
 		if err := rows.Scan(
 			&cred.ID, &cred.UserID, &cred.PublicKey, &cred.AttestationType,
 			&transportsJSON, &cred.SignCount, &cred.RPID, &aaguid,
-			&cred.FriendlyName, &createdAt, &lastUsedAt); err != nil {
+			&cred.FriendlyName, &backupEligible, &backupState, &createdAt, &lastUsedAt); err != nil {
 			return nil, err
 		}
 		if transportsJSON.Valid && transportsJSON.String != "" {
@@ -1910,6 +1931,8 @@ func (r *sqliteWebAuthnCredRepo) scanCreds(ctx context.Context, query string, ar
 			}
 		}
 		cred.AAGUID = aaguid
+		cred.BackupEligible = backupEligible != 0
+		cred.BackupState = backupState != 0
 		cred.CreatedAt = parseTimestamp(createdAt)
 		cred.LastUsedAt = parseTimestamp(lastUsedAt)
 		creds = append(creds, cred)

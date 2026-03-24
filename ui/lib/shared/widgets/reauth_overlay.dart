@@ -73,7 +73,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
           _isLoading = false;
           final msg = e.toString();
           if (msg.contains('NotAllowedError') || msg.contains('cancelled')) {
-            _error = 'Passkey operation was cancelled.';
+            _error = 'Cancelled or timed out. If using a phone, ensure Bluetooth is on and devices are nearby.';
           } else {
             _error = 'Passkey login failed';
           }

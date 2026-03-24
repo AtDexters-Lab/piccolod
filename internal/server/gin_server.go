@@ -119,6 +119,8 @@ type GinServer struct {
 	// simple rate-limit counters for login failures
 	loginFailures int
 	resetFailures int
+	// per-IP rate limiter for public passkey/invite endpoints
+	passkeyRateLimiter *ipRateLimiter
 
 	// Serializes concurrent /crypto/setup requests to prevent parallel LUKS init.
 	setupMu sync.Mutex
@@ -729,6 +731,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		installer:      installer,
 		execRunner:     execRunner,
 	}
+	// Per-IP rate limiter for public passkey/invite endpoints
+	s.passkeyRateLimiter = newIPRateLimiter(10, 5*time.Minute)
+
 	// Initialize persistent terminal session manager
 	s.terminalManager = terminal.NewManager()
 	s.terminalManager.SetEventBus(eventsBus)

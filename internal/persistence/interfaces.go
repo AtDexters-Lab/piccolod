@@ -421,6 +421,8 @@ type WebAuthnCredential struct {
 	RPID            string    // Relying Party ID this credential is bound to
 	AAGUID          []byte    // Authenticator AAGUID
 	FriendlyName    string    // User-assigned label
+	BackupEligible  bool      // WebAuthn BE flag — must not change after registration
+	BackupState     bool      // WebAuthn BS flag — may change (credential synced/backed up)
 	CreatedAt       time.Time
 	LastUsedAt      time.Time
 }
