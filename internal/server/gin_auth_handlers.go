@@ -12,7 +12,6 @@ import (
 
 	authpkg "piccolod/internal/auth"
 	"piccolod/internal/cryptoutil"
-	"piccolod/internal/events"
 	"piccolod/internal/persistence"
 )
 
@@ -475,26 +474,14 @@ func (s *GinServer) handleAuthStalenessAck(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update staleness"})
 		return
 	}
-	if s.events != nil {
-		targets := []string{}
-		if body.Password {
-			targets = append(targets, "password")
-		}
-		if body.Recovery {
-			targets = append(targets, "recovery")
-		}
-		s.events.Publish(events.Event{
-			Topic: events.TopicAudit,
-			Payload: events.AuditEvent{
-				Kind:   "auth.staleness_ack",
-				Time:   now,
-				Source: c.ClientIP(),
-				Metadata: map[string]any{
-					"flags": targets,
-				},
-			},
-		})
+	targets := []string{}
+	if body.Password {
+		targets = append(targets, "password")
 	}
+	if body.Recovery {
+		targets = append(targets, "recovery")
+	}
+	s.publishAuditEvent(c, "auth.staleness_ack", map[string]any{"flags": targets})
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
 

@@ -153,6 +153,9 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
   // Map of app:listener -> health status
   final Map<String, ListenerHealth> _healthMap = {};
   StreamSubscription<ListenerHealthEvent>? _subscription;
+  StreamSubscription<Map<String, dynamic>>? _remoteConfigSub;
+  // Portal state from remote_config events (null = not configured).
+  String? _portalState;
   // True between WebSocket connect and receiving health data (or grace timeout).
   // Prevents a brief "Healthy" flash on transient reconnects when backend is down.
   bool _pendingSnapshot = false;
@@ -192,12 +195,15 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
       _unsubscribeFromClient();
       client.addListener(_onClientStateChanged);
       _subscription = client.healthEvents.listen(_handleHealthEvent);
+      _remoteConfigSub = client.remoteConfigEvents.listen(_handleRemoteConfigEvent);
     }
   }
 
   void _unsubscribeFromClient() {
     unawaited(_subscription?.cancel());
     _subscription = null;
+    unawaited(_remoteConfigSub?.cancel());
+    _remoteConfigSub = null;
     widget.controller.eventStreamClient?.removeListener(_onClientStateChanged);
   }
 
@@ -206,6 +212,7 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
     final client = widget.controller.eventStreamClient;
     if (client?.state == WebSocketConnectionState.connected) {
       _healthMap.clear();
+      _portalState = null;
       _pendingSnapshot = true;
       _snapshotGrace?.cancel();
       _snapshotGrace = Timer(const Duration(seconds: 3), () {
@@ -233,6 +240,20 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
     });
   }
 
+  void _handleRemoteConfigEvent(Map<String, dynamic> event) {
+    if (!mounted) return;
+    final state = event['state'] as String?;
+    if (state != _portalState || _pendingSnapshot) {
+      setState(() {
+        _portalState = state;
+        if (_pendingSnapshot) {
+          _pendingSnapshot = false;
+          _snapshotGrace?.cancel();
+        }
+      });
+    }
+  }
+
   @override
   void dispose() {
     _snapshotGrace?.cancel();
@@ -247,9 +268,13 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
     return client.state == WebSocketConnectionState.connected;
   }
 
-  String get _aggregateStatus {
-    if (_healthMap.isEmpty) return 'ok';
+  /// Whether portal state is active enough to include in health aggregation.
+  bool get _portalStateRelevant {
+    final s = _portalState;
+    return s != null && s != 'disabled' && s != 'stopped';
+  }
 
+  String get _aggregateStatus {
     var hasError = false;
     var hasDegraded = false;
     var hasRecovering = false;
@@ -258,6 +283,14 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
       if (health.isError) hasError = true;
       if (health.isDegraded) hasDegraded = true;
       if (health.isRecovering) hasRecovering = true;
+    }
+
+    // Include portal/remote state when actively configured.
+    if (_portalStateRelevant) {
+      if (_portalState == 'error') hasError = true;
+      if (_portalState == 'warning' || _portalState == 'preflight_required') {
+        hasDegraded = true;
+      }
     }
 
     if (hasError) return 'error';

@@ -29,6 +29,12 @@ import (
 	acmepkg "golang.org/x/crypto/acme"
 )
 
+// Solver type constants for ACME challenge solvers.
+const (
+	SolverHTTP01 = "http-01"
+	SolverDNS01  = "dns-01"
+)
+
 func init() {
 	// Disable lego's CNAME following for DNS-01 challenges. Our orchestrator
 	// client creates TXT records directly in the authoritative zone. Lego's
@@ -78,7 +84,7 @@ func NewManager(stateDir string, sink ChallengeSink, email string, directoryURL 
 		directory: directoryURL,
 		email:     email,
 		sink:      sink,
-		solver:    "http-01",
+		solver:    SolverHTTP01,
 	}
 }
 
@@ -200,9 +206,9 @@ func (m *Manager) SetSolver(solver string) error {
 	}
 	s := strings.ToLower(strings.TrimSpace(solver))
 	if s == "" {
-		s = "http-01"
+		s = SolverHTTP01
 	}
-	if s != "http-01" && s != "dns-01" {
+	if s != SolverHTTP01 && s != SolverDNS01 {
 		return fmt.Errorf("acme: unsupported solver %q", s)
 	}
 	m.mu.Lock()
@@ -234,7 +240,7 @@ func configureChallengeWith(cli *lego.Client, solver string, orchClient Orchestr
 	if cli == nil {
 		return errors.New("acme: client unavailable")
 	}
-	if strings.EqualFold(solver, "dns-01") {
+	if strings.EqualFold(solver, SolverDNS01) {
 		if orchClient == nil {
 			return errors.New("acme: orchestrator client not configured")
 		}
@@ -390,7 +396,7 @@ func (p *http01Provider) CleanUp(domain, token, keyAuth string) error {
 	}
 	return nil
 }
-func (p *http01Provider) GetType() string { return "http-01" }
+func (p *http01Provider) GetType() string { return SolverHTTP01 }
 
 // PEM encode helper for EC keys
 func pemEncodeEC(key *ecdsa.PrivateKey) ([]byte, error) {

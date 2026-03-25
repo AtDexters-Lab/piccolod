@@ -12,7 +12,6 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 
 	authpkg "piccolod/internal/auth"
-	"piccolod/internal/events"
 	"piccolod/internal/persistence"
 )
 
@@ -61,22 +60,6 @@ func (s *GinServer) getAuthorizedCredential(c *gin.Context, sess *authpkg.Sessio
 }
 
 // --- Audit ---
-
-// publishPasskeyAudit publishes an audit event for passkey/invite operations.
-func (s *GinServer) publishPasskeyAudit(c *gin.Context, kind string, metadata map[string]any) {
-	if s.events == nil {
-		return
-	}
-	s.events.Publish(events.Event{
-		Topic: events.TopicAudit,
-		Payload: events.AuditEvent{
-			Kind:     kind,
-			Time:     time.Now(),
-			Source:   c.ClientIP(),
-			Metadata: metadata,
-		},
-	})
-}
 
 // --- Helpers ---
 
@@ -292,7 +275,7 @@ func (s *GinServer) handlePasskeyRegisterFinish(c *gin.Context) {
 
 	sess.MustRegisterPasskey = false
 
-	s.publishPasskeyAudit(c, "passkey.registered", map[string]any{
+	s.publishAuditEvent(c, "passkey.registered", map[string]any{
 		"user_id":       sess.UserID,
 		"credential_id": cred.ID,
 		"rp_id":         cred.RPID,
@@ -372,7 +355,7 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 			return
 		}
 		s.passkeyRateLimiter.RecordFailure(c.ClientIP())
-		s.publishPasskeyAudit(c, "passkey.auth.failure", map[string]any{
+		s.publishAuditEvent(c, "passkey.auth.failure", map[string]any{
 			"rp_id":  rpID,
 			"reason": err.Error(),
 		})
@@ -402,7 +385,7 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 	s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
 	s.resetLoginFailures()
 
-	s.publishPasskeyAudit(c, "passkey.auth.success", map[string]any{
+	s.publishAuditEvent(c, "passkey.auth.success", map[string]any{
 		"user_id": userInfo.ID,
 		"rp_id":   rpID,
 	})
@@ -490,7 +473,7 @@ func (s *GinServer) handleDeletePasskey(c *gin.Context) {
 		return
 	}
 
-	s.publishPasskeyAudit(c, "passkey.deleted", map[string]any{
+	s.publishAuditEvent(c, "passkey.deleted", map[string]any{
 		"user_id":       cred.UserID,
 		"credential_id": credID,
 		"deleted_by":    sess.UserID,
@@ -591,7 +574,7 @@ func (s *GinServer) handleCreateInvite(c *gin.Context) {
 		return
 	}
 
-	s.publishPasskeyAudit(c, "invite.created", map[string]any{
+	s.publishAuditEvent(c, "invite.created", map[string]any{
 		"user_id":    userInfo.ID,
 		"created_by": sess.UserID,
 	})
@@ -774,12 +757,12 @@ func (s *GinServer) handleInvitePasskeyFinish(c *gin.Context) {
 		return
 	}
 
-	s.publishPasskeyAudit(c, "passkey.registered", map[string]any{
+	s.publishAuditEvent(c, "passkey.registered", map[string]any{
 		"user_id":       cred.UserID,
 		"credential_id": cred.ID,
 		"rp_id":         cred.RPID,
 	})
-	s.publishPasskeyAudit(c, "invite.consumed", map[string]any{
+	s.publishAuditEvent(c, "invite.consumed", map[string]any{
 		"user_id": userID,
 	})
 

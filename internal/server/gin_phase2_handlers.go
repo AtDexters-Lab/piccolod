@@ -10,7 +10,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"piccolod/internal/events"
 	"piccolod/internal/identity"
 	"piccolod/internal/remote"
 	"piccolod/internal/update"
@@ -132,16 +131,7 @@ func (s *GinServer) handleOSUpdateReboot(c *gin.Context) {
 	force := c.Query("force") == "true"
 
 	if force {
-		if s.events != nil {
-			s.events.Publish(events.Event{
-				Topic: events.TopicAudit,
-				Payload: events.AuditEvent{
-					Kind:   "system.force_reboot",
-					Time:   time.Now().UTC(),
-					Source: c.ClientIP(),
-				},
-			})
-		}
+		s.publishAuditEvent(c, "system.force_reboot", nil)
 		if err := s.updateManager.ForceReboot(context.Background()); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to trigger reboot: " + err.Error()})
 			return

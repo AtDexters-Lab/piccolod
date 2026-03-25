@@ -357,6 +357,116 @@ func backfillInputDefaults(declared map[string]api.AppInput, provided map[string
 	return merged
 }
 
+// ValidateInputs validates user-provided inputs against their declared types and constraints.
+// Returns an error listing all validation failures, or nil if all inputs are valid.
+// Unknown types are silently accepted for forward compatibility.
+func ValidateInputs(declared map[string]api.AppInput, provided map[string]interface{}) error {
+	var errs []string
+	for name, spec := range declared {
+		val, exists := provided[name]
+		if !exists || val == nil {
+			if spec.Required && !spec.Generate {
+				errs = append(errs, fmt.Sprintf("input '%s' is required", name))
+			}
+			continue
+		}
+		if err := validateInputValue(name, spec, val); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("input validation failed: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func validateInputValue(name string, spec api.AppInput, val interface{}) error {
+	switch spec.Type {
+	case "string", "password":
+		s, ok := val.(string)
+		if !ok {
+			return fmt.Errorf("input '%s': expected string, got %T", name, val)
+		}
+		return validateRegex(name, spec, s)
+
+	case "boolean":
+		switch val.(type) {
+		case bool:
+			// ok
+		case string:
+			v := val.(string)
+			if v != "true" && v != "false" {
+				return fmt.Errorf("input '%s': expected boolean, got string %q", name, v)
+			}
+		default:
+			return fmt.Errorf("input '%s': expected boolean, got %T", name, val)
+		}
+
+	case "int":
+		f, ok := val.(float64)
+		if !ok {
+			return fmt.Errorf("input '%s': expected number, got %T", name, val)
+		}
+		if f != float64(int64(f)) {
+			return fmt.Errorf("input '%s': expected integer, got %v", name, f)
+		}
+
+	case "number":
+		if _, ok := val.(float64); !ok {
+			return fmt.Errorf("input '%s': expected number, got %T", name, val)
+		}
+
+	case "array":
+		arr, ok := val.([]interface{})
+		if !ok {
+			return fmt.Errorf("input '%s': expected array, got %T", name, val)
+		}
+		var re *regexp.Regexp
+		if spec.Validation != nil && spec.Validation.Regex != "" {
+			var err error
+			re, err = regexp.Compile(spec.Validation.Regex)
+			if err != nil {
+				return fmt.Errorf("input '%s': invalid regex pattern: %v", name, err)
+			}
+		}
+		for i, elem := range arr {
+			s, ok := elem.(string)
+			if !ok {
+				return fmt.Errorf("input '%s[%d]': expected string element, got %T", name, i, elem)
+			}
+			if re != nil && !re.MatchString(s) {
+				msg := spec.Validation.Message
+				if msg == "" {
+					msg = "does not match pattern"
+				}
+				return fmt.Errorf("input '%s[%d]': %s", name, i, msg)
+			}
+		}
+
+	default:
+		// Unknown type — skip validation for forward compatibility.
+	}
+	return nil
+}
+
+func validateRegex(name string, spec api.AppInput, val string) error {
+	if spec.Validation == nil || spec.Validation.Regex == "" {
+		return nil
+	}
+	re, err := regexp.Compile(spec.Validation.Regex)
+	if err != nil {
+		return fmt.Errorf("input '%s': invalid regex pattern: %v", name, err)
+	}
+	if !re.MatchString(val) {
+		msg := spec.Validation.Message
+		if msg == "" {
+			msg = "does not match pattern"
+		}
+		return fmt.Errorf("input '%s': %s", name, msg)
+	}
+	return nil
+}
+
 // RenderManifest applies user inputs to the app manifest template.
 func RenderManifest(rawYaml []byte, userInputs map[string]interface{}, systemContext map[string]interface{}) ([]byte, error) {
 	// Backfill zero values for declared-but-unprovided optional inputs

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/binary"
 	"errors"
 	"log"
 	"net"
@@ -18,6 +19,32 @@ const (
 	udpSweepInterval   = 30 * time.Second
 )
 
+// flowKey is a fixed-size byte key for UDP flow map lookups.
+// Avoids per-packet string allocation from srcAddr.String().
+// Layout: [2]byte port (big-endian) + up to [16]byte IP.
+type flowKey [18]byte
+
+// makeFlowKey builds a flowKey from a UDP address. Zero-alloc.
+// Uses To16() to normalize all IPs to 16 bytes, avoiding collisions
+// between short IPv4 and IPv6 addresses that share a byte prefix.
+func makeFlowKey(addr *net.UDPAddr) flowKey {
+	var k flowKey
+	binary.BigEndian.PutUint16(k[:2], uint16(addr.Port))
+	if ip16 := addr.IP.To16(); ip16 != nil {
+		copy(k[2:], ip16)
+	}
+	return k
+}
+
+// udpBufPool recycles 8KB buffers across relay goroutine lifetimes.
+// Uses pointer-to-slice to avoid interface boxing allocation on Put.
+var udpBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, udpReadBufSize)
+		return &b
+	},
+}
+
 // udpFlow tracks a single source-address-to-backend relay.
 // lastActiveNano is accessed from multiple goroutines via atomic operations.
 type udpFlow struct {
@@ -33,8 +60,8 @@ type udpProxyState struct {
 	stopCh      chan struct{}
 	stopped     chan struct{}
 	mu          sync.Mutex
-	flows       map[string]*udpFlow // keyed by srcAddr.String()
-	ipCounts    map[string]int      // keyed by srcAddr.IP.String()
+	flows       map[flowKey]*udpFlow
+	ipCounts    map[string]int // keyed by srcAddr.IP.String() (cold path only)
 }
 
 func (s *udpProxyState) stop() {
@@ -90,7 +117,7 @@ func (p *ProxyManager) startUDPProxy(ep ServiceEndpoint) {
 		backendAddr: backendUDP,
 		stopCh:      make(chan struct{}),
 		stopped:     make(chan struct{}),
-		flows:       make(map[string]*udpFlow),
+		flows:       make(map[flowKey]*udpFlow),
 		ipCounts:    make(map[string]int),
 	}
 	p.udpListeners[ep.PublicPort] = state
@@ -134,7 +161,7 @@ func isClosedConnErr(err error) bool {
 }
 
 func (s *udpProxyState) getOrCreateFlow(srcAddr *net.UDPAddr) *udpFlow {
-	key := srcAddr.String()
+	key := makeFlowKey(srcAddr)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -170,10 +197,19 @@ func (s *udpProxyState) getOrCreateFlow(srcAddr *net.UDPAddr) *udpFlow {
 	return flow
 }
 
-func (s *udpProxyState) relayReturn(flow *udpFlow, key string) {
-	buf := make([]byte, udpReadBufSize)
+// relayReturn reads responses from the backend and forwards them to the client.
+// Goroutine terminates when backendConn is closed (by sweepIdleFlows eviction
+// or stop()), which unblocks the Read call with an error.
+// TODO: pre-existing race — if sweep evicts this flow and getOrCreateFlow
+// immediately creates a new flow with the same key, this goroutine's
+// removeFlow call could delete the new flow. A removeFlowIfSame guard
+// comparing the flow pointer would prevent this.
+func (s *udpProxyState) relayReturn(flow *udpFlow, key flowKey) {
+	bufp := udpBufPool.Get().(*[]byte)
+	buf := *bufp
+	defer udpBufPool.Put(bufp)
+
 	for {
-		_ = flow.backendConn.SetReadDeadline(time.Now().Add(udpFlowIdleTimeout))
 		n, err := flow.backendConn.Read(buf)
 		if err != nil {
 			break
@@ -185,7 +221,7 @@ func (s *udpProxyState) relayReturn(flow *udpFlow, key string) {
 }
 
 // removeFlowLocked removes a flow and cleans up ipCounts. Caller must hold s.mu.
-func (s *udpProxyState) removeFlowLocked(key string) {
+func (s *udpProxyState) removeFlowLocked(key flowKey) {
 	flow, ok := s.flows[key]
 	if !ok {
 		return
@@ -199,23 +235,25 @@ func (s *udpProxyState) removeFlowLocked(key string) {
 	delete(s.flows, key)
 }
 
-func (s *udpProxyState) removeFlow(key string) {
+func (s *udpProxyState) removeFlow(key flowKey) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.removeFlowLocked(key)
 }
 
 func (s *udpProxyState) evictOldestLocked() {
-	var oldestKey string
+	var oldestKey flowKey
 	var oldestNano int64
+	found := false
 	for k, f := range s.flows {
 		nano := f.lastActiveNano.Load()
-		if oldestKey == "" || nano < oldestNano {
+		if !found || nano < oldestNano {
 			oldestKey = k
 			oldestNano = nano
+			found = true
 		}
 	}
-	if oldestKey != "" {
+	if found {
 		s.removeFlowLocked(oldestKey)
 	}
 }

@@ -29,6 +29,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/events"
 	"piccolod/internal/fsutil"
+	"piccolod/internal/hostname"
 	"piccolod/internal/remote/acme"
 	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/remote/orchestrator"
@@ -790,20 +791,20 @@ func (m *Manager) Status() Status {
 		latency = intPtr(cfg.LatencyMS)
 	}
 
-	state := "disabled"
+	state := string(RemoteStateDisabled)
 	if cfg.Enabled {
-		state = "active"
+		state = string(RemoteStateActive)
 		if cfg.LastPreflight == nil {
-			state = "preflight_required"
+			state = string(RemoteStatePreflightRequired)
 		} else if len(warnings) > 0 {
-			state = "warning"
+			state = string(RemoteStateWarning)
 		}
 		if !cfg.ExpiresAt.IsZero() && cfg.ExpiresAt.Before(m.now()) {
-			state = "error"
+			state = string(RemoteStateError)
 		}
 	} else if cfg.Endpoint != "" && cfg.PortalHostname != "" {
 		// Valid config exists but is disabled -> "stopped"
-		state = "stopped"
+		state = string(RemoteStateStopped)
 	}
 
 	aliases := cloneAliases(cfg.Aliases)
@@ -835,8 +836,8 @@ func (m *Manager) Status() Status {
 	if cfg.Enabled {
 		if w := m.relayWarning(); w != "" {
 			result.Warnings = append(result.Warnings, w)
-			if result.State == "active" {
-				result.State = "warning"
+			if result.State == string(RemoteStateActive) {
+				result.State = string(RemoteStateWarning)
 			}
 		}
 	}
@@ -872,20 +873,23 @@ type ManagedConfigureRequest struct {
 	PortalHostname       string `json:"portal_hostname"` // Fully-qualified hostname (e.g., portal.home.example.com)
 }
 
-// Configure persists a new user-managed remote configuration (HTTP-01 only).
-func (m *Manager) Configure(req ConfigureRequest) error {
-	endpoint := strings.TrimSpace(req.Endpoint)
-	if endpoint == "" {
-		return errors.New("endpoint required")
-	}
-	if _, err := url.ParseRequestURI(endpoint); err != nil {
-		return fmt.Errorf("invalid endpoint: %w", err)
-	}
+// configureParams holds mode-specific parameters for configureCommon.
+type configureParams struct {
+	portalHost   string
+	solver       string
+	endpoint     string
+	orchClient   acme.OrchestratorClient // nil for HTTP-01
+	eventMessage string
+	// mutateConfig applies mode-specific config changes under cfgMu.
+	// Return non-nil error to abort (configureCommon will unlock and return it).
+	mutateConfig func(cfg *Config) error
+}
 
-	// User-managed mode always uses HTTP-01
-	solver := "http-01"
-
-	portalHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(req.PortalHostname)), ".")
+// configureCommon encapsulates the shared configuration logic for Configure and ConfigureManaged.
+// It validates the portal hostname, configures ACME, mutates config, resets certificates, and saves.
+// NOTE: saveAll releases cfgMu — this function must NOT defer-unlock.
+func (m *Manager) configureCommon(p configureParams) error {
+	portalHost := hostname.Normalize(p.portalHost)
 	if portalHost == "" {
 		return errors.New("portal_hostname required")
 	}
@@ -896,8 +900,11 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	email := deriveACMEEmail(portalHost)
 	if m.acmeMgr != nil {
 		m.acmeMgr.SetEmail(email)
-		if err := m.acmeMgr.SetSolver(solver); err != nil {
+		if err := m.acmeMgr.SetSolver(p.solver); err != nil {
 			return err
+		}
+		if p.orchClient != nil {
+			m.acmeMgr.SetOrchestratorClient(p.orchClient)
 		}
 	}
 
@@ -908,31 +915,27 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	m.cfgMu.Lock()
 	cfg := m.currentConfigLocked()
 	existingCerts := append([]Certificate(nil), cfg.Certificates...)
-	cfg.Endpoint = endpoint
-	// Preserve existing secret if not provided (allows reconfigure without re-entering secret)
-	newSecret := strings.TrimSpace(req.DeviceSecret)
-	if newSecret != "" {
-		cfg.DeviceSecret = newSecret
-	} else if cfg.DeviceSecret == "" {
-		m.cfgMu.Unlock()
-		return errors.New("device_secret required")
+
+	// Apply mode-specific config changes under lock.
+	if p.mutateConfig != nil {
+		if err := p.mutateConfig(cfg); err != nil {
+			m.cfgMu.Unlock()
+			return err
+		}
 	}
-	cfg.Solver = solver
+
+	cfg.Endpoint = p.endpoint
+	cfg.Solver = p.solver
 	cfg.PortalHostname = portalHost
-	cfg.Managed = false
-	cfg.OrchestratorEndpoint = ""
 	cfg.Enabled = true
 	cfg.Issuer = "Let's Encrypt"
 	cfg.ExpiresAt = expires
 	cfg.NextRenewal = nextRenewal
 	cfg.LastHandshake = now
 	cfg.LatencyMS = 0
-	// Assume preflight passed during setup wizard; prevent immediate warning state
+	// Assume preflight passed during setup wizard; prevent immediate warning state.
 	cfg.LastPreflight = &now
-	// Queue background ACME issuance and surface events/inventory.
-	// User-managed mode only issues portal cert (no wildcard).
-	// Certs start as "pending"; actual issuance is gated on relay connectivity
-	// (httpChallengeReachable) and triggered by handleRelayEvent on connect.
+
 	newCerts := defaultCertificates(cfg)
 	for _, c := range existingCerts {
 		if c.ID == "portal" || c.ID == "wildcard" {
@@ -945,13 +948,46 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 		Timestamp: now,
 		Level:     "info",
 		Source:    "remote",
-		Message:   "Remote configuration saved (user-managed, HTTP-01)",
+		Message:   p.eventMessage,
 		NextStep:  "Run preflight",
 	})
-	if err := m.saveAll(cfg); err != nil {
+	// saveAll releases cfgMu on all paths.
+	return m.saveAll(cfg)
+}
+
+// Configure persists a new user-managed remote configuration (HTTP-01 only).
+func (m *Manager) Configure(req ConfigureRequest) error {
+	endpoint := strings.TrimSpace(req.Endpoint)
+	if endpoint == "" {
+		return errors.New("endpoint required")
+	}
+	if _, err := url.ParseRequestURI(endpoint); err != nil {
+		return fmt.Errorf("invalid endpoint: %w", err)
+	}
+
+	newSecret := strings.TrimSpace(req.DeviceSecret)
+
+	if err := m.configureCommon(configureParams{
+		portalHost:   req.PortalHostname,
+		solver:       acme.SolverHTTP01,
+		endpoint:     endpoint,
+		eventMessage: "Remote configuration saved (user-managed, HTTP-01)",
+		mutateConfig: func(cfg *Config) error {
+			// Preserve existing secret if not provided (allows reconfigure without re-entering secret).
+			if newSecret != "" {
+				cfg.DeviceSecret = newSecret
+			} else if cfg.DeviceSecret == "" {
+				return errors.New("device_secret required")
+			}
+			cfg.Managed = false
+			cfg.OrchestratorEndpoint = ""
+			return nil
+		},
+	}); err != nil {
 		return err
 	}
 
+	portalHost := hostname.Normalize(req.PortalHostname)
 	log.Printf("remote: configured (solver=http-01, portal=%s)", portalHost)
 	m.startRenewScheduler()
 	// Requeue pending certs. If the relay is already connected (e.g., re-saving
@@ -976,80 +1012,34 @@ func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
 		return errors.New("device_token required")
 	}
 
-	// Managed mode always uses DNS-01
-	solver := "dns-01"
-
-	portalHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(req.PortalHostname)), ".")
-	if portalHost == "" {
-		return errors.New("portal_hostname required")
-	}
-	if !strings.Contains(portalHost, ".") {
-		return errors.New("portal_hostname must be a fully-qualified hostname (e.g., portal.home.example.com)")
-	}
-
-	// Create orchestrator client and wire to ACME manager
 	orchClient := orchestrator.NewClient(endpoint, deviceToken)
-	email := deriveACMEEmail(portalHost)
-	if m.acmeMgr != nil {
-		m.acmeMgr.SetEmail(email)
-		if err := m.acmeMgr.SetSolver(solver); err != nil {
-			return err
-		}
-		m.acmeMgr.SetOrchestratorClient(orchClient)
-	}
 
-	now := m.now()
-	expires := now.Add(90 * 24 * time.Hour)
-	nextRenewal := now.Add(60 * 24 * time.Hour)
-
-	m.cfgMu.Lock()
-	cfg := m.currentConfigLocked()
-	existingCerts := append([]Certificate(nil), cfg.Certificates...)
-	cfg.Endpoint = endpoint // Use orchestrator endpoint as nexus endpoint for managed mode
-	cfg.DeviceSecret = deviceToken
-	cfg.Solver = solver
-	cfg.PortalHostname = portalHost
-	cfg.Managed = true
-	cfg.OrchestratorEndpoint = endpoint
-	cfg.Enabled = true
-	cfg.Issuer = "Let's Encrypt"
-	cfg.ExpiresAt = expires
-	cfg.NextRenewal = nextRenewal
-	cfg.LastHandshake = now
-	cfg.LatencyMS = 0
-	// Assume preflight passed during setup wizard; prevent immediate warning state
-	cfg.LastPreflight = &now
-	// Queue background ACME issuance and surface events/inventory.
-	// Managed mode issues both portal cert and wildcard cert
-	newCerts := defaultCertificates(cfg)
-	for _, c := range existingCerts {
-		if c.ID == "portal" || c.ID == "wildcard" {
-			continue
-		}
-		newCerts = append(newCerts, c)
-	}
-	cfg.Certificates = newCerts
-	cfg.Events = append(cfg.Events, Event{
-		Timestamp: now,
-		Level:     "info",
-		Source:    "remote",
-		Message:   "Remote configuration saved (managed, DNS-01)",
-		NextStep:  "Run preflight",
-	})
-	if err := m.saveAll(cfg); err != nil {
+	if err := m.configureCommon(configureParams{
+		portalHost:   req.PortalHostname,
+		solver:       acme.SolverDNS01,
+		endpoint:     endpoint,
+		orchClient:   orchClient,
+		eventMessage: "Remote configuration saved (managed, DNS-01)",
+		mutateConfig: func(cfg *Config) error {
+			cfg.DeviceSecret = deviceToken
+			cfg.Managed = true
+			cfg.OrchestratorEndpoint = endpoint
+			return nil
+		},
+	}); err != nil {
 		return err
 	}
 
+	portalHost := hostname.Normalize(req.PortalHostname)
 	log.Printf("remote: configured (solver=dns-01, managed=true, portal=%s)", portalHost)
 
 	// Queue issuance jobs after releasing lock (enqueueIssuanceJob acquires its own lock).
 	// Force=true so the duplicate guard doesn't skip certs that are already "pending".
 	m.enqueueIssuanceJob(issuanceJob{id: "portal", domains: []string{portalHost}, commonName: portalHost, force: true})
 	// Managed mode supports wildcard via DNS-01
-	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portalHost)), ".")
-	if base != "" {
-		cn := "*." + base
-		m.enqueueIssuanceJob(issuanceJob{id: "wildcard", domains: []string{cn, base}, commonName: cn, force: true})
+	if portalHost != "" {
+		cn := "*." + portalHost
+		m.enqueueIssuanceJob(issuanceJob{id: "wildcard", domains: []string{cn, portalHost}, commonName: cn, force: true})
 	}
 	return nil
 }
@@ -1132,7 +1122,7 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 		ID:       fmt.Sprintf("alias-%d", time.Now().UnixNano()+rand.Int63n(1000)),
 		Hostname: hostname,
 		Listener: listener,
-		Status:   "pending",
+		Status:   string(CertStatusPending),
 	}
 	cfg.Aliases = append(cfg.Aliases, alias)
 	cfg.Events = append(cfg.Events, Event{
@@ -1150,7 +1140,7 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 		id:         "alias:" + h,
 		domains:    []string{h},
 		commonName: h,
-		solver:     "http-01",
+		solver:     acme.SolverHTTP01,
 	})
 	return alias, nil
 }
@@ -1182,7 +1172,7 @@ func (m *Manager) RemoveAlias(id string) error {
 		return err
 	}
 	// Remove associated certificate entry and files (best-effort).
-	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(removed.Hostname)), ".")
+	h := hostname.Normalize(removed.Hostname)
 	if h != "" {
 		m.removeCertificateByID("alias:"+h, h, "")
 	}
@@ -1191,8 +1181,8 @@ func (m *Manager) RemoveAlias(id string) error {
 
 // RemoveHostnameCertificate removes a per-host certificate (host:<hostname>) and its files.
 // Safe to call even if no such certificate exists.
-func (m *Manager) RemoveHostnameCertificate(hostname string) {
-	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+func (m *Manager) RemoveHostnameCertificate(host string) {
+	h := hostname.Normalize(host)
 	if h == "" {
 		return
 	}
@@ -1617,7 +1607,7 @@ func (m *Manager) httpChallengeReachable() bool {
 // needsRelay returns true for solvers that require relay connectivity (HTTP-01).
 // DNS-01 uses the orchestrator API and does not need the relay.
 func needsRelay(solver string) bool {
-	return !strings.EqualFold(solver, "dns-01")
+	return !strings.EqualFold(solver, acme.SolverDNS01)
 }
 
 // ClearRelayState removes the relay state entry for the given adapter name.
@@ -1750,7 +1740,7 @@ func (m *Manager) computeNextWakeTime() time.Duration {
 			earliest = *c.RetryAt
 		}
 		// Check NextRenewal for non-error certs (error certs use RetryAt backoff only)
-		if !strings.EqualFold(c.Status, "error") && c.NextRenewal != nil && c.NextRenewal.Before(earliest) {
+		if !strings.EqualFold(c.Status, string(CertStatusError)) && c.NextRenewal != nil && c.NextRenewal.Before(earliest) {
 			earliest = *c.NextRenewal
 		}
 	}
@@ -1776,7 +1766,7 @@ func (m *Manager) scanAndQueueRenewals() {
 	relayReady := m.httpChallengeReachable()
 	var jobs []renewalJob
 	for _, c := range cfg.Certificates {
-		if strings.EqualFold(c.Status, "pending") {
+		if strings.EqualFold(c.Status, string(CertStatusPending)) {
 			continue // avoid duplicate queueing
 		}
 		// HTTP-01 relay gate: skip if not all relays are connected to prevent
@@ -1788,7 +1778,7 @@ func (m *Manager) scanAndQueueRenewals() {
 		dueRetry := c.RetryAt != nil && now.After(*c.RetryAt)
 		// Only check renewal schedule for non-error certs; error certs must wait for RetryAt backoff
 		dueRenewal := false
-		if !strings.EqualFold(c.Status, "error") && c.NextRenewal != nil && c.ExpiresAt != nil {
+		if !strings.EqualFold(c.Status, string(CertStatusError)) && c.NextRenewal != nil && c.ExpiresAt != nil {
 			dueRenewal = now.After(*c.NextRenewal) || now.Add(24*time.Hour).After(*c.ExpiresAt)
 		}
 		if !dueRetry && !dueRenewal {
@@ -1824,7 +1814,7 @@ func desiredDomainsAndCN(cfg *Config, c Certificate) ([]string, string, bool) {
 		if len(c.Domains) == 0 {
 			return nil, "", false
 		}
-		cn := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(c.Domains[0])), ".")
+		cn := hostname.Normalize(c.Domains[0])
 		return append([]string(nil), c.Domains...), cn, true
 	}
 
@@ -1833,14 +1823,14 @@ func desiredDomainsAndCN(cfg *Config, c Certificate) ([]string, string, bool) {
 		if cfg.PortalHostname == "" {
 			return nil, "", false
 		}
-		h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
+		h := hostname.Normalize(cfg.PortalHostname)
 		return []string{h}, h, true
 	case "wildcard":
 		// Wildcard only for managed mode (DNS-01 via orchestrator)
-		if !cfg.Managed || cfg.PortalHostname == "" || !strings.EqualFold(cfg.Solver, "dns-01") {
+		if !cfg.Managed || cfg.PortalHostname == "" || !strings.EqualFold(cfg.Solver, acme.SolverDNS01) {
 			return nil, "", false
 		}
-		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
+		base := hostname.Normalize(cfg.PortalHostname)
 		if base == "" {
 			return nil, "", false
 		}
@@ -1852,14 +1842,14 @@ func desiredDomainsAndCN(cfg *Config, c Certificate) ([]string, string, bool) {
 			if len(parts) != 2 || parts[1] == "" {
 				return nil, "", false
 			}
-			h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(parts[1])), ".")
+			h := hostname.Normalize(parts[1])
 			return []string{h}, h, true
 		}
 	}
 	if len(c.Domains) == 0 {
 		return nil, "", false
 	}
-	cn := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(c.Domains[0])), ".")
+	cn := hostname.Normalize(c.Domains[0])
 	return append([]string(nil), c.Domains...), cn, true
 }
 
@@ -1886,7 +1876,7 @@ func (m *Manager) requeueOutstandingIssuances() {
 	now := m.now()
 	var jobs []requeueJob
 	for _, c := range cfg.Certificates {
-		if strings.EqualFold(c.Status, "pending") {
+		if strings.EqualFold(c.Status, string(CertStatusPending)) {
 			domains, cn, ok := desiredDomainsAndCN(cfg, c)
 			if ok {
 				jobs = append(jobs, requeueJob{id: c.ID, domains: domains, cn: cn, source: c.Source, solver: c.Solver, certDir: c.CertDir, isPending: true})
@@ -1894,7 +1884,7 @@ func (m *Manager) requeueOutstandingIssuances() {
 			continue
 		}
 		// Requeue error certs that are due for retry (no max attempts - indefinite retry per RFC 20260125)
-		if strings.EqualFold(c.Status, "error") && c.RetryAt != nil && now.After(*c.RetryAt) {
+		if strings.EqualFold(c.Status, string(CertStatusError)) && c.RetryAt != nil && now.After(*c.RetryAt) {
 			domains, cn, ok := desiredDomainsAndCN(cfg, c)
 			if ok {
 				jobs = append(jobs, requeueJob{id: c.ID, domains: domains, cn: cn, source: c.Source, solver: c.Solver, certDir: c.CertDir, isPending: false})
@@ -1911,7 +1901,7 @@ func (m *Manager) requeueOutstandingIssuances() {
 		ij := issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, force: true, source: job.source, solver: job.solver, certDir: job.certDir}
 		// DNS-01 orchClient gate: skip if orchClient not yet registered
 		// (e.g., boot timing — the source's event handler will re-enqueue after registration).
-		if strings.EqualFold(job.solver, "dns-01") && job.source != "" {
+		if strings.EqualFold(job.solver, acme.SolverDNS01) && job.source != "" {
 			m.adapterMu.Lock()
 			ij.orchClient = m.orchClients[job.source]
 			m.adapterMu.Unlock()
@@ -1959,11 +1949,11 @@ func (m *Manager) RenewCertificate(id string) error {
 					errMsg = "wildcard renewals require managed mode"
 					break
 				}
-				if !strings.EqualFold(cfg.Solver, "dns-01") {
+				if !strings.EqualFold(cfg.Solver, acme.SolverDNS01) {
 					errMsg = "wildcard renewals require dns-01 solver"
 					break
 				}
-				base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
+				base := hostname.Normalize(cfg.PortalHostname)
 				if base == "" {
 					errMsg = "portal hostname missing"
 					break
@@ -1984,7 +1974,7 @@ func (m *Manager) RenewCertificate(id string) error {
 	}
 	job := issuanceJob{id: id, domains: domains, commonName: cn, force: true, source: source, solver: solver, certDir: certDir}
 	// Resolve orchClient for source-tagged certs so the correct solver path is used.
-	if source != "" && strings.EqualFold(solver, "dns-01") {
+	if source != "" && strings.EqualFold(solver, acme.SolverDNS01) {
 		m.adapterMu.Lock()
 		job.orchClient = m.orchClients[source]
 		m.adapterMu.Unlock()
@@ -2032,7 +2022,7 @@ func (m *Manager) enqueueIssuanceJob(job issuanceJob) {
 		m.cfgMu.RUnlock()
 
 		// Only DNS-01 certs need an orchestrator client; HTTP-01 uses the default ACME path.
-		if strings.EqualFold(job.solver, "dns-01") {
+		if strings.EqualFold(job.solver, acme.SolverDNS01) {
 			m.adapterMu.Lock()
 			if oc, ok := m.orchClients[job.source]; ok {
 				job.orchClient = oc
@@ -2059,13 +2049,13 @@ func (m *Manager) enqueueIssuanceJob(job issuanceJob) {
 			break
 		}
 		// Already queued for issuance.
-		if strings.EqualFold(c.Status, "pending") {
+		if strings.EqualFold(c.Status, string(CertStatusPending)) {
 			m.cfgMu.Unlock()
 			return
 		}
 		// Already issued and not yet due for renewal.
 		// Also honor the 24h-before-expiry safety net from scanAndQueueRenewals.
-		if strings.EqualFold(c.Status, "ok") && c.NextRenewal != nil && now.Before(*c.NextRenewal) &&
+		if strings.EqualFold(c.Status, string(CertStatusOK)) && c.NextRenewal != nil && now.Before(*c.NextRenewal) &&
 			(c.ExpiresAt == nil || !now.Add(24*time.Hour).After(*c.ExpiresAt)) {
 			m.cfgMu.Unlock()
 			return
@@ -2246,7 +2236,7 @@ func (m *Manager) processIssuance(job issuanceJob) {
 	var issueErr error
 	if job.solver != "" && job.orchClient != nil {
 		_, issueErr = m.acmeMgr.IssueWithSolver(job.solver, job.orchClient, job.commonName, sans, outName, certDir)
-	} else if strings.EqualFold(job.solver, "dns-01") {
+	} else if strings.EqualFold(job.solver, acme.SolverDNS01) {
 		// DNS-01 requires an orchClient; fail explicitly rather than falling back to default ACME.
 		issueErr = fmt.Errorf("dns-01 cert %s requires orchClient but none registered for source %q", job.id, job.source)
 	} else {
@@ -2264,10 +2254,10 @@ func (m *Manager) processIssuance(job issuanceJob) {
 }
 
 func buildSans(commonName string, domains []string) []string {
-	commonName = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(commonName)), ".")
+	commonName = hostname.Normalize(commonName)
 	uniq := make(map[string]struct{})
 	for _, d := range domains {
-		h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(d)), ".")
+		h := hostname.Normalize(d)
 		if h == "" || h == commonName {
 			continue
 		}
@@ -2304,7 +2294,7 @@ func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, no
 	for i := range cfg.Certificates {
 		if cfg.Certificates[i].ID == id {
 			cfg.Certificates[i].Domains = append([]string(nil), domains...)
-			cfg.Certificates[i].Status = "pending"
+			cfg.Certificates[i].Status = string(CertStatusPending)
 			cfg.Certificates[i].FailureReason = ""
 			cfg.Certificates[i].RetryAt = nil
 			cfg.Certificates[i].IssuedAt = nil
@@ -2327,7 +2317,7 @@ func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, no
 		cfg.Certificates = append(cfg.Certificates, Certificate{
 			ID:      id,
 			Domains: append([]string(nil), domains...),
-			Status:  "pending",
+			Status:  string(CertStatusPending),
 			Source:  source,
 			Solver:  solver,
 			CertDir: certDir,
@@ -2373,7 +2363,7 @@ func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
 			cfg.Certificates[i].IssuedAt = timePtr(now)
 			cfg.Certificates[i].ExpiresAt = timePtr(expiresAt)
 			cfg.Certificates[i].NextRenewal = timePtr(next)
-			cfg.Certificates[i].Status = "ok"
+			cfg.Certificates[i].Status = string(CertStatusOK)
 			cfg.Certificates[i].FailureReason = ""
 			cfg.Certificates[i].Attempts = 0
 			cfg.Certificates[i].RetryAt = nil
@@ -2393,7 +2383,7 @@ func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
 	_ = m.saveCertsAndEvents(cfg)
 
 	// Emit certificate status change event
-	m.publishCertificateChanged(id, "ok", "", "ok")
+	m.publishCertificateChanged(id, string(CertStatusOK), "", "ok")
 }
 
 // updateCertFailure records a certificate issuance failure with failure classification.
@@ -2430,7 +2420,7 @@ func (m *Manager) updateCertFailureWithError(id string, reason string, err error
 			class, code = m.handleUnauthorizedFailure(cert, now)
 		}
 
-		cert.Status = "error"
+		cert.Status = string(CertStatusError)
 		cert.FailureReason = reason
 		cert.FailureClass = class
 		cert.FailureCode = code
@@ -2483,7 +2473,7 @@ func (m *Manager) updateCertFailureWithError(id string, reason string, err error
 	m.notifySchedulerWake()
 
 	// Emit certificate status change event
-	m.publishCertificateChanged(id, "error", class, code)
+	m.publishCertificateChanged(id, string(CertStatusError), class, code)
 }
 
 // handleConnectionFailure applies hybrid escalation for persistent connection errors.
@@ -2803,15 +2793,15 @@ func (m *Manager) RunPreflight(candidate *Config) (PreflightResult, error) {
 	dnsStatus, dnsDetail := m.checkDNS(cfg)
 	checks = append(checks, PreflightCheck{Name: "DNS records", Status: dnsStatus, Detail: dnsDetail})
 
-	checks = append(checks, PreflightCheck{Name: "ACME solver", Status: "pass", Detail: fmt.Sprintf("Using %s", strings.ToUpper(cfg.Solver))})
+	checks = append(checks, PreflightCheck{Name: "ACME solver", Status: string(PreflightPass), Detail: fmt.Sprintf("Using %s", strings.ToUpper(cfg.Solver))})
 
 	// Only check aliases if we are running against active config, or if candidate has them
 	if len(cfg.Aliases) > 0 {
-		status := "pass"
+		status := string(PreflightPass)
 		detail := "All aliases have certificates"
 		for _, alias := range cfg.Aliases {
-			if s := aliasCertStatus(cfg, alias); !strings.EqualFold(s, "ok") {
-				status = "warn"
+			if s := aliasCertStatus(cfg, alias); !strings.EqualFold(s, string(CertStatusOK)) {
+				status = string(PreflightWarn)
 				detail = fmt.Sprintf("Alias %s certificate %s", alias.Hostname, s)
 				break
 			}
@@ -2868,7 +2858,7 @@ func (m *Manager) VerifyConnection(info GuideVerification) error {
 
 	// Perform the check
 	check := m.checkEndpoint(tempCfg)
-	if check.Status != "pass" {
+	if check.Status != string(PreflightPass) {
 		if check.Detail != "" {
 			return fmt.Errorf("connection failed: %s", check.Detail)
 		}
@@ -2931,7 +2921,7 @@ func (m *Manager) GuideInfo() GuideInfo {
 func (m *Manager) checkEndpoint(cfg *Config) PreflightCheck {
 	host, port := endpointHostPort(cfg.Endpoint)
 	if host == "" {
-		return PreflightCheck{Name: "Nexus endpoint reachable", Status: "fail", Detail: "invalid endpoint"}
+		return PreflightCheck{Name: "Nexus endpoint reachable", Status: string(PreflightFail), Detail: "invalid endpoint"}
 	}
 	if port == "" {
 		port = "443"
@@ -2956,13 +2946,13 @@ func (m *Manager) checkEndpoint(cfg *Config) PreflightCheck {
 			strings.Contains(detail, "tls:") || strings.Contains(detail, "x509:") {
 			nextStep = "Verify the relay's TLS certificate matches the endpoint hostname"
 		}
-		return PreflightCheck{Name: "Nexus endpoint reachable", Status: "fail", Detail: detail, NextStep: nextStep}
+		return PreflightCheck{Name: "Nexus endpoint reachable", Status: string(PreflightFail), Detail: detail, NextStep: nextStep}
 	}
 	latency := int(time.Since(start).Milliseconds())
 	_ = conn.Close()
 	cfg.LastHandshake = m.now()
 	cfg.LatencyMS = latency
-	return PreflightCheck{Name: "Nexus endpoint reachable", Status: "pass", Detail: fmt.Sprintf("Latency %d ms", latency)}
+	return PreflightCheck{Name: "Nexus endpoint reachable", Status: string(PreflightPass), Detail: fmt.Sprintf("Latency %d ms", latency)}
 }
 
 // endpointUsesTLS reports whether the endpoint URL implies a TLS connection.
@@ -2977,7 +2967,7 @@ func endpointUsesTLS(endpoint string) bool {
 func (m *Manager) checkDNS(cfg *Config) (string, string) {
 	host := cfg.PortalHostname
 	if host == "" {
-		return "fail", "portal hostname not configured"
+		return string(PreflightFail), "portal hostname not configured"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2990,16 +2980,16 @@ func (m *Manager) checkDNS(cfg *Config) (string, string) {
 		detail = fmt.Sprintf("%s CNAME %s", host, strings.TrimSuffix(cname, "."))
 	}
 
-	status := "pass"
+	status := string(PreflightPass)
 	if addrErr != nil {
-		status = "warn"
+		status = string(PreflightWarn)
 		detail = fmt.Sprintf("portal host lookup failed: %v", addrErr)
 	}
 
 	if strings.TrimSpace(cfg.PortalHostname) != "" {
 		sample := fmt.Sprintf("app.%s", strings.TrimSuffix(strings.TrimSpace(cfg.PortalHostname), "."))
 		if _, err := m.resolver.LookupHost(ctx, sample); err != nil {
-			status = "warn"
+			status = string(PreflightWarn)
 			detail = detail + "; wildcard host unresolved"
 		} else {
 			detail = detail + "; wildcard host resolves"
@@ -3025,7 +3015,7 @@ func aliasCertStatus(cfg *Config, alias Alias) string {
 			return c.Status // "ok", "pending", "error"
 		}
 	}
-	return "pending"
+	return string(CertStatusPending)
 }
 
 func computeWarnings(cfg *Config) []string {
@@ -3038,7 +3028,7 @@ func computeWarnings(cfg *Config) []string {
 		warnings = append(warnings, "Portal hostname missing")
 	}
 	for _, alias := range cfg.Aliases {
-		if s := aliasCertStatus(cfg, alias); !strings.EqualFold(s, "ok") {
+		if s := aliasCertStatus(cfg, alias); !strings.EqualFold(s, string(CertStatusOK)) {
 			warnings = append(warnings, fmt.Sprintf("Alias %s certificate %s", alias.Hostname, s))
 		}
 	}
@@ -3050,7 +3040,7 @@ func computeWarnings(cfg *Config) []string {
 		if c.Source != "" {
 			continue
 		}
-		if strings.EqualFold(c.Status, "error") {
+		if strings.EqualFold(c.Status, string(CertStatusError)) {
 			hasCertError = true
 			if c.RetryAt != nil && c.RetryAt.After(now) {
 				hasRetry = true
@@ -3072,12 +3062,12 @@ func defaultCertificates(cfg *Config) []Certificate {
 			ID:      "portal",
 			Domains: []string{cfg.PortalHostname},
 			Solver:  cfg.Solver,
-			Status:  "pending",
+			Status:  string(CertStatusPending),
 		})
 	}
 	// Wildcard cert only for managed mode (DNS-01 via orchestrator)
-	if cfg.Managed && cfg.PortalHostname != "" && strings.EqualFold(cfg.Solver, "dns-01") {
-		base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(cfg.PortalHostname)), ".")
+	if cfg.Managed && cfg.PortalHostname != "" && strings.EqualFold(cfg.Solver, acme.SolverDNS01) {
+		base := hostname.Normalize(cfg.PortalHostname)
 		if base == "" {
 			return certificates
 		}
@@ -3085,7 +3075,7 @@ func defaultCertificates(cfg *Config) []Certificate {
 			ID:      "wildcard",
 			Domains: []string{fmt.Sprintf("*.%s", base), base},
 			Solver:  cfg.Solver,
-			Status:  "pending",
+			Status:  string(CertStatusPending),
 		})
 	}
 	return certificates
@@ -3139,7 +3129,7 @@ func endpointHostPort(endpoint string) (string, string) {
 }
 
 func deriveACMEEmail(portalHostname string) string {
-	host := strings.Trim(strings.TrimSpace(strings.ToLower(portalHostname)), ".")
+	host := hostname.Normalize(portalHostname)
 	if host == "" || !strings.Contains(host, ".") {
 		return "admin@piccolo.invalid"
 	}

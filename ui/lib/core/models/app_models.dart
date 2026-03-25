@@ -334,6 +334,7 @@ class ServiceEndpoint {
     this.auth,
     this.portClaim,
     this.remoteHosts = const [],
+    this.derivedHostLabel,
   });
 
   factory ServiceEndpoint.fromJson(Map<String, dynamic> json) {
@@ -368,6 +369,7 @@ class ServiceEndpoint {
       remoteHosts: json['remote_hosts'] is List
           ? (json['remote_hosts'] as List).whereType<String>().toList()
           : [],
+      derivedHostLabel: json['derived_host_label'] as String?,
     );
   }
   final String app;
@@ -389,6 +391,7 @@ class ServiceEndpoint {
   final Map<String, dynamic>? auth;
   final int? portClaim;
   final List<String> remoteHosts;
+  final String? derivedHostLabel;
 
   // Helper to get the Remote URL (if enabled)
   String? get remoteUrl {

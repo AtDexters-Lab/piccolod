@@ -521,6 +521,15 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		}
 	}
 
+	// Validate user inputs against declared types and constraints before rendering.
+	// Runs even with empty inputs to catch missing required fields.
+	if schema, err := app.ParseAppSchema(yamlData); err == nil && len(schema.Inputs) > 0 {
+		if err := app.ValidateInputs(schema.Inputs, userInputs); err != nil {
+			writeGinError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
 	// Render template if inputs provided
 	if len(userInputs) > 0 || oidcClientID != "" {
 		rendered, err := app.RenderManifest(yamlData, userInputs, systemContext)

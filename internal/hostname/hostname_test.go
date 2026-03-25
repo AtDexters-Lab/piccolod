@@ -6,6 +6,28 @@ import (
 	"piccolod/internal/api"
 )
 
+func TestNormalize(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"example.com", "example.com"},
+		{"Example.COM", "example.com"},
+		{"example.com.", "example.com"},
+		{" example.com ", "example.com"},
+		{" Example.COM. ", "example.com"},
+		{"", ""},
+		{".", ""},
+		{" . ", ""},
+		{"LOCALHOST", "localhost"},
+	}
+	for _, tt := range tests {
+		if got := Normalize(tt.input); got != tt.want {
+			t.Errorf("Normalize(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestValidateAppName(t *testing.T) {
 	tests := []struct {
 		name    string

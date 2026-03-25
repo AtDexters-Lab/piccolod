@@ -183,6 +183,7 @@ func (m *MockContainerManager) InspectContainerState(ctx context.Context, runtim
 	return container.ContainerState{Exists: true, Running: c.Status == "running"}, nil
 }
 
+// NOTE: duplicated in internal/server/gin_app_handlers_test.go (cross-package).
 func (m *MockContainerManager) InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[string]int, error) {
 	_ = ctx
 	_ = runtime

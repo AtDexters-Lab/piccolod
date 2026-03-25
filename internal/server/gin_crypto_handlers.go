@@ -14,7 +14,6 @@ import (
 
 	"piccolod/internal/auth"
 	"piccolod/internal/cryptoutil"
-	"piccolod/internal/events"
 	"piccolod/internal/health"
 	"piccolod/internal/persistence"
 )
@@ -476,19 +475,7 @@ func (s *GinServer) handleCryptoResetPassword(c *gin.Context) {
 		needRelock = false
 	}
 
-	if s.events != nil {
-		s.events.Publish(events.Event{
-			Topic: events.TopicAudit,
-			Payload: events.AuditEvent{
-				Kind:   "auth.reset_with_recovery",
-				Time:   now,
-				Source: c.ClientIP(),
-				Metadata: map[string]any{
-					"was_locked": wasLocked,
-				},
-			},
-		})
-	}
+	s.publishAuditEvent(c, "auth.reset_with_recovery", map[string]any{"was_locked": wasLocked})
 
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
@@ -578,18 +565,6 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 	}); err != nil {
 		log.Printf("WARN: failed to clear recovery staleness: %v", err)
 	}
-	if s.events != nil {
-		s.events.Publish(events.Event{
-			Topic: events.TopicAudit,
-			Payload: events.AuditEvent{
-				Kind:   "auth.recovery_key_generate",
-				Time:   time.Now().UTC(),
-				Source: c.ClientIP(),
-				Metadata: map[string]any{
-					"rotated": rotating,
-				},
-			},
-		})
-	}
+	s.publishAuditEvent(c, "auth.recovery_key_generate", map[string]any{"rotated": rotating})
 	c.JSON(http.StatusOK, gin.H{"words": words})
 }

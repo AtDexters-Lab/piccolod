@@ -5,6 +5,7 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 // Rule describes a port to open or close in the firewall.
@@ -54,12 +55,28 @@ func (m *FirewalldManager) applyRule(rule Rule, action string) error {
 	if action == "remove" {
 		flag = "--remove-rich-rule="
 	}
+	type result struct {
+		subnet string
+		output string
+		err    error
+	}
+	results := make([]result, len(rfc1918Subnets))
+	var wg sync.WaitGroup
+	for i, subnet := range rfc1918Subnets {
+		wg.Add(1)
+		go func(i int, subnet string) {
+			defer wg.Done()
+			rr := m.richRule(rule, subnet)
+			cmd := exec.Command("firewall-cmd", "--zone="+m.zone, flag+rr)
+			out, err := cmd.CombinedOutput()
+			results[i] = result{subnet: subnet, output: strings.TrimSpace(string(out)), err: err}
+		}(i, subnet)
+	}
+	wg.Wait()
 	var errs []string
-	for _, subnet := range rfc1918Subnets {
-		rr := m.richRule(rule, subnet)
-		cmd := exec.Command("firewall-cmd", "--zone="+m.zone, flag+rr)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %s (%v)", subnet, strings.TrimSpace(string(out)), err))
+	for _, r := range results {
+		if r.err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %s (%v)", r.subnet, r.output, r.err))
 		}
 	}
 	if len(errs) > 0 {

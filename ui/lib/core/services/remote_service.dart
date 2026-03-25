@@ -1,5 +1,5 @@
+import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
-import 'package:piccolo_os/core/models/service_endpoint.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 
 class RemoteService {

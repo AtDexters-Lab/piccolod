@@ -37,6 +37,11 @@ var ReservedListenerNames = ReservedNames
 // Per RFC 20260130, this marker is replaced with the user-provided value at install time.
 const PrimaryListenerMarker = "__primary"
 
+// Normalize lowercases, trims whitespace, and strips a trailing dot from a hostname.
+func Normalize(h string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), ".")
+}
+
 // ValidateAppName validates an app name per RFC 20260122 Section 4.3 and RFC 20260130.
 // Rules:
 // - Must start with a letter
@@ -230,8 +235,8 @@ func ResolvePrimaryListener(listeners []api.AppListener) (string, error) {
 // Given "metrics-immich-piccolo.local" and base "piccolo.local", returns "metrics-immich".
 // Returns empty string if the hostname doesn't match the base.
 func NormalizeHostLabel(hostname, base string) string {
-	hostname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
-	base = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
+	hostname = Normalize(hostname)
+	base = Normalize(base)
 
 	if hostname == base {
 		return ""
@@ -272,14 +277,14 @@ func DeriveLANHostname(hostLabel, base string) string {
 	if hostLabel == "" {
 		return base
 	}
-	base = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
+	base = Normalize(base)
 	return strings.ToLower(hostLabel) + "-" + base
 }
 
 // ValidateDerivedHostname validates that a derived hostname's left-most DNS label
 // does not exceed 63 characters (DNS limit). Per RFC 20260122 §4.3, this is defense in depth.
 func ValidateDerivedHostname(hostname string) error {
-	hostname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+	hostname = Normalize(hostname)
 	if hostname == "" {
 		return nil
 	}

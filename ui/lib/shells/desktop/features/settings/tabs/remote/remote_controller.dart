@@ -2,9 +2,9 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/identity_models.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
-import 'package:piccolo_os/core/models/service_endpoint.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/event_stream_client.dart';
 import 'package:piccolo_os/core/services/identity_service.dart';

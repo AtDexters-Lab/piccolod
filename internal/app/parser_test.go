@@ -924,6 +924,176 @@ func TestNeutralizeTemplates(t *testing.T) {
 	}
 }
 
+func TestValidateInputs(t *testing.T) {
+	t.Run("string_valid", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"name": {Type: "string"},
+		}, map[string]interface{}{"name": "hello"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("string_wrong_type", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"name": {Type: "string"},
+		}, map[string]interface{}{"name": 123.0})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("string_regex_pass", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"name": {Type: "string", Validation: &api.AppInputValidation{Regex: `^[a-z]+$`}},
+		}, map[string]interface{}{"name": "hello"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("string_regex_fail", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"name": {Type: "string", Validation: &api.AppInputValidation{Regex: `^[a-z]+$`, Message: "lowercase only"}},
+		}, map[string]interface{}{"name": "Hello123"})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "lowercase only") {
+			t.Errorf("expected custom message, got: %s", err)
+		}
+	})
+
+	t.Run("boolean_valid", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"enabled": {Type: "boolean"},
+		}, map[string]interface{}{"enabled": true})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("boolean_string_true", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"enabled": {Type: "boolean"},
+		}, map[string]interface{}{"enabled": "true"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("boolean_wrong_type", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"enabled": {Type: "boolean"},
+		}, map[string]interface{}{"enabled": 1.0})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("int_valid", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"port": {Type: "int"},
+		}, map[string]interface{}{"port": float64(8080)})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("int_not_whole", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"port": {Type: "int"},
+		}, map[string]interface{}{"port": 3.14})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("number_valid", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"ratio": {Type: "number"},
+		}, map[string]interface{}{"ratio": 3.14})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("array_valid", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"domains": {Type: "array"},
+		}, map[string]interface{}{"domains": []interface{}{"a.com", "b.com"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("array_wrong_type", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"domains": {Type: "array"},
+		}, map[string]interface{}{"domains": "not-an-array"})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("array_non_string_element", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"domains": {Type: "array"},
+		}, map[string]interface{}{"domains": []interface{}{"ok.com", 123}})
+		if err == nil {
+			t.Fatal("expected error for non-string array element")
+		}
+	})
+
+	t.Run("required_missing", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"name": {Type: "string", Required: true},
+		}, map[string]interface{}{})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "required") {
+			t.Errorf("expected 'required' in error, got: %s", err)
+		}
+	})
+
+	t.Run("required_but_generated", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"secret": {Type: "string", Required: true, Generate: true},
+		}, map[string]interface{}{})
+		if err != nil {
+			t.Fatalf("generated inputs should not require user value: %v", err)
+		}
+	})
+
+	t.Run("optional_missing_ok", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"desc": {Type: "string"},
+		}, map[string]interface{}{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("unknown_type_skipped", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"custom": {Type: "futuretype"},
+		}, map[string]interface{}{"custom": "anything"})
+		if err != nil {
+			t.Fatalf("unknown types should be skipped: %v", err)
+		}
+	})
+
+	t.Run("password_type", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"pass": {Type: "password"},
+		}, map[string]interface{}{"pass": "secret123"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestRenderManifest_ToJSON(t *testing.T) {
 	t.Run("array_input", func(t *testing.T) {
 		manifest := `domains: {{ .Inputs.domain_list | toJSON }}`
