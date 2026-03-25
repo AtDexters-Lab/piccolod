@@ -533,7 +533,9 @@ func TestRemote_PortalHostnamePersistsAndAppCertQueued(t *testing.T) {
 
 	// Simulate relay connect event — in production, the relay event handler
 	// triggers requeueOutstandingIssuances when the tunnel comes up.
-	srv.remoteManager.RequeueOutstandingIssuances()
+	// The relay gate requires at least one relay to be connected before
+	// HTTP-01 cert issuance proceeds.
+	srv.remoteManager.RelayEventHandler()("piccolo-portal", true, "")
 
 	if status := waitForCertificateDomain(t, srv.remoteManager, "piccolo.example.com", 5*time.Second); !strings.EqualFold(status, "ok") {
 		for _, cert := range srv.remoteManager.ListCertificates() {

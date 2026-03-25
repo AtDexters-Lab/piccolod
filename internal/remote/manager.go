@@ -167,6 +167,12 @@ type PreflightResult struct {
 	RanAt  time.Time        `json:"ran_at"`
 }
 
+// relayState tracks the connection status of a single relay adapter.
+type relayState struct {
+	connected bool
+	err       string // last error message (empty when connected)
+}
+
 type dialer interface {
 	DialTimeout(network, address string, timeout time.Duration) (net.Conn, error)
 	DialTLS(network, address, serverName string, timeout time.Duration) (net.Conn, error)
@@ -226,10 +232,12 @@ type Manager struct {
 	// Port claim provider for Nexus relay registration
 	portClaimProvider PortClaimProvider
 
-	// Relay connection state (surfaced as warnings to the UI)
-	relayMu        sync.RWMutex
-	relayConnected bool
-	relayError     string // last relay connection error (empty when connected)
+	// Per-source relay connection state. Multiple relays (self-hosted "piccolo-portal",
+	// namek "piccolo-namek") can be active simultaneously. Entries appear on connect
+	// events and are removed when the adapter stops. HTTP-01 cert issuance is gated
+	// on ALL tracked relays being connected (see httpChallengeReachable).
+	relayMu     sync.RWMutex
+	relayStates map[string]relayState // adapter name → state
 }
 
 func (m *Manager) certDir() string {
@@ -270,6 +278,7 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 		now:            now,
 		baseDir:        baseDir,
 		scheduleWakeCh: make(chan struct{}, 1), // Buffered to avoid blocking
+		relayStates:    make(map[string]relayState),
 	}
 	m.challenges = NewChallengeManager()
 	// ACME manager (wire later on configure)
@@ -922,17 +931,9 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	cfg.LastPreflight = &now
 	// Queue background ACME issuance and surface events/inventory.
 	// User-managed mode only issues portal cert (no wildcard).
-	// HTTP-01 requires the relay tunnel to be up so Let's Encrypt can reach
-	// the device. The adapter starts asynchronously, so we set a near-future
-	// NextRenewal to let the scheduler pick it up after the tunnel connects.
-	// This is persisted, so it survives restarts — unlike an in-memory timer.
+	// Certs start as "pending"; actual issuance is gated on relay connectivity
+	// (httpChallengeReachable) and triggered by handleRelayEvent on connect.
 	newCerts := defaultCertificates(cfg)
-	deferredRenewal := now.Add(30 * time.Second)
-	for i := range newCerts {
-		if newCerts[i].ID == "portal" {
-			newCerts[i].NextRenewal = &deferredRenewal
-		}
-	}
 	for _, c := range existingCerts {
 		if c.ID == "portal" || c.ID == "wildcard" {
 			continue
@@ -952,12 +953,11 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	}
 
 	log.Printf("remote: configured (solver=http-01, portal=%s)", portalHost)
-
-	// Don't enqueue issuance immediately — HTTP-01 requires the relay tunnel
-	// to be up for Let's Encrypt to reach the device. The relay event handler
-	// (handleRelayEvent) calls requeueOutstandingIssuances when the tunnel
-	// connects, which will pick up this pending cert.
 	m.startRenewScheduler()
+	// Requeue pending certs. If the relay is already connected (e.g., re-saving
+	// the same config), issuance proceeds immediately. If not, the relay gate
+	// defers it and handleRelayEvent will pick it up on connect.
+	m.requeueOutstandingIssuances()
 	return nil
 }
 
@@ -1518,11 +1518,11 @@ func (m *Manager) stopAdapter() {
 		}
 	}
 
-	// Clear relay state AFTER stopping so trailing events don't persist.
-	m.relayMu.Lock()
-	m.relayConnected = false
-	m.relayError = ""
-	m.relayMu.Unlock()
+	// Clear self-hosted relay state AFTER stopping so trailing events don't persist.
+	// Uses the default adapter name "piccolo-portal" (see nexusclient/backend.go).
+	// ClearRelayState also publishes config change and requeues if this removal
+	// unblocks httpChallengeReachable (e.g., removing a disconnected relay).
+	m.ClearRelayState("piccolo-portal")
 }
 
 // RelayEventHandler returns a callback suitable for nexusclient.WithAdapterEventHandler.
@@ -1532,26 +1532,25 @@ func (m *Manager) RelayEventHandler() func(adapterName string, connected bool, e
 }
 
 // handleRelayEvent processes connection lifecycle events from the nexus backend
-// client and surfaces them as warnings/events for the UI.
+// client and surfaces them as warnings/events for the UI. Multiple relay sources
+// (self-hosted "piccolo-portal", namek "piccolo-namek") feed into this handler.
 func (m *Manager) handleRelayEvent(adapterName string, connected bool, errMsg string) {
 	if m == nil || m.closed.Load() {
 		return
 	}
 
 	m.relayMu.Lock()
-	wasConnected := m.relayConnected
-	wasError := m.relayError
-	m.relayConnected = connected
-	m.relayError = errMsg
-	changed := wasConnected != connected || wasError != errMsg
+	prev := m.relayStates[adapterName]
+	m.relayStates[adapterName] = relayState{connected: connected, err: errMsg}
+	changed := prev.connected != connected || prev.err != errMsg
 	m.relayMu.Unlock()
 
-	if connected && !wasConnected {
+	if connected && !prev.connected {
 		log.Printf("INFO: [%s] relay connected", adapterName)
 		// Relay just came up — kick off any pending HTTP-01 cert issuance
 		// that was waiting for the tunnel to be reachable.
 		m.requeueOutstandingIssuances()
-	} else if !connected && errMsg != "" && errMsg != wasError {
+	} else if !connected && errMsg != "" && errMsg != prev.err {
 		log.Printf("WARN: [%s] relay disconnected: %s", adapterName, errMsg)
 	}
 
@@ -1561,14 +1560,20 @@ func (m *Manager) handleRelayEvent(adapterName string, connected bool, errMsg st
 	}
 }
 
-// relayWarning returns a user-visible warning if the relay is disconnected with an error.
+// relayWarning returns a user-visible warning if any tracked relay is disconnected.
 func (m *Manager) relayWarning() string {
 	m.relayMu.RLock()
-	connected := m.relayConnected
-	errMsg := m.relayError
+	// Find the first disconnected relay with an error message.
+	var errMsg string
+	for _, s := range m.relayStates {
+		if !s.connected && s.err != "" {
+			errMsg = s.err
+			break
+		}
+	}
 	m.relayMu.RUnlock()
 
-	if connected || errMsg == "" {
+	if errMsg == "" {
 		return ""
 	}
 
@@ -1585,6 +1590,56 @@ func (m *Manager) relayWarning() string {
 		return "Relay TLS error — check the endpoint certificate"
 	default:
 		return fmt.Sprintf("Relay connection error: %s", errMsg)
+	}
+}
+
+// httpChallengeReachable reports whether HTTP-01 challenges can be served.
+// Requires ALL enabled relays to be connected. We use "all" rather than "any"
+// because HTTP-01 certs route through specific relays depending on external DNS
+// configuration (e.g., self-hosted portal certs need the self-hosted relay,
+// alias certs may route through either relay). Rather than tracking per-cert
+// relay affinity — which is fragile to DNS changes — we require all relays to
+// be ready, ensuring every traffic path is available before attempting ACME.
+func (m *Manager) httpChallengeReachable() bool {
+	m.relayMu.RLock()
+	defer m.relayMu.RUnlock()
+	if len(m.relayStates) == 0 {
+		return false
+	}
+	for _, s := range m.relayStates {
+		if !s.connected {
+			return false
+		}
+	}
+	return true
+}
+
+// needsRelay returns true for solvers that require relay connectivity (HTTP-01).
+// DNS-01 uses the orchestrator API and does not need the relay.
+func needsRelay(solver string) bool {
+	return !strings.EqualFold(solver, "dns-01")
+}
+
+// ClearRelayState removes the relay state entry for the given adapter name.
+// Called by GinServer when a relay adapter (e.g., namek) is stopped, and by
+// stopAdapter for the self-hosted relay.
+func (m *Manager) ClearRelayState(name string) {
+	if m == nil {
+		return
+	}
+	m.relayMu.Lock()
+	prev, existed := m.relayStates[name]
+	delete(m.relayStates, name)
+	m.relayMu.Unlock()
+	if !existed {
+		return
+	}
+	m.publishConfigChanged()
+	// Removing a disconnected relay may satisfy the all-relays condition,
+	// unblocking pending HTTP-01 certs that were waiting for it.
+	// Only requeue if the removed relay was actually blocking.
+	if !prev.connected && m.httpChallengeReachable() {
+		m.requeueOutstandingIssuances()
 	}
 }
 
@@ -1716,11 +1771,18 @@ func (m *Manager) scanAndQueueRenewals() {
 		domains []string
 		cn      string
 		source  string
+		solver  string
 	}
+	relayReady := m.httpChallengeReachable()
 	var jobs []renewalJob
 	for _, c := range cfg.Certificates {
 		if strings.EqualFold(c.Status, "pending") {
 			continue // avoid duplicate queueing
+		}
+		// HTTP-01 relay gate: skip if not all relays are connected to prevent
+		// wasted ACME attempts that would enter the error→backoff cycle.
+		if needsRelay(c.Solver) && !relayReady {
+			continue
 		}
 		// RetryAt-driven: retry when due (no max attempts - indefinite retry per RFC 20260125)
 		dueRetry := c.RetryAt != nil && now.After(*c.RetryAt)
@@ -1736,7 +1798,7 @@ func (m *Manager) scanAndQueueRenewals() {
 		if !ok {
 			continue
 		}
-		jobs = append(jobs, renewalJob{id: c.ID, domains: domains, cn: cn, source: c.Source})
+		jobs = append(jobs, renewalJob{id: c.ID, domains: domains, cn: cn, source: c.Source, solver: c.Solver})
 	}
 	m.cfgMu.RUnlock()
 
@@ -1745,7 +1807,7 @@ func (m *Manager) scanAndQueueRenewals() {
 		log.Printf("remote: scheduler queuing %d certificate renewal(s)", len(jobs))
 	}
 	for _, job := range jobs {
-		m.enqueueIssuanceJob(issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, source: job.source})
+		m.enqueueIssuanceJob(issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, source: job.source, solver: job.solver})
 	}
 }
 
@@ -1847,16 +1909,22 @@ func (m *Manager) requeueOutstandingIssuances() {
 	}
 	for _, job := range jobs {
 		ij := issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, force: true, source: job.source, solver: job.solver, certDir: job.certDir}
-		// Resolve orchClient for DNS-01 certs; skip if not yet registered
+		// DNS-01 orchClient gate: skip if orchClient not yet registered
 		// (e.g., boot timing — the source's event handler will re-enqueue after registration).
 		if strings.EqualFold(job.solver, "dns-01") && job.source != "" {
 			m.adapterMu.Lock()
 			ij.orchClient = m.orchClients[job.source]
 			m.adapterMu.Unlock()
 			if ij.orchClient == nil {
-				log.Printf("INFO: remote: skipping requeue of dns-01 cert %s (orchClient for %q not registered yet)", job.id, job.source)
+				log.Printf("INFO: remote: deferring requeue of dns-01 cert %s (orchClient for %q not registered yet)", job.id, job.source)
 				continue
 			}
+		}
+		// HTTP-01 relay gate: skip if not all relays are connected.
+		// handleRelayEvent calls requeueOutstandingIssuances when relays connect.
+		if needsRelay(job.solver) && !m.httpChallengeReachable() {
+			log.Printf("INFO: remote: deferring requeue of cert %s (not all relays connected)", job.id)
+			continue
 		}
 		if job.isPending {
 			m.queueIssuanceJobToWorker(ij)
@@ -2010,7 +2078,28 @@ func (m *Manager) enqueueIssuanceJob(job issuanceJob) {
 		}
 	}
 	m.ensureCertPending(cfg, job.id, job.domains, now, job.source, job.solver, job.certDir)
+	// Resolve effective solver from the persisted cert (ensureCertPending may have
+	// set it from the config's global solver). Must read before saveCertsAndEvents
+	// releases cfgMu.Lock.
+	effectiveSolver := job.solver
+	if effectiveSolver == "" {
+		for _, c := range cfg.Certificates {
+			if c.ID == job.id {
+				effectiveSolver = c.Solver
+				break
+			}
+		}
+	}
+	// saveCertsAndEvents releases cfgMu.Lock()
 	_ = m.saveCertsAndEvents(cfg)
+
+	// HTTP-01 relay gate: cert is persisted as "pending" in the inventory.
+	// Don't submit to worker until all relays are connected.
+	// requeueOutstandingIssuances (called on relay connect) will pick it up.
+	if needsRelay(effectiveSolver) && !m.httpChallengeReachable() {
+		log.Printf("INFO: remote: deferring cert %s (not all relays connected)", job.id)
+		return
+	}
 
 	log.Printf("remote: queuing certificate issuance: %s (domains=%v, source=%s)", job.id, job.domains, job.source)
 	m.queueIssuanceJobToWorker(job)
@@ -2098,6 +2187,25 @@ func (m *Manager) Close() error {
 
 func (m *Manager) processIssuance(job issuanceJob) {
 	if m == nil || m.acmeMgr == nil || job.commonName == "" {
+		return
+	}
+
+	// Safety net: if a relay went down after the job was enqueued, defer without
+	// recording a failure. The cert stays "pending" — no error, no backoff.
+	// Recovery: handleRelayEvent(connected) calls requeueOutstandingIssuances.
+	solver := job.solver
+	if solver == "" {
+		m.cfgMu.RLock()
+		for _, c := range m.currentConfigLocked().Certificates {
+			if c.ID == job.id {
+				solver = c.Solver
+				break
+			}
+		}
+		m.cfgMu.RUnlock()
+	}
+	if needsRelay(solver) && !m.httpChallengeReachable() {
+		log.Printf("INFO: remote: deferring issuance of %s (relay disconnected)", job.id)
 		return
 	}
 
