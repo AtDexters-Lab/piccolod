@@ -53,8 +53,10 @@ func TestIsEmergencySoftAllowed(t *testing.T) {
 		{"/api/v1/crypto/reset-password", true},
 		{"/api/v1/crypto/recovery-key", true},
 
-		// Blocked in soft emergency (setup requires disk prep)
-		{"/api/v1/crypto/setup", false},
+		// Allowed: setup is idempotent and needed for partial-setup recovery
+		{"/api/v1/crypto/setup", true},
+
+		// Blocked in soft emergency
 		{"/api/v1/crypto/lock", false},
 
 		// Unrelated paths

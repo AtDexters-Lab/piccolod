@@ -34,6 +34,9 @@ class ApiClient {
     '/api/v1/auth/csrf',
     '/api/v1/crypto/setup',
     '/api/v1/crypto/unlock',
+    '/api/v1/auth/login-options',
+    '/api/v1/auth/passkey/login/begin',
+    '/api/v1/auth/passkey/login/finish',
   };
 
   /// Helper to construct the full URI.
@@ -92,8 +95,9 @@ class ApiClient {
   ) async {
     final response = await request();
 
+    final cleanPath = path.contains('?') ? path.substring(0, path.indexOf('?')) : path;
     if (response.statusCode == 401 &&
-        !_reauthExcludedPaths.contains(path) &&
+        !_reauthExcludedPaths.contains(cleanPath) &&
         onAuthRequired != null) {
       // Deduplicate: if a re-auth flow is already in progress, await that one.
       if (_reauthCompleter == null) {
@@ -253,6 +257,80 @@ class ApiClient {
     } else {
       throw ApiException(response.statusCode, response.body);
     }
+  }
+
+  // --- Passkey API ---
+
+  Future<Map<String, dynamic>> getLoginOptions() async {
+    return await get('/api/v1/auth/login-options') as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> beginPasskeyRegistration() async {
+    return await post('/api/v1/auth/passkey/register/begin') as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> finishPasskeyRegistration(
+      String sessionId, Map<String, dynamic> credential) async {
+    return await post('/api/v1/auth/passkey/register/finish?session_id=$sessionId',
+        body: credential) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> beginPasskeyLogin() async {
+    return await post('/api/v1/auth/passkey/login/begin') as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> finishPasskeyLogin(
+      String sessionId, Map<String, dynamic> credential) async {
+    return await post('/api/v1/auth/passkey/login/finish?session_id=$sessionId',
+        body: credential) as Map<String, dynamic>;
+  }
+
+  Future<List<dynamic>> listPasskeys() async {
+    final result = await get('/api/v1/auth/passkeys') as Map<String, dynamic>;
+    return result['passkeys'] as List<dynamic>? ?? [];
+  }
+
+  Future<void> deletePasskey(String id) async {
+    await delete('/api/v1/auth/passkeys/$id');
+  }
+
+  Future<void> renamePasskey(String id, String name) async {
+    await patch('/api/v1/auth/passkeys/$id', body: {'friendly_name': name});
+  }
+
+  // --- Invite API ---
+
+  Future<Map<String, dynamic>> createInvite({
+    required String username,
+    required String email,
+    List<String>? allowedApps,
+  }) async {
+    return await post('/api/v1/users/invite', body: {
+      'username': username,
+      'email': email,
+      if (allowedApps != null) 'allowed_apps': allowedApps,
+    }) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> validateInvite(String token) async {
+    return await get('/api/v1/auth/invite/$token') as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> beginInvitePasskey(String token) async {
+    return await post('/api/v1/auth/invite/$token/passkey/begin')
+        as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> finishInvitePasskey(
+      String token, String sessionId, Map<String, dynamic> credential) async {
+    return await post(
+        '/api/v1/auth/invite/$token/passkey/finish?session_id=$sessionId',
+        body: credential) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> reinviteUser(String userId) async {
+    return await post('/api/v1/users/$userId/reinvite')
+        as Map<String, dynamic>;
   }
 }
 

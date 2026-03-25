@@ -2,6 +2,7 @@ package identity
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -66,4 +67,30 @@ func extractHTTPStatus(err error) int {
 		_, _ = fmt.Sscanf(msg, "server error %d:", &status)
 	}
 	return status
+}
+
+// extractErrorMessage extracts the "error" field from a namekclient error body.
+// namekclient errors are formatted as "server error NNN: <body>" where <body> is
+// typically JSON like {"error":"device not found"}.
+// Returns the parsed error string, the raw body, or empty string if unparseable.
+func extractErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if !strings.HasPrefix(msg, "server error ") {
+		return ""
+	}
+	idx := strings.Index(msg, ": ")
+	if idx < 0 {
+		return ""
+	}
+	body := msg[idx+2:]
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(body), &parsed) == nil && parsed.Error != "" {
+		return parsed.Error
+	}
+	return body
 }

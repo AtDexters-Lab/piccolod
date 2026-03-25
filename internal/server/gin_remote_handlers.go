@@ -196,11 +196,13 @@ func (s *GinServer) handleRemotePreflight(c *gin.Context) {
 			if req.Endpoint != "" || req.PortalHostname != "" {
 				// Map request to config candidate (user-managed mode, HTTP-01)
 				candidate = &remote.Config{
-					Endpoint:       req.Endpoint,
-					DeviceSecret:   req.DeviceSecret,
-					Solver:         "http-01", // User-managed mode is always HTTP-01
-					PortalHostname: req.PortalHostname,
-					Managed:        false,
+					NexusConfig: remote.NexusConfig{
+						Endpoint:       req.Endpoint,
+						DeviceSecret:   req.DeviceSecret,
+						Solver:         "http-01", // User-managed mode is always HTTP-01
+						PortalHostname: req.PortalHostname,
+						Managed:        false,
+					},
 				}
 			}
 		}

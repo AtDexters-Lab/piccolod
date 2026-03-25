@@ -74,6 +74,12 @@ func (g *guardedControlStore) OIDCRefreshTokens() OIDCRefreshTokenRepo {
 func (g *guardedControlStore) OIDCConfig() OIDCConfigRepo {
 	return &guardedOIDCConfigRepo{store: g, repo: g.inner.OIDCConfig()}
 }
+func (g *guardedControlStore) WebAuthnCredentials() WebAuthnCredentialRepo {
+	return &guardedWebAuthnCredRepo{store: g, repo: g.inner.WebAuthnCredentials()}
+}
+func (g *guardedControlStore) InviteTokens() InviteTokenRepo {
+	return &guardedInviteTokenRepo{store: g, repo: g.inner.InviteTokens()}
+}
 func (g *guardedControlStore) Close(ctx context.Context) error { return g.inner.Close(ctx) }
 
 func (g *guardedControlStore) Lock() {
@@ -378,4 +384,102 @@ func (r *guardedOIDCConfigRepo) SetEncryptionKey(ctx context.Context, key []byte
 		return ErrNotLeader
 	}
 	return r.store.notifyCommit(ctx, r.repo.SetEncryptionKey(ctx, key))
+}
+
+// -----------------------------------------------------------------------------
+// Guarded WebAuthn Credential Repository
+// -----------------------------------------------------------------------------
+
+type guardedWebAuthnCredRepo struct {
+	store *guardedControlStore
+	repo  WebAuthnCredentialRepo
+}
+
+func (r *guardedWebAuthnCredRepo) Get(ctx context.Context, credID string) (WebAuthnCredential, error) {
+	return r.repo.Get(ctx, credID)
+}
+func (r *guardedWebAuthnCredRepo) ListByUser(ctx context.Context, userID string) ([]WebAuthnCredential, error) {
+	return r.repo.ListByUser(ctx, userID)
+}
+func (r *guardedWebAuthnCredRepo) ListByUserAndRP(ctx context.Context, userID, rpID string) ([]WebAuthnCredential, error) {
+	return r.repo.ListByUserAndRP(ctx, userID, rpID)
+}
+func (r *guardedWebAuthnCredRepo) ListByRP(ctx context.Context, rpID string) ([]WebAuthnCredential, error) {
+	return r.repo.ListByRP(ctx, rpID)
+}
+func (r *guardedWebAuthnCredRepo) CountByUser(ctx context.Context, userID string) (int, error) {
+	return r.repo.CountByUser(ctx, userID)
+}
+func (r *guardedWebAuthnCredRepo) CountByUserAndRP(ctx context.Context, userID, rpID string) (int, error) {
+	return r.repo.CountByUserAndRP(ctx, userID, rpID)
+}
+func (r *guardedWebAuthnCredRepo) CountByUserSplitRP(ctx context.Context, userID, rpID string) (int, int, error) {
+	return r.repo.CountByUserSplitRP(ctx, userID, rpID)
+}
+func (r *guardedWebAuthnCredRepo) Create(ctx context.Context, cred WebAuthnCredential) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Create(ctx, cred))
+}
+func (r *guardedWebAuthnCredRepo) UpdateAfterAuth(ctx context.Context, credID string, signCount uint32, lastUsed time.Time) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.UpdateAfterAuth(ctx, credID, signCount, lastUsed))
+}
+func (r *guardedWebAuthnCredRepo) UpdateFriendlyName(ctx context.Context, credID, name string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.UpdateFriendlyName(ctx, credID, name))
+}
+func (r *guardedWebAuthnCredRepo) Delete(ctx context.Context, credID string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Delete(ctx, credID))
+}
+func (r *guardedWebAuthnCredRepo) DeleteByUser(ctx context.Context, userID string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.DeleteByUser(ctx, userID))
+}
+
+// -----------------------------------------------------------------------------
+// Guarded Invite Token Repository
+// -----------------------------------------------------------------------------
+
+type guardedInviteTokenRepo struct {
+	store *guardedControlStore
+	repo  InviteTokenRepo
+}
+
+func (r *guardedInviteTokenRepo) Get(ctx context.Context, token string) (InviteToken, error) {
+	return r.repo.Get(ctx, token)
+}
+func (r *guardedInviteTokenRepo) Create(ctx context.Context, token InviteToken) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Create(ctx, token))
+}
+func (r *guardedInviteTokenRepo) Consume(ctx context.Context, token string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.Consume(ctx, token))
+}
+func (r *guardedInviteTokenRepo) DeleteByUser(ctx context.Context, userID string) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.DeleteByUser(ctx, userID))
+}
+func (r *guardedInviteTokenRepo) DeleteExpired(ctx context.Context) error {
+	if r.store.leader != nil && !r.store.leader() {
+		return ErrNotLeader
+	}
+	return r.store.notifyCommit(ctx, r.repo.DeleteExpired(ctx))
 }

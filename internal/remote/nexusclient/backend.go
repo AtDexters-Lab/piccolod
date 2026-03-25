@@ -53,6 +53,17 @@ func WithAdapterName(name string) BackendAdapterOption {
 	return func(a *BackendAdapter) { a.name = name }
 }
 
+// RelayEventHandler receives simplified relay connection events.
+// connected is true when the relay tunnel is up, false on disconnect/error.
+// errMsg contains the error description when connected=false (empty otherwise).
+type RelayEventHandler func(adapterName string, connected bool, errMsg string)
+
+// WithAdapterEventHandler registers a callback for backend lifecycle events
+// (connected, disconnected, errors).
+func WithAdapterEventHandler(handler RelayEventHandler) BackendAdapterOption {
+	return func(a *BackendAdapter) { a.eventHandler = handler }
+}
+
 // BackendAdapter bridges piccolod with the nexus proxy backend client. It now uses
 // the upstream token provider hook so that every connection attempt receives a
 // freshly minted JWT without custom reconnect loops on our side.
@@ -66,6 +77,7 @@ type BackendAdapter struct {
 	cancel        context.CancelFunc
 	clients       []backendClient
 	tokenProvider backend.TokenProvider // nil = use HMAC from config
+	eventHandler  RelayEventHandler    // nil = no event forwarding
 	name          string               // backend name for Nexus registration
 }
 
@@ -157,6 +169,22 @@ func (a *BackendAdapter) Start(ctx context.Context) error {
 	clientOpts = append(clientOpts, backend.WithConnectHandler(handler))
 	if a.tokenProvider != nil {
 		clientOpts = append(clientOpts, backend.WithTokenProvider(a.tokenProvider))
+	}
+	if a.eventHandler != nil {
+		name := a.name
+		eh := a.eventHandler
+		clientOpts = append(clientOpts, backend.WithEventHandler(func(e backend.Event) {
+			switch e.Type {
+			case backend.EventConnected:
+				eh(name, true, "")
+			case backend.EventDisconnected, backend.EventError:
+				msg := e.Reason
+				if e.Error != nil {
+					msg = e.Error.Error()
+				}
+				eh(name, false, msg)
+			}
+		}))
 	}
 
 	// Create one client per endpoint (best-effort: warn on individual failures).

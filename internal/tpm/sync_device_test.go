@@ -36,6 +36,13 @@ func (m *mockDevice) Quote(nonce string) (string, error) {
 	return m.quoteResult, m.quoteErr
 }
 
+func (m *mockDevice) QuoteOverData(data []byte) (string, error) {
+	m.mu.Lock()
+	m.quoteCalls++
+	m.mu.Unlock()
+	return m.quoteResult, m.quoteErr
+}
+
 func (m *mockDevice) Close() error {
 	m.mu.Lock()
 	m.closeCalls++
@@ -100,6 +107,9 @@ func TestSyncDevice_UseAfterClose(t *testing.T) {
 	}
 	if _, err := dev.Quote("n"); err != errDeviceClosed {
 		t.Errorf("Quote after close: got %v, want errDeviceClosed", err)
+	}
+	if _, err := dev.QuoteOverData([]byte("data")); err != errDeviceClosed {
+		t.Errorf("QuoteOverData after close: got %v, want errDeviceClosed", err)
 	}
 }
 

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"log"
 	"net"
@@ -12,10 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	authpkg "piccolod/internal/auth"
-	"piccolod/internal/crypt"
 	"piccolod/internal/cryptoutil"
 	"piccolod/internal/events"
-	"piccolod/internal/health"
 	"piccolod/internal/persistence"
 )
 
@@ -169,13 +166,26 @@ func (s *GinServer) handleAuthSession(c *gin.Context) {
 			if s.cryptoManager != nil && s.cryptoManager.IsInitialized() {
 				locked = s.cryptoManager.IsLocked()
 			}
+			// Passkey info — has_passkey is scoped to the current request's RP ID
+			hasPasskey := false
+			passkeyCount := 0
+			if s.webauthnMgr != nil && sess.UserID != "" {
+				rpID := s.getRPID(c)
+				if total, rpCount, err := s.webauthnMgr.CountByUserSplitRP(c.Request.Context(), sess.UserID, rpID); err == nil {
+					passkeyCount = total
+					hasPasskey = rpCount > 0
+				}
+			}
 			c.JSON(http.StatusOK, gin.H{
-				"authenticated":  true,
-				"user":           sess.User,
-				"expires_at":     time.Unix(sess.ExpiresAt, 0).UTC().Format(time.RFC3339),
-				"volumes_locked": locked,
-				"password_stale": passwordStale,
-				"recovery_stale": recoveryStale,
+				"authenticated":         true,
+				"user":                  sess.User,
+				"expires_at":            time.Unix(sess.ExpiresAt, 0).UTC().Format(time.RFC3339),
+				"volumes_locked":        locked,
+				"password_stale":        passwordStale,
+				"recovery_stale":        recoveryStale,
+				"has_passkey":           hasPasskey,
+				"passkey_count":         passkeyCount,
+				"must_register_passkey": sess.MustRegisterPasskey,
 			})
 			return
 		}
@@ -238,64 +248,8 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 		err = errors.New("auth unavailable")
 	}
 
-	// 2. Handle locked state / legacy unlock logic
-	if err != nil {
-		// If locked, we might need to unlock first (only for admin/disk-key holder)
-		// We assume "admin" user password == disk key.
-		if errors.Is(err, persistence.ErrLocked) && s.cryptoManager != nil {
-			if unlockErr := s.cryptoManager.Unlock(body.Password); unlockErr != nil {
-				if errors.Is(unlockErr, crypt.ErrNotInitialized) {
-					c.JSON(http.StatusBadRequest, gin.H{"error": "not initialized"})
-					return
-				}
-				if s.recordLoginFailure() {
-					c.Header("Retry-After", "5")
-					c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too Many Requests"})
-				} else {
-					c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-				}
-				return
-			}
-			// Unlock successful — activate LVM data volume before notifying
-			// persistence, so storage volumes are available when the app-manager
-			// reconcile loop starts.
-			// Use a background context so long-running ops survive client disconnect.
-			unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			defer unlockCancel()
-			if s.storageMgr != nil {
-				if err := s.storageMgr.UnlockDataVolume(unlockCtx); err != nil {
-					log.Printf("ERROR: auth login data volume unlock failed: %v", err)
-					if s.healthTracker != nil {
-						s.healthTracker.Setf("storage", health.LevelError, "data volume unlock failed")
-					}
-				}
-			}
-			if notifyErr := s.notifyPersistenceLockState(unlockCtx, false); notifyErr != nil {
-				log.Printf("WARN: auth login persistence unlock failed: %v", notifyErr)
-			}
-
-			// Retry verification after unlock (use unlockCtx — gin ctx may be cancelled if client disconnected).
-			if s.userManager != nil {
-				userInfo, err = s.userManager.Verify(unlockCtx, username, body.Password)
-			} else if s.authManager != nil {
-				// Fallback retry with legacy auth manager
-				ok, verifyErr := s.authManager.Verify(unlockCtx, username, body.Password)
-				if verifyErr != nil {
-					err = verifyErr
-				} else if !ok {
-					err = authpkg.ErrInvalidCredentials
-				} else {
-					err = nil
-					userInfo = &authpkg.UserInfo{
-						ID:       "legacy-admin",
-						Username: "admin",
-						Email:    "admin@piccolo.local",
-						Role:     persistence.UserRoleAdmin,
-					}
-				}
-			}
-		}
-	}
+	// 2. Two-door model: login does not unlock disk. If storage is locked,
+	// the client must call /crypto/unlock first, then retry login.
 
 	// 3. Final verdict
 	if err != nil {
@@ -315,15 +269,50 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 
 	s.resetLoginFailures()
 
-	// Create session with full user info
+	// Enforce passkey-only policy: standard users can only use passkeys
+	// (they are passwordless by design), and remote users with existing
+	// passkeys must use them instead of password.
 	userID := userInfo.ID
 	userRole := string(userInfo.Role)
+	if s.webauthnMgr != nil {
+		rpID := authpkg.DetermineRPID(c.Request.Host, s.getBaseDomain())
+		hasPasskey, _ := s.webauthnMgr.HasCredentialsForRP(c.Request.Context(), userID, rpID)
+
+		// Standard users with passkeys must use them (passkey-only policy)
+		if userInfo.Role == persistence.UserRoleStandard && hasPasskey {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "passkey_required",
+				"message": "Standard users must sign in with a passkey.",
+			})
+			return
+		}
+
+		// Remote access: block password login if user has a passkey for this RP
+		if s.isRemoteSecureRequest(c.Request) && hasPasskey {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "passkey_required",
+				"message": "Password login is not available over remote access. Use your passkey.",
+			})
+			return
+		}
+	}
+
+	// Create session with full user info
 	// RFC 20260122 §6.2: Create portal session with origin binding for security
 	boundOrigin := s.computeCanonicalOrigin(c)
 	sess := s.sessions.CreatePortalSession(userID, userInfo.Username, userRole, boundOrigin, portalSessionTTL)
+
+	// Flag bootstrap sessions on remote for required passkey registration
+	if s.isRemoteSecureRequest(c.Request) && s.webauthnMgr != nil {
+		sess.MustRegisterPasskey = true
+	}
+
 	s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
 
 	resp := gin.H{"message": "ok"}
+	if sess.MustRegisterPasskey {
+		resp["must_register_passkey"] = true
+	}
 	if next := strings.TrimSpace(body.Next); next != "" {
 		if validated, ok := s.validateNextURL(next); ok {
 			resp["redirect_url"] = validated

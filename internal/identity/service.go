@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -50,12 +52,18 @@ type Service struct {
 
 	// Shutdown lifecycle: stopped prevents new recovery/sync goroutines after Stop(),
 	// recoverWg tracks in-flight recovery so Stop can wait for it.
+	// stopCh is closed on Stop() to interrupt backoff sleeps in recovery goroutines.
 	stopped   atomic.Bool
 	recoverWg sync.WaitGroup
+	stopCh    chan struct{}
+	stopOnce  sync.Once
 
 	// onTPMReplaced is called when AK recovery replaces the TPM device,
 	// so the owner can update its own reference and close the old one.
 	onTPMReplaced func(old tpm.Device, newResult *tpm.OpenResult)
+
+	// Server-reported recovery status (from GET /devices/me).
+	recoveryStatus string
 
 	// Endpoint sync loop lifecycle.
 	syncCancel context.CancelFunc
@@ -68,6 +76,7 @@ func NewService(configPath string, tpmDevice tpm.Device) *Service {
 	return &Service{
 		configPath: configPath,
 		tpmDev:     tpmDevice,
+		stopCh:     make(chan struct{}),
 	}
 }
 
@@ -128,6 +137,9 @@ func (s *Service) Stop(ctx context.Context) error {
 	s.stopped.Store(true)
 	s.mu.Unlock()
 
+	// Signal recovery goroutines to abort backoff sleeps.
+	s.stopOnce.Do(func() { close(s.stopCh) })
+
 	s.stopEndpointSync()
 
 	// Wait for in-flight recovery, but respect the caller's context timeout
@@ -184,10 +196,12 @@ func (s *Service) NamekClient() *namekclient.Client {
 // IdentityStatus represents the full state of namek-managed identity.
 type IdentityStatus struct {
 	Enabled        bool     `json:"enabled"`
-	State          string   `json:"state"` // "active", "disabled", "not_enrolled", "suspended"
+	State          string   `json:"state"` // "active", "disabled", "not_enrolled", "suspended", "recovering"
 	DeviceID       string   `json:"device_id,omitempty"`
+	AccountID      string   `json:"account_id,omitempty"`
 	Hostname       string   `json:"hostname,omitempty"`
 	CustomHostname string   `json:"custom_hostname,omitempty"`
+	RecoveryStatus string   `json:"recovery_status,omitempty"` // from server: "active", "pending_recovery", "standalone"
 	NexusEndpoints []string `json:"nexus_endpoints,omitempty"`
 }
 
@@ -216,6 +230,8 @@ func (s *Service) Status() IdentityStatus {
 	state := "not_enrolled"
 	if s.IsSuspended() {
 		state = "suspended"
+	} else if s.recovering.Load() {
+		state = "recovering"
 	} else if !cfg.Enabled {
 		state = "disabled"
 	} else if s.IsEnrolled() {
@@ -225,12 +241,19 @@ func (s *Service) Status() IdentityStatus {
 	if custom := cfg.CustomFQDN(); custom != "" {
 		hostname = custom
 	}
+
+	s.mu.RLock()
+	recoveryStatus := s.recoveryStatus
+	s.mu.RUnlock()
+
 	return IdentityStatus{
 		Enabled:        cfg.Enabled,
 		State:          state,
 		DeviceID:       cfg.DeviceID,
+		AccountID:      cfg.AccountID,
 		Hostname:       hostname,
 		CustomHostname: cfg.CustomHostname,
+		RecoveryStatus: recoveryStatus,
 		NexusEndpoints: cfg.NexusEndpoints,
 	}
 }
@@ -263,6 +286,12 @@ func (s *Service) Enroll(ctx context.Context) (*EnrollResult, error) {
 		return nil, fmt.Errorf("identity: enrollment failed: %w", err)
 	}
 
+	return s.finalizeEnrollment(result)
+}
+
+// finalizeEnrollment persists the enrollment result and restores runtime state.
+// Shared by Enroll and reenrollWithRecovery.
+func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult) (*EnrollResult, error) {
 	baseDomain := extractBaseDomain(result.Hostname)
 
 	s.mu.Lock()
@@ -279,7 +308,7 @@ func (s *Service) Enroll(ctx context.Context) (*EnrollResult, error) {
 	}
 
 	s.enrolled.Store(true)
-	s.suspended.Store(false) // clear suspension on successful enrollment
+	s.suspended.Store(false)
 	s.startEndpointSync()
 	s.publish(events.TopicIdentityChanged, nil)
 
@@ -347,6 +376,7 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 	s.mu.Lock()
 	s.cfg.NamekURL = url
 	s.cfg.DeviceID = ""
+	s.cfg.AccountID = ""
 	s.cfg.Hostname = ""
 	s.cfg.BaseDomain = ""
 	s.cfg.CustomHostname = ""
@@ -362,6 +392,11 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 	if err := saveConfig(s.configPath, cfg); err != nil {
 		return err
 	}
+
+	// Clear server-specific cached state (vouchers + state cache).
+	dir := filepath.Dir(s.configPath)
+	_ = clearVouchers(filepath.Join(dir, "vouchers"))
+	_ = os.Remove(filepath.Join(dir, "state_cache.json"))
 
 	// Reinitialize client with new URL if TPM is available
 	if s.tpmDev != nil {
@@ -400,34 +435,269 @@ func (s *Service) SetCustomHostname(ctx context.Context, hostname string) error 
 	return nil
 }
 
+// Error message substrings for classifying 401 responses.
+var (
+	// Transient 401 errors that resolve on retry (not identity loss).
+	// Includes both "nonce expired" and "expired nonce" to match server variations
+	// (Namek returns "invalid or expired nonce" which contains "expired nonce").
+	transientAuthErrors = []string{"nonce expired", "expired nonce", "nonce invalid"}
+	akRelatedErrors     = []string{"credential", "attestation key"}
+)
+
 // HandleTokenError handles authentication errors from namek token requests.
-// 401 → attempts re-enrollment; 403 → publishes suspended state.
+// 401 → distinguishes error sub-types; 403 → publishes suspended state.
 func (s *Service) HandleTokenError(err error, httpStatus int) {
 	switch httpStatus {
 	case 401:
-		if s.recovering.Load() {
+		errMsg := extractErrorMessage(err)
+		switch {
+		case containsAny(errMsg, transientAuthErrors...):
+			// Transient — the sync loop retries on next tick.
+			log.Printf("WARN: identity: transient auth error: %s", errMsg)
 			return
+		default:
+			// Identity loss ("device not found", "quote verification failed", or unknown).
+			// Re-enroll with existing AK + recovery bundle.
+			s.triggerReenrollWithRecovery(errMsg)
 		}
-		// RLock synchronizes with Stop()'s Lock: Add(1) completes before
-		// Stop() can call Wait(), preventing a WaitGroup panic.
-		s.mu.RLock()
-		if s.stopped.Load() {
-			s.mu.RUnlock()
-			return
-		}
-		s.recoverWg.Add(1)
-		s.mu.RUnlock()
-
-		log.Printf("WARN: identity: namek auth failed (401), attempting AK recovery and re-enrollment")
-		go func() {
-			defer s.recoverWg.Done()
-			s.recoverAndReenroll()
-		}()
 	case 403:
 		log.Printf("ERROR: identity: device suspended/revoked by namek (403)")
 		s.suspended.Store(true)
 		s.publish(events.TopicIdentityChanged, nil)
 	}
+}
+
+// triggerReenrollWithRecovery launches reenrollWithRecovery in a goroutine
+// with the same concurrency guards as the old HandleTokenError 401 path.
+func (s *Service) triggerReenrollWithRecovery(reason string) {
+	if s.recovering.Load() {
+		return
+	}
+	// RLock synchronizes with Stop()'s Lock: Add(1) completes before
+	// Stop() can call Wait(), preventing a WaitGroup panic.
+	s.mu.RLock()
+	if s.stopped.Load() {
+		s.mu.RUnlock()
+		return
+	}
+	s.recoverWg.Add(1)
+	s.mu.RUnlock()
+
+	log.Printf("WARN: identity: auth failed (%s), attempting re-enrollment with recovery bundle", reason)
+	go func() {
+		defer s.recoverWg.Done()
+		s.reenrollWithRecovery()
+	}()
+}
+
+// reenrollWithRecovery re-enrolls with the existing AK and a recovery bundle.
+// Does NOT perform AK recovery. Falls back to recoverAndReenroll on AK-specific errors.
+func (s *Service) reenrollWithRecovery() {
+	if !s.recovering.CompareAndSwap(false, true) {
+		log.Printf("INFO: identity: recovery already in progress, skipping")
+		return
+	}
+	s.publish(events.TopicIdentityChanged, nil) // notify: entering recovery
+	defer func() {
+		s.recovering.Store(false)
+		s.publish(events.TopicIdentityChanged, nil) // notify: exiting recovery
+	}()
+
+	// Stop sync loop to prevent conflicting calls during re-enrollment.
+	s.stopEndpointSync()
+
+	bundle := s.buildRecoveryBundle()
+
+	const baseDelay = 2 * time.Second
+	const maxDelay = 120 * time.Second
+	const jitterFactor = 0.5
+
+	for attempt := 0; ; attempt++ {
+		if s.stopped.Load() {
+			log.Printf("INFO: identity: re-enrollment aborted (service stopped)")
+			return
+		}
+		// Abort if identity was reset (e.g., SetNamekURL) or feature disabled.
+		if !s.enrolled.Load() || !s.IsEnabled() {
+			log.Printf("INFO: identity: re-enrollment aborted (identity reset or disabled)")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+		s.mu.RLock()
+		client := s.client
+		s.mu.RUnlock()
+
+		var result *namekclient.EnrollResult
+		var err error
+
+		if client == nil {
+			err = fmt.Errorf("identity: namekclient not initialized")
+		} else if bundle != nil {
+			result, err = client.EnrollWithRecovery(ctx, bundle)
+		} else {
+			result, err = client.Enroll(ctx)
+		}
+		cancel()
+
+		if err == nil {
+			// Clear recovering before finalize so the sync loop's initial
+			// tick (started by finalizeEnrollment) can fetch fresh device info.
+			s.recovering.Store(false)
+			if _, fErr := s.finalizeEnrollment(result); fErr != nil {
+				log.Printf("ERROR: identity: finalize re-enrollment: %v", fErr)
+				return
+			}
+			log.Printf("INFO: identity: re-enrollment succeeded after %d attempt(s)", attempt+1)
+			// Best-effort state replay from cached state (reuse bundle to avoid re-reading disk).
+			s.replayState(bundle)
+			return
+		}
+
+		// If error is AK-specific, fall back to full AK recovery.
+		errMsg := extractErrorMessage(err)
+		if containsAny(errMsg, akRelatedErrors...) {
+			log.Printf("WARN: identity: re-enrollment failed with AK error, falling back to AK recovery: %v", err)
+			s.recovering.Store(false) // release so recoverAndReenroll can CAS
+			s.recoverAndReenroll()
+			return
+		}
+
+		delay := backoffDelay(attempt, baseDelay, maxDelay, jitterFactor)
+		log.Printf("WARN: identity: re-enrollment attempt %d failed: %v (retry in %v)", attempt+1, err, delay)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-s.stopCh:
+			timer.Stop()
+			log.Printf("INFO: identity: re-enrollment aborted (service stopping)")
+			return
+		}
+	}
+}
+
+// buildRecoveryBundle constructs a recovery bundle from locally cached state.
+// Returns nil if no account_id is cached (fresh device, no recovery possible).
+func (s *Service) buildRecoveryBundle() *namekclient.RecoveryBundleInput {
+	s.mu.RLock()
+	accountID := s.cfg.AccountID
+	customHostname := s.cfg.CustomHostname
+	configPath := s.configPath
+	s.mu.RUnlock()
+
+	if accountID == "" {
+		return nil
+	}
+
+	vouchersDir := filepath.Join(filepath.Dir(configPath), "vouchers")
+	vouchers, err := loadAllVouchers(vouchersDir)
+	if err != nil {
+		log.Printf("WARN: identity: failed to load vouchers for recovery: %v", err)
+	}
+
+	// Recovery bundle requires at least one voucher (server validates min=1).
+	// Single-device accounts and devices before voucher exchange completes
+	// use plain Enroll() instead; state is replayed post-enrollment.
+	if len(vouchers) == 0 {
+		return nil
+	}
+
+	stateCachePath := filepath.Join(filepath.Dir(configPath), "state_cache.json")
+	sc, err := loadStateCache(stateCachePath)
+	if err != nil {
+		log.Printf("WARN: identity: failed to load state cache for recovery: %v", err)
+	}
+
+	// Prefer identity.json custom hostname (authoritative), fall back to state cache.
+	if customHostname == "" {
+		customHostname = sc.CustomHostname
+	}
+
+	return &namekclient.RecoveryBundleInput{
+		AccountID:      accountID,
+		Vouchers:       vouchers,
+		CustomHostname: customHostname,
+		AliasDomains:   sc.AliasDomains,
+	}
+}
+
+// replayState replays cached state after re-enrollment.
+// Best-effort: partial failures don't block device operation.
+// If bundle is non-nil, its CustomHostname and AliasDomains are used directly
+// (avoids re-reading state_cache.json from disk).
+func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput) {
+	var customHostname string
+	var aliasDomains []string
+
+	if bundle != nil {
+		customHostname = bundle.CustomHostname
+		aliasDomains = bundle.AliasDomains
+	} else {
+		stateCachePath := filepath.Join(filepath.Dir(s.configPath), "state_cache.json")
+		sc, err := loadStateCache(stateCachePath)
+		if err != nil {
+			log.Printf("WARN: identity: state replay: load cache: %v", err)
+			return
+		}
+		customHostname = sc.CustomHostname
+		aliasDomains = sc.AliasDomains
+	}
+
+	s.mu.RLock()
+	client := s.client
+	s.mu.RUnlock()
+	if client == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	if customHostname != "" {
+		if err := client.SetHostname(ctx, customHostname); err != nil {
+			log.Printf("WARN: identity: state replay: set hostname %q: %v", customHostname, err)
+		} else {
+			log.Printf("INFO: identity: state replay: restored custom hostname %q", customHostname)
+		}
+	}
+
+	for _, domain := range aliasDomains {
+		domainInfo, err := client.RegisterDomain(ctx, domain)
+		if err != nil {
+			log.Printf("WARN: identity: state replay: register domain %q: %v", domain, err)
+			continue
+		}
+		if _, err := client.VerifyDomain(ctx, domainInfo.ID); err != nil {
+			log.Printf("WARN: identity: state replay: verify domain %q: %v", domain, err)
+			continue
+		}
+		if _, err := client.AssignDomain(ctx, domainInfo.ID, []string{client.DeviceID()}); err != nil {
+			log.Printf("WARN: identity: state replay: assign domain %q: %v", domain, err)
+		} else {
+			log.Printf("INFO: identity: state replay: restored alias domain %q", domain)
+		}
+	}
+}
+
+func containsAny(s string, substrs ...string) bool {
+	lower := strings.ToLower(s)
+	for _, sub := range substrs {
+		if strings.Contains(lower, strings.ToLower(sub)) {
+			return true
+		}
+	}
+	return false
+}
+
+func backoffDelay(attempt int, baseDelay, maxDelay time.Duration, jitterFactor float64) time.Duration {
+	delay := baseDelay << uint(attempt)
+	if delay > maxDelay || delay <= 0 { // overflow guard
+		delay = maxDelay
+	}
+	jitter := time.Duration(rand.Float64() * jitterFactor * float64(delay))
+	return delay + jitter
 }
 
 func (s *Service) recoverAndReenroll() {
@@ -590,6 +860,128 @@ func (s *Service) syncEndpointsOnce(ctx context.Context) {
 		return
 	}
 
+	// 1. Sync account_id + recovery status
+	s.syncDeviceMeta(info)
+
+	// 2. Process pending voucher requests (sign)
+	s.processVoucherRequests(ctx, client, info.PendingVoucherRequests)
+
+	// 3. Cache new vouchers to disk
+	s.cacheNewVouchers(info.NewVouchers)
+
+	// 4. Sync state cache (custom hostname + alias domains)
+	s.syncStateCache(info)
+
+	// 5. Sync nexus endpoints (existing logic)
+	s.syncNexusEndpoints(info)
+}
+
+func (s *Service) syncDeviceMeta(info *namekclient.DeviceInfo) {
+	// Sync recovery status (in-memory only, no persist).
+	if info.RecoveryStatus != "" {
+		s.mu.Lock()
+		if s.recoveryStatus != info.RecoveryStatus {
+			s.recoveryStatus = info.RecoveryStatus
+		}
+		s.mu.Unlock()
+	}
+
+	if info.AccountID == "" {
+		return
+	}
+	s.mu.RLock()
+	current := s.cfg.AccountID
+	s.mu.RUnlock()
+
+	if info.AccountID == current {
+		return
+	}
+
+	s.mu.Lock()
+	s.cfg.AccountID = info.AccountID
+	cfg := s.cfg
+	s.mu.Unlock()
+
+	if err := saveConfig(s.configPath, cfg); err != nil {
+		log.Printf("ERROR: identity: sync account_id: failed to persist: %v", err)
+		s.mu.Lock()
+		s.cfg.AccountID = current
+		s.mu.Unlock()
+		return
+	}
+	log.Printf("INFO: identity: synced account_id %s", info.AccountID)
+}
+
+func (s *Service) processVoucherRequests(ctx context.Context, client *namekclient.Client, requests []namekclient.PendingVoucherRequest) {
+	if len(requests) == 0 {
+		return
+	}
+	s.mu.RLock()
+	tpmDev := s.tpmDev
+	s.mu.RUnlock()
+	if tpmDev == nil {
+		log.Printf("WARN: identity: cannot sign vouchers — TPM unavailable")
+		return
+	}
+
+	for _, req := range requests {
+		// Use server-provided nonce directly (hex sha256 of voucher data).
+		quoteB64, err := tpmDev.Quote(req.Nonce)
+		if err != nil {
+			log.Printf("WARN: identity: voucher sign: quote: %v", err)
+			continue
+		}
+		signCtx, signCancel := context.WithTimeout(ctx, 15*time.Second)
+		if err := client.SignVoucher(signCtx, req.RequestID, quoteB64); err != nil {
+			log.Printf("WARN: identity: voucher sign: submit %s: %v", req.RequestID, err)
+		} else {
+			log.Printf("INFO: identity: signed voucher request %s", req.RequestID)
+		}
+		signCancel()
+	}
+}
+
+func (s *Service) cacheNewVouchers(vouchers []namekclient.VoucherArtifact) {
+	if len(vouchers) == 0 {
+		return
+	}
+	vouchersDir := filepath.Join(filepath.Dir(s.configPath), "vouchers")
+	for _, v := range vouchers {
+		fp, err := saveVoucher(vouchersDir, v)
+		if err != nil {
+			log.Printf("WARN: identity: cache voucher: %v", err)
+		} else {
+			log.Printf("INFO: identity: cached voucher from peer %s", fp)
+		}
+	}
+}
+
+func (s *Service) syncStateCache(info *namekclient.DeviceInfo) {
+	stateCachePath := filepath.Join(filepath.Dir(s.configPath), "state_cache.json")
+	current, _ := loadStateCache(stateCachePath)
+
+	var customHostname string
+	if info.CustomHostname != nil {
+		customHostname = *info.CustomHostname
+	}
+
+	updated := StateCache{
+		CustomHostname: customHostname,
+		AliasDomains:   info.AliasDomains,
+	}
+
+	if !stateCacheChanged(current, updated) {
+		return
+	}
+
+	if err := saveStateCache(stateCachePath, updated); err != nil {
+		log.Printf("ERROR: identity: state cache sync: %v", err)
+		return
+	}
+	log.Printf("INFO: identity: state cache updated")
+}
+
+func (s *Service) syncNexusEndpoints(info *namekclient.DeviceInfo) {
 	// Snapshot local endpoints under lock for comparison.
 	s.mu.RLock()
 	localEndpoints := append([]string(nil), s.cfg.NexusEndpoints...)

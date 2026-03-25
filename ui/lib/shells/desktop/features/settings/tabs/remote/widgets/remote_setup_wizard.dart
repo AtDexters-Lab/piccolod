@@ -535,6 +535,7 @@ class _RemoteSetupWizardState extends State<RemoteSetupWizard> {
     return TextField(
       controller: ctrl,
       obscureText: obscureText,
+      autofillHints: obscureText ? const [] : null,
       decoration: InputDecoration(
         labelText: label,
         hintText: hint,

@@ -114,9 +114,13 @@ type GinServer struct {
 	authManager *authpkg.Manager
 	sessions    *authpkg.SessionStore
 	userManager *authpkg.UserManager
+	webauthnMgr *authpkg.WebAuthnManager
+	inviteMgr   *authpkg.InviteManager
 	// simple rate-limit counters for login failures
 	loginFailures int
 	resetFailures int
+	// per-IP rate limiter for public passkey/invite endpoints
+	passkeyRateLimiter *ipRateLimiter
 
 	// Serializes concurrent /crypto/setup requests to prevent parallel LUKS init.
 	setupMu sync.Mutex
@@ -727,6 +731,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		installer:      installer,
 		execRunner:     execRunner,
 	}
+	// Per-IP rate limiter for public passkey/invite endpoints
+	s.passkeyRateLimiter = newIPRateLimiter(10, 5*time.Minute)
+
 	// Initialize persistent terminal session manager
 	s.terminalManager = terminal.NewManager()
 	s.terminalManager.SetEventBus(eventsBus)
@@ -815,6 +822,10 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.sessions = authpkg.NewSessionStore()
 	s.authRepo = authRepo
 	s.userManager = authpkg.NewUserManager(persist.Control().Users())
+	if os.Getenv("PICCOLO_DISABLE_PASSKEY") != "1" {
+		s.webauthnMgr = authpkg.NewWebAuthnManager(persist.Control().WebAuthnCredentials(), false)
+		s.inviteMgr = authpkg.NewInviteManager(persist.Control().InviteTokens(), s.userManager)
+	}
 
 	// Wire proxy auth dependencies (listener auth rules enforcement happens in services.ProxyManager).
 	if svcMgr != nil {
@@ -1071,7 +1082,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	if os.Getenv("PICCOLO_NEXUS_USE_STUB") == "1" {
 		nexusAdapter = nexusclient.NewStub()
 	} else {
-		nexusAdapter = nexusclient.NewBackendAdapter(routeMgr, remoteResolver)
+		nexusAdapter = nexusclient.NewBackendAdapter(routeMgr, remoteResolver,
+			nexusclient.WithAdapterEventHandler(rm.RelayEventHandler()),
+		)
 	}
 	rm.SetNexusAdapter(nexusAdapter)
 	svcMgr.SetFirewallManager(firewall.NewFirewalldManager()) // falls back to no-op stub if firewall-cmd absent
@@ -1083,6 +1096,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		s.namekAdapter = nexusclient.NewBackendAdapter(routeMgr, remoteResolver,
 			nexusclient.WithAdapterTokenProvider(namekTP),
 			nexusclient.WithAdapterName("piccolo-namek"),
+			nexusclient.WithAdapterEventHandler(rm.RelayEventHandler()),
 		)
 
 		// Register namek orchClient in remote manager's source-agnostic registry
@@ -1305,6 +1319,9 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	// Prevent identity event subscriber from racing with shutdown
 	s.namekStopped.Store(true)
 	s.stopNamekAdapter()
+	if s.remoteManager != nil {
+		s.remoteManager.ClearRelayState("piccolo-namek")
+	}
 
 	// Cancel in-flight domain reconciliation to prevent stale network calls during shutdown
 	s.namekMu.Lock()
@@ -1552,6 +1569,16 @@ func (s *GinServer) setupGinRoutes() {
 		v1.GET("/auth/initialized", s.handleAuthInitialized)
 		v1.GET("/auth/validate-next", s.handleAuthValidateNext)
 		v1.POST("/auth/login", s.handleAuthLogin)
+		v1.GET("/auth/login-options", s.handleLoginOptions)
+
+		// Passkey login (public)
+		v1.POST("/auth/passkey/login/begin", s.handlePasskeyLoginBegin)
+		v1.POST("/auth/passkey/login/finish", s.handlePasskeyLoginFinish)
+
+		// Invite (public)
+		v1.GET("/auth/invite/:token", s.handleValidateInvite)
+		v1.POST("/auth/invite/:token/passkey/begin", s.handleInvitePasskeyBegin)
+		v1.POST("/auth/invite/:token/passkey/finish", s.handleInvitePasskeyFinish)
 
 		// Onboarding endpoints (public, no auth — needed pre-setup)
 		v1.GET("/system/onboarding", s.handleOnboardingStatus)
@@ -1703,6 +1730,13 @@ func (s *GinServer) setupGinRoutes() {
 		authed.GET("/auth/csrf", s.handleAuthCSRF)
 		authed.POST("/oauth/resume", s.handleOIDCResume)
 
+		// Passkey management (authenticated)
+		authed.POST("/auth/passkey/register/begin", s.handlePasskeyRegisterBegin)
+		authed.POST("/auth/passkey/register/finish", s.handlePasskeyRegisterFinish)
+		authed.GET("/auth/passkeys", s.handleListPasskeys)
+		authed.DELETE("/auth/passkeys/:id", s.handleDeletePasskey)
+		authed.PATCH("/auth/passkeys/:id", s.handleRenamePasskey)
+
 		// UI telemetry (Admin only)
 		admin.POST("/telemetry/log", s.handleTelemetryLog)
 
@@ -1732,10 +1766,12 @@ func (s *GinServer) setupGinRoutes() {
 		{
 			users.GET("", s.handleListUsers)
 			users.POST("", s.handleCreateUser)
+			users.POST("/invite", s.handleCreateInvite)
 			users.GET("/:id", s.handleGetUser)
 			users.PUT("/:id", s.handleUpdateUser)
 			users.DELETE("/:id", s.handleDeleteUser)
 			users.POST("/:id/password", s.handleSetUserPassword)
+			users.POST("/:id/reinvite", s.handleReinviteUser)
 		}
 
 		// Catalog (read-only) - Allow standard users to view catalog?
@@ -2259,6 +2295,7 @@ func (s *GinServer) clearNamekState(rm *remote.Manager) {
 	s.namekDomains = nil
 	s.namekMu.Unlock()
 	if rm != nil {
+		rm.ClearRelayState("piccolo-namek")
 		rm.UnregisterOrchClient("namek")
 	}
 	if s.remoteResolver != nil {
@@ -2798,8 +2835,12 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 						rm.RemoveHostnameCertificate(ep.DerivedHostLabel + "." + base)
 					}
 				}
-				// Also clean up per-app certs for alias hostnames
+				// Also clean up per-app certs for portal-targeted alias hostnames.
+				// App-specific aliases are flat and have no subdomain certs.
 				for _, a := range rm.ListAliases() {
+					if a.Listener != "" && a.Listener != nexusclient.PortalHostLabel {
+						continue
+					}
 					aliasBase := normalizeHostname(a.Hostname)
 					if aliasBase == "" {
 						continue

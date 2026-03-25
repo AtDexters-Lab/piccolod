@@ -188,4 +188,64 @@ class UsersController extends ChangeNotifier {
       }
     }
   }
+
+  /// Create an invite for a new user (passkey-based onboarding).
+  /// Returns the invite token on success.
+  Future<String> createInvite({
+    required String username,
+    required String email,
+    List<String> allowedApps = const [],
+  }) async {
+    if (_disposed) return '';
+    _isLoading = true;
+    _error = null;
+    _safeNotify();
+
+    try {
+      await ApiClient().fetchCsrfToken();
+      if (_disposed) return '';
+
+      final result = await ApiClient().createInvite(
+        username: username,
+        email: email,
+        allowedApps: allowedApps.isNotEmpty ? allowedApps : null,
+      );
+
+      if (_disposed) return '';
+      await loadUsers();
+      return (result['token'] as String?) ?? '';
+    } catch (e) {
+      if (_disposed) return '';
+      _error = e.toString();
+      _isLoading = false;
+      _safeNotify();
+      rethrow;
+    }
+  }
+
+  /// Reinvite an existing user, returning a fresh invite token.
+  Future<String> reinviteUser(String userId) async {
+    if (_disposed) return '';
+    _isLoading = true;
+    _error = null;
+    _safeNotify();
+
+    try {
+      await ApiClient().fetchCsrfToken();
+      if (_disposed) return '';
+
+      final result = await ApiClient().reinviteUser(userId);
+
+      if (_disposed) return '';
+      _isLoading = false;
+      _safeNotify();
+      return (result['token'] as String?) ?? '';
+    } catch (e) {
+      if (_disposed) return '';
+      _error = e.toString();
+      _isLoading = false;
+      _safeNotify();
+      rethrow;
+    }
+  }
 }

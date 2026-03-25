@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	sqliteSchemaVersion       = 3 // Incremented for OIDC config
+	sqliteSchemaVersion       = 4 // Incremented for WebAuthn + invite tokens
 	controlPayloadVersion     = 1
 	controlVolumeMetadataName = "piccolo.volume.json"
 )
@@ -252,6 +252,32 @@ func applyMigrations(db *sql.DB) error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);`,
+		// WebAuthn + invite tables (v4 schema)
+		`CREATE TABLE IF NOT EXISTS webauthn_credentials (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			public_key BLOB NOT NULL,
+			attestation_type TEXT NOT NULL DEFAULT 'none',
+			transports TEXT,
+			sign_count INTEGER NOT NULL DEFAULT 0,
+			rp_id TEXT NOT NULL,
+			aaguid BLOB,
+			friendly_name TEXT DEFAULT '',
+			backup_eligible INTEGER NOT NULL DEFAULT 0,
+			backup_state INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL,
+			last_used_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_webauthn_creds_user_rp ON webauthn_credentials(user_id, rp_id);`,
+		`CREATE TABLE IF NOT EXISTS invite_tokens (
+			token TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			created_by TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			consumed_at TEXT,
+			created_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_invite_tokens_user ON invite_tokens(user_id);`,
 		`INSERT INTO meta (id, revision, checksum, updated_at)
 			VALUES (1, 0, '', '')
 			ON CONFLICT(id) DO NOTHING;`,
@@ -269,6 +295,9 @@ func applyMigrations(db *sql.DB) error {
 		return err
 	}
 	if err := ensureOIDCSchemaColumns(tx); err != nil {
+		return err
+	}
+	if err := ensureWebAuthnBackupColumns(tx); err != nil {
 		return err
 	}
 	err = tx.Commit()
@@ -333,6 +362,17 @@ func ensureOIDCSchemaColumns(tx *sql.Tx) error {
 	}
 	// Add type to oidc_clients for proxy client detection (RFC 20260122 §5.3)
 	if err := ensureColumn(tx, "oidc_clients", "type", "TEXT NOT NULL DEFAULT 'app'"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureWebAuthnBackupColumns adds backup flags to webauthn_credentials for existing installs.
+func ensureWebAuthnBackupColumns(tx *sql.Tx) error {
+	if err := ensureColumn(tx, "webauthn_credentials", "backup_eligible", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(tx, "webauthn_credentials", "backup_state", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	return nil
@@ -651,6 +691,12 @@ func (s *sqliteControlStore) OIDCRefreshTokens() OIDCRefreshTokenRepo {
 }
 func (s *sqliteControlStore) OIDCConfig() OIDCConfigRepo {
 	return &sqliteOIDCConfigRepo{store: s}
+}
+func (s *sqliteControlStore) WebAuthnCredentials() WebAuthnCredentialRepo {
+	return &sqliteWebAuthnCredRepo{store: s}
+}
+func (s *sqliteControlStore) InviteTokens() InviteTokenRepo {
+	return &sqliteInviteTokenRepo{store: s}
 }
 
 func (s *sqliteControlStore) ensureWritableLocked() error {
@@ -1095,8 +1141,8 @@ func (r *sqliteAppStateRepo) UpsertApp(ctx context.Context, record AppRecord) er
 type sqliteUserRepo struct{ store *sqliteControlStore }
 
 func (r *sqliteUserRepo) Create(ctx context.Context, user User) error {
-	if user.ID == "" || user.Username == "" || user.Email == "" || user.PasswordHash == "" {
-		return errors.New("user id, username, email, and password_hash required")
+	if user.ID == "" || user.Username == "" || user.Email == "" {
+		return errors.New("user id, username, and email required")
 	}
 	if user.Role != UserRoleAdmin && user.Role != UserRoleStandard {
 		return errors.New("invalid role")
@@ -1258,6 +1304,16 @@ func (r *sqliteUserRepo) Delete(ctx context.Context, id string) error {
 	_, err := r.store.db.ExecContext(ctx, `DELETE FROM oidc_refresh_tokens WHERE user_id=?`, id)
 	if err != nil {
 		return fmt.Errorf("delete user refresh tokens: %w", err)
+	}
+	// Delete webauthn credentials (manual cascade)
+	_, err = r.store.db.ExecContext(ctx, `DELETE FROM webauthn_credentials WHERE user_id=?`, id)
+	if err != nil {
+		return fmt.Errorf("delete user webauthn credentials: %w", err)
+	}
+	// Delete invite tokens (manual cascade)
+	_, err = r.store.db.ExecContext(ctx, `DELETE FROM invite_tokens WHERE user_id=?`, id)
+	if err != nil {
+		return fmt.Errorf("delete user invite tokens: %w", err)
 	}
 
 	result, err := r.store.db.ExecContext(ctx, `DELETE FROM users WHERE id=?`, id)
@@ -1734,5 +1790,351 @@ func (r *sqliteOIDCConfigRepo) SetEncryptionKey(ctx context.Context, key []byte)
 		`INSERT INTO oidc_config (id, encryption_key, created_at, updated_at) VALUES (1, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET encryption_key=excluded.encryption_key, updated_at=excluded.updated_at`,
 		key, now, now)
+	return err
+}
+
+// -----------------------------------------------------------------------------
+// WebAuthn Credential Repository
+// -----------------------------------------------------------------------------
+
+type sqliteWebAuthnCredRepo struct{ store *sqliteControlStore }
+
+func (r *sqliteWebAuthnCredRepo) Create(ctx context.Context, cred WebAuthnCredential) error {
+	if cred.ID == "" || cred.UserID == "" || len(cred.PublicKey) == 0 || cred.RPID == "" {
+		return errors.New("credential id, user_id, public_key, and rp_id required")
+	}
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	if err := r.store.ensureWritableLocked(); err != nil {
+		return err
+	}
+	var transportsJSON *string
+	if cred.Transports != nil {
+		data, err := json.Marshal(cred.Transports)
+		if err != nil {
+			return err
+		}
+		s := string(data)
+		transportsJSON = &s
+	}
+	_, err := r.store.db.ExecContext(ctx,
+		`INSERT INTO webauthn_credentials (id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, backup_eligible, backup_state, created_at, last_used_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		cred.ID, cred.UserID, cred.PublicKey, cred.AttestationType, transportsJSON,
+		cred.SignCount, cred.RPID, cred.AAGUID, cred.FriendlyName,
+		boolToInt(cred.BackupEligible), boolToInt(cred.BackupState),
+		formatTimestamp(cred.CreatedAt), formatTimestamp(cred.LastUsedAt))
+	return err
+}
+
+func (r *sqliteWebAuthnCredRepo) Get(ctx context.Context, credID string) (WebAuthnCredential, error) {
+	r.store.mu.RLock()
+	defer r.store.mu.RUnlock()
+	if !r.store.loaded {
+		return WebAuthnCredential{}, ErrLocked
+	}
+	return r.scanCred(ctx,
+		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, backup_eligible, backup_state, created_at, last_used_at
+		 FROM webauthn_credentials WHERE id=?`, credID)
+}
+
+func (r *sqliteWebAuthnCredRepo) ListByUser(ctx context.Context, userID string) ([]WebAuthnCredential, error) {
+	r.store.mu.RLock()
+	defer r.store.mu.RUnlock()
+	if !r.store.loaded {
+		return nil, ErrLocked
+	}
+	return r.scanCreds(ctx,
+		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, backup_eligible, backup_state, created_at, last_used_at
+		 FROM webauthn_credentials WHERE user_id=? ORDER BY created_at`, userID)
+}
+
+func (r *sqliteWebAuthnCredRepo) ListByUserAndRP(ctx context.Context, userID, rpID string) ([]WebAuthnCredential, error) {
+	r.store.mu.RLock()
+	defer r.store.mu.RUnlock()
+	if !r.store.loaded {
+		return nil, ErrLocked
+	}
+	return r.scanCreds(ctx,
+		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, backup_eligible, backup_state, created_at, last_used_at
+		 FROM webauthn_credentials WHERE user_id=? AND rp_id=? ORDER BY created_at`, userID, rpID)
+}
+
+func (r *sqliteWebAuthnCredRepo) ListByRP(ctx context.Context, rpID string) ([]WebAuthnCredential, error) {
+	r.store.mu.RLock()
+	defer r.store.mu.RUnlock()
+	if !r.store.loaded {
+		return nil, ErrLocked
+	}
+	return r.scanCreds(ctx,
+		`SELECT id, user_id, public_key, attestation_type, transports, sign_count, rp_id, aaguid, friendly_name, backup_eligible, backup_state, created_at, last_used_at
+		 FROM webauthn_credentials WHERE rp_id=? ORDER BY created_at`, rpID)
+}
+
+func (r *sqliteWebAuthnCredRepo) scanCred(ctx context.Context, query string, args ...any) (WebAuthnCredential, error) {
+	var (
+		cred           WebAuthnCredential
+		transportsJSON sql.NullString
+		aaguid         []byte
+		createdAt      string
+		lastUsedAt     string
+	)
+	var backupEligible, backupState int
+	err := r.store.db.QueryRowContext(ctx, query, args...).Scan(
+		&cred.ID, &cred.UserID, &cred.PublicKey, &cred.AttestationType,
+		&transportsJSON, &cred.SignCount, &cred.RPID, &aaguid,
+		&cred.FriendlyName, &backupEligible, &backupState, &createdAt, &lastUsedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WebAuthnCredential{}, ErrNotFound
+		}
+		return WebAuthnCredential{}, err
+	}
+	if transportsJSON.Valid && transportsJSON.String != "" {
+		if err := json.Unmarshal([]byte(transportsJSON.String), &cred.Transports); err != nil {
+			return WebAuthnCredential{}, err
+		}
+	}
+	cred.AAGUID = aaguid
+	cred.BackupEligible = backupEligible != 0
+	cred.BackupState = backupState != 0
+	cred.CreatedAt = parseTimestamp(createdAt)
+	cred.LastUsedAt = parseTimestamp(lastUsedAt)
+	return cred, nil
+}
+
+func (r *sqliteWebAuthnCredRepo) scanCreds(ctx context.Context, query string, args ...any) ([]WebAuthnCredential, error) {
+	rows, err := r.store.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var creds []WebAuthnCredential
+	for rows.Next() {
+		var (
+			cred           WebAuthnCredential
+			transportsJSON sql.NullString
+			aaguid         []byte
+			createdAt      string
+			lastUsedAt     string
+		)
+		var backupEligible, backupState int
+		if err := rows.Scan(
+			&cred.ID, &cred.UserID, &cred.PublicKey, &cred.AttestationType,
+			&transportsJSON, &cred.SignCount, &cred.RPID, &aaguid,
+			&cred.FriendlyName, &backupEligible, &backupState, &createdAt, &lastUsedAt); err != nil {
+			return nil, err
+		}
+		if transportsJSON.Valid && transportsJSON.String != "" {
+			if err := json.Unmarshal([]byte(transportsJSON.String), &cred.Transports); err != nil {
+				return nil, err
+			}
+		}
+		cred.AAGUID = aaguid
+		cred.BackupEligible = backupEligible != 0
+		cred.BackupState = backupState != 0
+		cred.CreatedAt = parseTimestamp(createdAt)
+		cred.LastUsedAt = parseTimestamp(lastUsedAt)
+		creds = append(creds, cred)
+	}
+	return creds, rows.Err()
+}
+
+func (r *sqliteWebAuthnCredRepo) UpdateAfterAuth(ctx context.Context, credID string, signCount uint32, lastUsed time.Time) error {
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	if err := r.store.ensureWritableLocked(); err != nil {
+		return err
+	}
+	result, err := r.store.db.ExecContext(ctx,
+		`UPDATE webauthn_credentials SET sign_count=?, last_used_at=? WHERE id=?`,
+		signCount, formatTimestamp(lastUsed), credID)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *sqliteWebAuthnCredRepo) UpdateFriendlyName(ctx context.Context, credID, name string) error {
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	if err := r.store.ensureWritableLocked(); err != nil {
+		return err
+	}
+	result, err := r.store.db.ExecContext(ctx,
+		`UPDATE webauthn_credentials SET friendly_name=? WHERE id=?`, name, credID)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *sqliteWebAuthnCredRepo) Delete(ctx context.Context, credID string) error {
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	if err := r.store.ensureWritableLocked(); err != nil {
+		return err
+	}
+	result, err := r.store.db.ExecContext(ctx,
+		`DELETE FROM webauthn_credentials WHERE id=?`, credID)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *sqliteWebAuthnCredRepo) DeleteByUser(ctx context.Context, userID string) error {
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	if err := r.store.ensureWritableLocked(); err != nil {
+		return err
+	}
+	_, err := r.store.db.ExecContext(ctx,
+		`DELETE FROM webauthn_credentials WHERE user_id=?`, userID)
+	return err
+}
+
+func (r *sqliteWebAuthnCredRepo) CountByUser(ctx context.Context, userID string) (int, error) {
+	r.store.mu.RLock()
+	defer r.store.mu.RUnlock()
+	if !r.store.loaded {
+		return 0, ErrLocked
+	}
+	var count int
+	err := r.store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM webauthn_credentials WHERE user_id=?`, userID).Scan(&count)
+	return count, err
+}
+
+func (r *sqliteWebAuthnCredRepo) CountByUserAndRP(ctx context.Context, userID, rpID string) (int, error) {
+	r.store.mu.RLock()
+	defer r.store.mu.RUnlock()
+	if !r.store.loaded {
+		return 0, ErrLocked
+	}
+	var count int
+	err := r.store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM webauthn_credentials WHERE user_id=? AND rp_id=?`, userID, rpID).Scan(&count)
+	return count, err
+}
+
+func (r *sqliteWebAuthnCredRepo) CountByUserSplitRP(ctx context.Context, userID, rpID string) (int, int, error) {
+	r.store.mu.RLock()
+	defer r.store.mu.RUnlock()
+	if !r.store.loaded {
+		return 0, 0, ErrLocked
+	}
+	var total, rpCount int
+	err := r.store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), SUM(CASE WHEN rp_id=? THEN 1 ELSE 0 END) FROM webauthn_credentials WHERE user_id=?`,
+		rpID, userID).Scan(&total, &rpCount)
+	return total, rpCount, err
+}
+
+// -----------------------------------------------------------------------------
+// Invite Token Repository
+// -----------------------------------------------------------------------------
+
+type sqliteInviteTokenRepo struct{ store *sqliteControlStore }
+
+func (r *sqliteInviteTokenRepo) Create(ctx context.Context, token InviteToken) error {
+	if token.Token == "" || token.UserID == "" || token.CreatedBy == "" {
+		return errors.New("token, user_id, and created_by required")
+	}
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	if err := r.store.ensureWritableLocked(); err != nil {
+		return err
+	}
+	_, err := r.store.db.ExecContext(ctx,
+		`INSERT INTO invite_tokens (token, user_id, created_by, expires_at, consumed_at, created_at)
+		 VALUES (?, ?, ?, ?, NULL, ?)`,
+		token.Token, token.UserID, token.CreatedBy,
+		formatTimestamp(token.ExpiresAt), formatTimestamp(token.CreatedAt))
+	return err
+}
+
+func (r *sqliteInviteTokenRepo) Get(ctx context.Context, token string) (InviteToken, error) {
+	r.store.mu.RLock()
+	defer r.store.mu.RUnlock()
+	if !r.store.loaded {
+		return InviteToken{}, ErrLocked
+	}
+	var (
+		it         InviteToken
+		expiresAt  string
+		consumedAt sql.NullString
+		createdAt  string
+	)
+	err := r.store.db.QueryRowContext(ctx,
+		`SELECT token, user_id, created_by, expires_at, consumed_at, created_at
+		 FROM invite_tokens WHERE token=?`, token).Scan(
+		&it.Token, &it.UserID, &it.CreatedBy, &expiresAt, &consumedAt, &createdAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return InviteToken{}, ErrNotFound
+		}
+		return InviteToken{}, err
+	}
+	it.ExpiresAt = parseTimestamp(expiresAt)
+	if consumedAt.Valid {
+		t := parseTimestamp(consumedAt.String)
+		it.ConsumedAt = &t
+	}
+	it.CreatedAt = parseTimestamp(createdAt)
+	return it, nil
+}
+
+func (r *sqliteInviteTokenRepo) Consume(ctx context.Context, token string) error {
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	if err := r.store.ensureWritableLocked(); err != nil {
+		return err
+	}
+	now := formatTimestamp(time.Now().UTC())
+	result, err := r.store.db.ExecContext(ctx,
+		`UPDATE invite_tokens SET consumed_at=? WHERE token=? AND consumed_at IS NULL`, now, token)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return errors.New("invite token not found or already consumed")
+	}
+	return nil
+}
+
+func (r *sqliteInviteTokenRepo) DeleteByUser(ctx context.Context, userID string) error {
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	if err := r.store.ensureWritableLocked(); err != nil {
+		return err
+	}
+	_, err := r.store.db.ExecContext(ctx,
+		`DELETE FROM invite_tokens WHERE user_id=?`, userID)
+	return err
+}
+
+func (r *sqliteInviteTokenRepo) DeleteExpired(ctx context.Context) error {
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	if err := r.store.ensureWritableLocked(); err != nil {
+		return err
+	}
+	now := formatTimestamp(time.Now().UTC())
+	_, err := r.store.db.ExecContext(ctx,
+		`DELETE FROM invite_tokens WHERE expires_at < ? AND consumed_at IS NULL`, now)
 	return err
 }

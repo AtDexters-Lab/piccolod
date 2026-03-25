@@ -2,6 +2,7 @@ package remote
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"net"
 	"strings"
@@ -16,13 +17,21 @@ type stubDialer struct {
 	err error
 }
 
-func (s *stubDialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+func (s *stubDialer) dial() (net.Conn, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
 	c1, c2 := net.Pipe()
 	_ = c2.Close()
 	return c1, nil
+}
+
+func (s *stubDialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	return s.dial()
+}
+
+func (s *stubDialer) DialTLS(network, address, serverName string, timeout time.Duration) (net.Conn, error) {
+	return s.dial()
 }
 
 type stubResolver struct {
@@ -319,6 +328,132 @@ func TestConfigure_HTTP01NoWildcard(t *testing.T) {
 	}
 }
 
+func TestEndpointUsesTLS(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     bool
+	}{
+		{"wss://relay.example.com:8443/connect", true},
+		{"https://relay.example.com/connect", true},
+		{"ws://relay.example.com:8080/connect", false},
+		{"http://relay.example.com/connect", false},
+		{"", false}, // empty has no scheme
+	}
+	for _, tc := range tests {
+		if got := endpointUsesTLS(tc.endpoint); got != tc.want {
+			t.Errorf("endpointUsesTLS(%q) = %v, want %v", tc.endpoint, got, tc.want)
+		}
+	}
+}
+
+func TestCheckEndpoint_TLSError(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	dial := &stubDialer{err: errors.New("tls: certificate is valid for nxs.other.com, not relay.example.com")}
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, dial, &stubResolver{}, fixedNow(time.Unix(6, 0)))
+
+	cfg := &Config{NexusConfig: NexusConfig{
+		Endpoint:       "wss://relay.example.com:8443/connect",
+		PortalHostname: "portal.example.com",
+		Solver:         "http-01",
+	}}
+
+	check := m.checkEndpoint(cfg)
+	if check.Status != "fail" {
+		t.Fatalf("expected fail, got %s", check.Status)
+	}
+	if check.NextStep != "Verify the relay's TLS certificate matches the endpoint hostname" {
+		t.Fatalf("expected TLS-specific next step, got %q", check.NextStep)
+	}
+}
+
+func TestCheckEndpoint_TypedTLSError(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	dial := &stubDialer{err: x509.HostnameError{
+		Host:        "relay.example.com",
+		Certificate: &x509.Certificate{DNSNames: []string{"nxs.other.com"}},
+	}}
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, dial, &stubResolver{}, fixedNow(time.Unix(6, 0)))
+
+	cfg := &Config{NexusConfig: NexusConfig{
+		Endpoint:       "wss://relay.example.com:8443/connect",
+		PortalHostname: "portal.example.com",
+		Solver:         "http-01",
+	}}
+
+	check := m.checkEndpoint(cfg)
+	if check.Status != "fail" {
+		t.Fatalf("expected fail, got %s", check.Status)
+	}
+	if check.NextStep != "Verify the relay's TLS certificate matches the endpoint hostname" {
+		t.Fatalf("expected TLS-specific next step for typed error, got %q", check.NextStep)
+	}
+}
+
+func TestCheckEndpoint_NonTLSEndpoint(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	dial := &stubDialer{}
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, dial, &stubResolver{}, fixedNow(time.Unix(7, 0)))
+
+	cfg := &Config{NexusConfig: NexusConfig{
+		Endpoint:       "ws://relay.example.com:8080/connect",
+		PortalHostname: "portal.example.com",
+		Solver:         "http-01",
+	}}
+
+	check := m.checkEndpoint(cfg)
+	if check.Status != "pass" {
+		t.Fatalf("expected pass for non-TLS endpoint, got %s: %s", check.Status, check.Detail)
+	}
+}
+
+func TestConfigure_HTTP01DefersIssuance(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(8, 0)))
+
+	if err := m.Configure(ConfigureRequest{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		PortalHostname: "portal.example.com",
+	}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	// Immediately after Configure, the portal cert should be "pending" —
+	// actual issuance happens asynchronously via the ACME worker.
+	var found bool
+	for _, c := range m.ListCertificates() {
+		if c.ID == "portal" {
+			found = true
+			if !strings.EqualFold(c.Status, "pending") {
+				t.Fatalf("portal cert should be 'pending' immediately after Configure, got %q", c.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("portal cert not found after Configure")
+	}
+}
+
 func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 	dir := t.TempDir()
 	storage, err := newFileStorage(dir)
@@ -335,8 +470,7 @@ func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 		Status:   "ok",
 		Attempts: 2,
 	}}
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveAll(cfg); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -378,7 +512,7 @@ func TestEnqueueIssuanceRespectsRetryAt(t *testing.T) {
 		FailureCode:  "cert_rate_limited",
 		RetryAt:      &retryAt,
 	}}
-	if err := m.save(cfg); err != nil {
+	if err := m.saveAll(cfg); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -443,7 +577,7 @@ func TestEnqueueIssuanceReissuesOnDomainChange(t *testing.T) {
 		NextRenewal: &nextRenewal,
 		ExpiresAt:   &expires,
 	}}
-	if err := m.save(cfg); err != nil {
+	if err := m.saveAll(cfg); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -564,4 +698,219 @@ func TestOrchClientRegistry(t *testing.T) {
 		t.Fatal("expected namek orchClient to be unregistered")
 	}
 	m.adapterMu.Unlock()
+}
+
+// --- Relay-gated certificate issuance tests ---
+
+func TestHttpChallengeReachable(t *testing.T) {
+	m := &Manager{
+		relayStates: make(map[string]relayState),
+		cfg:         &Config{},
+		now:         func() time.Time { return time.Now() },
+	}
+
+	t.Run("empty_map_returns_false", func(t *testing.T) {
+		if m.httpChallengeReachable() {
+			t.Fatal("expected false when no relays tracked")
+		}
+	})
+
+	t.Run("single_relay_connected", func(t *testing.T) {
+		m.relayStates["piccolo-portal"] = relayState{connected: true}
+		if !m.httpChallengeReachable() {
+			t.Fatal("expected true when single relay connected")
+		}
+	})
+
+	t.Run("single_relay_disconnected", func(t *testing.T) {
+		m.relayStates["piccolo-portal"] = relayState{connected: false, err: "dial error"}
+		if m.httpChallengeReachable() {
+			t.Fatal("expected false when single relay disconnected")
+		}
+	})
+
+	t.Run("two_relays_both_connected", func(t *testing.T) {
+		m.relayStates["piccolo-portal"] = relayState{connected: true}
+		m.relayStates["piccolo-namek"] = relayState{connected: true}
+		if !m.httpChallengeReachable() {
+			t.Fatal("expected true when all relays connected")
+		}
+	})
+
+	t.Run("two_relays_one_disconnected", func(t *testing.T) {
+		m.relayStates["piccolo-portal"] = relayState{connected: true}
+		m.relayStates["piccolo-namek"] = relayState{connected: false, err: "timeout"}
+		if m.httpChallengeReachable() {
+			t.Fatal("expected false when one relay disconnected")
+		}
+	})
+
+	t.Run("clear_relay_state_removes_entry", func(t *testing.T) {
+		m.relayStates["piccolo-portal"] = relayState{connected: true}
+		m.relayStates["piccolo-namek"] = relayState{connected: false, err: "timeout"}
+		m.ClearRelayState("piccolo-namek")
+		if !m.httpChallengeReachable() {
+			t.Fatal("expected true after clearing disconnected relay")
+		}
+	})
+}
+
+func TestNeedsRelay(t *testing.T) {
+	tests := []struct {
+		solver string
+		want   bool
+	}{
+		{"http-01", true},
+		{"HTTP-01", true},
+		{"", true},          // conservative default
+		{"dns-01", false},
+		{"DNS-01", false},
+	}
+	for _, tt := range tests {
+		if got := needsRelay(tt.solver); got != tt.want {
+			t.Errorf("needsRelay(%q) = %v, want %v", tt.solver, got, tt.want)
+		}
+	}
+}
+
+func TestRelayGate_HTTP01DeferredWhenDisconnected(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(10, 0)))
+
+	// Configure self-hosted remote (creates a pending HTTP-01 portal cert)
+	if err := m.Configure(ConfigureRequest{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		PortalHostname: "portal.example.com",
+	}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	// No relay connected — cert should stay pending (not issued)
+	time.Sleep(100 * time.Millisecond)
+	for _, c := range m.ListCertificates() {
+		if c.ID == "portal" && !strings.EqualFold(c.Status, "pending") {
+			t.Fatalf("portal cert should remain 'pending' with no relay, got %q", c.Status)
+		}
+	}
+
+	// Simulate relay connect — should trigger issuance
+	m.handleRelayEvent("piccolo-portal", true, "")
+	time.Sleep(500 * time.Millisecond)
+
+	var found bool
+	for _, c := range m.ListCertificates() {
+		if c.ID == "portal" {
+			found = true
+			if !strings.EqualFold(c.Status, "ok") {
+				t.Fatalf("portal cert should be 'ok' after relay connect, got %q", c.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("portal cert not found")
+	}
+}
+
+func TestRelayGate_DNS01NotAffectedByRelayState(t *testing.T) {
+	// DNS-01 certs should not be gated by relay connectivity.
+	if needsRelay("dns-01") {
+		t.Fatal("dns-01 should not need relay")
+	}
+
+	m := &Manager{relayStates: make(map[string]relayState)}
+	// Even with no relays connected, dns-01 gate check should not block.
+	// The actual DNS-01 gating is via orchClient availability, not relay state.
+	if needsRelay("dns-01") && !m.httpChallengeReachable() {
+		t.Fatal("dns-01 should bypass relay gate")
+	}
+}
+
+func TestRelayGate_DNS01ManagedNotBlockedByRelay(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(10, 0)))
+
+	// Configure managed mode (DNS-01) — no relay needed for cert issuance.
+	if err := m.ConfigureManaged(ManagedConfigureRequest{
+		OrchestratorEndpoint: "https://orchestrator.example.com",
+		DeviceToken:          "secret",
+		PortalHostname:       "portal.example.com",
+	}); err != nil {
+		t.Fatalf("configure managed: %v", err)
+	}
+
+	// No relay connected — DNS-01 certs should still be issued because
+	// they don't depend on relay connectivity (challenges go through orchestrator API).
+	time.Sleep(500 * time.Millisecond)
+
+	for _, c := range m.ListCertificates() {
+		if c.ID == "portal" || c.ID == "wildcard" {
+			if strings.EqualFold(c.Status, "pending") {
+				t.Fatalf("DNS-01 cert %s should NOT be stuck in 'pending' without relay (solver=%s)", c.ID, c.Solver)
+			}
+		}
+	}
+}
+
+func TestRelayGate_BootSequence(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+
+	// Step 1: Create manager, configure, and close (simulates previous session)
+	m1 := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(10, 0)))
+	if err := m1.Configure(ConfigureRequest{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		PortalHostname: "portal.example.com",
+	}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	_ = m1.Close()
+
+	// Step 2: "Reboot" — new manager loads persisted config with pending cert.
+	// requeueOutstandingIssuances fires at boot but relay is not connected.
+	m2, err := newManagerWithDeps(storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(20, 0)))
+	if err != nil {
+		t.Fatalf("manager reboot: %v", err)
+	}
+	t.Cleanup(func() { _ = m2.Close() })
+
+	// Cert should still be pending (not error) — boot requeue was gated.
+	time.Sleep(100 * time.Millisecond)
+	for _, c := range m2.ListCertificates() {
+		if c.ID == "portal" {
+			if strings.EqualFold(c.Status, "error") {
+				t.Fatalf("portal cert should NOT be in 'error' state after boot (relay gate should have deferred it), got error: %s", c.FailureReason)
+			}
+			if !strings.EqualFold(c.Status, "pending") {
+				t.Fatalf("portal cert should be 'pending' after boot with no relay, got %q", c.Status)
+			}
+		}
+	}
+
+	// Step 3: Relay connects — cert should be issued
+	m2.handleRelayEvent("piccolo-portal", true, "")
+	time.Sleep(500 * time.Millisecond)
+
+	for _, c := range m2.ListCertificates() {
+		if c.ID == "portal" {
+			if !strings.EqualFold(c.Status, "ok") {
+				t.Fatalf("portal cert should be 'ok' after relay connect on reboot, got %q (reason: %s)", c.Status, c.FailureReason)
+			}
+		}
+	}
 }

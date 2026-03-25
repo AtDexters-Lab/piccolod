@@ -500,7 +500,9 @@ func TestCryptoRecoveryKeyGenerateRotatesAndClearsStaleness(t *testing.T) {
 	}
 }
 
-func TestAuthLoginUnlocksLockedControlStore(t *testing.T) {
+// TestAuthLogin_ReturnsLockedWhenStorageLocked verifies the two-door model:
+// login does NOT implicitly unlock disk — it returns 423 when storage is locked.
+func TestAuthLogin_ReturnsLockedWhenStorageLocked(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	const password = "pw123456"
 
@@ -528,15 +530,6 @@ func TestAuthLoginUnlocksLockedControlStore(t *testing.T) {
 		dispatcher:    commands.NewDispatcher(),
 	}
 
-	srv.dispatcher.Register(persistence.CommandRecordLockState, commands.HandlerFunc(func(ctx context.Context, cmd commands.Command) (commands.Response, error) {
-		record, ok := cmd.(persistence.RecordLockStateCommand)
-		if !ok {
-			t.Fatalf("unexpected command type %#v", cmd)
-		}
-		storage.setLocked(record.Locked)
-		return nil, nil
-	}))
-
 	router := gin.New()
 	srv.router = router
 	router.POST("/api/v1/auth/login", srv.handleAuthLogin)
@@ -547,23 +540,87 @@ func TestAuthLoginUnlocksLockedControlStore(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 
+	if w.Code != http.StatusLocked {
+		t.Fatalf("expected 423 Locked, got %d body=%s", w.Code, w.Body.String())
+	}
+	if !storage.isLocked() {
+		t.Fatalf("expected control store to remain locked")
+	}
+	if !cryptoMgr.IsLocked() {
+		t.Fatalf("expected crypto manager to remain locked")
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookieName && c.Value != "" {
+			t.Fatalf("expected no session cookie, got one")
+		}
+	}
+}
+
+// TestCryptoUnlock_NoSessionCreated verifies the two-door model:
+// unlock decrypts disk but does NOT create a portal session.
+func TestCryptoUnlock_NoSessionCreated(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const password = "pw123456"
+
+	tempDir := t.TempDir()
+	cryptoMgr, err := crypt.NewManager(tempDir)
+	if err != nil {
+		t.Fatalf("crypto manager init: %v", err)
+	}
+	if err := cryptoMgr.Setup(password); err != nil {
+		t.Fatalf("crypto setup: %v", err)
+	}
+	cryptoMgr.Lock()
+
+	authMgr, err := authpkg.NewManager(tempDir)
+	if err != nil {
+		t.Fatalf("auth manager init: %v", err)
+	}
+	if err := authMgr.Setup(context.Background(), password); err != nil {
+		t.Fatalf("auth setup: %v", err)
+	}
+
+	srv := &GinServer{
+		authManager:   authMgr,
+		cryptoManager: cryptoMgr,
+		sessions:      authpkg.NewSessionStore(),
+		dispatcher:    commands.NewDispatcher(),
+	}
+	srv.dispatcher.Register(persistence.CommandRecordLockState, commands.HandlerFunc(func(_ context.Context, _ commands.Command) (commands.Response, error) {
+		return nil, nil
+	}))
+
+	router := gin.New()
+	srv.router = router
+	router.POST("/api/v1/crypto/unlock", srv.handleCryptoUnlock)
+
+	w := httptest.NewRecorder()
+	reqBody := fmt.Sprintf(`{"password":"%s"}`, password)
+	req, _ := http.NewRequest("POST", "/api/v1/crypto/unlock", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
 	}
-	if storage.isLocked() {
-		t.Fatalf("expected control store unlocked")
-	}
-	if cryptoMgr.IsLocked() {
-		t.Fatalf("expected crypto manager unlocked")
-	}
-	found := false
 	for _, c := range w.Result().Cookies() {
 		if c.Name == sessionCookieName && c.Value != "" {
-			found = true
+			t.Fatalf("expected no session cookie after unlock, got one")
 		}
 	}
-	if !found {
-		t.Fatalf("expected session cookie in response")
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp["message"] != "ok" {
+		t.Fatalf("expected message=ok, got %v", resp["message"])
+	}
+	if _, hasWarning := resp["warning"]; hasWarning {
+		t.Fatalf("expected no warning field, got %v", resp["warning"])
+	}
+	// Auth is initialized → setup_complete should be true
+	if resp["setup_complete"] != true {
+		t.Fatalf("expected setup_complete=true, got %v", resp["setup_complete"])
 	}
 }
 

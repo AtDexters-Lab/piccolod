@@ -23,6 +23,7 @@ import (
 	"piccolod/internal/events"
 	"piccolod/internal/hostname"
 	"piccolod/internal/remote"
+	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/services"
 )
 
@@ -149,12 +150,14 @@ func (s *GinServer) portalCertEntries() []portalCertEntry {
 			}
 		}
 
-		// Alias domains — HTTP-01 per-app certs (source-agnostic: works for both
-		// self-hosted and namek traffic paths). Only include when at least one remote
-		// access path is active (self-hosted enabled or namek active), since HTTP-01
-		// challenges require the domain to be reachable.
+		// Portal-targeted alias domains need per-app subdomain certs (like the
+		// main portal hostname). App-targeted aliases are flat hostname mappings
+		// — their base cert is handled by AddAlias; no subdomain certs needed.
 		if st.Enabled || s.namekDomainActive() {
 			for _, a := range rm.ListAliases() {
+				if a.Listener != "" && a.Listener != nexusclient.PortalHostLabel {
+					continue // app-specific alias — no per-app subdomain certs
+				}
 				h := normalizeHostname(a.Hostname)
 				if h != "" {
 					entries = append(entries, portalCertEntry{

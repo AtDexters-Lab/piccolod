@@ -26,11 +26,12 @@ func NewUserManager(repo persistence.UserRepo) *UserManager {
 
 // CreateUserInput contains the input data for creating a new user.
 type CreateUserInput struct {
-	Username    string
-	Email       string
-	Password    string
-	Role        persistence.UserRole
-	AllowedApps []string // Only used for standard users
+	Username     string
+	Email        string
+	Password     string
+	Role         persistence.UserRole
+	AllowedApps  []string // Only used for standard users
+	Passwordless bool     // When true, skip password validation (invite-based onboarding)
 }
 
 // UserInfo represents user information without sensitive data.
@@ -40,8 +41,22 @@ type UserInfo struct {
 	Email       string
 	Role        persistence.UserRole
 	AllowedApps []string
+	HasPassword bool // true if user has a password (false for invite-based passwordless users)
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+}
+
+func userInfoFromUser(u persistence.User) UserInfo {
+	return UserInfo{
+		ID:          u.ID,
+		Username:    u.Username,
+		Email:       u.Email,
+		Role:        u.Role,
+		AllowedApps: u.AllowedApps,
+		HasPassword: u.PasswordHash != "",
+		CreatedAt:   u.CreatedAt,
+		UpdatedAt:   u.UpdatedAt,
+	}
 }
 
 // ErrUserNotFound is returned when a user is not found.
@@ -64,11 +79,17 @@ func (m *UserManager) Create(ctx context.Context, input CreateUserInput) (*UserI
 	if strings.TrimSpace(input.Email) == "" {
 		return nil, errors.New("email required")
 	}
-	if strings.TrimSpace(input.Password) == "" {
-		return nil, errors.New("password required")
-	}
-	if err := validatePasswordStrength(input.Password); err != nil {
-		return nil, err
+	if input.Passwordless {
+		if input.Role != persistence.UserRoleStandard {
+			return nil, errors.New("only standard users can be passwordless")
+		}
+	} else {
+		if strings.TrimSpace(input.Password) == "" {
+			return nil, errors.New("password required")
+		}
+		if err := validatePasswordStrength(input.Password); err != nil {
+			return nil, err
+		}
 	}
 	if input.Role != persistence.UserRoleAdmin && input.Role != persistence.UserRoleStandard {
 		return nil, errors.New("invalid role")
@@ -88,10 +109,14 @@ func (m *UserManager) Create(ctx context.Context, input CreateUserInput) (*UserI
 		return nil, err
 	}
 
-	// Hash the password
-	passwordHash, err := hashArgon2id(input.Password)
-	if err != nil {
-		return nil, fmt.Errorf("hash password: %w", err)
+	// Hash the password (skip for passwordless users)
+	var passwordHash string
+	if !input.Passwordless {
+		var err error
+		passwordHash, err = hashArgon2id(input.Password)
+		if err != nil {
+			return nil, fmt.Errorf("hash password: %w", err)
+		}
 	}
 
 	// Generate user ID
@@ -116,15 +141,8 @@ func (m *UserManager) Create(ctx context.Context, input CreateUserInput) (*UserI
 		return nil, err
 	}
 
-	return &UserInfo{
-		ID:          user.ID,
-		Username:    user.Username,
-		Email:       user.Email,
-		Role:        user.Role,
-		AllowedApps: user.AllowedApps,
-		CreatedAt:   user.CreatedAt,
-		UpdatedAt:   user.UpdatedAt,
-	}, nil
+	info := userInfoFromUser(user)
+	return &info, nil
 }
 
 // Verify verifies the user credentials and returns the user info.
@@ -141,15 +159,8 @@ func (m *UserManager) Verify(ctx context.Context, username, password string) (*U
 		return nil, ErrInvalidCredentials
 	}
 
-	return &UserInfo{
-		ID:          user.ID,
-		Username:    user.Username,
-		Email:       user.Email,
-		Role:        user.Role,
-		AllowedApps: user.AllowedApps,
-		CreatedAt:   user.CreatedAt,
-		UpdatedAt:   user.UpdatedAt,
-	}, nil
+	info := userInfoFromUser(user)
+	return &info, nil
 }
 
 // Get returns the user info by ID.
@@ -162,15 +173,8 @@ func (m *UserManager) Get(ctx context.Context, id string) (*UserInfo, error) {
 		return nil, err
 	}
 
-	return &UserInfo{
-		ID:          user.ID,
-		Username:    user.Username,
-		Email:       user.Email,
-		Role:        user.Role,
-		AllowedApps: user.AllowedApps,
-		CreatedAt:   user.CreatedAt,
-		UpdatedAt:   user.UpdatedAt,
-	}, nil
+	info := userInfoFromUser(user)
+	return &info, nil
 }
 
 // GetByUsername returns the user info by username.
@@ -183,15 +187,8 @@ func (m *UserManager) GetByUsername(ctx context.Context, username string) (*User
 		return nil, err
 	}
 
-	return &UserInfo{
-		ID:          user.ID,
-		Username:    user.Username,
-		Email:       user.Email,
-		Role:        user.Role,
-		AllowedApps: user.AllowedApps,
-		CreatedAt:   user.CreatedAt,
-		UpdatedAt:   user.UpdatedAt,
-	}, nil
+	info := userInfoFromUser(user)
+	return &info, nil
 }
 
 // List returns all users.
@@ -203,15 +200,7 @@ func (m *UserManager) List(ctx context.Context) ([]UserInfo, error) {
 
 	result := make([]UserInfo, len(users))
 	for i, user := range users {
-		result[i] = UserInfo{
-			ID:          user.ID,
-			Username:    user.Username,
-			Email:       user.Email,
-			Role:        user.Role,
-			AllowedApps: user.AllowedApps,
-			CreatedAt:   user.CreatedAt,
-			UpdatedAt:   user.UpdatedAt,
-		}
+		result[i] = userInfoFromUser(user)
 	}
 	return result, nil
 }
@@ -273,15 +262,8 @@ func (m *UserManager) Update(ctx context.Context, input UpdateUserInput) (*UserI
 		return nil, err
 	}
 
-	return &UserInfo{
-		ID:          user.ID,
-		Username:    user.Username,
-		Email:       user.Email,
-		Role:        user.Role,
-		AllowedApps: user.AllowedApps,
-		CreatedAt:   user.CreatedAt,
-		UpdatedAt:   user.UpdatedAt,
-	}, nil
+	info := userInfoFromUser(user)
+	return &info, nil
 }
 
 // ChangePassword changes the user's password after verifying the old one.

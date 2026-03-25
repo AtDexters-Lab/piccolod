@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
+import 'package:piccolo_os/core/services/webauthn_service.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
@@ -28,12 +31,55 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
   bool _obscurePassword = true;
   bool _isLoading = false;
   String? _error;
+  List<String>? _methods;
 
   @override
   void initState() {
     super.initState();
     _usernameController =
         TextEditingController(text: widget.lastKnownUsername ?? '');
+    unawaited(_fetchLoginOptions());
+  }
+
+  Future<void> _fetchLoginOptions() async {
+    try {
+      final result = await ApiClient().getLoginOptions();
+      if (mounted) {
+        setState(() => _methods = List<String>.from(result['methods'] as List));
+      }
+    } on Object catch (_) {
+      if (mounted) setState(() => _methods = ['password']);
+    }
+  }
+
+  Future<void> _loginWithPasskey() async {
+    if (_isLoading) return;
+    setState(() { _isLoading = true; _error = null; });
+
+    try {
+      final beginResult = await ApiClient().beginPasskeyLogin();
+      final sessionId = beginResult['session_id'] as String;
+      final options = beginResult['publicKey'] as Map<String, dynamic>;
+
+      final credential = await WebAuthnService.getCredential(options);
+
+      await ApiClient().finishPasskeyLogin(sessionId, credential);
+      await ApiClient().fetchCsrfToken();
+      ApiClient().completeReauth(success: true);
+      widget.onSuccess();
+    } on Object catch (e) {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          final msg = e.toString();
+          if (msg.contains('NotAllowedError') || msg.contains('cancelled')) {
+            _error = 'Cancelled or timed out. If using a phone, ensure Bluetooth is on and devices are nearby.';
+          } else {
+            _error = 'Passkey login failed';
+          }
+        });
+      }
+    }
   }
 
   @override
@@ -124,6 +170,25 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
                       mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
+                        if ((_methods?.contains('passkey') ?? false) && WebAuthnService.isAvailable()) ...[
+                          FilledButton.icon(
+                            onPressed: _isLoading ? null : _loginWithPasskey,
+                            icon: const Icon(PiccoloIcons.fingerprint),
+                            label: const Text('Sign in with Passkey'),
+                          ),
+                          const SizedBox(height: 16),
+                          Row(
+                            children: [
+                              const Expanded(child: Divider()),
+                              Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 12),
+                                child: Text('or', style: PiccoloTheme.textTheme.bodySmall?.copyWith(color: PiccoloTheme.inkMuted)),
+                              ),
+                              const Expanded(child: Divider()),
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                        ],
                         TextField(
                           controller: _usernameController,
                           autofillHints: const [AutofillHints.username],

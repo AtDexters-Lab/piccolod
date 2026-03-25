@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptoRand "crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -34,27 +35,45 @@ import (
 	"piccolod/internal/state/paths"
 )
 
-// Config holds the persisted remote (Nexus) configuration and runtime state.
-type Config struct {
-	Endpoint       string `json:"endpoint"`
-	DeviceSecret   string `json:"device_secret"`
-	Solver         string `json:"solver"`
-	PortalHostname string `json:"portal_hostname"` // Fully-qualified hostname (e.g., portal.home.example.com)
-	Managed        bool   `json:"managed,omitempty"` // True for piccolospace managed nexus (DNS-01 via orchestrator)
-	Enabled        bool   `json:"enabled"`
-	Issuer          string            `json:"issuer,omitempty"`
-	ExpiresAt       time.Time         `json:"expires_at,omitempty"`
-	NextRenewal     time.Time         `json:"next_renewal,omitempty"`
-	LastHandshake   time.Time         `json:"last_handshake,omitempty"`
-	LatencyMS       int               `json:"latency_ms,omitempty"`
-	GuideVerifiedAt *time.Time        `json:"guide_verified_at,omitempty"`
-	LastPreflight   *time.Time        `json:"last_preflight,omitempty"`
-	Aliases         []Alias           `json:"aliases,omitempty"`
-	Certificates    []Certificate     `json:"certificates,omitempty"`
-	Events          []Event           `json:"events,omitempty"`
+// NexusConfig holds self-hosted nexus credentials, connection state, and aliases.
+// Persisted to nexus.json.
+type NexusConfig struct {
+	Endpoint             string     `json:"endpoint"`
+	DeviceSecret         string     `json:"device_secret"`
+	Solver               string     `json:"solver"`
+	PortalHostname       string     `json:"portal_hostname"`        // Fully-qualified hostname (e.g., portal.home.example.com)
+	Managed              bool       `json:"managed,omitempty"`       // True for piccolospace managed nexus (DNS-01 via orchestrator)
+	Enabled              bool       `json:"enabled"`
+	OrchestratorEndpoint string     `json:"orchestrator_endpoint,omitempty"` // Orchestrator API endpoint
+	Issuer               string     `json:"issuer,omitempty"`
+	ExpiresAt            time.Time  `json:"expires_at,omitempty"`
+	NextRenewal          time.Time  `json:"next_renewal,omitempty"`
+	LastHandshake        time.Time  `json:"last_handshake,omitempty"`
+	LatencyMS            int        `json:"latency_ms,omitempty"`
+	GuideVerifiedAt      *time.Time `json:"guide_verified_at,omitempty"`
+	LastPreflight        *time.Time `json:"last_preflight,omitempty"`
+	Aliases              []Alias    `json:"aliases,omitempty"`
+}
 
-	// Managed mode orchestrator config (not persisted as credentials)
-	OrchestratorEndpoint string `json:"orchestrator_endpoint,omitempty"` // Orchestrator API endpoint
+// CertInventory holds the shared certificate inventory across all sources.
+// Persisted to certificates.json.
+type CertInventory struct {
+	Certificates []Certificate `json:"certificates,omitempty"`
+}
+
+// EventLog holds the activity log for remote operations.
+// Persisted to events.json (bootstrap filesystem only, not encrypted repo).
+type EventLog struct {
+	Events []Event `json:"events,omitempty"`
+}
+
+// Config is the unified in-memory remote configuration.
+// Embedding preserves all existing field access (cfg.Endpoint, cfg.Events, etc.).
+// JSON marshaling produces flat output for backward compatibility.
+type Config struct {
+	NexusConfig
+	CertInventory
+	EventLog
 }
 
 
@@ -148,8 +167,15 @@ type PreflightResult struct {
 	RanAt  time.Time        `json:"ran_at"`
 }
 
+// relayState tracks the connection status of a single relay adapter.
+type relayState struct {
+	connected bool
+	err       string // last error message (empty when connected)
+}
+
 type dialer interface {
 	DialTimeout(network, address string, timeout time.Duration) (net.Conn, error)
+	DialTLS(network, address, serverName string, timeout time.Duration) (net.Conn, error)
 }
 
 type resolver interface {
@@ -159,9 +185,13 @@ type resolver interface {
 
 var ErrLocked = errors.New("remote: storage locked")
 
+// Storage persists remote configuration to durable storage.
+// Callers MUST serialize Save* calls externally (Manager uses cfgMu for this).
 type Storage interface {
 	Load(ctx context.Context) (Config, error)
-	Save(ctx context.Context, cfg Config) error
+	SaveNexus(ctx context.Context, nexus NexusConfig, certs CertInventory) error
+	SaveCerts(ctx context.Context, nexus NexusConfig, certs CertInventory) error
+	SaveEvents(ctx context.Context, events EventLog) error
 }
 
 type Manager struct {
@@ -201,6 +231,13 @@ type Manager struct {
 
 	// Port claim provider for Nexus relay registration
 	portClaimProvider PortClaimProvider
+
+	// Per-source relay connection state. Multiple relays (self-hosted "piccolo-portal",
+	// namek "piccolo-namek") can be active simultaneously. Entries appear on connect
+	// events and are removed when the adapter stops. HTTP-01 cert issuance is gated
+	// on ALL tracked relays being connected (see httpChallengeReachable).
+	relayMu     sync.RWMutex
+	relayStates map[string]relayState // adapter name → state
 }
 
 func (m *Manager) certDir() string {
@@ -241,6 +278,7 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 		now:            now,
 		baseDir:        baseDir,
 		scheduleWakeCh: make(chan struct{}, 1), // Buffered to avoid blocking
+		relayStates:    make(map[string]relayState),
 	}
 	m.challenges = NewChallengeManager()
 	// ACME manager (wire later on configure)
@@ -352,8 +390,7 @@ func (m *Manager) AppendEvent(evt Event) {
 	m.cfgMu.Lock()
 	cfg := m.currentConfigLocked()
 	m.appendEventWithRetention(cfg, evt)
-	// save() releases cfgMu.Lock() and publishes config changed.
-	_ = m.save(cfg)
+	_ = m.saveEvents(cfg)
 }
 
 // CertIssuanceRequest is the public API for enqueuing cert issuance from external sources.
@@ -405,6 +442,11 @@ func (netDialer) DialTimeout(network, address string, timeout time.Duration) (ne
 	return d.Dial(network, address)
 }
 
+func (netDialer) DialTLS(network, address, serverName string, timeout time.Duration) (net.Conn, error) {
+	d := &net.Dialer{Timeout: timeout}
+	return tls.DialWithDialer(d, network, address, &tls.Config{ServerName: serverName})
+}
+
 type netResolver struct{}
 
 func (netResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
@@ -417,8 +459,36 @@ func (netResolver) LookupCNAME(ctx context.Context, host string) (string, error)
 	return r.LookupCNAME(ctx, host)
 }
 
+// Split-file path helpers shared by all Storage implementations.
+func NexusPath(dir string) string  { return filepath.Join(dir, "nexus.json") }
+func CertsPath(dir string) string  { return filepath.Join(dir, "certificates.json") }
+func EventsPath(dir string) string { return filepath.Join(dir, "events.json") }
+
+// LoadSplitFiles reads the three split files from dir, assembling a Config.
+// Missing files produce zero-value sub-structs. Returns (cfg, true) if at least
+// one file was found, or (zero, false) if none exist.
+func LoadSplitFiles(dir string) (Config, bool) {
+	var cfg Config
+	var found bool
+	if data, err := os.ReadFile(NexusPath(dir)); err == nil {
+		if json.Unmarshal(data, &cfg.NexusConfig) == nil {
+			found = true
+		}
+	}
+	if data, err := os.ReadFile(CertsPath(dir)); err == nil {
+		if json.Unmarshal(data, &cfg.CertInventory) == nil {
+			found = true
+		}
+	}
+	if data, err := os.ReadFile(EventsPath(dir)); err == nil {
+		_ = json.Unmarshal(data, &cfg.EventLog)
+		found = true
+	}
+	return cfg, found
+}
+
 type fileStorage struct {
-	path string
+	dir string
 }
 
 func newFileStorage(baseDir string) (*fileStorage, error) {
@@ -429,52 +499,207 @@ func newFileStorage(baseDir string) (*fileStorage, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &fileStorage{path: filepath.Join(dir, "config.json")}, nil
+	return &fileStorage{dir: dir}, nil
 }
 
-func (s *fileStorage) Load(ctx context.Context) (Config, error) {
-	_ = ctx
-	data, err := os.ReadFile(s.path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return Config{}, nil
-		}
-		return Config{}, err
-	}
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return Config{}, err
-	}
+func (s *fileStorage) Load(_ context.Context) (Config, error) {
+	cfg, _ := LoadSplitFiles(s.dir)
 	return cfg, nil
 }
 
-func (s *fileStorage) Save(ctx context.Context, cfg Config) error {
-	_ = ctx
-	payload, err := json.MarshalIndent(&cfg, "", "  ")
+func (s *fileStorage) SaveNexus(_ context.Context, nexus NexusConfig, _ CertInventory) error {
+	payload, err := json.MarshalIndent(&nexus, "", "  ")
 	if err != nil {
 		return err
 	}
-	return fsutil.AtomicWriteFile(s.path, payload, 0o600)
+	return fsutil.AtomicWriteFile(NexusPath(s.dir), payload, 0o600)
 }
 
-// save persists the config. Caller MUST hold cfgMu.Lock() - this function
-// releases it after storage I/O completes but before post-save hooks.
-func (m *Manager) save(cfg *Config) error {
-	// Caller must hold cfgMu.Lock() when calling this function.
-	// We release it after storage operations complete.
+func (s *fileStorage) SaveCerts(_ context.Context, _ NexusConfig, certs CertInventory) error {
+	payload, err := json.MarshalIndent(&certs, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsutil.AtomicWriteFile(CertsPath(s.dir), payload, 0o600)
+}
+
+func (s *fileStorage) SaveEvents(_ context.Context, events EventLog) error {
+	payload, err := json.MarshalIndent(&events, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsutil.AtomicWriteFile(EventsPath(s.dir), payload, 0o600)
+}
+
+// saveNexus persists nexus config changes.
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Triggers: adapter state + ACME config + config change publish.
+func (m *Manager) saveNexus(cfg *Config) error {
 	if cfg == nil {
 		m.cfgMu.Unlock()
 		return errors.New("config cannot be nil")
 	}
-
-	// Storage save (JSON marshal) happens under lock to prevent races.
 	if m.storage != nil {
-		if err := m.storage.Save(context.Background(), *cfg); err != nil {
+		if err := m.storage.SaveNexus(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
 			m.cfgMu.Unlock()
 			if errors.Is(err, ErrLocked) {
 				m.needsReload.Store(true)
 			}
 			return err
+		}
+	}
+	m.cfg = cfg
+	snap := extractAdapterSnapshot(cfg)
+	m.cfgMu.Unlock()
+
+	snap = m.snapshotWithClaims(snap)
+	m.needsReload.Store(false)
+	m.applyAdapterState(snap)
+	m.updateACMEConfig(cfg)
+	m.publishConfigChanged()
+	return nil
+}
+
+// saveCerts persists certificate inventory changes.
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Triggers: config change publish only (no adapter restart, no ACME reconfig).
+func (m *Manager) saveCerts(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		if err := m.storage.SaveCerts(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+	}
+	m.cfg = cfg
+	m.cfgMu.Unlock()
+
+	m.needsReload.Store(false)
+	m.publishConfigChanged()
+	return nil
+}
+
+// saveEvents persists the event log only.
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Triggers: config change publish only (for UI event stream).
+// No adapter restart, no ACME reconfig.
+func (m *Manager) saveEvents(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		if err := m.storage.SaveEvents(context.Background(), cfg.EventLog); err != nil {
+			log.Printf("WARN: remote: event save failed: %v", err)
+		}
+	}
+	m.cfg = cfg
+	m.cfgMu.Unlock()
+	m.publishConfigChanged()
+	return nil
+}
+
+// saveNexusAndEvents persists nexus config + events.
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Triggers: adapter state + ACME config + config change publish.
+// Events are best-effort — nexus save failure is hard error, event save failure is logged.
+func (m *Manager) saveNexusAndEvents(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		if err := m.storage.SaveNexus(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+		// Event save under lock to avoid data race on the Events slice.
+		if err := m.storage.SaveEvents(context.Background(), cfg.EventLog); err != nil {
+			log.Printf("WARN: remote: event save failed: %v", err)
+		}
+	}
+	m.cfg = cfg
+	snap := extractAdapterSnapshot(cfg)
+	m.cfgMu.Unlock()
+
+	snap = m.snapshotWithClaims(snap)
+	m.needsReload.Store(false)
+	m.applyAdapterState(snap)
+	m.updateACMEConfig(cfg)
+	m.publishConfigChanged()
+	return nil
+}
+
+// saveCertsAndEvents persists certificate inventory + events.
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Triggers: config change publish only (no adapter restart, no ACME reconfig).
+// Events are best-effort.
+func (m *Manager) saveCertsAndEvents(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		if err := m.storage.SaveCerts(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+		// Event save under lock to avoid data race on the Events slice.
+		if err := m.storage.SaveEvents(context.Background(), cfg.EventLog); err != nil {
+			log.Printf("WARN: remote: event save failed: %v", err)
+		}
+	}
+	m.cfg = cfg
+	m.cfgMu.Unlock()
+
+	m.needsReload.Store(false)
+	m.publishConfigChanged()
+	return nil
+}
+
+// saveAll persists all three (nexus + certs + events).
+// Caller MUST hold cfgMu.Lock(); this method releases it before returning.
+// Used for full config changes (Configure, ConfigureManaged).
+// Triggers: adapter state + ACME config + config change publish.
+func (m *Manager) saveAll(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		// SaveNexus writes repo (nexus+certs blob) + nexus.json.
+		if err := m.storage.SaveNexus(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+		// SaveCerts writes repo again (same blob) + certificates.json.
+		// The duplicate repo write is acceptable here since saveAll is only called
+		// during Configure/ConfigureManaged which are infrequent user actions.
+		if err := m.storage.SaveCerts(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+		// Event save under lock to avoid data race on the Events slice.
+		if err := m.storage.SaveEvents(context.Background(), cfg.EventLog); err != nil {
+			log.Printf("WARN: remote: event save failed: %v", err)
 		}
 	}
 	m.cfg = cfg
@@ -605,6 +830,17 @@ func (m *Manager) Status() Status {
 		Certificates:    cloneCertificates(cfg.Certificates),
 	}
 	m.cfgMu.RUnlock()
+
+	// Append relay connection warning (requires relayMu, so done after cfgMu release).
+	if cfg.Enabled {
+		if w := m.relayWarning(); w != "" {
+			result.Warnings = append(result.Warnings, w)
+			if result.State == "active" {
+				result.State = "warning"
+			}
+		}
+	}
+
 	return result
 }
 
@@ -694,8 +930,10 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	// Assume preflight passed during setup wizard; prevent immediate warning state
 	cfg.LastPreflight = &now
 	// Queue background ACME issuance and surface events/inventory.
-	// User-managed mode only issues portal cert (no wildcard)
-	newCerts := defaultCertificates(cfg, now)
+	// User-managed mode only issues portal cert (no wildcard).
+	// Certs start as "pending"; actual issuance is gated on relay connectivity
+	// (httpChallengeReachable) and triggered by handleRelayEvent on connect.
+	newCerts := defaultCertificates(cfg)
 	for _, c := range existingCerts {
 		if c.ID == "portal" || c.ID == "wildcard" {
 			continue
@@ -710,18 +948,16 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 		Message:   "Remote configuration saved (user-managed, HTTP-01)",
 		NextStep:  "Run preflight",
 	})
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveAll(cfg); err != nil {
 		return err
 	}
 
 	log.Printf("remote: configured (solver=http-01, portal=%s)", portalHost)
-
-	// Queue issuance jobs after releasing lock (enqueueIssuanceJob acquires its own lock).
-	// Force=true because defaultCertificates seeds optimistic "ok" entries; without force the
-	// duplicate guard would skip issuance since NextRenewal is in the future.
-	// User-managed mode only issues portal cert (no wildcard - HTTP-01 doesn't support it)
-	m.enqueueIssuanceJob(issuanceJob{id: "portal", domains: []string{portalHost}, commonName: portalHost, force: true})
+	m.startRenewScheduler()
+	// Requeue pending certs. If the relay is already connected (e.g., re-saving
+	// the same config), issuance proceeds immediately. If not, the relay gate
+	// defers it and handleRelayEvent will pick it up on connect.
+	m.requeueOutstandingIssuances()
 	return nil
 }
 
@@ -785,7 +1021,7 @@ func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
 	cfg.LastPreflight = &now
 	// Queue background ACME issuance and surface events/inventory.
 	// Managed mode issues both portal cert and wildcard cert
-	newCerts := defaultCertificates(cfg, now)
+	newCerts := defaultCertificates(cfg)
 	for _, c := range existingCerts {
 		if c.ID == "portal" || c.ID == "wildcard" {
 			continue
@@ -800,16 +1036,14 @@ func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
 		Message:   "Remote configuration saved (managed, DNS-01)",
 		NextStep:  "Run preflight",
 	})
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveAll(cfg); err != nil {
 		return err
 	}
 
 	log.Printf("remote: configured (solver=dns-01, managed=true, portal=%s)", portalHost)
 
 	// Queue issuance jobs after releasing lock (enqueueIssuanceJob acquires its own lock).
-	// Force=true because defaultCertificates seeds optimistic "ok" entries; without force the
-	// duplicate guard would skip issuance since NextRenewal is in the future.
+	// Force=true so the duplicate guard doesn't skip certs that are already "pending".
 	m.enqueueIssuanceJob(issuanceJob{id: "portal", domains: []string{portalHost}, commonName: portalHost, force: true})
 	// Managed mode supports wildcard via DNS-01
 	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portalHost)), ".")
@@ -832,8 +1066,7 @@ func (m *Manager) Disable() error {
 		Source:    "remote",
 		Message:   "Remote access disabled",
 	})
-	// save() releases cfgMu.Lock()
-	return m.save(cfg)
+	return m.saveNexusAndEvents(cfg)
 }
 
 // Rotate generates a new secure device secret.
@@ -856,8 +1089,7 @@ func (m *Manager) Rotate() (string, error) {
 		Source:    "remote",
 		Message:   "Remote device secret rotated",
 	})
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveNexusAndEvents(cfg); err != nil {
 		return "", err
 	}
 	return newSecret, nil
@@ -909,8 +1141,7 @@ func (m *Manager) AddAlias(listener, hostname string) (Alias, error) {
 		Source:    "remote",
 		Message:   fmt.Sprintf("Alias %s queued for listener %s", hostname, listener),
 	})
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveNexusAndEvents(cfg); err != nil {
 		return Alias{}, err
 	}
 	// Queue issuance for the alias hostname — always HTTP-01 (alias domains use user DNS, not namek PowerDNS)
@@ -947,8 +1178,7 @@ func (m *Manager) RemoveAlias(id string) error {
 		Source:    "remote",
 		Message:   fmt.Sprintf("Alias %s removed", removed.Hostname),
 	})
-	// save() releases cfgMu.Lock()
-	if err := m.save(cfg); err != nil {
+	if err := m.saveNexusAndEvents(cfg); err != nil {
 		return err
 	}
 	// Remove associated certificate entry and files (best-effort).
@@ -1028,8 +1258,7 @@ func (m *Manager) removeCertificateByID(id, commonName, certDir string) {
 			Source:    "remote",
 			Message:   fmt.Sprintf("Certificate removed (%s)", id),
 		})
-		// save() releases cfgMu.Lock()
-		_ = m.save(cfg)
+		_ = m.saveCertsAndEvents(cfg)
 	} else {
 		m.cfgMu.Unlock()
 	}
@@ -1288,8 +1517,131 @@ func (m *Manager) stopAdapter() {
 			log.Printf("WARN: remote: stopping nexus adapter: %v", err)
 		}
 	}
+
+	// Clear self-hosted relay state AFTER stopping so trailing events don't persist.
+	// Uses the default adapter name "piccolo-portal" (see nexusclient/backend.go).
+	// ClearRelayState also publishes config change and requeues if this removal
+	// unblocks httpChallengeReachable (e.g., removing a disconnected relay).
+	m.ClearRelayState("piccolo-portal")
 }
 
+// RelayEventHandler returns a callback suitable for nexusclient.WithAdapterEventHandler.
+// It translates relay lifecycle events into warnings visible in the UI.
+func (m *Manager) RelayEventHandler() func(adapterName string, connected bool, errMsg string) {
+	return m.handleRelayEvent
+}
+
+// handleRelayEvent processes connection lifecycle events from the nexus backend
+// client and surfaces them as warnings/events for the UI. Multiple relay sources
+// (self-hosted "piccolo-portal", namek "piccolo-namek") feed into this handler.
+func (m *Manager) handleRelayEvent(adapterName string, connected bool, errMsg string) {
+	if m == nil || m.closed.Load() {
+		return
+	}
+
+	m.relayMu.Lock()
+	prev := m.relayStates[adapterName]
+	m.relayStates[adapterName] = relayState{connected: connected, err: errMsg}
+	changed := prev.connected != connected || prev.err != errMsg
+	m.relayMu.Unlock()
+
+	if connected && !prev.connected {
+		log.Printf("INFO: [%s] relay connected", adapterName)
+		// Relay just came up — kick off any pending HTTP-01 cert issuance
+		// that was waiting for the tunnel to be reachable.
+		m.requeueOutstandingIssuances()
+	} else if !connected && errMsg != "" && errMsg != prev.err {
+		log.Printf("WARN: [%s] relay disconnected: %s", adapterName, errMsg)
+	}
+
+	// Republish config so SSE clients pick up the updated warning state.
+	if changed {
+		m.publishConfigChanged()
+	}
+}
+
+// relayWarning returns a user-visible warning if any tracked relay is disconnected.
+func (m *Manager) relayWarning() string {
+	m.relayMu.RLock()
+	// Find the first disconnected relay with an error message.
+	var errMsg string
+	for _, s := range m.relayStates {
+		if !s.connected && s.err != "" {
+			errMsg = s.err
+			break
+		}
+	}
+	m.relayMu.RUnlock()
+
+	if errMsg == "" {
+		return ""
+	}
+
+	// Raw relay errors are too technical for end-users; map to actionable guidance.
+	lower := strings.ToLower(errMsg)
+	switch {
+	case strings.Contains(lower, "token") && strings.Contains(lower, "signature"):
+		return "Relay authentication failed — check the device secret"
+	case strings.Contains(lower, "token") && strings.Contains(lower, "expired"):
+		return "Relay authentication failed — token expired, check system clock"
+	case strings.Contains(lower, "dial") || strings.Contains(lower, "connection refused"):
+		return "Relay unreachable — check the endpoint and network"
+	case strings.Contains(lower, "tls") || strings.Contains(lower, "x509"):
+		return "Relay TLS error — check the endpoint certificate"
+	default:
+		return fmt.Sprintf("Relay connection error: %s", errMsg)
+	}
+}
+
+// httpChallengeReachable reports whether HTTP-01 challenges can be served.
+// Requires ALL enabled relays to be connected. We use "all" rather than "any"
+// because HTTP-01 certs route through specific relays depending on external DNS
+// configuration (e.g., self-hosted portal certs need the self-hosted relay,
+// alias certs may route through either relay). Rather than tracking per-cert
+// relay affinity — which is fragile to DNS changes — we require all relays to
+// be ready, ensuring every traffic path is available before attempting ACME.
+func (m *Manager) httpChallengeReachable() bool {
+	m.relayMu.RLock()
+	defer m.relayMu.RUnlock()
+	if len(m.relayStates) == 0 {
+		return false
+	}
+	for _, s := range m.relayStates {
+		if !s.connected {
+			return false
+		}
+	}
+	return true
+}
+
+// needsRelay returns true for solvers that require relay connectivity (HTTP-01).
+// DNS-01 uses the orchestrator API and does not need the relay.
+func needsRelay(solver string) bool {
+	return !strings.EqualFold(solver, "dns-01")
+}
+
+// ClearRelayState removes the relay state entry for the given adapter name.
+// Called by GinServer when a relay adapter (e.g., namek) is stopped, and by
+// stopAdapter for the self-hosted relay.
+func (m *Manager) ClearRelayState(name string) {
+	if m == nil {
+		return
+	}
+	m.relayMu.Lock()
+	prev, existed := m.relayStates[name]
+	delete(m.relayStates, name)
+	m.relayMu.Unlock()
+	if !existed {
+		return
+	}
+	m.publishConfigChanged()
+	// Removing a disconnected relay may satisfy the all-relays condition,
+	// unblocking pending HTTP-01 certs that were waiting for it.
+	// Only requeue if the removed relay was actually blocking.
+	if !prev.connected && m.httpChallengeReachable() {
+		m.requeueOutstandingIssuances()
+	}
+}
 
 // startRenewScheduler starts a background loop to renew certificates when due.
 func (m *Manager) startRenewScheduler() {
@@ -1419,11 +1771,18 @@ func (m *Manager) scanAndQueueRenewals() {
 		domains []string
 		cn      string
 		source  string
+		solver  string
 	}
+	relayReady := m.httpChallengeReachable()
 	var jobs []renewalJob
 	for _, c := range cfg.Certificates {
 		if strings.EqualFold(c.Status, "pending") {
 			continue // avoid duplicate queueing
+		}
+		// HTTP-01 relay gate: skip if not all relays are connected to prevent
+		// wasted ACME attempts that would enter the error→backoff cycle.
+		if needsRelay(c.Solver) && !relayReady {
+			continue
 		}
 		// RetryAt-driven: retry when due (no max attempts - indefinite retry per RFC 20260125)
 		dueRetry := c.RetryAt != nil && now.After(*c.RetryAt)
@@ -1439,7 +1798,7 @@ func (m *Manager) scanAndQueueRenewals() {
 		if !ok {
 			continue
 		}
-		jobs = append(jobs, renewalJob{id: c.ID, domains: domains, cn: cn, source: c.Source})
+		jobs = append(jobs, renewalJob{id: c.ID, domains: domains, cn: cn, source: c.Source, solver: c.Solver})
 	}
 	m.cfgMu.RUnlock()
 
@@ -1448,7 +1807,7 @@ func (m *Manager) scanAndQueueRenewals() {
 		log.Printf("remote: scheduler queuing %d certificate renewal(s)", len(jobs))
 	}
 	for _, job := range jobs {
-		m.enqueueIssuanceJob(issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, source: job.source})
+		m.enqueueIssuanceJob(issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, source: job.source, solver: job.solver})
 	}
 }
 
@@ -1550,16 +1909,22 @@ func (m *Manager) requeueOutstandingIssuances() {
 	}
 	for _, job := range jobs {
 		ij := issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, force: true, source: job.source, solver: job.solver, certDir: job.certDir}
-		// Resolve orchClient for DNS-01 certs; skip if not yet registered
+		// DNS-01 orchClient gate: skip if orchClient not yet registered
 		// (e.g., boot timing — the source's event handler will re-enqueue after registration).
 		if strings.EqualFold(job.solver, "dns-01") && job.source != "" {
 			m.adapterMu.Lock()
 			ij.orchClient = m.orchClients[job.source]
 			m.adapterMu.Unlock()
 			if ij.orchClient == nil {
-				log.Printf("INFO: remote: skipping requeue of dns-01 cert %s (orchClient for %q not registered yet)", job.id, job.source)
+				log.Printf("INFO: remote: deferring requeue of dns-01 cert %s (orchClient for %q not registered yet)", job.id, job.source)
 				continue
 			}
+		}
+		// HTTP-01 relay gate: skip if not all relays are connected.
+		// handleRelayEvent calls requeueOutstandingIssuances when relays connect.
+		if needsRelay(job.solver) && !m.httpChallengeReachable() {
+			log.Printf("INFO: remote: deferring requeue of cert %s (not all relays connected)", job.id)
+			continue
 		}
 		if job.isPending {
 			m.queueIssuanceJobToWorker(ij)
@@ -1713,8 +2078,28 @@ func (m *Manager) enqueueIssuanceJob(job issuanceJob) {
 		}
 	}
 	m.ensureCertPending(cfg, job.id, job.domains, now, job.source, job.solver, job.certDir)
-	// save() releases cfgMu.Lock()
-	_ = m.save(cfg)
+	// Resolve effective solver from the persisted cert (ensureCertPending may have
+	// set it from the config's global solver). Must read before saveCertsAndEvents
+	// releases cfgMu.Lock.
+	effectiveSolver := job.solver
+	if effectiveSolver == "" {
+		for _, c := range cfg.Certificates {
+			if c.ID == job.id {
+				effectiveSolver = c.Solver
+				break
+			}
+		}
+	}
+	// saveCertsAndEvents releases cfgMu.Lock()
+	_ = m.saveCertsAndEvents(cfg)
+
+	// HTTP-01 relay gate: cert is persisted as "pending" in the inventory.
+	// Don't submit to worker until all relays are connected.
+	// requeueOutstandingIssuances (called on relay connect) will pick it up.
+	if needsRelay(effectiveSolver) && !m.httpChallengeReachable() {
+		log.Printf("INFO: remote: deferring cert %s (not all relays connected)", job.id)
+		return
+	}
 
 	log.Printf("remote: queuing certificate issuance: %s (domains=%v, source=%s)", job.id, job.domains, job.source)
 	m.queueIssuanceJobToWorker(job)
@@ -1805,6 +2190,25 @@ func (m *Manager) processIssuance(job issuanceJob) {
 		return
 	}
 
+	// Safety net: if a relay went down after the job was enqueued, defer without
+	// recording a failure. The cert stays "pending" — no error, no backoff.
+	// Recovery: handleRelayEvent(connected) calls requeueOutstandingIssuances.
+	solver := job.solver
+	if solver == "" {
+		m.cfgMu.RLock()
+		for _, c := range m.currentConfigLocked().Certificates {
+			if c.ID == job.id {
+				solver = c.Solver
+				break
+			}
+		}
+		m.cfgMu.RUnlock()
+	}
+	if needsRelay(solver) && !m.httpChallengeReachable() {
+		log.Printf("INFO: remote: deferring issuance of %s (relay disconnected)", job.id)
+		return
+	}
+
 	log.Printf("remote: issuing certificate %s (cn=%s, domains=%v)", job.id, job.commonName, job.domains)
 
 	// Record attempt under lock (no max attempts - indefinite retry per RFC 20260125)
@@ -1819,8 +2223,7 @@ func (m *Manager) processIssuance(job issuanceJob) {
 			break
 		}
 	}
-	// save() releases cfgMu.Lock()
-	_ = m.save(cfg)
+	_ = m.saveCerts(cfg)
 
 	certDir := job.certDir
 	if certDir == "" {
@@ -1987,8 +2390,7 @@ func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
 		Message:   fmt.Sprintf("Certificate issuance succeeded (%s)", id),
 		CertID:    id,
 	})
-	// save() releases cfgMu.Lock()
-	_ = m.save(cfg)
+	_ = m.saveCertsAndEvents(cfg)
 
 	// Emit certificate status change event
 	m.publishCertificateChanged(id, "ok", "", "ok")
@@ -2075,8 +2477,7 @@ func (m *Manager) updateCertFailureWithError(id string, reason string, err error
 		NextStep:  nextStepForCode(code),
 		CertID:    id,
 	})
-	// save() releases cfgMu.Lock()
-	_ = m.save(cfg)
+	_ = m.saveCertsAndEvents(cfg)
 
 	// Signal scheduler to re-evaluate wake time
 	m.notifySchedulerWake()
@@ -2428,8 +2829,7 @@ func (m *Manager) RunPreflight(candidate *Config) (PreflightResult, error) {
 			Source:    "remote",
 			Message:   "Preflight completed",
 		})
-		// save() releases cfgMu.Lock()
-		if err := m.save(cfg); err != nil {
+		if err := m.saveNexusAndEvents(cfg); err != nil {
 			return PreflightResult{}, err
 		}
 	}
@@ -2463,7 +2863,7 @@ func (m *Manager) VerifyConnection(info GuideVerification) error {
 
 	// Create a temporary config to reuse checkEndpoint logic
 	tempCfg := &Config{
-		Endpoint: endpoint,
+		NexusConfig: NexusConfig{Endpoint: endpoint},
 	}
 
 	// Perform the check
@@ -2496,8 +2896,7 @@ func (m *Manager) MarkGuideVerified(info GuideVerification) error {
 		Source:    "remote",
 		Message:   "Nexus connection verified",
 	})
-	// save() releases cfgMu.Lock()
-	return m.save(cfg)
+	return m.saveNexusAndEvents(cfg)
 }
 
 // GuideInfo returns static helper information along with verification timestamp.
@@ -2539,15 +2938,40 @@ func (m *Manager) checkEndpoint(cfg *Config) PreflightCheck {
 	}
 	address := net.JoinHostPort(host, port)
 	start := time.Now()
-	conn, err := m.dialer.DialTimeout("tcp", address, 5*time.Second)
+
+	var conn net.Conn
+	var err error
+	if endpointUsesTLS(cfg.Endpoint) {
+		conn, err = m.dialer.DialTLS("tcp", address, host, 5*time.Second)
+	} else {
+		conn, err = m.dialer.DialTimeout("tcp", address, 5*time.Second)
+	}
 	if err != nil {
-		return PreflightCheck{Name: "Nexus endpoint reachable", Status: "fail", Detail: err.Error(), NextStep: "Verify firewall and DNS"}
+		nextStep := "Verify firewall and DNS"
+		var hostnameErr x509.HostnameError
+		var certInvalidErr x509.CertificateInvalidError
+		var unknownAuthErr x509.UnknownAuthorityError
+		detail := err.Error()
+		if errors.As(err, &hostnameErr) || errors.As(err, &certInvalidErr) || errors.As(err, &unknownAuthErr) ||
+			strings.Contains(detail, "tls:") || strings.Contains(detail, "x509:") {
+			nextStep = "Verify the relay's TLS certificate matches the endpoint hostname"
+		}
+		return PreflightCheck{Name: "Nexus endpoint reachable", Status: "fail", Detail: detail, NextStep: nextStep}
 	}
 	latency := int(time.Since(start).Milliseconds())
 	_ = conn.Close()
 	cfg.LastHandshake = m.now()
 	cfg.LatencyMS = latency
 	return PreflightCheck{Name: "Nexus endpoint reachable", Status: "pass", Detail: fmt.Sprintf("Latency %d ms", latency)}
+}
+
+// endpointUsesTLS reports whether the endpoint URL implies a TLS connection.
+func endpointUsesTLS(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "wss" || u.Scheme == "https"
 }
 
 func (m *Manager) checkDNS(cfg *Config) (string, string) {
@@ -2641,19 +3065,14 @@ func computeWarnings(cfg *Config) []string {
 	return warnings
 }
 
-func defaultCertificates(cfg *Config, now time.Time) []Certificate {
-	exp := now.Add(90 * 24 * time.Hour)
-	next := now.Add(60 * 24 * time.Hour)
+func defaultCertificates(cfg *Config) []Certificate {
 	certificates := []Certificate{}
 	if cfg.PortalHostname != "" {
 		certificates = append(certificates, Certificate{
-			ID:          "portal",
-			Domains:     []string{cfg.PortalHostname},
-			Solver:      cfg.Solver,
-			IssuedAt:    timePtr(now),
-			ExpiresAt:   timePtr(exp),
-			NextRenewal: timePtr(next),
-			Status:      "ok",
+			ID:      "portal",
+			Domains: []string{cfg.PortalHostname},
+			Solver:  cfg.Solver,
+			Status:  "pending",
 		})
 	}
 	// Wildcard cert only for managed mode (DNS-01 via orchestrator)
@@ -2663,13 +3082,10 @@ func defaultCertificates(cfg *Config, now time.Time) []Certificate {
 			return certificates
 		}
 		certificates = append(certificates, Certificate{
-			ID:          "wildcard",
-			Domains:     []string{fmt.Sprintf("*.%s", base), base},
-			Solver:      cfg.Solver,
-			IssuedAt:    timePtr(now),
-			ExpiresAt:   timePtr(exp),
-			NextRenewal: timePtr(next),
-			Status:      "ok",
+			ID:      "wildcard",
+			Domains: []string{fmt.Sprintf("*.%s", base), base},
+			Solver:  cfg.Solver,
+			Status:  "pending",
 		})
 	}
 	return certificates
