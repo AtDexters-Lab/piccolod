@@ -37,6 +37,7 @@ class ApiClient {
     '/api/v1/auth/login-options',
     '/api/v1/auth/passkey/login/begin',
     '/api/v1/auth/passkey/login/finish',
+    '/api/v1/system/boot',
   };
 
   /// Helper to construct the full URI.

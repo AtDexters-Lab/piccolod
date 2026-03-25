@@ -1592,6 +1592,9 @@ func (s *GinServer) setupGinRoutes() {
 		lanInstall.POST("/system/install-to-disk", s.handleInstallToDisk)
 		lanInstall.POST("/system/reboot", s.handleOnboardingReboot)
 
+		// Consolidated boot directive — single source of truth for UI routing.
+		v1.GET("/system/boot", s.handleBoot)
+
 		// Selected read-only status endpoints remain public
 		v1.GET("/remote/status", s.handleRemoteStatus)
 		v1.GET("/health/live", s.handleHealthLive)

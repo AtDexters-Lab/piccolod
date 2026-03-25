@@ -88,44 +88,28 @@ class DesktopController extends ChangeNotifier {
   bool _isInitializing = true;
   bool get isInitializing => _isInitializing;
 
+  // Passkey state cached from /system/boot — consumed once by _onAuthenticated
+  // to avoid an extra /auth/session round-trip on direct page loads.
+  bool? _bootHasPasskey;
+  bool? _bootMustRegisterPasskey;
+
   Future<void> _checkSystemStatus() async {
     try {
-      // Check if admin setup is complete
-      final response = await ApiClient().get('/api/v1/auth/initialized');
-      // response is { "initialized": boolean }
-      final initialized = (response as Map<String, dynamic>)['initialized'] == true;
-
-      if (!initialized) {
-        _needsSetup = true;
+      final boot = await ApiClient().get('/api/v1/system/boot') as Map<String, dynamic>;
+      final screen = boot['screen'] as String?;
+      if (screen == 'desktop') {
+        _needsSetup = false;
+        _lastKnownUsername = boot['user'] as String?;
+        _bootHasPasskey = boot['has_passkey'] as bool? ?? false;
+        _bootMustRegisterPasskey = boot['must_register_passkey'] as bool? ?? false;
       } else {
-        // If initialized, check if we have a valid session (are we logged in?)
-         try {
-           final session = await ApiClient().get('/api/v1/auth/session') as Map<String, dynamic>;
-           if (session['authenticated'] != true) {
-             // Not authenticated, but system IS initialized.
-             // We reuse the Setup Wizard in "Login Mode".
-             // The SetupWizard (implemented in features/setup) handles logic to show Login if already setup.
-             _needsSetup = true;
-           } else {
-             _needsSetup = false;
-             // Capture username for re-auth overlay pre-fill.
-             if (session['user'] is String) {
-               _lastKnownUsername = session['user'] as String;
-             }
-           }
-         } on Object catch (_) {
-           // If session check fails, assume we need login
-           _needsSetup = true;
-         }
+        _needsSetup = true;
       }
     } on Object catch (e) {
-      debugPrint('System status check failed: $e');
-      // If backend is down or unreachable, what do we do?
-      // For now, assume we might need setup/login to be safe.
+      debugPrint('Boot check failed: $e');
       _needsSetup = true;
     } finally {
       _isInitializing = false;
-      // If already authenticated (returning user with valid session), transition to authenticated state
       if (!_needsSetup) {
         final showWelcome = Uri.base.queryParameters[_kWelcomeParam] == '1';
         if (showWelcome) {
@@ -180,6 +164,14 @@ class DesktopController extends ChangeNotifier {
     unawaited(logout());
   }
 
+  /// Returns true if the prompt state changed (caller should notifyListeners).
+  bool _updatePasskeyPrompt({required bool hasPasskey, required bool mustRegister}) {
+    final shouldPrompt = !hasPasskey && !mustRegister;
+    if (_showPasskeyPrompt == shouldPrompt) return false;
+    _showPasskeyPrompt = shouldPrompt;
+    return true;
+  }
+
   /// Single source of truth for "user is now authenticated" state transition.
   /// Handles event stream connection and optional first-setup welcome.
   void _onAuthenticated({required bool isFirstSetup}) {
@@ -196,24 +188,31 @@ class DesktopController extends ChangeNotifier {
     // mode, 401s should NOT trigger the reauth overlay.
     ApiClient().onAuthRequired = _onAuthRequired;
 
-    // Capture username and check passkey status (best-effort).
-    unawaited(ApiClient().get('/api/v1/auth/session').then((session) {
-      if (session is Map) {
-        if (session['user'] is String) {
-          _lastKnownUsername = session['user'] as String;
+    // Determine passkey prompt state. When boot data is available (direct
+    // page load), use it to avoid an extra /auth/session round-trip.
+    // When arriving via completeSetup (wizard path), fetch session info
+    // asynchronously since boot data is not available.
+    final hasPasskey = _bootHasPasskey;
+    final mustRegister = _bootMustRegisterPasskey;
+    _bootHasPasskey = null; // consume once
+    _bootMustRegisterPasskey = null;
+    if (hasPasskey != null) {
+      _updatePasskeyPrompt(hasPasskey: hasPasskey, mustRegister: mustRegister ?? false);
+    } else {
+      unawaited(ApiClient().get('/api/v1/auth/session').then((session) {
+        if (session is Map) {
+          if (session['user'] is String) {
+            _lastKnownUsername = session['user'] as String;
+          }
+          if (_updatePasskeyPrompt(
+            hasPasskey: session['has_passkey'] as bool? ?? false,
+            mustRegister: session['must_register_passkey'] as bool? ?? false,
+          )) {
+            notifyListeners();
+          }
         }
-        // Prompt to register passkey if user has none for this RP.
-        // Also clear the prompt if the user already has one (handles
-        // session changes, re-login as different user, or registration
-        // completed via Settings).
-        final shouldPrompt = session['has_passkey'] == false &&
-            session['must_register_passkey'] != true;
-        if (_showPasskeyPrompt != shouldPrompt) {
-          _showPasskeyPrompt = shouldPrompt;
-          notifyListeners();
-        }
-      }
-    }).catchError((_) {}));
+      }).catchError((_) {}));
+    }
 
     // Connect event stream
     _eventStreamClient ??= EventStreamClient();

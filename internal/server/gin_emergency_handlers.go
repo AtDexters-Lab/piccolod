@@ -78,6 +78,7 @@ func isEmergencyAllowed(path string) bool {
 	allowed := []string{
 		"/api/v1/health/",
 		"/api/v1/system/emergency",
+		"/api/v1/system/boot",
 		"/api/v1/system/diagnostic-log",
 		"/api/v1/system/admin/diagnostic-log",
 		"/api/v1/system/ca.crt",
