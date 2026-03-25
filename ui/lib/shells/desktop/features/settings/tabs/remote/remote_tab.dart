@@ -88,20 +88,6 @@ class _RemoteTabState extends State<RemoteTab> {
            );
         }
 
-        // Configuration / Provisioning Loading States
-        if (_controller.isSubmittingConfig) {
-          return const Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                CircularProgressIndicator(),
-                SizedBox(height: Spacing.base),
-                Text('Applying Configuration...', style: TextStyle(color: PiccoloTheme.inkMuted)),
-              ],
-            ),
-          );
-        }
-
         // Always show dashboard — it handles zero-state via portal list card
         final Widget content = RemoteDashboard(controller: _controller);
 
