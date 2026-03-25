@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net/http"
@@ -128,12 +129,15 @@ func (s *GinServer) getValidatedSession(c *gin.Context) (*authpkg.Session, bool)
 
 // handleLoginOptions: GET /api/v1/auth/login-options
 func (s *GinServer) handleLoginOptions(c *gin.Context) {
-	ctx := s.getAccessContext(c)
+	accessCtx := s.getAccessContext(c)
 	secure := s.isSecureRequest(c.Request)
+	rpID := s.getRPID(c)
 
-	// At login-options stage we don't know the user. Return the maximum
-	// possible methods for this context. Actual enforcement in login handler.
-	methods := authpkg.AllowedMethods(ctx, secure, "", false)
+	// Compute the union of allowed methods across all users who could
+	// plausibly use each method. We skip passwordless users because they
+	// can never authenticate with "password" — including them would keep
+	// the password form visible indefinitely.
+	methods := s.computeLoginOptionsUnion(c.Request.Context(), accessCtx, secure, rpID)
 
 	// When passkeys are disabled, strip "passkey" from methods
 	if s.webauthnMgr == nil {
@@ -148,9 +152,70 @@ func (s *GinServer) handleLoginOptions(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"methods": methods,
-		"context": ctx.String(),
-		"rp_id":   s.getRPID(c),
+		"context": accessCtx.String(),
+		"rp_id":   rpID,
 	})
+}
+
+// computeLoginOptionsUnion evaluates AllowedMethods for each user who has a
+// password and returns the union of results. Users without passwords are
+// excluded because they can never use the "password" method — including them
+// would keep the password form visible even after all password-capable users
+// have registered passkeys.
+func (s *GinServer) computeLoginOptionsUnion(ctx context.Context, accessCtx authpkg.AccessContext, secure bool, rpID string) []string {
+	// If we can't query users, fall back to the most permissive set.
+	if s.userManager == nil {
+		return authpkg.AllowedMethods(accessCtx, secure, "", false)
+	}
+
+	users, err := s.userManager.List(ctx)
+	if err != nil {
+		return authpkg.AllowedMethods(accessCtx, secure, "", false)
+	}
+
+	// Bulk-fetch which users have passkeys for this RP (single query).
+	passkeyUsers := map[string]struct{}{}
+	if s.webauthnMgr != nil {
+		if set, err := s.webauthnMgr.UserIDsWithPasskeyForRP(ctx, rpID); err == nil {
+			passkeyUsers = set
+		}
+	}
+
+	methodSet := make(map[string]struct{})
+	evaluated := false
+	for _, u := range users {
+		if !u.HasPassword {
+			continue
+		}
+		evaluated = true
+		_, hasPasskey := passkeyUsers[u.ID]
+		for _, m := range authpkg.AllowedMethods(accessCtx, secure, string(u.Role), hasPasskey) {
+			methodSet[m] = struct{}{}
+		}
+		// Max possible set is {"passkey","password"} — no point continuing.
+		if len(methodSet) >= 2 {
+			break
+		}
+	}
+
+	if !evaluated {
+		// No password-capable users found (e.g., only invite-based users).
+		// Return passkey-only since password is unusable by anyone.
+		return []string{"passkey"}
+	}
+
+	methods := make([]string, 0, len(methodSet))
+	// Stable order: known methods first, then any future additions.
+	for _, m := range []string{"passkey", "password"} {
+		if _, ok := methodSet[m]; ok {
+			methods = append(methods, m)
+			delete(methodSet, m)
+		}
+	}
+	for m := range methodSet {
+		methods = append(methods, m)
+	}
+	return methods
 }
 
 // --- Passkey Registration (authenticated) ---

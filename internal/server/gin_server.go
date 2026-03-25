@@ -1082,7 +1082,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	if os.Getenv("PICCOLO_NEXUS_USE_STUB") == "1" {
 		nexusAdapter = nexusclient.NewStub()
 	} else {
-		nexusAdapter = nexusclient.NewBackendAdapter(routeMgr, remoteResolver)
+		nexusAdapter = nexusclient.NewBackendAdapter(routeMgr, remoteResolver,
+			nexusclient.WithAdapterEventHandler(rm.RelayEventHandler()),
+		)
 	}
 	rm.SetNexusAdapter(nexusAdapter)
 	svcMgr.SetFirewallManager(firewall.NewFirewalldManager()) // falls back to no-op stub if firewall-cmd absent
@@ -2828,8 +2830,12 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 						rm.RemoveHostnameCertificate(ep.DerivedHostLabel + "." + base)
 					}
 				}
-				// Also clean up per-app certs for alias hostnames
+				// Also clean up per-app certs for portal-targeted alias hostnames.
+				// App-specific aliases are flat and have no subdomain certs.
 				for _, a := range rm.ListAliases() {
+					if a.Listener != "" && a.Listener != nexusclient.PortalHostLabel {
+						continue
+					}
 					aliasBase := normalizeHostname(a.Hostname)
 					if aliasBase == "" {
 						continue

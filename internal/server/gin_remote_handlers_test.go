@@ -531,6 +531,10 @@ func TestRemote_PortalHostnamePersistsAndAppCertQueued(t *testing.T) {
 		t.Fatalf("configure status=%d body=%s", w.Code, w.Body.String())
 	}
 
+	// Simulate relay connect event — in production, the relay event handler
+	// triggers requeueOutstandingIssuances when the tunnel comes up.
+	srv.remoteManager.RequeueOutstandingIssuances()
+
 	if status := waitForCertificateDomain(t, srv.remoteManager, "piccolo.example.com", 5*time.Second); !strings.EqualFold(status, "ok") {
 		for _, cert := range srv.remoteManager.ListCertificates() {
 			if hasDomain(cert, "piccolo.example.com") {

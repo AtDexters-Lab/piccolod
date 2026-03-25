@@ -328,6 +328,20 @@ func (m *WebAuthnManager) HasCredentialsForRP(ctx context.Context, userID, rpID 
 	return count > 0, nil
 }
 
+// UserIDsWithPasskeyForRP returns the set of user IDs that have at least one
+// credential for the given RP ID. Single query, avoids N+1 per-user lookups.
+func (m *WebAuthnManager) UserIDsWithPasskeyForRP(ctx context.Context, rpID string) (map[string]struct{}, error) {
+	creds, err := m.credRepo.ListByRP(ctx, rpID)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]struct{}, len(creds))
+	for _, c := range creds {
+		set[c.UserID] = struct{}{}
+	}
+	return set, nil
+}
+
 // CountCredentials returns the total credential count for a user.
 func (m *WebAuthnManager) CountCredentials(ctx context.Context, userID string) (int, error) {
 	return m.credRepo.CountByUser(ctx, userID)

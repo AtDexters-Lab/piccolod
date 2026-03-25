@@ -494,6 +494,11 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 	for _, l := range listeners {
 		hb, pp, err := m.allocator.AllocateForClaim(l.PortClaim, l.Flow == api.FlowUDP)
 		if err != nil {
+			// Roll back ports allocated by previous iterations.
+			for _, ep := range endpoints {
+				m.releaseEndpointPorts(ep)
+			}
+			delete(m.registry, appName)
 			return nil, err
 		}
 		isPrimary := l.Name == primaryName
@@ -1154,6 +1159,7 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 		if _, ok := newMap[name]; !ok {
 			m.proxyManager.StopEndpoint(ep.PublicPort, ep.Flow)
 			m.closeFirewallClaim(ep)
+			m.releaseEndpointPorts(ep)
 			containerChange = true
 			result.Removed = append(result.Removed, ep)
 			m.notifyUnpublish(ep.PublicPort)

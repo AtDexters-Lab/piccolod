@@ -225,6 +225,11 @@ type Manager struct {
 
 	// Port claim provider for Nexus relay registration
 	portClaimProvider PortClaimProvider
+
+	// Relay connection state (surfaced as warnings to the UI)
+	relayMu        sync.RWMutex
+	relayConnected bool
+	relayError     string // last relay connection error (empty when connected)
 }
 
 func (m *Manager) certDir() string {
@@ -816,6 +821,17 @@ func (m *Manager) Status() Status {
 		Certificates:    cloneCertificates(cfg.Certificates),
 	}
 	m.cfgMu.RUnlock()
+
+	// Append relay connection warning (requires relayMu, so done after cfgMu release).
+	if cfg.Enabled {
+		if w := m.relayWarning(); w != "" {
+			result.Warnings = append(result.Warnings, w)
+			if result.State == "active" {
+				result.State = "warning"
+			}
+		}
+	}
+
 	return result
 }
 
@@ -910,7 +926,7 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	// the device. The adapter starts asynchronously, so we set a near-future
 	// NextRenewal to let the scheduler pick it up after the tunnel connects.
 	// This is persisted, so it survives restarts — unlike an in-memory timer.
-	newCerts := defaultCertificates(cfg, now)
+	newCerts := defaultCertificates(cfg)
 	deferredRenewal := now.Add(30 * time.Second)
 	for i := range newCerts {
 		if newCerts[i].ID == "portal" {
@@ -936,9 +952,12 @@ func (m *Manager) Configure(req ConfigureRequest) error {
 	}
 
 	log.Printf("remote: configured (solver=http-01, portal=%s)", portalHost)
-	// Wake the scheduler so it re-evaluates with the near-future NextRenewal.
-	// Without this, an already-running scheduler could sleep up to 1 hour.
-	m.notifySchedulerWake()
+
+	// Don't enqueue issuance immediately — HTTP-01 requires the relay tunnel
+	// to be up for Let's Encrypt to reach the device. The relay event handler
+	// (handleRelayEvent) calls requeueOutstandingIssuances when the tunnel
+	// connects, which will pick up this pending cert.
+	m.startRenewScheduler()
 	return nil
 }
 
@@ -1002,7 +1021,7 @@ func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
 	cfg.LastPreflight = &now
 	// Queue background ACME issuance and surface events/inventory.
 	// Managed mode issues both portal cert and wildcard cert
-	newCerts := defaultCertificates(cfg, now)
+	newCerts := defaultCertificates(cfg)
 	for _, c := range existingCerts {
 		if c.ID == "portal" || c.ID == "wildcard" {
 			continue
@@ -1024,8 +1043,7 @@ func (m *Manager) ConfigureManaged(req ManagedConfigureRequest) error {
 	log.Printf("remote: configured (solver=dns-01, managed=true, portal=%s)", portalHost)
 
 	// Queue issuance jobs after releasing lock (enqueueIssuanceJob acquires its own lock).
-	// Force=true because defaultCertificates seeds optimistic "ok" entries; without force the
-	// duplicate guard would skip issuance since NextRenewal is in the future.
+	// Force=true so the duplicate guard doesn't skip certs that are already "pending".
 	m.enqueueIssuanceJob(issuanceJob{id: "portal", domains: []string{portalHost}, commonName: portalHost, force: true})
 	// Managed mode supports wildcard via DNS-01
 	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portalHost)), ".")
@@ -1499,8 +1517,76 @@ func (m *Manager) stopAdapter() {
 			log.Printf("WARN: remote: stopping nexus adapter: %v", err)
 		}
 	}
+
+	// Clear relay state AFTER stopping so trailing events don't persist.
+	m.relayMu.Lock()
+	m.relayConnected = false
+	m.relayError = ""
+	m.relayMu.Unlock()
 }
 
+// RelayEventHandler returns a callback suitable for nexusclient.WithAdapterEventHandler.
+// It translates relay lifecycle events into warnings visible in the UI.
+func (m *Manager) RelayEventHandler() func(adapterName string, connected bool, errMsg string) {
+	return m.handleRelayEvent
+}
+
+// handleRelayEvent processes connection lifecycle events from the nexus backend
+// client and surfaces them as warnings/events for the UI.
+func (m *Manager) handleRelayEvent(adapterName string, connected bool, errMsg string) {
+	if m == nil || m.closed.Load() {
+		return
+	}
+
+	m.relayMu.Lock()
+	wasConnected := m.relayConnected
+	wasError := m.relayError
+	m.relayConnected = connected
+	m.relayError = errMsg
+	changed := wasConnected != connected || wasError != errMsg
+	m.relayMu.Unlock()
+
+	if connected && !wasConnected {
+		log.Printf("INFO: [%s] relay connected", adapterName)
+		// Relay just came up — kick off any pending HTTP-01 cert issuance
+		// that was waiting for the tunnel to be reachable.
+		m.requeueOutstandingIssuances()
+	} else if !connected && errMsg != "" && errMsg != wasError {
+		log.Printf("WARN: [%s] relay disconnected: %s", adapterName, errMsg)
+	}
+
+	// Republish config so SSE clients pick up the updated warning state.
+	if changed {
+		m.publishConfigChanged()
+	}
+}
+
+// relayWarning returns a user-visible warning if the relay is disconnected with an error.
+func (m *Manager) relayWarning() string {
+	m.relayMu.RLock()
+	connected := m.relayConnected
+	errMsg := m.relayError
+	m.relayMu.RUnlock()
+
+	if connected || errMsg == "" {
+		return ""
+	}
+
+	// Raw relay errors are too technical for end-users; map to actionable guidance.
+	lower := strings.ToLower(errMsg)
+	switch {
+	case strings.Contains(lower, "token") && strings.Contains(lower, "signature"):
+		return "Relay authentication failed — check the device secret"
+	case strings.Contains(lower, "token") && strings.Contains(lower, "expired"):
+		return "Relay authentication failed — token expired, check system clock"
+	case strings.Contains(lower, "dial") || strings.Contains(lower, "connection refused"):
+		return "Relay unreachable — check the endpoint and network"
+	case strings.Contains(lower, "tls") || strings.Contains(lower, "x509"):
+		return "Relay TLS error — check the endpoint certificate"
+	default:
+		return fmt.Sprintf("Relay connection error: %s", errMsg)
+	}
+}
 
 // startRenewScheduler starts a background loop to renew certificates when due.
 func (m *Manager) startRenewScheduler() {
@@ -2871,19 +2957,14 @@ func computeWarnings(cfg *Config) []string {
 	return warnings
 }
 
-func defaultCertificates(cfg *Config, now time.Time) []Certificate {
-	exp := now.Add(90 * 24 * time.Hour)
-	next := now.Add(60 * 24 * time.Hour)
+func defaultCertificates(cfg *Config) []Certificate {
 	certificates := []Certificate{}
 	if cfg.PortalHostname != "" {
 		certificates = append(certificates, Certificate{
-			ID:          "portal",
-			Domains:     []string{cfg.PortalHostname},
-			Solver:      cfg.Solver,
-			IssuedAt:    timePtr(now),
-			ExpiresAt:   timePtr(exp),
-			NextRenewal: timePtr(next),
-			Status:      "ok",
+			ID:      "portal",
+			Domains: []string{cfg.PortalHostname},
+			Solver:  cfg.Solver,
+			Status:  "pending",
 		})
 	}
 	// Wildcard cert only for managed mode (DNS-01 via orchestrator)
@@ -2893,13 +2974,10 @@ func defaultCertificates(cfg *Config, now time.Time) []Certificate {
 			return certificates
 		}
 		certificates = append(certificates, Certificate{
-			ID:          "wildcard",
-			Domains:     []string{fmt.Sprintf("*.%s", base), base},
-			Solver:      cfg.Solver,
-			IssuedAt:    timePtr(now),
-			ExpiresAt:   timePtr(exp),
-			NextRenewal: timePtr(next),
-			Status:      "ok",
+			ID:      "wildcard",
+			Domains: []string{fmt.Sprintf("*.%s", base), base},
+			Solver:  cfg.Solver,
+			Status:  "pending",
 		})
 	}
 	return certificates

@@ -438,14 +438,14 @@ func TestConfigure_HTTP01DefersIssuance(t *testing.T) {
 		t.Fatalf("configure: %v", err)
 	}
 
-	// Immediately after Configure, the portal cert should still be at its
-	// seeded "ok" status — ACME issuance is deferred, not immediate.
+	// Immediately after Configure, the portal cert should be "pending" —
+	// actual issuance happens asynchronously via the ACME worker.
 	var found bool
 	for _, c := range m.ListCertificates() {
 		if c.ID == "portal" {
 			found = true
-			if !strings.EqualFold(c.Status, "ok") {
-				t.Fatalf("portal cert should be 'ok' (seeded) immediately after Configure, got %q (issuance should be deferred)", c.Status)
+			if !strings.EqualFold(c.Status, "pending") {
+				t.Fatalf("portal cert should be 'pending' immediately after Configure, got %q", c.Status)
 			}
 		}
 	}
