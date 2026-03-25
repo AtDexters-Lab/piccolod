@@ -1096,6 +1096,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		s.namekAdapter = nexusclient.NewBackendAdapter(routeMgr, remoteResolver,
 			nexusclient.WithAdapterTokenProvider(namekTP),
 			nexusclient.WithAdapterName("piccolo-namek"),
+			nexusclient.WithAdapterEventHandler(rm.RelayEventHandler()),
 		)
 
 		// Register namek orchClient in remote manager's source-agnostic registry
@@ -1318,6 +1319,9 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	// Prevent identity event subscriber from racing with shutdown
 	s.namekStopped.Store(true)
 	s.stopNamekAdapter()
+	if s.remoteManager != nil {
+		s.remoteManager.ClearRelayState("piccolo-namek")
+	}
 
 	// Cancel in-flight domain reconciliation to prevent stale network calls during shutdown
 	s.namekMu.Lock()
@@ -2291,6 +2295,7 @@ func (s *GinServer) clearNamekState(rm *remote.Manager) {
 	s.namekDomains = nil
 	s.namekMu.Unlock()
 	if rm != nil {
+		rm.ClearRelayState("piccolo-namek")
 		rm.UnregisterOrchClient("namek")
 	}
 	if s.remoteResolver != nil {
