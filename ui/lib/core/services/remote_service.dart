@@ -32,15 +32,6 @@ class RemoteService {
     return (response['device_secret'] as String?) ?? '';
   }
 
-  Future<List<RemotePreflightCheck>> runPreflight([Map<String, dynamic>? config]) async {
-    final response = await _api.post('/api/v1/remote/preflight', body: config) as Map<String, dynamic>;
-    final checks = (response['checks'] as List<dynamic>?) ?? <dynamic>[];
-    return checks
-        .whereType<Map<dynamic, dynamic>>()
-        .map((e) => RemotePreflightCheck.fromJson(Map<String, dynamic>.from(e)))
-        .toList();
-  }
-
   Future<List<RemoteAlias>> getAliases() async {
     final response = await _api.get('/api/v1/remote/aliases') as Map<String, dynamic>;
     final list = (response['aliases'] as List<dynamic>?) ?? <dynamic>[];

@@ -5,7 +5,7 @@ import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_aliases_card.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_certificates_card.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_events_card.dart';
-import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_setup_wizard.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/self_hosted_section.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
@@ -16,71 +16,34 @@ class RemoteDashboard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final status = controller.status;
-
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildHeader(context),
+        _buildHeader(),
         const SizedBox(height: Spacing.lg),
-        if (status != null && status.warnings.isNotEmpty) ...[
-          _buildWarnings(context, status.warnings),
-          const SizedBox(height: Spacing.lg),
-        ],
+        ..._buildRelayWarnings(),
         PortalListCard(controller: controller),
-        const SizedBox(height: Spacing.lg),
-        NamekManagementSection(controller: controller),
-        const SizedBox(height: Spacing.lg),
-        _buildSelfHostedSection(context),
         const SizedBox(height: Spacing.lg),
         RemoteCertificatesCard(controller: controller),
         const SizedBox(height: Spacing.lg),
         RemoteAliasesCard(controller: controller),
+        const SizedBox(height: Spacing.lg),
+        _buildSettingsDivider(),
+        const SizedBox(height: Spacing.lg),
+        NamekManagementSection(controller: controller),
+        const SizedBox(height: Spacing.lg),
+        SelfHostedSection(controller: controller),
         const SizedBox(height: Spacing.lg),
         RemoteEventsCard(controller: controller),
       ],
     );
   }
 
-  Widget _buildHeader(BuildContext context) {
-    var statusColor = PiccoloTheme.inkMuted;
-    var statusText = 'Inactive';
-    var statusIcon = PiccoloIcons.cloudOff;
-
-    if (controller.hasAnyRemoteActive) {
-      statusColor = PiccoloTheme.success;
-      statusText = 'Active';
-      statusIcon = PiccoloIcons.success;
-    }
-
-    final status = controller.status;
-    if (status != null && status.state == 'error') {
-      statusColor = PiccoloTheme.critical;
-      statusText = 'Error';
-      statusIcon = PiccoloIcons.error;
-    } else if (status != null && status.warnings.isNotEmpty) {
-      statusColor = PiccoloTheme.warning;
-      statusText = 'Degraded';
-      statusIcon = PiccoloIcons.warning;
-    }
-
+  Widget _buildHeader() {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Remote Access', style: PiccoloTheme.textTheme.headlineMedium),
-            const SizedBox(height: Spacing.sm),
-            Row(
-              children: [
-                Icon(statusIcon, color: statusColor, size: 20),
-                const SizedBox(width: Spacing.sm),
-                Text(statusText, style: TextStyle(color: statusColor, fontWeight: FontWeight.bold)),
-              ],
-            ),
-          ],
-        ),
+        Text('Remote Access', style: PiccoloTheme.textTheme.headlineMedium),
         FilledButton.icon(
           onPressed: controller.refresh,
           icon: const Icon(PiccoloIcons.refresh),
@@ -90,74 +53,55 @@ class RemoteDashboard extends StatelessWidget {
     );
   }
 
-  Widget _buildWarnings(BuildContext context, List<String> warnings) {
-    return Container(
-      padding: const EdgeInsets.all(Spacing.base),
-      decoration: BoxDecoration(
-        color: PiccoloTheme.warning.withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(Radii.sm),
-        border: Border.all(color: PiccoloTheme.warning.withValues(alpha: 0.3)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: warnings.map((w) => Padding(
-          padding: const EdgeInsets.only(bottom: Spacing.xs),
-          child: Row(
+  /// Shows relay connection warnings only — cert/alias warnings are covered
+  /// by per-item health in the certificates and aliases cards.
+  List<Widget> _buildRelayWarnings() {
+    final warnings = controller.status?.warnings ?? [];
+    // Filter to relay-level warnings (not cert-derived).
+    // Relay warnings contain "relay" from relayWarning() in the backend.
+    final relayWarnings = warnings.where((w) => w.toLowerCase().contains('relay')).toList();
+    if (relayWarnings.isEmpty) return [];
+
+    return [
+      Container(
+        padding: const EdgeInsets.all(Spacing.md),
+        decoration: BoxDecoration(
+          color: PiccoloTheme.warning.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(Radii.sm),
+          border: Border.all(color: PiccoloTheme.warning.withValues(alpha: 0.3)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: relayWarnings.map((w) => Row(
             children: [
               const Icon(PiccoloIcons.warning, color: PiccoloTheme.warning, size: 16),
               const SizedBox(width: Spacing.sm),
               Expanded(child: Text(w, style: const TextStyle(color: PiccoloTheme.ink))),
             ],
-          ),
-        )).toList(),
+          )).toList(),
+        ),
       ),
-    );
+      const SizedBox(height: Spacing.lg),
+    ];
   }
 
-  Widget _buildSelfHostedSection(BuildContext context) {
-    final status = controller.status;
-    final selfHostedActive = status != null &&
-        status.enabled &&
-        status.portalHostname != null &&
-        status.portalHostname!.isNotEmpty;
-
-    if (selfHostedActive) {
-      return Container(
-        padding: const EdgeInsets.all(Spacing.base),
-        decoration: BoxDecoration(
-          color: PiccoloTheme.porcelain,
-          borderRadius: BorderRadius.circular(Radii.sm),
-          boxShadow: Elevation.elev1,
-        ),
-        child: Row(
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Self-hosted Relay', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: Spacing.xs),
-                  Text('Endpoint: ${status.endpoint ?? "Unknown"}', style: PiccoloTheme.textTheme.labelSmall),
-                  Text('Hostname: ${status.portalHostname}', style: PiccoloTheme.textTheme.labelSmall),
-                ],
-              ),
+  Widget _buildSettingsDivider() {
+    return Row(
+      children: [
+        const Expanded(child: Divider()),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: Spacing.base),
+          child: Text(
+            'Settings',
+            style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+              color: PiccoloTheme.inkMuted,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 1.2,
             ),
-            OutlinedButton(
-              onPressed: () => RemoteSetupWizard.show(context, controller),
-              child: const Text('Manage'),
-            ),
-          ],
+          ),
         ),
-      );
-    }
-
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: TextButton.icon(
-        onPressed: () => RemoteSetupWizard.show(context, controller),
-        icon: const Icon(PiccoloIcons.router, size: 16),
-        label: const Text('Advanced: Set up your own relay'),
-      ),
+        const Expanded(child: Divider()),
+      ],
     );
   }
 }

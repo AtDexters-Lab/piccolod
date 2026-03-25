@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
@@ -8,10 +9,11 @@ class RemoteCertificatesCard extends StatelessWidget {
 
   const RemoteCertificatesCard({required this.controller, super.key});
   final RemoteController controller;
+  static final DateFormat _dateFormat = DateFormat.yMMMd();
 
   @override
   Widget build(BuildContext context) {
-    final certs = controller.certificates; // [P1] Fixed
+    final certs = controller.certificates;
 
     return Card(
       child: Padding(
@@ -19,12 +21,7 @@ class RemoteCertificatesCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text('Certificates', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
-              ],
-            ),
+            Text('Certificates', style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
             const SizedBox(height: Spacing.base),
             if (certs.isEmpty)
               const Text('No certificates issued yet.', style: TextStyle(color: PiccoloTheme.inkMuted))
@@ -52,20 +49,20 @@ class RemoteCertificatesCard extends StatelessWidget {
     if (cert.status == 'error') {
       icon = PiccoloIcons.error;
       iconColor = PiccoloTheme.critical;
-      subtitle = cert.failureReason ?? 'Unknown error';
+      subtitle = _buildErrorSubtitle(cert);
       subtitleColor = PiccoloTheme.critical;
       actionLabel = 'Retry';
     } else if (cert.status == 'pending') {
       icon = PiccoloIcons.hourglass;
       iconColor = PiccoloTheme.warning;
-      subtitle = 'Issuance in progress...';
+      subtitle = 'Issuing...';
       subtitleColor = PiccoloTheme.inkMuted;
     } else {
       icon = PiccoloIcons.shieldCheck;
       iconColor = PiccoloTheme.cobalt600;
       final expires = cert.expiresAt;
       final isExpiring = expires != null && expires.difference(DateTime.now()).inDays < 7;
-      subtitle = expires != null ? "Expires: ${expires.toLocal().toString().split(' ')[0]}" : 'No expiry';
+      subtitle = expires != null ? 'Expires ${_formatDate(expires)}' : 'Active';
       subtitleColor = isExpiring ? PiccoloTheme.warning : PiccoloTheme.inkMuted;
     }
 
@@ -78,13 +75,7 @@ class RemoteCertificatesCard extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(cert.domains.join(', '), style: const TextStyle(fontWeight: FontWeight.bold)),
-              Text(
-                subtitle,
-                style: TextStyle(
-                  color: subtitleColor,
-                  fontSize: 12,
-                ),
-              ),
+              Text(subtitle, style: TextStyle(color: subtitleColor, fontSize: 12)),
             ],
           ),
         ),
@@ -95,4 +86,28 @@ class RemoteCertificatesCard extends StatelessWidget {
       ],
     );
   }
+
+  /// Builds an actionable error subtitle with retry ETA when available.
+  String _buildErrorSubtitle(RemoteCertificate cert) {
+    final reason = cert.failureReason ?? 'Unknown error';
+    final retryAt = cert.retryAt;
+    if (retryAt == null) return reason;
+
+    final now = DateTime.now();
+    if (retryAt.isBefore(now)) return reason;
+
+    final diff = retryAt.difference(now);
+    String eta;
+    if (diff.inDays > 0) {
+      eta = 'retrying ${_formatDate(retryAt)}';
+    } else if (diff.inHours > 0) {
+      eta = 'retrying in ${diff.inHours}h';
+    } else {
+      final mins = diff.inMinutes;
+      eta = mins > 0 ? 'retrying in ${mins}m' : 'retrying shortly';
+    }
+    return '$reason · $eta';
+  }
+
+  String _formatDate(DateTime dt) => _dateFormat.format(dt.toLocal());
 }

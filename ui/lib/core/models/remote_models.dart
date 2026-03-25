@@ -151,29 +151,6 @@ class RemoteCertificate {
   final String? failureReason;
 }
 
-class RemotePreflightCheck {
-
-  RemotePreflightCheck({
-    required this.name,
-    required this.status,
-    this.detail,
-    this.nextStep,
-  });
-
-  factory RemotePreflightCheck.fromJson(Map<String, dynamic> json) {
-    return RemotePreflightCheck(
-      name: (json['name'] as String?) ?? '',
-      status: (json['status'] as String?) ?? 'unknown',
-      detail: json['detail'] as String?,
-      nextStep: json['next_step'] as String?,
-    );
-  }
-  final String name;
-  final String status; // pass, warn, fail
-  final String? detail;
-  final String? nextStep;
-}
-
 class RemoteEvent {
 
   RemoteEvent({
