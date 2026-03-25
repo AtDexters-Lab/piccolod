@@ -455,44 +455,31 @@ class SetupController extends ChangeNotifier {
   Future<bool> unlock(String password) async {
     try {
       debugPrint('Unlock attempt, authRequestId: $_authRequestId');
-      await _api.post('/api/v1/crypto/unlock', body: {'password': password});
-      // After unlock, we might have an auto-created session (best-effort).
-      // Let's verify or just proceed to login if needed.
-      // Actually, handleCryptoUnlock does try to create a session.
-      // Let's check session status to be sure.
+      final unlockResp = await _api.post(
+        '/api/v1/crypto/unlock',
+        body: {'password': password},
+      ) as Map<String, dynamic>?;
 
-      final session = await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
-      if (session['authenticated'] == true) {
-        await _api.fetchCsrfToken();
-
-        // Handle OIDC auth request if present (SSO flow)
-        if (_authRequestId != null) {
-          debugPrint('OIDC flow detected after unlock, completing auth request...');
-          await _completeOidcAuthRequest();
-          return true; // Don't set complete state - we're redirecting
-        }
-
-        if (_nextUrl != null && _nextUrl!.isNotEmpty) {
-          if (await _redirectToNextIfValid()) {
-            return true;
-          }
-        }
-
-        _state = SetupState.complete;
-      } else {
-        // Unlocked but no session (weird but possible) -> Login
-        _state = SetupState.login;
+      // Two-door model: unlock is a disk operation only — no session is created.
+      // Check for data volume warning (system degraded).
+      if (unlockResp?['warning'] != null) {
+        _error = unlockResp!['warning'] as String;
+        _state = SetupState.systemError;
+        notifyListeners();
+        return true; // Unlock succeeded, but system is degraded.
       }
 
+      // Route based on setup_complete: partial setup failure → retry setup,
+      // normal reboot → chain login.
+      if (unlockResp?['setup_complete'] == false) {
+        await _completeSetupAfterUnlock(password);
+      } else {
+        await _chainLoginAfterUnlock(password);
+      }
       notifyListeners();
       return true;
     } on ApiException catch (e) {
-      if (_isStorageSystemError(e)) {
-        _error = _extractServerError(e.message);
-        _state = SetupState.systemError;
-      } else {
-        _error = e.toString();
-      }
+      _error = e.toString();
       notifyListeners();
       return false;
     } on Object catch (e) {
@@ -502,41 +489,42 @@ class SetupController extends ChangeNotifier {
     }
   }
 
+  /// Complete a partial setup after unlock. Called when setup_complete is false
+  /// (reboot after interrupted first-run). Setup is idempotent — it picks up
+  /// where it left off (auth init, admin creation, session).
+  Future<void> _completeSetupAfterUnlock(String password) async {
+    debugPrint('Partial setup detected after unlock, completing via /crypto/setup');
+    await _api.post('/api/v1/crypto/setup', body: {'password': password});
+    await _api.fetchCsrfToken();
+    _state = SetupState.complete;
+  }
+
+  /// Attempt password login immediately after a successful unlock.
+  /// Falls back to the login screen if the backend rejects password auth
+  /// (e.g. remote passkey-only policy).
+  Future<void> _chainLoginAfterUnlock(String password) async {
+    try {
+      await _completeLoginFlow('admin', password);
+    } on ApiException catch (e) {
+      if (e.statusCode == 423) {
+        // Intentionally no _state change — stay on the unlock screen so the
+        // user sees the error and can retry.
+        _error = 'Unlock partially failed, please try again';
+        return;
+      }
+      debugPrint('Chained login after unlock failed (${e.statusCode}), '
+          'falling back to login screen');
+      _state = SetupState.login;
+    } on Object catch (e) {
+      debugPrint('Chained login after unlock failed: $e, '
+          'falling back to login screen');
+      _state = SetupState.login;
+    }
+  }
+
   Future<bool> login(String username, String password) async {
     try {
-      debugPrint('Login attempt for user: $username');
-      final resp = await _api.post(
-        '/api/v1/auth/login',
-        body: {'username': username, 'password': password, 'next': _nextUrl},
-      );
-      await _api.fetchCsrfToken();
-      debugPrint('Login successful, authRequestId: $_authRequestId');
-
-      // Check if session requires passkey registration (remote bootstrap)
-      final session = await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
-      if (session['must_register_passkey'] == true) {
-        _state = SetupState.passkeyRequired;
-        notifyListeners();
-        return true;
-      }
-
-      // Handle OIDC auth request if present (SSO flow)
-      if (_authRequestId != null) {
-        debugPrint('OIDC flow detected, completing auth request...');
-        await _completeOidcAuthRequest();
-        return true; // Don't set complete state - we're redirecting
-      }
-
-      if (resp is Map && resp['redirect_url'] is String) {
-        final redirectUrl = resp['redirect_url'] as String;
-        if (redirectUrl.isNotEmpty) {
-          debugPrint('Redirecting to login next URL: $redirectUrl');
-          web.window.location.href = redirectUrl;
-          return true;
-        }
-      }
-
-      _state = SetupState.complete;
+      await _completeLoginFlow(username, password);
       notifyListeners();
       return true;
     } on Object catch (e) {
@@ -545,6 +533,43 @@ class SetupController extends ChangeNotifier {
       notifyListeners();
       return false;
     }
+  }
+
+  /// Shared post-login flow: authenticate, handle passkey registration,
+  /// OIDC, redirects, and set final state. Throws on failure.
+  Future<void> _completeLoginFlow(String username, String password) async {
+    final resp = await _api.post(
+      '/api/v1/auth/login',
+      body: {'username': username, 'password': password, 'next': _nextUrl},
+    );
+    await _api.fetchCsrfToken();
+
+    // Check passkey registration requirement from login response.
+    if (resp is Map && resp['must_register_passkey'] == true) {
+      _state = SetupState.passkeyRequired;
+      return;
+    }
+
+    if (_authRequestId != null) {
+      debugPrint('OIDC flow detected, completing auth request...');
+      await _completeOidcAuthRequest();
+      return;
+    }
+
+    if (resp is Map && resp['redirect_url'] is String) {
+      final redirectUrl = resp['redirect_url'] as String;
+      if (redirectUrl.isNotEmpty) {
+        debugPrint('Redirecting to login next URL: $redirectUrl');
+        web.window.location.href = redirectUrl;
+        return;
+      }
+    }
+
+    if (_nextUrl != null && _nextUrl!.isNotEmpty) {
+      if (await _redirectToNextIfValid()) return;
+    }
+
+    _state = SetupState.complete;
   }
 
   /// Complete the OIDC auth request and redirect back to the app

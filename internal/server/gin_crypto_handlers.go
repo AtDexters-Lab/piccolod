@@ -19,6 +19,33 @@ import (
 	"piccolod/internal/persistence"
 )
 
+// isSetupComplete checks whether first-run provisioning has finished by
+// counting users (primary) or checking auth initialization (fallback).
+// Returns (false, nil) when the store is locked (ErrLocked).
+// Returns (false, err) on transient errors — callers should fail closed.
+func (s *GinServer) isSetupComplete(ctx context.Context) (bool, error) {
+	if s.userManager != nil {
+		count, err := s.userManager.Count(ctx)
+		if err == nil && count > 0 {
+			return true, nil
+		}
+		if err != nil && !errors.Is(err, persistence.ErrLocked) {
+			return false, err
+		}
+		return false, nil
+	}
+	if s.authManager != nil {
+		initialized, err := s.authManager.IsInitialized(ctx)
+		if err == nil && initialized {
+			return true, nil
+		}
+		if err != nil && !errors.Is(err, persistence.ErrLocked) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
 func (s *GinServer) notifyPersistenceLockState(ctx context.Context, locked bool) error {
 	if s == nil || s.dispatcher == nil {
 		return errors.New("persistence dispatcher unavailable")
@@ -65,13 +92,10 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		return
 	}
 
-	// 2. Reject if already initialized and locked — this is a reboot, not first-time
-	// setup. The caller should use /crypto/unlock instead, which handles recovery
-	// for incomplete LUKS initialization (Posture RFC §5.3).
-	if s.cryptoManager.IsInitialized() && s.cryptoManager.IsLocked() {
-		c.JSON(http.StatusConflict, gin.H{"error": "already initialized, use /crypto/unlock"})
-		return
-	}
+	// 2. [Gate removed] Setup is fully idempotent — every step has a "skip if
+	// already done" guard. When crypto is initialized+locked (reboot after
+	// partial setup failure), step 4 unlocks with the provided password and
+	// the remaining steps complete provisioning.
 
 	// 3. Setup crypto manager (disk encryption key) — skip if already initialized.
 	if !s.cryptoManager.IsInitialized() {
@@ -84,46 +108,15 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	}
 
 	// 4. Unlock crypto — skip if already unlocked.
+	// Unlock is idempotent when already unlocked (re-derives SDEK),
+	// and leaves state unchanged on failure — no Lock() side effect.
 	if s.cryptoManager.IsLocked() {
 		if err := s.cryptoManager.Unlock(body.Password); err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "wrong password"})
 			return
 		}
 	} else if s.cryptoManager.IsInitialized() {
-		// Already initialized and unlocked. If setup is fully complete,
-		// reject to prevent unauthenticated session creation (auth bypass).
-		// Fail closed: transient lookup errors return 500 rather than
-		// falling through to the destructive InitializeDataVolume path.
-		setupComplete := false
-		if s.userManager != nil {
-			// Check if any users exist (not just "admin") so that
-			// renamed/deleted admin accounts don't bypass the guard.
-			count, err := s.userManager.Count(c.Request.Context())
-			if err == nil && count > 0 {
-				setupComplete = true
-			} else if err != nil && !errors.Is(err, persistence.ErrLocked) {
-				log.Printf("ERROR: user count failed during setup guard: %v", err)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "setup state check failed"})
-				return
-			}
-		} else if s.authManager != nil {
-			initialized, err := s.authManager.IsInitialized(c.Request.Context())
-			if err != nil && !errors.Is(err, persistence.ErrLocked) {
-				log.Printf("ERROR: auth init check failed during setup guard: %v", err)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "setup state check failed"})
-				return
-			}
-			if err == nil && initialized {
-				setupComplete = true
-			}
-		}
-		if setupComplete {
-			c.JSON(http.StatusConflict, gin.H{"error": "setup already complete"})
-			return
-		}
-		// Partial retry: verify password matches the existing crypto key.
-		// Unlock is idempotent when already unlocked (re-derives SDEK),
-		// and leaves state unchanged on failure — no Lock() side effect.
+		// Partial retry on already-unlocked device: verify password matches.
 		if err := s.cryptoManager.Unlock(body.Password); err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "wrong password"})
 			return
@@ -155,22 +148,44 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	runtime.GC()
 	debug.FreeOSMemory()
 
-	// 5. Initialize data volume BEFORE notifying persistence, so that
-	// storage volumes are available before the app-manager reconcile loop
-	// starts. Capture error but defer failure until after session creation,
-	// so the user gets a portal session for recovery on LUKS failure.
+	// 5. Notify persistence (mounts control-plane LUKS volume, enables SQLite).
+	// Runs BEFORE data volume so the setupComplete guard (step 5b) can query
+	// SQLite and reject fully provisioned devices before any destructive ops.
+	if err := s.notifyPersistenceLockState(setupCtx, false); err != nil {
+		log.Printf("WARN: failed to propagate unlock state: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
+		return
+	}
+
+	// 5b. Guard: reject if setup is already complete to prevent /setup from
+	// bypassing the two-door login model on a fully configured device.
+	// Re-lock persistence on rejection so the rejected request has no side effects.
+	if complete, err := s.isSetupComplete(setupCtx); err != nil {
+		log.Printf("ERROR: setup-complete guard failed: %v", err)
+		_ = s.notifyPersistenceLockState(setupCtx, true)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "setup state check failed"})
+		return
+	} else if complete {
+		_ = s.notifyPersistenceLockState(setupCtx, true)
+		c.JSON(http.StatusConflict, gin.H{"error": "setup already complete"})
+		return
+	}
+
+	// 6. Activate/initialize data volume. Uses UnlockDataVolume (idempotent):
+	// checks VGExists first, falls back to InitializeDataVolume only if no VG.
+	// Safe for both first-run and retry.
 	var luksErr error
 	if s.storageMgr != nil {
-		if err := s.storageMgr.InitializeDataVolume(setupCtx); err != nil {
-			log.Printf("ERROR: data volume initialization failed: %v", err)
+		if err := s.storageMgr.UnlockDataVolume(setupCtx); err != nil {
+			log.Printf("ERROR: data volume setup failed: %v", err)
 			luksErr = err
 			if s.healthTracker != nil {
-				s.healthTracker.Setf("storage", health.LevelError, "data volume initialization failed")
+				s.healthTracker.Setf("storage", health.LevelError, "data volume setup failed")
 			}
 		}
 	}
 
-	// 5b. Provision LUKS keyslot 1 (admin password) on all v3 volumes.
+	// 6b. Provision LUKS keyslot 1 (admin password) on all v3 volumes.
 	if luksErr == nil {
 		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
 			passBytes := []byte(body.Password)
@@ -181,14 +196,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		}
 	}
 
-	// 6. Notify persistence (mounts control-plane LUKS volume, enables SQLite)
-	if err := s.notifyPersistenceLockState(setupCtx, false); err != nil {
-		log.Printf("WARN: failed to propagate unlock state: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
-		return
-	}
-
-	// 7. Setup auth manager (mandatory — needs SQLite from step 6) — skip if already initialized.
+	// 7. Setup auth manager (mandatory — needs SQLite from step 5) — skip if already initialized.
 	if s.authManager != nil {
 		initialized, err := s.authManager.IsInitialized(setupCtx)
 		if err != nil {
@@ -287,9 +295,15 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 		return
 	}
 	if err := s.cryptoManager.Unlock(password); err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		if s.recordLoginFailure() {
+			c.Header("Retry-After", "5")
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too Many Requests"})
+		} else {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		}
 		return
 	}
+	s.resetLoginFailures()
 
 	// Use a background context so long-running ops survive client disconnect.
 	unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -332,43 +346,19 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 	if s.pcvPublisher != nil {
 		s.pcvPublisher.Activate()
 	}
-	// Best-effort: verify admin credentials and create a session automatically.
-	ctx := unlockCtx
-	init := false
-	if s.authManager != nil {
-		if initialized, err := s.authManager.IsInitialized(ctx); err == nil {
-			init = initialized
-			if !initialized {
-				if err := s.authManager.Setup(ctx, password); err != nil {
-					log.Printf("WARN: auth setup during unlock failed: %v", err)
-				} else {
-					init = true
-				}
-			}
-		}
-		if init {
-			if ok, err := s.authManager.Verify(ctx, "admin", password); err == nil && ok {
-				userID := ""
-				if s.userManager != nil {
-					if u, err := s.userManager.GetByUsername(ctx, "admin"); err == nil {
-						userID = u.ID
-					}
-				}
-				// RFC 20260122 §6.2: Create portal session with origin binding
-				boundOrigin := s.computeCanonicalOrigin(c)
-				sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, portalSessionTTL)
-				s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
-			}
-		}
+	// Two-door model: unlock is a disk operation only — no session creation.
+	// Report setup_complete so the UI can route to /crypto/setup (partial
+	// recovery) or chain /auth/login (normal reboot).
+	setupComplete, err := s.isSetupComplete(unlockCtx)
+	if err != nil {
+		log.Printf("WARN: setup-complete check failed, assuming complete: %v", err)
+		setupComplete = true // Fail closed: assume provisioned, route to login
 	}
-	// Fail if LUKS unlock failed (after session is created for portal recovery access).
+	resp := gin.H{"message": "ok", "setup_complete": setupComplete}
 	if luksErr != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "data volume unlock failed: " + luksErr.Error(),
-		})
-		return
+		resp["warning"] = "data volume unlock failed: " + luksErr.Error()
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "ok"})
+	c.JSON(http.StatusOK, resp)
 }
 
 // handleCryptoResetPassword: POST /api/v1/crypto/reset-password

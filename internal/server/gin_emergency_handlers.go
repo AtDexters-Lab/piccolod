@@ -103,12 +103,13 @@ func isEmergencyAllowed(path string) bool {
 }
 
 // isEmergencySoftAllowed returns true for endpoints additionally permitted
-// during soft emergency. Crypto unlock and recovery are allowed because the
-// existing data volume may still be activatable. Crypto setup is blocked
-// because it requires successful disk preparation.
+// during soft emergency. Crypto unlock, recovery, and setup are allowed
+// because setup is idempotent (uses UnlockDataVolume which handles existing
+// volumes gracefully) and is needed for partial-setup recovery after reboot.
 func isEmergencySoftAllowed(path string) bool {
 	allowed := []string{
 		"/api/v1/crypto/unlock",
+		"/api/v1/crypto/setup",
 		"/api/v1/crypto/reset-password",
 		"/api/v1/crypto/recovery-key",
 	}

@@ -268,6 +268,7 @@ class _SetupWizardState extends State<SetupWizard> {
         return _UnlockStep(
           onUnlock: _controller.unlock,
           onForgotPassword: _controller.startRecovery,
+          controller: _controller,
         );
       case SetupState.login:
         return _LoginStep(
@@ -991,9 +992,10 @@ class _SecurityStepState extends State<_SecurityStep> {
 
 class _UnlockStep extends StatefulWidget {
 
-  const _UnlockStep({required this.onUnlock, required this.onForgotPassword});
+  const _UnlockStep({required this.onUnlock, required this.onForgotPassword, required this.controller});
   final Future<bool> Function(String) onUnlock;
   final VoidCallback onForgotPassword;
+  final SetupController controller;
 
   @override
   State<_UnlockStep> createState() => _UnlockStepState();
@@ -1022,7 +1024,7 @@ class _UnlockStepState extends State<_UnlockStep> {
     if (mounted && !success) {
       setState(() {
         _isSubmitting = false;
-        _error = 'Incorrect password';
+        _error = widget.controller.error ?? 'Incorrect password';
       });
     }
   }
