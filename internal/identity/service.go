@@ -813,7 +813,21 @@ func (s *Service) stopEndpointSync() {
 	}
 }
 
+// endpointSyncInitialDelay separates the first sync from adapter startup.
+// On enrollment, data is fresh from finalizeEnrollment so the delay is free.
+// On boot, the adapter needs a few seconds to connect before endpoint drift
+// detection is meaningful. Without this delay, the immediate sync bursts
+// Namek API requests alongside the adapter's nonce requests, hitting the
+// per-IP rate limit (2 req/s) and potentially cascading into adapter restarts.
+// endpointSyncInitialDelay is a var (not const) so tests can shorten it.
+var endpointSyncInitialDelay = 10 * time.Second
+
 func (s *Service) endpointSyncLoop(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(endpointSyncInitialDelay):
+	}
 	s.syncEndpointsOnce(ctx)
 
 	ticker := time.NewTicker(endpointSyncInterval())

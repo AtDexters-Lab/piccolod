@@ -1117,6 +1117,46 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if identityReadyCh == nil && identityChangedCh == nil {
 				return
 			}
+
+			// Drain + debounce: coalesce rapid identity events into a single
+			// applyNamekState call. Multiple events often arrive in quick
+			// succession (enrollment + endpoint sync, hostname + cache update).
+			// Processing each individually would restart the adapter redundantly
+			// and burst Namek nonce requests past the 2 req/IP/s rate limit.
+			const identityEventDebounce = 200 * time.Millisecond
+			debounce := time.NewTimer(identityEventDebounce)
+		drainLoop:
+			for {
+				select {
+				case _, ok := <-identityReadyCh:
+					if !ok {
+						identityReadyCh = nil
+						continue // shutdown signal, don't extend debounce
+					}
+					if !debounce.Stop() {
+						<-debounce.C
+					}
+					debounce.Reset(identityEventDebounce)
+				case _, ok := <-identityChangedCh:
+					if !ok {
+						identityChangedCh = nil
+						continue // shutdown signal, don't extend debounce
+					}
+					if !debounce.Stop() {
+						<-debounce.C
+					}
+					debounce.Reset(identityEventDebounce)
+				case <-debounce.C:
+					break drainLoop
+				}
+			}
+			debounce.Stop()
+
+			// Both channels may have closed during drain.
+			if identityReadyCh == nil && identityChangedCh == nil {
+				return
+			}
+
 			s.applyNamekState()
 			// Log identity state change to remote activity log (only on actual transitions)
 			if s.remoteManager != nil && s.identityService != nil {
