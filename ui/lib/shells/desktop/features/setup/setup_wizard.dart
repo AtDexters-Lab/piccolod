@@ -9,6 +9,7 @@ import 'package:piccolo_os/core/services/webauthn_service.dart';
 import 'package:piccolo_os/core/utils/downloader/downloader.dart';
 import 'package:piccolo_os/shared/widgets/ca_import_guide.dart';
 import 'package:piccolo_os/shared/widgets/diagnostic_log_download.dart';
+import 'package:piccolo_os/shared/widgets/login_form_fields.dart';
 import 'package:piccolo_os/shared/widgets/password_set_form.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/install_disk_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/onboarding_step.dart';
@@ -1107,7 +1108,6 @@ class _LoginStepState extends State<_LoginStep> {
   );
   final TextEditingController _passController = TextEditingController();
   bool _isSubmitting = false;
-  bool _obscureText = true;
   String? _error;
 
   @override
@@ -1161,8 +1161,7 @@ class _LoginStepState extends State<_LoginStep> {
   @override
   Widget build(BuildContext context) {
     final methods = widget.controller.loginMethods;
-    final showPasskey = (methods?.contains('passkey') ?? false) && WebAuthnService.isAvailable();
-    final showPassword = methods?.contains('password') ?? true;
+    final showPassword = LoginFormFields.isPasswordAvailable(methods);
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
@@ -1170,55 +1169,19 @@ class _LoginStepState extends State<_LoginStep> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (showPasskey) ...[
-            FilledButton.icon(
-              onPressed: _isSubmitting ? null : _loginWithPasskey,
-              icon: const Icon(PiccoloIcons.fingerprint),
-              label: const Text('Sign in with Passkey'),
-            ),
-            if (showPassword) ...[
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  const Expanded(child: Divider()),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: Text('or', style: PiccoloTheme.textTheme.bodySmall?.copyWith(color: PiccoloTheme.inkMuted)),
-                  ),
-                  const Expanded(child: Divider()),
-                ],
-              ),
-              const SizedBox(height: 16),
-            ],
-          ],
+          LoginFormFields(
+            methods: methods,
+            usernameController: _userController,
+            passwordController: _passController,
+            onSubmitPassword: _submit,
+            onSubmitPasskey: _loginWithPasskey,
+            isLoading: _isSubmitting,
+            error: _error,
+            unavailableMessage:
+                'Passkey sign-in is required but unavailable in this browser context. '
+                'Please access this device over HTTPS to sign in.',
+          ),
           if (showPassword) ...[
-            TextField(
-              controller: _userController,
-              autofillHints: const [AutofillHints.username],
-              decoration: const InputDecoration(
-                labelText: 'Username',
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _passController,
-              obscureText: _obscureText,
-              autofillHints: const [AutofillHints.password],
-              decoration: InputDecoration(
-                labelText: 'Password',
-                errorText: _error,
-                suffixIcon: IconButton(
-                  icon: Icon(
-                    _obscureText
-                        ? PiccoloIcons.visibilityOff
-                        : PiccoloIcons.visibility,
-                    color: PiccoloTheme.inkMuted,
-                  ),
-                  onPressed: () => setState(() => _obscureText = !_obscureText),
-                ),
-              ),
-              onSubmitted: (_) => _submit(),
-            ),
             const SizedBox(height: 24),
             Row(
               children: [
@@ -1241,14 +1204,6 @@ class _LoginStepState extends State<_LoginStep> {
                       : const Text('Log In'),
                 ),
               ],
-            ),
-          ] else if (_error != null) ...[
-            Text(_error!, style: const TextStyle(color: PiccoloTheme.critical)),
-          ] else if (!showPasskey && !showPassword) ...[
-            Text(
-              'Passkey sign-in is required but unavailable in this browser context. '
-              'Please access this device over HTTPS to sign in.',
-              style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
             ),
           ],
         ],

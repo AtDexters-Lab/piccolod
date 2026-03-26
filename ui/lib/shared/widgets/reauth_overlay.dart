@@ -3,13 +3,13 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/webauthn_service.dart';
-import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/shared/widgets/login_form_fields.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 /// Re-authentication overlay displayed when the portal session expires.
 ///
 /// Renders a scrim + centered dialog (matching the SetupWizard chrome) with
-/// username (pre-filled) and password fields.
+/// login fields gated by the server's login-options endpoint.
 /// "Log In" re-authenticates inline; "Log Out" cancels and triggers a full logout.
 class ReauthOverlay extends StatefulWidget {
 
@@ -28,7 +28,6 @@ class ReauthOverlay extends StatefulWidget {
 class _ReauthOverlayState extends State<ReauthOverlay> {
   late final TextEditingController _usernameController;
   final TextEditingController _passwordController = TextEditingController();
-  bool _obscurePassword = true;
   bool _isLoading = false;
   String? _error;
   List<String>? _methods;
@@ -170,57 +169,14 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
                       mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        if ((_methods?.contains('passkey') ?? false) && WebAuthnService.isAvailable()) ...[
-                          FilledButton.icon(
-                            onPressed: _isLoading ? null : _loginWithPasskey,
-                            icon: const Icon(PiccoloIcons.fingerprint),
-                            label: const Text('Sign in with Passkey'),
-                          ),
-                          const SizedBox(height: 16),
-                          Row(
-                            children: [
-                              const Expanded(child: Divider()),
-                              Padding(
-                                padding: const EdgeInsets.symmetric(horizontal: 12),
-                                child: Text('or', style: PiccoloTheme.textTheme.bodySmall?.copyWith(color: PiccoloTheme.inkMuted)),
-                              ),
-                              const Expanded(child: Divider()),
-                            ],
-                          ),
-                          const SizedBox(height: 16),
-                        ],
-                        TextField(
-                          controller: _usernameController,
-                          autofillHints: const [AutofillHints.username],
-                          decoration: const InputDecoration(
-                            labelText: 'Username',
-                          ),
-                          textInputAction: TextInputAction.next,
-                          enabled: !_isLoading,
-                        ),
-                        const SizedBox(height: 16),
-                        TextField(
-                          controller: _passwordController,
-                          obscureText: _obscurePassword,
-                          autofillHints: const [AutofillHints.password],
-                          decoration: InputDecoration(
-                            labelText: 'Password',
-                            errorText: _error,
-                            suffixIcon: IconButton(
-                              icon: Icon(
-                                _obscurePassword
-                                    ? PiccoloIcons.visibilityOff
-                                    : PiccoloIcons.visibility,
-                                color: PiccoloTheme.inkMuted,
-                              ),
-                              onPressed: () => setState(
-                                () => _obscurePassword = !_obscurePassword,
-                              ),
-                            ),
-                          ),
-                          textInputAction: TextInputAction.done,
-                          onSubmitted: _isLoading ? null : (_) => _submit(),
-                          enabled: !_isLoading,
+                        LoginFormFields(
+                          methods: _methods,
+                          usernameController: _usernameController,
+                          passwordController: _passwordController,
+                          onSubmitPassword: _submit,
+                          onSubmitPasskey: _loginWithPasskey,
+                          isLoading: _isLoading,
+                          error: _error,
                         ),
                         const SizedBox(height: 24),
                         Row(
@@ -236,19 +192,20 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
                               child: const Text('Log Out'),
                             ),
                             const Spacer(),
-                            FilledButton(
-                              onPressed: _isLoading ? null : _submit,
-                              child: _isLoading
-                                  ? const SizedBox(
-                                      width: 20,
-                                      height: 20,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        color: Colors.white,
-                                      ),
-                                    )
-                                  : const Text('Log In'),
-                            ),
+                            if (LoginFormFields.isPasswordAvailable(_methods))
+                              FilledButton(
+                                onPressed: _isLoading ? null : _submit,
+                                child: _isLoading
+                                    ? const SizedBox(
+                                        width: 20,
+                                        height: 20,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: Colors.white,
+                                        ),
+                                      )
+                                    : const Text('Log In'),
+                              ),
                           ],
                         ),
                       ],
