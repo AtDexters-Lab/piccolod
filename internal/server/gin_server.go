@@ -967,38 +967,22 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 				// Check slug hostname
 				if slugHost != "" && (h == slugHost || strings.HasSuffix(h, "."+slugHost)) {
-					if h == slugHost {
-						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-							ID: "namek-portal", Source: "namek", Solver: "dns-01",
-							CertDir: certDir, CommonName: slugHost, Domains: []string{slugHost},
-							Force: true,
-						})
-					} else {
-						wildcard := "*." + slugHost
-						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-							ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
-							CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, slugHost},
-							Force: true,
-						})
-					}
+					wildcard := "*." + slugHost
+					rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+						ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
+						CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, slugHost},
+						Force: true,
+					})
 					return
 				}
 				// Check custom hostname
 				if customHost != "" && customHost != slugHost && (h == customHost || strings.HasSuffix(h, "."+customHost)) {
-					if h == customHost {
-						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-							ID: "namek-custom-portal", Source: "namek", Solver: "dns-01",
-							CertDir: certDir, CommonName: customHost, Domains: []string{customHost},
-							Force: true,
-						})
-					} else {
-						wildcard := "*." + customHost
-						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-							ID: "namek-custom-wildcard", Source: "namek", Solver: "dns-01",
-							CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, customHost},
-							Force: true,
-						})
-					}
+					wildcard := "*." + customHost
+					rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+						ID: "namek-custom-wildcard", Source: "namek", Solver: "dns-01",
+						CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, customHost},
+						Force: true,
+					})
 					return
 				}
 			}
@@ -2477,18 +2461,22 @@ func (s *GinServer) applyNamekState() {
 	s.recomputeFrameAncestors()
 
 	// --- Cert provider portal mappings ---
+	// Portal mappings point bare hostnames to the wildcard cert (which includes
+	// the bare domain in its SANs). This is necessary because GetCertificate's
+	// wildcard fallback splits on the first dot — e.g., slug.example.com would
+	// try *.example.com, not *.slug.example.com.
 	if s.certProvider != nil {
 		var mappings []services.PortalCertMapping
 		if slugHostname != "" {
 			mappings = append(mappings, services.PortalCertMapping{
 				Hostname: normalizeHostname(slugHostname),
-				CertName: "namek-portal",
+				CertName: "*." + normalizeHostname(slugHostname),
 			})
 		}
 		if hasCustomHostname {
 			mappings = append(mappings, services.PortalCertMapping{
 				Hostname: normalizeHostname(customFQDN),
-				CertName: "namek-custom-portal",
+				CertName: "*." + normalizeHostname(customFQDN),
 			})
 		}
 		s.certProvider.SetPortalMappings("namek", mappings)
@@ -2498,7 +2486,6 @@ func (s *GinServer) applyNamekState() {
 	// Remove orphaned custom cert entries BEFORE requeueing, so
 	// RequeueOutstandingIssuances doesn't re-queue stale jobs.
 	if !hasCustomHostname && rm != nil {
-		rm.RemoveCertificateByID("namek-custom-portal")
 		rm.RemoveCertificateByID("namek-custom-wildcard")
 	}
 
@@ -2506,26 +2493,18 @@ func (s *GinServer) applyNamekState() {
 	if rm != nil && slugHostname != "" {
 		// Requeue persisted certs that may have been skipped before orchClient was registered
 		// (e.g., namek per-host certs or certs in error/pending from a prior boot).
-		// Must run BEFORE explicit enqueue to avoid double-queueing the portal/wildcard certs.
+		// Must run BEFORE explicit enqueue to avoid double-queueing the wildcard certs.
 		rm.RequeueOutstandingIssuances()
 
 		certDir := paths.CoreJoin("network-bootstrap", "remote", "certs")
-		// Slug certs (always present — canonical enrollment identity)
-		rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-			ID: "namek-portal", Source: "namek", Solver: "dns-01",
-			CertDir: certDir, CommonName: slugHostname, Domains: []string{slugHostname},
-		})
+		// Slug wildcard cert (covers both *.slug.example.com and slug.example.com)
 		slugWildcard := "*." + slugHostname
 		rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 			ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
 			CertDir: certDir, CommonName: slugWildcard, Domains: []string{slugWildcard, slugHostname},
 		})
-		// Custom hostname certs (additive, separate IDs to avoid overwriting slug certs)
+		// Custom hostname wildcard cert (separate ID to avoid overwriting slug cert)
 		if hasCustomHostname {
-			rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-				ID: "namek-custom-portal", Source: "namek", Solver: "dns-01",
-				CertDir: certDir, CommonName: customFQDN, Domains: []string{customFQDN},
-			})
 			customWildcard := "*." + customFQDN
 			rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 				ID: "namek-custom-wildcard", Source: "namek", Solver: "dns-01",

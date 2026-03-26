@@ -2272,21 +2272,12 @@ func buildSans(commonName string, domains []string) []string {
 }
 
 func outNameFor(id, cn string) string {
-	switch id {
-	case "wildcard", "namek-wildcard", "namek-custom-wildcard":
-		// For wildcards we want the actual CN as filename (e.g., *.example.com)
-		return cn
-	case "portal":
+	// Self-hosted portal uses a fixed filename so the old cert is served
+	// until reissuance completes after a hostname change.
+	if id == "portal" {
 		return "portal"
-	case "namek-portal":
-		// Fixed filename: after a hostname change, the old cert is served until reissuance
-		// completes. This is intentional — no TLS would be worse than a CN mismatch.
-		return "namek-portal"
-	case "namek-custom-portal":
-		return "namek-custom-portal"
-	default:
-		return cn
 	}
+	return cn
 }
 
 func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, now time.Time, source, solver, certDir string) {
