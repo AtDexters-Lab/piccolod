@@ -309,7 +309,7 @@ class ApiClient {
     return await post('/api/v1/users/invite', body: {
       'username': username,
       'email': email,
-      if (allowedApps != null) 'allowed_apps': allowedApps,
+      'allowed_apps': ?allowedApps,
     }) as Map<String, dynamic>;
   }
 
