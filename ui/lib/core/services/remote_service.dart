@@ -1,5 +1,5 @@
+import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
-import 'package:piccolo_os/core/models/service_endpoint.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 
 class RemoteService {
@@ -30,15 +30,6 @@ class RemoteService {
   Future<String> rotateCredentials() async {
     final response = await _api.post('/api/v1/remote/rotate') as Map<String, dynamic>;
     return (response['device_secret'] as String?) ?? '';
-  }
-
-  Future<List<RemotePreflightCheck>> runPreflight([Map<String, dynamic>? config]) async {
-    final response = await _api.post('/api/v1/remote/preflight', body: config) as Map<String, dynamic>;
-    final checks = (response['checks'] as List<dynamic>?) ?? <dynamic>[];
-    return checks
-        .whereType<Map<dynamic, dynamic>>()
-        .map((e) => RemotePreflightCheck.fromJson(Map<String, dynamic>.from(e)))
-        .toList();
   }
 
   Future<List<RemoteAlias>> getAliases() async {

@@ -2,9 +2,9 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/identity_models.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
-import 'package:piccolo_os/core/models/service_endpoint.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/event_stream_client.dart';
 import 'package:piccolo_os/core/services/identity_service.dart';
@@ -43,20 +43,13 @@ class RemoteController extends ChangeNotifier {
   List<RemoteCertificate> certificates = [];
   List<ServiceEndpoint> services = [];
 
-  // Setup Wizard State
-  int wizardStep = 0;
-  RemoteGuideInfo? guideInfo;
-  List<RemotePreflightCheck> preflightChecks = [];
-  bool isRunningPreflight = false;
-  bool isSubmittingConfig = false;
-
-  // Ephemeral configuration state for the wizard (not yet persisted to backend)
-  final Map<String, dynamic> _pendingConfig = {};
-
   // Computed properties
   bool get hasAnyRemoteActive => portals.any((p) => p.state == 'active');
-  bool get isNamekAvailable => identityStatus?.available ?? false;
   bool get isNamekEnrolled => identityStatus?.enrolled ?? false;
+  bool get isSelfHostedActive {
+    final st = status;
+    return st != null && st.enabled && st.portalHostname != null && st.portalHostname!.isNotEmpty;
+  }
 
   void _init() {
     unawaited(refresh());
@@ -113,8 +106,7 @@ class RemoteController extends ChangeNotifier {
     notifyListeners();
     await _pollStatus();
     if (!isLocked) {
-      await fetchServices();
-      await _fetchEvents();
+      await Future.wait([fetchServices(), _fetchEvents()]);
     }
     if (_disposed) return;
     isLoading = false;
@@ -202,13 +194,14 @@ class RemoteController extends ChangeNotifier {
       }
     }
 
-    // Self-hosted portal
+    // Self-hosted portal — preflight_required mapped to active for legacy configs.
     final st = status;
     if (st != null && st.enabled && st.portalHostname != null && st.portalHostname!.isNotEmpty) {
+      final portalState = st.state == 'preflight_required' ? 'active' : st.state;
       result.add(Portal(
         source: PortalSource.selfHosted,
         hostname: st.portalHostname!,
-        state: st.state,
+        state: portalState,
         endpoints: st.endpoint != null ? [st.endpoint!] : [],
       ));
     }
@@ -235,8 +228,10 @@ class RemoteController extends ChangeNotifier {
   Future<void> _fetchLists() async {
     if (_disposed) return;
     try {
-      aliases = await _remoteService.getAliases();
-      certificates = await _remoteService.getCertificates();
+      await Future.wait([
+        _remoteService.getAliases().then((v) => aliases = v),
+        _remoteService.getCertificates().then((v) => certificates = v),
+      ]);
     } on Object catch (e) {
       debugPrint('Failed to fetch lists: $e');
     }
@@ -260,108 +255,48 @@ class RemoteController extends ChangeNotifier {
     }
   }
 
-  // --- Setup Wizard ---
+  // --- Self-hosted ---
 
-  /// Seeds pending config from current status (used when resuming wizard)
-  void seedPendingConfigFromStatus() {
-    if (status == null) return;
-    if (status!.endpoint != null) _pendingConfig['endpoint'] = status!.endpoint;
-    if (status!.portalHostname != null) _pendingConfig['portal_hostname'] = status!.portalHostname;
-  }
+  /// Loads the Nexus relay setup guide info.
+  Future<RemoteGuideInfo> fetchGuideInfo() => _remoteService.getNexusGuide();
 
-  Future<void> loadNexusGuide() async {
-    try {
-      guideInfo = await _remoteService.getNexusGuide();
-      if (_disposed) return;
-      notifyListeners();
-    } on Object catch (e) {
-      if (_disposed) return;
-      error = 'Failed to load Nexus guide: $e';
-      notifyListeners();
-    }
-  }
-
-  Future<void> verifyNexusGuide(String endpoint, String portal, String secret) async {
+  /// Verifies and configures a self-hosted relay in one step.
+  /// Returns null on success, or an error message on failure.
+  Future<String?> connectSelfHosted(String endpoint, String portal, String secret) async {
     try {
       await _remoteService.verifyNexusGuide({
         'endpoint': endpoint,
         'portal_hostname': portal,
         'jwt_secret': secret,
       });
-      if (_disposed) return;
-
-      _pendingConfig['endpoint'] = endpoint;
-      _pendingConfig['portal_hostname'] = portal;
-      _pendingConfig['device_secret'] = secret;
-
-      wizardStep = 1;
-      notifyListeners();
     } on Object catch (e) {
-      if (_disposed) return;
-      error = 'Failed to verify guide: $e';
-      notifyListeners();
+      return 'Verification failed: $e';
     }
-  }
+    if (_disposed) return null;
 
-  Future<void> runPreflight() async {
-    isRunningPreflight = true;
-    notifyListeners();
     try {
-      Map<String, dynamic>? configPayload;
-      if (_pendingConfig.isNotEmpty && wizardStep > 0) {
-        configPayload = Map<String, dynamic>.from(_pendingConfig);
-      }
-
-      preflightChecks = await _remoteService.runPreflight(configPayload);
-      if (_disposed) return;
+      await _remoteService.configure({
+        'endpoint': endpoint,
+        'portal_hostname': portal,
+        'device_secret': secret,
+      });
     } on Object catch (e) {
-      if (_disposed) return;
-      error = 'Preflight failed: $e';
-    } finally {
-      if (!_disposed) {
-        isRunningPreflight = false;
-        notifyListeners();
-      }
+      return 'Configuration failed: $e';
     }
-  }
+    if (_disposed) return null;
 
-  Future<void> submitConfiguration() async {
-    isSubmittingConfig = true;
-    notifyListeners();
     try {
-      await _remoteService.configure(_pendingConfig);
-      if (_disposed) return;
-
-      _pendingConfig.clear();
-
       await refresh();
-      if (_disposed) return;
-      wizardStep = 0;
-    } on Object catch (e) {
-      if (_disposed) return;
-      error = 'Configuration failed: $e';
-    } finally {
-      if (!_disposed) {
-        isSubmittingConfig = false;
-        notifyListeners();
-      }
+    } on Object catch (_) {
+      // refresh() handles errors internally; swallow if it leaks.
     }
+    return null;
   }
-
-  /// Resets wizard state to avoid stale state on reopen.
-  void resetWizardState() {
-    wizardStep = 0;
-    _pendingConfig.clear();
-    preflightChecks = [];
-  }
-
-  // --- Self-hosted Management ---
 
   Future<void> disableRemote() async {
     try {
       await _remoteService.disable();
       if (_disposed) return;
-      wizardStep = 0;
       await refresh();
     } on Object catch (e) {
       if (_disposed) return;

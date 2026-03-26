@@ -37,6 +37,7 @@ class ApiClient {
     '/api/v1/auth/login-options',
     '/api/v1/auth/passkey/login/begin',
     '/api/v1/auth/passkey/login/finish',
+    '/api/v1/system/boot',
   };
 
   /// Helper to construct the full URI.
@@ -308,7 +309,7 @@ class ApiClient {
     return await post('/api/v1/users/invite', body: {
       'username': username,
       'email': email,
-      if (allowedApps != null) 'allowed_apps': allowedApps,
+      'allowed_apps': ?allowedApps,
     }) as Map<String, dynamic>;
   }
 

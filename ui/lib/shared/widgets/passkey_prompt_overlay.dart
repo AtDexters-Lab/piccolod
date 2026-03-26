@@ -119,7 +119,7 @@ class _PasskeyPromptOverlayState extends State<PasskeyPromptOverlay> {
                 if (_success) ...[
                   Row(
                     children: [
-                      Icon(PiccoloIcons.shieldCheck, color: PiccoloTheme.success, size: 18),
+                      const Icon(PiccoloIcons.shieldCheck, color: PiccoloTheme.success, size: 18),
                       const SizedBox(width: 8),
                       Text('Passkey registered successfully!',
                           style: PiccoloTheme.textTheme.bodySmall?.copyWith(color: PiccoloTheme.success)),

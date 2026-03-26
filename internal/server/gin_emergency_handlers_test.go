@@ -12,6 +12,7 @@ func TestIsEmergencyAllowed(t *testing.T) {
 		{"/api/v1/health/ready", true},
 		{"/api/v1/health/detail", true},
 		{"/api/v1/system/emergency", true},
+		{"/api/v1/system/boot", true},
 		{"/api/v1/system/diagnostic-log", true},
 		{"/api/v1/system/admin/diagnostic-log", true},
 		{"/api/v1/system/ca.crt", true},

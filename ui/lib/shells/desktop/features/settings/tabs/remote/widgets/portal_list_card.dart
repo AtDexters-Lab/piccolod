@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_controller.dart';
-import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/remote_setup_wizard.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/widgets/self_hosted_setup_dialog.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -61,7 +61,7 @@ class PortalListCard extends StatelessWidget {
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: Spacing.lg),
-          if (controller.isNamekAvailable && !controller.isNamekEnrolled) ...[
+          if ((controller.identityStatus?.available ?? false) && !controller.isNamekEnrolled) ...[
             FilledButton.icon(
               onPressed: controller.enrollNamek,
               icon: const Icon(PiccoloIcons.cloud),
@@ -70,7 +70,7 @@ class PortalListCard extends StatelessWidget {
             const SizedBox(height: Spacing.base),
           ],
           TextButton.icon(
-            onPressed: () => RemoteSetupWizard.show(context, controller),
+            onPressed: () => SelfHostedSetupDialog.show(context, controller),
             icon: const Icon(PiccoloIcons.router, size: 16),
             label: const Text('Advanced: Set up your own relay'),
           ),

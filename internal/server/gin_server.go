@@ -967,38 +967,22 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 				// Check slug hostname
 				if slugHost != "" && (h == slugHost || strings.HasSuffix(h, "."+slugHost)) {
-					if h == slugHost {
-						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-							ID: "namek-portal", Source: "namek", Solver: "dns-01",
-							CertDir: certDir, CommonName: slugHost, Domains: []string{slugHost},
-							Force: true,
-						})
-					} else {
-						wildcard := "*." + slugHost
-						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-							ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
-							CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, slugHost},
-							Force: true,
-						})
-					}
+					wildcard := "*." + slugHost
+					rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+						ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
+						CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, slugHost},
+						Force: true,
+					})
 					return
 				}
 				// Check custom hostname
 				if customHost != "" && customHost != slugHost && (h == customHost || strings.HasSuffix(h, "."+customHost)) {
-					if h == customHost {
-						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-							ID: "namek-custom-portal", Source: "namek", Solver: "dns-01",
-							CertDir: certDir, CommonName: customHost, Domains: []string{customHost},
-							Force: true,
-						})
-					} else {
-						wildcard := "*." + customHost
-						rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-							ID: "namek-custom-wildcard", Source: "namek", Solver: "dns-01",
-							CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, customHost},
-							Force: true,
-						})
-					}
+					wildcard := "*." + customHost
+					rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
+						ID: "namek-custom-wildcard", Source: "namek", Solver: "dns-01",
+						CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, customHost},
+						Force: true,
+					})
 					return
 				}
 			}
@@ -1133,6 +1117,46 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if identityReadyCh == nil && identityChangedCh == nil {
 				return
 			}
+
+			// Drain + debounce: coalesce rapid identity events into a single
+			// applyNamekState call. Multiple events often arrive in quick
+			// succession (enrollment + endpoint sync, hostname + cache update).
+			// Processing each individually would restart the adapter redundantly
+			// and burst Namek nonce requests past the 2 req/IP/s rate limit.
+			const identityEventDebounce = 200 * time.Millisecond
+			debounce := time.NewTimer(identityEventDebounce)
+		drainLoop:
+			for {
+				select {
+				case _, ok := <-identityReadyCh:
+					if !ok {
+						identityReadyCh = nil
+						continue // shutdown signal, don't extend debounce
+					}
+					if !debounce.Stop() {
+						<-debounce.C
+					}
+					debounce.Reset(identityEventDebounce)
+				case _, ok := <-identityChangedCh:
+					if !ok {
+						identityChangedCh = nil
+						continue // shutdown signal, don't extend debounce
+					}
+					if !debounce.Stop() {
+						<-debounce.C
+					}
+					debounce.Reset(identityEventDebounce)
+				case <-debounce.C:
+					break drainLoop
+				}
+			}
+			debounce.Stop()
+
+			// Both channels may have closed during drain.
+			if identityReadyCh == nil && identityChangedCh == nil {
+				return
+			}
+
 			s.applyNamekState()
 			// Log identity state change to remote activity log (only on actual transitions)
 			if s.remoteManager != nil && s.identityService != nil {
@@ -1555,8 +1579,12 @@ func (s *GinServer) setupGinRoutes() {
 	// API v1 group
 	v1 := r.Group("/api/v1")
 	{
-		// Serve embedded OpenAPI document for tooling/debug (no auth)
-		v1.GET("/openapi.yaml", func(c *gin.Context) {
+		// --- LAN-only public endpoints (no auth, blocked over remote tunnel) ---
+		lanPublic := v1.Group("/")
+		lanPublic.Use(s.allowLANOnly())
+
+		// OpenAPI spec — dev tooling, no reason to expose over internet.
+		lanPublic.GET("/openapi.yaml", func(c *gin.Context) {
 			if b, err := loadOpenAPISpec(); err == nil {
 				c.Data(http.StatusOK, "application/yaml; charset=utf-8", b)
 			} else {
@@ -1564,74 +1592,74 @@ func (s *GinServer) setupGinRoutes() {
 			}
 		})
 
-		// Auth & sessions (selected public endpoints)
+		// Onboarding — only relevant during initial LAN setup.
+		lanPublic.GET("/system/onboarding", s.handleOnboardingStatus)
+		lanPublic.POST("/system/onboarding", s.handleOnboardingChoice)
+		lanPublic.GET("/storage/disks", s.handleOnboardingDisks)
+		lanPublic.GET("/system/install-progress/stream", s.handleInstallProgressStream)
+		lanPublic.POST("/system/install-to-disk", s.handleInstallToDisk)
+		lanPublic.POST("/system/reboot", s.handleOnboardingReboot)
+
+		// Crypto setup/recovery — LAN-only; remote users unlock via /crypto/unlock.
+		lanPublic.POST("/crypto/setup", s.handleCryptoSetup)
+		lanPublic.POST("/crypto/reset-password", s.handleCryptoResetPassword)
+		lanPublic.GET("/crypto/recovery-key", s.handleCryptoRecoveryStatus)
+
+		// Emergency status — /system/boot already returns emergency info for remote callers.
+		lanPublic.GET("/system/emergency", s.handleEmergencyStatus)
+
+		// PCV import — device recovery, LAN-only.
+		lanPublic.POST("/system/pcv/import", s.handlePCVImport)
+
+		// Diagnostic log download (LAN-only, gated by error health state)
+		lanPublic.GET("/system/diagnostic-log", s.requireUnhealthy(), s.handleDiagnosticLog)
+
+		// --- Public endpoints (no auth, accessible from LAN and remote) ---
+
+		// Auth & sessions
 		v1.GET("/auth/session", s.handleAuthSession)
 		v1.GET("/auth/initialized", s.handleAuthInitialized)
 		v1.GET("/auth/validate-next", s.handleAuthValidateNext)
 		v1.POST("/auth/login", s.handleAuthLogin)
 		v1.GET("/auth/login-options", s.handleLoginOptions)
 
-		// Passkey login (public)
+		// Passkey login
 		v1.POST("/auth/passkey/login/begin", s.handlePasskeyLoginBegin)
 		v1.POST("/auth/passkey/login/finish", s.handlePasskeyLoginFinish)
 
-		// Invite (public)
+		// Invite
 		v1.GET("/auth/invite/:token", s.handleValidateInvite)
 		v1.POST("/auth/invite/:token/passkey/begin", s.handleInvitePasskeyBegin)
 		v1.POST("/auth/invite/:token/passkey/finish", s.handleInvitePasskeyFinish)
 
-		// Onboarding endpoints (public, no auth — needed pre-setup)
-		v1.GET("/system/onboarding", s.handleOnboardingStatus)
-		v1.POST("/system/onboarding", s.handleOnboardingChoice)
-		v1.GET("/storage/disks", s.handleOnboardingDisks)
-		v1.GET("/system/install-progress/stream", s.handleInstallProgressStream)
+		// Boot directive — single source of truth for UI routing.
+		v1.GET("/system/boot", s.handleBoot)
 
-		// Install to Disk and reboot (LAN-only + conditional auth in handlers)
-		lanInstall := v1.Group("/")
-		lanInstall.Use(s.allowLANOnly())
-		lanInstall.POST("/system/install-to-disk", s.handleInstallToDisk)
-		lanInstall.POST("/system/reboot", s.handleOnboardingReboot)
+		// Crypto status/unlock — must work remotely (reboot while away).
+		v1.GET("/crypto/status", s.handleCryptoStatus)
+		v1.POST("/crypto/unlock", s.handleCryptoUnlock)
 
-		// Selected read-only status endpoints remain public
-		v1.GET("/remote/status", s.handleRemoteStatus)
+		// Health probes
 		v1.GET("/health/live", s.handleHealthLive)
 		v1.GET("/health/ready", s.handleGinReadinessCheck)
-		v1.GET("/health/detail", s.handleHealthDetail)
 
-		// Storage emergency status (public)
-		v1.GET("/system/emergency", s.handleEmergencyStatus)
-
-		// Diagnostic log download (public, LAN-only, gated by error health state)
-		lanDiag := v1.Group("/")
-		lanDiag.Use(s.allowLANOnly())
-		lanDiag.Use(s.requireUnhealthy())
-		lanDiag.GET("/system/diagnostic-log", s.handleDiagnosticLog)
-
-		// PCV import (public — used during setup/recovery when no auth exists)
-		v1.POST("/system/pcv/import", s.handlePCVImport)
-
-		// Allow unlocking without a session to break the initial lock/setup cycle.
-		// Crypto: expose status/setup/unlock publicly to break circular dependency with sessions.
-		v1.GET("/crypto/status", s.handleCryptoStatus)
-		v1.POST("/crypto/setup", s.handleCryptoSetup)
-		v1.POST("/crypto/unlock", s.handleCryptoUnlock)
-		v1.POST("/crypto/reset-password", s.handleCryptoResetPassword)
-		v1.GET("/crypto/recovery-key", s.handleCryptoRecoveryStatus)
-
-		// Network discovery (public, LAN-only data)
+		// Network discovery (returns empty on remote — graceful degradation)
 		v1.GET("/network/peers", s.handleNetworkPeers)
 
-		// CA certificate download (public - needed before login for HTTPS setup)
+		// CA certificate download (needed before login for HTTPS setup)
 		v1.GET("/system/ca.crt", s.handleCADownload)
 
-		// Icon proxy (public, read-only - icons are public catalog metadata;
-		// unauthenticated so Image.network/SvgPicture.network work cross-origin in dev)
+		// Icon proxy (public catalog metadata)
 		v1.GET("/catalog/:name/icon", s.handleGinCatalogIcon)
 
-		// All other API endpoints require session + CSRF
+		// --- All other API endpoints require session + CSRF ---
 		authed := v1.Group("/")
 		authed.Use(s.requireSession())
 		authed.Use(s.csrfMiddleware())
+
+		// Remote status and health detail — no pre-login consumers.
+		authed.GET("/remote/status", s.handleRemoteStatus)
+		authed.GET("/health/detail", s.handleHealthDetail)
 
 		// Create Admin-only group
 		admin := authed.Group("/")
@@ -2474,18 +2502,22 @@ func (s *GinServer) applyNamekState() {
 	s.recomputeFrameAncestors()
 
 	// --- Cert provider portal mappings ---
+	// Portal mappings point bare hostnames to the wildcard cert (which includes
+	// the bare domain in its SANs). This is necessary because GetCertificate's
+	// wildcard fallback splits on the first dot — e.g., slug.example.com would
+	// try *.example.com, not *.slug.example.com.
 	if s.certProvider != nil {
 		var mappings []services.PortalCertMapping
 		if slugHostname != "" {
 			mappings = append(mappings, services.PortalCertMapping{
 				Hostname: normalizeHostname(slugHostname),
-				CertName: "namek-portal",
+				CertName: "*." + normalizeHostname(slugHostname),
 			})
 		}
 		if hasCustomHostname {
 			mappings = append(mappings, services.PortalCertMapping{
 				Hostname: normalizeHostname(customFQDN),
-				CertName: "namek-custom-portal",
+				CertName: "*." + normalizeHostname(customFQDN),
 			})
 		}
 		s.certProvider.SetPortalMappings("namek", mappings)
@@ -2495,7 +2527,6 @@ func (s *GinServer) applyNamekState() {
 	// Remove orphaned custom cert entries BEFORE requeueing, so
 	// RequeueOutstandingIssuances doesn't re-queue stale jobs.
 	if !hasCustomHostname && rm != nil {
-		rm.RemoveCertificateByID("namek-custom-portal")
 		rm.RemoveCertificateByID("namek-custom-wildcard")
 	}
 
@@ -2503,26 +2534,18 @@ func (s *GinServer) applyNamekState() {
 	if rm != nil && slugHostname != "" {
 		// Requeue persisted certs that may have been skipped before orchClient was registered
 		// (e.g., namek per-host certs or certs in error/pending from a prior boot).
-		// Must run BEFORE explicit enqueue to avoid double-queueing the portal/wildcard certs.
+		// Must run BEFORE explicit enqueue to avoid double-queueing the wildcard certs.
 		rm.RequeueOutstandingIssuances()
 
 		certDir := paths.CoreJoin("network-bootstrap", "remote", "certs")
-		// Slug certs (always present — canonical enrollment identity)
-		rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-			ID: "namek-portal", Source: "namek", Solver: "dns-01",
-			CertDir: certDir, CommonName: slugHostname, Domains: []string{slugHostname},
-		})
+		// Slug wildcard cert (covers both *.slug.example.com and slug.example.com)
 		slugWildcard := "*." + slugHostname
 		rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 			ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
 			CertDir: certDir, CommonName: slugWildcard, Domains: []string{slugWildcard, slugHostname},
 		})
-		// Custom hostname certs (additive, separate IDs to avoid overwriting slug certs)
+		// Custom hostname wildcard cert (separate ID to avoid overwriting slug cert)
 		if hasCustomHostname {
-			rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
-				ID: "namek-custom-portal", Source: "namek", Solver: "dns-01",
-				CertDir: certDir, CommonName: customFQDN, Domains: []string{customFQDN},
-			})
 			customWildcard := "*." + customFQDN
 			rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 				ID: "namek-custom-wildcard", Source: "namek", Solver: "dns-01",

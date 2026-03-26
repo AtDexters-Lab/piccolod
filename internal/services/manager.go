@@ -56,6 +56,9 @@ type ServiceManager struct {
 	appTransient    map[string]time.Time // app ID → time entered transient state
 	appTransientMu  sync.RWMutex
 	appStatusCancel func() // unsubscribe from app status events
+
+	// portClaimCache must be rebuilt via rebuildPortClaimCache() after every m.registry mutation.
+	portClaimCache []api.PortClaimInfo
 }
 
 // LockStateReader exposes the control lock state for services.
@@ -160,6 +163,14 @@ func (m *ServiceManager) closeFirewallClaim(ep ServiceEndpoint) {
 func (m *ServiceManager) ActivePortClaims() []api.PortClaimInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	out := make([]api.PortClaimInfo, len(m.portClaimCache))
+	copy(out, m.portClaimCache)
+	return out
+}
+
+// rebuildPortClaimCache rebuilds the cached port claims from the registry.
+// Caller must hold m.mu write lock.
+func (m *ServiceManager) rebuildPortClaimCache() {
 	var claims []api.PortClaimInfo
 	for _, mapp := range m.registry {
 		for _, ep := range mapp {
@@ -172,7 +183,7 @@ func (m *ServiceManager) ActivePortClaims() []api.PortClaimInfo {
 			}
 		}
 	}
-	return claims
+	m.portClaimCache = claims
 }
 
 // SetEventBus wires an event bus for publishing endpoint changes and starts the health aggregator.
@@ -462,6 +473,7 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 	if len(registry) > 0 {
 		m.registry[appName] = registry
 	}
+	m.rebuildPortClaimCache()
 	// App is back — clear any stashed deactivated state.
 	delete(m.deactivated, appName)
 
@@ -499,6 +511,7 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 				m.releaseEndpointPorts(ep)
 			}
 			delete(m.registry, appName)
+			m.rebuildPortClaimCache()
 			return nil, err
 		}
 		isPrimary := l.Name == primaryName
@@ -520,6 +533,8 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 		m.proxyManager.StartListener(ep)
 		m.notifyPublish(ep.PublicPort)
 	}
+
+	m.rebuildPortClaimCache()
 
 	// Publish endpoint changes (non-blocking)
 	m.publishEndpointsEvent(events.ServiceEndpointsChanged{
@@ -1171,6 +1186,7 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 
 	// Save
 	m.registry[appName] = newMap
+	m.rebuildPortClaimCache()
 
 	// Return endpoints slice
 	var eps []ServiceEndpoint
@@ -1274,6 +1290,7 @@ func (m *ServiceManager) removeAppEndpoints(appName string, permanent bool) {
 		}
 		delete(m.registry, appName)
 	}
+	m.rebuildPortClaimCache()
 	delete(m.containerIDs, appName)
 
 	m.appTransientMu.Lock()

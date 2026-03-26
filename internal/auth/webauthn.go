@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 
+	"piccolod/internal/cryptoutil"
 	"piccolod/internal/persistence"
 )
 
@@ -417,9 +417,5 @@ func (s *ceremonyStore) Consume(id string) (*ceremonySession, error) {
 }
 
 func generateSecureToken() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
+	return cryptoutil.GenerateSecureToken(32)
 }

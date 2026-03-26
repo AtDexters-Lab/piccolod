@@ -140,103 +140,79 @@ class SetupController extends ChangeNotifier {
       _state = SetupState.loading;
       notifyListeners();
 
-      // Check emergency status first — other endpoints may be degraded.
-      final emergency = await _api.get('/api/v1/system/emergency') as Map<String, dynamic>;
-      if (emergency['emergency'] == true) {
-        final level = emergency['level'] as String?;
-        if (level != 'soft') {
-          // Hard emergency: irrecoverable, show system error.
-          _error = emergency['error'] as String? ?? 'Storage emergency mode';
+      final boot = await _api.get('/api/v1/system/boot') as Map<String, dynamic>;
+      final screen = boot['screen'] as String?;
+
+      switch (screen) {
+        case 'emergency':
+          _error = boot['error'] as String? ?? 'Storage emergency mode';
           _state = SetupState.systemError;
-          return;
-        }
-        // Soft emergency: device was previously set up. Fall through to
-        // crypto/status check so the user can reach the unlock screen.
-      }
 
-      // Check onboarding status — USB boot may require onboarding choice.
-      final onboarding = await _api.get('/api/v1/system/onboarding') as Map<String, dynamic>;
-      _bootMode = onboarding['boot_mode'] as String?;
-      _bootOrderConfigured = onboarding['boot_order_configured'] == true;
-      if (onboarding['required'] == true) {
-        _state = SetupState.onboarding;
-        return;
-      }
-      // If install completed, show reboot prompt.
-      if (onboarding['state'] == 'install_disk' &&
-          onboarding['install_done'] == true) {
-        _state = SetupState.installComplete;
-        return;
-      }
-      // If install is in progress, reconnect to the progress stream.
-      if (onboarding['state'] == 'install_disk') {
-        final activeTaskId = onboarding['install_task_id'] as String?;
-        if (activeTaskId != null && activeTaskId.isNotEmpty) {
-          _installTaskId = activeTaskId;
-          _state = SetupState.installDisk;
-          return;
-        }
-        // Install failed or abandoned — no active task, not done.
-        if (_bootMode != 'internal') {
-          // USB boot: revert to onboarding so user can retry.
-          try {
-            await _api.post('/api/v1/system/onboarding', body: {'choice': 'pending'});
-            _state = SetupState.onboarding;
-            return;
-          } on Object catch (e) {
-            debugPrint('Revert to onboarding failed: $e');
-            _error = 'Installation failed. Please reboot to try again.';
-            _state = SetupState.error;
-            return;
-          }
-        }
-        // Internal boot: fall through to normal crypto/auth flow.
-      }
-
-      final status = await _api.get('/api/v1/crypto/status') as Map<String, dynamic>;
-      // Expect: {"initialized": bool, "locked": bool}
-
-      final initialized = status['initialized'] == true;
-      _isFirstSetupFlow = !initialized;
-
-      if (initialized) {
-        if (status['locked'] == true) {
-          _state = SetupState.unlock;
-        } else {
-          // Already unlocked. Check session.
-          final session = await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
-          if (session['authenticated'] == true) {
-            await _api.fetchCsrfToken();
-
-            // Bootstrap passkey required?
-            if (session['must_register_passkey'] == true) {
-              _state = SetupState.passkeyRequired;
+        case 'onboarding':
+          _bootMode = boot['boot_mode'] as String?;
+          _bootOrderConfigured = boot['boot_order_configured'] == true;
+          // If the boot endpoint detected an abandoned USB install, revert
+          // onboarding state so the user can retry.
+          if (boot['install_abandoned'] == true) {
+            try {
+              await _api.post('/api/v1/system/onboarding', body: {'choice': 'pending'});
+            } on Object catch (e) {
+              debugPrint('Revert to onboarding failed: $e');
+              _error = 'Installation failed. Please reboot to try again.';
+              _state = SetupState.error;
               return;
             }
+          }
+          _state = SetupState.onboarding;
 
-            // If there's an OIDC auth request, complete it immediately
-            if (_authRequestId != null) {
-              await _completeOidcAuthRequest();
-              return; // Don't update state - we're redirecting
-            }
+        case 'install_progress':
+          _installTaskId = boot['install_task_id'] as String?;
+          _state = SetupState.installDisk;
 
-            // Proxy-driven login flow: redirect back to the original target
-            if (_nextUrl != null && _nextUrl!.isNotEmpty) {
-              if (await _redirectToNextIfValid()) {
-                return;
-              }
-            }
+        case 'install_complete':
+          _bootOrderConfigured = boot['boot_order_configured'] == true;
+          _state = SetupState.installComplete;
 
-            _state = SetupState.complete;
-          } else if (_inviteToken != null) {
+        case 'setup':
+          _isFirstSetupFlow = true;
+          _state = SetupState.welcome;
+
+        case 'unlock':
+          _state = SetupState.unlock;
+
+        case 'login':
+          if (_inviteToken != null) {
             _state = SetupState.invite;
           } else {
             _state = SetupState.login;
           }
-        }
-      } else {
-        // Not initialized, start setup
-        _state = SetupState.welcome;
+
+        case 'passkey_required':
+          await _api.fetchCsrfToken();
+          _state = SetupState.passkeyRequired;
+
+        case 'desktop':
+          await _api.fetchCsrfToken();
+
+          // If there's an OIDC auth request, complete it immediately
+          if (_authRequestId != null) {
+            await _completeOidcAuthRequest();
+            return; // Don't update state - we're redirecting
+          }
+
+          // Proxy-driven login flow: redirect back to the original target
+          if (_nextUrl != null && _nextUrl!.isNotEmpty) {
+            if (await _redirectToNextIfValid()) {
+              return;
+            }
+          }
+
+          _state = SetupState.complete;
+
+        default:
+          debugPrint('Unknown boot screen: $screen');
+          _error = 'Unexpected server state';
+          _state = SetupState.error;
       }
     } on Object catch (e) {
       _error = e.toString();
@@ -656,7 +632,9 @@ class SetupController extends ChangeNotifier {
 
   Future<void> fetchLoginOptions() async {
     try {
-      final result = await _api.getLoginOptions();
+      final result = await _api
+          .getLoginOptions()
+          .timeout(const Duration(seconds: 3));
       _loginMethods = List<String>.from(result['methods'] as List);
       notifyListeners();
     } on Object catch (_) {

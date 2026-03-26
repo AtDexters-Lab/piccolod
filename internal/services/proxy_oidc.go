@@ -6,7 +6,6 @@ package services
 import (
 	"container/list"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"piccolod/internal/auth"
+	"piccolod/internal/cryptoutil"
 )
 
 const (
@@ -572,11 +572,7 @@ func ProxyClientID(appName string) string {
 
 // generateSecureToken generates a cryptographically secure random token.
 func generateSecureToken(length int) (string, error) {
-	b := make([]byte, length)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
+	return cryptoutil.GenerateSecureToken(length)
 }
 
 // computeCodeChallenge computes the PKCE code challenge using S256 method.

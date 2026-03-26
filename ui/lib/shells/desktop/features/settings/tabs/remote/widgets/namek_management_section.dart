@@ -30,11 +30,8 @@ class _NamekManagementSectionState extends State<NamekManagementSection> {
 
   @override
   Widget build(BuildContext context) {
-    if (!widget.controller.isNamekAvailable) {
-      return const SizedBox.shrink();
-    }
-
     final ids = widget.controller.identityStatus;
+    // Hide section entirely when identity service is unavailable (no TPM)
     if (ids == null) return const SizedBox.shrink();
 
     return Container(

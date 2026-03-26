@@ -38,6 +38,11 @@ import (
 	webassets "piccolod"
 )
 
+// testLANAddr is a private LAN address used in tests to simulate a request
+// arriving from the local network (as opposed to loopback, which signals the
+// Nexus remote tunnel).
+const testLANAddr = "192.168.1.100:54321"
+
 func requireMountBypassAllowed(t *testing.T) {
 	t.Helper()
 	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") != "1" {
@@ -1137,10 +1142,12 @@ func setupTestAdminSession(t *testing.T, server *GinServer) (*http.Cookie, strin
 	t.Helper()
 	const password = "TestPass123!"
 
-	// Use /crypto/setup which atomically sets up crypto, auth, and admin user
+	// Use /crypto/setup which atomically sets up crypto, auth, and admin user.
+	// Set a LAN RemoteAddr — crypto/setup is LAN-only.
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/crypto/setup", strings.NewReader(fmt.Sprintf(`{"password":"%s"}`, password)))
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = testLANAddr
 	server.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		// Allow already-initialized if tests re-use the helper on same server
@@ -1426,6 +1433,7 @@ func (m *GinMockContainerManager) InspectContainerState(ctx context.Context, run
 	return container.ContainerState{Exists: true, Running: c.Status == "running"}, nil
 }
 
+// NOTE: duplicated in internal/app/mock_container_test.go (cross-package).
 func (m *GinMockContainerManager) InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[string]int, error) {
 	_ = ctx
 	_ = runtime

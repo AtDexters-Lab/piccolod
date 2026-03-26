@@ -62,15 +62,8 @@ func (s *GinServer) handlePCVExport(c *gin.Context) {
 }
 
 // handlePCVImport: POST /api/v1/system/pcv/import
-// Imports a PCV archive for device recovery. LAN-only — rejected over Nexus tunnel.
+// Imports a PCV archive for device recovery. LAN-only (enforced by middleware).
 func (s *GinServer) handlePCVImport(c *gin.Context) {
-	// Reject requests arriving through the Nexus tunnel. The import endpoint
-	// is unauthenticated so it must be restricted to the local network.
-	if s.isRemoteSecureRequest(c.Request) {
-		writeGinError(c, http.StatusForbidden, "PCV import is not available over remote access")
-		return
-	}
-
 	if s.pcvImporter == nil {
 		writeGinError(c, http.StatusServiceUnavailable, "PCV importer not available")
 		return

@@ -363,6 +363,7 @@ func TestCryptoRecoveryStatusStale(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/api/v1/crypto/recovery-key", nil)
+	req.RemoteAddr = testLANAddr
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("recovery status: %d", w.Code)
@@ -380,10 +381,11 @@ func TestCryptoResetPasswordFlow(t *testing.T) {
 	srv := setupAuthTestServer(t)
 	ctx := context.Background()
 
-	// Setup crypto + auth via unified endpoint
+	// Setup crypto + auth via unified endpoint (LAN-only)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/api/v1/crypto/setup", strings.NewReader(`{"password":"OrigPass123!"}`))
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = testLANAddr
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("crypto setup: %d body=%s", w.Code, w.Body.String())
@@ -399,11 +401,12 @@ func TestCryptoResetPasswordFlow(t *testing.T) {
 	// Ensure locked before reset
 	srv.cryptoManager.Lock()
 
-	// Reset password with recovery key
+	// Reset password with recovery key (LAN-only)
 	body := fmt.Sprintf(`{"recovery_key":%q,"new_password":"NewPass456!"}`, recoveryKey)
 	w = httptest.NewRecorder()
 	req, _ = http.NewRequest("POST", "/api/v1/crypto/reset-password", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = testLANAddr
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("reset password: status=%d body=%s", w.Code, w.Body.String())

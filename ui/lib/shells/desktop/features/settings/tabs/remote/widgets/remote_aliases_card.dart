@@ -13,7 +13,7 @@ class RemoteAliasesCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final aliases = controller.aliases; // [P1] Fixed
+    final aliases = controller.aliases;
 
     return Card(
       child: Padding(
@@ -50,11 +50,28 @@ class RemoteAliasesCard extends StatelessWidget {
 
   Widget _buildAliasItem(BuildContext context, RemoteAlias alias) {
     final label = alias.listener == '__portal' ? 'Portal' : alias.listener;
+
+    Color statusColor;
+    switch (alias.status) {
+      case 'ok' || 'active':
+        statusColor = PiccoloTheme.success;
+      case 'pending':
+        statusColor = PiccoloTheme.warning;
+      default:
+        statusColor = PiccoloTheme.critical;
+    }
+
+    final showMessage = alias.status != 'ok' && alias.status != 'active' && alias.message != null;
+
     return ListTile(
       contentPadding: EdgeInsets.zero,
-      leading: const Icon(PiccoloIcons.link, color: PiccoloTheme.inkMuted),
+      leading: Container(
+        width: 10,
+        height: 10,
+        decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle),
+      ),
       title: Text(alias.hostname),
-      subtitle: Text('Points to: $label'),
+      subtitle: Text(showMessage ? alias.message! : 'Points to: $label'),
       trailing: IconButton(
         icon: const Icon(PiccoloIcons.delete, color: PiccoloTheme.critical),
         onPressed: () => controller.deleteAlias(alias.id),

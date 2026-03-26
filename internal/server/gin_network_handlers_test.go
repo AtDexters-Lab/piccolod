@@ -34,7 +34,7 @@ func TestHandleNetworkPeers_NoMdnsManager(t *testing.T) {
 	srv := setupNetworkTestServer(t, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/network/peers", nil)
-	req.RemoteAddr = "192.168.1.100:54321"
+	req.RemoteAddr = testLANAddr
 	w := httptest.NewRecorder()
 
 	srv.router.ServeHTTP(w, req)
@@ -127,7 +127,7 @@ func TestHandleNetworkPeers_LANAccessReturnsSelf(t *testing.T) {
 	srv := setupNetworkTestServer(t, mgr)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/network/peers", nil)
-	req.RemoteAddr = "192.168.1.100:54321" // LAN IP
+	req.RemoteAddr = testLANAddr
 	w := httptest.NewRecorder()
 
 	srv.router.ServeHTTP(w, req)
@@ -162,7 +162,7 @@ func TestHandleNetworkPeers_StaleThreshold(t *testing.T) {
 	srv := setupNetworkTestServer(t, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/network/peers", nil)
-	req.RemoteAddr = "192.168.1.100:54321"
+	req.RemoteAddr = testLANAddr
 	w := httptest.NewRecorder()
 
 	srv.router.ServeHTTP(w, req)

@@ -251,6 +251,11 @@ func TestSyncEndpointsOnce_SkipsWhenRecovering(t *testing.T) {
 }
 
 func TestStartStopEndpointSync(t *testing.T) {
+	// Shorten initial delay so the test doesn't wait 10 seconds.
+	old := endpointSyncInitialDelay
+	endpointSyncInitialDelay = 10 * time.Millisecond
+	t.Cleanup(func() { endpointSyncInitialDelay = old })
+
 	// Use a short interval via env var.
 	t.Setenv("PICCOLO_ENDPOINT_SYNC_INTERVAL", "50ms")
 
@@ -269,7 +274,7 @@ func TestStartStopEndpointSync(t *testing.T) {
 	// Idempotent: calling again should not panic.
 	svc.startEndpointSync()
 
-	// Let the loop run at least one tick.
+	// Let the loop run past the initial delay and at least one tick.
 	time.Sleep(100 * time.Millisecond)
 
 	// Stop should complete without panic or hang.

@@ -9,6 +9,7 @@ import 'package:piccolo_os/core/services/webauthn_service.dart';
 import 'package:piccolo_os/core/utils/downloader/downloader.dart';
 import 'package:piccolo_os/shared/widgets/ca_import_guide.dart';
 import 'package:piccolo_os/shared/widgets/diagnostic_log_download.dart';
+import 'package:piccolo_os/shared/widgets/login_form_fields.dart';
 import 'package:piccolo_os/shared/widgets/password_set_form.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/install_disk_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/onboarding_step.dart';
@@ -1107,7 +1108,6 @@ class _LoginStepState extends State<_LoginStep> {
   );
   final TextEditingController _passController = TextEditingController();
   bool _isSubmitting = false;
-  bool _obscureText = true;
   String? _error;
 
   @override
@@ -1161,8 +1161,7 @@ class _LoginStepState extends State<_LoginStep> {
   @override
   Widget build(BuildContext context) {
     final methods = widget.controller.loginMethods;
-    final showPasskey = (methods?.contains('passkey') ?? false) && WebAuthnService.isAvailable();
-    final showPassword = methods?.contains('password') ?? true;
+    final showPassword = LoginFormFields.isPasswordAvailable(methods);
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
@@ -1170,55 +1169,19 @@ class _LoginStepState extends State<_LoginStep> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (showPasskey) ...[
-            FilledButton.icon(
-              onPressed: _isSubmitting ? null : _loginWithPasskey,
-              icon: const Icon(PiccoloIcons.fingerprint),
-              label: const Text('Sign in with Passkey'),
-            ),
-            if (showPassword) ...[
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  const Expanded(child: Divider()),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: Text('or', style: PiccoloTheme.textTheme.bodySmall?.copyWith(color: PiccoloTheme.inkMuted)),
-                  ),
-                  const Expanded(child: Divider()),
-                ],
-              ),
-              const SizedBox(height: 16),
-            ],
-          ],
+          LoginFormFields(
+            methods: methods,
+            usernameController: _userController,
+            passwordController: _passController,
+            onSubmitPassword: _submit,
+            onSubmitPasskey: _loginWithPasskey,
+            isLoading: _isSubmitting,
+            error: _error,
+            unavailableMessage:
+                'Passkey sign-in is required but unavailable in this browser context. '
+                'Please access this device over HTTPS to sign in.',
+          ),
           if (showPassword) ...[
-            TextField(
-              controller: _userController,
-              autofillHints: const [AutofillHints.username],
-              decoration: const InputDecoration(
-                labelText: 'Username',
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _passController,
-              obscureText: _obscureText,
-              autofillHints: const [AutofillHints.password],
-              decoration: InputDecoration(
-                labelText: 'Password',
-                errorText: _error,
-                suffixIcon: IconButton(
-                  icon: Icon(
-                    _obscureText
-                        ? PiccoloIcons.visibilityOff
-                        : PiccoloIcons.visibility,
-                    color: PiccoloTheme.inkMuted,
-                  ),
-                  onPressed: () => setState(() => _obscureText = !_obscureText),
-                ),
-              ),
-              onSubmitted: (_) => _submit(),
-            ),
             const SizedBox(height: 24),
             Row(
               children: [
@@ -1241,14 +1204,6 @@ class _LoginStepState extends State<_LoginStep> {
                       : const Text('Log In'),
                 ),
               ],
-            ),
-          ] else if (_error != null) ...[
-            Text(_error!, style: const TextStyle(color: PiccoloTheme.critical)),
-          ] else if (!showPasskey && !showPassword) ...[
-            Text(
-              'Passkey sign-in is required but unavailable in this browser context. '
-              'Please access this device over HTTPS to sign in.',
-              style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
             ),
           ],
         ],
@@ -1733,17 +1688,18 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
   final NetworkService _networkService = NetworkService(ApiClient());
   List<DiscoveredPeer> _peers = [];
   bool _isLoading = false;
-  bool _hasLoaded = false;
-  String? _error;
   DateTime? _lastFetch;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_fetchPeers());
+  }
 
   Future<void> _fetchPeers() async {
     if (_isLoading) return;
 
-    setState(() {
-      _isLoading = true;
-      _error = null;
-    });
+    setState(() => _isLoading = true);
 
     try {
       final response = await _networkService.getPeers();
@@ -1751,18 +1707,11 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
         setState(() {
           _peers = response.peers;
           _isLoading = false;
-          _hasLoaded = true;
           _lastFetch = DateTime.now();
         });
       }
     } on Object catch (e) {
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-          _hasLoaded = true;
-          _error = 'Could not discover devices';
-        });
-      }
+      if (mounted) setState(() => _isLoading = false);
       debugPrint('Peer discovery error: $e');
     }
   }
@@ -1770,12 +1719,9 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
   void _onExpansionChanged(bool expanded) {
     if (!expanded) return;
 
-    // Fetch on first expand or if last fetch was > 30s ago
-    final shouldRefetch = !_hasLoaded ||
-        (_lastFetch != null &&
-            DateTime.now().difference(_lastFetch!).inSeconds > 30);
-
-    if (shouldRefetch) {
+    // Refresh if last fetch was > 30s ago.
+    if (_lastFetch != null &&
+        DateTime.now().difference(_lastFetch!).inSeconds > 30) {
       unawaited(_fetchPeers());
     }
   }
@@ -1789,6 +1735,11 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
 
   @override
   Widget build(BuildContext context) {
+    // Only show the panel when peers have been discovered. This is
+    // best-effort: if the initial fetch finds no peers (or fails),
+    // the panel stays hidden until the widget is remounted.
+    if (_peers.isEmpty) return const SizedBox.shrink();
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
       child: ExpansionTile(
@@ -1821,74 +1772,25 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
                 fontWeight: FontWeight.w500,
               ),
             ),
-            if (_hasLoaded && _peers.isNotEmpty) ...[
-              const SizedBox(width: 8),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(Radii.sm),
-                ),
-                child: Text(
-                  '${_peers.length}',
-                  style: const TextStyle(
-                    fontSize: 11,
-                    color: PiccoloTheme.cobalt600,
-                    fontWeight: FontWeight.w600,
-                  ),
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(Radii.sm),
+              ),
+              child: Text(
+                '${_peers.length}',
+                style: const TextStyle(
+                  fontSize: 11,
+                  color: PiccoloTheme.cobalt600,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
-            ],
+            ),
           ],
         ),
-        children: [
-          if (_isLoading)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: SizedBox(
-                width: 24,
-                height: 24,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: PiccoloTheme.cobalt600,
-                ),
-              ),
-            )
-          else if (_error != null)
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  Text(
-                    _error!,
-                    style: const TextStyle(
-                      fontSize: 13,
-                      color: PiccoloTheme.inkMuted,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  TextButton.icon(
-                    onPressed: _fetchPeers,
-                    icon: const Icon(PiccoloIcons.refresh, size: 16),
-                    label: const Text('Retry'),
-                  ),
-                ],
-              ),
-            )
-          else if (_peers.isEmpty)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: Text(
-                'No other devices found on this network',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: PiccoloTheme.inkMuted,
-                ),
-              ),
-            )
-          else
-            ..._peers.map(_buildPeerTile),
-        ],
+        children: _peers.map(_buildPeerTile).toList(),
       ),
     );
   }

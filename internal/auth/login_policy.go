@@ -24,28 +24,34 @@ func (c AccessContext) String() string {
 }
 
 // DetermineRPID derives the WebAuthn RP ID from the request hostname.
-// For .local hostnames (LAN), the RP ID is the full hostname.
-// For remote hostnames, the RP ID is the BaseDomain from identity service,
-// covering all subdomains (slug, custom) under one passkey registration.
-// If baseDomain is empty, falls back to the full hostname.
 //
-// Note: alias domains on different base domains are not served by passkey
-// auth — they use OIDC-delegated authentication to the primary remote domain.
+// For .local hostnames (LAN), the RP ID is the full hostname.
+//
+// For Namek hostnames under the identity base domain (e.g. slug.piccolospace.com
+// or custom-name.piccolospace.com), the RP ID is the base domain so all
+// subdomains share one passkey registration.
+//
+// For hosts on a different domain (e.g. a self-hosted Nexus portal like
+// mydevice.example.com), the base domain doesn't apply — the RP ID is the
+// request host itself, giving that domain its own independent passkey.
 func DetermineRPID(requestHost, baseDomain string) string {
 	host := requestHost
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	host = strings.ToLower(host)
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
 
 	// .local hostnames: use the full hostname as RP ID
 	if strings.HasSuffix(host, ".local") {
 		return host
 	}
 
-	// Remote hostnames: use the base domain if available
+	// Namek base domain: use it only when the host is actually under it.
 	if baseDomain != "" {
-		return strings.ToLower(baseDomain)
+		bd := strings.ToLower(baseDomain)
+		if host == bd || strings.HasSuffix(host, "."+bd) {
+			return bd
+		}
 	}
 
 	return host

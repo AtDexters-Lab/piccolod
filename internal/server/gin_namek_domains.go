@@ -9,6 +9,7 @@ import (
 
 	"github.com/AtDexters-Lab/namek-server/pkg/namekclient"
 
+	"piccolod/internal/hostname"
 	"piccolod/internal/identity"
 	"piccolod/internal/remote"
 )
@@ -23,7 +24,7 @@ type namekDomainState struct {
 
 // normalizeHostname lowercases and strips trailing dot.
 func normalizeHostname(h string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), ".")
+	return hostname.Normalize(h)
 }
 
 // namekDomainActive returns true if namek domain orchestration is available and ready.

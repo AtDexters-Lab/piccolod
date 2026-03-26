@@ -26,15 +26,52 @@ func TestDetermineRPID(t *testing.T) {
 		}
 	})
 
-	t.Run("remote_with_base_domain", func(t *testing.T) {
+	t.Run("namek_slug_under_base_domain", func(t *testing.T) {
 		got := DetermineRPID("slug.example.com", "example.com")
 		if got != "example.com" {
 			t.Fatalf("expected example.com, got %s", got)
 		}
 	})
 
-	t.Run("remote_base_domain_case_insensitive", func(t *testing.T) {
+	t.Run("namek_custom_name_under_base_domain", func(t *testing.T) {
+		got := DetermineRPID("my-device.example.com", "example.com")
+		if got != "example.com" {
+			t.Fatalf("expected example.com, got %s", got)
+		}
+	})
+
+	t.Run("namek_base_domain_case_insensitive", func(t *testing.T) {
 		got := DetermineRPID("slug.Example.COM", "Example.COM")
+		if got != "example.com" {
+			t.Fatalf("expected example.com, got %s", got)
+		}
+	})
+
+	t.Run("self_hosted_nexus_different_domain", func(t *testing.T) {
+		got := DetermineRPID("mydevice.otherdomain.com", "example.com")
+		if got != "mydevice.otherdomain.com" {
+			t.Fatalf("expected mydevice.otherdomain.com, got %s", got)
+		}
+	})
+
+	t.Run("suffix_confusion_not_a_subdomain", func(t *testing.T) {
+		// "notexample.com" is NOT a subdomain of "example.com" — the dot
+		// prefix in HasSuffix prevents this domain confusion.
+		got := DetermineRPID("notexample.com", "example.com")
+		if got != "notexample.com" {
+			t.Fatalf("expected notexample.com, got %s", got)
+		}
+	})
+
+	t.Run("trailing_dot_fqdn_under_base_domain", func(t *testing.T) {
+		got := DetermineRPID("slug.example.com.", "example.com")
+		if got != "example.com" {
+			t.Fatalf("expected example.com, got %s", got)
+		}
+	})
+
+	t.Run("exact_base_domain_match", func(t *testing.T) {
+		got := DetermineRPID("example.com", "example.com")
 		if got != "example.com" {
 			t.Fatalf("expected example.com, got %s", got)
 		}

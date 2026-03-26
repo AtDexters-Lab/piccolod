@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"piccolod/internal/remote/acme"
 	"piccolod/internal/remote/nexusclient"
 )
 
@@ -106,7 +107,7 @@ func TestRunPreflightSuccess(t *testing.T) {
 	}
 
 	st := m.Status()
-	if st.State != "active" && st.State != "warning" {
+	if st.State != string(RemoteStateActive) && st.State != string(RemoteStateWarning) {
 		t.Fatalf("unexpected state %s", st.State)
 	}
 	if st.PortalHostname != "portal.example.com" {
@@ -228,7 +229,7 @@ func TestRunPreflightFailures(t *testing.T) {
 
 	foundFail := false
 	for _, check := range result.Checks {
-		if check.Status == "fail" {
+		if check.Status == string(PreflightFail) {
 			foundFail = true
 		}
 	}
@@ -242,7 +243,7 @@ func waitForCertNotPending(t *testing.T, m *Manager, id string, timeout time.Dur
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		for _, c := range m.ListCertificates() {
-			if c.ID == id && !strings.EqualFold(c.Status, "pending") {
+			if c.ID == id && !strings.EqualFold(c.Status, string(CertStatusPending)) {
 				return
 			}
 		}
@@ -273,7 +274,7 @@ func TestConfigureManaged_DNS01SeedsWildcardWithApex(t *testing.T) {
 	if !st.Managed {
 		t.Fatalf("expected managed=true, got managed=%v", st.Managed)
 	}
-	if st.Solver != "dns-01" {
+	if st.Solver != acme.SolverDNS01 {
 		t.Fatalf("expected solver=dns-01, got solver=%s", st.Solver)
 	}
 
@@ -316,7 +317,7 @@ func TestConfigure_HTTP01NoWildcard(t *testing.T) {
 	if st.Managed {
 		t.Fatalf("expected managed=false, got managed=%v", st.Managed)
 	}
-	if st.Solver != "http-01" {
+	if st.Solver != acme.SolverHTTP01 {
 		t.Fatalf("expected solver=http-01, got solver=%s", st.Solver)
 	}
 
@@ -359,11 +360,11 @@ func TestCheckEndpoint_TLSError(t *testing.T) {
 	cfg := &Config{NexusConfig: NexusConfig{
 		Endpoint:       "wss://relay.example.com:8443/connect",
 		PortalHostname: "portal.example.com",
-		Solver:         "http-01",
+		Solver:         acme.SolverHTTP01,
 	}}
 
 	check := m.checkEndpoint(cfg)
-	if check.Status != "fail" {
+	if check.Status != string(PreflightFail) {
 		t.Fatalf("expected fail, got %s", check.Status)
 	}
 	if check.NextStep != "Verify the relay's TLS certificate matches the endpoint hostname" {
@@ -387,11 +388,11 @@ func TestCheckEndpoint_TypedTLSError(t *testing.T) {
 	cfg := &Config{NexusConfig: NexusConfig{
 		Endpoint:       "wss://relay.example.com:8443/connect",
 		PortalHostname: "portal.example.com",
-		Solver:         "http-01",
+		Solver:         acme.SolverHTTP01,
 	}}
 
 	check := m.checkEndpoint(cfg)
-	if check.Status != "fail" {
+	if check.Status != string(PreflightFail) {
 		t.Fatalf("expected fail, got %s", check.Status)
 	}
 	if check.NextStep != "Verify the relay's TLS certificate matches the endpoint hostname" {
@@ -412,11 +413,11 @@ func TestCheckEndpoint_NonTLSEndpoint(t *testing.T) {
 	cfg := &Config{NexusConfig: NexusConfig{
 		Endpoint:       "ws://relay.example.com:8080/connect",
 		PortalHostname: "portal.example.com",
-		Solver:         "http-01",
+		Solver:         acme.SolverHTTP01,
 	}}
 
 	check := m.checkEndpoint(cfg)
-	if check.Status != "pass" {
+	if check.Status != string(PreflightPass) {
 		t.Fatalf("expected pass for non-TLS endpoint, got %s: %s", check.Status, check.Detail)
 	}
 }
@@ -444,7 +445,7 @@ func TestConfigure_HTTP01DefersIssuance(t *testing.T) {
 	for _, c := range m.ListCertificates() {
 		if c.ID == "portal" {
 			found = true
-			if !strings.EqualFold(c.Status, "pending") {
+			if !strings.EqualFold(c.Status, string(CertStatusPending)) {
 				t.Fatalf("portal cert should be 'pending' immediately after Configure, got %q", c.Status)
 			}
 		}
@@ -467,7 +468,7 @@ func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 	cfg.Certificates = []Certificate{{
 		ID:       "portal",
 		Domains:  []string{"portal.example.com"},
-		Status:   "ok",
+		Status:   string(CertStatusOK),
 		Attempts: 2,
 	}}
 	if err := m.saveAll(cfg); err != nil {
@@ -482,7 +483,7 @@ func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 			portal = c
 		}
 	}
-	if portal.Status != "error" {
+	if portal.Status != string(CertStatusError) {
 		t.Fatalf("expected status error, got %s", portal.Status)
 	}
 	if portal.RetryAt == nil || !portal.RetryAt.After(now) {
@@ -507,7 +508,7 @@ func TestEnqueueIssuanceRespectsRetryAt(t *testing.T) {
 	cfg.Certificates = []Certificate{{
 		ID:           "host:app.portal.example.com",
 		Domains:      []string{"app.portal.example.com"},
-		Status:       "error",
+		Status:       string(CertStatusError),
 		FailureClass: FailureClassRateLimited,
 		FailureCode:  "cert_rate_limited",
 		RetryAt:      &retryAt,
@@ -522,7 +523,7 @@ func TestEnqueueIssuanceRespectsRetryAt(t *testing.T) {
 	// Cert should still be "error" — not reset to "pending".
 	for _, c := range m.ListCertificates() {
 		if c.ID == "host:app.portal.example.com" {
-			if c.Status != "error" {
+			if c.Status != string(CertStatusError) {
 				t.Fatalf("expected cert to stay in error state, got %q", c.Status)
 			}
 			if c.RetryAt == nil || !c.RetryAt.Equal(retryAt) {
@@ -573,7 +574,7 @@ func TestEnqueueIssuanceReissuesOnDomainChange(t *testing.T) {
 	cfg.Certificates = []Certificate{{
 		ID:          "portal",
 		Domains:     []string{"old.example.com"},
-		Status:      "ok",
+		Status:      string(CertStatusOK),
 		NextRenewal: &nextRenewal,
 		ExpiresAt:   &expires,
 	}}
@@ -586,7 +587,7 @@ func TestEnqueueIssuanceReissuesOnDomainChange(t *testing.T) {
 
 	for _, c := range m.ListCertificates() {
 		if c.ID == "portal" {
-			if c.Status != "pending" {
+			if c.Status != string(CertStatusPending) {
 				t.Fatalf("expected cert to be reset to pending, got %q", c.Status)
 			}
 			if len(c.Domains) != 1 || c.Domains[0] != "new.example.com" {
@@ -650,7 +651,7 @@ func TestEnqueueCertIssuance_SourceMetadataPersisted(t *testing.T) {
 	m.EnqueueCertIssuance(CertIssuanceRequest{
 		ID:         "host:app.namek.example.com",
 		Source:     "namek",
-		Solver:     "dns-01",
+		Solver:     acme.SolverDNS01,
 		CertDir:    "/tmp/certs",
 		Domains:    []string{"app.namek.example.com"},
 		CommonName: "app.namek.example.com",
@@ -663,7 +664,7 @@ func TestEnqueueCertIssuance_SourceMetadataPersisted(t *testing.T) {
 			if c.Source != "namek" {
 				t.Fatalf("expected source=namek, got %q", c.Source)
 			}
-			if c.Solver != "dns-01" {
+			if c.Solver != acme.SolverDNS01 {
 				t.Fatalf("expected solver=dns-01, got %q", c.Solver)
 			}
 			if c.CertDir != "/tmp/certs" {
@@ -760,10 +761,10 @@ func TestNeedsRelay(t *testing.T) {
 		solver string
 		want   bool
 	}{
-		{"http-01", true},
+		{acme.SolverHTTP01, true},
 		{"HTTP-01", true},
 		{"", true},          // conservative default
-		{"dns-01", false},
+		{acme.SolverDNS01, false},
 		{"DNS-01", false},
 	}
 	for _, tt := range tests {
@@ -794,7 +795,7 @@ func TestRelayGate_HTTP01DeferredWhenDisconnected(t *testing.T) {
 	// No relay connected — cert should stay pending (not issued)
 	time.Sleep(100 * time.Millisecond)
 	for _, c := range m.ListCertificates() {
-		if c.ID == "portal" && !strings.EqualFold(c.Status, "pending") {
+		if c.ID == "portal" && !strings.EqualFold(c.Status, string(CertStatusPending)) {
 			t.Fatalf("portal cert should remain 'pending' with no relay, got %q", c.Status)
 		}
 	}
@@ -807,7 +808,7 @@ func TestRelayGate_HTTP01DeferredWhenDisconnected(t *testing.T) {
 	for _, c := range m.ListCertificates() {
 		if c.ID == "portal" {
 			found = true
-			if !strings.EqualFold(c.Status, "ok") {
+			if !strings.EqualFold(c.Status, string(CertStatusOK)) {
 				t.Fatalf("portal cert should be 'ok' after relay connect, got %q", c.Status)
 			}
 		}
@@ -819,14 +820,14 @@ func TestRelayGate_HTTP01DeferredWhenDisconnected(t *testing.T) {
 
 func TestRelayGate_DNS01NotAffectedByRelayState(t *testing.T) {
 	// DNS-01 certs should not be gated by relay connectivity.
-	if needsRelay("dns-01") {
+	if needsRelay(acme.SolverDNS01) {
 		t.Fatal("dns-01 should not need relay")
 	}
 
 	m := &Manager{relayStates: make(map[string]relayState)}
 	// Even with no relays connected, dns-01 gate check should not block.
 	// The actual DNS-01 gating is via orchClient availability, not relay state.
-	if needsRelay("dns-01") && !m.httpChallengeReachable() {
+	if needsRelay(acme.SolverDNS01) && !m.httpChallengeReachable() {
 		t.Fatal("dns-01 should bypass relay gate")
 	}
 }
@@ -855,7 +856,7 @@ func TestRelayGate_DNS01ManagedNotBlockedByRelay(t *testing.T) {
 
 	for _, c := range m.ListCertificates() {
 		if c.ID == "portal" || c.ID == "wildcard" {
-			if strings.EqualFold(c.Status, "pending") {
+			if strings.EqualFold(c.Status, string(CertStatusPending)) {
 				t.Fatalf("DNS-01 cert %s should NOT be stuck in 'pending' without relay (solver=%s)", c.ID, c.Solver)
 			}
 		}
@@ -893,10 +894,10 @@ func TestRelayGate_BootSequence(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	for _, c := range m2.ListCertificates() {
 		if c.ID == "portal" {
-			if strings.EqualFold(c.Status, "error") {
+			if strings.EqualFold(c.Status, string(CertStatusError)) {
 				t.Fatalf("portal cert should NOT be in 'error' state after boot (relay gate should have deferred it), got error: %s", c.FailureReason)
 			}
-			if !strings.EqualFold(c.Status, "pending") {
+			if !strings.EqualFold(c.Status, string(CertStatusPending)) {
 				t.Fatalf("portal cert should be 'pending' after boot with no relay, got %q", c.Status)
 			}
 		}
@@ -908,7 +909,7 @@ func TestRelayGate_BootSequence(t *testing.T) {
 
 	for _, c := range m2.ListCertificates() {
 		if c.ID == "portal" {
-			if !strings.EqualFold(c.Status, "ok") {
+			if !strings.EqualFold(c.Status, string(CertStatusOK)) {
 				t.Fatalf("portal cert should be 'ok' after relay connect on reboot, got %q (reason: %s)", c.Status, c.FailureReason)
 			}
 		}
