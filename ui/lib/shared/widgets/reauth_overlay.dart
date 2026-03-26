@@ -42,7 +42,9 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
 
   Future<void> _fetchLoginOptions() async {
     try {
-      final result = await ApiClient().getLoginOptions();
+      final result = await ApiClient()
+          .getLoginOptions()
+          .timeout(const Duration(seconds: 3));
       if (mounted) {
         setState(() => _methods = List<String>.from(result['methods'] as List));
       }

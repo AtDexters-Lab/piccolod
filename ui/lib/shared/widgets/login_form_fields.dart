@@ -23,7 +23,7 @@ class LoginFormFields extends StatefulWidget {
   });
 
   /// Available login methods (e.g., `['passkey', 'password']`).
-  /// When null (not yet loaded), defaults to showing password fields.
+  /// When null (not yet loaded), a loading indicator is shown.
   /// An empty list means no methods are available.
   final List<String>? methods;
   final TextEditingController usernameController;
@@ -37,8 +37,9 @@ class LoginFormFields extends StatefulWidget {
   final String? unavailableMessage;
 
   /// Whether password login should be shown for the given [methods].
+  /// Returns false when [methods] is null (still loading).
   static bool isPasswordAvailable(List<String>? methods) =>
-      methods?.contains('password') ?? true;
+      methods?.contains('password') ?? false;
 
   /// Whether passkey login should be shown for the given [methods].
   static bool isPasskeyAvailable(List<String>? methods) =>
@@ -53,6 +54,20 @@ class _LoginFormFieldsState extends State<LoginFormFields> {
 
   @override
   Widget build(BuildContext context) {
+    // Methods not yet loaded — show a compact spinner.
+    if (widget.methods == null) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 24),
+        child: Center(
+          child: SizedBox(
+            width: 24,
+            height: 24,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+
     final showPasskey = LoginFormFields.isPasskeyAvailable(widget.methods);
     final showPassword = LoginFormFields.isPasswordAvailable(widget.methods);
 

@@ -1688,17 +1688,18 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
   final NetworkService _networkService = NetworkService(ApiClient());
   List<DiscoveredPeer> _peers = [];
   bool _isLoading = false;
-  bool _hasLoaded = false;
-  String? _error;
   DateTime? _lastFetch;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_fetchPeers());
+  }
 
   Future<void> _fetchPeers() async {
     if (_isLoading) return;
 
-    setState(() {
-      _isLoading = true;
-      _error = null;
-    });
+    setState(() => _isLoading = true);
 
     try {
       final response = await _networkService.getPeers();
@@ -1706,18 +1707,11 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
         setState(() {
           _peers = response.peers;
           _isLoading = false;
-          _hasLoaded = true;
           _lastFetch = DateTime.now();
         });
       }
     } on Object catch (e) {
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-          _hasLoaded = true;
-          _error = 'Could not discover devices';
-        });
-      }
+      if (mounted) setState(() => _isLoading = false);
       debugPrint('Peer discovery error: $e');
     }
   }
@@ -1725,12 +1719,9 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
   void _onExpansionChanged(bool expanded) {
     if (!expanded) return;
 
-    // Fetch on first expand or if last fetch was > 30s ago
-    final shouldRefetch = !_hasLoaded ||
-        (_lastFetch != null &&
-            DateTime.now().difference(_lastFetch!).inSeconds > 30);
-
-    if (shouldRefetch) {
+    // Refresh if last fetch was > 30s ago.
+    if (_lastFetch != null &&
+        DateTime.now().difference(_lastFetch!).inSeconds > 30) {
       unawaited(_fetchPeers());
     }
   }
@@ -1744,6 +1735,11 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
 
   @override
   Widget build(BuildContext context) {
+    // Only show the panel when peers have been discovered. This is
+    // best-effort: if the initial fetch finds no peers (or fails),
+    // the panel stays hidden until the widget is remounted.
+    if (_peers.isEmpty) return const SizedBox.shrink();
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
       child: ExpansionTile(
@@ -1776,74 +1772,25 @@ class _OtherDevicesPanelState extends State<_OtherDevicesPanel> {
                 fontWeight: FontWeight.w500,
               ),
             ),
-            if (_hasLoaded && _peers.isNotEmpty) ...[
-              const SizedBox(width: 8),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(Radii.sm),
-                ),
-                child: Text(
-                  '${_peers.length}',
-                  style: const TextStyle(
-                    fontSize: 11,
-                    color: PiccoloTheme.cobalt600,
-                    fontWeight: FontWeight.w600,
-                  ),
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(Radii.sm),
+              ),
+              child: Text(
+                '${_peers.length}',
+                style: const TextStyle(
+                  fontSize: 11,
+                  color: PiccoloTheme.cobalt600,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
-            ],
+            ),
           ],
         ),
-        children: [
-          if (_isLoading)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: SizedBox(
-                width: 24,
-                height: 24,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: PiccoloTheme.cobalt600,
-                ),
-              ),
-            )
-          else if (_error != null)
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  Text(
-                    _error!,
-                    style: const TextStyle(
-                      fontSize: 13,
-                      color: PiccoloTheme.inkMuted,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  TextButton.icon(
-                    onPressed: _fetchPeers,
-                    icon: const Icon(PiccoloIcons.refresh, size: 16),
-                    label: const Text('Retry'),
-                  ),
-                ],
-              ),
-            )
-          else if (_peers.isEmpty)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: Text(
-                'No other devices found on this network',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: PiccoloTheme.inkMuted,
-                ),
-              ),
-            )
-          else
-            ..._peers.map(_buildPeerTile),
-        ],
+        children: _peers.map(_buildPeerTile).toList(),
       ),
     );
   }

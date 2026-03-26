@@ -632,7 +632,9 @@ class SetupController extends ChangeNotifier {
 
   Future<void> fetchLoginOptions() async {
     try {
-      final result = await _api.getLoginOptions();
+      final result = await _api
+          .getLoginOptions()
+          .timeout(const Duration(seconds: 3));
       _loginMethods = List<String>.from(result['methods'] as List);
       notifyListeners();
     } on Object catch (_) {
