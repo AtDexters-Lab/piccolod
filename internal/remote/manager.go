@@ -2048,7 +2048,7 @@ func (m *Manager) enqueueIssuanceJob(job issuanceJob) {
 		if !domainsEqual(c.Domains, job.domains) {
 			break
 		}
-		// Already queued for issuance.
+		// Already queued or in-flight for issuance.
 		if strings.EqualFold(c.Status, string(CertStatusPending)) {
 			m.cfgMu.Unlock()
 			return
@@ -2103,7 +2103,10 @@ func (m *Manager) queueIssuanceJobToWorker(job issuanceJob) {
 	if m.issueQueued == nil {
 		m.issueQueued = make(map[string]struct{})
 	}
-	if _, ok := m.issueQueued[job.id]; ok && !job.force {
+	// Block if a job for this cert is already queued or in-flight.
+	// The force flag bypasses *inventory* guards (status/RetryAt checks
+	// in enqueueIssuanceJob), not in-flight duplicate prevention.
+	if _, ok := m.issueQueued[job.id]; ok {
 		m.issueMu.Unlock()
 		return
 	}
@@ -2131,10 +2134,17 @@ func (m *Manager) runIssuanceWorker(ctx context.Context) {
 				return
 			default:
 			}
-			m.issueMu.Lock()
-			delete(m.issueQueued, job.id)
-			m.issueMu.Unlock()
-			m.processIssuance(job)
+			// Invariant: single worker goroutine — no parallel calls.
+			// Defer keeps the in-flight marker set for the full duration
+			// and ensures cleanup even if processIssuance panics.
+			func() {
+				defer func() {
+					m.issueMu.Lock()
+					delete(m.issueQueued, job.id)
+					m.issueMu.Unlock()
+				}()
+				m.processIssuance(job)
+			}()
 		}
 	}
 }
@@ -2207,6 +2217,11 @@ func (m *Manager) processIssuance(job issuanceJob) {
 	now := m.now()
 	for i := range cfg.Certificates {
 		if cfg.Certificates[i].ID == job.id {
+			// Mark in-flight so the "pending" guard in enqueueIssuanceJob
+			// blocks event-driven re-enqueue while the ACME call runs.
+			// Without this, saveCerts → TopicRemoteConfigChanged → re-enqueue
+			// defeats backoff because RetryAt is nil and status is "error".
+			cfg.Certificates[i].Status = string(CertStatusPending)
 			cfg.Certificates[i].Attempts++
 			cfg.Certificates[i].LastAttempt = timePtr(now)
 			cfg.Certificates[i].RetryAt = nil
