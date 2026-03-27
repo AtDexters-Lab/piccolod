@@ -971,7 +971,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 					rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 						ID: "namek-wildcard", Source: "namek", Solver: "dns-01",
 						CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, slugHost},
-						Force: true,
+						Reissue: true,
 					})
 					return
 				}
@@ -981,7 +981,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 					rm.EnqueueCertIssuance(remote.CertIssuanceRequest{
 						ID: "namek-custom-wildcard", Source: "namek", Solver: "dns-01",
 						CertDir: certDir, CommonName: wildcard, Domains: []string{wildcard, customHost},
-						Force: true,
+						Reissue: true,
 					})
 					return
 				}

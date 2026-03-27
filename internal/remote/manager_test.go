@@ -54,6 +54,13 @@ func (s *stubResolver) LookupCNAME(ctx context.Context, host string) (string, er
 	return "", errors.New("cname not found")
 }
 
+// stubOrchClient is a no-op OrchestratorClient for tests that need a non-nil
+// orchClient registered in the manager's source registry.
+type stubOrchClient struct{}
+
+func (stubOrchClient) SetTXTRecord(_ context.Context, _, _ string) error { return nil }
+func (stubOrchClient) DeleteTXTRecord(_ context.Context, _ string) error { return nil }
+
 func fixedNow(t time.Time) func() time.Time {
 	return func() time.Time { return t }
 }
@@ -648,6 +655,9 @@ func TestEnqueueCertIssuance_SourceMetadataPersisted(t *testing.T) {
 	}
 	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(30, 0)))
 
+	// Register orchClient so the dns-01 gate in enqueueIssuanceJob passes.
+	m.RegisterOrchClient("namek", stubOrchClient{})
+
 	m.EnqueueCertIssuance(CertIssuanceRequest{
 		ID:         "host:app.namek.example.com",
 		Source:     "namek",
@@ -914,4 +924,124 @@ func TestRelayGate_BootSequence(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestSchedulerRetry_DNS01_ResolvesOrchClient verifies that the scheduler retry
+// path for dns-01 certs works even though the scheduler passes solver="dns-01"
+// explicitly (previously skipped orchClient resolution in enqueueIssuanceJob).
+func TestSchedulerRetry_DNS01_ResolvesOrchClient(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(30, 0)))
+	m.RegisterOrchClient("namek", stubOrchClient{})
+
+	// Simulate what the scheduler does: call enqueueIssuanceJob with solver
+	// pre-set (the scheduler reads it from persisted cert metadata).
+	m.enqueueIssuanceJob(issuanceJob{
+		id:         "namek-custom-wildcard",
+		domains:    []string{"*.custom.example.com", "custom.example.com"},
+		commonName: "*.custom.example.com",
+		source:     "namek",
+		solver:     acme.SolverDNS01,
+		certDir:    dir,
+	})
+
+	waitForCertNotPending(t, m, "namek-custom-wildcard", 2*time.Second)
+	for _, c := range m.ListCertificates() {
+		if c.ID == "namek-custom-wildcard" {
+			if strings.EqualFold(c.Status, string(CertStatusError)) &&
+				strings.Contains(c.FailureReason, "orchClient") {
+				t.Fatalf("scheduler retry should resolve orchClient from live registry, got error: %s", c.FailureReason)
+			}
+			return
+		}
+	}
+	t.Fatal("cert not found")
+}
+
+// TestQueueDedup_PreventsStampede verifies that multiple concurrent enqueue
+// calls for the same cert ID (even with reissue=true) produce only one
+// worker execution at a time.
+func TestQueueDedup_PreventsStampede(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(30, 0)))
+	m.RegisterOrchClient("namek", stubOrchClient{})
+
+	// Rapidly enqueue the same cert 10 times with reissue=true.
+	// Uses dns-01/namek to avoid the HTTP-01 relay gate.
+	for i := 0; i < 10; i++ {
+		m.enqueueIssuanceJob(issuanceJob{
+			id:         "stampede-test",
+			domains:    []string{"stampede.example.com"},
+			commonName: "stampede.example.com",
+			reissue:    true,
+			source:     "namek",
+			solver:     acme.SolverDNS01,
+			certDir:    dir,
+		})
+	}
+
+	waitForCertNotPending(t, m, "stampede-test", 2*time.Second)
+
+	// The cert should have been issued successfully (not stuck or errored from duplication).
+	for _, c := range m.ListCertificates() {
+		if c.ID == "stampede-test" {
+			if !strings.EqualFold(c.Status, string(CertStatusOK)) {
+				t.Fatalf("expected ok, got %q (reason: %s)", c.Status, c.FailureReason)
+			}
+			return
+		}
+	}
+	t.Fatal("cert not found")
+}
+
+// TestWorkerDefers_WhenOrchClientUnavailable verifies that the worker defers
+// without recording an error when the orchClient is not available for a dns-01
+// cert. The cert should remain in "pending" state (no backoff).
+func TestWorkerDefers_WhenOrchClientUnavailable(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(30, 0)))
+
+	// Register orchClient so enqueueIssuanceJob's gate passes...
+	m.RegisterOrchClient("namek", stubOrchClient{})
+
+	m.enqueueIssuanceJob(issuanceJob{
+		id:         "defer-test",
+		domains:    []string{"*.defer.example.com"},
+		commonName: "*.defer.example.com",
+		source:     "namek",
+		solver:     acme.SolverDNS01,
+		certDir:    dir,
+	})
+
+	// ...then immediately unregister so the worker finds nil at resolution time.
+	m.UnregisterOrchClient("namek")
+
+	// Give the worker time to process and defer.
+	time.Sleep(200 * time.Millisecond)
+
+	for _, c := range m.ListCertificates() {
+		if c.ID == "defer-test" {
+			// Should be pending (deferred) — NOT error with backoff.
+			if strings.EqualFold(c.Status, string(CertStatusError)) {
+				t.Fatalf("worker should defer without error when orchClient unavailable, got error: %s", c.FailureReason)
+			}
+			return
+		}
+	}
+	t.Fatal("cert not found")
 }

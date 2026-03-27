@@ -339,7 +339,7 @@ func (s *GinServer) forceRetryAliasCerts(hostname string) {
 		Domains:    []string{hostname},
 		CommonName: hostname,
 		Solver:     "http-01",
-		Force:      true,
+		Reissue:    true,
 	})
 
 	// Force-retry per-app certs

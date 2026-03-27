@@ -2,6 +2,7 @@ package remote
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,5 +33,37 @@ func TestFileCertProviderMissingHandlerCalled(t *testing.T) {
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatalf("expected missing handler to be called")
+	}
+}
+
+func TestMissingHandlerDebounce(t *testing.T) {
+	dir := t.TempDir()
+	p := NewFileCertProvider(dir)
+
+	var count atomic.Int32
+	p.SetMissingHandler(func(host string) {
+		count.Add(1)
+	})
+
+	// Call GetCertificate 20 times rapidly for the same host.
+	for i := 0; i < 20; i++ {
+		_, _ = p.GetCertificate("debounce.example.com")
+	}
+
+	// Give goroutines time to run.
+	time.Sleep(100 * time.Millisecond)
+
+	got := count.Load()
+	if got != 1 {
+		t.Fatalf("expected missing handler to fire exactly 1 time (debounced), got %d", got)
+	}
+
+	// Different host should fire independently.
+	_, _ = p.GetCertificate("other.example.com")
+	time.Sleep(50 * time.Millisecond)
+
+	got = count.Load()
+	if got != 2 {
+		t.Fatalf("expected 2 total fires (one per host), got %d", got)
 	}
 }
