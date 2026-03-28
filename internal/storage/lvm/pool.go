@@ -117,6 +117,60 @@ func (p *PoolManager) DeactivatePool(ctx context.Context) error {
 	return nil
 }
 
+// ExpandPool resizes the PV and thin pool to use any additional space on the
+// underlying device. This is needed when the data partition has been expanded
+// (e.g., image deployed to a larger disk, VM disk resize).
+//
+// Steps:
+//  1. Guard: skip if VG is degraded (missing PVs from --partial activation)
+//  2. pvresize <device> — PV picks up new partition size (idempotent no-op)
+//  3. lvextend thin pool to cfg.ExtentPct%VG — tolerates "matches existing
+//     size" for steady-state boots where pool is already at target
+//
+// All operations are online-safe and idempotent.
+func (p *PoolManager) ExpandPool(ctx context.Context, device string) error {
+	// Guard: skip expansion if VG is degraded. pvresize triggers VG metadata
+	// writes; doing this with missing PVs risks metadata inconsistency.
+	out, err := p.run.RunWithOutput(ctx, "vgs",
+		"--noheadings", "-o", "vg_missing_pv_count",
+		p.cfg.VGName,
+	)
+	if err != nil {
+		return fmt.Errorf("vgs missing PV check: %w", err)
+	}
+	missingCount, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return fmt.Errorf("parse vg_missing_pv_count %q: %w", strings.TrimSpace(string(out)), err)
+	}
+	if missingCount > 0 {
+		log.Printf("WARN: VG %s has %d missing PV(s) — skipping pool expansion", p.cfg.VGName, missingCount)
+		return nil
+	}
+
+	// Resize PV to use full partition. Idempotent: no-op if PV already matches.
+	if err := p.run.Run(ctx, "pvresize", device); err != nil {
+		return fmt.Errorf("pvresize %s: %w", device, err)
+	}
+
+	// Extend thin pool to configured percentage of VG. The pool was created at
+	// ExtentPct%VG and the VG only grows, so this target is always >= current.
+	// On steady-state boots the pool is already at 95%VG; lvextend reports
+	// "matches existing size" — treat that as a no-op, not an error.
+	extentArg := fmt.Sprintf("%d%%VG", p.cfg.ExtentPct)
+	poolPath := fmt.Sprintf("%s/%s", p.cfg.VGName, p.cfg.PoolName)
+	if out, err := p.run.RunWithOutput(ctx, "lvextend", "-l", extentArg, poolPath); err != nil {
+		errMsg := string(out) + err.Error()
+		if strings.Contains(errMsg, "matches existing size") || strings.Contains(errMsg, "not larger") {
+			log.Printf("LVM thin pool %s already at target size (%d%% VG)", poolPath, p.cfg.ExtentPct)
+			return nil
+		}
+		return fmt.Errorf("lvextend %s to %s: %w", poolPath, extentArg, err)
+	}
+
+	log.Printf("LVM thin pool expanded: %s", poolPath)
+	return nil
+}
+
 // PoolStatus returns the current thin pool utilization.
 func (p *PoolManager) PoolStatus(ctx context.Context) (PoolStats, error) {
 	// lvs --noheadings --nosuffix --units b -o data_percent,metadata_percent,lv_size

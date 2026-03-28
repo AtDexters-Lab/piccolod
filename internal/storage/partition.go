@@ -29,13 +29,14 @@ type PartitionLayout struct {
 // PartitionState captures the current state of the boot disk's partitions.
 // Used by diskprep.Preparer and storage.Manager.
 type PartitionState struct {
-	Disk              string // Parent disk (e.g., /dev/sda)
-	RootPartition     string // Root partition device (e.g., /dev/sda2)
-	RootSizeGB        int    // Current root partition size in GB
-	RootNeedsExpansion bool  // Root is smaller than the calculated target
-	DataPartition     string // Data partition device (empty if absent)
-	DataPartitionSlot int    // Partition slot (0 if absent)
-	UnallocatedGB     int    // Approximate unallocated space on disk
+	Disk               string // Parent disk (e.g., /dev/sda)
+	RootPartition      string // Root partition device (e.g., /dev/sda2)
+	RootSizeGB         int    // Current root partition size in GB
+	RootNeedsExpansion bool   // Root is smaller than the calculated target
+	DataPartition      string // Data partition device (empty if absent)
+	DataPartitionSlot  int    // Partition slot (0 if absent)
+	DataNeedsExpansion bool   // Data partition is the last partition and unallocated space follows it
+	UnallocatedGB      int    // Approximate unallocated space on disk
 }
 
 // calculatePartitionLayout computes the root/data split for a disk of the given size.

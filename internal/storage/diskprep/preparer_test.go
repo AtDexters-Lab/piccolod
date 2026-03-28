@@ -226,6 +226,100 @@ func TestExpandRootPartition_BadSlot(t *testing.T) {
 	}
 }
 
+func TestExpandDataPartition(t *testing.T) {
+	t.Run("calls_sgdisk_and_growpart", func(t *testing.T) {
+		var called []string
+		run := &recordingRunner{calls: &called}
+
+		p := NewPreparer(run)
+		err := p.ExpandDataPartition(context.Background(), "/dev/sda", "/dev/sda4")
+		if err != nil {
+			t.Fatalf("ExpandDataPartition: %v", err)
+		}
+
+		if len(called) != 2 {
+			t.Fatalf("expected 2 commands, got %d: %v", len(called), called)
+		}
+		if called[0] != "sgdisk -e /dev/sda" {
+			t.Errorf("first command = %q, want sgdisk -e", called[0])
+		}
+		if called[1] != "growpart /dev/sda 4" {
+			t.Errorf("second command = %q, want growpart", called[1])
+		}
+	})
+
+	t.Run("NOCHANGE_is_not_error", func(t *testing.T) {
+		run := &fakeRunner{
+			Errs: map[string]error{
+				buildKey("growpart", []string{"/dev/sda", "4"}): fmt.Errorf("exit status 1: NOCHANGE: partition 4 is size 20971520"),
+			},
+		}
+		p := NewPreparer(run)
+		err := p.ExpandDataPartition(context.Background(), "/dev/sda", "/dev/sda4")
+		if err != nil {
+			t.Fatalf("expected NOCHANGE to be treated as success, got: %v", err)
+		}
+	})
+
+	t.Run("NOCHANGE_in_stdout", func(t *testing.T) {
+		run := &fakeRunner{
+			Outputs: map[string]string{
+				buildKey("growpart", []string{"/dev/sda", "4"}): "NOCHANGE: partition 4 is size 20971520",
+			},
+			Errs: map[string]error{
+				buildKey("growpart", []string{"/dev/sda", "4"}): fmt.Errorf("exit status 1"),
+			},
+		}
+		p := NewPreparer(run)
+		err := p.ExpandDataPartition(context.Background(), "/dev/sda", "/dev/sda4")
+		if err != nil {
+			t.Fatalf("expected NOCHANGE in stdout to be treated as success, got: %v", err)
+		}
+	})
+
+	t.Run("growpart_failure", func(t *testing.T) {
+		run := &fakeRunner{
+			Errs: map[string]error{
+				buildKey("growpart", []string{"/dev/sda", "4"}): fmt.Errorf("disk I/O error"),
+			},
+		}
+		p := NewPreparer(run)
+		err := p.ExpandDataPartition(context.Background(), "/dev/sda", "/dev/sda4")
+		if err == nil {
+			t.Fatal("expected error from growpart failure")
+		}
+		if !strings.Contains(err.Error(), "growpart data partition") {
+			t.Errorf("error should mention growpart, got: %v", err)
+		}
+	})
+
+	t.Run("bad_slot", func(t *testing.T) {
+		p := NewPreparer(&fakeRunner{})
+		err := p.ExpandDataPartition(context.Background(), "/dev/sda", "/dev/sda")
+		if err == nil {
+			t.Fatal("expected error for device without partition number")
+		}
+	})
+
+	t.Run("nvme_device", func(t *testing.T) {
+		var called []string
+		run := &recordingRunner{calls: &called}
+
+		p := NewPreparer(run)
+		err := p.ExpandDataPartition(context.Background(), "/dev/nvme0n1", "/dev/nvme0n1p4")
+		if err != nil {
+			t.Fatalf("ExpandDataPartition: %v", err)
+		}
+
+		if len(called) != 2 {
+			t.Fatalf("expected 2 commands, got %d: %v", len(called), called)
+		}
+		if called[1] != "growpart /dev/nvme0n1 4" {
+			t.Errorf("growpart command = %q, want growpart /dev/nvme0n1 4", called[1])
+		}
+	})
+}
+
 // recordingRunner records Run calls for verifying command sequences.
 type recordingRunner struct {
 	calls         *[]string

@@ -398,6 +398,117 @@ func TestPoolManager_HealthMonitor_ThresholdEvent(t *testing.T) {
 	}
 }
 
+func TestPoolManager_ExpandPool(t *testing.T) {
+	missingPVKey := buildKey("vgs", []string{"--noheadings", "-o", "vg_missing_pv_count", "piccolo-data-vg"})
+	pvresizeKey := buildKey("pvresize", []string{"/dev/sda4"})
+	lvextendKey := buildKey("lvextend", []string{"-l", "95%VG", "piccolo-data-vg/thinpool"})
+
+	t.Run("success", func(t *testing.T) {
+		run := &fakeRunner{
+			Outputs: map[string]string{
+				missingPVKey: "  0\n",
+			},
+		}
+		mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+
+		if err := mgr.ExpandPool(context.Background(), "/dev/sda4"); err != nil {
+			t.Fatalf("ExpandPool: %v", err)
+		}
+
+		calls := run.GetCalls()
+		if len(calls) != 3 {
+			t.Fatalf("expected 3 commands, got %d: %v", len(calls), calls)
+		}
+		if calls[0] != missingPVKey {
+			t.Errorf("first call should be vgs missing PV check, got %q", calls[0])
+		}
+		if calls[1] != pvresizeKey {
+			t.Errorf("second call should be pvresize, got %q", calls[1])
+		}
+		if calls[2] != lvextendKey {
+			t.Errorf("third call should be lvextend, got %q", calls[2])
+		}
+	})
+
+	t.Run("already_at_target_size", func(t *testing.T) {
+		// Steady-state boot: pool already at 95%VG. lvextend reports
+		// "matches existing size" — should be treated as success.
+		run := &fakeRunner{
+			Outputs: map[string]string{
+				missingPVKey: "  0\n",
+				lvextendKey:  "New size matches existing size",
+			},
+			Errs: map[string]error{
+				lvextendKey: fmt.Errorf("exit status 5: New size matches existing size"),
+			},
+		}
+		mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+
+		if err := mgr.ExpandPool(context.Background(), "/dev/sda4"); err != nil {
+			t.Fatalf("expected 'matches existing size' to be treated as success, got: %v", err)
+		}
+	})
+
+	t.Run("degraded_VG_skips_expansion", func(t *testing.T) {
+		run := &fakeRunner{
+			Outputs: map[string]string{
+				missingPVKey: "  1\n", // 1 missing PV
+			},
+		}
+		mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+
+		if err := mgr.ExpandPool(context.Background(), "/dev/sda4"); err != nil {
+			t.Fatalf("ExpandPool should succeed (skip), got: %v", err)
+		}
+
+		// Only the missing PV check should be called.
+		calls := run.GetCalls()
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 command (VG check only), got %d: %v", len(calls), calls)
+		}
+	})
+
+	t.Run("pvresize_error", func(t *testing.T) {
+		run := &fakeRunner{
+			Outputs: map[string]string{
+				missingPVKey: "  0\n",
+			},
+			Errs: map[string]error{
+				pvresizeKey: fmt.Errorf("device busy"),
+			},
+		}
+		mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+
+		err := mgr.ExpandPool(context.Background(), "/dev/sda4")
+		if err == nil {
+			t.Fatal("expected error from pvresize failure")
+		}
+		if !strings.Contains(err.Error(), "pvresize") {
+			t.Errorf("error should mention pvresize, got: %v", err)
+		}
+	})
+
+	t.Run("lvextend_error", func(t *testing.T) {
+		run := &fakeRunner{
+			Outputs: map[string]string{
+				missingPVKey: "  0\n",
+			},
+			Errs: map[string]error{
+				lvextendKey: fmt.Errorf("insufficient extents"),
+			},
+		}
+		mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+
+		err := mgr.ExpandPool(context.Background(), "/dev/sda4")
+		if err == nil {
+			t.Fatal("expected error from lvextend failure")
+		}
+		if !strings.Contains(err.Error(), "lvextend") {
+			t.Errorf("error should mention lvextend, got: %v", err)
+		}
+	})
+}
+
 // --- LVManager tests ---
 
 func TestLVManager_CreateThinLV(t *testing.T) {
