@@ -903,6 +903,33 @@ func (m *luksVolumeManager) RootfsVolumeID(mode string, instanceID string) strin
 	}
 }
 
+// FindGoldenByImageRef scans the in-memory golden LV cache for a completed
+// entry matching imageRef. Linear scan — fine for the expected scale (10-30
+// golden LVs). When multiple entries match (mutable tag pulled at different
+// times), returns the most recently flattened one.
+func (m *luksVolumeManager) FindGoldenByImageRef(imageRef string) (digest string, goldenID string, found bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var bestTime time.Time
+	for digestShort, meta := range m.goldenLVs {
+		if meta.BaseImageRef != imageRef || meta.FlattenComplete == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, meta.FlattenComplete)
+		if err != nil {
+			continue
+		}
+		if !found || t.After(bestTime) {
+			bestTime = t
+			digest = meta.BaseImageDigest
+			goldenID = goldenLVPrefix + digestShort
+			found = true
+		}
+	}
+	return
+}
+
 // syncfsPath syncs all pending writes on the filesystem containing path.
 func syncfsPath(path string) error {
 	fd, err := syscall.Open(path, syscall.O_RDONLY, 0)

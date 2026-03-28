@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' show ClientException;
 import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
@@ -179,6 +180,8 @@ class AppService {
           .timeout(const Duration(seconds: 10));
     } on TimeoutException {
       debugPrint('updateApp: POST timed out (expected for image pulls)');
+    } on ClientException catch (e) {
+      debugPrint('updateApp: connection closed (expected): $e');
     }
   }
 
@@ -189,6 +192,8 @@ class AppService {
           .timeout(const Duration(seconds: 10));
     } on TimeoutException {
       debugPrint('rollbackApp: POST timed out (expected for slow container stops)');
+    } on ClientException catch (e) {
+      debugPrint('rollbackApp: connection closed (expected): $e');
     }
   }
 
@@ -305,6 +310,10 @@ class AppService {
     } on TimeoutException {
       // Expected for non-cached installs. Backend continues in background.
       debugPrint('initiateInstall: POST timed out (expected for long installs)');
+    } on ClientException catch (e) {
+      // Connection closed (relay reconnect, tunnel drop, etc.). Backend
+      // continues on its 30-min background context; progress tracked via WebSocket.
+      debugPrint('initiateInstall: connection closed (expected): $e');
     }
   }
 

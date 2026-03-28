@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"piccolod/internal/api"
@@ -129,7 +131,8 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 
 	// Block-native rootfs: prepare per-service rootfs from golden LV snapshots.
-	if m.currentRootfsManager() == nil {
+	rootfsMgr := m.currentRootfsManager()
+	if rootfsMgr == nil {
 		return nil, fmt.Errorf("rootfs volume manager not configured")
 	}
 	blockNativeRootfsMap := make(map[string]*rootfsMountInfo)
@@ -175,6 +178,33 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		}
 
 		if svc.Image != "" {
+			// Skip expensive image pull if a golden LV is already cached and fresh.
+			if cachedDigest, _, ok := rootfsMgr.FindGoldenByImageRef(svc.Image); ok {
+				useCache := true
+				// Freshness check: verify the tag still resolves to the same digest.
+				// If the registry is unreachable, fall back to the cached golden LV.
+				if remoteDigest, err := resolveRemoteDigest(ctx, svc.Image); err == nil {
+					if extractDigestHash(remoteDigest) != extractDigestHash(cachedDigest) {
+						log.Printf("INFO: image %s tag moved (cached=%s, remote=%s) -- pulling fresh", svc.Image, cachedDigest, remoteDigest)
+						useCache = false
+					}
+				} else {
+					log.Printf("INFO: registry check for %s failed (%v) -- using cached golden LV", svc.Image, err)
+				}
+				if useCache {
+					log.Printf("INFO: using cached golden LV for image %s (digest=%s) -- skipping pull", svc.Image, cachedDigest)
+					m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, progressRange.Max,
+						fmt.Sprintf("Using cached image %s", svc.Image), false, nil)
+					rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, cachedDigest, svc.Image, idmap, 0, "")
+					if err != nil {
+						return nil, fmt.Errorf("prepare rootfs for service '%s': %w", svcName, err)
+					}
+					blockNativeRootfsMap[svcName] = rInfo
+					serviceIdx++
+					continue
+				}
+			}
+
 			// Pull to ephemeral runtime for digest, then prepare rootfs.
 			// The same ephemeral runtime is reused by flattenFn inside EnsureGoldenLV,
 			// avoiding a redundant second pull of the same image.
@@ -407,4 +437,30 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		Definition:      appDef,
 		CatalogSource:   CatalogSourceFromContext(ctx),
 	}, nil
+}
+
+// resolveRemoteDigest queries the registry for the current digest of an image
+// reference without pulling layers. Uses skopeo inspect for a lightweight
+// manifest-only fetch. Returns the digest (e.g., "sha256:abc123...").
+func resolveRemoteDigest(ctx context.Context, imageRef string) (string, error) {
+	cmd := exec.CommandContext(ctx, "skopeo", "inspect", "--format", "{{.Digest}}", "docker://"+imageRef)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("skopeo inspect %s: %w", imageRef, err)
+	}
+	digest := strings.TrimSpace(string(out))
+	if digest == "" {
+		return "", fmt.Errorf("skopeo returned empty digest for %s", imageRef)
+	}
+	return digest, nil
+}
+
+// extractDigestHash extracts the "sha256:..." portion from a digest string.
+// Handles both bare digests ("sha256:abc...") and repo-qualified digests
+// ("docker.io/library/nginx@sha256:abc...").
+func extractDigestHash(digest string) string {
+	if i := strings.LastIndex(digest, "sha256:"); i >= 0 {
+		return digest[i:]
+	}
+	return digest
 }

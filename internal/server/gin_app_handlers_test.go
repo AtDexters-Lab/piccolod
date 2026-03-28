@@ -895,6 +895,9 @@ func (s *stubTestRootfsManager) RootfsVolumeID(mode, instanceID string) string {
 	return "rootfs-" + instanceID
 }
 func (s *stubTestRootfsManager) RootfsExists(_ string) bool { return true }
+func (s *stubTestRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool) {
+	return "", "", false
+}
 
 // createGinTestServer creates a Gin test server instance with filesystem state management
 func createGinTestServer(t *testing.T, tempDir string) *GinServer {

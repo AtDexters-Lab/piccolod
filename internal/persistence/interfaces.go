@@ -80,6 +80,13 @@ type RootfsVolumeManager interface {
 	// RootfsExists checks if rootfs volume metadata exists on disk for a given volume ID.
 	// Used to distinguish apps installed with block-native rootfs from legacy apps.
 	RootfsExists(volumeID string) bool
+	// FindGoldenByImageRef checks the in-memory golden LV cache for a completed
+	// golden LV matching the given image reference (e.g., "vaultwarden/server:latest").
+	// When multiple golden LVs match (mutable tag pulled at different times),
+	// returns the most recently created one. Returns the image digest and golden
+	// LV ID if found. Used to skip redundant image pulls when a golden LV already
+	// exists for the same image.
+	FindGoldenByImageRef(imageRef string) (digest string, goldenID string, found bool)
 }
 
 // GoldenLVRequest describes the image for a golden LV.

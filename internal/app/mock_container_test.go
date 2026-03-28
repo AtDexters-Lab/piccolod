@@ -378,6 +378,9 @@ func (s *stubRootfsManager) RootfsVolumeID(mode, instanceID string) string {
 }
 
 func (s *stubRootfsManager) RootfsExists(_ string) bool { return true }
+func (s *stubRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool) {
+	return "", "", false
+}
 
 func sanitize(s string) string {
 	if len(s) > 12 {

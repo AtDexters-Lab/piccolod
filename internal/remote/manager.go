@@ -1397,9 +1397,11 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 
 	if !snap.Enabled || snap.Endpoint == "" || snap.DeviceSecret == "" || snap.PortalHostname == "" {
 		m.stopAdapter()
+		// Reset lastAdapterKey so a subsequent enable always restarts the adapter.
 		// Only stop the renew scheduler if no external source has registered an orchClient.
 		// External sources (e.g., namek) share the same scheduler for cert renewals.
 		m.adapterMu.Lock()
+		m.lastAdapterKey = ""
 		hasExternalSources := len(m.orchClients) > 0
 		m.adapterMu.Unlock()
 		if !hasExternalSources {
@@ -1423,6 +1425,10 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 		// Adapter running with identical config — nothing to do.
 		m.startRenewScheduler()
 		return
+	}
+
+	if changed {
+		log.Printf("INFO: remote: restarting nexus adapter (config changed)")
 	}
 
 	if cancel != nil {
@@ -1497,7 +1503,6 @@ func (m *Manager) stopAdapter() {
 	cancel := m.adapterCancel
 	adapter := m.adapter
 	m.adapterCancel = nil
-	m.lastAdapterKey = "" // reset so next applyAdapterState always restarts
 	m.adapterMu.Unlock()
 
 	if cancel != nil {
