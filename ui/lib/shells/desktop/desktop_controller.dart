@@ -74,6 +74,9 @@ class DesktopController extends ChangeNotifier {
   bool _showReauth = false;
   bool get showReauth => _showReauth;
 
+  // Guards against concurrent boot checks when multiple 401s arrive rapidly.
+  bool _bootCheckInProgress = false;
+
   // Passkey registration prompt — shown when user has no passkey
   bool _showPasskeyPrompt = false;
   bool get showPasskeyPrompt => _showPasskeyPrompt;
@@ -135,9 +138,49 @@ class DesktopController extends ChangeNotifier {
   }
 
   void _onAuthRequired() {
-    if (_showReauth) return; // Already showing
-    _showReauth = true;
-    notifyListeners();
+    if (_showReauth || _needsSetup || _bootCheckInProgress) return;
+    unawaited(_handleAuthRequired());
+  }
+
+  /// Checks boot state to decide whether the device is locked (needs unlock
+  /// via SetupWizard) or just session-expired (needs ReauthOverlay).
+  Future<void> _handleAuthRequired() async {
+    _bootCheckInProgress = true;
+    try {
+      final boot = await ApiClient()
+          .get('/api/v1/system/boot')
+          .timeout(const Duration(seconds: 5)) as Map<String, dynamic>;
+      final screen = boot['screen'] as String?;
+      debugPrint('Auth required — boot screen: $screen');
+
+      switch (screen) {
+        case 'desktop':
+          // Transient 401 — session is actually valid. Retry pending calls.
+          ApiClient().completeReauth(success: true);
+          // Reconnect event stream in case the auth failure came from the
+          // WebSocket path (onAuthFailure). Without this, a transient
+          // WebSocket disconnect leaves live updates dead.
+          _eventStreamClient
+            ?..disconnect(clearError: true)
+            ..connect();
+
+        case 'login' || 'passkey_required':
+          // Device is unlocked, session expired. Show lightweight reauth overlay.
+          _showReauth = true;
+          notifyListeners();
+
+        default:
+          // Device is locked, in setup, emergency, or unknown state.
+          // Transition to SetupWizard which handles all pre-desktop states.
+          _transitionToSetupWizard();
+      }
+    } on Object catch (e) {
+      debugPrint('Boot check during reauth failed: $e');
+      // Backend may still be restarting. SetupWizard has error + retry UI.
+      _transitionToSetupWizard();
+    } finally {
+      _bootCheckInProgress = false;
+    }
   }
 
   void onReauthSuccess() {
@@ -293,28 +336,33 @@ class DesktopController extends ChangeNotifier {
     }
   }
 
+  /// Tears down desktop state and transitions to the SetupWizard.
+  /// Used by both logout (explicit user action) and lock detection
+  /// (backend restart with locked crypto volume).
+  /// Note: _lastKnownUsername is intentionally preserved — the user identity
+  /// persists across lock/unlock cycles. logout() clears it separately.
+  void _transitionToSetupWizard() {
+    _eventStreamClient?.disconnect();
+    _eventStreamClient?.dispose();
+    _eventStreamClient = null;
+
+    _showReauth = false;
+    ApiClient().onAuthRequired = null;
+    ApiClient().completeReauth(success: false);
+
+    _needsSetup = true;
+    _windows.clear();
+    notifyListeners();
+  }
+
   Future<void> logout() async {
     try {
       await ApiClient().post('/api/v1/auth/logout');
     } on Object catch (e) {
       debugPrint('Logout failed: $e');
     }
-
-    // Disconnect event stream
-    _eventStreamClient?.disconnect();
-    _eventStreamClient?.dispose();
-    _eventStreamClient = null;
-
-    // Deactivate reauth interceptor — setup wizard will own auth now.
-    _showReauth = false;
-    ApiClient().onAuthRequired = null;
-    ApiClient().completeReauth(success: false);
     _lastKnownUsername = null;
-
-    // Force UI back to SetupWizard (which will detect unauthenticated state and show Login)
-    _needsSetup = true;
-    _windows.clear(); // Clean up windows
-    notifyListeners();
+    _transitionToSetupWizard();
   }
 
   // Helper for Dock to know state

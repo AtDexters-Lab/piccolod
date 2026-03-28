@@ -10,10 +10,16 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"piccolod/internal/services"
 	"piccolod/internal/state/paths"
 )
+
+// missingFiredCap bounds the debounce map to prevent memory growth from
+// attacker-controlled SNI hostnames. ~1000 entries ≈ 80KB.
+const missingFiredCap int32 = 1000
 
 // FileCertProvider loads certificates from an on-disk store under the encrypted
 // control volume. It implements services.CertProvider.
@@ -22,6 +28,8 @@ type FileCertProvider struct {
 	mu           sync.RWMutex
 	cache        map[string]*tls.Certificate
 	missing      func(host string)
+	missingFired    sync.Map     // host → int64 (UnixNano of last fire) for debounce
+	missingFiredLen atomic.Int32 // approximate entry count for cap enforcement
 	fallbackDirs []string                       // additional cert directories (e.g., network-bootstrap)
 	portalMaps   map[string]map[string]string   // source → (hostname → certName) for multi-portal cert resolution
 }
@@ -83,7 +91,21 @@ func (p *FileCertProvider) GetCertificate(host string) (*tls.Certificate, error)
 	missing := p.missing
 	p.mu.RUnlock()
 	if missing != nil {
-		go missing(host)
+		const missingCooldown = 30 * time.Second
+		now := time.Now().UnixNano()
+		if last, ok := p.missingFired.Load(host); !ok || now-last.(int64) >= int64(missingCooldown) {
+			// Cap debounce map to prevent memory growth from attacker-controlled SNI.
+			// When full, skip debounce — downstream queue dedup handles duplicates.
+			if !ok && p.missingFiredLen.Load() >= missingFiredCap {
+				go missing(host)
+			} else {
+				if !ok {
+					p.missingFiredLen.Add(1)
+				}
+				p.missingFired.Store(host, now)
+				go missing(host)
+			}
+		}
 	}
 	return nil, services.ErrNoCert
 }
@@ -102,7 +124,7 @@ func (p *FileCertProvider) toCache(key string, cert *tls.Certificate) {
 }
 
 // SetMissingHandler registers a callback invoked when a cert is requested but not found.
-// The handler is called asynchronously.
+// The handler is called asynchronously with a per-host debounce cooldown.
 func (p *FileCertProvider) SetMissingHandler(fn func(host string)) {
 	p.mu.Lock()
 	p.missing = fn
