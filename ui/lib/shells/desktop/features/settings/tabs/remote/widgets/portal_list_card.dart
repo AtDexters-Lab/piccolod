@@ -94,8 +94,8 @@ class _PortalRowState extends State<_PortalRow> {
   @override
   Widget build(BuildContext context) {
     final portal = widget.portal;
-    final badgeLabel = portal.source == PortalSource.namek ? 'Managed' : 'Self-hosted';
-    final badgeColor = portal.source == PortalSource.namek ? PiccoloTheme.cobalt600 : PiccoloTheme.inkMuted;
+    final sourceIcon = portal.source == PortalSource.namek ? PiccoloIcons.cloud : PiccoloIcons.router;
+    final sourceTooltip = portal.source == PortalSource.namek ? 'Managed by Piccolo' : 'Self-hosted relay';
 
     Color stateColor;
     switch (portal.state) {
@@ -126,17 +126,9 @@ class _PortalRowState extends State<_PortalRow> {
                   ),
                 ),
                 const SizedBox(width: Spacing.sm),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: Spacing.sm, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: badgeColor.withValues(alpha: 0.1),
-                    borderRadius: BorderRadius.circular(Radii.xs),
-                    border: Border.all(color: badgeColor.withValues(alpha: 0.3)),
-                  ),
-                  child: Text(
-                    badgeLabel,
-                    style: TextStyle(fontSize: 11, color: badgeColor, fontWeight: FontWeight.w600),
-                  ),
+                Tooltip(
+                  message: sourceTooltip,
+                  child: Icon(sourceIcon, size: 16, color: PiccoloTheme.inkMuted),
                 ),
                 const SizedBox(width: Spacing.sm),
                 Expanded(
