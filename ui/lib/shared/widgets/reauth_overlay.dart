@@ -68,6 +68,14 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
       await ApiClient().fetchCsrfToken();
       ApiClient().completeReauth(success: true);
       widget.onSuccess();
+    } on ApiException catch (e) {
+      if (_handleLockedError(e)) return;
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _error = 'Passkey login failed';
+        });
+      }
     } on Object catch (e) {
       if (mounted) {
         setState(() {
@@ -81,6 +89,15 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
         });
       }
     }
+  }
+
+  /// Returns true (and cancels the overlay) if [e] is a 423 Locked error.
+  /// Storage is locked — reauth can't help; transition to SetupWizard.
+  bool _handleLockedError(ApiException e) {
+    if (e.statusCode != 423) return false;
+    ApiClient().completeReauth(success: false);
+    widget.onCancel();
+    return true;
   }
 
   @override
@@ -113,6 +130,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
       ApiClient().completeReauth(success: true);
       widget.onSuccess();
     } on ApiException catch (e) {
+      if (_handleLockedError(e)) return;
       setState(() {
         _isLoading = false;
         _error = e.statusCode == 401
