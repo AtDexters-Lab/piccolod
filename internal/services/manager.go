@@ -29,6 +29,7 @@ type ServiceManager struct {
 	containerIDs   map[string]string // app -> containerID (optional)
 	eventsMu       sync.Mutex
 	eventCancel    context.CancelFunc
+	eventSubCancels []func() // SubscribeWithCancel cleanup
 	eventBus       *events.Bus
 	statusMu       sync.RWMutex
 	leadership     map[string]cluster.Role
@@ -284,8 +285,11 @@ func (m *ServiceManager) ObserveRuntimeEvents(bus *events.Bus) {
 	m.eventCancel = cancel
 	m.eventsMu.Unlock()
 
-	leaders := bus.Subscribe(events.TopicLeadershipRoleChanged, 16)
-	locks := bus.Subscribe(events.TopicLockStateChanged, 8)
+	leaders, cancelLeaders := bus.SubscribeWithCancel(events.TopicLeadershipRoleChanged, 16)
+	locks, cancelLocks := bus.SubscribeWithCancel(events.TopicLockStateChanged, 8)
+	m.eventsMu.Lock()
+	m.eventSubCancels = []func(){cancelLeaders, cancelLocks}
+	m.eventsMu.Unlock()
 
 	m.wg.Add(1)
 	go func() {
@@ -346,6 +350,10 @@ func (m *ServiceManager) stopEventObservers() {
 		m.appStatusCancel()
 		m.appStatusCancel = nil
 	}
+	for _, cancel := range m.eventSubCancels {
+		cancel()
+	}
+	m.eventSubCancels = nil
 	m.eventsMu.Unlock()
 }
 

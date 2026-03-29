@@ -183,6 +183,9 @@ type GinServer struct {
 	namekDomainClient  *identity.NamekDomainClient           // domain management client
 	namekDomains       map[string]*namekDomainState           // alias hostname → namek state
 	namekReconcileStop context.CancelFunc                     // cancels in-flight reconciliation
+
+	// Event bus subscription cleanup (SubscribeWithCancel cancels)
+	busUnsubs []func()
 }
 
 type secureContextKey struct{}
@@ -1095,8 +1098,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	// Subscribe to identity events for namek adapter state changes.
 	// TopicIdentityReady fires on boot when an already-enrolled device starts;
 	// TopicIdentityChanged fires on enrollment, enable/disable, hostname change.
-	identityReadyCh := eventsBus.Subscribe(events.TopicIdentityReady, 8)
-	identityChangedCh := eventsBus.Subscribe(events.TopicIdentityChanged, 8)
+	identityReadyCh, cancelReady := eventsBus.SubscribeWithCancel(events.TopicIdentityReady, 8)
+	identityChangedCh, cancelChanged := eventsBus.SubscribeWithCancel(events.TopicIdentityChanged, 8)
+	s.busUnsubs = append(s.busUnsubs, cancelReady, cancelChanged)
 	go func() {
 		// Seed with current state to avoid spurious "activated" log on boot.
 		var lastLoggedState string
@@ -1340,9 +1344,17 @@ func (s *GinServer) runWatchdogLoop(ctx context.Context) {
 func (s *GinServer) Stop(ctx context.Context) error {
 	log.Printf("INFO: Beginning graceful shutdown...")
 
-	// Prevent identity event subscriber from racing with shutdown
+	// Prevent identity event subscriber from racing with shutdown.
+	// Must be set BEFORE unsubscribing — an in-flight handler that already
+	// dequeued an identity event checks this flag in applyNamekState.
 	s.namekStopped.Store(true)
 	s.stopNamekAdapter()
+
+	// Unsubscribe event bus observers
+	for _, cancel := range s.busUnsubs {
+		cancel()
+	}
+	s.busUnsubs = nil
 	if s.remoteManager != nil {
 		s.remoteManager.ClearRelayState("piccolo-namek")
 	}
@@ -2724,7 +2736,8 @@ func (s *GinServer) observeLockState(bus *events.Bus) {
 	if bus == nil || s.healthTracker == nil {
 		return
 	}
-	ch := bus.Subscribe(events.TopicLockStateChanged, 8)
+	ch, cancel := bus.SubscribeWithCancel(events.TopicLockStateChanged, 8)
+	s.busUnsubs = append(s.busUnsubs, cancel)
 	go func() {
 		for evt := range ch {
 			payload, ok := evt.Payload.(events.LockStateChanged)
@@ -2747,7 +2760,8 @@ func (s *GinServer) observeLeadership(bus *events.Bus) {
 	if bus == nil || s.healthTracker == nil {
 		return
 	}
-	ch := bus.Subscribe(events.TopicLeadershipRoleChanged, 8)
+	ch, cancel := bus.SubscribeWithCancel(events.TopicLeadershipRoleChanged, 8)
+	s.busUnsubs = append(s.busUnsubs, cancel)
 	go func() {
 		for evt := range ch {
 			payload, ok := evt.Payload.(events.LeadershipChanged)
@@ -2780,7 +2794,8 @@ func (s *GinServer) observeRemoteConfig(bus *events.Bus) {
 	if bus == nil {
 		return
 	}
-	ch := bus.Subscribe(events.TopicRemoteConfigChanged, 8)
+	ch, cancel := bus.SubscribeWithCancel(events.TopicRemoteConfigChanged, 8)
+	s.busUnsubs = append(s.busUnsubs, cancel)
 	go func() {
 		for evt := range ch {
 			status, ok := evt.Payload.(remote.Status)
@@ -2800,7 +2815,8 @@ func (s *GinServer) observeRemotePortClaims(bus *events.Bus) {
 	if bus == nil || s.remoteManager == nil {
 		return
 	}
-	ch := bus.Subscribe(events.TopicServiceEndpointsChanged, 16)
+	ch, cancel := bus.SubscribeWithCancel(events.TopicServiceEndpointsChanged, 16)
+	s.busUnsubs = append(s.busUnsubs, cancel)
 	go func() {
 		for range ch {
 			s.remoteManager.RefreshPortClaims()
@@ -2816,9 +2832,10 @@ func (s *GinServer) observeRemoteCertQueuing(bus *events.Bus) {
 	if bus == nil {
 		return
 	}
-	endpointsCh := bus.Subscribe(events.TopicServiceEndpointsChanged, 16)
-	remoteCfgCh := bus.Subscribe(events.TopicRemoteConfigChanged, 16)
-	identityCh := bus.Subscribe(events.TopicIdentityChanged, 16)
+	endpointsCh, cancelEndpoints := bus.SubscribeWithCancel(events.TopicServiceEndpointsChanged, 16)
+	remoteCfgCh, cancelRemoteCfg := bus.SubscribeWithCancel(events.TopicRemoteConfigChanged, 16)
+	identityCh, cancelIdentity := bus.SubscribeWithCancel(events.TopicIdentityChanged, 16)
+	s.busUnsubs = append(s.busUnsubs, cancelEndpoints, cancelRemoteCfg, cancelIdentity)
 
 	// Endpoints added: queue per-host certs for added endpoints only.
 	go func() {
@@ -2944,8 +2961,9 @@ func (s *GinServer) observeProxyOIDCClients(bus *events.Bus) {
 	if bus == nil {
 		return
 	}
-	appStatusCh := bus.Subscribe(events.TopicAppStatusChanged, 16)
-	endpointsCh := bus.Subscribe(events.TopicServiceEndpointsChanged, 16)
+	appStatusCh, cancelAppStatus := bus.SubscribeWithCancel(events.TopicAppStatusChanged, 16)
+	endpointsCh, cancelOIDCEndpoints := bus.SubscribeWithCancel(events.TopicServiceEndpointsChanged, 16)
+	s.busUnsubs = append(s.busUnsubs, cancelAppStatus, cancelOIDCEndpoints)
 
 	tryRegister := func(appName string) {
 		ctx := context.Background()

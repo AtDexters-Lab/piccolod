@@ -1,6 +1,7 @@
 package events
 
 import (
+	"log"
 	"sync"
 	"time"
 
@@ -217,9 +218,10 @@ type OnboardingStateChangedEvent struct {
 
 // Bus is a simple pub/sub dispatcher for intra-process events.
 type Bus struct {
-	mu     sync.RWMutex
-	subs   map[Topic][]chan Event
-	closed bool
+	mu       sync.RWMutex
+	subs     map[Topic][]chan Event
+	closed   bool
+	lastDrop sync.Map // Topic → time.Time; rate-limits drop warnings
 }
 
 // NewBus constructs an empty event bus.
@@ -292,11 +294,17 @@ func (b *Bus) Publish(evt Event) {
 	if b.closed {
 		return
 	}
-	for _, ch := range b.subs[evt.Topic] {
+	subs := b.subs[evt.Topic]
+	for i, ch := range subs {
 		select {
 		case ch <- evt:
 		default:
-			// Drop when subscriber is saturated; listeners should size buffers appropriately.
+			// Rate-limited drop warning: log at most once per 10s per topic.
+			now := time.Now()
+			if last, ok := b.lastDrop.Load(evt.Topic); !ok || now.Sub(last.(time.Time)) >= 10*time.Second {
+				b.lastDrop.Store(evt.Topic, now)
+				log.Printf("WARN: events: dropped %s event (subscriber %d/%d buffer full)", evt.Topic, i+1, len(subs))
+			}
 		}
 	}
 }

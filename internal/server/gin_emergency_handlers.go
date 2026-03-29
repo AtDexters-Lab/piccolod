@@ -128,11 +128,12 @@ func (s *GinServer) observeStorageEvents(bus *events.Bus) {
 		return
 	}
 
-	phase1Ch := bus.Subscribe(events.TopicStoragePhase1Complete, 4)
-	emergCh := bus.Subscribe(events.TopicStorageEmergency, 4)
-	initCh := bus.Subscribe(events.TopicStoragePoolInitialized, 4)
-	unlockCh := bus.Subscribe(events.TopicStoragePoolActivated, 4)
-	lockCh := bus.Subscribe(events.TopicStorageLocked, 4)
+	phase1Ch, cancelPhase1 := bus.SubscribeWithCancel(events.TopicStoragePhase1Complete, 4)
+	emergCh, cancelEmerg := bus.SubscribeWithCancel(events.TopicStorageEmergency, 4)
+	initCh, cancelInit := bus.SubscribeWithCancel(events.TopicStoragePoolInitialized, 4)
+	unlockCh, cancelUnlock := bus.SubscribeWithCancel(events.TopicStoragePoolActivated, 4)
+	lockCh, cancelLock := bus.SubscribeWithCancel(events.TopicStorageLocked, 4)
+	s.busUnsubs = append(s.busUnsubs, cancelPhase1, cancelEmerg, cancelInit, cancelUnlock, cancelLock)
 
 	go func() {
 		for evt := range phase1Ch {

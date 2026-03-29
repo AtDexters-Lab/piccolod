@@ -62,6 +62,7 @@ type Module struct {
 	commitMu           sync.Mutex
 	lastCommitRevision uint64
 	pollCancel         context.CancelFunc
+	leadershipCancel   func()
 	lockOpMu           sync.Mutex
 	lockStateMu        sync.RWMutex
 	lockState          bool
@@ -257,7 +258,8 @@ func (m *Module) observeLeadership() {
 	if m.events == nil {
 		return
 	}
-	ch := m.events.Subscribe(events.TopicLeadershipRoleChanged, 8)
+	ch, cancel := m.events.SubscribeWithCancel(events.TopicLeadershipRoleChanged, 8)
+	m.leadershipCancel = cancel
 	go func() {
 		for evt := range ch {
 			payload, ok := evt.Payload.(events.LeadershipChanged)
@@ -368,6 +370,12 @@ func (m *Module) Shutdown(ctx context.Context) error {
 		m.healthCancel = nil
 	}
 	m.healthMu.Unlock()
+	m.commitMu.Lock()
+	if m.leadershipCancel != nil {
+		m.leadershipCancel()
+		m.leadershipCancel = nil
+	}
+	m.commitMu.Unlock()
 	if m.control != nil {
 		_ = m.control.Close(ctx)
 	}
