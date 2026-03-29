@@ -481,11 +481,12 @@ func (m *Manager) ObserveServiceEndpoints(bus *events.Bus) {
 	m.endpointsMu.Unlock()
 
 	// Wire NameRegistry hostname changes to the event bus.
-	// The callback runs synchronously inside rebuildLocked() (under NameRegistry.mu)
-	// so it must not block. Bus.Publish uses non-blocking send with drop semantics.
+	// The callback runs synchronously inside rebuildLocked() (under NameRegistry.mu).
+	// Publish asynchronously to avoid lock inversion if any subscriber calls back
+	// into NameRegistry.
 	if m.names != nil {
 		m.names.SetOnChange(func() {
-			bus.Publish(events.Event{Topic: events.TopicHostnamesChanged})
+			go bus.Publish(events.Event{Topic: events.TopicHostnamesChanged})
 		})
 	}
 

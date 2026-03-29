@@ -39,6 +39,7 @@ type AppManager struct {
 	eventBus         *events.Bus
 	eventsMu         sync.Mutex
 	eventCancel      context.CancelFunc
+	eventSubCancels  []func()
 	eventsWG         sync.WaitGroup
 	reconcileMu      sync.Mutex
 	reconcileCancel  context.CancelFunc
@@ -507,8 +508,11 @@ func (m *AppManager) ObserveRuntimeEvents(bus *events.Bus) {
 	m.eventCancel = cancel
 	m.eventsMu.Unlock()
 
-	leaders := bus.Subscribe(events.TopicLeadershipRoleChanged, 16)
-	locks := bus.Subscribe(events.TopicLockStateChanged, 8)
+	leaders, cancelLeaders := bus.SubscribeWithCancel(events.TopicLeadershipRoleChanged, 16)
+	locks, cancelLocks := bus.SubscribeWithCancel(events.TopicLockStateChanged, 8)
+	m.eventsMu.Lock()
+	m.eventSubCancels = []func(){cancelLeaders, cancelLocks}
+	m.eventsMu.Unlock()
 	loopCtx := ctx
 
 	m.eventsWG.Add(1)
@@ -576,6 +580,10 @@ func (m *AppManager) StopRuntimeEvents() {
 		m.eventCancel()
 		m.eventCancel = nil
 	}
+	for _, cancel := range m.eventSubCancels {
+		cancel()
+	}
+	m.eventSubCancels = nil
 	m.eventsMu.Unlock()
 
 	// Wait with timeout to prevent indefinite blocking
