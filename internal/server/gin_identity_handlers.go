@@ -1,11 +1,14 @@
 package server
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 
+	"github.com/AtDexters-Lab/namek-server/pkg/namekclient"
 	"github.com/gin-gonic/gin"
 
 	"piccolod/internal/identity"
@@ -129,9 +132,22 @@ func (s *GinServer) validateAndSetHostname(c *gin.Context) (string, error) {
 // hostname error (400) rather than an internal server error (500).
 var hostnameClientErrorKeywords = []string{"validation", "invalid", "DNS label", "unavailable"}
 
-// respondHostnameError classifies a hostname error as 400 (client) or 500 (server)
-// and writes the appropriate JSON response.
+// respondHostnameError classifies a hostname error and writes the appropriate
+// JSON response. Prefers structured APIError unwrapping (from namekclient) to
+// get the upstream HTTP status; falls back to keyword matching for local errors.
 func respondHostnameError(c *gin.Context, err error) {
+	var apiErr *namekclient.APIError
+	if errors.As(err, &apiErr) {
+		status := http.StatusBadRequest
+		if apiErr.StatusCode >= 500 {
+			status = http.StatusInternalServerError
+		}
+		// apiErr.Message is the raw HTTP body (e.g., `{"error":"hostname already taken"}`).
+		// Extract the inner "error" field if it's JSON; fall back to raw string.
+		c.JSON(status, gin.H{"error": extractAPIErrorMessage(apiErr.Message)})
+		return
+	}
+	// Fallback: keyword matching for local validation errors.
 	errMsg := err.Error()
 	for _, kw := range hostnameClientErrorKeywords {
 		if strings.Contains(errMsg, kw) {
@@ -140,6 +156,18 @@ func respondHostnameError(c *gin.Context, err error) {
 		}
 	}
 	c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+}
+
+// extractAPIErrorMessage extracts the "error" field from a JSON error body.
+// Returns the raw string if it's not JSON or has no "error" field.
+func extractAPIErrorMessage(raw string) string {
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(raw), &parsed) == nil && parsed.Error != "" {
+		return parsed.Error
+	}
+	return raw
 }
 
 func (s *GinServer) handleIdentitySetHostname(c *gin.Context) {
@@ -216,5 +244,38 @@ func (s *GinServer) handleSetupHostname(c *gin.Context) {
 		"base_domain": cfg.BaseDomain,
 		"fqdn":        cfg.CustomFQDN(),
 		"setup_nonce": nonce,
+	})
+}
+
+// handleRemoteReadiness: GET /api/v1/identity/remote-readiness
+// Polled by the frontend after setup-hostname to wait for relay + cert
+// before redirecting to the remote domain.
+func (s *GinServer) handleRemoteReadiness(c *gin.Context) {
+	rm := s.remoteManager
+	if rm == nil {
+		c.JSON(http.StatusOK, gin.H{"ready": false, "relay": false, "cert": false})
+		return
+	}
+
+	// Check only the namek relay — self-hosted relays are irrelevant for
+	// initial setup of a namek hostname.
+	relayOK := rm.RelayConnectedByName("piccolo-namek")
+
+	// Only the custom wildcard cert matters — the redirect URL uses the
+	// custom FQDN, not the slug hostname.
+	certOK := false
+	for _, cert := range rm.ListCertificates() {
+		if cert.ID == "namek-custom-wildcard" &&
+			cert.Status == "ok" &&
+			cert.IssuedAt != nil {
+			certOK = true
+			break
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ready": relayOK && certOK,
+		"relay": relayOK,
+		"cert":  certOK,
 	})
 }

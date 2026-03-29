@@ -39,12 +39,14 @@ class ApiClient {
     '/api/v1/auth/passkey/login/finish',
     '/api/v1/system/boot',
     '/api/v1/identity/setup-hostname',
+    '/api/v1/identity/remote-readiness',
   };
 
   /// Pre-auth setup endpoints that skip automatic CSRF token fetch.
   static const _preAuthPaths = {
     '/api/v1/crypto/setup',
     '/api/v1/identity/setup-hostname',
+    '/api/v1/identity/remote-readiness',
   };
 
   static bool _isPreAuthPath(String path) => _preAuthPaths.contains(path);

@@ -34,6 +34,12 @@ class _SetupWizardState extends State<SetupWizard> {
   bool _didCallComplete = false;
 
   @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
       listenable: _controller,
@@ -65,6 +71,7 @@ class _SetupWizardState extends State<SetupWizard> {
                 _controller.isFirstSetupFlow &&
                 (state == SetupState.welcome ||
                     state == SetupState.remoteAddress ||
+                    state == SetupState.preparingRemote ||
                     state == SetupState.credentials ||
                     state == SetupState.finishing ||
                     state == SetupState.recovery ||
@@ -164,6 +171,7 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.welcome:
         return 'Welcome';
       case SetupState.remoteAddress:
+      case SetupState.preparingRemote:
         return 'Choose your address';
       case SetupState.credentials:
         return 'Create admin password';
@@ -213,6 +221,7 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.welcome:
         return 0;
       case SetupState.remoteAddress:
+      case SetupState.preparingRemote:
         return 1;
       case SetupState.credentials:
       case SetupState.finishing:
@@ -266,6 +275,12 @@ class _SetupWizardState extends State<SetupWizard> {
           onRefresh: _controller.refreshEnrollmentStatus,
           error: _controller.hostnameError,
           isSubmitting: _controller.settingHostname,
+        );
+      case SetupState.preparingRemote:
+        return _PreparingRemoteStep(
+          relayReady: _controller.relayReady,
+          certReady: _controller.certReady,
+          onSkip: _controller.skipRemoteWait,
         );
       case SetupState.credentials:
         return _CredentialsStep(
@@ -666,6 +681,65 @@ class _WelcomeStep extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _PreparingRemoteStep extends StatelessWidget {
+  const _PreparingRemoteStep({
+    required this.relayReady,
+    required this.certReady,
+    required this.onSkip,
+  });
+
+  final bool relayReady;
+  final bool certReady;
+  final VoidCallback onSkip;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 16, 32, 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 8),
+          const CircularProgressIndicator(color: PiccoloTheme.cobalt600),
+          const SizedBox(height: 24),
+          Text(
+            'Preparing your remote address\u2026',
+            style: PiccoloTheme.textTheme.titleMedium,
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 24),
+          _readinessRow('Connecting relay', relayReady),
+          const SizedBox(height: 8),
+          _readinessRow('Securing certificate', certReady),
+          const SizedBox(height: 24),
+          TextButton(
+            onPressed: onSkip,
+            child: const Text('Continue on local network'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _readinessRow(String label, bool done) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (done)
+          const Icon(Icons.check_circle, size: 18, color: PiccoloTheme.success)
+        else
+          const SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2, color: PiccoloTheme.cobalt600),
+          ),
+        const SizedBox(width: 8),
+        Text(label, style: PiccoloTheme.textTheme.bodyMedium),
+      ],
     );
   }
 }

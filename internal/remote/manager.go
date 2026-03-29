@@ -1620,6 +1620,15 @@ func (m *Manager) httpChallengeReachable() bool {
 	return true
 }
 
+// RelayConnectedByName reports whether the named relay adapter is connected.
+// Returns false if the adapter is not tracked.
+func (m *Manager) RelayConnectedByName(name string) bool {
+	m.relayMu.RLock()
+	defer m.relayMu.RUnlock()
+	s, ok := m.relayStates[name]
+	return ok && s.connected
+}
+
 // needsRelay returns true for solvers that require relay connectivity (HTTP-01).
 // DNS-01 uses the orchestrator API and does not need the relay.
 func needsRelay(solver string) bool {

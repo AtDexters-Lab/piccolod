@@ -153,10 +153,15 @@ func parseMappedAddress(data []byte) (string, error) {
 }
 
 // NormalizeIP canonicalizes an IP string for consistent comparison.
-// Handles IPv6-mapped-IPv4 (e.g., "::ffff:203.0.113.5" → "203.0.113.5")
-// and any other representation differences via net.ParseIP.
+// Strips port if present (e.g., "203.0.113.5:14812" → "203.0.113.5",
+// "[::1]:8080" → "::1"), handles IPv6-mapped-IPv4
+// (e.g., "::ffff:203.0.113.5" → "203.0.113.5"), and any other
+// representation differences via net.ParseIP.
 func NormalizeIP(s string) string {
 	s = strings.TrimSpace(s)
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
 	ip := net.ParseIP(s)
 	if ip == nil {
 		return s

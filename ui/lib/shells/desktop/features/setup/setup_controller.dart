@@ -13,6 +13,7 @@ enum SetupState {
   installComplete, // Reboot prompt after successful install
   welcome, // First run intro
   remoteAddress, // Choose your address (between welcome and credentials)
+  preparingRemote, // Waiting for relay + cert after hostname claim
   credentials, // Set password
   recovery, // Recovery key
   security, // CA download for HTTPS
@@ -36,6 +37,14 @@ class SetupController extends ChangeNotifier {
     _parseSetupNonceFromUrl();
     unawaited(_checkStatus());
   }
+
+  @override
+  void dispose() {
+    _pollCancelled = true;
+    _readinessTimer?.cancel();
+    super.dispose();
+  }
+
   SetupState _state = SetupState.loading;
   SetupState get state => _state;
 
@@ -96,6 +105,17 @@ class SetupController extends ChangeNotifier {
 
   String? _hostnameError;
   String? get hostnameError => _hostnameError;
+
+  // Remote readiness polling state (between hostname claim and redirect).
+  bool _relayReady = false;
+  bool get relayReady => _relayReady;
+  bool _certReady = false;
+  bool get certReady => _certReady;
+  bool _remoteFallback = false;
+  bool get remoteFallback => _remoteFallback;
+  String? _pendingFqdn;
+  String? _pendingNonce;
+  Timer? _readinessTimer;
 
   final ApiClient _api = ApiClient();
 
@@ -315,8 +335,8 @@ class SetupController extends ChangeNotifier {
     } on Object catch (_) {}
   }
 
-  /// Claim a custom hostname on namek and redirect to the remote domain
-  /// with the setup nonce for the rest of setup.
+  /// Claim a custom hostname on namek and start polling for remote readiness
+  /// before redirecting to the remote domain.
   Future<bool> submitHostname(String hostname) async {
     try {
       _settingHostname = true;
@@ -332,12 +352,15 @@ class SetupController extends ChangeNotifier {
       final baseDomain = result['base_domain'] as String?;
       final nonce = result['setup_nonce'] as String?;
 
-      // Redirect to the remote domain with the nonce.
       _settingHostname = false;
+      _pendingFqdn = fqdn ?? '$hostname.$baseDomain';
+      _pendingNonce = nonce;
+      _relayReady = false;
+      _certReady = false;
+      _state = SetupState.preparingRemote;
       notifyListeners();
-      final remoteHost = fqdn ?? '$hostname.$baseDomain';
-      final nonceParam = nonce != null ? '?setup_nonce=$nonce' : '';
-      web.window.location.href = 'https://$remoteHost/$nonceParam';
+
+      _startReadinessPolling();
       return true;
     } on ApiException catch (e) {
       _hostnameError = _extractServerError(e.message);
@@ -350,6 +373,79 @@ class SetupController extends ChangeNotifier {
       notifyListeners();
       return false;
     }
+  }
+
+  bool _pollCancelled = false;
+  final _readinessStopwatch = Stopwatch();
+
+  void _startReadinessPolling() {
+    _pollCancelled = false;
+    _readinessStopwatch
+      ..reset()
+      ..start();
+    _readinessTimer?.cancel();
+    _scheduleNextPoll();
+  }
+
+  void _scheduleNextPoll() {
+    _readinessTimer = Timer(const Duration(seconds: 3), _pollReadiness);
+  }
+
+  Future<void> _pollReadiness() async {
+    if (_pollCancelled) return;
+    try {
+      final resp = await _api
+          .get('/api/v1/identity/remote-readiness')
+          .timeout(const Duration(seconds: 10)) as Map<String, dynamic>;
+      if (_pollCancelled) return;
+      _relayReady = resp['relay'] == true;
+      _certReady = resp['cert'] == true;
+      notifyListeners();
+
+      if (resp['ready'] == true) {
+        _pollCancelled = true;
+        _readinessTimer = null;
+        _redirectToRemote();
+        return;
+      }
+    } on Object catch (_) {
+      // Polling failure (including timeout) is non-fatal; keep trying.
+      if (_pollCancelled) return;
+    }
+
+    if (_readinessStopwatch.elapsed.inSeconds >= 180) {
+      _readinessTimer = null;
+      _fallbackToLanSetup();
+      return;
+    }
+    _scheduleNextPoll();
+  }
+
+  void _redirectToRemote() {
+    final uri = Uri(
+      scheme: 'https',
+      host: _pendingFqdn,
+      path: '/',
+      queryParameters:
+          _pendingNonce != null ? {'setup_nonce': _pendingNonce!} : null,
+    );
+    web.window.location.href = uri.toString();
+  }
+
+  void _fallbackToLanSetup() {
+    _pendingFqdn = null;
+    _pendingNonce = null;
+    _pollCancelled = true;
+    _remoteFallback = true;
+    _state = SetupState.credentials;
+    notifyListeners();
+  }
+
+  /// Skip the remote waiting and continue setup on LAN.
+  void skipRemoteWait() {
+    _readinessTimer?.cancel();
+    _readinessTimer = null;
+    _fallbackToLanSetup();
   }
 
   /// Skip the remote address step and continue setup on LAN.

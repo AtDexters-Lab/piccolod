@@ -1654,6 +1654,10 @@ func (s *GinServer) setupGinRoutes() {
 		// If this were IP-match accessible, a CGNAT co-tenant could mint a nonce.
 		lanPublic.POST("/identity/setup-hostname", s.requireSetupState(), s.handleSetupHostname)
 
+		// Remote readiness: polled by the frontend after hostname claim to wait
+		// for relay + cert before redirecting to the remote domain.
+		lanPublic.GET("/identity/remote-readiness", s.requireSetupState(), s.handleRemoteReadiness)
+
 		// Emergency status — /system/boot already returns emergency info for remote callers.
 		lanPublic.GET("/system/emergency", s.handleEmergencyStatus)
 
@@ -2724,6 +2728,10 @@ func (s *GinServer) restartOIDCApps() {
 
 	apps, err := s.appManager.List(ctx)
 	if err != nil {
+		if errors.Is(err, app.ErrLocked) {
+			log.Printf("DEBUG: skipping OIDC app restart: persistence locked")
+			return
+		}
 		log.Printf("ERROR: failed to list apps for OIDC restart: %v", err)
 		return
 	}
