@@ -694,18 +694,27 @@ class _RemoteAddressStep extends StatefulWidget {
 
 class _RemoteAddressStepState extends State<_RemoteAddressStep> {
   final _hostnameController = TextEditingController();
+  final _focusNode = FocusNode();
   String? _localError;
+  bool _isFocused = false;
 
   @override
   void initState() {
     super.initState();
+    _focusNode.addListener(_onFocusChange);
     // Re-check enrollment in case auto-enrollment completed since welcome screen.
     widget.onRefresh();
   }
 
+  void _onFocusChange() {
+    setState(() => _isFocused = _focusNode.hasFocus);
+  }
+
   @override
   void dispose() {
+    _focusNode.removeListener(_onFocusChange);
     _hostnameController.dispose();
+    _focusNode.dispose();
     super.dispose();
   }
 
@@ -763,6 +772,9 @@ class _RemoteAddressStepState extends State<_RemoteAddressStep> {
     }
 
     // Enrolled mode: hostname input with domain suffix
+    final isFocused = _isFocused;
+    final hasError = displayError != null;
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
       child: Column(
@@ -776,36 +788,86 @@ class _RemoteAddressStepState extends State<_RemoteAddressStep> {
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 24),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _hostnameController,
-                  decoration: InputDecoration(
-                    hintText: 'yourname',
-                    errorText: displayError,
-                    enabled: !widget.isSubmitting,
-                  ),
-                  autofocus: true,
-                  textInputAction: TextInputAction.go,
-                  onSubmitted: (_) => _submit(),
+          // Unified input container: editable hostname + fixed domain suffix
+          // in a single visual box matching the TextField theme.
+          // Clicking anywhere in the box focuses the hostname input.
+          GestureDetector(
+            onTap: _focusNode.requestFocus,
+            child: Container(
+              decoration: BoxDecoration(
+                color: PiccoloTheme.porcelain,
+                borderRadius: BorderRadius.circular(Radii.sm),
+                border: Border.all(
+                  color: hasError
+                      ? PiccoloTheme.critical
+                      : isFocused
+                          ? PiccoloTheme.cobalt600
+                          : PiccoloTheme.outline,
+                  width: isFocused ? 2 : 1,
                 ),
               ),
-              Padding(
-                padding: const EdgeInsets.only(top: 12, left: 4),
-                child: Text(
-                  '.${widget.baseDomain}',
-                  style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
-                    color: PiccoloTheme.inkMuted,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _hostnameController,
+                      focusNode: _focusNode,
+                      decoration: const InputDecoration(
+                        hintText: 'yourname',
+                        filled: false, // outer Container handles background
+                        border: InputBorder.none,
+                        enabledBorder: InputBorder.none,
+                        focusedBorder: InputBorder.none,
+                        errorBorder: InputBorder.none,
+                        focusedErrorBorder: InputBorder.none,
+                        // Tighter than theme (16/12) to fit the compound layout.
+                        contentPadding:
+                            EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+                        isDense: true,
+                      ),
+                      enabled: !widget.isSubmitting,
+                      autofocus: true,
+                      textInputAction: TextInputAction.go,
+                      onSubmitted: (_) => _submit(),
+                    ),
                   ),
-                ),
+                  Container(
+                    width: 1,
+                    height: 24,
+                    color: PiccoloTheme.hairline,
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: Text(
+                      '.${widget.baseDomain}',
+                      style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
+                        color: PiccoloTheme.inkMuted,
+                      ),
+                    ),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
-          const SizedBox(height: 24),
+          if (displayError != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6, left: 12),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  displayError,
+                  style: PiccoloTheme.textTheme.bodySmall?.copyWith(
+                    color: PiccoloTheme.critical,
+                  ),
+                ),
+              ),
+            ),
+          const SizedBox(height: 32),
           if (widget.isSubmitting)
-            const CircularProgressIndicator(color: PiccoloTheme.cobalt600)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: CircularProgressIndicator(color: PiccoloTheme.cobalt600),
+            )
           else ...[
             FilledButton(
               onPressed: _submit,
