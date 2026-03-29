@@ -19,11 +19,12 @@ import (
 type mockTPM struct{}
 
 func (m *mockTPM) EKCertDER() ([]byte, error)                { return []byte("ek"), nil }
-func (m *mockTPM) AKPublic() ([]byte, error)                  { return []byte("ak"), nil }
-func (m *mockTPM) ActivateCredential([]byte) ([]byte, error)  { return []byte("secret"), nil }
-func (m *mockTPM) Quote(string) (string, error)               { return "dHBtcXVvdGU=", nil }
-func (m *mockTPM) QuoteOverData([]byte) (string, error)       { return "dHBtcXVvdGU=", nil }
-func (m *mockTPM) Close() error                               { return nil }
+func (m *mockTPM) EKPublicDER() ([]byte, error)              { return []byte("ekpub"), nil }
+func (m *mockTPM) AKPublic() ([]byte, error)                 { return []byte("ak"), nil }
+func (m *mockTPM) ActivateCredential([]byte) ([]byte, error) { return []byte("secret"), nil }
+func (m *mockTPM) Quote([]byte) (string, error)              { return "dHBtcXVvdGU=", nil }
+func (m *mockTPM) QuoteOverData([]byte) (string, error)      { return "dHBtcXVvdGU=", nil }
+func (m *mockTPM) Close() error                              { return nil }
 
 // newTestService creates a Service wired to a test namekclient and event bus.
 // The returned server must be closed by the caller.

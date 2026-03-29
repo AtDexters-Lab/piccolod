@@ -32,6 +32,15 @@ func (d *syncDevice) EKCertDER() ([]byte, error) {
 	return d.inner.EKCertDER()
 }
 
+func (d *syncDevice) EKPublicDER() ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return nil, errDeviceClosed
+	}
+	return d.inner.EKPublicDER()
+}
+
 func (d *syncDevice) AKPublic() ([]byte, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -50,7 +59,7 @@ func (d *syncDevice) ActivateCredential(encCredential []byte) ([]byte, error) {
 	return d.inner.ActivateCredential(encCredential)
 }
 
-func (d *syncDevice) Quote(nonce string) (string, error) {
+func (d *syncDevice) Quote(nonce []byte) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {

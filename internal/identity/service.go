@@ -2,6 +2,7 @@ package identity
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math/rand"
@@ -1051,8 +1052,13 @@ func (s *Service) processVoucherRequests(ctx context.Context, client *namekclien
 	}
 
 	for _, req := range requests {
-		// Use server-provided nonce directly (hex sha256 of voucher data).
-		quoteB64, err := tpmDev.Quote(req.Nonce)
+		// Nonce is hex-encoded sha256 of voucher data.
+		nonceBytes, err := hex.DecodeString(req.Nonce)
+		if err != nil {
+			log.Printf("WARN: identity: voucher sign: bad nonce hex %q: %v", req.Nonce, err)
+			continue
+		}
+		quoteB64, err := tpmDev.Quote(nonceBytes)
 		if err != nil {
 			log.Printf("WARN: identity: voucher sign: quote: %v", err)
 			continue
