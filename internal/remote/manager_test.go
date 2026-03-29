@@ -1256,3 +1256,52 @@ func TestWorkerDefers_WhenOrchClientUnavailable(t *testing.T) {
 	}
 	t.Fatal("cert not found")
 }
+
+func TestDeriveACMEEmail(t *testing.T) {
+	tests := []struct {
+		name     string
+		hostname string
+		want     string
+	}{
+		{"empty", "", ""},
+		{"bare_label", "localhost", ""},
+		{"bare_label_no_dot", "piccolo", ""},
+		{"valid_fqdn", "portal.example.com", "admin@portal.example.com"},
+		{"namek_slug", "hngjr00yn8qk8h2b55y1.piccolospace.com", "admin@hngjr00yn8qk8h2b55y1.piccolospace.com"},
+		{"trailing_dot", "portal.example.com.", "admin@portal.example.com"},
+		{"mixed_case", "Portal.Example.COM", "admin@portal.example.com"},
+		{"whitespace", "  portal.example.com  ", "admin@portal.example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveACMEEmail(tt.hostname)
+			if got != tt.want {
+				t.Errorf("deriveACMEEmail(%q) = %q, want %q", tt.hostname, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeriveNamekACMEEmail(t *testing.T) {
+	tests := []struct {
+		name         string
+		slugHostname string
+		baseDomain   string
+		want         string
+	}{
+		{"normal", "hngjr00yn8qk8h2b55y1.piccolospace.com", "piccolospace.com", "hngjr00yn8qk8h2b55y1@piccolospace.com"},
+		{"empty_slug", "", "piccolospace.com", ""},
+		{"empty_base", "slug.example.com", "", ""},
+		{"both_empty", "", "", ""},
+		{"no_dot_in_slug", "localhost", "example.com", ""},
+		{"multi_label", "slug.region.example.com", "example.com", "slug@example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DeriveNamekACMEEmail(tt.slugHostname, tt.baseDomain)
+			if got != tt.want {
+				t.Errorf("DeriveNamekACMEEmail(%q, %q) = %q, want %q", tt.slugHostname, tt.baseDomain, got, tt.want)
+			}
+		})
+	}
+}

@@ -2532,6 +2532,12 @@ func (s *GinServer) applyNamekState() {
 
 	// --- Cert issuance ---
 	if rm != nil && slugHostname != "" {
+		// Set ACME contact email from namek identity before any issuance.
+		// Uses slug@baseDomain (e.g., hngjr00yn8qk8h2b55y1@piccolospace.com).
+		if email := remote.DeriveNamekACMEEmail(slugHostname, idCfg.BaseDomain); email != "" {
+			rm.SetACMEEmail(email)
+		}
+
 		// Requeue persisted certs that may have been skipped before orchClient was registered
 		// (e.g., namek per-host certs or certs in error/pending from a prior boot).
 		// Must run BEFORE explicit enqueue to avoid double-queueing the wildcard certs.

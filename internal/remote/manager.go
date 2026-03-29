@@ -390,6 +390,16 @@ func (m *Manager) getOrchClient(source string) acme.OrchestratorClient {
 	return c
 }
 
+// SetACMEEmail sets the ACME account contact email used for Let's Encrypt registration.
+// Used by external sources (e.g., namek) that manage certs outside the self-hosted config path.
+// No-ops if email is empty after normalization.
+func (m *Manager) SetACMEEmail(email string) {
+	if m == nil || m.acmeMgr == nil {
+		return
+	}
+	m.acmeMgr.SetEmail(email)
+}
+
 // AppendEvent appends an event to the persisted activity log.
 // Safe for concurrent use. Uses the lock-persist-publish pattern.
 func (m *Manager) AppendEvent(evt Event) {
@@ -3132,9 +3142,24 @@ func endpointHostPort(endpoint string) (string, string) {
 func deriveACMEEmail(portalHostname string) string {
 	host := hostname.Normalize(portalHostname)
 	if host == "" || !strings.Contains(host, ".") {
-		return "admin@piccolo.invalid"
+		return ""
 	}
 	return fmt.Sprintf("admin@%s", host)
+}
+
+// DeriveNamekACMEEmail constructs an ACME contact email from a namek slug hostname
+// and base domain (e.g., "hngjr00yn8qk8h2b55y1.piccolospace.com", "piccolospace.com"
+// → "hngjr00yn8qk8h2b55y1@piccolospace.com"). Returns "" if inputs are empty or
+// the slug cannot be extracted.
+func DeriveNamekACMEEmail(slugHostname, baseDomain string) string {
+	if baseDomain == "" || slugHostname == "" {
+		return ""
+	}
+	parts := strings.SplitN(slugHostname, ".", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return ""
+	}
+	return parts[0] + "@" + baseDomain
 }
 
 func stringPtr(s string) *string {
