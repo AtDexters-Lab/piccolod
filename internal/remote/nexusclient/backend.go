@@ -279,9 +279,11 @@ func (a *BackendAdapter) connectHandler() backend.ConnectHandler {
 		if err != nil {
 			return nil, err
 		}
-		if recorder, ok := a.resolver.(interface{ RecordConnectionHint(int, int, int, bool) }); ok {
+		if recorder, ok := a.resolver.(interface {
+			RecordConnectionHint(int, int, int, bool, string)
+		}); ok {
 			if addr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
-				recorder.RecordConnectionHint(localPort, addr.Port, req.Port, req.IsTLS)
+				recorder.RecordConnectionHint(localPort, addr.Port, req.Port, req.IsTLS, req.ClientIP)
 			}
 		}
 		return conn, nil

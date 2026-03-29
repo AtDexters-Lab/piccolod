@@ -12,6 +12,7 @@ enum SetupState {
   installDisk, // Disk selection + download + write progress
   installComplete, // Reboot prompt after successful install
   welcome, // First run intro
+  remoteAddress, // Choose your address (between welcome and credentials)
   credentials, // Set password
   recovery, // Recovery key
   security, // CA download for HTTPS
@@ -32,6 +33,7 @@ class SetupController extends ChangeNotifier {
     _parseAuthRequestFromUrl();
     _parseNextFromUrl();
     _parseInviteFromUrl();
+    _parseSetupNonceFromUrl();
     unawaited(_checkStatus());
   }
   SetupState _state = SetupState.loading;
@@ -75,6 +77,26 @@ class SetupController extends ChangeNotifier {
   String? _inviteToken;
   String? get inviteToken => _inviteToken;
 
+  // Namek enrollment state (RFC 20260328)
+  bool _namekEnrolled = false;
+  bool get namekEnrolled => _namekEnrolled;
+
+  String? _namekBaseDomain;
+  String? get namekBaseDomain => _namekBaseDomain;
+
+  String? _setupNonce; // from URL on remote domain, sent in crypto/setup body
+
+  // True when the setup wizard is running on the remote domain (after redirect).
+  // Determined by origin detection, not token presence.
+  bool _isRemoteSetup = false;
+  bool get isRemoteSetup => _isRemoteSetup;
+
+  bool _settingHostname = false;
+  bool get settingHostname => _settingHostname;
+
+  String? _hostnameError;
+  String? get hostnameError => _hostnameError;
+
   final ApiClient _api = ApiClient();
 
   /// Parse auth request ID from URL query parameters (for OIDC SSO flow)
@@ -110,6 +132,50 @@ class SetupController extends ChangeNotifier {
         _inviteToken = token;
       }
     } on Object catch (_) {}
+  }
+
+  /// Parse setup nonce from URL or sessionStorage (for remote setup redirect).
+  /// Persists to sessionStorage so it survives page refreshes, then strips
+  /// the nonce from the URL bar via replaceState to reduce exposure.
+  void _parseSetupNonceFromUrl() {
+    try {
+      // Check URL first (initial redirect), then sessionStorage (page refresh).
+      var nonce = Uri.base.queryParameters['setup_nonce'];
+      if (nonce != null && nonce.isNotEmpty) {
+        _setupNonce = nonce;
+        // Persist in sessionStorage for page refresh survival.
+        web.window.sessionStorage.setItem('setup_nonce', nonce);
+        // Strip nonce from URL to avoid exposure in browser history/logs.
+        final cleanUri = Uri.base.replace(
+          queryParameters: Map<String, String>.from(Uri.base.queryParameters)
+            ..remove('setup_nonce'),
+        );
+        web.window.history.replaceState(null, '', cleanUri.toString());
+      } else {
+        // Page refresh: recover nonce from sessionStorage.
+        final stored = web.window.sessionStorage.getItem('setup_nonce');
+        if (stored != null && stored.isNotEmpty) {
+          _setupNonce = stored;
+        }
+      }
+    } on Object catch (_) {}
+  }
+
+  /// Detect if we're on the remote domain (HTTPS, not .local, not localhost, not an IP).
+  bool get _isOnRemoteDomain {
+    try {
+      final host = Uri.base.host;
+      if (Uri.base.scheme != 'https') return false;
+      if (host.endsWith('.local') || host.startsWith('localhost')) return false;
+      // Exclude raw IP addresses (LAN HTTPS via IP is not a remote domain).
+      if (Uri.tryParse('http://$host')?.hasAbsolutePath == true &&
+          RegExp(r'^[\d.:[\]]+$').hasMatch(host)) {
+        return false;
+      }
+      return true;
+    } on Object catch (_) {
+      return false;
+    }
   }
 
   Future<bool> _redirectToNextIfValid() async {
@@ -175,7 +241,16 @@ class SetupController extends ChangeNotifier {
 
         case 'setup':
           _isFirstSetupFlow = true;
-          _state = SetupState.welcome;
+          _namekEnrolled = boot['namek_enrolled'] == true;
+          _namekBaseDomain = boot['namek_base_domain'] as String?;
+          // Remote continuation: on the remote domain with a valid nonce from LAN.
+          // Skip to credentials (password step) — address was claimed on LAN.
+          if (_isOnRemoteDomain && _setupNonce != null) {
+            _isRemoteSetup = true;
+            _state = SetupState.credentials;
+          } else {
+            _state = SetupState.welcome;
+          }
 
         case 'unlock':
           _state = SetupState.unlock;
@@ -223,6 +298,62 @@ class SetupController extends ChangeNotifier {
   }
 
   void startSetup() {
+    _state = SetupState.remoteAddress;
+    notifyListeners();
+  }
+
+  /// Re-check boot response to detect if auto-enrollment completed
+  /// while the user was on the welcome screen.
+  Future<void> refreshEnrollmentStatus() async {
+    try {
+      final boot = await _api.get('/api/v1/system/boot') as Map<String, dynamic>;
+      if (boot['screen'] == 'setup') {
+        _namekEnrolled = boot['namek_enrolled'] == true;
+        _namekBaseDomain = boot['namek_base_domain'] as String?;
+        notifyListeners();
+      }
+    } on Object catch (_) {}
+  }
+
+  /// Claim a custom hostname on namek and redirect to the remote domain
+  /// with the setup nonce for the rest of setup.
+  Future<bool> submitHostname(String hostname) async {
+    try {
+      _settingHostname = true;
+      _hostnameError = null;
+      notifyListeners();
+
+      final result = await _api.post(
+        '/api/v1/identity/setup-hostname',
+        body: {'hostname': hostname},
+      ) as Map<String, dynamic>;
+
+      final fqdn = result['fqdn'] as String?;
+      final baseDomain = result['base_domain'] as String?;
+      final nonce = result['setup_nonce'] as String?;
+
+      // Redirect to the remote domain with the nonce.
+      _settingHostname = false;
+      notifyListeners();
+      final remoteHost = fqdn ?? '$hostname.$baseDomain';
+      final nonceParam = nonce != null ? '?setup_nonce=$nonce' : '';
+      web.window.location.href = 'https://$remoteHost/$nonceParam';
+      return true;
+    } on ApiException catch (e) {
+      _hostnameError = _extractServerError(e.message);
+      _settingHostname = false;
+      notifyListeners();
+      return false;
+    } on Object catch (e) {
+      _hostnameError = e.toString();
+      _settingHostname = false;
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// Skip the remote address step and continue setup on LAN.
+  void skipRemoteAddress() {
     _state = SetupState.credentials;
     notifyListeners();
   }
@@ -385,8 +516,16 @@ class SetupController extends ChangeNotifier {
       const timeout = Duration(seconds: 120);
 
       // 1. Initialize Crypto (also unlocks, sets up auth, creates admin user, creates session)
-      await _api.post('/api/v1/crypto/setup', body: {'password': password})
-          .timeout(timeout);
+      await _api.post('/api/v1/crypto/setup', body: {
+        'password': password,
+        if (_setupNonce != null) 'setup_nonce': _setupNonce,
+      }).timeout(timeout);
+
+      // Nonce consumed server-side. Clear client-side storage.
+      if (_setupNonce != null) {
+        _setupNonce = null;
+        try { web.window.sessionStorage.removeItem('setup_nonce'); } on Object catch (_) {}
+      }
 
       // 2. Fetch CSRF Token
       await _api.fetchCsrfToken().timeout(timeout);
@@ -613,8 +752,14 @@ class SetupController extends ChangeNotifier {
     }
   }
 
-  void proceedToSecurity() {
-    _state = SetupState.security;
+  void proceedAfterRecovery() {
+    if (_isRemoteSetup) {
+      // On remote domain: passkey registration (correct RP ID).
+      _state = SetupState.passkeyRequired;
+    } else {
+      // On LAN: CA certificate download for HTTPS.
+      _state = SetupState.security;
+    }
     notifyListeners();
   }
 

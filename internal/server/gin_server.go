@@ -30,6 +30,7 @@ import (
 	"piccolod/internal/firewall"
 	"piccolod/internal/health"
 	"piccolod/internal/identity"
+	stunpkg "piccolod/internal/network/stun"
 	"piccolod/internal/onboarding"
 	hostnamepkg "piccolod/internal/hostname"
 	"piccolod/internal/mdns"
@@ -169,6 +170,7 @@ type GinServer struct {
 
 	// Namek identity service (RFC 20260312)
 	identityService *identity.Service
+	stunService     *stunpkg.Service
 	tpmMu           sync.Mutex // protects tpmResult (written by recovery goroutine, read by Stop)
 	tpmResult       *tpm.OpenResult
 	certProvider    *remote.FileCertProvider
@@ -188,6 +190,12 @@ type GinServer struct {
 type secureContextKey struct{}
 
 var secureContextKeyInstance = secureContextKey{}
+
+// relayClientIPKey stores the real client IP from Nexus-relayed connections
+// in the request context. Set by the secure loopback's ConnContext hook.
+type relayClientIPKey struct{}
+
+var relayClientIPKeyInstance = relayClientIPKey{}
 
 // portUnpublisherFunc adapts a function into services.PortUnpublisher.
 type portUnpublisherFunc func(int)
@@ -360,14 +368,17 @@ func (r *serviceRemoteResolver) PortalHosts() []string {
 	return hosts
 }
 
-func (r *serviceRemoteResolver) RecordConnectionHint(localPort, sourcePort, remotePort int, isTLS bool) {
+func (r *serviceRemoteResolver) RecordConnectionHint(localPort, sourcePort, remotePort int, isTLS bool, clientIP string) {
 	if r.services == nil || sourcePort <= 0 {
 		return
 	}
-	if localPort == r.port {
+	// Skip cleartext portal requests (HTTP→HTTPS redirects, ACME HTTP-01 probes).
+	// These have no hint consumer and would leak into the map.
+	// TLS portal requests flow through the TLS mux → secure loopback ConnContext.
+	if localPort == r.port && !isTLS {
 		return
 	}
-	r.services.RegisterProxyHint(localPort, sourcePort, remotePort, isTLS)
+	r.services.RegisterProxyHint(localPort, sourcePort, remotePort, isTLS, clientIP)
 }
 
 func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS bool) (int, bool) {
@@ -1059,6 +1070,23 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	})
 	s.identityService = identitySvc
 
+	// STUN service for public IP discovery (used by setup IP matching, future P2P).
+	// Uses Nexus relay hosts as STUN servers when available.
+	stunSvc := stunpkg.New()
+	s.stunService = stunSvc
+	s.supervisor.Register(stunSvc)
+
+	// Seed STUN servers from relay-advertised services.
+	if servers := identitySvc.DeviceConfig().STUNServers(); len(servers) > 0 {
+		stunSvc.SetServers(servers)
+	}
+	// Keep STUN servers in sync when relay services change.
+	identitySvc.SetRelayServicesChangedHandler(func(services map[string][]string) {
+		if servers := services["stun"]; len(servers) > 0 {
+			stunSvc.SetServers(servers)
+		}
+	})
+
 	s.supervisor.Register(identitySvc)
 
 	// Self-hosted adapter (existing)
@@ -1600,10 +1628,19 @@ func (s *GinServer) setupGinRoutes() {
 		lanPublic.POST("/system/install-to-disk", s.handleInstallToDisk)
 		lanPublic.POST("/system/reboot", s.handleOnboardingReboot)
 
-		// Crypto setup/recovery — LAN-only; remote users unlock via /crypto/unlock.
-		lanPublic.POST("/crypto/setup", s.handleCryptoSetup)
+		// Crypto recovery — LAN-only; remote users unlock via /crypto/unlock.
 		lanPublic.POST("/crypto/reset-password", s.handleCryptoResetPassword)
 		lanPublic.GET("/crypto/recovery-key", s.handleCryptoRecoveryStatus)
+
+		// Crypto setup: LAN or same public IP (nonce validated inside handler).
+		// NOT gated by requireSetupState — the handler is idempotent and needed
+		// for partial-setup recovery after reboot (crypto initialized but no admin user).
+		v1.POST("/crypto/setup", s.allowLANOrSamePublicIP(), s.handleCryptoSetup)
+
+		// Setup hostname: LAN-only + pre-crypto-init only.
+		// Must be LAN-only so the returned nonce proves physical access.
+		// If this were IP-match accessible, a CGNAT co-tenant could mint a nonce.
+		lanPublic.POST("/identity/setup-hostname", s.requireSetupState(), s.handleSetupHostname)
 
 		// Emergency status — /system/boot already returns emergency info for remote callers.
 		lanPublic.GET("/system/emergency", s.handleEmergencyStatus)
@@ -3117,7 +3154,18 @@ func (s *GinServer) initSecureLoopback() error {
 		s.router.ServeHTTP(w, r.WithContext(ctx))
 	})
 	s.secureSrv = &http.Server{
-		Handler:      handler,
+		Handler: handler,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			// Look up the Nexus-relayed client IP from the connection hint.
+			// The TLS mux re-registers hints for the secure loopback port
+			// after TLS termination, carrying the original client IP.
+			if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok && s.serviceManager != nil {
+				if clientIP, ok := s.serviceManager.ConsumePortalHint(s.securePort, addr.Port); ok && clientIP != "" {
+					ctx = context.WithValue(ctx, relayClientIPKeyInstance, clientIP)
+				}
+			}
+			return ctx
+		},
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,

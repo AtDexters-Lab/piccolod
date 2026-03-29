@@ -27,6 +27,7 @@ type EnrollResult struct {
 	BaseDomain     string
 	IdentityClass  string
 	NexusEndpoints []string
+	RelayServices  map[string][]string // e.g., {"stun": ["relay:3478"]}
 	Reenrolled     bool
 }
 
@@ -50,6 +51,10 @@ type Service struct {
 	// Concurrency guard for recovery: prevents parallel recoverAndReenroll goroutines.
 	recovering atomic.Bool
 
+	// Concurrency guard for boot-time auto-enrollment (separate from recovering
+	// to avoid semantic overload — recovering is for re-enrollment after auth failure).
+	autoEnrolling atomic.Bool
+
 	// Shutdown lifecycle: stopped prevents new recovery/sync goroutines after Stop(),
 	// recoverWg tracks in-flight recovery so Stop can wait for it.
 	// stopCh is closed on Stop() to interrupt backoff sleeps in recovery goroutines.
@@ -64,6 +69,10 @@ type Service struct {
 
 	// Server-reported recovery status (from GET /devices/me).
 	recoveryStatus string
+
+	// onRelayServicesChanged is called when relay services (including STUN
+	// addresses) change, so the owner can update STUN server lists.
+	onRelayServicesChanged func(services map[string][]string)
 
 	// Endpoint sync loop lifecycle.
 	syncCancel context.CancelFunc
@@ -124,8 +133,86 @@ func (s *Service) Start(ctx context.Context) error {
 
 	if cfg.DeviceID != "" {
 		s.startEndpointSync()
+	} else {
+		// Not yet enrolled — attempt auto-enrollment in background.
+		// Does not block supervisor startup. Retries with exponential backoff.
+		s.triggerAutoEnroll()
 	}
 	return nil
+}
+
+// triggerAutoEnroll launches autoEnrollAtBoot in a goroutine with the same
+// lifecycle guards as triggerReenrollWithRecovery.
+func (s *Service) triggerAutoEnroll() {
+	if s.autoEnrolling.Load() {
+		return
+	}
+	s.mu.RLock()
+	if s.stopped.Load() {
+		s.mu.RUnlock()
+		return
+	}
+	s.recoverWg.Add(1)
+	s.mu.RUnlock()
+
+	log.Printf("INFO: identity: starting auto-enrollment at boot")
+	go func() {
+		defer s.recoverWg.Done()
+		s.autoEnrollAtBoot()
+	}()
+}
+
+// autoEnrollAtBoot attempts initial enrollment with exponential backoff.
+// Exits if enrollment succeeds, service stops, identity is disabled,
+// or enrollment happens via another path (e.g., manual enroll from Settings).
+func (s *Service) autoEnrollAtBoot() {
+	if !s.autoEnrolling.CompareAndSwap(false, true) {
+		log.Printf("INFO: identity: auto-enrollment already in progress, skipping")
+		return
+	}
+	defer s.autoEnrolling.Store(false)
+
+	const baseDelay = 5 * time.Second
+	const maxDelay = 120 * time.Second
+	const jitterFactor = 0.5
+
+	for attempt := 0; ; attempt++ {
+		if s.stopped.Load() {
+			log.Printf("INFO: identity: auto-enrollment aborted (service stopped)")
+			return
+		}
+		if !s.IsEnabled() {
+			log.Printf("INFO: identity: auto-enrollment aborted (identity disabled)")
+			return
+		}
+		// Another path may have enrolled while we were retrying.
+		if s.IsEnrolled() {
+			log.Printf("INFO: identity: auto-enrollment exiting (already enrolled)")
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		result, err := s.Enroll(ctx)
+		cancel()
+
+		if err == nil {
+			log.Printf("INFO: identity: auto-enrollment succeeded after %d attempt(s) (device=%s, hostname=%s)",
+				attempt+1, result.DeviceID, result.Hostname)
+			return
+		}
+
+		delay := backoffDelay(attempt, baseDelay, maxDelay, jitterFactor)
+		log.Printf("WARN: identity: auto-enrollment attempt %d failed: %v (retry in %v)", attempt+1, err, delay)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-s.stopCh:
+			timer.Stop()
+			log.Printf("INFO: identity: auto-enrollment aborted (service stopping)")
+			return
+		}
+	}
 }
 
 // Stop closes the namekclient. Does NOT close TPM — caller owns it.
@@ -175,6 +262,14 @@ func (s *Service) SetTPMDirs(akStateDir, swtpmStateDir string) {
 	s.mu.Lock()
 	s.akStateDir = akStateDir
 	s.swtpmStateDir = swtpmStateDir
+	s.mu.Unlock()
+}
+
+// SetRelayServicesChangedHandler registers a callback invoked when relay services
+// (STUN addresses, etc.) change. Used to propagate to the STUN service.
+func (s *Service) SetRelayServicesChangedHandler(fn func(services map[string][]string)) {
+	s.mu.Lock()
+	s.onRelayServicesChanged = fn
 	s.mu.Unlock()
 }
 
@@ -300,6 +395,8 @@ func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult) (*EnrollR
 	s.cfg.BaseDomain = baseDomain
 	s.cfg.IdentityClass = result.IdentityClass
 	s.cfg.NexusEndpoints = result.NexusEndpoints
+	// TODO(namek-stun): When namekclient is bumped to include RelayServices:
+	// s.cfg.RelayServices = result.RelayServices
 	cfg := s.cfg
 	s.mu.Unlock()
 
@@ -312,6 +409,17 @@ func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult) (*EnrollR
 	s.startEndpointSync()
 	s.publish(events.TopicIdentityChanged, nil)
 
+	// Notify relay services listener (e.g., STUN service) on first enrollment.
+	// syncNexusEndpoints handles subsequent changes, but the initial enrollment
+	// sets endpoints directly without going through the sync path.
+	s.mu.RLock()
+	cb := s.onRelayServicesChanged
+	relayServices := s.cfg.RelayServices
+	s.mu.RUnlock()
+	if cb != nil && len(relayServices) > 0 {
+		cb(relayServices)
+	}
+
 	log.Printf("INFO: identity: enrolled (device=%s, hostname=%s, reenrolled=%v)",
 		result.DeviceID, result.Hostname, result.Reenrolled)
 
@@ -321,6 +429,7 @@ func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult) (*EnrollR
 		BaseDomain:     baseDomain,
 		IdentityClass:  result.IdentityClass,
 		NexusEndpoints: result.NexusEndpoints,
+		RelayServices:  cfg.RelayServices,
 		Reenrolled:     result.Reenrolled,
 	}, nil
 }
@@ -888,6 +997,9 @@ func (s *Service) syncEndpointsOnce(ctx context.Context) {
 
 	// 5. Sync nexus endpoints (existing logic)
 	s.syncNexusEndpoints(info)
+
+	// TODO(namek-stun): When namekclient is bumped to include RelayServices:
+	// s.syncRelayServices(info.RelayServices)
 }
 
 func (s *Service) syncDeviceMeta(info *namekclient.DeviceInfo) {
@@ -1034,6 +1146,15 @@ func (s *Service) syncNexusEndpoints(info *namekclient.DeviceInfo) {
 	s.publish(events.TopicIdentityChanged, nil)
 	log.Printf("INFO: identity: endpoint sync: updated nexus endpoints (%d → %d)",
 		len(localEndpoints), len(info.NexusEndpoints))
+
+	// Notify relay services listener (e.g., STUN service) when relay services change.
+	s.mu.RLock()
+	cb := s.onRelayServicesChanged
+	relayServices := s.cfg.RelayServices
+	s.mu.RUnlock()
+	if cb != nil && len(relayServices) > 0 {
+		cb(relayServices)
+	}
 }
 
 func endpointSyncInterval() time.Duration {

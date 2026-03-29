@@ -14,6 +14,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/health"
 	"piccolod/internal/hostname"
+	"piccolod/internal/network/stun"
 	"piccolod/internal/services"
 )
 
@@ -270,31 +271,80 @@ func (s *GinServer) requireUnhealthy() gin.HandlerFunc {
 	}
 }
 
+// isLANRequest returns true if the request comes from a non-loopback IP (LAN).
+// Loopback implies Nexus remote proxy (dials 127.0.0.1) or local script.
+func isLANRequest(c *gin.Context) bool {
+	host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && !ip.IsLoopback()
+}
+
 // This prevents remote access via Nexus (which proxies via localhost) while allowing LAN access.
 func (s *GinServer) allowLANOnly() gin.HandlerFunc {
 	return func(c *gin.Context) {
-
-		// Parse the remote IP (direct connection)
-		host, _, err := net.SplitHostPort(c.Request.RemoteAddr)
-		if err != nil {
-			// If we can't parse the host/port, it's safer to block in this sensitive context
-			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Invalid RemoteAddr"})
-			c.Abort()
-			return
-		}
-
-		ip := net.ParseIP(host)
-		// If the IP is loopback (and not secure context), it implies it's either:
-		// 1. Nexus remote proxy (which dials 127.0.0.1) -> BLOCK
-		// 2. A local user/script connecting to the public port -> BLOCK
-		//    (We enforce "local inbounds" strictly as LAN/Private, or Secure Context)
-		if ip != nil && ip.IsLoopback() {
+		if !isLANRequest(c) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: Remote/Loopback access denied"})
 			c.Abort()
 			return
 		}
-
 		c.Next()
+	}
+}
+
+// relayClientIP extracts the real client IP from a Nexus-relayed request.
+// Returns empty string for direct LAN connections or when Nexus didn't provide one.
+func relayClientIP(c *gin.Context) string {
+	if ip, ok := c.Request.Context().Value(relayClientIPKeyInstance).(string); ok {
+		return ip
+	}
+	return ""
+}
+
+// requireSetupState blocks requests if crypto is already initialized.
+// Gates endpoints that should only be accessible during first-time setup.
+func (s *GinServer) requireSetupState() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s.cryptoManager != nil && s.cryptoManager.IsInitialized() {
+			c.JSON(http.StatusForbidden, gin.H{"error": "setup already complete"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// allowLANOrSamePublicIP allows requests from LAN (non-loopback) IPs or from
+// remote callers whose public IP matches the device's STUN-discovered public IP.
+// This enables setup endpoints to work from the remote domain after the redirect
+// when the user is on the same network as the device.
+func (s *GinServer) allowLANOrSamePublicIP() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isLANRequest(c) {
+			c.Next()
+			return
+		}
+
+		// Remote: match Nexus-relayed client IP against device public IP.
+		// Uses cached value (refreshed every 5 min by background loop).
+		// Falls back to a synchronous query if cache is empty (fresh boot).
+		if s.stunService != nil {
+			clientIP := relayClientIP(c)
+			deviceIP := s.stunService.PublicIP()
+			if deviceIP == "" {
+				deviceIP = s.stunService.Refresh() // cold-cache fill, at most once
+			}
+			if clientIP != "" && deviceIP != "" &&
+				stun.NormalizeIP(clientIP) == stun.NormalizeIP(deviceIP) {
+				c.Next()
+				return
+			}
+		}
+
+		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: LAN or same network required"})
+		c.Abort()
 	}
 }
 

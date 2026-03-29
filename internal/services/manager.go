@@ -358,11 +358,15 @@ func (m *ServiceManager) StopRuntimeEvents() {
 // ProxyManager returns the underlying ProxyManager.
 func (m *ServiceManager) ProxyManager() *ProxyManager { return m.proxyManager }
 
-func (m *ServiceManager) RegisterProxyHint(listenerPort, sourcePort, remotePort int, isTLS bool) {
+func (m *ServiceManager) RegisterProxyHint(listenerPort, sourcePort, remotePort int, isTLS bool, clientIP string) {
 	if listenerPort <= 0 || sourcePort <= 0 || m.proxyManager == nil {
 		return
 	}
-	m.proxyManager.registerHint(listenerPort, sourcePort, connectionHint{isTLS: isTLS, remotePort: remotePort})
+	m.proxyManager.registerHint(listenerPort, sourcePort, connectionHint{
+		clientIP:   clientIP,
+		isTLS:      isTLS,
+		remotePort: remotePort,
+	})
 }
 
 func (m *ServiceManager) consumeProxyHint(listenerPort, sourcePort int) (connectionHint, bool) {
@@ -370,6 +374,17 @@ func (m *ServiceManager) consumeProxyHint(listenerPort, sourcePort int) (connect
 		return connectionHint{}, false
 	}
 	return m.proxyManager.consumeHint(listenerPort, sourcePort)
+}
+
+// ConsumePortalHint extracts the Nexus-relayed client IP from a consumed portal
+// connection hint. Used by the secure loopback's ConnContext to make the real
+// client IP available to GinServer middleware.
+func (m *ServiceManager) ConsumePortalHint(listenerPort, sourcePort int) (string, bool) {
+	hint, ok := m.consumeProxyHint(listenerPort, sourcePort)
+	if !ok {
+		return "", false
+	}
+	return hint.clientIP, true
 }
 
 // LastObservedRole reports the most recent leadership role seen for a resource.

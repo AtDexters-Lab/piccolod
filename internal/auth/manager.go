@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -348,8 +349,9 @@ type Session struct {
 }
 
 type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
+	mu         sync.RWMutex
+	sessions   map[string]*Session
+	setupNonce string // short alphanumeric nonce for CGNAT-safe remote setup verification
 }
 
 func NewSessionStore() *SessionStore {
@@ -360,6 +362,43 @@ func randString(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// CreateSetupNonce generates a short alphanumeric nonce for CGNAT-safe remote
+// setup verification. The nonce is a second factor alongside IP matching —
+// it proves the remote user initiated setup from the LAN (where the hostname
+// claim happened). Replaces any existing nonce.
+func (s *SessionStore) CreateSetupNonce() string {
+	const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // no I/O/0/1 for readability
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	nonce := make([]byte, 6)
+	for i := range nonce {
+		nonce[i] = chars[int(b[i])%len(chars)]
+	}
+	result := string(nonce)
+	s.mu.Lock()
+	s.setupNonce = result
+	s.mu.Unlock()
+	return result
+}
+
+// ValidateSetupNonce checks if the provided nonce matches the active setup nonce.
+// Uses constant-time comparison to prevent timing side-channels.
+func (s *SessionStore) ValidateSetupNonce(nonce string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.setupNonce == "" || nonce == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(s.setupNonce), []byte(nonce)) == 1
+}
+
+// ConsumeSetupNonce clears the active setup nonce after successful setup.
+func (s *SessionStore) ConsumeSetupNonce() {
+	s.mu.Lock()
+	s.setupNonce = ""
+	s.mu.Unlock()
 }
 
 // CreateWithUserInfo creates a new portal session with full user information.

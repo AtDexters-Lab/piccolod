@@ -78,11 +78,22 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	defer s.setupMu.Unlock()
 
 	var body struct {
-		Password string `json:"password"`
+		Password   string `json:"password"`
+		SetupNonce string `json:"setup_nonce"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.Password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
+	}
+
+	// 0. For remote requests, verify the setup nonce (CGNAT defense).
+	// The nonce was generated during hostname claim on the LAN and proves the
+	// remote user initiated setup from the LAN (physical access trust zone).
+	if !isLANRequest(c) {
+		if !s.sessions.ValidateSetupNonce(body.SetupNonce) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "invalid setup nonce"})
+			return
+		}
 	}
 
 	// 1. Validate password policy FIRST (before any state changes)
@@ -158,14 +169,16 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 
 	// 5b. Guard: reject if setup is already complete to prevent /setup from
 	// bypassing the two-door login model on a fully configured device.
-	// Re-lock persistence on rejection so the rejected request has no side effects.
+	//
+	// On error: re-lock persistence (no session exists, safe to undo step 5).
+	// On complete (409): do NOT re-lock — a concurrent remote setup may have an
+	// active session that depends on persistence staying unlocked (RFC 20260328).
 	if complete, err := s.isSetupComplete(setupCtx); err != nil {
 		log.Printf("ERROR: setup-complete guard failed: %v", err)
 		_ = s.notifyPersistenceLockState(setupCtx, true)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "setup state check failed"})
 		return
 	} else if complete {
-		_ = s.notifyPersistenceLockState(setupCtx, true)
 		c.JSON(http.StatusConflict, gin.H{"error": "setup already complete"})
 		return
 	}
@@ -254,7 +267,18 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	// RFC 20260122 §6.2: Create portal session with origin binding
 	boundOrigin := s.computeCanonicalOrigin(c)
 	sess := s.sessions.CreatePortalSession(userID, "admin", "admin", boundOrigin, portalSessionTTL)
+
+	// RFC 20260328: When setup happens on the remote domain (via IP match + nonce),
+	// require passkey registration before accessing the dashboard. This ensures
+	// the boot handler enforces the passkey step even after page refresh.
+	if s.isRemoteSecureRequest(c.Request) && s.webauthnMgr != nil {
+		sess.MustRegisterPasskey = true
+	}
+
 	s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
+
+	// Consume the setup nonce now that setup has succeeded.
+	s.sessions.ConsumeSetupNonce()
 
 	// Mark onboarding as complete (accepts try_piccolo, pending, or already-complete).
 	// Best-effort: failure here doesn't block setup since LUKS header serves as fallback signal.
