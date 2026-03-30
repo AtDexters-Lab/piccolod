@@ -11,6 +11,7 @@ import 'package:piccolo_os/shared/widgets/ca_import_guide.dart';
 import 'package:piccolo_os/shared/widgets/diagnostic_log_download.dart';
 import 'package:piccolo_os/shared/widgets/login_form_fields.dart';
 import 'package:piccolo_os/shared/widgets/password_set_form.dart';
+import 'package:piccolo_os/shared/widgets/password_strength_indicator.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/install_disk_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/onboarding_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/setup_controller.dart';
@@ -136,14 +137,13 @@ class _SetupWizardState extends State<SetupWizard> {
                                 duration: Motion.slow,
                                 child: _buildStepContent(state),
                               ),
-                              // Other devices panel (shown in all states except loading/finishing/system error)
-                              if (state != SetupState.loading &&
-                                  state != SetupState.finishing &&
-                                  state != SetupState.recovery &&
-                                  state != SetupState.security &&
-                                  state != SetupState.systemError &&
-                                  state != SetupState.installDisk &&
-                                  state != SetupState.installComplete)
+                              // Other devices panel — shown only on discovery/orientation screens,
+                              // hidden during active setup and credential entry.
+                              if (state == SetupState.onboarding ||
+                                  state == SetupState.welcome ||
+                                  state == SetupState.error ||
+                                  state == SetupState.unlock ||
+                                  state == SetupState.login)
                                 const _OtherDevicesPanel(),
                             ],
                           ),
@@ -174,7 +174,7 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.preparingRemote:
         return 'Choose your address';
       case SetupState.credentials:
-        return 'Create admin password';
+        return 'Secure your disk';
       case SetupState.recovery:
         return 'Recovery key';
       case SetupState.security:
@@ -202,38 +202,50 @@ class _SetupWizardState extends State<SetupWizard> {
   }
 
   int _getFirstRunStepIndex(SetupState state) {
-    // Remote continuation: Password(0) → Recovery(1) → Passkey(2)
+    // Remote continuation: Encryption(0) → Recovery(1) → Passkey(2)
     if (_controller.isRemoteSetup) {
-      switch (state) {
-        case SetupState.credentials:
-        case SetupState.finishing:
-          return 0;
-        case SetupState.recovery:
-          return 1;
-        case SetupState.passkeyRequired:
-          return 2;
-        default:
-          return 0;
-      }
+      return switch (state) {
+        SetupState.credentials || SetupState.finishing => 0,
+        SetupState.recovery => 1,
+        SetupState.passkeyRequired => 2,
+        SetupState.loading ||
+        SetupState.onboarding ||
+        SetupState.installDisk ||
+        SetupState.installComplete ||
+        SetupState.welcome ||
+        SetupState.remoteAddress ||
+        SetupState.preparingRemote ||
+        SetupState.security ||
+        SetupState.unlock ||
+        SetupState.login ||
+        SetupState.forgotPassword ||
+        SetupState.invite ||
+        SetupState.complete ||
+        SetupState.error ||
+        SetupState.systemError =>
+          0,
+      };
     }
-    // LAN with address step: Welcome(0) → Address(1) → Password(2) → Recovery(3) → Passkey/Security(4)
-    switch (state) {
-      case SetupState.welcome:
-        return 0;
-      case SetupState.remoteAddress:
-      case SetupState.preparingRemote:
-        return 1;
-      case SetupState.credentials:
-      case SetupState.finishing:
-        return 2;
-      case SetupState.recovery:
-        return 3;
-      case SetupState.security:
-      case SetupState.passkeyRequired:
-        return 4;
-      default:
-        return 0;
-    }
+    // LAN with address step: Welcome(0) → Address(1) → Encryption(2) → Recovery(3) → Passkey/Security(4)
+    return switch (state) {
+      SetupState.welcome => 0,
+      SetupState.remoteAddress || SetupState.preparingRemote => 1,
+      SetupState.credentials || SetupState.finishing => 2,
+      SetupState.recovery => 3,
+      SetupState.security || SetupState.passkeyRequired => 4,
+      SetupState.loading ||
+      SetupState.onboarding ||
+      SetupState.installDisk ||
+      SetupState.installComplete ||
+      SetupState.unlock ||
+      SetupState.login ||
+      SetupState.forgotPassword ||
+      SetupState.invite ||
+      SetupState.complete ||
+      SetupState.error ||
+      SetupState.systemError =>
+        0,
+    };
   }
 
   Widget _buildStepContent(SetupState state) {
@@ -285,12 +297,16 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.credentials:
         return _CredentialsStep(
           onSubmit: _controller.submitCredentials,
-          initialError: _controller.error != null
-              ? 'Setup failed. Please try again.'
-              : null,
+          controller: _controller,
+          onBack: _controller.isRemoteSetup
+              ? null
+              : _controller.backToRemoteAddress,
         );
       case SetupState.finishing:
-        return const _FinishingStep();
+        return _FinishingStep(
+          key: const ValueKey('finishing'),
+          phase: _controller.setupPhase,
+        );
       case SetupState.recovery:
         return _RecoveryStep(
           words: _controller.recoveryWords,
@@ -356,7 +372,7 @@ class _FirstRunStepper extends StatelessWidget {
     final steps = _buildSteps();
     final children = <Widget>[];
     for (var i = 0; i < steps.length; i++) {
-      if (i > 0) children.add(_buildStepSeparator());
+      if (i > 0) children.add(_buildStepSeparator(i < currentStep));
       children.add(_buildStepIndicator(i, steps[i]));
     }
     return Row(children: children);
@@ -365,11 +381,11 @@ class _FirstRunStepper extends StatelessWidget {
   List<String> _buildSteps() {
     // Remote continuation: only show remaining steps
     if (isRemoteSetup) {
-      return ['Password', 'Recovery', 'Passkey'];
+      return ['Encryption', 'Recovery', 'Passkey'];
     }
     // LAN with address step (enrolled or not)
     final lastStep = enrolled ? 'Passkey' : 'Security';
-    return ['Welcome', 'Address', 'Password', 'Recovery', lastStep];
+    return ['Welcome', 'Address', 'Encryption', 'Recovery', lastStep];
   }
 
   Widget _buildStepIndicator(int step, String label) {
@@ -405,13 +421,26 @@ class _FirstRunStepper extends StatelessWidget {
     );
   }
 
-  Widget _buildStepSeparator() {
-    return const SizedBox(width: 24, child: Divider(height: 1));
+  Widget _buildStepSeparator(bool completed) {
+    return SizedBox(
+      width: 24,
+      child: Divider(
+        height: 1,
+        color: completed ? PiccoloTheme.cobalt600 : null,
+      ),
+    );
   }
 }
 
 class _FinishingStep extends StatelessWidget {
-  const _FinishingStep();
+  const _FinishingStep({super.key, this.phase});
+  final SetupPhase? phase;
+
+  static const Map<SetupPhase, String> _phaseLabels = {
+    SetupPhase.encrypting: 'Encrypting storage\u2026',
+    SetupPhase.creatingAdmin: 'Creating admin account\u2026',
+    SetupPhase.generatingKey: 'Generating recovery key\u2026',
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -423,13 +452,13 @@ class _FinishingStep extends StatelessWidget {
           const CircularProgressIndicator(color: PiccoloTheme.cobalt600),
           const SizedBox(height: 24),
           Text(
-            'Encrypting storage and creating your admin…',
+            _phaseLabels[phase] ?? 'Setting up\u2026',
             style: PiccoloTheme.textTheme.bodyLarge,
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 8),
           Text(
-            'This usually takes a few seconds.',
+            'This may take up to a minute on some devices.',
             style: PiccoloTheme.textTheme.labelSmall,
             textAlign: TextAlign.center,
           ),
@@ -777,7 +806,7 @@ class _RemoteAddressStepState extends State<_RemoteAddressStep> {
     super.initState();
     _focusNode.addListener(_onFocusChange);
     // Re-check enrollment in case auto-enrollment completed since welcome screen.
-    widget.onRefresh();
+    unawaited(widget.onRefresh());
   }
 
   void _onFocusChange() {
@@ -822,7 +851,7 @@ class _RemoteAddressStepState extends State<_RemoteAddressStep> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
+            const Icon(
               PiccoloIcons.router,
               size: 32,
               color: PiccoloTheme.inkMuted,
@@ -961,9 +990,14 @@ class _RemoteAddressStepState extends State<_RemoteAddressStep> {
 
 class _CredentialsStep extends StatefulWidget {
 
-  const _CredentialsStep({required this.onSubmit, this.initialError});
+  const _CredentialsStep({
+    required this.onSubmit,
+    required this.controller,
+    this.onBack,
+  });
   final Future<bool> Function(String) onSubmit;
-  final String? initialError;
+  final SetupController controller;
+  final VoidCallback? onBack;
 
   @override
   State<_CredentialsStep> createState() => _CredentialsStepState();
@@ -979,17 +1013,10 @@ class _CredentialsStepState extends State<_CredentialsStep> {
   @override
   void initState() {
     super.initState();
-    _error = widget.initialError;
-  }
-
-  @override
-  void didUpdateWidget(covariant _CredentialsStep oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.initialError != oldWidget.initialError &&
-        widget.initialError != null &&
-        _error == null) {
-      setState(() => _error = widget.initialError);
-    }
+    // Seed from controller error — handles the case where this widget is
+    // freshly rebuilt after a failed submitCredentials (old widget was
+    // disposed during the finishing→credentials state transition).
+    _error = widget.controller.error;
   }
 
   @override
@@ -1005,22 +1032,28 @@ class _CredentialsStepState extends State<_CredentialsStep> {
       _confirmError = null;
     });
 
-    if (_passController.text.isEmpty) {
+    final pass = _passController.text;
+    if (pass.isEmpty) {
       setState(() => _error = 'Password is required');
       return;
     }
-    if (_passController.text != _confirmController.text) {
+    final policyError = PasswordPolicy.validate(pass);
+    if (policyError != null) {
+      setState(() => _error = policyError);
+      return;
+    }
+    if (pass != _confirmController.text) {
       setState(() => _confirmError = 'Passwords do not match');
       return;
     }
 
     setState(() => _isSubmitting = true);
-    final success = await widget.onSubmit(_passController.text);
+    final success = await widget.onSubmit(pass);
 
     if (mounted && !success) {
       setState(() {
         _isSubmitting = false;
-        _error = 'Setup failed. Please try again.';
+        _error = widget.controller.error ?? 'Setup failed. Please try again.';
       });
     }
   }
@@ -1042,25 +1075,39 @@ class _CredentialsStepState extends State<_CredentialsStep> {
               passwordError: _error,
               confirmError: _confirmError,
               onSubmitted: _submit,
+              autofocus: true,
             ),
             const SizedBox(height: 16),
             const Text(
-              'This password encrypts storage and unlocks Piccolo. Keep it somewhere safe.',
+              'This password protects your encrypted storage — you\u2019ll need it after each reboot. Store it somewhere safe.',
               style: TextStyle(color: PiccoloTheme.inkMuted, fontSize: 13),
             ),
             const SizedBox(height: 32),
-            FilledButton(
-              onPressed: _isSubmitting ? null : _submit,
-              child: _isSubmitting
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(
-                        color: Colors.white,
-                        strokeWidth: 2,
-                      ),
-                    )
-                  : const Text('Continue'),
+            Row(
+              children: [
+                if (widget.onBack != null) ...[
+                  TextButton(
+                    onPressed: _isSubmitting ? null : widget.onBack,
+                    child: const Text('Back'),
+                  ),
+                  const SizedBox(width: 16),
+                ],
+                Expanded(
+                  child: FilledButton(
+                    onPressed: _isSubmitting ? null : _submit,
+                    child: _isSubmitting
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2,
+                            ),
+                          )
+                        : const Text('Encrypt & Continue'),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
@@ -1083,8 +1130,11 @@ class _RecoveryStepState extends State<_RecoveryStep> {
   bool _confirmed = false;
 
   void _downloadKey() {
+    // Download as raw mnemonic — the backend's reset flow tokenizes with
+    // strings.Fields and validates as plain BIP39. Numbered prefixes would
+    // introduce extra tokens that break recovery.
     final content =
-        "PICCOLO RECOVERY KEY\n\n${widget.words.join(" ")}\n\nKeep this file safe.";
+        'PICCOLO RECOVERY KEY\n\n${widget.words.join(' ')}\n\nKeep this file safe.';
     downloadTextFile(content, 'piccolo-recovery-key.txt');
 
     ScaffoldMessenger.of(context).showSnackBar(
@@ -1142,7 +1192,7 @@ class _RecoveryStepState extends State<_RecoveryStep> {
           ),
           const SizedBox(height: 18),
           Container(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
               color: PiccoloTheme.porcelain,
               borderRadius: BorderRadius.circular(Radii.sm),
@@ -1150,19 +1200,39 @@ class _RecoveryStepState extends State<_RecoveryStep> {
                 color: PiccoloTheme.ink.withValues(alpha: 0.06),
               ),
             ),
-            constraints: const BoxConstraints(maxHeight: 150),
-            child: SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  SelectableText(
-                    widget.words.join(' '),
-                    style: PiccoloTheme.mono.copyWith(
-                      fontSize: 16,
-                      height: 1.4,
+            child: SelectionArea(
+              child: Wrap(
+                spacing: 4,
+                runSpacing: 6,
+                children: List.generate(widget.words.length, (i) {
+                  return SizedBox(
+                    width: 80,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 24,
+                          child: Text(
+                            '${i + 1}. ',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: PiccoloTheme.inkMuted,
+                              fontFamily: PiccoloTheme.mono.fontFamily,
+                            ),
+                          ),
+                        ),
+                        Flexible(
+                          child: Text(
+                            // Trailing space so SelectionArea clipboard
+                            // output has whitespace between entries.
+                            '${widget.words[i]} ',
+                            style: PiccoloTheme.mono.copyWith(fontSize: 13),
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                ],
+                  );
+                }),
               ),
             ),
           ),
@@ -1201,14 +1271,8 @@ class _RecoveryStepState extends State<_RecoveryStep> {
           FilledButton(
             onPressed: _confirmed ? widget.onNext : null,
             style: FilledButton.styleFrom(
-              backgroundColor: PiccoloTheme.success,
-              foregroundColor: Colors.white,
               disabledBackgroundColor: PiccoloTheme.ink.withValues(alpha: 0.1),
               disabledForegroundColor: PiccoloTheme.ink.withValues(alpha: 0.3),
-              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(Radii.sm),
-              ),
             ),
             child: const Text('Continue'),
           ),
@@ -1297,13 +1361,6 @@ class _SecurityStepState extends State<_SecurityStep> {
           const SizedBox(height: Spacing.lg),
           FilledButton(
             onPressed: widget.onNext,
-            style: FilledButton.styleFrom(
-              backgroundColor: PiccoloTheme.success,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(Radii.sm)),
-            ),
             child: const Text('Finish setup'),
           ),
         ],
@@ -1361,6 +1418,7 @@ class _UnlockStepState extends State<_UnlockStep> {
           TextField(
             controller: _passController,
             obscureText: _obscureText,
+            autofocus: true,
             autofillHints: const [AutofillHints.password],
             decoration: InputDecoration(
               labelText: 'Password',
@@ -1458,7 +1516,7 @@ class _LoginStepState extends State<_LoginStep> {
     if (mounted && !success) {
       setState(() {
         _isSubmitting = false;
-        _error = 'Invalid credentials';
+        _error = widget.controller.error ?? 'Invalid credentials';
       });
     }
   }
@@ -1669,7 +1727,7 @@ class _PasskeyRequiredStepState extends State<_PasskeyRequiredStep> {
           ),
           const SizedBox(height: 8),
           Text(
-            'A passkey is required for remote access. This is a one-time setup.',
+            'A passkey is your daily key \u2014 fast, phishing-proof sign-in without typing your encryption password.',
             style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
           ),
           const SizedBox(height: 24),
@@ -1751,7 +1809,14 @@ class _ForgotPasswordStepState extends State<_ForgotPasswordStep> {
       return;
     }
 
-    if (_passController.text != _confirmController.text) {
+    final pass = _passController.text;
+    final policyError = PasswordPolicy.validate(pass);
+    if (policyError != null) {
+      setState(() => _generalError = policyError);
+      return;
+    }
+
+    if (pass != _confirmController.text) {
       setState(() => _confirmError = 'Passwords do not match');
 
       return;
@@ -1961,7 +2026,7 @@ class _ErrorStep extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           const Text(
-            'Check that your device is online, then try again.',
+            'Make sure your Piccolo is powered on and connected to the same network. If it just booted, wait a minute and retry.',
             style: TextStyle(color: PiccoloTheme.inkMuted, fontSize: 13),
             textAlign: TextAlign.center,
           ),

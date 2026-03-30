@@ -6,6 +6,9 @@ import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/webauthn_service.dart';
 import 'package:web/web.dart' as web;
 
+/// Phases within the crypto setup operation (displayed by _FinishingStep).
+enum SetupPhase { encrypting, creatingAdmin, generatingKey }
+
 enum SetupState {
   loading, // Checking status
   onboarding, // USB boot: Try Piccolo / Install to Disk choice
@@ -55,6 +58,9 @@ class SetupController extends ChangeNotifier {
 
   String? _error;
   String? get error => _error;
+
+  SetupPhase? _setupPhase;
+  SetupPhase? get setupPhase => _setupPhase;
 
   List<String> _recoveryWords = [];
   List<String> get recoveryWords => _recoveryWords;
@@ -160,7 +166,7 @@ class SetupController extends ChangeNotifier {
   void _parseSetupNonceFromUrl() {
     try {
       // Check URL first (initial redirect), then sessionStorage (page refresh).
-      var nonce = Uri.base.queryParameters['setup_nonce'];
+      final nonce = Uri.base.queryParameters['setup_nonce'];
       if (nonce != null && nonce.isNotEmpty) {
         _setupNonce = nonce;
         // Persist in sessionStorage for page refresh survival.
@@ -188,7 +194,7 @@ class SetupController extends ChangeNotifier {
       if (Uri.base.scheme != 'https') return false;
       if (host.endsWith('.local') || host.startsWith('localhost')) return false;
       // Exclude raw IP addresses (LAN HTTPS via IP is not a remote domain).
-      if (Uri.tryParse('http://$host')?.hasAbsolutePath == true &&
+      if ((Uri.tryParse('http://$host')?.hasAbsolutePath ?? false) &&
           RegExp(r'^[\d.:[\]]+$').hasMatch(host)) {
         return false;
       }
@@ -196,6 +202,21 @@ class SetupController extends ChangeNotifier {
     } on Object catch (_) {
       return false;
     }
+  }
+
+  /// Persist current setup step to sessionStorage on LAN (best-effort).
+  void _persistSetupStep() {
+    if (_isRemoteSetup) return;
+    try {
+      web.window.sessionStorage.setItem('setup_step', _state.name);
+    } on Object catch (_) {}
+  }
+
+  /// Clear persisted setup step from sessionStorage.
+  void _clearPersistedSetupStep() {
+    try {
+      web.window.sessionStorage.removeItem('setup_step');
+    } on Object catch (_) {}
   }
 
   Future<bool> _redirectToNextIfValid() async {
@@ -270,9 +291,23 @@ class SetupController extends ChangeNotifier {
             _state = SetupState.credentials;
           } else {
             _state = SetupState.welcome;
+            // Restore LAN step position from sessionStorage (page refresh).
+            try {
+              final saved = web.window.sessionStorage.getItem('setup_step');
+              if (saved != null) {
+                final restored = SetupState.values
+                    .where((s) => s.name == saved)
+                    .firstOrNull;
+                if (restored == SetupState.remoteAddress ||
+                    restored == SetupState.credentials) {
+                  _state = restored!;
+                }
+              }
+            } on Object catch (_) {}
           }
 
         case 'unlock':
+          _clearPersistedSetupStep();
           _state = SetupState.unlock;
 
         case 'login':
@@ -427,7 +462,7 @@ class SetupController extends ChangeNotifier {
       host: _pendingFqdn,
       path: '/',
       queryParameters:
-          _pendingNonce != null ? {'setup_nonce': _pendingNonce!} : null,
+          _pendingNonce != null ? {'setup_nonce': _pendingNonce} : null,
     );
     web.window.location.href = uri.toString();
   }
@@ -438,6 +473,7 @@ class SetupController extends ChangeNotifier {
     _pollCancelled = true;
     _remoteFallback = true;
     _state = SetupState.credentials;
+    _persistSetupStep();
     notifyListeners();
   }
 
@@ -451,6 +487,16 @@ class SetupController extends ChangeNotifier {
   /// Skip the remote address step and continue setup on LAN.
   void skipRemoteAddress() {
     _state = SetupState.credentials;
+    _persistSetupStep();
+    notifyListeners();
+  }
+
+  /// Go back from credentials to the remote address step.
+  void backToRemoteAddress() {
+    _state = SetupState.remoteAddress;
+    _error = null;
+    _remoteFallback = false;
+    _persistSetupStep();
     notifyListeners();
   }
 
@@ -483,6 +529,10 @@ class SetupController extends ChangeNotifier {
         if (decoded['error'] is String) return decoded['error'] as String;
       }
     } on Object catch (_) {}
+    // Guard against raw HTML or overly long error bodies.
+    if (body.length > 200 || body.contains('<html>')) {
+      return 'An unexpected error occurred. Please try again.';
+    }
     return body;
   }
 
@@ -607,6 +657,7 @@ class SetupController extends ChangeNotifier {
     try {
       _state = SetupState.finishing;
       _error = null;
+      _setupPhase = SetupPhase.encrypting;
       notifyListeners();
 
       const timeout = Duration(seconds: 120);
@@ -624,9 +675,13 @@ class SetupController extends ChangeNotifier {
       }
 
       // 2. Fetch CSRF Token
+      _setupPhase = SetupPhase.creatingAdmin;
+      notifyListeners();
       await _api.fetchCsrfToken().timeout(timeout);
 
       // 3. Generate Recovery Key
+      _setupPhase = SetupPhase.generatingKey;
+      notifyListeners();
       final recoveryData = await _api.post(
         '/api/v1/crypto/recovery-key/generate',
         body: {'password': password},
@@ -634,29 +689,35 @@ class SetupController extends ChangeNotifier {
 
       if (recoveryData != null && recoveryData['words'] != null) {
         _recoveryWords = List<String>.from(recoveryData['words'] as Iterable<dynamic>);
+        _setupPhase = null;
         _state = SetupState.recovery;
+        _clearPersistedSetupStep();
         notifyListeners();
         return true;
       } else {
         throw Exception('Failed to generate recovery key');
       }
     } on TimeoutException {
-      _error = 'Setup timed out. Please check your connection and try again.';
+      _setupPhase = null;
+      _error = 'Setup is taking longer than expected. Your device may still be working \u2014 try refreshing in a minute.';
       _state = SetupState.credentials;
       notifyListeners();
       return false;
     } on ApiException catch (e) {
+      _setupPhase = null;
       if (_isStorageSystemError(e)) {
         _error = _extractServerError(e.message);
         _state = SetupState.systemError;
       } else {
-        _error = e.toString();
+        _error = _extractServerError(e.message);
         _state = SetupState.credentials;
       }
       notifyListeners();
       return false;
     } on Object catch (e) {
-      _error = e.toString();
+      _setupPhase = null;
+      final msg = e.toString();
+      _error = msg.length > 200 ? 'Setup failed. Please try again.' : msg;
       _state = SetupState.credentials;
       notifyListeners();
       return false;
@@ -738,9 +799,15 @@ class SetupController extends ChangeNotifier {
       await _completeLoginFlow(username, password);
       notifyListeners();
       return true;
+    } on ApiException catch (e) {
+      debugPrint('Login failed: $e');
+      _error = _extractServerError(e.message);
+      notifyListeners();
+      return false;
     } on Object catch (e) {
       debugPrint('Login failed: $e');
-      _error = e.toString();
+      final msg = e.toString();
+      _error = msg.length > 200 ? 'Login failed. Please try again.' : msg;
       notifyListeners();
       return false;
     }

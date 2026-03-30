@@ -18,6 +18,32 @@ import (
 	"piccolod/internal/persistence"
 )
 
+// stripNumberedPrefixes removes tokens like "1.", "2", "24." that appear
+// when a user copies the recovery key from the numbered on-screen grid.
+// BIP-39 words are always alphabetic, so any token that is purely digits
+// (with an optional trailing dot) is safe to discard.
+func stripNumberedPrefixes(tokens []string) []string {
+	filtered := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		s := strings.TrimRight(t, ".")
+		if s == "" {
+			continue
+		}
+		isNumeric := true
+		for _, c := range s {
+			if c < '0' || c > '9' {
+				isNumeric = false
+				break
+			}
+		}
+		if isNumeric {
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	return filtered
+}
+
 // isSetupComplete checks whether first-run provisioning has finished by
 // counting users (primary) or checking auth initialization (fallback).
 // Returns (false, nil) when the store is locked (ErrLocked).
@@ -134,8 +160,8 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		log.Printf("INFO: crypto re-verified, continuing partial setup")
 	}
 
-	// Use a background context so long-running ops survive client disconnect.
-	setupCtx, setupCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Decouple from HTTP request context — setup must survive connection drops.
+	setupCtx, setupCancel := context.WithTimeout(s.serverContext(), 10*time.Minute)
 	defer setupCancel()
 
 	// Log if the client disconnects while setup is still running.
@@ -328,8 +354,8 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 	}
 	s.resetLoginFailures()
 
-	// Use a background context so long-running ops survive client disconnect.
-	unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// Decouple from HTTP request context — unlock must survive connection drops.
+	unlockCtx, unlockCancel := context.WithTimeout(s.serverContext(), 10*time.Minute)
 	defer unlockCancel()
 
 	reqCtx := c.Request.Context()
@@ -409,8 +435,9 @@ func (s *GinServer) handleCryptoResetPassword(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
-	words := strings.Fields(recoveryKey)
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
+	words := stripNumberedPrefixes(strings.Fields(recoveryKey))
 	wasLocked := s.cryptoManager.IsLocked()
 	needRelock := wasLocked
 
@@ -510,14 +537,16 @@ func (s *GinServer) handleCryptoLock(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "not initialized"})
 		return
 	}
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	// Lock LUKS data volume before crypto lock (best-effort).
 	if s.storageMgr != nil {
-		if err := s.storageMgr.LockDataVolume(c.Request.Context()); err != nil {
+		if err := s.storageMgr.LockDataVolume(ctx); err != nil {
 			log.Printf("WARN: lock data volume: %v", err)
 		}
 	}
 	s.cryptoManager.Lock()
-	if err := s.notifyPersistenceLockState(c.Request.Context(), true); err != nil {
+	if err := s.notifyPersistenceLockState(ctx, true); err != nil {
 		log.Printf("WARN: failed to propagate lock state: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
 		return
@@ -570,11 +599,13 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 	// When locked, the mnemonic still works for app-level recovery (wrapped in
 	// state file) but won't be usable for direct disk-level cryptsetup open
 	// until the next unlocked recovery-key rotation.
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	if !s.cryptoManager.IsLocked() {
 		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
 			mnemonic := strings.Join(words, " ")
 			mnemonicBytes := []byte(mnemonic)
-			if err := kp.ProvisionLUKSKeyslot(c.Request.Context(), 2, mnemonicBytes); err != nil {
+			if err := kp.ProvisionLUKSKeyslot(ctx, 2, mnemonicBytes); err != nil {
 				log.Printf("WARN: LUKS keyslot 2 provisioning: %v", err)
 			}
 			cryptoutil.SecureZero(mnemonicBytes)
@@ -582,7 +613,7 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 	} else {
 		log.Printf("INFO: LUKS keyslot 2 provisioning deferred (system locked)")
 	}
-	if err := s.applyStalenessUpdate(c.Request.Context(), persistence.AuthStalenessUpdate{
+	if err := s.applyStalenessUpdate(ctx, persistence.AuthStalenessUpdate{
 		RecoveryStale:   boolPtr(false),
 		RecoveryStaleAt: timePtr(time.Time{}),
 		RecoveryAckAt:   timePtr(time.Time{}),

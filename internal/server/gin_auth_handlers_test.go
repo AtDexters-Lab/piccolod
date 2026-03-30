@@ -774,3 +774,32 @@ func TestRequireSession_SlidingSession(t *testing.T) {
 		}
 	})
 }
+
+func TestStripNumberedPrefixes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"plain mnemonic", []string{"abandon", "ability", "able"}, []string{"abandon", "ability", "able"}},
+		{"numbered with dots", []string{"1.", "abandon", "2.", "ability", "3.", "able"}, []string{"abandon", "ability", "able"}},
+		{"numbered without dots", []string{"1", "abandon", "2", "ability"}, []string{"abandon", "ability"}},
+		{"mixed", []string{"1.", "abandon", "ability", "3.", "able"}, []string{"abandon", "ability", "able"}},
+		{"empty input", []string{}, []string{}},
+		{"only numbers", []string{"1.", "2.", "3."}, []string{}},
+		{"dots only", []string{".", ".."}, []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripNumberedPrefixes(tt.in)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("got[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
