@@ -1192,7 +1192,7 @@ class _RecoveryStepState extends State<_RecoveryStep> {
           ),
           const SizedBox(height: 18),
           Container(
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
               color: PiccoloTheme.porcelain,
               borderRadius: BorderRadius.circular(Radii.sm),
@@ -1200,39 +1200,15 @@ class _RecoveryStepState extends State<_RecoveryStep> {
                 color: PiccoloTheme.ink.withValues(alpha: 0.06),
               ),
             ),
-            child: SelectionArea(
-              child: Wrap(
-                spacing: 4,
-                runSpacing: 6,
-                children: List.generate(widget.words.length, (i) {
-                  return SizedBox(
-                    width: 80,
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        SizedBox(
-                          width: 24,
-                          child: Text(
-                            '${i + 1}. ',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: PiccoloTheme.inkMuted,
-                              fontFamily: PiccoloTheme.mono.fontFamily,
-                            ),
-                          ),
-                        ),
-                        Flexible(
-                          child: Text(
-                            // Trailing space so SelectionArea clipboard
-                            // output has whitespace between entries.
-                            '${widget.words[i]} ',
-                            style: PiccoloTheme.mono.copyWith(fontSize: 13),
-                          ),
-                        ),
-                      ],
-                    ),
-                  );
-                }),
+            child: SelectableText(
+              widget.words
+                  .asMap()
+                  .entries
+                  .map((e) => '${e.key + 1}.${e.value}')
+                  .join('  '),
+              style: PiccoloTheme.mono.copyWith(
+                fontSize: 14,
+                height: 1.8,
               ),
             ),
           ),
