@@ -1,12 +1,14 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/AtDexters-Lab/namek-server/pkg/namekclient"
 	"github.com/gin-gonic/gin"
@@ -69,7 +71,9 @@ func (s *GinServer) handleIdentityEnroll(c *gin.Context) {
 		c.JSON(http.StatusPreconditionFailed, gin.H{"error": "TPM not available"})
 		return
 	}
-	result, err := svc.Enroll(c.Request.Context())
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
+	result, err := svc.Enroll(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -83,7 +87,9 @@ func (s *GinServer) handleIdentityEnable(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
 		return
 	}
-	if err := svc.SetEnabled(c.Request.Context(), true); err != nil {
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
+	if err := svc.SetEnabled(ctx, true); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -96,7 +102,9 @@ func (s *GinServer) handleIdentityDisable(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
 		return
 	}
-	if err := svc.SetEnabled(c.Request.Context(), false); err != nil {
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
+	if err := svc.SetEnabled(ctx, false); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -109,7 +117,9 @@ type setHostnameRequest struct {
 
 // validateAndSetHostname validates the hostname and calls SetCustomHostname.
 // Returns the cleaned hostname and any error suitable for the client.
-func (s *GinServer) validateAndSetHostname(c *gin.Context) (string, error) {
+// ctx is used for the SetCustomHostname call — callers should pass a decoupled
+// context for remote-accessible handlers, or c.Request.Context() for LAN-only handlers.
+func (s *GinServer) validateAndSetHostname(ctx context.Context, c *gin.Context) (string, error) {
 	svc := s.identityService
 	if svc == nil {
 		return "", fmt.Errorf("identity service unavailable")
@@ -122,7 +132,7 @@ func (s *GinServer) validateAndSetHostname(c *gin.Context) (string, error) {
 	if req.Hostname != "" && !isValidDNSLabel(req.Hostname) {
 		return "", fmt.Errorf("hostname must be a valid DNS label (lowercase alphanumeric and hyphens, 1-63 chars, no leading/trailing hyphens)")
 	}
-	if err := svc.SetCustomHostname(c.Request.Context(), req.Hostname); err != nil {
+	if err := svc.SetCustomHostname(ctx, req.Hostname); err != nil {
 		return req.Hostname, err
 	}
 	return req.Hostname, nil
@@ -175,7 +185,9 @@ func (s *GinServer) handleIdentitySetHostname(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "identity service unavailable"})
 		return
 	}
-	hostname, err := s.validateAndSetHostname(c)
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
+	hostname, err := s.validateAndSetHostname(ctx, c)
 	if err != nil {
 		respondHostnameError(c, err)
 		return
@@ -208,7 +220,9 @@ func (s *GinServer) handleIdentitySetNamekURL(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "url must be a valid http or https URL"})
 		return
 	}
-	if err := svc.SetNamekURL(c.Request.Context(), req.URL); err != nil {
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
+	if err := svc.SetNamekURL(ctx, req.URL); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -229,7 +243,7 @@ func (s *GinServer) handleSetupHostname(c *gin.Context) {
 		return
 	}
 
-	hostname, err := s.validateAndSetHostname(c)
+	hostname, err := s.validateAndSetHostname(c.Request.Context(), c)
 	if err != nil {
 		respondHostnameError(c, err)
 		return

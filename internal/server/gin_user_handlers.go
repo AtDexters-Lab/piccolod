@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -121,7 +122,9 @@ func (s *GinServer) handleCreateUser(c *gin.Context) {
 		AllowedApps: req.AllowedApps,
 	}
 
-	user, err := s.userManager.Create(c.Request.Context(), input)
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
+	user, err := s.userManager.Create(ctx, input)
 	if err != nil {
 		if errors.Is(err, auth.ErrUsernameExists) {
 			c.JSON(http.StatusConflict, gin.H{"error": "username already exists"})
@@ -180,7 +183,9 @@ func (s *GinServer) handleUpdateUser(c *gin.Context) {
 		input.AllowedApps = req.AllowedApps
 	}
 
-	user, err := s.userManager.Update(c.Request.Context(), input)
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
+	user, err := s.userManager.Update(ctx, input)
 	if err != nil {
 		if errors.Is(err, auth.ErrUserNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
@@ -220,7 +225,9 @@ func (s *GinServer) handleDeleteUser(c *gin.Context) {
 		return
 	}
 
-	if err := s.userManager.Delete(c.Request.Context(), id); err != nil {
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
+	if err := s.userManager.Delete(ctx, id); err != nil {
 		if errors.Is(err, auth.ErrUserNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 			return
@@ -249,7 +256,8 @@ func (s *GinServer) handleSetUserPassword(c *gin.Context) {
 	}
 
 	id := c.Param("id")
-	ctx := c.Request.Context()
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
 
 	// First, get the user to check if it's the admin
 	user, err := s.userManager.Get(ctx, id)

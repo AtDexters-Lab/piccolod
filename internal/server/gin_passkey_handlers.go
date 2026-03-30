@@ -452,7 +452,8 @@ func (s *GinServer) handleDeletePasskey(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
 	credID := cred.ID
 
 	// Safety check: don't delete last credential for a passwordless user
@@ -517,7 +518,9 @@ func (s *GinServer) handleRenamePasskey(c *gin.Context) {
 		return
 	}
 
-	if err := s.webauthnMgr.RenameCredential(c.Request.Context(), cred.ID, name); err != nil {
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
+	if err := s.webauthnMgr.RenameCredential(ctx, cred.ID, name); err != nil {
 		log.Printf("WARN: rename passkey: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename passkey"})
 		return
@@ -554,7 +557,9 @@ func (s *GinServer) handleCreateInvite(c *gin.Context) {
 		return
 	}
 
-	token, userInfo, err := s.inviteMgr.CreateInvite(c.Request.Context(), authpkg.CreateInviteInput{
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
+	token, userInfo, err := s.inviteMgr.CreateInvite(ctx, authpkg.CreateInviteInput{
 		Username:    body.Username,
 		Email:       body.Email,
 		AllowedApps: body.AllowedApps,
@@ -795,7 +800,9 @@ func (s *GinServer) handleReinviteUser(c *gin.Context) {
 		return
 	}
 
-	token, err := s.inviteMgr.ReinviteUser(c.Request.Context(), userID, sess.UserID)
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
+	token, err := s.inviteMgr.ReinviteUser(ctx, userID, sess.UserID)
 	if err != nil {
 		log.Printf("WARN: reinvite user: %v", err)
 		if errors.Is(err, authpkg.ErrUserNotFound) {

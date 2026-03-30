@@ -643,13 +643,9 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	appDef := looseDef
 
 	// Install a new app instance.
-	// Use a background context with a generous timeout instead of the HTTP request context.
-	// The request context is canceled by the server's WriteTimeout (60s) or remote tunnel
-	// disconnects, which kills podman pull processes mid-download for large images.
-	// The install must survive connection drops.
-	installCtx, cancelInstall := context.WithTimeout(context.Background(), 30*time.Minute)
+	// Decouple from HTTP request context — installs must survive connection drops.
+	installCtx, cancelInstall := s.opContext(c, 30*time.Minute)
 	defer cancelInstall()
-	installCtx = app.WithTaskID(installCtx, c.GetHeader("X-Piccolo-Task-ID"))
 	if catalogSource != "" {
 		installCtx = app.WithCatalogSource(installCtx, catalogSource)
 	}
@@ -830,7 +826,10 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 		return
 	}
 
-	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	// Decouple from HTTP request context — listener updates trigger nexus adapter
+	// restarts (port claims change), which can sever the connection carrying this request.
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	_, err = s.appManager.UpdateListeners(ctx, appName, req.Listeners)
 	if err != nil {
 		if handleAppManagerError(c, err, "update listeners") {
@@ -848,8 +847,7 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 	// Queue certs for new listeners
 	s.queueAppRemoteCertificates(appName)
 
-	// Fetch updated details
-	newApp, err := s.appManager.Get(c.Request.Context(), appName)
+	newApp, err := s.appManager.Get(ctx, appName)
 	if err != nil {
 		writeGinError(c, http.StatusInternalServerError, "Updated successfully but failed to fetch fresh status")
 		return
@@ -892,7 +890,8 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 	appName := c.Param("name")
 
-	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	err := s.appManager.Uninstall(ctx, appName)
 	if err != nil {
 		if handleAppManagerError(c, err, "uninstall app") {
@@ -925,7 +924,8 @@ func (s *GinServer) handleGinAppStart(c *gin.Context) {
 		return
 	}
 
-	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	err := s.appManager.Start(ctx, appName)
 	if err != nil {
 		if handleAppManagerError(c, err, "start app") {
@@ -951,7 +951,8 @@ func (s *GinServer) handleGinAppStop(c *gin.Context) {
 		return
 	}
 
-	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	err := s.appManager.Stop(ctx, appName)
 	if err != nil {
 		if handleAppManagerError(c, err, "stop app") {
@@ -980,9 +981,8 @@ func (s *GinServer) handleGinAppUpdate(c *gin.Context) {
 	// Body is optional — nil tag means re-pull current tag.
 	_ = c.ShouldBindJSON(&body)
 
-	updateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	updateCtx, cancel := s.opContext(c, 30*time.Minute)
 	defer cancel()
-	updateCtx = app.WithTaskID(updateCtx, c.GetHeader("X-Piccolo-Task-ID"))
 
 	err := s.appManager.UpdateImage(updateCtx, appName, body.Tag)
 	if err != nil {
@@ -1010,9 +1010,8 @@ func (s *GinServer) handleGinAppUpdate(c *gin.Context) {
 func (s *GinServer) handleGinAppRollback(c *gin.Context) {
 	appName := c.Param("name")
 
-	rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	rollbackCtx, cancel := s.opContext(c, 5*time.Minute)
 	defer cancel()
-	rollbackCtx = app.WithTaskID(rollbackCtx, c.GetHeader("X-Piccolo-Task-ID"))
 
 	err := s.appManager.RollbackToSnapshot(rollbackCtx, appName)
 	if err != nil {
@@ -1047,7 +1046,8 @@ func (s *GinServer) handleGinAppClone(c *gin.Context) {
 	}
 	cloneName := strings.TrimSpace(body.Name)
 
-	ctx := app.WithTaskID(c.Request.Context(), c.GetHeader("X-Piccolo-Task-ID"))
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	inst, err := s.appManager.CloneWorkspace(ctx, originName, cloneName)
 	if err != nil {
 		if handleAppManagerError(c, err, "clone workspace") {

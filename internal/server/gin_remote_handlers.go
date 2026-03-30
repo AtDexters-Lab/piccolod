@@ -38,8 +38,10 @@ func (s *GinServer) handleRemoteConfigure(c *gin.Context) {
 		DeviceSecret:   req.DeviceSecret,
 		PortalHostname: req.PortalHostname,
 	}
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	if s.dispatcher != nil {
-		resp, err := s.dispatcher.Dispatch(c.Request.Context(), remote.ConfigureCommand{Req: configureReq})
+		resp, err := s.dispatcher.Dispatch(ctx, remote.ConfigureCommand{Req: configureReq})
 		if err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
@@ -80,8 +82,10 @@ func (s *GinServer) handleRemoteManagedConfigure(c *gin.Context) {
 		DeviceToken:          req.DeviceToken,
 		PortalHostname:       req.PortalHostname,
 	}
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	if s.dispatcher != nil {
-		resp, err := s.dispatcher.Dispatch(c.Request.Context(), remote.ManagedConfigureCommand{Req: configureReq})
+		resp, err := s.dispatcher.Dispatch(ctx, remote.ManagedConfigureCommand{Req: configureReq})
 		if err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
@@ -123,8 +127,10 @@ func (s *GinServer) resolvePortalPort() int {
 
 // handleRemoteDisable handles POST /api/v1/remote/disable
 func (s *GinServer) handleRemoteDisable(c *gin.Context) {
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	if s.dispatcher != nil {
-		if _, err := s.dispatcher.Dispatch(c.Request.Context(), remote.DisableCommand{}); err != nil {
+		if _, err := s.dispatcher.Dispatch(ctx, remote.DisableCommand{}); err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
 				return
@@ -148,9 +154,11 @@ func (s *GinServer) handleRemoteDisable(c *gin.Context) {
 
 // handleRemoteRotate handles POST /api/v1/remote/rotate
 func (s *GinServer) handleRemoteRotate(c *gin.Context) {
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	var secret string
 	if s.dispatcher != nil {
-		resp, err := s.dispatcher.Dispatch(c.Request.Context(), remote.RotateSecretCommand{})
+		resp, err := s.dispatcher.Dispatch(ctx, remote.RotateSecretCommand{})
 		if err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
@@ -208,8 +216,10 @@ func (s *GinServer) handleRemotePreflight(c *gin.Context) {
 		}
 	}
 
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	if s.dispatcher != nil {
-		resp, err := s.dispatcher.Dispatch(c.Request.Context(), remote.RunPreflightCommand{Candidate: candidate})
+		resp, err := s.dispatcher.Dispatch(ctx, remote.RunPreflightCommand{Candidate: candidate})
 		if err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
@@ -275,9 +285,11 @@ func (s *GinServer) handleRemoteAliasesCreate(c *gin.Context) {
 		writeGinError(c, http.StatusBadRequest, "invalid json body")
 		return
 	}
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	var alias remote.Alias
 	if s.dispatcher != nil {
-		resp, err := s.dispatcher.Dispatch(c.Request.Context(), remote.AddAliasCommand{Listener: req.Listener, Hostname: req.Hostname})
+		resp, err := s.dispatcher.Dispatch(ctx, remote.AddAliasCommand{Listener: req.Listener, Hostname: req.Hostname})
 		if err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
@@ -308,7 +320,7 @@ func (s *GinServer) handleRemoteAliasesCreate(c *gin.Context) {
 	// If namek is active, register the alias domain on namek
 	var namekState *namekDomainState
 	if s.namekDomainActive() {
-		ns, err := s.namekRegisterAlias(c.Request.Context(), alias.Hostname)
+		ns, err := s.namekRegisterAlias(ctx, alias.Hostname)
 		if err != nil {
 			log.Printf("WARN: server: namek register alias %s: %v", alias.Hostname, err)
 		}
@@ -334,8 +346,10 @@ func (s *GinServer) handleRemoteAliasesDelete(c *gin.Context) {
 		}
 	}
 
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	if s.dispatcher != nil {
-		if _, err := s.dispatcher.Dispatch(c.Request.Context(), remote.RemoveAliasCommand{ID: id}); err != nil {
+		if _, err := s.dispatcher.Dispatch(ctx, remote.RemoveAliasCommand{ID: id}); err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
 				return
@@ -356,7 +370,7 @@ func (s *GinServer) handleRemoteAliasesDelete(c *gin.Context) {
 
 	// Best-effort namek cleanup (local alias already removed — don't roll back on failure)
 	if hostname != "" {
-		_ = s.namekDeleteAlias(c.Request.Context(), hostname)
+		_ = s.namekDeleteAlias(ctx, hostname)
 
 		// Clean up per-app certs for this alias hostname (host:<label>.<alias>).
 		// RemoveAlias already cleans up the alias base cert (alias:<hostname>).
@@ -368,7 +382,8 @@ func (s *GinServer) handleRemoteAliasesDelete(c *gin.Context) {
 
 // handleRemoteAliasesVerifyNamek triggers CNAME verification on namek for a pending alias.
 // This handler does NOT go through the dispatcher because it only calls the namek API
-// (no local state mutation). The alias already exists in remote.Config.
+// (no local state mutation). Uses opContext because the network call traverses the nexus
+// tunnel which can be severed by adapter restarts.
 func (s *GinServer) handleRemoteAliasesVerifyNamek(c *gin.Context) {
 	id := c.Param("id")
 
@@ -390,7 +405,9 @@ func (s *GinServer) handleRemoteAliasesVerifyNamek(c *gin.Context) {
 		return
 	}
 
-	state, err := s.namekVerifyAlias(c.Request.Context(), found.Hostname)
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
+	state, err := s.namekVerifyAlias(ctx, found.Hostname)
 	if err != nil {
 		writeGinError(c, http.StatusBadRequest, err.Error())
 		return
@@ -412,8 +429,10 @@ func (s *GinServer) handleRemoteCertificatesList(c *gin.Context) {
 // handleRemoteCertificateRenew triggers a manual renewal.
 func (s *GinServer) handleRemoteCertificateRenew(c *gin.Context) {
 	id := c.Param("id")
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	if s.dispatcher != nil {
-		if _, err := s.dispatcher.Dispatch(c.Request.Context(), remote.RenewCertCommand{ID: id}); err != nil {
+		if _, err := s.dispatcher.Dispatch(ctx, remote.RenewCertCommand{ID: id}); err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
 				return
@@ -457,8 +476,10 @@ func (s *GinServer) handleRemoteGuideVerify(c *gin.Context) {
 		PortalHostname: req.PortalHostname,
 		JWTSecret:      req.JWTSecret,
 	}
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	if s.dispatcher != nil {
-		if _, err := s.dispatcher.Dispatch(c.Request.Context(), remote.GuideVerifyCommand{Verification: verification}); err != nil {
+		if _, err := s.dispatcher.Dispatch(ctx, remote.GuideVerifyCommand{Verification: verification}); err != nil {
 			if errors.Is(err, remote.ErrLocked) {
 				writeGinError(c, http.StatusLocked, "storage locked; unlock Piccolo to continue")
 				return

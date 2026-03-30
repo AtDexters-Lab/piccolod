@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -108,7 +109,9 @@ func (s *GinServer) handlePCVImport(c *gin.Context) {
 	}
 
 	// Run import.
-	if err := s.pcvImporter.Import(c.Request.Context(), tmpPath, expectedHash); err != nil {
+	ctx, cancel := s.opContext(c, 10*time.Minute)
+	defer cancel()
+	if err := s.pcvImporter.Import(ctx, tmpPath, expectedHash); err != nil {
 		if errors.Is(err, pcv.ErrControlPlaneExists) {
 			writeGinError(c, http.StatusConflict,
 				"Import is only available during setup or recovery. The existing control plane must be absent or structurally corrupted.")
