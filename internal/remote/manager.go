@@ -741,8 +741,17 @@ func (m *Manager) reloadFromStorage() error {
 
 	m.cfgMu.Lock()
 	m.cfg = &cfg
-	snap := extractAdapterSnapshot(&cfg)
+	m.validateCertFiles(m.cfg)
+	snap := extractAdapterSnapshot(m.cfg)
 	m.cfgMu.Unlock()
+
+	// Best-effort repo sync — closes the gap where filesystem was written
+	// pre-unlock but repo was locked. Runs unconditionally because normal updates
+	// (certs saved to filesystem while locked) also need repo backfill, not just
+	// certs reset by validateCertFiles.
+	// Uses local cfg (same backing data as m.cfg) to avoid reading m.cfg outside the lock.
+	_ = m.storage.SaveCerts(context.Background(), cfg.NexusConfig, cfg.CertInventory)
+
 	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
 	if cfg.Enabled {
@@ -1787,13 +1796,35 @@ func (m *Manager) scanAndQueueRenewals() {
 		cn      string
 		source  string
 		solver  string
+		reissue bool
+	}
+	// Collect OK cert file paths for ground-truth validation outside the lock.
+	type certFileCheck struct {
+		renewalJob
+		crtPath string
+		keyPath string
 	}
 	relayReady := m.httpChallengeReachable()
 	var jobs []renewalJob
+	var fileChecks []certFileCheck
 	for _, c := range cfg.Certificates {
 		if strings.EqualFold(c.Status, string(CertStatusPending)) {
 			continue // avoid duplicate queueing
 		}
+
+		// Collect OK certs for file validation (checked outside the lock).
+		if strings.EqualFold(c.Status, string(CertStatusOK)) {
+			crtPath, keyPath, ok := m.resolveCertPaths(cfg, c)
+			if ok {
+				domains, cn, _ := desiredDomainsAndCN(cfg, c)
+				fileChecks = append(fileChecks, certFileCheck{
+					renewalJob: renewalJob{id: c.ID, domains: domains, cn: cn, source: c.Source, solver: c.Solver},
+					crtPath:    crtPath,
+					keyPath:    keyPath,
+				})
+			}
+		}
+
 		// HTTP-01 relay gate: skip if not all relays are connected to prevent
 		// wasted ACME attempts that would enter the error→backoff cycle.
 		if needsRelay(c.Solver) && !relayReady {
@@ -1817,12 +1848,28 @@ func (m *Manager) scanAndQueueRenewals() {
 	}
 	m.cfgMu.RUnlock()
 
+	// Ground-truth file validation outside the lock to avoid holding RLock during I/O.
+	for _, fc := range fileChecks {
+		if _, err := os.Stat(fc.keyPath); err != nil {
+			log.Printf("WARN: remote: scheduler: cert %s inventory=ok but .key missing — scheduling reissue", fc.id)
+			fc.reissue = true
+			jobs = append(jobs, fc.renewalJob)
+			continue
+		}
+		expiry, found := readCertExpiry(fc.crtPath)
+		if !found || expiry.Before(now) {
+			log.Printf("WARN: remote: scheduler: cert %s inventory=ok but .crt missing/expired — scheduling reissue", fc.id)
+			fc.reissue = true
+			jobs = append(jobs, fc.renewalJob)
+		}
+	}
+
 	// Enqueue jobs outside of lock
 	if len(jobs) > 0 {
 		log.Printf("remote: scheduler queuing %d certificate renewal(s)", len(jobs))
 	}
 	for _, job := range jobs {
-		m.enqueueIssuanceJob(issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, source: job.source, solver: job.solver})
+		m.enqueueIssuanceJob(issuanceJob{id: job.id, domains: job.domains, commonName: job.cn, source: job.source, solver: job.solver, reissue: job.reissue})
 	}
 }
 
@@ -2319,12 +2366,7 @@ func (m *Manager) ensureCertPending(cfg *Config, id string, domains []string, no
 	for i := range cfg.Certificates {
 		if cfg.Certificates[i].ID == id {
 			cfg.Certificates[i].Domains = append([]string(nil), domains...)
-			cfg.Certificates[i].Status = string(CertStatusPending)
-			cfg.Certificates[i].FailureReason = ""
-			cfg.Certificates[i].RetryAt = nil
-			cfg.Certificates[i].IssuedAt = nil
-			cfg.Certificates[i].ExpiresAt = nil
-			cfg.Certificates[i].NextRenewal = nil
+			resetCertToPending(&cfg.Certificates[i])
 			if source != "" {
 				cfg.Certificates[i].Source = source
 			}
@@ -2793,6 +2835,74 @@ func readCertExpiry(path string) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+// resolveCertPaths returns the .crt and .key file paths for a certificate,
+// resolving the certDir fallback and output filename convention.
+func (m *Manager) resolveCertPaths(cfg *Config, c Certificate) (crtPath, keyPath string, ok bool) {
+	certDir := c.CertDir
+	if certDir == "" {
+		certDir = m.certDir()
+	}
+	if certDir == "" {
+		return "", "", false
+	}
+	_, cn, found := desiredDomainsAndCN(cfg, c)
+	if !found || cn == "" {
+		return "", "", false
+	}
+	outName := outNameFor(c.ID, cn)
+	return filepath.Join(certDir, outName+".crt"),
+		filepath.Join(certDir, outName+".key"), true
+}
+
+// validateCertFiles checks that each OK certificate's .crt and .key files exist
+// and the certificate is not expired. Certs whose files are missing, corrupt, or
+// expired are reset to pending for re-issuance.
+// Must be called with cfgMu held for writing.
+func (m *Manager) validateCertFiles(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	now := m.now()
+	for i := range cfg.Certificates {
+		c := &cfg.Certificates[i]
+		if !strings.EqualFold(c.Status, string(CertStatusOK)) {
+			continue
+		}
+
+		crtPath, keyPath, ok := m.resolveCertPaths(cfg, *c)
+		if !ok {
+			continue
+		}
+
+		if _, err := os.Stat(keyPath); err != nil {
+			log.Printf("WARN: remote: cert %s inventory=ok but .key missing at %s — resetting to pending", c.ID, keyPath)
+			resetCertToPending(c)
+			continue
+		}
+
+		expiry, found := readCertExpiry(crtPath)
+		if !found {
+			log.Printf("WARN: remote: cert %s inventory=ok but .crt missing or unreadable at %s — resetting to pending", c.ID, crtPath)
+			resetCertToPending(c)
+			continue
+		}
+		if expiry.Before(now) {
+			log.Printf("WARN: remote: cert %s inventory=ok but .crt expired at %s — resetting to pending", c.ID, expiry.Format(time.RFC3339))
+			resetCertToPending(c)
+			continue
+		}
+	}
+}
+
+func resetCertToPending(c *Certificate) {
+	c.Status = string(CertStatusPending)
+	c.IssuedAt = nil
+	c.ExpiresAt = nil
+	c.NextRenewal = nil
+	c.RetryAt = nil
+	c.FailureReason = ""
 }
 
 // RunPreflight performs validation checks for the remote configuration.

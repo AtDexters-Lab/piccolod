@@ -133,15 +133,25 @@ func (s *bootstrapRemoteStorage) SaveNexus(ctx context.Context, nexus remote.Nex
 	if !s.isMounted() {
 		return remote.ErrLocked
 	}
-	if err := s.saveToRepo(ctx, nexus, certs); err != nil {
-		return err
+	// Attempt repo first — non-lock errors (e.g., ErrNotLeader) must fail
+	// without writing the filesystem to avoid orphaned split files.
+	repoErr := s.saveToRepo(ctx, nexus, certs)
+	if repoErr != nil && !errors.Is(repoErr, remote.ErrLocked) {
+		return repoErr
 	}
+	// Repo succeeded or is locked — write filesystem (always available when mounted).
 	payload, err := json.MarshalIndent(&nexus, "", "  ")
 	if err != nil {
 		return err
 	}
 	_ = os.MkdirAll(s.dir, 0o700)
-	return fsutil.AtomicWriteFile(remote.NexusPath(s.dir), payload, 0o600)
+	if err := fsutil.AtomicWriteFile(remote.NexusPath(s.dir), payload, 0o600); err != nil {
+		return err
+	}
+	if repoErr != nil {
+		log.Printf("INFO: remote: nexus.json written to filesystem; repo locked, will sync after unlock")
+	}
+	return nil
 }
 
 func (s *bootstrapRemoteStorage) SaveCerts(ctx context.Context, nexus remote.NexusConfig, certs remote.CertInventory) error {
@@ -151,15 +161,25 @@ func (s *bootstrapRemoteStorage) SaveCerts(ctx context.Context, nexus remote.Nex
 	if !s.isMounted() {
 		return remote.ErrLocked
 	}
-	if err := s.saveToRepo(ctx, nexus, certs); err != nil {
-		return err
+	// Attempt repo first — non-lock errors (e.g., ErrNotLeader) must fail
+	// without writing the filesystem to avoid orphaned split files.
+	repoErr := s.saveToRepo(ctx, nexus, certs)
+	if repoErr != nil && !errors.Is(repoErr, remote.ErrLocked) {
+		return repoErr
 	}
+	// Repo succeeded or is locked — write filesystem (always available when mounted).
 	payload, err := json.MarshalIndent(&certs, "", "  ")
 	if err != nil {
 		return err
 	}
 	_ = os.MkdirAll(s.dir, 0o700)
-	return fsutil.AtomicWriteFile(remote.CertsPath(s.dir), payload, 0o600)
+	if err := fsutil.AtomicWriteFile(remote.CertsPath(s.dir), payload, 0o600); err != nil {
+		return err
+	}
+	if repoErr != nil {
+		log.Printf("INFO: remote: certificates.json written to filesystem; repo locked, will sync after unlock")
+	}
+	return nil
 }
 
 func (s *bootstrapRemoteStorage) SaveEvents(_ context.Context, events remote.EventLog) error {
