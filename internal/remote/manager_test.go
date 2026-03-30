@@ -2,9 +2,17 @@ package remote
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	cryptoRand "crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1255,4 +1263,417 @@ func TestWorkerDefers_WhenOrchClientUnavailable(t *testing.T) {
 		}
 	}
 	t.Fatal("cert not found")
+}
+
+func TestDeriveACMEEmail(t *testing.T) {
+	tests := []struct {
+		name     string
+		hostname string
+		want     string
+	}{
+		{"empty", "", ""},
+		{"bare_label", "localhost", ""},
+		{"bare_label_no_dot", "piccolo", ""},
+		{"valid_fqdn", "portal.example.com", "admin@portal.example.com"},
+		{"namek_slug", "hngjr00yn8qk8h2b55y1.piccolospace.com", "admin@hngjr00yn8qk8h2b55y1.piccolospace.com"},
+		{"trailing_dot", "portal.example.com.", "admin@portal.example.com"},
+		{"mixed_case", "Portal.Example.COM", "admin@portal.example.com"},
+		{"whitespace", "  portal.example.com  ", "admin@portal.example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveACMEEmail(tt.hostname)
+			if got != tt.want {
+				t.Errorf("deriveACMEEmail(%q) = %q, want %q", tt.hostname, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeriveNamekACMEEmail(t *testing.T) {
+	tests := []struct {
+		name         string
+		slugHostname string
+		baseDomain   string
+		want         string
+	}{
+		{"normal", "hngjr00yn8qk8h2b55y1.piccolospace.com", "piccolospace.com", "hngjr00yn8qk8h2b55y1@piccolospace.com"},
+		{"empty_slug", "", "piccolospace.com", ""},
+		{"empty_base", "slug.example.com", "", ""},
+		{"both_empty", "", "", ""},
+		{"no_dot_in_slug", "localhost", "example.com", ""},
+		{"multi_label", "slug.region.example.com", "example.com", "slug@example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DeriveNamekACMEEmail(tt.slugHostname, tt.baseDomain)
+			if got != tt.want {
+				t.Errorf("DeriveNamekACMEEmail(%q, %q) = %q, want %q", tt.slugHostname, tt.baseDomain, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- validateCertFiles tests ---
+
+// writeTestCert writes a self-signed .crt and .key to dir/outName.{crt,key}
+// with the given notBefore/notAfter. Returns expiry.
+func writeTestCert(t *testing.T, dir, outName, cn string, notBefore, notAfter time.Time) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), cryptoRand.Reader)
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	serial, _ := cryptoRand.Int(cryptoRand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	template := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+		DNSNames:     []string{cn},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(cryptoRand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	keyBytes, _ := x509.MarshalECPrivateKey(priv)
+	crtPath := filepath.Join(dir, outName+".crt")
+	keyPath := filepath.Join(dir, outName+".key")
+	if err := os.WriteFile(crtPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write crt: %v", err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+}
+
+func newValidateTestManager(t *testing.T, baseDir string) *Manager {
+	t.Helper()
+	now := time.Date(2026, 3, 30, 12, 0, 0, 0, time.UTC)
+	m := &Manager{
+		baseDir: baseDir,
+		now:     fixedNow(now),
+	}
+	return m
+}
+
+func TestValidateCertFiles_MissingCrt(t *testing.T) {
+	dir := t.TempDir()
+	m := newValidateTestManager(t, dir)
+	certDir := filepath.Join(dir, "remote", "certs")
+
+	// Write .key only — no .crt file. Tests the ".crt missing" path specifically.
+	now := time.Now()
+	writeTestCert(t, certDir, "test.example.com", "test.example.com",
+		now.Add(-time.Hour), now.Add(90*24*time.Hour))
+	os.Remove(filepath.Join(certDir, "test.example.com.crt"))
+
+	cfg := &Config{
+		NexusConfig: NexusConfig{PortalHostname: "portal.example.com"},
+		CertInventory: CertInventory{
+			Certificates: []Certificate{{
+				ID:      "test-cert",
+				Domains: []string{"test.example.com"},
+				Status:  "ok",
+				Source:  "namek",
+			}},
+		},
+	}
+
+	m.validateCertFiles(cfg)
+
+	if cfg.Certificates[0].Status != "pending" {
+		t.Fatalf("expected status=pending after missing .crt, got %s", cfg.Certificates[0].Status)
+	}
+	if cfg.Certificates[0].IssuedAt != nil || cfg.Certificates[0].ExpiresAt != nil || cfg.Certificates[0].NextRenewal != nil {
+		t.Fatalf("expected timing fields cleared")
+	}
+}
+
+func TestValidateCertFiles_MissingKey(t *testing.T) {
+	dir := t.TempDir()
+	m := newValidateTestManager(t, dir)
+	certDir := filepath.Join(dir, "remote", "certs")
+
+	// Write .crt but NOT .key
+	now := time.Now()
+	writeTestCert(t, certDir, "test.example.com", "test.example.com", now.Add(-time.Hour), now.Add(90*24*time.Hour))
+	os.Remove(filepath.Join(certDir, "test.example.com.key"))
+
+	cfg := &Config{
+		NexusConfig: NexusConfig{PortalHostname: "portal.example.com"},
+		CertInventory: CertInventory{
+			Certificates: []Certificate{{
+				ID:      "test-cert",
+				Domains: []string{"test.example.com"},
+				Status:  "ok",
+				Source:  "namek",
+			}},
+		},
+	}
+
+	m.validateCertFiles(cfg)
+
+	if cfg.Certificates[0].Status != "pending" {
+		t.Fatalf("expected status=pending after missing .key, got %s", cfg.Certificates[0].Status)
+	}
+}
+
+func TestValidateCertFiles_ExpiredFile(t *testing.T) {
+	dir := t.TempDir()
+	m := newValidateTestManager(t, dir)
+	certDir := filepath.Join(dir, "remote", "certs")
+
+	// Write an expired cert
+	writeTestCert(t, certDir, "test.example.com", "test.example.com",
+		time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2025, 4, 1, 0, 0, 0, 0, time.UTC)) // expired well before 2026-03-30
+
+	cfg := &Config{
+		NexusConfig: NexusConfig{PortalHostname: "portal.example.com"},
+		CertInventory: CertInventory{
+			Certificates: []Certificate{{
+				ID:      "test-cert",
+				Domains: []string{"test.example.com"},
+				Status:  "ok",
+				Source:  "namek",
+			}},
+		},
+	}
+
+	m.validateCertFiles(cfg)
+
+	if cfg.Certificates[0].Status != "pending" {
+		t.Fatalf("expected status=pending after expired .crt, got %s", cfg.Certificates[0].Status)
+	}
+}
+
+func TestValidateCertFiles_ValidFile(t *testing.T) {
+	dir := t.TempDir()
+	m := newValidateTestManager(t, dir)
+	certDir := filepath.Join(dir, "remote", "certs")
+
+	now := time.Date(2026, 3, 30, 12, 0, 0, 0, time.UTC)
+	writeTestCert(t, certDir, "test.example.com", "test.example.com",
+		now.Add(-24*time.Hour), now.Add(60*24*time.Hour))
+
+	issued := now.Add(-24 * time.Hour)
+	expires := now.Add(60 * 24 * time.Hour)
+	renewal := now.Add(30 * 24 * time.Hour)
+	cfg := &Config{
+		NexusConfig: NexusConfig{PortalHostname: "portal.example.com"},
+		CertInventory: CertInventory{
+			Certificates: []Certificate{{
+				ID:          "test-cert",
+				Domains:     []string{"test.example.com"},
+				Status:      "ok",
+				Source:      "namek",
+				IssuedAt:    &issued,
+				ExpiresAt:   &expires,
+				NextRenewal: &renewal,
+			}},
+		},
+	}
+
+	m.validateCertFiles(cfg)
+
+	if cfg.Certificates[0].Status != "ok" {
+		t.Fatalf("expected status=ok for valid cert, got %s", cfg.Certificates[0].Status)
+	}
+	if cfg.Certificates[0].IssuedAt == nil || cfg.Certificates[0].ExpiresAt == nil {
+		t.Fatal("expected timing fields preserved for valid cert")
+	}
+}
+
+func TestValidateCertFiles_PortalCert(t *testing.T) {
+	dir := t.TempDir()
+	m := newValidateTestManager(t, dir)
+	certDir := filepath.Join(dir, "remote", "certs")
+
+	now := time.Date(2026, 3, 30, 12, 0, 0, 0, time.UTC)
+	// Portal cert uses "portal" as filename, not the hostname
+	writeTestCert(t, certDir, "portal", "portal.example.com",
+		now.Add(-24*time.Hour), now.Add(60*24*time.Hour))
+
+	cfg := &Config{
+		NexusConfig: NexusConfig{PortalHostname: "portal.example.com"},
+		CertInventory: CertInventory{
+			Certificates: []Certificate{{
+				ID:      "portal",
+				Domains: []string{"portal.example.com"},
+				Status:  "ok",
+			}},
+		},
+	}
+
+	m.validateCertFiles(cfg)
+
+	if cfg.Certificates[0].Status != "ok" {
+		t.Fatalf("expected status=ok for portal cert with correct file, got %s", cfg.Certificates[0].Status)
+	}
+
+	// Now remove the file and verify it resets
+	os.Remove(filepath.Join(certDir, "portal.crt"))
+
+	m.validateCertFiles(cfg)
+
+	if cfg.Certificates[0].Status != "pending" {
+		t.Fatalf("expected status=pending after removing portal.crt, got %s", cfg.Certificates[0].Status)
+	}
+}
+
+func TestValidateCertFiles_CertDirOverride(t *testing.T) {
+	dir := t.TempDir()
+	m := newValidateTestManager(t, dir)
+
+	// Use a custom certDir separate from the default
+	customDir := filepath.Join(t.TempDir(), "custom-certs")
+	now := time.Date(2026, 3, 30, 12, 0, 0, 0, time.UTC)
+	writeTestCert(t, customDir, "test.example.com", "test.example.com",
+		now.Add(-24*time.Hour), now.Add(60*24*time.Hour))
+
+	cfg := &Config{
+		CertInventory: CertInventory{
+			Certificates: []Certificate{{
+				ID:      "test-cert",
+				Domains: []string{"test.example.com"},
+				Status:  "ok",
+				Source:  "namek",
+				CertDir: customDir,
+			}},
+		},
+	}
+
+	m.validateCertFiles(cfg)
+
+	if cfg.Certificates[0].Status != "ok" {
+		t.Fatalf("expected status=ok with custom certDir, got %s", cfg.Certificates[0].Status)
+	}
+
+	// Cert NOT in default dir should fail if CertDir is cleared
+	cfg.Certificates[0].CertDir = ""
+	m.validateCertFiles(cfg)
+
+	if cfg.Certificates[0].Status != "pending" {
+		t.Fatalf("expected status=pending when cert not in default dir, got %s", cfg.Certificates[0].Status)
+	}
+}
+
+func TestValidateCertFiles_CorruptFile(t *testing.T) {
+	dir := t.TempDir()
+	m := newValidateTestManager(t, dir)
+	certDir := filepath.Join(dir, "remote", "certs")
+	if err := os.MkdirAll(certDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a valid .key but corrupt .crt
+	now := time.Now()
+	writeTestCert(t, certDir, "test.example.com", "test.example.com",
+		now.Add(-time.Hour), now.Add(90*24*time.Hour))
+	// Overwrite .crt with garbage
+	if err := os.WriteFile(filepath.Join(certDir, "test.example.com.crt"), []byte("not a cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		CertInventory: CertInventory{
+			Certificates: []Certificate{{
+				ID:      "test-cert",
+				Domains: []string{"test.example.com"},
+				Status:  "ok",
+				Source:  "namek",
+			}},
+		},
+	}
+
+	m.validateCertFiles(cfg)
+
+	if cfg.Certificates[0].Status != "pending" {
+		t.Fatalf("expected status=pending for corrupt .crt, got %s", cfg.Certificates[0].Status)
+	}
+}
+
+func TestValidateCertFiles_SkipsPendingAndError(t *testing.T) {
+	dir := t.TempDir()
+	m := newValidateTestManager(t, dir)
+
+	cfg := &Config{
+		CertInventory: CertInventory{
+			Certificates: []Certificate{
+				{ID: "pending-cert", Domains: []string{"a.example.com"}, Status: "pending", Source: "namek"},
+				{ID: "error-cert", Domains: []string{"b.example.com"}, Status: "error", Source: "namek"},
+			},
+		},
+	}
+
+	m.validateCertFiles(cfg)
+
+	// Neither should be touched
+	if cfg.Certificates[0].Status != "pending" {
+		t.Fatalf("expected pending cert unchanged, got %s", cfg.Certificates[0].Status)
+	}
+	if cfg.Certificates[1].Status != "error" {
+		t.Fatalf("expected error cert unchanged, got %s", cfg.Certificates[1].Status)
+	}
+}
+
+func TestScanAndQueueRenewals_MissingCertFile(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+
+	now := time.Date(2026, 3, 30, 12, 0, 0, 0, time.UTC)
+	issued := now.Add(-24 * time.Hour)
+	expires := now.Add(60 * 24 * time.Hour)
+	renewal := now.Add(30 * 24 * time.Hour)
+
+	m := newTestManagerWithDeps(t, nil, dir, &stubDialer{}, &stubResolver{}, fixedNow(now))
+	m.RegisterOrchClient("namek", stubOrchClient{})
+	m.cfgMu.Lock()
+	m.cfg = &Config{
+		CertInventory: CertInventory{
+			Certificates: []Certificate{{
+				ID:          "test-cert",
+				Domains:     []string{"test.example.com"},
+				Status:      "ok",
+				Source:      "namek",
+				Solver:      acme.SolverDNS01,
+				IssuedAt:    &issued,
+				ExpiresAt:   &expires,
+				NextRenewal: &renewal,
+			}},
+		},
+	}
+	m.cfgMu.Unlock()
+
+	// Stop the issuance worker so jobs stay on the channel for inspection.
+	if m.issueCancel != nil {
+		m.issueCancel()
+		<-m.issueDone
+	}
+	// Drain any jobs queued during setup.
+	for len(m.issueCh) > 0 {
+		<-m.issueCh
+	}
+
+	// No cert file on disk — scanner should detect and enqueue reissue.
+	m.scanAndQueueRenewals()
+
+	// The job should be on issueCh.
+	select {
+	case job := <-m.issueCh:
+		if job.id != "test-cert" {
+			t.Fatalf("expected job for test-cert, got %s", job.id)
+		}
+		if !job.reissue {
+			t.Fatal("expected reissue=true for missing-file job")
+		}
+	default:
+		t.Fatal("expected issuance job enqueued for missing cert file, got none")
+	}
 }

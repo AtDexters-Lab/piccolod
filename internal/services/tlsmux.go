@@ -238,14 +238,18 @@ func (m *TlsMux) serveTLSConn(c net.Conn, services *ServiceManager) {
 	if services != nil {
 		if addr, ok := backend.LocalAddr().(*net.TCPAddr); ok {
 			remotePort := 0
+			clientIP := ""
 			if haveHint && hint.remotePort > 0 {
 				remotePort = hint.remotePort
+			}
+			if haveHint {
+				clientIP = hint.clientIP
 			}
 			isTLS := true
 			if haveHint {
 				isTLS = hint.isTLS || isTLS
 			}
-			services.RegisterProxyHint(upstream, addr.Port, remotePort, isTLS)
+			services.RegisterProxyHint(upstream, addr.Port, remotePort, isTLS, clientIP)
 		}
 	}
 	// Bi-directional copy: cleartext HTTP over TLS to upstream HTTP

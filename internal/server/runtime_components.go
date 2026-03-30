@@ -15,15 +15,17 @@ func newLeadershipObserver(bus *events.Bus) supervisor.Component {
 }
 
 type leadershipObserver struct {
-	bus    *events.Bus
-	cancel context.CancelFunc
+	bus       *events.Bus
+	cancel    context.CancelFunc
+	unsub     func()
 }
 
 func (o *leadershipObserver) start(ctx context.Context) error {
 	if o.bus == nil {
 		return nil
 	}
-	ch := o.bus.Subscribe(events.TopicLeadershipRoleChanged, 16)
+	ch, unsub := o.bus.SubscribeWithCancel(events.TopicLeadershipRoleChanged, 16)
+	o.unsub = unsub
 	runCtx, cancel := context.WithCancel(ctx)
 	o.cancel = cancel
 	go func() {
@@ -50,6 +52,9 @@ func (o *leadershipObserver) start(ctx context.Context) error {
 func (o *leadershipObserver) stop(ctx context.Context) error {
 	if o.cancel != nil {
 		o.cancel()
+	}
+	if o.unsub != nil {
+		o.unsub()
 	}
 	return nil
 }

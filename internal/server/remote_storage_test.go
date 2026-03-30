@@ -239,12 +239,50 @@ func TestBootstrapRemoteStorage_SaveNexusRepoLocked(t *testing.T) {
 	nexus := remote.NexusConfig{Endpoint: "wss://test"}
 	certs := remote.CertInventory{}
 	err := storage.SaveNexus(context.Background(), nexus, certs)
-	if !errors.Is(err, remote.ErrLocked) {
-		t.Fatalf("expected remote.ErrLocked, got %v", err)
+	if err != nil {
+		t.Fatalf("expected nil (filesystem write succeeds even when repo locked), got %v", err)
 	}
-	// nexus.json should NOT be written when repo is locked.
-	if _, err := os.Stat(filepath.Join(dir, "remote", "nexus.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected nexus.json absent on locked repo")
+	// nexus.json should be written to filesystem even when repo is locked.
+	data, err := os.ReadFile(filepath.Join(dir, "remote", "nexus.json"))
+	if err != nil {
+		t.Fatalf("expected nexus.json written, got read err: %v", err)
+	}
+	var fromFile remote.NexusConfig
+	if err := json.Unmarshal(data, &fromFile); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if fromFile.Endpoint != nexus.Endpoint {
+		t.Fatalf("expected endpoint %s, got %s", nexus.Endpoint, fromFile.Endpoint)
+	}
+}
+
+func TestBootstrapRemoteStorage_SaveCertsRepoLocked(t *testing.T) {
+	dir := t.TempDir()
+	prepareBootstrapMount(t, dir)
+	repo := &stubRemoteRepo{err: persistence.ErrLocked}
+	storage := newBootstrapRemoteStorage(repo, dir)
+
+	nexus := remote.NexusConfig{Endpoint: "wss://test"}
+	certs := remote.CertInventory{Certificates: []remote.Certificate{{ID: "c1", Status: "ok"}}}
+	err := storage.SaveCerts(context.Background(), nexus, certs)
+	if err != nil {
+		t.Fatalf("expected nil (filesystem write succeeds even when repo locked), got %v", err)
+	}
+	// certificates.json should be written to filesystem even when repo is locked.
+	data, err := os.ReadFile(filepath.Join(dir, "remote", "certificates.json"))
+	if err != nil {
+		t.Fatalf("expected certificates.json written, got read err: %v", err)
+	}
+	var fromFile remote.CertInventory
+	if err := json.Unmarshal(data, &fromFile); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(fromFile.Certificates) != 1 || fromFile.Certificates[0].ID != "c1" {
+		t.Fatalf("expected cert c1, got %v", fromFile.Certificates)
+	}
+	// Repo save was attempted (but failed with ErrLocked).
+	if repo.saveCalls != 1 {
+		t.Fatalf("expected 1 repo save attempt, got %d", repo.saveCalls)
 	}
 }
 

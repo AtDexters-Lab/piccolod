@@ -105,7 +105,16 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 	//    (Soft emergency falls through here — user can still unlock/login.)
 	cryptoInit := s.cryptoManager != nil && s.cryptoManager.IsInitialized()
 	if !cryptoInit {
-		c.JSON(http.StatusOK, gin.H{"screen": bootScreenSetup})
+		resp := gin.H{"screen": bootScreenSetup}
+		if s.identityService != nil {
+			enrolled := s.identityService.IsEnrolled()
+			resp["namek_enrolled"] = enrolled
+			if enrolled {
+				cfg := s.identityService.DeviceConfig()
+				resp["namek_base_domain"] = cfg.BaseDomain
+			}
+		}
+		c.JSON(http.StatusOK, resp)
 		return
 	}
 

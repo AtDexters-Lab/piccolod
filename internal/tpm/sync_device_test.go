@@ -17,13 +17,14 @@ type mockDevice struct {
 	quoteErr     error
 }
 
-func (m *mockDevice) EKCertDER() ([]byte, error) { return []byte("ek"), nil }
-func (m *mockDevice) AKPublic() ([]byte, error)   { return []byte("ak"), nil }
+func (m *mockDevice) EKCertDER() ([]byte, error)   { return []byte("ek"), nil }
+func (m *mockDevice) EKPublicDER() ([]byte, error) { return []byte("ekpub"), nil }
+func (m *mockDevice) AKPublic() ([]byte, error)    { return []byte("ak"), nil }
 func (m *mockDevice) ActivateCredential(enc []byte) ([]byte, error) {
 	return []byte("secret"), nil
 }
 
-func (m *mockDevice) Quote(nonce string) (string, error) {
+func (m *mockDevice) Quote(nonce []byte) (string, error) {
 	if m.quoteEntered != nil {
 		close(m.quoteEntered)
 	}
@@ -72,7 +73,7 @@ func TestSyncDevice_SerializesConcurrentCalls(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			result, err := dev.Quote("nonce")
+			result, err := dev.Quote([]byte("nonce"))
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
@@ -99,13 +100,16 @@ func TestSyncDevice_UseAfterClose(t *testing.T) {
 	if _, err := dev.EKCertDER(); err != errDeviceClosed {
 		t.Errorf("EKCertDER after close: got %v, want errDeviceClosed", err)
 	}
+	if _, err := dev.EKPublicDER(); err != errDeviceClosed {
+		t.Errorf("EKPublicDER after close: got %v, want errDeviceClosed", err)
+	}
 	if _, err := dev.AKPublic(); err != errDeviceClosed {
 		t.Errorf("AKPublic after close: got %v, want errDeviceClosed", err)
 	}
 	if _, err := dev.ActivateCredential(nil); err != errDeviceClosed {
 		t.Errorf("ActivateCredential after close: got %v, want errDeviceClosed", err)
 	}
-	if _, err := dev.Quote("n"); err != errDeviceClosed {
+	if _, err := dev.Quote([]byte("n")); err != errDeviceClosed {
 		t.Errorf("Quote after close: got %v, want errDeviceClosed", err)
 	}
 	if _, err := dev.QuoteOverData([]byte("data")); err != errDeviceClosed {
@@ -138,7 +142,7 @@ func TestSyncDevice_CloseWaitsForInFlight(t *testing.T) {
 	// and enter the inner Quote (which signals quoteEntered then blocks).
 	quoteDone := make(chan struct{})
 	go func() {
-		dev.Quote("n")
+		dev.Quote([]byte("n"))
 		close(quoteDone)
 	}()
 	<-quoteEntered // deterministic: inner.Quote is executing, holding syncDevice.mu

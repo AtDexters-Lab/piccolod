@@ -34,6 +34,12 @@ class _SetupWizardState extends State<SetupWizard> {
   bool _didCallComplete = false;
 
   @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
       listenable: _controller,
@@ -64,13 +70,13 @@ class _SetupWizardState extends State<SetupWizard> {
             final showFirstRunStepper =
                 _controller.isFirstSetupFlow &&
                 (state == SetupState.welcome ||
+                    state == SetupState.remoteAddress ||
+                    state == SetupState.preparingRemote ||
                     state == SetupState.credentials ||
                     state == SetupState.finishing ||
                     state == SetupState.recovery ||
-                    state == SetupState.security) &&
-                state != SetupState.onboarding &&
-                state != SetupState.installDisk &&
-                state != SetupState.installComplete;
+                    state == SetupState.security ||
+                    state == SetupState.passkeyRequired);
 
             return ColoredBox(
               color: PiccoloTheme.scrim,
@@ -111,6 +117,8 @@ class _SetupWizardState extends State<SetupWizard> {
                                 const SizedBox(height: 12),
                               _FirstRunStepper(
                                 currentStep: _getFirstRunStepIndex(state),
+                                isRemoteSetup: _controller.isRemoteSetup,
+                                enrolled: _controller.namekEnrolled,
                               ),
                             ],
                           ],
@@ -162,6 +170,9 @@ class _SetupWizardState extends State<SetupWizard> {
         return 'Installation Complete';
       case SetupState.welcome:
         return 'Welcome';
+      case SetupState.remoteAddress:
+      case SetupState.preparingRemote:
+        return 'Choose your address';
       case SetupState.credentials:
         return 'Create admin password';
       case SetupState.recovery:
@@ -191,28 +202,36 @@ class _SetupWizardState extends State<SetupWizard> {
   }
 
   int _getFirstRunStepIndex(SetupState state) {
+    // Remote continuation: Password(0) → Recovery(1) → Passkey(2)
+    if (_controller.isRemoteSetup) {
+      switch (state) {
+        case SetupState.credentials:
+        case SetupState.finishing:
+          return 0;
+        case SetupState.recovery:
+          return 1;
+        case SetupState.passkeyRequired:
+          return 2;
+        default:
+          return 0;
+      }
+    }
+    // LAN with address step: Welcome(0) → Address(1) → Password(2) → Recovery(3) → Passkey/Security(4)
     switch (state) {
       case SetupState.welcome:
         return 0;
+      case SetupState.remoteAddress:
+      case SetupState.preparingRemote:
+        return 1;
       case SetupState.credentials:
       case SetupState.finishing:
-        return 1;
-      case SetupState.recovery:
         return 2;
-      case SetupState.security:
+      case SetupState.recovery:
         return 3;
-      case SetupState.loading:
-      case SetupState.onboarding:
-      case SetupState.installDisk:
-      case SetupState.installComplete:
-      case SetupState.unlock:
-      case SetupState.login:
-      case SetupState.forgotPassword:
-      case SetupState.invite:
+      case SetupState.security:
       case SetupState.passkeyRequired:
-      case SetupState.error:
-      case SetupState.systemError:
-      case SetupState.complete:
+        return 4;
+      default:
         return 0;
     }
   }
@@ -247,6 +266,22 @@ class _SetupWizardState extends State<SetupWizard> {
         );
       case SetupState.welcome:
         return _WelcomeStep(onNext: _controller.startSetup);
+      case SetupState.remoteAddress:
+        return _RemoteAddressStep(
+          enrolled: _controller.namekEnrolled,
+          baseDomain: _controller.namekBaseDomain ?? '',
+          onSubmit: _controller.submitHostname,
+          onSkip: _controller.skipRemoteAddress,
+          onRefresh: _controller.refreshEnrollmentStatus,
+          error: _controller.hostnameError,
+          isSubmitting: _controller.settingHostname,
+        );
+      case SetupState.preparingRemote:
+        return _PreparingRemoteStep(
+          relayReady: _controller.relayReady,
+          certReady: _controller.certReady,
+          onSkip: _controller.skipRemoteWait,
+        );
       case SetupState.credentials:
         return _CredentialsStep(
           onSubmit: _controller.submitCredentials,
@@ -259,7 +294,7 @@ class _SetupWizardState extends State<SetupWizard> {
       case SetupState.recovery:
         return _RecoveryStep(
           words: _controller.recoveryWords,
-          onNext: _controller.proceedToSecurity,
+          onNext: _controller.proceedAfterRecovery,
         );
       case SetupState.security:
         return _SecurityStep(
@@ -307,22 +342,34 @@ class _SetupWizardState extends State<SetupWizard> {
 
 class _FirstRunStepper extends StatelessWidget {
 
-  const _FirstRunStepper({required this.currentStep});
+  const _FirstRunStepper({
+    required this.currentStep,
+    this.isRemoteSetup = false,
+    this.enrolled = false,
+  });
   final int currentStep;
+  final bool isRemoteSetup;
+  final bool enrolled;
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        _buildStepIndicator(0, 'Welcome'),
-        _buildStepSeparator(),
-        _buildStepIndicator(1, 'Password'),
-        _buildStepSeparator(),
-        _buildStepIndicator(2, 'Recovery'),
-        _buildStepSeparator(),
-        _buildStepIndicator(3, 'Security'),
-      ],
-    );
+    final steps = _buildSteps();
+    final children = <Widget>[];
+    for (var i = 0; i < steps.length; i++) {
+      if (i > 0) children.add(_buildStepSeparator());
+      children.add(_buildStepIndicator(i, steps[i]));
+    }
+    return Row(children: children);
+  }
+
+  List<String> _buildSteps() {
+    // Remote continuation: only show remaining steps
+    if (isRemoteSetup) {
+      return ['Password', 'Recovery', 'Passkey'];
+    }
+    // LAN with address step (enrolled or not)
+    final lastStep = enrolled ? 'Passkey' : 'Security';
+    return ['Welcome', 'Address', 'Password', 'Recovery', lastStep];
   }
 
   Widget _buildStepIndicator(int step, String label) {
@@ -632,6 +679,280 @@ class _WelcomeStep extends StatelessWidget {
             onPressed: onNext,
             child: const Text('Start setup'),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PreparingRemoteStep extends StatelessWidget {
+  const _PreparingRemoteStep({
+    required this.relayReady,
+    required this.certReady,
+    required this.onSkip,
+  });
+
+  final bool relayReady;
+  final bool certReady;
+  final VoidCallback onSkip;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 16, 32, 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 8),
+          const CircularProgressIndicator(color: PiccoloTheme.cobalt600),
+          const SizedBox(height: 24),
+          Text(
+            'Preparing your remote address\u2026',
+            style: PiccoloTheme.textTheme.titleMedium,
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 24),
+          _readinessRow('Connecting relay', relayReady),
+          const SizedBox(height: 8),
+          _readinessRow('Securing certificate', certReady),
+          const SizedBox(height: 24),
+          TextButton(
+            onPressed: onSkip,
+            child: const Text('Continue on local network'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _readinessRow(String label, bool done) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (done)
+          const Icon(Icons.check_circle, size: 18, color: PiccoloTheme.success)
+        else
+          const SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2, color: PiccoloTheme.cobalt600),
+          ),
+        const SizedBox(width: 8),
+        Text(label, style: PiccoloTheme.textTheme.bodyMedium),
+      ],
+    );
+  }
+}
+
+class _RemoteAddressStep extends StatefulWidget {
+  const _RemoteAddressStep({
+    required this.enrolled,
+    required this.baseDomain,
+    required this.onSubmit,
+    required this.onSkip,
+    required this.onRefresh,
+    this.error,
+    this.isSubmitting = false,
+  });
+  final bool enrolled;
+  final String baseDomain;
+  final Future<bool> Function(String) onSubmit;
+  final VoidCallback onSkip;
+  final Future<void> Function() onRefresh;
+  final String? error;
+  final bool isSubmitting;
+
+  @override
+  State<_RemoteAddressStep> createState() => _RemoteAddressStepState();
+}
+
+class _RemoteAddressStepState extends State<_RemoteAddressStep> {
+  final _hostnameController = TextEditingController();
+  final _focusNode = FocusNode();
+  String? _localError;
+  bool _isFocused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_onFocusChange);
+    // Re-check enrollment in case auto-enrollment completed since welcome screen.
+    widget.onRefresh();
+  }
+
+  void _onFocusChange() {
+    setState(() => _isFocused = _focusNode.hasFocus);
+  }
+
+  @override
+  void dispose() {
+    _focusNode.removeListener(_onFocusChange);
+    _hostnameController.dispose();
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  bool _isValidDNSLabel(String label) {
+    if (label.isEmpty || label.length > 63) return false;
+    return RegExp(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$').hasMatch(label);
+  }
+
+  Future<void> _submit() async {
+    final hostname = _hostnameController.text.trim().toLowerCase();
+    if (hostname.isEmpty) {
+      setState(() => _localError = 'Please enter an address');
+      return;
+    }
+    if (!_isValidDNSLabel(hostname)) {
+      setState(() => _localError = 'Use lowercase letters, numbers, and hyphens only');
+      return;
+    }
+    setState(() => _localError = null);
+    await widget.onSubmit(hostname);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final displayError = widget.error ?? _localError;
+
+    // Unenrolled mode: informational skip message
+    if (!widget.enrolled) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              PiccoloIcons.router,
+              size: 32,
+              color: PiccoloTheme.inkMuted,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'Remote access is not available yet.\nYou can set it up later in Settings.',
+              style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+                color: PiccoloTheme.inkMuted,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 32),
+            FilledButton(
+              onPressed: widget.onSkip,
+              child: const Text('Continue'),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // Enrolled mode: hostname input with domain suffix
+    final isFocused = _isFocused;
+    final hasError = displayError != null;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            'Choose a permanent address for your Piccolo.',
+            style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+              color: PiccoloTheme.inkMuted,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 24),
+          // Unified input container: editable hostname + fixed domain suffix
+          // in a single visual box matching the TextField theme.
+          // Clicking anywhere in the box focuses the hostname input.
+          GestureDetector(
+            onTap: _focusNode.requestFocus,
+            child: Container(
+              decoration: BoxDecoration(
+                color: PiccoloTheme.porcelain,
+                borderRadius: BorderRadius.circular(Radii.sm),
+                border: Border.all(
+                  color: hasError
+                      ? PiccoloTheme.critical
+                      : isFocused
+                          ? PiccoloTheme.cobalt600
+                          : PiccoloTheme.outline,
+                  width: isFocused ? 2 : 1,
+                ),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _hostnameController,
+                      focusNode: _focusNode,
+                      decoration: const InputDecoration(
+                        hintText: 'yourname',
+                        filled: false, // outer Container handles background
+                        border: InputBorder.none,
+                        enabledBorder: InputBorder.none,
+                        focusedBorder: InputBorder.none,
+                        errorBorder: InputBorder.none,
+                        focusedErrorBorder: InputBorder.none,
+                        // Tighter than theme (16/12) to fit the compound layout.
+                        contentPadding:
+                            EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+                        isDense: true,
+                      ),
+                      enabled: !widget.isSubmitting,
+                      autofocus: true,
+                      textInputAction: TextInputAction.go,
+                      onSubmitted: (_) => _submit(),
+                    ),
+                  ),
+                  Container(
+                    width: 1,
+                    height: 24,
+                    color: PiccoloTheme.hairline,
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: Text(
+                      '.${widget.baseDomain}',
+                      style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
+                        color: PiccoloTheme.inkMuted,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (displayError != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6, left: 12),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  displayError,
+                  style: PiccoloTheme.textTheme.bodySmall?.copyWith(
+                    color: PiccoloTheme.critical,
+                  ),
+                ),
+              ),
+            ),
+          const SizedBox(height: 32),
+          if (widget.isSubmitting)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: CircularProgressIndicator(color: PiccoloTheme.cobalt600),
+            )
+          else ...[
+            FilledButton(
+              onPressed: _submit,
+              child: const Text('Claim address'),
+            ),
+            const SizedBox(height: 8),
+            TextButton(
+              onPressed: widget.onSkip,
+              child: const Text('Skip for now'),
+            ),
+          ],
         ],
       ),
     );

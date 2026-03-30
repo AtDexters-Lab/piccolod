@@ -38,7 +38,18 @@ class ApiClient {
     '/api/v1/auth/passkey/login/begin',
     '/api/v1/auth/passkey/login/finish',
     '/api/v1/system/boot',
+    '/api/v1/identity/setup-hostname',
+    '/api/v1/identity/remote-readiness',
   };
+
+  /// Pre-auth setup endpoints that skip automatic CSRF token fetch.
+  static const _preAuthPaths = {
+    '/api/v1/crypto/setup',
+    '/api/v1/identity/setup-hostname',
+    '/api/v1/identity/remote-readiness',
+  };
+
+  static bool _isPreAuthPath(String path) => _preAuthPaths.contains(path);
 
   /// Helper to construct the full URI.
   Uri _buildUri(String path, [Map<String, dynamic>? queryParameters]) {
@@ -144,8 +155,8 @@ class ApiClient {
 
   Future<dynamic> post(String path, {Object? body, Map<String, String>? headers}) async {
     // Automatically ensure we have a CSRF token before mutating state.
-    // This prevents 401/403 errors when developers forget to call fetchCsrfToken().
-    if (_csrfToken == null) {
+    // Skip for pre-auth setup endpoints (no session exists yet, CSRF fetch would fail).
+    if (_csrfToken == null && !_isPreAuthPath(path)) {
       await fetchCsrfToken();
     }
 

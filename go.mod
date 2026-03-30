@@ -5,12 +5,12 @@ go 1.25.0
 replace github.com/docker/docker => github.com/moby/moby v26.1.4+incompatible
 
 require (
-	github.com/AtDexters-Lab/namek-server v0.1.5
+	github.com/AtDexters-Lab/namek-server v0.1.6
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/cosmos/go-bip39 v1.0.0
 	github.com/creack/pty v1.1.24
-	github.com/gin-contrib/gzip v1.2.5
+	github.com/gin-contrib/gzip v1.2.6
 	github.com/go-jose/go-jose/v4 v4.1.3
 	github.com/go-webauthn/webauthn v0.16.1
 	github.com/miekg/dns v1.1.72
@@ -69,7 +69,7 @@ require (
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.13 // indirect
 	github.com/getkin/kin-openapi v0.134.0
-	github.com/gin-contrib/sse v1.1.0 // indirect
+	github.com/gin-contrib/sse v1.1.1 // indirect
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-acme/lego/v4 v4.33.0
 	github.com/go-openapi/jsonpointer v0.22.5 // indirect
@@ -99,5 +99,5 @@ require (
 	golang.org/x/text v0.35.0 // indirect
 	golang.org/x/tools v0.43.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	modernc.org/sqlite v1.47.0
+	modernc.org/sqlite v1.48.0
 )

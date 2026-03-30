@@ -92,6 +92,19 @@ func (p *Preparer) GetPartitionState(ctx context.Context) (*storage.PartitionSta
 		state.DataPartitionSlot = dataSlot
 	}
 
+	// Determine if data partition needs expansion: it must exist, be the last
+	// partition on disk, and have unallocated space following it.
+	if state.DataPartition != "" && state.UnallocatedGB > 0 {
+		for _, part := range sfdisk.PartitionTable.Partitions {
+			if part.Node == state.DataPartition {
+				if part.Start+part.Size == lastEndSector {
+					state.DataNeedsExpansion = true
+				}
+				break
+			}
+		}
+	}
+
 	return state, nil
 }
 
@@ -513,6 +526,40 @@ func (p *Preparer) ExpandRootPartition(ctx context.Context, disk string, rootPar
 	}
 
 	log.Printf("root partition %s expanded", rootPartition)
+	return nil
+}
+
+// ExpandDataPartition expands the data partition to fill remaining disk space.
+// For GPT disks, repairs the backup header first (sgdisk -e) since the image
+// may have been written to a larger disk. Uses growpart which is online-safe
+// and idempotent (NOCHANGE = not an error). No filesystem resize is needed
+// because the partition is a raw LVM PV; the LVM-level expansion (pvresize +
+// lvextend) happens separately in Phase 2.
+func (p *Preparer) ExpandDataPartition(ctx context.Context, disk string, dataPartition string) error {
+	dataSlot := extractSlotNumber(dataPartition)
+	if dataSlot == 0 {
+		return fmt.Errorf("cannot determine data partition slot from %s", dataPartition)
+	}
+
+	// Repair GPT backup header if needed. On GPT disks with an image deployed
+	// to a larger disk, the backup header sits at the old end-of-disk position.
+	// sgdisk -e moves it. Safe to run idempotently; on MBR disks sgdisk fails
+	// harmlessly.
+	if _, err := p.run.RunWithOutput(ctx, "sgdisk", "-e", disk); err != nil {
+		log.Printf("WARN: sgdisk -e (GPT repair) on %s: %v (continuing)", disk, err)
+	}
+
+	// growpart expands the partition to fill remaining space (to end of disk
+	// for the last partition). NOCHANGE may appear on stdout or stderr.
+	if out, err := p.run.RunWithOutput(ctx, "growpart", disk, strconv.Itoa(dataSlot)); err != nil {
+		if strings.Contains(string(out), "NOCHANGE") || strings.Contains(err.Error(), "NOCHANGE") {
+			log.Printf("data partition %s already at maximum size", dataPartition)
+			return nil
+		}
+		return fmt.Errorf("growpart data partition: %w", err)
+	}
+
+	log.Printf("data partition %s expanded", dataPartition)
 	return nil
 }
 

@@ -68,9 +68,9 @@ func NewManager(stateDir string, sink ChallengeSink, email string, directoryURL 
 	if stateDir == "" {
 		stateDir = "."
 	}
-	if email == "" {
-		email = "admin@local"
-	}
+	// Leave empty if not provided — ACME contacts are optional per RFC 8555 §7.3.
+	// Callers (remote manager, applyNamekState) are responsible for setting a valid
+	// email before the first issuance via SetEmail.
 	if directoryURL == "" {
 		if v := os.Getenv("PICCOLO_ACME_DIR_URL"); v != "" {
 			directoryURL = v
@@ -325,7 +325,7 @@ func (m *Manager) ensureAccountWith(solver string, orchClient OrchestratorClient
 		return nil, nil, err
 	}
 	if acc.Registration != nil {
-		log.Printf("INFO: ACME registered new account %s", acc.Registration.URI)
+		log.Printf("INFO: ACME registered new account %s (email=%s)", acc.Registration.URI, curEmail)
 	}
 	return cli, acc, nil
 }

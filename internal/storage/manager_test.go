@@ -35,10 +35,12 @@ type fakeDiskPreparer struct {
 	createPartitionSlot int
 	createPartitionErr error
 	expandErr          error
+	expandDataErr      error
 	ensureDirsErr      error
 
-	createCalls int
-	expandCalls int
+	createCalls     int
+	expandCalls     int
+	expandDataCalls int
 }
 
 func (f *fakeDiskPreparer) VerifyPiccoloCoreExists(ctx context.Context, corePath string) bool {
@@ -57,6 +59,11 @@ func (f *fakeDiskPreparer) CreateDataPartition(ctx context.Context, disk string)
 func (f *fakeDiskPreparer) ExpandRootPartition(ctx context.Context, disk string, rootPartition string) error {
 	f.expandCalls++
 	return f.expandErr
+}
+
+func (f *fakeDiskPreparer) ExpandDataPartition(ctx context.Context, disk string, dataPartition string) error {
+	f.expandDataCalls++
+	return f.expandDataErr
 }
 
 func (f *fakeDiskPreparer) EnsureDirectories(ctx context.Context) error {
@@ -259,6 +266,89 @@ func TestManager_Phase1_ExpandRoot(t *testing.T) {
 	}
 	if prep.expandCalls != 1 {
 		t.Errorf("expected 1 expand call, got %d", prep.expandCalls)
+	}
+}
+
+func TestManager_Phase1_ExpandData(t *testing.T) {
+	paths.SetRootsForTest(t)
+
+	bus := events.NewBus()
+	defer bus.Close()
+
+	prep := &fakeDiskPreparer{
+		coreExists: true,
+		partitionState: &PartitionState{
+			Disk:               "/dev/sda",
+			RootPartition:      "/dev/sda2",
+			DataPartition:      "/dev/sda3",
+			DataNeedsExpansion: true,
+		},
+	}
+
+	mgr := NewManager(prep, bus, nil)
+	mgr.StartPartitioningAsync(context.Background())
+
+	if err := mgr.WaitForPhase1(context.Background()); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if prep.expandDataCalls != 1 {
+		t.Errorf("expected 1 expand-data call, got %d", prep.expandDataCalls)
+	}
+}
+
+func TestManager_Phase1_ExpandDataFailure_NonFatal(t *testing.T) {
+	paths.SetRootsForTest(t)
+
+	bus := events.NewBus()
+	defer bus.Close()
+
+	prep := &fakeDiskPreparer{
+		coreExists: true,
+		partitionState: &PartitionState{
+			Disk:               "/dev/sda",
+			RootPartition:      "/dev/sda2",
+			DataPartition:      "/dev/sda3",
+			DataNeedsExpansion: true,
+		},
+		expandDataErr: fmt.Errorf("growpart failed"),
+	}
+
+	mgr := NewManager(prep, bus, nil)
+	mgr.StartPartitioningAsync(context.Background())
+
+	// Phase 1 should succeed despite data expansion failure.
+	if err := mgr.WaitForPhase1(context.Background()); err != nil {
+		t.Fatalf("expected Phase 1 success (non-fatal expansion), got: %v", err)
+	}
+	if prep.expandDataCalls != 1 {
+		t.Errorf("expected 1 expand-data call, got %d", prep.expandDataCalls)
+	}
+}
+
+func TestManager_Phase1_SkipExpandData(t *testing.T) {
+	paths.SetRootsForTest(t)
+
+	bus := events.NewBus()
+	defer bus.Close()
+
+	prep := &fakeDiskPreparer{
+		coreExists: true,
+		partitionState: &PartitionState{
+			Disk:               "/dev/sda",
+			RootPartition:      "/dev/sda2",
+			DataPartition:      "/dev/sda3",
+			DataNeedsExpansion: false,
+		},
+	}
+
+	mgr := NewManager(prep, bus, nil)
+	mgr.StartPartitioningAsync(context.Background())
+
+	if err := mgr.WaitForPhase1(context.Background()); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if prep.expandDataCalls != 0 {
+		t.Errorf("expected 0 expand-data calls, got %d", prep.expandDataCalls)
 	}
 }
 
@@ -666,6 +756,7 @@ type fakeDiskPreparerFunc struct {
 	getPartitionState func(ctx context.Context) (*PartitionState, error)
 	createPartition   func(ctx context.Context, disk string) (string, int, error)
 	expandRoot        func(ctx context.Context, disk string, rootPartition string) error
+	expandData        func(ctx context.Context, disk string, dataPartition string) error
 	ensureDirs        func(ctx context.Context) error
 }
 
@@ -693,6 +784,13 @@ func (f *fakeDiskPreparerFunc) CreateDataPartition(ctx context.Context, disk str
 func (f *fakeDiskPreparerFunc) ExpandRootPartition(ctx context.Context, disk string, rootPartition string) error {
 	if f.expandRoot != nil {
 		return f.expandRoot(ctx, disk, rootPartition)
+	}
+	return nil
+}
+
+func (f *fakeDiskPreparerFunc) ExpandDataPartition(ctx context.Context, disk string, dataPartition string) error {
+	if f.expandData != nil {
+		return f.expandData(ctx, disk, dataPartition)
 	}
 	return nil
 }

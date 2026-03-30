@@ -39,6 +39,7 @@ type DiskPreparer interface {
 	GetPartitionState(ctx context.Context) (*PartitionState, error)
 	CreateDataPartition(ctx context.Context, disk string) (partDev string, slot int, err error)
 	ExpandRootPartition(ctx context.Context, disk string, rootPartition string) error
+	ExpandDataPartition(ctx context.Context, disk string, dataPartition string) error
 	EnsureDirectories(ctx context.Context) error
 }
 
@@ -264,6 +265,17 @@ func (m *Manager) preparePartitioning(ctx context.Context) error {
 		}
 	}
 
+	// Step 5: Expand data partition if unallocated space follows it.
+	// Must run AFTER root expansion — root expansion uses the data partition as
+	// a growpart boundary, so the data partition must not move until root is done.
+	// Non-fatal: the existing partition and VG are usable at their old size.
+	// Phase 2 ExpandPool will pick up whatever partition size is available.
+	if state.DataNeedsExpansion {
+		if err := m.diskPrep.ExpandDataPartition(ctx, state.Disk, state.DataPartition); err != nil {
+			log.Printf("WARN: data partition expansion failed (non-fatal): %v", err)
+		}
+	}
+
 	// Store data device for post-Phase-1 LVM operations.
 	m.mu.Lock()
 	m.dataDevice = state.DataPartition
@@ -411,6 +423,13 @@ func (m *Manager) UnlockDataVolume(ctx context.Context) error {
 	// Activate the VG (no password — no pool-level LUKS).
 	if err := m.lvmPool.ActivatePool(ctx); err != nil {
 		return fmt.Errorf("activate LVM pool: %w", err)
+	}
+
+	// Expand PV and thin pool if the data partition grew (Phase 1 growpart).
+	// Must run before StartHealthMonitor to avoid false threshold alerts from
+	// the pool's pre-expansion size. Non-fatal: pool works at old size.
+	if err := m.lvmPool.ExpandPool(ctx, device); err != nil {
+		log.Printf("WARN: thin pool expansion failed (non-fatal): %v", err)
 	}
 
 	// Ensure directory layout.
