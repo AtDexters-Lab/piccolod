@@ -438,7 +438,7 @@ class _FinishingStep extends StatelessWidget {
 
   static const Map<SetupPhase, String> _phaseLabels = {
     SetupPhase.encrypting: 'Encrypting storage\u2026',
-    SetupPhase.creatingAdmin: 'Creating admin account\u2026',
+    SetupPhase.creatingAdmin: 'Setting up your account\u2026',
     SetupPhase.generatingKey: 'Generating recovery key\u2026',
   };
 
@@ -697,7 +697,7 @@ class _WelcomeStep extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           Text(
-            "Let's set up your Piccolo.\nCreate an admin password and save a recovery key. Takes about a minute.",
+            "Let's set up your Piccolo.\nCreate an encryption password and save a recovery key. Takes about a minute.",
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               color: PiccoloTheme.inkMuted,
             ),
@@ -1083,7 +1083,7 @@ class _CredentialsStepState extends State<_CredentialsStep> {
             PasswordSetForm(
               passwordController: _passController,
               confirmController: _confirmController,
-              passwordLabel: 'Admin password',
+              passwordLabel: 'Encryption password',
               confirmLabel: 'Confirm password',
               passwordError: _error,
               confirmError: _confirmError,
@@ -1193,7 +1193,7 @@ class _RecoveryStepState extends State<_RecoveryStep> {
                 SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    "Your 24-word recovery key is below. Store it offline; you'll need it to reset your password.",
+                    "Your 24-word recovery key is below. Store it offline; you'll need it to reset your encryption password.",
                     style: TextStyle(
                       fontSize: 13,
                       color: PiccoloTheme.inkMuted,
@@ -1730,17 +1730,9 @@ class _PasskeyRequiredStepState extends State<_PasskeyRequiredStep> {
           ),
           const SizedBox(height: 8),
           Text(
-            'A passkey is your daily key \u2014 fast, phishing-proof sign-in without typing your encryption password.',
+            'A passkey lets you sign in quickly without typing your encryption password. '
+            'When prompted, save it on a device you carry with you \u2014 like your phone \u2014 so you can sign in from any network.',
             style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
-          ),
-          const SizedBox(height: 12),
-          Text(
-            '\u2022 When you tap Create Passkey, your browser will ask where to save it \u2014 your phone, a security key, or this device.\n'
-            '\u2022 If you access this device from multiple networks, register a passkey you carry with you (like your phone).\n'
-            '\u2022 You can add more passkeys later from Settings.',
-            style: PiccoloTheme.textTheme.labelSmall?.copyWith(
-              color: PiccoloTheme.inkMuted, height: 1.5,
-            ),
           ),
           const SizedBox(height: 24),
           if (_error != null)
@@ -1864,7 +1856,7 @@ class _ForgotPasswordStepState extends State<_ForgotPasswordStep> {
 
         children: [
           const Text(
-            'Enter your 24-word recovery key to reset your password.',
+            'Enter your 24-word recovery key to reset your encryption password.',
 
             style: TextStyle(color: PiccoloTheme.inkMuted, fontSize: 13),
           ),
