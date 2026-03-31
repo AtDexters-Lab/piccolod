@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -323,6 +324,10 @@ func (s *GinServer) requireSetupState() gin.HandlerFunc {
 // remote callers whose public IP matches the device's STUN-discovered public IP.
 // This enables setup endpoints to work from the remote domain after the redirect
 // when the user is on the same network as the device.
+//
+// NOTE: currently unused — removed from /crypto/setup (nonce is the trust anchor).
+// Retained with diagnostic logging to root-cause the relay-client-IP hint pipeline
+// failure before re-enabling on future endpoints.
 func (s *GinServer) allowLANOrSamePublicIP() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if isLANRequest(c) {
@@ -339,11 +344,16 @@ func (s *GinServer) allowLANOrSamePublicIP() gin.HandlerFunc {
 			if deviceIP == "" {
 				deviceIP = s.stunService.Refresh() // cold-cache fill, at most once
 			}
-			if clientIP != "" && deviceIP != "" &&
-				stun.NormalizeIP(clientIP) == stun.NormalizeIP(deviceIP) {
+			normClient := stun.NormalizeIP(clientIP)
+			normDevice := stun.NormalizeIP(deviceIP)
+			if clientIP != "" && deviceIP != "" && normClient == normDevice {
 				c.Next()
 				return
 			}
+			log.Printf("WARN: allowLANOrSamePublicIP denied %s %s: relayClientIP=%q (norm=%q) stunDeviceIP=%q (norm=%q)",
+				c.Request.Method, c.Request.URL.Path, clientIP, normClient, deviceIP, normDevice)
+		} else {
+			log.Printf("WARN: allowLANOrSamePublicIP denied %s %s: stunService is nil", c.Request.Method, c.Request.URL.Path)
 		}
 
 		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: LAN or same network required"})
