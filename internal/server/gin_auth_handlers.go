@@ -351,12 +351,15 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 		return
 	}
 
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
+
 	// 1. Update User Manager (Primary Source of Truth for Login)
 	// If user manager is available, we use it to update the user's password.
 	if s.userManager != nil {
 		sess, _ := s.sessions.Get(id)
 		if sess.UserID != "" {
-			if err := s.userManager.ChangePassword(c.Request.Context(), sess.UserID, body.OldPassword, body.NewPassword); err != nil {
+			if err := s.userManager.ChangePassword(ctx, sess.UserID, body.OldPassword, body.NewPassword); err != nil {
 				if errors.Is(err, persistence.ErrLocked) {
 					c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
 					return
@@ -373,11 +376,11 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 			// This is required for crypto/unlock handlers that still rely on authManager.
 			// We do this silently as a best-effort sync.
 			if sess.Role == "admin" || sess.User == "admin" {
-				_ = s.authManager.ChangePassword(c.Request.Context(), body.OldPassword, body.NewPassword)
+				_ = s.authManager.ChangePassword(ctx, body.OldPassword, body.NewPassword)
 			}
 		} else {
 			// Fallback for sessions without UserID (legacy/migration edge case)
-			if err := s.authManager.ChangePassword(c.Request.Context(), body.OldPassword, body.NewPassword); err != nil {
+			if err := s.authManager.ChangePassword(ctx, body.OldPassword, body.NewPassword); err != nil {
 				// existing error handling
 				if errors.Is(err, persistence.ErrLocked) {
 					c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
@@ -396,7 +399,7 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 		}
 	} else {
 		// Fallback when user manager is unavailable (should be rare/legacy)
-		if err := s.authManager.ChangePassword(c.Request.Context(), body.OldPassword, body.NewPassword); err != nil {
+		if err := s.authManager.ChangePassword(ctx, body.OldPassword, body.NewPassword); err != nil {
 			if errors.Is(err, persistence.ErrLocked) {
 				c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
 				return
@@ -426,7 +429,7 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 	if sess, ok := s.sessions.Get(id); ok && (sess.Role == "admin" || sess.User == "admin") {
 		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
 			passBytes := []byte(body.NewPassword)
-			if err := kp.ProvisionLUKSKeyslot(c.Request.Context(), 1, passBytes); err != nil {
+			if err := kp.ProvisionLUKSKeyslot(ctx, 1, passBytes); err != nil {
 				log.Printf("WARN: LUKS keyslot 1 rotation: %v", err)
 			}
 			cryptoutil.SecureZero(passBytes)
@@ -437,7 +440,7 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 		PasswordStaleAt: timePtr(time.Time{}),
 		PasswordAckAt:   timePtr(time.Time{}),
 	}
-	if err := s.applyStalenessUpdate(c.Request.Context(), update); err != nil {
+	if err := s.applyStalenessUpdate(ctx, update); err != nil {
 		log.Printf("WARN: failed to clear password staleness: %v", err)
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
@@ -457,7 +460,8 @@ func (s *GinServer) handleAuthStalenessAck(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no flags selected"})
 		return
 	}
-	ctx := c.Request.Context()
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
 	now := time.Now().UTC()
 	falseVal := false
 	update := persistence.AuthStalenessUpdate{}

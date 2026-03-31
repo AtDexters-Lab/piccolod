@@ -2982,6 +2982,8 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 }
 
 // UpdateListeners updates an app instance's listeners and recreates the container if necessary.
+// ctx must NOT be derived from an HTTP request context — callers must use a server-scoped
+// context so that the internal rollback closure (which captures ctx) survives connection drops.
 func (m *AppManager) UpdateListeners(ctx context.Context, instanceID string, listeners []api.AppListener) (*api.AppDefinition, error) {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()

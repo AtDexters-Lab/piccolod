@@ -12,6 +12,7 @@ class PasswordSetForm extends StatefulWidget {
     this.passwordError,
     this.confirmError,
     this.onSubmitted,
+    this.autofocus = false,
   });
   final TextEditingController passwordController;
   final TextEditingController confirmController;
@@ -20,13 +21,15 @@ class PasswordSetForm extends StatefulWidget {
   final String? passwordError;
   final String? confirmError;
   final VoidCallback? onSubmitted;
+  final bool autofocus;
 
   @override
   State<PasswordSetForm> createState() => _PasswordSetFormState();
 }
 
 class _PasswordSetFormState extends State<PasswordSetForm> {
-  bool _obscureText = true;
+  bool _obscurePassword = true;
+  bool _obscureConfirm = true;
   String? _internalConfirmError;
 
   @override
@@ -63,12 +66,6 @@ class _PasswordSetFormState extends State<PasswordSetForm> {
     }
   }
 
-  void _toggleVisibility() {
-    setState(() {
-      _obscureText = !_obscureText;
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -77,7 +74,8 @@ class _PasswordSetFormState extends State<PasswordSetForm> {
       children: [
         TextField(
           controller: widget.passwordController,
-          obscureText: _obscureText,
+          obscureText: _obscurePassword,
+          autofocus: widget.autofocus,
           autofillHints: const [AutofillHints.newPassword],
           decoration: InputDecoration(
             labelText: widget.passwordLabel,
@@ -85,12 +83,12 @@ class _PasswordSetFormState extends State<PasswordSetForm> {
             errorText: widget.passwordError,
             suffixIcon: IconButton(
               icon: Icon(
-                _obscureText
+                _obscurePassword
                     ? PiccoloIcons.visibilityOff
                     : PiccoloIcons.visibility,
                 color: PiccoloTheme.inkMuted,
               ),
-              onPressed: _toggleVisibility,
+              onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
             ),
           ),
         ),
@@ -98,7 +96,7 @@ class _PasswordSetFormState extends State<PasswordSetForm> {
         const SizedBox(height: 16),
         TextField(
           controller: widget.confirmController,
-          obscureText: _obscureText,
+          obscureText: _obscureConfirm,
           autofillHints: const [AutofillHints.newPassword],
           decoration: InputDecoration(
             labelText: widget.confirmLabel,
@@ -107,12 +105,12 @@ class _PasswordSetFormState extends State<PasswordSetForm> {
             errorText: widget.confirmError ?? _internalConfirmError,
             suffixIcon: IconButton(
               icon: Icon(
-                _obscureText
+                _obscureConfirm
                     ? PiccoloIcons.visibilityOff
                     : PiccoloIcons.visibility,
                 color: PiccoloTheme.inkMuted,
               ),
-              onPressed: _toggleVisibility,
+              onPressed: () => setState(() => _obscureConfirm = !_obscureConfirm),
             ),
           ),
           onSubmitted: widget.onSubmitted != null

@@ -188,6 +188,31 @@ type GinServer struct {
 
 	// Event bus subscription cleanup (SubscribeWithCancel cancels)
 	busUnsubs []func()
+
+	// Operation context for state-mutating handlers. Derived from Background(),
+	// canceled at the start of Stop(). Decouples mutations from HTTP request
+	// lifetime while remaining visible to graceful shutdown.
+	opCtx    context.Context
+	opCancel context.CancelFunc
+}
+
+// serverContext returns the server-scoped operation context, falling back to
+// context.Background() for test server instances that skip NewGinServer.
+func (s *GinServer) serverContext() context.Context {
+	if s.opCtx != nil {
+		return s.opCtx
+	}
+	return context.Background()
+}
+
+// opContext returns a context for state-mutating operations that survives HTTP
+// disconnections but respects server shutdown. Callers must defer the cancel func.
+func (s *GinServer) opContext(c *gin.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(s.serverContext(), timeout)
+	if taskID := c.GetHeader("X-Piccolo-Task-ID"); taskID != "" {
+		ctx = app.WithTaskID(ctx, taskID)
+	}
+	return ctx, cancel
 }
 
 type secureContextKey struct{}
@@ -745,6 +770,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		installer:      installer,
 		execRunner:     execRunner,
 	}
+	s.opCtx, s.opCancel = context.WithCancel(context.Background())
+
 	// Per-IP rate limiter for public passkey/invite endpoints
 	s.passkeyRateLimiter = newIPRateLimiter(10, 5*time.Minute)
 
@@ -1419,6 +1446,14 @@ func (s *GinServer) Stop(ctx context.Context) error {
 		s.certRefreshUnsub = nil
 	}
 	log.Printf("INFO: Phase 1/3: FENCE complete")
+
+	// Cancel in-flight mutating handlers (using opContext). Placed after FENCE
+	// so handlers get the 5s drain window to complete naturally. Any handler
+	// still holding reconcileMu is force-canceled here, releasing the lock
+	// before DRAIN's StopAllApps needs it.
+	if s.opCancel != nil {
+		s.opCancel()
+	}
 
 	// ── Phase 2: DRAIN (60s) ────────────────────────────────────────────
 	// Stop app event observers, reconciliation, containers, and detach app volumes.
@@ -2852,6 +2887,10 @@ func (s *GinServer) observeRemoteConfig(bus *events.Bus) {
 	}()
 }
 
+// portClaimsDebounceDelay is the trailing-edge debounce window for port claim
+// refreshes, coalescing rapid endpoint changes into a single adapter restart.
+const portClaimsDebounceDelay = 300 * time.Millisecond
+
 // observeRemotePortClaims subscribes to endpoint changes and refreshes port
 // claim mappings on the remote adapter. This fixes the boot race where
 // RestoreServices hasn't populated claims yet when the adapter first starts,
@@ -2863,9 +2902,24 @@ func (s *GinServer) observeRemotePortClaims(bus *events.Bus) {
 	ch, cancel := bus.SubscribeWithCancel(events.TopicServiceEndpointsChanged, 16)
 	s.busUnsubs = append(s.busUnsubs, cancel)
 	go func() {
+		var debounceTimer *time.Timer
+		var mu sync.Mutex
 		for range ch {
-			s.remoteManager.RefreshPortClaims()
+			mu.Lock()
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
+			debounceTimer = time.AfterFunc(portClaimsDebounceDelay, func() {
+				s.remoteManager.RefreshPortClaims()
+			})
+			mu.Unlock()
 		}
+		// Channel closed — clean up any pending timer.
+		mu.Lock()
+		if debounceTimer != nil {
+			debounceTimer.Stop()
+		}
+		mu.Unlock()
 	}()
 }
 

@@ -168,63 +168,93 @@ class _InstallDiskStepState extends State<InstallDiskStep> {
       (d) => d['device'] == _selectedDisk,
       orElse: () => {},
     );
-    final model = selectedDiskInfo['model'] as String? ?? _selectedDisk!;
+    final rawModel = selectedDiskInfo['model'] as String? ?? '';
+    final model = rawModel.isNotEmpty ? rawModel : _selectedDisk!;
     final hasData = selectedDiskInfo['has_data'] as bool? ?? false;
+
+    // For has_data disks: type-to-confirm with the disk model name.
+    // Controller declared in this scope so it survives StatefulBuilder rebuilds.
+    final confirmController = TextEditingController();
 
     final confirmed = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('Confirm Installation'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (hasData) ...[
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: PiccoloTheme.critical.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(Radii.sm),
-                  border: Border.all(
-                    color: PiccoloTheme.critical.withValues(alpha: 0.2),
-                  ),
-                ),
-                child: const Row(
-                  children: [
-                    Icon(PiccoloIcons.warning,
-                        color: PiccoloTheme.critical, size: 20),
-                    SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'This disk contains data that will be permanently destroyed.',
-                        style: TextStyle(fontSize: 13, color: PiccoloTheme.critical),
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          final matches = !hasData ||
+              confirmController.text.trim().toLowerCase() ==
+                  model.trim().toLowerCase();
+          return AlertDialog(
+            title: const Text('Confirm Installation'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (hasData) ...[
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: PiccoloTheme.critical.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(Radii.sm),
+                      border: Border.all(
+                        color: PiccoloTheme.critical.withValues(alpha: 0.2),
                       ),
                     ),
-                  ],
+                    child: const Row(
+                      children: [
+                        Icon(PiccoloIcons.warning,
+                            color: PiccoloTheme.critical, size: 20),
+                        SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'This disk contains data that will be permanently destroyed.',
+                            style: TextStyle(
+                                fontSize: 13, color: PiccoloTheme.critical),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+                Text(
+                  'All data on $model ($_selectedDisk) will be erased. '
+                  'This action cannot be undone.',
                 ),
-              ),
-              const SizedBox(height: 16),
-            ],
-            Text(
-              'All data on $model ($_selectedDisk) will be erased. '
-              'This action cannot be undone.',
+                if (hasData) ...[
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: confirmController,
+                    onChanged: (_) => setDialogState(() {}),
+                    decoration: InputDecoration(
+                      labelText: 'Type "$model" to confirm',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(Radii.sm),
+                      ),
+                    ),
+                  ),
+                ],
+              ],
             ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.critical),
-            child: const Text('Erase and Install'),
-          ),
-        ],
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed:
+                    matches ? () => Navigator.pop(context, true) : null,
+                style: FilledButton.styleFrom(
+                    backgroundColor: PiccoloTheme.critical),
+                child: const Text('Erase and Install'),
+              ),
+            ],
+          );
+        },
       ),
     );
+
+    confirmController.dispose();
 
     if (confirmed != true || !mounted) return;
 

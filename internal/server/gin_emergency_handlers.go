@@ -63,9 +63,10 @@ func (s *GinServer) emergencyMiddleware() gin.HandlerFunc {
 		}
 
 		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error":     "storage emergency",
-			"level":     string(level),
-			"message":   "Device is in storage emergency mode. Limited API access available.",
+			"error":   "storage emergency",
+			"code":    errorCodeStorageEmergency,
+			"level":   string(level),
+			"message": "Device is in storage emergency mode. Limited API access available.",
 		})
 		c.Abort()
 	}
