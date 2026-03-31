@@ -59,6 +59,9 @@ class SetupController extends ChangeNotifier {
   String? _error;
   String? get error => _error;
 
+  String? _passkeyError;
+  String? get passkeyError => _passkeyError;
+
   SetupPhase? _setupPhase;
   SetupPhase? get setupPhase => _setupPhase;
 
@@ -1037,6 +1040,7 @@ class SetupController extends ChangeNotifier {
   }
 
   Future<bool> login(String username, String password) async {
+    _passkeyError = null;
     try {
       await _completeLoginFlow(username, password);
       notifyListeners();
@@ -1213,6 +1217,7 @@ class SetupController extends ChangeNotifier {
 
   Future<bool> loginWithPasskey() async {
     _error = null;
+    _passkeyError = null;
     notifyListeners();
     try {
       final beginResult = await _api.beginPasskeyLogin();
@@ -1253,8 +1258,12 @@ class SetupController extends ChangeNotifier {
       _state = SetupState.complete;
       notifyListeners();
       return true;
+    } on ApiException catch (e) {
+      _passkeyError = _friendlyApiError(e);
+      notifyListeners();
+      return false;
     } on Object catch (e) {
-      _error = _friendlyPasskeyError(e);
+      _passkeyError = _friendlyPasskeyError(e);
       notifyListeners();
       return false;
     }
@@ -1262,6 +1271,7 @@ class SetupController extends ChangeNotifier {
 
   Future<bool> registerPasskey() async {
     _error = null;
+    _passkeyError = null;
     notifyListeners();
     try {
       final beginResult = await _api.beginPasskeyRegistration();
@@ -1285,8 +1295,12 @@ class SetupController extends ChangeNotifier {
       _state = SetupState.complete;
       notifyListeners();
       return true;
+    } on ApiException catch (e) {
+      _passkeyError = _friendlyApiError(e);
+      notifyListeners();
+      return false;
     } on Object catch (e) {
-      _error = _friendlyPasskeyError(e);
+      _passkeyError = _friendlyPasskeyError(e);
       notifyListeners();
       return false;
     }
@@ -1307,6 +1321,7 @@ class SetupController extends ChangeNotifier {
   Future<bool> completeInviteRegistration() async {
     if (_inviteToken == null) return false;
     _error = null;
+    _passkeyError = null;
     notifyListeners();
     try {
       final beginResult = await _api.beginInvitePasskey(_inviteToken!);
@@ -1321,11 +1336,27 @@ class SetupController extends ChangeNotifier {
       _state = SetupState.complete;
       notifyListeners();
       return true;
+    } on ApiException catch (e) {
+      _passkeyError = _friendlyApiError(e);
+      notifyListeners();
+      return false;
     } on Object catch (e) {
-      _error = _friendlyPasskeyError(e);
+      _passkeyError = _friendlyPasskeyError(e);
       notifyListeners();
       return false;
     }
+  }
+
+  String _friendlyApiError(ApiException e) {
+    final serverMsg = _extractServerError(e.message);
+    if (serverMsg.contains('ceremony expired') ||
+        serverMsg == 'ceremony expired or not found') {
+      return 'Session expired. Please try again.';
+    }
+    if (e.statusCode == 401) {
+      return 'Passkey sign-in failed. Please try again or sign in with your password.';
+    }
+    return 'Server error (${e.statusCode}). Please try again.';
   }
 
   String _friendlyPasskeyError(Object e) {
@@ -1342,6 +1373,7 @@ class SetupController extends ChangeNotifier {
     if (msg.contains('not found') || msg.contains('expired')) {
       return 'Session expired. Please try again.';
     }
-    return 'Passkey error: $msg';
+    debugPrint('Unexpected passkey error: $msg');
+    return 'An unexpected error occurred. Please try again.';
   }
 }

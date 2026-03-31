@@ -218,10 +218,11 @@ func (s *GinServer) handlePasskeyRegisterBegin(c *gin.Context) {
 	rpID := s.getRPID(c)
 	rpOrigin := s.computeCanonicalOrigin(c)
 	uv := s.getUserVerification(c)
+	regHost := authpkg.NormalizeHost(c.Request.Host)
 
 	options, sessionID, err := s.webauthnMgr.BeginRegistration(
 		c.Request.Context(), sess.UserID, sess.User,
-		rpID, rpDisplayName, rpOrigin, uv,
+		rpID, rpDisplayName, rpOrigin, regHost, uv,
 	)
 	if err != nil {
 		log.Printf("WARN: passkey register begin: %v", err)
@@ -422,14 +423,19 @@ func (s *GinServer) handleListPasskeys(c *gin.Context) {
 
 	result := make([]gin.H, 0, len(creds))
 	for _, cred := range creds {
-		result = append(result, gin.H{
+		entry := gin.H{
 			"id":            cred.ID,
 			"friendly_name": cred.FriendlyName,
 			"rp_id":         cred.RPID,
 			"created_at":    cred.CreatedAt.Format(time.RFC3339),
-			"last_used_at":  cred.LastUsedAt.Format(time.RFC3339),
 			"transports":    cred.Transports,
-		})
+		}
+		if !cred.LastUsedAt.IsZero() {
+			entry["last_used_at"] = cred.LastUsedAt.Format(time.RFC3339)
+		} else {
+			entry["last_used_at"] = nil
+		}
+		result = append(result, entry)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"passkeys": result})
@@ -664,10 +670,11 @@ func (s *GinServer) handleInvitePasskeyBegin(c *gin.Context) {
 	rpID := s.getRPID(c)
 	rpOrigin := s.computeCanonicalOrigin(c)
 	uv := s.getUserVerification(c)
+	regHost := authpkg.NormalizeHost(c.Request.Host)
 
 	options, sessionID, err := s.webauthnMgr.BeginRegistration(
 		ctx, userID, username,
-		rpID, rpDisplayName, rpOrigin, uv,
+		rpID, rpDisplayName, rpOrigin, regHost, uv,
 	)
 	if err != nil {
 		log.Printf("WARN: invite passkey begin: %v", err)

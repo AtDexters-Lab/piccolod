@@ -198,7 +198,9 @@ func (m *TlsMux) serveTLSConn(c net.Conn, services *ServiceManager) {
 	}
 	// Ensure handshake is complete so SNI is available.
 	if err := tlsConn.Handshake(); err != nil {
-		log.Printf("WARN: tlsmux handshake failed: %v", err)
+		// INFO not WARN: internet scanner probes with obsolete TLS versions are
+		// expected noise on public-facing devices, not actionable warnings.
+		log.Printf("INFO: tlsmux handshake failed: %v", err)
 		_ = tlsConn.Close()
 		return
 	}

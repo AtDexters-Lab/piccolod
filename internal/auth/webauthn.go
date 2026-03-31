@@ -109,7 +109,9 @@ func (m *WebAuthnManager) loadCredentials(ctx context.Context, userID, rpID stri
 }
 
 // BeginRegistration starts a passkey registration ceremony.
-func (m *WebAuthnManager) BeginRegistration(ctx context.Context, userID, username, rpID, rpDisplayName, rpOrigin string, userVerification protocol.UserVerificationRequirement) (*protocol.CredentialCreation, string, error) {
+// registrationHost is the normalized request hostname used for browser picker
+// disambiguation (user.name) and credential FriendlyName.
+func (m *WebAuthnManager) BeginRegistration(ctx context.Context, userID, username, rpID, rpDisplayName, rpOrigin, registrationHost string, userVerification protocol.UserVerificationRequirement) (*protocol.CredentialCreation, string, error) {
 	if m.disabled {
 		return nil, "", ErrWebAuthnDisabled
 	}
@@ -124,9 +126,15 @@ func (m *WebAuthnManager) BeginRegistration(ctx context.Context, userID, usernam
 		return nil, "", err
 	}
 
+	// Construct picker-friendly name: "admin on jane404" for browser credential UI.
+	pickerName := username
+	if registrationHost != "" {
+		pickerName = username + " on " + ShortHostLabel(registrationHost, rpID)
+	}
+
 	user := &webAuthnUser{
 		id:          []byte(userID),
-		name:        username,
+		name:        pickerName,
 		displayName: username,
 		credentials: creds,
 	}
@@ -143,11 +151,12 @@ func (m *WebAuthnManager) BeginRegistration(ctx context.Context, userID, usernam
 	}
 
 	sessionID, err := m.ceremonies.Store(&ceremonySession{
-		UserID:      userID,
-		RPID:        rpID,
-		RPOrigin:    rpOrigin,
-		Type:        ceremonyRegistration,
-		SessionData: session,
+		UserID:           userID,
+		RPID:             rpID,
+		RPOrigin:         rpOrigin,
+		RegistrationHost: registrationHost,
+		Type:             ceremonyRegistration,
+		SessionData:      session,
 	})
 	if err != nil {
 		return nil, "", err
@@ -207,11 +216,11 @@ func (m *WebAuthnManager) FinishRegistration(ctx context.Context, sessionID stri
 		SignCount:       credential.Authenticator.SignCount,
 		RPID:            cs.RPID,
 		AAGUID:          credential.Authenticator.AAGUID,
-		FriendlyName:    "",
+		FriendlyName:    truncate(cs.RegistrationHost, 100),
 		BackupEligible:  credential.Flags.BackupEligible,
 		BackupState:     credential.Flags.BackupState,
 		CreatedAt:       now,
-		LastUsedAt:      now,
+		LastUsedAt:      time.Time{},
 	}
 
 	if err := m.credRepo.Create(ctx, cred); err != nil {
@@ -355,12 +364,13 @@ func (m *WebAuthnManager) CountByUserSplitRP(ctx context.Context, userID, rpID s
 // --- Ceremony Store ---
 
 type ceremonySession struct {
-	UserID      string
-	RPID        string
-	RPOrigin    string
-	Type        ceremonyType
-	SessionData *webauthn.SessionData
-	ExpiresAt   time.Time
+	UserID           string
+	RPID             string
+	RPOrigin         string
+	RegistrationHost string // normalized request host at registration time
+	Type             ceremonyType
+	SessionData      *webauthn.SessionData
+	ExpiresAt        time.Time
 }
 
 type ceremonyStore struct {
@@ -418,4 +428,11 @@ func (s *ceremonyStore) Consume(id string) (*ceremonySession, error) {
 
 func generateSecureToken() (string, error) {
 	return cryptoutil.GenerateSecureToken(32)
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen]
 }

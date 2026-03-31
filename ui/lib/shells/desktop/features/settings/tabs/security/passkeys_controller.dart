@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/webauthn_service.dart';
@@ -112,6 +114,12 @@ class PasskeysController extends ChangeNotifier {
       if (_disposed) return;
 
       await loadPasskeys();
+    } on ApiException catch (e) {
+      if (_disposed) return;
+      _error = _friendlyApiError(e);
+      _isLoading = false;
+      _safeNotify();
+      rethrow;
     } on Object catch (e) {
       if (_disposed) return;
       _error = _friendlyPasskeyError(e);
@@ -161,6 +169,33 @@ class PasskeysController extends ChangeNotifier {
     }
   }
 
+  String _friendlyApiError(ApiException e) {
+    final serverMsg = _extractServerError(e.message);
+    if (serverMsg.contains('ceremony expired') ||
+        serverMsg == 'ceremony expired or not found') {
+      return 'Session expired. Please try again.';
+    }
+    if (e.statusCode == 401) {
+      return 'Your session has expired. Please sign in again.';
+    }
+    return 'Server error (${e.statusCode}). Please try again.';
+  }
+
+  /// Extract a human-readable error from a JSON error response body.
+  String _extractServerError(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map) {
+        if (decoded['message'] is String) return decoded['message'] as String;
+        if (decoded['error'] is String) return decoded['error'] as String;
+      }
+    } on Object catch (_) {}
+    if (body.length > 200 || body.contains('<html>')) {
+      return 'An unexpected error occurred. Please try again.';
+    }
+    return body;
+  }
+
   String _friendlyPasskeyError(Object e) {
     final msg = e.toString();
     if (msg.contains('InvalidStateError') || msg.contains('already registered')) {
@@ -175,6 +210,7 @@ class PasskeysController extends ChangeNotifier {
     if (msg.contains('not found') || msg.contains('expired')) {
       return 'Session expired. Please try again.';
     }
-    return 'Passkey error: $msg';
+    debugPrint('Unexpected passkey error: $msg');
+    return 'An unexpected error occurred. Please try again.';
   }
 }

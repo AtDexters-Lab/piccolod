@@ -1464,6 +1464,7 @@ class _LoginStepState extends State<_LoginStep> {
   final TextEditingController _passController = TextEditingController();
   bool _isSubmitting = false;
   String? _error;
+  String? _passkeyError;
 
   @override
   void initState() {
@@ -1478,10 +1479,15 @@ class _LoginStepState extends State<_LoginStep> {
     super.dispose();
   }
 
+  void _clearErrors() {
+    _error = null;
+    _passkeyError = null;
+  }
+
   Future<void> _submit() async {
     setState(() {
       _isSubmitting = true;
-      _error = null;
+      _clearErrors();
     });
 
     final success = await widget.onLogin(
@@ -1500,7 +1506,7 @@ class _LoginStepState extends State<_LoginStep> {
   Future<void> _loginWithPasskey() async {
     setState(() {
       _isSubmitting = true;
-      _error = null;
+      _clearErrors();
     });
 
     final success = await widget.onLoginWithPasskey();
@@ -1508,7 +1514,7 @@ class _LoginStepState extends State<_LoginStep> {
     if (mounted && !success) {
       setState(() {
         _isSubmitting = false;
-        _error = widget.controller.error;
+        _passkeyError = widget.controller.passkeyError;
       });
     }
   }
@@ -1532,6 +1538,7 @@ class _LoginStepState extends State<_LoginStep> {
             onSubmitPasskey: _loginWithPasskey,
             isLoading: _isSubmitting,
             error: _error,
+            passkeyError: _passkeyError,
             unavailableMessage:
                 'Passkey sign-in is required but unavailable in this browser context. '
                 'Please access this device over HTTPS to sign in.',
@@ -1608,7 +1615,7 @@ class _InviteStepState extends State<_InviteStep> {
     if (mounted && !success) {
       setState(() {
         _isRegistering = false;
-        _error = widget.controller.error;
+        _error = widget.controller.passkeyError;
       });
     }
   }
@@ -1634,6 +1641,13 @@ class _InviteStepState extends State<_InviteStep> {
             Text(
               'Set up your passkey to get started. This will be your fast, phishing-proof sign-in.',
               style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Your browser will ask where to save your passkey. You can add more later from Settings.',
+              style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+                color: PiccoloTheme.inkMuted,
+              ),
             ),
             const SizedBox(height: 24),
             if (_error != null)
@@ -1684,7 +1698,7 @@ class _PasskeyRequiredStepState extends State<_PasskeyRequiredStep> {
     if (mounted && !success) {
       setState(() {
         _isLoading = false;
-        _error = widget.controller.error;
+        _error = widget.controller.passkeyError;
       });
     }
   }
@@ -1705,6 +1719,15 @@ class _PasskeyRequiredStepState extends State<_PasskeyRequiredStep> {
           Text(
             'A passkey is your daily key \u2014 fast, phishing-proof sign-in without typing your encryption password.',
             style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            '\u2022 When you tap Create Passkey, your browser will ask where to save it \u2014 your phone, a security key, or this device.\n'
+            '\u2022 If you access this device from multiple networks, register a passkey you carry with you (like your phone).\n'
+            '\u2022 You can add more passkeys later from Settings.',
+            style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+              color: PiccoloTheme.inkMuted, height: 1.5,
+            ),
           ),
           const SizedBox(height: 24),
           if (_error != null)

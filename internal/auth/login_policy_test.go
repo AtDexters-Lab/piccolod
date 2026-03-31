@@ -106,6 +106,49 @@ func TestDetermineRPID(t *testing.T) {
 	})
 }
 
+func TestNormalizeHost(t *testing.T) {
+	cases := []struct {
+		name, input, want string
+	}{
+		{"plain_host", "piccolo.local", "piccolo.local"},
+		{"with_port", "jane404.piccolospace.com:8443", "jane404.piccolospace.com"},
+		{"uppercase", "Piccolo.Local", "piccolo.local"},
+		{"trailing_dot", "example.com.", "example.com"},
+		{"ipv6_with_port", "[::1]:8080", "::1"},
+		{"ipv4", "192.168.1.100", "192.168.1.100"},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NormalizeHost(tc.input); got != tc.want {
+				t.Fatalf("NormalizeHost(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestShortHostLabel(t *testing.T) {
+	cases := []struct {
+		name, host, rpID, want string
+	}{
+		{"subdomain_stripped", "jane404.piccolospace.com", "piccolospace.com", "jane404"},
+		{"multi_level_subdomain", "a.b.piccolospace.com", "piccolospace.com", "a.b"},
+		{"host_equals_rpid", "piccolospace.com", "piccolospace.com", "piccolospace.com"},
+		{"different_domain", "mydevice.example.com", "piccolospace.com", "mydevice.example.com"},
+		{"local_host", "piccolo.local", "piccolo.local", "piccolo.local"},
+		{"empty_rpid", "jane404.piccolospace.com", "", "jane404.piccolospace.com"},
+		{"empty_host", "", "piccolospace.com", ""},
+		{"ip_address", "192.168.1.100", "piccolospace.com", "192.168.1.100"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ShortHostLabel(tc.host, tc.rpID); got != tc.want {
+				t.Fatalf("ShortHostLabel(%q, %q) = %q, want %q", tc.host, tc.rpID, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAllowedMethods(t *testing.T) {
 	t.Run("remote_secure_has_passkey", func(t *testing.T) {
 		got := AllowedMethods(AccessContextRemote, true, "admin", true)

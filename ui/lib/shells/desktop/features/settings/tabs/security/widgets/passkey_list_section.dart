@@ -231,7 +231,7 @@ class _PasskeyListSectionState extends State<PasskeyListSection> {
       builder: (context) => AlertDialog(
         title: const Text('Remove Passkey'),
         content: Text(
-          'Are you sure you want to remove "${passkey.friendlyName}"? '
+          'Remove "${passkey.friendlyName}"? '
           'You will no longer be able to sign in with this passkey.',
         ),
         actions: [
@@ -245,6 +245,22 @@ class _PasskeyListSectionState extends State<PasskeyListSection> {
               Navigator.of(context).pop();
               try {
                 await _controller.deletePasskey(passkey.id);
+                if (mounted) {
+                  messenger.showSnackBar(
+                    SnackBar(
+                      content: const Text(
+                        'Passkey removed. To stop it appearing in sign-in '
+                        "prompts, also remove it from your browser's "
+                        'password settings.',
+                      ),
+                      duration: const Duration(seconds: 15),
+                      action: SnackBarAction(
+                        label: 'Dismiss',
+                        onPressed: () {},
+                      ),
+                    ),
+                  );
+                }
               } on Object catch (e) {
                 if (mounted) {
                   messenger.showSnackBar(
@@ -314,15 +330,13 @@ class _PasskeyCard extends StatelessWidget {
                         color: PiccoloTheme.inkMuted,
                       ),
                     ),
-                    if (passkey.lastUsedAt != null) ...[
-                      const SizedBox(width: Spacing.sm),
-                      Text(
-                        'Last used ${_formatDate(passkey.lastUsedAt!)}',
-                        style: PiccoloTheme.textTheme.labelSmall?.copyWith(
-                          color: PiccoloTheme.inkMuted,
-                        ),
+                    const SizedBox(width: Spacing.sm),
+                    Text(
+                      'Last used ${passkey.lastUsedAt != null ? _formatDate(passkey.lastUsedAt!) : 'Never'}',
+                      style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+                        color: PiccoloTheme.inkMuted,
                       ),
-                    ],
+                    ),
                   ],
                 ),
               ],
@@ -371,11 +385,29 @@ class _PasskeyCard extends StatelessWidget {
   }
 
   static String _formatDate(DateTime date) {
+    final localDate = date.toLocal();
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final dateDay = DateTime(localDate.year, localDate.month, localDate.day);
+    final time = _formatTime(localDate);
+
+    if (dateDay == today) return 'Today, $time';
+    if (dateDay == today.subtract(const Duration(days: 1))) {
+      return 'Yesterday, $time';
+    }
+
     final months = [
       'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
     ];
-    return '${months[date.month - 1]} ${date.day}, ${date.year}';
+    return '${months[localDate.month - 1]} ${localDate.day}, ${localDate.year}';
+  }
+
+  static String _formatTime(DateTime date) {
+    final hour = date.hour % 12 == 0 ? 12 : date.hour % 12;
+    final minute = date.minute.toString().padLeft(2, '0');
+    final period = date.hour < 12 ? 'AM' : 'PM';
+    return '$hour:$minute $period';
   }
 }
 

@@ -18,6 +18,7 @@ class LoginFormFields extends StatefulWidget {
     required this.onSubmitPasskey,
     required this.isLoading,
     this.error,
+    this.passkeyError,
     this.unavailableMessage,
     super.key,
   });
@@ -32,6 +33,9 @@ class LoginFormFields extends StatefulWidget {
   final VoidCallback onSubmitPasskey;
   final bool isLoading;
   final String? error;
+
+  /// Error from a passkey operation, shown near the passkey button.
+  final String? passkeyError;
 
   /// Message shown when neither passkey nor password is available.
   final String? unavailableMessage;
@@ -81,6 +85,14 @@ class _LoginFormFieldsState extends State<LoginFormFields> {
             icon: const Icon(PiccoloIcons.fingerprint),
             label: const Text('Sign in with Passkey'),
           ),
+          if (widget.passkeyError != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              widget.passkeyError!,
+              style: PiccoloTheme.textTheme.bodySmall
+                  ?.copyWith(color: PiccoloTheme.critical),
+            ),
+          ],
           if (showPassword) ...[
             const SizedBox(height: 16),
             Row(

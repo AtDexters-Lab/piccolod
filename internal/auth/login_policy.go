@@ -11,7 +11,7 @@ import (
 type AccessContext int
 
 const (
-	AccessContextLAN    AccessContext = iota
+	AccessContextLAN AccessContext = iota
 	AccessContextRemote
 )
 
@@ -21,6 +21,29 @@ func (c AccessContext) String() string {
 		return "remote"
 	}
 	return "lan"
+}
+
+// NormalizeHost extracts a clean hostname from a request Host header:
+// strips port, lowercases, and removes any trailing dot.
+func NormalizeHost(requestHost string) string {
+	host := requestHost
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return strings.ToLower(strings.TrimSuffix(host, "."))
+}
+
+// ShortHostLabel returns a concise host label for browser credential pickers.
+// If the host is a subdomain of rpID, strips the rpID suffix (e.g.
+// "jane404.piccolospace.com" with rpID "piccolospace.com" → "jane404").
+// Otherwise returns the full host.
+func ShortHostLabel(host, rpID string) string {
+	if rpID != "" && host != rpID && strings.HasSuffix(host, "."+rpID) {
+		if short := strings.TrimSuffix(host, "."+rpID); short != "" {
+			return short
+		}
+	}
+	return host
 }
 
 // DetermineRPID derives the WebAuthn RP ID from the request hostname.
@@ -35,11 +58,7 @@ func (c AccessContext) String() string {
 // mydevice.example.com), the base domain doesn't apply — the RP ID is the
 // request host itself, giving that domain its own independent passkey.
 func DetermineRPID(requestHost, baseDomain string) string {
-	host := requestHost
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	host := NormalizeHost(requestHost)
 
 	// .local hostnames: use the full hostname as RP ID
 	if strings.HasSuffix(host, ".local") {

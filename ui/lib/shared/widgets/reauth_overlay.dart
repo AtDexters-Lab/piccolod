@@ -30,6 +30,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
   final TextEditingController _passwordController = TextEditingController();
   bool _isLoading = false;
   String? _error;
+  String? _passkeyError;
   List<String>? _methods;
 
   @override
@@ -63,9 +64,14 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
     if (mounted) setState(() => _methods = ['password']);
   }
 
+  void _clearErrors() {
+    _error = null;
+    _passkeyError = null;
+  }
+
   Future<void> _loginWithPasskey() async {
     if (_isLoading) return;
-    setState(() { _isLoading = true; _error = null; });
+    setState(() { _isLoading = true; _clearErrors(); });
 
     try {
       final beginResult = await ApiClient().beginPasskeyLogin();
@@ -83,7 +89,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
       if (mounted) {
         setState(() {
           _isLoading = false;
-          _error = 'Passkey login failed';
+          _passkeyError = 'Passkey login failed. Please try again or use your password.';
         });
       }
     } on Object catch (e) {
@@ -92,9 +98,9 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
           _isLoading = false;
           final msg = e.toString();
           if (msg.contains('NotAllowedError') || msg.contains('cancelled')) {
-            _error = 'Cancelled or timed out. If using a phone, ensure Bluetooth is on and devices are nearby.';
+            _passkeyError = 'Cancelled or timed out. If using a phone, ensure Bluetooth is on and devices are nearby.';
           } else {
-            _error = 'Passkey login failed';
+            _passkeyError = 'Passkey login failed';
           }
         });
       }
@@ -122,13 +128,13 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
     final username = _usernameController.text.trim();
     final password = _passwordController.text;
     if (username.isEmpty || password.isEmpty) {
-      setState(() => _error = 'Username and password required');
+      setState(() { _clearErrors(); _error = 'Username and password required'; });
       return;
     }
 
     setState(() {
       _isLoading = true;
-      _error = null;
+      _clearErrors();
     });
 
     try {
@@ -207,6 +213,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
                           onSubmitPasskey: _loginWithPasskey,
                           isLoading: _isLoading,
                           error: _error,
+                          passkeyError: _passkeyError,
                         ),
                         const SizedBox(height: 24),
                         Row(
