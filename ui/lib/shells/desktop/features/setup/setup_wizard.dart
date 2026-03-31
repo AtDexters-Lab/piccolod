@@ -733,19 +733,23 @@ class _PreparingRemoteStep extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           const SizedBox(height: 8),
-          const CircularProgressIndicator(color: PiccoloTheme.cobalt600),
-          const SizedBox(height: 24),
-          Text(
-            'Preparing your remote address\u2026',
-            style: PiccoloTheme.textTheme.titleMedium,
-            textAlign: TextAlign.center,
-          ),
+          if (relayReady && certReady)
+            Text('Redirecting\u2026', style: PiccoloTheme.textTheme.bodySmall, textAlign: TextAlign.center)
+          else
+            Text(
+              'Preparing your remote address\u2026',
+              style: PiccoloTheme.textTheme.titleMedium,
+              textAlign: TextAlign.center,
+            ),
           const SizedBox(height: 24),
           _readinessRow('Connecting relay', relayReady),
           const SizedBox(height: 8),
           _readinessRow('Securing certificate', certReady),
           const SizedBox(height: 24),
           TextButton(
+            style: TextButton.styleFrom(
+              textStyle: PiccoloTheme.textTheme.bodySmall,
+            ),
             onPressed: onSkip,
             child: const Text('Continue on local network'),
           ),
@@ -890,6 +894,12 @@ class _RemoteAddressStepState extends State<_RemoteAddressStep> {
             ),
             textAlign: TextAlign.center,
           ),
+          const SizedBox(height: 6),
+          Text(
+            'This will be your web address for accessing Piccolo from anywhere.',
+            style: PiccoloTheme.textTheme.bodySmall,
+            textAlign: TextAlign.center,
+          ),
           const SizedBox(height: 24),
           // Unified input container: editable hostname + fixed domain suffix
           // in a single visual box matching the TextField theme.
@@ -978,6 +988,9 @@ class _RemoteAddressStepState extends State<_RemoteAddressStep> {
             ),
             const SizedBox(height: 8),
             TextButton(
+              style: TextButton.styleFrom(
+                textStyle: PiccoloTheme.textTheme.bodySmall,
+              ),
               onPressed: widget.onSkip,
               child: const Text('Skip for now'),
             ),
