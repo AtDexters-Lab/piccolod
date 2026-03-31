@@ -1679,10 +1679,12 @@ func (s *GinServer) setupGinRoutes() {
 		lanPublic.POST("/crypto/reset-password", s.handleCryptoResetPassword)
 		lanPublic.GET("/crypto/recovery-key", s.handleCryptoRecoveryStatus)
 
-		// Crypto setup: LAN or same public IP (nonce validated inside handler).
+		// Crypto setup: nonce validated inside handler (proves LAN-originated setup).
+		// No network middleware — the setup nonce is the trust anchor. The nonce was
+		// minted by setup-hostname (LAN-only), so a valid nonce proves physical access.
 		// NOT gated by requireSetupState — the handler is idempotent and needed
 		// for partial-setup recovery after reboot (crypto initialized but no admin user).
-		v1.POST("/crypto/setup", s.allowLANOrSamePublicIP(), s.handleCryptoSetup)
+		v1.POST("/crypto/setup", s.handleCryptoSetup)
 
 		// Setup hostname: LAN-only + pre-crypto-init only.
 		// Must be LAN-only so the returned nonce proves physical access.
