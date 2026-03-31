@@ -62,6 +62,15 @@ class SetupController extends ChangeNotifier {
   SetupPhase? _setupPhase;
   SetupPhase? get setupPhase => _setupPhase;
 
+  // Guard against double recovery key generation — each call creates new
+  // entropy and overwrites LUKS keyslot 2, silently invalidating any
+  // previously displayed words.
+  bool _recoveryKeyGenerated = false;
+
+  // Server-authoritative signal: recovery key has not been generated yet
+  // on a post-setup device. Set from boot response, consumed in routing.
+  bool _recoveryKeyPending = false;
+
   List<String> _recoveryWords = [];
   List<String> get recoveryWords => _recoveryWords;
 
@@ -134,7 +143,7 @@ class SetupController extends ChangeNotifier {
       if (_authRequestId != null) {
         debugPrint('OIDC auth request detected: $_authRequestId');
       }
-    } on Object catch (e) {
+    } on FormatException catch (e) {
       debugPrint('Failed to parse URL: $e');
     }
   }
@@ -146,7 +155,7 @@ class SetupController extends ChangeNotifier {
       if (_nextUrl != null && _nextUrl!.isNotEmpty) {
         debugPrint('Login redirect target detected: $_nextUrl');
       }
-    } on Object catch (e) {
+    } on FormatException catch (e) {
       debugPrint('Failed to parse next URL: $e');
     }
   }
@@ -157,7 +166,7 @@ class SetupController extends ChangeNotifier {
       if (token != null && token.isNotEmpty) {
         _inviteToken = token;
       }
-    } on Object catch (_) {}
+    } on FormatException catch (_) {}
   }
 
   /// Parse setup nonce from URL or sessionStorage (for remote setup redirect).
@@ -184,7 +193,10 @@ class SetupController extends ChangeNotifier {
           _setupNonce = stored;
         }
       }
-    } on Object catch (_) {}
+    } on Object catch (_) {
+      // Catches both FormatException (Uri.base) and DOMException
+      // (sessionStorage/replaceState when storage is disabled).
+    }
   }
 
   /// Detect if we're on the remote domain (HTTPS, not .local, not localhost, not an IP).
@@ -204,18 +216,31 @@ class SetupController extends ChangeNotifier {
     }
   }
 
-  /// Persist current setup step to sessionStorage on LAN (best-effort).
+  /// Persist current setup step to sessionStorage (best-effort).
+  /// sessionStorage is origin-scoped, so LAN and remote cannot interfere.
   void _persistSetupStep() {
-    if (_isRemoteSetup) return;
     try {
       web.window.sessionStorage.setItem('setup_step', _state.name);
+      if (_state == SetupState.preparingRemote) {
+        if (_pendingFqdn != null) {
+          web.window.sessionStorage.setItem('pending_fqdn', _pendingFqdn!);
+        }
+        if (_pendingNonce != null) {
+          web.window.sessionStorage.setItem('pending_nonce', _pendingNonce!);
+        }
+      }
     } on Object catch (_) {}
   }
 
-  /// Clear persisted setup step from sessionStorage.
+  /// Clear persisted setup step and auxiliary data from sessionStorage.
+  /// Note: setup_nonce is NOT cleared here — it has its own lifecycle
+  /// (cleared in submitCredentials after server-side consumption) and must
+  /// survive across retries and refresh-after-timeout on the remote domain.
   void _clearPersistedSetupStep() {
     try {
       web.window.sessionStorage.removeItem('setup_step');
+      web.window.sessionStorage.removeItem('pending_fqdn');
+      web.window.sessionStorage.removeItem('pending_nonce');
     } on Object catch (_) {}
   }
 
@@ -249,6 +274,13 @@ class SetupController extends ChangeNotifier {
 
       final boot = await _api.get('/api/v1/system/boot') as Map<String, dynamic>;
       final screen = boot['screen'] as String?;
+
+      // Detect remote setup before the switch — early-return branches
+      // (setup_in_progress waits) need _isRemoteSetup set so
+      // proceedAfterRecovery() routes correctly after recovery key display.
+      if (_isOnRemoteDomain && _setupNonce != null) {
+        _isRemoteSetup = true;
+      }
 
       switch (screen) {
         case 'emergency':
@@ -284,10 +316,12 @@ class SetupController extends ChangeNotifier {
           _isFirstSetupFlow = true;
           _namekEnrolled = boot['namek_enrolled'] == true;
           _namekBaseDomain = boot['namek_base_domain'] as String?;
+
+          if (_enterSetupWaitIfNeeded(boot)) return;
+
           // Remote continuation: on the remote domain with a valid nonce from LAN.
           // Skip to credentials (password step) — address was claimed on LAN.
-          if (_isOnRemoteDomain && _setupNonce != null) {
-            _isRemoteSetup = true;
+          if (_isRemoteSetup) {
             _state = SetupState.credentials;
           } else {
             _state = SetupState.welcome;
@@ -301,6 +335,19 @@ class SetupController extends ChangeNotifier {
                 if (restored == SetupState.remoteAddress ||
                     restored == SetupState.credentials) {
                   _state = restored!;
+                } else if (restored == SetupState.preparingRemote) {
+                  final fqdn = web.window.sessionStorage
+                      .getItem('pending_fqdn');
+                  final nonce = web.window.sessionStorage
+                      .getItem('pending_nonce');
+                  if (fqdn != null && fqdn.isNotEmpty) {
+                    _pendingFqdn = fqdn;
+                    _pendingNonce = nonce;
+                    _state = SetupState.preparingRemote;
+                    _startReadinessPolling();
+                  } else {
+                    _state = SetupState.remoteAddress;
+                  }
                 }
               }
             } on Object catch (_) {}
@@ -308,9 +355,13 @@ class SetupController extends ChangeNotifier {
 
         case 'unlock':
           _clearPersistedSetupStep();
+          _recoveryKeyPending = boot['recovery_key_pending'] == true;
+          if (_enterSetupWaitIfNeeded(boot)) return;
           _state = SetupState.unlock;
 
         case 'login':
+          _recoveryKeyPending = boot['recovery_key_pending'] == true;
+          if (_enterSetupWaitIfNeeded(boot)) return;
           if (_inviteToken != null) {
             _state = SetupState.invite;
           } else {
@@ -319,10 +370,20 @@ class SetupController extends ChangeNotifier {
 
         case 'passkey_required':
           await _api.fetchCsrfToken();
+          if (boot['recovery_key_pending'] == true &&
+              await _generateAndShowRecoveryKey()) {
+            return;
+          }
           _state = SetupState.passkeyRequired;
 
         case 'desktop':
           await _api.fetchCsrfToken();
+
+          // First-run: show recovery key before anything else.
+          if (boot['recovery_key_pending'] == true &&
+              await _generateAndShowRecoveryKey()) {
+            return;
+          }
 
           // If there's an OIDC auth request, complete it immediately
           if (_authRequestId != null) {
@@ -354,6 +415,7 @@ class SetupController extends ChangeNotifier {
 
   void startSetup() {
     _state = SetupState.remoteAddress;
+    _persistSetupStep();
     notifyListeners();
   }
 
@@ -373,6 +435,11 @@ class SetupController extends ChangeNotifier {
   /// Claim a custom hostname on namek and start polling for remote readiness
   /// before redirecting to the remote domain.
   Future<bool> submitHostname(String hostname) async {
+    // Cancel any in-flight readiness poll from a previous claim.
+    _readinessTimer?.cancel();
+    _readinessTimer = null;
+    _pollCancelled = true;
+
     try {
       _settingHostname = true;
       _hostnameError = null;
@@ -393,6 +460,7 @@ class SetupController extends ChangeNotifier {
       _relayReady = false;
       _certReady = false;
       _state = SetupState.preparingRemote;
+      _persistSetupStep();
       notifyListeners();
 
       _startReadinessPolling();
@@ -433,9 +501,13 @@ class SetupController extends ChangeNotifier {
           .get('/api/v1/identity/remote-readiness')
           .timeout(const Duration(seconds: 10)) as Map<String, dynamic>;
       if (_pollCancelled) return;
-      _relayReady = resp['relay'] == true;
-      _certReady = resp['cert'] == true;
-      notifyListeners();
+      final newRelay = resp['relay'] == true;
+      final newCert = resp['cert'] == true;
+      if (newRelay != _relayReady || newCert != _certReady) {
+        _relayReady = newRelay;
+        _certReady = newCert;
+        notifyListeners();
+      }
 
       if (resp['ready'] == true) {
         _pollCancelled = true;
@@ -503,19 +575,34 @@ class SetupController extends ChangeNotifier {
   /// Checks if an API exception represents a storage system error.
   /// Covers LUKS data volume failures (500) and emergency middleware blocks (503).
   bool _isStorageSystemError(ApiException e) {
-    // LUKS data volume failure (HTTP 500).
-    // Coupled to backend error message prefixes in gin_crypto_handlers.go.
-    // False negatives degrade to generic error UI.
+    // Prefer structured error code matching.
+    final code = _extractErrorCode(e.message);
+    if (code == 'storage_init_failed' ||
+        code == 'storage_unlock_failed' ||
+        code == 'storage_emergency') {
+      return true;
+    }
+    // Legacy fallback for older backends without code field.
     if (e.statusCode == 500 &&
         (e.message.contains('data volume initialization failed:') ||
             e.message.contains('data volume unlock failed:'))) {
       return true;
     }
-    // Storage emergency mode (HTTP 503 from emergency middleware).
     if (e.statusCode == 503 && e.message.contains('storage emergency')) {
       return true;
     }
     return false;
+  }
+
+  /// Extract a structured error code from a JSON error response body.
+  String? _extractErrorCode(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map && decoded['code'] is String) {
+        return decoded['code'] as String;
+      }
+    } on Object catch (_) {}
+    return null;
   }
 
   /// Extract a human-readable error from a JSON error response body.
@@ -653,6 +740,128 @@ class SetupController extends ChangeNotifier {
 
   // --- Credentials / Setup flow ---
 
+  /// Generate and display recovery key. Returns true on success (state is
+  /// now [SetupState.recovery]), false if skipped or timed out. On timeout,
+  /// sets [_error] but does NOT mutate [_state] — callers pick their own
+  /// fallback. Guarded against double invocation (each call creates new
+  /// entropy and overwrites LUKS keyslot 2).
+  /// ApiException and other errors propagate to the caller.
+  Future<bool> _generateAndShowRecoveryKey() async {
+    if (_recoveryKeyGenerated) return false;
+    _setupPhase = SetupPhase.generatingKey;
+    notifyListeners();
+    try {
+      final recoveryData = await _api.post(
+        '/api/v1/crypto/recovery-key/generate',
+        body: <String, dynamic>{},
+      ).timeout(const Duration(seconds: 120)) as Map<String, dynamic>?;
+      if (recoveryData != null && recoveryData['words'] != null) {
+        _recoveryWords = List<String>.from(
+            recoveryData['words'] as Iterable<dynamic>);
+        _recoveryKeyGenerated = true;
+        _setupPhase = null;
+        _state = SetupState.recovery;
+        _clearPersistedSetupStep();
+        return true;
+      } else {
+        throw Exception('Failed to generate recovery key');
+      }
+    } on TimeoutException {
+      _setupPhase = null;
+      _error = 'Recovery key generation timed out. '
+          'You can generate one later from Settings.';
+      return false;
+    } on ApiException catch (e) {
+      _setupPhase = null;
+      if (e.statusCode == 403) {
+        // Not authorized (non-admin user) — skip silently.
+        return false;
+      }
+      rethrow;
+    }
+  }
+
+  /// If boot indicates setup is in progress, enter the finishing/wait state.
+  /// Returns true if waiting was started (caller should return early).
+  bool _enterSetupWaitIfNeeded(Map<String, dynamic> boot) {
+    if (boot['setup_in_progress'] != true) return false;
+    _isFirstSetupFlow = true; // setup handler running = first-run
+    _state = SetupState.finishing;
+    _setupPhase = SetupPhase.encrypting;
+    notifyListeners();
+    unawaited(_waitForSetupCompletion());
+    return true;
+  }
+
+  /// Poll /crypto/status until setup handler releases the mutex, then
+  /// recover via boot. Ceiling: 3 minutes (setup takes 30-120s on typical
+  /// hardware; 10min server-side budget is for extreme ARM/eMMC devices
+  /// where a refresh-and-retry is acceptable UX).
+  Future<void> _waitForSetupCompletion() async {
+    _error = null;
+    // Callers set _state/phase before invoking; only notify if not already
+    // in the finishing state (avoids redundant rebuild).
+    if (_state != SetupState.finishing) {
+      _state = SetupState.finishing;
+      _setupPhase = SetupPhase.encrypting;
+      notifyListeners();
+    }
+    for (var i = 0; i < 60; i++) {
+      await Future<void>.delayed(const Duration(seconds: 3));
+      try {
+        final status = await _api.get('/api/v1/crypto/status')
+            as Map<String, dynamic>;
+        if (status['setup_in_progress'] != true) {
+          debugPrint('Setup no longer in progress, recovering via boot');
+          await _recoverAfterSetupComplete();
+          return;
+        }
+      } on Object catch (_) {
+        // Polling failure (network, timeout) is non-fatal; keep trying.
+      }
+    }
+    _setupPhase = null;
+    _error = 'Setup is taking longer than expected. Try refreshing.';
+    _state = SetupState.credentials;
+    notifyListeners();
+  }
+
+  /// After setup is known to be complete (or no longer in progress),
+  /// check boot for session state and route accordingly.
+  /// Uses server-authoritative `recovery_key_pending` to decide whether
+  /// to generate a recovery key, instead of always generating.
+  Future<void> _recoverAfterSetupComplete() async {
+    _setupPhase = null;
+    try {
+      final boot = await _api.get('/api/v1/system/boot')
+          as Map<String, dynamic>;
+      final screen = boot['screen'] as String?;
+      final rkPending = boot['recovery_key_pending'] == true;
+      if (screen == 'desktop' || screen == 'passkey_required') {
+        await _api.fetchCsrfToken();
+        if (!rkPending || !await _generateAndShowRecoveryKey()) {
+          _state = screen == 'passkey_required'
+              ? SetupState.passkeyRequired
+              : SetupState.complete;
+        }
+      } else if (screen == 'login') {
+        _recoveryKeyPending = rkPending;
+        _state = SetupState.login;
+      } else if (screen == 'unlock') {
+        _recoveryKeyPending = rkPending;
+        _state = SetupState.unlock;
+      } else {
+        _state = SetupState.credentials;
+        _error = null;
+      }
+    } on Object catch (e) {
+      debugPrint('Recovery after setup complete failed: $e');
+      _error = e.toString();
+      _state = SetupState.error;
+    }
+    notifyListeners();
+  }
+
   Future<bool> submitCredentials(String password) async {
     try {
       _state = SetupState.finishing;
@@ -680,34 +889,37 @@ class SetupController extends ChangeNotifier {
       await _api.fetchCsrfToken().timeout(timeout);
 
       // 3. Generate Recovery Key
-      _setupPhase = SetupPhase.generatingKey;
-      notifyListeners();
-      final recoveryData = await _api.post(
-        '/api/v1/crypto/recovery-key/generate',
-        body: {'password': password},
-      ).timeout(timeout) as Map<String, dynamic>?;
-
-      if (recoveryData != null && recoveryData['words'] != null) {
-        _recoveryWords = List<String>.from(recoveryData['words'] as Iterable<dynamic>);
-        _setupPhase = null;
-        _state = SetupState.recovery;
-        _clearPersistedSetupStep();
-        notifyListeners();
-        return true;
-      } else {
-        throw Exception('Failed to generate recovery key');
+      final ok = await _generateAndShowRecoveryKey();
+      if (!ok) {
+        // Timeout — setup succeeded but recovery key can be generated later.
+        _state = SetupState.complete;
       }
+      notifyListeners();
+      return ok;
     } on TimeoutException {
       _setupPhase = null;
-      _error = 'Setup is taking longer than expected. Your device may still be working \u2014 try refreshing in a minute.';
-      _state = SetupState.credentials;
-      notifyListeners();
+      // Client timeout does not mean server-side setup finished — the server
+      // has a 10-minute budget. Poll setup_in_progress before recovering,
+      // otherwise we may route to login/unlock while setupMu is still held.
+      try {
+        await _waitForSetupCompletion();
+      } on Object catch (_) {
+        _error = 'Setup is taking longer than expected. '
+            'Your device may still be working \u2014 try refreshing in a minute.';
+        _state = SetupState.credentials;
+        notifyListeners();
+      }
       return false;
     } on ApiException catch (e) {
       _setupPhase = null;
+      final code = _extractErrorCode(e.message);
       if (_isStorageSystemError(e)) {
         _error = _extractServerError(e.message);
         _state = SetupState.systemError;
+      } else if (e.statusCode == 409 && code == 'setup_in_progress') {
+        await _waitForSetupCompletion();
+      } else if (e.statusCode == 409 && code == 'setup_complete') {
+        await _recoverAfterSetupComplete();
       } else {
         _error = _extractServerError(e.message);
         _state = SetupState.credentials;
@@ -719,6 +931,7 @@ class SetupController extends ChangeNotifier {
       final msg = e.toString();
       _error = msg.length > 200 ? 'Setup failed. Please try again.' : msg;
       _state = SetupState.credentials;
+      debugPrint('Unexpected in submitCredentials: ${e.runtimeType}: $e');
       notifyListeners();
       return false;
     }
@@ -755,6 +968,7 @@ class SetupController extends ChangeNotifier {
       notifyListeners();
       return false;
     } on Object catch (e) {
+      debugPrint('Unexpected in unlock: ${e.runtimeType}: $e');
       _error = e.toString();
       notifyListeners();
       return false;
@@ -766,9 +980,37 @@ class SetupController extends ChangeNotifier {
   /// where it left off (auth init, admin creation, session).
   Future<void> _completeSetupAfterUnlock(String password) async {
     debugPrint('Partial setup detected after unlock, completing via /crypto/setup');
-    await _api.post('/api/v1/crypto/setup', body: {'password': password});
-    await _api.fetchCsrfToken();
-    _state = SetupState.complete;
+    if (_recoveryKeyPending) _isFirstSetupFlow = true; // UI stepper
+    _state = SetupState.finishing;
+    _setupPhase = SetupPhase.encrypting;
+    notifyListeners();
+    try {
+      await _api.post('/api/v1/crypto/setup', body: {'password': password});
+    } on ApiException catch (e) {
+      final code = _extractErrorCode(e.message);
+      if (e.statusCode == 409 && code == 'setup_in_progress') {
+        await _waitForSetupCompletion();
+        return;
+      } else if (e.statusCode == 409 && code == 'setup_complete') {
+        // Already done — fall through to recovery key.
+      } else {
+        rethrow;
+      }
+    }
+    try {
+      await _api.fetchCsrfToken();
+      if (!await _generateAndShowRecoveryKey()) {
+        // Timeout or guard — route to login so user can proceed.
+        _state = SetupState.login;
+      }
+    } on Object catch (e) {
+      // Unlock+setup succeeded but recovery key generation failed.
+      // Route to login rather than leaving user stuck on unlock screen.
+      debugPrint('Recovery key after partial setup failed: $e');
+      _setupPhase = null;
+      _state = SetupState.login;
+    }
+    notifyListeners();
   }
 
   /// Attempt password login immediately after a successful unlock.
@@ -805,7 +1047,7 @@ class SetupController extends ChangeNotifier {
       notifyListeners();
       return false;
     } on Object catch (e) {
-      debugPrint('Login failed: $e');
+      debugPrint('Unexpected in login: ${e.runtimeType}: $e');
       final msg = e.toString();
       _error = msg.length > 200 ? 'Login failed. Please try again.' : msg;
       notifyListeners();
@@ -821,6 +1063,11 @@ class SetupController extends ChangeNotifier {
       body: {'username': username, 'password': password, 'next': _nextUrl},
     );
     await _api.fetchCsrfToken();
+
+    // First-run: generate recovery key before any routing (passkey, OIDC,
+    // redirect). Uses server-authoritative _recoveryKeyPending from boot.
+    // Safe before OIDC: OIDC providers can't be configured during first-run.
+    if (_recoveryKeyPending && await _generateAndShowRecoveryKey()) return;
 
     // Check passkey registration requirement from login response.
     if (resp is Map && resp['must_register_passkey'] == true) {
@@ -916,11 +1163,18 @@ class SetupController extends ChangeNotifier {
   }
 
   void proceedAfterRecovery() {
-    if (_isRemoteSetup) {
-      // On remote domain: passkey registration (correct RP ID).
+    if (!_isFirstSetupFlow) {
+      // Non-first-run: recovery key was an interruption during a normal
+      // login. Re-check boot to resume the correct flow (passkey_required,
+      // OIDC redirect, next URL, or desktop). In-memory state like
+      // _authRequestId and _nextUrl survives from initial URL parsing.
+      unawaited(_checkStatus());
+      return;
+    } else if (_isOnRemoteDomain) {
+      // First-run remote: passkey registration (correct RP ID).
       _state = SetupState.passkeyRequired;
     } else {
-      // On LAN: CA certificate download for HTTPS.
+      // First-run LAN: CA certificate download for HTTPS.
       _state = SetupState.security;
     }
     notifyListeners();
@@ -939,16 +1193,22 @@ class SetupController extends ChangeNotifier {
   // --- Passkey ---
 
   Future<void> fetchLoginOptions() async {
-    try {
-      final result = await _api
-          .getLoginOptions()
-          .timeout(const Duration(seconds: 3));
-      _loginMethods = List<String>.from(result['methods'] as List);
-      notifyListeners();
-    } on Object catch (_) {
-      _loginMethods = ['password'];
-      notifyListeners();
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        final result = await _api
+            .getLoginOptions()
+            .timeout(const Duration(seconds: 5));
+        _loginMethods = List<String>.from(result['methods'] as List);
+        notifyListeners();
+        return;
+      } on Object catch (_) {
+        if (attempt < 2) {
+          await Future<void>.delayed(Duration(seconds: 1 << attempt));
+        }
+      }
     }
+    _loginMethods = ['password'];
+    notifyListeners();
   }
 
   Future<bool> loginWithPasskey() async {
@@ -963,6 +1223,14 @@ class SetupController extends ChangeNotifier {
 
       await _api.finishPasskeyLogin(sessionId, credential);
       await _api.fetchCsrfToken();
+
+      // First-run: generate recovery key before any routing.
+      if (_recoveryKeyPending) {
+        if (await _generateAndShowRecoveryKey()) {
+          notifyListeners();
+          return true;
+        }
+      }
 
       final session = await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
       if (session['must_register_passkey'] == true) {

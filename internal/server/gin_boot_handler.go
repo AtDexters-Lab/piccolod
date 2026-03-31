@@ -104,8 +104,15 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 	// 6. Crypto not initialized — first-time setup.
 	//    (Soft emergency falls through here — user can still unlock/login.)
 	cryptoInit := s.cryptoManager != nil && s.cryptoManager.IsInitialized()
+
+	// Compute once: recovery key not yet generated on an initialized device.
+	// HasRecoveryKey reads keyset.json directly (no lock/unlock dependency).
+	// Used by post-setup screens (7-10) to tell the frontend that the first-run
+	// recovery-key step is still pending.
+	recoveryKeyPending := cryptoInit && !s.cryptoManager.HasRecoveryKey()
+
 	if !cryptoInit {
-		resp := gin.H{"screen": bootScreenSetup}
+		resp := gin.H{"screen": bootScreenSetup, "setup_in_progress": s.isSetupInProgress()}
 		if s.identityService != nil {
 			enrolled := s.identityService.IsEnrolled()
 			resp["namek_enrolled"] = enrolled
@@ -120,20 +127,38 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 
 	// 7. Crypto locked — need password to unlock.
 	if s.cryptoManager.IsLocked() {
-		c.JSON(http.StatusOK, gin.H{"screen": bootScreenUnlock})
+		resp := gin.H{"screen": bootScreenUnlock}
+		if sip := s.isSetupInProgress(); sip {
+			resp["setup_in_progress"] = sip
+		}
+		if recoveryKeyPending {
+			resp["recovery_key_pending"] = true
+		}
+		c.JSON(http.StatusOK, resp)
 		return
 	}
 
 	// 8. No valid session — need login.
 	sess := s.getSessionFromContext(c)
 	if sess == nil {
-		c.JSON(http.StatusOK, gin.H{"screen": bootScreenLogin})
+		resp := gin.H{"screen": bootScreenLogin}
+		if sip := s.isSetupInProgress(); sip {
+			resp["setup_in_progress"] = sip
+		}
+		if recoveryKeyPending {
+			resp["recovery_key_pending"] = true
+		}
+		c.JSON(http.StatusOK, resp)
 		return
 	}
 
 	// 9. Passkey registration required — block dashboard until registered.
 	if sess.MustRegisterPasskey {
-		c.JSON(http.StatusOK, gin.H{"screen": bootScreenPasskeyRequired})
+		resp := gin.H{"screen": bootScreenPasskeyRequired}
+		if recoveryKeyPending {
+			resp["recovery_key_pending"] = true
+		}
+		c.JSON(http.StatusOK, resp)
 		return
 	}
 
@@ -146,10 +171,14 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"screen":                bootScreenDesktop,
 		"user":                  sess.User,
 		"has_passkey":           hasPasskey,
 		"must_register_passkey": sess.MustRegisterPasskey,
-	})
+	}
+	if recoveryKeyPending {
+		resp["recovery_key_pending"] = true
+	}
+	c.JSON(http.StatusOK, resp)
 }

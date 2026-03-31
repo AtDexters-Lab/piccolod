@@ -18,6 +18,15 @@ import (
 	"piccolod/internal/persistence"
 )
 
+// Structured error codes returned in JSON responses. Matched by frontend.
+const (
+	errorCodeSetupInProgress     = "setup_in_progress"
+	errorCodeSetupComplete       = "setup_complete"
+	errorCodeStorageInitFailed   = "storage_init_failed"
+	errorCodeStorageUnlockFailed = "storage_unlock_failed"
+	errorCodeStorageEmergency    = "storage_emergency"
+)
+
 // stripNumberedPrefixes removes tokens like "1.", "2", "24." that appear
 // when a user copies the recovery key from the numbered on-screen grid.
 // BIP-39 words are always alphabetic, so any token that is purely digits
@@ -79,6 +88,17 @@ func (s *GinServer) notifyPersistenceLockState(ctx context.Context, locked bool)
 	return err
 }
 
+// isSetupInProgress returns true if the setup mutex is currently held.
+// Point-in-time probe: inherently racy (TOCTOU) but acceptable for
+// polling-based UX — a stale value self-corrects on the next 3s poll.
+func (s *GinServer) isSetupInProgress() bool {
+	if !s.setupMu.TryLock() {
+		return true
+	}
+	s.setupMu.Unlock()
+	return false
+}
+
 // handleCryptoStatus: GET /api/v1/crypto/status
 func (s *GinServer) handleCryptoStatus(c *gin.Context) {
 	init := s.cryptoManager != nil && s.cryptoManager.IsInitialized()
@@ -86,7 +106,7 @@ func (s *GinServer) handleCryptoStatus(c *gin.Context) {
 	if init {
 		locked = s.cryptoManager.IsLocked()
 	}
-	c.JSON(http.StatusOK, gin.H{"initialized": init, "locked": locked})
+	c.JSON(http.StatusOK, gin.H{"initialized": init, "locked": locked, "setup_in_progress": s.isSetupInProgress()})
 }
 
 // handleCryptoSetup: POST /api/v1/crypto/setup { password }
@@ -98,7 +118,7 @@ func (s *GinServer) handleCryptoStatus(c *gin.Context) {
 func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	// Serialize setup requests to prevent concurrent LUKS initialization.
 	if !s.setupMu.TryLock() {
-		c.JSON(http.StatusConflict, gin.H{"error": "setup already in progress"})
+		c.JSON(http.StatusConflict, gin.H{"error": "setup already in progress", "code": errorCodeSetupInProgress})
 		return
 	}
 	defer s.setupMu.Unlock()
@@ -205,7 +225,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "setup state check failed"})
 		return
 	} else if complete {
-		c.JSON(http.StatusConflict, gin.H{"error": "setup already complete"})
+		c.JSON(http.StatusConflict, gin.H{"error": "setup already complete", "code": errorCodeSetupComplete})
 		return
 	}
 
@@ -318,6 +338,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	if luksErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "data volume initialization failed: " + luksErr.Error(),
+			"code":  errorCodeStorageInitFailed,
 		})
 		return
 	}
@@ -406,6 +427,7 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 	resp := gin.H{"message": "ok", "setup_complete": setupComplete}
 	if luksErr != nil {
 		resp["warning"] = "data volume unlock failed: " + luksErr.Error()
+		resp["warning_code"] = errorCodeStorageUnlockFailed
 	}
 	c.JSON(http.StatusOK, resp)
 }

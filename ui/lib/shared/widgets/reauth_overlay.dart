@@ -41,16 +41,26 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
   }
 
   Future<void> _fetchLoginOptions() async {
-    try {
-      final result = await ApiClient()
-          .getLoginOptions()
-          .timeout(const Duration(seconds: 3));
-      if (mounted) {
-        setState(() => _methods = List<String>.from(result['methods'] as List));
+    final api = ApiClient();
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        final result = await api
+            .getLoginOptions()
+            .timeout(const Duration(seconds: 5));
+        if (mounted) {
+          setState(
+              () => _methods = List<String>.from(result['methods'] as List));
+        }
+        return;
+      } on Object catch (_) {
+        if (!mounted) return;
+        if (attempt < 2) {
+          await Future<void>.delayed(Duration(seconds: 1 << attempt));
+          if (!mounted) return;
+        }
       }
-    } on Object catch (_) {
-      if (mounted) setState(() => _methods = ['password']);
     }
+    if (mounted) setState(() => _methods = ['password']);
   }
 
   Future<void> _loginWithPasskey() async {
