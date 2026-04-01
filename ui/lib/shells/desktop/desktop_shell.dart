@@ -3,7 +3,7 @@ import 'package:piccolo_os/shared/widgets/passkey_prompt_overlay.dart';
 import 'package:piccolo_os/shared/widgets/reauth_overlay.dart';
 import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
 import 'package:piccolo_os/shells/desktop/features/access_denied/access_denied_view.dart';
-import 'package:piccolo_os/shells/desktop/features/setup/setup_wizard.dart';
+import 'package:piccolo_os/shells/desktop/features/setup/setup_router.dart';
 import 'package:piccolo_os/shells/desktop/widgets/dock.dart';
 import 'package:piccolo_os/shells/desktop/widgets/stage.dart';
 import 'package:piccolo_os/shells/desktop/widgets/window_frame.dart';
@@ -51,7 +51,7 @@ class _DesktopShellState extends State<DesktopShell> {
                  )
               else if (_controller.needsSetup)
                 Positioned.fill(
-                  child: SetupWizard(onComplete: _controller.completeSetup),
+                  child: SetupRouter(onComplete: _controller.completeSetup),
                 )
               else if (isAccessDeniedRoute)
                 Positioned.fill(
