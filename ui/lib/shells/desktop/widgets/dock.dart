@@ -62,6 +62,9 @@ class Dock extends StatelessWidget {
             _HealthIndicator(controller: controller),
             const SizedBox(width: Spacing.md),
 
+            // Network uplink indicator (WiFi signal, AP mode, reconnecting)
+            _NetworkStatusIndicator(controller: controller),
+
             // Network peers indicator (hidden on remote access)
             if (AppLauncher.isLocalAccess(Uri.base.host.toLowerCase()))
               _NetworkPeersIndicator(controller: controller),
@@ -364,6 +367,162 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
         ),
       ),
     );
+  }
+}
+
+class _NetworkStatusIndicator extends StatefulWidget {
+  const _NetworkStatusIndicator({required this.controller});
+  final DesktopController controller;
+
+  @override
+  State<_NetworkStatusIndicator> createState() => _NetworkStatusIndicatorState();
+}
+
+class _NetworkStatusIndicatorState extends State<_NetworkStatusIndicator> {
+  StreamSubscription<Map<String, dynamic>>? _subscription;
+  String _state = '';
+  String _uplink = '';
+  String? _signalTier;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_onControllerChanged);
+    _subscribe();
+  }
+
+  @override
+  void didUpdateWidget(covariant _NetworkStatusIndicator oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller.removeListener(_onControllerChanged);
+      widget.controller.addListener(_onControllerChanged);
+      _unsubscribe();
+      _subscribe();
+    }
+  }
+
+  void _onControllerChanged() {
+    final client = widget.controller.eventStreamClient;
+    if (client != null && _subscription == null) {
+      _subscribe();
+    }
+  }
+
+  void _subscribe() {
+    final client = widget.controller.eventStreamClient;
+    if (client == null) return;
+    _unsubscribe();
+    _subscription = client.networkStatusEvents.listen(_handleEvent);
+  }
+
+  void _unsubscribe() {
+    unawaited(_subscription?.cancel());
+    _subscription = null;
+  }
+
+  void _handleEvent(Map<String, dynamic> event) {
+    if (!mounted) return;
+    setState(() {
+      _state = event['state'] as String? ?? '';
+      _uplink = event['active_uplink'] as String? ?? '';
+      _signalTier = event['signal_tier'] as String?;
+    });
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onControllerChanged);
+    _unsubscribe();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Only show when not on Ethernet (Ethernet is the normal/default state)
+    if (_state == '' || _state == 'ethernet') {
+      return const SizedBox.shrink();
+    }
+
+    final (color, icon, label, tooltip) = switch (_state) {
+      'wifi_connected' => (
+        _signalColor,
+        PiccoloIcons.wifiOff, // we'll use a wifi icon below
+        _signalLabel,
+        'Connected via WiFi${_signalTier != null ? " ($_signalTier)" : ""}',
+      ),
+      'reconnecting' => (
+        PiccoloTheme.warning,
+        PiccoloIcons.wifiOff,
+        'Reconnecting',
+        'WiFi lost — attempting to reconnect',
+      ),
+      'disconnected' => (
+        PiccoloTheme.critical,
+        PiccoloIcons.wifiOff,
+        'Disconnected',
+        'No network connection',
+      ),
+      'ap_mode' => (
+        PiccoloTheme.cobalt600,
+        Icons.wifi_tethering,
+        'AP Mode',
+        'Broadcasting setup access point',
+      ),
+      _ => (PiccoloTheme.inkMuted, PiccoloIcons.wifiOff, _state, ''),
+    };
+
+    return Padding(
+      padding: const EdgeInsets.only(right: Spacing.md),
+      child: Tooltip(
+        message: tooltip,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.1),
+            borderRadius: BorderRadius.circular(Radii.md),
+            border: Border.all(color: color.withValues(alpha: 0.3)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                _state == 'wifi_connected' ? Icons.wifi : icon,
+                size: 14,
+                color: color,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                label,
+                style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+                  color: PiccoloTheme.ink,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Color get _signalColor {
+    return switch (_signalTier) {
+      'good' || 'fair' => PiccoloTheme.success,
+      'weak' => PiccoloTheme.warning,
+      'poor' => PiccoloTheme.critical,
+      _ => PiccoloTheme.success,
+    };
+  }
+
+  String get _signalLabel {
+    return switch (_signalTier) {
+      'good' => 'WiFi',
+      'fair' => 'WiFi',
+      'weak' => 'WiFi (weak)',
+      'poor' => 'WiFi (poor)',
+      _ => 'WiFi',
+    };
   }
 }
 
