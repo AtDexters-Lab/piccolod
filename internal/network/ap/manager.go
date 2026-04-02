@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -24,7 +25,8 @@ type Manager struct {
 	mu      sync.Mutex
 	active  bool
 	ssid    string
-	apIP    string  // dynamically queried from NM after hotspot activation
+	ssidVal atomic.Value // non-blocking SSID for status queries (set in Start, cleared in Stop)
+	apIP    string       // dynamically queried from NM after hotspot activation
 
 	// Cleanup functions for atomic rollback on partial activation failure.
 	cleanups []func()
@@ -43,7 +45,7 @@ func NewManager(nm nmclient.Client, r runner.CommandRunner) *Manager {
 	return &Manager{
 		nm:     nm,
 		runner: r,
-		fw:     &firewallManager{runner: r},
+		fw:     newFirewallManager(r),
 	}
 }
 
@@ -65,6 +67,7 @@ func (m *Manager) Start(ctx context.Context, device dbus.ObjectPath, macAddr net
 
 	m.cleanups = nil
 	m.ssid = generateSSID(macAddr)
+	m.ssidVal.Store(m.ssid)
 
 	// Step 1: Write DNS redirect config BEFORE activating the hotspot.
 	// NM's shared mode starts its own dnsmasq — we configure it to redirect
@@ -175,6 +178,7 @@ func (m *Manager) Stop(ctx context.Context, device dbus.ObjectPath) error {
 	m.cleanups = nil
 
 	m.active = false
+	m.ssidVal.Store("")
 	log.Printf("INFO: ap: AP mode deactivated")
 	return nil
 }
@@ -187,10 +191,13 @@ func (m *Manager) Active() bool {
 }
 
 // SSID returns the current AP SSID (empty if not active).
+// Non-blocking: reads from an atomic value, safe to call from API handlers
+// while Start/Stop hold mu.
 func (m *Manager) SSID() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.ssid
+	if v, ok := m.ssidVal.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 
 // APIP returns the AP interface IP (empty if not active).
@@ -224,6 +231,7 @@ func (m *Manager) rollback(err error) error {
 		m.cleanups[i]()
 	}
 	m.cleanups = nil
+	m.ssidVal.Store("")
 	return err
 }
 

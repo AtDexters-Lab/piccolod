@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
 
 	"piccolod/internal/runner"
 )
@@ -13,12 +14,25 @@ import (
 const apZone = "piccolo-ap"
 
 // firewallManager manages firewalld rules for the AP zone.
+// All methods are no-ops when firewall-cmd is not available.
 type firewallManager struct {
-	runner runner.CommandRunner
+	runner    runner.CommandRunner
+	available bool
+}
+
+func newFirewallManager(r runner.CommandRunner) *firewallManager {
+	_, err := exec.LookPath("firewall-cmd")
+	if err != nil {
+		log.Printf("INFO: ap: firewall-cmd not found, firewall rules will be skipped")
+	}
+	return &firewallManager{runner: r, available: err == nil}
 }
 
 // ensureZone creates the piccolo-ap zone if it doesn't exist.
 func (f *firewallManager) ensureZone(ctx context.Context) error {
+	if !f.available {
+		return nil
+	}
 	// Check if zone exists
 	if err := f.runner.Run(ctx, "firewall-cmd", "--info-zone="+apZone); err == nil {
 		return nil // already exists
@@ -38,11 +52,17 @@ func (f *firewallManager) ensureZone(ctx context.Context) error {
 
 // assignInterface moves an interface into the AP zone.
 func (f *firewallManager) assignInterface(ctx context.Context, iface string) error {
+	if !f.available {
+		return nil
+	}
 	return f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, "--change-interface="+iface)
 }
 
 // verifyZoneAssignment checks that an interface is in the AP zone.
 func (f *firewallManager) verifyZoneAssignment(ctx context.Context, iface string) bool {
+	if !f.available {
+		return true // assume OK when firewalld unavailable
+	}
 	out, err := f.runner.RunWithOutput(ctx, "firewall-cmd", "--get-zone-of-interface="+iface)
 	if err != nil {
 		return false
@@ -52,6 +72,9 @@ func (f *firewallManager) verifyZoneAssignment(ctx context.Context, iface string
 
 // applyRules adds the AP-mode firewall rules: DHCP, DNS, HTTP.
 func (f *firewallManager) applyRules(ctx context.Context) error {
+	if !f.available {
+		return nil
+	}
 	rules := [][]string{
 		{"--zone=" + apZone, "--add-service=dhcp"},
 		{"--zone=" + apZone, "--add-service=dns"},
@@ -68,12 +91,18 @@ func (f *firewallManager) applyRules(ctx context.Context) error {
 
 // addNATRedirect adds a port forward from 80 to captivePort on the AP zone.
 func (f *firewallManager) addNATRedirect(ctx context.Context, captivePort int) error {
+	if !f.available {
+		return nil
+	}
 	rule := fmt.Sprintf("--add-forward-port=port=80:proto=tcp:toport=%d", captivePort)
 	return f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, rule)
 }
 
 // removeRules removes all runtime rules from the AP zone.
 func (f *firewallManager) removeRules(ctx context.Context) {
+	if !f.available {
+		return
+	}
 	_ = f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, "--remove-service=dhcp")
 	_ = f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, "--remove-service=dns")
 	_ = f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, "--remove-port=80/tcp")
@@ -84,6 +113,9 @@ func (f *firewallManager) removeRules(ctx context.Context) {
 // applySTAValidationLockdown restricts the WiFi interface to DHCP + ICMP only
 // during the STA validation window.
 func (f *firewallManager) applySTAValidationLockdown(ctx context.Context) error {
+	if !f.available {
+		return nil
+	}
 	rules := []string{
 		`rule family="ipv4" service name="dhcp" accept`,
 		`rule family="ipv4" protocol value="icmp" accept`,
@@ -98,6 +130,9 @@ func (f *firewallManager) applySTAValidationLockdown(ctx context.Context) error 
 
 // removeSTAValidationLockdown removes the STA validation firewall rules.
 func (f *firewallManager) removeSTAValidationLockdown(ctx context.Context) {
+	if !f.available {
+		return
+	}
 	rules := []string{
 		`rule family="ipv4" service name="dhcp" accept`,
 		`rule family="ipv4" protocol value="icmp" accept`,

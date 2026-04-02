@@ -10,7 +10,7 @@ import (
 
 func TestFirewall_EnsureZone_AlreadyExists(t *testing.T) {
 	fr := &testutil.FakeRunner{}
-	fw := &firewallManager{runner: fr}
+	fw := &firewallManager{runner: fr, available: true}
 
 	// firewall-cmd --info-zone succeeds → zone exists
 	if err := fw.ensureZone(context.Background()); err != nil {
@@ -28,7 +28,7 @@ func TestFirewall_EnsureZone_AlreadyExists(t *testing.T) {
 
 func TestFirewall_ApplyRules(t *testing.T) {
 	fr := &testutil.FakeRunner{}
-	fw := &firewallManager{runner: fr}
+	fw := &firewallManager{runner: fr, available: true}
 
 	if err := fw.applyRules(context.Background()); err != nil {
 		t.Fatalf("applyRules: %v", err)
@@ -49,7 +49,7 @@ func TestFirewall_ApplyRules(t *testing.T) {
 
 func TestFirewall_AddNATRedirect(t *testing.T) {
 	fr := &testutil.FakeRunner{}
-	fw := &firewallManager{runner: fr}
+	fw := &firewallManager{runner: fr, available: true}
 
 	if err := fw.addNATRedirect(context.Background(), 8080); err != nil {
 		t.Fatalf("addNATRedirect: %v", err)
@@ -66,7 +66,7 @@ func TestFirewall_AddNATRedirect(t *testing.T) {
 
 func TestFirewall_AssignInterface(t *testing.T) {
 	fr := &testutil.FakeRunner{}
-	fw := &firewallManager{runner: fr}
+	fw := &firewallManager{runner: fr, available: true}
 
 	if err := fw.assignInterface(context.Background(), "wlan0"); err != nil {
 		t.Fatalf("assignInterface: %v", err)
@@ -83,7 +83,7 @@ func TestFirewall_AssignInterface(t *testing.T) {
 
 func TestFirewall_STAValidationLockdown(t *testing.T) {
 	fr := &testutil.FakeRunner{}
-	fw := &firewallManager{runner: fr}
+	fw := &firewallManager{runner: fr, available: true}
 
 	if err := fw.applySTAValidationLockdown(context.Background()); err != nil {
 		t.Fatalf("applySTAValidationLockdown: %v", err)

@@ -57,7 +57,6 @@ func TestManualAPMode(t *testing.T) {
 		t.Fatalf("ForceAPMode: %v", err)
 	}
 
-	// Read AP info for the banner
 	apStatus := mgr.APStatus()
 	apIP := mgr.apMgr.APIP()
 

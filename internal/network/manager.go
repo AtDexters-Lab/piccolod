@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,7 +42,6 @@ type Manager struct {
 	ethDevices     []nmclient.EthernetDevice
 	wifiAvailable  bool
 	apSuppressed   bool
-	apForced       atomic.Bool // suppresses WiFi disconnect handling during forced AP
 
 	// Scan cache
 	scanCache     []ScanResult
@@ -375,8 +375,14 @@ func (m *Manager) ForgetNetwork() error {
 func (m *Manager) APStatus() APStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	active := m.state.Current() == StateAPMode
+	ssid := ""
+	if active {
+		ssid = m.apSSID()
+	}
 	return APStatus{
-		Active:     m.state.Current() == StateAPMode,
+		Active:     active,
+		SSID:       ssid,
 		Suppressed: m.apSuppressed,
 	}
 }
@@ -387,6 +393,23 @@ func (m *Manager) SetAPSuppressed(suppress bool) error {
 	m.apSuppressed = suppress
 	m.mu.Unlock()
 	return m.saveAPSuppression(suppress)
+}
+
+// waitForAP polls apMgr.Active for up to 20s, respecting context cancellation.
+func (m *Manager) waitForAP() bool {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for i := 0; i < 40; i++ {
+		if m.apMgr.Active() {
+			return true
+		}
+		select {
+		case <-m.ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+	return false
 }
 
 // ForceAPMode transitions directly to AP mode and waits for the AP + portal
@@ -400,25 +423,15 @@ func (m *Manager) ForceAPMode() error {
 		return errNoWifiDevice
 	}
 
-	// Suppress NM state loop's WiFi disconnect handler — NM will fire a
-	// DeviceStateChange when the hotspot tears down WiFi STA, which would
-	// race with AP activation.
-	m.apForced.Store(true)
-
 	m.state.mu.Lock()
 	m.state.transition(StateAPMode, UplinkNone)
 	m.state.mu.Unlock()
 	// handleAPTransition fires from onTransition, starts AP in a goroutine
 
-	// Wait for AP to be ready (up to 20s)
-	for i := 0; i < 40; i++ {
-		if m.apMgr.Active() {
-			return nil
-		}
-		time.Sleep(500 * time.Millisecond)
+	if !m.waitForAP() {
+		return fmt.Errorf("AP activation timed out")
 	}
-	m.apForced.Store(false)
-	return fmt.Errorf("AP activation timed out")
+	return nil
 }
 
 // handleAPTransition starts or stops AP mode based on state transitions.
@@ -445,7 +458,6 @@ func (m *Manager) handleAPTransition(newState ConnState) {
 			}
 		}()
 	} else if m.apMgr.Active() {
-		m.apForced.Store(false) // clear forced flag when leaving AP mode
 		go func() {
 			if dev != nil {
 				m.apMgr.Stop(m.ctx, dev.Path)
@@ -475,11 +487,6 @@ func (m *Manager) connectFromCaptivePortal(ssid, passphrase string) {
 	m.apMgr.Stop(m.ctx, dev.Path)
 
 	// 2. Attempt STA connection (with snapshot/rollback)
-	// Clear apForced regardless of outcome — the flag's purpose (suppressing
-	// NM disconnect signals during AP→hotspot activation) is no longer relevant
-	// once we're in the connect flow.
-	m.apForced.Store(false)
-
 	err := m.Connect(m.ctx, ssid, passphrase)
 
 	if err == nil {
@@ -488,16 +495,49 @@ func (m *Manager) connectFromCaptivePortal(ssid, passphrase string) {
 		return
 	}
 
-	// 3. Failed — reactivate AP + portal with error message
+	// 3. Failed — reactivate AP (unless rollback already restored connectivity).
 	log.Printf("WARN: network: captive portal connect to %q failed: %v — reactivating AP", ssid, err)
-	time.Sleep(2 * time.Second) // let NM settle after failed connect
-
-	if startErr := m.apMgr.Start(m.ctx, dev.Path, dev.HWAddress); startErr != nil {
-		log.Printf("ERROR: network: AP reactivation failed: %v", startErr)
+	select {
+	case <-time.After(2 * time.Second): // let NM settle after failed connect
+	case <-m.ctx.Done():
 		return
 	}
 
-	// Set error message on the new portal server (created by apMgr.Start)
+	// If rollback reconnected WiFi or Ethernet appeared during the settle
+	// window, the state machine already reflects working connectivity.
+	// Don't override it by forcing AP mode.
+	m.state.mu.Lock()
+	cur := m.state.current
+	if cur == StateWiFiSTA || cur == StateEthernet {
+		m.state.mu.Unlock()
+		log.Printf("INFO: network: uplink recovered after failed connect to %q — not reactivating AP", ssid)
+		return
+	}
+
+	// If state machine is already in APMode (common: wrong password never
+	// leaves APMode), transition() is a no-op. Start AP directly.
+	// If state changed (e.g., Reconnecting), transition to APMode and
+	// let handleAPTransition start it.
+	alreadyAP := cur == StateAPMode
+	if !alreadyAP {
+		m.state.transition(StateAPMode, UplinkNone)
+	}
+	m.state.mu.Unlock()
+
+	if alreadyAP {
+		go func() {
+			if startErr := m.apMgr.Start(m.ctx, dev.Path, dev.HWAddress); startErr != nil {
+				log.Printf("ERROR: network: AP reactivation failed: %v", startErr)
+			}
+		}()
+	}
+
+	if !m.waitForAP() {
+		log.Printf("ERROR: network: AP reactivation timed out")
+		return
+	}
+
+	// Set error message on the new portal server
 	if m.portalServer != nil {
 		m.portalServer.SetConnectError("Connection to '" + ssid + "' failed — check your password and try again.")
 	}
@@ -676,11 +716,25 @@ func (m *Manager) handleWifiStateChanges(ctx context.Context, ch <-chan nmclient
 			}
 			switch {
 			case evt.NewState.IsConnected():
+				// NM reports state 100 for both STA and hotspot on the
+				// same WiFi device. When our AP is active, check the
+				// connection ID to filter hotspot activation events.
+				//
+				// Active() may block if Start() is in progress — this
+				// is intentional: Start() holds apMgr.mu, so we only
+				// evaluate after AP activation succeeds or fails.
+				if m.apMgr.Active() {
+					info, err := m.nm.ActiveConnectionInfo(evt.Device)
+					if err != nil {
+						log.Printf("WARN: network: WiFi connected during AP — cannot classify, assuming hotspot: %v", err)
+						continue
+					}
+					if info == nil || strings.HasPrefix(info.ID, nmclient.HotspotIDPrefix) {
+						continue
+					}
+				}
 				m.state.handleWiFiConnected()
 			case evt.OldState.IsConnected() && !evt.NewState.IsConnected():
-				if m.apForced.Load() {
-					continue // suppress during forced AP mode
-				}
 				m.state.handleWiFiDisconnected()
 			}
 		}

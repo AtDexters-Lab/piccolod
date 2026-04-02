@@ -2,9 +2,14 @@ package nmclient
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/godbus/dbus/v5"
 )
+
+// HotspotIDPrefix is the NM connection ID prefix for our AP hotspot profiles.
+// Used to distinguish hotspot connections from STA connections.
+const HotspotIDPrefix = "piccolo-ap-"
 
 // ActivateHotspot configures and activates an open AP-mode hotspot on the
 // given WiFi device. NM handles hostapd internally. The connection profile
@@ -12,7 +17,7 @@ import (
 func (c *DBusClient) ActivateHotspot(device dbus.ObjectPath, ssid string, opts HotspotOpts) error {
 	settings := map[string]map[string]dbus.Variant{
 		"connection": {
-			"id":          dbus.MakeVariant("piccolo-ap-" + ssid),
+			"id":          dbus.MakeVariant(HotspotIDPrefix + ssid),
 			"type":        dbus.MakeVariant("802-11-wireless"),
 			"autoconnect": dbus.MakeVariant(false),
 		},
@@ -87,7 +92,7 @@ func (c *DBusClient) DeactivateHotspot(device dbus.ObjectPath) error {
 		// Check if it's our AP profile before deleting
 		settings, err := c.getConnectionSettings(connPath)
 		if err == nil {
-			if id := variantString(settings["connection"]["id"]); len(id) > 11 && id[:11] == "piccolo-ap-" {
+			if id := variantString(settings["connection"]["id"]); strings.HasPrefix(id, HotspotIDPrefix) {
 				_ = c.obj(connPath).Call(nmSettingsConnIface+".Delete", 0).Err
 			}
 		}
