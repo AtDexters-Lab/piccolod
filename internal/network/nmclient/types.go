@@ -235,6 +235,7 @@ type ConnectionProfile struct {
 // ConnectionSnapshot holds the full settings of a connection profile for rollback.
 type ConnectionSnapshot struct {
 	Path     dbus.ObjectPath
+	Device   dbus.ObjectPath // device to activate on when restoring
 	Settings map[string]map[string]dbus.Variant
 }
 

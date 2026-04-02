@@ -128,31 +128,101 @@ func TestManualAPMode(t *testing.T) {
 		return results, nil
 	}
 
-	// Forward declare so the connect closure can set the error message.
 	var srv *Server
+	var connectFn func(string, string)
 
-	dryRunConnect := func(ssid, passphrase string) {
-		log.Printf("=== DRY-RUN CONNECT (AP MODE) ===")
-		log.Printf("  SSID:       %s", ssid)
+	connectFn = func(targetSSID, passphrase string) {
+		log.Printf("=== REAL CONNECT ===")
+		log.Printf("  SSID:       %s", targetSSID)
 		log.Printf("  Passphrase: %s", passphrase)
 		log.Printf("  ECDH decryption successful!")
-		log.Printf("  (not changing WiFi — dry run)")
-		log.Printf("=================================")
-		// In production the AP tears down and the phone reconnects to home
-		// WiFi. In dry-run the AP stays up, so surface a result message —
-		// the user refreshes/revisits the portal to see it.
+		log.Printf("====================")
+
+		// 1. Stop the captive portal (we're about to tear down the AP)
 		if srv != nil {
-			srv.SetConnectError("Dry-run success: decrypted passphrase for '" + ssid + "'. Refresh to try again.")
+			srv.Stop()
+		}
+
+		// 2. Deactivate AP hotspot (card can't do AP+STA simultaneously)
+		log.Printf("INFO: tearing down AP for STA connection...")
+		if err := nm.DeactivateHotspot(dev.Path); err != nil {
+			log.Printf("WARN: deactivate hotspot: %v", err)
+		}
+		time.Sleep(2 * time.Second)
+
+		// 3. Connect to the target network
+		log.Printf("INFO: connecting to %q...", targetSSID)
+		if err := nm.Connect(dev.Path, targetSSID, passphrase); err != nil {
+			log.Printf("ERROR: connect failed: %v — reactivating AP + captive portal", err)
+			nm.ActivateHotspot(dev.Path, ssid, nmclient.HotspotOpts{})
+			time.Sleep(3 * time.Second)
+			newSrv, srvErr := NewServer(realScan, connectFn, func() {})
+			if srvErr != nil {
+				log.Printf("ERROR: restart captive portal: %v", srvErr)
+				return
+			}
+			srv = newSrv
+			srv.SetConnectError("Connection to '" + targetSSID + "' failed: " + err.Error())
+			if startErr := srv.Start(context.Background(), "0.0.0.0:80"); startErr != nil {
+				log.Printf("ERROR: restart portal server: %v", startErr)
+			} else {
+				log.Printf("INFO: captive portal restarted — connect your phone to %s", ssid)
+			}
+			return
+		}
+
+		// 4. Wait for connection (up to 30s)
+		log.Printf("INFO: waiting for connection activation (up to 30s)...")
+		connected := false
+		for i := 0; i < 30; i++ {
+			time.Sleep(time.Second)
+			state, err := nm.DeviceState(dev.Path)
+			if err == nil && state.IsConnected() {
+				connected = true
+				break
+			}
+			if i%5 == 4 {
+				log.Printf("INFO: still waiting... (attempt %d/30, state=%d)", i+1, state)
+			}
+		}
+
+		if connected {
+			info, _ := nm.ActiveConnectionInfo(dev.Path)
+			ip := ""
+			if info != nil {
+				ip = info.IP4Address
+			}
+			log.Printf("=== CONNECTED! ===")
+			log.Printf("  SSID: %s", targetSSID)
+			log.Printf("  IP:   %s", ip)
+			log.Printf("  The device is now on your home WiFi.")
+			log.Printf("  Open http://piccolo.local or http://%s to access the portal.", ip)
+			log.Printf("==================")
+		} else {
+			log.Printf("ERROR: connection to %q failed — reactivating AP + captive portal", targetSSID)
+			nm.ActivateHotspot(dev.Path, ssid, nmclient.HotspotOpts{})
+			time.Sleep(3 * time.Second) // wait for AP to come up
+
+			// Restart captive portal
+			newSrv, err := NewServer(realScan, connectFn, func() {})
+			if err != nil {
+				log.Printf("ERROR: restart captive portal: %v", err)
+				return
+			}
+			srv = newSrv
+			srv.SetConnectError("Connection to '" + targetSSID + "' failed — check your password and try again.")
+			if err := srv.Start(context.Background(), "0.0.0.0:80"); err != nil {
+				log.Printf("ERROR: restart captive portal server: %v", err)
+			} else {
+				log.Printf("INFO: captive portal restarted — connect your phone to %s", ssid)
+			}
 		}
 	}
 
 	var srvErr error
-	srv, srvErr = NewServer(realScan, dryRunConnect, func() {})
+	srv, srvErr = NewServer(realScan, connectFn, func() {})
 	if srvErr != nil {
 		t.Fatalf("NewServer: %v", srvErr)
-	}
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)

@@ -274,12 +274,15 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 		return errNoWifiDevice
 	}
 
-	// Snapshot for rollback
+	// Snapshot for rollback (includes device path so RestoreConnection can activate)
 	profiles, _ := m.nm.SavedWiFiConnections()
 	var snapshot *nmclient.ConnectionSnapshot
 	for _, p := range profiles {
 		if p.SSID == ssid || len(profiles) == 1 {
 			snapshot, _ = m.nm.SnapshotConnection(p.Path)
+			if snapshot != nil {
+				snapshot.Device = dev.Path
+			}
 			break
 		}
 	}
@@ -294,7 +297,9 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	// Connect
 	if err := m.nm.Connect(dev.Path, ssid, passphrase); err != nil {
 		if snapshot != nil {
-			_ = m.nm.RestoreConnection(snapshot)
+			if err := m.nm.RestoreConnection(snapshot); err != nil {
+				log.Printf("ERROR: network: WiFi rollback failed: %v", err)
+			}
 		}
 		return err
 	}
@@ -307,13 +312,17 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	case <-staCtx.Done():
 		// Preempted by Ethernet — rollback
 		if snapshot != nil {
-			_ = m.nm.RestoreConnection(snapshot)
+			if err := m.nm.RestoreConnection(snapshot); err != nil {
+				log.Printf("ERROR: network: WiFi rollback failed: %v", err)
+			}
 		}
 		return context.Canceled
 	case <-ctx.Done():
 		// Caller cancelled
 		if snapshot != nil {
-			_ = m.nm.RestoreConnection(snapshot)
+			if err := m.nm.RestoreConnection(snapshot); err != nil {
+				log.Printf("ERROR: network: WiFi rollback failed: %v", err)
+			}
 		}
 		return ctx.Err()
 	case <-timer.C:
@@ -321,7 +330,9 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 		state, err := m.nm.DeviceState(dev.Path)
 		if err != nil || !state.IsConnected() {
 			if snapshot != nil {
-				_ = m.nm.RestoreConnection(snapshot)
+				if err := m.nm.RestoreConnection(snapshot); err != nil {
+				log.Printf("ERROR: network: WiFi rollback failed: %v", err)
+			}
 			}
 			return errConnectTimeout
 		}

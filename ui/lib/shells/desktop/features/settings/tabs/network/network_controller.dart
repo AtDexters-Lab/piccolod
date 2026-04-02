@@ -61,6 +61,9 @@ class NetworkController extends ChangeNotifier {
       status = statusResult as WifiStatus;
       apStatus = apResult as WifiAPStatus;
       error = null;
+    } on ApiException catch (e) {
+      if (_disposed) return;
+      error = e.statusCode == 403 ? 'remote_access' : e.toString();
     } catch (e) {
       if (_disposed) return;
       error = e.toString();

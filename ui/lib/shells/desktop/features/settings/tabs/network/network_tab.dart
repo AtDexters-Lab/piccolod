@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/event_stream_client.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/network_controller.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/widgets/ap_mode_card.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/widgets/wifi_network_list.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/widgets/wifi_status_card.dart';
@@ -43,6 +45,33 @@ class _NetworkTabState extends State<NetworkTab> {
         }
 
         if (_controller.error != null && _controller.status == null) {
+          if (_controller.error == 'remote_access') {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(32),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(PiccoloIcons.lock, size: 48, color: PiccoloTheme.inkMuted),
+                    const SizedBox(height: Spacing.base),
+                    Text('Local Access Required',
+                        style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+                    const SizedBox(height: Spacing.sm),
+                    Text(
+                      'WiFi settings can only be managed when you are\nconnected to the same local network as your Piccolo.',
+                      textAlign: TextAlign.center,
+                      style: PiccoloTheme.textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: Spacing.base),
+                    FilledButton.tonal(
+                      onPressed: _controller.refresh,
+                      child: const Text('Check Again'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }
           return Center(
             child: Column(
               mainAxisSize: MainAxisSize.min,

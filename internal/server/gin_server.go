@@ -1856,9 +1856,9 @@ func (s *GinServer) setupGinRoutes() {
 		// Identity / namek endpoints (Admin only)
 		s.registerIdentityRoutes(admin)
 
-		// WiFi management (Admin only, LAN-only)
+		// WiFi management (Admin only, same-network or LAN)
 		wifi := admin.Group("/wifi")
-		wifi.Use(s.allowLANOnly())
+		wifi.Use(s.allowLANOrSamePublicIP())
 		{
 			wifi.GET("/status", s.handleWifiStatus)
 			wifi.POST("/scan", s.handleWifiScan)

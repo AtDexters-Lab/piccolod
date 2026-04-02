@@ -26,29 +26,13 @@ func (c *DBusClient) Connect(device dbus.ObjectPath, ssid, passphrase string) er
 	}
 
 	if existingPath != "" {
-		// Update the existing profile with the new passphrase
-		settings, err := c.getConnectionSettings(existingPath)
-		if err != nil {
-			return fmt.Errorf("nmclient: read settings for update: %w", err)
+		// Delete the old profile and create a fresh one. NM's GetSettings
+		// returns D-Bus types (e.g., ipv6.addresses as a(ayuay)) that don't
+		// round-trip through Go's dbus library (serialized as aav), causing
+		// Update to fail with type mismatches. Creating fresh avoids this.
+		if err := c.obj(existingPath).Call(nmSettingsConnIface+".Delete", 0).Err; err != nil {
+			return fmt.Errorf("nmclient: delete old profile: %w", err)
 		}
-
-		if settings["802-11-wireless-security"] == nil {
-			settings["802-11-wireless-security"] = map[string]dbus.Variant{}
-		}
-		settings["802-11-wireless-security"]["key-mgmt"] = dbus.MakeVariant("wpa-psk")
-		settings["802-11-wireless-security"]["psk"] = dbus.MakeVariant(passphrase)
-
-		// Remove secrets that NM doesn't allow in Update2
-		delete(settings["802-11-wireless-security"], "psk-flags")
-
-		if err := c.obj(existingPath).Call(nmSettingsConnIface+".Update", 0, settings).Err; err != nil {
-			return fmt.Errorf("nmclient: update connection: %w", err)
-		}
-
-		// Activate the updated profile
-		var activePath dbus.ObjectPath
-		return c.nm().Call(nmInterface+".ActivateConnection", 0,
-			existingPath, device, dbus.ObjectPath("/")).Store(&activePath)
 	}
 
 	// Create a new connection profile and activate it
@@ -161,9 +145,72 @@ func (c *DBusClient) SnapshotConnection(path dbus.ObjectPath) (*ConnectionSnapsh
 	}, nil
 }
 
-// RestoreConnection replaces a connection profile's settings with a snapshot.
+// RestoreConnection recreates a WiFi connection profile from a snapshot.
+// Builds clean settings from the snapshot's key fields to avoid D-Bus type
+// mismatches (NM's GetSettings returns types like a(ayuay) that don't
+// round-trip through godbus). This also handles the case where Connect()
+// deleted the original profile (the snapshot path no longer exists).
 func (c *DBusClient) RestoreConnection(snapshot *ConnectionSnapshot) error {
-	return c.obj(snapshot.Path).Call(nmSettingsConnIface+".Update", 0, snapshot.Settings).Err
+	// Extract the essential fields from the snapshot
+	ssid := ""
+	if ws, ok := snapshot.Settings["802-11-wireless"]; ok {
+		if ssidV, ok := ws["ssid"]; ok {
+			if ssidBytes, ok := ssidV.Value().([]byte); ok {
+				ssid = string(ssidBytes)
+			}
+		}
+	}
+	psk := ""
+	if sec, ok := snapshot.Settings["802-11-wireless-security"]; ok {
+		if pskV, ok := sec["psk"]; ok {
+			psk = variantString(pskV)
+		}
+	}
+	connID := ""
+	if conn, ok := snapshot.Settings["connection"]; ok {
+		connID = variantString(conn["id"])
+	}
+
+	if ssid == "" {
+		return fmt.Errorf("nmclient: restore: snapshot has no SSID")
+	}
+	if connID == "" {
+		connID = ssid
+	}
+
+	// Build a clean profile with known-good D-Bus types
+	cleanSettings := map[string]map[string]dbus.Variant{
+		"connection": {
+			"id":          dbus.MakeVariant(connID),
+			"type":        dbus.MakeVariant("802-11-wireless"),
+			"autoconnect": dbus.MakeVariant(true),
+		},
+		"802-11-wireless": {
+			"ssid": dbus.MakeVariant([]byte(ssid)),
+			"mode": dbus.MakeVariant("infrastructure"),
+		},
+		"ipv4": {
+			"method": dbus.MakeVariant("auto"),
+		},
+		"ipv6": {
+			"method": dbus.MakeVariant("auto"),
+		},
+	}
+	if psk != "" {
+		cleanSettings["802-11-wireless-security"] = map[string]dbus.Variant{
+			"key-mgmt": dbus.MakeVariant("wpa-psk"),
+			"psk":      dbus.MakeVariant(psk),
+		}
+	}
+
+	// Use AddAndActivateConnection (not just AddConnection) so the restored
+	// profile is immediately activated. AddConnection only saves to disk —
+	// the device would stay disconnected until NM's autoconnect scanner
+	// picks it up (30-120s+), during which the state machine could escalate
+	// to AP mode.
+	var settingsPath, activePath dbus.ObjectPath
+	return c.nm().Call(nmInterface+".AddAndActivateConnection", 0,
+		cleanSettings, snapshot.Device, dbus.ObjectPath("/")).Store(&settingsPath, &activePath)
 }
 
 // getConnectionSettings reads the settings dict from a connection profile.
