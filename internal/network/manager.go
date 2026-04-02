@@ -41,6 +41,7 @@ type Manager struct {
 	ethDevices     []nmclient.EthernetDevice
 	wifiAvailable  bool
 	apSuppressed   bool
+	apForced       atomic.Bool // suppresses WiFi disconnect handling during forced AP
 
 	// Scan cache
 	scanCache     []ScanResult
@@ -82,9 +83,10 @@ func (m *Manager) Name() string { return "network" }
 func (m *Manager) Start(ctx context.Context) error {
 	m.ctx, m.cancel = context.WithCancel(ctx)
 
-	// Wire health tracker callback on state transitions
-	if m.healthTracker != nil {
-		m.state.onTransition = func(newState ConnState) {
+	// Wire state transition callback. AP lifecycle is unconditional (core
+	// functionality), health reporting is optional (observability).
+	m.state.onTransition = func(newState ConnState) {
+		if m.healthTracker != nil {
 			switch newState {
 			case StateEthernet, StateWiFiSTA:
 				m.healthTracker.Setf("network", health.LevelOK, fmt.Sprintf("connected (%s)", newState))
@@ -93,9 +95,8 @@ func (m *Manager) Start(ctx context.Context) error {
 			case StateDisconnected:
 				m.healthTracker.Setf("network", health.LevelError, "disconnected")
 			}
-			// AP mode lifecycle: start AP when entering, stop when leaving
-			m.handleAPTransition(newState)
 		}
+		m.handleAPTransition(newState)
 	}
 
 	// Startup reconciliation: clean stale AP/firewall/dnsmasq from previous crash
@@ -127,10 +128,7 @@ func (m *Manager) Start(ctx context.Context) error {
 				return out, nil
 			}
 			connectFn := func(ssid, passphrase string) {
-				if err := m.Connect(ctx, ssid, passphrase); err != nil {
-					log.Printf("WARN: captive portal connect to %q failed: %v", ssid, err)
-					m.portalServer.SetConnectError("Connection failed — check your password and try again.")
-				}
+				m.connectFromCaptivePortal(ssid, passphrase)
 			}
 			srv, err := captive.NewServer(scanFn, connectFn, m.apMgr.RecordHTTPActivity)
 			if err != nil {
@@ -391,6 +389,38 @@ func (m *Manager) SetAPSuppressed(suppress bool) error {
 	return m.saveAPSuppression(suppress)
 }
 
+// ForceAPMode transitions directly to AP mode and waits for the AP + portal
+// to be ready. Bypasses the state machine's slow backoff escalation. Used by
+// the manual integration test and could be used for forced AP recovery.
+func (m *Manager) ForceAPMode() error {
+	m.mu.RLock()
+	dev := m.wifiDevice
+	m.mu.RUnlock()
+	if dev == nil {
+		return errNoWifiDevice
+	}
+
+	// Suppress NM state loop's WiFi disconnect handler — NM will fire a
+	// DeviceStateChange when the hotspot tears down WiFi STA, which would
+	// race with AP activation.
+	m.apForced.Store(true)
+
+	m.state.mu.Lock()
+	m.state.transition(StateAPMode, UplinkNone)
+	m.state.mu.Unlock()
+	// handleAPTransition fires from onTransition, starts AP in a goroutine
+
+	// Wait for AP to be ready (up to 20s)
+	for i := 0; i < 40; i++ {
+		if m.apMgr.Active() {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	m.apForced.Store(false)
+	return fmt.Errorf("AP activation timed out")
+}
+
 // handleAPTransition starts or stops AP mode based on state transitions.
 // Called from the onTransition callback (which fires under sm.mu — so this
 // method must not acquire sm.mu).
@@ -415,11 +445,61 @@ func (m *Manager) handleAPTransition(newState ConnState) {
 			}
 		}()
 	} else if m.apMgr.Active() {
+		m.apForced.Store(false) // clear forced flag when leaving AP mode
 		go func() {
 			if dev != nil {
 				m.apMgr.Stop(m.ctx, dev.Path)
 			}
 		}()
+	}
+}
+
+// connectFromCaptivePortal handles the WiFi connect flow initiated from the
+// captive portal. Unlike Connect() (called from the REST API), this method
+// explicitly tears down the AP before attempting STA connection, and restarts
+// the AP + portal with an error message on failure. This avoids the slow
+// state-machine backoff path (which takes minutes to re-enter AP mode).
+func (m *Manager) connectFromCaptivePortal(ssid, passphrase string) {
+	m.mu.RLock()
+	dev := m.wifiDevice
+	m.mu.RUnlock()
+	if dev == nil {
+		return
+	}
+
+	// 1. Stop captive portal + AP (card can't do AP+STA simultaneously)
+	log.Printf("INFO: network: captive portal connect to %q — tearing down AP", ssid)
+	if m.portalServer != nil {
+		m.portalServer.Stop()
+	}
+	m.apMgr.Stop(m.ctx, dev.Path)
+
+	// 2. Attempt STA connection (with snapshot/rollback)
+	// Clear apForced regardless of outcome — the flag's purpose (suppressing
+	// NM disconnect signals during AP→hotspot activation) is no longer relevant
+	// once we're in the connect flow.
+	m.apForced.Store(false)
+
+	err := m.Connect(m.ctx, ssid, passphrase)
+
+	if err == nil {
+		// Connect() already sets hasSavedWifi + savedSSID and calls handleWiFiConnected
+		log.Printf("INFO: network: captive portal connect to %q succeeded", ssid)
+		return
+	}
+
+	// 3. Failed — reactivate AP + portal with error message
+	log.Printf("WARN: network: captive portal connect to %q failed: %v — reactivating AP", ssid, err)
+	time.Sleep(2 * time.Second) // let NM settle after failed connect
+
+	if startErr := m.apMgr.Start(m.ctx, dev.Path, dev.HWAddress); startErr != nil {
+		log.Printf("ERROR: network: AP reactivation failed: %v", startErr)
+		return
+	}
+
+	// Set error message on the new portal server (created by apMgr.Start)
+	if m.portalServer != nil {
+		m.portalServer.SetConnectError("Connection to '" + ssid + "' failed — check your password and try again.")
 	}
 }
 
@@ -598,6 +678,9 @@ func (m *Manager) handleWifiStateChanges(ctx context.Context, ch <-chan nmclient
 			case evt.NewState.IsConnected():
 				m.state.handleWiFiConnected()
 			case evt.OldState.IsConnected() && !evt.NewState.IsConnected():
+				if m.apForced.Load() {
+					continue // suppress during forced AP mode
+				}
 				m.state.handleWiFiDisconnected()
 			}
 		}
