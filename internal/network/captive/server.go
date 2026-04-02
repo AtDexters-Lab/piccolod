@@ -84,7 +84,7 @@ func (s *Server) Start(ctx context.Context, listenAddr string) error {
 			return ctx
 		},
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: 20 * time.Second, // scan can take up to 10s + D-Bus overhead
 	}
 
 	ln, err := net.Listen("tcp", listenAddr)

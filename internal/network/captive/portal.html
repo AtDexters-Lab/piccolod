@@ -20,8 +20,8 @@ h1{font-size:20px;font-weight:600;margin-bottom:4px}
 .signal{font-size:18px;margin-left:8px}
 .form-group{margin-bottom:16px}
 label{display:block;font-size:13px;font-weight:500;color:#555;margin-bottom:4px}
-input[type="password"]{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;outline:none;transition:border .15s}
-input[type="password"]:focus{border-color:#3b82f6}
+#passphrase{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;outline:none;transition:border .15s}
+#passphrase:focus{border-color:#3b82f6}
 button{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;transition:background .15s}
 .btn-primary{background:#3b82f6;color:#fff}
 .btn-primary:hover{background:#2563eb}
@@ -57,7 +57,7 @@ button{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;font
     <p style="font-size:14px;color:#555;margin-bottom:12px">Network: <strong id="selected-ssid"></strong></p>
     <div class="form-group">
       <label for="passphrase">Password</label>
-      <input type="password" id="passphrase" placeholder="Enter WiFi password" autocomplete="off" onkeydown="if(event.key==='Enter')doConnect()">
+      <input type="text" id="passphrase" placeholder="Enter WiFi password" autocomplete="off" onkeydown="if(event.key==='Enter')doConnect()">
     </div>
     <button id="connect-btn" class="btn-primary" onclick="doConnect()">Connect</button>
     <button class="btn-secondary" onclick="showScanView()">Back</button>

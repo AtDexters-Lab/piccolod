@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -53,15 +54,45 @@ func (c *DBusClient) EthernetDevices() ([]EthernetDevice, error) {
 
 // Scan triggers a WiFi scan on the given device and returns visible APs.
 func (c *DBusClient) Scan(device dbus.ObjectPath) ([]AccessPoint, error) {
-	// Request a fresh scan. The option dict can specify SSIDs to probe for,
-	// but we scan for all networks (empty options).
+	// Read LastScan timestamp before requesting a new scan so we can detect
+	// when NM finishes. LastScan is available since NM 1.12 (CLOCK_BOOTTIME ms).
+	var lastScanBefore int64
+	canPoll := false
+	if lsV, err := c.prop(device, nmWirelessInterface, "LastScan"); err == nil {
+		if ts, ok := lsV.Value().(int64); ok && ts > 0 {
+			lastScanBefore = ts
+			canPoll = true
+		}
+	}
+
+	// Request a fresh scan. This is asynchronous — NM starts scanning in the
+	// background and updates AccessPoints when done.
 	opts := map[string]dbus.Variant{}
 	if err := c.obj(device).Call(nmWirelessInterface+".RequestScan", 0, opts).Err; err != nil {
 		// NM may return an error if a scan is already in progress — not fatal.
 		// We still read the current AP list below.
 	}
 
-	// Read the list of access points from the LastScan cache.
+	// Wait for NM to complete the scan.
+	if canPoll {
+		// Poll LastScan for a change (up to 6s, leaving headroom within the
+		// captive portal's WriteTimeout). Check before sleeping so fast scans
+		// are detected promptly.
+		for i := 0; i < 12; i++ {
+			if lsV, err := c.prop(device, nmWirelessInterface, "LastScan"); err == nil {
+				if ts, ok := lsV.Value().(int64); ok && ts > lastScanBefore {
+					break
+				}
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	} else {
+		// LastScan not available (NM < 1.12 or read failed). Fixed 3s wait
+		// as fallback — long enough for most scans, short enough to not annoy.
+		time.Sleep(3 * time.Second)
+	}
+
+	// Read the list of access points from the (now-updated) cache.
 	v, err := c.prop(device, nmWirelessInterface, "AccessPoints")
 	if err != nil {
 		return nil, fmt.Errorf("nmclient: list APs: %w", err)
