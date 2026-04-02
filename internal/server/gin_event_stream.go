@@ -23,6 +23,7 @@ const (
 	topicCertificate    = "certificate"
 	topicNetworkPeers   = "network_peers"
 	topicIdentity       = "identity"
+	topicNetworkStatus  = "network_status"
 )
 
 var supportedTopics = map[string]events.Topic{
@@ -32,6 +33,7 @@ var supportedTopics = map[string]events.Topic{
 	topicCertificate:    events.TopicCertificateChanged,
 	topicNetworkPeers:   events.TopicNetworkPeersChanged,
 	topicIdentity:       events.TopicIdentityChanged,
+	topicNetworkStatus:  events.TopicNetworkStateChanged,
 }
 
 type streamMessage struct {

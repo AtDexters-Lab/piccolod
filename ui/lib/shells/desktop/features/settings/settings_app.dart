@@ -5,6 +5,7 @@ import 'package:piccolo_os/shells/desktop/features/settings/tabs/profile_tab.dar
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_tab.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/security/security_tab.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/system_tab.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/network_tab.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/users/users_tab.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
@@ -17,6 +18,7 @@ class SettingsTab {
   static const int users = 2;
   static const int security = 3;
   static const int system = 4;
+  static const int network = 5;
 }
 
 class SettingsApp extends StatefulWidget {
@@ -108,6 +110,12 @@ class _SettingsAppState extends State<SettingsApp> {
                         isSelected: _controller.selectedIndex == 4,
                         onTap: () => _controller.selectTab(4),
                       ),
+                      _SidebarItem(
+                        icon: PiccoloIcons.router,
+                        label: 'Network',
+                        isSelected: _controller.selectedIndex == 5,
+                        onTap: () => _controller.selectTab(5),
+                      ),
                     ],
                   ),
                 ),
@@ -176,6 +184,8 @@ class _SettingsAppState extends State<SettingsApp> {
         return SecurityTab(controller: _controller);
       case 4:
         return SystemTab(controller: _controller);
+      case 5:
+        return NetworkTab(eventStreamClient: widget.eventStreamClient);
       default:
         return const SizedBox.shrink();
     }

@@ -53,6 +53,9 @@ const (
 	// Identity events (RFC 20260312: namek-managed remote access)
 	TopicIdentityReady   Topic = "identity.ready"   // Emitted when identity service finishes initialization
 	TopicIdentityChanged Topic = "identity.changed" // Emitted on enrollment, enable/disable, hostname change
+
+	// Network state events (WiFi uplink + watchdog)
+	TopicNetworkStateChanged Topic = "network_state_changed" // Emitted on connectivity state transitions, signal tier changes
 )
 
 // Event represents a message broadcast on the event bus.

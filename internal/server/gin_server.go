@@ -30,6 +30,8 @@ import (
 	"piccolod/internal/firewall"
 	"piccolod/internal/health"
 	"piccolod/internal/identity"
+	"piccolod/internal/network"
+	"piccolod/internal/network/nmclient"
 	stunpkg "piccolod/internal/network/stun"
 	"piccolod/internal/onboarding"
 	hostnamepkg "piccolod/internal/hostname"
@@ -167,6 +169,9 @@ type GinServer struct {
 
 	// Persistent terminal sessions
 	terminalManager *terminal.Manager
+
+	// Network manager (WiFi uplink + watchdog)
+	networkManager *network.Manager
 
 	// Namek identity service (RFC 20260312)
 	identityService *identity.Service
@@ -1119,6 +1124,20 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	s.supervisor.Register(identitySvc)
 
+	// Network manager (WiFi uplink + watchdog). D-Bus may be unavailable on
+	// dev machines — degrade gracefully, WiFi API returns available=false.
+	nmClient, nmErr := nmclient.NewDBusClient(execRunner)
+	if nmErr != nil {
+		log.Printf("WARN: network manager: D-Bus unavailable, WiFi disabled: %v", nmErr)
+		healthTracker.Setf("network", health.LevelWarn, "D-Bus unavailable — WiFi disabled")
+	} else {
+		networkMgr := network.NewManager(nmClient, execRunner, eventsBus)
+		networkMgr.SetHealthTracker(healthTracker)
+		s.networkManager = networkMgr
+		s.supervisor.Register(networkMgr)
+		healthTracker.Setf("network", health.LevelWarn, "network manager initializing")
+	}
+
 	// Self-hosted adapter (existing)
 	var nexusAdapter nexusclient.Adapter
 	if os.Getenv("PICCOLO_NEXUS_USE_STUB") == "1" {
@@ -1836,6 +1855,18 @@ func (s *GinServer) setupGinRoutes() {
 
 		// Identity / namek endpoints (Admin only)
 		s.registerIdentityRoutes(admin)
+
+		// WiFi management (Admin only, same-network or LAN)
+		wifi := admin.Group("/wifi")
+		wifi.Use(s.allowLANOrSamePublicIP())
+		{
+			wifi.GET("/status", s.handleWifiStatus)
+			wifi.POST("/scan", s.handleWifiScan)
+			wifi.POST("/connect", s.handleWifiConnect)
+			wifi.POST("/disconnect", s.handleWifiDisconnect)
+			wifi.GET("/ap", s.handleWifiAPStatus)
+			wifi.POST("/ap/suppress", s.handleWifiAPSuppress)
+		}
 
 		// PCV export/import (Admin only)
 		admin.POST("/system/pcv/publish", s.requireUnlocked(), s.handlePCVPublish)

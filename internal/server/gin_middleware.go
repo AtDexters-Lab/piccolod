@@ -322,12 +322,13 @@ func (s *GinServer) requireSetupState() gin.HandlerFunc {
 
 // allowLANOrSamePublicIP allows requests from LAN (non-loopback) IPs or from
 // remote callers whose public IP matches the device's STUN-discovered public IP.
-// This enables setup endpoints to work from the remote domain after the redirect
-// when the user is on the same network as the device.
+// This enables same-network access via Nexus relay for endpoints where the user
+// needs physical proximity but may be accessing via the remote domain.
 //
-// NOTE: currently unused — removed from /crypto/setup (nonce is the trust anchor).
-// Retained with diagnostic logging to root-cause the relay-client-IP hint pipeline
-// failure before re-enabling on future endpoints.
+// Used by: WiFi management routes (/api/v1/wifi/*).
+// Trust model: "same public IP" ≈ "same network". Note that CGNAT environments
+// may share a public IP across unrelated users — accepted risk since admin auth
+// is also required.
 func (s *GinServer) allowLANOrSamePublicIP() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if isLANRequest(c) {

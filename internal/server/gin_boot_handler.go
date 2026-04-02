@@ -1,6 +1,7 @@
 package server
 
 import (
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -112,16 +113,7 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 	recoveryKeyPending := cryptoInit && !s.cryptoManager.HasRecoveryKey()
 
 	if !cryptoInit {
-		resp := gin.H{"screen": bootScreenSetup, "setup_in_progress": s.isSetupInProgress()}
-		if s.identityService != nil {
-			enrolled := s.identityService.IsEnrolled()
-			resp["namek_enrolled"] = enrolled
-			if enrolled {
-				cfg := s.identityService.DeviceConfig()
-				resp["namek_base_domain"] = cfg.BaseDomain
-			}
-		}
-		c.JSON(http.StatusOK, resp)
+		c.JSON(http.StatusOK, s.bootSetupResponse())
 		return
 	}
 
@@ -135,6 +127,21 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 			resp["recovery_key_pending"] = true
 		}
 		c.JSON(http.StatusOK, resp)
+		return
+	}
+
+	// 7b. Crypto unlocked but setup incomplete — route back to setup screen.
+	// Catches daemon restart mid-setup (crypto stays unlocked, no admin user).
+	// Fail toward setup when completeness is indeterminate (SQLite error) —
+	// an already-complete device just triggers a benign 409 setup_complete
+	// from POST /crypto/setup, which the UI handles gracefully. Falling
+	// through to login on a device with no users would leave the user stuck.
+	setupComplete, setupErr := s.isSetupComplete(c.Request.Context())
+	if setupErr != nil {
+		log.Printf("WARN: boot setup-complete check failed, routing to setup: %v", setupErr)
+	}
+	if setupErr != nil || !setupComplete {
+		c.JSON(http.StatusOK, s.bootSetupResponse())
 		return
 	}
 
@@ -181,4 +188,20 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 		resp["recovery_key_pending"] = true
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// bootSetupResponse builds the JSON response for the setup screen, including
+// setup-in-progress state and namek enrollment info. Used by both step 6
+// (crypto not initialized) and step 7b (crypto unlocked, setup incomplete).
+func (s *GinServer) bootSetupResponse() gin.H {
+	resp := gin.H{"screen": bootScreenSetup, "setup_in_progress": s.isSetupInProgress()}
+	if s.identityService != nil {
+		enrolled := s.identityService.IsEnrolled()
+		resp["namek_enrolled"] = enrolled
+		if enrolled {
+			cfg := s.identityService.DeviceConfig()
+			resp["namek_base_domain"] = cfg.BaseDomain
+		}
+	}
+	return resp
 }
