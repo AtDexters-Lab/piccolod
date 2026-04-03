@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,8 +95,21 @@ func (m *Manager) Start(ctx context.Context, device dbus.ObjectPath, macAddr net
 		_ = m.nm.DeactivateHotspot(device)
 	})
 
-	// Brief pause for NM to bring up the interface and assign IP
-	time.Sleep(2 * time.Second)
+	// Step 3b: Wait for NM to finish activating the hotspot. This replaces
+	// the old blind sleep + poll — we now monitor the D-Bus device state and
+	// fail fast if NM can't bring up the AP (e.g., dnsmasq missing).
+	// 10s is generous for NM (typically 1-3s), and keeps total Start()
+	// duration within the 20s waitForAP budget used by ForceAPMode and
+	// connectFromCaptivePortal.
+	waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer waitCancel()
+	nmState, nmReason, waitErr := m.nm.WaitForActivation(waitCtx, device)
+	if waitErr != nil {
+		return m.rollback(fmt.Errorf("wait for hotspot activation: %w", waitErr))
+	}
+	if nmState != nmclient.NMDeviceStateActivated {
+		return m.rollback(fmt.Errorf("NM hotspot activation failed: %s", hotspotFailureMessage(nmState, nmReason)))
+	}
 
 	// Step 4: Verify zone assignment (belt-and-suspenders)
 	iface := deviceInterface(m.nm, device)
@@ -106,28 +120,28 @@ func (m *Manager) Start(ctx context.Context, device dbus.ObjectPath, macAddr net
 		}
 	}
 
-	// Step 5: Query actual AP IP from the interface directly.
-	// NM's ActiveConnectionInfo can return stale data from the previous
-	// WiFi connection — reading the interface address is reliable.
+	// Step 5: Query actual AP IP from the interface. NM reached Activated,
+	// so the IP should appear quickly. Retry with short intervals.
 	apIP := ""
+	ipRetryDelays := []time.Duration{200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond, time.Second, time.Second, time.Second, 2 * time.Second, 2 * time.Second}
 	if iface != "" {
-		for i := 0; i < 15; i++ {
+		for _, d := range ipRetryDelays {
 			select {
 			case <-ctx.Done():
 				return m.rollback(ctx.Err())
 			default:
 			}
 			apIP = getInterfaceIPv4(iface)
-			if apIP != "" && len(apIP) >= 5 && apIP[:5] == "10.42" {
+			if apIP != "" && strings.HasPrefix(apIP, "10.42") {
 				break
 			}
 			apIP = ""
-			time.Sleep(time.Second)
+			time.Sleep(d)
 		}
 	}
 	if apIP == "" {
-		apIP = "10.42.0.1" // fallback
-		log.Printf("WARN: ap: could not detect AP IP on %s, using fallback: %s", iface, apIP)
+		apIP = "10.42.0.1" // fallback — NM says Activated but IP not yet visible
+		log.Printf("ERROR: ap: could not detect AP IP on %s after NM activation, using fallback: %s", iface, apIP)
 	}
 	m.apIP = apIP
 	log.Printf("INFO: ap: AP interface IP: %s", apIP)
@@ -260,6 +274,23 @@ func getInterfaceIPv4(ifaceName string) string {
 		}
 	}
 	return ""
+}
+
+// hotspotFailureMessage maps NM device state and reason to a human-readable
+// error message for diagnosing AP activation failures.
+func hotspotFailureMessage(state nmclient.NMDeviceState, reason nmclient.NMDeviceStateReason) string {
+	switch reason {
+	case nmclient.NMDeviceStateReasonIPConfigUnavail:
+		return "NM hotspot IP config failed (is dnsmasq installed?)"
+	case nmclient.NMDeviceStateReasonSharedStartFailed, nmclient.NMDeviceStateReasonSharedFailed:
+		return "NM shared mode start failed"
+	case nmclient.NMDeviceStateReasonConfigFailed:
+		return "NM device configuration failed"
+	case nmclient.NMDeviceStateReasonSupplicantFailed, nmclient.NMDeviceStateReasonSupplicantTimeout:
+		return "WiFi supplicant failed (driver issue?)"
+	default:
+		return fmt.Sprintf("device state=%d, reason=%d", state, reason)
+	}
 }
 
 // deviceInterface extracts the interface name for a device.

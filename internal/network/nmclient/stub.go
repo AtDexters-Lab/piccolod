@@ -14,8 +14,11 @@ type StubClient struct {
 	mu sync.Mutex
 
 	// Configurable return values
-	WiFiDevicesResult     []WiFiDevice
-	WiFiDevicesErr        error
+	WaitForActivationState  NMDeviceState
+	WaitForActivationReason NMDeviceStateReason
+	WaitForActivationErr    error
+	WiFiDevicesResult       []WiFiDevice
+	WiFiDevicesErr          error
 	EthernetDevicesResult []EthernetDevice
 	EthernetDevicesErr    error
 	ScanResult            []AccessPoint
@@ -61,13 +64,15 @@ type StubCall struct {
 // NewStubClient creates a StubClient with sensible defaults.
 func NewStubClient() *StubClient {
 	return &StubClient{
-		Connected:             true,
-		ConnectivityResult:    NMConnectivityFull,
-		DeviceStateResult:     NMDeviceStateActivated,
-		WirelessEnabledResult: true,
-		stateChangeCh:         make(chan StateChange, 16),
-		deviceStateChangeCh:   make(chan DeviceStateChange, 16),
-		deviceEventCh:         make(chan DeviceEvent, 16),
+		Connected:               true,
+		ConnectivityResult:      NMConnectivityFull,
+		DeviceStateResult:       NMDeviceStateActivated,
+		WaitForActivationState:  NMDeviceStateActivated,
+		WaitForActivationReason: NMDeviceStateReasonNone,
+		WirelessEnabledResult:   true,
+		stateChangeCh:           make(chan StateChange, 16),
+		deviceStateChangeCh:     make(chan DeviceStateChange, 16),
+		deviceEventCh:           make(chan DeviceEvent, 16),
 	}
 }
 
@@ -287,6 +292,11 @@ func (s *StubClient) SubscribeDeviceAddedRemoved(ctx context.Context) (<-chan De
 		}
 	}()
 	return ch, nil
+}
+
+func (s *StubClient) WaitForActivation(_ context.Context, device dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
+	s.record("WaitForActivation", device)
+	return s.WaitForActivationState, s.WaitForActivationReason, s.WaitForActivationErr
 }
 
 func (s *StubClient) IsConnected() bool {

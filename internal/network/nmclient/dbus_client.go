@@ -209,3 +209,69 @@ func (c *DBusClient) readIP4Config(path dbus.ObjectPath) (addr, gw string) {
 	return
 }
 
+// WaitForActivation blocks until the device reaches Activated or a terminal
+// failure state. A second D-Bus subscription is safe: match rules are
+// reference-counted, and godbus fans out signals to all registered channels.
+func (c *DBusClient) WaitForActivation(ctx context.Context, device dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
+	// Create a child context so we cancel the D-Bus subscription immediately
+	// on return, rather than leaking it until the caller's context expires.
+	subCtx, subCancel := context.WithCancel(ctx)
+	defer subCancel()
+
+	ch, err := c.SubscribeDeviceStateChanges(subCtx, device)
+	if err != nil {
+		return NMDeviceStateUnknown, NMDeviceStateReasonNone, fmt.Errorf("nmclient: subscribe for activation wait: %w", err)
+	}
+
+	// TOCTOU guard: check current state before entering the wait loop.
+	// If NM already activated, failed, or raced through failure back to
+	// disconnected before we polled, return now to avoid a long stall.
+	curState, err := c.DeviceState(device)
+	if err == nil {
+		switch {
+		case curState == NMDeviceStateActivated:
+			return NMDeviceStateActivated, NMDeviceStateReasonNone, nil
+		case curState == NMDeviceStateFailed:
+			return NMDeviceStateFailed, NMDeviceStateReasonUnknown, nil
+		case curState <= NMDeviceStateDisconnected:
+			// Device is at Disconnected/Unavailable/Unmanaged — activation
+			// either hasn't started or already failed and was torn down.
+			// Check for an active connection to distinguish: if none exists,
+			// the device raced through failure before we got here.
+			if info, infoErr := c.ActiveConnectionInfo(device); infoErr != nil || info == nil {
+				return curState, NMDeviceStateReasonUnknown, nil
+			}
+		}
+	}
+
+	// Wait for state transitions. Terminal conditions:
+	//   Activated (100)           → success
+	//   Failed (120)              → activation failed (reason in event)
+	//   Disconnected (30) or below, after seeing a progressing state (>=Prepare/40)
+	//     → activation was torn down
+	seenProgressing := curState >= NMDeviceStatePrepare
+	for {
+		select {
+		case <-ctx.Done():
+			return NMDeviceStateUnknown, NMDeviceStateReasonNone, ctx.Err()
+		case evt, ok := <-ch:
+			if !ok {
+				return NMDeviceStateUnknown, NMDeviceStateReasonNone, fmt.Errorf("nmclient: device state channel closed")
+			}
+			if evt.NewState >= NMDeviceStatePrepare {
+				seenProgressing = true
+			}
+			switch {
+			case evt.NewState == NMDeviceStateActivated:
+				return NMDeviceStateActivated, evt.Reason, nil
+			case evt.NewState == NMDeviceStateFailed:
+				return NMDeviceStateFailed, evt.Reason, nil
+			case seenProgressing && evt.NewState <= NMDeviceStateDisconnected:
+				// Device regressed to disconnected/unmanaged/unavailable after
+				// progressing — activation was torn down.
+				return evt.NewState, evt.Reason, nil
+			}
+		}
+	}
+}
+

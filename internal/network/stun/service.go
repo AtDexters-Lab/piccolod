@@ -30,6 +30,7 @@ type Service struct {
 	stopped         chan struct{}
 	stopOnce        sync.Once
 	started         bool
+	triggerCh       chan struct{} // buffer-1, external refresh trigger
 }
 
 // Option configures the STUN service.
@@ -48,6 +49,7 @@ func New(opts ...Option) *Service {
 		queryTimeout:    defaultQueryTimeout,
 		stopCh:          make(chan struct{}),
 		stopped:         make(chan struct{}),
+		triggerCh:       make(chan struct{}, 1),
 	}
 	for _, o := range opts {
 		o(s)
@@ -107,6 +109,15 @@ func (s *Service) SetServers(addrs []string) {
 }
 
 
+// Trigger requests an immediate STUN refresh. Non-blocking: if a trigger
+// is already pending, subsequent calls are coalesced.
+func (s *Service) Trigger() {
+	select {
+	case s.triggerCh <- struct{}{}:
+	default:
+	}
+}
+
 func (s *Service) refresh() {
 	s.mu.RLock()
 	servers := append([]string(nil), s.servers...)
@@ -147,6 +158,8 @@ func (s *Service) refreshLoop() {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
+			s.refresh()
+		case <-s.triggerCh:
 			s.refresh()
 		}
 	}

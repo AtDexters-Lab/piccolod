@@ -75,6 +75,10 @@ type Service struct {
 	// addresses) change, so the owner can update STUN server lists.
 	onRelayServicesChanged func(services map[string][]string)
 
+	// networkUp receives a signal when network connectivity becomes available.
+	// Buffer-1 so callers never block; rapid signals coalesce naturally.
+	networkUp chan struct{}
+
 	// Endpoint sync loop lifecycle.
 	syncCancel context.CancelFunc
 	syncDone   chan struct{}
@@ -87,6 +91,7 @@ func NewService(configPath string, tpmDevice tpm.Device) *Service {
 		configPath: configPath,
 		tpmDev:     tpmDevice,
 		stopCh:     make(chan struct{}),
+		networkUp:  make(chan struct{}, 1),
 	}
 }
 
@@ -208,6 +213,9 @@ func (s *Service) autoEnrollAtBoot() {
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
+		case <-s.networkUp:
+			timer.Stop()
+			log.Printf("INFO: identity: network up, retrying enrollment immediately")
 		case <-s.stopCh:
 			timer.Stop()
 			log.Printf("INFO: identity: auto-enrollment aborted (service stopping)")
@@ -255,6 +263,16 @@ func (s *Service) SetEventsBus(bus *events.Bus) {
 	s.mu.Lock()
 	s.eventsBus = bus
 	s.mu.Unlock()
+}
+
+// NotifyNetworkUp signals that network connectivity is available. This
+// interrupts the auto-enrollment backoff timer so enrollment retries
+// immediately instead of waiting for the next scheduled attempt.
+func (s *Service) NotifyNetworkUp() {
+	select {
+	case s.networkUp <- struct{}{}:
+	default: // coalesces rapid signals
+	}
 }
 
 // SetTPMDirs stores the AK and swtpm state directories for recovery.

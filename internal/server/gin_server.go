@@ -1146,6 +1146,26 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		healthTracker.Setf("network", health.LevelWarn, "network manager initializing")
 	}
 
+	// Notify enrollment and STUN when network connectivity becomes available.
+	// Single event bus subscriber, two method calls — keeps services decoupled.
+	netStateCh, cancelNetState := eventsBus.SubscribeWithCancel(events.TopicNetworkStateChanged, 4)
+	s.busUnsubs = append(s.busUnsubs, cancelNetState)
+	go func() {
+		for evt := range netStateCh {
+			nse, ok := evt.Payload.(network.NetworkStateChangedEvent)
+			if !ok {
+				continue
+			}
+			// Filter: only react to state transitions (uplink changed), not
+			// signal-tier updates (which also publish on this topic with
+			// SignalDBm set but no actual connectivity change).
+			if nse.SignalDBm == nil && (nse.ActiveUplink == string(network.UplinkEthernet) || nse.ActiveUplink == string(network.UplinkWiFi)) {
+				identitySvc.NotifyNetworkUp()
+				stunSvc.Trigger()
+			}
+		}
+	}()
+
 	// Self-hosted adapter (existing)
 	var nexusAdapter nexusclient.Adapter
 	if os.Getenv("PICCOLO_NEXUS_USE_STUB") == "1" {

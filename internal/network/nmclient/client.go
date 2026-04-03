@@ -84,6 +84,12 @@ type Client interface {
 	// when devices are added to or removed from NetworkManager (hotplug).
 	SubscribeDeviceAddedRemoved(ctx context.Context) (<-chan DeviceEvent, error)
 
+	// WaitForActivation blocks until the device reaches Activated or a
+	// terminal failure state (Failed, Disconnected) after an activation
+	// request. Returns the final state and reason code. Use a context
+	// with timeout to bound the wait.
+	WaitForActivation(ctx context.Context, device dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error)
+
 	// IsConnected returns true if the D-Bus connection to NM is alive.
 	// When false, the client is operating in degraded polling-fallback mode.
 	IsConnected() bool

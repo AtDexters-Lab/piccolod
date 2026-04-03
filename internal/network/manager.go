@@ -458,10 +458,45 @@ func (m *Manager) handleAPTransition(newState ConnState) {
 			return
 		}
 		go func() {
-			if err := m.apMgr.Start(m.ctx, dev.Path, dev.HWAddress); err != nil {
-				log.Printf("ERROR: network: AP activation failed: %v", err)
-				m.revertAPState()
+			const maxAPRetries = 3
+			for attempt := 0; attempt < maxAPRetries; attempt++ {
+				// Re-read device each attempt (handles USB hotplug)
+				m.mu.RLock()
+				dev := m.wifiDevice
+				m.mu.RUnlock()
+				if dev == nil {
+					break
+				}
+
+				// Abort if state changed away from APMode (Ethernet/WiFi arrived)
+				if m.state.Current() != StateAPMode {
+					return
+				}
+
+				// Backoff before retries (not before first attempt)
+				if attempt > 0 {
+					delay := time.Duration(attempt) * 10 * time.Second
+					log.Printf("INFO: network: AP retry %d/%d in %v", attempt+1, maxAPRetries, delay)
+					timer := time.NewTimer(delay)
+					select {
+					case <-timer.C:
+					case <-m.ctx.Done():
+						timer.Stop()
+						return
+					}
+					if m.state.Current() != StateAPMode {
+						return
+					}
+				}
+
+				if err := m.apMgr.Start(m.ctx, dev.Path, dev.HWAddress); err == nil {
+					return // success
+				} else {
+					log.Printf("ERROR: network: AP activation failed (attempt %d/%d): %v", attempt+1, maxAPRetries, err)
+				}
 			}
+			log.Printf("ERROR: network: AP activation failed after %d attempts, giving up", maxAPRetries)
+			m.revertAPState()
 		}()
 	} else if m.apMgr.Active() {
 		go func() {

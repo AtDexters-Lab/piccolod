@@ -32,12 +32,39 @@ class _RemoteAddressStepState extends State<RemoteAddressStep> {
   final _focusNode = FocusNode();
   String? _localError;
   bool _isFocused = false;
+  Timer? _pollTimer;
+  bool _pollInFlight = false;
 
   @override
   void initState() {
     super.initState();
     _focusNode.addListener(_onFocusChange);
     unawaited(widget.onRefresh());
+    // Poll for enrollment completion while not yet enrolled.
+    // Auto-enrollment may finish seconds after this step renders.
+    if (!widget.enrolled) {
+      _pollTimer = Timer.periodic(
+        const Duration(seconds: 3),
+        (_) async {
+          if (_pollInFlight) return;
+          _pollInFlight = true;
+          try {
+            await widget.onRefresh();
+          } finally {
+            _pollInFlight = false;
+          }
+        },
+      );
+    }
+  }
+
+  @override
+  void didUpdateWidget(RemoteAddressStep oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.enrolled && !oldWidget.enrolled) {
+      _pollTimer?.cancel();
+      _pollTimer = null;
+    }
   }
 
   void _onFocusChange() {
@@ -46,6 +73,7 @@ class _RemoteAddressStepState extends State<RemoteAddressStep> {
 
   @override
   void dispose() {
+    _pollTimer?.cancel();
     _focusNode.removeListener(_onFocusChange);
     _hostnameController.dispose();
     _focusNode.dispose();
