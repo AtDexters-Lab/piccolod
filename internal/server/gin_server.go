@@ -235,7 +235,7 @@ var relayClientIPKeyInstance = relayClientIPKey{}
 // registered within microseconds once the TLS mux goroutine runs.
 const (
 	hintRetryAttempts = 40
-	hintRetryInterval = 500 * time.Microsecond // 40 × 500µs = 20ms max
+	hintRetryInterval = 500 * time.Microsecond // hint arrives in 1-3 retries typically; 20ms budget handles scheduler jitter
 )
 
 // portUnpublisherFunc adapts a function into services.PortUnpublisher.

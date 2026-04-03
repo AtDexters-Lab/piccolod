@@ -13,7 +13,7 @@ import (
 )
 
 func newTestStateMachine() *stateMachine {
-	return newStateMachine(nmclient.NewStubClient(), nil)
+	return newStateMachine(nil)
 }
 
 func TestStateMachine_InitialState(t *testing.T) {
@@ -42,13 +42,7 @@ func TestStateMachine_EthernetDown_WithSavedWifi(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleEthernetUp()
 
-	sm.mu.Lock()
-	sm.hasSavedWifi = true
-	sm.mu.Unlock()
-
-	// Should transition to Reconnecting (not WiFiSTA) because NM needs
-	// time to associate + DHCP. handleWiFiConnected sets WiFiSTA later.
-	sm.handleEthernetDown()
+	sm.handleEthernetDown(true)
 	if sm.Current() != StateReconnecting {
 		t.Fatalf("state = %s, want %s", sm.Current(), StateReconnecting)
 	}
@@ -58,7 +52,7 @@ func TestStateMachine_EthernetDown_NoWifi(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleEthernetUp()
 
-	sm.handleEthernetDown()
+	sm.handleEthernetDown(false)
 	if sm.Current() != StateAPMode {
 		t.Fatalf("state = %s, want %s", sm.Current(), StateAPMode)
 	}
@@ -67,13 +61,9 @@ func TestStateMachine_EthernetDown_NoWifi(t *testing.T) {
 func TestStateMachine_EthernetDown_WiFiAlreadyConnected(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleEthernetUp()
-
-	sm.mu.Lock()
-	sm.hasSavedWifi = true
-	sm.mu.Unlock()
 	sm.wifiConnected = func() bool { return true }
 
-	sm.handleEthernetDown()
+	sm.handleEthernetDown(true)
 	if sm.Current() != StateWiFiSTA {
 		t.Fatalf("state = %s, want %s", sm.Current(), StateWiFiSTA)
 	}
@@ -85,13 +75,9 @@ func TestStateMachine_EthernetDown_WiFiAlreadyConnected(t *testing.T) {
 func TestStateMachine_EthernetDown_WiFiNotConnected(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleEthernetUp()
-
-	sm.mu.Lock()
-	sm.hasSavedWifi = true
-	sm.mu.Unlock()
 	sm.wifiConnected = func() bool { return false }
 
-	sm.handleEthernetDown()
+	sm.handleEthernetDown(true)
 	if sm.Current() != StateReconnecting {
 		t.Fatalf("state = %s, want %s", sm.Current(), StateReconnecting)
 	}
@@ -122,17 +108,27 @@ func TestStateMachine_WiFiConnected_DoesNotOverrideEthernet(t *testing.T) {
 func TestStateMachine_WiFiDisconnected(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	if sm.Current() != StateReconnecting {
 		t.Fatalf("state = %s, want %s", sm.Current(), StateReconnecting)
 	}
 }
 
+func TestStateMachine_WiFiDisconnected_NoSavedProfiles(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleWiFiConnected()
+	sm.handleWiFiDisconnected(false)
+
+	if sm.Current() != StateAPMode {
+		t.Fatalf("state = %s, want %s (profile deleted → AP mode)", sm.Current(), StateAPMode)
+	}
+}
+
 func TestStateMachine_WiFiDisconnected_IgnoredWhenNotWifi(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleEthernetUp()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	if sm.Current() != StateEthernet {
 		t.Fatalf("state = %s, want %s (should ignore WiFi disconnect when on Ethernet)", sm.Current(), StateEthernet)
@@ -142,7 +138,7 @@ func TestStateMachine_WiFiDisconnected_IgnoredWhenNotWifi(t *testing.T) {
 func TestStateMachine_ReconnectSuccess(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	sm.handleReconnectResult(true)
 	if sm.Current() != StateWiFiSTA {
@@ -153,7 +149,7 @@ func TestStateMachine_ReconnectSuccess(t *testing.T) {
 func TestStateMachine_ReconnectFailure_Backoff(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	// First failure — still reconnecting, backoff advances
 	sm.handleReconnectResult(false)
@@ -176,7 +172,7 @@ func TestStateMachine_ReconnectFailure_Backoff(t *testing.T) {
 func TestStateMachine_ReconnectFailure_EscalatesToAPMode(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	// Advance to ceiling
 	for i := 0; i < len(backoffSchedule); i++ {
@@ -196,7 +192,7 @@ func TestStateMachine_ReconnectFailure_EscalatesToAPMode(t *testing.T) {
 func TestStateMachine_ReconnectSuccess_ResetsBackoff(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	// Advance backoff partway
 	for i := 0; i < 3; i++ {
@@ -327,7 +323,7 @@ func TestStateMachine_TransitionCallback(t *testing.T) {
 	}
 
 	sm.handleEthernetUp()
-	sm.handleEthernetDown() // → AP mode (no saved wifi)
+	sm.handleEthernetDown(false) // → AP mode (no saved wifi)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -422,9 +418,6 @@ func TestDetermineInitialState_HasProfiles_NotConnected(t *testing.T) {
 	if m.state.Current() != StateReconnecting {
 		t.Fatalf("state = %s, want %s (saved profile exists → NM will auto-connect)", m.state.Current(), StateReconnecting)
 	}
-	if !m.state.hasSavedWifi {
-		t.Fatal("hasSavedWifi should be true")
-	}
 }
 
 func TestDetermineInitialState_NoProfiles_WiFiUnavailable(t *testing.T) {
@@ -482,8 +475,5 @@ func TestDetermineInitialState_HasProfiles_WiFiUnavailable(t *testing.T) {
 	// WiFi unavailable — cannot reconnect, fall through to Disconnected
 	if m.state.Current() != StateDisconnected {
 		t.Fatalf("state = %s, want %s (saved profiles but WiFi unavailable)", m.state.Current(), StateDisconnected)
-	}
-	if !m.state.hasSavedWifi {
-		t.Fatal("hasSavedWifi should still be true (profile exists, just can't connect)")
 	}
 }

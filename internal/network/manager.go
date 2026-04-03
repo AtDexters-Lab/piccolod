@@ -61,7 +61,7 @@ type Manager struct {
 // NewManager creates a network Manager. It does NOT start any goroutines;
 // call Start() to begin monitoring.
 func NewManager(nm nmclient.Client, r runner.CommandRunner, bus *events.Bus) *Manager {
-	sm := newStateMachine(nm, bus)
+	sm := newStateMachine(bus)
 	m := &Manager{
 		nm:     nm,
 		runner: r,
@@ -188,9 +188,8 @@ func (m *Manager) Status() Status {
 
 	m.mu.RLock()
 	wifiAvail := m.wifiAvailable
-	var ssid, savedSSID, ipAddr, band string
+	var ssid, ipAddr, band string
 	var freqMHz uint32
-	var hasSaved bool
 
 	if m.wifiDevice != nil && uplink == UplinkWiFi {
 		info, err := m.nm.ActiveConnectionInfo(m.wifiDevice.Path)
@@ -199,13 +198,10 @@ func (m *Manager) Status() Status {
 			ipAddr = info.IP4Address
 		}
 	}
-
-	sm := m.state
-	sm.mu.Lock()
-	hasSaved = sm.hasSavedWifi
-	savedSSID = sm.savedSSID
-	sm.mu.Unlock()
 	m.mu.RUnlock()
+
+	// Query NM directly — no cached state.
+	hasSaved, savedSSID := m.savedWifiInfo()
 
 	s := Status{
 		WifiAvailable:   wifiAvail,
@@ -355,12 +351,6 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	// Update state machine
 	m.state.handleWiFiConnected()
 
-	// Update saved SSID tracking
-	m.state.mu.Lock()
-	m.state.hasSavedWifi = true
-	m.state.savedSSID = ssid
-	m.state.mu.Unlock()
-
 	return nil
 }
 
@@ -377,8 +367,6 @@ func (m *Manager) ForgetNetwork() error {
 	}
 
 	m.state.mu.Lock()
-	m.state.hasSavedWifi = false
-	m.state.savedSSID = ""
 	if m.state.current == StateWiFiSTA || m.state.current == StateReconnecting || m.state.current == StateDisconnected {
 		m.state.transition(StateAPMode, UplinkNone)
 	}
@@ -460,17 +448,19 @@ func (m *Manager) handleAPTransition(newState ConnState) {
 	m.mu.RUnlock()
 
 	if newState == StateAPMode {
-		if suppressed {
-			log.Printf("INFO: network: AP mode suppressed by user setting")
-			return
-		}
-		if dev == nil {
-			log.Printf("WARN: network: cannot activate AP — no WiFi device")
+		if suppressed || dev == nil {
+			if suppressed {
+				log.Printf("INFO: network: AP mode suppressed by user setting")
+			} else {
+				log.Printf("WARN: network: cannot activate AP — no WiFi device")
+			}
+			go m.revertAPState() // async: called from onTransition which holds sm.mu
 			return
 		}
 		go func() {
 			if err := m.apMgr.Start(m.ctx, dev.Path, dev.HWAddress); err != nil {
 				log.Printf("ERROR: network: AP activation failed: %v", err)
+				m.revertAPState()
 			}
 		}()
 	} else if m.apMgr.Active() {
@@ -506,7 +496,7 @@ func (m *Manager) connectFromCaptivePortal(ssid, passphrase string) {
 	err := m.Connect(m.ctx, ssid, passphrase)
 
 	if err == nil {
-		// Connect() already sets hasSavedWifi + savedSSID and calls handleWiFiConnected
+		// Connect() calls handleWiFiConnected which updates the state machine
 		log.Printf("INFO: network: captive portal connect to %q succeeded", ssid)
 		return
 	}
@@ -565,6 +555,26 @@ func (m *Manager) apSSID() string {
 		return m.apMgr.SSID()
 	}
 	return ""
+}
+
+// revertAPState transitions out of StateAPMode when AP activation cannot
+// proceed (hardware unsupported, suppressed, no device). Without this the
+// watchdog and state machine would be wedged — both skip during APMode.
+func (m *Manager) revertAPState() {
+	m.state.mu.Lock()
+	if m.state.current == StateAPMode {
+		m.state.transition(StateDisconnected, UplinkNone)
+	}
+	m.state.mu.Unlock()
+}
+
+// savedWifiInfo queries NM for saved WiFi profiles. Returns (exists, ssid).
+func (m *Manager) savedWifiInfo() (bool, string) {
+	profiles, err := m.nm.SavedWiFiConnections()
+	if err != nil || len(profiles) == 0 {
+		return false, ""
+	}
+	return true, profiles[0].SSID
 }
 
 // SetHealthTracker wires the health tracker (called before Start).
@@ -641,13 +651,7 @@ func (m *Manager) determineInitialState() {
 	}
 
 	// Check for saved WiFi connections
-	profiles, err := m.nm.SavedWiFiConnections()
-	if err == nil && len(profiles) > 0 {
-		m.state.mu.Lock()
-		m.state.hasSavedWifi = true
-		m.state.savedSSID = profiles[0].SSID
-		m.state.mu.Unlock()
-
+	if hasSaved, _ := m.savedWifiInfo(); hasSaved {
 		// Only enter Reconnecting if the WiFi device is present and its
 		// radio is enabled — otherwise NM cannot auto-connect and the state
 		// would wedge (watchdog skips Reconnecting).
@@ -770,7 +774,8 @@ func (m *Manager) handleWifiStateChanges(ctx context.Context, ch <-chan nmclient
 				}
 				m.state.handleWiFiConnected()
 			case evt.OldState.IsConnected() && !evt.NewState.IsConnected():
-				m.state.handleWiFiDisconnected()
+				hasSaved, _ := m.savedWifiInfo()
+				m.state.handleWiFiDisconnected(hasSaved)
 			}
 		}
 	}
@@ -812,7 +817,8 @@ func (m *Manager) handleEthStateChanges(ctx context.Context, ch <-chan nmclient.
 					debounceTimer.Stop()
 					debounceTimer = nil
 				}
-				m.state.handleEthernetDown()
+				hasSaved, _ := m.savedWifiInfo()
+				m.state.handleEthernetDown(hasSaved)
 			}
 		}
 	}
