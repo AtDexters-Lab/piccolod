@@ -34,8 +34,13 @@ type stateMachine struct {
 	lastSignalDBm  int
 	lastSignalTier SignalTier
 
-	// Callbacks
-	onTransition func(newState ConnState) // called after state change (for health tracker)
+	// Callbacks (set before Start, read under sm.mu)
+	//
+	// Lock ordering: sm.mu → Manager.mu (RLock). The wifiConnected callback
+	// acquires Manager.mu.RLock while sm.mu is held. No code path acquires
+	// these in reverse order.
+	onTransition  func(newState ConnState) // called after state change (for health tracker)
+	wifiConnected func() bool             // queries whether WiFi STA is currently active
 
 	// Dependencies
 	nm     nmclient.Client
@@ -133,6 +138,13 @@ func (sm *stateMachine) handleEthernetDown() {
 
 	if sm.current != StateEthernet {
 		return // not relevant
+	}
+
+	// If WiFi STA is already active (NM auto-connected a saved profile while
+	// Ethernet was primary), promote it directly — no reconnection needed.
+	if sm.hasSavedWifi && sm.wifiConnected != nil && sm.wifiConnected() {
+		sm.transition(StateWiFiSTA, UplinkWiFi)
+		return
 	}
 
 	if sm.hasSavedWifi {

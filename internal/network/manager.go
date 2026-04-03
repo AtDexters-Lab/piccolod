@@ -107,6 +107,22 @@ func (m *Manager) Start(ctx context.Context) error {
 		log.Printf("WARN: network: device discovery failed: %v", err)
 	}
 
+	// Wire WiFi state query for handleEthernetDown — lets the state machine
+	// check if WiFi STA is already active when Ethernet drops.
+	m.state.wifiConnected = func() bool {
+		m.mu.RLock()
+		dev := m.wifiDevice
+		m.mu.RUnlock()
+		if dev == nil {
+			return false
+		}
+		state, err := m.nm.DeviceState(dev.Path)
+		if err != nil {
+			return false // D-Bus error — safe default
+		}
+		return state.IsConnected()
+	}
+
 	// Load AP suppression flag
 	m.loadAPSuppression()
 
@@ -631,9 +647,28 @@ func (m *Manager) determineInitialState() {
 		m.state.hasSavedWifi = true
 		m.state.savedSSID = profiles[0].SSID
 		m.state.mu.Unlock()
+
+		// Only enter Reconnecting if the WiFi device is present and its
+		// radio is enabled — otherwise NM cannot auto-connect and the state
+		// would wedge (watchdog skips Reconnecting).
+		if m.wifiDevice != nil && m.wifiDevice.State != nmclient.NMDeviceStateUnavailable {
+			m.state.mu.Lock()
+			m.state.transition(StateReconnecting, UplinkNone)
+			m.state.mu.Unlock()
+			return
+		}
 	}
 
-	// No connectivity — start in disconnected (watchdog/state machine will escalate to AP)
+	// No usable WiFi connection. Activate AP mode only when the WiFi
+	// hardware is present, the radio is available, and AP is not suppressed.
+	if m.wifiDevice != nil && m.wifiDevice.State != nmclient.NMDeviceStateUnavailable && !m.apSuppressed {
+		m.state.mu.Lock()
+		m.state.transition(StateAPMode, UplinkNone)
+		m.state.mu.Unlock()
+		return
+	}
+
+	// No usable WiFi or AP suppressed — genuinely disconnected.
 	m.state.mu.Lock()
 	m.state.transition(StateDisconnected, UplinkNone)
 	m.state.mu.Unlock()

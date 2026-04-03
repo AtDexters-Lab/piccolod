@@ -230,6 +230,14 @@ type relayClientIPKey struct{}
 
 var relayClientIPKeyInstance = relayClientIPKey{}
 
+// Retry budget for the secure loopback ConnContext hint lookup. On loopback,
+// Accept() can return before the TLS mux's DialTimeout() — the hint is
+// registered within microseconds once the TLS mux goroutine runs.
+const (
+	hintRetryAttempts = 40
+	hintRetryInterval = 500 * time.Microsecond // 40 × 500µs = 20ms max
+)
+
 // portUnpublisherFunc adapts a function into services.PortUnpublisher.
 type portUnpublisherFunc func(int)
 
@@ -3278,9 +3286,26 @@ func (s *GinServer) initSecureLoopback() error {
 			// Look up the Nexus-relayed client IP from the connection hint.
 			// The TLS mux re-registers hints for the secure loopback port
 			// after TLS termination, carrying the original client IP.
+			//
+			// Race: on loopback, the kernel completes the TCP handshake and
+			// the server's Accept() returns before the client's DialTimeout()
+			// returns to user code. ConnContext therefore can execute before
+			// the TLS mux calls RegisterProxyHint. Retry briefly — the hint
+			// arrives within microseconds once the TLS mux goroutine runs.
 			if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok && s.serviceManager != nil {
-				if clientIP, ok := s.serviceManager.ConsumePortalHint(s.securePort, addr.Port); ok && clientIP != "" {
+				var clientIP string
+				var found bool
+				for attempt := 0; attempt < hintRetryAttempts; attempt++ {
+					clientIP, found = s.serviceManager.ConsumePortalHint(s.securePort, addr.Port)
+					if found {
+						break
+					}
+					time.Sleep(hintRetryInterval)
+				}
+				if found && clientIP != "" {
 					ctx = context.WithValue(ctx, relayClientIPKeyInstance, clientIP)
+				} else if !found {
+					log.Printf("WARN: secure loopback: relay client IP hint not found for port %d (exhausted retries)", addr.Port)
 				}
 			}
 			return ctx
