@@ -1,15 +1,19 @@
 package network
 
 import (
+	"net"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/godbus/dbus/v5"
+
 	"piccolod/internal/network/nmclient"
+	"piccolod/internal/testutil"
 )
 
 func newTestStateMachine() *stateMachine {
-	return newStateMachine(nmclient.NewStubClient(), nil)
+	return newStateMachine(nil)
 }
 
 func TestStateMachine_InitialState(t *testing.T) {
@@ -38,13 +42,7 @@ func TestStateMachine_EthernetDown_WithSavedWifi(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleEthernetUp()
 
-	sm.mu.Lock()
-	sm.hasSavedWifi = true
-	sm.mu.Unlock()
-
-	// Should transition to Reconnecting (not WiFiSTA) because NM needs
-	// time to associate + DHCP. handleWiFiConnected sets WiFiSTA later.
-	sm.handleEthernetDown()
+	sm.handleEthernetDown(true)
 	if sm.Current() != StateReconnecting {
 		t.Fatalf("state = %s, want %s", sm.Current(), StateReconnecting)
 	}
@@ -54,9 +52,34 @@ func TestStateMachine_EthernetDown_NoWifi(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleEthernetUp()
 
-	sm.handleEthernetDown()
+	sm.handleEthernetDown(false)
 	if sm.Current() != StateAPMode {
 		t.Fatalf("state = %s, want %s", sm.Current(), StateAPMode)
+	}
+}
+
+func TestStateMachine_EthernetDown_WiFiAlreadyConnected(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleEthernetUp()
+	sm.wifiConnected = func() bool { return true }
+
+	sm.handleEthernetDown(true)
+	if sm.Current() != StateWiFiSTA {
+		t.Fatalf("state = %s, want %s", sm.Current(), StateWiFiSTA)
+	}
+	if sm.Uplink() != UplinkWiFi {
+		t.Fatalf("uplink = %s, want %s", sm.Uplink(), UplinkWiFi)
+	}
+}
+
+func TestStateMachine_EthernetDown_WiFiNotConnected(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleEthernetUp()
+	sm.wifiConnected = func() bool { return false }
+
+	sm.handleEthernetDown(true)
+	if sm.Current() != StateReconnecting {
+		t.Fatalf("state = %s, want %s", sm.Current(), StateReconnecting)
 	}
 }
 
@@ -85,17 +108,27 @@ func TestStateMachine_WiFiConnected_DoesNotOverrideEthernet(t *testing.T) {
 func TestStateMachine_WiFiDisconnected(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	if sm.Current() != StateReconnecting {
 		t.Fatalf("state = %s, want %s", sm.Current(), StateReconnecting)
 	}
 }
 
+func TestStateMachine_WiFiDisconnected_NoSavedProfiles(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleWiFiConnected()
+	sm.handleWiFiDisconnected(false)
+
+	if sm.Current() != StateAPMode {
+		t.Fatalf("state = %s, want %s (profile deleted → AP mode)", sm.Current(), StateAPMode)
+	}
+}
+
 func TestStateMachine_WiFiDisconnected_IgnoredWhenNotWifi(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleEthernetUp()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	if sm.Current() != StateEthernet {
 		t.Fatalf("state = %s, want %s (should ignore WiFi disconnect when on Ethernet)", sm.Current(), StateEthernet)
@@ -105,7 +138,7 @@ func TestStateMachine_WiFiDisconnected_IgnoredWhenNotWifi(t *testing.T) {
 func TestStateMachine_ReconnectSuccess(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	sm.handleReconnectResult(true)
 	if sm.Current() != StateWiFiSTA {
@@ -116,7 +149,7 @@ func TestStateMachine_ReconnectSuccess(t *testing.T) {
 func TestStateMachine_ReconnectFailure_Backoff(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	// First failure — still reconnecting, backoff advances
 	sm.handleReconnectResult(false)
@@ -139,7 +172,7 @@ func TestStateMachine_ReconnectFailure_Backoff(t *testing.T) {
 func TestStateMachine_ReconnectFailure_EscalatesToAPMode(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	// Advance to ceiling
 	for i := 0; i < len(backoffSchedule); i++ {
@@ -159,7 +192,7 @@ func TestStateMachine_ReconnectFailure_EscalatesToAPMode(t *testing.T) {
 func TestStateMachine_ReconnectSuccess_ResetsBackoff(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
-	sm.handleWiFiDisconnected()
+	sm.handleWiFiDisconnected(true)
 
 	// Advance backoff partway
 	for i := 0; i < 3; i++ {
@@ -290,7 +323,7 @@ func TestStateMachine_TransitionCallback(t *testing.T) {
 	}
 
 	sm.handleEthernetUp()
-	sm.handleEthernetDown() // → AP mode (no saved wifi)
+	sm.handleEthernetDown(false) // → AP mode (no saved wifi)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -328,5 +361,119 @@ func TestStateMachine_NextBackoff(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("nextBackoff(idx=%d) = %v, want %v", tt.idx, got, tt.expected)
 		}
+	}
+}
+
+// --- determineInitialState tests (exercises Manager method) ---
+
+func newTestManager(stub *nmclient.StubClient) *Manager {
+	return NewManager(stub, &testutil.FakeRunner{}, nil)
+}
+
+func TestDetermineInitialState_NoProfiles_WithWiFiDevice(t *testing.T) {
+	stub := nmclient.NewStubClient()
+	stub.SavedConnections = nil // no saved WiFi profiles
+	stub.WiFiDevicesResult = []nmclient.WiFiDevice{{
+		Path:      dbus.ObjectPath("/dev/wifi0"),
+		Interface: "wlan0",
+		HWAddress: net.HardwareAddr{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
+		State:     nmclient.NMDeviceStateDisconnected,
+	}}
+	m := newTestManager(stub)
+	_ = m.discoverDevices()
+	m.determineInitialState()
+
+	if m.state.Current() != StateAPMode {
+		t.Fatalf("state = %s, want %s (no profiles + WiFi device → AP mode)", m.state.Current(), StateAPMode)
+	}
+}
+
+func TestDetermineInitialState_NoProfiles_NoWiFiDevice(t *testing.T) {
+	stub := nmclient.NewStubClient()
+	stub.SavedConnections = nil
+	stub.WiFiDevicesResult = nil // no WiFi hardware
+	m := newTestManager(stub)
+	_ = m.discoverDevices()
+	m.determineInitialState()
+
+	if m.state.Current() != StateDisconnected {
+		t.Fatalf("state = %s, want %s (no profiles + no WiFi → disconnected)", m.state.Current(), StateDisconnected)
+	}
+}
+
+func TestDetermineInitialState_HasProfiles_NotConnected(t *testing.T) {
+	stub := nmclient.NewStubClient()
+	stub.SavedConnections = []nmclient.ConnectionProfile{
+		{SSID: "HomeWiFi", Path: dbus.ObjectPath("/conn/1")},
+	}
+	stub.WiFiDevicesResult = []nmclient.WiFiDevice{{
+		Path:      dbus.ObjectPath("/dev/wifi0"),
+		Interface: "wlan0",
+		State:     nmclient.NMDeviceStateDisconnected,
+	}}
+	m := newTestManager(stub)
+	_ = m.discoverDevices()
+	m.determineInitialState()
+
+	if m.state.Current() != StateReconnecting {
+		t.Fatalf("state = %s, want %s (saved profile exists → NM will auto-connect)", m.state.Current(), StateReconnecting)
+	}
+}
+
+func TestDetermineInitialState_NoProfiles_WiFiUnavailable(t *testing.T) {
+	stub := nmclient.NewStubClient()
+	stub.SavedConnections = nil
+	stub.WiFiDevicesResult = []nmclient.WiFiDevice{{
+		Path:      dbus.ObjectPath("/dev/wifi0"),
+		Interface: "wlan0",
+		State:     nmclient.NMDeviceStateUnavailable, // rfkill or driver issue
+	}}
+	m := newTestManager(stub)
+	_ = m.discoverDevices()
+	m.determineInitialState()
+
+	if m.state.Current() != StateDisconnected {
+		t.Fatalf("state = %s, want %s (WiFi unavailable → cannot AP)", m.state.Current(), StateDisconnected)
+	}
+}
+
+func TestDetermineInitialState_NoProfiles_APSuppressed(t *testing.T) {
+	stub := nmclient.NewStubClient()
+	stub.SavedConnections = nil
+	stub.WiFiDevicesResult = []nmclient.WiFiDevice{{
+		Path:      dbus.ObjectPath("/dev/wifi0"),
+		Interface: "wlan0",
+		HWAddress: net.HardwareAddr{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
+		State:     nmclient.NMDeviceStateDisconnected,
+	}}
+	m := newTestManager(stub)
+	_ = m.discoverDevices()
+	m.mu.Lock()
+	m.apSuppressed = true
+	m.mu.Unlock()
+	m.determineInitialState()
+
+	if m.state.Current() != StateDisconnected {
+		t.Fatalf("state = %s, want %s (AP suppressed → no AP mode)", m.state.Current(), StateDisconnected)
+	}
+}
+
+func TestDetermineInitialState_HasProfiles_WiFiUnavailable(t *testing.T) {
+	stub := nmclient.NewStubClient()
+	stub.SavedConnections = []nmclient.ConnectionProfile{
+		{SSID: "HomeWiFi", Path: dbus.ObjectPath("/conn/1")},
+	}
+	stub.WiFiDevicesResult = []nmclient.WiFiDevice{{
+		Path:      dbus.ObjectPath("/dev/wifi0"),
+		Interface: "wlan0",
+		State:     nmclient.NMDeviceStateUnavailable,
+	}}
+	m := newTestManager(stub)
+	_ = m.discoverDevices()
+	m.determineInitialState()
+
+	// WiFi unavailable — cannot reconnect, fall through to Disconnected
+	if m.state.Current() != StateDisconnected {
+		t.Fatalf("state = %s, want %s (saved profiles but WiFi unavailable)", m.state.Current(), StateDisconnected)
 	}
 }

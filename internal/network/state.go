@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"piccolod/internal/events"
-	"piccolod/internal/network/nmclient"
 )
 
 // stateMachine manages the three-tier connectivity priority stack:
@@ -26,24 +25,23 @@ type stateMachine struct {
 	cancelSTA context.CancelFunc
 
 	// WiFi reconnection backoff
-	backoffIdx       int       // index into backoffSchedule
-	ceilingFailures  int       // consecutive failures at backoff ceiling
-	lastReconnectErr error
+	backoffIdx      int // index into backoffSchedule
+	ceilingFailures int // consecutive failures at backoff ceiling
 
 	// Signal quality
 	lastSignalDBm  int
 	lastSignalTier SignalTier
 
-	// Callbacks
-	onTransition func(newState ConnState) // called after state change (for health tracker)
+	// Callbacks (set before Start, read under sm.mu)
+	//
+	// Lock ordering: sm.mu → Manager.mu (RLock). The wifiConnected callback
+	// acquires Manager.mu.RLock while sm.mu is held. No code path acquires
+	// these in reverse order.
+	onTransition  func(newState ConnState) // called after state change (for health tracker)
+	wifiConnected func() bool             // queries whether WiFi STA is currently active
 
 	// Dependencies
-	nm     nmclient.Client
 	events *events.Bus
-
-	// WiFi state tracking
-	hasSavedWifi   bool
-	savedSSID      string
 }
 
 var backoffSchedule = []time.Duration{
@@ -61,11 +59,10 @@ const (
 	ethDebounceDuration  = 5 * time.Second
 )
 
-func newStateMachine(nm nmclient.Client, bus *events.Bus) *stateMachine {
+func newStateMachine(bus *events.Bus) *stateMachine {
 	return &stateMachine{
 		current: StateDisconnected,
 		uplink:  UplinkNone,
-		nm:      nm,
 		events:  bus,
 	}
 }
@@ -126,8 +123,9 @@ func (sm *stateMachine) handleEthernetUp() {
 	sm.resetBackoff()
 }
 
-// handleEthernetDown is called when Ethernet is lost.
-func (sm *stateMachine) handleEthernetDown() {
+// handleEthernetDown is called when Ethernet is lost. hasSavedWifi is
+// queried from NM by the caller — not cached in the state machine.
+func (sm *stateMachine) handleEthernetDown(hasSavedWifi bool) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -135,7 +133,14 @@ func (sm *stateMachine) handleEthernetDown() {
 		return // not relevant
 	}
 
-	if sm.hasSavedWifi {
+	// If WiFi STA is already active (NM auto-connected a saved profile while
+	// Ethernet was primary), promote it directly — no reconnection needed.
+	if hasSavedWifi && sm.wifiConnected != nil && sm.wifiConnected() {
+		sm.transition(StateWiFiSTA, UplinkWiFi)
+		return
+	}
+
+	if hasSavedWifi {
 		// NM will auto-connect the saved profile, but association + DHCP
 		// takes seconds. Report Reconnecting until the D-Bus DeviceStateChange
 		// signal confirms WiFi is actually activated.
@@ -159,7 +164,8 @@ func (sm *stateMachine) handleWiFiConnected() {
 }
 
 // handleWiFiDisconnected is called when WiFi STA loses association.
-func (sm *stateMachine) handleWiFiDisconnected() {
+// hasSavedWifi is queried from NM by the caller.
+func (sm *stateMachine) handleWiFiDisconnected(hasSavedWifi bool) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -167,7 +173,13 @@ func (sm *stateMachine) handleWiFiDisconnected() {
 		return
 	}
 
-	sm.transition(StateReconnecting, UplinkNone)
+	if hasSavedWifi {
+		sm.transition(StateReconnecting, UplinkNone)
+	} else {
+		// Profile was deleted externally (nmcli, NM auto-cleanup) — no
+		// point reconnecting. AP mode lets the user reconfigure.
+		sm.transition(StateAPMode, UplinkNone)
+	}
 }
 
 // handleReconnectResult is called after a reconnection attempt.
