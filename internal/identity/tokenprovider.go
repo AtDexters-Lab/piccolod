@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	backend "github.com/AtDexters-Lab/nexus-proxy-backend-client/client"
+	backend "github.com/AtDexters-Lab/nexus-proxy/client"
 	"github.com/AtDexters-Lab/namek-server/pkg/namekclient"
 )
 

@@ -13,6 +13,7 @@ require (
 	github.com/gin-contrib/gzip v1.2.6
 	github.com/go-jose/go-jose/v4 v4.1.3
 	github.com/go-webauthn/webauthn v0.16.1
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/miekg/dns v1.1.72
 	github.com/zitadel/oidc/v3 v3.45.5
 	golang.org/x/net v0.52.0
@@ -34,7 +35,6 @@ require (
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/go-webauthn/x v0.2.2 // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect
-	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/gorilla/securecookie v1.1.2 // indirect
@@ -64,7 +64,7 @@ require (
 )
 
 require (
-	github.com/AtDexters-Lab/nexus-proxy-backend-client v0.2.6
+	github.com/AtDexters-Lab/nexus-proxy v0.3.4
 	github.com/bytedance/sonic v1.15.0 // indirect
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect

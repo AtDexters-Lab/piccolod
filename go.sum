@@ -1,7 +1,7 @@
 github.com/AtDexters-Lab/namek-server v0.1.6 h1:wEFYade3ss2xcm8z1aj97p10BnUIB7DAZa75BGfVj1k=
 github.com/AtDexters-Lab/namek-server v0.1.6/go.mod h1:r6pAHPVrXavDRoUfSFC0p0Q+06lhBFZG6brfqAsEeyQ=
-github.com/AtDexters-Lab/nexus-proxy-backend-client v0.2.6 h1:olN/UM09LxuPO47WcKR93ulxXoPF4A6ff+pj3yV/7AU=
-github.com/AtDexters-Lab/nexus-proxy-backend-client v0.2.6/go.mod h1:HTS899wUgAKulKZY41Lb6In58vT3HiwjZt6ZnRGPUrE=
+github.com/AtDexters-Lab/nexus-proxy v0.3.4 h1:/HQImpHOl4taRIwP8mUm3Fl3zlf7eTj0IapujbvBrLM=
+github.com/AtDexters-Lab/nexus-proxy v0.3.4/go.mod h1:fOROS1v6e+roqo4fIq6aeRQmkkumg9em9qO1XdXf2fk=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d h1:licZJFw2RwpHMqeKTCYkitsPqHNxTmd4SNR5r94FGM8=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d/go.mod h1:asat636LX7Bqt5lYEZ27JNDcqxfjdBQuJ/MM4CN/Lzo=
 github.com/bmatcuk/doublestar/v4 v4.10.0 h1:zU9WiOla1YA122oLM6i4EXvGW62DvKZVxIe6TYWexEs=

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	backend "github.com/AtDexters-Lab/nexus-proxy-backend-client/client"
+	backend "github.com/AtDexters-Lab/nexus-proxy/client"
 
 	"piccolod/internal/router"
 )

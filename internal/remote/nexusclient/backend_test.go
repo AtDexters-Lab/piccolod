@@ -13,7 +13,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/router"
 
-	backend "github.com/AtDexters-Lab/nexus-proxy-backend-client/client"
+	backend "github.com/AtDexters-Lab/nexus-proxy/client"
 )
 
 type fakeClient struct {
