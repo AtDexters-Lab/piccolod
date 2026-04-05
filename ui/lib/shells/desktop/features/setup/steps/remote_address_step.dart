@@ -11,6 +11,7 @@ class RemoteAddressStep extends StatefulWidget {
     required this.onSubmit,
     required this.onSkip,
     required this.onRefresh,
+    this.suggestedHostname,
     this.error,
     this.isSubmitting = false,
     super.key,
@@ -20,6 +21,7 @@ class RemoteAddressStep extends StatefulWidget {
   final Future<bool> Function(String) onSubmit;
   final VoidCallback onSkip;
   final Future<void> Function() onRefresh;
+  final String? suggestedHostname;
   final String? error;
   final bool isSubmitting;
 
@@ -28,42 +30,103 @@ class RemoteAddressStep extends StatefulWidget {
 }
 
 class _RemoteAddressStepState extends State<RemoteAddressStep> {
-  final _hostnameController = TextEditingController();
+  late final TextEditingController _hostnameController;
   final _focusNode = FocusNode();
   String? _localError;
   bool _isFocused = false;
   Timer? _pollTimer;
   bool _pollInFlight = false;
+  bool _suggestionApplied = false;
 
   @override
   void initState() {
     super.initState();
+    final suggestion = widget.suggestedHostname ?? '';
+    _hostnameController = TextEditingController(text: suggestion);
+    _suggestionApplied = suggestion.isNotEmpty;
     _focusNode.addListener(_onFocusChange);
     unawaited(widget.onRefresh());
-    // Poll for enrollment completion while not yet enrolled.
-    // Auto-enrollment may finish seconds after this step renders.
     if (!widget.enrolled) {
-      _pollTimer = Timer.periodic(
-        const Duration(seconds: 3),
-        (_) async {
-          if (_pollInFlight) return;
-          _pollInFlight = true;
-          try {
-            await widget.onRefresh();
-          } finally {
-            _pollInFlight = false;
-          }
-        },
-      );
+      // Poll for enrollment completion while not yet enrolled.
+      // Auto-enrollment may finish seconds after this step renders.
+      _startPoll(const Duration(seconds: 3));
+    } else if (_needsSuggestionPoll) {
+      // Enrolled but suggestion hasn't arrived yet (fetchSuggestedHostname
+      // still in flight). Poll briefly to catch it.
+      _startSuggestionPoll();
     }
+  }
+
+  bool get _needsSuggestionPoll =>
+      widget.suggestedHostname == null || widget.suggestedHostname!.isEmpty;
+
+  void _startPoll(Duration interval) {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(
+      interval,
+      (_) async {
+        if (_pollInFlight) return;
+        _pollInFlight = true;
+        try {
+          await widget.onRefresh();
+        } finally {
+          _pollInFlight = false;
+        }
+      },
+    );
+  }
+
+  /// Short-lived poll to catch a late-arriving suggested hostname after
+  /// enrollment. Auto-cancels after 20 seconds (the backend fetch has a
+  /// 15-second timeout; 20s provides margin for slow responses).
+  void _startSuggestionPoll() {
+    _startPoll(const Duration(seconds: 2));
+    Future<void>.delayed(const Duration(seconds: 20), () {
+      if (!mounted) return;
+      _pollTimer?.cancel();
+      _pollTimer = null;
+    });
   }
 
   @override
   void didUpdateWidget(RemoteAddressStep oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // Pre-populate if suggested hostname arrives after initial build
+    // (e.g., from refreshEnrollmentStatus polling) and the user hasn't typed yet.
+    if (widget.suggestedHostname != oldWidget.suggestedHostname &&
+        widget.suggestedHostname != null &&
+        widget.suggestedHostname!.isNotEmpty &&
+        _hostnameController.text.isEmpty) {
+      _hostnameController.text = widget.suggestedHostname!;
+      // Setting .text resets cursor to position 0; move it to the end.
+      _hostnameController.selection = TextSelection.collapsed(
+        offset: _hostnameController.text.length,
+      );
+      _suggestionApplied = true;
+    }
+    // Enrollment just detected — switch from enrollment poll to suggestion poll.
     if (widget.enrolled && !oldWidget.enrolled) {
       _pollTimer?.cancel();
       _pollTimer = null;
+      if (_needsSuggestionPoll) {
+        _startSuggestionPoll();
+      }
+    }
+    // Suggestion arrived — stop any polling.
+    if (widget.suggestedHostname != null &&
+        widget.suggestedHostname!.isNotEmpty &&
+        _pollTimer != null) {
+      _pollTimer?.cancel();
+      _pollTimer = null;
+    }
+    // Suggested hostname was rejected (taken/unavailable) — clear the field
+    // only if the user hadn't edited it (preserve user's modified input).
+    if (oldWidget.suggestedHostname != null &&
+        widget.suggestedHostname == null &&
+        widget.error != null &&
+        _hostnameController.text == oldWidget.suggestedHostname) {
+      _hostnameController.clear();
+      _suggestionApplied = false;
     }
   }
 
@@ -214,6 +277,19 @@ class _RemoteAddressStepState extends State<RemoteAddressStep> {
                   displayError,
                   style: PiccoloTheme.textTheme.bodySmall?.copyWith(
                     color: PiccoloTheme.critical,
+                  ),
+                ),
+              ),
+            ),
+          if (_suggestionApplied && displayError == null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6, left: 12),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Your previous address has been pre-filled. You can change it.',
+                  style: PiccoloTheme.textTheme.bodySmall?.copyWith(
+                    color: PiccoloTheme.inkMuted,
                   ),
                 ),
               ),

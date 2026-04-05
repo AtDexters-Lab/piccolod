@@ -71,6 +71,13 @@ type Service struct {
 	// Server-reported recovery status (from GET /devices/me).
 	recoveryStatus string
 
+	// suggestedHostname is an ephemeral, in-memory-only hint populated when
+	// autoEnrollAtBoot detects a re-enrollment (Reenrolled: true). The boot
+	// handler surfaces it so the setup UI can pre-populate the hostname input.
+	// Not persisted — only meaningful during the current setup session.
+	// Orthogonal to state_cache.json, which serves as durable cache for replayState.
+	suggestedHostname string
+
 	// onRelayServicesChanged is called when relay services (including STUN
 	// addresses) change, so the owner can update STUN server lists.
 	onRelayServicesChanged func(services map[string][]string)
@@ -204,6 +211,9 @@ func (s *Service) autoEnrollAtBoot() {
 		if err == nil {
 			log.Printf("INFO: identity: auto-enrollment succeeded after %d attempt(s) (device=%s, hostname=%s)",
 				attempt+1, result.DeviceID, result.Hostname)
+			if result.Reenrolled {
+				go s.fetchSuggestedHostname()
+			}
 			return
 		}
 
@@ -386,6 +396,15 @@ func (s *Service) DeviceConfig() Config {
 	return cfg
 }
 
+// SuggestedHostname returns the ephemeral hostname suggestion from a
+// re-enrollment, or empty string. Used by the boot handler to pre-populate
+// the setup UI. Not persisted and not part of the device config.
+func (s *Service) SuggestedHostname() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.suggestedHostname
+}
+
 // Enroll performs TPM-attested enrollment with the namek server.
 func (s *Service) Enroll(ctx context.Context) (*EnrollResult, error) {
 	s.mu.RLock()
@@ -510,6 +529,7 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 	s.cfg.CustomHostname = ""
 	s.cfg.IdentityClass = ""
 	s.cfg.NexusEndpoints = nil
+	s.suggestedHostname = ""
 	s.client = nil
 	cfg := s.cfg
 	s.mu.Unlock()
@@ -553,6 +573,7 @@ func (s *Service) SetCustomHostname(ctx context.Context, hostname string) error 
 
 	s.mu.Lock()
 	s.cfg.CustomHostname = hostname
+	s.suggestedHostname = ""
 	cfg := s.cfg
 	s.mu.Unlock()
 
@@ -1019,6 +1040,65 @@ func (s *Service) syncEndpointsOnce(ctx context.Context) {
 
 	// TODO(namek-stun): When namekclient is bumped to include RelayServices:
 	// s.syncRelayServices(info.RelayServices)
+}
+
+// fetchSuggestedHostname performs a best-effort GetDeviceInfo call to retrieve
+// the prior custom hostname after a re-enrollment. The result is stored in
+// suggestedHostname (in-memory only) for the boot handler to surface as a
+// UI pre-fill hint. Failures are logged and swallowed.
+func (s *Service) fetchSuggestedHostname() {
+	s.mu.RLock()
+	client := s.client
+	s.mu.RUnlock()
+	if client == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	info, err := client.GetDeviceInfo(ctx)
+	if err != nil {
+		log.Printf("WARN: identity: fetch suggested hostname: %v", err)
+		return
+	}
+
+	if info.CustomHostname != nil && *info.CustomHostname != "" {
+		hostname := strings.ToLower(*info.CustomHostname)
+		if !isValidDNSLabel(hostname) {
+			log.Printf("WARN: identity: suggested hostname %q from server is not a valid DNS label, ignoring", hostname)
+			return
+		}
+		s.mu.Lock()
+		// Don't overwrite if user already claimed a hostname (late-arriving fetch).
+		if s.cfg.CustomHostname == "" {
+			s.suggestedHostname = hostname
+			s.mu.Unlock()
+			log.Printf("INFO: identity: suggested hostname from prior enrollment: %q", hostname)
+		} else {
+			s.mu.Unlock()
+			log.Printf("INFO: identity: suggested hostname %q discarded (hostname already claimed)", hostname)
+		}
+	}
+}
+
+// isValidDNSLabel rejects server-provided hostnames that would fail DNS resolution
+// or confuse the setup UI. Deliberately lowercase-only — callers must ToLower first.
+func isValidDNSLabel(label string) bool {
+	if label == "" || len(label) > 63 {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		ch := label[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (s *Service) syncDeviceMeta(info *namekclient.DeviceInfo) {

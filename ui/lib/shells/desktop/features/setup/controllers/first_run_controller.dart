@@ -25,6 +25,7 @@ class FirstRunController extends ChangeNotifier {
     required this.reRoute,
     required this.onSystemError,
     required this.generateRecoveryKey,
+    this.namekSuggestedHostname,
     String? setupNonce,
   }) : _setupNonce = setupNonce {
     _step = isRemote ? FirstRunStep.credentials : FirstRunStep.welcome;
@@ -33,6 +34,7 @@ class FirstRunController extends ChangeNotifier {
   final bool isRemote;
   bool namekEnrolled;
   String? namekBaseDomain;
+  String? namekSuggestedHostname;
   final VoidCallback onComplete;
   final VoidCallback reRoute;
   final void Function(String error) onSystemError;
@@ -113,6 +115,7 @@ class FirstRunController extends ChangeNotifier {
       if (boot['screen'] == 'setup') {
         namekEnrolled = boot['namek_enrolled'] == true;
         namekBaseDomain = boot['namek_base_domain'] as String?;
+        namekSuggestedHostname = boot['namek_suggested_hostname'] as String?;
         notifyListeners();
       }
     } on Object catch (_) {}
@@ -153,6 +156,7 @@ class FirstRunController extends ChangeNotifier {
       final nonce = result['setup_nonce'] as String?;
 
       _settingHostname = false;
+      namekSuggestedHostname = null; // prevent stale suggestion on back-navigation
       _pendingFqdn = fqdn ?? '$hostname.$baseDomain';
       _pendingNonce = nonce;
       _relayReady = false;
@@ -165,11 +169,14 @@ class FirstRunController extends ChangeNotifier {
       return true;
     } on ApiException catch (e) {
       _hostnameError = extractServerError(e.message);
+      namekSuggestedHostname = null; // clear stale suggestion on rejection
       _settingHostname = false;
       notifyListeners();
       return false;
     } on Object catch (e) {
       _hostnameError = e.toString();
+      // Don't clear suggestion on transient errors (timeout, network) —
+      // the user should retry with the same hostname.
       _settingHostname = false;
       notifyListeners();
       return false;
