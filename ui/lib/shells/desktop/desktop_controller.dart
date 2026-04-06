@@ -84,6 +84,11 @@ class DesktopController extends ChangeNotifier {
   String? _lastKnownUsername;
   String? get lastKnownUsername => _lastKnownUsername;
 
+  // Screen size cache — updated by DesktopShell.build() every frame.
+  // Used as fallback in openApp() when callers don't pass screenSize.
+  Size? _lastKnownScreenSize;
+  set screenSize(Size size) => _lastKnownScreenSize = size;
+
   // Setup State
   bool _needsSetup = false; // Default to false to avoid flash
   bool get needsSetup => _needsSetup;
@@ -418,15 +423,17 @@ class DesktopController extends ChangeNotifier {
       return;
     }
 
+    final resolvedScreenSize = screenSize ?? _lastKnownScreenSize;
+
     // 1. Determine Target Size
     // Use provided initialSize or a sensible default (1024x700)
     var targetSize = initialSize ?? const Size(1024, 700);
 
     // 2. Clamp to Screen Size (Safety)
-    if (screenSize != null) {
+    if (resolvedScreenSize != null) {
       // Ensure window isn't larger than the screen (minus dock area)
-      final maxWidth = screenSize.width;
-      final maxHeight = screenSize.height - kDockAreaHeight;
+      final maxWidth = resolvedScreenSize.width;
+      final maxHeight = resolvedScreenSize.height - kDockAreaHeight;
 
       if (targetSize.width > maxWidth) {
         targetSize = Size(maxWidth, targetSize.height);
@@ -440,9 +447,9 @@ class DesktopController extends ChangeNotifier {
     double x;
     double y;
 
-    if (screenSize != null) {
+    if (resolvedScreenSize != null) {
       // Available height for centering
-      final availableHeight = screenSize.height - kTopMargin - kDockAreaHeight;
+      final availableHeight = resolvedScreenSize.height - kTopMargin - kDockAreaHeight;
 
       // Clamp height to available space to ensure dock visibility
       if (targetSize.height > availableHeight) {
@@ -450,7 +457,7 @@ class DesktopController extends ChangeNotifier {
       }
 
       // Center horizontally
-      x = (screenSize.width - targetSize.width) / 2;
+      x = (resolvedScreenSize.width - targetSize.width) / 2;
 
       // Center vertically within the safe area, then add top offset
       y = kTopMargin + (availableHeight - targetSize.height) / 2;
@@ -458,7 +465,8 @@ class DesktopController extends ChangeNotifier {
       // Final safety clamps
       if (y < kTopMargin) y = kTopMargin;
     } else {
-      // Fallback: Cascade based on window count
+      // Fallback: Cascade based on window count (should rarely hit —
+      // _lastKnownScreenSize is set on first DesktopShell build).
       final offset = _windows.length * 30.0;
       x = 100.0 + offset;
       y = 80.0 + offset;

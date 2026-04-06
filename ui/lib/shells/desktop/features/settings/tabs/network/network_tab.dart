@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/wifi_models.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/event_stream_client.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/network_controller.dart';
-import 'package:piccolo_os/theme/piccolo_icons.dart';
-import 'package:piccolo_os/theme/piccolo_theme.dart';
-import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/widgets/ap_mode_card.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/widgets/wifi_connect_dialog.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/widgets/wifi_network_list.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/widgets/wifi_status_card.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class NetworkTab extends StatefulWidget {
   const NetworkTab({super.key, this.eventStreamClient});
@@ -33,6 +34,22 @@ class _NetworkTabState extends State<NetworkTab> {
   void dispose() {
     _controller.dispose();
     super.dispose();
+  }
+
+  Future<void> _onNetworkSelected(WifiNetwork network) async {
+    final connected = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => WifiConnectDialog(
+        network: network,
+        onConnect: _controller.connectRaw,
+        onVerify: _controller.verifyConnection,
+        isAPMode: _controller.status?.isAPMode ?? false,
+      ),
+    );
+    if (connected == true) {
+      await _controller.refresh();
+    }
   }
 
   @override
@@ -106,20 +123,13 @@ class _NetworkTabState extends State<NetworkTab> {
                   await _controller.scanNetworks();
                 },
               ),
-              const SizedBox(height: 16),
-              if (_controller.scanResults != null)
+              if (_controller.scanResults != null) ...[
+                const SizedBox(height: 16),
                 WifiNetworkList(
                   networks: _controller.scanResults!,
                   isScanning: _controller.isScanning,
-                  isConnecting: _controller.isConnecting,
-                  onConnect: _controller.connectToNetwork,
+                  onNetworkSelected: _onNetworkSelected,
                   onRescan: _controller.scanNetworks,
-                ),
-              if (_controller.apStatus != null) ...[
-                const SizedBox(height: 16),
-                APModeCard(
-                  apStatus: _controller.apStatus!,
-                  onToggleSuppression: _controller.toggleAPSuppression,
                 ),
               ],
             ],

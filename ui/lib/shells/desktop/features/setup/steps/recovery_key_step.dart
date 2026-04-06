@@ -31,7 +31,7 @@ class _RecoveryKeyStepState extends State<RecoveryKeyStep> {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
+      padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -41,9 +41,9 @@ class _RecoveryKeyStepState extends State<RecoveryKeyStep> {
               fontWeight: FontWeight.bold,
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
           Container(
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(
               color: PiccoloTheme.mist,
               borderRadius: BorderRadius.circular(Radii.sm),
@@ -66,9 +66,9 @@ class _RecoveryKeyStepState extends State<RecoveryKeyStep> {
               ],
             ),
           ),
-          const SizedBox(height: 18),
+          const SizedBox(height: 12),
           Container(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
               color: PiccoloTheme.porcelain,
               borderRadius: BorderRadius.circular(Radii.sm),
@@ -80,22 +80,22 @@ class _RecoveryKeyStepState extends State<RecoveryKeyStep> {
               widget.words
                   .asMap()
                   .entries
-                  .map((e) => '${e.key + 1}.${e.value}')
+                  .map((e) => '${e.key + 1}. ${e.value}')
                   .join('  '),
               style: PiccoloTheme.mono.copyWith(
-                fontSize: 14,
-                height: 1.8,
+                fontSize: 13,
+                height: 1.5,
               ),
             ),
           ),
-          const SizedBox(height: 18),
+          const SizedBox(height: 12),
           OutlinedButton.icon(
             onPressed: _downloadKey,
             icon: const Icon(PiccoloIcons.download, size: 16),
             label: const Text('Download key'),
             style: OutlinedButton.styleFrom(foregroundColor: PiccoloTheme.ink),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 12),
           InkWell(
             onTap: () => setState(() => _confirmed = !_confirmed),
             child: Row(
@@ -114,7 +114,7 @@ class _RecoveryKeyStepState extends State<RecoveryKeyStep> {
               ],
             ),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: 14),
           FilledButton(
             onPressed: _confirmed ? widget.onNext : null,
             style: FilledButton.styleFrom(

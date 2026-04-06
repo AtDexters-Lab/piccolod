@@ -1,6 +1,10 @@
 /// Models for the WiFi management API (/api/v1/wifi/*).
 library;
 
+import 'package:flutter/widgets.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
+
 class WifiStatus {
 
   WifiStatus({
@@ -78,6 +82,24 @@ class WifiNetwork {
   final String signalTier;
   final int frequencyMhz;
   final String band;
+
+  bool get isOpen {
+    final sec = security.toLowerCase();
+    return sec == 'open' || sec == 'none' || sec == '';
+  }
+
+  IconData get signalIcon => switch (signalTier) {
+    'good' => PiccoloIcons.wifi,
+    'fair' => PiccoloIcons.wifiMedium,
+    'weak' => PiccoloIcons.wifiLow,
+    _ => PiccoloIcons.wifiNone,
+  };
+
+  Color get signalColor => switch (signalTier) {
+    'good' || 'fair' => PiccoloTheme.success,
+    'weak' => PiccoloTheme.warning,
+    _ => PiccoloTheme.critical,
+  };
 }
 
 class WifiConnectResult {

@@ -29,7 +29,6 @@ class NetworkController extends ChangeNotifier {
   WifiAPStatus? apStatus;
   List<WifiNetwork>? scanResults;
   bool isScanning = false;
-  bool isConnecting = false;
 
   void _init() {
     unawaited(refresh());
@@ -88,24 +87,32 @@ class NetworkController extends ChangeNotifier {
     }
   }
 
-  Future<String?> connectToNetwork(String ssid, String passphrase) async {
-    isConnecting = true;
-    notifyListeners();
+  /// Sends a WiFi connect request. Lets exceptions propagate for
+  /// network-reset detection by the caller (WiFi connect dialog).
+  Future<WifiConnectResult> connectRaw(String ssid, String passphrase) {
+    return _wifiService.connect(ssid, passphrase);
+  }
 
-    try {
-      final result = await _wifiService.connect(ssid, passphrase);
-      if (!result.success) {
-        return result.error ?? 'Connection failed';
+  /// Polls getStatus() to verify the device connected to [targetSsid].
+  /// Returns true if connected, false after all retries are exhausted.
+  Future<bool> verifyConnection(String targetSsid) async {
+    for (var i = 0; i < 5; i++) {
+      await Future<void>.delayed(const Duration(seconds: 2));
+      if (_disposed) return false;
+      try {
+        debugPrint('WiFi verify poll ${i + 1}/5: checking for $targetSsid');
+        final s = await _wifiService.getStatus();
+        if (s.isWifiConnected && s.ssid == targetSsid) {
+          debugPrint('WiFi verify: connected to $targetSsid');
+          if (!_disposed) await refresh();
+          return true;
+        }
+      } catch (e) {
+        debugPrint('WiFi verify poll ${i + 1}/5 failed: $e');
       }
-      // Refresh status after successful connection
-      await refresh();
-      return null; // success
-    } catch (e) {
-      return e.toString();
-    } finally {
-      isConnecting = false;
-      if (!_disposed) notifyListeners();
     }
+    debugPrint('WiFi verify: gave up after 5 polls');
+    return false;
   }
 
   Future<void> disconnectWifi() async {
@@ -114,16 +121,6 @@ class NetworkController extends ChangeNotifier {
       await refresh();
     } catch (e) {
       error = 'Disconnect failed: $e';
-      notifyListeners();
-    }
-  }
-
-  Future<void> toggleAPSuppression(bool suppress) async {
-    try {
-      await _wifiService.suppressAP(suppress);
-      await refresh();
-    } catch (e) {
-      error = 'Failed to update AP setting: $e';
       notifyListeners();
     }
   }

@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/wifi_models.dart';
+import 'package:piccolo_os/theme/piccolo_icons.dart';
+import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class WifiStatusCard extends StatelessWidget {
   const WifiStatusCard({
@@ -28,13 +30,11 @@ class WifiStatusCard extends StatelessWidget {
                     children: [
                       Text(
                         _connectionLabel,
-                        style: Theme.of(context).textTheme.titleMedium,
+                        style: PiccoloTheme.textTheme.titleMedium,
                       ),
                       Text(
                         _statusDescription,
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                              color: Colors.grey[600],
-                            ),
+                        style: PiccoloTheme.textTheme.bodySmall,
                       ),
                     ],
                   ),
@@ -72,18 +72,18 @@ class WifiStatusCard extends StatelessWidget {
   }
 
   IconData get _uplinkIcon {
-    if (status.isEthernet) return Icons.settings_ethernet;
-    if (status.isWifiConnected) return Icons.wifi;
-    if (status.isReconnecting) return Icons.wifi_find;
-    if (status.isAPMode) return Icons.wifi_tethering;
-    return Icons.wifi_off;
+    if (status.isEthernet) return PiccoloIcons.ethernet;
+    if (status.isWifiConnected) return PiccoloIcons.wifi;
+    if (status.isReconnecting) return PiccoloIcons.wifiNone;
+    if (status.isAPMode) return PiccoloIcons.accessPoint;
+    return PiccoloIcons.wifiOff;
   }
 
   Color get _statusColor {
-    if (status.isEthernet || status.isWifiConnected) return Colors.green;
-    if (status.isReconnecting) return Colors.orange;
-    if (status.isAPMode) return Colors.blue;
-    return Colors.red;
+    if (status.isEthernet || status.isWifiConnected) return PiccoloTheme.success;
+    if (status.isReconnecting) return PiccoloTheme.warning;
+    if (status.isAPMode) return PiccoloTheme.info;
+    return PiccoloTheme.critical;
   }
 
   String get _connectionLabel {
@@ -116,7 +116,7 @@ class _InfoRow extends StatelessWidget {
         children: [
           SizedBox(
             width: 100,
-            child: Text(label, style: TextStyle(color: Colors.grey[600], fontSize: 13)),
+            child: Text(label, style: const TextStyle(color: PiccoloTheme.inkMuted, fontSize: 13)),
           ),
           Text(value, style: const TextStyle(fontSize: 13)),
         ],
@@ -138,9 +138,9 @@ class _SignalBars extends StatelessWidget {
       _ => 1,
     };
     final color = switch (tier) {
-      'good' || 'fair' => Colors.green,
-      'weak' => Colors.orange,
-      _ => Colors.red,
+      'good' || 'fair' => PiccoloTheme.success,
+      'weak' => PiccoloTheme.warning,
+      _ => PiccoloTheme.critical,
     };
 
     return Row(
@@ -153,7 +153,7 @@ class _SignalBars extends StatelessWidget {
           height: height,
           margin: const EdgeInsets.only(left: 2),
           decoration: BoxDecoration(
-            color: i < activeBars ? color : Colors.grey[300],
+            color: i < activeBars ? color : PiccoloTheme.hairline,
             borderRadius: BorderRadius.circular(1),
           ),
         );

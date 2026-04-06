@@ -29,6 +29,7 @@ class _DesktopShellState extends State<DesktopShell> {
   @override
   Widget build(BuildContext context) {
     final screenSize = MediaQuery.of(context).size;
+    _controller.screenSize = screenSize;
     final uri = Uri.base;
     final isAccessDeniedRoute = uri.path == '/access-denied';
     final next = uri.queryParameters['next'];

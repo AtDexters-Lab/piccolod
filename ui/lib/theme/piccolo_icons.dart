@@ -27,6 +27,14 @@ class PiccoloIcons {
   static const IconData info = PhosphorIconsRegular.info;
   static const IconData wifiOff = PhosphorIconsRegular.wifiSlash;
 
+  // ---- Network ----
+  static const IconData wifi = PhosphorIconsRegular.wifiHigh;
+  static const IconData wifiMedium = PhosphorIconsRegular.wifiMedium;
+  static const IconData wifiLow = PhosphorIconsRegular.wifiLow;
+  static const IconData wifiNone = PhosphorIconsRegular.wifiNone;
+  static const IconData ethernet = PhosphorIconsRegular.plugsConnected;
+  static const IconData accessPoint = PhosphorIconsRegular.broadcast;
+
   // ---- Actions ----
   static const IconData close = PhosphorIconsRegular.x;
   static const IconData minimize = PhosphorIconsRegular.minus;
