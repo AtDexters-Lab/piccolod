@@ -16,6 +16,15 @@ import (
 	"piccolod/internal/runner"
 )
 
+// captivePort is the port the captive portal HTTP server listens on.
+// Firewalld forwards port 80 → captivePort via NAT on the AP zone, avoiding
+// a bind conflict with the GinServer on 0.0.0.0:80.
+const (
+	captivePort     = 8080
+	captivePortRule = "8080/tcp"                                       // for firewalld --add-port / --remove-port
+	captiveNATRule  = "--add-forward-port=port=80:proto=tcp:toport=8080" // for firewalld NAT redirect
+)
+
 // Manager controls the AP mode lifecycle: hotspot activation/deactivation,
 // dnsmasq DNS redirect, firewalld zone rules, and captive portal server.
 type Manager struct {
@@ -156,11 +165,27 @@ func (m *Manager) Start(ctx context.Context, device dbus.ObjectPath, macAddr net
 		m.fw.removeRules(cleanupCtx)
 	})
 
-	// Step 7: Start captive portal on <AP_IP>:80.
-	// On Linux, binding to a specific IP:80 takes precedence over the
-	// GinServer's 0.0.0.0:80 binding. No NAT redirect needed.
+	// Step 6b: NAT redirect port 80 → captivePort on the AP zone.
+	// Client devices send captive portal probes to port 80; the forward-port
+	// rule rewrites the destination to captivePort before it reaches the
+	// kernel's socket layer, avoiding a bind conflict with the GinServer
+	// on 0.0.0.0:80. No separate cleanup needed — removeRules() reloads
+	// firewalld which clears all runtime forward-port rules.
+	//
+	// When firewalld is unavailable, fall back to port 80 directly.
+	portalPort := captivePort
+	if m.fw.available {
+		if err := m.fw.addNATRedirect(ctx); err != nil {
+			return m.rollback(fmt.Errorf("add NAT redirect: %w", err))
+		}
+		log.Printf("INFO: ap: NAT redirect port 80 → %d on zone %s", captivePort, apZone)
+	} else {
+		portalPort = 80
+	}
+
+	// Step 7: Start captive portal.
 	if m.onStartPortal != nil {
-		listenAddr := fmt.Sprintf("%s:80", apIP)
+		listenAddr := fmt.Sprintf("%s:%d", apIP, portalPort)
 		if err := m.onStartPortal(ctx, listenAddr); err != nil {
 			return m.rollback(fmt.Errorf("start captive portal: %w", err))
 		}

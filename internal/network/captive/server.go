@@ -31,7 +31,7 @@ type ScanResult struct {
 }
 
 // Server is the captive portal HTTP server. It runs on the AP interface IP
-// on a high port (e.g., 8080), with firewalld NAT redirecting port 80 to it.
+// on port 8080, with firewalld NAT redirecting port 80 to it.
 type Server struct {
 	httpSrv    *http.Server
 	keypair    *ECDHKeypair

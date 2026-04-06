@@ -1148,6 +1148,8 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 			switch pc {
 			case 80, 443:
 				return fmt.Errorf("listener '%s' port_claim %d is reserved for the portal", l.Name, pc)
+			case 8080:
+				return fmt.Errorf("listener '%s' port_claim %d is reserved for the captive portal", l.Name, pc)
 			case 5353:
 				return fmt.Errorf("listener '%s' port_claim %d is reserved for mDNS", l.Name, pc)
 			}

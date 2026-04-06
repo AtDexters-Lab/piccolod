@@ -664,7 +664,7 @@ func TestPortClaimValidation(t *testing.T) {
 		{
 			name: "valid_tcp_port_claim",
 			app: baseApp([]api.AppListener{
-				{Name: "web", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true, PortClaim: intPtr(8080)},
+				{Name: "web", GuestPort: 9090, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true, PortClaim: intPtr(9090)},
 			}),
 		},
 		{
@@ -739,11 +739,11 @@ func TestPortClaimValidation(t *testing.T) {
 			name: "reject_duplicate_claim_same_transport",
 			app: baseApp([]api.AppListener{
 				{Name: "main", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
-				{Name: "raw1", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(8080)},
-				{Name: "raw2", GuestPort: 8081, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(8080)},
+				{Name: "raw1", GuestPort: 9090, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(9090)},
+				{Name: "raw2", GuestPort: 9091, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(9090)},
 			}),
 			expectError: true,
-			errContains: "port_claim 8080/tcp used by both",
+			errContains: "port_claim 9090/tcp used by both",
 		},
 		{
 			name: "allow_same_claim_different_transport",
