@@ -103,7 +103,8 @@ func cleanStaleAPFirewall(ctx context.Context, r runner.CommandRunner) {
 	// Remove all runtime rules from the AP zone
 	_ = r.Run(ctx, "firewall-cmd", "--zone="+apFirewallZone, "--remove-service=dhcp")
 	_ = r.Run(ctx, "firewall-cmd", "--zone="+apFirewallZone, "--remove-service=dns")
-	_ = r.Run(ctx, "firewall-cmd", "--zone="+apFirewallZone, "--remove-port=80/tcp")
+	_ = r.Run(ctx, "firewall-cmd", "--zone="+apFirewallZone, "--remove-port=80/tcp")  // TODO: remove after all images updated past v0.2.5
+	_ = r.Run(ctx, "firewall-cmd", "--zone="+apFirewallZone, "--remove-port=8080/tcp") // current
 	// Forward-port rules need the full spec to remove; just reload to clear runtime rules
 	_ = r.Run(ctx, "firewall-cmd", "--reload")
 }

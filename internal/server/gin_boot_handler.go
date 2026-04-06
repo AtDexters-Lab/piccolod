@@ -201,6 +201,9 @@ func (s *GinServer) bootSetupResponse() gin.H {
 		if enrolled {
 			cfg := s.identityService.DeviceConfig()
 			resp["namek_base_domain"] = cfg.BaseDomain
+			if sh := s.identityService.SuggestedHostname(); sh != "" {
+				resp["namek_suggested_hostname"] = sh
+			}
 		}
 	}
 	return resp

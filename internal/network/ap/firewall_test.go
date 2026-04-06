@@ -39,7 +39,7 @@ func TestFirewall_ApplyRules(t *testing.T) {
 		t.Fatalf("calls = %d, want 3 (dhcp, dns, http)", len(calls))
 	}
 
-	wantSubstrings := []string{"--add-service=dhcp", "--add-service=dns", "--add-port=80/tcp"}
+	wantSubstrings := []string{"--add-service=dhcp", "--add-service=dns", "--add-port=8080/tcp"}
 	for i, want := range wantSubstrings {
 		if !strings.Contains(calls[i], want) {
 			t.Errorf("call[%d] = %q, want substring %q", i, calls[i], want)
@@ -51,7 +51,7 @@ func TestFirewall_AddNATRedirect(t *testing.T) {
 	fr := &testutil.FakeRunner{}
 	fw := &firewallManager{runner: fr, available: true}
 
-	if err := fw.addNATRedirect(context.Background(), 8080); err != nil {
+	if err := fw.addNATRedirect(context.Background()); err != nil {
 		t.Fatalf("addNATRedirect: %v", err)
 	}
 

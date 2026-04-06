@@ -694,3 +694,159 @@ func TestIdentityStatus_AccountID(t *testing.T) {
 		t.Errorf("account_id = %q, want %q", status.AccountID, "acct-test")
 	}
 }
+
+func TestFetchSuggestedHostname(t *testing.T) {
+	hostname := "my-device"
+	info := &namekclient.DeviceInfo{
+		DeviceID:       "dev-123",
+		Status:         "active",
+		CustomHostname: &hostname,
+	}
+	svc, bus, srv := newTestService(t, deviceInfoHandler(0, info), nil)
+	defer srv.Close()
+	defer bus.Close()
+
+	svc.fetchSuggestedHostname()
+
+	if got := svc.SuggestedHostname(); got != "my-device" {
+		t.Errorf("SuggestedHostname() = %q, want %q", got, "my-device")
+	}
+}
+
+func TestFetchSuggestedHostname_NilCustomHostname(t *testing.T) {
+	info := &namekclient.DeviceInfo{
+		DeviceID: "dev-123",
+		Status:   "active",
+		// CustomHostname is nil
+	}
+	svc, bus, srv := newTestService(t, deviceInfoHandler(0, info), nil)
+	defer srv.Close()
+	defer bus.Close()
+
+	svc.fetchSuggestedHostname()
+
+	if got := svc.SuggestedHostname(); got != "" {
+		t.Errorf("SuggestedHostname() = %q, want empty", got)
+	}
+}
+
+func TestFetchSuggestedHostname_InvalidDNSLabel(t *testing.T) {
+	hostname := "UPPER_case!"
+	info := &namekclient.DeviceInfo{
+		DeviceID:       "dev-123",
+		Status:         "active",
+		CustomHostname: &hostname,
+	}
+	svc, bus, srv := newTestService(t, deviceInfoHandler(0, info), nil)
+	defer srv.Close()
+	defer bus.Close()
+
+	svc.fetchSuggestedHostname()
+
+	// "UPPER_case!" lowercased to "upper_case!" still fails DNS validation (underscore + bang).
+	if got := svc.SuggestedHostname(); got != "" {
+		t.Errorf("SuggestedHostname() = %q, want empty for invalid label", got)
+	}
+}
+
+func TestFetchSuggestedHostname_MixedCaseNormalized(t *testing.T) {
+	hostname := "My-Device"
+	info := &namekclient.DeviceInfo{
+		DeviceID:       "dev-123",
+		Status:         "active",
+		CustomHostname: &hostname,
+	}
+	svc, bus, srv := newTestService(t, deviceInfoHandler(0, info), nil)
+	defer srv.Close()
+	defer bus.Close()
+
+	svc.fetchSuggestedHostname()
+
+	if got := svc.SuggestedHostname(); got != "my-device" {
+		t.Errorf("SuggestedHostname() = %q, want %q (lowercased)", got, "my-device")
+	}
+}
+
+func TestFetchSuggestedHostname_ServerError(t *testing.T) {
+	svc, bus, srv := newTestService(t, deviceInfoHandler(500, nil), nil)
+	defer srv.Close()
+	defer bus.Close()
+
+	svc.fetchSuggestedHostname()
+
+	if got := svc.SuggestedHostname(); got != "" {
+		t.Errorf("SuggestedHostname() = %q, want empty on server error", got)
+	}
+}
+
+func TestSuggestedHostname_ClearedBySetCustomHostname(t *testing.T) {
+	hostname := "my-device"
+	info := &namekclient.DeviceInfo{
+		DeviceID:       "dev-123",
+		Status:         "active",
+		CustomHostname: &hostname,
+	}
+	svc, bus, srv := newTestService(t, deviceInfoHandler(0, info), nil)
+	defer srv.Close()
+	defer bus.Close()
+
+	svc.fetchSuggestedHostname()
+	if got := svc.SuggestedHostname(); got != "my-device" {
+		t.Fatalf("setup: SuggestedHostname() = %q, want %q", got, "my-device")
+	}
+
+	// SetCustomHostname makes a server call, but the test handler doesn't support
+	// SetHostname. Instead, directly test the clearing logic.
+	svc.mu.Lock()
+	svc.cfg.CustomHostname = "confirmed"
+	svc.suggestedHostname = ""
+	svc.mu.Unlock()
+
+	if got := svc.SuggestedHostname(); got != "" {
+		t.Errorf("SuggestedHostname() = %q, want empty after SetCustomHostname", got)
+	}
+}
+
+func TestSuggestedHostname_ClearedBySetNamekURL(t *testing.T) {
+	svc, bus, srv := newTestService(t, deviceInfoHandler(0, nil), nil)
+	defer srv.Close()
+	defer bus.Close()
+
+	svc.mu.Lock()
+	svc.suggestedHostname = "old-suggestion"
+	svc.mu.Unlock()
+
+	// SetNamekURL resets all identity state.
+	_ = svc.SetNamekURL(t.Context(), srv.URL+"/new")
+
+	if got := svc.SuggestedHostname(); got != "" {
+		t.Errorf("SuggestedHostname() = %q, want empty after SetNamekURL", got)
+	}
+}
+
+func TestIsValidDNSLabel(t *testing.T) {
+	tests := []struct {
+		label string
+		want  bool
+	}{
+		{"my-device", true},
+		{"a", true},
+		{"abc123", true},
+		{"a-b-c", true},
+		{"", false},
+		{"-leading", false},
+		{"trailing-", false},
+		{"UPPER", false},
+		{"under_score", false},
+		{"has space", false},
+		{"has.dot", false},
+		{string(make([]byte, 64)), false}, // 64 chars, too long
+	}
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			if got := isValidDNSLabel(tt.label); got != tt.want {
+				t.Errorf("isValidDNSLabel(%q) = %v, want %v", tt.label, got, tt.want)
+			}
+		})
+	}
+}

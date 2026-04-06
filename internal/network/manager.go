@@ -42,6 +42,8 @@ type Manager struct {
 	ethDevices     []nmclient.EthernetDevice
 	wifiAvailable  bool
 	apSuppressed   bool
+	apRetryActive  atomic.Bool  // true while AP retry goroutine is running
+	apRetryCount   atomic.Int32 // persists across goroutine restarts from WiFi bounces
 
 	// Scan cache
 	scanCache     []ScanResult
@@ -457,9 +459,28 @@ func (m *Manager) handleAPTransition(newState ConnState) {
 			go m.revertAPState() // async: called from onTransition which holds sm.mu
 			return
 		}
+		// Guard: only one retry goroutine at a time. During AP retry, NM
+		// may briefly autoconnect to saved WiFi (causing a state bounce
+		// through wifi_connected back to ap_mode), which would re-trigger
+		// handleAPTransition. The guard prevents spawning a duplicate;
+		// the persistent apRetryCount survives goroutine restarts so the
+		// counter advances across bounces instead of resetting to 0.
+		//
+		// Note: connectFromCaptivePortal handles its own AP restart path
+		// and only runs when the AP is active (apRetryActive is false).
+		if !m.apRetryActive.CompareAndSwap(false, true) {
+			return // retry goroutine already running
+		}
 		go func() {
+			defer m.apRetryActive.Store(false)
+			defer m.apRetryCount.Store(0) // reset for next AP cycle on any exit
 			const maxAPRetries = 3
-			for attempt := 0; attempt < maxAPRetries; attempt++ {
+			for {
+				attempt := int(m.apRetryCount.Load())
+				if attempt >= maxAPRetries {
+					break
+				}
+
 				// Re-read device each attempt (handles USB hotplug)
 				m.mu.RLock()
 				dev := m.wifiDevice
@@ -468,7 +489,7 @@ func (m *Manager) handleAPTransition(newState ConnState) {
 					break
 				}
 
-				// Abort if state changed away from APMode (Ethernet/WiFi arrived)
+				// Abort if state changed away from APMode (WiFi/Ethernet arrived)
 				if m.state.Current() != StateAPMode {
 					return
 				}
@@ -492,6 +513,7 @@ func (m *Manager) handleAPTransition(newState ConnState) {
 				if err := m.apMgr.Start(m.ctx, dev.Path, dev.HWAddress); err == nil {
 					return // success
 				} else {
+					m.apRetryCount.Add(1)
 					log.Printf("ERROR: network: AP activation failed (attempt %d/%d): %v", attempt+1, maxAPRetries, err)
 				}
 			}

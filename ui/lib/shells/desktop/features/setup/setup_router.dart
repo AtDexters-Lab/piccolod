@@ -224,12 +224,14 @@ class _SetupRouterState extends State<SetupRouter> {
 
     final namekEnrolled = boot['namek_enrolled'] == true;
     final baseDomain = boot['namek_base_domain'] as String?;
+    final suggestedHostname = boot['namek_suggested_hostname'] as String?;
     final isRemote = isOnRemoteDomain() && _setupNonce != null;
 
     final ctrl = FirstRunController(
       isRemote: isRemote,
       namekEnrolled: namekEnrolled,
       namekBaseDomain: baseDomain,
+      namekSuggestedHostname: suggestedHostname,
       onComplete: _onControllerComplete,
       reRoute: () => unawaited(_checkBoot()),
       onSystemError: (err) => setState(() => _systemError = err),
@@ -645,6 +647,7 @@ class _SetupRouterState extends State<SetupRouter> {
         widget = RemoteAddressStep(
           enrolled: ctrl.namekEnrolled,
           baseDomain: ctrl.namekBaseDomain ?? '',
+          suggestedHostname: ctrl.namekSuggestedHostname,
           onSubmit: ctrl.submitHostname,
           onSkip: ctrl.skipRemoteAddress,
           onRefresh: ctrl.refreshEnrollmentStatus,

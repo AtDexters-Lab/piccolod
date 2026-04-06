@@ -78,7 +78,7 @@ func (f *firewallManager) applyRules(ctx context.Context) error {
 	rules := [][]string{
 		{"--zone=" + apZone, "--add-service=dhcp"},
 		{"--zone=" + apZone, "--add-service=dns"},
-		{"--zone=" + apZone, "--add-port=80/tcp"},
+		{"--zone=" + apZone, "--add-port=" + captivePortRule},
 	}
 
 	for _, args := range rules {
@@ -90,12 +90,11 @@ func (f *firewallManager) applyRules(ctx context.Context) error {
 }
 
 // addNATRedirect adds a port forward from 80 to captivePort on the AP zone.
-func (f *firewallManager) addNATRedirect(ctx context.Context, captivePort int) error {
+func (f *firewallManager) addNATRedirect(ctx context.Context) error {
 	if !f.available {
 		return nil
 	}
-	rule := fmt.Sprintf("--add-forward-port=port=80:proto=tcp:toport=%d", captivePort)
-	return f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, rule)
+	return f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, captiveNATRule)
 }
 
 // removeRules removes all runtime rules from the AP zone.
@@ -105,7 +104,7 @@ func (f *firewallManager) removeRules(ctx context.Context) {
 	}
 	_ = f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, "--remove-service=dhcp")
 	_ = f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, "--remove-service=dns")
-	_ = f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, "--remove-port=80/tcp")
+	_ = f.runner.Run(ctx, "firewall-cmd", "--zone="+apZone, "--remove-port="+captivePortRule)
 	// Reload clears forward-port rules (easier than specifying the full rule)
 	_ = f.runner.Run(ctx, "firewall-cmd", "--reload")
 }
