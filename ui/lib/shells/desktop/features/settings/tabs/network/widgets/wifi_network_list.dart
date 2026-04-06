@@ -3,12 +3,7 @@ import 'package:piccolo_os/core/models/wifi_models.dart';
 
 class WifiNetworkList extends StatefulWidget {
   const WifiNetworkList({
-    super.key,
-    required this.networks,
-    required this.isScanning,
-    required this.isConnecting,
-    required this.onConnect,
-    required this.onRescan,
+    required this.networks, required this.isScanning, required this.isConnecting, required this.onConnect, required this.onRescan, super.key,
   });
 
   final List<WifiNetwork> networks;

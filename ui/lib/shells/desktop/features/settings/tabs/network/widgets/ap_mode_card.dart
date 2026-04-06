@@ -3,9 +3,7 @@ import 'package:piccolo_os/core/models/wifi_models.dart';
 
 class APModeCard extends StatelessWidget {
   const APModeCard({
-    super.key,
-    required this.apStatus,
-    required this.onToggleSuppression,
+    required this.apStatus, required this.onToggleSuppression, super.key,
   });
 
   final WifiAPStatus apStatus;

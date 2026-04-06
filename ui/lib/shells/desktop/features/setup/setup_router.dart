@@ -511,7 +511,7 @@ class _SetupRouterState extends State<SetupRouter> {
         Widget content;
         String title;
         Widget? stepper;
-        bool showOtherDevices = false;
+        var showOtherDevices = false;
 
         if (_loading) {
           content = const Padding(
@@ -704,7 +704,7 @@ class _SetupRouterState extends State<SetupRouter> {
     final step = ctrl.step;
     Widget widget;
     String title;
-    bool showOtherDevices = false;
+    var showOtherDevices = false;
 
     switch (step) {
       case AuthStep.main:

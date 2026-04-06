@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/services/event_stream_client.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/settings_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/network_tab.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/profile_tab.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/remote/remote_tab.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/security/security_tab.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/system_tab.dart';
-import 'package:piccolo_os/shells/desktop/features/settings/tabs/network/network_tab.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/tabs/users/users_tab.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';

@@ -3,10 +3,7 @@ import 'package:piccolo_os/core/models/wifi_models.dart';
 
 class WifiStatusCard extends StatelessWidget {
   const WifiStatusCard({
-    super.key,
-    required this.status,
-    required this.onForgetNetwork,
-    required this.onScanNetworks,
+    required this.status, required this.onForgetNetwork, required this.onScanNetworks, super.key,
   });
 
   final WifiStatus status;
