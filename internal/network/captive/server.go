@@ -244,6 +244,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"missing_fields"}`, http.StatusBadRequest)
 		return
 	}
+	if len(req.SSID) > 32 {
+		http.Error(w, `{"error":"ssid_too_long"}`, http.StatusBadRequest)
+		return
+	}
 
 	// Decrypt passphrase
 	passphrase, err := decryptConnectRequest(s.keypair, req.ClientPublicKey, req.Nonce, req.EncryptedPassphrase)
