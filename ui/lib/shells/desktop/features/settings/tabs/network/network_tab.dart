@@ -52,7 +52,7 @@ class _NetworkTabState extends State<NetworkTab> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(PiccoloIcons.lock, size: 48, color: PiccoloTheme.inkMuted),
+                    const Icon(PiccoloIcons.lock, size: 48, color: PiccoloTheme.inkMuted),
                     const SizedBox(height: Spacing.base),
                     Text('Local Access Required',
                         style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),

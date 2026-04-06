@@ -20,8 +20,8 @@ h1{font-size:20px;font-weight:600;margin-bottom:4px}
 .signal{font-size:18px;margin-left:8px}
 .form-group{margin-bottom:16px}
 label{display:block;font-size:13px;font-weight:500;color:#555;margin-bottom:4px}
-#passphrase{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;outline:none;transition:border .15s}
-#passphrase:focus{border-color:#3b82f6}
+#passphrase,#manual-ssid,#manual-pass{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:15px;outline:none;transition:border .15s}
+#passphrase:focus,#manual-ssid:focus,#manual-pass:focus{border-color:#3b82f6}
 button{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;transition:background .15s}
 .btn-primary{background:#3b82f6;color:#fff}
 .btn-primary:hover{background:#2563eb}
@@ -32,6 +32,9 @@ button{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;font
 .spinner{display:inline-block;width:24px;height:24px;border:3px solid #e5e7eb;border-top-color:#3b82f6;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:12px}
 @keyframes spin{to{transform:rotate(360deg)}}
 .empty{text-align:center;padding:24px 0;color:#666;font-size:14px}
+.manual-link{text-align:center;margin-top:4px;margin-bottom:8px}
+.manual-link a{color:#3b82f6;font-size:14px;text-decoration:none}
+.manual-link a:hover{text-decoration:underline}
 </style>
 </head>
 <body>
@@ -47,17 +50,32 @@ button{width:100%;padding:12px;border:none;border-radius:8px;font-size:15px;font
     <div id="loading" class="status"><div class="spinner"></div><p>Scanning for networks…</p></div>
     <ul id="networks" class="network-list" style="display:none"></ul>
     <div id="empty" class="empty" style="display:none">
-      <p>No networks found.</p>
-      <p style="margin-top:8px">Make sure your router is powered on and in range.</p>
+      <p>No WiFi networks detected.</p>
     </div>
-    <button id="retry-btn" class="btn-secondary" style="display:none" onclick="doScan()">Retry Scan</button>
+    <div id="manual-link" class="manual-link" style="display:none">
+      <a href="#" onclick="showManualEntry();return false">Or enter network name manually</a>
+    </div>
+    <div id="manual-entry" style="display:none">
+      <p style="font-size:14px;color:#555;margin-bottom:12px">Enter your WiFi network details:</p>
+      <div class="form-group">
+        <label for="manual-ssid">Network Name</label>
+        <input type="text" id="manual-ssid" placeholder="Exact name, including capitalization" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="32">
+      </div>
+      <div class="form-group">
+        <label for="manual-pass">Password</label>
+        <input type="password" id="manual-pass" placeholder="Enter WiFi password" autocomplete="off" onkeydown="if(event.key==='Enter')doManualConnect()">
+      </div>
+      <button id="manual-connect-btn" class="btn-primary" onclick="doManualConnect()">Connect</button>
+      <button class="btn-secondary" id="manual-back-btn" onclick="hideManualEntry()">Back</button>
+      <p id="ethernet-hint" style="margin-top:16px;font-size:13px;color:#999;text-align:center">Having trouble? You can also set up with an Ethernet cable.</p>
+    </div>
   </div>
 
   <div id="connect-form" style="display:none">
     <p style="font-size:14px;color:#555;margin-bottom:12px">Network: <strong id="selected-ssid"></strong></p>
     <div class="form-group">
       <label for="passphrase">Password</label>
-      <input type="text" id="passphrase" placeholder="Enter WiFi password" autocomplete="off" onkeydown="if(event.key==='Enter')doConnect()">
+      <input type="password" id="passphrase" placeholder="Enter WiFi password" autocomplete="off" onkeydown="if(event.key==='Enter')doConnect()">
     </div>
     <button id="connect-btn" class="btn-primary" onclick="doConnect()">Connect</button>
     <button class="btn-secondary" onclick="showScanView()">Back</button>
@@ -85,7 +103,8 @@ async function doScan() {
   document.getElementById("loading").style.display = "";
   document.getElementById("networks").style.display = "none";
   document.getElementById("empty").style.display = "none";
-  document.getElementById("retry-btn").style.display = "none";
+  document.getElementById("manual-link").style.display = "none";
+  document.getElementById("manual-entry").style.display = "none";
 
   try {
     const resp = await fetch("/api/scan", {method: "POST"});
@@ -96,7 +115,9 @@ async function doScan() {
 
     if (networks.length === 0) {
       document.getElementById("empty").style.display = "";
-      document.getElementById("retry-btn").style.display = "";
+      document.getElementById("manual-entry").style.display = "";
+      document.getElementById("manual-back-btn").style.display = "none";
+      document.getElementById("ethernet-hint").style.display = "";
       return;
     }
 
@@ -118,11 +139,13 @@ async function doScan() {
     });
 
     list.style.display = "";
-    document.getElementById("retry-btn").style.display = "";
+    document.getElementById("manual-link").style.display = "";
   } catch (e) {
     document.getElementById("loading").style.display = "none";
     document.getElementById("empty").style.display = "";
-    document.getElementById("retry-btn").style.display = "";
+    document.getElementById("manual-entry").style.display = "";
+    document.getElementById("manual-back-btn").style.display = "none";
+    document.getElementById("ethernet-hint").style.display = "";
   }
 }
 
@@ -137,16 +160,64 @@ function selectNetwork(ssid) {
 
 function showScanView() {
   document.getElementById("connect-form").style.display = "none";
+  document.getElementById("manual-entry").style.display = "none";
   document.getElementById("scan-view").style.display = "";
+}
+
+function showManualEntry() {
+  document.getElementById("networks").style.display = "none";
+  document.getElementById("manual-link").style.display = "none";
+  document.getElementById("empty").style.display = "none";
+  document.getElementById("manual-entry").style.display = "";
+  document.getElementById("manual-back-btn").style.display = "";
+  document.getElementById("ethernet-hint").style.display = "none";
+  document.getElementById("manual-ssid").value = "";
+  document.getElementById("manual-pass").value = "";
+  document.getElementById("manual-ssid").focus();
+}
+
+function hideManualEntry() {
+  document.getElementById("manual-entry").style.display = "none";
+  document.getElementById("networks").style.display = "";
+  document.getElementById("manual-link").style.display = "";
+}
+
+async function doManualConnect() {
+  clearError("manual-error");
+
+  const ssid = document.getElementById("manual-ssid").value.trim();
+  const passphrase = document.getElementById("manual-pass").value;
+
+  if (!ssid) {
+    showErrorIn("manual-entry", "manual-error", "Please enter a network name.");
+    return;
+  }
+  if (passphrase.length < 8) {
+    showErrorIn("manual-entry", "manual-error", "WiFi passwords are at least 8 characters.");
+    return;
+  }
+
+  await submitConnect(ssid, passphrase, "manual-connect-btn", "scan-view",
+    function(msg) { showErrorIn("manual-entry", "manual-error", msg); });
 }
 
 async function doConnect() {
   const passphrase = document.getElementById("passphrase").value;
   if (!passphrase) return;
+  if (passphrase.length < 8) {
+    showErrorIn("connect-form", "portal-error", "WiFi passwords are at least 8 characters.");
+    return;
+  }
 
-  const btn = document.getElementById("connect-btn");
+  await submitConnect(selectedSSID, passphrase, "connect-btn", "connect-form",
+    function(msg) { showErrorIn("connect-form", "portal-error", msg); });
+}
+
+// Shared encryption + connect submission used by both list-select and manual entry.
+async function submitConnect(ssid, passphrase, btnId, hideViewId, onError) {
+  const btn = document.getElementById(btnId);
   btn.disabled = true;
-  btn.textContent = "Connecting…";
+  btn.textContent = "Connecting\u2026";
 
   try {
     const serverPubKey = nacl.util.decodeBase64(SERVER_PUB_KEY);
@@ -156,7 +227,7 @@ async function doConnect() {
     const encrypted = nacl.box(message, nonce, serverPubKey, ephemeral.secretKey);
 
     const body = JSON.stringify({
-      ssid: selectedSSID,
+      ssid: ssid,
       client_public_key: nacl.util.encodeBase64(ephemeral.publicKey),
       nonce: nacl.util.encodeBase64(nonce),
       encrypted_passphrase: nacl.util.encodeBase64(encrypted)
@@ -170,40 +241,41 @@ async function doConnect() {
 
     const data = await resp.json();
 
-    // Check for error responses (rate limit, bad request, etc.)
     if (!resp.ok) {
       btn.disabled = false;
       btn.textContent = "Connect";
-      showError(data.message || data.error || "Connection failed. Please try again.");
+      onError(data.message || data.error || "Connection failed. Please try again.");
       return;
     }
 
-    // Show connecting view. On phones, the captive portal mini-browser
-    // auto-closes when the AP tears down, so this is the last thing the
-    // user sees. The message must be self-contained.
-    document.getElementById("connect-form").style.display = "none";
+    document.getElementById(hideViewId).style.display = "none";
     document.getElementById("connecting-view").style.display = "";
     document.getElementById("connecting-msg").textContent =
-      "Connecting to " + selectedSSID + "…";
+      "Connecting to " + ssid + "\u2026";
 
   } catch (e) {
     btn.disabled = false;
     btn.textContent = "Connect";
-    showError("Connection failed: " + e.message);
+    onError("Connection failed: " + e.message);
   }
 }
 
-function showError(msg) {
-  var errDiv = document.getElementById("portal-error");
+function showErrorIn(containerId, errorId, msg) {
+  var errDiv = document.getElementById(errorId);
   if (!errDiv) {
     errDiv = document.createElement("div");
-    errDiv.id = "portal-error";
+    errDiv.id = errorId;
     errDiv.className = "error";
-    var form = document.getElementById("connect-form");
-    form.insertBefore(errDiv, form.firstChild);
+    var container = document.getElementById(containerId);
+    container.insertBefore(errDiv, container.firstChild);
   }
   errDiv.textContent = msg;
   errDiv.style.display = "";
+}
+
+function clearError(errorId) {
+  var el = document.getElementById(errorId);
+  if (el) el.style.display = "none";
 }
 
 function escapeHtml(s) {

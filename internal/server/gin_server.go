@@ -29,14 +29,14 @@ import (
 	"piccolod/internal/events"
 	"piccolod/internal/firewall"
 	"piccolod/internal/health"
+	hostnamepkg "piccolod/internal/hostname"
 	"piccolod/internal/identity"
+	"piccolod/internal/mdns"
 	"piccolod/internal/network"
 	"piccolod/internal/network/nmclient"
 	stunpkg "piccolod/internal/network/stun"
-	"piccolod/internal/onboarding"
-	hostnamepkg "piccolod/internal/hostname"
-	"piccolod/internal/mdns"
 	"piccolod/internal/oidc"
+	"piccolod/internal/onboarding"
 	"piccolod/internal/pcv"
 	"piccolod/internal/persistence"
 	"piccolod/internal/remote"
@@ -46,13 +46,13 @@ import (
 	"piccolod/internal/runtime/commands"
 	"piccolod/internal/runtime/supervisor"
 	"piccolod/internal/services"
-	"piccolod/internal/terminal"
-	"piccolod/internal/tpm"
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage"
 	"piccolod/internal/storage/diskprep"
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/nbd"
+	"piccolod/internal/terminal"
+	"piccolod/internal/tpm"
 	"piccolod/internal/update"
 
 	"github.com/coreos/go-systemd/v22/daemon"
@@ -150,7 +150,7 @@ type GinServer struct {
 	// Internal CA for OIDC Back-Channel
 	internalCA   *pki.InternalCA
 	internalCAMu sync.Mutex
-	internalSrv *http.Server
+	internalSrv  *http.Server
 
 	// Cached TLS certificate for GetCertificate callback (avoids disk I/O per handshake)
 	cachedCert   *tls.Certificate
@@ -187,9 +187,9 @@ type GinServer struct {
 	namekStopped       atomic.Bool
 	namekMu            sync.RWMutex // protects namek adapter fields + namek domain state
 	namekACME          *identity.NamekACMEClient
-	namekDomainClient  *identity.NamekDomainClient           // domain management client
-	namekDomains       map[string]*namekDomainState           // alias hostname → namek state
-	namekReconcileStop context.CancelFunc                     // cancels in-flight reconciliation
+	namekDomainClient  *identity.NamekDomainClient  // domain management client
+	namekDomains       map[string]*namekDomainState // alias hostname → namek state
+	namekReconcileStop context.CancelFunc           // cancels in-flight reconciliation
 
 	// Event bus subscription cleanup (SubscribeWithCancel cancels)
 	busUnsubs []func()
@@ -702,18 +702,18 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Initialize persistence module (skeleton; concrete components wired later)
 	persist, err := persistence.NewService(persistence.Options{
-		Events:     eventsBus,
-		Leadership: leadershipReg,
-		Consensus:  consensusMgr,
-		Dispatcher: dispatch,
-		Crypto:     cmgr,
-		StateDir:   stateDir,
-		DataDir:    paths.CoreRoot(),
-		Runner:     execRunner,
-		LVMgr:      storageMgr.LVMVolumes(),
-		PoolMgr:    storageMgr.LVMPool(),
-		NBDSrv:     nbdSrv,
-		DRBDMgr:    drbdMgr,
+		Events:      eventsBus,
+		Leadership:  leadershipReg,
+		Consensus:   consensusMgr,
+		Dispatcher:  dispatch,
+		Crypto:      cmgr,
+		StateDir:    stateDir,
+		DataDir:     paths.CoreRoot(),
+		Runner:      execRunner,
+		LVMgr:       storageMgr.LVMVolumes(),
+		PoolMgr:     storageMgr.LVMPool(),
+		NBDSrv:      nbdSrv,
+		DRBDMgr:     drbdMgr,
 		FlattenFn:   appMgr.MakeFlattenFn(),
 		ImageSizeFn: appMgr.MakeImageSizeFn(),
 	})
@@ -940,8 +940,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			return "piccolo.local"
 		})
 		svcMgr.ProxyManager().SetProxyOIDCConfig(services.ProxyOIDCConfig{
-			SessionStore: s.sessions,
-			UserManager:  s.userManager,
+			SessionStore:    s.sessions,
+			UserManager:     s.userManager,
 			GetPortalOrigin: s.portalOriginForRequest,
 			GetLocalHostname: func() string {
 				if s.mdnsManager != nil {

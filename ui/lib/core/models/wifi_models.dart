@@ -1,17 +1,7 @@
 /// Models for the WiFi management API (/api/v1/wifi/*).
+library;
 
 class WifiStatus {
-  final bool available;
-  final String state;
-  final String activeUplink;
-  final String? ssid;
-  final int? signalDbm;
-  final String? signalTier;
-  final int? frequencyMhz;
-  final String? band;
-  final String? ipAddress;
-  final bool hasSavedNetwork;
-  final String? savedSsid;
 
   WifiStatus({
     required this.available,
@@ -42,6 +32,17 @@ class WifiStatus {
       savedSsid: json['saved_ssid'] as String?,
     );
   }
+  final bool available;
+  final String state;
+  final String activeUplink;
+  final String? ssid;
+  final int? signalDbm;
+  final String? signalTier;
+  final int? frequencyMhz;
+  final String? band;
+  final String? ipAddress;
+  final bool hasSavedNetwork;
+  final String? savedSsid;
 
   bool get isWifiConnected => state == 'wifi_connected';
   bool get isEthernet => state == 'ethernet';
@@ -51,12 +52,6 @@ class WifiStatus {
 }
 
 class WifiNetwork {
-  final String ssid;
-  final String security;
-  final int signalDbm;
-  final String signalTier;
-  final int frequencyMhz;
-  final String band;
 
   WifiNetwork({
     required this.ssid,
@@ -77,12 +72,15 @@ class WifiNetwork {
       band: json['band'] as String? ?? '',
     );
   }
+  final String ssid;
+  final String security;
+  final int signalDbm;
+  final String signalTier;
+  final int frequencyMhz;
+  final String band;
 }
 
 class WifiConnectResult {
-  final bool success;
-  final String? error;
-  final String state;
 
   WifiConnectResult({
     required this.success,
@@ -97,13 +95,12 @@ class WifiConnectResult {
       state: json['state'] as String? ?? 'disconnected',
     );
   }
+  final bool success;
+  final String? error;
+  final String state;
 }
 
 class WifiAPStatus {
-  final bool active;
-  final String? ssid;
-  final bool suppressed;
-  final int clients;
 
   WifiAPStatus({
     required this.active,
@@ -120,4 +117,8 @@ class WifiAPStatus {
       clients: json['clients'] as int? ?? 0,
     );
   }
+  final bool active;
+  final String? ssid;
+  final bool suppressed;
+  final int clients;
 }

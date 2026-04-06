@@ -230,6 +230,14 @@ func (m *Manager) ScanNetworks(forceRefresh bool) ([]ScanResult, error) {
 	m.scanMu.Lock()
 	defer m.scanMu.Unlock()
 
+	// During AP mode, the WiFi adapter cannot scan — serve cached results.
+	// The pre-scan in handleAPTransition populated scanCache before AP started.
+	// May be empty if pre-scan found nothing; the portal handles that with
+	// manual SSID entry.
+	if m.apMgr.Active() {
+		return m.scanCache, nil
+	}
+
 	if !forceRefresh && time.Since(m.scanCacheTime) < 15*time.Second && len(m.scanCache) > 0 {
 		return m.scanCache, nil
 	}
@@ -474,6 +482,18 @@ func (m *Manager) handleAPTransition(newState ConnState) {
 		go func() {
 			defer m.apRetryActive.Store(false)
 			defer m.apRetryCount.Store(0) // reset for next AP cycle on any exit
+
+			// Pre-scan while adapter is still in STA mode. Once AP starts,
+			// NM cannot scan — ScanNetworks serves these cached results.
+			// Clear stale cache first so a failed pre-scan shows manual
+			// entry instead of networks from a previous environment.
+			m.scanMu.Lock()
+			m.scanCache = nil
+			m.scanMu.Unlock()
+			if _, err := m.ScanNetworks(true); err != nil {
+				log.Printf("WARN: network: pre-AP scan failed: %v", err)
+			}
+
 			const maxAPRetries = 3
 			for {
 				attempt := int(m.apRetryCount.Load())
@@ -589,6 +609,9 @@ func (m *Manager) connectFromCaptivePortal(ssid, passphrase string) {
 
 	if alreadyAP {
 		go func() {
+			// Pre-scan while adapter is in STA mode (AP was torn down for
+			// connect attempt). Refreshes the portal's network list.
+			m.ScanNetworks(true)
 			if startErr := m.apMgr.Start(m.ctx, dev.Path, dev.HWAddress); startErr != nil {
 				log.Printf("ERROR: network: AP reactivation failed: %v", startErr)
 			}
