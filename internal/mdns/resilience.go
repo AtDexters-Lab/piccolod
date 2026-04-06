@@ -256,8 +256,11 @@ func (m *Manager) exitRecoveryMode() {
 	overallHealth := m.healthMonitor.OverallHealth
 	m.healthMonitor.mutex.Unlock()
 
-	log.Printf("RESILIENCE: EXITING RECOVERY MODE - System health restored (%.2f)",
-		overallHealth)
+	sysErrs := atomic.SwapUint64(&m.healthMonitor.SystemErrors, 0)
+	recovAttempts := atomic.SwapUint64(&m.healthMonitor.RecoveryAttempts, 0)
+
+	log.Printf("RESILIENCE: EXITING RECOVERY MODE - System health restored (%.2f), resolved after %d errors, %d recovery attempts",
+		overallHealth, sysErrs, recovAttempts)
 }
 
 // healthMonitorLoop runs periodic health checks and recovery operations

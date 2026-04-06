@@ -99,10 +99,16 @@ func (p *PoolManager) CreatePool(ctx context.Context, device string) error {
 }
 
 // ActivatePool activates the VG and thin pool.
-// Uses --partial to allow degraded activation if a USB PV is missing.
+// Attempts clean activation first; falls back to --partial (degraded mode)
+// if clean activation fails, to allow boot on partially-corrupted PVs.
 func (p *PoolManager) ActivatePool(ctx context.Context) error {
-	if err := p.run.Run(ctx, "vgchange", "-ay", "--partial", p.cfg.VGName); err != nil {
-		return fmt.Errorf("vgchange -ay %s: %w", p.cfg.VGName, err)
+	if err := p.run.Run(ctx, "vgchange", "-ay", p.cfg.VGName); err != nil {
+		log.Printf("WARN: clean VG activation failed, trying degraded mode: %v", err)
+		if err2 := p.run.Run(ctx, "vgchange", "-ay", "--partial", p.cfg.VGName); err2 != nil {
+			return fmt.Errorf("vgchange -ay %s (degraded): %w", p.cfg.VGName, err2)
+		}
+		log.Printf("WARN: VG %s activated in DEGRADED mode — investigate PV health", p.cfg.VGName)
+		return nil
 	}
 	log.Printf("LVM VG activated: %s", p.cfg.VGName)
 	return nil

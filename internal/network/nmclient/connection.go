@@ -43,8 +43,9 @@ func (c *DBusClient) Connect(device dbus.ObjectPath, ssid, passphrase string) er
 			"autoconnect": dbus.MakeVariant(true),
 		},
 		"802-11-wireless": {
-			"ssid": dbus.MakeVariant([]byte(ssid)),
-			"mode": dbus.MakeVariant("infrastructure"),
+			"ssid":   dbus.MakeVariant([]byte(ssid)),
+			"mode":   dbus.MakeVariant("infrastructure"),
+			"hidden": dbus.MakeVariant(false),
 		},
 		"802-11-wireless-security": {
 			"key-mgmt": dbus.MakeVariant("wpa-psk"),
@@ -186,8 +187,9 @@ func (c *DBusClient) RestoreConnection(snapshot *ConnectionSnapshot) error {
 			"autoconnect": dbus.MakeVariant(true),
 		},
 		"802-11-wireless": {
-			"ssid": dbus.MakeVariant([]byte(ssid)),
-			"mode": dbus.MakeVariant("infrastructure"),
+			"ssid":   dbus.MakeVariant([]byte(ssid)),
+			"mode":   dbus.MakeVariant("infrastructure"),
+			"hidden": dbus.MakeVariant(false),
 		},
 		"ipv4": {
 			"method": dbus.MakeVariant("auto"),

@@ -207,15 +207,60 @@ func TestPoolManager_CreatePool_WipefsError(t *testing.T) {
 }
 
 func TestPoolManager_ActivatePool(t *testing.T) {
-	run := &fakeRunner{}
-	mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
-	if err := mgr.ActivatePool(context.Background()); err != nil {
-		t.Fatalf("ActivatePool: %v", err)
-	}
-	calls := run.GetCalls()
-	if len(calls) != 1 || !strings.Contains(calls[0], "vgchange -ay") {
-		t.Errorf("expected vgchange -ay call, got: %v", calls)
-	}
+	t.Run("clean_activation", func(t *testing.T) {
+		run := &fakeRunner{}
+		mgr := NewPoolManager(run, nil, DefaultThinPoolConfig())
+		if err := mgr.ActivatePool(context.Background()); err != nil {
+			t.Fatalf("ActivatePool: %v", err)
+		}
+		calls := run.GetCalls()
+		if len(calls) != 1 || !strings.Contains(calls[0], "vgchange -ay") {
+			t.Errorf("expected single vgchange -ay call, got: %v", calls)
+		}
+		if strings.Contains(calls[0], "--partial") {
+			t.Errorf("clean activation should not use --partial, got: %v", calls[0])
+		}
+	})
+
+	t.Run("degraded_fallback", func(t *testing.T) {
+		cfg := DefaultThinPoolConfig()
+		cleanKey := buildKey("vgchange", []string{"-ay", cfg.VGName})
+		run := &fakeRunner{
+			Errs: map[string]error{
+				cleanKey: fmt.Errorf("VG not found"),
+			},
+		}
+		mgr := NewPoolManager(run, nil, cfg)
+		if err := mgr.ActivatePool(context.Background()); err != nil {
+			t.Fatalf("ActivatePool should succeed via fallback: %v", err)
+		}
+		calls := run.GetCalls()
+		if len(calls) != 2 {
+			t.Fatalf("expected 2 calls (clean + fallback), got %d: %v", len(calls), calls)
+		}
+		if strings.Contains(calls[0], "--partial") {
+			t.Errorf("first call should not use --partial, got: %v", calls[0])
+		}
+		if !strings.Contains(calls[1], "--partial") {
+			t.Errorf("second call should use --partial, got: %v", calls[1])
+		}
+	})
+
+	t.Run("both_fail", func(t *testing.T) {
+		cfg := DefaultThinPoolConfig()
+		cleanKey := buildKey("vgchange", []string{"-ay", cfg.VGName})
+		partialKey := buildKey("vgchange", []string{"-ay", "--partial", cfg.VGName})
+		run := &fakeRunner{
+			Errs: map[string]error{
+				cleanKey:   fmt.Errorf("VG not found"),
+				partialKey: fmt.Errorf("PV missing"),
+			},
+		}
+		mgr := NewPoolManager(run, nil, cfg)
+		if err := mgr.ActivatePool(context.Background()); err == nil {
+			t.Fatal("ActivatePool should fail when both attempts fail")
+		}
+	})
 }
 
 func TestPoolManager_DeactivatePool(t *testing.T) {

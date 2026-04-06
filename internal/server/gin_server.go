@@ -1972,6 +1972,10 @@ func (s *GinServer) setupGinRoutes() {
 	r.NoRoute(func(c *gin.Context) {
 		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
 			requestedPath := c.Request.URL.Path
+			if isSuspiciousPath(requestedPath) {
+				c.Status(http.StatusNotFound)
+				return
+			}
 			if strings.HasPrefix(requestedPath, "/api/") || strings.HasPrefix(requestedPath, "/oauth/") {
 				c.Status(http.StatusNotFound)
 				return
@@ -1995,6 +1999,37 @@ func (s *GinServer) setupGinRoutes() {
 	})
 
 	s.router = r
+}
+
+// suspiciousPathPrefixes are path prefixes commonly probed by automated scanners.
+// Matching requests are rejected with 404 before the SPA catch-all can serve them
+// as 200 (which signals the scanner that the resource exists).
+// NOTE: /.well-known paths are registered as explicit Gin routes and never reach NoRoute.
+var suspiciousPathPrefixes = []string{
+	"/.env", "/.git", "/.svn", "/.htaccess", "/.htpasswd", "/.ds_store",
+	"/.aws", "/.docker", "/.ssh", "/.npmrc",
+	"/wp-admin", "/wp-content", "/wp-includes", "/wp-login",
+	"/server-status", "/server-info", "/phpinfo", "/actuator",
+}
+
+// suspiciousPathSubstrings are substrings that indicate scanner probes regardless of position.
+var suspiciousPathSubstrings = []string{
+	"wp-config",
+}
+
+func isSuspiciousPath(path string) bool {
+	lp := strings.ToLower(path)
+	for _, prefix := range suspiciousPathPrefixes {
+		if strings.HasPrefix(lp, prefix) {
+			return true
+		}
+	}
+	for _, sub := range suspiciousPathSubstrings {
+		if strings.Contains(lp, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleGinServicesAll returns all service endpoints across apps
@@ -2284,6 +2319,11 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 			log.Printf("WARN: unlock reload failed: %v", err)
 		}
 	}
+
+	// Retry OIDC app restart — earlier attempts may have been skipped while
+	// persistence was locked. This is stateless: restartOIDCApps computes
+	// from current runtime state (app list, OIDC flags, running status).
+	s.scheduleOIDCAppsRestart()
 }
 
 // subscribeCertRefresh watches for hostname/leadership changes to regenerate cert SANs.

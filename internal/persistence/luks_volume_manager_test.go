@@ -360,7 +360,7 @@ func TestProvisionKeyslotOnAllVolumes_RejectsInvalidSlot(t *testing.T) {
 	}
 }
 
-func TestProvisionKeyslotOnAllVolumes_FailsWithNilCrypto(t *testing.T) {
+func TestProvisionKeyslotOnAllVolumes_NoVolumes_ReturnsNil(t *testing.T) {
 	paths.SetRootsForTest(t)
 
 	run := &fakeRunner{}
@@ -370,9 +370,10 @@ func TestProvisionKeyslotOnAllVolumes_FailsWithNilCrypto(t *testing.T) {
 		stacks:   make(map[string]*blockdev.DeviceStack),
 	}
 
+	// With no volumes, provisioning is a no-op regardless of crypto state.
 	err := mgr.provisionKeyslotOnAllVolumes(context.Background(), 1, []byte("pass"))
-	if err == nil {
-		t.Fatal("expected error (no crypto manager)")
+	if err != nil {
+		t.Fatalf("expected nil error with no volumes, got: %v", err)
 	}
 	// No cryptsetup calls should have been made.
 	if calls := run.GetCalls(); len(calls) != 0 {

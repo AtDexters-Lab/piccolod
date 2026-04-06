@@ -995,18 +995,18 @@ func (m *luksVolumeManager) provisionKeyslotOnAllVolumes(ctx context.Context, sl
 		return fmt.Errorf("invalid keyslot %d: only slots 1 and 2 are provisionable", slot)
 	}
 
-	masterKey, err := m.crypto.UnwrapLUKSMasterKey()
-	if err != nil {
-		return fmt.Errorf("unwrap master key: %w", err)
-	}
-	defer cryptoutil.SecureZero(masterKey)
-
+	// Collect eligible volumes first — if none exist (e.g., first boot with no
+	// apps), return early without attempting the master key unwrap.
 	volIDs, err := listVolumeIDs()
 	if err != nil {
 		return err
 	}
 
-	var errs []error
+	type candidate struct {
+		id   string
+		meta *volumeMetaV3
+	}
+	var targets []candidate
 	for _, volID := range volIDs {
 		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
 		version, _ := readVolumeMetaVersion(metaPath)
@@ -1021,10 +1021,23 @@ func (m *luksVolumeManager) provisionKeyslotOnAllVolumes(ctx context.Context, sl
 		if meta.Type == "ephemeral" {
 			continue
 		}
+		targets = append(targets, candidate{id: volID, meta: meta})
+	}
+	if len(targets) == 0 {
+		return nil
+	}
 
-		if err := m.provisionKeyslotOnVolume(ctx, volID, meta, slot, passphrase, masterKey); err != nil {
-			log.Printf("WARN: keyslot %d failed for %s: %v", slot, volID, err)
-			errs = append(errs, fmt.Errorf("%s: %w", volID, err))
+	masterKey, err := m.crypto.UnwrapLUKSMasterKey()
+	if err != nil {
+		return fmt.Errorf("unwrap master key: %w", err)
+	}
+	defer cryptoutil.SecureZero(masterKey)
+
+	var errs []error
+	for _, t := range targets {
+		if err := m.provisionKeyslotOnVolume(ctx, t.id, t.meta, slot, passphrase, masterKey); err != nil {
+			log.Printf("WARN: keyslot %d failed for %s: %v", slot, t.id, err)
+			errs = append(errs, fmt.Errorf("%s: %w", t.id, err))
 		}
 	}
 	return errors.Join(errs...)

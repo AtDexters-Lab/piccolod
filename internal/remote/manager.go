@@ -750,7 +750,9 @@ func (m *Manager) reloadFromStorage() error {
 	// (certs saved to filesystem while locked) also need repo backfill, not just
 	// certs reset by validateCertFiles.
 	// Uses local cfg (same backing data as m.cfg) to avoid reading m.cfg outside the lock.
-	_ = m.storage.SaveCerts(context.Background(), cfg.NexusConfig, cfg.CertInventory)
+	if err := m.storage.SaveCerts(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+		log.Printf("WARN: post-unlock cert repo sync failed: %v", err)
+	}
 
 	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
