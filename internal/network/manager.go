@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -230,24 +229,24 @@ func (m *Manager) ScanNetworks(forceRefresh bool) ([]ScanResult, error) {
 	m.scanMu.Lock()
 	defer m.scanMu.Unlock()
 
-	// During AP mode, the WiFi adapter cannot scan — serve cached results.
-	// The pre-scan in handleAPTransition populated scanCache before AP started.
-	// May be empty if pre-scan found nothing; the portal handles that with
-	// manual SSID entry.
-	if m.apMgr.Active() {
-		return m.scanCache, nil
-	}
-
-	if !forceRefresh && time.Since(m.scanCacheTime) < 15*time.Second && len(m.scanCache) > 0 {
-		return m.scanCache, nil
-	}
-
 	m.mu.RLock()
 	dev := m.wifiDevice
 	m.mu.RUnlock()
 
 	if dev == nil {
 		return nil, nil
+	}
+
+	// During AP mode, the WiFi adapter cannot scan — serve cached results.
+	// The pre-scan in handleAPTransition populated scanCache before AP started.
+	// Check local hint first (fast), then NM ground truth (catches orphaned
+	// hotspot where local active bool desynced from NM).
+	if m.apMgr.Active() || m.apMgr.ActiveOnNM(dev.Path) {
+		return m.scanCache, nil
+	}
+
+	if !forceRefresh && time.Since(m.scanCacheTime) < 15*time.Second && len(m.scanCache) > 0 {
+		return m.scanCache, nil
 	}
 
 	aps, err := m.nm.Scan(dev.Path)
@@ -280,6 +279,13 @@ func (m *Manager) ScanNetworks(forceRefresh bool) ([]ScanResult, error) {
 
 // Connect attempts to join a WiFi network. It uses the state machine's
 // preemptible transition mechanism so Ethernet can cancel it.
+//
+// Profile deletion is deferred until after successful connection to prevent
+// the state machine from entering AP mode during the intermediate disconnect.
+// When NM disconnects from the old network to try the new one, the old profile
+// still exists, so handleWiFiDisconnected sees hasSavedWifi=true and transitions
+// to StateReconnecting (not StateAPMode), avoiding the AP/STA race on the
+// single WiFi radio.
 func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	staCtx, ok := m.state.beginLongTransition()
 	if !ok {
@@ -294,31 +300,52 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 		return errNoWifiDevice
 	}
 
-	// Snapshot for rollback (includes device path so RestoreConnection can activate)
+	// Snapshot for rollback and collect other-SSID paths for deferred deletion.
+	//
+	// Two cases:
+	// 1. Switching SSIDs (A → B): snapshot A for rollback, defer A's deletion.
+	// 2. Same-SSID reconnect (A → A with new password): snapshot A for
+	//    rollback. nmclient.Connect deletes same-SSID profiles internally,
+	//    so the snapshot is the only way to restore on failure.
 	profiles, _ := m.nm.SavedWiFiConnections()
-	var snapshot *nmclient.ConnectionSnapshot
-	for _, p := range profiles {
-		if p.SSID == ssid || len(profiles) == 1 {
-			snapshot, _ = m.nm.SnapshotConnection(p.Path)
-			if snapshot != nil {
-				snapshot.Device = dev.Path
-			}
-			break
-		}
-	}
+	var rollbackSnapshot *nmclient.ConnectionSnapshot
+	var deferredDeletePaths []dbus.ObjectPath
 
-	// Delete other WiFi profiles (single-SSID policy)
+	// First pass: prefer snapshotting the same-SSID profile (for password
+	// change rollback — nmclient.Connect deletes same-SSID profiles internally).
 	for _, p := range profiles {
 		if p.SSID != ssid {
-			_ = m.nm.DeleteConnection(p.Path)
+			deferredDeletePaths = append(deferredDeletePaths, p.Path)
+		} else if rollbackSnapshot == nil {
+			snap, err := m.nm.SnapshotConnection(p.Path)
+			if err == nil && snap != nil {
+				snap.Device = dev.Path
+				rollbackSnapshot = snap
+			}
+		}
+	}
+	// Fallback: if no same-SSID profile exists (pure cross-SSID switch),
+	// snapshot the first other-SSID profile for rollback.
+	if rollbackSnapshot == nil && len(deferredDeletePaths) > 0 {
+		snap, err := m.nm.SnapshotConnection(deferredDeletePaths[0])
+		if err == nil && snap != nil {
+			snap.Device = dev.Path
+			rollbackSnapshot = snap
 		}
 	}
 
-	// Connect
-	if err := m.nm.Connect(dev.Path, ssid, passphrase); err != nil {
-		if snapshot != nil {
-			if err := m.nm.RestoreConnection(snapshot); err != nil {
-				log.Printf("ERROR: network: WiFi rollback failed: %v", err)
+	// Connect: nmclient.Connect deletes same-SSID profiles (D-Bus type
+	// round-trip issue) and creates a fresh one. Other-SSID profiles are
+	// kept alive so the state machine stays in StateReconnecting, not AP mode.
+	// Returns the new profile's D-Bus path for precise cleanup on failure.
+	newProfilePath, err := m.nm.Connect(dev.Path, ssid, passphrase)
+	if err != nil {
+		// nmclient.Connect may have already deleted the same-SSID profile
+		// before failing. Restore from snapshot to avoid losing the only
+		// saved WiFi configuration.
+		if rollbackSnapshot != nil {
+			if restoreErr := m.nm.RestoreConnection(rollbackSnapshot); restoreErr != nil {
+				log.Printf("ERROR: network: WiFi rollback after connect failure: %v", restoreErr)
 			}
 		}
 		return err
@@ -328,39 +355,54 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	timer := time.NewTimer(30 * time.Second)
 	defer timer.Stop()
 
+	var connectErr error
 	select {
 	case <-staCtx.Done():
-		// Preempted by Ethernet — rollback
-		if snapshot != nil {
-			if err := m.nm.RestoreConnection(snapshot); err != nil {
-				log.Printf("ERROR: network: WiFi rollback failed: %v", err)
-			}
-		}
-		return context.Canceled
+		connectErr = context.Canceled
 	case <-ctx.Done():
-		// Caller cancelled
-		if snapshot != nil {
-			if err := m.nm.RestoreConnection(snapshot); err != nil {
-				log.Printf("ERROR: network: WiFi rollback failed: %v", err)
-			}
-		}
-		return ctx.Err()
+		connectErr = ctx.Err()
 	case <-timer.C:
-		// Timeout — check if connected
-		state, err := m.nm.DeviceState(dev.Path)
-		if err != nil || !state.IsConnected() {
-			if snapshot != nil {
-				if err := m.nm.RestoreConnection(snapshot); err != nil {
-				log.Printf("ERROR: network: WiFi rollback failed: %v", err)
-			}
-			}
-			return errConnectTimeout
+		// Timeout — verify connected to the CORRECT SSID, not the old
+		// network (NM autoconnect) or an orphaned AP hotspot.
+		info, err := m.nm.ActiveConnectionInfo(dev.Path)
+		if err != nil || info == nil || info.ID != ssid {
+			connectErr = errConnectTimeout
 		}
 	}
 
-	// Update state machine
-	m.state.handleWiFiConnected()
+	if connectErr != nil {
+		// Smart rollback: NM may have auto-reconnected to the old profile
+		// (it still exists with autoconnect=true for cross-SSID case).
+		// Check before restoring to avoid creating duplicate profiles.
+		if rollbackSnapshot != nil {
+			needsRestore := true
+			info, err := m.nm.ActiveConnectionInfo(dev.Path)
+			if err == nil && info != nil && info.ID == rollbackSnapshot.SSID() {
+				needsRestore = false
+			}
+			if needsRestore {
+				if err := m.nm.RestoreConnection(rollbackSnapshot); err != nil {
+					log.Printf("ERROR: network: WiFi rollback failed: %v", err)
+				}
+			}
+		}
+		// Delete the specific failed profile by its D-Bus path — no SSID
+		// scanning needed, no risk of deleting the just-restored profile.
+		if newProfilePath != "" {
+			_ = m.nm.DeleteConnection(newProfilePath)
+		}
+		return connectErr
+	}
 
+	// Success — enforce single-SSID policy by deleting old profiles.
+	// The new connection is established, so this won't trigger AP mode.
+	for _, path := range deferredDeletePaths {
+		if err := m.nm.DeleteConnection(path); err != nil {
+			log.Printf("WARN: network: failed to delete old WiFi profile %s: %v", path, err)
+		}
+	}
+
+	m.state.handleWiFiConnected()
 	return nil
 }
 
@@ -409,12 +451,25 @@ func (m *Manager) SetAPSuppressed(suppress bool) error {
 	return m.saveAPSuppression(suppress)
 }
 
-// waitForAP polls apMgr.Active for up to 20s, respecting context cancellation.
+// waitForAP polls for AP activation for up to 20s.
+// Checks both the local fast-path (Active) and NM ground truth (ActiveOnNM)
+// to catch cases where Start()'s WaitForActivation misread a transient state.
 func (m *Manager) waitForAP() bool {
+	m.mu.RLock()
+	dev := m.wifiDevice
+	m.mu.RUnlock()
+	if dev == nil {
+		return false
+	}
+
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for i := 0; i < 40; i++ {
 		if m.apMgr.Active() {
+			return true
+		}
+		if m.apMgr.ActiveOnNM(dev.Path) {
+			log.Printf("WARN: network: AP detected on NM but local state is inactive (desync) — portal may not be running")
 			return true
 		}
 		select {
@@ -540,12 +595,15 @@ func (m *Manager) handleAPTransition(newState ConnState) {
 			log.Printf("ERROR: network: AP activation failed after %d attempts, giving up", maxAPRetries)
 			m.revertAPState()
 		}()
-	} else if m.apMgr.Active() {
-		go func() {
-			if dev != nil {
-				m.apMgr.Stop(m.ctx, dev.Path)
-			}
-		}()
+	} else {
+		// Leaving AP mode — tear down hotspot. Use ForceStop to catch
+		// orphaned hotspots where the local active bool desynced from NM
+		// (e.g., WaitForActivation misread a transient NM state).
+		if dev != nil {
+			go func() {
+				m.apMgr.ForceStop(m.ctx, dev.Path)
+			}()
+		}
 	}
 }
 
@@ -835,27 +893,53 @@ func (m *Manager) handleWifiStateChanges(ctx context.Context, ch <-chan nmclient
 			}
 			switch {
 			case evt.NewState.IsConnected():
-				// NM reports state 100 for both STA and hotspot on the
-				// same WiFi device. When our AP is active, check the
-				// connection ID to filter hotspot activation events.
-				//
-				// Active() may block if Start() is in progress — this
-				// is intentional: Start() holds apMgr.mu, so we only
-				// evaluate after AP activation succeeds or fails.
-				if m.apMgr.Active() {
-					info, err := m.nm.ActiveConnectionInfo(evt.Device)
-					if err != nil {
-						log.Printf("WARN: network: WiFi connected during AP — cannot classify, assuming hotspot: %v", err)
-						continue
-					}
-					if info == nil || strings.HasPrefix(info.ID, nmclient.HotspotIDPrefix) {
-						continue
-					}
+				// NM reports state 100 (Activated) for both STA and AP-mode
+				// connections on the same WiFi device. Always query NM to
+				// distinguish — never trust the local apMgr.active bool,
+				// which can desync when WaitForActivation misreads a
+				// transient NM state.
+				info, err := m.nm.ActiveConnectionInfo(evt.Device)
+				if err != nil {
+					log.Printf("WARN: network: WiFi state=connected but cannot classify: %v", err)
+					continue
+				}
+				if info == nil || info.IsHotspot() {
+					continue
 				}
 				m.state.handleWiFiConnected()
 			case evt.OldState.IsConnected() && !evt.NewState.IsConnected():
 				hasSaved, _ := m.savedWifiInfo()
 				m.state.handleWiFiDisconnected(hasSaved)
+			case evt.NewState == nmclient.NMDeviceStateFailed:
+				// NM failed to reconnect. Only match Failed(120), NOT
+				// Disconnected(30) — NM fires both per attempt and matching
+				// both would double-count failures.
+				//
+				// NM state sequence for auth failure:
+				//   Disconnected→Prepare→Config→NeedAuth→Failed→Disconnected
+				cur := m.state.Current()
+				if cur != StateReconnecting && cur != StateDisconnected {
+					continue
+				}
+				log.Printf("INFO: network: WiFi reconnect failed (reason=%d)", evt.Reason)
+				switch evt.Reason {
+				case nmclient.NMDeviceStateReasonNoSecrets,
+					nmclient.NMDeviceStateReasonSupplicantConfigFailed,
+					nmclient.NMDeviceStateReasonSupplicantFailed,
+					nmclient.NMDeviceStateReasonSupplicantTimeout:
+					// Deterministic: credentials are wrong, retrying is pointless.
+					// - NoSecrets(7): NM has no new secrets (headless, wrong PSK stored)
+					// - SupplicantConfigFailed(9): supplicant rejected config
+					// - SupplicantFailed(10): WPA handshake rejected
+					// - SupplicantTimeout(11): 4-way handshake timed out (wrong PSK)
+					//
+					// Note: SupplicantDisconnect(8) is deliberately NOT here — it
+					// is ambiguous (wrong-password handshake AND transient signal loss).
+					m.state.handleAuthFailure()
+				default:
+					// Transient (DHCP failure, signal loss, etc.): backoff and retry.
+					m.state.handleReconnectResult(false)
+				}
 			}
 		}
 	}

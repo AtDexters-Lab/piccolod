@@ -10,11 +10,11 @@ import (
 // activates it on the device. It creates a new profile or reuses an existing
 // one matching the SSID. Returns when the activation request is submitted (not
 // when the connection is established — callers should watch DeviceStateChange).
-func (c *DBusClient) Connect(device dbus.ObjectPath, ssid, passphrase string) error {
+func (c *DBusClient) Connect(device dbus.ObjectPath, ssid, passphrase string) (dbus.ObjectPath, error) {
 	// Check for existing profile for this SSID
 	profiles, err := c.SavedWiFiConnections()
 	if err != nil {
-		return fmt.Errorf("nmclient: list saved connections: %w", err)
+		return "", fmt.Errorf("nmclient: list saved connections: %w", err)
 	}
 
 	var existingPath dbus.ObjectPath
@@ -31,7 +31,7 @@ func (c *DBusClient) Connect(device dbus.ObjectPath, ssid, passphrase string) er
 		// round-trip through Go's dbus library (serialized as aav), causing
 		// Update to fail with type mismatches. Creating fresh avoids this.
 		if err := c.obj(existingPath).Call(nmSettingsConnIface+".Delete", 0).Err; err != nil {
-			return fmt.Errorf("nmclient: delete old profile: %w", err)
+			return "", fmt.Errorf("nmclient: delete old profile: %w", err)
 		}
 	}
 
@@ -60,8 +60,9 @@ func (c *DBusClient) Connect(device dbus.ObjectPath, ssid, passphrase string) er
 	}
 
 	var settingsPath, activePath dbus.ObjectPath
-	return c.nm().Call(nmInterface+".AddAndActivateConnection", 0,
+	err = c.nm().Call(nmInterface+".AddAndActivateConnection", 0,
 		connSettings, device, dbus.ObjectPath("/")).Store(&settingsPath, &activePath)
+	return settingsPath, err
 }
 
 // Disconnect deactivates the active connection on the device.
@@ -153,14 +154,7 @@ func (c *DBusClient) SnapshotConnection(path dbus.ObjectPath) (*ConnectionSnapsh
 // deleted the original profile (the snapshot path no longer exists).
 func (c *DBusClient) RestoreConnection(snapshot *ConnectionSnapshot) error {
 	// Extract the essential fields from the snapshot
-	ssid := ""
-	if ws, ok := snapshot.Settings["802-11-wireless"]; ok {
-		if ssidV, ok := ws["ssid"]; ok {
-			if ssidBytes, ok := ssidV.Value().([]byte); ok {
-				ssid = string(ssidBytes)
-			}
-		}
-	}
+	ssid := snapshot.SSID()
 	psk := ""
 	if sec, ok := snapshot.Settings["802-11-wireless-security"]; ok {
 		if pskV, ok := sec["psk"]; ok {

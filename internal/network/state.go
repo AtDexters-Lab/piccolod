@@ -90,6 +90,12 @@ func (sm *stateMachine) transition(newState ConnState, newUplink UplinkType) {
 	sm.current = newState
 	sm.uplink = newUplink
 
+	// Clear stale signal readings when leaving WiFi STA.
+	if old == StateWiFiSTA && newState != StateWiFiSTA {
+		sm.lastSignalDBm = 0
+		sm.lastSignalTier = ""
+	}
+
 	log.Printf("INFO: network: state %s → %s (uplink=%s)", old, newState, newUplink)
 
 	if sm.onTransition != nil {
@@ -173,6 +179,16 @@ func (sm *stateMachine) handleWiFiDisconnected(hasSavedWifi bool) {
 		return
 	}
 
+	// Guard: if a long transition (Connect or watchdog reconnection) is in
+	// progress, the disconnect is expected — NM is switching from the old
+	// network to the new one. Don't escalate to AP mode regardless of
+	// hasSavedWifi; Connect() will set the final state on success or
+	// restore the old profile on failure.
+	if sm.cancelSTA != nil {
+		sm.transition(StateReconnecting, UplinkNone)
+		return
+	}
+
 	if hasSavedWifi {
 		sm.transition(StateReconnecting, UplinkNone)
 	} else {
@@ -182,10 +198,21 @@ func (sm *stateMachine) handleWiFiDisconnected(hasSavedWifi bool) {
 	}
 }
 
-// handleReconnectResult is called after a reconnection attempt.
+// handleReconnectResult is called after a transient reconnection failure
+// (DHCP timeout, signal loss, etc.). Advances backoff and eventually
+// escalates to AP mode after repeated failures at the ceiling.
 func (sm *stateMachine) handleReconnectResult(success bool) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+
+	// Only process during active reconnection
+	if sm.current != StateReconnecting && sm.current != StateDisconnected {
+		return
+	}
+	// Skip during Connect() — it manages its own success/failure lifecycle
+	if sm.cancelSTA != nil {
+		return
+	}
 
 	if success {
 		sm.transition(StateWiFiSTA, UplinkWiFi)
@@ -208,6 +235,26 @@ func (sm *stateMachine) handleReconnectResult(success bool) {
 			sm.transition(StateAPMode, UplinkNone)
 		}
 	}
+}
+
+// handleAuthFailure is called when WiFi reconnection fails with a
+// deterministic auth error (wrong password, no secrets). Retrying with
+// the same saved credentials will always fail, so skip backoff and
+// enter AP mode immediately for user reconfiguration.
+func (sm *stateMachine) handleAuthFailure() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.current != StateReconnecting && sm.current != StateDisconnected {
+		return
+	}
+	if sm.cancelSTA != nil {
+		return
+	}
+
+	log.Printf("INFO: network: WiFi auth failure — credentials invalid, entering AP mode")
+	sm.transition(StateAPMode, UplinkNone)
+	sm.resetBackoff()
 }
 
 // nextBackoff returns the current backoff duration.

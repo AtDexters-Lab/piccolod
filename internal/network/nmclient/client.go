@@ -21,9 +21,10 @@ type Client interface {
 	Scan(device dbus.ObjectPath) ([]AccessPoint, error)
 
 	// Connect creates or updates an NM connection profile for the given SSID
-	// and activates it on the device. Returns when the connection attempt
-	// starts (not when it succeeds — watch DeviceStateChange for activation).
-	Connect(device dbus.ObjectPath, ssid, passphrase string) error
+	// and activates it on the device. Returns the D-Bus path of the new
+	// connection profile and when the connection attempt starts (not when it
+	// succeeds — watch DeviceStateChange for activation).
+	Connect(device dbus.ObjectPath, ssid, passphrase string) (dbus.ObjectPath, error)
 
 	// Disconnect deactivates the active connection on the device.
 	Disconnect(device dbus.ObjectPath) error

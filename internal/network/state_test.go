@@ -135,6 +135,53 @@ func TestStateMachine_WiFiDisconnected_IgnoredWhenNotWifi(t *testing.T) {
 	}
 }
 
+func TestStateMachine_WiFiDisconnected_DuringLongTransition(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleWiFiConnected()
+
+	// Simulate Connect() in progress (long transition active)
+	_, ok := sm.beginLongTransition()
+	if !ok {
+		t.Fatal("beginLongTransition should succeed")
+	}
+
+	// WiFi disconnect during Connect — should go to Reconnecting (not AP mode)
+	// even when hasSavedWifi=false (profile may have been deleted by NM)
+	sm.handleWiFiDisconnected(false)
+
+	if sm.Current() != StateReconnecting {
+		t.Fatalf("state = %s, want %s (during long transition, should reconnect not AP)",
+			sm.Current(), StateReconnecting)
+	}
+
+	sm.endLongTransition()
+}
+
+func TestStateMachine_SignalClearedOnLeavingWiFi(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleWiFiConnected()
+	sm.updateSignal(-55) // good
+
+	sm.mu.Lock()
+	if sm.lastSignalDBm == 0 {
+		sm.mu.Unlock()
+		t.Fatal("signal should be set while in WiFi STA")
+	}
+	sm.mu.Unlock()
+
+	// Leave WiFi → signal should be cleared
+	sm.handleWiFiDisconnected(true) // → Reconnecting
+
+	sm.mu.Lock()
+	dbm := sm.lastSignalDBm
+	tier := sm.lastSignalTier
+	sm.mu.Unlock()
+
+	if dbm != 0 || tier != "" {
+		t.Fatalf("signal not cleared on leaving WiFi STA: dbm=%d, tier=%s", dbm, tier)
+	}
+}
+
 func TestStateMachine_ReconnectSuccess(t *testing.T) {
 	sm := newTestStateMachine()
 	sm.handleWiFiConnected()
@@ -186,6 +233,86 @@ func TestStateMachine_ReconnectFailure_EscalatesToAPMode(t *testing.T) {
 
 	if sm.Current() != StateAPMode {
 		t.Fatalf("after %d ceiling failures: state = %s, want %s", ceilingFailuresForAP, sm.Current(), StateAPMode)
+	}
+}
+
+func TestStateMachine_ReconnectResult_IgnoredOutsideReconnecting(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleEthernetUp() // → StateEthernet
+
+	sm.handleReconnectResult(false)
+
+	if sm.Current() != StateEthernet {
+		t.Fatalf("state = %s, want %s (reconnect result should be ignored outside reconnecting)",
+			sm.Current(), StateEthernet)
+	}
+}
+
+func TestStateMachine_ReconnectResult_IgnoredDuringLongTransition(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleWiFiConnected()
+	sm.handleWiFiDisconnected(true) // → StateReconnecting
+
+	_, ok := sm.beginLongTransition()
+	if !ok {
+		t.Fatal("beginLongTransition should succeed")
+	}
+
+	sm.handleReconnectResult(false)
+
+	// Backoff should NOT have advanced
+	sm.mu.Lock()
+	idx := sm.backoffIdx
+	sm.mu.Unlock()
+	if idx != 0 {
+		t.Fatalf("backoffIdx = %d, want 0 (should be ignored during long transition)", idx)
+	}
+
+	sm.endLongTransition()
+}
+
+func TestStateMachine_AuthFailure_ImmediateAPMode(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleWiFiConnected()
+	sm.handleWiFiDisconnected(true) // → StateReconnecting
+
+	sm.handleAuthFailure()
+
+	if sm.Current() != StateAPMode {
+		t.Fatalf("state = %s, want %s (auth failure should skip backoff → AP mode)",
+			sm.Current(), StateAPMode)
+	}
+}
+
+func TestStateMachine_AuthFailure_IgnoredDuringLongTransition(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleWiFiConnected()
+	sm.handleWiFiDisconnected(true) // → StateReconnecting
+
+	_, ok := sm.beginLongTransition()
+	if !ok {
+		t.Fatal("beginLongTransition should succeed")
+	}
+
+	sm.handleAuthFailure()
+
+	if sm.Current() != StateReconnecting {
+		t.Fatalf("state = %s, want %s (auth failure should be ignored during long transition)",
+			sm.Current(), StateReconnecting)
+	}
+
+	sm.endLongTransition()
+}
+
+func TestStateMachine_AuthFailure_IgnoredOutsideReconnecting(t *testing.T) {
+	sm := newTestStateMachine()
+	sm.handleEthernetUp() // → StateEthernet
+
+	sm.handleAuthFailure()
+
+	if sm.Current() != StateEthernet {
+		t.Fatalf("state = %s, want %s (auth failure should be ignored outside reconnecting)",
+			sm.Current(), StateEthernet)
 	}
 }
 

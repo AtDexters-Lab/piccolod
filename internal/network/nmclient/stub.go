@@ -25,6 +25,7 @@ type StubClient struct {
 	ScanErr               error
 	ConnectErr            error
 	DisconnectErr         error
+	ConnectPath           dbus.ObjectPath
 	SavedConnections      []ConnectionProfile
 	SavedConnectionsErr   error
 	DeleteConnectionErr   error
@@ -148,9 +149,9 @@ func (s *StubClient) Scan(device dbus.ObjectPath) ([]AccessPoint, error) {
 	return s.ScanResult, s.ScanErr
 }
 
-func (s *StubClient) Connect(device dbus.ObjectPath, ssid, passphrase string) error {
+func (s *StubClient) Connect(device dbus.ObjectPath, ssid, passphrase string) (dbus.ObjectPath, error) {
 	s.record("Connect", device, ssid, passphrase)
-	return s.ConnectErr
+	return s.ConnectPath, s.ConnectErr
 }
 
 func (s *StubClient) Disconnect(device dbus.ObjectPath) error {

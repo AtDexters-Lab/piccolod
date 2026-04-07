@@ -146,7 +146,7 @@ func cleanStaleHotspot(nm nmclient.Client) {
 		if err != nil || info == nil {
 			continue
 		}
-		if strings.HasPrefix(info.ID, nmclient.HotspotIDPrefix) {
+		if info.IsHotspot() {
 			log.Printf("INFO: network: deactivating stale hotspot %q on %s", info.ID, dev.Interface)
 			_ = nm.DeactivateHotspot(dev.Path)
 		}

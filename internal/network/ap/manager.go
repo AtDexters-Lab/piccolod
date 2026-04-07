@@ -210,23 +210,63 @@ func (m *Manager) Stop(ctx context.Context, device dbus.ObjectPath) error {
 		return nil
 	}
 
-	// Run cleanup in reverse order
-	for i := len(m.cleanups) - 1; i >= 0; i-- {
-		m.cleanups[i]()
-	}
-	m.cleanups = nil
-
-	m.active = false
-	m.ssidVal.Store("")
+	m.teardown()
 	log.Printf("INFO: ap: AP mode deactivated")
 	return nil
 }
 
-// Active returns true if AP mode is currently running.
+// Active returns true if AP mode is currently running (local state).
+// This is a fast hint; for authoritative checks, use ActiveOnNM.
 func (m *Manager) Active() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.active
+}
+
+// ActiveOnNM queries NetworkManager to determine whether a piccolo hotspot
+// is currently active on the given device. This is the authoritative check
+// (~7 D-Bus round-trips). Use Active() for fast-path hints only.
+//
+// No locks acquired — nm.ActiveConnectionInfo is thread-safe. Safe to call
+// from goroutines spawned under sm.mu.
+func (m *Manager) ActiveOnNM(device dbus.ObjectPath) bool {
+	info, err := m.nm.ActiveConnectionInfo(device)
+	if err != nil || info == nil {
+		return false
+	}
+	return info.IsHotspot()
+}
+
+// ForceStop tears down AP mode using NM as the source of truth, handling
+// the case where the local active flag has desynchronized from NM.
+func (m *Manager) ForceStop(ctx context.Context, device dbus.ObjectPath) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.active {
+		m.teardown()
+		log.Printf("INFO: ap: AP mode deactivated (forced)")
+		return
+	}
+
+	// Desync path: local state says inactive but NM may have an orphaned
+	// hotspot. This happens when Start()'s WaitForActivation misread a
+	// transient NM state — Start() rolled back (running all cleanups for
+	// portal/firewall/DNS), but NM actually activated the hotspot in the
+	// background. Only the NM-level hotspot needs cleanup here; portal,
+	// firewall, and DNS were already cleaned by Start()'s rollback.
+	//
+	// Check NM first to avoid noisy ERROR logs on every normal non-AP
+	// state transition (ForceStop is called on all transitions away from
+	// AP mode, not just after actual desyncs).
+	if !m.ActiveOnNM(device) {
+		return
+	}
+	if err := m.nm.DeactivateHotspot(device); err != nil {
+		log.Printf("ERROR: ap: failed to deactivate orphaned NM hotspot: %v", err)
+	} else {
+		log.Printf("WARN: ap: deactivated orphaned NM hotspot (local state was inactive — desync)")
+	}
 }
 
 // SSID returns the current AP SSID (empty if not active).
@@ -237,6 +277,20 @@ func (m *Manager) SSID() string {
 		return v
 	}
 	return ""
+}
+
+// teardown runs cleanup, resets local state. Caller must hold mu.
+func (m *Manager) teardown() {
+	for i := len(m.cleanups) - 1; i >= 0; i-- {
+		m.cleanups[i]()
+	}
+	m.cleanups = nil
+	m.active = false
+	m.apIP = ""
+	m.ssidVal.Store("")
+	m.lastHTTPMu.Lock()
+	m.lastHTTPActivity = time.Time{}
+	m.lastHTTPMu.Unlock()
 }
 
 // APIP returns the AP interface IP (empty if not active).
@@ -264,13 +318,10 @@ func (m *Manager) RecordHTTPActivity() {
 }
 
 // rollback executes cleanup functions in reverse and returns the original error.
+// Caller must hold mu (Start() holds it).
 func (m *Manager) rollback(err error) error {
 	log.Printf("WARN: ap: rolling back AP activation: %v", err)
-	for i := len(m.cleanups) - 1; i >= 0; i-- {
-		m.cleanups[i]()
-	}
-	m.cleanups = nil
-	m.ssidVal.Store("")
+	m.teardown()
 	return err
 }
 

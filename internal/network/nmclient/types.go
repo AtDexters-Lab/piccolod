@@ -5,6 +5,7 @@ package nmclient
 
 import (
 	"net"
+	"strings"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -239,6 +240,21 @@ type ConnectionSnapshot struct {
 	Settings map[string]map[string]dbus.Variant
 }
 
+// SSID extracts the SSID from the snapshot settings.
+func (s *ConnectionSnapshot) SSID() string {
+	if s == nil {
+		return ""
+	}
+	if ws, ok := s.Settings["802-11-wireless"]; ok {
+		if ssidV, ok := ws["ssid"]; ok {
+			if ssidBytes, ok := ssidV.Value().([]byte); ok {
+				return string(ssidBytes)
+			}
+		}
+	}
+	return ""
+}
+
 // ActiveConnectionInfo holds details about a currently active connection.
 type ActiveConnectionInfo struct {
 	Path        dbus.ObjectPath
@@ -249,6 +265,11 @@ type ActiveConnectionInfo struct {
 	IP4Address  string
 	IP4Gateway  string
 	Devices     []dbus.ObjectPath
+}
+
+// IsHotspot returns true if this connection is a piccolo AP hotspot.
+func (i *ActiveConnectionInfo) IsHotspot() bool {
+	return i != nil && strings.HasPrefix(i.ID, HotspotIDPrefix)
 }
 
 // HotspotOpts configures AP mode hotspot activation.
