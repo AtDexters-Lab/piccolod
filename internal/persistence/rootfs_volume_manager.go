@@ -33,6 +33,10 @@ const (
 
 	btrfsRootfsMountOpts = "compress=zstd:1,discard=async,noatime"
 
+	// defaultWorkspaceVirtualSize is the initial virtual size for workspace
+	// snapshot LVs. Thin-provisioned — only written blocks consume physical space.
+	defaultWorkspaceVirtualSize = 50 << 30 // 50 GiB
+
 	// svcRootfsDelimiter separates instanceID from serviceName in per-service
 	// rootfs volume IDs. Service names (YAML map keys) don't contain "--".
 	svcRootfsDelimiter = "--"
@@ -372,6 +376,17 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 		return RootfsHandle{}, fmt.Errorf("set LUKS UUID: %w", err)
 	}
 
+	// Workspace snapshots get a generous virtual size — thin provisioning
+	// means only written blocks consume physical pool space.
+	sizeBytes := goldenMeta.SizeBytes
+	if volType == "workspace" && defaultWorkspaceVirtualSize > sizeBytes {
+		if err := m.lvMgr.ResizeLV(ctx, snapshotName, defaultWorkspaceVirtualSize); err != nil {
+			log.Printf("WARN: resize workspace LV %s to default: %v", snapshotName, err)
+		} else {
+			sizeBytes = defaultWorkspaceVirtualSize
+		}
+	}
+
 	// Write v3 metadata.
 	metaDir := paths.VolumeMetaDir(volumeID)
 	if err := os.MkdirAll(metaDir, 0o700); err != nil {
@@ -385,7 +400,7 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 		Type:            volType,
 		LVName:          snapshotName,
 		VGName:          lvm.DefaultVGName,
-		SizeBytes:       goldenMeta.SizeBytes,
+		SizeBytes:       sizeBytes,
 		FSType:          "btrfs",
 		ReadOnly:        readOnly,
 		BaseImageDigest: goldenMeta.BaseImageDigest,
@@ -572,6 +587,19 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		return RootfsHandle{}, fmt.Errorf("open stack: %w", err)
 	}
 
+	// Upgrade existing undersized workspace LVs to the default virtual size.
+	// This runs before LUKS open, so LUKS will see the new LV size.
+	// Only in single-node mode — with NBD/DRBD, the stack is already open at the old size.
+	if meta.Type == "workspace" && meta.SizeBytes < defaultWorkspaceVirtualSize && m.nbdSrv == nil && m.drbdMgr == nil {
+		if err := m.lvMgr.ResizeLV(ctx, lvName, defaultWorkspaceVirtualSize); err != nil {
+			log.Printf("WARN: resize existing workspace LV %s: %v", lvName, err)
+		} else {
+			meta.SizeBytes = defaultWorkspaceVirtualSize
+			metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
+			_ = writeVolumeMetaV3(metaPath, meta)
+		}
+	}
+
 	// Rollback on failure: close resources in reverse order.
 	var openedMapper string
 	var mountedDir string
@@ -626,6 +654,12 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		return RootfsHandle{}, fmt.Errorf("mount: %w", err)
 	}
 	mountedDir = mountDir
+
+	// Grow btrfs to fill the LV — handles workspaces resized beyond golden LV size.
+	// Idempotent: no-op if filesystem already at max.
+	if meta.Type == "workspace" {
+		_ = m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", mountDir)
+	}
 
 	// Idmapped mount.
 	var idmapPath string
@@ -719,6 +753,7 @@ func (m *luksVolumeManager) DetachRootfs(ctx context.Context, volumeID string) e
 	m.mu.Lock()
 	delete(m.rootfsMounts, volumeID)
 	delete(m.stacks, volumeID)
+	delete(m.wsResizeCooldown, volumeID)
 	m.mu.Unlock()
 
 	if len(errs) > 0 {
@@ -957,4 +992,57 @@ func newUUID() string {
 	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// ResizeWorkspace grows a workspace volume to the specified size.
+func (m *luksVolumeManager) ResizeWorkspace(ctx context.Context, volumeID string, newSizeBytes int64) error {
+	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
+	meta, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		return fmt.Errorf("read metadata: %w", err)
+	}
+	if meta.Type != "workspace" {
+		return fmt.Errorf("volume %s is type %s, not workspace", volumeID, meta.Type)
+	}
+	if newSizeBytes <= meta.SizeBytes {
+		return fmt.Errorf("new size %d must be larger than current %d", newSizeBytes, meta.SizeBytes)
+	}
+	if newSizeBytes > workspaceMaxVirtualSize {
+		return fmt.Errorf("new size %d exceeds max %d", newSizeBytes, workspaceMaxVirtualSize)
+	}
+
+	if err := m.checkThinPoolCapacity(ctx); err != nil {
+		return fmt.Errorf("pool capacity: %w", err)
+	}
+
+	if err := m.lvMgr.ResizeLV(ctx, meta.LVName, newSizeBytes); err != nil {
+		return fmt.Errorf("lvresize: %w", err)
+	}
+
+	// If mounted, resize LUKS and btrfs inline.
+	m.mu.Lock()
+	state := m.rootfsMounts[volumeID]
+	m.mu.Unlock()
+	if state != nil && state.rawMountPath != "" {
+		if err := m.run.Run(ctx, "cryptsetup", "resize", state.luksMapper); err != nil {
+			return fmt.Errorf("cryptsetup resize: %w", err)
+		}
+		if err := m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", state.rawMountPath); err != nil {
+			return fmt.Errorf("btrfs resize: %w", err)
+		}
+	}
+	// If not mounted, LUKS/btrfs resize will happen on next attach.
+
+	meta.SizeBytes = newSizeBytes
+	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
+		return fmt.Errorf("update metadata: %w", err)
+	}
+
+	// Record cooldown to prevent the auto-resize monitor from racing.
+	m.mu.Lock()
+	m.wsResizeCooldown[volumeID] = time.Now()
+	m.mu.Unlock()
+
+	log.Printf("INFO: workspace %s resized to %d bytes", volumeID, newSizeBytes)
+	return nil
 }

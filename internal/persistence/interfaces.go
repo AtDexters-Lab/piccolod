@@ -48,6 +48,18 @@ type VolumeManager interface {
 	RoleStream(volumeID string) (<-chan VolumeRole, error)
 }
 
+// OrphanReconciler cleans up LVs that have no corresponding metadata.
+// Used post-unlock when the LVM pool is active.
+type OrphanReconciler interface {
+	ReconcileOrphanLVs(ctx context.Context) error
+}
+
+// WorkspaceResizeMonitor manages automatic workspace volume resizing.
+type WorkspaceResizeMonitor interface {
+	StartWorkspaceResizeMonitor()
+	StopWorkspaceResizeMonitor()
+}
+
 // RootfsVolumeManager manages block-native rootfs volumes — golden LVs,
 // workspace snapshots, and service rootfs instances with idmapped mounts.
 type RootfsVolumeManager interface {
@@ -87,6 +99,9 @@ type RootfsVolumeManager interface {
 	// LV ID if found. Used to skip redundant image pulls when a golden LV already
 	// exists for the same image.
 	FindGoldenByImageRef(imageRef string) (digest string, goldenID string, found bool)
+	// ResizeWorkspace grows a workspace volume to the specified size.
+	// Handles LV resize, LUKS resize (if mounted), and btrfs filesystem resize.
+	ResizeWorkspace(ctx context.Context, volumeID string, newSizeBytes int64) error
 }
 
 // GoldenLVRequest describes the image for a golden LV.

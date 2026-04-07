@@ -358,6 +358,13 @@ func (m *Module) setLockState(ctx context.Context, locked bool) error {
 
 // Shutdown terminates sub-components that require cleanup.
 func (m *Module) Shutdown(ctx context.Context) error {
+	// Stop workspace resize monitor before detaching volumes.
+	if m.volumes != nil {
+		if wrm, ok := m.volumes.(WorkspaceResizeMonitor); ok {
+			wrm.StopWorkspaceResizeMonitor()
+		}
+	}
+
 	m.commitMu.Lock()
 	if m.pollCancel != nil {
 		m.pollCancel()

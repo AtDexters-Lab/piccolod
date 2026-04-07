@@ -9,7 +9,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"piccolod/internal/crypt"
 	"piccolod/internal/cryptoutil"
@@ -32,6 +34,7 @@ const (
 	controlPlaneSize     = 256 << 20 // 256 MiB
 
 	ephLVPrefix    = "eph-"
+	appLVPrefix    = "vol-"
 	ephDefaultSize = 50 << 30 // 50 GiB (thin-provisioned — only written blocks consume physical space)
 )
 
@@ -97,6 +100,10 @@ type luksVolumeManager struct {
 
 	// Rootfs mount tracking.
 	rootfsMounts map[string]*rootfsMountState // volumeID → mount state
+
+	// Workspace resize monitor.
+	wsResizeCancel   context.CancelFunc
+	wsResizeCooldown map[string]time.Time // volumeID → last resize time
 }
 
 // rootfsMountState tracks the full device stack for a mounted rootfs volume.
@@ -141,7 +148,8 @@ func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) *luksVolumeManager {
 		stacks:       make(map[string]*blockdev.DeviceStack),
 		goldenLVs:    make(map[string]*volumeMetaV3),
 		goldenMu:     make(map[string]*sync.Mutex),
-		rootfsMounts: make(map[string]*rootfsMountState),
+		rootfsMounts:      make(map[string]*rootfsMountState),
+		wsResizeCooldown:  make(map[string]time.Time),
 	}
 }
 
@@ -194,6 +202,103 @@ func (m *luksVolumeManager) ReconcileAllVolumeStates() error {
 		}
 	}
 	return nil
+}
+
+// ReconcileOrphanLVs scans the LVM thin pool for LVs that have no corresponding
+// metadata in /piccolo-core/volumes/. This handles stale LVs left after an OS
+// reinstall (metadata on root disk is wiped, but LVs on the data partition persist).
+// Must be called after pool activation.
+func (m *luksVolumeManager) ReconcileOrphanLVs(ctx context.Context) error {
+	if m.lvMgr == nil {
+		return nil
+	}
+
+	lvs, err := m.lvMgr.ListLVs(ctx)
+	if err != nil {
+		return fmt.Errorf("list LVs: %w", err)
+	}
+
+	volIDs, err := listVolumeIDs()
+	if err != nil {
+		return fmt.Errorf("list volume IDs: %w", err)
+	}
+
+	// Build set of known LV names from metadata. If metadata exists but
+	// can't be parsed (corruption, partial write), protect the LV by adding
+	// all plausible LV name derivations — do not treat unreadable metadata
+	// as proof that the LV is orphaned.
+	knownLVs := make(map[string]bool, len(volIDs))
+	for _, volID := range volIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
+		version, _ := readVolumeMetaVersion(metaPath)
+		parsed := false
+		switch version {
+		case metadataV2Version:
+			if meta, err := readVolumeMetaV2(metaPath); err == nil {
+				knownLVs[meta.LVName] = true
+				parsed = true
+			}
+		case metadataV3Version:
+			if meta, err := readVolumeMetaV3(metaPath); err == nil {
+				knownLVs[meta.LVName] = true
+				parsed = true
+			}
+		}
+		if !parsed {
+			// Metadata unreadable — protect all possible LV names for this volume ID.
+			knownLVs[volID] = true                   // golden-*, ws-*, svc-rootfs-*
+			knownLVs[ephLVPrefix+volID] = true        // eph-*
+			knownLVs[appLVPrefix+volID] = true        // vol-*
+		}
+	}
+
+	// Piccolo LV prefixes — any LV not matching these is not ours.
+	piccoloPrefixes := []string{
+		ephLVPrefix,
+		appLVPrefix,
+		goldenLVPrefix,
+		workspaceLVPrefix,
+		svcRootfsLVPrefix,
+	}
+
+	var errs []error
+	for _, lv := range lvs {
+		if knownLVs[lv.Name] {
+			continue
+		}
+		// Skip the thin pool LV itself.
+		if lv.Name == lvm.DefaultThinPoolName {
+			continue
+		}
+		// Skip tuple-managed LVs: data snapshots and failed rollback LVs.
+		if strings.HasPrefix(lv.Name, "snap-") {
+			continue
+		}
+		if strings.Contains(lv.Name, "--failed-gen") {
+			continue
+		}
+		// Only touch LVs with known piccolo prefixes.
+		isPiccolo := false
+		for _, prefix := range piccoloPrefixes {
+			if strings.HasPrefix(lv.Name, prefix) {
+				isPiccolo = true
+				break
+			}
+		}
+		if !isPiccolo {
+			continue
+		}
+
+		log.Printf("WARN: removing orphan LV %s (no metadata found)", lv.Name)
+		if lv.Active {
+			_ = m.lvMgr.DeactivateLV(ctx, lv.Name)
+		}
+		if err := m.lvMgr.RemoveThinLV(ctx, lv.Name); err != nil {
+			log.Printf("WARN: failed to remove orphan LV %s: %v", lv.Name, err)
+			errs = append(errs, fmt.Errorf("remove %s: %w", lv.Name, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // EnsureVolume creates a volume if it doesn't exist, or returns an existing one.
@@ -409,7 +514,7 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 func (m *luksVolumeManager) cleanupStaleAppState(ctx context.Context, id string) {
 	mountDir := paths.MountDir(id)
 	mapper := "piccolo-vol-" + id
-	lvName := "vol-" + id
+	lvName := appLVPrefix + id
 
 	// Best-effort teardown: unmount → close LUKS → deactivate LV → remove LV.
 	if m.run != nil {
@@ -496,11 +601,7 @@ func (m *luksVolumeManager) detachControlVolume(ctx context.Context, handle Volu
 
 func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeRequest) (VolumeHandle, error) {
 	metaDir := paths.VolumeMetaDir(req.ID)
-	if err := os.MkdirAll(metaDir, 0o700); err != nil {
-		return VolumeHandle{}, fmt.Errorf("create meta dir: %w", err)
-	}
-
-	lvName := "vol-" + req.ID
+	lvName := appLVPrefix + req.ID
 	sizeBytes := int64(10 << 30) // 10 GiB default
 
 	if m.lvMgr.LVExists(ctx, lvName) {
@@ -550,6 +651,9 @@ func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeReque
 		VGName:    lvm.DefaultVGName,
 		SizeBytes: sizeBytes,
 		FSType:    "ext4",
+	}
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		return VolumeHandle{}, fmt.Errorf("create meta dir: %w", err)
 	}
 	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), meta); err != nil {
 		return VolumeHandle{}, fmt.Errorf("write metadata: %w", err)
@@ -692,10 +796,6 @@ func (m *luksVolumeManager) ensureEphemeralVolume(ctx context.Context, req Volum
 	}
 
 	metaDir := paths.VolumeMetaDir(req.ID)
-	if err := os.MkdirAll(metaDir, 0o700); err != nil {
-		return VolumeHandle{}, fmt.Errorf("create meta dir: %w", err)
-	}
-
 	lvName := ephLVPrefix + req.ID
 
 	if m.lvMgr.LVExists(ctx, lvName) {
@@ -727,6 +827,9 @@ func (m *luksVolumeManager) ensureEphemeralVolume(ctx context.Context, req Volum
 		VGName:    lvm.DefaultVGName,
 		SizeBytes: ephDefaultSize,
 		FSType:    "btrfs",
+	}
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		return VolumeHandle{}, fmt.Errorf("create meta dir: %w", err)
 	}
 	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), meta); err != nil {
 		return VolumeHandle{}, fmt.Errorf("write metadata: %w", err)

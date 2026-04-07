@@ -381,6 +381,9 @@ func (s *stubRootfsManager) RootfsExists(_ string) bool { return true }
 func (s *stubRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool) {
 	return "", "", false
 }
+func (s *stubRootfsManager) ResizeWorkspace(_ context.Context, _ string, _ int64) error {
+	return nil
+}
 
 func sanitize(s string) string {
 	if len(s) > 12 {

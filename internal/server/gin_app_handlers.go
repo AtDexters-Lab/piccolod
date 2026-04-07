@@ -1364,3 +1364,50 @@ func (s *GinServer) deriveAppHealth(inst *app.AppInstance) *services.ListenerHea
 	}
 	return nil
 }
+
+// handleAppResizeStorage handles POST /api/v1/apps/:name/resize-storage
+func (s *GinServer) handleAppResizeStorage(c *gin.Context) {
+	appName := c.Param("name")
+	ctx := c.Request.Context()
+
+	var req struct {
+		SizeBytes int64 `json:"size_bytes" binding:"required,gt=0"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeGinError(c, http.StatusBadRequest, "Invalid request: "+err.Error())
+		return
+	}
+
+	inst, err := s.appManager.Get(ctx, appName)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeGinError(c, http.StatusNotFound, "App not found: "+appName)
+		} else {
+			writeGinError(c, http.StatusInternalServerError, "Failed to get app: "+err.Error())
+		}
+		return
+	}
+
+	rootfs := s.persistence.Rootfs()
+	if rootfs == nil {
+		writeGinError(c, http.StatusServiceUnavailable, "Rootfs manager not available")
+		return
+	}
+
+	volumeID := rootfs.RootfsVolumeID("workspace", inst.InstanceID)
+	if !rootfs.RootfsExists(volumeID) {
+		writeGinError(c, http.StatusBadRequest, "App '"+appName+"' does not have a workspace volume")
+		return
+	}
+	if err := rootfs.ResizeWorkspace(ctx, volumeID, req.SizeBytes); err != nil {
+		log.Printf("WARN: resize workspace %s: %v", volumeID, err)
+		writeGinError(c, http.StatusInternalServerError, "Resize failed")
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "resized",
+		"volume_id":  volumeID,
+		"size_bytes": req.SizeBytes,
+	})
+}

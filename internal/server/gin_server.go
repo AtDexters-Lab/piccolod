@@ -1837,6 +1837,7 @@ func (s *GinServer) setupGinRoutes() {
 			apps.GET("/:name/terminal/sessions", s.requireAdmin(), s.handleListWorkspaceTerminalSessions)
 			apps.DELETE("/:name/terminal/sessions/:id", s.requireAdmin(), s.handleDeleteWorkspaceTerminalSession)
 			apps.GET("/:name/terminal/sessions/:id/attach", s.requireAdmin(), s.handleAttachWorkspaceTerminalSession)
+			apps.POST("/:name/resize-storage", s.requireUnlocked(), s.requireAdmin(), s.handleAppResizeStorage)
 		}
 
 		// Image search (Admin only)
@@ -2306,6 +2307,28 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 	} else {
 		// Refresh cert SANs after unlock in case mDNS hostnames changed.
 		s.refreshServerCertSANs()
+	}
+
+	// Post-unlock reconciliation: clean up orphan LVs and golden LV GC.
+	// Must run before unlock reloaders (which start the app manager) to prevent
+	// the app manager from racing with orphan cleanup.
+	if s.persistence != nil {
+		rctx := context.Background()
+		if rootfs := s.persistence.Rootfs(); rootfs != nil {
+			if err := rootfs.ReconcileRootfsStates(rctx); err != nil {
+				log.Printf("WARN: post-unlock rootfs reconciliation: %v", err)
+			}
+		}
+		if volumes := s.persistence.Volumes(); volumes != nil {
+			if reconciler, ok := volumes.(persistence.OrphanReconciler); ok {
+				if err := reconciler.ReconcileOrphanLVs(rctx); err != nil {
+					log.Printf("WARN: post-unlock orphan LV cleanup: %v", err)
+				}
+			}
+			if wrm, ok := volumes.(persistence.WorkspaceResizeMonitor); ok {
+				wrm.StartWorkspaceResizeMonitor()
+			}
+		}
 	}
 
 	s.reloadersMu.RLock()

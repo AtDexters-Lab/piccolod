@@ -898,6 +898,9 @@ func (s *stubTestRootfsManager) RootfsExists(_ string) bool { return true }
 func (s *stubTestRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool) {
 	return "", "", false
 }
+func (s *stubTestRootfsManager) ResizeWorkspace(_ context.Context, _ string, _ int64) error {
+	return nil
+}
 
 // createGinTestServer creates a Gin test server instance with filesystem state management
 func createGinTestServer(t *testing.T, tempDir string) *GinServer {

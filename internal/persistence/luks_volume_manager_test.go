@@ -573,3 +573,124 @@ func TestProvisionKeyslotOnAllVolumes_SkipsEphemeral(t *testing.T) {
 		}
 	}
 }
+
+func TestReconcileOrphanLVs(t *testing.T) {
+	core, _ := paths.SetRootsForTest(t)
+
+	// Stub lvs output: mix of known, orphan, snapshot, and failed-rollback LVs.
+	// Format: lv_name  lv_size  lv_attr  pool_lv
+	lvsOutput := strings.Join([]string{
+		"  eph-scratch       53687091200  Vwi-a-tz--  thinpool",  // known (has metadata)
+		"  vol-app-myapp     10737418240  Vwi-a-tz--  thinpool",  // known (has metadata)
+		"  golden-abc123     3221225472   Vwi---tz--  thinpool",  // known (has metadata)
+		"  eph-orphan        53687091200  Vwi---tz--  thinpool",  // orphan — should be removed
+		"  ws-old-install    5368709120   Vwi-a-tz--  thinpool",  // orphan (active) — should be deactivated + removed
+		"  snap-app-myapp--gen1  10737418240  Vwi---tz--  thinpool", // tuple snapshot — skip
+		"  vol-app-myapp--failed-gen2  10737418240  Vwi---tz--  thinpool", // tuple failed rollback — skip
+		"  thinpool          214748364800  twi-a-t---  ",          // thin pool itself — skip
+		"  foreign-lv        1073741824   -wi-a-----  ",          // not in pool — ListLVs filters it
+	}, "\n")
+
+	lvsKey := testutil.BuildKey("lvs", []string{
+		"--noheadings", "--nosuffix", "--units", "b",
+		"-o", "lv_name,lv_size,lv_attr,pool_lv",
+		lvm.DefaultVGName,
+	})
+
+	run := &fakeRunner{
+		Outputs: map[string]string{lvsKey: lvsOutput},
+	}
+	lvMgr := lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName)
+
+	mgr := &luksVolumeManager{
+		run:          run,
+		lvMgr:        lvMgr,
+		stacks:       make(map[string]*blockdev.DeviceStack),
+		rootfsMounts: make(map[string]*rootfsMountState),
+	}
+
+	// Create metadata for the "known" LVs.
+	for _, tc := range []struct {
+		volID  string
+		lvName string
+		typ    string
+	}{
+		{"scratch", "eph-scratch", "ephemeral"},
+		{"app-myapp", "vol-app-myapp", "service-data"},
+		{"golden-abc123", "golden-abc123", "golden"},
+	} {
+		volDir := filepath.Join(core, "volumes", tc.volID)
+		if err := os.MkdirAll(volDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		meta := &volumeMetaV3{
+			Version: metadataV3Version,
+			Type:    tc.typ,
+			LVName:  tc.lvName,
+			VGName:  lvm.DefaultVGName,
+		}
+		if err := writeVolumeMetaV3(filepath.Join(volDir, metadataV2File), meta); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := mgr.ReconcileOrphanLVs(context.Background()); err != nil {
+		t.Fatalf("ReconcileOrphanLVs: %v", err)
+	}
+
+	calls := run.GetCalls()
+
+	// Verify orphan "eph-orphan" was removed.
+	expectRemoved := map[string]bool{
+		"eph-orphan":    false,
+		"ws-old-install": false,
+	}
+	for _, call := range calls {
+		if strings.Contains(call, "lvremove") {
+			for name := range expectRemoved {
+				if strings.Contains(call, name) {
+					expectRemoved[name] = true
+				}
+			}
+		}
+	}
+	for name, removed := range expectRemoved {
+		if !removed {
+			t.Errorf("orphan LV %s was not removed", name)
+		}
+	}
+
+	// Verify active orphan "ws-old-install" was deactivated first.
+	deactivated := false
+	for _, call := range calls {
+		if strings.Contains(call, "lvchange -an") && strings.Contains(call, "ws-old-install") {
+			deactivated = true
+		}
+	}
+	if !deactivated {
+		t.Error("active orphan ws-old-install was not deactivated before removal")
+	}
+
+	// Verify known LVs were NOT removed.
+	for _, call := range calls {
+		if strings.Contains(call, "lvremove") {
+			for _, name := range []string{"eph-scratch", "vol-app-myapp", "golden-abc123"} {
+				if strings.Contains(call, name) {
+					t.Errorf("known LV %s should not be removed", name)
+				}
+			}
+		}
+	}
+
+	// Verify tuple-managed LVs were NOT removed.
+	for _, call := range calls {
+		if strings.Contains(call, "lvremove") {
+			if strings.Contains(call, "snap-app-myapp--gen1") {
+				t.Error("tuple snapshot LV should not be removed")
+			}
+			if strings.Contains(call, "vol-app-myapp--failed-gen2") {
+				t.Error("tuple failed rollback LV should not be removed")
+			}
+		}
+	}
+}
