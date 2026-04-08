@@ -16,6 +16,22 @@ import (
 
 type fakeRunner = testutil.FakeRunner
 
+// fakeBlockDevice implements blockdev.BlockDevice for testing.
+type fakeBlockDevice struct {
+	name   string
+	closed bool
+	err    error
+}
+
+func (d *fakeBlockDevice) Name() string               { return d.name }
+func (d *fakeBlockDevice) Path() string                { return "/dev/fake/" + d.name }
+func (d *fakeBlockDevice) Open(_ context.Context) error { return nil }
+func (d *fakeBlockDevice) Close(_ context.Context) error {
+	d.closed = true
+	return d.err
+}
+func (d *fakeBlockDevice) SizeBytes() int64 { return 0 }
+
 func TestLUKSVolumeManager_ImplementsInterfaces(t *testing.T) {
 	// Compile-time interface checks.
 	var _ VolumeManager = (*luksVolumeManager)(nil)
@@ -692,5 +708,140 @@ func TestReconcileOrphanLVs(t *testing.T) {
 				t.Error("tuple failed rollback LV should not be removed")
 			}
 		}
+	}
+}
+
+func TestDetachAppVolume_ContinuesOnUmountFailure(t *testing.T) {
+	tests := []struct {
+		name          string
+		umountErr     error // error for first umount
+		lazyUmountErr error // error for lazy umount
+		cryptsetupErr error // error for cryptsetup close
+		stackCloseErr error // error for device stack Close
+		wantErr       bool
+	}{
+		{
+			name: "all_succeed",
+		},
+		{
+			name:          "umount_already_gone_lazy_also_fails",
+			umountErr:     errors.New("not mounted"),
+			lazyUmountErr: errors.New("not mounted"),
+			wantErr:       true,
+		},
+		{
+			name:      "umount_fails_lazy_succeeds",
+			umountErr: errors.New("device busy"),
+		},
+		{
+			name:          "cryptsetup_fails_stack_still_closes",
+			cryptsetupErr: errors.New("device busy"),
+			wantErr:       true,
+		},
+		{
+			name:          "stack_close_fails",
+			stackCloseErr: errors.New("deactivate failed"),
+			wantErr:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mountDir := t.TempDir()
+			handle := VolumeHandle{ID: "app-test", MountDir: mountDir}
+
+			errs := make(map[string]error)
+			umountKey := testutil.BuildKey("umount", []string{mountDir})
+			if tt.umountErr != nil {
+				errs[umountKey] = tt.umountErr
+			}
+			lazyKey := testutil.BuildKey("umount", []string{"-l", mountDir})
+			if tt.lazyUmountErr != nil {
+				errs[lazyKey] = tt.lazyUmountErr
+			}
+			if tt.cryptsetupErr != nil {
+				errs["cryptsetup close piccolo-vol-app-test"] = tt.cryptsetupErr
+			}
+
+			run := &fakeRunner{Errs: errs}
+
+			dev := &fakeBlockDevice{name: "thinlv", err: tt.stackCloseErr}
+			stack, _ := blockdev.NewDeviceStack("app-test", dev)
+
+			mgr := &luksVolumeManager{
+				run:    run,
+				stacks: map[string]*blockdev.DeviceStack{"app-test": stack},
+			}
+
+			err := mgr.detachAppVolume(context.Background(), handle)
+
+			if tt.wantErr && err == nil {
+				t.Error("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+
+			// cryptsetup close and stack.Close must always be called.
+			calls := run.GetCalls()
+			found := false
+			for _, c := range calls {
+				if strings.HasPrefix(c, "cryptsetup close") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Error("cryptsetup close was not called")
+			}
+			if !dev.closed {
+				t.Error("device stack Close was not called")
+			}
+
+			// Tracking map should always be cleaned up.
+			mgr.mu.Lock()
+			_, exists := mgr.stacks["app-test"]
+			mgr.mu.Unlock()
+			if exists {
+				t.Error("stacks tracking entry not cleaned up")
+			}
+		})
+	}
+}
+
+func TestDetachEphemeralVolume_ContinuesOnUmountFailure(t *testing.T) {
+	mountDir := t.TempDir()
+	handle := VolumeHandle{ID: "eph-test", MountDir: mountDir}
+
+	umountKey := testutil.BuildKey("umount", []string{mountDir})
+	lazyKey := testutil.BuildKey("umount", []string{"-l", mountDir})
+
+	run := &fakeRunner{Errs: map[string]error{
+		umountKey: errors.New("not mounted"),
+		lazyKey:   errors.New("not mounted"),
+	}}
+
+	dev := &fakeBlockDevice{name: "thinlv"}
+	stack, _ := blockdev.NewDeviceStack("eph-test", dev)
+
+	mgr := &luksVolumeManager{
+		run:    run,
+		stacks: map[string]*blockdev.DeviceStack{"eph-test": stack},
+	}
+
+	err := mgr.detachEphemeralVolume(context.Background(), handle)
+	if err == nil {
+		t.Error("expected error for failed umount, got nil")
+	}
+
+	if !dev.closed {
+		t.Error("device stack Close was not called despite umount failure")
+	}
+
+	mgr.mu.Lock()
+	_, exists := mgr.stacks["eph-test"]
+	mgr.mu.Unlock()
+	if exists {
+		t.Error("stacks tracking entry not cleaned up")
 	}
 }

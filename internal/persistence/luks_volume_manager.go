@@ -754,29 +754,29 @@ func (m *luksVolumeManager) detachAppVolume(ctx context.Context, handle VolumeHa
 	mapper := "piccolo-vol-" + handle.ID
 	var errs []error
 
-	// Unmount — if this fails, can't proceed to cryptsetup (device still in use).
+	// Unmount with lazy fallback. Continue regardless — the mount may
+	// already be gone (systemd race) and cryptsetup close still needs to run.
 	if err := m.run.Run(ctx, "umount", handle.MountDir); err != nil {
-		return fmt.Errorf("umount %s: %w", handle.MountDir, err)
+		log.Printf("umount %s failed, trying lazy unmount", handle.MountDir)
+		if lazyErr := m.run.Run(ctx, "umount", "-l", handle.MountDir); lazyErr != nil {
+			errs = append(errs, fmt.Errorf("umount %s: %w", handle.MountDir, lazyErr))
+		}
 	}
 
-	// LUKS close — if this fails, still try stack.Close to deactivate the
-	// underlying LV/NBD/DRBD layers.
 	if err := m.run.Run(ctx, "cryptsetup", "close", mapper); err != nil {
 		errs = append(errs, fmt.Errorf("luks close %s: %w", mapper, err))
 	}
 
-	// Close device stack — only delete from tracking on success.
+	// Close device stack. Always remove from tracking — during shutdown
+	// there is no retry opportunity; a stale entry is worse than a missing one.
 	m.mu.Lock()
 	stack := m.stacks[handle.ID]
+	delete(m.stacks, handle.ID)
 	m.mu.Unlock()
 
 	if stack != nil {
 		if err := stack.Close(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("close device stack: %w", err))
-		} else {
-			m.mu.Lock()
-			delete(m.stacks, handle.ID)
-			m.mu.Unlock()
 		}
 	}
 
@@ -892,30 +892,31 @@ func (m *luksVolumeManager) attachEphemeralVolume(ctx context.Context, handle Vo
 }
 
 func (m *luksVolumeManager) detachEphemeralVolume(ctx context.Context, handle VolumeHandle) error {
-	// Unmount with lazy fallback on EBUSY.
+	var errs []error
+
+	// Unmount with lazy fallback. Continue regardless — the mount may
+	// already be gone (systemd race) and stack.Close still needs to run.
 	if err := m.run.Run(ctx, "umount", handle.MountDir); err != nil {
+		log.Printf("umount %s failed, trying lazy unmount", handle.MountDir)
 		if lazyErr := m.run.Run(ctx, "umount", "-l", handle.MountDir); lazyErr != nil {
-			return fmt.Errorf("umount %s: %w (lazy also failed: %v)", handle.MountDir, err, lazyErr)
+			errs = append(errs, fmt.Errorf("umount %s: %w", handle.MountDir, lazyErr))
 		}
 	}
 
-	// Close device stack — only delete from tracking on success.
-	// Unlike detachAppVolume, no error-collection here: ephemeral volumes have no LUKS layer,
-	// so the only dependency chain is umount → stack.Close with no intermediate step to skip.
+	// Close device stack. Always remove from tracking — during shutdown
+	// there is no retry opportunity; a stale entry is worse than a missing one.
 	m.mu.Lock()
 	stack := m.stacks[handle.ID]
+	delete(m.stacks, handle.ID)
 	m.mu.Unlock()
 
 	if stack != nil {
 		if err := stack.Close(ctx); err != nil {
-			return fmt.Errorf("close device stack: %w", err)
+			errs = append(errs, fmt.Errorf("close device stack: %w", err))
 		}
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // cleanupStaleEphemeralState tears down leftover mounts, LVs, and dirs for an

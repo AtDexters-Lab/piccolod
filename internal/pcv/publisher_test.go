@@ -212,7 +212,7 @@ func TestPublisher_DirtyLatchClears(t *testing.T) {
 	pub.mu.Unlock()
 }
 
-func TestPublisher_StopFlush(t *testing.T) {
+func TestPublisher_StopSkipsFlush(t *testing.T) {
 	pub, coreRoot := newTestPublisher(t)
 
 	pub.mu.Lock()
@@ -223,8 +223,8 @@ func TestPublisher_StopFlush(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(coreRoot, "recovery", "current.enc")); err != nil {
-		t.Fatalf("flush-on-shutdown did not produce archive: %v", err)
+	if _, err := os.Stat(filepath.Join(coreRoot, "recovery", "current.enc")); err == nil {
+		t.Fatal("Stop should not produce archive — flush-on-shutdown was removed")
 	}
 }
 

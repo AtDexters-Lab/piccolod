@@ -30,8 +30,7 @@ const (
 	historyLimit      = 5
 	publishTimeout    = 2 * time.Minute
 	manifestVersion   = 1
-	eventBufferSize   = 16
-	shutdownTimeout   = 10 * time.Second
+	eventBufferSize = 16
 )
 
 // Manifest describes a published PCV archive.
@@ -95,7 +94,9 @@ func (p *Publisher) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop implements supervisor.Component. Flushes pending publishes and shuts down.
+// Stop implements supervisor.Component. Shuts down without flushing — the daemon
+// is going away so no consumer benefits from a final publish. Recovery archives
+// are produced by the mutation debounce (30s) and periodic timer (6h).
 func (p *Publisher) Stop(ctx context.Context) error {
 	p.mu.Lock()
 	select {
@@ -106,7 +107,6 @@ func (p *Publisher) Stop(ctx context.Context) error {
 	}
 	cancelMut := p.cancelMutation
 	cancelPer := p.cancelPeriodic
-	dirty := p.dirty && p.active
 	p.mu.Unlock()
 
 	if cancelMut != nil {
@@ -114,15 +114,6 @@ func (p *Publisher) Stop(ctx context.Context) error {
 	}
 	if cancelPer != nil {
 		cancelPer()
-	}
-
-	// Flush-on-shutdown: if dirty, do a final publish.
-	if dirty {
-		pubCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		if err := p.doPublish(pubCtx); err != nil {
-			log.Printf("WARN: pcv publisher: flush-on-shutdown failed: %v", err)
-		}
 	}
 
 	// Prevent new PublishNow calls and wait for any in-flight publish.
