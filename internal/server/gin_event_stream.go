@@ -24,6 +24,7 @@ const (
 	topicNetworkPeers   = "network_peers"
 	topicIdentity       = "identity"
 	topicNetworkStatus  = "network_status"
+	topicStorageAlert   = "storage_alert"
 )
 
 var supportedTopics = map[string]events.Topic{
@@ -34,6 +35,7 @@ var supportedTopics = map[string]events.Topic{
 	topicNetworkPeers:   events.TopicNetworkPeersChanged,
 	topicIdentity:       events.TopicIdentityChanged,
 	topicNetworkStatus:  events.TopicNetworkStateChanged,
+	topicStorageAlert:   events.TopicStorageAlert,
 }
 
 type streamMessage struct {
@@ -310,6 +312,18 @@ func (s *GinServer) processEvent(topic string, evt events.Event, isAppAllowed fu
 			return nil
 		}
 		return s.buildIdentitySnapshot()
+
+	case topicStorageAlert:
+		payload, ok := evt.Payload.(events.StorageAlertEvent)
+		if !ok {
+			return nil
+		}
+		if !isAdmin {
+			// Strip instance IDs for non-admin users to avoid leaking
+			// workspace names belonging to other users.
+			payload.AffectedApps = nil
+		}
+		return &streamMessage{Type: topicStorageAlert, Payload: payload}
 	}
 	return nil
 }

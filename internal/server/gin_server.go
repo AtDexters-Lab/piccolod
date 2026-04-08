@@ -51,6 +51,7 @@ import (
 	"piccolod/internal/storage/diskprep"
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/nbd"
+	"piccolod/internal/storage/poolguard"
 	"piccolod/internal/terminal"
 	"piccolod/internal/tpm"
 	"piccolod/internal/update"
@@ -836,6 +837,12 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	// pcvPub must be registered after storageMgr: supervisor stops in reverse
 	// order, so pcvPub flushes before storage locks.
 	s.supervisor.Register(pcvPub)
+	var poolQ poolguard.PoolQuerier
+	if p := storageMgr.LVMPool(); p != nil {
+		poolQ = p
+	}
+	pgrd := poolguard.New(poolQ, s.appManager, eventsBus)
+	s.supervisor.Register(supervisor.NewComponent("pool-guard", pgrd.Start, pgrd.Stop))
 	s.supervisor.Register(supervisor.NewComponent("consensus", consensusMgr.Start, consensusMgr.Stop))
 	s.supervisor.Register(newLeadershipObserver(eventsBus))
 	s.supervisor.Register(supervisor.NewComponent("catalog", func(ctx context.Context) error {

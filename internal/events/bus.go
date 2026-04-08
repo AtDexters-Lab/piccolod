@@ -39,6 +39,7 @@ const (
 	TopicStoragePoolInitialized Topic = "storage_pool_initialized" // LVM data pool initialized
 	TopicStoragePoolActivated   Topic = "storage_pool_activated"   // LVM data pool activated
 	TopicStorageLocked          Topic = "storage_locked"            // Storage locked (LVM deactivated)
+	TopicStorageAlert           Topic = "storage_alert"             // User-visible storage pressure notification
 
 	// PCV export events
 	TopicPCVExportPublished Topic = "pcv_export_published" // PCV archive published successfully
@@ -170,6 +171,28 @@ type StoragePhase1Complete struct {
 type StorageEmergencyEvent struct {
 	Level string // "hard" or "soft"
 	Error string
+}
+
+// Storage alert severity levels.
+const (
+	AlertSeverityCritical = "critical"
+	AlertSeverityUrgent   = "urgent"
+)
+
+// Storage alert actions.
+const (
+	AlertActionNone              = "none"
+	AlertActionWorkspacesStopped = "workspaces_stopped"
+)
+
+// StorageAlertEvent is a user-visible notification about storage pressure.
+// Published by the pool guard when thin pool usage exceeds critical thresholds.
+type StorageAlertEvent struct {
+	Severity     string   `json:"severity"`
+	Message      string   `json:"message"`
+	DataPercent  float64  `json:"data_percent"`
+	Action       string   `json:"action"`
+	AffectedApps []string `json:"affected_apps,omitempty"`
 }
 
 // AppStatusChangedEvent is emitted when an app's status changes.
