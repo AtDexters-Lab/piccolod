@@ -649,6 +649,36 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	if catalogSource != "" {
 		installCtx = app.WithCatalogSource(installCtx, catalogSource)
 	}
+
+	// Fetch init script files from the store. Requires catalog_source because
+	// the store URL is derived from the catalog index. Non-catalog installs
+	// that declare init_script will hit the warning below and the init phase
+	// will be silently skipped (since FileContent will be empty).
+	// Uses installCtx so the fetch survives client disconnects.
+	for svcName, svc := range appDef.Services {
+		if svc.InitScript == nil || svc.InitScript.File == "" {
+			continue
+		}
+		if catalogSource == "" || s.catalogManager == nil {
+			log.Printf("WARN: services.%s.init_script declared but install has no catalog_source; init will be skipped. Use the JSON install wrapper with catalog_source to enable init scripts.", svcName)
+			continue
+		}
+		content, err := s.catalogManager.FetchAppFile(installCtx, catalogSource, svc.InitScript.File)
+		if err != nil {
+			writeGinError(c, http.StatusBadRequest, fmt.Sprintf(
+				"failed to fetch init script '%s' for service '%s': %v",
+				svc.InitScript.File, svcName, err))
+			return
+		}
+		svc.InitScript.FileContent = content
+		appDef.Services[svcName] = svc
+	}
+
+	// Note: OIDC clients are registered AFTER Install (below). Init scripts
+	// can receive OIDC credentials via {{ .System.Auth.* }} but cannot perform
+	// full OIDC authorization flows during init — redirect URIs are only
+	// resolvable after StoreApp completes. Init scripts should store the
+	// credentials for the app to use after install (like Immich does).
 	appInstance, err := s.appManager.Install(installCtx, appDef)
 	if err != nil {
 		if handleAppManagerError(c, err, "install app") {

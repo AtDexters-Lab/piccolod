@@ -325,6 +325,25 @@ type AppService struct {
 	Storage     *AppStorage        `yaml:"storage,omitempty" json:"storage,omitempty"`
 	Resources   *AppResources      `yaml:"resources,omitempty" json:"resources,omitempty"`
 	OIDCClient  *ServiceOIDCClient `yaml:"oidc_client,omitempty" json:"oidc_client,omitempty"`
+	InitScript  *ServiceInitScript `yaml:"init_script,omitempty" json:"init_script,omitempty"`
+}
+
+// ServiceInitScript defines a post-start init script for a service container.
+// The script file is fetched from the app store and executed via podman exec
+// after the container is running.
+type ServiceInitScript struct {
+	// File is the script path relative to app.yaml in the store (e.g., "scripts/init.js").
+	File string `yaml:"file" json:"file"`
+	// Env contains environment variables injected via podman exec -e. Values are template-evaluated.
+	Env map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+	// Timeout is the maximum execution time (e.g., "90s", "5m"). Default: 120s.
+	Timeout string `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	// ReadyTimeout is the time to wait for the container to be running before executing. Default: 30s.
+	ReadyTimeout string `yaml:"ready_timeout,omitempty" json:"ready_timeout,omitempty"`
+	// Shell is the interpreter used to run the script (e.g., "node", "/bin/bash"). Default: "/bin/sh".
+	Shell string `yaml:"shell,omitempty" json:"shell,omitempty"`
+	// FileContent is populated at install time by fetching from the store. Not serialized.
+	FileContent []byte `yaml:"-" json:"-"`
 }
 
 // AppStorage defines storage configuration

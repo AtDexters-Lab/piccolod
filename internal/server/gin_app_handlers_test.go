@@ -1525,6 +1525,10 @@ func (m *GinMockContainerManager) ExecShellCmd(runtime container.PodmanRuntime, 
 	return exec.Command("echo", "mock shell"), nil
 }
 
+func (m *GinMockContainerManager) ExecScript(ctx context.Context, runtime container.PodmanRuntime, containerID string, opts container.ExecScriptOptions) (int, string, error) {
+	return 0, "mock exec script", nil
+}
+
 func TestServicesLocalURLGeneration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tempDir := t.TempDir()

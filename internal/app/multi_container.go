@@ -228,6 +228,14 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		if err := writeAppConfig(configDir, opts.appDef.AppConfig, int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
 			return container.ContainerCreateSpec{}, err
 		}
+
+		// Write init script file to config dir if fetched from store.
+		if svc.InitScript != nil && len(svc.InitScript.FileContent) > 0 {
+			if err := writeInitScript(configDir, svc.InitScript.File, svc.InitScript.FileContent,
+				int(opts.credential.Uid), int(opts.credential.Gid)); err != nil {
+				return container.ContainerCreateSpec{}, err
+			}
+		}
 	}
 
 	if svc.Resources != nil && svc.Resources.Limits != nil {
@@ -336,6 +344,36 @@ func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreate
 		}
 	}
 
+	return nil
+}
+
+// writeInitScript writes a fetched init script file to the config directory,
+// creating intermediate directories as needed. The path is validated to stay
+// within configDir to prevent traversal.
+func writeInitScript(configDir, relPath string, content []byte, uid, gid int) error {
+	scriptPath := filepath.Join(configDir, relPath)
+
+	// Containment check: resolved path must stay under configDir.
+	rel, err := filepath.Rel(configDir, scriptPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return fmt.Errorf("init script path escapes config dir: %s", relPath)
+	}
+
+	scriptDir := filepath.Dir(scriptPath)
+	if err := os.MkdirAll(scriptDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create init script dir: %w", err)
+	}
+	// Chown intermediate directories for rootless UID remapping.
+	if err := container.ChownIfNeeded(scriptDir, uid, gid); err != nil {
+		return fmt.Errorf("failed to chown init script dir: %w", err)
+	}
+
+	if err := os.WriteFile(scriptPath, content, 0o755); err != nil {
+		return fmt.Errorf("failed to write init script: %w", err)
+	}
+	if err := container.ChownIfNeeded(scriptPath, uid, gid); err != nil {
+		return fmt.Errorf("failed to chown init script: %w", err)
+	}
 	return nil
 }
 

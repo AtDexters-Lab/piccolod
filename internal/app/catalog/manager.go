@@ -9,7 +9,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -547,16 +549,17 @@ func (m *Manager) GetApps(ctx context.Context, opts FilterOptions) (*api.Catalog
 	}, nil
 }
 
-func (m *Manager) GetAppTemplate(ctx context.Context, appName string) (string, error) {
+// resolveAppPath looks up the manifest path for an app from the cached catalog index.
+// Ensures the cache is populated first, falling back to stale data on fetch errors.
+func (m *Manager) resolveAppPath(ctx context.Context, appName string) (string, error) {
 	if err := m.ensureCache(ctx, false); err != nil {
-		// Proceed if we have cached data, otherwise fail
 		m.cacheMu.RLock()
 		if len(m.cachedApps) == 0 {
 			m.cacheMu.RUnlock()
 			return "", err
 		}
 		m.cacheMu.RUnlock()
-		log.Printf("WARN: serving stale catalog template lookup due to fetch error: %v", err)
+		log.Printf("WARN: serving stale catalog lookup due to fetch error: %v", err)
 	}
 
 	m.cacheMu.RLock()
@@ -571,6 +574,14 @@ func (m *Manager) GetAppTemplate(ctx context.Context, appName string) (string, e
 
 	if appPath == "" {
 		return "", fmt.Errorf("app %s not found in catalog", appName)
+	}
+	return appPath, nil
+}
+
+func (m *Manager) GetAppTemplate(ctx context.Context, appName string) (string, error) {
+	appPath, err := m.resolveAppPath(ctx, appName)
+	if err != nil {
+		return "", err
 	}
 
 	// Fetch the actual app.yaml
@@ -608,6 +619,73 @@ func (m *Manager) GetAppTemplate(ctx context.Context, appName string) (string, e
 	}
 
 	return string(body), nil
+}
+
+// FetchAppFile fetches a file relative to an app's directory in the store.
+// For example, appName="immich", relativePath="scripts/init.js" fetches
+// {repoURL}/apps/immich/scripts/init.js (assuming the app's path is apps/immich/app.yaml).
+func (m *Manager) FetchAppFile(ctx context.Context, appName, relativePath string) ([]byte, error) {
+	if strings.Contains(relativePath, "..") {
+		return nil, fmt.Errorf("relative path must not contain '..': %s", relativePath)
+	}
+
+	appPath, err := m.resolveAppPath(ctx, appName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Construct the sibling file URL. Handle two catalog path formats:
+	// (a) Absolute URL: resolve relative to the manifest URL's directory,
+	//     preserving query parameters (e.g., presigned tokens, ?raw=1).
+	// (b) Relative path: derive base dir and join onto repoURL.
+	var fileURL string
+	if strings.HasPrefix(appPath, "http://") || strings.HasPrefix(appPath, "https://") {
+		parsed, parseErr := url.Parse(appPath)
+		if parseErr != nil {
+			return nil, fmt.Errorf("failed to parse catalog path %s: %w", appPath, parseErr)
+		}
+		parsed.Path = path.Join(path.Dir(parsed.Path), relativePath)
+		// Preserve RawQuery and Fragment so presigned URLs / required tokens
+		// still apply to the sibling file.
+		fileURL = parsed.String()
+	} else {
+		baseDir := path.Dir(strings.TrimPrefix(appPath, "/"))
+		joined, joinErr := url.JoinPath(m.repoURL, baseDir, relativePath)
+		if joinErr != nil {
+			return nil, fmt.Errorf("failed to construct URL for %s/%s: %w", appName, relativePath, joinErr)
+		}
+		fileURL = joined
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch app file %s: %w", relativePath, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("app file %s not found for %s (404)", relativePath, appName)
+		}
+		return nil, fmt.Errorf("failed to fetch app file %s: status %d", relativePath, resp.StatusCode)
+	}
+
+	// Limit read to 1MB to prevent OOM from oversized files.
+	const maxFileSize = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read app file %s: %w", relativePath, err)
+	}
+	if len(body) > maxFileSize {
+		return nil, fmt.Errorf("app file %s exceeds 1MB limit", relativePath)
+	}
+
+	return body, nil
 }
 
 func (m *Manager) GetCategories(ctx context.Context) ([]string, error) {

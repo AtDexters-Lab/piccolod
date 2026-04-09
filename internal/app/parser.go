@@ -10,8 +10,11 @@ import (
 	"regexp"
 	"strings"
 	"text/template"
+	"time"
+	"unicode/utf8"
 
 	"piccolod/internal/api"
+	"piccolod/internal/container"
 	"piccolod/internal/hostname"
 
 	"gopkg.in/yaml.v3"
@@ -67,6 +70,11 @@ var (
 	// Valid app name pattern: lowercase letters, numbers, hyphens
 	// Must start with letter, end with letter or number
 	appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$`)
+
+	// initShellRegex restricts init_script.shell to a safe character set:
+	// alphanumerics, underscore, slash, dot, hyphen. Prevents whitespace,
+	// shell metacharacters, and control characters.
+	initShellRegex = regexp.MustCompile(`^[A-Za-z0-9_/.-]+$`)
 
 	// tplExprRegex matches Go template expressions {{ ... }}.
 	// Unquoted {{ }} in YAML is interpreted as a flow mapping, which breaks
@@ -235,6 +243,7 @@ func validateRawServicesBlocks(root *yaml.Node) error {
 	allowedServiceKeys := map[string]struct{}{
 		"image":       {},
 		"init":        {},
+		"init_script": {},
 		"after":       {},
 		"bind_ports":  {},
 		"environment": {},
@@ -797,6 +806,12 @@ func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
 			return fmt.Errorf("resources must be specified per-service under services for workspace mode apps")
 		}
 
+		for name, svc := range app.Services {
+			if svc.InitScript != nil {
+				return fmt.Errorf("services.%s.init_script is not supported for workspace mode apps", name)
+			}
+		}
+
 		primary := strings.TrimSpace(app.PrimaryService)
 		if primary == "" {
 			primary = defaultPrimaryServiceName
@@ -875,6 +890,10 @@ func validateServices(services map[string]api.AppService, primary string, listen
 					return newValidationError("INVALID_REDIRECT_URI", fmt.Sprintf("redirect_uri \"%s\" must be localhost, loopback (127.0.0.1, ::1), or custom scheme", redirectURI))
 				}
 			}
+		}
+
+		if err := validateInitScript(name, svc.InitScript); err != nil {
+			return err
 		}
 	}
 
@@ -1272,6 +1291,72 @@ func validateOIDCRedirectPath(path string) error {
 	// If the raw path differs from input, the input contained characters that needed encoding.
 	if parsed.Path != path {
 		return fmt.Errorf("redirect_uri_paths entry %q contains characters that require encoding (got %q after parsing)", path, parsed.Path)
+	}
+	return nil
+}
+
+// validateInitScript validates a service-level init script block.
+func validateInitScript(svcName string, init *api.ServiceInitScript) error {
+	if init == nil {
+		return nil
+	}
+	if strings.TrimSpace(init.File) == "" {
+		return fmt.Errorf("services.%s.init_script.file is required", svcName)
+	}
+	// Reject path traversal and absolute paths.
+	if strings.Contains(init.File, "..") {
+		return fmt.Errorf("services.%s.init_script.file must not contain '..'", svcName)
+	}
+	if path.IsAbs(init.File) {
+		return fmt.Errorf("services.%s.init_script.file must be a relative path", svcName)
+	}
+	if len(init.File) > 256 {
+		return fmt.Errorf("services.%s.init_script.file path too long (max 256)", svcName)
+	}
+	if !utf8.ValidString(init.File) {
+		return fmt.Errorf("services.%s.init_script.file must be valid UTF-8", svcName)
+	}
+	// Validate shell: absolute path or bare command name. Enforce length cap
+	// and restrictive character set for defense-in-depth.
+	if init.Shell != "" {
+		if len(init.Shell) > 128 {
+			return fmt.Errorf("services.%s.init_script.shell too long (max 128)", svcName)
+		}
+		if !initShellRegex.MatchString(init.Shell) {
+			return fmt.Errorf("services.%s.init_script.shell contains invalid characters: %s", svcName, init.Shell)
+		}
+		if strings.Contains(init.Shell, "/") && !path.IsAbs(init.Shell) {
+			return fmt.Errorf("services.%s.init_script.shell must be an absolute path or bare command name, got '%s'", svcName, init.Shell)
+		}
+	}
+	// Validate env keys and values.
+	for k, v := range init.Env {
+		if err := container.ValidateEnvKey(k); err != nil {
+			return fmt.Errorf("services.%s.init_script.env key '%s': %w", svcName, k, err)
+		}
+		if err := container.ValidateEnvValue(v); err != nil {
+			return fmt.Errorf("services.%s.init_script.env value for '%s': %w", svcName, k, err)
+		}
+	}
+	// Validate timeout.
+	if init.Timeout != "" {
+		d, err := time.ParseDuration(init.Timeout)
+		if err != nil {
+			return fmt.Errorf("services.%s.init_script.timeout: %w", svcName, err)
+		}
+		if d < time.Second || d > time.Hour {
+			return fmt.Errorf("services.%s.init_script.timeout must be between 1s and 3600s", svcName)
+		}
+	}
+	// Validate ready_timeout.
+	if init.ReadyTimeout != "" {
+		d, err := time.ParseDuration(init.ReadyTimeout)
+		if err != nil {
+			return fmt.Errorf("services.%s.init_script.ready_timeout: %w", svcName, err)
+		}
+		if d < 0 || d > 10*time.Minute {
+			return fmt.Errorf("services.%s.init_script.ready_timeout must be between 0s and 600s", svcName)
+		}
 	}
 	return nil
 }

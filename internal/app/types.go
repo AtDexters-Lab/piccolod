@@ -72,6 +72,8 @@ type ContainerManager interface {
 	NetworkReload(ctx context.Context, runtime container.PodmanRuntime, containerNameOrID string) error
 	// ExecShellCmd returns an exec.Cmd for running a shell inside a container.
 	ExecShellCmd(runtime container.PodmanRuntime, containerID string) (*exec.Cmd, error)
+	// ExecScript runs a non-interactive script inside a container.
+	ExecScript(ctx context.Context, runtime container.PodmanRuntime, containerID string, opts container.ExecScriptOptions) (int, string, error)
 }
 
 // AppInstance captures the runtime metadata for an installed application instance.
@@ -101,6 +103,9 @@ type AppInstance struct {
 
 	// ClonedFrom tracks the origin instance ID this app was cloned from (RFC 20260302).
 	ClonedFrom string `json:"cloned_from,omitempty"`
+
+	// Init tracks per-service init script execution state.
+	Init *InitState `json:"init,omitempty"`
 
 	// Startup failure tracking for escalation (RFC 20260125)
 	// After StartupEscalateAfterAttempts consecutive failures OR StartupEscalateAfterDuration,

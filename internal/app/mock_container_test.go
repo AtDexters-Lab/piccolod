@@ -310,6 +310,10 @@ func (m *MockContainerManager) ExecShellCmd(runtime container.PodmanRuntime, con
 	return exec.Command("echo", "mock shell"), nil
 }
 
+func (m *MockContainerManager) ExecScript(ctx context.Context, runtime container.PodmanRuntime, containerID string, opts container.ExecScriptOptions) (int, string, error) {
+	return 0, "mock exec script", nil
+}
+
 func generateMockContainerID(id int) string {
 	return "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd" + string(rune('0'+id%10))
 }

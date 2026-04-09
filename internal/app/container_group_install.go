@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -359,6 +361,9 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	emitCreateProgress(fmt.Sprintf("Created container (1/%d): network", totalContainers))
 
 	// 2) Create + start all service containers attached to the anchor netns.
+	// Init scripts run inline after each container starts, before its dependents
+	// are created. This ensures dependent services see fully initialized state.
+	var initState *InitState
 	containers := make(map[string]string, len(appDef.Services))
 	for _, svcName := range startOrder {
 		updateSubtask(svcName, 10, "Creating")
@@ -414,6 +419,21 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		emitCreateProgress(fmt.Sprintf("Created container (%d/%d): %s", doneContainers, totalContainers, svcName))
 
 		containers[svcName] = cid
+
+		// Run init script for this service BEFORE starting dependent services,
+		// so dependents see fully initialized state (e.g., db schema/users).
+		svc := appDef.Services[svcName]
+		if svc.InitScript != nil && len(svc.InitScript.FileContent) > 0 {
+			if initState == nil {
+				initState = &InitState{Services: make(map[string]ServiceInitState)}
+				m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseRunningInit, 88,
+					fmt.Sprintf("Running init script: %s", svcName), false, nil)
+			}
+			if err := m.runServiceInit(ctx, runtime, instanceID, svcName, cid, &svc, layout, initState); err != nil {
+				cleanup()
+				return nil, err
+			}
+		}
 	}
 
 	primaryCID := containers[primary]
@@ -436,6 +456,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		UpdatedAt:       now,
 		Definition:      appDef,
 		CatalogSource:   CatalogSourceFromContext(ctx),
+		Init:            initState,
 	}, nil
 }
 
@@ -453,6 +474,113 @@ func resolveRemoteDigest(ctx context.Context, imageRef string) (string, error) {
 		return "", fmt.Errorf("skopeo returned empty digest for %s", imageRef)
 	}
 	return digest, nil
+}
+
+// runServiceInit executes a single service's init script, updating initState
+// with the result. Returns an error if the init fails (caller should cleanup
+// and abort the install).
+func (m *AppManager) runServiceInit(ctx context.Context, runtime container.PodmanRuntime, instanceID, svcName, cid string, svc *api.AppService, layout appVolumeLayout, initState *InitState) error {
+	startedAt := time.Now()
+	initState.Services[svcName] = ServiceInitState{
+		Status:    InitStatusRunning,
+		StartedAt: startedAt,
+	}
+
+	readyTimeout := 30 * time.Second
+	if svc.InitScript.ReadyTimeout != "" {
+		if d, err := time.ParseDuration(svc.InitScript.ReadyTimeout); err == nil {
+			readyTimeout = d
+		}
+	}
+	if err := m.waitForContainerReady(ctx, runtime, cid, readyTimeout); err != nil {
+		initState.Services[svcName] = ServiceInitState{
+			Status: InitStatusFailed, StartedAt: startedAt, Error: fmt.Sprintf("container not ready: %v", err),
+		}
+		log.Printf("ERROR: init script for service '%s' (%s): container not ready: %v", svcName, instanceID, err)
+		return fmt.Errorf("init: service '%s' container not ready: %w", svcName, err)
+	}
+
+	execTimeout := 120 * time.Second
+	if svc.InitScript.Timeout != "" {
+		if d, err := time.ParseDuration(svc.InitScript.Timeout); err == nil {
+			execTimeout = d
+		}
+	}
+
+	log.Printf("INFO: init script for service '%s' (%s) started: shell=%s file=%s timeout=%s",
+		svcName, instanceID, svc.InitScript.Shell, svc.InitScript.File, execTimeout)
+
+	exitCode, output, execErr := m.containerManager.ExecScript(ctx, runtime, cid,
+		container.ExecScriptOptions{
+			Shell:      svc.InitScript.Shell,
+			ScriptPath: path.Join("/piccolo/config", svc.InitScript.File),
+			Env:        svc.InitScript.Env,
+			Timeout:    execTimeout,
+		})
+
+	// Write init log to the control-plane metadata dir, not the per-app
+	// data volume. The metadata dir survives cleanupInstallResources() on
+	// install failure, so the log remains available for debugging.
+	// Mode 0600: init output may contain secrets injected via env vars.
+	if state, stateErr := m.ensureStateManager(); stateErr == nil {
+		metaDir := state.AppMetaDir(instanceID)
+		if err := os.MkdirAll(metaDir, 0700); err != nil {
+			log.Printf("WARN: failed to create meta dir for init log (%s): %v", instanceID, err)
+		} else {
+			logPath := filepath.Join(metaDir, fmt.Sprintf("init-%s.log", svcName))
+			if err := os.WriteFile(logPath, []byte(output), 0600); err != nil {
+				log.Printf("WARN: failed to write init log for service '%s' (%s): %v", svcName, instanceID, err)
+			}
+		}
+	}
+
+	if execErr != nil {
+		initState.Services[svcName] = ServiceInitState{
+			Status:      InitStatusFailed,
+			StartedAt:   startedAt,
+			CompletedAt: time.Now(),
+			ExitCode:    exitCode,
+			Error:       execErr.Error(),
+		}
+		log.Printf("ERROR: init script for service '%s' (%s) failed (exit=%d): %v", svcName, instanceID, exitCode, execErr)
+		return fmt.Errorf("init script for service '%s' failed: %w", svcName, execErr)
+	}
+
+	initState.Services[svcName] = ServiceInitState{
+		Status:      InitStatusCompleted,
+		StartedAt:   startedAt,
+		CompletedAt: time.Now(),
+	}
+	log.Printf("INFO: init script for service '%s' (%s) completed in %s",
+		svcName, instanceID, time.Since(startedAt).Round(time.Millisecond))
+	return nil
+}
+
+// waitForContainerReady polls the container state until it is running.
+// The init script itself is responsible for app-level readiness checks.
+func (m *AppManager) waitForContainerReady(ctx context.Context, runtime container.PodmanRuntime, containerID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	// Check at least once even if timeout is 0s.
+	for {
+		state, err := m.containerManager.InspectContainerState(ctx, runtime, containerID)
+		if err != nil {
+			return err
+		}
+		if !state.Exists {
+			return fmt.Errorf("container no longer exists")
+		}
+		if state.Running {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("container not running after %s", timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+		}
+	}
 }
 
 // extractDigestHash extracts the "sha256:..." portion from a digest string.

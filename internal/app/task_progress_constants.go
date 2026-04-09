@@ -30,8 +30,11 @@ const (
 	taskPhaseSnapshotting   = "snapshotting"
 	taskPhaseCreatingRootfs = "creating_rootfs"
 
+	// Init script phases
+	taskPhaseRunningInit = "running_init"
+
 	// Workspace disk phases
-	taskPhaseMountingWorkspace   = "mounting_workspace"
+	taskPhaseMountingWorkspace = "mounting_workspace"
 	taskPhaseUnmountingWorkspace = "unmounting_workspace"
 	taskPhaseInitializingDisk    = "initializing_disk"
 )

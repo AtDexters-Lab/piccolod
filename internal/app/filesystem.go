@@ -50,9 +50,42 @@ type AppMetadata struct {
 	ActiveRootfs map[string]string `json:"active_rootfs,omitempty"`
 	// ClonedFrom tracks the origin instance ID this app was cloned from.
 	ClonedFrom string `json:"cloned_from,omitempty"`
+	// Init tracks per-service init script execution state.
+	Init *InitState `json:"init,omitempty"`
+}
+
+// InitState tracks init script execution across services.
+type InitState struct {
+	Services map[string]ServiceInitState `json:"services"`
+}
+
+// InitStatus constants for ServiceInitState.Status.
+const (
+	InitStatusPending   = "pending"
+	InitStatusRunning   = "running"
+	InitStatusCompleted = "completed"
+	InitStatusFailed    = "failed"
+)
+
+// ServiceInitState tracks the execution state of a single service's init script.
+type ServiceInitState struct {
+	Status      string    `json:"status"`
+	StartedAt   time.Time `json:"started_at,omitempty"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
+	ExitCode    int       `json:"exit_code,omitempty"`
+	Error       string    `json:"error,omitempty"`
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// AppMetaDir returns the control-plane metadata directory for an instance.
+// Unlike layout.DataDir (which lives on the encrypted per-app volume and is
+// destroyed by cleanupInstallResources on failure), this directory survives
+// install-failure cleanup, making it suitable for diagnostic artifacts like
+// init script logs.
+func (fsm *FilesystemStateManager) AppMetaDir(instanceID string) string {
+	return filepath.Join(fsm.appsDir, instanceID)
+}
 
 // NewFilesystemStateManager creates a new filesystem state manager
 func NewFilesystemStateManager(stateDir string) (*FilesystemStateManager, error) {
@@ -186,6 +219,7 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 		CatalogSource:   raw.CatalogSource,
 		ActiveRootfs:    raw.ActiveRootfs,
 		ClonedFrom:      raw.ClonedFrom,
+		Init:            raw.Init,
 	}
 
 	// Fallback: if InstanceID is empty in metadata, use directory name
@@ -289,6 +323,7 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 		CatalogSource:   app.CatalogSource,
 		ActiveRootfs:    app.ActiveRootfs,
 		ClonedFrom:      app.ClonedFrom,
+		Init:            app.Init,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -335,6 +370,7 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, containerID stri
 	catalogSource := app.CatalogSource
 	activeRootfs := app.ActiveRootfs
 	clonedFrom := app.ClonedFrom
+	initState := app.Init
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem
@@ -352,6 +388,7 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, containerID stri
 		CatalogSource:   catalogSource,
 		ActiveRootfs:    activeRootfs,
 		ClonedFrom:      clonedFrom,
+		Init:            initState,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
@@ -391,6 +428,7 @@ func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 		CatalogSource:   app.CatalogSource,
 		ActiveRootfs:    app.ActiveRootfs,
 		ClonedFrom:      app.ClonedFrom,
+		Init:            app.Init,
 	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")

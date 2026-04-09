@@ -1478,6 +1478,102 @@ func (p *PodmanCLI) ExecShellCmd(runtime PodmanRuntime, containerID string) (*ex
 	return cmd, nil
 }
 
+// ExecScriptOptions configures non-interactive script execution inside a container.
+type ExecScriptOptions struct {
+	Shell      string            // Interpreter to run the script (default: "/bin/sh").
+	ScriptPath string            // Absolute path to the script inside the container.
+	Env        map[string]string // Environment variables injected via podman exec -e.
+	Timeout    time.Duration     // Maximum execution time. Zero means no timeout.
+}
+
+// ExecScript executes a script non-interactively inside a running container.
+// Returns the exit code, combined stdout+stderr output (capped at 1MB), and any error.
+func (p *PodmanCLI) ExecScript(ctx context.Context, runtime PodmanRuntime, containerID string, opts ExecScriptOptions) (int, string, error) {
+	if !isValidContainerID(containerID) {
+		return -1, "", fmt.Errorf("invalid container ID format: %s", containerID)
+	}
+
+	shell := opts.Shell
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+
+	// Build podman exec args: each -e K=V as separate args to avoid shell metachar issues.
+	execArgs := []string{"exec"}
+	// Sort env keys for deterministic ordering.
+	envKeys := make([]string, 0, len(opts.Env))
+	for k := range opts.Env {
+		envKeys = append(envKeys, k)
+	}
+	sort.Strings(envKeys)
+	for _, k := range envKeys {
+		execArgs = append(execArgs, "-e", k+"="+opts.Env[k])
+	}
+	execArgs = append(execArgs, containerID, shell, opts.ScriptPath)
+
+	args, err := BuildPodmanArgs(runtime, execArgs)
+	if err != nil {
+		return -1, "", err
+	}
+
+	// Apply timeout via context.
+	execCtx := ctx
+	if opts.Timeout > 0 {
+		var cancel context.CancelFunc
+		execCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		defer cancel()
+	}
+
+	cmd := podmanCmd(execCtx, runtime, args...)
+
+	// Capture stdout+stderr with a 1MB limit to prevent OOM from misbehaving scripts.
+	var buf limitedBuffer
+	buf.max = 1 << 20 // 1MB
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+
+	err = cmd.Run()
+	outStr := buf.String()
+
+	if err != nil {
+		// Check for timeout FIRST: context.WithTimeout + CommandContext returns
+		// *exec.ExitError with code -1 when the deadline fires, so checking exit
+		// code first would misclassify timeouts as generic exit failures.
+		if execCtx.Err() == context.DeadlineExceeded {
+			return -1, outStr, fmt.Errorf("script timed out after %s", opts.Timeout)
+		}
+		if code, ok := exitCode(err); ok {
+			return code, outStr, fmt.Errorf("script exited with code %d", code)
+		}
+		return -1, outStr, fmt.Errorf("exec failed: %w", err)
+	}
+
+	return 0, outStr, nil
+}
+
+// limitedBuffer is an io.Writer that caps total bytes written.
+type limitedBuffer struct {
+	buf []byte
+	max int
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	n := len(p) // preserve original length for io.Writer contract
+	remaining := b.max - len(b.buf)
+	if remaining <= 0 {
+		return n, nil // silently discard
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	b.buf = append(b.buf, p...)
+	return n, nil // always report full write to avoid io.ErrShortWrite
+}
+
+func (b *limitedBuffer) String() string {
+	return string(b.buf)
+}
+
 // SearchRegistry searches for images in container registries using podman search.
 // The query is passed directly to podman search. Results are limited by the limit parameter.
 func (p *PodmanCLI) SearchRegistry(ctx context.Context, runtime PodmanRuntime, query string, limit int) ([]ImageSearchResult, error) {
