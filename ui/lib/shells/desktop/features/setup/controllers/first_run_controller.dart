@@ -26,6 +26,7 @@ class FirstRunController extends ChangeNotifier {
     required this.onSystemError,
     required this.generateRecoveryKey,
     this.namekSuggestedHostname,
+    this.namekStatus,
     String? setupNonce,
   }) : _setupNonce = setupNonce {
     _step = isRemote ? FirstRunStep.credentials : FirstRunStep.welcome;
@@ -35,6 +36,9 @@ class FirstRunController extends ChangeNotifier {
   bool namekEnrolled;
   String? namekBaseDomain;
   String? namekSuggestedHostname;
+  // Tri-state signal from the backend: "enrolled" | "pending" | "unavailable".
+  // Null for legacy backends — UI treats null as "unavailable" branch.
+  String? namekStatus;
   final VoidCallback onComplete;
   final VoidCallback reRoute;
   final void Function(String error) onSystemError;
@@ -116,6 +120,7 @@ class FirstRunController extends ChangeNotifier {
         namekEnrolled = boot['namek_enrolled'] == true;
         namekBaseDomain = boot['namek_base_domain'] as String?;
         namekSuggestedHostname = boot['namek_suggested_hostname'] as String?;
+        namekStatus = boot['namek_status'] as String?;
         notifyListeners();
       }
     } on Object catch (_) {}

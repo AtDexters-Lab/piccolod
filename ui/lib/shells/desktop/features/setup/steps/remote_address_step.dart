@@ -12,6 +12,7 @@ class RemoteAddressStep extends StatefulWidget {
     required this.onSkip,
     required this.onRefresh,
     this.suggestedHostname,
+    this.status,
     this.error,
     this.isSubmitting = false,
     super.key,
@@ -22,6 +23,9 @@ class RemoteAddressStep extends StatefulWidget {
   final VoidCallback onSkip;
   final Future<void> Function() onRefresh;
   final String? suggestedHostname;
+  // Tri-state backend signal: "enrolled" | "pending" | "unavailable".
+  // Null for legacy backends — treated as "unavailable" (current-day copy).
+  final String? status;
   final String? error;
   final bool isSubmitting;
 
@@ -167,28 +171,56 @@ class _RemoteAddressStepState extends State<RemoteAddressStep> {
     final displayError = widget.error ?? _localError;
 
     if (!widget.enrolled) {
+      // Skip is preserved across both pending and unavailable sub-branches —
+      // never gate it on status. A late-arriving enrollment after Skip is
+      // harmless; Settings → Remote Access picks it up on next visit.
+      final isPending = widget.status == 'pending';
+      const pendingMessage =
+          'Your device is finishing remote access setup. Usually ready in under a minute.';
+      const unavailableMessage =
+          'Remote access is not available yet.\nYou can set it up later in Settings.';
       return Padding(
         padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(
-              PiccoloIcons.router,
-              size: 32,
-              color: PiccoloTheme.inkMuted,
+            // Reserve consistent vertical space across pending/unavailable so
+            // the transition between states does not visually jump.
+            SizedBox(
+              height: 48,
+              child: Center(
+                child: isPending
+                    ? const SizedBox(
+                        width: 32,
+                        height: 32,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 3,
+                          color: PiccoloTheme.cobalt600,
+                          semanticsLabel: 'Preparing remote access',
+                        ),
+                      )
+                    : const Icon(
+                        PiccoloIcons.router,
+                        size: 32,
+                        color: PiccoloTheme.inkMuted,
+                      ),
+              ),
             ),
             const SizedBox(height: 16),
-            Text(
-              'Remote access is not available yet.\nYou can set it up later in Settings.',
-              style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
-                color: PiccoloTheme.inkMuted,
+            Semantics(
+              liveRegion: true,
+              child: Text(
+                isPending ? pendingMessage : unavailableMessage,
+                style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+                  color: PiccoloTheme.inkMuted,
+                ),
+                textAlign: TextAlign.center,
               ),
-              textAlign: TextAlign.center,
             ),
             const SizedBox(height: 32),
             FilledButton(
               onPressed: widget.onSkip,
-              child: const Text('Continue'),
+              child: Text(isPending ? 'Skip for now' : 'Continue'),
             ),
           ],
         ),

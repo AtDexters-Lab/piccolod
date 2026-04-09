@@ -1092,18 +1092,33 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	_ = os.MkdirAll(swtpmStateDir, 0o700)
 
 	var tpmDevice tpm.Device
-	tpmResult, tpmErr := tpm.Open(akStateDir, swtpmStateDir)
+	var akRecovered bool
+	tpmResult, recoveredFlag, tpmErr := tpm.OpenWithAKRecovery(akStateDir, swtpmStateDir)
 	if tpmErr != nil {
-		log.Printf("WARN: TPM unavailable: %v (identity service will be limited)", tpmErr)
+		log.Printf("ERROR: TPM unavailable: %v (identity service will be limited)", tpmErr)
+		healthTracker.Setf("tpm", health.LevelError, fmt.Sprintf("TPM unavailable: %v", tpmErr))
 	} else {
 		tpmDevice = tpmResult.Device
 		s.tpmResult = tpmResult
+		akRecovered = recoveredFlag
+		if akRecovered {
+			log.Printf("WARN: tpm: stale AK blob was regenerated at boot; device will re-enroll with namek (if enabled)")
+		}
+		// Always set OK at boot — the TopicIdentityChanged subscriber below
+		// drives transitions to warn/error if a re-enrollment actually runs.
+		// This avoids a stale "re-enrolling" warn on fresh or disabled
+		// devices where no re-enrollment is scheduled.
+		healthTracker.Setf("tpm", health.LevelOK, "TPM available")
 	}
 
 	identityConfigPath := paths.CoreJoin("network-bootstrap", "remote", "identity.json")
 	identitySvc := identity.NewService(identityConfigPath, tpmDevice)
 	identitySvc.SetTPMDirs(akStateDir, swtpmStateDir)
 	identitySvc.SetEventsBus(eventsBus)
+	// SetAKRecovered must be called before supervisor.Register triggers Start().
+	// Start() reads s.akRecovered to decide whether to schedule a background
+	// re-enrollment; setting it after Start would silently no-op.
+	identitySvc.SetAKRecovered(akRecovered)
 	identitySvc.SetTPMReplacedHandler(func(old tpm.Device, newResult *tpm.OpenResult) {
 		// Close the full OpenResult (Device + SwtpmProc) to avoid leaking
 		// swtpm child processes on repeated AK recoveries.
@@ -1136,6 +1151,27 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			stunSvc.SetServers(servers)
 		}
 	})
+
+	// Health tracker transitions for the "tpm" component when boot-time AK
+	// recovery was invoked. This subscriber lives for the process lifetime
+	// (drained by busUnsubs on shutdown) so a later suspended→active flip
+	// can move the tracker from warn/error back to OK.
+	if akRecovered {
+		identityChangedCh, cancelIdentityChanged := eventsBus.SubscribeWithCancel(events.TopicIdentityChanged, 4)
+		s.busUnsubs = append(s.busUnsubs, cancelIdentityChanged)
+		go func() {
+			for range identityChangedCh {
+				switch identitySvc.Status().State {
+				case "suspended":
+					healthTracker.Setf("tpm", health.LevelError, "device suspended/revoked by namek")
+				case "recovering":
+					healthTracker.Setf("tpm", health.LevelWarn, "re-enrolling after AK recovery")
+				default:
+					healthTracker.Setf("tpm", health.LevelOK, "TPM available")
+				}
+			}
+		}()
+	}
 
 	s.supervisor.Register(identitySvc)
 

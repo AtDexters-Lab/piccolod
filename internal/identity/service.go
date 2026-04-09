@@ -3,9 +3,11 @@ package identity
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -55,6 +57,13 @@ type Service struct {
 	// Concurrency guard for boot-time auto-enrollment (separate from recovering
 	// to avoid semantic overload — recovering is for re-enrollment after auth failure).
 	autoEnrolling atomic.Bool
+
+	// akRecovered is set via SetAKRecovered before Start() when boot-time
+	// tpm.OpenWithAKRecovery regenerated a stale AK blob. When set, Start()
+	// schedules a background re-enrollment so the server-side AK pubkey is
+	// refreshed (otherwise the fast-path would start endpoint sync with an
+	// AK the server rejects).
+	akRecovered atomic.Bool
 
 	// Shutdown lifecycle: stopped prevents new recovery/sync goroutines after Stop(),
 	// recoverWg tracks in-flight recovery so Stop can wait for it.
@@ -125,7 +134,7 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 
 	if s.tpmDev == nil {
-		log.Printf("WARN: identity: TPM unavailable, identity service will be limited")
+		log.Printf("ERROR: identity: TPM unavailable, remote access will be disabled until TPM is recovered")
 		return nil // don't fail supervisor
 	}
 
@@ -151,6 +160,18 @@ func (s *Service) Start(ctx context.Context) error {
 		// Does not block supervisor startup. Retries with exponential backoff.
 		s.triggerAutoEnroll()
 	}
+
+	// Boot-time AK recovery signal: gin_server.go regenerated a stale AK,
+	// so the server's stored AK pubkey for cfg.DeviceID is now out of sync.
+	// Kick off a background re-enrollment via the runtime recovery path,
+	// which handles replayState, 409 device-conflict, and the recovering
+	// concurrency guard. The fast-path above still runs so endpoint sync
+	// can surface server-side states in parallel.
+	if s.akRecovered.Load() && cfg.DeviceID != "" {
+		log.Printf("WARN: identity: AK was recovered at boot; triggering background re-enrollment (device=%s)", cfg.DeviceID)
+		s.triggerReenrollWithRecovery("ak recovered at boot")
+	}
+
 	return nil
 }
 
@@ -217,8 +238,15 @@ func (s *Service) autoEnrollAtBoot() {
 			return
 		}
 
+		// Device-conflict 409: surface via suspended=true, fall through to
+		// backoff — do NOT exit the loop. When namek restores Active, the
+		// next attempt succeeds and finalizeEnrollment clears suspended.
+		if isDeviceConflictError(err) {
+			s.handleDeviceConflict(err, "auto-enrollment")
+		}
+
 		delay := backoffDelay(attempt, baseDelay, maxDelay, jitterFactor)
-		log.Printf("WARN: identity: auto-enrollment attempt %d failed: %v (retry in %v)", attempt+1, err, delay)
+		log.Printf("WARN: identity: auto-enrollment attempt %d failed: %s (retry in %v)", attempt+1, sanitizeErrForLog(err), delay)
 
 		timer := time.NewTimer(delay)
 		select {
@@ -310,6 +338,13 @@ func (s *Service) SetTPMReplacedHandler(fn func(old tpm.Device, newResult *tpm.O
 	s.mu.Unlock()
 }
 
+// SetAKRecovered signals that boot-time tpm.OpenWithAKRecovery regenerated a
+// stale AK blob. Must be called before Start(); Start() reads the flag to
+// decide whether to schedule a background re-enrollment.
+func (s *Service) SetAKRecovered(v bool) {
+	s.akRecovered.Store(v)
+}
+
 // NamekClient returns the current namekclient, or nil if not available.
 func (s *Service) NamekClient() *namekclient.Client {
 	s.mu.RLock()
@@ -386,6 +421,34 @@ func (s *Service) IsEnrolled() bool   { return s.enrolled.Load() }
 func (s *Service) IsEnabled() bool    { s.mu.RLock(); defer s.mu.RUnlock(); return s.cfg.Enabled }
 func (s *Service) IsAvailable() bool  { return s.available.Load() }
 func (s *Service) IsSuspended() bool  { return s.suspended.Load() }
+
+// SetupStatus returns a coarse signal for the setup UI: "enrolled",
+// "pending", or "unavailable". Ordering matters:
+//   - Terminal states first, so a suspended device never hangs at "pending"
+//     while its retry loop keeps running.
+//   - In-flight states next, so a previously-enrolled device whose AK was
+//     regenerated at boot reports "pending" while its background re-enroll
+//     runs (rather than "enrolled" — which would let the user attempt a
+//     hostname claim against a namek that still has the stale AK pubkey).
+//   - "enrolled" only when steady-state.
+//   - The fallback is "unavailable", not "pending": if the service is
+//     enabled and TPM is available but nothing is in-flight and we're not
+//     enrolled, no enrollment job is actually running (e.g., post
+//     SetEnabled(true) / SetNamekURL with no DeviceID and no autoEnroll
+//     trigger). Reporting "pending" would spin the UI forever; "unavailable"
+//     correctly tells the user there is nothing to wait for.
+func (s *Service) SetupStatus() string {
+	if s.suspended.Load() || !s.IsEnabled() || !s.available.Load() {
+		return "unavailable"
+	}
+	if s.autoEnrolling.Load() || s.recovering.Load() {
+		return "pending"
+	}
+	if s.enrolled.Load() {
+		return "enrolled"
+	}
+	return "unavailable"
+}
 
 // DeviceConfig returns a read-only snapshot of the identity config.
 func (s *Service) DeviceConfig() Config {
@@ -491,6 +554,10 @@ func (s *Service) SetEnabled(ctx context.Context, enabled bool) error {
 
 	if !enabled {
 		s.stopEndpointSync()
+		// Clear suspended on disable — see the rationale in reenrollWithRecovery's
+		// early-exit branch. suspended is a "namek says we're not Active" signal;
+		// if we're not asking namek, the flag is no longer meaningful.
+		s.suspended.Store(false)
 	}
 
 	// Reinitialize client if enabling and it was never created (e.g., started disabled).
@@ -593,6 +660,59 @@ var (
 	akRelatedErrors     = []string{"credential", "attestation key"}
 )
 
+// isDeviceConflictError reports whether err unwraps to an HTTP 409 from namek,
+// returned by enrollment handlers when the EK fingerprint matches a non-Active
+// device (Suspended, Revoked, PendingDeletion). Uses errors.As so the check
+// works through Service.Enroll's %w wrapping — substring matching on the
+// wrapped error text fails. Only valid at enrollment call sites.
+func isDeviceConflictError(err error) bool {
+	var apiErr *namekclient.APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict
+}
+
+// sanitizeErrForLog strips control characters (including newlines, carriage
+// returns, tabs, and ANSI escapes) from an error message before logging.
+// Namek HTTP error bodies are surfaced verbatim via APIError.Error(), and a
+// malicious or compromised namek server could otherwise inject fake log
+// entries by embedding "\n[FAKE LOG] ..." in a 4xx body.
+func sanitizeErrForLog(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == '\n' || r == '\r' || r == '\t' || r < 0x20 || r == 0x7f {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// handleDeviceConflict records a device-conflict (409) error from a retry
+// loop. It sets suspended=true and publishes a state-change event on the
+// transition from !suspended to suspended, so ERROR-level log and event
+// fire only once per stuck period — subsequent retries quietly loop at
+// backoff until the operator restores Active on namek and the next attempt
+// succeeds via finalizeEnrollment (which clears suspended).
+//
+// This is shared between autoEnrollAtBoot (fresh-device path) and
+// reenrollWithRecovery (already-enrolled path). The two loops are mutually
+// exclusive by precondition (autoEnrollAtBoot requires cfg.DeviceID == "",
+// reenrollWithRecovery requires enrolled == true), so the log-on-transition
+// guard is safe — a future refactor allowing both loops to coexist must
+// re-evaluate the guard.
+func (s *Service) handleDeviceConflict(err error, scope string) {
+	if !s.suspended.Load() {
+		log.Printf("ERROR: identity: %s rejected — device exists server-side but is not Active (likely suspended/revoked). Will continue to retry at backoff cap; restore Active status on namek to self-heal. (%s)", scope, sanitizeErrForLog(err))
+		s.suspended.Store(true)
+		s.publish(events.TopicIdentityChanged, nil)
+	}
+}
+
 // HandleTokenError handles authentication errors from namek token requests.
 // 401 → distinguishes error sub-types; 403 → publishes suspended state.
 func (s *Service) HandleTokenError(err error, httpStatus int) {
@@ -616,10 +736,13 @@ func (s *Service) HandleTokenError(err error, httpStatus int) {
 	}
 }
 
-// triggerReenrollWithRecovery launches reenrollWithRecovery in a goroutine
-// with the same concurrency guards as the old HandleTokenError 401 path.
+// triggerReenrollWithRecovery launches reenrollWithRecovery in a goroutine.
+// The recovering CAS runs synchronously so callers see a consistent
+// "recovering" state immediately after return — Start()'s boot-time
+// invocation relies on this to avoid a transient "enrolled" SetupStatus.
 func (s *Service) triggerReenrollWithRecovery(reason string) {
-	if s.recovering.Load() {
+	if !s.recovering.CompareAndSwap(false, true) {
+		log.Printf("INFO: identity: recovery already in progress, skipping (%s)", reason)
 		return
 	}
 	// RLock synchronizes with Stop()'s Lock: Add(1) completes before
@@ -627,6 +750,7 @@ func (s *Service) triggerReenrollWithRecovery(reason string) {
 	s.mu.RLock()
 	if s.stopped.Load() {
 		s.mu.RUnlock()
+		s.recovering.Store(false) // release the CAS we just acquired
 		return
 	}
 	s.recoverWg.Add(1)
@@ -640,12 +764,9 @@ func (s *Service) triggerReenrollWithRecovery(reason string) {
 }
 
 // reenrollWithRecovery re-enrolls with the existing AK and a recovery bundle.
-// Does NOT perform AK recovery. Falls back to recoverAndReenroll on AK-specific errors.
+// Caller (triggerReenrollWithRecovery) must have set s.recovering=true; this
+// function clears it on exit. Falls back to recoverAndReenroll on AK errors.
 func (s *Service) reenrollWithRecovery() {
-	if !s.recovering.CompareAndSwap(false, true) {
-		log.Printf("INFO: identity: recovery already in progress, skipping")
-		return
-	}
 	s.publish(events.TopicIdentityChanged, nil) // notify: entering recovery
 	defer func() {
 		s.recovering.Store(false)
@@ -667,7 +788,11 @@ func (s *Service) reenrollWithRecovery() {
 			return
 		}
 		// Abort if identity was reset (e.g., SetNamekURL) or feature disabled.
+		// Clear suspended on exit: it means "namek says we're not Active",
+		// which is no longer meaningful if we're not asking namek anymore.
+		// Leaving it latched would wedge SetupStatus until piccolod restart.
 		if !s.enrolled.Load() || !s.IsEnabled() {
+			s.suspended.Store(false)
 			log.Printf("INFO: identity: re-enrollment aborted (identity reset or disabled)")
 			return
 		}
@@ -713,8 +838,14 @@ func (s *Service) reenrollWithRecovery() {
 			return
 		}
 
+		// Device-conflict 409: see handleDeviceConflict / autoEnrollAtBoot
+		// sibling — fall through to backoff, self-heal on next success.
+		if isDeviceConflictError(err) {
+			s.handleDeviceConflict(err, "re-enrollment")
+		}
+
 		delay := backoffDelay(attempt, baseDelay, maxDelay, jitterFactor)
-		log.Printf("WARN: identity: re-enrollment attempt %d failed: %v (retry in %v)", attempt+1, err, delay)
+		log.Printf("WARN: identity: re-enrollment attempt %d failed: %s (retry in %v)", attempt+1, sanitizeErrForLog(err), delay)
 
 		timer := time.NewTimer(delay)
 		select {

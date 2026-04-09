@@ -193,11 +193,18 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 // bootSetupResponse builds the JSON response for the setup screen, including
 // setup-in-progress state and namek enrollment info. Used by both step 6
 // (crypto not initialized) and step 7b (crypto unlocked, setup incomplete).
+//
+// Derives namek_enrolled from SetupStatus() so both signals stay coherent:
+// a device flipped from Active→Suspended at runtime correctly reports
+// namek_enrolled: false even if the internal enrolled flag is still true,
+// eliminating contract drift between the two fields.
 func (s *GinServer) bootSetupResponse() gin.H {
 	resp := gin.H{"screen": bootScreenSetup, "setup_in_progress": s.isSetupInProgress()}
 	if s.identityService != nil {
-		enrolled := s.identityService.IsEnrolled()
+		status := s.identityService.SetupStatus()
+		enrolled := status == "enrolled"
 		resp["namek_enrolled"] = enrolled
+		resp["namek_status"] = status
 		if enrolled {
 			cfg := s.identityService.DeviceConfig()
 			resp["namek_base_domain"] = cfg.BaseDomain

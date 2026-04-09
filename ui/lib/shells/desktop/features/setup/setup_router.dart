@@ -225,6 +225,7 @@ class _SetupRouterState extends State<SetupRouter> {
     final namekEnrolled = boot['namek_enrolled'] == true;
     final baseDomain = boot['namek_base_domain'] as String?;
     final suggestedHostname = boot['namek_suggested_hostname'] as String?;
+    final namekStatus = boot['namek_status'] as String?;
     final isRemote = isOnRemoteDomain() && _setupNonce != null;
 
     final ctrl = FirstRunController(
@@ -232,6 +233,7 @@ class _SetupRouterState extends State<SetupRouter> {
       namekEnrolled: namekEnrolled,
       namekBaseDomain: baseDomain,
       namekSuggestedHostname: suggestedHostname,
+      namekStatus: namekStatus,
       onComplete: _onControllerComplete,
       reRoute: () => unawaited(_checkBoot()),
       onSystemError: (err) => setState(() => _systemError = err),
@@ -648,6 +650,7 @@ class _SetupRouterState extends State<SetupRouter> {
           enrolled: ctrl.namekEnrolled,
           baseDomain: ctrl.namekBaseDomain ?? '',
           suggestedHostname: ctrl.namekSuggestedHostname,
+          status: ctrl.namekStatus,
           onSubmit: ctrl.submitHostname,
           onSkip: ctrl.skipRemoteAddress,
           onRefresh: ctrl.refreshEnrollmentStatus,
