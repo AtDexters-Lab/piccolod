@@ -105,6 +105,11 @@ const (
 	// scratchFlattenVolumeID is the ephemeral thin LV used as backing store
 	// for flatten operations (image pull → export → golden LV creation).
 	scratchFlattenVolumeID = "scratch-flatten"
+
+	// cleanupBudget is the timeout for detached cleanup contexts used when the
+	// caller's context may have expired (e.g. install timeout). Must fit within
+	// the server's shutdown drain window to complete before systemd SIGKILL.
+	cleanupBudget = 60 * time.Second
 )
 
 // parseEnvSlice converts OCI-style env slice (KEY=VALUE) to a map.
@@ -1476,7 +1481,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	if err != nil {
 		// Volume was created but runtime setup failed. Clean up the volume and
 		// any partially-created resources (per-app user, runroot).
-		m.cleanupInstallResources(ctx, instanceID, container.PodmanRuntime{}, appDef)
+		m.cleanupInstallResources(instanceID, container.PodmanRuntime{}, appDef)
 		return nil, err
 	}
 
@@ -1485,7 +1490,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	cleanupResources := true
 	defer func() {
 		if cleanupResources {
-			m.cleanupInstallResources(ctx, instanceID, runtime, appDef)
+			m.cleanupInstallResources(instanceID, runtime, appDef)
 		}
 	}()
 
@@ -1527,18 +1532,22 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseRegisteringServices, 90, "Finalizing installation", false, nil)
 	if err := state.StoreApp(app); err != nil {
-		// Cleanup all containers if storage fails
+		// Cleanup all containers if storage fails.
+		// Use a detached context — the caller's ctx may be near expiry after
+		// a long pull + flatten phase.
+		storeCleanupCtx, storeCleanupCancel := context.WithTimeout(context.Background(), cleanupBudget)
+		defer storeCleanupCancel()
 		if app.NetworkAnchorID != "" {
-			_ = m.containerManager.StopContainer(ctx, runtime, app.NetworkAnchorID)
-			_ = m.containerManager.RemoveContainer(ctx, runtime, app.NetworkAnchorID)
+			_ = m.containerManager.StopContainer(storeCleanupCtx, runtime, app.NetworkAnchorID)
+			_ = m.containerManager.RemoveContainer(storeCleanupCtx, runtime, app.NetworkAnchorID)
 		}
 		for _, cid := range app.Containers {
-			_ = m.containerManager.StopContainer(ctx, runtime, cid)
-			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
+			_ = m.containerManager.StopContainer(storeCleanupCtx, runtime, cid)
+			_ = m.containerManager.RemoveContainer(storeCleanupCtx, runtime, cid)
 		}
 		// Cleanup rootfs.
 		mode := piccoloModeFromExtensions(appDef.Extensions)
-		m.detachAllServiceRootfs(ctx, instanceID, mode, appDef, nil)
+		m.detachAllServiceRootfs(storeCleanupCtx, instanceID, mode, appDef, nil)
 		m.serviceManager.RemoveApp(instanceID)
 		cleanupServices = false
 		// cleanupResources runs via defer: destroys volume, runroot, per-app user
@@ -1561,8 +1570,15 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 // cleanupInstallResources performs best-effort cleanup of resources created during
 // a failed install. This mirrors the cleanup sequence in uninstallLocked to prevent
 // orphaned volumes, podman state, and per-app users from leaking on install failure.
-func (m *AppManager) cleanupInstallResources(ctx context.Context, instanceID string, runtime container.PodmanRuntime, appDef *api.AppDefinition) {
+//
+// Uses a detached context internally — the caller's context may have expired
+// (e.g. install timeout), but cleanup must still run to prevent resource leaks.
+// The 60s budget fits within the server's shutdown drain window.
+func (m *AppManager) cleanupInstallResources(instanceID string, runtime container.PodmanRuntime, appDef *api.AppDefinition) {
 	log.Printf("INFO: cleaning up resources for failed install: %s", instanceID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupBudget)
+	defer cancel()
 
 	// Destroy block-native rootfs if it was partially created.
 	// Best-effort: detach + destroy + GC before cleaning up the data volume.
@@ -1676,7 +1692,7 @@ func (m *AppManager) cloneWorkspaceLocked(ctx context.Context, originID, cloneID
 	}
 	runtime, err := m.podmanRuntimeForApp(cloneID, layout, ModeWorkspace)
 	if err != nil {
-		m.cleanupInstallResources(ctx, cloneID, container.PodmanRuntime{}, originDef)
+		m.cleanupInstallResources(cloneID, container.PodmanRuntime{}, originDef)
 		return nil, fmt.Errorf("clone %s from %s: podman runtime: %w", cloneID, originID, err)
 	}
 
@@ -1693,12 +1709,15 @@ func (m *AppManager) cloneWorkspaceLocked(ctx context.Context, originID, cloneID
 		if cleanupRootfs {
 			rootfsMgr := m.currentRootfsManager()
 			if rootfsMgr != nil {
-				rootfsMgr.DetachRootfs(ctx, rootfsVolumeID)
-				rootfsMgr.DestroyRootfs(ctx, rootfsVolumeID)
+				// Use a detached context — the caller's ctx may have expired.
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupBudget)
+				defer cancel()
+				rootfsMgr.DetachRootfs(cleanupCtx, rootfsVolumeID)
+				rootfsMgr.DestroyRootfs(cleanupCtx, rootfsVolumeID)
 			}
 		}
 		if cleanupResources {
-			m.cleanupInstallResources(ctx, cloneID, runtime, originDef)
+			m.cleanupInstallResources(cloneID, runtime, originDef)
 		}
 	}()
 

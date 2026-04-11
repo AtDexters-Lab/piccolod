@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,6 +46,44 @@ var ErrDynamicPortUpdateNotSupported = errors.New("podman does not support dynam
 // ErrPortReconciliationRequired indicates that the container's published ports
 // do not match the expected ports and the container needs to be recreated.
 var ErrPortReconciliationRequired = errors.New("container port bindings do not match expected; recreation required")
+
+// PullStallError indicates an image pull was aborted because no download
+// progress (byte progress or PTY I/O) was observed for an extended period.
+type PullStallError struct {
+	Image           string
+	StallDuration   time.Duration
+	DownloadedBytes int64
+	TotalBytes      int64
+}
+
+func (e *PullStallError) Error() string {
+	return fmt.Sprintf("pull stalled: no progress for %s (downloaded %s/%s) for image %s",
+		e.StallDuration.Truncate(time.Second), formatBytesCompact(e.DownloadedBytes), formatBytesCompact(e.TotalBytes), e.Image)
+}
+
+const (
+	// pullWatchdogInterval is the tick rate for the pull progress watchdog.
+	// Stall duration and PTY-liveness grace window are derived from this value.
+	pullWatchdogInterval = 30 * time.Second
+
+	// pullStallTicks is the number of consecutive watchdog ticks with zero byte
+	// progress AND zero PTY I/O before a pull is declared stalled.
+	// 10 ticks = 5 minutes. This balances detection speed against tolerance for
+	// slow or bursty connections (TCP keepalive ~2 min handles truly dead connections).
+	pullStallTicks = 10
+)
+
+// killProcess sends SIGTERM followed by SIGKILL after 5 seconds.
+// Safe to call on an already-exited process (signals return errors that are discarded).
+func killProcess(p *os.Process) {
+	if p == nil {
+		return
+	}
+	_ = p.Signal(syscall.SIGTERM)
+	time.AfterFunc(5*time.Second, func() {
+		_ = p.Kill()
+	})
+}
 
 // PodmanCLI provides safe Podman CLI integration with injection prevention
 type PodmanCLI struct{}
@@ -1740,6 +1779,20 @@ func parseBytes(numStr, unit string) int64 {
 	return int64(val * multiplier)
 }
 
+// formatBytesCompact formats bytes for log messages (e.g. "150MB", "2.1GB").
+func formatBytesCompact(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%dB", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
 // report generates an ImagePullReport from current state.
 func (p *pullProgressParser) report() ImagePullReport {
 	p.mu.Lock()
@@ -1867,36 +1920,83 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 	go func() {
 		select {
 		case <-ctx.Done():
-			if cmd.Process != nil {
-				// Send SIGTERM for graceful shutdown
-				_ = cmd.Process.Signal(syscall.SIGTERM)
-				// Give 5 seconds for graceful shutdown, then SIGKILL
-				time.AfterFunc(5*time.Second, func() {
-					if cmd.Process != nil {
-						_ = cmd.Process.Kill()
-					}
-				})
-			}
+			killProcess(cmd.Process)
 		case <-done:
 			// Normal completion
 		}
 	}()
 
-	// Watchdog: log periodically while pull is in progress
-	watchdog := time.NewTicker(30 * time.Second)
+	parser := newPullProgressParser(image)
+
+	// Stall detection state. Both signals must be silent for pullStallTicks
+	// consecutive ticks before declaring a stall:
+	//   1. Byte progress: parser.report().DownloadedBytes hasn't advanced
+	//   2. PTY I/O liveness: no bytes read from PTY (covers slow connections
+	//      where podman receives data but doesn't emit parseable progress lines)
+	var stallDetected atomic.Bool
+	var lastPTYReadNano atomic.Int64
+	lastPTYReadNano.Store(time.Now().UnixNano())
+
+	// Watchdog: log periodically + stall detection
+	watchdog := time.NewTicker(pullWatchdogInterval)
 	go func() {
 		defer watchdog.Stop()
+		var prevBytes int64
+		var stallCount int
 		for {
 			select {
 			case <-watchdog.C:
-				log.Printf("INFO: PullImageWithProgress: still waiting for podman pull %s (pid=%d)", image, cmd.Process.Pid)
+				report := parser.report()
+				downloaded := report.DownloadedBytes
+				total := report.TotalBytes
+				pct := report.OverallPercent
+
+				// Check for progress via either signal.
+				byteProgress := downloaded > prevBytes
+				ptyAlive := time.Since(time.Unix(0, lastPTYReadNano.Load())) < pullWatchdogInterval+5*time.Second
+
+				if byteProgress || ptyAlive {
+					stallCount = 0
+					prevBytes = downloaded
+				} else {
+					// Count stall ticks unless all layers are already "done"/"exists"
+					// (post-download extraction/verification is local CPU work, not
+					// a network stall). Covers both:
+					//  - Pre-download hang (no layers yet: auth/TLS/manifest resolution)
+					//  - Mid-download hang (layers actively downloading)
+					allComplete := len(report.Layers) > 0
+					for _, l := range report.Layers {
+						if l.Status != "done" && l.Status != "exists" {
+							allComplete = false
+							break
+						}
+					}
+					if !allComplete {
+						stallCount++
+					}
+				}
+
+				if stallCount > 0 {
+					log.Printf("INFO: PullImageWithProgress: still waiting for podman pull %s (pid=%d, %s/%s, %d%%, stall: %d/%d)",
+						image, cmd.Process.Pid, formatBytesCompact(downloaded), formatBytesCompact(total), pct, stallCount, pullStallTicks)
+				} else {
+					log.Printf("INFO: PullImageWithProgress: still waiting for podman pull %s (pid=%d, %s/%s, %d%%)",
+						image, cmd.Process.Pid, formatBytesCompact(downloaded), formatBytesCompact(total), pct)
+				}
+
+				if stallCount >= pullStallTicks {
+					stallDuration := time.Duration(stallCount) * pullWatchdogInterval
+					log.Printf("WARN: PullImageWithProgress: pull stalled for %s with no progress — aborting (downloaded %s/%s)",
+						stallDuration, formatBytesCompact(downloaded), formatBytesCompact(total))
+					stallDetected.Store(true)
+					killProcess(cmd.Process)
+					return
+				}
 			case <-done:
 				return
 			}
 		}
 	}()
-
-	parser := newPullProgressParser(image)
 
 	// Emit initial progress
 	callback(ImagePullReport{
@@ -1945,6 +2045,9 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 			if n == 0 {
 				continue
 			}
+
+			// Update PTY-liveness signal for stall detection.
+			lastPTYReadNano.Store(time.Now().UnixNano())
 
 			// Process the bytes
 			data := string(buf[:n])
@@ -2000,13 +2103,36 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 	callback(finalReport)
 
 	if cmdErr != nil {
-		// Check if it was due to context cancellation
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+		// Always log the diagnostic tail on failure — context cancellation is
+		// often a symptom; the tail reveals the underlying cause (manifest
+		// unknown, rate limit, network error, etc.).
 		tail := getTail()
 		if tail != "" {
 			log.Printf("WARN: PullImageWithProgress: podman pull %s output tail:\n%s", image, tail)
+		}
+		// Check stall detection first — it's more specific than a generic
+		// context timeout and provides structured diagnostic data.
+		if stallDetected.Load() {
+			report := parser.report()
+			return &PullStallError{
+				Image:           image,
+				StallDuration:   time.Duration(pullStallTicks) * pullWatchdogInterval,
+				DownloadedBytes: report.DownloadedBytes,
+				TotalBytes:      report.TotalBytes,
+			}
+		}
+		if ctx.Err() != nil {
+			if tail != "" {
+				// Surface the last meaningful output line in the error so it
+				// reaches the UI. Truncate to prevent oversized error messages.
+				lines := strings.Split(strings.TrimSpace(tail), "\n")
+				lastLine := lines[len(lines)-1]
+				if len(lastLine) > 200 {
+					lastLine = lastLine[:200]
+				}
+				return fmt.Errorf("%w (last output: %s)", ctx.Err(), lastLine)
+			}
+			return ctx.Err()
 		}
 		return fmt.Errorf("podman pull failed: %w", cmdErr)
 	}

@@ -27,6 +27,13 @@ import (
 	"piccolod/internal/services"
 )
 
+// Operation timeouts for app lifecycle handlers. These are safety ceilings —
+// the real liveness check for pulls is the stall detector in PullImageWithProgress.
+const (
+	installTimeout        = 45 * time.Minute // image pull + flatten + container create + init scripts
+	cloneWorkspaceTimeout = 10 * time.Minute // LV snapshot + anchor pull + container create
+)
+
 var (
 	cachedHostTimezone string
 	hostTimezoneOnce   sync.Once
@@ -644,7 +651,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 
 	// Install a new app instance.
 	// Decouple from HTTP request context — installs must survive connection drops.
-	installCtx, cancelInstall := s.opContext(c, 30*time.Minute)
+	installCtx, cancelInstall := s.opContext(c, installTimeout)
 	defer cancelInstall()
 	if catalogSource != "" {
 		installCtx = app.WithCatalogSource(installCtx, catalogSource)
@@ -1076,7 +1083,7 @@ func (s *GinServer) handleGinAppClone(c *gin.Context) {
 	}
 	cloneName := strings.TrimSpace(body.Name)
 
-	ctx, cancel := s.opContext(c, 2*time.Minute)
+	ctx, cancel := s.opContext(c, cloneWorkspaceTimeout)
 	defer cancel()
 	inst, err := s.appManager.CloneWorkspace(ctx, originName, cloneName)
 	if err != nil {
