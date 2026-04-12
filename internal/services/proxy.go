@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -86,6 +87,14 @@ type ProxyManager struct {
 	proxyOIDC           *ProxyOIDCHandler
 	sessionStore        *auth.SessionStore
 	localHostnameGetter func() string
+
+	// OIDC authorize URL rewriting for oidc_passthrough apps (WAN only).
+	// The proxy rewrites the stable LAN-based authorization URL to the
+	// correct portal origin for each WAN request. The issuer origin is a
+	// closure (not a snapshot) so it tracks hostname/IP changes — important
+	// when mDNS is disabled and the value comes from getPreferredOutboundIP.
+	oidcIssuerOriginFn func() string
+	oidcAuthorizePaths map[string][]string // app name → authorize_paths from manifest
 }
 
 func NewProxyManager() *ProxyManager {
@@ -291,6 +300,45 @@ func (p *ProxyManager) SetProxyOIDCConfig(config ProxyOIDCConfig) {
 	p.mu.Unlock()
 }
 
+// SetOIDCIssuerOrigin sets a callback that returns the stable LAN-based origin
+// the OIDC discovery document advertises for the authorization_endpoint
+// (e.g., "http://piccolo-abc123.local"). The callback is invoked per-request
+// so the proxy tracks hostname/IP changes (e.g., when mDNS is disabled and the
+// value comes from getPreferredOutboundIP). Must match the discovery handler's
+// authorization_endpoint origin exactly.
+func (p *ProxyManager) SetOIDCIssuerOrigin(fn func() string) {
+	if fn == nil {
+		log.Printf("ERROR: SetOIDCIssuerOrigin called with nil function, OIDC rewriting disabled")
+		return
+	}
+	p.mu.Lock()
+	p.oidcIssuerOriginFn = fn
+	p.mu.Unlock()
+	log.Printf("INFO: OIDC issuer origin function configured for proxy rewriting")
+}
+
+// SetOIDCAuthorizePaths stores the authorize_paths from an app's manifest.
+// These paths scope Layer 2 body rewriting for OIDC authorization URLs.
+func (p *ProxyManager) SetOIDCAuthorizePaths(appName string, paths []string) {
+	p.mu.Lock()
+	if p.oidcAuthorizePaths == nil {
+		p.oidcAuthorizePaths = make(map[string][]string)
+	}
+	if len(paths) > 0 {
+		p.oidcAuthorizePaths[appName] = paths
+	} else {
+		delete(p.oidcAuthorizePaths, appName)
+	}
+	p.mu.Unlock()
+}
+
+// ClearOIDCAuthorizePaths removes the authorize_paths for an app.
+func (p *ProxyManager) ClearOIDCAuthorizePaths(appName string) {
+	p.mu.Lock()
+	delete(p.oidcAuthorizePaths, appName)
+	p.mu.Unlock()
+}
+
 // SetAllowedAncestors updates the list of hostnames allowed to frame apps.
 // It constructs a CSP frame-ancestors directive including default local origins and wildcard ports.
 func (p *ProxyManager) SetAllowedAncestors(hosts []string) {
@@ -475,6 +523,11 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		// XHR/fetch from within the iframe can propagate CHIPS context.
 		if proxyContextNeedsMarker(resp.Request.Context()) {
 			resp.Header.Add("Set-Cookie", embeddedMarkerSetCookie())
+		}
+
+		// OIDC authorize URL rewriting for WAN requests.
+		if snap, ok := resp.Request.Context().Value(proxyOIDCRewriteContextKey{}).(*oidcRewriteSnapshot); ok && snap != nil {
+			rewriteOIDCAuthorizeResponse(resp, snap, ep.App)
 		}
 
 		return nil
@@ -691,6 +744,28 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		needsMarker := needsEmbeddedMarker(r)
 		stripAndRewriteRequestCookies(r, ep.App, rewriteCookies)
 		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies, partitionCookies, needsMarker)
+
+		// Snapshot OIDC rewrite state for WAN authorize URL rewriting.
+		if RequestArrivedViaTLS(r) {
+			p.mu.Lock()
+			issuerOriginFn := p.oidcIssuerOriginFn
+			authPaths := p.oidcAuthorizePaths[ep.App]
+			portalOriginFn := p.portalOrigin
+			p.mu.Unlock()
+
+			if issuerOriginFn != nil && portalOriginFn != nil {
+				issuerOrigin := issuerOriginFn()
+				portal := portalOriginFn(r)
+				if issuerOrigin != "" && portal != "" {
+					snap := &oidcRewriteSnapshot{
+						issuerOrigin:   issuerOrigin,
+						portalOrigin:   portal,
+						authorizePaths: authPaths,
+					}
+					r = r.WithContext(context.WithValue(r.Context(), proxyOIDCRewriteContextKey{}, snap))
+				}
+			}
+		}
 
 		applyForwardHeaders(r, ep)
 
@@ -1030,6 +1105,171 @@ func RequestArrivedViaTLS(r *http.Request) bool {
 	}
 	return false
 }
+
+// oidcAuthorizeRewriteMaxBody is the maximum response body size for Layer 2
+// body rewriting. Responses larger than this are passed through unmodified.
+const oidcAuthorizeRewriteMaxBody = 1 << 20 // 1 MB
+
+// rewriteOIDCAuthorizeResponse performs dual-layer OIDC authorization URL
+// rewriting for WAN requests. Layer 1 rewrites Location headers on 3xx
+// responses. Layer 2 rewrites response bodies on declared authorize_paths.
+func rewriteOIDCAuthorizeResponse(resp *http.Response, snap *oidcRewriteSnapshot, appName string) {
+	oldURL := snap.issuerOrigin + "/oauth/authorize"
+	newURL := snap.portalOrigin + "/oauth/authorize"
+
+	// Layer 1: Location header rewrite on 3xx responses.
+	// Match the exact authorize URL or one followed by '?' (query string) or '/'
+	// (subpath) to avoid matching unrelated paths like .../authorize_token.
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		if loc := resp.Header.Get("Location"); loc != "" {
+			if loc == oldURL || strings.HasPrefix(loc, oldURL+"?") || strings.HasPrefix(loc, oldURL+"/") || strings.HasPrefix(loc, oldURL+"#") {
+				resp.Header.Set("Location", newURL+loc[len(oldURL):])
+				log.Printf("DEBUG: OIDC rewrite L1: app=%s location rewritten", appName)
+			}
+		}
+	}
+
+	// Layer 2: Body text replacement on declared authorize_paths.
+	if len(snap.authorizePaths) == 0 {
+		return
+	}
+	reqPath := ""
+	if resp.Request != nil && resp.Request.URL != nil {
+		reqPath = resp.Request.URL.Path
+	}
+	pathMatch := false
+	for _, ap := range snap.authorizePaths {
+		if reqPath == ap {
+			pathMatch = true
+			break
+		}
+	}
+	if !pathMatch {
+		return
+	}
+
+	// Only rewrite text-based content types. Reuses the proxy's existing
+	// compressible-types definition (mime.ParseMediaType-based, handles
+	// charset suffixes correctly).
+	if !isCompressibleContentType(resp.Header.Get("Content-Type")) {
+		return
+	}
+
+	// Skip compressed responses — we cannot rewrite without decompressing.
+	if resp.Header.Get("Content-Encoding") != "" {
+		log.Printf("WARN: OIDC rewrite L2 skipped (Content-Encoding present): app=%s path=%s", appName, reqPath)
+		return
+	}
+
+	// Pre-check Content-Length to avoid consuming oversized responses.
+	if resp.ContentLength > oidcAuthorizeRewriteMaxBody {
+		log.Printf("WARN: OIDC rewrite L2 skipped (Content-Length %d > %d): app=%s path=%s", resp.ContentLength, oidcAuthorizeRewriteMaxBody, appName, reqPath)
+		return
+	}
+
+	// Read up to maxBody+1 bytes to detect oversize from chunked responses.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, oidcAuthorizeRewriteMaxBody+1))
+	if err != nil {
+		// Splice the read bytes back so the downstream client gets the full body.
+		// Preserve the original Closer so resources are released correctly.
+		log.Printf("WARN: OIDC rewrite L2 body read error: app=%s path=%s err=%v", appName, reqPath, err)
+		resp.Body = &spliceCloser{
+			Reader: io.MultiReader(bytes.NewReader(body), resp.Body),
+			closer: resp.Body,
+		}
+		return
+	}
+	if int64(len(body)) > oidcAuthorizeRewriteMaxBody {
+		// Body exceeded the limit. Splice back the consumed portion plus the
+		// rest of the original body so nothing is truncated.
+		log.Printf("WARN: OIDC rewrite L2 skipped (body too large: >%d bytes): app=%s path=%s", oidcAuthorizeRewriteMaxBody, appName, reqPath)
+		resp.Body = &spliceCloser{
+			Reader: io.MultiReader(bytes.NewReader(body), resp.Body),
+			closer: resp.Body,
+		}
+		return
+	}
+
+	// Body fully read; safe to close the original.
+	resp.Body.Close()
+
+	// Empty body — nothing to do.
+	if len(body) == 0 {
+		resp.Body = io.NopCloser(bytes.NewReader(nil))
+		resp.ContentLength = 0
+		resp.Header.Set("Content-Length", "0")
+		return
+	}
+
+	// Replace the authorize URL pattern, matching only when followed by a
+	// valid URL boundary to avoid false positives like `/oauth/authorize_token`.
+	// This mirrors Layer 1's boundary check.
+	newBody, count := replaceAuthorizeURL(body, []byte(oldURL), []byte(newURL))
+	if count == 0 {
+		log.Printf("WARN: OIDC rewrite L2 matched path but zero replacements: app=%s path=%s", appName, reqPath)
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(newBody))
+	resp.ContentLength = int64(len(newBody))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+	resp.Header.Del("Transfer-Encoding")
+	log.Printf("DEBUG: OIDC rewrite L2: app=%s path=%s replacements=%d oldSize=%d newSize=%d", appName, reqPath, count, len(body), len(newBody))
+}
+
+// replaceAuthorizeURL replaces `old` with `new` in `body`, but only when the
+// match is followed by a valid URL boundary (end-of-buffer or one of the
+// characters that legitimately terminate a URL in HTML/JSON/JS contexts).
+// This prevents false positives like `/oauth/authorize_token`.
+func replaceAuthorizeURL(body, old, new []byte) ([]byte, int) {
+	if len(old) == 0 {
+		return body, 0
+	}
+	var out bytes.Buffer
+	out.Grow(len(body))
+	count := 0
+	i := 0
+	for {
+		j := bytes.Index(body[i:], old)
+		if j < 0 {
+			out.Write(body[i:])
+			break
+		}
+		matchStart := i + j
+		matchEnd := matchStart + len(old)
+		if matchEnd == len(body) || isURLBoundary(body[matchEnd]) {
+			out.Write(body[i:matchStart])
+			out.Write(new)
+			count++
+			i = matchEnd
+		} else {
+			// Not a boundary match — keep original bytes up to and including the prefix
+			// and advance past the first byte of the match to allow overlapping searches.
+			out.Write(body[i : matchStart+1])
+			i = matchStart + 1
+		}
+	}
+	return out.Bytes(), count
+}
+
+// isURLBoundary reports whether b is a character that legitimately terminates
+// a URL in HTML/JSON/JS contexts.
+func isURLBoundary(b byte) bool {
+	switch b {
+	case '?', '#', '/', '"', '\'', '<', '>', ' ', '\t', '\n', '\r', ',', ';', ')', '}', ']', '\\':
+		return true
+	}
+	return false
+}
+
+// spliceCloser combines a Reader (typically a MultiReader) with the original
+// body's Closer so the downstream HTTP transport closes the underlying body.
+type spliceCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (s *spliceCloser) Close() error { return s.closer.Close() }
 
 // computeRequestOrigin computes the canonical origin (scheme://host[:port]) for a request.
 // Used for session origin binding per RFC 20260122 §6.1.

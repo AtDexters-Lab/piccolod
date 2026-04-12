@@ -530,6 +530,7 @@ func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *F
 		if err != nil {
 			return fmt.Errorf("allocate service ports: %w", err)
 		}
+		m.configureOIDCAuthorizePaths(appInst.InstanceID, def)
 
 		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, layout, runtime, endpoints, prebuiltRootfs)
 		if err == nil {

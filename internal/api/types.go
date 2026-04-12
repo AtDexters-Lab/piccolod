@@ -311,6 +311,12 @@ type ServiceOIDCClient struct {
 	// Example: ["myapp://callback", "http://localhost:8081/callback"]
 	RedirectURIs []string `yaml:"redirect_uris,omitempty" json:"redirect_uris,omitempty"`
 
+	// AuthorizePaths declares app paths whose responses may contain the OIDC
+	// authorization URL and need proxy-side rewriting for WAN access.
+	// Only responses on these exact paths with text content types are rewritten.
+	// Example: ["/auth/login", "/api/oauth/authorize"]
+	AuthorizePaths []string `yaml:"authorize_paths,omitempty" json:"authorize_paths,omitempty"`
+
 	CAMountPath string            `yaml:"ca_mount_path" json:"ca_mount_path"`
 	Env         map[string]string `yaml:"env" json:"env"`
 }

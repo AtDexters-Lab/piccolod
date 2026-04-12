@@ -14,6 +14,15 @@ type proxyAppHostContextKey struct{}
 type proxyCookieRewriteContextKey struct{}
 type proxyPartitionCookiesContextKey struct{}
 type proxyNeedsMarkerContextKey struct{}
+type proxyOIDCRewriteContextKey struct{}
+
+// oidcRewriteSnapshot holds OIDC rewrite state captured under lock in the
+// request handler and threaded into ModifyResponse via request context.
+type oidcRewriteSnapshot struct {
+	issuerOrigin   string   // e.g., "http://piccolo-abc123.local"
+	portalOrigin   string   // e.g., "https://slug.piccolospace.com"
+	authorizePaths []string // app's declared authorize_paths
+}
 
 // Cookie names for Piccolo sessions and OIDC flows
 const (

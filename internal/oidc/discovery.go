@@ -6,27 +6,24 @@ import (
 	"net/http"
 )
 
-// DiscoveryConfig configures the dynamic discovery endpoint.
+// DiscoveryConfig configures the discovery endpoint.
 type DiscoveryConfig struct {
 	// StableIssuer is the canonical issuer (e.g., "https://piccolo-<machineId>.local")
 	StableIssuer string
 
-	// IsRemoteActive returns true if remote/WAN access is enabled
-	IsRemoteActive func() bool
-
-	// GetPortalHostname returns the portal hostname for WAN access
-	GetPortalHostname func() string
-
-	// GetLocalHostname returns the local hostname for LAN access (e.g., "piccolo.local",
-	// "piccolo-abc123.local", or an IP address if mDNS is disabled)
+	// GetLocalHostname returns the stable local hostname for the authorization
+	// endpoint (e.g., "piccolo-abc123.local" via SpecificHostname, or an IP
+	// address if mDNS is disabled). The proxy rewrites this to the correct
+	// portal origin for WAN requests.
 	GetLocalHostname func() string
 
 	// Logger for discovery handler warnings
 	Logger *slog.Logger
 }
 
-// DiscoveryHandler returns a handler for /.well-known/openid-configuration
-// that implements the "Stable Issuer, Dynamic Discovery" strategy.
+// DiscoveryHandler returns a handler for /.well-known/openid-configuration.
+// The authorization_endpoint always uses the stable LAN hostname — the proxy
+// rewrites it to the correct portal origin for WAN access per-request.
 type DiscoveryHandler struct {
 	config DiscoveryConfig
 }
@@ -63,37 +60,21 @@ type OpenIDConfiguration struct {
 
 // ServeHTTP handles the discovery request.
 func (h *DiscoveryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Issuer is the machine-specific issuer (e.g., "https://piccolo-<machineId>.local").
-	// Only the authorization_endpoint varies based on LAN/WAN state.
-	// All back-channel endpoints (token, jwks, userinfo) use the issuer.
 	issuer := h.config.StableIssuer
 
-	// Determine the authorization endpoint based on remote state (front-channel)
-	var authEndpoint string
-	if h.config.IsRemoteActive != nil && h.config.IsRemoteActive() {
-		// Remote is active: use portal hostname for browser-facing authorization
-		if h.config.GetPortalHostname != nil {
-			portalHost := h.config.GetPortalHostname()
-			if portalHost != "" {
-				authEndpoint = "https://" + portalHost + "/oauth/authorize"
-			}
+	// Authorization endpoint always uses the stable LAN hostname.
+	// The proxy rewrites this to the correct portal for WAN requests.
+	localHost := "piccolo.local"
+	if h.config.GetLocalHostname != nil {
+		if lh := h.config.GetLocalHostname(); lh != "" {
+			localHost = lh
 		}
 	}
-	if authEndpoint == "" {
-		// Local only or no portal hostname: use local hostname for LAN authorization.
-		// This allows the browser to reach the authorization endpoint on LAN without TLS issues.
-		localHost := "piccolo.local" // fallback
-		if h.config.GetLocalHostname != nil {
-			if lh := h.config.GetLocalHostname(); lh != "" {
-				localHost = lh
-			}
-		}
-		authEndpoint = "http://" + localHost + "/oauth/authorize"
-	}
+	authEndpoint := "http://" + localHost + "/oauth/authorize"
 
 	config := OpenIDConfiguration{
 		Issuer:                issuer,
-		AuthorizationEndpoint: authEndpoint, // Dynamic based on remote state
+		AuthorizationEndpoint: authEndpoint,
 		TokenEndpoint:         issuer + "/oauth/token",
 		UserinfoEndpoint:      issuer + "/oauth/userinfo",
 		JwksURI:               issuer + "/oauth/jwks",
@@ -156,7 +137,6 @@ func (h *DiscoveryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	if err := json.NewEncoder(w).Encode(config); err != nil {
 		h.config.Logger.Warn("failed to encode OIDC discovery", "error", err)
-		// Note: headers already sent, can't change status code at this point
 	}
 }
 

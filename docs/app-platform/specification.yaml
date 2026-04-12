@@ -191,6 +191,15 @@ services:
         # These are used as-is without origin expansion.
         - "app.example:///oauth-callback"
         - "http://localhost:8081/callback"
+      authorize_paths:
+        # Optional: app paths whose responses contain the OIDC authorization URL.
+        # Used by the proxy to rewrite the LAN-based authorization_endpoint to
+        # the correct portal origin for WAN access. Only responses on these
+        # exact paths (text content types only) are rewritten. Required for
+        # apps that embed the authorization URL in API responses (e.g., AJAX
+        # POSTs returning JSON with a redirect URL).
+        - /auth/login
+        - /api/oauth/authorize
       ca_mount_path: /etc/ssl/certs/piccolo-internal-ca.crt # REQUIRED
       env: # REQUIRED (may be templated)
         ISSUER_URL: "{{ .System.Auth.Issuer }}"

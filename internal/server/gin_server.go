@@ -138,12 +138,6 @@ type GinServer struct {
 	updateManager  osUpdateManager
 	catalogManager *catalog.Manager
 
-	// Remote state tracking for OIDC app cache busting
-	remoteStateMu         sync.Mutex
-	remoteStateHosts      string // sorted, joined host list for diff detection
-	oidcRestartTimer      *time.Timer
-	oidcRestartDebounceMs int
-
 	// OIDC Provider (cached)
 	oidcProvider   *oidc.Provider
 	oidcProviderMu sync.Mutex
@@ -912,6 +906,13 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		})
 
 		svcMgr.ProxyManager().SetPortalOriginResolver(s.portalOriginForRequest)
+
+		// OIDC authorize URL rewriting: set the stable LAN-based issuer origin
+		// that the proxy rewrites to the correct portal for WAN requests.
+		// Pass a closure so the value tracks hostname/IP changes (mDNS-disabled).
+		svcMgr.ProxyManager().SetOIDCIssuerOrigin(func() string {
+			return "http://" + s.oidcLocalHostname()
+		})
 
 		// RFC 20260112: alias-domain warnings for protected/headers strategies.
 		// The callback receives host and DerivedHostLabel (not listener name).
@@ -2385,11 +2386,6 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 			log.Printf("WARN: unlock reload failed: %v", err)
 		}
 	}
-
-	// Retry OIDC app restart — earlier attempts may have been skipped while
-	// persistence was locked. This is stateless: restartOIDCApps computes
-	// from current runtime state (app list, OIDC flags, running status).
-	s.scheduleOIDCAppsRestart()
 }
 
 // subscribeCertRefresh watches for hostname/leadership changes to regenerate cert SANs.
@@ -2557,11 +2553,6 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 			}
 		}
 	}
-
-	// Detect remote state transition and schedule OIDC app restart.
-	// Uses the unified portal hosts list so transitions from either source
-	// (self-hosted or namek) trigger a restart.
-	s.detectRemoteTransitionAndRestart()
 }
 
 // clearNamekState tears down namek adapter and clears all namek routing/cert/domain state.
@@ -2602,7 +2593,6 @@ func (s *GinServer) clearNamekState(rm *remote.Manager) {
 		s.certProvider.SetPortalMappings("namek", nil)
 	}
 	s.recomputeFrameAncestors()
-	s.detectRemoteTransitionAndRestart()
 }
 
 // applyNamekState consolidates namek adapter lifecycle, routing, cert mappings, and cert
@@ -2829,8 +2819,6 @@ func (s *GinServer) applyNamekState() {
 	// All namek domain changes originate from this device (1:1 model).
 	// When multi-device accounts are implemented, periodic sync will be needed.
 	go s.rebuildNamekDomains(reconcileCtx)
-
-	s.detectRemoteTransitionAndRestart()
 }
 
 // stopNamekAdapter cancels the namek adapter context and stops the adapter.
@@ -2869,114 +2857,6 @@ func (s *GinServer) recomputeFrameAncestors() {
 		return
 	}
 	s.serviceManager.ProxyManager().SetAllowedAncestors(s.portalHosts())
-}
-
-// detectRemoteTransitionAndRestart checks whether the set of active portal hosts
-// has changed (enable/disable, hostname rename, custom domain) and schedules an
-// OIDC app restart on any change.
-func (s *GinServer) detectRemoteTransitionAndRestart() {
-	hosts := s.portalHosts()
-	sort.Strings(hosts)
-	nowKey := strings.Join(hosts, ",")
-
-	s.remoteStateMu.Lock()
-	changed := s.remoteStateHosts != nowKey
-	s.remoteStateHosts = nowKey
-	s.remoteStateMu.Unlock()
-
-	if changed {
-		s.scheduleOIDCAppsRestart()
-	}
-}
-
-// scheduleOIDCAppsRestart schedules a debounced restart of apps that declare oidc_client.
-// This is called when remote state changes to ensure apps refresh OIDC discovery behavior.
-func (s *GinServer) scheduleOIDCAppsRestart() {
-	if s == nil || s.appManager == nil {
-		return
-	}
-
-	// Only run on kernel leader (local mode)
-	if s.routeManager != nil && s.routeManager.KernelRoute().Mode != router.ModeLocal {
-		log.Printf("INFO: skipping OIDC app restart - not kernel leader")
-		return
-	}
-
-	debounceMs := s.oidcRestartDebounceMs
-	if debounceMs <= 0 {
-		debounceMs = 5000 // default 5 second debounce
-	}
-
-	s.remoteStateMu.Lock()
-	if s.oidcRestartTimer != nil {
-		s.oidcRestartTimer.Stop()
-	}
-	s.oidcRestartTimer = time.AfterFunc(time.Duration(debounceMs)*time.Millisecond, func() {
-		s.restartOIDCApps()
-	})
-	s.remoteStateMu.Unlock()
-
-	log.Printf("INFO: scheduled OIDC apps restart in %dms due to remote state change", debounceMs)
-}
-
-// restartOIDCApps restarts all apps with oidc_client to update OIDC discovery behavior.
-func (s *GinServer) restartOIDCApps() {
-	if s == nil || s.appManager == nil {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	apps, err := s.appManager.List(ctx)
-	if err != nil {
-		if errors.Is(err, app.ErrLocked) {
-			log.Printf("DEBUG: skipping OIDC app restart: persistence locked")
-			return
-		}
-		log.Printf("ERROR: failed to list apps for OIDC restart: %v", err)
-		return
-	}
-
-	var oidcApps []string
-	for _, a := range apps {
-		if a.Definition != nil && appDeclaresOIDCClient(a.Definition) {
-			// Only restart apps that were running - don't start stopped apps
-			if a.Status == "running" || a.Status == "starting" {
-				oidcApps = append(oidcApps, a.InstanceID)
-			}
-		}
-	}
-
-	if len(oidcApps) == 0 {
-		log.Printf("INFO: no running OIDC apps to restart")
-		return
-	}
-
-	log.Printf("INFO: restarting %d OIDC apps due to remote state change: %v", len(oidcApps), oidcApps)
-
-	for _, id := range oidcApps {
-		// Stop then start to trigger fresh discovery endpoint configuration
-		if err := s.appManager.Stop(ctx, id); err != nil {
-			log.Printf("WARN: failed to stop OIDC app %s: %v", id, err)
-			continue
-		}
-		if err := s.appManager.Start(ctx, id); err != nil {
-			log.Printf("WARN: failed to start OIDC app %s: %v", id, err)
-		}
-	}
-}
-
-func appDeclaresOIDCClient(def *api.AppDefinition) bool {
-	if def == nil {
-		return false
-	}
-	for _, svc := range def.Services {
-		if svc.OIDCClient != nil {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *GinServer) observeLockState(bus *events.Bus) {

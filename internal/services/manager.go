@@ -1293,6 +1293,13 @@ func (m *ServiceManager) DeactivateApp(appName string) {
 // Downstream listeners (e.g., cert cleanup) act on the permanent signal.
 func (m *ServiceManager) RemoveApp(appName string) {
 	m.removeAppEndpoints(appName, true)
+	m.proxyManager.ClearOIDCAuthorizePaths(appName)
+}
+
+// SetAppOIDCConfig stores OIDC authorize_paths for an app on the proxy manager.
+// These paths scope Layer 2 body rewriting for OIDC authorization URLs on WAN.
+func (m *ServiceManager) SetAppOIDCConfig(appName string, authorizePaths []string) {
+	m.proxyManager.SetOIDCAuthorizePaths(appName, authorizePaths)
 }
 
 func (m *ServiceManager) removeAppEndpoints(appName string, permanent bool) {

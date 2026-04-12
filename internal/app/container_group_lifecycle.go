@@ -143,6 +143,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 				if _, restoreErr := m.serviceManager.RestoreFromPodman(appInst.InstanceID, def.Listeners, ports); restoreErr != nil {
 					log.Printf("WARN: start app %s: failed to restore services: %v", appInst.InstanceID, restoreErr)
 				} else {
+					m.configureOIDCAuthorizePaths(appInst.InstanceID, def)
 					m.serviceManager.SetAppContainerID(appInst.InstanceID, anchorID)
 				}
 			}

@@ -215,6 +215,35 @@ func (m *AppManager) SetOIDCHostname(hostname string) {
 	m.stateMu.Unlock()
 }
 
+// configureOIDCAuthorizePaths extracts authorize_paths from the app definition
+// and wires them on the proxy for OIDC authorize URL rewriting. Always called
+// after AllocateForApp/RestoreFromPodman so empty paths propagate as a delete
+// to clear any stale state from a previous app version.
+func (m *AppManager) configureOIDCAuthorizePaths(instanceID string, def *api.AppDefinition) {
+	if m.serviceManager == nil || def == nil {
+		return
+	}
+	var paths []string
+	seen := make(map[string]struct{})
+	for _, svc := range def.Services {
+		if svc.OIDCClient == nil {
+			continue
+		}
+		for _, p := range svc.OIDCClient.AuthorizePaths {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			paths = append(paths, p)
+		}
+	}
+	m.serviceManager.SetAppOIDCConfig(instanceID, paths)
+}
+
 // SetMountVerifier overrides the mount verification callback. Intended for tests.
 func (m *AppManager) SetMountVerifier(fn func(string) error) {
 	m.stateInitMu.Lock()
@@ -1228,6 +1257,7 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 			log.Printf("WARN: restore services: failed to restore proxies for %s: %v", app.InstanceID, err)
 			continue
 		}
+		m.configureOIDCAuthorizePaths(app.InstanceID, def)
 		m.serviceManager.SetAppContainerID(app.InstanceID, publishCID)
 	}
 }
@@ -1325,6 +1355,7 @@ func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.A
 		if _, err := m.serviceManager.AllocateForApp(instanceID, def.Listeners); err != nil {
 			return err
 		}
+		m.configureOIDCAuthorizePaths(instanceID, def)
 		m.serviceManager.SetAppContainerID(instanceID, containerID)
 		return nil
 	}
@@ -1332,6 +1363,7 @@ func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.A
 	if _, err := m.serviceManager.RestoreFromPodman(instanceID, def.Listeners, ports); err != nil {
 		return err
 	}
+	m.configureOIDCAuthorizePaths(instanceID, def)
 	m.serviceManager.SetAppContainerID(instanceID, containerID)
 	return nil
 }
@@ -1499,6 +1531,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate service ports: %w", err)
 	}
+	m.configureOIDCAuthorizePaths(instanceID, appDef)
 	cleanupServices := true
 	defer func() {
 		if cleanupServices {
@@ -1793,6 +1826,7 @@ func (m *AppManager) cloneWorkspaceLocked(ctx context.Context, originID, cloneID
 	if err != nil {
 		return nil, fmt.Errorf("clone %s from %s: allocate ports: %w", cloneID, originID, err)
 	}
+	m.configureOIDCAuthorizePaths(cloneID, &cloneDef)
 	cleanupServices = true
 
 	// Install the clone's container group with prebuilt rootfs.
@@ -2567,6 +2601,10 @@ func (m *AppManager) updateServiceModeImage(
 			return fmt.Errorf("update %s: allocate endpoints: %w", instanceID, allocErr)
 		}
 	}
+	// Update OIDC authorize paths from the new manifest on both paths
+	// (endpoints preserved or freshly allocated) — an app update may add,
+	// remove, or change authorize_paths and the proxy must reflect the new version.
+	m.configureOIDCAuthorizePaths(instanceID, newDef)
 	result, err := m.installContainerGroup(ctx, newDef, instanceID, layout, runtime, endpoints, prebuiltRootfs)
 	if err != nil {
 		// Detach new rootfs volumes, leave old ones for recovery.
@@ -2963,6 +3001,8 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 			return fmt.Errorf("rollback %s: allocate endpoints: %w", instanceID, allocErr)
 		}
 	}
+	// Restore OIDC authorize paths from the rolled-back definition on both paths.
+	m.configureOIDCAuthorizePaths(instanceID, curDef)
 
 	m.emitProgress(ctx, taskTypeRollbackApp, instanceID, taskPhaseRecreatingContainer, 60, "Recreating containers", false, nil)
 

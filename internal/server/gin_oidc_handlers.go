@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -277,40 +278,22 @@ func getLocalMachineIPs() []string {
 // OIDC Handlers ---------------------------------------------------------------
 
 func (s *GinServer) handleOIDCDiscovery(c *gin.Context) {
-	// Custom discovery handler that is "Split-Horizon" aware
 	cfg := oidc.DiscoveryConfig{
-		StableIssuer: s.oidcIssuer(),
-		IsRemoteActive: func() bool {
-			return len(s.portalHosts()) > 0
-		},
-		GetPortalHostname: func() string {
-			// Use the request Host to select the matching portal, so the
-			// discovery document advertises the correct authorization_endpoint
-			// when both self-hosted and namek portals are active.
-			if s.remoteResolver != nil {
-				reqHost := canonicalHost(c.Request.Host)
-				if portal := s.remoteResolver.PortalHostForRequest(reqHost); portal != "" {
-					return portal
-				}
-			}
-			// Fallback: first portal (LAN requests or unrecognized host).
-			if hosts := s.portalHosts(); len(hosts) > 0 {
-				return hosts[0]
-			}
-			return ""
-		},
-		GetLocalHostname: func() string {
-			// Use mDNS hostname if available (handles conflicts like "piccolo-abc123.local")
-			if s.mdnsManager != nil {
-				return s.mdnsManager.Hostname()
-			}
-			// mDNS disabled: fall back to local IP address
-			return getPreferredOutboundIP()
-		},
-		Logger: slog.Default(),
+		StableIssuer:     s.oidcIssuer(),
+		GetLocalHostname: s.oidcLocalHostname,
+		Logger:           slog.Default(),
 	}
 	h := oidc.NewDiscoveryHandler(cfg)
 	h.ServeHTTP(c.Writer, c.Request)
+}
+
+// oidcLocalHostname returns the stable local hostname used in the OIDC
+// discovery authorization_endpoint. Must match the proxy's oidcIssuerOrigin.
+func (s *GinServer) oidcLocalHostname() string {
+	if s.mdnsManager != nil {
+		return s.mdnsManager.SpecificHostname()
+	}
+	return getPreferredOutboundIP()
 }
 
 // getPreferredOutboundIP returns a local IP address suitable for LAN access.
@@ -391,6 +374,14 @@ func (s *GinServer) handleOIDCAuthorize(c *gin.Context) {
 	}
 
 	// Case 3: Regular authorize request (user not logged in)
+	// Custom-scheme redirect URIs (e.g., app.immich:///oauth-callback) are rejected
+	// by the zitadel library for ApplicationTypeWeb clients. We validate them ourselves
+	// and create the auth request manually, bypassing the library's type-based validation.
+	if isCustomSchemeRedirectURI(redirectURI) {
+		s.handleCustomSchemeAuthorize(c, p)
+		return
+	}
+
 	// Inject redirect_uri for validation
 	if redirectURI != "" {
 		ctx := context.WithValue(c.Request.Context(), requestedRedirectURIContextKey, redirectURI)
@@ -398,6 +389,110 @@ func (s *GinServer) handleOIDCAuthorize(c *gin.Context) {
 	}
 
 	p.Handler().ServeHTTP(c.Writer, c.Request)
+}
+
+// isCustomSchemeRedirectURI returns true if the URI uses a custom scheme
+// (anything other than http:// or https://). Used to route mobile/native app
+// OIDC requests around the zitadel library's type-based validation.
+// Comparison is case-insensitive per RFC 3986 §3.1 (scheme).
+func isCustomSchemeRedirectURI(redirectURI string) bool {
+	if redirectURI == "" {
+		return false
+	}
+	lower := strings.ToLower(redirectURI)
+	return !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://")
+}
+
+// handleCustomSchemeAuthorize handles authorize requests with custom-scheme
+// redirect URIs (e.g., app.immich:///oauth-callback). The zitadel library
+// rejects custom schemes for ApplicationTypeWeb clients, so we validate
+// and create the auth request ourselves, then redirect to the login page.
+//
+// Validation chain (must mirror op.Authorize for security):
+//   - client_id present
+//   - client exists in storage
+//   - redirect_uri is in client's registered RedirectURIs (exact match)
+//   - response_type is allowed for client (op.ValidateAuthReqResponseType)
+//   - scopes are allowed for client (op.ValidateAuthReqScopes)
+//   - prompt parameter is valid (op.ValidateAuthReqPrompt)
+func (s *GinServer) handleCustomSchemeAuthorize(c *gin.Context, p *oidc.Provider) {
+	authReq, err := op.ParseAuthorizeRequest(c.Request, p.Inner().Decoder())
+	if err != nil {
+		slog.Error("OIDC custom-scheme: failed to parse authorize request", "error", err)
+		writeGinError(c, http.StatusBadRequest, "Invalid authorize request")
+		return
+	}
+
+	if authReq.ClientID == "" {
+		writeGinError(c, http.StatusBadRequest, "client_id is required")
+		return
+	}
+
+	// OIDC Core §6: reject `request` parameter when request object support is disabled.
+	// Our provider sets RequestObjectSupported=false, so this mirrors what op.Authorize would do.
+	if authReq.RequestParam != "" {
+		writeGinError(c, http.StatusBadRequest, "request parameter not supported")
+		return
+	}
+
+	client, err := p.Storage().GetClientByClientID(c.Request.Context(), authReq.ClientID)
+	if err != nil {
+		slog.Error("OIDC custom-scheme: client not found", "client_id", authReq.ClientID, "error", err)
+		writeGinError(c, http.StatusBadRequest, "Invalid client_id")
+		return
+	}
+
+	// Validate redirect_uri is registered for this client (exact match).
+	redirectURI := authReq.RedirectURI
+	if !slices.Contains(client.RedirectURIs(), redirectURI) {
+		slog.Error("OIDC custom-scheme: redirect_uri not registered",
+			"client_id", authReq.ClientID, "redirect_uri", redirectURI)
+		writeGinError(c, http.StatusBadRequest, "redirect_uri is not registered for this client")
+		return
+	}
+
+	// Run standard library validations.
+	if err := op.ValidateAuthReqResponseType(client, authReq.ResponseType); err != nil {
+		slog.Error("OIDC custom-scheme: invalid response_type", "error", err)
+		writeGinError(c, http.StatusBadRequest, "Invalid response_type")
+		return
+	}
+	scopes, err := op.ValidateAuthReqScopes(client, authReq.Scopes)
+	if err != nil {
+		slog.Error("OIDC custom-scheme: invalid scopes", "error", err)
+		writeGinError(c, http.StatusBadRequest, "Invalid scopes")
+		return
+	}
+	authReq.Scopes = scopes
+
+	maxAge, err := op.ValidateAuthReqPrompt(authReq.Prompt, authReq.MaxAge)
+	if err != nil {
+		slog.Error("OIDC custom-scheme: invalid prompt", "error", err)
+		writeGinError(c, http.StatusBadRequest, "Invalid prompt parameter")
+		return
+	}
+	authReq.MaxAge = maxAge
+
+	// Inject redirect_uri for the storage layer.
+	ctx := context.WithValue(c.Request.Context(), requestedRedirectURIContextKey, redirectURI)
+
+	// Create auth request (no userID — user hasn't logged in yet).
+	storedReq, err := p.Storage().CreateAuthRequest(ctx, authReq, "")
+	if err != nil {
+		slog.Error("OIDC custom-scheme: failed to create auth request", "error", err)
+		writeGinError(c, http.StatusInternalServerError, "Failed to create auth request")
+		return
+	}
+
+	slog.Info("OIDC custom-scheme: created auth request, redirecting to login",
+		"id", storedReq.GetID(),
+		"client_id", authReq.ClientID,
+		"redirect_uri", redirectURI,
+	)
+
+	// Redirect to login page.
+	loginURL := client.LoginURL(storedReq.GetID())
+	http.Redirect(c.Writer, c.Request, loginURL, http.StatusFound)
 }
 
 // handleOIDCAuthorizeCallback handles the authorize callback after user login
