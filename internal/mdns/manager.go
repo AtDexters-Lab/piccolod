@@ -46,8 +46,10 @@ func NewManager() *Manager {
 		RecoveryTimeout:       time.Minute * 2,
 	}
 
-	// Capture device info at startup
 	deviceModel := GetDeviceModel()
+	if deviceModel == "" {
+		deviceModel = "Unknown"
+	}
 	bootTime := GetBootTime()
 
 	manager := &Manager{

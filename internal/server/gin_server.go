@@ -39,6 +39,7 @@ import (
 	"piccolod/internal/onboarding"
 	"piccolod/internal/pcv"
 	"piccolod/internal/persistence"
+	"piccolod/internal/provisioning"
 	"piccolod/internal/remote"
 	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/router"
@@ -158,9 +159,10 @@ type GinServer struct {
 	unlockReloaders []unlockReloader
 
 	// Onboarding and Install to Disk
-	onboardingMgr *onboarding.Manager
-	installer     *onboarding.Installer
-	execRunner    runner.CommandRunner
+	onboardingMgr     *onboarding.Manager
+	installer         *onboarding.Installer
+	execRunner        runner.CommandRunner
+	provisioningState *provisioning.State
 
 	// Persistent terminal sessions
 	terminalManager *terminal.Manager
@@ -775,9 +777,10 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		pcvImporter:    pcvImp,
 		healthTracker:  healthTracker,
 		catalogManager: catalogMgr,
-		onboardingMgr:  onboardingMgr,
-		installer:      installer,
-		execRunner:     execRunner,
+		onboardingMgr:     onboardingMgr,
+		installer:         installer,
+		execRunner:        execRunner,
+		provisioningState: provisioning.New(onboardingMgr),
 	}
 	s.opCtx, s.opCancel = context.WithCancel(context.Background())
 
@@ -1125,6 +1128,37 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	// Start() reads s.akRecovered to decide whether to schedule a background
 	// re-enrollment; setting it after Start would silently no-op.
 	identitySvc.SetAKRecovered(akRecovered)
+	// Setup heartbeat decision. Three layers:
+	//
+	//  1. provisioningState.IsProvisioned() — durable, pre-unlock-readable
+	//     signal that this device finished first-run setup at any point in
+	//     its history. Backed by onboarding.json + reconcile-on-unlock so
+	//     it's correct across upgrades, crashes, and best-effort write
+	//     failures. See internal/provisioning/state.go.
+	//
+	//  2. Otherwise consult isSetupComplete (persistence query) under a
+	//     5s budget. The timeout bounds Stop() shutdown latency in case a
+	//     hung store wedges the callback.
+	//
+	//  3. Fail-safe: a real persistence error returns true (stop — better
+	//     than leaking setup-mode visibility on a broken store). A timeout
+	//     returns false (keep heartbeating — better than silent vanishing
+	//     mid-setup; rows age out via the 2-min server TTL anyway).
+	identitySvc.SetSetupCompleteCheck(func() bool {
+		if s.provisioningState.IsProvisioned() {
+			return true
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		complete, err := s.isSetupComplete(ctx)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return false
+			}
+			return true
+		}
+		return complete
+	})
 	identitySvc.SetTPMReplacedHandler(func(old tpm.Device, newResult *tpm.OpenResult) {
 		// Close the full OpenResult (Device + SwtpmProc) to avoid leaking
 		// swtpm child processes on repeated AK recoveries.

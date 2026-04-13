@@ -16,8 +16,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"piccolod/internal/events"
+	"piccolod/internal/mdns"
 	"piccolod/internal/tpm"
 
 	"github.com/AtDexters-Lab/namek-server/pkg/namekclient"
@@ -98,6 +100,13 @@ type Service struct {
 	// Endpoint sync loop lifecycle.
 	syncCancel context.CancelFunc
 	syncDone   chan struct{}
+
+	// Setup heartbeat loop lifecycle — see setup_heartbeat.go.
+	onSetupCompleteCheck func() bool
+	setupHBCancel        context.CancelFunc
+	setupHBDone          chan struct{}
+	setupHBWake          chan struct{} // buffered, coalescing
+	setupHBFirstLogged   atomic.Bool   // log only the first successful send
 }
 
 // NewService constructs a new identity service.
@@ -155,6 +164,7 @@ func (s *Service) Start(ctx context.Context) error {
 
 	if cfg.DeviceID != "" {
 		s.startEndpointSync()
+		s.maybeStartSetupHeartbeat()
 	} else {
 		// Not yet enrolled — attempt auto-enrollment in background.
 		// Does not block supervisor startup. Retries with exponential backoff.
@@ -275,6 +285,7 @@ func (s *Service) Stop(ctx context.Context) error {
 	s.stopOnce.Do(func() { close(s.stopCh) })
 
 	s.stopEndpointSync()
+	s.stopSetupHeartbeat()
 
 	// Wait for in-flight recovery, but respect the caller's context timeout
 	// so a hung recovery doesn't block the entire shutdown sequence.
@@ -343,6 +354,17 @@ func (s *Service) SetTPMReplacedHandler(fn func(old tpm.Device, newResult *tpm.O
 // decide whether to schedule a background re-enrollment.
 func (s *Service) SetAKRecovered(v bool) {
 	s.akRecovered.Store(v)
+}
+
+// SetSetupCompleteCheck registers a callback the setup-heartbeat loop polls
+// to know when first-run setup has finished. Must be called before Start()
+// (and before finalizeEnrollment) so the heartbeat can self-terminate.
+// On error the callback should return true (fail-safe: stop heartbeating
+// rather than leak setup-mode visibility forever on a locked persistence layer).
+func (s *Service) SetSetupCompleteCheck(fn func() bool) {
+	s.mu.Lock()
+	s.onSetupCompleteCheck = fn
+	s.mu.Unlock()
 }
 
 // NamekClient returns the current namekclient, or nil if not available.
@@ -508,6 +530,7 @@ func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult) (*EnrollR
 	s.enrolled.Store(true)
 	s.suspended.Store(false)
 	s.startEndpointSync()
+	s.maybeStartSetupHeartbeat()
 	s.publish(events.TopicIdentityChanged, nil)
 
 	// Notify relay services listener (e.g., STUN service) on first enrollment.
@@ -554,6 +577,7 @@ func (s *Service) SetEnabled(ctx context.Context, enabled bool) error {
 
 	if !enabled {
 		s.stopEndpointSync()
+		s.stopSetupHeartbeat()
 		// Clear suspended on disable — see the rationale in reenrollWithRecovery's
 		// early-exit branch. suspended is a "namek says we're not Active" signal;
 		// if we're not asking namek, the flag is no longer meaningful.
@@ -574,6 +598,7 @@ func (s *Service) SetEnabled(ctx context.Context, enabled bool) error {
 
 	if enabled && s.enrolled.Load() {
 		s.startEndpointSync()
+		s.maybeStartSetupHeartbeat()
 	}
 
 	s.publish(events.TopicIdentityChanged, nil)
@@ -586,6 +611,7 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 		return fmt.Errorf("identity: namek URL cannot be empty")
 	}
 	s.stopEndpointSync()
+	s.stopSetupHeartbeat()
 
 	s.mu.Lock()
 	s.cfg.NamekURL = url
@@ -1046,16 +1072,39 @@ func resolveNamekURL(cfg Config) string {
 	return defaultNamekURL
 }
 
-// newNamekClient creates a namekclient with standard options (device ID, insecure skip).
+// maxHardwareModelLen mirrors namek-server's `max=128` validator on the
+// hardware_model attest field. Long DMI/devicetree strings are truncated
+// rather than dropped so namek still gets useful identifying info.
+const maxHardwareModelLen = 128
+
+// newNamekClient creates a namekclient with standard options (device ID,
+// hardware model, insecure skip). The hardware model ships in the enrollment
+// attest body so namek can surface it via the setup-discovery endpoint.
 func newNamekClient(url string, dev tpm.Device, deviceID string) *namekclient.Client {
 	var opts []namekclient.Option
 	if deviceID != "" {
 		opts = append(opts, namekclient.WithDeviceID(deviceID))
 	}
+	if model := truncateHardwareModel(mdns.GetDeviceModel()); model != "" {
+		opts = append(opts, namekclient.WithHardwareModel(model))
+	}
 	if os.Getenv("PICCOLO_NAMEK_INSECURE") == "1" {
 		opts = append(opts, namekclient.WithInsecureSkipVerify())
 	}
 	return namekclient.New(url, dev, opts...)
+}
+
+// truncateHardwareModel clamps a hardware model string to namek's max length,
+// taking care not to split a UTF-8 rune at the cut point.
+func truncateHardwareModel(model string) string {
+	if len(model) <= maxHardwareModelLen {
+		return model
+	}
+	cut := maxHardwareModelLen
+	for cut > 0 && !utf8.RuneStart(model[cut]) {
+		cut--
+	}
+	return model[:cut]
 }
 
 // startEndpointSync launches the background endpoint sync loop.

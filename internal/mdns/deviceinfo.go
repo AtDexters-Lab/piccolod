@@ -4,31 +4,31 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// GetDeviceModel returns the device model string.
-// Priority: ARM devicetree > DMI product_name > "Unknown"
-func GetDeviceModel() string {
-	// Try ARM devicetree first (Raspberry Pi and other ARM devices)
+// GetDeviceModel returns the device model string from sysfs (ARM devicetree
+// or x86 DMI), or empty string if neither is available. Hardware doesn't
+// change at runtime, so the result is cached after the first call.
+//
+// Callers that need a user-visible placeholder (e.g., the mDNS TXT record)
+// should default to their own label on empty return — the producer should
+// not fabricate one, since some consumers (e.g., namek enrollment) prefer
+// to omit the field entirely rather than show a misleading "Unknown".
+var GetDeviceModel = sync.OnceValue(func() string {
 	if data, err := os.ReadFile("/sys/firmware/devicetree/base/model"); err == nil {
-		// Remove trailing null byte if present
-		model := strings.TrimRight(string(data), "\x00\n\r")
-		if model != "" {
+		if model := strings.TrimRight(string(data), "\x00\n\r"); model != "" {
 			return model
 		}
 	}
-
-	// Try DMI product_name (x86 systems)
 	if data, err := os.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err == nil {
-		model := strings.TrimSpace(string(data))
-		if model != "" {
+		if model := strings.TrimSpace(string(data)); model != "" {
 			return model
 		}
 	}
-
-	return "Unknown"
-}
+	return ""
+})
 
 // GetBootTime calculates the boot time from /proc/uptime.
 // Returns the time.Time when the system booted.

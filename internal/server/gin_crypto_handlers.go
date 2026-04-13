@@ -229,6 +229,21 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		return
 	}
 
+	// 5c. Mark provisioning BEFORE any irreversible state writes (data volume,
+	// admin user, session). Strict here: if the marker write fails, fail the
+	// whole request so the client can retry — at this point no irreversible
+	// state has been committed and step 5b will let a retry through. After
+	// admin-user creation in step 8, the same step 5b guard would reject
+	// retries (isSetupComplete returns true), so a write failure later in
+	// the flow would have no in-flow recovery path. Doing the write here
+	// closes that gap.
+	if err := s.provisioningState.MarkProvisioned(); err != nil {
+		log.Printf("ERROR: mark provisioned: %v", err)
+		_ = s.notifyPersistenceLockState(setupCtx, true)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record setup completion: " + err.Error()})
+		return
+	}
+
 	// 6. Activate/initialize data volume. Uses UnlockDataVolume (idempotent):
 	// checks VGExists first, falls back to InitializeDataVolume only if no VG.
 	// Safe for both first-run and retry.
@@ -326,12 +341,12 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	// Consume the setup nonce now that setup has succeeded.
 	s.sessions.ConsumeSetupNonce()
 
-	// Mark onboarding as complete (accepts try_piccolo, pending, or already-complete).
-	// Best-effort: failure here doesn't block setup since LUKS header serves as fallback signal.
-	if s.onboardingMgr != nil {
-		if err := s.onboardingMgr.Complete(); err != nil {
-			log.Printf("WARN: onboarding complete: %v", err)
-		}
+	// Wake the setup-heartbeat loop so it sends its terminal heartbeat
+	// immediately rather than waiting up to one 30s tick — the device
+	// should disappear from picolospace.com/setup as soon as the user
+	// finishes the wizard. (MarkProvisioned ran earlier, in step 5c.)
+	if s.identityService != nil {
+		s.identityService.NotifySetupComplete()
 	}
 
 	// Fail after session creation so the user has portal access for recovery.
@@ -423,6 +438,14 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 	if err != nil {
 		log.Printf("WARN: setup-complete check failed, assuming complete: %v", err)
 		setupComplete = true // Fail closed: assume provisioned, route to login
+	}
+	// Reconcile the durable provisioning marker from the authoritative
+	// post-unlock answer. Closes the gap left by handleCryptoSetup's
+	// best-effort MarkProvisioned write.
+	if err == nil {
+		if rerr := s.provisioningState.ReconcileFromPersistence(setupComplete); rerr != nil {
+			log.Printf("WARN: reconcile provisioning: %v", rerr)
+		}
 	}
 	resp := gin.H{"message": "ok", "setup_complete": setupComplete}
 	if luksErr != nil {
