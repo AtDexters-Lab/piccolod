@@ -85,6 +85,15 @@ type AppManager struct {
 	scratchMu       sync.Mutex
 	scratchHandle   persistence.VolumeHandle
 	scratchAttached bool
+
+	// Catalog manifest sync host. Wired by GinServer post-construction. nil
+	// for tests that do not exercise sync. Guarded by stateMu.
+	syncHost SyncHost
+
+	// Tracks in-flight sync operations per instance ID. Used to reject
+	// concurrent /sync/trigger calls (AR-2). Guarded by syncStateMu.
+	syncInFlight map[string]bool
+	syncStateMu  sync.Mutex
 }
 
 var (
@@ -180,6 +189,7 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		observedStatusMessage: make(map[string]string),
 		oidcHostname:          "piccolo.local",
 		runtimeUser:           *runtimeUser,
+		syncInFlight:          make(map[string]bool),
 	}
 
 	return mgr, nil
@@ -661,6 +671,8 @@ func (m *AppManager) StartBackground() {
 			}
 		}
 	}()
+
+	m.startCatalogSyncLoop(ctx)
 }
 
 func (m *AppManager) StopBackground() {
@@ -1165,6 +1177,7 @@ func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*
 		credentialResolver: func(string) (*syscall.Credential, string, error) {
 			return testCred, testHome, nil
 		},
+		syncInFlight: make(map[string]bool),
 	}, nil
 }
 
@@ -1194,6 +1207,7 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 		credentialResolver: func(string) (*syscall.Credential, string, error) {
 			return testCred, testHome, nil
 		},
+		syncInFlight: make(map[string]bool),
 	}, nil
 }
 
@@ -2365,7 +2379,23 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	// Image pull happens inside EnsureGoldenLV via flattenFn/imageSizeFn (ephemeral runtime).
 	if mode == ModeService {
 		updatedImages := map[string]string{primary: newImage}
-		return m.updateServiceModeImage(ctx, state, appInst, &newDef, layout, runtime, updatedImages)
+		if err := m.updateServiceModeImage(ctx, state, appInst, &newDef, layout, runtime, updatedImages); err != nil {
+			return err
+		}
+		// Image update succeeded — clear catalog manifest sync throttle so
+		// the next sync tick re-classifies the catalog version (which may
+		// have been blocked as DiffKindImageOnly or
+		// DiffKindStructuralWithImage). Without this, sync remains throttled
+		// on the same hash and never picks up remaining structural changes
+		// even though the image diff has just been resolved manually.
+		if appInst.LastSyncAttemptHash != "" || appInst.LastSyncError != "" {
+			appInst.LastSyncAttemptHash = ""
+			appInst.LastSyncError = ""
+			if err := state.StoreAppMetadata(appInst); err != nil {
+				log.Printf("WARN: update image %s: clear sync throttle: %v", instanceID, err)
+			}
+		}
+		return nil
 	}
 
 	// Workspace mode is rejected above; service mode dispatches to updateServiceModeImage.

@@ -694,6 +694,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	appMgr.SetRouter(routeMgr)
 	appMgr.SetProgressReporter(progressReporter)
 	appMgr.SetEventBus(eventsBus)
+	// SyncHost is wired post-construction below once GinServer is in scope.
 
 	// Initialize persistence module (skeleton; concrete components wired later)
 	persist, err := persistence.NewService(persistence.Options{
@@ -779,6 +780,10 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		execRunner:     execRunner,
 	}
 	s.opCtx, s.opCancel = context.WithCancel(context.Background())
+
+	// Wire catalog manifest sync now that GinServer is in scope. The adapter
+	// implements app.SyncHost using the existing helpers on s.
+	s.appManager.SetSyncHost(catalogSyncHost{server: s})
 
 	// Per-IP rate limiter for public passkey/invite endpoints
 	s.passkeyRateLimiter = newIPRateLimiter(10, 5*time.Minute)
@@ -1882,6 +1887,13 @@ func (s *GinServer) setupGinRoutes() {
 			apps.DELETE("/:name/terminal/sessions/:id", s.requireAdmin(), s.handleDeleteWorkspaceTerminalSession)
 			apps.GET("/:name/terminal/sessions/:id/attach", s.requireAdmin(), s.handleAttachWorkspaceTerminalSession)
 			apps.POST("/:name/resize-storage", s.requireUnlocked(), s.requireAdmin(), s.handleAppResizeStorage)
+
+			// Catalog manifest sync controls (Admin only).
+			apps.GET("/:name/sync/status", s.requireAdmin(), s.handleGinAppSyncStatus)
+			apps.POST("/:name/sync/disable", s.requireAdmin(), s.handleGinAppSyncDisable)
+			apps.POST("/:name/sync/enable", s.requireAdmin(), s.handleGinAppSyncEnable)
+			apps.POST("/:name/sync/trigger", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppSyncTrigger)
+			apps.POST("/:name/sync/refresh-context", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppSyncRefreshContext)
 		}
 
 		// Image search (Admin only)

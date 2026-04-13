@@ -613,9 +613,15 @@ func (m *Manager) GetAppTemplate(ctx context.Context, appName string) (string, e
 		return "", fmt.Errorf("failed to fetch app template: status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// Limit read to 1MB to prevent OOM from a hostile or misconfigured catalog
+	// returning an oversized manifest. Matches FetchAppFile's cap.
+	const maxManifestSize = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize+1))
 	if err != nil {
 		return "", err
+	}
+	if len(body) > maxManifestSize {
+		return "", fmt.Errorf("catalog manifest exceeds 1MB limit")
 	}
 
 	return string(body), nil

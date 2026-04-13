@@ -27,6 +27,15 @@ import (
 	"piccolod/internal/services"
 )
 
+// syncBlockedReason returns the SyncBlockedReason string for the S1' invariant,
+// or empty string when sync is permitted.
+func syncBlockedReason(usedSecretOnlyInInitScript bool) string {
+	if usedSecretOnlyInInitScript {
+		return "catalog uses oidc client_secret only in init_script scope; sync disabled to prevent silent rotation on container recreate"
+	}
+	return ""
+}
+
 // Operation timeouts for app lifecycle handlers. These are safety ceilings —
 // the real liveness check for pulls is the stall detector in PullImageWithProgress.
 const (
@@ -78,15 +87,30 @@ func isValidTimezone(tz string) bool {
 
 // buildSystemContext returns the template context for {{ .System.* }} variables.
 func (s *GinServer) buildSystemContext() map[string]interface{} {
-	ctx := map[string]interface{}{
-		"Domain":       "local",
-		"Architecture": runtime.GOARCH,
-		"Timezone":     detectHostTimezone(),
+	snap := s.buildInstallSystemContext()
+	return map[string]interface{}{
+		"Domain":       snap.Domain,
+		"Architecture": snap.Architecture,
+		"Timezone":     snap.Timezone,
+	}
+}
+
+// buildInstallSystemContext returns the typed snapshot of the live host
+// system context. This is the source of truth for both the install handler
+// (which uses it to render templates) and the catalog manifest sync host
+// (which freezes it into install_state.json so sync re-renders are
+// deterministic).
+func (s *GinServer) buildInstallSystemContext() app.InstallSystemContext {
+	snap := app.InstallSystemContext{
+		Domain:       "local",
+		Architecture: runtime.GOARCH,
+		Timezone:     detectHostTimezone(),
+		IssuerHint:   s.oidcIssuer(),
 	}
 	if hosts := s.portalHosts(); len(hosts) > 0 {
-		ctx["Domain"] = hosts[0]
+		snap.Domain = hosts[0]
 	}
-	return ctx
+	return snap
 }
 
 // resolveSystemDefaults renders {{ .System.* }} expressions in input default values
@@ -495,159 +519,59 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		yamlData = body
 	}
 
-	systemContext := s.buildSystemContext()
-
-	// Check for service-level oidc_client in loose schema to pre-generate credentials.
-	// We do this before rendering so we can inject the credentials into the template.
-	var oidcClientID, oidcClientSecret string
-	if looseDef, err := app.ParseAppSchema(yamlData); err == nil && func() bool {
-		for _, svc := range looseDef.Services {
-			if svc.OIDCClient != nil {
-				return true
-			}
-		}
-		return false
-	}() {
-		clientMgr := s.getOIDCClientManager()
-		if clientMgr != nil {
-			var credErr error
-			oidcClientID, oidcClientSecret, credErr = clientMgr.GenerateCredentials()
-			if credErr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate OIDC credentials: " + credErr.Error()})
-				return
-			}
-
-			// Inject Auth context for templating (machine-specific issuer for back-channel).
-			issuer := s.oidcIssuer()
-
-			systemContext["Auth"] = map[string]string{
-				"Issuer":       issuer,
-				"ClientID":     oidcClientID,
-				"ClientSecret": oidcClientSecret,
-			}
-		}
+	systemSnap := s.buildInstallSystemContext()
+	clientMgr := s.getOIDCClientManager()
+	// Convert *oidc.ClientManager nil to a true-nil interface so the pipeline's
+	// `clientGen != nil` check matches Go interface semantics.
+	var clientGen app.OIDCClientGenerator
+	if clientMgr != nil {
+		clientGen = clientMgr
 	}
 
-	// Validate user inputs against declared types and constraints before rendering.
-	// Runs even with empty inputs to catch missing required fields.
-	if schema, err := app.ParseAppSchema(yamlData); err == nil && len(schema.Inputs) > 0 {
-		if err := app.ValidateInputs(schema.Inputs, userInputs); err != nil {
-			writeGinError(c, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-
-	// Render template if inputs provided
-	if len(userInputs) > 0 || oidcClientID != "" {
-		rendered, err := app.RenderManifest(yamlData, userInputs, systemContext)
-		if err != nil {
-			writeGinError(c, http.StatusBadRequest, "Failed to render manifest template: "+err.Error())
-			return
-		}
-		yamlData = rendered
-	}
-
-	// RFC 20260130: Parse YAML first, then handle __primary substitution via struct manipulation.
-	// This is safer than regex replacement which could corrupt comments/descriptions/env vars.
-	looseDef, err := app.ParseAppSchema(yamlData)
+	pipelineRes, err := app.RunInstallPipeline(c.Request.Context(), app.InstallPipelineInput{
+		RawTemplate:   yamlData,
+		UserInputs:    userInputs,
+		SystemContext: systemSnap,
+		ExistingOIDC:  nil,
+	}, clientGen, s.appManager)
 	if err != nil {
-		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
-		return
-	}
-
-	// RFC 20260130: Find __primary listener and substitute with user-provided value
-	var primaryListenerName string
-	hasPrimaryMarker := false
-	for i := range looseDef.Listeners {
-		if hostname.IsPrimaryMarker(looseDef.Listeners[i].Name) {
-			hasPrimaryMarker = true
-			// Get user-provided app address
-			if appAddress, ok := userInputs["__app_address__"].(string); ok && strings.TrimSpace(appAddress) != "" {
-				primaryListenerName = strings.TrimSpace(appAddress)
-				// Validate the provided name before using it
-				if err := app.ValidateInstanceID(primaryListenerName); err != nil {
-					writeGinError(c, http.StatusBadRequest, "Invalid app address: "+err.Error())
-					return
-				}
-				// RFC 20260130: Check for collision with existing app instance IDs
-				existingApps, err := s.appManager.List(c.Request.Context())
-				if err != nil {
-					writeGinError(c, http.StatusInternalServerError, "Failed to check existing apps: "+err.Error())
-					return
-				}
-				existingIDs := make([]string, len(existingApps))
-				for i, a := range existingApps {
-					existingIDs[i] = a.InstanceID
-				}
-				if err := app.ValidatePrimaryNameAvailable(primaryListenerName, existingIDs); err != nil {
-					writeGinError(c, http.StatusConflict, err.Error())
-					return
-				}
-				// Substitute the listener name and mark as primary
-				looseDef.Listeners[i].Name = primaryListenerName
-				looseDef.Listeners[i].Primary = true
-			} else {
-				writeGinError(c, http.StatusBadRequest, "App requires '__app_address__' input for primary listener name")
-				return
-			}
-			break
-		}
-	}
-
-	// RFC 20260130: All apps with listeners MUST use __primary marker
-	if !hasPrimaryMarker && len(looseDef.Listeners) > 0 {
-		writeGinError(c, http.StatusBadRequest, "Apps with listeners must have exactly one listener named '__primary'; update your app.yaml to use the __primary marker")
-		return
-	}
-
-	// Workspace apps: handle workspace_name identity.
-	// This block fires when the app has no listeners AND either:
-	//   - the template already contains workspace_name (custom Docker Hub flow), or
-	//   - the user supplied __app_address__ via inputs (catalog flow where
-	//     PrepareSmartDefaults injected the synthetic input).
-	appAddr, _ := userInputs["__app_address__"].(string)
-	appAddr = strings.TrimSpace(appAddr)
-	if len(looseDef.Listeners) == 0 && (looseDef.WorkspaceName != "" || appAddr != "") {
-		wsName := looseDef.WorkspaceName // default: template's workspace_name (custom Docker Hub flow)
-
-		// Catalog flow: substitute __app_address__ into workspace_name
-		if appAddr != "" {
-			wsName = appAddr
-		}
-
-		// Validate and check collision (both flows)
-		if err := app.ValidateInstanceID(wsName); err != nil {
-			writeGinError(c, http.StatusBadRequest, "Invalid workspace name: "+err.Error())
-			return
-		}
-		existingApps, err := s.appManager.List(c.Request.Context())
-		if err != nil {
-			writeGinError(c, http.StatusInternalServerError, "Failed to check existing apps: "+err.Error())
-			return
-		}
-		existingIDs := make([]string, len(existingApps))
-		for i, a := range existingApps {
-			existingIDs[i] = a.InstanceID
-		}
-		if err := app.ValidatePrimaryNameAvailable(wsName, existingIDs); err != nil {
-			writeGinError(c, http.StatusConflict, err.Error())
-			return
-		}
-		looseDef.WorkspaceName = wsName
-	}
-
-	// Set defaults and validate
-	app.SetDefaults(looseDef)
-	if err := app.ValidateAppDefinition(looseDef); err != nil {
 		var ve *app.ValidationError
 		if errors.As(err, &ve) && ve != nil {
 			writeGinErrorWithKey(c, http.StatusBadRequest, "Invalid app.yaml: "+ve.Message, ve.Code)
 			return
 		}
-		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
-		return
+		// Map well-known pipeline errors to 4xx responses.
+		msg := err.Error()
+		switch {
+		case strings.Contains(msg, "parse schema"),
+			strings.Contains(msg, "parse rendered"),
+			strings.Contains(msg, "parse re-rendered"),
+			strings.Contains(msg, "re-render with creds"),
+			strings.Contains(msg, "render manifest"),
+			strings.Contains(msg, "validate definition"),
+			strings.Contains(msg, "primary listener name"),
+			strings.Contains(msg, "invalid app address"),
+			strings.Contains(msg, "invalid workspace name"),
+			strings.Contains(msg, "input validation failed"),
+			strings.Contains(msg, "must have exactly one listener"),
+			strings.Contains(msg, "invalid app definition"):
+			writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+msg)
+			return
+		case strings.Contains(msg, "already exists") || strings.Contains(msg, "already in use"):
+			writeGinError(c, http.StatusConflict, msg)
+			return
+		default:
+			writeGinError(c, http.StatusInternalServerError, "Failed to render manifest: "+msg)
+			return
+		}
 	}
-	appDef := looseDef
+
+	appDef := pipelineRes.Definition
+	var oidcClientID, oidcClientSecret string
+	if pipelineRes.OIDCCredentials != nil {
+		oidcClientID = pipelineRes.OIDCCredentials.ClientID
+		oidcClientSecret = pipelineRes.OIDCCredentials.ClientSecret
+	}
 
 	// Install a new app instance.
 	// Decouple from HTTP request context — installs must survive connection drops.
@@ -697,7 +621,6 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 
 	// Persist OIDC client if generated
 	if oidcClientID != "" {
-		clientMgr := s.getOIDCClientManager()
 		if err := clientMgr.CreateClient(installCtx, oidcClientID, oidcClientSecret, appInstance.InstanceID); err != nil {
 			log.Printf("ERROR: failed to persist OIDC client for %s: %v. Rolling back install.", appInstance.InstanceID, err)
 			// Rollback: uninstall the app
@@ -706,6 +629,39 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 			}
 			writeGinError(c, http.StatusInternalServerError, "Failed to register OIDC client: "+err.Error())
 			return
+		}
+	}
+
+	// Persist install state for catalog manifest sync. Skip entirely for
+	// non-catalog installs (custom Docker Hub flow): they have no
+	// CatalogSource so sync would never act on them, but install_state.json
+	// would still hold plaintext InstallInputs and OIDC ClientSecret for the
+	// app's lifetime — an avoidable secrets footprint.
+	if catalogSource != "" {
+		initScriptHashes := map[string]string{}
+		for svcName, svc := range appDef.Services {
+			if svc.InitScript == nil || len(svc.InitScript.FileContent) == 0 {
+				continue
+			}
+			initScriptHashes[svcName] = app.Sha256Hex(svc.InitScript.FileContent)
+		}
+		persistErr := s.appManager.RecordInstallState(installCtx, appInstance.InstanceID, app.RecordInstallStateInput{
+			CatalogManifestHash: pipelineRes.RawTemplateHash,
+			InitScriptHashes:    initScriptHashes,
+			InstallState: &app.InstallState{
+				InstanceID:        appInstance.InstanceID,
+				InstallInputs:     userInputs,
+				InstallSystemCtx:  &systemSnap,
+				OIDCCredentials:   pipelineRes.OIDCCredentials,
+				SyncBlocked:       pipelineRes.UsedSecretOnlyInInitScript,
+				SyncBlockedReason: syncBlockedReason(pipelineRes.UsedSecretOnlyInInitScript),
+			},
+		})
+		if persistErr != nil {
+			// Persistence is best-effort: install already succeeded. Sync
+			// will treat the app as legacy on first contact and patch via
+			// allowlist.
+			log.Printf("WARN: install %s: persist install_state.json: %v", appInstance.InstanceID, persistErr)
 		}
 	}
 
@@ -1222,8 +1178,24 @@ func handleAppManagerError(c *gin.Context, err error, action string) bool {
 		writeGinError(c, http.StatusLocked, msg)
 		return true
 	}
+	if errors.Is(err, app.ErrNotLeader) {
+		writeGinError(c, http.StatusServiceUnavailable, "This node is not the cluster leader; retry on the leader.")
+		return true
+	}
 	if errors.Is(err, app.ErrAppUninstalling) {
 		writeGinError(c, http.StatusConflict, "App is being uninstalled")
+		return true
+	}
+	if errors.Is(err, app.ErrAppNotFound) {
+		writeGinError(c, http.StatusNotFound, err.Error())
+		return true
+	}
+	if errors.Is(err, app.ErrSyncInProgress) {
+		writeGinError(c, http.StatusConflict, err.Error())
+		return true
+	}
+	if errors.Is(err, app.ErrSyncHostUnavailable) {
+		writeGinError(c, http.StatusServiceUnavailable, err.Error())
 		return true
 	}
 	return false

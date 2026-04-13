@@ -112,6 +112,13 @@ type AppInstance struct {
 	// status escalates from "starting" to "error".
 	StartupAttempts       int        `json:"startup_attempts,omitempty"`
 	FirstStartupFailureAt *time.Time `json:"first_startup_failure_at,omitempty"`
+
+	// Catalog manifest sync fields. See AppMetadata for documentation.
+	CatalogManifestHash string            `json:"catalog_manifest_hash,omitempty"`
+	InitScriptHashes    map[string]string `json:"init_script_hashes,omitempty"`
+	SyncDisabled        bool              `json:"sync_disabled,omitempty"`
+	LastSyncAttemptHash string            `json:"last_sync_attempt_hash,omitempty"`
+	LastSyncError       string            `json:"last_sync_error,omitempty"`
 }
 
 // Helper methods to access commonly used Definition fields safely

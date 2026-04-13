@@ -52,6 +52,72 @@ type AppMetadata struct {
 	ClonedFrom string `json:"cloned_from,omitempty"`
 	// Init tracks per-service init script execution state.
 	Init *InitState `json:"init,omitempty"`
+
+	// Catalog manifest sync fields.
+
+	// CatalogManifestHash is the SHA-256 of the raw catalog app.yaml bytes
+	// captured at install (or after a successful sync). Used to detect drift.
+	CatalogManifestHash string `json:"catalog_manifest_hash,omitempty"`
+	// InitScriptHashes maps service name to SHA-256 of the init script file
+	// content captured at install. Sync skips an app whose init scripts have
+	// changed (manual reinstall required) since init scripts are never re-run
+	// automatically.
+	InitScriptHashes map[string]string `json:"init_script_hashes,omitempty"`
+	// SyncDisabled, when true, opts this app out of automatic catalog sync.
+	SyncDisabled bool `json:"sync_disabled,omitempty"`
+	// LastSyncAttemptHash records the catalog hash of the most recent sync
+	// attempt. Used to throttle retries: a hash that already failed will not
+	// be re-attempted until the catalog publishes a different hash or the
+	// admin clears the throttle via /sync/trigger or /sync/enable.
+	LastSyncAttemptHash string `json:"last_sync_attempt_hash,omitempty"`
+	// LastSyncError records a human-readable reason the most recent sync
+	// attempt failed. Empty on success or when no attempt has been made.
+	LastSyncError string `json:"last_sync_error,omitempty"`
+}
+
+// instanceToMetadata projects an AppInstance into the on-disk AppMetadata
+// shape. The single source of truth for the field set, used by all three
+// persistence write paths.
+func instanceToMetadata(app *AppInstance) AppMetadata {
+	return AppMetadata{
+		InstanceID:          app.InstanceID,
+		Enabled:             boolPtr(app.Enabled),
+		PrimaryService:      app.PrimaryService,
+		NetworkAnchorID:     app.NetworkAnchorID,
+		Containers:          app.Containers,
+		CreatedAt:           app.CreatedAt,
+		UpdatedAt:           app.UpdatedAt,
+		CatalogSource:       app.CatalogSource,
+		ActiveRootfs:        app.ActiveRootfs,
+		ClonedFrom:          app.ClonedFrom,
+		Init:                app.Init,
+		CatalogManifestHash: app.CatalogManifestHash,
+		InitScriptHashes:    app.InitScriptHashes,
+		SyncDisabled:        app.SyncDisabled,
+		LastSyncAttemptHash: app.LastSyncAttemptHash,
+		LastSyncError:       app.LastSyncError,
+	}
+}
+
+// metadataIntoInstance applies an on-disk AppMetadata onto an in-memory
+// AppInstance. Mirrors instanceToMetadata; shared between LoadApp and any
+// other read path.
+func metadataIntoInstance(meta AppMetadata, app *AppInstance) {
+	app.InstanceID = meta.InstanceID
+	app.PrimaryService = meta.PrimaryService
+	app.NetworkAnchorID = meta.NetworkAnchorID
+	app.Containers = meta.Containers
+	app.CreatedAt = meta.CreatedAt
+	app.UpdatedAt = meta.UpdatedAt
+	app.CatalogSource = meta.CatalogSource
+	app.ActiveRootfs = meta.ActiveRootfs
+	app.ClonedFrom = meta.ClonedFrom
+	app.Init = meta.Init
+	app.CatalogManifestHash = meta.CatalogManifestHash
+	app.InitScriptHashes = meta.InitScriptHashes
+	app.SyncDisabled = meta.SyncDisabled
+	app.LastSyncAttemptHash = meta.LastSyncAttemptHash
+	app.LastSyncError = meta.LastSyncError
 }
 
 // InitState tracks init script execution across services.
@@ -208,19 +274,10 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 
 	// Create AppInstance with embedded definition
 	app := &AppInstance{
-		InstanceID:      raw.InstanceID,
-		Enabled:         enabled,
-		PrimaryService:  raw.PrimaryService,
-		NetworkAnchorID: raw.NetworkAnchorID,
-		Containers:      raw.Containers,
-		CreatedAt:       raw.CreatedAt,
-		UpdatedAt:       raw.UpdatedAt,
-		Definition:      appDef,
-		CatalogSource:   raw.CatalogSource,
-		ActiveRootfs:    raw.ActiveRootfs,
-		ClonedFrom:      raw.ClonedFrom,
-		Init:            raw.Init,
+		Enabled:    enabled,
+		Definition: appDef,
 	}
+	metadataIntoInstance(raw.AppMetadata, app)
 
 	// Fallback: if InstanceID is empty in metadata, use directory name
 	if app.InstanceID == "" {
@@ -312,19 +369,7 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 	}
 
 	// Store metadata.json with runtime fields (atomic write)
-	metadata := AppMetadata{
-		InstanceID:      app.InstanceID,
-		Enabled:         boolPtr(app.Enabled),
-		PrimaryService:  app.PrimaryService,
-		NetworkAnchorID: app.NetworkAnchorID,
-		Containers:      app.Containers,
-		CreatedAt:       app.CreatedAt,
-		UpdatedAt:       app.UpdatedAt,
-		CatalogSource:   app.CatalogSource,
-		ActiveRootfs:    app.ActiveRootfs,
-		ClonedFrom:      app.ClonedFrom,
-		Init:            app.Init,
-	}
+	metadata := instanceToMetadata(app)
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
@@ -362,34 +407,12 @@ func (fsm *FilesystemStateManager) UpdateAppRuntime(instanceID, containerID stri
 		app.SetPrimaryContainerID(containerID)
 	}
 	app.UpdatedAt = time.Now()
-	enabled := app.Enabled
-	createdAt := app.CreatedAt
-	primaryService := app.PrimaryService
-	networkAnchorID := app.NetworkAnchorID
-	containers := app.Containers
-	catalogSource := app.CatalogSource
-	activeRootfs := app.ActiveRootfs
-	clonedFrom := app.ClonedFrom
-	initState := app.Init
+	metadata := instanceToMetadata(app)
 	fsm.cacheMu.Unlock()
 
 	// Update filesystem
 	appDir := filepath.Join(fsm.appsDir, instanceID)
 	metadataPath := filepath.Join(appDir, "metadata.json")
-
-	metadata := AppMetadata{
-		InstanceID:      instanceID,
-		Enabled:         boolPtr(enabled),
-		PrimaryService:  primaryService,
-		NetworkAnchorID: networkAnchorID,
-		Containers:      containers,
-		CreatedAt:       createdAt,
-		UpdatedAt:       app.UpdatedAt,
-		CatalogSource:   catalogSource,
-		ActiveRootfs:    activeRootfs,
-		ClonedFrom:      clonedFrom,
-		Init:            initState,
-	}
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
@@ -417,19 +440,7 @@ func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 		return fmt.Errorf("failed to create app directory: %w", err)
 	}
 
-	metadata := AppMetadata{
-		InstanceID:      app.InstanceID,
-		Enabled:         boolPtr(app.Enabled),
-		PrimaryService:  app.PrimaryService,
-		NetworkAnchorID: app.NetworkAnchorID,
-		Containers:      app.Containers,
-		CreatedAt:       app.CreatedAt,
-		UpdatedAt:       app.UpdatedAt,
-		CatalogSource:   app.CatalogSource,
-		ActiveRootfs:    app.ActiveRootfs,
-		ClonedFrom:      app.ClonedFrom,
-		Init:            app.Init,
-	}
+	metadata := instanceToMetadata(app)
 
 	metadataData, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
