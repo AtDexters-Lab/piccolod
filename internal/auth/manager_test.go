@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -104,6 +105,151 @@ func TestSessionStore_ExtendTTLIfNeeded(t *testing.T) {
 			t.Fatal("expired session should have been deleted")
 		}
 	})
+}
+
+func TestSessionStore_ClearMustRegisterPasskey(t *testing.T) {
+	store := NewSessionStore()
+	// userA: three gated LAN sessions (RP=piccolo.local) + one off-gate LAN
+	// session + one gated REMOTE session (RP=example.com). Clear for LAN
+	// must only touch the three gated LAN sessions.
+	newSess := func(userID, username, origin string) *Session {
+		sess := store.CreatePortalSession(userID, username, "admin", origin, 3600)
+		return sess
+	}
+	a1 := newSess("userA", "alice", "https://piccolo.local")
+	a2 := newSess("userA", "alice", "https://piccolo.local:8080")
+	a3 := newSess("userA", "alice", "https://piccolo.local")
+	a4 := newSess("userA", "alice", "https://piccolo.local") // stays off-gate
+	aRemote := newSess("userA", "alice", "https://remote.example.com")
+	a1.MustRegisterPasskey.Store(true)
+	a2.MustRegisterPasskey.Store(true)
+	a3.MustRegisterPasskey.Store(true)
+	aRemote.MustRegisterPasskey.Store(true)
+
+	// userB: separate user, must not be affected.
+	b1 := newSess("userB", "bob", "https://piccolo.local")
+	b1.MustRegisterPasskey.Store(true)
+
+	// Clear for LAN RP only.
+	n := store.ClearMustRegisterPasskey("userA", "piccolo.local", "")
+	if n != 3 {
+		t.Fatalf("expected 3 LAN sessions cleared, got %d", n)
+	}
+	for _, id := range []string{a1.ID, a2.ID, a3.ID, a4.ID} {
+		got, _ := store.Get(id)
+		if got.MustRegisterPasskey.Load() {
+			t.Fatalf("userA LAN session %s still has forcing flag set", id)
+		}
+	}
+	// Remote session on a different RP must stay gated (cross-RP bypass
+	// guard — see Codex P2 review 2026-04-20).
+	gotRemote, _ := store.Get(aRemote.ID)
+	if !gotRemote.MustRegisterPasskey.Load() {
+		t.Fatalf("cross-RP bypass: userA remote-RP session was cleared by a LAN clear")
+	}
+	// userB untouched.
+	gotB, _ := store.Get(b1.ID)
+	if !gotB.MustRegisterPasskey.Load() {
+		t.Fatalf("userB session forcing flag was incorrectly cleared")
+	}
+
+	// Idempotent: a second call clears zero.
+	if n := store.ClearMustRegisterPasskey("userA", "piccolo.local", ""); n != 0 {
+		t.Fatalf("expected 0 on second call, got %d", n)
+	}
+	// Now clear the remote RP — should release exactly the remote session.
+	if n := store.ClearMustRegisterPasskey("userA", "remote.example.com", ""); n != 1 {
+		t.Fatalf("expected 1 remote session cleared, got %d", n)
+	}
+	// Empty args are a no-op.
+	if n := store.ClearMustRegisterPasskey("", "piccolo.local", ""); n != 0 {
+		t.Fatalf("expected 0 for empty userID, got %d", n)
+	}
+	if n := store.ClearMustRegisterPasskey("userA", "", ""); n != 0 {
+		t.Fatalf("expected 0 for empty rpID, got %d", n)
+	}
+}
+
+// TestSessionStore_MustRegisterPasskey_ConcurrentRace guards against the
+// data race that existed when MustRegisterPasskey was a plain bool: readers
+// in request handlers dereferenced *Session after SessionStore.Get released
+// its lock while ClearMustRegisterPasskey fanned writes across sessions.
+// Under -race this fires immediately if the atomic.Bool is regressed.
+func TestSessionStore_MustRegisterPasskey_ConcurrentRace(t *testing.T) {
+	store := NewSessionStore()
+	const sessionsPerUser = 8
+	var sids []string
+	for range sessionsPerUser {
+		s := store.CreatePortalSession("u", "alice", "admin", "https://piccolo.local", 3600)
+		s.MustRegisterPasskey.Store(true)
+		sids = append(sids, s.ID)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, id := range sids {
+					if sess, ok := store.Get(id); ok {
+						_ = sess.MustRegisterPasskey.Load()
+					}
+				}
+			}
+		}()
+	}
+
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				store.ClearMustRegisterPasskey("u", "piccolo.local", "")
+				for _, id := range sids {
+					store.SetMustRegisterPasskey(id)
+				}
+			}
+		}()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+func TestSessionStore_SetMustRegisterPasskey(t *testing.T) {
+	store := NewSessionStore()
+	sess := store.CreateWithUserInfo("u1", "alice", "admin", 3600)
+
+	if !store.SetMustRegisterPasskey(sess.ID) {
+		t.Fatal("expected SetMustRegisterPasskey to succeed on live session")
+	}
+	got, _ := store.Get(sess.ID)
+	if !got.MustRegisterPasskey.Load() {
+		t.Fatalf("MustRegisterPasskey not set")
+	}
+
+	// Missing session returns false.
+	if store.SetMustRegisterPasskey("nonexistent") {
+		t.Fatal("expected false for nonexistent session")
+	}
+	// Empty id returns false.
+	if store.SetMustRegisterPasskey("") {
+		t.Fatal("expected false for empty id")
+	}
 }
 
 func TestManager_ChangePasswordWithRecovery(t *testing.T) {

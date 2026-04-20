@@ -302,12 +302,21 @@ class ApiClient {
     return result['passkeys'] as List<dynamic>? ?? [];
   }
 
-  Future<void> deletePasskey(String id) async {
-    await delete('/api/v1/auth/passkeys/$id');
+  /// Returns the response body which carries `rp_id` and `credential_id` for
+  /// the post-delete WebAuthn Signal API call (D-9 / D-14).
+  Future<Map<String, dynamic>> deletePasskey(String id) async {
+    final res = await delete('/api/v1/auth/passkeys/$id');
+    return (res is Map<String, dynamic>) ? res : <String, dynamic>{};
   }
 
-  Future<void> renamePasskey(String id, String name) async {
-    await patch('/api/v1/auth/passkeys/$id', body: {'friendly_name': name});
+  /// Renames a passkey's friendly label. No Signal API call is fired on
+  /// rename: the WebAuthn Signal API's signalCurrentUserDetails mutates
+  /// account-level user identity, not per-credential labels — firing it here
+  /// would clobber the OS/browser's account display with a credential nickname.
+  Future<Map<String, dynamic>> renamePasskey(String id, String name) async {
+    final res =
+        await patch('/api/v1/auth/passkeys/$id', body: {'friendly_name': name});
+    return (res is Map<String, dynamic>) ? res : <String, dynamic>{};
   }
 
   // --- Invite API ---

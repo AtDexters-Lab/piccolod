@@ -126,6 +126,8 @@ type GinServer struct {
 	resetFailures int
 	// per-IP rate limiter for public passkey/invite endpoints
 	passkeyRateLimiter *ipRateLimiter
+	// per-username rate limiter for password login (D-12)
+	loginRateLimiter *loginRateLimiter
 
 	// Serializes concurrent /crypto/setup requests to prevent parallel LUKS init.
 	setupMu sync.Mutex
@@ -790,6 +792,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Per-IP rate limiter for public passkey/invite endpoints
 	s.passkeyRateLimiter = newIPRateLimiter(10, 5*time.Minute)
+	// Per-username password login rate limiter (D-12): 10 fails → 15-min lockout.
+	// LRU-bounded at 10k usernames to cap memory under churn (AR-8).
+	s.loginRateLimiter = newLoginRateLimiter(10, 15*time.Minute, 10000)
 
 	// Initialize persistent terminal session manager
 	s.terminalManager = terminal.NewManager()
@@ -1693,9 +1698,9 @@ func (s *GinServer) portalOriginForRequest(r *http.Request) string {
 	if host == "" && s.mdnsManager != nil {
 		host = strings.TrimSpace(s.mdnsManager.Hostname())
 	}
-	if host == "" {
-		host = reqHost
-	}
+	// Fail-closed: do NOT echo reqHost here unvalidated — a spoofed Host
+	// header would flow into any redirect target built from this function.
+	// Fall through to server-known outbound IP instead.
 	if host == "" {
 		host = getPreferredOutboundIP()
 	}

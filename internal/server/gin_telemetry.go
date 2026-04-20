@@ -28,6 +28,11 @@ var telemetryKnownTypes = map[string]bool{
 	"web_error":     true,
 	"js_rejection":  true,
 	"jank":          true,
+	// passkey_error is emitted by setup_utils.dart and passkeys_controller.dart
+	// when a WebAuthn/Signal-API call throws. Caught-and-presented errors
+	// otherwise never leave the browser — this makes them visible in the
+	// journal for operator diagnosis.
+	"passkey_error": true,
 }
 
 type telemetryRequest struct {
@@ -78,6 +83,13 @@ func (s *GinServer) handleTelemetryLog(c *gin.Context) {
 
 	for _, e := range req.Entries {
 		if !telemetryKnownTypes[e.Type] {
+			// Silently dropping was masking real client bugs (e.g. a stale
+			// build sending an unexpected type). Log at WARN so the presence
+			// of the POST is still visible even though we don't structure
+			// the full payload.
+			log.Printf("WARN: ui-telemetry dropped unknown type=%q msg=%q",
+				truncateTelemetryString(e.Type, 64),
+				truncateTelemetryString(sanitizeTelemetryField(e.Message, telemetryMaxMessageLen), 200))
 			continue
 		}
 
@@ -111,7 +123,7 @@ func (s *GinServer) handleTelemetryLog(c *gin.Context) {
 		log.Printf("ui-telemetry: %s", strings.Join(parts, " "))
 
 		// Log stack trace for error types only
-		if e.Stack != "" && (e.Type == "flutter_error" || e.Type == "async_error" || e.Type == "web_error") {
+		if e.Stack != "" && (e.Type == "flutter_error" || e.Type == "async_error" || e.Type == "web_error" || e.Type == "passkey_error") {
 			stack := sanitizeTelemetryField(e.Stack, telemetryMaxStackLen)
 			log.Printf("ui-telemetry-stack: type=%s msg=%q stack=%q", e.Type, truncateTelemetryString(msg, 80), stack)
 		}

@@ -370,7 +370,7 @@ type User struct {
 	Email        string
 	PasswordHash string
 	Role         UserRole
-	AllowedApps  []string  // JSON-encoded list of allowed app instance IDs (nil for admin)
+	AllowedApps  []string // JSON-encoded list of allowed app instance IDs (nil for admin)
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
@@ -434,17 +434,17 @@ type OIDCRefreshToken struct {
 
 // WebAuthnCredential represents a stored WebAuthn credential for a user.
 type WebAuthnCredential struct {
-	ID              string    // base64url-encoded credential ID
-	UserID          string    // FK to users.id
-	PublicKey       []byte    // CBOR-encoded public key
-	AttestationType string    // e.g., "none", "packed"
-	Transports      []string  // e.g., ["internal", "usb"]
+	ID              string   // base64url-encoded credential ID
+	UserID          string   // FK to users.id
+	PublicKey       []byte   // CBOR-encoded public key
+	AttestationType string   // e.g., "none", "packed"
+	Transports      []string // e.g., ["internal", "usb"]
 	SignCount       uint32
-	RPID            string    // Relying Party ID this credential is bound to
-	AAGUID          []byte    // Authenticator AAGUID
-	FriendlyName    string    // User-assigned label
-	BackupEligible  bool      // WebAuthn BE flag — must not change after registration
-	BackupState     bool      // WebAuthn BS flag — may change (credential synced/backed up)
+	RPID            string // Relying Party ID this credential is bound to
+	AAGUID          []byte // Authenticator AAGUID
+	FriendlyName    string // User-assigned label
+	BackupEligible  bool   // WebAuthn BE flag — must not change after registration
+	BackupState     bool   // WebAuthn BS flag — may change (credential synced/backed up)
 	CreatedAt       time.Time
 	LastUsedAt      time.Time
 }
@@ -452,8 +452,8 @@ type WebAuthnCredential struct {
 // InviteToken represents a magic link invite for passwordless user onboarding.
 type InviteToken struct {
 	Token      string
-	UserID     string     // FK to users.id (pre-created passwordless user)
-	CreatedBy  string     // Admin user_id who created the invite
+	UserID     string // FK to users.id (pre-created passwordless user)
+	CreatedBy  string // Admin user_id who created the invite
 	ExpiresAt  time.Time
 	ConsumedAt *time.Time // nil until used
 	CreatedAt  time.Time
@@ -480,7 +480,9 @@ type WebAuthnCredentialRepo interface {
 	DeleteByUser(ctx context.Context, userID string) error
 	CountByUser(ctx context.Context, userID string) (int, error)
 	CountByUserAndRP(ctx context.Context, userID, rpID string) (int, error)
-	CountByUserSplitRP(ctx context.Context, userID, rpID string) (total int, rpCount int, err error)
+	// ListUserIDsByRP returns the distinct set of user IDs with at least one
+	// credential for rpID. Cheaper than ListByRP (no blob columns).
+	ListUserIDsByRP(ctx context.Context, rpID string) ([]string, error)
 }
 
 // InviteTokenRepo manages magic link invite tokens.

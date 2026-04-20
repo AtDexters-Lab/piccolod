@@ -413,8 +413,8 @@ func (r *guardedWebAuthnCredRepo) CountByUser(ctx context.Context, userID string
 func (r *guardedWebAuthnCredRepo) CountByUserAndRP(ctx context.Context, userID, rpID string) (int, error) {
 	return r.repo.CountByUserAndRP(ctx, userID, rpID)
 }
-func (r *guardedWebAuthnCredRepo) CountByUserSplitRP(ctx context.Context, userID, rpID string) (int, int, error) {
-	return r.repo.CountByUserSplitRP(ctx, userID, rpID)
+func (r *guardedWebAuthnCredRepo) ListUserIDsByRP(ctx context.Context, rpID string) ([]string, error) {
+	return r.repo.ListUserIDsByRP(ctx, rpID)
 }
 func (r *guardedWebAuthnCredRepo) Create(ctx context.Context, cred WebAuthnCredential) error {
 	if r.store.leader != nil && !r.store.leader() {

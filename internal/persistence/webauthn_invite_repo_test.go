@@ -365,13 +365,17 @@ func TestWebAuthnCredentialRepo_Counts(t *testing.T) {
 		}
 	})
 
-	t.Run("count_by_user_split_rp", func(t *testing.T) {
-		total, rpCount, err := repo.CountByUserSplitRP(ctx, "user-1", "piccolo.local")
+	t.Run("count_by_user_and_rp_cross_rp", func(t *testing.T) {
+		total, err := repo.CountByUser(ctx, "user-1")
 		if err != nil {
-			t.Fatalf("CountByUserSplitRP: %v", err)
+			t.Fatalf("CountByUser: %v", err)
 		}
 		if total != 3 {
 			t.Fatalf("expected total 3, got %d", total)
+		}
+		rpCount, err := repo.CountByUserAndRP(ctx, "user-1", "piccolo.local")
+		if err != nil {
+			t.Fatalf("CountByUserAndRP: %v", err)
 		}
 		if rpCount != 2 {
 			t.Fatalf("expected rpCount 2, got %d", rpCount)

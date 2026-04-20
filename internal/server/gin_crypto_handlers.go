@@ -333,7 +333,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	// require passkey registration before accessing the dashboard. This ensures
 	// the boot handler enforces the passkey step even after page refresh.
 	if s.isRemoteSecureRequest(c.Request) && s.webauthnMgr != nil {
-		sess.MustRegisterPasskey = true
+		s.sessions.SetMustRegisterPasskey(sess.ID)
 	}
 
 	s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
@@ -614,6 +614,21 @@ func (s *GinServer) handleCryptoRecoveryStatus(c *gin.Context) {
 
 // handleCryptoRecoveryGenerate: POST /api/v1/crypto/recovery-key/generate
 func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
+	// C7 / RF-4: belt-and-suspenders denial for the bootstrap window. Runs
+	// before the initialization check to avoid leaking crypto-state via the
+	// 400-vs-403 response distinction. Even if the middleware allowlist
+	// regresses to admit /crypto/recovery-key/generate under
+	// MustRegisterPasskey=true, this handler refuses. Closes both the D-1
+	// extension and the pre-existing variant where an attacker with the
+	// password could rotate the recovery key during normal bootstrap.
+	if id, ok := s.getSession(c); ok {
+		if sess, sok := s.sessions.Get(id); sok && sess.MustRegisterPasskey.Load() {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "passkey_registration_required",
+			})
+			return
+		}
+	}
 	if s.cryptoManager == nil || !s.cryptoManager.IsInitialized() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "not initialized"})
 		return

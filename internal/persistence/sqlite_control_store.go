@@ -1883,7 +1883,8 @@ func (r *sqliteWebAuthnCredRepo) scanCred(ctx context.Context, query string, arg
 	err := r.store.db.QueryRowContext(ctx, query, args...).Scan(
 		&cred.ID, &cred.UserID, &cred.PublicKey, &cred.AttestationType,
 		&transportsJSON, &cred.SignCount, &cred.RPID, &aaguid,
-		&cred.FriendlyName, &backupEligible, &backupState, &createdAt, &lastUsedAt)
+		&cred.FriendlyName, &backupEligible, &backupState,
+		&createdAt, &lastUsedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return WebAuthnCredential{}, ErrNotFound
@@ -1922,7 +1923,8 @@ func (r *sqliteWebAuthnCredRepo) scanCreds(ctx context.Context, query string, ar
 		if err := rows.Scan(
 			&cred.ID, &cred.UserID, &cred.PublicKey, &cred.AttestationType,
 			&transportsJSON, &cred.SignCount, &cred.RPID, &aaguid,
-			&cred.FriendlyName, &backupEligible, &backupState, &createdAt, &lastUsedAt); err != nil {
+			&cred.FriendlyName, &backupEligible, &backupState,
+			&createdAt, &lastUsedAt); err != nil {
 			return nil, err
 		}
 		if transportsJSON.Valid && transportsJSON.String != "" {
@@ -2030,17 +2032,27 @@ func (r *sqliteWebAuthnCredRepo) CountByUserAndRP(ctx context.Context, userID, r
 	return count, err
 }
 
-func (r *sqliteWebAuthnCredRepo) CountByUserSplitRP(ctx context.Context, userID, rpID string) (int, int, error) {
+func (r *sqliteWebAuthnCredRepo) ListUserIDsByRP(ctx context.Context, rpID string) ([]string, error) {
 	r.store.mu.RLock()
 	defer r.store.mu.RUnlock()
 	if !r.store.loaded {
-		return 0, 0, ErrLocked
+		return nil, ErrLocked
 	}
-	var total, rpCount int
-	err := r.store.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), SUM(CASE WHEN rp_id=? THEN 1 ELSE 0 END) FROM webauthn_credentials WHERE user_id=?`,
-		rpID, userID).Scan(&total, &rpCount)
-	return total, rpCount, err
+	rows, err := r.store.db.QueryContext(ctx,
+		`SELECT DISTINCT user_id FROM webauthn_credentials WHERE rp_id=?`, rpID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var userIDs []string
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		userIDs = append(userIDs, uid)
+	}
+	return userIDs, rows.Err()
 }
 
 // -----------------------------------------------------------------------------

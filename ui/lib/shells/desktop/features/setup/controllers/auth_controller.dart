@@ -289,6 +289,7 @@ class AuthController extends ChangeNotifier {
       onComplete();
       return true;
     } on ApiException catch (e) {
+      WebAuthnService.maybeSignalFromApiError(e);
       _passkeyError = friendlyApiError(e);
       if (!_disposed) notifyListeners();
       return false;
@@ -319,6 +320,17 @@ class AuthController extends ChangeNotifier {
       onComplete();
       return true;
     } on ApiException catch (e) {
+      // Benign-duplicate during the bootstrap PasskeyRequired flow: server
+      // cleared the forcing-gate server-side (the user demonstrably owns a
+      // passkey for this RP), so treat 409 as a soft success and transition
+      // forward. Without this the user stays on PasskeyRequiredStep with an
+      // error message despite the gate being cleared.
+      if (e.statusCode == 409 &&
+          extractServerError(e.message) == 'passkey_already_registered') {
+        if (await _completeAuthAndRedirect(null)) return true;
+        onComplete();
+        return true;
+      }
       _passkeyError = friendlyApiError(e);
       if (!_disposed) notifyListeners();
       return false;

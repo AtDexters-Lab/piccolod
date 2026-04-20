@@ -164,7 +164,43 @@ class _PasskeyListSectionState extends State<PasskeyListSection> {
         ),
       );
     } on Object catch (_) {
-      // Error is shown via _controller.error in the UI
+      // Errors are shown via _controller.error in the UI.
+    }
+  }
+
+  Future<void> _performDelete(Passkey passkey) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final delivery = await _controller.deletePasskey(passkey.id);
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text(_deleteCopyForState(delivery)),
+        duration: const Duration(seconds: 10),
+        action: SnackBarAction(label: 'Dismiss', onPressed: () {}),
+      ));
+    } on Object catch (e) {
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(
+        content: Text('Failed to remove passkey: $e'),
+        backgroundColor: PiccoloTheme.critical,
+      ));
+    }
+  }
+
+  // E6: two-state SnackBar copy variants based on Signal API outcome.
+  // "delivered" gives a soft confirmation that acknowledges async propagation
+  // (cloud-synced password managers can lag). failed and unsupported collapse
+  // into one variant — both surface the same actionable advice (remove from
+  // browser/password-manager settings too).
+  String _deleteCopyForState(SignalDeliveryState state) {
+    switch (state) {
+      case SignalDeliveryState.delivered:
+        return 'Passkey removed. Your browser was notified — it may take '
+            'a moment to update across devices.';
+      case SignalDeliveryState.failed:
+      case SignalDeliveryState.unsupported:
+        return 'Passkey removed from Piccolo. To also remove it from sign-in '
+            'prompts, delete it from your browser or password-manager settings.';
     }
   }
 
@@ -241,36 +277,8 @@ class _PasskeyListSectionState extends State<PasskeyListSection> {
           ),
           FilledButton(
             onPressed: () async {
-              final messenger = ScaffoldMessenger.of(context);
               Navigator.of(context).pop();
-              try {
-                await _controller.deletePasskey(passkey.id);
-                if (mounted) {
-                  messenger.showSnackBar(
-                    SnackBar(
-                      content: const Text(
-                        'Passkey removed. To stop it appearing in sign-in '
-                        "prompts, also remove it from your browser's "
-                        'password settings.',
-                      ),
-                      duration: const Duration(seconds: 15),
-                      action: SnackBarAction(
-                        label: 'Dismiss',
-                        onPressed: () {},
-                      ),
-                    ),
-                  );
-                }
-              } on Object catch (e) {
-                if (mounted) {
-                  messenger.showSnackBar(
-                    SnackBar(
-                      content: Text('Failed to remove passkey: $e'),
-                      backgroundColor: PiccoloTheme.critical,
-                    ),
-                  );
-                }
-              }
+              await _performDelete(passkey);
             },
             style: FilledButton.styleFrom(
               backgroundColor: PiccoloTheme.critical,
@@ -320,17 +328,18 @@ class _PasskeyCard extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(height: Spacing.xs),
-                Row(
+                Wrap(
+                  spacing: Spacing.sm,
+                  runSpacing: Spacing.xs,
+                  crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
                     _MetadataChip(label: passkey.rpContext),
-                    const SizedBox(width: Spacing.sm),
                     Text(
                       'Added ${_formatDate(passkey.createdAt)}',
                       style: PiccoloTheme.textTheme.labelSmall?.copyWith(
                         color: PiccoloTheme.inkMuted,
                       ),
                     ),
-                    const SizedBox(width: Spacing.sm),
                     Text(
                       'Last used ${passkey.lastUsedAt != null ? _formatDate(passkey.lastUsedAt!) : 'Never'}',
                       style: PiccoloTheme.textTheme.labelSmall?.copyWith(
@@ -417,21 +426,20 @@ class _MetadataChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final base = PiccoloTheme.cobalt600;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: Spacing.sm, vertical: 2),
       decoration: BoxDecoration(
-        color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
+        color: base.withValues(alpha: 0.1),
         borderRadius: BorderRadius.circular(Radii.xxs),
-        border: Border.all(
-          color: PiccoloTheme.cobalt600.withValues(alpha: 0.3),
-        ),
+        border: Border.all(color: base.withValues(alpha: 0.3)),
       ),
       child: Text(
         label,
-        style: const TextStyle(
+        style: TextStyle(
           fontSize: 10,
           fontWeight: FontWeight.w500,
-          color: PiccoloTheme.cobalt600,
+          color: base,
         ),
       ),
     );

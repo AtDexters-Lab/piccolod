@@ -165,16 +165,7 @@ func (s *GinServer) handleAuthSession(c *gin.Context) {
 			if s.cryptoManager != nil && s.cryptoManager.IsInitialized() {
 				locked = s.cryptoManager.IsLocked()
 			}
-			// Passkey info — has_passkey is scoped to the current request's RP ID
-			hasPasskey := false
-			passkeyCount := 0
-			if s.webauthnMgr != nil && sess.UserID != "" {
-				rpID := s.getRPID(c)
-				if total, rpCount, err := s.webauthnMgr.CountByUserSplitRP(c.Request.Context(), sess.UserID, rpID); err == nil {
-					passkeyCount = total
-					hasPasskey = rpCount > 0
-				}
-			}
+			presence := s.computePasskeyPresence(c, sess.UserID, s.getRPID(c))
 			c.JSON(http.StatusOK, gin.H{
 				"authenticated":         true,
 				"user":                  sess.User,
@@ -182,9 +173,9 @@ func (s *GinServer) handleAuthSession(c *gin.Context) {
 				"volumes_locked":        locked,
 				"password_stale":        passwordStale,
 				"recovery_stale":        recoveryStale,
-				"has_passkey":           hasPasskey,
-				"passkey_count":         passkeyCount,
-				"must_register_passkey": sess.MustRegisterPasskey,
+				"has_passkey":           presence.HasPasskey,
+				"passkey_count":         presence.TotalCount,
+				"must_register_passkey": sess.MustRegisterPasskey.Load(),
 			})
 			return
 		}
@@ -217,6 +208,14 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 	username := strings.TrimSpace(body.Username)
 	if username == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "username required"})
+		return
+	}
+
+	// D-12: per-username lockout precedes verify so password-holder attackers
+	// against a single victim cannot defeat it via concurrent attempts.
+	if s.loginRateLimiter != nil && !s.loginRateLimiter.Allow(username) {
+		c.Header("Retry-After", "900")
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too Many Requests"})
 		return
 	}
 
@@ -256,6 +255,9 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 			c.JSON(http.StatusLocked, gin.H{"error": "storage locked; unlock Piccolo to continue"})
 			return
 		}
+		if s.loginRateLimiter != nil {
+			s.loginRateLimiter.RecordFailure(username)
+		}
 		// Generic failure
 		if s.recordLoginFailure() {
 			c.Header("Retry-After", "5")
@@ -267,17 +269,19 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 	}
 
 	s.resetLoginFailures()
+	if s.loginRateLimiter != nil {
+		s.loginRateLimiter.RecordSuccess(username)
+	}
 
-	// Enforce passkey-only policy: standard users can only use passkeys
-	// (they are passwordless by design), and remote users with existing
-	// passkeys must use them instead of password.
+	// Enforce passkey-only policy: standard users must use passkeys (they
+	// are passwordless by design), and remote users with a passkey for this
+	// RP must use it instead of a password.
 	userID := userInfo.ID
 	userRole := string(userInfo.Role)
+	rpID := authpkg.DetermineRPID(c.Request.Host, s.getBaseDomain())
 	if s.webauthnMgr != nil {
-		rpID := authpkg.DetermineRPID(c.Request.Host, s.getBaseDomain())
 		hasPasskey, _ := s.webauthnMgr.HasCredentialsForRP(c.Request.Context(), userID, rpID)
 
-		// Standard users with passkeys must use them (passkey-only policy)
 		if userInfo.Role == persistence.UserRoleStandard && hasPasskey {
 			c.JSON(http.StatusForbidden, gin.H{
 				"error":   "passkey_required",
@@ -286,7 +290,6 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 			return
 		}
 
-		// Remote access: block password login if user has a passkey for this RP
 		if s.isRemoteSecureRequest(c.Request) && hasPasskey {
 			c.JSON(http.StatusForbidden, gin.H{
 				"error":   "passkey_required",
@@ -301,15 +304,15 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 	boundOrigin := s.computeCanonicalOrigin(c)
 	sess := s.sessions.CreatePortalSession(userID, userInfo.Username, userRole, boundOrigin, portalSessionTTL)
 
-	// Flag bootstrap sessions on remote for required passkey registration
+	// Flag bootstrap sessions on remote for required passkey registration.
 	if s.isRemoteSecureRequest(c.Request) && s.webauthnMgr != nil {
-		sess.MustRegisterPasskey = true
+		s.sessions.SetMustRegisterPasskey(sess.ID)
 	}
 
 	s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
 
 	resp := gin.H{"message": "ok"}
-	if sess.MustRegisterPasskey {
+	if sess.MustRegisterPasskey.Load() {
 		resp["must_register_passkey"] = true
 	}
 	if next := strings.TrimSpace(body.Next); next != "" {

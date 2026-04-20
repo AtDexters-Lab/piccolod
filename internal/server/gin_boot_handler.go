@@ -160,7 +160,7 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 	}
 
 	// 9. Passkey registration required — block dashboard until registered.
-	if sess.MustRegisterPasskey {
+	if sess.MustRegisterPasskey.Load() {
 		resp := gin.H{"screen": bootScreenPasskeyRequired}
 		if recoveryKeyPending {
 			resp["recovery_key_pending"] = true
@@ -169,20 +169,13 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 		return
 	}
 
-	// 10. All clear — desktop.
-	hasPasskey := false
-	if s.webauthnMgr != nil && sess.UserID != "" {
-		rpID := s.getRPID(c)
-		if _, rpCount, err := s.webauthnMgr.CountByUserSplitRP(c.Request.Context(), sess.UserID, rpID); err == nil {
-			hasPasskey = rpCount > 0
-		}
-	}
+	presence := s.computePasskeyPresence(c, sess.UserID, s.getRPID(c))
 
 	resp := gin.H{
 		"screen":                bootScreenDesktop,
 		"user":                  sess.User,
-		"has_passkey":           hasPasskey,
-		"must_register_passkey": sess.MustRegisterPasskey,
+		"has_passkey":           presence.HasPasskey,
+		"must_register_passkey": sess.MustRegisterPasskey.Load(),
 	}
 	if recoveryKeyPending {
 		resp["recovery_key_pending"] = true

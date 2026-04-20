@@ -36,10 +36,15 @@ class ErrorReporter {
   }
 
   /// Report an error or event for telemetry.
+  /// When [flushImmediate] is true, also schedules an immediate flush instead
+  /// of waiting for the periodic timer or buffer threshold — used for rare
+  /// high-signal events (e.g. passkey_error) where the user may reload or
+  /// navigate away before the 30s periodic flush would fire.
   void report({
     required String type,
     required String message,
     String? stack,
+    bool flushImmediate = false,
   }) {
     try {
       if (!_initialized) return;
@@ -63,7 +68,7 @@ class ErrorReporter {
         );
       }
 
-      if (_buffer.length >= _flushThreshold) {
+      if (flushImmediate || _buffer.length >= _flushThreshold) {
         unawaited(_flush());
       }
     } on Object catch (_) {

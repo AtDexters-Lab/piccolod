@@ -343,6 +343,36 @@ func (s *GinServer) handleOIDCAuthorize(c *gin.Context) {
 		"scope", c.Request.FormValue("scope"),
 	)
 
+	// MustRegisterPasskey forcing-gate (plan D-10): a session in the bootstrap
+	// window must not mint OIDC tokens via the authorize fast-path. Checked
+	// before getOIDCProvider() because it's a session-state decision that
+	// must fire regardless of OIDC-infra health; the authorize endpoint lives
+	// at the root router and does not traverse the requireSession middleware
+	// that otherwise enforces the gate. Without this, an attacker with the
+	// victim's password could bypass D-10 in two requests to any
+	// oidc_passthrough/headers app. We redirect the browser to the portal
+	// root (resolved via portalOriginForRequest to handle nexus-proxied
+	// remote traffic) rather than a same-origin "/" — the authorize handler
+	// can be reached from app-facing origins through oidc_passthrough, and a
+	// relative redirect would land on the app's root rather than piccolod's
+	// bootscreen.
+	if clientID != "" {
+		if sess := s.getSessionFromContext(c); sess != nil && sess.MustRegisterPasskey.Load() {
+			slog.Warn("OIDC authorize: session in MustRegisterPasskey bootstrap; refusing fast-path",
+				"user_id", sess.UserID,
+				"client_id", clientID,
+			)
+			target := s.portalOriginForRequest(c.Request)
+			if target == "" {
+				target = "/"
+			} else {
+				target = target + "/"
+			}
+			c.Redirect(http.StatusFound, target)
+			return
+		}
+	}
+
 	p, err := s.getOIDCProvider()
 	if err != nil {
 		c.Status(http.StatusInternalServerError)
@@ -355,18 +385,15 @@ func (s *GinServer) handleOIDCAuthorize(c *gin.Context) {
 		return
 	}
 
-	// Case 2: New authorize request - check if user already has a portal session
+	// Case 2: New authorize request — user already has a (non-gated) portal
+	// session ⇒ fast-path without bouncing through login.
 	if clientID != "" {
-		sess := s.getSessionFromContext(c)
-		if sess != nil {
+		if sess := s.getSessionFromContext(c); sess != nil {
 			slog.Info("OIDC authorize: user already authenticated, fast-path",
 				"user_id", sess.UserID,
 				"session_id", sess.ID,
 				"client_id", clientID,
 			)
-
-			// User is already logged in - create auth request and immediately complete it
-			// This avoids redirecting to login page
 			// RFC 20260122 §6.3: Pass portal session ID for logout propagation
 			s.handleOIDCAuthorizeFastPath(c, p, sess.UserID, sess.ID)
 			return

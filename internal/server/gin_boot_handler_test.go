@@ -89,7 +89,7 @@ func TestBoot_MustRegisterPasskey(t *testing.T) {
 	if !ok {
 		t.Fatal("session not found")
 	}
-	sess.MustRegisterPasskey = true
+	sess.MustRegisterPasskey.Store(true)
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/system/boot", nil)

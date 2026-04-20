@@ -35,8 +35,60 @@ func respondInviteError(c *gin.Context, err error) bool {
 	return false
 }
 
+// mapRegistrationError translates the typed errors returned by
+// WebAuthnManager.FinishRegistration into HTTP responses. Returns true if a
+// response was written (caller must return without further work).
+func (s *GinServer) mapRegistrationError(c *gin.Context, err error) bool {
+	if errors.Is(err, authpkg.ErrCeremonyNotFound) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ceremony expired or not found"})
+		return true
+	}
+	var dup *authpkg.AlreadyRegisteredError
+	if errors.As(err, &dup) {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":         "passkey_already_registered",
+			"credential_id": dup.CredentialID,
+			"rp_id":         dup.RPID,
+		})
+		return true
+	}
+	return false
+}
+
+// passkeyPresence captures the per-RP credential summary used by both the
+// session and boot handlers.
+type passkeyPresence struct {
+	HasPasskey bool
+	TotalCount int
+}
+
+// computePasskeyPresence derives the passkey summary for the given user/RP.
+// Falls back to a zero value when webauthnMgr is nil or the query fails.
+func (s *GinServer) computePasskeyPresence(c *gin.Context, userID, rpID string) passkeyPresence {
+	if s.webauthnMgr == nil || userID == "" {
+		return passkeyPresence{}
+	}
+	total, err := s.webauthnMgr.CountCredentials(c.Request.Context(), userID)
+	if err != nil {
+		return passkeyPresence{}
+	}
+	rpCount, err := s.webauthnMgr.CountByUserAndRP(c.Request.Context(), userID, rpID)
+	if err != nil {
+		return passkeyPresence{}
+	}
+	return passkeyPresence{
+		HasPasskey: rpCount > 0,
+		TotalCount: total,
+	}
+}
+
 // getAuthorizedCredential fetches a credential by path param and checks ownership or admin access.
 // Returns the credential and true on success, or responds with an error and returns false.
+//
+// Under MustRegisterPasskey=true (D-10 forcing-gate), admin-cross-user access
+// is suppressed: an attacker who reaches the bootscreen with a stolen admin
+// password must not be able to enumerate/destroy other users' credentials
+// before completing a passkey ceremony bound to an authenticator they control.
 func (s *GinServer) getAuthorizedCredential(c *gin.Context, sess *authpkg.Session) (*persistence.WebAuthnCredential, bool) {
 	credID := c.Param("id")
 	if credID == "" {
@@ -52,7 +104,8 @@ func (s *GinServer) getAuthorizedCredential(c *gin.Context, sess *authpkg.Sessio
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up passkey"})
 		return nil, false
 	}
-	if cred.UserID != sess.UserID && sess.Role != string(persistence.UserRoleAdmin) {
+	adminCrossUser := sess.Role == string(persistence.UserRoleAdmin) && !sess.MustRegisterPasskey.Load()
+	if cred.UserID != sess.UserID && !adminCrossUser {
 		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized"})
 		return nil, false
 	}
@@ -120,7 +173,7 @@ func (s *GinServer) handleLoginOptions(c *gin.Context) {
 	// plausibly use each method. We skip passwordless users because they
 	// can never authenticate with "password" — including them would keep
 	// the password form visible indefinitely.
-	methods := s.computeLoginOptionsUnion(c.Request.Context(), accessCtx, secure, rpID)
+	methods, derived := s.computeLoginOptionsUnion(c.Request.Context(), accessCtx, secure, rpID)
 
 	// When passkeys are disabled, strip "passkey" from methods
 	if s.webauthnMgr == nil {
@@ -133,35 +186,55 @@ func (s *GinServer) handleLoginOptions(c *gin.Context) {
 		methods = filtered
 	}
 
+	// Suppress the passkey button when no user has any credential for this RP.
+	if derived.NoPasskeyAnywhere {
+		filtered := methods[:0]
+		for _, m := range methods {
+			if m != "passkey" {
+				filtered = append(filtered, m)
+			}
+		}
+		methods = filtered
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"methods": methods,
-		"context": accessCtx.String(),
-		"rp_id":   rpID,
+		"methods":             methods,
+		"context":             accessCtx.String(),
+		"rp_id":               rpID,
+		"no_passkey_anywhere": derived.NoPasskeyAnywhere,
 	})
 }
 
-// computeLoginOptionsUnion evaluates AllowedMethods for each user who has a
-// password and returns the union of results. Users without passwords are
-// excluded because they can never use the "password" method — including them
-// would keep the password form visible even after all password-capable users
-// have registered passkeys.
-func (s *GinServer) computeLoginOptionsUnion(ctx context.Context, accessCtx authpkg.AccessContext, secure bool, rpID string) []string {
-	// If we can't query users, fall back to the most permissive set.
+// loginOptionsDerived carries flags used to shape the login UI.
+type loginOptionsDerived struct {
+	// NoPasskeyAnywhere is true when NO user has any credential for this RP.
+	// Drives the "suppress passkey button" rule at the login screen.
+	NoPasskeyAnywhere bool
+}
+
+// computeLoginOptionsUnion evaluates AllowedMethods for each password-capable
+// user and returns the union of results. Users without passwords are excluded
+// from method evaluation because they can never use "password" — including
+// them would keep the password form visible indefinitely.
+func (s *GinServer) computeLoginOptionsUnion(ctx context.Context, accessCtx authpkg.AccessContext, secure bool, rpID string) ([]string, loginOptionsDerived) {
+	derived := loginOptionsDerived{NoPasskeyAnywhere: true}
 	if s.userManager == nil {
-		return authpkg.AllowedMethods(accessCtx, secure, "", false)
+		return authpkg.AllowedMethods(accessCtx, secure, "", false), derived
 	}
 
 	users, err := s.userManager.List(ctx)
 	if err != nil {
-		return authpkg.AllowedMethods(accessCtx, secure, "", false)
+		return authpkg.AllowedMethods(accessCtx, secure, "", false), derived
 	}
 
-	// Bulk-fetch which users have passkeys for this RP (single query).
 	passkeyUsers := map[string]struct{}{}
 	if s.webauthnMgr != nil {
 		if set, err := s.webauthnMgr.UserIDsWithPasskeyForRP(ctx, rpID); err == nil {
 			passkeyUsers = set
 		}
+	}
+	if len(passkeyUsers) > 0 {
+		derived.NoPasskeyAnywhere = false
 	}
 
 	methodSet := make(map[string]struct{})
@@ -175,20 +248,13 @@ func (s *GinServer) computeLoginOptionsUnion(ctx context.Context, accessCtx auth
 		for _, m := range authpkg.AllowedMethods(accessCtx, secure, string(u.Role), hasPasskey) {
 			methodSet[m] = struct{}{}
 		}
-		// Max possible set is {"passkey","password"} — no point continuing.
-		if len(methodSet) >= 2 {
-			break
-		}
 	}
 
 	if !evaluated {
-		// No password-capable users found (e.g., only invite-based users).
-		// Return passkey-only since password is unusable by anyone.
-		return []string{"passkey"}
+		return []string{"passkey"}, derived
 	}
 
 	methods := make([]string, 0, len(methodSet))
-	// Stable order: known methods first, then any future additions.
 	for _, m := range []string{"passkey", "password"} {
 		if _, ok := methodSet[m]; ok {
 			methods = append(methods, m)
@@ -198,7 +264,7 @@ func (s *GinServer) computeLoginOptionsUnion(ctx context.Context, accessCtx auth
 	for m := range methodSet {
 		methods = append(methods, m)
 	}
-	return methods
+	return methods, derived
 }
 
 // --- Passkey Registration (authenticated) ---
@@ -265,8 +331,19 @@ func (s *GinServer) handlePasskeyRegisterFinish(c *gin.Context) {
 		c.Request.Context(), sessionID, rpDisplayName, parsedResponse,
 	)
 	if err != nil {
-		if errors.Is(err, authpkg.ErrCeremonyNotFound) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "ceremony expired or not found"})
+		// Benign-duplicate (same-user, same-credential): the authenticator
+		// ignored excludeCredentials and returned a credential we already
+		// have. The user demonstrably owns a passkey for this RP, so clear
+		// the forcing-gate before returning — otherwise they'd be stuck in
+		// bootscreen with a valid passkey they can't register again. Scope
+		// the clear to the credential's RP so cross-RP sessions (e.g. a
+		// remote-domain bootstrap) aren't silently unlocked by a LAN-only
+		// registration.
+		var dup *authpkg.AlreadyRegisteredError
+		if errors.As(err, &dup) {
+			s.sessions.ClearMustRegisterPasskey(sess.UserID, dup.RPID, s.getBaseDomain())
+		}
+		if s.mapRegistrationError(c, err) {
 			return
 		}
 		log.Printf("WARN: passkey register finish: %v", err)
@@ -274,7 +351,19 @@ func (s *GinServer) handlePasskeyRegisterFinish(c *gin.Context) {
 		return
 	}
 
-	sess.MustRegisterPasskey = false
+	// Clear the forcing gate across all of the user's sessions bound to the
+	// registered credential's RP (includes the caller's). A passkey
+	// registered on one device releases the gate on the user's other open
+	// sessions for the same RP — but NOT on sessions for a different RP (a
+	// LAN passkey must not unlock a remote-domain bootstrap). Residual race
+	// (self-healing): a login racing with this finish can re-set the flag
+	// on the new session because the login's hasPasskeyForRP check is
+	// TOCTOU against credential persistence; the user hits the gate once
+	// more and the next register-finish clears it idempotently.
+	if n := s.sessions.ClearMustRegisterPasskey(sess.UserID, cred.RPID, s.getBaseDomain()); n > 1 {
+		log.Printf("INFO: passkey register cleared forcing flag on %d sessions for user=%s (id=%s) rp=%s",
+			n, sess.User, sess.UserID, cred.RPID)
+	}
 
 	s.publishAuditEvent(c, "passkey.registered", map[string]any{
 		"user_id":       sess.UserID,
@@ -347,7 +436,7 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 
 	rpID := s.getRPID(c)
 
-	userID, err := s.webauthnMgr.FinishAuthentication(
+	authResult, err := s.webauthnMgr.FinishAuthentication(
 		c.Request.Context(), sessionID, rpDisplayName, parsedResponse,
 	)
 	if err != nil {
@@ -360,6 +449,20 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 			"rp_id":  rpID,
 			"reason": err.Error(),
 		})
+		// Genuine DB miss: include a Signal API hint so the frontend can prune
+		// the stale picker entry. Other failures (signature/origin/etc.) get
+		// the generic 401 with no leak.
+		var notFound *authpkg.CredentialNotFoundError
+		if errors.As(err, &notFound) {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "authentication failed",
+				"signal_unknown_credential": gin.H{
+					"rp_id":         notFound.RPID,
+					"credential_id": notFound.CredentialID,
+				},
+			})
+			return
+		}
 		log.Printf("WARN: passkey login finish: %v", err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
 		return
@@ -370,7 +473,7 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "user management unavailable"})
 		return
 	}
-	userInfo, err := s.userManager.Get(c.Request.Context(), userID)
+	userInfo, err := s.userManager.Get(c.Request.Context(), authResult.UserID)
 	if err != nil {
 		log.Printf("WARN: passkey login user lookup: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup failed"})
@@ -408,9 +511,12 @@ func (s *GinServer) handleListPasskeys(c *gin.Context) {
 		return
 	}
 
-	// Admin can list passkeys for another user via ?user_id=
+	// Admin can list passkeys for another user via ?user_id=, but not while
+	// MustRegisterPasskey is set — that gate exists to contain a stolen-admin-
+	// password attacker; cross-user enumeration would expand their reach.
 	targetUserID := sess.UserID
-	if qUserID := c.Query("user_id"); qUserID != "" && sess.Role == string(persistence.UserRoleAdmin) {
+	if qUserID := c.Query("user_id"); qUserID != "" &&
+		sess.Role == string(persistence.UserRoleAdmin) && !sess.MustRegisterPasskey.Load() {
 		targetUserID = qUserID
 	}
 
@@ -458,23 +564,40 @@ func (s *GinServer) handleDeletePasskey(c *gin.Context) {
 		return
 	}
 
+	// Under the MustRegisterPasskey forcing-gate, DELETE is admitted for the
+	// "inline legacy removal" bootstrap flow (delete stale cred then register
+	// a new one). Restrict that to the session's current RP — otherwise a
+	// remote-domain password-bootstrap session could delete the user's LAN
+	// passkeys before registering the required new one, destroying recovery
+	// paths the user had on a different network.
+	if sess.MustRegisterPasskey.Load() {
+		sessRPID := s.getRPID(c)
+		if sessRPID != "" && cred.RPID != sessRPID {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "passkey_registration_required",
+				"message": "Passkeys for other networks cannot be deleted before completing passkey registration here.",
+			})
+			return
+		}
+	}
+
 	ctx, cancel := s.opContext(c, 30*time.Second)
 	defer cancel()
-	credID := cred.ID
 
-	// Safety check: don't delete last credential for a passwordless user
-	count, err := s.webauthnMgr.CountCredentials(ctx, cred.UserID)
-	if err == nil && count <= 1 {
-		if s.userManager != nil {
-			user, userErr := s.userManager.Get(ctx, cred.UserID)
-			if userErr == nil && !user.HasPassword {
+	// Safety check: a passwordless user must retain at least one passkey,
+	// otherwise they'd have no way back in.
+	if s.userManager != nil {
+		user, userErr := s.userManager.Get(ctx, cred.UserID)
+		if userErr == nil && !user.HasPassword {
+			count, cErr := s.webauthnMgr.CountCredentials(ctx, cred.UserID)
+			if cErr == nil && count <= 1 {
 				c.JSON(http.StatusConflict, gin.H{"error": "cannot delete last passkey for passwordless user"})
 				return
 			}
 		}
 	}
 
-	if err := s.webauthnMgr.DeleteCredential(ctx, credID); err != nil {
+	if err := s.webauthnMgr.DeleteCredential(ctx, cred.ID); err != nil {
 		log.Printf("WARN: delete passkey: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete passkey"})
 		return
@@ -482,11 +605,15 @@ func (s *GinServer) handleDeletePasskey(c *gin.Context) {
 
 	s.publishAuditEvent(c, "passkey.deleted", map[string]any{
 		"user_id":       cred.UserID,
-		"credential_id": credID,
+		"credential_id": cred.ID,
 		"deleted_by":    sess.UserID,
 	})
 
-	c.JSON(http.StatusOK, gin.H{"message": "ok"})
+	c.JSON(http.StatusOK, gin.H{
+		"message":       "ok",
+		"rp_id":         cred.RPID,
+		"credential_id": cred.ID,
+	})
 }
 
 // handleRenamePasskey: PATCH /api/v1/auth/passkeys/:id
@@ -734,8 +861,7 @@ func (s *GinServer) handleInvitePasskeyFinish(c *gin.Context) {
 	// cancelled, etc.), the invite remains valid and can be retried.
 	cred, err := s.webauthnMgr.FinishRegistration(ctx, sessionID, rpDisplayName, parsedResponse)
 	if err != nil {
-		if errors.Is(err, authpkg.ErrCeremonyNotFound) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "ceremony expired or not found"})
+		if s.mapRegistrationError(c, err) {
 			return
 		}
 		log.Printf("WARN: invite passkey finish registration: %v", err)
@@ -786,7 +912,11 @@ func (s *GinServer) handleInvitePasskeyFinish(c *gin.Context) {
 	)
 	s.setSessionCookie(c, sess.ID, portalSessionCookieTTL)
 
-	c.JSON(http.StatusOK, gin.H{"message": "ok"})
+	c.JSON(http.StatusOK, gin.H{
+		"message":       "ok",
+		"credential_id": cred.ID,
+		"created_at":    cred.CreatedAt.Format(time.RFC3339),
+	})
 }
 
 // handleReinviteUser: POST /api/v1/users/:id/reinvite

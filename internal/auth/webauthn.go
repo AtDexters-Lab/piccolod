@@ -20,7 +20,44 @@ var (
 	ErrWebAuthnDisabled  = errors.New("passkey authentication is disabled")
 	ErrCeremonyNotFound  = errors.New("ceremony session not found or expired")
 	ErrCeremonyStoreFull = errors.New("too many pending ceremonies")
+
+	// ErrPasskeyAlreadyRegistered indicates a registration ceremony returned a
+	// credential ID that already exists — a benign duplicate. The frontend
+	// shows a non-destructive "already registered" message.
+	ErrPasskeyAlreadyRegistered = errors.New("passkey already registered")
+
+	// ErrCredentialNotFoundInDB indicates a discoverable login asserted a
+	// credential ID that is not registered server-side. Distinct from generic
+	// auth failures so handlers can include a Signal API hint to prune the
+	// stale picker entry without leaking other validation failure modes.
+	ErrCredentialNotFoundInDB = errors.New("credential not found in db")
 )
+
+// AlreadyRegisteredError carries the existing credential ID alongside
+// ErrPasskeyAlreadyRegistered. Wrap-checked via errors.As.
+type AlreadyRegisteredError struct {
+	CredentialID string
+	RPID         string
+}
+
+func (e *AlreadyRegisteredError) Error() string {
+	return ErrPasskeyAlreadyRegistered.Error()
+}
+
+func (e *AlreadyRegisteredError) Unwrap() error { return ErrPasskeyAlreadyRegistered }
+
+// CredentialNotFoundError carries the missing credential ID and RP ID alongside
+// ErrCredentialNotFoundInDB. Wrap-checked via errors.As.
+type CredentialNotFoundError struct {
+	CredentialID string
+	RPID         string
+}
+
+func (e *CredentialNotFoundError) Error() string {
+	return ErrCredentialNotFoundInDB.Error()
+}
+
+func (e *CredentialNotFoundError) Unwrap() error { return ErrCredentialNotFoundInDB }
 
 type ceremonyType string
 
@@ -139,10 +176,15 @@ func (m *WebAuthnManager) BeginRegistration(ctx context.Context, userID, usernam
 		credentials: creds,
 	}
 
+	// Single AuthenticatorSelection struct: WithAuthenticatorSelection replaces the
+	// entire struct, so residentKey/requireResidentKey/userVerification must be set
+	// together. Splitting these across multiple options silently wipes residentKey
+	// and produces non-discoverable credentials that won't appear in the picker.
 	options, session, err := w.BeginRegistration(user,
-		webauthn.WithResidentKeyRequirement(protocol.ResidentKeyRequirementRequired),
 		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
-			UserVerification: userVerification,
+			ResidentKey:        protocol.ResidentKeyRequirementRequired,
+			RequireResidentKey: protocol.ResidentKeyRequired(),
+			UserVerification:   userVerification,
 		}),
 		webauthn.WithExclusions(webauthn.Credentials(creds).CredentialDescriptors()),
 	)
@@ -166,6 +208,9 @@ func (m *WebAuthnManager) BeginRegistration(ctx context.Context, userID, usernam
 }
 
 // FinishRegistration completes registration and stores the credential.
+// BeginRegistration sets residentKey=Required so every persisted credential
+// is guaranteed discoverable. If the response carries a credential ID that
+// already exists for this user, returns an *AlreadyRegisteredError.
 func (m *WebAuthnManager) FinishRegistration(ctx context.Context, sessionID string, rpDisplayName string, parsedResponse *protocol.ParsedCredentialCreationData) (*persistence.WebAuthnCredential, error) {
 	if m.disabled {
 		return nil, ErrWebAuthnDisabled
@@ -201,6 +246,27 @@ func (m *WebAuthnManager) FinishRegistration(ctx context.Context, sessionID stri
 		return nil, fmt.Errorf("create credential: %w", err)
 	}
 
+	credID := base64.RawURLEncoding.EncodeToString(credential.ID)
+
+	// Re-registration over an existing entry: some authenticators ignore the
+	// excludeCredentials hint and return a credential whose ID is already in
+	// our DB. Surface AlreadyRegisteredError so the frontend shows a
+	// non-destructive "already registered" message.
+	if existing, getErr := m.credRepo.Get(ctx, credID); getErr == nil {
+		// Cross-user collision: credential ID already belongs to a DIFFERENT
+		// user. Extremely unlikely (credential IDs are ≥16 random bytes), but
+		// echoing the foreign credential ID to the caller would drive a dead-
+		// end delete flow (DELETE is cross-user-gated → 403). Return a
+		// generic registration failure instead.
+		if existing.UserID != cs.UserID {
+			return nil, fmt.Errorf("create credential: id collision")
+		}
+		return nil, &AlreadyRegisteredError{
+			CredentialID: existing.ID,
+			RPID:         existing.RPID,
+		}
+	}
+
 	var transports []string
 	for _, t := range credential.Transport {
 		transports = append(transports, string(t))
@@ -208,7 +274,7 @@ func (m *WebAuthnManager) FinishRegistration(ctx context.Context, sessionID stri
 
 	now := time.Now().UTC()
 	cred := persistence.WebAuthnCredential{
-		ID:              base64.RawURLEncoding.EncodeToString(credential.ID),
+		ID:              credID,
 		UserID:          cs.UserID,
 		PublicKey:       credential.PublicKey,
 		AttestationType: credential.AttestationType,
@@ -226,7 +292,6 @@ func (m *WebAuthnManager) FinishRegistration(ctx context.Context, sessionID stri
 	if err := m.credRepo.Create(ctx, cred); err != nil {
 		return nil, fmt.Errorf("store credential: %w", err)
 	}
-
 	return &cred, nil
 }
 
@@ -261,23 +326,50 @@ func (m *WebAuthnManager) BeginAuthentication(ctx context.Context, rpID, rpDispl
 	return options, sessionID, nil
 }
 
-// FinishAuthentication completes authentication and returns the authenticated user ID.
-func (m *WebAuthnManager) FinishAuthentication(ctx context.Context, sessionID, rpDisplayName string, parsedResponse *protocol.ParsedCredentialAssertionData) (string, error) {
+// AuthenticationResult bundles the authenticated user ID after a successful
+// passkey assertion.
+type AuthenticationResult struct {
+	UserID string
+}
+
+// FinishAuthentication completes authentication and returns the authenticated user.
+//
+// If the parsed response carries a credential ID that does not exist in the DB,
+// returns *CredentialNotFoundError so the handler can include a Signal API
+// pruning hint without conflating with other validation failures.
+func (m *WebAuthnManager) FinishAuthentication(ctx context.Context, sessionID, rpDisplayName string, parsedResponse *protocol.ParsedCredentialAssertionData) (*AuthenticationResult, error) {
 	if m.disabled {
-		return "", ErrWebAuthnDisabled
+		return nil, ErrWebAuthnDisabled
 	}
 
 	cs, err := m.ceremonies.Consume(sessionID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if cs.Type != ceremonyAuthentication {
-		return "", errors.New("invalid ceremony type")
+		return nil, errors.New("invalid ceremony type")
 	}
 
 	w, err := newWebAuthn(cs.RPID, rpDisplayName, cs.RPOrigin)
 	if err != nil {
-		return "", fmt.Errorf("create webauthn: %w", err)
+		return nil, fmt.Errorf("create webauthn: %w", err)
+	}
+
+	// Pre-check: if the asserted credential ID is not in our DB, surface a
+	// typed sentinel so the handler can emit a signalUnknownCredential hint.
+	// This is checked before ValidateDiscoverableLogin so the "genuine DB
+	// miss" condition is mechanically distinct from signature/origin/etc.
+	// failures, which the library surfaces via generic *protocol.Error and
+	// would otherwise be brittle to pattern-match.
+	assertedCredID := base64.RawURLEncoding.EncodeToString(parsedResponse.RawID)
+	if _, getErr := m.credRepo.Get(ctx, assertedCredID); getErr != nil {
+		if errors.Is(getErr, persistence.ErrNotFound) {
+			return nil, &CredentialNotFoundError{
+				CredentialID: assertedCredID,
+				RPID:         cs.RPID,
+			}
+		}
+		return nil, fmt.Errorf("lookup credential: %w", getErr)
 	}
 
 	handler := func(rawID, userHandle []byte) (webauthn.User, error) {
@@ -296,7 +388,7 @@ func (m *WebAuthnManager) FinishAuthentication(ctx context.Context, sessionID, r
 
 	credential, err := w.ValidateDiscoverableLogin(handler, *cs.SessionData, parsedResponse)
 	if err != nil {
-		return "", fmt.Errorf("validate login: %w", err)
+		return nil, fmt.Errorf("validate login: %w", err)
 	}
 
 	credID := base64.RawURLEncoding.EncodeToString(credential.ID)
@@ -304,8 +396,9 @@ func (m *WebAuthnManager) FinishAuthentication(ctx context.Context, sessionID, r
 		log.Printf("WARN: webauthn: update credential after auth: %v", err)
 	}
 
-	userID := string(parsedResponse.Response.UserHandle)
-	return userID, nil
+	return &AuthenticationResult{
+		UserID: string(parsedResponse.Response.UserHandle),
+	}, nil
 }
 
 // ListCredentials returns all credentials for a user.
@@ -338,15 +431,16 @@ func (m *WebAuthnManager) HasCredentialsForRP(ctx context.Context, userID, rpID 
 }
 
 // UserIDsWithPasskeyForRP returns the set of user IDs that have at least one
-// credential for the given RP ID. Single query, avoids N+1 per-user lookups.
+// credential for the given RP ID. Single query, avoids N+1 per-user lookups
+// and avoids pulling credential blobs (uses ListUserIDsByRP).
 func (m *WebAuthnManager) UserIDsWithPasskeyForRP(ctx context.Context, rpID string) (map[string]struct{}, error) {
-	creds, err := m.credRepo.ListByRP(ctx, rpID)
+	uids, err := m.credRepo.ListUserIDsByRP(ctx, rpID)
 	if err != nil {
 		return nil, err
 	}
-	set := make(map[string]struct{}, len(creds))
-	for _, c := range creds {
-		set[c.UserID] = struct{}{}
+	set := make(map[string]struct{}, len(uids))
+	for _, uid := range uids {
+		set[uid] = struct{}{}
 	}
 	return set, nil
 }
@@ -356,9 +450,9 @@ func (m *WebAuthnManager) CountCredentials(ctx context.Context, userID string) (
 	return m.credRepo.CountByUser(ctx, userID)
 }
 
-// CountByUserSplitRP returns both total credential count and RP-specific count in a single query.
-func (m *WebAuthnManager) CountByUserSplitRP(ctx context.Context, userID, rpID string) (int, int, error) {
-	return m.credRepo.CountByUserSplitRP(ctx, userID, rpID)
+// CountByUserAndRP returns the credential count for the (user, rp) pair.
+func (m *WebAuthnManager) CountByUserAndRP(ctx context.Context, userID, rpID string) (int, error) {
+	return m.credRepo.CountByUserAndRP(ctx, userID, rpID)
 }
 
 // --- Ceremony Store ---

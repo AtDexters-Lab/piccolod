@@ -169,7 +169,7 @@ func (s *GinServer) requireSession() gin.HandlerFunc {
 			return
 		}
 		origin := s.computeCanonicalOrigin(c)
-		_, ok = s.sessions.ValidatePortalSession(id, origin)
+		sess, ok := s.sessions.ValidatePortalSession(id, origin)
 		if !ok {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			c.Abort()
@@ -183,16 +183,54 @@ func (s *GinServer) requireSession() gin.HandlerFunc {
 		}
 
 		// Enforce MustRegisterPasskey: block dashboard access until the user
-		// registers a passkey. The allow-list covers setup-flow endpoints
-		// that run between session creation and passkey registration
-		// (recovery key generation, CSRF, session status).
-		if sess, ok := s.sessions.Get(id); ok && sess.MustRegisterPasskey {
+		// registers a passkey. Allowlist covers setup-flow endpoints that run
+		// between session creation and passkey registration, plus the inline
+		// "remove legacy entry then register" flow (C6, D-10).
+		//
+		// Allowed under MustRegisterPasskey:
+		//   - /api/v1/auth/passkey/register/*       — ceremony
+		//   - /api/v1/auth/session, /logout, /csrf
+		//   - GET /api/v1/auth/passkeys             — list, so the bootscreen can
+		//                                              show what to delete
+		//   - DELETE /api/v1/auth/passkeys/:id      — inline legacy removal
+		//   - /api/v1/crypto/recovery-key/...      — admitted by prefix; today
+		//     the only route under requireSession with this prefix is the
+		//     mutator below, denied at the handler. The prefix admission is
+		//     defensive: any future read-only recovery endpoint registered
+		//     under requireSession is reachable for the bootstrap-screen view
+		//     flow without re-touching this allowlist.
+		//
+		// Notably DENIED even though under /crypto/recovery-key/ prefix:
+		//   - POST /api/v1/crypto/recovery-key/generate — state-mutating; the
+		//     handler enforces this with an explicit 403 (C7) belt-and-
+		//     suspenders against future allowlist regressions.
+		if sess.MustRegisterPasskey.Load() {
 			path := c.Request.URL.Path
-			if !strings.HasPrefix(path, "/api/v1/auth/passkey/register/") &&
-				!strings.HasPrefix(path, "/api/v1/auth/session") &&
-				!strings.HasPrefix(path, "/api/v1/auth/logout") &&
-				!strings.HasPrefix(path, "/api/v1/auth/csrf") &&
-				!strings.HasPrefix(path, "/api/v1/crypto/recovery-key/") {
+			method := c.Request.Method
+			allowed := false
+			switch {
+			case strings.HasPrefix(path, "/api/v1/auth/passkey/register/"):
+				allowed = true
+			case strings.HasPrefix(path, "/api/v1/auth/session"),
+				strings.HasPrefix(path, "/api/v1/auth/logout"),
+				strings.HasPrefix(path, "/api/v1/auth/csrf"):
+				allowed = true
+			case path == "/api/v1/auth/passkeys" && method == http.MethodGet:
+				allowed = true
+			case strings.HasPrefix(path, "/api/v1/auth/passkeys/") && method == http.MethodDelete:
+				allowed = true
+			case strings.HasPrefix(path, "/api/v1/crypto/recovery-key/"):
+				// Read paths permitted; mutators denied at handler level (C7).
+				allowed = true
+			case path == "/api/v1/telemetry/log" && method == http.MethodPost:
+				// Admit error telemetry: the forced-registration window is
+				// precisely when passkey-related errors are most likely, and
+				// blocking telemetry here means the operator loses visibility
+				// into exactly the failures that matter. Telemetry is append-
+				// only; it grants no additional capability to an attacker.
+				allowed = true
+			}
+			if !allowed {
 				c.JSON(http.StatusForbidden, gin.H{
 					"error":   "passkey_registration_required",
 					"message": "You must register a passkey before accessing the dashboard.",

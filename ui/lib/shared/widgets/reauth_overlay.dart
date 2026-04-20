@@ -86,6 +86,7 @@ class _ReauthOverlayState extends State<ReauthOverlay> {
       widget.onSuccess();
     } on ApiException catch (e) {
       if (_handleLockedError(e)) return;
+      WebAuthnService.maybeSignalFromApiError(e);
       if (mounted) {
         setState(() {
           _isLoading = false;

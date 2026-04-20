@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/argon2"
@@ -343,9 +345,14 @@ type Session struct {
 	CSRF            string
 	ExpiresAt       int64  // unix seconds
 	Audience        string // RFC 20260122 §6.2: "portal" | "app:<appname>" - binds session to specific context
-	BoundOrigin         string // RFC 20260122 §6.2: Canonical origin (scheme://host[:port]) - prevents cross-origin replay
-	ParentSessionID     string // RFC 20260122 §6.3: For app sessions, ID of portal session that authorized this session
-	MustRegisterPasskey bool   // Set during bootstrap login over remote — user must register a passkey
+	BoundOrigin     string // RFC 20260122 §6.2: Canonical origin (scheme://host[:port]) - prevents cross-origin replay
+	ParentSessionID string // RFC 20260122 §6.3: For app sessions, ID of portal session that authorized this session
+	// MustRegisterPasskey: set during bootstrap login over remote — user must
+	// register a passkey. Accessed atomically because ClearMustRegisterPasskey
+	// fans out writes across sessions concurrently with lock-free reads from
+	// request handlers that dereference *Session after SessionStore.Get()
+	// releases its lock.
+	MustRegisterPasskey atomic.Bool
 }
 
 type SessionStore struct {
@@ -582,6 +589,67 @@ func originsMatchIgnoringScheme(a, b string) bool {
 	hostA := normalize(a)
 	hostB := normalize(b)
 	return hostA != "" && hostA == hostB
+}
+
+// SetMustRegisterPasskey sets MustRegisterPasskey=true on the session.
+// Returns false if the session is missing. The field is atomic.Bool, so this
+// composes safely with concurrent ClearMustRegisterPasskey fanouts and lock-
+// free reads from request handlers.
+func (s *SessionStore) SetMustRegisterPasskey(id string) bool {
+	if id == "" {
+		return false
+	}
+	s.mu.RLock()
+	sess, ok := s.sessions[id]
+	s.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	sess.MustRegisterPasskey.Store(true)
+	return true
+}
+
+// ClearMustRegisterPasskey clears the forcing gate on every live session
+// belonging to userID whose BoundOrigin maps to rpID under the provided
+// baseDomain. Returns the number of sessions updated. Called after
+// /register/finish so a passkey registered on one device releases the gate
+// on the user's other open sessions for the SAME RP — without the RP
+// scoping, a LAN (`piccolo.local`) registration would also clear a
+// remote-domain session whose bootstrap was allowed precisely because the
+// remote RP had no credential, bypassing the per-RP forcing gate.
+func (s *SessionStore) ClearMustRegisterPasskey(userID, rpID, baseDomain string) int {
+	if userID == "" || rpID == "" {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, sess := range s.sessions {
+		if sess.UserID != userID {
+			continue
+		}
+		if DetermineRPID(hostFromOrigin(sess.BoundOrigin), baseDomain) != rpID {
+			continue
+		}
+		if sess.MustRegisterPasskey.CompareAndSwap(true, false) {
+			n++
+		}
+	}
+	return n
+}
+
+// hostFromOrigin extracts the host (including port, if present) from a
+// canonical origin URL like "https://piccolo.local:8080". Returns origin
+// unchanged if parsing fails — DetermineRPID's own normalization handles
+// the port and case.
+func hostFromOrigin(origin string) string {
+	if origin == "" {
+		return ""
+	}
+	if u, err := url.Parse(origin); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return origin
 }
 
 // DeleteWithPropagation deletes a portal session and all derived app sessions per RFC 20260122 §6.3.
