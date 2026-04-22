@@ -388,6 +388,9 @@ func (s *stubRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool
 func (s *stubRootfsManager) ResizeWorkspace(_ context.Context, _ string, _ int64) error {
 	return nil
 }
+func (s *stubRootfsManager) ResizeApplication(_ context.Context, _ string, _ int64) error {
+	return nil
+}
 
 func sanitize(s string) string {
 	if len(s) > 12 {

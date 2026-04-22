@@ -1046,3 +1046,63 @@ func (m *luksVolumeManager) ResizeWorkspace(ctx context.Context, volumeID string
 	log.Printf("INFO: workspace %s resized to %d bytes", volumeID, newSizeBytes)
 	return nil
 }
+
+// ResizeApplication grows a per-app application volume (type=service-data)
+// to the specified size. Same primitive chain as ResizeWorkspace except
+// the filesystem is ext4, so resize2fs is used instead of btrfs online
+// grow. Application volumes are not in rootfsMounts; the mount path is
+// derived from paths.MountDir and the mapper name from the volume ID.
+func (m *luksVolumeManager) ResizeApplication(ctx context.Context, volumeID string, newSizeBytes int64) error {
+	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
+	meta, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		return fmt.Errorf("read metadata: %w", err)
+	}
+	if meta.Type != "service-data" {
+		return fmt.Errorf("volume %s is type %s, not service-data (application)", volumeID, meta.Type)
+	}
+	if newSizeBytes <= meta.SizeBytes {
+		return fmt.Errorf("new size %d must be larger than current %d", newSizeBytes, meta.SizeBytes)
+	}
+
+	if err := m.checkThinPoolCapacity(ctx); err != nil {
+		return fmt.Errorf("pool capacity: %w", err)
+	}
+
+	if err := m.lvMgr.ResizeLV(ctx, meta.LVName, newSizeBytes); err != nil {
+		return fmt.Errorf("lvresize: %w", err)
+	}
+
+	// If the volume is currently attached (stack open + mounted), resize
+	// the LUKS mapper and ext4 filesystem inline. Otherwise, resize will
+	// occur naturally on next attach (or manual remount).
+	m.mu.Lock()
+	stackOpen := m.stacks[volumeID] != nil
+	m.mu.Unlock()
+	if stackOpen {
+		mapper := "piccolo-vol-" + volumeID
+		if err := m.run.Run(ctx, "cryptsetup", "resize", mapper); err != nil {
+			return fmt.Errorf("cryptsetup resize: %w", err)
+		}
+		mountDir := paths.MountDir(volumeID)
+		if err := m.run.Run(ctx, "resize2fs", "/dev/mapper/"+mapper); err != nil {
+			// resize2fs can take a mount point OR a device; the mapper is
+			// the safer target (works whether mounted or not).
+			return fmt.Errorf("resize2fs: %w", err)
+		}
+		_ = mountDir // reserved for future fs-specific fallbacks
+	}
+
+	meta.SizeBytes = newSizeBytes
+	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
+		return fmt.Errorf("update metadata: %w", err)
+	}
+
+	// Record cooldown to prevent the auto-resize monitor from racing.
+	m.mu.Lock()
+	m.wsResizeCooldown[volumeID] = time.Now()
+	m.mu.Unlock()
+
+	log.Printf("INFO: application volume %s resized to %d bytes", volumeID, newSizeBytes)
+	return nil
+}

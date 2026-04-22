@@ -22,10 +22,12 @@ services:
         data:
           container: /data
           size_limit: 1GB
-    resources:
-      limits:
-        memory: 512MB
-        cpu: 0.5
+
+resources:
+  priority: normal
+  memory:
+    min_required: 512MB
+    profile: bounded
 
 x-piccolo:
   mode: service

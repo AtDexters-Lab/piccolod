@@ -1374,7 +1374,11 @@ func (s *GinServer) deriveAppHealth(inst *app.AppInstance) *services.ListenerHea
 	return nil
 }
 
-// handleAppResizeStorage handles POST /api/v1/apps/:name/resize-storage
+// handleAppResizeStorage handles POST /api/v1/apps/:name/resize-storage.
+// Dispatches by volume type: workspace-mode apps resize their workspace
+// rootfs volume; service-mode apps resize the per-app application
+// volume (service-data) that holds their /data. Route shape and request
+// body are unchanged from before the resource-stewardship change.
 func (s *GinServer) handleAppResizeStorage(c *gin.Context) {
 	appName := c.Param("name")
 	ctx := c.Request.Context()
@@ -1403,20 +1407,35 @@ func (s *GinServer) handleAppResizeStorage(c *gin.Context) {
 		return
 	}
 
-	volumeID := rootfs.RootfsVolumeID("workspace", inst.InstanceID)
-	if !rootfs.RootfsExists(volumeID) {
-		writeGinError(c, http.StatusBadRequest, "App '"+appName+"' does not have a workspace volume")
-		return
-	}
-	if err := rootfs.ResizeWorkspace(ctx, volumeID, req.SizeBytes); err != nil {
-		log.Printf("WARN: resize workspace %s: %v", volumeID, err)
-		writeGinError(c, http.StatusInternalServerError, "Resize failed")
+	// Prefer workspace-volume resize when present (workspace-mode apps).
+	// Fall back to the per-app application volume (service-mode).
+	workspaceVolumeID := rootfs.RootfsVolumeID("workspace", inst.InstanceID)
+	if rootfs.RootfsExists(workspaceVolumeID) {
+		if err := rootfs.ResizeWorkspace(ctx, workspaceVolumeID, req.SizeBytes); err != nil {
+			log.Printf("WARN: resize workspace %s: %v", workspaceVolumeID, err)
+			writeGinError(c, http.StatusInternalServerError, "Resize failed")
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":      "resized",
+			"volume_id":   workspaceVolumeID,
+			"volume_kind": "workspace",
+			"size_bytes":  req.SizeBytes,
+		})
 		return
 	}
 
+	// Service-mode app: resize the per-app application volume (app-<instanceID>).
+	appVolumeID := "app-" + inst.InstanceID
+	if err := rootfs.ResizeApplication(ctx, appVolumeID, req.SizeBytes); err != nil {
+		log.Printf("WARN: resize application volume %s: %v", appVolumeID, err)
+		writeGinError(c, http.StatusInternalServerError, "Resize failed")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"status":     "resized",
-		"volume_id":  volumeID,
-		"size_bytes": req.SizeBytes,
+		"status":      "resized",
+		"volume_id":   appVolumeID,
+		"volume_kind": "application",
+		"size_bytes":  req.SizeBytes,
 	})
 }

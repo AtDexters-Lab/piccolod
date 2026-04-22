@@ -238,15 +238,13 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		}
 	}
 
-	if svc.Resources != nil && svc.Resources.Limits != nil {
-		spec.Resources = container.ResourceLimits{
-			Memory: svc.Resources.Limits.Memory,
-			CPU:    fmt.Sprintf("%.1f", svc.Resources.Limits.CPU),
-		}
-	}
-
-	// Resource limit defaults: pids-limit and nofile are always set to prevent
-	// fork bombs and file descriptor exhaustion. Manifest permissions can override.
+	// Memory and CPU limits are enforced at the per-app-user systemd slice
+	// (see internal/container/slice_policy.go). Per-service Resources blocks
+	// in the manifest no longer drive container-scope limits.
+	//
+	// Per-container pids-limit and nofile defaults are applied here because
+	// they are per-process guards (fork-bomb / fd-exhaustion) and not a
+	// shared-resource concern.
 	const defaultPidsLimit = 4096
 	const defaultNofileLimit = 65536
 	spec.Resources.PidsLimit = defaultPidsLimit

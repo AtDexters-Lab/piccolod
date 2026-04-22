@@ -16,6 +16,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/container"
 	"piccolod/internal/hostname"
+	"piccolod/internal/resources"
 
 	"gopkg.in/yaml.v3"
 )
@@ -248,7 +249,6 @@ func validateRawServicesBlocks(root *yaml.Node) error {
 		"bind_ports":  {},
 		"environment": {},
 		"storage":     {},
-		"resources":   {},
 		"oidc_client": {},
 	}
 
@@ -271,12 +271,69 @@ func validateRawServicesBlocks(root *yaml.Node) error {
 			if field == "wait_for" {
 				return fmt.Errorf("services.%s.wait_for is not supported yet", name)
 			}
+			if field == "resources" {
+				return fmt.Errorf("services.%s.resources is no longer supported (pre-v2 resource-stewardship schema); the resources block now lives at the app top level. Run 'piccolod catalog sync' to fetch an updated manifest.", name)
+			}
 			if _, ok := allowedServiceKeys[field]; !ok {
 				return fmt.Errorf("services.%s contains unsupported field '%s'", name, field)
 			}
 		}
 	}
 
+	return nil
+}
+
+// validateRawServicesNoResources rejects per-service `resources` blocks at
+// the raw-YAML stage. Called from both ParseAppSchema (loose parse) and
+// ParseAppDefinition (full parse) so the legacy shape is consistently
+// rejected regardless of entry point. See plans/resource-stewardship.md D-6.
+func validateRawServicesNoResources(root *yaml.Node) error {
+	services := topLevelValue(root, "services")
+	if services == nil || services.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(services.Content); i += 2 {
+		svcKey := services.Content[i]
+		svcVal := services.Content[i+1]
+		if svcKey == nil || svcKey.Kind != yaml.ScalarNode {
+			continue
+		}
+		if svcVal == nil || svcVal.Kind != yaml.MappingNode {
+			continue
+		}
+		for j := 0; j+1 < len(svcVal.Content); j += 2 {
+			fieldKey := svcVal.Content[j]
+			if fieldKey == nil || fieldKey.Kind != yaml.ScalarNode {
+				continue
+			}
+			if fieldKey.Value == "resources" {
+				return fmt.Errorf("services.%s.resources is no longer supported (pre-v2 resource-stewardship schema); the resources block now lives at the app top level. Run 'piccolod catalog sync' to fetch an updated manifest.", svcKey.Value)
+			}
+		}
+	}
+	return nil
+}
+
+// validateRawResourcesShape rejects pre-v2 resource-stewardship schema at the
+// raw-YAML stage. Triggers a hard parse error with a catalog-sync hint when:
+//   - top-level resources.limits is present (legacy shape pre-RFC)
+//
+// Per-service resources blocks are rejected by validateRawServicesNoResources.
+// See plans/resource-stewardship.md D-6.
+func validateRawResourcesShape(root *yaml.Node) error {
+	resources := topLevelValue(root, "resources")
+	if resources == nil || resources.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(resources.Content); i += 2 {
+		k := resources.Content[i]
+		if k == nil || k.Kind != yaml.ScalarNode {
+			continue
+		}
+		if k.Value == "limits" {
+			return fmt.Errorf("resources.limits is no longer supported (pre-v2 resource-stewardship schema); declare priority/memory/storage at the resources top level. Run 'piccolod catalog sync' to fetch an updated manifest.")
+		}
+	}
 	return nil
 }
 
@@ -302,6 +359,17 @@ func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
 	}
 	// RFC 20260130: Reject primary field in listener YAML even during schema parsing
 	if err := validateRawListenersNoPrimary(&root); err != nil {
+		return nil, err
+	}
+	// Resource-stewardship: reject pre-v2 resource schema at the raw-YAML
+	// stage in all parse paths (both ParseAppSchema and ParseAppDefinition).
+	// Legacy shapes silently drop through YAML decode otherwise, because the
+	// new AppResources struct has no `limits` field and unknown keys are
+	// ignored by the gopkg.in/yaml.v3 decoder. See plans/resource-stewardship.md D-6.
+	if err := validateRawResourcesShape(&root); err != nil {
+		return nil, err
+	}
+	if err := validateRawServicesNoResources(&root); err != nil {
 		return nil, err
 	}
 
@@ -526,6 +594,9 @@ func ParseAppDefinition(content []byte) (*api.AppDefinition, error) {
 		return nil, fmt.Errorf("depends_on is not supported; dependencies must be packaged as sidecars")
 	}
 	if err := validateRawServicesBlocks(&root); err != nil {
+		return nil, err
+	}
+	if err := validateRawResourcesShape(&root); err != nil {
 		return nil, err
 	}
 	// RFC 20260130: Reject primary field in listener YAML - it's set programmatically only
@@ -762,9 +833,11 @@ func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
 		if app.Storage != nil {
 			return fmt.Errorf("storage must be specified per-service under services for service mode apps")
 		}
-		if app.Resources != nil {
-			return fmt.Errorf("resources must be specified per-service under services for service mode apps")
-		}
+		// app.Resources (resource-stewardship) IS valid at the app level for service
+		// mode — the block enforces priority/memory/storage at the per-app-user slice
+		// covering all services collectively. Per-service resources are rejected at
+		// the raw-YAML stage. Field validation happens via validateResources called
+		// from ValidateAppDefinition before we reach this mode-specific switch.
 		for name, svc := range app.Services {
 			if svc.Init == "image" {
 				return fmt.Errorf("services.%s.init: 'image' is only valid for workspace mode apps", name)
@@ -802,9 +875,9 @@ func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
 		if app.Storage != nil {
 			return fmt.Errorf("storage must be specified per-service under services for workspace mode apps")
 		}
-		if app.Resources != nil {
-			return fmt.Errorf("resources must be specified per-service under services for workspace mode apps")
-		}
+		// app.Resources (resource-stewardship) IS valid at the app level for workspace
+		// mode — same semantics as service mode. Field validation happens via
+		// validateResources called from ValidateAppDefinition.
 
 		for name, svc := range app.Services {
 			if svc.InitScript != nil {
@@ -857,9 +930,10 @@ func validateServices(services map[string]api.AppService, primary string, listen
 		if svc.BindPorts == nil {
 			return fmt.Errorf("services.%s.bind_ports is required (may be empty)", name)
 		}
-		if err := validateResources(svc.Resources); err != nil {
-			return fmt.Errorf("services.%s.resources invalid: %w", name, err)
-		}
+		// Per-service resources blocks are no longer accepted. The resource-stewardship
+		// schema places all memory/CPU/storage declarations at the app level. Detection
+		// of legacy per-service resources blocks happens at the raw-YAML scan stage
+		// (see validateRawServicesNoResources in this file).
 		if err := validateStorage(svc.Storage); err != nil {
 			return fmt.Errorf("services.%s.storage invalid: %w", name, err)
 		}
@@ -1437,36 +1511,70 @@ func validateStorageVolumes(volumes map[string]api.AppVolume, storageType string
 	return nil
 }
 
-// validateResources validates resource limits
+// validateResources validates the app-level resource-stewardship block.
+// Authors declare classifications (priority, profile) plus a memory floor;
+// runtime derives kernel knobs. No target/ceiling numbers in the manifest
+// itself. See plans/resource-stewardship.md D-1, D-2, D-5, D-6.
 func validateResources(resources *api.AppResources) error {
-	if resources == nil || resources.Limits == nil {
-		return nil // Resources are optional
+	if resources == nil {
+		return nil // Resources block is optional at the app level.
 	}
 
-	limits := resources.Limits
+	// Decode-time catch-all for legacy `resources.limits` that slipped past
+	// the raw-YAML shape check (e.g. alias/merge-key smuggling). The raw
+	// scan is the primary rejection path; this is the belt-and-suspenders.
+	if resources.LegacyLimits != nil {
+		return fmt.Errorf("resources.limits is no longer supported (pre-v2 resource-stewardship schema); declare priority/memory/storage at the resources top level. Run 'piccolod catalog sync' to fetch an updated manifest.")
+	}
 
-	// Validate memory limit
-	if limits.Memory != "" {
-		if err := validateSizeLimit(limits.Memory); err != nil {
-			return fmt.Errorf("invalid memory limit: %w", err)
+	if err := validateResourcePriority(resources.Priority); err != nil {
+		return err
+	}
+	if err := validateResourceMemory(resources.Memory); err != nil {
+		return fmt.Errorf("memory: %w", err)
+	}
+	if err := validateResourceStorage(resources.Storage); err != nil {
+		return fmt.Errorf("storage: %w", err)
+	}
+	return nil
+}
+
+func validateResourcePriority(p api.ResourcePriority) error {
+	switch p {
+	case "", api.PriorityHigh, api.PriorityNormal, api.PriorityBackground:
+		return nil
+	default:
+		return fmt.Errorf("priority must be one of: high, normal, background (got %q)", p)
+	}
+}
+
+func validateResourceMemory(m *api.ResourceMemory) error {
+	if m == nil {
+		return nil
+	}
+	if strings.TrimSpace(m.MinRequired) == "" {
+		return fmt.Errorf("min_required is required when memory block is declared")
+	}
+	if err := validateSizeLimit(m.MinRequired); err != nil {
+		return fmt.Errorf("min_required invalid: %w", err)
+	}
+	switch m.Profile {
+	case "", api.ProfileBounded, api.ProfileElastic:
+		return nil
+	default:
+		return fmt.Errorf("profile must be one of: bounded, elastic (got %q)", m.Profile)
+	}
+}
+
+func validateResourceStorage(s *api.ResourceStorage) error {
+	if s == nil {
+		return nil
+	}
+	if s.Max != "" {
+		if err := validateSizeLimit(s.Max); err != nil {
+			return fmt.Errorf("max invalid: %w", err)
 		}
 	}
-
-	// Validate CPU limit
-	if limits.CPU < 0 {
-		return fmt.Errorf("CPU limit must be non-negative")
-	}
-	if limits.CPU > 64 { // Reasonable upper limit
-		return fmt.Errorf("CPU limit cannot exceed 64 cores")
-	}
-
-	// Validate storage limit
-	if limits.Storage != "" {
-		if err := validateSizeLimit(limits.Storage); err != nil {
-			return fmt.Errorf("invalid storage limit: %w", err)
-		}
-	}
-
 	return nil
 }
 
@@ -1536,29 +1644,16 @@ func validateResourcePermissions(resources *api.AppResourcePermissions) error {
 	return nil
 }
 
-// validateSizeLimit validates size limit format (e.g., "1GB", "500MB")
+// validateSizeLimit validates a size string against the authoritative
+// parser in internal/resources.ParseSize. Single source of truth for the
+// size-string grammar (integer + [B|KB|MB|GB|TB|KiB|MiB|GiB|TiB]).
+// Empty input is treated as "not specified" (the field is optional).
 func validateSizeLimit(limit string) error {
 	if limit == "" {
 		return nil
 	}
-
-	// Simple validation for size format
-	validSuffixes := []string{"B", "KB", "MB", "GB", "TB"}
-
-	for _, suffix := range validSuffixes {
-		if strings.HasSuffix(strings.ToUpper(limit), suffix) {
-			// Extract number part and validate it's positive
-			numPart := strings.TrimSuffix(strings.ToUpper(limit), suffix)
-			if numPart == "" {
-				return fmt.Errorf("size limit must have a numeric value")
-			}
-			// Basic check - should be more thorough with strconv.ParseFloat
-			if strings.Contains(numPart, "-") {
-				return fmt.Errorf("size limit must be positive")
-			}
-			return nil
-		}
+	if _, err := resources.ParseSize(limit); err != nil {
+		return err
 	}
-
-	return fmt.Errorf("size limit must end with B, KB, MB, GB, or TB")
+	return nil
 }

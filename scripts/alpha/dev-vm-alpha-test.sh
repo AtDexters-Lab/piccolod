@@ -17,6 +17,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> workspace-app    # stage 8: workspace app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> reboot           # stage 9: reboot & unlock cycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> storage-post     # stage 10: post-reboot storage
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> stewardship      # stage 11: resource stewardship (slice drop-ins, podman args)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> logs             # download piccolod journal
 set -euo pipefail
 
@@ -741,6 +742,240 @@ stage_storage_post() {
 }
 
 # ─────────────────────────────────────────────────────────
+# Stage 11: Resource Stewardship (HTTP + SSH)
+#
+# Exercises the post-RFC resource-stewardship plumbing end-to-end:
+#   - New-shape manifest (convertx: priority normal, bounded 512MB) installs cleanly.
+#   - Per-app-user slice gets a piccolo-resources.conf drop-in with the
+#     expected MemoryHigh/MemoryMax/CPUWeight values.
+#   - systemctl show reports matching live properties.
+#   - Container args are slice-only: no --memory / --cpus / --memory-swap
+#     emitted by podman (enforcement has moved to the slice).
+#   - Pre-v2 legacy-schema manifests are rejected with a catalog-sync hint.
+#   - Uninstall cleans up the drop-in.
+# ─────────────────────────────────────────────────────────
+stage_stewardship() {
+  echo -e "\n${CYAN}═══ Stage 11: Resource Stewardship ═══${NC}"
+  ensure_session
+
+  # Inline new-shape convertx manifest (mirrors piccolo-store/apps/convertx/app.yaml
+  # post-Phase-2.4). Inlined because the remote catalog on
+  # github.com/AtDexters-Lab/piccolo-store/main may not yet carry the
+  # re-authored manifest during local dev.
+  local APP_NAME="convertx"
+  local template_yaml
+  template_yaml=$(cat <<'EOF'
+inputs:
+  jwt_secret:
+    type: password
+    label: "JWT Secret"
+    generate: true
+    required: true
+  account_registration:
+    type: string
+    label: "Account Registration"
+    default: "false"
+    required: false
+  allow_unauthenticated:
+    type: string
+    label: "Allow Unauthenticated"
+    default: "false"
+    required: false
+
+services:
+  main:
+    image: ghcr.io/c4illin/convertx:v0.16.1
+    bind_ports: [3000]
+    environment:
+      JWT_SECRET: "{{ .Inputs.jwt_secret }}"
+      ACCOUNT_REGISTRATION: "{{ .Inputs.account_registration }}"
+      ALLOW_UNAUTHENTICATED: "{{ .Inputs.allow_unauthenticated }}"
+      HTTP_ALLOWED: "true"
+    storage:
+      persistent:
+        data:
+          container: /app/data
+          size_limit: 10GB
+
+listeners:
+  - name: __primary
+    guest_port: 3000
+    flow: tcp
+    protocol: http
+
+resources:
+  priority: normal
+  memory:
+    min_required: 512MB
+    profile: bounded
+
+x-piccolo:
+  mode: service
+EOF
+)
+
+  # Pre-check: inlined manifest should carry new-shape resources (app-level).
+  check "11.0" "Inlined manifest declares new-shape resources" "$template_yaml" "min_required"
+
+  # Install convertx with its new-shape manifest. convertx declares three
+  # password-type inputs (jwt_secret, account_registration, allow_unauthenticated);
+  # we supply all three so the template renders without missing-key errors.
+  local payload
+  payload=$(YAML="$template_yaml" NAME="$APP_NAME" python3 -c "
+import json, os
+print(json.dumps({
+    'app_definition': os.environ['YAML'],
+    'inputs': {
+        '__app_address__': os.environ['NAME'],
+        'jwt_secret': 'e2e-test-jwt-2026',
+        'account_registration': 'false',
+        'allow_unauthenticated': 'false',
+    },
+    'catalog_source': 'convertx'
+}))")
+
+  local token
+  token=$(csrf)
+  # Larger timeout: convertx image pull from ghcr.io can be slow over WAN.
+  local install_http
+  install_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 600 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null)
+  check "11.1" "New-shape manifest installs cleanly" "$install_http" "201"
+
+  if [[ "$install_http" != "201" ]]; then
+    dump_logs "stage11-install-fail"
+    return
+  fi
+
+  # Wait for running.
+  local app_status=""
+  for i in $(seq 1 90); do
+    app_status=$(api "/api/v1/apps/$APP_NAME" | python3 -c "
+import sys, json
+try: print(json.load(sys.stdin).get('data',{}).get('app',{}).get('status',''))
+except: print('')" 2>/dev/null)
+    [[ "$app_status" == "running" ]] && break
+    sleep 2
+  done
+  check "11.2" "App reaches running" "$app_status" "running"
+
+  # Resolve per-app UID (pa-<app>).
+  local pa_uid
+  pa_uid=$(vssh "id -u pa-$APP_NAME 2>/dev/null || true")
+  if [[ -z "$pa_uid" ]]; then
+    echo -e "  ${RED}FAIL${NC} [11.3] Could not resolve per-app user UID"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+  echo -e "  ${CYAN}INFO${NC} Per-app user UID: $pa_uid"
+
+  # Drop-in file exists.
+  local dropin_path="/etc/systemd/system/user-${pa_uid}.slice.d/piccolo-resources.conf"
+  check_ssh_ok "11.3" "Slice drop-in file exists" "test -f $dropin_path"
+
+  # Drop-in content: convertx manifest has min_required=512MB, profile=bounded.
+  # Bounded: MemoryHigh = 512*1.25 = 640 MB (in bytes: 640000000).
+  #          MemoryMax  = 512*2    = 1024 MB = 1 GB (in bytes: 1024000000).
+  # Priority normal → CPUWeight 100.
+  local dropin_content
+  dropin_content=$(vssh "cat $dropin_path 2>/dev/null")
+  check "11.4" "Drop-in has [Slice] header" "$dropin_content" "[Slice]"
+  check "11.5" "Drop-in has MemoryHigh" "$dropin_content" "MemoryHigh="
+  check "11.6" "Drop-in has MemoryMax" "$dropin_content" "MemoryMax="
+  check "11.7" "Drop-in has CPUWeight=100 (normal)" "$dropin_content" "CPUWeight=100"
+
+  # systemctl show reports the live values.
+  local live_props
+  live_props=$(vssh "systemctl show user-${pa_uid}.slice --property=MemoryHigh,MemoryMax,CPUWeight 2>/dev/null")
+  echo -e "  ${CYAN}INFO${NC} Live slice properties:"
+  echo "$live_props" | sed 's/^/       /'
+  check "11.8" "Live MemoryHigh is set (non-infinity)" "$live_props" "MemoryHigh="
+  check_not "11.9" "Live MemoryHigh is not infinity" "$(echo "$live_props" | grep MemoryHigh=)" "infinity"
+  check "11.10" "Live CPUWeight=100" "$live_props" "CPUWeight=100"
+
+  # Slice-only enforcement: verify the per-container cgroup *.scope files
+  # have no memory cap (memory.max="max") while the slice parent has the
+  # derived limit. This is the cgroup-level evidence that enforcement
+  # moved from scope to slice per D-3.
+  local scope_mems
+  scope_mems=$(vssh "find /sys/fs/cgroup/user.slice/user-${pa_uid}.slice -name 'memory.max' 2>/dev/null | xargs -r cat 2>/dev/null | sort -u")
+  echo -e "  ${CYAN}INFO${NC} Cgroup memory.max values in user-${pa_uid} subtree:"
+  echo "$scope_mems" | sed 's/^/       /'
+  # Expected: slice-level memory.max = 1024000000 (our MemoryMax); scope-level = "max".
+  check "11.11" "Slice memory.max reflects derived MemoryMax" "$scope_mems" "1024000000"
+  check "11.12" "Container scope memory.max is 'max' (no container-level cap)" "$scope_mems" "max"
+
+  # Same check for cpu.max (scope level): should be "max" since we don't emit --cpus.
+  local scope_cpus
+  scope_cpus=$(vssh "find /sys/fs/cgroup/user.slice/user-${pa_uid}.slice -name 'cpu.max' -path '*scope*' 2>/dev/null | xargs -r cat 2>/dev/null | sort -u")
+  if [[ -n "$scope_cpus" ]]; then
+    check "11.13" "Container scope cpu.max unbounded (no --cpus emitted)" "$scope_cpus" "max"
+  else
+    skip "11.13" "Container cpu.max check" "no scope cgroups found (containers may be coming up)"
+  fi
+
+  # pids.max at the scope should be set to the PidsLimit default (4096) — fork-bomb guard retained.
+  local scope_pids
+  scope_pids=$(vssh "find /sys/fs/cgroup/user.slice/user-${pa_uid}.slice -name 'pids.max' -path '*scope*' 2>/dev/null | xargs -r cat 2>/dev/null | sort -u")
+  if [[ -n "$scope_pids" ]]; then
+    echo -e "  ${CYAN}INFO${NC} Scope pids.max values: $scope_pids"
+    check "11.14" "Container pids.max shows per-process cap (fork-bomb guard retained)" "$scope_pids" "4096"
+  else
+    skip "11.14" "pids.max check" "no scope cgroups"
+  fi
+
+  # Legacy manifest rejection: inject a pre-v2 shape and verify the parser
+  # rejects it with the catalog-sync hint. We use /api/v1/apps/validate-like
+  # pathway by attempting install with a malformed manifest.
+  local legacy_yaml
+  legacy_yaml='type: user
+listeners:
+  - name: __primary
+    guest_port: 80
+services:
+  main:
+    image: alpine:latest
+    bind_ports: [80]
+resources:
+  limits:
+    memory: 512MB
+x-piccolo:
+  mode: service'
+  local legacy_payload
+  legacy_payload=$(YAML="$legacy_yaml" python3 -c "
+import json, os
+print(json.dumps({
+    'app_definition': os.environ['YAML'],
+    'inputs': {'__app_address__': 'legacytest'},
+    'catalog_source': 'none'
+}))")
+  token=$(csrf)
+  local legacy_resp
+  legacy_resp=$(curl -sf -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$legacy_payload" "http://$IP/api/v1/apps" 2>&1 || true)
+  # The handler returns the error body. Install should FAIL with catalog-sync hint text.
+  local legacy_err
+  legacy_err=$(curl -s -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$legacy_payload" "http://$IP/api/v1/apps" 2>&1)
+  check "11.15" "Legacy manifest rejected with catalog-sync hint" "$legacy_err" "catalog sync"
+
+  # Uninstall convertx and verify drop-in cleanup.
+  token=$(csrf)
+  local uninstall_code
+  uninstall_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 30 --max-time 120 \
+    -b "$COOKIE_JAR" -X DELETE -H "X-CSRF-Token: $token" \
+    "http://$IP/api/v1/apps/$APP_NAME" 2>/dev/null)
+  check "11.16" "Convertx uninstalled" "$uninstall_code" "200"
+
+  sleep 3
+  check_ssh_fail "11.17" "Drop-in removed on uninstall" "test -f $dropin_path"
+}
+
+# ─────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────
 mkdir -p "$(dirname "$COOKIE_JAR")"
@@ -757,6 +992,7 @@ case "$STAGE" in
   workspace-app)   stage_workspace_app ;;
   reboot)          stage_reboot ;;
   storage-post)    stage_storage_post ;;
+  stewardship)     stage_stewardship ;;
   logs)            dump_logs "manual" ;;
   all)
     stage_prereq
@@ -768,12 +1004,13 @@ case "$STAGE" in
     stage_rootfs_verify
     stage_service_app
     stage_workspace_app
+    stage_stewardship
     stage_reboot
     stage_storage_post
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app reboot storage-post logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app reboot storage-post stewardship logs all"
     exit 1
     ;;
 esac

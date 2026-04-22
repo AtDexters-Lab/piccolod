@@ -901,6 +901,9 @@ func (s *stubTestRootfsManager) FindGoldenByImageRef(_ string) (string, string, 
 func (s *stubTestRootfsManager) ResizeWorkspace(_ context.Context, _ string, _ int64) error {
 	return nil
 }
+func (s *stubTestRootfsManager) ResizeApplication(_ context.Context, _ string, _ int64) error {
+	return nil
+}
 
 // createGinTestServer creates a Gin test server instance with filesystem state management
 func createGinTestServer(t *testing.T, tempDir string) *GinServer {

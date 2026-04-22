@@ -17,6 +17,21 @@ const (
 	workspaceResizeGrowFactor    = 2     // double the virtual size
 	workspaceMaxVirtualSize      = 500 << 30 // 500 GiB cap
 	workspaceResizeCooldown      = 5 * time.Minute
+
+	// Application-volume auto-grow policy (D-5 / D-5a simplified form).
+	// The initial implementation mirrors the workspace 80% threshold;
+	// the two-stage schedule-and-defer variant (70% + idle-window) is a
+	// follow-up (P5.3a).
+	applicationResizeThreshold = 0.80
+	// applicationMaxVirtualSize is a global ceiling. Per-app storage.max
+	// (D-5 "hidden/advanced override") is NOT wired through yet —
+	// doing so requires adding a Max field to volumeMetaV3 and writing
+	// it from manifest at provisioning time. Tracked as a P5.3 follow-up.
+	// For today, all application volumes share this 500 GiB ceiling,
+	// which matches the plan's default and is the safer-for-shared-pool
+	// bound on consumer-hardware (pool_total × 0.4 on typical 256-512 GB
+	// SSDs is ≤ 200 GiB anyway).
+	applicationMaxVirtualSize = 500 << 30 // 500 GiB
 )
 
 // StartWorkspaceResizeMonitor launches a background goroutine that monitors
@@ -66,6 +81,7 @@ func (m *luksVolumeManager) workspaceResizeLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			m.checkWorkspaceUsage(ctx)
+			m.checkApplicationUsage(ctx)
 		}
 	}
 }
@@ -150,5 +166,79 @@ func (m *luksVolumeManager) maybeResizeWorkspace(ctx context.Context, volumeID, 
 	// Delegate the actual resize (LV + LUKS + btrfs + metadata + cooldown) to ResizeWorkspace.
 	if err := m.ResizeWorkspace(ctx, volumeID, newSize); err != nil {
 		log.Printf("ERROR: workspace auto-resize %s: %v", volumeID, err)
+	}
+}
+
+// checkApplicationUsage walks per-app application volumes (type=service-data)
+// and auto-grows any whose filesystem usage crosses the threshold. Mirrors
+// checkWorkspaceUsage but iterates m.stacks (application volumes are not
+// tracked in rootfsMounts).
+//
+// See plan P5.1, P5.2, P5.3. Two-stage auto-grow (P5.3a) and per-grow
+// pool admission (P5.3b) are follow-ups; this first pass preserves the
+// proven workspace behaviour (80% single-threshold, thin-pool capacity
+// gate at ResizeApplication level).
+func (m *luksVolumeManager) checkApplicationUsage(ctx context.Context) {
+	m.mu.Lock()
+	var appVols []string
+	for volID := range m.stacks {
+		appVols = append(appVols, volID)
+	}
+	m.mu.Unlock()
+
+	for _, volID := range appVols {
+		m.maybeResizeApplication(ctx, volID)
+	}
+}
+
+func (m *luksVolumeManager) maybeResizeApplication(ctx context.Context, volumeID string) {
+	// Cooldown shared with workspace path.
+	m.mu.Lock()
+	if lastResize, ok := m.wsResizeCooldown[volumeID]; ok && time.Since(lastResize) < workspaceResizeCooldown {
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+
+	// Read metadata to filter by type + compute target size.
+	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
+	meta, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		return // not all stacks have v3 metadata (golden LVs etc.); skip silently
+	}
+	if meta.Type != "service-data" {
+		return
+	}
+
+	mountPath := paths.MountDir(volumeID)
+	var st unix.Statfs_t
+	if err := unix.Statfs(mountPath, &st); err != nil {
+		return
+	}
+	totalBytes := int64(st.Blocks) * int64(st.Bsize)
+	freeBytes := int64(st.Bavail) * int64(st.Bsize)
+	if totalBytes == 0 {
+		return
+	}
+	usedBytes := totalBytes - freeBytes
+	usageRatio := float64(usedBytes) / float64(totalBytes)
+	if usageRatio < applicationResizeThreshold {
+		return
+	}
+
+	newSize := meta.SizeBytes * workspaceResizeGrowFactor
+	if newSize > applicationMaxVirtualSize {
+		if meta.SizeBytes >= applicationMaxVirtualSize {
+			log.Printf("WARN: application volume %s at %.0f%% usage, already at max virtual size", volumeID, usageRatio*100)
+			return
+		}
+		newSize = applicationMaxVirtualSize
+	}
+
+	log.Printf("INFO: application volume %s at %.0f%% usage (%d/%d bytes), resizing from %d to %d",
+		volumeID, usageRatio*100, usedBytes, totalBytes, meta.SizeBytes, newSize)
+
+	if err := m.ResizeApplication(ctx, volumeID, newSize); err != nil {
+		log.Printf("ERROR: application volume auto-resize %s: %v", volumeID, err)
 	}
 }

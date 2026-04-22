@@ -563,6 +563,13 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		}
 	}
 
+	// Resource stewardship (D-9 ordering): apply slice policy updates BEFORE
+	// container recreate. appInst.Definition is already newDef at this point,
+	// so ReconcileAllSlicePolicies derives against the new shape. Runs across
+	// all apps because a manifest change to this app may alter sibling elastic
+	// shares; the reconcile mutex serializes against concurrent changes.
+	m.ReconcileAllSlicePolicies()
+
 	if applyErr := m.applySyncedDefinition(ctx, host, instanceID, appInst, newDef, prevDef, diffKind); applyErr != nil {
 		return failApply(applyErr)
 	}

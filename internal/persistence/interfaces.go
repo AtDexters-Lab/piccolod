@@ -102,6 +102,12 @@ type RootfsVolumeManager interface {
 	// ResizeWorkspace grows a workspace volume to the specified size.
 	// Handles LV resize, LUKS resize (if mounted), and btrfs filesystem resize.
 	ResizeWorkspace(ctx context.Context, volumeID string, newSizeBytes int64) error
+
+	// ResizeApplication grows a per-app application volume (service-data)
+	// to the specified size. Uses ext4 online resize (resize2fs) rather
+	// than btrfs. Same thin-pool capacity and cooldown safeguards as
+	// ResizeWorkspace.
+	ResizeApplication(ctx context.Context, volumeID string, newSizeBytes int64) error
 }
 
 // GoldenLVRequest describes the image for a golden LV.

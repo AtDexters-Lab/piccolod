@@ -240,6 +240,7 @@ type AppDefinition struct {
 	Permissions *AppPermissions        `yaml:"permissions,omitempty" json:"permissions,omitempty"`
 	Environment map[string]string      `yaml:"environment,omitempty" json:"environment,omitempty"`
 	Resources   *AppResources          `yaml:"resources,omitempty" json:"resources,omitempty"`
+	Lifecycle   *AppLifecycle          `yaml:"lifecycle,omitempty" json:"lifecycle,omitempty"`
 	HealthCheck *AppHealthCheck        `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
 	AppConfig   interface{}            `yaml:"app_config,omitempty" json:"app_config,omitempty"`
 	Extensions  map[string]interface{} `yaml:"x-piccolo,omitempty" json:"x-piccolo,omitempty"`
@@ -322,6 +323,11 @@ type ServiceOIDCClient struct {
 }
 
 // AppService defines a single container within a compose-style app (service mode).
+// Per-service resource overrides are intentionally absent: memory and CPU are
+// enforced at the per-app-user systemd slice (see internal/container/slice_policy.go),
+// which covers all services of an app collectively. Services within a slice compete
+// via kernel-level reclaim + OOM scorer, which correctly attributes pressure to
+// the actual offender without manifest-level per-service knobs.
 type AppService struct {
 	Image       string             `yaml:"image" json:"image"`
 	Init        string             `yaml:"init,omitempty" json:"init,omitempty"`
@@ -329,7 +335,6 @@ type AppService struct {
 	BindPorts   []int              `yaml:"bind_ports" json:"bind_ports"`
 	Environment map[string]string  `yaml:"environment,omitempty" json:"environment,omitempty"`
 	Storage     *AppStorage        `yaml:"storage,omitempty" json:"storage,omitempty"`
-	Resources   *AppResources      `yaml:"resources,omitempty" json:"resources,omitempty"`
 	OIDCClient  *ServiceOIDCClient `yaml:"oidc_client,omitempty" json:"oidc_client,omitempty"`
 	InitScript  *ServiceInitScript `yaml:"init_script,omitempty" json:"init_script,omitempty"`
 }
@@ -385,16 +390,67 @@ type AppFilesystemPermissions struct {
 	DeviceAccess string `yaml:"device_access,omitempty" json:"device_access,omitempty"` // "allow" or "deny"
 }
 
-// AppResources defines resource limits
+// AppResources is the app-level resource-stewardship declaration. Catalog
+// authors declare *shape* (priority tier, memory profile + minimum) and the
+// runtime derives kernel knobs. No fixed target/ceiling numbers in the
+// manifest; no per-service overrides. See plans/resource-stewardship.md.
 type AppResources struct {
-	Limits *AppResourceLimits `yaml:"limits,omitempty" json:"limits,omitempty"`
+	Priority ResourcePriority `yaml:"priority,omitempty" json:"priority,omitempty"`
+	Memory   *ResourceMemory  `yaml:"memory,omitempty" json:"memory,omitempty"`
+	Storage  *ResourceStorage `yaml:"storage,omitempty" json:"storage,omitempty"`
+
+	// LegacyLimits catches pre-v2 `resources.limits` blocks that slip past
+	// the raw-YAML shape check — e.g. when a catalog ships the legacy block
+	// via a YAML alias or merge key that validateRawResourcesShape's
+	// MappingNode walk misses. A non-nil Limits here is always a parse
+	// error (see validateResources in internal/app/parser.go).
+	LegacyLimits interface{} `yaml:"limits,omitempty" json:"-"`
 }
 
-type AppResourceLimits struct {
-	Memory  string  `yaml:"memory,omitempty" json:"memory,omitempty"`
-	CPU     float64 `yaml:"cpu,omitempty" json:"cpu,omitempty"`
-	Storage string  `yaml:"storage,omitempty" json:"storage,omitempty"`
+// ResourcePriority classifies the app's CPU-contention behavior.
+// Maps to cgroup v2 cpu.weight values at the slice level.
+type ResourcePriority string
+
+const (
+	PriorityHigh       ResourcePriority = "high"       // -> CPUWeight 400
+	PriorityNormal     ResourcePriority = "normal"     // -> CPUWeight 100 (kernel default)
+	PriorityBackground ResourcePriority = "background" // -> CPUWeight 25
+)
+
+// ResourceMemory declares the app's memory footprint shape. Authors declare
+// what they know (functional minimum + whether the app is stay-in-its-lane
+// or grow-to-fill); runtime derives MemoryHigh / MemoryMax against actual
+// system RAM.
+type ResourceMemory struct {
+	// MinRequired is the functional floor below which the app cannot run
+	// correctly. Required when the `memory` block is declared. Parsed as
+	// a size string (e.g. "512MB", "4GB").
+	MinRequired string `yaml:"min_required" json:"min_required"`
+	// Profile classifies the app's memory behavior. `bounded` = stay in
+	// lane; `elastic` = grow to fill available headroom. Default `bounded`.
+	Profile ResourceProfile `yaml:"profile,omitempty" json:"profile,omitempty"`
 }
+
+// ResourceProfile classifies an app's memory behavior.
+type ResourceProfile string
+
+const (
+	ProfileBounded ResourceProfile = "bounded"
+	ProfileElastic ResourceProfile = "elastic"
+)
+
+// ResourceStorage declares the app's storage ceiling.
+type ResourceStorage struct {
+	// Max is the per-app LV ceiling (e.g. "500GiB"). When unset, runtime
+	// defaults to min(100 GiB, pool_total × 0.4). See plans/resource-stewardship.md D-5.
+	Max string `yaml:"max,omitempty" json:"max,omitempty"`
+}
+
+// AppLifecycle is a reserved namespace for the future stop-on-idle RFC.
+// No fields are consumed by this codebase today; the block exists so that
+// catalog authors can anticipate the namespace without forcing another
+// schema bump when lifecycle policy lands. See plans/resource-stewardship.md.
+type AppLifecycle struct{}
 
 // AppHealthCheck defines health monitoring
 type AppHealthCheck struct {

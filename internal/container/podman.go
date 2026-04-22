@@ -145,9 +145,6 @@ var (
 	// Volume paths: absolute paths only, no special chars
 	pathPattern = regexp.MustCompile(`^/[a-zA-Z0-9._/-]*$`)
 
-	// Resource values: numbers with units
-	resourcePattern = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?[kmgtKMGT]?[bB]?$`)
-
 	// Environment variable keys
 	envKeyPattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
@@ -356,17 +353,6 @@ func ValidatePath(path string) error {
 	return nil
 }
 
-// ValidateResource validates resource limits (memory, CPU)
-func ValidateResource(resource string) error {
-	if resource == "" {
-		return fmt.Errorf("resource cannot be empty")
-	}
-	if !resourcePattern.MatchString(resource) {
-		return fmt.Errorf("invalid resource format: %s", resource)
-	}
-	return nil
-}
-
 // ValidateEnvKey validates environment variable keys
 func ValidateEnvKey(key string) error {
 	if key == "" {
@@ -506,9 +492,14 @@ type TmpfsMount struct {
 	Options   string // e.g. "rw,size=1g"
 }
 
+// ResourceLimits carries container-scope resource knobs. Memory and CPU
+// limits are intentionally absent — the resource-stewardship design
+// enforces memory and CPU at the per-app-user systemd slice
+// (see internal/container/slice_policy.go), not at individual container
+// scopes. PidsLimit and NofileLimit remain per-container: they protect
+// against fork-bomb and fd-exhaustion per-process, not shared-resource
+// concerns.
 type ResourceLimits struct {
-	Memory      string
-	CPU         string
 	PidsLimit   int
 	NofileLimit int
 }
@@ -590,15 +581,9 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 		args = append(args, "--tmpfs", tmpfsArg)
 	}
 
-	if spec.Resources.Memory != "" {
-		args = append(args, "--memory", spec.Resources.Memory)
-		// Disable swap limit to avoid "memory.swap.max: no such file or directory"
-		// on kernels without swap accounting (common in VMs).
-		args = append(args, "--memory-swap", "-1")
-	}
-	if spec.Resources.CPU != "" {
-		args = append(args, "--cpus", spec.Resources.CPU)
-	}
+	// Memory/CPU limits are enforced at the per-app-user systemd slice
+	// (slice_policy.go), not at container scope. Only per-process guards
+	// (pids-limit, nofile) are emitted here.
 	if spec.Resources.PidsLimit > 0 {
 		args = append(args, "--pids-limit", fmt.Sprintf("%d", spec.Resources.PidsLimit))
 	}
@@ -1396,18 +1381,9 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 		}
 	}
 
-	// Validate resources
-	if spec.Resources.Memory != "" {
-		if err := ValidateResource(spec.Resources.Memory); err != nil {
-			return fmt.Errorf("invalid memory resource: %w", err)
-		}
-	}
-	if spec.Resources.CPU != "" {
-		if err := ValidateResource(spec.Resources.CPU); err != nil {
-			return fmt.Errorf("invalid CPU resource: %w", err)
-		}
-	}
-
+	// Memory and CPU resources are enforced at the slice level, not per
+	// container. Validation of those fields lives in the manifest parser
+	// path (see internal/app/parser.go) against the new-shape schema.
 	return nil
 }
 

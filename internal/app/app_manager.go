@@ -672,6 +672,28 @@ func (m *AppManager) StartBackground() {
 		}
 	}()
 
+	// Resource stewardship: one-shot startup reconcile of slice policies
+	// for all installed apps, then a 5-minute periodic retry loop. The
+	// startup pass fixes drift accumulated while piccolod was down (reboot,
+	// crash); the periodic pass retries transient failures (systemctl
+	// hiccups, /etc/systemd ephemerally unwritable). See plan P1.7.
+	m.reconcileWG.Add(1)
+	go func() {
+		defer m.reconcileWG.Done()
+		const slicePolicyInterval = 5 * time.Minute
+		m.ReconcileAllSlicePolicies()
+		ticker := time.NewTicker(slicePolicyInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.ReconcileAllSlicePolicies()
+			}
+		}
+	}()
+
 	m.startCatalogSyncLoop(ctx)
 }
 
@@ -1430,8 +1452,24 @@ func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefi
 // - The workspace_name (for workspace apps without listeners)
 func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
 	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
-	return m.installLocked(ctx, appDef)
+	inst, err := m.installLocked(ctx, appDef)
+	m.reconcileMu.Unlock()
+	// Resource stewardship: derive + apply slice policies for all installed apps.
+	// Runs *outside* reconcileMu so the systemctl daemon-reload/set-property
+	// calls don't block app lifecycle work. The catalog-sync apply path
+	// (catalog_sync_apply.go) calls ReconcileAllSlicePolicies *inside*
+	// reconcileMu — that asymmetry is intentional: sync-apply needs the
+	// D-9 ordering invariant (slice update strictly before container recreate),
+	// while the Install path here has already completed the recreate so
+	// ordering is moot. Both are serialized at the sliceReconcileMu layer
+	// inside ReconcileAllSlicePolicies itself, so the outer lock-nesting
+	// difference is safe.
+	// Per D-9: num_active_elastic may have changed, so every elastic app's share
+	// needs recompute, not just the newly-installed app.
+	if err == nil {
+		m.ReconcileAllSlicePolicies()
+	}
+	return inst, err
 }
 
 func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinition) (inst *AppInstance, err error) {
@@ -1458,6 +1496,12 @@ func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinitio
 	SetDefaults(appDef)
 	if err := ValidateAppDefinition(appDef); err != nil {
 		return nil, fmt.Errorf("invalid app definition: %w", err)
+	}
+
+	// Resource-stewardship install-time gate (D-11). Hard-blocks Tier-2
+	// (single-app-over-host); logs Tier-1 (soft overshoot) and proceeds.
+	if err := m.CheckInstallMemoryGate(appDef); err != nil {
+		return nil, err
 	}
 
 	state, err := m.ensureStateManager()
@@ -2167,9 +2211,20 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 // Uninstall removes an application instance completely by instanceID,
 // including all container data, encrypted volumes, and podman state.
 func (m *AppManager) Uninstall(ctx context.Context, instanceID string) error {
+	// Remove the slice drop-in before the user is destroyed. Live-reset is
+	// unnecessary because the slice itself is about to be torn down.
+	m.RemoveSlicePolicyForApp(instanceID)
+
 	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
-	return m.uninstallLocked(ctx, instanceID)
+	err := m.uninstallLocked(ctx, instanceID)
+	m.reconcileMu.Unlock()
+
+	// Recompute slice policies for remaining apps: num_active_elastic may
+	// have changed. Runs outside reconcileMu (systemctl calls).
+	if err == nil {
+		m.ReconcileAllSlicePolicies()
+	}
+	return err
 }
 
 func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (err error) {

@@ -746,6 +746,15 @@ func (m *luksVolumeManager) attachAppVolumeCommon(ctx context.Context, handle Vo
 		return fmt.Errorf("mount: %w", err)
 	}
 
+	// If the LV was resized while detached (via ResizeApplication), the ext4
+	// filesystem is still at its old size. Run resize2fs to grow the fs to
+	// fill the underlying device. Idempotent — no-op when sizes already match.
+	// Mirrors the workspace-mode pattern where btrfs online grow handles the
+	// equivalent case at attach time.
+	if out, err := m.run.RunWithOutput(ctx, "resize2fs", mapperPath); err != nil {
+		return fmt.Errorf("resize2fs on attach: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
 	success = true
 	return nil
 }
