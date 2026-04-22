@@ -137,17 +137,31 @@ func (g *Guard) check(ctx context.Context) {
 
 func (g *Guard) handleCritical(stats lvm.PoolStats) {
 	log.Printf("WARN: pool-guard: thin pool at %.1f%%, publishing user warning", stats.DataPercent)
-	if g.bus != nil {
-		g.bus.Publish(events.Event{
-			Topic: events.TopicStorageAlert,
-			Payload: events.StorageAlertEvent{
-				Severity:    events.AlertSeverityCritical,
-				Message:     "Storage is critically low. Consider cleaning up unused apps or files to prevent service disruption.",
-				DataPercent: stats.DataPercent,
-				Action:      events.AlertActionNone,
-			},
-		})
+	if g.bus == nil {
+		return
 	}
+	msg := "Storage is critically low. Consider cleaning up unused apps or files to prevent service disruption."
+	// Legacy topic (deprecated). Kept during two-release transition so existing
+	// UI consumers don't regress before they migrate to TopicResourcePressure.
+	g.bus.Publish(events.Event{
+		Topic: events.TopicStorageAlert,
+		Payload: events.StorageAlertEvent{
+			Severity:    events.AlertSeverityCritical,
+			Message:     msg,
+			DataPercent: stats.DataPercent,
+			Action:      events.AlertActionNone,
+		},
+	})
+	// New unified topic (D-7).
+	g.bus.Publish(events.Event{
+		Topic: events.TopicResourcePressure,
+		Payload: events.ResourcePressureEvent{
+			Resource:    events.PressureResourceDisk,
+			Severity:    events.PressureSeverityWarn,
+			SliceMetric: stats.DataPercent,
+			Message:     msg,
+		},
+	})
 }
 
 func (g *Guard) handleUrgent(ctx context.Context, stats lvm.PoolStats) {
@@ -163,22 +177,36 @@ func (g *Guard) handleUrgent(ctx context.Context, stats lvm.PoolStats) {
 	log.Printf("WARN: pool-guard: thin pool at %.1f%%, stopping workspace apps", stats.DataPercent)
 	stopped := g.stopWorkspaceApps(ctx)
 
-	if g.bus != nil {
-		msg := "Storage critically full. Workspace apps have been stopped to prevent data loss. Free space and restart manually."
-		if len(stopped) == 0 {
-			msg = "Storage critically full. No running workspace apps to stop — check service app usage."
-		}
-		g.bus.Publish(events.Event{
-			Topic: events.TopicStorageAlert,
-			Payload: events.StorageAlertEvent{
-				Severity:     events.AlertSeverityUrgent,
-				Message:      msg,
-				DataPercent:  stats.DataPercent,
-				Action:       events.AlertActionWorkspacesStopped,
-				AffectedApps: stopped,
-			},
-		})
+	if g.bus == nil {
+		return
 	}
+	msg := "Storage critically full. Workspace apps have been stopped to prevent data loss. Free space and restart manually."
+	if len(stopped) == 0 {
+		msg = "Storage critically full. No running workspace apps to stop — check service app usage."
+	}
+	// Legacy topic (deprecated).
+	g.bus.Publish(events.Event{
+		Topic: events.TopicStorageAlert,
+		Payload: events.StorageAlertEvent{
+			Severity:     events.AlertSeverityUrgent,
+			Message:      msg,
+			DataPercent:  stats.DataPercent,
+			Action:       events.AlertActionWorkspacesStopped,
+			AffectedApps: stopped,
+		},
+	})
+	// New unified topic (D-7).
+	g.bus.Publish(events.Event{
+		Topic: events.TopicResourcePressure,
+		Payload: events.ResourcePressureEvent{
+			Resource:     events.PressureResourceDisk,
+			Severity:     events.PressureSeverityUrgent,
+			SliceMetric:  stats.DataPercent,
+			Message:      msg,
+			ActionTaken:  events.AlertActionWorkspacesStopped,
+			AffectedApps: stopped,
+		},
+	})
 }
 
 func (g *Guard) stopWorkspaceApps(ctx context.Context) []string {

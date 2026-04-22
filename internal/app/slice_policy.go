@@ -235,6 +235,25 @@ func bytesToGiB(b int64) float64 {
 	return float64(b) / float64(1<<30)
 }
 
+// ListAppUIDs returns the per-app-user UIDs for installed apps. Used by
+// the resource-pressure monitor to enumerate per-app slices to observe.
+// Implements pressure.AppLister.
+func (m *AppManager) ListAppUIDs() []uint32 {
+	apps := m.snapshotApps(false)
+	uids := make([]uint32, 0, len(apps))
+	for _, app := range apps {
+		user, err := container.ResolveRuntimeCredential(container.AppUsername(app.InstanceID))
+		if err != nil {
+			continue
+		}
+		if user.Credential.Uid == 0 {
+			continue
+		}
+		uids = append(uids, user.Credential.Uid)
+	}
+	return uids
+}
+
 // RemoveSlicePolicyForApp clears the slice drop-in for an uninstalled app.
 // Called from the uninstall path before user deletion. Does not live-reset
 // the slice — the slice itself is about to be torn down.

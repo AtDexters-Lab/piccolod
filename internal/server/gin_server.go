@@ -52,6 +52,7 @@ import (
 	"piccolod/internal/storage/diskprep"
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/nbd"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/storage/poolguard"
 	"piccolod/internal/terminal"
 	"piccolod/internal/tpm"
@@ -850,6 +851,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	}
 	pgrd := poolguard.New(poolQ, s.appManager, eventsBus)
 	s.supervisor.Register(supervisor.NewComponent("pool-guard", pgrd.Start, pgrd.Stop))
+	pressureMon := pressure.New(eventsBus, s.appManager)
+	s.supervisor.Register(supervisor.NewComponent("resource-pressure", pressureMon.Start, pressureMon.Stop))
 	s.supervisor.Register(supervisor.NewComponent("consensus", consensusMgr.Start, consensusMgr.Stop))
 	s.supervisor.Register(newLeadershipObserver(eventsBus))
 	s.supervisor.Register(supervisor.NewComponent("catalog", func(ctx context.Context) error {

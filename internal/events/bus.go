@@ -39,7 +39,10 @@ const (
 	TopicStoragePoolInitialized Topic = "storage_pool_initialized" // LVM data pool initialized
 	TopicStoragePoolActivated   Topic = "storage_pool_activated"   // LVM data pool activated
 	TopicStorageLocked          Topic = "storage_locked"            // Storage locked (LVM deactivated)
-	TopicStorageAlert           Topic = "storage_alert"             // User-visible storage pressure notification
+	TopicStorageAlert           Topic = "storage_alert"             // User-visible storage pressure notification (deprecated, see TopicResourcePressure)
+
+	// Resource stewardship pressure events
+	TopicResourcePressure Topic = "resource_pressure" // Unified pressure signal for memory, cpu, disk per app slice
 
 	// PCV export events
 	TopicPCVExportPublished Topic = "pcv_export_published" // PCV archive published successfully
@@ -193,6 +196,38 @@ type StorageAlertEvent struct {
 	DataPercent  float64  `json:"data_percent"`
 	Action       string   `json:"action"`
 	AffectedApps []string `json:"affected_apps,omitempty"`
+}
+
+// Pressure-event resource kinds.
+const (
+	PressureResourceMemory = "memory"
+	PressureResourceCPU    = "cpu"
+	PressureResourceDisk   = "disk"
+)
+
+// Pressure-event severity levels.
+const (
+	PressureSeverityInfo   = "info"   // approaching threshold; advisory
+	PressureSeverityWarn   = "warn"   // sustained pressure; user should consider action
+	PressureSeverityUrgent = "urgent" // imminent failure / protective action taken
+)
+
+// ResourcePressureEvent is the unified pressure notification for
+// memory, CPU, and disk across the per-app-user slice hierarchy.
+// Published by pressure-attribution components (pool guard for disk,
+// the pressure monitor for memory/CPU). See plan D-7 and D-15.
+type ResourcePressureEvent struct {
+	Resource              string  `json:"resource"`                         // memory | cpu | disk
+	Severity              string  `json:"severity"`                         // info | warn | urgent
+	AppInstanceID         string  `json:"app_instance_id,omitempty"`        // per-app attribution; empty for global (pool-wide disk)
+	HeaviestContributor   string  `json:"heaviest_contributor,omitempty"`   // service name within app (multi-service apps)
+	SliceMetric           float64 `json:"slice_metric,omitempty"`           // PSI percent or pool percent
+	DeclaredMinRequired   int64   `json:"declared_min_required,omitempty"`  // D-15 drift: manifest value
+	ObservedRSSPeak       int64   `json:"observed_rss_peak,omitempty"`      // D-15 drift: observed vs declared
+	OOMKillCount          int64   `json:"oom_kill_count,omitempty"`         // memory.events.oom_kill delta
+	Message               string  `json:"message,omitempty"`
+	ActionTaken           string  `json:"action_taken,omitempty"` // e.g. "workspaces_stopped", "autogrow_refused"
+	AffectedApps          []string `json:"affected_apps,omitempty"`
 }
 
 // AppStatusChangedEvent is emitted when an app's status changes.

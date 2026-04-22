@@ -104,6 +104,10 @@ type luksVolumeManager struct {
 	// Workspace resize monitor.
 	wsResizeCancel   context.CancelFunc
 	wsResizeCooldown map[string]time.Time // volumeID → last resize time
+
+	// Application-volume auto-grow scheduling (D-5a two-stage).
+	// Defined in workspace_resize_monitor.go.
+	appResizeSchedules map[string]*appResizeSchedule // volumeID → schedule
 }
 
 // rootfsMountState tracks the full device stack for a mounted rootfs volume.
@@ -148,8 +152,9 @@ func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) *luksVolumeManager {
 		stacks:       make(map[string]*blockdev.DeviceStack),
 		goldenLVs:    make(map[string]*volumeMetaV3),
 		goldenMu:     make(map[string]*sync.Mutex),
-		rootfsMounts:      make(map[string]*rootfsMountState),
-		wsResizeCooldown:  make(map[string]time.Time),
+		rootfsMounts:       make(map[string]*rootfsMountState),
+		wsResizeCooldown:   make(map[string]time.Time),
+		appResizeSchedules: make(map[string]*appResizeSchedule),
 	}
 }
 
