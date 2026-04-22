@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -242,7 +243,7 @@ func (fsm *FilesystemStateManager) loadAppFromDisk(instanceID string) (*AppInsta
 		return nil, fmt.Errorf("failed to read app.yaml: %w", err)
 	}
 
-	appDef, err := ParseAppDefinition(appDefData)
+	appDef, err := parseAppDefinitionWithLegacyMigration(appDefData, appDefPath, instanceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse app.yaml: %w", err)
 	}
@@ -330,11 +331,46 @@ func (fsm *FilesystemStateManager) GetAppDefinition(instanceID string) (*api.App
 	if err != nil {
 		return nil, fmt.Errorf("failed to read app.yaml: %w", err)
 	}
-	appDef, err := ParseAppDefinition(data)
+	appDef, err := parseAppDefinitionWithLegacyMigration(data, appDefPath, instanceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse app.yaml: %w", err)
 	}
 	return appDef, nil
+}
+
+// parseAppDefinitionWithLegacyMigration wraps ParseAppDefinition with the
+// one-shot pre-v2 resource-stewardship migration for persisted app.yaml
+// files carried forward from older piccolod installs. On parse-time
+// rejection with IsLegacyResourcesSchemaError, strips the legacy
+// resources declarations and persists the rewritten file so subsequent
+// reads short-circuit the fast path. See plan D-6 and
+// docs/runtime/resource-stewardship-rollout.md.
+//
+// This block can be removed once all deployed installs have been
+// migrated past the rollout window (tracked alongside the LegacyLimits
+// catch-all in api/types.go).
+func parseAppDefinitionWithLegacyMigration(data []byte, appDefPath, instanceID string) (*api.AppDefinition, error) {
+	def, err := ParseAppDefinition(data)
+	if err == nil {
+		return def, nil
+	}
+	if !IsLegacyResourcesSchemaError(err) {
+		return nil, err
+	}
+	migrated, changed, mErr := MigrateLegacyResourcesYAML(data)
+	if mErr != nil || !changed {
+		return nil, err
+	}
+	def2, pErr := ParseAppDefinition(migrated)
+	if pErr != nil {
+		return nil, fmt.Errorf("migration attempted but still invalid: %w", pErr)
+	}
+	if wErr := os.WriteFile(appDefPath, migrated, 0o644); wErr != nil {
+		log.Printf("WARN: load %s: legacy app.yaml migrated in-memory but persist failed: %v", instanceID, wErr)
+	} else {
+		log.Printf("INFO: load %s: migrated legacy app.yaml to new-shape (run 'piccolod catalog sync' to pick up current resource declarations)", instanceID)
+	}
+	return def2, nil
 }
 
 // StoreApp saves app definition and metadata to filesystem.

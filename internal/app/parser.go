@@ -283,6 +283,97 @@ func validateRawServicesBlocks(root *yaml.Node) error {
 	return nil
 }
 
+// IsLegacyResourcesSchemaError reports whether err came from the pre-v2
+// resource-stewardship raw-YAML rejection path (validateRawResourcesShape
+// or validateRawServicesNoResources). Callers use this to trigger the
+// one-shot legacy→new-shape migration on persisted app.yaml loads.
+func IsLegacyResourcesSchemaError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "pre-v2 resource-stewardship schema")
+}
+
+// MigrateLegacyResourcesYAML rewrites persisted legacy-shape app.yaml
+// into new-shape form by stripping pre-v2 resource declarations. The
+// stripped manifest parses cleanly under the new schema with no
+// resources block (kernel defaults apply). The next catalog sync picks
+// up the properly authored new-shape manifest and re-derives the slice
+// policy.
+//
+// This is strictly a safety-net for the upgrade path on the deployed
+// N=1 user's existing immich install. Steady-state behaviour is
+// governed by the catalog re-author (Phase 2.4).
+//
+// Returns the migrated YAML content and true if any legacy fields were
+// present; returns the original bytes and false if nothing needed
+// rewriting.
+func MigrateLegacyResourcesYAML(content []byte) ([]byte, bool, error) {
+	safe := neutralizeTemplates(content)
+	var root yaml.Node
+	if err := yaml.Unmarshal(safe, &root); err != nil {
+		return content, false, fmt.Errorf("migrate: parse yaml: %w", err)
+	}
+	changed := false
+	// Strip top-level resources.limits (preserve other resources subkeys
+	// if any — none exist in legacy form, but the scan is defensive).
+	if rn := topLevelValue(&root, "resources"); rn != nil && rn.Kind == yaml.MappingNode {
+		var keep []*yaml.Node
+		for i := 0; i+1 < len(rn.Content); i += 2 {
+			k := rn.Content[i]
+			v := rn.Content[i+1]
+			if k != nil && k.Kind == yaml.ScalarNode && k.Value == "limits" {
+				changed = true
+				continue
+			}
+			keep = append(keep, k, v)
+		}
+		rn.Content = keep
+		// If the resources block is now empty, remove it from the parent map.
+		if len(rn.Content) == 0 {
+			if m := topLevelMapping(&root); m != nil {
+				var nkeep []*yaml.Node
+				for i := 0; i+1 < len(m.Content); i += 2 {
+					k := m.Content[i]
+					if k != nil && k.Kind == yaml.ScalarNode && k.Value == "resources" {
+						continue
+					}
+					nkeep = append(nkeep, m.Content[i], m.Content[i+1])
+				}
+				m.Content = nkeep
+			}
+		}
+	}
+	// Strip per-service resources blocks.
+	if svcs := topLevelValue(&root, "services"); svcs != nil && svcs.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(svcs.Content); i += 2 {
+			svcVal := svcs.Content[i+1]
+			if svcVal == nil || svcVal.Kind != yaml.MappingNode {
+				continue
+			}
+			var keep []*yaml.Node
+			for j := 0; j+1 < len(svcVal.Content); j += 2 {
+				fk := svcVal.Content[j]
+				if fk != nil && fk.Kind == yaml.ScalarNode && fk.Value == "resources" {
+					changed = true
+					continue
+				}
+				keep = append(keep, svcVal.Content[j], svcVal.Content[j+1])
+			}
+			svcVal.Content = keep
+		}
+	}
+	if !changed {
+		return content, false, nil
+	}
+	restoreTemplatesInNode(&root)
+	migrated, err := yaml.Marshal(&root)
+	if err != nil {
+		return content, false, fmt.Errorf("migrate: re-marshal yaml: %w", err)
+	}
+	return migrated, true, nil
+}
+
 // validateRawServicesNoResources rejects per-service `resources` blocks at
 // the raw-YAML stage. Called from both ParseAppSchema (loose parse) and
 // ParseAppDefinition (full parse) so the legacy shape is consistently

@@ -307,6 +307,61 @@ x-piccolo:
 	}
 }
 
+// TestMigrateLegacyResourcesYAML verifies the upgrade-path safety net.
+// Legacy app.yaml persisted from pre-v2 installs must be rewriteable into
+// a new-shape-compatible form so the load-path doesn't silently drop
+// existing apps after the piccolod upgrade.
+func TestMigrateLegacyResourcesYAML(t *testing.T) {
+	legacy := []byte(`type: user
+primary_service: server
+listeners:
+  - name: __primary
+    guest_port: 80
+services:
+  server:
+    image: nginx:alpine
+    bind_ports: [80]
+    resources:
+      limits:
+        memory: 4GB
+        cpu: 2.0
+  ml:
+    image: some/ml:v1
+    bind_ports: [3003]
+    resources:
+      limits:
+        memory: 6GB
+        cpu: 2.0
+resources:
+  limits:
+    memory: 2GB
+x-piccolo:
+  mode: service
+`)
+	migrated, changed, err := MigrateLegacyResourcesYAML(legacy)
+	if err != nil {
+		t.Fatalf("unexpected migration error: %v", err)
+	}
+	if !changed {
+		t.Fatal("migration should report changed=true for legacy input")
+	}
+	// Migrated output must parse clean under the new schema.
+	if _, err := ParseAppDefinition(migrated); err != nil {
+		t.Fatalf("migrated manifest should parse: %v", err)
+	}
+	// Idempotent: migrating already-new-shape input is a no-op.
+	migrated2, changed2, err := MigrateLegacyResourcesYAML(migrated)
+	if err != nil {
+		t.Fatalf("second migration error: %v", err)
+	}
+	if changed2 {
+		t.Error("second migration should report changed=false (idempotent)")
+	}
+	if string(migrated2) != string(migrated) {
+		t.Error("idempotent migration should return identical bytes")
+	}
+}
+
 // TestParseResources_LifecycleReservedNamespace verifies the lifecycle
 // block is accepted (reserved for future use) without fields being
 // consumed.
