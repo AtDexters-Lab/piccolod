@@ -46,6 +46,33 @@ type VolumeManager interface {
 	Detach(ctx context.Context, handle VolumeHandle) error
 	DestroyVolume(ctx context.Context, id string) error
 	RoleStream(volumeID string) (<-chan VolumeRole, error)
+
+	// AttachStateOf returns the kernel-state-derived attach state. Lock-free
+	// advisory probe; transition callers serialize internally.
+	//
+	// IMPORTANT: this primitive returns the raw 7-state partition; the caller
+	// must encode its own state→action policy. Different consumers want
+	// different mappings (a "Foreign" mount is a hard-error for lock-teardown
+	// but a normal "skip" for Shutdown). Misclassifying that mapping is the
+	// failure mode that motivated the typed advisory probe below
+	// (IsAttachedAdvisory) and the intra-package detach orchestration
+	// policies in service.go (Module.detachVolumeStrict /
+	// Module.detachVolumeBestEffort). External consumers of this interface
+	// should prefer IsAttachedAdvisory for the common "is this volume
+	// currently usable?" question; intra-package code that needs detach
+	// semantics should use the typed orchestration wrappers rather than
+	// hand-rolling a switch on AttachState.
+	//
+	// Use AttachStateOf directly only when none of the above fits — typically
+	// a transition reconciler that genuinely needs per-state dispatch.
+	AttachStateOf(ctx context.Context, volumeID string) (AttachState, error)
+
+	// IsAttachedAdvisory reports whether the volume is currently in
+	// AttachStateAttached. Lock-free; probe errors and ambiguous states
+	// return false (the volume is not safely usable). Use for "is this
+	// volume currently usable?" filter cases — auto-grow's volume
+	// enumeration, scratch-flatten reuse check, etc.
+	IsAttachedAdvisory(ctx context.Context, volumeID string) bool
 }
 
 // OrphanReconciler cleans up LVs that have no corresponding metadata.

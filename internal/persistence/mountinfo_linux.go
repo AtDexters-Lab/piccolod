@@ -4,7 +4,6 @@ package persistence
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,27 +16,28 @@ var mountPointReplacer = strings.NewReplacer(
 	`\134`, `\`,
 )
 
+// isMountPoint reports whether mountPoint appears in /proc/self/mountinfo.
+// Thin wrapper over readMountInfo (the kernel-state probe's parser) so the
+// mountinfo column-format knowledge lives in exactly one place.
 func isMountPoint(mountPoint string) (bool, error) {
-	data, err := os.ReadFile("/proc/self/mountinfo")
+	mounts, err := readMountInfo("/proc/self/mountinfo")
 	if err != nil {
 		return false, err
 	}
-	target := filepath.Clean(mountPoint)
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		fields := strings.Split(line, " ")
-		if len(fields) < 5 {
-			continue
-		}
-		pathField := decodeMountPoint(fields[4])
-		if pathField == target {
-			return true, nil
-		}
+	_, ok := mounts[filepath.Clean(mountPoint)]
+	return ok, nil
+}
+
+// mountAtPath reports whether mountPoint is a mount point and, if so,
+// what the mount entry contains. Used by transition idempotency shortcuts
+// to verify ownership before treating an existing mount as ours.
+func mountAtPath(mountPoint string) (bool, mountEntry, error) {
+	mounts, err := readMountInfo("/proc/self/mountinfo")
+	if err != nil {
+		return false, mountEntry{}, err
 	}
-	return false, nil
+	entry, ok := mounts[filepath.Clean(mountPoint)]
+	return ok, entry, nil
 }
 
 func decodeMountPoint(raw string) string {

@@ -297,14 +297,15 @@ func (m *AppManager) ensureScratchVolume(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("ensure scratch volume: %w", err)
 	}
 
-	// After an unclean restart the LV may still be mounted from the previous
-	// process. Detect this and reuse the existing mount to avoid a double-mount
-	// error from attachEphemeralVolume.
-	if mounted, _ := persistence.IsMountPoint(handle.MountDir); mounted {
+	// After an unclean restart the LV may still be attached from the previous
+	// process. IsAttachedAdvisory encodes the "reuse only when usable"
+	// policy: any non-Attached state (including ambiguous probe) returns
+	// false → fall through to a clean Attach.
+	if vm.IsAttachedAdvisory(ctx, scratchFlattenVolumeID) {
 		cleanStaleDirsIn(handle.MountDir)
 		m.scratchHandle = handle
 		m.scratchAttached = true
-		log.Printf("INFO: scratch flatten volume already mounted at %s (reusing)", handle.MountDir)
+		log.Printf("INFO: scratch flatten volume already attached at %s (reusing)", handle.MountDir)
 		return handle.MountDir, nil
 	}
 

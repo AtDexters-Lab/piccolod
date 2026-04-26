@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -41,7 +42,7 @@ const (
 // volumeMetaV2 is the on-disk metadata schema for block-native volumes.
 type volumeMetaV2 struct {
 	Version    int    `json:"version"`
-	Type       string `json:"type"` // "luks-loop" or "luks-thinlv"
+	Type       string `json:"type"` // volumeTypeLUKSLoop or volumeTypeLUKSThinLV
 	WrappedKey string `json:"wrapped_key"`
 	Nonce      string `json:"nonce"`
 	LVName     string `json:"lv_name,omitempty"`     // luks-thinlv only
@@ -91,32 +92,36 @@ type luksVolumeManager struct {
 
 	mu          sync.Mutex
 	roleChecker func(string, VolumeRole) bool
-	stacks      map[string]*blockdev.DeviceStack // volumeID → active stack
 
 	// Golden LV management.
 	goldenLVs    map[string]*volumeMetaV3 // imageDigestShort → meta cache
 	goldenMu     map[string]*sync.Mutex   // per-image-digest lock
 	goldenMuLock sync.Mutex               // protects goldenMu map
 
-	// Rootfs mount tracking.
-	rootfsMounts map[string]*rootfsMountState // volumeID → mount state
-
 	// Workspace resize monitor.
 	wsResizeCancel   context.CancelFunc
-	wsResizeCooldown map[string]time.Time // volumeID → last resize time
+	volumeResizeCooldown map[string]time.Time // volumeID → last resize time
 
 	// Application-volume auto-grow scheduling (D-5a two-stage).
 	// Defined in workspace_resize_monitor.go.
 	appResizeSchedules map[string]*appResizeSchedule // volumeID → schedule
-}
 
-// rootfsMountState tracks the full device stack for a mounted rootfs volume.
-type rootfsMountState struct {
-	stack      *blockdev.DeviceStack
-	luksMapper string
-	rawMountPath string // raw btrfs mount (used for unmount)
-	idmapPath    string // idmapped bind mount (used for unmount)
-	handle     RootfsHandle // caller-facing handle — single source of truth for cached returns
+	// Per-volume transition serialization (volume-attach-truth, RFC 2026-04-25).
+	// volumeID → *sync.Mutex. Held for entire transition (Attach, Detach,
+	// AttachRootfs, DetachRootfs, ResizeApplication, ResizeWorkspace).
+	// Phase 1 wires this map for the AttachStateOf forced-under-lock escape
+	// hatch and the admin clear-corrupted-state endpoint; Phase 2 acquires
+	// it from transition entry points.
+	locks sync.Map
+
+	// Per-volume Unknown-streak counter for the AttachStateOf K-escape ladder.
+	// volumeID → *unknownCounterEntry. Process-local, cleared on restart.
+	unknownCounter sync.Map
+
+	// Kernel-state snapshot reader. nil = use the live reader. Tests inject
+	// a fake to drive the AttachStateOf partition without touching the
+	// real kernel.
+	kernelSnapshotFn kernelSnapshotReader
 }
 
 // LUKSVolumeManagerConfig holds dependencies for the unified volume manager.
@@ -135,8 +140,15 @@ type LUKSVolumeManagerConfig struct {
 	ImageSizeFn func(ctx context.Context, imageRef string) (int64, error)
 }
 
-// NewLUKSVolumeManager creates the unified volume manager.
-func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) *luksVolumeManager {
+// NewLUKSVolumeManager creates the unified volume manager. Single-node only —
+// returns ErrMultiNodeUnsupportedForAttachTruth if cfg.NBDSrv or cfg.DRBDMgr
+// is non-nil. Multi-node enablement requires extending LiveLayers and
+// AttachStateOf to query NBD and DRBD layers (see project_multi_node_prereq.md
+// and .claude/plans/volume-attach-truth.md §"Multi-node prerequisite gate").
+func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) (*luksVolumeManager, error) {
+	if cfg.NBDSrv != nil || cfg.DRBDMgr != nil {
+		return nil, ErrMultiNodeUnsupportedForAttachTruth
+	}
 	return &luksVolumeManager{
 		run:          cfg.Run,
 		crypto:       cfg.Crypto,
@@ -149,13 +161,11 @@ func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) *luksVolumeManager {
 		flattenFn:    cfg.FlattenFn,
 		imageSizeFn:  cfg.ImageSizeFn,
 		loopVol:      NewLUKSLoopVolume(cfg.Run),
-		stacks:       make(map[string]*blockdev.DeviceStack),
-		goldenLVs:    make(map[string]*volumeMetaV3),
-		goldenMu:     make(map[string]*sync.Mutex),
-		rootfsMounts:       make(map[string]*rootfsMountState),
-		wsResizeCooldown:   make(map[string]time.Time),
+		goldenLVs: make(map[string]*volumeMetaV3),
+		goldenMu:  make(map[string]*sync.Mutex),
+		volumeResizeCooldown:   make(map[string]time.Time),
 		appResizeSchedules: make(map[string]*appResizeSchedule),
-	}
+	}, nil
 }
 
 // SetRoleChecker sets the function used to check if a volume operation
@@ -197,15 +207,21 @@ func (m *luksVolumeManager) ReconcileAllVolumeStates() error {
 			}
 			// Skip rootfs types — handled by ReconcileRootfsStates.
 			switch meta.Type {
-			case "golden", "workspace", "service-rootfs":
+			case volumeTypeGolden, volumeTypeWorkspace, volumeTypeServiceRootfs:
 				continue
-			case "service-data", "ephemeral":
+			case volumeTypeServiceData, volumeTypeEphemeral:
 				// Validate parseable, nothing else needed.
 			}
 		default:
 			log.Printf("WARN: volume %s has unsupported metadata version %d", volID, version)
 		}
 	}
+
+	// Persist IDMap fingerprints for any pre-existing volumes that don't
+	// have one yet. Runs here — at startup, before any other transition
+	// can race — to avoid the unlocked-backfill clobber that codex2-P2-A
+	// flagged.
+	m.backfillIDMapFingerprintsAtStartup(context.Background())
 	return nil
 }
 
@@ -346,10 +362,27 @@ func (m *luksVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 	}
 }
 
-// Attach mounts a volume, making it available for I/O.
-// Dispatches based on metadata version: v2 uses per-volume wrapped keys,
-// v3 service-data uses the pool keyfile. v3 rootfs types must use AttachRootfs.
+// Attach mounts a volume, making it available for I/O. Acquires the
+// per-volume transition lock for the duration of the call; concurrent
+// callers serialize. Dispatches based on metadata version: v2 uses
+// per-volume wrapped keys, v3 service-data uses the pool keyfile. v3
+// rootfs types must use AttachRootfs.
+//
+// Reconciliation shape: probes AttachStateOf under lock first.
+//   - Attached → reconcile size invariants, return success (idempotent for
+//     callers like the post-unlock RestoreServices+ReconcileOnce fan-out).
+//   - ForeignMountAtPath → fail loud; surfaced to UI as unrecoverable.
+//   - KernelStateCorrupted → ErrKernelStateCorrupted; admin clear required.
+//   - Unknown → ErrKernelStateAmbiguous; caller may retry.
+//   - StaleMountRecord → lazy umount the stale path, then full attach.
+//   - Detached / PartialMapperOnly → run the type-specific full attach,
+//     which is naturally idempotent at each step (cryptsetup luksOpen
+//     tolerates exit 5; mount tolerates EBUSY; resize2fs is idempotent).
 func (m *luksVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opts AttachOptions) error {
+	lock := m.lockFor(handle.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	metaPath := filepath.Join(paths.VolumeMetaDir(handle.ID), metadataV2File)
 
 	version, err := readVolumeMetaVersion(metaPath)
@@ -360,6 +393,47 @@ func (m *luksVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 		return fmt.Errorf("read volume metadata version: %w", err)
 	}
 
+	// Probe under lock — by-construction snapshot is consistent against
+	// concurrent transitions on this volumeID.
+	state, probeErr := m.attachStateOfUnderLock(ctx, handle.ID)
+	if probeErr != nil {
+		// Unknown/Corrupted carry their own errors. Corrupt metadata also
+		// returns Unknown via probe; surface to caller.
+		if errors.Is(probeErr, ErrKernelStateCorrupted) || errors.Is(probeErr, ErrKernelStateAmbiguous) {
+			return probeErr
+		}
+		// Other probe errors (corrupt metadata, transient procfs/sysfs read
+		// failure). attachStateOfInternal returns these with state ==
+		// AttachStateUnknown; the switch below fail-closes on Unknown by
+		// returning ErrKernelStateAmbiguous. Log carries the underlying
+		// cause for operator triage.
+		log.Printf("WARN: Attach %s probe error (will refuse with ambiguous): %v", handle.ID, probeErr)
+	}
+	switch state {
+	case AttachStateAttached:
+		// Steady state — reconcile size invariants then short-circuit. This
+		// is the path the "loser" goroutine in the post-unlock fan-out hits.
+		m.reconcileAttachedSize(ctx, handle.ID, version)
+		return nil
+	case AttachStateForeignMountAtPath:
+		return fmt.Errorf("foreign mount at %s; volume %s in unrecoverable state — logged for diagnostics", paths.MountDir(handle.ID), handle.ID)
+	case AttachStateKernelStateCorrupted:
+		return ErrKernelStateCorrupted
+	case AttachStateUnknown:
+		return ErrKernelStateAmbiguous
+	case AttachStateStaleMountRecord:
+		// Lazy-umount only when actually mounted. The stale-record state
+		// can present even when the mountinfo entry has already vanished
+		// from underneath (concurrent kernel cleanup) — running umount
+		// on a non-mountpoint errors, and aborting on that would refuse
+		// recovery for state that's already in the desired shape.
+		if err := m.unmountStaleIfPresent(ctx, paths.MountDir(handle.ID)); err != nil {
+			return fmt.Errorf("attach %s: %w", handle.ID, err)
+		}
+	case AttachStateDetached, AttachStatePartialMapperOnly:
+		// Fall through to dispatch.
+	}
+
 	switch version {
 	case metadataV2Version:
 		meta, err := readVolumeMetaV2(metaPath)
@@ -367,9 +441,9 @@ func (m *luksVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 			return fmt.Errorf("read v2 metadata: %w", err)
 		}
 		switch meta.Type {
-		case "luks-loop":
+		case volumeTypeLUKSLoop:
 			return m.attachControlVolume(ctx, handle, meta)
-		case "luks-thinlv":
+		case volumeTypeLUKSThinLV:
 			return m.attachAppVolume(ctx, handle, meta, opts)
 		default:
 			return fmt.Errorf("unknown v2 volume type: %s", meta.Type)
@@ -381,11 +455,11 @@ func (m *luksVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 			return fmt.Errorf("read v3 metadata: %w", err)
 		}
 		switch meta.Type {
-		case "service-data":
+		case volumeTypeServiceData:
 			return m.attachAppVolumeV3(ctx, handle, meta, opts)
-		case "ephemeral":
+		case volumeTypeEphemeral:
 			return m.attachEphemeralVolume(ctx, handle, meta)
-		case "golden", "workspace", "service-rootfs":
+		case volumeTypeGolden, volumeTypeWorkspace, volumeTypeServiceRootfs:
 			return fmt.Errorf("rootfs volume %s (type=%s): use AttachRootfs instead", handle.ID, meta.Type)
 		default:
 			return fmt.Errorf("unknown v3 volume type: %s", meta.Type)
@@ -396,8 +470,47 @@ func (m *luksVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opt
 	}
 }
 
-// Detach unmounts a volume and tears down its device stack.
+// reconcileAttachedSize handles the Attached-branch size invariant:
+// run cryptsetup resize + resize2fs (or btrfs filesystem resize) to
+// converge the upper layers if the LV was resized while attached.
+// Idempotent — both ops are no-ops when sizes already match.
+func (m *luksVolumeManager) reconcileAttachedSize(ctx context.Context, volumeID string, metaVersion int) {
+	if metaVersion != metadataV3Version {
+		// v2 (luks-loop / luks-thinlv legacy) does not participate in the
+		// resize cascade; nothing to reconcile.
+		return
+	}
+	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
+	meta, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		return
+	}
+	switch meta.Type {
+	case volumeTypeServiceData:
+		mapper := volMapperName(volumeID)
+		_ = m.run.Run(ctx, "cryptsetup", "resize", mapper)
+		_, _ = m.run.RunWithOutput(ctx, "resize2fs", "/dev/mapper/"+mapper)
+	case volumeTypeWorkspace:
+		mapper := volMapperName(volumeID)
+		_ = m.run.Run(ctx, "cryptsetup", "resize", mapper)
+		_ = m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", paths.MountDir(volumeID))
+	}
+}
+
+// Detach unmounts a volume and tears down its device stack. Acquires the
+// per-volume lock for the duration; serializes against concurrent Attach,
+// Resize, and DestroyVolume on the same volumeID.
 func (m *luksVolumeManager) Detach(ctx context.Context, handle VolumeHandle) error {
+	lock := m.lockFor(handle.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	return m.detachLocked(ctx, handle)
+}
+
+// detachLocked is the lock-already-held variant. Used by DestroyVolume,
+// which acquires the lock at its own entry and dispatches through the
+// type-specific destroy flow.
+func (m *luksVolumeManager) detachLocked(ctx context.Context, handle VolumeHandle) error {
 	metaPath := filepath.Join(paths.VolumeMetaDir(handle.ID), metadataV2File)
 	version, err := readVolumeMetaVersion(metaPath)
 	if err != nil {
@@ -411,9 +524,9 @@ func (m *luksVolumeManager) Detach(ctx context.Context, handle VolumeHandle) err
 			return fmt.Errorf("read v2 metadata: %w", err)
 		}
 		switch meta.Type {
-		case "luks-loop":
+		case volumeTypeLUKSLoop:
 			return m.detachControlVolume(ctx, handle, meta)
-		case "luks-thinlv":
+		case volumeTypeLUKSThinLV:
 			return m.detachAppVolume(ctx, handle)
 		default:
 			return fmt.Errorf("unknown v2 volume type: %s", meta.Type)
@@ -424,11 +537,11 @@ func (m *luksVolumeManager) Detach(ctx context.Context, handle VolumeHandle) err
 			return fmt.Errorf("read v3 metadata: %w", err)
 		}
 		switch meta.Type {
-		case "service-data":
+		case volumeTypeServiceData:
 			return m.detachAppVolume(ctx, handle)
-		case "ephemeral":
+		case volumeTypeEphemeral:
 			return m.detachEphemeralVolume(ctx, handle)
-		case "golden", "workspace", "service-rootfs":
+		case volumeTypeGolden, volumeTypeWorkspace, volumeTypeServiceRootfs:
 			return fmt.Errorf("rootfs volume %s: use DetachRootfs", handle.ID)
 		default:
 			return fmt.Errorf("unknown v3 volume type: %s", meta.Type)
@@ -438,8 +551,36 @@ func (m *luksVolumeManager) Detach(ctx context.Context, handle VolumeHandle) err
 	}
 }
 
-// DestroyVolume permanently removes a volume and its metadata.
+// DestroyVolume permanently removes a volume and its metadata. Acquires
+// the per-volume lock unconditionally — including the no-metadata branch
+// where cleanupStale*State is the only operation — then runs the
+// per-volume side-state cleanup contract (purges m.appResizeSchedules,
+// m.volumeResizeCooldown, and the unknown counter) regardless of whether
+// destroy succeeds. Half-destroyed volumes do not leak side state.
+//
+// Lock-map churn: the m.locks entry for `id` is intentionally
+// NOT deleted. Two-phase deletion (Unlock-then-Delete vs Delete-then-Unlock)
+// both have TOCTOU windows where two concurrent transitions can hold
+// different lock instances for the same volumeID. Keeping the *sync.Mutex
+// in the map for process lifetime eliminates the entire family of
+// map-churn races. Memory cost is ~24 bytes × destroyed-volumes per
+// process — negligible on a consumer appliance with low destroy frequency.
 func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error {
+	lock := m.lockFor(id)
+	lock.Lock()
+	defer func() {
+		// Side-state cleanup contract: purge per-volume in-memory state
+		// owned by the manager. The m.locks entry is intentionally retained
+		// for process lifetime (see godoc). Any future
+		// per-volume map MUST be added here.
+		m.mu.Lock()
+		delete(m.appResizeSchedules, id)
+		delete(m.volumeResizeCooldown, id)
+		m.mu.Unlock()
+		m.unknownCounter.Delete(id)
+		lock.Unlock()
+	}()
+
 	metaDir := paths.VolumeMetaDir(id)
 	metaPath := filepath.Join(metaDir, metadataV2File)
 	mountDir := paths.MountDir(id)
@@ -447,6 +588,8 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 	version, err := readVolumeMetaVersion(metaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// No metadata — run both cleanups defensively. They expect the
+			// caller (us) to hold the per-volume lock per the contract.
 			m.cleanupStaleAppState(ctx, id)
 			m.cleanupStaleEphemeralState(ctx, id)
 			return nil
@@ -460,13 +603,13 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 		if err != nil {
 			return fmt.Errorf("read v2 metadata: %w", err)
 		}
-		if err := m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir}); err != nil {
+		if err := m.detachLocked(ctx, VolumeHandle{ID: id, MountDir: mountDir}); err != nil {
 			log.Printf("WARN: detach volume %s during destroy: %v", id, err)
 		}
 		switch meta.Type {
-		case "luks-loop":
+		case volumeTypeLUKSLoop:
 			_ = os.Remove(paths.CoreJoin(meta.LoopFile))
-		case "luks-thinlv":
+		case volumeTypeLUKSThinLV:
 			if m.lvMgr != nil && meta.LVName != "" {
 				if err := m.lvMgr.RemoveThinLV(ctx, meta.LVName); err != nil {
 					log.Printf("WARN: remove thin LV %s: %v", meta.LVName, err)
@@ -480,10 +623,12 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 			return fmt.Errorf("read v3 metadata: %w", err)
 		}
 		switch meta.Type {
-		case "golden", "workspace", "service-rootfs":
-			return m.DestroyRootfs(ctx, id)
-		case "service-data":
-			if err := m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir}); err != nil {
+		case volumeTypeGolden, volumeTypeWorkspace, volumeTypeServiceRootfs:
+			// Rootfs destroy needs its own per-volume lock; we hold it. Use
+			// the lock-already-held variant to avoid re-entry deadlock.
+			return m.destroyRootfsLocked(ctx, id)
+		case volumeTypeServiceData:
+			if err := m.detachLocked(ctx, VolumeHandle{ID: id, MountDir: mountDir}); err != nil {
 				log.Printf("WARN: detach volume %s during destroy: %v", id, err)
 			}
 			if m.lvMgr != nil && meta.LVName != "" {
@@ -491,9 +636,8 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 					log.Printf("WARN: remove thin LV %s: %v", meta.LVName, err)
 				}
 			}
-		case "ephemeral":
-			// Detach dispatches to detachEphemeralVolume (no LUKS close).
-			if err := m.Detach(ctx, VolumeHandle{ID: id, MountDir: mountDir}); err != nil {
+		case volumeTypeEphemeral:
+			if err := m.detachLocked(ctx, VolumeHandle{ID: id, MountDir: mountDir}); err != nil {
 				log.Printf("WARN: detach ephemeral volume %s during destroy: %v", id, err)
 			}
 			if m.lvMgr != nil && meta.LVName != "" {
@@ -516,9 +660,16 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 
 // cleanupStaleAppState tears down leftover LUKS mappers, LVs, and dirs for a
 // volume that has no metadata (e.g., partial creation that was interrupted).
+//
+// Lock contract: caller MUST hold m.locks[id]. All callers (EnsureVolume,
+// DestroyVolume) acquire this lock at their top-level entry. This helper
+// MUST NOT call back into any lock-acquiring transition (DestroyVolume,
+// Detach, Attach, AttachRootfs, DetachRootfs, ResizeApplication,
+// ResizeWorkspace) — re-entering m.locks[id] would deadlock (Go's
+// sync.Mutex is not reentrant).
 func (m *luksVolumeManager) cleanupStaleAppState(ctx context.Context, id string) {
 	mountDir := paths.MountDir(id)
-	mapper := "piccolo-vol-" + id
+	mapper := volMapperName(id)
 	lvName := appLVPrefix + id
 
 	// Best-effort teardown: unmount → close LUKS → deactivate LV → remove LV.
@@ -566,7 +717,7 @@ func (m *luksVolumeManager) ensureControlVolume(ctx context.Context, req VolumeR
 	// Persist metadata.
 	meta := &volumeMetaV2{
 		Version:    metadataV2Version,
-		Type:       "luks-loop",
+		Type:       volumeTypeLUKSLoop,
 		WrappedKey: wrappedKey,
 		Nonce:      nonce,
 		LoopFile:   controlPlaneLoopFile,
@@ -637,7 +788,7 @@ func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeReque
 	}
 
 	// Open LUKS, mkfs, close.
-	mapper := "piccolo-vol-" + req.ID
+	mapper := volMapperName(req.ID)
 	if err := m.luksOpenWithPoolKeyfile(ctx, topDev, mapper); err != nil {
 		return VolumeHandle{}, fmt.Errorf("luks open for mkfs: %w", err)
 	}
@@ -651,7 +802,7 @@ func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeReque
 	// Persist v3 metadata.
 	meta := &volumeMetaV3{
 		Version:   metadataV3Version,
-		Type:      "service-data",
+		Type:      volumeTypeServiceData,
 		LVName:    lvName,
 		VGName:    lvm.DefaultVGName,
 		SizeBytes: sizeBytes,
@@ -693,7 +844,9 @@ func (m *luksVolumeManager) attachAppVolumeCommon(ctx context.Context, handle Vo
 		return fmt.Errorf("role check failed for %s", handle.ID)
 	}
 
-	// Build and open the device stack.
+	// Build and open the device stack. The stack object is local to this
+	// transition; rollback closes it directly without touching any shared
+	// in-memory map (Phase 4 of volume-attach-truth eliminated the cache).
 	stack, err := m.buildStack(handle.ID, lvName, sizeBytes)
 	if err != nil {
 		return fmt.Errorf("build device stack: %w", err)
@@ -702,13 +855,7 @@ func (m *luksVolumeManager) attachAppVolumeCommon(ctx context.Context, handle Vo
 		return fmt.Errorf("open device stack: %w", err)
 	}
 
-	// Track the active stack.
-	m.mu.Lock()
-	m.stacks[handle.ID] = stack
-	m.mu.Unlock()
-
-	// Rollback on failure: close LUKS mapper (if opened), close stack, remove tracking.
-	mapper := "piccolo-vol-" + handle.ID
+	mapper := volMapperName(handle.ID)
 	var openedMapper string
 	success := false
 	defer func() {
@@ -719,19 +866,25 @@ func (m *luksVolumeManager) attachAppVolumeCommon(ctx context.Context, handle Vo
 			m.run.Run(ctx, "cryptsetup", "close", openedMapper)
 		}
 		stack.Close(ctx)
-		m.mu.Lock()
-		delete(m.stacks, handle.ID)
-		m.mu.Unlock()
 	}()
 
-	// LUKS open.
+	// LUKS open. Tolerate cryptsetup exit 5 (mapper already exists) — the
+	// reconciler may be completing a PartialMapperOnly state where the
+	// mapper survived but the mount didn't.
 	topDev := stack.Top().Path()
 	if err := luksOpenFn(topDev, mapper); err != nil {
-		return fmt.Errorf("luks open: %w", err)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != cryptsetupExitDeviceExists {
+			return fmt.Errorf("luks open: %w", err)
+		}
+		// Mapper already present — do not register it for rollback close,
+		// since we didn't open it this call.
+	} else {
+		openedMapper = mapper
 	}
-	openedMapper = mapper
 
-	// Mount ext4.
+	// Mount ext4. Tolerate "already mounted" — mount returns EBUSY when
+	// the path is already a mount point (idempotent for re-attach paths).
 	mountDir := handle.MountDir
 	// Ensure the mounts/ parent directory is traversable (0o711) so per-app
 	// users can reach their own mount points without being able to list siblings.
@@ -747,8 +900,19 @@ func (m *luksVolumeManager) attachAppVolumeCommon(ctx context.Context, handle Vo
 	}
 
 	mapperPath := "/dev/mapper/" + mapper
-	if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", "discard", mapperPath, mountDir); err != nil {
-		return fmt.Errorf("mount: %w", err)
+	mounted, entry, _ := mountAtPath(mountDir)
+	if mounted {
+		// Ownership check (codex2-P3): verify the existing mount belongs
+		// to our mapper before skipping. Window between top-level probe
+		// and this branch is small but nonzero; refuse to silently treat
+		// a foreign mount as ours.
+		if entry.Source != mapperPath {
+			return fmt.Errorf("foreign mount at %s (source=%s, expected=%s); refusing to coexist", mountDir, entry.Source, mapperPath)
+		}
+	} else {
+		if err := m.run.Run(ctx, "mount", "-t", "ext4", "-o", "discard", mapperPath, mountDir); err != nil {
+			return fmt.Errorf("mount: %w", err)
+		}
 	}
 
 	// If the LV was resized while detached (via ResizeApplication), the ext4
@@ -765,7 +929,7 @@ func (m *luksVolumeManager) attachAppVolumeCommon(ctx context.Context, handle Vo
 }
 
 func (m *luksVolumeManager) detachAppVolume(ctx context.Context, handle VolumeHandle) error {
-	mapper := "piccolo-vol-" + handle.ID
+	mapper := volMapperName(handle.ID)
 	var errs []error
 
 	// Unmount with lazy fallback. Continue regardless — the mount may
@@ -781,19 +945,26 @@ func (m *luksVolumeManager) detachAppVolume(ctx context.Context, handle VolumeHa
 		errs = append(errs, fmt.Errorf("luks close %s: %w", mapper, err))
 	}
 
-	// Close device stack. Always remove from tracking — during shutdown
-	// there is no retry opportunity; a stale entry is worse than a missing one.
-	m.mu.Lock()
-	stack := m.stacks[handle.ID]
-	delete(m.stacks, handle.ID)
-	m.mu.Unlock()
-
-	if stack != nil {
-		if err := stack.Close(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("close device stack: %w", err))
+	// Deactivate the LV (kernel-state truth: read meta to find LV name —
+	// no dependency on the deprecated cache). Single-node only — multi-node
+	// stack tear-down is gated out at construction.
+	metaPath := filepath.Join(paths.VolumeMetaDir(handle.ID), metadataV2File)
+	if version, err := readVolumeMetaVersion(metaPath); err == nil {
+		var lvName string
+		switch version {
+		case metadataV2Version:
+			if v2, err := readVolumeMetaV2(metaPath); err == nil {
+				lvName = v2.LVName
+			}
+		case metadataV3Version:
+			if v3, err := readVolumeMetaV3(metaPath); err == nil {
+				lvName = v3.LVName
+			}
+		}
+		if m.lvMgr != nil && lvName != "" {
+			_ = m.lvMgr.DeactivateLV(ctx, lvName)
 		}
 	}
-
 	return errors.Join(errs...)
 }
 
@@ -836,7 +1007,7 @@ func (m *luksVolumeManager) ensureEphemeralVolume(ctx context.Context, req Volum
 
 	meta := &volumeMetaV3{
 		Version:   metadataV3Version,
-		Type:      "ephemeral",
+		Type:      volumeTypeEphemeral,
 		LVName:    lvName,
 		VGName:    lvm.DefaultVGName,
 		SizeBytes: ephDefaultSize,
@@ -854,14 +1025,10 @@ func (m *luksVolumeManager) ensureEphemeralVolume(ctx context.Context, req Volum
 }
 
 func (m *luksVolumeManager) attachEphemeralVolume(ctx context.Context, handle VolumeHandle, meta *volumeMetaV3) error {
-	// Idempotent: if already attached, skip.
-	m.mu.Lock()
-	_, exists := m.stacks[handle.ID]
-	m.mu.Unlock()
-	if exists {
-		return nil
-	}
-
+	// Caller (Attach dispatcher) probed under lock and reaches here only
+	// for Detached / PartialMapperOnly / StaleMountRecord. The mount step
+	// below is idempotent (skips when already mounted) so PartialMapperOnly
+	// completes naturally; no second probe needed.
 	thinDev := blockdev.NewThinLVDevice(m.lvMgr, meta.LVName, meta.SizeBytes)
 	stack, err := blockdev.NewDeviceStack(handle.ID, thinDev)
 	if err != nil {
@@ -871,17 +1038,10 @@ func (m *luksVolumeManager) attachEphemeralVolume(ctx context.Context, handle Vo
 		return fmt.Errorf("open ephemeral device stack: %w", err)
 	}
 
-	m.mu.Lock()
-	m.stacks[handle.ID] = stack
-	m.mu.Unlock()
-
 	success := false
 	defer func() {
 		if !success {
 			stack.Close(ctx)
-			m.mu.Lock()
-			delete(m.stacks, handle.ID)
-			m.mu.Unlock()
 		}
 	}()
 
@@ -909,7 +1069,7 @@ func (m *luksVolumeManager) detachEphemeralVolume(ctx context.Context, handle Vo
 	var errs []error
 
 	// Unmount with lazy fallback. Continue regardless — the mount may
-	// already be gone (systemd race) and stack.Close still needs to run.
+	// already be gone (systemd race) and LV deactivation still needs to run.
 	if err := m.run.Run(ctx, "umount", handle.MountDir); err != nil {
 		log.Printf("umount %s failed, trying lazy unmount", handle.MountDir)
 		if lazyErr := m.run.Run(ctx, "umount", "-l", handle.MountDir); lazyErr != nil {
@@ -917,24 +1077,19 @@ func (m *luksVolumeManager) detachEphemeralVolume(ctx context.Context, handle Vo
 		}
 	}
 
-	// Close device stack. Always remove from tracking — during shutdown
-	// there is no retry opportunity; a stale entry is worse than a missing one.
-	m.mu.Lock()
-	stack := m.stacks[handle.ID]
-	delete(m.stacks, handle.ID)
-	m.mu.Unlock()
-
-	if stack != nil {
-		if err := stack.Close(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("close device stack: %w", err))
-		}
+	// Deactivate the LV via metadata (kernel-state truth).
+	metaPath := filepath.Join(paths.VolumeMetaDir(handle.ID), metadataV2File)
+	if v3, err := readVolumeMetaV3(metaPath); err == nil && v3.LVName != "" && m.lvMgr != nil {
+		_ = m.lvMgr.DeactivateLV(ctx, v3.LVName)
 	}
-
 	return errors.Join(errs...)
 }
 
 // cleanupStaleEphemeralState tears down leftover mounts, LVs, and dirs for an
 // ephemeral volume that has no metadata (e.g., partial creation that was interrupted).
+//
+// Lock contract: caller MUST hold m.locks[id]. Same reasoning as
+// cleanupStaleAppState — see its godoc.
 func (m *luksVolumeManager) cleanupStaleEphemeralState(ctx context.Context, id string) {
 	mountDir := paths.MountDir(id)
 	lvName := ephLVPrefix + id
@@ -1136,7 +1291,7 @@ func (m *luksVolumeManager) provisionKeyslotOnAllVolumes(ctx context.Context, sl
 			continue
 		}
 		// Ephemeral volumes have no LUKS container — skip keyslot provisioning.
-		if meta.Type == "ephemeral" {
+		if meta.Type == volumeTypeEphemeral {
 			continue
 		}
 		targets = append(targets, candidate{id: volID, meta: meta})
@@ -1172,24 +1327,20 @@ func (m *luksVolumeManager) provisionKeyslotOnVolume(ctx context.Context, volID 
 }
 
 // resolveLUKSDevice returns the block device path for a volume's LUKS container.
-// For already-active volumes, uses the existing device. For inactive volumes,
-// activates the underlying device and returns a cleanup function.
+// For already-attached volumes, uses LUKSBackingDevice (kernel-state truth).
+// For inactive volumes, activates the underlying device and returns a cleanup
+// function. Single-node only — multi-node is gated out at construction.
 func (m *luksVolumeManager) resolveLUKSDevice(ctx context.Context, volID string, meta *volumeMetaV3) (string, func(), error) {
 	noop := func() {}
 
 	switch meta.Type {
-	case "ephemeral":
+	case volumeTypeEphemeral:
 		return "", noop, fmt.Errorf("ephemeral volumes have no LUKS device")
 
-	case "golden", "workspace", "service-rootfs":
+	case volumeTypeGolden, volumeTypeWorkspace, volumeTypeServiceRootfs:
 		// Rootfs types: LUKS sits directly on the LV (no DRBD in stack).
-		// NOTE: if workspace replication via DRBD is added, this must
-		// resolve through the device stack instead of the raw LV.
-		m.mu.Lock()
-		state := m.rootfsMounts[volID]
-		m.mu.Unlock()
-		if state != nil {
-			return m.lvMgr.LVPath(meta.LVName), noop, nil
+		if dev, err := m.LUKSBackingDevice(ctx, volID); err == nil {
+			return dev, noop, nil
 		}
 		if err := m.lvMgr.ActivateLV(ctx, meta.LVName); err != nil {
 			return "", nil, fmt.Errorf("activate LV %s: %w", meta.LVName, err)
@@ -1198,22 +1349,18 @@ func (m *luksVolumeManager) resolveLUKSDevice(ctx context.Context, volID string,
 			m.lvMgr.DeactivateLV(ctx, meta.LVName)
 		}, nil
 
-	case "service-data":
-		// Service-data: LUKS sits on top of the device stack.
-		m.mu.Lock()
-		stack := m.stacks[volID]
-		m.mu.Unlock()
-		if stack != nil {
-			return stack.Top().Path(), noop, nil
+	case volumeTypeServiceData:
+		// Service-data on single-node: LUKS sits directly on the thin LV.
+		if dev, err := m.LUKSBackingDevice(ctx, volID); err == nil {
+			return dev, noop, nil
 		}
-		tmpStack, err := m.buildStack(volID, meta.LVName, meta.SizeBytes)
-		if err != nil {
-			return "", nil, fmt.Errorf("build stack: %w", err)
+		// Not attached — activate the LV transiently for keyslot ops.
+		if err := m.lvMgr.ActivateLV(ctx, meta.LVName); err != nil {
+			return "", nil, fmt.Errorf("activate LV %s: %w", meta.LVName, err)
 		}
-		if err := tmpStack.Open(ctx); err != nil {
-			return "", nil, fmt.Errorf("open stack: %w", err)
-		}
-		return tmpStack.Top().Path(), func() { tmpStack.Close(ctx) }, nil
+		return m.lvMgr.LVPath(meta.LVName), func() {
+			m.lvMgr.DeactivateLV(ctx, meta.LVName)
+		}, nil
 
 	default:
 		return "", nil, fmt.Errorf("unsupported volume type: %s", meta.Type)
@@ -1294,6 +1441,14 @@ type volumeMetaV3 struct {
 	CloneOf         string         `json:"clone_of,omitempty"`
 	IDMap           *IDMapMeta     `json:"idmap,omitempty"`
 	FlattenComplete string         `json:"flatten_complete,omitempty"` // RFC3339 timestamp
+
+	// IDMapFingerprint is the lowercase hex BLAKE2b-256 of canonicalIDMapBytes(*IDMap).
+	// Empty for volumes without IDMap. Once non-empty, mutations to the IDMap
+	// fields are rejected by writeVolumeMetaV3 (ErrIDMapImmutable). Backfilled
+	// from the in-memory IDMap on first read for volumes created before the
+	// volume-attach-truth work shipped — pre-existing hand-edited metadata is
+	// grandfathered (see plan §"Pre-Phase-1 fleet grandfathering").
+	IDMapFingerprint string `json:"idmap_fingerprint,omitempty"`
 }
 
 // IDMapMeta persists idmap configuration for rootfs volumes.
@@ -1361,7 +1516,14 @@ func readVolumeMetaV2(path string) (*volumeMetaV2, error) {
 	return &meta, nil
 }
 
-// readVolumeMetaV3 reads v3 metadata.
+// readVolumeMetaV3 reads v3 metadata. Computes IDMapFingerprint in-memory
+// for volumes created before this work shipped (so the immutability guard
+// works for the duration of this process), but does NOT persist the
+// backfill. A persisting backfill from this read path raced ResizeWorkspace
+// and other writers (codex2-P2-A) — the rewrite would clobber concurrent
+// updates. Persistence happens via writeVolumeMetaV3 on the next legitimate
+// metadata write (always under the per-volume lock), or explicitly through
+// backfillIDMapFingerprintsAtStartup before any concurrent transition runs.
 func readVolumeMetaV3(path string) (*volumeMetaV3, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1374,7 +1536,54 @@ func readVolumeMetaV3(path string) (*volumeMetaV3, error) {
 	if meta.Version != metadataV3Version {
 		return nil, fmt.Errorf("%w: expected v3, got %d", ErrVolumeMetadataCorrupted, meta.Version)
 	}
+	if meta.IDMap != nil && meta.IDMapFingerprint == "" {
+		meta.IDMapFingerprint = computeIDMapFingerprint(meta.IDMap)
+	}
 	return &meta, nil
+}
+
+// backfillIDMapFingerprintsAtStartup walks every v3 metadata file and
+// persists IDMapFingerprint for volumes that don't yet have one. Runs
+// once during ReconcileAllVolumeStates before any other transition can
+// race; uses the per-volume lock to serialize against any unlikely
+// concurrent caller. Volumes with their fingerprint already set are
+// touched only in-memory (no rewrite), so this is idempotent.
+func (m *luksVolumeManager) backfillIDMapFingerprintsAtStartup(ctx context.Context) {
+	volIDs, err := listVolumeIDs()
+	if err != nil {
+		return
+	}
+	for _, volID := range volIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
+		// Quick filter: only v3 metadata, only volumes with IDMap and no
+		// fingerprint. Read without taking the lock — we re-read after.
+		preview, err := readVolumeMetaV3(metaPath)
+		if err != nil || preview.IDMap == nil {
+			continue
+		}
+		// readVolumeMetaV3 already computed the fingerprint in-memory; if
+		// the on-disk file was missing one, persist it now under the lock.
+		// Re-read under the lock to avoid clobbering a concurrent write.
+		lock := m.lockFor(volID)
+		lock.Lock()
+		fresh, ferr := readVolumeMetaV3(metaPath)
+		if ferr != nil || fresh.IDMap == nil {
+			lock.Unlock()
+			continue
+		}
+		// If the on-disk file already has a fingerprint, no work to do.
+		if persistedFp, _ := readPersistedIDMapFingerprint(metaPath); persistedFp != "" {
+			lock.Unlock()
+			continue
+		}
+		// writeVolumeMetaV3 recomputes + persists the fingerprint and
+		// honors the immutability guard.
+		if err := writeVolumeMetaV3(metaPath, fresh); err != nil {
+			log.Printf("WARN: backfill IDMap fingerprint for %s: %v", volID, err)
+		}
+		lock.Unlock()
+		_ = ctx // honor caller context shape; nothing inside takes it
+	}
 }
 
 // readVolumeMeta reads v2 metadata (backward-compatible reader for existing callers).
@@ -1390,12 +1599,62 @@ func writeVolumeMeta(path string, meta *volumeMetaV2) error {
 	return fsutil.AtomicWriteFile(path, data, 0o600)
 }
 
+// writeVolumeMetaV3 writes v3 metadata with two contracts:
+//
+//  1. IDMap immutability: if a fingerprint already exists on disk for this
+//     volume, the incoming meta's IDMap fields must produce the same
+//     fingerprint. Otherwise: ErrIDMapImmutable. This blocks the
+//     hand-edit-the-JSON workflow at the write site; the attach-time
+//     fingerprint check (Phase 2 reconciler) is the second line of defense.
+//     Removing IDMap entirely (setting it to nil when a fingerprint is
+//     persisted) is also rejected — otherwise an attacker could clear the
+//     guard by deleting the idmap field, then re-add a different IDMap on
+//     the next write (which would have no fingerprint to compare against).
+//  2. Fingerprint maintenance: when meta.IDMap != nil and meta.IDMapFingerprint
+//     is empty, the fingerprint is computed and stored. When IDMap == nil
+//     AND no fingerprint was previously persisted, the fingerprint stays
+//     empty (legitimate case: volume created without idmap).
 func writeVolumeMetaV3(path string, meta *volumeMetaV3) error {
+	existingFp, _ := readPersistedIDMapFingerprint(path)
+	if meta.IDMap == nil {
+		if existingFp != "" {
+			return fmt.Errorf("%w: cannot remove IDMap (persisted fingerprint %s)", ErrIDMapImmutable, existingFp)
+		}
+		meta.IDMapFingerprint = ""
+	} else {
+		newFp := computeIDMapFingerprint(meta.IDMap)
+		if existingFp != "" && existingFp != newFp {
+			return fmt.Errorf("%w: persisted fingerprint %s vs new %s", ErrIDMapImmutable, existingFp, newFp)
+		}
+		meta.IDMapFingerprint = newFp
+	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err
 	}
 	return fsutil.AtomicWriteFile(path, data, 0o600)
+}
+
+// readPersistedIDMapFingerprint reads only the IDMapFingerprint field from
+// an existing on-disk metadata file. Returns ("", nil) when the file does
+// not exist — used to allow first-write through writeVolumeMetaV3.
+func readPersistedIDMapFingerprint(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	var v struct {
+		IDMapFingerprint string `json:"idmap_fingerprint"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		// Treat unparseable existing metadata as "no fingerprint" — the
+		// caller will overwrite it; corruption is handled by the read path.
+		return "", nil
+	}
+	return v.IDMapFingerprint, nil
 }
 
 // --- Data volume snapshot and rollback (RFC 20260302 Phases 2-3) ---

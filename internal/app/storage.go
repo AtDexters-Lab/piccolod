@@ -107,27 +107,32 @@ func (m *AppManager) ensureAppVolumeLayout(ctx context.Context, instanceID strin
 		return appVolumeLayout{}, fmt.Errorf("app manager: volume %s mount dir unavailable", volID)
 	}
 
-	// In production we must never write to the expected mount directory unless it is
-	// actually mounted (encrypted). Tests can bypass this with PICCOLO_ALLOW_UNMOUNTED_TESTS=1.
+	// In production we must never write to the expected mount directory unless
+	// the volume is actually attached (kernel-state truth, beyond just the
+	// mount-point bit). Tests bypass via PICCOLO_ALLOW_UNMOUNTED_TESTS=1.
 	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") != "1" {
-		mounted, err := persistence.IsMountPoint(handle.MountDir)
+		state, err := volumes.AttachStateOf(ctx, volID)
 		if err != nil {
-			return appVolumeLayout{}, fmt.Errorf("app manager: check mountpoint %s: %w", handle.MountDir, err)
+			if errors.Is(err, persistence.ErrKernelStateAmbiguous) {
+				// Probe couldn't get a consistent snapshot — treat as
+				// transient unavailability so the caller retries.
+				return appVolumeLayout{}, ErrVolumeUnavailable
+			}
+			if errors.Is(err, persistence.ErrKernelStateCorrupted) {
+				// Operator action required; surface distinctly.
+				return appVolumeLayout{}, fmt.Errorf("app manager: volume %s requires operator action: %w", volID, err)
+			}
+			return appVolumeLayout{}, fmt.Errorf("app manager: probe attach state for %s: %w", volID, err)
 		}
-		if !mounted {
+		if state != persistence.AttachStateAttached {
 			if err := volumes.Attach(ctx, handle, persistence.AttachOptions{Role: persistence.VolumeRoleLeader}); err != nil {
 				if errors.Is(err, persistence.ErrNotImplemented) {
 					return appVolumeLayout{}, fmt.Errorf("app manager: volume attachment not supported")
 				}
 				return appVolumeLayout{}, err
 			}
-			mounted, err = persistence.IsMountPoint(handle.MountDir)
-			if err != nil {
-				return appVolumeLayout{}, fmt.Errorf("app manager: recheck mountpoint %s: %w", handle.MountDir, err)
-			}
-			if !mounted {
-				return appVolumeLayout{}, ErrVolumeUnavailable
-			}
+			// Attach contract: returns nil only when state is Attached. No
+			// re-check needed.
 		}
 	}
 

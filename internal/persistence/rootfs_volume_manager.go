@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -174,7 +176,7 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 		}
 	}
 
-	mapper := "piccolo-vol-" + goldenID
+	mapper := volMapperName(goldenID)
 	mountDir := paths.MountDir(goldenID)
 
 	// Track which layers have been set up for deferred cleanup.
@@ -281,7 +283,7 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	// On crash after this write: FlattenComplete set → reconcile caches (correct).
 	meta := &volumeMetaV3{
 		Version:         metadataV3Version,
-		Type:            "golden",
+		Type:            volumeTypeGolden,
 		LVName:          lvName,
 		VGName:          lvm.DefaultVGName,
 		SizeBytes:       sizeBytes,
@@ -322,7 +324,7 @@ func (m *luksVolumeManager) CreateWorkspaceFromGolden(ctx context.Context, req W
 	}
 
 	volumeID := workspaceLVPrefix + req.InstanceID
-	return m.createRootfsFromGolden(ctx, goldenID, volumeID, "workspace", false, &req.IDMap)
+	return m.createRootfsFromGolden(ctx, goldenID, volumeID, volumeTypeWorkspace, false, &req.IDMap)
 }
 
 // CreateServiceRootfs creates a read-only service rootfs from a golden LV snapshot.
@@ -341,7 +343,7 @@ func (m *luksVolumeManager) CreateServiceRootfs(ctx context.Context, req Service
 	if volumeID == "" {
 		volumeID = ServiceRootfsVolumeID(req.InstanceID, req.ServiceName)
 	}
-	return m.createRootfsFromGolden(ctx, goldenID, volumeID, "service-rootfs", true, &req.IDMap)
+	return m.createRootfsFromGolden(ctx, goldenID, volumeID, volumeTypeServiceRootfs, true, &req.IDMap)
 }
 
 // createRootfsFromGolden creates a rootfs from a golden LV via snapshot.
@@ -379,7 +381,7 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 	// Workspace snapshots get a generous virtual size — thin provisioning
 	// means only written blocks consume physical pool space.
 	sizeBytes := goldenMeta.SizeBytes
-	if volType == "workspace" && defaultWorkspaceVirtualSize > sizeBytes {
+	if volType == volumeTypeWorkspace && defaultWorkspaceVirtualSize > sizeBytes {
 		if err := m.lvMgr.ResizeLV(ctx, snapshotName, defaultWorkspaceVirtualSize); err != nil {
 			log.Printf("WARN: resize workspace LV %s to default: %v", snapshotName, err)
 		} else {
@@ -424,8 +426,18 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 		return RootfsHandle{}, fmt.Errorf("write metadata: %w", err)
 	}
 
-	// Attach the rootfs.
-	handle, err := m.attachRootfsFromMeta(ctx, volumeID, meta)
+	// Acquire the per-volume transition lock and route through the same
+	// reconciler-shaped attach path AttachRootfs uses. This
+	// closes the "fresh LV lands on stale mount" hazard: if a prior destroy
+	// left a StaleMountRecord at paths.MountDir(volumeID), the probe sees
+	// it and lazy-umounts before the fresh mount runs. attachRootfsLocked
+	// re-reads metadata from disk; the metadata we just wrote is what it
+	// will see.
+	lock := m.lockFor(volumeID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	handle, err := m.attachRootfsLocked(ctx, volumeID)
 	if err != nil {
 		m.lvMgr.DeactivateLV(ctx, snapshotName)
 		m.lvMgr.RemoveThinLV(ctx, snapshotName)
@@ -479,7 +491,7 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 
 	meta := &volumeMetaV3{
 		Version:         metadataV3Version,
-		Type:            "workspace",
+		Type:            volumeTypeWorkspace,
 		LVName:          cloneVolumeID,
 		VGName:          lvm.DefaultVGName,
 		SizeBytes:       originMeta.SizeBytes,
@@ -508,7 +520,13 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 		return RootfsHandle{}, fmt.Errorf("write clone metadata: %w", err)
 	}
 
-	handle, err := m.attachRootfsFromMeta(ctx, cloneVolumeID, meta)
+	// Per-volume transition lock + reconciler-shaped attach —
+	// see createRootfsFromGolden for rationale.
+	lock := m.lockFor(cloneVolumeID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	handle, err := m.attachRootfsLocked(ctx, cloneVolumeID)
 	if err != nil {
 		m.lvMgr.DeactivateLV(ctx, cloneVolumeID)
 		m.lvMgr.RemoveThinLV(ctx, cloneVolumeID)
@@ -540,39 +558,232 @@ func (m *luksVolumeManager) ListClones(ctx context.Context, originVolumeID strin
 	return clones, nil
 }
 
-// AttachRootfs activates and mounts an existing rootfs volume.
+// AttachRootfs activates and mounts an existing rootfs volume. Acquires
+// the per-volume transition lock; concurrent callers serialize.
+//
+// Reconciliation shape: probes AttachStateOf under lock first.
+//   - Attached → return the metadata-derived RootfsHandle (no cache lookup
+//     required; rootfs handle is fully derivable from metadata).
+//   - ForeignMountAtPath / KernelStateCorrupted / Unknown → fail loud.
+//   - StaleMountRecord → lazy umount, then full attach.
+//   - Detached / PartialMapperOnly → run attachRootfsFromMeta, which is
+//     naturally idempotent.
+//
+// The pre-existing m.rootfsMounts fast-path has been removed — every call
+// goes through the kernel-state probe. Cost is microseconds per call;
+// eliminates the divergence-risk-via-cache-shortcut hazard.
 func (m *luksVolumeManager) AttachRootfs(ctx context.Context, volumeID string) (RootfsHandle, error) {
-	// Check if already mounted.
-	m.mu.Lock()
-	if state, ok := m.rootfsMounts[volumeID]; ok {
-		m.mu.Unlock()
-		return state.handle, nil
-	}
-	m.mu.Unlock()
+	lock := m.lockFor(volumeID)
+	lock.Lock()
+	defer lock.Unlock()
+	return m.attachRootfsLocked(ctx, volumeID)
+}
 
+// attachRootfsLocked is the lock-already-held variant of AttachRootfs.
+// Callers MUST hold m.locks[volumeID]. Three call sites:
+//   - AttachRootfs (public entry; takes the lock and calls through here).
+//   - createRootfsFromGolden (takes the lock after metadata
+//     write, then calls through to get probe-and-reconcile + IDMap
+//     fingerprint check + StaleMountRecord lazy-umount for free).
+//   - CloneWorkspace (same shape as createRootfsFromGolden).
+//
+// Re-reads metadata from disk every call. The IDMap fingerprint check
+// lives in attachRootfsFromMeta so all callers — including any that bypass
+// this function and call attachRootfsFromMeta directly — run the check.
+// Additionally, the Attached fast-path here runs the same fingerprint
+// check before deriving the handle (codex P2): a volume that stayed
+// mounted across a daemon restart with hand-edited metadata would
+// otherwise return the derived handle bypassing the immutability guard.
+func (m *luksVolumeManager) attachRootfsLocked(ctx context.Context, volumeID string) (RootfsHandle, error) {
 	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
 	meta, err := readVolumeMetaV3(metaPath)
 	if err != nil {
 		return RootfsHandle{}, fmt.Errorf("read rootfs metadata: %w", err)
 	}
 
+	state, probeErr := m.attachStateOfUnderLock(ctx, volumeID)
+	if probeErr != nil {
+		if errors.Is(probeErr, ErrKernelStateCorrupted) || errors.Is(probeErr, ErrKernelStateAmbiguous) {
+			return RootfsHandle{}, probeErr
+		}
+		log.Printf("WARN: AttachRootfs %s probe error (will refuse with ambiguous): %v", volumeID, probeErr)
+	}
+
+	switch state {
+	case AttachStateAttached:
+		// Fingerprint guard runs on every Attached return — see godoc.
+		if err := verifyIDMapFingerprint(volumeID, meta); err != nil {
+			return RootfsHandle{}, err
+		}
+		// Legacy workspace size upgrade must run on every attach path
+		// (codex5-P2). Idempotent — no-op when already at default size.
+		m.upgradeUndersizedWorkspace(ctx, volumeID, meta)
+		return deriveRootfsHandle(volumeID, meta), nil
+	case AttachStateForeignMountAtPath:
+		return RootfsHandle{}, fmt.Errorf("foreign mount at %s; volume %s in unrecoverable state — logged for diagnostics", paths.MountDir(volumeID), volumeID)
+	case AttachStateKernelStateCorrupted:
+		return RootfsHandle{}, ErrKernelStateCorrupted
+	case AttachStateUnknown:
+		return RootfsHandle{}, ErrKernelStateAmbiguous
+	case AttachStateStaleMountRecord:
+		// Lazy-umount only the paths that are actually mount points right
+		// now. Stale-record can present in three shapes (raw + idmap, raw
+		// only, idmap only after a partial teardown); we tear down idmap
+		// before raw so the bind doesn't pin the underlying mount, then
+		// raw. Skipping a path that isn't a mount point is correct (it
+		// was already gone) and necessary — running umount on a non-mount
+		// errors, and aborting on that error would leave the volume
+		// permanently unrecoverable in the idmap-only case (codex6-P2-B).
+		if err := m.unmountStaleIfPresent(ctx, paths.MountDir(volumeID)+"-idmap"); err != nil {
+			return RootfsHandle{}, fmt.Errorf("attach rootfs %s: %w", volumeID, err)
+		}
+		if err := m.unmountStaleIfPresent(ctx, paths.MountDir(volumeID)); err != nil {
+			return RootfsHandle{}, fmt.Errorf("attach rootfs %s: %w", volumeID, err)
+		}
+	case AttachStateDetached, AttachStatePartialMapperOnly:
+		// Fall through to attachRootfsFromMeta.
+	}
+
 	return m.attachRootfsFromMeta(ctx, volumeID, meta)
 }
 
+// upgradeUndersizedWorkspace resizes a legacy workspace LV up to
+// defaultWorkspaceVirtualSize when meta.SizeBytes is still below it.
+// Idempotent (no-op when meta is already at or above default). Must run
+// on every attach path — pre-attach-truth this only happened on a cold
+// attach because the cache miss forced the full path; post-refactor the
+// Attached fast-path bypasses attachRootfsFromMeta, so the upgrade has
+// to be invoked here too. Single-node only (multi-node managers are
+// gated out at construction).
+func (m *luksVolumeManager) upgradeUndersizedWorkspace(ctx context.Context, volumeID string, meta *volumeMetaV3) {
+	if meta.Type != volumeTypeWorkspace {
+		return
+	}
+	if meta.SizeBytes >= defaultWorkspaceVirtualSize {
+		return
+	}
+	if m.nbdSrv != nil || m.drbdMgr != nil {
+		return
+	}
+	if err := m.lvMgr.ResizeLV(ctx, meta.LVName, defaultWorkspaceVirtualSize); err != nil {
+		log.Printf("WARN: resize existing workspace LV %s: %v", meta.LVName, err)
+		return
+	}
+
+	// Live upper-layer resize. Order matters for metadata persistence:
+	// only advance meta.SizeBytes after every currently-live layer has
+	// converged. Persisting metadata before live resize succeeds (codex
+	// iter-7 B2) would leave future attaches skipping the upgrade because
+	// meta.SizeBytes >= defaultWorkspaceVirtualSize, freezing the
+	// mapper/fs at the old size while metadata claims the new one.
+	//
+	// From the full-attach path the mapper isn't open yet at this point,
+	// so the stat below misses and we skip the live steps; metadata
+	// persists immediately because the subsequent luksOpen+mount see the
+	// new LV size naturally. From the Attached fast-path the mapper is
+	// open and we run cryptsetup+btrfs inline; metadata only persists
+	// once both succeed (or are correctly skipped).
+	mapper := volMapperName(volumeID)
+	mapperOpen := false
+	if _, err := os.Stat("/dev/mapper/" + mapper); err == nil {
+		mapperOpen = true
+	}
+	if mapperOpen {
+		if err := m.run.Run(ctx, "cryptsetup", "resize", mapper); err != nil {
+			log.Printf("WARN: cryptsetup resize %s during legacy upgrade: %v (metadata not advanced; next attach will retry)", mapper, err)
+			return
+		}
+		mountDir := paths.MountDir(volumeID)
+		if mounted, _ := isMountPoint(mountDir); mounted {
+			if err := m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", mountDir); err != nil {
+				log.Printf("WARN: btrfs resize %s during legacy upgrade: %v (metadata not advanced; next attach will retry)", mountDir, err)
+				return
+			}
+		}
+	}
+
+	// Live layers (if any) have converged. Safe to persist new size.
+	meta.SizeBytes = defaultWorkspaceVirtualSize
+	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
+	_ = writeVolumeMetaV3(metaPath, meta)
+}
+
+// unmountStaleIfPresent lazy-umounts path iff it's currently a mount
+// point; returns nil otherwise. This is the StaleMountRecord recovery
+// primitive: post-condition is "path is not a mount." If the path was
+// never mounted (or is no longer mounted), that's already the
+// post-condition and we return nil.
+//
+// The check-then-umount pattern is TOCTOU-safe by post-condition rather
+// than pre-condition (codex iter-7 B3): if the mount disappears between
+// our isMountPoint check and the umount call, umount fails ("not
+// mounted") but the desired post-condition is already true, so we
+// re-probe and accept that. We only surface a real error when umount
+// fails AND the path is still a mount point.
+func (m *luksVolumeManager) unmountStaleIfPresent(ctx context.Context, path string) error {
+	mounted, err := isMountPoint(path)
+	if err != nil {
+		return fmt.Errorf("check mount %s: %w", path, err)
+	}
+	if !mounted {
+		return nil
+	}
+	if umountErr := m.run.Run(ctx, "umount", "-l", path); umountErr != nil {
+		// Re-probe: if the umount race lost (mount vanished concurrently),
+		// the umount error is benign — post-condition already satisfied.
+		stillMounted, probeErr := isMountPoint(path)
+		if probeErr == nil && !stillMounted {
+			return nil
+		}
+		return fmt.Errorf("lazy umount %s: %w", path, umountErr)
+	}
+	return nil
+}
+
+// deriveRootfsHandle reconstructs the caller-facing handle from metadata
+// and naming convention — the cache that used to hold this is being
+// eliminated (Phase 4). All fields are convention-derivable.
+func deriveRootfsHandle(volumeID string, meta *volumeMetaV3) RootfsHandle {
+	mountDir := paths.MountDir(volumeID)
+	resultPath := mountDir
+	if meta.IDMap != nil {
+		resultPath = mountDir + "-idmap"
+	}
+	return RootfsHandle{
+		VolumeID:  volumeID,
+		MountPath: resultPath,
+		ReadOnly:  meta.ReadOnly,
+		GoldenLV:  meta.GoldenLV,
+	}
+}
+
 // attachRootfsFromMeta performs the full attach sequence for a rootfs volume.
+//
+// Sole direct caller is attachRootfsLocked, which is reached from three
+// transition entry points (AttachRootfs, createRootfsFromGolden,
+// CloneWorkspace) each holding m.locks[volumeID]. Lock contract is
+// inherited from attachRootfsLocked.
+//
+// IDMap fingerprint check: detects out-of-band hand-edits to metadata.
+// The check runs here AND on the Attached fast-path in attachRootfsLocked
+// so any return from a rootfs attach has been validated.
 func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID string, meta *volumeMetaV3) (RootfsHandle, error) {
+	if err := verifyIDMapFingerprint(volumeID, meta); err != nil {
+		return RootfsHandle{}, err
+	}
+
 	lvName := meta.LVName
-	mapper := "piccolo-vol-" + volumeID
+	mapper := volMapperName(volumeID)
 
 	// Build below-LUKS device stack.
 	var stack *blockdev.DeviceStack
 	var err error
 
 	switch meta.Type {
-	case "workspace":
+	case volumeTypeWorkspace:
 		// Workspace: ThinLV → NBD → DRBD
 		stack, err = m.buildStack(volumeID, lvName, meta.SizeBytes)
-	case "service-rootfs":
+	case volumeTypeServiceRootfs:
 		// Service rootfs: ThinLV only (not replicated)
 		thinDev := blockdev.NewThinLVDevice(m.lvMgr, lvName, meta.SizeBytes)
 		stack, err = blockdev.NewDeviceStack(volumeID, thinDev)
@@ -587,18 +798,7 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		return RootfsHandle{}, fmt.Errorf("open stack: %w", err)
 	}
 
-	// Upgrade existing undersized workspace LVs to the default virtual size.
-	// This runs before LUKS open, so LUKS will see the new LV size.
-	// Only in single-node mode — with NBD/DRBD, the stack is already open at the old size.
-	if meta.Type == "workspace" && meta.SizeBytes < defaultWorkspaceVirtualSize && m.nbdSrv == nil && m.drbdMgr == nil {
-		if err := m.lvMgr.ResizeLV(ctx, lvName, defaultWorkspaceVirtualSize); err != nil {
-			log.Printf("WARN: resize existing workspace LV %s: %v", lvName, err)
-		} else {
-			meta.SizeBytes = defaultWorkspaceVirtualSize
-			metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
-			_ = writeVolumeMetaV3(metaPath, meta)
-		}
-	}
+	m.upgradeUndersizedWorkspace(ctx, volumeID, meta)
 
 	// Rollback on failure: close resources in reverse order.
 	var openedMapper string
@@ -619,12 +819,18 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		stack.Close(rctx)
 	}()
 
-	// LUKS open.
+	// LUKS open. Tolerate cryptsetup exit 5 (mapper already exists) — the
+	// reconciler may be completing a PartialMapperOnly state.
 	topDev := stack.Top().Path()
 	if err := m.luksOpenWithPoolKeyfile(ctx, topDev, mapper); err != nil {
-		return RootfsHandle{}, fmt.Errorf("luks open: %w", err)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != cryptsetupExitDeviceExists {
+			return RootfsHandle{}, fmt.Errorf("luks open: %w", err)
+		}
+		// Mapper already present — do not register for rollback close.
+	} else {
+		openedMapper = mapper
 	}
-	openedMapper = mapper
 
 	luksPath := "/dev/mapper/" + mapper
 
@@ -646,35 +852,55 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 	// from podman export contains all OCI bind mount targets (/etc/resolv.conf,
 	// /etc/hostname, /etc/hosts, /etc/mtab) — runc bind-mounts over existing paths,
 	// it does not need to create them. Workspaces: read-write for user data.
+	// Skip when already mounted (PartialMapperOnly recovery may find raw mount present).
 	mountOpts := btrfsRootfsMountOpts
 	if meta.ReadOnly {
 		mountOpts = "ro," + mountOpts
 	}
-	if err := m.run.Run(ctx, "mount", "-t", "btrfs", "-o", mountOpts, luksPath, mountDir); err != nil {
-		return RootfsHandle{}, fmt.Errorf("mount: %w", err)
+	mounted, entry, _ := mountAtPath(mountDir)
+	if mounted {
+		// Ownership check (codex2-P3): refuse to coexist with a foreign mount.
+		if entry.Source != luksPath {
+			return RootfsHandle{}, fmt.Errorf("foreign mount at %s (source=%s, expected=%s); refusing to coexist", mountDir, entry.Source, luksPath)
+		}
+	} else {
+		if err := m.run.Run(ctx, "mount", "-t", "btrfs", "-o", mountOpts, luksPath, mountDir); err != nil {
+			return RootfsHandle{}, fmt.Errorf("mount: %w", err)
+		}
+		mountedDir = mountDir
 	}
-	mountedDir = mountDir
 
 	// Grow btrfs to fill the LV — handles workspaces resized beyond golden LV size.
 	// Idempotent: no-op if filesystem already at max.
-	if meta.Type == "workspace" {
+	if meta.Type == volumeTypeWorkspace {
 		_ = m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", mountDir)
 	}
 
-	// Idmapped mount.
+	// Idmapped mount. Skip when already present (PartialMapperOnly recovery
+	// may find raw mount + idmap both already in place). Ownership check
+	// (codex2-P3): an idmap bind inherits the underlying mount's source
+	// token, so source != luksPath at the idmap path means a foreign
+	// mount got there.
 	var idmapPath string
 	if meta.IDMap != nil {
 		idmapPath = mountDir + "-idmap"
-		idmapConfig := fsutil.IDMapConfig{
-			AppUID:      meta.IDMap.AppUID,
-			AppGID:      meta.IDMap.AppGID,
-			SubUIDStart: meta.IDMap.SubUIDStart,
-			SubUIDCount: meta.IDMap.SubUIDCount,
-			SubGIDStart: meta.IDMap.SubGIDStart,
-			SubGIDCount: meta.IDMap.SubGIDCount,
-		}
-		if err := fsutil.CreateIDMappedMount(mountDir, idmapPath, idmapConfig); err != nil {
-			return RootfsHandle{}, fmt.Errorf("idmap mount: %w", err)
+		idmapMounted, idmapEntry, _ := mountAtPath(idmapPath)
+		if idmapMounted {
+			if idmapEntry.Source != luksPath {
+				return RootfsHandle{}, fmt.Errorf("foreign mount at %s (source=%s, expected=%s); refusing to coexist", idmapPath, idmapEntry.Source, luksPath)
+			}
+		} else {
+			idmapConfig := fsutil.IDMapConfig{
+				AppUID:      meta.IDMap.AppUID,
+				AppGID:      meta.IDMap.AppGID,
+				SubUIDStart: meta.IDMap.SubUIDStart,
+				SubUIDCount: meta.IDMap.SubUIDCount,
+				SubGIDStart: meta.IDMap.SubGIDStart,
+				SubGIDCount: meta.IDMap.SubGIDCount,
+			}
+			if err := fsutil.CreateIDMappedMount(mountDir, idmapPath, idmapConfig); err != nil {
+				return RootfsHandle{}, fmt.Errorf("idmap mount: %w", err)
+			}
 		}
 	}
 
@@ -691,69 +917,38 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 		GoldenLV:  meta.GoldenLV,
 	}
 
-	state := &rootfsMountState{
-		stack:      stack,
-		luksMapper: mapper,
-		rawMountPath: mountDir,
-		idmapPath:  idmapPath,
-		handle:     handle,
-	}
-	m.mu.Lock()
-	m.rootfsMounts[volumeID] = state
-	m.stacks[volumeID] = stack
-	m.mu.Unlock()
-
 	success = true
 
 	return handle, nil
 }
 
-// DetachRootfs unmounts and deactivates a rootfs volume.
+// DetachRootfs unmounts and deactivates a rootfs volume. Acquires the
+// per-volume lock; concurrent transitions on the same volumeID serialize.
 func (m *luksVolumeManager) DetachRootfs(ctx context.Context, volumeID string) error {
-	m.mu.Lock()
-	state := m.rootfsMounts[volumeID]
-	m.mu.Unlock()
+	lock := m.lockFor(volumeID)
+	lock.Lock()
+	defer lock.Unlock()
+	return m.detachRootfsLocked(ctx, volumeID)
+}
 
-	if state == nil {
+// detachRootfsLocked is the lock-already-held variant. Used by
+// destroyRootfsLocked (DestroyVolume's rootfs branch) which acquires the
+// lock at its entry. Walks LiveLayers (kernel-state truth) top-down — no
+// dependency on the in-memory rootfsMounts cache.
+func (m *luksVolumeManager) detachRootfsLocked(ctx context.Context, volumeID string) error {
+	layers, err := m.LiveLayers(ctx, volumeID)
+	if err != nil {
+		return fmt.Errorf("enumerate live layers for %s: %w", volumeID, err)
+	}
+	if len(layers) == 0 {
 		return nil // already detached
 	}
 
-	var errs []error
+	errs := m.tearDownLayers(ctx, layers)
 
-	// Unmount idmapped bind mount.
-	if state.idmapPath != "" {
-		if err := m.run.Run(ctx, "umount", state.idmapPath); err != nil {
-			// Try lazy unmount on EBUSY.
-			if err2 := m.run.Run(ctx, "umount", "-l", state.idmapPath); err2 != nil {
-				errs = append(errs, fmt.Errorf("umount idmap %s: %w", state.idmapPath, err2))
-			}
-		}
-	}
-
-	// Unmount btrfs.
-	if err := m.run.Run(ctx, "umount", state.rawMountPath); err != nil {
-		if err2 := m.run.Run(ctx, "umount", "-l", state.rawMountPath); err2 != nil {
-			errs = append(errs, fmt.Errorf("umount %s: %w", state.rawMountPath, err2))
-		}
-	}
-
-	// LUKS close.
-	if err := m.run.Run(ctx, "cryptsetup", "close", state.luksMapper); err != nil {
-		errs = append(errs, fmt.Errorf("luks close %s: %w", state.luksMapper, err))
-	}
-
-	// Device stack close.
-	if state.stack != nil {
-		if err := state.stack.Close(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("stack close: %w", err))
-		}
-	}
-
-	// Delete from tracking maps only after teardown completes.
+	// Side-state cleanup: clear cooldown so a subsequent re-attach starts fresh.
 	m.mu.Lock()
-	delete(m.rootfsMounts, volumeID)
-	delete(m.stacks, volumeID)
-	delete(m.wsResizeCooldown, volumeID)
+	delete(m.volumeResizeCooldown, volumeID)
 	m.mu.Unlock()
 
 	if len(errs) > 0 {
@@ -763,9 +958,31 @@ func (m *luksVolumeManager) DetachRootfs(ctx context.Context, volumeID string) e
 }
 
 // DestroyRootfs permanently removes a rootfs volume (workspace, service-rootfs, or golden).
+// Acquires the per-volume lock; concurrent transitions on the same volumeID
+// serialize. Side-state cleanup (m.locks, schedules, cooldowns, unknown counter)
+// is owned by DestroyVolume — DestroyRootfs is one of its dispatch branches
+// and runs under the same lock.
 func (m *luksVolumeManager) DestroyRootfs(ctx context.Context, volumeID string) error {
-	// Detach first.
-	_ = m.DetachRootfs(ctx, volumeID)
+	lock := m.lockFor(volumeID)
+	lock.Lock()
+	defer lock.Unlock()
+	return m.destroyRootfsLocked(ctx, volumeID)
+}
+
+// destroyRootfsLocked is the lock-already-held variant used by
+// DestroyVolume's rootfs dispatch branch — and also reachable directly
+// via DestroyRootfs (app teardown, tuple GC). Both paths must purge the
+// per-volume side state (unknownCounter, volumeResizeCooldown) so a
+// recreated rootfs with the same volumeID doesn't inherit a sticky
+// AttachStateKernelStateCorrupted from the prior life.
+func (m *luksVolumeManager) destroyRootfsLocked(ctx context.Context, volumeID string) error {
+	// Detach first (lock-already-held). detachRootfsLocked clears the
+	// resize cooldown.
+	_ = m.detachRootfsLocked(ctx, volumeID)
+
+	// Side-state purge (must run on every destroy path, including direct
+	// DestroyRootfs callers — codex4-P2).
+	defer m.unknownCounter.Delete(volumeID)
 
 	metaDir := paths.VolumeMetaDir(volumeID)
 	metaPath := filepath.Join(metaDir, metadataV2File)
@@ -796,7 +1013,7 @@ func (m *luksVolumeManager) DestroyRootfs(ctx context.Context, volumeID string) 
 
 // destroyGoldenLVUnsafe destroys a golden LV without lock. Called under goldenMu.
 func (m *luksVolumeManager) destroyGoldenLVUnsafe(ctx context.Context, goldenID string) {
-	mapper := "piccolo-vol-" + goldenID
+	mapper := volMapperName(goldenID)
 
 	// Best-effort teardown of any active state.
 	m.run.Run(ctx, "umount", paths.MountDir(goldenID))
@@ -831,7 +1048,7 @@ func (m *luksVolumeManager) GarbageCollectGoldenLVs(ctx context.Context) error {
 		if err != nil {
 			continue
 		}
-		if meta.Type == "golden" {
+		if meta.Type == volumeTypeGolden {
 			goldenIDs[volID] = true
 		}
 		if meta.GoldenLV != "" {
@@ -885,7 +1102,7 @@ func (m *luksVolumeManager) ReconcileRootfsStates(ctx context.Context) error {
 		}
 
 		switch meta.Type {
-		case "golden":
+		case volumeTypeGolden:
 			digestShort := strings.TrimPrefix(volID, goldenLVPrefix)
 			if meta.FlattenComplete != "" {
 				// Fast path: flatten complete, cache and skip.
@@ -901,7 +1118,7 @@ func (m *luksVolumeManager) ReconcileRootfsStates(ctx context.Context) error {
 				mu.Unlock()
 			}
 
-		case "workspace", "service-rootfs":
+		case volumeTypeWorkspace, volumeTypeServiceRootfs:
 			// Validate metadata is parseable. Actual re-attach happens lazily
 			// when AppManager starts the container.
 			log.Printf("reconcile: rootfs volume %s (type=%s) present", volID, meta.Type)
@@ -929,9 +1146,9 @@ func (m *luksVolumeManager) ReadGoldenImageConfig(ctx context.Context, goldenID 
 // RootfsVolumeID returns the rootfs volume ID for a given instance and mode.
 func (m *luksVolumeManager) RootfsVolumeID(mode string, instanceID string) string {
 	switch mode {
-	case "workspace":
+	case volumeTypeWorkspace:
 		return workspaceLVPrefix + instanceID
-	case "service-rootfs":
+	case volumeTypeServiceRootfs:
 		return svcRootfsLVPrefix + instanceID
 	default:
 		return instanceID
@@ -994,14 +1211,35 @@ func newUUID() string {
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// ResizeWorkspace grows a workspace volume to the specified size.
+// ResizeWorkspace grows a workspace volume to the specified size. Acquires
+// the per-volume lock; concurrent transitions on the same volumeID
+// serialize. Auto-grow uses tryResizeWorkspace (TryLock variant) to avoid
+// blocking the resize-monitor loop.
 func (m *luksVolumeManager) ResizeWorkspace(ctx context.Context, volumeID string, newSizeBytes int64) error {
+	lock := m.lockFor(volumeID)
+	lock.Lock()
+	defer lock.Unlock()
+	return m.resizeWorkspaceLocked(ctx, volumeID, newSizeBytes)
+}
+
+// tryResizeWorkspace attempts to acquire the per-volume lock without
+// blocking; on contention returns (false, nil). Used by auto-grow.
+func (m *luksVolumeManager) tryResizeWorkspace(ctx context.Context, volumeID string, newSizeBytes int64) (bool, error) {
+	lock := m.lockFor(volumeID)
+	if !lock.TryLock() {
+		return false, nil
+	}
+	defer lock.Unlock()
+	return true, m.resizeWorkspaceLocked(ctx, volumeID, newSizeBytes)
+}
+
+func (m *luksVolumeManager) resizeWorkspaceLocked(ctx context.Context, volumeID string, newSizeBytes int64) error {
 	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
 	meta, err := readVolumeMetaV3(metaPath)
 	if err != nil {
 		return fmt.Errorf("read metadata: %w", err)
 	}
-	if meta.Type != "workspace" {
+	if meta.Type != volumeTypeWorkspace {
 		return fmt.Errorf("volume %s is type %s, not workspace", volumeID, meta.Type)
 	}
 	if newSizeBytes <= meta.SizeBytes {
@@ -1019,19 +1257,21 @@ func (m *luksVolumeManager) ResizeWorkspace(ctx context.Context, volumeID string
 		return fmt.Errorf("lvresize: %w", err)
 	}
 
-	// If mounted, resize LUKS and btrfs inline.
-	m.mu.Lock()
-	state := m.rootfsMounts[volumeID]
-	m.mu.Unlock()
-	if state != nil && state.rawMountPath != "" {
-		if err := m.run.Run(ctx, "cryptsetup", "resize", state.luksMapper); err != nil {
+	// If currently attached (kernel-state truth), resize LUKS and btrfs
+	// inline. We hold the per-volume lock, so AttachStateOf can't churn
+	// under us. mapper + raw mount path are derivable from naming convention.
+	state, _ := m.attachStateOfUnderLock(ctx, volumeID)
+	if state == AttachStateAttached {
+		mapper := volMapperName(volumeID)
+		mountPath := paths.MountDir(volumeID)
+		if err := m.run.Run(ctx, "cryptsetup", "resize", mapper); err != nil {
 			return fmt.Errorf("cryptsetup resize: %w", err)
 		}
-		if err := m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", state.rawMountPath); err != nil {
+		if err := m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", mountPath); err != nil {
 			return fmt.Errorf("btrfs resize: %w", err)
 		}
 	}
-	// If not mounted, LUKS/btrfs resize will happen on next attach.
+	// If not attached, LUKS/btrfs resize will happen on next attach.
 
 	meta.SizeBytes = newSizeBytes
 	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
@@ -1040,7 +1280,7 @@ func (m *luksVolumeManager) ResizeWorkspace(ctx context.Context, volumeID string
 
 	// Record cooldown to prevent the auto-resize monitor from racing.
 	m.mu.Lock()
-	m.wsResizeCooldown[volumeID] = time.Now()
+	m.volumeResizeCooldown[volumeID] = time.Now()
 	m.mu.Unlock()
 
 	log.Printf("INFO: workspace %s resized to %d bytes", volumeID, newSizeBytes)
@@ -1052,13 +1292,34 @@ func (m *luksVolumeManager) ResizeWorkspace(ctx context.Context, volumeID string
 // the filesystem is ext4, so resize2fs is used instead of btrfs online
 // grow. Application volumes are not in rootfsMounts; the mount path is
 // derived from paths.MountDir and the mapper name from the volume ID.
+//
+// Acquires the per-volume lock. Auto-grow uses tryResizeApplication to
+// avoid blocking.
 func (m *luksVolumeManager) ResizeApplication(ctx context.Context, volumeID string, newSizeBytes int64) error {
+	lock := m.lockFor(volumeID)
+	lock.Lock()
+	defer lock.Unlock()
+	return m.resizeApplicationLocked(ctx, volumeID, newSizeBytes)
+}
+
+// tryResizeApplication attempts to acquire the per-volume lock without
+// blocking. Used by auto-grow.
+func (m *luksVolumeManager) tryResizeApplication(ctx context.Context, volumeID string, newSizeBytes int64) (bool, error) {
+	lock := m.lockFor(volumeID)
+	if !lock.TryLock() {
+		return false, nil
+	}
+	defer lock.Unlock()
+	return true, m.resizeApplicationLocked(ctx, volumeID, newSizeBytes)
+}
+
+func (m *luksVolumeManager) resizeApplicationLocked(ctx context.Context, volumeID string, newSizeBytes int64) error {
 	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
 	meta, err := readVolumeMetaV3(metaPath)
 	if err != nil {
 		return fmt.Errorf("read metadata: %w", err)
 	}
-	if meta.Type != "service-data" {
+	if meta.Type != volumeTypeServiceData {
 		return fmt.Errorf("volume %s is type %s, not service-data (application)", volumeID, meta.Type)
 	}
 	if newSizeBytes <= meta.SizeBytes {
@@ -1073,24 +1334,18 @@ func (m *luksVolumeManager) ResizeApplication(ctx context.Context, volumeID stri
 		return fmt.Errorf("lvresize: %w", err)
 	}
 
-	// If the volume is currently attached (stack open + mounted), resize
-	// the LUKS mapper and ext4 filesystem inline. Otherwise, resize will
-	// occur naturally on next attach (or manual remount).
-	m.mu.Lock()
-	stackOpen := m.stacks[volumeID] != nil
-	m.mu.Unlock()
-	if stackOpen {
-		mapper := "piccolo-vol-" + volumeID
+	// If currently attached (kernel-state truth), resize the LUKS mapper
+	// and ext4 filesystem inline. Otherwise, resize will occur naturally on
+	// next attach. We hold the per-volume lock, so the probe is consistent.
+	state, _ := m.attachStateOfUnderLock(ctx, volumeID)
+	if state == AttachStateAttached {
+		mapper := volMapperName(volumeID)
 		if err := m.run.Run(ctx, "cryptsetup", "resize", mapper); err != nil {
 			return fmt.Errorf("cryptsetup resize: %w", err)
 		}
-		mountDir := paths.MountDir(volumeID)
 		if err := m.run.Run(ctx, "resize2fs", "/dev/mapper/"+mapper); err != nil {
-			// resize2fs can take a mount point OR a device; the mapper is
-			// the safer target (works whether mounted or not).
 			return fmt.Errorf("resize2fs: %w", err)
 		}
-		_ = mountDir // reserved for future fs-specific fallbacks
 	}
 
 	meta.SizeBytes = newSizeBytes
@@ -1100,7 +1355,7 @@ func (m *luksVolumeManager) ResizeApplication(ctx context.Context, volumeID stri
 
 	// Record cooldown to prevent the auto-resize monitor from racing.
 	m.mu.Lock()
-	m.wsResizeCooldown[volumeID] = time.Now()
+	m.volumeResizeCooldown[volumeID] = time.Now()
 	m.mu.Unlock()
 
 	log.Printf("INFO: application volume %s resized to %d bytes", volumeID, newSizeBytes)

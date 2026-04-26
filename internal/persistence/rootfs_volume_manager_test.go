@@ -206,7 +206,7 @@ func TestListClones(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 	clones, err := mgr.ListClones(context.Background(), originVolumeID)
 	if err != nil {
 		t.Fatalf("ListClones: %v", err)
@@ -244,7 +244,7 @@ func TestListClones_NoClones(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 	clones, err := mgr.ListClones(context.Background(), originVolumeID)
 	if err != nil {
 		t.Fatalf("ListClones: %v", err)

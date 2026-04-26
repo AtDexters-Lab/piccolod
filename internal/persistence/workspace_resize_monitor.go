@@ -107,28 +107,41 @@ func (m *luksVolumeManager) workspaceResizeLoop(ctx context.Context) {
 }
 
 func (m *luksVolumeManager) checkWorkspaceUsage(ctx context.Context) {
-	// Snapshot rootfsMounts under lock, then release for I/O.
-	m.mu.Lock()
+	// Walk on-disk metadata + filter by AttachStateOf (kernel-state truth).
+	// Decoupled from any in-memory cache — survives the cross-cache-and-truth
+	// drift that motivated volume-attach-truth.
 	type wsEntry struct {
 		volumeID     string
 		rawMountPath string
 		luksMapper   string
 	}
+	volIDs, err := listVolumeIDs()
+	if err != nil {
+		log.Printf("WARN: workspace auto-grow: list volumes: %v", err)
+		return
+	}
 	var workspaces []wsEntry
-	for volID, state := range m.rootfsMounts {
-		if state.handle.ReadOnly {
-			continue // service rootfs, not workspace
-		}
-		if state.rawMountPath == "" {
+	for _, volID := range volIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
+		meta, err := readVolumeMetaV3(metaPath)
+		if err != nil {
 			continue
 		}
+		if meta.Type != volumeTypeWorkspace {
+			continue
+		}
+		if !m.IsAttachedAdvisory(ctx, volID) {
+			continue
+		}
+		// Workspace's writable raw mount is paths.MountDir(volID) (the
+		// idmap bind, when present, layers on top — but statfs walks the
+		// underlying btrfs from either mount).
 		workspaces = append(workspaces, wsEntry{
 			volumeID:     volID,
-			rawMountPath: state.rawMountPath,
-			luksMapper:   state.luksMapper,
+			rawMountPath: paths.MountDir(volID),
+			luksMapper:   volMapperName(volID),
 		})
 	}
-	m.mu.Unlock()
 
 	for _, ws := range workspaces {
 		m.maybeResizeWorkspace(ctx, ws.volumeID, ws.rawMountPath, ws.luksMapper)
@@ -138,7 +151,7 @@ func (m *luksVolumeManager) checkWorkspaceUsage(ctx context.Context) {
 func (m *luksVolumeManager) maybeResizeWorkspace(ctx context.Context, volumeID, mountPath, luksMapper string) {
 	// Check cooldown.
 	m.mu.Lock()
-	if lastResize, ok := m.wsResizeCooldown[volumeID]; ok && time.Since(lastResize) < workspaceResizeCooldown {
+	if lastResize, ok := m.volumeResizeCooldown[volumeID]; ok && time.Since(lastResize) < workspaceResizeCooldown {
 		m.mu.Unlock()
 		return
 	}
@@ -167,7 +180,7 @@ func (m *luksVolumeManager) maybeResizeWorkspace(ctx context.Context, volumeID, 
 		log.Printf("WARN: workspace resize: read metadata %s: %v", volumeID, err)
 		return
 	}
-	if meta.Type != "workspace" {
+	if meta.Type != volumeTypeWorkspace {
 		return
 	}
 
@@ -183,8 +196,15 @@ func (m *luksVolumeManager) maybeResizeWorkspace(ctx context.Context, volumeID, 
 	log.Printf("INFO: workspace %s at %.0f%% usage (%d/%d bytes), resizing from %d to %d",
 		volumeID, usageRatio*100, usedBytes, totalBytes, meta.SizeBytes, newSize)
 
-	// Delegate the actual resize (LV + LUKS + btrfs + metadata + cooldown) to ResizeWorkspace.
-	if err := m.ResizeWorkspace(ctx, volumeID, newSize); err != nil {
+	// Auto-grow uses TryLock to avoid blocking the monitor loop on long
+	// transitions (RollbackDataVolume, multi-step destroy). On contention,
+	// skip this tick — the next tick re-evaluates fresh.
+	acquired, err := m.tryResizeWorkspace(ctx, volumeID, newSize)
+	if !acquired {
+		log.Printf("INFO: workspace %s auto-resize deferred (per-volume lock held); will retry next tick", volumeID)
+		return
+	}
+	if err != nil {
 		log.Printf("ERROR: workspace auto-resize %s: %v", volumeID, err)
 	}
 }
@@ -199,12 +219,15 @@ func (m *luksVolumeManager) maybeResizeWorkspace(ctx context.Context, volumeID, 
 // to its own ceiling grows first — beats Go-map iteration randomness when
 // pool budget is constrained.
 func (m *luksVolumeManager) checkApplicationUsage(ctx context.Context) {
-	m.mu.Lock()
-	var appVols []string
-	for volID := range m.stacks {
-		appVols = append(appVols, volID)
+	// Walk on-disk metadata + filter by AttachStateOf (kernel-state truth).
+	// Decoupled from any in-memory cache — was the user's bug: stale cache
+	// after the post-unlock fan-out race made the volume invisible to
+	// auto-grow despite being attached and full.
+	volIDs, err := listVolumeIDs()
+	if err != nil {
+		log.Printf("WARN: app auto-grow: list volumes: %v", err)
+		return
 	}
-	m.mu.Unlock()
 
 	// Collect candidates + their usage ratios, filtered to service-data only.
 	type candidate struct {
@@ -212,10 +235,13 @@ func (m *luksVolumeManager) checkApplicationUsage(ctx context.Context) {
 		usageRatio float64
 	}
 	var candidates []candidate
-	for _, volID := range appVols {
+	for _, volID := range volIDs {
 		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
 		meta, err := readVolumeMetaV3(metaPath)
-		if err != nil || meta.Type != "service-data" {
+		if err != nil || meta.Type != volumeTypeServiceData {
+			continue
+		}
+		if !m.IsAttachedAdvisory(ctx, volID) {
 			continue
 		}
 		mountPath := paths.MountDir(volID)
@@ -246,7 +272,7 @@ func (m *luksVolumeManager) checkApplicationUsage(ctx context.Context) {
 func (m *luksVolumeManager) maybeResizeApplication(ctx context.Context, volumeID string) {
 	// Cooldown shared with workspace path.
 	m.mu.Lock()
-	if lastResize, ok := m.wsResizeCooldown[volumeID]; ok && time.Since(lastResize) < workspaceResizeCooldown {
+	if lastResize, ok := m.volumeResizeCooldown[volumeID]; ok && time.Since(lastResize) < workspaceResizeCooldown {
 		m.mu.Unlock()
 		return
 	}
@@ -258,7 +284,7 @@ func (m *luksVolumeManager) maybeResizeApplication(ctx context.Context, volumeID
 	if err != nil {
 		return // not all stacks have v3 metadata (golden LVs etc.); skip silently
 	}
-	if meta.Type != "service-data" {
+	if meta.Type != volumeTypeServiceData {
 		return
 	}
 
@@ -290,7 +316,7 @@ func (m *luksVolumeManager) maybeResizeApplication(ctx context.Context, volumeID
 	}
 
 	// Between thresholds: two-stage schedule + idle-window defer.
-	writes, haveWrites := readMapperWriteCounter("piccolo-vol-" + volumeID)
+	writes, haveWrites := readMapperWriteCounter(volMapperName(volumeID))
 	now := time.Now()
 
 	m.mu.Lock()
@@ -389,7 +415,12 @@ func (m *luksVolumeManager) performApplicationGrow(ctx context.Context, volumeID
 
 	log.Printf("INFO: application volume %s at %.0f%% usage (%d/%d bytes), resizing from %d to %d (trigger: %s)",
 		volumeID, usageRatio*100, usedBytes, totalBytes, meta.SizeBytes, newSize, reason)
-	if err := m.ResizeApplication(ctx, volumeID, newSize); err != nil {
+	acquired, err := m.tryResizeApplication(ctx, volumeID, newSize)
+	if !acquired {
+		log.Printf("INFO: application volume %s auto-resize deferred (per-volume lock held); will retry next tick", volumeID)
+		return
+	}
+	if err != nil {
 		log.Printf("ERROR: application volume auto-resize %s: %v", volumeID, err)
 	}
 }

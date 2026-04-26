@@ -849,6 +849,21 @@ func (s *stubTestVolumeManager) RoleStream(id string) (<-chan persistence.Volume
 	return ch, nil
 }
 
+func (s *stubTestVolumeManager) AttachStateOf(ctx context.Context, id string) (persistence.AttachState, error) {
+	// Test stub: report the volume as attached when its mount dir was
+	// created by this stub's filesystem-based EnsureVolume/Attach. Falls
+	// back to Detached on probe failure.
+	if _, err := os.Stat(filepath.Join(s.root, "mounts", id)); err == nil {
+		return persistence.AttachStateAttached, nil
+	}
+	return persistence.AttachStateDetached, nil
+}
+
+func (s *stubTestVolumeManager) IsAttachedAdvisory(ctx context.Context, id string) bool {
+	state, err := s.AttachStateOf(ctx, id)
+	return err == nil && state == persistence.AttachStateAttached
+}
+
 // stubTestRootfsManager provides a minimal RootfsVolumeManager for server tests.
 type stubTestRootfsManager struct {
 	root string

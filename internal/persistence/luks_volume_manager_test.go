@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"piccolod/internal/state/paths"
-	"piccolod/internal/storage/blockdev"
 	"piccolod/internal/storage/lvm"
 	"piccolod/internal/testutil"
 )
@@ -40,7 +39,7 @@ func TestLUKSVolumeManager_ImplementsInterfaces(t *testing.T) {
 }
 
 func TestLUKSVolumeManager_SetRoleChecker(t *testing.T) {
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 
 	called := false
 	mgr.SetRoleChecker(func(id string, role VolumeRole) bool {
@@ -66,7 +65,7 @@ func TestLUKSVolumeManager_SetRoleChecker(t *testing.T) {
 func TestLUKSVolumeManager_ReconcileAllVolumeStates_Empty(t *testing.T) {
 	core, _ := paths.SetRootsForTest(t)
 
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 
 	// No volumes dir yet — should not error.
 	if err := mgr.ReconcileAllVolumeStates(); err != nil {
@@ -85,7 +84,7 @@ func TestLUKSVolumeManager_ReconcileAllVolumeStates_Empty(t *testing.T) {
 func TestLUKSVolumeManager_ReconcileAllVolumeStates_ValidMeta(t *testing.T) {
 	core, _ := paths.SetRootsForTest(t)
 
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 
 	// Create a volume with valid metadata.
 	volDir := filepath.Join(core, "volumes", "test-vol")
@@ -105,7 +104,7 @@ func TestLUKSVolumeManager_ReconcileAllVolumeStates_ValidMeta(t *testing.T) {
 func TestLUKSVolumeManager_EnsureVolume_ExistingReturnsHandle(t *testing.T) {
 	core, _ := paths.SetRootsForTest(t)
 
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 
 	// Pre-create metadata.
 	volDir := filepath.Join(core, "volumes", "existing-vol")
@@ -133,7 +132,7 @@ func TestLUKSVolumeManager_EnsureVolume_ExistingReturnsHandle(t *testing.T) {
 }
 
 func TestLUKSVolumeManager_RoleStream(t *testing.T) {
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 
 	ch, err := mgr.RoleStream("any-vol")
 	if err != nil {
@@ -148,7 +147,7 @@ func TestLUKSVolumeManager_RoleStream(t *testing.T) {
 func TestLUKSVolumeManager_DestroyVolume_NonExistent(t *testing.T) {
 	paths.SetRootsForTest(t)
 
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 
 	// Should not error for non-existent volume.
 	if err := mgr.DestroyVolume(context.Background(), "nonexistent"); err != nil {
@@ -159,7 +158,7 @@ func TestLUKSVolumeManager_DestroyVolume_NonExistent(t *testing.T) {
 func TestLUKSVolumeManager_DestroyVolume_LoopType(t *testing.T) {
 	core, _ := paths.SetRootsForTest(t)
 
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 
 	// Create a loop volume's metadata.
 	volDir := filepath.Join(core, "volumes", "ctrl")
@@ -284,7 +283,7 @@ func TestReadWriteVolumeMetaV3_ServiceData(t *testing.T) {
 func TestReconcileAllVolumeStates_V3ServiceData(t *testing.T) {
 	core, _ := paths.SetRootsForTest(t)
 
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 
 	// Create a v3 service-data volume metadata.
 	volDir := filepath.Join(core, "volumes", "app-nextcloud")
@@ -365,7 +364,6 @@ func TestLuksSetKeyslot_CallsAddKey(t *testing.T) {
 
 func TestProvisionKeyslotOnAllVolumes_RejectsInvalidSlot(t *testing.T) {
 	mgr := &luksVolumeManager{
-		stacks: make(map[string]*blockdev.DeviceStack),
 	}
 
 	if err := mgr.provisionKeyslotOnAllVolumes(context.Background(), 0, []byte("pass")); err == nil {
@@ -383,7 +381,6 @@ func TestProvisionKeyslotOnAllVolumes_NoVolumes_ReturnsNil(t *testing.T) {
 	mgr := &luksVolumeManager{
 		run:      run,
 		tmpfsDir: t.TempDir(),
-		stacks:   make(map[string]*blockdev.DeviceStack),
 	}
 
 	// With no volumes, provisioning is a no-op regardless of crypto state.
@@ -456,7 +453,7 @@ func TestReadWriteVolumeMetaV3_Ephemeral(t *testing.T) {
 func TestReconcileAllVolumeStates_V3Ephemeral(t *testing.T) {
 	core, _ := paths.SetRootsForTest(t)
 
-	mgr := &luksVolumeManager{stacks: nil}
+	mgr := &luksVolumeManager{}
 
 	volDir := filepath.Join(core, "volumes", "eph-scratch")
 	if err := os.MkdirAll(volDir, 0o755); err != nil {
@@ -474,8 +471,6 @@ func TestReconcileAllVolumeStates_V3Ephemeral(t *testing.T) {
 
 func TestResolveLUKSDevice_RejectsEphemeral(t *testing.T) {
 	mgr := &luksVolumeManager{
-		stacks:       make(map[string]*blockdev.DeviceStack),
-		rootfsMounts: make(map[string]*rootfsMountState),
 	}
 
 	meta := &volumeMetaV3{
@@ -502,8 +497,6 @@ func TestDestroyVolume_Ephemeral_NoCryptsetup(t *testing.T) {
 	mgr := &luksVolumeManager{
 		run:          run,
 		lvMgr:        lvMgr,
-		stacks:       make(map[string]*blockdev.DeviceStack),
-		rootfsMounts: make(map[string]*rootfsMountState),
 	}
 
 	// Create ephemeral volume metadata.
@@ -571,8 +564,6 @@ func TestProvisionKeyslotOnAllVolumes_SkipsEphemeral(t *testing.T) {
 	mgr := &luksVolumeManager{
 		run:          run,
 		tmpfsDir:     t.TempDir(),
-		stacks:       make(map[string]*blockdev.DeviceStack),
-		rootfsMounts: make(map[string]*rootfsMountState),
 		// crypto is nil — provisionKeyslotOnAllVolumes will fail on UnwrapLUKSMasterKey.
 		// But ephemeral volumes should be skipped before we get to any per-volume operations.
 	}
@@ -621,8 +612,6 @@ func TestReconcileOrphanLVs(t *testing.T) {
 	mgr := &luksVolumeManager{
 		run:          run,
 		lvMgr:        lvMgr,
-		stacks:       make(map[string]*blockdev.DeviceStack),
-		rootfsMounts: make(map[string]*rootfsMountState),
 	}
 
 	// Create metadata for the "known" LVs.
@@ -712,12 +701,17 @@ func TestReconcileOrphanLVs(t *testing.T) {
 }
 
 func TestDetachAppVolume_ContinuesOnUmountFailure(t *testing.T) {
+	// Phase 3 of volume-attach-truth migrates Detach off the cached
+	// DeviceStack object; LV deactivation now goes through lvMgr directly
+	// (kernel-state truth). Tests that previously asserted dev.closed are
+	// updated to assert "cryptsetup close was called even when umount
+	// failed" — the cross-step continuation invariant the original test
+	// was guarding.
 	tests := []struct {
 		name          string
 		umountErr     error // error for first umount
 		lazyUmountErr error // error for lazy umount
 		cryptsetupErr error // error for cryptsetup close
-		stackCloseErr error // error for device stack Close
 		wantErr       bool
 	}{
 		{
@@ -734,21 +728,20 @@ func TestDetachAppVolume_ContinuesOnUmountFailure(t *testing.T) {
 			umountErr: errors.New("device busy"),
 		},
 		{
-			name:          "cryptsetup_fails_stack_still_closes",
+			name:          "cryptsetup_fails",
 			cryptsetupErr: errors.New("device busy"),
-			wantErr:       true,
-		},
-		{
-			name:          "stack_close_fails",
-			stackCloseErr: errors.New("deactivate failed"),
 			wantErr:       true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mountDir := t.TempDir()
+			paths.SetRootsForTest(t)
+			mountDir := paths.MountDir("app-test")
 			handle := VolumeHandle{ID: "app-test", MountDir: mountDir}
+			// Pre-create the metadata so detachAppVolume's metadata-read
+			// branch (Phase 3 migration) finds an LVName to deactivate.
+			writeAppMetaForDetachTest(t, "app-test")
 
 			errs := make(map[string]error)
 			umountKey := testutil.BuildKey("umount", []string{mountDir})
@@ -765,12 +758,8 @@ func TestDetachAppVolume_ContinuesOnUmountFailure(t *testing.T) {
 
 			run := &fakeRunner{Errs: errs}
 
-			dev := &fakeBlockDevice{name: "thinlv", err: tt.stackCloseErr}
-			stack, _ := blockdev.NewDeviceStack("app-test", dev)
-
 			mgr := &luksVolumeManager{
-				run:    run,
-				stacks: map[string]*blockdev.DeviceStack{"app-test": stack},
+				run:                        run,
 			}
 
 			err := mgr.detachAppVolume(context.Background(), handle)
@@ -782,7 +771,7 @@ func TestDetachAppVolume_ContinuesOnUmountFailure(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 
-			// cryptsetup close and stack.Close must always be called.
+			// cryptsetup close must always be attempted, even when umount fails.
 			calls := run.GetCalls()
 			found := false
 			for _, c := range calls {
@@ -794,24 +783,40 @@ func TestDetachAppVolume_ContinuesOnUmountFailure(t *testing.T) {
 			if !found {
 				t.Error("cryptsetup close was not called")
 			}
-			if !dev.closed {
-				t.Error("device stack Close was not called")
-			}
-
-			// Tracking map should always be cleaned up.
-			mgr.mu.Lock()
-			_, exists := mgr.stacks["app-test"]
-			mgr.mu.Unlock()
-			if exists {
-				t.Error("stacks tracking entry not cleaned up")
-			}
 		})
 	}
 }
 
+// writeAppMetaForDetachTest mirrors writeAppMeta but lives in the same
+// _test.go grouping. Inlined to keep the test file self-contained.
+func writeAppMetaForDetachTest(t *testing.T, volumeID string) {
+	t.Helper()
+	dir := paths.VolumeMetaDir(volumeID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"version":3,"type":"service-data","lv_name":"vol-` + volumeID + `","vg_name":"piccolo-data-vg","fs_type":"ext4"}`
+	if err := os.WriteFile(filepath.Join(dir, metadataV2File), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDetachEphemeralVolume_ContinuesOnUmountFailure(t *testing.T) {
-	mountDir := t.TempDir()
+	// Phase 3 migration: Detach uses kernel-state truth (metadata + lvMgr)
+	// rather than the cached DeviceStack. Test asserts the umount-failure
+	// continuation invariant against the new path.
+	paths.SetRootsForTest(t)
+	mountDir := paths.MountDir("eph-test")
 	handle := VolumeHandle{ID: "eph-test", MountDir: mountDir}
+
+	dir := paths.VolumeMetaDir("eph-test")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"version":3,"type":"ephemeral","lv_name":"eph-eph-test","vg_name":"piccolo-data-vg","fs_type":"btrfs"}`
+	if err := os.WriteFile(filepath.Join(dir, metadataV2File), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	umountKey := testutil.BuildKey("umount", []string{mountDir})
 	lazyKey := testutil.BuildKey("umount", []string{"-l", mountDir})
@@ -821,27 +826,23 @@ func TestDetachEphemeralVolume_ContinuesOnUmountFailure(t *testing.T) {
 		lazyKey:   errors.New("not mounted"),
 	}}
 
-	dev := &fakeBlockDevice{name: "thinlv"}
-	stack, _ := blockdev.NewDeviceStack("eph-test", dev)
-
 	mgr := &luksVolumeManager{
-		run:    run,
-		stacks: map[string]*blockdev.DeviceStack{"eph-test": stack},
+		run:                        run,
 	}
 
 	err := mgr.detachEphemeralVolume(context.Background(), handle)
 	if err == nil {
 		t.Error("expected error for failed umount, got nil")
 	}
-
-	if !dev.closed {
-		t.Error("device stack Close was not called despite umount failure")
+	// umount + lazy umount were both attempted.
+	calls := run.GetCalls()
+	found := 0
+	for _, c := range calls {
+		if strings.HasPrefix(c, "umount") {
+			found++
+		}
 	}
-
-	mgr.mu.Lock()
-	_, exists := mgr.stacks["eph-test"]
-	mgr.mu.Unlock()
-	if exists {
-		t.Error("stacks tracking entry not cleaned up")
+	if found < 2 {
+		t.Errorf("expected umount + lazy fallback to be attempted, saw %d umount calls", found)
 	}
 }

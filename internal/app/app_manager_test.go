@@ -78,6 +78,18 @@ func (s *stubVolumeManager) RoleStream(id string) (<-chan persistence.VolumeRole
 	return ch, nil
 }
 
+func (s *stubVolumeManager) AttachStateOf(ctx context.Context, id string) (persistence.AttachState, error) {
+	if _, err := os.Stat(filepath.Join(s.root, "mounts", id)); err == nil {
+		return persistence.AttachStateAttached, nil
+	}
+	return persistence.AttachStateDetached, nil
+}
+
+func (s *stubVolumeManager) IsAttachedAdvisory(ctx context.Context, id string) bool {
+	state, err := s.AttachStateOf(ctx, id)
+	return err == nil && state == persistence.AttachStateAttached
+}
+
 func allowHostStorage(t *testing.T, m *AppManager) {
 	t.Helper()
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
