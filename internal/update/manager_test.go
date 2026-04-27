@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -692,5 +693,154 @@ func TestRollbackInvalidSnapshotReturnsError(t *testing.T) {
 	}
 	if err := m.Rollback(context.Background(), "999"); err != ErrInvalidSnapshot {
 		t.Fatalf("expected ErrInvalidSnapshot, got %v", err)
+	}
+}
+
+// countingRunner wraps fakeRunner and counts shellouts so tests can verify
+// status caching avoids re-running readStatus.
+type countingRunner struct {
+	fakeRunner
+	calls atomic.Int32
+}
+
+func (r *countingRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	r.calls.Add(1)
+	return r.fakeRunner.Run(ctx, name, args...)
+}
+
+// expectedIsInProgressShellouts caps the runner-call overhead a Status() call
+// pays even when served from cache: it's the cost of the isInProgress probe
+// (a marker-file read can short-circuit; the shell-out fallbacks make 1–2 calls
+// to systemctl). If isInProgress grows new probes, this needs to follow.
+const expectedIsInProgressShellouts = 3
+
+func TestStatusServedFromSnapshotCache(t *testing.T) {
+	tmp := t.TempDir()
+	r := &countingRunner{}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithStateDir(tmp),
+		WithRuntimeDir(filepath.Join(tmp, "run")),
+		WithSupportOverride(true),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	if _, err := m.Status(context.Background()); err != nil {
+		t.Fatalf("first Status: %v", err)
+	}
+	primingDelta := r.calls.Load()
+	if primingDelta <= expectedIsInProgressShellouts {
+		t.Fatalf("expected first Status to invoke many runner calls; got %d", primingDelta)
+	}
+
+	if _, err := m.Status(context.Background()); err != nil {
+		t.Fatalf("second Status: %v", err)
+	}
+	cachedDelta := r.calls.Load() - primingDelta
+	if cachedDelta > expectedIsInProgressShellouts {
+		t.Errorf("cached Status made %d runner calls; expected ≤%d (isInProgress overhead)", cachedDelta, expectedIsInProgressShellouts)
+	}
+
+	beforeInv := r.calls.Load()
+	m.invalidateStatusCache()
+	if _, err := m.Status(context.Background()); err != nil {
+		t.Fatalf("post-invalidate Status: %v", err)
+	}
+	postInvDelta := r.calls.Load() - beforeInv
+	if postInvDelta < primingDelta-expectedIsInProgressShellouts {
+		t.Errorf("post-invalidate Status made %d calls; expected full readStatus (~%d)", postInvDelta, primingDelta)
+	}
+}
+
+// TestStatusInvalidateDuringRefresh asserts that a sample taken before an
+// invalidate is NOT published after the invalidate (otherwise the next
+// Status() call serves pre-invalidation stale data, defeating the contract
+// that Apply/Rollback/Reboot guarantee a fresh re-read).
+func TestStatusInvalidateDuringRefresh(t *testing.T) {
+	tmp := t.TempDir()
+	m, err := newMicroOSBackend(
+		WithRunner(fakeRunner{}),
+		WithStateDir(tmp),
+		WithRuntimeDir(filepath.Join(tmp, "run")),
+		WithSupportOverride(true),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	// Simulate a sample-start preceding the invalidation.
+	sampleStart := time.Now()
+	time.Sleep(2 * time.Millisecond) // ensure invalidatedAt > sampleStart
+	m.invalidateStatusCache()
+
+	// Attempt to publish a snapshot using the pre-invalidate sampleStart;
+	// the guard must drop the write.
+	m.publishStatusSnapshot(Status{CurrentVersion: "stale"}, sampleStart)
+
+	m.statusMu.RLock()
+	cachedAt := m.statusCachedAt
+	cachedVer := m.statusCache.CurrentVersion
+	m.statusMu.RUnlock()
+	if !cachedAt.IsZero() {
+		t.Errorf("publish-after-invalidate succeeded: cachedAt=%v want zero", cachedAt)
+	}
+	if cachedVer == "stale" {
+		t.Errorf("publish-after-invalidate published stale snapshot: %q", cachedVer)
+	}
+
+	// A sample taken *after* the invalidate must publish normally.
+	freshSample := time.Now()
+	m.publishStatusSnapshot(Status{CurrentVersion: "fresh"}, freshSample)
+	m.statusMu.RLock()
+	cachedVer = m.statusCache.CurrentVersion
+	m.statusMu.RUnlock()
+	if cachedVer != "fresh" {
+		t.Errorf("post-invalidate publish failed: cachedVer=%q want fresh", cachedVer)
+	}
+}
+
+func TestApplyInvalidatesStatusCache(t *testing.T) {
+	tmp := t.TempDir()
+	r := &countingRunner{}
+	m, err := NewManager(
+		WithRunner(r),
+		WithStateDir(tmp),
+		WithRuntimeDir(filepath.Join(tmp, "run")),
+		WithSupportOverride(true),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+		WithTimeout(50*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+
+	// Prime the cache.
+	if _, err := m.Status(context.Background()); err != nil {
+		t.Fatalf("prime Status: %v", err)
+	}
+	primingCalls := r.calls.Load()
+
+	if _, err := m.Status(context.Background()); err != nil {
+		t.Fatalf("cached Status: %v", err)
+	}
+	if delta := r.calls.Load() - primingCalls; delta > expectedIsInProgressShellouts {
+		t.Fatalf("cache not primed: cached call made %d runner calls", delta)
+	}
+
+	// Apply will fail (fakeRunner doesn't implement systemd-run for TU), but the
+	// invalidation hook in the Manager facade fires via defer regardless.
+	_ = m.Apply(context.Background())
+	beforeStatus := r.calls.Load()
+
+	if _, err := m.Status(context.Background()); err != nil {
+		t.Fatalf("post-apply Status: %v", err)
+	}
+	postStatusDelta := r.calls.Load() - beforeStatus
+	if postStatusDelta < primingCalls-expectedIsInProgressShellouts {
+		t.Errorf("expected Apply to invalidate cache (post-Status delta=%d, priming=%d)", postStatusDelta, primingCalls)
 	}
 }

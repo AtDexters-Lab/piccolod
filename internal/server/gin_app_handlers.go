@@ -1131,7 +1131,9 @@ func (s *GinServer) handleGinCatalogCategories(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"categories": cats})
 }
 
-// handleGinCatalogIcon handles GET /api/v1/catalog/:name/icon - proxy and cache app icons
+// handleGinCatalogIcon handles GET /api/v1/catalog/:name/icon - proxy and cache app icons.
+// Cache-Control headers are set BEFORE writeGinError / c.Data because Gin flushes
+// response headers on body write — c.Header after that is a no-op.
 func (s *GinServer) handleGinCatalogIcon(c *gin.Context) {
 	if s.catalogManager == nil {
 		writeGinError(c, http.StatusInternalServerError, "Catalog manager not initialized")
@@ -1139,22 +1141,30 @@ func (s *GinServer) handleGinCatalogIcon(c *gin.Context) {
 	}
 
 	name := c.Param("name")
-	result, err := s.catalogManager.GetIconByName(c.Request.Context(), name)
+	result, isStale, err := s.catalogManager.GetIconByName(c.Request.Context(), name)
 	if err != nil {
 		if errors.Is(err, catalog.ErrIconNotFound) || errors.Is(err, catalog.ErrNoIconURL) {
+			c.Header("Cache-Control", "private, max-age=300")
 			writeGinError(c, http.StatusNotFound, err.Error())
 			return
 		}
 		if errors.Is(err, catalog.ErrSSRFBlocked) {
+			c.Header("Cache-Control", "private, max-age=300")
 			writeGinError(c, http.StatusForbidden, "icon URL blocked for security reasons")
 			return
 		}
+		c.Header("Cache-Control", "private, max-age=30")
 		writeGinError(c, http.StatusBadGateway, "failed to fetch icon")
 		return
 	}
 
-	// Set cache and security headers
-	c.Header("Cache-Control", "public, max-age=86400")
+	// Stale-but-served: short browser cache so the client picks up the background
+	// refresh on its next poll instead of holding the stale bytes for another day.
+	if isStale {
+		c.Header("Cache-Control", "public, max-age=300")
+	} else {
+		c.Header("Cache-Control", "public, max-age=86400")
+	}
 	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
 	c.Data(http.StatusOK, result.ContentType, result.Data)

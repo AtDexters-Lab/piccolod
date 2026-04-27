@@ -95,7 +95,7 @@ func TestGetIconByName_ValidPNG(t *testing.T) {
 	m.iconHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 	ctx := context.Background()
-	result, err := m.GetIconByName(ctx, "testapp")
+	result, _, err := m.GetIconByName(ctx, "testapp")
 	if err != nil {
 		t.Fatalf("GetIconByName() error = %v", err)
 	}
@@ -143,7 +143,7 @@ func TestGetIconByName_ValidSVG(t *testing.T) {
 	m.iconHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 	ctx := context.Background()
-	result, err := m.GetIconByName(ctx, "testsvg")
+	result, _, err := m.GetIconByName(ctx, "testsvg")
 	if err != nil {
 		t.Fatalf("GetIconByName() error = %v", err)
 	}
@@ -174,7 +174,7 @@ func TestGetIconByName_AppNotFound(t *testing.T) {
 	m := NewManager(ts.URL, tmpDir)
 
 	ctx := context.Background()
-	_, err := m.GetIconByName(ctx, "nonexistent")
+	_, _, err := m.GetIconByName(ctx, "nonexistent")
 	if err == nil {
 		t.Fatal("expected error for nonexistent app")
 	}
@@ -201,7 +201,7 @@ func TestGetIconByName_NoIconURL(t *testing.T) {
 	m := NewManager(ts.URL, tmpDir)
 
 	ctx := context.Background()
-	_, err := m.GetIconByName(ctx, "noicon")
+	_, _, err := m.GetIconByName(ctx, "noicon")
 	if err == nil {
 		t.Fatal("expected error for app without icon")
 	}
@@ -246,7 +246,7 @@ func TestGetIconByName_OversizedResponse(t *testing.T) {
 	m.iconHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 	ctx := context.Background()
-	_, err := m.GetIconByName(ctx, "largeicon")
+	_, _, err := m.GetIconByName(ctx, "largeicon")
 	if err == nil {
 		t.Fatal("expected error for oversized icon")
 	}
@@ -288,7 +288,7 @@ func TestGetIconByName_InvalidContentType(t *testing.T) {
 	m.iconHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 	ctx := context.Background()
-	_, err := m.GetIconByName(ctx, "texticon")
+	_, _, err := m.GetIconByName(ctx, "texticon")
 	if err == nil {
 		t.Fatal("expected error for invalid content type")
 	}
@@ -336,7 +336,7 @@ func TestGetIconByName_CacheHit(t *testing.T) {
 	ctx := context.Background()
 
 	// First fetch - should hit network
-	_, err := m.GetIconByName(ctx, "cachedapp")
+	_, _, err := m.GetIconByName(ctx, "cachedapp")
 	if err != nil {
 		t.Fatalf("first GetIconByName() error = %v", err)
 	}
@@ -345,7 +345,7 @@ func TestGetIconByName_CacheHit(t *testing.T) {
 	}
 
 	// Second fetch - should hit cache
-	result2, err := m.GetIconByName(ctx, "cachedapp")
+	result2, _, err := m.GetIconByName(ctx, "cachedapp")
 	if err != nil {
 		t.Fatalf("second GetIconByName() error = %v", err)
 	}
@@ -392,13 +392,17 @@ func TestGetIconByName_CacheExpiry(t *testing.T) {
 	tmpDir := t.TempDir()
 	m := NewManager(catalogServer.URL, tmpDir)
 	m.iconHTTPClient = &http.Client{Timeout: 10 * time.Second}
+	t.Cleanup(m.Stop) // drain any background SWR refresh goroutines
 
 	ctx := context.Background()
 
-	// First fetch
-	_, err := m.GetIconByName(ctx, "expiredapp")
+	// First fetch — fresh, isStale must be false.
+	_, isStale, err := m.GetIconByName(ctx, "expiredapp")
 	if err != nil {
 		t.Fatalf("first GetIconByName() error = %v", err)
+	}
+	if isStale {
+		t.Errorf("first fetch should not be stale")
 	}
 	if atomic.LoadInt32(&fetchCount) != 1 {
 		t.Errorf("fetchCount = %d, want 1", fetchCount)
@@ -411,13 +415,26 @@ func TestGetIconByName_CacheExpiry(t *testing.T) {
 		t.Fatalf("failed to modify meta file: %v", err)
 	}
 
-	// Third fetch - should hit network due to expired cache
-	_, err = m.GetIconByName(ctx, "expiredapp")
+	// SWR: the next call returns the stale disk copy immediately (isStale=true)
+	// and triggers an async background refresh.
+	_, isStale, err = m.GetIconByName(ctx, "expiredapp")
 	if err != nil {
 		t.Fatalf("third GetIconByName() error = %v", err)
 	}
-	if atomic.LoadInt32(&fetchCount) != 2 {
-		t.Errorf("fetchCount = %d, want 2 (cache should have been expired)", fetchCount)
+	if !isStale {
+		t.Errorf("expired-cache fetch should report isStale=true")
+	}
+
+	// Wait for the background refresh to complete (bounded poll).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&fetchCount) == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&fetchCount); got != 2 {
+		t.Errorf("fetchCount = %d, want 2 (background refresh should have fired)", got)
 	}
 }
 
@@ -442,7 +459,7 @@ func TestSSRFBlocked_Loopback(t *testing.T) {
 	// Use the default SSRF-safe client (don't override)
 
 	ctx := context.Background()
-	_, err := m.GetIconByName(ctx, "ssrftest")
+	_, _, err := m.GetIconByName(ctx, "ssrftest")
 	if err == nil {
 		t.Fatal("expected SSRF error for loopback URL")
 	}
@@ -560,7 +577,7 @@ func TestGetIconByName_ConcurrencySemaphore(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		name := "app" + string(rune('a'+i))
 		go func() {
-			_, err := m.GetIconByName(ctx, name)
+			_, _, err := m.GetIconByName(ctx, name)
 			errs <- err
 		}()
 	}

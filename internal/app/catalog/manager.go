@@ -34,10 +34,10 @@ const (
 	MaxPageSize      = 100
 
 	// Icon caching constants
-	IconCacheDuration   = 24 * time.Hour
-	IconMaxSize         = 1 << 20 // 1MB
-	IconDialTimeout     = 10 * time.Second // TCP + TLS handshake
-	IconRequestTimeout  = 30 * time.Second // full request lifecycle
+	IconCacheDuration  = 24 * time.Hour
+	IconMaxSize        = 1 << 20          // 1MB
+	IconDialTimeout    = 10 * time.Second // TCP + TLS handshake
+	IconRequestTimeout = 30 * time.Second // full request lifecycle
 
 	// Concurrency control for external icon fetches
 	MaxConcurrentIconFetches = 3
@@ -733,18 +733,20 @@ func containsTag(tags []string, query string) bool {
 
 // GetIconByName fetches and caches the icon for a catalog app.
 // Returns the icon data and content type, using disk cache with 24h TTL.
-func (m *Manager) GetIconByName(ctx context.Context, appName string) (*IconResult, error) {
+// isStale=true means the disk copy was past TTL and the caller should emit a
+// short browser Cache-Control so the client picks up the background refresh
+// without waiting another full TTL cycle.
+func (m *Manager) GetIconByName(ctx context.Context, appName string) (result *IconResult, isStale bool, err error) {
 	if err := m.ensureCache(ctx, false); err != nil {
 		m.cacheMu.RLock()
 		if len(m.cachedApps) == 0 {
 			m.cacheMu.RUnlock()
-			return nil, err
+			return nil, false, err
 		}
 		m.cacheMu.RUnlock()
 		log.Printf("WARN: serving stale catalog for icon lookup due to fetch error: %v", err)
 	}
 
-	// Find the app in catalog
 	m.cacheMu.RLock()
 	var iconURL string
 	var found bool
@@ -758,24 +760,57 @@ func (m *Manager) GetIconByName(ctx context.Context, appName string) (*IconResul
 	m.cacheMu.RUnlock()
 
 	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrIconNotFound, appName)
+		return nil, false, fmt.Errorf("%w: %s", ErrIconNotFound, appName)
 	}
 
 	if iconURL == "" {
-		return nil, fmt.Errorf("%w: %s", ErrNoIconURL, appName)
+		return nil, false, fmt.Errorf("%w: %s", ErrNoIconURL, appName)
 	}
 
-	// Normalize app name for cache key (catalog lookup is case-insensitive)
 	cacheKey := strings.ToLower(appName)
 
-	// Check disk cache
 	if m.cacheDir != "" {
-		if result, err := m.loadIconFromDisk(cacheKey); err == nil {
-			return result, nil
+		if result, isStale, err := m.loadIconFromDisk(cacheKey); err == nil {
+			if isStale {
+				m.spawnIconRefresh(iconURL, cacheKey)
+			}
+			return result, isStale, nil
 		}
 	}
 
-	// Acquire semaphore for external fetch (disk cache hits never block)
+	res, err := m.fetchAndCacheIcon(ctx, iconURL, cacheKey)
+	return res, false, err
+}
+
+// spawnIconRefresh launches a stale-while-revalidate background refresh under
+// lifecycleMu so the new goroutine is reliably tracked by m.wg before Stop()
+// can observe a zero counter, and the captured ctx cannot be reassigned out
+// from under us by Stop()'s post-Wait reset. If the manager is already shutting
+// down (lifecycleCtx already cancelled), the refresh is skipped.
+func (m *Manager) spawnIconRefresh(iconURL, cacheKey string) {
+	m.lifecycleMu.Lock()
+	if m.lifecycleCtx.Err() != nil {
+		m.lifecycleMu.Unlock()
+		return
+	}
+	parentCtx := m.lifecycleCtx
+	m.wg.Add(1)
+	m.lifecycleMu.Unlock()
+
+	go func() {
+		defer m.wg.Done()
+		refreshCtx, cancel := context.WithTimeout(parentCtx, IconRequestTimeout)
+		defer cancel()
+		if _, err := m.fetchAndCacheIcon(refreshCtx, iconURL, cacheKey); err != nil {
+			log.Printf("DEBUG: background icon refresh failed for %s: %v", cacheKey, err)
+		}
+	}()
+}
+
+// fetchAndCacheIcon performs the upstream icon fetch and writes the result to
+// the disk cache. Used by both the cold-miss synchronous path and the
+// stale-while-revalidate background refresh path.
+func (m *Manager) fetchAndCacheIcon(ctx context.Context, iconURL, cacheKey string) (*IconResult, error) {
 	select {
 	case m.iconSemaphore <- struct{}{}:
 		defer func() { <-m.iconSemaphore }()
@@ -783,12 +818,10 @@ func (m *Manager) GetIconByName(ctx context.Context, appName string) (*IconResul
 		return nil, ctx.Err()
 	}
 
-	// Validate URL
 	if !strings.HasPrefix(iconURL, "http://") && !strings.HasPrefix(iconURL, "https://") {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidIconURL, iconURL)
 	}
 
-	// Fetch icon with SSRF-safe client
 	req, err := http.NewRequestWithContext(ctx, "GET", iconURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create icon request: %w", err)
@@ -804,24 +837,21 @@ func (m *Manager) GetIconByName(ctx context.Context, appName string) (*IconResul
 		return nil, fmt.Errorf("icon fetch failed: status %d", resp.StatusCode)
 	}
 
-	// Validate Content-Type with allowlist
 	contentType := resp.Header.Get("Content-Type")
-	// Extract base MIME type without parameters (e.g., "image/png; charset=utf-8" -> "image/png")
 	baseMIME := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
 	allowedTypes := map[string]bool{
-		"image/png":     true,
-		"image/jpeg":    true,
-		"image/gif":     true,
-		"image/webp":    true,
-		"image/svg+xml": true,
-		"image/x-icon":  true,
+		"image/png":                true,
+		"image/jpeg":               true,
+		"image/gif":                true,
+		"image/webp":               true,
+		"image/svg+xml":            true,
+		"image/x-icon":             true,
 		"image/vnd.microsoft.icon": true,
 	}
 	if !allowedTypes[baseMIME] {
 		return nil, fmt.Errorf("%w: got %s", ErrInvalidMIMEType, contentType)
 	}
 
-	// Read with size limit
 	data, err := io.ReadAll(io.LimitReader(resp.Body, IconMaxSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read icon body: %w", err)
@@ -835,7 +865,6 @@ func (m *Manager) GetIconByName(ctx context.Context, appName string) (*IconResul
 		ContentType: baseMIME,
 	}
 
-	// Save to disk cache
 	if m.cacheDir != "" {
 		if err := m.saveIconToDisk(cacheKey, result); err != nil {
 			log.Printf("WARN: failed to cache icon for %s: %v", cacheKey, err)
@@ -868,46 +897,41 @@ func sanitizeAppNameForCache(appName string) (string, error) {
 	return appName, nil
 }
 
-// loadIconFromDisk loads a cached icon from disk if valid (< 24h old).
-func (m *Manager) loadIconFromDisk(appName string) (*IconResult, error) {
+// loadIconFromDisk loads a cached icon from disk. Returns isStale=true when the
+// on-disk copy is older than IconCacheDuration but otherwise valid; the caller
+// is expected to serve the stale copy and trigger a background refresh.
+func (m *Manager) loadIconFromDisk(appName string) (result *IconResult, isStale bool, err error) {
 	if m.cacheDir == "" {
-		return nil, fmt.Errorf("no cache dir")
+		return nil, false, fmt.Errorf("no cache dir")
 	}
 
 	safeName, err := sanitizeAppNameForCache(appName)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	metaPath := filepath.Join(m.cacheDir, "icons", safeName+".meta")
 	dataPath := filepath.Join(m.cacheDir, "icons", safeName+".bin")
 
-	// Read metadata
 	metaData, err := os.ReadFile(metaPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	var meta iconMeta
 	if err := json.Unmarshal(metaData, &meta); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	// Check TTL
-	if time.Since(meta.FetchedAt) > IconCacheDuration {
-		return nil, fmt.Errorf("cache expired")
-	}
-
-	// Read icon data
 	data, err := os.ReadFile(dataPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	return &IconResult{
 		Data:        data,
 		ContentType: meta.ContentType,
-	}, nil
+	}, time.Since(meta.FetchedAt) > IconCacheDuration, nil
 }
 
 // saveIconToDisk saves an icon and its metadata to disk cache.

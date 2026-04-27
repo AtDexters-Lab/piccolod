@@ -24,6 +24,13 @@ const (
 	defaultStateSubdir      = "update"
 	defaultStateFilename    = "state.json"
 	transactionalUpdateUnit = "transactional-update.service"
+
+	// Status snapshot served from cache to avoid running readStatus (up to ~14s
+	// of shell-outs to snapper/rpm/btrfs/journalctl) on every UI poll. The Watch
+	// loop refreshes the snapshot at statusRefreshInterval; Apply/Rollback/Reboot
+	// invalidate it at the Manager facade so post-action UI reflects the change.
+	statusSnapshotTTL     = 60 * time.Second
+	statusRefreshInterval = 30 * time.Second
 )
 
 var (
@@ -58,6 +65,7 @@ type osBackend interface {
 	ForceReboot(context.Context) error
 	PowerOff(context.Context) error
 	Watch(context.Context) error
+	invalidateStatusCache()
 }
 
 // microOSBackend interacts with MicroOS transactional-update to report and apply updates.
@@ -74,6 +82,16 @@ type microOSBackend struct {
 	mu              sync.Mutex
 	supported       bool
 	overrideSupport bool
+
+	// statusMu is separate from m.mu to avoid contention with runTransactionalUpdate
+	// (which holds m.mu for the full TU lifetime). statusInvalidatedAt is the
+	// high-water mark for invalidation: a sample taken before this timestamp
+	// must NOT be published (would overwrite a concurrent invalidate from
+	// Apply/Rollback/Reboot with pre-mutation data).
+	statusMu            sync.RWMutex
+	statusCache         Status
+	statusCachedAt      time.Time
+	statusInvalidatedAt time.Time
 }
 
 // Option configures the MicroOS backend.
@@ -130,16 +148,26 @@ func NewManager(opts ...Option) (*Manager, error) {
 // Status returns the current OS update status (graceful on unsupported hosts).
 func (m *Manager) Status(ctx context.Context) (Status, error) { return m.backend.Status(ctx) }
 
+// Apply, Rollback, and Reboot invalidate the status cache unconditionally on
+// return — including on no-op rejections like ErrInProgress. We accept one
+// extra readStatus over reaching into backend internals to discriminate
+// "actually mutated" from "rejected before mutation."
+
 // Apply triggers transactional-update dup.
-func (m *Manager) Apply(ctx context.Context) error { return m.backend.Apply(ctx) }
+func (m *Manager) Apply(ctx context.Context) error {
+	defer m.backend.invalidateStatusCache()
+	return m.backend.Apply(ctx)
+}
 
 // Rollback sets the requested snapshot as default for next boot.
 func (m *Manager) Rollback(ctx context.Context, targetID string) error {
+	defer m.backend.invalidateStatusCache()
 	return m.backend.Rollback(ctx, targetID)
 }
 
 // Reboot validates the staged snapshot and triggers a system reboot.
 func (m *Manager) Reboot(ctx context.Context) error {
+	defer m.backend.invalidateStatusCache()
 	return m.backend.Reboot(ctx)
 }
 
@@ -219,7 +247,47 @@ func (m *microOSBackend) Status(ctx context.Context) (Status, error) {
 	if m.isInProgress(ctx) {
 		return Status{}, ErrInProgress
 	}
-	return m.readStatus(ctx)
+
+	m.statusMu.RLock()
+	if !m.statusCachedAt.IsZero() && time.Since(m.statusCachedAt) < statusSnapshotTTL {
+		st := m.statusCache
+		m.statusMu.RUnlock()
+		return st, nil
+	}
+	m.statusMu.RUnlock()
+
+	sampleStart := time.Now()
+	st, err := m.readStatus(ctx)
+	if err != nil {
+		return st, err
+	}
+	// readStatus's helpers swallow command errors — if the request ctx was
+	// cancelled mid-call, st may be a partial/empty sample. Don't pollute the
+	// 60s cache with that.
+	if ctx.Err() != nil {
+		return st, ctx.Err()
+	}
+	m.publishStatusSnapshot(st, sampleStart)
+	return st, nil
+}
+
+func (m *microOSBackend) invalidateStatusCache() {
+	m.statusMu.Lock()
+	m.statusCachedAt = time.Time{}
+	m.statusInvalidatedAt = time.Now()
+	m.statusMu.Unlock()
+}
+
+// publishStatusSnapshot writes a freshly-sampled status under statusMu, but
+// drops the write if an invalidation occurred after the sample started — that
+// would overwrite the invalidate with stale pre-mutation data.
+func (m *microOSBackend) publishStatusSnapshot(st Status, sampleStart time.Time) {
+	m.statusMu.Lock()
+	if sampleStart.After(m.statusInvalidatedAt) {
+		m.statusCache = st
+		m.statusCachedAt = sampleStart
+	}
+	m.statusMu.Unlock()
 }
 
 // Apply triggers transactional-update dup with a fallback to package-only update.
@@ -336,6 +404,9 @@ func (m *microOSBackend) Watch(ctx context.Context) error {
 	snapshotTicker := time.NewTicker(2 * time.Minute)
 	defer snapshotTicker.Stop()
 
+	statusRefreshTicker := time.NewTicker(statusRefreshInterval)
+	defer statusRefreshTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -344,8 +415,22 @@ func (m *microOSBackend) Watch(ctx context.Context) error {
 			m.checkAndRecover(ctx)
 		case <-snapshotTicker.C:
 			m.watchSnapshots(ctx)
+		case <-statusRefreshTicker.C:
+			m.refreshStatusCache(ctx)
 		}
 	}
+}
+
+func (m *microOSBackend) refreshStatusCache(ctx context.Context) {
+	if m.isInProgress(ctx) {
+		return
+	}
+	sampleStart := time.Now()
+	st, err := m.readStatus(ctx)
+	if err != nil || ctx.Err() != nil {
+		return
+	}
+	m.publishStatusSnapshot(st, sampleStart)
 }
 
 // watchSnapshots validates any staged snapshot and auto-reverts if it's missing
