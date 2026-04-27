@@ -11,13 +11,12 @@ class WifiStatus {
     required this.available,
     required this.state,
     required this.activeUplink,
-    this.ssid,
+    required this.hasSavedNetwork, this.ssid,
     this.signalDbm,
     this.signalTier,
     this.frequencyMhz,
     this.band,
     this.ipAddress,
-    required this.hasSavedNetwork,
     this.savedSsid,
   });
 
@@ -106,8 +105,7 @@ class WifiConnectResult {
 
   WifiConnectResult({
     required this.success,
-    this.error,
-    required this.state,
+    required this.state, this.error,
   });
 
   factory WifiConnectResult.fromJson(Map<String, dynamic> json) {
@@ -126,9 +124,7 @@ class WifiAPStatus {
 
   WifiAPStatus({
     required this.active,
-    this.ssid,
-    required this.suppressed,
-    required this.clients,
+    required this.suppressed, required this.clients, this.ssid,
   });
 
   factory WifiAPStatus.fromJson(Map<String, dynamic> json) {

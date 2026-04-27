@@ -426,7 +426,7 @@ class _MetadataChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final base = PiccoloTheme.cobalt600;
+    const base = PiccoloTheme.cobalt600;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: Spacing.sm, vertical: 2),
       decoration: BoxDecoration(
@@ -436,7 +436,7 @@ class _MetadataChip extends StatelessWidget {
       ),
       child: Text(
         label,
-        style: TextStyle(
+        style: const TextStyle(
           fontSize: 10,
           fontWeight: FontWeight.w500,
           color: base,

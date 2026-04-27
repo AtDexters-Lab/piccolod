@@ -117,7 +117,7 @@ String friendlyPasskeyError(Object e) {
     // Android Credential Manager / Google Password Manager refused the
     // request. Usually means the phone has no screen lock, or Play Services /
     // Credential Manager is disabled / out of date.
-    return 'Your phone\'s passkey system refused the request. Make sure '
+    return "Your phone's passkey system refused the request. Make sure "
         'you have a screen lock set (PIN, pattern, or biometric), Google '
         'Play Services is up to date, and then try again.';
   }

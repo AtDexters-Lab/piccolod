@@ -47,7 +47,7 @@ class _NetworkTabState extends State<NetworkTab> {
         isAPMode: _controller.status?.isAPMode ?? false,
       ),
     );
-    if (connected == true) {
+    if (connected ?? false) {
       await _controller.refresh();
     }
   }
