@@ -213,11 +213,27 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 
 	// D-12: per-username lockout precedes verify so password-holder attackers
 	// against a single victim cannot defeat it via concurrent attempts.
-	if s.loginRateLimiter != nil && !s.loginRateLimiter.Allow(username) {
-		c.Header("Retry-After", "900")
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too Many Requests"})
-		return
+	// Allow reserves inflight capacity on the bucket; release MUST run once
+	// the verify finishes (every code path below is covered by the defer)
+	// so a burst that early-returns (e.g. ErrLocked) doesn't leak the
+	// reservation and stick subsequent callers behind a phantom inflight.
+	release := noopRelease
+	if s.loginRateLimiter != nil {
+		var allowed bool
+		allowed, release = s.loginRateLimiter.Allow(username)
+		if !allowed {
+			// 900s = lockout window worst case. The 429 also fires when the
+			// bucket is inflight-saturated (failures<maxFails but enough
+			// concurrent verifies in flight to reach the threshold); the
+			// real wait there is sub-second (verify completion releases the
+			// reservation). Conservative ceiling rather than complicating
+			// the response — admin guidance is "wait it out or reset."
+			c.Header("Retry-After", "900")
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Too Many Requests"})
+			return
+		}
 	}
+	defer release()
 
 	ctx := c.Request.Context()
 	var userInfo *authpkg.UserInfo

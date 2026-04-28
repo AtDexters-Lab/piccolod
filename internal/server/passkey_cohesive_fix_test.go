@@ -127,14 +127,18 @@ func TestLoginRateLimit_PerUsername_LockoutAfter10Failures(t *testing.T) {
 	rl := newLoginRateLimiter(10, 15*time.Minute, 100)
 	const u = "alice"
 	for i := 0; i < 9; i++ {
-		if !rl.Allow(u) {
+		allowed, release := rl.Allow(u)
+		if !allowed {
 			t.Fatalf("expected Allow=true at i=%d", i)
 		}
 		rl.RecordFailure(u)
+		// Release the inflight reservation per the Allow→release
+		// contract; RecordFailure owns failures only, not inflight.
+		release()
 	}
 	// 10th failure crosses threshold.
 	rl.RecordFailure(u)
-	if rl.Allow(u) {
+	if allowed, _ := rl.Allow(u); allowed {
 		t.Fatalf("expected lockout after 10 failures")
 	}
 }
@@ -150,7 +154,7 @@ func TestLoginRateLimit_LockedBucket_SurvivesDistinctUsernameChurn(t *testing.T)
 	for i := 0; i < 3; i++ {
 		rl.RecordFailure("victim")
 	}
-	if rl.Allow("victim") {
+	if allowed, _ := rl.Allow("victim"); allowed {
 		t.Fatalf("precondition: victim should be locked")
 	}
 	// Churn cap*3 distinct attacker-chosen usernames. Each is a fresh bucket
@@ -159,7 +163,7 @@ func TestLoginRateLimit_LockedBucket_SurvivesDistinctUsernameChurn(t *testing.T)
 	for i := 0; i < cap*3; i++ {
 		rl.RecordFailure("churn_" + strings.Repeat("x", i%8) + "_" + time.Now().Format("150405.000000"))
 	}
-	if rl.Allow("victim") {
+	if allowed, _ := rl.Allow("victim"); allowed {
 		t.Fatalf("victim lockout was reset by distinct-username churn — LRU eviction bypassed the pin")
 	}
 }
@@ -176,7 +180,7 @@ func TestLoginRateLimit_PartialBucket_SurvivesDistinctUsernameChurn(t *testing.T
 	for i := 0; i < maxFails-1; i++ {
 		rl.RecordFailure("victim")
 	}
-	if !rl.Allow("victim") {
+	if allowed, _ := rl.Allow("victim"); !allowed {
 		t.Fatalf("precondition: victim should still be allowed at %d failures", maxFails-1)
 	}
 	// Churn distinct attacker-chosen usernames to try to evict the victim.
@@ -187,7 +191,7 @@ func TestLoginRateLimit_PartialBucket_SurvivesDistinctUsernameChurn(t *testing.T
 	// the partial bucket, the counter would be fresh and this single failure
 	// would NOT lock (10 more would be needed).
 	rl.RecordFailure("victim")
-	if rl.Allow("victim") {
+	if allowed, _ := rl.Allow("victim"); allowed {
 		t.Fatalf("partial bucket was evicted by distinct-username churn — failure counter reset")
 	}
 }
@@ -198,16 +202,16 @@ func TestLoginRateLimit_SuccessOnDifferentUser_DoesNotResetLockout(t *testing.T)
 	for i := 0; i < 3; i++ {
 		rl.RecordFailure("victim")
 	}
-	if rl.Allow("victim") {
+	if allowed, _ := rl.Allow("victim"); allowed {
 		t.Fatalf("victim should be locked")
 	}
 	rl.RecordSuccess("attacker")
-	if rl.Allow("victim") {
+	if allowed, _ := rl.Allow("victim"); allowed {
 		t.Fatalf("victim should remain locked after attacker success")
 	}
 	// A success for victim itself should clear the lock.
 	rl.RecordSuccess("victim")
-	if !rl.Allow("victim") {
+	if allowed, _ := rl.Allow("victim"); !allowed {
 		t.Fatalf("victim should be unlocked after own success")
 	}
 }
@@ -225,7 +229,7 @@ func TestLoginRateLimit_PartialBucket_AgesOutAfterLockoutWindow(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	// A single fresh failure should restart the counter at 1, not jump to 10.
 	rl.RecordFailure("alice")
-	if !rl.Allow("alice") {
+	if allowed, _ := rl.Allow("alice"); !allowed {
 		t.Fatalf("stale partial bucket was not aged out: single fresh failure after window locked the account")
 	}
 }
@@ -248,7 +252,7 @@ func TestLoginRateLimit_HardCap_EvictsExpiredBeforeDropping(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		rl.RecordFailure("new_user")
 	}
-	if rl.Allow("new_user") {
+	if allowed, _ := rl.Allow("new_user"); allowed {
 		t.Fatalf("new_user lockout did not engage — failures were silently dropped")
 	}
 }
