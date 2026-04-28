@@ -461,12 +461,31 @@ const (
 // gone." A skip-on-ambiguity policy would let a "locked" system retain
 // decrypted state — security regression.
 //
+// Zero-handle policy: strict callers MUST pass a populated handle. An
+// empty ID or MountDir is treated as a programmer error and rejected
+// here, BEFORE classifyForDetach (which folds zero handles into NoOp
+// for the benefit of best-effort callers). This is the structural close
+// for the B1 regression class — codex iter-7 caught NewService calling
+// setLockState before controlHandle was populated; the empty handle
+// short-circuited as NoOp, flipping lockState=true while a stale
+// post-crash mapper could still be live. Refusing here makes "I forgot
+// to populate the handle" a loud error rather than a silent fail-open.
+//
+// The refusal is unconditional on `m.volumes` — strict means strict
+// regardless of which sub-components are wired. The legitimate "no
+// volume manager" path falls through classifyForDetach and returns
+// NoOp via the volumes==nil branch; that path is reachable only with a
+// populated handle (any caller passing a zero handle is buggy).
+//
 // Implementation: switch on the typed detachClass returned by
 // classifyForDetach. Go does not enforce switch exhaustiveness against
 // the enum (see detachClass godoc) — the runtime safety net is the
 // fail-closed default branch at the bottom that returns an error for any
 // unhandled class, plus the test table covering each named case.
 func (m *Module) detachVolumeStrict(ctx context.Context, handle VolumeHandle) error {
+	if handle.ID == "" || handle.MountDir == "" {
+		return fmt.Errorf("detachVolumeStrict: refusing zero/incomplete handle (id=%q, mount=%q)", handle.ID, handle.MountDir)
+	}
 	class, err := m.classifyForDetach(ctx, handle)
 	switch class {
 	case detachClassNoOp, detachClassSkip:

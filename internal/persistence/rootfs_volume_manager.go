@@ -647,6 +647,115 @@ func (m *luksVolumeManager) attachRootfsLocked(ctx context.Context, volumeID str
 	return m.attachRootfsFromMeta(ctx, volumeID, meta)
 }
 
+// liveResizeSpec describes which live layers above the LV must be
+// resized in lockstep with the LV. Used by resizeConverge to enforce the
+// strict ordering codex iter-7 B2 pinned.
+//
+// Mapper: when non-empty, cryptsetup resize <Mapper> runs after the LV
+// resize succeeds. Empty means no live LUKS mapper to resize (volume is
+// detached, or the strict caller's probe says so).
+//
+// FSResize: filesystem-specific online-grow callback (btrfs filesystem
+// resize for workspace, resize2fs for application). Invoked only when
+// Mapper is non-empty AND FSResize is non-nil — the cryptsetup-only
+// state covers partial-attach states where the mapper is open but the fs
+// is not mounted; the LV+LUKS sizes will be visible naturally on the
+// next mount.
+//
+// Coupling: FSResize is gated by Mapper. Setting FSResize without
+// Mapper is a programmer error — the helper rejects it at entry rather
+// than silently dropping the callback.
+type liveResizeSpec struct {
+	Mapper   string
+	FSResize func(ctx context.Context) error
+}
+
+// liveResizeFromState builds the live-resize spec for a STRICT resize
+// from a probed AttachState. Pre-existing strict callers gated only on
+// AttachStateAttached, leaving two structural holes codex iter-7
+// follow-up surfaced: PartialMapperOnly advanced LV+meta while the
+// open cryptsetup mapper stayed at the old size (next mount saw stale
+// LUKS-payload-size); ambiguous/hostile states (Foreign / Unknown /
+// Corrupted / Stale) collapsed silently into the Detached branch and
+// also advanced LV+meta. Both are fixed here:
+//
+//   - Attached            → mapper + fs resize
+//   - Detached            → LV-only (LUKS+fs converge on next attach)
+//   - any other state     → refuse the resize; auto-grow's next cycle
+//                           or admin retry observes the now-clearer
+//                           kernel state and tries again.
+//
+// PartialMapperOnly is refused on purpose: the AttachState enum doesn't
+// distinguish "mapper open, raw fs not mounted" (the mapper-only sub-
+// shape) from "mapper open, raw fs mounted, idmap bind missing" (a
+// transient mid-attach shape where the fs IS resizable). Resizing only
+// the mapper in the second sub-shape would advance meta while the
+// mounted raw fs stays at the old size, recreating the B2 hole inside
+// PartialMapperOnly's coarse classification. Refusing forces the caller
+// to retry once the reconciler completes the missing layer (typical
+// recovery <1s); auto-grow and admin both tolerate that latency.
+//
+// fsResize is the filesystem-specific online-grow callback (btrfs
+// filesystem resize for workspace, resize2fs for application). It is
+// invoked only from the Attached branch (mapper open AND fs mounted).
+func liveResizeFromState(state AttachState, mapper string, fsResize func(ctx context.Context) error) (liveResizeSpec, error) {
+	switch state {
+	case AttachStateAttached:
+		return liveResizeSpec{Mapper: mapper, FSResize: fsResize}, nil
+	case AttachStateDetached:
+		return liveResizeSpec{}, nil
+	default:
+		return liveResizeSpec{}, fmt.Errorf("refusing resize on attach state %s; clear ambiguity before retry", state)
+	}
+}
+
+// resizeConverge runs the LV → cryptsetup → fs convergence in the strict
+// order codex iter-7 B2 pinned: every live layer above the LV converges
+// BEFORE meta.SizeBytes is persisted. If any step errors, the metadata
+// is NOT advanced — a future attach retries from the still-old size and
+// the upgrade fires again. Persisting metadata before live convergence
+// would let a future attach skip the upgrade (meta says we're already
+// at the new size), freezing the mapper/fs forever at the old size.
+//
+// Sole owner of the size-write ordering for v3 volumes; new resize
+// sites should compose with this helper rather than reimplementing the
+// sequence (the bug class B2 closed structurally is "person forgot to
+// defer the meta write past the live steps").
+//
+// metaPath is the absolute path of the volume metadata file that meta
+// was read from; it is the file the helper writes back to on success.
+// Passing it in (rather than re-deriving from volumeID) avoids
+// recomputing filepath.Join + paths.VolumeMetaDir at each callsite.
+func (m *luksVolumeManager) resizeConverge(
+	ctx context.Context,
+	meta *volumeMetaV3,
+	metaPath string,
+	newSizeBytes int64,
+	live liveResizeSpec,
+) error {
+	if live.FSResize != nil && live.Mapper == "" {
+		return fmt.Errorf("resizeConverge: FSResize requires Mapper (meta %s)", metaPath)
+	}
+	if err := m.lvMgr.ResizeLV(ctx, meta.LVName, newSizeBytes); err != nil {
+		return fmt.Errorf("lvresize: %w", err)
+	}
+	if live.Mapper != "" {
+		if err := m.run.Run(ctx, "cryptsetup", "resize", live.Mapper); err != nil {
+			return fmt.Errorf("cryptsetup resize: %w", err)
+		}
+		if live.FSResize != nil {
+			if err := live.FSResize(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	meta.SizeBytes = newSizeBytes
+	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
+		return fmt.Errorf("update metadata: %w", err)
+	}
+	return nil
+}
+
 // upgradeUndersizedWorkspace resizes a legacy workspace LV up to
 // defaultWorkspaceVirtualSize when meta.SizeBytes is still below it.
 // Idempotent (no-op when meta is already at or above default). Must run
@@ -665,47 +774,30 @@ func (m *luksVolumeManager) upgradeUndersizedWorkspace(ctx context.Context, volu
 	if m.nbdSrv != nil || m.drbdMgr != nil {
 		return
 	}
-	if err := m.lvMgr.ResizeLV(ctx, meta.LVName, defaultWorkspaceVirtualSize); err != nil {
-		log.Printf("WARN: resize existing workspace LV %s: %v", meta.LVName, err)
-		return
-	}
 
-	// Live upper-layer resize. Order matters for metadata persistence:
-	// only advance meta.SizeBytes after every currently-live layer has
-	// converged. Persisting metadata before live resize succeeds (codex
-	// iter-7 B2) would leave future attaches skipping the upgrade because
-	// meta.SizeBytes >= defaultWorkspaceVirtualSize, freezing the
-	// mapper/fs at the old size while metadata claims the new one.
-	//
-	// From the full-attach path the mapper isn't open yet at this point,
-	// so the stat below misses and we skip the live steps; metadata
-	// persists immediately because the subsequent luksOpen+mount see the
-	// new LV size naturally. From the Attached fast-path the mapper is
-	// open and we run cryptsetup+btrfs inline; metadata only persists
-	// once both succeed (or are correctly skipped).
+	// From the full-attach path the mapper isn't open yet, so the stat
+	// below misses and live stays empty; resizeConverge runs LV-only and
+	// the subsequent luksOpen+mount see the new size naturally. From the
+	// Attached fast-path the mapper is open and we resize cryptsetup +
+	// btrfs inline; metadata only persists once both succeed.
+	live := liveResizeSpec{}
 	mapper := volMapperName(volumeID)
-	mapperOpen := false
 	if _, err := os.Stat("/dev/mapper/" + mapper); err == nil {
-		mapperOpen = true
-	}
-	if mapperOpen {
-		if err := m.run.Run(ctx, "cryptsetup", "resize", mapper); err != nil {
-			log.Printf("WARN: cryptsetup resize %s during legacy upgrade: %v (metadata not advanced; next attach will retry)", mapper, err)
-			return
-		}
+		live.Mapper = mapper
 		mountDir := paths.MountDir(volumeID)
 		if mounted, _ := isMountPoint(mountDir); mounted {
-			if err := m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", mountDir); err != nil {
-				log.Printf("WARN: btrfs resize %s during legacy upgrade: %v (metadata not advanced; next attach will retry)", mountDir, err)
-				return
+			live.FSResize = func(ctx context.Context) error {
+				if err := m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", mountDir); err != nil {
+					return fmt.Errorf("btrfs resize: %w", err)
+				}
+				return nil
 			}
 		}
 	}
-
-	// Live layers (if any) have converged. Safe to persist new size.
-	meta.SizeBytes = defaultWorkspaceVirtualSize
 	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
-	_ = writeVolumeMetaV3(metaPath, meta)
+	if err := m.resizeConverge(ctx, meta, metaPath, defaultWorkspaceVirtualSize, live); err != nil {
+		log.Printf("WARN: legacy workspace upgrade %s: %v (metadata not advanced; next attach will retry)", volumeID, err)
+	}
 }
 
 // unmountStaleIfPresent lazy-umounts path iff it's currently a mount
@@ -1253,29 +1345,26 @@ func (m *luksVolumeManager) resizeWorkspaceLocked(ctx context.Context, volumeID 
 		return fmt.Errorf("pool capacity: %w", err)
 	}
 
-	if err := m.lvMgr.ResizeLV(ctx, meta.LVName, newSizeBytes); err != nil {
-		return fmt.Errorf("lvresize: %w", err)
+	// Probe under the per-volume lock — AttachStateOf can't churn
+	// concurrently. liveResizeFromState fails closed on ambiguous /
+	// hostile states (Foreign, Unknown, Corrupted, Stale) so meta
+	// never advances while kernel-state truth is unclear.
+	state, err := m.attachStateOfUnderLock(ctx, volumeID)
+	if err != nil {
+		return fmt.Errorf("probe attach state for resize: %w", err)
 	}
-
-	// If currently attached (kernel-state truth), resize LUKS and btrfs
-	// inline. We hold the per-volume lock, so AttachStateOf can't churn
-	// under us. mapper + raw mount path are derivable from naming convention.
-	state, _ := m.attachStateOfUnderLock(ctx, volumeID)
-	if state == AttachStateAttached {
-		mapper := volMapperName(volumeID)
-		mountPath := paths.MountDir(volumeID)
-		if err := m.run.Run(ctx, "cryptsetup", "resize", mapper); err != nil {
-			return fmt.Errorf("cryptsetup resize: %w", err)
-		}
+	mountPath := paths.MountDir(volumeID)
+	live, err := liveResizeFromState(state, volMapperName(volumeID), func(ctx context.Context) error {
 		if err := m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", mountPath); err != nil {
 			return fmt.Errorf("btrfs resize: %w", err)
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	// If not attached, LUKS/btrfs resize will happen on next attach.
-
-	meta.SizeBytes = newSizeBytes
-	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
-		return fmt.Errorf("update metadata: %w", err)
+	if err := m.resizeConverge(ctx, meta, metaPath, newSizeBytes, live); err != nil {
+		return err
 	}
 
 	// Record cooldown to prevent the auto-resize monitor from racing.
@@ -1330,27 +1419,27 @@ func (m *luksVolumeManager) resizeApplicationLocked(ctx context.Context, volumeI
 		return fmt.Errorf("pool capacity: %w", err)
 	}
 
-	if err := m.lvMgr.ResizeLV(ctx, meta.LVName, newSizeBytes); err != nil {
-		return fmt.Errorf("lvresize: %w", err)
+	// Probe under the per-volume lock — AttachStateOf can't churn
+	// concurrently. liveResizeFromState fails closed on ambiguous /
+	// hostile states so meta never advances while kernel-state truth
+	// is unclear.
+	state, err := m.attachStateOfUnderLock(ctx, volumeID)
+	if err != nil {
+		return fmt.Errorf("probe attach state for resize: %w", err)
 	}
-
-	// If currently attached (kernel-state truth), resize the LUKS mapper
-	// and ext4 filesystem inline. Otherwise, resize will occur naturally on
-	// next attach. We hold the per-volume lock, so the probe is consistent.
-	state, _ := m.attachStateOfUnderLock(ctx, volumeID)
-	if state == AttachStateAttached {
-		mapper := volMapperName(volumeID)
-		if err := m.run.Run(ctx, "cryptsetup", "resize", mapper); err != nil {
-			return fmt.Errorf("cryptsetup resize: %w", err)
-		}
-		if err := m.run.Run(ctx, "resize2fs", "/dev/mapper/"+mapper); err != nil {
+	mapper := volMapperName(volumeID)
+	mapperPath := "/dev/mapper/" + mapper
+	live, err := liveResizeFromState(state, mapper, func(ctx context.Context) error {
+		if err := m.run.Run(ctx, "resize2fs", mapperPath); err != nil {
 			return fmt.Errorf("resize2fs: %w", err)
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-
-	meta.SizeBytes = newSizeBytes
-	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
-		return fmt.Errorf("update metadata: %w", err)
+	if err := m.resizeConverge(ctx, meta, metaPath, newSizeBytes, live); err != nil {
+		return err
 	}
 
 	// Record cooldown to prevent the auto-resize monitor from racing.

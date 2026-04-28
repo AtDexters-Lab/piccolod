@@ -253,3 +253,55 @@ func TestListClones_NoClones(t *testing.T) {
 		t.Fatalf("expected 0 clones, got %d: %v", len(clones), clones)
 	}
 }
+
+// TestLiveResizeFromState pins the strict-resize state→spec contract.
+// Codex iter-7 follow-up surfaced two pre-existing holes when this lived
+// inline at the resize sites: (1) PartialMapperOnly advanced LV+meta
+// while the open cryptsetup mapper stayed at the old size; (2)
+// ambiguous / hostile states (Foreign / Unknown / Corrupted / Stale)
+// collapsed into the Detached branch and silently advanced LV+meta.
+// The helper now refuses on (2) and runs cryptsetup-only on (1).
+func TestLiveResizeFromState(t *testing.T) {
+	mapper := "test-mapper"
+	fsResize := func(context.Context) error { return nil }
+
+	cases := []struct {
+		name           string
+		state          AttachState
+		wantErr        bool
+		wantMapper     string
+		wantFSResize   bool
+	}{
+		{"Attached_full_live", AttachStateAttached, false, mapper, true},
+		{"Detached_lv_only", AttachStateDetached, false, "", false},
+		// PartialMapperOnly is refused on purpose: the enum doesn't
+		// distinguish mapper-only from mapper+raw-fs-mounted, so resizing
+		// could leave a mounted raw fs un-grown. Caller retries after
+		// the reconciler completes the missing layer.
+		{"PartialMapperOnly_refuses", AttachStatePartialMapperOnly, true, "", false},
+		{"Foreign_refuses", AttachStateForeignMountAtPath, true, "", false},
+		{"Unknown_refuses", AttachStateUnknown, true, "", false},
+		{"Corrupted_refuses", AttachStateKernelStateCorrupted, true, "", false},
+		{"Stale_refuses", AttachStateStaleMountRecord, true, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			live, err := liveResizeFromState(tc.state, mapper, fsResize)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want error for state %s, got nil", tc.state)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for state %s: %v", tc.state, err)
+			}
+			if live.Mapper != tc.wantMapper {
+				t.Fatalf("mapper: got %q, want %q", live.Mapper, tc.wantMapper)
+			}
+			if (live.FSResize != nil) != tc.wantFSResize {
+				t.Fatalf("FSResize presence: got %v, want %v", live.FSResize != nil, tc.wantFSResize)
+			}
+		})
+	}
+}

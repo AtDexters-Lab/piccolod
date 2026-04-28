@@ -295,33 +295,32 @@ func TestModuleSetLockState_FailsClosedOnAmbiguous(t *testing.T) {
 
 // TestModuleSetLockState_RejectsZeroHandle pins codex iter-7 B1: at
 // startup, NewService calls setLockState(true) BEFORE ensureCoreVolumes
-// populates the controlHandle. If the handle is the zero VolumeHandle
-// (no canonical seed), classifyForDetach short-circuits as NoOp and the
-// strict wrapper returns nil — leaving lockState=true while a stale
-// post-crash control mapper can survive. NewService now seeds the
-// canonical handle pre-lock; this test guards against future regressions
-// that would re-introduce the zero-handle path.
+// populates the controlHandle. Pre-fix, the zero VolumeHandle classified
+// as NoOp and the strict wrapper returned nil — leaving lockState=true
+// while a stale post-crash control mapper could survive.
+//
+// Two layers of defense are now in place:
+//   (a) detachVolumeStrict refuses zero/incomplete handles up-front
+//       (this test) — structural close for the regression class.
+//   (b) NewService seeds the canonical handle before the first
+//       setLockState — keeps the strict path from ever firing with a
+//       zero handle in production.
+//
+// detachVolumeBestEffort retains the NoOp-on-zero-handle behavior so
+// shutdown paths don't wedge on a transient programmer error.
 func TestModuleSetLockState_RejectsZeroHandle(t *testing.T) {
 	t.Parallel()
 
-	// State the contract directly: a zero handle through detachVolumeStrict
-	// must NOT short-circuit silently. Two acceptable behaviors:
-	//   (a) detachVolumeStrict surfaces an error (preferred), or
-	//   (b) the caller never invokes strict detach with a zero handle.
-	// NewService now does (b) by seeding the canonical handle pre-lock.
-	// Verify by constructing a Module without seeding and asserting
-	// detachVolumeStrict's NoOp behavior is documented (current contract):
-	// it returns nil because the *intent* is "no handle = no work." This
-	// is the SAFE behavior only when callers guarantee a non-zero handle
-	// before invoking strict detach. The B1 regression was a caller-side
-	// bug; this test documents the API expectation rather than reshaping
-	// classifyForDetach (which would break legitimate "uninitialized
-	// volumes" callers in tests).
 	vol := &stubVolumeManager{}
 	mod := &Module{volumes: vol}
-	// Zero handle — NoOp returns nil by design.
-	if err := mod.detachVolumeStrict(context.Background(), VolumeHandle{}); err != nil {
-		t.Fatalf("zero-handle strict detach should return nil (NoOp class), got %v", err)
+	// Zero handle — strict wrapper now refuses, fail-closed.
+	if err := mod.detachVolumeStrict(context.Background(), VolumeHandle{}); err == nil {
+		t.Fatalf("zero-handle strict detach must error (was silent NoOp pre-fix); got nil")
+	}
+	// Best-effort wrapper still NoOps on zero-handle so shutdown paths
+	// don't wedge on a partial init.
+	if err := mod.detachVolumeBestEffort(context.Background(), VolumeHandle{}); err != nil {
+		t.Fatalf("zero-handle best-effort detach should return nil (NoOp class), got %v", err)
 	}
 	// Canonical handle (the post-fix shape) — would actually probe.
 	canonical := VolumeHandle{ID: "control-plane", MountDir: "/mounts/control-plane"}

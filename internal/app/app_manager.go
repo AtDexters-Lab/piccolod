@@ -604,8 +604,19 @@ func (m *AppManager) ObserveRuntimeEvents(bus *events.Bus) {
 				if payload.Locked {
 					m.markPendingRestore()
 				} else {
-					go m.RestoreServices(loopCtx)
-					go m.ReconcileOnce(loopCtx)
+					// Sequential post-unlock fan-out: restore proxies for
+					// already-running containers first, then reconcile toward
+					// desired state. Concurrent goroutines were race-safe
+					// (per-volume lock + AttachStateAttached short-circuit),
+					// but they raced on the same volumes for no benefit and
+					// made restore-vs-reconcile ordering observably
+					// non-deterministic. Sequencing avoids the redundant
+					// volume-attach work the loser would have done, and lets
+					// reconcile see the restored proxy state as input.
+					go func() {
+						m.RestoreServices(loopCtx)
+						m.ReconcileOnce(loopCtx)
+					}()
 				}
 			case <-ctx.Done():
 				return
