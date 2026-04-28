@@ -371,9 +371,14 @@ func (s *GinServer) handlePasskeyRegisterFinish(c *gin.Context) {
 		"rp_id":         cred.RPID,
 	})
 
+	// Surface the recovery-key gate so the post-registration flow (forced or
+	// voluntary) can route to the recovery screen on unack'd keys. The
+	// MustRegisterPasskey forcing path lands here and historically went
+	// straight to the dashboard without consulting the gate.
 	c.JSON(http.StatusOK, gin.H{
-		"credential_id": cred.ID,
-		"created_at":    cred.CreatedAt.Format(time.RFC3339),
+		"credential_id":        cred.ID,
+		"created_at":           cred.CreatedAt.Format(time.RFC3339),
+		"recovery_key_pending": s.computeRecoveryKeyPending(c.Request.Context()),
 	})
 }
 
@@ -494,7 +499,12 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 		"rp_id":   rpID,
 	})
 
-	c.JSON(http.StatusOK, gin.H{"message": "ok"})
+	// Surface the recovery-key gate so the passkey-login flow can route to
+	// the recovery screen on unack'd keys, matching /auth/login's behavior.
+	c.JSON(http.StatusOK, gin.H{
+		"message":              "ok",
+		"recovery_key_pending": s.computeRecoveryKeyPending(c.Request.Context()),
+	})
 }
 
 // --- Passkey Management (authenticated) ---

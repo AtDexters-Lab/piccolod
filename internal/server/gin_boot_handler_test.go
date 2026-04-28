@@ -341,6 +341,129 @@ func TestLogin_RecoveryKeyPendingFalseWhenAcked(t *testing.T) {
 	}
 }
 
+// TestRecoveryKeyGenerate_RefusesRotationOnAckedKey guards REC-FOLLOWUP:
+// /generate must refuse to rotate an already-acknowledged recovery key
+// without explicit force_rotate. Without this, any false-positive on the
+// recovery_key_pending gate (transient DB error, race, locked-state misclass)
+// triggers the UI to call /generate, which would silently invalidate the
+// operator's saved paper words.
+func TestRecoveryKeyGenerate_RefusesRotationOnAckedKey(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	srv.authRepo = &fakeAuthRepo{
+		staleness: persistence.AuthStaleness{RecoveryAckAt: time.Now().UTC()},
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/generate",
+		strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 conflict on acked-key rotation; got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != ErrRecoveryKeyAlreadyAcked {
+		t.Fatalf("expected error=%s; got %v", ErrRecoveryKeyAlreadyAcked, resp["error"])
+	}
+}
+
+// TestRecoveryKeyGenerate_AllowsRotationWithForceFlag verifies that explicit
+// rotations (e.g., a future Settings → Rotate Recovery Key flow) bypass the
+// REC-FOLLOWUP guard with force_rotate=true.
+func TestRecoveryKeyGenerate_AllowsRotationWithForceFlag(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	srv.authRepo = &fakeAuthRepo{
+		staleness: persistence.AuthStaleness{RecoveryAckAt: time.Now().UTC()},
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/generate",
+		strings.NewReader(`{"force_rotate":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with force_rotate=true; got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestRecoveryKeyGenerate_AllowsRotationOnUnackedKey verifies that the
+// timeout-recovery scenario still works: server has a key written but never
+// acked → /generate rotates and returns fresh words (operator never had
+// paper from the old key).
+func TestRecoveryKeyGenerate_AllowsRotationOnUnackedKey(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	srv.authRepo = &fakeAuthRepo{} // RecoveryAckAt zero — unack'd
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/generate",
+		strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on unack'd-key rotation; got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if _, ok := resp["words"]; !ok {
+		t.Fatalf("expected words in response; got %v", resp)
+	}
+}
+
+// TestRecoveryKeyGenerate_RefusesOnAckStateUnknown guards the fail-closed
+// posture of the REC-FOLLOWUP guard: if we cannot read the ack state
+// (locked, transient DB error, repo nil), rotation is refused rather than
+// silently destroying the operator's saved words. Mirrors the conservative
+// posture computeRecoveryKeyPending takes for the gate-decision side.
+func TestRecoveryKeyGenerate_RefusesOnAckStateUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"ErrLocked", persistence.ErrLocked},
+		{"transient", errors.New("transient db failure")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := createGinTestServer(t, t.TempDir())
+			sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+			if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+				t.Fatalf("GenerateRecoveryKey: %v", err)
+			}
+			srv.authRepo = &fakeAuthRepo{loadErr: tc.err}
+
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/generate",
+				strings.NewReader(`{}`))
+			req.Header.Set("Content-Type", "application/json")
+			attachAuth(req, sessionCookie, csrfToken)
+			srv.router.ServeHTTP(w, req)
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503 fail-closed on unknown ack state; got %d body=%s", w.Code, w.Body.String())
+			}
+			var resp map[string]any
+			_ = json.Unmarshal(w.Body.Bytes(), &resp)
+			if resp["error"] != ErrAckStateUnknown {
+				t.Fatalf("expected error=%s; got %v", ErrAckStateUnknown, resp["error"])
+			}
+		})
+	}
+}
+
 // TestRecoveryKeyAck_DeniedDuringForcedPasskeyRegistration guards the C7
 // belt-and-suspenders contract: state-mutating handlers under the
 // /crypto/recovery-key/ prefix must reject sessions with MustRegisterPasskey

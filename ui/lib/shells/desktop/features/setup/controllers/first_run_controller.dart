@@ -405,8 +405,18 @@ class FirstRunController extends ChangeNotifier {
 
   // --- Recovery key proceed ---
 
+  bool _recoveryEntryFromPasskey = false;
+
   void proceedAfterRecovery() {
     unawaited(ackRecoveryKey());
+    if (_recoveryEntryFromPasskey) {
+      // Post-passkey-registration recovery: passkey ceremony already
+      // succeeded, the forcing gate is cleared. Routing to passkeyRequired
+      // would loop the operator into another registration screen; jump
+      // straight to setup completion.
+      onComplete();
+      return;
+    }
     if (isOnRemoteDomain()) {
       _step = FirstRunStep.passkeyRequired;
     } else {
@@ -432,7 +442,25 @@ class FirstRunController extends ChangeNotifier {
 
       final credential = await WebAuthnService.createCredential(options);
 
-      await _api.finishPasskeyRegistration(sessionId, credential);
+      final finishResp = await _api.finishPasskeyRegistration(sessionId, credential);
+
+      // First-run passkey registration historically skipped the recovery-key
+      // gate. Honor it now so an operator who reaches this step on a device
+      // with an unack'd recovery key sees the words before landing on the
+      // dashboard. generateRecoveryKey() returns null on transient 409/503
+      // (handled at router level) so a server-side false-positive or
+      // staleness-read failure won't misattribute as a passkey error.
+      if (finishResp['recovery_key_pending'] == true) {
+        final words = await generateRecoveryKey();
+        if (words != null) {
+          _recoveryWords = words;
+          _step = FirstRunStep.recoveryKey;
+          _recoveryEntryFromPasskey = true;
+          if (!_disposed) notifyListeners();
+          return true;
+        }
+      }
+
       onComplete();
       return true;
     } on ApiException catch (e) {

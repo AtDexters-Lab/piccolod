@@ -25,6 +25,14 @@ const (
 	errorCodeStorageInitFailed   = "storage_init_failed"
 	errorCodeStorageUnlockFailed = "storage_unlock_failed"
 	errorCodeStorageEmergency    = "storage_emergency"
+
+	// ErrRecoveryKeyAlreadyAcked: /recovery-key/generate refused to rotate
+	// because the existing key is acknowledged. Caller must pass
+	// force_rotate=true if rotation is genuinely intended.
+	ErrRecoveryKeyAlreadyAcked = "recovery_key_already_acked"
+	// ErrAckStateUnknown: /recovery-key/generate could not read the ack
+	// state to verify rotation safety. Treated as transient by callers.
+	ErrAckStateUnknown = "ack_state_unknown"
 )
 
 // stripNumberedPrefixes removes tokens like "1.", "2", "24." that appear
@@ -633,14 +641,40 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "not initialized"})
 		return
 	}
-	// Optional body: { password }
+	// Optional body: { password, force_rotate }
 	var body struct {
-		Password string `json:"password"`
+		Password    string `json:"password"`
+		ForceRotate bool   `json:"force_rotate"`
 	}
 	_ = c.ShouldBindJSON(&body)
+	// Refuse to rotate an already-acknowledged recovery key without explicit
+	// force_rotate. Closes the REC-FOLLOWUP root cause: `recovery_key_pending`
+	// can spuriously flip true (transient DB error, locked-state misclass,
+	// etc.) — without this guard, the UI's response is to call /generate,
+	// which would rotate and silently invalidate the operator's saved paper
+	// words. The unack'd-key path stays rotation-friendly because the
+	// operator never had paper words from that key (UI didn't display them
+	// or display failed), so generating fresh is harmless. Fail-closed on
+	// read errors mirrors computeRecoveryKeyPending's conservative posture.
+	keyExists := s.cryptoManager.HasRecoveryKey()
+	if keyExists && !body.ForceRotate {
+		st, err := s.readAuthStaleness(c.Request.Context())
+		switch {
+		case errors.Is(err, persistence.ErrLocked):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": ErrAckStateUnknown})
+			return
+		case err != nil:
+			log.Printf("WARN: recovery-key generate ack-state read: %v", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": ErrAckStateUnknown})
+			return
+		case !st.RecoveryAckAt.IsZero():
+			c.JSON(http.StatusConflict, gin.H{"error": ErrRecoveryKeyAlreadyAcked})
+			return
+		}
+	}
 	var words []string
 	var err error
-	rotating := s.cryptoManager.HasRecoveryKey()
+	rotating := keyExists
 	// Prefer unlocked path; else use direct with password
 	if !s.cryptoManager.IsLocked() {
 		words, err = s.cryptoManager.GenerateRecoveryKey(rotating)

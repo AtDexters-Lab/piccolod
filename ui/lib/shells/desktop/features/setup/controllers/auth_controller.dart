@@ -231,15 +231,9 @@ class AuthController extends ChangeNotifier {
     );
     await _api.fetchCsrfToken();
 
-    // First-run: generate recovery key before any routing. The server
-    // re-evaluates the gate at login time; treat that as authoritative when
-    // present (covers the locked-boot-then-unlock chain where the boot
-    // snapshot is suppressed by file-presence-only fallback). Fall back to
-    // the constructor value only if the field is absent (older server).
-    final pending = resp is Map && resp.containsKey('recovery_key_pending')
-        ? resp['recovery_key_pending'] == true
-        : recoveryKeyPending;
-    if (pending) {
+    // First-run: generate recovery key before any routing. Server is
+    // authoritative when present; constructor fallback only for older builds.
+    if (_resolvePending(resp is Map ? resp.cast<String, dynamic>() : null)) {
       final words = await generateRecoveryKey();
       if (words != null) {
         _recoveryWords = words;
@@ -271,11 +265,14 @@ class AuthController extends ChangeNotifier {
 
       final credential = await WebAuthnService.getCredential(options);
 
-      await _api.finishPasskeyLogin(sessionId, credential);
+      final finishResp = await _api.finishPasskeyLogin(sessionId, credential);
       await _api.fetchCsrfToken();
 
-      // First-run: generate recovery key before any routing.
-      if (recoveryKeyPending) {
+      // Locked-then-unlock-via-passkey didn't go through /system/boot since
+      // login, so the constructor-time recoveryKeyPending may be stale —
+      // _resolvePending centralizes the server-authoritative-with-fallback
+      // rule.
+      if (_resolvePending(finishResp)) {
         final words = await generateRecoveryKey();
         if (words != null) {
           _recoveryWords = words;
@@ -320,7 +317,23 @@ class AuthController extends ChangeNotifier {
 
       final credential = await WebAuthnService.createCredential(options);
 
-      await _api.finishPasskeyRegistration(sessionId, credential);
+      final finishResp = await _api.finishPasskeyRegistration(sessionId, credential);
+
+      // The MustRegisterPasskey forcing path lands here and used to skip
+      // the recovery-key gate entirely. If the server says the key is
+      // unack'd, route through the recovery-key step before completing.
+      // generateRecoveryKey() returns null on transient 409/503 (handled
+      // at router level) so a server-side false-positive on the gate or a
+      // staleness-read failure won't misattribute as a passkey error.
+      if (finishResp['recovery_key_pending'] == true) {
+        final words = await generateRecoveryKey();
+        if (words != null) {
+          _recoveryWords = words;
+          _step = AuthStep.recoveryKey;
+          if (!_disposed) notifyListeners();
+          return true;
+        }
+      }
 
       if (await _completeAuthAndRedirect(null)) return true;
 
@@ -332,8 +345,7 @@ class AuthController extends ChangeNotifier {
       // passkey for this RP), so treat 409 as a soft success and transition
       // forward. Without this the user stays on PasskeyRequiredStep with an
       // error message despite the gate being cleared.
-      if (e.statusCode == 409 &&
-          extractServerError(e.message) == 'passkey_already_registered') {
+      if (isApiError(e, 409, ServerErrorCode.passkeyAlreadyRegistered)) {
         if (await _completeAuthAndRedirect(null)) return true;
         onComplete();
         return true;
@@ -376,6 +388,18 @@ class AuthController extends ChangeNotifier {
       if (!_disposed) notifyListeners();
       return false;
     }
+  }
+
+  /// Server-authoritative-with-fallback rule for the recovery-key gate. When
+  /// the server includes recovery_key_pending in its response, that is the
+  /// definitive answer (the server re-evaluates the gate at login time, so
+  /// it sees post-unlock state the constructor-time boot snapshot misses).
+  /// The recoveryKeyPending fallback handles the "older server" case only.
+  bool _resolvePending(Map<String, dynamic>? resp) {
+    if (resp != null && resp.containsKey('recovery_key_pending')) {
+      return resp['recovery_key_pending'] == true;
+    }
+    return recoveryKeyPending;
   }
 
   // --- Recovery key proceed ---

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
+import 'package:piccolo_os/core/services/error_reporter.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/controllers/auth_controller.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/controllers/first_run_controller.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/controllers/invite_controller.dart';
@@ -394,6 +395,35 @@ class _SetupRouterState extends State<SetupRouter> {
       return null;
     } on ApiException catch (e) {
       if (e.statusCode == 403) return null; // Not admin — skip silently.
+      // 409 recovery_key_already_acked: server refuses to rotate an
+      // already-acknowledged key without explicit force_rotate. The gate
+      // that brought us here was a false positive (transient DB error,
+      // race, etc.) — skip the recovery-key step and let the caller
+      // route forward. Mark generated so we don't retry on this controller.
+      if (isApiError(e, 409, ServerErrorCode.recoveryKeyAlreadyAcked)) {
+        // Telemetry: the gate told us pending=true but the server holds an
+        // ack — false-positive on the gate (transient err, race, etc.). The
+        // user sees no recovery-key screen on this skip, so observability
+        // is the only signal that the gate's confidence was wrong.
+        ErrorReporter().report(
+          type: 'recovery_key_already_acked',
+          message: 'pending-true but server has ack; skipped silently',
+        );
+        _recoveryKeyGenerated = true;
+        return null;
+      }
+      // 503 ack_state_unknown: server couldn't read the ack state to verify
+      // rotation safety. Treat as transient skip — gate re-evaluates next
+      // sign-in. Without this catch, password/passkey login flows that
+      // routed here on a stale pending=true surface the 503 as an auth
+      // failure even though the session was already created.
+      if (isApiError(e, 503, ServerErrorCode.ackStateUnknown)) {
+        ErrorReporter().report(
+          type: 'recovery_key_ack_state_unknown',
+          message: 'transient staleness read failure; recovery skipped',
+        );
+        return null;
+      }
       rethrow;
     }
   }

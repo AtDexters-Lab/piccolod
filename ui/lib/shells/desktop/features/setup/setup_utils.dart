@@ -7,6 +7,23 @@ import 'package:piccolo_os/core/services/error_reporter.dart';
 /// Phases within the crypto setup operation (displayed by FinishingStep).
 enum SetupPhase { encrypting, creatingAdmin, generatingKey }
 
+/// Server-emitted error codes consumed by the UI. Mirror of Go consts in
+/// internal/server/gin_crypto_handlers.go (ErrRecoveryKeyAlreadyAcked etc.)
+/// — keep both sides in sync; a typo on either fails open silently.
+class ServerErrorCode {
+  static const recoveryKeyAlreadyAcked = 'recovery_key_already_acked';
+  static const ackStateUnknown = 'ack_state_unknown';
+  static const passkeyAlreadyRegistered = 'passkey_already_registered';
+}
+
+/// Matches an ApiException by both HTTP status and structured error string.
+/// Centralizes the two-clause `e.statusCode == X && extractServerError(...) == Y`
+/// pattern that previously duplicated across call sites — a typo on either
+/// clause used to fail-open silently (rethrow path), now compile-checked.
+bool isApiError(ApiException e, int status, String code) {
+  return e.statusCode == status && extractServerError(e.message) == code;
+}
+
 /// Records that the operator has seen and saved the current recovery-key words.
 /// Without this, recovery_key_pending stays true on next boot only by file
 /// presence — but a UI timeout between the server writing keyset.json and the
@@ -99,7 +116,7 @@ String friendlyApiError(ApiException e) {
   // Benign duplicate on /register/finish — the authenticator already has a
   // credential for this account and we correctly refused to insert a second
   // row. Surface a non-destructive message.
-  if (e.statusCode == 409 && serverMsg == 'passkey_already_registered') {
+  if (e.statusCode == 409 && serverMsg == ServerErrorCode.passkeyAlreadyRegistered) {
     return 'This device already has a passkey for this account. Try signing '
         'in with your existing passkey, or use a different device.';
   }
