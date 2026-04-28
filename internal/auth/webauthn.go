@@ -69,6 +69,7 @@ const (
 const (
 	ceremonyMaxCapacity = 200
 	ceremonyTTL         = 120 * time.Second
+	ceremonyIDBytes     = 32 // 256-bit ceremony session ID
 )
 
 // WebAuthnManager handles WebAuthn registration and authentication ceremonies.
@@ -494,7 +495,7 @@ func (s *ceremonyStore) Store(cs *ceremonySession) (string, error) {
 		return "", ErrCeremonyStoreFull
 	}
 
-	id, err := generateSecureToken()
+	id, err := cryptoutil.GenerateSecureToken(ceremonyIDBytes)
 	if err != nil {
 		return "", err
 	}
@@ -518,10 +519,6 @@ func (s *ceremonyStore) Consume(id string) (*ceremonySession, error) {
 	}
 	delete(s.sessions, id)
 	return cs, nil
-}
-
-func generateSecureToken() (string, error) {
-	return cryptoutil.GenerateSecureToken(32)
 }
 
 func truncate(s string, maxLen int) string {

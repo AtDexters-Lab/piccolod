@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"piccolod/internal/cryptoutil"
 	"piccolod/internal/persistence"
 )
 
@@ -15,7 +16,10 @@ var (
 	ErrInviteConsumed = errors.New("invite already consumed")
 )
 
-const inviteTTL = 7 * 24 * time.Hour // 7 days
+const (
+	inviteTTL        = 7 * 24 * time.Hour // 7 days
+	inviteTokenBytes = 32                 // 256-bit invite token
+)
 
 // InviteManager manages magic link invite tokens for passwordless user onboarding.
 type InviteManager struct {
@@ -52,7 +56,7 @@ func (m *InviteManager) CreateInvite(ctx context.Context, input CreateInviteInpu
 		return "", nil, fmt.Errorf("create user: %w", err)
 	}
 
-	token, err := generateSecureToken()
+	token, err := cryptoutil.GenerateSecureToken(inviteTokenBytes)
 	if err != nil {
 		return "", nil, fmt.Errorf("generate token: %w", err)
 	}
@@ -137,7 +141,7 @@ func (m *InviteManager) ReinviteUser(ctx context.Context, userID, createdBy stri
 	// Revoke any existing unconsumed invites for this user
 	_ = m.tokenRepo.DeleteByUser(ctx, userID)
 
-	token, err := generateSecureToken()
+	token, err := cryptoutil.GenerateSecureToken(inviteTokenBytes)
 	if err != nil {
 		return "", fmt.Errorf("generate token: %w", err)
 	}

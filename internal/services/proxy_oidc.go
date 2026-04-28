@@ -85,7 +85,7 @@ func (s *OIDCStateStore) Create(state *OIDCState) error {
 	}
 
 	// Generate state ID
-	stateID, err := generateSecureToken(stateTokenBytes)
+	stateID, err := cryptoutil.GenerateSecureToken(stateTokenBytes)
 	if err != nil {
 		return fmt.Errorf("failed to generate state ID: %w", err)
 	}
@@ -229,7 +229,7 @@ func IsReservedPath(path string) bool {
 // Returns the redirect URL to the authorization endpoint.
 func (h *ProxyOIDCHandler) InitiateOIDCFlow(w http.ResponseWriter, r *http.Request, appName string, endpoint ServiceEndpoint) {
 	// Generate PKCE code verifier and challenge
-	codeVerifier, err := generateSecureToken(codeVerifierBytes)
+	codeVerifier, err := cryptoutil.GenerateSecureToken(codeVerifierBytes)
 	if err != nil {
 		log.Printf("ERROR: proxy OIDC: failed to generate code verifier: %v", err)
 		writeProxyJSONError(w, http.StatusInternalServerError, "internal_error", "OIDC_INIT_FAILED")
@@ -568,11 +568,6 @@ func (h *ProxyOIDCHandler) renderAccessDenied(w http.ResponseWriter, r *http.Req
 // ProxyClientID returns the OIDC client ID for an app's proxy client.
 func ProxyClientID(appName string) string {
 	return proxyClientIDPrefix + appName + proxyClientIDSuffix
-}
-
-// generateSecureToken generates a cryptographically secure random token.
-func generateSecureToken(length int) (string, error) {
-	return cryptoutil.GenerateSecureToken(length)
 }
 
 // computeCodeChallenge computes the PKCE code challenge using S256 method.
