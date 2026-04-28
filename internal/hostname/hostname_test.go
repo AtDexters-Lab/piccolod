@@ -6,6 +6,33 @@ import (
 	"piccolod/internal/api"
 )
 
+func TestIsValidDNSLabel(t *testing.T) {
+	tests := []struct {
+		label string
+		want  bool
+	}{
+		{"my-device", true},
+		{"a", true},
+		{"abc123", true},
+		{"a-b-c", true},
+		{"", false},
+		{"-leading", false},
+		{"trailing-", false},
+		{"UPPER", false},
+		{"under_score", false},
+		{"has space", false},
+		{"has.dot", false},
+		{string(make([]byte, 64)), false}, // 64 chars, too long
+	}
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			if got := IsValidDNSLabel(tt.label); got != tt.want {
+				t.Errorf("IsValidDNSLabel(%q) = %v, want %v", tt.label, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNormalize(t *testing.T) {
 	tests := []struct {
 		input string

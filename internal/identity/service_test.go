@@ -824,29 +824,3 @@ func TestSuggestedHostname_ClearedBySetNamekURL(t *testing.T) {
 	}
 }
 
-func TestIsValidDNSLabel(t *testing.T) {
-	tests := []struct {
-		label string
-		want  bool
-	}{
-		{"my-device", true},
-		{"a", true},
-		{"abc123", true},
-		{"a-b-c", true},
-		{"", false},
-		{"-leading", false},
-		{"trailing-", false},
-		{"UPPER", false},
-		{"under_score", false},
-		{"has space", false},
-		{"has.dot", false},
-		{string(make([]byte, 64)), false}, // 64 chars, too long
-	}
-	for _, tt := range tests {
-		t.Run(tt.label, func(t *testing.T) {
-			if got := isValidDNSLabel(tt.label); got != tt.want {
-				t.Errorf("isValidDNSLabel(%q) = %v, want %v", tt.label, got, tt.want)
-			}
-		})
-	}
-}

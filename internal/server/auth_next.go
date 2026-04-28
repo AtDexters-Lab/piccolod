@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"piccolod/internal/hostname"
 	"piccolod/internal/services"
 )
 
@@ -53,7 +54,7 @@ func (s *GinServer) validateNextURL(raw string) (string, bool) {
 		return "", false
 	}
 
-	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(u.Hostname()), "."))
+	host := hostname.Normalize(u.Hostname())
 	if host == "" {
 		return "", false
 	}
@@ -69,7 +70,7 @@ func (s *GinServer) validateNextURL(raw string) (string, bool) {
 
 	localHostname := ""
 	if s.mdnsManager != nil {
-		localHostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s.mdnsManager.Hostname()), "."))
+		localHostname = hostname.Normalize(s.mdnsManager.Hostname())
 	}
 
 	allowedPorts := make(map[int]struct{})

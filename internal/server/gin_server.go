@@ -941,7 +941,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if s == nil || s.remoteManager == nil {
 				return false
 			}
-			h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+			h := hostnamepkg.Normalize(host)
 			if h == "" || hostLabel == "" {
 				return false
 			}
@@ -952,7 +952,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 				if a.Listener != hostLabel {
 					continue
 				}
-				aliasHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(a.Hostname)), ".")
+				aliasHost := hostnamepkg.Normalize(a.Hostname)
 				if aliasHost != "" && strings.EqualFold(h, aliasHost) {
 					return true
 				}
@@ -1035,7 +1035,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if rm == nil {
 				return
 			}
-			h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+			h := hostnamepkg.Normalize(host)
 			if h == "" {
 				return
 			}
@@ -1079,7 +1079,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if base == "" {
 				return
 			}
-			portal := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(st.PortalHostname)), ".")
+			portal := hostnamepkg.Normalize(st.PortalHostname)
 			if portal != "" && h == portal {
 				return
 			}
@@ -1090,7 +1090,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			if i := strings.Index(label, "."); i != -1 {
 				label = label[:i]
 			}
-			if label == "" || !isValidDNSLabel(label) {
+			if label == "" || !hostnamepkg.IsValidDNSLabel(label) {
 				return
 			}
 			// Only queue a cert if an active service endpoint exists for this label.
@@ -2325,14 +2325,14 @@ func remotePortalBase(status *remote.Status) string {
 	if status == nil {
 		return ""
 	}
-	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(status.PortalHostname)), ".")
+	base := hostnamepkg.Normalize(status.PortalHostname)
 	if base == "" {
 		return ""
 	}
 	if h, _, err := net.SplitHostPort(base); err == nil {
 		base = h
 	}
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
+	return hostnamepkg.Normalize(base)
 }
 
 // contextAwareRemoteHost returns the remote hostname for the endpoint derived from
@@ -2575,7 +2575,7 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 
 	// Set self-hosted remote bases on resolver and TLS mux
 	if status.Enabled && strings.TrimSpace(status.PortalHostname) != "" {
-		portal := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(status.PortalHostname)), ".")
+		portal := hostnamepkg.Normalize(status.PortalHostname)
 		if s.remoteResolver != nil {
 			s.remoteResolver.SetRemoteBases("self-hosted", []remoteBase{
 				{source: "self-hosted", portalHost: portal, domain: portal},

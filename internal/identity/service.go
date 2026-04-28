@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"piccolod/internal/events"
+	hostnamepkg "piccolod/internal/hostname"
 	"piccolod/internal/mdns"
 	"piccolod/internal/tpm"
 
@@ -1264,7 +1265,7 @@ func (s *Service) fetchSuggestedHostname() {
 
 	if info.CustomHostname != nil && *info.CustomHostname != "" {
 		hostname := strings.ToLower(*info.CustomHostname)
-		if !isValidDNSLabel(hostname) {
+		if !hostnamepkg.IsValidDNSLabel(hostname) {
 			log.Printf("WARN: identity: suggested hostname %q from server is not a valid DNS label, ignoring", hostname)
 			return
 		}
@@ -1279,25 +1280,6 @@ func (s *Service) fetchSuggestedHostname() {
 			log.Printf("INFO: identity: suggested hostname %q discarded (hostname already claimed)", hostname)
 		}
 	}
-}
-
-// isValidDNSLabel rejects server-provided hostnames that would fail DNS resolution
-// or confuse the setup UI. Deliberately lowercase-only — callers must ToLower first.
-func isValidDNSLabel(label string) bool {
-	if label == "" || len(label) > 63 {
-		return false
-	}
-	if label[0] == '-' || label[len(label)-1] == '-' {
-		return false
-	}
-	for i := 0; i < len(label); i++ {
-		ch := label[i]
-		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
-			continue
-		}
-		return false
-	}
-	return true
 }
 
 func (s *Service) syncDeviceMeta(info *namekclient.DeviceInfo) {

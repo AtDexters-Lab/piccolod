@@ -42,6 +42,26 @@ func Normalize(h string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), ".")
 }
 
+// IsValidDNSLabel reports whether label is a valid single DNS label
+// (1-63 chars, lowercase letters/digits/hyphens, no leading/trailing hyphen).
+// Callers must lowercase first; this function does not normalize.
+func IsValidDNSLabel(label string) bool {
+	if label == "" || len(label) > 63 {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		ch := label[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // ValidateAppName validates an app name per RFC 20260122 Section 4.3 and RFC 20260130.
 // Rules:
 // - Must start with a letter

@@ -253,7 +253,7 @@ func (s *GinServer) removePerAppCertsForBase(base string) {
 
 func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, base string) map[string]struct{} {
 	hosts := map[string]struct{}{}
-	base = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(base)), ".")
+	base = hostname.Normalize(base)
 	if base == "" {
 		return hosts
 	}
@@ -267,23 +267,6 @@ func remoteHostsForEndpoints(endpoints []services.ServiceEndpoint, base string) 
 		hosts[host] = struct{}{}
 	}
 	return hosts
-}
-
-func isValidDNSLabel(label string) bool {
-	if label == "" || len(label) > 63 {
-		return false
-	}
-	if label[0] == '-' || label[len(label)-1] == '-' {
-		return false
-	}
-	for i := 0; i < len(label); i++ {
-		ch := label[i]
-		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' {
-			continue
-		}
-		return false
-	}
-	return true
 }
 
 // APIError represents a structured API error response

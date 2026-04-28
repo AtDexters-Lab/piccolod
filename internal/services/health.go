@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"piccolod/internal/api"
+	"piccolod/internal/hostname"
 )
 
 // ListenerHealthStatus represents the overall health state of a listener.
@@ -288,7 +289,7 @@ func RemoteServiceHostname(derivedHostLabel, portalHostname string) string {
 	if derivedHostLabel == "" {
 		return ""
 	}
-	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(portalHostname)), ".")
+	base := hostname.Normalize(portalHostname)
 	if h, _, err := net.SplitHostPort(base); err == nil {
 		base = h
 	}
