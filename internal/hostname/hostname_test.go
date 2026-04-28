@@ -15,13 +15,18 @@ func TestIsValidDNSLabel(t *testing.T) {
 		{"a", true},
 		{"abc123", true},
 		{"a-b-c", true},
+		// Mixed case accepted: function lowercases internally per its contract.
+		{"UPPER", true},
+		{"My-Device", true},
 		{"", false},
 		{"-leading", false},
 		{"trailing-", false},
-		{"UPPER", false},
 		{"under_score", false},
 		{"has space", false},
 		{"has.dot", false},
+		{"café", false},                 // non-ASCII rune in UTF-8 bytes
+		{"a\x00b", false},               // NUL byte
+		{"a\x01b", false},               // control char
 		{string(make([]byte, 64)), false}, // 64 chars, too long
 	}
 	for _, tt := range tests {

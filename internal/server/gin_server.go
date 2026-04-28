@@ -2332,6 +2332,10 @@ func remotePortalBase(status *remote.Status) string {
 	if h, _, err := net.SplitHostPort(base); err == nil {
 		base = h
 	}
+	// Re-normalize after SplitHostPort: the first Normalize can't strip a
+	// trailing dot when a port suffix is present ("example.com.:443" — the
+	// trailing char is '3', not '.'), so SplitHostPort returns "example.com."
+	// with the dot intact. Downstream suffix checks expect no trailing dot.
 	return hostnamepkg.Normalize(base)
 }
 

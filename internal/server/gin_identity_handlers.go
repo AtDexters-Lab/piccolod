@@ -129,6 +129,9 @@ func (s *GinServer) validateAndSetHostname(ctx context.Context, c *gin.Context) 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		return "", err
 	}
+	// Normalize before validation: trailing dot, whitespace, mixed case all
+	// canonicalize rather than 400. "my-device." and "My-Device" both store
+	// as "my-device". TestNormalize pins "example.com." → "example.com".
 	req.Hostname = hostnamepkg.Normalize(req.Hostname)
 	if req.Hostname != "" && !hostnamepkg.IsValidDNSLabel(req.Hostname) {
 		return "", fmt.Errorf("hostname must be a valid DNS label (lowercase alphanumeric and hyphens, 1-63 chars, no leading/trailing hyphens)")

@@ -43,12 +43,13 @@ func Normalize(h string) string {
 }
 
 // IsValidDNSLabel reports whether label is a valid single DNS label
-// (1-63 chars, lowercase letters/digits/hyphens, no leading/trailing hyphen).
-// Callers must lowercase first; this function does not normalize.
+// (1-63 chars, ASCII letters/digits/hyphens, no leading/trailing hyphen).
+// Mixed case is accepted; the function lowercases internally.
 func IsValidDNSLabel(label string) bool {
 	if label == "" || len(label) > 63 {
 		return false
 	}
+	label = strings.ToLower(label)
 	if label[0] == '-' || label[len(label)-1] == '-' {
 		return false
 	}

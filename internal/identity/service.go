@@ -1264,7 +1264,7 @@ func (s *Service) fetchSuggestedHostname() {
 	}
 
 	if info.CustomHostname != nil && *info.CustomHostname != "" {
-		hostname := strings.ToLower(*info.CustomHostname)
+		hostname := hostnamepkg.Normalize(*info.CustomHostname)
 		if !hostnamepkg.IsValidDNSLabel(hostname) {
 			log.Printf("WARN: identity: suggested hostname %q from server is not a valid DNS label, ignoring", hostname)
 			return
