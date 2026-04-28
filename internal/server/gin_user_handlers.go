@@ -308,6 +308,12 @@ func (s *GinServer) handleSetUserPassword(c *gin.Context) {
 
 // getSessionFromContext retrieves the validated portal session from the gin context.
 // RFC 20260122 §6.2: Validates audience="portal" and origin binding.
+//
+// Handlers that operate outside the requireSession middleware (public OIDC,
+// boot, login flows) and those that admit the /crypto/recovery-key/ prefix
+// during the bootstrap window MUST NOT use this helper to gate access — it
+// silently ignores MustRegisterPasskey. Use sessionGate instead so the gate
+// state is a type-level return the caller cannot drop accidentally.
 func (s *GinServer) getSessionFromContext(c *gin.Context) *auth.Session {
 	id, ok := s.getSession(c)
 	if !ok {
@@ -319,4 +325,26 @@ func (s *GinServer) getSessionFromContext(c *gin.Context) *auth.Session {
 		return nil
 	}
 	return sess
+}
+
+// sessionGate returns the validated portal session and whether it is in the
+// MustRegisterPasskey bootstrap window (D-10 forcing-gate). The two-value
+// signature exists to make the gate state a type-level return: a caller that
+// reads a session at all must also acknowledge the gate (even if to ignore
+// it via `_`), which closes the bug class where a new handler reads the
+// session and forgets the gate (closure for project_deferred_findings_passkey_cohesive_fix.md
+// deferred 2 / "Cluster A root cause").
+//
+//   - (nil, false): no validated session — caller decides whether that's OK
+//     (login flows, public endpoints).
+//   - (sess, true): session valid and gated — caller MUST refuse with the
+//     response shape appropriate to the route (403 passkey_registration_required
+//     for API, 302 to portal root for OIDC authorize, etc.).
+//   - (sess, false): session valid and not gated — proceed.
+func (s *GinServer) sessionGate(c *gin.Context) (*auth.Session, bool) {
+	sess := s.getSessionFromContext(c)
+	if sess == nil {
+		return nil, false
+	}
+	return sess, sess.MustRegisterPasskey.Load()
 }

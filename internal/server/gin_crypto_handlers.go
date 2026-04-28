@@ -629,13 +629,11 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 	// MustRegisterPasskey=true, this handler refuses. Closes both the D-1
 	// extension and the pre-existing variant where an attacker with the
 	// password could rotate the recovery key during normal bootstrap.
-	if id, ok := s.getSession(c); ok {
-		if sess, sok := s.sessions.Get(id); sok && sess.MustRegisterPasskey.Load() {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "passkey_registration_required",
-			})
-			return
-		}
+	if _, gated := s.sessionGate(c); gated {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "passkey_registration_required",
+		})
+		return
 	}
 	if s.cryptoManager == nil || !s.cryptoManager.IsInitialized() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "not initialized"})
@@ -734,11 +732,9 @@ func (s *GinServer) handleCryptoRecoveryKeyAck(c *gin.Context) {
 	// a stolen-admin-password attacker in the bootstrap window could ack the
 	// recovery key, suppressing the boot-time prompt that REC-1 exists to
 	// surface to the legitimate operator.
-	if id, ok := s.getSession(c); ok {
-		if sess, sok := s.sessions.Get(id); sok && sess.MustRegisterPasskey.Load() {
-			c.JSON(http.StatusForbidden, gin.H{"error": "passkey_registration_required"})
-			return
-		}
+	if _, gated := s.sessionGate(c); gated {
+		c.JSON(http.StatusForbidden, gin.H{"error": "passkey_registration_required"})
+		return
 	}
 	ctx, cancel := s.opContext(c, 30*time.Second)
 	defer cancel()

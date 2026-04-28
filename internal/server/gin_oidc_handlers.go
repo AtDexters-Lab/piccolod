@@ -357,7 +357,7 @@ func (s *GinServer) handleOIDCAuthorize(c *gin.Context) {
 	// relative redirect would land on the app's root rather than piccolod's
 	// bootscreen.
 	if clientID != "" {
-		if sess := s.getSessionFromContext(c); sess != nil && sess.MustRegisterPasskey.Load() {
+		if sess, gated := s.sessionGate(c); gated {
 			slog.Warn("OIDC authorize: session in MustRegisterPasskey bootstrap; refusing fast-path",
 				"user_id", sess.UserID,
 				"client_id", clientID,

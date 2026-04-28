@@ -8,7 +8,100 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
+
+// TestSessionGate_ContractAllThreeStates pins the three-state contract of
+// `(*GinServer).sessionGate`: (nil, false) when no session, (sess, true) when
+// gated, (sess, false) when ungated. The helper is the type-level surface that
+// closes the bug class where a handler reads a session and forgets to check
+// MustRegisterPasskey (deferred passkey-cohesive-fix #2 / "Cluster A root cause").
+func TestSessionGate_ContractAllThreeStates(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+
+	t.Run("no_session_returns_nil_false", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/", nil)
+		c, _ := gin.CreateTestContext(w)
+		c.Request = req
+		sess, gated := srv.sessionGate(c)
+		if sess != nil || gated {
+			t.Fatalf("no session: want (nil, false), got (%v, %v)", sess, gated)
+		}
+	})
+
+	sessionCookie, _ := setupTestAdminSession(t, srv)
+
+	t.Run("session_ungated_returns_sess_false", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/", nil)
+		req.AddCookie(sessionCookie)
+		c, _ := gin.CreateTestContext(w)
+		c.Request = req
+		sess, gated := srv.sessionGate(c)
+		if sess == nil {
+			t.Fatalf("ungated: want non-nil session")
+		}
+		if gated {
+			t.Fatalf("ungated: want gated=false, got true")
+		}
+	})
+
+	t.Run("session_gated_returns_sess_true", func(t *testing.T) {
+		stored, ok := srv.sessions.Get(sessionCookie.Value)
+		if !ok {
+			t.Fatalf("session not found")
+		}
+		stored.MustRegisterPasskey.Store(true)
+		defer stored.MustRegisterPasskey.Store(false)
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/", nil)
+		req.AddCookie(sessionCookie)
+		c, _ := gin.CreateTestContext(w)
+		c.Request = req
+		sess, gated := srv.sessionGate(c)
+		if sess == nil {
+			t.Fatalf("gated: want non-nil session (caller may need user_id for logging)")
+		}
+		if !gated {
+			t.Fatalf("gated: want gated=true, got false")
+		}
+	})
+
+	// Pin the strictness delta vs the prior `getSession + sessions.Get`
+	// pattern: sessionGate routes through ValidatePortalSession, which
+	// rejects a session whose BoundOrigin doesn't match the request origin.
+	// A future refactor that swaps sessionGate back to raw lookup would lose
+	// the cross-origin-replay defense; this case fails such a regression.
+	//
+	// Note: setupTestAdminSession creates a session with empty BoundOrigin
+	// (legacy/backwards-compat path that ValidatePortalSession admits per
+	// internal/auth/manager.go:531). To exercise the strict path we set a
+	// non-empty BoundOrigin and then mismatch it — that's the production
+	// shape (regular login flow always sets BoundOrigin).
+	t.Run("origin_mismatch_returns_nil_false", func(t *testing.T) {
+		stored, ok := srv.sessions.Get(sessionCookie.Value)
+		if !ok {
+			t.Fatalf("session not found")
+		}
+		original := stored.BoundOrigin
+		stored.BoundOrigin = "https://portal.example.invalid"
+		defer func() { stored.BoundOrigin = original }()
+
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/", nil)
+		req.AddCookie(sessionCookie)
+		req.Host = "evil.invalid"
+		c, _ := gin.CreateTestContext(w)
+		c.Request = req
+		sess, gated := srv.sessionGate(c)
+		if sess != nil || gated {
+			t.Fatalf("origin mismatch: want (nil, false) — session must NOT be admitted past validation; got (%v, %v)", sess, gated)
+		}
+	})
+}
 
 // TestOIDCAuthorize_BlockedUnderMustRegisterPasskey mirrors plan test #22 for
 // the OIDC authorize endpoint. D-10's forcing-gate must prevent a
