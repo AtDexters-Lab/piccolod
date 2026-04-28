@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	authpkg "piccolod/internal/auth"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -81,17 +83,38 @@ func TestHandleTelemetryLog(t *testing.T) {
 		}
 	})
 
-	t.Run("unknown_type_skipped", func(t *testing.T) {
+	t.Run("novel_type_accepted", func(t *testing.T) {
+		// Allowlists defeat unknown-unknown discovery; the regex is the only gate.
 		r, _ := setupTelemetryTestRouter()
 		w := postTelemetry(r, telemetryRequest{
 			Entries: []telemetryEntry{
-				{Type: "unknown_type", Message: "test"},
+				{Type: "brand_new_signal_2099", Message: "from a future build"},
 			},
 			Session: telemetrySession{PiccoloVersion: "dev"},
 		})
-		// Still returns 202 — unknown types are silently skipped
 		if w.Code != http.StatusAccepted {
 			t.Errorf("got status %d, want %d", w.Code, http.StatusAccepted)
+		}
+	})
+
+	t.Run("malformed_type_skipped", func(t *testing.T) {
+		r, _ := setupTelemetryTestRouter()
+		for _, badType := range []string{
+			"",
+			"UPPER_CASE",
+			"has-dash",
+			"has space",
+			"123leading_digit",
+			"_leading_underscore",
+			strings.Repeat("a", 65), // exceeds 64-char ceiling
+		} {
+			w := postTelemetry(r, telemetryRequest{
+				Entries: []telemetryEntry{{Type: badType, Message: "test"}},
+				Session: telemetrySession{PiccoloVersion: "dev"},
+			})
+			if w.Code != http.StatusAccepted {
+				t.Errorf("type %q: got status %d, want %d (still 202; malformed entries skipped)", badType, w.Code, http.StatusAccepted)
+			}
 		}
 	})
 
@@ -126,9 +149,9 @@ func TestHandleTelemetryLog(t *testing.T) {
 		}
 	})
 
-	t.Run("all_known_types_accepted", func(t *testing.T) {
+	t.Run("common_types_accepted", func(t *testing.T) {
 		r, _ := setupTelemetryTestRouter()
-		for _, typ := range []string{"flutter_error", "async_error", "web_error", "js_rejection", "jank"} {
+		for _, typ := range []string{"flutter_error", "async_error", "web_error", "js_rejection", "jank", "passkey_error", "render_error"} {
 			w := postTelemetry(r, telemetryRequest{
 				Entries: []telemetryEntry{
 					{Type: typ, Message: "test " + typ, Count: 1},
@@ -151,6 +174,46 @@ func TestHandleTelemetryLog(t *testing.T) {
 		})
 		if w.Code != http.StatusAccepted {
 			t.Errorf("got status %d, want %d", w.Code, http.StatusAccepted)
+		}
+	})
+}
+
+// TestCSRFExemption_TelemetryLog verifies the CSRF middleware lets
+// POST /api/v1/telemetry/log through without a token. sendBeacon (the
+// durable-flush path the UI uses) cannot carry custom headers; if this
+// regresses, every flushImmediate=true entry is silently dropped at the
+// gate, which is exactly what the durability work was meant to prevent.
+func TestCSRFExemption_TelemetryLog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	s := &GinServer{sessions: authpkg.NewSessionStore()}
+	sess := s.sessions.CreateWithUserInfo("admin", "admin", "admin", 3600)
+	r.Use(s.csrfMiddleware())
+	r.POST("/api/v1/telemetry/log", s.handleTelemetryLog)
+	r.POST("/api/v1/other", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	t.Run("telemetry_post_bypasses_csrf", func(t *testing.T) {
+		body, _ := json.Marshal(telemetryRequest{
+			Entries: []telemetryEntry{{Type: "passkey_error", Message: "test"}},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/telemetry/log", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sess.ID})
+		// No X-CSRF-Token header — exactly what sendBeacon cannot send.
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusAccepted {
+			t.Errorf("telemetry POST without CSRF: got %d body=%s, want 202 (exemption regressed)", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("non_telemetry_post_still_requires_csrf", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/other", nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sess.ID})
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("other POST without CSRF: got %d, want 403 (exemption is too broad)", w.Code)
 		}
 	})
 }

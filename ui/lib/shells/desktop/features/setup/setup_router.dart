@@ -408,6 +408,7 @@ class _SetupRouterState extends State<SetupRouter> {
         ErrorReporter().report(
           type: 'recovery_key_already_acked',
           message: 'pending-true but server has ack; skipped silently',
+          flushImmediate: true,
         );
         _recoveryKeyGenerated = true;
         return null;
@@ -421,6 +422,7 @@ class _SetupRouterState extends State<SetupRouter> {
         ErrorReporter().report(
           type: 'recovery_key_ack_state_unknown',
           message: 'transient staleness read failure; recovery skipped',
+          flushImmediate: true,
         );
         return null;
       }

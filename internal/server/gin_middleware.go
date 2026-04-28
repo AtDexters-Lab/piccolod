@@ -278,6 +278,17 @@ func (s *GinServer) csrfMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		// Telemetry POST is exempt: navigator.sendBeacon (the durable path
+		// for end-of-life flushes) has no header-customization API and so
+		// can't carry X-CSRF-Token. Telemetry is append-only journal
+		// logging — it grants no additional capability to an attacker who
+		// already has the session cookie, and it's already gated by
+		// requireSession + requireAdmin upstream. The cookie alone is the
+		// authentication boundary we care about here.
+		if c.Request.Method == http.MethodPost && c.Request.URL.Path == "/api/v1/telemetry/log" {
+			c.Next()
+			return
+		}
 		id, ok := s.getSession(c)
 		if !ok {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})

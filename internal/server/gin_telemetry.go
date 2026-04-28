@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -22,18 +23,11 @@ const (
 	telemetryMaxScreenLen  = 16
 )
 
-var telemetryKnownTypes = map[string]bool{
-	"flutter_error": true,
-	"async_error":   true,
-	"web_error":     true,
-	"js_rejection":  true,
-	"jank":          true,
-	// passkey_error is emitted by setup_utils.dart and passkeys_controller.dart
-	// when a WebAuthn/Signal-API call throws. Caught-and-presented errors
-	// otherwise never leave the browser — this makes them visible in the
-	// journal for operator diagnosis.
-	"passkey_error": true,
-}
+// telemetryTypeRe constrains the type token shape; the shape is the only gate.
+// Allowlists defeat the purpose of telemetry — we want unknown-unknowns to land
+// in the journal, not be silently dropped because the backend hadn't heard of
+// them yet.
+var telemetryTypeRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 type telemetryRequest struct {
 	Entries []telemetryEntry `json:"entries"`
@@ -82,12 +76,8 @@ func (s *GinServer) handleTelemetryLog(c *gin.Context) {
 	screen := sanitizeTelemetryField(req.Session.Screen, telemetryMaxScreenLen)
 
 	for _, e := range req.Entries {
-		if !telemetryKnownTypes[e.Type] {
-			// Silently dropping was masking real client bugs (e.g. a stale
-			// build sending an unexpected type). Log at WARN so the presence
-			// of the POST is still visible even though we don't structure
-			// the full payload.
-			log.Printf("WARN: ui-telemetry dropped unknown type=%q msg=%q",
+		if !telemetryTypeRe.MatchString(e.Type) {
+			log.Printf("WARN: ui-telemetry dropped malformed type=%q msg=%q",
 				truncateTelemetryString(e.Type, 64),
 				truncateTelemetryString(sanitizeTelemetryField(e.Message, telemetryMaxMessageLen), 200))
 			continue
@@ -104,26 +94,31 @@ func (s *GinServer) handleTelemetryLog(c *gin.Context) {
 			count = 10000
 		}
 
+		// All client-supplied free-text fields use %q so embedded spaces or
+		// '=' can't spoof other fields when the journal line is grep'd. type
+		// is regex-bounded to [a-z0-9_]; count/ts are typed/format-validated.
 		parts := []string{
 			fmt.Sprintf("type=%s", e.Type),
 		}
 		if route != "" {
-			parts = append(parts, fmt.Sprintf("route=%s", route))
+			parts = append(parts, fmt.Sprintf("route=%q", route))
 		}
 		parts = append(parts, fmt.Sprintf("count=%d", count))
 		if ts != "" {
 			parts = append(parts, fmt.Sprintf("ts=%s", ts))
 		}
 		parts = append(parts, fmt.Sprintf("msg=%q", msg))
-		parts = append(parts, fmt.Sprintf("version=%s", version))
+		parts = append(parts, fmt.Sprintf("version=%q", version))
 		if screen != "" {
-			parts = append(parts, fmt.Sprintf("screen=%s", screen))
+			parts = append(parts, fmt.Sprintf("screen=%q", screen))
 		}
 
 		log.Printf("ui-telemetry: %s", strings.Join(parts, " "))
 
-		// Log stack trace for error types only
-		if e.Stack != "" && (e.Type == "flutter_error" || e.Type == "async_error" || e.Type == "web_error" || e.Type == "passkey_error") {
+		// Stack logging is conditioned on payload, not type — the client owns
+		// what's worth a stack. Volume is bounded by client-side fingerprint
+		// dedup (one stack per unique error per flush), not by the type list.
+		if e.Stack != "" {
 			stack := sanitizeTelemetryField(e.Stack, telemetryMaxStackLen)
 			log.Printf("ui-telemetry-stack: type=%s msg=%q stack=%q", e.Type, truncateTelemetryString(msg, 80), stack)
 		}
