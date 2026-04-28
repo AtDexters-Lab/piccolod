@@ -40,6 +40,17 @@ class ServerErrorCode {
   static const recoveryKeyAlreadyAcked = 'recovery_key_already_acked';
   static const ackStateUnknown = 'ack_state_unknown';
   static const passkeyAlreadyRegistered = 'passkey_already_registered';
+  static const staleRecoveryKeyID = 'stale_recovery_key_id';
+}
+
+/// Recovery-key generate response — words alongside their version anchor.
+/// REC-4: keyId binds /generate to /ack so a multi-tab rotation race or a
+/// delayed fire-and-forget ack from a stale tab cannot mark a *rotated*
+/// key as acked. Callers MUST propagate keyId verbatim into ackRecoveryKey.
+class RecoveryKeyMaterial {
+  const RecoveryKeyMaterial({required this.words, required this.keyId});
+  final List<String> words;
+  final String keyId;
 }
 
 /// Matches an ApiException by both HTTP status and structured error string.
@@ -63,13 +74,59 @@ bool isApiError(ApiException e, int status, String code) {
 /// Persistent failure beyond the retry budget logs and gives up; the operator
 /// will be re-prompted on next reload, which is the correct fail-closed
 /// posture even though it costs them an extra recovery-key save.
-Future<void> ackRecoveryKey() async {
+///
+/// REC-4: keyId binds the acknowledgement to the specific recovery-key
+/// version the operator was shown (returned by /recovery-key/generate). The
+/// server rejects with 409 stale_recovery_key_id when the supplied id
+/// doesn't match the current SDEKRK fingerprint — closes the multi-tab
+/// rotation race + the silent-ack-failure resurrection class. An empty
+/// keyId is rejected by the server (400 key_id required); callers must
+/// propagate the value from /generate verbatim.
+Future<void> ackRecoveryKey(String keyId) async {
+  if (keyId.isEmpty) {
+    // Caller bug — _recoveryKeyID was never populated (controller path
+    // displayed words without going through _generateRecoveryKey, or the
+    // material was discarded between capture and ack). The server would
+    // 400 on every retry; short-circuit to surface the bug in telemetry
+    // instead of burning the retry budget on a deterministic failure.
+    ErrorReporter().report(
+      type: 'recovery_key_ack_missing_key_id',
+      message: 'ackRecoveryKey called with empty keyId — caller plumbing bug',
+      flushImmediate: true,
+    );
+    return;
+  }
   const attempts = 3;
   const backoff = [Duration(milliseconds: 500), Duration(seconds: 2)];
   for (var i = 0; i < attempts; i++) {
     try {
-      await ApiClient().post('/api/v1/crypto/recovery-key/ack');
+      await ApiClient().post(
+        '/api/v1/crypto/recovery-key/ack',
+        body: <String, dynamic>{'key_id': keyId},
+      );
       return;
+    } on ApiException catch (e) {
+      // 409 stale_recovery_key_id is deterministic — another tab rotated
+      // the key between /generate and /ack, or the keyset on disk does
+      // not match the words this tab is showing. Retrying loses the retry
+      // budget against an answer that will not change. Short-circuit to
+      // telemetry; operator is re-prompted on next reload with current
+      // words. Distinct UX (a banner explaining the rotation rather than
+      // a silent re-prompt) is REC-3 territory; not in cluster 8 scope.
+      if (isApiError(e, 409, ServerErrorCode.staleRecoveryKeyID)) {
+        ErrorReporter().report(
+          type: 'recovery_key_ack_stale',
+          message: 'ack rejected — key rotated between generate and ack',
+          flushImmediate: true,
+        );
+        return;
+      }
+      if (i == attempts - 1) {
+        debugPrint('Recovery-key ack failed after $attempts attempts '
+            '(will re-prompt on reload): $e');
+        return;
+      }
+      await Future<void>.delayed(backoff[i]);
     } on Object catch (e) {
       if (i == attempts - 1) {
         debugPrint('Recovery-key ack failed after $attempts attempts '

@@ -32,8 +32,8 @@ class AuthController extends ChangeNotifier {
   bool recoveryKeyPending;
   final String? authRequestId;
   final String? nextUrl;
-  /// Router-owned guard: returns words on success, null on skip/timeout.
-  final Future<List<String>?> Function() generateRecoveryKey;
+  /// Router-owned guard: returns words+keyId on success, null on skip/timeout.
+  final Future<RecoveryKeyMaterial?> Function() generateRecoveryKey;
 
   final ApiClient _api = ApiClient();
   bool _disposed = false;
@@ -55,6 +55,10 @@ class AuthController extends ChangeNotifier {
 
   List<String> _recoveryWords = [];
   List<String> get recoveryWords => _recoveryWords;
+
+  // REC-4: keyId companion to _recoveryWords so proceedAfterRecovery can
+  // bind the ack to the version the operator actually saw.
+  String _recoveryKeyID = '';
 
   @override
   void dispose() {
@@ -140,9 +144,10 @@ class AuthController extends ChangeNotifier {
     }
     try {
       await _api.fetchCsrfToken();
-      final words = await generateRecoveryKey();
-      if (words != null) {
-        _recoveryWords = words;
+      final material = await generateRecoveryKey();
+      if (material != null) {
+        _recoveryWords = material.words;
+        _recoveryKeyID = material.keyId;
         _setupPhase = null;
         _step = AuthStep.recoveryKey;
         return;
@@ -387,9 +392,10 @@ class AuthController extends ChangeNotifier {
   /// reflects the step change without relying on the caller's later notify.
   Future<bool> _showRecoveryKeyIfPending(bool pending) async {
     if (!pending) return false;
-    final words = await generateRecoveryKey();
-    if (words == null) return false;
-    _recoveryWords = words;
+    final material = await generateRecoveryKey();
+    if (material == null) return false;
+    _recoveryWords = material.words;
+    _recoveryKeyID = material.keyId;
     _step = AuthStep.recoveryKey;
     if (!_disposed) notifyListeners();
     return true;
@@ -404,8 +410,9 @@ class AuthController extends ChangeNotifier {
     // would race the navigation and may never reach the server, leaving
     // RecoveryAckAt=zero and the operator re-prompted with rotated words
     // on next sign-in.
+    final keyId = _recoveryKeyID;
     unawaited(() async {
-      await ackRecoveryKey();
+      await ackRecoveryKey(keyId);
       if (_disposed) return;
       reRoute();
     }());

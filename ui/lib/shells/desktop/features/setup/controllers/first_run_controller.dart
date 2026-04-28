@@ -42,7 +42,7 @@ class FirstRunController extends ChangeNotifier {
   final VoidCallback onComplete;
   final VoidCallback reRoute;
   final void Function(String error) onSystemError;
-  final Future<List<String>?> Function() generateRecoveryKey;
+  final Future<RecoveryKeyMaterial?> Function() generateRecoveryKey;
 
   String? _setupNonce;
   final ApiClient _api = ApiClient();
@@ -61,6 +61,9 @@ class FirstRunController extends ChangeNotifier {
 
   List<String> _recoveryWords = [];
   List<String> get recoveryWords => _recoveryWords;
+
+  // REC-4: keyId companion to _recoveryWords for ack binding (see ack call sites).
+  String _recoveryKeyID = '';
 
   // Hostname claim state
   bool _settingHostname = false;
@@ -293,9 +296,10 @@ class FirstRunController extends ChangeNotifier {
       await _api.fetchCsrfToken().timeout(timeout);
 
       // Generate recovery key
-      final words = await generateRecoveryKey();
-      if (words != null) {
-        _recoveryWords = words;
+      final material = await generateRecoveryKey();
+      if (material != null) {
+        _recoveryWords = material.words;
+        _recoveryKeyID = material.keyId;
         _setupPhase = null;
         _step = FirstRunStep.recoveryKey;
       } else {
@@ -305,7 +309,7 @@ class FirstRunController extends ChangeNotifier {
         reRoute();
       }
       if (!_disposed) notifyListeners();
-      return words != null;
+      return material != null;
     } on TimeoutException {
       _setupPhase = null;
       try {
@@ -371,9 +375,10 @@ class FirstRunController extends ChangeNotifier {
       if (screen == 'desktop' || screen == 'passkey_required') {
         await _api.fetchCsrfToken();
         if (rkPending) {
-          final words = await generateRecoveryKey();
-          if (words != null) {
-            _recoveryWords = words;
+          final material = await generateRecoveryKey();
+          if (material != null) {
+            _recoveryWords = material.words;
+            _recoveryKeyID = material.keyId;
             _step = FirstRunStep.recoveryKey;
             if (!_disposed) notifyListeners();
             return;
@@ -403,7 +408,7 @@ class FirstRunController extends ChangeNotifier {
   bool _recoveryEntryFromPasskey = false;
 
   void proceedAfterRecovery() {
-    unawaited(ackRecoveryKey());
+    unawaited(ackRecoveryKey(_recoveryKeyID));
     if (_recoveryEntryFromPasskey) {
       // Post-passkey-registration recovery: passkey ceremony already
       // succeeded, the forcing gate is cleared. Routing to passkeyRequired
@@ -446,9 +451,10 @@ class FirstRunController extends ChangeNotifier {
       // (handled at router level) so a server-side false-positive or
       // staleness-read failure won't misattribute as a passkey error.
       if (finishResp['recovery_key_pending'] == true) {
-        final words = await generateRecoveryKey();
-        if (words != null) {
-          _recoveryWords = words;
+        final material = await generateRecoveryKey();
+        if (material != null) {
+          _recoveryWords = material.words;
+          _recoveryKeyID = material.keyId;
           _step = FirstRunStep.recoveryKey;
           _recoveryEntryFromPasskey = true;
           if (!_disposed) notifyListeners();

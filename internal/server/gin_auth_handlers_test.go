@@ -392,7 +392,7 @@ func TestCryptoResetPasswordFlow(t *testing.T) {
 	}
 
 	// Generate recovery key
-	words, err := srv.cryptoManager.GenerateRecoveryKeyWithPassword("OrigPass123!", false)
+	words, _, err := srv.cryptoManager.GenerateRecoveryKeyWithPassword("OrigPass123!", false)
 	if err != nil {
 		t.Fatalf("generate recovery key: %v", err)
 	}
@@ -453,7 +453,7 @@ func TestCryptoRecoveryKeyGenerateRotatesAndClearsStaleness(t *testing.T) {
 
 	// Crypto is already initialized by setupTestAdminSession via /crypto/setup
 	// Generate initial recovery key with the same password
-	initialWords, err := srv.cryptoManager.GenerateRecoveryKeyWithPassword("TestPass123!", false)
+	initialWords, _, err := srv.cryptoManager.GenerateRecoveryKeyWithPassword("TestPass123!", false)
 	if err != nil {
 		t.Fatalf("initial generate: %v", err)
 	}

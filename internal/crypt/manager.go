@@ -2,11 +2,14 @@ package crypt
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -343,22 +346,28 @@ func (m *Manager) RewrapUnlocked(newPassword string) error {
 
 // Recovery key management using BIP39 (256-bit entropy, 24 words).
 
-func (m *Manager) GenerateRecoveryKey(force bool) ([]string, error) {
+// GenerateRecoveryKey generates fresh recovery-mnemonic words, wraps the
+// SDEK with a key derived from them, and persists keyset.json. Returns the
+// words AND the key fingerprint (REC-4 anchor). The fingerprint is computed
+// inside the write lock from the just-constructed SDEKRK ciphertext: this
+// closes the race where a concurrent /generate could rotate past us between
+// release and a separate fingerprint read, mismatching words against id.
+func (m *Manager) GenerateRecoveryKey(force bool) ([]string, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.inited {
-		return nil, errors.New("not initialized")
+		return nil, "", errors.New("not initialized")
 	}
 	b, err := os.ReadFile(m.path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var st fileState
 	if err := json.Unmarshal(b, &st); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if st.SDEKRK != "" && !force {
-		return nil, errors.New("recovery key already set")
+		return nil, "", errors.New("recovery key already set")
 	}
 	// Use plaintext SDEK if already unlocked; otherwise require password via helper
 	var sdek []byte
@@ -366,29 +375,29 @@ func (m *Manager) GenerateRecoveryKey(force bool) ([]string, error) {
 		sdek = make([]byte, len(m.sdek))
 		copy(sdek, m.sdek)
 	} else {
-		return nil, errors.New("unlock required")
+		return nil, "", errors.New("unlock required")
 	}
 	// Generate BIP39 mnemonic (256-bit entropy → 24 words)
 	entropy, err := bip39.NewEntropy(256)
 	if err != nil {
-		return nil, fmt.Errorf("entropy generation failed: %w", err)
+		return nil, "", fmt.Errorf("entropy generation failed: %w", err)
 	}
 	mnemonic, err := bip39.NewMnemonic(entropy)
 	if err != nil {
-		return nil, fmt.Errorf("mnemonic generation failed: %w", err)
+		return nil, "", fmt.Errorf("mnemonic generation failed: %w", err)
 	}
 	words := strings.Split(mnemonic, " ")
 	// Derive RK key from mnemonic with new salt
 	rkSalt := make([]byte, 16)
 	if _, err := rand.Read(rkSalt); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	rkParams := st.KDF
 	rkKey := m.deriveKey(mnemonic, rkSalt, rkParams)
 	aead, _ := newAES256GCM(rkKey)
 	rkNonce := make([]byte, aead.NonceSize())
 	if _, err := rand.Read(rkNonce); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	rkCT := aead.Seal(nil, rkNonce, sdek, nil)
 	st.RKSalt = base64.RawStdEncoding.EncodeToString(rkSalt)
@@ -397,31 +406,46 @@ func (m *Manager) GenerateRecoveryKey(force bool) ([]string, error) {
 	// Save
 	nb, _ := json.MarshalIndent(&st, "", "  ")
 	if err := fsutil.AtomicWriteFile(m.path, nb, 0o600); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return words, nil
+	keyID := fingerprintSDEKRK(st.SDEKRK)
+	return words, keyID, nil
 }
 
-// GenerateRecoveryKeyWithPassword unlocks SDEK using provided password and sets recovery wrapper.
-func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) ([]string, error) {
+// fingerprintSDEKRK derives the REC-4 key_id anchor from a base64-encoded
+// SDEKRK ciphertext. Single source of truth so /generate (computed inside
+// the write lock) and RecoveryKeyID() (read-only fingerprint of on-disk
+// state) cannot drift.
+func fingerprintSDEKRK(sdekrkB64 string) string {
+	if sdekrkB64 == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(sdekrkB64))
+	return hex.EncodeToString(sum[:8])
+}
+
+// GenerateRecoveryKeyWithPassword unlocks SDEK using provided password and
+// sets recovery wrapper. Returns words + REC-4 key fingerprint (computed
+// inside the write lock — same race-closure rationale as GenerateRecoveryKey).
+func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) ([]string, string, error) {
 	if password == "" {
-		return nil, errors.New("password required")
+		return nil, "", errors.New("password required")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.inited {
-		return nil, errors.New("not initialized")
+		return nil, "", errors.New("not initialized")
 	}
 	b, err := os.ReadFile(m.path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var st fileState
 	if err := json.Unmarshal(b, &st); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if st.SDEKRK != "" && !force {
-		return nil, errors.New("recovery key already set")
+		return nil, "", errors.New("recovery key already set")
 	}
 	salt, _ := base64.RawStdEncoding.DecodeString(st.Salt)
 	key := m.deriveKey(password, salt, st.KDF)
@@ -430,27 +454,27 @@ func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) (
 	ct, _ := base64.RawStdEncoding.DecodeString(st.SDEK)
 	pt, err := aead.Open(nil, nonce, ct, nil)
 	if err != nil {
-		return nil, errors.New("invalid password")
+		return nil, "", errors.New("invalid password")
 	}
 	// Generate BIP39 mnemonic (256-bit entropy → 24 words)
 	entropy, err := bip39.NewEntropy(256)
 	if err != nil {
-		return nil, fmt.Errorf("entropy generation failed: %w", err)
+		return nil, "", fmt.Errorf("entropy generation failed: %w", err)
 	}
 	mnemonic, err := bip39.NewMnemonic(entropy)
 	if err != nil {
-		return nil, fmt.Errorf("mnemonic generation failed: %w", err)
+		return nil, "", fmt.Errorf("mnemonic generation failed: %w", err)
 	}
 	words := strings.Split(mnemonic, " ")
 	rkSalt := make([]byte, 16)
 	if _, err := rand.Read(rkSalt); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	rkKey := m.deriveKey(mnemonic, rkSalt, st.KDF)
 	aead2, _ := newAES256GCM(rkKey)
 	rkNonce := make([]byte, aead2.NonceSize())
 	if _, err := rand.Read(rkNonce); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	rkCT := aead2.Seal(nil, rkNonce, pt, nil)
 	st.RKSalt = base64.RawStdEncoding.EncodeToString(rkSalt)
@@ -458,9 +482,10 @@ func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) (
 	st.SDEKRK = base64.RawStdEncoding.EncodeToString(rkCT)
 	nb, _ := json.MarshalIndent(&st, "", "  ")
 	if err := fsutil.AtomicWriteFile(m.path, nb, 0o600); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return words, nil
+	keyID := fingerprintSDEKRK(st.SDEKRK)
+	return words, keyID, nil
 }
 
 func (m *Manager) HasRecoveryKey() bool {
@@ -475,6 +500,40 @@ func (m *Manager) HasRecoveryKey() bool {
 		return false
 	}
 	return st.SDEKRK != ""
+}
+
+// RecoveryKeyID returns a stable fingerprint of the current recovery-key
+// material — the first 16 hex chars of SHA-256(SDEKRK ciphertext). It changes
+// whenever the recovery key rotates (new RKSalt + RKNonce produce new
+// SDEKRK ciphertext under the same SDEK plaintext). Empty string when no
+// recovery key is set or the keyset file cannot be read.
+//
+// Used by /recovery-key/generate (returned alongside words) and
+// /recovery-key/ack (required in request body) to bind the operator's
+// acknowledgement to the specific words they were shown — closes REC-4
+// (multi-tab rotation race).
+func (m *Manager) RecoveryKeyID() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	b, err := os.ReadFile(m.path)
+	if err != nil {
+		// Corruption + permanent-empty-fingerprint mode: every /ack will 409.
+		// Operator stays in re-prompt loop. Surface at WARN so operators
+		// triaging "I cannot ack my recovery key" see the underlying I/O
+		// fault rather than chasing the symptom. Distinct from the
+		// no-recovery-key-yet case (read succeeds, SDEKRK empty), which is
+		// a normal pre-generation state.
+		if !os.IsNotExist(err) {
+			log.Printf("WARN: RecoveryKeyID: keyset read failed: %v", err)
+		}
+		return ""
+	}
+	var st fileState
+	if err := json.Unmarshal(b, &st); err != nil {
+		log.Printf("WARN: RecoveryKeyID: keyset unmarshal failed: %v", err)
+		return ""
+	}
+	return fingerprintSDEKRK(st.SDEKRK)
 }
 
 func (m *Manager) UnlockWithRecoveryKey(words []string) error {

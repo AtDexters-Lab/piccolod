@@ -671,13 +671,18 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 		}
 	}
 	var words []string
+	var keyID string
 	var err error
 	rotating := keyExists
-	// Prefer unlocked path; else use direct with password
+	// Prefer unlocked path; else use direct with password.
+	// REC-4: keyID is returned atomically by GenerateRecoveryKey under its
+	// write lock — pairing with words from the same call. Computing the id
+	// here via a separate RecoveryKeyID() read would reintroduce the
+	// concurrent-rotation race the binding is designed to close.
 	if !s.cryptoManager.IsLocked() {
-		words, err = s.cryptoManager.GenerateRecoveryKey(rotating)
+		words, keyID, err = s.cryptoManager.GenerateRecoveryKey(rotating)
 	} else if strings.TrimSpace(body.Password) != "" {
-		words, err = s.cryptoManager.GenerateRecoveryKeyWithPassword(body.Password, rotating)
+		words, keyID, err = s.cryptoManager.GenerateRecoveryKeyWithPassword(body.Password, rotating)
 	} else {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unlock required"})
 		return
@@ -713,7 +718,12 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 		log.Printf("WARN: failed to clear recovery staleness: %v", err)
 	}
 	s.publishAuditEvent(c, "auth.recovery_key_generate", map[string]any{"rotated": rotating})
-	c.JSON(http.StatusOK, gin.H{"words": words})
+	// REC-4: keyID is paired with words by GenerateRecoveryKey under its
+	// write lock. Do not re-derive from RecoveryKeyID() here — a concurrent
+	// /generate from another tab can rotate past us between lock release
+	// and the read, returning words from generation A but key_id of
+	// generation B. The /ack would then accept the wrong-words tab's id.
+	c.JSON(http.StatusOK, gin.H{"words": words, "key_id": keyID})
 }
 
 // handleCryptoRecoveryKeyAck: POST /api/v1/crypto/recovery-key/ack
@@ -734,6 +744,36 @@ func (s *GinServer) handleCryptoRecoveryKeyAck(c *gin.Context) {
 	// surface to the legitimate operator.
 	if _, gated := s.sessionGate(c); gated {
 		c.JSON(http.StatusForbidden, gin.H{"error": "passkey_registration_required"})
+		return
+	}
+	// REC-4: bind ack to the specific recovery-key version the operator was
+	// shown. Without this binding, a multi-tab rotation race or a delayed
+	// fire-and-forget ack from a stale tab can mark a *rotated* key as acked,
+	// suppressing the boot-time prompt for the operator who never saw the
+	// new words. The server rejects with 409 stale_recovery_key_id when the
+	// supplied key_id doesn't match the current SDEKRK fingerprint; the UI
+	// surfaces this as a "your saved words are out of date — view current"
+	// flow rather than silently advancing.
+	var ackBody struct {
+		KeyID string `json:"key_id"`
+	}
+	_ = c.ShouldBindJSON(&ackBody)
+	suppliedID := strings.TrimSpace(ackBody.KeyID)
+	if suppliedID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "key_id required"})
+		return
+	}
+	currentID := s.cryptoManager.RecoveryKeyID()
+	if currentID == "" {
+		// No recovery key on disk — nothing to ack against. Either an
+		// out-of-band reset cleared it or /generate has never run; either way
+		// /ack is meaningless. 409 over 400 because the request shape is
+		// valid; only the server state is wrong.
+		c.JSON(http.StatusConflict, gin.H{"error": "stale_recovery_key_id"})
+		return
+	}
+	if suppliedID != currentID {
+		c.JSON(http.StatusConflict, gin.H{"error": "stale_recovery_key_id"})
 		return
 	}
 	ctx, cancel := s.opContext(c, 30*time.Second)

@@ -337,7 +337,7 @@ class _SetupRouterState extends State<SetupRouter> {
 
   // --- Recovery key generation (router-level guard) ---
 
-  Future<List<String>?> _generateRecoveryKey() async {
+  Future<RecoveryKeyMaterial?> _generateRecoveryKey() async {
     if (_recoveryKeyGenerated) return null;
     try {
       final recoveryData = await _api.post(
@@ -346,7 +346,23 @@ class _SetupRouterState extends State<SetupRouter> {
       ).timeout(const Duration(seconds: 120)) as Map<String, dynamic>?;
       if (recoveryData != null && recoveryData['words'] != null) {
         _recoveryKeyGenerated = true;
-        return List<String>.from(recoveryData['words'] as Iterable<dynamic>);
+        // REC-4: server is required to return key_id alongside words. Empty
+        // key_id surfaces as a hard skip — without it, /ack will 400 and the
+        // operator gets re-prompted on next reload, which is the correct
+        // fail-closed posture for a contract violation.
+        final keyId = (recoveryData['key_id'] as String?) ?? '';
+        if (keyId.isEmpty) {
+          ErrorReporter().report(
+            type: 'recovery_key_generate_missing_key_id',
+            message: '/generate response missing key_id; ack will fail',
+            flushImmediate: true,
+          );
+          return null;
+        }
+        return RecoveryKeyMaterial(
+          words: List<String>.from(recoveryData['words'] as Iterable<dynamic>),
+          keyId: keyId,
+        );
       }
       return null;
     } on TimeoutException {
@@ -392,11 +408,12 @@ class _SetupRouterState extends State<SetupRouter> {
   Future<void> _handleRecoveryKeyThenPasskey() async {
     try {
       await _api.fetchCsrfToken();
-      final words = await _generateRecoveryKey();
-      if (words != null && mounted) {
-        _pendingRecoveryWords = words;
+      final material = await _generateRecoveryKey();
+      if (material != null && mounted) {
+        _pendingRecoveryWords = material.words;
+        final keyId = material.keyId;
         _pendingPostRecoveryAction = () {
-          unawaited(ackRecoveryKey());
+          unawaited(ackRecoveryKey(keyId));
           _pendingRecoveryWords = null;
           _pendingPostRecoveryAction = null;
           _createAuthController(AuthMode.passkeyRequired);
@@ -420,16 +437,17 @@ class _SetupRouterState extends State<SetupRouter> {
   Future<void> _handleRecoveryKeyThenComplete() async {
     try {
       await _api.fetchCsrfToken();
-      final words = await _generateRecoveryKey();
-      if (words != null && mounted) {
-        _pendingRecoveryWords = words;
+      final material = await _generateRecoveryKey();
+      if (material != null && mounted) {
+        _pendingRecoveryWords = material.words;
+        final keyId = material.keyId;
         _pendingPostRecoveryAction = () async {
           // Await the ack here — _resumeOIDCOrComplete below can assign
           // window.location.href, which aborts in-flight requests on the
           // page. A fire-and-forget ack would race the navigation and may
           // never reach the server, leaving RecoveryAckAt=zero and the
           // operator re-prompted with rotated words on next sign-in.
-          await ackRecoveryKey();
+          await ackRecoveryKey(keyId);
           if (!mounted) return;
           _pendingRecoveryWords = null;
           _pendingPostRecoveryAction = null;

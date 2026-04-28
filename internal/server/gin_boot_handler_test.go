@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -151,7 +152,7 @@ func TestBoot_Locked_DoesNotClaimRecoveryPending(t *testing.T) {
 
 	// Generate a recovery key, then lock crypto and inject the locked-state
 	// read failure (the real repo returns ErrLocked when locked).
-	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	srv.cryptoManager.Lock()
@@ -176,16 +177,21 @@ func TestBoot_Locked_DoesNotClaimRecoveryPending(t *testing.T) {
 
 // TestBoot_RecoveryPendingClearedAfterAck verifies the ack→gate contract:
 // post-setup with a recovery key generated but unacknowledged, boot reports
-// pending; once the operator acks via /crypto/recovery-key/ack, boot stops
-// reporting pending. This is the central guarantee REC-1 provides.
+// pending; once the operator acks via /crypto/recovery-key/ack with the
+// matching key_id, boot stops reporting pending. This is the central
+// guarantee REC-1 provides; REC-4 adds the key_id binding.
 func TestBoot_RecoveryPendingClearedAfterAck(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
-	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	repo := &fakeAuthRepo{} // RecoveryAckAt zero
 	srv.authRepo = repo
+	keyID := srv.cryptoManager.RecoveryKeyID()
+	if keyID == "" {
+		t.Fatalf("RecoveryKeyID() should be non-empty after GenerateRecoveryKey")
+	}
 
 	// Pre-ack: boot must report pending.
 	w := httptest.NewRecorder()
@@ -198,9 +204,11 @@ func TestBoot_RecoveryPendingClearedAfterAck(t *testing.T) {
 		t.Fatalf("pre-ack: expected recovery_key_pending=true, got %v body=%s", pre["recovery_key_pending"], w.Body.String())
 	}
 
-	// Ack via the new endpoint.
+	// Ack via the new endpoint, supplying the key_id the operator was shown.
 	w = httptest.NewRecorder()
-	req, _ = http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/ack", nil)
+	req, _ = http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/ack",
+		strings.NewReader(fmt.Sprintf(`{"key_id":%q}`, keyID)))
+	req.Header.Set("Content-Type", "application/json")
 	attachAuth(req, sessionCookie, csrfToken)
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -229,7 +237,7 @@ func TestBoot_RecoveryPendingClearedAfterAck(t *testing.T) {
 func TestBoot_RecoveryPendingFailClosedOnUnlockedReadError(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, _ := setupTestAdminSession(t, srv)
-	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	// Inject a fake auth repo that errors with a non-ErrLocked failure.
@@ -257,7 +265,7 @@ func TestBoot_RecoveryPendingFailClosedOnUnlockedReadError(t *testing.T) {
 func TestBoot_RecoveryNotPendingWhenAcked(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, _ := setupTestAdminSession(t, srv)
-	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	srv.authRepo = &fakeAuthRepo{
@@ -288,7 +296,7 @@ func TestBoot_RecoveryNotPendingWhenAcked(t *testing.T) {
 func TestLogin_SurfacesRecoveryKeyPendingForUnlockChain(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	setupTestAdminSession(t, srv) // initializes crypto + admin user
-	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	srv.authRepo = &fakeAuthRepo{} // RecoveryAckAt zero
@@ -315,7 +323,7 @@ func TestLogin_SurfacesRecoveryKeyPendingForUnlockChain(t *testing.T) {
 func TestLogin_RecoveryKeyPendingFalseWhenAcked(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	setupTestAdminSession(t, srv)
-	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	srv.authRepo = &fakeAuthRepo{
@@ -350,7 +358,7 @@ func TestLogin_RecoveryKeyPendingFalseWhenAcked(t *testing.T) {
 func TestRecoveryKeyGenerate_RefusesRotationOnAckedKey(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
-	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	srv.authRepo = &fakeAuthRepo{
@@ -379,7 +387,7 @@ func TestRecoveryKeyGenerate_RefusesRotationOnAckedKey(t *testing.T) {
 func TestRecoveryKeyGenerate_AllowsRotationWithForceFlag(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
-	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	srv.authRepo = &fakeAuthRepo{
@@ -404,7 +412,7 @@ func TestRecoveryKeyGenerate_AllowsRotationWithForceFlag(t *testing.T) {
 func TestRecoveryKeyGenerate_AllowsRotationOnUnackedKey(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
-	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	srv.authRepo = &fakeAuthRepo{} // RecoveryAckAt zero — unack'd
@@ -441,7 +449,7 @@ func TestRecoveryKeyGenerate_RefusesOnAckStateUnknown(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := createGinTestServer(t, t.TempDir())
 			sessionCookie, csrfToken := setupTestAdminSession(t, srv)
-			if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+			if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 				t.Fatalf("GenerateRecoveryKey: %v", err)
 			}
 			srv.authRepo = &fakeAuthRepo{loadErr: tc.err}
@@ -462,6 +470,101 @@ func TestRecoveryKeyGenerate_RefusesOnAckStateUnknown(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRecoveryKeyAck_REC4_KeyIDBinding pins the REC-4 contract: /ack must
+// supply a key_id that matches the current SDEKRK fingerprint, otherwise
+// the server refuses (400 if missing, 409 stale_recovery_key_id if mismatch).
+// Closes the multi-tab rotation race + the silent-ack-failure resurrection
+// class structurally — a stale tab acking with the OLD key_id can no longer
+// suppress the boot prompt the operator needs to see for the NEW key.
+func TestRecoveryKeyAck_REC4_KeyIDBinding(t *testing.T) {
+	post := func(t *testing.T, srv *GinServer, sessionCookie *http.Cookie, csrfToken, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		var req *http.Request
+		if body == "" {
+			req, _ = http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/ack", nil)
+		} else {
+			req, _ = http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/ack", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+		}
+		attachAuth(req, sessionCookie, csrfToken)
+		srv.router.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("missing_key_id_returns_400", func(t *testing.T) {
+		srv := createGinTestServer(t, t.TempDir())
+		sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+		if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+			t.Fatalf("GenerateRecoveryKey: %v", err)
+		}
+		srv.authRepo = &fakeAuthRepo{}
+
+		w := post(t, srv, sessionCookie, csrfToken, "")
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("missing key_id: want 400, got %d body=%s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("stale_key_id_returns_409", func(t *testing.T) {
+		srv := createGinTestServer(t, t.TempDir())
+		sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+		if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+			t.Fatalf("GenerateRecoveryKey: %v", err)
+		}
+		srv.authRepo = &fakeAuthRepo{}
+		// Capture the version Tab A would have received.
+		staleID := srv.cryptoManager.RecoveryKeyID()
+		// Tab B rotates; current SDEKRK changes, so RecoveryKeyID() does too.
+		if _, _, err := srv.cryptoManager.GenerateRecoveryKey(true); err != nil {
+			t.Fatalf("rotation: %v", err)
+		}
+		if srv.cryptoManager.RecoveryKeyID() == staleID {
+			t.Fatalf("rotation did not change RecoveryKeyID — REC-4 fingerprint not capturing rotation")
+		}
+		// Tab A acks with the old id — must be rejected with 409, NOT silently
+		// stamp RecoveryAckAt over Tab B's words.
+		w := post(t, srv, sessionCookie, csrfToken, fmt.Sprintf(`{"key_id":%q}`, staleID))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("stale key_id: want 409, got %d body=%s", w.Code, w.Body.String())
+		}
+		var body map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &body)
+		if body["error"] != "stale_recovery_key_id" {
+			t.Fatalf("stale key_id: expected error=stale_recovery_key_id, got %v", body)
+		}
+	})
+
+	t.Run("matching_key_id_succeeds", func(t *testing.T) {
+		srv := createGinTestServer(t, t.TempDir())
+		sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+		if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+			t.Fatalf("GenerateRecoveryKey: %v", err)
+		}
+		repo := &fakeAuthRepo{}
+		srv.authRepo = repo
+		keyID := srv.cryptoManager.RecoveryKeyID()
+		w := post(t, srv, sessionCookie, csrfToken, fmt.Sprintf(`{"key_id":%q}`, keyID))
+		if w.Code != http.StatusOK {
+			t.Fatalf("matching key_id: want 200, got %d body=%s", w.Code, w.Body.String())
+		}
+		if repo.staleness.RecoveryAckAt.IsZero() {
+			t.Fatalf("matching key_id: ack did not persist RecoveryAckAt")
+		}
+	})
+
+	t.Run("no_key_on_disk_returns_409", func(t *testing.T) {
+		srv := createGinTestServer(t, t.TempDir())
+		sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+		// No GenerateRecoveryKey call — RecoveryKeyID() is empty.
+		srv.authRepo = &fakeAuthRepo{}
+		w := post(t, srv, sessionCookie, csrfToken, `{"key_id":"deadbeef00000000"}`)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("no key on disk: want 409 stale_recovery_key_id, got %d body=%s", w.Code, w.Body.String())
+		}
+	})
 }
 
 // TestRecoveryKeyAck_DeniedDuringForcedPasskeyRegistration guards the C7
@@ -496,7 +599,7 @@ func TestRecoveryKeyAck_DeniedDuringForcedPasskeyRegistration(t *testing.T) {
 func TestBoot_RecoveryPendingNotPendingOnErrLockedRace(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, _ := setupTestAdminSession(t, srv)
-	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	// Crypto stays unlocked at the IsLocked() check, but the staleness read

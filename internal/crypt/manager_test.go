@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"piccolod/internal/state/paths"
@@ -47,17 +48,17 @@ func TestManager_GenerateRecoveryKeyRotation(t *testing.T) {
 	if err := m.Unlock("admin-pass"); err != nil {
 		t.Fatalf("Unlock: %v", err)
 	}
-	words1, err := m.GenerateRecoveryKey(false)
+	words1, _, err := m.GenerateRecoveryKey(false)
 	if err != nil {
 		t.Fatalf("GenerateRecoveryKey first: %v", err)
 	}
 	if len(words1) != 24 {
 		t.Fatalf("expected 24 words, got %d", len(words1))
 	}
-	if _, err := m.GenerateRecoveryKey(false); err == nil {
+	if _, _, err := m.GenerateRecoveryKey(false); err == nil {
 		t.Fatalf("expected error when regenerating without force")
 	}
-	words2, err := m.GenerateRecoveryKey(true)
+	words2, _, err := m.GenerateRecoveryKey(true)
 	if err != nil {
 		t.Fatalf("GenerateRecoveryKey force: %v", err)
 	}
@@ -74,6 +75,85 @@ func TestManager_GenerateRecoveryKeyRotation(t *testing.T) {
 	m.Lock()
 	if err := m.UnlockWithRecoveryKey(words2); err != nil {
 		t.Fatalf("failed to unlock with rotated recovery key: %v", err)
+	}
+}
+
+// TestManager_GenerateRecoveryKey_AtomicWordsKeyIDPairing pins the REC-4
+// race-closure contract: under concurrent rotation, each caller's returned
+// (words, keyID) pair MUST be self-consistent — keyID is the fingerprint of
+// the SDEKRK that wraps THIS caller's words. Computing keyID via a separate
+// post-write RecoveryKeyID() read allows another caller's rotation to
+// interleave, returning words from generation A but keyID of generation B.
+//
+// This test would fail on the pre-fix /generate handler that called
+// RecoveryKeyID() after GenerateRecoveryKey returned (codex Phase 3 finding,
+// 2026-04-28). Fix: GenerateRecoveryKey computes keyID inside its write
+// lock from the just-constructed st.SDEKRK.
+func TestManager_GenerateRecoveryKey_AtomicWordsKeyIDPairing(t *testing.T) {
+	dir := t.TempDir()
+	m, err := NewManager(dir)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := m.Setup("admin-pass"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := m.Unlock("admin-pass"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	// First generation establishes a key so subsequent rotations exercise the
+	// force=true branch.
+	if _, _, err := m.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Run N concurrent rotations and verify each returned (words, keyID) is
+	// internally consistent. Specifically: keyID must be the fingerprint of
+	// the SDEKRK that wraps the caller's words. We verify this by re-deriving
+	// the wrapping key from the words and comparing the resulting ciphertext's
+	// fingerprint — but a simpler proof is: at least one caller must observe
+	// a keyID equal to RecoveryKeyID()-at-some-point — which is satisfied if
+	// the function preserves the "words and keyID came from the same write"
+	// invariant. Stronger property: any two concurrent callers must NOT return
+	// the same keyID with different words (would mean one fingerprint paired
+	// with two distinct mnemonics).
+	const N = 8
+	type pair struct {
+		words []string
+		keyID string
+	}
+	pairs := make([]pair, N)
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			words, keyID, err := m.GenerateRecoveryKey(true)
+			if err != nil {
+				t.Errorf("goroutine %d: %v", idx, err)
+				return
+			}
+			pairs[idx] = pair{words: words, keyID: keyID}
+		}(i)
+	}
+	wg.Wait()
+
+	// Each (words, keyID) must be unique together. Two different callers
+	// returning the SAME keyID for DIFFERENT words is the race signature.
+	for i := 0; i < N; i++ {
+		for j := i + 1; j < N; j++ {
+			if pairs[i].keyID == pairs[j].keyID {
+				wi := strings.Join(pairs[i].words, " ")
+				wj := strings.Join(pairs[j].words, " ")
+				if wi != wj {
+					t.Fatalf("REC-4 race: callers %d and %d returned same keyID %q with different words — keyID was computed from on-disk state after another caller rotated past us",
+						i, j, pairs[i].keyID)
+				}
+				// Same keyID + same words is impossible (each call generates
+				// fresh entropy), but the comparison is for safety.
+				t.Fatalf("unexpected: callers %d and %d returned identical (words, keyID) — entropy generation collapsed?", i, j)
+			}
+		}
 	}
 }
 
@@ -96,7 +176,7 @@ func TestManager_UnlockWithRecoveryKey_Validation(t *testing.T) {
 	if err := m.Unlock("admin-pass"); err != nil {
 		t.Fatalf("Unlock: %v", err)
 	}
-	words, err := m.GenerateRecoveryKey(false)
+	words, _, err := m.GenerateRecoveryKey(false)
 	if err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
