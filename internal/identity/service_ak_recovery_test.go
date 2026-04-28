@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -371,6 +372,140 @@ func TestAutoEnrollAtBoot_WakesOnNamekURLChanged(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("autoEnrollAtBoot did not exit after stop signal")
+	}
+}
+
+// SETN-1 (codex Phase 3 finding from cluster 10): if SetNamekURL swaps the
+// namekclient mid-Enroll, the in-flight RPC's result is bound to the OLD
+// server but the config now points to the NEW server. Persisting that
+// hybrid would mark the device "enrolled" with a DeviceID the new server
+// has never seen — every subsequent call 401/404s.
+//
+// Test holds the first HTTP call so we can interleave SetNamekURL exactly
+// during the in-flight RPC, then verifies Enroll returns the SETN-1 error
+// and config retains the new URL with NO DeviceID (no hybrid persisted).
+func TestEnroll_DiscardsResultWhenURLChangedMidFlight(t *testing.T) {
+	tracker := newEnrollTracker()
+	tracker.returnOK.Store(true)
+
+	releaseCh := make(chan struct{})
+	holdCh := make(chan struct{}, 1)
+	holdOnce := make(chan struct{}, 1)
+	holdOnce <- struct{}{}
+
+	// Wrap the tracker handler to block the first /devices/enroll call so
+	// we can interleave SetNamekURL exactly during the in-flight RPC.
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/devices/enroll" {
+			select {
+			case <-holdOnce:
+				holdCh <- struct{}{}
+				<-releaseCh
+			default:
+			}
+		}
+		tracker.Handler().ServeHTTP(w, r)
+	}))
+	defer srvA.Close()
+
+	// srvB always 500s. Without this, SetNamekURL's spawned autoEnrollAtBoot
+	// goroutine could finalize successfully against srvB and populate DeviceID
+	// — making the post-SetNamekURL "DeviceID empty" assertion ambiguous
+	// (passes whether SETN-1 fired or not). With srvB failing, the only path
+	// that could populate DeviceID is finalizeEnrollment from A's result, so
+	// asserting empty is a clean test of the SETN-1 guard.
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "srvB unavailable"})
+	}))
+	defer srvB.Close()
+
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "identity.json")
+	svc := &Service{
+		configPath: configPath,
+		tpmDev:     &mockTPM{},
+		cfg: Config{
+			Enabled:  true,
+			DeviceID: "",
+			NamekURL: srvA.URL,
+		},
+		client:          newNamekClient(srvA.URL, &mockTPM{}, ""),
+		stopCh:          make(chan struct{}),
+		networkUp:       make(chan struct{}, 1),
+		namekURLChanged: make(chan struct{}, 1),
+	}
+	bus := events.NewBus()
+	defer bus.Close()
+	svc.eventsBus = bus
+	if err := saveConfig(configPath, svc.cfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// SetNamekURL spawns an autoEnrollAtBoot goroutine. Stop it so
+		// subsequent test invocations (-count=N) don't see leaked
+		// retry-against-closed-server goroutines logging warnings.
+		svc.stopped.Store(true)
+		select {
+		case <-svc.stopCh:
+		default:
+			close(svc.stopCh)
+		}
+		svc.recoverWg.Wait()
+	})
+
+	type enrollResult struct {
+		result *EnrollResult
+		err    error
+	}
+	resultCh := make(chan enrollResult, 1)
+	go func() {
+		r, err := svc.Enroll(t.Context())
+		resultCh <- enrollResult{r, err}
+	}()
+
+	// Wait until the handler has the first call held.
+	select {
+	case <-holdCh:
+	case <-time.After(3 * time.Second):
+		close(releaseCh)
+		t.Fatal("first /devices/enroll call did not arrive at server A within 3s")
+	}
+
+	// Swap to a different namek URL while the RPC is in-flight.
+	if err := svc.SetNamekURL(t.Context(), srvB.URL); err != nil {
+		close(releaseCh)
+		t.Fatalf("SetNamekURL: %v", err)
+	}
+
+	// Release the held call. The in-flight Enroll continues against srvA
+	// using the captured (now-stale) client, succeeds, and the SETN-1
+	// guard discards the result.
+	close(releaseCh)
+
+	select {
+	case got := <-resultCh:
+		if got.err == nil {
+			t.Fatalf("expected SETN-1 discard error; got nil err with result %+v", got.result)
+		}
+		if !strings.Contains(got.err.Error(), "SETN-1") {
+			t.Errorf("error %q does not mention SETN-1", got.err.Error())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Enroll did not return within 5s of release")
+	}
+
+	// Config should reflect the new URL with NO persisted DeviceID — the
+	// guard prevented finalizeEnrollment from running.
+	cfg := svc.DeviceConfig()
+	if cfg.NamekURL != srvB.URL {
+		t.Errorf("NamekURL = %q, want %q (post-SetNamekURL)", cfg.NamekURL, srvB.URL)
+	}
+	if cfg.DeviceID != "" {
+		t.Errorf("DeviceID = %q, want empty (no hybrid persisted)", cfg.DeviceID)
+	}
+	if svc.IsEnrolled() {
+		t.Error("expected enrolled=false after SETN-1 discard")
 	}
 }
 

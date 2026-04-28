@@ -516,6 +516,23 @@ func (s *Service) SuggestedHostname() string {
 }
 
 // Enroll performs TPM-attested enrollment with the namek server.
+//
+// SETN-1: the captured client is passed through to finalizeEnrollment,
+// which compares it against s.client UNDER THE SAME write lock that
+// performs the config mutation. If SetNamekURL swapped the client
+// mid-flight (clearing state + pointing config at a new namek server),
+// the in-flight result is bound to the OLD server's identity but the
+// config now points to the NEW server. Persisting that hybrid would
+// mark the device "enrolled" with a DeviceID the new server has never
+// seen — every subsequent call 401/404s. Discard and let the caller
+// (autoEnrollAtBoot's backoff loop) retry against the new client; the
+// namekURLChanged wake signal queued by SetNamekURL fires the retry
+// immediately.
+//
+// The check MUST be inside the write lock — an earlier draft compared
+// the pointer outside the lock, which left a small window between
+// recheck and finalize where SetNamekURL could still swap (codex Phase
+// 3 caught this).
 func (s *Service) Enroll(ctx context.Context) (*EnrollResult, error) {
 	s.mu.RLock()
 	client := s.client
@@ -529,15 +546,26 @@ func (s *Service) Enroll(ctx context.Context) (*EnrollResult, error) {
 		return nil, fmt.Errorf("identity: enrollment failed: %w", err)
 	}
 
-	return s.finalizeEnrollment(result)
+	return s.finalizeEnrollment(result, client)
 }
 
 // finalizeEnrollment persists the enrollment result and restores runtime state.
 // Shared by Enroll and reenrollWithRecovery.
-func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult) (*EnrollResult, error) {
+//
+// expectedClient is the namekclient pointer the caller used for the RPC.
+// Pass nil to skip the SETN-1 check (e.g., reenrollWithRecovery — covered
+// in deferred_setn1_sibling_sites.md). When non-nil, the check happens
+// inside the write lock immediately before the mutation: if s.client
+// swapped between the RPC and now, discard so a hybrid identity (new
+// NamekURL + old DeviceID) cannot be persisted.
+func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult, expectedClient *namekclient.Client) (*EnrollResult, error) {
 	baseDomain := extractBaseDomain(result.Hostname)
 
 	s.mu.Lock()
+	if expectedClient != nil && s.client != expectedClient {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("identity: enrollment discarded — namek URL changed mid-flight (SETN-1)")
+	}
 	s.cfg.DeviceID = result.DeviceID
 	s.cfg.Hostname = result.Hostname
 	s.cfg.BaseDomain = baseDomain
@@ -893,7 +921,10 @@ func (s *Service) reenrollWithRecovery() {
 			// Clear recovering before finalize so the sync loop's initial
 			// tick (started by finalizeEnrollment) can fetch fresh device info.
 			s.recovering.Store(false)
-			if _, fErr := s.finalizeEnrollment(result); fErr != nil {
+			// SETN-1 guard not yet applied here — see deferred_setn1_sibling_sites.md.
+			// reenrollWithRecovery is one of 4 sibling sites with the same race shape;
+			// scoped out of cluster 11 (Enroll-only) and tracked for a follow-up.
+			if _, fErr := s.finalizeEnrollment(result, nil); fErr != nil {
 				log.Printf("ERROR: identity: finalize re-enrollment: %v", fErr)
 				return
 			}
