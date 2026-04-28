@@ -90,9 +90,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		if m.healthTracker != nil {
 			switch newState {
 			case StateEthernet, StateWiFiSTA:
-				m.healthTracker.Setf("network", health.LevelOK, fmt.Sprintf("connected (%s)", newState))
+				m.healthTracker.Setf("network", health.LevelOK, "connected (%s)", newState)
 			case StateReconnecting, StateAPMode:
-				m.healthTracker.Setf("network", health.LevelWarn, string(newState))
+				m.healthTracker.Setf("network", health.LevelWarn, "%s", newState)
 			case StateDisconnected:
 				m.healthTracker.Setf("network", health.LevelError, "disconnected")
 			}

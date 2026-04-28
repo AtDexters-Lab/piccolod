@@ -33,14 +33,21 @@ class RemoteAddressStep extends StatefulWidget {
   State<RemoteAddressStep> createState() => _RemoteAddressStepState();
 }
 
+enum _PollKind { none, enrollment, suggestion }
+
 class _RemoteAddressStepState extends State<RemoteAddressStep> {
   late final TextEditingController _hostnameController;
   final _focusNode = FocusNode();
   String? _localError;
   bool _isFocused = false;
   Timer? _pollTimer;
+  // Suggestion-poll 20s cap timer. Held as a field so a fresh suggestion
+  // poll started while an older cap is still scheduled doesn't get
+  // prematurely stopped by the older cap firing.
+  Timer? _suggestionCap;
   bool _pollInFlight = false;
   bool _suggestionApplied = false;
+  _PollKind _activePollKind = _PollKind.none;
 
   @override
   void initState() {
@@ -50,19 +57,53 @@ class _RemoteAddressStepState extends State<RemoteAddressStep> {
     _suggestionApplied = suggestion.isNotEmpty;
     _focusNode.addListener(_onFocusChange);
     unawaited(widget.onRefresh());
-    if (!widget.enrolled) {
-      // Poll for enrollment completion while not yet enrolled.
-      // Auto-enrollment may finish seconds after this step renders.
-      _startPoll(const Duration(seconds: 3));
-    } else if (_needsSuggestionPoll) {
-      // Enrolled but suggestion hasn't arrived yet (fetchSuggestedHostname
-      // still in flight). Poll briefly to catch it.
-      _startSuggestionPoll();
-    }
+    _reconcilePolling();
   }
 
   bool get _needsSuggestionPoll =>
       widget.suggestedHostname == null || widget.suggestedHostname!.isEmpty;
+
+  // Single source of truth for which poll (if any) should be running given
+  // the current widget state. Driven from semantic state so transitions in
+  // both directions are handled symmetrically — including the case where
+  // status flips back from 'unavailable' to 'pending' after auto-enroll
+  // completes mid-flow. Null status (legacy backend or terminal-unknown)
+  // is treated as "no poll": the contract documents null → unavailable
+  // semantics, and we have no observable transition to wait for. Operator
+  // refresh covers the rare unsuspend / legacy-backend-update cases.
+  _PollKind _desiredPollKind() {
+    if (!widget.enrolled && widget.status == 'pending') {
+      return _PollKind.enrollment;
+    }
+    if (widget.enrolled && _needsSuggestionPoll) {
+      return _PollKind.suggestion;
+    }
+    return _PollKind.none;
+  }
+
+  void _reconcilePolling() {
+    final desired = _desiredPollKind();
+    if (desired == _activePollKind && _pollTimer != null) return;
+    _stopPoll();
+    switch (desired) {
+      case _PollKind.enrollment:
+        _activePollKind = _PollKind.enrollment;
+        _startPoll(const Duration(seconds: 3));
+      case _PollKind.suggestion:
+        _activePollKind = _PollKind.suggestion;
+        _startSuggestionPoll();
+      case _PollKind.none:
+        break;
+    }
+  }
+
+  void _stopPoll() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    _suggestionCap?.cancel();
+    _suggestionCap = null;
+    _activePollKind = _PollKind.none;
+  }
 
   void _startPoll(Duration interval) {
     _pollTimer?.cancel();
@@ -82,13 +123,16 @@ class _RemoteAddressStepState extends State<RemoteAddressStep> {
 
   /// Short-lived poll to catch a late-arriving suggested hostname after
   /// enrollment. Auto-cancels after 20 seconds (the backend fetch has a
-  /// 15-second timeout; 20s provides margin for slow responses).
+  /// 15-second timeout; 20s provides margin for slow responses). The cap
+  /// timer is held in [_suggestionCap] so a re-entered poll cancels and
+  /// re-schedules its own cap; otherwise an older cap could fire mid-cycle
+  /// and stop a fresh poll prematurely.
   void _startSuggestionPoll() {
     _startPoll(const Duration(seconds: 2));
-    Future<void>.delayed(const Duration(seconds: 20), () {
+    _suggestionCap?.cancel();
+    _suggestionCap = Timer(const Duration(seconds: 20), () {
       if (!mounted) return;
-      _pollTimer?.cancel();
-      _pollTimer = null;
+      if (_activePollKind == _PollKind.suggestion) _stopPoll();
     });
   }
 
@@ -108,21 +152,6 @@ class _RemoteAddressStepState extends State<RemoteAddressStep> {
       );
       _suggestionApplied = true;
     }
-    // Enrollment just detected — switch from enrollment poll to suggestion poll.
-    if (widget.enrolled && !oldWidget.enrolled) {
-      _pollTimer?.cancel();
-      _pollTimer = null;
-      if (_needsSuggestionPoll) {
-        _startSuggestionPoll();
-      }
-    }
-    // Suggestion arrived — stop any polling.
-    if (widget.suggestedHostname != null &&
-        widget.suggestedHostname!.isNotEmpty &&
-        _pollTimer != null) {
-      _pollTimer?.cancel();
-      _pollTimer = null;
-    }
     // Suggested hostname was rejected (taken/unavailable) — clear the field
     // only if the user hadn't edited it (preserve user's modified input).
     if (oldWidget.suggestedHostname != null &&
@@ -132,6 +161,7 @@ class _RemoteAddressStepState extends State<RemoteAddressStep> {
       _hostnameController.clear();
       _suggestionApplied = false;
     }
+    _reconcilePolling();
   }
 
   void _onFocusChange() {
@@ -140,7 +170,7 @@ class _RemoteAddressStepState extends State<RemoteAddressStep> {
 
   @override
   void dispose() {
-    _pollTimer?.cancel();
+    _stopPoll();
     _focusNode.removeListener(_onFocusChange);
     _hostnameController.dispose();
     _focusNode.dispose();

@@ -153,7 +153,7 @@ func (s *GinServer) observeStorageEvents(bus *events.Bus) {
 			if !ok {
 				continue
 			}
-			s.healthTracker.Setf("storage", health.LevelError, "emergency ("+payload.Level+"): "+payload.Error)
+			s.healthTracker.Setf("storage", health.LevelError, "emergency (%s): %s", payload.Level, payload.Error)
 		}
 	}()
 	go func() {

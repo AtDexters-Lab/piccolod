@@ -182,21 +182,13 @@ class AuthController extends ChangeNotifier {
       _setupPhase = SetupPhase.encrypting;
       notifyListeners();
     }
-    for (var i = 0; i < 60; i++) {
-      await Future<void>.delayed(const Duration(seconds: 3));
-      if (_disposed) return;
-      try {
-        final status = await _api.get('/api/v1/crypto/status')
-            as Map<String, dynamic>;
-        if (status['setup_in_progress'] != true) {
-          debugPrint('Setup no longer in progress, recovering via reRoute');
-          reRoute();
-          return;
-        }
-      } on Object catch (_) {}
-    }
+    final completed = await pollSetupCompletion(isCancelled: () => _disposed);
     if (_disposed) return;
-    _setupPhase = null;
+    if (completed) {
+      debugPrint('Setup no longer in progress, recovering via reRoute');
+    } else {
+      _setupPhase = null;
+    }
     reRoute();
   }
 
@@ -233,13 +225,9 @@ class AuthController extends ChangeNotifier {
 
     // First-run: generate recovery key before any routing. Server is
     // authoritative when present; constructor fallback only for older builds.
-    if (_resolvePending(resp is Map ? resp.cast<String, dynamic>() : null)) {
-      final words = await generateRecoveryKey();
-      if (words != null) {
-        _recoveryWords = words;
-        _step = AuthStep.recoveryKey;
-        return;
-      }
+    if (await _showRecoveryKeyIfPending(
+        _resolvePending(resp is Map ? resp.cast<String, dynamic>() : null))) {
+      return;
     }
 
     if (resp is Map && resp['must_register_passkey'] == true) {
@@ -272,14 +260,8 @@ class AuthController extends ChangeNotifier {
       // login, so the constructor-time recoveryKeyPending may be stale —
       // _resolvePending centralizes the server-authoritative-with-fallback
       // rule.
-      if (_resolvePending(finishResp)) {
-        final words = await generateRecoveryKey();
-        if (words != null) {
-          _recoveryWords = words;
-          _step = AuthStep.recoveryKey;
-          if (!_disposed) notifyListeners();
-          return true;
-        }
+      if (await _showRecoveryKeyIfPending(_resolvePending(finishResp))) {
+        return true;
       }
 
       final session = await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
@@ -325,14 +307,9 @@ class AuthController extends ChangeNotifier {
       // generateRecoveryKey() returns null on transient 409/503 (handled
       // at router level) so a server-side false-positive on the gate or a
       // staleness-read failure won't misattribute as a passkey error.
-      if (finishResp['recovery_key_pending'] == true) {
-        final words = await generateRecoveryKey();
-        if (words != null) {
-          _recoveryWords = words;
-          _step = AuthStep.recoveryKey;
-          if (!_disposed) notifyListeners();
-          return true;
-        }
+      if (await _showRecoveryKeyIfPending(
+          finishResp['recovery_key_pending'] == true)) {
+        return true;
       }
 
       if (await _completeAuthAndRedirect(null)) return true;
@@ -402,15 +379,31 @@ class AuthController extends ChangeNotifier {
     return recoveryKeyPending;
   }
 
+  /// Single entry point for routing the controller into the recovery-key step.
+  /// Returns true when the step is staged (caller should bail out of its own
+  /// post-login flow); false when the gate is clear or the router-level
+  /// generateRecoveryKey returned null on transient 409/503 (skip silently
+  /// per router policy). notifyListeners is called on success so the UI
+  /// reflects the step change without relying on the caller's later notify.
+  Future<bool> _showRecoveryKeyIfPending(bool pending) async {
+    if (!pending) return false;
+    final words = await generateRecoveryKey();
+    if (words == null) return false;
+    _recoveryWords = words;
+    _step = AuthStep.recoveryKey;
+    if (!_disposed) notifyListeners();
+    return true;
+  }
+
   // --- Recovery key proceed ---
 
   void proceedAfterRecovery() {
     // Await the ack before rerouting — reRoute → _checkBoot → _routeDesktop
-    // can land on _completeDesktopRedirectOrFinish, which assigns
-    // window.location.href and aborts in-flight requests on the page. A
-    // fire-and-forget ack would race the navigation and may never reach
-    // the server, leaving RecoveryAckAt=zero and the operator re-prompted
-    // with rotated words on next sign-in.
+    // can land on _resumeOIDCOrComplete, which assigns window.location.href
+    // and aborts in-flight requests on the page. A fire-and-forget ack
+    // would race the navigation and may never reach the server, leaving
+    // RecoveryAckAt=zero and the operator re-prompted with rotated words
+    // on next sign-in.
     unawaited(() async {
       await ackRecoveryKey();
       if (_disposed) return;

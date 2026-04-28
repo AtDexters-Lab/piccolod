@@ -57,7 +57,14 @@ func (t *Tracker) Set(name string, status Status) {
 	t.mu.Unlock()
 }
 
-func (t *Tracker) Setf(name string, level Level, msg string) {
+// Setf records a status with a printf-style message. When args is empty,
+// format is treated as a literal so callers can pass strings containing '%'
+// without escaping.
+func (t *Tracker) Setf(name string, level Level, format string, args ...any) {
+	msg := format
+	if len(args) > 0 {
+		msg = fmt.Sprintf(format, args...)
+	}
 	t.Set(name, Status{Level: level, Message: msg, UpdatedAt: time.Now().UTC()})
 }
 

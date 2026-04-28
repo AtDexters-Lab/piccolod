@@ -7,6 +7,32 @@ import 'package:piccolo_os/core/services/error_reporter.dart';
 /// Phases within the crypto setup operation (displayed by FinishingStep).
 enum SetupPhase { encrypting, creatingAdmin, generatingKey }
 
+/// Polls `/api/v1/crypto/status` until `setup_in_progress` becomes false, the
+/// caller signals cancellation, or [maxIterations] elapses. Returns true on
+/// completion, false on timeout or cancellation. Caller distinguishes by
+/// re-checking [isCancelled] after the call.
+///
+/// Each iteration's individual error is swallowed: the lock contention this
+/// loop polls through routinely surfaces transient 5xx, and bailing out on
+/// the first error would defeat the loop's purpose.
+Future<bool> pollSetupCompletion({
+  required bool Function() isCancelled,
+  Duration interval = const Duration(seconds: 3),
+  int maxIterations = 60,
+}) async {
+  final api = ApiClient();
+  for (var i = 0; i < maxIterations; i++) {
+    await Future<void>.delayed(interval);
+    if (isCancelled()) return false;
+    try {
+      final status =
+          await api.get('/api/v1/crypto/status') as Map<String, dynamic>;
+      if (status['setup_in_progress'] != true) return true;
+    } on Object catch (_) {}
+  }
+  return false;
+}
+
 /// Server-emitted error codes consumed by the UI. Mirror of Go consts in
 /// internal/server/gin_crypto_handlers.go (ErrRecoveryKeyAlreadyAcked etc.)
 /// — keep both sides in sync; a typo on either fails open silently.

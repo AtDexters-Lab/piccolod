@@ -120,7 +120,9 @@ class FirstRunController extends ChangeNotifier {
         namekEnrolled = boot['namek_enrolled'] == true;
         namekBaseDomain = boot['namek_base_domain'] as String?;
         namekSuggestedHostname = boot['namek_suggested_hostname'] as String?;
-        namekStatus = boot['namek_status'] as String?;
+        // Null from a legacy backend → 'unavailable' per the field contract;
+        // normalize at the boundary so downstream gates don't have to.
+        namekStatus = boot['namek_status'] as String? ?? 'unavailable';
         notifyListeners();
       }
     } on Object catch (_) {}
@@ -346,20 +348,13 @@ class FirstRunController extends ChangeNotifier {
     _error = null;
     _setupPhase = SetupPhase.encrypting;
     if (!_disposed) notifyListeners();
-    for (var i = 0; i < 60; i++) {
-      await Future<void>.delayed(const Duration(seconds: 3));
-      if (_disposed) return;
-      try {
-        final status = await _api.get('/api/v1/crypto/status')
-            as Map<String, dynamic>;
-        if (status['setup_in_progress'] != true) {
-          debugPrint('Setup no longer in progress, recovering via boot');
-          await _recoverAfterSetupComplete();
-          return;
-        }
-      } on Object catch (_) {}
-    }
+    final completed = await pollSetupCompletion(isCancelled: () => _disposed);
     if (_disposed) return;
+    if (completed) {
+      debugPrint('Setup no longer in progress, recovering via boot');
+      await _recoverAfterSetupComplete();
+      return;
+    }
     _setupPhase = null;
     _error = 'Setup is taking longer than expected. Try refreshing.';
     _step = FirstRunStep.credentials;

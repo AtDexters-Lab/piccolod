@@ -1118,7 +1118,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	tpmResult, recoveredFlag, tpmErr := tpm.OpenWithAKRecovery(akStateDir, swtpmStateDir)
 	if tpmErr != nil {
 		log.Printf("ERROR: TPM unavailable: %v (identity service will be limited)", tpmErr)
-		healthTracker.Setf("tpm", health.LevelError, fmt.Sprintf("TPM unavailable: %v", tpmErr))
+		healthTracker.Setf("tpm", health.LevelError, "TPM unavailable: %v", tpmErr)
 	} else {
 		tpmDevice = tpmResult.Device
 		s.tpmResult = tpmResult

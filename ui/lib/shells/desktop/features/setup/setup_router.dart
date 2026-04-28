@@ -226,7 +226,9 @@ class _SetupRouterState extends State<SetupRouter> {
     final namekEnrolled = boot['namek_enrolled'] == true;
     final baseDomain = boot['namek_base_domain'] as String?;
     final suggestedHostname = boot['namek_suggested_hostname'] as String?;
-    final namekStatus = boot['namek_status'] as String?;
+    // Null from a legacy backend → 'unavailable' per the field contract;
+    // normalize at the boundary so downstream gates don't have to.
+    final namekStatus = boot['namek_status'] as String? ?? 'unavailable';
     final isRemote = isOnRemoteDomain() && _setupNonce != null;
 
     final ctrl = FirstRunController(
@@ -271,49 +273,12 @@ class _SetupRouterState extends State<SetupRouter> {
       unawaited(_handleRecoveryKeyThenComplete());
       return;
     }
-
-    // OIDC or ?next= redirect — keep loading=true while in-flight.
+    // Keep loading=true while OIDC/next redirect is in-flight; the helper is
+    // a no-op fall-through to onComplete when neither path is set.
     if (_authRequestId != null || (_nextUrl != null && _nextUrl!.isNotEmpty)) {
       _loading = true;
-      unawaited(_api.fetchCsrfToken().then((_) async {
-        if (_authRequestId != null) {
-          try {
-            final response = await _api.post(
-              '/api/v1/oauth/resume',
-              body: {'auth_request_id': _authRequestId},
-            ) as Map<String, dynamic>;
-            final data = response['data'] as Map<String, dynamic>?;
-            final redirectUrl = data?['redirect_url'] as String?;
-            if (redirectUrl != null && redirectUrl.isNotEmpty) {
-              web.window.location.href = redirectUrl;
-              return;
-            }
-          } on Object catch (e) {
-            debugPrint('OIDC resume failed: $e');
-          }
-        } else if (_nextUrl != null) {
-          try {
-            final response = await _api.get(
-              '/api/v1/auth/validate-next',
-              queryParameters: {'next': _nextUrl},
-            );
-            if (response is Map && response['valid'] == true) {
-              final redirectUrl = response['redirect_url'] as String?;
-              if (redirectUrl != null && redirectUrl.isNotEmpty) {
-                web.window.location.href = redirectUrl;
-                return;
-              }
-            }
-          } on Object catch (e) {
-            debugPrint('Next URL validation failed: $e');
-          }
-        }
-        widget.onComplete(_firstSetupDetected);
-      }));
-      return;
     }
-
-    widget.onComplete(_firstSetupDetected);
+    _resumeOIDCOrComplete();
   }
 
   void _createAuthController(AuthMode mode, {bool recoveryKeyPending = false}) {
@@ -357,20 +322,13 @@ class _SetupRouterState extends State<SetupRouter> {
   }
 
   Future<void> _pollSetupInProgress() async {
-    for (var i = 0; i < 60; i++) {
-      await Future<void>.delayed(const Duration(seconds: 3));
-      if (!mounted) return;
-      try {
-        final status = await _api.get('/api/v1/crypto/status')
-            as Map<String, dynamic>;
-        if (status['setup_in_progress'] != true) {
-          debugPrint('Setup no longer in progress, re-checking boot');
-          await _checkBoot();
-          return;
-        }
-      } on Object catch (_) {}
-    }
+    final completed = await pollSetupCompletion(isCancelled: () => !mounted);
     if (!mounted) return;
+    if (completed) {
+      debugPrint('Setup no longer in progress, re-checking boot');
+      await _checkBoot();
+      return;
+    }
     setState(() {
       _showFinishing = false;
       _bootError = 'Setup is taking longer than expected. Try refreshing.';
@@ -466,16 +424,16 @@ class _SetupRouterState extends State<SetupRouter> {
       if (words != null && mounted) {
         _pendingRecoveryWords = words;
         _pendingPostRecoveryAction = () async {
-          // Await the ack here — _completeDesktopRedirectOrFinish below can
-          // assign window.location.href, which aborts in-flight requests on
-          // the page. A fire-and-forget ack would race the navigation and
-          // may never reach the server, leaving RecoveryAckAt=zero and the
+          // Await the ack here — _resumeOIDCOrComplete below can assign
+          // window.location.href, which aborts in-flight requests on the
+          // page. A fire-and-forget ack would race the navigation and may
+          // never reach the server, leaving RecoveryAckAt=zero and the
           // operator re-prompted with rotated words on next sign-in.
           await ackRecoveryKey();
           if (!mounted) return;
           _pendingRecoveryWords = null;
           _pendingPostRecoveryAction = null;
-          _completeDesktopRedirectOrFinish();
+          _resumeOIDCOrComplete();
         };
         setState(() => _loading = false);
         return;
@@ -483,51 +441,54 @@ class _SetupRouterState extends State<SetupRouter> {
     } on Object catch (e) {
       debugPrint('Recovery key before complete failed: $e');
     }
-    _completeDesktopRedirectOrFinish();
+    _resumeOIDCOrComplete();
   }
 
-  /// Handle OIDC/next redirect after recovery key on the desktop screen.
-  /// Falls through to onComplete if no redirect is needed.
-  void _completeDesktopRedirectOrFinish() {
-    if (_authRequestId != null || (_nextUrl != null && _nextUrl!.isNotEmpty)) {
-      unawaited(_api.fetchCsrfToken().then((_) async {
-        if (_authRequestId != null) {
-          try {
-            final response = await _api.post(
-              '/api/v1/oauth/resume',
-              body: {'auth_request_id': _authRequestId},
-            ) as Map<String, dynamic>;
-            final data = response['data'] as Map<String, dynamic>?;
-            final redirectUrl = data?['redirect_url'] as String?;
+  /// Resume an OIDC auth request or redirect to a validated next URL, falling
+  /// through to widget.onComplete when neither is set. Redirect work is
+  /// fire-and-forget — `window.location.href` aborts in-flight requests on
+  /// success, so the caller cannot reliably observe completion.
+  void _resumeOIDCOrComplete() {
+    if (_authRequestId == null &&
+        (_nextUrl == null || _nextUrl!.isEmpty)) {
+      widget.onComplete(_firstSetupDetected);
+      return;
+    }
+    unawaited(_api.fetchCsrfToken().then((_) async {
+      if (_authRequestId != null) {
+        try {
+          final response = await _api.post(
+            '/api/v1/oauth/resume',
+            body: {'auth_request_id': _authRequestId},
+          ) as Map<String, dynamic>;
+          final data = response['data'] as Map<String, dynamic>?;
+          final redirectUrl = data?['redirect_url'] as String?;
+          if (redirectUrl != null && redirectUrl.isNotEmpty) {
+            web.window.location.href = redirectUrl;
+            return;
+          }
+        } on Object catch (e) {
+          debugPrint('OIDC resume failed: $e');
+        }
+      } else if (_nextUrl != null) {
+        try {
+          final response = await _api.get(
+            '/api/v1/auth/validate-next',
+            queryParameters: {'next': _nextUrl},
+          );
+          if (response is Map && response['valid'] == true) {
+            final redirectUrl = response['redirect_url'] as String?;
             if (redirectUrl != null && redirectUrl.isNotEmpty) {
               web.window.location.href = redirectUrl;
               return;
             }
-          } on Object catch (e) {
-            debugPrint('OIDC resume after recovery key failed: $e');
           }
-        } else if (_nextUrl != null) {
-          try {
-            final response = await _api.get(
-              '/api/v1/auth/validate-next',
-              queryParameters: {'next': _nextUrl},
-            );
-            if (response is Map && response['valid'] == true) {
-              final redirectUrl = response['redirect_url'] as String?;
-              if (redirectUrl != null && redirectUrl.isNotEmpty) {
-                web.window.location.href = redirectUrl;
-                return;
-              }
-            }
-          } on Object catch (e) {
-            debugPrint('Next URL validation after recovery key failed: $e');
-          }
+        } on Object catch (e) {
+          debugPrint('Next URL validation failed: $e');
         }
-        widget.onComplete(_firstSetupDetected);
-      }));
-      return;
-    }
-    widget.onComplete(_firstSetupDetected);
+      }
+      widget.onComplete(_firstSetupDetected);
+    }));
   }
 
   // --- Reboot handler for install_complete ---
