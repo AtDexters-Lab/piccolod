@@ -717,13 +717,22 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 	}); err != nil {
 		log.Printf("WARN: failed to clear recovery staleness: %v", err)
 	}
+	// silentRotation: true when this generation replaced an unack'd previous
+	// key without the operator explicitly requesting rotation. Distinct from
+	// the audit log's `rotated` (which records the mechanical fact that a
+	// prior key existed): force_rotate=true is a rotation in the audit sense
+	// but NOT silent — the operator triggered it, the Settings UX owns the
+	// "you just rotated" affordance, and a second banner here would only
+	// confuse. The wire field is named `rotated` for backwards-compatibility
+	// with the older response shape; UI-side it's parsed as wasRotated.
+	silentRotation := rotating && !body.ForceRotate
 	s.publishAuditEvent(c, "auth.recovery_key_generate", map[string]any{"rotated": rotating})
 	// REC-4: keyID is paired with words by GenerateRecoveryKey under its
 	// write lock. Do not re-derive from RecoveryKeyID() here — a concurrent
 	// /generate from another tab can rotate past us between lock release
 	// and the read, returning words from generation A but key_id of
 	// generation B. The /ack would then accept the wrong-words tab's id.
-	c.JSON(http.StatusOK, gin.H{"words": words, "key_id": keyID})
+	c.JSON(http.StatusOK, gin.H{"words": words, "key_id": keyID, "rotated": silentRotation})
 }
 
 // handleCryptoRecoveryKeyAck: POST /api/v1/crypto/recovery-key/ack

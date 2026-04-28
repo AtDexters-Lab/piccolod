@@ -1,12 +1,22 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/utils/downloader/downloader.dart';
+import 'package:piccolo_os/shared/widgets/status_banner.dart';
+import 'package:piccolo_os/shells/desktop/features/setup/setup_utils.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class RecoveryKeyStep extends StatefulWidget {
-  const RecoveryKeyStep({required this.words, required this.onNext, super.key});
+  const RecoveryKeyStep({
+    required this.words,
+    required this.onNext,
+    this.entryContext = RecoveryKeyEntryContext.postSetup,
+    this.wasRotated = false,
+    super.key,
+  });
   final List<String> words;
   final VoidCallback onNext;
+  final RecoveryKeyEntryContext entryContext;
+  final bool wasRotated;
 
   @override
   State<RecoveryKeyStep> createState() => _RecoveryKeyStepState();
@@ -28,19 +38,64 @@ class _RecoveryKeyStepState extends State<RecoveryKeyStep> {
     );
   }
 
+  /// Per-context subtitle. Empty for postSetup — the stepper above the screen
+  /// already names the step ("Recovery"), so an extra line would be redundant.
+  /// Banner and subtitle render together when both apply: banner conveys
+  /// urgency, subtitle conveys context — they occupy different semantic slots.
+  String? get _contextSubtitle {
+    switch (widget.entryContext) {
+      case RecoveryKeyEntryContext.postSetup:
+        return null;
+      case RecoveryKeyEntryContext.postLogin:
+        return "Save your recovery key — it's how you'll reset your "
+            'password if you forget it.';
+      case RecoveryKeyEntryContext.postPasskeyRegister:
+        return 'Your passkey is set up. One more thing: save the recovery '
+            'key below.';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final subtitle = _contextSubtitle;
     return Padding(
       padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
+          if (widget.wasRotated) ...[
+            // REC-3: silent-rotation banner. Reached when the previous key
+            // was generated but never acknowledged on this device — the
+            // server rotated to fresh words on this /generate, so any paper
+            // saved from a prior generation is no longer valid. Operator-
+            // centric copy avoids asserting "your previous key" (a referent
+            // they may not remember) — instead anchors on what they can
+            // observe: words on paper that no longer work.
+            const StatusBanner(
+              severity: BannerSeverity.warning,
+              title: 'These are new recovery words',
+              message:
+                  'If you wrote down a previous recovery key, those words '
+                  'no longer work — please use these instead.',
+            ),
+            const SizedBox(height: 10),
+          ],
           Text(
             'Your recovery key',
             style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
               fontWeight: FontWeight.bold,
             ),
           ),
+          if (subtitle != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              subtitle,
+              textAlign: TextAlign.center,
+              style: PiccoloTheme.textTheme.bodySmall?.copyWith(
+                color: PiccoloTheme.inkMuted,
+              ),
+            ),
+          ],
           const SizedBox(height: 10),
           Container(
             padding: const EdgeInsets.all(10),

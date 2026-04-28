@@ -59,11 +59,16 @@ class FirstRunController extends ChangeNotifier {
   SetupPhase? _setupPhase;
   SetupPhase? get setupPhase => _setupPhase;
 
-  List<String> _recoveryWords = [];
-  List<String> get recoveryWords => _recoveryWords;
+  // Hold the server-returned material intact rather than unpacking into
+  // parallel fields — adding a future RecoveryKeyMaterial field then
+  // propagates structurally instead of via 7 capture-site edits.
+  RecoveryKeyMaterial? _recoveryMaterial;
+  RecoveryKeyEntryContext _recoveryEntryContext =
+      RecoveryKeyEntryContext.postSetup;
 
-  // REC-4: keyId companion to _recoveryWords for ack binding (see ack call sites).
-  String _recoveryKeyID = '';
+  List<String> get recoveryWords => _recoveryMaterial?.words ?? const [];
+  bool get recoveryWasRotated => _recoveryMaterial?.wasRotated ?? false;
+  RecoveryKeyEntryContext get recoveryEntryContext => _recoveryEntryContext;
 
   // Hostname claim state
   bool _settingHostname = false;
@@ -298,8 +303,8 @@ class FirstRunController extends ChangeNotifier {
       // Generate recovery key
       final material = await generateRecoveryKey();
       if (material != null) {
-        _recoveryWords = material.words;
-        _recoveryKeyID = material.keyId;
+        _recoveryMaterial = material;
+        _recoveryEntryContext = RecoveryKeyEntryContext.postSetup;
         _setupPhase = null;
         _step = FirstRunStep.recoveryKey;
       } else {
@@ -377,8 +382,8 @@ class FirstRunController extends ChangeNotifier {
         if (rkPending) {
           final material = await generateRecoveryKey();
           if (material != null) {
-            _recoveryWords = material.words;
-            _recoveryKeyID = material.keyId;
+            _recoveryMaterial = material;
+            _recoveryEntryContext = RecoveryKeyEntryContext.postSetup;
             _step = FirstRunStep.recoveryKey;
             if (!_disposed) notifyListeners();
             return;
@@ -408,7 +413,7 @@ class FirstRunController extends ChangeNotifier {
   bool _recoveryEntryFromPasskey = false;
 
   void proceedAfterRecovery() {
-    unawaited(ackRecoveryKey(_recoveryKeyID));
+    unawaited(ackRecoveryKey(_recoveryMaterial?.keyId ?? ''));
     if (_recoveryEntryFromPasskey) {
       // Post-passkey-registration recovery: passkey ceremony already
       // succeeded, the forcing gate is cleared. Routing to passkeyRequired
@@ -453,8 +458,8 @@ class FirstRunController extends ChangeNotifier {
       if (finishResp['recovery_key_pending'] == true) {
         final material = await generateRecoveryKey();
         if (material != null) {
-          _recoveryWords = material.words;
-          _recoveryKeyID = material.keyId;
+          _recoveryMaterial = material;
+          _recoveryEntryContext = RecoveryKeyEntryContext.postPasskeyRegister;
           _step = FirstRunStep.recoveryKey;
           _recoveryEntryFromPasskey = true;
           if (!_disposed) notifyListeners();

@@ -47,10 +47,29 @@ class ServerErrorCode {
 /// REC-4: keyId binds /generate to /ack so a multi-tab rotation race or a
 /// delayed fire-and-forget ack from a stale tab cannot mark a *rotated*
 /// key as acked. Callers MUST propagate keyId verbatim into ackRecoveryKey.
+/// REC-3: wasRotated=true when this generation replaced an unack'd previous
+/// key — the UI raises a banner so the operator notices the words changed.
 class RecoveryKeyMaterial {
-  const RecoveryKeyMaterial({required this.words, required this.keyId});
+  const RecoveryKeyMaterial({
+    required this.words,
+    required this.keyId,
+    this.wasRotated = false,
+  });
   final List<String> words;
   final String keyId;
+  final bool wasRotated;
+}
+
+/// Why the recovery-key screen is being shown right now. The screen surfaces
+/// from 5 call sites across setup_router/auth_controller/first_run_controller
+/// but collapses to 3 contexts: post-passkey-login intentionally shares
+/// postLogin (same operator mental state — "I just signed in, now I'm here"),
+/// and partial-setup-after-unlock shares postSetup (operator is finishing
+/// initial setup, regardless of unlock-screen entry).
+enum RecoveryKeyEntryContext {
+  postSetup,
+  postLogin,
+  postPasskeyRegister,
 }
 
 /// Matches an ApiException by both HTTP status and structured error string.
@@ -84,11 +103,11 @@ bool isApiError(ApiException e, int status, String code) {
 /// propagate the value from /generate verbatim.
 Future<void> ackRecoveryKey(String keyId) async {
   if (keyId.isEmpty) {
-    // Caller bug — _recoveryKeyID was never populated (controller path
-    // displayed words without going through _generateRecoveryKey, or the
-    // material was discarded between capture and ack). The server would
-    // 400 on every retry; short-circuit to surface the bug in telemetry
-    // instead of burning the retry budget on a deterministic failure.
+    // Caller bug — keyId was never populated (controller path displayed
+    // words without going through _generateRecoveryKey, or the material
+    // was discarded between capture and ack). The server would 400 on
+    // every retry; short-circuit to surface the bug in telemetry instead
+    // of burning the retry budget on a deterministic failure.
     ErrorReporter().report(
       type: 'recovery_key_ack_missing_key_id',
       message: 'ackRecoveryKey called with empty keyId — caller plumbing bug',

@@ -362,6 +362,10 @@ class _SetupRouterState extends State<SetupRouter> {
         return RecoveryKeyMaterial(
           words: List<String>.from(recoveryData['words'] as Iterable<dynamic>),
           keyId: keyId,
+          // REC-3: server returns rotated=true when this generation replaced
+          // an unack'd previous key. Default-false so older builds (no field)
+          // render the standard chrome rather than spuriously banner.
+          wasRotated: recoveryData['rotated'] == true,
         );
       }
       return null;
@@ -410,12 +414,18 @@ class _SetupRouterState extends State<SetupRouter> {
       await _api.fetchCsrfToken();
       final material = await _generateRecoveryKey();
       if (material != null && mounted) {
-        _pendingRecoveryWords = material.words;
+        _pendingRecoveryMaterial = material;
+        // postLogin even when _firstSetupDetected: this direct-render path
+        // has no stepper (unlike FirstRunController), and postSetup would
+        // emit a null subtitle leaving the screen with no bridging copy at
+        // all. The postLogin subtitle ("save your recovery key — it's how
+        // you'll reset your password") is grammatically correct for a
+        // post-auth landing whether the operator came from setup or login.
+        _pendingRecoveryContext = RecoveryKeyEntryContext.postLogin;
         final keyId = material.keyId;
         _pendingPostRecoveryAction = () {
           unawaited(ackRecoveryKey(keyId));
-          _pendingRecoveryWords = null;
-          _pendingPostRecoveryAction = null;
+          _clearPendingRecovery();
           _createAuthController(AuthMode.passkeyRequired);
           setState(() {});
         };
@@ -430,8 +440,22 @@ class _SetupRouterState extends State<SetupRouter> {
     setState(() => _loading = false);
   }
 
-  List<String>? _pendingRecoveryWords;
+  // Hold material intact rather than unpacking — same shape as the
+  // controller-level capture.
+  RecoveryKeyMaterial? _pendingRecoveryMaterial;
+  RecoveryKeyEntryContext _pendingRecoveryContext =
+      RecoveryKeyEntryContext.postLogin;
   VoidCallback? _pendingPostRecoveryAction;
+
+  void _clearPendingRecovery() {
+    _pendingRecoveryMaterial = null;
+    // Reset to default rather than leave the last-flow value behind — keeps
+    // the gate (`_pendingRecoveryMaterial != null`) and the context in lock-
+    // step so a future code path that reads context outside that gate cannot
+    // see stale data.
+    _pendingRecoveryContext = RecoveryKeyEntryContext.postLogin;
+    _pendingPostRecoveryAction = null;
+  }
 
   /// Generate recovery key → show → then complete.
   Future<void> _handleRecoveryKeyThenComplete() async {
@@ -439,7 +463,13 @@ class _SetupRouterState extends State<SetupRouter> {
       await _api.fetchCsrfToken();
       final material = await _generateRecoveryKey();
       if (material != null && mounted) {
-        _pendingRecoveryWords = material.words;
+        _pendingRecoveryMaterial = material;
+        // postLogin even when _firstSetupDetected: see rationale on the
+        // sibling _handleRecoveryKeyThenPasskey — direct-render path lacks
+        // the stepper postSetup relies on, and postLogin's subtitle is the
+        // correct fallback regardless of whether the operator's prior
+        // screen was setup or login.
+        _pendingRecoveryContext = RecoveryKeyEntryContext.postLogin;
         final keyId = material.keyId;
         _pendingPostRecoveryAction = () async {
           // Await the ack here — _resumeOIDCOrComplete below can assign
@@ -449,8 +479,7 @@ class _SetupRouterState extends State<SetupRouter> {
           // operator re-prompted with rotated words on next sign-in.
           await ackRecoveryKey(keyId);
           if (!mounted) return;
-          _pendingRecoveryWords = null;
-          _pendingPostRecoveryAction = null;
+          _clearPendingRecovery();
           _resumeOIDCOrComplete();
         };
         setState(() => _loading = false);
@@ -549,10 +578,12 @@ class _SetupRouterState extends State<SetupRouter> {
         } else if (_showFinishing) {
           content = FinishingStep(phase: _finishingPhase);
           title = 'Setting up...';
-        } else if (_pendingRecoveryWords != null) {
+        } else if (_pendingRecoveryMaterial != null) {
           content = RecoveryKeyStep(
-            words: _pendingRecoveryWords!,
+            words: _pendingRecoveryMaterial!.words,
             onNext: _pendingPostRecoveryAction!,
+            entryContext: _pendingRecoveryContext,
+            wasRotated: _pendingRecoveryMaterial!.wasRotated,
           );
           title = 'Recovery key';
         } else {
@@ -694,6 +725,8 @@ class _SetupRouterState extends State<SetupRouter> {
         widget = RecoveryKeyStep(
           words: ctrl.recoveryWords,
           onNext: ctrl.proceedAfterRecovery,
+          entryContext: ctrl.recoveryEntryContext,
+          wasRotated: ctrl.recoveryWasRotated,
         );
         title = 'Recovery key';
       case FirstRunStep.security:
@@ -770,6 +803,8 @@ class _SetupRouterState extends State<SetupRouter> {
         widget = RecoveryKeyStep(
           words: ctrl.recoveryWords,
           onNext: ctrl.proceedAfterRecovery,
+          entryContext: ctrl.recoveryEntryContext,
+          wasRotated: ctrl.recoveryWasRotated,
         );
         title = 'Recovery key';
     }

@@ -53,12 +53,17 @@ class AuthController extends ChangeNotifier {
   List<String>? _loginMethods;
   List<String>? get loginMethods => _loginMethods;
 
-  List<String> _recoveryWords = [];
-  List<String> get recoveryWords => _recoveryWords;
+  // Hold the server-returned material intact rather than unpacking into
+  // parallel fields — adding a future RecoveryKeyMaterial field (e.g., a
+  // staleness timestamp) then propagates structurally instead of via 7
+  // capture-site edits. Getters expose the bits the screen actually reads.
+  RecoveryKeyMaterial? _recoveryMaterial;
+  RecoveryKeyEntryContext _recoveryEntryContext =
+      RecoveryKeyEntryContext.postLogin;
 
-  // REC-4: keyId companion to _recoveryWords so proceedAfterRecovery can
-  // bind the ack to the version the operator actually saw.
-  String _recoveryKeyID = '';
+  List<String> get recoveryWords => _recoveryMaterial?.words ?? const [];
+  bool get recoveryWasRotated => _recoveryMaterial?.wasRotated ?? false;
+  RecoveryKeyEntryContext get recoveryEntryContext => _recoveryEntryContext;
 
   @override
   void dispose() {
@@ -146,8 +151,12 @@ class AuthController extends ChangeNotifier {
       await _api.fetchCsrfToken();
       final material = await generateRecoveryKey();
       if (material != null) {
-        _recoveryWords = material.words;
-        _recoveryKeyID = material.keyId;
+        // Partial-setup recovery — operator unlocked into a half-finished
+        // setup state and we just completed it here. Treat as postSetup
+        // (they're literally finishing initial setup) rather than postLogin,
+        // even though the entry was an unlock screen.
+        _recoveryMaterial = material;
+        _recoveryEntryContext = RecoveryKeyEntryContext.postSetup;
         _setupPhase = null;
         _step = AuthStep.recoveryKey;
         return;
@@ -231,7 +240,8 @@ class AuthController extends ChangeNotifier {
     // First-run: generate recovery key before any routing. Server is
     // authoritative when present; constructor fallback only for older builds.
     if (await _showRecoveryKeyIfPending(
-        _resolvePending(resp is Map ? resp.cast<String, dynamic>() : null))) {
+        _resolvePending(resp is Map ? resp.cast<String, dynamic>() : null),
+        RecoveryKeyEntryContext.postLogin)) {
       return;
     }
 
@@ -265,7 +275,8 @@ class AuthController extends ChangeNotifier {
       // login, so the constructor-time recoveryKeyPending may be stale —
       // _resolvePending centralizes the server-authoritative-with-fallback
       // rule.
-      if (await _showRecoveryKeyIfPending(_resolvePending(finishResp))) {
+      if (await _showRecoveryKeyIfPending(
+          _resolvePending(finishResp), RecoveryKeyEntryContext.postLogin)) {
         return true;
       }
 
@@ -313,7 +324,8 @@ class AuthController extends ChangeNotifier {
       // at router level) so a server-side false-positive on the gate or a
       // staleness-read failure won't misattribute as a passkey error.
       if (await _showRecoveryKeyIfPending(
-          finishResp['recovery_key_pending'] == true)) {
+          finishResp['recovery_key_pending'] == true,
+          RecoveryKeyEntryContext.postPasskeyRegister)) {
         return true;
       }
 
@@ -390,12 +402,13 @@ class AuthController extends ChangeNotifier {
   /// generateRecoveryKey returned null on transient 409/503 (skip silently
   /// per router policy). notifyListeners is called on success so the UI
   /// reflects the step change without relying on the caller's later notify.
-  Future<bool> _showRecoveryKeyIfPending(bool pending) async {
+  Future<bool> _showRecoveryKeyIfPending(
+      bool pending, RecoveryKeyEntryContext ctx) async {
     if (!pending) return false;
     final material = await generateRecoveryKey();
     if (material == null) return false;
-    _recoveryWords = material.words;
-    _recoveryKeyID = material.keyId;
+    _recoveryMaterial = material;
+    _recoveryEntryContext = ctx;
     _step = AuthStep.recoveryKey;
     if (!_disposed) notifyListeners();
     return true;
@@ -410,7 +423,7 @@ class AuthController extends ChangeNotifier {
     // would race the navigation and may never reach the server, leaving
     // RecoveryAckAt=zero and the operator re-prompted with rotated words
     // on next sign-in.
-    final keyId = _recoveryKeyID;
+    final keyId = _recoveryMaterial?.keyId ?? '';
     unawaited(() async {
       await ackRecoveryKey(keyId);
       if (_disposed) return;

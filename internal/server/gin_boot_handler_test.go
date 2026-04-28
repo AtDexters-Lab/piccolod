@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"piccolod/internal/events"
 	"piccolod/internal/persistence"
 )
 
@@ -384,6 +385,11 @@ func TestRecoveryKeyGenerate_RefusesRotationOnAckedKey(t *testing.T) {
 // TestRecoveryKeyGenerate_AllowsRotationWithForceFlag verifies that explicit
 // rotations (e.g., a future Settings → Rotate Recovery Key flow) bypass the
 // REC-FOLLOWUP guard with force_rotate=true.
+//
+// Also pins REC-3: rotated=false when force_rotate=true. The "these words are
+// new" banner is for *silent* rotation (the operator was prompted unexpectedly);
+// an explicit Settings rotation has its own UX and would only confuse if it
+// also raised the banner.
 func TestRecoveryKeyGenerate_AllowsRotationWithForceFlag(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
@@ -403,12 +409,21 @@ func TestRecoveryKeyGenerate_AllowsRotationWithForceFlag(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 with force_rotate=true; got %d body=%s", w.Code, w.Body.String())
 	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if rotated, _ := resp["rotated"].(bool); rotated {
+		t.Fatalf("expected rotated=false on force_rotate=true (explicit rotation, no banner); got rotated=true")
+	}
 }
 
 // TestRecoveryKeyGenerate_AllowsRotationOnUnackedKey verifies that the
 // timeout-recovery scenario still works: server has a key written but never
 // acked → /generate rotates and returns fresh words (operator never had
 // paper from the old key).
+//
+// Also pins REC-3: rotated=true when /generate replaces an unack'd previous
+// key. The UI uses this signal to render the "these words are new" banner so
+// an operator who saved stale paper notices the words changed.
 func TestRecoveryKeyGenerate_AllowsRotationOnUnackedKey(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
@@ -430,6 +445,85 @@ func TestRecoveryKeyGenerate_AllowsRotationOnUnackedKey(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	if _, ok := resp["words"]; !ok {
 		t.Fatalf("expected words in response; got %v", resp)
+	}
+	if rotated, _ := resp["rotated"].(bool); !rotated {
+		t.Fatalf("expected rotated=true on silent rotation of unack'd key (REC-3 banner trigger); got %v", resp["rotated"])
+	}
+}
+
+// TestRecoveryKeyGenerate_AuditVsResponse_DivergeOnForceRotate pins the
+// intentional semantic split: the audit log records `rotated: rotating`
+// (mechanical fact — was a prior key replaced), while the JSON response
+// carries `rotated: silentRotation` (UX signal — should the UI banner show).
+// On force_rotate=true these diverge: audit=true, response=false. Without
+// this test, a future "consolidate to one rotated value" refactor could
+// silently break either the audit trail or the silent-rotation banner.
+func TestRecoveryKeyGenerate_AuditVsResponse_DivergeOnForceRotate(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	srv.authRepo = &fakeAuthRepo{
+		staleness: persistence.AuthStaleness{RecoveryAckAt: time.Now().UTC()},
+	}
+
+	auditCh := srv.events.Subscribe(events.TopicAudit, 8)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/generate",
+		strings.NewReader(`{"force_rotate":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200; got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if rotated, _ := resp["rotated"].(bool); rotated {
+		t.Fatalf("response: expected rotated=false on force_rotate (silent-rotation signal); got true")
+	}
+
+	select {
+	case ev := <-auditCh:
+		audit, ok := ev.Payload.(events.AuditEvent)
+		if !ok {
+			t.Fatalf("audit payload type: got %T", ev.Payload)
+		}
+		if audit.Kind != "auth.recovery_key_generate" {
+			t.Fatalf("audit kind: got %q want auth.recovery_key_generate", audit.Kind)
+		}
+		if rotated, _ := audit.Metadata["rotated"].(bool); !rotated {
+			t.Fatalf("audit metadata: expected rotated=true on force_rotate (mechanical fact); got %v", audit.Metadata["rotated"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for audit event")
+	}
+}
+
+// TestRecoveryKeyGenerate_FirstTimeGen_RotatedFalse pins the first-time
+// generation case for REC-3: when no recovery key existed before this call,
+// rotated=false. There's no prior paper for the operator to be confused
+// about, so the banner would be misleading.
+func TestRecoveryKeyGenerate_FirstTimeGen_RotatedFalse(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+	srv.authRepo = &fakeAuthRepo{} // RecoveryAckAt zero
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/generate",
+		strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on first-time generation; got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if rotated, _ := resp["rotated"].(bool); rotated {
+		t.Fatalf("expected rotated=false on first-time generation (no prior paper to invalidate); got rotated=true")
 	}
 }
 
