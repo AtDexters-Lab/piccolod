@@ -84,37 +84,38 @@ func TestHandleTelemetryLog(t *testing.T) {
 	})
 
 	t.Run("novel_type_accepted", func(t *testing.T) {
-		// Allowlists defeat unknown-unknown discovery; the regex is the only gate.
+		// Whatever the client sends, the journal logs it. No allowlist, no
+		// shape gate — that's the point.
+		r, _ := setupTelemetryTestRouter()
+		for _, typ := range []string{
+			"brand_new_signal_2099",
+			"UPPER_CASE",
+			"has-dash",
+			"123leading_digit",
+		} {
+			w := postTelemetry(r, telemetryRequest{
+				Entries: []telemetryEntry{{Type: typ, Message: "from a future build"}},
+				Session: telemetrySession{PiccoloVersion: "dev"},
+			})
+			if w.Code != http.StatusAccepted {
+				t.Errorf("type %q: got status %d, want %d", typ, w.Code, http.StatusAccepted)
+			}
+		}
+	})
+
+	t.Run("empty_type_skipped", func(t *testing.T) {
+		// Empty type after sanitization is the only filter — nothing useful
+		// to log.
 		r, _ := setupTelemetryTestRouter()
 		w := postTelemetry(r, telemetryRequest{
 			Entries: []telemetryEntry{
-				{Type: "brand_new_signal_2099", Message: "from a future build"},
+				{Type: "", Message: "noise"},
+				{Type: "\x00\x01", Message: "control-chars-only"},
 			},
 			Session: telemetrySession{PiccoloVersion: "dev"},
 		})
 		if w.Code != http.StatusAccepted {
 			t.Errorf("got status %d, want %d", w.Code, http.StatusAccepted)
-		}
-	})
-
-	t.Run("malformed_type_skipped", func(t *testing.T) {
-		r, _ := setupTelemetryTestRouter()
-		for _, badType := range []string{
-			"",
-			"UPPER_CASE",
-			"has-dash",
-			"has space",
-			"123leading_digit",
-			"_leading_underscore",
-			strings.Repeat("a", 65), // exceeds 64-char ceiling
-		} {
-			w := postTelemetry(r, telemetryRequest{
-				Entries: []telemetryEntry{{Type: badType, Message: "test"}},
-				Session: telemetrySession{PiccoloVersion: "dev"},
-			})
-			if w.Code != http.StatusAccepted {
-				t.Errorf("type %q: got status %d, want %d (still 202; malformed entries skipped)", badType, w.Code, http.StatusAccepted)
-			}
 		}
 	})
 

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,15 +18,10 @@ const (
 	telemetryMaxMessageLen = 512
 	telemetryMaxStackLen   = 2048
 	telemetryMaxRouteLen   = 64
+	telemetryMaxTypeLen    = 64
 	telemetryMaxVersionLen = 32
 	telemetryMaxScreenLen  = 16
 )
-
-// telemetryTypeRe constrains the type token shape; the shape is the only gate.
-// Allowlists defeat the purpose of telemetry — we want unknown-unknowns to land
-// in the journal, not be silently dropped because the backend hadn't heard of
-// them yet.
-var telemetryTypeRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 type telemetryRequest struct {
 	Entries []telemetryEntry `json:"entries"`
@@ -76,13 +70,10 @@ func (s *GinServer) handleTelemetryLog(c *gin.Context) {
 	screen := sanitizeTelemetryField(req.Session.Screen, telemetryMaxScreenLen)
 
 	for _, e := range req.Entries {
-		if !telemetryTypeRe.MatchString(e.Type) {
-			log.Printf("WARN: ui-telemetry dropped malformed type=%q msg=%q",
-				truncateTelemetryString(e.Type, 64),
-				truncateTelemetryString(sanitizeTelemetryField(e.Message, telemetryMaxMessageLen), 200))
+		typ := sanitizeTelemetryField(e.Type, telemetryMaxTypeLen)
+		if typ == "" {
 			continue
 		}
-
 		msg := sanitizeTelemetryField(e.Message, telemetryMaxMessageLen)
 		route := sanitizeTelemetryField(e.Route, telemetryMaxRouteLen)
 		ts := sanitizeTelemetryTimestamp(e.Ts)
@@ -95,10 +86,10 @@ func (s *GinServer) handleTelemetryLog(c *gin.Context) {
 		}
 
 		// All client-supplied free-text fields use %q so embedded spaces or
-		// '=' can't spoof other fields when the journal line is grep'd. type
-		// is regex-bounded to [a-z0-9_]; count/ts are typed/format-validated.
+		// '=' can't be misread by a human grep'ing the journal. Empty type is
+		// the only filter — we want unknown-unknowns to land here.
 		parts := []string{
-			fmt.Sprintf("type=%s", e.Type),
+			fmt.Sprintf("type=%q", typ),
 		}
 		if route != "" {
 			parts = append(parts, fmt.Sprintf("route=%q", route))
@@ -117,10 +108,10 @@ func (s *GinServer) handleTelemetryLog(c *gin.Context) {
 
 		// Stack logging is conditioned on payload, not type — the client owns
 		// what's worth a stack. Volume is bounded by client-side fingerprint
-		// dedup (one stack per unique error per flush), not by the type list.
+		// dedup (one stack per unique error per flush).
 		if e.Stack != "" {
 			stack := sanitizeTelemetryField(e.Stack, telemetryMaxStackLen)
-			log.Printf("ui-telemetry-stack: type=%s msg=%q stack=%q", e.Type, truncateTelemetryString(msg, 80), stack)
+			log.Printf("ui-telemetry-stack: type=%q msg=%q stack=%q", typ, truncateTelemetryString(msg, 80), stack)
 		}
 	}
 
