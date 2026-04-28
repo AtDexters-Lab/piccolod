@@ -2,9 +2,14 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"piccolod/internal/persistence"
 )
 
 func TestBoot_FreshServer(t *testing.T) {
@@ -130,5 +135,262 @@ func TestBoot_Locked(t *testing.T) {
 	}
 	if resp["screen"] != "unlock" {
 		t.Fatalf("expected screen=unlock, got %v", resp["screen"])
+	}
+}
+
+// TestBoot_Locked_DoesNotClaimRecoveryPending guards against a regression
+// where the staleness gate runs on locked devices, where Staleness() always
+// returns ErrLocked, fail-closing recovery_key_pending=true. The auth
+// controller would then call /recovery-key/generate on unlock, which rotates
+// the existing recovery key and silently invalidates the operator's saved
+// words on every routine reboot. Locked boots must fall back to file-presence
+// only.
+func TestBoot_Locked_DoesNotClaimRecoveryPending(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	setupTestAdminSession(t, srv) // initializes crypto
+
+	// Generate a recovery key, then lock crypto and inject the locked-state
+	// read failure (the real repo returns ErrLocked when locked).
+	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	srv.cryptoManager.Lock()
+	srv.authRepo = &fakeAuthRepo{loadErr: persistence.ErrLocked}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/system/boot", nil)
+	srv.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["screen"] != "unlock" {
+		t.Fatalf("expected screen=unlock, got %v", resp["screen"])
+	}
+	if v, present := resp["recovery_key_pending"]; present && v == true {
+		t.Fatalf("locked boot must not claim recovery_key_pending — would trigger rotation on unlock and destroy saved key (got %v)", v)
+	}
+}
+
+// TestBoot_RecoveryPendingClearedAfterAck verifies the ack→gate contract:
+// post-setup with a recovery key generated but unacknowledged, boot reports
+// pending; once the operator acks via /crypto/recovery-key/ack, boot stops
+// reporting pending. This is the central guarantee REC-1 provides.
+func TestBoot_RecoveryPendingClearedAfterAck(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	repo := &fakeAuthRepo{} // RecoveryAckAt zero
+	srv.authRepo = repo
+
+	// Pre-ack: boot must report pending.
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/system/boot", nil)
+	req.AddCookie(sessionCookie)
+	srv.router.ServeHTTP(w, req)
+	var pre map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &pre)
+	if pre["recovery_key_pending"] != true {
+		t.Fatalf("pre-ack: expected recovery_key_pending=true, got %v body=%s", pre["recovery_key_pending"], w.Body.String())
+	}
+
+	// Ack via the new endpoint.
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/ack", nil)
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ack failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if repo.staleness.RecoveryAckAt.IsZero() {
+		t.Fatalf("ack endpoint did not persist RecoveryAckAt")
+	}
+
+	// Post-ack: boot must NOT report pending.
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/system/boot", nil)
+	req.AddCookie(sessionCookie)
+	srv.router.ServeHTTP(w, req)
+	var post map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &post)
+	if v, present := post["recovery_key_pending"]; present && v == true {
+		t.Fatalf("post-ack: recovery_key_pending must be cleared (got %v)", v)
+	}
+}
+
+// TestBoot_RecoveryPendingFailClosedOnUnlockedReadError verifies the gate's
+// fail-closed posture: on an unlocked boot, if the staleness read errors
+// for any reason other than ErrLocked, recovery_key_pending must be true so
+// the user is re-prompted rather than silently treated as ack'd.
+func TestBoot_RecoveryPendingFailClosedOnUnlockedReadError(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, _ := setupTestAdminSession(t, srv)
+	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	// Inject a fake auth repo that errors with a non-ErrLocked failure.
+	srv.authRepo = &fakeAuthRepo{loadErr: errors.New("transient db failure")}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/system/boot", nil)
+	req.AddCookie(sessionCookie)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["recovery_key_pending"] != true {
+		t.Fatalf("expected fail-closed recovery_key_pending=true on staleness read error, got %v", resp["recovery_key_pending"])
+	}
+}
+
+// TestBoot_RecoveryNotPendingWhenAcked is the happy-path direct read: a
+// fully populated repo (RecoveryAckAt non-zero) on an unlocked, initialized
+// device with HasRecoveryKey()=true must return recovery_key_pending absent.
+// Complements the ack-via-endpoint test by asserting the gate's read of an
+// already-persisted ack works independently of the endpoint write path.
+func TestBoot_RecoveryNotPendingWhenAcked(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, _ := setupTestAdminSession(t, srv)
+	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	srv.authRepo = &fakeAuthRepo{
+		staleness: persistence.AuthStaleness{RecoveryAckAt: time.Now().UTC()},
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/system/boot", nil)
+	req.AddCookie(sessionCookie)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if v, present := resp["recovery_key_pending"]; present && v == true {
+		t.Fatalf("acked-state direct read must not flip pending=true; got %v", v)
+	}
+}
+
+// TestLogin_SurfacesRecoveryKeyPendingForUnlockChain guards the post-unlock
+// re-evaluation of the recovery-key gate. Locked boot suppresses pending=true
+// (file-presence-only fallback to avoid the rotation hazard), and the
+// unlock-then-login chain doesn't re-call /system/boot. The login response
+// must therefore re-evaluate and surface the gate so the auth controller can
+// route the operator to the recovery-key screen instead of straight to
+// dashboard with an unack'd key.
+func TestLogin_SurfacesRecoveryKeyPendingForUnlockChain(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	setupTestAdminSession(t, srv) // initializes crypto + admin user
+	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	srv.authRepo = &fakeAuthRepo{} // RecoveryAckAt zero
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/auth/login",
+		strings.NewReader(`{"username":"admin","password":"TestPass123!"}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["recovery_key_pending"] != true {
+		t.Fatalf("login response must surface recovery_key_pending=true on unack'd device; got %v", resp["recovery_key_pending"])
+	}
+}
+
+// TestLogin_RecoveryKeyPendingFalseWhenAcked locks in the always-emit
+// contract: the login response must include `recovery_key_pending` (true OR
+// false) so the client can treat it as authoritative rather than OR-ing in
+// the stale boot snapshot. Asserts false-case is explicit, not absent.
+func TestLogin_RecoveryKeyPendingFalseWhenAcked(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	setupTestAdminSession(t, srv)
+	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	srv.authRepo = &fakeAuthRepo{
+		staleness: persistence.AuthStaleness{RecoveryAckAt: time.Now().UTC()},
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/auth/login",
+		strings.NewReader(`{"username":"admin","password":"TestPass123!"}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	v, present := resp["recovery_key_pending"]
+	if !present {
+		t.Fatalf("login response must always include recovery_key_pending field; got body=%s", w.Body.String())
+	}
+	if v != false {
+		t.Fatalf("expected recovery_key_pending=false on acked device; got %v", v)
+	}
+}
+
+// TestRecoveryKeyAck_DeniedDuringForcedPasskeyRegistration guards the C7
+// belt-and-suspenders contract: state-mutating handlers under the
+// /crypto/recovery-key/ prefix must reject sessions with MustRegisterPasskey
+// set. Without this, a stolen-admin-password attacker could ack the recovery
+// key during the bootstrap window, suppressing the boot prompt that the
+// legitimate operator needs to actually see/save their recovery words.
+func TestRecoveryKeyAck_DeniedDuringForcedPasskeyRegistration(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+	sess, ok := srv.sessions.Get(sessionCookie.Value)
+	if !ok {
+		t.Fatalf("session not found")
+	}
+	sess.MustRegisterPasskey.Store(true)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/crypto/recovery-key/ack", nil)
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 during MustRegisterPasskey, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestBoot_RecoveryPendingNotPendingOnErrLockedRace guards against a TOCTOU
+// where /crypto/lock fires between the IsLocked() check and Staleness() call.
+// The staleness read returns ErrLocked; the gate must treat that identically
+// to IsLocked()=true (file-presence only) rather than fail-closing to
+// pending=true, which would re-introduce the B1 rotation hazard via the race.
+func TestBoot_RecoveryPendingNotPendingOnErrLockedRace(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, _ := setupTestAdminSession(t, srv)
+	if _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
+		t.Fatalf("GenerateRecoveryKey: %v", err)
+	}
+	// Crypto stays unlocked at the IsLocked() check, but the staleness read
+	// errors with ErrLocked — simulating a concurrent /crypto/lock that
+	// landed between the two probes.
+	srv.authRepo = &fakeAuthRepo{loadErr: persistence.ErrLocked}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/system/boot", nil)
+	req.AddCookie(sessionCookie)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if v, present := resp["recovery_key_pending"]; present && v == true {
+		t.Fatalf("ErrLocked race must not flip recovery_key_pending=true (would invalidate saved key on unlock); got %v", v)
 	}
 }

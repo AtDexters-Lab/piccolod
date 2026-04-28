@@ -231,8 +231,15 @@ class AuthController extends ChangeNotifier {
     );
     await _api.fetchCsrfToken();
 
-    // First-run: generate recovery key before any routing.
-    if (recoveryKeyPending) {
+    // First-run: generate recovery key before any routing. The server
+    // re-evaluates the gate at login time; treat that as authoritative when
+    // present (covers the locked-boot-then-unlock chain where the boot
+    // snapshot is suppressed by file-presence-only fallback). Fall back to
+    // the constructor value only if the field is absent (older server).
+    final pending = resp is Map && resp.containsKey('recovery_key_pending')
+        ? resp['recovery_key_pending'] == true
+        : recoveryKeyPending;
+    if (pending) {
       final words = await generateRecoveryKey();
       if (words != null) {
         _recoveryWords = words;
@@ -374,7 +381,17 @@ class AuthController extends ChangeNotifier {
   // --- Recovery key proceed ---
 
   void proceedAfterRecovery() {
-    reRoute();
+    // Await the ack before rerouting — reRoute → _checkBoot → _routeDesktop
+    // can land on _completeDesktopRedirectOrFinish, which assigns
+    // window.location.href and aborts in-flight requests on the page. A
+    // fire-and-forget ack would race the navigation and may never reach
+    // the server, leaving RecoveryAckAt=zero and the operator re-prompted
+    // with rotated words on next sign-in.
+    unawaited(() async {
+      await ackRecoveryKey();
+      if (_disposed) return;
+      reRoute();
+    }());
   }
 
   // --- Redirect helpers ---

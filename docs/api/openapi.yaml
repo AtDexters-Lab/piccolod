@@ -419,6 +419,25 @@ paths:
                   words:
                     type: array
                     items: { type: string }
+  /crypto/recovery-key/ack:
+    post:
+      summary: Acknowledge that the operator has seen and saved the current recovery-key words (admin only)
+      security:
+        - cookieAuth: []
+        - csrfToken: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+        '403':
+          description: Forbidden during MustRegisterPasskey bootstrap window
+        '500':
+          description: Failed to record acknowledgement
   /updates/os:
     get:
       summary: OS update status

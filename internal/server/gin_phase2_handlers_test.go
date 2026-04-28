@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"piccolod/internal/remote"
+	"strings"
 	"testing"
 )
 
@@ -75,7 +76,6 @@ func TestLANOnly_RejectsLoopback(t *testing.T) {
 		{"GET", "/api/v1/system/emergency"},
 		{"GET", "/api/v1/openapi.yaml"},
 		{"GET", "/api/v1/crypto/recovery-key"},
-		{"POST", "/api/v1/crypto/setup"},
 		{"POST", "/api/v1/crypto/reset-password"},
 		{"POST", "/api/v1/system/pcv/import"},
 	}
@@ -90,6 +90,26 @@ func TestLANOnly_RejectsLoopback(t *testing.T) {
 				t.Errorf("expected 403 for loopback, got %d", w.Code)
 			}
 		})
+	}
+}
+
+// TestCryptoSetup_NonceGatedFromLoopback verifies that /crypto/setup is no
+// longer LAN-only network-gated — instead, loopback (Nexus-tunneled) requests
+// are required to present a valid setup nonce, which proves the requester held
+// LAN access at the time of /identity/setup-hostname (where the nonce is minted).
+// The nonce-as-trust-anchor is a stronger primitive than per-request LAN check
+// because it works across reboots for partial-setup recovery.
+func TestCryptoSetup_NonceGatedFromLoopback(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/crypto/setup",
+		strings.NewReader(`{"password":"some-strong-password-123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "127.0.0.1:12345"
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 from nonce check on loopback, got %d body=%s", w.Code, w.Body.String())
 	}
 }
 

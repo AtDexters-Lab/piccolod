@@ -406,6 +406,7 @@ class _SetupRouterState extends State<SetupRouter> {
       if (words != null && mounted) {
         _pendingRecoveryWords = words;
         _pendingPostRecoveryAction = () {
+          unawaited(ackRecoveryKey());
           _pendingRecoveryWords = null;
           _pendingPostRecoveryAction = null;
           _createAuthController(AuthMode.passkeyRequired);
@@ -432,10 +433,16 @@ class _SetupRouterState extends State<SetupRouter> {
       final words = await _generateRecoveryKey();
       if (words != null && mounted) {
         _pendingRecoveryWords = words;
-        _pendingPostRecoveryAction = () {
+        _pendingPostRecoveryAction = () async {
+          // Await the ack here — _completeDesktopRedirectOrFinish below can
+          // assign window.location.href, which aborts in-flight requests on
+          // the page. A fire-and-forget ack would race the navigation and
+          // may never reach the server, leaving RecoveryAckAt=zero and the
+          // operator re-prompted with rotated words on next sign-in.
+          await ackRecoveryKey();
+          if (!mounted) return;
           _pendingRecoveryWords = null;
           _pendingPostRecoveryAction = null;
-          // Resume deferred OIDC/next redirect before completing.
           _completeDesktopRedirectOrFinish();
         };
         setState(() => _loading = false);

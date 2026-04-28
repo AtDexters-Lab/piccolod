@@ -320,6 +320,15 @@ func (s *GinServer) handleAuthLogin(c *gin.Context) {
 			resp["redirect_url"] = validated
 		}
 	}
+	// Surface the recovery-key gate post-login so the post-unlock-then-login
+	// path picks it up. Without this, a locked boot suppresses pending=true
+	// (file-presence-only fallback to avoid the rotation hazard), the auth
+	// controller caches the stale flag at construction, and the unlock chain
+	// goes straight to login/desktop without re-checking /system/boot —
+	// leaving an unack'd key un-prompted forever. Always emit the field
+	// (true or false) so the client treats the login response as
+	// authoritative rather than OR-ing in the stale boot snapshot.
+	resp["recovery_key_pending"] = s.computeRecoveryKeyPending(c.Request.Context())
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -462,6 +471,23 @@ func (s *GinServer) handleAuthStalenessAck(c *gin.Context) {
 	if !body.Password && !body.Recovery {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no flags selected"})
 		return
+	}
+	// Recovery-ack is admin-only: viewing the recovery words is admin-gated
+	// (handleCryptoRecoveryGenerate is admin.POST), so the corresponding ack
+	// must match. Without this guard, any authed non-admin could set
+	// RecoveryAckAt, suppressing the boot/login recovery-key prompt and
+	// hiding from the legitimate admin that they need to view/save the key.
+	if body.Recovery {
+		id, ok := s.getSession(c)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			return
+		}
+		sess, sok := s.sessions.Get(id)
+		if !sok || sess.Role != "admin" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "admin required"})
+			return
+		}
 	}
 	ctx, cancel := s.opContext(c, 30*time.Second)
 	defer cancel()

@@ -683,3 +683,39 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 	s.publishAuditEvent(c, "auth.recovery_key_generate", map[string]any{"rotated": rotating})
 	c.JSON(http.StatusOK, gin.H{"words": words})
 }
+
+// handleCryptoRecoveryKeyAck: POST /api/v1/crypto/recovery-key/ack
+// Records that the operator has seen and saved the current recovery-key words.
+// Without this, recovery_key_pending is presence-based — a UI timeout between
+// /crypto/setup writing keyset.json and the words reaching the browser leaves
+// the user permanently locked out of password recovery despite the file
+// existing on disk. The boot handler gates recovery_key_pending on
+// RecoveryAckAt being non-zero so a reload after timeout re-prompts.
+func (s *GinServer) handleCryptoRecoveryKeyAck(c *gin.Context) {
+	// C7 belt-and-suspenders: the requireSession middleware admits the entire
+	// /api/v1/crypto/recovery-key/ prefix during the MustRegisterPasskey
+	// bootstrap window so the read-only status endpoint stays reachable. State-
+	// mutating handlers under that prefix must individually deny — sibling
+	// handleCryptoRecoveryGenerate enforces the same gate. Without this guard,
+	// a stolen-admin-password attacker in the bootstrap window could ack the
+	// recovery key, suppressing the boot-time prompt that REC-1 exists to
+	// surface to the legitimate operator.
+	if id, ok := s.getSession(c); ok {
+		if sess, sok := s.sessions.Get(id); sok && sess.MustRegisterPasskey.Load() {
+			c.JSON(http.StatusForbidden, gin.H{"error": "passkey_registration_required"})
+			return
+		}
+	}
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
+	now := time.Now().UTC()
+	if err := s.applyStalenessUpdate(ctx, persistence.AuthStalenessUpdate{
+		RecoveryAckAt: timePtr(now),
+	}); err != nil {
+		log.Printf("WARN: recovery-key ack failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record acknowledgement"})
+		return
+	}
+	s.publishAuditEvent(c, "auth.recovery_key_ack", nil)
+	c.JSON(http.StatusOK, gin.H{"message": "ok"})
+}

@@ -7,6 +7,37 @@ import 'package:piccolo_os/core/services/error_reporter.dart';
 /// Phases within the crypto setup operation (displayed by FinishingStep).
 enum SetupPhase { encrypting, creatingAdmin, generatingKey }
 
+/// Records that the operator has seen and saved the current recovery-key words.
+/// Without this, recovery_key_pending stays true on next boot only by file
+/// presence — but a UI timeout between the server writing keyset.json and the
+/// words reaching the browser leaves a "ghost" recovery key the user never saw.
+///
+/// Retries a few times with backoff before giving up: a transient ack-write
+/// failure → next boot returns recovery_key_pending=true → auth controller
+/// calls /recovery-key/generate on unlock → ROTATES the freshly-saved key,
+/// silently invalidating the words the operator just wrote down. The retry
+/// loop closes that window for plausible blip durations (~2.5 seconds total).
+/// Persistent failure beyond the retry budget logs and gives up; the operator
+/// will be re-prompted on next reload, which is the correct fail-closed
+/// posture even though it costs them an extra recovery-key save.
+Future<void> ackRecoveryKey() async {
+  const attempts = 3;
+  const backoff = [Duration(milliseconds: 500), Duration(seconds: 2)];
+  for (var i = 0; i < attempts; i++) {
+    try {
+      await ApiClient().post('/api/v1/crypto/recovery-key/ack');
+      return;
+    } on Object catch (e) {
+      if (i == attempts - 1) {
+        debugPrint('Recovery-key ack failed after $attempts attempts '
+            '(will re-prompt on reload): $e');
+        return;
+      }
+      await Future<void>.delayed(backoff[i]);
+    }
+  }
+}
+
 /// Extract a structured error code from a JSON error response body.
 String? extractErrorCode(String body) {
   try {

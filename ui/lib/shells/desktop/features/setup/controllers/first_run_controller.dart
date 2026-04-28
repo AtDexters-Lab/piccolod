@@ -406,6 +406,7 @@ class FirstRunController extends ChangeNotifier {
   // --- Recovery key proceed ---
 
   void proceedAfterRecovery() {
+    unawaited(ackRecoveryKey());
     if (isOnRemoteDomain()) {
       _step = FirstRunStep.passkeyRequired;
     } else {

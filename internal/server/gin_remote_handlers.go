@@ -114,8 +114,10 @@ func (s *GinServer) handleRemoteManagedConfigure(c *gin.Context) {
 }
 
 func (s *GinServer) resolvePortalPort() int {
-	if s != nil && s.securePort > 0 {
-		return s.securePort
+	if s != nil {
+		if p := s.securePort.Load(); p > 0 {
+			return int(p)
+		}
 	}
 	if p := os.Getenv("PORT"); p != "" {
 		if v, err := strconv.Atoi(p); err == nil && v > 0 {

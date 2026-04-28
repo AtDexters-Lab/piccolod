@@ -106,11 +106,7 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 	//    (Soft emergency falls through here — user can still unlock/login.)
 	cryptoInit := s.cryptoManager != nil && s.cryptoManager.IsInitialized()
 
-	// Compute once: recovery key not yet generated on an initialized device.
-	// HasRecoveryKey reads keyset.json directly (no lock/unlock dependency).
-	// Used by post-setup screens (7-10) to tell the frontend that the first-run
-	// recovery-key step is still pending.
-	recoveryKeyPending := cryptoInit && !s.cryptoManager.HasRecoveryKey()
+	recoveryKeyPending := s.computeRecoveryKeyPending(c.Request.Context())
 
 	if !cryptoInit {
 		c.JSON(http.StatusOK, s.bootSetupResponse())

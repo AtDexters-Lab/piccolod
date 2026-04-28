@@ -108,7 +108,12 @@ type GinServer struct {
 
 	secureSrv      *http.Server
 	secureListener net.Listener
-	securePort     int
+	// securePort is read by the observeRemoteConfig subscriber goroutine via
+	// resolvePortalPort(); written by initSecureLoopback / stopSecureLoopback.
+	// atomic.Int32 documents the cross-goroutine intent and silences the race
+	// detector. The fallback path in resolvePortalPort already tolerates a
+	// transient zero load (PORT env / 80), so functional behavior is unchanged.
+	securePort atomic.Int32
 
 	// Precomputed ETags and cache policies for embedded web assets
 	staticCache *staticAssetCache
@@ -1896,6 +1901,7 @@ func (s *GinServer) setupGinRoutes() {
 		// Crypto endpoints (session required for lock/recovery management)
 		admin.POST("/crypto/lock", s.handleCryptoLock)
 		admin.POST("/crypto/recovery-key/generate", s.handleCryptoRecoveryGenerate)
+		admin.POST("/crypto/recovery-key/ack", s.handleCryptoRecoveryKeyAck)
 
 		// App management endpoints
 		apps := authed.Group("/apps")
@@ -3334,7 +3340,7 @@ func (s *GinServer) initSecureLoopback() error {
 	}
 	s.secureListener = ln
 	if addr, ok := ln.Addr().(*net.TCPAddr); ok {
-		s.securePort = addr.Port
+		s.securePort.Store(int32(addr.Port))
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), secureContextKeyInstance, true)
@@ -3353,10 +3359,11 @@ func (s *GinServer) initSecureLoopback() error {
 			// the TLS mux calls RegisterProxyHint. Retry briefly — the hint
 			// arrives within microseconds once the TLS mux goroutine runs.
 			if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok && s.serviceManager != nil {
+				port := int(s.securePort.Load())
 				var clientIP string
 				var found bool
 				for attempt := 0; attempt < hintRetryAttempts; attempt++ {
-					clientIP, found = s.serviceManager.ConsumePortalHint(s.securePort, addr.Port)
+					clientIP, found = s.serviceManager.ConsumePortalHint(port, addr.Port)
 					if found {
 						break
 					}
@@ -3387,7 +3394,7 @@ func (s *GinServer) startSecureLoopback() {
 			log.Printf("WARN: secure loopback server stopped: %v", err)
 		}
 	}()
-	log.Printf("INFO: Secure loopback portal listening on 127.0.0.1:%d", s.securePort)
+	log.Printf("INFO: Secure loopback portal listening on 127.0.0.1:%d", s.securePort.Load())
 }
 
 func (s *GinServer) stopSecureLoopback(ctx context.Context) {
@@ -3399,7 +3406,7 @@ func (s *GinServer) stopSecureLoopback(ctx context.Context) {
 	}
 	s.secureSrv = nil
 	s.secureListener = nil
-	s.securePort = 0
+	s.securePort.Store(0)
 }
 
 func (s *GinServer) startInternalHTTPSListener() {

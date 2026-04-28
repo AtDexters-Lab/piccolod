@@ -601,6 +601,16 @@ func (s *Service) SetEnabled(ctx context.Context, enabled bool) error {
 		s.maybeStartSetupHeartbeat()
 	}
 
+	// When enabling identity on an unenrolled device with TPM available, kick
+	// auto-enrollment immediately rather than waiting for the next piccolod
+	// restart. Without this, an admin who toggles identity on via Settings
+	// sees the device stuck in "available, not enrolled" until they reboot.
+	// TPM-presence gate avoids a perpetual fail-fast retry loop on no-TPM
+	// devices (e.g., dev VMs) where Enroll() can never succeed.
+	if enabled && cfg.DeviceID == "" && s.tpmDev != nil {
+		s.triggerAutoEnroll()
+	}
+
 	s.publish(events.TopicIdentityChanged, nil)
 	return nil
 }
@@ -639,12 +649,21 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 	_ = clearVouchers(filepath.Join(dir, "vouchers"))
 	_ = os.Remove(filepath.Join(dir, "state_cache.json"))
 
-	// Reinitialize client with new URL if TPM is available
+	// Reinitialize client with new URL if TPM is available, and kick
+	// auto-enrollment against the new server immediately. Without this, the
+	// device sits unenrolled until next piccolod restart even though identity
+	// is enabled and DeviceID was just cleared. TPM-presence is a
+	// correctness-and-resource gate: Enroll() requires a live namekclient,
+	// which we only create when tpmDev is non-nil — without the gate we
+	// would spawn a perpetual fail-fast retry goroutine on no-TPM devices.
 	if s.tpmDev != nil {
 		client := newNamekClient(url, s.tpmDev, "")
 		s.mu.Lock()
 		s.client = client
 		s.mu.Unlock()
+		if cfg.Enabled {
+			s.triggerAutoEnroll()
+		}
 	}
 
 	s.publish(events.TopicIdentityChanged, nil)

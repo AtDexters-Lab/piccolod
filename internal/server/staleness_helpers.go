@@ -8,6 +8,47 @@ import (
 	"piccolod/internal/persistence"
 )
 
+// computeRecoveryKeyPending decides whether the operator should be re-prompted
+// to view/save the recovery key. Shared by /system/boot and /auth/login —
+// login must re-evaluate post-unlock because a locked boot suppresses the
+// gate (see below) and the unlock-then-login chain doesn't re-call /boot.
+//
+// The two-step decision:
+//
+//  1. File-presence: keyset.json absent → pending (no key to ack).
+//  2. Ack-presence: file exists but RecoveryAckAt is zero → pending (key
+//     written but operator may not have seen the words).
+//
+// Skip step (2) while crypto is locked: the staleness store lives behind the
+// unlock barrier, so the read is *guaranteed* to fail every locked boot.
+// Treating that as "pending" would force the auth controller to call
+// /recovery-key/generate on unlock, which ROTATES the existing key and
+// invalidates the operator's saved words on every routine reboot. Treat
+// persistence.ErrLocked from the staleness read identically (TOCTOU vs a
+// concurrent /crypto/lock between the IsLocked check and the Staleness call).
+// Other staleness read errors fail-closed (re-prompt) — the rotation hazard
+// does not apply because /generate is only auto-invoked behind unlock and a
+// transient unlocked-state DB error self-heals.
+func (s *GinServer) computeRecoveryKeyPending(ctx context.Context) bool {
+	if s == nil || s.cryptoManager == nil || !s.cryptoManager.IsInitialized() {
+		return false
+	}
+	if !s.cryptoManager.HasRecoveryKey() {
+		return true
+	}
+	if s.cryptoManager.IsLocked() {
+		return false
+	}
+	st, err := s.readAuthStaleness(ctx)
+	switch {
+	case errors.Is(err, persistence.ErrLocked):
+		return false
+	case err != nil, st.RecoveryAckAt.IsZero():
+		return true
+	}
+	return false
+}
+
 func (s *GinServer) authStalenessRepo() persistence.AuthRepo {
 	if s == nil {
 		return nil
