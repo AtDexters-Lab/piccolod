@@ -98,6 +98,10 @@ type Service struct {
 	// Buffer-1 so callers never block; rapid signals coalesce naturally.
 	networkUp chan struct{}
 
+	// namekURLChanged wakes autoEnrollAtBoot's backoff after SetNamekURL —
+	// see signalNamekURLChanged for rationale.
+	namekURLChanged chan struct{}
+
 	// Endpoint sync loop lifecycle.
 	syncCancel context.CancelFunc
 	syncDone   chan struct{}
@@ -114,10 +118,11 @@ type Service struct {
 // tpmDevice may be nil if no TPM is available.
 func NewService(configPath string, tpmDevice tpm.Device) *Service {
 	return &Service{
-		configPath: configPath,
-		tpmDev:     tpmDevice,
-		stopCh:     make(chan struct{}),
-		networkUp:  make(chan struct{}, 1),
+		configPath:      configPath,
+		tpmDev:          tpmDevice,
+		stopCh:          make(chan struct{}),
+		networkUp:       make(chan struct{}, 1),
+		namekURLChanged: make(chan struct{}, 1),
 	}
 }
 
@@ -265,6 +270,9 @@ func (s *Service) autoEnrollAtBoot() {
 		case <-s.networkUp:
 			timer.Stop()
 			log.Printf("INFO: identity: network up, retrying enrollment immediately")
+		case <-s.namekURLChanged:
+			timer.Stop()
+			log.Printf("INFO: identity: namek URL changed, retrying enrollment immediately")
 		case <-s.stopCh:
 			timer.Stop()
 			log.Printf("INFO: identity: auto-enrollment aborted (service stopping)")
@@ -322,6 +330,22 @@ func (s *Service) NotifyNetworkUp() {
 	select {
 	case s.networkUp <- struct{}{}:
 	default: // coalesces rapid signals
+	}
+}
+
+// signalNamekURLChanged wakes an in-progress autoEnrollAtBoot backoff loop
+// so its next iteration runs against the new namekclient instead of waiting
+// out the current backoff timer (up to ~120s at the cap). Without this,
+// triggerAutoEnroll's autoEnrolling.Load() guard makes the post-SetNamekURL
+// trigger a no-op when the loop is already running, and the admin URL
+// switch sees a multi-minute lag before the new server is tried.
+//
+// Buffer-1 + select-default mirrors NotifyNetworkUp — coalescing semantics,
+// non-blocking send. Internal-only; the signal site is SetNamekURL.
+func (s *Service) signalNamekURLChanged() {
+	select {
+	case s.namekURLChanged <- struct{}{}:
+	default: // coalesces with any pending signal
 	}
 }
 
@@ -663,6 +687,10 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 		s.client = client
 		s.mu.Unlock()
 		if cfg.Enabled {
+			// Signal first so an in-progress backoff loop picks up the new
+			// client immediately; triggerAutoEnroll below is a no-op in
+			// that case (autoEnrolling.Load()=true).
+			s.signalNamekURLChanged()
 			s.triggerAutoEnroll()
 		}
 	}

@@ -261,6 +261,119 @@ func TestAutoEnrollAtBoot_DeviceConflict_WrappedError(t *testing.T) {
 	}
 }
 
+// REC-5: SetNamekURL must wake an in-progress autoEnrollAtBoot backoff
+// loop so the new client is exercised immediately, not after the current
+// timer expires (up to ~120s at the cap). Without this wake source, an
+// admin URL switch sees a multi-minute lag before the new server is tried,
+// because triggerAutoEnroll's autoEnrolling.Load() guard makes the
+// post-SetNamekURL trigger a no-op when the loop is already running.
+//
+// Test exercises the wake mechanism in isolation by signaling the channel
+// directly. The SetNamekURL → namekURLChanged plumbing is a 4-line
+// composition reviewable by inspection.
+//
+// Synchronization strategy: rather than racing wall-clock sleeps against
+// the loop reaching its select, we use `IsSuspended()` as the observable
+// "loop is past the 409 handler, parked in the backoff select" signal —
+// the same pattern as TestAutoEnrollAtBoot_DeviceConflict_WrappedError.
+// Then we snapshot the atomic call counter so the post-wake assertion is
+// "calls increased" rather than relying on calledCh ordering (the handler
+// fires calledCh per HTTP request, not per attempt, so calledCh can carry
+// stale residual sends from the first attempt).
+func TestAutoEnrollAtBoot_WakesOnNamekURLChanged(t *testing.T) {
+	tracker := newEnrollTracker()
+	srv := httptest.NewServer(tracker.Handler())
+	defer srv.Close()
+
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "identity.json")
+	svc := &Service{
+		configPath: configPath,
+		tpmDev:     &mockTPM{},
+		cfg: Config{
+			Enabled:  true,
+			DeviceID: "",
+			NamekURL: srv.URL,
+		},
+		client:          newNamekClient(srv.URL, &mockTPM{}, ""),
+		stopCh:          make(chan struct{}),
+		networkUp:       make(chan struct{}, 1),
+		namekURLChanged: make(chan struct{}, 1),
+	}
+
+	bus := events.NewBus()
+	defer bus.Close()
+	svc.eventsBus = bus
+
+	if err := saveConfig(configPath, svc.cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	changedCh := bus.Subscribe(events.TopicIdentityChanged, 8)
+
+	done := make(chan struct{})
+	go func() {
+		svc.autoEnrollAtBoot()
+		close(done)
+	}()
+
+	// Wait for the first enroll attempt to start (handler signals calledCh).
+	select {
+	case <-tracker.calledCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first enroll attempt did not start within 5s")
+	}
+
+	// Wait until handleDeviceConflict flips suspended=true — observable
+	// proof that the loop processed the 409 response and is on its way
+	// into the backoff select. Drains the IdentityChanged event so the
+	// test doesn't busy-loop on the suspended check.
+	drainDeadline := time.Now().Add(3 * time.Second)
+	for !svc.IsSuspended() {
+		if time.Now().After(drainDeadline) {
+			t.Fatal("suspended=true not observed within 3s — loop may not have reached the conflict handler")
+		}
+		select {
+		case <-changedCh:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	// Snapshot the atomic call counter; the post-wake assertion compares
+	// against this rather than reading calledCh (which the handler fires
+	// once per HTTP request — multiple per attempt — and could carry
+	// residual sends from the first attempt).
+	callsBefore := atomic.LoadInt64(&tracker.calls)
+
+	// Send the wake. backoffDelay is `baseDelay<<attempt + jitter`, so for
+	// attempt 0 it returns 5s..7.5s (jitter adds a non-negative slice up
+	// to 0.5×delay). A sub-1.5s second-attempt is only possible if the
+	// wake fires the select case rather than the timer.
+	wakeStart := time.Now()
+	svc.namekURLChanged <- struct{}{}
+
+	// Poll the call counter until it advances or the deadline expires.
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt64(&tracker.calls) <= callsBefore {
+		if time.Now().After(deadline) {
+			t.Fatal("call counter did not advance within 2s of wake — namekURLChanged not wired into the autoEnrollAtBoot select")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if elapsed := time.Since(wakeStart); elapsed > 1500*time.Millisecond {
+		t.Errorf("retry took %v after wake; want well under attempt-0 backoff floor (5s)", elapsed)
+	}
+
+	// Stop cleanly.
+	svc.stopped.Store(true)
+	close(svc.stopCh)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("autoEnrollAtBoot did not exit after stop signal")
+	}
+}
+
 // drainCalled removes any pending entries from tracker.calledCh. Used after
 // a direct s.Enroll() verification call so subsequent channel receives
 // synchronize on the intended path.
