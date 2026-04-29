@@ -309,11 +309,22 @@ func (s *GinServer) handleSetUserPassword(c *gin.Context) {
 // getSessionFromContext retrieves the validated portal session from the gin context.
 // RFC 20260122 §6.2: Validates audience="portal" and origin binding.
 //
-// Handlers that operate outside the requireSession middleware (public OIDC,
-// boot, login flows) and those that admit the /crypto/recovery-key/ prefix
-// during the bootstrap window MUST NOT use this helper to gate access — it
-// silently ignores MustRegisterPasskey. Use sessionGate instead so the gate
-// state is a type-level return the caller cannot drop accidentally.
+// **MustRegisterPasskey gating is NOT performed here.** This helper is safe
+// to use ONLY in handlers under the requireSession middleware (gin_server.go
+// `authed` group), which centrally rejects gated sessions with 403 before
+// they reach the handler. Most callsites in this package fall in that
+// category — see gin_middleware.go:207 for the central enforcement.
+//
+// MUST NOT be used by handlers outside requireSession (public OIDC at the
+// root router, boot handler, login flows) OR by recovery-key state-mutating
+// handlers (admitted by the middleware's prefix allowlist for read paths).
+// Those callers must use sessionGate so the gate state is a type-level
+// return they cannot drop accidentally.
+//
+// Cluster 6.5b (2026-04-29) recalibration: the ~13 callsites of this helper
+// are all in handlers under requireSession, so the middleware-level gate
+// covers them. Migration to sessionGate would be cosmetic; the architectural
+// invariant is captured here instead.
 func (s *GinServer) getSessionFromContext(c *gin.Context) *auth.Session {
 	id, ok := s.getSession(c)
 	if !ok {
@@ -335,6 +346,20 @@ func (s *GinServer) getSessionFromContext(c *gin.Context) *auth.Session {
 // session and forgets the gate (closure for project_deferred_findings_passkey_cohesive_fix.md
 // deferred 2 / "Cluster A root cause").
 //
+// **Use this helper only in routes that bypass the requireSession middleware
+// umbrella** — the middleware (gin_middleware.go:207) already returns 403 for
+// gated sessions on routes under the `authed` group. The two known bypass
+// classes today:
+//
+//  1. Routes registered at the root router outside `authed` (e.g., handleOIDCAuthorize
+//     reachable via oidc_passthrough — see gin_oidc_handlers.go:350 for the
+//     attack surface this gate closes).
+//  2. State-mutating handlers under the `/api/v1/crypto/recovery-key/` prefix,
+//     which the middleware admits via its prefix allowlist so the read-only
+//     bootstrap-screen view works (gin_middleware.go:222); the mutators must
+//     self-deny here.
+//
+// Returns:
 //   - (nil, false): no validated session — caller decides whether that's OK
 //     (login flows, public endpoints).
 //   - (sess, true): session valid and gated — caller MUST refuse with the

@@ -386,7 +386,10 @@ func (s *GinServer) handleOIDCAuthorize(c *gin.Context) {
 	}
 
 	// Case 2: New authorize request — user already has a (non-gated) portal
-	// session ⇒ fast-path without bouncing through login.
+	// session ⇒ fast-path without bouncing through login. getSessionFromContext
+	// is safe here because the sessionGate at the top of this function (line
+	// ~360) already refused gated sessions for the same `clientID != ""` path;
+	// reaching this branch means the session is non-gated.
 	if clientID != "" {
 		if sess := s.getSessionFromContext(c); sess != nil {
 			slog.Info("OIDC authorize: user already authenticated, fast-path",
