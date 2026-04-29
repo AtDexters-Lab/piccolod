@@ -45,6 +45,25 @@ type Service struct {
 	configPath string
 	tpmDev     tpm.Device
 	client     *namekclient.Client
+
+	// identityMu serializes SetNamekURL against in-flight identity-bound
+	// RPC+persist sequences. Identity-bound operations (Enroll, syncEndpointsOnce,
+	// fetchSuggestedHostname, SetCustomHostname, reenrollWithRecovery's per-attempt
+	// RPC+finalize+replay, etc.) hold RLock while their RPC executes and their
+	// result persists. SetNamekURL takes Lock around its swap+saveConfig — it
+	// blocks until in-flight ops drain, then performs the URL switch atomically
+	// with respect to all readers. This is the structural close of the
+	// SETN-1/3/4/5 race-class (the per-site guards in clusters 11+12 narrowed
+	// individual windows but couldn't close them all without this serialization
+	// primitive).
+	//
+	// Distinct from `mu` which protects struct-field reads/writes briefly.
+	// `mu` is fine-grained; `identityMu` is held across full RPC durations
+	// (up to ~30s per call). SetNamekURL is admin-initiated and rare
+	// (single-user appliance, typically 1-3 invocations per device lifetime),
+	// so the worst-case "SetNamekURL waits 30s for in-flight Enroll to drain"
+	// is acceptable.
+	identityMu sync.RWMutex
 	enrolled   atomic.Bool
 	available  atomic.Bool // false if TPM unavailable
 	suspended  atomic.Bool // true if namek returned 403 (device revoked/suspended)
@@ -220,7 +239,22 @@ func (s *Service) autoEnrollAtBoot() {
 		log.Printf("INFO: identity: auto-enrollment already in progress, skipping")
 		return
 	}
-	defer s.autoEnrolling.Store(false)
+	// SETN-2: closes the wake-signal-loss race. If SetNamekURL fired
+	// concurrently with our exit (signaled namekURLChanged but its
+	// triggerAutoEnroll saw autoEnrolling=true and no-op'd), the buffered
+	// wake would otherwise sit unread. Drop ownership FIRST so any new
+	// triggerAutoEnroll succeeds, then drain a pending wake; if found,
+	// re-trigger so the URL change actually starts a fresh attempt.
+	defer func() {
+		s.autoEnrolling.Store(false)
+		select {
+		case <-s.namekURLChanged:
+			if s.IsEnabled() && !s.IsEnrolled() && !s.stopped.Load() {
+				s.triggerAutoEnroll()
+			}
+		default:
+		}
+	}()
 
 	const baseDelay = 5 * time.Second
 	const maxDelay = 120 * time.Second
@@ -331,24 +365,6 @@ func (s *Service) NotifyNetworkUp() {
 	case s.networkUp <- struct{}{}:
 	default: // coalesces rapid signals
 	}
-}
-
-// guardClientChanged returns true if s.client has been swapped since
-// `captured` was snapshotted (SetNamekURL is the only swap site outside
-// initialization). Callers use it AFTER an RPC and BEFORE persisting
-// the result, so OLD-server data cannot leak into NEW-server config —
-// the SETN-1 race-class structurally closed in cluster 11 for Enroll(),
-// extended to sibling RPC sites in cluster 12.
-//
-// For sites where the persist is itself inside a write lock (e.g.,
-// finalizeEnrollment, fetchSuggestedHostname's suggestedHostname write),
-// prefer an inline `s.client != captured` check inside the same lock —
-// this helper is for sites that persist outside a lock and accept the
-// narrow residual window between guard and mutation.
-func (s *Service) guardClientChanged(captured *namekclient.Client) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.client != captured
 }
 
 // signalNamekURLChanged wakes an in-progress autoEnrollAtBoot backoff loop
@@ -535,23 +551,14 @@ func (s *Service) SuggestedHostname() string {
 
 // Enroll performs TPM-attested enrollment with the namek server.
 //
-// SETN-1: the captured client is passed through to finalizeEnrollment,
-// which compares it against s.client UNDER THE SAME write lock that
-// performs the config mutation. If SetNamekURL swapped the client
-// mid-flight (clearing state + pointing config at a new namek server),
-// the in-flight result is bound to the OLD server's identity but the
-// config now points to the NEW server. Persisting that hybrid would
-// mark the device "enrolled" with a DeviceID the new server has never
-// seen — every subsequent call 401/404s. Discard and let the caller
-// (autoEnrollAtBoot's backoff loop) retry against the new client; the
-// namekURLChanged wake signal queued by SetNamekURL fires the retry
-// immediately.
-//
-// The check MUST be inside the write lock — an earlier draft compared
-// the pointer outside the lock, which left a small window between
-// recheck and finalize where SetNamekURL could still swap (codex Phase
-// 3 caught this).
+// Holds identityMu.RLock for the full RPC+persist sequence — SetNamekURL
+// blocks on identityMu.Lock until this completes, so the result cannot
+// be persisted against a config that has been swapped to a different
+// namek server (the SETN-1 race-class).
 func (s *Service) Enroll(ctx context.Context) (*EnrollResult, error) {
+	s.identityMu.RLock()
+	defer s.identityMu.RUnlock()
+
 	s.mu.RLock()
 	client := s.client
 	s.mu.RUnlock()
@@ -564,27 +571,23 @@ func (s *Service) Enroll(ctx context.Context) (*EnrollResult, error) {
 		return nil, fmt.Errorf("identity: enrollment failed: %w", err)
 	}
 
-	return s.finalizeEnrollment(result, client)
+	return s.finalizeEnrollment(result)
 }
 
 // finalizeEnrollment persists the enrollment result and restores runtime state.
 // Shared by Enroll and reenrollWithRecovery.
 //
-// expectedClient is the namekclient pointer the caller used for the RPC.
-// All current callers (Enroll, reenrollWithRecovery) pass non-nil. The
-// nil-skip branch is kept as a forward-compat escape hatch for any
-// future caller that legitimately doesn't need the guard. When non-nil,
-// the check happens inside the write lock immediately before the
-// mutation: if s.client swapped between the RPC and now, discard so a
-// hybrid identity (new NamekURL + old DeviceID) cannot be persisted.
-func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult, expectedClient *namekclient.Client) (*EnrollResult, error) {
+// Callers MUST hold identityMu.RLock for the full RPC+persist sequence so
+// SetNamekURL cannot swap the client mid-flight. Without that invariant,
+// OLD-server-derived DeviceID/Hostname could be persisted against config
+// now pointing at a NEW server (hybrid identity, every subsequent call
+// 401/404s). The previous design (cluster 11+12) used a captured-client
+// guard inside this function; cluster 13 replaced it with the broader
+// identityMu serialization.
+func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult) (*EnrollResult, error) {
 	baseDomain := extractBaseDomain(result.Hostname)
 
 	s.mu.Lock()
-	if expectedClient != nil && s.client != expectedClient {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("identity: enrollment discarded — namek URL changed mid-flight (SETN-1)")
-	}
 	s.cfg.DeviceID = result.DeviceID
 	s.cfg.Hostname = result.Hostname
 	s.cfg.BaseDomain = baseDomain
@@ -632,7 +635,27 @@ func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult, expectedC
 
 // SetEnabled enables or disables namek identity (persists + publishes event).
 // When re-enabling, reinitializes the namekclient if TPM is available.
+//
+// Holds identityMu.Lock around the config mutation+saveConfig+client-swap
+// so a concurrent SetNamekURL's saveConfig cannot interleave with this
+// one — the two writers would otherwise race on disk via AtomicWriteFile,
+// last-writer-wins, possibly resurrecting stale identity. Same rationale
+// as SetNamekURL itself: serialization is the SETN-3 close.
+//
+// stopEndpointSync / stopSetupHeartbeat run BEFORE Lock acquisition to
+// avoid the syncEndpointsOnce-deadlock pattern (sync iteration's RLock
+// would block on this Lock; the loop would never exit).
 func (s *Service) SetEnabled(ctx context.Context, enabled bool) error {
+	if !enabled {
+		// Pre-stop sync loops outside Lock so their in-flight iterations
+		// can complete without queueing behind our pending Lock.
+		s.stopEndpointSync()
+		s.stopSetupHeartbeat()
+	}
+
+	s.identityMu.Lock()
+	defer s.identityMu.Unlock()
+
 	s.mu.Lock()
 	if s.cfg.Enabled == enabled {
 		s.mu.Unlock()
@@ -648,8 +671,6 @@ func (s *Service) SetEnabled(ctx context.Context, enabled bool) error {
 	}
 
 	if !enabled {
-		s.stopEndpointSync()
-		s.stopSetupHeartbeat()
 		// Clear suspended on disable — see the rationale in reenrollWithRecovery's
 		// early-exit branch. suspended is a "namek says we're not Active" signal;
 		// if we're not asking namek, the flag is no longer meaningful.
@@ -688,12 +709,32 @@ func (s *Service) SetEnabled(ctx context.Context, enabled bool) error {
 }
 
 // SetNamekURL changes the namek server URL. Clears identity (re-enrollment needed).
+//
+// Takes identityMu.Lock for the entire swap+saveConfig sequence, blocking
+// until any in-flight identity-bound op (Enroll, syncEndpointsOnce, etc.)
+// drains. This is the structural close of the SETN-1/3/4/5 race-class:
+// in-flight ops complete against the OLD client+config (which gets cleared
+// AFTER they finish), and the disk write happens with no concurrent writer.
+// Worst-case wait is ~30s (the RPC timeout); SetNamekURL is admin-initiated
+// and rare, so the latency is acceptable.
+//
+// stopEndpointSync / stopSetupHeartbeat run BEFORE Lock acquisition.
+// stopEndpointSync waits for the sync loop's `<-done`; if a sync iteration
+// were blocked on identityMu.RLock while this writer held Lock, the sync
+// goroutine could never exit and we would deadlock. Pre-stopping lets
+// any in-flight iteration complete without queueing behind a pending
+// writer. (syncEndpointsOnce also uses TryRLock as a defensive backstop
+// for any future writer that forgets this pattern.)
 func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 	if strings.TrimSpace(url) == "" {
 		return fmt.Errorf("identity: namek URL cannot be empty")
 	}
+
 	s.stopEndpointSync()
 	s.stopSetupHeartbeat()
+
+	s.identityMu.Lock()
+	defer s.identityMu.Unlock()
 
 	s.mu.Lock()
 	s.cfg.NamekURL = url
@@ -747,7 +788,15 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 }
 
 // SetCustomHostname sets a custom hostname label via namekclient.
+//
+// Holds identityMu.RLock for the full RPC+persist sequence — SetNamekURL
+// blocks on Lock until this completes. Without this, SetNamekURL landing
+// after the RPC succeeds but before the config persist would write the
+// OLD server's accepted hostname into the NEW server's config.
 func (s *Service) SetCustomHostname(ctx context.Context, hostname string) error {
+	s.identityMu.RLock()
+	defer s.identityMu.RUnlock()
+
 	s.mu.RLock()
 	client := s.client
 	s.mu.RUnlock()
@@ -908,11 +957,23 @@ func (s *Service) reenrollWithRecovery() {
 			log.Printf("INFO: identity: re-enrollment aborted (service stopped)")
 			return
 		}
+
+		// identityMu.RLock held for the per-attempt RPC+finalize+replay
+		// sequence. SetNamekURL blocks on Lock until the iteration completes,
+		// so a URL swap can only happen between iterations (during backoff).
+		// Acquired here (not at function entry) so backoff sleeps don't block
+		// SetNamekURL — the loop can run for minutes before giving up.
+		s.identityMu.RLock()
+
 		// Abort if identity was reset (e.g., SetNamekURL) or feature disabled.
+		// Re-checked INSIDE the RLock so SetNamekURL cannot clear enrolled +
+		// swap client between this check and the RPC capture below — without
+		// the lock the attempt could run against the NEW client with the
+		// OLD recovery bundle (codex Phase 3 of cluster 13 caught this).
 		// Clear suspended on exit: it means "namek says we're not Active",
 		// which is no longer meaningful if we're not asking namek anymore.
-		// Leaving it latched would wedge SetupStatus until piccolod restart.
 		if !s.enrolled.Load() || !s.IsEnabled() {
+			s.identityMu.RUnlock()
 			s.suspended.Store(false)
 			log.Printf("INFO: identity: re-enrollment aborted (identity reset or disabled)")
 			return
@@ -940,22 +1001,18 @@ func (s *Service) reenrollWithRecovery() {
 			// Clear recovering before finalize so the sync loop's initial
 			// tick (started by finalizeEnrollment) can fetch fresh device info.
 			s.recovering.Store(false)
-			// SETN-1: pass the captured client so finalizeEnrollment's
-			// write-locked check discards an old-server result if SetNamekURL
-			// swapped mid-RPC. Same shape as Enroll's call — both atomic with
-			// the config mutation.
-			if _, fErr := s.finalizeEnrollment(result, client); fErr != nil {
+			if _, fErr := s.finalizeEnrollment(result); fErr != nil {
+				s.identityMu.RUnlock()
 				log.Printf("ERROR: identity: finalize re-enrollment: %v", fErr)
 				return
 			}
 			log.Printf("INFO: identity: re-enrollment succeeded after %d attempt(s)", attempt+1)
 			// Best-effort state replay from cached state (reuse bundle to avoid re-reading disk).
-			// Bind replay to the same client we just re-enrolled with so a
-			// SetNamekURL landing between finalize and replay cannot push
-			// OLD-bundle state to the NEW server (SETN-1 binding).
-			s.replayState(bundle, client)
+			s.replayState(bundle)
+			s.identityMu.RUnlock()
 			return
 		}
+		s.identityMu.RUnlock()
 
 		// If error is AK-specific, fall back to full AK recovery.
 		errMsg := extractErrorMessage(err)
@@ -1036,14 +1093,11 @@ func (s *Service) buildRecoveryBundle() *namekclient.RecoveryBundleInput {
 // If bundle is non-nil, its CustomHostname and AliasDomains are used directly
 // (avoids re-reading state_cache.json from disk).
 //
-// expectedClient is the namekclient bound to the re-enrollment whose state
-// is being replayed. Pass nil only if the caller is intentionally decoupled
-// from a specific enrollment (no current callers do). When non-nil, replayState
-// uses this client directly for all RPCs and aborts via guardClientChanged
-// before each step. Without binding to the captured client, a SetNamekURL
-// landing between finalizeEnrollment and replayState would push OLD-bundle
-// state to the NEW server (codex Phase 3 of cluster 12 caught this).
-func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput, expectedClient *namekclient.Client) {
+// Caller MUST hold identityMu.RLock — replayState makes RPCs against
+// s.client and SetNamekURL would otherwise be free to swap mid-replay.
+// Currently called only from reenrollWithRecovery's per-attempt RLock
+// section.
+func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput) {
 	var customHostname string
 	var aliasDomains []string
 
@@ -1061,12 +1115,9 @@ func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput, expectedC
 		aliasDomains = sc.AliasDomains
 	}
 
-	client := expectedClient
-	if client == nil {
-		s.mu.RLock()
-		client = s.client
-		s.mu.RUnlock()
-	}
+	s.mu.RLock()
+	client := s.client
+	s.mu.RUnlock()
 	if client == nil {
 		return
 	}
@@ -1075,14 +1126,6 @@ func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput, expectedC
 	defer cancel()
 
 	if customHostname != "" {
-		// SETN-1: skip if SetNamekURL swapped client before this replay
-		// step. Each step rechecks because mutations span multiple RPCs;
-		// without per-step guards a URL switch midway would continue
-		// pushing alias domains to the OLD server.
-		if s.guardClientChanged(client) {
-			log.Printf("INFO: identity: state replay aborted — namek URL changed mid-flight (SETN-1)")
-			return
-		}
 		if err := client.SetHostname(ctx, customHostname); err != nil {
 			log.Printf("WARN: identity: state replay: set hostname %q: %v", customHostname, err)
 		} else {
@@ -1091,10 +1134,6 @@ func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput, expectedC
 	}
 
 	for _, domain := range aliasDomains {
-		if s.guardClientChanged(client) {
-			log.Printf("INFO: identity: state replay aborted — namek URL changed mid-flight (SETN-1)")
-			return
-		}
 		domainInfo, err := client.RegisterDomain(ctx, domain)
 		if err != nil {
 			log.Printf("WARN: identity: state replay: register domain %q: %v", domain, err)
@@ -1301,6 +1340,19 @@ func (s *Service) syncEndpointsOnce(ctx context.Context) {
 		return
 	}
 
+	// TryRLock + skip on contention. A blocking RLock would deadlock against
+	// SetNamekURL: SetNamekURL holds identityMu.Lock and calls stopEndpointSync
+	// which waits for the sync loop's `<-done`. If this iteration was already
+	// past its enrolled-gate when SetNamekURL acquired Lock, a blocking RLock
+	// would queue (RWMutex is write-preferring), the loop goroutine couldn't
+	// exit, and SetNamekURL's stopEndpointSync would wait forever. Skipping is
+	// cheap — endpointSyncLoop's next tick retries, and SetNamekURL is rare.
+	if !s.identityMu.TryRLock() {
+		log.Printf("INFO: identity: endpoint sync skipped (namek URL change in progress)")
+		return
+	}
+	defer s.identityMu.RUnlock()
+
 	s.mu.RLock()
 	client := s.client
 	s.mu.RUnlock()
@@ -1328,17 +1380,6 @@ func (s *Service) syncEndpointsOnce(ctx context.Context) {
 		return
 	}
 
-	// SETN-1: discard if SetNamekURL swapped the client between the RPC
-	// and now. Without this guard, syncDeviceMeta would persist account_id
-	// from the OLD server into config now pointing at the NEW server —
-	// silent account lockout. Residual window between this check and the
-	// mutating calls below; tighter atomicity would require pushing the
-	// check into each *Sync* helper, deferred.
-	if s.guardClientChanged(client) {
-		log.Printf("INFO: identity: endpoint sync discarded — namek URL changed mid-flight (SETN-1)")
-		return
-	}
-
 	// 1. Sync account_id + recovery status
 	s.syncDeviceMeta(info)
 
@@ -1363,6 +1404,11 @@ func (s *Service) syncEndpointsOnce(ctx context.Context) {
 // suggestedHostname (in-memory only) for the boot handler to surface as a
 // UI pre-fill hint. Failures are logged and swallowed.
 func (s *Service) fetchSuggestedHostname() {
+	// identityMu.RLock for the full RPC+persist sequence — see Enroll's
+	// rationale. SetNamekURL waits for in-flight fetches to drain.
+	s.identityMu.RLock()
+	defer s.identityMu.RUnlock()
+
 	s.mu.RLock()
 	client := s.client
 	s.mu.RUnlock()
@@ -1386,13 +1432,6 @@ func (s *Service) fetchSuggestedHostname() {
 			return
 		}
 		s.mu.Lock()
-		// SETN-1: inline check inside the same write lock as the persist
-		// — atomic close of the OLD-server-data leak window.
-		if s.client != client {
-			s.mu.Unlock()
-			log.Printf("INFO: identity: suggested hostname discarded — namek URL changed mid-flight (SETN-1)")
-			return
-		}
 		// Don't overwrite if user already claimed a hostname (late-arriving fetch).
 		if s.cfg.CustomHostname == "" {
 			s.suggestedHostname = hostname

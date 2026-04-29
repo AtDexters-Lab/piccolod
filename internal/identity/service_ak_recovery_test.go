@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -375,16 +374,17 @@ func TestAutoEnrollAtBoot_WakesOnNamekURLChanged(t *testing.T) {
 	}
 }
 
-// SETN-1 (codex Phase 3 finding from cluster 10): if SetNamekURL swaps the
-// namekclient mid-Enroll, the in-flight RPC's result is bound to the OLD
-// server but the config now points to the NEW server. Persisting that
-// hybrid would mark the device "enrolled" with a DeviceID the new server
-// has never seen — every subsequent call 401/404s.
+// TestSetNamekURL_SerializesAgainstInFlightEnroll verifies the structural
+// SETN-1 close (cluster 13): SetNamekURL holds identityMu.Lock and BLOCKS
+// until any in-flight identity-bound op (Enroll here) drains. The hybrid-
+// identity bug is closed by ordering — Enroll completes against the OLD
+// client+config first (committing OLD DeviceID briefly), then SetNamekURL
+// runs and clears the config. End state: NEW URL, no DeviceID, no hybrid.
 //
-// Test holds the first HTTP call so we can interleave SetNamekURL exactly
-// during the in-flight RPC, then verifies Enroll returns the SETN-1 error
-// and config retains the new URL with NO DeviceID (no hybrid persisted).
-func TestEnroll_DiscardsResultWhenURLChangedMidFlight(t *testing.T) {
+// The test asserts both: (a) SetNamekURL was actually blocked while Enroll
+// was in-flight, and (b) the end state reflects the SetNamekURL clear, not
+// a persisted hybrid identity.
+func TestSetNamekURL_SerializesAgainstInFlightEnroll(t *testing.T) {
 	tracker := newEnrollTracker()
 	tracker.returnOK.Store(true)
 
@@ -393,8 +393,6 @@ func TestEnroll_DiscardsResultWhenURLChangedMidFlight(t *testing.T) {
 	holdOnce := make(chan struct{}, 1)
 	holdOnce <- struct{}{}
 
-	// Wrap the tracker handler to block the first /devices/enroll call so
-	// we can interleave SetNamekURL exactly during the in-flight RPC.
 	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/devices/enroll" {
 			select {
@@ -408,12 +406,6 @@ func TestEnroll_DiscardsResultWhenURLChangedMidFlight(t *testing.T) {
 	}))
 	defer srvA.Close()
 
-	// srvB always 500s. Without this, SetNamekURL's spawned autoEnrollAtBoot
-	// goroutine could finalize successfully against srvB and populate DeviceID
-	// — making the post-SetNamekURL "DeviceID empty" assertion ambiguous
-	// (passes whether SETN-1 fired or not). With srvB failing, the only path
-	// that could populate DeviceID is finalizeEnrollment from A's result, so
-	// asserting empty is a clean test of the SETN-1 guard.
 	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "srvB unavailable"})
@@ -442,9 +434,6 @@ func TestEnroll_DiscardsResultWhenURLChangedMidFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		// SetNamekURL spawns an autoEnrollAtBoot goroutine. Stop it so
-		// subsequent test invocations (-count=N) don't see leaked
-		// retry-against-closed-server goroutines logging warnings.
 		svc.stopped.Store(true)
 		select {
 		case <-svc.stopCh:
@@ -458,13 +447,14 @@ func TestEnroll_DiscardsResultWhenURLChangedMidFlight(t *testing.T) {
 		result *EnrollResult
 		err    error
 	}
-	resultCh := make(chan enrollResult, 1)
+	enrollDone := make(chan enrollResult, 1)
 	go func() {
 		r, err := svc.Enroll(t.Context())
-		resultCh <- enrollResult{r, err}
+		enrollDone <- enrollResult{r, err}
 	}()
 
-	// Wait until the handler has the first call held.
+	// Wait until Enroll has the first call held — Enroll holds identityMu.RLock
+	// at this point.
 	select {
 	case <-holdCh:
 	case <-time.After(3 * time.Second):
@@ -472,89 +462,63 @@ func TestEnroll_DiscardsResultWhenURLChangedMidFlight(t *testing.T) {
 		t.Fatal("first /devices/enroll call did not arrive at server A within 3s")
 	}
 
-	// Swap to a different namek URL while the RPC is in-flight.
-	if err := svc.SetNamekURL(t.Context(), srvB.URL); err != nil {
+	// SetNamekURL must block on identityMu.Lock until Enroll's RLock releases.
+	setNamekDone := make(chan error, 1)
+	go func() {
+		setNamekDone <- svc.SetNamekURL(t.Context(), srvB.URL)
+	}()
+
+	// Brief grace window: SetNamekURL should NOT have completed because
+	// Enroll still holds identityMu.RLock.
+	select {
+	case err := <-setNamekDone:
 		close(releaseCh)
-		t.Fatalf("SetNamekURL: %v", err)
+		t.Fatalf("SetNamekURL completed (err=%v) while Enroll's RLock is held — serialization failed", err)
+	case <-time.After(200 * time.Millisecond):
 	}
 
-	// Release the held call. The in-flight Enroll continues against srvA
-	// using the captured (now-stale) client, succeeds, and the SETN-1
-	// guard discards the result.
+	// Release Enroll's hold. RPC succeeds, finalizeEnrollment commits, RLock
+	// releases. SetNamekURL's pending Lock then acquires and clears the config.
 	close(releaseCh)
 
 	select {
-	case got := <-resultCh:
-		if got.err == nil {
-			t.Fatalf("expected SETN-1 discard error; got nil err with result %+v", got.result)
-		}
-		if !strings.Contains(got.err.Error(), "SETN-1") {
-			t.Errorf("error %q does not mention SETN-1", got.err.Error())
+	case got := <-enrollDone:
+		if got.err != nil {
+			t.Fatalf("expected Enroll to succeed; got err=%v", got.err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Enroll did not return within 5s of release")
 	}
 
-	// Config should reflect the new URL with NO persisted DeviceID — the
-	// guard prevented finalizeEnrollment from running.
+	select {
+	case err := <-setNamekDone:
+		if err != nil {
+			t.Fatalf("SetNamekURL: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SetNamekURL did not return within 5s of Enroll completing")
+	}
+
+	// End state: SetNamekURL ran AFTER Enroll committed, so it cleared the
+	// hybrid back to fresh. NEW URL, no DeviceID, not enrolled.
 	cfg := svc.DeviceConfig()
 	if cfg.NamekURL != srvB.URL {
 		t.Errorf("NamekURL = %q, want %q (post-SetNamekURL)", cfg.NamekURL, srvB.URL)
 	}
 	if cfg.DeviceID != "" {
-		t.Errorf("DeviceID = %q, want empty (no hybrid persisted)", cfg.DeviceID)
+		t.Errorf("DeviceID = %q, want empty (SetNamekURL should have cleared)", cfg.DeviceID)
 	}
 	if svc.IsEnrolled() {
-		t.Error("expected enrolled=false after SETN-1 discard")
+		t.Error("expected enrolled=false after SetNamekURL")
 	}
 }
 
-// TestGuardClientChanged unit-tests the helper that closes the SETN-1
-// race-class for sibling RPC sites (cluster 12). The helper is the
-// canonical "post-RPC, pre-persist" check for syncEndpointsOnce and
-// replayState; finalizeEnrollment + fetchSuggestedHostname inline the
-// same comparison inside their own write locks.
-func TestGuardClientChanged(t *testing.T) {
-	svc := &Service{}
-	original := newNamekClient("https://orig.example", &mockTPM{}, "")
-	swapped := newNamekClient("https://other.example", &mockTPM{}, "")
-	svc.client = original
-
-	if svc.guardClientChanged(original) {
-		t.Error("guardClientChanged(original) = true; want false (no swap)")
-	}
-	svc.client = swapped
-	if !svc.guardClientChanged(original) {
-		t.Error("guardClientChanged(original) = false after swap; want true")
-	}
-	if svc.guardClientChanged(swapped) {
-		t.Error("guardClientChanged(swapped) = true; want false (matches current)")
-	}
-	// s.client cleared (e.g., during shutdown): helper still compares
-	// against captured non-nil → true. Caller contract is to pass a
-	// non-nil capture; this branch is defensive.
-	svc.client = nil
-	if !svc.guardClientChanged(original) {
-		t.Error("guardClientChanged(original) when s.client=nil = false; want true")
-	}
-}
-
-// TestReenrollWithRecovery_DiscardsResultWhenURLChangedMidFlight verifies
-// the system as a whole prevents OLD-server result from being persisted
-// against NEW-server config. Two layers contribute:
-//   - the captured-client SETN-1 guard inside finalizeEnrollment (the
-//     structural backstop introduced by this cluster + cluster 11), and
-//   - the loop's `!s.enrolled.Load()` early-exit at the next iteration
-//     (operational defense-in-depth — SetNamekURL clears enrolled).
-//
-// Both lead to the same observable end-state (no hybrid persisted), and
-// the test asserts on that end-state. The unit test for guardClientChanged
-// pins the structural guard's comparison logic; this test is integration
-// coverage for the highest-impact sibling site (same DeviceID-persistence
-// shape as Enroll). Deeper integration tests for syncEndpointsOnce /
-// fetchSuggestedHostname / replayState deferred — they use the same
-// helper pattern verified here.
-func TestReenrollWithRecovery_DiscardsResultWhenURLChangedMidFlight(t *testing.T) {
+// TestSetNamekURL_SerializesAgainstReenrollWithRecovery is the same
+// shape as TestSetNamekURL_SerializesAgainstInFlightEnroll, but for the
+// reenrollWithRecovery RPC path. reenrollWithRecovery holds RLock per
+// attempt (not per loop), so SetNamekURL blocks until the in-flight
+// attempt's RPC + finalize + replay drains.
+func TestSetNamekURL_SerializesAgainstReenrollWithRecovery(t *testing.T) {
 	tracker := newEnrollTracker()
 	tracker.returnOK.Store(true)
 
@@ -623,7 +587,8 @@ func TestReenrollWithRecovery_DiscardsResultWhenURLChangedMidFlight(t *testing.T
 		close(done)
 	}()
 
-	// Wait until the handler has the first /devices/enroll call held.
+	// Wait until the handler has the first /devices/enroll call held —
+	// reenrollWithRecovery holds identityMu.RLock for this attempt.
 	select {
 	case <-holdCh:
 	case <-time.After(3 * time.Second):
@@ -631,35 +596,160 @@ func TestReenrollWithRecovery_DiscardsResultWhenURLChangedMidFlight(t *testing.T
 		t.Fatal("first /devices/enroll call did not arrive at server A within 3s")
 	}
 
-	// Swap to srvB while the RPC is in-flight.
-	if err := svc.SetNamekURL(t.Context(), srvB.URL); err != nil {
+	// SetNamekURL must block on identityMu.Lock until the in-flight
+	// reenroll attempt's RLock releases.
+	setNamekDone := make(chan error, 1)
+	go func() {
+		setNamekDone <- svc.SetNamekURL(t.Context(), srvB.URL)
+	}()
+	select {
+	case err := <-setNamekDone:
 		close(releaseCh)
-		t.Fatalf("SetNamekURL: %v", err)
+		t.Fatalf("SetNamekURL completed (err=%v) while reenroll's RLock held — serialization failed", err)
+	case <-time.After(200 * time.Millisecond):
 	}
 
 	close(releaseCh)
 
-	// reenrollWithRecovery's inner loop should detect SetNamekURL via
-	// `!s.IsEnrolled()` (SetNamekURL clears enrolled) and bail.
-	// finalizeEnrollment with non-nil expectedClient also catches the
-	// swap if the loop progresses past the enrolled check before the
-	// SetNamekURL clears it.
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("reenrollWithRecovery did not exit within 10s")
 	}
+	select {
+	case err := <-setNamekDone:
+		if err != nil {
+			t.Fatalf("SetNamekURL: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SetNamekURL did not return within 5s of reenroll completing")
+	}
 
-	// Config must reflect the new URL with NO persisted DeviceID from srvA.
+	// End state: SetNamekURL ran AFTER the reenroll attempt (which committed
+	// "dev-123" against srvA) and cleared everything. NEW URL, no DeviceID.
 	cfg := svc.DeviceConfig()
 	if cfg.NamekURL != srvB.URL {
 		t.Errorf("NamekURL = %q, want %q", cfg.NamekURL, srvB.URL)
 	}
 	if cfg.DeviceID == "dev-123" {
-		t.Errorf("DeviceID = %q — finalized A's result against B's config (SETN-1 leak)", cfg.DeviceID)
+		t.Errorf("DeviceID = %q — SetNamekURL did not clear (hybrid persisted)", cfg.DeviceID)
 	}
-	if cfg.Hostname == "slug.test.local" && cfg.DeviceID == "dev-123" {
-		t.Error("hybrid identity persisted (A's hostname + A's DeviceID under B's URL)")
+}
+
+// TestSetNamekURL_NoDeadlockWithRunningSync regression-pins the cluster 13
+// deadlock scenario CRA + codex caught: endpoint sync loop runs an
+// iteration → enters syncEndpointsOnce → SetNamekURL acquires identityMu.Lock
+// → syncEndpointsOnce's RLock would block (writer-preferring) → SetNamekURL's
+// stopEndpointSync waits for the sync loop's `<-done` → the sync loop can't
+// exit because its iteration is blocked on RLock → permanent deadlock.
+//
+// Fix: syncEndpointsOnce uses TryRLock + skip on contention; SetNamekURL
+// pre-stops sync loops BEFORE Lock. Either alone closes the deadlock; both
+// together provide defense in depth.
+//
+// Test: start sync loop with frequent ticks against a slow handler so an
+// iteration is highly likely to be in-flight when SetNamekURL fires; assert
+// SetNamekURL completes within bounded time (deadlock would hang forever).
+func TestSetNamekURL_NoDeadlockWithRunningSync(t *testing.T) {
+	tracker := newEnrollTracker()
+	tracker.returnOK.Store(true)
+
+	// Slow handler: GetDeviceInfo takes ~50ms each call so a sync iteration
+	// is in-flight when SetNamekURL fires (sync interval 100ms below).
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/devices/me" {
+			time.Sleep(50 * time.Millisecond)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "active",
+				"account_id":       "acc-A",
+				"nexus_endpoints":  []string{"wss://relay.A"},
+				"custom_hostname":  nil,
+			})
+			return
+		}
+		tracker.Handler().ServeHTTP(w, r)
+	}))
+	defer srvA.Close()
+
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srvB.Close()
+
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "identity.json")
+	svc := &Service{
+		configPath: configPath,
+		tpmDev:     &mockTPM{},
+		cfg: Config{
+			Enabled:  true,
+			DeviceID: "dev-existing",
+			Hostname: "slug.test.local",
+			NamekURL: srvA.URL,
+		},
+		client:          newNamekClient(srvA.URL, &mockTPM{}, "dev-existing"),
+		stopCh:          make(chan struct{}),
+		networkUp:       make(chan struct{}, 1),
+		namekURLChanged: make(chan struct{}, 1),
+	}
+	svc.enrolled.Store(true)
+	bus := events.NewBus()
+	defer bus.Close()
+	svc.eventsBus = bus
+	if err := saveConfig(configPath, svc.cfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		svc.stopped.Store(true)
+		select {
+		case <-svc.stopCh:
+		default:
+			close(svc.stopCh)
+		}
+		svc.recoverWg.Wait()
+	})
+
+	// Start endpoint sync. Default interval is too long for this test to
+	// reliably hit the race window, so we hand-launch the loop with a tight
+	// ticker via direct goroutine control.
+	syncStop := make(chan struct{})
+	syncDone := make(chan struct{})
+	go func() {
+		defer close(syncDone)
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-syncStop:
+				return
+			case <-ticker.C:
+				svc.syncEndpointsOnce(t.Context())
+			}
+		}
+	}()
+	defer func() {
+		close(syncStop)
+		<-syncDone
+	}()
+
+	// Let several sync iterations run so we know one is likely in-flight.
+	time.Sleep(100 * time.Millisecond)
+
+	// Without the deadlock fix, SetNamekURL could block indefinitely because
+	// it holds identityMu.Lock while its (eventual) stopEndpointSync waits
+	// for a sync goroutine that's stuck on RLock. With TryRLock + pre-stop,
+	// SetNamekURL completes promptly.
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.SetNamekURL(t.Context(), srvB.URL)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SetNamekURL: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("SetNamekURL did not complete within 10s — likely deadlock with running sync loop")
 	}
 }
 
