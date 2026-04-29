@@ -283,8 +283,8 @@ stage_boot() {
   check "1.2" "No emergency mode" "$emerg" '"emergency":false'
 
   local health
-  health=$(api "/api/v1/health/detail")
-  check "1.3" "HTTP health OK" "$health" '"HTTP server initialized"'
+  health=$(api "/api/v1/health/live")
+  check "1.3" "HTTP health OK" "$health" '"status":"ok"'
 }
 
 # ─────────────────────────────────────────────────────────
