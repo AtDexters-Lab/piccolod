@@ -315,16 +315,19 @@ func (s *GinServer) handleSetUserPassword(c *gin.Context) {
 // they reach the handler. Most callsites in this package fall in that
 // category — see gin_middleware.go:207 for the central enforcement.
 //
-// MUST NOT be used by handlers outside requireSession (public OIDC at the
-// root router, boot handler, login flows) OR by recovery-key state-mutating
-// handlers (admitted by the middleware's prefix allowlist for read paths).
-// Those callers must use sessionGate so the gate state is a type-level
-// return they cannot drop accidentally.
+// Most callsites are in handlers under requireSession; the middleware-level
+// gate covers them. Two intentional exceptions exist on root-router routes
+// that must work pre-login:
+//   - handleOIDCAuthorize (gin_oidc_handlers.go:394): sessionGates at the
+//     top of the function, then fast-paths via this helper post-gate.
+//   - handleBoot (gin_boot_handler.go:145): performs its own
+//     MustRegisterPasskey check at the next branch (line ~159).
 //
-// Cluster 6.5b (2026-04-29) recalibration: the ~13 callsites of this helper
-// are all in handlers under requireSession, so the middleware-level gate
-// covers them. Migration to sessionGate would be cosmetic; the architectural
-// invariant is captured here instead.
+// New handlers OUTSIDE requireSession that read a session must use
+// sessionGate, not this helper — the type-level two-value return makes the
+// gate impossible to drop accidentally. Same rule for recovery-key
+// state-mutating handlers (admitted by the middleware's prefix allowlist
+// for read paths).
 func (s *GinServer) getSessionFromContext(c *gin.Context) *auth.Session {
 	id, ok := s.getSession(c)
 	if !ok {
