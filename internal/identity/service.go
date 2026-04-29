@@ -333,6 +333,24 @@ func (s *Service) NotifyNetworkUp() {
 	}
 }
 
+// guardClientChanged returns true if s.client has been swapped since
+// `captured` was snapshotted (SetNamekURL is the only swap site outside
+// initialization). Callers use it AFTER an RPC and BEFORE persisting
+// the result, so OLD-server data cannot leak into NEW-server config —
+// the SETN-1 race-class structurally closed in cluster 11 for Enroll(),
+// extended to sibling RPC sites in cluster 12.
+//
+// For sites where the persist is itself inside a write lock (e.g.,
+// finalizeEnrollment, fetchSuggestedHostname's suggestedHostname write),
+// prefer an inline `s.client != captured` check inside the same lock —
+// this helper is for sites that persist outside a lock and accept the
+// narrow residual window between guard and mutation.
+func (s *Service) guardClientChanged(captured *namekclient.Client) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.client != captured
+}
+
 // signalNamekURLChanged wakes an in-progress autoEnrollAtBoot backoff loop
 // so its next iteration runs against the new namekclient instead of waiting
 // out the current backoff timer (up to ~120s at the cap). Without this,
@@ -553,11 +571,12 @@ func (s *Service) Enroll(ctx context.Context) (*EnrollResult, error) {
 // Shared by Enroll and reenrollWithRecovery.
 //
 // expectedClient is the namekclient pointer the caller used for the RPC.
-// Pass nil to skip the SETN-1 check (e.g., reenrollWithRecovery — covered
-// in deferred_setn1_sibling_sites.md). When non-nil, the check happens
-// inside the write lock immediately before the mutation: if s.client
-// swapped between the RPC and now, discard so a hybrid identity (new
-// NamekURL + old DeviceID) cannot be persisted.
+// All current callers (Enroll, reenrollWithRecovery) pass non-nil. The
+// nil-skip branch is kept as a forward-compat escape hatch for any
+// future caller that legitimately doesn't need the guard. When non-nil,
+// the check happens inside the write lock immediately before the
+// mutation: if s.client swapped between the RPC and now, discard so a
+// hybrid identity (new NamekURL + old DeviceID) cannot be persisted.
 func (s *Service) finalizeEnrollment(result *namekclient.EnrollResult, expectedClient *namekclient.Client) (*EnrollResult, error) {
 	baseDomain := extractBaseDomain(result.Hostname)
 
@@ -921,16 +940,20 @@ func (s *Service) reenrollWithRecovery() {
 			// Clear recovering before finalize so the sync loop's initial
 			// tick (started by finalizeEnrollment) can fetch fresh device info.
 			s.recovering.Store(false)
-			// SETN-1 guard not yet applied here — see deferred_setn1_sibling_sites.md.
-			// reenrollWithRecovery is one of 4 sibling sites with the same race shape;
-			// scoped out of cluster 11 (Enroll-only) and tracked for a follow-up.
-			if _, fErr := s.finalizeEnrollment(result, nil); fErr != nil {
+			// SETN-1: pass the captured client so finalizeEnrollment's
+			// write-locked check discards an old-server result if SetNamekURL
+			// swapped mid-RPC. Same shape as Enroll's call — both atomic with
+			// the config mutation.
+			if _, fErr := s.finalizeEnrollment(result, client); fErr != nil {
 				log.Printf("ERROR: identity: finalize re-enrollment: %v", fErr)
 				return
 			}
 			log.Printf("INFO: identity: re-enrollment succeeded after %d attempt(s)", attempt+1)
 			// Best-effort state replay from cached state (reuse bundle to avoid re-reading disk).
-			s.replayState(bundle)
+			// Bind replay to the same client we just re-enrolled with so a
+			// SetNamekURL landing between finalize and replay cannot push
+			// OLD-bundle state to the NEW server (SETN-1 binding).
+			s.replayState(bundle, client)
 			return
 		}
 
@@ -1012,7 +1035,15 @@ func (s *Service) buildRecoveryBundle() *namekclient.RecoveryBundleInput {
 // Best-effort: partial failures don't block device operation.
 // If bundle is non-nil, its CustomHostname and AliasDomains are used directly
 // (avoids re-reading state_cache.json from disk).
-func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput) {
+//
+// expectedClient is the namekclient bound to the re-enrollment whose state
+// is being replayed. Pass nil only if the caller is intentionally decoupled
+// from a specific enrollment (no current callers do). When non-nil, replayState
+// uses this client directly for all RPCs and aborts via guardClientChanged
+// before each step. Without binding to the captured client, a SetNamekURL
+// landing between finalizeEnrollment and replayState would push OLD-bundle
+// state to the NEW server (codex Phase 3 of cluster 12 caught this).
+func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput, expectedClient *namekclient.Client) {
 	var customHostname string
 	var aliasDomains []string
 
@@ -1030,9 +1061,12 @@ func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput) {
 		aliasDomains = sc.AliasDomains
 	}
 
-	s.mu.RLock()
-	client := s.client
-	s.mu.RUnlock()
+	client := expectedClient
+	if client == nil {
+		s.mu.RLock()
+		client = s.client
+		s.mu.RUnlock()
+	}
 	if client == nil {
 		return
 	}
@@ -1041,6 +1075,14 @@ func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput) {
 	defer cancel()
 
 	if customHostname != "" {
+		// SETN-1: skip if SetNamekURL swapped client before this replay
+		// step. Each step rechecks because mutations span multiple RPCs;
+		// without per-step guards a URL switch midway would continue
+		// pushing alias domains to the OLD server.
+		if s.guardClientChanged(client) {
+			log.Printf("INFO: identity: state replay aborted — namek URL changed mid-flight (SETN-1)")
+			return
+		}
 		if err := client.SetHostname(ctx, customHostname); err != nil {
 			log.Printf("WARN: identity: state replay: set hostname %q: %v", customHostname, err)
 		} else {
@@ -1049,6 +1091,10 @@ func (s *Service) replayState(bundle *namekclient.RecoveryBundleInput) {
 	}
 
 	for _, domain := range aliasDomains {
+		if s.guardClientChanged(client) {
+			log.Printf("INFO: identity: state replay aborted — namek URL changed mid-flight (SETN-1)")
+			return
+		}
 		domainInfo, err := client.RegisterDomain(ctx, domain)
 		if err != nil {
 			log.Printf("WARN: identity: state replay: register domain %q: %v", domain, err)
@@ -1282,6 +1328,17 @@ func (s *Service) syncEndpointsOnce(ctx context.Context) {
 		return
 	}
 
+	// SETN-1: discard if SetNamekURL swapped the client between the RPC
+	// and now. Without this guard, syncDeviceMeta would persist account_id
+	// from the OLD server into config now pointing at the NEW server —
+	// silent account lockout. Residual window between this check and the
+	// mutating calls below; tighter atomicity would require pushing the
+	// check into each *Sync* helper, deferred.
+	if s.guardClientChanged(client) {
+		log.Printf("INFO: identity: endpoint sync discarded — namek URL changed mid-flight (SETN-1)")
+		return
+	}
+
 	// 1. Sync account_id + recovery status
 	s.syncDeviceMeta(info)
 
@@ -1329,6 +1386,13 @@ func (s *Service) fetchSuggestedHostname() {
 			return
 		}
 		s.mu.Lock()
+		// SETN-1: inline check inside the same write lock as the persist
+		// — atomic close of the OLD-server-data leak window.
+		if s.client != client {
+			s.mu.Unlock()
+			log.Printf("INFO: identity: suggested hostname discarded — namek URL changed mid-flight (SETN-1)")
+			return
+		}
 		// Don't overwrite if user already claimed a hostname (late-arriving fetch).
 		if s.cfg.CustomHostname == "" {
 			s.suggestedHostname = hostname

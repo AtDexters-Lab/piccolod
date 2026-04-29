@@ -509,6 +509,160 @@ func TestEnroll_DiscardsResultWhenURLChangedMidFlight(t *testing.T) {
 	}
 }
 
+// TestGuardClientChanged unit-tests the helper that closes the SETN-1
+// race-class for sibling RPC sites (cluster 12). The helper is the
+// canonical "post-RPC, pre-persist" check for syncEndpointsOnce and
+// replayState; finalizeEnrollment + fetchSuggestedHostname inline the
+// same comparison inside their own write locks.
+func TestGuardClientChanged(t *testing.T) {
+	svc := &Service{}
+	original := newNamekClient("https://orig.example", &mockTPM{}, "")
+	swapped := newNamekClient("https://other.example", &mockTPM{}, "")
+	svc.client = original
+
+	if svc.guardClientChanged(original) {
+		t.Error("guardClientChanged(original) = true; want false (no swap)")
+	}
+	svc.client = swapped
+	if !svc.guardClientChanged(original) {
+		t.Error("guardClientChanged(original) = false after swap; want true")
+	}
+	if svc.guardClientChanged(swapped) {
+		t.Error("guardClientChanged(swapped) = true; want false (matches current)")
+	}
+	// s.client cleared (e.g., during shutdown): helper still compares
+	// against captured non-nil → true. Caller contract is to pass a
+	// non-nil capture; this branch is defensive.
+	svc.client = nil
+	if !svc.guardClientChanged(original) {
+		t.Error("guardClientChanged(original) when s.client=nil = false; want true")
+	}
+}
+
+// TestReenrollWithRecovery_DiscardsResultWhenURLChangedMidFlight verifies
+// the system as a whole prevents OLD-server result from being persisted
+// against NEW-server config. Two layers contribute:
+//   - the captured-client SETN-1 guard inside finalizeEnrollment (the
+//     structural backstop introduced by this cluster + cluster 11), and
+//   - the loop's `!s.enrolled.Load()` early-exit at the next iteration
+//     (operational defense-in-depth — SetNamekURL clears enrolled).
+//
+// Both lead to the same observable end-state (no hybrid persisted), and
+// the test asserts on that end-state. The unit test for guardClientChanged
+// pins the structural guard's comparison logic; this test is integration
+// coverage for the highest-impact sibling site (same DeviceID-persistence
+// shape as Enroll). Deeper integration tests for syncEndpointsOnce /
+// fetchSuggestedHostname / replayState deferred — they use the same
+// helper pattern verified here.
+func TestReenrollWithRecovery_DiscardsResultWhenURLChangedMidFlight(t *testing.T) {
+	tracker := newEnrollTracker()
+	tracker.returnOK.Store(true)
+
+	releaseCh := make(chan struct{})
+	holdCh := make(chan struct{}, 1)
+	holdOnce := make(chan struct{}, 1)
+	holdOnce <- struct{}{}
+
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/devices/enroll" {
+			select {
+			case <-holdOnce:
+				holdCh <- struct{}{}
+				<-releaseCh
+			default:
+			}
+		}
+		tracker.Handler().ServeHTTP(w, r)
+	}))
+	defer srvA.Close()
+
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "srvB unavailable"})
+	}))
+	defer srvB.Close()
+
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "identity.json")
+	svc := &Service{
+		configPath: configPath,
+		tpmDev:     &mockTPM{},
+		cfg: Config{
+			Enabled:  true,
+			DeviceID: "dev-old",
+			Hostname: "slug.test.local",
+			NamekURL: srvA.URL,
+		},
+		client:          newNamekClient(srvA.URL, &mockTPM{}, "dev-old"),
+		stopCh:          make(chan struct{}),
+		networkUp:       make(chan struct{}, 1),
+		namekURLChanged: make(chan struct{}, 1),
+	}
+	svc.enrolled.Store(true)
+	bus := events.NewBus()
+	defer bus.Close()
+	svc.eventsBus = bus
+	if err := saveConfig(configPath, svc.cfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		svc.stopped.Store(true)
+		select {
+		case <-svc.stopCh:
+		default:
+			close(svc.stopCh)
+		}
+		svc.recoverWg.Wait()
+	})
+
+	// reenrollWithRecovery requires recovering=true precondition.
+	svc.recovering.Store(true)
+	done := make(chan struct{})
+	go func() {
+		svc.reenrollWithRecovery()
+		close(done)
+	}()
+
+	// Wait until the handler has the first /devices/enroll call held.
+	select {
+	case <-holdCh:
+	case <-time.After(3 * time.Second):
+		close(releaseCh)
+		t.Fatal("first /devices/enroll call did not arrive at server A within 3s")
+	}
+
+	// Swap to srvB while the RPC is in-flight.
+	if err := svc.SetNamekURL(t.Context(), srvB.URL); err != nil {
+		close(releaseCh)
+		t.Fatalf("SetNamekURL: %v", err)
+	}
+
+	close(releaseCh)
+
+	// reenrollWithRecovery's inner loop should detect SetNamekURL via
+	// `!s.IsEnrolled()` (SetNamekURL clears enrolled) and bail.
+	// finalizeEnrollment with non-nil expectedClient also catches the
+	// swap if the loop progresses past the enrolled check before the
+	// SetNamekURL clears it.
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("reenrollWithRecovery did not exit within 10s")
+	}
+
+	// Config must reflect the new URL with NO persisted DeviceID from srvA.
+	cfg := svc.DeviceConfig()
+	if cfg.NamekURL != srvB.URL {
+		t.Errorf("NamekURL = %q, want %q", cfg.NamekURL, srvB.URL)
+	}
+	if cfg.DeviceID == "dev-123" {
+		t.Errorf("DeviceID = %q — finalized A's result against B's config (SETN-1 leak)", cfg.DeviceID)
+	}
+	if cfg.Hostname == "slug.test.local" && cfg.DeviceID == "dev-123" {
+		t.Error("hybrid identity persisted (A's hostname + A's DeviceID under B's URL)")
+	}
+}
+
 // drainCalled removes any pending entries from tracker.calledCh. Used after
 // a direct s.Enroll() verification call so subsequent channel receives
 // synchronize on the intended path.
