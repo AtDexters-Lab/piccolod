@@ -1985,6 +1985,15 @@ func (s *GinServer) setupGinRoutes() {
 		admin.POST("/crypto/recovery-key/generate", s.handleCryptoRecoveryGenerate)
 		admin.POST("/crypto/recovery-key/ack", s.handleCryptoRecoveryKeyAck)
 
+		// Auto-unlock surface — requires unlocked + admin. GET returns state +
+		// has_outstanding_blob; PUT applies a partial update with cleanup on
+		// disable; DELETE is sugar for PUT enabled=false; POST /test runs the
+		// namek round-trip without touching SDEK or blob.
+		admin.GET("/security/auto-unlock", s.requireUnlocked(), s.handleAutoUnlockGet)
+		admin.PUT("/security/auto-unlock", s.requireUnlocked(), s.handleAutoUnlockPut)
+		admin.DELETE("/security/auto-unlock", s.requireUnlocked(), s.handleAutoUnlockDelete)
+		admin.POST("/security/auto-unlock/test", s.requireUnlocked(), s.handleAutoUnlockTest)
+
 		// App management endpoints
 		apps := authed.Group("/apps")
 		{

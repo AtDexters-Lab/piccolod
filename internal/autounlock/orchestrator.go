@@ -2,6 +2,7 @@ package autounlock
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -89,3 +90,22 @@ const aadSuffix = "auto_unlock_v1"
 func (o *Orchestrator) aad() []byte {
 	return []byte(o.deps.GetDeviceID() + "|" + aadSuffix)
 }
+
+// UpdateInput is the partial-update shape consumed by the HTTP PUT handler.
+// All fields are optional pointers — nil means "leave unchanged."
+type UpdateInput struct {
+	Enabled    *bool             `json:"enabled,omitempty"`
+	AutoReboot *AutoRebootUpdate `json:"auto_reboot,omitempty"`
+}
+
+// AutoRebootUpdate is the partial-update shape for the nested auto_reboot
+// block. Same pointer convention.
+type AutoRebootUpdate struct {
+	Enabled         *bool `json:"enabled,omitempty"`
+	WindowStartHour *int  `json:"window_start_hour,omitempty"`
+	WindowEndHour   *int  `json:"window_end_hour,omitempty"`
+}
+
+// ErrInvalidWindow is returned when a PUT supplies an out-of-range or
+// equal-bounds window. Caller maps to 400.
+var ErrInvalidWindow = errors.New("autounlock: invalid window — hours must be 0..23, start != end")
