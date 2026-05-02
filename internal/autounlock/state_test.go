@@ -16,8 +16,16 @@ func TestLoadState_MissingFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadState (missing): %v", err)
 	}
-	if s.Enabled {
-		t.Errorf("missing-file enabled = true; want false")
+	// Default-on: the appliance value-prop is "it just works" post-reboot.
+	if !s.Enabled {
+		t.Errorf("missing-file enabled = false; want true (default-on)")
+	}
+	if !s.AutoReboot.Enabled {
+		t.Errorf("missing-file auto_reboot.enabled = false; want true (default-on)")
+	}
+	if s.AutoReboot.WindowStartHour != 3 || s.AutoReboot.WindowEndHour != 5 {
+		t.Errorf("missing-file window = %d-%d; want 3-5",
+			s.AutoReboot.WindowStartHour, s.AutoReboot.WindowEndHour)
 	}
 }
 
@@ -34,8 +42,11 @@ func TestLoadState_InvalidJSON(t *testing.T) {
 	if err != ErrInvalidStateFile {
 		t.Fatalf("expected ErrInvalidStateFile; got %v", err)
 	}
-	if s.Enabled {
-		t.Errorf("fall-back enabled = true; want false")
+	// Fall-back to DefaultState (default-on) — corrupt file does not down-
+	// grade to disabled, since the implicit semantic is "this device's
+	// auto-unlock state is unknowable, fall back to the appliance default."
+	if !s.Enabled {
+		t.Errorf("fall-back enabled = false; want true (DefaultState)")
 	}
 }
 

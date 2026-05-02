@@ -8,8 +8,13 @@ import (
 func ptrBool(v bool) *bool { return &v }
 func ptrInt(v int) *int    { return &v }
 
-func TestUpdate_EnableFromDefault(t *testing.T) {
+func TestUpdate_EnableFromDisabled(t *testing.T) {
 	o, _, _, audits := newOrchestrator(t)
+	// Start from explicit disabled (the post-default-flip "user opted out"
+	// state) so we can exercise the disabled→enabled transition.
+	if err := SaveState(State{Enabled: false}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
 	if err := o.Update(context.Background(), UpdateInput{Enabled: ptrBool(true)}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}

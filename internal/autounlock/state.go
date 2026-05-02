@@ -39,15 +39,28 @@ type State struct {
 	LastFailureReason string     `json:"last_failure_reason,omitempty"`
 }
 
-// DefaultState is the implicit state when the file is missing.
+// DefaultState is the implicit state when the file is missing — i.e. on a
+// fresh device or before the operator has interacted with Settings →
+// Security. Defaults are ON: the appliance value-prop is "it just works"
+// post-reboot. Operators with a physical-security threat model that
+// rules out auto-unlock can flip it off via Settings; the trust
+// disclosure surfaces the trade-off before they leave the default.
+//
+// Enrolment-gated in practice: ceremony's IsIdentityReady() check
+// excludes devices that aren't enrolled to namek, so default-on doesn't
+// activate the scheduler / ceremony / pickup on unsupported devices.
 func DefaultState() State {
-	return State{Enabled: false}
+	return State{
+		Enabled:    true,
+		AutoReboot: DefaultAutoReboot(),
+	}
 }
 
-// DefaultAutoReboot is initialised when auto-unlock is first enabled.
+// DefaultAutoReboot is the auto-reboot block carried in DefaultState and
+// re-seeded when an operator re-enables after a prior disable.
 func DefaultAutoReboot() AutoReboot {
 	return AutoReboot{
-		Enabled:         false, // user opts in to overnight reboots explicitly
+		Enabled:         true,
 		WindowStartHour: 3,
 		WindowEndHour:   5,
 	}
