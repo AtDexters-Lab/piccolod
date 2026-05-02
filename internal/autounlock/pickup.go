@@ -6,12 +6,21 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	"piccolod/internal/crypt"
 	"piccolod/internal/cryptoutil"
 
 	"github.com/AtDexters-Lab/namek-server/pkg/namekclient"
 )
+
+// pickupIdentityWaitTimeout bounds how long pickup will wait for the identity
+// service (TPM enrollment + namek client init) to come up before giving up.
+// Warm boots typically settle in < 5s; first-boot or post-network-outage
+// boots can lag closer to 30s. 60s leaves headroom while still keeping the
+// locked-screen UI responsive — after that the operator can password-unlock.
+const pickupIdentityWaitTimeout = 60 * time.Second
+const pickupIdentityWaitInterval = 1 * time.Second
 
 // PickupOutcome reports what happened in the post-boot pickup attempt. The
 // caller (gin_server.Start integration) uses this to drive UI status (the
@@ -58,7 +67,7 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 	defer o.mu.Unlock()
 
 	state, err := LoadState()
-	if err != nil && err != ErrInvalidStateFile {
+	if err != nil && !errors.Is(err, ErrInvalidStateFile) {
 		log.Printf("WARN: autounlock: pickup load state: %v", err)
 		return PickupOutcomeNoBlob
 	}
@@ -66,28 +75,40 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 		return PickupOutcomeNoBlob
 	}
 
+	// Marker for handleCryptoStatus's UI surface. Set after the disabled-
+	// or-state-unreadable bail so the "Auto-unlocking…" indicator never
+	// shows on devices that never opted in.
+	o.inFlight.Store(true)
+	defer o.inFlight.Store(false)
+
 	blob, err := ReadBlob()
 	if err != nil {
 		if errors.Is(err, ErrBlobMissing) {
 			// Auto-unlock is enabled but ceremony didn't deposit (crash,
 			// SIGKILL, hardware-watchdog reset). Audit the silent gap so
 			// operators can see "we expected to auto-unlock and didn't."
-			o.recordFailure(&state, ReasonNoBlob)
+			o.recordFailure(&state, AuditCycleFailedPickup, ReasonNoBlob)
 			return PickupOutcomeNoBlob
 		}
 		log.Printf("ERROR: autounlock: pickup read blob: %v", err)
-		o.recordFailure(&state, ReasonNoBlob)
+		o.recordFailure(&state, AuditCycleFailedPickup, ReasonNoBlob)
 		return PickupOutcomeFailed
 	}
 
-	if !o.deps.IsIdentityReady() {
-		log.Printf("WARN: autounlock: pickup — identity not ready")
-		o.recordFailure(&state, ReasonServiceNotReady)
+	// Wait briefly for identity to come up — TPM enrollment + namek client
+	// init can race the pickup goroutine on a fast boot. Without this wait,
+	// a first-boot pickup that runs ~2s before identity finishes would
+	// record service_not_ready and require manual unlock for that boot. The
+	// wait is bounded by deps.PickupIdentityWaitTimeout AND by ctx (Stop
+	// Phase 0 cancels promptly).
+	if !o.waitForIdentity(ctx, o.deps.PickupIdentityWaitTimeout) {
+		log.Printf("WARN: autounlock: pickup — identity not ready after %s", o.deps.PickupIdentityWaitTimeout)
+		o.recordFailure(&state, AuditCycleFailedPickup, ReasonServiceNotReady)
 		return PickupOutcomeFailed
 	}
 	client := o.deps.NamekClient()
 	if client == nil {
-		o.recordFailure(&state, ReasonServiceNotReady)
+		o.recordFailure(&state, AuditCycleFailedPickup, ReasonServiceNotReady)
 		return PickupOutcomeFailed
 	}
 
@@ -108,14 +129,14 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 			}
 		}
 		log.Printf("WARN: autounlock: pickup failed (%s): %v", reason, err)
-		o.recordFailure(&state, reason)
+		o.recordFailure(&state, AuditCycleFailedPickup, reason)
 		return PickupOutcomeFailed
 	}
 
 	F, err := base64.RawURLEncoding.DecodeString(resp.Secret)
 	if err != nil {
 		log.Printf("ERROR: autounlock: decode F: %v", err)
-		o.recordFailure(&state, ReasonBlobCorrupt)
+		o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
 		return PickupOutcomeFailed
 	}
 	defer cryptoutil.SecureZero(F)
@@ -132,18 +153,22 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 	}
 	if errors.Is(unwrapErr, crypt.ErrAutoUnlockBlobCorrupt) {
 		_ = DeleteBlob()
-		o.recordFailure(&state, ReasonBlobCorrupt)
+		o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
 		return PickupOutcomeFailed
 	}
 	if unwrapErr != nil {
 		log.Printf("ERROR: autounlock: unwrap SDEK: %v", unwrapErr)
-		o.recordFailure(&state, ReasonBlobCorrupt)
+		o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
 		return PickupOutcomeFailed
 	}
 
 	if err := completeChain(ctx); err != nil {
+		// Post-decrypt chain failure (storage volume, persistence notify, PCV,
+		// reload). Externally indistinguishable from a corrupt blob — the
+		// device is locked at the same downstream level. Folded into
+		// ReasonBlobCorrupt to keep the failure-token vocabulary minimal.
 		log.Printf("ERROR: autounlock: post-unlock chain: %v", err)
-		o.recordFailure(&state, ReasonChainFailed)
+		o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
 		return PickupOutcomeFailed
 	}
 
@@ -169,5 +194,28 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 func (o *Orchestrator) bestEffortRevoke(ctx context.Context, client NamekEscrowClient) {
 	if err := client.RevokeUnlockEscrow(ctx); err != nil {
 		log.Printf("WARN: autounlock: revoke: %v", err)
+	}
+}
+
+// waitForIdentity polls IsIdentityReady at pickupIdentityWaitInterval until
+// it returns true, the timeout elapses, or ctx is cancelled. Returns the
+// final readiness state — true on success, false on timeout/cancel.
+func (o *Orchestrator) waitForIdentity(ctx context.Context, timeout time.Duration) bool {
+	if o.deps.IsIdentityReady() {
+		return true
+	}
+	deadline, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(pickupIdentityWaitInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-deadline.Done():
+			return o.deps.IsIdentityReady()
+		case <-ticker.C:
+			if o.deps.IsIdentityReady() {
+				return true
+			}
+		}
 	}
 }

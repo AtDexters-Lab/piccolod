@@ -14,7 +14,7 @@ import (
 // supplied; returns ErrInvalidWindow on malformed input.
 //
 // Caller is the HTTP PUT handler; emits AuditEnabledChanged on enabled
-// transitions. State changes other than enabled toggles are not audited.
+// transitions and AuditAutoRebootChanged when the auto_reboot block changes.
 func (o *Orchestrator) Update(ctx context.Context, in UpdateInput) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -55,7 +55,11 @@ func (o *Orchestrator) Update(ctx context.Context, in UpdateInput) error {
 	}
 
 	// Disable transition: clean up server-side escrow and on-disk blob so
-	// the next reboot cycle doesn't try to pickup against stale state.
+	// the next reboot cycle doesn't try to pickup against stale state. Also
+	// reset the auto_reboot block (window + last_fired/failed timestamps)
+	// so a future re-enable starts from defaults — without this, an operator
+	// who toggles off-then-on retains stale fire timestamps that could
+	// suppress the next legitimate fire via rehydrate.
 	if prev.Enabled && !state.Enabled {
 		if client := o.deps.NamekClient(); client != nil {
 			if err := client.RevokeUnlockEscrow(ctx); err != nil {
@@ -65,6 +69,10 @@ func (o *Orchestrator) Update(ctx context.Context, in UpdateInput) error {
 		if err := DeleteBlob(); err != nil {
 			log.Printf("WARN: autounlock: disable-cleanup blob: %v", err)
 		}
+		state.AutoReboot = AutoReboot{}
+		if err := SaveState(state); err != nil {
+			log.Printf("WARN: autounlock: persist post-disable reset: %v", err)
+		}
 		o.emitAudit(AuditCycleRevoked, map[string]any{"reason": "disabled"})
 	}
 
@@ -72,6 +80,20 @@ func (o *Orchestrator) Update(ctx context.Context, in UpdateInput) error {
 		o.emitAudit(AuditEnabledChanged, map[string]any{
 			"from": prev.Enabled,
 			"to":   *in.Enabled,
+		})
+	}
+	// Audit operator-initiated auto_reboot changes — drives the Activity
+	// sub-page entry that lets the operator audit "did someone change my
+	// maintenance window?" Gate on `in.AutoReboot != nil` (operator
+	// explicitly sent the block) rather than struct-diff: the
+	// first-enable seed-defaults branch and the disable-cleanup zero both
+	// modify state.AutoReboot internally, and neither is user-initiated.
+	if in.AutoReboot != nil && state.AutoReboot != prev.AutoReboot {
+		o.emitAudit(AuditAutoRebootChanged, map[string]any{
+			"from_enabled": prev.AutoReboot.Enabled,
+			"to_enabled":   state.AutoReboot.Enabled,
+			"from_window":  [2]int{prev.AutoReboot.WindowStartHour, prev.AutoReboot.WindowEndHour},
+			"to_window":    [2]int{state.AutoReboot.WindowStartHour, state.AutoReboot.WindowEndHour},
 		})
 	}
 	return nil

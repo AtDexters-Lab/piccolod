@@ -2,7 +2,10 @@ package autounlock
 
 import (
 	"context"
+	"errors"
 	"log"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +35,10 @@ type SchedulerDeps struct {
 	UpdateManager UpdateManager
 	PublishAudit  AuditEmitter
 	Now           func() time.Time
+	// TZSafeToFire reports whether the system timezone has been configured
+	// away from UTC (the dangerous default). Optional; defaults to a
+	// /etc/localtime readlink probe when nil. Tests inject a fake.
+	TZSafeToFire func() bool
 }
 
 // Scheduler triggers the maintenance-window auto-reboot. Gated on:
@@ -63,6 +70,9 @@ type Scheduler struct {
 func NewScheduler(deps SchedulerDeps) *Scheduler {
 	if deps.Now == nil {
 		deps.Now = time.Now
+	}
+	if deps.TZSafeToFire == nil {
+		deps.TZSafeToFire = tzSafeToFire
 	}
 	return &Scheduler{deps: deps}
 }
@@ -102,10 +112,20 @@ func (s *Scheduler) tick(ctx context.Context) {
 	defer s.mu.Unlock()
 
 	state, err := LoadState()
-	if err != nil && err != ErrInvalidStateFile {
+	if err != nil && !errors.Is(err, ErrInvalidStateFile) {
 		return
 	}
 	if !state.Enabled || !state.AutoReboot.Enabled {
+		return
+	}
+
+	// P1 safety gate: window hours are wall-clock-local. If the device's
+	// timezone has never been configured, time.Now() is implicitly UTC, so a
+	// 3-5AM window fires at 3-5AM UTC instead of the operator's local night.
+	// Gate firing until the operator (or the X-Browser-Timezone middleware,
+	// once shipped) sets a non-UTC zone via timedatectl. Reads at every tick
+	// so the gate clears the moment timezone is configured — no restart needed.
+	if !s.deps.TZSafeToFire() {
 		return
 	}
 
@@ -153,7 +173,9 @@ func (s *Scheduler) tick(ctx context.Context) {
 		log.Printf("ERROR: autounlock scheduler: Reboot failed: %v", err)
 		failedAt := s.deps.Now()
 		state.AutoReboot.LastFailedAt = &failedAt
-		_ = SaveState(state)
+		if err := SaveState(state); err != nil {
+			log.Printf("WARN: autounlock scheduler: persist last_failed_at: %v", err)
+		}
 		if s.deps.PublishAudit != nil {
 			s.deps.PublishAudit(AuditSchedulerFailed, map[string]any{
 				"reason":     err.Error(),
@@ -168,7 +190,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 // a piccolod restart inside the window doesn't double-fire.
 func (s *Scheduler) rehydrate() {
 	state, err := LoadState()
-	if err != nil && err != ErrInvalidStateFile {
+	if err != nil && !errors.Is(err, ErrInvalidStateFile) {
 		return
 	}
 	now := s.deps.Now()
@@ -218,4 +240,39 @@ func inWindow(hour, start, end int) bool {
 		return hour >= start && hour < end
 	}
 	return hour >= start || hour < end
+}
+
+// tzWarnOnce ensures the "timezone unset, scheduler gated" log fires at most
+// once per piccolod lifetime. Without this every 60s tick would re-log.
+var tzWarnOnce sync.Once
+
+// tzSafeToFire reports whether the system timezone has been set away from the
+// UTC default. Implementation reads `/etc/localtime` (a symlink into
+// /usr/share/zoneinfo/...). The OOTB MicroOS default targets UTC; once the
+// operator sets a real zone via timedatectl (or the X-Browser-Timezone
+// middleware lands), the symlink retargets and the gate opens.
+//
+// Conservative on errors: any read failure returns false (gates firing). The
+// scheduler-fire path is the dangerous direction; gating an extra cycle is
+// cheap, firing at the wrong wall-clock hour is not.
+func tzSafeToFire() bool {
+	target, err := os.Readlink("/etc/localtime")
+	if err != nil {
+		tzWarnOnce.Do(func() {
+			log.Printf("WARN: autounlock scheduler: /etc/localtime readlink (%v) — firing gated until timezone configured", err)
+		})
+		return false
+	}
+	// Symlink targets observed in practice:
+	//   "../usr/share/zoneinfo/UTC"            (MicroOS default)
+	//   "/usr/share/zoneinfo/UTC"
+	//   "../usr/share/zoneinfo/America/New_York" (after timedatectl)
+	//   "UTC"                                    (rare, hand-edited)
+	if target == "UTC" || strings.HasSuffix(target, "/UTC") {
+		tzWarnOnce.Do(func() {
+			log.Printf("WARN: autounlock scheduler: /etc/localtime resolves to UTC — firing gated until timezone configured")
+		})
+		return false
+	}
+	return true
 }

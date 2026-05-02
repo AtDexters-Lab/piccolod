@@ -1,15 +1,15 @@
 package autounlock
 
 // Audit event kind tokens, namespaced under auto_unlock.* and system.timezone.*.
-// Plan §audit-event-kinds enumerates the full set including scheduler events
-// (deferred to the scheduler commit).
 const (
-	AuditEnabledChanged    = "auto_unlock.enabled.changed"
-	AuditCycleDeposited    = "auto_unlock.cycle.deposited"
-	AuditCyclePickedUp     = "auto_unlock.cycle.picked_up"
-	AuditCycleRevoked      = "auto_unlock.cycle.revoked"
-	AuditCycleFailedPickup = "auto_unlock.cycle.failed_pickup"
-	AuditTestRun           = "auto_unlock.test.run"
+	AuditEnabledChanged     = "auto_unlock.enabled.changed"
+	AuditAutoRebootChanged  = "auto_unlock.auto_reboot.changed"
+	AuditCycleDeposited     = "auto_unlock.cycle.deposited"
+	AuditCyclePickedUp      = "auto_unlock.cycle.picked_up"
+	AuditCycleRevoked       = "auto_unlock.cycle.revoked"
+	AuditCycleFailedDeposit = "auto_unlock.cycle.failed_deposit"
+	AuditCycleFailedPickup  = "auto_unlock.cycle.failed_pickup"
+	AuditTestRun            = "auto_unlock.test.run"
 )
 
 // Failure-reason tokens passed in the `reason` field of `failed_pickup` audit
@@ -26,11 +26,6 @@ const (
 	ReasonNoBlob             = "no_blob"
 	ReasonDepositFailed      = "deposit_failed"
 	ReasonManualUnlockFirst  = "manual_unlock_first"
-	// ReasonChainFailed: pickup retrieved F and unwrapped SDEK successfully,
-	// but the post-decrypt chain (UnlockDataVolume / persistence notify /
-	// PCV / reload) failed. Distinct from blob_corrupt — the blob was good;
-	// the downstream subsystem broke.
-	ReasonChainFailed        = "chain_failed"
 )
 
 // emitAudit is a thin nil-safe wrapper so callers don't need to check the

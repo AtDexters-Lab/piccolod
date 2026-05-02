@@ -35,7 +35,7 @@ func (o *Orchestrator) RunCeremony(ctx context.Context) error {
 	defer o.mu.Unlock()
 
 	state, err := LoadState()
-	if err != nil && err != ErrInvalidStateFile {
+	if err != nil && !errors.Is(err, ErrInvalidStateFile) {
 		log.Printf("WARN: autounlock: ceremony load state: %v", err)
 		return err
 	}
@@ -65,19 +65,19 @@ func (o *Orchestrator) RunCeremony(ctx context.Context) error {
 	defer cryptoutil.SecureZero(F)
 	if _, err := io.ReadFull(rand.Reader, F); err != nil {
 		log.Printf("ERROR: autounlock: rand F: %v", err)
-		o.recordFailure(&state, ReasonDepositFailed)
+		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonDepositFailed)
 		return err
 	}
 
 	blob, err := o.deps.Manager.WrapSDEKForEscrow(F, o.aad())
 	if err != nil {
 		log.Printf("ERROR: autounlock: wrap SDEK: %v", err)
-		o.recordFailure(&state, ReasonDepositFailed)
+		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonDepositFailed)
 		return err
 	}
 	if err := WriteBlob(blob); err != nil {
 		log.Printf("ERROR: autounlock: write blob: %v", err)
-		o.recordFailure(&state, ReasonBlobWriteFailed)
+		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonBlobWriteFailed)
 		return err
 	}
 
@@ -87,11 +87,11 @@ func (o *Orchestrator) RunCeremony(ctx context.Context) error {
 		// Deleting prevents a stale-blob pickup on next boot.
 		_ = DeleteBlob()
 		log.Printf("ERROR: autounlock: deposit failed: %v", err)
-		reason := ReasonDepositFailed
-		if errors.Is(err, context.DeadlineExceeded) {
-			reason = ReasonServiceUnreachable
-		}
-		o.recordFailure(&state, reason)
+		// All deposit-side failures (including the 25s ceremony-budget
+		// timeout) collapse to deposit_failed. The pickup goroutine's
+		// service_unreachable is for the *next boot's* read — they're not
+		// the same failure class.
+		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonDepositFailed)
 		return err
 	}
 
@@ -109,8 +109,9 @@ func (o *Orchestrator) RunCeremony(ctx context.Context) error {
 }
 
 // deposit attempts the deposit RPC with a single retry on transient errors.
-// F is captured once at ceremony start (per Red-team F1 fix) — the retry
-// reuses the same bytes, never regenerates.
+// F is captured once at ceremony start — the retry reuses the same bytes,
+// never regenerates. Regenerating mid-retry would race the wrap/blob already
+// committed to the same F, leaving an unrecoverable blob on disk.
 func (o *Orchestrator) deposit(ctx context.Context, client NamekEscrowClient, F []byte) (*namekclient.DepositUnlockEscrowResponse, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		resp, err := client.DepositUnlockEscrow(ctx, F, configuredWindowSeconds)
@@ -126,18 +127,20 @@ func (o *Orchestrator) deposit(ctx context.Context, client NamekEscrowClient, F 
 	return nil, errors.New("deposit retries exhausted")
 }
 
-// recordFailure persists last_failure_* and emits the failed_pickup audit
-// event. Used by both ceremony (deposit-side failures) and pickup (retrieval-
-// side failures) — `failed_pickup` is the canonical "auto-unlock didn't work
-// this cycle" signal.
-func (o *Orchestrator) recordFailure(state *State, reason string) {
+// recordFailure persists last_failure_* and emits the supplied audit kind.
+// Ceremony-side failures pass AuditCycleFailedDeposit; pickup-side failures
+// pass AuditCycleFailedPickup. Distinguishing the two lets the Activity
+// sub-page tell the operator whether the previous cycle failed at deposit
+// (last shutdown couldn't reach namek) or at pickup (this boot couldn't
+// retrieve from namek) — different remediation flows.
+func (o *Orchestrator) recordFailure(state *State, auditKind, reason string) {
 	now := o.deps.Now()
 	state.LastFailureAt = &now
 	state.LastFailureReason = reason
 	if err := SaveState(*state); err != nil {
 		log.Printf("WARN: autounlock: persist failure state: %v", err)
 	}
-	o.emitAudit(AuditCycleFailedPickup, map[string]any{"reason": reason})
+	o.emitAudit(auditKind, map[string]any{"reason": reason})
 }
 
 // isTransientNamekErr classifies an error as worth retrying. Transport-level

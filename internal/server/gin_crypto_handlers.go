@@ -175,19 +175,17 @@ func (s *GinServer) handleCryptoStatus(c *gin.Context) {
 	}
 	resp := gin.H{"initialized": init, "locked": locked, "setup_in_progress": s.isSetupInProgress()}
 
-	// Auto-unlock surface — drives UI's transient "Auto-unlocking" state
-	// and the locked-screen failure banner. Always reports enabled state so
-	// the UI can decide whether to show the banner at all (disabled → no
-	// banner regardless of prior failures).
+	// Auto-unlock surface — public, pre-auth. Reports enabled state and the
+	// transient in-flight marker so the locked-screen UI can show the
+	// "Auto-unlocking…" indicator without polling /security/auto-unlock
+	// (which is session-gated and thus unreachable pre-auth). Failure
+	// detail (reason + timestamp) lives behind the gate; emitting it here
+	// would leak operator-visible state.
 	if state, err := autounlock.LoadState(); err == nil {
 		resp["auto_unlock_enabled"] = state.Enabled
-		if state.LastFailureAt != nil &&
-			(state.LastPickupAt == nil || state.LastFailureAt.After(*state.LastPickupAt)) {
-			resp["auto_unlock_last_failure"] = gin.H{
-				"at":     state.LastFailureAt,
-				"reason": state.LastFailureReason,
-			}
-		}
+	}
+	if s.autounlockOrch != nil {
+		resp["auto_unlock_in_flight"] = s.autounlockOrch.InFlight()
 	}
 	c.JSON(http.StatusOK, resp)
 }

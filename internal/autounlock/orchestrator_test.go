@@ -150,7 +150,8 @@ func newOrchestrator(t *testing.T) (*Orchestrator, *fakeManager, *fakeNamek, *[]
 			defer auditMu.Unlock()
 			*audits = append(*audits, capturedAudit{kind, details})
 		},
-		Now: func() time.Time { return time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC) },
+		Now:                       func() time.Time { return time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC) },
+		PickupIdentityWaitTimeout: 100 * time.Millisecond,
 	}
 	o, err := New(deps)
 	if err != nil {
@@ -246,8 +247,8 @@ func TestRunCeremony_DepositFails_DeletesBlob(t *testing.T) {
 	if state.LastFailureReason != ReasonDepositFailed {
 		t.Errorf("last_failure_reason = %q; want %q", state.LastFailureReason, ReasonDepositFailed)
 	}
-	if len(*audits) != 1 || (*audits)[0].kind != AuditCycleFailedPickup {
-		t.Errorf("expected failed_pickup audit; got %v", *audits)
+	if len(*audits) != 1 || (*audits)[0].kind != AuditCycleFailedDeposit {
+		t.Errorf("expected failed_deposit audit; got %v", *audits)
 	}
 }
 
@@ -507,8 +508,10 @@ func TestRunPickup_ChainFails(t *testing.T) {
 	if out != PickupOutcomeFailed {
 		t.Errorf("outcome = %v; want Failed", out)
 	}
-	if (*audits)[0].details["reason"] != ReasonChainFailed {
-		t.Errorf("reason = %v; want %s (chain failure)", (*audits)[0].details["reason"], ReasonChainFailed)
+	// Chain failure folds into blob_corrupt — externally indistinguishable
+	// from a corrupt blob (device locked at the same downstream level).
+	if (*audits)[0].details["reason"] != ReasonBlobCorrupt {
+		t.Errorf("reason = %v; want %s (chain failure folds into blob_corrupt)", (*audits)[0].details["reason"], ReasonBlobCorrupt)
 	}
 }
 
@@ -598,8 +601,8 @@ func TestRunCeremony_WrapFails_RecordsDepositFailed(t *testing.T) {
 	if state.LastFailureReason != ReasonDepositFailed {
 		t.Errorf("reason = %q; want %q", state.LastFailureReason, ReasonDepositFailed)
 	}
-	if len(*audits) != 1 || (*audits)[0].kind != AuditCycleFailedPickup {
-		t.Errorf("expected failed_pickup audit; got %v", *audits)
+	if len(*audits) != 1 || (*audits)[0].kind != AuditCycleFailedDeposit {
+		t.Errorf("expected failed_deposit audit; got %v", *audits)
 	}
 }
 

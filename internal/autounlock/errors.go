@@ -6,7 +6,6 @@
 //     crypt.Manager.Wrap/Unwrap escrow methods (sibling to Path P/R).
 //   - This package owns enabled state, the on-disk blob lifecycle, and the
 //     pre-shutdown ceremony / post-boot pickup orchestrators.
-//   - Plan: .claude/plans/auto-unlock-v1.md
 package autounlock
 
 import "errors"

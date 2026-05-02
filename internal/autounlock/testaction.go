@@ -45,7 +45,7 @@ func (o *Orchestrator) RunTest(ctx context.Context) (TestResult, error) {
 	defer o.mu.Unlock()
 
 	state, err := LoadState()
-	if err != nil && err != ErrInvalidStateFile {
+	if err != nil && !errors.Is(err, ErrInvalidStateFile) {
 		return TestResult{}, err
 	}
 	if !state.Enabled {

@@ -43,6 +43,7 @@ import (
 	"piccolod/internal/provisioning"
 	"piccolod/internal/remote"
 	"piccolod/internal/remote/nexusclient"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/router"
 	"piccolod/internal/runner"
 	"piccolod/internal/runtime/commands"
@@ -53,7 +54,6 @@ import (
 	"piccolod/internal/storage/diskprep"
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/nbd"
-	"piccolod/internal/resources/pressure"
 	"piccolod/internal/storage/poolguard"
 	"piccolod/internal/terminal"
 	"piccolod/internal/tpm"
@@ -781,24 +781,24 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), paths.CoreJoin("cache", "catalog"))
 
 	s := &GinServer{
-		appManager:     appMgr,
-		serviceManager: svcMgr,
-		persistence:    persist,
-		mdnsManager:    mdnsMgr,
-		routeManager:   routeMgr,
-		tlsMux:         tlsMux,
-		remoteResolver: remoteResolver,
-		events:         eventsBus,
-		progress:       progressReporter,
-		leadership:     leadershipReg,
-		supervisor:     sup,
-		dispatcher:     dispatch,
-		cryptoManager:  cmgr,
-		storageMgr:     storageMgr,
-		pcvPublisher:   pcvPub,
-		pcvImporter:    pcvImp,
-		healthTracker:  healthTracker,
-		catalogManager: catalogMgr,
+		appManager:        appMgr,
+		serviceManager:    svcMgr,
+		persistence:       persist,
+		mdnsManager:       mdnsMgr,
+		routeManager:      routeMgr,
+		tlsMux:            tlsMux,
+		remoteResolver:    remoteResolver,
+		events:            eventsBus,
+		progress:          progressReporter,
+		leadership:        leadershipReg,
+		supervisor:        sup,
+		dispatcher:        dispatch,
+		cryptoManager:     cmgr,
+		storageMgr:        storageMgr,
+		pcvPublisher:      pcvPub,
+		pcvImporter:       pcvImp,
+		healthTracker:     healthTracker,
+		catalogManager:    catalogMgr,
 		onboardingMgr:     onboardingMgr,
 		installer:         installer,
 		execRunner:        execRunner,
@@ -1262,19 +1262,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 				!identitySvc.IsSuspended() &&
 				identitySvc.NamekClient() != nil
 		},
-		PublishAudit: func(kind string, details map[string]any) {
-			if eventsBus == nil {
-				return
-			}
-			eventsBus.Publish(events.Event{
-				Topic: events.TopicAudit,
-				Payload: events.AuditEvent{
-					Kind:     kind,
-					Time:     time.Now().UTC(),
-					Metadata: details,
-				},
-			})
-		},
+		PublishAudit: s.publishBackgroundAuditEvent,
 	})
 	if err != nil {
 		// Auto-unlock is opt-in; failure to construct shouldn't deny boot
@@ -1289,19 +1277,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		// existing osUpdateManager.Status to expose HasStagedUpdate.
 		s.autounlockScheduler = autounlock.NewScheduler(autounlock.SchedulerDeps{
 			UpdateManager: &osUpdateManagerAdapter{inner: func() osUpdateManager { return s.updateManager }},
-			PublishAudit: func(kind string, details map[string]any) {
-				if eventsBus == nil {
-					return
-				}
-				eventsBus.Publish(events.Event{
-					Topic: events.TopicAudit,
-					Payload: events.AuditEvent{
-						Kind:     kind,
-						Time:     time.Now().UTC(),
-						Metadata: details,
-					},
-				})
-			},
+			PublishAudit:  s.publishBackgroundAuditEvent,
 		})
 	}
 

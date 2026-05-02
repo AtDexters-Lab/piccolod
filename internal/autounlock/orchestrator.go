@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AtDexters-Lab/namek-server/pkg/namekclient"
@@ -58,6 +59,11 @@ type Deps struct {
 
 	// Now is the clock source. Tests inject a fake.
 	Now func() time.Time
+
+	// PickupIdentityWaitTimeout overrides the per-pickup wait for identity
+	// readiness. Optional; defaults to 60s. Tests inject 100ms so the
+	// IsIdentityReady-always-false path doesn't make the suite hang.
+	PickupIdentityWaitTimeout time.Duration
 }
 
 // Orchestrator owns the autounlock package's mutating operations. A single
@@ -69,6 +75,19 @@ type Deps struct {
 type Orchestrator struct {
 	deps Deps
 	mu   sync.Mutex
+
+	// inFlight reports whether a pickup attempt is currently running. Read
+	// (without taking o.mu) by handleCryptoStatus so the locked-screen UI
+	// can show the transient "Auto-unlocking…" state. Set true at RunPickup
+	// entry, cleared via defer.
+	inFlight atomic.Bool
+}
+
+// InFlight reports whether a pickup attempt is currently running. Read by
+// handleCryptoStatus to drive the UI's transient "Auto-unlocking" state.
+// Lock-free atomic load — safe to call concurrently with RunPickup.
+func (o *Orchestrator) InFlight() bool {
+	return o.inFlight.Load()
 }
 
 // New constructs an Orchestrator and ensures the on-disk state directory
@@ -76,6 +95,9 @@ type Orchestrator struct {
 func New(deps Deps) (*Orchestrator, error) {
 	if deps.Now == nil {
 		deps.Now = time.Now
+	}
+	if deps.PickupIdentityWaitTimeout == 0 {
+		deps.PickupIdentityWaitTimeout = pickupIdentityWaitTimeout
 	}
 	if err := EnsureStateDir(); err != nil {
 		return nil, err

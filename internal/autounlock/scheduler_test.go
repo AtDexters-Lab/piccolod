@@ -42,7 +42,8 @@ func newScheduler(t *testing.T, now time.Time) (*Scheduler, *fakeUpdateManager, 
 			defer mu.Unlock()
 			*audits = append(*audits, capturedAudit{kind, details})
 		},
-		Now: func() time.Time { return now },
+		Now:          func() time.Time { return now },
+		TZSafeToFire: func() bool { return true },
 	})
 	return s, um, audits
 }
@@ -268,6 +269,23 @@ func TestRehydrate_LastFiredInCurrentWindow(t *testing.T) {
 	s.tick(context.Background())
 	if um.rebootCount != 0 {
 		t.Errorf("rehydrate failed to mark already-tried; reboot count = %d", um.rebootCount)
+	}
+}
+
+func TestTick_TZUnsetGatesFire(t *testing.T) {
+	now := time.Date(2026, 5, 2, 4, 0, 0, 0, time.UTC)
+	paths.SetCoreRootForTest(t, t.TempDir())
+	um := &fakeUpdateManager{}
+	s := NewScheduler(SchedulerDeps{
+		UpdateManager: um,
+		Now:           func() time.Time { return now },
+		TZSafeToFire:  func() bool { return false },
+	})
+	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
+	um.hasStaged = true
+	s.tick(context.Background())
+	if um.rebootCount != 0 {
+		t.Errorf("TZ-unset gate failed to block fire; reboot count = %d", um.rebootCount)
 	}
 }
 
