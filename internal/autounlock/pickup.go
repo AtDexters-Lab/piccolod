@@ -112,7 +112,7 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 		return PickupOutcomeFailed
 	}
 
-	resp, err := client.PickupUnlockEscrow(ctx)
+	resp, err := o.pickupWithRetry(ctx, client)
 	if err != nil {
 		reason := ReasonServiceUnreachable
 		if errors.Is(err, namekclient.ErrEscrowNotFound) {
@@ -201,6 +201,44 @@ func (o *Orchestrator) bestEffortRevoke(ctx context.Context, client NamekEscrowC
 	if err := client.RevokeUnlockEscrow(ctx); err != nil {
 		log.Printf("WARN: autounlock: revoke: %v", err)
 	}
+}
+
+// pickupRetryAttempts bounds the number of namek PickupUnlockEscrow tries.
+// Boot timing is racy: WaitForIdentityReady fires when IsIdentityReady()
+// flips true (namek client constructed + identity enrolled), but the
+// underlying namek client may still be mid-DNS-lookup / mid-TLS-handshake
+// for several seconds after construction. Without retry, the first pickup
+// attempt fails with service_unreachable and the device sits at the
+// password prompt despite a healthy blob + healthy escrow row.
+const pickupRetryAttempts = 4
+const pickupRetryBackoff = 2 * time.Second
+
+// pickupWithRetry calls PickupUnlockEscrow with bounded retry on transient
+// errors. Mirrors ceremony.deposit's retry pattern but with more attempts
+// since boot-time network ramp-up can take several seconds. Non-transient
+// errors (auth_failed, escrow_not_found) bail immediately so the caller
+// records the right failure reason on the first cycle.
+func (o *Orchestrator) pickupWithRetry(ctx context.Context, client NamekEscrowClient) (*namekclient.PickupUnlockEscrowResponse, error) {
+	var lastErr error
+	for attempt := 0; attempt < pickupRetryAttempts; attempt++ {
+		resp, err := client.PickupUnlockEscrow(ctx)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !isTransientNamekErr(err) {
+			return nil, err
+		}
+		if attempt+1 < pickupRetryAttempts {
+			log.Printf("WARN: autounlock: pickup transient error, retrying in %s: %v", pickupRetryBackoff, err)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(pickupRetryBackoff):
+			}
+		}
+	}
+	return nil, lastErr
 }
 
 // waitForIdentity blocks until identity is ready, the timeout elapses, or

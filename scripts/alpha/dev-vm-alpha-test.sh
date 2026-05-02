@@ -829,23 +829,41 @@ stage_auto_unlock() {
     ((FAIL_COUNT++)) || true
   fi
 
-  # 11a.12 — X-Browser-Timezone capture: reset to UTC, send header, expect retarget.
+  # 11a.12 — X-Browser-Timezone capture is gated to authed routes only
+  # (middleware moved off r.Use() to the authed group as a security fix).
+  # Reset device to UTC, send header on a PRE-AUTH endpoint — capture must
+  # NOT fire (closes the LAN-attacker-seeds-TZ surface).
   vssh 'timedatectl set-timezone UTC' >/dev/null 2>&1
   curl -sf -H "X-Browser-Timezone: Europe/Berlin" "http://$IP/version" >/dev/null
-  sleep 2
-  local linktarget
-  linktarget=$(vssh 'readlink /etc/localtime' 2>/dev/null | tail -1)
-  if [[ "$linktarget" == *"Europe/Berlin"* ]]; then
-    echo -e "  ${GREEN}PASS${NC} [11a.12] X-Browser-Timezone capture retargeted /etc/localtime"
+  sleep 1
+  local pre_auth_link
+  pre_auth_link=$(vssh 'readlink /etc/localtime' 2>/dev/null | tail -1)
+  if [[ "$pre_auth_link" != *"Europe/Berlin"* ]]; then
+    echo -e "  ${GREEN}PASS${NC} [11a.12a] X-Browser-Timezone NOT captured pre-auth (gated to authed routes)"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [11a.12] X-Browser-Timezone capture failed (target=$linktarget)"
+    echo -e "  ${RED}FAIL${NC} [11a.12a] Pre-auth capture leaked (target=$pre_auth_link)"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 11a.12b — Same header on an AUTHED route triggers capture.
+  curl -sf -b "$COOKIE_JAR" -H "X-Browser-Timezone: Europe/Berlin" \
+    "http://$IP/api/v1/remote/status" >/dev/null
+  sleep 2
+  local authed_link
+  authed_link=$(vssh 'readlink /etc/localtime' 2>/dev/null | tail -1)
+  if [[ "$authed_link" == *"Europe/Berlin"* ]]; then
+    echo -e "  ${GREEN}PASS${NC} [11a.12b] X-Browser-Timezone captured on authed route"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [11a.12b] Authed capture failed (target=$authed_link)"
     ((FAIL_COUNT++)) || true
   fi
 
   # 11a.13 — Subsequent X-Browser-Timezone is a no-op (IsSet short-circuits).
   local before_target; before_target=$(vssh 'readlink /etc/localtime' 2>/dev/null | tail -1)
-  curl -sf -H "X-Browser-Timezone: Asia/Tokyo" "http://$IP/version" >/dev/null
+  curl -sf -b "$COOKIE_JAR" -H "X-Browser-Timezone: Asia/Tokyo" \
+    "http://$IP/api/v1/remote/status" >/dev/null
   sleep 2
   local after_target; after_target=$(vssh 'readlink /etc/localtime' 2>/dev/null | tail -1)
   if [[ "$before_target" == "$after_target" ]]; then
@@ -853,6 +871,23 @@ stage_auto_unlock() {
     ((PASS_COUNT++)) || true
   else
     echo -e "  ${RED}FAIL${NC} [11a.13] Capture re-fired ($before_target → $after_target)"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 11a.14 — Test action 5s rate-limit: second call within 5s → 429.
+  local code1
+  code1=$(curl -s -b "$COOKIE_JAR" -X POST -H "X-CSRF-Token: $token" \
+    -o /dev/null -w "%{http_code}" \
+    "http://$IP/api/v1/security/auto-unlock/test")
+  local code2
+  code2=$(curl -s -b "$COOKIE_JAR" -X POST -H "X-CSRF-Token: $token" \
+    -o /dev/null -w "%{http_code}" \
+    "http://$IP/api/v1/security/auto-unlock/test")
+  if [[ "$code1" == "200" && "$code2" == "429" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [11a.14] Test action rate-limited (200 → 429 within 5s)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [11a.14] Rate-limit unexpected: first=$code1 second=$code2 (want 200, 429)"
     ((FAIL_COUNT++)) || true
   fi
 }

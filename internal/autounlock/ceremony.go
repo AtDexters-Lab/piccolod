@@ -151,13 +151,18 @@ func (o *Orchestrator) recordFailure(state *State, auditKind, reason string) {
 
 // isTransientNamekErr classifies an error as worth retrying. Transport-level
 // errors (network, timeout) and 5xx responses are transient; 4xx (auth, bad
-// request) are not.
+// request) are not. Sentinel errors that indicate permanent server-side
+// state (ErrEscrowNotFound, ErrEnrollmentRequired) are also non-transient.
 func isTransientNamekErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true
+	}
+	// Permanent sentinels — retrying just burns cycles.
+	if errors.Is(err, namekclient.ErrEscrowNotFound) {
+		return false
 	}
 	var apiErr *namekclient.APIError
 	if errors.As(err, &apiErr) {
