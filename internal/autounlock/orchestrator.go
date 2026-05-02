@@ -47,10 +47,6 @@ type Deps struct {
 	// passed to Wrap/Unwrap to bind the blob to this device.
 	GetDeviceID func() string
 
-	// GetIdentityClass returns the persisted identity_class
-	// ("hardware_tpm" / "software_tpm" / ""). Used for posture eligibility.
-	GetIdentityClass func() string
-
 	// IsIdentityReady reports whether the identity service is in a state
 	// where namek calls will work (enrolled + enabled + not suspended +
 	// client non-nil). Ceremony / pickup gate on this.
@@ -65,7 +61,7 @@ type Deps struct {
 
 // Orchestrator owns the autounlock package's mutating operations. A single
 // instance per piccolod process. The internal mutex serializes ceremony /
-// test / posture-change / pickup against each other. Pickup typically runs
+// test / state-change / pickup against each other. Pickup typically runs
 // at startup and completes before Stop fires, but a fast Stop catching pickup
 // mid-namek-call requires the wiring layer to cancel pickup's context first
 // so pickup releases the mutex promptly.

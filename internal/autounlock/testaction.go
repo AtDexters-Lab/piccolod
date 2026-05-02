@@ -31,8 +31,8 @@ type TestResult struct {
 const testWindowSeconds = 60
 
 // ErrTestPreconditions is returned when RunTest is called from a state where
-// the test cannot meaningfully run (manager locked, posture off, identity not
-// ready). HTTP handler maps to 412 Precondition Failed.
+// the test cannot meaningfully run (manager locked, auto-unlock disabled,
+// identity not ready). HTTP handler maps to 412 Precondition Failed.
 var ErrTestPreconditions = errors.New("autounlock: test preconditions not met")
 
 // RunTest exercises the full namek round-trip without touching the on-disk
@@ -48,7 +48,7 @@ func (o *Orchestrator) RunTest(ctx context.Context) (TestResult, error) {
 	if err != nil && err != ErrInvalidStateFile {
 		return TestResult{}, err
 	}
-	if state.Posture == PostureOff {
+	if !state.Enabled {
 		return TestResult{}, ErrTestPreconditions
 	}
 	if o.deps.Manager.IsLocked() {

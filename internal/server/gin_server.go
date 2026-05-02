@@ -1252,8 +1252,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			}
 			return c
 		},
-		GetDeviceID:      identitySvc.DeviceID,
-		GetIdentityClass: identitySvc.IdentityClass,
+		GetDeviceID: identitySvc.DeviceID,
 		IsIdentityReady: func() bool {
 			return identitySvc.IsEnrolled() &&
 				identitySvc.IsEnabled() &&

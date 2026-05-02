@@ -9,9 +9,9 @@ import (
 )
 
 // blob lifecycle: write-temp-fsync-rename via fsutil.AtomicWriteFile, read
-// pre-unlock, delete after pickup-success or posture-disable. The blob lives
+// pre-unlock, delete after pickup-success or disable. The blob lives
 // at {coreRoot}/network-bootstrap/security/auto_unlock_blob — alongside the
-// posture state file, outside the encrypted control volume so pickup can
+// state file, outside the encrypted control volume so pickup can
 // read it pre-unlock. Format is opaque to this package: nonce + AEAD output
 // produced by crypt.Manager.WrapSDEKForEscrow.
 
@@ -42,7 +42,7 @@ func ReadBlob() ([]byte, error) {
 }
 
 // DeleteBlob removes the on-disk blob. Idempotent — absent file returns nil.
-// Called after successful pickup, on posture-disable, and on pickup failure
+// Called after successful pickup, on disable, and on pickup failure
 // when retry is no longer meaningful (e.g. ErrEscrowNotFound from namek).
 func DeleteBlob() error {
 	err := os.Remove(blobPath())
@@ -53,7 +53,7 @@ func DeleteBlob() error {
 }
 
 // BlobExists returns true if the on-disk blob is present. Used by the
-// posture HTTP GET handler to surface `has_outstanding_blob` to the UI.
+// HTTP GET handler to surface `has_outstanding_blob` to the UI.
 func BlobExists() bool {
 	_, err := os.Stat(blobPath())
 	return err == nil

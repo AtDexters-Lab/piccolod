@@ -503,15 +503,6 @@ func (s *Service) IsEnabled() bool    { s.mu.RLock(); defer s.mu.RUnlock(); retu
 func (s *Service) IsAvailable() bool  { return s.available.Load() }
 func (s *Service) IsSuspended() bool  { return s.suspended.Load() }
 
-// IdentityClass returns the persisted identity_class string from the
-// enrollment result ("hardware_tpm" / "software_tpm" / ""). Used by
-// auto-unlock posture eligibility — see internal/autounlock.
-func (s *Service) IdentityClass() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.cfg.IdentityClass
-}
-
 // DeviceID returns the persisted namek device.id, or empty if not yet
 // enrolled. Used as part of the auto-unlock blob's AAD.
 func (s *Service) DeviceID() string {

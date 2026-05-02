@@ -4,7 +4,7 @@ package autounlock
 // Plan §audit-event-kinds enumerates the full set including scheduler events
 // (deferred to the scheduler commit).
 const (
-	AuditPostureChanged    = "auto_unlock.posture.changed"
+	AuditEnabledChanged    = "auto_unlock.enabled.changed"
 	AuditCycleDeposited    = "auto_unlock.cycle.deposited"
 	AuditCyclePickedUp     = "auto_unlock.cycle.picked_up"
 	AuditCycleRevoked      = "auto_unlock.cycle.revoked"

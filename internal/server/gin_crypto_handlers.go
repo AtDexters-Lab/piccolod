@@ -176,11 +176,11 @@ func (s *GinServer) handleCryptoStatus(c *gin.Context) {
 	resp := gin.H{"initialized": init, "locked": locked, "setup_in_progress": s.isSetupInProgress()}
 
 	// Auto-unlock surface — drives UI's transient "Auto-unlocking" state
-	// and the locked-screen failure banner. Always reports posture so the
-	// UI can decide whether to show the banner at all (posture=off → no
+	// and the locked-screen failure banner. Always reports enabled state so
+	// the UI can decide whether to show the banner at all (disabled → no
 	// banner regardless of prior failures).
 	if state, err := autounlock.LoadState(); err == nil {
-		resp["auto_unlock_posture"] = string(state.Posture)
+		resp["auto_unlock_enabled"] = state.Enabled
 		if state.LastFailureAt != nil &&
 			(state.LastPickupAt == nil || state.LastFailureAt.After(*state.LastPickupAt)) {
 			resp["auto_unlock_last_failure"] = gin.H{

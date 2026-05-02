@@ -141,11 +141,10 @@ func newOrchestrator(t *testing.T) (*Orchestrator, *fakeManager, *fakeNamek, *[]
 	audits := &[]capturedAudit{}
 	auditMu := sync.Mutex{}
 	deps := Deps{
-		Manager:          mgr,
-		NamekClient:      func() NamekEscrowClient { return nc },
-		GetDeviceID:      func() string { return "dev-test-1" },
-		GetIdentityClass: func() string { return IdentityClassVerified },
-		IsIdentityReady:  func() bool { return true },
+		Manager:         mgr,
+		NamekClient:     func() NamekEscrowClient { return nc },
+		GetDeviceID:     func() string { return "dev-test-1" },
+		IsIdentityReady: func() bool { return true },
 		PublishAudit: func(kind string, details map[string]any) {
 			auditMu.Lock()
 			defer auditMu.Unlock()
@@ -162,28 +161,28 @@ func newOrchestrator(t *testing.T) (*Orchestrator, *fakeManager, *fakeNamek, *[]
 
 // --- ceremony ---
 
-func TestRunCeremony_PostureOff_NoOp(t *testing.T) {
+func TestRunCeremony_Disabled_NoOp(t *testing.T) {
 	o, _, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureOff}); err != nil {
+	if err := SaveState(State{Enabled: false}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	if err := o.RunCeremony(context.Background()); err != nil {
 		t.Fatalf("RunCeremony: %v", err)
 	}
 	if nc.depositCount != 0 {
-		t.Errorf("deposit called on posture=off; count=%d", nc.depositCount)
+		t.Errorf("deposit called when disabled; count=%d", nc.depositCount)
 	}
 	if BlobExists() {
-		t.Errorf("blob written on posture=off")
+		t.Errorf("blob written when disabled")
 	}
 	if len(*audits) != 0 {
-		t.Errorf("audit emitted on posture=off; count=%d", len(*audits))
+		t.Errorf("audit emitted when disabled; count=%d", len(*audits))
 	}
 }
 
 func TestRunCeremony_HappyPath(t *testing.T) {
 	o, mgr, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	if err := o.RunCeremony(context.Background()); err != nil {
@@ -212,24 +211,10 @@ func TestRunCeremony_HappyPath(t *testing.T) {
 	}
 }
 
-func TestRunCeremony_PostureNotEligible_NoOp(t *testing.T) {
-	o, _, nc, _ := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureSoftAuto}); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-	// identity_class is verified — soft_auto is ineligible (only unverified is).
-	if err := o.RunCeremony(context.Background()); err != nil {
-		t.Fatalf("RunCeremony: %v", err)
-	}
-	if nc.depositCount != 0 {
-		t.Errorf("deposit called when posture ineligible; count=%d", nc.depositCount)
-	}
-}
-
 func TestRunCeremony_ManagerLocked_NoOp(t *testing.T) {
 	o, mgr, nc, _ := newOrchestrator(t)
 	mgr.locked = true
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	if err := o.RunCeremony(context.Background()); err != nil {
@@ -245,7 +230,7 @@ func TestRunCeremony_ManagerLocked_NoOp(t *testing.T) {
 
 func TestRunCeremony_DepositFails_DeletesBlob(t *testing.T) {
 	o, _, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	// Both attempts fail (transport error → retried once, retry also fails).
@@ -268,7 +253,7 @@ func TestRunCeremony_DepositFails_DeletesBlob(t *testing.T) {
 
 func TestRunCeremony_DepositRetriesOnTransient(t *testing.T) {
 	o, _, nc, _ := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	// First attempt: 503 transient. Second attempt: success (no error queued).
@@ -285,7 +270,7 @@ func TestRunCeremony_FRetryStable(t *testing.T) {
 	// Verify the deposit retry reuses the same F bytes — load-bearing for
 	// the blob/F desync invariant from Red-team F1.
 	o, _, nc, _ := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	// First attempt fails (transport-level → retryable); second succeeds.
@@ -332,9 +317,9 @@ func (c *capturingNamek) RevokeUnlockEscrow(ctx context.Context) error {
 
 // --- pickup ---
 
-func TestRunPickup_PostureOff_NoBlob(t *testing.T) {
+func TestRunPickup_Disabled_NoBlob(t *testing.T) {
 	o, _, nc, _ := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureOff}); err != nil {
+	if err := SaveState(State{Enabled: false}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	out := o.RunPickup(context.Background(), neverCalledChain(t))
@@ -342,13 +327,13 @@ func TestRunPickup_PostureOff_NoBlob(t *testing.T) {
 		t.Errorf("outcome = %v; want NoBlob", out)
 	}
 	if nc.pickupCount != 0 {
-		t.Errorf("pickup called with posture=off; count=%d", nc.pickupCount)
+		t.Errorf("pickup called when disabled; count=%d", nc.pickupCount)
 	}
 }
 
 func TestRunPickup_NoBlobOnDisk_AuditsAndExits(t *testing.T) {
 	o, _, _, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	// No blob written.
@@ -366,7 +351,7 @@ func TestRunPickup_NoBlobOnDisk_AuditsAndExits(t *testing.T) {
 
 func TestRunPickup_HappyPath(t *testing.T) {
 	o, mgr, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	if err := WriteBlob([]byte("opaque-blob")); err != nil {
@@ -409,7 +394,7 @@ func TestRunPickup_HappyPath(t *testing.T) {
 
 func TestRunPickup_EscrowNotFound_DeletesBlob(t *testing.T) {
 	o, _, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	if err := WriteBlob([]byte("opaque-blob")); err != nil {
@@ -430,7 +415,7 @@ func TestRunPickup_EscrowNotFound_DeletesBlob(t *testing.T) {
 
 func TestRunPickup_AuthFailed_RetainsBlob(t *testing.T) {
 	o, _, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	if err := WriteBlob([]byte("opaque-blob")); err != nil {
@@ -451,7 +436,7 @@ func TestRunPickup_AuthFailed_RetainsBlob(t *testing.T) {
 
 func TestRunPickup_ManualUnlockFirst(t *testing.T) {
 	o, mgr, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	if err := WriteBlob([]byte("opaque-blob")); err != nil {
@@ -480,7 +465,7 @@ func TestRunPickup_ManualUnlockFirst(t *testing.T) {
 
 func TestRunPickup_BlobCorrupt_DeletesBlob(t *testing.T) {
 	o, mgr, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	if err := WriteBlob([]byte("opaque-blob")); err != nil {
@@ -506,7 +491,7 @@ func TestRunPickup_BlobCorrupt_DeletesBlob(t *testing.T) {
 
 func TestRunPickup_ChainFails(t *testing.T) {
 	o, _, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	if err := WriteBlob([]byte("opaque-blob")); err != nil {
@@ -531,7 +516,7 @@ func TestRunPickup_ChainFails(t *testing.T) {
 
 func TestRunTest_HappyPath(t *testing.T) {
 	o, _, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	// Echo the deposited F back on pickup so the test's byte-equality check passes.
@@ -557,9 +542,9 @@ func TestRunTest_HappyPath(t *testing.T) {
 	}
 }
 
-func TestRunTest_PostureOff_PreconditionFails(t *testing.T) {
+func TestRunTest_Disabled_PreconditionFails(t *testing.T) {
 	o, _, nc, _ := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureOff}); err != nil {
+	if err := SaveState(State{Enabled: false}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	_, err := o.RunTest(context.Background())
@@ -567,13 +552,13 @@ func TestRunTest_PostureOff_PreconditionFails(t *testing.T) {
 		t.Errorf("expected ErrTestPreconditions; got %v", err)
 	}
 	if nc.depositCount != 0 {
-		t.Errorf("deposit called on posture=off; count=%d", nc.depositCount)
+		t.Errorf("deposit called when disabled; count=%d", nc.depositCount)
 	}
 }
 
 func TestRunTest_DepositFails(t *testing.T) {
 	o, _, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	nc.depositErrs = []error{&namekclient.APIError{StatusCode: 401, Message: "Unauthorized"}}
@@ -596,7 +581,7 @@ func TestRunTest_DepositFails(t *testing.T) {
 
 func TestRunCeremony_WrapFails_RecordsDepositFailed(t *testing.T) {
 	o, mgr, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	mgr.wrapErr = errors.New("manager refused wrap")
@@ -620,7 +605,7 @@ func TestRunCeremony_WrapFails_RecordsDepositFailed(t *testing.T) {
 
 func TestRunPickup_IdentityNotReady_RecordsServiceNotReady(t *testing.T) {
 	o, _, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	if err := WriteBlob([]byte("opaque-blob")); err != nil {
@@ -641,7 +626,7 @@ func TestRunPickup_IdentityNotReady_RecordsServiceNotReady(t *testing.T) {
 
 func TestRunTest_RevokeFails(t *testing.T) {
 	o, _, nc, audits := newOrchestrator(t)
-	if err := SaveState(State{Posture: PostureTPMAuto}); err != nil {
+	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 	nc.pickupEchoesF = true

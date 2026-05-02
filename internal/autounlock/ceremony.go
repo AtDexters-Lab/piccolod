@@ -28,7 +28,7 @@ const fSize = 32
 
 // RunCeremony is invoked from gin_server.Stop()'s Phase 0. Generates a fresh
 // per-cycle F, wraps the in-memory SDEK into an on-disk blob, and deposits F
-// at namek. Bails (no-op) when posture is off or identity is not in a state
+// at namek. Bails (no-op) when auto-unlock is disabled or identity is not in a state
 // to deposit. Failure does NOT block shutdown — caller logs and proceeds.
 func (o *Orchestrator) RunCeremony(ctx context.Context) error {
 	o.mu.Lock()
@@ -39,12 +39,7 @@ func (o *Orchestrator) RunCeremony(ctx context.Context) error {
 		log.Printf("WARN: autounlock: ceremony load state: %v", err)
 		return err
 	}
-	if state.Posture == PostureOff {
-		return nil
-	}
-	if !IsEligible(state.Posture, o.deps.GetIdentityClass()) {
-		log.Printf("WARN: autounlock: ceremony skipped — posture %q inconsistent with identity_class %q",
-			state.Posture, o.deps.GetIdentityClass())
+	if !state.Enabled {
 		return nil
 	}
 	if !o.deps.IsIdentityReady() {

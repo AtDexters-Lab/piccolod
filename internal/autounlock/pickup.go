@@ -19,7 +19,7 @@ import (
 type PickupOutcome int
 
 const (
-	// PickupOutcomeNoBlob: posture is off OR no blob present. Either way,
+	// PickupOutcomeNoBlob: auto-unlock is disabled OR no blob present. Either way,
 	// nothing to do — caller proceeds to normal locked-state startup.
 	PickupOutcomeNoBlob PickupOutcome = iota
 	// PickupOutcomeUnlocked: blob retrieved + unwrapped successfully; the
@@ -43,7 +43,7 @@ const (
 type CompleteUnlockChain func(ctx context.Context) error
 
 // RunPickup is invoked from gin_server.Start as a goroutine. Reads the
-// posture state, retrieves F from namek if a blob exists, unwraps the SDEK,
+// state, retrieves F from namek if a blob exists, unwraps the SDEK,
 // and triggers the post-decrypt chain. Falls through cleanly to manual unlock
 // on any failure — the locked HTTP server stays up the whole time so the
 // password path is always available in parallel.
@@ -62,16 +62,16 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 		log.Printf("WARN: autounlock: pickup load state: %v", err)
 		return PickupOutcomeNoBlob
 	}
-	if state.Posture == PostureOff {
+	if !state.Enabled {
 		return PickupOutcomeNoBlob
 	}
 
 	blob, err := ReadBlob()
 	if err != nil {
 		if errors.Is(err, ErrBlobMissing) {
-			// Posture is B/C but ceremony didn't deposit (crash, SIGKILL,
-			// hardware-watchdog reset). Audit the silent gap so operators
-			// can see "we expected to auto-unlock and didn't."
+			// Auto-unlock is enabled but ceremony didn't deposit (crash,
+			// SIGKILL, hardware-watchdog reset). Audit the silent gap so
+			// operators can see "we expected to auto-unlock and didn't."
 			o.recordFailure(&state, ReasonNoBlob)
 			return PickupOutcomeNoBlob
 		}
