@@ -33,25 +33,35 @@ const (
 	PostureSoftAuto Posture = "soft_auto"
 )
 
-// IdentityClass values mirror the strings namek-server returns in
-// EnrollResult.IdentityClass — see namek-server/docs/piccolod-integration-spec.md.
+// IdentityClass values mirror the tokens namek-server emits in
+// EnrollResult.IdentityClass (see namek-server/internal/tpm/identity_class.go).
+// namek moved from a 2-tier (hardware_tpm/software_tpm) to a 3-tier model:
+//
+//   - verified: EK chains to a known TPM-vendor root (manufacturer-attested)
+//   - crowd_corroborated: validated by peer-consensus across independent enrollments
+//   - unverified: EK does not chain to a known root — could be a real TPM with
+//     an unlisted vendor, or a software TPM. piccolod cannot tell them apart
+//     locally, so both fall under soft_auto's "modest theft regression" notice.
 const (
-	IdentityClassHardwareTPM = "hardware_tpm"
-	IdentityClassSoftwareTPM = "software_tpm"
+	IdentityClassVerified          = "verified"
+	IdentityClassCrowdCorroborated = "crowd_corroborated"
+	IdentityClassUnverified        = "unverified"
 )
 
 // IsEligible reports whether the supplied posture is consistent with the
 // device's identity_class. Off is always eligible. TPMAuto requires
-// hardware_tpm; SoftAuto requires software_tpm. Any unknown identity_class
-// is treated as ineligible for either auto posture — degrades to Off-only.
+// verified/crowd_corroborated (cold-theft-safe). SoftAuto requires unverified
+// (cold-theft-regressed; the amber notice covers this). Unknown identity_class
+// degrades to Off-only — defensive against future namek schema changes.
 func IsEligible(posture Posture, identityClass string) bool {
 	switch posture {
 	case PostureOff:
 		return true
 	case PostureTPMAuto:
-		return identityClass == IdentityClassHardwareTPM
+		return identityClass == IdentityClassVerified ||
+			identityClass == IdentityClassCrowdCorroborated
 	case PostureSoftAuto:
-		return identityClass == IdentityClassSoftwareTPM
+		return identityClass == IdentityClassUnverified
 	default:
 		return false
 	}
@@ -62,9 +72,9 @@ func IsEligible(posture Posture, identityClass string) bool {
 func AllowedPostures(identityClass string) []Posture {
 	out := []Posture{PostureOff}
 	switch identityClass {
-	case IdentityClassHardwareTPM:
+	case IdentityClassVerified, IdentityClassCrowdCorroborated:
 		out = append(out, PostureTPMAuto)
-	case IdentityClassSoftwareTPM:
+	case IdentityClassUnverified:
 		out = append(out, PostureSoftAuto)
 	}
 	return out

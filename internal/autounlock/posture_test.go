@@ -16,16 +16,18 @@ func TestIsEligible(t *testing.T) {
 		identityClass string
 		want          bool
 	}{
-		{PostureOff, IdentityClassHardwareTPM, true},
-		{PostureOff, IdentityClassSoftwareTPM, true},
+		{PostureOff, IdentityClassVerified, true},
+		{PostureOff, IdentityClassUnverified, true},
 		{PostureOff, "", true},
-		{PostureTPMAuto, IdentityClassHardwareTPM, true},
-		{PostureTPMAuto, IdentityClassSoftwareTPM, false},
+		{PostureTPMAuto, IdentityClassVerified, true},
+		{PostureTPMAuto, IdentityClassCrowdCorroborated, true},
+		{PostureTPMAuto, IdentityClassUnverified, false},
 		{PostureTPMAuto, "", false},
-		{PostureSoftAuto, IdentityClassSoftwareTPM, true},
-		{PostureSoftAuto, IdentityClassHardwareTPM, false},
+		{PostureSoftAuto, IdentityClassUnverified, true},
+		{PostureSoftAuto, IdentityClassVerified, false},
+		{PostureSoftAuto, IdentityClassCrowdCorroborated, false},
 		{PostureSoftAuto, "", false},
-		{Posture("garbage"), IdentityClassHardwareTPM, false},
+		{Posture("garbage"), IdentityClassVerified, false},
 	}
 	for _, tc := range cases {
 		got := IsEligible(tc.posture, tc.identityClass)
@@ -40,8 +42,9 @@ func TestAllowedPostures(t *testing.T) {
 		identityClass string
 		want          []Posture
 	}{
-		{IdentityClassHardwareTPM, []Posture{PostureOff, PostureTPMAuto}},
-		{IdentityClassSoftwareTPM, []Posture{PostureOff, PostureSoftAuto}},
+		{IdentityClassVerified, []Posture{PostureOff, PostureTPMAuto}},
+		{IdentityClassCrowdCorroborated, []Posture{PostureOff, PostureTPMAuto}},
+		{IdentityClassUnverified, []Posture{PostureOff, PostureSoftAuto}},
 		{"unknown", []Posture{PostureOff}},
 		{"", []Posture{PostureOff}},
 	}

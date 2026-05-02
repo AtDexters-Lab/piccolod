@@ -144,7 +144,7 @@ func newOrchestrator(t *testing.T) (*Orchestrator, *fakeManager, *fakeNamek, *[]
 		Manager:          mgr,
 		NamekClient:      func() NamekEscrowClient { return nc },
 		GetDeviceID:      func() string { return "dev-test-1" },
-		GetIdentityClass: func() string { return IdentityClassHardwareTPM },
+		GetIdentityClass: func() string { return IdentityClassVerified },
 		IsIdentityReady:  func() bool { return true },
 		PublishAudit: func(kind string, details map[string]any) {
 			auditMu.Lock()
@@ -217,7 +217,7 @@ func TestRunCeremony_PostureNotEligible_NoOp(t *testing.T) {
 	if err := SaveState(State{Posture: PostureSoftAuto}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
-	// identity_class is hardware_tpm — soft_auto is ineligible.
+	// identity_class is verified — soft_auto is ineligible (only unverified is).
 	if err := o.RunCeremony(context.Background()); err != nil {
 		t.Fatalf("RunCeremony: %v", err)
 	}
