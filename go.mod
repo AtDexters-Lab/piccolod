@@ -5,7 +5,7 @@ go 1.25.0
 replace github.com/docker/docker => github.com/moby/moby v26.1.4+incompatible
 
 require (
-	github.com/AtDexters-Lab/namek-server v0.1.7
+	github.com/AtDexters-Lab/namek-server v0.1.8
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/cosmos/go-bip39 v1.0.0

@@ -1,5 +1,7 @@
 github.com/AtDexters-Lab/namek-server v0.1.7 h1:VLqtZMrMoXDfePU1eAtwvsT6+EWCxBi6FsTrgefw4Y8=
 github.com/AtDexters-Lab/namek-server v0.1.7/go.mod h1:r6pAHPVrXavDRoUfSFC0p0Q+06lhBFZG6brfqAsEeyQ=
+github.com/AtDexters-Lab/namek-server v0.1.8 h1:N6myFq+ONhQaJ3jzvWeZrvegqxSqzy3P0hk8aZ8iOz4=
+github.com/AtDexters-Lab/namek-server v0.1.8/go.mod h1:r6pAHPVrXavDRoUfSFC0p0Q+06lhBFZG6brfqAsEeyQ=
 github.com/AtDexters-Lab/nexus-proxy v0.3.11 h1:aaf12tH4l0FYwb1hXAUGE9dv0T8xA3k5a4z93sVSNEc=
 github.com/AtDexters-Lab/nexus-proxy v0.3.11/go.mod h1:fOROS1v6e+roqo4fIq6aeRQmkkumg9em9qO1XdXf2fk=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d h1:licZJFw2RwpHMqeKTCYkitsPqHNxTmd4SNR5r94FGM8=
