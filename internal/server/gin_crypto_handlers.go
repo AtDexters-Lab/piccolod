@@ -61,6 +61,64 @@ func stripNumberedPrefixes(tokens []string) []string {
 	return filtered
 }
 
+// unlockChainResult carries the data each caller needs to shape its response
+// after the post-decrypt chain runs. luksErr is non-fatal — caller surfaces
+// it as a warning. setupComplete drives the UI's post-unlock routing.
+type unlockChainResult struct {
+	setupComplete bool
+	luksErr       error
+}
+
+// completeUnlockChain runs the post-decrypt chain after Manager.Unlock has
+// installed m.sdek: release KDF memory, unlock the data volume, propagate
+// the unlocked state to persistence, activate the PCV publisher, and
+// reconcile the provisioning marker.
+//
+// Returns (result, err) where err is fatal (caller should respond 500) and
+// result.luksErr is a non-fatal warning surfaced as a `warning` field in
+// the success response.
+func (s *GinServer) completeUnlockChain(ctx context.Context) (unlockChainResult, error) {
+	var luksErr error
+
+	log.Printf("INFO: releasing KDF memory before storage unlock")
+	runtime.GC()
+	debug.FreeOSMemory()
+
+	// Unlock data volume BEFORE notifying persistence, so storage volumes
+	// are available before the app-manager reconcile loop starts.
+	if s.storageMgr != nil {
+		if err := s.storageMgr.UnlockDataVolume(ctx); err != nil {
+			log.Printf("ERROR: data volume unlock failed: %v", err)
+			luksErr = err
+			if s.healthTracker != nil {
+				s.healthTracker.Setf("storage", health.LevelError, "data volume unlock failed")
+			}
+		}
+	}
+	if err := s.notifyPersistenceLockState(ctx, false); err != nil {
+		log.Printf("WARN: failed to propagate unlock state: %v", err)
+		return unlockChainResult{}, err
+	}
+	// PCV publisher depends on the control-plane mount, safe even on data LUKS failure.
+	if s.pcvPublisher != nil {
+		s.pcvPublisher.Activate()
+	}
+
+	setupComplete, err := s.isSetupComplete(ctx)
+	if err != nil {
+		log.Printf("WARN: setup-complete check failed, assuming complete: %v", err)
+		// Fail closed: assume provisioned, route to login.
+		return unlockChainResult{setupComplete: true, luksErr: luksErr}, nil
+	}
+	// Reconcile the durable provisioning marker from the authoritative
+	// post-unlock answer. Closes the gap left by handleCryptoSetup's
+	// best-effort MarkProvisioned write.
+	if rerr := s.provisioningState.ReconcileFromPersistence(setupComplete); rerr != nil {
+		log.Printf("WARN: reconcile provisioning: %v", rerr)
+	}
+	return unlockChainResult{setupComplete: setupComplete, luksErr: luksErr}, nil
+}
+
 // isSetupComplete checks whether first-run provisioning has finished by
 // counting users (primary) or checking auth initialization (fallback).
 // Returns (false, nil) when the store is locked (ErrLocked).
@@ -398,7 +456,7 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 	}
 	s.resetLoginFailures()
 
-	// Decouple from HTTP request context — unlock must survive connection drops.
+	// Decouple from HTTP request context — unlock chain must survive connection drops.
 	unlockCtx, unlockCancel := context.WithTimeout(s.serverContext(), 10*time.Minute)
 	defer unlockCancel()
 
@@ -413,51 +471,14 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 		}
 	}()
 
-	// Release KDF memory before LUKS unlock — same rationale as setup handler.
-	log.Printf("INFO: releasing KDF memory before storage unlock")
-	runtime.GC()
-	debug.FreeOSMemory()
-
-	// Unlock data volume BEFORE notifying persistence, so that
-	// storage volumes are available before the app-manager reconcile loop starts.
-	var luksErr error
-	if s.storageMgr != nil {
-		if err := s.storageMgr.UnlockDataVolume(unlockCtx); err != nil {
-			log.Printf("ERROR: data volume unlock failed: %v", err)
-			luksErr = err
-			if s.healthTracker != nil {
-				s.healthTracker.Setf("storage", health.LevelError, "data volume unlock failed")
-			}
-		}
-	}
-	if err := s.notifyPersistenceLockState(unlockCtx, false); err != nil {
-		log.Printf("WARN: failed to propagate unlock state: %v", err)
+	result, err := s.completeUnlockChain(unlockCtx)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
 		return
 	}
-	// Activate PCV publisher (depends on control-plane mount, safe even on data LUKS failure).
-	if s.pcvPublisher != nil {
-		s.pcvPublisher.Activate()
-	}
-	// Two-door model: unlock is a disk operation only — no session creation.
-	// Report setup_complete so the UI can route to /crypto/setup (partial
-	// recovery) or chain /auth/login (normal reboot).
-	setupComplete, err := s.isSetupComplete(unlockCtx)
-	if err != nil {
-		log.Printf("WARN: setup-complete check failed, assuming complete: %v", err)
-		setupComplete = true // Fail closed: assume provisioned, route to login
-	}
-	// Reconcile the durable provisioning marker from the authoritative
-	// post-unlock answer. Closes the gap left by handleCryptoSetup's
-	// best-effort MarkProvisioned write.
-	if err == nil {
-		if rerr := s.provisioningState.ReconcileFromPersistence(setupComplete); rerr != nil {
-			log.Printf("WARN: reconcile provisioning: %v", rerr)
-		}
-	}
-	resp := gin.H{"message": "ok", "setup_complete": setupComplete}
-	if luksErr != nil {
-		resp["warning"] = "data volume unlock failed: " + luksErr.Error()
+	resp := gin.H{"message": "ok", "setup_complete": result.setupComplete}
+	if result.luksErr != nil {
+		resp["warning"] = "data volume unlock failed: " + result.luksErr.Error()
 		resp["warning_code"] = errorCodeStorageUnlockFailed
 	}
 	c.JSON(http.StatusOK, resp)
