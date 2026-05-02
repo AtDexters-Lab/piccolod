@@ -392,3 +392,124 @@ func TestRandomKeyMaterial_UniqueKeys(t *testing.T) {
 		t.Error("expected different keys from two rand.Read calls")
 	}
 }
+
+func setupUnlocked(t *testing.T) *Manager {
+	t.Helper()
+	m, err := NewManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := m.Setup("admin-pass"); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := m.Unlock("admin-pass"); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	return m
+}
+
+func TestManager_WrapUnwrapEscrow_RoundTrip(t *testing.T) {
+	m := setupUnlocked(t)
+	F := make([]byte, 32)
+	if _, err := rand.Read(F); err != nil {
+		t.Fatal(err)
+	}
+	aad := []byte("device-abc123|auto_unlock_v1")
+
+	blob, err := m.WrapSDEKForEscrow(F, aad)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+
+	// Snapshot SDEK, lock, then unwrap and verify it matches.
+	var original []byte
+	if err := m.WithSDEK(func(sdek []byte) error { original = bytes.Clone(sdek); return nil }); err != nil {
+		t.Fatalf("WithSDEK: %v", err)
+	}
+	m.Lock()
+
+	if err := m.UnwrapSDEKWithEscrow(blob, F, aad); err != nil {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if err := m.WithSDEK(func(sdek []byte) error {
+		if !bytes.Equal(sdek, original) {
+			t.Fatalf("SDEK after unwrap differs from original")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WithSDEK after unwrap: %v", err)
+	}
+}
+
+func TestManager_WrapForEscrow_LockedFails(t *testing.T) {
+	m := setupUnlocked(t)
+	m.Lock()
+	F := make([]byte, 32)
+	if _, err := m.WrapSDEKForEscrow(F, nil); err != ErrAutoUnlockManagerLocked {
+		t.Fatalf("expected ErrAutoUnlockManagerLocked, got %v", err)
+	}
+}
+
+func TestManager_UnwrapWithEscrow_AlreadyUnlocked(t *testing.T) {
+	m := setupUnlocked(t)
+	F := make([]byte, 32)
+	rand.Read(F)
+	blob, err := m.WrapSDEKForEscrow(F, nil)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	if err := m.UnwrapSDEKWithEscrow(blob, F, nil); err != ErrAutoUnlockAlreadyUnlocked {
+		t.Fatalf("expected ErrAutoUnlockAlreadyUnlocked, got %v", err)
+	}
+}
+
+func TestManager_UnwrapWithEscrow_WrongF(t *testing.T) {
+	m := setupUnlocked(t)
+	F := make([]byte, 32)
+	rand.Read(F)
+	blob, err := m.WrapSDEKForEscrow(F, nil)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	m.Lock()
+	wrongF := make([]byte, 32)
+	rand.Read(wrongF)
+	if err := m.UnwrapSDEKWithEscrow(blob, wrongF, nil); err != ErrAutoUnlockBlobCorrupt {
+		t.Fatalf("expected ErrAutoUnlockBlobCorrupt for wrong F, got %v", err)
+	}
+}
+
+func TestManager_UnwrapWithEscrow_WrongAAD(t *testing.T) {
+	m := setupUnlocked(t)
+	F := make([]byte, 32)
+	rand.Read(F)
+	blob, err := m.WrapSDEKForEscrow(F, []byte("device-abc"))
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	m.Lock()
+	if err := m.UnwrapSDEKWithEscrow(blob, F, []byte("device-xyz")); err != ErrAutoUnlockBlobCorrupt {
+		t.Fatalf("expected ErrAutoUnlockBlobCorrupt for wrong AAD, got %v", err)
+	}
+}
+
+func TestManager_UnwrapWithEscrow_TruncatedBlob(t *testing.T) {
+	m := setupUnlocked(t)
+	m.Lock()
+	F := make([]byte, 32)
+	rand.Read(F)
+	if err := m.UnwrapSDEKWithEscrow([]byte{1, 2, 3}, F, nil); err != ErrAutoUnlockBlobCorrupt {
+		t.Fatalf("expected ErrAutoUnlockBlobCorrupt for truncated blob, got %v", err)
+	}
+}
+
+func TestManager_EscrowF_LengthValidation(t *testing.T) {
+	m := setupUnlocked(t)
+	if _, err := m.WrapSDEKForEscrow(make([]byte, 16), nil); err != ErrAutoUnlockBadFLen {
+		t.Fatalf("expected ErrAutoUnlockBadFLen on Wrap, got %v", err)
+	}
+	m.Lock()
+	if err := m.UnwrapSDEKWithEscrow([]byte{}, make([]byte, 16), nil); err != ErrAutoUnlockBadFLen {
+		t.Fatalf("expected ErrAutoUnlockBadFLen on Unwrap, got %v", err)
+	}
+}

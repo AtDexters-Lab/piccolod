@@ -66,6 +66,22 @@ type Manager struct {
 var (
 	ErrNotInitialized = errors.New("crypt: not initialized")
 	ErrLocked         = errors.New("crypt: locked")
+
+	// ErrAutoUnlockManagerLocked: WrapSDEKForEscrow called with no SDEK in
+	// memory (Manager locked). Pre-shutdown ceremony only runs while unlocked.
+	ErrAutoUnlockManagerLocked = errors.New("crypt: auto-unlock wrap requires unlocked manager")
+	// ErrAutoUnlockBlobCorrupt: AEAD-Open of the on-disk blob failed during
+	// pickup. Tamper, format mismatch, wrong F, or wrong AAD.
+	ErrAutoUnlockBlobCorrupt = errors.New("crypt: auto-unlock blob corrupt")
+	// ErrAutoUnlockAlreadyUnlocked: UnwrapSDEKWithEscrow called when the
+	// Manager is already unlocked. Pickup goroutine reads this as a signal
+	// that the password handler won the unlock race.
+	ErrAutoUnlockAlreadyUnlocked = errors.New("crypt: auto-unlock unwrap on already-unlocked manager")
+	// ErrAutoUnlockBadFLen: caller supplied an F that isn't 32 bytes. F is
+	// always rand.Read-sourced in production, so this is a programmer-error
+	// signal — distinct from blob_corrupt, which is the tamper / wrong-F /
+	// wrong-AAD signal at the AEAD layer.
+	ErrAutoUnlockBadFLen = errors.New("crypt: auto-unlock F must be 32 bytes")
 )
 
 func NewManager(stateDir string) (*Manager, error) {
@@ -609,6 +625,76 @@ func (m *Manager) Decrypt(ciphertext []byte) ([]byte, error) {
 		return decErr
 	})
 	return pt, err
+}
+
+// WrapSDEKForEscrow seals the in-memory SDEK with F as the AEAD key, returning
+// the on-disk blob shape used by the auto-unlock pre-shutdown ceremony. Blob
+// format: 12-byte AES-GCM nonce ‖ ciphertext+tag. The caller supplies aad
+// (typically device.id ‖ "auto_unlock_v1") to bind the blob to a particular
+// device, closing cross-device replay.
+//
+// F must be exactly 32 bytes (AES-256 key). Returns ErrAutoUnlockManagerLocked
+// when the manager is locked.
+func (m *Manager) WrapSDEKForEscrow(F []byte, aad []byte) ([]byte, error) {
+	if len(F) != 32 {
+		return nil, ErrAutoUnlockBadFLen
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.inited {
+		return nil, ErrNotInitialized
+	}
+	if len(m.sdek) == 0 {
+		return nil, ErrAutoUnlockManagerLocked
+	}
+	aead, err := newAES256GCM(F)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	// Prepend nonce so the blob is self-contained — same shape as Encrypt.
+	return aead.Seal(nonce, nonce, m.sdek, aad), nil
+}
+
+// UnwrapSDEKWithEscrow opens an auto-unlock blob with F and installs the
+// recovered SDEK into the manager — equivalent in effect to a successful
+// Unlock(password) call. Caller supplies the same aad the wrap used.
+//
+// Returns ErrAutoUnlockAlreadyUnlocked when the manager is already unlocked
+// (caller treats this as a benign success-path marker — manual unlock won
+// the race). Returns ErrAutoUnlockBlobCorrupt on AEAD-Open failure (truncated
+// blob, wrong F, wrong aad, tamper). F must be exactly 32 bytes.
+func (m *Manager) UnwrapSDEKWithEscrow(blob []byte, F []byte, aad []byte) error {
+	if len(F) != 32 {
+		return ErrAutoUnlockBadFLen
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.inited {
+		return ErrNotInitialized
+	}
+	if len(m.sdek) != 0 {
+		return ErrAutoUnlockAlreadyUnlocked
+	}
+	aead, err := newAES256GCM(F)
+	if err != nil {
+		return err
+	}
+	nonceSize := aead.NonceSize()
+	if len(blob) < nonceSize {
+		return ErrAutoUnlockBlobCorrupt
+	}
+	nonce := blob[:nonceSize]
+	ct := blob[nonceSize:]
+	pt, err := aead.Open(nil, nonce, ct, aad)
+	if err != nil {
+		return ErrAutoUnlockBlobCorrupt
+	}
+	m.sdek = pt
+	return nil
 }
 
 // SetMnemonicKeyCallback sets the callback used to access the current recovery
