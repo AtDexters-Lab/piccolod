@@ -56,6 +56,12 @@ func (s *GinServer) handleAutoUnlockPut(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update failed"})
 		return
 	}
+	// Window or auto_reboot.enabled change → block today's scheduler fire.
+	// Closes the compromised-admin DoS where a window edit could otherwise
+	// trigger an immediate reboot. In-memory only by design.
+	if s.autounlockScheduler != nil && body.AutoReboot != nil {
+		s.autounlockScheduler.MarkWindowEdit()
+	}
 	s.handleAutoUnlockGet(c)
 }
 

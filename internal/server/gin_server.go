@@ -148,11 +148,14 @@ type GinServer struct {
 	updateManager  osUpdateManager
 	catalogManager *catalog.Manager
 
-	// Auto-unlock framework (opt-in per-device via posture A/B/C). Owns the
-	// pre-shutdown ceremony, post-boot pickup goroutine, and Test action.
-	// nil before NewGinServer wires it (or if construction failed — feature
-	// is opt-in, server still boots).
+	// Auto-unlock framework (opt-in per-device). Owns the pre-shutdown
+	// ceremony, post-boot pickup goroutine, Test action, and Update. nil
+	// before NewGinServer wires it (or if construction failed — feature is
+	// opt-in, server still boots).
 	autounlockOrch *autounlock.Orchestrator
+	// autounlockScheduler runs the maintenance-window auto-reboot tick.
+	// nil when the orchestrator construction failed.
+	autounlockScheduler *autounlock.Scheduler
 	// autounlockPickupCancel cancels the pickup goroutine's context. Stop's
 	// Phase 0 calls this BEFORE invoking RunCeremony so a slow pickup (e.g.,
 	// mid-namek-HTTP) returns promptly and releases the orchestrator mutex.
@@ -1275,12 +1278,31 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	})
 	if err != nil {
 		// Auto-unlock is opt-in; failure to construct shouldn't deny boot
-		// for posture-off devices. Log and continue with autounlockOrch == nil
+		// for disabled devices. Log and continue with autounlockOrch == nil
 		// — the wiring sites (Stop Phase 0, Start pickup goroutine) all
 		// nil-check before invoking.
 		log.Printf("WARN: auto-unlock orchestrator init failed (feature disabled): %v", err)
 	} else {
 		s.autounlockOrch = autounlockOrch
+		// Scheduler shares the same audit emit. Constructed alongside the
+		// orchestrator; spawned in Start. updateManager adapter wraps the
+		// existing osUpdateManager.Status to expose HasStagedUpdate.
+		s.autounlockScheduler = autounlock.NewScheduler(autounlock.SchedulerDeps{
+			UpdateManager: &osUpdateManagerAdapter{inner: func() osUpdateManager { return s.updateManager }},
+			PublishAudit: func(kind string, details map[string]any) {
+				if eventsBus == nil {
+					return
+				}
+				eventsBus.Publish(events.Event{
+					Topic: events.TopicAudit,
+					Payload: events.AuditEvent{
+						Kind:     kind,
+						Time:     time.Now().UTC(),
+						Metadata: details,
+					},
+				})
+			},
+		})
 	}
 
 	// Network manager (WiFi uplink + watchdog). D-Bus may be unavailable on
@@ -1502,7 +1524,7 @@ func (s *GinServer) Start() error {
 	// server — password-unlock path stays available the whole time. Pickup
 	// holds the orchestrator mutex; Stop Phase 0 cancels pickupCtx before
 	// invoking ceremony so a slow namek round-trip aborts promptly and the
-	// mutex is released. Posture-off / no-blob fast-exit, no async cost.
+	// mutex is released. Disabled / no-blob fast-exit, no async cost.
 	if s.autounlockOrch != nil {
 		pickupCtx, pickupCancel := context.WithCancel(s.serverContext())
 		s.autounlockPickupCancel = pickupCancel
@@ -1510,6 +1532,12 @@ func (s *GinServer) Start() error {
 			_, err := s.completeUnlockChain(ctx)
 			return err
 		})
+	}
+	// Auto-reboot scheduler tick goroutine. Gated on enabled + auto_reboot
+	// + in-window + has-staged-update; calls updateManager.Reboot which
+	// triggers SIGTERM → ceremony → reboot.
+	if s.autounlockScheduler != nil {
+		go s.autounlockScheduler.Run(s.serverContext())
 	}
 
 	// Start disk preparation based on boot mode and onboarding state.
