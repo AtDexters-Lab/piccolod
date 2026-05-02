@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"piccolod/internal/auth"
+	"piccolod/internal/autounlock"
 	"piccolod/internal/cryptoutil"
 	"piccolod/internal/health"
 	"piccolod/internal/persistence"
@@ -172,7 +173,23 @@ func (s *GinServer) handleCryptoStatus(c *gin.Context) {
 	if init {
 		locked = s.cryptoManager.IsLocked()
 	}
-	c.JSON(http.StatusOK, gin.H{"initialized": init, "locked": locked, "setup_in_progress": s.isSetupInProgress()})
+	resp := gin.H{"initialized": init, "locked": locked, "setup_in_progress": s.isSetupInProgress()}
+
+	// Auto-unlock surface — drives UI's transient "Auto-unlocking" state
+	// and the locked-screen failure banner. Always reports posture so the
+	// UI can decide whether to show the banner at all (posture=off → no
+	// banner regardless of prior failures).
+	if state, err := autounlock.LoadState(); err == nil {
+		resp["auto_unlock_posture"] = string(state.Posture)
+		if state.LastFailureAt != nil &&
+			(state.LastPickupAt == nil || state.LastFailureAt.After(*state.LastPickupAt)) {
+			resp["auto_unlock_last_failure"] = gin.H{
+				"at":     state.LastFailureAt,
+				"reason": state.LastFailureReason,
+			}
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // handleCryptoSetup: POST /api/v1/crypto/setup { password }
