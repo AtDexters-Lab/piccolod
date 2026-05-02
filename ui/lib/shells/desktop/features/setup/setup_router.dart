@@ -10,6 +10,7 @@ import 'package:piccolo_os/shells/desktop/features/setup/controllers/onboarding_
 import 'package:piccolo_os/shells/desktop/features/setup/install_disk_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/onboarding_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/setup_utils.dart';
+import 'package:piccolo_os/shells/desktop/features/setup/steps/auto_unlocking_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/credentials_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/error_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/finishing_step.dart';
@@ -64,6 +65,8 @@ class _SetupRouterState extends State<SetupRouter> {
   String? _systemError;
   bool _showFinishing = false;
   SetupPhase? _finishingPhase;
+  bool _showAutoUnlocking = false;
+  Timer? _autoUnlockingPoll;
 
   // Boot data for install_complete.
   bool _bootOrderConfigured = false;
@@ -77,6 +80,7 @@ class _SetupRouterState extends State<SetupRouter> {
 
   @override
   void dispose() {
+    _autoUnlockingPoll?.cancel();
     _controller?.dispose();
     super.dispose();
   }
@@ -143,6 +147,9 @@ class _SetupRouterState extends State<SetupRouter> {
     _controller = null;
     _systemError = null;
     _showFinishing = false;
+    _showAutoUnlocking = false;
+    _autoUnlockingPoll?.cancel();
+    _autoUnlockingPoll = null;
 
     switch (screen) {
       case 'emergency':
@@ -172,6 +179,13 @@ class _SetupRouterState extends State<SetupRouter> {
         if (boot['setup_in_progress'] == true) {
           _firstSetupDetected = true;
           _startSetupInProgressPolling();
+        } else if (boot['auto_unlock_in_flight'] == true) {
+          // Pickup goroutine is mid-flight; show the spinner instead of
+          // the password prompt and poll boot until it clears. On
+          // success the device transitions away from screen='unlock' so
+          // the next _route picks up the right destination; on failure
+          // in_flight goes false → password prompt with no callout.
+          _startAutoUnlockingPoll();
         } else {
           if (boot['recovery_key_pending'] == true) _firstSetupDetected = true;
           _createAuthController(
@@ -319,6 +333,15 @@ class _SetupRouterState extends State<SetupRouter> {
     _showFinishing = true;
     _finishingPhase = SetupPhase.encrypting;
     unawaited(_pollSetupInProgress());
+  }
+
+  void _startAutoUnlockingPoll() {
+    _showAutoUnlocking = true;
+    _autoUnlockingPoll?.cancel();
+    _autoUnlockingPoll = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      unawaited(_checkBoot());
+    });
   }
 
   Future<void> _pollSetupInProgress() async {
@@ -578,6 +601,9 @@ class _SetupRouterState extends State<SetupRouter> {
         } else if (_showFinishing) {
           content = FinishingStep(phase: _finishingPhase);
           title = 'Setting up...';
+        } else if (_showAutoUnlocking) {
+          content = const AutoUnlockingStep();
+          title = 'Welcome back';
         } else if (_pendingRecoveryMaterial != null) {
           content = RecoveryKeyStep(
             words: _pendingRecoveryMaterial!.words,

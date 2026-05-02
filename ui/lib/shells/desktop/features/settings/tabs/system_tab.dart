@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/auto_unlock.dart';
 import 'package:piccolo_os/core/models/os_update.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/shared/widgets/diagnostic_log_download.dart';
@@ -9,6 +10,7 @@ import 'package:piccolo_os/shared/widgets/log_stream_viewer.dart';
 import 'package:piccolo_os/shared/widgets/piccolo_card.dart';
 import 'package:piccolo_os/shared/widgets/task_progress_panel.dart';
 import 'package:piccolo_os/shells/desktop/features/settings/settings_controller.dart';
+import 'package:piccolo_os/shells/desktop/features/settings/tabs/system/timezone_card.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
@@ -44,8 +46,12 @@ class SystemTab extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('System Update', style: PiccoloTheme.textTheme.headlineLarge),
-        const SizedBox(height: 32),
+        Text('System', style: PiccoloTheme.textTheme.headlineLarge),
+        const SizedBox(height: 24),
+        TimezoneCard(controller: controller),
+        const SizedBox(height: 48),
+        Text('System Update', style: PiccoloTheme.textTheme.titleMedium),
+        const SizedBox(height: 16),
 
         if (update != null || isBusy) ...[
           // 1. Hero Status Card
@@ -54,6 +60,7 @@ class SystemTab extends StatelessWidget {
             isChecking: isBusy,
             onCheck: controller.checkForUpdates,
             onReboot: controller.rebootOS,
+            autoUnlock: controller.autoUnlock,
           ),
 
           const SizedBox(height: 48),
@@ -151,6 +158,12 @@ class SystemTab extends StatelessWidget {
   }
 }
 
+String _formatHour(int h) {
+  final period = h < 12 ? 'AM' : 'PM';
+  final hour12 = h == 0 ? 12 : (h > 12 ? h - 12 : h);
+  return '$hour12:00 $period';
+}
+
 class _UpdateStatusCard extends StatelessWidget {
 
   const _UpdateStatusCard({
@@ -158,11 +171,16 @@ class _UpdateStatusCard extends StatelessWidget {
     required this.isChecking,
     required this.onCheck,
     required this.onReboot,
+    required this.autoUnlock,
   });
   final OSUpdate? update; // Make nullable
   final bool isChecking;
   final VoidCallback onCheck;
   final VoidCallback onReboot;
+  // When auto-reboot is configured + enabled, the "Update Available" state
+  // shows the maintenance-window subtitle alongside Restart Now so the
+  // operator knows the update will apply itself overnight if untouched.
+  final AutoUnlockState? autoUnlock;
 
   @override
   Widget build(BuildContext context) {
@@ -189,7 +207,19 @@ class _UpdateStatusCard extends StatelessWidget {
       accentColor = PiccoloTheme.cobalt600; // or Info color
       icon = PiccoloIcons.systemUpdate;
       title = 'Update Available';
-      subtitle = 'Version ${update!.availableVersion} is ready to install.';
+      // When auto-reboot is enabled, surface the maintenance-window plan so
+      // the operator doesn't feel pressured to click Restart Now — the
+      // device will apply the update on its own overnight.
+      final ar = autoUnlock?.autoReboot;
+      final autoEnabled = autoUnlock?.enabled ?? false;
+      if (autoEnabled && ar != null && ar.enabled) {
+        subtitle =
+            'Version ${update!.availableVersion} will install automatically '
+            'between ${_formatHour(ar.windowStartHour)} and '
+            '${_formatHour(ar.windowEndHour)}, or restart now to apply it sooner.';
+      } else {
+        subtitle = 'Version ${update!.availableVersion} is ready to install.';
+      }
       action = FilledButton.icon(
         onPressed: onReboot,
         icon: const Icon(PiccoloIcons.restart),

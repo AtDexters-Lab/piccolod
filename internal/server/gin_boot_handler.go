@@ -122,6 +122,14 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 		if recoveryKeyPending {
 			resp["recovery_key_pending"] = true
 		}
+		// auto_unlock_in_flight drives the UI's transient
+		// "Auto-unlocking…" state on the unlock screen. Pre-auth (no
+		// session needed) — the orchestrator only flips this to true
+		// when state.Enabled is already on, so opting out leaves the
+		// field absent / false.
+		if s.autounlockOrch != nil && s.autounlockOrch.InFlight() {
+			resp["auto_unlock_in_flight"] = true
+		}
 		c.JSON(http.StatusOK, resp)
 		return
 	}

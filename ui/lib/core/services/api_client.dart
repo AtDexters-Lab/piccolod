@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:piccolo_os/core/config/core_config.dart';
 import 'package:piccolo_os/core/services/http_client_factory.dart'; // Import the factory
+import 'package:piccolo_os/core/utils/browser_tz/browser_tz.dart';
 
 class ApiClient {
   factory ApiClient() => _instance;
@@ -252,6 +253,14 @@ class ApiClient {
     }
     if (_csrfToken != null) {
       headers['X-CSRF-Token'] = _csrfToken!;
+    }
+    // X-Browser-Timezone: one-shot hint for the backend to seed
+    // /etc/localtime if it's still on the UTC default. The middleware
+    // skips when the device timezone is already configured, so this is
+    // safe to include on every request. Cached after the first lookup.
+    final tz = resolvedBrowserTimezone();
+    if (tz != null) {
+      headers['X-Browser-Timezone'] = tz;
     }
     // Note: "withCredentials" is a property of the request, not a header.
     // package:http BrowserClient usually handles cookies if the browser sends them.

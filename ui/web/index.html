@@ -160,6 +160,19 @@
       e.preventDefault();
       return false;
     });
+
+    // Resolve the browser's IANA timezone for the auto-unlock scheduler's
+    // wall-clock-local window. Read once and cached; the Dart layer sends
+    // it via X-Browser-Timezone on every request — backend's middleware
+    // ignores it after the device is configured away from UTC.
+    window.piccoloBrowserTimezone = function () {
+      try {
+        var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        return (typeof tz === 'string' && tz.length > 0) ? tz : '';
+      } catch (e) {
+        return '';
+      }
+    };
   </script>
   <script src="webauthn.js"></script>
   <script src="flutter_bootstrap.js" async></script>

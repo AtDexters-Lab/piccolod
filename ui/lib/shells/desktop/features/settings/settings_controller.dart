@@ -1,9 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:piccolo_os/core/models/auto_unlock.dart';
 import 'package:piccolo_os/core/models/os_update.dart';
 import 'package:piccolo_os/core/models/remote_models.dart';
 import 'package:piccolo_os/core/models/session.dart';
+import 'package:piccolo_os/core/models/system_timezone.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/network_service.dart';
 import 'package:piccolo_os/core/utils/downloader/downloader.dart' as downloader;
@@ -42,6 +44,26 @@ class SettingsController extends ChangeNotifier {
   String? _specificHostname;
   String? get specificHostname => _specificHostname;
 
+  AutoUnlockState? _autoUnlock;
+  AutoUnlockState? get autoUnlock => _autoUnlock;
+
+  SystemTimezone? _timezone;
+  SystemTimezone? get timezone => _timezone;
+
+  bool _autoUnlockTesting = false;
+  bool get autoUnlockTesting => _autoUnlockTesting;
+
+  String? _autoUnlockTestResult; // Empty = success; non-empty = failure-token.
+  String? get autoUnlockTestResult => _autoUnlockTestResult;
+  int? _autoUnlockTestLatencyMs;
+  int? get autoUnlockTestLatencyMs => _autoUnlockTestLatencyMs;
+
+  bool _autoUnlockSaving = false;
+  bool get autoUnlockSaving => _autoUnlockSaving;
+
+  bool _timezoneSaving = false;
+  bool get timezoneSaving => _timezoneSaving;
+
   // Navigation
   int _selectedIndex = 0;
   int get selectedIndex => _selectedIndex;
@@ -66,8 +88,15 @@ class SettingsController extends ChangeNotifier {
         break;
       case 3: // Security
         await fetchSpecificHostname();
+        await fetchAutoUnlock();
       case 4: // System
         await fetchOSUpdate();
+        await fetchTimezone();
+        // Auto-unlock state drives the maintenance-window subtitle on the
+        // Update Available card. Fetched here too (not just on Security)
+        // so the operator sees the auto-reboot plan when they open System
+        // first.
+        await fetchAutoUnlock();
         if (!_disposed && _isBackendBusy) {
           unawaited(_pollWhileBusy());
         }
@@ -368,5 +397,131 @@ class SettingsController extends ChangeNotifier {
 
         await Future<void>.delayed(const Duration(seconds: 2));
       }
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Auto-Unlock (Settings → Security)
+  // ─────────────────────────────────────────────────────────
+
+  Future<void> fetchAutoUnlock() async {
+    if (_disposed) return;
+    try {
+      final response = await ApiClient().get('/api/v1/security/auto-unlock');
+      if (_disposed) return;
+      _autoUnlock = AutoUnlockState.fromJson(response as Map<String, dynamic>);
+      _error = null;
+      notifyListeners();
+    } on Object catch (e) {
+      if (_disposed) return;
+      _error = e.toString();
+      notifyListeners();
+    }
+  }
+
+  /// Updates auto-unlock state with a partial body. Pass only the fields
+  /// being changed; the backend merges with persisted state. Returns the
+  /// updated state on success; throws ApiException with the `error` body
+  /// on validation failure (e.g. invalid window).
+  Future<void> updateAutoUnlock({
+    bool? enabled,
+    bool? autoRebootEnabled,
+    int? windowStartHour,
+    int? windowEndHour,
+  }) async {
+    if (_disposed) return;
+    _autoUnlockSaving = true;
+    notifyListeners();
+    try {
+      final body = <String, dynamic>{};
+      if (enabled != null) body['enabled'] = enabled;
+      final ar = <String, dynamic>{};
+      if (autoRebootEnabled != null) ar['enabled'] = autoRebootEnabled;
+      if (windowStartHour != null) ar['window_start_hour'] = windowStartHour;
+      if (windowEndHour != null) ar['window_end_hour'] = windowEndHour;
+      if (ar.isNotEmpty) body['auto_reboot'] = ar;
+      final response = await ApiClient().put('/api/v1/security/auto-unlock', body: body);
+      if (_disposed) return;
+      _autoUnlock = AutoUnlockState.fromJson(response as Map<String, dynamic>);
+      _error = null;
+    } on Object catch (e) {
+      if (!_disposed) _error = e.toString();
+      rethrow;
+    } finally {
+      if (!_disposed) {
+        _autoUnlockSaving = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Runs the namek round-trip self-test. Captures success + latency or
+  /// failure-token on the controller; UI reads via autoUnlockTestResult /
+  /// autoUnlockTestLatencyMs. Cleared on next fetchAutoUnlock or another
+  /// runAutoUnlockTest invocation.
+  Future<void> runAutoUnlockTest() async {
+    if (_disposed) return;
+    _autoUnlockTesting = true;
+    _autoUnlockTestResult = null;
+    _autoUnlockTestLatencyMs = null;
+    notifyListeners();
+    try {
+      final response = await ApiClient().post('/api/v1/security/auto-unlock/test');
+      if (_disposed) return;
+      final data = response as Map<String, dynamic>? ?? <String, dynamic>{};
+      final ok = data['success'] == true;
+      _autoUnlockTestResult = ok ? '' : ((data['error_kind'] as String?) ?? 'unknown');
+      _autoUnlockTestLatencyMs = data['latency_ms'] as int?;
+    } on Object catch (e) {
+      if (!_disposed) _autoUnlockTestResult = e.toString();
+    } finally {
+      if (!_disposed) {
+        _autoUnlockTesting = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Timezone (Settings → System)
+  // ─────────────────────────────────────────────────────────
+
+  Future<void> fetchTimezone() async {
+    if (_disposed) return;
+    try {
+      final response = await ApiClient().get('/api/v1/system/timezone');
+      if (_disposed) return;
+      _timezone = SystemTimezone.fromJson(response as Map<String, dynamic>);
+      notifyListeners();
+    } on Object catch (e) {
+      if (_disposed) return;
+      _error = e.toString();
+      notifyListeners();
+    }
+  }
+
+  Future<void> updateTimezone(String zone) async {
+    if (_disposed) return;
+    _timezoneSaving = true;
+    notifyListeners();
+    try {
+      final response = await ApiClient().put(
+        '/api/v1/system/timezone',
+        body: {'timezone': zone},
+      );
+      if (_disposed) return;
+      _timezone = SystemTimezone.fromJson(
+        // PUT returns {timezone}; merge with is_set=true since we just set it.
+        {...?(response as Map<String, dynamic>?), 'is_set': true},
+      );
+      _error = null;
+    } on Object catch (e) {
+      if (!_disposed) _error = e.toString();
+      rethrow;
+    } finally {
+      if (!_disposed) {
+        _timezoneSaving = false;
+        notifyListeners();
+      }
+    }
   }
 }

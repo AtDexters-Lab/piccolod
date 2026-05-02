@@ -64,6 +64,7 @@ class PiccoloIcons {
   // ---- Objects ----
   static const IconData lock = PhosphorIconsRegular.lock;
   static const IconData lockKey = PhosphorIconsRegular.lockKey;
+  static const IconData clock = PhosphorIconsRegular.clock;
   static const IconData shield = PhosphorIconsRegular.shield;
   static const IconData shieldCheck = PhosphorIconsRegular.shieldCheck;
   static const IconData security = PhosphorIconsRegular.shieldCheck;
