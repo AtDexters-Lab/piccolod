@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -142,6 +144,53 @@ func (s *GinServer) requestLoggingMiddleware() gin.HandlerFunc {
 			param.ErrorMessage,
 		)
 	})
+}
+
+// timezoneCaptureMiddleware does a one-shot capture of the browser's IANA
+// timezone hint via the `X-Browser-Timezone` request header, calling
+// `timedatectl set-timezone` once when the device is still on its UTC
+// default. Lets piccolod's auto-unlock scheduler interpret 3-5AM windows in
+// the operator's local time without ever surfacing a timezone setup screen.
+//
+// One-shot semantics: skips when timezoneMgr.IsSet() == true (operator or
+// prior capture already configured), and serializes concurrent racers via a
+// CAS-guarded "currently setting" flag. Non-blocking — set runs in a
+// goroutine so the request never waits on `timedatectl`.
+//
+// Validation: malformed zones (rejected by time.LoadLocation) are dropped
+// silently. The header is a hint, not a contract — bad input doesn't fail
+// the request.
+func (s *GinServer) timezoneCaptureMiddleware() gin.HandlerFunc {
+	var setting atomic.Bool
+	return func(c *gin.Context) {
+		c.Next()
+		if s.timezoneMgr == nil {
+			return
+		}
+		zone := strings.TrimSpace(c.Request.Header.Get("X-Browser-Timezone"))
+		if zone == "" {
+			return
+		}
+		if s.timezoneMgr.IsSet() {
+			return
+		}
+		if _, err := time.LoadLocation(zone); err != nil {
+			return
+		}
+		if !setting.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			defer setting.Store(false)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := s.timezoneMgr.Set(ctx, zone); err != nil {
+				log.Printf("WARN: timezone capture from X-Browser-Timezone (%q): %v", zone, err)
+				return
+			}
+			log.Printf("INFO: timezone captured from browser: %s", zone)
+		}()
+	}
 }
 
 // requireUnlocked blocks state-changing operations when crypto is initialized and currently locked

@@ -55,6 +55,7 @@ import (
 	"piccolod/internal/storage/drbd"
 	"piccolod/internal/storage/nbd"
 	"piccolod/internal/storage/poolguard"
+	"piccolod/internal/sysconfig/timezone"
 	"piccolod/internal/terminal"
 	"piccolod/internal/tpm"
 	"piccolod/internal/update"
@@ -160,6 +161,12 @@ type GinServer struct {
 	// Phase 0 calls this BEFORE invoking RunCeremony so a slow pickup (e.g.,
 	// mid-namek-HTTP) returns promptly and releases the orchestrator mutex.
 	autounlockPickupCancel context.CancelFunc
+
+	// timezoneMgr wraps timedatectl set-timezone + /etc/localtime readback.
+	// Used by the X-Browser-Timezone middleware (one-shot capture from the
+	// browser's IANA hint), the Settings → System → Timezone HTTP endpoints,
+	// and the auto-unlock scheduler's pre-fire safety gate.
+	timezoneMgr *timezone.Manager
 
 	// OIDC Provider (cached)
 	oidcProvider   *oidc.Provider
@@ -681,6 +688,11 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	diskPreparer := diskprep.NewPreparer(execRunner)
 	storageMgr := storage.NewManager(diskPreparer, eventsBus, execRunner)
 
+	// Timezone wrapper. Used by the X-Browser-Timezone middleware (one-shot
+	// capture from the browser's IANA hint), the Settings → System → Timezone
+	// HTTP endpoints, and the auto-unlock scheduler's pre-fire safety gate.
+	timezoneMgr := timezone.NewManager(execRunner)
+
 	// Initialize NBD server and DRBD resource manager for block-native volume stack.
 	// On single-node deployments (no cluster), these are nil — the volume manager
 	// uses a simplified stack: thin LV → LUKS → ext4 (no NBD/DRBD layers).
@@ -802,6 +814,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		onboardingMgr:     onboardingMgr,
 		installer:         installer,
 		execRunner:        execRunner,
+		timezoneMgr:       timezoneMgr,
 		provisioningState: provisioning.New(onboardingMgr),
 	}
 	s.opCtx, s.opCancel = context.WithCancel(context.Background())
@@ -1278,6 +1291,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		s.autounlockScheduler = autounlock.NewScheduler(autounlock.SchedulerDeps{
 			UpdateManager: &osUpdateManagerAdapter{inner: func() osUpdateManager { return s.updateManager }},
 			PublishAudit:  s.publishBackgroundAuditEvent,
+			TZSafeToFire:  s.timezoneMgr.IsSet,
 		})
 	}
 
@@ -1831,6 +1845,7 @@ func (s *GinServer) setupGinRoutes() {
 	r.Use(s.corsMiddleware())
 	r.Use(s.httpsRedirectMiddleware())
 	r.Use(s.securityHeadersMiddleware())
+	r.Use(s.timezoneCaptureMiddleware())
 
 	// Optional: OpenAPI request validation (enabled when validator is initialized)
 	if s.apiValidator == nil {
@@ -1997,6 +2012,12 @@ func (s *GinServer) setupGinRoutes() {
 		admin.PUT("/security/auto-unlock", s.requireUnlocked(), s.handleAutoUnlockPut)
 		admin.DELETE("/security/auto-unlock", s.requireUnlocked(), s.handleAutoUnlockDelete)
 		admin.POST("/security/auto-unlock/test", s.requireUnlocked(), s.handleAutoUnlockTest)
+
+		// System timezone (Settings → System → Timezone). Get is unlocked-
+		// independent (read of /etc/localtime); Put runs `timedatectl
+		// set-timezone` and is admin-gated.
+		admin.GET("/system/timezone", s.handleSystemTimezoneGet)
+		admin.PUT("/system/timezone", s.requireUnlocked(), s.handleSystemTimezonePut)
 
 		// App management endpoints
 		apps := authed.Group("/apps")
