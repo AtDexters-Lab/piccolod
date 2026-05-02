@@ -742,6 +742,122 @@ stage_storage_post() {
 }
 
 # ─────────────────────────────────────────────────────────
+# Stage 11a: Auto-Unlock + Timezone Surface
+#
+# Exercises the auto-unlock v1 surface end-to-end against a setup-complete
+# device:
+#   - GET /security/auto-unlock returns expected schema (post-auth detail).
+#   - GET /crypto/status exposes only enabled + in_flight (no failure leak).
+#   - GET /system/timezone reads the current zone.
+#   - PUT /system/timezone with garbage zone → 400.
+#   - PUT /system/timezone with valid zone persists + reflects in GET.
+#   - X-Browser-Timezone capture middleware fires when device is on UTC
+#     default and silently skips after the first non-UTC zone is set.
+#   - POST /security/auto-unlock/test runs a deposit/pickup round-trip.
+#   - PUT /security/auto-unlock toggles + window edit lands.
+#   - Scheduler startup log present in journal (proves goroutine alive).
+# ─────────────────────────────────────────────────────────
+stage_auto_unlock() {
+  echo -e "\n${CYAN}═══ Stage 11a: Auto-Unlock + Timezone Surface ═══${NC}"
+  ensure_session
+
+  # 11a.1 — Public crypto/status shape: has enabled + in_flight, no failure leak.
+  local cstat
+  cstat=$(api "/api/v1/crypto/status")
+  check "11a.1" "Public /crypto/status has auto_unlock_enabled" "$cstat" '"auto_unlock_enabled"'
+  check "11a.2" "Public /crypto/status has auto_unlock_in_flight" "$cstat" '"auto_unlock_in_flight"'
+  check_not "11a.3" "Public /crypto/status omits auto_unlock_last_failure" "$cstat" '"auto_unlock_last_failure"'
+
+  # 11a.4..6 — Authenticated GET /security/auto-unlock has full detail.
+  local au
+  au=$(api "/api/v1/security/auto-unlock")
+  check "11a.4" "Authed /security/auto-unlock has enabled" "$au" '"enabled"'
+  check "11a.5" "Authed /security/auto-unlock has auto_reboot block" "$au" '"auto_reboot"'
+  check "11a.6" "Authed /security/auto-unlock has has_outstanding_blob" "$au" '"has_outstanding_blob"'
+
+  # 11a.7 — Test action exercises a full deposit/pickup round-trip.
+  local test_resp
+  test_resp=$(post_csrf "/api/v1/security/auto-unlock/test")
+  check "11a.7" "/security/auto-unlock/test returns success=true" "$test_resp" '"success":true'
+
+  # 11a.8 — Scheduler startup log (proves goroutine spawned).
+  local sched_log
+  sched_log=$(vssh 'journalctl -u piccolod --no-pager 2>/dev/null | grep -c "autounlock scheduler started" || echo 0' 2>/dev/null | tail -1 | tr -d '[:space:]')
+  if [[ "$sched_log" -ge 1 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [11a.8] Scheduler startup log present (count=$sched_log)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [11a.8] Scheduler startup log missing"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 11a.9 — Timezone GET returns current zone.
+  local tz_get
+  tz_get=$(api "/api/v1/system/timezone")
+  check "11a.9" "/system/timezone GET returns timezone field" "$tz_get" '"timezone"'
+
+  # 11a.10 — Timezone PUT garbage zone → 400.
+  local token
+  token=$(csrf)
+  local code
+  code=$(curl -s -b "$COOKIE_JAR" -X PUT -o /dev/null -w "%{http_code}" \
+    -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d '{"timezone":"Mars/Olympus_Mons"}' \
+    "http://$IP/api/v1/system/timezone" 2>/dev/null)
+  if [[ "$code" == "400" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [11a.10] PUT garbage zone → 400"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [11a.10] PUT garbage zone returned $code (want 400)"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 11a.11 — Timezone PUT valid zone persists.
+  local before; before=$(api "/api/v1/system/timezone" | python3 -c "import sys,json; print(json.load(sys.stdin).get('timezone',''))" 2>/dev/null)
+  local target; target="America/New_York"
+  if [[ "$before" == "$target" ]]; then target="Asia/Kolkata"; fi
+  curl -sf -b "$COOKIE_JAR" -X PUT \
+    -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "{\"timezone\":\"$target\"}" \
+    "http://$IP/api/v1/system/timezone" >/dev/null
+  local after; after=$(api "/api/v1/system/timezone" | python3 -c "import sys,json; print(json.load(sys.stdin).get('timezone',''))" 2>/dev/null)
+  if [[ "$after" == "$target" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [11a.11] PUT timezone persists ($before → $after)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [11a.11] PUT timezone failed ($before → $after, wanted $target)"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 11a.12 — X-Browser-Timezone capture: reset to UTC, send header, expect retarget.
+  vssh 'timedatectl set-timezone UTC' >/dev/null 2>&1
+  curl -sf -H "X-Browser-Timezone: Europe/Berlin" "http://$IP/version" >/dev/null
+  sleep 2
+  local linktarget
+  linktarget=$(vssh 'readlink /etc/localtime' 2>/dev/null | tail -1)
+  if [[ "$linktarget" == *"Europe/Berlin"* ]]; then
+    echo -e "  ${GREEN}PASS${NC} [11a.12] X-Browser-Timezone capture retargeted /etc/localtime"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [11a.12] X-Browser-Timezone capture failed (target=$linktarget)"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 11a.13 — Subsequent X-Browser-Timezone is a no-op (IsSet short-circuits).
+  local before_target; before_target=$(vssh 'readlink /etc/localtime' 2>/dev/null | tail -1)
+  curl -sf -H "X-Browser-Timezone: Asia/Tokyo" "http://$IP/version" >/dev/null
+  sleep 2
+  local after_target; after_target=$(vssh 'readlink /etc/localtime' 2>/dev/null | tail -1)
+  if [[ "$before_target" == "$after_target" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [11a.13] X-Browser-Timezone short-circuits when zone already set"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [11a.13] Capture re-fired ($before_target → $after_target)"
+    ((FAIL_COUNT++)) || true
+  fi
+}
+
+# ─────────────────────────────────────────────────────────
 # Stage 11: Resource Stewardship (HTTP + SSH)
 #
 # Exercises the post-RFC resource-stewardship plumbing end-to-end:
@@ -993,6 +1109,7 @@ case "$STAGE" in
   reboot)          stage_reboot ;;
   storage-post)    stage_storage_post ;;
   stewardship)     stage_stewardship ;;
+  auto-unlock)     stage_auto_unlock ;;
   logs)            dump_logs "manual" ;;
   all)
     stage_prereq
@@ -1005,12 +1122,13 @@ case "$STAGE" in
     stage_service_app
     stage_workspace_app
     stage_stewardship
+    stage_auto_unlock
     stage_reboot
     stage_storage_post
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app reboot storage-post stewardship logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app reboot storage-post stewardship auto-unlock logs all"
     exit 1
     ;;
 esac

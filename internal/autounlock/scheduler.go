@@ -81,11 +81,16 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 // ctx is cancelled.
 func (s *Scheduler) Run(ctx context.Context) {
 	s.rehydrate()
+	// One-shot startup log so the operator can see "scheduler is alive" in
+	// the journal without observing a fire. Subsequent ticks are silent on
+	// the happy path; failures and fires log themselves.
+	log.Printf("INFO: autounlock scheduler started (tick=%s)", schedulerTickRate)
 	ticker := time.NewTicker(schedulerTickRate)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			log.Printf("INFO: autounlock scheduler stopped")
 			return
 		case <-ticker.C:
 			s.tick(ctx)
