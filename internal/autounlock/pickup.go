@@ -47,7 +47,16 @@ type CompleteUnlockChain func(ctx context.Context) error
 // and triggers the post-decrypt chain. Falls through cleanly to manual unlock
 // on any failure — the locked HTTP server stays up the whole time so the
 // password path is always available in parallel.
+//
+// Takes o.mu to serialize against ceremony. If a fast Stop catches pickup
+// mid-namek-call, the wiring layer cancels pickup's context first → pickup's
+// HTTP call returns ctx.Canceled → pickup releases the mutex → ceremony
+// proceeds. Without this lock, pickup's tail (state-file save, blob delete,
+// revoke) could race ceremony's wrap+deposit on the same files.
 func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlockChain) PickupOutcome {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	state, err := LoadState()
 	if err != nil && err != ErrInvalidStateFile {
 		log.Printf("WARN: autounlock: pickup load state: %v", err)

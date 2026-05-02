@@ -21,6 +21,7 @@ import (
 	"piccolod/internal/app"
 	"piccolod/internal/app/catalog"
 	authpkg "piccolod/internal/auth"
+	"piccolod/internal/autounlock"
 	"piccolod/internal/cluster"
 	"piccolod/internal/consensus"
 	"piccolod/internal/container"
@@ -146,6 +147,16 @@ type GinServer struct {
 	healthTracker  *health.Tracker
 	updateManager  osUpdateManager
 	catalogManager *catalog.Manager
+
+	// Auto-unlock framework (opt-in per-device via posture A/B/C). Owns the
+	// pre-shutdown ceremony, post-boot pickup goroutine, and Test action.
+	// nil before NewGinServer wires it (or if construction failed — feature
+	// is opt-in, server still boots).
+	autounlockOrch *autounlock.Orchestrator
+	// autounlockPickupCancel cancels the pickup goroutine's context. Stop's
+	// Phase 0 calls this BEFORE invoking RunCeremony so a slow pickup (e.g.,
+	// mid-namek-HTTP) returns promptly and releases the orchestrator mutex.
+	autounlockPickupCancel context.CancelFunc
 
 	// OIDC Provider (cached)
 	oidcProvider   *oidc.Provider
@@ -1228,6 +1239,51 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	s.supervisor.Register(identitySvc)
 
+	// Auto-unlock orchestrator (opt-in per-device). Constructed after the
+	// identity service is wired so the deps closures can read its state.
+	// Posture defaults to off — bringing this up does NOT change behavior
+	// for devices that haven't opted in.
+	autounlockOrch, err := autounlock.New(autounlock.Deps{
+		Manager: s.cryptoManager,
+		NamekClient: func() autounlock.NamekEscrowClient {
+			c := identitySvc.NamekClient()
+			if c == nil {
+				return nil
+			}
+			return c
+		},
+		GetDeviceID:      identitySvc.DeviceID,
+		GetIdentityClass: identitySvc.IdentityClass,
+		IsIdentityReady: func() bool {
+			return identitySvc.IsEnrolled() &&
+				identitySvc.IsEnabled() &&
+				!identitySvc.IsSuspended() &&
+				identitySvc.NamekClient() != nil
+		},
+		PublishAudit: func(kind string, details map[string]any) {
+			if eventsBus == nil {
+				return
+			}
+			eventsBus.Publish(events.Event{
+				Topic: events.TopicAudit,
+				Payload: events.AuditEvent{
+					Kind:     kind,
+					Time:     time.Now().UTC(),
+					Metadata: details,
+				},
+			})
+		},
+	})
+	if err != nil {
+		// Auto-unlock is opt-in; failure to construct shouldn't deny boot
+		// for posture-off devices. Log and continue with autounlockOrch == nil
+		// — the wiring sites (Stop Phase 0, Start pickup goroutine) all
+		// nil-check before invoking.
+		log.Printf("WARN: auto-unlock orchestrator init failed (feature disabled): %v", err)
+	} else {
+		s.autounlockOrch = autounlockOrch
+	}
+
 	// Network manager (WiFi uplink + watchdog). D-Bus may be unavailable on
 	// dev machines — degrade gracefully, WiFi API returns available=false.
 	nmClient, nmErr := nmclient.NewDBusClient(execRunner)
@@ -1443,6 +1499,20 @@ func (s *GinServer) Start() error {
 		return fmt.Errorf("failed to start runtime components: %w", err)
 	}
 
+	// Auto-unlock pickup goroutine. Runs in parallel with the locked HTTP
+	// server — password-unlock path stays available the whole time. Pickup
+	// holds the orchestrator mutex; Stop Phase 0 cancels pickupCtx before
+	// invoking ceremony so a slow namek round-trip aborts promptly and the
+	// mutex is released. Posture-off / no-blob fast-exit, no async cost.
+	if s.autounlockOrch != nil {
+		pickupCtx, pickupCancel := context.WithCancel(s.serverContext())
+		s.autounlockPickupCancel = pickupCancel
+		go s.autounlockOrch.RunPickup(pickupCtx, func(ctx context.Context) error {
+			_, err := s.completeUnlockChain(ctx)
+			return err
+		})
+	}
+
 	// Start disk preparation based on boot mode and onboarding state.
 	if s.storageMgr != nil && s.onboardingMgr != nil {
 		switch {
@@ -1542,10 +1612,23 @@ func (s *GinServer) runWatchdogLoop(ctx context.Context) {
 func (s *GinServer) Stop(ctx context.Context) error {
 	log.Printf("INFO: Beginning graceful shutdown...")
 
-	// Prevent identity event subscriber from racing with shutdown.
-	// Must be set BEFORE unsubscribing — an in-flight handler that already
-	// dequeued an identity event checks this flag in applyNamekState.
+	// Phase 0: pre-shutdown auto-unlock ceremony.
+	// namekStopped flips FIRST so identity-event subscribers (applyNamekState)
+	// see the flag at their entry guard and bail, rather than racing the
+	// ceremony's namek HTTPS call. Pickup goroutine's context is canceled
+	// before ceremony so a slow namek round-trip in pickup releases the
+	// orchestrator mutex promptly. The namek HTTPS client itself stays alive
+	// — only stopNamekAdapter (next line) tears it down. Ceremony failure
+	// does NOT block shutdown; it logs and proceeds.
 	s.namekStopped.Store(true)
+	if s.autounlockPickupCancel != nil {
+		s.autounlockPickupCancel()
+	}
+	if s.autounlockOrch != nil {
+		if err := s.autounlockOrch.RunCeremony(ctx); err != nil {
+			log.Printf("WARN: auto-unlock ceremony failed: %v", err)
+		}
+	}
 	s.stopNamekAdapter()
 
 	// Unsubscribe event bus observers

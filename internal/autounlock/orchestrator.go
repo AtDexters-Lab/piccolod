@@ -65,8 +65,10 @@ type Deps struct {
 
 // Orchestrator owns the autounlock package's mutating operations. A single
 // instance per piccolod process. The internal mutex serializes ceremony /
-// test / posture-change against each other; pickup runs at startup only and
-// cannot interleave with ceremony (which runs at shutdown only).
+// test / posture-change / pickup against each other. Pickup typically runs
+// at startup and completes before Stop fires, but a fast Stop catching pickup
+// mid-namek-call requires the wiring layer to cancel pickup's context first
+// so pickup releases the mutex promptly.
 type Orchestrator struct {
 	deps Deps
 	mu   sync.Mutex
