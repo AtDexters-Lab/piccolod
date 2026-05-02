@@ -101,6 +101,13 @@ func (s *GinServer) handleAutoUnlockTest(c *gin.Context) {
 			c.JSON(http.StatusPreconditionFailed, gin.H{"error": err.Error()})
 			return
 		}
+		if errors.Is(err, autounlock.ErrTestRateLimit) {
+			// Plan §"Test action" step 3 — Retry-After hints the UI to wait
+			// at least 5s before retrying. Compact-int seconds.
+			c.Header("Retry-After", "5")
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+			return
+		}
 		log.Printf("ERROR: auto-unlock test: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "test failed"})
 		return

@@ -67,6 +67,10 @@ class _SetupRouterState extends State<SetupRouter> {
   SetupPhase? _finishingPhase;
   bool _showAutoUnlocking = false;
   Timer? _autoUnlockingPoll;
+  // Sticky for one route after the in-flight spinner clears. Threaded into
+  // UnlockStep so it shows a neutral state-the-action prompt instead of
+  // landing the operator on a bare password field with no bridging signal.
+  bool _recentlyTriedAutoUnlock = false;
 
   // Boot data for install_complete.
   bool _bootOrderConfigured = false;
@@ -132,6 +136,13 @@ class _SetupRouterState extends State<SetupRouter> {
   void _route(Map<String, dynamic> boot) {
     final screen = boot['screen'] as String?;
     debugPrint('SetupRouter: boot screen=$screen');
+    // Auto-unlock-just-failed bridging signal stays sticky only across
+    // the spinner→unlock transition. Once we route to anything other
+    // than 'unlock' (login, desktop, etc.), clear it so a later re-lock
+    // doesn't inherit the signal.
+    if (screen != 'unlock') {
+      _recentlyTriedAutoUnlock = false;
+    }
 
     // Clear setup state on non-setup screens (factory reset, setup by other user).
     if (screen != 'setup') {
@@ -147,6 +158,12 @@ class _SetupRouterState extends State<SetupRouter> {
     _controller = null;
     _systemError = null;
     _showFinishing = false;
+    // If we were just showing the auto-unlocking spinner and are now
+    // routing somewhere else (typically UnlockStep on failure), mark the
+    // sticky flag so the next render carries the bridging signal.
+    if (_showAutoUnlocking) {
+      _recentlyTriedAutoUnlock = true;
+    }
     _showAutoUnlocking = false;
     _autoUnlockingPoll?.cancel();
     _autoUnlockingPoll = null;
@@ -794,6 +811,7 @@ class _SetupRouterState extends State<SetupRouter> {
               onUnlock: ctrl.unlock,
               onForgotPassword: ctrl.startRecovery,
               error: ctrl.error,
+              recentlyTriedAutoUnlock: _recentlyTriedAutoUnlock,
             );
             title = 'Unlock Device';
             showOtherDevices = true;

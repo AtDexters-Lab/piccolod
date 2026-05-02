@@ -471,6 +471,11 @@ class SettingsController extends ChangeNotifier {
       final ok = data['success'] == true;
       _autoUnlockTestResult = ok ? '' : ((data['error_kind'] as String?) ?? 'unknown');
       _autoUnlockTestLatencyMs = data['latency_ms'] as int?;
+    } on ApiException catch (e) {
+      // 429 from the orchestrator's 5s rate-limit. Map to a synthetic token
+      // so the UI can render the friendly "Tested too recently" copy via
+      // autoUnlockFailureReasonLabel instead of surfacing a raw exception.
+      if (!_disposed) _autoUnlockTestResult = e.statusCode == 429 ? 'rate_limited' : e.toString();
     } on Object catch (e) {
       if (!_disposed) _autoUnlockTestResult = e.toString();
     } finally {

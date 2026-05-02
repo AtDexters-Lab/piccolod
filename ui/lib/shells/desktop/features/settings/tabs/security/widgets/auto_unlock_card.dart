@@ -105,7 +105,10 @@ class _AutoUnlockCardState extends State<AutoUnlockCard> {
           const SizedBox(height: Spacing.sm),
           Text(
             'Restore your encrypted disk automatically when the device reboots, '
-            'so apps come back online without you entering the password.',
+            'so apps come back online without you entering the password. The '
+            'unlock key is held encrypted by piccolospace; this means the '
+            'device boots without a password if it is powered on by anyone '
+            'with physical access.',
             style: PiccoloTheme.textTheme.labelSmall,
           ),
           if (state == null) ...[
@@ -139,27 +142,35 @@ class _StatusRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final lastSuccess = state.lastPickupAt ?? state.lastDepositAt;
+    final reason = state.lastFailureReason;
+    // Hide the failure surface entirely for benign tokens (e.g. the
+    // operator-typed-password-first race). Those aren't failures the
+    // operator should worry about.
+    final showFailure = state.isInFailureState &&
+        reason.isNotEmpty &&
+        !isAutoUnlockBenignToken(reason);
     return Wrap(
       spacing: Spacing.lg,
       runSpacing: Spacing.sm,
       children: [
-        _StatusBadge(
-          label: 'Status',
-          value: state.isInFailureState ? 'Last attempt failed' : 'Active',
-          color: state.isInFailureState
-              ? PiccoloTheme.warning
-              : PiccoloTheme.success,
-        ),
+        // When showing a failure reason, collapse Status + Reason into the
+        // single Reason badge — the doubled warning copy was Gestalt noise.
+        if (!showFailure)
+          const _StatusBadge(
+            label: 'Status',
+            value: 'Active',
+            color: PiccoloTheme.success,
+          ),
         if (lastSuccess != null)
           _StatusBadge(
             label: 'Last successful cycle',
             value: _formatRelative(lastSuccess),
             color: PiccoloTheme.inkMuted,
           ),
-        if (state.isInFailureState && state.lastFailureReason.isNotEmpty)
+        if (showFailure)
           _StatusBadge(
-            label: 'Reason',
-            value: autoUnlockFailureReasonLabel(state.lastFailureReason),
+            label: 'Last attempt',
+            value: 'Failed — ${autoUnlockFailureReasonLabel(reason)}',
             color: PiccoloTheme.warning,
           ),
       ],
@@ -268,6 +279,7 @@ class _WindowPicker extends StatelessWidget {
         const SizedBox(width: Spacing.sm),
         _HourDropdown(
           value: startHour,
+          disabledHour: endHour,
           saving: saving,
           onChanged: (h) {
             if (h != null && h != endHour) onChanged(h, endHour);
@@ -278,6 +290,7 @@ class _WindowPicker extends StatelessWidget {
         const SizedBox(width: Spacing.sm),
         _HourDropdown(
           value: endHour,
+          disabledHour: startHour,
           saving: saving,
           onChanged: (h) {
             if (h != null && h != startHour) onChanged(startHour, h);
@@ -295,10 +308,15 @@ class _WindowPicker extends StatelessWidget {
 class _HourDropdown extends StatelessWidget {
   const _HourDropdown({
     required this.value,
+    required this.disabledHour,
     required this.saving,
     required this.onChanged,
   });
   final int value;
+  // Hour to grey out — the other end of the window. Surfaces the
+  // start != end constraint to the user instead of silently dropping
+  // same-hour selections in the change handler.
+  final int disabledHour;
   final bool saving;
   final ValueChanged<int?> onChanged;
 
@@ -309,7 +327,16 @@ class _HourDropdown extends StatelessWidget {
       onChanged: saving ? null : onChanged,
       items: [
         for (var h = 0; h < 24; h++)
-          DropdownMenuItem(value: h, child: Text(_formatHour(h))),
+          DropdownMenuItem(
+            value: h,
+            enabled: h != disabledHour,
+            child: Text(
+              _formatHour(h),
+              style: h == disabledHour
+                  ? const TextStyle(color: PiccoloTheme.inkMuted)
+                  : null,
+            ),
+          ),
       ],
     );
   }
@@ -328,14 +355,17 @@ class _TestActionRow extends StatelessWidget {
     Widget? feedback;
     if (result != null) {
       if (result.isEmpty) {
+        // Surface latency only when notably high — bare millisecond counts
+        // are debug noise without a benchmark the operator can interpret.
+        final slow = latency != null && latency > 2000;
         feedback = Row(
           children: [
             const Icon(PiccoloIcons.success,
                 color: PiccoloTheme.success, size: 16),
             const SizedBox(width: Spacing.xs),
             Text(
-              latency != null
-                  ? 'Connection healthy (${latency}ms round-trip)'
+              slow
+                  ? 'Connection healthy but slow (${(latency / 1000).toStringAsFixed(1)}s)'
                   : 'Connection healthy',
               style: PiccoloTheme.textTheme.labelSmall
                   ?.copyWith(color: PiccoloTheme.success),

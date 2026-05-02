@@ -75,10 +75,12 @@ class AutoUnlockState {
 /// auto-unlock detail (post-auth — locked-screen UI does NOT use these).
 String autoUnlockFailureReasonLabel(String token) {
   switch (token) {
+    // service_unreachable + service_not_ready collapse to one operator-
+    // facing label — the network-vs-local-service distinction is a
+    // backend concern, not user-actionable.
     case 'service_unreachable':
-      return "Couldn't reach piccolospace";
     case 'service_not_ready':
-      return 'Connection service not ready';
+      return "Couldn't reach piccolospace right now";
     case 'auth_failed':
       return 'Authentication with piccolospace failed';
     case 'escrow_not_found':
@@ -91,9 +93,17 @@ String autoUnlockFailureReasonLabel(String token) {
       return 'No unlock data was prepared (last shutdown was unclean)';
     case 'deposit_failed':
       return 'Could not save unlock data with piccolospace';
-    case 'manual_unlock_first':
-      return 'Password unlock happened first';
+    case 'rate_limited':
+      return 'Tested too recently — please wait a few seconds.';
     default:
       return token.isEmpty ? 'Unknown' : token;
   }
+}
+
+/// Tokens the UI must NOT render in the "last failure" badge — they
+/// represent benign races, not failures the operator should worry about.
+/// `manual_unlock_first` happens when the operator types their password
+/// before pickup completes; from their perspective the device unlocked.
+bool isAutoUnlockBenignToken(String token) {
+  return token == 'manual_unlock_first';
 }

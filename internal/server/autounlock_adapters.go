@@ -2,8 +2,16 @@ package server
 
 import (
 	"context"
+	"errors"
 	"log"
 )
+
+// errUpdateManagerUnavailable is returned by osUpdateManagerAdapter.Reboot
+// when the inner update manager is nil. Distinct from a successful no-op so
+// the scheduler audits the misconfiguration via scheduler.failed instead of
+// silently flipping last_fired_at + alreadyTriedThisWindow without ever
+// rebooting (which would suppress every subsequent fire until tEdge rollover).
+var errUpdateManagerUnavailable = errors.New("autounlock adapter: update manager unavailable")
 
 // osUpdateManagerAdapter bridges the autounlock.UpdateManager interface to the
 // existing GinServer.updateManager surface. The osUpdateManager already has
@@ -33,7 +41,7 @@ func (a *osUpdateManagerAdapter) HasStagedUpdate(ctx context.Context) bool {
 func (a *osUpdateManagerAdapter) Reboot(ctx context.Context) error {
 	m := a.inner()
 	if m == nil {
-		return nil
+		return errUpdateManagerUnavailable
 	}
 	return m.Reboot(ctx)
 }

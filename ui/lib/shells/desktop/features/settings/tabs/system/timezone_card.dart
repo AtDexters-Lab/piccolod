@@ -76,7 +76,8 @@ class _TimezoneCardState extends State<TimezoneCard> {
           const SizedBox(height: Spacing.sm),
           Text(
             'Used for scheduled tasks like overnight system updates. '
-            'Your browser timezone is captured automatically the first time you open the portal.',
+            'Your browser timezone is captured the first time you sign in. '
+            'To change it later, pick from the list below.',
             style: PiccoloTheme.textTheme.labelSmall,
           ),
           const SizedBox(height: Spacing.lg),

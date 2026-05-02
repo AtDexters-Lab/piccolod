@@ -59,10 +59,14 @@ func TestOSUpdateAdapter_HasStagedUpdate_NoReboot(t *testing.T) {
 	}
 }
 
-func TestOSUpdateAdapter_Reboot_NilInner(t *testing.T) {
+func TestOSUpdateAdapter_Reboot_NilInner_ReturnsError(t *testing.T) {
+	// Fail-loud: a nil-inner Reboot must NOT return nil. The scheduler reads
+	// Reboot's nil/non-nil to drive the failed-fire audit; nil-as-success
+	// would silently flip last_fired_at + alreadyTriedThisWindow without a
+	// real reboot, suppressing every subsequent fire until tEdge rollover.
 	a := &osUpdateManagerAdapter{inner: func() osUpdateManager { return nil }}
-	if err := a.Reboot(context.Background()); err != nil {
-		t.Errorf("nil inner should return nil error, got %v", err)
+	if err := a.Reboot(context.Background()); !errors.Is(err, errUpdateManagerUnavailable) {
+		t.Errorf("nil inner should return errUpdateManagerUnavailable, got %v", err)
 	}
 }
 

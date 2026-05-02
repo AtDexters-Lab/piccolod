@@ -250,6 +250,9 @@ func TestRunCeremony_DepositFails_DeletesBlob(t *testing.T) {
 	if len(*audits) != 1 || (*audits)[0].kind != AuditCycleFailedDeposit {
 		t.Errorf("expected failed_deposit audit; got %v", *audits)
 	}
+	if (*audits)[0].details["reason"] != ReasonDepositFailed {
+		t.Errorf("audit reason = %v; want %s", (*audits)[0].details["reason"], ReasonDepositFailed)
+	}
 }
 
 func TestRunCeremony_DepositRetriesOnTransient(t *testing.T) {
@@ -545,6 +548,30 @@ func TestRunTest_HappyPath(t *testing.T) {
 	}
 }
 
+func TestRunTest_RateLimited(t *testing.T) {
+	o, _, nc, _ := newOrchestrator(t)
+	if err := SaveState(State{Enabled: true}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+	nc.pickupEchoesF = true
+	// First call passes (lastTestAt was zero).
+	if _, err := o.RunTest(context.Background()); err != nil {
+		t.Fatalf("first RunTest: %v", err)
+	}
+	// Second call within testRateLimit (the orchestrator's Now is constant
+	// in the fixture, so 0 < testRateLimit) must return ErrTestRateLimit.
+	_, err := o.RunTest(context.Background())
+	if !errors.Is(err, ErrTestRateLimit) {
+		t.Errorf("err = %v; want ErrTestRateLimit", err)
+	}
+	// Sanity: the rate-limit check fires BEFORE namek interaction; the
+	// second call should NOT have reached deposit/pickup/revoke.
+	if nc.depositCount != 1 || nc.pickupCount != 1 || nc.revokeCount != 1 {
+		t.Errorf("rate-limited call still hit namek: deposit/pickup/revoke = %d/%d/%d; want 1/1/1",
+			nc.depositCount, nc.pickupCount, nc.revokeCount)
+	}
+}
+
 func TestRunTest_Disabled_PreconditionFails(t *testing.T) {
 	o, _, nc, _ := newOrchestrator(t)
 	if err := SaveState(State{Enabled: false}); err != nil {
@@ -603,6 +630,9 @@ func TestRunCeremony_WrapFails_RecordsDepositFailed(t *testing.T) {
 	}
 	if len(*audits) != 1 || (*audits)[0].kind != AuditCycleFailedDeposit {
 		t.Errorf("expected failed_deposit audit; got %v", *audits)
+	}
+	if (*audits)[0].details["reason"] != ReasonDepositFailed {
+		t.Errorf("audit reason = %v; want %s", (*audits)[0].details["reason"], ReasonDepositFailed)
 	}
 }
 

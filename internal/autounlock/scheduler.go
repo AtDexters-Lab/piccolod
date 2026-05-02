@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"log"
-	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,13 +64,17 @@ type Scheduler struct {
 	lastTEdge atomic.Int64
 }
 
-// NewScheduler constructs a Scheduler.
+// NewScheduler constructs a Scheduler. Caller must wire deps.TZSafeToFire —
+// production passes LoggedTZGate(timezone.Manager.IsSet); tests inject a
+// fake. There is no silent fallback because /etc/localtime probing has a
+// single source of truth in sysconfig/timezone, and a missing gate would
+// silently let the scheduler fire at 3-5AM-UTC on devices in non-UTC zones.
 func NewScheduler(deps SchedulerDeps) *Scheduler {
 	if deps.Now == nil {
 		deps.Now = time.Now
 	}
 	if deps.TZSafeToFire == nil {
-		deps.TZSafeToFire = tzSafeToFire
+		panic("autounlock.NewScheduler: TZSafeToFire is required")
 	}
 	return &Scheduler{deps: deps}
 }
@@ -247,37 +249,23 @@ func inWindow(hour, start, end int) bool {
 	return hour >= start || hour < end
 }
 
-// tzWarnOnce ensures the "timezone unset, scheduler gated" log fires at most
-// once per piccolod lifetime. Without this every 60s tick would re-log.
-var tzWarnOnce sync.Once
-
-// tzSafeToFire reports whether the system timezone has been set away from the
-// UTC default. Implementation reads `/etc/localtime` (a symlink into
-// /usr/share/zoneinfo/...). The OOTB MicroOS default targets UTC; once the
-// operator sets a real zone via timedatectl (or the X-Browser-Timezone
-// middleware lands), the symlink retargets and the gate opens.
+// LoggedTZGate wraps an IsSet probe (typically sysconfig.timezone.Manager.IsSet)
+// with a once-per-lifetime WARN log so the operator gets visibility into
+// "scheduler is gated waiting for timezone configuration." Without the log,
+// the scheduler ticks silently every 60s without firing — invisible until
+// someone goes spelunking in /etc/localtime.
 //
-// Conservative on errors: any read failure returns false (gates firing). The
-// scheduler-fire path is the dangerous direction; gating an extra cycle is
-// cheap, firing at the wrong wall-clock hour is not.
-func tzSafeToFire() bool {
-	target, err := os.Readlink("/etc/localtime")
-	if err != nil {
-		tzWarnOnce.Do(func() {
-			log.Printf("WARN: autounlock scheduler: /etc/localtime readlink (%v) — firing gated until timezone configured", err)
-		})
-		return false
+// Use as the SchedulerDeps.TZSafeToFire wiring at construction.
+func LoggedTZGate(probe func() bool) func() bool {
+	var once sync.Once
+	return func() bool {
+		ok := probe()
+		if !ok {
+			once.Do(func() {
+				log.Printf("WARN: autounlock scheduler: timezone unset (UTC default) — firing gated until timezone configured")
+			})
+		}
+		return ok
 	}
-	// Symlink targets observed in practice:
-	//   "../usr/share/zoneinfo/UTC"            (MicroOS default)
-	//   "/usr/share/zoneinfo/UTC"
-	//   "../usr/share/zoneinfo/America/New_York" (after timedatectl)
-	//   "UTC"                                    (rare, hand-edited)
-	if target == "UTC" || strings.HasSuffix(target, "/UTC") {
-		tzWarnOnce.Do(func() {
-			log.Printf("WARN: autounlock scheduler: /etc/localtime resolves to UTC — firing gated until timezone configured")
-		})
-		return false
-	}
-	return true
 }
+

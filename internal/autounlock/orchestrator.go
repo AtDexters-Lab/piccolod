@@ -54,6 +54,15 @@ type Deps struct {
 	// client non-nil). Ceremony / pickup gate on this.
 	IsIdentityReady func() bool
 
+	// WaitForIdentityReady blocks until IsIdentityReady() returns true,
+	// timeout elapses, or ctx is cancelled. Returns the final readiness.
+	// Production wiring at gin_server.go subscribes to TopicIdentityReady +
+	// TopicIdentityChanged so pickup wakes immediately on enrollment
+	// completion (vs the prior 1s-poll which added per-boot UX latency).
+	// Optional; when nil, pickup falls back to 1s polling on
+	// IsIdentityReady. Tests inject a fake.
+	WaitForIdentityReady func(ctx context.Context, timeout time.Duration) bool
+
 	// PublishAudit emits an audit event. Best-effort.
 	PublishAudit AuditEmitter
 
@@ -81,6 +90,13 @@ type Orchestrator struct {
 	// can show the transient "Auto-unlocking…" state. Set true at RunPickup
 	// entry, cleared via defer.
 	inFlight atomic.Bool
+
+	// lastTestAt timestamps the most recent RunTest invocation. Read under
+	// o.mu inside RunTest to enforce the plan-mandated ≥5s gap between
+	// successive Test calls per device. Closes the "admin script clicks
+	// Test in a loop" surface that bombards namek and starves the
+	// orchestrator mutex.
+	lastTestAt time.Time
 }
 
 // InFlight reports whether a pickup attempt is currently running. Read by
@@ -109,8 +125,17 @@ func New(deps Deps) (*Orchestrator, error) {
 // the blob to a specific device — closes cross-device blob replay.
 const aadSuffix = "auto_unlock_v1"
 
-func (o *Orchestrator) aad() []byte {
-	return []byte(o.deps.GetDeviceID() + "|" + aadSuffix)
+// ErrAADIncomplete signals an empty device.id; AAD would not be device-bound.
+// Production callers gate via IsIdentityReady so reaching this is defense in
+// depth against a future bypass.
+var ErrAADIncomplete = errors.New("autounlock: device.id empty — AAD would be constant")
+
+func (o *Orchestrator) aad() ([]byte, error) {
+	id := o.deps.GetDeviceID()
+	if id == "" {
+		return nil, ErrAADIncomplete
+	}
+	return []byte(id + "|" + aadSuffix), nil
 }
 
 // UpdateInput is the partial-update shape consumed by the HTTP PUT handler.

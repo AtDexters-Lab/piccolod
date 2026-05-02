@@ -141,7 +141,13 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 	}
 	defer cryptoutil.SecureZero(F)
 
-	unwrapErr := o.deps.Manager.UnwrapSDEKWithEscrow(blob, F, o.aad())
+	aad, aadErr := o.aad()
+	if aadErr != nil {
+		log.Printf("ERROR: autounlock: aad: %v", aadErr)
+		o.recordFailure(&state, AuditCycleFailedPickup, ReasonServiceNotReady)
+		return PickupOutcomeFailed
+	}
+	unwrapErr := o.deps.Manager.UnwrapSDEKWithEscrow(blob, F, aad)
 	if errors.Is(unwrapErr, crypt.ErrAutoUnlockAlreadyUnlocked) {
 		// Manual-unlock-first race: revoke server-side state and delete the
 		// blob. From the user's perspective this is a success — the device
@@ -197,12 +203,16 @@ func (o *Orchestrator) bestEffortRevoke(ctx context.Context, client NamekEscrowC
 	}
 }
 
-// waitForIdentity polls IsIdentityReady at pickupIdentityWaitInterval until
-// it returns true, the timeout elapses, or ctx is cancelled. Returns the
-// final readiness state — true on success, false on timeout/cancel.
+// waitForIdentity blocks until identity is ready, the timeout elapses, or
+// ctx is cancelled. When deps.WaitForIdentityReady is wired (production),
+// uses event-bus subscription for sub-1s wake on enrollment completion;
+// falls back to 1s polling when nil (tests, hand-wired callers).
 func (o *Orchestrator) waitForIdentity(ctx context.Context, timeout time.Duration) bool {
 	if o.deps.IsIdentityReady() {
 		return true
+	}
+	if o.deps.WaitForIdentityReady != nil {
+		return o.deps.WaitForIdentityReady(ctx, timeout)
 	}
 	deadline, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

@@ -1259,6 +1259,12 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	// identity service is wired so the deps closures can read its state.
 	// Posture defaults to off — bringing this up does NOT change behavior
 	// for devices that haven't opted in.
+	isIdentityReady := func() bool {
+		return identitySvc.IsEnrolled() &&
+			identitySvc.IsEnabled() &&
+			!identitySvc.IsSuspended() &&
+			identitySvc.NamekClient() != nil
+	}
 	autounlockOrch, err := autounlock.New(autounlock.Deps{
 		Manager: s.cryptoManager,
 		NamekClient: func() autounlock.NamekEscrowClient {
@@ -1268,12 +1274,38 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			}
 			return c
 		},
-		GetDeviceID: identitySvc.DeviceID,
-		IsIdentityReady: func() bool {
-			return identitySvc.IsEnrolled() &&
-				identitySvc.IsEnabled() &&
-				!identitySvc.IsSuspended() &&
-				identitySvc.NamekClient() != nil
+		GetDeviceID:     identitySvc.DeviceID,
+		IsIdentityReady: isIdentityReady,
+		// Event-driven wait: subscribes to identity.ready + identity.changed
+		// so pickup wakes immediately on enrollment completion instead of
+		// the 1s-polling fallback. Closes plan §"Post-boot pickup" step 3.
+		// Caller (Orchestrator.waitForIdentity) pre-checks IsIdentityReady
+		// before invoking, so the only fast-path needed here is the
+		// post-subscribe re-check that closes the subscribe-after-flip race.
+		WaitForIdentityReady: func(ctx context.Context, timeout time.Duration) bool {
+			readyCh, cancelReady := eventsBus.SubscribeWithCancel(events.TopicIdentityReady, 4)
+			defer cancelReady()
+			changedCh, cancelChanged := eventsBus.SubscribeWithCancel(events.TopicIdentityChanged, 4)
+			defer cancelChanged()
+			deadline, cancelDeadline := context.WithTimeout(ctx, timeout)
+			defer cancelDeadline()
+			if isIdentityReady() {
+				return true
+			}
+			for {
+				select {
+				case <-deadline.Done():
+					return isIdentityReady()
+				case <-readyCh:
+					if isIdentityReady() {
+						return true
+					}
+				case <-changedCh:
+					if isIdentityReady() {
+						return true
+					}
+				}
+			}
 		},
 		PublishAudit: s.publishBackgroundAuditEvent,
 	})
@@ -1291,7 +1323,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		s.autounlockScheduler = autounlock.NewScheduler(autounlock.SchedulerDeps{
 			UpdateManager: &osUpdateManagerAdapter{inner: func() osUpdateManager { return s.updateManager }},
 			PublishAudit:  s.publishBackgroundAuditEvent,
-			TZSafeToFire:  s.timezoneMgr.IsSet,
+			// LoggedTZGate adds a once-per-lifetime WARN so operators can see
+			// "gated waiting for timezone" without spelunking /etc/localtime.
+			TZSafeToFire: autounlock.LoggedTZGate(s.timezoneMgr.IsSet),
 		})
 	}
 
@@ -1845,7 +1879,13 @@ func (s *GinServer) setupGinRoutes() {
 	r.Use(s.corsMiddleware())
 	r.Use(s.httpsRedirectMiddleware())
 	r.Use(s.securityHeadersMiddleware())
-	r.Use(s.timezoneCaptureMiddleware())
+	// Note: timezoneCaptureMiddleware is intentionally NOT registered here.
+	// It runs only on the authed group (post-session) so pre-auth public
+	// surface (/system/boot, /crypto/status, /health/live, /oauth/*,
+	// /.well-known/acme-challenge/*, LAN-routed app traffic) cannot seed
+	// the device timezone via X-Browser-Timezone. A first-touch attacker
+	// on the same LAN would otherwise pick the device's wall-clock zone
+	// for the auto-reboot scheduler.
 
 	// Optional: OpenAPI request validation (enabled when validator is initialized)
 	if s.apiValidator == nil {
@@ -1990,6 +2030,10 @@ func (s *GinServer) setupGinRoutes() {
 		authed := v1.Group("/")
 		authed.Use(s.requireSession())
 		authed.Use(s.csrfMiddleware())
+		// One-shot X-Browser-Timezone capture runs ONLY on authenticated
+		// requests — closes the pre-auth attacker-seeds-TZ surface that a
+		// global r.Use(...) would expose.
+		authed.Use(s.timezoneCaptureMiddleware())
 
 		// Remote status and health detail — no pre-login consumers.
 		authed.GET("/remote/status", s.handleRemoteStatus)

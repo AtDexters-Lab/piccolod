@@ -69,7 +69,13 @@ func (o *Orchestrator) RunCeremony(ctx context.Context) error {
 		return err
 	}
 
-	blob, err := o.deps.Manager.WrapSDEKForEscrow(F, o.aad())
+	aad, err := o.aad()
+	if err != nil {
+		log.Printf("ERROR: autounlock: aad: %v", err)
+		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonDepositFailed)
+		return err
+	}
+	blob, err := o.deps.Manager.WrapSDEKForEscrow(F, aad)
 	if err != nil {
 		log.Printf("ERROR: autounlock: wrap SDEK: %v", err)
 		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonDepositFailed)

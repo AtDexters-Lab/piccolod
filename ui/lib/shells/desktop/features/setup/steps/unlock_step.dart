@@ -7,11 +7,19 @@ class UnlockStep extends StatefulWidget {
     required this.onUnlock,
     required this.onForgotPassword,
     this.error,
+    this.recentlyTriedAutoUnlock = false,
     super.key,
   });
   final Future<bool> Function(String) onUnlock;
   final VoidCallback onForgotPassword;
   final String? error;
+  // When true, an auto-unlock attempt just resolved without unlocking the
+  // device; the router transitioned us into this step. Show a neutral
+  // state-the-action prompt above the password field so the operator
+  // doesn't experience the spinner→prompt transition as a teleport. Per
+  // the no-failure-callout principle, the prompt does NOT narrate the
+  // failure — it just states what the user needs to do now.
+  final bool recentlyTriedAutoUnlock;
 
   @override
   State<UnlockStep> createState() => _UnlockStepState();
@@ -65,7 +73,15 @@ class _UnlockStepState extends State<UnlockStep> {
       padding: const EdgeInsets.fromLTRB(32, 0, 32, 32),
       child: Column(
         mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (widget.recentlyTriedAutoUnlock) ...[
+            const Text(
+              'Please enter your password to unlock.',
+              style: TextStyle(color: PiccoloTheme.inkMuted),
+            ),
+            const SizedBox(height: 16),
+          ],
           TextField(
             controller: _passController,
             obscureText: _obscureText,

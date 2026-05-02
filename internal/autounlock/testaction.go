@@ -35,6 +35,17 @@ const testWindowSeconds = 60
 // identity not ready). HTTP handler maps to 412 Precondition Failed.
 var ErrTestPreconditions = errors.New("autounlock: test preconditions not met")
 
+// ErrTestRateLimit is returned when RunTest is called within testRateLimit of
+// the last invocation. HTTP handler maps to 429 Too Many Requests with
+// Retry-After. Closes the "admin script clicks Test in a loop" surface that
+// would otherwise bombard namek and starve other orchestrator users on o.mu.
+var ErrTestRateLimit = errors.New("autounlock: test rate limited (≥5s between calls)")
+
+// testRateLimit is the minimum gap between successive RunTest invocations.
+// Plan §"Test action" step 3 mandates ≥5s. Tunable as a Deps field would be
+// over-engineering for a single-user appliance.
+const testRateLimit = 5 * time.Second
+
 // RunTest exercises the full namek round-trip without touching the on-disk
 // blob or the manager's SDEK. Generates a fresh random F, deposits, picks up,
 // verifies byte-equality, revokes. Validates that namek connectivity works
@@ -43,6 +54,14 @@ var ErrTestPreconditions = errors.New("autounlock: test preconditions not met")
 func (o *Orchestrator) RunTest(ctx context.Context) (TestResult, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
+	now := o.deps.Now()
+	if !o.lastTestAt.IsZero() && now.Sub(o.lastTestAt) < testRateLimit {
+		return TestResult{}, ErrTestRateLimit
+	}
+	// Charge cooldown before precondition checks — closes loop-clicking DoS
+	// on misconfigured devices.
+	o.lastTestAt = now
 
 	state, err := LoadState()
 	if err != nil && !errors.Is(err, ErrInvalidStateFile) {
