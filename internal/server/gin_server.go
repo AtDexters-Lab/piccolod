@@ -32,6 +32,7 @@ import (
 	"piccolod/internal/health"
 	hostnamepkg "piccolod/internal/hostname"
 	"piccolod/internal/identity"
+	"piccolod/internal/lifecycle"
 	"piccolod/internal/mdns"
 	"piccolod/internal/network"
 	"piccolod/internal/network/nmclient"
@@ -192,6 +193,11 @@ type GinServer struct {
 	installer         *onboarding.Installer
 	execRunner        runner.CommandRunner
 	provisioningState *provisioning.State
+
+	// Composite system-readiness state. Single source of truth for "is the
+	// post-unlock plane ready?" — closes the race window where SDEK was
+	// loaded but persistence was still loading. See internal/lifecycle.
+	lifecycle *lifecycle.Coordinator
 
 	// Persistent terminal sessions
 	terminalManager *terminal.Manager
@@ -816,6 +822,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		execRunner:        execRunner,
 		timezoneMgr:       timezoneMgr,
 		provisioningState: provisioning.New(onboardingMgr),
+		lifecycle:         lifecycle.New(initialLifecycleState(cmgr)),
 	}
 	s.opCtx, s.opCancel = context.WithCancel(context.Background())
 

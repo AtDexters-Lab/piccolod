@@ -1,12 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
-/// Transient state shown on the unlock screen while the auto-unlock
-/// pickup goroutine is in flight. Shown in place of the password prompt;
-/// when the goroutine completes, the parent re-routes via /system/boot
-/// (success → desktop; failure → password prompt with no failure callout).
-class AutoUnlockingStep extends StatelessWidget {
-  const AutoUnlockingStep({super.key});
+/// Transient state shown on the unlock screen while any post-decrypt
+/// chain is in flight — auto-unlock pickup, manual /crypto/unlock from
+/// another tab, or a recovery-key reset's transient unlock. Shown in
+/// place of the password prompt; when the chain completes, the parent
+/// re-routes via /system/boot (success → desktop; failure → password
+/// prompt with no failure callout).
+class UnlockingStep extends StatelessWidget {
+  const UnlockingStep({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -25,7 +27,7 @@ class AutoUnlockingStep extends StatelessWidget {
           ),
           SizedBox(height: 24),
           Text(
-            'Auto-unlocking…',
+            'Unlocking…',
             style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
           ),
           SizedBox(height: 8),

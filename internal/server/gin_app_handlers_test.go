@@ -27,8 +27,10 @@ import (
 	crypt "piccolod/internal/crypt"
 	"piccolod/internal/events"
 	"piccolod/internal/health"
+	"piccolod/internal/lifecycle"
 	"piccolod/internal/mdns"
 	"piccolod/internal/persistence"
+	"piccolod/internal/provisioning"
 	"piccolod/internal/remote"
 	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/runtime/commands"
@@ -1044,19 +1046,21 @@ x-piccolo:
 	catalogMgr := catalog.NewManager(catalogStub.URL, filepath.Join(tempDir, "catalog-cache"))
 
 	server := &GinServer{
-		appManager:     appMgr,
-		serviceManager: svcMgr,
-		mdnsManager:    mdns.NewManager(),
-		dispatcher:     dispatch,
-		remoteManager:  rm,
-		catalogManager: catalogMgr,
-		authManager:    authMgr,
-		sessions:       authpkg.NewSessionStore(),
-		cryptoManager:  cryptoMgr,
-		version:        "test-gin",
-		healthTracker:  health.NewTracker(),
-		tlsMux:         tlsMux,
-		remoteResolver: remoteResolver,
+		appManager:        appMgr,
+		serviceManager:    svcMgr,
+		mdnsManager:       mdns.NewManager(),
+		dispatcher:        dispatch,
+		remoteManager:     rm,
+		catalogManager:    catalogMgr,
+		authManager:       authMgr,
+		sessions:          authpkg.NewSessionStore(),
+		cryptoManager:     cryptoMgr,
+		version:           "test-gin",
+		healthTracker:     health.NewTracker(),
+		tlsMux:            tlsMux,
+		remoteResolver:    remoteResolver,
+		provisioningState: provisioning.New(nil),
+		lifecycle:         lifecycle.New(initialLifecycleState(cryptoMgr)),
 	}
 	server.events = eventsBus
 	server.healthTracker.Setf("app-manager", health.LevelOK, "test app manager ready")

@@ -193,10 +193,13 @@ func (s *GinServer) timezoneCaptureMiddleware() gin.HandlerFunc {
 	}
 }
 
-// requireUnlocked blocks state-changing operations when crypto is initialized and currently locked
+// requireUnlocked blocks state-changing operations when the system is not in
+// a Ready state. Composite readiness via lifecycle, not the narrow SDEK
+// check — this closes the window where the SDEK is loaded but persistence
+// is still loading and a request would observe ErrLocked from any DB query.
 func (s *GinServer) requireUnlocked() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if s != nil && s.cryptoManager != nil && s.cryptoManager.IsInitialized() && s.cryptoManager.IsLocked() {
+		if s == nil || s.lifecycle == nil || !s.lifecycle.IsReady() {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden"})
 			c.Abort()
 			return

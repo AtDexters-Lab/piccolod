@@ -36,12 +36,20 @@ func (s *GinServer) computeRecoveryKeyPending(ctx context.Context) bool {
 	if !s.cryptoManager.HasRecoveryKey() {
 		return true
 	}
-	if s.cryptoManager.IsLocked() {
+	// Composite readiness via lifecycle, not the narrow SDEK check. While
+	// the system isn't Ready, the staleness store may not be queryable —
+	// emitting "pending" would force the auth controller to call
+	// /recovery-key/generate on unlock, which rotates the key and
+	// destroys the operator's saved words on every routine reboot.
+	if s.lifecycle == nil || !s.lifecycle.IsReady() {
 		return false
 	}
 	st, err := s.readAuthStaleness(ctx)
 	switch {
 	case errors.Is(err, persistence.ErrLocked):
+		// Defensive: TOCTOU vs concurrent /crypto/lock between the lifecycle
+		// check above and the Staleness call. Same treatment — don't claim
+		// pending and risk rotation hazard.
 		return false
 	case err != nil, st.RecoveryAckAt.IsZero():
 		return true

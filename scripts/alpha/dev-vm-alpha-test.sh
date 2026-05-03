@@ -761,12 +761,16 @@ stage_auto_unlock() {
   echo -e "\n${CYAN}═══ Stage 11a: Auto-Unlock + Timezone Surface ═══${NC}"
   ensure_session
 
-  # 11a.1 — Public crypto/status shape: has enabled + in_flight, no failure leak.
+  # 11a.1 — Public crypto/status shape: has enabled + lifecycle token, no
+  # failure leak. The previous auto_unlock_in_flight field was retired in
+  # favor of the canonical lifecycle token (== "unlocking" while pickup is
+  # in flight); see internal/lifecycle.
   local cstat
   cstat=$(api "/api/v1/crypto/status")
   check "11a.1" "Public /crypto/status has auto_unlock_enabled" "$cstat" '"auto_unlock_enabled"'
-  check "11a.2" "Public /crypto/status has auto_unlock_in_flight" "$cstat" '"auto_unlock_in_flight"'
+  check "11a.2" "Public /crypto/status has lifecycle token" "$cstat" '"lifecycle"'
   check_not "11a.3" "Public /crypto/status omits auto_unlock_last_failure" "$cstat" '"auto_unlock_last_failure"'
+  check_not "11a.3b" "Public /crypto/status no longer emits retired auto_unlock_in_flight" "$cstat" '"auto_unlock_in_flight"'
 
   # 11a.4..6 — Authenticated GET /security/auto-unlock has full detail.
   local au

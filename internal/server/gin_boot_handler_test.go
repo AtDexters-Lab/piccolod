@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"piccolod/internal/events"
+	"piccolod/internal/lifecycle"
 	"piccolod/internal/persistence"
 )
 
@@ -120,8 +121,13 @@ func TestBoot_Locked(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	setupTestAdminSession(t, srv) // initializes crypto
 
-	// Lock crypto
+	// Lock crypto + lifecycle. Production code (handleCryptoLock) keeps
+	// these aligned; tests must do the same to mirror the post-lock state
+	// the boot handler is meant to route on.
 	srv.cryptoManager.Lock()
+	if err := srv.lifecycle.Lock(); err != nil {
+		t.Fatalf("lifecycle.Lock: %v", err)
+	}
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/system/boot", nil)
@@ -157,6 +163,9 @@ func TestBoot_Locked_DoesNotClaimRecoveryPending(t *testing.T) {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
 	srv.cryptoManager.Lock()
+	if err := srv.lifecycle.Lock(); err != nil {
+		t.Fatalf("lifecycle.Lock: %v", err)
+	}
 	srv.authRepo = &fakeAuthRepo{loadErr: persistence.ErrLocked}
 
 	w := httptest.NewRecorder()
@@ -682,6 +691,122 @@ func TestRecoveryKeyAck_DeniedDuringForcedPasskeyRegistration(t *testing.T) {
 	srv.router.ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 during MustRegisterPasskey, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestBoot_DuringUnlockChain_DoesNotRouteToSetup is the regression test for
+// the bug that motivated the lifecycle package. Pre-fix: a /system/boot poll
+// arriving in the multi-second window between cryptoManager.Unlock returning
+// (SDEK loaded → IsLocked() == false) and notifyPersistenceLockState
+// completing (persistence still locked → ErrLocked from any user query)
+// would see step 7b's isSetupComplete return (false, nil) and route an
+// already-provisioned device to the first-run setup wizard. Reproduced
+// in the field on a Raspberry Pi after a remote unlock.
+//
+// Post-fix: handleBoot routes on lifecycle.State() (StateUnlocking) instead
+// of cryptoManager.IsLocked() + isSetupComplete derivation. screen must be
+// "unlock" with lifecycle="unlocking", never "setup".
+func TestBoot_DuringUnlockChain_DoesNotRouteToSetup(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	setupTestAdminSession(t, srv) // initializes crypto + admin, lifecycle = Ready
+
+	// Simulate the race window: SDEK is loaded (cryptoManager not locked)
+	// but the unlock chain is still running (lifecycle = Unlocking). In
+	// production this state is held for the duration of completeUnlockChain;
+	// here we drive it directly to keep the test deterministic.
+	if err := srv.lifecycle.Lock(); err != nil {
+		t.Fatalf("lifecycle.Lock: %v", err)
+	}
+	if err := srv.lifecycle.BeginUnlock(); err != nil {
+		t.Fatalf("lifecycle.BeginUnlock: %v", err)
+	}
+	if got := srv.lifecycle.State(); got != lifecycle.StateUnlocking {
+		t.Fatalf("setup precondition: state = %s, want %s", got, lifecycle.StateUnlocking)
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/system/boot", nil)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["screen"] == "setup" {
+		t.Fatalf("REGRESSION: boot routed to setup during unlock chain — the precise bug the lifecycle package is built to prevent. body=%s", w.Body.String())
+	}
+	if resp["screen"] != "unlock" {
+		t.Fatalf("expected screen=unlock during Unlocking, got %v", resp["screen"])
+	}
+	if resp["lifecycle"] != "unlocking" {
+		t.Fatalf("expected lifecycle=unlocking, got %v", resp["lifecycle"])
+	}
+}
+
+// TestBoot_AutoUnlockInFlight_SurfacesUnlockingViaLifecycle covers the
+// wireToken bridge: when state is still Locked (BeginUnlock fires inside
+// completeUnlockChain, AFTER UnwrapSDEKWithEscrow) but autounlockOrch.InFlight()
+// is true (pickup mid-namek), the wire format must report lifecycle=unlocking
+// so the UI shows the spinner. Without this bridge the UI would show the
+// password prompt during the early-pickup window.
+func TestBoot_AutoUnlockInFlight_SurfacesUnlockingViaLifecycle(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	setupTestAdminSession(t, srv)
+	if err := srv.lifecycle.Lock(); err != nil {
+		t.Fatalf("lifecycle.Lock: %v", err)
+	}
+
+	// No autounlockOrch is wired into the test fixture, so we can't directly
+	// test the InFlight branch end-to-end here without injecting a stub.
+	// Instead exercise the wireLifecycleToken normalizer directly — its
+	// behavior is the integration-relevant property.
+	if got := wireLifecycleToken(lifecycle.StateLocked, true); got != "unlocking" {
+		t.Errorf("wireLifecycleToken(Locked, autoInFlight=true) = %q, want %q", got, "unlocking")
+	}
+	if got := wireLifecycleToken(lifecycle.StateLocked, false); got != "locked" {
+		t.Errorf("wireLifecycleToken(Locked, autoInFlight=false) = %q, want %q", got, "locked")
+	}
+	if got := wireLifecycleToken(lifecycle.StateUnlocking, false); got != "unlocking" {
+		t.Errorf("wireLifecycleToken(Unlocking, autoInFlight=false) = %q, want %q", got, "unlocking")
+	}
+	// Failed normalizes to "locked" per the no-failure-callout UX feedback.
+	if got := wireLifecycleToken(lifecycle.StateFailed, false); got != "locked" {
+		t.Errorf("wireLifecycleToken(Failed, autoInFlight=false) = %q, want %q", got, "locked")
+	}
+}
+
+// TestBoot_FailedAndUnprovisioned_RoutesToSetup covers a partial-setup
+// failure scenario: setup ran step 4 (BeginUnlock) but failed before
+// MarkProvisioned. lifecycle=Failed; provisioning marker absent. The boot
+// handler must route to the setup wizard, not the unlock prompt — the user
+// has no unlock password to enter.
+func TestBoot_FailedAndUnprovisioned_RoutesToSetup(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	// Explicitly DO NOT call setupTestAdminSession. Drive lifecycle into
+	// Failed via the legal path (Locked → Unlocking → Failed) without ever
+	// touching the provisioning marker.
+	if err := srv.lifecycle.BeginUnlock(); err != nil {
+		t.Fatalf("BeginUnlock: %v", err)
+	}
+	if err := srv.lifecycle.MarkFailed(errors.New("simulated mid-setup failure")); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+	if got := srv.lifecycle.State(); got != lifecycle.StateFailed {
+		t.Fatalf("precondition: state = %s, want %s", got, lifecycle.StateFailed)
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/system/boot", nil)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["screen"] != "setup" {
+		t.Fatalf("Failed + !provisioned must route to setup (user has no unlock password); got screen=%v", resp["screen"])
 	}
 }
 

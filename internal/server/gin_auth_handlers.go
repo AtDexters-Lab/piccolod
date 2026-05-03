@@ -159,18 +159,19 @@ func (s *GinServer) handleAuthSession(c *gin.Context) {
 		passwordStale = st.PasswordStale
 		recoveryStale = st.RecoveryStale
 	}
+	// volumes_locked semantically means "is the data plane unavailable for
+	// queries?" — composite readiness, not the narrow "is SDEK loaded" check.
+	// Sourced from lifecycle so a /auth/session call mid-unlock-chain can't
+	// claim "unlocked" while persistence is still loading.
+	volumesLocked := s.lifecycle == nil || !s.lifecycle.IsReady()
 	if ok {
 		if sess, ok := s.sessions.Get(id); ok {
-			locked := false
-			if s.cryptoManager != nil && s.cryptoManager.IsInitialized() {
-				locked = s.cryptoManager.IsLocked()
-			}
 			presence := s.computePasskeyPresence(c, sess.UserID, s.getRPID(c))
 			c.JSON(http.StatusOK, gin.H{
 				"authenticated":         true,
 				"user":                  sess.User,
 				"expires_at":            time.Unix(sess.ExpiresAt, 0).UTC().Format(time.RFC3339),
-				"volumes_locked":        locked,
+				"volumes_locked":        volumesLocked,
 				"password_stale":        passwordStale,
 				"recovery_stale":        recoveryStale,
 				"has_passkey":           presence.HasPasskey,
@@ -180,15 +181,11 @@ func (s *GinServer) handleAuthSession(c *gin.Context) {
 			return
 		}
 	}
-	locked := false
-	if s.cryptoManager != nil && s.cryptoManager.IsInitialized() {
-		locked = s.cryptoManager.IsLocked()
-	}
 	c.JSON(http.StatusOK, gin.H{
 		"authenticated":  false,
 		"user":           "",
 		"expires_at":     time.Now().UTC().Format(time.RFC3339),
-		"volumes_locked": locked,
+		"volumes_locked": volumesLocked,
 		"password_stale": passwordStale,
 		"recovery_stale": recoveryStale,
 	})

@@ -14,8 +14,10 @@ import (
 
 	"piccolod/internal/auth"
 	"piccolod/internal/autounlock"
+	"piccolod/internal/crypt"
 	"piccolod/internal/cryptoutil"
 	"piccolod/internal/health"
+	"piccolod/internal/lifecycle"
 	"piccolod/internal/persistence"
 )
 
@@ -78,7 +80,63 @@ type unlockChainResult struct {
 // Returns (result, err) where err is fatal (caller should respond 500) and
 // result.luksErr is a non-fatal warning surfaced as a `warning` field in
 // the success response.
+//
+// Lifecycle ownership: this helper claims the unlock-chain phase via
+// lifecycle.BeginUnlock at entry and resolves it via MarkReady (success,
+// including LUKS-warning) or MarkFailed (persistence-fatal) before
+// returning. Concurrent unlock paths (manual + auto-unlock pickup racing
+// at boot) lose the BeginUnlock claim race; the loser runs the chain
+// idempotently but does NOT publish a terminal transition (the winner
+// owns it). LUKS data-volume warnings are reported as Ready, mirroring
+// the existing semantic that the control plane is usable even if the
+// data plane is degraded.
 func (s *GinServer) completeUnlockChain(ctx context.Context) (unlockChainResult, error) {
+	owned := false
+	if s.lifecycle != nil {
+		if err := s.lifecycle.BeginUnlock(); err == nil {
+			owned = true
+		} else {
+			log.Printf("INFO: lifecycle: BeginUnlock skipped (%v); chain runs idempotently", err)
+		}
+	}
+
+	result, fatalErr := s.runUnlockChain(ctx)
+
+	if owned && s.lifecycle != nil {
+		if fatalErr != nil {
+			_ = s.lifecycle.MarkFailed(fatalErr)
+		} else {
+			_ = s.lifecycle.MarkReady()
+		}
+		return result, fatalErr
+	}
+
+	// Loser-of-race override. We did not own the unlock claim; another path
+	// (manual + auto racing at boot) is or was driving the chain to a
+	// terminal state. If the system is genuinely Ready by the time our
+	// idempotent body returns, the winner already established success —
+	// suppress any transient error from our pass and report a synthesized
+	// success. Without this, a transient persistence-notify failure on the
+	// loser surfaces as a 500 to the user even though the system is up.
+	if s.lifecycle != nil && s.lifecycle.IsReady() {
+		setupComplete := result.setupComplete
+		if fatalErr != nil {
+			log.Printf("INFO: lifecycle: idempotent unlock body errored after winner reached Ready; reporting success (suppressed err=%v)", fatalErr)
+			// Loser's runUnlockChain returned the zero value on error;
+			// re-derive setupComplete from a fresh query (persistence is
+			// loaded since IsReady() returned true).
+			setupComplete, _ = s.isSetupComplete(ctx)
+		}
+		return unlockChainResult{setupComplete: setupComplete, luksErr: result.luksErr}, nil
+	}
+	return result, fatalErr
+}
+
+// runUnlockChain is the lifecycle-unaware body of the post-decrypt chain.
+// Split from completeUnlockChain so the lifecycle BeginUnlock/MarkReady
+// pairing wraps a single linear body without intermediate early-returns
+// leaking the Unlocking state.
+func (s *GinServer) runUnlockChain(ctx context.Context) (unlockChainResult, error) {
 	var luksErr error
 
 	log.Printf("INFO: releasing KDF memory before storage unlock")
@@ -118,6 +176,18 @@ func (s *GinServer) completeUnlockChain(ctx context.Context) (unlockChainResult,
 		log.Printf("WARN: reconcile provisioning: %v", rerr)
 	}
 	return unlockChainResult{setupComplete: setupComplete, luksErr: luksErr}, nil
+}
+
+// initialLifecycleState derives the lifecycle bootstrap state from durable
+// signals available at process start. cryptoManager.IsInitialized() is the
+// only signal needed: a fresh device has no keyset (NotInitialized); an
+// already-set-up device starts Locked and transitions via BeginUnlock when
+// the unlock pathway (manual or auto-unlock pickup) begins.
+func initialLifecycleState(cmgr *crypt.Manager) lifecycle.State {
+	if cmgr == nil || !cmgr.IsInitialized() {
+		return lifecycle.StateNotInitialized
+	}
+	return lifecycle.StateLocked
 }
 
 // isSetupComplete checks whether first-run provisioning has finished by
@@ -169,23 +239,39 @@ func (s *GinServer) isSetupInProgress() bool {
 // handleCryptoStatus: GET /api/v1/crypto/status
 func (s *GinServer) handleCryptoStatus(c *gin.Context) {
 	init := s.cryptoManager != nil && s.cryptoManager.IsInitialized()
+	// `locked` is composite readiness when the device has a keyset —
+	// sourced from lifecycle so callers don't see an inconsistent
+	// "unlocked" answer mid-chain while persistence is still loading.
+	// On a fresh (uninitialized) device, locked=false preserves the
+	// pre-existing wire contract where pre-setup means "no keyset, no
+	// lock to speak of" (the smoke test in scripts/production/dev-vm-test.sh
+	// asserts this shape).
 	locked := false
 	if init {
-		locked = s.cryptoManager.IsLocked()
+		locked = s.lifecycle == nil || !s.lifecycle.IsReady()
 	}
-	resp := gin.H{"initialized": init, "locked": locked, "setup_in_progress": s.isSetupInProgress()}
+	resp := gin.H{
+		"initialized":       init,
+		"locked":            locked,
+		"setup_in_progress": s.isSetupInProgress(),
+	}
+	// Lifecycle wire token — same view-side normalization as /system/boot
+	// (Failed→"locked", autoInFlight bridge → "unlocking"). Without the
+	// bridge, /crypto/status loses the in-flight progress signal that the
+	// retired auto_unlock_in_flight field carried during the early-pickup
+	// window where coordinator state is still Locked.
+	autoInFlight := s.autounlockOrch != nil && s.autounlockOrch.InFlight()
+	resp["lifecycle"] = wireLifecycleToken(s.lifecycle.State(), autoInFlight)
 
-	// Auto-unlock surface — public, pre-auth. Reports enabled state and the
-	// transient in-flight marker so the locked-screen UI can show the
-	// "Auto-unlocking…" indicator without polling /security/auto-unlock
-	// (which is session-gated and thus unreachable pre-auth). Failure
-	// detail (reason + timestamp) lives behind the gate; emitting it here
-	// would leak operator-visible state.
+	// Auto-unlock surface — public, pre-auth. Reports enabled state so
+	// pre-auth UI can decide whether the auto-unlock card should render
+	// the toggle as on. The previous `auto_unlock_in_flight` field is
+	// retired in favor of the canonical `lifecycle` token (==
+	// "unlocking" while pickup is in flight). Failure detail (reason +
+	// timestamp) lives behind the session gate; emitting it here would
+	// leak operator-visible state.
 	if state, err := autounlock.LoadState(); err == nil {
 		resp["auto_unlock_enabled"] = state.Enabled
-	}
-	if s.autounlockOrch != nil {
-		resp["auto_unlock_in_flight"] = s.autounlockOrch.InFlight()
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -277,6 +363,31 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		}
 	}()
 
+	// Lifecycle: claim the unlock-chain phase now that the SDEK is loaded.
+	// Resolved by the deferred clause based on `ready` — the 409
+	// already-complete short-circuit also counts as Ready (the system is in
+	// fact up; we just rejected a duplicate setup attempt). All other early
+	// returns leave ready=false and resolve as Failed.
+	lifecycleOwned := false
+	ready := false
+	if s.lifecycle != nil {
+		if err := s.lifecycle.BeginUnlock(); err == nil {
+			lifecycleOwned = true
+		} else {
+			log.Printf("INFO: lifecycle: BeginUnlock skipped during setup (%v)", err)
+		}
+	}
+	defer func() {
+		if !lifecycleOwned || s.lifecycle == nil {
+			return
+		}
+		if ready {
+			_ = s.lifecycle.MarkReady()
+		} else {
+			_ = s.lifecycle.MarkFailed(errors.New("setup did not complete"))
+		}
+	}()
+
 	// Release KDF memory before LUKS initialization — the Argon2id key
 	// derivation above may have allocated hundreds of MiBs that Go's GC
 	// hasn't returned to the OS yet. cryptsetup spawns its own Argon2id,
@@ -306,6 +417,10 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "setup state check failed"})
 		return
 	} else if complete {
+		// 409: the device is fully provisioned. The post-decrypt chain ran
+		// successfully above (steps 4 + 5), so lifecycle should resolve to
+		// Ready — nothing failed; we just rejected a duplicate setup.
+		ready = true
 		c.JSON(http.StatusConflict, gin.H{"error": "setup already complete", "code": errorCodeSetupComplete})
 		return
 	}
@@ -430,6 +545,13 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		s.identityService.NotifySetupComplete()
 	}
 
+	// Lifecycle Ready: admin user, persistence, and control plane are up.
+	// Set BEFORE the luksErr 500 fork so a degraded data plane still resolves
+	// to Ready — subsequent boot polls correctly route to desktop, and the
+	// LUKS error surfaces via health tracker rather than as a persistent
+	// "system is failed" lifecycle state.
+	ready = true
+
 	// Fail after session creation so the user has portal access for recovery.
 	if luksErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -542,6 +664,17 @@ func (s *GinServer) handleCryptoResetPassword(c *gin.Context) {
 	s.resetResetFailures()
 
 	if wasLocked {
+		// Reset-password operates BELOW the lifecycle layer. The transient
+		// unlock-rewrap-relock dance is an internal key rotation, not a
+		// user-facing unlock attempt — externally, the device must remain
+		// "locked" from start to end (the user is on the recovery-key
+		// modal, not transitioning to the desktop). The lifecycle stays
+		// in StateLocked throughout; composite-readiness consumers
+		// (requireUnlocked middleware, etc.) correctly continue to block
+		// state-changing operations because IsReady() stays false.
+		//
+		// Narrow-semantics consumers (cryptoManager.IsLocked) DO observe
+		// the SDEK toggle — that's the truth they're asking for.
 		if err := s.notifyPersistenceLockState(ctx, false); err != nil {
 			log.Printf("WARN: reset-password unlock notify failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to unlock persistence"})
@@ -626,12 +759,34 @@ func (s *GinServer) handleCryptoLock(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "not initialized"})
 		return
 	}
+	// Reject lock-during-unlock to prevent the in-flight chain's later
+	// MarkReady from leaving lifecycle == Ready while crypto is locked.
+	// Coordinator.Lock() rejects the Unlocking → Locked transition by
+	// design (the chain must reach a terminal state first); we surface
+	// that as a retriable 409 rather than mutate crypto and leak an
+	// inconsistent state.
+	if s.lifecycle != nil && s.lifecycle.State() == lifecycle.StateUnlocking {
+		c.JSON(http.StatusConflict, gin.H{"error": "unlock chain in flight; retry after it completes"})
+		return
+	}
 	ctx, cancel := s.opContext(c, 2*time.Minute)
 	defer cancel()
 	// Lock LUKS data volume before crypto lock (best-effort).
 	if s.storageMgr != nil {
 		if err := s.storageMgr.LockDataVolume(ctx); err != nil {
 			log.Printf("WARN: lock data volume: %v", err)
+		}
+	}
+	// Lifecycle ordering convention: when moving AWAY from Ready, the
+	// lifecycle transition fires BEFORE the underlying-layer mutation,
+	// not after. Briefly claiming "not ready" while the SDEK is still
+	// loaded is safe (more conservative than reality); claiming "ready"
+	// while the SDEK is gone is not. This also closes the
+	// notifyPersistence-fails window: even if the persistence notify
+	// hangs or errors, composite consumers already see Locked.
+	if s.lifecycle != nil {
+		if err := s.lifecycle.Lock(); err != nil {
+			log.Printf("WARN: lifecycle: Lock from %s rejected: %v", s.lifecycle.State(), err)
 		}
 	}
 	s.cryptoManager.Lock()

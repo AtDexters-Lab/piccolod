@@ -10,7 +10,7 @@ import 'package:piccolo_os/shells/desktop/features/setup/controllers/onboarding_
 import 'package:piccolo_os/shells/desktop/features/setup/install_disk_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/onboarding_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/setup_utils.dart';
-import 'package:piccolo_os/shells/desktop/features/setup/steps/auto_unlocking_step.dart';
+import 'package:piccolo_os/shells/desktop/features/setup/steps/unlocking_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/credentials_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/error_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/finishing_step.dart';
@@ -65,12 +65,12 @@ class _SetupRouterState extends State<SetupRouter> {
   String? _systemError;
   bool _showFinishing = false;
   SetupPhase? _finishingPhase;
-  bool _showAutoUnlocking = false;
+  bool _showUnlocking = false;
   Timer? _autoUnlockingPoll;
   // Sticky for one route after the in-flight spinner clears. Threaded into
   // UnlockStep so it shows a neutral state-the-action prompt instead of
   // landing the operator on a bare password field with no bridging signal.
-  bool _recentlyTriedAutoUnlock = false;
+  bool _recentlyTriedUnlock = false;
 
   // Boot data for install_complete.
   bool _bootOrderConfigured = false;
@@ -141,7 +141,7 @@ class _SetupRouterState extends State<SetupRouter> {
     // than 'unlock' (login, desktop, etc.), clear it so a later re-lock
     // doesn't inherit the signal.
     if (screen != 'unlock') {
-      _recentlyTriedAutoUnlock = false;
+      _recentlyTriedUnlock = false;
     }
 
     // Clear setup state on non-setup screens (factory reset, setup by other user).
@@ -161,10 +161,10 @@ class _SetupRouterState extends State<SetupRouter> {
     // If we were just showing the auto-unlocking spinner and are now
     // routing somewhere else (typically UnlockStep on failure), mark the
     // sticky flag so the next render carries the bridging signal.
-    if (_showAutoUnlocking) {
-      _recentlyTriedAutoUnlock = true;
+    if (_showUnlocking) {
+      _recentlyTriedUnlock = true;
     }
-    _showAutoUnlocking = false;
+    _showUnlocking = false;
     _autoUnlockingPoll?.cancel();
     _autoUnlockingPoll = null;
 
@@ -196,13 +196,14 @@ class _SetupRouterState extends State<SetupRouter> {
         if (boot['setup_in_progress'] == true) {
           _firstSetupDetected = true;
           _startSetupInProgressPolling();
-        } else if (boot['auto_unlock_in_flight'] == true) {
-          // Pickup goroutine is mid-flight; show the spinner instead of
-          // the password prompt and poll boot until it clears. On
-          // success the device transitions away from screen='unlock' so
-          // the next _route picks up the right destination; on failure
-          // in_flight goes false → password prompt with no callout.
-          _startAutoUnlockingPoll();
+        } else if (boot['lifecycle'] == 'unlocking') {
+          // The post-decrypt chain is in flight (manual unlock OR auto-
+          // unlock pickup). Show the spinner instead of the password
+          // prompt and poll boot until the lifecycle resolves. On success
+          // the device transitions to screen=login/desktop so the next
+          // _route picks up the right destination; on failure lifecycle
+          // returns to "locked" → password prompt with no callout.
+          _startUnlockingPoll();
         } else {
           if (boot['recovery_key_pending'] == true) _firstSetupDetected = true;
           _createAuthController(
@@ -352,8 +353,8 @@ class _SetupRouterState extends State<SetupRouter> {
     unawaited(_pollSetupInProgress());
   }
 
-  void _startAutoUnlockingPoll() {
-    _showAutoUnlocking = true;
+  void _startUnlockingPoll() {
+    _showUnlocking = true;
     _autoUnlockingPoll?.cancel();
     _autoUnlockingPoll = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
@@ -618,8 +619,8 @@ class _SetupRouterState extends State<SetupRouter> {
         } else if (_showFinishing) {
           content = FinishingStep(phase: _finishingPhase);
           title = 'Setting up...';
-        } else if (_showAutoUnlocking) {
-          content = const AutoUnlockingStep();
+        } else if (_showUnlocking) {
+          content = const UnlockingStep();
           title = 'Welcome back';
         } else if (_pendingRecoveryMaterial != null) {
           content = RecoveryKeyStep(
@@ -811,7 +812,7 @@ class _SetupRouterState extends State<SetupRouter> {
               onUnlock: ctrl.unlock,
               onForgotPassword: ctrl.startRecovery,
               error: ctrl.error,
-              recentlyTriedAutoUnlock: _recentlyTriedAutoUnlock,
+              recentlyTriedUnlock: _recentlyTriedUnlock,
             );
             title = 'Unlock Device';
             showOtherDevices = true;
