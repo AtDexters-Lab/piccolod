@@ -412,8 +412,8 @@ func TestCryptoResetPasswordFlow(t *testing.T) {
 		t.Fatalf("reset password: status=%d body=%s", w.Code, w.Body.String())
 	}
 
-	if !srv.cryptoManager.IsLocked() {
-		t.Fatalf("expected crypto to relock after reset")
+	if srv.cryptoManager.SDEKLoaded() {
+		t.Fatalf("expected crypto to relock after reset (SDEK should be cleared)")
 	}
 	if err := srv.cryptoManager.Unlock("OrigPass123!"); err == nil {
 		t.Fatalf("expected old password to fail after reset")
@@ -549,8 +549,8 @@ func TestAuthLogin_ReturnsLockedWhenStorageLocked(t *testing.T) {
 	if !storage.isLocked() {
 		t.Fatalf("expected control store to remain locked")
 	}
-	if !cryptoMgr.IsLocked() {
-		t.Fatalf("expected crypto manager to remain locked")
+	if cryptoMgr.SDEKLoaded() {
+		t.Fatalf("expected crypto manager to remain locked (SDEK absent)")
 	}
 	for _, c := range w.Result().Cookies() {
 		if c.Name == sessionCookieName && c.Value != "" {

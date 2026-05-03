@@ -14,7 +14,7 @@ import (
 // Defined as an interface here so the orchestrator can be unit-tested with
 // a fake without pulling the full crypt package into tests.
 type ManagerOps interface {
-	IsLocked() bool
+	SDEKLoaded() bool
 	WrapSDEKForEscrow(F []byte, aad []byte) ([]byte, error)
 	UnwrapSDEKWithEscrow(blob []byte, F []byte, aad []byte) error
 }

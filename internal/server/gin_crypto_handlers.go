@@ -124,8 +124,16 @@ func (s *GinServer) completeUnlockChain(ctx context.Context) (unlockChainResult,
 			log.Printf("INFO: lifecycle: idempotent unlock body errored after winner reached Ready; reporting success (suppressed err=%v)", fatalErr)
 			// Loser's runUnlockChain returned the zero value on error;
 			// re-derive setupComplete from a fresh query (persistence is
-			// loaded since IsReady() returned true).
-			setupComplete, _ = s.isSetupComplete(ctx)
+			// loaded since IsReady() returned true). Fail closed on any
+			// query error (including TOCTOU ErrLocked from a concurrent
+			// /crypto/lock): the winner reached Ready, so the system IS
+			// set up — assume so to avoid misrouting to setup.
+			complete, err := s.isSetupComplete(ctx)
+			if err != nil {
+				setupComplete = true
+			} else {
+				setupComplete = complete
+			}
 		}
 		return unlockChainResult{setupComplete: setupComplete, luksErr: result.luksErr}, nil
 	}
@@ -165,8 +173,20 @@ func (s *GinServer) runUnlockChain(ctx context.Context) (unlockChainResult, erro
 
 	setupComplete, err := s.isSetupComplete(ctx)
 	if err != nil {
+		// ErrLocked here means persistence claimed unlocked
+		// (notifyPersistenceLockState returned nil above) but the user
+		// repo immediately reports locked. The two layers are out of
+		// sync — a real bug, not a transient. Escalate to the caller
+		// (HTTP 500) so the user retries; treating it as "fail closed
+		// to complete" would silently route to login on a system whose
+		// data plane isn't actually queryable.
+		if errors.Is(err, persistence.ErrLocked) {
+			log.Printf("ERROR: persistence inconsistency — notify said unlocked but userManager reports ErrLocked: %v", err)
+			return unlockChainResult{}, err
+		}
 		log.Printf("WARN: setup-complete check failed, assuming complete: %v", err)
-		// Fail closed: assume provisioned, route to login.
+		// Fail closed for genuine transient errors: assume provisioned,
+		// route to login. The user can retry if needed.
 		return unlockChainResult{setupComplete: true, luksErr: luksErr}, nil
 	}
 	// Reconcile the durable provisioning marker from the authoritative
@@ -192,27 +212,42 @@ func initialLifecycleState(cmgr *crypt.Manager) lifecycle.State {
 
 // isSetupComplete checks whether first-run provisioning has finished by
 // counting users (primary) or checking auth initialization (fallback).
-// Returns (false, nil) when the store is locked (ErrLocked).
-// Returns (false, err) on transient errors — callers should fail closed.
+//
+// Three-way result encoded in (bool, error):
+//   - (true, nil)             — provisioning complete (≥1 user OR auth
+//                                manager reports initialized)
+//   - (false, nil)            — store readable AND no users / auth not
+//                                initialized (genuinely incomplete)
+//   - (false, persistence.ErrLocked) — control store is locked; the
+//                                question cannot be answered authoritatively
+//                                right now. Callers MUST distinguish this
+//                                from genuine incompleteness via
+//                                errors.Is(err, persistence.ErrLocked).
+//   - (false, err)            — transient error; callers should fail
+//                                toward whichever direction is safer for
+//                                their gate.
+//
+// The ErrLocked propagation is what closes the original race-window bug:
+// previously this function swallowed ErrLocked into (false, nil), which
+// any gate of shape "if !setupComplete → setup" would misclassify as
+// "device not provisioned" during the multi-second window between SDEK
+// load and persistence load. Callers that need a binary answer in the
+// presence of ErrLocked should consult provisioningState.IsProvisioned()
+// (durable, pre-unlock-readable) as the primary signal.
 func (s *GinServer) isSetupComplete(ctx context.Context) (bool, error) {
 	if s.userManager != nil {
 		count, err := s.userManager.Count(ctx)
-		if err == nil && count > 0 {
-			return true, nil
+		if err == nil {
+			return count > 0, nil
 		}
-		if err != nil && !errors.Is(err, persistence.ErrLocked) {
-			return false, err
-		}
-		return false, nil
+		return false, err
 	}
 	if s.authManager != nil {
 		initialized, err := s.authManager.IsInitialized(ctx)
-		if err == nil && initialized {
-			return true, nil
+		if err == nil {
+			return initialized, nil
 		}
-		if err != nil && !errors.Is(err, persistence.ErrLocked) {
-			return false, err
-		}
+		return false, err
 	}
 	return false, nil
 }
@@ -333,7 +368,11 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 	// 4. Unlock crypto — skip if already unlocked.
 	// Unlock is idempotent when already unlocked (re-derives SDEK),
 	// and leaves state unchanged on failure — no Lock() side effect.
-	if s.cryptoManager.IsLocked() {
+	// Narrow SDEK-presence check here (not lifecycle.IsReady) — we want
+	// "is the SDEK currently in memory?", which is exactly what the
+	// crypto layer answers; lifecycle composite readiness would also
+	// trigger Unlock during the post-decrypt chain, which is wrong.
+	if !s.cryptoManager.SDEKLoaded() {
 		if err := s.cryptoManager.Unlock(body.Password); err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "wrong password"})
 			return
@@ -649,7 +688,11 @@ func (s *GinServer) handleCryptoResetPassword(c *gin.Context) {
 	ctx, cancel := s.opContext(c, 2*time.Minute)
 	defer cancel()
 	words := stripNumberedPrefixes(strings.Fields(recoveryKey))
-	wasLocked := s.cryptoManager.IsLocked()
+	// Narrow SDEK-presence check: the rewrap flow needs to know whether
+	// the SDEK was loaded at entry so it can re-lock at the end if it
+	// wasn't. Composite-readiness (lifecycle) would conflate the two
+	// directions of the recovery flow.
+	wasLocked := !s.cryptoManager.SDEKLoaded()
 	needRelock := wasLocked
 
 	if err := s.cryptoManager.UnlockWithRecoveryKey(words); err != nil {
@@ -673,7 +716,7 @@ func (s *GinServer) handleCryptoResetPassword(c *gin.Context) {
 		// (requireUnlocked middleware, etc.) correctly continue to block
 		// state-changing operations because IsReady() stays false.
 		//
-		// Narrow-semantics consumers (cryptoManager.IsLocked) DO observe
+		// Narrow-semantics consumers (cryptoManager.SDEKLoaded) DO observe
 		// the SDEK toggle — that's the truth they're asking for.
 		if err := s.notifyPersistenceLockState(ctx, false); err != nil {
 			log.Printf("WARN: reset-password unlock notify failed: %v", err)
@@ -870,7 +913,11 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 	// write lock — pairing with words from the same call. Computing the id
 	// here via a separate RecoveryKeyID() read would reintroduce the
 	// concurrent-rotation race the binding is designed to close.
-	if !s.cryptoManager.IsLocked() {
+	// Narrow SDEK check: routes between the unlocked-path generator (uses
+	// the in-memory SDEK to wrap the recovery key) and the password-path
+	// generator. Composite readiness is the wrong question here — what
+	// matters is whether the SDEK is currently available in this process.
+	if s.cryptoManager.SDEKLoaded() {
 		words, keyID, err = s.cryptoManager.GenerateRecoveryKey(rotating)
 	} else if strings.TrimSpace(body.Password) != "" {
 		words, keyID, err = s.cryptoManager.GenerateRecoveryKeyWithPassword(body.Password, rotating)
@@ -889,7 +936,7 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 	// until the next unlocked recovery-key rotation.
 	ctx, cancel := s.opContext(c, 2*time.Minute)
 	defer cancel()
-	if !s.cryptoManager.IsLocked() {
+	if s.cryptoManager.SDEKLoaded() {
 		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
 			mnemonic := strings.Join(words, " ")
 			mnemonicBytes := []byte(mnemonic)

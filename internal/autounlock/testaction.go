@@ -70,7 +70,7 @@ func (o *Orchestrator) RunTest(ctx context.Context) (TestResult, error) {
 	if !state.Enabled {
 		return TestResult{}, ErrTestPreconditions
 	}
-	if o.deps.Manager.IsLocked() {
+	if !o.deps.Manager.SDEKLoaded() {
 		return TestResult{}, ErrTestPreconditions
 	}
 	if !o.deps.IsIdentityReady() {

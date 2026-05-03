@@ -697,15 +697,15 @@ func TestRecoveryKeyAck_DeniedDuringForcedPasskeyRegistration(t *testing.T) {
 // TestBoot_DuringUnlockChain_DoesNotRouteToSetup is the regression test for
 // the bug that motivated the lifecycle package. Pre-fix: a /system/boot poll
 // arriving in the multi-second window between cryptoManager.Unlock returning
-// (SDEK loaded → IsLocked() == false) and notifyPersistenceLockState
+// (SDEK loaded → SDEKLoaded()==true) and notifyPersistenceLockState
 // completing (persistence still locked → ErrLocked from any user query)
 // would see step 7b's isSetupComplete return (false, nil) and route an
 // already-provisioned device to the first-run setup wizard. Reproduced
 // in the field on a Raspberry Pi after a remote unlock.
 //
 // Post-fix: handleBoot routes on lifecycle.State() (StateUnlocking) instead
-// of cryptoManager.IsLocked() + isSetupComplete derivation. screen must be
-// "unlock" with lifecycle="unlocking", never "setup".
+// of cryptoManager.SDEKLoaded() + isSetupComplete derivation. screen must
+// be "unlock" with lifecycle="unlocking", never "setup".
 func TestBoot_DuringUnlockChain_DoesNotRouteToSetup(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	setupTestAdminSession(t, srv) // initializes crypto + admin, lifecycle = Ready
@@ -811,17 +811,18 @@ func TestBoot_FailedAndUnprovisioned_RoutesToSetup(t *testing.T) {
 }
 
 // TestBoot_RecoveryPendingNotPendingOnErrLockedRace guards against a TOCTOU
-// where /crypto/lock fires between the IsLocked() check and Staleness() call.
-// The staleness read returns ErrLocked; the gate must treat that identically
-// to IsLocked()=true (file-presence only) rather than fail-closing to
-// pending=true, which would re-introduce the B1 rotation hazard via the race.
+// where /crypto/lock fires between the lifecycle.IsReady() check and the
+// Staleness() call. The staleness read returns ErrLocked; the gate must
+// treat that identically to !IsReady (file-presence only) rather than
+// fail-closing to pending=true, which would re-introduce the B1 rotation
+// hazard via the race.
 func TestBoot_RecoveryPendingNotPendingOnErrLockedRace(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
 	sessionCookie, _ := setupTestAdminSession(t, srv)
 	if _, _, err := srv.cryptoManager.GenerateRecoveryKey(false); err != nil {
 		t.Fatalf("GenerateRecoveryKey: %v", err)
 	}
-	// Crypto stays unlocked at the IsLocked() check, but the staleness read
+	// lifecycle stays Ready, but the staleness read
 	// errors with ErrLocked — simulating a concurrent /crypto/lock that
 	// landed between the two probes.
 	srv.authRepo = &fakeAuthRepo{loadErr: persistence.ErrLocked}

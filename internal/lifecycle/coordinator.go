@@ -2,7 +2,7 @@
 //
 // Background. Before this package, callers that needed to know "is the system
 // ready for unlock-dependent work?" had to derive the answer from a cascade of
-// independent signals — cryptoManager.IsLocked() (SDEK loaded?), then a
+// independent signals — cryptoManager.SDEKLoaded() (SDEK loaded?), then a
 // persistence query (store unlocked?), sometimes also a session check. The
 // signals flip at different points during /crypto/unlock's post-decrypt chain,
 // so the cascade exposed a multi-second window where the layers disagreed: a
@@ -142,7 +142,7 @@ func (c *Coordinator) State() State {
 
 // IsReady reports whether the system is in StateReady. This is the canonical
 // "is the post-unlock plane fully usable?" query; replaces composite-readiness
-// uses of cryptoManager.IsLocked() across the codebase.
+// uses of cryptoManager.SDEKLoaded() (formerly IsLocked) across the codebase.
 func (c *Coordinator) IsReady() bool {
 	return c.State() == StateReady
 }

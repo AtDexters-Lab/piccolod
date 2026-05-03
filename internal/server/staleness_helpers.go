@@ -25,7 +25,8 @@ import (
 // /recovery-key/generate on unlock, which ROTATES the existing key and
 // invalidates the operator's saved words on every routine reboot. Treat
 // persistence.ErrLocked from the staleness read identically (TOCTOU vs a
-// concurrent /crypto/lock between the IsLocked check and the Staleness call).
+// concurrent /crypto/lock between the lifecycle.IsReady check and the
+// Staleness call).
 // Other staleness read errors fail-closed (re-prompt) — the rotation hazard
 // does not apply because /generate is only auto-invoked behind unlock and a
 // transient unlocked-state DB error self-heals.

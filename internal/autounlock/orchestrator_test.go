@@ -16,11 +16,11 @@ import (
 )
 
 // fakeManager implements ManagerOps. Backed by a real crypt.Manager when the
-// test needs SDEK semantics; bypassed when we just need IsLocked / Wrap /
+// test needs SDEK semantics; bypassed when we just need SDEKLoaded / Wrap /
 // Unwrap stubs for failure-path tests.
 type fakeManager struct {
 	mu              sync.Mutex
-	locked          bool
+	sdekLoaded      bool
 	sdek            []byte
 	wrapErr         error
 	unwrapErr       error
@@ -32,10 +32,10 @@ type fakeManager struct {
 	lastUnwrapAAD []byte
 }
 
-func (f *fakeManager) IsLocked() bool {
+func (f *fakeManager) SDEKLoaded() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.locked
+	return f.sdekLoaded
 }
 
 func (f *fakeManager) WrapSDEKForEscrow(F []byte, aad []byte) ([]byte, error) {
@@ -136,7 +136,7 @@ type capturedAudit struct {
 func newOrchestrator(t *testing.T) (*Orchestrator, *fakeManager, *fakeNamek, *[]capturedAudit) {
 	t.Helper()
 	paths.SetCoreRootForTest(t, t.TempDir())
-	mgr := &fakeManager{sdek: []byte("test-sdek-32-bytes-padded-padded")}
+	mgr := &fakeManager{sdekLoaded: true, sdek: []byte("test-sdek-32-bytes-padded-padded")}
 	nc := &fakeNamek{}
 	audits := &[]capturedAudit{}
 	auditMu := sync.Mutex{}
@@ -214,7 +214,7 @@ func TestRunCeremony_HappyPath(t *testing.T) {
 
 func TestRunCeremony_ManagerLocked_NoOp(t *testing.T) {
 	o, mgr, nc, _ := newOrchestrator(t)
-	mgr.locked = true
+	mgr.sdekLoaded = false
 	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}

@@ -46,7 +46,7 @@ func (o *Orchestrator) RunCeremony(ctx context.Context) error {
 		log.Printf("WARN: autounlock: ceremony skipped — identity not ready")
 		return nil
 	}
-	if o.deps.Manager.IsLocked() {
+	if !o.deps.Manager.SDEKLoaded() {
 		// Defense-in-depth: shutdown without an unlocked manager has no SDEK
 		// to wrap. Should not happen in normal operation.
 		log.Printf("WARN: autounlock: ceremony skipped — manager locked")

@@ -59,7 +59,7 @@ func wireLifecycleToken(state lifecycle.State, autoUnlockInFlight bool) string {
 // Routing on lifecycle state. The crypto/persistence/data-volume readiness
 // signals are consolidated by the lifecycle.Coordinator into a single
 // composite state. handleBoot routes on that composite state instead of
-// re-deriving readiness from cryptoManager.IsLocked() + a persistence query
+// re-deriving readiness from cryptoManager.SDEKLoaded() + a persistence query
 // — that derivation exposed a multi-second window during /crypto/unlock's
 // post-decrypt chain where the layers disagreed (SDEK loaded but persistence
 // still loading), causing isSetupComplete to return ErrLocked → (false, nil)
@@ -174,18 +174,28 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 		//     normalization).
 		// Note: Failed only persists across the current daemon run; on
 		// daemon restart, an in-flight Failed transitions to Locked via
-		// the cryptoManager.IsInitialized() bootstrap derivation. State
-		// is Failed → persistence may or may not be loaded depending on
-		// where the failure landed; isSetupComplete returns ErrLocked →
-		// (false, nil) when persistence is closed, which collapses
-		// safely into the partial-setup branch (route to setup; the
-		// wizard's idempotent guards handle the rest).
+		// the cryptoManager.IsInitialized() bootstrap derivation.
+		// Persistence may or may not be loaded depending on where the
+		// failure landed; the secondary check below uses the new
+		// (post-Cluster-B) ErrLocked-propagating contract — when
+		// persistence is closed, isSetupComplete returns
+		// (false, ErrLocked) and we trust the durable marker (fall
+		// through to unlock) rather than route to setup. The
+		// "Failed+provisioned+ErrLocked" combination is structurally
+		// transient (any subsequent /crypto/lock or daemon restart
+		// transitions out of Failed; mid-setup failures don't reach
+		// this branch because the marker is written at step 5c, after
+		// persistence is unlocked).
 		if !s.provisioningState.IsProvisioned() {
 			c.JSON(http.StatusOK, s.bootSetupResponse(wireToken))
 			return
 		}
-		setupComplete, _ := s.isSetupComplete(c.Request.Context())
-		if !setupComplete {
+		// Marker present. Distinguish a genuine partial-setup state
+		// (admin user not yet created) from an ErrLocked / transient
+		// answer where we cannot tell — for the latter, trust the
+		// marker and fall through to unlock.
+		setupComplete, setupErr := s.isSetupComplete(c.Request.Context())
+		if setupErr == nil && !setupComplete {
 			c.JSON(http.StatusOK, s.bootSetupResponse(wireToken))
 			return
 		}

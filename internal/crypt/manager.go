@@ -107,13 +107,20 @@ func (m *Manager) IsInitialized() bool {
 	return m.inited
 }
 
-func (m *Manager) IsLocked() bool {
+// SDEKLoaded reports whether the SDEK is currently loaded in memory. This
+// is the NARROW per-layer check — it answers "is the SDEK installed?" not
+// "is the system ready?". The latter (composite readiness) lives on
+// internal/lifecycle.Coordinator.IsReady() and is what most callers want.
+//
+// Use SDEKLoaded only when the SDEK-presence answer (not composite
+// readiness) is genuinely the question. Returns false on uninitialized
+// devices (no keyset → no SDEK to load); the previous IsLocked() returned
+// false in that case too, but the inverted naming makes the truthy
+// meaning unambiguous.
+func (m *Manager) SDEKLoaded() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if !m.inited {
-		return false
-	}
-	return len(m.sdek) == 0
+	return m.inited && len(m.sdek) > 0
 }
 
 // WithSDEK invokes fn with a copy of the unlocked SDEK. Returns ErrNotInitialized

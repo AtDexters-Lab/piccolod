@@ -1199,7 +1199,13 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		defer cancel()
 		complete, err := s.isSetupComplete(ctx)
 		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
+			// ErrLocked + DeadlineExceeded → heartbeat continues (return
+			// false). The device may legitimately be pre-unlock; silently
+			// stopping the heartbeat would make it vanish from the setup
+			// dashboard mid-session. Other errors → fail-safe stop (return
+			// true) since a hard persistence error suggests the device is
+			// in a state we can't reason about.
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, persistence.ErrLocked) {
 				return false
 			}
 			return true
