@@ -12,18 +12,20 @@ type PortRange struct {
 }
 
 // IsEligibleForHostRouting returns true if a listener should have a DerivedHostLabel
-// for hostname-based resolution (remote or LAN). Per RFC 20260316:
-// - flow:tls returns true (host label needed for remote resolver; LAN host-based skips flow:tls)
-// - flow:udp returns false (uses port-based routing only)
-// - flow:tcp requires protocol:http|websocket
+// for hostname-based resolution (remote or LAN). Per RFC 20260316 +
+// plan §D8 (tcp+raw enablement):
+//   - flow:udp returns false (uses port-based routing only)
+//   - flow:tls returns true (host label needed for remote resolver; LAN
+//     host-based skips flow:tls because piccolod doesn't terminate TLS)
+//   - flow:tcp returns true for any protocol — http/websocket route via
+//     the L7 chain on the host-based label; raw routes via the TLS mux
+//     (passthrough) on the host-based label, with TLS still terminated
+//     by the mux (clients connect over TLS by SNI; backend sees raw bytes).
 func IsEligibleForHostRouting(protocol api.ListenerProtocol, flow api.ListenerFlow) bool {
 	if flow == api.FlowUDP {
 		return false
 	}
-	if flow == api.FlowTLS {
-		return true // host label needed for remote routing; LAN host-based skips flow:tls
-	}
-	return protocol == api.ListenerProtocolHTTP || protocol == api.ListenerProtocolWebsocket
+	return true
 }
 
 // ServiceEndpoint represents a fully allocated listener

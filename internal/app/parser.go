@@ -1210,12 +1210,13 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 			}
 			hasPrimaryMarker = true
 
-			// Primary listeners: flow:tcp + protocol:raw is the only rejected combination
-			// (no HTTP semantics for LAN host-based routing, and no TLS/UDP passthrough path).
-			// flow:tls and flow:udp are allowed as primary per RFC 20260316.
-			if l.Flow == api.FlowTCP && l.Protocol == api.ListenerProtocolRaw {
-				return fmt.Errorf("primary listener '%s' cannot use protocol: raw with flow: tcp (not eligible for host routing)", l.Name)
-			}
+			// Per plan §D8: flow:tcp + protocol:raw is now allowed as primary —
+			// the TLS mux's SNI-based routing terminates TLS for the client,
+			// then proxies raw bytes to the backend. Apps with raw-TCP backends
+			// (DNS-over-TLS, custom TCP protocols) can declare __primary on
+			// flow:tcp+protocol:raw and get hostname routing on remote +
+			// LAN host-based access. flow:udp remains the only rejected primary
+			// (port-based routing only, no host-label channel).
 		}
 
 		// Validate listener name only if not __primary marker

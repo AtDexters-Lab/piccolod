@@ -214,21 +214,19 @@ func CheckCollisions(newLabels []string, existingLabels map[string]string) error
 // ResolvePrimaryListener determines which listener should be the primary listener.
 // Returns the primary listener name and any validation error.
 //
-// Rules:
-// - If a listener has Primary=true, it becomes primary (only one allowed)
-// - Primary=true is not allowed on flow:tcp + protocol:raw (no host routing)
-// - If no explicit primary, the first eligible listener becomes primary
-//   (any listener except flow:tcp + protocol:raw)
-// - Returns "" if there are no eligible primary listeners
+// Rules (per plan §D8 — tcp+raw now eligible for host routing):
+// - If a listener has Primary=true, it becomes primary (only one allowed).
+//   Permitted on every flow.
+// - If no explicit primary, the first listener becomes auto-primary.
+//   tcp+raw used to be skipped (not host-routable); plan §D8 makes it
+//   eligible via TLS mux SNI.
+// - Returns "" only when the listener list is empty.
 func ResolvePrimaryListener(listeners []api.AppListener) (string, error) {
 	var explicit string
 	for _, l := range listeners {
 		if l.Primary {
 			if explicit != "" {
 				return "", fmt.Errorf("multiple primary listeners: '%s' and '%s'", explicit, l.Name)
-			}
-			if l.Flow == api.FlowTCP && l.Protocol == api.ListenerProtocolRaw {
-				return "", fmt.Errorf("primary not allowed on protocol:raw with flow:tcp listener '%s'", l.Name)
 			}
 			explicit = l.Name
 		}
@@ -237,17 +235,12 @@ func ResolvePrimaryListener(listeners []api.AppListener) (string, error) {
 		return explicit, nil
 	}
 
-	// Auto-select: first eligible listener becomes primary.
-	// Skip flow:tcp + protocol:raw (not eligible for host-based routing).
-	// All other combinations are allowed per RFC 20260316.
-	for _, l := range listeners {
-		if l.Flow == api.FlowTCP && l.Protocol == api.ListenerProtocolRaw {
-			continue
-		}
-		return l.Name, nil
+	// Auto-select: first listener becomes primary. Every flow is now
+	// auto-primary-eligible.
+	if len(listeners) > 0 {
+		return listeners[0].Name, nil
 	}
-
-	return "", nil // No eligible primary
+	return "", nil
 }
 
 // NormalizeHostLabel extracts the host label from a full hostname.

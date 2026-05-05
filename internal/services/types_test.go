@@ -17,8 +17,10 @@ func TestIsEligibleForHostRouting(t *testing.T) {
 		{"websocket tcp", api.ListenerProtocolWebsocket, api.FlowTCP, true},
 		{"http tls", api.ListenerProtocolHTTP, api.FlowTLS, true},
 		{"websocket tls", api.ListenerProtocolWebsocket, api.FlowTLS, true},
-		{"raw tcp", api.ListenerProtocolRaw, api.FlowTCP, false},
+		// Plan §D8: tcp+raw is now host-routable via TLS mux SNI.
+		{"raw tcp", api.ListenerProtocolRaw, api.FlowTCP, true},
 		{"raw tls", api.ListenerProtocolRaw, api.FlowTLS, true},
+		// Only flow:udp remains port-routed-only.
 		{"raw udp", api.ListenerProtocolRaw, api.FlowUDP, false},
 	}
 
