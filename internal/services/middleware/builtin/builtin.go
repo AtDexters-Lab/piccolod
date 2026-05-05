@@ -1,6 +1,6 @@
-// Package builtin registers the canonical L7 + L7Response chain factories
-// that reproduce today's startHTTPProxy behavior. Lives in a sibling package
-// of middleware/ to avoid the middleware → l7 → middleware import cycle.
+// Package builtin registers the canonical L4 / L4UDP / L7 / L7Response chain
+// factories. Lives in a sibling package of middleware/ to avoid the
+// middleware → l4|l7 → middleware import cycle.
 package builtin
 
 import (
@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"piccolod/internal/services/middleware"
+	"piccolod/internal/services/middleware/l4"
 	"piccolod/internal/services/middleware/l7"
 	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 )
@@ -23,6 +24,13 @@ import (
 // transitional inlines that wrap services-internal closures via deps. They
 // retire in step 9 when the hint chain migrates to middleware.HintFromContext.
 const (
+	// L4 (TCP) + L4UDP canonical names.
+	NameHintConsumerL4 = "hint_consumer_l4"
+	NameConnMetrics    = "conn_metrics"
+	// L4 / L4UDP operator-listable names.
+	NameIPAllowlist = "ip_allowlist"
+	NameIPRateLimit = "ip_rate_limit"
+
 	NameForwardedScrub        = "forwarded_scrub"
 	NamePathNormalize         = "path_normalize"
 	NameHintConsumerL7        = "hint_consumer_l7"
@@ -43,6 +51,10 @@ const (
 // expected concrete type that the services package binds at deps-construction
 // time.
 const (
+	DepHintLookupL4    = "hint_consumer_l4.lookup" // l4.HintLookupFn
+	DepListenerPort    = "shared.listener_port"    // int
+	DepMetricsRegistry = "shared.metrics_registry" // *l4.MetricsRegistry
+
 	DepHintConsumerL7        = "hint_consumer_l7.consume"            // func(*http.Request) *http.Request
 	DepReservedPathCallback  = "reserved_path_intercept.callback_fn" // func() l7oidc.CallbackHandlerFn
 	DepACMEHandler           = "acme_bypass.handler_fn"              // l7.ACMEHandlerFn
@@ -55,12 +67,23 @@ const (
 	DepMarkerCookie          = "embedded_marker_response.cookie_fn"  // l7.MarkerCookieFn
 )
 
-// RegisterDefaults registers the canonical L7 + L7Response chain factories
-// that reproduce today's startHTTPProxy behavior. Call once per Registry
-// (services package wires this in NewProxyManager).
-//
-// Operator-listable middlewares (step 6+) register via Register, not here.
+// RegisterDefaults registers the canonical L4 / L4UDP / L7 / L7Response
+// chain factories plus the operator-listable IP-rule built-ins. Call once
+// per Registry (services package wires this in NewProxyManager).
 func RegisterDefaults(reg *middleware.Registry) {
+	// L4 (TCP) canonical — outermost first.
+	reg.RegisterCanonical(NameConnMetrics, middleware.LayerL4, factoryConnMetrics)
+	reg.RegisterCanonical(NameHintConsumerL4, middleware.LayerL4, factoryHintConsumerL4)
+
+	// L4UDP canonical.
+	reg.RegisterCanonical(NameConnMetrics+"_udp", middleware.LayerL4UDP, factoryConnMetricsUDP)
+
+	// L4 / L4UDP operator-listable IP-rule middlewares. Both layers share a
+	// single name — Build picks the appropriate signature based on the
+	// listener's flow.
+	reg.Register(NameIPAllowlist, []middleware.Layer{middleware.LayerL4, middleware.LayerL4UDP}, factoryIPAllowlist)
+	reg.Register(NameIPRateLimit, []middleware.Layer{middleware.LayerL4, middleware.LayerL4UDP}, factoryIPRateLimit)
+
 	// Request-side L7 — canonical order matches plan §H.
 	reg.RegisterCanonical(NameForwardedScrub, middleware.LayerL7, factoryForwardedScrub)
 	reg.RegisterCanonical(NamePathNormalize, middleware.LayerL7, factoryPathNormalize)
@@ -78,6 +101,56 @@ func RegisterDefaults(reg *middleware.Registry) {
 	reg.RegisterCanonical(NameCookieIsolationResponse, middleware.LayerL7Response, factoryCookieIsolationResponse)
 	reg.RegisterCanonical(NameEmbeddedMarkerResponse, middleware.LayerL7Response, factoryEmbeddedMarkerResponse)
 	reg.RegisterCanonical(NameOIDCAuthorizeRewriteResponse, middleware.LayerL7Response, factoryOIDCAuthorizeRewriteResponse)
+}
+
+// --- L4 / L4UDP factories ---
+
+func factoryHintConsumerL4(_ map[string]any, ep middleware.EndpointInfo, deps middleware.RegistryDeps, _ middleware.Layer) (any, error) {
+	lookup, ok := deps.Get(DepHintLookupL4).(l4.HintLookupFn)
+	if !ok {
+		return nil, fmt.Errorf("hint_consumer_l4: missing dep %q", DepHintLookupL4)
+	}
+	return l4.HintConsumer(lookup, ep.PublicPort), nil
+}
+
+func factoryConnMetrics(_ map[string]any, _ middleware.EndpointInfo, deps middleware.RegistryDeps, _ middleware.Layer) (any, error) {
+	reg, ok := deps.Get(DepMetricsRegistry).(*l4.MetricsRegistry)
+	if !ok {
+		return nil, fmt.Errorf("conn_metrics: missing dep %q", DepMetricsRegistry)
+	}
+	return l4.ConnMetrics(reg), nil
+}
+
+func factoryConnMetricsUDP(_ map[string]any, _ middleware.EndpointInfo, deps middleware.RegistryDeps, _ middleware.Layer) (any, error) {
+	reg, ok := deps.Get(DepMetricsRegistry).(*l4.MetricsRegistry)
+	if !ok {
+		return nil, fmt.Errorf("conn_metrics_udp: missing dep %q", DepMetricsRegistry)
+	}
+	return l4.ConnMetricsUDP(reg), nil
+}
+
+func factoryIPAllowlist(params map[string]any, _ middleware.EndpointInfo, deps middleware.RegistryDeps, layer middleware.Layer) (any, error) {
+	metrics, _ := deps.Get(DepMetricsRegistry).(*l4.MetricsRegistry) // optional — denies still work without metrics
+	switch layer {
+	case middleware.LayerL4:
+		return l4.IPAllowlist(params, metrics)
+	case middleware.LayerL4UDP:
+		return l4.IPAllowlistUDP(params, metrics)
+	default:
+		return nil, fmt.Errorf("ip_allowlist: unsupported layer %s", layer)
+	}
+}
+
+func factoryIPRateLimit(params map[string]any, _ middleware.EndpointInfo, deps middleware.RegistryDeps, layer middleware.Layer) (any, error) {
+	metrics, _ := deps.Get(DepMetricsRegistry).(*l4.MetricsRegistry)
+	switch layer {
+	case middleware.LayerL4:
+		return l4.IPRateLimit(params, metrics)
+	case middleware.LayerL4UDP:
+		return l4.IPRateLimitUDP(params, metrics)
+	default:
+		return nil, fmt.Errorf("ip_rate_limit: unsupported layer %s", layer)
+	}
 }
 
 // --- Request-side L7 factories ---

@@ -20,6 +20,7 @@ import (
 	"piccolod/internal/auth"
 	"piccolod/internal/services/middleware"
 	"piccolod/internal/services/middleware/builtin"
+	"piccolod/internal/services/middleware/l4"
 	"piccolod/internal/services/middleware/l7"
 	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 )
@@ -96,10 +97,13 @@ type ProxyManager struct {
 	oidcIssuerOriginFn func() string
 	oidcAuthorizePaths map[string][]string // app name → authorize_paths from manifest
 
-	// Middleware registry holds canonical L7 + L7Response factories that
-	// drive startHTTPProxy chain composition. Initialized once per
-	// ProxyManager via builtin.RegisterDefaults.
+	// Middleware registry holds canonical L4 / L4UDP / L7 / L7Response
+	// factories. Initialized once per ProxyManager via builtin.RegisterDefaults.
 	registry *middleware.Registry
+
+	// l4Metrics is the shared in-memory store backing conn_metrics. One
+	// registry per ProxyManager — Snapshot is the read API.
+	l4Metrics *l4.MetricsRegistry
 }
 
 func NewProxyManager() *ProxyManager {
@@ -108,6 +112,7 @@ func NewProxyManager() *ProxyManager {
 	// Default safe CSP
 	return &ProxyManager{
 		registry:          reg,
+		l4Metrics:         l4.NewMetricsRegistry(),
 		listeners:         make(map[int]net.Listener),
 		udpListeners:      make(map[int]*udpProxyState),
 		cspFrameAncestors: "frame-ancestors \"self\" http://localhost:* http://*.local:* https://*.local:*",
@@ -253,6 +258,21 @@ func (p *ProxyManager) consumeHint(listenerPort, sourcePort int) (connectionHint
 			if len(m) == 0 {
 				delete(p.hints, listenerPort)
 			}
+			return hint, true
+		}
+	}
+	return connectionHint{}, false
+}
+
+// peekHint returns the hint without removing it. Used by the L4 chain
+// (hint_consumer_l4) so the L7 path's consumeHint still observes the same
+// hint and the conn-hint chain remains single-cleanup. Step 9 retires this
+// when the hint chain unifies across L4 + L7.
+func (p *ProxyManager) peekHint(listenerPort, sourcePort int) (connectionHint, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if m := p.hints[listenerPort]; m != nil {
+		if hint, ok := m[sourcePort]; ok {
 			return hint, true
 		}
 	}
@@ -930,20 +950,53 @@ func RequestArrivedViaTLS(r *http.Request) bool {
 }
 
 // buildL4Deps assembles the per-listener RegistryDeps for L4 / L4UDP chain
-// factories. Empty in step 4 — the L4 chain has no factories registered yet.
-// Step 5 lands hint_consumer_l4 / ip_allowlist / ip_rate_limit / conn_metrics
-// and populates this map with their dep keys.
+// factories. Bound dep keys: hint_consumer_l4 lookup, conn_metrics registry.
+// IP-rule middlewares (ip_allowlist, ip_rate_limit) are operator-listed and
+// pull their config from operator-supplied params; they share the metrics
+// registry via DepMetricsRegistry.
 func (p *ProxyManager) buildL4Deps(_ ServiceEndpoint) middleware.RegistryDeps {
-	return middleware.MapDeps{}
+	pm := p
+	return middleware.MapDeps{
+		builtin.DepHintLookupL4: func() any {
+			// Peek so the L7 path (http.Server.ConnContext + hintLookup) still
+			// observes and ultimately consumes the hint. Step 9 unifies the
+			// chain so peek-vs-consume is a single bookkeeping point.
+			return l4.HintLookupFn(func(listenerPort, sourcePort int) (middleware.Hint, bool) {
+				h, ok := pm.peekHint(listenerPort, sourcePort)
+				if !ok {
+					return middleware.Hint{}, false
+				}
+				return middleware.Hint{
+					ClientIP:   h.clientIP,
+					IsTLS:      h.isTLS,
+					RemotePort: h.remotePort,
+				}, true
+			})
+		},
+		builtin.DepMetricsRegistry: func() any { return pm.l4Metrics },
+	}
 }
 
-// l4HintLookup returns the lazy Hint accessor attached to ConnContext at
-// L4 chain entry. Step 4: stub — no L4 middleware reads Hint. Step 5
-// (hint_consumer_l4) replaces the stub with the real bridge into
-// p.consumeHint, mirroring the L7 hint chain that lives in startHTTPProxy
-// via http.Server.ConnContext.
-func l4HintLookup(_ *ProxyManager, _ int, _ net.Addr) func() (middleware.Hint, bool) {
-	return func() (middleware.Hint, bool) { return middleware.Hint{}, false }
+// l4HintLookup is retained for the bridge listener wrapper (l4AcceptBridge)
+// which constructs ConnContext outside the registry chain. Uses peek so the
+// L7 path's consumeHint observes the same hint. Step 9 retires this when
+// the chain owns hint resolution end-to-end.
+func l4HintLookup(pm *ProxyManager, listenerPort int, remoteAddr net.Addr) func() (middleware.Hint, bool) {
+	return func() (middleware.Hint, bool) {
+		addr, ok := remoteAddr.(*net.TCPAddr)
+		if !ok || addr == nil {
+			return middleware.Hint{}, false
+		}
+		h, ok := pm.peekHint(listenerPort, addr.Port)
+		if !ok {
+			return middleware.Hint{}, false
+		}
+		return middleware.Hint{
+			ClientIP:   h.clientIP,
+			IsTLS:      h.isTLS,
+			RemotePort: h.remotePort,
+		}, true
+	}
 }
 
 // buildL7Deps assembles the per-listener RegistryDeps that the canonical

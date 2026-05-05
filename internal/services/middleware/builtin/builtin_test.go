@@ -5,16 +5,25 @@ import (
 	"testing"
 
 	"piccolod/internal/services/middleware"
+	"piccolod/internal/services/middleware/l4"
 	"piccolod/internal/services/middleware/l7"
 	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 )
 
 // stubDeps returns a MapDeps populated with no-op getters for every dep key
-// the canonical L7 + L7Response factories read. Any factory missing a dep here
-// would surface as an error from RegisterDefaults + Build, so the table in
-// TestRegisterDefaults_canonicalOrder doubles as a coverage check.
+// the canonical L4 + L7 + L7Response factories read. Any factory missing a
+// dep here would surface as an error from RegisterDefaults + Build, so the
+// table doubles as a coverage check.
 func stubDeps() middleware.MapDeps {
+	metricsReg := l4.NewMetricsRegistry()
 	return middleware.MapDeps{
+		// L4 deps.
+		DepHintLookupL4: func() any {
+			return l4.HintLookupFn(func(int, int) (middleware.Hint, bool) { return middleware.Hint{}, false })
+		},
+		DepMetricsRegistry: func() any { return metricsReg },
+
+		// L7 deps.
 		DepHintConsumerL7:        func() any { return func(r *http.Request) *http.Request { return r } },
 		DepReservedPathCallback:  func() any { return func() l7oidc.CallbackHandlerFn { return nil } },
 		DepACMEHandler:           func() any { return l7.ACMEHandlerFn(func() http.Handler { return nil }) },
@@ -48,6 +57,14 @@ func TestRegisterDefaults_buildsFullChain(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
+	// L4: conn_metrics + hint_consumer_l4 (canonical, always-on). 2 entries.
+	if len(got.L4) != 2 {
+		t.Fatalf("L4 chain length: got %d, want 2", len(got.L4))
+	}
+	// L4UDP: conn_metrics_udp only. 1 entry.
+	if len(got.L4UDP) != 1 {
+		t.Fatalf("L4UDP chain length: got %d, want 1", len(got.L4UDP))
+	}
 	// All 10 canonical L7 entries when HasAuth=true.
 	if len(got.L7) != 10 {
 		t.Fatalf("L7 chain length: got %d, want 10", len(got.L7))
