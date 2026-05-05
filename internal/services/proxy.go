@@ -25,14 +25,16 @@ import (
 	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 )
 
+// connectionHint is the storage shape for per-conn hints registered by the
+// TLS mux relay path. Read sites use middleware.HintFromContext instead of
+// touching this type — connectionHint exists only for the registerHint /
+// peekHint map storage. Plan §D13 unifies the read path under
+// middleware.Hint; storage stays here because it's services-private state.
 type connectionHint struct {
 	clientIP   string
 	isTLS      bool
 	remotePort int
 }
-
-type hintContextKey struct{}
-type hintLookupContextKey struct{}
 
 const (
 	HeaderPiccoloHintToken = "X-Piccolo-Hint-Token"
@@ -47,24 +49,14 @@ type tokenHintEntry struct {
 	expiresAt    time.Time
 }
 
-type hintLookup struct {
-	pm           *ProxyManager
-	listenerPort int
-	sourcePort   int
-
-	once sync.Once
-	hint connectionHint
-	ok   bool
-}
-
-func (l *hintLookup) get() (connectionHint, bool) {
-	if l == nil || l.pm == nil || l.listenerPort <= 0 || l.sourcePort <= 0 {
-		return connectionHint{}, false
+// asMiddlewareHint converts the services-private connectionHint into the
+// shared middleware.Hint shape used by every read site after plan §D13.
+func (h connectionHint) asMiddlewareHint() middleware.Hint {
+	return middleware.Hint{
+		ClientIP:   h.clientIP,
+		IsTLS:      h.isTLS,
+		RemotePort: h.remotePort,
 	}
-	l.once.Do(func() {
-		l.hint, l.ok = l.pm.consumeHint(l.listenerPort, l.sourcePort)
-	})
-	return l.hint, l.ok
 }
 
 // ProxyManager manages TCP listeners and proxies traffic based on ServiceEndpoint
@@ -583,12 +575,16 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		srv := &http.Server{
 			Handler: handler,
 			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+				// L4→L7 hint bridge per plan §D13. Consume the conn-level
+				// hint here (one-shot) and stash it on ctx via
+				// middleware.ContextWithHint. Downstream L7 readers go through
+				// middleware.HintFromContext — single source of truth. The
+				// hint_consumer_l7 middleware may overwrite later if a
+				// LAN-host-based hop carries a header-token hint.
 				if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
-					ctx = context.WithValue(ctx, hintLookupContextKey{}, &hintLookup{
-						pm:           p,
-						listenerPort: ep.PublicPort,
-						sourcePort:   addr.Port,
-					})
+					if hint, ok := p.consumeHint(ep.PublicPort, addr.Port); ok {
+						ctx = middleware.ContextWithHint(ctx, hint.asMiddlewareHint())
+					}
 				}
 				return ctx
 			},
@@ -716,16 +712,6 @@ func basicRateLimit(next http.Handler) http.Handler { // placeholder
 	})
 }
 
-func hintFromRequest(r *http.Request) (connectionHint, bool) {
-	if hint, ok := r.Context().Value(hintContextKey{}).(connectionHint); ok {
-		return hint, true
-	}
-	if lookup, ok := r.Context().Value(hintLookupContextKey{}).(*hintLookup); ok {
-		return lookup.get()
-	}
-	return connectionHint{}, false
-}
-
 func applyForwardHeaders(r *http.Request, ep ServiceEndpoint) {
 	clientIP := ""
 	if remoteHost, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
@@ -733,9 +719,9 @@ func applyForwardHeaders(r *http.Request, ep ServiceEndpoint) {
 	} else {
 		clientIP = r.RemoteAddr
 	}
-	if hint, ok := hintFromRequest(r); ok {
-		if strings.TrimSpace(hint.clientIP) != "" {
-			clientIP = hint.clientIP
+	if hint, ok := middleware.HintFromContext(r.Context()); ok {
+		if strings.TrimSpace(hint.ClientIP) != "" {
+			clientIP = hint.ClientIP
 		}
 	}
 
@@ -785,8 +771,8 @@ func applyForwardHeaders(r *http.Request, ep ServiceEndpoint) {
 	}
 
 	port := ""
-	if hint, ok := hintFromRequest(r); ok && hint.remotePort > 0 {
-		port = strconv.Itoa(hint.remotePort)
+	if hint, ok := middleware.HintFromContext(r.Context()); ok && hint.RemotePort > 0 {
+		port = strconv.Itoa(hint.RemotePort)
 	} else if hostPort != "" {
 		port = hostPort
 	} else if proto == "https" {
@@ -937,15 +923,16 @@ func needsForwardedQuotedString(v string) bool {
 // over TLS, even if the current hop is plain HTTP. It checks direct TLS
 // (r.TLS) and the connection hint issued by the portal's lanHostRoutingMiddleware.
 //
-// Stays in services/ until step 9 because the hint chain (hintFromRequest →
-// connectionHint) is services-internal. Step 9 migrates to
-// middleware.HintFromContext, after which this function moves to middleware/l7/
-// (or its callers inline middleware.HintFromContext directly).
+// After plan §D13 (step 9), the hint chain reads from middleware.HintFromContext.
+// Two writers populate it: the L4 chain entry stashes the conn-level hint via
+// http.Server.ConnContext; the L7 hint_consumer_l7 stashes the header-token
+// hint forwarded by gin's lanHostRoutingMiddleware. Last writer wins; the
+// header-token hint takes precedence on the LAN-host-based hop.
 func RequestArrivedViaTLS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	if hint, ok := hintFromRequest(r); ok && hint.isTLS {
+	if hint, ok := middleware.HintFromContext(r.Context()); ok && hint.IsTLS {
 		return true
 	}
 	return false
@@ -960,29 +947,26 @@ func (p *ProxyManager) buildL4Deps(_ ServiceEndpoint) middleware.RegistryDeps {
 	pm := p
 	return middleware.MapDeps{
 		builtin.DepHintLookupL4: func() any {
-			// Peek so the L7 path (http.Server.ConnContext + hintLookup) still
-			// observes and ultimately consumes the hint. Step 9 unifies the
-			// chain so peek-vs-consume is a single bookkeeping point.
+			// L4 chain peeks so the http.Server.ConnContext bridge can
+			// consume the hint once and stash it on r.Context() via
+			// middleware.ContextWithHint for L7 readers.
 			return l4.HintLookupFn(func(listenerPort, sourcePort int) (middleware.Hint, bool) {
 				h, ok := pm.peekHint(listenerPort, sourcePort)
 				if !ok {
 					return middleware.Hint{}, false
 				}
-				return middleware.Hint{
-					ClientIP:   h.clientIP,
-					IsTLS:      h.isTLS,
-					RemotePort: h.remotePort,
-				}, true
+				return h.asMiddlewareHint(), true
 			})
 		},
 		builtin.DepMetricsRegistry: func() any { return pm.l4Metrics },
 	}
 }
 
-// l4HintLookup is retained for the bridge listener wrapper (l4AcceptBridge)
-// which constructs ConnContext outside the registry chain. Uses peek so the
-// L7 path's consumeHint observes the same hint. Step 9 retires this when
-// the chain owns hint resolution end-to-end.
+// l4HintLookup is retained for the bridge listener wrapper (l4AcceptBridge),
+// which constructs ConnContext outside the registry chain (the chain only
+// runs when l4AcceptBridge is non-empty). Peeks so the http.Server.ConnContext
+// bridge can consume the hint once and stash it via middleware.ContextWithHint
+// for L7 readers.
 func l4HintLookup(pm *ProxyManager, listenerPort int, remoteAddr net.Addr) func() (middleware.Hint, bool) {
 	return func() (middleware.Hint, bool) {
 		addr, ok := remoteAddr.(*net.TCPAddr)
@@ -993,11 +977,7 @@ func l4HintLookup(pm *ProxyManager, listenerPort int, remoteAddr net.Addr) func(
 		if !ok {
 			return middleware.Hint{}, false
 		}
-		return middleware.Hint{
-			ClientIP:   h.clientIP,
-			IsTLS:      h.isTLS,
-			RemotePort: h.remotePort,
-		}, true
+		return h.asMiddlewareHint(), true
 	}
 }
 
@@ -1015,7 +995,10 @@ func (p *ProxyManager) buildL7Deps(ep ServiceEndpoint) middleware.RegistryDeps {
 		}
 		r.Header.Del(HeaderPiccoloHintToken)
 		if hint, ok := p.consumeRequestHint(listenerPort, token); ok {
-			r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, hint))
+			// Per plan §D13 last-writer-wins: header-token hint from the
+			// LAN-host-based hop overrides any L4 conn-level hint already
+			// stashed by the http.Server.ConnContext bridge.
+			r = r.WithContext(middleware.ContextWithHint(r.Context(), hint.asMiddlewareHint()))
 		}
 		return r
 	}

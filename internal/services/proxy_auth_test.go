@@ -1,13 +1,13 @@
 package services
 
 import (
-	"context"
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"piccolod/internal/services/middleware"
 	"piccolod/internal/services/middleware/l7"
 )
 
@@ -133,7 +133,7 @@ func TestShouldPartitionCookies(t *testing.T) {
 				r := httptest.NewRequest(http.MethodGet, "http://homebox-piccolo-xyz.local/", nil)
 				r.Host = "homebox-piccolo-xyz.local"
 				r.Header.Set("Sec-Fetch-Dest", "iframe")
-				r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, connectionHint{isTLS: true}))
+				r = r.WithContext(middleware.ContextWithHint(r.Context(), middleware.Hint{IsTLS: true}))
 				return r
 			},
 			expect: true,
