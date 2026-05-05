@@ -677,6 +677,14 @@ func (l *l4AcceptBridge) Accept() (net.Conn, error) {
 			return conn, nil
 		}
 		_ = conn.Close()
+		// Drain the per-conn hint registration: ConnContext consumes only
+		// for admitted conns; denied conns would leak the entry until the
+		// kernel's ephemeral-port reuse window wrapped, with the same
+		// stale-hint contamination class the TCP-path dispatch helper
+		// drains. Mirror the TCP path here.
+		if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+			_, _ = l.pm.consumeHint(l.listenerPort, addr.Port)
+		}
 	}
 }
 
