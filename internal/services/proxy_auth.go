@@ -1,24 +1,12 @@
 package services
 
 import (
+	"net"
 	"net/http"
 	"strings"
 
 	"piccolod/internal/services/middleware/l7"
 )
-
-// proxyOIDCRewriteContextKey carries the per-request snapshot used by the
-// response-side OIDC URL rewrite. Lives in services/ for now; moves to
-// middleware/l7/oidc/ in step 1.5d alongside ProxyOIDCHandler.
-type proxyOIDCRewriteContextKey struct{}
-
-// oidcRewriteSnapshot holds OIDC rewrite state captured under lock in the
-// request handler and threaded into ModifyResponse via request context.
-type oidcRewriteSnapshot struct {
-	issuerOrigin   string   // e.g., "http://piccolo-abc123.local"
-	portalOrigin   string   // e.g., "https://slug.piccolospace.com"
-	authorizePaths []string // app's declared authorize_paths
-}
 
 // chipsEligible returns true when the request's host/TLS context is eligible
 // for CHIPS Partitioned cookies. Stays in services/ until step 9 because it
@@ -70,4 +58,18 @@ func needsEmbeddedMarker(r *http.Request) bool {
 		return false
 	}
 	return chipsEligible(r)
+}
+
+// isPortBasedAccess checks if the request is using port-based LAN routing.
+func isPortBasedAccess(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	host := r.Host
+	if _, port, err := net.SplitHostPort(host); err == nil {
+		if port != "80" && port != "443" {
+			return true
+		}
+	}
+	return false
 }

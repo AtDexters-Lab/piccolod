@@ -50,6 +50,7 @@ import (
 	"piccolod/internal/runtime/commands"
 	"piccolod/internal/runtime/supervisor"
 	"piccolod/internal/services"
+	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage"
 	"piccolod/internal/storage/diskprep"
@@ -1002,7 +1003,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			}
 			return "piccolo.local"
 		})
-		svcMgr.ProxyManager().SetProxyOIDCConfig(services.ProxyOIDCConfig{
+		svcMgr.ProxyManager().SetProxyOIDCConfig(l7oidc.Config{
 			SessionStore:    s.sessions,
 			UserManager:     s.userManager,
 			GetPortalOrigin: s.portalOriginForRequest,

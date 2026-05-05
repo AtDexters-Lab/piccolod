@@ -1,7 +1,6 @@
 package services
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -20,6 +19,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/auth"
 	"piccolod/internal/services/middleware/l7"
+	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 )
 
 type connectionHint struct {
@@ -67,8 +67,8 @@ func (l *hintLookup) get() (connectionHint, bool) {
 // ProxyManager manages TCP listeners and proxies traffic based on ServiceEndpoint
 type ProxyManager struct {
 	mu                sync.Mutex
-	listeners         map[int]net.Listener     // TCP listeners by public port
-	udpListeners      map[int]*udpProxyState   // UDP listeners by public port
+	listeners         map[int]net.Listener   // TCP listeners by public port
+	udpListeners      map[int]*udpProxyState // UDP listeners by public port
 	hints             map[int]map[int]connectionHint
 	tokenHints        map[string]tokenHintEntry
 	cspFrameAncestors string // pre-calculated CSP header value
@@ -82,7 +82,7 @@ type ProxyManager struct {
 	aliasChecker  func(host, listener string) bool
 
 	// RFC 20260122: Proxy OIDC handler for headers/protected strategies
-	proxyOIDC           *ProxyOIDCHandler
+	proxyOIDC           *l7oidc.Handler
 	sessionStore        *auth.SessionStore
 	localHostnameGetter func() string
 
@@ -291,10 +291,17 @@ func (p *ProxyManager) SetLocalHostnameGetter(fn func() string) {
 	p.mu.Unlock()
 }
 
-// SetProxyOIDCConfig configures the proxy OIDC handler per RFC 20260122.
-func (p *ProxyManager) SetProxyOIDCConfig(config ProxyOIDCConfig) {
+// SetProxyOIDCConfig configures the proxy OIDC handler per RFC 20260122. The
+// services-internal predicates (TLS detection + CHIPS classification) are
+// wired in here because they depend on the hint chain that step 9 migrates to
+// middleware.HintFromContext.
+func (p *ProxyManager) SetProxyOIDCConfig(config l7oidc.Config) {
+	config.ArrivedViaTLS = RequestArrivedViaTLS
+	config.NeedsEmbeddedMarker = needsEmbeddedMarker
+	config.ShouldPartitionCookies = shouldPartitionCookies
+
 	p.mu.Lock()
-	p.proxyOIDC = NewProxyOIDCHandler(config)
+	p.proxyOIDC = l7oidc.NewHandler(config)
 	p.mu.Unlock()
 }
 
@@ -520,8 +527,8 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		}
 
 		// OIDC authorize URL rewriting for WAN requests.
-		if snap, ok := resp.Request.Context().Value(proxyOIDCRewriteContextKey{}).(*oidcRewriteSnapshot); ok && snap != nil {
-			rewriteOIDCAuthorizeResponse(resp, snap, ep.App)
+		if snap, ok := l7oidc.SnapshotFromContext(resp.Request.Context()); ok {
+			l7oidc.RewriteAuthorizeResponse(resp, snap, ep.App)
 		}
 
 		return nil
@@ -561,7 +568,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		cleanedPath := r.URL.Path
 
 		// RFC 20260122 §5.10: Intercept reserved proxy OIDC paths
-		if IsReservedPath(cleanedPath) {
+		if l7oidc.IsReservedPath(cleanedPath) {
 			p.mu.Lock()
 			proxyOIDC := p.proxyOIDC
 			p.mu.Unlock()
@@ -571,8 +578,8 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				return
 			}
 
-			if cleanedPath == ProxyOIDCCallbackPath {
-				proxyOIDC.HandleCallback(w, r, ep.App, ep)
+			if cleanedPath == l7oidc.CallbackPath {
+				proxyOIDC.HandleCallback(w, r, ep.App, ep.AsMiddlewareInfo())
 				return
 			}
 
@@ -646,7 +653,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				isSafeMethod := r.Method == http.MethodGet || r.Method == http.MethodHead
 				if isSafeMethod && l7.IsBrowserNavigation(r) {
 					if proxyOIDC != nil {
-						proxyOIDC.InitiateOIDCFlow(w, r, ep.App, ep)
+						proxyOIDC.InitiateFlow(w, r, ep.App, ep.AsMiddlewareInfo())
 						return
 					}
 					// Fallback to portal redirect if proxy OIDC not configured
@@ -744,12 +751,12 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				issuerOrigin := issuerOriginFn()
 				portal := portalOriginFn(r)
 				if issuerOrigin != "" && portal != "" {
-					snap := &oidcRewriteSnapshot{
-						issuerOrigin:   issuerOrigin,
-						portalOrigin:   portal,
-						authorizePaths: authPaths,
+					snap := &l7oidc.Snapshot{
+						IssuerOrigin:   issuerOrigin,
+						PortalOrigin:   portal,
+						AuthorizePaths: authPaths,
 					}
-					r = r.WithContext(context.WithValue(r.Context(), proxyOIDCRewriteContextKey{}, snap))
+					r = r.WithContext(l7oidc.ContextWithSnapshot(r.Context(), snap))
 				}
 			}
 		}
@@ -1087,176 +1094,6 @@ func RequestArrivedViaTLS(r *http.Request) bool {
 	}
 	return false
 }
-
-// oidcAuthorizeRewriteMaxBody is the maximum response body size for Layer 2
-// body rewriting. Responses larger than this are passed through unmodified.
-const oidcAuthorizeRewriteMaxBody = 1 << 20 // 1 MB
-
-// rewriteOIDCAuthorizeResponse performs dual-layer OIDC authorization URL
-// rewriting for WAN requests. Layer 1 rewrites Location headers on 3xx
-// responses. Layer 2 rewrites response bodies on declared authorize_paths.
-func rewriteOIDCAuthorizeResponse(resp *http.Response, snap *oidcRewriteSnapshot, appName string) {
-	oldURL := snap.issuerOrigin + "/oauth/authorize"
-	newURL := snap.portalOrigin + "/oauth/authorize"
-
-	// Layer 1: Location header rewrite on 3xx responses.
-	// Match the exact authorize URL or one followed by '?' (query string) or '/'
-	// (subpath) to avoid matching unrelated paths like .../authorize_token.
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		if loc := resp.Header.Get("Location"); loc != "" {
-			if loc == oldURL || strings.HasPrefix(loc, oldURL+"?") || strings.HasPrefix(loc, oldURL+"/") || strings.HasPrefix(loc, oldURL+"#") {
-				resp.Header.Set("Location", newURL+loc[len(oldURL):])
-				log.Printf("DEBUG: OIDC rewrite L1: app=%s location rewritten", appName)
-			}
-		}
-	}
-
-	// Layer 2: Body text replacement on declared authorize_paths.
-	if len(snap.authorizePaths) == 0 {
-		return
-	}
-	reqPath := ""
-	if resp.Request != nil && resp.Request.URL != nil {
-		reqPath = resp.Request.URL.Path
-	}
-	pathMatch := false
-	for _, ap := range snap.authorizePaths {
-		if reqPath == ap {
-			pathMatch = true
-			break
-		}
-	}
-	if !pathMatch {
-		return
-	}
-
-	// Only rewrite text-based content types. Reuses the proxy's existing
-	// compressible-types definition (mime.ParseMediaType-based, handles
-	// charset suffixes correctly).
-	if !l7.IsCompressibleContentType(resp.Header.Get("Content-Type")) {
-		return
-	}
-
-	// Skip compressed responses — we cannot rewrite without decompressing.
-	if resp.Header.Get("Content-Encoding") != "" {
-		log.Printf("WARN: OIDC rewrite L2 skipped (Content-Encoding present): app=%s path=%s", appName, reqPath)
-		return
-	}
-
-	// Pre-check Content-Length to avoid consuming oversized responses.
-	if resp.ContentLength > oidcAuthorizeRewriteMaxBody {
-		log.Printf("WARN: OIDC rewrite L2 skipped (Content-Length %d > %d): app=%s path=%s", resp.ContentLength, oidcAuthorizeRewriteMaxBody, appName, reqPath)
-		return
-	}
-
-	// Read up to maxBody+1 bytes to detect oversize from chunked responses.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, oidcAuthorizeRewriteMaxBody+1))
-	if err != nil {
-		// Splice the read bytes back so the downstream client gets the full body.
-		// Preserve the original Closer so resources are released correctly.
-		log.Printf("WARN: OIDC rewrite L2 body read error: app=%s path=%s err=%v", appName, reqPath, err)
-		resp.Body = &spliceCloser{
-			Reader: io.MultiReader(bytes.NewReader(body), resp.Body),
-			closer: resp.Body,
-		}
-		return
-	}
-	if int64(len(body)) > oidcAuthorizeRewriteMaxBody {
-		// Body exceeded the limit. Splice back the consumed portion plus the
-		// rest of the original body so nothing is truncated.
-		log.Printf("WARN: OIDC rewrite L2 skipped (body too large: >%d bytes): app=%s path=%s", oidcAuthorizeRewriteMaxBody, appName, reqPath)
-		resp.Body = &spliceCloser{
-			Reader: io.MultiReader(bytes.NewReader(body), resp.Body),
-			closer: resp.Body,
-		}
-		return
-	}
-
-	// Body fully read; safe to close the original.
-	resp.Body.Close()
-
-	// Empty body — nothing to do.
-	if len(body) == 0 {
-		resp.Body = io.NopCloser(bytes.NewReader(nil))
-		resp.ContentLength = 0
-		resp.Header.Set("Content-Length", "0")
-		return
-	}
-
-	// Replace the authorize URL pattern, matching only when followed by a
-	// valid URL boundary to avoid false positives like `/oauth/authorize_token`.
-	// This mirrors Layer 1's boundary check.
-	newBody, count := replaceAuthorizeURL(body, []byte(oldURL), []byte(newURL))
-	if count == 0 {
-		log.Printf("WARN: OIDC rewrite L2 matched path but zero replacements: app=%s path=%s", appName, reqPath)
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		return
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(newBody))
-	resp.ContentLength = int64(len(newBody))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
-	resp.Header.Del("Transfer-Encoding")
-	log.Printf("DEBUG: OIDC rewrite L2: app=%s path=%s replacements=%d oldSize=%d newSize=%d", appName, reqPath, count, len(body), len(newBody))
-}
-
-// replaceAuthorizeURL replaces `old` with `new` in `body`, but only when the
-// match is followed by a valid URL boundary (end-of-buffer or one of the
-// characters that legitimately terminate a URL in HTML/JSON/JS contexts).
-// This prevents false positives like `/oauth/authorize_token`.
-func replaceAuthorizeURL(body, old, new []byte) ([]byte, int) {
-	if len(old) == 0 {
-		return body, 0
-	}
-	var out bytes.Buffer
-	out.Grow(len(body))
-	count := 0
-	i := 0
-	for {
-		j := bytes.Index(body[i:], old)
-		if j < 0 {
-			out.Write(body[i:])
-			break
-		}
-		matchStart := i + j
-		matchEnd := matchStart + len(old)
-		if matchEnd == len(body) || isURLBoundary(body[matchEnd]) {
-			out.Write(body[i:matchStart])
-			out.Write(new)
-			count++
-			i = matchEnd
-		} else {
-			// Not a boundary match — keep original bytes up to and including the prefix
-			// and advance past the first byte of the match to allow overlapping searches.
-			out.Write(body[i : matchStart+1])
-			i = matchStart + 1
-		}
-	}
-	return out.Bytes(), count
-}
-
-// isURLBoundary reports whether b is a character that legitimately terminates
-// a URL in HTML/JSON/JS contexts.
-func isURLBoundary(b byte) bool {
-	switch b {
-	case '?', '#', '/', '"', '\'', '<', '>', ' ', '\t', '\n', '\r', ',', ';', ')', '}', ']', '\\':
-		return true
-	}
-	return false
-}
-
-// spliceCloser combines a Reader (typically a MultiReader) with the original
-// body's Closer so the downstream HTTP transport closes the underlying body.
-type spliceCloser struct {
-	io.Reader
-	closer io.Closer
-}
-
-func (s *spliceCloser) Close() error { return s.closer.Close() }
-
-// computeRequestOrigin / shouldRewriteAsHTTPS / absoluteRequestURL moved to
-// internal/services/middleware/l7/url.go in step 1.5c. Callers in this package
-// use l7.ComputeRequestOrigin / l7.ShouldRewriteAsHTTPS / l7.AbsoluteRequestURL
-// with ep.AsMiddlewareInfo() and RequestArrivedViaTLS as the dep.
 
 // StopAll stops all listeners
 func (p *ProxyManager) StopAll() {
