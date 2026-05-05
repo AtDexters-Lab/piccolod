@@ -10,13 +10,17 @@ import (
 // CookieIsolationResponse implements RFC 20260112 Set-Cookie isolation:
 //   - Drops `piccolo_*` cookies from app responses (apps cannot impersonate
 //     Piccolo session cookies).
-//   - Drops `__piccolo_*` cookies from app responses unless they target THIS
-//     app's prefix. Closes a cross-app cookie injection: in port-based LAN
-//     mode, browsers scope cookies by host (not port — RFC 6265 §8.5), so
-//     a compromised app A returning `Set-Cookie: __piccolo_appB_session=evil`
-//     (no HttpOnly to bypass the rewrite gate) would otherwise be stored
-//     host-scoped and then unwrapped by app B's request-side strip into
-//     `Cookie: session=evil` — forging app B's session.
+//   - Drops `__piccolo_*` cookies from app responses UNCONDITIONALLY — the
+//     namespace is reserved for proxy-managed cookie isolation; backends
+//     MUST NOT set cookies in it. Closes a cross-app cookie injection: in
+//     port-based LAN mode, browsers scope cookies by host (not port —
+//     RFC 6265 §8.5), so a compromised app A returning
+//     `Set-Cookie: __piccolo_appB_session=evil` (no HttpOnly to bypass the
+//     rewrite gate) would otherwise be stored host-scoped and then
+//     unwrapped by app B's request-side strip into `Cookie: session=evil` —
+//     forging app B's session. The proxy's own __piccolo_<thisApp>_*
+//     rewrites (added by the rewrite block below) are added directly to
+//     resp.Header.Add and don't re-enter the filter.
 //   - Drops Set-Cookie with a Domain attribute that doesn't match the request
 //     app host (defends against domain-scoped cookies leaking across apps).
 //     Fails closed if the app host can't be determined.
