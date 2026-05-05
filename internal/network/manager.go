@@ -314,13 +314,22 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 		return err
 	}
 
-	// Wait for activation up to 30s. WaitForActivation returns Activated
-	// for ANY currently-active connection on the device — including the
-	// still-active old profile if NM hasn't transitioned yet (TOCTOU on
-	// the synchronous-state-check fast path). Verify the activated SSID
-	// matches the requested one before declaring success; mismatch routes
-	// to the failure branch and triggers rollback.
-	finalState, _, err := m.nm.WaitForActivation(ctx, dev.Path)
+	// Wait for activation up to 30s. The 30s budget is enforced by a
+	// derived context — the caller's ctx is typically m.ctx (long-lived),
+	// and NM can stall indefinitely in an Activating state without
+	// emitting a terminal signal (saw this on rtw88_8723de under load).
+	// Without the bound, the captive-portal flow blocks here forever and
+	// the AP never re-enters until piccolod stops.
+	//
+	// WaitForActivation returns Activated for ANY currently-active
+	// connection on the device — including the still-active old profile
+	// if NM hasn't transitioned yet (TOCTOU on the synchronous-state-check
+	// fast path). Verify the activated SSID matches the requested one
+	// before declaring success; mismatch routes to the failure branch
+	// and triggers rollback.
+	waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
+	finalState, _, err := m.nm.WaitForActivation(waitCtx, dev.Path)
+	cancelWait()
 	activated := err == nil && finalState == nmclient.NMDeviceStateActivated
 	if activated {
 		info, infoErr := m.nm.ActiveConnectionInfo(dev.Path)
@@ -362,7 +371,7 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	}
 
 	// Hint the supervisor — ConfigHealth flips Healthy on the next tick;
-	// any AP active will exit because anyDeviceGwReachable() returns true.
+	// any AP active will exit because anyDeviceWorking() returns true.
 	if m.supervisor != nil {
 		m.supervisor.RequestProbeAndDecide()
 	}

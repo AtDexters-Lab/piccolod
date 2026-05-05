@@ -75,8 +75,12 @@ func (p *Prober) probeWiFi() rawWiFiObs {
 		raw.HasProfile = len(profiles) > 0
 	}
 
-	// Active connection info → IP presence.
-	if info, err := p.nm.ActiveConnectionInfo(dev.Path); err == nil && info != nil {
+	// Active connection info → IP presence. Skip if the active connection
+	// is OUR hotspot — NM exposes the AP-mode hotspot as the WiFi device's
+	// active connection with a 10.42.x address, and counting that as a
+	// STA IP makes ConfigHealth flip to Healthy → APArbiter exits AP →
+	// recovery oscillates with no real STA uplink.
+	if info, err := p.nm.ActiveConnectionInfo(dev.Path); err == nil && info != nil && !info.IsHotspot() {
 		raw.HasIP = info.IP4Address != ""
 	}
 
@@ -139,17 +143,49 @@ func (p *Prober) resolveWiFi(raw rawWiFiObs, led ActionLedger, sysUptime time.Du
 		obs.ConfigHealth = TriInactive
 	case raw.NMState == nmclient.NMDeviceStateActivated && raw.HasIP:
 		obs.ConfigHealth = TriHealthy
+		p.resetConfigFault(DeviceWiFi)
 	case raw.IsAuthFailure:
-		// Deterministic auth failure — Faulted, AP-handover candidate.
+		// Deterministic auth failure — Faulted immediately, no dampening
+		// (NM has explicitly told us credentials are wrong; retrying is
+		// pointless).
 		obs.ConfigHealth = TriFaulted
 	case !raw.HasProfile:
 		obs.ConfigHealth = TriInactive
+		p.resetConfigFault(DeviceWiFi)
+	case isTerminalConfigFailure(raw.NMState):
+		// Saved profile + NM in Failed/Disconnected past grace = sustained
+		// failure (SSID renamed, out of range, BSSID gone). Dampen 3-of-3
+		// before flipping to Faulted so a transient drop doesn't
+		// prematurely escalate to AP entry. Without this branch, the
+		// owner of an SSID-rename device would never see the setup AP
+		// because ConfigHealth would stay "DHCP-in-flight Healthy" forever.
+		obs.ConfigHealth = p.dampenConfigFault(DeviceWiFi, TriFaulted, led, now)
 	default:
-		// Activating, transient — DHCP-in-flight maps to Healthy per RFC.
+		// Activating (Prepare/Config/IPConfig/etc.) — transient DHCP-in-
+		// flight maps to Healthy per RFC.
 		obs.ConfigHealth = TriHealthy
+		p.resetConfigFault(DeviceWiFi)
 	}
 
 	return obs
+}
+
+// resetConfigFault clears the consecConfigFault counter for kind. Called
+// from any branch that classifies Config as Healthy/Inactive so the
+// sustained-failure dampener requires fresh consecutive faults before
+// promoting again.
+func (p *Prober) resetConfigFault(kind DeviceKind) {
+	p.mu.Lock()
+	p.consecConfigFault[kind] = 0
+	p.mu.Unlock()
+}
+
+// isTerminalConfigFailure reports whether the NM state represents a
+// non-progressing failure (NM has stopped trying or hit a hard wall). NM
+// Disconnected (30) and Failed (120) are terminal; Prepare/Config/
+// NeedAuth/IPConfig/IPCheck/Secondaries (40-90) are in-flight.
+func isTerminalConfigFailure(s nmclient.NMDeviceState) bool {
+	return s == nmclient.NMDeviceStateDisconnected || s == nmclient.NMDeviceStateFailed
 }
 
 // readWiFiRfkill scans /sys/class/rfkill for type=wlan entries and reports

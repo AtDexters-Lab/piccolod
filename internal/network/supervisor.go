@@ -329,12 +329,31 @@ func (s *Supervisor) recordHW(act HWAction, now time.Time) bool {
 // act dispatches actuators for the decided actions. Each side-effecting
 // call runs in its own goroutine; outcomes observed by next tick's probe.
 //
+// Sequencing rule: when the same tick decides both APExit and a WiFi
+// Bounce, the Exit MUST complete before the Bounce — bounceWiFi refuses
+// to run while the AP is active, but recordIntent has already consumed
+// a bounce slot and updated LastBounceAt → without sequencing the device
+// enters a 90s quiet period with no actual bounce having happened. We
+// chain them in a single goroutine instead of two concurrent ones.
+//
 // rebootPersisted gates the Reboot fire — see recordIntent.
 func (s *Supervisor) act(ctx context.Context, hwW, hwE HWAction, apA APAction, rebootPersisted bool) {
-	if s.devAct != nil {
-		if act, ok := hwW.(HWBounce); ok {
-			go s.fireBounce(ctx, act)
+	_, apExiting := apA.(APExit)
+	wifiBounce, wifiBouncing := hwW.(HWBounce)
+
+	// WiFi bounce: chain after APExit if both are decided this tick.
+	if s.devAct != nil && wifiBouncing {
+		if apExiting && s.apAct != nil {
+			go func() {
+				s.fireAPExit(ctx)
+				s.fireBounce(ctx, wifiBounce)
+			}()
+		} else {
+			go s.fireBounce(ctx, wifiBounce)
 		}
+	}
+
+	if s.devAct != nil {
 		if act, ok := hwE.(HWBounce); ok {
 			go s.fireBounce(ctx, act)
 		}
@@ -351,7 +370,10 @@ func (s *Supervisor) act(ctx context.Context, hwW, hwE HWAction, apA APAction, r
 		case APEnter:
 			go s.fireAPEnter(ctx)
 		case APExit:
-			go s.fireAPExit(ctx)
+			// Already chained above when paired with WiFi Bounce.
+			if !wifiBouncing {
+				go s.fireAPExit(ctx)
+			}
 		}
 	}
 }

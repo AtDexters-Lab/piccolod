@@ -492,6 +492,56 @@ func TestClassifyConnectivity(t *testing.T) {
 	}
 }
 
+// TestProbeWiFi_TerminalConfigFailureDampened verifies the 3-of-3
+// sustained-failure detection for saved-profile-but-not-connecting cases
+// (SSID renamed, out of range, BSSID gone). Pre-fix, NMState=Disconnected
+// + HasProfile=true fell through to "DHCP-in-flight Healthy" forever and
+// the supervisor never entered the setup AP — the owner had no way to
+// fix credentials.
+func TestProbeWiFi_TerminalConfigFailureDampened(t *testing.T) {
+	f := newFixture(t)
+	f.wifiAt(nmclient.NMDeviceStateDisconnected, false, "")
+	f.nm.SavedConnections = []nmclient.ConnectionProfile{{Path: "/c0", SSID: "home"}}
+
+	// Tick 1+2: candidate=Faulted, counter < 3 → reported as Healthy
+	for i := 1; i <= 2; i++ {
+		tick := f.prober.Probe(context.Background(), ActionLedger{Bounces: map[DeviceKind][]time.Time{}, LastBounceAt: map[DeviceKind]time.Time{}}, f.now.Add(time.Duration(i)*TickInterval))
+		if got := tick.Devices[DeviceWiFi].ConfigHealth; got != TriHealthy {
+			t.Errorf("tick %d: ConfigHealth = %s, want healthy (dampener at %d/3)", i, got, i)
+		}
+	}
+
+	// Tick 3: counter=3 → ConfigHealth flips to Faulted.
+	tick := f.prober.Probe(context.Background(), ActionLedger{Bounces: map[DeviceKind][]time.Time{}, LastBounceAt: map[DeviceKind]time.Time{}}, f.now.Add(3*TickInterval))
+	if got := tick.Devices[DeviceWiFi].ConfigHealth; got != TriFaulted {
+		t.Errorf("after 3 ticks: ConfigHealth = %s, want faulted", got)
+	}
+}
+
+// TestProbeWiFi_IgnoresHotspotActiveConnection verifies that during AP
+// mode the supervisor does NOT treat the hotspot's local 10.42.x IP as a
+// STA uplink. Pre-fix, info.IP4Address from the hotspot ActiveConnection
+// flipped HasIP=true → ConfigHealth=Healthy → APArbiter exits AP →
+// recovery oscillates with no real STA uplink.
+func TestProbeWiFi_IgnoresHotspotActiveConnection(t *testing.T) {
+	f := newFixture(t)
+	f.wifiAt(nmclient.NMDeviceStateActivated, true, "10.42.0.1") // hotspot-shaped IP
+	// Override ActiveConnectionInfo to return a hotspot (ID prefix matches
+	// nmclient.HotspotIDPrefix → IsHotspot() returns true).
+	f.nm.ActiveConnResult = &nmclient.ActiveConnectionInfo{
+		Path:       "/org/freedesktop/NetworkManager/ActiveConnection/0",
+		ID:         nmclient.HotspotIDPrefix + "ABCD",
+		IP4Address: "10.42.0.1",
+		IP4Gateway: "",
+	}
+
+	tick := f.probeN(1)
+	wifi := tick.Devices[DeviceWiFi]
+	if wifi.HasIP {
+		t.Errorf("HasIP = true on hotspot active connection; want false (hotspot is not a STA uplink)")
+	}
+}
+
 // TestProbeWiFi_ColdStartReadsStateReason verifies that on piccolod
 // restart with NM in a persistent failure state (e.g. NoSecrets after a
 // wrong-password attempt), the prober falls back to NM's cached

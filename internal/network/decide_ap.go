@@ -70,7 +70,7 @@ func decideAP(tick Tick, led ActionLedger, intent UserIntent, apActive bool) APA
 	}
 
 	// Exit unconditionally when any uplink is reachable.
-	if anyDeviceGwReachable(tick) {
+	if anyDeviceWorking(tick) {
 		if apActive {
 			return APExit{Reason: "uplink restored"}
 		}
@@ -94,7 +94,7 @@ func decideAP(tick Tick, led ActionLedger, intent UserIntent, apActive bool) APA
 	if !configBroken {
 		// Config is healthy or recovering — STA flow handles it.
 		if apActive {
-			// Should not happen (anyDeviceGwReachable would have exited),
+			// Should not happen (anyDeviceWorking would have exited),
 			// but be defensive.
 			return APExit{Reason: "wifi config healthy"}
 		}
@@ -126,9 +126,17 @@ func apEntryPermitted(led ActionLedger, now time.Time) bool {
 	return false
 }
 
-func anyDeviceGwReachable(tick Tick) bool {
+// anyDeviceWorking returns true when any device has a working uplink —
+// either the gateway is ARP-reachable, OR the L3 probe is up via this
+// device's link. ARP-suppressed networks (corp guest WiFi, hotel APs —
+// catalog C8/C9) keep the AP up otherwise, despite working connectivity.
+// Predicate aligned with deriveLegacyState's deviceWorking helper.
+func anyDeviceWorking(tick Tick) bool {
 	for _, obs := range tick.Devices {
-		if obs.GwReachable == TriHealthy {
+		if obs.HWHealth != TriHealthy || obs.ConfigHealth != TriHealthy || !obs.LinkUp {
+			continue
+		}
+		if obs.GwReachable == TriHealthy || tick.L3Probe == L3ProbeUp {
 			return true
 		}
 	}

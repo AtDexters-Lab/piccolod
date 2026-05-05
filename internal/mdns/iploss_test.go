@@ -71,15 +71,15 @@ func TestCheckInterfaceChanges_TransientIPLossDoesNotReconfigure(t *testing.T) {
 		t.Errorf("IPLossTicks = %d, want 2", state.IPLossTicks)
 	}
 
-	// Third consecutive tick crosses the threshold → reconfigure path
-	// (counter resets to 0 once reconfigure fires; conn closure observable
-	// via the original conn becoming unwritable).
+	// Third consecutive tick crosses the threshold → drop stale entry
+	// (counter cannot reset on a deleted entry; the manager will
+	// recreate it via the "new interface" path once IPs return).
 	mgr.checkInterfaceChanges()
-	if state.IPLossTicks != 0 {
-		t.Errorf("IPLossTicks after 3rd tick = %d, want 0 (reconfigure path)", state.IPLossTicks)
+	if _, stillPresent := mgr.interfaces["eth0"]; stillPresent {
+		t.Errorf("expected eth0 entry to be dropped after sustained IP loss; setupInterface cannot succeed without IPs and a stale active entry blocks recovery")
 	}
 	if err := pingConn(originalConn); err == nil {
-		t.Errorf("expected original connection to be closed after reconfigure")
+		t.Errorf("expected original connection to be closed after sustained loss")
 	}
 }
 
@@ -143,6 +143,74 @@ func TestCheckInterfaceChanges_IPRecoveryResetsCounter(t *testing.T) {
 	mgr.checkInterfaceChanges()
 	if state.IPLossTicks != 0 {
 		t.Errorf("IPLossTicks after recovery = %d, want 0", state.IPLossTicks)
+	}
+}
+
+// TestCheckInterfaceChanges_RecoveryAfterSustainedLoss verifies that mDNS
+// resumes once the interface gets a fresh IP after sustained loss. The
+// pre-fix code closed sockets + called setupInterface inline; setupInterface
+// silently failed (no IPs available) and left a stale entry with closed
+// conns, so when the IP returned with the same address, hasIPChanged=false
+// and the default path marked the stale state active without ever
+// reopening sockets — mDNS never resumed.
+func TestCheckInterfaceChanges_RecoveryAfterSustainedLoss(t *testing.T) {
+	interfaceFuncsMu.Lock()
+	origList := listNetworkInterfaces
+	origAddrs := interfaceAddrs
+
+	iface := net.Interface{Name: "eth0", Flags: net.FlagUp | net.FlagMulticast}
+	listNetworkInterfaces = func() ([]net.Interface, error) {
+		return []net.Interface{iface}, nil
+	}
+
+	var hasIP atomic.Bool
+	hasIP.Store(true)
+	ipnet := &net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)}
+	interfaceAddrs = func(*net.Interface) ([]net.Addr, error) {
+		if hasIP.Load() {
+			return []net.Addr{ipnet}, nil
+		}
+		return nil, nil
+	}
+	interfaceFuncsMu.Unlock()
+
+	t.Cleanup(func() {
+		interfaceFuncsMu.Lock()
+		listNetworkInterfaces = origList
+		interfaceAddrs = origAddrs
+		interfaceFuncsMu.Unlock()
+	})
+
+	mgr := NewManager()
+	mgr.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	mgr.ipv6SocketFactory = func(*net.Interface) (*net.UDPConn, error) { return nil, nil }
+	t.Cleanup(func() { _ = mgr.Stop() })
+
+	if err := mgr.discoverInterfaces(); err != nil {
+		t.Fatalf("discoverInterfaces: %v", err)
+	}
+
+	// Drive sustained loss → entry deleted.
+	hasIP.Store(false)
+	for i := 0; i < 3; i++ {
+		mgr.checkInterfaceChanges()
+	}
+	if _, ok := mgr.interfaces["eth0"]; ok {
+		t.Fatalf("expected eth0 dropped after sustained loss")
+	}
+
+	// IP returns. Next tick goes through the "new interface" branch and
+	// recreates the entry with fresh sockets.
+	hasIP.Store(true)
+	mgr.checkInterfaceChanges()
+	state, ok := mgr.interfaces["eth0"]
+	if !ok {
+		t.Fatalf("eth0 not recreated after recovery")
+	}
+	if state.IPv4Conn == nil {
+		t.Errorf("expected fresh IPv4Conn after recovery; got nil")
 	}
 }
 

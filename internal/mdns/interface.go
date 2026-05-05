@@ -426,31 +426,28 @@ func (m *Manager) checkInterfaceChanges() {
 
 			switch {
 			case !ifaceUp:
-				// Interface down — kernel says the link is gone.
+				// Interface down — kernel says the link is gone. Close the
+				// stale conns and DROP the entry; setupInterface refuses to
+				// run on a Down interface, and leaving stale state with
+				// closed conns means recovery never reopens them. The "new
+				// interface detected" branch will pick this back up once
+				// the link returns.
 				log.Printf("INFO: Interface %s down, closing connections", ifaceCopy.Name)
-				if existing.IPv4Conn != nil {
-					existing.IPv4Conn.Close()
-				}
-				if existing.IPv6Conn != nil {
-					existing.IPv6Conn.Close()
-				}
-				existing.IPLossTicks = 0
-				m.setupInterface(&ifaceCopy)
+				closeConns(existing)
+				delete(m.interfaces, ifaceCopy.Name)
 			case ipLost:
 				// IP lost while interface still Up — likely transient (DHCP
 				// renewal, brief carrier drop). Require 3-of-3 ticks before
 				// reconfiguring.
 				existing.IPLossTicks++
 				if existing.IPLossTicks >= 3 {
-					log.Printf("INFO: Sustained IP loss on %s (%d ticks), reconfiguring", ifaceCopy.Name, existing.IPLossTicks)
-					if existing.IPv4Conn != nil {
-						existing.IPv4Conn.Close()
-					}
-					if existing.IPv6Conn != nil {
-						existing.IPv6Conn.Close()
-					}
-					existing.IPLossTicks = 0
-					m.setupInterface(&ifaceCopy)
+					log.Printf("INFO: Sustained IP loss on %s (%d ticks), dropping stale state", ifaceCopy.Name, existing.IPLossTicks)
+					closeConns(existing)
+					// Drop the stale entry — setupInterface cannot succeed
+					// without an IP, and a stale active entry with closed
+					// conns blocks recovery (next-tick default branch
+					// would mark it active without reopening sockets).
+					delete(m.interfaces, ifaceCopy.Name)
 				} else {
 					existing.Active = true
 					existing.LastSeen = time.Now()
@@ -458,14 +455,14 @@ func (m *Manager) checkInterfaceChanges() {
 			case ipChanged:
 				// IP changed to a new value (network move) — legitimate change.
 				log.Printf("INFO: IP changed on interface %s, reconfiguring", ifaceCopy.Name)
-				if existing.IPv4Conn != nil {
-					existing.IPv4Conn.Close()
-				}
-				if existing.IPv6Conn != nil {
-					existing.IPv6Conn.Close()
-				}
+				closeConns(existing)
 				existing.IPLossTicks = 0
-				m.setupInterface(&ifaceCopy)
+				if err := m.setupInterface(&ifaceCopy); err != nil {
+					// New IP turned out to be unusable — drop the entry
+					// rather than leaving closed sockets active.
+					log.Printf("WARN: Failed to reconfigure interface %s after IP change: %v", ifaceCopy.Name, err)
+					delete(m.interfaces, ifaceCopy.Name)
+				}
 			default:
 				existing.IPLossTicks = 0
 				existing.Active = true
@@ -544,6 +541,18 @@ func (m *Manager) checkInterfaceChanges() {
 			m.sendMultiInterfaceAnnouncements()
 			m.sendPeerDiscoveryQuery()
 		}()
+	}
+}
+
+// closeConns closes both IPv4 and IPv6 connections of an InterfaceState
+// (no-op for nils). Used by the recovery paths in checkInterfaceChanges
+// before either reconfiguring or dropping the stale entry.
+func closeConns(s *InterfaceState) {
+	if s.IPv4Conn != nil {
+		s.IPv4Conn.Close()
+	}
+	if s.IPv6Conn != nil {
+		s.IPv6Conn.Close()
 	}
 }
 

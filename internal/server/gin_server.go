@@ -1359,17 +1359,21 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		s.networkManager = networkMgr
 
 		// Build the supervisor with a SystemState backed by the bus's
-		// onboarding-state channel.
+		// onboarding-state channel. Order matters: register networkMgr
+		// FIRST so its Start runs (and SetPortalCallbacks is invoked)
+		// before the supervisor's first tick can fire APEnter — otherwise
+		// the hotspot would activate without a captive portal attached
+		// and setting callbacks later would not backfill it.
 		sys := network.NewBusSystemState(context.Background(), eventsBus)
 		netSup, supErr := network.BuildSupervisor(context.Background(), execRunner, sys)
 		if supErr != nil {
 			log.Printf("WARN: net-supervisor: private bus init failed (%v) — supervisor disabled", supErr)
+			s.supervisor.Register(networkMgr)
 		} else {
 			networkMgr.AttachSupervisor(netSup)
+			s.supervisor.Register(networkMgr) // must come before netSup
 			s.supervisor.Register(netSup)
 		}
-
-		s.supervisor.Register(networkMgr)
 		healthTracker.Setf("network", health.LevelWarn, "network manager initializing")
 	}
 

@@ -35,10 +35,11 @@ type Prober struct {
 	sys    SystemState
 
 	// dampener counters
-	mu              sync.Mutex
-	consecHWFault   map[DeviceKind]int
-	consecL3Down    int
-	lastReasonByDev map[dbus.ObjectPath]nmclient.NMDeviceStateReason
+	mu                sync.Mutex
+	consecHWFault     map[DeviceKind]int
+	consecConfigFault map[DeviceKind]int
+	consecL3Down      int
+	lastReasonByDev   map[dbus.ObjectPath]nmclient.NMDeviceStateReason
 
 	// device path cache — written by probeWiFi/probeEth, read by L3 probe
 	// and signal subscription. Reset on each tick by Probe().
@@ -55,12 +56,13 @@ type Prober struct {
 // signal-subscription goroutine that caches the last NMReason per device.
 func NewProber(nm nmclient.Client, r runner.CommandRunner, sys SystemState) *Prober {
 	return &Prober{
-		nm:              nm,
-		runner:          r,
-		sys:             sys,
-		consecHWFault:   make(map[DeviceKind]int),
-		lastReasonByDev: make(map[dbus.ObjectPath]nmclient.NMDeviceStateReason),
-		devicePath:      make(map[DeviceKind]dbus.ObjectPath),
+		nm:                nm,
+		runner:            r,
+		sys:               sys,
+		consecHWFault:     make(map[DeviceKind]int),
+		consecConfigFault: make(map[DeviceKind]int),
+		lastReasonByDev:   make(map[dbus.ObjectPath]nmclient.NMDeviceStateReason),
+		devicePath:        make(map[DeviceKind]dbus.ObjectPath),
 	}
 }
 
@@ -239,6 +241,34 @@ func (p *Prober) dampenHW(kind DeviceKind, candidate Tri, led ActionLedger, now 
 		return TriHealthy
 	}
 	p.consecHWFault[kind] = 0
+	return candidate
+}
+
+// dampenConfigFault applies 3-of-3 dampening + quiet-period suppression
+// for a Config fault candidate (e.g. saved profile + non-Activated +
+// non-Activating NM state). Mirrors dampenHW: quiet period freezes the
+// counter at 0 (we just bounced; let things settle); else accumulate
+// 3-of-3 before promoting to Faulted.
+func (p *Prober) dampenConfigFault(kind DeviceKind, candidate Tri, led ActionLedger, now time.Time) Tri {
+	if last, ok := led.LastBounceAt[kind]; ok && now.Sub(last) < QuietPeriod {
+		p.mu.Lock()
+		p.consecConfigFault[kind] = 0
+		p.mu.Unlock()
+		return TriHealthy
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if candidate == TriFaulted {
+		if p.consecConfigFault[kind] < NofM {
+			p.consecConfigFault[kind]++
+		}
+		if p.consecConfigFault[kind] >= NofM {
+			return TriFaulted
+		}
+		return TriHealthy
+	}
+	p.consecConfigFault[kind] = 0
 	return candidate
 }
 
