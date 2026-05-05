@@ -7,9 +7,14 @@ import (
 	"piccolod/internal/services/middleware"
 )
 
-// MetricsSample is a single observed event keyed by (Listener, SourceIP,
+// MetricsSample is a single observed event keyed by (App, Listener, SourceIP,
 // DenyReason). DenyReason is empty for accepted connections.
+//
+// App is required because listener names are unique only within an app:
+// two installed apps each declaring a listener named "web" would otherwise
+// share counters for the same source IP and silently mix tenants.
 type MetricsSample struct {
+	App        string
 	Listener   string
 	SourceIP   string
 	DenyReason string
@@ -50,21 +55,21 @@ func NewMetricsRegistry() *MetricsRegistry {
 	}
 }
 
-// RecordReceived increments the received counter for (listener, sourceIP).
+// RecordReceived increments the received counter for (app, listener, sourceIP).
 // Called by ConnMetrics for every conn observed at the L4 chain entry.
-func (r *MetricsRegistry) RecordReceived(listener, sourceIP string) {
+func (r *MetricsRegistry) RecordReceived(app, listener, sourceIP string) {
 	r.mu.Lock()
-	r.received[MetricsSample{Listener: listener, SourceIP: sourceIP}]++
+	r.received[MetricsSample{App: app, Listener: listener, SourceIP: sourceIP}]++
 	r.mu.Unlock()
 }
 
-// RecordDenied increments the denied counter for (listener, sourceIP, reason).
+// RecordDenied increments the denied counter for (app, listener, sourceIP, reason).
 // Each rule middleware (ip_allowlist, ip_rate_limit, connection_auth) calls
 // this directly with its own reason label before returning without calling
 // next. ConnMetrics never invents a deny — rule middlewares own that surface.
-func (r *MetricsRegistry) RecordDenied(listener, sourceIP, reason string) {
+func (r *MetricsRegistry) RecordDenied(app, listener, sourceIP, reason string) {
 	r.mu.Lock()
-	r.denied[MetricsSample{Listener: listener, SourceIP: sourceIP, DenyReason: reason}]++
+	r.denied[MetricsSample{App: app, Listener: listener, SourceIP: sourceIP, DenyReason: reason}]++
 	r.mu.Unlock()
 }
 
@@ -98,7 +103,7 @@ func (r *MetricsRegistry) Snapshot() MetricsSnapshot {
 func ConnMetrics(reg *MetricsRegistry) middleware.L4Middleware {
 	return func(next middleware.ConnHandler) middleware.ConnHandler {
 		return func(ctx middleware.ConnContext, c net.Conn) {
-			reg.RecordReceived(ctx.Endpoint.Listener, sourceIPLabel(ctx))
+			reg.RecordReceived(ctx.Endpoint.App, ctx.Endpoint.Listener, sourceIPLabel(ctx))
 			next(ctx, c)
 		}
 	}
@@ -108,7 +113,7 @@ func ConnMetrics(reg *MetricsRegistry) middleware.L4Middleware {
 func ConnMetricsUDP(reg *MetricsRegistry) middleware.L4UDPMiddleware {
 	return func(next middleware.UDPHandler) middleware.UDPHandler {
 		return func(ctx middleware.UDPContext, payload []byte, sink middleware.UDPSink) {
-			reg.RecordReceived(ctx.Endpoint.Listener, udpSourceIPLabel(ctx))
+			reg.RecordReceived(ctx.Endpoint.App, ctx.Endpoint.Listener, udpSourceIPLabel(ctx))
 			next(ctx, payload, sink)
 		}
 	}

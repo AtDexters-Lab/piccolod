@@ -11,9 +11,12 @@
 //
 //   - L7 chain: operates on http.Handler. Applies only when piccolod parses
 //     the application protocol (flow:tcp + protocol:http|websocket). Sees
-//     full request, headers, path, method. Built-ins: forwarded_scrub,
-//     hint_consumer_l7, path_normalize, reserved_path_intercept, path_auth,
-//     proxy_oidc, oidc_authorize_snapshot, forward_headers, reverse_proxy.
+//     full request, headers, path, method. As-built canonical chain (in
+//     execution order): forwarded_scrub, path_normalize, hint_consumer_l7,
+//     reserved_path_intercept, strip_piccolo_headers, acme_bypass,
+//     path_auth, cookie_context, oidc_authorize_snapshot, forward_headers
+//     (terminal: gzip + httputil.ReverseProxy is wired by the services
+//     package, not registered in the registry).
 //     Plus response-side ResponseModifier chain composed into a single
 //     httputil.ReverseProxy.ModifyResponse: security_headers_response,
 //     cookie_isolation_response, embedded_marker_response,

@@ -149,9 +149,10 @@ func (l *ipRateLimiter) allow(ipKey string) bool {
 	return false
 }
 
-// IPRateLimit constructs an L4 (TCP) ip_rate_limit middleware. Denied
-// connections are closed; metrics record the deny event with reason
-// "ip_rate_limit".
+// IPRateLimit constructs an L4 (TCP) ip_rate_limit middleware. The chain
+// signals deny by returning without calling next; the chain entry closes
+// the conn (see IPAllowlist comment for the contract). Metrics record the
+// deny event with reason "ip_rate_limit".
 func IPRateLimit(params map[string]any, metrics *MetricsRegistry) (middleware.L4Middleware, error) {
 	cfg, err := parseIPRateLimitParams(params)
 	if err != nil {
@@ -166,7 +167,7 @@ func IPRateLimit(params map[string]any, metrics *MetricsRegistry) (middleware.L4
 				next(ctx, c)
 				return
 			}
-			recordDeny(metrics, ctx.Endpoint.Listener, ip, "ip_rate_limit")
+			recordDeny(metrics, ctx.Endpoint.App, ctx.Endpoint.Listener, ip, "ip_rate_limit")
 		}
 	}, nil
 }
@@ -182,14 +183,14 @@ func IPRateLimitUDP(params map[string]any, metrics *MetricsRegistry) (middleware
 		return func(ctx middleware.UDPContext, payload []byte, sink middleware.UDPSink) {
 			var ip net.IP
 			if ctx.Source != nil {
-				ip = ctx.Source.IP
+				ip = middleware.CanonicalIP(ctx.Source.IP)
 			}
 			key := ipRateKey(ip)
 			if limiter.allow(key) {
 				next(ctx, payload, sink)
 				return
 			}
-			recordDeny(metrics, ctx.Endpoint.Listener, ip, "ip_rate_limit")
+			recordDeny(metrics, ctx.Endpoint.App, ctx.Endpoint.Listener, ip, "ip_rate_limit")
 		}
 	}, nil
 }

@@ -83,11 +83,11 @@ func TestConnMetrics_recordsReceivedForEveryConn(t *testing.T) {
 	mw(terminal)(mkCtx("192.0.2.2", nil), &stubConn{})
 
 	snap := reg.Snapshot()
-	if snap.Received[MetricsSample{Listener: "lstn", SourceIP: "192.0.2.1"}] != 2 {
-		t.Errorf("received[192.0.2.1] = %d, want 2", snap.Received[MetricsSample{Listener: "lstn", SourceIP: "192.0.2.1"}])
+	if snap.Received[MetricsSample{App: "app", Listener: "lstn", SourceIP: "192.0.2.1"}] != 2 {
+		t.Errorf("received[192.0.2.1] = %d, want 2", snap.Received[MetricsSample{App: "app", Listener: "lstn", SourceIP: "192.0.2.1"}])
 	}
-	if snap.Received[MetricsSample{Listener: "lstn", SourceIP: "192.0.2.2"}] != 1 {
-		t.Errorf("received[192.0.2.2] = %d, want 1", snap.Received[MetricsSample{Listener: "lstn", SourceIP: "192.0.2.2"}])
+	if snap.Received[MetricsSample{App: "app", Listener: "lstn", SourceIP: "192.0.2.2"}] != 1 {
+		t.Errorf("received[192.0.2.2] = %d, want 1", snap.Received[MetricsSample{App: "app", Listener: "lstn", SourceIP: "192.0.2.2"}])
 	}
 	if len(snap.Denied) != 0 {
 		t.Errorf("denied should be empty, got %v", snap.Denied)
@@ -104,7 +104,7 @@ func TestConnMetrics_recordsReceivedEvenWhenDownstreamDenies(t *testing.T) {
 	denyMW := middleware.L4Middleware(func(_ middleware.ConnHandler) middleware.ConnHandler {
 		return middleware.ConnHandler(func(ctx middleware.ConnContext, _ net.Conn) {
 			ip := middleware.EffectiveSourceIP(ctx)
-			reg.RecordDenied(ctx.Endpoint.Listener, ip.String(), "test_rule")
+			reg.RecordDenied(ctx.Endpoint.App, ctx.Endpoint.Listener, ip.String(), "test_rule")
 		})
 	})
 	terminal := middleware.ConnHandler(func(_ middleware.ConnContext, _ net.Conn) {})
@@ -112,10 +112,10 @@ func TestConnMetrics_recordsReceivedEvenWhenDownstreamDenies(t *testing.T) {
 	chain(mkCtx("192.0.2.2", nil), &stubConn{})
 
 	snap := reg.Snapshot()
-	if snap.Received[MetricsSample{Listener: "lstn", SourceIP: "192.0.2.2"}] != 1 {
+	if snap.Received[MetricsSample{App: "app", Listener: "lstn", SourceIP: "192.0.2.2"}] != 1 {
 		t.Errorf("received = %v, want 1", snap.Received)
 	}
-	if snap.Denied[MetricsSample{Listener: "lstn", SourceIP: "192.0.2.2", DenyReason: "test_rule"}] != 1 {
+	if snap.Denied[MetricsSample{App: "app", Listener: "lstn", SourceIP: "192.0.2.2", DenyReason: "test_rule"}] != 1 {
 		t.Errorf("denied = %v, want 1", snap.Denied)
 	}
 }
@@ -182,7 +182,7 @@ func TestIPAllowlist_allowDenyDefault(t *testing.T) {
 				t.Errorf("terminal called = %v, want %v", called, tc.wantOK)
 			}
 			snap := reg.Snapshot()
-			denied := snap.Denied[MetricsSample{Listener: "lstn", SourceIP: net.ParseIP(tc.ip).String(), DenyReason: "ip_allowlist"}]
+			denied := snap.Denied[MetricsSample{App: "app", Listener: "lstn", SourceIP: net.ParseIP(tc.ip).String(), DenyReason: "ip_allowlist"}]
 			gotDen := denied > 0
 			if gotDen != tc.wantDen {
 				t.Errorf("metrics denied count = %d, want recorded=%v", denied, tc.wantDen)
@@ -227,7 +227,7 @@ func TestIPRateLimit_burstThenDeny(t *testing.T) {
 		t.Errorf("calls = %d, want 3 (burst)", calls)
 	}
 	snap := reg.Snapshot()
-	denied := snap.Denied[MetricsSample{Listener: "lstn", SourceIP: "192.0.2.7", DenyReason: "ip_rate_limit"}]
+	denied := snap.Denied[MetricsSample{App: "app", Listener: "lstn", SourceIP: "192.0.2.7", DenyReason: "ip_rate_limit"}]
 	if denied != 2 {
 		t.Errorf("denied count = %d, want 2", denied)
 	}

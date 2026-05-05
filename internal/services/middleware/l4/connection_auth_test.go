@@ -79,7 +79,7 @@ func TestConnectionAuth_decisionMatrix(t *testing.T) {
 				t.Errorf("terminal called = %v, want %v", called, tc.wantOK)
 			}
 			snap := reg.Snapshot()
-			denied := snap.Denied[MetricsSample{Listener: "lstn", SourceIP: net.ParseIP(tc.ip).String(), DenyReason: "connection_auth"}]
+			denied := snap.Denied[MetricsSample{App: "app", Listener: "lstn", SourceIP: net.ParseIP(tc.ip).String(), DenyReason: "connection_auth"}]
 			gotDen := denied > 0
 			if gotDen != tc.wantDen {
 				t.Errorf("metrics denied = %d, want recorded=%v", denied, tc.wantDen)

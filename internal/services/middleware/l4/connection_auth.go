@@ -81,7 +81,7 @@ func ConnectionAuth(cfg *api.ConnectionAuth, metrics *MetricsRegistry) (middlewa
 				next(ctx, c)
 				return
 			}
-			recordDeny(metrics, ctx.Endpoint.Listener, ip, "connection_auth")
+			recordDeny(metrics, ctx.Endpoint.App, ctx.Endpoint.Listener, ip, "connection_auth")
 		}
 	}, nil
 }
@@ -96,13 +96,13 @@ func ConnectionAuthUDP(cfg *api.ConnectionAuth, metrics *MetricsRegistry) (middl
 		return func(ctx middleware.UDPContext, payload []byte, sink middleware.UDPSink) {
 			var ip net.IP
 			if ctx.Source != nil {
-				ip = ctx.Source.IP
+				ip = middleware.CanonicalIP(ctx.Source.IP)
 			}
 			if connectionAuthDecide(rules, def, ip) {
 				next(ctx, payload, sink)
 				return
 			}
-			recordDeny(metrics, ctx.Endpoint.Listener, ip, "connection_auth")
+			recordDeny(metrics, ctx.Endpoint.App, ctx.Endpoint.Listener, ip, "connection_auth")
 		}
 	}, nil
 }

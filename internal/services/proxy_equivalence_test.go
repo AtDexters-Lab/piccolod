@@ -5,8 +5,11 @@ import (
 	"testing"
 
 	"piccolod/internal/api"
+	"piccolod/internal/services/middleware"
 	"piccolod/internal/services/middleware/builtin"
+	"piccolod/internal/services/middleware/l4"
 	"piccolod/internal/services/middleware/l7"
+	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 )
 
 // proxy_equivalence_test.go is the plan §H step-3 behavior-preservation
@@ -74,25 +77,34 @@ func TestProxyEquivalence_DepTypesMatchFactoryExpectations(t *testing.T) {
 	defer pm.StopAll()
 
 	ep := ServiceEndpoint{App: "app", Name: "lstn", Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}
-	deps := pm.buildL7Deps(ep)
+	l7Deps := pm.buildL7Deps(ep)
+	l4Deps := pm.buildL4Deps(ep)
 
 	type assertion struct {
+		deps  middleware.RegistryDeps
 		key   string
 		check func(any) bool
 	}
 	checks := []assertion{
-		{builtin.DepHintConsumerL7, func(v any) bool { _, ok := v.(func(*http.Request) *http.Request); return ok }},
-		{builtin.DepACMEHandler, func(v any) bool { _, ok := v.(l7.ACMEHandlerFn); return ok }},
-		{builtin.DepArrivedViaTLS, func(v any) bool { _, ok := v.(l7.ArrivedViaTLSFn); return ok }},
-		{builtin.DepPathAuthSnapshot, func(v any) bool { _, ok := v.(func() l7.PathAuthSnapshot); return ok }},
-		{builtin.DepCookieContext, func(v any) bool { _, ok := v.(func(*http.Request) *http.Request); return ok }},
-		{builtin.DepForwardHeaders, func(v any) bool { _, ok := v.(func(*http.Request)); return ok }},
-		{builtin.DepNeedsMarker, func(v any) bool { _, ok := v.(l7.NeedsMarkerFn); return ok }},
-		{builtin.DepMarkerCookie, func(v any) bool { _, ok := v.(l7.MarkerCookieFn); return ok }},
+		// L4 deps.
+		{l4Deps, builtin.DepHintLookupL4, func(v any) bool { _, ok := v.(l4.HintLookupFn); return ok }},
+		{l4Deps, builtin.DepMetricsRegistry, func(v any) bool { _, ok := v.(*l4.MetricsRegistry); return ok }},
+
+		// L7 deps.
+		{l7Deps, builtin.DepHintConsumerL7, func(v any) bool { _, ok := v.(func(*http.Request) *http.Request); return ok }},
+		{l7Deps, builtin.DepReservedPathCallback, func(v any) bool { _, ok := v.(func() l7oidc.CallbackHandlerFn); return ok }},
+		{l7Deps, builtin.DepACMEHandler, func(v any) bool { _, ok := v.(l7.ACMEHandlerFn); return ok }},
+		{l7Deps, builtin.DepArrivedViaTLS, func(v any) bool { _, ok := v.(l7.ArrivedViaTLSFn); return ok }},
+		{l7Deps, builtin.DepPathAuthSnapshot, func(v any) bool { _, ok := v.(func() l7.PathAuthSnapshot); return ok }},
+		{l7Deps, builtin.DepCookieContext, func(v any) bool { _, ok := v.(func(*http.Request) *http.Request); return ok }},
+		{l7Deps, builtin.DepOIDCAuthorizeSnapshot, func(v any) bool { _, ok := v.(func() l7oidc.AuthorizeSnapshotState); return ok }},
+		{l7Deps, builtin.DepForwardHeaders, func(v any) bool { _, ok := v.(func(*http.Request)); return ok }},
+		{l7Deps, builtin.DepNeedsMarker, func(v any) bool { _, ok := v.(l7.NeedsMarkerFn); return ok }},
+		{l7Deps, builtin.DepMarkerCookie, func(v any) bool { _, ok := v.(l7.MarkerCookieFn); return ok }},
 	}
 
 	for _, c := range checks {
-		v := deps.Get(c.key)
+		v := c.deps.Get(c.key)
 		if v == nil {
 			t.Errorf("dep %q: nil", c.key)
 			continue

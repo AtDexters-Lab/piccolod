@@ -38,7 +38,7 @@ type ServiceEndpoint struct {
 	Flow             api.ListenerFlow            `json:"flow"`
 	Protocol         api.ListenerProtocol        `json:"protocol"`
 	Primary          bool                        `json:"primary,omitempty"`            // Is this the primary listener for host-based routing?
-	DerivedHostLabel string                      `json:"derived_host_label,omitempty"` // "<app>" for primary, "<listener>-<app>" for others, "" for raw(tcp)/udp
+	DerivedHostLabel string                      `json:"derived_host_label,omitempty"` // "<app>" for primary, "<listener>-<app>" for others, "" for udp (per RFC 20260505 §3.5 raw(tcp) is now host-routable via TLS mux SNI)
 	Middleware       []api.AppProtocolMiddleware `json:"middleware"`
 	RemotePorts      []int                       `json:"remote_ports"`
 	LocalURL         string                      `json:"local_url,omitempty"` // Optional pre-calculated LAN URL

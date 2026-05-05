@@ -24,9 +24,13 @@ import (
 // transitional inlines that wrap services-internal closures via deps. They
 // retire in step 9 when the hint chain migrates to middleware.HintFromContext.
 const (
-	// L4 (TCP) + L4UDP canonical names.
-	NameHintConsumerL4 = "hint_consumer_l4"
-	NameConnMetrics    = "conn_metrics"
+	// L4 (TCP) + L4UDP canonical names. UDP variants have explicit
+	// constants rather than `+ "_udp"` string concatenation so a future
+	// rename catches every site via the type checker.
+	NameHintConsumerL4    = "hint_consumer_l4"
+	NameConnMetrics       = "conn_metrics"
+	NameConnMetricsUDP    = "conn_metrics_udp"
+	NameConnectionAuthUDP = "connection_auth_udp"
 	// L4 / L4UDP operator-listable names.
 	NameIPAllowlist = "ip_allowlist"
 	NameIPRateLimit = "ip_rate_limit"
@@ -52,7 +56,6 @@ const (
 // time.
 const (
 	DepHintLookupL4    = "hint_consumer_l4.lookup" // l4.HintLookupFn
-	DepListenerPort    = "shared.listener_port"    // int
 	DepMetricsRegistry = "shared.metrics_registry" // *l4.MetricsRegistry
 
 	DepHintConsumerL7        = "hint_consumer_l7.consume"            // func(*http.Request) *http.Request
@@ -71,16 +74,24 @@ const (
 // chain factories plus the operator-listable IP-rule built-ins. Call once
 // per Registry (services package wires this in NewProxyManager).
 func RegisterDefaults(reg *middleware.Registry) {
-	// L4 (TCP) canonical chain order per plan §D7:
-	//   hint_consumer_l4 → connection_auth (gated) → conn_metrics
-	// Outermost first; innermost (conn_metrics) records counts post-decision.
+	// L4 (TCP) canonical chain order:
+	//   conn_metrics → hint_consumer_l4 → connection_auth (gated) → ...rules
+	// conn_metrics is OUTERMOST so its Received counter sees every conn at
+	// L4 chain entry (pre-decision intake) per plan §D19 F9 fix —
+	// operators need intake rate for storm detection, not admit rate.
+	// Effective accept = Received − sum(Denied per IP). hint_consumer_l4
+	// runs next so connection_auth (and any operator-listed ip_allowlist /
+	// ip_rate_limit appended after) can read the resolved hint via
+	// EffectiveSourceIP.
+	reg.RegisterCanonical(NameConnMetrics, middleware.LayerL4, factoryConnMetrics)
 	reg.RegisterCanonical(NameHintConsumerL4, middleware.LayerL4, factoryHintConsumerL4)
 	reg.RegisterCanonical(middleware.NameConnectionAuth, middleware.LayerL4, factoryConnectionAuth) // conditionally canonical
-	reg.RegisterCanonical(NameConnMetrics, middleware.LayerL4, factoryConnMetrics)
 
-	// L4UDP canonical mirror — same order, UDP variant.
-	reg.RegisterCanonical(middleware.NameConnectionAuth+"_udp", middleware.LayerL4UDP, factoryConnectionAuthUDP) // conditionally canonical
-	reg.RegisterCanonical(NameConnMetrics+"_udp", middleware.LayerL4UDP, factoryConnMetricsUDP)
+	// L4UDP canonical mirror — same intake-counter-first ordering. UDP has
+	// no hint_consumer (datagrams don't traverse the secure-loopback hop
+	// today; ConnContext.Hint is L4-only).
+	reg.RegisterCanonical(NameConnMetricsUDP, middleware.LayerL4UDP, factoryConnMetricsUDP)
+	reg.RegisterCanonical(NameConnectionAuthUDP, middleware.LayerL4UDP, factoryConnectionAuthUDP) // conditionally canonical
 
 	// L4 / L4UDP operator-listable IP-rule middlewares. Both layers share a
 	// single name — Build picks the appropriate signature based on the
@@ -88,14 +99,29 @@ func RegisterDefaults(reg *middleware.Registry) {
 	reg.Register(NameIPAllowlist, []middleware.Layer{middleware.LayerL4, middleware.LayerL4UDP}, factoryIPAllowlist)
 	reg.Register(NameIPRateLimit, []middleware.Layer{middleware.LayerL4, middleware.LayerL4UDP}, factoryIPRateLimit)
 
-	// Request-side L7 — canonical order matches plan §H.
+	// Request-side L7 chain — order is the as-built canonical sequence,
+	// supersedes plan §D7's earlier 8-entry sketch (which described
+	// proxy_oidc as one bundled middleware; the implementation decomposed
+	// it into reserved_path_intercept + oidc_authorize_snapshot, and added
+	// strip_piccolo_headers + acme_bypass + cookie_context as separately-
+	// composable concerns). RFC 20260505 §3.3 documents the as-built order.
+	//
+	// path_auth is composed UNCONDITIONALLY (true gate, not HasAuth) because
+	// RFC 4.1.1 says auth omitted → all paths "protected". The middleware
+	// itself implements this default via ListenerStrategyForPath; gating
+	// composition would silently disable enforcement on listeners that
+	// omit the auth block (B1 finding).
+	//
+	// Ordering invariant: hint_consumer_l7 MUST run BEFORE
+	// strip_piccolo_headers because the X-Piccolo-Hint-Token header is in
+	// the X-Piccolo-* namespace that strip_piccolo_headers scrubs.
 	reg.RegisterCanonical(NameForwardedScrub, middleware.LayerL7, factoryForwardedScrub)
 	reg.RegisterCanonical(NamePathNormalize, middleware.LayerL7, factoryPathNormalize)
 	reg.RegisterCanonical(NameHintConsumerL7, middleware.LayerL7, factoryHintConsumerL7)
 	reg.RegisterCanonical(NameReservedPathIntercept, middleware.LayerL7, factoryReservedPathIntercept)
 	reg.RegisterCanonical(NameStripPiccoloHeaders, middleware.LayerL7, factoryStripPiccoloHeaders)
 	reg.RegisterCanonical(NameACMEBypass, middleware.LayerL7, factoryACMEBypass)
-	reg.RegisterCanonical(middleware.NamePathAuth, middleware.LayerL7, factoryPathAuth) // conditionally canonical
+	reg.RegisterCanonical(middleware.NamePathAuth, middleware.LayerL7, factoryPathAuth) // gated true; see comment above
 	reg.RegisterCanonical(NameCookieContext, middleware.LayerL7, factoryCookieContext)
 	reg.RegisterCanonical(NameOIDCAuthorizeSnapshot, middleware.LayerL7, factoryOIDCAuthorizeSnapshot)
 	reg.RegisterCanonical(NameForwardHeaders, middleware.LayerL7, factoryForwardHeaders)

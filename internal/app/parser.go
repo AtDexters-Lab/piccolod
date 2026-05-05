@@ -1325,21 +1325,26 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 
 		// RFC 20260112 §ConnectionAuth: L4 IP-based access rules. Permitted on
 		// every flow including UDP (per plan §D6 / §D12). Rules must carry
-		// strategy ∈ {allow, deny} and a parseable CIDR.
+		// strategy ∈ {allow, deny} and a parseable CIDR. Trim-and-store so
+		// the runtime middleware (`l4.parseConnectionAuth`) sees clean values
+		// — without this, a manifest with `default: " allow"` would pass
+		// parser validation and then fail-build at proxy startup.
 		if l.ConnectionAuth != nil {
-			if d := strings.TrimSpace(l.ConnectionAuth.Default); d != "" && d != "allow" && d != "deny" {
+			l.ConnectionAuth.Default = strings.TrimSpace(l.ConnectionAuth.Default)
+			if d := l.ConnectionAuth.Default; d != "" && d != "allow" && d != "deny" {
 				return newValidationError("INVALID_CONN_AUTH_DEFAULT", fmt.Sprintf("listener '%s' connection_auth.default must be \"allow\" or \"deny\", got %q", l.Name, d))
 			}
-			for j, rule := range l.ConnectionAuth.Rules {
-				strategy := strings.TrimSpace(rule.Strategy)
-				if strategy != "allow" && strategy != "deny" {
+			for j := range l.ConnectionAuth.Rules {
+				rule := &l.ConnectionAuth.Rules[j]
+				rule.Strategy = strings.TrimSpace(rule.Strategy)
+				rule.Match = strings.TrimSpace(rule.Match)
+				if rule.Strategy != "allow" && rule.Strategy != "deny" {
 					return newValidationError("INVALID_CONN_AUTH_STRATEGY", fmt.Sprintf("listener '%s' connection_auth.rules[%d].strategy must be \"allow\" or \"deny\", got %q", l.Name, j, rule.Strategy))
 				}
-				match := strings.TrimSpace(rule.Match)
-				if match == "" {
+				if rule.Match == "" {
 					return newValidationError("INVALID_CONN_AUTH_MATCH", fmt.Sprintf("listener '%s' connection_auth.rules[%d].match is required", l.Name, j))
 				}
-				if _, _, err := net.ParseCIDR(match); err != nil {
+				if _, _, err := net.ParseCIDR(rule.Match); err != nil {
 					return newValidationError("INVALID_CONN_AUTH_MATCH", fmt.Sprintf("listener '%s' connection_auth.rules[%d].match: invalid CIDR %q: %v", l.Name, j, rule.Match, err))
 				}
 			}

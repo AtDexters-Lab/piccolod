@@ -101,9 +101,11 @@ func ipAllowlistDecide(cfg *ipAllowlistConfig, ip net.IP) bool {
 	return cfg.Default == "allow"
 }
 
-// IPAllowlist constructs an L4 (TCP) ip_allowlist middleware. Denied
-// connections are closed (the chain returns without calling next) and the
-// metrics registry receives a deny event with reason "ip_allowlist".
+// IPAllowlist constructs an L4 (TCP) ip_allowlist middleware. The chain
+// signals deny by returning without calling next; the chain entry
+// (l4AcceptBridge for HTTP listeners, the dispatch helper in startTCPProxy
+// for raw/TLS listeners) closes the conn on deny. The metrics registry
+// receives a deny event with reason "ip_allowlist".
 func IPAllowlist(params map[string]any, metrics *MetricsRegistry) (middleware.L4Middleware, error) {
 	cfg, err := parseIPAllowlistParams(params)
 	if err != nil {
@@ -116,7 +118,7 @@ func IPAllowlist(params map[string]any, metrics *MetricsRegistry) (middleware.L4
 				next(ctx, c)
 				return
 			}
-			recordDeny(metrics, ctx.Endpoint.Listener, ip, "ip_allowlist")
+			recordDeny(metrics, ctx.Endpoint.App, ctx.Endpoint.Listener, ip, "ip_allowlist")
 		}
 	}, nil
 }
@@ -132,18 +134,18 @@ func IPAllowlistUDP(params map[string]any, metrics *MetricsRegistry) (middleware
 		return func(ctx middleware.UDPContext, payload []byte, sink middleware.UDPSink) {
 			var ip net.IP
 			if ctx.Source != nil {
-				ip = ctx.Source.IP
+				ip = middleware.CanonicalIP(ctx.Source.IP)
 			}
 			if ipAllowlistDecide(cfg, ip) {
 				next(ctx, payload, sink)
 				return
 			}
-			recordDeny(metrics, ctx.Endpoint.Listener, ip, "ip_allowlist")
+			recordDeny(metrics, ctx.Endpoint.App, ctx.Endpoint.Listener, ip, "ip_allowlist")
 		}
 	}, nil
 }
 
-func recordDeny(metrics *MetricsRegistry, listener string, ip net.IP, reason string) {
+func recordDeny(metrics *MetricsRegistry, app, listener string, ip net.IP, reason string) {
 	if metrics == nil {
 		return
 	}
@@ -151,5 +153,5 @@ func recordDeny(metrics *MetricsRegistry, listener string, ip net.IP, reason str
 	if ip != nil {
 		src = ip.String()
 	}
-	metrics.RecordDenied(listener, src, reason)
+	metrics.RecordDenied(app, listener, src, reason)
 }

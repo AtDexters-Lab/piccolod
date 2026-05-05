@@ -5,13 +5,15 @@ import (
 	"sync"
 )
 
-// Canonical middleware names. These are the names step 5+ will use when registering
-// the corresponding factories via RegisterCanonical, and they're referenced here so
-// the conditional-canonical gate (canonicalApplies) and the factories share a single
-// source of truth for the spelling.
+// Canonical middleware names that the conditional-canonical gate
+// (canonicalApplies) needs to recognize. Defined here (in middleware/) so
+// canonicalApplies can switch on them without importing the builtin
+// subpackage. Other names (forwarded_scrub, conn_metrics, etc.) are
+// always-canonical and live in builtin/builtin.go.
 const (
-	NameConnectionAuth = "connection_auth"
-	NamePathAuth       = "path_auth"
+	NameConnectionAuth    = "connection_auth"
+	NameConnectionAuthUDP = "connection_auth_udp"
+	NamePathAuth          = "path_auth"
 )
 
 // Registry holds named middleware factories. Factories register at package init time
@@ -292,7 +294,7 @@ func buildLayer[M any](r *Registry, spec BuildSpec, layer Layer) ([]M, error) {
 // rather than continuing to grow the switch + Has* fields.
 func canonicalApplies(name string, spec BuildSpec) bool {
 	switch name {
-	case NameConnectionAuth, NameConnectionAuth + "_udp":
+	case NameConnectionAuth, NameConnectionAuthUDP:
 		return spec.HasConnectionAuth
 	case NamePathAuth:
 		return spec.HasAuth

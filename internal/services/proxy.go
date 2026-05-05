@@ -459,10 +459,9 @@ func (p *ProxyManager) handleConn(ep ServiceEndpoint, client net.Conn) {
 func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
 	mwEndpoint := ep.AsMiddlewareInfo()
 
-	// Build L4 chain via the registry. With no L4 factories registered today,
-	// the chain is empty and ComposeL4Chain returns the terminal unchanged.
-	// Step 5 lands the canonical L4 entries (ip_allowlist, ip_rate_limit,
-	// conn_metrics, hint_consumer_l4) and step 6 adds connection_auth.
+	// Build the L4 chain via the registry. Default canonical chain is
+	// conn_metrics → hint_consumer_l4 → connection_auth (gated). Operator-
+	// listed ip_allowlist / ip_rate_limit append after.
 	l4Mws, err := p.registry.BuildL4(middleware.BuildSpec{
 		Endpoint:          mwEndpoint,
 		HasConnectionAuth: ep.ConnectionAuth != nil,
@@ -472,10 +471,33 @@ func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
 		log.Printf("ERROR: registry.BuildL4 for app=%s listener=%s: %v", ep.App, ep.Name, err)
 		return
 	}
-	terminal := middleware.ConnHandler(func(_ middleware.ConnContext, c net.Conn) {
-		p.handleConn(ep, c)
-	})
-	chain := middleware.ComposeL4Chain(l4Mws, terminal)
+	// L4 chain dispatcher per accepted conn: the chain "denies" by returning
+	// without invoking next, so the dispatcher MUST close the conn whenever
+	// the terminal wasn't reached (B2 fix — without this every deny on a
+	// raw-TCP / TLS-passthrough listener leaks a socket until GC). The
+	// dispatcher also drains the per-conn hint registration whether or not
+	// the chain admitted (B3 fix — startHTTPProxy.ConnContext consumes for
+	// HTTP listeners; the TCP-side path was leaking entries until the
+	// kernel's ephemeral-port reuse window wrapped).
+	dispatch := func(ctx middleware.ConnContext, c net.Conn) {
+		admitted := false
+		wrapped := middleware.ConnHandler(func(inner middleware.ConnContext, conn net.Conn) {
+			admitted = true
+			p.handleConn(ep, conn)
+		})
+		runChain := middleware.ComposeL4Chain(l4Mws, wrapped)
+		runChain(ctx, c)
+		if !admitted {
+			_ = c.Close()
+		}
+		if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+			// Drain the hint registration. peekHint reads (no-op cleanup) are
+			// fine; the consume here is the single removal site for this
+			// conn-level hint, mirroring the http.Server.ConnContext bridge
+			// in startHTTPProxy.
+			_, _ = p.consumeHint(ep.PublicPort, addr.Port)
+		}
+	}
 
 	p.wg.Add(1)
 	go func() {
@@ -501,7 +523,7 @@ func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
 			p.wg.Add(1)
 			go func(c net.Conn, ctx middleware.ConnContext) {
 				defer p.wg.Done()
-				chain(ctx, c)
+				dispatch(ctx, c)
 			}(conn, ctx)
 		}
 	}()
@@ -520,9 +542,15 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	// (HasAuth gates path_auth); deps carries the closures that bridge into
 	// services-internal state (mutable proxy-manager fields read live per call).
 	mwEndpoint := ep.AsMiddlewareInfo()
+	// path_auth composes UNCONDITIONALLY per RFC 4.1.1: when a listener's
+	// auth block is omitted (or has empty Rules), every path resolves to
+	// "protected" and the chain enforces the OIDC redirect. The middleware
+	// itself implements this default in ListenerStrategyForPath; gating
+	// composition on a non-empty auth field would silently disable
+	// enforcement on listeners that omit the block.
 	l7Spec := middleware.BuildSpec{
 		Endpoint: mwEndpoint,
-		HasAuth:  ep.Auth != nil && len(ep.Auth.Rules) > 0,
+		HasAuth:  true,
 		Deps:     p.buildL7Deps(ep),
 	}
 	l7Mws, err := p.registry.BuildL7(l7Spec)
@@ -609,7 +637,10 @@ type l4AcceptBridge struct {
 
 func newL4AcceptBridge(ln net.Listener, ep middleware.EndpointInfo, mws []middleware.L4Middleware, pm *ProxyManager, listenerPort int) net.Listener {
 	if len(mws) == 0 {
-		// Empty chain: skip the wrapper entirely. Step 4 default.
+		// Empty chain: skip the wrapper entirely. Today's canonical L4 chain
+		// has 2+ entries (conn_metrics + hint_consumer_l4), so this branch
+		// is reserved for hypothetical chains where every canonical factory
+		// returned no-op (or for tests that explicitly pass an empty slice).
 		return ln
 	}
 	return &l4AcceptBridge{

@@ -4,11 +4,69 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"piccolod/internal/api"
 )
+
+// TestProxy_AuthOmittedDefaultsToProtected is the B1 regression guard. Per
+// RFC 4.1.1: when a listener's `auth:` block is omitted (or has empty
+// Rules), every path resolves to "protected" and unauthenticated requests
+// MUST be rejected (no SessionGetter wired → 503). The pre-refactor inline
+// handler composed `path_auth` unconditionally; the registry refactor
+// originally gated composition on `Auth != nil && len(Rules) > 0`, which
+// silently disabled enforcement. This test pins the corrected behavior.
+func TestProxy_AuthOmittedDefaultsToProtected(t *testing.T) {
+	hb, stop := startEchoBackend(t)
+	defer stop()
+
+	pm := NewProxyManager()
+	defer pm.StopAll()
+
+	public := getFreePort(t)
+	ep := ServiceEndpoint{
+		App:        "test",
+		Name:       "web",
+		HostBind:   hb,
+		PublicPort: public,
+		Flow:       api.FlowTCP,
+		Protocol:   api.ListenerProtocolHTTP,
+		// Auth deliberately omitted — RFC 4.1.1 default = protected.
+	}
+	pm.StartListener(ep)
+	time.Sleep(100 * time.Millisecond)
+
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(public)), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	req := "GET / HTTP/1.1\r\nHost: web.local\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("read: %v", err)
+	}
+	resp := string(buf[:n])
+
+	// Path-auth on protected strategy with no SessionGetter wired returns
+	// 503 Service Unavailable. The critical assertion: the backend was NOT
+	// reached. Pre-fix this returned 200 from the echo backend.
+	if !strings.Contains(resp, "503") && !strings.Contains(resp, "401") {
+		t.Fatalf("expected 503/401 (protected default with no session); got: %s", resp)
+	}
+	if strings.Contains(resp, "hello\n") {
+		t.Fatal("backend reached — path_auth was NOT enforced (B1 regression)")
+	}
+}
 
 // TestMatrixSweep_ChainComposition is the plan §D16 step-11 test matrix
 // sweep: every (flow, protocol) × auth-shape combination that the parser
