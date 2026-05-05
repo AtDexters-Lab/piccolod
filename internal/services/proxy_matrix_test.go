@@ -11,13 +11,13 @@ import (
 	"piccolod/internal/api"
 )
 
-// TestProxy_AuthOmittedDefaultsToProtected is the B1 regression guard. Per
-// RFC 4.1.1: when a listener's `auth:` block is omitted (or has empty
-// Rules), every path resolves to "protected" and unauthenticated requests
-// MUST be rejected (no SessionGetter wired → 503). The pre-refactor inline
-// handler composed `path_auth` unconditionally; the registry refactor
-// originally gated composition on `Auth != nil && len(Rules) > 0`, which
-// silently disabled enforcement. This test pins the corrected behavior.
+// TestProxy_AuthOmittedDefaultsToProtected pins the RFC 4.1.1 default:
+// when a listener's `auth:` block is omitted (or has empty Rules), every
+// path resolves to "protected" and unauthenticated requests MUST be
+// rejected (no SessionGetter wired → 503). Regression guard against any
+// future change that gates `path_auth` composition on a non-empty auth
+// field — that would silently disable enforcement on listeners that omit
+// the block.
 func TestProxy_AuthOmittedDefaultsToProtected(t *testing.T) {
 	hb, stop := startEchoBackend(t)
 	defer stop()
@@ -64,7 +64,7 @@ func TestProxy_AuthOmittedDefaultsToProtected(t *testing.T) {
 		t.Fatalf("expected 503/401 (protected default with no session); got: %s", resp)
 	}
 	if strings.Contains(resp, "hello\n") {
-		t.Fatal("backend reached — path_auth was NOT enforced (B1 regression)")
+		t.Fatal("backend reached — path_auth was NOT enforced for auth-omitted listener")
 	}
 }
 

@@ -31,8 +31,8 @@ type MetricsSample struct {
 //     itself via RecordDenied with its reason label).
 //
 // Effective-accept count is computed by the consumer as Received − sum(Denied
-// per IP). Future metrics endpoint surfaces the raw counters with labels
-// {listener, source_ip, deny_reason} per F9 fix in plan §D19.
+// per IP). A future metrics endpoint surfaces the raw counters with labels
+// {listener, source_ip, deny_reason}.
 type MetricsRegistry struct {
 	mu       sync.Mutex
 	received map[MetricsSample]uint64
@@ -120,16 +120,21 @@ func ConnMetricsUDP(reg *MetricsRegistry) middleware.L4UDPMiddleware {
 }
 
 func sourceIPLabel(ctx middleware.ConnContext) string {
-	ip := middleware.EffectiveSourceIP(ctx)
+	return ipStringOrUnknown(middleware.EffectiveSourceIP(ctx))
+}
+
+// udpSourceIPLabel MUST go through EffectiveSourceIPUDP so the label
+// canonicalizes IPv4-mapped IPv6 the same way rule middlewares
+// (connection_auth_udp, ip_allowlist_udp, ip_rate_limit_udp) do —
+// otherwise the metrics-key arithmetic identity Received − Denied breaks
+// for IPv4-mapped sources.
+func udpSourceIPLabel(ctx middleware.UDPContext) string {
+	return ipStringOrUnknown(middleware.EffectiveSourceIPUDP(ctx))
+}
+
+func ipStringOrUnknown(ip net.IP) string {
 	if ip == nil {
 		return "unknown"
 	}
 	return ip.String()
-}
-
-func udpSourceIPLabel(ctx middleware.UDPContext) string {
-	if ctx.Source == nil || ctx.Source.IP == nil {
-		return "unknown"
-	}
-	return ctx.Source.IP.String()
 }

@@ -11,15 +11,6 @@ import (
 	"piccolod/internal/services/middleware"
 )
 
-// Hint-resolution retry budget per plan §D13: the TLS mux registers the
-// hint a moment after the conn is accepted, so the first lookup may race
-// the registration. Inherits the pre-refactor `initSecureLoopback`
-// constants (40 attempts × 500µs = ~20ms total budget).
-const (
-	hintRetryAttempts = 40
-	hintRetryInterval = 500 * time.Microsecond
-)
-
 // HintLookupFn looks up the connection hint registered for (listenerPort,
 // sourcePort) by the relay path (TLS mux). Returns the hint and true on
 // success, zero+false otherwise.
@@ -54,11 +45,11 @@ func HintConsumer(lookup HintLookupFn, listenerPort int) middleware.L4Middleware
 					if !addrOK || addr == nil {
 						return
 					}
-					for attempt := 0; attempt < hintRetryAttempts; attempt++ {
+					for attempt := 0; attempt < middleware.HintRetryAttempts; attempt++ {
 						if cached, ok = lookup(listenerPort, addr.Port); ok {
 							return
 						}
-						time.Sleep(hintRetryInterval)
+						time.Sleep(middleware.HintRetryInterval)
 					}
 				})
 				return cached, ok

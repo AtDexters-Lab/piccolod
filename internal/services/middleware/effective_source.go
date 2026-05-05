@@ -33,7 +33,7 @@ func EffectiveSourceIP(ctx ConnContext) net.IP {
 	if ctx.SourceTrust == TrustedLoopback && ctx.Hint != nil {
 		if hint, ok := ctx.Hint(); ok && hint.ClientIP != "" {
 			if ip := net.ParseIP(hint.ClientIP); ip != nil {
-				return CanonicalIP(ip)
+				return canonicalIP(ip)
 			}
 			// Malformed ClientIP on a TrustedLoopback connection: no authoritative
 			// real-client IP available. Returning the loopback SourceAddr would let
@@ -47,25 +47,39 @@ func EffectiveSourceIP(ctx ConnContext) net.IP {
 		if a == nil {
 			return nil
 		}
-		return CanonicalIP(a.IP)
+		return canonicalIP(a.IP)
 	case *net.UDPAddr:
 		if a == nil {
 			return nil
 		}
-		return CanonicalIP(a.IP)
+		return canonicalIP(a.IP)
 	default:
 		return nil
 	}
 }
 
-// CanonicalIP reduces IPv4-mapped IPv6 (::ffff:a.b.c.d) to its 4-byte v4 form so
+// EffectiveSourceIPUDP is the L4UDP analogue of EffectiveSourceIP. UDPContext
+// has no Hint (datagrams don't traverse the secure-loopback hop today), so
+// the resolution reduces to extracting ctx.Source.IP and canonicalizing
+// IPv4-mapped IPv6 to its v4 form so CIDR rules written as `192.0.2.0/24`
+// match both natively-v4 and IPv4-mapped-v6 sources.
+//
+// All UDP IP-rule middlewares (connection_auth_udp, ip_allowlist_udp,
+// ip_rate_limit_udp) MUST use this helper rather than reading ctx.Source.IP
+// directly. Single resolution site, single bug surface — and the only place
+// the metrics-side udpSourceIPLabel can stay in sync with the rule-side
+// labeling.
+func EffectiveSourceIPUDP(ctx UDPContext) net.IP {
+	if ctx.Source == nil {
+		return nil
+	}
+	return canonicalIP(ctx.Source.IP)
+}
+
+// canonicalIP reduces IPv4-mapped IPv6 (::ffff:a.b.c.d) to its 4-byte v4 form so
 // a CIDR like 192.0.2.0/24 matches both natively-v4 and IPv4-mapped-v6 sources.
 // Pure IPv6 addresses are returned unchanged.
-//
-// Exported so UDP rule middlewares (which can't go through EffectiveSourceIP
-// — UDPContext has no Hint) can apply the same v4/v6 normalization on
-// ctx.Source.IP.
-func CanonicalIP(ip net.IP) net.IP {
+func canonicalIP(ip net.IP) net.IP {
 	if ip == nil {
 		return nil
 	}

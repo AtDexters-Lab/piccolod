@@ -473,28 +473,17 @@ func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
 	}
 	// L4 chain dispatcher per accepted conn: the chain "denies" by returning
 	// without invoking next, so the dispatcher MUST close the conn whenever
-	// the terminal wasn't reached (B2 fix — without this every deny on a
-	// raw-TCP / TLS-passthrough listener leaks a socket until GC). The
-	// dispatcher also drains the per-conn hint registration whether or not
-	// the chain admitted (B3 fix — startHTTPProxy.ConnContext consumes for
-	// HTTP listeners; the TCP-side path was leaking entries until the
-	// kernel's ephemeral-port reuse window wrapped).
-	dispatch := func(ctx middleware.ConnContext, c net.Conn) {
-		admitted := false
-		wrapped := middleware.ConnHandler(func(inner middleware.ConnContext, conn net.Conn) {
-			admitted = true
-			p.handleConn(ep, conn)
-		})
-		runChain := middleware.ComposeL4Chain(l4Mws, wrapped)
-		runChain(ctx, c)
-		if !admitted {
+	// the terminal wasn't reached. It also drains the per-conn hint
+	// registration whether or not the chain admitted, mirroring the
+	// http.Server.ConnContext bridge in startHTTPProxy.
+	dispatch := func(c net.Conn) {
+		admitted := p.runL4Chain(l4Mws, mwEndpoint, ep.PublicPort, c)
+		if admitted {
+			p.handleConn(ep, c)
+		} else {
 			_ = c.Close()
 		}
 		if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
-			// Drain the hint registration. peekHint reads (no-op cleanup) are
-			// fine; the consume here is the single removal site for this
-			// conn-level hint, mirroring the http.Server.ConnContext bridge
-			// in startHTTPProxy.
 			_, _ = p.consumeHint(ep.PublicPort, addr.Port)
 		}
 	}
@@ -512,21 +501,36 @@ func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
 				}
 				return
 			}
-			ctx := middleware.ConnContext{
-				Endpoint:    mwEndpoint,
-				SourceAddr:  conn.RemoteAddr(),
-				LocalAddr:   conn.LocalAddr(),
-				AcceptedAt:  time.Now(),
-				SourceTrust: middleware.DeriveSourceTrust(conn.LocalAddr()),
-				Hint:        l4HintLookup(p, ep.PublicPort, conn.RemoteAddr()),
-			}
 			p.wg.Add(1)
-			go func(c net.Conn, ctx middleware.ConnContext) {
+			go func(c net.Conn) {
 				defer p.wg.Done()
-				dispatch(ctx, c)
-			}(conn, ctx)
+				dispatch(c)
+			}(conn)
 		}
 	}()
+}
+
+// runL4Chain composes and runs the L4 chain for a single conn. Returns true
+// when the chain reached its terminal (admitted), false on deny. ConnContext
+// is built per-call from (endpoint, conn-derived addrs, the per-listener
+// hint lookup); shared between startTCPProxy.dispatch and l4AcceptBridge so
+// the two sites can't drift on ConnContext field population.
+func (p *ProxyManager) runL4Chain(mws []middleware.L4Middleware, ep middleware.EndpointInfo, listenerPort int, c net.Conn) bool {
+	admitted := false
+	terminal := middleware.ConnHandler(func(_ middleware.ConnContext, _ net.Conn) {
+		admitted = true
+	})
+	chain := middleware.ComposeL4Chain(mws, terminal)
+	ctx := middleware.ConnContext{
+		Endpoint:    ep,
+		SourceAddr:  c.RemoteAddr(),
+		LocalAddr:   c.LocalAddr(),
+		AcceptedAt:  time.Now(),
+		SourceTrust: middleware.DeriveSourceTrust(c.LocalAddr()),
+		Hint:        l4HintLookup(p, listenerPort, c.RemoteAddr()),
+	}
+	chain(ctx, c)
+	return admitted
 }
 
 func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
@@ -538,19 +542,12 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	}
 	rp := httputil.NewSingleHostReverseProxy(u)
 
-	// Build the L7 chain via the registry. spec carries the per-listener facts
-	// (HasAuth gates path_auth); deps carries the closures that bridge into
-	// services-internal state (mutable proxy-manager fields read live per call).
+	// Build the L7 chain via the registry. deps carries the closures that
+	// bridge into services-internal state (mutable proxy-manager fields read
+	// live per call).
 	mwEndpoint := ep.AsMiddlewareInfo()
-	// path_auth composes UNCONDITIONALLY per RFC 4.1.1: when a listener's
-	// auth block is omitted (or has empty Rules), every path resolves to
-	// "protected" and the chain enforces the OIDC redirect. The middleware
-	// itself implements this default in ListenerStrategyForPath; gating
-	// composition on a non-empty auth field would silently disable
-	// enforcement on listeners that omit the block.
 	l7Spec := middleware.BuildSpec{
 		Endpoint: mwEndpoint,
-		HasAuth:  true,
 		Deps:     p.buildL7Deps(ep),
 	}
 	l7Mws, err := p.registry.BuildL7(l7Spec)
@@ -658,21 +655,7 @@ func (l *l4AcceptBridge) Accept() (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		allowed := false
-		terminal := middleware.ConnHandler(func(_ middleware.ConnContext, _ net.Conn) {
-			allowed = true
-		})
-		chain := middleware.ComposeL4Chain(l.middlewares, terminal)
-		ctx := middleware.ConnContext{
-			Endpoint:    l.endpoint,
-			SourceAddr:  conn.RemoteAddr(),
-			LocalAddr:   conn.LocalAddr(),
-			AcceptedAt:  time.Now(),
-			SourceTrust: middleware.DeriveSourceTrust(conn.LocalAddr()),
-			Hint:        l4HintLookup(l.pm, l.listenerPort, conn.RemoteAddr()),
-		}
-		chain(ctx, conn)
-		if allowed {
+		if l.pm.runL4Chain(l.middlewares, l.endpoint, l.listenerPort, conn) {
 			return conn, nil
 		}
 		_ = conn.Close()

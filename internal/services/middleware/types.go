@@ -46,9 +46,10 @@ type EndpointInfo struct {
 	Protocol         api.ListenerProtocol
 	DerivedHostLabel string
 	// Auth carries the listener's per-path auth rules. nil when the listener
-	// declares no rules (path_auth canonical entry is gated on Auth != nil
-	// via spec.HasAuth). Held as a pointer to match the api.AppListener.Auth
-	// shape and keep the empty case zero-cost.
+	// declares no rules — path_auth's ListenerStrategyForPath defaults nil
+	// + empty Rules to "protected" per RFC 4.1.1. Held as a pointer to
+	// match the api.AppListener.Auth shape and keep the empty case
+	// zero-cost.
 	Auth *api.ListenerAuth
 
 	// ConnectionAuth carries the listener's L4 IP-based access rules. nil

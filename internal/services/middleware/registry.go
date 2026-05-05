@@ -8,12 +8,11 @@ import (
 // Canonical middleware names that the conditional-canonical gate
 // (canonicalApplies) needs to recognize. Defined here (in middleware/) so
 // canonicalApplies can switch on them without importing the builtin
-// subpackage. Other names (forwarded_scrub, conn_metrics, etc.) are
-// always-canonical and live in builtin/builtin.go.
+// subpackage. Other names (forwarded_scrub, conn_metrics, path_auth, etc.)
+// are always-canonical and live in builtin/builtin.go.
 const (
 	NameConnectionAuth    = "connection_auth"
 	NameConnectionAuthUDP = "connection_auth_udp"
-	NamePathAuth          = "path_auth"
 )
 
 // Registry holds named middleware factories. Factories register at package init time
@@ -124,9 +123,14 @@ func (r *Registry) insertEntry(caller, name string, entry registryEntry) {
 // The services package constructs a BuildSpec by:
 //   - Setting Endpoint from a ServiceEndpoint.
 //   - Listing operator middlewares (from listener.Middleware[]) in OperatorEntries.
-//   - Including ConnectionAuth/Auth presence flags so canonical middlewares that are
-//     conditionally composed (e.g., connection_auth only when ConnectionAuth field is
-//     non-nil) can be included or skipped.
+//   - Setting HasConnectionAuth so the gated `connection_auth` canonical entry is
+//     included only when the listener has the field non-nil.
+//
+// path_auth is unconditionally canonical for HTTP listeners — RFC 4.1.1 says
+// auth-omitted listeners default to "protected" on every path; the path_auth
+// middleware implements that default in ListenerStrategyForPath. Gating the
+// composition on a non-empty Auth field would silently disable enforcement
+// for listeners that omit the auth block.
 //
 // Build does not consume listener.Middleware[] directly — it stays opaque to the
 // shape of that field; the services package translates it into operator entries.
@@ -134,7 +138,6 @@ type BuildSpec struct {
 	Endpoint          EndpointInfo
 	OperatorEntries   []OperatorEntry
 	HasConnectionAuth bool // gate for conditionally-canonical connection_auth
-	HasAuth           bool // gate for conditionally-canonical path_auth
 	Deps              RegistryDeps
 }
 
@@ -296,8 +299,6 @@ func canonicalApplies(name string, spec BuildSpec) bool {
 	switch name {
 	case NameConnectionAuth, NameConnectionAuthUDP:
 		return spec.HasConnectionAuth
-	case NamePathAuth:
-		return spec.HasAuth
 	default:
 		return true
 	}

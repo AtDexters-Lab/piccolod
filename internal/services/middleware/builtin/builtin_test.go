@@ -48,7 +48,6 @@ func TestRegisterDefaults_buildsFullChain(t *testing.T) {
 
 	spec := middleware.BuildSpec{
 		Endpoint: middleware.EndpointInfo{App: "test", Listener: "test"},
-		HasAuth:  true, // exercise the conditionally-canonical path_auth entry
 		Deps:     stubDeps(),
 	}
 
@@ -67,11 +66,11 @@ func TestRegisterDefaults_buildsFullChain(t *testing.T) {
 	if len(got.L4UDP) != 1 {
 		t.Fatalf("L4UDP chain length (no ConnectionAuth): got %d, want 1", len(got.L4UDP))
 	}
-	// All 10 canonical L7 entries when HasAuth=true.
+	// All 10 canonical L7 entries (path_auth is unconditionally canonical
+	// per RFC 4.1.1's auth-omitted-→-protected default).
 	if len(got.L7) != 10 {
 		t.Fatalf("L7 chain length: got %d, want 10", len(got.L7))
 	}
-	// All 4 response-side entries.
 	if len(got.L7Response) != 4 {
 		t.Fatalf("L7Response chain length: got %d, want 4", len(got.L7Response))
 	}
@@ -101,26 +100,24 @@ func TestRegisterDefaults_connectionAuthGated(t *testing.T) {
 	}
 }
 
-// TestRegisterDefaults_pathAuthGated verifies that when HasAuth=false, the
-// path_auth canonical entry is skipped. Composition-blindness check: path_auth
-// is the only conditionally-canonical L7 entry today, so chain length drops by
-// exactly one.
-func TestRegisterDefaults_pathAuthGated(t *testing.T) {
+// TestRegisterDefaults_pathAuthAlwaysComposed verifies that path_auth is
+// composed unconditionally — it has no spec gate and so always shows up in
+// the L7 canonical chain. RFC 4.1.1's auth-omitted-→-protected default is
+// implemented inside path_auth itself; gating the composition would silently
+// disable enforcement on listeners that omit the auth block.
+func TestRegisterDefaults_pathAuthAlwaysComposed(t *testing.T) {
 	reg := middleware.NewRegistry()
 	RegisterDefaults(reg)
 
-	spec := middleware.BuildSpec{
+	got, err := reg.Build(middleware.BuildSpec{
 		Endpoint: middleware.EndpointInfo{App: "test", Listener: "test"},
-		HasAuth:  false,
 		Deps:     stubDeps(),
-	}
-
-	got, err := reg.Build(spec)
+	})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if len(got.L7) != 9 {
-		t.Fatalf("L7 chain length without HasAuth: got %d, want 9", len(got.L7))
+	if len(got.L7) != 10 {
+		t.Fatalf("L7 chain length: got %d, want 10 (path_auth always composed)", len(got.L7))
 	}
 }
 

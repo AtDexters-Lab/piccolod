@@ -94,10 +94,7 @@ func ConnectionAuthUDP(cfg *api.ConnectionAuth, metrics *MetricsRegistry) (middl
 	}
 	return func(next middleware.UDPHandler) middleware.UDPHandler {
 		return func(ctx middleware.UDPContext, payload []byte, sink middleware.UDPSink) {
-			var ip net.IP
-			if ctx.Source != nil {
-				ip = middleware.CanonicalIP(ctx.Source.IP)
-			}
+			ip := middleware.EffectiveSourceIPUDP(ctx)
 			if connectionAuthDecide(rules, def, ip) {
 				next(ctx, payload, sink)
 				return

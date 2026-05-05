@@ -1,6 +1,25 @@
 package middleware
 
-import "context"
+import (
+	"context"
+	"time"
+)
+
+// Hint-resolution retry budget for the conn-level hint lookup. The TLS mux
+// registers the hint a moment after the conn is accepted; lookup callers
+// retry with this back-off to absorb the registration race window.
+//
+// Two consumers share these constants:
+//   - middleware/l4/HintConsumer (L4 chain entry, sync.Once-cached resolver)
+//   - server/gin_server.go's secureSrv.ConnContext callback (HTTP path)
+//
+// Hoisted here so a future tuning change can't drift between sites.
+// 40 × 500µs ≈ 20ms total budget — hint arrives in 1-3 retries typically;
+// the budget handles scheduler jitter.
+const (
+	HintRetryAttempts = 40
+	HintRetryInterval = 500 * time.Microsecond
+)
 
 // hintContextKey is the unexported key under which Hint values are stored in
 // request contexts. Only this package writes/reads it via the typed accessors

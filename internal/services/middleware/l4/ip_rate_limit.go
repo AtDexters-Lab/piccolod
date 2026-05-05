@@ -181,10 +181,7 @@ func IPRateLimitUDP(params map[string]any, metrics *MetricsRegistry) (middleware
 	limiter := newIPRateLimiter(cfg)
 	return func(next middleware.UDPHandler) middleware.UDPHandler {
 		return func(ctx middleware.UDPContext, payload []byte, sink middleware.UDPSink) {
-			var ip net.IP
-			if ctx.Source != nil {
-				ip = middleware.CanonicalIP(ctx.Source.IP)
-			}
+			ip := middleware.EffectiveSourceIPUDP(ctx)
 			key := ipRateKey(ip)
 			if limiter.allow(key) {
 				next(ctx, payload, sink)

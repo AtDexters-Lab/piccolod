@@ -16,13 +16,15 @@ import (
 // Canonical middleware names. Listed in canonical execution order — Build
 // composes them in the order they are registered below.
 //
-// The conditional gates from registry.go (canonicalApplies) still apply:
-//   - NamePathAuth runs only when spec.HasAuth (ep.Auth != nil)
-//   - NameConnectionAuth runs only when spec.HasConnectionAuth (step 6)
+// One conditional gate (per registry.go::canonicalApplies):
+//   - NameConnectionAuth / NameConnectionAuthUDP runs only when
+//     spec.HasConnectionAuth (the listener has a non-nil ConnectionAuth).
 //
-// Two of the canonical L7 entries (hint_consumer_l7, cookie_context) are
-// transitional inlines that wrap services-internal closures via deps. They
-// retire in step 9 when the hint chain migrates to middleware.HintFromContext.
+// Two L7 entries (hint_consumer_l7, cookie_context) wrap services-internal
+// closures via deps because the hint chain and cookie-context glue still
+// reach into the services package. RFC 20260505 §3.3 captures the
+// rationale; the indirection can collapse when those concerns move into
+// the middleware tree wholesale.
 const (
 	// L4 (TCP) + L4UDP canonical names. UDP variants have explicit
 	// constants rather than `+ "_udp"` string concatenation so a future
@@ -35,13 +37,13 @@ const (
 	NameIPAllowlist = "ip_allowlist"
 	NameIPRateLimit = "ip_rate_limit"
 
-	NameForwardedScrub        = "forwarded_scrub"
-	NamePathNormalize         = "path_normalize"
-	NameHintConsumerL7        = "hint_consumer_l7"
-	NameReservedPathIntercept = "reserved_path_intercept"
-	NameStripPiccoloHeaders   = "strip_piccolo_headers"
-	NameACMEBypass            = "acme_bypass"
-	// NamePathAuth defined in registry.go (conditionally canonical).
+	NameForwardedScrub               = "forwarded_scrub"
+	NamePathNormalize                = "path_normalize"
+	NameHintConsumerL7               = "hint_consumer_l7"
+	NameReservedPathIntercept        = "reserved_path_intercept"
+	NameStripPiccoloHeaders          = "strip_piccolo_headers"
+	NameACMEBypass                   = "acme_bypass"
+	NamePathAuth                     = "path_auth"
 	NameCookieContext                = "cookie_context"
 	NameOIDCAuthorizeSnapshot        = "oidc_authorize_snapshot"
 	NameForwardHeaders               = "forward_headers"
@@ -105,18 +107,16 @@ func RegisterDefaults(reg *middleware.Registry) {
 	reg.Register(NameIPAllowlist, []middleware.Layer{middleware.LayerL4, middleware.LayerL4UDP}, factoryIPAllowlist)
 	reg.Register(NameIPRateLimit, []middleware.Layer{middleware.LayerL4, middleware.LayerL4UDP}, factoryIPRateLimit)
 
-	// Request-side L7 chain — order is the as-built canonical sequence,
-	// supersedes plan §D7's earlier 8-entry sketch (which described
-	// proxy_oidc as one bundled middleware; the implementation decomposed
-	// it into reserved_path_intercept + oidc_authorize_snapshot, and added
+	// Request-side L7 chain — as-built canonical sequence per RFC 20260505 §3.3.
+	// Supersedes plan §D7's earlier 8-entry sketch (which described proxy_oidc
+	// as one bundled middleware; the implementation decomposed it into
+	// reserved_path_intercept + oidc_authorize_snapshot, and added
 	// strip_piccolo_headers + acme_bypass + cookie_context as separately-
-	// composable concerns). RFC 20260505 §3.3 documents the as-built order.
+	// composable concerns).
 	//
-	// path_auth is composed UNCONDITIONALLY (true gate, not HasAuth) because
-	// RFC 4.1.1 says auth omitted → all paths "protected". The middleware
-	// itself implements this default via ListenerStrategyForPath; gating
-	// composition would silently disable enforcement on listeners that
-	// omit the auth block (B1 finding).
+	// path_auth is unconditionally canonical because RFC 4.1.1 says auth
+	// omitted → all paths "protected". The middleware itself implements that
+	// default in ListenerStrategyForPath.
 	//
 	// Ordering invariant: hint_consumer_l7 MUST run BEFORE
 	// strip_piccolo_headers because the X-Piccolo-Hint-Token header is in
@@ -127,7 +127,7 @@ func RegisterDefaults(reg *middleware.Registry) {
 	reg.RegisterCanonical(NameReservedPathIntercept, middleware.LayerL7, factoryReservedPathIntercept)
 	reg.RegisterCanonical(NameStripPiccoloHeaders, middleware.LayerL7, factoryStripPiccoloHeaders)
 	reg.RegisterCanonical(NameACMEBypass, middleware.LayerL7, factoryACMEBypass)
-	reg.RegisterCanonical(middleware.NamePathAuth, middleware.LayerL7, factoryPathAuth) // gated true; see comment above
+	reg.RegisterCanonical(NamePathAuth, middleware.LayerL7, factoryPathAuth)
 	reg.RegisterCanonical(NameCookieContext, middleware.LayerL7, factoryCookieContext)
 	reg.RegisterCanonical(NameOIDCAuthorizeSnapshot, middleware.LayerL7, factoryOIDCAuthorizeSnapshot)
 	reg.RegisterCanonical(NameForwardHeaders, middleware.LayerL7, factoryForwardHeaders)
