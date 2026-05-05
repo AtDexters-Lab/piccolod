@@ -20,7 +20,6 @@ type oidcRewriteSnapshot struct {
 	authorizePaths []string // app's declared authorize_paths
 }
 
-
 // chipsEligible returns true when the request's host/TLS context is eligible
 // for CHIPS Partitioned cookies. Stays in services/ until step 9 because it
 // transitively depends on RequestArrivedViaTLS, which itself depends on the

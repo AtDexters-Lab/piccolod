@@ -7,15 +7,16 @@ import (
 )
 
 // NeedsMarkerFn reports whether the request should trigger embedded-marker
-// cookie injection. Bound at factory time to services.proxyContextNeedsMarker
-// which inspects the request context for the iframe-context flag set during
-// request-side proxy-context setup.
+// cookie injection. Typically bound to NeedsMarkerFromContext, which inspects
+// the request context for the iframe-context flag set during request-side
+// proxy-context setup. Kept as a func type so callers can swap the predicate
+// (e.g., for tests) without changing the L7 factory signature.
 type NeedsMarkerFn func(r *http.Request) bool
 
 // MarkerCookieFn returns the literal Set-Cookie header value for the marker.
-// Bound to services.embeddedMarkerSetCookie. A function rather than a constant
-// so future-changes to the marker (e.g., per-app variant) don't force the L7
-// signature to change.
+// Typically bound to EmbeddedMarkerSetCookie. A function rather than a constant
+// so future changes to the marker (e.g., per-app variant) don't force the L7
+// factory signature to change.
 type MarkerCookieFn func() string
 
 // EmbeddedMarkerResponse adds the iframe-context marker cookie to the response
