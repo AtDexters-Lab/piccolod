@@ -136,6 +136,9 @@ func (p *ProxyManager) startUDPProxy(ep ServiceEndpoint) {
 	if err != nil {
 		log.Printf("ERROR: registry.BuildL4UDP for app=%s listener=%s: %v", ep.App, ep.Name, err)
 		_ = conn.Close()
+		p.mu.Lock()
+		delete(p.udpListeners, ep.PublicPort)
+		p.mu.Unlock()
 		return
 	}
 	udpTerminal := middleware.UDPHandler(func(ctx middleware.UDPContext, payload []byte, _ middleware.UDPSink) {

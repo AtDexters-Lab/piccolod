@@ -271,6 +271,19 @@ func (p *ProxyManager) peekHint(listenerPort, sourcePort int) (connectionHint, b
 	return connectionHint{}, false
 }
 
+// releaseListener closes the bound socket and removes the entry from
+// p.listeners so a subsequent reconcile can rebind the port. Used when
+// startTCPProxy / startHTTPProxy aborts after the listener has been
+// registered (e.g., registry.Build error returns config_error per plan
+// §S5; without releasing here the bound socket lingers without an Accept
+// loop and connection attempts hang).
+func (p *ProxyManager) releaseListener(ln net.Listener, port int) {
+	_ = ln.Close()
+	p.mu.Lock()
+	delete(p.listeners, port)
+	p.mu.Unlock()
+}
+
 // SetAcmeHandler registers a handler to serve HTTP-01 challenges for all HTTP proxies.
 func (p *ProxyManager) SetAcmeHandler(h http.Handler) { p.mu.Lock(); p.acme = h; p.mu.Unlock() }
 
@@ -469,6 +482,7 @@ func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
 	})
 	if err != nil {
 		log.Printf("ERROR: registry.BuildL4 for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		p.releaseListener(ln, ep.PublicPort)
 		return
 	}
 	// L4 chain dispatcher per accepted conn: the chain "denies" by returning
@@ -538,6 +552,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	u, err := url.Parse(target)
 	if err != nil {
 		log.Printf("WARN: invalid reverse proxy target %s: %v", target, err)
+		p.releaseListener(ln, ep.PublicPort)
 		return
 	}
 	rp := httputil.NewSingleHostReverseProxy(u)
@@ -553,11 +568,13 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	l7Mws, err := p.registry.BuildL7(l7Spec)
 	if err != nil {
 		log.Printf("ERROR: registry.BuildL7 for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		p.releaseListener(ln, ep.PublicPort)
 		return
 	}
 	respMods, err := p.registry.BuildL7Response(l7Spec)
 	if err != nil {
 		log.Printf("ERROR: registry.BuildL7Response for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		p.releaseListener(ln, ep.PublicPort)
 		return
 	}
 
@@ -589,6 +606,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	})
 	if err != nil {
 		log.Printf("ERROR: registry.BuildL4 for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		p.releaseListener(ln, ep.PublicPort)
 		return
 	}
 	wrappedLn := newL4AcceptBridge(ln, mwEndpoint, l4Mws, p, ep.PublicPort)
