@@ -9,12 +9,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"piccolod/internal/services/middleware"
 )
 
 const (
-	udpMaxFlows        = 4096             // max concurrent UDP flows
-	udpMaxFlowsPerIP   = 64              // max flows per source IP
-	udpReadBufSize     = 8192            // sufficient for DNS with EDNS0 and other UDP protocols
+	udpMaxFlows        = 4096 // max concurrent UDP flows
+	udpMaxFlowsPerIP   = 64   // max flows per source IP
+	udpReadBufSize     = 8192 // sufficient for DNS with EDNS0 and other UDP protocols
 	udpFlowIdleTimeout = 60 * time.Second
 	udpSweepInterval   = 30 * time.Second
 )
@@ -125,6 +127,27 @@ func (p *ProxyManager) startUDPProxy(ep ServiceEndpoint) {
 
 	log.Printf("INFO: UDP proxy %s → %s (app=%s listener=%s)", addr, backendStr, ep.App, ep.Name)
 
+	mwEndpoint := ep.AsMiddlewareInfo()
+	udpMws, err := p.registry.BuildL4UDP(middleware.BuildSpec{
+		Endpoint: mwEndpoint,
+		Deps:     p.buildL4Deps(ep),
+	})
+	if err != nil {
+		log.Printf("ERROR: registry.BuildL4UDP for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		_ = conn.Close()
+		return
+	}
+	udpTerminal := middleware.UDPHandler(func(ctx middleware.UDPContext, payload []byte, _ middleware.UDPSink) {
+		flow := state.getOrCreateFlow(ctx.Source)
+		if flow == nil {
+			return // at capacity
+		}
+		flow.lastActiveNano.Store(time.Now().UnixNano())
+		_, _ = flow.backendConn.Write(payload)
+	})
+	udpChain := middleware.ComposeL4UDPChain(udpMws, udpTerminal)
+	udpSink := udpListenerSink{conn: conn}
+
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -146,14 +169,27 @@ func (p *ProxyManager) startUDPProxy(ep ServiceEndpoint) {
 				return
 			}
 
-			flow := state.getOrCreateFlow(srcAddr)
-			if flow == nil {
-				continue // at capacity
+			ctx := middleware.UDPContext{
+				Endpoint:   mwEndpoint,
+				Source:     srcAddr,
+				Local:      udpAddr,
+				AcceptedAt: time.Now(),
 			}
-			flow.lastActiveNano.Store(time.Now().UnixNano())
-			_, _ = flow.backendConn.Write(buf[:n])
+			udpChain(ctx, buf[:n], udpSink)
 		}
 	}()
+}
+
+// udpListenerSink adapts the UDP listener conn into middleware.UDPSink so
+// L4UDP middlewares can write back to the source (e.g., conn_metrics
+// rejection responses in step 5+). Step 4: unused — the empty L4UDP chain
+// invokes the terminal directly.
+type udpListenerSink struct {
+	conn *net.UDPConn
+}
+
+func (s udpListenerSink) WriteTo(payload []byte, addr *net.UDPAddr) (int, error) {
+	return s.conn.WriteToUDP(payload, addr)
 }
 
 func isClosedConnErr(err error) bool {

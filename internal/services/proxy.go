@@ -445,6 +445,25 @@ func (p *ProxyManager) handleConn(ep ServiceEndpoint, client net.Conn) {
 }
 
 func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
+	mwEndpoint := ep.AsMiddlewareInfo()
+
+	// Build L4 chain via the registry. With no L4 factories registered today,
+	// the chain is empty and ComposeL4Chain returns the terminal unchanged.
+	// Step 5 lands the canonical L4 entries (ip_allowlist, ip_rate_limit,
+	// conn_metrics, hint_consumer_l4) and step 6 adds connection_auth.
+	l4Mws, err := p.registry.BuildL4(middleware.BuildSpec{
+		Endpoint: mwEndpoint,
+		Deps:     p.buildL4Deps(ep),
+	})
+	if err != nil {
+		log.Printf("ERROR: registry.BuildL4 for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		return
+	}
+	terminal := middleware.ConnHandler(func(_ middleware.ConnContext, c net.Conn) {
+		p.handleConn(ep, c)
+	})
+	chain := middleware.ComposeL4Chain(l4Mws, terminal)
+
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -458,12 +477,19 @@ func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
 				}
 				return
 			}
-			// TODO L0: rate-limit + metrics per IP (stub)
+			ctx := middleware.ConnContext{
+				Endpoint:    mwEndpoint,
+				SourceAddr:  conn.RemoteAddr(),
+				LocalAddr:   conn.LocalAddr(),
+				AcceptedAt:  time.Now(),
+				SourceTrust: middleware.DeriveSourceTrust(conn.LocalAddr()),
+				Hint:        l4HintLookup(p, ep.PublicPort, conn.RemoteAddr()),
+			}
 			p.wg.Add(1)
-			go func(c net.Conn) {
+			go func(c net.Conn, ctx middleware.ConnContext) {
 				defer p.wg.Done()
-				p.handleConn(ep, c)
-			}(conn)
+				chain(ctx, c)
+			}(conn, ctx)
 		}
 	}()
 }
@@ -481,26 +507,30 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	// (HasAuth gates path_auth); deps carries the closures that bridge into
 	// services-internal state (mutable proxy-manager fields read live per call).
 	mwEndpoint := ep.AsMiddlewareInfo()
-	deps := p.buildL7Deps(ep)
-	spec := middleware.BuildSpec{
+	l7Spec := middleware.BuildSpec{
 		Endpoint: mwEndpoint,
 		HasAuth:  ep.Auth != nil && len(ep.Auth.Rules) > 0,
-		Deps:     deps,
+		Deps:     p.buildL7Deps(ep),
 	}
-	built, err := p.registry.Build(spec)
+	l7Mws, err := p.registry.BuildL7(l7Spec)
 	if err != nil {
-		log.Printf("ERROR: registry.Build for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		log.Printf("ERROR: registry.BuildL7 for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		return
+	}
+	respMods, err := p.registry.BuildL7Response(l7Spec)
+	if err != nil {
+		log.Printf("ERROR: registry.BuildL7Response for app=%s listener=%s: %v", ep.App, ep.Name, err)
 		return
 	}
 
-	rp.ModifyResponse = middleware.ComposeResponseChain(built.L7Response)
+	rp.ModifyResponse = middleware.ComposeResponseChain(respMods)
 
 	terminal := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gzw := l7.NewGzipResponseWriter(w, r)
 		defer gzw.Close()
 		rp.ServeHTTP(gzw, r)
 	}))
-	handler := middleware.ComposeRequestChain(built.L7, terminal)
+	handler := middleware.ComposeRequestChain(l7Mws, terminal)
 
 	// Outer non-listener-specific middleware wrapping (security headers,
 	// request logging, rate limiting). Stays out of the registry until those
@@ -508,6 +538,21 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	handler = p.securityHeaders(handler)
 	handler = requestLogging(handler)
 	handler = basicRateLimit(handler) // stub
+
+	// L4 chain at accept boundary. The HTTP variant runs the L4 chain for
+	// side-effects + deny semantics: when the chain calls its terminal the
+	// connection proceeds to http.Server, otherwise it is closed and the
+	// listener loops. With no L4 factories registered today, the chain is
+	// empty and Accept behavior is identical to the underlying listener.
+	l4Mws, err := p.registry.BuildL4(middleware.BuildSpec{
+		Endpoint: mwEndpoint,
+		Deps:     p.buildL4Deps(ep),
+	})
+	if err != nil {
+		log.Printf("ERROR: registry.BuildL4 for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		return
+	}
+	wrappedLn := newL4AcceptBridge(ln, mwEndpoint, l4Mws, p, ep.PublicPort)
 
 	p.wg.Add(1)
 	go func() {
@@ -526,8 +571,63 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				return ctx
 			},
 		}
-		_ = srv.Serve(ln) // returns on ln.Close()
+		_ = srv.Serve(wrappedLn) // returns on ln.Close()
 	}()
+}
+
+// l4AcceptBridge wraps a net.Listener with the L4 middleware chain. Each
+// accepted conn passes through the chain; if the chain invokes its terminal
+// the conn proceeds to whatever consumes the wrapped listener (http.Server).
+// If the chain returns without calling terminal, the conn is closed and
+// Accept loops. With an empty chain, terminal is invoked synchronously and
+// behavior matches the underlying listener byte-for-byte.
+type l4AcceptBridge struct {
+	net.Listener
+	endpoint     middleware.EndpointInfo
+	middlewares  []middleware.L4Middleware
+	pm           *ProxyManager
+	listenerPort int
+}
+
+func newL4AcceptBridge(ln net.Listener, ep middleware.EndpointInfo, mws []middleware.L4Middleware, pm *ProxyManager, listenerPort int) net.Listener {
+	if len(mws) == 0 {
+		// Empty chain: skip the wrapper entirely. Step 4 default.
+		return ln
+	}
+	return &l4AcceptBridge{
+		Listener:     ln,
+		endpoint:     ep,
+		middlewares:  mws,
+		pm:           pm,
+		listenerPort: listenerPort,
+	}
+}
+
+func (l *l4AcceptBridge) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		allowed := false
+		terminal := middleware.ConnHandler(func(_ middleware.ConnContext, _ net.Conn) {
+			allowed = true
+		})
+		chain := middleware.ComposeL4Chain(l.middlewares, terminal)
+		ctx := middleware.ConnContext{
+			Endpoint:    l.endpoint,
+			SourceAddr:  conn.RemoteAddr(),
+			LocalAddr:   conn.LocalAddr(),
+			AcceptedAt:  time.Now(),
+			SourceTrust: middleware.DeriveSourceTrust(conn.LocalAddr()),
+			Hint:        l4HintLookup(l.pm, l.listenerPort, conn.RemoteAddr()),
+		}
+		chain(ctx, conn)
+		if allowed {
+			return conn, nil
+		}
+		_ = conn.Close()
+	}
 }
 
 // Middleware stubs
@@ -827,6 +927,23 @@ func RequestArrivedViaTLS(r *http.Request) bool {
 		return true
 	}
 	return false
+}
+
+// buildL4Deps assembles the per-listener RegistryDeps for L4 / L4UDP chain
+// factories. Empty in step 4 — the L4 chain has no factories registered yet.
+// Step 5 lands hint_consumer_l4 / ip_allowlist / ip_rate_limit / conn_metrics
+// and populates this map with their dep keys.
+func (p *ProxyManager) buildL4Deps(_ ServiceEndpoint) middleware.RegistryDeps {
+	return middleware.MapDeps{}
+}
+
+// l4HintLookup returns the lazy Hint accessor attached to ConnContext at
+// L4 chain entry. Step 4: stub — no L4 middleware reads Hint. Step 5
+// (hint_consumer_l4) replaces the stub with the real bridge into
+// p.consumeHint, mirroring the L7 hint chain that lives in startHTTPProxy
+// via http.Server.ConnContext.
+func l4HintLookup(_ *ProxyManager, _ int, _ net.Addr) func() (middleware.Hint, bool) {
+	return func() (middleware.Hint, bool) { return middleware.Hint{}, false }
 }
 
 // buildL7Deps assembles the per-listener RegistryDeps that the canonical

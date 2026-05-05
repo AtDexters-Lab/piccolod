@@ -153,7 +153,10 @@ type BuildResult struct {
 	L7Response []ResponseModifier
 }
 
-// Build composes the per-endpoint chains.
+// Build composes the full BuildResult (all four layers). Useful when a caller
+// needs every chain at once (e.g., test harness). Production listener callers
+// build per-layer via BuildL4 / BuildL4UDP / BuildL7 / BuildL7Response so each
+// layer's deps stay scoped to that layer's factories.
 //
 // Algorithm:
 //  1. For each layer, walk the canonical names in registration order. Skip names
@@ -173,10 +176,6 @@ type BuildResult struct {
 //
 // Reconcile callers treat any Build error as fail-closed: listener is rejected
 // with a config_error health badge rather than starting with a partial chain.
-//
-// For step 1 of the plan landing: with no factories registered yet, Build returns
-// an empty BuildResult successfully. Real composition kicks in when step 5 lands
-// the built-in factories.
 func (r *Registry) Build(spec BuildSpec) (BuildResult, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -198,6 +197,35 @@ func (r *Registry) Build(spec BuildSpec) (BuildResult, error) {
 	}
 
 	return result, nil
+}
+
+// BuildL4 composes the L4 (TCP-conn) chain only. Lets callers scope deps to
+// the L4 factories without pulling in L7 dep requirements.
+func (r *Registry) BuildL4(spec BuildSpec) ([]L4Middleware, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return buildLayer[L4Middleware](r, spec, LayerL4)
+}
+
+// BuildL4UDP composes the L4UDP (datagram) chain only.
+func (r *Registry) BuildL4UDP(spec BuildSpec) ([]L4UDPMiddleware, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return buildLayer[L4UDPMiddleware](r, spec, LayerL4UDP)
+}
+
+// BuildL7 composes the L7 (HTTP request-side) chain only.
+func (r *Registry) BuildL7(spec BuildSpec) ([]L7Middleware, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return buildLayer[L7Middleware](r, spec, LayerL7)
+}
+
+// BuildL7Response composes the L7Response (HTTP response-side) chain only.
+func (r *Registry) BuildL7Response(spec BuildSpec) ([]ResponseModifier, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return buildLayer[ResponseModifier](r, spec, LayerL7Response)
 }
 
 // buildLayer composes one layer's chain. Generic over the middleware type so the
