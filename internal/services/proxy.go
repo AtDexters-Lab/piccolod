@@ -636,7 +636,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			sess, ok := sg(r)
 			if ok && sess != nil && sessionStore != nil {
 				// Validate app session with audience and origin binding
-				requestOrigin := computeRequestOrigin(r, ep)
+				requestOrigin := l7.ComputeRequestOrigin(r, ep.AsMiddlewareInfo(), RequestArrivedViaTLS)
 				sess, ok = sessionStore.ValidateAppSession(sess.ID, ep.App, requestOrigin)
 			}
 
@@ -656,12 +656,12 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 					}
 					if origin == "" {
 						scheme := "http"
-						if shouldRewriteAsHTTPS(ep, r) {
+						if l7.ShouldRewriteAsHTTPS(ep.AsMiddlewareInfo(), r, RequestArrivedViaTLS) {
 							scheme = "https"
 						}
 						origin = scheme + "://" + l7.NormalizeHostNoPort(r.Host)
 					}
-					http.Redirect(w, r, l7.PortalLoginURL(origin, absoluteRequestURL(r, ep)), http.StatusFound)
+					http.Redirect(w, r, l7.PortalLoginURL(origin, l7.AbsoluteRequestURL(r, ep.AsMiddlewareInfo(), RequestArrivedViaTLS)), http.StatusFound)
 					return
 				}
 				if cookiePresent {
@@ -687,12 +687,12 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 						}
 						if origin == "" {
 							scheme := "http"
-							if shouldRewriteAsHTTPS(ep, r) {
+							if l7.ShouldRewriteAsHTTPS(ep.AsMiddlewareInfo(), r, RequestArrivedViaTLS) {
 								scheme = "https"
 							}
 							origin = scheme + "://" + l7.NormalizeHostNoPort(r.Host)
 						}
-						http.Redirect(w, r, l7.PortalAccessDeniedURL(origin, absoluteRequestURL(r, ep)), http.StatusFound)
+						http.Redirect(w, r, l7.PortalAccessDeniedURL(origin, l7.AbsoluteRequestURL(r, ep.AsMiddlewareInfo(), RequestArrivedViaTLS)), http.StatusFound)
 						return
 					}
 					l7.WriteJSONError(w, http.StatusForbidden, "app_access_denied", "APP_NOT_ALLOWED")
@@ -902,7 +902,7 @@ func applyForwardHeaders(r *http.Request, ep ServiceEndpoint) {
 	proto := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
 	if !trusted || proto == "" {
 		proto = "http"
-		if shouldRewriteAsHTTPS(ep, r) {
+		if l7.ShouldRewriteAsHTTPS(ep.AsMiddlewareInfo(), r, RequestArrivedViaTLS) {
 			proto = "https"
 		}
 	}
@@ -1070,21 +1070,14 @@ func needsForwardedQuotedString(v string) bool {
 	return false
 }
 
-func shouldRewriteAsHTTPS(ep ServiceEndpoint, r *http.Request) bool {
-	if ep.Flow != api.FlowTCP {
-		return false
-	}
-	switch ep.Protocol {
-	case api.ListenerProtocolHTTP, api.ListenerProtocolWebsocket:
-		return RequestArrivedViaTLS(r)
-	default:
-		return false
-	}
-}
-
 // RequestArrivedViaTLS reports whether the original client request was made
 // over TLS, even if the current hop is plain HTTP. It checks direct TLS
 // (r.TLS) and the connection hint issued by the portal's lanHostRoutingMiddleware.
+//
+// Stays in services/ until step 9 because the hint chain (hintFromRequest →
+// connectionHint) is services-internal. Step 9 migrates to
+// middleware.HintFromContext, after which this function moves to middleware/l7/
+// (or its callers inline middleware.HintFromContext directly).
 func RequestArrivedViaTLS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
@@ -1260,51 +1253,10 @@ type spliceCloser struct {
 
 func (s *spliceCloser) Close() error { return s.closer.Close() }
 
-// computeRequestOrigin computes the canonical origin (scheme://host[:port]) for a request.
-// Used for session origin binding per RFC 20260122 §6.1.
-// IPv6 addresses are preserved with brackets per RFC 3986.
-func computeRequestOrigin(r *http.Request, ep ServiceEndpoint) string {
-	scheme := "http"
-	if shouldRewriteAsHTTPS(ep, r) || r.TLS != nil {
-		scheme = "https"
-	}
-
-	// Use net.SplitHostPort for correct IPv6 handling
-	host, portStr, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		// No port in Host header
-		host = r.Host
-		portStr = ""
-	}
-
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	if host == "" {
-		return ""
-	}
-
-	// Strip existing brackets before re-adding to avoid double-bracketing (e.g., Host: [::1] without port)
-	host = strings.TrimPrefix(host, "[")
-	host = strings.TrimSuffix(host, "]")
-
-	// Preserve IPv6 brackets per RFC 3986
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
-	}
-
-	// Omit default ports
-	if portStr != "" {
-		port, parseErr := strconv.Atoi(portStr)
-		if parseErr == nil {
-			if (scheme == "http" && port != 80) || (scheme == "https" && port != 443) {
-				return scheme + "://" + host + ":" + portStr
-			}
-		}
-	}
-
-	return scheme + "://" + host
-}
-
-// no extra helpers
+// computeRequestOrigin / shouldRewriteAsHTTPS / absoluteRequestURL moved to
+// internal/services/middleware/l7/url.go in step 1.5c. Callers in this package
+// use l7.ComputeRequestOrigin / l7.ShouldRewriteAsHTTPS / l7.AbsoluteRequestURL
+// with ep.AsMiddlewareInfo() and RequestArrivedViaTLS as the dep.
 
 // StopAll stops all listeners
 func (p *ProxyManager) StopAll() {

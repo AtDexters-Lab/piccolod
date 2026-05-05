@@ -20,32 +20,6 @@ type oidcRewriteSnapshot struct {
 	authorizePaths []string // app's declared authorize_paths
 }
 
-// absoluteRequestURL builds the absolute URL for the request as the client
-// would have seen it. Stays in services/ until step 1.5c because it takes
-// ServiceEndpoint to call shouldRewriteAsHTTPS — both refactor to EndpointInfo
-// in that substep before moving to middleware/l7/.
-func absoluteRequestURL(r *http.Request, ep ServiceEndpoint) string {
-	if r == nil {
-		return ""
-	}
-	host := r.Host
-	if host == "" && r.URL != nil {
-		host = r.URL.Host
-	}
-	scheme := "http"
-	if shouldRewriteAsHTTPS(ep, r) {
-		scheme = "https"
-	}
-	path := "/"
-	if r.URL != nil && r.URL.Path != "" {
-		path = r.URL.Path
-	}
-	out := scheme + "://" + host + path
-	if r.URL != nil && r.URL.RawQuery != "" {
-		out += "?" + r.URL.RawQuery
-	}
-	return out
-}
 
 // chipsEligible returns true when the request's host/TLS context is eligible
 // for CHIPS Partitioned cookies. Stays in services/ until step 9 because it

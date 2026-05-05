@@ -1,6 +1,9 @@
 package services
 
-import "piccolod/internal/api"
+import (
+	"piccolod/internal/api"
+	"piccolod/internal/services/middleware"
+)
 
 // PortRange defines an inclusive range of ports
 type PortRange struct {
@@ -44,4 +47,20 @@ type ServiceEndpoint struct {
 // endpointKey returns a unique key for an endpoint (app/listener)
 func (e ServiceEndpoint) endpointKey() string {
 	return e.App + "/" + e.Name
+}
+
+// AsMiddlewareInfo projects the orchestrator's ServiceEndpoint into the
+// middleware-package's EndpointInfo shape (the minimal endpoint metadata that
+// middleware implementations need at chain time). Used at every middleware
+// dispatch site to bridge the type boundary.
+func (e ServiceEndpoint) AsMiddlewareInfo() middleware.EndpointInfo {
+	return middleware.EndpointInfo{
+		App:              e.App,
+		Listener:         e.Name,
+		HostBind:         e.HostBind,
+		PublicPort:       e.PublicPort,
+		Flow:             e.Flow,
+		Protocol:         e.Protocol,
+		DerivedHostLabel: e.DerivedHostLabel,
+	}
 }
