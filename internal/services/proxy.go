@@ -557,69 +557,40 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		withAuthSnap.ServeHTTP(w, r)
 	}))
 
-	// path_auth wraps the tail; head (below) wraps path_auth.
-	withPathAuth := l7.PathAuth(ep.AsMiddlewareInfo(), ep.Auth, pathAuthDeps)(cookieContext)
+	mwEndpoint := ep.AsMiddlewareInfo()
 
-	// Head: hint_consumer_l7, reserved_path_intercept, header strip, ACME bypass.
-	// Pending extraction in substep 2e (reserved_path_intercept + ACME bypass)
-	// and step 9 (hint_consumer_l7 alongside the hint-chain migration).
-	inlineHead := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// hint_consumer_l7 (inline; extraction deferred to step 9 alongside the
-		// connectionHint→middleware.HintFromContext migration).
+	// Wrap each middleware around the next inner one (innermost-first).
+	withPathAuth := l7.PathAuth(mwEndpoint, ep.Auth, pathAuthDeps)(cookieContext)
+	withACME := l7.ACMEBypass(func() http.Handler {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.acme
+	})(withPathAuth)
+	withStrip := l7.StripPiccoloHeaders()(withACME)
+	withReserved := l7oidc.ReservedPathIntercept(mwEndpoint, l7oidc.ReservedPathInterceptDeps{
+		GetCallbackHandler: func() l7oidc.CallbackHandlerFn {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if p.proxyOIDC == nil {
+				return nil
+			}
+			return p.proxyOIDC.HandleCallback
+		},
+	})(withStrip)
+
+	// hint_consumer_l7 — last remaining inline middleware. Extraction deferred
+	// to step 9 alongside the connectionHint→middleware.HintFromContext migration.
+	withHint := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token := strings.TrimSpace(r.Header.Get(HeaderPiccoloHintToken)); token != "" {
 			r.Header.Del(HeaderPiccoloHintToken)
 			if hint, ok := p.consumeRequestHint(ep.PublicPort, token); ok {
 				r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, hint))
 			}
 		}
-
-		// path_normalize already mutated r.URL.Path; downstream reads it directly.
-		cleanedPath := r.URL.Path
-
-		// RFC 20260122 §5.10: Intercept reserved proxy OIDC paths.
-		if l7oidc.IsReservedPath(cleanedPath) {
-			p.mu.Lock()
-			proxyOIDC := p.proxyOIDC
-			p.mu.Unlock()
-
-			if proxyOIDC == nil {
-				l7.WriteJSONError(w, http.StatusServiceUnavailable, "proxy_oidc_not_configured", "OIDC_UNAVAILABLE")
-				return
-			}
-
-			if cleanedPath == l7oidc.CallbackPath {
-				proxyOIDC.HandleCallback(w, r, ep.App, ep.AsMiddlewareInfo())
-				return
-			}
-
-			// Other reserved paths (future: logout, session status).
-			l7.WriteJSONError(w, http.StatusNotFound, "not_found", "RESERVED_PATH_NOT_IMPLEMENTED")
-			return
-		}
-
-		// RFC 4.1.5: Strip spoofed trusted headers for all strategies. Must happen
-		// before any handler (ACME, backend) to prevent header spoofing.
-		StripHeadersFromRequest(r)
-
-		// Intercept ACME HTTP-01 challenges for remote cert issuance (RFC 20260122).
-		// These bypass auth rules because they're infrastructure-level (piccolod's
-		// TLS termination), not app business logic. External ACME verifiers have
-		// no session.
-		if strings.HasPrefix(cleanedPath, "/.well-known/acme-challenge/") {
-			p.mu.Lock()
-			acme := p.acme
-			p.mu.Unlock()
-			if acme != nil {
-				acme.ServeHTTP(w, r)
-				return
-			}
-		}
-
-		withPathAuth.ServeHTTP(w, r)
+		withReserved.ServeHTTP(w, r)
 	}))
 
-	// Wrap inline handler with extracted L7 middlewares (innermost-first; outer wraps inner).
-	handler := l7.PathNormalize(l7.NormalizeAndSetRequestPath, l7.WriteJSONError)(inlineHead)
+	handler := l7.PathNormalize(l7.NormalizeAndSetRequestPath, l7.WriteJSONError)(withHint)
 	handler = l7.ForwardedScrub()(handler)
 
 	// Apply common middleware chain

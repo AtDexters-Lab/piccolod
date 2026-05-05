@@ -14,9 +14,10 @@ import (
 // user without re-implementing session validation.
 //
 // Invariant: every Piccolo-injected header MUST start with "X-Piccolo-" so
-// services.stripPiccoloHeaders (services/proxy_middleware.go) can scrub
-// client-spoofed copies before any handler runs. X-Piccolo-Hint-Token (still
-// in services/proxy.go pending step 9) shares the same prefix.
+// l7.StripPiccoloHeaders (strip_piccolo_headers.go) can scrub client-spoofed
+// copies before any handler that trusts X-Piccolo-* runs.
+// X-Piccolo-Hint-Token (still in services/proxy.go pending step 9) shares
+// the same prefix.
 const (
 	HeaderPiccoloUser  = "X-Piccolo-User"
 	HeaderPiccoloEmail = "X-Piccolo-Email"
