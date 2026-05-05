@@ -207,6 +207,30 @@ func TestRegistry_Register_panicsOnInvalid(t *testing.T) {
 		{"empty name", func() { NewRegistry().Register("", []Layer{LayerL4}, dummyFactory) }, "empty name"},
 		{"empty layers", func() { NewRegistry().Register("x", nil, dummyFactory) }, "empty layers"},
 		{"nil factory", func() { NewRegistry().Register("x", []Layer{LayerL4}, nil) }, "nil factory"},
+		{"duplicate layers", func() {
+			NewRegistry().Register("x", []Layer{LayerL4, LayerL4}, dummyFactory)
+		}, "duplicate layer"},
+		{"re-register same name (Register then Register)", func() {
+			r := NewRegistry()
+			r.Register("x", []Layer{LayerL4}, dummyFactory)
+			r.Register("x", []Layer{LayerL7}, dummyFactory)
+		}, "already registered"},
+		{"re-register same name (Register then RegisterCanonical)", func() {
+			r := NewRegistry()
+			r.Register("x", []Layer{LayerL4}, dummyFactory)
+			r.RegisterCanonical("x", LayerL4, dummyFactory)
+		}, "already registered"},
+		{"re-register same name (RegisterCanonical twice)", func() {
+			r := NewRegistry()
+			r.RegisterCanonical("x", LayerL4, dummyFactory)
+			r.RegisterCanonical("x", LayerL4, dummyFactory)
+		}, "already registered"},
+		{"RegisterCanonical empty name", func() {
+			NewRegistry().RegisterCanonical("", LayerL4, dummyFactory)
+		}, "empty name"},
+		{"RegisterCanonical nil factory", func() {
+			NewRegistry().RegisterCanonical("x", LayerL4, nil)
+		}, "nil factory"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -225,6 +249,25 @@ func TestRegistry_Register_panicsOnInvalid(t *testing.T) {
 			}()
 			tc.fn()
 		})
+	}
+}
+
+func TestRegistry_Build_rejectsCanonicalAsOperator(t *testing.T) {
+	// S3 fix: canonical entries are composed automatically (always-on, or via typed
+	// fields like ConnectionAuth/Auth). Listing them in Middleware[] is a config
+	// error per D7 positionability table — must be rejected at Build time.
+	r := NewRegistry()
+	r.RegisterCanonical("connection_auth", LayerL4, dummyFactory)
+
+	_, err := r.Build(BuildSpec{
+		HasConnectionAuth: true, // canonical pass would include it
+		OperatorEntries:   []OperatorEntry{{Name: "connection_auth"}},
+	})
+	if err == nil {
+		t.Fatal("expected error rejecting canonical name in operator entries")
+	}
+	if !strings.Contains(err.Error(), "canonical entry not operator-listable") {
+		t.Fatalf("error should explain canonical-vs-operator rule; got %v", err)
 	}
 }
 

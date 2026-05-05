@@ -11,6 +11,10 @@ type hintContextKey struct{}
 // hint_consumer_l4 middleware via http.Server.ConnContext, or the L7
 // hint_consumer_l7 middleware reading the X-Piccolo-Hint-Token header).
 //
+// L7 read site. L4 middlewares read the lazy accessor directly via
+// ConnContext.Hint (types.go) — the L4→L7 bridge resolves it once and stashes
+// the value here so L7 doesn't pay the lookup cost per request.
+//
 // Returns (Hint{}, false) when no hint is present on ctx — callers should
 // treat this as "no real-client metadata available; fall back to socket-level
 // source addr."

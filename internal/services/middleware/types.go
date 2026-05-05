@@ -57,6 +57,12 @@ type ConnContext struct {
 	// SourceTrust == Direct. First call may block briefly (~20ms budget) waiting for
 	// the TlsMux to register the hint; subsequent calls return cached result via
 	// sync.Once. Direct connections never trigger lookup.
+	//
+	// L4 read site only — middlewares running in the L4 chain see the lazy func
+	// directly. L7 middlewares read a resolved Hint value from the request context
+	// via HintFromContext (hint.go), populated by the L4→L7 bridge that step 5+
+	// installs (http.Server.ConnContext invoking the lazy lookup once and stashing
+	// the result via ContextWithHint).
 	Hint func() (Hint, bool)
 }
 

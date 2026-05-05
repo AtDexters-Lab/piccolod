@@ -25,8 +25,9 @@ type Registry struct {
 }
 
 type registryEntry struct {
-	layers  []Layer
-	factory Factory
+	layers    []Layer
+	factory   Factory
+	canonical bool // true when registered via RegisterCanonical; rejects operator-listing per D7 table
 }
 
 // NewRegistry constructs an empty registry. Built-in factories register themselves
@@ -38,9 +39,16 @@ func NewRegistry() *Registry {
 	}
 }
 
-// Register adds (or replaces) a middleware factory under name, valid for the given layers.
+// Register adds a middleware factory under name, valid for the given layers.
 // Operator-listable middlewares register here. Built-ins that should always run register
 // via RegisterCanonical.
+//
+// Panics on:
+//   - empty name, empty layers, or nil factory (programming error at init time)
+//   - duplicate layers in the layers slice (sibling-shape latent bug)
+//   - re-registration of an existing name (fail-fast against accidental double-reg
+//     across init() ordering or two packages registering the same name; tests that
+//     need to override should construct a fresh Registry)
 func (r *Registry) Register(name string, layers []Layer, factory Factory) {
 	if name == "" {
 		panic("middleware.Register: empty name")
@@ -51,18 +59,38 @@ func (r *Registry) Register(name string, layers []Layer, factory Factory) {
 	if factory == nil {
 		panic("middleware.Register: nil factory")
 	}
+	seen := map[Layer]bool{}
+	for _, l := range layers {
+		if seen[l] {
+			panic(fmt.Sprintf("middleware.Register: duplicate layer %s in %q", l, name))
+		}
+		seen[l] = true
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.entries[name] = registryEntry{layers: layers, factory: factory}
+	if _, exists := r.entries[name]; exists {
+		panic(fmt.Sprintf("middleware.Register: %q already registered", name))
+	}
+	r.entries[name] = registryEntry{layers: layers, factory: factory, canonical: false}
 }
 
 // RegisterCanonical registers a factory AND appends its name to the canonical
 // chain for the given layer. Canonical entries always run first in their layer's
 // chain, in registration order.
 //
-// A factory may register canonically in multiple layers (e.g., hint_consumer_l4
-// in LayerL4 only, but ip_allowlist could register in both L4 and L4UDP — that
-// case uses Register, not RegisterCanonical, since ip_allowlist is operator-listable).
+// Canonical entries are NEVER operator-listable per D7 table — listing a canonical
+// name in a listener's Middleware[] field is rejected at Build time.
+//
+// To register the same factory for additional non-canonical layers (e.g.,
+// hypothetically: a primarily-canonical-on-L4 factory that's also operator-listable
+// on L4UDP), use a SEPARATE name for the non-canonical registration, or design the
+// factory's two roles as two distinct Register calls under different names. Mixing
+// canonical and non-canonical responsibilities under one name is rejected to
+// preserve the canonical-vs-operator distinction at the registry layer.
+//
+// Panics on:
+//   - empty name or nil factory
+//   - re-registration (canonical or operator) of an existing name (fail-fast)
 func (r *Registry) RegisterCanonical(name string, layer Layer, factory Factory) {
 	if name == "" {
 		panic("middleware.RegisterCanonical: empty name")
@@ -72,7 +100,10 @@ func (r *Registry) RegisterCanonical(name string, layer Layer, factory Factory) 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.entries[name] = registryEntry{layers: []Layer{layer}, factory: factory}
+	if _, exists := r.entries[name]; exists {
+		panic(fmt.Sprintf("middleware.RegisterCanonical: %q already registered", name))
+	}
+	r.entries[name] = registryEntry{layers: []Layer{layer}, factory: factory, canonical: true}
 	r.canonical[layer] = append(r.canonical[layer], name)
 }
 
@@ -187,6 +218,13 @@ func buildLayer[M any](r *Registry, spec BuildSpec, layer Layer) ([]M, error) {
 		ent, ok := r.entries[entry.Name]
 		if !ok {
 			return nil, fmt.Errorf("middleware %q: not registered", entry.Name)
+		}
+		// Reject canonical names listed by operator. Canonical entries are composed via
+		// dedicated mechanisms (always-on + conditional via typed listener fields like
+		// ConnectionAuth/Auth). Listing them in Middleware[] is a config error per the
+		// D7 positionability table.
+		if ent.canonical {
+			return nil, fmt.Errorf("middleware %q: canonical entry not operator-listable (composed automatically; remove from Middleware[])", entry.Name)
 		}
 		// Skip operator entries that aren't valid for this layer (e.g., an L7-only
 		// middleware listed on a UDP listener — silently skipped at this layer,

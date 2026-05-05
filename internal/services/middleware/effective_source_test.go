@@ -169,6 +169,24 @@ func TestEffectiveSourceIP_nilSourceAddr(t *testing.T) {
 	}
 }
 
+func TestEffectiveSourceIP_trustedLoopbackHintWinsOverNilSourceAddr(t *testing.T) {
+	// Defense-in-depth: valid hint should resolve even if SourceAddr is somehow nil.
+	// Production path won't hit this (hint_consumer_l4 only populates Hint when
+	// there's a real conn), but the algorithm should not depend on SourceAddr
+	// presence when hint is the authoritative source.
+	ctx := ConnContext{
+		SourceAddr:  nil,
+		SourceTrust: TrustedLoopback,
+		Hint: func() (Hint, bool) {
+			return Hint{ClientIP: "203.0.113.99"}, true
+		},
+	}
+	got := EffectiveSourceIP(ctx)
+	if !got.Equal(net.ParseIP("203.0.113.99")) {
+		t.Fatalf("hint should win even with nil SourceAddr; got %v", got)
+	}
+}
+
 func TestEffectiveSourceIP_typedNilTCPAddr(t *testing.T) {
 	// SourceAddr is a typed *net.TCPAddr that's nil → return nil without panic.
 	var ta *net.TCPAddr
