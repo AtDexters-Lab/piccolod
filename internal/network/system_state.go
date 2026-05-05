@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"piccolod/internal/events"
+	"piccolod/internal/onboarding"
 	"piccolod/internal/state/paths"
 )
 
@@ -24,10 +25,11 @@ type SystemState interface {
 }
 
 // busSystemState subscribes to TopicOnboardingStateChanged and caches the
-// latest phase under a mutex.
+// latest phase under a mutex. Empty phase ("") means unknown / never seen
+// (default for devices with no on-disk marker).
 type busSystemState struct {
 	mu     sync.RWMutex
-	phase  string // "" | "pending" | "install_disk" | "complete" | "try_piccolo" | ...
+	phase  onboarding.OnboardingState
 	cancel func()
 }
 
@@ -68,7 +70,7 @@ func NewBusSystemState(ctx context.Context, bus *events.Bus) SystemState {
 				}
 				if p, ok := evt.Payload.(events.OnboardingStateChangedEvent); ok {
 					s.mu.Lock()
-					s.phase = p.State
+					s.phase = onboarding.OnboardingState(p.State)
 					s.mu.Unlock()
 				}
 			}
@@ -79,39 +81,28 @@ func NewBusSystemState(ctx context.Context, bus *events.Bus) SystemState {
 }
 
 // readOnboardingPhase parses the on-disk onboarding marker and returns the
-// current phase string. Returns "" if the file is missing/unparseable —
-// safe default since "" maps to SystemBusy=false (devices without an
-// onboarding marker are presumed past first-run).
-func readOnboardingPhase() string {
+// current phase. Returns "" (zero value) if the file is missing or
+// unparseable — safe default since "" maps to SystemBusy=false (devices
+// without an onboarding marker are presumed past first-run).
+//
+// Mirrors onboarding.NewManager's boot-recovery rule: install_disk +
+// !InstallDone resolves to StatePending (an interrupted install never
+// reached "done", so we treat it as a fresh install attempt).
+func readOnboardingPhase() onboarding.OnboardingState {
 	path := paths.CoreJoin("network-bootstrap", "onboarding.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	var cfg struct {
-		State       string `json:"state"`
-		InstallDone bool   `json:"install_done"`
-	}
+	var cfg onboarding.OnboardingConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		log.Printf("WARN: net-supervisor: parse %s: %v — assuming SystemBusy=false", path, err)
 		return ""
 	}
-	// Mirror onboarding.NewManager's boot-recovery path: install_disk +
-	// !InstallDone resolves to pending. Either way the supervisor stays
-	// busy, but log the equivalence so the journald trace is honest.
-	if cfg.State == "install_disk" && !cfg.InstallDone {
-		return "pending"
+	if cfg.State == onboarding.StateInstallDisk && !cfg.InstallDone {
+		return onboarding.StatePending
 	}
 	return cfg.State
-}
-
-// SetInitialPhase seeds the cached onboarding phase. Useful for tests and for
-// the orchestrator startup path where the current phase is known synchronously
-// from disk before the event bus carries any transition.
-func (s *busSystemState) SetInitialPhase(phase string) {
-	s.mu.Lock()
-	s.phase = phase
-	s.mu.Unlock()
 }
 
 func (s *busSystemState) SystemBusy() (busy bool, reason string) {
@@ -119,8 +110,8 @@ func (s *busSystemState) SystemBusy() (busy bool, reason string) {
 	p := s.phase
 	s.mu.RUnlock()
 	switch p {
-	case "pending", "install_disk":
-		return true, "onboarding:" + p
+	case onboarding.StatePending, onboarding.StateInstallDisk:
+		return true, "onboarding:" + string(p)
 	default:
 		return false, ""
 	}

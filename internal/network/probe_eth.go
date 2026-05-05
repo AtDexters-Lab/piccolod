@@ -46,13 +46,13 @@ func (p *Prober) probeEth() rawEthObs {
 	return raw
 }
 
-func (p *Prober) resolveEth(raw rawEthObs, led ActionLedger, sysUptime, quietPeriod, grace time.Duration, now time.Time) DeviceObservation {
+func (p *Prober) resolveEth(raw rawEthObs, led ActionLedger, sysUptime time.Duration, now time.Time) DeviceObservation {
 	obs := DeviceObservation{
 		Kind:     DeviceEthernet,
 		Present:  raw.Present,
 		Iface:    raw.Iface,
-		NMState:  nmStateString(raw.NMState),
-		NMReason: nmReasonString(raw.NMReason),
+		NMState:  raw.NMState.String(),
+		NMReason: raw.NMReason.String(),
 		HasIP:    raw.HasIP,
 	}
 	if !raw.Present {
@@ -67,14 +67,14 @@ func (p *Prober) resolveEth(raw rawEthObs, led ActionLedger, sysUptime, quietPer
 	case !raw.Carrier:
 		// No cable plugged in — Inactive (catalog B1).
 		obs.HWHealth = TriInactive
-	case sysUptime < grace:
+	case sysUptime < ColdBootGrace:
 		// Cold-boot grace.
 		obs.HWHealth = TriHealthy
 	case raw.NMState <= nmclient.NMDeviceStateUnavailable:
 		// Carrier=1 + NM Unavailable past grace = HW wedge (catalog A3).
-		obs.HWHealth = p.dampenHW(DeviceEthernet, TriFaulted, led, quietPeriod, now)
+		obs.HWHealth = p.dampenHW(DeviceEthernet, TriFaulted, led, now)
 	default:
-		obs.HWHealth = p.dampenHW(DeviceEthernet, TriHealthy, led, quietPeriod, now)
+		obs.HWHealth = p.dampenHW(DeviceEthernet, TriHealthy, led, now)
 	}
 
 	switch {

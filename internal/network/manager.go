@@ -76,20 +76,19 @@ func NewManager(nm nmclient.Client, r runner.CommandRunner, bus *events.Bus) *Ma
 	return m
 }
 
-// SetSupervisor installs the externally-built supervisor (private bus,
-// shared with the rest of gin_server.go). Caller invokes WireActuators
-// after this so the supervisor can drive the AP/system actuators.
-func (m *Manager) SetSupervisor(sup *Supervisor) {
+// AttachSupervisor installs the externally-built supervisor (private bus,
+// shared with gin_server.go), wires its actuators against the manager's
+// nmclient + ap.Manager, propagates the event bus, loads the persisted
+// AP-suppression flag, and enables actuation. One call replaces the
+// previous wire dance of SetSupervisor + SetEventBus + WireActuators +
+// EnableActuation + LoadAPSuppressionFlag.
+func (m *Manager) AttachSupervisor(sup *Supervisor) {
 	m.supervisor = sup
+	sup.SetEventBus(m.events)
+	sup.WireActuators(m.nm, m.runner, m.apMgr)
+	m.LoadAPSuppressionFlag()
+	sup.EnableActuation(true)
 }
-
-// Supervisor returns the underlying supervisor (used by WireActuators
-// callers that pass our ap.Manager into the wire path).
-func (m *Manager) Supervisor() *Supervisor { return m.supervisor }
-
-// APMgr returns the underlying AP manager. Used by gin_server.go at wire
-// time to construct the APModeActuator.
-func (m *Manager) APMgr() *ap.Manager { return m.apMgr }
 
 // Name implements supervisor.Component.
 func (m *Manager) Name() string { return "network" }
@@ -172,8 +171,7 @@ func (m *Manager) Status() Status {
 	uplink := tick.ActiveUplink
 
 	wifiAvail := m.wifiPresent()
-	var ssid, ipAddr, band string
-	var freqMHz uint32
+	var ssid, ipAddr string
 	var signalDBm *int
 	var signalTier SignalTier
 
@@ -202,14 +200,10 @@ func (m *Manager) Status() Status {
 		HasSavedNetwork: hasSaved,
 		SavedSSID:       savedSSID,
 		IPAddress:       ipAddr,
-		Band:            band,
 	}
 	if signalDBm != nil {
 		s.SignalDBm = signalDBm
 		s.SignalTier = signalTier
-	}
-	if freqMHz != 0 {
-		s.FrequencyMHz = &freqMHz
 	}
 	return s
 }

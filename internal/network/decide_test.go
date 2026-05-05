@@ -769,7 +769,7 @@ func TestDecideAP_Catalog(t *testing.T) {
 func TestSnapshot_Catalog(t *testing.T) {
 	for _, sc := range catalogScenarios() {
 		t.Run(sc.id+"/"+sc.desc, func(t *testing.T) {
-			snap := buildSnapshot(sc.tick, sc.led, sc.apActive, "", "")
+			snap := buildSnapshot(sc.tick, sc.led.LastBounceAt, sc.apActive, "", "")
 			if got := snap.Devices[DeviceWiFi].Status; got != sc.wantStatusW {
 				t.Errorf("WiFi status = %s, want %s", got, sc.wantStatusW)
 			}

@@ -65,6 +65,71 @@ func (s NMDeviceState) IsConnected() bool {
 	return s == NMDeviceStateActivated
 }
 
+// String renders the device state as a short lowercase identifier suitable
+// for structured logs and diagnostic output.
+func (s NMDeviceState) String() string {
+	switch s {
+	case NMDeviceStateUnknown:
+		return "unknown"
+	case NMDeviceStateUnmanaged:
+		return "unmanaged"
+	case NMDeviceStateUnavailable:
+		return "unavailable"
+	case NMDeviceStateDisconnected:
+		return "disconnected"
+	case NMDeviceStatePrepare:
+		return "prepare"
+	case NMDeviceStateConfig:
+		return "config"
+	case NMDeviceStateNeedAuth:
+		return "need_auth"
+	case NMDeviceStateIPConfig:
+		return "ip_config"
+	case NMDeviceStateIPCheck:
+		return "ip_check"
+	case NMDeviceStateSecondaries:
+		return "secondaries"
+	case NMDeviceStateActivated:
+		return "activated"
+	case NMDeviceStateDeactivating:
+		return "deactivating"
+	case NMDeviceStateFailed:
+		return "failed"
+	default:
+		return "?"
+	}
+}
+
+// String renders the most operationally-meaningful reason codes; less-common
+// reasons collapse to "other" so callers don't have to enumerate the whole
+// enum just to get readable output.
+func (r NMDeviceStateReason) String() string {
+	switch r {
+	case NMDeviceStateReasonNone:
+		return "none"
+	case NMDeviceStateReasonNoSecrets:
+		return "no_secrets"
+	case NMDeviceStateReasonSupplicantConfigFailed:
+		return "supplicant_config_failed"
+	case NMDeviceStateReasonSupplicantFailed:
+		return "supplicant_failed"
+	case NMDeviceStateReasonSupplicantTimeout:
+		return "supplicant_timeout"
+	case NMDeviceStateReasonSupplicantDisconnect:
+		return "supplicant_disconnect"
+	case NMDeviceStateReasonDHCPFailed:
+		return "dhcp_failed"
+	case NMDeviceStateReasonDHCPError:
+		return "dhcp_error"
+	case NMDeviceStateReasonCarrier:
+		return "carrier"
+	case NMDeviceStateReasonUserRequested:
+		return "user_requested"
+	default:
+		return "other"
+	}
+}
+
 // NMDeviceStateReason provides additional context for device state changes.
 type NMDeviceStateReason uint32
 

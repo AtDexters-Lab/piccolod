@@ -62,14 +62,15 @@ type Snapshot struct {
 	At           time.Time
 }
 
-// buildSnapshot constructs a Snapshot from the latest Tick + Ledger +
-// AP runtime state. Mechanical (no judgment); see RFC §"Snapshot construction".
-func buildSnapshot(tick Tick, led ActionLedger, apActive bool, apSSID, apReason string) Snapshot {
+// buildSnapshot constructs a Snapshot from the latest Tick + LastBounceAt
+// (the only ledger projection needed) + AP runtime state. Mechanical (no
+// judgment); see RFC §"Snapshot construction".
+func buildSnapshot(tick Tick, lastBounceAt map[DeviceKind]time.Time, apActive bool, apSSID, apReason string) Snapshot {
 	devices := make(map[DeviceKind]DeviceStatusInfo, len(tick.Devices))
 	for k, obs := range tick.Devices {
 		devices[k] = DeviceStatusInfo{
-			Status:     classifyDeviceStatus(k, obs, led, tick),
-			LastAction: led.LastBounceAt[k],
+			Status:     classifyDeviceStatus(k, obs, lastBounceAt, tick),
+			LastAction: lastBounceAt[k],
 		}
 	}
 
@@ -85,10 +86,10 @@ func buildSnapshot(tick Tick, led ActionLedger, apActive bool, apSSID, apReason 
 
 // classifyDeviceStatus implements the priority ladder from the RFC's
 // "DeviceStatus resolution priority" section.
-func classifyDeviceStatus(dev DeviceKind, obs DeviceObservation, led ActionLedger, tick Tick) DeviceStatus {
+func classifyDeviceStatus(dev DeviceKind, obs DeviceObservation, lastBounceAt map[DeviceKind]time.Time, tick Tick) DeviceStatus {
 	// Quiet period wins regardless of current probe — prevents
 	// Healthy→Recovering→Healthy flicker.
-	if last, ok := led.LastBounceAt[dev]; ok && tick.At.Sub(last) < QuietPeriod {
+	if last, ok := lastBounceAt[dev]; ok && tick.At.Sub(last) < QuietPeriod {
 		return StatusRecovering
 	}
 

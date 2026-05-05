@@ -1365,11 +1365,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		if supErr != nil {
 			log.Printf("WARN: net-supervisor: private bus init failed (%v) — supervisor disabled", supErr)
 		} else {
-			networkMgr.SetSupervisor(netSup)
-			netSup.SetEventBus(eventsBus)
-			netSup.WireActuators(nmClient, execRunner, networkMgr.APMgr())
-			netSup.EnableActuation(true)
-			networkMgr.LoadAPSuppressionFlag()
+			networkMgr.AttachSupervisor(netSup)
 			s.supervisor.Register(netSup)
 		}
 

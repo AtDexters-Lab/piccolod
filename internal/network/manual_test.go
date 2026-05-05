@@ -51,10 +51,7 @@ func TestManualAPMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSupervisor: %v", err)
 	}
-	mgr.SetSupervisor(sup)
-	sup.SetEventBus(bus)
-	sup.WireActuators(nm, r, mgr.APMgr())
-	sup.EnableActuation(true)
+	mgr.AttachSupervisor(sup)
 
 	// Full production startup: reconcile, discover devices, wire portal, background loops
 	if err := mgr.Start(ctx); err != nil {

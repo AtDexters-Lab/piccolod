@@ -3,7 +3,6 @@ package network
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/fs"
 	"log"
 	"os"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"piccolod/internal/fsutil"
 )
 
 // APEvent records an AP-mode toggle for rate-shaping decideAP.
@@ -132,7 +133,7 @@ func (s *LedgerStore) Load() ActionLedger {
 		}
 		if merged {
 			pj := persistentJSON{Reboots: append([]time.Time(nil), led.Reboots...)}
-			if perr := writeJSONAtomic(s.persistentPath, pj, 0o644); perr != nil {
+			if perr := marshalAndWrite(s.persistentPath, pj); perr != nil {
 				// Leave legacy file in place for next-boot retry —
 				// in-memory ledger reflects the merge for the current
 				// run, but the on-disk state is still legacy-only.
@@ -181,6 +182,19 @@ func (s *LedgerStore) Snapshot() ActionLedger {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return cloneLedger(s.ledger)
+}
+
+// LastBounceAtSnapshot returns a deep-copied LastBounceAt map. Cheaper than
+// Snapshot when callers only need the quiet-period anchor (snapshot.go's
+// Recovering classification).
+func (s *LedgerStore) LastBounceAtSnapshot() map[DeviceKind]time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[DeviceKind]time.Time, len(s.ledger.LastBounceAt))
+	for k, v := range s.ledger.LastBounceAt {
+		out[k] = v
+	}
+	return out
 }
 
 // RecordBounce appends a bounce timestamp for dev and updates LastBounceAt.
@@ -235,7 +249,7 @@ func (s *LedgerStore) persistPersistent() error {
 	s.mu.Lock()
 	pj := persistentJSON{Reboots: append([]time.Time(nil), s.ledger.Reboots...)}
 	s.mu.Unlock()
-	return writeJSONAtomic(s.persistentPath, pj, 0o644)
+	return marshalAndWrite(s.persistentPath, pj)
 }
 
 func (s *LedgerStore) persistVolatile() {
@@ -252,7 +266,7 @@ func (s *LedgerStore) persistVolatile() {
 		vj.LastBounceAt[k.String()] = v
 	}
 	s.mu.Unlock()
-	if err := writeJSONAtomic(s.volatilePath, vj, 0o644); err != nil {
+	if err := marshalAndWrite(s.volatilePath, vj); err != nil {
 		log.Printf("WARN: net-ledger: volatile persist failed: %v", err)
 	}
 }
@@ -268,32 +282,18 @@ func (s *LedgerStore) synthesizeFailClosed(led *ActionLedger) {
 	}
 }
 
-func writeJSONAtomic(path string, v any, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*")
+// marshalAndWrite JSON-marshals v with indentation and atomically writes
+// to path via fsutil.AtomicWriteFile (fsync + parent-dir sync for power-loss
+// durability). Creates parent directories as needed.
+func marshalAndWrite(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
-	enc := json.NewEncoder(tmp)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return fsutil.AtomicWriteFile(path, data, 0o644)
 }
 
 func pruneTimes(ts []time.Time, now time.Time, window time.Duration) []time.Time {

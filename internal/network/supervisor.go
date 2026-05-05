@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -271,13 +272,14 @@ func (s *Supervisor) runTick(ctx context.Context) {
 		s.act(ctx, hwWiFi, hwEth, apA, rebootPersisted)
 	}
 
-	// Step 5: construct + publish snapshot.
+	// Step 5: construct + publish snapshot. Only LastBounceAt is needed
+	// from the post-action ledger — avoid the full clone.
 	apSSID := ""
 	if s.apAct != nil {
 		apSSID = s.apAct.SSID()
 	}
 	apReason := apReasonFor(apA, intent, apActive)
-	snap := buildSnapshot(tick, s.led.Snapshot(), s.isAPActive(), apSSID, apReason)
+	snap := buildSnapshot(tick, s.led.LastBounceAtSnapshot(), s.isAPActive(), apSSID, apReason)
 	s.snap.Store(&snap)
 
 	// Step 6: emit legacy wire-contract event for existing subscribers.
@@ -296,30 +298,8 @@ func (s *Supervisor) runTick(ctx context.Context) {
 // Bounces and AP toggles are best-effort; their persist failures only lose
 // rate-shaping precision, not safety.
 func (s *Supervisor) recordIntent(now time.Time, hwW, hwE HWAction, apA APAction) (rebootPersisted bool) {
-	switch act := hwW.(type) {
-	case HWBounce:
-		s.led.RecordBounce(act.Device, now)
-	case HWReboot:
-		if err := s.led.RecordReboot(now); err != nil {
-			log.Printf("ERROR: net-supervisor: persist reboot ledger failed (%v) — SUPPRESSING reboot to avoid loop on next boot", err)
-			rebootPersisted = false
-		} else {
-			rebootPersisted = true
-		}
-		_ = act
-	}
-	switch act := hwE.(type) {
-	case HWBounce:
-		s.led.RecordBounce(act.Device, now)
-	case HWReboot:
-		if err := s.led.RecordReboot(now); err != nil {
-			log.Printf("ERROR: net-supervisor: persist reboot ledger failed (%v) — SUPPRESSING reboot to avoid loop on next boot", err)
-			rebootPersisted = false
-		} else {
-			rebootPersisted = true
-		}
-		_ = act
-	}
+	rebootPersisted = s.recordHW(hwW, now) || s.recordHW(hwE, now)
+
 	switch a := apA.(type) {
 	case APEnter:
 		s.led.RecordAPToggle(true, now, a.Reason)
@@ -327,6 +307,23 @@ func (s *Supervisor) recordIntent(now time.Time, hwW, hwE HWAction, apA APAction
 		s.led.RecordAPToggle(false, now, a.Reason)
 	}
 	return rebootPersisted
+}
+
+// recordHW handles one HWAction's persistence side. Returns true iff a
+// Reboot was decided AND its timestamp was successfully persisted (caller
+// uses this to gate the actuator dispatch — see recordIntent).
+func (s *Supervisor) recordHW(act HWAction, now time.Time) bool {
+	switch a := act.(type) {
+	case HWBounce:
+		s.led.RecordBounce(a.Device, now)
+	case HWReboot:
+		if err := s.led.RecordReboot(now); err != nil {
+			log.Printf("ERROR: net-supervisor: persist reboot ledger failed (%v) — SUPPRESSING reboot to avoid loop on next boot", err)
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 // act dispatches actuators for the decided actions. Each side-effecting
@@ -343,10 +340,10 @@ func (s *Supervisor) act(ctx context.Context, hwW, hwE HWAction, apA APAction, r
 		}
 	}
 	if s.sysAct != nil && rebootPersisted {
-		if _, ok := hwW.(HWReboot); ok {
-			go s.fireReboot(ctx, "wifi HW Faulted; bounce budget exhausted")
-		} else if _, ok := hwE.(HWReboot); ok {
-			go s.fireReboot(ctx, "eth HW Faulted; bounce budget exhausted")
+		if act, ok := hwW.(HWReboot); ok {
+			go s.fireReboot(ctx, "wifi: "+act.Reason)
+		} else if act, ok := hwE.(HWReboot); ok {
+			go s.fireReboot(ctx, "eth: "+act.Reason)
 		}
 	}
 	if s.apAct != nil {
@@ -552,16 +549,5 @@ func summarizeBounces(b map[DeviceKind][]time.Time) string {
 	for k, v := range b {
 		parts = append(parts, fmt.Sprintf("%s=%d", k, len(v)))
 	}
-	return "{" + joinComma(parts) + "}"
-}
-
-func joinComma(parts []string) string {
-	out := ""
-	for i, p := range parts {
-		if i > 0 {
-			out += ","
-		}
-		out += p
-	}
-	return out
+	return "{" + strings.Join(parts, ",") + "}"
 }

@@ -177,8 +177,8 @@ func (p *Prober) Probe(ctx context.Context, led ActionLedger, now time.Time) Tic
 	rawEth := p.probeEth()
 
 	devices := map[DeviceKind]DeviceObservation{
-		DeviceWiFi:     p.resolveWiFi(rawWiFi, led, uptime, QuietPeriod, ColdBootGrace, now),
-		DeviceEthernet: p.resolveEth(rawEth, led, uptime, QuietPeriod, ColdBootGrace, now),
+		DeviceWiFi:     p.resolveWiFi(rawWiFi, led, uptime, now),
+		DeviceEthernet: p.resolveEth(rawEth, led, uptime, now),
 	}
 
 	// L3 + per-device gateway ARP. Run after device probes so we know which
@@ -211,13 +211,13 @@ func (p *Prober) Probe(ctx context.Context, led ActionLedger, now time.Time) Tic
 // dampenHW applies 3-of-3 dampening + quiet-period suppression for HW health.
 // Returns the smoothed Tri.
 //
-// Quiet period rule (F-B1): for `quietPeriod` after the last bounce on this
+// Quiet period rule (F-B1): for QuietPeriod after the last bounce on this
 // device, do not advance the counter and report Healthy. This prevents the
 // post-bounce "still recovering" state from being mistaken for a fresh
 // fault and ensures decideHW returns Wait (which it does anyway via its
 // own quiet-period gate).
-func (p *Prober) dampenHW(kind DeviceKind, candidate Tri, led ActionLedger, quietPeriod time.Duration, now time.Time) Tri {
-	if last, ok := led.LastBounceAt[kind]; ok && now.Sub(last) < quietPeriod {
+func (p *Prober) dampenHW(kind DeviceKind, candidate Tri, led ActionLedger, now time.Time) Tri {
+	if last, ok := led.LastBounceAt[kind]; ok && now.Sub(last) < QuietPeriod {
 		// Reset counter; suppress fault report during quiet period.
 		p.mu.Lock()
 		p.consecHWFault[kind] = 0

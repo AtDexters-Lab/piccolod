@@ -93,13 +93,13 @@ func (p *Prober) probeWiFi() rawWiFiObs {
 // resolveWiFi smooths the raw observation through the dampener and quiet
 // period, producing the final DeviceObservation. Caller passes ledger so the
 // probe can suppress N-of-M during quiet period.
-func (p *Prober) resolveWiFi(raw rawWiFiObs, led ActionLedger, sysUptime, quietPeriod, grace time.Duration, now time.Time) DeviceObservation {
+func (p *Prober) resolveWiFi(raw rawWiFiObs, led ActionLedger, sysUptime time.Duration, now time.Time) DeviceObservation {
 	obs := DeviceObservation{
 		Kind:       DeviceWiFi,
 		Present:    raw.Present,
 		Iface:      raw.Iface,
-		NMState:    nmStateString(raw.NMState),
-		NMReason:   nmReasonString(raw.NMReason),
+		NMState:    raw.NMState.String(),
+		NMReason:   raw.NMReason.String(),
 		RfkillHard: raw.RfkillHard,
 		HasIP:      raw.HasIP,
 	}
@@ -119,17 +119,17 @@ func (p *Prober) resolveWiFi(raw rawWiFiObs, led ActionLedger, sysUptime, quietP
 		obs.HWHealth = TriInactive
 	case raw.RfkillSoft && raw.HasProfile:
 		// Soft-block + intent contradicts → Faulted (recoverable via unblock+bounce).
-		obs.HWHealth = p.dampenHW(DeviceWiFi, TriFaulted, led, quietPeriod, now)
+		obs.HWHealth = p.dampenHW(DeviceWiFi, TriFaulted, led, now)
 	case raw.RfkillSoft && !raw.HasProfile:
 		// Soft-block + no profile → Inactive (no intent to be on).
 		obs.HWHealth = TriInactive
-	case sysUptime < grace:
+	case sysUptime < ColdBootGrace:
 		// Cold-boot grace.
 		obs.HWHealth = TriHealthy
 	case raw.NMState <= nmclient.NMDeviceStateUnavailable:
-		obs.HWHealth = p.dampenHW(DeviceWiFi, TriFaulted, led, quietPeriod, now)
+		obs.HWHealth = p.dampenHW(DeviceWiFi, TriFaulted, led, now)
 	default:
-		obs.HWHealth = p.dampenHW(DeviceWiFi, TriHealthy, led, quietPeriod, now)
+		obs.HWHealth = p.dampenHW(DeviceWiFi, TriHealthy, led, now)
 	}
 
 	// ConfigHealth classification.
@@ -203,62 +203,3 @@ func isAuthFailure(r nmclient.NMDeviceStateReason) bool {
 	return false
 }
 
-func nmStateString(s nmclient.NMDeviceState) string {
-	switch s {
-	case nmclient.NMDeviceStateUnknown:
-		return "unknown"
-	case nmclient.NMDeviceStateUnmanaged:
-		return "unmanaged"
-	case nmclient.NMDeviceStateUnavailable:
-		return "unavailable"
-	case nmclient.NMDeviceStateDisconnected:
-		return "disconnected"
-	case nmclient.NMDeviceStatePrepare:
-		return "prepare"
-	case nmclient.NMDeviceStateConfig:
-		return "config"
-	case nmclient.NMDeviceStateNeedAuth:
-		return "need_auth"
-	case nmclient.NMDeviceStateIPConfig:
-		return "ip_config"
-	case nmclient.NMDeviceStateIPCheck:
-		return "ip_check"
-	case nmclient.NMDeviceStateSecondaries:
-		return "secondaries"
-	case nmclient.NMDeviceStateActivated:
-		return "activated"
-	case nmclient.NMDeviceStateDeactivating:
-		return "deactivating"
-	case nmclient.NMDeviceStateFailed:
-		return "failed"
-	default:
-		return "?"
-	}
-}
-
-func nmReasonString(r nmclient.NMDeviceStateReason) string {
-	switch r {
-	case nmclient.NMDeviceStateReasonNone:
-		return "none"
-	case nmclient.NMDeviceStateReasonNoSecrets:
-		return "no_secrets"
-	case nmclient.NMDeviceStateReasonSupplicantConfigFailed:
-		return "supplicant_config_failed"
-	case nmclient.NMDeviceStateReasonSupplicantFailed:
-		return "supplicant_failed"
-	case nmclient.NMDeviceStateReasonSupplicantTimeout:
-		return "supplicant_timeout"
-	case nmclient.NMDeviceStateReasonSupplicantDisconnect:
-		return "supplicant_disconnect"
-	case nmclient.NMDeviceStateReasonDHCPFailed:
-		return "dhcp_failed"
-	case nmclient.NMDeviceStateReasonDHCPError:
-		return "dhcp_error"
-	case nmclient.NMDeviceStateReasonCarrier:
-		return "carrier"
-	case nmclient.NMDeviceStateReasonUserRequested:
-		return "user_requested"
-	default:
-		return "other"
-	}
-}

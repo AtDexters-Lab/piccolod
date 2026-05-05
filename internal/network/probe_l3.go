@@ -3,7 +3,6 @@ package network
 import (
 	"context"
 	"net"
-	"strings"
 	"time"
 
 	"piccolod/internal/network/nmclient"
@@ -167,7 +166,3 @@ func activeUplinkFor(devs map[DeviceKind]DeviceObservation) UplinkType {
 	return UplinkNone
 }
 
-// strContains is a thin wrapper to keep imports tidy if needed in future.
-//
-//nolint:unused // kept for symmetry with sibling probes
-func strContains(s, sub string) bool { return strings.Contains(s, sub) }
