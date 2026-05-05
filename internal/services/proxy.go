@@ -18,6 +18,7 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/auth"
+	"piccolod/internal/services/middleware"
 	"piccolod/internal/services/middleware/l7"
 	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 )
@@ -467,63 +468,21 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	}
 	rp := httputil.NewSingleHostReverseProxy(u)
 
-	// Response-side modifier composition (extraction substep 2a per plan §H).
-	// Modifiers run in canonical order:
-	//   1. security_headers_response — extracted (l7.SecurityHeadersResponse)
-	//   2. cookie_isolation_response — INLINE (substep 2c)
-	//   3. embedded_marker_response  — extracted (l7.EmbeddedMarkerResponse)
+	// Response-side modifier composition. Modifiers run in canonical order:
+	//   1. security_headers_response  — extracted (l7.SecurityHeadersResponse)
+	//   2. cookie_isolation_response  — extracted (l7.CookieIsolationResponse)
+	//   3. embedded_marker_response   — extracted (l7.EmbeddedMarkerResponse)
 	//   4. oidc_authorize_rewrite_response — INLINE (substep 2d)
-	secHeadersResp := l7.SecurityHeadersResponse()
-	markerResp := l7.EmbeddedMarkerResponse(needsEmbeddedMarker, l7.EmbeddedMarkerSetCookie)
+	respChain := []middleware.ResponseModifier{
+		l7.SecurityHeadersResponse(),
+		l7.CookieIsolationResponse(ep.App),
+		l7.EmbeddedMarkerResponse(needsEmbeddedMarker, l7.EmbeddedMarkerSetCookie),
+	}
 	rp.ModifyResponse = func(resp *http.Response) error {
-		if err := secHeadersResp(resp); err != nil {
-			return err
-		}
-
-		// RFC 20260112: Set-Cookie blocking + optional LAN port-based cookie isolation.
-		setCookies := resp.Header.Values("Set-Cookie")
-		if len(setCookies) > 0 {
-			resp.Header.Del("Set-Cookie")
-
-			appHost := l7.NormalizeHostNoPort(l7.AppHostFromContext(resp.Request.Context()))
-			rewriteCookies := l7.CookieRewriteFromContext(resp.Request.Context())
-			partitionCookies := l7.PartitionCookiesFromContext(resp.Request.Context())
-			appPrefix := l7.CookiePrefixForApp(ep.App)
-
-			for _, sc := range setCookies {
-				name, eq := l7.ParseSetCookieName(sc)
-				if name == "" || eq == -1 {
-					continue
-				}
-				if l7.IsPiccoloCookieName(name) {
-					continue
-				}
-
-				if dom, ok := l7.SetCookieDomain(sc); ok {
-					// If we can't determine the app host, fail closed for Domain cookies.
-					if appHost == "" {
-						continue
-					}
-					if l7.NormalizeCookieDomain(dom) != appHost {
-						continue
-					}
-				}
-
-				if rewriteCookies && l7.SetCookieHasHttpOnly(sc) && !strings.HasPrefix(name, appPrefix) {
-					sc = appPrefix + name + sc[eq:]
-				}
-
-				// CHIPS: add Partitioned, SameSite=None, Secure for cross-site iframe embedding
-				if partitionCookies {
-					sc = l7.EnsurePartitionedAttributes(sc)
-				}
-
-				resp.Header.Add("Set-Cookie", sc)
+		for _, mod := range respChain {
+			if err := mod(resp); err != nil {
+				return err
 			}
-		}
-
-		if err := markerResp(resp); err != nil {
-			return err
 		}
 
 		// OIDC authorize URL rewriting for WAN requests.
