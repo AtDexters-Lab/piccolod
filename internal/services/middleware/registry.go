@@ -281,7 +281,7 @@ func (r *Registry) invokeFactory(name string, layer Layer, params map[string]any
 	if !layerInList(layer, ent.layers) {
 		return nil, fmt.Errorf("middleware %q: not registered for layer %s", name, layer)
 	}
-	mw, err := ent.factory(params, spec.Endpoint, spec.Deps)
+	mw, err := ent.factory(params, spec.Endpoint, spec.Deps, layer)
 	if err != nil {
 		return nil, fmt.Errorf("middleware %q factory: %w", name, err)
 	}

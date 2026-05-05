@@ -130,17 +130,22 @@ func (l Layer) String() string {
 	}
 }
 
-// Factory constructs a middleware instance for a specific endpoint.
+// Factory constructs a middleware instance for a specific endpoint and target layer.
 //
-// The returned interface{} must be one of: L4Middleware, L4UDPMiddleware,
-// L7Middleware, ResponseModifier — matching one of the layers the factory was
-// registered for. Build picks the appropriate type based on which chain it is
-// composing.
+// The returned interface{} must match the requested layer:
+//   - LayerL4         → L4Middleware
+//   - LayerL4UDP      → L4UDPMiddleware
+//   - LayerL7         → L7Middleware
+//   - LayerL7Response → ResponseModifier
+//
+// Multi-layer factories (e.g., ip_allowlist registered for both LayerL4 and
+// LayerL4UDP) branch on the layer parameter to return the correct middleware
+// type. Single-layer factories may ignore the parameter.
 //
 // Factories MUST capture deps as getter functions (read each invocation), not
 // snapshot values, so dependency hot-swap (SetUserManager, SetSessionStore, etc.)
 // propagates to in-flight chains without rebuild.
-type Factory func(params map[string]any, ep EndpointInfo, deps RegistryDeps) (any, error)
+type Factory func(params map[string]any, ep EndpointInfo, deps RegistryDeps, layer Layer) (any, error)
 
 // RegistryDeps is the opaque dep-bag passed to factories. Middlewares fetch
 // named entries via Get and type-assert to the concrete type they need.

@@ -28,7 +28,7 @@ func TestRegistry_Build_canonicalOrder(t *testing.T) {
 	var calls []string
 
 	mkL4 := func(name string) Factory {
-		return func(_ map[string]any, _ EndpointInfo, _ RegistryDeps) (any, error) {
+		return func(_ map[string]any, _ EndpointInfo, _ RegistryDeps, _ Layer) (any, error) {
 			return L4Middleware(func(next ConnHandler) ConnHandler {
 				calls = append(calls, name)
 				return next
@@ -61,7 +61,7 @@ func TestRegistry_Build_operatorAppendedAfterCanonical(t *testing.T) {
 	var calls []string
 
 	mkL4 := func(name string) Factory {
-		return func(_ map[string]any, _ EndpointInfo, _ RegistryDeps) (any, error) {
+		return func(_ map[string]any, _ EndpointInfo, _ RegistryDeps, _ Layer) (any, error) {
 			return L4Middleware(func(next ConnHandler) ConnHandler {
 				calls = append(calls, name)
 				return next
@@ -114,7 +114,7 @@ func TestRegistry_Build_unknownOperatorEntryFails(t *testing.T) {
 
 func TestRegistry_Build_factoryError(t *testing.T) {
 	r := NewRegistry()
-	r.Register("boom", []Layer{LayerL4}, func(_ map[string]any, _ EndpointInfo, _ RegistryDeps) (any, error) {
+	r.Register("boom", []Layer{LayerL4}, func(_ map[string]any, _ EndpointInfo, _ RegistryDeps, _ Layer) (any, error) {
 		return nil, errors.New("synthetic failure")
 	})
 	_, err := r.Build(BuildSpec{
@@ -131,7 +131,7 @@ func TestRegistry_Build_factoryError(t *testing.T) {
 func TestRegistry_Build_typeAssertionMismatch(t *testing.T) {
 	r := NewRegistry()
 	// Factory claims L4 but returns an L7Middleware — Build should reject.
-	r.Register("liar", []Layer{LayerL4}, func(_ map[string]any, _ EndpointInfo, _ RegistryDeps) (any, error) {
+	r.Register("liar", []Layer{LayerL4}, func(_ map[string]any, _ EndpointInfo, _ RegistryDeps, _ Layer) (any, error) {
 		return L7Middleware(func(next http.Handler) http.Handler { return next }), nil
 	})
 	_, err := r.Build(BuildSpec{
@@ -148,7 +148,7 @@ func TestRegistry_Build_typeAssertionMismatch(t *testing.T) {
 func TestRegistry_Build_conditionalCanonicalGate(t *testing.T) {
 	r := NewRegistry()
 	calls := 0
-	r.RegisterCanonical("connection_auth", LayerL4, func(_ map[string]any, _ EndpointInfo, _ RegistryDeps) (any, error) {
+	r.RegisterCanonical("connection_auth", LayerL4, func(_ map[string]any, _ EndpointInfo, _ RegistryDeps, _ Layer) (any, error) {
 		calls++
 		return L4Middleware(func(next ConnHandler) ConnHandler { return next }), nil
 	})
@@ -181,7 +181,7 @@ func TestRegistry_Build_conditionalCanonicalGate(t *testing.T) {
 func TestRegistry_Build_operatorEntrySkippedForWrongLayer(t *testing.T) {
 	r := NewRegistry()
 	// Middleware registered for L4 only; listener composes L7 chain — should silently skip.
-	r.Register("l4only", []Layer{LayerL4}, func(_ map[string]any, _ EndpointInfo, _ RegistryDeps) (any, error) {
+	r.Register("l4only", []Layer{LayerL4}, func(_ map[string]any, _ EndpointInfo, _ RegistryDeps, _ Layer) (any, error) {
 		return L4Middleware(func(next ConnHandler) ConnHandler { return next }), nil
 	})
 	out, err := r.Build(BuildSpec{
@@ -271,8 +271,39 @@ func TestRegistry_Build_rejectsCanonicalAsOperator(t *testing.T) {
 	}
 }
 
-func dummyFactory(_ map[string]any, _ EndpointInfo, _ RegistryDeps) (any, error) {
+func dummyFactory(_ map[string]any, _ EndpointInfo, _ RegistryDeps, _ Layer) (any, error) {
 	return L4Middleware(func(next ConnHandler) ConnHandler { return next }), nil
+}
+
+func TestRegistry_Build_multiLayerFactoryBranchesOnLayer(t *testing.T) {
+	// Codex P2 fix: a single Factory registered for multiple layers must receive the
+	// target layer so it can return the correct middleware type. Verifies the
+	// ip_allowlist L4+L4UDP pattern works without a type-assertion failure.
+	r := NewRegistry()
+	r.Register("ip_allowlist", []Layer{LayerL4, LayerL4UDP}, func(_ map[string]any, _ EndpointInfo, _ RegistryDeps, layer Layer) (any, error) {
+		switch layer {
+		case LayerL4:
+			return L4Middleware(func(next ConnHandler) ConnHandler { return next }), nil
+		case LayerL4UDP:
+			return L4UDPMiddleware(func(next UDPHandler) UDPHandler { return next }), nil
+		default:
+			t.Fatalf("unexpected layer %s", layer)
+			return nil, nil
+		}
+	})
+
+	out, err := r.Build(BuildSpec{
+		OperatorEntries: []OperatorEntry{{Name: "ip_allowlist"}},
+	})
+	if err != nil {
+		t.Fatalf("multi-layer Build: %v", err)
+	}
+	if len(out.L4) != 1 {
+		t.Fatalf("expected 1 L4 entry; got %d", len(out.L4))
+	}
+	if len(out.L4UDP) != 1 {
+		t.Fatalf("expected 1 L4UDP entry; got %d", len(out.L4UDP))
+	}
 }
 
 func TestMapDeps(t *testing.T) {
