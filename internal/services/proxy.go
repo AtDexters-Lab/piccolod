@@ -598,7 +598,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			}
 		}
 
-		strategy := listenerStrategyForPath(ep.Auth, cleanedPath)
+		strategy := l7.ListenerStrategyForPath(ep.Auth, cleanedPath)
 
 		// RFC 4.1.6: Strategy-specific behavior.
 		switch strategy {
@@ -760,7 +760,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	}))
 
 	// Wrap inline handler with extracted L7 middlewares (innermost-first; outer wraps inner).
-	handler := l7.PathNormalize(normalizeAndSetRequestPath, writeProxyJSONError)(inlineHandler)
+	handler := l7.PathNormalize(l7.NormalizeAndSetRequestPath, writeProxyJSONError)(inlineHandler)
 	handler = l7.ForwardedScrub()(handler)
 
 	// Apply common middleware chain
