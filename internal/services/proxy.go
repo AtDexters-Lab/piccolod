@@ -469,14 +469,15 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	rp := httputil.NewSingleHostReverseProxy(u)
 
 	// Response-side modifier composition. Modifiers run in canonical order:
-	//   1. security_headers_response  — extracted (l7.SecurityHeadersResponse)
-	//   2. cookie_isolation_response  — extracted (l7.CookieIsolationResponse)
-	//   3. embedded_marker_response   — extracted (l7.EmbeddedMarkerResponse)
-	//   4. oidc_authorize_rewrite_response — INLINE (substep 2d)
+	//   1. security_headers_response       — l7.SecurityHeadersResponse
+	//   2. cookie_isolation_response       — l7.CookieIsolationResponse
+	//   3. embedded_marker_response        — l7.EmbeddedMarkerResponse
+	//   4. oidc_authorize_rewrite_response — l7oidc.AuthorizeRewriteResponse
 	respChain := []middleware.ResponseModifier{
 		l7.SecurityHeadersResponse(),
 		l7.CookieIsolationResponse(ep.App),
 		l7.EmbeddedMarkerResponse(needsEmbeddedMarker, l7.EmbeddedMarkerSetCookie),
+		l7oidc.AuthorizeRewriteResponse(ep.App),
 	}
 	rp.ModifyResponse = func(resp *http.Response) error {
 		for _, mod := range respChain {
@@ -484,12 +485,6 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				return err
 			}
 		}
-
-		// OIDC authorize URL rewriting for WAN requests.
-		if snap, ok := l7oidc.SnapshotFromContext(resp.Request.Context()); ok {
-			l7oidc.RewriteAuthorizeResponse(resp, snap, ep.App)
-		}
-
 		return nil
 	}
 
@@ -500,12 +495,14 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	//     → path_normalize
 	//       → INLINE handler (hint_consumer_l7, reserved_path_intercept, ACME bypass)
 	//         → path_auth
-	//           → INLINE tail (cookie context, oidc_authorize_snapshot)
-	//             → forward_headers
-	//               → gzip + reverse_proxy (terminal)
+	//           → cookie_context (INLINE; substep 2e neighborhood)
+	//             → oidc_authorize_snapshot
+	//               → forward_headers
+	//                 → gzip + reverse_proxy (terminal)
 	//
-	// Extracted: forwarded_scrub, path_normalize, forward_headers (2a),
-	// path_auth (2b). Remaining inline pending substeps 2c–2e.
+	// Remaining inline: hint_consumer_l7 (step 9), reserved_path_intercept,
+	// ACME bypass, header strip (substep 2e), and the cookie_context glue
+	// (deferred — composes with proxy-context setters in services/).
 
 	pathAuthDeps := l7.PathAuthDeps{
 		Snapshot: func() l7.PathAuthSnapshot {
@@ -526,52 +523,42 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		ArrivedViaTLS: RequestArrivedViaTLS,
 	}
 
+	authSnapDeps := l7oidc.AuthorizeSnapshotDeps{
+		ArrivedViaTLS: RequestArrivedViaTLS,
+		Snapshot: func() l7oidc.AuthorizeSnapshotState {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			return l7oidc.AuthorizeSnapshotState{
+				IssuerOrigin:   p.oidcIssuerOriginFn,
+				PortalOrigin:   p.portalOrigin,
+				AuthorizePaths: p.oidcAuthorizePaths[ep.App],
+			}
+		},
+	}
+
 	terminal := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gzw := l7.NewGzipResponseWriter(w, r)
 		defer gzw.Close()
 		rp.ServeHTTP(gzw, r)
 	}))
 	withForward := l7.ForwardHeaders(func(r *http.Request) { applyForwardHeaders(r, ep) })(terminal)
+	withAuthSnap := l7oidc.AuthorizeSnapshot(authSnapDeps)(withForward)
 
-	// Tail: cookie context + OIDC authorize-snapshot, then forward_headers +
-	// gzip + reverse_proxy. Pending extraction in substeps 2c (cookie context)
-	// and 2d (OIDC authorize snapshot).
-	inlineTail := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// RFC 4.1.5 + 4.1.8: Strip Piccolo cookies before forwarding and
-		// optionally rewrite cookies for LAN port-based isolation.
+	// Cookie context glue: applies request-side cookie strip/rewrite and stashes
+	// per-request flags for the response-side cookie_isolation/embedded_marker
+	// modifiers. Stays inline because it composes with the services-internal
+	// `shouldPartitionCookies`/`needsEmbeddedMarker` predicates pending step 9.
+	cookieContext := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rewriteCookies := l7.ShouldRewriteLegacyCookies(r.Host)
 		partitionCookies := shouldPartitionCookies(r)
 		needsMarker := needsEmbeddedMarker(r)
 		l7.StripAndRewriteRequestCookies(r, ep.App, rewriteCookies)
 		r = l7.SetProxyContext(r, ep.App, l7.NormalizeHostNoPort(r.Host), rewriteCookies, partitionCookies, needsMarker)
-
-		// Snapshot OIDC rewrite state for WAN authorize URL rewriting.
-		if RequestArrivedViaTLS(r) {
-			p.mu.Lock()
-			issuerOriginFn := p.oidcIssuerOriginFn
-			authPaths := p.oidcAuthorizePaths[ep.App]
-			portalOriginFn := p.portalOrigin
-			p.mu.Unlock()
-
-			if issuerOriginFn != nil && portalOriginFn != nil {
-				issuerOrigin := issuerOriginFn()
-				portal := portalOriginFn(r)
-				if issuerOrigin != "" && portal != "" {
-					snap := &l7oidc.Snapshot{
-						IssuerOrigin:   issuerOrigin,
-						PortalOrigin:   portal,
-						AuthorizePaths: authPaths,
-					}
-					r = r.WithContext(l7oidc.ContextWithSnapshot(r.Context(), snap))
-				}
-			}
-		}
-
-		withForward.ServeHTTP(w, r)
+		withAuthSnap.ServeHTTP(w, r)
 	}))
 
 	// path_auth wraps the tail; head (below) wraps path_auth.
-	withPathAuth := l7.PathAuth(ep.AsMiddlewareInfo(), ep.Auth, pathAuthDeps)(inlineTail)
+	withPathAuth := l7.PathAuth(ep.AsMiddlewareInfo(), ep.Auth, pathAuthDeps)(cookieContext)
 
 	// Head: hint_consumer_l7, reserved_path_intercept, header strip, ACME bypass.
 	// Pending extraction in substep 2e (reserved_path_intercept + ACME bypass)
