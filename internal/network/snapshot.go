@@ -130,25 +130,43 @@ func deriveHint(tick Tick) string {
 // deriveLegacyState maps the new-world Snapshot back onto the legacy
 // /api/wifi/status ConnState string. Preserves the Flutter wire contract.
 //
+// "Connected" is satisfied by EITHER GwReachable=Healthy OR L3Probe=Up
+// AND the device's HW + Config are Healthy. The L3Probe disjunct covers
+// catalog C8/C9: ARP-suppressed networks (corp guest WiFi, hotel APs)
+// where ARP fails but TCP-connect succeeds. Without it, /api/wifi/status
+// returned state="disconnected" while ssid+ip_address+active_uplink
+// reported a live connection — wire-contract regression vs pre-cutover.
+//
 // Cases evaluated in order (priority encodes eth>wlan tiebreaker):
 //
 //	"ap_mode"         — apActive=true  (highest precedence)
-//	"ethernet"        — eth.GwReachable=Healthy
-//	"wifi_connected"  — wlan.GwReachable=Healthy
+//	"ethernet"        — eth working (gw OR L3 reachable)
+//	"wifi_connected"  — wlan working (gw OR L3 reachable)
 //	"reconnecting"    — wlan HW Healthy + Config Faulted
 //	"disconnected"    — none of the above
 func deriveLegacyState(tick Tick, apActive bool) ConnState {
 	if apActive {
 		return StateAPMode
 	}
-	if eth, ok := tick.Devices[DeviceEthernet]; ok && eth.GwReachable == TriHealthy {
+	if eth, ok := tick.Devices[DeviceEthernet]; ok && deviceWorking(eth, tick) {
 		return StateEthernet
 	}
-	if w, ok := tick.Devices[DeviceWiFi]; ok && w.GwReachable == TriHealthy {
+	if w, ok := tick.Devices[DeviceWiFi]; ok && deviceWorking(w, tick) {
 		return StateWiFiSTA
 	}
 	if w, ok := tick.Devices[DeviceWiFi]; ok && w.HWHealth == TriHealthy && w.ConfigHealth == TriFaulted {
 		return StateReconnecting
 	}
 	return StateDisconnected
+}
+
+// deviceWorking returns true when the device has a working uplink — either
+// gateway is ARP-reachable, OR L3 is reachable through it (covers
+// ARP-suppressed networks). Requires HW + Config health AND LinkUp so
+// "active uplink" semantics match (predicate aligned with activeUplinkFor).
+func deviceWorking(d DeviceObservation, tick Tick) bool {
+	if d.HWHealth != TriHealthy || d.ConfigHealth != TriHealthy || !d.LinkUp {
+		return false
+	}
+	return d.GwReachable == TriHealthy || tick.L3Probe == L3ProbeUp
 }

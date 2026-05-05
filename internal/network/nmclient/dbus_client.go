@@ -140,14 +140,25 @@ func (c *DBusClient) setProp(path dbus.ObjectPath, iface, property string, value
 	return c.obj(path).Call(dbusPropertiesInterface+".Set", 0, iface, property, dbus.MakeVariant(value)).Err
 }
 
-// Connectivity returns NM's assessment of internet connectivity.
+// Connectivity returns NM's cached connectivity classification by reading
+// the Connectivity *property*. This is a passive read of NM's last-known
+// state — it does NOT dispatch a fresh check. Calling NM's CheckConnectivity
+// method instead would force NM to issue an HTTP GET to its configured
+// connectivity-check-uri (default https://nmcheck.gnome.org/...), turning
+// every probe tick into unsolicited external traffic — explicitly forbidden
+// by the supervisor design (RFC 20260505 §"Probes" / "Risks": "no NM
+// external-probe externality"). The supervisor uses TCP-connect probes
+// for L3 truth; this method is advisory diagnostic only.
 func (c *DBusClient) Connectivity() (NMConnectivityState, error) {
-	var state uint32
-	err := c.nm().Call(nmInterface+".CheckConnectivity", 0).Store(&state)
+	v, err := c.prop(dbus.ObjectPath(nmObjectPath), nmInterface, "Connectivity")
 	if err != nil {
-		return NMConnectivityUnknown, fmt.Errorf("nmclient: check connectivity: %w", err)
+		return NMConnectivityUnknown, fmt.Errorf("nmclient: read connectivity property: %w", err)
 	}
-	return NMConnectivityState(state), nil
+	s, ok := v.Value().(uint32)
+	if !ok {
+		return NMConnectivityUnknown, fmt.Errorf("nmclient: unexpected Connectivity type %T", v.Value())
+	}
+	return NMConnectivityState(s), nil
 }
 
 // DeviceState returns the current state of a specific device.

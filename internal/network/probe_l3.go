@@ -19,8 +19,14 @@ var l3ProbeTargets = []string{"8.8.8.8:53", "1.1.1.1:53"}
 const l3ProbeTimeout = 2 * time.Second
 
 func (p *Prober) probeL3(ctx context.Context, devices map[DeviceKind]DeviceObservation) (L3ProbeResult, map[DeviceKind]Tri) {
-	// TCP-connect probe — succeeds if any target connects within timeout.
-	probeCtx, cancel := context.WithTimeout(ctx, l3ProbeTimeout+250*time.Millisecond)
+	// TCP-connect probe — sequential dials, first success wins. Parent
+	// budget MUST cover the sum of per-target attempts so a silently-
+	// blackholed first target (corp guest WiFi DROP, regional blocks —
+	// catalog C9) does not strangle the fallback's full timeout. Without
+	// this, the second target gets only ~250ms after the first 2s elapses,
+	// producing false L3 Down (and after dampening, spurious WiFi bounce).
+	probeCtx, cancel := context.WithTimeout(ctx,
+		time.Duration(len(l3ProbeTargets))*l3ProbeTimeout+250*time.Millisecond)
 	defer cancel()
 	tcpUp := tcpConnectAny(probeCtx, l3ProbeTargets, l3ProbeTimeout)
 

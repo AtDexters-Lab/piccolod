@@ -112,7 +112,12 @@ func (s *LedgerStore) Load() ActionLedger {
 	}
 
 	// 2. Legacy migration — one-shot. Each line is a unix timestamp.
+	// Persist the merged result BEFORE deleting the legacy file so a
+	// crash window or quick restart between merge and the next
+	// RecordReboot cannot lose the migrated history (RFC S8-rev:
+	// "preserves reboot budget across cutover").
 	if data, err := os.ReadFile(s.legacyPath); err == nil {
+		merged := false
 		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
@@ -123,10 +128,24 @@ func (s *LedgerStore) Load() ActionLedger {
 				continue
 			}
 			led.Reboots = append(led.Reboots, time.Unix(ts, 0))
+			merged = true
 		}
-		// Delete legacy file after merging — best effort.
-		if rerr := os.Remove(s.legacyPath); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
-			log.Printf("WARN: net-ledger: legacy file delete failed: %v", rerr)
+		if merged {
+			pj := persistentJSON{Reboots: append([]time.Time(nil), led.Reboots...)}
+			if perr := writeJSONAtomic(s.persistentPath, pj, 0o644); perr != nil {
+				// Leave legacy file in place for next-boot retry —
+				// in-memory ledger reflects the merge for the current
+				// run, but the on-disk state is still legacy-only.
+				log.Printf("WARN: net-ledger: persist after migration failed (%v) — legacy file retained for retry", perr)
+			} else if rerr := os.Remove(s.legacyPath); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+				log.Printf("WARN: net-ledger: legacy file delete failed: %v", rerr)
+			}
+		} else {
+			// Empty/garbage legacy file — no merge happened, but still
+			// remove it so we don't keep parsing garbage every boot.
+			if rerr := os.Remove(s.legacyPath); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+				log.Printf("WARN: net-ledger: legacy file delete failed: %v", rerr)
+			}
 		}
 	}
 

@@ -569,7 +569,12 @@ func (m *Manager) isIPLost(iface *net.Interface) bool {
 		if ipv4 := ipnet.IP.To4(); ipv4 != nil && !ipnet.IP.IsLinkLocalUnicast() {
 			return false
 		}
-		if ipnet.IP.To4() == nil && ipnet.IP.To16() != nil && !ipnet.IP.IsLoopback() {
+		// IPv6 link-local (fe80::/10) is auto-assigned by the kernel via
+		// SLAAC on every UP interface. Treating it as a usable address would
+		// mask real IPv4 loss (the dampener never engages) — the exact bug
+		// the storm-fix was meant to close. Require a non-link-local IPv6.
+		if ipnet.IP.To4() == nil && ipnet.IP.To16() != nil &&
+			!ipnet.IP.IsLoopback() && !ipnet.IP.IsLinkLocalUnicast() {
 			return false
 		}
 	}

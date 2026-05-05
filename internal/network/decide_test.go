@@ -921,6 +921,11 @@ func TestDeriveLegacyState(t *testing.T) {
 			false, StateReconnecting,
 		},
 		{
+			"C8/C9 ARP-suppressed but L3 reachable — wifi_connected",
+			tick(dev(DeviceWiFi, TriHealthy, TriHealthy, TriFaulted, true, true), absent(DeviceEthernet), L3ProbeUp, false, UplinkWiFi),
+			false, StateWiFiSTA,
+		},
+		{
 			"Disconnected fallthrough",
 			tick(dev(DeviceWiFi, TriFaulted, TriInactive, TriInactive, false, false), absent(DeviceEthernet), L3ProbeDown, false, UplinkNone),
 			false, StateDisconnected,

@@ -2,7 +2,9 @@ package network
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 
 	"piccolod/internal/network/nmclient"
 	"piccolod/internal/runner"
+	"piccolod/internal/state/paths"
 )
 
 // stubRunner is a runner.CommandRunner for tests. Records invocations and
@@ -411,16 +414,19 @@ func TestLedger_CorruptVolatileFailsClosed(t *testing.T) {
 	}
 }
 
-// LegacyMigration: legacy net-watchdog-reboots is parsed into Reboots and
-// then deleted.
+// LegacyMigration: legacy net-watchdog-reboots is parsed into Reboots,
+// persisted, and then deleted. A subsequent Load() must read the merged
+// reboots from the persistent file (covers the bug_010 regression where
+// the merge survived only in-memory until the next RecordReboot fired).
 func TestLedger_LegacyMigration(t *testing.T) {
 	dir := t.TempDir()
 	legacy := dir + "/legacy"
+	persistent := dir + "/persistent.json"
 	contents := []byte("1714867200\n1714870800\n")
 	if err := writeFile(t, legacy, contents); err != nil {
 		t.Fatal(err)
 	}
-	store := NewLedgerStoreWithPaths(dir+"/persistent.json", dir+"/volatile.json", legacy)
+	store := NewLedgerStoreWithPaths(persistent, dir+"/volatile.json", legacy)
 	led := store.Load()
 	if got := len(led.Reboots); got != 2 {
 		t.Errorf("Reboots = %d, want 2 (migrated from legacy)", got)
@@ -428,6 +434,13 @@ func TestLedger_LegacyMigration(t *testing.T) {
 	// Legacy file must be deleted post-migrate.
 	if _, err := readFile(legacy); err == nil {
 		t.Errorf("legacy file still exists after migration")
+	}
+	// Migration must have been persisted: a fresh store on the same
+	// paths must observe the merged reboots from the persistent file.
+	store2 := NewLedgerStoreWithPaths(persistent, dir+"/volatile.json", legacy)
+	led2 := store2.Load()
+	if got := len(led2.Reboots); got != 2 {
+		t.Errorf("Reboots after restart = %d, want 2 (migration must have been persisted)", got)
 	}
 }
 
@@ -479,6 +492,89 @@ func TestClassifyConnectivity(t *testing.T) {
 	}
 }
 
+// TestSystemState_SelfSeedsFromDisk verifies the post-restart guarantee:
+// when piccolod starts mid-onboarding, NewBusSystemState reads the
+// on-disk onboarding.json and reports SystemBusy=true from the very first
+// call — before any bus event arrives. Without this, the supervisor would
+// bounce wifi during install_disk on a restart (defeats catalog A7/G7).
+func TestSystemState_SelfSeedsFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	pathsSetCoreRoot(t, dir)
+
+	// Simulate mid-install state.
+	mustWriteJSON(t, dir+"/network-bootstrap/onboarding.json", map[string]any{
+		"state":        "install_disk",
+		"install_done": false,
+	})
+
+	sys := NewBusSystemState(context.Background(), nil)
+	busy, reason := sys.SystemBusy()
+	if !busy {
+		t.Fatalf("SystemBusy = false on first call after restart mid-install_disk; want true")
+	}
+	if reason == "" {
+		t.Errorf("reason = empty; want a non-empty reason")
+	}
+}
+
+// TestSystemState_NoFileNotBusy verifies that a missing onboarding.json
+// resolves to SystemBusy=false (devices past first-run lack the marker).
+func TestSystemState_NoFileNotBusy(t *testing.T) {
+	dir := t.TempDir()
+	pathsSetCoreRoot(t, dir)
+
+	sys := NewBusSystemState(context.Background(), nil)
+	busy, _ := sys.SystemBusy()
+	if busy {
+		t.Errorf("SystemBusy = true on first call with no onboarding.json; want false")
+	}
+}
+
+// pathsSetCoreRoot is a thin wrapper for paths.SetCoreRootForTest so the
+// test stays readable. Imported lazily to keep the network package's test
+// surface small.
+func pathsSetCoreRoot(t *testing.T, dir string) {
+	t.Helper()
+	pathsSetCoreRootImpl(t, dir)
+}
+
+// TestProbeL3_ParentBudgetCoversSumOfAttempts verifies that probeL3's
+// parent context budget covers sequential dials to ALL targets, not just
+// one. A silently-blackholed first target must not strangle the second
+// target's per-attempt timeout.
+//
+// Pre-fix: parent timeout was 2.25s while two sequential 2s attempts
+// need 4s — the second target had only ~250ms instead of 2s, producing
+// false L3 Down on real RFC catalog C9 scenarios.
+func TestProbeL3_ParentBudgetCoversSumOfAttempts(t *testing.T) {
+	f := newFixture(t)
+	f.wifiAt(nmclient.NMDeviceStateActivated, true, "192.168.1.1")
+
+	prevTCP := tcpConnectAny
+	t.Cleanup(func() { tcpConnectAny = prevTCP })
+
+	// Stub: target[0] consumes its full perAttempt budget then fails;
+	// target[1] succeeds 150ms in. Total wall-clock ≈ perAttempt + 150ms.
+	tcpConnectAny = func(ctx context.Context, targets []string, perAttempt time.Duration) bool {
+		select {
+		case <-time.After(perAttempt):
+		case <-ctx.Done():
+			return false
+		}
+		select {
+		case <-time.After(150 * time.Millisecond):
+			return ctx.Err() == nil
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	tick := f.probeN(1)
+	if got := tick.L3Probe; got != L3ProbeUp {
+		t.Errorf("L3Probe = %s, want up (parent budget should cover both targets after blackholed target[0])", got)
+	}
+}
+
 // ----- helpers -----
 
 func writeFile(t *testing.T, path string, data []byte) error {
@@ -487,3 +583,22 @@ func writeFile(t *testing.T, path string, data []byte) error {
 }
 
 func readFile(path string) ([]byte, error) { return os.ReadFile(path) }
+
+func pathsSetCoreRootImpl(t *testing.T, dir string) {
+	t.Helper()
+	paths.SetCoreRootForTest(t, dir)
+}
+
+func mustWriteJSON(t *testing.T, path string, v any) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

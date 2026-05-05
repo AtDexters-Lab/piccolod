@@ -2,9 +2,13 @@ package network
 
 import (
 	"context"
+	"encoding/json"
+	"log"
+	"os"
 	"sync"
 
 	"piccolod/internal/events"
+	"piccolod/internal/state/paths"
 )
 
 // SystemState reports whether the system is in a state where bouncing wifi
@@ -28,16 +32,24 @@ type busSystemState struct {
 }
 
 // NewBusSystemState constructs a SystemState backed by the event bus.
-// It immediately subscribes to TopicOnboardingStateChanged and spawns a
-// goroutine to watch for transitions. The goroutine exits when ctx is done.
 //
-// Note: callers must publish the current onboarding phase as an initial
-// event after subscribers are wired (or call SetInitialPhase) to avoid a
-// brief window where SystemBusy returns false until the first event arrives.
-// The orchestrator calls this with a sane default at construction; the bus
-// then drives state transitions.
+// At construction it self-seeds by reading the current onboarding phase
+// synchronously from /piccolo-core/network-bootstrap/onboarding.json. This
+// closes the post-restart window where SystemBusy=false until the first
+// bus event arrives — events.Bus has no replay-on-subscribe, and
+// publishOnboardingEvent only fires from POST handlers, so without the
+// disk seed a piccolod restart mid-onboarding would let the supervisor
+// bounce wifi during install_disk (defeats catalog A7/G7).
+//
+// It also subscribes to TopicOnboardingStateChanged for subsequent
+// transitions; the goroutine exits when ctx is done.
 func NewBusSystemState(ctx context.Context, bus *events.Bus) SystemState {
 	s := &busSystemState{}
+
+	// Self-seed from disk before subscribing — readers see the correct
+	// phase from the very first SystemBusy() call.
+	s.phase = readOnboardingPhase()
+
 	if bus == nil {
 		return s
 	}
@@ -64,6 +76,33 @@ func NewBusSystemState(ctx context.Context, bus *events.Bus) SystemState {
 	}()
 
 	return s
+}
+
+// readOnboardingPhase parses the on-disk onboarding marker and returns the
+// current phase string. Returns "" if the file is missing/unparseable —
+// safe default since "" maps to SystemBusy=false (devices without an
+// onboarding marker are presumed past first-run).
+func readOnboardingPhase() string {
+	path := paths.CoreJoin("network-bootstrap", "onboarding.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var cfg struct {
+		State       string `json:"state"`
+		InstallDone bool   `json:"install_done"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Printf("WARN: net-supervisor: parse %s: %v — assuming SystemBusy=false", path, err)
+		return ""
+	}
+	// Mirror onboarding.NewManager's boot-recovery path: install_disk +
+	// !InstallDone resolves to pending. Either way the supervisor stays
+	// busy, but log the equivalence so the journald trace is honest.
+	if cfg.State == "install_disk" && !cfg.InstallDone {
+		return "pending"
+	}
+	return cfg.State
 }
 
 // SetInitialPhase seeds the cached onboarding phase. Useful for tests and for

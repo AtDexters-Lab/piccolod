@@ -320,19 +320,34 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 		return err
 	}
 
-	// Wait for activation up to 30s.
+	// Wait for activation up to 30s. WaitForActivation returns Activated
+	// for ANY currently-active connection on the device — including the
+	// still-active old profile if NM hasn't transitioned yet (TOCTOU on
+	// the synchronous-state-check fast path). Verify the activated SSID
+	// matches the requested one before declaring success; mismatch routes
+	// to the failure branch and triggers rollback.
 	finalState, _, err := m.nm.WaitForActivation(ctx, dev.Path)
-	if err != nil || finalState != nmclient.NMDeviceStateActivated {
+	activated := err == nil && finalState == nmclient.NMDeviceStateActivated
+	if activated {
+		info, infoErr := m.nm.ActiveConnectionInfo(dev.Path)
+		if infoErr != nil || info == nil || info.ID != ssid {
+			activated = false
+			if err == nil {
+				err = errConnectWrongSSID
+			}
+		}
+	}
+	if !activated {
 		// Smart rollback: NM may have auto-reconnected.
 		if rollbackSnapshot != nil {
 			needsRestore := true
-			info, err := m.nm.ActiveConnectionInfo(dev.Path)
-			if err == nil && info != nil && info.ID == rollbackSnapshot.SSID() {
+			info, infoErr := m.nm.ActiveConnectionInfo(dev.Path)
+			if infoErr == nil && info != nil && info.ID == rollbackSnapshot.SSID() {
 				needsRestore = false
 			}
 			if needsRestore {
-				if err := m.nm.RestoreConnection(rollbackSnapshot); err != nil {
-					log.Printf("ERROR: network: WiFi rollback failed: %v", err)
+				if rerr := m.nm.RestoreConnection(rollbackSnapshot); rerr != nil {
+					log.Printf("ERROR: network: WiFi rollback failed: %v", rerr)
 				}
 			}
 		}
@@ -634,8 +649,9 @@ func (m *Manager) LoadAPSuppressionFlag() {
 
 // Sentinel errors.
 var (
-	errNoWifiDevice   = &networkError{"no WiFi device available"}
-	errConnectTimeout = &networkError{"connection timed out"}
+	errNoWifiDevice     = &networkError{"no WiFi device available"}
+	errConnectTimeout   = &networkError{"connection timed out"}
+	errConnectWrongSSID = &networkError{"activation reported success on a different SSID"}
 )
 
 type networkError struct{ msg string }
