@@ -107,7 +107,20 @@ RFC 20260114 §4.3 states: "`protocol: raw` and `flow: tls` listeners are never 
 
 This RFC amends that statement to:
 
-> All flow types (`tcp`, `tls`, `udp`) are eligible as primary listeners. `flow: tls` listeners are eligible for **remote** host-based routing (hostname-based resolution via the Nexus resolver) but are **not eligible for LAN host-based routing**. `flow: udp` listeners use port-based routing only (LAN always, remote only with `port_claim`). `protocol: raw` is eligible when combined with `flow: tls` or `flow: udp`.
+> All flow types (`tcp`, `tls`, `udp`) are eligible as primary listeners. `flow: tls` listeners are eligible for **remote** host-based routing (hostname-based resolution via the Nexus resolver) but are **not eligible for LAN host-based routing**. `flow: udp` listeners use port-based routing only (LAN always, remote only with `port_claim`). `protocol: raw` is eligible when combined with `flow: tls` or `flow: udp` — and, per RFC 20260505 §3.5, also with `flow: tcp` (host routing via TLS mux SNI termination on remote + LAN port-based).
+
+#### tcp+raw row in the access matrix (RFC 20260505)
+
+| Path                | tcp+raw                                       |
+| ------------------- | --------------------------------------------- |
+| Remote (Nexus)      | TLS mux SNI route — terminates TLS for the   |
+|                     | listener cert, proxies raw bytes to backend.  |
+| LAN port-based      | Same as remote — TLS mux on `<lan-base>:443`. |
+| LAN host-based      | Not supported (HTTP-only path; mDNS suppressed). |
+
+Recommended deployment guidance: pair `tcp+raw + __primary` with
+`ConnectionAuth` rules. The app's protocol-level auth may be weak; the
+L4 IP-allow/deny rules provide defense-in-depth at the network edge.
 
 ### 4.4 Certificate Considerations
 
@@ -361,7 +374,7 @@ No migration is needed. No existing manifests are invalidated.
 - Verify parser accepts `__primary` + `flow: tls` + `protocol: websocket`.
 - Verify parser accepts `__primary` + `flow: tls` + `protocol: raw`.
 - Verify parser accepts `__primary` + `flow: udp` + `protocol: raw`.
-- Verify parser still rejects `__primary` + `flow: tcp` + `protocol: raw` (unchanged).
+- ~~Verify parser still rejects `__primary` + `flow: tcp` + `protocol: raw`~~ — RFC 20260505 §3.5 makes this combination valid (TLS mux SNI route).
 - Verify parser rejects `flow: tls` + auth rules (unchanged behavior).
 - Verify parser rejects `flow: udp` + auth rules (unchanged behavior).
 - Verify `SetDefaults` does NOT default protocol to `http` for `flow: tls` or `flow: udp` primary listeners.

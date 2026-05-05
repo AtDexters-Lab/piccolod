@@ -84,13 +84,17 @@ This uses a single DNS label (left-most) for both primary and secondary listener
 
 ### 4.3 “Primary” Listener Selection
 
-Each app’s listeners MUST have exactly one “primary” HTTP/WebSocket listener when using host-based URLs.
+Each app’s listeners MUST have exactly one “primary” listener when using host-based URLs.
 
 Proposal:
 - Add optional `listeners[].primary: bool`.
-- If omitted, the first HTTP/WebSocket listener in manifest order is treated as primary.
+- If omitted, the first listener in manifest order is treated as primary.
 - Multiple `primary: true` entries MUST be rejected.
-- `protocol: raw` and `flow: tls` listeners are never eligible for primary host-based URLs.
+- Every flow is eligible for primary status. RFC 20260316 amends this to
+  cover `flow: tls` (remote + LAN port-based via raw passthrough); RFC
+  20260505 §3.5 extends host routing to `flow: tcp + protocol: raw`
+  (remote + LAN port-based via TLS mux SNI termination). Only LAN
+  host-based routing is restricted to HTTP/WebSocket — see §5.3.
 
 ### 4.4 Validation Requirements
 
@@ -143,7 +147,21 @@ Piccolo MAY additionally expose a shared LAN HTTP entrypoint:
 
 ### 5.3 LAN (Non-HTTP)
 
-For `protocol: raw` or `flow: tls`, Piccolo continues to allocate and expose per-listener public ports on LAN.
+LAN host-based routing (gin's `lanHostRoutingMiddleware` on
+`127.0.0.1:443`) is HTTP-only because gin terminates TLS for the portal
+cert and decodes the request before routing. Listener types that don't
+speak HTTP traverse a different LAN access path:
+
+- `flow: tls` (passthrough) and `flow: tcp + protocol: raw` (added by
+  RFC 20260505 §3.5): served on remote (Nexus) and LAN port-based via
+  the TLS mux SNI route. The mux terminates TLS for the listener cert
+  using SNI, then proxies the (raw) bytes to the backend.
+- `flow: udp`: served on LAN port-based and (with a `port_claim`) remote
+  via the Nexus relay's claimed-port registration.
+
+The eligibility predicate is centralized in
+`internal/api/types.go::LanHostBasedEligible(flow, protocol)` so mDNS
+suppression and the gin router stay in sync.
 
 ## 6. mDNS & Fallback Strategy
 
