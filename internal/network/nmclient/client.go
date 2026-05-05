@@ -57,6 +57,13 @@ type Client interface {
 	// DeviceState returns the current state of a specific device.
 	DeviceState(device dbus.ObjectPath) (NMDeviceState, error)
 
+	// DeviceStateReason returns the (state, reason) pair NM is tracking
+	// for a device. Used at startup before any StateChanged signal has
+	// been observed — without this, the prober's signal cache is empty
+	// and persistent NoSecrets / SupplicantFailed states misclassify as
+	// "no reason known".
+	DeviceStateReason(device dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error)
+
 	// ActiveConnectionInfo returns details about the active connection on a
 	// device, or nil if no connection is active.
 	ActiveConnectionInfo(device dbus.ObjectPath) (*ActiveConnectionInfo, error)

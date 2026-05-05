@@ -36,8 +36,10 @@ type StubClient struct {
 	DeactivateHotspotErr  error
 	ConnectivityResult    NMConnectivityState
 	ConnectivityErr       error
-	DeviceStateResult     NMDeviceState
-	DeviceStateErr        error
+	DeviceStateResult       NMDeviceState
+	DeviceStateErr          error
+	DeviceStateReasonResult NMDeviceStateReason
+	DeviceStateReasonErr    error
 	ActiveConnResult      *ActiveConnectionInfo
 	ActiveConnErr         error
 	SignalStrengthResult  uint8
@@ -197,6 +199,11 @@ func (s *StubClient) Connectivity() (NMConnectivityState, error) {
 func (s *StubClient) DeviceState(device dbus.ObjectPath) (NMDeviceState, error) {
 	s.record("DeviceState", device)
 	return s.DeviceStateResult, s.DeviceStateErr
+}
+
+func (s *StubClient) DeviceStateReason(device dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
+	s.record("DeviceStateReason", device)
+	return s.DeviceStateResult, s.DeviceStateReasonResult, s.DeviceStateReasonErr
 }
 
 func (s *StubClient) ActiveConnectionInfo(device dbus.ObjectPath) (*ActiveConnectionInfo, error) {

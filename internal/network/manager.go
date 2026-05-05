@@ -457,6 +457,13 @@ func (m *Manager) connectFromCaptivePortal(ssid, passphrase string) {
 	if m.portalServer != nil {
 		m.portalServer.Stop()
 	}
+	// Record the AP exit in the supervisor's ledger BEFORE the direct stop,
+	// so the rate-shaper sees the toggle even though we bypass the
+	// supervisor's actuator (single-radio constraint forces a synchronous
+	// stop here — the actuator path would race with the impending Connect).
+	if m.supervisor != nil {
+		m.supervisor.RecordExternalAPExit("captive-portal-connect")
+	}
 	m.apMgr.Stop(m.ctx, dev.Path)
 
 	// Clear the user-forced flag (captive portal credential entry implies

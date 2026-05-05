@@ -135,6 +135,9 @@ func (p *Prober) signalLoop() {
 			return
 		case evt, ok := <-devEvents:
 			if !ok {
+				// Channel closed — nil-out so the select case is permanently
+				// disabled. Without this we tight-spin until ctx cancels.
+				devEvents = nil
 				continue
 			}
 			if evt.Type == nmclient.DeviceAdded {
@@ -225,7 +228,11 @@ func (p *Prober) dampenHW(kind DeviceKind, candidate Tri, led ActionLedger, quie
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if candidate == TriFaulted {
-		p.consecHWFault[kind]++
+		// Cap at NofM — past the threshold the counter only matters as a
+		// boolean ("over the line"); growing it forever serves no purpose.
+		if p.consecHWFault[kind] < NofM {
+			p.consecHWFault[kind]++
+		}
 		if p.consecHWFault[kind] >= NofM {
 			return TriFaulted
 		}
@@ -239,7 +246,9 @@ func (p *Prober) dampenL3(raw L3ProbeResult) L3ProbeResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if raw == L3ProbeDown {
-		p.consecL3Down++
+		if p.consecL3Down < NofM {
+			p.consecL3Down++
+		}
 		if p.consecL3Down >= NofM {
 			return L3ProbeDown
 		}
@@ -255,6 +264,15 @@ func (p *Prober) lastReason(path dbus.ObjectPath) (nmclient.NMDeviceStateReason,
 	defer p.mu.Unlock()
 	r, ok := p.lastReasonByDev[path]
 	return r, ok
+}
+
+// setDevicePath records the per-tick device path under the prober mutex.
+// Must be locked because the supervisor's actuator-side pathFn callback
+// reads p.devicePath from a different goroutine concurrent with Probe().
+func (p *Prober) setDevicePath(kind DeviceKind, path dbus.ObjectPath) {
+	p.mu.Lock()
+	p.devicePath[kind] = path
+	p.mu.Unlock()
 }
 
 // readSystemUptime returns the system-wide uptime (NOT process uptime —

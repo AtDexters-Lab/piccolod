@@ -35,12 +35,14 @@ func (p *Prober) probeEth() rawEthObs {
 
 	if cached, ok := p.lastReason(dev.Path); ok {
 		raw.NMReason = cached
+	} else if _, reason, err := p.nm.DeviceStateReason(dev.Path); err == nil && reason != nmclient.NMDeviceStateReasonUnknown {
+		raw.NMReason = reason
 	}
 	if info, err := p.nm.ActiveConnectionInfo(dev.Path); err == nil && info != nil {
 		raw.HasIP = info.IP4Address != ""
 	}
 
-	p.devicePath[DeviceEthernet] = dev.Path
+	p.setDevicePath(DeviceEthernet, dev.Path)
 	return raw
 }
 

@@ -56,6 +56,18 @@ type Supervisor struct {
 	// the orchestrator only probes + classifies; decisions are computed but
 	// no side effects fire. Stage-1/2 testing path.
 	enableActuation bool
+
+	// Dedupe key for publishLegacyEvent so subscribers (identity, stun,
+	// health) are woken only on actual transitions, not every 30s tick.
+	legacyEventMu   sync.Mutex
+	lastLegacyEvent legacyEventKey
+}
+
+type legacyEventKey struct {
+	state    string
+	uplink   string
+	apActive bool
+	apSSID   string
 }
 
 // NewSupervisor constructs a probe-only supervisor. Use SetActuators to
@@ -112,15 +124,22 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop implements supervisor.Component.
+// Stop implements supervisor.Component. Safe to call before Start: cancel
+// is nil and tickLoop never runs, so we skip the doneCh wait.
 func (s *Supervisor) Stop(_ context.Context) error {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
 		cancel := s.cancelCtx
 		s.mu.Unlock()
-		if cancel != nil {
-			cancel()
+		if cancel == nil {
+			// Start was never called — nothing to wait on.
+			s.prober.Stop()
+			if s.closer != nil {
+				_ = s.closer.Close()
+			}
+			return
 		}
+		cancel()
 		s.prober.Stop()
 		<-s.doneCh
 		if s.closer != nil {
@@ -169,6 +188,16 @@ func (s *Supervisor) IntentSnapshot() UserIntent {
 	s.intentMu.RLock()
 	defer s.intentMu.RUnlock()
 	return s.intent
+}
+
+// RecordExternalAPExit records an AP-toggle Exit event in the ledger. Used
+// by callers that drive ap.Manager.Stop directly (e.g., the captive-portal
+// connect flow tears down AP synchronously before invoking nmclient.Connect
+// because the single radio cannot do AP+STA simultaneously). Without this
+// call, the rate-shaper undercounts toggles and a flapping captive-portal
+// failure cycle would not engage the entry budget.
+func (s *Supervisor) RecordExternalAPExit(reason string) {
+	s.led.RecordAPToggle(false, time.Now(), reason)
 }
 
 // RequestProbeAndDecide asks the orchestrator to run an early tick. Buffered
@@ -231,11 +260,15 @@ func (s *Supervisor) runTick(ctx context.Context) {
 	// Step 4a: synchronous ledger writes for actions about to fire. Snapshot
 	// must reflect these so quiet-period gates and budget views are
 	// consistent across the same tick (RFC §"Snapshot construction order").
-	s.recordIntent(now, hwWiFi, hwEth, apA)
+	// rebootPersisted gates the actuator dispatch in step 4b — if the
+	// reboot timestamp could not be persisted, we MUST NOT issue the
+	// reboot, otherwise the next boot reads a stale ledger and the same
+	// fault can immediately fire another reboot (loop).
+	rebootPersisted := s.recordIntent(now, hwWiFi, hwEth, apA)
 
 	// Step 4b: spawn actuator goroutines (async; outcomes observed next tick).
 	if s.enableActuation {
-		s.act(ctx, hwWiFi, hwEth, apA)
+		s.act(ctx, hwWiFi, hwEth, apA, rebootPersisted)
 	}
 
 	// Step 5: construct + publish snapshot.
@@ -255,19 +288,36 @@ func (s *Supervisor) runTick(ctx context.Context) {
 
 // recordIntent writes ledger entries synchronously for the actions about to
 // fire. F-B2: writes happen on initiation, not completion.
-func (s *Supervisor) recordIntent(now time.Time, hwW, hwE HWAction, apA APAction) {
+//
+// Returns rebootPersisted=true iff a Reboot was decided AND the persistent
+// ledger write succeeded. Caller MUST gate the actuator dispatch on this:
+// firing a reboot whose timestamp was not persisted creates a reboot loop
+// (next boot reads a stale ledger and the same fault re-fires immediately).
+// Bounces and AP toggles are best-effort; their persist failures only lose
+// rate-shaping precision, not safety.
+func (s *Supervisor) recordIntent(now time.Time, hwW, hwE HWAction, apA APAction) (rebootPersisted bool) {
 	switch act := hwW.(type) {
 	case HWBounce:
 		s.led.RecordBounce(act.Device, now)
 	case HWReboot:
-		_ = s.led.RecordReboot(now)
+		if err := s.led.RecordReboot(now); err != nil {
+			log.Printf("ERROR: net-supervisor: persist reboot ledger failed (%v) — SUPPRESSING reboot to avoid loop on next boot", err)
+			rebootPersisted = false
+		} else {
+			rebootPersisted = true
+		}
 		_ = act
 	}
 	switch act := hwE.(type) {
 	case HWBounce:
 		s.led.RecordBounce(act.Device, now)
 	case HWReboot:
-		_ = s.led.RecordReboot(now)
+		if err := s.led.RecordReboot(now); err != nil {
+			log.Printf("ERROR: net-supervisor: persist reboot ledger failed (%v) — SUPPRESSING reboot to avoid loop on next boot", err)
+			rebootPersisted = false
+		} else {
+			rebootPersisted = true
+		}
 		_ = act
 	}
 	switch a := apA.(type) {
@@ -276,11 +326,14 @@ func (s *Supervisor) recordIntent(now time.Time, hwW, hwE HWAction, apA APAction
 	case APExit:
 		s.led.RecordAPToggle(false, now, a.Reason)
 	}
+	return rebootPersisted
 }
 
 // act dispatches actuators for the decided actions. Each side-effecting
 // call runs in its own goroutine; outcomes observed by next tick's probe.
-func (s *Supervisor) act(ctx context.Context, hwW, hwE HWAction, apA APAction) {
+//
+// rebootPersisted gates the Reboot fire — see recordIntent.
+func (s *Supervisor) act(ctx context.Context, hwW, hwE HWAction, apA APAction, rebootPersisted bool) {
 	if s.devAct != nil {
 		if act, ok := hwW.(HWBounce); ok {
 			go s.fireBounce(ctx, act)
@@ -289,7 +342,7 @@ func (s *Supervisor) act(ctx context.Context, hwW, hwE HWAction, apA APAction) {
 			go s.fireBounce(ctx, act)
 		}
 	}
-	if s.sysAct != nil {
+	if s.sysAct != nil && rebootPersisted {
 		if _, ok := hwW.(HWReboot); ok {
 			go s.fireReboot(ctx, "wifi HW Faulted; bounce budget exhausted")
 		} else if _, ok := hwE.(HWReboot); ok {
@@ -365,22 +418,38 @@ func apReasonFor(a APAction, intent UserIntent, apActive bool) string {
 // so existing subscribers (identity.NotifyNetworkUp, stun.Trigger, health
 // tracker) continue receiving uplink-up signals after the cutover.
 //
-// Emits only on state transitions, not signal-tier ticks (the Snapshot does
-// not yet carry signal-tier; that surface is captured by signal.go's existing
-// monitor and remains untouched).
+// Dedupes against the previously-published (state, uplink, apActive, apSSID)
+// tuple so subscribers are only woken on actual transitions — pre-cutover
+// publishers fired only on state changes, and the new code's downstream
+// subscribers (identity refresh, STUN trigger) coalesce poorly with 30s-tick
+// spam.
 func (s *Supervisor) publishLegacyEvent(tick Tick, snap Snapshot) {
 	if s.bus == nil {
 		return
 	}
 	state := deriveLegacyState(tick, snap.APMode.Active)
 	uplink := tick.ActiveUplink
+	cur := legacyEventKey{
+		state:    string(state),
+		uplink:   string(uplink),
+		apActive: snap.APMode.Active,
+		apSSID:   snap.APMode.SSID,
+	}
+	s.legacyEventMu.Lock()
+	if s.lastLegacyEvent == cur {
+		s.legacyEventMu.Unlock()
+		return
+	}
+	s.lastLegacyEvent = cur
+	s.legacyEventMu.Unlock()
+
 	s.bus.Publish(events.Event{
 		Topic: events.TopicNetworkStateChanged,
 		Payload: NetworkStateChangedEvent{
-			State:        string(state),
-			ActiveUplink: string(uplink),
-			APActive:     snap.APMode.Active,
-			APSSID:       snap.APMode.SSID,
+			State:        cur.state,
+			ActiveUplink: cur.uplink,
+			APActive:     cur.apActive,
+			APSSID:       cur.apSSID,
 		},
 	})
 }

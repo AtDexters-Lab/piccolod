@@ -170,6 +170,35 @@ func (c *DBusClient) DeviceState(device dbus.ObjectPath) (NMDeviceState, error) 
 	return NMDeviceState(v.Value().(uint32)), nil
 }
 
+// DeviceStateReason reads the cached (state, reason) pair for a device via
+// the StateReason property. Useful at startup when the supervisor has not
+// yet observed any StateChanged signals — without this, callers fall back
+// to "no reason known" and may misclassify a persistent NoSecrets state.
+//
+// Returns the most recent state-reason pair NM is tracking; on older NM
+// builds that lack the StateReason property, falls back to (DeviceState,
+// NMDeviceStateReasonUnknown).
+func (c *DBusClient) DeviceStateReason(device dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
+	v, err := c.prop(device, nmDeviceInterface, "StateReason")
+	if err != nil {
+		// Fallback to State alone — best effort.
+		st, sErr := c.DeviceState(device)
+		if sErr != nil {
+			return NMDeviceStateUnknown, NMDeviceStateReasonNone, err
+		}
+		return st, NMDeviceStateReasonUnknown, nil
+	}
+	// StateReason is exposed as a struct of (uint32 state, uint32 reason).
+	if pair, ok := v.Value().([]interface{}); ok && len(pair) == 2 {
+		state, _ := pair[0].(uint32)
+		reason, _ := pair[1].(uint32)
+		return NMDeviceState(state), NMDeviceStateReason(reason), nil
+	}
+	// Unexpected encoding — fall back to State alone.
+	st, _ := c.DeviceState(device)
+	return st, NMDeviceStateReasonUnknown, nil
+}
+
 // SignalStrength returns the WiFi signal strength (0–100) for the active AP.
 func (c *DBusClient) SignalStrength(device dbus.ObjectPath) (uint8, error) {
 	v, err := c.prop(device, nmWirelessInterface, "ActiveAccessPoint")

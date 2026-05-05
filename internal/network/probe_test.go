@@ -492,6 +492,30 @@ func TestClassifyConnectivity(t *testing.T) {
 	}
 }
 
+// TestProbeWiFi_ColdStartReadsStateReason verifies that on piccolod
+// restart with NM in a persistent failure state (e.g. NoSecrets after a
+// wrong-password attempt), the prober falls back to NM's cached
+// StateReason property when the signal cache is empty. Without this,
+// catalog D2 regresses across restart — ConfigHealth misclassifies as
+// Healthy and the supervisor never triggers AP entry.
+func TestProbeWiFi_ColdStartReadsStateReason(t *testing.T) {
+	f := newFixture(t)
+	f.wifiAt(nmclient.NMDeviceStateDisconnected, false, "")
+	f.nm.SavedConnections = []nmclient.ConnectionProfile{{Path: "/c0", SSID: "home"}}
+	// NM's cached StateReason returns NoSecrets; signal cache is empty
+	// (lastReasonByDev not populated — fresh restart).
+	f.nm.DeviceStateReasonResult = nmclient.NMDeviceStateReasonNoSecrets
+
+	tick := f.probeN(1)
+	wifi := tick.Devices[DeviceWiFi]
+	if wifi.HWHealth != TriHealthy {
+		t.Errorf("HWHealth = %s, want healthy", wifi.HWHealth)
+	}
+	if wifi.ConfigHealth != TriFaulted {
+		t.Errorf("ConfigHealth = %s, want faulted (cold-start StateReason fallback)", wifi.ConfigHealth)
+	}
+}
+
 // TestSystemState_SelfSeedsFromDisk verifies the post-restart guarantee:
 // when piccolod starts mid-onboarding, NewBusSystemState reads the
 // on-disk onboarding.json and reports SystemBusy=true from the very first

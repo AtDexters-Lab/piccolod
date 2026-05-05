@@ -53,11 +53,20 @@ func (p *Prober) probeWiFi() rawWiFiObs {
 	raw.Iface = dev.Interface
 	raw.NMState = dev.State
 
-	// Last-known state-change reason from the signal cache (populated by the
-	// signal goroutine started in Prober.Run).
+	// Reason resolution — preference order:
+	//   1. Signal-cached reason from p.lastReasonByDev (most recent
+	//      transition observed at runtime).
+	//   2. NM's cached StateReason property — covers the cold-start path
+	//      where piccolod restarted into a persistent failure state (e.g.
+	//      NoSecrets after a wrong-password attempt) and no signal has
+	//      fired since the prober subscribed. Without this, catalog D2
+	//      regresses across piccolod restart.
 	if cached, ok := p.lastReason(dev.Path); ok {
 		raw.NMReason = cached
 		raw.IsAuthFailure = isAuthFailure(cached)
+	} else if _, reason, err := p.nm.DeviceStateReason(dev.Path); err == nil && reason != nmclient.NMDeviceStateReasonUnknown {
+		raw.NMReason = reason
+		raw.IsAuthFailure = isAuthFailure(reason)
 	}
 
 	// Saved profiles — drives ConfigHealth Inactive vs Faulted.
@@ -77,7 +86,7 @@ func (p *Prober) probeWiFi() rawWiFiObs {
 	// works. Stage 1 keeps this conservative — orchestrator can call scan
 	// directly when needed.
 
-	p.devicePath[DeviceWiFi] = dev.Path
+	p.setDevicePath(DeviceWiFi, dev.Path)
 	return raw
 }
 
