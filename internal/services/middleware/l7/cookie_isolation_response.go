@@ -10,6 +10,13 @@ import (
 // CookieIsolationResponse implements RFC 20260112 Set-Cookie isolation:
 //   - Drops `piccolo_*` cookies from app responses (apps cannot impersonate
 //     Piccolo session cookies).
+//   - Drops `__piccolo_*` cookies from app responses unless they target THIS
+//     app's prefix. Closes a cross-app cookie injection: in port-based LAN
+//     mode, browsers scope cookies by host (not port — RFC 6265 §8.5), so
+//     a compromised app A returning `Set-Cookie: __piccolo_appB_session=evil`
+//     (no HttpOnly to bypass the rewrite gate) would otherwise be stored
+//     host-scoped and then unwrapped by app B's request-side strip into
+//     `Cookie: session=evil` — forging app B's session.
 //   - Drops Set-Cookie with a Domain attribute that doesn't match the request
 //     app host (defends against domain-scoped cookies leaking across apps).
 //     Fails closed if the app host can't be determined.
@@ -44,6 +51,13 @@ func CookieIsolationResponse(appName string) middleware.ResponseModifier {
 				continue
 			}
 			if IsPiccoloCookieName(name) {
+				continue
+			}
+			// Block backend attempts to set cookies in another app's
+			// __piccolo_<otherApp>_ namespace. Same-app `__piccolo_<thisApp>_`
+			// is also blocked at this point — the proxy itself produces those
+			// via the rewrite block below, the backend MUST NOT.
+			if strings.HasPrefix(name, "__piccolo_") {
 				continue
 			}
 
