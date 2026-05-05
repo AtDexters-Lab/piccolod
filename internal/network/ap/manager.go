@@ -112,7 +112,9 @@ func (m *Manager) Start(ctx context.Context, device dbus.ObjectPath, macAddr net
 	// connectFromCaptivePortal.
 	waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer waitCancel()
-	nmState, nmReason, waitErr := m.nm.WaitForActivation(waitCtx, device)
+	// AP-mode hotspot has no specific active-conn path to wait for —
+	// any Activated transition on the device is the one we caused.
+	nmState, nmReason, waitErr := m.nm.WaitForActivation(waitCtx, device, "")
 	if waitErr != nil {
 		return m.rollback(fmt.Errorf("wait for hotspot activation: %w", waitErr))
 	}

@@ -154,13 +154,24 @@ func nmConnAdvisory(nm nmclient.Client) Connectivity {
 }
 
 // activeUplinkFor returns the priority-based active uplink. Predicate:
-// HWHealth==Healthy AND LinkUp. Priority: ethernet > wifi > none. AP mode
-// maps to UplinkNone per existing wire convention (see types.go).
+// HWHealth==Healthy AND LinkUp AND HasIP. Priority: ethernet > wifi > none.
+// AP mode maps to UplinkNone per existing wire convention.
+//
+// HasIP is required so that DHCP-in-flight (NMState=IPConfig=70 with no
+// address yet) does not produce a false "uplink up" signal: gin_server.go
+// triggers identity.NotifyNetworkUp + stun.Trigger on any non-none uplink,
+// and we don't want enrollment refreshes mid-DHCP.
+//
+// Critically, HasIP does NOT blip during transient gateway-ARP loss (it
+// reflects NM's lease state, not gateway reachability), so this preserves
+// the RFC §"Risks" #8 no-flicker property the loose predicate was meant
+// to give us. The flip case codex round-2 P2-A flagged is when LinkUp
+// becomes true at IPConfig but HasIP is still false — that's the gap.
 func activeUplinkFor(devs map[DeviceKind]DeviceObservation) UplinkType {
-	if obs, ok := devs[DeviceEthernet]; ok && obs.HWHealth == TriHealthy && obs.LinkUp {
+	if obs, ok := devs[DeviceEthernet]; ok && obs.HWHealth == TriHealthy && obs.LinkUp && obs.HasIP {
 		return UplinkEthernet
 	}
-	if obs, ok := devs[DeviceWiFi]; ok && obs.HWHealth == TriHealthy && obs.LinkUp {
+	if obs, ok := devs[DeviceWiFi]; ok && obs.HWHealth == TriHealthy && obs.LinkUp && obs.HasIP {
 		return UplinkWiFi
 	}
 	return UplinkNone

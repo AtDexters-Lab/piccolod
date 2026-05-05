@@ -21,10 +21,14 @@ type Client interface {
 	Scan(device dbus.ObjectPath) ([]AccessPoint, error)
 
 	// Connect creates or updates an NM connection profile for the given SSID
-	// and activates it on the device. Returns the D-Bus path of the new
-	// connection profile and when the connection attempt starts (not when it
-	// succeeds — watch DeviceStateChange for activation).
-	Connect(device dbus.ObjectPath, ssid, passphrase string) (dbus.ObjectPath, error)
+	// and activates it on the device. Returns the D-Bus paths of the new
+	// connection profile (settings) AND the new active connection — the
+	// latter is required by WaitForActivation to disambiguate this attempt
+	// from a still-Activated previous connection (TOCTOU).
+	//
+	// The connection attempt is fire-and-forget at this layer; success is
+	// determined via WaitForActivation or DeviceStateChange.
+	Connect(device dbus.ObjectPath, ssid, passphrase string) (dbus.ObjectPath, dbus.ObjectPath, error)
 
 	// Disconnect deactivates the active connection on the device.
 	Disconnect(device dbus.ObjectPath) error
@@ -96,7 +100,14 @@ type Client interface {
 	// terminal failure state (Failed, Disconnected) after an activation
 	// request. Returns the final state and reason code. Use a context
 	// with timeout to bound the wait.
-	WaitForActivation(ctx context.Context, device dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error)
+	//
+	// expectedActiveConn is the active connection path returned from
+	// Connect/AddAndActivateConnection. When non-empty, the synchronous
+	// fast path only returns Activated if the device's CURRENT active
+	// connection matches — without this, an old still-Activated profile
+	// would be reported as success before NM has transitioned to the new
+	// one. Pass "" if you don't have the path (legacy callers).
+	WaitForActivation(ctx context.Context, device, expectedActiveConn dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error)
 
 	// IsConnected returns true if the D-Bus connection to NM is alive.
 	// When false, the client is operating in degraded polling-fallback mode.

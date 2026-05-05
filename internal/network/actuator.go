@@ -154,21 +154,36 @@ func (a *realDeviceActuator) bounceEth(ctx context.Context) error {
 
 // realAPActuator wraps the existing internal/network/ap.Manager. The
 // orchestrator constructs this with a function that supplies the WiFi
-// device path + MAC at Enter() time (re-read each call for hotplug safety).
+// device path + MAC at Enter() time (re-read each call for hotplug safety),
+// plus an optional pre-scan hook that runs while the radio is still in
+// STA mode — once AP starts, the WiFi adapter cannot scan, so the
+// captive portal serves the cache populated by this hook.
 type realAPActuator struct {
 	apMgr        *ap.Manager
 	wifiDeviceFn func() (dbus.ObjectPath, net.HardwareAddr, bool)
+	prescanFn    func(ctx context.Context) error
 }
 
-// NewAPModeActuator wires the ap.Manager wrapper.
-func NewAPModeActuator(apMgr *ap.Manager, wifiDeviceFn func() (dbus.ObjectPath, net.HardwareAddr, bool)) APModeActuator {
-	return &realAPActuator{apMgr: apMgr, wifiDeviceFn: wifiDeviceFn}
+// NewAPModeActuator wires the ap.Manager wrapper. prescanFn (if non-nil)
+// runs immediately before AP entry so the captive portal has a fresh
+// network list to display — without it, first-run users see an empty
+// list because Manager.ScanNetworks returns scanCache while AP is up
+// and the cache has not been primed.
+func NewAPModeActuator(apMgr *ap.Manager, wifiDeviceFn func() (dbus.ObjectPath, net.HardwareAddr, bool), prescanFn func(ctx context.Context) error) APModeActuator {
+	return &realAPActuator{apMgr: apMgr, wifiDeviceFn: wifiDeviceFn, prescanFn: prescanFn}
 }
 
 func (a *realAPActuator) Enter(ctx context.Context) error {
 	path, mac, ok := a.wifiDeviceFn()
 	if !ok {
 		return errors.New("ap-actuator: no wifi device for AP entry")
+	}
+	// Pre-scan while the adapter is still in STA mode — once the hotspot
+	// starts, NM cannot scan on the same radio.
+	if a.prescanFn != nil {
+		if err := a.prescanFn(ctx); err != nil {
+			log.Printf("WARN: ap-actuator: pre-AP scan failed: %v", err)
+		}
 	}
 	return a.apMgr.Start(ctx, path, mac)
 }

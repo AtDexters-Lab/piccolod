@@ -288,7 +288,13 @@ func (c *DBusClient) readIP4Config(path dbus.ObjectPath) (addr, gw string) {
 // WaitForActivation blocks until the device reaches Activated or a terminal
 // failure state. A second D-Bus subscription is safe: match rules are
 // reference-counted, and godbus fans out signals to all registered channels.
-func (c *DBusClient) WaitForActivation(ctx context.Context, device dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
+//
+// expectedActiveConn (when non-empty) constrains the synchronous fast path:
+// Activated is only treated as success when the device's CURRENT active
+// connection matches expectedActiveConn. Without this guard, switching from
+// an already-Activated SSID would return success for the OLD connection
+// before NM had moved off it.
+func (c *DBusClient) WaitForActivation(ctx context.Context, device, expectedActiveConn dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
 	// Create a child context so we cancel the D-Bus subscription immediately
 	// on return, rather than leaking it until the caller's context expires.
 	subCtx, subCancel := context.WithCancel(ctx)
@@ -302,11 +308,22 @@ func (c *DBusClient) WaitForActivation(ctx context.Context, device dbus.ObjectPa
 	// TOCTOU guard: check current state before entering the wait loop.
 	// If NM already activated, failed, or raced through failure back to
 	// disconnected before we polled, return now to avoid a long stall.
+	//
+	// For Activated, verify the active connection path matches the one
+	// the caller is waiting on (if known) — otherwise we'd report success
+	// for a still-Activated previous SSID.
 	curState, err := c.DeviceState(device)
 	if err == nil {
 		switch {
 		case curState == NMDeviceStateActivated:
-			return NMDeviceStateActivated, NMDeviceStateReasonNone, nil
+			if expectedActiveConn == "" {
+				return NMDeviceStateActivated, NMDeviceStateReasonNone, nil
+			}
+			if info, infoErr := c.ActiveConnectionInfo(device); infoErr == nil && info != nil && info.Path == expectedActiveConn {
+				return NMDeviceStateActivated, NMDeviceStateReasonNone, nil
+			}
+			// Still on the old connection — fall through to wait for
+			// the state-change event that will move us off it.
 		case curState == NMDeviceStateFailed:
 			return NMDeviceStateFailed, NMDeviceStateReasonUnknown, nil
 		case curState <= NMDeviceStateDisconnected:

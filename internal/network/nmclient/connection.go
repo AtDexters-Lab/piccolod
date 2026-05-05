@@ -8,13 +8,17 @@ import (
 
 // Connect creates or updates an NM connection profile for the given SSID and
 // activates it on the device. It creates a new profile or reuses an existing
-// one matching the SSID. Returns when the activation request is submitted (not
-// when the connection is established — callers should watch DeviceStateChange).
-func (c *DBusClient) Connect(device dbus.ObjectPath, ssid, passphrase string) (dbus.ObjectPath, error) {
+// one matching the SSID. Returns the new settings path and the active
+// connection path. The latter is needed by WaitForActivation to disambiguate
+// the requested connection from a still-Activated old profile (TOCTOU).
+//
+// Returns when the activation request is submitted (not when the connection
+// is established — callers should watch DeviceStateChange).
+func (c *DBusClient) Connect(device dbus.ObjectPath, ssid, passphrase string) (dbus.ObjectPath, dbus.ObjectPath, error) {
 	// Check for existing profile for this SSID
 	profiles, err := c.SavedWiFiConnections()
 	if err != nil {
-		return "", fmt.Errorf("nmclient: list saved connections: %w", err)
+		return "", "", fmt.Errorf("nmclient: list saved connections: %w", err)
 	}
 
 	var existingPath dbus.ObjectPath
@@ -31,7 +35,7 @@ func (c *DBusClient) Connect(device dbus.ObjectPath, ssid, passphrase string) (d
 		// round-trip through Go's dbus library (serialized as aav), causing
 		// Update to fail with type mismatches. Creating fresh avoids this.
 		if err := c.obj(existingPath).Call(nmSettingsConnIface+".Delete", 0).Err; err != nil {
-			return "", fmt.Errorf("nmclient: delete old profile: %w", err)
+			return "", "", fmt.Errorf("nmclient: delete old profile: %w", err)
 		}
 	}
 
@@ -62,7 +66,7 @@ func (c *DBusClient) Connect(device dbus.ObjectPath, ssid, passphrase string) (d
 	var settingsPath, activePath dbus.ObjectPath
 	err = c.nm().Call(nmInterface+".AddAndActivateConnection", 0,
 		connSettings, device, dbus.ObjectPath("/")).Store(&settingsPath, &activePath)
-	return settingsPath, err
+	return settingsPath, activePath, err
 }
 
 // Disconnect deactivates the active connection on the device.

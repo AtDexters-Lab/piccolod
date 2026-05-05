@@ -53,6 +53,12 @@ type Manager struct {
 	scanCacheTime time.Time
 	scanMu        sync.Mutex
 
+	// connectMu serializes Connect attempts. Pre-cutover the state machine's
+	// beginLongTransition gate handled this; without serialization,
+	// concurrent /api/wifi/connect + captive-portal connects can race on
+	// profile snapshot/delete/restore and corrupt the saved-profile set.
+	connectMu sync.Mutex
+
 	healthTracker *health.Tracker
 
 	stopOnce sync.Once
@@ -85,7 +91,15 @@ func NewManager(nm nmclient.Client, r runner.CommandRunner, bus *events.Bus) *Ma
 func (m *Manager) AttachSupervisor(sup *Supervisor) {
 	m.supervisor = sup
 	sup.SetEventBus(m.events)
-	sup.WireActuators(m.nm, m.runner, m.apMgr)
+	// Prescan hook: refresh the scan cache before AP entry so the
+	// captive portal has fresh BSS results to display. Once AP is up,
+	// the WiFi adapter cannot scan, so this is the only chance to
+	// prime the cache for first-run / recovery flows.
+	prescan := func(ctx context.Context) error {
+		_, err := m.ScanNetworks(true)
+		return err
+	}
+	sup.WireActuators(m.nm, m.runner, m.apMgr, prescan)
 	m.LoadAPSuppressionFlag()
 	sup.EnableActuation(true)
 }
@@ -208,16 +222,19 @@ func (m *Manager) Status() Status {
 	return s
 }
 
-// APStatus reports AP mode state read from the supervisor's snapshot.
+// APStatus reports AP mode state. Reads ap.Manager directly (not the
+// supervisor's last-tick snapshot) so callers polling immediately after
+// ForceAPMode/SetAPSuppressed don't see stale state — actuators run
+// asynchronously after the tick snapshot is built; without a live read,
+// state would lag up to 30s.
 func (m *Manager) APStatus() APStatus {
-	snap := m.snapshot()
 	suppressed := false
 	if m.supervisor != nil {
 		suppressed = m.supervisor.IntentSnapshot().SuppressAP
 	}
 	return APStatus{
-		Active:     snap.APMode.Active,
-		SSID:       snap.APMode.SSID,
+		Active:     m.apMgr.Active(),
+		SSID:       m.apMgr.SSID(),
 		Suppressed: suppressed,
 	}
 }
@@ -274,6 +291,9 @@ func (m *Manager) ScanNetworks(forceRefresh bool) ([]ScanResult, error) {
 // for rollback; on success, requests a probe-and-decide so the supervisor
 // re-evaluates immediately.
 func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+
 	m.mu.RLock()
 	dev := m.wifiDevice
 	m.mu.RUnlock()
@@ -304,7 +324,7 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 		}
 	}
 
-	newProfilePath, err := m.nm.Connect(dev.Path, ssid, passphrase)
+	newProfilePath, newActivePath, err := m.nm.Connect(dev.Path, ssid, passphrase)
 	if err != nil {
 		if rollbackSnapshot != nil {
 			if rerr := m.nm.RestoreConnection(rollbackSnapshot); rerr != nil {
@@ -328,7 +348,7 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	// before declaring success; mismatch routes to the failure branch
 	// and triggers rollback.
 	waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
-	finalState, _, err := m.nm.WaitForActivation(waitCtx, dev.Path)
+	finalState, _, err := m.nm.WaitForActivation(waitCtx, dev.Path, newActivePath)
 	cancelWait()
 	activated := err == nil && finalState == nmclient.NMDeviceStateActivated
 	if activated {

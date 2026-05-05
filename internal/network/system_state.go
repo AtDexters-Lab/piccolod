@@ -35,10 +35,10 @@ type busSystemState struct {
 
 // NewBusSystemState constructs a SystemState backed by the event bus.
 //
-// At construction it self-seeds by reading the current onboarding phase
-// synchronously from /piccolo-core/network-bootstrap/onboarding.json. This
-// closes the post-restart window where SystemBusy=false until the first
-// bus event arrives — events.Bus has no replay-on-subscribe, and
+// At construction it self-seeds by reading the on-disk onboarding marker
+// (paths.CoreJoin("network-bootstrap", "onboarding.json")). This closes
+// the post-restart window where SystemBusy=false until the first bus
+// event arrives — events.Bus has no replay-on-subscribe, and
 // publishOnboardingEvent only fires from POST handlers, so without the
 // disk seed a piccolod restart mid-onboarding would let the supervisor
 // bounce wifi during install_disk (defeats catalog A7/G7).

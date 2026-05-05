@@ -298,7 +298,13 @@ func (s *Supervisor) runTick(ctx context.Context) {
 // Bounces and AP toggles are best-effort; their persist failures only lose
 // rate-shaping precision, not safety.
 func (s *Supervisor) recordIntent(now time.Time, hwW, hwE HWAction, apA APAction) (rebootPersisted bool) {
-	rebootPersisted = s.recordHW(hwW, now) || s.recordHW(hwE, now)
+	// Both arms must run unconditionally — `||` short-circuits if hwW
+	// records a Reboot (returns true) and would skip recording an
+	// HWBounce on hwE, leaving the actuator dispatch with no ledger
+	// entry (next tick can spend another bounce immediately).
+	persistedW := s.recordHW(hwW, now)
+	persistedE := s.recordHW(hwE, now)
+	rebootPersisted = persistedW || persistedE
 
 	switch a := apA.(type) {
 	case APEnter:
@@ -530,8 +536,10 @@ func BuildSupervisor(_ context.Context, r runner.CommandRunner, sys SystemState)
 
 // WireActuators constructs and installs the production actuators. Caller
 // supplies the AP manager (existing one from manager.go); the device-path
-// resolver reads from the prober's most recent observation.
-func (s *Supervisor) WireActuators(nm nmclient.Client, r runner.CommandRunner, apMgr *ap.Manager) {
+// resolver reads from the prober's most recent observation. prescanFn
+// (optional) primes the WiFi scan cache before AP entry so the captive
+// portal has a network list to display.
+func (s *Supervisor) WireActuators(nm nmclient.Client, r runner.CommandRunner, apMgr *ap.Manager, prescanFn func(ctx context.Context) error) {
 	pathFn := func(k DeviceKind) dbus.ObjectPath {
 		s.prober.mu.Lock()
 		defer s.prober.mu.Unlock()
@@ -558,7 +566,7 @@ func (s *Supervisor) WireActuators(nm nmclient.Client, r runner.CommandRunner, a
 	}
 
 	devAct := NewDeviceActuator(nm, r, pathFn, ifaceFn, func() bool { return s.isAPActive() })
-	apAct := NewAPModeActuator(apMgr, wifiDeviceFn)
+	apAct := NewAPModeActuator(apMgr, wifiDeviceFn, prescanFn)
 	sysAct := NewSystemActuator(r, s.sys)
 	s.SetActuators(devAct, apAct, sysAct)
 }

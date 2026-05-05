@@ -26,6 +26,7 @@ type StubClient struct {
 	ConnectErr            error
 	DisconnectErr         error
 	ConnectPath           dbus.ObjectPath
+	ConnectActivePath     dbus.ObjectPath
 	SavedConnections      []ConnectionProfile
 	SavedConnectionsErr   error
 	DeleteConnectionErr   error
@@ -151,9 +152,9 @@ func (s *StubClient) Scan(device dbus.ObjectPath) ([]AccessPoint, error) {
 	return s.ScanResult, s.ScanErr
 }
 
-func (s *StubClient) Connect(device dbus.ObjectPath, ssid, passphrase string) (dbus.ObjectPath, error) {
+func (s *StubClient) Connect(device dbus.ObjectPath, ssid, passphrase string) (dbus.ObjectPath, dbus.ObjectPath, error) {
 	s.record("Connect", device, ssid, passphrase)
-	return s.ConnectPath, s.ConnectErr
+	return s.ConnectPath, s.ConnectActivePath, s.ConnectErr
 }
 
 func (s *StubClient) Disconnect(device dbus.ObjectPath) error {
@@ -302,8 +303,8 @@ func (s *StubClient) SubscribeDeviceAddedRemoved(ctx context.Context) (<-chan De
 	return ch, nil
 }
 
-func (s *StubClient) WaitForActivation(_ context.Context, device dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
-	s.record("WaitForActivation", device)
+func (s *StubClient) WaitForActivation(_ context.Context, device, expectedActiveConn dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
+	s.record("WaitForActivation", device, expectedActiveConn)
 	return s.WaitForActivationState, s.WaitForActivationReason, s.WaitForActivationErr
 }
 
