@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,9 +19,8 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/auth"
+	"piccolod/internal/services/middleware/l7"
 )
-
-var frameAncestorsRe = regexp.MustCompile(`(?i)frame-ancestors\s+[^;]+(; ?)?`)
 
 type connectionHint struct {
 	clientIP   string
@@ -461,20 +459,18 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		return
 	}
 	rp := httputil.NewSingleHostReverseProxy(u)
-	// Strip backend restrictions so we can apply our own
-	rp.ModifyResponse = func(resp *http.Response) error {
-		// Strip backend security headers that conflict with proxy-level policies.
-		// The proxy's securityHeaders middleware sets consistent CORP/COEP for all responses.
-		resp.Header.Del("X-Frame-Options")
-		resp.Header.Del("Cross-Origin-Resource-Policy")
-		resp.Header.Del("Cross-Origin-Embedder-Policy")
 
-		// Remove existing frame-ancestors directive if present, but keep other CSP directives
-		if val := resp.Header.Get("Content-Security-Policy"); val != "" {
-			newVal := frameAncestorsRe.ReplaceAllString(val, "")
-			// If cleaning resulted in empty or just whitespace/semicolons, strictly we might want to keep it empty
-			// But for now, just setting it back is fine.
-			resp.Header.Set("Content-Security-Policy", newVal)
+	// Response-side modifier composition (extraction substep 2a per plan §H).
+	// Modifiers run in canonical order:
+	//   1. security_headers_response — extracted (l7.SecurityHeadersResponse)
+	//   2. cookie_isolation_response — INLINE (substep 2c)
+	//   3. embedded_marker_response  — extracted (l7.EmbeddedMarkerResponse)
+	//   4. oidc_authorize_rewrite_response — INLINE (substep 2d)
+	secHeadersResp := l7.SecurityHeadersResponse()
+	markerResp := l7.EmbeddedMarkerResponse(needsEmbeddedMarker, embeddedMarkerSetCookie)
+	rp.ModifyResponse = func(resp *http.Response) error {
+		if err := secHeadersResp(resp); err != nil {
+			return err
 		}
 
 		// RFC 20260112: Set-Cookie blocking + optional LAN port-based cookie isolation.
@@ -519,10 +515,8 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			}
 		}
 
-		// Set embedded marker cookie on initial iframe loads so subsequent
-		// XHR/fetch from within the iframe can propagate CHIPS context.
-		if proxyContextNeedsMarker(resp.Request.Context()) {
-			resp.Header.Add("Set-Cookie", embeddedMarkerSetCookie())
+		if err := markerResp(resp); err != nil {
+			return err
 		}
 
 		// OIDC authorize URL rewriting for WAN requests.
@@ -533,28 +527,29 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		return nil
 	}
 
-	// Single handler that enforces listener auth rules (per-path) before forwarding.
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Zero-trust: for non-loopback listener hops, do not allow clients to influence
-		// portal origin / redirect scheme / host via spoofed forwarding headers.
-		// Loopback-only sources (e.g., Nexus via TLS mux) remain eligible for trusted forwarding.
-		trustedLoopback := false
-		if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
-			if host, _, err := net.SplitHostPort(localAddr.String()); err == nil {
-				if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-					trustedLoopback = true
-				}
-			}
-		}
-		if !trustedLoopback {
-			r.Header.Del("Forwarded")
-			r.Header.Del("X-Forwarded-For")
-			r.Header.Del("X-Forwarded-Proto")
-			r.Header.Del("X-Forwarded-Host")
-			r.Header.Del("X-Forwarded-Port")
-			r.Header.Del("X-Real-IP")
-		}
+	// Request-side L7 chain composition (extraction substep 2a per plan §H).
+	// Build innermost-first; outer wraps inner.
+	//
+	//   forwarded_scrub
+	//     → path_normalize
+	//       → INLINE handler (hint_consumer_l7, reserved_path_intercept, ACME bypass,
+	//                          path_auth, cookie context, oidc_authorize_snapshot)
+	//         → forward_headers
+	//           → gzip + reverse_proxy (terminal)
+	//
+	// Extracted in this substep: forwarded_scrub, path_normalize, forward_headers.
+	// Remaining inline pending substeps 2b–2e.
 
+	terminal := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gzw := newGzipResponseWriter(w, r)
+		defer gzw.Close()
+		rp.ServeHTTP(gzw, r)
+	}))
+	withForward := l7.ForwardHeaders(func(r *http.Request) { applyForwardHeaders(r, ep) })(terminal)
+
+	inlineHandler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// hint_consumer_l7 (inline; extraction deferred to step 9 alongside the
+		// connectionHint→middleware.HintFromContext migration).
 		if token := strings.TrimSpace(r.Header.Get(HeaderPiccoloHintToken)); token != "" {
 			r.Header.Del(HeaderPiccoloHintToken)
 			if hint, ok := p.consumeRequestHint(ep.PublicPort, token); ok {
@@ -562,16 +557,8 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			}
 		}
 
-		cleanedPath, pathErr := normalizeAndSetRequestPath(r)
-		if pathErr != "" {
-			// RFC 7.2: runtime path errors
-			if pathErr == "INVALID_PATH" {
-				writeProxyJSONError(w, http.StatusBadRequest, "invalid_request_path", "INVALID_PATH")
-				return
-			}
-			writeProxyJSONError(w, http.StatusBadRequest, "path_normalization_failed", "PATH_INVALID")
-			return
-		}
+		// path_normalize already mutated r.URL.Path; downstream reads it directly.
+		cleanedPath := r.URL.Path
 
 		// RFC 20260122 §5.10: Intercept reserved proxy OIDC paths
 		if IsReservedPath(cleanedPath) {
@@ -767,12 +754,14 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			}
 		}
 
-		applyForwardHeaders(r, ep)
-
-		gzw := newGzipResponseWriter(w, r)
-		defer gzw.Close()
-		rp.ServeHTTP(gzw, r)
+		// forward_headers + gzip + reverse_proxy are the terminal of the chain,
+		// composed into withForward above.
+		withForward.ServeHTTP(w, r)
 	}))
+
+	// Wrap inline handler with extracted L7 middlewares (innermost-first; outer wraps inner).
+	handler := l7.PathNormalize(normalizeAndSetRequestPath, writeProxyJSONError)(inlineHandler)
+	handler = l7.ForwardedScrub()(handler)
 
 	// Apply common middleware chain
 	handler = p.securityHeaders(handler)
