@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -269,7 +270,7 @@ func (s *Supervisor) runTick(ctx context.Context) {
 
 	// Step 4b: spawn actuator goroutines (async; outcomes observed next tick).
 	if s.enableActuation {
-		s.act(ctx, hwWiFi, hwEth, apA, rebootPersisted)
+		s.act(ctx, now, hwWiFi, hwEth, apA, rebootPersisted)
 	}
 
 	// Step 5: construct + publish snapshot. Only LastBounceAt is needed
@@ -298,13 +299,23 @@ func (s *Supervisor) runTick(ctx context.Context) {
 // Bounces and AP toggles are best-effort; their persist failures only lose
 // rate-shaping precision, not safety.
 func (s *Supervisor) recordIntent(now time.Time, hwW, hwE HWAction, apA APAction) (rebootPersisted bool) {
-	// Both arms must run unconditionally — `||` short-circuits if hwW
-	// records a Reboot (returns true) and would skip recording an
-	// HWBounce on hwE, leaving the actuator dispatch with no ledger
-	// entry (next tick can spend another bounce immediately).
-	persistedW := s.recordHW(hwW, now)
-	persistedE := s.recordHW(hwE, now)
-	rebootPersisted = persistedW || persistedE
+	// Bounces: each device's bounce is independent → record both arms.
+	if act, ok := hwW.(HWBounce); ok {
+		s.led.RecordBounce(act.Device, now)
+	}
+	if act, ok := hwE.(HWBounce); ok {
+		s.led.RecordBounce(act.Device, now)
+	}
+
+	// Reboot: at most ONE per tick. Even if both arms decided HWReboot
+	// (rare; typical case is wifi OR eth Faulted), act() only fires one
+	// systemctl reboot — recording two timestamps would over-count the
+	// 1/2h budget and falsely starve future legitimate reboots.
+	if _, ok := hwW.(HWReboot); ok {
+		rebootPersisted = s.persistReboot(now)
+	} else if _, ok := hwE.(HWReboot); ok {
+		rebootPersisted = s.persistReboot(now)
+	}
 
 	switch a := apA.(type) {
 	case APEnter:
@@ -315,21 +326,17 @@ func (s *Supervisor) recordIntent(now time.Time, hwW, hwE HWAction, apA APAction
 	return rebootPersisted
 }
 
-// recordHW handles one HWAction's persistence side. Returns true iff a
-// Reboot was decided AND its timestamp was successfully persisted (caller
-// uses this to gate the actuator dispatch — see recordIntent).
-func (s *Supervisor) recordHW(act HWAction, now time.Time) bool {
-	switch a := act.(type) {
-	case HWBounce:
-		s.led.RecordBounce(a.Device, now)
-	case HWReboot:
-		if err := s.led.RecordReboot(now); err != nil {
-			log.Printf("ERROR: net-supervisor: persist reboot ledger failed (%v) — SUPPRESSING reboot to avoid loop on next boot", err)
-			return false
-		}
-		return true
+// persistReboot writes a single reboot timestamp to the persistent ledger
+// and reports whether the write succeeded. Callers MUST gate the actual
+// systemctl reboot on this return value — firing a reboot whose timestamp
+// was not persisted creates a reboot loop (next boot reads the stale
+// ledger and the same fault re-fires).
+func (s *Supervisor) persistReboot(now time.Time) bool {
+	if err := s.led.RecordReboot(now); err != nil {
+		log.Printf("ERROR: net-supervisor: persist reboot ledger failed (%v) — SUPPRESSING reboot to avoid loop on next boot", err)
+		return false
 	}
-	return false
+	return true
 }
 
 // act dispatches actuators for the decided actions. Each side-effecting
@@ -342,8 +349,11 @@ func (s *Supervisor) recordHW(act HWAction, now time.Time) bool {
 // enters a 90s quiet period with no actual bounce having happened. We
 // chain them in a single goroutine instead of two concurrent ones.
 //
-// rebootPersisted gates the Reboot fire — see recordIntent.
-func (s *Supervisor) act(ctx context.Context, hwW, hwE HWAction, apA APAction, rebootPersisted bool) {
+// rebootPersisted gates the Reboot fire — see recordIntent. recordedAt
+// is the tick timestamp that was written to the ledger; passed to
+// fireReboot so it can refund the entry if the actuator returns
+// ErrRebootDeferred.
+func (s *Supervisor) act(ctx context.Context, recordedAt time.Time, hwW, hwE HWAction, apA APAction, rebootPersisted bool) {
 	_, apExiting := apA.(APExit)
 	wifiBounce, wifiBouncing := hwW.(HWBounce)
 
@@ -366,9 +376,9 @@ func (s *Supervisor) act(ctx context.Context, hwW, hwE HWAction, apA APAction, r
 	}
 	if s.sysAct != nil && rebootPersisted {
 		if act, ok := hwW.(HWReboot); ok {
-			go s.fireReboot(ctx, "wifi: "+act.Reason)
+			go s.fireReboot(ctx, recordedAt, "wifi: "+act.Reason)
 		} else if act, ok := hwE.(HWReboot); ok {
-			go s.fireReboot(ctx, "eth: "+act.Reason)
+			go s.fireReboot(ctx, recordedAt, "eth: "+act.Reason)
 		}
 	}
 	if s.apAct != nil {
@@ -393,12 +403,25 @@ func (s *Supervisor) fireBounce(ctx context.Context, act HWBounce) {
 	}
 }
 
-func (s *Supervisor) fireReboot(ctx context.Context, reason string) {
+func (s *Supervisor) fireReboot(ctx context.Context, recordedAt time.Time, reason string) {
 	rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if err := s.sysAct.Reboot(rctx, reason); err != nil {
-		log.Printf("ERROR: net-supervisor: Reboot failed: %v", err)
+	err := s.sysAct.Reboot(rctx, reason)
+	if err == nil {
+		return
 	}
+	if errors.Is(err, ErrRebootDeferred) {
+		// Actuator declined because SystemBusy flipped between tick-time
+		// (where decideHW already gated) and fire-time. Refund the ledger
+		// entry — otherwise the budget is consumed without an actual
+		// reboot, starving future legitimate escalations for 2h.
+		log.Printf("INFO: net-supervisor: Reboot deferred (%v) — refunding ledger entry %s", err, recordedAt)
+		if uerr := s.led.UndoLastReboot(recordedAt); uerr != nil {
+			log.Printf("WARN: net-supervisor: refund persist failed (%v) — budget will recover via 2h window", uerr)
+		}
+		return
+	}
+	log.Printf("ERROR: net-supervisor: Reboot failed: %v", err)
 }
 
 func (s *Supervisor) fireAPEnter(ctx context.Context) {

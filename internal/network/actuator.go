@@ -122,13 +122,42 @@ func (a *realDeviceActuator) bounceWiFi(ctx context.Context) error {
 	select {
 	case <-time.After(a.bounceSettleDelay):
 	case <-ctx.Done():
-		_ = a.nm.SetWirelessEnabled(true) // best-effort restore
+		_ = enableWirelessWithRetry(ctx, a.nm) // best-effort restore
 		return ctx.Err()
 	}
-	if err := a.nm.SetWirelessEnabled(true); err != nil {
-		return fmt.Errorf("device-actuator: wireless on: %w", err)
+	if err := enableWirelessWithRetry(ctx, a.nm); err != nil {
+		// Critical: returning here leaves the radio off. We've retried
+		// the maximum number of times — surface the error so the caller
+		// records the bounce attempt as failed (next-tick observation
+		// will see HW Faulted and re-escalate via the normal ladder).
+		return fmt.Errorf("device-actuator: wireless on after retries: %w", err)
 	}
 	return nil
+}
+
+// enableWirelessWithRetry calls nm.SetWirelessEnabled(true) up to 3 times
+// with brief backoff. The radio MUST come back on after a bounce — leaving
+// it off makes the supervisor's next-tick probe observe HW=Unavailable
+// and re-escalate, which would just bounce again (off→fail-on, repeat).
+// Three retries is enough to ride out transient D-Bus hiccups without
+// hanging the actuator goroutine.
+func enableWirelessWithRetry(ctx context.Context, nm nmclient.Client) error {
+	const attempts = 3
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if err := nm.SetWirelessEnabled(true); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			log.Printf("WARN: device-actuator: wireless on attempt %d/%d: %v", i+1, attempts, err)
+		}
+		select {
+		case <-time.After(time.Duration(i+1) * time.Second):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return lastErr
 }
 
 func (a *realDeviceActuator) bounceEth(ctx context.Context) error {

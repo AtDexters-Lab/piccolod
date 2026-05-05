@@ -88,10 +88,16 @@ func (p *Prober) probeGateway(ctx context.Context, obs DeviceObservation) Tri {
 }
 
 // deviceGateway reads the NM-reported gateway for a device kind. Returns ""
-// if no active connection or no gateway. Cached at probe construction time
-// via devicePath[kind].
+// if no active connection or no gateway. Reads p.devicePath under p.mu —
+// even though all current callers run in the same goroutine as the
+// per-device probes that populate the map, locking here is defense-
+// in-depth: the actuator-side pathFn callback is on a different goroutine
+// and locks too, so any future call site that reads devicePath without
+// holding mu would race against it.
 func (p *Prober) deviceGateway(kind DeviceKind) string {
+	p.mu.Lock()
 	path, ok := p.devicePath[kind]
+	p.mu.Unlock()
 	if !ok {
 		return ""
 	}

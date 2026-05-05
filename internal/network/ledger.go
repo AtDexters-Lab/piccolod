@@ -226,6 +226,30 @@ func (s *LedgerStore) RecordReboot(when time.Time) error {
 	return s.persistPersistent()
 }
 
+// UndoLastReboot removes the most recent Reboots entry whose timestamp
+// equals `when` (set-membership match) and persists. Used when an
+// actuator returns ErrRebootDeferred — the recorded-on-initiation entry
+// would otherwise consume budget without a real reboot ever happening,
+// starving future legitimate escalations. Returns nil if no matching
+// entry was found (idempotent).
+//
+// Distinct from "ledger persist failed → don't fire" path: that's
+// handled by RecordReboot's error return; persistReboot in supervisor.go
+// already gates the actuator dispatch on it. UndoLastReboot covers the
+// orthogonal case where persistence succeeded but the actuator
+// explicitly chose not to act.
+func (s *LedgerStore) UndoLastReboot(when time.Time) error {
+	s.mu.Lock()
+	for i := len(s.ledger.Reboots) - 1; i >= 0; i-- {
+		if s.ledger.Reboots[i].Equal(when) {
+			s.ledger.Reboots = append(s.ledger.Reboots[:i], s.ledger.Reboots[i+1:]...)
+			break
+		}
+	}
+	s.mu.Unlock()
+	return s.persistPersistent()
+}
+
 // Prune drops entries outside the relevant rate-shaping windows. Called once
 // per tick before deciders read.
 func (s *LedgerStore) Prune(now time.Time) {
