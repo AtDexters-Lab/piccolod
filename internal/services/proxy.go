@@ -467,7 +467,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	//   3. embedded_marker_response  — extracted (l7.EmbeddedMarkerResponse)
 	//   4. oidc_authorize_rewrite_response — INLINE (substep 2d)
 	secHeadersResp := l7.SecurityHeadersResponse()
-	markerResp := l7.EmbeddedMarkerResponse(needsEmbeddedMarker, embeddedMarkerSetCookie)
+	markerResp := l7.EmbeddedMarkerResponse(needsEmbeddedMarker, l7.EmbeddedMarkerSetCookie)
 	rp.ModifyResponse = func(resp *http.Response) error {
 		if err := secHeadersResp(resp); err != nil {
 			return err
@@ -478,37 +478,37 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		if len(setCookies) > 0 {
 			resp.Header.Del("Set-Cookie")
 
-			appHost := normalizeHostNoPort(proxyContextAppHost(resp.Request.Context()))
-			rewriteCookies := proxyContextCookieRewrite(resp.Request.Context())
-			partitionCookies := proxyContextPartitionCookies(resp.Request.Context())
-			appPrefix := cookiePrefixForApp(ep.App)
+			appHost := l7.NormalizeHostNoPort(l7.AppHostFromContext(resp.Request.Context()))
+			rewriteCookies := l7.CookieRewriteFromContext(resp.Request.Context())
+			partitionCookies := l7.PartitionCookiesFromContext(resp.Request.Context())
+			appPrefix := l7.CookiePrefixForApp(ep.App)
 
 			for _, sc := range setCookies {
-				name, eq := parseSetCookieName(sc)
+				name, eq := l7.ParseSetCookieName(sc)
 				if name == "" || eq == -1 {
 					continue
 				}
-				if isPiccoloCookieName(name) {
+				if l7.IsPiccoloCookieName(name) {
 					continue
 				}
 
-				if dom, ok := setCookieDomain(sc); ok {
+				if dom, ok := l7.SetCookieDomain(sc); ok {
 					// If we can't determine the app host, fail closed for Domain cookies.
 					if appHost == "" {
 						continue
 					}
-					if normalizeCookieDomain(dom) != appHost {
+					if l7.NormalizeCookieDomain(dom) != appHost {
 						continue
 					}
 				}
 
-				if rewriteCookies && setCookieHasHttpOnly(sc) && !strings.HasPrefix(name, appPrefix) {
+				if rewriteCookies && l7.SetCookieHasHttpOnly(sc) && !strings.HasPrefix(name, appPrefix) {
 					sc = appPrefix + name + sc[eq:]
 				}
 
 				// CHIPS: add Partitioned, SameSite=None, Secure for cross-site iframe embedding
 				if partitionCookies {
-					sc = ensurePartitionedAttributes(sc)
+					sc = l7.EnsurePartitionedAttributes(sc)
 				}
 
 				resp.Header.Add("Set-Cookie", sc)
@@ -541,7 +541,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	// Remaining inline pending substeps 2b–2e.
 
 	terminal := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gzw := newGzipResponseWriter(w, r)
+		gzw := l7.NewGzipResponseWriter(w, r)
 		defer gzw.Close()
 		rp.ServeHTTP(gzw, r)
 	}))
@@ -567,7 +567,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			p.mu.Unlock()
 
 			if proxyOIDC == nil {
-				writeProxyJSONError(w, http.StatusServiceUnavailable, "proxy_oidc_not_configured", "OIDC_UNAVAILABLE")
+				l7.WriteJSONError(w, http.StatusServiceUnavailable, "proxy_oidc_not_configured", "OIDC_UNAVAILABLE")
 				return
 			}
 
@@ -577,7 +577,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			}
 
 			// Other reserved paths (future: logout, session status)
-			writeProxyJSONError(w, http.StatusNotFound, "not_found", "RESERVED_PATH_NOT_IMPLEMENTED")
+			l7.WriteJSONError(w, http.StatusNotFound, "not_found", "RESERVED_PATH_NOT_IMPLEMENTED")
 			return
 		}
 
@@ -625,11 +625,11 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 
 			// RFC 20260112: alias domains are not compatible with protected/headers strategies.
 			// The session cookie cannot be shared across custom domains.
-			if aliasChecker != nil && aliasChecker(normalizeHostNoPort(r.Host), ep.DerivedHostLabel) {
-				log.Printf("WARN: alias domain access is not supported for auth strategy=%s (host=%s app=%s listener=%s)", strategy, normalizeHostNoPort(r.Host), ep.App, ep.Name)
+			if aliasChecker != nil && aliasChecker(l7.NormalizeHostNoPort(r.Host), ep.DerivedHostLabel) {
+				log.Printf("WARN: alias domain access is not supported for auth strategy=%s (host=%s app=%s listener=%s)", strategy, l7.NormalizeHostNoPort(r.Host), ep.App, ep.Name)
 			}
 
-			_, cookieErr := r.Cookie(sessionCookieName)
+			_, cookieErr := r.Cookie(l7.SessionCookieName)
 			cookiePresent := cookieErr == nil
 
 			// RFC 20260122 §5: Try to get session and validate with app audience/origin binding
@@ -644,7 +644,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				// RFC 20260122 §5.9: Only redirect safe methods (GET/HEAD) into OIDC flow.
 				// Non-safe methods (POST/PUT/DELETE) would lose the request body on redirect.
 				isSafeMethod := r.Method == http.MethodGet || r.Method == http.MethodHead
-				if isSafeMethod && isBrowserNavigation(r) {
+				if isSafeMethod && l7.IsBrowserNavigation(r) {
 					if proxyOIDC != nil {
 						proxyOIDC.InitiateOIDCFlow(w, r, ep.App, ep)
 						return
@@ -659,15 +659,15 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 						if shouldRewriteAsHTTPS(ep, r) {
 							scheme = "https"
 						}
-						origin = scheme + "://" + normalizeHostNoPort(r.Host)
+						origin = scheme + "://" + l7.NormalizeHostNoPort(r.Host)
 					}
-					http.Redirect(w, r, portalLoginURL(origin, absoluteRequestURL(r, ep)), http.StatusFound)
+					http.Redirect(w, r, l7.PortalLoginURL(origin, absoluteRequestURL(r, ep)), http.StatusFound)
 					return
 				}
 				if cookiePresent {
-					writeProxyJSONError(w, http.StatusUnauthorized, "session_expired", "SESSION_EXPIRED")
+					l7.WriteJSONError(w, http.StatusUnauthorized, "session_expired", "SESSION_EXPIRED")
 				} else {
-					writeProxyJSONError(w, http.StatusUnauthorized, "authentication_required", "AUTH_REQUIRED")
+					l7.WriteJSONError(w, http.StatusUnauthorized, "authentication_required", "AUTH_REQUIRED")
 				}
 				return
 			}
@@ -680,7 +680,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				}
 				allowed, err := um.IsAppAllowed(r.Context(), sess.UserID, ep.App)
 				if err != nil || !allowed {
-					if isBrowserNavigation(r) {
+					if l7.IsBrowserNavigation(r) {
 						origin := ""
 						if portalOrigin != nil {
 							origin = portalOrigin(r)
@@ -690,12 +690,12 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 							if shouldRewriteAsHTTPS(ep, r) {
 								scheme = "https"
 							}
-							origin = scheme + "://" + normalizeHostNoPort(r.Host)
+							origin = scheme + "://" + l7.NormalizeHostNoPort(r.Host)
 						}
-						http.Redirect(w, r, portalAccessDeniedURL(origin, absoluteRequestURL(r, ep)), http.StatusFound)
+						http.Redirect(w, r, l7.PortalAccessDeniedURL(origin, absoluteRequestURL(r, ep)), http.StatusFound)
 						return
 					}
-					writeProxyJSONError(w, http.StatusForbidden, "app_access_denied", "APP_NOT_ALLOWED")
+					l7.WriteJSONError(w, http.StatusForbidden, "app_access_denied", "APP_NOT_ALLOWED")
 					return
 				}
 			}
@@ -707,7 +707,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 				}
 				user, err := um.Get(r.Context(), sess.UserID)
 				if err != nil {
-					writeProxyJSONError(w, http.StatusUnauthorized, "session_expired", "SESSION_EXPIRED")
+					l7.WriteJSONError(w, http.StatusUnauthorized, "session_expired", "SESSION_EXPIRED")
 					return
 				}
 				// Inject trusted identity headers (RFC 4.1.6).
@@ -720,17 +720,17 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			// Pass-through; app manages auth or requires none.
 		default:
 			// Unknown strategy should fail closed.
-			writeProxyJSONError(w, http.StatusUnauthorized, "authentication_required", "AUTH_REQUIRED")
+			l7.WriteJSONError(w, http.StatusUnauthorized, "authentication_required", "AUTH_REQUIRED")
 			return
 		}
 
 		// RFC 4.1.5 + 4.1.8: Strip Piccolo cookies before forwarding and optionally rewrite cookies
 		// for LAN port-based isolation.
-		rewriteCookies := shouldRewriteLegacyCookies(r.Host)
+		rewriteCookies := l7.ShouldRewriteLegacyCookies(r.Host)
 		partitionCookies := shouldPartitionCookies(r)
 		needsMarker := needsEmbeddedMarker(r)
-		stripAndRewriteRequestCookies(r, ep.App, rewriteCookies)
-		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies, partitionCookies, needsMarker)
+		l7.StripAndRewriteRequestCookies(r, ep.App, rewriteCookies)
+		r = l7.SetProxyContext(r, ep.App, l7.NormalizeHostNoPort(r.Host), rewriteCookies, partitionCookies, needsMarker)
 
 		// Snapshot OIDC rewrite state for WAN authorize URL rewriting.
 		if RequestArrivedViaTLS(r) {
@@ -760,7 +760,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	}))
 
 	// Wrap inline handler with extracted L7 middlewares (innermost-first; outer wraps inner).
-	handler := l7.PathNormalize(l7.NormalizeAndSetRequestPath, writeProxyJSONError)(inlineHandler)
+	handler := l7.PathNormalize(l7.NormalizeAndSetRequestPath, l7.WriteJSONError)(inlineHandler)
 	handler = l7.ForwardedScrub()(handler)
 
 	// Apply common middleware chain
@@ -1140,7 +1140,7 @@ func rewriteOIDCAuthorizeResponse(resp *http.Response, snap *oidcRewriteSnapshot
 	// Only rewrite text-based content types. Reuses the proxy's existing
 	// compressible-types definition (mime.ParseMediaType-based, handles
 	// charset suffixes correctly).
-	if !isCompressibleContentType(resp.Header.Get("Content-Type")) {
+	if !l7.IsCompressibleContentType(resp.Header.Get("Content-Type")) {
 		return
 	}
 

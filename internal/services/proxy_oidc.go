@@ -21,6 +21,7 @@ import (
 
 	"piccolod/internal/auth"
 	"piccolod/internal/cryptoutil"
+	"piccolod/internal/services/middleware/l7"
 )
 
 const (
@@ -232,7 +233,7 @@ func (h *ProxyOIDCHandler) InitiateOIDCFlow(w http.ResponseWriter, r *http.Reque
 	codeVerifier, err := cryptoutil.GenerateSecureToken(codeVerifierBytes)
 	if err != nil {
 		log.Printf("ERROR: proxy OIDC: failed to generate code verifier: %v", err)
-		writeProxyJSONError(w, http.StatusInternalServerError, "internal_error", "OIDC_INIT_FAILED")
+		l7.WriteJSONError(w, http.StatusInternalServerError, "internal_error", "OIDC_INIT_FAILED")
 		return
 	}
 	codeChallenge := computeCodeChallenge(codeVerifier)
@@ -241,7 +242,7 @@ func (h *ProxyOIDCHandler) InitiateOIDCFlow(w http.ResponseWriter, r *http.Reque
 	callbackOrigin := h.computeCallbackOrigin(r, endpoint)
 	if callbackOrigin == "" {
 		log.Printf("ERROR: proxy OIDC: failed to compute callback origin")
-		writeProxyJSONError(w, http.StatusInternalServerError, "internal_error", "ORIGIN_COMPUTE_FAILED")
+		l7.WriteJSONError(w, http.StatusInternalServerError, "internal_error", "ORIGIN_COMPUTE_FAILED")
 		return
 	}
 
@@ -267,14 +268,14 @@ func (h *ProxyOIDCHandler) InitiateOIDCFlow(w http.ResponseWriter, r *http.Reque
 
 	if err := h.stateStore.Create(state); err != nil {
 		log.Printf("ERROR: proxy OIDC: failed to create state: %v", err)
-		writeProxyJSONError(w, http.StatusInternalServerError, "internal_error", "STATE_CREATE_FAILED")
+		l7.WriteJSONError(w, http.StatusInternalServerError, "internal_error", "STATE_CREATE_FAILED")
 		return
 	}
 
 	// Set the embedded marker cookie early (on the redirect response) so the
 	// browser stores it in the iframe partition before navigating to the IdP.
 	if isIframe {
-		http.SetCookie(w, embeddedMarkerCookie())
+		http.SetCookie(w, l7.EmbeddedMarkerCookie())
 	}
 
 	// Build authorization URL
@@ -327,10 +328,10 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 				h.renderAccessDenied(w, r, appName)
 				return
 			}
-			writeProxyJSONError(w, http.StatusBadRequest, "authorization_failed", "AUTH_FAILED")
+			l7.WriteJSONError(w, http.StatusBadRequest, "authorization_failed", "AUTH_FAILED")
 			return
 		}
-		writeProxyJSONError(w, http.StatusBadRequest, "invalid_callback", "MISSING_PARAMS")
+		l7.WriteJSONError(w, http.StatusBadRequest, "invalid_callback", "MISSING_PARAMS")
 		return
 	}
 
@@ -338,7 +339,7 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 	state, ok := h.stateStore.Validate(stateID)
 	if !ok {
 		log.Printf("WARN: proxy OIDC: invalid or expired state (len=%d)", len(stateID))
-		writeProxyJSONError(w, http.StatusBadRequest, "invalid_or_expired_state", "INVALID_STATE")
+		l7.WriteJSONError(w, http.StatusBadRequest, "invalid_or_expired_state", "INVALID_STATE")
 		return
 	}
 
@@ -346,14 +347,14 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 	callbackOrigin := h.computeCallbackOrigin(r, endpoint)
 	if callbackOrigin != state.ExpectedOrigin {
 		log.Printf("WARN: proxy OIDC: origin mismatch: got %s, expected %s", callbackOrigin, state.ExpectedOrigin)
-		writeProxyJSONError(w, http.StatusBadRequest, "origin_mismatch", "ORIGIN_MISMATCH")
+		l7.WriteJSONError(w, http.StatusBadRequest, "origin_mismatch", "ORIGIN_MISMATCH")
 		return
 	}
 
 	// Verify app matches
 	if state.ExpectedApp != appName {
 		log.Printf("WARN: proxy OIDC: app mismatch: got %s, expected %s", appName, state.ExpectedApp)
-		writeProxyJSONError(w, http.StatusBadRequest, "app_mismatch", "APP_MISMATCH")
+		l7.WriteJSONError(w, http.StatusBadRequest, "app_mismatch", "APP_MISMATCH")
 		return
 	}
 
@@ -362,7 +363,7 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 	result, err := h.config.ExchangeCode(r.Context(), code, redirectURI, state.CodeVerifier)
 	if err != nil {
 		log.Printf("ERROR: proxy OIDC: token exchange failed: %v", err)
-		writeProxyJSONError(w, http.StatusUnauthorized, "token_exchange_failed", "TOKEN_FAILED")
+		l7.WriteJSONError(w, http.StatusUnauthorized, "token_exchange_failed", "TOKEN_FAILED")
 		return
 	}
 
@@ -370,7 +371,7 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 	userInfo, err := h.config.GetUserInfo(r.Context(), result.AccessToken)
 	if err != nil {
 		log.Printf("ERROR: proxy OIDC: userinfo failed: %v", err)
-		writeProxyJSONError(w, http.StatusUnauthorized, "userinfo_failed", "USERINFO_FAILED")
+		l7.WriteJSONError(w, http.StatusUnauthorized, "userinfo_failed", "USERINFO_FAILED")
 		return
 	}
 
@@ -396,7 +397,7 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 	})
 
 	// Set host-only cookie with appropriate security attributes
-	cookieName := sessionCookieName
+	cookieName := l7.SessionCookieName
 	if isPortBasedAccess(r) {
 		if port := requestPort(r); port > 0 {
 			cookieName = fmt.Sprintf("piccolo_app_session_p%d", port)
@@ -432,7 +433,7 @@ func (h *ProxyOIDCHandler) HandleCallback(w http.ResponseWriter, r *http.Request
 	// Re-set the embedded marker cookie on the callback response so subsequent
 	// XHR/fetch from within the iframe propagate the CHIPS context.
 	if state.IsIframe {
-		http.SetCookie(w, embeddedMarkerCookie())
+		http.SetCookie(w, l7.EmbeddedMarkerCookie())
 	}
 
 	// Redirect to original path (safe: OriginalPath is relative, not absolute)
@@ -454,7 +455,7 @@ func (h *ProxyOIDCHandler) computeCallbackOrigin(r *http.Request, ep ServiceEndp
 		localHostname = strings.ToLower(h.config.GetLocalHostname())
 	}
 
-	reqHost := normalizeHostNoPort(r.Host)
+	reqHost := l7.NormalizeHostNoPort(r.Host)
 
 	// LAN host-based: derive from ep.DerivedHostLabel + known base hostname
 	if ep.DerivedHostLabel != "" && localHostname != "" {
@@ -533,7 +534,7 @@ func (h *ProxyOIDCHandler) renderAccessDenied(w http.ResponseWriter, r *http.Req
 	// Check if API client
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "application/json") {
-		writeProxyJSONError(w, http.StatusForbidden, "forbidden", "APP_NOT_ALLOWED")
+		l7.WriteJSONError(w, http.StatusForbidden, "forbidden", "APP_NOT_ALLOWED")
 		return
 	}
 

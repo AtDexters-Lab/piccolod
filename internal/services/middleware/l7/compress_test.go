@@ -1,4 +1,4 @@
-package services
+package l7
 
 import (
 	"bufio"
@@ -16,7 +16,7 @@ func TestGzipResponseWriter_CompressesText(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept-Encoding", "gzip, deflate")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "text/html; charset=utf-8")
 	gzw.WriteHeader(http.StatusOK)
 
@@ -54,7 +54,7 @@ func TestGzipResponseWriter_SkipsAlreadyCompressed(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "text/html")
 	gzw.Header().Set("Content-Encoding", "gzip")
 	gzw.WriteHeader(http.StatusOK)
@@ -77,7 +77,7 @@ func TestGzipResponseWriter_SkipsNonCompressible(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "image/png")
 	gzw.WriteHeader(http.StatusOK)
 
@@ -98,7 +98,7 @@ func TestGzipResponseWriter_SkipsNoAcceptEncoding(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	// No Accept-Encoding header
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "text/html")
 	gzw.WriteHeader(http.StatusOK)
 
@@ -119,7 +119,7 @@ func TestGzipResponseWriter_SkipsGzipQZero(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept-Encoding", "gzip;q=0, deflate")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "text/html")
 	gzw.WriteHeader(http.StatusOK)
 
@@ -140,7 +140,7 @@ func TestGzipResponseWriter_SkipsSmallResponse(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "application/json")
 	gzw.Header().Set("Content-Length", "100")
 	gzw.WriteHeader(http.StatusOK)
@@ -159,7 +159,7 @@ func TestGzipResponseWriter_Status206(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "video/mp4")
 	gzw.Header().Set("Content-Range", "bytes 0-999/5000")
 	gzw.WriteHeader(http.StatusPartialContent)
@@ -184,7 +184,7 @@ func TestGzipResponseWriter_Flush(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "text/event-stream")
 	gzw.WriteHeader(http.StatusOK)
 
@@ -203,7 +203,7 @@ func TestGzipResponseWriter_Status304(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "text/html")
 	gzw.WriteHeader(http.StatusNotModified)
 	gzw.Close()
@@ -221,7 +221,7 @@ func TestGzipResponseWriter_ImplicitWriteHeader(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "application/json")
 
 	// Write without calling WriteHeader first
@@ -253,7 +253,7 @@ func TestGzipResponseWriter_ChunkedNoContentLength(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "text/plain")
 	// No Content-Length set — should still compress
 	gzw.WriteHeader(http.StatusOK)
@@ -291,7 +291,7 @@ func TestGzipResponseWriter_WebSocketUpgrade(t *testing.T) {
 	req.Header.Set("Accept-Encoding", "gzip")
 	req.Header.Set("Upgrade", "websocket")
 
-	gzw := newGzipResponseWriter(rec, req)
+	gzw := NewGzipResponseWriter(rec, req)
 	gzw.Header().Set("Content-Type", "text/html") // irrelevant for 101
 
 	// 101 should not compress (statusCode < 200 check skips it)
@@ -343,9 +343,9 @@ func TestIsCompressibleContentType(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.ct, func(t *testing.T) {
-			got := isCompressibleContentType(tt.ct)
+			got := IsCompressibleContentType(tt.ct)
 			if got != tt.expect {
-				t.Errorf("isCompressibleContentType(%q) = %v, want %v", tt.ct, got, tt.expect)
+				t.Errorf("IsCompressibleContentType(%q) = %v, want %v", tt.ct, got, tt.expect)
 			}
 		})
 	}
