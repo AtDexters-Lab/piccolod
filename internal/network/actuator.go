@@ -191,7 +191,13 @@ func (a *realAPActuator) Enter(ctx context.Context) error {
 func (a *realAPActuator) Exit(ctx context.Context) error {
 	path, _, ok := a.wifiDeviceFn()
 	if !ok {
-		// Without a device path, ForceStop wouldn't help; just bail.
+		// USB WiFi adapter removed (or otherwise gone) while AP was up.
+		// ForceStop tears down local AP state (teardown — captive portal
+		// stop, firewall + DNS cleanup) regardless of NM device-level
+		// reachability; without this branch the supervisor would see
+		// apActive=true forever and keep deciding APExit while the
+		// captive portal stays running on a missing radio.
+		a.apMgr.ForceStop(ctx, "")
 		return nil
 	}
 	return a.apMgr.Stop(ctx, path)

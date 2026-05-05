@@ -69,10 +69,16 @@ func (p *Prober) probeWiFi() rawWiFiObs {
 		raw.IsAuthFailure = isAuthFailure(reason)
 	}
 
-	// Saved profiles — drives ConfigHealth Inactive vs Faulted.
+	// Saved profiles — drives ConfigHealth Inactive vs Faulted. Filter
+	// out our own AP hotspot profiles (NM exposes the temporary
+	// piccolo-ap-* connection as a saved 802-11-wireless profile while
+	// AP mode is active). Without this filter, a first-run device with
+	// no real STA profile reports HasProfile=true → ConfigHealth defaults
+	// to Healthy → APArbiter exits AP and oscillates instead of keeping
+	// the captive portal up.
 	profiles, err := p.nm.SavedWiFiConnections()
 	if err == nil {
-		raw.HasProfile = len(profiles) > 0
+		raw.HasProfile = hasNonHotspotProfile(profiles)
 	}
 
 	// Active connection info → IP presence. Skip if the active connection
@@ -186,6 +192,17 @@ func (p *Prober) resetConfigFault(kind DeviceKind) {
 // NeedAuth/IPConfig/IPCheck/Secondaries (40-90) are in-flight.
 func isTerminalConfigFailure(s nmclient.NMDeviceState) bool {
 	return s == nmclient.NMDeviceStateDisconnected || s == nmclient.NMDeviceStateFailed
+}
+
+// hasNonHotspotProfile returns true iff at least one of the saved WiFi
+// profiles is NOT one of our AP hotspot profiles (HotspotIDPrefix).
+func hasNonHotspotProfile(profiles []nmclient.ConnectionProfile) bool {
+	for _, p := range profiles {
+		if !strings.HasPrefix(p.ID, nmclient.HotspotIDPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // readWiFiRfkill scans /sys/class/rfkill for type=wlan entries and reports

@@ -161,12 +161,13 @@ func deriveLegacyState(tick Tick, apActive bool) ConnState {
 	return StateDisconnected
 }
 
-// deviceWorking returns true when the device has a working uplink — either
-// gateway is ARP-reachable, OR L3 is reachable through it (covers
-// ARP-suppressed networks). Requires HW + Config health AND LinkUp so
-// "active uplink" semantics match (predicate aligned with activeUplinkFor).
+// deviceWorking returns true when the device has a working uplink — HW
+// + Config Healthy + LinkUp + HasIP + (gateway-ARP-reachable OR L3 Up).
+// Aligned with anyDeviceWorking (decide_ap.go) and activeUplinkFor
+// (probe_l3.go). HasIP is required so DHCP-in-flight (LinkUp without a
+// lease) doesn't count.
 func deviceWorking(d DeviceObservation, tick Tick) bool {
-	if d.HWHealth != TriHealthy || d.ConfigHealth != TriHealthy || !d.LinkUp {
+	if d.HWHealth != TriHealthy || d.ConfigHealth != TriHealthy || !d.LinkUp || !d.HasIP {
 		return false
 	}
 	return d.GwReachable == TriHealthy || tick.L3Probe == L3ProbeUp

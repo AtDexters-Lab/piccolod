@@ -127,13 +127,14 @@ func apEntryPermitted(led ActionLedger, now time.Time) bool {
 }
 
 // anyDeviceWorking returns true when any device has a working uplink —
-// either the gateway is ARP-reachable, OR the L3 probe is up via this
-// device's link. ARP-suppressed networks (corp guest WiFi, hotel APs —
-// catalog C8/C9) keep the AP up otherwise, despite working connectivity.
-// Predicate aligned with deriveLegacyState's deviceWorking helper.
+// HW + Config Healthy + LinkUp + HasIP + (gateway-ARP-reachable OR L3
+// probe Up). HasIP is required so DHCP-in-flight (LinkUp=true but no
+// lease yet) doesn't count as working — paired with the L3 dampener's
+// initial Up classification, that would prematurely exit AP. Mirrors
+// deriveLegacyState's deviceWorking and probe_l3's activeUplinkFor.
 func anyDeviceWorking(tick Tick) bool {
 	for _, obs := range tick.Devices {
-		if obs.HWHealth != TriHealthy || obs.ConfigHealth != TriHealthy || !obs.LinkUp {
+		if obs.HWHealth != TriHealthy || obs.ConfigHealth != TriHealthy || !obs.LinkUp || !obs.HasIP {
 			continue
 		}
 		if obs.GwReachable == TriHealthy || tick.L3Probe == L3ProbeUp {
