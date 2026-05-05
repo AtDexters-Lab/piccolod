@@ -5,18 +5,10 @@ import (
 	"strings"
 )
 
-// PiccoloHeaders are the trusted headers that piccolod injects when an app's
-// auth strategy is "headers". Apps consume these to identify the authenticated
-// user without re-implementing session validation.
-const (
-	HeaderPiccoloUser  = "X-Piccolo-User"
-	HeaderPiccoloEmail = "X-Piccolo-Email"
-	HeaderPiccoloName  = "X-Piccolo-Name"
-	HeaderPiccoloRole  = "X-Piccolo-Role"
-)
-
-// piccoloHeaderPrefix is the prefix of all Piccolo-injected headers. Used by
-// stripPiccoloHeaders to remove client-spoofed values before injection.
+// piccoloHeaderPrefix is the prefix of all Piccolo-injected headers (e.g.,
+// X-Piccolo-User defined alongside the path_auth middleware in l7/path_auth.go,
+// and X-Piccolo-Hint-Token in proxy.go). stripPiccoloHeaders uses the prefix
+// to remove client-spoofed values before any Piccolo-side injection runs.
 const piccoloHeaderPrefix = "X-Piccolo-"
 
 // StripHeadersFromRequest removes all X-Piccolo-* headers from the request to

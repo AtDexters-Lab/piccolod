@@ -534,18 +534,38 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		return nil
 	}
 
-	// Request-side L7 chain composition (extraction substep 2a per plan §H).
+	// Request-side L7 chain composition (extraction per plan §H).
 	// Build innermost-first; outer wraps inner.
 	//
 	//   forwarded_scrub
 	//     → path_normalize
-	//       → INLINE handler (hint_consumer_l7, reserved_path_intercept, ACME bypass,
-	//                          path_auth, cookie context, oidc_authorize_snapshot)
-	//         → forward_headers
-	//           → gzip + reverse_proxy (terminal)
+	//       → INLINE handler (hint_consumer_l7, reserved_path_intercept, ACME bypass)
+	//         → path_auth
+	//           → INLINE tail (cookie context, oidc_authorize_snapshot)
+	//             → forward_headers
+	//               → gzip + reverse_proxy (terminal)
 	//
-	// Extracted in this substep: forwarded_scrub, path_normalize, forward_headers.
-	// Remaining inline pending substeps 2b–2e.
+	// Extracted: forwarded_scrub, path_normalize, forward_headers (2a),
+	// path_auth (2b). Remaining inline pending substeps 2c–2e.
+
+	pathAuthDeps := l7.PathAuthDeps{
+		Snapshot: func() l7.PathAuthSnapshot {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			snap := l7.PathAuthSnapshot{
+				UserManager:   p.userManager,
+				SessionGetter: p.sessionGetter,
+				PortalOrigin:  p.portalOrigin,
+				AliasChecker:  p.aliasChecker,
+				SessionStore:  p.sessionStore,
+			}
+			if p.proxyOIDC != nil {
+				snap.InitiateOIDC = p.proxyOIDC.InitiateFlow
+			}
+			return snap
+		},
+		ArrivedViaTLS: RequestArrivedViaTLS,
+	}
 
 	terminal := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gzw := l7.NewGzipResponseWriter(w, r)
@@ -554,185 +574,12 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	}))
 	withForward := l7.ForwardHeaders(func(r *http.Request) { applyForwardHeaders(r, ep) })(terminal)
 
-	inlineHandler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// hint_consumer_l7 (inline; extraction deferred to step 9 alongside the
-		// connectionHint→middleware.HintFromContext migration).
-		if token := strings.TrimSpace(r.Header.Get(HeaderPiccoloHintToken)); token != "" {
-			r.Header.Del(HeaderPiccoloHintToken)
-			if hint, ok := p.consumeRequestHint(ep.PublicPort, token); ok {
-				r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, hint))
-			}
-		}
-
-		// path_normalize already mutated r.URL.Path; downstream reads it directly.
-		cleanedPath := r.URL.Path
-
-		// RFC 20260122 §5.10: Intercept reserved proxy OIDC paths
-		if l7oidc.IsReservedPath(cleanedPath) {
-			p.mu.Lock()
-			proxyOIDC := p.proxyOIDC
-			p.mu.Unlock()
-
-			if proxyOIDC == nil {
-				l7.WriteJSONError(w, http.StatusServiceUnavailable, "proxy_oidc_not_configured", "OIDC_UNAVAILABLE")
-				return
-			}
-
-			if cleanedPath == l7oidc.CallbackPath {
-				proxyOIDC.HandleCallback(w, r, ep.App, ep.AsMiddlewareInfo())
-				return
-			}
-
-			// Other reserved paths (future: logout, session status)
-			l7.WriteJSONError(w, http.StatusNotFound, "not_found", "RESERVED_PATH_NOT_IMPLEMENTED")
-			return
-		}
-
-		// RFC 4.1.5: Strip spoofed trusted headers for all strategies.
-		// Must happen before any handler (ACME, backend) to prevent header spoofing.
-		StripHeadersFromRequest(r)
-
-		// Intercept ACME HTTP-01 challenges for remote cert issuance (RFC 20260122).
-		// These bypass auth rules because they're infrastructure-level (piccolod's TLS
-		// termination), not app business logic. External ACME verifiers have no session.
-		if strings.HasPrefix(cleanedPath, "/.well-known/acme-challenge/") {
-			p.mu.Lock()
-			acme := p.acme
-			p.mu.Unlock()
-			if acme != nil {
-				acme.ServeHTTP(w, r)
-				return
-			}
-		}
-
-		strategy := l7.ListenerStrategyForPath(ep.Auth, cleanedPath)
-
-		// RFC 4.1.6: Strategy-specific behavior.
-		switch strategy {
-		case "protected", "headers":
-			// RFC 20260122 §5: Allow CORS preflight (OPTIONS) to bypass auth.
-			// Browsers send preflight without cookies; blocking them breaks cross-origin API calls.
-			if r.Method == http.MethodOptions && r.Header.Get("Origin") != "" && r.Header.Get("Access-Control-Request-Method") != "" {
-				break
-			}
-
-			p.mu.Lock()
-			um := p.userManager
-			sg := p.sessionGetter
-			portalOrigin := p.portalOrigin
-			aliasChecker := p.aliasChecker
-			proxyOIDC := p.proxyOIDC
-			sessionStore := p.sessionStore
-			p.mu.Unlock()
-
-			if sg == nil {
-				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-				return
-			}
-
-			// RFC 20260112: alias domains are not compatible with protected/headers strategies.
-			// The session cookie cannot be shared across custom domains.
-			if aliasChecker != nil && aliasChecker(l7.NormalizeHostNoPort(r.Host), ep.DerivedHostLabel) {
-				log.Printf("WARN: alias domain access is not supported for auth strategy=%s (host=%s app=%s listener=%s)", strategy, l7.NormalizeHostNoPort(r.Host), ep.App, ep.Name)
-			}
-
-			_, cookieErr := r.Cookie(l7.SessionCookieName)
-			cookiePresent := cookieErr == nil
-
-			// RFC 20260122 §5: Try to get session and validate with app audience/origin binding
-			sess, ok := sg(r)
-			if ok && sess != nil && sessionStore != nil {
-				// Validate app session with audience and origin binding
-				requestOrigin := l7.ComputeRequestOrigin(r, ep.AsMiddlewareInfo(), RequestArrivedViaTLS)
-				sess, ok = sessionStore.ValidateAppSession(sess.ID, ep.App, requestOrigin)
-			}
-
-			if !ok || sess == nil {
-				// RFC 20260122 §5.9: Only redirect safe methods (GET/HEAD) into OIDC flow.
-				// Non-safe methods (POST/PUT/DELETE) would lose the request body on redirect.
-				isSafeMethod := r.Method == http.MethodGet || r.Method == http.MethodHead
-				if isSafeMethod && l7.IsBrowserNavigation(r) {
-					if proxyOIDC != nil {
-						proxyOIDC.InitiateFlow(w, r, ep.App, ep.AsMiddlewareInfo())
-						return
-					}
-					// Fallback to portal redirect if proxy OIDC not configured
-					origin := ""
-					if portalOrigin != nil {
-						origin = portalOrigin(r)
-					}
-					if origin == "" {
-						scheme := "http"
-						if l7.ShouldRewriteAsHTTPS(ep.AsMiddlewareInfo(), r, RequestArrivedViaTLS) {
-							scheme = "https"
-						}
-						origin = scheme + "://" + l7.NormalizeHostNoPort(r.Host)
-					}
-					http.Redirect(w, r, l7.PortalLoginURL(origin, l7.AbsoluteRequestURL(r, ep.AsMiddlewareInfo(), RequestArrivedViaTLS)), http.StatusFound)
-					return
-				}
-				if cookiePresent {
-					l7.WriteJSONError(w, http.StatusUnauthorized, "session_expired", "SESSION_EXPIRED")
-				} else {
-					l7.WriteJSONError(w, http.StatusUnauthorized, "authentication_required", "AUTH_REQUIRED")
-				}
-				return
-			}
-
-			// Check allowed_apps for standard users (admin has full access).
-			if sess.Role != "admin" {
-				if um == nil {
-					http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-					return
-				}
-				allowed, err := um.IsAppAllowed(r.Context(), sess.UserID, ep.App)
-				if err != nil || !allowed {
-					if l7.IsBrowserNavigation(r) {
-						origin := ""
-						if portalOrigin != nil {
-							origin = portalOrigin(r)
-						}
-						if origin == "" {
-							scheme := "http"
-							if l7.ShouldRewriteAsHTTPS(ep.AsMiddlewareInfo(), r, RequestArrivedViaTLS) {
-								scheme = "https"
-							}
-							origin = scheme + "://" + l7.NormalizeHostNoPort(r.Host)
-						}
-						http.Redirect(w, r, l7.PortalAccessDeniedURL(origin, l7.AbsoluteRequestURL(r, ep.AsMiddlewareInfo(), RequestArrivedViaTLS)), http.StatusFound)
-						return
-					}
-					l7.WriteJSONError(w, http.StatusForbidden, "app_access_denied", "APP_NOT_ALLOWED")
-					return
-				}
-			}
-
-			if strategy == "headers" {
-				if um == nil {
-					http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-					return
-				}
-				user, err := um.Get(r.Context(), sess.UserID)
-				if err != nil {
-					l7.WriteJSONError(w, http.StatusUnauthorized, "session_expired", "SESSION_EXPIRED")
-					return
-				}
-				// Inject trusted identity headers (RFC 4.1.6).
-				r.Header.Set(HeaderPiccoloUser, user.Username)
-				r.Header.Set(HeaderPiccoloEmail, user.Email)
-				r.Header.Set(HeaderPiccoloName, user.Username)
-				r.Header.Set(HeaderPiccoloRole, string(user.Role))
-			}
-		case "oidc_passthrough", "public":
-			// Pass-through; app manages auth or requires none.
-		default:
-			// Unknown strategy should fail closed.
-			l7.WriteJSONError(w, http.StatusUnauthorized, "authentication_required", "AUTH_REQUIRED")
-			return
-		}
-
-		// RFC 4.1.5 + 4.1.8: Strip Piccolo cookies before forwarding and optionally rewrite cookies
-		// for LAN port-based isolation.
+	// Tail: cookie context + OIDC authorize-snapshot, then forward_headers +
+	// gzip + reverse_proxy. Pending extraction in substeps 2c (cookie context)
+	// and 2d (OIDC authorize snapshot).
+	inlineTail := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// RFC 4.1.5 + 4.1.8: Strip Piccolo cookies before forwarding and
+		// optionally rewrite cookies for LAN port-based isolation.
 		rewriteCookies := l7.ShouldRewriteLegacyCookies(r.Host)
 		partitionCookies := shouldPartitionCookies(r)
 		needsMarker := needsEmbeddedMarker(r)
@@ -761,13 +608,72 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 			}
 		}
 
-		// forward_headers + gzip + reverse_proxy are the terminal of the chain,
-		// composed into withForward above.
 		withForward.ServeHTTP(w, r)
 	}))
 
+	// path_auth wraps the tail; head (below) wraps path_auth.
+	withPathAuth := l7.PathAuth(ep.AsMiddlewareInfo(), ep.Auth, pathAuthDeps)(inlineTail)
+
+	// Head: hint_consumer_l7, reserved_path_intercept, header strip, ACME bypass.
+	// Pending extraction in substep 2e (reserved_path_intercept + ACME bypass)
+	// and step 9 (hint_consumer_l7 alongside the hint-chain migration).
+	inlineHead := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// hint_consumer_l7 (inline; extraction deferred to step 9 alongside the
+		// connectionHint→middleware.HintFromContext migration).
+		if token := strings.TrimSpace(r.Header.Get(HeaderPiccoloHintToken)); token != "" {
+			r.Header.Del(HeaderPiccoloHintToken)
+			if hint, ok := p.consumeRequestHint(ep.PublicPort, token); ok {
+				r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, hint))
+			}
+		}
+
+		// path_normalize already mutated r.URL.Path; downstream reads it directly.
+		cleanedPath := r.URL.Path
+
+		// RFC 20260122 §5.10: Intercept reserved proxy OIDC paths.
+		if l7oidc.IsReservedPath(cleanedPath) {
+			p.mu.Lock()
+			proxyOIDC := p.proxyOIDC
+			p.mu.Unlock()
+
+			if proxyOIDC == nil {
+				l7.WriteJSONError(w, http.StatusServiceUnavailable, "proxy_oidc_not_configured", "OIDC_UNAVAILABLE")
+				return
+			}
+
+			if cleanedPath == l7oidc.CallbackPath {
+				proxyOIDC.HandleCallback(w, r, ep.App, ep.AsMiddlewareInfo())
+				return
+			}
+
+			// Other reserved paths (future: logout, session status).
+			l7.WriteJSONError(w, http.StatusNotFound, "not_found", "RESERVED_PATH_NOT_IMPLEMENTED")
+			return
+		}
+
+		// RFC 4.1.5: Strip spoofed trusted headers for all strategies. Must happen
+		// before any handler (ACME, backend) to prevent header spoofing.
+		StripHeadersFromRequest(r)
+
+		// Intercept ACME HTTP-01 challenges for remote cert issuance (RFC 20260122).
+		// These bypass auth rules because they're infrastructure-level (piccolod's
+		// TLS termination), not app business logic. External ACME verifiers have
+		// no session.
+		if strings.HasPrefix(cleanedPath, "/.well-known/acme-challenge/") {
+			p.mu.Lock()
+			acme := p.acme
+			p.mu.Unlock()
+			if acme != nil {
+				acme.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		withPathAuth.ServeHTTP(w, r)
+	}))
+
 	// Wrap inline handler with extracted L7 middlewares (innermost-first; outer wraps inner).
-	handler := l7.PathNormalize(l7.NormalizeAndSetRequestPath, l7.WriteJSONError)(inlineHandler)
+	handler := l7.PathNormalize(l7.NormalizeAndSetRequestPath, l7.WriteJSONError)(inlineHead)
 	handler = l7.ForwardedScrub()(handler)
 
 	// Apply common middleware chain
