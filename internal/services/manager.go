@@ -228,6 +228,7 @@ func endpointInfoSlice(eps []ServiceEndpoint) []events.ServiceEndpointInfo {
 			Name:             ep.Name,
 			DerivedHostLabel: ep.DerivedHostLabel,
 			Flow:             ep.Flow,
+			Protocol:         ep.Protocol,
 		}
 	}
 	return info

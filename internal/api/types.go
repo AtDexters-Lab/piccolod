@@ -271,6 +271,26 @@ func (f ListenerFlow) TransportProtocol() string {
 	return "tcp"
 }
 
+// LanHostBasedEligible reports whether a listener can be reached on LAN via
+// the host-based proxy (gin's lanHostRoutingMiddleware) on 127.0.0.1:443.
+// The host-based path is HTTP-only — piccolod terminates TLS for the
+// portal cert and routes to the matching listener via gin. Listeners that
+// don't speak HTTP/Websocket can't traverse this path:
+//
+//   - flow:tls (passthrough): piccolod doesn't terminate TLS for the
+//     listener, so gin can't decode the request.
+//   - flow:tcp + protocol:raw: backend is raw bytes, not HTTP. Routed via
+//     the TLS mux SNI path instead (added in plan §D8).
+//   - flow:udp: UDP can't reach gin (HTTP server is TCP-only).
+//
+// Per RFC 20260316 + plan §D8/§D9/§D10.
+func LanHostBasedEligible(flow ListenerFlow, protocol ListenerProtocol) bool {
+	if flow != FlowTCP {
+		return false
+	}
+	return protocol == ListenerProtocolHTTP || protocol == ListenerProtocolWebsocket
+}
+
 // PortClaimInfo describes an active port claim for cross-package communication
 // between the service manager and remote manager.
 type PortClaimInfo struct {
