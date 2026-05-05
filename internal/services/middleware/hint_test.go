@@ -30,8 +30,9 @@ func TestHintFromContext_roundTrip(t *testing.T) {
 }
 
 func TestHintFromContext_overwrite(t *testing.T) {
-	// L7 overwrites L4 per D13 — the LAN-host-based hop's header-token IS source of truth
-	// for that case. Verify ContextWithHint replaces an earlier value rather than wrapping.
+	// L7 overwrites L4 — the LAN-host-based hop's header-token is source of truth
+	// when both layers see the same connection. Verify ContextWithHint replaces an
+	// earlier value rather than wrapping.
 	first := Hint{ClientIP: "10.0.0.1"}
 	second := Hint{ClientIP: "10.0.0.2"}
 	ctx := ContextWithHint(context.Background(), first)

@@ -99,7 +99,7 @@ func TestEffectiveSourceIP_trustedLoopbackWithoutHint(t *testing.T) {
 }
 
 func TestEffectiveSourceIP_trustedLoopbackEmptyClientIP(t *testing.T) {
-	// TrustedLoopback + hint with empty ClientIP → fall through to SourceAddr per D14.
+	// TrustedLoopback + hint with empty ClientIP → fall through to SourceAddr.
 	// Intentional fail-closed: an empty hint provides no authoritative real-client IP.
 	ctx := ConnContext{
 		SourceAddr:  &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5000},

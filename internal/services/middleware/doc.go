@@ -22,7 +22,8 @@
 // Package boundary: middleware does NOT import internal/services to avoid an
 // import cycle (services imports middleware to use the registry). Endpoint
 // metadata reaches middleware as an EndpointInfo struct constructed by the
-// services package from a ServiceEndpoint.
+// services package from a ServiceEndpoint. internal/api is a leaf package and
+// is imported here for the typed Flow/Protocol enums.
 //
 // Plan: .claude/plans/protocol-agnostic-listener-pipeline.md
 package middleware

@@ -4,7 +4,7 @@ import "net"
 
 // EffectiveSourceIP resolves the effective client IP for an L4 connection.
 //
-// Algorithm per plan D14:
+// Algorithm:
 //
 //  1. If SourceTrust == TrustedLoopback, attempt the lazy hint lookup. If a
 //     hint is present and Hint.ClientIP is non-empty and parses as a valid IP,

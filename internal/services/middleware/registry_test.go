@@ -253,9 +253,9 @@ func TestRegistry_Register_panicsOnInvalid(t *testing.T) {
 }
 
 func TestRegistry_Build_rejectsCanonicalAsOperator(t *testing.T) {
-	// S3 fix: canonical entries are composed automatically (always-on, or via typed
-	// fields like ConnectionAuth/Auth). Listing them in Middleware[] is a config
-	// error per D7 positionability table — must be rejected at Build time.
+	// Canonical entries are composed automatically (always-on, or via typed fields
+	// like ConnectionAuth/Auth). Listing them in Middleware[] is a config error and
+	// must be rejected at Build time.
 	r := NewRegistry()
 	r.RegisterCanonical("connection_auth", LayerL4, dummyFactory)
 

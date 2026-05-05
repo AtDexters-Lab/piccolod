@@ -19,10 +19,10 @@ type hintContextKey struct{}
 // treat this as "no real-client metadata available; fall back to socket-level
 // source addr."
 //
-// Per plan D13: this is the SINGLE READ SITE for resolved hint data. Two write
-// sites (L4 conn-level via ContextWithHint, L7 header-token via the same), with
-// L7 overwriting L4 when both apply (LAN-host-based hop's header-token IS source
-// of truth for that case).
+// This is the single read site for resolved hint data. Two write sites (L4
+// conn-level via ContextWithHint, L7 header-token via the same), with L7
+// overwriting L4 when both apply — the LAN-host-based hop's header-token is
+// source of truth for that case.
 func HintFromContext(ctx context.Context) (Hint, bool) {
 	if ctx == nil {
 		return Hint{}, false

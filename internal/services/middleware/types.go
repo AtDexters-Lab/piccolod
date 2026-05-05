@@ -4,6 +4,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"piccolod/internal/api"
 )
 
 // SourceTrust distinguishes connections that arrived directly (LAN/internet) from
@@ -40,8 +42,8 @@ type EndpointInfo struct {
 	Listener         string
 	HostBind         int
 	PublicPort       int
-	Flow             string // "tcp" | "tls" | "udp"
-	Protocol         string // "http" | "websocket" | "raw"
+	Flow             api.ListenerFlow
+	Protocol         api.ListenerProtocol
 	DerivedHostLabel string
 }
 
@@ -135,9 +137,9 @@ func (l Layer) String() string {
 // registered for. Build picks the appropriate type based on which chain it is
 // composing.
 //
-// Per S5 fix in plan: factories MUST capture deps as getter functions (read each
-// invocation), not snapshot values, so dependency hot-swap (SetUserManager,
-// SetSessionStore, etc.) propagates to in-flight chains without rebuild.
+// Factories MUST capture deps as getter functions (read each invocation), not
+// snapshot values, so dependency hot-swap (SetUserManager, SetSessionStore, etc.)
+// propagates to in-flight chains without rebuild.
 type Factory func(params map[string]any, ep EndpointInfo, deps RegistryDeps) (any, error)
 
 // RegistryDeps is the opaque dep-bag passed to factories. Middlewares fetch
@@ -147,7 +149,7 @@ type Factory func(params map[string]any, ep EndpointInfo, deps RegistryDeps) (an
 // concrete service types like *auth.UserManager — that would force every
 // consumer of the middleware package to drag those imports.
 //
-// Per S5 fix in plan: each entry is a getter function so dep hot-swap propagates.
+// Each entry is a getter function so dep hot-swap propagates.
 type RegistryDeps interface {
 	// Get returns the value for the named dep, or nil if not registered.
 	// Implementations should invoke a getter function on each call so callers

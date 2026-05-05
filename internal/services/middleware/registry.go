@@ -5,17 +5,25 @@ import (
 	"sync"
 )
 
+// Canonical middleware names. These are the names step 5+ will use when registering
+// the corresponding factories via RegisterCanonical, and they're referenced here so
+// the conditional-canonical gate (canonicalApplies) and the factories share a single
+// source of truth for the spelling.
+const (
+	NameConnectionAuth = "connection_auth"
+	NamePathAuth       = "path_auth"
+)
+
 // Registry holds named middleware factories. Factories register at package init time
 // (typically) and are looked up at endpoint-build time to compose per-listener chains.
 //
-// Build-time composition rule per plan D7:
+// Build-time composition rule:
 //   - Canonical entries (registered as canonical) run first in their layer's chain
 //     in their canonical order.
 //   - Operator-listed entries (from listener.Middleware[]) append to the end of
 //     the canonical chain in declaration order.
 //   - No reordering syntax (no position:); no removal of canonical entries.
-//   - Unknown name → Build returns error; reconcile rejects listener fail-closed
-//     per S5.
+//   - Unknown name → Build returns error; reconcile rejects listener fail-closed.
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]registryEntry
@@ -27,7 +35,7 @@ type Registry struct {
 type registryEntry struct {
 	layers    []Layer
 	factory   Factory
-	canonical bool // true when registered via RegisterCanonical; rejects operator-listing per D7 table
+	canonical bool // true when registered via RegisterCanonical; rejects operator-listing
 }
 
 // NewRegistry constructs an empty registry. Built-in factories register themselves
@@ -50,15 +58,7 @@ func NewRegistry() *Registry {
 //     across init() ordering or two packages registering the same name; tests that
 //     need to override should construct a fresh Registry)
 func (r *Registry) Register(name string, layers []Layer, factory Factory) {
-	if name == "" {
-		panic("middleware.Register: empty name")
-	}
-	if len(layers) == 0 {
-		panic("middleware.Register: empty layers")
-	}
-	if factory == nil {
-		panic("middleware.Register: nil factory")
-	}
+	r.validateRegistration("Register", name, layers, factory)
 	seen := map[Layer]bool{}
 	for _, l := range layers {
 		if seen[l] {
@@ -66,20 +66,15 @@ func (r *Registry) Register(name string, layers []Layer, factory Factory) {
 		}
 		seen[l] = true
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, exists := r.entries[name]; exists {
-		panic(fmt.Sprintf("middleware.Register: %q already registered", name))
-	}
-	r.entries[name] = registryEntry{layers: layers, factory: factory, canonical: false}
+	r.insertEntry("Register", name, registryEntry{layers: layers, factory: factory, canonical: false})
 }
 
 // RegisterCanonical registers a factory AND appends its name to the canonical
 // chain for the given layer. Canonical entries always run first in their layer's
 // chain, in registration order.
 //
-// Canonical entries are NEVER operator-listable per D7 table — listing a canonical
-// name in a listener's Middleware[] field is rejected at Build time.
+// Canonical entries are NEVER operator-listable — listing a canonical name in a
+// listener's Middleware[] field is rejected at Build time.
 //
 // To register the same factory for additional non-canonical layers (e.g.,
 // hypothetically: a primarily-canonical-on-L4 factory that's also operator-listable
@@ -92,19 +87,34 @@ func (r *Registry) Register(name string, layers []Layer, factory Factory) {
 //   - empty name or nil factory
 //   - re-registration (canonical or operator) of an existing name (fail-fast)
 func (r *Registry) RegisterCanonical(name string, layer Layer, factory Factory) {
+	r.validateRegistration("RegisterCanonical", name, []Layer{layer}, factory)
+	r.insertEntry("RegisterCanonical", name, registryEntry{layers: []Layer{layer}, factory: factory, canonical: true})
+	r.mu.Lock()
+	r.canonical[layer] = append(r.canonical[layer], name)
+	r.mu.Unlock()
+}
+
+// validateRegistration enforces shared init-time argument checks.
+func (r *Registry) validateRegistration(caller, name string, layers []Layer, factory Factory) {
 	if name == "" {
-		panic("middleware.RegisterCanonical: empty name")
+		panic(fmt.Sprintf("middleware.%s: empty name", caller))
+	}
+	if len(layers) == 0 {
+		panic(fmt.Sprintf("middleware.%s: empty layers", caller))
 	}
 	if factory == nil {
-		panic("middleware.RegisterCanonical: nil factory")
+		panic(fmt.Sprintf("middleware.%s: nil factory", caller))
 	}
+}
+
+// insertEntry takes the write lock, rejects duplicates, and stores the entry.
+func (r *Registry) insertEntry(caller, name string, entry registryEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, exists := r.entries[name]; exists {
-		panic(fmt.Sprintf("middleware.RegisterCanonical: %q already registered", name))
+		panic(fmt.Sprintf("middleware.%s: %q already registered", caller, name))
 	}
-	r.entries[name] = registryEntry{layers: []Layer{layer}, factory: factory, canonical: true}
-	r.canonical[layer] = append(r.canonical[layer], name)
+	r.entries[name] = entry
 }
 
 // BuildSpec describes which middlewares Build should compose.
@@ -161,8 +171,8 @@ type BuildResult struct {
 //   - Factory returns error.
 //   - Factory return is not the expected type for the layer.
 //
-// Reconcile callers treat any Build error as fail-closed per S5: listener is
-// rejected with a config_error health badge.
+// Reconcile callers treat any Build error as fail-closed: listener is rejected
+// with a config_error health badge rather than starting with a partial chain.
 //
 // For step 1 of the plan landing: with no factories registered yet, Build returns
 // an empty BuildResult successfully. Real composition kicks in when step 5 lands
@@ -221,8 +231,7 @@ func buildLayer[M any](r *Registry, spec BuildSpec, layer Layer) ([]M, error) {
 		}
 		// Reject canonical names listed by operator. Canonical entries are composed via
 		// dedicated mechanisms (always-on + conditional via typed listener fields like
-		// ConnectionAuth/Auth). Listing them in Middleware[] is a config error per the
-		// D7 positionability table.
+		// ConnectionAuth/Auth). Listing them in Middleware[] is a config error.
 		if ent.canonical {
 			return nil, fmt.Errorf("middleware %q: canonical entry not operator-listable (composed automatically; remove from Middleware[])", entry.Name)
 		}
@@ -251,13 +260,13 @@ func buildLayer[M any](r *Registry, spec BuildSpec, layer Layer) ([]M, error) {
 // Conditionally-canonical entries are included only when their gate is set in the
 // spec. Unconditional canonical entries always apply.
 //
-// Step 1 has no canonical registrations; the gate logic stubs are in place for
-// step 5 when built-ins land.
+// If a third gate ever lands here, refactor to a Gates map[string]bool on BuildSpec
+// rather than continuing to grow the switch + Has* fields.
 func canonicalApplies(name string, spec BuildSpec) bool {
 	switch name {
-	case "connection_auth":
+	case NameConnectionAuth:
 		return spec.HasConnectionAuth
-	case "path_auth":
+	case NamePathAuth:
 		return spec.HasAuth
 	default:
 		return true
