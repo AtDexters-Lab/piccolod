@@ -414,8 +414,49 @@ func (m *Manager) checkInterfaceChanges() {
 		ifaceCopy := iface
 		seenInterfaces[ifaceCopy.Name] = true
 		if existing, exists := m.interfaces[ifaceCopy.Name]; exists {
-			// Interface still exists - check if IP changed
-			if m.hasIPChanged(&ifaceCopy, existing) {
+			// Interface still exists. Two cases:
+			//   1. Interface flag is Down (link-down or admin-down): legitimate
+			//      change — reconfigure on next FlagUp tick.
+			//   2. Interface flag is Up + IP changed: dampen for 3-of-3 ticks
+			//      before reconfiguring. Eliminates the 10s reconfig storm
+			//      seen during transient DHCP renewal / brief carrier drops.
+			ifaceUp := ifaceCopy.Flags&net.FlagUp != 0
+			ipChanged := m.hasIPChanged(&ifaceCopy, existing)
+			ipLost := ipChanged && m.isIPLost(&ifaceCopy)
+
+			switch {
+			case !ifaceUp:
+				// Interface down — kernel says the link is gone.
+				log.Printf("INFO: Interface %s down, closing connections", ifaceCopy.Name)
+				if existing.IPv4Conn != nil {
+					existing.IPv4Conn.Close()
+				}
+				if existing.IPv6Conn != nil {
+					existing.IPv6Conn.Close()
+				}
+				existing.IPLossTicks = 0
+				m.setupInterface(&ifaceCopy)
+			case ipLost:
+				// IP lost while interface still Up — likely transient (DHCP
+				// renewal, brief carrier drop). Require 3-of-3 ticks before
+				// reconfiguring.
+				existing.IPLossTicks++
+				if existing.IPLossTicks >= 3 {
+					log.Printf("INFO: Sustained IP loss on %s (%d ticks), reconfiguring", ifaceCopy.Name, existing.IPLossTicks)
+					if existing.IPv4Conn != nil {
+						existing.IPv4Conn.Close()
+					}
+					if existing.IPv6Conn != nil {
+						existing.IPv6Conn.Close()
+					}
+					existing.IPLossTicks = 0
+					m.setupInterface(&ifaceCopy)
+				} else {
+					existing.Active = true
+					existing.LastSeen = time.Now()
+				}
+			case ipChanged:
+				// IP changed to a new value (network move) — legitimate change.
 				log.Printf("INFO: IP changed on interface %s, reconfiguring", ifaceCopy.Name)
 				if existing.IPv4Conn != nil {
 					existing.IPv4Conn.Close()
@@ -423,8 +464,10 @@ func (m *Manager) checkInterfaceChanges() {
 				if existing.IPv6Conn != nil {
 					existing.IPv6Conn.Close()
 				}
+				existing.IPLossTicks = 0
 				m.setupInterface(&ifaceCopy)
-			} else {
+			default:
+				existing.IPLossTicks = 0
 				existing.Active = true
 				existing.LastSeen = time.Now()
 			}
@@ -502,6 +545,35 @@ func (m *Manager) checkInterfaceChanges() {
 			m.sendPeerDiscoveryQuery()
 		}()
 	}
+}
+
+// isIPLost returns true if the interface currently has no usable IPv4 or
+// IPv6 address (the previous state had one). Used by checkInterfaceChanges
+// to dampen transient IP losses (DHCP renewal, brief carrier drops) for
+// 3-of-3 ticks before reconfiguring — closes the 10s reconfig storm.
+func (m *Manager) isIPLost(iface *net.Interface) bool {
+	interfaceFuncsMu.RLock()
+	addrsFn := interfaceAddrs
+	interfaceFuncsMu.RUnlock()
+
+	addrs, err := addrsFn(iface)
+	if err != nil {
+		// Treat as loss if we can't enumerate.
+		return true
+	}
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ipv4 := ipnet.IP.To4(); ipv4 != nil && !ipnet.IP.IsLinkLocalUnicast() {
+			return false
+		}
+		if ipnet.IP.To4() == nil && ipnet.IP.To16() != nil && !ipnet.IP.IsLoopback() {
+			return false
+		}
+	}
+	return true
 }
 
 // hasIPChanged checks if an interface's IPv4 or IPv6 addresses have changed

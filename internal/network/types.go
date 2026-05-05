@@ -82,3 +82,17 @@ type APStatus struct {
 	Suppressed bool   `json:"suppressed"`
 	Clients    int    `json:"clients"`
 }
+
+// NetworkStateChangedEvent is the payload for events.TopicNetworkStateChanged.
+// Preserved as a wire contract — existing subscribers (identity, stun, ui)
+// pattern-match on (ActiveUplink, SignalDBm) to react to uplink-up.
+type NetworkStateChangedEvent struct {
+	State        string `json:"state"`
+	ActiveUplink string `json:"active_uplink"`
+	SSID         string `json:"ssid,omitempty"`
+	SignalDBm    *int   `json:"signal_dbm,omitempty"`
+	SignalTier   string `json:"signal_tier,omitempty"`
+	APActive     bool   `json:"ap_active"`
+	APSSID       string `json:"ap_ssid,omitempty"`
+	Error        string `json:"error,omitempty"`
+}

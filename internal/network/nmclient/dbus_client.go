@@ -30,16 +30,52 @@ type DBusClient struct {
 	stopCh   chan struct{}
 }
 
-// NewDBusClient connects to the system D-Bus and verifies that NetworkManager
-// is reachable. The runner is used as fallback for nmcli commands when D-Bus
-// is unavailable, and for subprocess execution (arping, firewall-cmd, etc.).
+// NewDBusClient connects to the shared system D-Bus and verifies that
+// NetworkManager is reachable. The runner is used as fallback for nmcli
+// commands when D-Bus is unavailable, and for subprocess execution (arping,
+// firewall-cmd, etc.).
+//
+// NOTE: the shared system bus singleton dispatches signals connection-wide
+// to all subscribers. If two subsystems register signal handlers on the
+// same connection, signals fan out to both. Use NewPrivateDBusClient when
+// you need an isolated signal dispatch — e.g., the network supervisor.
 func NewDBusClient(r runner.CommandRunner) (*DBusClient, error) {
 	conn, err := dbus.ConnectSystemBus()
 	if err != nil {
 		return nil, fmt.Errorf("nmclient: system bus connect: %w", err)
 	}
+	return finishNewDBusClient(conn, r)
+}
 
-	// Verify NM is reachable by reading its version.
+// NewPrivateDBusClient establishes a NEW (private) connection to the system
+// bus — NOT the shared singleton — and verifies NetworkManager is reachable.
+//
+// This is the constructor the network supervisor's probe layer must use:
+// godbus's `conn.Signal(sigCh)` is connection-wide, so registering signal
+// handlers on the shared `dbus.SystemBus()` singleton would fan out signals
+// to every subscriber on the connection (cross-talk). A private connection
+// gives the caller isolated signal dispatch.
+//
+// The caller is responsible for calling Close() when done.
+func NewPrivateDBusClient(r runner.CommandRunner) (*DBusClient, error) {
+	conn, err := dbus.SystemBusPrivate()
+	if err != nil {
+		return nil, fmt.Errorf("nmclient: private system bus: %w", err)
+	}
+	if err := conn.Auth(nil); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("nmclient: private bus auth: %w", err)
+	}
+	if err := conn.Hello(); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("nmclient: private bus hello: %w", err)
+	}
+	return finishNewDBusClient(conn, r)
+}
+
+// finishNewDBusClient verifies NM reachability and constructs the client.
+// Used by both the shared and private constructors.
+func finishNewDBusClient(conn *dbus.Conn, r runner.CommandRunner) (*DBusClient, error) {
 	obj := conn.Object(nmBusName, dbus.ObjectPath(nmObjectPath))
 	var version dbus.Variant
 	if err := obj.Call(dbusPropertiesInterface+".Get", 0, nmInterface, "Version").Store(&version); err != nil {

@@ -1,0 +1,143 @@
+package network
+
+import "time"
+
+// Tri is a three-state classification used for HW and Config health per device.
+//
+//   - TriHealthy:  proved working
+//   - TriFaulted:  preconditions agree it should work, but it isn't
+//   - TriInactive: preconditions correctly say "nothing to do here" (no cable,
+//                  rfkill-by-intent, no profile)
+type Tri int
+
+const (
+	TriHealthy Tri = iota
+	TriFaulted
+	TriInactive
+)
+
+func (t Tri) String() string {
+	switch t {
+	case TriHealthy:
+		return "healthy"
+	case TriFaulted:
+		return "faulted"
+	case TriInactive:
+		return "inactive"
+	default:
+		return "unknown"
+	}
+}
+
+// DeviceKind enumerates the device kinds the supervisor manages. Single
+// device per kind — first NM-managed device of each kind wins (catalog A8).
+type DeviceKind int
+
+const (
+	DeviceWiFi DeviceKind = iota
+	DeviceEthernet
+)
+
+func (d DeviceKind) String() string {
+	switch d {
+	case DeviceWiFi:
+		return "wifi"
+	case DeviceEthernet:
+		return "ethernet"
+	default:
+		return "unknown"
+	}
+}
+
+// DeviceObservation is a per-device snapshot from one probe pass.
+type DeviceObservation struct {
+	Kind         DeviceKind
+	Present      bool
+	HWHealth     Tri
+	ConfigHealth Tri  // Healthy | Faulted | Inactive — DHCP-in-flight maps to Healthy
+	LinkUp       bool
+	HasIP        bool
+	GwReachable  Tri
+	RfkillHard   bool   // physical kill switch — unblock impossible
+	NMState      string // diagnostic only ("activated", "failed", etc.)
+	NMReason     string // diagnostic only ("no_secrets", etc.)
+	Iface        string // e.g. "wlan0", "eth0" (empty if Present=false)
+}
+
+// Connectivity is the supervisor's classification of upstream connectivity.
+// Sourced from L3Probe + GwReachable + NMConn (advisory).
+type Connectivity int
+
+const (
+	ConnectivityUnknown Connectivity = iota
+	ConnectivityNone
+	ConnectivityPortal
+	ConnectivityLimited
+	ConnectivityFull
+)
+
+func (c Connectivity) String() string {
+	switch c {
+	case ConnectivityNone:
+		return "none"
+	case ConnectivityPortal:
+		return "portal"
+	case ConnectivityLimited:
+		return "limited"
+	case ConnectivityFull:
+		return "full"
+	default:
+		return "unknown"
+	}
+}
+
+// L3ProbeResult is the result of the TCP-connect L3 probe to a small set of
+// well-known IPs. Up if any target succeeds within the timeout; Down otherwise.
+type L3ProbeResult int
+
+const (
+	L3ProbeUnknown L3ProbeResult = iota
+	L3ProbeUp
+	L3ProbeDown
+)
+
+func (r L3ProbeResult) String() string {
+	switch r {
+	case L3ProbeUp:
+		return "up"
+	case L3ProbeDown:
+		return "down"
+	default:
+		return "unknown"
+	}
+}
+
+// Tick is the input to deciders for one supervisor tick. Pure data — every
+// field is set by the probe layer before deciders run.
+type Tick struct {
+	Devices map[DeviceKind]DeviceObservation
+
+	// NMConn is advisory only — read from NM's Connectivity property as it
+	// stands. Deciders consume L3Probe (the TCP-connect truth) instead.
+	NMConn Connectivity
+
+	// L3Probe is the primary L3-truth: TCP-connect to 8.8.8.8:53 / 1.1.1.1:53.
+	L3Probe L3ProbeResult
+
+	// ActiveUplink — the uplink that currently carries traffic, derived from
+	// device observations. Predicate: HWHealth==Healthy AND LinkUp; priority
+	// ethernet-if-eligible-else-wifi-if-eligible-else-none. AP mode maps to
+	// UplinkNone per existing wire convention.
+	ActiveUplink UplinkType
+
+	// SystemBusy is read once per tick from SystemState, then passed as data
+	// to deciders. Closes mid-tick TOCTOU between deciders.
+	SystemBusy       bool
+	SystemBusyReason string
+
+	// SystemUptime is sourced from /proc/uptime (NOT process uptime —
+	// piccolod restart doesn't reset grace if the system has been up).
+	SystemUptime time.Duration
+
+	At time.Time
+}

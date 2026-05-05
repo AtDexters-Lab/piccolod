@@ -1342,8 +1342,13 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		})
 	}
 
-	// Network manager (WiFi uplink + watchdog). D-Bus may be unavailable on
-	// dev machines — degrade gracefully, WiFi API returns available=false.
+	// Network manager + supervisor. D-Bus may be unavailable on dev machines —
+	// degrade gracefully, WiFi API returns available=false.
+	//
+	// The supervisor runs the probe-decide-act pipeline against its OWN
+	// private dbus connection (F3-B1 fix — godbus signal dispatch is
+	// connection-wide, so the manager's connection cannot be shared with
+	// the supervisor's signal subscriptions without cross-talk).
 	nmClient, nmErr := nmclient.NewDBusClient(execRunner)
 	if nmErr != nil {
 		log.Printf("WARN: network manager: D-Bus unavailable, WiFi disabled: %v", nmErr)
@@ -1352,6 +1357,22 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		networkMgr := network.NewManager(nmClient, execRunner, eventsBus)
 		networkMgr.SetHealthTracker(healthTracker)
 		s.networkManager = networkMgr
+
+		// Build the supervisor with a SystemState backed by the bus's
+		// onboarding-state channel.
+		sys := network.NewBusSystemState(context.Background(), eventsBus)
+		netSup, supErr := network.BuildSupervisor(context.Background(), execRunner, sys)
+		if supErr != nil {
+			log.Printf("WARN: net-supervisor: private bus init failed (%v) — supervisor disabled", supErr)
+		} else {
+			networkMgr.SetSupervisor(netSup)
+			netSup.SetEventBus(eventsBus)
+			netSup.WireActuators(nmClient, execRunner, networkMgr.APMgr())
+			netSup.EnableActuation(true)
+			networkMgr.LoadAPSuppressionFlag()
+			s.supervisor.Register(netSup)
+		}
+
 		s.supervisor.Register(networkMgr)
 		healthTracker.Setf("network", health.LevelWarn, "network manager initializing")
 	}

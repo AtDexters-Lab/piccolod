@@ -44,6 +44,13 @@ type InterfaceState struct {
 	BackoffUntil     time.Time
 	HealthScore      float64 // 0.0 (unhealthy) to 1.0 (healthy)
 	resilienceMu     sync.RWMutex
+
+	// IP-loss dampening — RFC 20260505: 13-day silent failure root cause
+	// was checkInterfaceChanges reconfiguring every 10s when an interface
+	// lost its IP. Treat IP-loss as transient (3-of-3 ticks at 10s = 30s
+	// sustained) and disambiguate via interface-down (FlagUp) — only act
+	// on interface-down OR sustained loss, never on every IP fluctuation.
+	IPLossTicks int
 }
 
 // SecurityConfig defines security limits and thresholds

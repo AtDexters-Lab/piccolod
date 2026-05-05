@@ -8,35 +8,44 @@ import (
 
 	"github.com/godbus/dbus/v5"
 
+	"piccolod/internal/events"
 	"piccolod/internal/network/nmclient"
 )
 
 const signalPollInterval = 30 * time.Second
 
-// signalMonitor periodically polls WiFi RSSI and updates the state machine.
+// signalMonitor periodically polls WiFi RSSI when WiFi is the active uplink
+// and publishes a NetworkStateChangedEvent on tier transitions.
 type signalMonitor struct {
-	nm         nmclient.Client
-	sm         *stateMachine
-	mu         sync.Mutex
-	wifiDevice dbus.ObjectPath
+	nm  nmclient.Client
+	mgr *Manager
+
+	mu             sync.Mutex
+	wifiDevice     dbus.ObjectPath
+	lastSignalDBm  int
+	lastSignalTier SignalTier
 }
 
-func newSignalMonitor(nm nmclient.Client, sm *stateMachine) *signalMonitor {
-	return &signalMonitor{nm: nm, sm: sm}
+func newSignalMonitor(nm nmclient.Client, mgr *Manager) *signalMonitor {
+	return &signalMonitor{nm: nm, mgr: mgr}
 }
 
-// setDevice updates the WiFi device to monitor (thread-safe).
 func (m *signalMonitor) setDevice(path dbus.ObjectPath) {
 	m.mu.Lock()
 	m.wifiDevice = path
 	m.mu.Unlock()
 }
 
-// run polls RSSI every 30 seconds and updates the state machine's signal info.
+// snapshot returns the latest cached signal reading (thread-safe).
+func (m *signalMonitor) snapshot() (int, SignalTier) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastSignalDBm, m.lastSignalTier
+}
+
 func (m *signalMonitor) run(ctx context.Context) {
 	ticker := time.NewTicker(signalPollInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -51,14 +60,20 @@ func (m *signalMonitor) poll() {
 	m.mu.Lock()
 	dev := m.wifiDevice
 	m.mu.Unlock()
-
 	if dev == "" {
 		return
 	}
 
-	// Only poll when WiFi is the active uplink
-	state := m.sm.Current()
-	if state != StateWiFiSTA {
+	// Gate on WiFi being the active uplink — read from supervisor's snapshot.
+	if m.mgr == nil || m.mgr.snapshot().ActiveUplink != UplinkWiFi {
+		// Clear cached tier when leaving WiFi STA so stale dBm doesn't
+		// linger on the legacy wire contract.
+		m.mu.Lock()
+		if m.lastSignalDBm != 0 {
+			m.lastSignalDBm = 0
+			m.lastSignalTier = ""
+		}
+		m.mu.Unlock()
 		return
 	}
 
@@ -71,7 +86,26 @@ func (m *signalMonitor) poll() {
 		return // no active AP
 	}
 
-	// Convert NM's 0–100 percentage to approximate dBm
 	dbm := int(strength)*60/100 - 90
-	m.sm.updateSignal(dbm)
+	tier := ClassifySignal(dbm)
+
+	m.mu.Lock()
+	oldTier := m.lastSignalTier
+	m.lastSignalDBm = dbm
+	m.lastSignalTier = tier
+	m.mu.Unlock()
+
+	if tier != oldTier && m.mgr.events != nil {
+		state := deriveLegacyState(m.mgr.lastTick(), m.mgr.snapshot().APMode.Active)
+		uplink := m.mgr.lastTick().ActiveUplink
+		m.mgr.events.Publish(events.Event{
+			Topic: events.TopicNetworkStateChanged,
+			Payload: NetworkStateChangedEvent{
+				State:        string(state),
+				ActiveUplink: string(uplink),
+				SignalDBm:    &dbm,
+				SignalTier:   string(tier),
+			},
+		})
+	}
 }

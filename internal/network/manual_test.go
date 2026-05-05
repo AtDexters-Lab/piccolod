@@ -44,11 +44,27 @@ func TestManualAPMode(t *testing.T) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
+	// Wire the supervisor (production path). Uses a private dbus connection
+	// so its NM signal subscriptions don't cross-talk with the manager's.
+	sys := NewStaticSystemState(false, "")
+	sup, err := BuildSupervisor(ctx, r, sys)
+	if err != nil {
+		t.Fatalf("BuildSupervisor: %v", err)
+	}
+	mgr.SetSupervisor(sup)
+	sup.SetEventBus(bus)
+	sup.WireActuators(nm, r, mgr.APMgr())
+	sup.EnableActuation(true)
+
 	// Full production startup: reconcile, discover devices, wire portal, background loops
 	if err := mgr.Start(ctx); err != nil {
 		t.Fatalf("Manager.Start: %v", err)
 	}
 	defer mgr.Stop(ctx)
+	if err := sup.Start(ctx); err != nil {
+		t.Fatalf("Supervisor.Start: %v", err)
+	}
+	defer sup.Stop(ctx)
 
 	// Force AP mode — bypasses the slow state machine escalation.
 	// Blocks until AP + captive portal are ready.
