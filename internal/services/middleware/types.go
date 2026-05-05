@@ -45,6 +45,11 @@ type EndpointInfo struct {
 	Flow             api.ListenerFlow
 	Protocol         api.ListenerProtocol
 	DerivedHostLabel string
+	// Auth carries the listener's per-path auth rules. nil when the listener
+	// declares no rules (path_auth canonical entry is gated on Auth != nil
+	// via spec.HasAuth). Held as a pointer to match the api.AppListener.Auth
+	// shape and keep the empty case zero-cost.
+	Auth *api.ListenerAuth
 }
 
 // ConnContext is the per-connection context passed to L4 middlewares.

@@ -62,5 +62,6 @@ func (e ServiceEndpoint) AsMiddlewareInfo() middleware.EndpointInfo {
 		Flow:             e.Flow,
 		Protocol:         e.Protocol,
 		DerivedHostLabel: e.DerivedHostLabel,
+		Auth:             e.Auth,
 	}
 }

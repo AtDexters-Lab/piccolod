@@ -19,6 +19,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/auth"
 	"piccolod/internal/services/middleware"
+	"piccolod/internal/services/middleware/builtin"
 	"piccolod/internal/services/middleware/l7"
 	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 )
@@ -94,11 +95,19 @@ type ProxyManager struct {
 	// when mDNS is disabled and the value comes from getPreferredOutboundIP.
 	oidcIssuerOriginFn func() string
 	oidcAuthorizePaths map[string][]string // app name → authorize_paths from manifest
+
+	// Middleware registry holds canonical L7 + L7Response factories that
+	// drive startHTTPProxy chain composition. Initialized once per
+	// ProxyManager via builtin.RegisterDefaults.
+	registry *middleware.Registry
 }
 
 func NewProxyManager() *ProxyManager {
+	reg := middleware.NewRegistry()
+	builtin.RegisterDefaults(reg)
 	// Default safe CSP
 	return &ProxyManager{
+		registry:          reg,
 		listeners:         make(map[int]net.Listener),
 		udpListeners:      make(map[int]*udpProxyState),
 		cspFrameAncestors: "frame-ancestors \"self\" http://localhost:* http://*.local:* https://*.local:*",
@@ -468,132 +477,34 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	}
 	rp := httputil.NewSingleHostReverseProxy(u)
 
-	// Response-side modifier composition. Modifiers run in canonical order:
-	//   1. security_headers_response       — l7.SecurityHeadersResponse
-	//   2. cookie_isolation_response       — l7.CookieIsolationResponse
-	//   3. embedded_marker_response        — l7.EmbeddedMarkerResponse
-	//   4. oidc_authorize_rewrite_response — l7oidc.AuthorizeRewriteResponse
-	respChain := []middleware.ResponseModifier{
-		l7.SecurityHeadersResponse(),
-		l7.CookieIsolationResponse(ep.App),
-		l7.EmbeddedMarkerResponse(needsEmbeddedMarker, l7.EmbeddedMarkerSetCookie),
-		l7oidc.AuthorizeRewriteResponse(ep.App),
+	// Build the L7 chain via the registry. spec carries the per-listener facts
+	// (HasAuth gates path_auth); deps carries the closures that bridge into
+	// services-internal state (mutable proxy-manager fields read live per call).
+	mwEndpoint := ep.AsMiddlewareInfo()
+	deps := p.buildL7Deps(ep)
+	spec := middleware.BuildSpec{
+		Endpoint: mwEndpoint,
+		HasAuth:  ep.Auth != nil && len(ep.Auth.Rules) > 0,
+		Deps:     deps,
 	}
-	rp.ModifyResponse = func(resp *http.Response) error {
-		for _, mod := range respChain {
-			if err := mod(resp); err != nil {
-				return err
-			}
-		}
-		return nil
+	built, err := p.registry.Build(spec)
+	if err != nil {
+		log.Printf("ERROR: registry.Build for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		return
 	}
 
-	// Request-side L7 chain composition (extraction per plan §H).
-	// Build innermost-first; outer wraps inner.
-	//
-	//   forwarded_scrub
-	//     → path_normalize
-	//       → INLINE handler (hint_consumer_l7, reserved_path_intercept, ACME bypass)
-	//         → path_auth
-	//           → cookie_context (INLINE; substep 2e neighborhood)
-	//             → oidc_authorize_snapshot
-	//               → forward_headers
-	//                 → gzip + reverse_proxy (terminal)
-	//
-	// Remaining inline: hint_consumer_l7 (step 9), reserved_path_intercept,
-	// ACME bypass, header strip (substep 2e), and the cookie_context glue
-	// (deferred — composes with proxy-context setters in services/).
-
-	pathAuthDeps := l7.PathAuthDeps{
-		Snapshot: func() l7.PathAuthSnapshot {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			snap := l7.PathAuthSnapshot{
-				UserManager:   p.userManager,
-				SessionGetter: p.sessionGetter,
-				PortalOrigin:  p.portalOrigin,
-				AliasChecker:  p.aliasChecker,
-				SessionStore:  p.sessionStore,
-			}
-			if p.proxyOIDC != nil {
-				snap.InitiateOIDC = p.proxyOIDC.InitiateFlow
-			}
-			return snap
-		},
-		ArrivedViaTLS: RequestArrivedViaTLS,
-	}
-
-	authSnapDeps := l7oidc.AuthorizeSnapshotDeps{
-		ArrivedViaTLS: RequestArrivedViaTLS,
-		Snapshot: func() l7oidc.AuthorizeSnapshotState {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			return l7oidc.AuthorizeSnapshotState{
-				IssuerOrigin:   p.oidcIssuerOriginFn,
-				PortalOrigin:   p.portalOrigin,
-				AuthorizePaths: p.oidcAuthorizePaths[ep.App],
-			}
-		},
-	}
+	rp.ModifyResponse = middleware.ComposeResponseChain(built.L7Response)
 
 	terminal := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gzw := l7.NewGzipResponseWriter(w, r)
 		defer gzw.Close()
 		rp.ServeHTTP(gzw, r)
 	}))
-	withForward := l7.ForwardHeaders(func(r *http.Request) { applyForwardHeaders(r, ep) })(terminal)
-	withAuthSnap := l7oidc.AuthorizeSnapshot(authSnapDeps)(withForward)
+	handler := middleware.ComposeRequestChain(built.L7, terminal)
 
-	// Cookie context glue: applies request-side cookie strip/rewrite and stashes
-	// per-request flags for the response-side cookie_isolation/embedded_marker
-	// modifiers. Stays inline because it composes with the services-internal
-	// `shouldPartitionCookies`/`needsEmbeddedMarker` predicates pending step 9.
-	cookieContext := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rewriteCookies := l7.ShouldRewriteLegacyCookies(r.Host)
-		partitionCookies := shouldPartitionCookies(r)
-		needsMarker := needsEmbeddedMarker(r)
-		l7.StripAndRewriteRequestCookies(r, ep.App, rewriteCookies)
-		r = l7.SetProxyContext(r, ep.App, l7.NormalizeHostNoPort(r.Host), rewriteCookies, partitionCookies, needsMarker)
-		withAuthSnap.ServeHTTP(w, r)
-	}))
-
-	mwEndpoint := ep.AsMiddlewareInfo()
-
-	// Wrap each middleware around the next inner one (innermost-first).
-	withPathAuth := l7.PathAuth(mwEndpoint, ep.Auth, pathAuthDeps)(cookieContext)
-	withACME := l7.ACMEBypass(func() http.Handler {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return p.acme
-	})(withPathAuth)
-	withStrip := l7.StripPiccoloHeaders()(withACME)
-	withReserved := l7oidc.ReservedPathIntercept(mwEndpoint, l7oidc.ReservedPathInterceptDeps{
-		GetCallbackHandler: func() l7oidc.CallbackHandlerFn {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			if p.proxyOIDC == nil {
-				return nil
-			}
-			return p.proxyOIDC.HandleCallback
-		},
-	})(withStrip)
-
-	// hint_consumer_l7 — last remaining inline middleware. Extraction deferred
-	// to step 9 alongside the connectionHint→middleware.HintFromContext migration.
-	withHint := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if token := strings.TrimSpace(r.Header.Get(HeaderPiccoloHintToken)); token != "" {
-			r.Header.Del(HeaderPiccoloHintToken)
-			if hint, ok := p.consumeRequestHint(ep.PublicPort, token); ok {
-				r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, hint))
-			}
-		}
-		withReserved.ServeHTTP(w, r)
-	}))
-
-	handler := l7.PathNormalize(l7.NormalizeAndSetRequestPath, l7.WriteJSONError)(withHint)
-	handler = l7.ForwardedScrub()(handler)
-
-	// Apply common middleware chain
+	// Outer non-listener-specific middleware wrapping (security headers,
+	// request logging, rate limiting). Stays out of the registry until those
+	// concerns get their own canonical entries.
 	handler = p.securityHeaders(handler)
 	handler = requestLogging(handler)
 	handler = basicRateLimit(handler) // stub
@@ -916,6 +827,92 @@ func RequestArrivedViaTLS(r *http.Request) bool {
 		return true
 	}
 	return false
+}
+
+// buildL7Deps assembles the per-listener RegistryDeps that the canonical
+// chain factories pull from. Each entry is a getter function so dep hot-swap
+// (SetUserManager etc.) propagates without registry rebuild.
+func (p *ProxyManager) buildL7Deps(ep ServiceEndpoint) middleware.RegistryDeps {
+	listenerPort := ep.PublicPort
+	appName := ep.App
+
+	hintConsumer := func(r *http.Request) *http.Request {
+		token := strings.TrimSpace(r.Header.Get(HeaderPiccoloHintToken))
+		if token == "" {
+			return r
+		}
+		r.Header.Del(HeaderPiccoloHintToken)
+		if hint, ok := p.consumeRequestHint(listenerPort, token); ok {
+			r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, hint))
+		}
+		return r
+	}
+
+	cookieContext := func(r *http.Request) *http.Request {
+		rewriteCookies := l7.ShouldRewriteLegacyCookies(r.Host)
+		partitionCookies := shouldPartitionCookies(r)
+		needsMarker := needsEmbeddedMarker(r)
+		l7.StripAndRewriteRequestCookies(r, appName, rewriteCookies)
+		return l7.SetProxyContext(r, appName, l7.NormalizeHostNoPort(r.Host), rewriteCookies, partitionCookies, needsMarker)
+	}
+
+	pathAuthSnapshot := func() l7.PathAuthSnapshot {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		snap := l7.PathAuthSnapshot{
+			UserManager:   p.userManager,
+			SessionGetter: p.sessionGetter,
+			PortalOrigin:  p.portalOrigin,
+			AliasChecker:  p.aliasChecker,
+			SessionStore:  p.sessionStore,
+		}
+		if p.proxyOIDC != nil {
+			snap.InitiateOIDC = p.proxyOIDC.InitiateFlow
+		}
+		return snap
+	}
+
+	authSnapshot := func() l7oidc.AuthorizeSnapshotState {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return l7oidc.AuthorizeSnapshotState{
+			IssuerOrigin:   p.oidcIssuerOriginFn,
+			PortalOrigin:   p.portalOrigin,
+			AuthorizePaths: p.oidcAuthorizePaths[appName],
+		}
+	}
+
+	acmeHandler := func() http.Handler {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.acme
+	}
+
+	reservedCallback := func() l7oidc.CallbackHandlerFn {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.proxyOIDC == nil {
+			return nil
+		}
+		return p.proxyOIDC.HandleCallback
+	}
+
+	forwardHeaders := func(r *http.Request) {
+		applyForwardHeaders(r, ep)
+	}
+
+	return middleware.MapDeps{
+		builtin.DepHintConsumerL7:        func() any { return hintConsumer },
+		builtin.DepReservedPathCallback:  func() any { return reservedCallback },
+		builtin.DepACMEHandler:           func() any { return l7.ACMEHandlerFn(acmeHandler) },
+		builtin.DepArrivedViaTLS:         func() any { return l7.ArrivedViaTLSFn(RequestArrivedViaTLS) },
+		builtin.DepPathAuthSnapshot:      func() any { return pathAuthSnapshot },
+		builtin.DepCookieContext:         func() any { return cookieContext },
+		builtin.DepOIDCAuthorizeSnapshot: func() any { return authSnapshot },
+		builtin.DepForwardHeaders:        func() any { return forwardHeaders },
+		builtin.DepNeedsMarker:           func() any { return l7.NeedsMarkerFn(needsEmbeddedMarker) },
+		builtin.DepMarkerCookie:          func() any { return l7.MarkerCookieFn(l7.EmbeddedMarkerSetCookie) },
+	}
 }
 
 // StopAll stops all listeners
