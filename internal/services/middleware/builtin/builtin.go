@@ -75,21 +75,27 @@ const (
 // per Registry (services package wires this in NewProxyManager).
 func RegisterDefaults(reg *middleware.Registry) {
 	// L4 (TCP) canonical chain order:
-	//   conn_metrics → hint_consumer_l4 → connection_auth (gated) → ...rules
-	// conn_metrics is OUTERMOST so its Received counter sees every conn at
-	// L4 chain entry (pre-decision intake) per plan §D19 F9 fix —
-	// operators need intake rate for storm detection, not admit rate.
-	// Effective accept = Received − sum(Denied per IP). hint_consumer_l4
-	// runs next so connection_auth (and any operator-listed ip_allowlist /
-	// ip_rate_limit appended after) can read the resolved hint via
-	// EffectiveSourceIP.
-	reg.RegisterCanonical(NameConnMetrics, middleware.LayerL4, factoryConnMetrics)
+	//   hint_consumer_l4 → conn_metrics → connection_auth (gated) → ...rules
+	//
+	// hint_consumer_l4 is outermost so it installs the sync.Once+retry
+	// resolver on ctx.Hint BEFORE any downstream call to EffectiveSourceIP.
+	// This is purely a setup-time concern — the lookup is lazy (deferred
+	// until first .Hint() call) and only TrustedLoopback connections incur
+	// the retry budget; intake counters still see "every conn that arrived
+	// at L4" because conn_metrics still runs before any rule deny.
+	//
+	// conn_metrics records Received counters keyed by the resolved IP —
+	// matches the per-IP arithmetic identity Effective accept = Received −
+	// sum(Denied per IP) used downstream by rule middlewares
+	// (connection_auth + operator-listed ip_allowlist / ip_rate_limit).
+	// Without the resolved IP at intake time, race-window conns would be
+	// labeled with the loopback fallback and the math would break.
 	reg.RegisterCanonical(NameHintConsumerL4, middleware.LayerL4, factoryHintConsumerL4)
+	reg.RegisterCanonical(NameConnMetrics, middleware.LayerL4, factoryConnMetrics)
 	reg.RegisterCanonical(middleware.NameConnectionAuth, middleware.LayerL4, factoryConnectionAuth) // conditionally canonical
 
-	// L4UDP canonical mirror — same intake-counter-first ordering. UDP has
-	// no hint_consumer (datagrams don't traverse the secure-loopback hop
-	// today; ConnContext.Hint is L4-only).
+	// L4UDP canonical mirror. UDP has no hint_consumer (datagrams don't
+	// traverse the secure-loopback hop today; ConnContext.Hint is L4-only).
 	reg.RegisterCanonical(NameConnMetricsUDP, middleware.LayerL4UDP, factoryConnMetricsUDP)
 	reg.RegisterCanonical(NameConnectionAuthUDP, middleware.LayerL4UDP, factoryConnectionAuthUDP) // conditionally canonical
 

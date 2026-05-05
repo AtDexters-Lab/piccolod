@@ -57,7 +57,9 @@ func TestRegisterDefaults_buildsFullChain(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	// L4 without ConnectionAuth: hint_consumer_l4 + conn_metrics. 2 entries.
+	// L4 without ConnectionAuth: hint_consumer_l4 + conn_metrics, in that
+	// canonical order (outermost first per builtin.go RegisterDefaults
+	// rationale). 2 entries.
 	if len(got.L4) != 2 {
 		t.Fatalf("L4 chain length (no ConnectionAuth): got %d, want 2", len(got.L4))
 	}
@@ -92,7 +94,7 @@ func TestRegisterDefaults_connectionAuthGated(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 	if len(got.L4) != 3 {
-		t.Errorf("L4 chain length with ConnectionAuth: got %d, want 3 (hint_consumer_l4 + connection_auth + conn_metrics)", len(got.L4))
+		t.Errorf("L4 chain length with ConnectionAuth: got %d, want 3 (hint_consumer_l4 + conn_metrics + connection_auth)", len(got.L4))
 	}
 	if len(got.L4UDP) != 2 {
 		t.Errorf("L4UDP chain length with ConnectionAuth: got %d, want 2 (connection_auth_udp + conn_metrics_udp)", len(got.L4UDP))
