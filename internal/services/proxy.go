@@ -472,8 +472,9 @@ func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
 	// Step 5 lands the canonical L4 entries (ip_allowlist, ip_rate_limit,
 	// conn_metrics, hint_consumer_l4) and step 6 adds connection_auth.
 	l4Mws, err := p.registry.BuildL4(middleware.BuildSpec{
-		Endpoint: mwEndpoint,
-		Deps:     p.buildL4Deps(ep),
+		Endpoint:          mwEndpoint,
+		HasConnectionAuth: ep.ConnectionAuth != nil,
+		Deps:              p.buildL4Deps(ep),
 	})
 	if err != nil {
 		log.Printf("ERROR: registry.BuildL4 for app=%s listener=%s: %v", ep.App, ep.Name, err)
@@ -565,8 +566,9 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	// listener loops. With no L4 factories registered today, the chain is
 	// empty and Accept behavior is identical to the underlying listener.
 	l4Mws, err := p.registry.BuildL4(middleware.BuildSpec{
-		Endpoint: mwEndpoint,
-		Deps:     p.buildL4Deps(ep),
+		Endpoint:          mwEndpoint,
+		HasConnectionAuth: ep.ConnectionAuth != nil,
+		Deps:              p.buildL4Deps(ep),
 	})
 	if err != nil {
 		log.Printf("ERROR: registry.BuildL4 for app=%s listener=%s: %v", ep.App, ep.Name, err)

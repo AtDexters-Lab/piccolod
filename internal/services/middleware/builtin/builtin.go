@@ -71,11 +71,15 @@ const (
 // chain factories plus the operator-listable IP-rule built-ins. Call once
 // per Registry (services package wires this in NewProxyManager).
 func RegisterDefaults(reg *middleware.Registry) {
-	// L4 (TCP) canonical — outermost first.
-	reg.RegisterCanonical(NameConnMetrics, middleware.LayerL4, factoryConnMetrics)
+	// L4 (TCP) canonical chain order per plan §D7:
+	//   hint_consumer_l4 → connection_auth (gated) → conn_metrics
+	// Outermost first; innermost (conn_metrics) records counts post-decision.
 	reg.RegisterCanonical(NameHintConsumerL4, middleware.LayerL4, factoryHintConsumerL4)
+	reg.RegisterCanonical(middleware.NameConnectionAuth, middleware.LayerL4, factoryConnectionAuth) // conditionally canonical
+	reg.RegisterCanonical(NameConnMetrics, middleware.LayerL4, factoryConnMetrics)
 
-	// L4UDP canonical.
+	// L4UDP canonical mirror — same order, UDP variant.
+	reg.RegisterCanonical(middleware.NameConnectionAuth+"_udp", middleware.LayerL4UDP, factoryConnectionAuthUDP) // conditionally canonical
 	reg.RegisterCanonical(NameConnMetrics+"_udp", middleware.LayerL4UDP, factoryConnMetricsUDP)
 
 	// L4 / L4UDP operator-listable IP-rule middlewares. Both layers share a
@@ -119,6 +123,16 @@ func factoryConnMetrics(_ map[string]any, _ middleware.EndpointInfo, deps middle
 		return nil, fmt.Errorf("conn_metrics: missing dep %q", DepMetricsRegistry)
 	}
 	return l4.ConnMetrics(reg), nil
+}
+
+func factoryConnectionAuth(_ map[string]any, ep middleware.EndpointInfo, deps middleware.RegistryDeps, _ middleware.Layer) (any, error) {
+	metrics, _ := deps.Get(DepMetricsRegistry).(*l4.MetricsRegistry)
+	return l4.ConnectionAuth(ep.ConnectionAuth, metrics)
+}
+
+func factoryConnectionAuthUDP(_ map[string]any, ep middleware.EndpointInfo, deps middleware.RegistryDeps, _ middleware.Layer) (any, error) {
+	metrics, _ := deps.Get(DepMetricsRegistry).(*l4.MetricsRegistry)
+	return l4.ConnectionAuthUDP(ep.ConnectionAuth, metrics)
 }
 
 func factoryConnMetricsUDP(_ map[string]any, _ middleware.EndpointInfo, deps middleware.RegistryDeps, _ middleware.Layer) (any, error) {

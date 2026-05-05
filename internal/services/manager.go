@@ -268,6 +268,7 @@ func buildEndpoint(appName string, l api.AppListener, hostBind, publicPort int, 
 		Middleware:       l.Middleware,
 		RemotePorts:      defaultRemotePorts(l),
 		Auth:             l.Auth,
+		ConnectionAuth:   l.ConnectionAuth,
 		PortClaim:        l.PortClaim,
 	}
 }
@@ -1262,7 +1263,33 @@ func proxyConfigChanged(old, cur ServiceEndpoint) bool {
 	return old.Flow != cur.Flow ||
 		old.Protocol != cur.Protocol ||
 		!middlewareEqual(old.Middleware, cur.Middleware) ||
-		!authEqual(old.Auth, cur.Auth)
+		!authEqual(old.Auth, cur.Auth) ||
+		!connectionAuthEqual(old.ConnectionAuth, cur.ConnectionAuth)
+}
+
+// connectionAuthEqual compares two ConnectionAuth pointers for equality.
+// Per plan §D17 upgrade-churn fix (F10): nil and an explicit
+// {Default:"allow", Rules:nil} compare equal — both encode the same
+// "implicit allow, no rules" semantics. Default="" normalizes to "allow".
+// Rules:nil and Rules:[] also compare equal (sibling-shape consistency
+// per F-It3-D, mirrors middlewareEqual's `len(nil) == len([])`).
+func connectionAuthEqual(a, b *api.ConnectionAuth) bool {
+	return connectionAuthDefault(a) == connectionAuthDefault(b) &&
+		slices.Equal(connectionAuthRules(a), connectionAuthRules(b))
+}
+
+func connectionAuthDefault(a *api.ConnectionAuth) string {
+	if a == nil || a.Default == "" {
+		return "allow"
+	}
+	return a.Default
+}
+
+func connectionAuthRules(a *api.ConnectionAuth) []api.ConnectionAuthRule {
+	if a == nil {
+		return nil
+	}
+	return a.Rules
 }
 
 // authEqual compares two ListenerAuth pointers for equality.

@@ -50,6 +50,11 @@ type EndpointInfo struct {
 	// via spec.HasAuth). Held as a pointer to match the api.AppListener.Auth
 	// shape and keep the empty case zero-cost.
 	Auth *api.ListenerAuth
+
+	// ConnectionAuth carries the listener's L4 IP-based access rules. nil
+	// when the listener declares no rules (connection_auth canonical entry
+	// is gated on ConnectionAuth != nil via spec.HasConnectionAuth).
+	ConnectionAuth *api.ConnectionAuth
 }
 
 // ConnContext is the per-connection context passed to L4 middlewares.

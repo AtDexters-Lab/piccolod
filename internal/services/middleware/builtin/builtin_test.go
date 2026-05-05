@@ -57,13 +57,13 @@ func TestRegisterDefaults_buildsFullChain(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	// L4: conn_metrics + hint_consumer_l4 (canonical, always-on). 2 entries.
+	// L4 without ConnectionAuth: hint_consumer_l4 + conn_metrics. 2 entries.
 	if len(got.L4) != 2 {
-		t.Fatalf("L4 chain length: got %d, want 2", len(got.L4))
+		t.Fatalf("L4 chain length (no ConnectionAuth): got %d, want 2", len(got.L4))
 	}
-	// L4UDP: conn_metrics_udp only. 1 entry.
+	// L4UDP without ConnectionAuth: conn_metrics_udp only. 1 entry.
 	if len(got.L4UDP) != 1 {
-		t.Fatalf("L4UDP chain length: got %d, want 1", len(got.L4UDP))
+		t.Fatalf("L4UDP chain length (no ConnectionAuth): got %d, want 1", len(got.L4UDP))
 	}
 	// All 10 canonical L7 entries when HasAuth=true.
 	if len(got.L7) != 10 {
@@ -72,6 +72,30 @@ func TestRegisterDefaults_buildsFullChain(t *testing.T) {
 	// All 4 response-side entries.
 	if len(got.L7Response) != 4 {
 		t.Fatalf("L7Response chain length: got %d, want 4", len(got.L7Response))
+	}
+}
+
+// TestRegisterDefaults_connectionAuthGated verifies the conditionally-
+// canonical connection_auth entry composes only when HasConnectionAuth.
+// Composition-blindness check: chain length grows by exactly one on each
+// layer (L4 + L4UDP).
+func TestRegisterDefaults_connectionAuthGated(t *testing.T) {
+	reg := middleware.NewRegistry()
+	RegisterDefaults(reg)
+
+	got, err := reg.Build(middleware.BuildSpec{
+		Endpoint:          middleware.EndpointInfo{App: "test", Listener: "test"},
+		HasConnectionAuth: true,
+		Deps:              stubDeps(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(got.L4) != 3 {
+		t.Errorf("L4 chain length with ConnectionAuth: got %d, want 3 (hint_consumer_l4 + connection_auth + conn_metrics)", len(got.L4))
+	}
+	if len(got.L4UDP) != 2 {
+		t.Errorf("L4UDP chain length with ConnectionAuth: got %d, want 2 (connection_auth_udp + conn_metrics_udp)", len(got.L4UDP))
 	}
 }
 

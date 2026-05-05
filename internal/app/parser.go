@@ -1322,6 +1322,28 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 			}
 		}
 
+		// RFC 20260112 §ConnectionAuth: L4 IP-based access rules. Permitted on
+		// every flow including UDP (per plan §D6 / §D12). Rules must carry
+		// strategy ∈ {allow, deny} and a parseable CIDR.
+		if l.ConnectionAuth != nil {
+			if d := strings.TrimSpace(l.ConnectionAuth.Default); d != "" && d != "allow" && d != "deny" {
+				return newValidationError("INVALID_CONN_AUTH_DEFAULT", fmt.Sprintf("listener '%s' connection_auth.default must be \"allow\" or \"deny\", got %q", l.Name, d))
+			}
+			for j, rule := range l.ConnectionAuth.Rules {
+				strategy := strings.TrimSpace(rule.Strategy)
+				if strategy != "allow" && strategy != "deny" {
+					return newValidationError("INVALID_CONN_AUTH_STRATEGY", fmt.Sprintf("listener '%s' connection_auth.rules[%d].strategy must be \"allow\" or \"deny\", got %q", l.Name, j, rule.Strategy))
+				}
+				match := strings.TrimSpace(rule.Match)
+				if match == "" {
+					return newValidationError("INVALID_CONN_AUTH_MATCH", fmt.Sprintf("listener '%s' connection_auth.rules[%d].match is required", l.Name, j))
+				}
+				if _, _, err := net.ParseCIDR(match); err != nil {
+					return newValidationError("INVALID_CONN_AUTH_MATCH", fmt.Sprintf("listener '%s' connection_auth.rules[%d].match: invalid CIDR %q: %v", l.Name, j, rule.Match, err))
+				}
+			}
+		}
+
 		// port_claim validation
 		if l.PortClaim != nil {
 			pc := *l.PortClaim

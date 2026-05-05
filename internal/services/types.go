@@ -41,6 +41,7 @@ type ServiceEndpoint struct {
 	RemotePorts      []int                       `json:"remote_ports"`
 	LocalURL         string                      `json:"local_url,omitempty"` // Optional pre-calculated LAN URL
 	Auth             *api.ListenerAuth           `json:"auth,omitempty"`
+	ConnectionAuth   *api.ConnectionAuth         `json:"connection_auth,omitempty"`
 	PortClaim        *int                        `json:"port_claim,omitempty"` // Well-known port to bind on LAN (and claim on relay)
 }
 
@@ -63,5 +64,6 @@ func (e ServiceEndpoint) AsMiddlewareInfo() middleware.EndpointInfo {
 		Protocol:         e.Protocol,
 		DerivedHostLabel: e.DerivedHostLabel,
 		Auth:             e.Auth,
+		ConnectionAuth:   e.ConnectionAuth,
 	}
 }

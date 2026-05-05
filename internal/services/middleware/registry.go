@@ -292,7 +292,7 @@ func buildLayer[M any](r *Registry, spec BuildSpec, layer Layer) ([]M, error) {
 // rather than continuing to grow the switch + Has* fields.
 func canonicalApplies(name string, spec BuildSpec) bool {
 	switch name {
-	case NameConnectionAuth:
+	case NameConnectionAuth, NameConnectionAuth + "_udp":
 		return spec.HasConnectionAuth
 	case NamePathAuth:
 		return spec.HasAuth

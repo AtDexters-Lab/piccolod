@@ -129,8 +129,9 @@ func (p *ProxyManager) startUDPProxy(ep ServiceEndpoint) {
 
 	mwEndpoint := ep.AsMiddlewareInfo()
 	udpMws, err := p.registry.BuildL4UDP(middleware.BuildSpec{
-		Endpoint: mwEndpoint,
-		Deps:     p.buildL4Deps(ep),
+		Endpoint:          mwEndpoint,
+		HasConnectionAuth: ep.ConnectionAuth != nil,
+		Deps:              p.buildL4Deps(ep),
 	})
 	if err != nil {
 		log.Printf("ERROR: registry.BuildL4UDP for app=%s listener=%s: %v", ep.App, ep.Name, err)
