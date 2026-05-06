@@ -250,15 +250,16 @@ type AppDefinition struct {
 
 // AppListener defines a named service exposed by the app (service-oriented model)
 type AppListener struct {
-	Name        string                  `yaml:"name" json:"name"`
-	GuestPort   int                     `yaml:"guest_port" json:"guest_port"`
-	Flow        ListenerFlow            `yaml:"flow,omitempty" json:"flow,omitempty"`
-	Protocol    ListenerProtocol        `yaml:"protocol,omitempty" json:"protocol,omitempty"`
-	Primary     bool                    `yaml:"primary,omitempty" json:"primary,omitempty"` // Set programmatically when __primary is substituted. RFC 20260130.
-	Middleware  []AppProtocolMiddleware `yaml:"protocol_middleware,omitempty" json:"protocol_middleware,omitempty"`
-	RemotePorts []int                   `yaml:"remote_ports,omitempty" json:"remote_ports,omitempty"`
-	Auth        *ListenerAuth           `yaml:"auth,omitempty" json:"auth,omitempty"`
-	PortClaim   *int                    `yaml:"port_claim,omitempty" json:"port_claim,omitempty"`
+	Name           string                  `yaml:"name" json:"name"`
+	GuestPort      int                     `yaml:"guest_port" json:"guest_port"`
+	Flow           ListenerFlow            `yaml:"flow,omitempty" json:"flow,omitempty"`
+	Protocol       ListenerProtocol        `yaml:"protocol,omitempty" json:"protocol,omitempty"`
+	Primary        bool                    `yaml:"primary,omitempty" json:"primary,omitempty"` // Set programmatically when __primary is substituted. RFC 20260130.
+	Middleware     []AppProtocolMiddleware `yaml:"protocol_middleware,omitempty" json:"protocol_middleware,omitempty"`
+	RemotePorts    []int                   `yaml:"remote_ports,omitempty" json:"remote_ports,omitempty"`
+	Auth           *ListenerAuth           `yaml:"auth,omitempty" json:"auth,omitempty"`
+	ConnectionAuth *ConnectionAuth         `yaml:"connection_auth,omitempty" json:"connection_auth,omitempty"`
+	PortClaim      *int                    `yaml:"port_claim,omitempty" json:"port_claim,omitempty"`
 }
 
 // TransportProtocol returns the OS-level transport protocol for this flow.
@@ -268,6 +269,26 @@ func (f ListenerFlow) TransportProtocol() string {
 		return "udp"
 	}
 	return "tcp"
+}
+
+// LanHostBasedEligible reports whether a listener can be reached on LAN via
+// the host-based proxy (gin's lanHostRoutingMiddleware) on 127.0.0.1:443.
+// The host-based path is HTTP-only — piccolod terminates TLS for the
+// portal cert and routes to the matching listener via gin. Listeners that
+// don't speak HTTP/Websocket can't traverse this path:
+//
+//   - flow:tls (passthrough): piccolod doesn't terminate TLS for the
+//     listener, so gin can't decode the request.
+//   - flow:tcp + protocol:raw: backend is raw bytes, not HTTP. Routed via
+//     the TLS mux SNI path instead (added in plan §D8).
+//   - flow:udp: UDP can't reach gin (HTTP server is TCP-only).
+//
+// Per RFC 20260316 + plan §D8/§D9/§D10.
+func LanHostBasedEligible(flow ListenerFlow, protocol ListenerProtocol) bool {
+	if flow != FlowTCP {
+		return false
+	}
+	return protocol == ListenerProtocolHTTP || protocol == ListenerProtocolWebsocket
 }
 
 // PortClaimInfo describes an active port claim for cross-package communication
@@ -288,6 +309,29 @@ type ListenerAuthRule struct {
 	Path     string `yaml:"path" json:"path"`
 	Type     string `yaml:"type" json:"type"`         // exact | prefix | pattern
 	Strategy string `yaml:"strategy" json:"strategy"` // oidc_passthrough | headers | protected | public
+}
+
+// ConnectionAuth configures L4 IP-based access rules for a listener (per
+// plan §D6). Composes via the registry as the canonical `connection_auth`
+// L4 / L4UDP middleware when the field is non-nil. Permitted on every flow
+// — TCP, TLS-passthrough, UDP — providing firewall-style protection at the
+// network edge before any L7 routing.
+type ConnectionAuth struct {
+	// Default is "allow" or "deny" — applied when no rule matches. Defaults
+	// to "allow" (preserves the existing implicit-allow behavior). Per
+	// plan §D17 upgrade-churn: nil ConnectionAuth and an explicit
+	// {Default:"allow", Rules:nil} compare equal.
+	Default string `yaml:"default,omitempty" json:"default,omitempty"`
+
+	// Rules are evaluated in declaration order; first match wins. Falls
+	// through to Default when nothing matches.
+	Rules []ConnectionAuthRule `yaml:"rules,omitempty" json:"rules,omitempty"`
+}
+
+// ConnectionAuthRule matches a single source-IP CIDR and emits a verdict.
+type ConnectionAuthRule struct {
+	Match    string `yaml:"match" json:"match"`       // CIDR (IPv4 or IPv6)
+	Strategy string `yaml:"strategy" json:"strategy"` // "allow" | "deny"
 }
 
 // AppProtocolMiddleware defines protocol-specific middleware entry

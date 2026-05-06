@@ -3,6 +3,8 @@ package services
 import (
 	"testing"
 	"time"
+
+	"piccolod/internal/api"
 )
 
 func TestStatusWorseThan(t *testing.T) {
@@ -279,8 +281,11 @@ func TestResolveCertificatesForListener(t *testing.T) {
 			wantRequired:  true,
 		},
 		{
-			name:          "raw listener (no derived host)",
-			ep:            ServiceEndpoint{Name: "tcp", DerivedHostLabel: ""},
+			// flow:udp is the only flow that does NOT get a DerivedHostLabel
+			// (port-based routing only). flow:tcp+protocol:raw used to be
+			// excluded too, but plan §D8 makes it host-routable via TLS mux SNI.
+			name:          "udp listener (no derived host)",
+			ep:            ServiceEndpoint{Name: "udp", Flow: api.FlowUDP, DerivedHostLabel: ""},
 			remoteEnabled: true,
 			solver:        "dns-01",
 			portalHost:    "example.com",

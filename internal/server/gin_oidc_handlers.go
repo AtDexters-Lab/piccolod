@@ -18,6 +18,7 @@ import (
 
 	"piccolod/internal/oidc"
 	"piccolod/internal/services"
+	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 )
 
 // getOIDCClientManager helper to get client manager from persistence
@@ -107,7 +108,7 @@ func (s *GinServer) resolveAppRedirectURI(ctx context.Context, appID string) ([]
 
 	// RFC 20260122 §5.3: Include proxy OIDC callback path for apps using headers/protected strategies.
 	if s.appUsesProxyAuth(ctx, appID) {
-		paths = append(paths, services.ProxyOIDCCallbackPath)
+		paths = append(paths, l7oidc.CallbackPath)
 	}
 
 	if len(paths) == 0 {
@@ -749,7 +750,7 @@ func (s *GinServer) getOIDCProvider() (*oidc.Provider, error) {
 
 // proxyOIDCExchangeCode performs the OIDC token exchange for proxy clients per RFC 20260122 §5.6.
 // This is a back-channel request from the proxy OIDC handler to the OIDC provider.
-func (s *GinServer) proxyOIDCExchangeCode(ctx context.Context, code, redirectURI, codeVerifier string) (*services.ExchangeResult, error) {
+func (s *GinServer) proxyOIDCExchangeCode(ctx context.Context, code, redirectURI, codeVerifier string) (*l7oidc.ExchangeResult, error) {
 	p, err := s.getOIDCProvider()
 	if err != nil {
 		return nil, fmt.Errorf("OIDC provider unavailable: %w", err)
@@ -791,7 +792,7 @@ func (s *GinServer) proxyOIDCExchangeCode(ctx context.Context, code, redirectURI
 		portalSessionID = ar.PortalSessionID
 	}
 
-	return &services.ExchangeResult{
+	return &l7oidc.ExchangeResult{
 		AccessToken:     accessToken,
 		TokenType:       "Bearer",
 		ExpiresIn:       3600,
@@ -800,7 +801,7 @@ func (s *GinServer) proxyOIDCExchangeCode(ctx context.Context, code, redirectURI
 }
 
 // proxyOIDCGetUserInfo retrieves user info for proxy OIDC flow per RFC 20260122 §5.6.
-func (s *GinServer) proxyOIDCGetUserInfo(ctx context.Context, accessToken string) (*services.UserInfoResult, error) {
+func (s *GinServer) proxyOIDCGetUserInfo(ctx context.Context, accessToken string) (*l7oidc.UserInfoResult, error) {
 	p, err := s.getOIDCProvider()
 	if err != nil {
 		return nil, fmt.Errorf("OIDC provider unavailable: %w", err)
@@ -813,7 +814,7 @@ func (s *GinServer) proxyOIDCGetUserInfo(ctx context.Context, accessToken string
 		return nil, fmt.Errorf("user not found: %w", err)
 	}
 
-	return &services.UserInfoResult{
+	return &l7oidc.UserInfoResult{
 		Sub:      user.ID,
 		Username: user.Username,
 		Email:    user.Email,

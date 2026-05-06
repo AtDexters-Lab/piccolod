@@ -1,4 +1,4 @@
-package services
+package l7
 
 import (
 	"net/http"
@@ -8,13 +8,16 @@ import (
 	"piccolod/internal/api"
 )
 
-// normalizeAndSetRequestPath applies RFC 20260112 path handling rules.
+// NormalizeAndSetRequestPath applies RFC 20260112 path handling rules.
 //
 // It returns a cleaned path that MUST be used for both rule matching and forwarding.
 // On error, it returns an error code suitable for proxy JSON responses:
-// - "INVALID_PATH" for malformed/unsafe raw paths
-// - "PATH_INVALID" for normalization failures (e.g., traversal above root)
-func normalizeAndSetRequestPath(r *http.Request) (string, string) {
+//   - "INVALID_PATH" for malformed/unsafe raw paths
+//   - "PATH_INVALID" for normalization failures (e.g., traversal above root)
+//
+// Used by the path_normalize middleware factory in path_normalize.go to produce
+// the in-place mutation per the §H path-representation contract.
+func NormalizeAndSetRequestPath(r *http.Request) (string, string) {
 	if r == nil || r.URL == nil {
 		return "", "INVALID_PATH"
 	}
@@ -100,8 +103,13 @@ func violatesRootTraversal(p string) bool {
 	return false
 }
 
-func listenerStrategyForPath(auth *api.ListenerAuth, requestPath string) string {
-	// RFC 4.1.1: auth omitted → all protected.
+// ListenerStrategyForPath resolves the listener auth strategy for a request path
+// against the listener's auth rules. RFC 4.1.1: auth omitted → all "protected";
+// no rule matches → "protected"; first matching rule wins.
+//
+// Used by the path_auth middleware to choose between protected, headers,
+// oidc_passthrough, and public branches.
+func ListenerStrategyForPath(auth *api.ListenerAuth, requestPath string) string {
 	if auth == nil || len(auth.Rules) == 0 {
 		return "protected"
 	}
@@ -130,6 +138,5 @@ func listenerStrategyForPath(auth *api.ListenerAuth, requestPath string) string 
 		}
 	}
 
-	// RFC 4.1.1: no match → protected.
 	return "protected"
 }

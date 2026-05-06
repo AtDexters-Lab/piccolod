@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"piccolod/internal/api"
 	"piccolod/internal/events"
 )
 
@@ -360,8 +361,8 @@ func TestHandleServiceEndpointsChanged_AddLabels(t *testing.T) {
 	payload := events.ServiceEndpointsChanged{
 		App: "myapp",
 		Added: []events.ServiceEndpointInfo{
-			{App: "myapp", Name: "web", DerivedHostLabel: "myapp"},
-			{App: "myapp", Name: "api", DerivedHostLabel: "api-myapp"},
+			{App: "myapp", Name: "web", DerivedHostLabel: "myapp", Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
+			{App: "myapp", Name: "api", DerivedHostLabel: "api-myapp", Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
 		},
 		Removed: nil,
 	}
@@ -433,10 +434,10 @@ func TestHandleServiceEndpointsChanged_MergeDelta(t *testing.T) {
 	payload := events.ServiceEndpointsChanged{
 		App: "myapp",
 		Added: []events.ServiceEndpointInfo{
-			{App: "myapp", Name: "db", DerivedHostLabel: "db-myapp"},
+			{App: "myapp", Name: "db", DerivedHostLabel: "db-myapp", Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
 		},
 		Removed: []events.ServiceEndpointInfo{
-			{App: "myapp", Name: "api", DerivedHostLabel: "api-myapp"},
+			{App: "myapp", Name: "api", DerivedHostLabel: "api-myapp", Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
 		},
 	}
 
@@ -496,7 +497,7 @@ func TestDebouncedAnnouncement(t *testing.T) {
 		payload := events.ServiceEndpointsChanged{
 			App: fmt.Sprintf("app%d", i),
 			Added: []events.ServiceEndpointInfo{
-				{App: fmt.Sprintf("app%d", i), Name: "web", DerivedHostLabel: fmt.Sprintf("app%d", i)},
+				{App: fmt.Sprintf("app%d", i), Name: "web", DerivedHostLabel: fmt.Sprintf("app%d", i), Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
 			},
 		}
 		manager.handleServiceEndpointsChanged(payload)

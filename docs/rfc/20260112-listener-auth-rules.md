@@ -947,17 +947,86 @@ The parser will reject valid manifests containing the legacy `auth` block with a
 - **PKCE required:** All OIDC flows require PKCE.
 - **Redirect URI validation:** External URLs rejected; `next` param limited to same-origin.
 
-## 11. Future Enhancements
+## 11. ConnectionAuth (L4 IP-based access control)
 
-### 11.1 App-Driven User Provisioning
+Per RFC 20260505 §3.4, the `auth` block defined above operates at L7 (path
++ HTTP request). A complementary `connection_auth` block on the listener
+provides L4 IP-based access control that runs BEFORE TLS termination. It
+is permitted on every flow including `flow: tls` (passthrough) and
+`flow: udp` — paths where the L7 `auth` block isn't applicable because
+piccolod doesn't decode the request payload.
+
+### 11.1 Schema
+
+```yaml
+listeners:
+  - name: api
+    flow: tcp
+    protocol: http
+    connection_auth:
+      default: deny
+      rules:
+        - match: 192.168.0.0/16
+          strategy: allow
+        - match: 192.168.0.42/32
+          strategy: deny
+```
+
+- `default`: `"allow"` (default — preserves implicit-allow behavior) or
+  `"deny"`.
+- `rules[]`: evaluated in declaration order; first match wins; falls
+  through to `default` when nothing matches.
+- `rules[].match`: CIDR (IPv4 or IPv6).
+- `rules[].strategy`: `"allow"` or `"deny"`.
+
+### 11.2 Semantics
+
+When the field is non-nil, the registry composes the `connection_auth`
+canonical L4 / L4UDP middleware automatically — no need to also list it
+under `Middleware[]`. Symmetric to how this RFC's `auth` block composes
+the `path_auth` middleware.
+
+The middleware reads
+`internal/services/middleware/EffectiveSourceIP(ctx)`, which honors the
+TrustedLoopback gate: connections relayed via the TLS mux carry the
+real-client IP via `ConnContext.Hint`, which overrides the loopback
+`SourceAddr`. Unresolvable source IP is fail-closed (deny) regardless of
+`default`.
+
+Denied connections are closed at L4 before any handler runs. A deny event
+is recorded by the `conn_metrics` registry with reason `"connection_auth"`
+and labels `{listener, source_ip}`.
+
+### 11.3 Coexistence with `auth`
+
+`auth` (path-based, L7) and `connection_auth` (IP-based, L4) coexist. L4
+evaluates first; if L4 denies, the connection drops before TLS termination.
+L7 path rules apply only after L4 admits. Apps with `connection_auth` get
+firewall-style protection at the network edge.
+
+For `flow: tls` listeners (passthrough), only `connection_auth` is
+applicable — `auth.rules` cannot be evaluated without HTTP visibility.
+The parser already rejects `auth` on `flow: tls` (existing behavior).
+The parser permits `connection_auth` on any flow including UDP.
+
+### 11.4 Reconcile equality
+
+`nil` and `{Default: "allow", Rules: nil}` compare equal (no spurious
+chain rebuild on YAML-roundtrip variation per RFC 20260505 plan §D17).
+`Rules: nil` and `Rules: []` also compare equal (sibling-shape
+consistency with existing `middlewareEqual`).
+
+## 12. Future Enhancements
+
+### 12.1 App-Driven User Provisioning
 
 Apps could notify Piccolo when they invite external users. Deferred to future RFC.
 
-### 11.2 Access Policies
+### 12.2 Access Policies
 
 Future RFCs may introduce richer access policies (e.g., allow specific user groups per path) within the `rules` block.
 
-## 12. Implementation Notes & Status
+## 13. Implementation Notes & Status
 
 - **Status:** Draft
 - **Depends on:** RFC 20260106 (Native OIDC Auth), RFC 20260102 (Multi-Container Apps)

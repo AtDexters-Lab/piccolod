@@ -220,12 +220,14 @@ func TestResolvePrimaryListener(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "implicit primary - skip raw",
+			// Plan §D8: tcp+raw is now host-routable, so it's a valid implicit
+			// primary. Auto-select picks the first non-UDP listener.
+			name: "implicit primary - tcp raw is now eligible",
 			listeners: []api.AppListener{
 				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP},
 				{Name: "web", Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTCP},
 			},
-			want:    "web",
+			want:    "tcp",
 			wantErr: false,
 		},
 		{
@@ -238,21 +240,13 @@ func TestResolvePrimaryListener(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "implicit primary - skip raw tcp only",
+			// Plan §D8: every listener is auto-primary-eligible. First wins.
+			name: "implicit primary - first listener wins",
 			listeners: []api.AppListener{
+				{Name: "dns", Protocol: api.ListenerProtocolRaw, Flow: api.FlowUDP},
 				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP},
-				{Name: "secure", Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTLS},
 			},
-			want:    "secure",
-			wantErr: false,
-		},
-		{
-			name: "no eligible primary - all raw tcp",
-			listeners: []api.AppListener{
-				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP},
-				{Name: "tcp2", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP},
-			},
-			want:    "",
+			want:    "dns",
 			wantErr: false,
 		},
 		{
@@ -272,7 +266,18 @@ func TestResolvePrimaryListener(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "primary on udp - allowed",
+			// Plan §D8: tcp+raw + Primary is now allowed. The TLS mux
+			// terminates TLS for the client by SNI and proxies raw bytes to
+			// the backend.
+			name: "primary on raw tcp - allowed (plan §D8)",
+			listeners: []api.AppListener{
+				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP, Primary: true},
+			},
+			want:    "tcp",
+			wantErr: false,
+		},
+		{
+			name: "primary on udp - allowed (explicit)",
 			listeners: []api.AppListener{
 				{Name: "dns", Protocol: api.ListenerProtocolRaw, Flow: api.FlowUDP, Primary: true},
 			},
@@ -280,13 +285,7 @@ func TestResolvePrimaryListener(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "primary on raw tcp - rejected",
-			listeners: []api.AppListener{
-				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP, Primary: true},
-			},
-			wantErr: true,
-		},
-		{
+			// Plan §D8: every flow is auto-primary-eligible.
 			name: "implicit primary - udp eligible",
 			listeners: []api.AppListener{
 				{Name: "dns", Protocol: api.ListenerProtocolRaw, Flow: api.FlowUDP},

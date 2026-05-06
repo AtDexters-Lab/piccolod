@@ -1,12 +1,14 @@
 package services
 
 import (
-	"context"
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"piccolod/internal/services/middleware"
+	"piccolod/internal/services/middleware/l7"
 )
 
 func TestShouldPartitionCookies(t *testing.T) {
@@ -131,7 +133,7 @@ func TestShouldPartitionCookies(t *testing.T) {
 				r := httptest.NewRequest(http.MethodGet, "http://homebox-piccolo-xyz.local/", nil)
 				r.Host = "homebox-piccolo-xyz.local"
 				r.Header.Set("Sec-Fetch-Dest", "iframe")
-				r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, connectionHint{isTLS: true}))
+				r = r.WithContext(middleware.ContextWithHint(r.Context(), middleware.Hint{IsTLS: true}))
 				return r
 			},
 			expect: true,
@@ -165,7 +167,7 @@ func TestShouldPartitionCookies(t *testing.T) {
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "homebox-piccolo-xyz.local"
 				r.Header.Set("Sec-Fetch-Dest", "empty")
-				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				r.AddCookie(&http.Cookie{Name: l7.EmbeddedCookieName, Value: "1"})
 				return r
 			},
 			expect: true,
@@ -176,7 +178,7 @@ func TestShouldPartitionCookies(t *testing.T) {
 				r := httptest.NewRequest(http.MethodGet, "http://homebox-piccolo-xyz.local/api/data", nil)
 				r.Host = "homebox-piccolo-xyz.local"
 				r.Header.Set("Sec-Fetch-Dest", "empty")
-				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				r.AddCookie(&http.Cookie{Name: l7.EmbeddedCookieName, Value: "1"})
 				return r
 			},
 			expect: false,
@@ -188,7 +190,7 @@ func TestShouldPartitionCookies(t *testing.T) {
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "piccolo-xyz.local:8080"
 				r.Header.Set("Sec-Fetch-Dest", "empty")
-				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				r.AddCookie(&http.Cookie{Name: l7.EmbeddedCookieName, Value: "1"})
 				return r
 			},
 			expect: false,
@@ -200,7 +202,7 @@ func TestShouldPartitionCookies(t *testing.T) {
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "homebox.example.com"
 				r.Header.Set("Sec-Fetch-Dest", "empty")
-				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				r.AddCookie(&http.Cookie{Name: l7.EmbeddedCookieName, Value: "1"})
 				return r
 			},
 			expect: false,
@@ -213,7 +215,7 @@ func TestShouldPartitionCookies(t *testing.T) {
 				r.Host = "homebox-piccolo-xyz.local"
 				r.Header.Set("Sec-Fetch-Dest", "empty")
 				r.AddCookie(&http.Cookie{Name: "session", Value: "abc"})
-				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				r.AddCookie(&http.Cookie{Name: l7.EmbeddedCookieName, Value: "1"})
 				r.AddCookie(&http.Cookie{Name: "other", Value: "xyz"})
 				return r
 			},
@@ -248,9 +250,9 @@ func TestHasCookieAttribute(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.sc+"_"+tt.attr, func(t *testing.T) {
-			got := hasCookieAttribute(tt.sc, tt.attr)
+			got := l7.HasCookieAttribute(tt.sc, tt.attr)
 			if got != tt.expect {
-				t.Errorf("hasCookieAttribute(%q, %q) = %v, want %v", tt.sc, tt.attr, got, tt.expect)
+				t.Errorf("l7.HasCookieAttribute(%q, %q) = %v, want %v", tt.sc, tt.attr, got, tt.expect)
 			}
 		})
 	}
@@ -302,9 +304,9 @@ func TestRemoveCookieAttribute(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := removeCookieAttribute(tt.sc, tt.attr)
+			got := l7.RemoveCookieAttribute(tt.sc, tt.attr)
 			if got != tt.expect {
-				t.Errorf("removeCookieAttribute(%q, %q) = %q, want %q", tt.sc, tt.attr, got, tt.expect)
+				t.Errorf("l7.RemoveCookieAttribute(%q, %q) = %q, want %q", tt.sc, tt.attr, got, tt.expect)
 			}
 		})
 	}
@@ -347,43 +349,23 @@ func TestEnsurePartitionedAttributes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ensurePartitionedAttributes(tt.sc)
+			got := l7.EnsurePartitionedAttributes(tt.sc)
 			for _, want := range tt.checks {
 				if !strings.Contains(got, want) {
-					t.Errorf("ensurePartitionedAttributes(%q) = %q, missing %q", tt.sc, got, want)
+					t.Errorf("l7.EnsurePartitionedAttributes(%q) = %q, missing %q", tt.sc, got, want)
 				}
 			}
 			for _, nowant := range tt.absent {
 				if strings.Contains(got, nowant) {
-					t.Errorf("ensurePartitionedAttributes(%q) = %q, should not contain %q", tt.sc, got, nowant)
+					t.Errorf("l7.EnsurePartitionedAttributes(%q) = %q, should not contain %q", tt.sc, got, nowant)
 				}
 			}
 			// Verify no duplicate Partitioned attribute
 			count := strings.Count(got, "Partitioned")
 			if count != 1 {
-				t.Errorf("ensurePartitionedAttributes(%q) = %q, has %d occurrences of Partitioned (want 1)", tt.sc, got, count)
+				t.Errorf("l7.EnsurePartitionedAttributes(%q) = %q, has %d occurrences of Partitioned (want 1)", tt.sc, got, count)
 			}
 		})
-	}
-}
-
-func TestProxyContextPartitionCookies(t *testing.T) {
-	// Default context returns false
-	ctx := context.Background()
-	if proxyContextPartitionCookies(ctx) {
-		t.Error("expected false for context without partition key")
-	}
-
-	// Context with true
-	ctx = context.WithValue(ctx, proxyPartitionCookiesContextKey{}, true)
-	if !proxyContextPartitionCookies(ctx) {
-		t.Error("expected true for context with partition=true")
-	}
-
-	// Context with false
-	ctx = context.WithValue(context.Background(), proxyPartitionCookiesContextKey{}, false)
-	if proxyContextPartitionCookies(ctx) {
-		t.Error("expected false for context with partition=false")
 	}
 }
 
@@ -391,14 +373,14 @@ func TestWithProxyContext_PartitionCookies(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
 
 	// partition=true
-	r2 := withProxyContext(r, "homebox", "homebox-piccolo-xyz.local", false, true, false)
-	if !proxyContextPartitionCookies(r2.Context()) {
+	r2 := l7.SetProxyContext(r, "homebox", "homebox-piccolo-xyz.local", false, true, false)
+	if !l7.PartitionCookiesFromContext(r2.Context()) {
 		t.Error("expected partitionCookies=true in context")
 	}
 
 	// partition=false
-	r3 := withProxyContext(r, "homebox", "piccolo-xyz.local", true, false, false)
-	if proxyContextPartitionCookies(r3.Context()) {
+	r3 := l7.SetProxyContext(r, "homebox", "piccolo-xyz.local", true, false, false)
+	if l7.PartitionCookiesFromContext(r3.Context()) {
 		t.Error("expected partitionCookies=false in context")
 	}
 }
@@ -406,13 +388,13 @@ func TestWithProxyContext_PartitionCookies(t *testing.T) {
 func TestWithProxyContext_NeedsMarker(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
 
-	r2 := withProxyContext(r, "homebox", "homebox-piccolo-xyz.local", false, true, true)
-	if !proxyContextNeedsMarker(r2.Context()) {
+	r2 := l7.SetProxyContext(r, "homebox", "homebox-piccolo-xyz.local", false, true, true)
+	if !l7.NeedsMarkerFromContext(r2.Context()) {
 		t.Error("expected needsMarker=true in context")
 	}
 
-	r3 := withProxyContext(r, "homebox", "homebox-piccolo-xyz.local", false, true, false)
-	if proxyContextNeedsMarker(r3.Context()) {
+	r3 := l7.SetProxyContext(r, "homebox", "homebox-piccolo-xyz.local", false, true, false)
+	if l7.NeedsMarkerFromContext(r3.Context()) {
 		t.Error("expected needsMarker=false in context")
 	}
 }
@@ -439,7 +421,7 @@ func TestHasEmbeddedMarker(t *testing.T) {
 			name: "marker present",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
-				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				r.AddCookie(&http.Cookie{Name: l7.EmbeddedCookieName, Value: "1"})
 				return r
 			},
 			expect: true,
@@ -449,7 +431,7 @@ func TestHasEmbeddedMarker(t *testing.T) {
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
 				r.AddCookie(&http.Cookie{Name: "session", Value: "abc"})
-				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				r.AddCookie(&http.Cookie{Name: l7.EmbeddedCookieName, Value: "1"})
 				r.AddCookie(&http.Cookie{Name: "other", Value: "xyz"})
 				return r
 			},
@@ -459,7 +441,7 @@ func TestHasEmbeddedMarker(t *testing.T) {
 			name: "different piccolo cookie (not marker)",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
-				r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "abc"})
+				r.AddCookie(&http.Cookie{Name: l7.SessionCookieName, Value: "abc"})
 				return r
 			},
 			expect: false,
@@ -468,7 +450,7 @@ func TestHasEmbeddedMarker(t *testing.T) {
 			name: "marker with wrong value",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
-				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "wrong"})
+				r.AddCookie(&http.Cookie{Name: l7.EmbeddedCookieName, Value: "wrong"})
 				return r
 			},
 			expect: false,
@@ -477,7 +459,7 @@ func TestHasEmbeddedMarker(t *testing.T) {
 			name: "marker with empty value",
 			setup: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://homebox-piccolo-xyz.local/", nil)
-				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: ""})
+				r.AddCookie(&http.Cookie{Name: l7.EmbeddedCookieName, Value: ""})
 				return r
 			},
 			expect: false,
@@ -485,9 +467,9 @@ func TestHasEmbeddedMarker(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := hasEmbeddedMarker(tt.setup())
+			got := l7.HasEmbeddedMarker(tt.setup())
 			if got != tt.expect {
-				t.Errorf("hasEmbeddedMarker() = %v, want %v", got, tt.expect)
+				t.Errorf("l7.HasEmbeddedMarker() = %v, want %v", got, tt.expect)
 			}
 		})
 	}
@@ -533,7 +515,7 @@ func TestNeedsEmbeddedMarker(t *testing.T) {
 				r.TLS = &tls.ConnectionState{}
 				r.Host = "homebox-piccolo-xyz.local"
 				r.Header.Set("Sec-Fetch-Dest", "empty")
-				r.AddCookie(&http.Cookie{Name: embeddedCookieName, Value: "1"})
+				r.AddCookie(&http.Cookie{Name: l7.EmbeddedCookieName, Value: "1"})
 				return r
 			},
 			expect: false,
@@ -582,9 +564,9 @@ func TestNeedsEmbeddedMarker(t *testing.T) {
 }
 
 func TestEmbeddedMarkerSetCookie(t *testing.T) {
-	sc := embeddedMarkerSetCookie()
+	sc := l7.EmbeddedMarkerSetCookie()
 	required := []string{
-		embeddedCookieName + "=1",
+		l7.EmbeddedCookieName + "=1",
 		"Path=/",
 		"HttpOnly",
 		"Secure",
@@ -593,7 +575,7 @@ func TestEmbeddedMarkerSetCookie(t *testing.T) {
 	}
 	for _, want := range required {
 		if !strings.Contains(sc, want) {
-			t.Errorf("embeddedMarkerSetCookie() = %q, missing %q", sc, want)
+			t.Errorf("l7.EmbeddedMarkerSetCookie() = %q, missing %q", sc, want)
 		}
 	}
 }

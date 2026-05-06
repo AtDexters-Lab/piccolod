@@ -1210,12 +1210,13 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 			}
 			hasPrimaryMarker = true
 
-			// Primary listeners: flow:tcp + protocol:raw is the only rejected combination
-			// (no HTTP semantics for LAN host-based routing, and no TLS/UDP passthrough path).
-			// flow:tls and flow:udp are allowed as primary per RFC 20260316.
-			if l.Flow == api.FlowTCP && l.Protocol == api.ListenerProtocolRaw {
-				return fmt.Errorf("primary listener '%s' cannot use protocol: raw with flow: tcp (not eligible for host routing)", l.Name)
-			}
+			// Per plan §D8: flow:tcp + protocol:raw is now allowed as primary —
+			// the TLS mux's SNI-based routing terminates TLS for the client,
+			// then proxies raw bytes to the backend. Apps with raw-TCP backends
+			// (DNS-over-TLS, custom TCP protocols) can declare __primary on
+			// flow:tcp+protocol:raw and get hostname routing on remote +
+			// LAN host-based access. flow:udp remains the only rejected primary
+			// (port-based routing only, no host-label channel).
 		}
 
 		// Validate listener name only if not __primary marker
@@ -1318,6 +1319,33 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 					if _, err := path.Match(rulePath, "/"); err != nil {
 						return newValidationError("INVALID_PATH", fmt.Sprintf("invalid path \"%s\" for type \"%s\": %s", rule.Path, rule.Type, err.Error()))
 					}
+				}
+			}
+		}
+
+		// RFC 20260112 §ConnectionAuth: L4 IP-based access rules. Permitted on
+		// every flow including UDP (per plan §D6 / §D12). Rules must carry
+		// strategy ∈ {allow, deny} and a parseable CIDR. Trim-and-store so
+		// the runtime middleware (`l4.parseConnectionAuth`) sees clean values
+		// — without this, a manifest with `default: " allow"` would pass
+		// parser validation and then fail-build at proxy startup.
+		if l.ConnectionAuth != nil {
+			l.ConnectionAuth.Default = strings.TrimSpace(l.ConnectionAuth.Default)
+			if d := l.ConnectionAuth.Default; d != "" && d != "allow" && d != "deny" {
+				return newValidationError("INVALID_CONN_AUTH_DEFAULT", fmt.Sprintf("listener '%s' connection_auth.default must be \"allow\" or \"deny\", got %q", l.Name, d))
+			}
+			for j := range l.ConnectionAuth.Rules {
+				rule := &l.ConnectionAuth.Rules[j]
+				rule.Strategy = strings.TrimSpace(rule.Strategy)
+				rule.Match = strings.TrimSpace(rule.Match)
+				if rule.Strategy != "allow" && rule.Strategy != "deny" {
+					return newValidationError("INVALID_CONN_AUTH_STRATEGY", fmt.Sprintf("listener '%s' connection_auth.rules[%d].strategy must be \"allow\" or \"deny\", got %q", l.Name, j, rule.Strategy))
+				}
+				if rule.Match == "" {
+					return newValidationError("INVALID_CONN_AUTH_MATCH", fmt.Sprintf("listener '%s' connection_auth.rules[%d].match is required", l.Name, j))
+				}
+				if _, _, err := net.ParseCIDR(rule.Match); err != nil {
+					return newValidationError("INVALID_CONN_AUTH_MATCH", fmt.Sprintf("listener '%s' connection_auth.rules[%d].match: invalid CIDR %q: %v", l.Name, j, rule.Match, err))
 				}
 			}
 		}

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"piccolod/internal/api"
+	"piccolod/internal/services/middleware"
 )
 
 // startEchoBackend starts a simple TCP echo server on 127.0.0.1:0 and returns its port and a shutdown func
@@ -109,7 +110,7 @@ func TestProxy_PassthroughTCP(t *testing.T) {
 
 func TestApplyForwardHeadersUsesTLSHint(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://web.example.com", nil)
-	req = req.WithContext(context.WithValue(req.Context(), hintContextKey{}, connectionHint{isTLS: true}))
+	req = req.WithContext(middleware.ContextWithHint(req.Context(), middleware.Hint{IsTLS: true}))
 	ep := ServiceEndpoint{Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}
 
 	applyForwardHeaders(req, ep)
@@ -126,7 +127,7 @@ func TestApplyForwardHeadersUsesClientIPHint(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
 	req.Host = "example.test"
 	req.RemoteAddr = "10.0.0.2:1234"
-	req = req.WithContext(context.WithValue(req.Context(), hintContextKey{}, connectionHint{clientIP: "203.0.113.9"}))
+	req = req.WithContext(middleware.ContextWithHint(req.Context(), middleware.Hint{ClientIP: "203.0.113.9"}))
 	ep := ServiceEndpoint{Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP}
 
 	applyForwardHeaders(req, ep)

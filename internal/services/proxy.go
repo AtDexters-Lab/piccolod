@@ -1,7 +1,6 @@
 package services
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -12,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,18 +18,23 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/auth"
+	"piccolod/internal/services/middleware"
+	"piccolod/internal/services/middleware/builtin"
+	"piccolod/internal/services/middleware/l4"
+	"piccolod/internal/services/middleware/l7"
+	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 )
 
-var frameAncestorsRe = regexp.MustCompile(`(?i)frame-ancestors\s+[^;]+(; ?)?`)
-
+// connectionHint is the storage shape for per-conn hints registered by the
+// TLS mux relay path. Read sites use middleware.HintFromContext instead of
+// touching this type — connectionHint exists only for the registerHint /
+// peekHint map storage. Plan §D13 unifies the read path under
+// middleware.Hint; storage stays here because it's services-private state.
 type connectionHint struct {
 	clientIP   string
 	isTLS      bool
 	remotePort int
 }
-
-type hintContextKey struct{}
-type hintLookupContextKey struct{}
 
 const (
 	HeaderPiccoloHintToken = "X-Piccolo-Hint-Token"
@@ -46,31 +49,21 @@ type tokenHintEntry struct {
 	expiresAt    time.Time
 }
 
-type hintLookup struct {
-	pm           *ProxyManager
-	listenerPort int
-	sourcePort   int
-
-	once sync.Once
-	hint connectionHint
-	ok   bool
-}
-
-func (l *hintLookup) get() (connectionHint, bool) {
-	if l == nil || l.pm == nil || l.listenerPort <= 0 || l.sourcePort <= 0 {
-		return connectionHint{}, false
+// asMiddlewareHint converts the services-private connectionHint into the
+// shared middleware.Hint shape used by every read site after plan §D13.
+func (h connectionHint) asMiddlewareHint() middleware.Hint {
+	return middleware.Hint{
+		ClientIP:   h.clientIP,
+		IsTLS:      h.isTLS,
+		RemotePort: h.remotePort,
 	}
-	l.once.Do(func() {
-		l.hint, l.ok = l.pm.consumeHint(l.listenerPort, l.sourcePort)
-	})
-	return l.hint, l.ok
 }
 
 // ProxyManager manages TCP listeners and proxies traffic based on ServiceEndpoint
 type ProxyManager struct {
 	mu                sync.Mutex
-	listeners         map[int]net.Listener     // TCP listeners by public port
-	udpListeners      map[int]*udpProxyState   // UDP listeners by public port
+	listeners         map[int]net.Listener   // TCP listeners by public port
+	udpListeners      map[int]*udpProxyState // UDP listeners by public port
 	hints             map[int]map[int]connectionHint
 	tokenHints        map[string]tokenHintEntry
 	cspFrameAncestors string // pre-calculated CSP header value
@@ -84,7 +77,7 @@ type ProxyManager struct {
 	aliasChecker  func(host, listener string) bool
 
 	// RFC 20260122: Proxy OIDC handler for headers/protected strategies
-	proxyOIDC           *ProxyOIDCHandler
+	proxyOIDC           *l7oidc.Handler
 	sessionStore        *auth.SessionStore
 	localHostnameGetter func() string
 
@@ -95,11 +88,23 @@ type ProxyManager struct {
 	// when mDNS is disabled and the value comes from getPreferredOutboundIP.
 	oidcIssuerOriginFn func() string
 	oidcAuthorizePaths map[string][]string // app name → authorize_paths from manifest
+
+	// Middleware registry holds canonical L4 / L4UDP / L7 / L7Response
+	// factories. Initialized once per ProxyManager via builtin.RegisterDefaults.
+	registry *middleware.Registry
+
+	// l4Metrics is the shared in-memory store backing conn_metrics. One
+	// registry per ProxyManager — Snapshot is the read API.
+	l4Metrics *l4.MetricsRegistry
 }
 
 func NewProxyManager() *ProxyManager {
+	reg := middleware.NewRegistry()
+	builtin.RegisterDefaults(reg)
 	// Default safe CSP
 	return &ProxyManager{
+		registry:          reg,
+		l4Metrics:         l4.NewMetricsRegistry(),
 		listeners:         make(map[int]net.Listener),
 		udpListeners:      make(map[int]*udpProxyState),
 		cspFrameAncestors: "frame-ancestors \"self\" http://localhost:* http://*.local:* https://*.local:*",
@@ -251,6 +256,34 @@ func (p *ProxyManager) consumeHint(listenerPort, sourcePort int) (connectionHint
 	return connectionHint{}, false
 }
 
+// peekHint returns the hint without removing it. Used by the L4 chain
+// (hint_consumer_l4) so the L7 path's consumeHint still observes the same
+// hint and the conn-hint chain remains single-cleanup. Step 9 retires this
+// when the hint chain unifies across L4 + L7.
+func (p *ProxyManager) peekHint(listenerPort, sourcePort int) (connectionHint, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if m := p.hints[listenerPort]; m != nil {
+		if hint, ok := m[sourcePort]; ok {
+			return hint, true
+		}
+	}
+	return connectionHint{}, false
+}
+
+// releaseListener closes the bound socket and removes the entry from
+// p.listeners so a subsequent reconcile can rebind the port. Used when
+// startTCPProxy / startHTTPProxy aborts after the listener has been
+// registered (e.g., registry.Build error returns config_error per plan
+// §S5; without releasing here the bound socket lingers without an Accept
+// loop and connection attempts hang).
+func (p *ProxyManager) releaseListener(ln net.Listener, port int) {
+	_ = ln.Close()
+	p.mu.Lock()
+	delete(p.listeners, port)
+	p.mu.Unlock()
+}
+
 // SetAcmeHandler registers a handler to serve HTTP-01 challenges for all HTTP proxies.
 func (p *ProxyManager) SetAcmeHandler(h http.Handler) { p.mu.Lock(); p.acme = h; p.mu.Unlock() }
 
@@ -293,10 +326,17 @@ func (p *ProxyManager) SetLocalHostnameGetter(fn func() string) {
 	p.mu.Unlock()
 }
 
-// SetProxyOIDCConfig configures the proxy OIDC handler per RFC 20260122.
-func (p *ProxyManager) SetProxyOIDCConfig(config ProxyOIDCConfig) {
+// SetProxyOIDCConfig configures the proxy OIDC handler per RFC 20260122. The
+// services-internal predicates (TLS detection + CHIPS classification) are
+// wired in here because they depend on the hint chain that step 9 migrates to
+// middleware.HintFromContext.
+func (p *ProxyManager) SetProxyOIDCConfig(config l7oidc.Config) {
+	config.ArrivedViaTLS = RequestArrivedViaTLS
+	config.NeedsEmbeddedMarker = needsEmbeddedMarker
+	config.ShouldPartitionCookies = shouldPartitionCookies
+
 	p.mu.Lock()
-	p.proxyOIDC = NewProxyOIDCHandler(config)
+	p.proxyOIDC = l7oidc.NewHandler(config)
 	p.mu.Unlock()
 }
 
@@ -430,6 +470,38 @@ func (p *ProxyManager) handleConn(ep ServiceEndpoint, client net.Conn) {
 }
 
 func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
+	mwEndpoint := ep.AsMiddlewareInfo()
+
+	// Build the L4 chain via the registry. Default canonical chain is
+	// conn_metrics → hint_consumer_l4 → connection_auth (gated). Operator-
+	// listed ip_allowlist / ip_rate_limit append after.
+	l4Mws, err := p.registry.BuildL4(middleware.BuildSpec{
+		Endpoint:          mwEndpoint,
+		HasConnectionAuth: ep.ConnectionAuth != nil,
+		Deps:              p.buildL4Deps(ep),
+	})
+	if err != nil {
+		log.Printf("ERROR: registry.BuildL4 for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		p.releaseListener(ln, ep.PublicPort)
+		return
+	}
+	// L4 chain dispatcher per accepted conn: the chain "denies" by returning
+	// without invoking next, so the dispatcher MUST close the conn whenever
+	// the terminal wasn't reached. It also drains the per-conn hint
+	// registration whether or not the chain admitted, mirroring the
+	// http.Server.ConnContext bridge in startHTTPProxy.
+	dispatch := func(c net.Conn) {
+		admitted := p.runL4Chain(l4Mws, mwEndpoint, ep.PublicPort, c)
+		if admitted {
+			p.handleConn(ep, c)
+		} else {
+			_ = c.Close()
+		}
+		if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+			_, _ = p.consumeHint(ep.PublicPort, addr.Port)
+		}
+	}
+
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -443,14 +515,36 @@ func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
 				}
 				return
 			}
-			// TODO L0: rate-limit + metrics per IP (stub)
 			p.wg.Add(1)
 			go func(c net.Conn) {
 				defer p.wg.Done()
-				p.handleConn(ep, c)
+				dispatch(c)
 			}(conn)
 		}
 	}()
+}
+
+// runL4Chain composes and runs the L4 chain for a single conn. Returns true
+// when the chain reached its terminal (admitted), false on deny. ConnContext
+// is built per-call from (endpoint, conn-derived addrs, the per-listener
+// hint lookup); shared between startTCPProxy.dispatch and l4AcceptBridge so
+// the two sites can't drift on ConnContext field population.
+func (p *ProxyManager) runL4Chain(mws []middleware.L4Middleware, ep middleware.EndpointInfo, listenerPort int, c net.Conn) bool {
+	admitted := false
+	terminal := middleware.ConnHandler(func(_ middleware.ConnContext, _ net.Conn) {
+		admitted = true
+	})
+	chain := middleware.ComposeL4Chain(mws, terminal)
+	ctx := middleware.ConnContext{
+		Endpoint:    ep,
+		SourceAddr:  c.RemoteAddr(),
+		LocalAddr:   c.LocalAddr(),
+		AcceptedAt:  time.Now(),
+		SourceTrust: middleware.DeriveSourceTrust(c.LocalAddr()),
+		Hint:        l4HintLookup(p, listenerPort, c.RemoteAddr()),
+	}
+	chain(ctx, c)
+	return admitted
 }
 
 func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
@@ -458,326 +552,64 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	u, err := url.Parse(target)
 	if err != nil {
 		log.Printf("WARN: invalid reverse proxy target %s: %v", target, err)
+		p.releaseListener(ln, ep.PublicPort)
 		return
 	}
 	rp := httputil.NewSingleHostReverseProxy(u)
-	// Strip backend restrictions so we can apply our own
-	rp.ModifyResponse = func(resp *http.Response) error {
-		// Strip backend security headers that conflict with proxy-level policies.
-		// The proxy's securityHeaders middleware sets consistent CORP/COEP for all responses.
-		resp.Header.Del("X-Frame-Options")
-		resp.Header.Del("Cross-Origin-Resource-Policy")
-		resp.Header.Del("Cross-Origin-Embedder-Policy")
 
-		// Remove existing frame-ancestors directive if present, but keep other CSP directives
-		if val := resp.Header.Get("Content-Security-Policy"); val != "" {
-			newVal := frameAncestorsRe.ReplaceAllString(val, "")
-			// If cleaning resulted in empty or just whitespace/semicolons, strictly we might want to keep it empty
-			// But for now, just setting it back is fine.
-			resp.Header.Set("Content-Security-Policy", newVal)
-		}
-
-		// RFC 20260112: Set-Cookie blocking + optional LAN port-based cookie isolation.
-		setCookies := resp.Header.Values("Set-Cookie")
-		if len(setCookies) > 0 {
-			resp.Header.Del("Set-Cookie")
-
-			appHost := normalizeHostNoPort(proxyContextAppHost(resp.Request.Context()))
-			rewriteCookies := proxyContextCookieRewrite(resp.Request.Context())
-			partitionCookies := proxyContextPartitionCookies(resp.Request.Context())
-			appPrefix := cookiePrefixForApp(ep.App)
-
-			for _, sc := range setCookies {
-				name, eq := parseSetCookieName(sc)
-				if name == "" || eq == -1 {
-					continue
-				}
-				if isPiccoloCookieName(name) {
-					continue
-				}
-
-				if dom, ok := setCookieDomain(sc); ok {
-					// If we can't determine the app host, fail closed for Domain cookies.
-					if appHost == "" {
-						continue
-					}
-					if normalizeCookieDomain(dom) != appHost {
-						continue
-					}
-				}
-
-				if rewriteCookies && setCookieHasHttpOnly(sc) && !strings.HasPrefix(name, appPrefix) {
-					sc = appPrefix + name + sc[eq:]
-				}
-
-				// CHIPS: add Partitioned, SameSite=None, Secure for cross-site iframe embedding
-				if partitionCookies {
-					sc = ensurePartitionedAttributes(sc)
-				}
-
-				resp.Header.Add("Set-Cookie", sc)
-			}
-		}
-
-		// Set embedded marker cookie on initial iframe loads so subsequent
-		// XHR/fetch from within the iframe can propagate CHIPS context.
-		if proxyContextNeedsMarker(resp.Request.Context()) {
-			resp.Header.Add("Set-Cookie", embeddedMarkerSetCookie())
-		}
-
-		// OIDC authorize URL rewriting for WAN requests.
-		if snap, ok := resp.Request.Context().Value(proxyOIDCRewriteContextKey{}).(*oidcRewriteSnapshot); ok && snap != nil {
-			rewriteOIDCAuthorizeResponse(resp, snap, ep.App)
-		}
-
-		return nil
+	// Build the L7 chain via the registry. deps carries the closures that
+	// bridge into services-internal state (mutable proxy-manager fields read
+	// live per call).
+	mwEndpoint := ep.AsMiddlewareInfo()
+	l7Spec := middleware.BuildSpec{
+		Endpoint: mwEndpoint,
+		Deps:     p.buildL7Deps(ep),
+	}
+	l7Mws, err := p.registry.BuildL7(l7Spec)
+	if err != nil {
+		log.Printf("ERROR: registry.BuildL7 for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		p.releaseListener(ln, ep.PublicPort)
+		return
+	}
+	respMods, err := p.registry.BuildL7Response(l7Spec)
+	if err != nil {
+		log.Printf("ERROR: registry.BuildL7Response for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		p.releaseListener(ln, ep.PublicPort)
+		return
 	}
 
-	// Single handler that enforces listener auth rules (per-path) before forwarding.
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Zero-trust: for non-loopback listener hops, do not allow clients to influence
-		// portal origin / redirect scheme / host via spoofed forwarding headers.
-		// Loopback-only sources (e.g., Nexus via TLS mux) remain eligible for trusted forwarding.
-		trustedLoopback := false
-		if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
-			if host, _, err := net.SplitHostPort(localAddr.String()); err == nil {
-				if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-					trustedLoopback = true
-				}
-			}
-		}
-		if !trustedLoopback {
-			r.Header.Del("Forwarded")
-			r.Header.Del("X-Forwarded-For")
-			r.Header.Del("X-Forwarded-Proto")
-			r.Header.Del("X-Forwarded-Host")
-			r.Header.Del("X-Forwarded-Port")
-			r.Header.Del("X-Real-IP")
-		}
+	rp.ModifyResponse = middleware.ComposeResponseChain(respMods)
 
-		if token := strings.TrimSpace(r.Header.Get(HeaderPiccoloHintToken)); token != "" {
-			r.Header.Del(HeaderPiccoloHintToken)
-			if hint, ok := p.consumeRequestHint(ep.PublicPort, token); ok {
-				r = r.WithContext(context.WithValue(r.Context(), hintContextKey{}, hint))
-			}
-		}
-
-		cleanedPath, pathErr := normalizeAndSetRequestPath(r)
-		if pathErr != "" {
-			// RFC 7.2: runtime path errors
-			if pathErr == "INVALID_PATH" {
-				writeProxyJSONError(w, http.StatusBadRequest, "invalid_request_path", "INVALID_PATH")
-				return
-			}
-			writeProxyJSONError(w, http.StatusBadRequest, "path_normalization_failed", "PATH_INVALID")
-			return
-		}
-
-		// RFC 20260122 §5.10: Intercept reserved proxy OIDC paths
-		if IsReservedPath(cleanedPath) {
-			p.mu.Lock()
-			proxyOIDC := p.proxyOIDC
-			p.mu.Unlock()
-
-			if proxyOIDC == nil {
-				writeProxyJSONError(w, http.StatusServiceUnavailable, "proxy_oidc_not_configured", "OIDC_UNAVAILABLE")
-				return
-			}
-
-			if cleanedPath == ProxyOIDCCallbackPath {
-				proxyOIDC.HandleCallback(w, r, ep.App, ep)
-				return
-			}
-
-			// Other reserved paths (future: logout, session status)
-			writeProxyJSONError(w, http.StatusNotFound, "not_found", "RESERVED_PATH_NOT_IMPLEMENTED")
-			return
-		}
-
-		// RFC 4.1.5: Strip spoofed trusted headers for all strategies.
-		// Must happen before any handler (ACME, backend) to prevent header spoofing.
-		StripHeadersFromRequest(r)
-
-		// Intercept ACME HTTP-01 challenges for remote cert issuance (RFC 20260122).
-		// These bypass auth rules because they're infrastructure-level (piccolod's TLS
-		// termination), not app business logic. External ACME verifiers have no session.
-		if strings.HasPrefix(cleanedPath, "/.well-known/acme-challenge/") {
-			p.mu.Lock()
-			acme := p.acme
-			p.mu.Unlock()
-			if acme != nil {
-				acme.ServeHTTP(w, r)
-				return
-			}
-		}
-
-		strategy := listenerStrategyForPath(ep.Auth, cleanedPath)
-
-		// RFC 4.1.6: Strategy-specific behavior.
-		switch strategy {
-		case "protected", "headers":
-			// RFC 20260122 §5: Allow CORS preflight (OPTIONS) to bypass auth.
-			// Browsers send preflight without cookies; blocking them breaks cross-origin API calls.
-			if r.Method == http.MethodOptions && r.Header.Get("Origin") != "" && r.Header.Get("Access-Control-Request-Method") != "" {
-				break
-			}
-
-			p.mu.Lock()
-			um := p.userManager
-			sg := p.sessionGetter
-			portalOrigin := p.portalOrigin
-			aliasChecker := p.aliasChecker
-			proxyOIDC := p.proxyOIDC
-			sessionStore := p.sessionStore
-			p.mu.Unlock()
-
-			if sg == nil {
-				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-				return
-			}
-
-			// RFC 20260112: alias domains are not compatible with protected/headers strategies.
-			// The session cookie cannot be shared across custom domains.
-			if aliasChecker != nil && aliasChecker(normalizeHostNoPort(r.Host), ep.DerivedHostLabel) {
-				log.Printf("WARN: alias domain access is not supported for auth strategy=%s (host=%s app=%s listener=%s)", strategy, normalizeHostNoPort(r.Host), ep.App, ep.Name)
-			}
-
-			_, cookieErr := r.Cookie(sessionCookieName)
-			cookiePresent := cookieErr == nil
-
-			// RFC 20260122 §5: Try to get session and validate with app audience/origin binding
-			sess, ok := sg(r)
-			if ok && sess != nil && sessionStore != nil {
-				// Validate app session with audience and origin binding
-				requestOrigin := computeRequestOrigin(r, ep)
-				sess, ok = sessionStore.ValidateAppSession(sess.ID, ep.App, requestOrigin)
-			}
-
-			if !ok || sess == nil {
-				// RFC 20260122 §5.9: Only redirect safe methods (GET/HEAD) into OIDC flow.
-				// Non-safe methods (POST/PUT/DELETE) would lose the request body on redirect.
-				isSafeMethod := r.Method == http.MethodGet || r.Method == http.MethodHead
-				if isSafeMethod && isBrowserNavigation(r) {
-					if proxyOIDC != nil {
-						proxyOIDC.InitiateOIDCFlow(w, r, ep.App, ep)
-						return
-					}
-					// Fallback to portal redirect if proxy OIDC not configured
-					origin := ""
-					if portalOrigin != nil {
-						origin = portalOrigin(r)
-					}
-					if origin == "" {
-						scheme := "http"
-						if shouldRewriteAsHTTPS(ep, r) {
-							scheme = "https"
-						}
-						origin = scheme + "://" + normalizeHostNoPort(r.Host)
-					}
-					http.Redirect(w, r, portalLoginURL(origin, absoluteRequestURL(r, ep)), http.StatusFound)
-					return
-				}
-				if cookiePresent {
-					writeProxyJSONError(w, http.StatusUnauthorized, "session_expired", "SESSION_EXPIRED")
-				} else {
-					writeProxyJSONError(w, http.StatusUnauthorized, "authentication_required", "AUTH_REQUIRED")
-				}
-				return
-			}
-
-			// Check allowed_apps for standard users (admin has full access).
-			if sess.Role != "admin" {
-				if um == nil {
-					http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-					return
-				}
-				allowed, err := um.IsAppAllowed(r.Context(), sess.UserID, ep.App)
-				if err != nil || !allowed {
-					if isBrowserNavigation(r) {
-						origin := ""
-						if portalOrigin != nil {
-							origin = portalOrigin(r)
-						}
-						if origin == "" {
-							scheme := "http"
-							if shouldRewriteAsHTTPS(ep, r) {
-								scheme = "https"
-							}
-							origin = scheme + "://" + normalizeHostNoPort(r.Host)
-						}
-						http.Redirect(w, r, portalAccessDeniedURL(origin, absoluteRequestURL(r, ep)), http.StatusFound)
-						return
-					}
-					writeProxyJSONError(w, http.StatusForbidden, "app_access_denied", "APP_NOT_ALLOWED")
-					return
-				}
-			}
-
-			if strategy == "headers" {
-				if um == nil {
-					http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-					return
-				}
-				user, err := um.Get(r.Context(), sess.UserID)
-				if err != nil {
-					writeProxyJSONError(w, http.StatusUnauthorized, "session_expired", "SESSION_EXPIRED")
-					return
-				}
-				// Inject trusted identity headers (RFC 4.1.6).
-				r.Header.Set(HeaderPiccoloUser, user.Username)
-				r.Header.Set(HeaderPiccoloEmail, user.Email)
-				r.Header.Set(HeaderPiccoloName, user.Username)
-				r.Header.Set(HeaderPiccoloRole, string(user.Role))
-			}
-		case "oidc_passthrough", "public":
-			// Pass-through; app manages auth or requires none.
-		default:
-			// Unknown strategy should fail closed.
-			writeProxyJSONError(w, http.StatusUnauthorized, "authentication_required", "AUTH_REQUIRED")
-			return
-		}
-
-		// RFC 4.1.5 + 4.1.8: Strip Piccolo cookies before forwarding and optionally rewrite cookies
-		// for LAN port-based isolation.
-		rewriteCookies := shouldRewriteLegacyCookies(r.Host)
-		partitionCookies := shouldPartitionCookies(r)
-		needsMarker := needsEmbeddedMarker(r)
-		stripAndRewriteRequestCookies(r, ep.App, rewriteCookies)
-		r = withProxyContext(r, ep.App, normalizeHostNoPort(r.Host), rewriteCookies, partitionCookies, needsMarker)
-
-		// Snapshot OIDC rewrite state for WAN authorize URL rewriting.
-		if RequestArrivedViaTLS(r) {
-			p.mu.Lock()
-			issuerOriginFn := p.oidcIssuerOriginFn
-			authPaths := p.oidcAuthorizePaths[ep.App]
-			portalOriginFn := p.portalOrigin
-			p.mu.Unlock()
-
-			if issuerOriginFn != nil && portalOriginFn != nil {
-				issuerOrigin := issuerOriginFn()
-				portal := portalOriginFn(r)
-				if issuerOrigin != "" && portal != "" {
-					snap := &oidcRewriteSnapshot{
-						issuerOrigin:   issuerOrigin,
-						portalOrigin:   portal,
-						authorizePaths: authPaths,
-					}
-					r = r.WithContext(context.WithValue(r.Context(), proxyOIDCRewriteContextKey{}, snap))
-				}
-			}
-		}
-
-		applyForwardHeaders(r, ep)
-
-		gzw := newGzipResponseWriter(w, r)
+	terminal := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gzw := l7.NewGzipResponseWriter(w, r)
 		defer gzw.Close()
 		rp.ServeHTTP(gzw, r)
 	}))
+	handler := middleware.ComposeRequestChain(l7Mws, terminal)
 
-	// Apply common middleware chain
+	// Outer non-listener-specific middleware wrapping (security headers,
+	// request logging, rate limiting). Stays out of the registry until those
+	// concerns get their own canonical entries.
 	handler = p.securityHeaders(handler)
 	handler = requestLogging(handler)
 	handler = basicRateLimit(handler) // stub
+
+	// L4 chain at accept boundary. The HTTP variant runs the L4 chain for
+	// side-effects + deny semantics: when the chain calls its terminal the
+	// connection proceeds to http.Server, otherwise it is closed and the
+	// listener loops. With no L4 factories registered today, the chain is
+	// empty and Accept behavior is identical to the underlying listener.
+	l4Mws, err := p.registry.BuildL4(middleware.BuildSpec{
+		Endpoint:          mwEndpoint,
+		HasConnectionAuth: ep.ConnectionAuth != nil,
+		Deps:              p.buildL4Deps(ep),
+	})
+	if err != nil {
+		log.Printf("ERROR: registry.BuildL4 for app=%s listener=%s: %v", ep.App, ep.Name, err)
+		p.releaseListener(ln, ep.PublicPort)
+		return
+	}
+	wrappedLn := newL4AcceptBridge(ln, mwEndpoint, l4Mws, p, ep.PublicPort)
 
 	p.wg.Add(1)
 	go func() {
@@ -786,18 +618,74 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 		srv := &http.Server{
 			Handler: handler,
 			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+				// L4→L7 hint bridge per plan §D13. Consume the conn-level
+				// hint here (one-shot) and stash it on ctx via
+				// middleware.ContextWithHint. Downstream L7 readers go through
+				// middleware.HintFromContext — single source of truth. The
+				// hint_consumer_l7 middleware may overwrite later if a
+				// LAN-host-based hop carries a header-token hint.
 				if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
-					ctx = context.WithValue(ctx, hintLookupContextKey{}, &hintLookup{
-						pm:           p,
-						listenerPort: ep.PublicPort,
-						sourcePort:   addr.Port,
-					})
+					if hint, ok := p.consumeHint(ep.PublicPort, addr.Port); ok {
+						ctx = middleware.ContextWithHint(ctx, hint.asMiddlewareHint())
+					}
 				}
 				return ctx
 			},
 		}
-		_ = srv.Serve(ln) // returns on ln.Close()
+		_ = srv.Serve(wrappedLn) // returns on ln.Close()
 	}()
+}
+
+// l4AcceptBridge wraps a net.Listener with the L4 middleware chain. Each
+// accepted conn passes through the chain; if the chain invokes its terminal
+// the conn proceeds to whatever consumes the wrapped listener (http.Server).
+// If the chain returns without calling terminal, the conn is closed and
+// Accept loops. With an empty chain, terminal is invoked synchronously and
+// behavior matches the underlying listener byte-for-byte.
+type l4AcceptBridge struct {
+	net.Listener
+	endpoint     middleware.EndpointInfo
+	middlewares  []middleware.L4Middleware
+	pm           *ProxyManager
+	listenerPort int
+}
+
+func newL4AcceptBridge(ln net.Listener, ep middleware.EndpointInfo, mws []middleware.L4Middleware, pm *ProxyManager, listenerPort int) net.Listener {
+	if len(mws) == 0 {
+		// Empty chain: skip the wrapper entirely. Today's canonical L4 chain
+		// has 2+ entries (conn_metrics + hint_consumer_l4), so this branch
+		// is reserved for hypothetical chains where every canonical factory
+		// returned no-op (or for tests that explicitly pass an empty slice).
+		return ln
+	}
+	return &l4AcceptBridge{
+		Listener:     ln,
+		endpoint:     ep,
+		middlewares:  mws,
+		pm:           pm,
+		listenerPort: listenerPort,
+	}
+}
+
+func (l *l4AcceptBridge) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if l.pm.runL4Chain(l.middlewares, l.endpoint, l.listenerPort, conn) {
+			return conn, nil
+		}
+		_ = conn.Close()
+		// Drain the per-conn hint registration: ConnContext consumes only
+		// for admitted conns; denied conns would leak the entry until the
+		// kernel's ephemeral-port reuse window wrapped, with the same
+		// stale-hint contamination class the TCP-path dispatch helper
+		// drains. Mirror the TCP path here.
+		if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+			_, _ = l.pm.consumeHint(l.listenerPort, addr.Port)
+		}
+	}
 }
 
 // Middleware stubs
@@ -864,16 +752,6 @@ func basicRateLimit(next http.Handler) http.Handler { // placeholder
 	})
 }
 
-func hintFromRequest(r *http.Request) (connectionHint, bool) {
-	if hint, ok := r.Context().Value(hintContextKey{}).(connectionHint); ok {
-		return hint, true
-	}
-	if lookup, ok := r.Context().Value(hintLookupContextKey{}).(*hintLookup); ok {
-		return lookup.get()
-	}
-	return connectionHint{}, false
-}
-
 func applyForwardHeaders(r *http.Request, ep ServiceEndpoint) {
 	clientIP := ""
 	if remoteHost, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
@@ -881,9 +759,9 @@ func applyForwardHeaders(r *http.Request, ep ServiceEndpoint) {
 	} else {
 		clientIP = r.RemoteAddr
 	}
-	if hint, ok := hintFromRequest(r); ok {
-		if strings.TrimSpace(hint.clientIP) != "" {
-			clientIP = hint.clientIP
+	if hint, ok := middleware.HintFromContext(r.Context()); ok {
+		if strings.TrimSpace(hint.ClientIP) != "" {
+			clientIP = hint.ClientIP
 		}
 	}
 
@@ -913,7 +791,7 @@ func applyForwardHeaders(r *http.Request, ep ServiceEndpoint) {
 	proto := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
 	if !trusted || proto == "" {
 		proto = "http"
-		if shouldRewriteAsHTTPS(ep, r) {
+		if l7.ShouldRewriteAsHTTPS(ep.AsMiddlewareInfo(), r, RequestArrivedViaTLS) {
 			proto = "https"
 		}
 	}
@@ -933,8 +811,8 @@ func applyForwardHeaders(r *http.Request, ep ServiceEndpoint) {
 	}
 
 	port := ""
-	if hint, ok := hintFromRequest(r); ok && hint.remotePort > 0 {
-		port = strconv.Itoa(hint.remotePort)
+	if hint, ok := middleware.HintFromContext(r.Context()); ok && hint.RemotePort > 0 {
+		port = strconv.Itoa(hint.RemotePort)
 	} else if hostPort != "" {
 		port = hostPort
 	} else if proto == "https" {
@@ -1081,241 +959,156 @@ func needsForwardedQuotedString(v string) bool {
 	return false
 }
 
-func shouldRewriteAsHTTPS(ep ServiceEndpoint, r *http.Request) bool {
-	if ep.Flow != api.FlowTCP {
-		return false
-	}
-	switch ep.Protocol {
-	case api.ListenerProtocolHTTP, api.ListenerProtocolWebsocket:
-		return RequestArrivedViaTLS(r)
-	default:
-		return false
-	}
-}
-
 // RequestArrivedViaTLS reports whether the original client request was made
 // over TLS, even if the current hop is plain HTTP. It checks direct TLS
 // (r.TLS) and the connection hint issued by the portal's lanHostRoutingMiddleware.
+//
+// After plan §D13 (step 9), the hint chain reads from middleware.HintFromContext.
+// Two writers populate it: the L4 chain entry stashes the conn-level hint via
+// http.Server.ConnContext; the L7 hint_consumer_l7 stashes the header-token
+// hint forwarded by gin's lanHostRoutingMiddleware. Last writer wins; the
+// header-token hint takes precedence on the LAN-host-based hop.
 func RequestArrivedViaTLS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	if hint, ok := hintFromRequest(r); ok && hint.isTLS {
+	if hint, ok := middleware.HintFromContext(r.Context()); ok && hint.IsTLS {
 		return true
 	}
 	return false
 }
 
-// oidcAuthorizeRewriteMaxBody is the maximum response body size for Layer 2
-// body rewriting. Responses larger than this are passed through unmodified.
-const oidcAuthorizeRewriteMaxBody = 1 << 20 // 1 MB
-
-// rewriteOIDCAuthorizeResponse performs dual-layer OIDC authorization URL
-// rewriting for WAN requests. Layer 1 rewrites Location headers on 3xx
-// responses. Layer 2 rewrites response bodies on declared authorize_paths.
-func rewriteOIDCAuthorizeResponse(resp *http.Response, snap *oidcRewriteSnapshot, appName string) {
-	oldURL := snap.issuerOrigin + "/oauth/authorize"
-	newURL := snap.portalOrigin + "/oauth/authorize"
-
-	// Layer 1: Location header rewrite on 3xx responses.
-	// Match the exact authorize URL or one followed by '?' (query string) or '/'
-	// (subpath) to avoid matching unrelated paths like .../authorize_token.
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		if loc := resp.Header.Get("Location"); loc != "" {
-			if loc == oldURL || strings.HasPrefix(loc, oldURL+"?") || strings.HasPrefix(loc, oldURL+"/") || strings.HasPrefix(loc, oldURL+"#") {
-				resp.Header.Set("Location", newURL+loc[len(oldURL):])
-				log.Printf("DEBUG: OIDC rewrite L1: app=%s location rewritten", appName)
-			}
-		}
+// buildL4Deps assembles the per-listener RegistryDeps for L4 / L4UDP chain
+// factories. Bound dep keys: hint_consumer_l4 lookup, conn_metrics registry.
+// IP-rule middlewares (ip_allowlist, ip_rate_limit) are operator-listed and
+// pull their config from operator-supplied params; they share the metrics
+// registry via DepMetricsRegistry.
+func (p *ProxyManager) buildL4Deps(_ ServiceEndpoint) middleware.RegistryDeps {
+	pm := p
+	return middleware.MapDeps{
+		builtin.DepHintLookupL4: func() any {
+			// L4 chain peeks so the http.Server.ConnContext bridge can
+			// consume the hint once and stash it on r.Context() via
+			// middleware.ContextWithHint for L7 readers.
+			return l4.HintLookupFn(func(listenerPort, sourcePort int) (middleware.Hint, bool) {
+				h, ok := pm.peekHint(listenerPort, sourcePort)
+				if !ok {
+					return middleware.Hint{}, false
+				}
+				return h.asMiddlewareHint(), true
+			})
+		},
+		builtin.DepMetricsRegistry: func() any { return pm.l4Metrics },
 	}
-
-	// Layer 2: Body text replacement on declared authorize_paths.
-	if len(snap.authorizePaths) == 0 {
-		return
-	}
-	reqPath := ""
-	if resp.Request != nil && resp.Request.URL != nil {
-		reqPath = resp.Request.URL.Path
-	}
-	pathMatch := false
-	for _, ap := range snap.authorizePaths {
-		if reqPath == ap {
-			pathMatch = true
-			break
-		}
-	}
-	if !pathMatch {
-		return
-	}
-
-	// Only rewrite text-based content types. Reuses the proxy's existing
-	// compressible-types definition (mime.ParseMediaType-based, handles
-	// charset suffixes correctly).
-	if !isCompressibleContentType(resp.Header.Get("Content-Type")) {
-		return
-	}
-
-	// Skip compressed responses — we cannot rewrite without decompressing.
-	if resp.Header.Get("Content-Encoding") != "" {
-		log.Printf("WARN: OIDC rewrite L2 skipped (Content-Encoding present): app=%s path=%s", appName, reqPath)
-		return
-	}
-
-	// Pre-check Content-Length to avoid consuming oversized responses.
-	if resp.ContentLength > oidcAuthorizeRewriteMaxBody {
-		log.Printf("WARN: OIDC rewrite L2 skipped (Content-Length %d > %d): app=%s path=%s", resp.ContentLength, oidcAuthorizeRewriteMaxBody, appName, reqPath)
-		return
-	}
-
-	// Read up to maxBody+1 bytes to detect oversize from chunked responses.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, oidcAuthorizeRewriteMaxBody+1))
-	if err != nil {
-		// Splice the read bytes back so the downstream client gets the full body.
-		// Preserve the original Closer so resources are released correctly.
-		log.Printf("WARN: OIDC rewrite L2 body read error: app=%s path=%s err=%v", appName, reqPath, err)
-		resp.Body = &spliceCloser{
-			Reader: io.MultiReader(bytes.NewReader(body), resp.Body),
-			closer: resp.Body,
-		}
-		return
-	}
-	if int64(len(body)) > oidcAuthorizeRewriteMaxBody {
-		// Body exceeded the limit. Splice back the consumed portion plus the
-		// rest of the original body so nothing is truncated.
-		log.Printf("WARN: OIDC rewrite L2 skipped (body too large: >%d bytes): app=%s path=%s", oidcAuthorizeRewriteMaxBody, appName, reqPath)
-		resp.Body = &spliceCloser{
-			Reader: io.MultiReader(bytes.NewReader(body), resp.Body),
-			closer: resp.Body,
-		}
-		return
-	}
-
-	// Body fully read; safe to close the original.
-	resp.Body.Close()
-
-	// Empty body — nothing to do.
-	if len(body) == 0 {
-		resp.Body = io.NopCloser(bytes.NewReader(nil))
-		resp.ContentLength = 0
-		resp.Header.Set("Content-Length", "0")
-		return
-	}
-
-	// Replace the authorize URL pattern, matching only when followed by a
-	// valid URL boundary to avoid false positives like `/oauth/authorize_token`.
-	// This mirrors Layer 1's boundary check.
-	newBody, count := replaceAuthorizeURL(body, []byte(oldURL), []byte(newURL))
-	if count == 0 {
-		log.Printf("WARN: OIDC rewrite L2 matched path but zero replacements: app=%s path=%s", appName, reqPath)
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		return
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(newBody))
-	resp.ContentLength = int64(len(newBody))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
-	resp.Header.Del("Transfer-Encoding")
-	log.Printf("DEBUG: OIDC rewrite L2: app=%s path=%s replacements=%d oldSize=%d newSize=%d", appName, reqPath, count, len(body), len(newBody))
 }
 
-// replaceAuthorizeURL replaces `old` with `new` in `body`, but only when the
-// match is followed by a valid URL boundary (end-of-buffer or one of the
-// characters that legitimately terminate a URL in HTML/JSON/JS contexts).
-// This prevents false positives like `/oauth/authorize_token`.
-func replaceAuthorizeURL(body, old, new []byte) ([]byte, int) {
-	if len(old) == 0 {
-		return body, 0
-	}
-	var out bytes.Buffer
-	out.Grow(len(body))
-	count := 0
-	i := 0
-	for {
-		j := bytes.Index(body[i:], old)
-		if j < 0 {
-			out.Write(body[i:])
-			break
+// l4HintLookup is retained for the bridge listener wrapper (l4AcceptBridge),
+// which constructs ConnContext outside the registry chain (the chain only
+// runs when l4AcceptBridge is non-empty). Peeks so the http.Server.ConnContext
+// bridge can consume the hint once and stash it via middleware.ContextWithHint
+// for L7 readers.
+func l4HintLookup(pm *ProxyManager, listenerPort int, remoteAddr net.Addr) func() (middleware.Hint, bool) {
+	return func() (middleware.Hint, bool) {
+		addr, ok := remoteAddr.(*net.TCPAddr)
+		if !ok || addr == nil {
+			return middleware.Hint{}, false
 		}
-		matchStart := i + j
-		matchEnd := matchStart + len(old)
-		if matchEnd == len(body) || isURLBoundary(body[matchEnd]) {
-			out.Write(body[i:matchStart])
-			out.Write(new)
-			count++
-			i = matchEnd
-		} else {
-			// Not a boundary match — keep original bytes up to and including the prefix
-			// and advance past the first byte of the match to allow overlapping searches.
-			out.Write(body[i : matchStart+1])
-			i = matchStart + 1
+		h, ok := pm.peekHint(listenerPort, addr.Port)
+		if !ok {
+			return middleware.Hint{}, false
 		}
+		return h.asMiddlewareHint(), true
 	}
-	return out.Bytes(), count
 }
 
-// isURLBoundary reports whether b is a character that legitimately terminates
-// a URL in HTML/JSON/JS contexts.
-func isURLBoundary(b byte) bool {
-	switch b {
-	case '?', '#', '/', '"', '\'', '<', '>', ' ', '\t', '\n', '\r', ',', ';', ')', '}', ']', '\\':
-		return true
-	}
-	return false
-}
+// buildL7Deps assembles the per-listener RegistryDeps that the canonical
+// chain factories pull from. Each entry is a getter function so dep hot-swap
+// (SetUserManager etc.) propagates without registry rebuild.
+func (p *ProxyManager) buildL7Deps(ep ServiceEndpoint) middleware.RegistryDeps {
+	listenerPort := ep.PublicPort
+	appName := ep.App
 
-// spliceCloser combines a Reader (typically a MultiReader) with the original
-// body's Closer so the downstream HTTP transport closes the underlying body.
-type spliceCloser struct {
-	io.Reader
-	closer io.Closer
-}
-
-func (s *spliceCloser) Close() error { return s.closer.Close() }
-
-// computeRequestOrigin computes the canonical origin (scheme://host[:port]) for a request.
-// Used for session origin binding per RFC 20260122 §6.1.
-// IPv6 addresses are preserved with brackets per RFC 3986.
-func computeRequestOrigin(r *http.Request, ep ServiceEndpoint) string {
-	scheme := "http"
-	if shouldRewriteAsHTTPS(ep, r) || r.TLS != nil {
-		scheme = "https"
+	hintConsumer := func(r *http.Request) *http.Request {
+		token := strings.TrimSpace(r.Header.Get(HeaderPiccoloHintToken))
+		if token == "" {
+			return r
+		}
+		r.Header.Del(HeaderPiccoloHintToken)
+		if hint, ok := p.consumeRequestHint(listenerPort, token); ok {
+			// Per plan §D13 last-writer-wins: header-token hint from the
+			// LAN-host-based hop overrides any L4 conn-level hint already
+			// stashed by the http.Server.ConnContext bridge.
+			r = r.WithContext(middleware.ContextWithHint(r.Context(), hint.asMiddlewareHint()))
+		}
+		return r
 	}
 
-	// Use net.SplitHostPort for correct IPv6 handling
-	host, portStr, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		// No port in Host header
-		host = r.Host
-		portStr = ""
+	cookieContext := func(r *http.Request) *http.Request {
+		rewriteCookies := l7.ShouldRewriteLegacyCookies(r.Host)
+		partitionCookies := shouldPartitionCookies(r)
+		needsMarker := needsEmbeddedMarker(r)
+		l7.StripAndRewriteRequestCookies(r, appName, rewriteCookies)
+		return l7.SetProxyContext(r, appName, l7.NormalizeHostNoPort(r.Host), rewriteCookies, partitionCookies, needsMarker)
 	}
 
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	if host == "" {
-		return ""
+	pathAuthSnapshot := func() l7.PathAuthSnapshot {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		snap := l7.PathAuthSnapshot{
+			UserManager:   p.userManager,
+			SessionGetter: p.sessionGetter,
+			PortalOrigin:  p.portalOrigin,
+			AliasChecker:  p.aliasChecker,
+			SessionStore:  p.sessionStore,
+		}
+		if p.proxyOIDC != nil {
+			snap.InitiateOIDC = p.proxyOIDC.InitiateFlow
+		}
+		return snap
 	}
 
-	// Strip existing brackets before re-adding to avoid double-bracketing (e.g., Host: [::1] without port)
-	host = strings.TrimPrefix(host, "[")
-	host = strings.TrimSuffix(host, "]")
-
-	// Preserve IPv6 brackets per RFC 3986
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
-	}
-
-	// Omit default ports
-	if portStr != "" {
-		port, parseErr := strconv.Atoi(portStr)
-		if parseErr == nil {
-			if (scheme == "http" && port != 80) || (scheme == "https" && port != 443) {
-				return scheme + "://" + host + ":" + portStr
-			}
+	authSnapshot := func() l7oidc.AuthorizeSnapshotState {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return l7oidc.AuthorizeSnapshotState{
+			IssuerOrigin:   p.oidcIssuerOriginFn,
+			PortalOrigin:   p.portalOrigin,
+			AuthorizePaths: p.oidcAuthorizePaths[appName],
 		}
 	}
 
-	return scheme + "://" + host
-}
+	acmeHandler := func() http.Handler {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.acme
+	}
 
-// no extra helpers
+	reservedCallback := func() l7oidc.CallbackHandlerFn {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.proxyOIDC == nil {
+			return nil
+		}
+		return p.proxyOIDC.HandleCallback
+	}
+
+	forwardHeaders := func(r *http.Request) {
+		applyForwardHeaders(r, ep)
+	}
+
+	return middleware.MapDeps{
+		builtin.DepHintConsumerL7:        func() any { return hintConsumer },
+		builtin.DepReservedPathCallback:  func() any { return reservedCallback },
+		builtin.DepACMEHandler:           func() any { return l7.ACMEHandlerFn(acmeHandler) },
+		builtin.DepArrivedViaTLS:         func() any { return l7.ArrivedViaTLSFn(RequestArrivedViaTLS) },
+		builtin.DepPathAuthSnapshot:      func() any { return pathAuthSnapshot },
+		builtin.DepCookieContext:         func() any { return cookieContext },
+		builtin.DepOIDCAuthorizeSnapshot: func() any { return authSnapshot },
+		builtin.DepForwardHeaders:        func() any { return forwardHeaders },
+		builtin.DepNeedsMarker:           func() any { return l7.NeedsMarkerFn(needsEmbeddedMarker) },
+		builtin.DepMarkerCookie:          func() any { return l7.MarkerCookieFn(l7.EmbeddedMarkerSetCookie) },
+	}
+}
 
 // StopAll stops all listeners
 func (p *ProxyManager) StopAll() {

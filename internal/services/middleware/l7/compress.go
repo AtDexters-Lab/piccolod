@@ -1,4 +1,4 @@
-package services
+package l7
 
 import (
 	"bufio"
@@ -22,10 +22,10 @@ var gzipWriterPool = sync.Pool{
 	},
 }
 
-// gzipResponseWriter wraps http.ResponseWriter with conditional gzip compression.
+// GzipResponseWriter wraps http.ResponseWriter with conditional gzip compression.
 // It defers the compression decision until WriteHeader, when Content-Type and
 // Content-Encoding are known from the proxied backend.
-type gzipResponseWriter struct {
+type GzipResponseWriter struct {
 	http.ResponseWriter
 	gzWriter   *gzip.Writer
 	request    *http.Request
@@ -35,14 +35,14 @@ type gzipResponseWriter struct {
 	statusCode int  // buffered status code
 }
 
-func newGzipResponseWriter(w http.ResponseWriter, r *http.Request) *gzipResponseWriter {
-	return &gzipResponseWriter{
+func NewGzipResponseWriter(w http.ResponseWriter, r *http.Request) *GzipResponseWriter {
+	return &GzipResponseWriter{
 		ResponseWriter: w,
 		request:        r,
 	}
 }
 
-func (w *gzipResponseWriter) WriteHeader(statusCode int) {
+func (w *GzipResponseWriter) WriteHeader(statusCode int) {
 	if w.headerSent {
 		return
 	}
@@ -71,7 +71,7 @@ func (w *gzipResponseWriter) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
-func (w *gzipResponseWriter) shouldCompress(statusCode int) bool {
+func (w *GzipResponseWriter) shouldCompress(statusCode int) bool {
 	// No body expected, or partial content (compressing would invalidate Content-Range)
 	if statusCode < 200 || statusCode == 204 || statusCode == 206 || statusCode == 304 {
 		return false
@@ -91,7 +91,7 @@ func (w *gzipResponseWriter) shouldCompress(statusCode int) bool {
 
 	// Check content type
 	ct := h.Get("Content-Type")
-	if !isCompressibleContentType(ct) {
+	if !IsCompressibleContentType(ct) {
 		return false
 	}
 
@@ -105,7 +105,7 @@ func (w *gzipResponseWriter) shouldCompress(statusCode int) bool {
 	return true
 }
 
-func (w *gzipResponseWriter) Write(b []byte) (int, error) {
+func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 	if !w.headerSent {
 		w.WriteHeader(http.StatusOK)
 	}
@@ -116,7 +116,7 @@ func (w *gzipResponseWriter) Write(b []byte) (int, error) {
 }
 
 // Flush flushes buffered gzip data and the underlying writer.
-func (w *gzipResponseWriter) Flush() {
+func (w *GzipResponseWriter) Flush() {
 	if w.compress && w.gzWriter != nil {
 		w.gzWriter.Flush()
 	}
@@ -126,7 +126,7 @@ func (w *gzipResponseWriter) Flush() {
 }
 
 // Hijack delegates to the underlying http.Hijacker for WebSocket upgrades.
-func (w *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+func (w *GzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return hj.Hijack()
 	}
@@ -135,12 +135,12 @@ func (w *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // Unwrap returns the underlying ResponseWriter for http.ResponseController
 // interface discovery (Go 1.20+).
-func (w *gzipResponseWriter) Unwrap() http.ResponseWriter {
+func (w *GzipResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
 // Close finalizes gzip compression and returns the writer to the pool.
-func (w *gzipResponseWriter) Close() error {
+func (w *GzipResponseWriter) Close() error {
 	if w.gzWriter != nil {
 		err := w.gzWriter.Close()
 		if err == nil {
@@ -182,9 +182,9 @@ func clientAcceptsGzip(r *http.Request) bool {
 	return false
 }
 
-// isCompressibleContentType returns true if the media type is text-based or
+// IsCompressibleContentType returns true if the media type is text-based or
 // a known compressible application type.
-func isCompressibleContentType(ct string) bool {
+func IsCompressibleContentType(ct string) bool {
 	if ct == "" {
 		return false
 	}

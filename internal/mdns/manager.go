@@ -579,11 +579,16 @@ func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsC
 		}
 	}
 
-	// Add new labels (skip flow:tls — not served on LAN host-based, RFC 20260316)
+	// Add new labels. Only listeners that speak HTTP via gin's
+	// lanHostRoutingMiddleware get an mDNS announcement — others (flow:tls
+	// passthrough, tcp+raw, UDP) are reached via TLS mux SNI or port-based
+	// routing, neither of which needs an mDNS host-label. Per
+	// RFC 20260316 + plan §D10.
 	for _, ep := range payload.Added {
-		if ep.DerivedHostLabel != "" && ep.Flow != api.FlowTLS {
-			merged = append(merged, ep.DerivedHostLabel)
+		if ep.DerivedHostLabel == "" || !api.LanHostBasedEligible(ep.Flow, ep.Protocol) {
+			continue
 		}
+		merged = append(merged, ep.DerivedHostLabel)
 	}
 
 	// Update or delete the app entry

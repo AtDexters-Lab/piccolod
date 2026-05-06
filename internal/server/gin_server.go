@@ -50,6 +50,8 @@ import (
 	"piccolod/internal/runtime/commands"
 	"piccolod/internal/runtime/supervisor"
 	"piccolod/internal/services"
+	"piccolod/internal/services/middleware"
+	l7oidc "piccolod/internal/services/middleware/l7/oidc"
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage"
 	"piccolod/internal/storage/diskprep"
@@ -262,13 +264,9 @@ type relayClientIPKey struct{}
 
 var relayClientIPKeyInstance = relayClientIPKey{}
 
-// Retry budget for the secure loopback ConnContext hint lookup. On loopback,
-// Accept() can return before the TLS mux's DialTimeout() — the hint is
-// registered within microseconds once the TLS mux goroutine runs.
-const (
-	hintRetryAttempts = 40
-	hintRetryInterval = 500 * time.Microsecond // hint arrives in 1-3 retries typically; 20ms budget handles scheduler jitter
-)
+// Retry budget constants moved to middleware/hint.go (HintRetryAttempts /
+// HintRetryInterval) so the secure-loopback ConnContext hook and the L4
+// chain entry share one source of truth on the registration race window.
 
 // portUnpublisherFunc adapts a function into services.PortUnpublisher.
 type portUnpublisherFunc func(int)
@@ -1002,7 +1000,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			}
 			return "piccolo.local"
 		})
-		svcMgr.ProxyManager().SetProxyOIDCConfig(services.ProxyOIDCConfig{
+		svcMgr.ProxyManager().SetProxyOIDCConfig(l7oidc.Config{
 			SessionStore:    s.sessions,
 			UserManager:     s.userManager,
 			GetPortalOrigin: s.portalOriginForRequest,
@@ -3560,12 +3558,12 @@ func (s *GinServer) initSecureLoopback() error {
 				port := int(s.securePort.Load())
 				var clientIP string
 				var found bool
-				for attempt := 0; attempt < hintRetryAttempts; attempt++ {
+				for attempt := 0; attempt < middleware.HintRetryAttempts; attempt++ {
 					clientIP, found = s.serviceManager.ConsumePortalHint(port, addr.Port)
 					if found {
 						break
 					}
-					time.Sleep(hintRetryInterval)
+					time.Sleep(middleware.HintRetryInterval)
 				}
 				if found && clientIP != "" {
 					ctx = context.WithValue(ctx, relayClientIPKeyInstance, clientIP)

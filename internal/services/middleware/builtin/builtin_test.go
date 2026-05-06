@@ -1,0 +1,142 @@
+package builtin
+
+import (
+	"net/http"
+	"testing"
+
+	"piccolod/internal/services/middleware"
+	"piccolod/internal/services/middleware/l4"
+	"piccolod/internal/services/middleware/l7"
+	l7oidc "piccolod/internal/services/middleware/l7/oidc"
+)
+
+// stubDeps returns a MapDeps populated with no-op getters for every dep key
+// the canonical L4 + L7 + L7Response factories read. Any factory missing a
+// dep here would surface as an error from RegisterDefaults + Build, so the
+// table doubles as a coverage check.
+func stubDeps() middleware.MapDeps {
+	metricsReg := l4.NewMetricsRegistry()
+	return middleware.MapDeps{
+		// L4 deps.
+		DepHintLookupL4: func() any {
+			return l4.HintLookupFn(func(int, int) (middleware.Hint, bool) { return middleware.Hint{}, false })
+		},
+		DepMetricsRegistry: func() any { return metricsReg },
+
+		// L7 deps.
+		DepHintConsumerL7:        func() any { return func(r *http.Request) *http.Request { return r } },
+		DepReservedPathCallback:  func() any { return func() l7oidc.CallbackHandlerFn { return nil } },
+		DepACMEHandler:           func() any { return l7.ACMEHandlerFn(func() http.Handler { return nil }) },
+		DepArrivedViaTLS:         func() any { return l7.ArrivedViaTLSFn(func(*http.Request) bool { return false }) },
+		DepPathAuthSnapshot:      func() any { return func() l7.PathAuthSnapshot { return l7.PathAuthSnapshot{} } },
+		DepCookieContext:         func() any { return func(r *http.Request) *http.Request { return r } },
+		DepOIDCAuthorizeSnapshot: func() any { return func() l7oidc.AuthorizeSnapshotState { return l7oidc.AuthorizeSnapshotState{} } },
+		DepForwardHeaders:        func() any { return func(*http.Request) {} },
+		DepNeedsMarker:           func() any { return l7.NeedsMarkerFn(func(*http.Request) bool { return false }) },
+		DepMarkerCookie:          func() any { return l7.MarkerCookieFn(func() string { return "" }) },
+	}
+}
+
+// TestRegisterDefaults_buildsFullChain verifies the registry yields the full
+// canonical L7 + L7Response chains in the documented order, and that every
+// factory binds successfully against the documented dep keys. This is the
+// equivalence anchor for plan §H step 3 — order regressions or missing deps
+// fail here before they can degrade the proxy's request-handling behavior.
+func TestRegisterDefaults_buildsFullChain(t *testing.T) {
+	reg := middleware.NewRegistry()
+	RegisterDefaults(reg)
+
+	spec := middleware.BuildSpec{
+		Endpoint: middleware.EndpointInfo{App: "test", Listener: "test"},
+		Deps:     stubDeps(),
+	}
+
+	got, err := reg.Build(spec)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// L4 without ConnectionAuth: hint_consumer_l4 + conn_metrics, in that
+	// canonical order (outermost first per builtin.go RegisterDefaults
+	// rationale). 2 entries.
+	if len(got.L4) != 2 {
+		t.Fatalf("L4 chain length (no ConnectionAuth): got %d, want 2", len(got.L4))
+	}
+	// L4UDP without ConnectionAuth: conn_metrics_udp only. 1 entry.
+	if len(got.L4UDP) != 1 {
+		t.Fatalf("L4UDP chain length (no ConnectionAuth): got %d, want 1", len(got.L4UDP))
+	}
+	// All 10 canonical L7 entries (path_auth is unconditionally canonical
+	// per RFC 4.1.1's auth-omitted-→-protected default).
+	if len(got.L7) != 10 {
+		t.Fatalf("L7 chain length: got %d, want 10", len(got.L7))
+	}
+	if len(got.L7Response) != 4 {
+		t.Fatalf("L7Response chain length: got %d, want 4", len(got.L7Response))
+	}
+}
+
+// TestRegisterDefaults_connectionAuthGated verifies the conditionally-
+// canonical connection_auth entry composes only when HasConnectionAuth.
+// Composition-blindness check: chain length grows by exactly one on each
+// layer (L4 + L4UDP).
+func TestRegisterDefaults_connectionAuthGated(t *testing.T) {
+	reg := middleware.NewRegistry()
+	RegisterDefaults(reg)
+
+	got, err := reg.Build(middleware.BuildSpec{
+		Endpoint:          middleware.EndpointInfo{App: "test", Listener: "test"},
+		HasConnectionAuth: true,
+		Deps:              stubDeps(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(got.L4) != 3 {
+		t.Errorf("L4 chain length with ConnectionAuth: got %d, want 3 (hint_consumer_l4 + conn_metrics + connection_auth)", len(got.L4))
+	}
+	if len(got.L4UDP) != 2 {
+		t.Errorf("L4UDP chain length with ConnectionAuth: got %d, want 2 (connection_auth_udp + conn_metrics_udp)", len(got.L4UDP))
+	}
+}
+
+// TestRegisterDefaults_pathAuthAlwaysComposed verifies that path_auth is
+// composed unconditionally — it has no spec gate and so always shows up in
+// the L7 canonical chain. RFC 4.1.1's auth-omitted-→-protected default is
+// implemented inside path_auth itself; gating the composition would silently
+// disable enforcement on listeners that omit the auth block.
+func TestRegisterDefaults_pathAuthAlwaysComposed(t *testing.T) {
+	reg := middleware.NewRegistry()
+	RegisterDefaults(reg)
+
+	got, err := reg.Build(middleware.BuildSpec{
+		Endpoint: middleware.EndpointInfo{App: "test", Listener: "test"},
+		Deps:     stubDeps(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(got.L7) != 10 {
+		t.Fatalf("L7 chain length: got %d, want 10 (path_auth always composed)", len(got.L7))
+	}
+}
+
+// TestRegisterDefaults_missingDepFailsClosed verifies that a factory whose
+// required dep isn't bound returns an error from Build (which the proxy
+// treats as a config_error per plan D7 §S5).
+func TestRegisterDefaults_missingDepFailsClosed(t *testing.T) {
+	reg := middleware.NewRegistry()
+	RegisterDefaults(reg)
+
+	deps := stubDeps()
+	delete(deps, DepACMEHandler) // simulate misconfiguration
+
+	spec := middleware.BuildSpec{
+		Endpoint: middleware.EndpointInfo{App: "test", Listener: "test"},
+		Deps:     deps,
+	}
+
+	if _, err := reg.Build(spec); err == nil {
+		t.Fatal("Build with missing dep: expected error, got nil")
+	}
+}

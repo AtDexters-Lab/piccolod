@@ -531,10 +531,11 @@ func (s *GinServer) lanHostRoutingMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// flow:tls endpoints are not supported on LAN host-based routing (RFC 20260316).
-		// Users access them via port-based (piccolo.local:<port>) or remote (app.<base>).
-		// flow:udp endpoints never reach here (IsEligibleForHostRouting returns false for UDP).
-		if ep.Flow == api.FlowTLS {
+		// Only HTTP/Websocket-on-flow:tcp endpoints can be proxied via gin's
+		// host-based router — everything else (flow:tls passthrough,
+		// tcp+raw added in plan §D8) is reachable via the TLS mux SNI route
+		// or port-based access. Per RFC 20260316 + plan §D9.
+		if !api.LanHostBasedEligible(ep.Flow, ep.Protocol) {
 			c.Next()
 			return
 		}

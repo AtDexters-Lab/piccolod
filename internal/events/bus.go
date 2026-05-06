@@ -103,11 +103,15 @@ type ControlStoreCommit struct {
 }
 
 // ServiceEndpointInfo is a lightweight representation of a service endpoint for events.
+// Protocol is required alongside Flow for downstream consumers that need to
+// distinguish raw vs HTTP/Websocket on the same flow (e.g., mDNS suppression
+// of tcp+raw from LAN host-based announcements per plan §D9/D15).
 type ServiceEndpointInfo struct {
 	App              string
 	Name             string
 	DerivedHostLabel string
 	Flow             api.ListenerFlow
+	Protocol         api.ListenerProtocol
 }
 
 // ServiceEndpointsChanged announces endpoint lifecycle transitions for an app.
