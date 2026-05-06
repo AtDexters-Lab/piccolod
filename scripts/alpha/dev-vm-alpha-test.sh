@@ -18,6 +18,11 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> reboot           # stage 9: reboot & unlock cycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> storage-post     # stage 10: post-reboot storage
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> stewardship      # stage 11: resource stewardship (slice drop-ins, podman args)
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> connection-auth  # stage 12: ConnectionAuth L4 deny/allow rules (RFC 20260505)
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> tcp-raw          # stage 13: tcp+raw + __primary listener (RFC 20260505)
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> cookie-isolation # stage 14: cross-app cookie injection regression (f1a24d8)
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> listener-pipeline # stages 12+13+14 (the listener-pipeline RFC validation suite)
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> net-supervisor   # stage 15: probe-decide-act validation (RFC 20260505) — destructive (restarts piccolod, plants legacy ledger, blocks rfkill)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> logs             # download piccolod journal
 set -euo pipefail
 
@@ -1131,25 +1136,854 @@ print(json.dumps({
 }
 
 # ─────────────────────────────────────────────────────────
+# Stage 12: ConnectionAuth (L4 IP allow/deny — listener-pipeline RFC 20260505)
+#
+# Verifies the new ConnectionAuth field on AppListener composes through the
+# registry-driven L4 chain. Three scenarios:
+#   (a) default: deny, no rules        → TCP RST (chain denies, conn closed)
+#   (b) default: deny + allow $myip/32 → HTTP response (L4 allowed, L7 may gate)
+#   (c) default: allow + deny $myip/32 → TCP RST
+# Plus the S4 trim fix (default: " allow" with leading space parses correctly).
+# ─────────────────────────────────────────────────────────
+stage_connection_auth() {
+  echo -e "\n${CYAN}═══ Stage 12: ConnectionAuth (L4 IP allow/deny) ═══${NC}"
+  ensure_session
+
+  # Pre-cleanup any leftovers from a prior aborted run (S2 fix).
+  local _ca_app
+  for _ca_app in cadenyall caallowme cadenyme catrim cabadcidr; do
+    local _t; _t=$(csrf)
+    curl -s -o /dev/null -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -X DELETE -H "X-CSRF-Token: $_t" "http://$IP/api/v1/apps/$_ca_app" >/dev/null 2>&1 || true
+  done
+  sleep 2
+
+  # Detect the source IP we appear as to the VM (for the allow/deny-rule cases).
+  local host_ip
+  host_ip=$(ip -4 route get "$IP" 2>/dev/null | head -1 | grep -oP 'src \K[0-9.]+' || echo "")
+  if [[ -z "$host_ip" ]]; then
+    skip "12.0" "Detect host source IP" "ip route get failed"
+    return
+  fi
+  echo -e "  ${CYAN}INFO${NC} test client appears to VM as: $host_ip"
+
+  # Helper: install whoami app with given listener YAML, wait running, return public_port.
+  # On any failure path emits `install_failed_<code>` or `not_running` so callers
+  # can distinguish via the `^[0-9]+$` regex; the function never returns non-zero
+  # (which would trip set -e at caller's $(...) capture).
+  _ca_install() {
+    local name="$1" listener_yaml="$2"
+    local yaml='services:
+  main:
+    image: docker.io/traefik/whoami:latest
+    bind_ports: [80]
+listeners:
+'"$listener_yaml"'
+resources:
+  priority: normal
+  memory:
+    min_required: 64MB
+    profile: bounded
+x-piccolo:
+  mode: service'
+    local payload
+    payload=$(YAML="$yaml" NAME="$name" python3 -c "
+import json, os
+print(json.dumps({
+    'app_definition': os.environ['YAML'],
+    'inputs': {'__app_address__': os.environ['NAME']},
+    'catalog_source': 'none'}))")
+    local token; token=$(csrf)
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 \
+      -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+      -d "$payload" "http://$IP/api/v1/apps" || true)
+    [[ "$code" == "201" ]] || { echo "install_failed_$code"; return 0; }
+    local i ran=0
+    for i in $(seq 1 60); do
+      local s
+      s=$(curl -s -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$name" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('app',{}).get('status',''))" 2>/dev/null || true)
+      [[ "$s" == "running" ]] && { ran=1; break; }
+      sleep 2
+    done
+    [[ "$ran" -eq 1 ]] || { echo "not_running"; return 0; }
+    sleep 2  # backend warm-up
+    curl -s -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$name" | python3 -c "
+import sys,json
+ls=json.load(sys.stdin).get('data',{}).get('listeners') or []
+for l in ls:
+    if l.get('public_port'): print(l['public_port']); break" || true
+  }
+
+  _ca_uninstall() {
+    local name="$1" token
+    token=$(csrf)
+    curl -s -o /dev/null -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -X DELETE -H "X-CSRF-Token: $token" "http://$IP/api/v1/apps/$name"
+    sleep 2
+  }
+
+  # Probe a port and report TCP-level outcome.
+  # Echoes "rst" on TCP rejection, "http_<code>" on HTTP response, or "timeout".
+  # set -e safety: curl returns non-zero on TCP-level failures (refused/RST/
+  # timeout) which would normally abort the script at the var=$(...) line.
+  # The `|| rc=$?` pattern keeps set -e from firing while still capturing
+  # the curl exit code we need to classify.
+  _ca_probe() {
+    local port="$1" out rc=0
+    out=$(curl -sS -m 5 -b "$COOKIE_JAR" -w '|HTTP_CODE:%{http_code}' "http://$IP:$port/" 2>&1) || rc=$?
+    if [[ $rc -eq 56 ]] || [[ $rc -eq 52 ]] || [[ $rc -eq 7 ]] || echo "$out" | grep -qE 'reset by peer|Recv failure|Empty reply'; then
+      echo "rst"
+    elif [[ $rc -ne 0 ]]; then
+      echo "timeout"
+    else
+      local code
+      code=$(echo "$out" | grep -oP 'HTTP_CODE:\K[0-9]+' || true)
+      echo "http_${code:-?}"
+    fi
+  }
+
+  # ── (a) default: deny, no rules ──
+  local deny_listener='  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: http
+    connection_auth:
+      default: deny'
+  local port_a
+  port_a=$(_ca_install "cadenyall" "$deny_listener")
+  if [[ ! "$port_a" =~ ^[0-9]+$ ]]; then
+    echo -e "  ${RED}FAIL${NC} [12.1] Install deny-all app: $port_a"
+    ((FAIL_COUNT++)) || true
+  else
+    echo -e "  ${GREEN}PASS${NC} [12.1] Install deny-all app (port $port_a)"
+    ((PASS_COUNT++)) || true
+    local res_a; res_a=$(_ca_probe "$port_a")
+    check "12.2" "deny-all → TCP RST (L4 chain rejects)" "$res_a" "rst"
+    _ca_uninstall "cadenyall"
+  fi
+
+  # ── (b) default: deny + allow $host_ip/32 ──
+  local allow_listener="  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: http
+    connection_auth:
+      default: deny
+      rules:
+        - match: $host_ip/32
+          strategy: allow"
+  local port_b
+  port_b=$(_ca_install "caallowme" "$allow_listener")
+  if [[ ! "$port_b" =~ ^[0-9]+$ ]]; then
+    echo -e "  ${RED}FAIL${NC} [12.3] Install allow-rule app: $port_b"
+    ((FAIL_COUNT++)) || true
+  else
+    echo -e "  ${GREEN}PASS${NC} [12.3] Install allow-rule app (port $port_b)"
+    ((PASS_COUNT++)) || true
+    local res_b; res_b=$(_ca_probe "$port_b")
+    # Success here means we got an HTTP response (not TCP RST). HTTP code is
+    # likely 401 from L7 path_auth (no auth: block in manifest), but any
+    # http_* result proves L4 admitted.
+    if [[ "$res_b" == http_* ]]; then
+      echo -e "  ${GREEN}PASS${NC} [12.4] allow-rule → HTTP response (L4 admitted, $res_b)"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [12.4] allow-rule should admit; got $res_b"
+      ((FAIL_COUNT++)) || true
+    fi
+    _ca_uninstall "caallowme"
+  fi
+
+  # ── (c) default: allow + deny $host_ip/32 ──
+  local denyme_listener="  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: http
+    connection_auth:
+      default: allow
+      rules:
+        - match: $host_ip/32
+          strategy: deny"
+  local port_c
+  port_c=$(_ca_install "cadenyme" "$denyme_listener")
+  if [[ ! "$port_c" =~ ^[0-9]+$ ]]; then
+    echo -e "  ${RED}FAIL${NC} [12.5] Install deny-rule app: $port_c"
+    ((FAIL_COUNT++)) || true
+  else
+    echo -e "  ${GREEN}PASS${NC} [12.5] Install deny-rule app (port $port_c)"
+    ((PASS_COUNT++)) || true
+    local res_c; res_c=$(_ca_probe "$port_c")
+    check "12.6" "deny-rule for our IP → TCP RST" "$res_c" "rst"
+    _ca_uninstall "cadenyme"
+  fi
+
+  # ── (d) S4 trim fix: leading-space "default: ' allow'" parses ──
+  local trim_listener='  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: http
+    connection_auth:
+      default: " allow"'
+  local port_d
+  port_d=$(_ca_install "catrim" "$trim_listener")
+  if [[ "$port_d" =~ ^[0-9]+$ ]]; then
+    echo -e "  ${GREEN}PASS${NC} [12.7] S4 trim fix: leading-space default parses + builds (port $port_d)"
+    ((PASS_COUNT++)) || true
+    _ca_uninstall "catrim"
+  else
+    echo -e "  ${RED}FAIL${NC} [12.7] S4 trim fix: $port_d"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # ── (e) bad CIDR → parser rejects pre-build ──
+  local bad_yaml='services:
+  main: { image: docker.io/traefik/whoami:latest, bind_ports: [80] }
+listeners:
+  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: http
+    connection_auth:
+      default: deny
+      rules:
+        - match: "not-a-cidr"
+          strategy: allow
+resources: { priority: normal, memory: { min_required: 64MB, profile: bounded } }
+x-piccolo: { mode: service }'
+  local bad_payload
+  bad_payload=$(YAML="$bad_yaml" python3 -c "
+import json,os
+print(json.dumps({'app_definition':os.environ['YAML'],'inputs':{'__app_address__':'cabadcidr'},'catalog_source':'none'}))")
+  local bad_resp token
+  token=$(csrf)
+  bad_resp=$(curl -s -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$bad_payload" "http://$IP/api/v1/apps" 2>&1)
+  check "12.8" "Bad CIDR rejected by parser (pre-build validation)" "$bad_resp" "INVALID_CONN_AUTH_MATCH"
+}
+
+# ─────────────────────────────────────────────────────────
+# Stage 13: tcp+raw + __primary (listener-pipeline RFC 20260505)
+#
+# Verifies tcp+raw protocol can be __primary (was previously rejected),
+# DerivedHostLabel populates, byte passthrough works, and LAN host-based
+# routing + mDNS are correctly suppressed (HTTP-only path per RFC).
+# Backend: traefik/whoami (HTTP backend used as raw bytes — the L4 chain
+# doesn't parse payloads, so HTTP-over-tcp+raw proves byte passthrough).
+# ─────────────────────────────────────────────────────────
+stage_tcp_raw() {
+  echo -e "\n${CYAN}═══ Stage 13: tcp+raw + __primary ═══${NC}"
+  ensure_session
+
+  local APP_NAME="rawtcp"
+  # Cleanup any prior run
+  local token; token=$(csrf)
+  curl -s -o /dev/null -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X DELETE -H "X-CSRF-Token: $token" "http://$IP/api/v1/apps/$APP_NAME" 2>/dev/null || true
+  sleep 2
+
+  local yaml='services:
+  main:
+    image: docker.io/traefik/whoami:latest
+    bind_ports: [80]
+listeners:
+  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: raw
+resources:
+  priority: normal
+  memory:
+    min_required: 64MB
+    profile: bounded
+x-piccolo:
+  mode: service'
+  local payload
+  payload=$(YAML="$yaml" python3 -c "
+import json,os
+print(json.dumps({'app_definition':os.environ['YAML'],'inputs':{'__app_address__':'rawtcp'},'catalog_source':'none'}))")
+
+  token=$(csrf)
+  local install_code
+  install_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$payload" "http://$IP/api/v1/apps")
+  check "13.1" "Parser accepts __primary + tcp+raw (was rejected pre-RFC)" "$install_code" "201"
+  [[ "$install_code" == "201" ]] || return
+
+  # Wait for backend healthy
+  local i
+  for i in $(seq 1 60); do
+    local h
+    h=$(curl -s -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$APP_NAME" \
+      | python3 -c "import sys,json
+ls=json.load(sys.stdin).get('data',{}).get('listeners') or []
+for l in ls: print(l.get('health',{}).get('status')); break" 2>/dev/null || true)
+    [[ "$h" == "ok" ]] && break
+    sleep 2
+  done
+  sleep 5  # backend warm-up
+
+  local meta
+  meta=$(curl -s -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$APP_NAME" || true)
+  local pub_port derived lan_host_url
+  pub_port=$(echo "$meta" | python3 -c "import sys,json
+ls=json.load(sys.stdin).get('data',{}).get('listeners') or []
+for l in ls:
+    if l.get('public_port'): print(l['public_port']); break" 2>/dev/null || true)
+  derived=$(echo "$meta" | python3 -c "import sys,json
+ls=json.load(sys.stdin).get('data',{}).get('listeners') or []
+for l in ls:
+    if l.get('derived_host_label'): print(l['derived_host_label']); break" 2>/dev/null || true)
+  lan_host_url=$(echo "$meta" | python3 -c "import sys,json
+ls=json.load(sys.stdin).get('data',{}).get('listeners') or []
+for l in ls:
+    if l.get('lan_host_url'): print(l['lan_host_url']); break" 2>/dev/null || true)
+
+  if [[ -n "$derived" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [13.2] DerivedHostLabel populated for tcp+raw: \"$derived\""
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [13.2] DerivedHostLabel empty (IsEligibleForHostRouting regression)"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # Byte passthrough — send raw HTTP, expect raw HTTP back. Use curl rather
+  # than nc because nc -N's EOF handling is finicky across distros and tcp+raw
+  # is byte-oriented (curl over plain TCP is equivalent to "raw HTTP bytes"
+  # from the listener's perspective). Backend takes 20-40s past health=ok on
+  # first install due to pasta/podman wiring; retry up to 60s.
+  local raw_body; raw_body=$(mktemp /tmp/claude-1000/raw-body-XXXXXX)
+  local body="" attempt code=""
+  for attempt in $(seq 1 20); do
+    code=$(curl -s -o "$raw_body" -w '%{http_code}' --max-time 4 "http://$IP:$pub_port/" 2>/dev/null || true)
+    if [[ "$code" == "200" ]]; then
+      body=$(head -3 "$raw_body" 2>/dev/null || true)
+      break
+    fi
+    sleep 3
+  done
+  if [[ "$code" == "200" ]] && echo "$body" | grep -qiE 'hostname|whoami|x-real-ip'; then
+    echo -e "  ${GREEN}PASS${NC} [13.3] LAN port-based byte passthrough (whoami HTTP/200, attempt ${attempt}/20)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [13.3] No HTTP response through tcp+raw proxy (last code=$code, body head: $body)"
+    ((FAIL_COUNT++)) || true
+  fi
+  rm -f "$raw_body"
+
+  # LAN host-based should NOT route tcp+raw — should fall through to portal/404
+  if [[ -n "$lan_host_url" ]]; then
+    local host_label
+    host_label=$(echo "$lan_host_url" | sed 's|http://||;s|/.*||')
+    local lan_resp
+    lan_resp=$(curl -s --max-time 3 --resolve "$host_label:80:$IP" "http://$host_label/" 2>&1 | head -3)
+    if echo "$lan_resp" | grep -qiE 'whoami|hostname'; then
+      echo -e "  ${RED}FAIL${NC} [13.4] LAN host-based incorrectly routed tcp+raw to backend"
+      ((FAIL_COUNT++)) || true
+    else
+      echo -e "  ${GREEN}PASS${NC} [13.4] LAN host-based correctly suppressed for tcp+raw (HTTP-only path)"
+      ((PASS_COUNT++)) || true
+    fi
+  else
+    skip "13.4" "LAN host-based suppression" "no lan_host_url"
+  fi
+
+  # mDNS suppression — host-side avahi-browse shouldn't see this listener
+  if command -v avahi-browse >/dev/null 2>&1; then
+    local mdns_out
+    mdns_out=$(timeout 5 avahi-browse -arpt 2>/dev/null | grep -i "$derived" || true)
+    if [[ -z "$mdns_out" ]]; then
+      echo -e "  ${GREEN}PASS${NC} [13.5] mDNS suppression for tcp+raw (no avahi entries)"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [13.5] mDNS entries leaked for tcp+raw: $mdns_out"
+      ((FAIL_COUNT++)) || true
+    fi
+  else
+    skip "13.5" "mDNS suppression check" "avahi-browse not installed on host"
+  fi
+
+  # Cleanup before deny-variant install
+  token=$(csrf)
+  curl -s -o /dev/null -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X DELETE -H "X-CSRF-Token: $token" "http://$IP/api/v1/apps/$APP_NAME"
+  sleep 3
+
+  # ── ConnectionAuth deny on tcp+raw (combined feature test) ──
+  local deny_yaml='services:
+  main:
+    image: docker.io/traefik/whoami:latest
+    bind_ports: [80]
+listeners:
+  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: raw
+    connection_auth:
+      default: deny
+resources:
+  priority: normal
+  memory:
+    min_required: 64MB
+    profile: bounded
+x-piccolo:
+  mode: service'
+  local deny_payload
+  deny_payload=$(YAML="$deny_yaml" python3 -c "
+import json,os
+print(json.dumps({'app_definition':os.environ['YAML'],'inputs':{'__app_address__':'rawtcp'},'catalog_source':'none'}))")
+
+  token=$(csrf)
+  local deny_install
+  deny_install=$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$deny_payload" "http://$IP/api/v1/apps")
+  if [[ "$deny_install" != "201" ]]; then
+    skip "13.6" "ConnectionAuth deny on tcp+raw" "install_failed_$deny_install"
+  else
+    for i in $(seq 1 60); do
+      local h
+      h=$(curl -s -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$APP_NAME" \
+        | python3 -c "import sys,json
+ls=json.load(sys.stdin).get('data',{}).get('listeners') or []
+for l in ls: print(l.get('health',{}).get('status')); break" 2>/dev/null || true)
+      [[ "$h" == "ok" ]] && break
+      sleep 2
+    done
+    sleep 3
+    local deny_port
+    deny_port=$(curl -s -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$APP_NAME" \
+      | python3 -c "import sys,json
+ls=json.load(sys.stdin).get('data',{}).get('listeners') or []
+for l in ls:
+    if l.get('public_port'): print(l['public_port']); break" 2>/dev/null || true)
+    # Use curl for the deny-side probe (same `|| rc=$?` pattern as _ca_probe).
+    # The deny scenario produces TCP RST or empty-reply; curl exits non-zero
+    # on both. Capturing rc explicitly avoids the set -e abort.
+    local deny_out="" deny_rc=0
+    deny_out=$(curl -sS -m 4 "http://$IP:$deny_port/" 2>&1) || deny_rc=$?
+    if [[ "$deny_rc" -ne 0 ]] || [[ -z "$deny_out" ]]; then
+      echo -e "  ${GREEN}PASS${NC} [13.6] ConnectionAuth deny on tcp+raw closes connection (curl rc=$deny_rc)"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [13.6] tcp+raw deny-all returned data: \"$(echo "$deny_out" | head -1)\""
+      ((FAIL_COUNT++)) || true
+    fi
+  fi
+
+  # Cleanup
+  token=$(csrf)
+  curl -s -o /dev/null -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X DELETE -H "X-CSRF-Token: $token" "http://$IP/api/v1/apps/$APP_NAME"
+}
+
+# ─────────────────────────────────────────────────────────
+# Stage 14: Cookie isolation regression (security fix f1a24d8)
+#
+# Verifies that the response-side cookie_isolation_response middleware drops
+# cross-app __piccolo_* injection attempts, regardless of whose prefix they
+# target. Backend: mccutchen/go-httpbin (has /cookies/set?<k=v>... endpoint).
+#
+# Pre-fix: backend Set-Cookie: __piccolo_otherapp_session=ATTACKER would pass
+# through host-scoped, then on visit to otherapp the request-side strip would
+# unwrap to "session=ATTACKER" → forged session.
+# ─────────────────────────────────────────────────────────
+stage_cookie_isolation() {
+  echo -e "\n${CYAN}═══ Stage 14: Cookie Isolation Regression (f1a24d8) ═══${NC}"
+  ensure_session
+
+  local APP_NAME="hbin"
+  # Cleanup any prior run
+  local token; token=$(csrf)
+  curl -s -o /dev/null -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X DELETE -H "X-CSRF-Token: $token" "http://$IP/api/v1/apps/$APP_NAME" 2>/dev/null || true
+  sleep 2
+
+  # httpbin with PUBLIC auth so we can curl unauthenticated and exercise the
+  # cookie filter on the actual backend response (not a 401 from path_auth).
+  local yaml='services:
+  main:
+    image: docker.io/mccutchen/go-httpbin:latest
+    bind_ports: [8080]
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: /
+          type: prefix
+          strategy: public
+resources:
+  priority: normal
+  memory:
+    min_required: 64MB
+    profile: bounded
+x-piccolo:
+  mode: service'
+  local payload
+  payload=$(YAML="$yaml" python3 -c "
+import json,os
+print(json.dumps({'app_definition':os.environ['YAML'],'inputs':{'__app_address__':'hbin'},'catalog_source':'none'}))")
+
+  token=$(csrf)
+  local install_code
+  install_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$payload" "http://$IP/api/v1/apps")
+  check "14.1" "Install httpbin app" "$install_code" "201"
+  [[ "$install_code" == "201" ]] || return
+
+  # Wait for healthy
+  local i
+  for i in $(seq 1 60); do
+    local h
+    h=$(curl -s -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$APP_NAME" \
+      | python3 -c "import sys,json
+ls=json.load(sys.stdin).get('data',{}).get('listeners') or []
+for l in ls: print(l.get('health',{}).get('status')); break" 2>/dev/null || true)
+    [[ "$h" == "ok" ]] && break
+    sleep 2
+  done
+  sleep 5
+
+  local port
+  port=$(curl -s -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$APP_NAME" \
+    | python3 -c "import sys,json
+ls=json.load(sys.stdin).get('data',{}).get('listeners') or []
+for l in ls:
+    if l.get('public_port'): print(l['public_port']); break" 2>/dev/null || true)
+
+  # Sanity: backend reachable
+  local sanity
+  sanity=$(curl -s --max-time 5 "http://$IP:$port/headers" | head -3)
+  if echo "$sanity" | grep -q '"headers"'; then
+    echo -e "  ${GREEN}PASS${NC} [14.2] Backend reachable through new chain"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [14.2] Backend not reachable: $sanity"
+    ((FAIL_COUNT++)) || true
+    token=$(csrf)
+    curl -s -o /dev/null -b "$COOKIE_JAR" -c "$COOKIE_JAR" -X DELETE -H "X-CSRF-Token: $token" "http://$IP/api/v1/apps/$APP_NAME"
+    return
+  fi
+
+  # Attack: backend emits 5 Set-Cookies via httpbin's /cookies/set
+  local attack_resp
+  attack_resp=$(curl -sv --max-time 5 \
+    "http://$IP:$port/cookies/set?__piccolo_victim_session=ATTACKER&__piccolo_hbin_self=SELFINJ&piccolo_legacy=L&__Host-secure=HOK&ordinary=OK" 2>&1)
+  local set_cookies
+  set_cookies=$(echo "$attack_resp" | grep -E '^< Set-Cookie:' || true)
+
+  # Cross-app __piccolo_<otherapp>_* must be DROPPED (the f1a24d8 fix)
+  if echo "$set_cookies" | grep -qE 'Set-Cookie: ?__piccolo_victim_session='; then
+    echo -e "  ${RED}FAIL${NC} [14.3] f1a24d8 REGRESSION: cross-app __piccolo_victim_session leaked through"
+    ((FAIL_COUNT++)) || true
+  else
+    echo -e "  ${GREEN}PASS${NC} [14.3] f1a24d8 fix: cross-app __piccolo_victim_session DROPPED"
+    ((PASS_COUNT++)) || true
+  fi
+
+  # Same-app __piccolo_<thisapp>_* must also be DROPPED (proxy reserved namespace)
+  if echo "$set_cookies" | grep -qE 'Set-Cookie: ?__piccolo_hbin_self='; then
+    echo -e "  ${RED}FAIL${NC} [14.4] same-app __piccolo_hbin_self leaked (proxy namespace must be reserved)"
+    ((FAIL_COUNT++)) || true
+  else
+    echo -e "  ${GREEN}PASS${NC} [14.4] same-app __piccolo_hbin_self DROPPED (reserved namespace)"
+    ((PASS_COUNT++)) || true
+  fi
+
+  # Existing piccolo_ (single underscore) prefix must be DROPPED via isPiccoloCookieName
+  if echo "$set_cookies" | grep -qE 'Set-Cookie: ?piccolo_legacy='; then
+    echo -e "  ${RED}FAIL${NC} [14.5] piccolo_ legacy prefix leaked (existing isPiccoloCookieName regression)"
+    ((FAIL_COUNT++)) || true
+  else
+    echo -e "  ${GREEN}PASS${NC} [14.5] piccolo_legacy DROPPED (existing filter)"
+    ((PASS_COUNT++)) || true
+  fi
+
+  # Legitimate cookies should be rewritten with per-app prefix __piccolo_hbin_*
+  # (port-based LAN mode → cookies are host-scoped → per-app namespacing applies)
+  if echo "$set_cookies" | grep -qE 'Set-Cookie: ?__piccolo_hbin_ordinary='; then
+    echo -e "  ${GREEN}PASS${NC} [14.6] ordinary cookie rewritten with per-app prefix"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [14.6] ordinary cookie missing or not rewritten"
+    echo -e "       Set-Cookie headers: $set_cookies"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # Cleanup
+  token=$(csrf)
+  curl -s -o /dev/null -w '  [cleanup] uninstall %{http_code}\n' \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X DELETE -H "X-CSRF-Token: $token" "http://$IP/api/v1/apps/$APP_NAME"
+}
+
+# ─────────────────────────────────────────────────────────
+# Stage 15: Net-supervisor (probe-decide-act, RFC 20260505)
+#
+# Validates the cutover from the procedural watchdog + ConnState machine to
+# the new probe→decide→act architecture. Covers the failure modes that the
+# rewrite was designed to handle, exercised non-destructively from the host:
+#
+#   - Supervisor tick observability + cadence
+#   - /api/v1/admin/wifi/status legacy wire contract preserved
+#   - Private dbus connection (F3-B1 fix)
+#   - No NM connectivity-check externality per tick (UR1 bug002)
+#   - Piccolod restart mid-state — ledger reload + supervisor resume (1.D.G6)
+#   - Legacy net-watchdog-reboots → net-ledger.json migration (1.E.bug010)
+#   - rfkill+profile dampened to ConfigHealth Faulted at 3-of-3 (codex P1-4),
+#     no bounce because L3 up via eth — the silent-cope behavior
+#
+# Out of scope here (handled manually with VBoxManage from the operator):
+#   - Eth disconnect/reconnect — needs SSH path swap to the wifi IP
+#   - AP-entry showcase — needs eth + wifi config-faulted simultaneously
+#   - Originating-incident hardware (rtw88_8723de)
+# ─────────────────────────────────────────────────────────
+stage_net_supervisor() {
+  echo -e "\n${CYAN}═══ Stage 15: Net-supervisor (probe-decide-act) ═══${NC}"
+
+  # B4 fix — destructive ops (rfkill block, piccolod stop) need an EXIT trap
+  # so a Ctrl-C / set -e death between block-and-unblock or stop-and-start
+  # leaves the dev VM recoverable rather than hosed.
+  _ns_cleanup() {
+    vssh "rfkill unblock wifi 2>/dev/null; systemctl is-active piccolod >/dev/null 2>&1 || systemctl start piccolod 2>/dev/null" >/dev/null 2>&1 || true
+  }
+  trap _ns_cleanup EXIT
+
+  # Settle window after piccolod restart — used by 15.6 and 15.7. Polling
+  # the journal would be tighter but a fixed window is consistent and
+  # easier to reason about across the two ledger-touching tests.
+  local PICCOLO_SETTLE_S=5
+
+  # Detect environment
+  local has_wifi_profile=0 has_wifi_device=0 conn_via=""
+  if vssh "nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep ':802-11-wireless\$'" >/dev/null 2>&1; then
+    has_wifi_profile=1
+  fi
+  if vssh "nmcli -t -f DEVICE,TYPE device status 2>/dev/null | grep ':wifi\$'" >/dev/null 2>&1; then
+    has_wifi_device=1
+  fi
+  if [[ "$IP" == "$(vssh 'ip -4 -o addr show enp0s3 2>/dev/null | grep -oP "inet \K[0-9.]+" | head -1' 2>/dev/null || true)" ]]; then
+    conn_via="eth"
+  else
+    conn_via="wifi"
+  fi
+  echo -e "  ${CYAN}INFO${NC} SSH path: $conn_via; wifi profile: $has_wifi_profile; wifi device present: $has_wifi_device"
+
+  # 15.1 supervisor tick visible
+  local tick_line
+  tick_line=$(vssh "journalctl -u piccolod --no-pager -n 200 2>/dev/null | grep 'net-supervisor.tick' | tail -1")
+  if echo "$tick_line" | grep -q 'uplink='; then
+    echo -e "  ${GREEN}PASS${NC} [15.1] Supervisor tick visible in journal"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [15.1] No supervisor tick in journal — supervisor not running?"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+
+  # 15.2 tick cadence ≈ 30s — sample 3 ticks
+  local timestamps
+  timestamps=$(vssh "journalctl -u piccolod --no-pager -n 500 2>/dev/null | grep 'net-supervisor.tick' | tail -3 | awk '{print \$1, \$2, \$3}'")
+  local distinct_count
+  distinct_count=$(echo "$timestamps" | wc -l)
+  if [[ "$distinct_count" -ge 2 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [15.2] Tick cadence active (${distinct_count}+ ticks observed)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [15.2] Insufficient ticks observed"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 15.3 wire contract — /api/v1/wifi/status returns valid legacy ConnState
+  ensure_session
+  local wifi_status state
+  wifi_status=$(curl -s -b "$COOKIE_JAR" --connect-timeout 5 "http://$IP/api/v1/wifi/status" 2>/dev/null || true)
+  state=$(echo "$wifi_status" | python3 -c "import sys,json
+try: print(json.load(sys.stdin).get('state',''))
+except: print('')" 2>/dev/null || true)
+  case "$state" in
+    ethernet|wifi_connected|ap_mode|reconnecting|disconnected)
+      echo -e "  ${GREEN}PASS${NC} [15.3] Legacy wire contract: state=\"$state\""
+      ((PASS_COUNT++)) || true
+      ;;
+    *)
+      echo -e "  ${RED}FAIL${NC} [15.3] Unexpected state: \"$state\" (response: $(echo "$wifi_status" | head -c 200))"
+      ((FAIL_COUNT++)) || true
+      ;;
+  esac
+
+  # 15.4 private dbus connection (F3-B1) — piccolod has 2 dbus connections
+  local dbus_count
+  dbus_count=$(vssh "busctl --no-pager 2>/dev/null | awk '\$3==\"piccolod\"' | wc -l")
+  if [[ "$dbus_count" -ge 2 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [15.4] Private dbus connection (F3-B1): $dbus_count piccolod connections"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [15.4] F3-B1 fix: expected ≥2 piccolod dbus connections, got $dbus_count"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 15.5 NM no per-tick connectivity probe (UR1 bug002)
+  local probe_count
+  probe_count=$(vssh "journalctl -u NetworkManager --no-pager --since '3 minutes ago' 2>/dev/null | grep -ciE 'connectivity check|HTTP GET' | head -1" 2>/dev/null || echo 0)
+  probe_count="${probe_count:-0}"
+  # Strip whitespace/newlines defensively
+  probe_count=$(echo "$probe_count" | tr -d '[:space:]')
+  if [[ "$probe_count" =~ ^[0-9]+$ ]] && [[ "$probe_count" -le 2 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [15.5] No per-tick NM connectivity probes (UR1 bug002): $probe_count in 3min"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [15.5] UR1 bug002 regression: \"$probe_count\" NM probes in 3min"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 15.6 piccolod restart mid-state — ledger reload + clean resume
+  echo -e "  ${CYAN}INFO${NC} restarting piccolod for ledger-reload test..."
+  vssh "systemctl restart piccolod" >/dev/null 2>&1
+  # Wait for service active
+  local i
+  for i in $(seq 1 30); do
+    if vssh "systemctl is-active piccolod" 2>/dev/null | grep -q '^active$'; then break; fi
+    sleep 2
+  done
+  sleep "$PICCOLO_SETTLE_S"  # let supervisor get one tick in
+  local post_restart_tick
+  post_restart_tick=$(vssh "journalctl -u piccolod --no-pager --since '20 seconds ago' 2>/dev/null | grep -E 'net-supervisor: ledger loaded|net-supervisor.tick' | head -3")
+  if echo "$post_restart_tick" | grep -q 'ledger loaded'; then
+    echo -e "  ${GREEN}PASS${NC} [15.6] Piccolod restart: ledger reload visible, supervisor resumed (1.D.G6)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [15.6] No 'ledger loaded' message after restart"
+    ((FAIL_COUNT++)) || true
+  fi
+  # Re-establish session — restart invalidates cookies
+  ensure_session
+
+  # 15.7 legacy ledger migration (1.E.bug010) — destructive: stop piccolod,
+  # plant legacy file, start, verify migration, verify legacy file deleted
+  echo -e "  ${CYAN}INFO${NC} legacy ledger migration test (destructive)..."
+  vssh "systemctl stop piccolod" >/dev/null 2>&1
+  sleep 2
+  # Snapshot current ledger
+  local ledger_pre
+  ledger_pre=$(vssh "cat /var/lib/piccolo/net-ledger.json 2>/dev/null | python3 -c \"import sys,json
+try: print(len(json.load(sys.stdin).get('reboots',[])))
+except: print(0)\"" 2>/dev/null || echo "0")
+  # Plant legacy file: 2 timestamps (1h ago, 30min ago)
+  vssh "mkdir -p /var/lib/piccolo && now=\$(date +%s) && printf '%s\\n%s\\n' \$((now-3600)) \$((now-1800)) > /var/lib/piccolo/net-watchdog-reboots" >/dev/null 2>&1
+  vssh "systemctl start piccolod" >/dev/null 2>&1
+  for i in $(seq 1 30); do
+    if vssh "systemctl is-active piccolod" 2>/dev/null | grep -q '^active$'; then break; fi
+    sleep 2
+  done
+  sleep "$PICCOLO_SETTLE_S"
+  # Verify migration: net-ledger.json should now have +2 reboot entries; legacy file gone
+  local ledger_post legacy_present
+  ledger_post=$(vssh "cat /var/lib/piccolo/net-ledger.json 2>/dev/null | python3 -c \"import sys,json
+try: print(len(json.load(sys.stdin).get('reboots',[])))
+except: print(0)\"" 2>/dev/null || echo "0")
+  legacy_present=$(vssh "test -f /var/lib/piccolo/net-watchdog-reboots && echo yes || echo no" 2>/dev/null)
+  if [[ "$ledger_post" -ge $((ledger_pre + 2)) ]] && [[ "$legacy_present" == "no" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [15.7] Legacy migration (1.E.bug010): reboots ${ledger_pre}→${ledger_post}; legacy file deleted"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [15.7] Migration: reboots ${ledger_pre}→${ledger_post} (expected +2); legacy_present=$legacy_present"
+    ((FAIL_COUNT++)) || true
+  fi
+  ensure_session
+
+  # 15.8 rfkill + profile + eth-up: dampened to ConfigHealth Faulted (codex P1-4)
+  if [[ "$has_wifi_device" -eq 0 ]]; then
+    skip "15.8" "rfkill+profile dampener (codex P1-4)" "no wifi device present (USB dongle not attached?)"
+    skip "15.9" "post-rfkill recovery" "no wifi device present"
+  elif [[ "$has_wifi_profile" -eq 0 ]]; then
+    skip "15.8" "rfkill+profile dampener (codex P1-4)" "no wifi profile configured"
+    skip "15.9" "post-rfkill recovery" "no wifi profile configured"
+  elif [[ "$conn_via" != "eth" ]]; then
+    skip "15.8" "rfkill+profile dampener" "SSH via wifi — would self-destruct"
+    skip "15.9" "post-rfkill recovery" "SSH via wifi — would self-destruct"
+  else
+    echo -e "  ${CYAN}INFO${NC} rfkill block wifi (eth still SSH path)..."
+    vssh "rfkill block wifi; nmcli connection down id \$(nmcli -t -f NAME,TYPE connection show | grep ':802-11-wireless\$' | head -1 | cut -d: -f1) >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    # Wait 100s for 3-of-3 dampener (~90s) plus margin
+    echo -e "  ${CYAN}INFO${NC} waiting 100s for 3-of-3 ConfigHealth dampener..."
+    sleep 100
+    local rfkill_ticks
+    rfkill_ticks=$(vssh "journalctl -u piccolod --no-pager --since '120 seconds ago' 2>/dev/null | grep 'net-supervisor.tick' | tail -5" 2>/dev/null || true)
+    # Look for HW=faulted or cfg=faulted in any of the recent ticks
+    if echo "$rfkill_ticks" | grep -qE 'wifi=\[hw=faulted|cfg=faulted'; then
+      # Also verify decisions stayed conservative (no bounce — L3 up via eth).
+      # `grep` returns 1 when no match; under pipefail+set -e that aborts the
+      # script. Wrap to tolerate empty match (which is itself a valid signal).
+      local actions
+      actions=$(echo "$rfkill_ticks" | { grep -oE 'decisions=\[[^]]+\]' || true; } | tail -1)
+      if echo "$actions" | grep -qE 'wifi=bounce|wifi=reboot'; then
+        echo -e "  ${RED}FAIL${NC} [15.8] Supervisor bounced/rebooted with L3 up via eth (silent-cope regression): $actions"
+        ((FAIL_COUNT++)) || true
+      else
+        echo -e "  ${GREEN}PASS${NC} [15.8] rfkill dampened to Faulted; decisions stayed wait (silent-cope intact): $actions"
+        ((PASS_COUNT++)) || true
+      fi
+    else
+      echo -e "  ${RED}FAIL${NC} [15.8] No HW/cfg=faulted observed after 100s of rfkill block"
+      echo -e "       last 3 ticks:"
+      echo "$rfkill_ticks" | tail -3 | sed 's/^/         /'
+      ((FAIL_COUNT++)) || true
+    fi
+
+    # 15.9 unblock + recovery
+    echo -e "  ${CYAN}INFO${NC} rfkill unblock + reactivate wifi..."
+    vssh "rfkill unblock wifi; sleep 2; nmcli connection up id \$(nmcli -t -f NAME,TYPE connection show | grep ':802-11-wireless\$' | head -1 | cut -d: -f1) >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    sleep 35
+    local recovery_tick
+    recovery_tick=$(vssh "journalctl -u piccolod --no-pager --since '40 seconds ago' 2>/dev/null | grep 'net-supervisor.tick' | tail -1" 2>/dev/null || true)
+    if echo "$recovery_tick" | grep -qE 'wifi=\[hw=healthy.*cfg=healthy'; then
+      echo -e "  ${GREEN}PASS${NC} [15.9] WiFi recovery observed (cfg=healthy after unblock)"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [15.9] Wifi did not recover to cfg=healthy"
+      echo -e "       last tick: $recovery_tick"
+      ((FAIL_COUNT++)) || true
+    fi
+  fi
+}
+
+# ─────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────
 mkdir -p "$(dirname "$COOKIE_JAR")"
 
 case "$STAGE" in
-  prereq)          stage_prereq ;;
-  boot)            stage_boot ;;
-  pre-setup)       stage_pre_setup ;;
-  setup)           stage_setup ;;
-  post-setup)      stage_post_setup ;;
-  storage-inspect) stage_storage_inspect ;;
-  rootfs-verify)   stage_rootfs_verify ;;
-  service-app)     stage_service_app ;;
-  workspace-app)   stage_workspace_app ;;
-  reboot)          stage_reboot ;;
-  storage-post)    stage_storage_post ;;
-  stewardship)     stage_stewardship ;;
-  auto-unlock)     stage_auto_unlock ;;
-  logs)            dump_logs "manual" ;;
+  prereq)            stage_prereq ;;
+  boot)              stage_boot ;;
+  pre-setup)         stage_pre_setup ;;
+  setup)             stage_setup ;;
+  post-setup)        stage_post_setup ;;
+  storage-inspect)   stage_storage_inspect ;;
+  rootfs-verify)     stage_rootfs_verify ;;
+  service-app)       stage_service_app ;;
+  workspace-app)     stage_workspace_app ;;
+  reboot)            stage_reboot ;;
+  storage-post)      stage_storage_post ;;
+  stewardship)       stage_stewardship ;;
+  auto-unlock)       stage_auto_unlock ;;
+  connection-auth)   stage_connection_auth ;;
+  tcp-raw)           stage_tcp_raw ;;
+  cookie-isolation)  stage_cookie_isolation ;;
+  listener-pipeline) stage_connection_auth; stage_tcp_raw; stage_cookie_isolation ;;
+  net-supervisor)    stage_net_supervisor ;;
+  logs)              dump_logs "manual" ;;
   all)
     stage_prereq
     stage_boot
@@ -1161,13 +1995,17 @@ case "$STAGE" in
     stage_service_app
     stage_workspace_app
     stage_stewardship
+    stage_connection_auth
+    stage_tcp_raw
+    stage_cookie_isolation
+    stage_net_supervisor
     stage_auto_unlock
     stage_reboot
     stage_storage_post
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app reboot storage-post stewardship auto-unlock logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor logs all"
     exit 1
     ;;
 esac
