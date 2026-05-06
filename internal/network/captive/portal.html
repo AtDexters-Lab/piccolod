@@ -226,11 +226,21 @@ async function submitConnect(ssid, passphrase, btnId, hideViewId, onError) {
     const message = nacl.util.decodeUTF8(passphrase);
     const encrypted = nacl.box(message, nonce, serverPubKey, ephemeral.secretKey);
 
+    // Diagnostic: client-reported lengths at each step of the JS chain.
+    // Untrusted (client could lie) but useful when correlated with the
+    // server-side post-decrypt log — a mismatch points at the broken step
+    // (input field empty? decodeUTF8 mangled? nacl.box produced wrong size?).
     const body = JSON.stringify({
       ssid: ssid,
       client_public_key: nacl.util.encodeBase64(ephemeral.publicKey),
       nonce: nacl.util.encodeBase64(nonce),
-      encrypted_passphrase: nacl.util.encodeBase64(encrypted)
+      encrypted_passphrase: nacl.util.encodeBase64(encrypted),
+      client_diag: {
+        input_len: passphrase.length,
+        utf8_len: message.length,
+        boxed_len: encrypted.length,
+        has_nacl_util: typeof nacl !== "undefined" && typeof nacl.util !== "undefined"
+      }
     });
 
     const resp = await fetch("/api/connect", {

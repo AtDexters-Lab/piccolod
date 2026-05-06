@@ -234,6 +234,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		ClientPublicKey     string `json:"client_public_key"`
 		Nonce               string `json:"nonce"`
 		EncryptedPassphrase string `json:"encrypted_passphrase"`
+		// Untrusted client-reported diagnostics. Logged for triage only —
+		// never used for control flow. Omitted by older portal builds.
+		ClientDiag struct {
+			InputLen    int  `json:"input_len"`
+			UTF8Len     int  `json:"utf8_len"`
+			BoxedLen    int  `json:"boxed_len"`
+			HasNaclUtil bool `json:"has_nacl_util"`
+		} `json:"client_diag"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid_request"}`, http.StatusBadRequest)
@@ -260,10 +268,15 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Diagnostic: byte-level visibility on what survived the JS→ECDH→Go path
 	// in actual phone-captive-portal browsers. Lengths only — never log the
-	// passphrase content. Distinguishes "JS produced wrong bytes" from "NM
-	// rejected correct bytes" on the next prod repro.
-	log.Printf("INFO: captive: /api/connect decrypted ssid_len=%d psk_len=%d ciphertext_len=%d",
-		len(req.SSID), len(passphrase), len(req.EncryptedPassphrase))
+	// passphrase content. Pair the server-side decrypted lengths with the
+	// untrusted client-reported lengths; a mismatch points at the broken
+	// step. UA narrows down which captive-mode browser (iOS Safari / Android
+	// Chrome / something exotic) is involved.
+	log.Printf("INFO: captive: /api/connect decrypted ssid_len=%d psk_len=%d ciphertext_len=%d "+
+		"client_diag={input=%d utf8=%d boxed=%d nacl_util=%t} ua=%q",
+		len(req.SSID), len(passphrase), len(req.EncryptedPassphrase),
+		req.ClientDiag.InputLen, req.ClientDiag.UTF8Len, req.ClientDiag.BoxedLen, req.ClientDiag.HasNaclUtil,
+		r.UserAgent())
 
 	// Return interstitial before AP teardown
 	w.Header().Set("Content-Type", "application/json")
