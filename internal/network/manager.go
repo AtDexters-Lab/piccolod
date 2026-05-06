@@ -301,6 +301,15 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 		return errNoWifiDevice
 	}
 
+	// Byte-level boundary log — what reached us vs. what NM is about to see.
+	// Lengths only; never log secret content. Combined with the device-state
+	// snapshot below this lets us distinguish A1 (empty/wrong PSK reaches NM)
+	// from A4/A5 (right PSK, NM rejects on its own). devState helps spot a
+	// post-AP-teardown race where wlan0 is not yet in a clean managed state.
+	devState, _ := m.nm.DeviceState(dev.Path)
+	log.Printf("INFO: network: Connect entry ssid_len=%d psk_len=%d wlan0_state=%s",
+		len(ssid), len(passphrase), devState)
+
 	profiles, _ := m.nm.SavedWiFiConnections()
 	var rollbackSnapshot *nmclient.ConnectionSnapshot
 	var deferredDeletePaths []dbus.ObjectPath
@@ -348,19 +357,31 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	// before declaring success; mismatch routes to the failure branch
 	// and triggers rollback.
 	waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
-	finalState, _, err := m.nm.WaitForActivation(waitCtx, dev.Path, newActivePath)
+	waitStart := time.Now()
+	finalState, finalReason, err := m.nm.WaitForActivation(waitCtx, dev.Path, newActivePath)
 	cancelWait()
+	waitElapsed := time.Since(waitStart)
 	activated := err == nil && finalState == nmclient.NMDeviceStateActivated
+	var activeID string
 	if activated {
 		info, infoErr := m.nm.ActiveConnectionInfo(dev.Path)
 		if infoErr != nil || info == nil || info.ID != ssid {
 			activated = false
+			if info != nil {
+				activeID = info.ID
+			}
 			if err == nil {
 				err = errConnectWrongSSID
 			}
 		}
 	}
 	if !activated {
+		// Replace the "connection timed out" black box with what actually
+		// happened: NM's terminal device state, the reason code (e.g.
+		// NoSecrets=7 vs SupplicantTimeout=11 vs ConnectionRemoved=38),
+		// elapsed wait, and any active SSID mismatch.
+		log.Printf("WARN: network: Connect failed ssid=%q final_state=%s reason=%s wait_elapsed=%s wait_err=%v active_id=%q",
+			ssid, finalState, finalReason, waitElapsed, err, activeID)
 		// Smart rollback: NM may have auto-reconnected.
 		if rollbackSnapshot != nil {
 			needsRestore := true

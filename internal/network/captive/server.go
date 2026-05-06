@@ -258,6 +258,13 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Diagnostic: byte-level visibility on what survived the JS→ECDH→Go path
+	// in actual phone-captive-portal browsers. Lengths only — never log the
+	// passphrase content. Distinguishes "JS produced wrong bytes" from "NM
+	// rejected correct bytes" on the next prod repro.
+	log.Printf("INFO: captive: /api/connect decrypted ssid_len=%d psk_len=%d ciphertext_len=%d",
+		len(req.SSID), len(passphrase), len(req.EncryptedPassphrase))
+
 	// Return interstitial before AP teardown
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
