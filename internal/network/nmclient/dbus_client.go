@@ -47,17 +47,16 @@ func NewDBusClient(r runner.CommandRunner) (*DBusClient, error) {
 	return finishNewDBusClient(conn, r)
 }
 
-// NewPrivateDBusClient establishes a NEW (private) connection to the system
-// bus — NOT the shared singleton — and verifies NetworkManager is reachable.
+// OpenPrivateSystemBus opens a NEW (private) connection to the system bus —
+// NOT the shared singleton — completing the SystemBusPrivate + Auth + Hello
+// handshake. Returns the raw connection without any NM-reachability check;
+// callers needing the full DBusClient should use NewPrivateDBusClient.
 //
-// This is the constructor the network supervisor's probe layer must use:
-// godbus's `conn.Signal(sigCh)` is connection-wide, so registering signal
-// handlers on the shared `dbus.SystemBus()` singleton would fan out signals
-// to every subscriber on the connection (cross-talk). A private connection
-// gives the caller isolated signal dispatch.
-//
-// The caller is responsible for calling Close() when done.
-func NewPrivateDBusClient(r runner.CommandRunner) (*DBusClient, error) {
+// A private connection is required when the caller registers signal
+// handlers (godbus's `conn.Signal(sigCh)` is connection-wide and would
+// fan out signals to every subscriber on a shared connection) or exports
+// D-Bus services. The caller owns the connection and must Close() it.
+func OpenPrivateSystemBus() (*dbus.Conn, error) {
 	conn, err := dbus.SystemBusPrivate()
 	if err != nil {
 		return nil, fmt.Errorf("nmclient: private system bus: %w", err)
@@ -69,6 +68,20 @@ func NewPrivateDBusClient(r runner.CommandRunner) (*DBusClient, error) {
 	if err := conn.Hello(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("nmclient: private bus hello: %w", err)
+	}
+	return conn, nil
+}
+
+// NewPrivateDBusClient establishes a private connection to the system bus
+// and verifies NetworkManager is reachable. This is the constructor the
+// network supervisor's probe layer must use — see OpenPrivateSystemBus
+// for the rationale on private vs shared connections.
+//
+// The caller is responsible for calling Close() when done.
+func NewPrivateDBusClient(r runner.CommandRunner) (*DBusClient, error) {
+	conn, err := OpenPrivateSystemBus()
+	if err != nil {
+		return nil, err
 	}
 	return finishNewDBusClient(conn, r)
 }

@@ -310,10 +310,44 @@ func (s *ConnectionSnapshot) SSID() string {
 	if s == nil {
 		return ""
 	}
-	if ws, ok := s.Settings["802-11-wireless"]; ok {
-		if ssidV, ok := ws["ssid"]; ok {
-			if ssidBytes, ok := ssidV.Value().([]byte); ok {
-				return string(ssidBytes)
+	return SSIDFromSettings(s.Settings)
+}
+
+// SSIDFromSettings reads the 802-11-wireless.ssid byte field from a
+// connection-settings dict and returns it as a string. Returns "" on any
+// missing section, missing key, or wrong-typed value. Shared between
+// (*ConnectionSnapshot).SSID and the NM SecretAgent's GetSecrets handler
+// (nmagent), which receives the same dict shape from NM but does not wrap
+// it in a ConnectionSnapshot.
+func SSIDFromSettings(settings map[string]map[string]dbus.Variant) string {
+	ws, ok := settings["802-11-wireless"]
+	if !ok {
+		return ""
+	}
+	v, ok := ws["ssid"]
+	if !ok {
+		return ""
+	}
+	b, ok := v.Value().([]byte)
+	if !ok {
+		return ""
+	}
+	return string(b)
+}
+
+// PSK extracts the WPA-PSK passphrase from the snapshot settings.
+// Returns "" for open profiles, profiles whose secrets weren't recoverable
+// from getConnectionSecrets, or any non-string PSK value. Mirrors SSID()'s
+// nil-tolerant accessor pattern. Used by Manager.Connect's rollback path
+// to populate the secret-agent cache and by RestoreConnection itself.
+func (s *ConnectionSnapshot) PSK() string {
+	if s == nil {
+		return ""
+	}
+	if sec, ok := s.Settings["802-11-wireless-security"]; ok {
+		if pskV, ok := sec["psk"]; ok {
+			if psk, ok := pskV.Value().(string); ok {
+				return psk
 			}
 		}
 	}

@@ -1,6 +1,10 @@
 package nmclient
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/godbus/dbus/v5"
+)
 
 func TestAccessPoint_SecurityType(t *testing.T) {
 	tests := []struct {
@@ -112,5 +116,75 @@ func TestStubClient_CallRecording(t *testing.T) {
 	}
 	if last.Method != "WiFiDevices" {
 		t.Errorf("LastCall method = %q, want WiFiDevices", last.Method)
+	}
+}
+
+func TestConnectionSnapshot_SSID(t *testing.T) {
+	cases := []struct {
+		name string
+		s    *ConnectionSnapshot
+		want string
+	}{
+		{"nil receiver", nil, ""},
+		{"empty settings", &ConnectionSnapshot{Settings: map[string]map[string]dbus.Variant{}}, ""},
+		{"missing wifi section",
+			&ConnectionSnapshot{Settings: map[string]map[string]dbus.Variant{
+				"connection": {"id": dbus.MakeVariant("foo")},
+			}}, ""},
+		{"non-byte ssid",
+			&ConnectionSnapshot{Settings: map[string]map[string]dbus.Variant{
+				"802-11-wireless": {"ssid": dbus.MakeVariant("string-ssid")},
+			}}, ""},
+		{"happy path",
+			&ConnectionSnapshot{Settings: map[string]map[string]dbus.Variant{
+				"802-11-wireless": {"ssid": dbus.MakeVariant([]byte("HomeNet"))},
+			}}, "HomeNet"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.s.SSID(); got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestConnectionSnapshot_PSK(t *testing.T) {
+	cases := []struct {
+		name string
+		s    *ConnectionSnapshot
+		want string
+	}{
+		{"nil receiver", nil, ""},
+		{"open profile (no security section)",
+			&ConnectionSnapshot{Settings: map[string]map[string]dbus.Variant{
+				"802-11-wireless": {"ssid": dbus.MakeVariant([]byte("Open"))},
+			}}, ""},
+		{"security section present, psk missing",
+			&ConnectionSnapshot{Settings: map[string]map[string]dbus.Variant{
+				"802-11-wireless-security": {"key-mgmt": dbus.MakeVariant("wpa-psk")},
+			}}, ""},
+		{"non-string psk value",
+			&ConnectionSnapshot{Settings: map[string]map[string]dbus.Variant{
+				"802-11-wireless-security": {"psk": dbus.MakeVariant([]byte("bytes-not-string"))},
+			}}, ""},
+		{"happy path",
+			&ConnectionSnapshot{Settings: map[string]map[string]dbus.Variant{
+				"802-11-wireless-security": {
+					"key-mgmt": dbus.MakeVariant("wpa-psk"),
+					"psk":      dbus.MakeVariant("secret123"),
+				},
+			}}, "secret123"},
+		{"empty string psk",
+			&ConnectionSnapshot{Settings: map[string]map[string]dbus.Variant{
+				"802-11-wireless-security": {"psk": dbus.MakeVariant("")},
+			}}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.s.PSK(); got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
 	}
 }

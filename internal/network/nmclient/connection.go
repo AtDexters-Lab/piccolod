@@ -159,12 +159,7 @@ func (c *DBusClient) SnapshotConnection(path dbus.ObjectPath) (*ConnectionSnapsh
 func (c *DBusClient) RestoreConnection(snapshot *ConnectionSnapshot) error {
 	// Extract the essential fields from the snapshot
 	ssid := snapshot.SSID()
-	psk := ""
-	if sec, ok := snapshot.Settings["802-11-wireless-security"]; ok {
-		if pskV, ok := sec["psk"]; ok {
-			psk = variantString(pskV)
-		}
-	}
+	psk := snapshot.PSK()
 	connID := ""
 	if conn, ok := snapshot.Settings["connection"]; ok {
 		connID = variantString(conn["id"])

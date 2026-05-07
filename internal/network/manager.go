@@ -24,6 +24,7 @@ import (
 	"piccolod/internal/health"
 	"piccolod/internal/network/ap"
 	"piccolod/internal/network/captive"
+	"piccolod/internal/network/nmagent"
 	"piccolod/internal/network/nmclient"
 	"piccolod/internal/runner"
 )
@@ -61,6 +62,12 @@ type Manager struct {
 
 	healthTracker *health.Tracker
 
+	// agent is piccolod's NM SecretAgent, registered at startup. nil when
+	// D-Bus is unreachable at construction time — Connect runs in degraded
+	// mode (inline-only secrets, current pre-RFC behavior). See RFC
+	// docs/rfc/20260507-wifi-secret-agent.md.
+	agent *nmagent.Agent
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	ctx      context.Context
@@ -79,6 +86,17 @@ func NewManager(nm nmclient.Client, r runner.CommandRunner, bus *events.Bus) *Ma
 	}
 	m.apMgr = ap.NewManager(nm, r)
 	m.sigMon = newSignalMonitor(nm, m)
+
+	// Construct the NM SecretAgent (Phase 1: bus + watchers + object
+	// export). On D-Bus reachability failure, log + continue in degraded
+	// mode — Connect falls back to inline-only secrets. Phase 2
+	// (AgentManager.Register) runs from Manager.Start where we have a
+	// long-lived ctx.
+	if agent, err := nmagent.New(); err != nil {
+		log.Printf("WARN: network: nmagent construct failed: %v (degraded — captive flow may fail on AP→STA need-auth)", err)
+	} else {
+		m.agent = agent
+	}
 	return m
 }
 
@@ -110,6 +128,13 @@ func (m *Manager) Name() string { return "network" }
 // Start implements supervisor.Component.
 func (m *Manager) Start(ctx context.Context) error {
 	m.ctx, m.cancel = context.WithCancel(ctx)
+
+	// Launch the secret agent's lifecycle goroutine (Phase 2 of D7 —
+	// AgentManager.Register + NM-name churn + bus-disconnect recovery).
+	// No-op when m.agent == nil (degraded mode).
+	if m.agent != nil {
+		m.agent.Start(m.ctx)
+	}
 
 	reconcileStartup(m.ctx, m.nm, m.runner)
 
@@ -171,6 +196,9 @@ func (m *Manager) Stop(ctx context.Context) error {
 	m.stopOnce.Do(func() {
 		close(m.stopCh)
 		m.cancel()
+		if m.agent != nil {
+			m.agent.Stop(ctx)
+		}
 	})
 	return nil
 }
@@ -287,6 +315,45 @@ func (m *Manager) ScanNetworks(forceRefresh bool) ([]ScanResult, error) {
 	return results, nil
 }
 
+// rollbackDrainLinger bounds how long the rollback snapshot's PSK stays in
+// the agent cache after Connect returns. RestoreConnection's underlying
+// AddAndActivateConnection is fire-and-forget at the D-Bus level — it
+// returns once the activation request is queued, NOT when NM finishes
+// authentication. NM's need-auth callback may fire seconds later, by
+// which point Connect (and any defer-paired Drain) has already returned.
+// The linger keeps the cache entry alive long enough to cover the typical
+// activation window, mirroring the 30s WaitForActivation budget the
+// primary Connect path uses.
+const rollbackDrainLinger = 30 * time.Second
+
+// stashRollbackForAgent populates the secret-agent cache with the rollback
+// snapshot's SSID/PSK and returns a drain function to be deferred by the
+// caller. The returned function does NOT drain immediately — it schedules
+// a delayed drain via time.AfterFunc so the cache entry survives Connect's
+// return and remains available for NM's asynchronous rollback need-auth
+// (see rollbackDrainLinger). Returns a no-op when m.agent == nil,
+// snap == nil, or snap.PSK() == "" (open-AP rollback or secured-but-
+// unrecoverable — RestoreConnection handles those without agent help).
+func (m *Manager) stashRollbackForAgent(snap *nmclient.ConnectionSnapshot) func() {
+	if m.agent == nil || snap == nil {
+		return func() {}
+	}
+	rssid := snap.SSID()
+	psk := snap.PSK()
+	// Skip silently when either field is empty — Stash would WARN-log
+	// "rejected — empty ssid/psk" which is misleading here. Open-AP
+	// rollback (no security section) and missing-SSID corner cases are
+	// expected; RestoreConnection itself handles them without agent help.
+	if rssid == "" || psk == "" {
+		return func() {}
+	}
+	agent := m.agent
+	m.agent.Stash(rssid, psk)
+	return func() {
+		time.AfterFunc(rollbackDrainLinger, func() { agent.Drain(rssid) })
+	}
+}
+
 // Connect attempts to join a WiFi network. Snapshots the current profile
 // for rollback; on success, requests a probe-and-decide so the supervisor
 // re-evaluates immediately.
@@ -309,6 +376,17 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	devState, _ := m.nm.DeviceState(dev.Path)
 	log.Printf("INFO: network: Connect entry ssid_len=%d psk_len=%d wlan0_state=%s",
 		len(ssid), len(passphrase), devState)
+
+	// Populate the secret agent's cache for the duration of this Connect.
+	// If NM falls through to need-auth on the inline PSK (observed on
+	// brcmfmac AP→STA transitions per RFC 20260507), the agent answers
+	// with the cached PSK. No-op when m.agent == nil (degraded mode).
+	if m.agent != nil {
+		m.agent.SetConnectInFlight(true)
+		defer m.agent.SetConnectInFlight(false)
+		m.agent.Stash(ssid, passphrase)
+		defer m.agent.Drain(ssid)
+	}
 
 	profiles, _ := m.nm.SavedWiFiConnections()
 	var rollbackSnapshot *nmclient.ConnectionSnapshot
@@ -336,6 +414,8 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	newProfilePath, newActivePath, err := m.nm.Connect(dev.Path, ssid, passphrase)
 	if err != nil {
 		if rollbackSnapshot != nil {
+			drain := m.stashRollbackForAgent(rollbackSnapshot)
+			defer drain()
 			if rerr := m.nm.RestoreConnection(rollbackSnapshot); rerr != nil {
 				log.Printf("ERROR: network: WiFi rollback after connect failure: %v", rerr)
 			}
@@ -390,6 +470,8 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 				needsRestore = false
 			}
 			if needsRestore {
+				drain := m.stashRollbackForAgent(rollbackSnapshot)
+				defer drain()
 				if rerr := m.nm.RestoreConnection(rollbackSnapshot); rerr != nil {
 					log.Printf("ERROR: network: WiFi rollback failed: %v", rerr)
 				}
