@@ -23,6 +23,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> cookie-isolation # stage 14: cross-app cookie injection regression (f1a24d8)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> listener-pipeline # stages 12+13+14 (the listener-pipeline RFC validation suite)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> net-supervisor   # stage 15: probe-decide-act validation (RFC 20260505) — destructive (restarts piccolod, plants legacy ledger, blocks rfkill)
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> wifi-secret-agent # stage 16: NM SecretAgent registration + lifecycle (RFC 20260507) — destructive (restarts NetworkManager)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> logs             # download piccolod journal
 set -euo pipefail
 
@@ -1959,6 +1960,150 @@ except: print(0)\"" 2>/dev/null || echo "0")
   fi
 }
 
+stage_wifi_secret_agent() {
+  echo -e "\n${CYAN}═══ Stage 16: WiFi NM SecretAgent (RFC 20260507) ═══${NC}"
+
+  # Destructive cleanup: 16.5 restarts NetworkManager. If the script is
+  # killed mid-restart (Ctrl-C, set -e), make sure NM ends up running.
+  _wsa_cleanup() {
+    vssh "systemctl is-active NetworkManager >/dev/null 2>&1 || systemctl start NetworkManager 2>/dev/null" >/dev/null 2>&1 || true
+  }
+  trap _wsa_cleanup EXIT
+
+  # Detect SSH path — we cannot restart NM if SSH'd via WiFi
+  # (self-destructive). Same gate as Stage 15.
+  local conn_via=""
+  if [[ "$IP" == "$(vssh 'ip -4 -o addr show enp0s3 2>/dev/null | grep -oP "inet \K[0-9.]+" | head -1' 2>/dev/null || true)" ]]; then
+    conn_via="eth"
+  else
+    conn_via="wifi"
+  fi
+  echo -e "  ${CYAN}INFO${NC} SSH path: $conn_via"
+
+  # 16.1 Agent registered with NM at startup
+  local reg_line
+  reg_line=$(vssh "journalctl -u piccolod --no-pager -n 2000 2>/dev/null | grep -m1 'nmagent: registered with NM as'" 2>/dev/null || true)
+  if [[ -n "$reg_line" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [16.1] Agent registered: $(echo "$reg_line" | grep -oE 'piccolod-wifi[^[:space:]]*' | head -1 || echo "(see journal)")"
+    ((PASS_COUNT++)) || true
+  else
+    # No registration log yet — could mean degraded mode (D-Bus unreachable)
+    # OR the journal scroll-back is too short. Look for the WARN that would
+    # accompany degraded mode.
+    local degraded_line
+    degraded_line=$(vssh "journalctl -u piccolod --no-pager -n 2000 2>/dev/null | grep -m1 'nmagent construct failed'" 2>/dev/null || true)
+    if [[ -n "$degraded_line" ]]; then
+      echo -e "  ${RED}FAIL${NC} [16.1] Agent in degraded mode: $degraded_line"
+      ((FAIL_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [16.1] No 'registered with NM' log line found in last 2000 journal lines"
+      ((FAIL_COUNT++)) || true
+    fi
+    return
+  fi
+
+  # 16.2 SecretAgent object exported on a piccolod-owned bus
+  # Find piccolod's unique-bus-names and introspect each at the agent path.
+  # The right one will list the SecretAgent interface; others fail or omit it.
+  local agent_bus_name
+  agent_bus_name=$(vssh "busctl --no-pager 2>/dev/null | awk '\$3==\"piccolod\" {print \$1}' | while read -r n; do busctl introspect \"\$n\" /org/freedesktop/NetworkManager/SecretAgent 2>/dev/null | grep -q 'org.freedesktop.NetworkManager.SecretAgent' && { echo \"\$n\"; break; }; done" 2>/dev/null || true)
+  if [[ -n "$agent_bus_name" ]]; then
+    # Verify all four required SecretAgent methods are exported.
+    local methods
+    methods=$(vssh "busctl introspect '$agent_bus_name' /org/freedesktop/NetworkManager/SecretAgent 2>/dev/null | grep -oE '(GetSecrets|CancelGetSecrets|SaveSecrets|DeleteSecrets)\\s+method' | wc -l" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$methods" == "4" ]]; then
+      echo -e "  ${GREEN}PASS${NC} [16.2] SecretAgent exported on $agent_bus_name with all 4 methods"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [16.2] SecretAgent path found at $agent_bus_name but only $methods/4 methods exposed"
+      ((FAIL_COUNT++)) || true
+    fi
+  else
+    echo -e "  ${RED}FAIL${NC} [16.2] No piccolod bus connection exports SecretAgent at /org/freedesktop/NetworkManager/SecretAgent"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 16.3 Private bus connection count: pre-RFC piccolod had 2 (shared +
+  # supervisor's private). With nmagent registered, expect ≥3. Same
+  # accounting as Stage 15.4.
+  local dbus_count
+  dbus_count=$(vssh "busctl --no-pager 2>/dev/null | awk '\$3==\"piccolod\"' | wc -l" 2>/dev/null | tr -d '[:space:]')
+  if [[ "$dbus_count" =~ ^[0-9]+$ ]] && [[ "$dbus_count" -ge 3 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [16.3] Private bus added: $dbus_count piccolod bus connections (pre-RFC was 2)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [16.3] Expected ≥3 piccolod bus connections, got: \"$dbus_count\""
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 16.4 RLIMIT_CORE=0 in effect — guards plaintext PSK from coredump leak
+  # regardless of systemd unit's LimitCORE setting.
+  local core_lim
+  core_lim=$(vssh "prlimit --pid=\$(pidof piccolod | awk '{print \$1}') --core --noheadings 2>/dev/null | awk '{print \$5, \$6}'" 2>/dev/null | tr -d '[:space:]')
+  if [[ "$core_lim" == "00" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [16.4] RLIMIT_CORE=0 active (soft=0 hard=0) — coredump leak path closed"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [16.4] RLIMIT_CORE not zero — got \"$core_lim\""
+    ((FAIL_COUNT++)) || true
+  fi
+
+  # 16.5 NM-restart lifecycle recovery — DESTRUCTIVE.
+  # The Phase 1 + Phase 3 P1s lived here: NameOwnerChanged drives Lost,
+  # retry-timer reopens bus, AgentManager.Register re-runs. We restart NM
+  # and verify all four observable transitions land in the journal within
+  # a bounded window.
+  if [[ "$conn_via" != "eth" ]]; then
+    skip "16.5" "NM-restart lifecycle recovery" "SSH via wifi — restarting NM would self-destruct"
+    skip "16.6" "no CPU spin after recovery" "depends on 16.5"
+  else
+    # Capture journal cursor before the restart so we can scope the search.
+    local cursor_pre
+    cursor_pre=$(vssh "journalctl -u piccolod --show-cursor -n 0 2>/dev/null | tail -1 | grep -oP 'cursor: \\K.*' || true" 2>/dev/null)
+    echo -e "  ${CYAN}INFO${NC} restarting NetworkManager (destructive)..."
+    vssh "systemctl restart NetworkManager" >/dev/null 2>&1
+    # NM-name-disappears-then-reappears + agent re-Register on backoff.
+    # Observed on dev VM: ~3-6s end-to-end; 20s ceiling is generous.
+    sleep 20
+    local recovery_log
+    if [[ -n "$cursor_pre" ]]; then
+      recovery_log=$(vssh "journalctl -u piccolod --no-pager --after-cursor='$cursor_pre' 2>/dev/null | grep -E 'nmagent:'" 2>/dev/null || true)
+    else
+      recovery_log=$(vssh "journalctl -u piccolod --no-pager --since '25 seconds ago' 2>/dev/null | grep -E 'nmagent:'" 2>/dev/null || true)
+    fi
+    local saw_lost saw_reregister
+    saw_lost=$(echo "$recovery_log" | grep -c 'state -> Lost' || true)
+    saw_reregister=$(echo "$recovery_log" | grep -c 'registered with NM' || true)
+    if [[ "$saw_lost" -ge 1 ]] && [[ "$saw_reregister" -ge 1 ]]; then
+      echo -e "  ${GREEN}PASS${NC} [16.5] NM-restart recovery: Lost transition + re-register both observed"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [16.5] NM-restart recovery: lost=$saw_lost reregister=$saw_reregister (expected ≥1 each)"
+      echo -e "       last nmagent lines:"
+      echo "$recovery_log" | tail -5 | sed 's/^/         /'
+      ((FAIL_COUNT++)) || true
+    fi
+
+    # 16.6 No CPU spin after the recovery — the closed-channel and
+    # openBus-failure regressions both manifest as a tight loop on the
+    # lifecycle goroutine. Steady-state piccolod is well under 5% on dev
+    # VMs; a spin pins one core (≥90%).
+    sleep 3   # let any post-recovery housekeeping settle
+    local cpu
+    cpu=$(vssh "ps -o %cpu= -p \$(pidof piccolod | awk '{print \$1}') 2>/dev/null | tr -d ' '" 2>/dev/null)
+    # cpu is a float like "0.3" or "97.4" — strip the decimal for integer compare
+    local cpu_int="${cpu%%.*}"
+    cpu_int="${cpu_int:-0}"
+    if [[ "$cpu_int" =~ ^[0-9]+$ ]] && [[ "$cpu_int" -lt 30 ]]; then
+      echo -e "  ${GREEN}PASS${NC} [16.6] No CPU spin: piccolod=${cpu}% post-recovery"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [16.6] Possible spin: piccolod CPU=${cpu}% (expected <30%)"
+      ((FAIL_COUNT++)) || true
+    fi
+  fi
+}
+
 # ─────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────
@@ -1983,6 +2128,7 @@ case "$STAGE" in
   cookie-isolation)  stage_cookie_isolation ;;
   listener-pipeline) stage_connection_auth; stage_tcp_raw; stage_cookie_isolation ;;
   net-supervisor)    stage_net_supervisor ;;
+  wifi-secret-agent) stage_wifi_secret_agent ;;
   logs)              dump_logs "manual" ;;
   all)
     stage_prereq
@@ -1999,13 +2145,14 @@ case "$STAGE" in
     stage_tcp_raw
     stage_cookie_isolation
     stage_net_supervisor
+    stage_wifi_secret_agent
     stage_auto_unlock
     stage_reboot
     stage_storage_post
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent logs all"
     exit 1
     ;;
 esac
