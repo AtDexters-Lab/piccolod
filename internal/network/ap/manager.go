@@ -94,27 +94,40 @@ func (m *Manager) Start(ctx context.Context, device dbus.ObjectPath, macAddr net
 		return m.rollback(fmt.Errorf("ensure AP zone: %w", err))
 	}
 
-	// Step 3: Activate NM hotspot with zone assignment
-	if err := m.nm.ActivateHotspot(device, m.ssid, nmclient.HotspotOpts{
+	// Step 3: Activate NM hotspot with zone assignment.
+	// Per RFC 20260508 D11, ActivateHotspot returns paths on best-effort
+	// even on error — settingsPath may be populated if NM created the
+	// profile before failing activation (firmware mid-crash, broker mid-
+	// restart). Path-scoped DeleteConnection cleanup runs regardless.
+	activePath, settingsPath, err := m.nm.ActivateHotspot(device, m.ssid, nmclient.HotspotOpts{
 		Zone: apZone,
-	}); err != nil {
+	})
+	if settingsPath != "" {
+		// Path-scoped cleanup runs BEFORE device-scoped DeactivateHotspot
+		// in LIFO. cleanups append-order: path-scoped first, device-scoped
+		// second; teardown reverses → DeactivateHotspot runs first, then
+		// DeleteConnection. Both are idempotent.
+		m.cleanups = append(m.cleanups, func() {
+			_ = m.nm.DeleteConnection(settingsPath)
+		})
+	}
+	if err != nil {
 		return m.rollback(fmt.Errorf("activate hotspot: %w", err))
 	}
 	m.cleanups = append(m.cleanups, func() {
 		_ = m.nm.DeactivateHotspot(device)
 	})
 
-	// Step 3b: Wait for NM to finish activating the hotspot. This replaces
-	// the old blind sleep + poll — we now monitor the D-Bus device state and
-	// fail fast if NM can't bring up the AP (e.g., dnsmasq missing).
+	// Step 3b: Wait for NM to finish activating the hotspot. Path-scoped
+	// per RFC 20260508 — immune to OLD-conn contamination during the
+	// captive-failure-then-AP-reentry sequence (wlan0 in Deactivating
+	// from a just-failed STA when AP-Start runs).
 	// 10s is generous for NM (typically 1-3s), and keeps total Start()
 	// duration within the 20s waitForAP budget used by ForceAPMode and
 	// connectFromCaptivePortal.
 	waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer waitCancel()
-	// AP-mode hotspot has no specific active-conn path to wait for —
-	// any Activated transition on the device is the one we caused.
-	nmState, nmReason, waitErr := m.nm.WaitForActivation(waitCtx, device, "")
+	nmState, nmReason, waitErr := m.nm.WaitForActivation(waitCtx, activePath)
 	if waitErr != nil {
 		return m.rollback(fmt.Errorf("wait for hotspot activation: %w", waitErr))
 	}

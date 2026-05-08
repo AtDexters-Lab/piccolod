@@ -2122,6 +2122,24 @@ stage_wifi_secret_agent() {
       ((FAIL_COUNT++)) || true
     fi
   fi
+
+  # 16.7 Path-scoped WaitForActivation surface check (RFC 20260508).
+  # Validates that the binary registers the path-scoped subscription path —
+  # i.e., it knows about ActiveConnection PropertiesChanged. We can't
+  # reproduce the brcmfmac AP→STA timing on virtio-wifi (the OLD-conn
+  # contamination window is sub-millisecond on dev VMs), so this is a
+  # surface check only: the binary contains the new symbols and the
+  # interface accepts the new method. The empirical validation lives on
+  # real hardware; failure here means the binary didn't ship the RFC.
+  local has_path_scoped
+  has_path_scoped=$(vssh "strings /usr/local/bin/piccolod 2>/dev/null | grep -c 'SubscribeActiveConnectionState' || echo 0" 2>/dev/null | tr -d '[:space:]')
+  if [[ "$has_path_scoped" =~ ^[0-9]+$ ]] && [[ "$has_path_scoped" -ge 1 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [16.7] Binary contains path-scoped WaitForActivation symbols (RFC 20260508)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [16.7] Binary missing SubscribeActiveConnectionState — RFC 20260508 not deployed"
+    ((FAIL_COUNT++)) || true
+  fi
 }
 
 # ─────────────────────────────────────────────────────────

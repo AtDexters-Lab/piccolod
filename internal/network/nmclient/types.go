@@ -404,3 +404,71 @@ type DeviceEvent struct {
 	Type   DeviceEventType
 	Device dbus.ObjectPath
 }
+
+// NMActiveConnectionState represents the state of a single active-connection
+// D-Bus object (org.freedesktop.NetworkManager.Connection.Active.State).
+// Distinct from NMDeviceState (which is per-device, shared across every
+// connection's lifecycle on that device). Path-scoped subscriptions on
+// ActiveConnection paths return this enum's values.
+type NMActiveConnectionState uint32
+
+const (
+	NMActiveConnectionStateUnknown      NMActiveConnectionState = 0
+	NMActiveConnectionStateActivating   NMActiveConnectionState = 1
+	NMActiveConnectionStateActivated    NMActiveConnectionState = 2
+	NMActiveConnectionStateDeactivating NMActiveConnectionState = 3
+	NMActiveConnectionStateDeactivated  NMActiveConnectionState = 4
+)
+
+func (s NMActiveConnectionState) String() string {
+	switch s {
+	case NMActiveConnectionStateUnknown:
+		return "unknown"
+	case NMActiveConnectionStateActivating:
+		return "activating"
+	case NMActiveConnectionStateActivated:
+		return "activated"
+	case NMActiveConnectionStateDeactivating:
+		return "deactivating"
+	case NMActiveConnectionStateDeactivated:
+		return "deactivated"
+	default:
+		return "?"
+	}
+}
+
+// NMActiveConnectionStateReason provides additional context for active-conn
+// state changes. Distinct enum from NMDeviceStateReason; values DO NOT match
+// numerically. Translated to NMDeviceStateReason at the WaitForActivation
+// boundary via translateActiveConnReason so callers see a single reason
+// vocabulary.
+type NMActiveConnectionStateReason uint32
+
+const (
+	NMActiveConnectionStateReasonUnknown          NMActiveConnectionStateReason = 0
+	NMActiveConnectionStateReasonNone             NMActiveConnectionStateReason = 1
+	NMActiveConnectionStateReasonUserDisconnected NMActiveConnectionStateReason = 2
+	NMActiveConnectionStateReasonDeviceDisconnect NMActiveConnectionStateReason = 3
+	NMActiveConnectionStateReasonServiceStopped   NMActiveConnectionStateReason = 4
+	NMActiveConnectionStateReasonIPConfigInvalid  NMActiveConnectionStateReason = 5
+	NMActiveConnectionStateReasonConnectTimeout   NMActiveConnectionStateReason = 6
+	NMActiveConnectionStateReasonServiceStartTimeout NMActiveConnectionStateReason = 7
+	NMActiveConnectionStateReasonServiceStartFailed  NMActiveConnectionStateReason = 8
+	NMActiveConnectionStateReasonNoSecrets        NMActiveConnectionStateReason = 9
+	NMActiveConnectionStateReasonLoginFailed      NMActiveConnectionStateReason = 10
+	NMActiveConnectionStateReasonConnectionRemoved NMActiveConnectionStateReason = 11
+	NMActiveConnectionStateReasonDependencyFailed NMActiveConnectionStateReason = 12
+	NMActiveConnectionStateReasonDeviceRealizeFailed NMActiveConnectionStateReason = 13
+	NMActiveConnectionStateReasonDeviceRemoved    NMActiveConnectionStateReason = 14
+)
+
+// ActiveConnectionStateChange is emitted when an active-connection D-Bus
+// object's State property changes. Path-scoped (vs DeviceStateChange which
+// is device-scoped); the wait function for a specific activation watches
+// only its own path's stream, immune to OLD-connection contamination from
+// other paths on the same device.
+type ActiveConnectionStateChange struct {
+	Path     dbus.ObjectPath
+	NewState NMActiveConnectionState
+	Reason   NMActiveConnectionStateReason
+}

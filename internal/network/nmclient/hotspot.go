@@ -14,7 +14,20 @@ const HotspotIDPrefix = "piccolo-ap-"
 // ActivateHotspot configures and activates an open AP-mode hotspot on the
 // given WiFi device. NM handles hostapd internally. The connection profile
 // is created with the specified firewalld zone assignment.
-func (c *DBusClient) ActivateHotspot(device dbus.ObjectPath, ssid string, opts HotspotOpts) error {
+//
+// Returns (activePath, settingsPath, err). On err == nil both paths are
+// populated; the path-scoped DeleteConnection(settingsPath) cleanup at the
+// caller is the load-bearing leak prevention for the case where Activate
+// succeeds but a later step in AP Start fails.
+//
+// On err != nil, both paths are empty. godbus's (*Call).Store returns the
+// transport error before populating retvalues, and D-Bus METHOD_RETURN /
+// ERROR are mutually exclusive — there's no partial-reply transport. If
+// brcmfmac firmware mid-crash (or NM/broker mid-restart) ever causes NM to
+// allocate settingsPath then fail activation synchronously, the profile
+// leaks here; supervisor's retry loop is the residual mitigation, not
+// path-scoped cleanup.
+func (c *DBusClient) ActivateHotspot(device dbus.ObjectPath, ssid string, opts HotspotOpts) (dbus.ObjectPath, dbus.ObjectPath, error) {
 	settings := map[string]map[string]dbus.Variant{
 		"connection": {
 			"id":          dbus.MakeVariant(HotspotIDPrefix + ssid),
@@ -56,9 +69,9 @@ func (c *DBusClient) ActivateHotspot(device dbus.ObjectPath, ssid string, opts H
 	err := c.nm().Call(nmInterface+".AddAndActivateConnection", 0,
 		settings, device, dbus.ObjectPath("/")).Store(&settingsPath, &activePath)
 	if err != nil {
-		return fmt.Errorf("nmclient: activate hotspot %q: %w", ssid, err)
+		return "", "", fmt.Errorf("nmclient: activate hotspot %q: %w", ssid, err)
 	}
-	return nil
+	return activePath, settingsPath, nil
 }
 
 // DeactivateHotspot tears down any active hotspot connection on the device

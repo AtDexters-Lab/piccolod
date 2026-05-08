@@ -49,8 +49,14 @@ type Client interface {
 
 	// ActivateHotspot configures and activates an AP-mode hotspot on the
 	// given WiFi device with the specified SSID. The hotspot is open (no
-	// passphrase). NM handles hostapd internally.
-	ActivateHotspot(device dbus.ObjectPath, ssid string, opts HotspotOpts) error
+	// passphrase). NM handles hostapd internally. Returns both the active-
+	// connection path (for path-scoped WaitForActivation) and the settings
+	// path (for path-scoped DeleteConnection on rollback). When err is non-
+	// nil, paths are returned on a best-effort basis — callers MUST issue
+	// DeleteConnection(settingsPath) on rollback if non-empty regardless of
+	// err, because NM may have created the profile before failing the
+	// activation step (brcmfmac firmware mid-crash, broker mid-restart).
+	ActivateHotspot(device dbus.ObjectPath, ssid string, opts HotspotOpts) (dbus.ObjectPath, dbus.ObjectPath, error)
 
 	// DeactivateHotspot tears down the active hotspot on the device.
 	DeactivateHotspot(device dbus.ObjectPath) error
@@ -96,18 +102,24 @@ type Client interface {
 	// when devices are added to or removed from NetworkManager (hotplug).
 	SubscribeDeviceAddedRemoved(ctx context.Context) (<-chan DeviceEvent, error)
 
-	// WaitForActivation blocks until the device reaches Activated or a
-	// terminal failure state (Failed, Disconnected) after an activation
-	// request. Returns the final state and reason code. Use a context
-	// with timeout to bound the wait.
+	// SubscribeActiveConnectionState returns a channel that receives State
+	// property changes for a specific active-connection path. Path-scoped;
+	// used by WaitForActivation to disambiguate this activation's lifecycle
+	// from any concurrent OLD-connection teardown on the same device.
+	SubscribeActiveConnectionState(ctx context.Context, path dbus.ObjectPath) (<-chan ActiveConnectionStateChange, error)
+
+	// WaitForActivation blocks until the active-connection path reaches
+	// Activated or a terminal failure state. Returns the final device-
+	// equivalent state and reason after translation. Use a context with
+	// timeout to bound the wait.
 	//
-	// expectedActiveConn is the active connection path returned from
-	// Connect/AddAndActivateConnection. When non-empty, the synchronous
-	// fast path only returns Activated if the device's CURRENT active
-	// connection matches — without this, an old still-Activated profile
-	// would be reported as success before NM has transitioned to the new
-	// one. Pass "" if you don't have the path (legacy callers).
-	WaitForActivation(ctx context.Context, device, expectedActiveConn dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error)
+	// path is the active-connection D-Bus object returned from
+	// AddAndActivateConnection (Connect for STA, ActivateHotspot for AP).
+	// The wait is path-scoped: it subscribes to PropertiesChanged on that
+	// specific object, immune to OLD-connection contamination from any
+	// concurrent teardown on the same device. path must be non-empty;
+	// passing "" returns errEmptyActiveConnPath.
+	WaitForActivation(ctx context.Context, path dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error)
 
 	// IsConnected returns true if the D-Bus connection to NM is alive.
 	// When false, the client is operating in degraded polling-fallback mode.

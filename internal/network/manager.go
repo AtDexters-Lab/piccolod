@@ -438,28 +438,22 @@ func (m *Manager) Connect(ctx context.Context, ssid, passphrase string) error {
 	// and triggers rollback.
 	waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
 	waitStart := time.Now()
-	finalState, finalReason, err := m.nm.WaitForActivation(waitCtx, dev.Path, newActivePath)
+	finalState, finalReason, err := m.nm.WaitForActivation(waitCtx, newActivePath)
 	cancelWait()
 	waitElapsed := time.Since(waitStart)
+	// Path-scoped wait: returning Activated for our specific newActivePath
+	// is itself proof of correct activation (RFC 20260508 D12). No post-
+	// success Id-vs-SSID check needed; path identity from
+	// AddAndActivateConnection is the disambiguator.
 	activated := err == nil && finalState == nmclient.NMDeviceStateActivated
-	var activeID string
-	if activated {
-		info, infoErr := m.nm.ActiveConnectionInfo(dev.Path)
-		if infoErr != nil || info == nil || info.ID != ssid {
-			activated = false
-			if info != nil {
-				activeID = info.ID
-			}
-			if err == nil {
-				err = errConnectWrongSSID
-			}
-		}
-	}
 	if !activated {
-		// Replace the "connection timed out" black box with what actually
-		// happened: NM's terminal device state, the reason code (e.g.
-		// NoSecrets=7 vs SupplicantTimeout=11 vs ConnectionRemoved=38),
-		// elapsed wait, and any active SSID mismatch.
+		// Failure-branch only: read device active-conn for log triage and
+		// rollback decision. Device-scoped read is correct here — we want
+		// "what's active on the device right now" for rollback choice.
+		var activeID string
+		if info, infoErr := m.nm.ActiveConnectionInfo(dev.Path); infoErr == nil && info != nil {
+			activeID = info.ID
+		}
 		log.Printf("WARN: network: Connect failed ssid=%q final_state=%s reason=%s wait_elapsed=%s wait_err=%v active_id=%q",
 			ssid, finalState, finalReason, waitElapsed, err, activeID)
 		// Smart rollback: NM may have auto-reconnected.
@@ -782,9 +776,8 @@ func (m *Manager) LoadAPSuppressionFlag() {
 
 // Sentinel errors.
 var (
-	errNoWifiDevice     = &networkError{"no WiFi device available"}
-	errConnectTimeout   = &networkError{"connection timed out"}
-	errConnectWrongSSID = &networkError{"activation reported success on a different SSID"}
+	errNoWifiDevice   = &networkError{"no WiFi device available"}
+	errConnectTimeout = &networkError{"connection timed out"}
 )
 
 type networkError struct{ msg string }

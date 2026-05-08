@@ -2,6 +2,7 @@ package nmclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -298,86 +299,214 @@ func (c *DBusClient) readIP4Config(path dbus.ObjectPath) (addr, gw string) {
 	return
 }
 
-// WaitForActivation blocks until the device reaches Activated or a terminal
-// failure state. A second D-Bus subscription is safe: match rules are
-// reference-counted, and godbus fans out signals to all registered channels.
+// errEmptyActiveConnPath is returned by WaitForActivation when called with
+// an empty expectedActiveConn. Path-scoped wait requires a path; both
+// production callers always pass one post-RFC.
+var errEmptyActiveConnPath = errors.New("nmclient: WaitForActivation requires non-empty expectedActiveConn")
+
+// WaitForActivation blocks until the active-connection path reaches
+// Activated or a terminal failure state. Path-scoped: subscribes to
+// PropertiesChanged on the specific D-Bus object returned by
+// AddAndActivateConnection. Immune to OLD-connection contamination from
+// concurrent teardowns on the same device.
 //
-// expectedActiveConn (when non-empty) constrains the synchronous fast path:
-// Activated is only treated as success when the device's CURRENT active
-// connection matches expectedActiveConn. Without this guard, switching from
-// an already-Activated SSID would return success for the OLD connection
-// before NM had moved off it.
-func (c *DBusClient) WaitForActivation(ctx context.Context, device, expectedActiveConn dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
-	// Create a child context so we cancel the D-Bus subscription immediately
-	// on return, rather than leaking it until the caller's context expires.
+// See RFC 20260508 for the full design.
+func (c *DBusClient) WaitForActivation(ctx context.Context, path dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
+	if path == "" {
+		return NMDeviceStateUnknown, NMDeviceStateReasonNone, errEmptyActiveConnPath
+	}
+
+	// Cancel the subscription on return rather than leaking until ctx expires.
 	subCtx, subCancel := context.WithCancel(ctx)
 	defer subCancel()
 
-	ch, err := c.SubscribeDeviceStateChanges(subCtx, device)
+	ch, err := c.SubscribeActiveConnectionState(subCtx, path)
 	if err != nil {
 		return NMDeviceStateUnknown, NMDeviceStateReasonNone, fmt.Errorf("nmclient: subscribe for activation wait: %w", err)
 	}
 
-	// TOCTOU guard: check current state before entering the wait loop.
-	// If NM already activated, failed, or raced through failure back to
-	// disconnected before we polled, return now to avoid a long stall.
-	//
-	// For Activated, verify the active connection path matches the one
-	// the caller is waiting on (if known) — otherwise we'd report success
-	// for a still-Activated previous SSID.
-	curState, err := c.DeviceState(device)
-	if err == nil {
-		switch {
-		case curState == NMDeviceStateActivated:
-			if expectedActiveConn == "" {
-				return NMDeviceStateActivated, NMDeviceStateReasonNone, nil
-			}
-			if info, infoErr := c.ActiveConnectionInfo(device); infoErr == nil && info != nil && info.Path == expectedActiveConn {
-				return NMDeviceStateActivated, NMDeviceStateReasonNone, nil
-			}
-			// Still on the old connection — fall through to wait for
-			// the state-change event that will move us off it.
-		case curState == NMDeviceStateFailed:
-			return NMDeviceStateFailed, NMDeviceStateReasonUnknown, nil
-		case curState <= NMDeviceStateDisconnected:
-			// Device is at Disconnected/Unavailable/Unmanaged — activation
-			// either hasn't started or already failed and was torn down.
-			// Check for an active connection to distinguish: if none exists,
-			// the device raced through failure before we got here.
-			if info, infoErr := c.ActiveConnectionInfo(device); infoErr != nil || info == nil {
-				return curState, NMDeviceStateReasonUnknown, nil
-			}
-		}
+	// TOCTOU guard: read State after subscribe (subscribe-before-read order
+	// ensures we don't miss transitions in the gap; double-observation is
+	// idempotent on terminal values).
+	state, reason, terminal, err := c.readActiveConnTerminalState(path)
+	if err != nil {
+		return NMDeviceStateUnknown, NMDeviceStateReasonNone, err
+	}
+	if terminal {
+		return translateActiveConnTerminalPure(path, state, reason)
 	}
 
-	// Wait for state transitions. Terminal conditions:
-	//   Activated (100)           → success
-	//   Failed (120)              → activation failed (reason in event)
-	//   Disconnected (30) or below, after seeing a progressing state (>=Prepare/40)
-	//     → activation was torn down
-	seenProgressing := curState >= NMDeviceStatePrepare
+	return runActivationWaitByPath(ctx, ch, c.readActiveConnTerminalState, path)
+}
+
+// terminalReader resolves State for a path. Used by runActivationWaitByPath
+// to dispatch D1 case-C (invalidated[State] → Get) and as the test seam
+// for that path.
+type terminalReader func(path dbus.ObjectPath) (NMActiveConnectionState, NMActiveConnectionStateReason, bool, error)
+
+// readActiveConnTerminalState performs the D4 TOCTOU Properties.Get and
+// classifies the outcome per D4 sub-cases (i)–(v). Returns:
+//   - (state, reason, true, nil) if Get returned a terminal state
+//   - (Activating, Unknown, false, nil) for non-terminal or transient errors
+//   - (_, _, true, nil) with state=Deactivated for UnknownObject (D4-iv)
+//   - (_, _, _, err) only on programmer-error class issues
+func (c *DBusClient) readActiveConnTerminalState(path dbus.ObjectPath) (NMActiveConnectionState, NMActiveConnectionStateReason, bool, error) {
+	v, err := c.prop(path, nmActiveConnInterface, "State")
+	if err != nil {
+		// D4-iv: path-removed-class errors synthesize terminal Deactivated
+		// with the path_removed token (logged below). Other errors fall
+		// through to the loop, which is floored by ctx-timeout.
+		if isUnknownObjectErr(err) {
+			log.Printf("WARN: nmclient: WaitForActivation path-removed-on-toctou path=%s synth=path_removed", path)
+			return NMActiveConnectionStateDeactivated, NMActiveConnectionStateReasonUnknown, true, nil
+		}
+		log.Printf("WARN: nmclient: WaitForActivation TOCTOU State read failed path=%s err=%v (proceeding to signal loop)", path, err)
+		return NMActiveConnectionStateActivating, NMActiveConnectionStateReasonUnknown, false, nil
+	}
+	u, ok := v.Value().(uint32)
+	if !ok {
+		return NMActiveConnectionStateActivating, NMActiveConnectionStateReasonUnknown, false, nil
+	}
+	state := NMActiveConnectionState(u)
+	switch state {
+	case NMActiveConnectionStateActivated, NMActiveConnectionStateDeactivating, NMActiveConnectionStateDeactivated:
+		// D4-i: terminal — read Reason for additional context (best-effort).
+		reason := readActiveConnReason(c, path)
+		return state, reason, true, nil
+	default:
+		// D4-ii (Activating) and D4-iii (Unknown) — proceed to signal loop.
+		return state, NMActiveConnectionStateReasonUnknown, false, nil
+	}
+}
+
+// readActiveConnReason reads the Reason property for additional failure
+// context. Best-effort: returns Unknown(0) on any read error.
+func readActiveConnReason(c *DBusClient, path dbus.ObjectPath) NMActiveConnectionStateReason {
+	v, err := c.prop(path, nmActiveConnInterface, "Reason")
+	if err != nil {
+		return NMActiveConnectionStateReasonUnknown
+	}
+	if u, ok := v.Value().(uint32); ok {
+		return NMActiveConnectionStateReason(u)
+	}
+	return NMActiveConnectionStateReasonUnknown
+}
+
+// runActivationWaitByPath drives the post-TOCTOU signal loop. Exposed as a
+// package-private helper for unit tests; production callers use
+// WaitForActivation. `read` is the function-typed seam tests substitute to
+// inject the D1 case-C (invalidated[State] → Get) outcome without a live
+// D-Bus.
+func runActivationWaitByPath(ctx context.Context, ch <-chan ActiveConnectionStateChange, read terminalReader, path dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
 	for {
 		select {
 		case <-ctx.Done():
 			return NMDeviceStateUnknown, NMDeviceStateReasonNone, ctx.Err()
 		case evt, ok := <-ch:
 			if !ok {
-				return NMDeviceStateUnknown, NMDeviceStateReasonNone, fmt.Errorf("nmclient: device state channel closed")
+				return NMDeviceStateUnknown, NMDeviceStateReasonNone, fmt.Errorf("nmclient: active-conn state channel closed")
 			}
-			if evt.NewState >= NMDeviceStatePrepare {
-				seenProgressing = true
+			// D1 case-C: NewState=Unknown signals invalidated[State] dispatch.
+			// Issue Properties.Get via the injected reader to resolve State.
+			if evt.NewState == NMActiveConnectionStateUnknown {
+				state, reason, terminal, err := read(path)
+				if err != nil {
+					return NMDeviceStateUnknown, NMDeviceStateReasonNone, err
+				}
+				if terminal {
+					return translateActiveConnTerminalPure(path, state, reason)
+				}
+				continue
 			}
-			switch {
-			case evt.NewState == NMDeviceStateActivated:
-				return NMDeviceStateActivated, evt.Reason, nil
-			case evt.NewState == NMDeviceStateFailed:
-				return NMDeviceStateFailed, evt.Reason, nil
-			case seenProgressing && evt.NewState <= NMDeviceStateDisconnected:
-				// Device regressed to disconnected/unmanaged/unavailable after
-				// progressing — activation was torn down.
-				return evt.NewState, evt.Reason, nil
+			// Terminal states: Activated (success), Deactivating, Deactivated.
+			if evt.NewState == NMActiveConnectionStateActivated ||
+				evt.NewState == NMActiveConnectionStateDeactivating ||
+				evt.NewState == NMActiveConnectionStateDeactivated {
+				return translateActiveConnTerminalPure(path, evt.NewState, evt.Reason)
 			}
+			// Activating — non-terminal, keep waiting.
 		}
 	}
+}
+
+// translateActiveConnTerminalPure maps an active-conn terminal
+// (state, reason) to the NMDeviceState{Reason} pair the caller expects.
+// Emits the translation-fallthrough fingerprint log when the ACR maps to
+// Unknown (D3).
+func translateActiveConnTerminalPure(path dbus.ObjectPath, state NMActiveConnectionState, acReason NMActiveConnectionStateReason) (NMDeviceState, NMDeviceStateReason, error) {
+	devReason := translateActiveConnReason(acReason)
+	if devReason == NMDeviceStateReasonUnknown && acReason != NMActiveConnectionStateReasonUnknown {
+		log.Printf("WARN: nmclient: WaitForActivation translation-fallthrough path=%s ac_reason=%d", path, acReason)
+	}
+	switch state {
+	case NMActiveConnectionStateActivated:
+		return NMDeviceStateActivated, devReason, nil
+	case NMActiveConnectionStateDeactivating, NMActiveConnectionStateDeactivated:
+		return NMDeviceStateDisconnected, devReason, nil
+	case NMActiveConnectionStateUnknown:
+		return NMDeviceStateUnknown, devReason, nil
+	default:
+		return NMDeviceStateUnknown, devReason, nil
+	}
+}
+
+// translateActiveConnReason maps NMActiveConnectionStateReason to
+// NMDeviceStateReason for caller compatibility. Total over defined ACR
+// values; unmapped values return Unknown(1) and trigger the
+// translation-fallthrough fingerprint log.
+//
+// brcmfmac firmware-failure modes (DependencyFailed, DeviceRealizeFailed,
+// DeviceRemoved) are explicitly enumerated to prevent operator-triage
+// degradation on the headline hardware.
+func translateActiveConnReason(r NMActiveConnectionStateReason) NMDeviceStateReason {
+	switch r {
+	case NMActiveConnectionStateReasonNone:
+		return NMDeviceStateReasonNone
+	case NMActiveConnectionStateReasonUserDisconnected, NMActiveConnectionStateReasonDeviceDisconnect:
+		return NMDeviceStateReasonUserRequested
+	case NMActiveConnectionStateReasonServiceStopped:
+		return NMDeviceStateReasonSupplicantDisconnect
+	case NMActiveConnectionStateReasonIPConfigInvalid:
+		return NMDeviceStateReasonConfigFailed
+	case NMActiveConnectionStateReasonConnectTimeout, NMActiveConnectionStateReasonServiceStartTimeout:
+		return NMDeviceStateReasonSupplicantTimeout
+	case NMActiveConnectionStateReasonServiceStartFailed:
+		return NMDeviceStateReasonSupplicantFailed
+	case NMActiveConnectionStateReasonNoSecrets:
+		return NMDeviceStateReasonNoSecrets
+	case NMActiveConnectionStateReasonLoginFailed:
+		return NMDeviceStateReasonSupplicantFailed
+	case NMActiveConnectionStateReasonConnectionRemoved:
+		return NMDeviceStateReasonConnectionRemoved
+	case NMActiveConnectionStateReasonDependencyFailed:
+		return NMDeviceStateReasonConfigFailed
+	case NMActiveConnectionStateReasonDeviceRealizeFailed:
+		return NMDeviceStateReasonFirmwareMissing
+	case NMActiveConnectionStateReasonDeviceRemoved:
+		return NMDeviceStateReasonRemoved
+	default:
+		return NMDeviceStateReasonUnknown
+	}
+}
+
+// isUnknownObjectErr returns true for D-Bus errors indicating the path
+// is no longer registered with NM. godbus's dbus.Error.Error() returns
+// the human Body, not the Name — match on Name via errors.As to avoid
+// fragile substring matching on a non-contractual format.
+func isUnknownObjectErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dbusErr dbus.Error
+	if !errors.As(err, &dbusErr) {
+		return false
+	}
+	switch dbusErr.Name {
+	case "org.freedesktop.DBus.Error.UnknownObject",
+		"org.freedesktop.DBus.Error.UnknownInterface",
+		"org.freedesktop.DBus.Error.UnknownProperty":
+		return true
+	}
+	return false
 }
 

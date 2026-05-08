@@ -17,6 +17,9 @@ type StubClient struct {
 	WaitForActivationState  NMDeviceState
 	WaitForActivationReason NMDeviceStateReason
 	WaitForActivationErr    error
+	ActivateHotspotActivePath   dbus.ObjectPath
+	ActivateHotspotSettingsPath dbus.ObjectPath
+	ActiveConnStateCh       chan ActiveConnectionStateChange
 	WiFiDevicesResult       []WiFiDevice
 	WiFiDevicesErr          error
 	EthernetDevicesResult []EthernetDevice
@@ -68,15 +71,18 @@ type StubCall struct {
 // NewStubClient creates a StubClient with sensible defaults.
 func NewStubClient() *StubClient {
 	return &StubClient{
-		Connected:               true,
-		ConnectivityResult:      NMConnectivityFull,
-		DeviceStateResult:       NMDeviceStateActivated,
-		WaitForActivationState:  NMDeviceStateActivated,
-		WaitForActivationReason: NMDeviceStateReasonNone,
-		WirelessEnabledResult:   true,
-		stateChangeCh:           make(chan StateChange, 16),
-		deviceStateChangeCh:     make(chan DeviceStateChange, 16),
-		deviceEventCh:           make(chan DeviceEvent, 16),
+		Connected:                   true,
+		ConnectivityResult:          NMConnectivityFull,
+		DeviceStateResult:           NMDeviceStateActivated,
+		WaitForActivationState:      NMDeviceStateActivated,
+		WaitForActivationReason:     NMDeviceStateReasonNone,
+		ActivateHotspotActivePath:   "/org/freedesktop/NetworkManager/ActiveConnection/stub-hotspot",
+		ActivateHotspotSettingsPath: "/org/freedesktop/NetworkManager/Settings/stub-hotspot",
+		WirelessEnabledResult:       true,
+		stateChangeCh:               make(chan StateChange, 16),
+		deviceStateChangeCh:         make(chan DeviceStateChange, 16),
+		deviceEventCh:               make(chan DeviceEvent, 16),
+		ActiveConnStateCh:           make(chan ActiveConnectionStateChange, 64),
 	}
 }
 
@@ -182,9 +188,9 @@ func (s *StubClient) RestoreConnection(snapshot *ConnectionSnapshot) error {
 	return s.RestoreErr
 }
 
-func (s *StubClient) ActivateHotspot(device dbus.ObjectPath, ssid string, opts HotspotOpts) error {
+func (s *StubClient) ActivateHotspot(device dbus.ObjectPath, ssid string, opts HotspotOpts) (dbus.ObjectPath, dbus.ObjectPath, error) {
 	s.record("ActivateHotspot", device, ssid, opts)
-	return s.ActivateHotspotErr
+	return s.ActivateHotspotActivePath, s.ActivateHotspotSettingsPath, s.ActivateHotspotErr
 }
 
 func (s *StubClient) DeactivateHotspot(device dbus.ObjectPath) error {
@@ -303,9 +309,47 @@ func (s *StubClient) SubscribeDeviceAddedRemoved(ctx context.Context) (<-chan De
 	return ch, nil
 }
 
-func (s *StubClient) WaitForActivation(_ context.Context, device, expectedActiveConn dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
-	s.record("WaitForActivation", device, expectedActiveConn)
+func (s *StubClient) WaitForActivation(_ context.Context, path dbus.ObjectPath) (NMDeviceState, NMDeviceStateReason, error) {
+	s.record("WaitForActivation", path)
+	if path == "" {
+		return NMDeviceStateUnknown, NMDeviceStateReasonNone, errEmptyActiveConnPath
+	}
 	return s.WaitForActivationState, s.WaitForActivationReason, s.WaitForActivationErr
+}
+
+func (s *StubClient) SubscribeActiveConnectionState(ctx context.Context, path dbus.ObjectPath) (<-chan ActiveConnectionStateChange, error) {
+	s.record("SubscribeActiveConnectionState", path)
+	ch := make(chan ActiveConnectionStateChange, 64)
+	go func() {
+		defer close(ch)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case evt, ok := <-s.ActiveConnStateCh:
+				if !ok {
+					return
+				}
+				if path != "" && evt.Path != path {
+					continue
+				}
+				select {
+				case ch <- evt:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return ch, nil
+}
+
+// InjectActiveConnStateChange sends an active-conn state change to any subscriber.
+func (s *StubClient) InjectActiveConnStateChange(evt ActiveConnectionStateChange) {
+	select {
+	case s.ActiveConnStateCh <- evt:
+	default:
+	}
 }
 
 func (s *StubClient) IsConnected() bool {
