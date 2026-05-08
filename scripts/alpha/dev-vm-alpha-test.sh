@@ -2002,24 +2002,42 @@ stage_wifi_secret_agent() {
     return
   fi
 
-  # 16.2 SecretAgent object exported on a piccolod-owned bus
-  # Find piccolod's unique-bus-names and introspect each at the agent path.
-  # The right one will list the SecretAgent interface; others fail or omit it.
+  # 16.2 SecretAgent methods reachable on a piccolod-owned bus
+  # godbus's `conn.Export` does not auto-register the Introspectable
+  # interface, so `busctl introspect` returns "Access denied" — but the
+  # methods themselves are callable. Probe by directly invoking each
+  # no-op method; the right bus name is the one where the call succeeds.
+  # CancelGetSecrets/SaveSecrets/DeleteSecrets are no-ops with stable
+  # signatures (os, a{sa{sv}}o, a{sa{sv}}o); we use CancelGetSecrets's
+  # 'os' signature as the discriminator. Empty output = success.
   local agent_bus_name
-  agent_bus_name=$(vssh "busctl --no-pager 2>/dev/null | awk '\$3==\"piccolod\" {print \$1}' | while read -r n; do busctl introspect \"\$n\" /org/freedesktop/NetworkManager/SecretAgent 2>/dev/null | grep -q 'org.freedesktop.NetworkManager.SecretAgent' && { echo \"\$n\"; break; }; done" 2>/dev/null || true)
+  agent_bus_name=$(vssh "for n in \$(busctl --no-pager 2>/dev/null | awk '\$3==\"piccolod\" {print \$1}'); do err=\$(busctl call \"\$n\" /org/freedesktop/NetworkManager/SecretAgent org.freedesktop.NetworkManager.SecretAgent CancelGetSecrets os /probe wifi 2>&1); if [[ -z \"\$err\" ]]; then echo \"\$n\"; break; fi; done" 2>/dev/null || true)
   if [[ -n "$agent_bus_name" ]]; then
-    # Verify all four required SecretAgent methods are exported.
-    local methods
-    methods=$(vssh "busctl introspect '$agent_bus_name' /org/freedesktop/NetworkManager/SecretAgent 2>/dev/null | grep -oE '(GetSecrets|CancelGetSecrets|SaveSecrets|DeleteSecrets)\\s+method' | wc -l" 2>/dev/null | tr -d '[:space:]')
-    if [[ "$methods" == "4" ]]; then
-      echo -e "  ${GREEN}PASS${NC} [16.2] SecretAgent exported on $agent_bus_name with all 4 methods"
+    # Verify all four SecretAgent methods are callable. Probe each:
+    # - CancelGetSecrets(os)         — no-op, returns void
+    # - SaveSecrets(a{sa{sv}}o)      — no-op, returns void
+    # - DeleteSecrets(a{sa{sv}}o)    — no-op, returns void
+    # - GetSecrets(a{sa{sv}}osasu)   — returns a{sa{sv}}; with empty
+    #                                  cache + ssid="" we expect served=false
+    #                                  (but the method itself dispatches OK)
+    local m_ok=0
+    if [[ -z "$(vssh "busctl call '$agent_bus_name' /org/freedesktop/NetworkManager/SecretAgent org.freedesktop.NetworkManager.SecretAgent CancelGetSecrets os /probe wifi 2>&1" 2>/dev/null)" ]]; then ((m_ok++)) || true; fi
+    if [[ -z "$(vssh "busctl call '$agent_bus_name' /org/freedesktop/NetworkManager/SecretAgent org.freedesktop.NetworkManager.SecretAgent SaveSecrets 'a{sa{sv}}o' 0 /probe 2>&1" 2>/dev/null)" ]]; then ((m_ok++)) || true; fi
+    if [[ -z "$(vssh "busctl call '$agent_bus_name' /org/freedesktop/NetworkManager/SecretAgent org.freedesktop.NetworkManager.SecretAgent DeleteSecrets 'a{sa{sv}}o' 0 /probe 2>&1" 2>/dev/null)" ]]; then ((m_ok++)) || true; fi
+    # GetSecrets returns a result rather than empty; it dispatched OK if no
+    # "does not implement" / "unknown method" error.
+    local gs_err
+    gs_err=$(vssh "busctl call '$agent_bus_name' /org/freedesktop/NetworkManager/SecretAgent org.freedesktop.NetworkManager.SecretAgent GetSecrets 'a{sa{sv}}osasu' 0 /probe wifi 0 0 2>&1" 2>/dev/null || true)
+    if [[ "$gs_err" != *"does not implement"* ]] && [[ "$gs_err" != *"Unknown method"* ]]; then ((m_ok++)) || true; fi
+    if [[ "$m_ok" == "4" ]]; then
+      echo -e "  ${GREEN}PASS${NC} [16.2] SecretAgent on $agent_bus_name: all 4 methods reachable"
       ((PASS_COUNT++)) || true
     else
-      echo -e "  ${RED}FAIL${NC} [16.2] SecretAgent path found at $agent_bus_name but only $methods/4 methods exposed"
+      echo -e "  ${RED}FAIL${NC} [16.2] SecretAgent path found at $agent_bus_name but only $m_ok/4 methods reachable"
       ((FAIL_COUNT++)) || true
     fi
   else
-    echo -e "  ${RED}FAIL${NC} [16.2] No piccolod bus connection exports SecretAgent at /org/freedesktop/NetworkManager/SecretAgent"
+    echo -e "  ${RED}FAIL${NC} [16.2] No piccolod bus connection has reachable SecretAgent methods at /org/freedesktop/NetworkManager/SecretAgent"
     ((FAIL_COUNT++)) || true
   fi
 
@@ -2038,13 +2056,15 @@ stage_wifi_secret_agent() {
 
   # 16.4 RLIMIT_CORE=0 in effect — guards plaintext PSK from coredump leak
   # regardless of systemd unit's LimitCORE setting.
+  # `prlimit --core --noheadings` output (Tumbleweed): "CORE max core file
+  # size 0 0 bytes" — soft is field 6, hard is field 7.
   local core_lim
-  core_lim=$(vssh "prlimit --pid=\$(pidof piccolod | awk '{print \$1}') --core --noheadings 2>/dev/null | awk '{print \$5, \$6}'" 2>/dev/null | tr -d '[:space:]')
+  core_lim=$(vssh "prlimit --pid=\$(pidof piccolod | awk '{print \$1}') --core --noheadings 2>/dev/null | awk '{print \$6, \$7}'" 2>/dev/null | tr -d '[:space:]')
   if [[ "$core_lim" == "00" ]]; then
     echo -e "  ${GREEN}PASS${NC} [16.4] RLIMIT_CORE=0 active (soft=0 hard=0) — coredump leak path closed"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [16.4] RLIMIT_CORE not zero — got \"$core_lim\""
+    echo -e "  ${RED}FAIL${NC} [16.4] RLIMIT_CORE not zero — got soft/hard=\"$core_lim\""
     ((FAIL_COUNT++)) || true
   fi
 
