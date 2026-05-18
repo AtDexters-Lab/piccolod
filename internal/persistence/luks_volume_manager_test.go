@@ -330,6 +330,10 @@ func TestReadVolumeMeta_WrongVersion(t *testing.T) {
 }
 
 func TestLuksSetKeyslot_CallsAddKey(t *testing.T) {
+	// FakeRunner returns empty output for luksDump → probe parse fails →
+	// we fall through to the optimistic-add path. Optimistic add succeeds
+	// (no Errs configured), so the kill+add fallback is not exercised.
+	// Expected calls: luksDump (probe), luksAddKey (optimistic).
 	run := &fakeRunner{}
 	tmpfs := t.TempDir()
 	mgr := &luksVolumeManager{run: run, tmpfsDir: tmpfs}
@@ -342,23 +346,117 @@ func TestLuksSetKeyslot_CallsAddKey(t *testing.T) {
 	}
 
 	calls := run.GetCalls()
-	if len(calls) != 1 {
-		t.Fatalf("expected 1 call, got %d: %v", len(calls), calls)
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 calls (probe + add), got %d: %v", len(calls), calls)
 	}
-	if !strings.Contains(calls[0], "cryptsetup luksAddKey") {
-		t.Errorf("expected luksAddKey, got %q", calls[0])
+	if !strings.Contains(calls[0], "cryptsetup luksDump") {
+		t.Errorf("expected first call to be luksDump probe, got %q", calls[0])
 	}
-	if !strings.Contains(calls[0], "--key-slot 1") {
-		t.Errorf("expected --key-slot 1, got %q", calls[0])
+	if !strings.Contains(calls[1], "cryptsetup luksAddKey") {
+		t.Errorf("expected second call to be luksAddKey, got %q", calls[1])
 	}
-	if !strings.Contains(calls[0], "/dev/fake") {
-		t.Errorf("expected device /dev/fake, got %q", calls[0])
+	if !strings.Contains(calls[1], "--key-slot 1") {
+		t.Errorf("expected --key-slot 1, got %q", calls[1])
+	}
+	if !strings.Contains(calls[1], "/dev/fake") {
+		t.Errorf("expected device /dev/fake, got %q", calls[1])
 	}
 
 	// Verify tmpfs files are cleaned up (key material must not persist).
 	entries, _ := os.ReadDir(tmpfs)
 	if len(entries) != 0 {
 		t.Errorf("expected tmpfs dir to be clean, found %d files", len(entries))
+	}
+}
+
+// luksSetKeyslot when the probe reports the slot is empty: add-only path,
+// no kill (sub-case ii / "unprovisioned" sentinel). Empty-window invariant
+// holds because the slot is already empty.
+func TestLuksSetKeyslot_AddOnlyWhenSlotEmpty(t *testing.T) {
+	run := &fakeRunner{
+		Outputs: map[string]string{
+			"cryptsetup luksDump --dump-json-metadata /dev/fake": `{"keyslots":{}}`,
+		},
+	}
+	tmpfs := t.TempDir()
+	mgr := &luksVolumeManager{run: run, tmpfsDir: tmpfs}
+
+	if err := mgr.luksSetKeyslot(context.Background(), "/dev/fake", 1,
+		[]byte("pw"), []byte("master-key-padded-to-32-bytes-here!!")); err != nil {
+		t.Fatalf("luksSetKeyslot: %v", err)
+	}
+	calls := run.GetCalls()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 calls (probe + add), got %d: %v", len(calls), calls)
+	}
+	for _, c := range calls {
+		if strings.Contains(c, "luksKillSlot") {
+			t.Errorf("did not expect luksKillSlot on add-only path, got %q", c)
+		}
+	}
+}
+
+// luksSetKeyslot when the probe reports the slot is occupied: kill+add
+// pair runs under WithoutCancel so external cancellation cannot tear the
+// pair apart and leave the slot empty.
+func TestLuksSetKeyslot_KillAddWhenSlotOccupied(t *testing.T) {
+	run := &fakeRunner{
+		Outputs: map[string]string{
+			"cryptsetup luksDump --dump-json-metadata /dev/fake": `{"keyslots":{"1":{"type":"luks2"}}}`,
+		},
+	}
+	tmpfs := t.TempDir()
+	mgr := &luksVolumeManager{run: run, tmpfsDir: tmpfs}
+
+	if err := mgr.luksSetKeyslot(context.Background(), "/dev/fake", 1,
+		[]byte("pw"), []byte("master-key-padded-to-32-bytes-here!!")); err != nil {
+		t.Fatalf("luksSetKeyslot: %v", err)
+	}
+	calls := run.GetCalls()
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 calls (probe + kill + add), got %d: %v", len(calls), calls)
+	}
+	if !strings.Contains(calls[0], "luksDump") {
+		t.Errorf("call 0 not luksDump: %q", calls[0])
+	}
+	if !strings.Contains(calls[1], "luksKillSlot") {
+		t.Errorf("call 1 not luksKillSlot: %q", calls[1])
+	}
+	if !strings.Contains(calls[2], "luksAddKey") {
+		t.Errorf("call 2 not luksAddKey: %q", calls[2])
+	}
+}
+
+// luksDumpSlotOccupied parses cryptsetup's --dump-json-metadata output and
+// reports whether the given keyslot ID is present.
+func TestLuksDumpSlotOccupied(t *testing.T) {
+	cases := []struct {
+		name     string
+		dump     string
+		slot     int
+		want     bool
+		wantErr  bool
+	}{
+		{"empty keyslots", `{"keyslots":{}}`, 1, false, false},
+		{"slot 1 present", `{"keyslots":{"1":{"type":"luks2"}}}`, 1, true, false},
+		{"slot 2 present, asking 1", `{"keyslots":{"2":{"type":"luks2"}}}`, 1, false, false},
+		{"both slots", `{"keyslots":{"0":{},"1":{},"2":{}}}`, 2, true, false},
+		{"malformed JSON", `not json`, 1, false, true},
+		{"missing keyslots field", `{}`, 1, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := luksDumpSlotOccupied([]byte(tc.dump), tc.slot)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -394,11 +492,13 @@ func TestProvisionKeyslotOnAllVolumes_NoVolumes_ReturnsNil(t *testing.T) {
 	}
 }
 
-func TestModuleProvisionLUKSKeyslot_NoopWithoutLUKS(t *testing.T) {
-	// Module with nil volume manager should be a no-op.
+func TestModuleWriteKeyslotBlob_StubReturnsErrNotImplemented(t *testing.T) {
+	// Module with nil/stub volume manager surfaces ErrNotImplemented so
+	// callers can fall through to legacy behavior without panicking.
 	mod := &Module{}
-	if err := mod.ProvisionLUKSKeyslot(context.Background(), 1, []byte("pass")); err != nil {
-		t.Errorf("expected nil error, got %v", err)
+	err := mod.WriteKeyslotBlob(context.Background(), KeyslotRecovery, "deadbeefdeadbeef", []byte("p"))
+	if err != ErrNotImplemented {
+		t.Errorf("expected ErrNotImplemented, got %v", err)
 	}
 }
 

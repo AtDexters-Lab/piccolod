@@ -13,6 +13,14 @@ var (
 	ErrCryptoUnavailable       = errors.New("persistence: crypto unavailable")
 	ErrNotFound                = errors.New("persistence: not found")
 	ErrVolumeMetadataCorrupted = errors.New("persistence: volume metadata corrupted")
+	// ErrAuthMigrationDegradedStorage is returned by Unlock when the
+	// recovery_ack_at backfill migration cannot evaluate keyset.json after
+	// retries. The control store stays locked and the operator must attend
+	// storage health (replace SD, restore from backup) before retrying. RFC
+	// 20260510 §Backfill migration — degraded-startup posture preserves the
+	// pre-Apr-28 hostile silent-rotation guard rather than letting the device
+	// regenerate the recovery key on next login.
+	ErrAuthMigrationDegradedStorage = errors.New("persistence: auth migration aborted (degraded storage)")
 )
 
 // Control -------------------------------------------------------------------

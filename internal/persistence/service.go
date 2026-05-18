@@ -315,14 +315,86 @@ func (m *Module) Consensus() ConsensusManager {
 	return m.consensus
 }
 
-// ProvisionLUKSKeyslot adds or replaces a passphrase on the given LUKS keyslot
-// across all v3 volumes. No-op if the volume manager is not LUKS-based.
-func (m *Module) ProvisionLUKSKeyslot(ctx context.Context, slot int, passphrase []byte) error {
+// ProvisionLUKSKeyslotSync rotates a slot synchronously across all v3
+// volumes — the legacy N×Argon2id path. Reserved for callers that need
+// the rotation completed BEFORE returning. No-op when the volume manager
+// is not LUKS-based.
+func (m *Module) ProvisionLUKSKeyslotSync(ctx context.Context, slot int, passphrase []byte, stampKeyID string) error {
 	lvm, ok := m.volumes.(*luksVolumeManager)
 	if !ok {
 		return nil
 	}
-	return lvm.provisionKeyslotOnAllVolumes(ctx, slot, passphrase)
+	return lvm.provisionKeyslotOnAllVolumesAndStamp(ctx, slot, passphrase, stampKeyID)
+}
+
+// NewKeyslotReconciler constructs a KeyslotReconciler bound to this
+// Module's volume manager + crypto. Returns nil if the volume manager is
+// not LUKS-based (no-op test stubs). The server is responsible for
+// wiring the live-id probes (slot-1 from userManager, slot-2 from
+// cryptoManager.RecoveryKeyID) and the audit callback, then calling
+// Start with a long-lived context.
+//
+// Side effect: the constructed reconciler is also registered as the
+// Module's volume-creation nudge target, so newly-created v3 volumes
+// (which stamp "unprovisioned" by default per RFC §Volume-creation
+// atomicity) get picked up on the next reconciler pass without waiting
+// for the operator's next /generate or password change.
+func (m *Module) NewKeyslotReconciler(opts KeyslotReconcilerOptions) *KeyslotReconciler {
+	lvm, ok := m.volumes.(*luksVolumeManager)
+	if !ok {
+		return nil
+	}
+	if opts.VolumeManager == nil {
+		opts.VolumeManager = lvm
+	}
+	if opts.Crypto == nil {
+		opts.Crypto = m.crypto
+	}
+	r := NewKeyslotReconciler(opts)
+	lvm.SetVolumeCreationNudge(r.Nudge)
+	return r
+}
+
+// WriteKeyslotBlob persists a pending-passphrase blob for the reconciler
+// to drain. RFC 20260510 §Architecture — blob-write-first ordering: the
+// synchronous handler writes the blob BEFORE committing keyset.json /
+// userManager.ChangePassword, so a blob-write failure leaves the device
+// in its prior state (operator's saved paper words / current password
+// remain authoritative).
+//
+// Returns ErrNotImplemented when the volume manager is not LUKS-based
+// (no-op test stubs) — caller should treat this as "no async path needed,
+// fall back to synchronous behavior."
+func (m *Module) WriteKeyslotBlob(ctx context.Context, slot KeyslotSlot, keyID string, passphrase []byte) error {
+	if _, ok := m.volumes.(*luksVolumeManager); !ok {
+		return ErrNotImplemented
+	}
+	if m.crypto == nil {
+		return ErrCryptoUnavailable
+	}
+	_ = ctx
+	return writeKeyslotBlob(m.crypto, slot, keyID, passphrase)
+}
+
+// WriteKeyslotBlobWithKey is the variant for callers holding the crypt
+// manager's write lock (RFC 20260510 D11 prepare hook path). Uses the
+// supplied SDEK directly to avoid re-entering the lock via EncryptWithAAD.
+func (m *Module) WriteKeyslotBlobWithKey(ctx context.Context, sdek []byte, slot KeyslotSlot, keyID string, passphrase []byte) error {
+	if _, ok := m.volumes.(*luksVolumeManager); !ok {
+		return ErrNotImplemented
+	}
+	_ = ctx
+	return writeKeyslotBlobWithKey(sdek, slot, keyID, passphrase)
+}
+
+// CountKeyslotUnprovisioned returns slot 1 + slot 2 counts of v3 volumes
+// stamped "unprovisioned" in a single metadata walk (RFC 20260510 S7).
+func (m *Module) CountKeyslotUnprovisioned() (slot1, slot2 int, err error) {
+	lvm, ok := m.volumes.(*luksVolumeManager)
+	if !ok {
+		return 0, 0, nil
+	}
+	return lvm.CountKeyslotUnprovisioned()
 }
 
 func (m *Module) setLockState(ctx context.Context, locked bool) error {

@@ -6,7 +6,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"piccolod/internal/health"
 	"piccolod/internal/lifecycle"
+	"piccolod/internal/persistence"
 	"piccolod/internal/storage"
 )
 
@@ -218,6 +220,7 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 		if recoveryKeyPending {
 			resp["recovery_key_pending"] = true
 		}
+		s.applyAuthMigrationDegraded(resp)
 		c.JSON(http.StatusOK, resp)
 		return
 	}
@@ -290,7 +293,55 @@ func (s *GinServer) handleBoot(c *gin.Context) {
 	if recoveryKeyPending {
 		resp["recovery_key_pending"] = true
 	}
+	s.applyKeyslotUnprovisionedCount(resp)
 	c.JSON(http.StatusOK, resp)
+}
+
+// applyKeyslotUnprovisionedCount surfaces the count of v3 volumes whose
+// slot 1 or slot 2 is in the "unprovisioned" sentinel state — newly-created
+// volumes that haven't been picked up by an operator-initiated rotation
+// yet (RFC 20260510 S7 fix). Non-zero means the operator's paper words
+// won't unlock these volumes via `cryptsetup luksOpen` directly; UI surfaces
+// this on the home/login surface so operators who don't visit /crypto/status
+// still see the gap.
+func (s *GinServer) applyKeyslotUnprovisionedCount(resp gin.H) {
+	// Read directly from volume metadata so the count reflects current
+	// truth — not the last reconciler pass's snapshot. Single walk
+	// returns both slot counts.
+	kp, ok := s.persistence.(persistence.KeyslotProvisioner)
+	if !ok {
+		return
+	}
+	s1, s2, err := kp.CountKeyslotUnprovisioned()
+	if err != nil {
+		log.Printf("WARN: keyslot unprovisioned count: %v", err)
+		return
+	}
+	if total := s1 + s2; total > 0 {
+		resp["keyslot_unprovisioned_count"] = total
+	}
+}
+
+// applyAuthMigrationDegraded annotates the boot response when the
+// recovery_ack_at backfill aborted on degraded storage (RFC 20260510). The
+// signal is durable across polls via health.Tracker — the locked-screen UI
+// reads `auth_migration_degraded: true` and renders an action-oriented
+// banner so the operator knows to attend storage health rather than retry
+// the password.
+//
+// Action-oriented copy (not failure-narration) per the
+// no-failure-callout-in-UI feedback: the operator sees what to do, not
+// what the system tried and failed to do.
+func (s *GinServer) applyAuthMigrationDegraded(resp gin.H) {
+	if s.healthTracker == nil {
+		return
+	}
+	status, ok := s.healthTracker.Status("auth-migration")
+	if !ok || status.Level < health.LevelError {
+		return
+	}
+	resp["auth_migration_degraded"] = true
+	resp["auth_migration_message"] = "Storage attention required. Saved recovery words remain valid. Use the device console or contact support."
 }
 
 // bootSetupResponse builds the JSON response for the setup screen, including

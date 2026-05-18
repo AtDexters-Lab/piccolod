@@ -11,7 +11,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	authpkg "piccolod/internal/auth"
-	"piccolod/internal/cryptoutil"
 	"piccolod/internal/persistence"
 )
 
@@ -449,16 +448,19 @@ func (s *GinServer) handleAuthPassword(c *gin.Context) {
 			return
 		}
 	}
-	// Rotate LUKS keyslot 1 (admin-password passphrase) on all volumes.
-	// Only for admin — keyslot 1 is the admin disk-encryption passphrase.
+	// Rotate LUKS keyslot 1 (admin-password passphrase) on all volumes
+	// via the async reconciler — RFC 20260510 §Slot-1 expansion. Only for
+	// admin (keyslot 1 is the admin disk-encryption passphrase).
+	//
+	// Lifecycle vs D11: slot-1 ordering differs from slot-2. The admin
+	// password change has already been committed (userManager.ChangePassword
+	// + Rewrap) by the time we reach this point — we're not protecting
+	// against blob-write failure (the password is already changed). The
+	// blob is the durable hand-off so the reconciler can drain the kill+add
+	// across volumes asynchronously after this handler returns, closing
+	// the 30s opContext timeout failure on multi-volume devices.
 	if sess, ok := s.sessions.Get(id); ok && (sess.Role == "admin" || sess.User == "admin") {
-		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
-			passBytes := []byte(body.NewPassword)
-			if err := kp.ProvisionLUKSKeyslot(ctx, 1, passBytes); err != nil {
-				log.Printf("WARN: LUKS keyslot 1 rotation: %v", err)
-			}
-			cryptoutil.SecureZero(passBytes)
-		}
+		s.handoffSlot1ToReconciler(ctx, body.NewPassword)
 	}
 	update := persistence.AuthStalenessUpdate{
 		PasswordStale:   boolPtr(false),

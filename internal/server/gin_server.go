@@ -152,6 +152,13 @@ type GinServer struct {
 	updateManager  osUpdateManager
 	catalogManager *catalog.Manager
 
+	// Keyslot reconciler — drains slot-1 (admin password) and slot-2
+	// (recovery mnemonic) passphrase blobs across all v3 LUKS volumes
+	// asynchronously after the synchronous handlers return (RFC 20260510).
+	// nil when persistence is not LUKS-backed (test stubs); handlers fall
+	// back to the legacy synchronous ProvisionLUKSKeyslot in that case.
+	keyslotReconciler *persistence.KeyslotReconciler
+
 	// Auto-unlock framework (opt-in per-device). Owns the pre-shutdown
 	// ceremony, post-boot pickup goroutine, Test action, and Update. nil
 	// before NewGinServer wires it (or if construction failed — feature is
@@ -935,6 +942,43 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		s.inviteMgr = authpkg.NewInviteManager(persist.Control().InviteTokens(), s.userManager)
 	}
 
+	// Construct the keyslot reconciler (RFC 20260510). Live id probes:
+	//   - slot 2: cryptoManager.RecoveryKeyID() reads the on-disk
+	//     SDEKRK fingerprint — stable signal across rotations.
+	//   - slot 1: fingerprint the admin user's password_hash from the
+	//     persistence Users repo. Empty when no admin user yet (fresh
+	//     device) — the reconciler short-circuits on empty live id.
+	// Reconciler is started in Start() so the goroutine binds to the
+	// long-lived server context.
+	if persist != nil {
+		s.keyslotReconciler = persist.NewKeyslotReconciler(persistence.KeyslotReconcilerOptions{
+			LiveRecoveryKeyID: func() string {
+				if s.cryptoManager == nil {
+					return ""
+				}
+				return s.cryptoManager.RecoveryKeyID()
+			},
+			LivePasswordKeyID: func() string {
+				if persist == nil {
+					return ""
+				}
+				ctx, cancel := context.WithTimeout(s.serverContext(), 5*time.Second)
+				defer cancel()
+				u, err := persist.Control().Users().GetByUsername(ctx, "admin")
+				if err != nil || u.PasswordHash == "" {
+					return ""
+				}
+				return crypt.FingerprintPasswordHash(u.PasswordHash)
+			},
+			SDEKLoaded: func() bool {
+				return s.cryptoManager != nil && s.cryptoManager.SDEKLoaded()
+			},
+			AuditFn: func(event string, fields map[string]any) {
+				s.publishBackgroundAuditEvent(event, fields)
+			},
+		})
+	}
+
 	// Wire proxy auth dependencies (listener auth rules enforcement happens in services.ProxyManager).
 	if svcMgr != nil {
 		svcMgr.ProxyManager().SetAuthConfig(s.userManager, func(r *http.Request) (*authpkg.Session, bool) {
@@ -1556,6 +1600,16 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// (Simplified) No dynamic port publish/unpublish wiring; allow dial to fail gracefully.
 
+	// Start the keyslot reconciler (RFC 20260510 §Reconciler shape).
+	// Goroutine binds to the server's long-lived opCtx so it survives
+	// individual request lifetimes and respects shutdown via Stop().
+	// Initial pass drains any blobs left pending by a prior process /
+	// system reboot (restart-safe by design — blobs live on the encrypted
+	// control plane).
+	if s.keyslotReconciler != nil {
+		s.keyslotReconciler.Start(s.serverContext())
+	}
+
 	// Rehydrate proxies for containers that survived restarts
 	appMgr.RestoreServices(context.Background())
 
@@ -1762,6 +1816,17 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	// before DRAIN's StopAllApps needs it.
 	if s.opCancel != nil {
 		s.opCancel()
+	}
+
+	// Stop the keyslot reconciler with a bounded budget. Per RFC D7 the
+	// kill+add pair runs under context.WithoutCancel so an in-flight
+	// per-volume rotation completes even after Stop signals; StopCtx
+	// caps that wait at 30s so a hung cryptsetup cannot wedge the
+	// remaining shutdown sequence (FENCE→DRAIN→CLEANUP).
+	if s.keyslotReconciler != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		s.keyslotReconciler.StopCtx(stopCtx)
+		stopCancel()
 	}
 
 	// ── Phase 2: DRAIN (60s) ────────────────────────────────────────────

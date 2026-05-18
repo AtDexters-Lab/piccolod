@@ -189,12 +189,41 @@ type GoldenImageConfig struct {
 	Labels     map[string]string `json:"labels,omitempty"`
 }
 
-// KeyslotProvisioner provisions LUKS keyslots on all v3 volumes.
-// Implemented by Module when backed by luksVolumeManager.
+// KeyslotProvisioner provisions LUKS keyslots on all v3 volumes via the
+// async reconciler (RFC 20260510). Implemented by Module when backed by
+// luksVolumeManager.
 type KeyslotProvisioner interface {
-	// ProvisionLUKSKeyslot adds or replaces a passphrase on the given LUKS
-	// keyslot across all v3 volumes. Slot 1 = admin password, slot 2 = recovery mnemonic.
-	ProvisionLUKSKeyslot(ctx context.Context, slot int, passphrase []byte) error
+	// ProvisionLUKSKeyslotSync rotates a slot synchronously across all
+	// v3 volumes — the legacy N×Argon2id path. Reserved for callers
+	// that need the rotation completed BEFORE returning (e.g., the
+	// locked /reset-password handler that must drain slot-1 before
+	// relocking the SDEK). Stamps per-volume kskey_id = stampKeyID on
+	// success so the async reconciler does not redundantly re-provision
+	// later. stampKeyID == "" disables stamping (test-only).
+	// Normal callers should use WriteKeyslotBlob + the async reconciler.
+	ProvisionLUKSKeyslotSync(ctx context.Context, slot int, passphrase []byte, stampKeyID string) error
+
+	// WriteKeyslotBlob persists a pending-passphrase blob for the keyslot
+	// reconciler to drain (RFC 20260510 §Architecture). Called by the
+	// synchronous handler BEFORE committing the persistent state change
+	// (keyset.json for slot 2, userManager.ChangePassword for slot 1) so
+	// a blob-write failure leaves the operator's prior state authoritative.
+	//
+	// slot=1 (admin password) | slot=2 (recovery mnemonic).
+	// keyID is the generation fingerprint — crypt.FingerprintPasswordHash
+	// for slot 1, crypt.Manager.RecoveryKeyID() for slot 2.
+	WriteKeyslotBlob(ctx context.Context, slot KeyslotSlot, keyID string, passphrase []byte) error
+
+	// WriteKeyslotBlobWithKey is the D11 prepare-hook variant — caller is
+	// inside crypt.Manager's write lock and would deadlock if we called
+	// back through EncryptWithAAD's RLock. Uses the supplied SDEK directly.
+	WriteKeyslotBlobWithKey(ctx context.Context, sdek []byte, slot KeyslotSlot, keyID string, passphrase []byte) error
+
+	// CountKeyslotUnprovisioned returns the slot 1 + slot 2 counts of
+	// v3 LUKS volumes stamped "unprovisioned" (RFC 20260510 S7) in a
+	// single metadata walk. Counted from on-disk metadata so the boot
+	// surface reflects current truth, not stale reconciler-pass state.
+	CountKeyslotUnprovisioned() (slot1, slot2 int, err error)
 }
 
 // DeviceManager discovers and manages physical storage devices.

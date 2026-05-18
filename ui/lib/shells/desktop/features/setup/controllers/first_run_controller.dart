@@ -413,21 +413,31 @@ class FirstRunController extends ChangeNotifier {
   bool _recoveryEntryFromPasskey = false;
 
   void proceedAfterRecovery() {
-    unawaited(ackRecoveryKey(_recoveryMaterial?.keyId ?? ''));
-    if (_recoveryEntryFromPasskey) {
-      // Post-passkey-registration recovery: passkey ceremony already
-      // succeeded, the forcing gate is cleared. Routing to passkeyRequired
-      // would loop the operator into another registration screen; jump
-      // straight to setup completion.
-      onComplete();
-      return;
-    }
-    if (isOnRemoteDomain()) {
-      _step = FirstRunStep.passkeyRequired;
-    } else {
-      _step = FirstRunStep.security;
-    }
-    notifyListeners();
+    final keyId = _recoveryMaterial?.keyId ?? '';
+    // RFC 20260510 §Frontend ack-await fix: await the ack BEFORE
+    // transitioning steps (or calling onComplete which can navigate). A
+    // fire-and-forget ack races the step transition and may never reach
+    // the server, leaving RecoveryAckAt=zero and the operator re-prompted
+    // with rotated words on next sign-in. The post-ack action mirrors
+    // the awaited-then-act pattern in setup_router.dart:521.
+    unawaited(() async {
+      await ackRecoveryKey(keyId);
+      if (_disposed) return;
+      if (_recoveryEntryFromPasskey) {
+        // Post-passkey-registration recovery: passkey ceremony already
+        // succeeded, the forcing gate is cleared. Routing to passkeyRequired
+        // would loop the operator into another registration screen; jump
+        // straight to setup completion.
+        onComplete();
+        return;
+      }
+      if (isOnRemoteDomain()) {
+        _step = FirstRunStep.passkeyRequired;
+      } else {
+        _step = FirstRunStep.security;
+      }
+      notifyListeners();
+    }());
   }
 
   void completeSetup() {

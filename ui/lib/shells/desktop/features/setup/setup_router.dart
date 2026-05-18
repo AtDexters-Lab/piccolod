@@ -465,10 +465,19 @@ class _SetupRouterState extends State<SetupRouter> {
         _pendingRecoveryContext = RecoveryKeyEntryContext.postLogin;
         final keyId = material.keyId;
         _pendingPostRecoveryAction = () {
-          unawaited(ackRecoveryKey(keyId));
-          _clearPendingRecovery();
-          _createAuthController(AuthMode.passkeyRequired);
-          setState(() {});
+          // RFC 20260510 §Frontend ack-await fix: await the ack BEFORE
+          // transitioning to the passkey screen — a fire-and-forget ack
+          // races the route transition and may never reach the server,
+          // leaving RecoveryAckAt=zero and the operator re-prompted with
+          // rotated words on next sign-in. Same pattern as
+          // _handleRecoveryKeyThenComplete's awaited site below.
+          unawaited(() async {
+            await ackRecoveryKey(keyId);
+            if (!mounted) return;
+            _clearPendingRecovery();
+            _createAuthController(AuthMode.passkeyRequired);
+            setState(() {});
+          }());
         };
         setState(() => _loading = false);
         return;

@@ -90,8 +90,9 @@ type luksVolumeManager struct {
 	// ImageSizeFn returns the uncompressed image size in bytes for right-sizing golden LVs.
 	imageSizeFn func(ctx context.Context, imageRef string) (int64, error)
 
-	mu          sync.Mutex
-	roleChecker func(string, VolumeRole) bool
+	mu                  sync.Mutex
+	roleChecker         func(string, VolumeRole) bool
+	volumeCreationNudge func() // RFC 20260510 — invoked after EnsureVolume persists v3 metadata
 
 	// Golden LV management.
 	goldenLVs    map[string]*volumeMetaV3 // imageDigestShort → meta cache
@@ -170,6 +171,27 @@ func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) (*luksVolumeManager, erro
 
 // SetRoleChecker sets the function used to check if a volume operation
 // is permitted for a given role.
+// SetVolumeCreationNudge registers a callback invoked after a newly-created
+// v3 volume's metadata is persisted (RFC 20260510 §Volume-creation
+// atomicity). Lets the keyslot reconciler pick up the new volume on its
+// next pass without waiting for the operator's next /generate or password
+// change. nil-safe: if no callback is registered, volume creation
+// proceeds normally and the next reconciler signal picks up the volume.
+func (m *luksVolumeManager) SetVolumeCreationNudge(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.volumeCreationNudge = fn
+}
+
+func (m *luksVolumeManager) nudgeVolumeCreation() {
+	m.mu.Lock()
+	fn := m.volumeCreationNudge
+	m.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
 func (m *luksVolumeManager) SetRoleChecker(fn func(string, VolumeRole) bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -799,14 +821,30 @@ func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeReque
 		return VolumeHandle{}, fmt.Errorf("mkfs.ext4: %w", mkfsErr)
 	}
 
-	// Persist v3 metadata.
+	// Persist v3 metadata. RFC 20260510 §Volume-creation atomicity stamps
+	// kskey_id for both slots: "unprovisioned" sentinel when no pending
+	// blob exists (operator initiates rotation later to populate), or the
+	// blob's key_id when a rotation is in flight (sub-case i — the
+	// post-write reconciler nudge will then provision this volume's slots
+	// against the captured passphrase). The post-write nudge happens at
+	// the EnsureVolume completion below so the reconciler picks up the
+	// just-stamped volume immediately.
 	meta := &volumeMetaV3{
-		Version:   metadataV3Version,
-		Type:      volumeTypeServiceData,
-		LVName:    lvName,
-		VGName:    lvm.DefaultVGName,
-		SizeBytes: sizeBytes,
-		FSType:    "ext4",
+		Version:              metadataV3Version,
+		Type:                 volumeTypeServiceData,
+		LVName:               lvName,
+		VGName:               lvm.DefaultVGName,
+		SizeBytes:            sizeBytes,
+		FSType:               "ext4",
+		// New v3 volumes are stamped "unprovisioned" for both slots
+		// (RFC 20260510 §Volume-creation atomicity sub-case ii). Even
+		// when a /generate or password-change rotation is in flight at
+		// creation time, the post-creation reconciler nudge picks the
+		// volume up and the reconciler's case-KeyslotKeyIDUnprovisioned
+		// arm provisions it via the D7 pre-kill probe (kill is a no-op
+		// on the empty slot, only add runs).
+		PasswordKeyslotKeyID: KeyslotKeyIDUnprovisioned,
+		RecoveryKeyslotKeyID: KeyslotKeyIDUnprovisioned,
 	}
 	if err := os.MkdirAll(metaDir, 0o700); err != nil {
 		return VolumeHandle{}, fmt.Errorf("create meta dir: %w", err)
@@ -815,10 +853,46 @@ func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeReque
 		return VolumeHandle{}, fmt.Errorf("write metadata: %w", err)
 	}
 
+	m.nudgeVolumeCreation()
+
 	return VolumeHandle{
 		ID:       req.ID,
 		MountDir: paths.MountDir(req.ID),
 	}, nil
+}
+
+// CountKeyslotUnprovisioned returns slot 1 + slot 2 counts in a single
+// metadata walk (RFC 20260510 §Status surface, S7). Counted on-demand
+// from on-disk metadata rather than reconciler-pass-cached state so the
+// boot-surface count reflects the current truth even between reconciler
+// passes. Single walk avoids the 2× IO of separate per-slot calls under
+// the 3-second frontend boot poll.
+func (m *luksVolumeManager) CountKeyslotUnprovisioned() (slot1, slot2 int, err error) {
+	ids, listErr := listVolumeIDs()
+	if listErr != nil {
+		return 0, 0, listErr
+	}
+	for _, id := range ids {
+		metaPath := filepath.Join(paths.VolumeMetaDir(id), metadataV2File)
+		version, _ := readVolumeMetaVersion(metaPath)
+		if version != metadataV3Version {
+			continue
+		}
+		meta, mErr := readVolumeMetaV3(metaPath)
+		if mErr != nil {
+			continue
+		}
+		if meta.Type == volumeTypeEphemeral {
+			continue
+		}
+		if meta.PasswordKeyslotKeyID == KeyslotKeyIDUnprovisioned {
+			slot1++
+		}
+		if meta.RecoveryKeyslotKeyID == KeyslotKeyIDUnprovisioned {
+			slot2++
+		}
+	}
+	return slot1, slot2, nil
 }
 
 func (m *luksVolumeManager) attachAppVolume(ctx context.Context, handle VolumeHandle, meta *volumeMetaV2, opts AttachOptions) error {
@@ -1260,9 +1334,85 @@ func (m *luksVolumeManager) luksOpenWithPoolKeyfile(ctx context.Context, device,
 
 // --- LUKS keyslot provisioning ---
 
+// provisionKeyslotOnAllVolumesAndStamp is the sync path with metadata
+// stamping (RFC 20260510 + codex iter-3 P2). Called by the locked
+// /reset-password handler that must complete the rotation before the
+// deferred relock; after the cryptsetup-add succeeds per volume, stamps
+// PasswordKeyslotKeyID / RecoveryKeyslotKeyID = stampKeyID so the async
+// reconciler doesn't redundantly re-provision later. stampKeyID == "" is
+// the legacy no-stamp variant (called via provisionKeyslotOnAllVolumes
+// wrapper).
+func (m *luksVolumeManager) provisionKeyslotOnAllVolumesAndStamp(ctx context.Context, slot int, passphrase []byte, stampKeyID string) error {
+	if slot < 1 || slot > 2 {
+		return fmt.Errorf("invalid keyslot %d: only slots 1 and 2 are provisionable", slot)
+	}
+	volIDs, err := listVolumeIDs()
+	if err != nil {
+		return err
+	}
+	type candidate struct {
+		id   string
+		meta *volumeMetaV3
+	}
+	var targets []candidate
+	for _, volID := range volIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
+		version, _ := readVolumeMetaVersion(metaPath)
+		if version != metadataV3Version {
+			continue
+		}
+		meta, err := readVolumeMetaV3(metaPath)
+		if err != nil {
+			continue
+		}
+		if meta.Type == volumeTypeEphemeral {
+			continue
+		}
+		targets = append(targets, candidate{id: volID, meta: meta})
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	masterKey, err := m.crypto.UnwrapLUKSMasterKey()
+	if err != nil {
+		return fmt.Errorf("unwrap master key: %w", err)
+	}
+	defer cryptoutil.SecureZero(masterKey)
+
+	var errs []error
+	for _, t := range targets {
+		if err := m.provisionKeyslotOnVolume(ctx, t.id, t.meta, slot, passphrase, masterKey); err != nil {
+			log.Printf("WARN: keyslot %d failed for %s: %v", slot, t.id, err)
+			errs = append(errs, fmt.Errorf("%s: %w", t.id, err))
+			continue
+		}
+		if stampKeyID != "" {
+			// Read-modify-write so a concurrent writer (resize updating
+			// SizeBytes, attach-time fingerprint backfill) is not
+			// clobbered by writing back the stale `t.meta` snapshot.
+			// Mirror of the reconciler's keyslot_reconciler.go:452-462
+			// pattern.
+			metaPath := filepath.Join(paths.VolumeMetaDir(t.id), metadataV2File)
+			latest, rerr := readVolumeMetaV3(metaPath)
+			if rerr != nil {
+				log.Printf("WARN: re-read meta %s slot=%d: %v", t.id, slot, rerr)
+				continue
+			}
+			setMetaKeyslotKeyID(latest, KeyslotSlot(slot), stampKeyID)
+			if werr := writeVolumeMetaV3(metaPath, latest); werr != nil {
+				log.Printf("WARN: stamp kskey_id %s slot=%d: %v", t.id, slot, werr)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // provisionKeyslotOnAllVolumes iterates all v3 volumes and adds (or replaces)
 // a passphrase on the given LUKS keyslot. Volumes that fail are logged and
-// collected; the caller gets a joined error.
+// collected; the caller gets a joined error. Stub legacy wrapper — no
+// metadata stamping. Tests call this directly; production callers should
+// route through provisionKeyslotOnAllVolumesAndStamp with a non-empty
+// fingerprint.
 func (m *luksVolumeManager) provisionKeyslotOnAllVolumes(ctx context.Context, slot int, passphrase []byte) error {
 	if slot < 1 || slot > 2 {
 		return fmt.Errorf("invalid keyslot %d: only slots 1 and 2 are provisionable", slot)
@@ -1326,6 +1476,60 @@ func (m *luksVolumeManager) provisionKeyslotOnVolume(ctx context.Context, volID 
 	return m.luksSetKeyslot(ctx, device, slot, passphrase, masterKey)
 }
 
+// --- keyslotReconcilerVM adapter ---
+//
+// These methods expose the subset of luksVolumeManager the KeyslotReconciler
+// (RFC 20260510 §Reconciler shape) needs. Implementing the interface here
+// keeps the reconciler decoupled from volume-manager internals while
+// reusing the existing helpers for volume enumeration, metadata I/O, and
+// the kill+add primitive.
+
+// listKeyslotVolumes returns every v3 non-ephemeral volume's id + metadata.
+// Ephemeral volumes have no LUKS container so they cannot host a slot-1
+// or slot-2 passphrase; the existing provisionKeyslotOnAllVolumes iterator
+// skips them and the reconciler inherits that filter.
+func (m *luksVolumeManager) listKeyslotVolumes() ([]keyslotVolume, error) {
+	ids, err := listVolumeIDs()
+	if err != nil {
+		return nil, err
+	}
+	var out []keyslotVolume
+	for _, id := range ids {
+		metaPath := filepath.Join(paths.VolumeMetaDir(id), metadataV2File)
+		version, _ := readVolumeMetaVersion(metaPath)
+		if version != metadataV3Version {
+			continue
+		}
+		meta, err := readVolumeMetaV3(metaPath)
+		if err != nil {
+			continue
+		}
+		if meta.Type == volumeTypeEphemeral {
+			continue
+		}
+		out = append(out, keyslotVolume{ID: id, Meta: meta})
+	}
+	return out, nil
+}
+
+func (m *luksVolumeManager) readKeyslotMeta(volID string) (*volumeMetaV3, error) {
+	metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
+	return readVolumeMetaV3(metaPath)
+}
+
+func (m *luksVolumeManager) writeKeyslotMeta(volID string, meta *volumeMetaV3) error {
+	metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
+	return writeVolumeMetaV3(metaPath, meta)
+}
+
+func (m *luksVolumeManager) provisionKeyslotOnVolumeByID(ctx context.Context, volID string, meta *volumeMetaV3, slot int, passphrase, masterKey []byte) error {
+	return m.provisionKeyslotOnVolume(ctx, volID, meta, slot, passphrase, masterKey)
+}
+
+func (m *luksVolumeManager) unwrapMasterKey() ([]byte, error) {
+	return m.crypto.UnwrapLUKSMasterKey()
+}
+
 // resolveLUKSDevice returns the block device path for a volume's LUKS container.
 // For already-attached volumes, uses LUKSBackingDevice (kernel-state truth).
 // For inactive volumes, activates the underlying device and returns a cleanup
@@ -1367,8 +1571,28 @@ func (m *luksVolumeManager) resolveLUKSDevice(ctx context.Context, volID string,
 	}
 }
 
-// luksSetKeyslot adds a passphrase to a specific LUKS keyslot, using the master
-// key for authentication. If the slot is already occupied, it is killed first.
+// luksSetKeyslot installs `passphrase` in the given LUKS keyslot, using the
+// master key for authentication. RFC 20260510 D7 — the kill→add pair is the
+// critical span where the slot is transiently empty. Two defenses combine
+// to keep the slot from transitioning through empty under
+// explicit-cancellation failure modes (SIGKILL during Argon2id remains the
+// residual hazard; rotate-to-recover policy is the documented recourse):
+//
+//   1. Pre-kill probe via `cryptsetup luksDump`: if the slot is already
+//      empty, the kill is skipped entirely and we go straight to add. This
+//      collapses the "unprovisioned" sentinel case (RFC §Volume-creation
+//      atomicity sub-case ii) to a single non-destructive operation.
+//   2. The kill+add pair is wrapped in `context.WithoutCancel`: a
+//      reconciler nudge, per-pass timeout, or process-exit signal mid-pair
+//      cannot tear them apart. The compute time is bounded by Argon2id
+//      (single-digit seconds per slot), so withholding cancellation for
+//      this window is a finite, acceptable trade against the silent-empty
+//      hazard.
+//
+// Net invariant: the slot transitions atomically from old-passphrase to
+// new-passphrase OR stays at old-passphrase; it never transitions through
+// empty under the explicit-cancellation failure modes the reconciler is
+// responsible for.
 func (m *luksVolumeManager) luksSetKeyslot(ctx context.Context, device string, slot int, passphrase, masterKey []byte) error {
 	masterKeyPath, mkCleanup, err := writeKeyToTmpfsDir(m.tmpfsDir, masterKey)
 	if err != nil {
@@ -1384,21 +1608,41 @@ func (m *luksVolumeManager) luksSetKeyslot(ctx context.Context, device string, s
 
 	slotStr := fmt.Sprintf("%d", slot)
 
-	// Try adding directly; if the slot is occupied, kill and retry.
-	err = m.run.Run(ctx, "cryptsetup", "luksAddKey",
-		"--master-key-file", masterKeyPath,
-		"--key-slot", slotStr,
-		"--batch-mode",
-		device,
-		passphrasePath,
-	)
-	if err == nil {
-		return nil
+	addKey := func(c context.Context) error {
+		return m.run.Run(c, "cryptsetup", "luksAddKey",
+			"--master-key-file", masterKeyPath,
+			"--key-slot", slotStr,
+			"--batch-mode",
+			device,
+			passphrasePath,
+		)
 	}
 
-	// Slot may be occupied. Kill and retry. Log the original error for diagnostics.
-	log.Printf("luksAddKey slot %s on %s failed (will retry): %v", slotStr, device, err)
-	if killErr := m.run.Run(ctx, "cryptsetup", "luksKillSlot",
+	// Pre-kill probe — read-only, runs under the caller's context so
+	// external cancellation is observable here.
+	occupied, probeErr := m.luksSlotOccupied(ctx, device, slot)
+	switch {
+	case probeErr == nil && !occupied:
+		// Sub-case ii / "unprovisioned" sentinel: add-only, no kill. No
+		// empty-window risk because the slot is already empty.
+		return addKey(ctx)
+	case probeErr != nil:
+		// Probe failure means we don't know the slot state. Try the
+		// optimistic add first (the historical behavior) so a transient
+		// `luksDump` issue does not block legitimate provisioning of an
+		// empty slot. If the add fails (slot was occupied), fall through
+		// to the atomic kill+add pair.
+		log.Printf("WARN: luksDump probe slot=%d on %s: %v; trying optimistic add", slot, device, probeErr)
+		if err := addKey(ctx); err == nil {
+			return nil
+		}
+	}
+
+	// Slot is occupied (or probe failed and optimistic add failed) —
+	// execute kill+add under WithoutCancel so the pair stays atomic
+	// against external cancellation.
+	uncancellable := context.WithoutCancel(ctx)
+	if killErr := m.run.Run(uncancellable, "cryptsetup", "luksKillSlot",
 		"--master-key-file", masterKeyPath,
 		"--batch-mode",
 		device,
@@ -1406,13 +1650,39 @@ func (m *luksVolumeManager) luksSetKeyslot(ctx context.Context, device string, s
 	); killErr != nil {
 		log.Printf("luksKillSlot %s on %s: %v", slotStr, device, killErr)
 	}
-	return m.run.Run(ctx, "cryptsetup", "luksAddKey",
-		"--master-key-file", masterKeyPath,
-		"--key-slot", slotStr,
-		"--batch-mode",
-		device,
-		passphrasePath,
-	)
+	return addKey(uncancellable)
+}
+
+// luksSlotOccupied reports whether the given LUKS keyslot holds a key. It
+// shells out to `cryptsetup luksDump --dump-json-metadata` and parses the
+// returned JSON. Pre-kill probe per RFC D7.
+//
+// Returns (false, nil) when the dump succeeds and the slot is unmarked.
+// Returns (true, nil) when the dump succeeds and the slot is enabled.
+// Returns (_, err) for transport / parse failures — caller falls back to
+// the optimistic add-first path so a probe-only failure doesn't gate
+// legitimate rotations.
+func (m *luksVolumeManager) luksSlotOccupied(ctx context.Context, device string, slot int) (bool, error) {
+	out, err := m.run.RunWithOutput(ctx, "cryptsetup", "luksDump", "--dump-json-metadata", device)
+	if err != nil {
+		return false, fmt.Errorf("luksDump: %w", err)
+	}
+	return luksDumpSlotOccupied(out, slot)
+}
+
+// luksDumpSlotOccupied parses the `cryptsetup luksDump --dump-json-metadata`
+// output and reports whether the keyslot ID `slot` is present in the
+// `keyslots` object. Pure function for unit-testing the probe shape
+// without invoking cryptsetup.
+func luksDumpSlotOccupied(dump []byte, slot int) (bool, error) {
+	var doc struct {
+		Keyslots map[string]json.RawMessage `json:"keyslots"`
+	}
+	if err := json.Unmarshal(dump, &doc); err != nil {
+		return false, fmt.Errorf("parse luksDump JSON: %w", err)
+	}
+	_, present := doc.Keyslots[fmt.Sprintf("%d", slot)]
+	return present, nil
 }
 
 // attachAppVolumeV3 attaches a v3 service-data volume using the pool keyfile.
@@ -1449,7 +1719,30 @@ type volumeMetaV3 struct {
 	// volume-attach-truth work shipped — pre-existing hand-edited metadata is
 	// grandfathered (see plan §"Pre-Phase-1 fleet grandfathering").
 	IDMapFingerprint string `json:"idmap_fingerprint,omitempty"`
+
+	// PasswordKeyslotKeyID / RecoveryKeyslotKeyID record which generation's
+	// passphrase is currently provisioned in LUKS keyslot 1 (admin password)
+	// and keyslot 2 (recovery mnemonic) respectively. RFC 20260510 §Data
+	// shape additions. Typed sentinel values are load-bearing:
+	//
+	//   ""              = pre-RFC-existing volume; reconciler kill+re-adds
+	//                     unconditionally (slot may hold any old generation)
+	//   "unprovisioned" = volume created in steady state with no in-flight
+	//                     passphrase; slot is empty; reconciler adds-only
+	//                     (skips the kill via pre-kill luksDump probe)
+	//   <hex digest>    = current generation fingerprint; reconciler skips
+	//                     this volume for that slot
+	PasswordKeyslotKeyID string `json:"password_keyslot_key_id,omitempty"`
+	RecoveryKeyslotKeyID string `json:"recovery_keyslot_key_id,omitempty"`
 }
+
+const (
+	// KeyslotKeyIDUnprovisioned marks a volume created in steady state with
+	// no in-flight passphrase material — the LUKS slot is known empty so the
+	// reconciler skips the kill and goes straight to add. Distinct from the
+	// empty-string sentinel (pre-RFC unknown state), which forces kill+add.
+	KeyslotKeyIDUnprovisioned = "unprovisioned"
+)
 
 // IDMapMeta persists idmap configuration for rootfs volumes.
 type IDMapMeta struct {

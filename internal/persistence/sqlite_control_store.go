@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +25,7 @@ import (
 )
 
 const (
-	sqliteSchemaVersion       = 4 // Incremented for WebAuthn + invite tokens
+	sqliteSchemaVersion       = 5 // v5: recovery_ack_at backfill (RFC 20260510)
 	controlPayloadVersion     = 1
 	controlVolumeMetadataName = "piccolo.volume.json"
 )
@@ -175,6 +176,22 @@ func applyMigrations(db *sql.DB) error {
 		}
 	}()
 
+	// Capture the OLD user_version before the CREATE/PRAGMA block below
+	// bumps it to current. The backfill migration (RFC 20260510) is gated
+	// on oldVersion < 5 — devices that already ran the pre-RFC schema
+	// (commit 10daa79) have the `recovery_ack_at` column present with
+	// empty default and would NOT trigger the "column-just-added" gate;
+	// the user_version gate catches them too. Devices that already ran
+	// v5 (this RFC) won't re-fire backfill after legitimate /reset-password
+	// clears.
+	var oldVersion int
+	// Assign to outer `err` (no `:=`) per the convention in the comment
+	// before `ensureAuthStateColumns` below — keeps the deferred rollback
+	// at line 173 wired to every error-return path.
+	if err = tx.QueryRow(`PRAGMA user_version;`).Scan(&oldVersion); err != nil {
+		return err
+	}
+
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS meta (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -291,20 +308,30 @@ func applyMigrations(db *sql.DB) error {
 			return err
 		}
 	}
-	if err := ensureAuthStateColumns(tx); err != nil {
+	// IMPORTANT: assign to the outer `err` (no `:=`) so the deferred
+	// rollback at line 173 actually fires. Prior `if err := ...` shadowed
+	// the closure-captured `err` and left the transaction open on
+	// migration errors (codex iter-4 P2 #3) — critical for the typed
+	// ErrAuthMigrationDegradedStorage path which needs clean rollback
+	// for retry on next Unlock.
+	if err = ensureAuthStateColumns(tx, oldVersion); err != nil {
 		return err
 	}
-	if err := ensureOIDCSchemaColumns(tx); err != nil {
+	if err = ensureOIDCSchemaColumns(tx); err != nil {
 		return err
 	}
-	if err := ensureWebAuthnBackupColumns(tx); err != nil {
+	if err = ensureWebAuthnBackupColumns(tx); err != nil {
 		return err
 	}
 	err = tx.Commit()
 	return err
 }
 
-func ensureAuthStateColumns(tx *sql.Tx) error {
+// recoveryAckBackfillVersion gates the one-shot backfill (RFC 20260510).
+// Bumped to match sqliteSchemaVersion at the version this migration ships.
+const recoveryAckBackfillVersion = 5
+
+func ensureAuthStateColumns(tx *sql.Tx, oldVersion int) error {
 	rows, err := tx.Query(`PRAGMA table_info(auth_state);`)
 	if err != nil {
 		return err
@@ -326,32 +353,229 @@ func ensureAuthStateColumns(tx *sql.Tx) error {
 		}
 		cols[strings.ToLower(name)] = true
 	}
-	addColumn := func(name, definition string) error {
+	addColumn := func(name, definition string) (added bool, err error) {
 		if cols[strings.ToLower(name)] {
-			return nil
+			return false, nil
 		}
-		_, err := tx.Exec(fmt.Sprintf("ALTER TABLE auth_state ADD COLUMN %s %s", name, definition))
+		_, err = tx.Exec(fmt.Sprintf("ALTER TABLE auth_state ADD COLUMN %s %s", name, definition))
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if _, err := addColumn("password_stale", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
-	if err := addColumn("password_stale", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+	if _, err := addColumn("password_stale_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
-	if err := addColumn("password_stale_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+	if _, err := addColumn("password_ack_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
-	if err := addColumn("password_ack_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+	if _, err := addColumn("recovery_stale", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
-	if err := addColumn("recovery_stale", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+	if _, err := addColumn("recovery_stale_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
-	if err := addColumn("recovery_stale_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+	if _, err := addColumn("recovery_ack_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
-	if err := addColumn("recovery_ack_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
+	// One-shot backfill gated on the OLD schema version. Fires when
+	// upgrading from any pre-v5 schema (regardless of whether the
+	// `recovery_ack_at` column was already present from commit 10daa79).
+	// Subsequent /reset-password calls that legitimately clear
+	// recovery_ack_at are protected by the version gate: the upgrade
+	// already happened, so backfill will not re-fire and silently re-ack.
+	if oldVersion < recoveryAckBackfillVersion {
+		if err := backfillRecoveryAckAt(tx); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// backfillRecoveryAckAt seeds recovery_ack_at on pre-Apr-28-2026 devices that
+// have a usable recovery key on disk but no acknowledgement on record. RFC
+// 20260510 §Backfill migration.
+//
+// Closes the regenerate-loop introduced by commit 10daa79 (recovery_ack_at
+// added with TEXT NOT NULL DEFAULT '' and no backfill): without this seed
+// computeRecoveryKeyPending returns true on every login → /generate fires →
+// rotation invalidates the operator's saved paper words → recovery_ack_at
+// reset to '' again. Three pre-Apr-28 devices in the field are stuck here;
+// one (RPi 400, ~19 volumes) is unrecoverable without code intervention
+// because the synchronous /generate exceeds the 120 s frontend timeout
+// before the ack screen renders.
+//
+// Conditions (all must hold to backfill):
+//  1. auth_state.password_hash is non-empty (rules out fresh INSERT rows
+//     that haven't completed setup).
+//  2. auth_state.recovery_ack_at is empty (the column was just added or no
+//     ack on record).
+//  3. keyset.json at <core>/crypto/keyset.json exists, parses, and has
+//     SDEKRK set (the recovery key is actually usable for /reset-password).
+//
+// Read-error matrix per RFC §Backfill migration:
+//   - file does not exist                → skip cleanly (genuinely pre-setup)
+//   - SDEKRK empty                       → skip + WARN (partial setup)
+//   - I/O error / parse error / corrupt  → 3× retry (250ms/1s/4s), then
+//                                          ErrAuthMigrationDegradedStorage
+//                                          (silent skip would put the device
+//                                          back in the regenerate-loop).
+//
+// The migration runs inside applyMigrations' transaction; returning the
+// typed error rolls back the column add as well, so a re-run starts clean.
+func backfillRecoveryAckAt(tx *sql.Tx) error {
+	var (
+		passwordHash string
+		ackAt        string
+	)
+	row := tx.QueryRow(`SELECT IFNULL(password_hash,''), IFNULL(recovery_ack_at,'') FROM auth_state WHERE id=1;`)
+	if err := row.Scan(&passwordHash, &ackAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("backfill: read auth_state: %w", err)
+	}
+	if passwordHash == "" || ackAt != "" {
+		return nil
+	}
+
+	keysetPath := paths.CoreJoin("crypto", "keyset.json")
+	state, err := readKeysetForBackfill(keysetPath)
+	if err != nil {
+		switch {
+		case errors.Is(err, errKeysetMissing):
+			return nil
+		case errors.Is(err, errKeysetEmptySDEKRK):
+			log.Printf("WARN: recovery_ack_at backfill: keyset.json present but SDEKRK empty (partial setup); skipping")
+			return nil
+		default:
+			log.Printf("ERROR: recovery_ack_at backfill: keyset.json unreadable after retries: %v", err)
+			return fmt.Errorf("%w: %v", ErrAuthMigrationDegradedStorage, err)
+		}
+	}
+	_ = state // SDEKRK presence is the entire signal
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.Exec(
+		`UPDATE auth_state SET recovery_ack_at=?, updated_at=? WHERE id=1 AND password_hash IS NOT NULL AND password_hash<>'' AND IFNULL(recovery_ack_at,'')='';`,
+		now, now,
+	); err != nil {
+		return fmt.Errorf("backfill: update auth_state: %w", err)
+	}
+	log.Printf("INFO: recovery_ack_at backfill: seeded ack at %s (pre-Apr-28 device upgrade)", now)
+	return nil
+}
+
+var (
+	errKeysetMissing     = errors.New("keyset: file missing")
+	errKeysetEmptySDEKRK = errors.New("keyset: SDEKRK empty")
+)
+
+// keysetSDEKRKProbe is the minimal projection of keyset.json fields needed
+// to decide the backfill. The full recovery wrapper (codex iter-5 P2 #1)
+// requires SDEKRK + RKSalt + RKNonce; without all three UnlockWithRecoveryKey
+// would fail. Validating only SDEKRK presence would falsely back-fill ack
+// on a corrupt-but-non-empty wrapper.
+type keysetSDEKRKProbe struct {
+	SDEKRK  string `json:"sdek_rk"`
+	RKSalt  string `json:"rk_salt"`
+	RKNonce string `json:"rk_nonce"`
+}
+
+// readKeysetForBackfill reads keyset.json with a bounded retry to absorb
+// transient I/O glitches on marginal SD cards (RFC F-A4 / S6). Returns:
+//   - errKeysetMissing     — file does not exist (legitimate pre-setup state)
+//   - errKeysetEmptySDEKRK — parses, SDEKRK is empty (partial setup state)
+//   - other error          — persistent I/O / parse / decode failure after
+//                            retries (caller wraps in ErrAuthMigrationDegradedStorage)
+//   - (*keysetSDEKRKProbe, nil) — usable SDEKRK present
+//
+// Backoff schedule 250 ms / 1 s / 4 s — total worst-case ~5.25 s, bounded
+// at startup. The retry covers I/O and parse errors uniformly because on
+// marginal storage a corrupt read may succeed on retry; parse errors on
+// stable storage are deterministic and the retries are cheap.
+func readKeysetForBackfill(path string) (*keysetSDEKRKProbe, error) {
+	backoffs := []time.Duration{250 * time.Millisecond, 1 * time.Second, 4 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt <= len(backoffs); attempt++ {
+		probe, err := readKeysetSDEKRKOnce(path)
+		if err == nil {
+			if probe.SDEKRK == "" {
+				return nil, errKeysetEmptySDEKRK
+			}
+			if dErr := validateRecoveryWrapperFields(probe); dErr != nil {
+				lastErr = dErr
+			} else {
+				return probe, nil
+			}
+		} else {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, errKeysetMissing
+			}
+			lastErr = err
+		}
+		if attempt < len(backoffs) {
+			time.Sleep(backoffs[attempt])
+		}
+	}
+	return nil, lastErr
+}
+
+// validateRecoveryWrapperFields confirms the recovery wrapper is
+// structurally usable for UnlockWithRecoveryKey: all three fields
+// present, all base64-decode, ciphertext at least nonce-size (AES-GCM
+// nonce is 12 bytes — anything shorter than nonce+tag cannot AEAD-Open).
+// Codex iter-5 P2 #1: backing up only SDEKRK presence would seed
+// recovery_ack_at on a corrupt wrapper, suppressing the UI's
+// regenerate prompt even though the saved words can't unlock.
+func validateRecoveryWrapperFields(p *keysetSDEKRKProbe) error {
+	sdek, err := base64.RawStdEncoding.DecodeString(p.SDEKRK)
+	if err != nil {
+		return fmt.Errorf("decode SDEKRK: %w", err)
+	}
+	// AES-GCM ciphertext minimum: 16-byte authentication tag (zero-length
+	// plaintext is legal but rare). RFC 20260510's actual SDEKRK wraps a
+	// 32-byte SDEK → at least 32 plaintext + 16 tag = 48 bytes. Reject
+	// anything shorter to avoid backfilling on truncated wrappers
+	// (codex iter-6 P2 #2): UnlockWithRecoveryKey would fail at aead.Open
+	// but the backfill would have silently seeded recovery_ack_at.
+	if len(sdek) < 48 {
+		return fmt.Errorf("SDEKRK ciphertext length %d < 48 (truncated wrapper)", len(sdek))
+	}
+	if p.RKSalt == "" {
+		return errors.New("recovery wrapper: rk_salt empty")
+	}
+	if _, err := base64.RawStdEncoding.DecodeString(p.RKSalt); err != nil {
+		return fmt.Errorf("decode rk_salt: %w", err)
+	}
+	if p.RKNonce == "" {
+		return errors.New("recovery wrapper: rk_nonce empty")
+	}
+	nonce, err := base64.RawStdEncoding.DecodeString(p.RKNonce)
+	if err != nil {
+		return fmt.Errorf("decode rk_nonce: %w", err)
+	}
+	// AES-GCM standard nonce is 12 bytes; UnlockWithRecoveryKey would
+	// reject anything else at the aead.Open boundary.
+	if len(nonce) != 12 {
+		return fmt.Errorf("rk_nonce length %d != 12 (AES-GCM nonce size)", len(nonce))
+	}
+	return nil
+}
+
+func readKeysetSDEKRKOnce(path string) (*keysetSDEKRKProbe, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var probe keysetSDEKRKProbe
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil, fmt.Errorf("parse keyset.json: %w", err)
+	}
+	return &probe, nil
 }
 
 // ensureOIDCSchemaColumns adds columns introduced by RFC 20260122 to OIDC tables.

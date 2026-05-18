@@ -75,6 +75,16 @@ func (t *Tracker) Status(name string) (Status, bool) {
 	return s, ok
 }
 
+// Clear removes a status entry. Used by callers that need to retract a
+// transient error condition (e.g., RFC 20260510's auth-migration
+// degraded-storage flag once the next successful unlock proves the
+// underlying issue is resolved). Idempotent on absent keys.
+func (t *Tracker) Clear(name string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.statuses, name)
+}
+
 func (t *Tracker) Snapshot() map[string]Status {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

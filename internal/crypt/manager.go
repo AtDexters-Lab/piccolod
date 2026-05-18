@@ -376,6 +376,38 @@ func (m *Manager) RewrapUnlocked(newPassword string) error {
 // closes the race where a concurrent /generate could rotate past us between
 // release and a separate fingerprint read, mismatching words against id.
 func (m *Manager) GenerateRecoveryKey(force bool) ([]string, string, error) {
+	return m.GenerateRecoveryKeyWithHook(force, nil)
+}
+
+// GenerateRecoveryKeyWithHook implements the RFC 20260510 D11 blob-write-first
+// ordering by inviting the caller to do work between candidate computation
+// and the atomic keyset.json commit. The hook receives the candidate
+// (words, keyID, sdek) — typically the synchronous handler uses it to
+// write the SDEK-encrypted slot-2 pending blob so the reconciler can drain
+// it asynchronously after the commit.
+//
+// The SDEK is passed by reference into the hook so the hook can encrypt
+// the blob without re-acquiring the manager's lock (which would deadlock
+// against the write lock held here). The hook MUST NOT retain the SDEK
+// pointer past its return — the manager rezeros the duplicate on return.
+//
+// Atomicity guarantees:
+//   - The write mutex is held across candidate computation, hook
+//     invocation, AND commit. Concurrent /generate calls cannot
+//     interleave their candidates.
+//   - If the hook returns an error, keyset.json is NOT written. The
+//     operator's existing recovery key (if any) remains authoritative.
+//   - On success keyset.json is atomic-written via fsutil.AtomicWriteFile
+//     (fsync + rename + parent-dir fsync) so a power loss after the
+//     hook's blob write and before the commit either leaves both files
+//     present (atomic happy path) or leaves the blob without a referencing
+//     keyset.json (which the reconciler treats as orphan and deletes —
+//     state is operator-equivalent to "blob write failed").
+//
+// The hook==nil case is identical to the original GenerateRecoveryKey
+// behavior — for backwards compatibility and tests that don't care about
+// the async path.
+func (m *Manager) GenerateRecoveryKeyWithHook(force bool, hook func(words []string, keyID string, sdek []byte) error) ([]string, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.inited {
@@ -400,6 +432,13 @@ func (m *Manager) GenerateRecoveryKey(force bool) ([]string, string, error) {
 	} else {
 		return nil, "", errors.New("unlock required")
 	}
+	// Hoist SecureZero before any further error returns so the SDEK
+	// duplicate is wiped on every exit path (entropy/mnemonic/rand
+	// failures, hook errors, keyset commit failures). Without the hoist a
+	// blob-write failure — the documented operator-facing failure mode the
+	// D11 ordering exists to handle — would leak the SDEK to the heap until
+	// GC eventually overwrites it.
+	defer cryptoutil.SecureZero(sdek)
 	// Generate BIP39 mnemonic (256-bit entropy → 24 words)
 	entropy, err := bip39.NewEntropy(256)
 	if err != nil {
@@ -417,6 +456,7 @@ func (m *Manager) GenerateRecoveryKey(force bool) ([]string, string, error) {
 	}
 	rkParams := st.KDF
 	rkKey := m.deriveKey(mnemonic, rkSalt, rkParams)
+	defer cryptoutil.SecureZero(rkKey)
 	aead, _ := newAES256GCM(rkKey)
 	rkNonce := make([]byte, aead.NonceSize())
 	if _, err := rand.Read(rkNonce); err != nil {
@@ -426,12 +466,22 @@ func (m *Manager) GenerateRecoveryKey(force bool) ([]string, string, error) {
 	st.RKSalt = base64.RawStdEncoding.EncodeToString(rkSalt)
 	st.RKNonce = base64.RawStdEncoding.EncodeToString(rkNonce)
 	st.SDEKRK = base64.RawStdEncoding.EncodeToString(rkCT)
-	// Save
+	keyID := fingerprintSDEKRK(st.SDEKRK)
+
+	// D11: write blob BEFORE keyset.json commit. If the hook fails the
+	// commit is skipped and the operator's existing recovery state stands.
+	// Pass the plaintext SDEK so the hook can encrypt blobs without
+	// re-acquiring m.mu (which would deadlock).
+	if hook != nil {
+		if err := hook(words, keyID, sdek); err != nil {
+			return nil, "", fmt.Errorf("recovery key prepare hook: %w", err)
+		}
+	}
+
 	nb, _ := json.MarshalIndent(&st, "", "  ")
 	if err := fsutil.AtomicWriteFile(m.path, nb, 0o600); err != nil {
 		return nil, "", err
 	}
-	keyID := fingerprintSDEKRK(st.SDEKRK)
 	return words, keyID, nil
 }
 
@@ -447,10 +497,33 @@ func fingerprintSDEKRK(sdekrkB64 string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// FingerprintPasswordHash derives the slot-1 keyslot key_id anchor from a
+// password hash. Parallels fingerprintSDEKRK so the keyslot reconciler can
+// use the same "current key_id" comparison shape across both slots. The
+// hash is the argon2id-encoded string already used by the userManager /
+// auth pathways — it changes whenever the admin password rotates, so the
+// fingerprint is the stable per-generation anchor for slot-1 reconcile.
+func FingerprintPasswordHash(hash string) string {
+	if hash == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(hash))
+	return hex.EncodeToString(sum[:8])
+}
+
 // GenerateRecoveryKeyWithPassword unlocks SDEK using provided password and
 // sets recovery wrapper. Returns words + REC-4 key fingerprint (computed
 // inside the write lock — same race-closure rationale as GenerateRecoveryKey).
 func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) ([]string, string, error) {
+	return m.GenerateRecoveryKeyWithPasswordHook(password, force, nil)
+}
+
+// GenerateRecoveryKeyWithPasswordHook is the password-path variant of
+// GenerateRecoveryKeyWithHook (RFC 20260510 D11 blob-write-first). Same
+// atomicity semantics: hook runs after candidate computation, before
+// keyset.json commit, all under the write mutex. The hook receives the
+// unwrapped SDEK so it can encrypt blobs without re-locking.
+func (m *Manager) GenerateRecoveryKeyWithPasswordHook(password string, force bool, hook func(words []string, keyID string, sdek []byte) error) ([]string, string, error) {
 	if password == "" {
 		return nil, "", errors.New("password required")
 	}
@@ -472,6 +545,7 @@ func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) (
 	}
 	salt, _ := base64.RawStdEncoding.DecodeString(st.Salt)
 	key := m.deriveKey(password, salt, st.KDF)
+	defer cryptoutil.SecureZero(key)
 	aead, _ := newAES256GCM(key)
 	nonce, _ := base64.RawStdEncoding.DecodeString(st.Nonce)
 	ct, _ := base64.RawStdEncoding.DecodeString(st.SDEK)
@@ -479,6 +553,10 @@ func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) (
 	if err != nil {
 		return nil, "", errors.New("invalid password")
 	}
+	// Hoist before any error returns so the unwrapped SDEK plaintext is
+	// wiped on every exit path — see the matching guard in
+	// GenerateRecoveryKeyWithHook for rationale.
+	defer cryptoutil.SecureZero(pt)
 	// Generate BIP39 mnemonic (256-bit entropy → 24 words)
 	entropy, err := bip39.NewEntropy(256)
 	if err != nil {
@@ -494,6 +572,7 @@ func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) (
 		return nil, "", err
 	}
 	rkKey := m.deriveKey(mnemonic, rkSalt, st.KDF)
+	defer cryptoutil.SecureZero(rkKey)
 	aead2, _ := newAES256GCM(rkKey)
 	rkNonce := make([]byte, aead2.NonceSize())
 	if _, err := rand.Read(rkNonce); err != nil {
@@ -503,11 +582,18 @@ func (m *Manager) GenerateRecoveryKeyWithPassword(password string, force bool) (
 	st.RKSalt = base64.RawStdEncoding.EncodeToString(rkSalt)
 	st.RKNonce = base64.RawStdEncoding.EncodeToString(rkNonce)
 	st.SDEKRK = base64.RawStdEncoding.EncodeToString(rkCT)
+	keyID := fingerprintSDEKRK(st.SDEKRK)
+
+	if hook != nil {
+		if err := hook(words, keyID, pt); err != nil {
+			return nil, "", fmt.Errorf("recovery key prepare hook: %w", err)
+		}
+	}
+
 	nb, _ := json.MarshalIndent(&st, "", "  ")
 	if err := fsutil.AtomicWriteFile(m.path, nb, 0o600); err != nil {
 		return nil, "", err
 	}
-	keyID := fingerprintSDEKRK(st.SDEKRK)
 	return words, keyID, nil
 }
 
@@ -591,6 +677,69 @@ func (m *Manager) UnlockWithRecoveryKey(words []string) error {
 	}
 	m.sdek = pt
 	return nil
+}
+
+// sealWithKey is the package-internal AES-GCM-with-prefixed-nonce primitive
+// shared by Encrypt/EncryptWithAAD/EncryptWithExplicitKey/WrapSDEKForEscrow.
+// Blob shape: nonce ‖ ciphertext+tag. Caller owns the key's lifetime.
+func sealWithKey(key, plaintext, aad []byte) ([]byte, error) {
+	aead, err := newAES256GCM(key)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	return aead.Seal(nonce, nonce, plaintext, aad), nil
+}
+
+// EncryptWithExplicitKey seals plaintext under AES-GCM using a caller-
+// supplied 32-byte AEAD key (not the manager's SDEK). Used by the RFC
+// 20260510 D11 prepare hook path where the hook needs to encrypt blobs
+// while the manager's write lock is held — calling back into a method
+// that takes RLock would deadlock.
+func EncryptWithExplicitKey(key, plaintext, aad []byte) ([]byte, error) {
+	return sealWithKey(key, plaintext, aad)
+}
+
+// EncryptWithAAD seals plaintext under SDEK-AES-GCM, binding the ciphertext
+// to caller-supplied additional authenticated data. Used by the keyslot
+// reconciler's pending-passphrase blob format (RFC 20260510 D13) where
+// `aad = slot || key_id || version_byte` prevents cross-slot or
+// cross-generation blob swaps. Blob shape: nonce ‖ ciphertext+tag.
+// Returns ErrLocked if the manager is locked.
+func (m *Manager) EncryptWithAAD(plaintext, aad []byte) ([]byte, error) {
+	var ct []byte
+	err := m.WithSDEK(func(sdek []byte) error {
+		out, sErr := sealWithKey(sdek, plaintext, aad)
+		ct = out
+		return sErr
+	})
+	return ct, err
+}
+
+// DecryptWithAAD opens a blob produced by EncryptWithAAD. Caller must supply
+// the same aad. Returns ErrLocked when manager is locked; AEAD failures
+// (tamper, wrong AAD, wrong SDEK, truncation) surface as the underlying
+// AEAD error so callers can distinguish from infrastructure errors.
+func (m *Manager) DecryptWithAAD(ciphertext, aad []byte) ([]byte, error) {
+	var pt []byte
+	err := m.WithSDEK(func(sdek []byte) error {
+		aead, err := newAES256GCM(sdek)
+		if err != nil {
+			return err
+		}
+		if len(ciphertext) < aead.NonceSize() {
+			return errors.New("ciphertext too short")
+		}
+		nonce := ciphertext[:aead.NonceSize()]
+		ct := ciphertext[aead.NonceSize():]
+		var decErr error
+		pt, decErr = aead.Open(nil, nonce, ct, aad)
+		return decErr
+	})
+	return pt, err
 }
 
 // Encrypt encrypts plaintext using AES-GCM with the SDEK.

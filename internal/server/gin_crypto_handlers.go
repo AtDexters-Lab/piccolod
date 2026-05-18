@@ -28,6 +28,11 @@ const (
 	errorCodeStorageInitFailed   = "storage_init_failed"
 	errorCodeStorageUnlockFailed = "storage_unlock_failed"
 	errorCodeStorageEmergency    = "storage_emergency"
+	// errorCodeAuthMigrationDegradedStorage: persistence.Unlock aborted
+	// because the recovery_ack_at backfill could not evaluate keyset.json on
+	// degraded storage (RFC 20260510 §Backfill migration). The control store
+	// stays locked; the operator must attend storage health before retrying.
+	errorCodeAuthMigrationDegradedStorage = "auth_migration_degraded_storage"
 
 	// ErrRecoveryKeyAlreadyAcked: /recovery-key/generate refused to rotate
 	// because the existing key is acknowledged. Caller must pass
@@ -62,6 +67,58 @@ func stripNumberedPrefixes(tokens []string) []string {
 		filtered = append(filtered, t)
 	}
 	return filtered
+}
+
+// handoffSlot1ToReconciler hands a newly-set admin password off to the
+// keyslot reconciler (RFC 20260510 §Slot-1 expansion). The key_id is the
+// fingerprint of the committed admin password_hash from the users repo —
+// reading back here (rather than recomputing the hash) guarantees the
+// fingerprint matches what the reconciler's livePasswordKeyID probe sees
+// (which also reads the users repo). Otherwise the kskey_id stamping
+// could permanently drift from the live id and prevent convergence.
+//
+// Common to handleAuthPassword, handleCryptoResetPassword, handleCryptoSetup.
+//
+// Slot-1 ordering deviation from RFC D11: the password commit
+// (userManager.ChangePassword + Rewrap) has already happened by the time
+// this runs. Full D11 would require pre-computing the hash, writing the
+// blob with the candidate fingerprint, then calling a SetPasswordHash
+// (pre-hashed) variant on userManager — a 3-call-site API change across
+// userManager/authManager/CreateUserInput that exceeds this RFC's surface.
+// Trade-off: on blob-write failure here, the operator's web/portal access
+// works (password changed cleanly), but cryptsetup luksOpen on volumes
+// stays at the prior password until the next rotation. Same recovery
+// shape as RFC §Volume-creation sub-case-ii's rotate-to-recover policy.
+//
+// No sync fallback: the legacy ProvisionLUKSKeyslot path is what this RFC
+// exists to escape (N×Argon2id under the request opContext). On blob-write
+// failure we surface a typed audit event and stop — operator retries the
+// password change after attending storage health.
+func (s *GinServer) handoffSlot1ToReconciler(ctx context.Context, newPassword string) {
+	kp, ok := s.persistence.(persistence.KeyslotProvisioner)
+	if !ok {
+		return
+	}
+	passBytes := []byte(newPassword)
+	defer cryptoutil.SecureZero(passBytes)
+
+	keyID := ""
+	if s.userManager != nil {
+		if u, err := s.persistence.Control().Users().GetByUsername(ctx, "admin"); err == nil && u.PasswordHash != "" {
+			keyID = crypt.FingerprintPasswordHash(u.PasswordHash)
+		}
+	}
+	if keyID == "" {
+		log.Printf("WARN: keyslot 1 hand-off skipped: admin password_hash unavailable; next password change will retry")
+		return
+	}
+	if err := kp.WriteKeyslotBlob(ctx, persistence.KeyslotPassword, keyID, passBytes); err != nil {
+		log.Printf("ERROR: keyslot 1 blob write failed: %v; slot-1 LUKS provisioning deferred to next password change", err)
+		return
+	}
+	if s.keyslotReconciler != nil {
+		s.keyslotReconciler.Nudge()
+	}
 }
 
 // unlockChainResult carries the data each caller needs to shape its response
@@ -169,6 +226,14 @@ func (s *GinServer) runUnlockChain(ctx context.Context) (unlockChainResult, erro
 	// PCV publisher depends on the control-plane mount, safe even on data LUKS failure.
 	if s.pcvPublisher != nil {
 		s.pcvPublisher.Activate()
+	}
+	// Nudge the keyslot reconciler after the control plane is mounted —
+	// any pending blob left by a prior process or reboot was un-drainable
+	// during the reconciler's Start() initial pass (SDEK locked at boot)
+	// and will not retry until an unrelated rotation otherwise. RFC
+	// 20260510 §Reconciler restart-safety + codex P2 #2.
+	if s.keyslotReconciler != nil {
+		s.keyslotReconciler.Nudge()
 	}
 
 	setupComplete, err := s.isSetupComplete(ctx)
@@ -308,7 +373,50 @@ func (s *GinServer) handleCryptoStatus(c *gin.Context) {
 	if state, err := autounlock.LoadState(); err == nil {
 		resp["auto_unlock_enabled"] = state.Enabled
 	}
+
+	// Keyslot provisioning surface (RFC 20260510 §Status surface). Reports
+	// per-slot reconciler progress so the operator can observe
+	// offline-recovery-readiness for slot 1 (admin password) and slot 2
+	// (recovery mnemonic) independently. captured_key_id == target_key_id
+	// means "no rotation queued; reconciler is converging on the latest";
+	// captured != target means "rotation storm — reconciler will pick up
+	// the latest after the current pass completes" (S5 fix).
+	if s.keyslotReconciler != nil {
+		status := s.keyslotReconciler.Status()
+		// unprovisioned_steady_state is counted from on-disk volume
+		// metadata (single walk for both slots) so it reflects the
+		// current truth — volumes created since the last reconciler
+		// pass are stamped "unprovisioned" at creation and need to be
+		// surfaced even before the next pass runs.
+		s1Unprov, s2Unprov := 0, 0
+		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
+			s1Unprov, s2Unprov, _ = kp.CountKeyslotUnprovisioned()
+		}
+		resp["keyslot_provisioning"] = gin.H{
+			"slot1": keyslotStatusForWire(status[persistence.KeyslotPassword], s1Unprov),
+			"slot2": keyslotStatusForWire(status[persistence.KeyslotRecovery], s2Unprov),
+		}
+	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// keyslotStatusForWire shapes the per-slot status struct into the JSON
+// surface defined in RFC 20260510 §Status surface. Field names are wire-
+// canonical; do not rename without updating frontend consumers. The
+// unprovisioned_steady_state override is supplied by the caller (counted
+// from on-disk metadata, not from reconciler state) per the S7 fix.
+func keyslotStatusForWire(st persistence.KeyslotReconcilerStatus, unprovisionedCount int) gin.H {
+	return gin.H{
+		"captured_key_id":            st.CapturedKeyID,
+		"target_key_id":              st.TargetKeyID,
+		"total_volumes":              st.TotalVolumes,
+		"done":                       st.Done,
+		"pending":                    st.Pending,
+		"unprovisioned_steady_state": unprovisionedCount,
+		"rotation_storm_pending":     st.RotationStormPending,
+		"in_progress":                st.InProgress,
+		"last_error":                 st.LastError,
+	}
 }
 
 // handleCryptoSetup: POST /api/v1/crypto/setup { password }
@@ -493,15 +601,23 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		}
 	}
 
-	// 6b. Provision LUKS keyslot 1 (admin password) on all v3 volumes.
-	if luksErr == nil {
-		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
-			passBytes := []byte(body.Password)
-			if err := kp.ProvisionLUKSKeyslot(setupCtx, 1, passBytes); err != nil {
-				log.Printf("WARN: LUKS keyslot 1 provisioning during setup: %v", err)
-			}
-			cryptoutil.SecureZero(passBytes)
+	// 6b. Provision LUKS keyslot 1 (admin password) via the async
+	// reconciler (RFC 20260510 §Slot-1 expansion). At first setup there's
+	// typically only the control-plane volume, so the latency benefit is
+	// small, but uniformity with the post-setup rotation path keeps the
+	// volume metadata stamping consistent (otherwise sub-case-i hooks
+	// during early app installs would observe an inconsistent slot-1
+	// fingerprint state).
+	//
+	// Wait for the admin user creation below to commit the password_hash
+	// before handing off — the fingerprint is derived from the persisted
+	// hash. We defer the handoff via a slot1 closure and call it in
+	// step 8 after admin user creation.
+	slot1Handoff := func(handoffCtx context.Context) {
+		if luksErr != nil {
+			return
 		}
+		s.handoffSlot1ToReconciler(handoffCtx, body.Password)
 	}
 
 	// 7. Setup auth manager (mandatory — needs SQLite from step 5) — skip if already initialized.
@@ -547,6 +663,13 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 			log.Printf("INFO: admin user already exists, skipping creation")
 		}
 	}
+
+	// 8b. Hand off slot-1 (admin password) to the keyslot reconciler now
+	// that the admin user's password_hash is committed to the users repo.
+	// The handoff fingerprints the persisted hash so the reconciler's
+	// livePasswordKeyID probe sees the same id (RFC 20260510 §Slot-1
+	// expansion).
+	slot1Handoff(setupCtx)
 
 	// 9. Activate PCV publisher (depends on control-plane mount, safe even on data LUKS failure).
 	if s.pcvPublisher != nil {
@@ -648,7 +771,31 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 	}()
 
 	result, err := s.completeUnlockChain(unlockCtx)
+	if err == nil && s.healthTracker != nil {
+		// Successful unlock — clear any prior auth-migration degraded
+		// flag so the locked-screen banner doesn't persist across
+		// recovery (operator fixed storage and the migration succeeded
+		// this time). Idempotent on absent keys.
+		s.healthTracker.Clear("auth-migration")
+	}
 	if err != nil {
+		if errors.Is(err, persistence.ErrAuthMigrationDegradedStorage) {
+			// RFC 20260510 §Backfill migration: keep the typed signal alive
+			// for /system/boot to surface a degraded-startup banner so
+			// operators triaging by web UI or serial console see the
+			// underlying storage health, not just a generic 5xx. Health
+			// tracker is the durable surface across polls; the JSON code
+			// carries the immediate signal.
+			if s.healthTracker != nil {
+				s.healthTracker.Setf("auth-migration", health.LevelError, "auth migration aborted (degraded storage): %v", err)
+			}
+			s.publishAuditEvent(c, "auth.migration_keyset_unreadable", map[string]any{"reason": err.Error()})
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "Storage attention required. Saved recovery words remain valid. Use the device console or contact support.",
+				"code":  errorCodeAuthMigrationDegradedStorage,
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
 		return
 	}
@@ -758,12 +905,35 @@ func (s *GinServer) handleCryptoResetPassword(c *gin.Context) {
 	}
 
 	// Rotate LUKS keyslot 1 (admin-password passphrase) on all volumes.
-	if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
-		passBytes := []byte(newPassword)
-		if err := kp.ProvisionLUKSKeyslot(ctx, 1, passBytes); err != nil {
-			log.Printf("WARN: LUKS keyslot 1 rotation during reset: %v", err)
+	// Two paths (codex P2 #2):
+	//   - wasLocked=false: async via the reconciler — handler returns
+	//     sub-second, reconciler drains in the background.
+	//   - wasLocked=true: SYNC via legacy ProvisionLUKSKeyslotSync — the
+	//     deferred relock below would otherwise race the reconciler
+	//     (SDEKLoaded flips false mid-pass, pass aborts, slot-1 LUKS
+	//     stays at OLD password until next unlock+nudge). For
+	//     locked-recovery the operator is already in "this will take a
+	//     minute" mode; pay the N×Argon2id cost to keep the rotation
+	//     atomic with the password change as the legacy code did.
+	if wasLocked {
+		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
+			passBytes := []byte(newPassword)
+			// Read back the committed admin password_hash to fingerprint
+			// (matches livePasswordKeyID's read-back pattern). The sync
+			// provisioner then stamps each volume's PasswordKeyslotKeyID
+			// = fingerprint so the async reconciler doesn't redundantly
+			// re-provision later (codex iter-3 P2).
+			stampID := ""
+			if u, err := s.persistence.Control().Users().GetByUsername(ctx, "admin"); err == nil && u.PasswordHash != "" {
+				stampID = crypt.FingerprintPasswordHash(u.PasswordHash)
+			}
+			if err := kp.ProvisionLUKSKeyslotSync(ctx, 1, passBytes, stampID); err != nil {
+				log.Printf("WARN: locked-reset slot-1 sync provision: %v", err)
+			}
+			cryptoutil.SecureZero(passBytes)
 		}
-		cryptoutil.SecureZero(passBytes)
+	} else {
+		s.handoffSlot1ToReconciler(ctx, newPassword)
 	}
 
 	now := time.Now().UTC()
@@ -908,46 +1078,79 @@ func (s *GinServer) handleCryptoRecoveryGenerate(c *gin.Context) {
 	var keyID string
 	var err error
 	rotating := keyExists
-	// Prefer unlocked path; else use direct with password.
-	// REC-4: keyID is returned atomically by GenerateRecoveryKey under its
-	// write lock — pairing with words from the same call. Computing the id
-	// here via a separate RecoveryKeyID() read would reintroduce the
-	// concurrent-rotation race the binding is designed to close.
+
+	// RFC 20260510 D11 blob-write-first ordering: the slot-2 pending-blob
+	// is written under the crypt write mutex BEFORE keyset.json is
+	// committed. If the blob write fails, keyset.json is NOT updated and
+	// the operator's prior recovery key remains authoritative — they
+	// retry, no silent rotation hostility. Reconciler nudge fires after
+	// the commit so the slot-2 provisioning across volumes runs async.
+	//
+	// The hook MUST NOT call back into cryptoManager methods that take
+	// the mutex — caller is inside its write lock; that would deadlock.
+	// Hook receives the SDEK by parameter and uses WriteKeyslotBlobWithKey
+	// to encrypt without re-locking.
+	kp, _ := s.persistence.(persistence.KeyslotProvisioner)
+	prepareHook := func(words []string, keyID string, sdek []byte) error {
+		if kp == nil {
+			return nil
+		}
+		blobCtx, blobCancel := s.opContext(c, 30*time.Second)
+		defer blobCancel()
+		mnemonic := strings.Join(words, " ")
+		mnemonicBytes := []byte(mnemonic)
+		defer cryptoutil.SecureZero(mnemonicBytes)
+		err := kp.WriteKeyslotBlobWithKey(blobCtx, sdek, persistence.KeyslotRecovery, keyID, mnemonicBytes)
+		// Non-LUKS configurations (test stubs, future non-LUKS volume
+		// managers) surface ErrNotImplemented from the Module method —
+		// not an error here, just "no async path needed." Without this
+		// translation the hook would propagate the error and abort
+		// keyset.json commit, breaking /generate on non-LUKS installs
+		// (codex P2 #1).
+		if errors.Is(err, persistence.ErrNotImplemented) {
+			return nil
+		}
+		return err
+	}
+
 	// Narrow SDEK check: routes between the unlocked-path generator (uses
 	// the in-memory SDEK to wrap the recovery key) and the password-path
 	// generator. Composite readiness is the wrong question here — what
 	// matters is whether the SDEK is currently available in this process.
 	if s.cryptoManager.SDEKLoaded() {
-		words, keyID, err = s.cryptoManager.GenerateRecoveryKey(rotating)
+		words, keyID, err = s.cryptoManager.GenerateRecoveryKeyWithHook(rotating, prepareHook)
 	} else if strings.TrimSpace(body.Password) != "" {
-		words, keyID, err = s.cryptoManager.GenerateRecoveryKeyWithPassword(body.Password, rotating)
+		// Locked-rotation path: control-plane mount is not available,
+		// so the blob would land on the un-mounted rootfs and be hidden
+		// after unlock (codex P2 #3). Skip the async hand-off entirely
+		// — keyset.json + paper words still rotate (online recovery
+		// works), LUKS slot-2 stays at the prior generation until the
+		// next unlocked rotation. Matches pre-RFC locked-path semantics
+		// of "LUKS keyslot 2 provisioning deferred (system locked)".
+		log.Printf("INFO: locked-path /generate: skipping async slot-2 blob (control plane unmounted)")
+		words, keyID, err = s.cryptoManager.GenerateRecoveryKeyWithPasswordHook(body.Password, rotating, nil)
 	} else {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unlock required"})
 		return
 	}
 	if err != nil {
+		// Blob-write failure surfaces here (wrapped by the hook). Operator
+		// retries; their prior recovery state is unchanged.
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	// Provision LUKS keyslot 2 (recovery-mnemonic passphrase) on all volumes.
-	// Only possible when unlocked — SDEK must be cached to unwrap master key.
-	// When locked, the mnemonic still works for app-level recovery (wrapped in
-	// state file) but won't be usable for direct disk-level cryptsetup open
-	// until the next unlocked recovery-key rotation.
-	ctx, cancel := s.opContext(c, 2*time.Minute)
-	defer cancel()
-	if s.cryptoManager.SDEKLoaded() {
-		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
-			mnemonic := strings.Join(words, " ")
-			mnemonicBytes := []byte(mnemonic)
-			if err := kp.ProvisionLUKSKeyslot(ctx, 2, mnemonicBytes); err != nil {
-				log.Printf("WARN: LUKS keyslot 2 provisioning: %v", err)
-			}
-			cryptoutil.SecureZero(mnemonicBytes)
-		}
-	} else {
-		log.Printf("INFO: LUKS keyslot 2 provisioning deferred (system locked)")
+
+	// Nudge the async reconciler. Non-blocking. The reconciler walks all
+	// v3 volumes and rotates slot 2 to the new mnemonic in the background;
+	// the handler returns sub-second regardless of volume count, closing
+	// the regenerate-loop's "120 s timeout before ack screen renders" bug
+	// on the RPi 400.
+	if s.keyslotReconciler != nil {
+		s.keyslotReconciler.Nudge()
 	}
+
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
 	if err := s.applyStalenessUpdate(ctx, persistence.AuthStalenessUpdate{
 		RecoveryStale:   boolPtr(false),
 		RecoveryStaleAt: timePtr(time.Time{}),

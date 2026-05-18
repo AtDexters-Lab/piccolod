@@ -282,19 +282,22 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	// On crash before this write: metadata absent/incomplete → reconcile destroys.
 	// On crash after this write: FlattenComplete set → reconcile caches (correct).
 	meta := &volumeMetaV3{
-		Version:         metadataV3Version,
-		Type:            volumeTypeGolden,
-		LVName:          lvName,
-		VGName:          lvm.DefaultVGName,
-		SizeBytes:       sizeBytes,
-		FSType:          "btrfs",
-		BaseImageDigest: req.ImageDigest,
-		BaseImageRef:    req.ImageRef,
-		FlattenComplete: time.Now().UTC().Format(time.RFC3339),
+		Version:              metadataV3Version,
+		Type:                 volumeTypeGolden,
+		LVName:               lvName,
+		VGName:               lvm.DefaultVGName,
+		SizeBytes:            sizeBytes,
+		FSType:               "btrfs",
+		BaseImageDigest:      req.ImageDigest,
+		BaseImageRef:         req.ImageRef,
+		FlattenComplete:      time.Now().UTC().Format(time.RFC3339),
+		PasswordKeyslotKeyID: KeyslotKeyIDUnprovisioned,
+		RecoveryKeyslotKeyID: KeyslotKeyIDUnprovisioned,
 	}
 	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
 		return "", fmt.Errorf("write golden metadata: %w", err)
 	}
+	m.nudgeVolumeCreation()
 
 	// Remove sentinel (cleanup only — reconcile checks FlattenComplete, not sentinel).
 	_ = os.Remove(sentinelPath)
@@ -398,16 +401,18 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 	}
 
 	meta := &volumeMetaV3{
-		Version:         metadataV3Version,
-		Type:            volType,
-		LVName:          snapshotName,
-		VGName:          lvm.DefaultVGName,
-		SizeBytes:       sizeBytes,
-		FSType:          "btrfs",
-		ReadOnly:        readOnly,
-		BaseImageDigest: goldenMeta.BaseImageDigest,
-		BaseImageRef:    goldenMeta.BaseImageRef,
-		GoldenLV:        goldenID,
+		Version:              metadataV3Version,
+		Type:                 volType,
+		LVName:               snapshotName,
+		VGName:               lvm.DefaultVGName,
+		SizeBytes:            sizeBytes,
+		FSType:               "btrfs",
+		ReadOnly:             readOnly,
+		BaseImageDigest:      goldenMeta.BaseImageDigest,
+		BaseImageRef:         goldenMeta.BaseImageRef,
+		GoldenLV:             goldenID,
+		PasswordKeyslotKeyID: KeyslotKeyIDUnprovisioned,
+		RecoveryKeyslotKeyID: KeyslotKeyIDUnprovisioned,
 	}
 	if idmap != nil {
 		meta.IDMap = &IDMapMeta{
@@ -425,6 +430,7 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 		m.lvMgr.RemoveThinLV(ctx, snapshotName)
 		return RootfsHandle{}, fmt.Errorf("write metadata: %w", err)
 	}
+	m.nudgeVolumeCreation()
 
 	// Acquire the per-volume transition lock and route through the same
 	// reconciler-shaped attach path AttachRootfs uses. This
@@ -490,17 +496,19 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 	}
 
 	meta := &volumeMetaV3{
-		Version:         metadataV3Version,
-		Type:            volumeTypeWorkspace,
-		LVName:          cloneVolumeID,
-		VGName:          lvm.DefaultVGName,
-		SizeBytes:       originMeta.SizeBytes,
-		FSType:          "btrfs",
-		BaseImageDigest: originMeta.BaseImageDigest,
-		BaseImageRef:    originMeta.BaseImageRef,
-		GoldenLV:        originMeta.GoldenLV,
-		CloneOf:         originVolumeID,
-		IDMap:           originMeta.IDMap,
+		Version:              metadataV3Version,
+		Type:                 volumeTypeWorkspace,
+		LVName:               cloneVolumeID,
+		VGName:               lvm.DefaultVGName,
+		SizeBytes:            originMeta.SizeBytes,
+		FSType:               "btrfs",
+		BaseImageDigest:      originMeta.BaseImageDigest,
+		BaseImageRef:         originMeta.BaseImageRef,
+		GoldenLV:             originMeta.GoldenLV,
+		CloneOf:              originVolumeID,
+		IDMap:                originMeta.IDMap,
+		PasswordKeyslotKeyID: KeyslotKeyIDUnprovisioned,
+		RecoveryKeyslotKeyID: KeyslotKeyIDUnprovisioned,
 	}
 	// Override IDMap when the clone belongs to a different per-app user.
 	if idmap != nil {
@@ -519,6 +527,7 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 		m.lvMgr.RemoveThinLV(ctx, cloneVolumeID)
 		return RootfsHandle{}, fmt.Errorf("write clone metadata: %w", err)
 	}
+	m.nudgeVolumeCreation()
 
 	// Per-volume transition lock + reconciler-shaped attach —
 	// see createRootfsFromGolden for rationale.
