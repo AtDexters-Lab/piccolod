@@ -9,7 +9,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  phosphor_flutter: ^2.1.0
   flutter_svg: ^2.0.17
   http: ^1.6.0
   intl: ^0.20.2
@@ -48,3 +47,6 @@ flutter:
         - asset: assets/fonts/JetBrainsMono/JetBrainsMono-Regular.ttf
         - asset: assets/fonts/JetBrainsMono/JetBrainsMono-Bold.ttf
           weight: 700
+    - family: PhosphorRegular
+      fonts:
+        - asset: assets/fonts/Phosphor/PhosphorRegular.ttf
