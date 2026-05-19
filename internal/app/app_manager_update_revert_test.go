@@ -39,21 +39,22 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 	}
 	instanceID := inst.InstanceID
 
-	// UpdateImage for service-mode apps uses the block-native rootfs pipeline.
-	tag := "3.19"
-	err = mgr.UpdateImage(ctx, instanceID, &tag)
+	// UpdateImage for service-mode apps re-pulls every non-digest-pinned
+	// service image and rebuilds rootfs for any whose registry digest drifted.
+	// The manifest is not modified — image refs stay the same.
+	err = mgr.UpdateImage(ctx, instanceID)
 	if err != nil {
 		t.Fatalf("update image: %v", err)
 	}
 
-	// Verify the definition was updated with the new image tag.
+	// Verify the definition's image ref is unchanged.
 	state, _ := mgr.ensureStateManager()
 	updatedDef, err := state.GetAppDefinition(instanceID)
 	if err != nil {
 		t.Fatalf("get app def: %v", err)
 	}
-	if svc, ok := updatedDef.Services["main"]; !ok || svc.Image != "alpine:3.19" {
-		t.Fatalf("expected service image alpine:3.19, got %v", updatedDef.Services)
+	if svc, ok := updatedDef.Services["main"]; !ok || svc.Image != "alpine:3.18" {
+		t.Fatalf("expected service image alpine:3.18 (unchanged), got %v", updatedDef.Services)
 	}
 
 	// Revert is not supported for service-mode apps.

@@ -171,12 +171,10 @@ class AppService {
     );
   }
 
-  Future<void> updateApp(String name, {String? tag, String? taskId}) async {
-    final body = <String, dynamic>{};
-    if (tag != null) body['tag'] = tag;
+  Future<void> updateApp(String name, {String? taskId}) async {
     try {
       await _client
-          .post('/api/v1/apps/$name/update', body: body, headers: _taskHeaders(taskId))
+          .post('/api/v1/apps/$name/update', body: {}, headers: _taskHeaders(taskId))
           .timeout(const Duration(seconds: 10));
     } on TimeoutException {
       debugPrint('updateApp: POST timed out (expected for image pulls)');

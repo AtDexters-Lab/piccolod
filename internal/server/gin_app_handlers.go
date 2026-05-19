@@ -961,16 +961,10 @@ func (s *GinServer) handleGinAppStop(c *gin.Context) {
 func (s *GinServer) handleGinAppUpdate(c *gin.Context) {
 	appName := c.Param("name")
 
-	var body struct {
-		Tag *string `json:"tag"`
-	}
-	// Body is optional — nil tag means re-pull current tag.
-	_ = c.ShouldBindJSON(&body)
-
 	updateCtx, cancel := s.opContext(c, 30*time.Minute)
 	defer cancel()
 
-	err := s.appManager.UpdateImage(updateCtx, appName, body.Tag)
+	err := s.appManager.UpdateImage(updateCtx, appName)
 	if err != nil {
 		if handleAppManagerError(c, err, "update app") {
 			return

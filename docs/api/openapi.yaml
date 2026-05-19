@@ -122,20 +122,12 @@ paths:
         '200': { description: OK }
   /apps/{name}/update:
     post:
-      summary: Update an app to a newer tag
+      summary: Re-pull every non-digest-pinned image and refresh rootfs for services whose registry digest drifted
       parameters:
         - in: path
           name: name
           required: true
           schema: { type: string }
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                tag: { type: string, nullable: true }
       responses:
         '200': { description: OK }
         '409': { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }

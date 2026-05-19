@@ -2345,14 +2345,17 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 	return nil
 }
 
-// UpdateImage updates an app instance's container image tag and recreates the container preserving services.
-func (m *AppManager) UpdateImage(ctx context.Context, instanceID string, tag *string) error {
+// UpdateImage re-pulls every non-digest-pinned service image for an app
+// instance and rebuilds the rootfs for any service whose registry-resolved
+// manifest digest has drifted. The app manifest is not modified — tag refs
+// stay the same; only the underlying rootfs LV gets refreshed.
+func (m *AppManager) UpdateImage(ctx context.Context, instanceID string) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-	return m.updateImageLocked(ctx, instanceID, tag)
+	return m.updateImageLocked(ctx, instanceID)
 }
 
-func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, tag *string) (err error) {
+func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string) (err error) {
 	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseValidating, 0, "Validating update", false, nil)
 	defer func() {
 		if err != nil {
@@ -2384,7 +2387,6 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 		return err
 	}
 
-	// Load current app definition
 	curDef, err := state.GetAppDefinition(instanceID)
 	if err != nil {
 		return fmt.Errorf("failed to read current app.yaml: %w", err)
@@ -2394,101 +2396,56 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string, t
 	if mode == ModeWorkspace {
 		return fmt.Errorf("cannot update image for workspace apps: workspace persistence is tied to the base image; uninstall and reinstall to use a different base image")
 	}
-
-	// Determine the primary service for image reference.
-	primary := primaryServiceFor(curDef, appInst)
+	if mode != ModeService {
+		return fmt.Errorf("image update not supported for mode %q", mode)
+	}
 
 	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
 	if err != nil {
 		return err
 	}
 
-	// Compute new image — for service-mode, derive from service image (not top-level).
-	var baseImage string
-	if mode == ModeService && primary != "" {
-		if svc, ok := curDef.Services[primary]; ok && svc.Image != "" {
-			baseImage = svc.Image
+	// Sweep every service with a non-digest-pinned image — the registry tag
+	// may resolve to a new manifest digest. Digest-pinned refs (foo@sha256:…)
+	// are immutable by definition; skip them. Services whose digest matches
+	// the running rootfs LV short-circuit inside updateServiceModeImage.
+	updatedImages := make(map[string]string)
+	for svcName, svc := range curDef.Services {
+		if svc.Image == "" || isDigestPinned(svc.Image) {
+			continue
 		}
+		updatedImages[svcName] = svc.Image
 	}
-	if baseImage == "" {
-		baseImage = curDef.Image
-	}
-
-	newImage := baseImage
-	if tag != nil {
-		newImage = replaceImageTag(baseImage, *tag)
+	if len(updatedImages) == 0 {
+		return nil
 	}
 
-	// Prepare new definition (deep-copy Services map to avoid mutating curDef).
-	newDef := *curDef
-	if curDef.Services != nil {
-		newDef.Services = make(map[string]api.AppService, len(curDef.Services))
-		for k, v := range curDef.Services {
-			newDef.Services[k] = v
-		}
-	}
-	if mode == ModeService && primary != "" {
-		svc := newDef.Services[primary]
-		svc.Image = newImage
-		newDef.Services[primary] = svc
-	} else {
-		newDef.Image = newImage
-	}
-
-	if err := ValidateAppDefinition(&newDef); err != nil {
-		return fmt.Errorf("invalid new app definition: %w", err)
-	}
 	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
 		return fmt.Errorf("backup app.yaml: %w", err)
 	}
 
 	// Service-mode: transactional rootfs update (RFC 20260302).
-	// Image pull happens inside EnsureGoldenLV via flattenFn/imageSizeFn (ephemeral runtime).
-	if mode == ModeService {
-		updatedImages := map[string]string{primary: newImage}
-		if err := m.updateServiceModeImage(ctx, state, appInst, &newDef, layout, runtime, updatedImages); err != nil {
-			return err
-		}
-		// Image update succeeded — clear catalog manifest sync throttle so
-		// the next sync tick re-classifies the catalog version (which may
-		// have been blocked as DiffKindImageOnly or
-		// DiffKindStructuralWithImage). Without this, sync remains throttled
-		// on the same hash and never picks up remaining structural changes
-		// even though the image diff has just been resolved manually.
-		if appInst.LastSyncAttemptHash != "" || appInst.LastSyncError != "" {
-			appInst.LastSyncAttemptHash = ""
-			appInst.LastSyncError = ""
-			if err := state.StoreAppMetadata(appInst); err != nil {
-				log.Printf("WARN: update image %s: clear sync throttle: %v", instanceID, err)
-			}
-		}
-		return nil
+	if err := m.updateServiceModeImage(ctx, state, appInst, curDef, layout, runtime, updatedImages); err != nil {
+		return err
 	}
-
-	// Workspace mode is rejected above; service mode dispatches to updateServiceModeImage.
-	// No other modes exist in block-native.
-	return fmt.Errorf("image update not supported for mode %q", mode)
+	// Image update succeeded — clear catalog manifest sync throttle so
+	// the next sync tick re-classifies the catalog version (which may
+	// have been blocked as DiffKindImageOnly or DiffKindStructuralWithImage).
+	if appInst.LastSyncAttemptHash != "" || appInst.LastSyncError != "" {
+		appInst.LastSyncAttemptHash = ""
+		appInst.LastSyncError = ""
+		if err := state.StoreAppMetadata(appInst); err != nil {
+			log.Printf("WARN: update image %s: clear sync throttle: %v", instanceID, err)
+		}
+	}
+	return nil
 }
 
-// replaceImageTag replaces the tag portion of an image reference.
-// Handles digest-pinned references (e.g. "image@sha256:abc") by stripping the digest.
-func replaceImageTag(img, newTag string) string {
-	// Strip digest suffix if present (e.g. "nginx@sha256:abc123..." → "nginx").
-	if at := strings.Index(img, "@"); at >= 0 {
-		img = img[:at]
-	}
-	if i := strings.LastIndex(img, "/"); i >= 0 {
-		repo := img[:i+1]
-		rest := img[i+1:]
-		if j := strings.LastIndex(rest, ":"); j >= 0 {
-			return repo + rest[:j] + ":" + newTag
-		}
-		return repo + rest + ":" + newTag
-	}
-	if j := strings.LastIndex(img, ":"); j >= 0 {
-		return img[:j] + ":" + newTag
-	}
-	return img + ":" + newTag
+// isDigestPinned reports whether an image reference is pinned to a content
+// digest (e.g. "nginx@sha256:..."). Digest-pinned refs are immutable, so
+// re-pulling them cannot produce a new digest.
+func isDigestPinned(img string) bool {
+	return strings.Contains(img, "@")
 }
 
 // dataVolumeSnapshotter is a narrow interface for data volume snapshot operations.

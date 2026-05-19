@@ -9,30 +9,24 @@ import (
 	"piccolod/internal/api"
 )
 
-func TestReplaceImageTag(t *testing.T) {
+func TestIsDigestPinned(t *testing.T) {
 	tests := []struct {
-		name   string
-		img    string
-		tag    string
-		want   string
+		img  string
+		want bool
 	}{
-		{"simple_with_tag", "alpine:3.18", "3.19", "alpine:3.19"},
-		{"no_tag", "alpine", "3.19", "alpine:3.19"},
-		{"registry_with_tag", "docker.io/library/nginx:1.25", "1.26", "docker.io/library/nginx:1.26"},
-		{"registry_no_tag", "docker.io/library/nginx", "latest", "docker.io/library/nginx:latest"},
-		{"custom_registry", "ghcr.io/my-org/my-app:v1.0", "v2.0", "ghcr.io/my-org/my-app:v2.0"},
-		{"digest_pinned", "nginx@sha256:abc123def456", "1.26", "nginx:1.26"},
-		{"digest_with_tag", "nginx:1.25@sha256:abc123def456", "1.26", "nginx:1.26"},
-		{"registry_digest", "docker.io/library/nginx@sha256:abc123", "1.26", "docker.io/library/nginx:1.26"},
-		{"registry_with_port", "localhost:5000/myapp:v1", "v2", "localhost:5000/myapp:v2"},
+		{"alpine:3.18", false},
+		{"alpine", false},
+		{"docker.io/library/nginx:1.25", false},
+		{"ghcr.io/my-org/my-app:v1.0", false},
+		{"localhost:5000/myapp:v1", false},
+		{"nginx@sha256:abc123def456", true},
+		{"nginx:1.25@sha256:abc123def456", true},
+		{"docker.io/library/nginx@sha256:abc123", true},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := replaceImageTag(tt.img, tt.tag)
-			if got != tt.want {
-				t.Errorf("replaceImageTag(%q, %q) = %q, want %q", tt.img, tt.tag, got, tt.want)
-			}
-		})
+		if got := isDigestPinned(tt.img); got != tt.want {
+			t.Errorf("isDigestPinned(%q) = %v, want %v", tt.img, got, tt.want)
+		}
 	}
 }
 
@@ -68,8 +62,7 @@ func TestUpdateImage_WorkspaceMode_Blocked(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 
-	tag := "24.04"
-	err = mgr.UpdateImage(ctx, inst.InstanceID, &tag)
+	err = mgr.UpdateImage(ctx, inst.InstanceID)
 	if err == nil {
 		t.Fatal("expected error for workspace-mode update")
 	}
