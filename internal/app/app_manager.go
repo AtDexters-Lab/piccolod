@@ -2405,10 +2405,7 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string) (
 		return err
 	}
 
-	// Sweep every service with a non-digest-pinned image — the registry tag
-	// may resolve to a new manifest digest. Digest-pinned refs (foo@sha256:…)
-	// are immutable by definition; skip them. Services whose digest matches
-	// the running rootfs LV short-circuit inside updateServiceModeImage.
+	// Services whose digest didn't drift short-circuit inside updateServiceModeImage.
 	updatedImages := make(map[string]string)
 	for svcName, svc := range curDef.Services {
 		if svc.Image == "" || isDigestPinned(svc.Image) {
@@ -2417,9 +2414,12 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string) (
 		updatedImages[svcName] = svc.Image
 	}
 	if len(updatedImages) == 0 {
+		log.Printf("INFO: update image %s: all service images are digest-pinned; nothing to re-pull", instanceID)
 		return nil
 	}
 
+	// RollbackToSnapshot reads app.prev.yaml to restore pre-update state — keep
+	// it in sync even though Update itself doesn't mutate the manifest.
 	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
 		return fmt.Errorf("backup app.yaml: %w", err)
 	}
@@ -2441,9 +2441,8 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string) (
 	return nil
 }
 
-// isDigestPinned reports whether an image reference is pinned to a content
-// digest (e.g. "nginx@sha256:..."). Digest-pinned refs are immutable, so
-// re-pulling them cannot produce a new digest.
+// isDigestPinned: refs of form "name@digest" are immutable, so re-pulling
+// them cannot produce a new digest.
 func isDigestPinned(img string) bool {
 	return strings.Contains(img, "@")
 }

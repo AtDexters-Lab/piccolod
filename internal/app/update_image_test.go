@@ -24,9 +24,11 @@ func TestIsDigestPinned(t *testing.T) {
 		{"docker.io/library/nginx@sha256:abc123", true},
 	}
 	for _, tt := range tests {
-		if got := isDigestPinned(tt.img); got != tt.want {
-			t.Errorf("isDigestPinned(%q) = %v, want %v", tt.img, got, tt.want)
-		}
+		t.Run(tt.img, func(t *testing.T) {
+			if got := isDigestPinned(tt.img); got != tt.want {
+				t.Errorf("isDigestPinned(%q) = %v, want %v", tt.img, got, tt.want)
+			}
+		})
 	}
 }
 
