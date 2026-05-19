@@ -5,8 +5,7 @@ import 'package:piccolo_os/core/config/core_config.dart';
 import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/services/app_service.dart';
 import 'package:piccolo_os/features/apps/app_detail_view.dart';
-import 'package:piccolo_os/features/apps/custom_install_wizard.dart';
-import 'package:piccolo_os/features/apps/dynamic_install_wizard.dart';
+import 'package:piccolo_os/features/apps/install_wizard.dart';
 import 'package:piccolo_os/shared/widgets/app_icon.dart';
 import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
@@ -123,52 +122,27 @@ class _StoreTabState extends State<StoreTab> {
       }
     }
 
-    if (yaml == null) return;
-
-    // Fetch configuration schema
-    var schema = <String, dynamic>{};
-    try {
-      schema = await widget.appService.getCatalogConfigure(item.name);
-    } on Object catch (e) {
-      debugPrint('Failed to load config schema (falling back to raw yaml): $e');
-    }
-
-    if (!mounted) return;
+    if (yaml == null || !mounted) return;
 
     final proxyIconUrl = (item.icon ?? '').isNotEmpty
         ? CoreConfig.catalogIconUrl(item.name)
         : null;
     final originalIconUrl = item.icon;
 
-    if (schema.isNotEmpty) {
-      unawaited(showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => DynamicInstallWizard(
-          appService: widget.appService,
-          appName: item.name,
-          yamlContent: yaml!,
-          schema: schema,
-          onSuccess: (appName) {
-            Navigator.of(context).pop(); // Close Wizard
-            _openAppDetail(appName, iconUrl: proxyIconUrl, originalIconUrl: originalIconUrl);
-          },
-        ),
-      ));
-    } else {
-      unawaited(showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => CustomInstallWizard(
-          appService: widget.appService,
-          initialYaml: yaml,
-          onSuccess: (appName) {
-            Navigator.of(context).pop(); // Close Wizard
-            _openAppDetail(appName, iconUrl: proxyIconUrl, originalIconUrl: originalIconUrl);
-          },
-        ),
-      ));
-    }
+    unawaited(showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => InstallWizard(
+        appService: widget.appService,
+        initialYaml: yaml,
+        catalogSource: item.name,
+        displayName: item.name,
+        onSuccess: (appName) {
+          Navigator.of(context).pop();
+          _openAppDetail(appName, iconUrl: proxyIconUrl, originalIconUrl: originalIconUrl);
+        },
+      ),
+    ));
   }
 
   void _openAppDetail(String appName, {String? iconUrl, String? originalIconUrl}) {

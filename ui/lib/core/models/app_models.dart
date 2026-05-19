@@ -475,23 +475,6 @@ class CatalogResponse {
   final int totalPages;
 }
 
-class AppValidationResult {
-
-  AppValidationResult({required this.valid, this.error});
-
-  factory AppValidationResult.fromJson(Map<String, dynamic> json) {
-    // Some validation endpoints might return a 400 with 'error' field in body
-    // or 200 with { "valid": true/false }
-    return AppValidationResult(
-      valid: (json['valid'] as bool?) ?? false,
-      error:
-          json['error'] as String?, // If backend returns error detail in 200 OK structure
-    );
-  }
-  final bool valid;
-  final String? error;
-}
-
 /// Represents a container image search result from Docker Hub or other registries.
 class ImageSearchResult {
 

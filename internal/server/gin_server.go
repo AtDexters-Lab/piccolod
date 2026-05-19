@@ -2174,7 +2174,7 @@ func (s *GinServer) setupGinRoutes() {
 
 			// Admin-only actions
 			apps.POST("", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppInstall)
-			apps.POST("/validate", s.requireAdmin(), s.handleGinAppValidate)
+			apps.POST("/configure", s.requireAdmin(), s.handleGinAppConfigure)
 			apps.POST("/preflight", s.requireAdmin(), s.handleGinAppPreflight)
 			apps.DELETE("/:name", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUninstall)
 			apps.PATCH("/:name/listeners", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppUpdateListeners)
@@ -2320,7 +2320,6 @@ func (s *GinServer) setupGinRoutes() {
 		admin.GET("/catalog", s.handleGinCatalog)
 		admin.GET("/catalog/categories", s.handleGinCatalogCategories)
 		admin.GET("/catalog/:name/template", s.handleGinCatalogTemplate)
-		admin.GET("/catalog/:name/configure", s.handleGinCatalogConfigure)
 		// Icon proxy is registered below outside admin group (public, read-only)
 
 		// Services list (Needs filtering)

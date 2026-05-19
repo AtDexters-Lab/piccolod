@@ -349,11 +349,58 @@ func (s *GinServer) parseAppDefinitionFromRequest(c *gin.Context) *api.AppDefini
 	return def
 }
 
-// handleGinAppValidate handles POST /api/v1/apps/validate - Validate app.yaml without installing
-func (s *GinServer) handleGinAppValidate(c *gin.Context) {
-	if def := s.parseAppDefinitionFromRequest(c); def != nil {
-		writeGinSuccess(c, gin.H{"valid": true}, "valid")
+// handleGinAppConfigure handles POST /api/v1/apps/configure - parse an arbitrary
+// YAML manifest and return its enriched input schema (smart defaults + system
+// templates resolved). Accepts either raw YAML or a JSON wrapper with an
+// optional catalog_source hint used for __app_address__ default derivation.
+func (s *GinServer) handleGinAppConfigure(c *gin.Context) {
+	contentType := c.GetHeader("Content-Type")
+	if !strings.Contains(contentType, "application/x-yaml") &&
+		!strings.Contains(contentType, "text/yaml") &&
+		!strings.Contains(contentType, "application/json") {
+		writeGinError(c, http.StatusUnsupportedMediaType, "Content-Type must be application/x-yaml or text/yaml or application/json")
+		return
 	}
+	var yamlData []byte
+	var catalogSource string
+	if strings.Contains(contentType, "application/json") {
+		var req struct {
+			AppDefinition string `json:"app_definition"`
+			CatalogSource string `json:"catalog_source"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
+			writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
+			return
+		}
+		yamlData = []byte(req.AppDefinition)
+		catalogSource = req.CatalogSource
+	} else {
+		body, err := c.GetRawData()
+		if err != nil || len(body) == 0 {
+			writeGinError(c, http.StatusBadRequest, "Request body cannot be empty")
+			return
+		}
+		yamlData = body
+	}
+
+	def, err := app.ParseAppSchema(yamlData)
+	if err != nil {
+		var ve *app.ValidationError
+		if errors.As(err, &ve) && ve != nil {
+			writeGinErrorWithKey(c, http.StatusBadRequest, "Invalid app.yaml: "+ve.Message, ve.Code)
+			return
+		}
+		writeGinError(c, http.StatusBadRequest, "Invalid app.yaml: "+err.Error())
+		return
+	}
+
+	if err := app.PrepareSmartDefaults(c.Request.Context(), s.appManager, def, catalogSource); err != nil {
+		log.Printf("WARN: failed to prepare smart defaults: %v", err)
+		// Continue anyway, just without smarts
+	}
+	resolveSystemDefaults(def.Inputs, s.buildSystemContext())
+
+	writeGinSuccess(c, def.Inputs, "Configuration schema prepared")
 }
 
 // handleGinAppPreflight handles POST /api/v1/apps/preflight - validate manifest and report port claims
@@ -422,43 +469,6 @@ func (s *GinServer) handleGinCatalogTemplate(c *gin.Context) {
 		return
 	}
 	c.Data(http.StatusOK, "application/x-yaml; charset=utf-8", []byte(yaml))
-}
-
-// handleGinCatalogConfigure handles GET /api/v1/catalog/:name/configure - return enriched input schema for a catalog app
-func (s *GinServer) handleGinCatalogConfigure(c *gin.Context) {
-	if s.catalogManager == nil {
-		writeGinError(c, http.StatusInternalServerError, "Catalog manager not initialized")
-		return
-	}
-	name := c.Param("name")
-	yamlContent, err := s.catalogManager.GetAppTemplate(c.Request.Context(), name)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			writeGinError(c, http.StatusNotFound, "template not found")
-		} else {
-			writeGinError(c, http.StatusInternalServerError, "failed to fetch template: "+err.Error())
-		}
-		return
-	}
-
-	// Parse schema loose
-	def, err := app.ParseAppSchema([]byte(yamlContent))
-	if err != nil {
-		writeGinError(c, http.StatusInternalServerError, "failed to parse app schema: "+err.Error())
-		return
-	}
-
-	// Prepare smart defaults (pass catalog item name for __app_address__ default)
-	if err := app.PrepareSmartDefaults(c.Request.Context(), s.appManager, def, name); err != nil {
-		log.Printf("WARN: failed to prepare smart defaults for %s: %v", name, err)
-		// Continue anyway, just without smarts
-	}
-
-	// Resolve {{ .System.* }} expressions in input defaults so the UI shows
-	// concrete values (e.g. "America/New_York") instead of raw template strings.
-	resolveSystemDefaults(def.Inputs, s.buildSystemContext())
-
-	writeGinSuccess(c, def.Inputs, "Configuration schema prepared")
 }
 
 // handleGinAppInstall handles POST /api/v1/apps - Install app from app.yaml upload

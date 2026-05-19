@@ -39,9 +39,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/ResponseApp'
         '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
-  /apps/validate:
+  /apps/configure:
     post:
-      summary: Validate an app.yaml without installing
+      summary: Parse an app.yaml and return its enriched input schema
+      description: |
+        Parses the manifest (loose schema parse), applies smart defaults, and
+        resolves `{{ .System.* }}` expressions in input defaults. Returns the
+        inputs map for the install wizard to render. Symmetric to install:
+        accepts either raw YAML or a JSON wrapper with optional
+        `catalog_source` used to seed `__app_address__` defaults.
       requestBody:
         required: true
         content:
@@ -50,8 +56,11 @@ paths:
           application/json:
             schema:
               type: object
+              required: [app_definition]
               properties:
                 app_definition:
+                  type: string
+                catalog_source:
                   type: string
       responses:
         '200':
@@ -61,7 +70,11 @@ paths:
               schema:
                 type: object
                 properties:
-                  valid: { type: boolean }
+                  data:
+                    type: object
+                    additionalProperties:
+                      type: object
+                  message: { type: string }
         '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
   /apps/{name}:
     get:

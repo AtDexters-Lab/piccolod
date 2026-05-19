@@ -6,7 +6,7 @@ import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/app_service.dart';
 import 'package:piccolo_os/core/utils/task_id.dart';
-import 'package:piccolo_os/features/apps/dynamic_install_wizard.dart';
+import 'package:piccolo_os/features/apps/install_wizard.dart';
 import 'package:piccolo_os/shared/widgets/app_icon.dart';
 import 'package:piccolo_os/shared/widgets/task_progress_panel.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
@@ -17,7 +17,7 @@ import 'package:piccolo_os/theme/piccolo_theme.dart';
 /// Workspaces are persistent, mutable containers that behave like lightweight VPS.
 /// This wizard allows users to:
 /// 1. Select a base image (from catalog or Docker Hub search)
-/// 2. Configure the workspace (for catalog: use DynamicInstallWizard; for custom: inline config)
+/// 2. Configure the workspace (for catalog: use InstallWizard; for custom: inline config)
 /// 3. Watch the installation progress
 class CreateWorkspaceWizard extends StatefulWidget {
 
@@ -140,24 +140,15 @@ class _CreateWorkspaceWizardState extends State<CreateWorkspaceWizard> {
 
     if (yaml == null || !mounted) return;
 
-    // Fetch configuration schema
-    var schema = <String, dynamic>{};
-    try {
-      schema = await appService.getCatalogConfigure(item.name);
-    } on Object catch (e) {
-      debugPrint('Failed to load config schema: $e');
-    }
-
-    if (!mounted) return;
-    // Show DynamicInstallWizard first (while context is still valid), then pop this wizard.
+    // Show the unified install wizard first, then pop the workspace wizard.
     unawaited(showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (dialogContext) => DynamicInstallWizard(
+      builder: (dialogContext) => InstallWizard(
         appService: appService,
-        appName: item.name,
-        yamlContent: yaml!,
-        schema: schema,
+        initialYaml: yaml,
+        catalogSource: item.name,
+        displayName: item.name,
         onSuccess: (appName) {
           Navigator.of(dialogContext).pop(true);
           onSuccess?.call();

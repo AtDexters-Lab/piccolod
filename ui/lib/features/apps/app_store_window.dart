@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/features/apps/app_detail_view.dart';
 import 'package:piccolo_os/features/apps/create_workspace_wizard.dart';
-import 'package:piccolo_os/features/apps/custom_install_wizard.dart';
+import 'package:piccolo_os/features/apps/install_wizard.dart';
 import 'package:piccolo_os/features/apps/store_tab.dart';
 import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
@@ -66,7 +66,7 @@ class _AppStoreWindowState extends State<AppStoreWindow> {
     unawaited(showDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (context) => CustomInstallWizard(
+      builder: (context) => InstallWizard(
         appService: widget.desktopController.appService,
         onSuccess: (appName) {
           Navigator.of(context).pop();

@@ -219,45 +219,20 @@ class AppService {
     );
   }
 
-  // --- Install / Validate ---
+  // --- Install / Configure ---
 
-  Future<AppValidationResult> validateManifest(String yamlContent) async {
-    try {
-      final data = await _client.postRaw(
-        '/api/v1/apps/validate',
-        body: yamlContent,
-        contentType: 'application/x-yaml',
-      );
-
-      // Expected: { data: { valid: true }, message: "valid" }
-      final dataMap = (data as Map<String, dynamic>)['data'];
-      final valid = (dataMap is Map<dynamic, dynamic> ? (dataMap['valid'] as bool?) : null) ?? false;
-      return AppValidationResult(valid: valid);
-    } on ApiException catch (e) {
-      // Validation error often comes as 400 with details
-      return AppValidationResult(valid: false, error: e.message);
-    } on Exception catch (e) {
-      return AppValidationResult(valid: false, error: e.toString());
+  /// Parse the given YAML manifest and return its enriched input schema.
+  /// catalogSource is optional and hints the default for synthetic inputs
+  /// like __app_address__. Throws on parse failure.
+  Future<Map<String, dynamic>> configureManifest(
+    String yamlContent, {
+    String? catalogSource,
+  }) async {
+    final body = <String, dynamic>{'app_definition': yamlContent};
+    if (catalogSource != null && catalogSource.isNotEmpty) {
+      body['catalog_source'] = catalogSource;
     }
-  }
-
-  Future<App> installApp(String yamlContent, {String? taskId}) async {
-    final data = await _client.postRaw(
-      '/api/v1/apps',
-      body: yamlContent,
-      contentType: 'application/x-yaml',
-      headers: _taskHeaders(taskId),
-    );
-
-    // Expected: { data: {App}, message: ... }
-    return App.fromJson(
-      Map<String, dynamic>.from((data as Map<String, dynamic>)['data'] as Map),
-    );
-  }
-
-  Future<Map<String, dynamic>> getCatalogConfigure(String name) async {
-    final data = await _client.get('/api/v1/catalog/$name/configure');
-    // Expected: { data: { inputName: { type:..., default:..., ... } } }
+    final data = await _client.post('/api/v1/apps/configure', body: body);
     final rawData = (data as Map<String, dynamic>)['data'];
     return rawData is Map<dynamic, dynamic> ? Map<String, dynamic>.from(rawData) : <String, dynamic>{};
   }
