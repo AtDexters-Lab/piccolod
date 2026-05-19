@@ -220,11 +220,24 @@ func TestResolvePrimaryListener(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			// Plan §D8: tcp+raw is now host-routable, so it's a valid implicit
-			// primary. Auto-select picks the first non-UDP listener.
-			name: "implicit primary - tcp raw is now eligible",
+			// RFC 20260519: tcp+raw is host-routing eligible only with
+			// tls_wrap. Auto-select must skip raw-without-wrap so the apex
+			// host label binds to the http listener — otherwise apex routing
+			// silently regresses to "<listener>-<app>" on the http endpoint.
+			name: "implicit primary - skip raw-no-wrap, pick http",
 			listeners: []api.AppListener{
 				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP},
+				{Name: "web", Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTCP},
+			},
+			want:    "web",
+			wantErr: false,
+		},
+		{
+			// RFC 20260519: tcp+raw with tls_wrap is eligible, so auto-select
+			// picks it as the first eligible listener.
+			name: "implicit primary - raw-with-wrap is eligible",
+			listeners: []api.AppListener{
+				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP, TLSWrap: true},
 				{Name: "web", Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTCP},
 			},
 			want:    "tcp",
@@ -240,8 +253,11 @@ func TestResolvePrimaryListener(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			// Plan §D8: every listener is auto-primary-eligible. First wins.
-			name: "implicit primary - first listener wins",
+			// RFC 20260519: neither listener is eligible (udp; raw-without-wrap),
+			// so auto-select falls back to the first listener — the apex host
+			// label will be empty regardless, but every app keeps an identity
+			// listener for housekeeping.
+			name: "implicit primary - all ineligible, fall back to first",
 			listeners: []api.AppListener{
 				{Name: "dns", Protocol: api.ListenerProtocolRaw, Flow: api.FlowUDP},
 				{Name: "tcp", Protocol: api.ListenerProtocolRaw, Flow: api.FlowTCP},

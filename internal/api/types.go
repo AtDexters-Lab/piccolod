@@ -260,6 +260,42 @@ type AppListener struct {
 	Auth           *ListenerAuth           `yaml:"auth,omitempty" json:"auth,omitempty"`
 	ConnectionAuth *ConnectionAuth         `yaml:"connection_auth,omitempty" json:"connection_auth,omitempty"`
 	PortClaim      *int                    `yaml:"port_claim,omitempty" json:"port_claim,omitempty"`
+	// TLSWrap opts a flow:tcp + protocol:raw listener into TLS-mux hostname
+	// routing on :443 (stunnel-style — piccolod terminates TLS, backend
+	// sees plaintext). Invalid on any other flow/protocol (parser-enforced).
+	// See RFC 20260519.
+	TLSWrap bool `yaml:"tls_wrap,omitempty" json:"tls_wrap,omitempty"`
+}
+
+// IsRawTCP reports whether the listener is a flow:tcp + protocol:raw
+// listener. Used by the parser, RemotePorts derivation, and host-routing
+// eligibility — RFC 20260519's raw-listener-specific surface.
+func (l AppListener) IsRawTCP() bool {
+	return l.Flow == FlowTCP && l.Protocol == ListenerProtocolRaw
+}
+
+// IsEligibleForHostRouting reports whether the listener should have a
+// DerivedHostLabel for hostname-based resolution (remote or LAN). Per
+// RFC 20260316 + plan §D8 + RFC 20260519 (raw tls_wrap opt-in): flow:udp
+// never; flow:tls always; flow:tcp by protocol — http/ws always, raw only
+// when tls_wrap=true. The predicate is also the single source of truth
+// for the [80, 443] default in deriveRemotePorts and for auto-primary
+// selection in hostname.ResolvePrimaryListener — keep all three aligned.
+func (l AppListener) IsEligibleForHostRouting() bool {
+	switch l.Flow {
+	case FlowUDP:
+		return false
+	case FlowTLS:
+		return true
+	case FlowTCP:
+		switch l.Protocol {
+		case ListenerProtocolHTTP, ListenerProtocolWebsocket:
+			return true
+		case ListenerProtocolRaw:
+			return l.TLSWrap
+		}
+	}
+	return false
 }
 
 // TransportProtocol returns the OS-level transport protocol for this flow.

@@ -1270,6 +1270,13 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 			return fmt.Errorf("listener '%s' protocol '%s' not supported in v1", l.Name, l.Protocol.String())
 		}
 
+		// RFC 20260519 §D3: tls_wrap is structurally meaningful only on
+		// flow:tcp + protocol:raw; strictly additive (pre-RFC manifests
+		// without the field pass).
+		if l.TLSWrap && !l.IsRawTCP() {
+			return newValidationError("INVALID_TLS_WRAP", fmt.Sprintf("listener '%s' tls_wrap is only valid on flow:tcp + protocol:raw, got flow:%s + protocol:%s", l.Name, l.Flow.String(), l.Protocol.String()))
+		}
+
 		// middleware entries: ensure names present
 		for j, m := range l.Middleware {
 			if strings.TrimSpace(m.Name) == "" {

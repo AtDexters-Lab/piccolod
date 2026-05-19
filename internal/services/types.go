@@ -11,21 +11,12 @@ type PortRange struct {
 	End   int
 }
 
-// IsEligibleForHostRouting returns true if a listener should have a DerivedHostLabel
-// for hostname-based resolution (remote or LAN). Per RFC 20260316 +
-// plan §D8 (tcp+raw enablement):
-//   - flow:udp returns false (uses port-based routing only)
-//   - flow:tls returns true (host label needed for remote resolver; LAN
-//     host-based skips flow:tls because piccolod doesn't terminate TLS)
-//   - flow:tcp returns true for any protocol — http/websocket route via
-//     the L7 chain on the host-based label; raw routes via the TLS mux
-//     (passthrough) on the host-based label, with TLS still terminated
-//     by the mux (clients connect over TLS by SNI; backend sees raw bytes).
-func IsEligibleForHostRouting(protocol api.ListenerProtocol, flow api.ListenerFlow) bool {
-	if flow == api.FlowUDP {
-		return false
-	}
-	return true
+// IsEligibleForHostRouting is a thin wrapper for api.AppListener's method
+// of the same name. Retained as a package-level function so existing call
+// sites in this package read naturally; new callers should prefer the
+// method form `l.IsEligibleForHostRouting()`.
+func IsEligibleForHostRouting(l api.AppListener) bool {
+	return l.IsEligibleForHostRouting()
 }
 
 // ServiceEndpoint represents a fully allocated listener
@@ -38,7 +29,7 @@ type ServiceEndpoint struct {
 	Flow             api.ListenerFlow            `json:"flow"`
 	Protocol         api.ListenerProtocol        `json:"protocol"`
 	Primary          bool                        `json:"primary,omitempty"`            // Is this the primary listener for host-based routing?
-	DerivedHostLabel string                      `json:"derived_host_label,omitempty"` // "<app>" for primary, "<listener>-<app>" for others, "" for udp (per RFC 20260505 §3.5 raw(tcp) is now host-routable via TLS mux SNI)
+	DerivedHostLabel string                      `json:"derived_host_label,omitempty"` // "<app>" for primary, "<listener>-<app>" for others, "" when IsEligibleForHostRouting returns false (udp; raw-tcp without tls_wrap per RFC 20260519)
 	Middleware       []api.AppProtocolMiddleware `json:"middleware"`
 	RemotePorts      []int                       `json:"remote_ports"`
 	LocalURL         string                      `json:"local_url,omitempty"` // Optional pre-calculated LAN URL

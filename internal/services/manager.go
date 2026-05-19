@@ -243,12 +243,38 @@ func normalizeRemotePort(port int) int {
 	return port
 }
 
-func defaultRemotePorts(listener api.AppListener) []int {
-	if len(listener.RemotePorts) == 0 {
+// deriveRemotePorts computes a listener's effective RemotePorts per
+// RFC 20260519 §D2: union of manifest RemotePorts + port_claim + (443 when
+// tls_wrap on raw); falls back to [80, 443] when the union is empty AND
+// the listener is host-routing-eligible. The eligibility predicate is the
+// single source of truth: a listener that gets a DerivedHostLabel also
+// gets the [80, 443] default — and conversely, a raw-without-wrap listener
+// (not host-routable) stays empty, preserving the byte-leak closure.
+func deriveRemotePorts(listener api.AppListener) []int {
+	ports := make([]int, 0, len(listener.RemotePorts)+2)
+	seen := make(map[int]struct{}, len(listener.RemotePorts)+2)
+	add := func(p int) {
+		if p <= 0 {
+			return
+		}
+		if _, ok := seen[p]; ok {
+			return
+		}
+		seen[p] = struct{}{}
+		ports = append(ports, p)
+	}
+	for _, p := range listener.RemotePorts {
+		add(p)
+	}
+	if listener.PortClaim != nil {
+		add(*listener.PortClaim)
+	}
+	if listener.IsRawTCP() && listener.TLSWrap {
+		add(443)
+	}
+	if len(ports) == 0 && IsEligibleForHostRouting(listener) {
 		return []int{80, 443}
 	}
-	ports := make([]int, len(listener.RemotePorts))
-	copy(ports, listener.RemotePorts)
 	return ports
 }
 
@@ -267,7 +293,7 @@ func buildEndpoint(appName string, l api.AppListener, hostBind, publicPort int, 
 		Primary:          isPrimary,
 		DerivedHostLabel: hostLabel,
 		Middleware:       l.Middleware,
-		RemotePorts:      defaultRemotePorts(l),
+		RemotePorts:      deriveRemotePorts(l),
 		Auth:             l.Auth,
 		ConnectionAuth:   l.ConnectionAuth,
 		PortClaim:        l.PortClaim,
@@ -486,7 +512,7 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 			return endpoints, err
 		}
 		isPrimary := l.Name == primaryName
-		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
+		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l))
 		ep := buildEndpoint(appName, l, host, public, isPrimary, hostLabel)
 		registry[l.Name] = ep
 		endpoints = append(endpoints, ep)
@@ -540,7 +566,7 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 			return nil, err
 		}
 		isPrimary := l.Name == primaryName
-		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
+		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l))
 		ep := buildEndpoint(appName, l, hb, pp, isPrimary, hostLabel)
 		endpoints = append(endpoints, ep)
 		if _, ok := m.registry[appName]; !ok {
@@ -649,8 +675,16 @@ func matchesRemotePort(ep ServiceEndpoint, remotePort int) bool {
 	if remotePort <= 0 {
 		return true
 	}
+	// Per RFC 20260519 §D2: deriveRemotePorts is the single source of truth
+	// for an endpoint's accepted remote ports. The HTTP-flavor default
+	// [80, 443] is now applied at derivation, not here. An endpoint that
+	// reaches this function with an empty RemotePorts list is structurally
+	// unreachable from outside (raw listener without port_claim, without
+	// tls_wrap) — return false rather than the legacy [80, 443] fallback,
+	// which would silently re-open the byte-leak if a future refactor
+	// allowed such an endpoint to acquire a DerivedHostLabel.
 	if len(ep.RemotePorts) == 0 {
-		return remotePort == 80 || remotePort == 443
+		return false
 	}
 	for _, rp := range ep.RemotePorts {
 		if rp == remotePort || rp == original {
@@ -701,7 +735,7 @@ func (m *ServiceManager) checkHostLabelCollisions(appName string, listeners []ap
 	newLabels := make([]string, 0, len(listeners))
 	for _, l := range listeners {
 		isPrimary := l.Name == primaryName
-		label := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
+		label := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l))
 		if label != "" {
 			newLabels = append(newLabels, label)
 		}
@@ -1131,7 +1165,7 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 	// Index new by name
 	for _, l := range listeners {
 		isPrimary := l.Name == primaryName
-		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l.Protocol, l.Flow))
+		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l))
 
 		if old, ok := existing[l.Name]; ok {
 			// If port claim changed, treat as remove + add (different public port).

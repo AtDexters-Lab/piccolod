@@ -809,6 +809,183 @@ func TestPortClaimValidation(t *testing.T) {
 	}
 }
 
+// TestTLSWrapValidation covers RFC 20260519 §D3: tls_wrap is valid only on
+// flow:tcp + protocol:raw. Strictly additive — tls_wrap absent or false on
+// any flow/protocol combination is accepted; only tls_wrap:true on a
+// non-(tcp+raw) listener is rejected.
+func TestTLSWrapValidation(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+	primary := api.AppListener{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}
+	withListeners := func(extras ...api.AppListener) *api.AppDefinition {
+		return &api.AppDefinition{
+			Listeners:  append([]api.AppListener{primary}, extras...),
+			Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80, 8443, 9090, 53}}},
+			Extensions: map[string]interface{}{"mode": "service"},
+		}
+	}
+	primaryOverride := func(modify func(*api.AppListener)) *api.AppDefinition {
+		p := primary
+		modify(&p)
+		return &api.AppDefinition{
+			Listeners:  []api.AppListener{p},
+			Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80}}},
+			Extensions: map[string]interface{}{"mode": "service"},
+		}
+	}
+
+	const rejectMsg = "tls_wrap is only valid on flow:tcp + protocol:raw"
+
+	tests := []struct {
+		name        string
+		app         *api.AppDefinition
+		expectError bool
+		errContains string
+	}{
+		{
+			name: "accept_tls_wrap_true_on_tcp_raw",
+			app: withListeners(
+				api.AppListener{Name: "wrapped", GuestPort: 9090, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, TLSWrap: true},
+			),
+		},
+		{
+			name: "accept_tls_wrap_false_on_tcp_raw",
+			app: withListeners(
+				api.AppListener{Name: "ssh", GuestPort: 22, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(2222)},
+			),
+		},
+		{
+			name: "accept_tls_wrap_absent_on_tcp_http",
+			app:  withListeners(),
+		},
+		{
+			name: "accept_tls_wrap_absent_on_tls",
+			app: withListeners(
+				api.AppListener{Name: "passthrough", GuestPort: 8443, Flow: api.FlowTLS, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(8443)},
+			),
+		},
+		{
+			name: "accept_tls_wrap_absent_on_udp",
+			app: withListeners(
+				api.AppListener{Name: "dnsudp", GuestPort: 53, Flow: api.FlowUDP, Protocol: api.ListenerProtocolRaw, PortClaim: intPtr(53)},
+			),
+		},
+		{
+			name:        "reject_tls_wrap_true_on_tcp_http",
+			app:         primaryOverride(func(l *api.AppListener) { l.TLSWrap = true }),
+			expectError: true,
+			errContains: rejectMsg,
+		},
+		{
+			name: "reject_tls_wrap_true_on_tcp_websocket",
+			app: withListeners(
+				api.AppListener{Name: "ws", GuestPort: 9090, Flow: api.FlowTCP, Protocol: api.ListenerProtocolWebsocket, TLSWrap: true},
+			),
+			expectError: true,
+			errContains: rejectMsg,
+		},
+		{
+			name: "reject_tls_wrap_true_on_tls",
+			app: withListeners(
+				api.AppListener{Name: "passthrough", GuestPort: 8443, Flow: api.FlowTLS, Protocol: api.ListenerProtocolRaw, TLSWrap: true, PortClaim: intPtr(8443)},
+			),
+			expectError: true,
+			errContains: rejectMsg,
+		},
+		{
+			name: "reject_tls_wrap_true_on_udp",
+			app: withListeners(
+				api.AppListener{Name: "dnsudp", GuestPort: 53, Flow: api.FlowUDP, Protocol: api.ListenerProtocolRaw, TLSWrap: true, PortClaim: intPtr(53)},
+			),
+			expectError: true,
+			errContains: rejectMsg,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			SetDefaults(tt.app)
+			err := ValidateAppDefinition(tt.app)
+			if tt.expectError {
+				if err == nil {
+					t.Fatal("expected error but got none")
+				}
+				if tt.errContains != "" && !containsString(err.Error(), tt.errContains) {
+					t.Errorf("expected error containing %q, got %q", tt.errContains, err.Error())
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestTLSWrapYAMLRoundtrip verifies the tls_wrap YAML field round-trips
+// through ParseAppDefinition and lands on api.AppListener.TLSWrap, and that
+// pre-RFC manifests (no tls_wrap key) parse without error — the cold-start
+// regression case for RestoreServices → GetAppDefinition.
+func TestTLSWrapYAMLRoundtrip(t *testing.T) {
+	t.Run("tls_wrap_true_on_tcp_raw_parses", func(t *testing.T) {
+		yaml := `
+listeners:
+  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: http
+  - name: wrapped
+    guest_port: 9090
+    flow: tcp
+    protocol: raw
+    tls_wrap: true
+services:
+  main:
+    image: alpine:latest
+    bind_ports: [80, 9090]
+x-piccolo:
+  mode: service
+`
+		def, err := ParseAppDefinition([]byte(yaml))
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if len(def.Listeners) != 2 {
+			t.Fatalf("expected 2 listeners, got %d", len(def.Listeners))
+		}
+		if !def.Listeners[1].TLSWrap {
+			t.Errorf("expected wrapped listener TLSWrap=true, got false")
+		}
+	})
+
+	t.Run("pre_rfc_manifest_parses", func(t *testing.T) {
+		yaml := `
+listeners:
+  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: http
+  - name: ssh
+    guest_port: 22
+    flow: tcp
+    protocol: raw
+    port_claim: 2222
+services:
+  main:
+    image: alpine:latest
+    bind_ports: [80, 22]
+x-piccolo:
+  mode: service
+`
+		def, err := ParseAppDefinition([]byte(yaml))
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		for _, l := range def.Listeners {
+			if l.TLSWrap {
+				t.Errorf("listener %s: expected TLSWrap=false (default), got true", l.Name)
+			}
+		}
+	})
+}
+
 func TestFlowUDP(t *testing.T) {
 	t.Run("transport_protocol", func(t *testing.T) {
 		if api.FlowTCP.TransportProtocol() != "tcp" {

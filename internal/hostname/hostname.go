@@ -214,13 +214,20 @@ func CheckCollisions(newLabels []string, existingLabels map[string]string) error
 // ResolvePrimaryListener determines which listener should be the primary listener.
 // Returns the primary listener name and any validation error.
 //
-// Rules (per plan §D8 — tcp+raw now eligible for host routing):
-// - If a listener has Primary=true, it becomes primary (only one allowed).
-//   Permitted on every flow.
-// - If no explicit primary, the first listener becomes auto-primary.
-//   tcp+raw used to be skipped (not host-routable); plan §D8 makes it
-//   eligible via TLS mux SNI.
-// - Returns "" only when the listener list is empty.
+// Rules (per plan §D8 + RFC 20260519):
+//   - If a listener has Primary=true, it becomes primary (only one allowed).
+//     Permitted on every flow; manifest author's call.
+//   - If no explicit primary, auto-select the first host-routing-eligible
+//     listener (so that the apex DerivedHostLabel ("<app>") is bound to a
+//     listener that can actually serve it). Without this filter, a manifest
+//     declaring a raw-without-wrap listener before an HTTP listener would
+//     auto-pick the raw one, the apex would be orphaned, and the HTTP
+//     listener would silently demote to "<listener>-<app>".
+//   - If no listener is eligible (UDP-only app, all-raw-without-wrap),
+//     fall back to the first listener — its host label is empty regardless,
+//     but downstream code expects every app with listeners to have an
+//     identity listener for housekeeping.
+//   - Returns "" only when the listener list is empty.
 func ResolvePrimaryListener(listeners []api.AppListener) (string, error) {
 	var explicit string
 	for _, l := range listeners {
@@ -235,12 +242,15 @@ func ResolvePrimaryListener(listeners []api.AppListener) (string, error) {
 		return explicit, nil
 	}
 
-	// Auto-select: first listener becomes primary. Every flow is now
-	// auto-primary-eligible.
-	if len(listeners) > 0 {
-		return listeners[0].Name, nil
+	if len(listeners) == 0 {
+		return "", nil
 	}
-	return "", nil
+	for _, l := range listeners {
+		if l.IsEligibleForHostRouting() {
+			return l.Name, nil
+		}
+	}
+	return listeners[0].Name, nil
 }
 
 // NormalizeHostLabel extracts the host label from a full hostname.
