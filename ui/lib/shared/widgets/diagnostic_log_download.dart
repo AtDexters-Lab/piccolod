@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/config/core_config.dart';
 import 'package:piccolo_os/core/utils/downloader/downloader.dart';
+import 'package:piccolo_os/shared/widgets/log_download_chips.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
@@ -140,7 +141,7 @@ class _DiagnosticLogDownloadState extends State<DiagnosticLogDownload> {
         const SizedBox(height: 12),
         Row(
           children: [
-            _ModeChip(
+            LogModeChip(
               label: 'Current Boot',
               isActive: !_useDateRange,
               onTap: () => setState(() {
@@ -149,7 +150,7 @@ class _DiagnosticLogDownloadState extends State<DiagnosticLogDownload> {
               }),
             ),
             const SizedBox(width: 8),
-            _ModeChip(
+            LogModeChip(
               label: 'Date Range',
               isActive: _useDateRange,
               onTap: () => setState(() => _useDateRange = true),
@@ -160,7 +161,7 @@ class _DiagnosticLogDownloadState extends State<DiagnosticLogDownload> {
           const SizedBox(height: 12),
           Row(
             children: [
-              _DateChip(
+              LogDateChip(
                 label: 'From',
                 value: _formatDate(_from),
                 isActive: _activePicker ?? false,
@@ -171,7 +172,7 @@ class _DiagnosticLogDownloadState extends State<DiagnosticLogDownload> {
                 child:
                     Text('\u2014', style: TextStyle(color: PiccoloTheme.inkMuted)),
               ),
-              _DateChip(
+              LogDateChip(
                 label: 'To',
                 value: _formatDate(_to),
                 isActive: _activePicker == false,
@@ -207,98 +208,6 @@ class _DiagnosticLogDownloadState extends State<DiagnosticLogDownload> {
           ),
         ],
       ],
-    );
-  }
-}
-
-class _ModeChip extends StatelessWidget {
-  const _ModeChip({
-    required this.label,
-    required this.isActive,
-    required this.onTap,
-  });
-
-  final String label;
-  final bool isActive;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(Radii.sm),
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(Radii.sm),
-          border: Border.all(
-            color: isActive
-                ? PiccoloTheme.cobalt600
-                : PiccoloTheme.ink.withValues(alpha: 0.1),
-          ),
-          color: isActive
-              ? PiccoloTheme.cobalt600.withValues(alpha: 0.05)
-              : null,
-        ),
-        child: Text(
-          label,
-          style: PiccoloTheme.textTheme.labelSmall?.copyWith(
-            color: isActive ? PiccoloTheme.cobalt600 : null,
-            fontWeight: isActive ? FontWeight.w600 : null,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _DateChip extends StatelessWidget {
-  const _DateChip({
-    required this.label,
-    required this.value,
-    required this.isActive,
-    required this.onTap,
-  });
-
-  final String label;
-  final String value;
-  final bool isActive;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(Radii.sm),
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(Radii.sm),
-          border: Border.all(
-            color: isActive
-                ? PiccoloTheme.cobalt600
-                : PiccoloTheme.ink.withValues(alpha: 0.1),
-          ),
-          color: isActive
-              ? PiccoloTheme.cobalt600.withValues(alpha: 0.05)
-              : null,
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text('$label: ', style: PiccoloTheme.textTheme.labelSmall),
-            Text(value,
-                style: PiccoloTheme.textTheme.bodyMedium
-                    ?.copyWith(fontWeight: FontWeight.w500)),
-            const SizedBox(width: 4),
-            Icon(
-              isActive ? PiccoloIcons.expandLess : PiccoloIcons.calendar,
-              size: 14,
-              color: isActive ? PiccoloTheme.cobalt600 : PiccoloTheme.inkMuted,
-            ),
-          ],
-        ),
-      ),
     );
   }
 }

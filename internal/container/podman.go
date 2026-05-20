@@ -461,6 +461,15 @@ type ContainerCreateSpec struct {
 	// whose overlay layers or rootfs reside on filesystems where SELinux contexts
 	// don't match the standard container_file_t type.
 	SecurityOpt []string
+
+	// LogPath, when non-empty, redirects the k8s-file log driver to a custom
+	// path (--log-opt path=). Used to persist per-service app logs on the
+	// shared app-logs volume so they survive container recreation/rollback
+	//. Empty preserves the default graphroot location.
+	LogPath string
+	// LogMaxSize, when non-empty (e.g. "10mb"), bounds the k8s-file log via
+	// rotation (--log-opt max-size=). Only meaningful alongside LogPath.
+	LogMaxSize string
 }
 
 // HostEntry represents an /etc/hosts entry for --add-host.
@@ -518,6 +527,16 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 	// logs are inaccessible via `podman logs`. k8s-file stores logs as flat
 	// files in the container's graphroot, which the per-app user owns.
 	args = append(args, "--log-driver=k8s-file")
+
+	// Optional custom log location + rotation cap. When unset,
+	// k8s-file uses its default graphroot path — preserving behavior for the
+	// network anchor, ephemeral diagnostic runtime, and any other caller.
+	if spec.LogPath != "" {
+		args = append(args, "--log-opt", "path="+spec.LogPath)
+	}
+	if spec.LogMaxSize != "" {
+		args = append(args, "--log-opt", "max-size="+spec.LogMaxSize)
+	}
 
 	// Capability hardening: drop all capabilities and re-add only
 	// the minimal set required for typical container workloads.
@@ -730,7 +749,7 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 		}
 		if strings.Contains(outStr, "name is already in use") || strings.Contains(outStr, "already in use by") {
 			// Try to extract the ID
-			// Error: ... name "code-server" is already in use by <id>. ...
+			// Error:... name "code-server" is already in use by <id>....
 			// Simple regex to find the ID?
 			// The ID is usually 64 chars hex.
 			if match := nameInUseIDPattern.FindStringSubmatch(outStr); len(match) == 2 {
@@ -1472,7 +1491,7 @@ func (p *PodmanCLI) ExecShellCmd(runtime PodmanRuntime, containerID string) (*ex
 	}
 
 	// Shell wrapper that prefers bash (for readline/completion) but falls back to sh.
-	// Uses login shell (-l) to load full shell initialization (.bash_profile, .bashrc).
+	// Uses login shell (-l) to load full shell initialization (.bash_profile,.bashrc).
 	shellCmd := `if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh; fi`
 
 	// Build podman exec args with proper environment propagation
@@ -1661,7 +1680,7 @@ func newPullProgressParser(image string) *pullProgressParser {
 
 // Regular expressions for parsing podman pull output
 var (
-	// Matches: "Copying blob sha256:abc123 [======>    ] 15.2MiB / 45.3MiB"
+	// Matches: "Copying blob sha256:abc123 [======> ] 15.2MiB / 45.3MiB"
 	// Also handles: "Copying blob sha256:abc123 1.2KiB / 5.6KiB"
 	// Layer ID can be sha256:hex or just hex
 	pullProgressRe = regexp.MustCompile(`Copying blob ([a-zA-Z0-9:]+)\s*(?:\[.*?\])?\s*([\d.]+)\s*([KMGTkmgt]?i?[Bb]?)\s*/\s*([\d.]+)\s*([KMGTkmgt]?i?[Bb]?)`)
@@ -1906,9 +1925,9 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 
 	// Stall detection state. Both signals must be silent for pullStallTicks
 	// consecutive ticks before declaring a stall:
-	//   1. Byte progress: parser.report().DownloadedBytes hasn't advanced
-	//   2. PTY I/O liveness: no bytes read from PTY (covers slow connections
-	//      where podman receives data but doesn't emit parseable progress lines)
+	// 1. Byte progress: parser.report().DownloadedBytes hasn't advanced
+	// 2. PTY I/O liveness: no bytes read from PTY (covers slow connections
+	// where podman receives data but doesn't emit parseable progress lines)
 	var stallDetected atomic.Bool
 	var lastPTYReadNano atomic.Int64
 	lastPTYReadNano.Store(time.Now().UnixNano())
@@ -1938,8 +1957,8 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 					// Count stall ticks unless all layers are already "done"/"exists"
 					// (post-download extraction/verification is local CPU work, not
 					// a network stall). Covers both:
-					//  - Pre-download hang (no layers yet: auth/TLS/manifest resolution)
-					//  - Mid-download hang (layers actively downloading)
+					// - Pre-download hang (no layers yet: auth/TLS/manifest resolution)
+					// - Mid-download hang (layers actively downloading)
 					allComplete := len(report.Layers) > 0
 					for _, l := range report.Layers {
 						if l.Status != "done" && l.Status != "exists" {

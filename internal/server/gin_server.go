@@ -943,11 +943,11 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	}
 
 	// Construct the keyslot reconciler (RFC 20260510). Live id probes:
-	//   - slot 2: cryptoManager.RecoveryKeyID() reads the on-disk
-	//     SDEKRK fingerprint — stable signal across rotations.
-	//   - slot 1: fingerprint the admin user's password_hash from the
-	//     persistence Users repo. Empty when no admin user yet (fresh
-	//     device) — the reconciler short-circuits on empty live id.
+	// - slot 2: cryptoManager.RecoveryKeyID() reads the on-disk
+	// SDEKRK fingerprint — stable signal across rotations.
+	// - slot 1: fingerprint the admin user's password_hash from the
+	// persistence Users repo. Empty when no admin user yet (fresh
+	// device) — the reconciler short-circuits on empty live id.
 	// Reconciler is started in Start() so the goroutine binds to the
 	// long-lived server context.
 	if persist != nil {
@@ -1219,20 +1219,20 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	identitySvc.SetAKRecovered(akRecovered)
 	// Setup heartbeat decision. Three layers:
 	//
-	//  1. provisioningState.IsProvisioned() — durable, pre-unlock-readable
-	//     signal that this device finished first-run setup at any point in
-	//     its history. Backed by onboarding.json + reconcile-on-unlock so
-	//     it's correct across upgrades, crashes, and best-effort write
-	//     failures. See internal/provisioning/state.go.
+	// 1. provisioningState.IsProvisioned() — durable, pre-unlock-readable
+	// signal that this device finished first-run setup at any point in
+	// its history. Backed by onboarding.json + reconcile-on-unlock so
+	// it's correct across upgrades, crashes, and best-effort write
+	// failures. See internal/provisioning/state.go.
 	//
-	//  2. Otherwise consult isSetupComplete (persistence query) under a
-	//     5s budget. The timeout bounds Stop() shutdown latency in case a
-	//     hung store wedges the callback.
+	// 2. Otherwise consult isSetupComplete (persistence query) under a
+	// 5s budget. The timeout bounds Stop() shutdown latency in case a
+	// hung store wedges the callback.
 	//
-	//  3. Fail-safe: a real persistence error returns true (stop — better
-	//     than leaking setup-mode visibility on a broken store). A timeout
-	//     returns false (keep heartbeating — better than silent vanishing
-	//     mid-setup; rows age out via the 2-min server TTL anyway).
+	// 3. Fail-safe: a real persistence error returns true (stop — better
+	// than leaking setup-mode visibility on a broken store). A timeout
+	// returns false (keep heartbeating — better than silent vanishing
+	// mid-setup; rows age out via the 2-min server TTL anyway).
 	identitySvc.SetSetupCompleteCheck(func() bool {
 		if s.provisioningState.IsProvisioned() {
 			return true
@@ -1968,9 +1968,9 @@ func (s *GinServer) setupGinRoutes() {
 	r.Use(gin.Recovery())
 	// LAN host routing must run BEFORE gzip and security headers:
 	// 1. Before gzip: proxied app responses are already compressed; gzip middleware
-	//    would strip Content-Encoding and corrupt the response.
+	// would strip Content-Encoding and corrupt the response.
 	// 2. Before security headers: avoid portal-only headers (e.g., X-Frame-Options: DENY,
-	//    Cross-Origin-Embedder-Policy) leaking into app responses.
+	// Cross-Origin-Embedder-Policy) leaking into app responses.
 	r.Use(s.lanHostRoutingMiddleware())
 	r.Use(gzip.Gzip(gzip.DefaultCompression))
 	r.Use(s.corsMiddleware())
@@ -2171,6 +2171,7 @@ func (s *GinServer) setupGinRoutes() {
 			apps.GET("/:name/listeners/:listener/health", s.handleGinListenerHealth)
 			apps.GET("/:name/logs", s.handleGinAppLogs)
 			apps.GET("/:name/logs/stream", s.handleGinAppLogStream)
+			apps.GET("/:name/logs/download", s.handleGinAppLogDownload)
 
 			// Admin-only actions
 			apps.POST("", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppInstall)
@@ -2692,6 +2693,15 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 			if wrm, ok := volumes.(persistence.WorkspaceResizeMonitor); ok {
 				wrm.StartWorkspaceResizeMonitor()
 			}
+		}
+	}
+
+	// Reap orphaned app-log subtrees before the app reloaders can create new
+	// ones. Fail-closed inside: aborts without deleting
+	// if the known-app set can't be loaded.
+	if s.appManager != nil {
+		if err := s.appManager.ReapOrphanAppLogs(context.Background()); err != nil {
+			log.Printf("WARN: app-logs orphan reaper: %v", err)
 		}
 	}
 
@@ -3416,9 +3426,9 @@ func (s *GinServer) queueAllEndpointCerts() {
 // listeners require authentication (RFC 20260122 §5.3).
 //
 // Subscribes to two topics:
-//   - TopicAppStatusChanged ("installed"): fires after StoreApp, covers new installs.
-//   - TopicServiceEndpointsChanged (added): covers RestoreFromPodman on reboot and
-//     any future path that adds endpoints.
+// - TopicAppStatusChanged ("installed"): fires after StoreApp, covers new installs.
+// - TopicServiceEndpointsChanged (added): covers RestoreFromPodman on reboot and
+// any future path that adds endpoints.
 //
 // Note: cleanup of proxy OIDC clients on uninstall is handled separately in
 // handleGinAppUninstall (via DeleteClientsByAppID). Update-listeners uses an

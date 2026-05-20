@@ -106,6 +106,17 @@ class ApiClient {
     String path,
     Future<http.Response> Function() request,
   ) async {
+    return _handleResponse(await _withReauthRaw(path, request));
+  }
+
+  /// _withReauthRaw runs [request], driving the re-auth overlay + single retry
+  /// on a 401, and returns the raw [http.Response] (no JSON decoding). Shared by
+  /// [_withReauth] (which adds JSON handling) and [getText] (which wants the raw
+  /// body) so both authenticated GET paths get the same session-expiry flow.
+  Future<http.Response> _withReauthRaw(
+    String path,
+    Future<http.Response> Function() request,
+  ) async {
     final response = await request();
 
     final cleanPath = path.contains('?') ? path.substring(0, path.indexOf('?')) : path;
@@ -129,16 +140,15 @@ class ApiClient {
       );
 
       if (success) {
-        // Retry once — if the retry also 401s, throw immediately (no re-enter).
-        final retryResponse = await request();
-        return _handleResponse(retryResponse);
+        // Retry once — if the retry also 401s, the caller surfaces it.
+        return request();
       }
 
       // Re-auth failed or cancelled — throw original 401.
       throw ApiException(response.statusCode, response.body);
     }
 
-    return _handleResponse(response);
+    return response;
   }
 
   Future<dynamic> get(
@@ -152,6 +162,25 @@ class ApiClient {
       if (headers != null) mergedHeaders.addAll(headers);
       return _client.get(uri, headers: mergedHeaders);
     });
+  }
+
+  /// getText performs a GET expecting a non-JSON (text/plain) body, returning
+  /// it raw. Throws [ApiException] (carrying the HTTP status) on non-2xx so
+  /// callers can branch on 503/429/etc. Used by the app-log download, which
+  /// needs status visibility rather than the JSON-decoding [get].
+  Future<String> getText(
+    String path, {
+    Map<String, dynamic>? queryParameters,
+  }) async {
+    final uri = _buildUri(path, queryParameters);
+    final response = await _withReauthRaw(
+      path,
+      () async => _client.get(uri, headers: _getHeaders()),
+    );
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return response.body;
+    }
+    throw ApiException(response.statusCode, response.body);
   }
 
   Future<dynamic> post(String path, {Object? body, Map<String, String>? headers}) async {

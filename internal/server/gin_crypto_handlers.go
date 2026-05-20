@@ -279,18 +279,18 @@ func initialLifecycleState(cmgr *crypt.Manager) lifecycle.State {
 // counting users (primary) or checking auth initialization (fallback).
 //
 // Three-way result encoded in (bool, error):
-//   - (true, nil)             — provisioning complete (≥1 user OR auth
-//                                manager reports initialized)
-//   - (false, nil)            — store readable AND no users / auth not
-//                                initialized (genuinely incomplete)
-//   - (false, persistence.ErrLocked) — control store is locked; the
-//                                question cannot be answered authoritatively
-//                                right now. Callers MUST distinguish this
-//                                from genuine incompleteness via
-//                                errors.Is(err, persistence.ErrLocked).
-//   - (false, err)            — transient error; callers should fail
-//                                toward whichever direction is safer for
-//                                their gate.
+// - (true, nil) — provisioning complete (≥1 user OR auth
+// manager reports initialized)
+// - (false, nil) — store readable AND no users / auth not
+// initialized (genuinely incomplete)
+// - (false, persistence.ErrLocked) — control store is locked; the
+// question cannot be answered authoritatively
+// right now. Callers MUST distinguish this
+// from genuine incompleteness via
+// errors.Is(err, persistence.ErrLocked).
+// - (false, err) — transient error; callers should fail
+// toward whichever direction is safer for
+// their gate.
 //
 // The ErrLocked propagation is what closes the original race-window bug:
 // previously this function swallowed ErrLocked into (false, nil), which
@@ -601,6 +601,14 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 		}
 	}
 
+	// The data pool now exists. At first setup the persistence unlock ran
+	// before this step, so the app-logs store could not provision then —
+	// attach it now. Idempotent on retries and on
+	// normal boots (where the pool is activated before persistence unlock).
+	if luksErr == nil && s.persistence != nil {
+		s.persistence.AttachAppLogs(setupCtx)
+	}
+
 	// 6b. Provision LUKS keyslot 1 (admin password) via the async
 	// reconciler (RFC 20260510 §Slot-1 expansion). At first setup there's
 	// typically only the control-plane volume, so the latency benefit is
@@ -906,15 +914,15 @@ func (s *GinServer) handleCryptoResetPassword(c *gin.Context) {
 
 	// Rotate LUKS keyslot 1 (admin-password passphrase) on all volumes.
 	// Two paths (codex P2 #2):
-	//   - wasLocked=false: async via the reconciler — handler returns
-	//     sub-second, reconciler drains in the background.
-	//   - wasLocked=true: SYNC via legacy ProvisionLUKSKeyslotSync — the
-	//     deferred relock below would otherwise race the reconciler
-	//     (SDEKLoaded flips false mid-pass, pass aborts, slot-1 LUKS
-	//     stays at OLD password until next unlock+nudge). For
-	//     locked-recovery the operator is already in "this will take a
-	//     minute" mode; pay the N×Argon2id cost to keep the rotation
-	//     atomic with the password change as the legacy code did.
+	// - wasLocked=false: async via the reconciler — handler returns
+	// sub-second, reconciler drains in the background.
+	// - wasLocked=true: SYNC via legacy ProvisionLUKSKeyslotSync — the
+	// deferred relock below would otherwise race the reconciler
+	// (SDEKLoaded flips false mid-pass, pass aborts, slot-1 LUKS
+	// stays at OLD password until next unlock+nudge). For
+	// locked-recovery the operator is already in "this will take a
+	// minute" mode; pay the N×Argon2id cost to keep the rotation
+	// atomic with the password change as the legacy code did.
 	if wasLocked {
 		if kp, ok := s.persistence.(persistence.KeyslotProvisioner); ok {
 			passBytes := []byte(newPassword)

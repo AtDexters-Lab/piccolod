@@ -37,6 +37,9 @@ const (
 	ephLVPrefix    = "eph-"
 	appLVPrefix    = "vol-"
 	ephDefaultSize = 50 << 30 // 50 GiB (thin-provisioned — only written blocks consume physical space)
+
+	appVolumeDefaultSize = 10 << 30 // 10 GiB (thin-provisioned)
+	appLogsVolumeSize    = 2 << 30  // 2 GiB cap for the singleton app-logs store
 )
 
 // volumeMetaV2 is the on-disk metadata schema for block-native volumes.
@@ -145,7 +148,7 @@ type LUKSVolumeManagerConfig struct {
 // returns ErrMultiNodeUnsupportedForAttachTruth if cfg.NBDSrv or cfg.DRBDMgr
 // is non-nil. Multi-node enablement requires extending LiveLayers and
 // AttachStateOf to query NBD and DRBD layers (see project_multi_node_prereq.md
-// and .claude/plans/volume-attach-truth.md §"Multi-node prerequisite gate").
+// and.claude/plans/volume-attach-truth.md §"Multi-node prerequisite gate").
 func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) (*luksVolumeManager, error) {
 	if cfg.NBDSrv != nil || cfg.DRBDMgr != nil {
 		return nil, ErrMultiNodeUnsupportedForAttachTruth
@@ -378,7 +381,11 @@ func (m *luksVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 	case VolumeClassControl:
 		return m.ensureControlVolume(ctx, req)
 	case VolumeClassApplication:
-		return m.ensureAppVolume(ctx, req)
+		return m.ensureServiceDataVolume(ctx, req, appVolumeDefaultSize)
+	case VolumeClassAppLogs:
+		// Singleton app-logs store — same v3 service-data backing as an
+		// application volume, just a fixed cap and a non-app LV name.
+		return m.ensureServiceDataVolume(ctx, req, appLogsVolumeSize)
 	default:
 		return VolumeHandle{}, fmt.Errorf("unknown volume class: %s", req.Class)
 	}
@@ -391,15 +398,15 @@ func (m *luksVolumeManager) EnsureVolume(ctx context.Context, req VolumeRequest)
 // rootfs types must use AttachRootfs.
 //
 // Reconciliation shape: probes AttachStateOf under lock first.
-//   - Attached → reconcile size invariants, return success (idempotent for
-//     callers like the post-unlock RestoreServices+ReconcileOnce fan-out).
-//   - ForeignMountAtPath → fail loud; surfaced to UI as unrecoverable.
-//   - KernelStateCorrupted → ErrKernelStateCorrupted; admin clear required.
-//   - Unknown → ErrKernelStateAmbiguous; caller may retry.
-//   - StaleMountRecord → lazy umount the stale path, then full attach.
-//   - Detached / PartialMapperOnly → run the type-specific full attach,
-//     which is naturally idempotent at each step (cryptsetup luksOpen
-//     tolerates exit 5; mount tolerates EBUSY; resize2fs is idempotent).
+// - Attached → reconcile size invariants, return success (idempotent for
+// callers like the post-unlock RestoreServices+ReconcileOnce fan-out).
+// - ForeignMountAtPath → fail loud; surfaced to UI as unrecoverable.
+// - KernelStateCorrupted → ErrKernelStateCorrupted; admin clear required.
+// - Unknown → ErrKernelStateAmbiguous; caller may retry.
+// - StaleMountRecord → lazy umount the stale path, then full attach.
+// - Detached / PartialMapperOnly → run the type-specific full attach,
+// which is naturally idempotent at each step (cryptsetup luksOpen
+// tolerates exit 5; mount tolerates EBUSY; resize2fs is idempotent).
 func (m *luksVolumeManager) Attach(ctx context.Context, handle VolumeHandle, opts AttachOptions) error {
 	lock := m.lockFor(handle.ID)
 	lock.Lock()
@@ -777,10 +784,14 @@ func (m *luksVolumeManager) detachControlVolume(ctx context.Context, handle Volu
 
 // --- Application volume (DeviceStack + LUKS) ---
 
-func (m *luksVolumeManager) ensureAppVolume(ctx context.Context, req VolumeRequest) (VolumeHandle, error) {
+// ensureServiceDataVolume provisions a v3 service-data volume (thin LV on the
+// data pool + per-volume LUKS2 via the pool keyfile + ext4). Shared by
+// application volumes and the singleton app-logs store; the only difference is
+// the size cap and the LV name (derived from req.ID). Both ride the same v3
+// attach/detach/destroy/keyslot-reconciliation paths thereafter.
+func (m *luksVolumeManager) ensureServiceDataVolume(ctx context.Context, req VolumeRequest, sizeBytes int64) (VolumeHandle, error) {
 	metaDir := paths.VolumeMetaDir(req.ID)
 	lvName := appLVPrefix + req.ID
-	sizeBytes := int64(10 << 30) // 10 GiB default
 
 	if m.lvMgr.LVExists(ctx, lvName) {
 		// LV exists from a partial previous attempt. Tear down stale LUKS/mount
@@ -1578,16 +1589,16 @@ func (m *luksVolumeManager) resolveLUKSDevice(ctx context.Context, volID string,
 // explicit-cancellation failure modes (SIGKILL during Argon2id remains the
 // residual hazard; rotate-to-recover policy is the documented recourse):
 //
-//   1. Pre-kill probe via `cryptsetup luksDump`: if the slot is already
-//      empty, the kill is skipped entirely and we go straight to add. This
-//      collapses the "unprovisioned" sentinel case (RFC §Volume-creation
-//      atomicity sub-case ii) to a single non-destructive operation.
-//   2. The kill+add pair is wrapped in `context.WithoutCancel`: a
-//      reconciler nudge, per-pass timeout, or process-exit signal mid-pair
-//      cannot tear them apart. The compute time is bounded by Argon2id
-//      (single-digit seconds per slot), so withholding cancellation for
-//      this window is a finite, acceptable trade against the silent-empty
-//      hazard.
+// 1. Pre-kill probe via `cryptsetup luksDump`: if the slot is already
+// empty, the kill is skipped entirely and we go straight to add. This
+// collapses the "unprovisioned" sentinel case (RFC §Volume-creation
+// atomicity sub-case ii) to a single non-destructive operation.
+// 2. The kill+add pair is wrapped in `context.WithoutCancel`: a
+// reconciler nudge, per-pass timeout, or process-exit signal mid-pair
+// cannot tear them apart. The compute time is bounded by Argon2id
+// (single-digit seconds per slot), so withholding cancellation for
+// this window is a finite, acceptable trade against the silent-empty
+// hazard.
 //
 // Net invariant: the slot transitions atomically from old-passphrase to
 // new-passphrase OR stays at old-passphrase; it never transitions through
@@ -1725,13 +1736,13 @@ type volumeMetaV3 struct {
 	// and keyslot 2 (recovery mnemonic) respectively. RFC 20260510 §Data
 	// shape additions. Typed sentinel values are load-bearing:
 	//
-	//   ""              = pre-RFC-existing volume; reconciler kill+re-adds
-	//                     unconditionally (slot may hold any old generation)
-	//   "unprovisioned" = volume created in steady state with no in-flight
-	//                     passphrase; slot is empty; reconciler adds-only
-	//                     (skips the kill via pre-kill luksDump probe)
-	//   <hex digest>    = current generation fingerprint; reconciler skips
-	//                     this volume for that slot
+	// "" = pre-RFC-existing volume; reconciler kill+re-adds
+	// unconditionally (slot may hold any old generation)
+	// "unprovisioned" = volume created in steady state with no in-flight
+	// passphrase; slot is empty; reconciler adds-only
+	// (skips the kill via pre-kill luksDump probe)
+	// <hex digest> = current generation fingerprint; reconciler skips
+	// this volume for that slot
 	PasswordKeyslotKeyID string `json:"password_keyslot_key_id,omitempty"`
 	RecoveryKeyslotKeyID string `json:"recovery_keyslot_key_id,omitempty"`
 }
@@ -1894,19 +1905,19 @@ func writeVolumeMeta(path string, meta *volumeMetaV2) error {
 
 // writeVolumeMetaV3 writes v3 metadata with two contracts:
 //
-//  1. IDMap immutability: if a fingerprint already exists on disk for this
-//     volume, the incoming meta's IDMap fields must produce the same
-//     fingerprint. Otherwise: ErrIDMapImmutable. This blocks the
-//     hand-edit-the-JSON workflow at the write site; the attach-time
-//     fingerprint check (Phase 2 reconciler) is the second line of defense.
-//     Removing IDMap entirely (setting it to nil when a fingerprint is
-//     persisted) is also rejected — otherwise an attacker could clear the
-//     guard by deleting the idmap field, then re-add a different IDMap on
-//     the next write (which would have no fingerprint to compare against).
-//  2. Fingerprint maintenance: when meta.IDMap != nil and meta.IDMapFingerprint
-//     is empty, the fingerprint is computed and stored. When IDMap == nil
-//     AND no fingerprint was previously persisted, the fingerprint stays
-//     empty (legitimate case: volume created without idmap).
+// 1. IDMap immutability: if a fingerprint already exists on disk for this
+// volume, the incoming meta's IDMap fields must produce the same
+// fingerprint. Otherwise: ErrIDMapImmutable. This blocks the
+// hand-edit-the-JSON workflow at the write site; the attach-time
+// fingerprint check (Phase 2 reconciler) is the second line of defense.
+// Removing IDMap entirely (setting it to nil when a fingerprint is
+// persisted) is also rejected — otherwise an attacker could clear the
+// guard by deleting the idmap field, then re-add a different IDMap on
+// the next write (which would have no fingerprint to compare against).
+// 2. Fingerprint maintenance: when meta.IDMap != nil and meta.IDMapFingerprint
+// is empty, the fingerprint is computed and stored. When IDMap == nil
+// AND no fingerprint was previously persisted, the fingerprint stays
+// empty (legitimate case: volume created without idmap).
 func writeVolumeMetaV3(path string, meta *volumeMetaV3) error {
 	existingFp, _ := readPersistedIDMapFingerprint(path)
 	if meta.IDMap == nil {
@@ -1976,16 +1987,16 @@ func (m *luksVolumeManager) DestroyDataSnapshot(ctx context.Context, snapshotLVN
 // RollbackDataVolume performs a LUKS-aware LV rename swap with full detach/attach cycle.
 //
 // Sequence:
-//  1. Detach data volume (unmount ext4, cryptsetup close, close device stack)
-//  2. Rename active LV → failedLVName
-//  3. Rename snapshotLVName → active LV name
-//  4. Attach data volume (open stack, LUKS open, mount ext4)
+// 1. Detach data volume (unmount ext4, cryptsetup close, close device stack)
+// 2. Rename active LV → failedLVName
+// 3. Rename snapshotLVName → active LV name
+// 4. Attach data volume (open stack, LUKS open, mount ext4)
 //
 // Returns (renamesCommitted, snapshotPromoted, error):
-//   - (false, false, err): failed before LV renames (detach or first rename failed), no LV state change
-//   - (true, false, err):  active→failed rename committed, but snapshot→active failed (partial state)
-//   - (true, true, nil):   fully succeeded (both renames + re-attach)
-//   - (true, true, err):   both renames committed but re-attach failed; caller must update tuple state
+// - (false, false, err): failed before LV renames (detach or first rename failed), no LV state change
+// - (true, false, err): active→failed rename committed, but snapshot→active failed (partial state)
+// - (true, true, nil): fully succeeded (both renames + re-attach)
+// - (true, true, err): both renames committed but re-attach failed; caller must update tuple state
 //
 // The volume handle ID stays the same — only the underlying LV changes.
 // All containers must be stopped before calling this method.

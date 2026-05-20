@@ -187,20 +187,21 @@ func TestSetLockState_idempotent(t *testing.T) {
 		lockState:     true,
 	}
 
-	// First unlock should attach.
+	// First unlock attaches both the control-plane and the app-logs volume
+	// (RFC 20260520 Site 0b wires app-logs into the same unlock sequence).
 	if err := mod.setLockState(context.Background(), false); err != nil {
 		t.Fatalf("first unlock: %v", err)
 	}
-	if got := attachCount.Load(); got != 1 {
-		t.Fatalf("expected 1 attach, got %d", got)
+	if got := attachCount.Load(); got != 2 {
+		t.Fatalf("expected 2 attaches (control + app-logs), got %d", got)
 	}
 
 	// Second unlock should be a no-op (idempotent).
 	if err := mod.setLockState(context.Background(), false); err != nil {
 		t.Fatalf("second unlock: %v", err)
 	}
-	if got := attachCount.Load(); got != 1 {
-		t.Fatalf("expected still 1 attach after idempotent unlock, got %d", got)
+	if got := attachCount.Load(); got != 2 {
+		t.Fatalf("expected still 2 attaches after idempotent unlock, got %d", got)
 	}
 }
 
@@ -235,8 +236,10 @@ func TestSetLockState_concurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := attachCount.Load(); got != 1 {
-		t.Fatalf("expected exactly 1 attach from concurrent unlocks, got %d", got)
+	// Exactly one effective unlock occurs (the rest no-op under lockOpMu),
+	// and that one unlock attaches control-plane + app-logs = 2.
+	if got := attachCount.Load(); got != 2 {
+		t.Fatalf("expected exactly 2 attaches (control + app-logs) from concurrent unlocks, got %d", got)
 	}
 }
 

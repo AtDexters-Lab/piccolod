@@ -59,6 +59,7 @@ type Module struct {
 	crypto             *crypt.Manager
 	stateDir           string
 	controlHandle      VolumeHandle
+	appLogsHandle      VolumeHandle
 	commitMu           sync.Mutex
 	lastCommitRevision uint64
 	pollCancel         context.CancelFunc
@@ -186,6 +187,10 @@ func NewService(opts Options) (*Module, error) {
 	// VolumeHandle, classifyForDetach returns NoOp, and a stale post-crash
 	// control mapper survives across "logically locked" — codex iter-7 B1.
 	mod.controlHandle = VolumeHandle{ID: "control-plane", MountDir: paths.MountDir("control-plane")}
+	// Same seed for the singleton app-logs handle so the first
+	// setLockState(true) has a well-formed (possibly-unmounted) handle to
+	// detach rather than a zero handle.
+	mod.appLogsHandle = VolumeHandle{ID: AppLogsVolumeID, MountDir: paths.MountDir(AppLogsVolumeID)}
 
 	if err := mod.setLockState(context.Background(), true); err != nil {
 		return nil, err
@@ -220,7 +225,41 @@ func (m *Module) ensureCoreVolumes(ctx context.Context) error {
 	} else {
 		m.controlHandle = handle
 	}
+	// App-logs store is NOT created here: at boot the data pool
+	// isn't initialized and crypto is locked (on a set-up device), so creation
+	// would fail. Its handle is seeded in NewService for the lock path; the
+	// volume is created+attached at unlock (setLockState / AttachAppLogs), once
+	// the pool exists and crypto is unlocked.
 	return nil
+}
+
+// attachAppLogsVolume ensures+attaches the singleton app-logs store after
+// crypto is unlocked. Fail-open: any failure is logged and swallowed so it can
+// never block an unlock — app logging degrades, the device stays usable.
+func (m *Module) attachAppLogsVolume(ctx context.Context) {
+	if m.volumes == nil {
+		return
+	}
+	appLogsReq := VolumeRequest{ID: AppLogsVolumeID, Class: VolumeClassAppLogs, ClusterMode: ClusterModeStateful}
+	handle, err := m.volumes.EnsureVolume(ctx, appLogsReq)
+	if err != nil {
+		log.Printf("WARN: app-logs volume unavailable (ensure failed): %v", err)
+		return
+	}
+	m.appLogsHandle = handle
+	role := VolumeRoleLeader
+	if m.leadership != nil {
+		if current := m.leadership.Current(cluster.ResourceKernel); current == cluster.RoleFollower {
+			role = VolumeRoleFollower
+		}
+	}
+	attachCtx := context.WithoutCancel(ctx)
+	if err := m.volumes.Attach(attachCtx, m.appLogsHandle, AttachOptions{Role: role}); err != nil {
+		if errors.Is(err, ErrNotImplemented) {
+			return
+		}
+		log.Printf("WARN: app-logs volume unavailable (attach failed): %v", err)
+	}
 }
 
 func (m *Module) attachControlVolume(ctx context.Context) error {
@@ -285,6 +324,21 @@ func (m *Module) observeLeadership() {
 			log.Printf("INFO: persistence observed control-plane role=%s", payload.Role)
 		}
 	}()
+}
+
+// AttachAppLogs ensures+attaches the singleton app-logs store on demand.
+// First-setup creates the data pool (handleCryptoSetup step 6) AFTER the
+// initial persistence unlock, so the unlock-time attach in setLockState found
+// no pool and failed open; the setup handler calls this once the pool exists.
+// Serialized with lock/unlock via lockOpMu (so no race on appLogsHandle);
+// no-op when locked. Idempotent on subsequent boots (pool already up).
+func (m *Module) AttachAppLogs(ctx context.Context) {
+	m.lockOpMu.Lock()
+	defer m.lockOpMu.Unlock()
+	// lockState read is safe under lockOpMu (serializes all writers).
+	if !m.lockState {
+		m.attachAppLogsVolume(ctx)
+	}
 }
 
 func (m *Module) Control() ControlStore {
@@ -420,6 +474,15 @@ func (m *Module) setLockState(ctx context.Context, locked bool) error {
 		if err := m.detachVolumeStrict(ctx, m.controlHandle); err != nil {
 			return err
 		}
+		// App-logs holds plaintext app output — tear it down on lock too.
+		// Strict attempt for fail-closed intent, but it must NOT block the
+		// authoritative control-plane lock (already locked above): on failure
+		// log CRITICAL (plaintext logs may remain mapped) and proceed.
+		if m.appLogsHandle.ID != "" {
+			if err := m.detachVolumeStrict(ctx, m.appLogsHandle); err != nil {
+				log.Printf("CRITICAL: app-logs volume not detached on lock (plaintext logs may remain mapped): %v", err)
+			}
+		}
 		m.lockStateMu.Lock()
 		m.lockState = true
 		m.lockStateMu.Unlock()
@@ -450,6 +513,11 @@ func (m *Module) setLockState(ctx context.Context, locked bool) error {
 		}
 		return err
 	}
+	// Crypto is fully unlocked — bring up the app-logs store before this
+	// function returns, which is before commands.go publishes the unlock
+	// event that triggers the app-manager reconcile fan-out. So the store is
+	// mounted before any container is (re)created against it. Fail-open.
+	m.attachAppLogsVolume(ctx)
 	m.lockStateMu.Lock()
 	m.lockState = false
 	m.lockStateMu.Unlock()
@@ -490,6 +558,11 @@ func (m *Module) Shutdown(ctx context.Context) error {
 	// shutdown; we're tearing down anyway.
 	if err := m.detachVolumeBestEffort(ctx, m.controlHandle); err != nil {
 		log.Printf("WARN: persistence failed to detach control volume: %v", err)
+	}
+	if m.appLogsHandle.ID != "" {
+		if err := m.detachVolumeBestEffort(ctx, m.appLogsHandle); err != nil {
+			log.Printf("WARN: persistence failed to detach app-logs volume: %v", err)
+		}
 	}
 	// Other sub-components expose explicit Stop methods when implemented.
 	return nil

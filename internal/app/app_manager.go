@@ -1314,7 +1314,7 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 //
 // Desired state is derived from the persisted Enabled flag:
 // - Enabled == false => desired stopped
-// - Enabled == true  => desired running
+// - Enabled == true => desired running
 func (m *AppManager) ReconcileOnce(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1679,6 +1679,9 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 // The 60s budget fits within the server's shutdown drain window.
 func (m *AppManager) cleanupInstallResources(instanceID string, runtime container.PodmanRuntime, appDef *api.AppDefinition) {
 	log.Printf("INFO: cleaning up resources for failed install: %s", instanceID)
+	// App-logs subtree lives off the data volume, so the DestroyVolume below
+	// won't reclaim it — remove it regardless of how this returns.
+	defer m.removeAppLogSubtree(instanceID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupBudget)
 	defer cancel()
@@ -2248,6 +2251,15 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 		}
 		m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseComplete, 100, "Uninstalled", true, nil)
 	}()
+	// Remove the app-logs subtree only on a SUCCESSFUL uninstall. If this
+	// returns early (locked, follower, container teardown or DestroyVolume
+	// error) the app is still installed — keep its logs for diagnosis. A
+	// success-then-crash orphan is reaped at the next unlock.
+	defer func() {
+		if err == nil {
+			m.removeAppLogSubtree(instanceID)
+		}
+	}()
 
 	if err := m.ensureUnlocked(); err != nil {
 		return err
@@ -2459,10 +2471,10 @@ type dataVolumeSnapshotter interface {
 type dataVolumeRollbacker interface {
 	// RollbackDataVolume performs a LUKS-aware LV rename swap with full detach/attach cycle.
 	// Returns (renamesCommitted, snapshotPromoted, error):
-	//   (false, false, err) — failed before LV renames, no LV state change
-	//   (true, false, err)  — active→failed rename committed, but snapshot→active failed
-	//   (true, true, nil)   — fully succeeded (both renames + re-attach)
-	//   (true, true, err)   — both renames committed but re-attach failed
+	// (false, false, err) — failed before LV renames, no LV state change
+	// (true, false, err) — active→failed rename committed, but snapshot→active failed
+	// (true, true, nil) — fully succeeded (both renames + re-attach)
+	// (true, true, err) — both renames committed but re-attach failed
 	RollbackDataVolume(ctx context.Context, instanceID string, snapshotLVName, failedLVName string) (renamesCommitted, snapshotPromoted bool, err error)
 }
 

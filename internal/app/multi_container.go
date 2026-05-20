@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"piccolod/internal/container"
 	"piccolod/internal/fsutil"
 	"piccolod/internal/persistence"
+	"piccolod/internal/state/paths"
 )
 
 const (
@@ -124,6 +126,47 @@ func buildOriginalCmdFromSlices(entrypoint, cmd []string) []string {
 	return result
 }
 
+// appLogMaxSize caps each per-service k8s-file log via rotation, to bound
+// disk use. podman --log-opt max-size format.
+const appLogMaxSize = "10mb"
+
+// appLogsInstanceDir is the per-app subtree on the shared app-logs volume:
+// {app-logs mount}/{instanceID}. Per-service files live as {svcName}.log here.
+func appLogsInstanceDir(instanceID string) string {
+	return filepath.Join(paths.MountDir(persistence.AppLogsVolumeID), instanceID)
+}
+
+// appLogPathForService resolves the persistent log path for a service and
+// ensures its per-app subtree exists (0700, owned by the per-app credential so
+// conmon can write and piccolod-as-root can read; the ext4 mount root stays
+// traversable for the per-app user). Fail-safe: returns
+// ok=false when the app-logs volume is NOT mounted, so the caller omits LogPath
+// and conmon falls back to the default graphroot driver rather than writing to
+// the bare /piccolo-core mountpoint.
+func (m *AppManager) appLogPathForService(instanceID, svcName string, cred *syscall.Credential) (string, bool) {
+	mount := paths.MountDir(persistence.AppLogsVolumeID)
+	mounted, err := persistence.IsMountPoint(mount)
+	if err != nil {
+		log.Printf("WARN: app-logs mount check failed for %s/%s, using default log driver: %v", instanceID, svcName, err)
+		return "", false
+	}
+	if !mounted {
+		return "", false
+	}
+	dir := appLogsInstanceDir(instanceID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("WARN: create app-logs subtree %s failed, using default log driver: %v", dir, err)
+		return "", false
+	}
+	if cred != nil {
+		if err := container.ChownIfNeeded(dir, int(cred.Uid), int(cred.Gid)); err != nil {
+			log.Printf("WARN: chown app-logs subtree %s failed, using default log driver: %v", dir, err)
+			return "", false
+		}
+	}
+	return filepath.Join(dir, svcName+".log"), true
+}
+
 // buildServiceContainerSpec builds a container spec for a service container.
 // In rootfs mode (rootfsHandle + goldenImgConfig), the entrypoint strategy depends
 // on x-piccolo.mode: workspace gets boot.sh wrapping, service/unknown gets the
@@ -149,6 +192,14 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		RestartPolicy: appRestartPolicy(opts.appDef),
 		Labels:        piccoloLabels(opts.instanceID, opts.svcName, "service"),
 		SecurityOpt:   selinuxDisableLabel(), // overlay context= ignored in user namespaces
+	}
+
+	// Persist this service's logs on the shared app-logs volume so they survive
+	// container recreation and failed-update rollback. Fail-safe:
+	// only when the volume is mounted (else default driver, never /piccolo-core).
+	if logPath, ok := m.appLogPathForService(opts.instanceID, opts.svcName, opts.credential); ok {
+		spec.LogPath = logPath
+		spec.LogMaxSize = appLogMaxSize
 	}
 
 	// Apply block-native rootfs configuration (golden LV path) if provided

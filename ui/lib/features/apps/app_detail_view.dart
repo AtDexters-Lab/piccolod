@@ -12,6 +12,7 @@ import 'package:piccolo_os/features/apps/widgets/health_banner.dart';
 import 'package:piccolo_os/features/apps/widgets/local_fallback_overlay.dart';
 import 'package:piccolo_os/features/apps/workspace_terminal.dart';
 import 'package:piccolo_os/shared/widgets/app_icon.dart';
+import 'package:piccolo_os/shared/widgets/app_log_download.dart';
 import 'package:piccolo_os/shared/widgets/health_badge.dart';
 import 'package:piccolo_os/shared/widgets/log_stream_viewer.dart';
 import 'package:piccolo_os/shared/widgets/status_banner.dart';
@@ -875,9 +876,20 @@ class _AppDetailViewState extends State<AppDetailView>
   Widget _buildLogsTab() {
     return Padding(
       padding: const EdgeInsets.all(Spacing.lg),
-      child: LogStreamViewer(
-        appName: _app!.name,
-        serviceName: _selectedService,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Combined-across-services historic download. Does NOT
+          // take _selectedService — it always downloads all services.
+          AppLogDownload(appName: _app!.name),
+          const SizedBox(height: Spacing.lg),
+          Expanded(
+            child: LogStreamViewer(
+              appName: _app!.name,
+              serviceName: _selectedService,
+            ),
+          ),
+        ],
       ),
     );
   }

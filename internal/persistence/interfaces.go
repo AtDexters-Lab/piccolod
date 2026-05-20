@@ -17,6 +17,11 @@ type Service interface {
 	StorageAdapter() StorageAdapter
 	Consensus() ConsensusManager
 	ControlVolume() VolumeHandle
+	// AttachAppLogs ensures+attaches the singleton app-logs store on demand
+	// (used by first-setup, where the data pool is created after the initial
+	// unlock so the unlock-time attach found no pool). Idempotent; no-op when
+	// locked.
+	AttachAppLogs(ctx context.Context)
 	// Shutdown terminates background tasks and detaches mounted volumes.
 	Shutdown(ctx context.Context) error
 }
@@ -336,7 +341,19 @@ const (
 	VolumeClassControl     VolumeClass = "control"
 	VolumeClassApplication VolumeClass = "application"
 	VolumeClassEphemeral   VolumeClass = "ephemeral"
+	// VolumeClassAppLogs is the singleton store holding all apps' persistent
+	// service logs. Backed like an application volume (v3
+	// service-data thin LV on the data pool, per-volume LUKS2), but it is one
+	// shared volume keyed by AppLogsVolumeID, mounted for the whole unlocked
+	// session and disjoint from any app/container lifecycle.
+	VolumeClassAppLogs VolumeClass = "applogs"
 )
+
+// AppLogsVolumeID is the volume ID of the singleton app-logs store. Its LV
+// name is appLVPrefix+ID = "vol-logstore", deliberately outside the
+// "vol-app-{instanceID}" namespace that per-app volumes and RollbackDataVolume
+// operate on, so a per-app rollback can never rename it.
+const AppLogsVolumeID = "logstore"
 
 type ClusterMode string
 

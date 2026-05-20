@@ -23,7 +23,10 @@ var appNameRegex = regexp.MustCompile(`^[a-z][a-z0-9]{0,15}$`)
 // Non-primary listener names are exempt (their derived hostname <listener>-<app> cannot collide).
 // Per RFC 20260130, all identity-level identifiers share the same reserved list.
 // __primary is the magic listener name marker and must not be used as an actual name.
-var ReservedNames = []string{"api", "www", "admin", "root", "system", "piccolo", "piccoloos", "__primary"}
+// "logstore" is the singleton app-logs volume ID, reserved as
+// defense-in-depth so a future change deriving state from the volume ID cannot
+// silently collide with an app of that name.
+var ReservedNames = []string{"api", "www", "admin", "root", "system", "piccolo", "piccoloos", "logstore", "__primary"}
 
 // ReservedAppNames is kept for backward compatibility but points to ReservedNames.
 // Deprecated: Use ReservedNames instead.
@@ -215,19 +218,19 @@ func CheckCollisions(newLabels []string, existingLabels map[string]string) error
 // Returns the primary listener name and any validation error.
 //
 // Rules (per plan §D8 + RFC 20260519):
-//   - If a listener has Primary=true, it becomes primary (only one allowed).
-//     Permitted on every flow; manifest author's call.
-//   - If no explicit primary, auto-select the first host-routing-eligible
-//     listener (so that the apex DerivedHostLabel ("<app>") is bound to a
-//     listener that can actually serve it). Without this filter, a manifest
-//     declaring a raw-without-wrap listener before an HTTP listener would
-//     auto-pick the raw one, the apex would be orphaned, and the HTTP
-//     listener would silently demote to "<listener>-<app>".
-//   - If no listener is eligible (UDP-only app, all-raw-without-wrap),
-//     fall back to the first listener — its host label is empty regardless,
-//     but downstream code expects every app with listeners to have an
-//     identity listener for housekeeping.
-//   - Returns "" only when the listener list is empty.
+// - If a listener has Primary=true, it becomes primary (only one allowed).
+// Permitted on every flow; manifest author's call.
+// - If no explicit primary, auto-select the first host-routing-eligible
+// listener (so that the apex DerivedHostLabel ("<app>") is bound to a
+// listener that can actually serve it). Without this filter, a manifest
+// declaring a raw-without-wrap listener before an HTTP listener would
+// auto-pick the raw one, the apex would be orphaned, and the HTTP
+// listener would silently demote to "<listener>-<app>".
+// - If no listener is eligible (UDP-only app, all-raw-without-wrap),
+// fall back to the first listener — its host label is empty regardless,
+// but downstream code expects every app with listeners to have an
+// identity listener for housekeeping.
+// - Returns "" only when the listener list is empty.
 func ResolvePrimaryListener(listeners []api.AppListener) (string, error) {
 	var explicit string
 	for _, l := range listeners {
