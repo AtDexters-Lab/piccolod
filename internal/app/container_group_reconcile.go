@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"piccolod/internal/api"
@@ -164,14 +165,17 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		m.checkTupleHealth(ctx, state, appInst)
 	}
 
-	// Ensure all service rootfs volumes are attached before reconciling containers.
-	var blockNativeRootfsMap map[string]*rootfsMountInfo
+	// Service rootfs volumes attach lazily: sync.OnceValues memoizes the
+	// (map, error) so the first create/recreate consumer triggers the attach and
+	// the rest reuse it. A steady-state pass reaches no consumer and never
+	// attaches, probes, or logs. Constructed only on the running path —
+	// consumers are unreachable when this is nil (the !desiredRunning branches
+	// return first).
+	var rootfsMap func() (map[string]*rootfsMountInfo, error)
 	if desiredRunning {
-		var rootfsErr error
-		blockNativeRootfsMap, rootfsErr = m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
-		if rootfsErr != nil {
-			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
-		}
+		rootfsMap = sync.OnceValues(func() (map[string]*rootfsMountInfo, error) {
+			return m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
+		})
 	}
 
 	primary := primaryServiceFor(def, appInst)
@@ -242,6 +246,13 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			return nil
 		}
 
+		// Resolve rootfs handles before teardown: a transient attach error must
+		// not tear down the existing group before we can recreate it.
+		bn, rootfsErr := rootfsMap()
+		if rootfsErr != nil {
+			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+		}
+
 		// The anchor is missing but we desire the app running. Stop and remove all service containers
 		// so we can recreate the entire group (anchor + services) deterministically.
 		// Best-effort cleanup before recreation; errors logged but don't block.
@@ -254,7 +265,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		m.serviceManager.DeactivateApp(appInst.InstanceID)
 
 		m.setObservedStatusMessage(appInst.InstanceID, "Containers not found, recreating")
-		if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime, blockNativeRootfsMap); err != nil {
+		if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime, bn); err != nil {
 			m.handleStartupFailure(state, appInst)
 			return err
 		}
@@ -282,8 +293,12 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			// Container can't start — remove and recreate the entire group.
 			// Covers all stale state: reboot (wiped /run/), dead netns, corrupted runtime, etc.
 			m.setObservedStatusMessage(appInst.InstanceID, "Container start failed, recreating")
+			bn, rootfsErr := rootfsMap()
+			if rootfsErr != nil {
+				return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+			}
 			if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-				fmt.Sprintf("anchor start failed (%v), recreating container group", err), blockNativeRootfsMap); recoverErr != nil {
+				fmt.Sprintf("anchor start failed (%v), recreating container group", err), bn); recoverErr != nil {
 				m.handleStartupFailure(state, appInst)
 				return recoverErr
 			}
@@ -336,6 +351,10 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 
 		if cid == "" || !st.Exists {
 			m.setObservedStatusMessage(appInst.InstanceID, fmt.Sprintf("Recreating service '%s'", svcName))
+			bn, rootfsErr := rootfsMap()
+			if rootfsErr != nil {
+				return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+			}
 			opts := serviceContainerOptions{
 				layout:     layout,
 				appDef:     def,
@@ -345,7 +364,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				anchorID:   anchorID,
 				credential: runtime.Credential,
 			}
-			if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
+			if svcRootfs, ok := bn[svcName]; ok {
 				opts.rootfsHandle = &svcRootfs.handle
 				opts.goldenImgConfig = &svcRootfs.imgConfig
 			}
@@ -370,6 +389,10 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 					appInst.InstanceID, svcName, cid, err)
 				m.setObservedStatusMessage(appInst.InstanceID, "Service start failed, recreating")
 
+				bn, rootfsErr := rootfsMap()
+				if rootfsErr != nil {
+					return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+				}
 				opts := serviceContainerOptions{
 					layout:     layout,
 					appDef:     def,
@@ -379,7 +402,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 					anchorID:   anchorID,
 					credential: runtime.Credential,
 				}
-				if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
+				if svcRootfs, ok := bn[svcName]; ok {
 					opts.rootfsHandle = &svcRootfs.handle
 					opts.goldenImgConfig = &svcRootfs.imgConfig
 				}
@@ -422,6 +445,12 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			}
 			log.Printf("INFO: reconcile app %s: port bindings mismatch, recreating containers", appInst.InstanceID)
 			m.setObservedStatusMessage(appInst.InstanceID, "Port mismatch, recreating containers")
+			// Resolve rootfs handles before any teardown: a transient attach
+			// error must not leave the group half-torn-down.
+			bn, rootfsErr := rootfsMap()
+			if rootfsErr != nil {
+				return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+			}
 			// Best-effort cleanup before port-reconciliation recreation; errors logged but don't block.
 			if stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime); stopErr != nil {
 				log.Printf("WARN: reconcile app %s: port-reconcile stop failed: %v", appInst.InstanceID, stopErr)
@@ -430,7 +459,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				log.Printf("WARN: reconcile app %s: port-reconcile remove failed: %v", appInst.InstanceID, removeErr)
 			}
 			m.serviceManager.DeactivateApp(appInst.InstanceID)
-			if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime, blockNativeRootfsMap); err != nil {
+			if err := m.recreateMissingMultiContainer(ctx, state, appInst, def, layout, runtime, bn); err != nil {
 				m.handleStartupFailure(state, appInst)
 				return err
 			}
@@ -475,6 +504,13 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				log.Printf("INFO: reconcile app %s: backend unhealthy with running containers, likely stale DNAT — recreating with new ports (attempt %d)",
 					appInst.InstanceID, appInst.StartupAttempts+1)
 				m.setObservedStatusMessage(appInst.InstanceID, "Repairing stale network routes")
+				// Resolve rootfs handles before handleStartupFailure / teardown:
+				// a transient attach error must not escalate a running app to
+				// StatusError, nor tear the group down before recreate.
+				bn, rootfsErr := rootfsMap()
+				if rootfsErr != nil {
+					return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+				}
 				m.handleStartupFailure(state, appInst)
 				// Preserve the startup attempt counter across recreation.
 				// recreateMissingMultiContainer resets it on success, but for DNAT repair
@@ -482,7 +518,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				savedAttempts := appInst.StartupAttempts
 				savedFirstFailure := appInst.FirstStartupFailureAt
 				err := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-					"stale DNAT rules detected: backend unhealthy with running containers", blockNativeRootfsMap)
+					"stale DNAT rules detected: backend unhealthy with running containers", bn)
 				if err == nil {
 					appInst.StartupAttempts = savedAttempts
 					appInst.FirstStartupFailureAt = savedFirstFailure
