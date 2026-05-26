@@ -155,6 +155,7 @@ func TestRunTransactionalUpdateStopsOnTimeout(t *testing.T) {
 		WithStateDir(tmp),
 		WithRuntimeDir(filepath.Join(tmp, "run")),
 		WithSupportOverride(true),
+		WithFreeBytesFn(func(string) (uint64, error) { return 10 << 30, nil }),
 	)
 	if err != nil {
 		t.Fatalf("backend: %v", err)
@@ -226,7 +227,7 @@ func (fakeRunner) Run(ctx context.Context, name string, args ...string) (string,
 			return "", "", 3, nil
 		}
 		if len(args) > 0 && args[0] == "show" {
-			return "success\n0\nMon 2025-11-24 09:59:00 UTC", "", 0, nil
+			return "ActiveEnterTimestamp=Mon 2025-11-24 09:59:00 UTC\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=Mon 2025-11-24 09:59:01 UTC", "", 0, nil
 		}
 		return "", "", 0, nil
 	case "journalctl":
@@ -338,7 +339,7 @@ func (r *validationRunner) Run(ctx context.Context, name string, args ...string)
 			return "", "", 3, nil
 		}
 		if len(args) > 0 && args[0] == "show" {
-			return "success\n0\nMon 2025-11-24 09:59:00 UTC", "", 0, nil
+			return "ActiveEnterTimestamp=Mon 2025-11-24 09:59:00 UTC\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=Mon 2025-11-24 09:59:01 UTC", "", 0, nil
 		}
 		return "", "", 0, nil
 	case "snapper":

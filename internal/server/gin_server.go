@@ -1572,7 +1572,12 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Update manager (MicroOS transactional-update)
 	if s.updateManager == nil {
-		um, err := update.NewManager(update.WithCurrentVersion(s.version))
+		um, err := update.NewManager(
+			update.WithCurrentVersion(s.version),
+			update.WithHealthReporter(func(level health.Level, msg string) {
+				s.healthTracker.Setf("update", level, "%s", msg)
+			}),
+		)
 		if err != nil {
 			s.stopSecureLoopback(context.Background())
 			return nil, fmt.Errorf("update manager init: %w", err)

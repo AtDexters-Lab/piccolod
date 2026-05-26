@@ -14,7 +14,10 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"piccolod/internal/fsutil"
+	"piccolod/internal/health"
 	"piccolod/internal/state/paths"
 )
 
@@ -31,6 +34,23 @@ const (
 	// invalidate it at the Manager facade so post-action UI reflects the change.
 	statusSnapshotTTL     = 60 * time.Second
 	statusRefreshInterval = 30 * time.Second
+
+	// Auto-recovery circuit breaker: bound how often checkAndRecover may fire
+	// the agent-package fallback so a persistently-failing OS update can't loop
+	// and exhaust the disk with snapshots. The window re-arms on expiry, and a
+	// successful OS update (exit 0) resets it immediately.
+	maxAutoRecoveryPerWindow = 3
+	autoRecoveryWindow       = 24 * time.Hour
+
+	// minFreeBytesForRecovery is the free-space floor below which piccolod
+	// refuses to start a snapshot-creating update. It must exceed the peak
+	// transient footprint of a single transactional-update (download cache +
+	// new snapshot delta). The OS itself is ~0.9 GiB, so 2 GiB clears a
+	// worst-case dup with margin while leaving most of a 16 GiB disk usable.
+	// Tunable: raise on larger images.
+	minFreeBytesForRecovery = 2 << 30 // 2 GiB
+
+	recoveryLedgerFilename = "recovery.json"
 )
 
 var (
@@ -39,6 +59,7 @@ var (
 	ErrInvalidSnapshot          = errors.New("invalid snapshot id")
 	ErrTimeout                  = errors.New("transactional-update timed out")
 	ErrSnapshotValidationFailed = errors.New("staged snapshot missing critical components")
+	ErrInsufficientDisk         = errors.New("insufficient disk space for update")
 )
 
 // Status mirrors the public API shape and carries a meta section for richer data.
@@ -92,6 +113,23 @@ type microOSBackend struct {
 	statusCache         Status
 	statusCachedAt      time.Time
 	statusInvalidatedAt time.Time
+
+	// Auto-recovery circuit breaker, guarded by mu. In-memory is authoritative;
+	// it is mirrored best-effort to recoveryPath so a reboot-loop accumulates
+	// toward the cap. Under a read-only fs the mirror write fails harmlessly —
+	// the disk-headroom gate is the protection there.
+	recoveryPath            string
+	autoRecoveryCount       int
+	autoRecoveryWindowStart time.Time
+	lastHandledFailure      time.Time
+	lastHealthLevel         health.Level
+	lastHealthMsg           string
+
+	// setHealth escalates the "update" health key (nil => no-op). Injected to
+	// keep this package decoupled from the server. freeBytes probes free space
+	// (defaults to statfs); injectable for tests.
+	setHealth func(level health.Level, msg string)
+	freeBytes func(path string) (uint64, error)
 }
 
 // Option configures the MicroOS backend.
@@ -134,6 +172,17 @@ func WithCurrentVersion(v string) Option {
 // WithSnapshotsDir overrides the btrfs snapshots directory (default /.snapshots).
 func WithSnapshotsDir(dir string) Option {
 	return func(m *microOSBackend) { m.snapshotsDir = dir }
+}
+
+// WithHealthReporter injects a callback used to escalate the "update" health
+// key. Nil-safe: if unset, escalation is a no-op.
+func WithHealthReporter(fn func(level health.Level, msg string)) Option {
+	return func(m *microOSBackend) { m.setHealth = fn }
+}
+
+// WithFreeBytesFn overrides the free-space probe (used in tests).
+func WithFreeBytesFn(fn func(path string) (uint64, error)) Option {
+	return func(m *microOSBackend) { m.freeBytes = fn }
 }
 
 // NewManager constructs a Manager with an OS backend (MicroOS today).
@@ -218,6 +267,12 @@ func newMicroOSBackend(opts ...Option) (*microOSBackend, error) {
 		}
 		m.runtimeDir = alt
 	}
+
+	if m.freeBytes == nil {
+		m.freeBytes = statfsFree
+	}
+	m.recoveryPath = filepath.Join(filepath.Dir(m.statePath), recoveryLedgerFilename)
+	m.loadRecoveryLedger()
 
 	m.supported = m.overrideSupport || m.detectSupported()
 
@@ -459,59 +514,244 @@ func (m *microOSBackend) watchSnapshots(ctx context.Context) {
 }
 
 func (m *microOSBackend) checkAndRecover(ctx context.Context) {
-	// 1. Check if we are already running something
+	// 1. Already running something — nothing to do.
 	if m.isInProgress(ctx) {
 		return
 	}
 
-	// 2. Check system status
-	// Use a detached context for the check so we don't fail if the watch loop is cancelling (though mostly it shares life)
+	// 2. Sample current status.
 	status, err := m.readStatus(ctx)
 	if err != nil {
 		return
 	}
 
-	// 3. If update is pending (staged), we are good. User needs to reboot.
+	// 3. An update is staged awaiting reboot — a recovery candidate already
+	//    exists; firing again would stack snapshots. This is NOT a success
+	//    signal (a failed dup also stages a snapshot), so we do not reset the
+	//    breaker here.
 	if status.Pending {
 		return
 	}
 
-	// 4. Check Last Run result
-	// The map value is *lastRunInfo because readStatus populates it that way.
+	// 4. Did the last OS update fail? last_run reflects transactional-update.service
+	//    (the OS timer's unit) — the signal piccolod reacts to.
 	lastRun, ok := status.Meta["last_run"].(*lastRunInfo)
-	if !ok || lastRun == nil {
+	if !ok || lastRun == nil || lastRun.RanAt == nil {
 		return
 	}
-
-	// If success or unknown, do nothing
 	if lastRun.ExitCode == 0 {
+		// The OS update path is healthy again — clear the breaker and health.
+		m.resetAutoRecovery()
 		return
 	}
 
-	// 5. Check if we (or the user) already reacted to this failure.
-	if lastRun.RanAt == nil {
+	// 5. Already responded to this exact failed run? Our fallback runs as a
+	//    separate piccolo-tu-* unit and doesn't replace last_run, so without this
+	//    we'd re-fire for the same failure every tick until the cap.
+	if m.failureAlreadyHandled(*lastRun.RanAt) {
 		return
 	}
 
-	state := m.loadState()
-	if state != nil {
-		// If our last request was AFTER the system failure, we assume we responded.
-		if state.RequestedAt.After(*lastRun.RanAt) {
-			return
-		}
+	// 5b. Some transactional-update action already responded to this failed run
+	//     since it ran — a manual rollback/apply, or an auto-fallback recorded by
+	//     an older daemon before the ledger existed (the upgrade path most likely
+	//     to hit this). Those actions run as separate units and don't clear
+	//     last_run, so without this we'd fire on top of an operator's fix or
+	//     repeat a pre-ledger recovery. This is a best-effort, legacy-compatible
+	//     layer; the robust Equal-based dedup above (plus the breaker cap) is what
+	//     actually prevents a loop, so this timestamp compare can't reintroduce one.
+	if st := m.loadState(); st != nil && st.ExitCode == 0 &&
+		(st.LastAction == "apply" || st.LastAction == "rollback" || st.LastAction == "auto-fallback") &&
+		st.RequestedAt.After(*lastRun.RanAt) {
+		return
 	}
 
-	// 6. Trigger Fallback
-	// "auto-recovery": Update only the agent packages.
+	// 6. Reserve a slot in the rolling window before firing — atomically, so
+	//    concurrent ticks can't both slip past the cap. The window re-arms on
+	//    expiry, so this throttles rather than permanently disables. Stays at
+	//    LevelWarn (never LevelError): update health feeds the readiness probe,
+	//    and a boot-fatal status there can trigger a snapshot rollback — an
+	//    inability to auto-recover must not roll back an otherwise-healthy boot.
+	if !m.tryReserveAutoRecovery() {
+		m.escalateHealth(health.LevelWarn,
+			"OS auto-recovery paused after repeated failures; manual intervention may be required")
+		return
+	}
+
+	// 7. Fire the narrow agent-package fallback. The headroom gate inside
+	//    runTransactionalUpdate refuses (ErrInsufficientDisk) if the disk is low.
 	cmd := []string{
 		"transactional-update",
 		"--non-interactive",
 		"pkg", "update", "piccolo-os-support", "piccolod",
 	}
-	// Fire and forget (wait=false), but we log the start.
-	// We use "auto-fallback" as the action name to distinguish from user actions.
-	// This will update state.json, preventing a retry loop on the next tick (step 5).
-	_ = m.runTransactionalUpdate(ctx, cmd, "auto-fallback", "", false)
+	switch err := m.runTransactionalUpdate(ctx, cmd, "auto-fallback", "", false); {
+	case err == nil:
+		// Launched (async). Only a real launch creates a snapshot, so only here do
+		// we keep the reserved slot and mark this failure handled.
+		m.markFailureHandled(*lastRun.RanAt)
+		m.escalateHealth(health.LevelWarn, "attempting OS auto-recovery (agent packages)")
+	case errors.Is(err, ErrInsufficientDisk):
+		// Gate refused — no snapshot created; return the slot and leave the failure
+		// unhandled so recovery retries once space frees.
+		m.releaseAutoRecovery()
+		m.escalateHealth(health.LevelWarn,
+			"OS auto-recovery suspended: insufficient disk space; free space to allow updates")
+	default:
+		// ErrInProgress, or a transient launch failure (e.g. systemd/D-Bus): no
+		// snapshot was created and nothing was handled — return the slot so a
+		// failed launch can't exhaust the budget, and let a later tick retry.
+		m.releaseAutoRecovery()
+	}
+}
+
+// createsSnapshot reports whether an action produces a new btrfs snapshot (and
+// thus consumes disk). Rollback only repoints the default subvolume.
+func createsSnapshot(action string) bool {
+	return action == "apply" || action == "auto-fallback"
+}
+
+// tryReserveAutoRecovery atomically rolls the window if expired and, when the cap
+// has room, reserves a slot (increments) and returns true. Performing the cap
+// check and the increment under the same lock is what stops concurrent ticks from
+// both slipping past the cap. A reserved slot that does not result in a launch is
+// returned via releaseAutoRecovery.
+func (m *microOSBackend) tryReserveAutoRecovery() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.clock()
+	if m.autoRecoveryWindowStart.IsZero() || now.Sub(m.autoRecoveryWindowStart) > autoRecoveryWindow {
+		m.autoRecoveryWindowStart = now
+		m.autoRecoveryCount = 0
+	}
+	if m.autoRecoveryCount >= maxAutoRecoveryPerWindow {
+		return false
+	}
+	m.autoRecoveryCount++
+	m.persistLedgerLocked() // under m.mu so ledger writes can't reorder vs the count
+	return true
+}
+
+// releaseAutoRecovery rolls back a reservation when the fire did not launch
+// (a concurrent run won, or the disk gate refused) so it isn't charged to the
+// window.
+func (m *microOSBackend) releaseAutoRecovery() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.autoRecoveryCount > 0 {
+		m.autoRecoveryCount--
+	}
+	m.persistLedgerLocked()
+}
+
+// failureAlreadyHandled reports whether auto-recovery already responded to the
+// failed run identified by ranAt. Because our fallback runs as a separate
+// piccolo-tu-* unit, it does not replace the sampled transactional-update.service
+// run — so without this we would re-fire for the same failure on every tick.
+func (m *microOSBackend) failureAlreadyHandled(ranAt time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return !m.lastHandledFailure.IsZero() && m.lastHandledFailure.Equal(ranAt)
+}
+
+// markFailureHandled records (and persists) that we have launched recovery for
+// the failed run identified by ranAt, so later ticks don't re-fire for it.
+func (m *microOSBackend) markFailureHandled(ranAt time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastHandledFailure = ranAt
+	m.persistLedgerLocked()
+}
+
+// resetAutoRecovery clears the breaker after a verified-healthy update and lowers
+// the health key — but only if something actually changed, to avoid re-stamping.
+func (m *microOSBackend) resetAutoRecovery() {
+	m.mu.Lock()
+	changed := m.autoRecoveryCount != 0 || !m.autoRecoveryWindowStart.IsZero() || !m.lastHandledFailure.IsZero()
+	m.autoRecoveryCount = 0
+	m.autoRecoveryWindowStart = time.Time{}
+	m.lastHandledFailure = time.Time{}
+	if changed {
+		m.persistLedgerLocked()
+	}
+	m.mu.Unlock()
+	if changed {
+		m.escalateHealth(health.LevelOK, "OS updates healthy")
+	}
+}
+
+// escalateHealth reports an update-health transition via the injected reporter,
+// suppressing repeats (set-once) so a stuck condition doesn't re-stamp every tick.
+func (m *microOSBackend) escalateHealth(level health.Level, msg string) {
+	m.mu.Lock()
+	if m.setHealth == nil || (level == m.lastHealthLevel && msg == m.lastHealthMsg) {
+		m.mu.Unlock()
+		return
+	}
+	m.lastHealthLevel, m.lastHealthMsg = level, msg
+	report := m.setHealth
+	m.mu.Unlock()
+	report(level, msg)
+}
+
+type recoveryLedger struct {
+	Count            int       `json:"count"`
+	WindowStart      time.Time `json:"window_start"`
+	HandledFailureAt time.Time `json:"handled_failure_at"`
+}
+
+// loadRecoveryLedger restores the breaker counters at startup (best-effort).
+func (m *microOSBackend) loadRecoveryLedger() {
+	b, err := os.ReadFile(m.recoveryPath)
+	if err != nil {
+		return
+	}
+	var l recoveryLedger
+	if json.Unmarshal(b, &l) != nil {
+		return
+	}
+	// Clamp against a corrupt or tampered ledger: it can neither lift the cap nor
+	// (via a future window start that never elapses) permanently disable recovery.
+	if l.Count < 0 {
+		l.Count = 0
+	}
+	if l.Count > maxAutoRecoveryPerWindow {
+		l.Count = maxAutoRecoveryPerWindow
+	}
+	if l.WindowStart.After(m.clock()) {
+		l.WindowStart = time.Time{}
+	}
+	m.autoRecoveryCount = l.Count
+	m.autoRecoveryWindowStart = l.WindowStart
+	m.lastHandledFailure = l.HandledFailureAt
+}
+
+// persistLedgerLocked mirrors the breaker state to disk. The caller must hold
+// m.mu — keeping the write under the lock serializes ledger writes with the count
+// mutations so an older snapshot can't overwrite a newer one. Best-effort: a
+// failure under a read-only fs is harmless because the in-memory state stays
+// authoritative and the headroom gate is the protection in that state.
+func (m *microOSBackend) persistLedgerLocked() {
+	if m.recoveryPath == "" {
+		return
+	}
+	l := recoveryLedger{
+		Count:            m.autoRecoveryCount,
+		WindowStart:      m.autoRecoveryWindowStart,
+		HandledFailureAt: m.lastHandledFailure,
+	}
+	_ = os.MkdirAll(filepath.Dir(m.recoveryPath), 0o700)
+	_ = fsutil.AtomicWriteFile(m.recoveryPath, mustJSON(l), 0o600)
+}
+
+// statfsFree returns the bytes available to unprivileged writers on path's
+// filesystem (btrfs AVAIL is pool-wide).
+func statfsFree(path string) (uint64, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return 0, err
+	}
+	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
 
 // validateStagedSnapshot checks that the default (staged) snapshot contains
@@ -781,6 +1021,19 @@ func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []strin
 		return ErrInProgress
 	}
 
+	// Disk-headroom gate. Snapshot-creating updates (apply, auto-fallback) are
+	// refused when free space is below the floor one update needs to complete —
+	// this stops a runaway from filling the disk and preserves room for the OS
+	// timer's own recovery dup. Rollback is exempt: it repoints the default
+	// snapshot (creates nothing) and must run to escape a full disk. statfs is a
+	// pure read, so the gate holds even after the fs has gone read-only, and it
+	// runs before any persistent-pool write below.
+	if createsSnapshot(action) {
+		if free, err := m.freeBytes(m.snapshotsDir); err != nil || free < minFreeBytesForRecovery {
+			return ErrInsufficientDisk
+		}
+	}
+
 	unit := fmt.Sprintf("piccolo-tu-%s-%d", action, m.clock().Unix())
 	runCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
@@ -1044,23 +1297,39 @@ func (m *microOSBackend) pickRollbackTarget(ctx context.Context) string {
 }
 
 func (m *microOSBackend) lastRunInfo(ctx context.Context) *lastRunInfo {
-	stdout, _, _, err := m.runner.Run(ctx, "systemctl", "show", transactionalUpdateUnit, "-p", "Result", "-p", "ExecMainStatus", "-p", "ActiveEnterTimestamp", "--value")
+	// Parse by key (Key=Value), not by position: `systemctl show --value` does NOT
+	// emit properties in -p order, and an empty value shifts positional parsing —
+	// which previously made ExitCode always 0 and RanAt always nil on real devices.
+	//
+	// Use ExecMainExitTimestamp (when the main process exited) for RanAt, NOT
+	// ActiveEnterTimestamp: transactional-update.service is Type=oneshot, and a
+	// FAILED dup goes activating->failed without ever becoming "active", so
+	// ActiveEnterTimestamp is EMPTY exactly on failure (verified on-device) — the
+	// one case we must detect. ExecMainExitTimestamp is set on both success and
+	// failure. isInProgress already gates out a still-running unit, so the main
+	// process has exited by the time we read this.
+	stdout, _, _, err := m.runner.Run(ctx, "systemctl", "show", transactionalUpdateUnit, "-p", "Result", "-p", "ExecMainStatus", "-p", "ExecMainExitTimestamp")
 	if err != nil || strings.TrimSpace(stdout) == "" {
 		return nil
 	}
-	lines := splitNonEmpty(strings.Split(strings.TrimSpace(stdout), "\n"))
 	info := &lastRunInfo{}
-	if len(lines) > 0 {
-		info.Result = strings.TrimSpace(lines[0])
-	}
-	if len(lines) > 1 {
-		if code, err := strconv.Atoi(strings.TrimSpace(lines[1])); err == nil {
-			info.ExitCode = code
+	for _, line := range strings.Split(stdout, "\n") {
+		key, val, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
 		}
-	}
-	if len(lines) > 2 {
-		if ts := parseSystemdTime(lines[2]); ts != nil {
-			info.RanAt = ts
+		val = strings.TrimSpace(val)
+		switch key {
+		case "Result":
+			info.Result = val
+		case "ExecMainStatus":
+			if code, err := strconv.Atoi(val); err == nil {
+				info.ExitCode = code
+			}
+		case "ExecMainExitTimestamp":
+			if ts := parseSystemdTime(val); ts != nil {
+				info.RanAt = ts
+			}
 		}
 	}
 	logs := m.readJournal(ctx, transactionalUpdateUnit)
@@ -1120,13 +1389,35 @@ func parseSystemdTime(val string) *time.Time {
 	if val == "" || strings.EqualFold(val, "n/a") {
 		return nil
 	}
+	// Resolve the zone abbreviation systemd emits (e.g. "IST") against the device's
+	// LIVE local zone, not Go's time.Local: time.Local is cached at process start
+	// and never refreshed, but piccolod changes the zone at runtime via
+	// `timedatectl set-timezone` with no restart, so a cached time.Local would skew
+	// the parsed instant by the true UTC offset.
+	loc := systemLocation()
 	layouts := []string{time.RFC3339, "Mon 2006-01-02 15:04:05 MST", "Mon 2006-01-02 15:04:05 -0700"}
 	for _, layout := range layouts {
-		if ts, err := time.Parse(layout, val); err == nil {
+		if ts, err := time.ParseInLocation(layout, val, loc); err == nil {
 			return &ts
 		}
 	}
 	return nil
+}
+
+// systemLocation resolves the device's current local zone by reading
+// /etc/localtime live (mirrors internal/sysconfig/timezone.Manager.Get and the
+// app-handler probe). Read fresh each call so a runtime `timedatectl` change is
+// honored without a piccolod restart. Falls back to time.Local. Overridable in tests.
+var systemLocation = func() *time.Location {
+	if target, err := filepath.EvalSymlinks("/etc/localtime"); err == nil {
+		const prefix = "/usr/share/zoneinfo/"
+		if idx := strings.Index(target, prefix); idx != -1 {
+			if loc, err := time.LoadLocation(target[idx+len(prefix):]); err == nil {
+				return loc
+			}
+		}
+	}
+	return time.Local
 }
 
 func resultFromExit(code int) string {

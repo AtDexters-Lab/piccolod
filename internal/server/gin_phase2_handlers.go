@@ -85,16 +85,18 @@ func (s *GinServer) handleOSUpdateRollback(c *gin.Context) {
 }
 
 func (s *GinServer) respondUpdateError(c *gin.Context, err error) {
-	switch err {
-	case update.ErrUnsupported:
+	switch {
+	case errors.Is(err, update.ErrUnsupported):
 		c.JSON(http.StatusNotImplemented, gin.H{"error": err.Error()})
-	case update.ErrInProgress:
+	case errors.Is(err, update.ErrInProgress):
 		c.Header("Retry-After", "30")
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
-	case update.ErrInvalidSnapshot:
+	case errors.Is(err, update.ErrInvalidSnapshot):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-	case update.ErrTimeout:
+	case errors.Is(err, update.ErrTimeout):
 		c.JSON(http.StatusGatewayTimeout, gin.H{"error": err.Error()})
+	case errors.Is(err, update.ErrInsufficientDisk):
+		c.JSON(http.StatusInsufficientStorage, gin.H{"error": "Not enough free disk space to install the update. Free up space and try again."})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}
