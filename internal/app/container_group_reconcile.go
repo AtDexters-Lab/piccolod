@@ -709,40 +709,44 @@ func (m *AppManager) removeContainersForMultiApp(ctx context.Context, appInst *A
 	primary := primaryServiceFor(def, appInst)
 	order, _ := serviceStartOrder(def.Services)
 	var errs []error
+	remove := func(label, id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if err := m.containerManager.StopContainer(ctx, runtime, id); err != nil {
+			var notFound *container.ContainerNotFoundError
+			if !errors.As(err, &notFound) {
+				log.Printf("WARN: remove %s: failed to stop container %s: %v", label, id, err)
+			}
+		}
+		if err := m.containerManager.RemoveContainer(ctx, runtime, id); err != nil {
+			var notFound *container.ContainerNotFoundError
+			if !errors.As(err, &notFound) {
+				errs = append(errs, fmt.Errorf("remove %s: %w", label, err))
+			}
+		}
+	}
 
 	for i := len(order) - 1; i >= 0; i-- {
 		svcName := order[i]
 		stored := strings.TrimSpace(appInst.Containers[svcName])
 		if stored != "" {
-			if err := m.containerManager.RemoveContainer(ctx, runtime, stored); err != nil {
-				var notFound *container.ContainerNotFoundError
-				if !errors.As(err, &notFound) {
-					errs = append(errs, fmt.Errorf("remove %s: %w", svcName, err))
-				}
-			}
+			remove(svcName, stored)
 		}
 		name := containerNameForService(appInst.InstanceID, svcName, primary)
 		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" && id != stored {
-			if err := m.containerManager.RemoveContainer(ctx, runtime, id); err != nil {
-				var notFound *container.ContainerNotFoundError
-				if !errors.As(err, &notFound) {
-					errs = append(errs, fmt.Errorf("remove %s (resolved): %w", svcName, err))
-				}
-			}
+			remove(svcName+" (resolved)", id)
 		}
 	}
 	anchorID := strings.TrimSpace(appInst.NetworkAnchorID)
-	if anchorID == "" {
-		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, networkAnchorContainerName(appInst.InstanceID)); err == nil {
-			anchorID = id
-		}
-	}
 	if anchorID != "" {
-		if err := m.containerManager.RemoveContainer(ctx, runtime, anchorID); err != nil {
-			var notFound *container.ContainerNotFoundError
-			if !errors.As(err, &notFound) {
-				errs = append(errs, fmt.Errorf("remove anchor: %w", err))
-			}
+		remove("anchor", anchorID)
+	}
+	if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, networkAnchorContainerName(appInst.InstanceID)); err == nil {
+		id = strings.TrimSpace(id)
+		if id != "" && id != anchorID {
+			remove("anchor (resolved)", id)
 		}
 	}
 	return errors.Join(errs...)

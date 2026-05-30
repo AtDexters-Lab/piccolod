@@ -26,12 +26,12 @@ import (
 )
 
 const (
-	goldenLVPrefix       = "golden-"
-	workspaceLVPrefix    = "ws-"
-	svcRootfsLVPrefix    = "svc-rootfs-"
-	flattenSentinelFile  = ".piccolo_flatten_incomplete"
-	imageConfigFile      = "image-config.json"
-	defaultGoldenLVSize  = 10 << 30 // 10 GiB
+	goldenLVPrefix      = "golden-"
+	workspaceLVPrefix   = "ws-"
+	svcRootfsLVPrefix   = "svc-rootfs-"
+	flattenSentinelFile = ".piccolo_flatten_incomplete"
+	imageConfigFile     = "image-config.json"
+	defaultGoldenLVSize = 10 << 30 // 10 GiB
 
 	btrfsRootfsMountOpts = "compress=zstd:1,discard=async,noatime"
 
@@ -187,6 +187,11 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 		success    bool
 	)
 	defer func() {
+		if success {
+			m.nudgeVolumeCreation()
+		}
+	}()
+	defer func() {
 		// Use a detached context for cleanup — the caller's ctx may be cancelled.
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -297,7 +302,6 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
 		return "", fmt.Errorf("write golden metadata: %w", err)
 	}
-	m.nudgeVolumeCreation()
 
 	// Remove sentinel (cleanup only — reconcile checks FlattenComplete, not sentinel).
 	_ = os.Remove(sentinelPath)
@@ -430,7 +434,6 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 		m.lvMgr.RemoveThinLV(ctx, snapshotName)
 		return RootfsHandle{}, fmt.Errorf("write metadata: %w", err)
 	}
-	m.nudgeVolumeCreation()
 
 	// Acquire the per-volume transition lock and route through the same
 	// reconciler-shaped attach path AttachRootfs uses. This
@@ -451,6 +454,7 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 		return RootfsHandle{}, err
 	}
 
+	m.nudgeVolumeCreation()
 	return handle, nil
 }
 
@@ -527,7 +531,6 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 		m.lvMgr.RemoveThinLV(ctx, cloneVolumeID)
 		return RootfsHandle{}, fmt.Errorf("write clone metadata: %w", err)
 	}
-	m.nudgeVolumeCreation()
 
 	// Per-volume transition lock + reconciler-shaped attach —
 	// see createRootfsFromGolden for rationale.
@@ -543,6 +546,7 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 		return RootfsHandle{}, err
 	}
 
+	m.nudgeVolumeCreation()
 	return handle, nil
 }
 
@@ -691,8 +695,8 @@ type liveResizeSpec struct {
 //   - Attached            → mapper + fs resize
 //   - Detached            → LV-only (LUKS+fs converge on next attach)
 //   - any other state     → refuse the resize; auto-grow's next cycle
-//                           or admin retry observes the now-clearer
-//                           kernel state and tries again.
+//     or admin retry observes the now-clearer
+//     kernel state and tries again.
 //
 // PartialMapperOnly is refused on purpose: the AttachState enum doesn't
 // distinguish "mapper open, raw fs not mounted" (the mapper-only sub-

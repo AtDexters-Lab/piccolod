@@ -131,6 +131,82 @@ paths:
       responses:
         '200': { description: OK }
         '409': { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+  /apps/{name}/manifest/configure:
+    post:
+      summary: Prepare a custom app manifest update input schema
+      description: |
+        Parses a candidate manifest template for an already-installed custom
+        service-mode app and returns the update-mode input schema. Previous
+        custom install inputs are not remembered; password/generated values
+        must be re-entered or explicitly regenerated.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManifestUpdateConfigureRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResponseManifestUpdateConfigure' }
+        '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '409': { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+  /apps/{name}/manifest/dry-run:
+    post:
+      summary: Dry-run a custom app manifest update
+      description: |
+        Renders the candidate manifest with supplied inputs, enforces the v1
+        topology-neutral policy, and returns a redacted change summary plus an
+        opaque dry-run token when the update is applicable.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManifestUpdateDryRunRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResponseManifestUpdateResult' }
+        '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '409': { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+  /apps/{name}/manifest/update:
+    post:
+      summary: Apply a confirmed custom app manifest update
+      description: |
+        Applies the exact rendered candidate identified by the dry-run token.
+        V1 recreates containers with existing images/rootfs for structural
+        non-image changes and performs manifest/runtime-only failure recovery.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManifestUpdateApplyRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResponseManifestUpdateResult' }
+        '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '409': { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
   /apps/{name}/revert:
     post:
       summary: Revert an app to previous version
@@ -1154,6 +1230,117 @@ components:
       properties:
         data: { $ref: '#/components/schemas/App' }
         message: { type: string }
+    ManifestUpdateConfigureRequest:
+      type: object
+      required: [app_definition]
+      properties:
+        app_definition: { type: string }
+    ManifestUpdateDryRunRequest:
+      type: object
+      required: [app_definition]
+      properties:
+        app_definition: { type: string }
+        inputs:
+          type: object
+          additionalProperties: true
+        regenerate_inputs:
+          type: array
+          items: { type: string }
+    ManifestUpdateApplyRequest:
+      type: object
+      required: [dry_run_token]
+      properties:
+        app_definition: { type: string }
+        inputs:
+          type: object
+          additionalProperties: true
+        regenerate_inputs:
+          type: array
+          items: { type: string }
+        base_manifest_hash: { type: string }
+        runtime_fingerprint: { type: string }
+        dry_run_token: { type: string }
+    ResponseManifestUpdateConfigure:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            inputs:
+              type: object
+              additionalProperties: { $ref: '#/components/schemas/AppInput' }
+            fields:
+              type: array
+              items: { $ref: '#/components/schemas/ManifestUpdateInputField' }
+            secret_generated_preflight:
+              type: array
+              items: { type: string }
+            eligible: { type: boolean }
+            blocking_reason: { type: string, nullable: true }
+        message: { type: string }
+    ResponseManifestUpdateResult:
+      type: object
+      properties:
+        data: { $ref: '#/components/schemas/ManifestUpdateResult' }
+        message: { type: string }
+    AppInput:
+      type: object
+      properties:
+        type: { type: string }
+        label: { type: string }
+        description: { type: string }
+        default: {}
+        required: { type: boolean }
+        generate: { type: boolean }
+        validation:
+          type: object
+          properties:
+            regex: { type: string }
+            message: { type: string }
+    ManifestUpdateInputField:
+      type: object
+      properties:
+        name: { type: string }
+        type: { type: string }
+        provenance:
+          type: string
+          enum: [Locked current value, Re-enter required, New manifest default, Entered now]
+        required: { type: boolean }
+        generate: { type: boolean }
+        locked: { type: boolean }
+    ManifestUpdateSummary:
+      type: object
+      properties:
+        will_change:
+          type: array
+          items: { type: string }
+        will_restart:
+          type: array
+          items: { type: string }
+        will_preserve:
+          type: array
+          items: { type: string }
+        expected_interruption:
+          type: array
+          items: { type: string }
+        rejected:
+          type: array
+          items: { type: string }
+    ManifestUpdateResult:
+      type: object
+      properties:
+        instance_id: { type: string }
+        base_manifest_hash: { type: string }
+        runtime_fingerprint: { type: string }
+        dry_run_token: { type: string, nullable: true }
+        rendered_app_id: { type: string }
+        diff_kind:
+          type: string
+          enum: [none, oidc_library_only, structural_no_image, image_only, structural_with_image, unknown]
+        applicable: { type: boolean }
+        blocking_reason: { type: string, nullable: true }
+        metadata_only: { type: boolean }
+        summary: { $ref: '#/components/schemas/ManifestUpdateSummary' }
     ExportResponse:
       type: object
       properties:

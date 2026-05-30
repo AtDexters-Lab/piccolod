@@ -77,6 +77,24 @@ curl -X POST /api/v1/apps \
   --data-binary @app.yaml
 ```
 
+### Custom App Manifest Updates
+
+Installed custom service-mode apps can apply topology-neutral YAML wiring
+changes without uninstalling. The update flow is explicit: prepare the
+manifest, re-enter or regenerate any password/generated inputs, dry-run the
+diff, then apply the confirmed candidate.
+
+V1 supports existing-service environment changes and additive storage mounts
+against the same service images, rootfs volumes, listener topology, and app
+identity. It rejects catalog-backed apps, disabled apps, workspace apps, image
+reference changes, listener/auth changes, service additions/removals, storage
+renames/removals, resource/app_config/auth/healthcheck changes, service-level
+OIDC clients, and init-script drift.
+
+For apps that also need new image bits, run the image update path first while
+keeping manifest image references stable, then apply the custom manifest YAML
+for non-image wiring.
+
 ## Development
 
 The app platform is implemented in the `piccolod` daemon using:

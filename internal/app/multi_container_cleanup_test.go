@@ -89,3 +89,70 @@ func TestStopRemoveContainersForMultiApp_UsesNamesWhenIDsStale(t *testing.T) {
 		t.Fatalf("expected db container to be removed")
 	}
 }
+
+func TestRemoveContainersForMultiApp_StopsRunningContainersAndResolvesAnchor(t *testing.T) {
+	tempDir := t.TempDir()
+
+	mock := NewMockContainerManager()
+	mock.removeRunningError = true
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("NewAppManager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	ctx := context.Background()
+	layout, err := mgr.ensureAppVolumeLayout(ctx, "demo")
+	if err != nil {
+		t.Fatalf("ensureAppVolumeLayout: %v", err)
+	}
+	runtime, err := mgr.podmanRuntimeForApp("demo", layout, ModeService)
+	if err != nil {
+		t.Fatalf("podmanRuntimeForApp: %v", err)
+	}
+
+	def := &api.AppDefinition{
+		Listeners: []api.AppListener{
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+		},
+		PrimaryService: "main",
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest", BindPorts: []int{8080}},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	SetDefaults(def)
+
+	mainCID, err := mock.CreateContainer(ctx, runtime, container.ContainerCreateSpec{Name: "demo", Image: "alpine:latest"})
+	if err != nil {
+		t.Fatalf("create main container: %v", err)
+	}
+	anchorCID, err := mock.CreateContainer(ctx, runtime, container.ContainerCreateSpec{Name: "demo__netns__", Image: "pause:latest"})
+	if err != nil {
+		t.Fatalf("create anchor container: %v", err)
+	}
+	_ = mock.StartContainer(ctx, runtime, mainCID)
+	_ = mock.StartContainer(ctx, runtime, anchorCID)
+
+	appInst := &AppInstance{
+		InstanceID:      "demo",
+		Status:          StatusRunning,
+		PrimaryService:  "main",
+		NetworkAnchorID: "deadbeefdeadbeef",
+		Containers: map[string]string{
+			"main": mainCID,
+		},
+		Definition: def,
+	}
+
+	if err := mgr.removeContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
+		t.Fatalf("removeContainersForMultiApp: %v", err)
+	}
+	if _, err := mock.ResolveContainerIDByName(ctx, runtime, "demo"); err == nil {
+		t.Fatalf("expected main container to be removed")
+	}
+	if _, err := mock.ResolveContainerIDByName(ctx, runtime, "demo__netns__"); err == nil {
+		t.Fatalf("expected anchor container to be removed")
+	}
+}

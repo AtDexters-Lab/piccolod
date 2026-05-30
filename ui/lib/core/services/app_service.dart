@@ -7,7 +7,6 @@ import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 
 class AppService {
-
   AppService(this._client);
   final ApiClient _client;
 
@@ -75,7 +74,8 @@ class AppService {
     var list = <dynamic>[];
     if (data is Map<dynamic, dynamic>) {
       final dataWrapper = data['data'];
-      if (dataWrapper is Map<dynamic, dynamic> && dataWrapper['categories'] is List<dynamic>) {
+      if (dataWrapper is Map<dynamic, dynamic> &&
+          dataWrapper['categories'] is List<dynamic>) {
         list = dataWrapper['categories'] as List<dynamic>;
       } else if (data['categories'] is List<dynamic>) {
         list = data['categories'] as List<dynamic>;
@@ -125,23 +125,34 @@ class AppService {
 
     final appJson = json['app'];
     final app = App.fromJson(
-      appJson is Map<dynamic, dynamic> ? Map<String, dynamic>.from(appJson) : <String, dynamic>{},
+      appJson is Map<dynamic, dynamic>
+          ? Map<String, dynamic>.from(appJson)
+          : <String, dynamic>{},
     );
 
     final rawListeners = json['listeners'] ?? json['services'];
-    final listeners = (rawListeners is List<dynamic> ? rawListeners : const <dynamic>[])
-        .whereType<Map<dynamic, dynamic>>()
-        .map((e) => ServiceEndpoint.fromJson(Map<String, dynamic>.from(e)))
-        .toList();
+    final listeners =
+        (rawListeners is List<dynamic> ? rawListeners : const <dynamic>[])
+            .whereType<Map<dynamic, dynamic>>()
+            .map((e) => ServiceEndpoint.fromJson(Map<String, dynamic>.from(e)))
+            .toList();
 
     final rawContainers = json['containers'];
-    final containers = (rawContainers is List<dynamic> ? rawContainers : const <dynamic>[])
-        .whereType<Map<dynamic, dynamic>>()
-        .map((e) => AppContainerStatus.fromJson(Map<String, dynamic>.from(e)))
-        .toList();
+    final containers =
+        (rawContainers is List<dynamic> ? rawContainers : const <dynamic>[])
+            .whereType<Map<dynamic, dynamic>>()
+            .map(
+              (e) => AppContainerStatus.fromJson(Map<String, dynamic>.from(e)),
+            )
+            .toList();
 
     final snapshotAvailable = json['snapshot_available'] == true;
-    return AppDetail(app: app, listeners: listeners, containers: containers, snapshotAvailable: snapshotAvailable);
+    return AppDetail(
+      app: app,
+      listeners: listeners,
+      containers: containers,
+      snapshotAvailable: snapshotAvailable,
+    );
   }
 
   Future<List<ServiceEndpoint>> getAppServices(String name) async {
@@ -174,7 +185,11 @@ class AppService {
   Future<void> updateApp(String name, {String? taskId}) async {
     try {
       await _client
-          .post('/api/v1/apps/$name/update', body: {}, headers: _taskHeaders(taskId))
+          .post(
+            '/api/v1/apps/$name/update',
+            body: {},
+            headers: _taskHeaders(taskId),
+          )
           .timeout(const Duration(seconds: 10));
     } on TimeoutException {
       debugPrint('updateApp: POST timed out (expected for image pulls)');
@@ -186,10 +201,16 @@ class AppService {
   Future<void> rollbackApp(String name, {String? taskId}) async {
     try {
       await _client
-          .post('/api/v1/apps/$name/rollback', body: {}, headers: _taskHeaders(taskId))
+          .post(
+            '/api/v1/apps/$name/rollback',
+            body: {},
+            headers: _taskHeaders(taskId),
+          )
           .timeout(const Duration(seconds: 10));
     } on TimeoutException {
-      debugPrint('rollbackApp: POST timed out (expected for slow container stops)');
+      debugPrint(
+        'rollbackApp: POST timed out (expected for slow container stops)',
+      );
     } on ClientException catch (e) {
       debugPrint('rollbackApp: connection closed (expected): $e');
     }
@@ -232,14 +253,77 @@ class AppService {
     }
     final data = await _client.post('/api/v1/apps/configure', body: body);
     final rawData = (data as Map<String, dynamic>)['data'];
-    return rawData is Map<dynamic, dynamic> ? Map<String, dynamic>.from(rawData) : <String, dynamic>{};
+    return rawData is Map<dynamic, dynamic>
+        ? Map<String, dynamic>.from(rawData)
+        : <String, dynamic>{};
+  }
+
+  Future<ManifestUpdateConfigureResult> configureManifestUpdate(
+    String appId,
+    String yamlContent,
+  ) async {
+    final data = await _client.post(
+      '/api/v1/apps/$appId/manifest/configure',
+      body: {'app_definition': yamlContent},
+    );
+    final rawData = (data as Map<String, dynamic>)['data'];
+    return ManifestUpdateConfigureResult.fromJson(
+      rawData is Map<dynamic, dynamic>
+          ? Map<String, dynamic>.from(rawData)
+          : <String, dynamic>{},
+    );
+  }
+
+  Future<ManifestUpdateResult> dryRunManifestUpdate(
+    String appId,
+    String yamlContent,
+    Map<String, dynamic> inputs,
+    List<String> regenerateInputs,
+  ) async {
+    final data = await _client.post(
+      '/api/v1/apps/$appId/manifest/dry-run',
+      body: {
+        'app_definition': yamlContent,
+        'inputs': inputs,
+        'regenerate_inputs': regenerateInputs,
+      },
+    );
+    final rawData = (data as Map<String, dynamic>)['data'];
+    return ManifestUpdateResult.fromJson(
+      rawData is Map<dynamic, dynamic>
+          ? Map<String, dynamic>.from(rawData)
+          : <String, dynamic>{},
+    );
+  }
+
+  Future<ManifestUpdateResult> applyManifestUpdate(
+    String appId,
+    ManifestUpdateResult dryRun, {
+    String? taskId,
+  }) async {
+    final data = await _client.post(
+      '/api/v1/apps/$appId/manifest/update',
+      body: {
+        'base_manifest_hash': dryRun.baseManifestHash,
+        'runtime_fingerprint': dryRun.runtimeFingerprint,
+        'dry_run_token': dryRun.dryRunToken,
+      },
+      headers: _taskHeaders(taskId),
+    );
+    final rawData = (data as Map<String, dynamic>)['data'];
+    return ManifestUpdateResult.fromJson(
+      rawData is Map<dynamic, dynamic>
+          ? Map<String, dynamic>.from(rawData)
+          : <String, dynamic>{},
+    );
   }
 
   Future<App> installAppWithInputs(
     String yamlContent,
     Map<String, dynamic> inputs, {
     String? taskId,
-    String? catalogSource, // Tracks which catalog item this app was installed from
+    String?
+    catalogSource, // Tracks which catalog item this app was installed from
   }) async {
     final body = <String, dynamic>{
       'app_definition': yamlContent,
@@ -282,7 +366,9 @@ class AppService {
           .timeout(const Duration(seconds: 10));
     } on TimeoutException {
       // Expected for non-cached installs. Backend continues in background.
-      debugPrint('initiateInstall: POST timed out (expected for long installs)');
+      debugPrint(
+        'initiateInstall: POST timed out (expected for long installs)',
+      );
     } on ClientException catch (e) {
       // Connection closed (relay reconnect, tunnel drop, etc.). Backend
       // continues on its 30-min background context; progress tracked via WebSocket.
@@ -317,7 +403,9 @@ class AppService {
     Map<String, dynamic> response;
     if (data is Map<String, dynamic>) {
       if (data.containsKey('data') && data['data'] is Map<dynamic, dynamic>) {
-        response = Map<String, dynamic>.from(data['data'] as Map<dynamic, dynamic>);
+        response = Map<String, dynamic>.from(
+          data['data'] as Map<dynamic, dynamic>,
+        );
       } else {
         response = data;
       }

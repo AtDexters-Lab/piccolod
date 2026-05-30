@@ -2,13 +2,13 @@ import 'package:piccolo_os/core/models/app_status_event.dart';
 import 'package:piccolo_os/core/models/listener_health.dart';
 
 class App {
-
   App({
     required this.id,
     required this.name,
     required this.image,
     required this.type,
-    required this.status, this.mode = '',
+    required this.status,
+    this.mode = '',
     this.statusMessage = '',
     this.volumes = const [],
     this.environment = const {},
@@ -62,7 +62,9 @@ class App {
     if (environment.isEmpty && primarySvc != null) {
       final rawEnv = primarySvc['environment'];
       if (rawEnv is Map) {
-        environment = rawEnv.map((k, v) => MapEntry(k.toString(), v.toString()));
+        environment = rawEnv.map(
+          (k, v) => MapEntry(k.toString(), v.toString()),
+        );
       }
     }
 
@@ -137,8 +139,10 @@ class App {
   final String? containerId;
   final Map<String, dynamic> definition;
   final ListenerHealth? primaryListenerHealth;
-  final String catalogSource; // Tracks which catalog item this app was installed from
-  final String statusMessage; // Transient status context (e.g., "Re-pulling base image")
+  final String
+  catalogSource; // Tracks which catalog item this app was installed from
+  final String
+  statusMessage; // Transient status context (e.g., "Re-pulling base image")
 
   bool get isRunning => status.toLowerCase() == AppStatusEvent.statusRunning;
   bool get isStopped =>
@@ -189,7 +193,6 @@ class App {
 }
 
 class AppDetail {
-
   const AppDetail({
     required this.app,
     this.listeners = const [],
@@ -202,8 +205,153 @@ class AppDetail {
   final bool snapshotAvailable;
 }
 
-class AppContainerStatus {
+class ManifestUpdateConfigureResult {
+  const ManifestUpdateConfigureResult({
+    required this.inputs,
+    required this.fields,
+    required this.secretGeneratedPreflight,
+    required this.eligible,
+    this.blockingReason = '',
+  });
 
+  factory ManifestUpdateConfigureResult.fromJson(Map<String, dynamic> json) {
+    final rawInputs = json['inputs'];
+    final rawFields = json['fields'];
+    final rawPreflight = json['secret_generated_preflight'];
+    return ManifestUpdateConfigureResult(
+      inputs: rawInputs is Map<dynamic, dynamic>
+          ? Map<String, dynamic>.from(rawInputs)
+          : <String, dynamic>{},
+      fields: rawFields is List<dynamic>
+          ? rawFields
+                .whereType<Map<dynamic, dynamic>>()
+                .map(
+                  (e) => ManifestUpdateInputField.fromJson(
+                    Map<String, dynamic>.from(e),
+                  ),
+                )
+                .toList()
+          : const [],
+      secretGeneratedPreflight: rawPreflight is List<dynamic>
+          ? rawPreflight.map((e) => e.toString()).toList()
+          : const [],
+      eligible: json['eligible'] == true,
+      blockingReason: (json['blocking_reason'] ?? '').toString(),
+    );
+  }
+  final Map<String, dynamic> inputs;
+  final List<ManifestUpdateInputField> fields;
+  final List<String> secretGeneratedPreflight;
+  final bool eligible;
+  final String blockingReason;
+}
+
+class ManifestUpdateInputField {
+  const ManifestUpdateInputField({
+    required this.name,
+    required this.type,
+    required this.provenance,
+    required this.required,
+    required this.generate,
+    required this.locked,
+  });
+
+  factory ManifestUpdateInputField.fromJson(Map<String, dynamic> json) {
+    return ManifestUpdateInputField(
+      name: (json['name'] ?? '').toString(),
+      type: (json['type'] ?? '').toString(),
+      provenance: (json['provenance'] ?? '').toString(),
+      required: json['required'] == true,
+      generate: json['generate'] == true,
+      locked: json['locked'] == true,
+    );
+  }
+  final String name;
+  final String type;
+  final String provenance;
+  final bool required;
+  final bool generate;
+  final bool locked;
+}
+
+class ManifestUpdateSummary {
+  const ManifestUpdateSummary({
+    this.willChange = const [],
+    this.willRestart = const [],
+    this.willPreserve = const [],
+    this.expectedInterruption = const [],
+    this.rejected = const [],
+  });
+
+  factory ManifestUpdateSummary.fromJson(Map<String, dynamic> json) {
+    List<String> readList(String key) {
+      final raw = json[key];
+      return raw is List<dynamic>
+          ? raw.map((e) => e.toString()).toList()
+          : const [];
+    }
+
+    return ManifestUpdateSummary(
+      willChange: readList('will_change'),
+      willRestart: readList('will_restart'),
+      willPreserve: readList('will_preserve'),
+      expectedInterruption: readList('expected_interruption'),
+      rejected: readList('rejected'),
+    );
+  }
+  final List<String> willChange;
+  final List<String> willRestart;
+  final List<String> willPreserve;
+  final List<String> expectedInterruption;
+  final List<String> rejected;
+}
+
+class ManifestUpdateResult {
+  const ManifestUpdateResult({
+    required this.instanceId,
+    required this.baseManifestHash,
+    required this.runtimeFingerprint,
+    required this.diffKind,
+    required this.applicable,
+    required this.metadataOnly,
+    required this.summary,
+    this.dryRunToken = '',
+    this.renderedAppId = '',
+    this.blockingReason = '',
+  });
+
+  factory ManifestUpdateResult.fromJson(Map<String, dynamic> json) {
+    final rawSummary = json['summary'];
+    return ManifestUpdateResult(
+      instanceId: (json['instance_id'] ?? '').toString(),
+      baseManifestHash: (json['base_manifest_hash'] ?? '').toString(),
+      runtimeFingerprint: (json['runtime_fingerprint'] ?? '').toString(),
+      dryRunToken: (json['dry_run_token'] ?? '').toString(),
+      renderedAppId: (json['rendered_app_id'] ?? '').toString(),
+      diffKind: (json['diff_kind'] ?? '').toString(),
+      applicable: json['applicable'] == true,
+      blockingReason: (json['blocking_reason'] ?? '').toString(),
+      metadataOnly: json['metadata_only'] == true,
+      summary: rawSummary is Map<dynamic, dynamic>
+          ? ManifestUpdateSummary.fromJson(
+              Map<String, dynamic>.from(rawSummary),
+            )
+          : const ManifestUpdateSummary(),
+    );
+  }
+  final String instanceId;
+  final String baseManifestHash;
+  final String runtimeFingerprint;
+  final String dryRunToken;
+  final String renderedAppId;
+  final String diffKind;
+  final bool applicable;
+  final String blockingReason;
+  final bool metadataOnly;
+  final ManifestUpdateSummary summary;
+}
+
+class AppContainerStatus {
   const AppContainerStatus({
     required this.service,
     required this.containerId,
@@ -223,7 +371,6 @@ class AppContainerStatus {
 }
 
 class AppVolume {
-
   AppVolume({
     required this.containerPath,
     required this.hostPath,
@@ -243,7 +390,6 @@ class AppVolume {
 }
 
 class AppListener {
-
   AppListener({
     required this.name,
     required this.guestPort,
@@ -297,9 +443,7 @@ String classifyAccess(Map<String, dynamic>? auth) {
   if (rules is! List || rules.isEmpty) return 'private';
   if (rules.length == 1) {
     final rule = rules[0];
-    if (rule is Map &&
-        rule['path'] == '/' &&
-        rule['type'] == 'prefix') {
+    if (rule is Map && rule['path'] == '/' && rule['type'] == 'prefix') {
       if (rule['strategy'] == 'public') return 'public';
       if (rule['strategy'] == 'protected') return 'private';
     }
@@ -315,14 +459,15 @@ Map<String, dynamic> publicAuthPayload() => {
 };
 
 class ServiceEndpoint {
-
   ServiceEndpoint({
     required this.app,
     required this.name,
     required this.guestPort,
     required this.hostPort,
     required this.publicPort,
-    required this.flow, required this.protocol, this.remotePorts = const [],
+    required this.flow,
+    required this.protocol,
+    this.remotePorts = const [],
     this.remoteHost,
     this.localUrl,
     this.lanHostUrl,
@@ -400,11 +545,12 @@ class ServiceEndpoint {
   }
 
   // All remote URLs across all active portals (derived from remoteHosts, computed once)
-  late final List<String> remoteUrls = remoteHosts.map((h) => 'https://$h').toList();
+  late final List<String> remoteUrls = remoteHosts
+      .map((h) => 'https://$h')
+      .toList();
 }
 
 class CatalogItem {
-
   CatalogItem({
     required this.name,
     required this.description,
@@ -427,7 +573,8 @@ class CatalogItem {
       category: (json['category'] as String?) ?? 'Uncategorized',
       compatibility: json['compatibility'] as String?,
       maintainer: json['maintainer'] as String?,
-      tags: (json['tags'] as List<dynamic>?)?.whereType<String>().toList() ?? [],
+      tags:
+          (json['tags'] as List<dynamic>?)?.whereType<String>().toList() ?? [],
       sourceUrl: json['source_url'] as String?,
       template: json['template'] as String?,
     );
@@ -445,7 +592,6 @@ class CatalogItem {
 }
 
 class CatalogResponse {
-
   CatalogResponse({
     required this.apps,
     required this.page,
@@ -477,7 +623,6 @@ class CatalogResponse {
 
 /// Represents a container image search result from Docker Hub or other registries.
 class ImageSearchResult {
-
   ImageSearchResult({
     required this.name,
     required this.description,

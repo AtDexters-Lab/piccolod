@@ -94,6 +94,12 @@ type AppManager struct {
 	// concurrent /sync/trigger calls (AR-2). Guarded by syncStateMu.
 	syncInFlight map[string]bool
 	syncStateMu  sync.Mutex
+
+	// Server-side dry-run candidates for custom manifest update. The token
+	// exposed to clients is only an opaque handle; rendered YAML and generated
+	// values stay process-local until apply consumes or expires the entry.
+	manifestUpdateMu         sync.Mutex
+	manifestUpdateCandidates map[string]*manifestUpdateCandidate
 }
 
 var (
@@ -179,17 +185,18 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 	cleanStaleFlattenDirs()
 
 	mgr := &AppManager{
-		containerManager:      containerManager,
-		stateBaseDir:          base,
-		serviceManager:        serviceManager,
-		leadershipState:       make(map[string]cluster.Role),
-		lockReader:            lockReader,
-		mountVerifier:         defaultMountVerifier,
-		observedStatus:        make(map[string]string),
-		observedStatusMessage: make(map[string]string),
-		oidcHostname:          "piccolo.local",
-		runtimeUser:           *runtimeUser,
-		syncInFlight:          make(map[string]bool),
+		containerManager:         containerManager,
+		stateBaseDir:             base,
+		serviceManager:           serviceManager,
+		leadershipState:          make(map[string]cluster.Role),
+		lockReader:               lockReader,
+		mountVerifier:            defaultMountVerifier,
+		observedStatus:           make(map[string]string),
+		observedStatusMessage:    make(map[string]string),
+		oidcHostname:             "piccolo.local",
+		runtimeUser:              *runtimeUser,
+		syncInFlight:             make(map[string]bool),
+		manifestUpdateCandidates: make(map[string]*manifestUpdateCandidate),
 	}
 
 	return mgr, nil
@@ -1196,14 +1203,14 @@ func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*
 	testHome := "/tmp"
 	svc := services.NewServiceManager()
 	return &AppManager{
-		containerManager: containerManager,
-		stateBaseDir:     base,
-		serviceManager:   svc,
-		leadershipState:  make(map[string]cluster.Role),
-		mountVerifier:    testMountVerifier,
-		observedStatus:   make(map[string]string),
+		containerManager:      containerManager,
+		stateBaseDir:          base,
+		serviceManager:        svc,
+		leadershipState:       make(map[string]cluster.Role),
+		mountVerifier:         testMountVerifier,
+		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
-		oidcHostname: "piccolo.local",
+		oidcHostname:          "piccolo.local",
 		runtimeUser: container.RuntimeUser{
 			Credential: testCred,
 			HomeDir:    testHome,
@@ -1211,7 +1218,8 @@ func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*
 		credentialResolver: func(string) (*syscall.Credential, string, error) {
 			return testCred, testHome, nil
 		},
-		syncInFlight: make(map[string]bool),
+		syncInFlight:             make(map[string]bool),
+		manifestUpdateCandidates: make(map[string]*manifestUpdateCandidate),
 	}, nil
 }
 
@@ -1225,15 +1233,15 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 	testCred := &syscall.Credential{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
 	testHome := "/tmp"
 	return &AppManager{
-		containerManager: containerManager,
-		stateBaseDir:     base,
-		serviceManager:   serviceManager,
-		leadershipState:  make(map[string]cluster.Role),
-		lockReader:       lockReader,
-		mountVerifier:    testMountVerifier,
-		observedStatus:   make(map[string]string),
+		containerManager:      containerManager,
+		stateBaseDir:          base,
+		serviceManager:        serviceManager,
+		leadershipState:       make(map[string]cluster.Role),
+		lockReader:            lockReader,
+		mountVerifier:         testMountVerifier,
+		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
-		oidcHostname: "piccolo.local",
+		oidcHostname:          "piccolo.local",
 		runtimeUser: container.RuntimeUser{
 			Credential: testCred,
 			HomeDir:    testHome,
@@ -1241,7 +1249,8 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 		credentialResolver: func(string) (*syscall.Credential, string, error) {
 			return testCred, testHome, nil
 		},
-		syncInFlight: make(map[string]bool),
+		syncInFlight:             make(map[string]bool),
+		manifestUpdateCandidates: make(map[string]*manifestUpdateCandidate),
 	}, nil
 }
 
@@ -1333,6 +1342,7 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	manifestUpdateBlocked := m.recoverPendingManifestUpdates(ctx, state)
 
 	// Clean up orphaned per-app users on first reconciliation.
 	m.orphanCleanupOnce.Do(func() {
@@ -1350,6 +1360,9 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 			return
 		}
 		if appInst == nil || strings.TrimSpace(appInst.InstanceID) == "" {
+			continue
+		}
+		if manifestUpdateBlocked[appInst.InstanceID] {
 			continue
 		}
 		if err := m.reconcileApp(ctx, state, appInst); err != nil {

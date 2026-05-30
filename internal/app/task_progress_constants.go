@@ -7,6 +7,7 @@ const (
 	taskTypeUninstallApp    = "uninstall_app"
 	taskTypeUpdateListeners = "update_listeners"
 	taskTypeUpdateImage     = "update_image"
+	taskTypeUpdateManifest  = "update_manifest"
 	taskTypeRollbackApp     = "rollback_app"
 )
 
@@ -25,6 +26,9 @@ const (
 	taskPhaseStopping            = "stopping"
 	taskPhaseUpdatingServices    = "updating_services"
 	taskPhaseValidating          = "validating"
+	taskPhaseApplyingManifest    = "applying_manifest"
+	taskPhaseRestoringManifest   = "restoring_manifest"
+	taskPhaseRestoreFailed       = "restore_failed"
 
 	// Update-specific phases
 	taskPhaseSnapshotting   = "snapshotting"
@@ -34,7 +38,7 @@ const (
 	taskPhaseRunningInit = "running_init"
 
 	// Workspace disk phases
-	taskPhaseMountingWorkspace = "mounting_workspace"
+	taskPhaseMountingWorkspace   = "mounting_workspace"
 	taskPhaseUnmountingWorkspace = "unmounting_workspace"
 	taskPhaseInitializingDisk    = "initializing_disk"
 )

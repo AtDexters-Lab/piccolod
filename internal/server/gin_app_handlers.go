@@ -403,6 +403,98 @@ func (s *GinServer) handleGinAppConfigure(c *gin.Context) {
 	writeGinSuccess(c, def.Inputs, "Configuration schema prepared")
 }
 
+// handleGinAppManifestConfigure prepares the input schema for applying a new
+// YAML manifest to an already-installed custom app.
+func (s *GinServer) handleGinAppManifestConfigure(c *gin.Context) {
+	appName := c.Param("name")
+	var req struct {
+		AppDefinition string `json:"app_definition"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
+		writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
+		return
+	}
+	result, err := s.appManager.ConfigureCustomManifestUpdate(c.Request.Context(), appName, []byte(req.AppDefinition))
+	if err != nil {
+		if handleManifestUpdateError(c, err, "prepare manifest update") {
+			return
+		}
+		writeGinError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	resolveSystemDefaults(result.Inputs, s.buildSystemContext())
+	writeGinSuccess(c, result, "Manifest update configuration schema prepared")
+}
+
+// handleGinAppManifestDryRun validates and summarizes a custom app manifest
+// update without mutating app.yaml or runtime state.
+func (s *GinServer) handleGinAppManifestDryRun(c *gin.Context) {
+	appName := c.Param("name")
+	var req struct {
+		AppDefinition    string                 `json:"app_definition"`
+		Inputs           map[string]interface{} `json:"inputs"`
+		RegenerateInputs []string               `json:"regenerate_inputs"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
+		writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
+		return
+	}
+	result, err := s.appManager.DryRunCustomManifestUpdate(c.Request.Context(), app.ManifestUpdateRequest{
+		InstanceID:       appName,
+		RawTemplate:      []byte(req.AppDefinition),
+		Inputs:           req.Inputs,
+		RegenerateInputs: req.RegenerateInputs,
+		SystemContext:    s.buildInstallSystemContext(),
+	})
+	if err != nil {
+		if handleManifestUpdateError(c, err, "dry-run manifest update") {
+			return
+		}
+		writeGinError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeGinSuccess(c, result, "Manifest update dry run complete")
+}
+
+// handleGinAppManifestUpdate applies a previously confirmed custom app manifest
+// dry run. The dry-run token is an opaque server-side handle for the exact
+// rendered candidate.
+func (s *GinServer) handleGinAppManifestUpdate(c *gin.Context) {
+	appName := c.Param("name")
+	var req struct {
+		AppDefinition      string                 `json:"app_definition"`
+		Inputs             map[string]interface{} `json:"inputs"`
+		RegenerateInputs   []string               `json:"regenerate_inputs"`
+		BaseManifestHash   string                 `json:"base_manifest_hash"`
+		RuntimeFingerprint string                 `json:"runtime_fingerprint"`
+		DryRunToken        string                 `json:"dry_run_token"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.DryRunToken) == "" {
+		writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected dry_run_token")
+		return
+	}
+	updateCtx, cancel := s.opContext(c, 10*time.Minute)
+	defer cancel()
+	result, err := s.appManager.ApplyCustomManifestUpdate(updateCtx, app.ManifestUpdateRequest{
+		InstanceID:         appName,
+		RawTemplate:        []byte(req.AppDefinition),
+		Inputs:             req.Inputs,
+		RegenerateInputs:   req.RegenerateInputs,
+		SystemContext:      s.buildInstallSystemContext(),
+		BaseManifestHash:   req.BaseManifestHash,
+		RuntimeFingerprint: req.RuntimeFingerprint,
+		DryRunToken:        req.DryRunToken,
+	})
+	if err != nil {
+		if handleManifestUpdateError(c, err, "apply manifest update") {
+			return
+		}
+		writeGinError(c, http.StatusInternalServerError, "Manifest update failed: "+err.Error())
+		return
+	}
+	writeGinSuccess(c, result, "Manifest update applied")
+}
+
 // handleGinAppPreflight handles POST /api/v1/apps/preflight - validate manifest and report port claims
 func (s *GinServer) handleGinAppPreflight(c *gin.Context) {
 	def := s.parseAppDefinitionFromRequest(c)
@@ -1193,6 +1285,21 @@ func handleAppManagerError(c *gin.Context, err error, action string) bool {
 	}
 	if errors.Is(err, app.ErrSyncHostUnavailable) {
 		writeGinError(c, http.StatusServiceUnavailable, err.Error())
+		return true
+	}
+	return false
+}
+
+func handleManifestUpdateError(c *gin.Context, err error, action string) bool {
+	if handleAppManagerError(c, err, action) {
+		return true
+	}
+	if errors.Is(err, app.ErrManifestUpdateConflict) {
+		writeGinError(c, http.StatusConflict, err.Error())
+		return true
+	}
+	if errors.Is(err, app.ErrManifestUpdateRejected) {
+		writeGinError(c, http.StatusConflict, err.Error())
 		return true
 	}
 	return false

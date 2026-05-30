@@ -48,9 +48,9 @@ type volumeMetaV2 struct {
 	Type       string `json:"type"` // volumeTypeLUKSLoop or volumeTypeLUKSThinLV
 	WrappedKey string `json:"wrapped_key"`
 	Nonce      string `json:"nonce"`
-	LVName     string `json:"lv_name,omitempty"`     // luks-thinlv only
-	VGName     string `json:"vg_name,omitempty"`     // luks-thinlv only
-	LoopFile   string `json:"loop_file,omitempty"`   // luks-loop only
+	LVName     string `json:"lv_name,omitempty"`   // luks-thinlv only
+	VGName     string `json:"vg_name,omitempty"`   // luks-thinlv only
+	LoopFile   string `json:"loop_file,omitempty"` // luks-loop only
 	SizeBytes  int64  `json:"size_bytes"`
 	FSType     string `json:"fs_type"`
 }
@@ -95,7 +95,7 @@ type luksVolumeManager struct {
 
 	mu                  sync.Mutex
 	roleChecker         func(string, VolumeRole) bool
-	volumeCreationNudge func() // RFC 20260510 — invoked after EnsureVolume persists v3 metadata
+	volumeCreationNudge func() // RFC 20260510 — invoked after a v3 volume reaches stable creation success
 
 	// Golden LV management.
 	goldenLVs    map[string]*volumeMetaV3 // imageDigestShort → meta cache
@@ -103,7 +103,7 @@ type luksVolumeManager struct {
 	goldenMuLock sync.Mutex               // protects goldenMu map
 
 	// Workspace resize monitor.
-	wsResizeCancel   context.CancelFunc
+	wsResizeCancel       context.CancelFunc
 	volumeResizeCooldown map[string]time.Time // volumeID → last resize time
 
 	// Application-volume auto-grow scheduling (D-5a two-stage).
@@ -154,32 +154,33 @@ func NewLUKSVolumeManager(cfg LUKSVolumeManagerConfig) (*luksVolumeManager, erro
 		return nil, ErrMultiNodeUnsupportedForAttachTruth
 	}
 	return &luksVolumeManager{
-		run:          cfg.Run,
-		crypto:       cfg.Crypto,
-		bus:          cfg.Bus,
-		tmpfsDir:     "/run/piccolo",
-		lvMgr:        cfg.LVMgr,
-		poolMgr:      cfg.PoolMgr,
-		nbdSrv:       cfg.NBDSrv,
-		drbdMgr:      cfg.DRBDMgr,
-		flattenFn:    cfg.FlattenFn,
-		imageSizeFn:  cfg.ImageSizeFn,
-		loopVol:      NewLUKSLoopVolume(cfg.Run),
-		goldenLVs: make(map[string]*volumeMetaV3),
-		goldenMu:  make(map[string]*sync.Mutex),
-		volumeResizeCooldown:   make(map[string]time.Time),
-		appResizeSchedules: make(map[string]*appResizeSchedule),
+		run:                  cfg.Run,
+		crypto:               cfg.Crypto,
+		bus:                  cfg.Bus,
+		tmpfsDir:             "/run/piccolo",
+		lvMgr:                cfg.LVMgr,
+		poolMgr:              cfg.PoolMgr,
+		nbdSrv:               cfg.NBDSrv,
+		drbdMgr:              cfg.DRBDMgr,
+		flattenFn:            cfg.FlattenFn,
+		imageSizeFn:          cfg.ImageSizeFn,
+		loopVol:              NewLUKSLoopVolume(cfg.Run),
+		goldenLVs:            make(map[string]*volumeMetaV3),
+		goldenMu:             make(map[string]*sync.Mutex),
+		volumeResizeCooldown: make(map[string]time.Time),
+		appResizeSchedules:   make(map[string]*appResizeSchedule),
 	}, nil
 }
 
 // SetRoleChecker sets the function used to check if a volume operation
 // is permitted for a given role.
 // SetVolumeCreationNudge registers a callback invoked after a newly-created
-// v3 volume's metadata is persisted (RFC 20260510 §Volume-creation
-// atomicity). Lets the keyslot reconciler pick up the new volume on its
-// next pass without waiting for the operator's next /generate or password
-// change. nil-safe: if no callback is registered, volume creation
-// proceeds normally and the next reconciler signal picks up the volume.
+// v3 volume reaches its stable success state (metadata persisted and any
+// transient creation stack settled). Lets the keyslot reconciler pick up the
+// new volume on its next pass without waiting for the operator's next
+// /generate or password change. nil-safe: if no callback is registered,
+// volume creation proceeds normally and the next reconciler signal picks up
+// the volume.
 func (m *luksVolumeManager) SetVolumeCreationNudge(fn func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -251,7 +252,7 @@ func (m *luksVolumeManager) ReconcileAllVolumeStates() error {
 }
 
 // ReconcileOrphanLVs scans the LVM thin pool for LVs that have no corresponding
-// metadata in /piccolo-core/volumes/. This handles stale LVs left after an OS
+// metadata under the core-root volumes directory. This handles stale LVs left after an OS
 // reinstall (metadata on root disk is wiped, but LVs on the data partition persist).
 // Must be called after pool activation.
 func (m *luksVolumeManager) ReconcileOrphanLVs(ctx context.Context) error {
@@ -292,9 +293,9 @@ func (m *luksVolumeManager) ReconcileOrphanLVs(ctx context.Context) error {
 		}
 		if !parsed {
 			// Metadata unreadable — protect all possible LV names for this volume ID.
-			knownLVs[volID] = true                   // golden-*, ws-*, svc-rootfs-*
-			knownLVs[ephLVPrefix+volID] = true        // eph-*
-			knownLVs[appLVPrefix+volID] = true        // vol-*
+			knownLVs[volID] = true             // golden-*, ws-*, svc-rootfs-*
+			knownLVs[ephLVPrefix+volID] = true // eph-*
+			knownLVs[appLVPrefix+volID] = true // vol-*
 		}
 	}
 
@@ -812,7 +813,17 @@ func (m *luksVolumeManager) ensureServiceDataVolume(ctx context.Context, req Vol
 	if err := stack.Open(ctx); err != nil {
 		return VolumeHandle{}, fmt.Errorf("open device stack: %w", err)
 	}
-	defer stack.Close(ctx)
+	nudgeOnSuccess := false
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := stack.Close(closeCtx); err != nil {
+			log.Printf("WARN: failed to close device stack for %s after creation: %v", req.ID, err)
+		}
+		if nudgeOnSuccess {
+			m.nudgeVolumeCreation()
+		}
+	}()
 
 	// LUKS format with the shared master key (pool keyfile as passphrase).
 	topDev := stack.Top().Path()
@@ -836,17 +847,17 @@ func (m *luksVolumeManager) ensureServiceDataVolume(ctx context.Context, req Vol
 	// kskey_id for both slots: "unprovisioned" sentinel when no pending
 	// blob exists (operator initiates rotation later to populate), or the
 	// blob's key_id when a rotation is in flight (sub-case i — the
-	// post-write reconciler nudge will then provision this volume's slots
-	// against the captured passphrase). The post-write nudge happens at
-	// the EnsureVolume completion below so the reconciler picks up the
-	// just-stamped volume immediately.
+	// post-success reconciler nudge will then provision this volume's slots
+	// against the captured passphrase). The nudge happens after the
+	// transient device stack has closed so the reconciler does not race
+	// creation teardown.
 	meta := &volumeMetaV3{
-		Version:              metadataV3Version,
-		Type:                 volumeTypeServiceData,
-		LVName:               lvName,
-		VGName:               lvm.DefaultVGName,
-		SizeBytes:            sizeBytes,
-		FSType:               "ext4",
+		Version:   metadataV3Version,
+		Type:      volumeTypeServiceData,
+		LVName:    lvName,
+		VGName:    lvm.DefaultVGName,
+		SizeBytes: sizeBytes,
+		FSType:    "ext4",
 		// New v3 volumes are stamped "unprovisioned" for both slots
 		// (RFC 20260510 §Volume-creation atomicity sub-case ii). Even
 		// when a /generate or password-change rotation is in flight at
@@ -864,7 +875,7 @@ func (m *luksVolumeManager) ensureServiceDataVolume(ctx context.Context, req Vol
 		return VolumeHandle{}, fmt.Errorf("write metadata: %w", err)
 	}
 
-	m.nudgeVolumeCreation()
+	nudgeOnSuccess = true
 
 	return VolumeHandle{
 		ID:       req.ID,
@@ -1709,19 +1720,19 @@ func (m *luksVolumeManager) attachAppVolumeV3(ctx context.Context, handle Volume
 // volumeMetaV3 is the on-disk metadata schema for block-native rootfs volumes
 // and v3 service-data volumes using the single LUKS master key.
 type volumeMetaV3 struct {
-	Version         int            `json:"version"`                    // 3
-	Type            string         `json:"type"`                      // golden/workspace/service-rootfs/service-data/ephemeral
-	LVName          string         `json:"lv_name"`
-	VGName          string         `json:"vg_name"`
-	SizeBytes       int64          `json:"size_bytes,omitempty"`
-	FSType   string `json:"fs_type"`
-	ReadOnly bool   `json:"read_only,omitempty"`
-	BaseImageDigest string         `json:"base_image_digest,omitempty"`
-	BaseImageRef    string         `json:"base_image_ref,omitempty"`
-	GoldenLV        string         `json:"golden_lv,omitempty"`
-	CloneOf         string         `json:"clone_of,omitempty"`
-	IDMap           *IDMapMeta     `json:"idmap,omitempty"`
-	FlattenComplete string         `json:"flatten_complete,omitempty"` // RFC3339 timestamp
+	Version         int        `json:"version"` // 3
+	Type            string     `json:"type"`    // golden/workspace/service-rootfs/service-data/ephemeral
+	LVName          string     `json:"lv_name"`
+	VGName          string     `json:"vg_name"`
+	SizeBytes       int64      `json:"size_bytes,omitempty"`
+	FSType          string     `json:"fs_type"`
+	ReadOnly        bool       `json:"read_only,omitempty"`
+	BaseImageDigest string     `json:"base_image_digest,omitempty"`
+	BaseImageRef    string     `json:"base_image_ref,omitempty"`
+	GoldenLV        string     `json:"golden_lv,omitempty"`
+	CloneOf         string     `json:"clone_of,omitempty"`
+	IDMap           *IDMapMeta `json:"idmap,omitempty"`
+	FlattenComplete string     `json:"flatten_complete,omitempty"` // RFC3339 timestamp
 
 	// IDMapFingerprint is the lowercase hex BLAKE2b-256 of canonicalIDMapBytes(*IDMap).
 	// Empty for volumes without IDMap. Once non-empty, mutations to the IDMap

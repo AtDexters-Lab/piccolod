@@ -602,7 +602,7 @@ func TestAlignToSector(t *testing.T) {
 		{513, 1024},
 		{1024, 1024},
 		{1319306057, 1319306240}, // the real-world failing case
-		{10 << 30, 10 << 30},    // already aligned (10 GiB)
+		{10 << 30, 10 << 30},     // already aligned (10 GiB)
 	}
 	for _, tt := range tests {
 		got := alignToSector(tt.input)
@@ -635,13 +635,16 @@ func TestLVManager_ActivateDeactivate(t *testing.T) {
 	if !strings.Contains(calls[0], "lvchange -ay") {
 		t.Errorf("expected lvchange -ay, got %q", calls[0])
 	}
+	if !strings.Contains(calls[1], "udevadm settle") {
+		t.Errorf("expected udevadm settle, got %q", calls[1])
+	}
 
 	if err := mgr.DeactivateLV(context.Background(), "vol-test"); err != nil {
 		t.Fatalf("DeactivateLV: %v", err)
 	}
 	calls = run.GetCalls()
-	if !strings.Contains(calls[1], "lvchange -an") {
-		t.Errorf("expected lvchange -an, got %q", calls[1])
+	if !strings.Contains(calls[2], "lvchange -an") {
+		t.Errorf("expected lvchange -an, got %q", calls[2])
 	}
 }
 

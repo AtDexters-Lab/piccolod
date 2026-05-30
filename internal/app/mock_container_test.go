@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os/exec"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -14,17 +14,18 @@ import (
 )
 
 type MockContainerManager struct {
-	containers              map[string]*mockContainer
-	nextID                  int
-	createError             error
-	startError              error
-	startErrorForContainer  map[string]error // per-container start errors (checked before global startError)
-	stopError               error
-	removeError             error
-	removedImages           []string
-	removeImageErr          error
-	reloadedContainers      []string
-	reloadErr               error
+	containers             map[string]*mockContainer
+	nextID                 int
+	createError            error
+	startError             error
+	startErrorForContainer map[string]error // per-container start errors (checked before global startError)
+	stopError              error
+	removeError            error
+	removeRunningError     bool
+	removedImages          []string
+	removeImageErr         error
+	reloadedContainers     []string
+	reloadErr              error
 }
 
 type mockContainer struct {
@@ -83,7 +84,10 @@ func (m *MockContainerManager) RemoveContainer(ctx context.Context, runtime cont
 	if m.removeError != nil {
 		return m.removeError
 	}
-	if _, ok := m.containers[containerID]; ok {
+	if c, ok := m.containers[containerID]; ok {
+		if m.removeRunningError && c.Status == "running" {
+			return fmt.Errorf("container %s is running", containerID)
+		}
 		delete(m.containers, containerID)
 		return nil
 	}
@@ -366,7 +370,7 @@ func (s *stubRootfsManager) AttachRootfs(_ context.Context, volumeID string) (pe
 	return persistence.RootfsHandle{VolumeID: volumeID, MountPath: mp, ReadOnly: true}, nil
 }
 
-func (s *stubRootfsManager) DetachRootfs(_ context.Context, _ string) error { return nil }
+func (s *stubRootfsManager) DetachRootfs(_ context.Context, _ string) error  { return nil }
 func (s *stubRootfsManager) DestroyRootfs(_ context.Context, _ string) error { return nil }
 func (s *stubRootfsManager) GarbageCollectGoldenLVs(_ context.Context) error { return nil }
 func (s *stubRootfsManager) ReconcileRootfsStates(_ context.Context) error   { return nil }

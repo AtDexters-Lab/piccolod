@@ -80,7 +80,7 @@ type LiveLayer struct {
 	// Name is a human-readable identifier (mapper name, LV name, mount path).
 	Name string
 	// Path is the device or mount path used to operate on the layer
-	// (e.g., /dev/mapper/<name>, /piccolo-core/mounts/<id>).
+	// (e.g., /dev/mapper/<name>, <core-root>/mounts/<id>).
 	Path string
 }
 
@@ -350,7 +350,6 @@ func readMountInfo(path string) (map[string]mountEntry, error) {
 	}
 	return out, nil
 }
-
 
 // unknownCounterEntry tracks K-consecutive Unknown escalation per-volume.
 // All fields are guarded by mu.
@@ -706,7 +705,7 @@ func mappersOfInterest(volumeID string, meta *volumeMetaSummary) []string {
 //   - raw-mount only          (ephemeral): no mapper, btrfs mount on the LV.
 //   - single-fs LUKS stack    (luks-loop, service-data): mapper + fs mount.
 //   - two-fs LUKS stack       (golden / service-rootfs / workspace): mapper +
-//                              raw fs mount + optional idmap bind.
+//     raw fs mount + optional idmap bind.
 func evaluatePartition(snap kernelSnapshot, volumeID string, meta *volumeMetaSummary) (AttachState, bool) {
 	mountPath := expectedMountPath(volumeID)
 	mapper := expectedMapperName(volumeID, meta)

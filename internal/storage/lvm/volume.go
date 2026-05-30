@@ -66,6 +66,9 @@ func (m *LVManager) ActivateLV(ctx context.Context, name string) error {
 	if err := m.run.Run(ctx, "lvchange", "-ay", lvPath); err != nil {
 		return fmt.Errorf("lvchange -ay %s: %w", lvPath, err)
 	}
+	if err := m.run.Run(ctx, "udevadm", "settle", "--timeout=5"); err != nil {
+		return fmt.Errorf("udevadm settle after lvchange -ay %s: %w", lvPath, err)
+	}
 	return nil
 }
 

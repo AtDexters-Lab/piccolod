@@ -111,7 +111,7 @@ type serviceContainerOptions struct {
 	credential *syscall.Credential
 
 	// Block-native rootfs fields (optional, used when rootfsMgr is available)
-	rootfsHandle    *persistence.RootfsHandle    // Mounted rootfs from RootfsVolumeManager
+	rootfsHandle    *persistence.RootfsHandle      // Mounted rootfs from RootfsVolumeManager
 	goldenImgConfig *persistence.GoldenImageConfig // Image config from golden LV
 }
 
@@ -142,7 +142,7 @@ func appLogsInstanceDir(instanceID string) string {
 // traversable for the per-app user). Fail-safe: returns
 // ok=false when the app-logs volume is NOT mounted, so the caller omits LogPath
 // and conmon falls back to the default graphroot driver rather than writing to
-// the bare /piccolo-core mountpoint.
+// the bare core-root mountpoint.
 func (m *AppManager) appLogPathForService(instanceID, svcName string, cred *syscall.Credential) (string, bool) {
 	mount := paths.MountDir(persistence.AppLogsVolumeID)
 	mounted, err := persistence.IsMountPoint(mount)
@@ -196,7 +196,7 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 
 	// Persist this service's logs on the shared app-logs volume so they survive
 	// container recreation and failed-update rollback. Fail-safe:
-	// only when the volume is mounted (else default driver, never /piccolo-core).
+	// only when the volume is mounted (else default driver, never the core root).
 	if logPath, ok := m.appLogPathForService(opts.instanceID, opts.svcName, opts.credential); ok {
 		spec.LogPath = logPath
 		spec.LogMaxSize = appLogMaxSize
@@ -450,4 +450,3 @@ func writeAppConfig(configDir string, appConfig interface{}, uid, gid int) error
 	}
 	return nil
 }
-

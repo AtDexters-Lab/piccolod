@@ -7,6 +7,7 @@ import 'package:piccolo_os/core/models/listener_health.dart';
 import 'package:piccolo_os/core/services/app_service.dart';
 import 'package:piccolo_os/core/utils/task_id.dart';
 import 'package:piccolo_os/features/apps/app_launcher.dart';
+import 'package:piccolo_os/features/apps/manifest_update_wizard.dart';
 import 'package:piccolo_os/features/apps/widgets/edit_listeners_dialog.dart';
 import 'package:piccolo_os/features/apps/widgets/health_banner.dart';
 import 'package:piccolo_os/features/apps/widgets/local_fallback_overlay.dart';
@@ -24,9 +25,11 @@ import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 class AppDetailView extends StatefulWidget {
-
   const AppDetailView({
-    required this.appId, required this.appService, required this.desktopController, super.key,
+    required this.appId,
+    required this.appService,
+    required this.desktopController,
+    super.key,
     this.initialTab = 0,
     this.iconUrl,
     this.originalIconUrl,
@@ -91,7 +94,10 @@ class _AppDetailViewState extends State<AppDetailView>
       if (!mounted) return;
       if (event.app != widget.appId) return;
       setState(() {
-        _app = _app?.copyWithStatus(event.status, statusMessage: event.message ?? '');
+        _app = _app?.copyWithStatus(
+          event.status,
+          statusMessage: event.message ?? '',
+        );
       });
     });
   }
@@ -167,23 +173,25 @@ class _AppDetailViewState extends State<AppDetailView>
     final taskId = generateTaskId();
     final progressDone = Completer<void>();
 
-    unawaited(showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: Text(taskType),
-        content: SizedBox(
-          width: 520,
-          child: TaskProgressPanel(
-            taskId: taskId,
-            taskType: taskType,
-            onComplete: (_) {
-              if (!progressDone.isCompleted) progressDone.complete();
-            },
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          title: Text(taskType),
+          content: SizedBox(
+            width: 520,
+            child: TaskProgressPanel(
+              taskId: taskId,
+              taskType: taskType,
+              onComplete: (_) {
+                if (!progressDone.isCompleted) progressDone.complete();
+              },
+            ),
           ),
         ),
       ),
-    ));
+    );
 
     setState(() => _isActionLoading = true);
     Object? actionError;
@@ -220,7 +228,26 @@ class _AppDetailViewState extends State<AppDetailView>
   Future<void> _handleUpdate() async {
     await _handleActionWithProgress(
       taskType: 'update_image',
-      action: (taskId) => widget.appService.updateApp(widget.appId, taskId: taskId),
+      action: (taskId) =>
+          widget.appService.updateApp(widget.appId, taskId: taskId),
+    );
+  }
+
+  void _showManifestUpdateWizard() {
+    if (_app == null) return;
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => ManifestUpdateWizard(
+          appId: _app!.name,
+          appService: widget.appService,
+          onApplied: () async {
+            widget.desktopController.notifyAppsChanged();
+            await _loadData();
+          },
+        ),
+      ),
     );
   }
 
@@ -239,7 +266,9 @@ class _AppDetailViewState extends State<AppDetailView>
           ),
           FilledButton(
             onPressed: () => Navigator.of(context).pop(true),
-            style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.warning),
+            style: FilledButton.styleFrom(
+              backgroundColor: PiccoloTheme.warning,
+            ),
             child: const Text('Roll Back'),
           ),
         ],
@@ -250,7 +279,8 @@ class _AppDetailViewState extends State<AppDetailView>
 
     await _handleActionWithProgress(
       taskType: 'rollback_app',
-      action: (taskId) => widget.appService.rollbackApp(widget.appId, taskId: taskId),
+      action: (taskId) =>
+          widget.appService.rollbackApp(widget.appId, taskId: taskId),
     );
   }
 
@@ -287,22 +317,24 @@ class _AppDetailViewState extends State<AppDetailView>
         .map(AppListener.fromServiceEndpoint)
         .toList();
 
-    unawaited(showDialog<void>(
-      context: context,
-      builder: (context) => EditListenersDialog(
-        initialListeners: initialListeners,
-        onSave: (newListeners) async {
-          await _handleActionWithProgress(
-            taskType: 'update_listeners',
-            action: (taskId) => widget.appService.updateAppListeners(
-              _app!.name,
-              newListeners,
-              taskId: taskId,
-            ),
-          );
-        },
+    unawaited(
+      showDialog<void>(
+        context: context,
+        builder: (context) => EditListenersDialog(
+          initialListeners: initialListeners,
+          onSave: (newListeners) async {
+            await _handleActionWithProgress(
+              taskType: 'update_listeners',
+              action: (taskId) => widget.appService.updateAppListeners(
+                _app!.name,
+                newListeners,
+                taskId: taskId,
+              ),
+            );
+          },
+        ),
       ),
-    ));
+    );
   }
 
   void _openTerminal() {
@@ -338,12 +370,10 @@ class _AppDetailViewState extends State<AppDetailView>
         _buildHeader(),
 
         // Starting status banner
-        if (_app!.isStarting)
-          _buildStartingBanner(),
+        if (_app!.isStarting) _buildStartingBanner(),
 
         // Error status banner
-        if (_app!.isError)
-          _buildErrorBanner(),
+        if (_app!.isError) _buildErrorBanner(),
 
         // Health banner
         if (_primaryHealth != null && !_primaryHealth!.isOk)
@@ -504,10 +534,18 @@ class _AppDetailViewState extends State<AppDetailView>
                   const SizedBox(width: Spacing.md),
                 ],
                 if (!_app!.isWorkspace && _app!.isRunning) ...[
+                  if (_app!.catalogSource.isEmpty) ...[
+                    OutlinedButton.icon(
+                      onPressed: _showManifestUpdateWizard,
+                      icon: const Icon(PiccoloIcons.fileText),
+                      label: const Text('Apply YAML'),
+                    ),
+                    const SizedBox(width: Spacing.md),
+                  ],
                   FilledButton.icon(
                     onPressed: _handleUpdate,
                     icon: const Icon(PiccoloIcons.refresh),
-                    label: const Text('Update'),
+                    label: const Text('Update Image'),
                     style: FilledButton.styleFrom(
                       backgroundColor: PiccoloTheme.cobalt600,
                     ),
@@ -545,8 +583,10 @@ class _AppDetailViewState extends State<AppDetailView>
                   FilledButton.icon(
                     onPressed: () => _handleActionWithProgress(
                       taskType: 'start_app',
-                      action: (taskId) =>
-                          widget.appService.startApp(_app!.name, taskId: taskId),
+                      action: (taskId) => widget.appService.startApp(
+                        _app!.name,
+                        taskId: taskId,
+                      ),
                     ),
                     icon: const Icon(PiccoloIcons.play),
                     label: const Text('Start'),
@@ -690,151 +730,157 @@ class _AppDetailViewState extends State<AppDetailView>
         ? const Center(child: Text('No network services exposed.'))
         : ListView(
             padding: const EdgeInsets.all(Spacing.lg),
-            children: _listeners
-                .map(
-                  (svc) {
-                    final access = classifyAccess(svc.auth);
-                    return Card(
-                    child: Padding(
-                      padding: const EdgeInsets.all(Spacing.base),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+            children: _listeners.map((svc) {
+              final access = classifyAccess(svc.auth);
+              return Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(Spacing.base),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
                         children: [
-                          Row(
-                            children: [
-                              const Icon(
-                                PiccoloIcons.router,
-                                color: PiccoloTheme.cobalt600,
-                              ),
-                              const SizedBox(width: Spacing.md),
-                              Text(
-                                svc.name,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 16,
-                                ),
-                              ),
-                              if (svc.health != null && !svc.health!.isOk) ...[
-                                const SizedBox(width: Spacing.sm),
-                                HealthBadge(health: svc.health),
-                              ],
-                              const Spacer(),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: Spacing.sm,
-                                  vertical: 2,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: PiccoloTheme.mist,
-                                  borderRadius: BorderRadius.circular(Radii.xxs),
-                                  border: Border.all(color: PiccoloTheme.hairline),
-                                ),
-                                child: Text(
-                                  svc.protocol.toUpperCase(),
-                                  style: const TextStyle(fontSize: 12),
-                                ),
-                              ),
-                              if (access != 'private') ...[
-                                const SizedBox(width: Spacing.sm),
-                                _buildAccessBadge(access),
-                              ],
-                            ],
+                          const Icon(
+                            PiccoloIcons.router,
+                            color: PiccoloTheme.cobalt600,
                           ),
-                          const Divider(height: Spacing.lg),
-                          _buildNetworkRow('Internal Port', '${svc.guestPort}'),
-                          if (svc.lanHostUrl != null)
-                            Builder(builder: (_) {
-                              final host = Uri.base.host.toLowerCase();
-                              // When accessed via IP, prefer localUrl (port-based) since
-                              // mDNS hostname won't resolve for this user.
-                              final useLocal = AppLauncher.isIpAddress(host) ||
-                                  AppLauncher.isLoopback(host);
-                              final url = useLocal
-                                  ? (svc.localUrl ?? svc.lanHostUrl!)
-                                  : svc.lanHostUrl!;
-                              return _buildNetworkLinkRow(
-                                'LAN Access',
-                                url,
-                                onTap: () => launchUrl(Uri.parse(url)),
-                                icon: PiccoloIcons.openExternal,
-                                tooltip: 'Opens in new tab',
-                              );
-                            }),
-                          if (svc.localUrl != null)
-                            _buildNetworkLinkRow(
-                              svc.lanHostUrl != null
-                                  ? 'LAN Fallback'
-                                  : 'LAN Access',
-                              '${svc.localUrl} (Port ${svc.publicPort}${svc.portClaim != null ? ", claimed" : ""})',
-                              onTap: () => AppLauncher.openAppWindow(
-                                controller: widget.desktopController,
-                                appService: widget.appService,
-                                app: _app!,
-                                service: svc,
-                              ),
-                              icon: PiccoloIcons.webAsset,
-                              tooltip: 'Opens in app window',
+                          const SizedBox(width: Spacing.md),
+                          Text(
+                            svc.name,
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
                             ),
-                          if (svc.remoteUrls.isNotEmpty)
-                            ...svc.remoteUrls.map((url) {
-                              // Only the context-aware URL (matching current portal) can be
-                              // embedded in an iframe — other portals have different cookies/OIDC.
-                              final isCurrentPortal = url == svc.remoteUrl;
-                              return _buildNetworkLinkRow(
-                                'Remote Access',
-                                url,
-                                onTap: isCurrentPortal
-                                    ? () => AppLauncher.healthGatedOpen(
-                                        context: context,
-                                        controller: widget.desktopController,
-                                        appService: widget.appService,
-                                        app: _app!,
-                                        service: svc,
-                                        overrideUrl: url,
-                                        healthOverride: svc.name == _primaryListenerName
-                                            ? _primaryHealth
-                                            : null,
-                                      )
-                                    : () => _healthGatedLaunchUrl(url, svc),
-                                icon: isCurrentPortal
-                                    ? PiccoloIcons.webAsset
-                                    : PiccoloIcons.openExternal,
-                                tooltip: isCurrentPortal
-                                    ? 'Opens in app window'
-                                    : 'Opens in browser',
-                              );
-                            })
-                          else if (svc.remoteUrl != null)
-                            _buildNetworkLinkRow(
-                              'Remote Access',
-                              svc.remoteUrl!,
-                              onTap: () => AppLauncher.healthGatedOpen(
-                                context: context,
-                                controller: widget.desktopController,
-                                appService: widget.appService,
-                                app: _app!,
-                                service: svc,
-                                overrideUrl: svc.remoteUrl,
-                                healthOverride: svc.name == _primaryListenerName
-                                    ? _primaryHealth
-                                    : null,
-                              ),
-                              icon: PiccoloIcons.webAsset,
-                              tooltip: 'Opens in app window',
+                          ),
+                          if (svc.health != null && !svc.health!.isOk) ...[
+                            const SizedBox(width: Spacing.sm),
+                            HealthBadge(health: svc.health),
+                          ],
+                          const Spacer(),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: Spacing.sm,
+                              vertical: 2,
                             ),
+                            decoration: BoxDecoration(
+                              color: PiccoloTheme.mist,
+                              borderRadius: BorderRadius.circular(Radii.xxs),
+                              border: Border.all(color: PiccoloTheme.hairline),
+                            ),
+                            child: Text(
+                              svc.protocol.toUpperCase(),
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                          ),
+                          if (access != 'private') ...[
+                            const SizedBox(width: Spacing.sm),
+                            _buildAccessBadge(access),
+                          ],
                         ],
                       ),
-                    ),
-                  );
-                  })
-                .toList(),
+                      const Divider(height: Spacing.lg),
+                      _buildNetworkRow('Internal Port', '${svc.guestPort}'),
+                      if (svc.lanHostUrl != null)
+                        Builder(
+                          builder: (_) {
+                            final host = Uri.base.host.toLowerCase();
+                            // When accessed via IP, prefer localUrl (port-based) since
+                            // mDNS hostname won't resolve for this user.
+                            final useLocal =
+                                AppLauncher.isIpAddress(host) ||
+                                AppLauncher.isLoopback(host);
+                            final url = useLocal
+                                ? (svc.localUrl ?? svc.lanHostUrl!)
+                                : svc.lanHostUrl!;
+                            return _buildNetworkLinkRow(
+                              'LAN Access',
+                              url,
+                              onTap: () => launchUrl(Uri.parse(url)),
+                              icon: PiccoloIcons.openExternal,
+                              tooltip: 'Opens in new tab',
+                            );
+                          },
+                        ),
+                      if (svc.localUrl != null)
+                        _buildNetworkLinkRow(
+                          svc.lanHostUrl != null
+                              ? 'LAN Fallback'
+                              : 'LAN Access',
+                          '${svc.localUrl} (Port ${svc.publicPort}${svc.portClaim != null ? ", claimed" : ""})',
+                          onTap: () => AppLauncher.openAppWindow(
+                            controller: widget.desktopController,
+                            appService: widget.appService,
+                            app: _app!,
+                            service: svc,
+                          ),
+                          icon: PiccoloIcons.webAsset,
+                          tooltip: 'Opens in app window',
+                        ),
+                      if (svc.remoteUrls.isNotEmpty)
+                        ...svc.remoteUrls.map((url) {
+                          // Only the context-aware URL (matching current portal) can be
+                          // embedded in an iframe — other portals have different cookies/OIDC.
+                          final isCurrentPortal = url == svc.remoteUrl;
+                          return _buildNetworkLinkRow(
+                            'Remote Access',
+                            url,
+                            onTap: isCurrentPortal
+                                ? () => AppLauncher.healthGatedOpen(
+                                    context: context,
+                                    controller: widget.desktopController,
+                                    appService: widget.appService,
+                                    app: _app!,
+                                    service: svc,
+                                    overrideUrl: url,
+                                    healthOverride:
+                                        svc.name == _primaryListenerName
+                                        ? _primaryHealth
+                                        : null,
+                                  )
+                                : () => _healthGatedLaunchUrl(url, svc),
+                            icon: isCurrentPortal
+                                ? PiccoloIcons.webAsset
+                                : PiccoloIcons.openExternal,
+                            tooltip: isCurrentPortal
+                                ? 'Opens in app window'
+                                : 'Opens in browser',
+                          );
+                        })
+                      else if (svc.remoteUrl != null)
+                        _buildNetworkLinkRow(
+                          'Remote Access',
+                          svc.remoteUrl!,
+                          onTap: () => AppLauncher.healthGatedOpen(
+                            context: context,
+                            controller: widget.desktopController,
+                            appService: widget.appService,
+                            app: _app!,
+                            service: svc,
+                            overrideUrl: svc.remoteUrl,
+                            healthOverride: svc.name == _primaryListenerName
+                                ? _primaryHealth
+                                : null,
+                          ),
+                          icon: PiccoloIcons.webAsset,
+                          tooltip: 'Opens in app window',
+                        ),
+                    ],
+                  ),
+                ),
+              );
+            }).toList(),
           );
 
     return Column(
       children: [
         if (_app!.isWorkspace)
           Padding(
-            padding: const EdgeInsets.fromLTRB(Spacing.lg, Spacing.lg, Spacing.lg, 0),
+            padding: const EdgeInsets.fromLTRB(
+              Spacing.lg,
+              Spacing.lg,
+              Spacing.lg,
+              0,
+            ),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
@@ -914,7 +960,10 @@ class _AppDetailViewState extends State<AppDetailView>
     }
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: Spacing.md, vertical: Spacing.xs),
+      padding: const EdgeInsets.symmetric(
+        horizontal: Spacing.md,
+        vertical: Spacing.xs,
+      ),
       decoration: BoxDecoration(
         color: PiccoloTheme.mist,
         borderRadius: BorderRadius.circular(Radii.sm),
@@ -1047,21 +1096,25 @@ class _AppDetailViewState extends State<AppDetailView>
   /// Used for alternate portal URLs that can't be iframe-embedded (cross-site cookies)
   /// but should still be gated to avoid dumping users into TLS errors.
   void _healthGatedLaunchUrl(String url, ServiceEndpoint svc) {
-    final health = (svc.name == _primaryListenerName ? _primaryHealth : null)
-        ?? svc.health ?? _app!.primaryListenerHealth;
+    final health =
+        (svc.name == _primaryListenerName ? _primaryHealth : null) ??
+        svc.health ??
+        _app!.primaryListenerHealth;
     if (health != null && !health.isOk && !health.isDegraded) {
       final fallbackUrl =
           svc.lanFallbackUrl ?? svc.lanHostUrl ?? svc.localUrl ?? '';
-      unawaited(showDialog<void>(
-        context: context,
-        builder: (_) => LocalFallbackOverlay(
-          health: health,
-          appName: _app!.displayTitle,
-          lanFallbackUrl: fallbackUrl,
-          appService: widget.appService,
-          desktopController: widget.desktopController,
+      unawaited(
+        showDialog<void>(
+          context: context,
+          builder: (_) => LocalFallbackOverlay(
+            health: health,
+            appName: _app!.displayTitle,
+            lanFallbackUrl: fallbackUrl,
+            appService: widget.appService,
+            desktopController: widget.desktopController,
+          ),
         ),
-      ));
+      );
       return;
     }
     unawaited(launchUrl(Uri.parse(url)));
@@ -1106,7 +1159,11 @@ class _AppDetailViewState extends State<AppDetailView>
                     const SizedBox(width: 6),
                     Tooltip(
                       message: tooltip ?? '',
-                      child: Icon(icon, size: 14, color: PiccoloTheme.cobalt600),
+                      child: Icon(
+                        icon,
+                        size: 14,
+                        color: PiccoloTheme.cobalt600,
+                      ),
                     ),
                   ],
                 ),
