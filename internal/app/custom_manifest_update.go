@@ -18,12 +18,14 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/fsutil"
+	"piccolod/internal/persistence"
 )
 
 const (
 	manifestUpdateTokenTTL       = 30 * time.Minute
 	manifestUpdateTxnFilename    = "manifest_update_transaction.json"
 	manifestUpdateBackupFilename = "app.manifest-update.prev.yaml"
+	installStateBackupFilename   = "install_state.manifest-update.prev.json"
 )
 
 var (
@@ -81,30 +83,46 @@ type ManifestUpdateResult struct {
 }
 
 type manifestUpdateCandidate struct {
-	Token              string
-	InstanceID         string
-	BaseManifestHash   string
-	RuntimeFingerprint string
-	CandidateDigest    string
-	DiffKind           DiffKind
-	MetadataOnly       bool
-	Definition         *api.AppDefinition
-	Summary            ManifestUpdateSummary
-	CreatedAt          time.Time
-	ExpiresAt          time.Time
+	Token                string
+	InstanceID           string
+	RawTemplate          []byte
+	Inputs               map[string]interface{}
+	SystemContext        InstallSystemContext
+	BaseManifestHash     string
+	RuntimeFingerprint   string
+	BaseLedgerExists     bool
+	BaseLedgerRevision   int64
+	BaseLedgerSourceHash string
+	CandidateDigest      string
+	DiffKind             DiffKind
+	MetadataOnly         bool
+	Definition           *api.AppDefinition
+	Summary              ManifestUpdateSummary
+	CreatedAt            time.Time
+	ExpiresAt            time.Time
 }
 
 type ManifestUpdateTransaction struct {
-	OperationID           string    `json:"operation_id"`
-	Phase                 string    `json:"phase"`
-	PreviousManifestHash  string    `json:"previous_manifest_hash"`
-	CandidateManifestHash string    `json:"candidate_manifest_hash"`
-	DryRunToken           string    `json:"dry_run_token"`
-	RuntimeFingerprint    string    `json:"runtime_fingerprint"`
-	BackupPath            string    `json:"backup_path"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
-	LastError             string    `json:"last_error,omitempty"`
+	OperationID               string    `json:"operation_id"`
+	OperationKind             string    `json:"operation_kind,omitempty"`
+	Phase                     string    `json:"phase"`
+	PreviousManifestHash      string    `json:"previous_manifest_hash"`
+	CandidateManifestHash     string    `json:"candidate_manifest_hash"`
+	PreviousLedgerRevision    int64     `json:"previous_ledger_revision,omitempty"`
+	CandidateLedgerRevision   int64     `json:"candidate_ledger_revision,omitempty"`
+	PreviousLedgerSourceHash  string    `json:"previous_ledger_source_hash,omitempty"`
+	CandidateLedgerSourceHash string    `json:"candidate_ledger_source_hash,omitempty"`
+	DryRunToken               string    `json:"dry_run_token"`
+	RuntimeFingerprint        string    `json:"runtime_fingerprint"`
+	BackupPath                string    `json:"backup_path"`
+	BackupInstallStatePath    string    `json:"backup_install_state_path,omitempty"`
+	CreatedInstallState       bool      `json:"created_install_state,omitempty"`
+	CreatedOIDCClientID       string    `json:"created_oidc_client_id,omitempty"`
+	ProxyOIDCDeltaApplied     bool      `json:"proxy_oidc_delta_applied,omitempty"`
+	RuntimeTouched            bool      `json:"runtime_touched,omitempty"`
+	CreatedAt                 time.Time `json:"created_at"`
+	UpdatedAt                 time.Time `json:"updated_at"`
+	LastError                 string    `json:"last_error,omitempty"`
 }
 
 func (m *AppManager) ConfigureCustomManifestUpdate(ctx context.Context, instanceID string, raw []byte) (*ManifestUpdateConfigureResult, error) {
@@ -300,64 +318,67 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 	if runtimeFingerprint != cand.RuntimeFingerprint {
 		return nil, fmt.Errorf("%w: runtime changed after dry run", ErrManifestUpdateConflict)
 	}
-
-	operationID, err := randomManifestUpdateToken()
+	currentLedgerExists, currentLedgerRevision, currentLedgerSourceHash, err := loadInstallLedgerFingerprint(state, req.InstanceID)
 	if err != nil {
 		return nil, err
 	}
-	backupPath, err := state.BackupCurrentAppDefinitionForManifestUpdate(req.InstanceID)
+	if currentLedgerExists != cand.BaseLedgerExists ||
+		currentLedgerRevision != cand.BaseLedgerRevision ||
+		currentLedgerSourceHash != cand.BaseLedgerSourceHash {
+		return nil, fmt.Errorf("%w: config ledger changed after dry run", ErrManifestUpdateConflict)
+	}
+
+	candidateLedgerRevision := currentLedgerRevision + 1
+	if candidateLedgerRevision <= 0 {
+		candidateLedgerRevision = 1
+	}
+	nextState := NewV2InstallState(
+		req.InstanceID,
+		InstallSourceKindCustom,
+		"",
+		cand.RawTemplate,
+		cand.Inputs,
+		cand.SystemContext,
+		nil,
+		false,
+	)
+	nextState.Revision = candidateLedgerRevision
+	applyTxn, err := m.beginInstalledAppApplyTransaction(ctx, state, installedAppApplyTransactionSpec{
+		OperationKind:             "manifest_update",
+		TaskType:                  taskTypeUpdateManifest,
+		RollbackPrefix:            "manifest update rolled back",
+		InstanceID:                req.InstanceID,
+		AppInst:                   appInst,
+		PreviousDefinition:        curDef,
+		CandidateDefinition:       cand.Definition,
+		PreviousManifestHash:      cand.BaseManifestHash,
+		CandidateManifestHash:     cand.CandidateDigest,
+		PreviousLedgerRevision:    currentLedgerRevision,
+		CandidateLedgerRevision:   nextState.Revision,
+		PreviousLedgerSourceHash:  currentLedgerSourceHash,
+		CandidateLedgerSourceHash: nextState.RawTemplateHash,
+		DryRunToken:               cand.Token,
+		RuntimeFingerprint:        cand.RuntimeFingerprint,
+		MetadataOnly:              cand.MetadataOnly,
+		ApplyPhase:                taskPhaseApplyingManifest,
+		ApplyMessage:              "Persisting manifest",
+		FinalizingMessage:         "Saving config ledger",
+	})
 	if err != nil {
-		return nil, fmt.Errorf("backup current manifest: %w", err)
+		return nil, err
 	}
-	txn := &ManifestUpdateTransaction{
-		OperationID:           operationID,
-		Phase:                 "prepared",
-		PreviousManifestHash:  cand.BaseManifestHash,
-		CandidateManifestHash: cand.CandidateDigest,
-		DryRunToken:           cand.Token,
-		RuntimeFingerprint:    cand.RuntimeFingerprint,
-		BackupPath:            backupPath,
-		CreatedAt:             time.Now().UTC(),
-		UpdatedAt:             time.Now().UTC(),
+	if err := applyTxn.persistCandidateManifest(); err != nil {
+		return nil, err
 	}
-	if err := state.StoreManifestUpdateTransaction(req.InstanceID, txn); err != nil {
-		return nil, fmt.Errorf("store manifest update transaction: %w", err)
+	if err := applyTxn.recreateRuntimeIfNeeded(); err != nil {
+		return nil, err
 	}
-
-	prevDef := curDef
-	prevDefinition := *appInst.Definition
-	appInst.Definition = cand.Definition
-	appInst.UpdatedAt = time.Now()
-	m.emitProgress(ctx, taskTypeUpdateManifest, req.InstanceID, taskPhaseApplyingManifest, 20, "Persisting manifest", false, nil)
-	if err := state.StoreApp(appInst); err != nil {
-		appInst.Definition = &prevDefinition
-		_ = state.ClearManifestUpdateTransaction(req.InstanceID, backupPath)
-		return nil, fmt.Errorf("persist candidate manifest: %w", err)
-	}
-	txn.Phase = "candidate_persisted"
-	txn.UpdatedAt = time.Now().UTC()
-	_ = state.StoreManifestUpdateTransaction(req.InstanceID, txn)
-
-	if !cand.MetadataOnly {
-		txn.Phase = "recreating_runtime"
-		txn.UpdatedAt = time.Now().UTC()
-		_ = state.StoreManifestUpdateTransaction(req.InstanceID, txn)
-		m.emitProgress(ctx, taskTypeUpdateManifest, req.InstanceID, taskPhaseRecreatingContainer, 50, "Recreating containers", false, nil)
-		if applyErr := m.recreateContainersInPlace(ctx, req.InstanceID, cand.Definition, prevDef, appInst); applyErr != nil {
-			restoreErr := m.restoreManifestUpdateFailure(ctx, state, appInst, prevDef, cand.Definition, txn, applyErr)
-			if restoreErr != nil {
-				return nil, restoreErr
-			}
-			return nil, fmt.Errorf("manifest update rolled back: %w", applyErr)
+	if len(bytes.TrimSpace(cand.RawTemplate)) > 0 && appInst.CatalogSource == "" {
+		if err := applyTxn.commitLedger(nextState); err != nil {
+			return nil, err
 		}
 	}
-
-	txn.Phase = "committed"
-	txn.UpdatedAt = time.Now().UTC()
-	_ = state.StoreManifestUpdateTransaction(req.InstanceID, txn)
-	if err := state.ClearManifestUpdateTransaction(req.InstanceID, backupPath); err != nil {
-		log.Printf("WARN: manifest update %s: cleanup transaction: %v", req.InstanceID, err)
-	}
+	applyTxn.complete()
 	return &ManifestUpdateResult{
 		InstanceID:         req.InstanceID,
 		BaseManifestHash:   cand.BaseManifestHash,
@@ -370,35 +391,113 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 	}, nil
 }
 
-func (m *AppManager) restoreManifestUpdateFailure(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, prevDef, failedDef *api.AppDefinition, txn *ManifestUpdateTransaction, cause error) error {
+func (m *AppManager) restoreInstalledAppApplyFailure(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, prevDef, failedDef *api.AppDefinition, txn *ManifestUpdateTransaction, taskType, operationKind string, cause error) error {
 	instanceID := appInst.InstanceID
 	txn.Phase = "restoring_previous"
 	txn.LastError = cause.Error()
 	txn.UpdatedAt = time.Now().UTC()
 	_ = state.StoreManifestUpdateTransaction(instanceID, txn)
-	m.emitProgress(ctx, taskTypeUpdateManifest, instanceID, taskPhaseRestoringManifest, 75, "Restoring previous manifest", false, nil)
+	m.emitProgress(ctx, taskType, instanceID, taskPhaseRestoringManifest, 75, "Restoring previous manifest", false, nil)
 
+	var rollbackErrs []error
 	appInst.Definition = prevDef
 	if err := state.StoreApp(appInst); err != nil {
+		rollbackErrs = append(rollbackErrs, fmt.Errorf("restore manifest failed: %w", err))
+	}
+	if err := state.RestoreInstallStateForTransaction(instanceID, txn); err != nil {
+		rollbackErrs = append(rollbackErrs, fmt.Errorf("restore install state failed: %w", err))
+	}
+	if err := m.cleanupTransactionCreatedOIDCClient(ctx, txn); err != nil {
+		rollbackErrs = append(rollbackErrs, err)
+	}
+	if manifestTransactionRuntimeTouched(txn) {
+		if err := m.recreateContainersInPlace(ctx, instanceID, prevDef, failedDef, appInst); err != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("recreate previous containers failed: %w", err))
+		}
+	}
+	m.configureOIDCAuthorizePaths(instanceID, prevDef)
+	if err := m.rollbackTransactionProxyOIDCDelta(ctx, instanceID, txn, prevDef, failedDef); err != nil {
+		rollbackErrs = append(rollbackErrs, err)
+	}
+	if restoreErr := errors.Join(rollbackErrs...); restoreErr != nil {
 		txn.Phase = "restore_failed"
-		txn.LastError = fmt.Sprintf("apply failed: %v; restore manifest failed: %v", cause, err)
+		txn.LastError = fmt.Sprintf("apply failed: %v; rollback failed: %v", cause, restoreErr)
 		txn.UpdatedAt = time.Now().UTC()
 		_ = state.StoreManifestUpdateTransaction(instanceID, txn)
 		m.setObservedStatus(instanceID, StatusError)
-		m.emitProgress(ctx, taskTypeUpdateManifest, instanceID, taskPhaseRestoreFailed, 95, "Restore failed", false, err)
-		return fmt.Errorf("manifest update failed: %w; restore manifest failed: %v", cause, err)
+		m.emitProgress(ctx, taskType, instanceID, taskPhaseRestoreFailed, 95, "Restore failed", false, restoreErr)
+		return fmt.Errorf("%s failed: %w; rollback failed: %w", operationKind, cause, restoreErr)
 	}
-	if err := m.recreateContainersInPlace(ctx, instanceID, prevDef, failedDef, appInst); err != nil {
-		txn.Phase = "restore_failed"
-		txn.LastError = fmt.Sprintf("apply failed: %v; recreate previous containers failed: %v", cause, err)
-		txn.UpdatedAt = time.Now().UTC()
-		_ = state.StoreManifestUpdateTransaction(instanceID, txn)
-		m.setObservedStatus(instanceID, StatusError)
-		m.emitProgress(ctx, taskTypeUpdateManifest, instanceID, taskPhaseRestoreFailed, 95, "Restore failed", false, err)
-		return fmt.Errorf("manifest update failed: %w; recreate previous containers failed: %v", cause, err)
-	}
+	m.ReconcileAllSlicePolicies()
 	if err := state.ClearManifestUpdateTransaction(instanceID, txn.BackupPath); err != nil {
 		log.Printf("WARN: manifest update %s: cleanup after rollback: %v", instanceID, err)
+	}
+	return nil
+}
+
+func (m *AppManager) cleanupTransactionCreatedOIDCClient(ctx context.Context, txn *ManifestUpdateTransaction) error {
+	if txn == nil || strings.TrimSpace(txn.CreatedOIDCClientID) == "" {
+		return nil
+	}
+	clientID := strings.TrimSpace(txn.CreatedOIDCClientID)
+	host := m.currentSyncHost()
+	if host == nil {
+		return fmt.Errorf("delete created oidc client %s: %w", clientID, ErrSyncHostUnavailable)
+	}
+	if err := host.DeleteOIDCClient(ctx, clientID); err != nil && !errors.Is(err, persistence.ErrNotFound) {
+		return fmt.Errorf("delete created oidc client %s: %w", clientID, err)
+	}
+	return nil
+}
+
+func (m *AppManager) rollbackTransactionProxyOIDCDelta(ctx context.Context, instanceID string, txn *ManifestUpdateTransaction, prevDef, failedDef *api.AppDefinition) error {
+	if txn == nil || !txn.ProxyOIDCDeltaApplied {
+		return nil
+	}
+	host := m.currentSyncHost()
+	if host == nil {
+		return fmt.Errorf("rollback proxy oidc delta: %w", ErrSyncHostUnavailable)
+	}
+	if err := m.applyProxyOIDCDelta(ctx, host, instanceID, failedDef, prevDef); err != nil {
+		return fmt.Errorf("rollback proxy oidc delta: %w", err)
+	}
+	txn.ProxyOIDCDeltaApplied = false
+	return nil
+}
+
+func manifestTransactionRuntimeTouched(txn *ManifestUpdateTransaction) bool {
+	if txn == nil {
+		return false
+	}
+	if txn.RuntimeTouched {
+		return true
+	}
+	if strings.TrimSpace(txn.OperationKind) != "" {
+		return false
+	}
+	switch txn.Phase {
+	case "recreating_runtime", "ledger_committing", "restoring_previous", "restore_failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func markManifestTransactionRuntimeTouched(state *FilesystemStateManager, instanceID string, txn *ManifestUpdateTransaction) error {
+	if txn == nil {
+		return fmt.Errorf("manifest update transaction required")
+	}
+	prevPhase := txn.Phase
+	prevRuntimeTouched := txn.RuntimeTouched
+	prevUpdatedAt := txn.UpdatedAt
+	txn.RuntimeTouched = true
+	txn.Phase = "recreating_runtime"
+	txn.UpdatedAt = time.Now().UTC()
+	if err := state.StoreManifestUpdateTransaction(instanceID, txn); err != nil {
+		txn.Phase = prevPhase
+		txn.RuntimeTouched = prevRuntimeTouched
+		txn.UpdatedAt = prevUpdatedAt
+		return err
 	}
 	return nil
 }
@@ -462,6 +561,10 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 	if err != nil {
 		return nil, nil, err
 	}
+	ledgerExists, ledgerRevision, ledgerSourceHash, err := loadInstallLedgerFingerprint(state, req.InstanceID)
+	if err != nil {
+		return nil, nil, err
+	}
 	policy, summary := evaluateCustomManifestUpdatePolicy(curDef, res.Definition)
 	diffKind := classifyDiff(cloneDefinitionForCompare(curDef), cloneDefinitionForCompare(res.Definition))
 	candidateDigest := Sha256Hex(res.CanonicalBytes)
@@ -480,14 +583,20 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 		return nil, result, nil
 	}
 	cand := &manifestUpdateCandidate{
-		InstanceID:         req.InstanceID,
-		BaseManifestHash:   baseHash,
-		RuntimeFingerprint: runtimeFingerprint,
-		CandidateDigest:    candidateDigest,
-		DiffKind:           diffKind,
-		MetadataOnly:       policy.MetadataOnly,
-		Definition:         res.Definition,
-		Summary:            summary,
+		InstanceID:           req.InstanceID,
+		RawTemplate:          append([]byte(nil), req.RawTemplate...),
+		Inputs:               inputs,
+		SystemContext:        req.SystemContext,
+		BaseManifestHash:     baseHash,
+		RuntimeFingerprint:   runtimeFingerprint,
+		BaseLedgerExists:     ledgerExists,
+		BaseLedgerRevision:   ledgerRevision,
+		BaseLedgerSourceHash: ledgerSourceHash,
+		CandidateDigest:      candidateDigest,
+		DiffKind:             diffKind,
+		MetadataOnly:         policy.MetadataOnly,
+		Definition:           res.Definition,
+		Summary:              summary,
 	}
 	return cand, result, nil
 }
@@ -674,7 +783,7 @@ func normalizeManifestUpdateInputs(declared map[string]api.AppInput, provided ma
 			return nil, fmt.Errorf("input %q is required", name)
 		}
 		if spec.Default != nil {
-			out[name] = spec.Default
+			out[name] = normalizeInputValueForValidation(spec.Type, spec.Default)
 			continue
 		}
 		out[name] = zeroInputValue(spec.Type)
@@ -712,6 +821,17 @@ func customManifestBasicEligibility(appInst *AppInstance) error {
 		return fmt.Errorf("%w: only service-mode custom apps are supported", ErrManifestUpdateRejected)
 	}
 	return nil
+}
+
+func loadInstallLedgerFingerprint(state *FilesystemStateManager, instanceID string) (bool, int64, string, error) {
+	st, err := state.LoadInstallState(instanceID)
+	if errors.Is(err, ErrInstallStateNotFound) {
+		return false, 0, "", nil
+	}
+	if err != nil {
+		return false, 0, "", fmt.Errorf("load config ledger: %w", err)
+	}
+	return true, st.Revision, st.RawTemplateHash, nil
 }
 
 func manifestUpdateRejectedResult(instanceID string, curDef *api.AppDefinition, appInst *AppInstance, reason string) (*manifestUpdateCandidate, *ManifestUpdateResult, error) {
@@ -897,9 +1017,74 @@ func (fsm *FilesystemStateManager) BackupCurrentAppDefinitionForManifestUpdate(i
 	return backup, nil
 }
 
+func (fsm *FilesystemStateManager) BackupInstallStateForManifestUpdate(instanceID string) (string, error) {
+	fsm.fsMu.Lock()
+	defer fsm.fsMu.Unlock()
+	appDir := filepath.Join(fsm.appsDir, instanceID)
+	cur := filepath.Join(appDir, installStateFilename)
+	data, err := os.ReadFile(cur)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read install state: %w", err)
+	}
+	backup := filepath.Join(appDir, installStateBackupFilename)
+	if err := fsutil.AtomicWriteFile(backup, data, 0600); err != nil {
+		return "", fmt.Errorf("write install state backup: %w", err)
+	}
+	return backup, nil
+}
+
+func (fsm *FilesystemStateManager) RestoreInstallStateBackup(instanceID, backupPath string) error {
+	if strings.TrimSpace(backupPath) == "" {
+		return nil
+	}
+	fsm.fsMu.Lock()
+	defer fsm.fsMu.Unlock()
+	data, err := os.ReadFile(backupPath)
+	if err != nil {
+		return fmt.Errorf("read install state backup: %w", err)
+	}
+	if err := fsutil.AtomicWriteFile(fsm.installStatePath(instanceID), data, 0600); err != nil {
+		return fmt.Errorf("restore install state backup: %w", err)
+	}
+	return nil
+}
+
+func (fsm *FilesystemStateManager) RestoreInstallStateForTransaction(instanceID string, txn *ManifestUpdateTransaction) error {
+	if txn == nil {
+		return nil
+	}
+	if strings.TrimSpace(txn.BackupInstallStatePath) != "" {
+		return fsm.RestoreInstallStateBackup(instanceID, txn.BackupInstallStatePath)
+	}
+	if txn.CreatedInstallState {
+		return fsm.DeleteInstallState(instanceID)
+	}
+	return nil
+}
+
+func (fsm *FilesystemStateManager) ClearInstallStateBackup(backupPath string) error {
+	if strings.TrimSpace(backupPath) == "" {
+		return nil
+	}
+	fsm.fsMu.Lock()
+	defer fsm.fsMu.Unlock()
+	if err := os.Remove(backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func (fsm *FilesystemStateManager) StoreManifestUpdateTransaction(instanceID string, txn *ManifestUpdateTransaction) error {
 	if txn == nil {
 		return fmt.Errorf("manifest update transaction required")
+	}
+	if fsm.storeManifestUpdateTransactionHook != nil {
+		if err := fsm.storeManifestUpdateTransactionHook(instanceID, txn); err != nil {
+			return err
+		}
 	}
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
@@ -934,6 +1119,13 @@ func (fsm *FilesystemStateManager) ClearManifestUpdateTransaction(instanceID, ba
 	appDir := filepath.Join(fsm.appsDir, instanceID)
 	var firstErr error
 	txnPath := filepath.Join(appDir, manifestUpdateTxnFilename)
+	installStateBackupPath := ""
+	if data, err := os.ReadFile(txnPath); err == nil {
+		var txn ManifestUpdateTransaction
+		if json.Unmarshal(data, &txn) == nil {
+			installStateBackupPath = txn.BackupInstallStatePath
+		}
+	}
 	if err := os.Remove(txnPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		firstErr = err
 	}
@@ -942,6 +1134,11 @@ func (fsm *FilesystemStateManager) ClearManifestUpdateTransaction(instanceID, ba
 	}
 	if err := os.Remove(backupPath); err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
 		firstErr = err
+	}
+	if strings.TrimSpace(installStateBackupPath) != "" {
+		if err := os.Remove(installStateBackupPath); err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
+			firstErr = err
+		}
 	}
 	return firstErr
 }
@@ -978,6 +1175,26 @@ func (m *AppManager) recoverPendingManifestUpdates(ctx context.Context, state *F
 
 func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, txn *ManifestUpdateTransaction) error {
 	instanceID := appInst.InstanceID
+	if txn.Phase == "committed" {
+		if err := state.ClearManifestUpdateTransaction(instanceID, txn.BackupPath); err != nil {
+			log.Printf("WARN: manifest update recovery %s: cleanup committed transaction: %v", instanceID, err)
+		}
+		return nil
+	}
+	if recoverLedgerCommitReached(state, appInst, txn) {
+		txn.Phase = "committed"
+		txn.LastError = ""
+		txn.UpdatedAt = time.Now().UTC()
+		if err := state.StoreManifestUpdateTransaction(instanceID, txn); err != nil {
+			log.Printf("WARN: manifest update recovery %s: mark committed after ledger recovery: %v", instanceID, err)
+		}
+		if err := state.ClearManifestUpdateTransaction(instanceID, txn.BackupPath); err != nil {
+			log.Printf("WARN: manifest update recovery %s: cleanup recovered ledger commit: %v", instanceID, err)
+		}
+		log.Printf("INFO: manifest update recovery %s: completed recovered ledger commit", instanceID)
+		return nil
+	}
+
 	backupPath := txn.BackupPath
 	if strings.TrimSpace(backupPath) == "" {
 		backupPath = filepath.Join(state.appsDir, instanceID, manifestUpdateBackupFilename)
@@ -1002,25 +1219,59 @@ func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *Filesy
 	txn.Phase = "restoring_previous"
 	_ = state.StoreManifestUpdateTransaction(instanceID, txn)
 	appInst.Definition = prevDef
+	var rollbackErrs []error
 	if err := state.StoreApp(appInst); err != nil {
-		txn.Phase = "restore_failed"
-		txn.LastError = fmt.Sprintf("store backup manifest: %v", err)
-		_ = state.StoreManifestUpdateTransaction(instanceID, txn)
-		m.setObservedStatus(instanceID, StatusError)
-		return fmt.Errorf("manifest update recovery %s: store backup manifest: %w", instanceID, err)
+		rollbackErrs = append(rollbackErrs, fmt.Errorf("store backup manifest: %w", err))
 	}
-	if appInst.Enabled {
+	if err := state.RestoreInstallStateForTransaction(instanceID, txn); err != nil {
+		rollbackErrs = append(rollbackErrs, fmt.Errorf("restore install state: %w", err))
+	}
+	if err := m.cleanupTransactionCreatedOIDCClient(ctx, txn); err != nil {
+		rollbackErrs = append(rollbackErrs, err)
+	}
+	if manifestTransactionRuntimeTouched(txn) && appInst.Enabled {
 		if err := m.recreateContainersInPlace(ctx, instanceID, prevDef, failedDef, appInst); err != nil {
-			txn.Phase = "restore_failed"
-			txn.LastError = fmt.Sprintf("recreate previous containers: %v", err)
-			_ = state.StoreManifestUpdateTransaction(instanceID, txn)
-			m.setObservedStatus(instanceID, StatusError)
-			return fmt.Errorf("manifest update recovery %s: recreate previous containers: %w", instanceID, err)
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("recreate previous containers: %w", err))
 		}
 	}
+	m.configureOIDCAuthorizePaths(instanceID, prevDef)
+	if err := m.rollbackTransactionProxyOIDCDelta(ctx, instanceID, txn, prevDef, failedDef); err != nil {
+		rollbackErrs = append(rollbackErrs, err)
+	}
+	if restoreErr := errors.Join(rollbackErrs...); restoreErr != nil {
+		txn.Phase = "restore_failed"
+		txn.LastError = restoreErr.Error()
+		_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("manifest update recovery %s: %w", instanceID, restoreErr)
+	}
+	m.ReconcileAllSlicePolicies()
 	if err := state.ClearManifestUpdateTransaction(instanceID, backupPath); err != nil {
 		log.Printf("WARN: manifest update recovery %s: cleanup transaction: %v", instanceID, err)
 	}
 	log.Printf("INFO: manifest update recovery %s: restored previous manifest/runtime from transaction phase %s", instanceID, txn.Phase)
 	return nil
+}
+
+func recoverLedgerCommitReached(state *FilesystemStateManager, appInst *AppInstance, txn *ManifestUpdateTransaction) bool {
+	if state == nil || appInst == nil || txn == nil || txn.Phase != "ledger_committing" {
+		return false
+	}
+	if txn.CandidateLedgerRevision <= 0 ||
+		strings.TrimSpace(txn.CandidateLedgerSourceHash) == "" ||
+		strings.TrimSpace(txn.CandidateManifestHash) == "" {
+		return false
+	}
+	st, err := state.LoadInstallState(appInst.InstanceID)
+	if err != nil {
+		return false
+	}
+	if st.Revision != txn.CandidateLedgerRevision || st.RawTemplateHash != txn.CandidateLedgerSourceHash {
+		return false
+	}
+	currentManifestHash, err := canonicalManifestHash(appInst.Definition)
+	if err != nil {
+		return false
+	}
+	return currentManifestHash == txn.CandidateManifestHash
 }

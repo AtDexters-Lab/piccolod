@@ -31,6 +31,16 @@ type FilesystemStateManager struct {
 
 	// File system mutex for atomic operations
 	fsMu sync.Mutex
+
+	// Test hook for fault-injecting install_state.json writes.
+	storeInstallStateHook func(instanceID string, st *InstallState) error
+
+	// Test hook for fault-injecting manifest update transaction writes.
+	storeManifestUpdateTransactionHook func(instanceID string, txn *ManifestUpdateTransaction) error
+
+	// Test hook for fault-injecting StoreApp after app.yaml is written and
+	// before metadata.json is written.
+	storeAppMetadataHook func(instanceID string, app *AppInstance) error
 }
 
 // AppMetadata represents runtime metadata stored separately from app.yaml.
@@ -413,6 +423,11 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 	}
 
 	metadataPath := filepath.Join(appDir, "metadata.json")
+	if fsm.storeAppMetadataHook != nil {
+		if err := fsm.storeAppMetadataHook(app.InstanceID, app); err != nil {
+			return fmt.Errorf("failed to write metadata.json: %w", err)
+		}
+	}
 	if err := fsutil.AtomicWriteFile(metadataPath, metadataData, 0644); err != nil {
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}
@@ -611,4 +626,3 @@ func (fsm *FilesystemStateManager) RemoveApp(instanceID string) error {
 
 	return nil
 }
-

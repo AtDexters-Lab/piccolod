@@ -27,6 +27,10 @@ class ManifestUpdateWizard extends StatefulWidget {
 
 class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
   final TextEditingController _yamlController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  final GlobalKey _dryRunSummaryKey = GlobalKey();
+  final GlobalKey _taskProgressKey = GlobalKey();
+  final GlobalKey _errorKey = GlobalKey();
   final Map<String, TextEditingController> _inputControllers = {};
   final Set<String> _regenerateInputs = {};
 
@@ -34,12 +38,14 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
   ManifestUpdateResult? _dryRun;
   String? _error;
   bool _busy = false;
+  bool _dryRunning = false;
   String? _taskId;
   bool _applied = false;
 
   @override
   void dispose() {
     _yamlController.dispose();
+    _scrollController.dispose();
     for (final controller in _inputControllers.values) {
       controller.dispose();
     }
@@ -50,6 +56,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
     final yaml = _yamlController.text.trim();
     if (yaml.isEmpty) {
       setState(() => _error = 'Manifest YAML is required.');
+      _revealError();
       return;
     }
     setState(() {
@@ -84,6 +91,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
     } on Object catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
+      _revealError();
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -100,6 +108,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
     }
     setState(() {
       _busy = true;
+      _dryRunning = true;
       _error = null;
       _dryRun = null;
     });
@@ -112,12 +121,64 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
       );
       if (!mounted) return;
       setState(() => _dryRun = result);
+      _revealDryRunSummary();
     } on Object catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
+      _revealError();
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _dryRunning = false;
+        });
+      }
     }
+  }
+
+  void _revealDryRunSummary() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final context = _dryRunSummaryKey.currentContext;
+      if (!mounted || context == null) return;
+      unawaited(
+        Scrollable.ensureVisible(
+          context,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+          alignment: 0.08,
+        ),
+      );
+    });
+  }
+
+  void _revealTaskProgress() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final context = _taskProgressKey.currentContext;
+      if (!mounted || context == null) return;
+      unawaited(
+        Scrollable.ensureVisible(
+          context,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+          alignment: 0.08,
+        ),
+      );
+    });
+  }
+
+  void _revealError() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final context = _errorKey.currentContext;
+      if (!mounted || context == null) return;
+      unawaited(
+        Scrollable.ensureVisible(
+          context,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+          alignment: 0.08,
+        ),
+      );
+    });
   }
 
   Object _valueForField(ManifestUpdateInputField field) {
@@ -156,6 +217,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
       _error = null;
       _taskId = taskId;
     });
+    _revealTaskProgress();
     try {
       await widget.appService.applyManifestUpdate(
         widget.appId,
@@ -169,6 +231,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
         _taskId = null;
         _error = e.toString();
       });
+      _revealError();
     }
   }
 
@@ -181,6 +244,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
         _taskId = null;
         _error = event.error;
       });
+      _revealError();
       return;
     }
     _applied = true;
@@ -197,6 +261,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxHeight: 720),
           child: SingleChildScrollView(
+            controller: _scrollController,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               mainAxisSize: MainAxisSize.min,
@@ -232,21 +297,30 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
                 ],
                 if (_dryRun != null) ...[
                   const SizedBox(height: Spacing.lg),
-                  _buildDryRunSummary(_dryRun!),
+                  KeyedSubtree(
+                    key: _dryRunSummaryKey,
+                    child: _buildDryRunSummary(_dryRun!),
+                  ),
                 ],
                 if (_taskId != null) ...[
                   const SizedBox(height: Spacing.lg),
-                  TaskProgressPanel(
-                    taskId: _taskId!,
-                    taskType: 'update_manifest',
-                    onComplete: (evt) => unawaited(_completeApply(evt)),
+                  KeyedSubtree(
+                    key: _taskProgressKey,
+                    child: TaskProgressPanel(
+                      taskId: _taskId!,
+                      taskType: 'update_manifest',
+                      onComplete: (evt) => unawaited(_completeApply(evt)),
+                    ),
                   ),
                 ],
                 if (_error != null) ...[
                   const SizedBox(height: Spacing.base),
-                  Text(
-                    _error!,
-                    style: const TextStyle(color: PiccoloTheme.critical),
+                  KeyedSubtree(
+                    key: _errorKey,
+                    child: Text(
+                      _error!,
+                      style: const TextStyle(color: PiccoloTheme.critical),
+                    ),
                   ),
                 ],
               ],
@@ -267,8 +341,14 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
                   _taskId != null
               ? null
               : _apply,
-          icon: const Icon(PiccoloIcons.check),
-          label: const Text('Apply'),
+          icon: _taskId == null
+              ? const Icon(PiccoloIcons.check)
+              : const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+          label: Text(_taskId == null ? 'Apply' : 'Applying'),
         ),
       ],
     );
@@ -298,10 +378,24 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
           alignment: Alignment.centerLeft,
           child: OutlinedButton.icon(
             onPressed: _busy ? null : _dryRunUpdate,
-            icon: const Icon(PiccoloIcons.search),
-            label: const Text('Dry Run'),
+            icon: _dryRunning
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(PiccoloIcons.search),
+            label: Text(_dryRunning ? 'Running Dry Run' : 'Dry Run'),
           ),
         ),
+        if (_dryRunning || _dryRun != null) ...[
+          const SizedBox(height: Spacing.sm),
+          _DryRunStatusStrip(
+            running: _dryRunning,
+            result: _dryRun,
+            onViewDetails: _dryRun == null ? null : _revealDryRunSummary,
+          ),
+        ],
       ],
     );
   }
@@ -406,6 +500,71 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
           _SummarySection(title: 'Rejected', items: summary.rejected),
       ],
     );
+  }
+}
+
+class _DryRunStatusStrip extends StatelessWidget {
+  const _DryRunStatusStrip({
+    required this.running,
+    required this.result,
+    required this.onViewDetails,
+  });
+
+  final bool running;
+  final ManifestUpdateResult? result;
+  final VoidCallback? onViewDetails;
+
+  @override
+  Widget build(BuildContext context) {
+    final result = this.result;
+    final applicable = result?.applicable ?? false;
+    final color = running
+        ? PiccoloTheme.inkMuted
+        : applicable
+        ? PiccoloTheme.success
+        : PiccoloTheme.critical;
+    final icon = running
+        ? PiccoloIcons.search
+        : applicable
+        ? PiccoloIcons.check
+        : PiccoloIcons.error;
+    final text = running ? 'Running dry run...' : _summaryText(result);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: Spacing.base,
+        vertical: Spacing.sm,
+      ),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+        borderRadius: BorderRadius.circular(Radii.sm),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 18),
+          const SizedBox(width: Spacing.sm),
+          Expanded(child: Text(text)),
+          if (!running && onViewDetails != null)
+            TextButton(
+              onPressed: onViewDetails,
+              child: const Text('View details'),
+            ),
+        ],
+      ),
+    );
+  }
+
+  String _summaryText(ManifestUpdateResult? result) {
+    if (result == null) return '';
+    if (!result.applicable) return 'Dry run rejected';
+    final summary = result.summary;
+    final changeCount =
+        summary.willChange.length +
+        summary.willRestart.length +
+        summary.expectedInterruption.length;
+    if (changeCount == 0) return 'Dry run complete: no runtime changes';
+    return 'Dry run complete: $changeCount change${changeCount == 1 ? '' : 's'}';
   }
 }
 

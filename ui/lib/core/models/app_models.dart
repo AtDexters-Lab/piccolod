@@ -351,6 +351,206 @@ class ManifestUpdateResult {
   final ManifestUpdateSummary summary;
 }
 
+class InstalledConfigReadResult {
+  const InstalledConfigReadResult({
+    required this.instanceId,
+    required this.ledgerHealth,
+    this.sourceKind = '',
+    this.sourceRef = '',
+    this.ledgerRevision = 0,
+    this.sourceHash = '',
+    this.inputSchemaHash = '',
+    this.fields = const [],
+    this.warnings = const [],
+  });
+
+  factory InstalledConfigReadResult.fromJson(Map<String, dynamic> json) {
+    final rawFields = json['fields'];
+    final rawWarnings = json['warnings'];
+    return InstalledConfigReadResult(
+      instanceId: (json['instance_id'] ?? '').toString(),
+      sourceKind: (json['source_kind'] ?? '').toString(),
+      sourceRef: (json['source_ref'] ?? '').toString(),
+      ledgerHealth: (json['ledger_health'] ?? '').toString(),
+      ledgerRevision: (json['ledger_revision'] as num?)?.toInt() ?? 0,
+      sourceHash: (json['source_hash'] ?? '').toString(),
+      inputSchemaHash: (json['input_schema_hash'] ?? '').toString(),
+      fields: rawFields is List<dynamic>
+          ? rawFields
+                .whereType<Map<dynamic, dynamic>>()
+                .map(
+                  (e) => InstalledConfigField.fromJson(
+                    Map<String, dynamic>.from(e),
+                  ),
+                )
+                .toList()
+          : const [],
+      warnings: rawWarnings is List<dynamic>
+          ? rawWarnings.map((e) => e.toString()).toList()
+          : const [],
+    );
+  }
+
+  final String instanceId;
+  final String sourceKind;
+  final String sourceRef;
+  final String ledgerHealth;
+  final int ledgerRevision;
+  final String sourceHash;
+  final String inputSchemaHash;
+  final List<InstalledConfigField> fields;
+  final List<String> warnings;
+
+  bool get recoverable => ledgerHealth == 'complete';
+}
+
+class InstalledConfigField {
+  const InstalledConfigField({
+    required this.name,
+    required this.type,
+    required this.required,
+    required this.generate,
+    required this.sensitive,
+    required this.present,
+    required this.provenance,
+    required this.editable,
+    this.label = '',
+    this.description = '',
+    this.display,
+    this.actions = const [],
+  });
+
+  factory InstalledConfigField.fromJson(Map<String, dynamic> json) {
+    final rawActions = json['actions'];
+    return InstalledConfigField(
+      name: (json['name'] ?? '').toString(),
+      type: (json['type'] ?? '').toString(),
+      label: (json['label'] ?? '').toString(),
+      description: (json['description'] ?? '').toString(),
+      required: json['required'] == true,
+      generate: json['generate'] == true,
+      sensitive: json['sensitive'] == true,
+      present: json['present'] == true,
+      display: json['display'],
+      provenance: (json['provenance'] ?? '').toString(),
+      editable: json['editable'] == true,
+      actions: rawActions is List<dynamic>
+          ? rawActions.map((e) => e.toString()).toList()
+          : const [],
+    );
+  }
+
+  final String name;
+  final String type;
+  final String label;
+  final String description;
+  final bool required;
+  final bool generate;
+  final bool sensitive;
+  final bool present;
+  final Object? display;
+  final String provenance;
+  final bool editable;
+  final List<String> actions;
+}
+
+class InstalledConfigActionSummary {
+  const InstalledConfigActionSummary({
+    required this.field,
+    required this.action,
+    required this.sensitive,
+    this.oldDisplay,
+    this.newDisplay,
+    this.consequence = '',
+  });
+
+  factory InstalledConfigActionSummary.fromJson(Map<String, dynamic> json) {
+    return InstalledConfigActionSummary(
+      field: (json['field'] ?? '').toString(),
+      action: (json['action'] ?? '').toString(),
+      sensitive: json['sensitive'] == true,
+      oldDisplay: json['old_display'],
+      newDisplay: json['new_display'],
+      consequence: (json['consequence'] ?? '').toString(),
+    );
+  }
+
+  final String field;
+  final String action;
+  final bool sensitive;
+  final Object? oldDisplay;
+  final Object? newDisplay;
+  final String consequence;
+}
+
+class InstalledConfigUpdateResult {
+  const InstalledConfigUpdateResult({
+    required this.instanceId,
+    required this.ledgerRevision,
+    required this.sourceHash,
+    required this.inputSchemaHash,
+    required this.baseManifestHash,
+    required this.runtimeFingerprint,
+    required this.candidateDigest,
+    required this.diffKind,
+    required this.applicable,
+    required this.metadataOnly,
+    required this.summary,
+    this.dryRunToken = '',
+    this.blockingReason = '',
+    this.actions = const [],
+  });
+
+  factory InstalledConfigUpdateResult.fromJson(Map<String, dynamic> json) {
+    final rawSummary = json['summary'];
+    final rawActions = json['actions'];
+    return InstalledConfigUpdateResult(
+      instanceId: (json['instance_id'] ?? '').toString(),
+      ledgerRevision: (json['ledger_revision'] as num?)?.toInt() ?? 0,
+      sourceHash: (json['source_hash'] ?? '').toString(),
+      inputSchemaHash: (json['input_schema_hash'] ?? '').toString(),
+      baseManifestHash: (json['base_manifest_hash'] ?? '').toString(),
+      runtimeFingerprint: (json['runtime_fingerprint'] ?? '').toString(),
+      dryRunToken: (json['dry_run_token'] ?? '').toString(),
+      candidateDigest: (json['candidate_digest'] ?? '').toString(),
+      diffKind: (json['diff_kind'] ?? '').toString(),
+      applicable: json['applicable'] == true,
+      blockingReason: (json['blocking_reason'] ?? '').toString(),
+      metadataOnly: json['metadata_only'] == true,
+      actions: rawActions is List<dynamic>
+          ? rawActions
+                .whereType<Map<dynamic, dynamic>>()
+                .map(
+                  (e) => InstalledConfigActionSummary.fromJson(
+                    Map<String, dynamic>.from(e),
+                  ),
+                )
+                .toList()
+          : const [],
+      summary: rawSummary is Map<dynamic, dynamic>
+          ? ManifestUpdateSummary.fromJson(
+              Map<String, dynamic>.from(rawSummary),
+            )
+          : const ManifestUpdateSummary(),
+    );
+  }
+
+  final String instanceId;
+  final int ledgerRevision;
+  final String sourceHash;
+  final String inputSchemaHash;
+  final String baseManifestHash;
+  final String runtimeFingerprint;
+  final String dryRunToken;
+  final String candidateDigest;
+  final String diffKind;
+  final bool applicable;
+  final String blockingReason;
+  final bool metadataOnly;
+  final List<InstalledConfigActionSummary> actions;
+  final ManifestUpdateSummary summary;
+}
+
 class AppContainerStatus {
   const AppContainerStatus({
     required this.service,

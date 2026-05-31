@@ -495,6 +495,57 @@ func (s *GinServer) handleGinAppManifestUpdate(c *gin.Context) {
 	writeGinSuccess(c, result, "Manifest update applied")
 }
 
+func (s *GinServer) handleGinAppConfigGet(c *gin.Context) {
+	appName := c.Param("name")
+	result, err := s.appManager.ReadInstalledConfig(c.Request.Context(), appName)
+	if err != nil {
+		if handleAppManagerError(c, err, "read installed config") {
+			return
+		}
+		writeGinError(c, http.StatusInternalServerError, "Failed to read installed config: "+err.Error())
+		return
+	}
+	writeGinSuccess(c, result, "Installed config loaded")
+}
+
+func (s *GinServer) handleGinAppConfigDryRun(c *gin.Context) {
+	appName := c.Param("name")
+	var req app.InstalledConfigUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeGinError(c, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+	result, err := s.appManager.DryRunInstalledConfigUpdate(c.Request.Context(), appName, req)
+	if err != nil {
+		if handleInstalledConfigError(c, err, "dry-run installed config update") {
+			return
+		}
+		writeGinError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeGinSuccess(c, result, "Installed config dry run complete")
+}
+
+func (s *GinServer) handleGinAppConfigApply(c *gin.Context) {
+	appName := c.Param("name")
+	var req app.InstalledConfigUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.DryRunToken) == "" {
+		writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected dry_run_token")
+		return
+	}
+	updateCtx, cancel := s.opContext(c, 10*time.Minute)
+	defer cancel()
+	result, err := s.appManager.ApplyInstalledConfigUpdate(updateCtx, appName, req)
+	if err != nil {
+		if handleInstalledConfigError(c, err, "apply installed config update") {
+			return
+		}
+		writeGinError(c, http.StatusInternalServerError, "Installed config update failed: "+err.Error())
+		return
+	}
+	writeGinSuccess(c, result, "Installed config applied")
+}
+
 // handleGinAppPreflight handles POST /api/v1/apps/preflight - validate manifest and report port claims
 func (s *GinServer) handleGinAppPreflight(c *gin.Context) {
 	def := s.parseAppDefinitionFromRequest(c)
@@ -717,37 +768,48 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		}
 	}
 
-	// Persist install state for catalog manifest sync. Skip entirely for
-	// non-catalog installs (custom Docker Hub flow): they have no
-	// CatalogSource so sync would never act on them, but install_state.json
-	// would still hold plaintext InstallInputs and OIDC ClientSecret for the
-	// app's lifetime — an avoidable secrets footprint.
+	initScriptHashes := map[string]string{}
+	for svcName, svc := range appDef.Services {
+		if svc.InitScript == nil || len(svc.InitScript.FileContent) == 0 {
+			continue
+		}
+		initScriptHashes[svcName] = app.Sha256Hex(svc.InitScript.FileContent)
+	}
+	sourceKind := app.InstallSourceKindCustom
 	if catalogSource != "" {
-		initScriptHashes := map[string]string{}
-		for svcName, svc := range appDef.Services {
-			if svc.InitScript == nil || len(svc.InitScript.FileContent) == 0 {
-				continue
+		sourceKind = app.InstallSourceKindCatalog
+	}
+	persistErr := s.appManager.RecordInstallState(installCtx, appInstance.InstanceID, app.RecordInstallStateInput{
+		CatalogManifestHash: func() string {
+			if catalogSource == "" {
+				return ""
 			}
-			initScriptHashes[svcName] = app.Sha256Hex(svc.InitScript.FileContent)
+			return pipelineRes.RawTemplateHash
+		}(),
+		InitScriptHashes: initScriptHashes,
+		InstallState: app.NewV2InstallState(
+			appInstance.InstanceID,
+			sourceKind,
+			catalogSource,
+			yamlData,
+			userInputs,
+			systemSnap,
+			pipelineRes.OIDCCredentials,
+			pipelineRes.UsedSecretOnlyInInitScript,
+		),
+	})
+	if persistErr != nil {
+		log.Printf("ERROR: failed to persist install config ledger for %s: %v. Rolling back install.", appInstance.InstanceID, persistErr)
+		if clientMgr != nil {
+			if delErr := clientMgr.DeleteClientsByAppID(installCtx, appInstance.InstanceID); delErr != nil {
+				log.Printf("WARN: failed to remove OIDC clients for rolled-back install %s: %v", appInstance.InstanceID, delErr)
+			}
 		}
-		persistErr := s.appManager.RecordInstallState(installCtx, appInstance.InstanceID, app.RecordInstallStateInput{
-			CatalogManifestHash: pipelineRes.RawTemplateHash,
-			InitScriptHashes:    initScriptHashes,
-			InstallState: &app.InstallState{
-				InstanceID:        appInstance.InstanceID,
-				InstallInputs:     userInputs,
-				InstallSystemCtx:  &systemSnap,
-				OIDCCredentials:   pipelineRes.OIDCCredentials,
-				SyncBlocked:       pipelineRes.UsedSecretOnlyInInitScript,
-				SyncBlockedReason: syncBlockedReason(pipelineRes.UsedSecretOnlyInInitScript),
-			},
-		})
-		if persistErr != nil {
-			// Persistence is best-effort: install already succeeded. Sync
-			// will treat the app as legacy on first contact and patch via
-			// allowlist.
-			log.Printf("WARN: install %s: persist install_state.json: %v", appInstance.InstanceID, persistErr)
+		if rbErr := s.appManager.Uninstall(installCtx, appInstance.InstanceID); rbErr != nil {
+			log.Printf("CRITICAL: failed to rollback uninstall for %s: %v", appInstance.InstanceID, rbErr)
 		}
+		writeGinError(c, http.StatusInternalServerError, "Failed to persist install config ledger: "+persistErr.Error())
+		return
 	}
 
 	s.queueAppRemoteCertificates(appInstance.InstanceID)
@@ -1299,6 +1361,25 @@ func handleManifestUpdateError(c *gin.Context, err error, action string) bool {
 		return true
 	}
 	if errors.Is(err, app.ErrManifestUpdateRejected) {
+		writeGinError(c, http.StatusConflict, err.Error())
+		return true
+	}
+	return false
+}
+
+func handleInstalledConfigError(c *gin.Context, err error, action string) bool {
+	if handleAppManagerError(c, err, action) {
+		return true
+	}
+	if errors.Is(err, app.ErrInstalledConfigConflict) {
+		writeGinError(c, http.StatusConflict, err.Error())
+		return true
+	}
+	if errors.Is(err, app.ErrInstalledConfigRejected) {
+		writeGinError(c, http.StatusConflict, err.Error())
+		return true
+	}
+	if errors.Is(err, app.ErrInstalledConfigUnavailable) {
 		writeGinError(c, http.StatusConflict, err.Error())
 		return true
 	}

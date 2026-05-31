@@ -207,6 +207,76 @@ paths:
               schema: { $ref: '#/components/schemas/ResponseManifestUpdateResult' }
         '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
         '409': { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+  /apps/{name}/config:
+    get:
+      summary: Read declared installed app config values
+      description: |
+        Loads the installed config ledger for an app and returns a redacted,
+        write-only field model. Legacy/custom installs without recoverable raw
+        source return ledger_health=unrecoverable with warnings instead of
+        exposing already-rendered secrets.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResponseInstalledConfigRead' }
+        '404': { description: Not Found, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+  /apps/{name}/config/dry-run:
+    post:
+      summary: Dry-run declared installed app config changes
+      description: |
+        Renders the currently-installed source with supplied value changes,
+        enforces the service-mode v1 config-update policy, and returns a
+        redacted change summary plus an opaque dry-run token when applicable.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstalledConfigUpdateRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResponseInstalledConfigUpdateResult' }
+        '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '409': { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+  /apps/{name}/config/apply:
+    post:
+      summary: Apply a confirmed installed app config update
+      description: |
+        Applies the exact rendered candidate identified by the dry-run token.
+        The apply path uses the same manifest/runtime/ledger transaction and
+        recovery guard as custom manifest update.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InstalledConfigUpdateRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResponseInstalledConfigUpdateResult' }
+        '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '409': { description: Conflict, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
   /apps/{name}/revert:
     post:
       summary: Revert an app to previous version
@@ -1340,6 +1410,111 @@ components:
         applicable: { type: boolean }
         blocking_reason: { type: string, nullable: true }
         metadata_only: { type: boolean }
+        summary: { $ref: '#/components/schemas/ManifestUpdateSummary' }
+    ResponseInstalledConfigRead:
+      type: object
+      properties:
+        data: { $ref: '#/components/schemas/InstalledConfigReadResult' }
+        message: { type: string }
+    InstalledConfigReadResult:
+      type: object
+      properties:
+        instance_id: { type: string }
+        source_kind:
+          type: string
+          enum: [catalog, custom]
+        source_ref: { type: string }
+        ledger_health:
+          type: string
+          enum: [complete, unrecoverable]
+        ledger_revision: { type: integer, format: int64 }
+        source_hash: { type: string }
+        input_schema_hash: { type: string }
+        fields:
+          type: array
+          items: { $ref: '#/components/schemas/InstalledConfigField' }
+        warnings:
+          type: array
+          items: { type: string }
+    InstalledConfigField:
+      type: object
+      properties:
+        name: { type: string }
+        type: { type: string }
+        label: { type: string }
+        description: { type: string }
+        required: { type: boolean }
+        generate: { type: boolean }
+        sensitive: { type: boolean }
+        present: { type: boolean }
+        display: {}
+        provenance:
+          type: string
+          enum: [operator, catalog_default, generated, system, legacy_unknown]
+        editable: { type: boolean }
+        actions:
+          type: array
+          items:
+            type: string
+            enum: [keep, replace, regenerate, clear]
+        schema: { $ref: '#/components/schemas/AppInput' }
+    InstalledConfigUpdateRequest:
+      type: object
+      properties:
+        inputs:
+          type: object
+          additionalProperties: true
+        secret_actions:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [keep, replace, clear]
+        regenerate_inputs:
+          type: array
+          items: { type: string }
+        dry_run_token: { type: string }
+        candidate_digest: { type: string }
+        ledger_revision: { type: integer, format: int64 }
+        source_hash: { type: string }
+        input_schema_hash: { type: string }
+        base_manifest_hash: { type: string }
+        runtime_fingerprint: { type: string }
+    ResponseInstalledConfigUpdateResult:
+      type: object
+      properties:
+        data: { $ref: '#/components/schemas/InstalledConfigUpdateResult' }
+        message: { type: string }
+    InstalledConfigActionSummary:
+      type: object
+      properties:
+        field: { type: string }
+        action:
+          type: string
+          enum: [replace, regenerate, clear]
+        sensitive: { type: boolean }
+        old_display: {}
+        new_display: {}
+        consequence: { type: string }
+    InstalledConfigUpdateResult:
+      type: object
+      properties:
+        instance_id: { type: string }
+        ledger_revision: { type: integer, format: int64 }
+        source_hash: { type: string }
+        input_schema_hash: { type: string }
+        base_manifest_hash: { type: string }
+        runtime_fingerprint: { type: string }
+        dry_run_token: { type: string, nullable: true }
+        candidate_digest: { type: string }
+        diff_kind:
+          type: string
+          enum: [none, oidc_library_only, structural_no_image, image_only, structural_with_image, unknown]
+        applicable: { type: boolean }
+        blocking_reason: { type: string, nullable: true }
+        metadata_only: { type: boolean }
+        actions:
+          type: array
+          items: { $ref: '#/components/schemas/InstalledConfigActionSummary' }
         summary: { $ref: '#/components/schemas/ManifestUpdateSummary' }
     ExportResponse:
       type: object

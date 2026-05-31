@@ -100,6 +100,12 @@ type AppManager struct {
 	// values stay process-local until apply consumes or expires the entry.
 	manifestUpdateMu         sync.Mutex
 	manifestUpdateCandidates map[string]*manifestUpdateCandidate
+
+	// Server-side dry-run candidates for installed app config updates. Tokens
+	// remain opaque so replacement secrets and generated values do not return
+	// to the browser after dry run.
+	configUpdateMu         sync.Mutex
+	configUpdateCandidates map[string]*installedConfigCandidate
 }
 
 var (
@@ -197,6 +203,7 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		runtimeUser:              *runtimeUser,
 		syncInFlight:             make(map[string]bool),
 		manifestUpdateCandidates: make(map[string]*manifestUpdateCandidate),
+		configUpdateCandidates:   make(map[string]*installedConfigCandidate),
 	}
 
 	return mgr, nil

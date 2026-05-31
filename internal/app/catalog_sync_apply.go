@@ -8,6 +8,7 @@ import (
 	"log"
 	"reflect"
 	"slices"
+	"strings"
 	"time"
 
 	"piccolod/internal/api"
@@ -226,21 +227,21 @@ func equalStringSliceUnordered(a, b []string) bool {
 
 // syncManifestIfDrifted is the per-app sync entry point. Implements the
 // flow described in the plan (Phase 5):
-//   1. follower / unlock / mode / disabled / catalog source guards
-//   2. fetch + hash compare
-//   3. retry throttle
-//   4. install state load (modern vs legacy)
-//   5. init script drift check
-//   6. re-render via pipeline (modern) or allowlist patch (legacy)
-//   7. canonical diff + classify
-//   8. backup + persist new app.yaml
-//   9. apply (live OIDC path or container recreate)
-//   10. proxy OIDC client delta
-//   11. failure → manifest-only rollback
+//  1. follower / unlock / mode / disabled / catalog source guards
+//  2. fetch + hash compare
+//  3. retry throttle
+//  4. install state load (modern vs legacy)
+//  5. init script drift check
+//  6. re-render via pipeline (modern) or allowlist patch (legacy)
+//  7. canonical diff + classify
+//  8. backup + persist new app.yaml
+//  9. apply (live OIDC path or container recreate)
+//  10. proxy OIDC client delta
+//  11. failure → manifest-only rollback
 //
 // manual=true bypasses the per-app SyncDisabled flag. The auto-ticker
 // always passes false; /sync/trigger and /sync/refresh-context pass true.
-func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID string, manual bool) error {
+func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID string, manual bool, stagedSystemCtx *InstallSystemContext) error {
 	host := m.currentSyncHost()
 	if host == nil {
 		return nil
@@ -363,8 +364,18 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 			log.Printf("WARN: catalog sync %s: backfill stub install_state.json: %v", instanceID, err)
 		}
 	case ierr != nil:
-		log.Printf("WARN: catalog sync %s: install_state.json malformed, treating as legacy: %v", instanceID, ierr)
-		installSt = &InstallState{InstanceID: instanceID, IsLegacyBackfill: true}
+		return m.recordSyncFailure(state, appInst, newHash, fmt.Errorf("install_state.json malformed: %w", ierr))
+	}
+
+	renderInstallSt := installSt
+	if stagedSystemCtx != nil && !installSt.IsLegacyBackfill && installSt.SchemaVersion >= installStateSchemaVersionConfig {
+		cloned, err := installSt.Clone()
+		if err != nil {
+			return m.recordSyncFailure(state, appInst, newHash, err)
+		}
+		fresh := *stagedSystemCtx
+		cloned.InstallSystemCtx = &fresh
+		renderInstallSt = cloned
 	}
 
 	var newDef *api.AppDefinition
@@ -387,17 +398,24 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		newCanonical = canon
 	} else {
 		// Modern path: full re-render via the install pipeline.
-		if installSt.InstallSystemCtx == nil {
+		if renderInstallSt.InstallSystemCtx == nil {
 			return m.recordSyncFailure(state, appInst, newHash, errors.New("modern install missing install_system_context"))
+		}
+		renderInputs := renderInstallSt.InstallInputs
+		if effectiveInputs, ok := catalogSyncRenderInputsForRawTemplate(instanceID, rawBytes, renderInstallSt.InstallInputs); ok {
+			renderInputs = effectiveInputs
 		}
 		res, perr := RunInstallPipeline(ctx, InstallPipelineInput{
 			RawTemplate:   rawBytes,
-			UserInputs:    installSt.InstallInputs,
-			SystemContext: *installSt.InstallSystemCtx,
+			UserInputs:    renderInputs,
+			SystemContext: *renderInstallSt.InstallSystemCtx,
 			InstanceID:    instanceID,
-			ExistingOIDC:  installSt.OIDCCredentials,
+			ExistingOIDC:  renderInstallSt.OIDCCredentials,
 		}, host.OIDCClientGenerator(), m.syncSelfSkippingLister(instanceID))
 		if perr != nil {
+			if storeErr := m.storePendingCatalogConfigSource(state, instanceID, installSt, rawBytes, perr); storeErr != nil {
+				log.Printf("WARN: catalog sync %s: store pending config source: %v", instanceID, storeErr)
+			}
 			return m.recordSyncFailure(state, appInst, newHash, perr)
 		}
 		// S1' invariant evaluation. Re-evaluate every sync — a previously
@@ -407,25 +425,31 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		blockedNow := res.UsedSecretOnlyInInitScript
 		blockedBefore := installSt.SyncBlocked
 		if blockedNow != blockedBefore {
-			installSt.SyncBlocked = blockedNow
-			if blockedNow {
-				installSt.SyncBlockedReason = "catalog uses oidc client_secret only in init_script scope; sync disabled to prevent silent rotation on container recreate"
-			} else {
-				installSt.SyncBlockedReason = ""
+			blockedState, err := installSt.Clone()
+			if err != nil {
+				return m.recordSyncFailure(state, appInst, newHash, err)
 			}
-			if err := state.StoreInstallState(instanceID, installSt); err != nil {
+			blockedState.SyncBlocked = blockedNow
+			if blockedNow {
+				blockedState.SyncBlockedReason = "catalog uses oidc client_secret only in init_script scope; sync disabled to prevent silent rotation on container recreate"
+			} else {
+				blockedState.SyncBlockedReason = ""
+			}
+			if err := state.StoreInstallState(instanceID, blockedState); err != nil {
 				log.Printf("WARN: catalog sync %s: persist sync_blocked verdict: %v", instanceID, err)
 			}
+			renderInstallSt.SyncBlocked = blockedState.SyncBlocked
+			renderInstallSt.SyncBlockedReason = blockedState.SyncBlockedReason
 		}
 		if blockedNow {
-			return m.recordSyncFailure(state, appInst, newHash, errors.New(installSt.SyncBlockedReason))
+			return m.recordSyncFailure(state, appInst, newHash, errors.New(renderInstallSt.SyncBlockedReason))
 		}
 		newDef = res.Definition
 		newCanonical = res.CanonicalBytes
 		// If the pipeline generated fresh credentials (catalog added an
 		// oidc_client to a service that didn't have one before), capture
 		// them for post-apply persistence.
-		if installSt.OIDCCredentials == nil && res.OIDCCredentials != nil {
+		if renderInstallSt.OIDCCredentials == nil && res.OIDCCredentials != nil {
 			freshOIDCCreds = res.OIDCCredentials
 		}
 
@@ -473,9 +497,15 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		if installSt.IsLegacyBackfill {
 			return m.recordSyncFailure(state, appInst, newHash, errors.New("legacy install: catalog changes are not allowlisted, manual reinstall required"))
 		}
+		renderInstallSt.markCatalogSourceCommitted(instanceID, appInst.CatalogSource, rawBytes)
+		if err := state.StoreInstallState(instanceID, renderInstallSt); err != nil {
+			return m.recordSyncFailure(state, appInst, newHash, fmt.Errorf("persist config ledger source: %w", err))
+		}
+		prevHash := appInst.CatalogManifestHash
 		appInst.CatalogManifestHash = newHash
 		appInst.LastSyncError = ""
 		if err := state.StoreAppMetadata(appInst); err != nil {
+			appInst.CatalogManifestHash = prevHash
 			return fmt.Errorf("persist hash bump: %w", err)
 		}
 		return nil
@@ -484,34 +514,69 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 	diffKind := classifyDiff(curDef, newDef)
 	switch diffKind {
 	case DiffKindNone:
+		renderInstallSt.markCatalogSourceCommitted(instanceID, appInst.CatalogSource, rawBytes)
+		if err := state.StoreInstallState(instanceID, renderInstallSt); err != nil {
+			return m.recordSyncFailure(state, appInst, newHash, fmt.Errorf("persist config ledger source: %w", err))
+		}
+		prevHash := appInst.CatalogManifestHash
 		appInst.CatalogManifestHash = newHash
 		appInst.LastSyncError = ""
-		return state.StoreAppMetadata(appInst)
+		if err := state.StoreAppMetadata(appInst); err != nil {
+			appInst.CatalogManifestHash = prevHash
+			return err
+		}
+		return nil
 	case DiffKindImageOnly, DiffKindStructuralWithImage:
 		// Sync does not apply image diffs; user must run UpdateImage.
 		return m.recordSyncFailure(state, appInst, newHash, fmt.Errorf("image update available — run UpdateImage (%s)", diffKind))
 	}
 
-	// Real apply: backup + persist + reconcile.
-	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
-		return m.recordSyncFailure(state, appInst, newHash, fmt.Errorf("backup app.yaml: %w", err))
-	}
-
 	prevDef := curDef
-	prevDefinition := *appInst.Definition
-	prevHash := appInst.CatalogManifestHash
-	// Persist the new definition to disk + cache, but DO NOT advance
-	// CatalogManifestHash yet — that gets set only after the apply commits
-	// successfully. If anything below fails the rollback path restores both
-	// the definition AND the hash, so background passes will retry.
-	appInst.Definition = newDef
-	appInst.LastSyncError = ""
-	if err := state.StoreApp(appInst); err != nil {
-		// Restore in-memory cache before bailing.
-		appInst.Definition = &prevDefinition
-		return m.recordSyncFailure(state, appInst, newHash, fmt.Errorf("persist new app.yaml: %w", err))
+	prevManifestHash := Sha256Hex(oldCanonical)
+	candidateDigest := Sha256Hex(newCanonical)
+	runtimeFingerprint, err := manifestRuntimeFingerprint(appInst)
+	if err != nil {
+		return m.recordSyncFailure(state, appInst, newHash, fmt.Errorf("fingerprint runtime: %w", err))
 	}
 
+	nextInstallSt, err := renderInstallSt.Clone()
+	if err != nil {
+		return m.recordSyncFailure(state, appInst, newHash, err)
+	}
+	nextInstallSt.markCatalogSourceCommitted(instanceID, appInst.CatalogSource, rawBytes)
+	if freshOIDCCreds != nil {
+		nextInstallSt.OIDCCredentials = freshOIDCCreds
+	}
+	applyTxn, err := m.beginInstalledAppApplyTransaction(ctx, state, installedAppApplyTransactionSpec{
+		OperationKind:             "catalog_sync",
+		TaskType:                  taskTypeUpdateManifest,
+		RollbackPrefix:            "catalog sync rolled back",
+		InstanceID:                instanceID,
+		AppInst:                   appInst,
+		PreviousDefinition:        prevDef,
+		CandidateDefinition:       newDef,
+		PreviousManifestHash:      prevManifestHash,
+		CandidateManifestHash:     candidateDigest,
+		PreviousLedgerRevision:    installSt.Revision,
+		CandidateLedgerRevision:   nextInstallSt.Revision,
+		PreviousLedgerSourceHash:  installSt.RawTemplateHash,
+		CandidateLedgerSourceHash: nextInstallSt.RawTemplateHash,
+		RuntimeFingerprint:        runtimeFingerprint,
+		MetadataOnly:              diffKind == DiffKindOIDCLibraryOnly,
+		ApplyPhase:                taskPhaseApplyingManifest,
+		ApplyMessage:              "Persisting catalog manifest",
+		FinalizingMessage:         "Saving catalog config ledger",
+	})
+	if err != nil {
+		return m.recordSyncFailure(state, appInst, newHash, err)
+	}
+	failApply := func(cause error) error {
+		if rollbackErr := applyTxn.rollback(cause); rollbackErr != nil {
+			m.setObservedStatus(instanceID, StatusError)
+			return m.recordSyncFailure(state, appInst, newHash, rollbackErr)
+		}
+		return m.recordSyncFailure(state, appInst, newHash, fmt.Errorf("catalog sync rolled back: %w", cause))
+	}
 	// commitHash bumps CatalogManifestHash to newHash and persists it. Called
 	// only on success paths after the apply (or no-op-write paths) commits.
 	commitHash := func() error {
@@ -519,32 +584,9 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		appInst.LastSyncError = ""
 		return state.StoreAppMetadata(appInst)
 	}
-	// failPreApply rolls back the in-memory + on-disk definition to prevDef
-	// WITHOUT touching containers (used when sync fails before any container
-	// modification has happened — e.g. PersistOIDCClient failure).
-	failPreApply := func(cause error) error {
-		appInst.Definition = &prevDefinition
-		if err := state.StoreApp(appInst); err != nil {
-			log.Printf("WARN: catalog sync %s: restore app.yaml after pre-apply failure: %v", instanceID, err)
-		}
-		appInst.CatalogManifestHash = prevHash
-		return m.recordSyncFailure(state, appInst, newHash, cause)
-	}
-	// failApply rolls back the definition to prevDef and tears down + rebuilds
-	// containers from prevDef (used when applySyncedDefinition itself failed
-	// after partially mutating runtime state).
-	failApply := func(applyErr error) error {
-		rollbackErr := m.rollbackManifestOnly(ctx, host, instanceID, appInst, prevDef)
-		// rollbackManifestOnly leaves appInst.Definition pointing at prevDef
-		// on success. Reset the hash so future passes still see drift.
-		appInst.CatalogManifestHash = prevHash
-		if rollbackErr != nil {
-			m.setObservedStatus(instanceID, StatusError)
-			failMsg := fmt.Sprintf("sync failed: %v; rollback failed: %v", applyErr, rollbackErr)
-			_ = m.recordSyncFailure(state, appInst, prevHash, errors.New(failMsg))
-			return errors.New(failMsg)
-		}
-		return m.recordSyncFailure(state, appInst, newHash, fmt.Errorf("sync rolled back: %w", applyErr))
+
+	if err := applyTxn.persistCandidateManifest(); err != nil {
+		return m.recordSyncFailure(state, appInst, newHash, err)
 	}
 
 	// If the catalog added oidc_client to a service that didn't have one,
@@ -554,12 +596,11 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 	// containers would come up with an unregistered client; abort using the
 	// pre-apply rollback path (no containers have been touched yet).
 	if freshOIDCCreds != nil {
-		if err := host.PersistOIDCClient(ctx, freshOIDCCreds.ClientID, freshOIDCCreds.ClientSecret, instanceID); err != nil {
-			return failPreApply(fmt.Errorf("persist new oidc client: %w", err))
+		if err := applyTxn.markCreatedOIDCClient(freshOIDCCreds.ClientID); err != nil {
+			return m.recordSyncFailure(state, appInst, newHash, err)
 		}
-		installSt.OIDCCredentials = freshOIDCCreds
-		if err := state.StoreInstallState(instanceID, installSt); err != nil {
-			log.Printf("WARN: catalog sync %s: persist install_state.json after oidc registration: %v", instanceID, err)
+		if err := host.PersistOIDCClient(ctx, freshOIDCCreds.ClientID, freshOIDCCreds.ClientSecret, instanceID); err != nil {
+			return failApply(fmt.Errorf("persist new oidc client: %w", err))
 		}
 	}
 
@@ -570,8 +611,34 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 	// shares; the reconcile mutex serializes against concurrent changes.
 	m.ReconcileAllSlicePolicies()
 
-	if applyErr := m.applySyncedDefinition(ctx, host, instanceID, appInst, newDef, prevDef, diffKind); applyErr != nil {
-		return failApply(applyErr)
+	switch diffKind {
+	case DiffKindOIDCLibraryOnly:
+		m.configureOIDCAuthorizePaths(instanceID, newDef)
+		if proxyOIDCDeltaRequired(host, prevDef, newDef) {
+			if err := applyTxn.markProxyOIDCDeltaApplied(); err != nil {
+				return m.recordSyncFailure(state, appInst, newHash, err)
+			}
+		}
+		if err := m.applyProxyOIDCDelta(ctx, host, instanceID, prevDef, newDef); err != nil {
+			return failApply(err)
+		}
+	case DiffKindStructuralNoImage:
+		if err := applyTxn.recreateRuntimeIfNeeded(); err != nil {
+			return m.recordSyncFailure(state, appInst, newHash, err)
+		}
+		if proxyOIDCDeltaRequired(host, prevDef, newDef) {
+			if err := applyTxn.markProxyOIDCDeltaApplied(); err != nil {
+				return m.recordSyncFailure(state, appInst, newHash, err)
+			}
+		}
+		if err := m.applyProxyOIDCDelta(ctx, host, instanceID, prevDef, newDef); err != nil {
+			return failApply(err)
+		}
+	default:
+		return failApply(fmt.Errorf("unsupported sync diff kind %s", diffKind))
+	}
+	if err := applyTxn.commitLedger(nextInstallSt); err != nil {
+		return m.recordSyncFailure(state, appInst, newHash, err)
 	}
 	if err := commitHash(); err != nil {
 		// Apply succeeded but hash commit failed — log and let next pass
@@ -579,6 +646,7 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		// canonical equality and just bump the hash).
 		log.Printf("WARN: catalog sync %s: persist hash post-apply: %v", instanceID, err)
 	}
+	applyTxn.complete()
 	log.Printf("INFO: catalog sync %s: applied %s", instanceID, diffKind)
 	return nil
 }
@@ -594,6 +662,27 @@ func (m *AppManager) recordSyncFailure(state *FilesystemStateManager, appInst *A
 		return fmt.Errorf("persist sync failure (%v): %w", cause, err)
 	}
 	return cause
+}
+
+func (m *AppManager) storePendingCatalogConfigSource(state *FilesystemStateManager, instanceID string, st *InstallState, raw []byte, cause error) error {
+	if state == nil || st == nil || st.IsLegacyBackfill || st.SchemaVersion < installStateSchemaVersionConfig {
+		return nil
+	}
+	if _, err := ParseAppSchema(raw); err != nil {
+		return nil
+	}
+	next, err := st.Clone()
+	if err != nil {
+		return err
+	}
+	reason := strings.TrimSpace(cause.Error())
+	if reason == "" {
+		reason = "catalog sync render failed"
+	}
+	if !next.markPendingCatalogSource(instanceID, raw, reason) {
+		return nil
+	}
+	return state.StoreInstallState(instanceID, next)
 }
 
 // applySyncedDefinition routes a non-no-op diff to the right apply path:
@@ -788,6 +877,13 @@ func (m *AppManager) applyProxyOIDCDelta(ctx context.Context, host SyncHost, ins
 		host.DeleteProxyOIDCClient(ctx, instanceID)
 	}
 	return nil
+}
+
+func proxyOIDCDeltaRequired(host SyncHost, oldDef, newDef *api.AppDefinition) bool {
+	if host == nil {
+		return false
+	}
+	return host.RequiresProxyOIDCClient(oldDef) != host.RequiresProxyOIDCClient(newDef)
 }
 
 // initScriptDrift compares init_script declarations between the current
@@ -1022,4 +1118,3 @@ func (m *AppManager) syncSelfSkippingLister(skipInstanceID string) AppLister {
 		return out, nil
 	})
 }
-

@@ -318,6 +318,68 @@ class AppService {
     );
   }
 
+  Future<InstalledConfigReadResult> getInstalledConfig(String appId) async {
+    final data = await _client.get('/api/v1/apps/$appId/config');
+    final rawData = (data as Map<String, dynamic>)['data'];
+    return InstalledConfigReadResult.fromJson(
+      rawData is Map<dynamic, dynamic>
+          ? Map<String, dynamic>.from(rawData)
+          : <String, dynamic>{},
+    );
+  }
+
+  Future<InstalledConfigUpdateResult> dryRunInstalledConfigUpdate(
+    String appId, {
+    required Map<String, dynamic> inputs,
+    required Map<String, String> secretActions,
+    required List<String> regenerateInputs,
+    required InstalledConfigReadResult base,
+  }) async {
+    final data = await _client.post(
+      '/api/v1/apps/$appId/config/dry-run',
+      body: {
+        'inputs': inputs,
+        'secret_actions': secretActions,
+        'regenerate_inputs': regenerateInputs,
+        'ledger_revision': base.ledgerRevision,
+        'source_hash': base.sourceHash,
+        'input_schema_hash': base.inputSchemaHash,
+      },
+    );
+    final rawData = (data as Map<String, dynamic>)['data'];
+    return InstalledConfigUpdateResult.fromJson(
+      rawData is Map<dynamic, dynamic>
+          ? Map<String, dynamic>.from(rawData)
+          : <String, dynamic>{},
+    );
+  }
+
+  Future<InstalledConfigUpdateResult> applyInstalledConfigUpdate(
+    String appId,
+    InstalledConfigUpdateResult dryRun, {
+    String? taskId,
+  }) async {
+    final data = await _client.post(
+      '/api/v1/apps/$appId/config/apply',
+      body: {
+        'dry_run_token': dryRun.dryRunToken,
+        'candidate_digest': dryRun.candidateDigest,
+        'ledger_revision': dryRun.ledgerRevision,
+        'source_hash': dryRun.sourceHash,
+        'input_schema_hash': dryRun.inputSchemaHash,
+        'base_manifest_hash': dryRun.baseManifestHash,
+        'runtime_fingerprint': dryRun.runtimeFingerprint,
+      },
+      headers: _taskHeaders(taskId),
+    );
+    final rawData = (data as Map<String, dynamic>)['data'];
+    return InstalledConfigUpdateResult.fromJson(
+      rawData is Map<dynamic, dynamic>
+          ? Map<String, dynamic>.from(rawData)
+          : <String, dynamic>{},
+    );
+  }
+
   Future<App> installAppWithInputs(
     String yamlContent,
     Map<String, dynamic> inputs, {

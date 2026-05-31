@@ -72,6 +72,7 @@ type SyncHost interface {
 	// client manager. Called by sync when the catalog adds oidc_client to a
 	// service that didn't previously declare one.
 	PersistOIDCClient(ctx context.Context, clientID, clientSecret, appID string) error
+	DeleteOIDCClient(ctx context.Context, clientID string) error
 
 	// RequiresProxyOIDCClient mirrors the GinServer helper of the same name.
 	// Sync uses this to compute proxy-client register/delete deltas.
@@ -167,7 +168,7 @@ func (m *AppManager) runCatalogSyncPass(ctx context.Context) {
 		if inst.CatalogSource == "" {
 			continue
 		}
-		if err := m.syncManifestIfDrifted(ctx, inst.InstanceID, false); err != nil {
+		if err := m.syncManifestIfDrifted(ctx, inst.InstanceID, false, nil); err != nil {
 			log.Printf("WARN: catalog sync %s: %v", inst.InstanceID, err)
 		}
 	}
@@ -247,7 +248,7 @@ func (m *AppManager) SyncManifest(ctx context.Context, instanceID string) error 
 	if _, err := m.ensureStateManager(); err != nil {
 		return err
 	}
-	return m.syncManifestIfDrifted(ctx, instanceID, true)
+	return m.syncManifestIfDrifted(ctx, instanceID, true, nil)
 }
 
 // SetSyncDisabled persists the per-app sync opt-out flag. When clearing
@@ -313,9 +314,9 @@ func (m *AppManager) GetSyncStatus(ctx context.Context, instanceID string) (*Syn
 }
 
 // RefreshInstallSystemContext re-snapshots the live host system context and
-// persists it to install_state.json, then triggers a sync. AR-1 mitigation:
-// after admin enrolls a new portal or changes timezone, this endpoint
-// repairs the frozen context. Leader-only.
+// stages it through catalog sync. AR-1 mitigation: after admin enrolls a new
+// portal or changes timezone, this endpoint repairs the frozen context.
+// Leader-only.
 func (m *AppManager) RefreshInstallSystemContext(ctx context.Context, instanceID string) error {
 	host := m.currentSyncHost()
 	if host == nil {
@@ -339,9 +340,31 @@ func (m *AppManager) RefreshInstallSystemContext(ctx context.Context, instanceID
 		st = &InstallState{InstanceID: instanceID, IsLegacyBackfill: true}
 	}
 	fresh := host.CurrentInstallSystemContext()
-	st.InstallSystemCtx = &fresh
-	if err := state.StoreInstallState(instanceID, st); err != nil {
-		return err
+
+	if st.IsLegacyBackfill || st.SchemaVersion < installStateSchemaVersionConfig {
+		hadInstallState := !errors.Is(err, ErrInstallStateNotFound)
+		previous, err := st.Clone()
+		if err != nil {
+			return err
+		}
+		st.InstallSystemCtx = &fresh
+		if err := state.StoreInstallState(instanceID, st); err != nil {
+			return err
+		}
+		if err := m.syncManifestIfDrifted(ctx, instanceID, true, nil); err != nil {
+			var restoreErr error
+			if hadInstallState && previous != nil {
+				restoreErr = state.StoreInstallState(instanceID, previous)
+			} else {
+				restoreErr = state.DeleteInstallState(instanceID)
+			}
+			if restoreErr != nil {
+				return errors.Join(err, fmt.Errorf("restore install context after sync failure: %w", restoreErr))
+			}
+			return err
+		}
+		return nil
 	}
-	return m.SyncManifest(ctx, instanceID)
+
+	return m.syncManifestIfDrifted(ctx, instanceID, true, &fresh)
 }

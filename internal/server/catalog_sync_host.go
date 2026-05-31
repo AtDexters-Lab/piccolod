@@ -68,6 +68,17 @@ func (h catalogSyncHost) PersistOIDCClient(ctx context.Context, clientID, client
 	return mgr.CreateClient(ctx, clientID, clientSecret, appID)
 }
 
+func (h catalogSyncHost) DeleteOIDCClient(ctx context.Context, clientID string) error {
+	if h.server == nil {
+		return errCatalogManagerUnavailable
+	}
+	mgr := h.server.getOIDCClientManager()
+	if mgr == nil {
+		return errCatalogManagerUnavailable
+	}
+	return mgr.DeleteClient(ctx, clientID)
+}
+
 func (h catalogSyncHost) RequiresProxyOIDCClient(def *api.AppDefinition) bool {
 	if h.server == nil {
 		return false

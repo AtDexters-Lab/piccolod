@@ -7,6 +7,7 @@ import 'package:piccolo_os/core/models/listener_health.dart';
 import 'package:piccolo_os/core/services/app_service.dart';
 import 'package:piccolo_os/core/utils/task_id.dart';
 import 'package:piccolo_os/features/apps/app_launcher.dart';
+import 'package:piccolo_os/features/apps/installed_config_wizard.dart';
 import 'package:piccolo_os/features/apps/manifest_update_wizard.dart';
 import 'package:piccolo_os/features/apps/widgets/edit_listeners_dialog.dart';
 import 'package:piccolo_os/features/apps/widgets/health_banner.dart';
@@ -240,6 +241,24 @@ class _AppDetailViewState extends State<AppDetailView>
         context: context,
         barrierDismissible: false,
         builder: (context) => ManifestUpdateWizard(
+          appId: _app!.name,
+          appService: widget.appService,
+          onApplied: () async {
+            widget.desktopController.notifyAppsChanged();
+            await _loadData();
+          },
+        ),
+      ),
+    );
+  }
+
+  void _showInstalledConfigWizard() {
+    if (_app == null) return;
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => InstalledConfigWizard(
           appId: _app!.name,
           appService: widget.appService,
           onApplied: () async {
@@ -530,6 +549,14 @@ class _AppDetailViewState extends State<AppDetailView>
                     style: FilledButton.styleFrom(
                       backgroundColor: PiccoloTheme.cobalt600,
                     ),
+                  ),
+                  const SizedBox(width: Spacing.md),
+                ],
+                if (!_app!.isWorkspace) ...[
+                  OutlinedButton.icon(
+                    onPressed: _showInstalledConfigWizard,
+                    icon: const Icon(PiccoloIcons.settings),
+                    label: const Text('Edit Config'),
                   ),
                   const SizedBox(width: Spacing.md),
                 ],

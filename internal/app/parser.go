@@ -508,7 +508,7 @@ func backfillInputDefaults(declared map[string]api.AppInput, provided map[string
 			continue // let missingkey=error catch missing required inputs
 		}
 		if spec.Default != nil {
-			merged[name] = spec.Default
+			merged[name] = normalizeInputValueForValidation(spec.Type, spec.Default)
 			continue
 		}
 		switch spec.Type {
@@ -523,6 +523,42 @@ func backfillInputDefaults(declared map[string]api.AppInput, provided map[string
 		}
 	}
 	return merged
+}
+
+func normalizeInputValueForValidation(inputType string, value interface{}) interface{} {
+	switch inputType {
+	case "int", "number":
+		switch v := value.(type) {
+		case int:
+			return float64(v)
+		case int8:
+			return float64(v)
+		case int16:
+			return float64(v)
+		case int32:
+			return float64(v)
+		case int64:
+			return float64(v)
+		case uint:
+			return float64(v)
+		case uint8:
+			return float64(v)
+		case uint16:
+			return float64(v)
+		case uint32:
+			return float64(v)
+		case uint64:
+			return float64(v)
+		case float32:
+			return float64(v)
+		case json.Number:
+			f, err := v.Float64()
+			if err == nil {
+				return f
+			}
+		}
+	}
+	return value
 }
 
 // ValidateInputs validates user-provided inputs against their declared types and constraints.

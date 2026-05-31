@@ -8,6 +8,7 @@ const (
 	taskTypeUpdateListeners = "update_listeners"
 	taskTypeUpdateImage     = "update_image"
 	taskTypeUpdateManifest  = "update_manifest"
+	taskTypeUpdateConfig    = "update_config"
 	taskTypeRollbackApp     = "rollback_app"
 )
 
@@ -25,6 +26,7 @@ const (
 	taskPhaseStarting            = "starting"
 	taskPhaseStopping            = "stopping"
 	taskPhaseUpdatingServices    = "updating_services"
+	taskPhaseApplyingConfig      = "applying_config"
 	taskPhaseValidating          = "validating"
 	taskPhaseApplyingManifest    = "applying_manifest"
 	taskPhaseRestoringManifest   = "restoring_manifest"
