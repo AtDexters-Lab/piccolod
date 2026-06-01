@@ -870,6 +870,12 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 	if err := validateListeners(app.Listeners, mode); err != nil {
 		return err
 	}
+	if usesConnectionAuthMTLS(app.Listeners) && !hasRequiredFeature(app, api.FeatureConnectionAuthMTLSV1) {
+		return newValidationError("MISSING_REQUIRED_FEATURE", fmt.Sprintf("connection_auth.mtls requires x-piccolo.requires_features to include %q", api.FeatureConnectionAuthMTLSV1))
+	}
+	if err := validateListenerPortOwnership(app.Services, app.Listeners); err != nil {
+		return err
+	}
 
 	// Validate storage
 	if err := validateStorage(app.Storage); err != nil {
@@ -934,6 +940,86 @@ func validatePiccoloExtensions(app *api.AppDefinition) error {
 		return fmt.Errorf("x-piccolo.mode is required; must be 'service' or 'workspace'")
 	}
 
+	if err := validateRequiredFeatures(app); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func extensionStringSlice(extensions map[string]interface{}, key string) ([]string, bool, error) {
+	if extensions == nil {
+		return nil, false, nil
+	}
+	raw, ok := extensions[key]
+	if !ok {
+		return nil, false, nil
+	}
+	if stringsSlice, ok := raw.([]string); ok {
+		out := make([]string, 0, len(stringsSlice))
+		for i, s := range stringsSlice {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return nil, true, fmt.Errorf("x-piccolo.%s[%d] must not be empty", key, i)
+			}
+			out = append(out, s)
+		}
+		return out, true, nil
+	}
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil, true, fmt.Errorf("x-piccolo.%s must be a list of strings", key)
+	}
+	out := make([]string, 0, len(items))
+	for i, item := range items {
+		s, ok := item.(string)
+		if !ok {
+			return nil, true, fmt.Errorf("x-piccolo.%s[%d] must be a string", key, i)
+		}
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return nil, true, fmt.Errorf("x-piccolo.%s[%d] must not be empty", key, i)
+		}
+		out = append(out, s)
+	}
+	return out, true, nil
+}
+
+func hasRequiredFeature(app *api.AppDefinition, feature string) bool {
+	features, _, err := extensionStringSlice(app.Extensions, "requires_features")
+	if err != nil {
+		return false
+	}
+	for _, f := range features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
+}
+
+func usesConnectionAuthMTLS(listeners []api.AppListener) bool {
+	for _, l := range listeners {
+		if l.ConnectionAuth.RequiresMTLS() {
+			return true
+		}
+	}
+	return false
+}
+
+func validateRequiredFeatures(app *api.AppDefinition) error {
+	features, _, err := extensionStringSlice(app.Extensions, "requires_features")
+	if err != nil {
+		return err
+	}
+	for _, f := range features {
+		switch f {
+		case api.FeatureConnectionAuthMTLSV1:
+			// supported by this binary
+		default:
+			return fmt.Errorf("x-piccolo.requires_features contains unsupported feature %q", f)
+		}
+	}
 	return nil
 }
 
@@ -984,7 +1070,7 @@ func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
 			return fmt.Errorf("primary_service '%s' not found in services", primary)
 		}
 
-		return validateServices(app.Services, primary, app.Listeners)
+		return validateServices(app.Services, primary)
 	case ModeWorkspace:
 		if len(app.Services) == 0 {
 			return fmt.Errorf("services is required for workspace mode apps")
@@ -1019,7 +1105,7 @@ func validateContainerModel(app *api.AppDefinition, mode PiccoloMode) error {
 		if _, ok := app.Services[primary]; !ok {
 			return fmt.Errorf("primary_service '%s' not found in services", primary)
 		}
-		return validateServices(app.Services, primary, app.Listeners)
+		return validateServices(app.Services, primary)
 	}
 
 	return nil
@@ -1039,7 +1125,7 @@ func validateServiceName(name string) error {
 	return nil
 }
 
-func validateServices(services map[string]api.AppService, primary string, listeners []api.AppListener) error {
+func validateServices(services map[string]api.AppService, primary string) error {
 	oidcEnv := make(map[string]string)
 
 	// Validate service specs first (names, images, per-service storage/resources).
@@ -1122,21 +1208,6 @@ func validateServices(services map[string]api.AppService, primary string, listen
 		}
 	}
 
-	// Primary service must declare all listener guest ports (v1 listeners target primary by default).
-	// Skip this check for single-service apps since port conflicts are impossible.
-	if len(services) > 1 {
-		primarySvc := services[primary]
-		primaryPorts := make(map[int]struct{}, len(primarySvc.BindPorts))
-		for _, p := range primarySvc.BindPorts {
-			primaryPorts[p] = struct{}{}
-		}
-		for _, l := range listeners {
-			if _, ok := primaryPorts[l.GuestPort]; !ok {
-				return fmt.Errorf("primary service '%s' must declare listener guest_port %d in bind_ports", primary, l.GuestPort)
-			}
-		}
-	}
-
 	// Explicit persistent volume sharing rules.
 	type volumeRef struct {
 		service   string
@@ -1173,6 +1244,27 @@ func validateServices(services map[string]api.AppService, primary string, listen
 		}
 	}
 
+	return nil
+}
+
+func validateListenerPortOwnership(services map[string]api.AppService, listeners []api.AppListener) error {
+	if len(listeners) == 0 {
+		return nil
+	}
+	portOwners := make(map[int]string)
+	for name, svc := range services {
+		for _, port := range svc.BindPorts {
+			if port < 1 || port > 65535 {
+				continue
+			}
+			portOwners[port] = name
+		}
+	}
+	for _, l := range listeners {
+		if _, ok := portOwners[l.GuestPort]; !ok {
+			return fmt.Errorf("listener '%s' guest_port %d must be declared in exactly one service bind_ports", l.Name, l.GuestPort)
+		}
+	}
 	return nil
 }
 
@@ -1313,6 +1405,12 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 			return newValidationError("INVALID_TLS_WRAP", fmt.Sprintf("listener '%s' tls_wrap is only valid on flow:tcp + protocol:raw, got flow:%s + protocol:%s", l.Name, l.Flow.String(), l.Protocol.String()))
 		}
 
+		for j, p := range l.RemotePorts {
+			if p < 1 || p > 65535 {
+				return newValidationError("INVALID_REMOTE_PORT", fmt.Sprintf("listener '%s' remote_ports[%d] must be between 1 and 65535", l.Name, j))
+			}
+		}
+
 		// middleware entries: ensure names present
 		for j, m := range l.Middleware {
 			if strings.TrimSpace(m.Name) == "" {
@@ -1389,6 +1487,27 @@ func validateListeners(listeners []api.AppListener, mode PiccoloMode) error {
 				}
 				if _, _, err := net.ParseCIDR(rule.Match); err != nil {
 					return newValidationError("INVALID_CONN_AUTH_MATCH", fmt.Sprintf("listener '%s' connection_auth.rules[%d].match: invalid CIDR %q: %v", l.Name, j, rule.Match, err))
+				}
+			}
+			if l.ConnectionAuth.MTLS != nil {
+				l.ConnectionAuth.MTLS.Verifier.Type = strings.TrimSpace(l.ConnectionAuth.MTLS.Verifier.Type)
+				if l.ConnectionAuth.MTLS.Verifier.Type != "piccolo_session" {
+					return newValidationError("INVALID_CONN_AUTH_MTLS_VERIFIER", fmt.Sprintf("listener '%s' connection_auth.mtls.verifier.type must be \"piccolo_session\"", l.Name))
+				}
+				if l.Flow == api.FlowUDP {
+					return newValidationError("INVALID_CONN_AUTH_MTLS_PLACEMENT", fmt.Sprintf("listener '%s' connection_auth.mtls is not valid on flow:udp", l.Name))
+				}
+				if l.Flow == api.FlowTLS {
+					return newValidationError("INVALID_CONN_AUTH_MTLS_PLACEMENT", fmt.Sprintf("listener '%s' connection_auth.mtls is not valid on flow:tls because the app terminates TLS", l.Name))
+				}
+				if l.IsRawTCP() && !l.TLSWrap {
+					return newValidationError("INVALID_CONN_AUTH_MTLS_PLACEMENT", fmt.Sprintf("listener '%s' connection_auth.mtls on raw TCP requires tls_wrap: true", l.Name))
+				}
+				if !l.IsRawTCP() && l.Protocol != api.ListenerProtocolHTTP && l.Protocol != api.ListenerProtocolWebsocket {
+					return newValidationError("INVALID_CONN_AUTH_MTLS_PLACEMENT", fmt.Sprintf("listener '%s' connection_auth.mtls requires HTTP, WebSocket, or raw TCP with tls_wrap", l.Name))
+				}
+				if l.PortClaim != nil {
+					return newValidationError("INVALID_CONN_AUTH_MTLS_PORT_CLAIM", fmt.Sprintf("listener '%s' connection_auth.mtls cannot be combined with port_claim in v1", l.Name))
 				}
 			}
 		}

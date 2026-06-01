@@ -108,6 +108,117 @@ func TestProxy_PassthroughTCP(t *testing.T) {
 	}
 }
 
+func TestProxy_PassthroughTCPHalfCloseKeepsResponse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer ln.Close()
+	backendDone := make(chan struct{})
+	go func() {
+		defer close(backendDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
+		_, _ = conn.Write([]byte("backend-response"))
+	}()
+
+	pm := NewProxyManager()
+	public := getFreePort(t)
+	ep := ServiceEndpoint{App: "test", Name: "raw", GuestPort: 0, HostBind: ln.Addr().(*net.TCPAddr).Port, PublicPort: public, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw}
+	pm.StartListener(ep)
+	defer pm.StopAll()
+
+	time.Sleep(100 * time.Millisecond)
+
+	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(public)))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	tcpConn := conn.(*net.TCPConn)
+	if _, err := tcpConn.Write([]byte("request")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	if err := tcpConn.CloseWrite(); err != nil {
+		t.Fatalf("close write: %v", err)
+	}
+	if err := tcpConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	body, err := io.ReadAll(tcpConn)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if got, want := string(body), "backend-response"; got != want {
+		t.Fatalf("response = %q, want %q", got, want)
+	}
+	<-backendDone
+}
+
+func TestProxy_PassthroughTCPBackendCloseReleasesHalfOpenClient(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer ln.Close()
+	backendDone := make(chan struct{})
+	go func() {
+		defer close(backendDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte("backend-response"))
+		_ = conn.Close()
+	}()
+
+	pm := NewProxyManager()
+	public := getFreePort(t)
+	ep := ServiceEndpoint{App: "test", Name: "raw", GuestPort: 0, HostBind: ln.Addr().(*net.TCPAddr).Port, PublicPort: public, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw}
+	pm.StartListener(ep)
+
+	time.Sleep(100 * time.Millisecond)
+
+	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(public)))
+	if err != nil {
+		pm.StopAll()
+		t.Fatalf("dial proxy: %v", err)
+	}
+	tcpConn := conn.(*net.TCPConn)
+	defer tcpConn.Close()
+	if err := tcpConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		pm.StopAll()
+		t.Fatalf("set read deadline: %v", err)
+	}
+	body, err := io.ReadAll(tcpConn)
+	if err != nil {
+		pm.StopAll()
+		t.Fatalf("read response: %v", err)
+	}
+	if got, want := string(body), "backend-response"; got != want {
+		pm.StopAll()
+		t.Fatalf("response = %q, want %q", got, want)
+	}
+	<-backendDone
+
+	stopped := make(chan struct{})
+	go func() {
+		pm.StopAll()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(500 * time.Millisecond):
+		_ = tcpConn.Close()
+		<-stopped
+		t.Fatal("proxy StopAll blocked on half-open client after backend closed")
+	}
+}
+
 func TestApplyForwardHeadersUsesTLSHint(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://web.example.com", nil)
 	req = req.WithContext(middleware.ContextWithHint(req.Context(), middleware.Hint{IsTLS: true}))

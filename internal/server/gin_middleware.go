@@ -539,6 +539,10 @@ func (s *GinServer) lanHostRoutingMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		if ep.RequiresTLSMuxAuth {
+			c.Next()
+			return
+		}
 
 		// Proxy the request to the resolved endpoint
 		s.proxyToEndpoint(c, ep)

@@ -634,6 +634,7 @@ paths:
         '200': { description: OK }
         '400': { description: Bad Request (invalid snapshot id), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
         '403': { description: Forbidden (crypto locked), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '409': { description: Conflict (enabled apps require a newer guarded capability), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
         '429': { description: Too Many Requests (update already running), headers: { Retry-After: { schema: { type: integer } } }, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
         '501': { description: Not Implemented (unsupported platform), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
         '504': { description: Gateway Timeout (transactional-update timed out), content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
@@ -821,6 +822,33 @@ paths:
                 type: object
                 properties:
                   message: { type: string }
+  /tunnels/certificates:
+    post:
+      summary: Issue a short-lived tunnel client certificate
+      security:
+        - cookieAuth: []
+        - csrfToken: []
+      description: |
+        Issues a Piccolo-session client certificate for a host-routed listener
+        that declares `connection_auth.mtls.verifier.type: piccolo_session`.
+        The caller must be an unlocked admin session; the certificate is scoped
+        to the resolved host, remote port, app, and listener.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TunnelCertificateRequest' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TunnelCertificateResponse' }
+        '400': { description: Bad Request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '401': { description: Unauthorized, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '403': { description: Forbidden, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '404': { description: Not Found, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '503': { description: Service Unavailable, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
   /remote/events:
     get:
       summary: Remote activity log
@@ -1579,19 +1607,65 @@ components:
       properties:
         name: { type: string }
         guest_port: { type: integer }
-        flow: { type: string, enum: [tcp, tls], nullable: true }
+        flow: { type: string, enum: [tcp, tls, udp], nullable: true }
         protocol: { type: string, enum: [raw, http, websocket], nullable: true }
+        tls_wrap:
+          type: boolean
+          description: Enables TLS-mux hostname routing for flow=tcp protocol=raw listeners.
         protocol_middleware:
           type: array
           items: { $ref: '#/components/schemas/AppProtocolMiddleware' }
         remote_ports:
           type: array
           items: { type: integer }
+        auth: { $ref: '#/components/schemas/ListenerAuth' }
+        connection_auth: { $ref: '#/components/schemas/ConnectionAuth' }
+        port_claim:
+          type: integer
+          nullable: true
     AppProtocolMiddleware:
       type: object
       properties:
         name: { type: string }
         params: { type: object, additionalProperties: { type: object } }
+    ListenerAuth:
+      type: object
+      properties:
+        rules:
+          type: array
+          items: { $ref: '#/components/schemas/ListenerAuthRule' }
+    ListenerAuthRule:
+      type: object
+      properties:
+        path: { type: string }
+        type: { type: string, enum: [exact, prefix, pattern] }
+        strategy: { type: string, enum: [oidc_passthrough, headers, protected, public] }
+    ConnectionAuth:
+      type: object
+      description: |
+        L4 connection admission. IP/CIDR rules compose with mTLS; when both are
+        present, both checks must pass before bytes reach the app listener.
+      properties:
+        default: { type: string, enum: [allow, deny] }
+        rules:
+          type: array
+          items: { $ref: '#/components/schemas/ConnectionAuthRule' }
+        mtls: { $ref: '#/components/schemas/ConnectionAuthMTLS' }
+    ConnectionAuthRule:
+      type: object
+      properties:
+        match: { type: string, description: IPv4 or IPv6 CIDR }
+        strategy: { type: string, enum: [allow, deny] }
+    ConnectionAuthMTLS:
+      type: object
+      required: [verifier]
+      properties:
+        verifier: { $ref: '#/components/schemas/ConnectionAuthMTLSVerifier' }
+    ConnectionAuthMTLSVerifier:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, enum: [piccolo_session] }
     ResponseAppListenersUpdate:
       type: object
       properties:
@@ -1626,6 +1700,13 @@ components:
         protocol: { type: string }
         middleware: { type: array, items: { type: object } }
         local_url: { type: string, nullable: true }
+        connection_auth: { $ref: '#/components/schemas/ConnectionAuth' }
+        requires_tls_mux_auth:
+          type: boolean
+          description: True when TLS-mux client certificate admission is required.
+        port_claim:
+          type: integer
+          nullable: true
     StorageDisks:
       type: object
       properties:
@@ -1760,6 +1841,32 @@ components:
         source: { type: string }
         message: { type: string }
         next_step: { type: string, nullable: true }
+    TunnelCertificateRequest:
+      type: object
+      required: [host, public_key_pem]
+      properties:
+        host:
+          type: string
+          description: Remote listener hostname or alias.
+        remote_port:
+          type: integer
+          default: 443
+          minimum: 1
+          maximum: 65535
+        public_key_pem:
+          type: string
+          description: PEM-encoded Ed25519 or ECDSA P-256 public key.
+        requested_ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 14400
+    TunnelCertificateResponse:
+      type: object
+      properties:
+        certificate_pem: { type: string }
+        serial: { type: string }
+        not_after: { type: string, format: date-time }
+        max_tunnel_lifetime_seconds: { type: integer }
     RemoteGuideInfo:
       type: object
       properties:
@@ -1909,6 +2016,9 @@ components:
           type: array
           items: { type: string }
         source_url: { type: string, nullable: true }
+        required_features:
+          type: array
+          items: { type: string }
     TaskProgressEvent:
       type: object
       properties:

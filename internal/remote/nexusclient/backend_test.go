@@ -218,6 +218,19 @@ func (m *mockResolver) Resolve(hostname string, remotePort int, isTLS bool) (int
 	return m.port, m.ok
 }
 
+type routeMockResolver struct {
+	decision RouteDecision
+	port     int
+}
+
+func (m *routeMockResolver) Resolve(hostname string, remotePort int, isTLS bool) (int, bool) {
+	return 0, false
+}
+
+func (m *routeMockResolver) ResolveRoute(hostname string, remotePort int, isTLS bool) RouteResolution {
+	return RouteResolution{Decision: m.decision, Port: m.port}
+}
+
 func TestConnectHandler(t *testing.T) {
 	t.Run("resolver_valid_port", func(t *testing.T) {
 		// Start a real TCP listener so the dial succeeds.
@@ -317,6 +330,28 @@ func TestConnectHandler(t *testing.T) {
 			t.Fatalf("expected TCP port-claim to resolve, got %v", err)
 		}
 		conn.Close()
+	})
+
+	t.Run("terminal_deny_does_not_fall_back_to_port_claim", func(t *testing.T) {
+		adapter := NewBackendAdapter(nil, &routeMockResolver{decision: RouteDeny})
+		adapter.cfg = Config{
+			ClaimMappings: []api.PortClaimInfo{
+				{Port: 53, HostBind: 15001, Protocol: "tcp"},
+			},
+		}
+		handler := adapter.connectHandler()
+		_, err := handler(context.Background(), backend.ConnectRequest{
+			Hostname:         "protected.example.com",
+			OriginalHostname: "protected.example.com",
+			Port:             53,
+			Transport:        backend.TransportTCP,
+		})
+		if !errors.Is(err, errRouteDenied) {
+			t.Fatalf("expected hard route denial, got %v", err)
+		}
+		if errors.Is(err, backend.ErrNoRoute) {
+			t.Fatal("terminal deny must not return ErrNoRoute because Nexus treats it as port-mapping fallback")
+		}
 	})
 
 	t.Run("port_claim_udp", func(t *testing.T) {

@@ -248,6 +248,14 @@ type AppDefinition struct {
 	Auth *AppAuth `yaml:"auth,omitempty" json:"auth,omitempty"`
 }
 
+const (
+	// FeatureConnectionAuthMTLSV1 gates manifests that rely on Piccolo-session
+	// client-certificate admission at the TLS mux. Older piccolod binaries may
+	// ignore unknown nested connection_auth fields, so manifests using mTLS must
+	// declare this capability explicitly.
+	FeatureConnectionAuthMTLSV1 = "connection_auth_mtls_v1"
+)
+
 // AppListener defines a named service exposed by the app (service-oriented model)
 type AppListener struct {
 	Name           string                  `yaml:"name" json:"name"`
@@ -362,12 +370,41 @@ type ConnectionAuth struct {
 	// Rules are evaluated in declaration order; first match wins. Falls
 	// through to Default when nothing matches.
 	Rules []ConnectionAuthRule `yaml:"rules,omitempty" json:"rules,omitempty"`
+
+	// MTLS configures TLS-mux client-certificate admission. It composes with
+	// the IP rule portion above; both must pass when both are present.
+	MTLS *ConnectionAuthMTLS `yaml:"mtls,omitempty" json:"mtls,omitempty"`
 }
 
 // ConnectionAuthRule matches a single source-IP CIDR and emits a verdict.
 type ConnectionAuthRule struct {
 	Match    string `yaml:"match" json:"match"`       // CIDR (IPv4 or IPv6)
 	Strategy string `yaml:"strategy" json:"strategy"` // "allow" | "deny"
+}
+
+// ConnectionAuthMTLS configures TLS-mux client certificate admission.
+type ConnectionAuthMTLS struct {
+	Verifier ConnectionAuthMTLSVerifier `yaml:"verifier" json:"verifier"`
+}
+
+// ConnectionAuthMTLSVerifier identifies the verifier used for client certs.
+type ConnectionAuthMTLSVerifier struct {
+	Type string `yaml:"type" json:"type"`
+}
+
+// HasIPRules reports whether the IP/CIDR portion of connection_auth is
+// explicitly configured. A non-nil ConnectionAuth with only mTLS must not cause
+// the existing IP-rule middleware to run.
+func (c *ConnectionAuth) HasIPRules() bool {
+	if c == nil {
+		return false
+	}
+	return c.Default != "" || len(c.Rules) > 0
+}
+
+// RequiresMTLS reports whether TLS-mux client-certificate admission is required.
+func (c *ConnectionAuth) RequiresMTLS() bool {
+	return c != nil && c.MTLS != nil
 }
 
 // AppProtocolMiddleware defines protocol-specific middleware entry
@@ -561,16 +598,17 @@ type InstallAppRequest struct {
 
 // CatalogItem represents an available application in the external catalog
 type CatalogItem struct {
-	Name          string   `json:"name" yaml:"name"`
-	Description   string   `json:"description" yaml:"description"`
-	Icon          string   `json:"icon" yaml:"icon"`
-	Version       string   `json:"version" yaml:"version"`
-	Category      string   `json:"category" yaml:"category"`
-	Compatibility string   `json:"compatibility" yaml:"compatibility"` // e.g. ">= 0.1.0"
-	Path          string   `json:"path" yaml:"path"`
-	Maintainer    string   `json:"maintainer" yaml:"maintainer"`
-	Tags          []string `json:"tags" yaml:"tags"`
-	SourceURL     string   `json:"source_url,omitempty" yaml:"source_url,omitempty"`
+	Name             string   `json:"name" yaml:"name"`
+	Description      string   `json:"description" yaml:"description"`
+	Icon             string   `json:"icon" yaml:"icon"`
+	Version          string   `json:"version" yaml:"version"`
+	Category         string   `json:"category" yaml:"category"`
+	Compatibility    string   `json:"compatibility" yaml:"compatibility"` // e.g. ">= 0.1.0"
+	Path             string   `json:"path" yaml:"path"`
+	Maintainer       string   `json:"maintainer" yaml:"maintainer"`
+	Tags             []string `json:"tags" yaml:"tags"`
+	SourceURL        string   `json:"source_url,omitempty" yaml:"source_url,omitempty"`
+	RequiredFeatures []string `json:"required_features,omitempty" yaml:"required_features,omitempty"`
 }
 
 // CatalogResponse defines the response for the catalog endpoint with pagination

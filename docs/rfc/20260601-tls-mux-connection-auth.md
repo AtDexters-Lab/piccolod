@@ -217,6 +217,8 @@ Portal routes do not inherit app listener connection auth. Alias routes inherit 
 
 Remote route resolution also needs a terminal-deny outcome distinct from "no host matched." The Nexus backend may continue to try port-claim fallback only for "no host matched"; it must not try fallback after a protected hostname matched but was denied because the connection was non-TLS, used a disallowed remote port, or otherwise failed the TLS-mux-only policy.
 
+HTTP-01 remains Piccolo-owned. A known app hostname on remote port 80 routes to piccolod's HTTP surface for ACME challenge handling and ordinary HTTP-to-HTTPS redirects, even when the target listener itself is raw and mTLS-protected. That does not create a payload bypass: non-TLS traffic to the listener's declared remote payload ports is still a terminal deny.
+
 ### D6 - TLS mux enforces mTLS at handshake time
 
 The TLS mux must choose client-certificate behavior per SNI. In Go, this means moving from a certificate-only callback shape to a per-client TLS config shape, so the mux can require a client certificate for routes that declare `connection_auth.mtls`.

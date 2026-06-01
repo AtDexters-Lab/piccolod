@@ -36,6 +36,7 @@ import (
 	"piccolod/internal/runtime/commands"
 	"piccolod/internal/services"
 	"piccolod/internal/state/paths"
+	"piccolod/internal/tunnelauth"
 
 	webassets "piccolod"
 )
@@ -901,10 +902,10 @@ func (s *stubTestRootfsManager) AttachRootfs(_ context.Context, volumeID string)
 	_ = os.MkdirAll(mp, 0o755)
 	return persistence.RootfsHandle{MountPath: mp, ReadOnly: true}, nil
 }
-func (s *stubTestRootfsManager) DetachRootfs(_ context.Context, _ string) error              { return nil }
-func (s *stubTestRootfsManager) DestroyRootfs(_ context.Context, _ string) error             { return nil }
-func (s *stubTestRootfsManager) GarbageCollectGoldenLVs(_ context.Context) error             { return nil }
-func (s *stubTestRootfsManager) ReconcileRootfsStates(_ context.Context) error               { return nil }
+func (s *stubTestRootfsManager) DetachRootfs(_ context.Context, _ string) error  { return nil }
+func (s *stubTestRootfsManager) DestroyRootfs(_ context.Context, _ string) error { return nil }
+func (s *stubTestRootfsManager) GarbageCollectGoldenLVs(_ context.Context) error { return nil }
+func (s *stubTestRootfsManager) ReconcileRootfsStates(_ context.Context) error   { return nil }
 func (s *stubTestRootfsManager) ReadGoldenImageConfig(_ context.Context, _ string) (persistence.GoldenImageConfig, error) {
 	return persistence.GoldenImageConfig{Entrypoint: []string{"/bin/sh"}}, nil
 }
@@ -1000,6 +1001,8 @@ func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	rm.SetNexusAdapter(nexusclient.NewStub())
 	remote.RegisterHandlers(dispatch, rm)
 	tlsMux := services.NewTlsMux(svcMgr)
+	tunnelAuth := tunnelauth.New(filepath.Join(tempDir, "mounts", "control", "tunnel-auth"))
+	tlsMux.SetTunnelClientVerifier(tunnelAuth)
 	remoteResolver := newServiceRemoteResolver(svcMgr)
 
 	// Catalog manager stub (avoid outbound network calls).
@@ -1058,6 +1061,7 @@ x-piccolo:
 		version:           "test-gin",
 		healthTracker:     health.NewTracker(),
 		tlsMux:            tlsMux,
+		tunnelAuth:        tunnelAuth,
 		remoteResolver:    remoteResolver,
 		provisioningState: provisioning.New(nil),
 		lifecycle:         lifecycle.New(initialLifecycleState(cryptoMgr)),

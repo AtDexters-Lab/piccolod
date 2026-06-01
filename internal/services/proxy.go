@@ -418,7 +418,11 @@ func (p *ProxyManager) StartListener(ep ServiceEndpoint) {
 		return
 	}
 
-	addr := net.JoinHostPort("0.0.0.0", strconv.Itoa(ep.PublicPort))
+	listenHost := "0.0.0.0"
+	if ep.RequiresTLSMuxAuth {
+		listenHost = "127.0.0.1"
+	}
+	addr := net.JoinHostPort(listenHost, strconv.Itoa(ep.PublicPort))
 	// Avoid double-start
 	p.mu.Lock()
 	if _, exists := p.listeners[ep.PublicPort]; exists {
@@ -462,11 +466,56 @@ func (p *ProxyManager) handleConn(ep ServiceEndpoint, client net.Conn) {
 	}
 	defer backend.Close()
 
-	// Bi-directional copy
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(backend, client); backend.(*net.TCPConn).CloseWrite(); done <- struct{}{} }()
-	go func() { io.Copy(client, backend); client.(*net.TCPConn).CloseWrite(); done <- struct{}{} }()
+	// Bi-directional copy. If the client half-closes first, keep the response
+	// path open so raw protocols can send a final backend response. If the
+	// backend response path finishes first, stop reading from the client so a
+	// half-open client cannot pin the proxy goroutine forever.
+	done := make(chan tcpProxyCopySide, 2)
+	go func() {
+		_, _ = io.Copy(backend, client)
+		closeWrite(backend)
+		done <- tcpProxyCopyClientToBackend
+	}()
+	go func() {
+		_, _ = io.Copy(client, backend)
+		closeWrite(client)
+		done <- tcpProxyCopyBackendToClient
+	}()
+	if first := <-done; first == tcpProxyCopyBackendToClient {
+		closeRead(client)
+	}
 	<-done
+}
+
+type tcpProxyCopySide int
+
+const (
+	tcpProxyCopyClientToBackend tcpProxyCopySide = iota
+	tcpProxyCopyBackendToClient
+)
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+type closeReader interface {
+	CloseRead() error
+}
+
+func closeWrite(conn net.Conn) {
+	if cw, ok := conn.(closeWriter); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	_ = conn.Close()
+}
+
+func closeRead(conn net.Conn) {
+	if cr, ok := conn.(closeReader); ok {
+		_ = cr.CloseRead()
+		return
+	}
+	_ = conn.Close()
 }
 
 func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
@@ -477,7 +526,7 @@ func (p *ProxyManager) startTCPProxy(ln net.Listener, ep ServiceEndpoint) {
 	// listed ip_allowlist / ip_rate_limit append after.
 	l4Mws, err := p.registry.BuildL4(middleware.BuildSpec{
 		Endpoint:          mwEndpoint,
-		HasConnectionAuth: ep.ConnectionAuth != nil,
+		HasConnectionAuth: ep.ConnectionAuth.HasIPRules(),
 		Deps:              p.buildL4Deps(ep),
 	})
 	if err != nil {
@@ -601,7 +650,7 @@ func (p *ProxyManager) startHTTPProxy(ln net.Listener, ep ServiceEndpoint) {
 	// empty and Accept behavior is identical to the underlying listener.
 	l4Mws, err := p.registry.BuildL4(middleware.BuildSpec{
 		Endpoint:          mwEndpoint,
-		HasConnectionAuth: ep.ConnectionAuth != nil,
+		HasConnectionAuth: ep.ConnectionAuth.HasIPRules(),
 		Deps:              p.buildL4Deps(ep),
 	})
 	if err != nil {

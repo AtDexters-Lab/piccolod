@@ -141,6 +141,49 @@ func TestServiceManagerPublishesEndpointEventsOnRemove(t *testing.T) {
 	}
 }
 
+func TestServiceManagerPublishesEndpointMetadataUpdateOnMTLSFlip(t *testing.T) {
+	mgr := NewServiceManager()
+	bus := events.NewBus()
+	mgr.SetEventBus(bus)
+
+	listeners := []api.AppListener{
+		{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+	}
+	if _, err := mgr.AllocateForApp("testapp", listeners); err != nil {
+		t.Fatalf("AllocateForApp failed: %v", err)
+	}
+
+	ch := bus.Subscribe(events.TopicServiceEndpointsChanged, 4)
+	listeners[0].ConnectionAuth = &api.ConnectionAuth{MTLS: &api.ConnectionAuthMTLS{
+		Verifier: api.ConnectionAuthMTLSVerifier{Type: "piccolo_session"},
+	}}
+	if _, _, err := mgr.Reconcile("testapp", listeners); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	select {
+	case evt := <-ch:
+		payload, ok := evt.Payload.(events.ServiceEndpointsChanged)
+		if !ok {
+			t.Fatalf("expected ServiceEndpointsChanged payload, got %T", evt.Payload)
+		}
+		if payload.App != "testapp" {
+			t.Errorf("expected app=testapp, got %s", payload.App)
+		}
+		if len(payload.Added) != 0 || len(payload.Removed) != 0 {
+			t.Fatalf("expected metadata-only event, got added=%d removed=%d", len(payload.Added), len(payload.Removed))
+		}
+		if len(payload.Updated) != 1 {
+			t.Fatalf("expected 1 updated endpoint, got %d", len(payload.Updated))
+		}
+		if !payload.Updated[0].RequiresTLSMuxAuth {
+			t.Fatalf("expected updated endpoint to require TLS mux auth")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for ServiceEndpointsChanged update event")
+	}
+}
+
 func TestCheckBackends_SkipsTransientApps(t *testing.T) {
 	mgr := NewServiceManager()
 	bus := events.NewBus()

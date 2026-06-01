@@ -479,7 +479,12 @@ func (m *Manager) GetApps(ctx context.Context, opts FilterOptions) (*api.Catalog
 			}
 		}
 
-		// 3. Version Compatibility Filter
+		// 3. Capability Filter
+		if !supportedCatalogFeatures(app.RequiredFeatures) {
+			continue
+		}
+
+		// 4. Version Compatibility Filter
 		if sysVer != "" && app.Compatibility != "" {
 			// app.Compatibility is something like ">=0.1.0"
 			// semver.Compare requires "v" prefix.
@@ -547,6 +552,20 @@ func (m *Manager) GetApps(ctx context.Context, opts FilterOptions) (*api.Catalog
 		Total:      total,
 		TotalPages: (total + pageSize - 1) / pageSize,
 	}, nil
+}
+
+func supportedCatalogFeatures(features []string) bool {
+	for _, f := range features {
+		switch strings.TrimSpace(f) {
+		case "":
+			return false
+		case api.FeatureConnectionAuthMTLSV1:
+			// supported by this binary
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // resolveAppPath looks up the manifest path for an app from the cached catalog index.

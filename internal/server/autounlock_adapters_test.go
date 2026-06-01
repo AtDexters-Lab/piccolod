@@ -9,17 +9,24 @@ import (
 )
 
 type fakeOSUpdateMgr struct {
-	statusResp update.Status
-	statusErr  error
-	rebootErr  error
-	rebooted   int
+	statusResp     update.Status
+	statusErr      error
+	rollbackErr    error
+	rollbacked     int
+	rollbackTarget string
+	rebootErr      error
+	rebooted       int
 }
 
 func (f *fakeOSUpdateMgr) Status(ctx context.Context) (update.Status, error) {
 	return f.statusResp, f.statusErr
 }
-func (f *fakeOSUpdateMgr) Apply(ctx context.Context) error            { return nil }
-func (f *fakeOSUpdateMgr) Rollback(ctx context.Context, _ string) error { return nil }
+func (f *fakeOSUpdateMgr) Apply(ctx context.Context) error { return nil }
+func (f *fakeOSUpdateMgr) Rollback(ctx context.Context, target string) error {
+	f.rollbacked++
+	f.rollbackTarget = target
+	return f.rollbackErr
+}
 func (f *fakeOSUpdateMgr) Reboot(ctx context.Context) error {
 	f.rebooted++
 	return f.rebootErr

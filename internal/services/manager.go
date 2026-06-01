@@ -20,25 +20,25 @@ import (
 
 // ServiceManager coordinates listener allocation, registry, and proxy startup
 type ServiceManager struct {
-	allocator      *PortAllocator
-	registry       map[string]map[string]ServiceEndpoint // app -> name -> endpoint
-	proxyManager   *ProxyManager
-	mu             sync.RWMutex
-	stopCh         chan struct{}
-	wg             sync.WaitGroup
-	containerIDs   map[string]string // app -> containerID (optional)
-	eventsMu       sync.Mutex
-	eventCancel    context.CancelFunc
+	allocator       *PortAllocator
+	registry        map[string]map[string]ServiceEndpoint // app -> name -> endpoint
+	proxyManager    *ProxyManager
+	mu              sync.RWMutex
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
+	containerIDs    map[string]string // app -> containerID (optional)
+	eventsMu        sync.Mutex
+	eventCancel     context.CancelFunc
 	eventSubCancels []func() // SubscribeWithCancel cleanup
-	eventBus       *events.Bus
-	statusMu       sync.RWMutex
-	leadership     map[string]cluster.Role
-	unpublisher    PortUnpublisher
-	publisher      PortPublisher
-	firewallMgr    firewall.Manager
-	lockReader     LockStateReader
-	lockOverrideMu sync.RWMutex
-	lockOverride   *bool
+	eventBus        *events.Bus
+	statusMu        sync.RWMutex
+	leadership      map[string]cluster.Role
+	unpublisher     PortUnpublisher
+	publisher       PortPublisher
+	firewallMgr     firewall.Manager
+	lockReader      LockStateReader
+	lockOverrideMu  sync.RWMutex
+	lockOverride    *bool
 
 	// Backend health debouncing (RFC 20260125)
 	backendHealth *BackendHealthState
@@ -224,11 +224,12 @@ func endpointInfoSlice(eps []ServiceEndpoint) []events.ServiceEndpointInfo {
 	info := make([]events.ServiceEndpointInfo, len(eps))
 	for i, ep := range eps {
 		info[i] = events.ServiceEndpointInfo{
-			App:              ep.App,
-			Name:             ep.Name,
-			DerivedHostLabel: ep.DerivedHostLabel,
-			Flow:             ep.Flow,
-			Protocol:         ep.Protocol,
+			App:                ep.App,
+			Name:               ep.Name,
+			DerivedHostLabel:   ep.DerivedHostLabel,
+			Flow:               ep.Flow,
+			Protocol:           ep.Protocol,
+			RequiresTLSMuxAuth: ep.RequiresTLSMuxAuth,
 		}
 	}
 	return info
@@ -283,20 +284,21 @@ func deriveRemotePorts(listener api.AppListener) []int {
 // to avoid field-omission bugs when new fields are added.
 func buildEndpoint(appName string, l api.AppListener, hostBind, publicPort int, isPrimary bool, hostLabel string) ServiceEndpoint {
 	return ServiceEndpoint{
-		App:              appName,
-		Name:             l.Name,
-		GuestPort:        l.GuestPort,
-		HostBind:         hostBind,
-		PublicPort:       publicPort,
-		Flow:             l.Flow,
-		Protocol:         l.Protocol,
-		Primary:          isPrimary,
-		DerivedHostLabel: hostLabel,
-		Middleware:       l.Middleware,
-		RemotePorts:      deriveRemotePorts(l),
-		Auth:             l.Auth,
-		ConnectionAuth:   l.ConnectionAuth,
-		PortClaim:        l.PortClaim,
+		App:                appName,
+		Name:               l.Name,
+		GuestPort:          l.GuestPort,
+		HostBind:           hostBind,
+		PublicPort:         publicPort,
+		Flow:               l.Flow,
+		Protocol:           l.Protocol,
+		Primary:            isPrimary,
+		DerivedHostLabel:   hostLabel,
+		Middleware:         l.Middleware,
+		RemotePorts:        deriveRemotePorts(l),
+		Auth:               l.Auth,
+		ConnectionAuth:     l.ConnectionAuth,
+		RequiresTLSMuxAuth: l.ConnectionAuth.RequiresMTLS(),
+		PortClaim:          l.PortClaim,
 	}
 }
 
@@ -410,6 +412,13 @@ func (m *ServiceManager) consumeProxyHint(listenerPort, sourcePort int) (connect
 		return connectionHint{}, false
 	}
 	return m.proxyManager.consumeHint(listenerPort, sourcePort)
+}
+
+func (m *ServiceManager) peekProxyHint(listenerPort, sourcePort int) (connectionHint, bool) {
+	if listenerPort <= 0 || sourcePort <= 0 || m.proxyManager == nil {
+		return connectionHint{}, false
+	}
+	return m.proxyManager.peekHint(listenerPort, sourcePort)
 }
 
 // ConsumePortalHint extracts the Nexus-relayed client IP from a consumed portal
@@ -712,6 +721,25 @@ func (m *ServiceManager) ResolveByHostLabel(label string, remotePort int) (Servi
 	return ServiceEndpoint{}, false
 }
 
+// ResolveByHostLabelAnyPort finds an endpoint by derived host label without
+// applying remote-port filtering. Use this only to distinguish "host matched
+// but the requested port is denied" from "host did not match".
+func (m *ServiceManager) ResolveByHostLabelAnyPort(label string) (ServiceEndpoint, bool) {
+	if label == "" {
+		return ServiceEndpoint{}, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, mapp := range m.registry {
+		for _, ep := range mapp {
+			if ep.DerivedHostLabel == label {
+				return ep, true
+			}
+		}
+	}
+	return ServiceEndpoint{}, false
+}
+
 // ResolveAppPrimary finds the primary listener for an app.
 func (m *ServiceManager) ResolveAppPrimary(appName string) (ServiceEndpoint, bool) {
 	m.mu.RLock()
@@ -888,10 +916,10 @@ func (m *ServiceManager) checkBackends() {
 //
 // Design note: This emits a simplified health based only on backend status, not including
 // certificate health. This is intentional because:
-// 1. ServiceManager doesn't have access to certificate data (avoiding import cycle)
-// 2. Full health is computed on-demand via API (handleGinListenerHealth) and on WebSocket connect
-// 3. This event serves as a notification that health may have changed, prompting clients to
-//    refresh via API if needed
+//  1. ServiceManager doesn't have access to certificate data (avoiding import cycle)
+//  2. Full health is computed on-demand via API (handleGinListenerHealth) and on WebSocket connect
+//  3. This event serves as a notification that health may have changed, prompting clients to
+//     refresh via API if needed
 //
 // The WebSocket stream provides initial full health on connect, and clients should treat
 // subsequent events as hints to refresh the complete health state via the API endpoint.
@@ -1135,6 +1163,7 @@ func (m *ServiceManager) emitListenerHealthChanged(ep ServiceEndpoint, health Li
 type ReconcileResult struct {
 	Endpoints        []ServiceEndpoint
 	Added            []ServiceEndpoint
+	Updated          []ServiceEndpoint
 	Removed          []ServiceEndpoint
 	GuestPortChanged []struct{ Old, New ServiceEndpoint }
 	ProxyOnlyChanged []ServiceEndpoint
@@ -1203,6 +1232,9 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 				result.Removed = append(result.Removed, old)
 				result.Added = append(result.Added, newEp)
 			}
+			if endpointMDNSVisibilityChanged(old, newEp) {
+				result.Updated = append(result.Updated, newEp)
+			}
 
 			if proxyConfigChanged(old, newEp) {
 				m.proxyManager.StopEndpoint(old.PublicPort, old.Flow)
@@ -1256,10 +1288,11 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 
 	// Publish endpoint changes (non-blocking). Listener config changes are
 	// permanent — removed endpoints will not come back.
-	if len(result.Added) > 0 || len(result.Removed) > 0 {
+	if len(result.Added) > 0 || len(result.Updated) > 0 || len(result.Removed) > 0 {
 		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
 			App:     appName,
 			Added:   endpointInfoSlice(result.Added),
+			Updated: endpointInfoSlice(result.Updated),
 			Removed: endpointInfoSlice(result.Removed),
 		})
 	}
@@ -1302,6 +1335,19 @@ func proxyConfigChanged(old, cur ServiceEndpoint) bool {
 		!connectionAuthEqual(old.ConnectionAuth, cur.ConnectionAuth)
 }
 
+func endpointMDNSVisibilityChanged(old, cur ServiceEndpoint) bool {
+	if old.DerivedHostLabel != cur.DerivedHostLabel {
+		return false
+	}
+	return endpointMDNSAdvertisable(old) != endpointMDNSAdvertisable(cur)
+}
+
+func endpointMDNSAdvertisable(ep ServiceEndpoint) bool {
+	return ep.DerivedHostLabel != "" &&
+		!ep.RequiresTLSMuxAuth &&
+		api.LanHostBasedEligible(ep.Flow, ep.Protocol)
+}
+
 // connectionAuthEqual compares two ConnectionAuth pointers for equality.
 // Per plan §D17 upgrade-churn fix (F10): nil and an explicit
 // {Default:"allow", Rules:nil} compare equal — both encode the same
@@ -1310,7 +1356,8 @@ func proxyConfigChanged(old, cur ServiceEndpoint) bool {
 // per F-It3-D, mirrors middlewareEqual's `len(nil) == len([])`).
 func connectionAuthEqual(a, b *api.ConnectionAuth) bool {
 	return connectionAuthDefault(a) == connectionAuthDefault(b) &&
-		slices.Equal(connectionAuthRules(a), connectionAuthRules(b))
+		slices.Equal(connectionAuthRules(a), connectionAuthRules(b)) &&
+		connectionAuthMTLSEqual(a, b)
 }
 
 func connectionAuthDefault(a *api.ConnectionAuth) string {
@@ -1325,6 +1372,17 @@ func connectionAuthRules(a *api.ConnectionAuth) []api.ConnectionAuthRule {
 		return nil
 	}
 	return a.Rules
+}
+
+func connectionAuthMTLSEqual(a, b *api.ConnectionAuth) bool {
+	var at, bt string
+	if a != nil && a.MTLS != nil {
+		at = a.MTLS.Verifier.Type
+	}
+	if b != nil && b.MTLS != nil {
+		bt = b.MTLS.Verifier.Type
+	}
+	return at == bt
 }
 
 // authEqual compares two ListenerAuth pointers for equality.

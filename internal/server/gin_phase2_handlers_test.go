@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	apppkg "piccolod/internal/app"
 	"piccolod/internal/remote"
 	"strings"
 	"testing"
@@ -38,6 +40,57 @@ func TestOSUpdateStatus_OK(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &m)
 	if _, ok := m["current_version"]; !ok {
 		t.Fatalf("missing current_version")
+	}
+}
+
+func TestOSUpdateRollbackBlocksEnabledMTLSApps(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	updater := &fakeOSUpdateMgr{}
+	srv.updateManager = updater
+
+	def, err := apppkg.ParseAppDefinition([]byte(`type: user
+listeners:
+  - name: __primary
+    guest_port: 22
+    flow: tcp
+    protocol: raw
+    tls_wrap: true
+    connection_auth:
+      mtls:
+        verifier:
+          type: piccolo_session
+services:
+  main:
+    image: docker.io/library/alpine:latest
+    bind_ports: [22]
+x-piccolo:
+  mode: service
+  requires_features:
+    - connection_auth_mtls_v1
+`))
+	if err != nil {
+		t.Fatalf("parse app: %v", err)
+	}
+	def.Listeners[0].Name = "sshdev"
+	def.Listeners[0].Primary = true
+	if _, err := srv.appManager.Install(context.Background(), def); err != nil {
+		t.Fatalf("install app: %v", err)
+	}
+
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/updates/os/rollback", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status %d body=%s", w.Code, w.Body.String())
+	}
+	if updater.rollbacked != 0 {
+		t.Fatalf("rollback manager called %d times", updater.rollbacked)
+	}
+	if !strings.Contains(w.Body.String(), "sshdev") {
+		t.Fatalf("response does not name blocking app: %s", w.Body.String())
 	}
 }
 

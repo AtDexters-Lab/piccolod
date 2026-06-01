@@ -397,7 +397,7 @@ func TestHandleServiceEndpointsChanged_RemoveLabels(t *testing.T) {
 
 	// Remove one label
 	payload := events.ServiceEndpointsChanged{
-		App: "myapp",
+		App:   "myapp",
 		Added: nil,
 		Removed: []events.ServiceEndpointInfo{
 			{App: "myapp", Name: "db", DerivedHostLabel: "db-myapp"},
@@ -465,6 +465,47 @@ func TestHandleServiceEndpointsChanged_MergeDelta(t *testing.T) {
 	if !labelSet["db-myapp"] {
 		t.Error("db-myapp should have been added")
 	}
+}
+
+func TestHandleServiceEndpointsChanged_MetadataUpdateRefreshesMTLSVisibility(t *testing.T) {
+	t.Run("enabling mTLS removes existing label", func(t *testing.T) {
+		manager := NewManager()
+		manager.appHostLabelsMu.Lock()
+		manager.appHostLabels["myapp"] = []string{"myapp"}
+		manager.appHostLabelsMu.Unlock()
+
+		manager.handleServiceEndpointsChanged(events.ServiceEndpointsChanged{
+			App: "myapp",
+			Updated: []events.ServiceEndpointInfo{
+				{App: "myapp", Name: "web", DerivedHostLabel: "myapp", Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, RequiresTLSMuxAuth: true},
+			},
+		})
+
+		manager.appHostLabelsMu.RLock()
+		_, ok := manager.appHostLabels["myapp"]
+		manager.appHostLabelsMu.RUnlock()
+		if ok {
+			t.Fatal("mTLS-protected HTTP listener should no longer be advertised")
+		}
+	})
+
+	t.Run("disabling mTLS adds label back", func(t *testing.T) {
+		manager := NewManager()
+
+		manager.handleServiceEndpointsChanged(events.ServiceEndpointsChanged{
+			App: "myapp",
+			Updated: []events.ServiceEndpointInfo{
+				{App: "myapp", Name: "web", DerivedHostLabel: "myapp", Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
+			},
+		})
+
+		manager.appHostLabelsMu.RLock()
+		labels := append([]string(nil), manager.appHostLabels["myapp"]...)
+		manager.appHostLabelsMu.RUnlock()
+		if len(labels) != 1 || labels[0] != "myapp" {
+			t.Fatalf("expected myapp label after mTLS removal, got %v", labels)
+		}
+	})
 }
 
 func TestHandleServiceEndpointsChanged_EmptyAppIgnored(t *testing.T) {

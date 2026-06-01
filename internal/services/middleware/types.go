@@ -52,10 +52,15 @@ type EndpointInfo struct {
 	// zero-cost.
 	Auth *api.ListenerAuth
 
-	// ConnectionAuth carries the listener's L4 IP-based access rules. nil
-	// when the listener declares no rules (connection_auth canonical entry
-	// is gated on ConnectionAuth != nil via spec.HasConnectionAuth).
+	// ConnectionAuth carries the listener's connection admission policy. The
+	// IP-rule canonical middleware is gated on ConnectionAuth.HasIPRules(), not
+	// merely on ConnectionAuth != nil, so mTLS-only listeners are not treated as
+	// IP-auth listeners on the loopback upstream path.
 	ConnectionAuth *api.ConnectionAuth
+
+	// RequiresTLSMuxAuth means the listener's public access must pass through
+	// the TLS mux before bytes reach the upstream.
+	RequiresTLSMuxAuth bool
 }
 
 // ConnContext is the per-connection context passed to L4 middlewares.

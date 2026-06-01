@@ -130,7 +130,7 @@ func (p *ProxyManager) startUDPProxy(ep ServiceEndpoint) {
 	mwEndpoint := ep.AsMiddlewareInfo()
 	udpMws, err := p.registry.BuildL4UDP(middleware.BuildSpec{
 		Endpoint:          mwEndpoint,
-		HasConnectionAuth: ep.ConnectionAuth != nil,
+		HasConnectionAuth: ep.ConnectionAuth.HasIPRules(),
 		Deps:              p.buildL4Deps(ep),
 	})
 	if err != nil {

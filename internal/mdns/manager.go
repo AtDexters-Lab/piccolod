@@ -549,6 +549,11 @@ func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsC
 			labelsToGoodbye = append(labelsToGoodbye, ep.DerivedHostLabel)
 		}
 	}
+	for _, ep := range payload.Updated {
+		if ep.DerivedHostLabel != "" && !mdnsAdvertisableEndpoint(ep) {
+			labelsToGoodbye = append(labelsToGoodbye, ep.DerivedHostLabel)
+		}
+	}
 
 	// Send goodbye for removed aliases first
 	if len(labelsToGoodbye) > 0 {
@@ -569,6 +574,11 @@ func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsC
 			removeSet[ep.DerivedHostLabel] = struct{}{}
 		}
 	}
+	for _, ep := range payload.Updated {
+		if ep.DerivedHostLabel != "" {
+			removeSet[ep.DerivedHostLabel] = struct{}{}
+		}
+	}
 
 	// Start with existing labels, filtering out removed ones
 	existing := m.appHostLabels[payload.App]
@@ -584,8 +594,8 @@ func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsC
 	// passthrough, tcp+raw, UDP) are reached via TLS mux SNI or port-based
 	// routing, neither of which needs an mDNS host-label. Per
 	// RFC 20260316 + plan §D10.
-	for _, ep := range payload.Added {
-		if ep.DerivedHostLabel == "" || !api.LanHostBasedEligible(ep.Flow, ep.Protocol) {
+	for _, ep := range slices.Concat(payload.Added, payload.Updated) {
+		if !mdnsAdvertisableEndpoint(ep) {
 			continue
 		}
 		merged = append(merged, ep.DerivedHostLabel)
@@ -605,12 +615,18 @@ func (m *Manager) handleServiceEndpointsChanged(payload events.ServiceEndpointsC
 	// registry update lands. Mixed events (both additions and removals) also take this
 	// path; additions are already merged into appHostLabels above, so flushDebouncedAnnouncement
 	// will include them.
-	if len(inactive) > 0 {
+	if len(inactive) > 0 || len(payload.Updated) > 0 {
 		m.cancelPendingAnnouncement()
 		m.flushDebouncedAnnouncement()
 	} else {
 		m.scheduleDebouncedAnnouncement()
 	}
+}
+
+func mdnsAdvertisableEndpoint(ep events.ServiceEndpointInfo) bool {
+	return ep.DerivedHostLabel != "" &&
+		!ep.RequiresTLSMuxAuth &&
+		api.LanHostBasedEligible(ep.Flow, ep.Protocol)
 }
 
 // cancelPendingAnnouncement stops any in-flight debounce timer so its callback

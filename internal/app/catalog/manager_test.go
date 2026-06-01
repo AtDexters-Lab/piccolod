@@ -25,6 +25,45 @@ func unlockEvent() events.Event {
 	}
 }
 
+func TestGetApps_FiltersUnsupportedRequiredFeatures(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/index.yaml" {
+			w.Header().Set("Content-Type", "application/x-yaml")
+			w.Write([]byte(`apps:
+  - name: supported
+    description: Uses supported mTLS feature
+    required_features:
+      - connection_auth_mtls_v1
+  - name: future
+    description: Uses future feature
+    required_features:
+      - imaginary_future_feature
+  - name: ordinary
+    description: No special feature
+`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	m := NewManager(ts.URL, t.TempDir())
+	resp, err := m.GetApps(context.Background(), FilterOptions{})
+	if err != nil {
+		t.Fatalf("GetApps: %v", err)
+	}
+	if resp.Total != 2 {
+		t.Fatalf("Total = %d, want 2", resp.Total)
+	}
+	got := map[string]bool{}
+	for _, app := range resp.Apps {
+		got[app.Name] = true
+	}
+	if !got["supported"] || !got["ordinary"] || got["future"] {
+		t.Fatalf("unexpected app set: %#v", got)
+	}
+}
+
 func TestIsBlockedIP(t *testing.T) {
 	tests := []struct {
 		name    string

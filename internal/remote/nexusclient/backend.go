@@ -38,6 +38,8 @@ const (
 	attestationCacheHandshake     = 5 * time.Second
 )
 
+var errRouteDenied = errors.New("nexus route denied")
+
 // BackendAdapterOption configures a BackendAdapter.
 type BackendAdapterOption func(*BackendAdapter)
 
@@ -77,8 +79,8 @@ type BackendAdapter struct {
 	cancel        context.CancelFunc
 	clients       []backendClient
 	tokenProvider backend.TokenProvider // nil = use HMAC from config
-	eventHandler  RelayEventHandler    // nil = no event forwarding
-	name          string               // backend name for Nexus registration
+	eventHandler  RelayEventHandler     // nil = no event forwarding
+	name          string                // backend name for Nexus registration
 }
 
 func NewBackendAdapter(r *router.Manager, resolver RemoteResolver, opts ...BackendAdapterOption) *BackendAdapter {
@@ -251,18 +253,19 @@ func (a *BackendAdapter) connectHandler() backend.ConnectHandler {
 			return nil, backend.ErrNoRoute
 		}
 
-		localPort := 0
-		if port, ok := a.resolver.Resolve(req.OriginalHostname, req.Port, req.IsTLS); ok {
-			localPort = port
-		} else if port, ok := a.resolver.Resolve(req.Hostname, req.Port, req.IsTLS); ok {
-			localPort = port
-		} else if port, ok := a.resolvePortClaim(req.Port, req.Transport); ok {
-			// Port-claim resolution: match by port AND protocol to handle
-			// dual-protocol claims (e.g., DNS with both TCP and UDP on port 53)
-			// that have different host-bind ports per protocol.
-			localPort = port
-		} else {
-			return nil, backend.ErrNoRoute
+		localPort, denied, matched := a.resolveHostRoute(req.OriginalHostname, req.Hostname, req.Port, req.IsTLS)
+		if denied {
+			return nil, errRouteDenied
+		}
+		if !matched {
+			if port, ok := a.resolvePortClaim(req.Port, req.Transport); ok {
+				// Port-claim resolution: match by port AND protocol to handle
+				// dual-protocol claims (e.g., DNS with both TCP and UDP on port 53)
+				// that have different host-bind ports per protocol.
+				localPort = port
+			} else {
+				return nil, backend.ErrNoRoute
+			}
 		}
 
 		if localPort == 0 {
@@ -288,6 +291,28 @@ func (a *BackendAdapter) connectHandler() backend.ConnectHandler {
 		}
 		return conn, nil
 	}
+}
+
+func (a *BackendAdapter) resolveHostRoute(originalHostname, hostname string, remotePort int, isTLS bool) (int, bool, bool) {
+	if routed, ok := a.resolver.(RemoteRouteResolver); ok {
+		for _, h := range []string{originalHostname, hostname} {
+			route := routed.ResolveRoute(h, remotePort, isTLS)
+			switch route.Decision {
+			case RouteAllow:
+				return route.Port, false, true
+			case RouteDeny:
+				return 0, true, true
+			}
+		}
+		return 0, false, false
+	}
+	if port, ok := a.resolver.Resolve(originalHostname, remotePort, isTLS); ok {
+		return port, false, true
+	}
+	if port, ok := a.resolver.Resolve(hostname, remotePort, isTLS); ok {
+		return port, false, true
+	}
+	return 0, false, false
 }
 
 // resolvePortClaim matches a port claim by port number and transport protocol.

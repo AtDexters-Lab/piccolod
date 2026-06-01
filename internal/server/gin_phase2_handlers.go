@@ -5,11 +5,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"piccolod/internal/api"
 	"piccolod/internal/identity"
 	"piccolod/internal/remote"
 	"piccolod/internal/update"
@@ -77,11 +79,52 @@ func (s *GinServer) handleOSUpdateRollback(c *gin.Context) {
 			return
 		}
 	}
+	if blocked, err := s.enabledMTLSGuardedApps(c.Request.Context()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to inspect installed apps before rollback"})
+		return
+	} else if len(blocked) > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "rollback blocked while enabled apps require connection_auth_mtls_v1; stop or uninstall those apps before rolling back",
+			"apps":  blocked,
+		})
+		return
+	}
 	if err := s.updateManager.Rollback(context.Background(), strings.TrimSpace(req.SnapshotID)); err != nil {
 		s.respondUpdateError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "rollback staged"})
+}
+
+func (s *GinServer) enabledMTLSGuardedApps(ctx context.Context) ([]string, error) {
+	if s == nil || s.appManager == nil {
+		return nil, nil
+	}
+	apps, err := s.appManager.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	blocked := make([]string, 0)
+	for _, inst := range apps {
+		if inst == nil || !inst.Enabled || !definitionUsesMTLSGuard(inst.Definition) {
+			continue
+		}
+		blocked = append(blocked, inst.InstanceID)
+	}
+	sort.Strings(blocked)
+	return blocked, nil
+}
+
+func definitionUsesMTLSGuard(def *api.AppDefinition) bool {
+	if def == nil {
+		return false
+	}
+	for _, listener := range def.Listeners {
+		if listener.ConnectionAuth.RequiresMTLS() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *GinServer) respondUpdateError(c *gin.Context, err error) {

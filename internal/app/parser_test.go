@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -646,9 +647,21 @@ listeners:
 
 func TestPortClaimValidation(t *testing.T) {
 	baseApp := func(listeners []api.AppListener) *api.AppDefinition {
+		seen := make(map[int]struct{}, len(listeners))
+		bindPorts := make([]int, 0, len(listeners))
+		for _, l := range listeners {
+			if l.GuestPort <= 0 {
+				continue
+			}
+			if _, ok := seen[l.GuestPort]; ok {
+				continue
+			}
+			seen[l.GuestPort] = struct{}{}
+			bindPorts = append(bindPorts, l.GuestPort)
+		}
 		return &api.AppDefinition{
 			Listeners:  listeners,
-			Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{53}}},
+			Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: bindPorts}},
 			Extensions: map[string]interface{}{"mode": "service"},
 		}
 	}
@@ -819,7 +832,7 @@ func TestTLSWrapValidation(t *testing.T) {
 	withListeners := func(extras ...api.AppListener) *api.AppDefinition {
 		return &api.AppDefinition{
 			Listeners:  append([]api.AppListener{primary}, extras...),
-			Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80, 8443, 9090, 53}}},
+			Services:   map[string]api.AppService{"main": {Image: "nginx:latest", BindPorts: []int{80, 22, 8443, 9090, 53}}},
 			Extensions: map[string]interface{}{"mode": "service"},
 		}
 	}
@@ -984,6 +997,163 @@ x-piccolo:
 			}
 		}
 	})
+}
+
+func TestConnectionAuthMTLSValidation(t *testing.T) {
+	base := func(listener string, requiresFeature bool) string {
+		featureBlock := ""
+		if requiresFeature {
+			featureBlock = "\n  requires_features:\n    - connection_auth_mtls_v1"
+		}
+		return fmt.Sprintf(`
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+  - %s
+services:
+  main:
+    image: alpine:latest
+    bind_ports: [8080, 2022, 2023, 2024, 2025, 2026]
+x-piccolo:
+  mode: service%s
+`, listener, featureBlock)
+	}
+
+	validMTLS := `
+    name: ssh
+    guest_port: 2022
+    flow: tcp
+    protocol: raw
+    tls_wrap: true
+    remote_ports: [8443]
+    connection_auth:
+      mtls:
+        verifier:
+          type: piccolo_session`
+
+	tests := []struct {
+		name            string
+		listener        string
+		requiresFeature bool
+		wantErr         string
+	}{
+		{
+			name:            "raw_tls_wrap_accepts_piccolo_session",
+			listener:        validMTLS,
+			requiresFeature: true,
+		},
+		{
+			name:            "http_accepts_piccolo_session",
+			requiresFeature: true,
+			listener: `
+    name: admin
+    guest_port: 2023
+    flow: tcp
+    protocol: http
+    connection_auth:
+      mtls:
+        verifier:
+          type: piccolo_session`,
+		},
+		{
+			name:     "missing_feature_rejected",
+			listener: validMTLS,
+			wantErr:  "requires_features",
+		},
+		{
+			name:            "raw_without_tls_wrap_rejected",
+			requiresFeature: true,
+			listener: `
+    name: ssh
+    guest_port: 2024
+    flow: tcp
+    protocol: raw
+    connection_auth:
+      mtls:
+        verifier:
+          type: piccolo_session`,
+			wantErr: "requires tls_wrap",
+		},
+		{
+			name:            "flow_tls_rejected",
+			requiresFeature: true,
+			listener: `
+    name: passthrough
+    guest_port: 2025
+    flow: tls
+    protocol: raw
+    connection_auth:
+      mtls:
+        verifier:
+          type: piccolo_session`,
+			wantErr: "flow:tls",
+		},
+		{
+			name:            "udp_rejected",
+			requiresFeature: true,
+			listener: `
+    name: dns
+    guest_port: 2026
+    flow: udp
+    protocol: raw
+    connection_auth:
+      mtls:
+        verifier:
+          type: piccolo_session`,
+			wantErr: "flow:udp",
+		},
+		{
+			name:            "port_claim_rejected",
+			requiresFeature: true,
+			listener: `
+    name: ssh
+    guest_port: 2022
+    flow: tcp
+    protocol: raw
+    tls_wrap: true
+    port_claim: 2222
+    connection_auth:
+      mtls:
+        verifier:
+          type: piccolo_session`,
+			wantErr: "port_claim",
+		},
+		{
+			name:            "unknown_verifier_rejected",
+			requiresFeature: true,
+			listener: `
+    name: ssh
+    guest_port: 2022
+    flow: tcp
+    protocol: raw
+    tls_wrap: true
+    connection_auth:
+      mtls:
+        verifier:
+          type: ca_bundle`,
+			wantErr: "piccolo_session",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseAppDefinition([]byte(base(tt.listener, tt.requiresFeature)))
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !containsString(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %q", tt.wantErr, err.Error())
+			}
+		})
+	}
 }
 
 func TestFlowUDP(t *testing.T) {

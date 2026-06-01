@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -62,10 +63,14 @@ type TlsMux struct {
 
 	services *ServiceManager
 	certs    CertProvider
+	verifier TunnelClientVerifier
+
+	decisionRecorder  TunnelAuthDecisionRecorder
+	tunnelAuthMetrics *TunnelAuthMetricsRegistry
 }
 
 func NewTlsMux(svc *ServiceManager) *TlsMux {
-	return &TlsMux{services: svc, stopCh: make(chan struct{})}
+	return &TlsMux{services: svc, stopCh: make(chan struct{}), tunnelAuthMetrics: NewTunnelAuthMetricsRegistry()}
 }
 
 // UpdateConfig sets portal hostname, domain, and portal upstream port.
@@ -83,6 +88,28 @@ func (m *TlsMux) UpdateConfig(portalHost, domain string, portalPort int) {
 }
 
 func (m *TlsMux) SetCertProvider(p CertProvider) { m.mu.Lock(); m.certs = p; m.mu.Unlock() }
+
+func (m *TlsMux) SetTunnelClientVerifier(v TunnelClientVerifier) {
+	m.mu.Lock()
+	m.verifier = v
+	m.mu.Unlock()
+}
+
+func (m *TlsMux) SetTunnelAuthDecisionRecorder(recorder TunnelAuthDecisionRecorder) {
+	m.mu.Lock()
+	m.decisionRecorder = recorder
+	m.mu.Unlock()
+}
+
+func (m *TlsMux) TunnelAuthMetricsSnapshot() TunnelAuthMetricsSnapshot {
+	if m == nil || m.tunnelAuthMetrics == nil {
+		return TunnelAuthMetricsSnapshot{
+			Allowed: map[TunnelAuthMetricsSample]uint64{},
+			Denied:  map[TunnelAuthMetricsSample]uint64{},
+		}
+	}
+	return m.tunnelAuthMetrics.Snapshot()
+}
 
 // UpdateAliases sets the alias hostname→hostLabel mapping for routing.
 // hostLabel is a DerivedHostLabel or "__portal" for portal-targeted aliases.
@@ -128,26 +155,35 @@ func (m *TlsMux) Start() (int, error) {
 
 	go func() {
 		// Build tls.Config with SNI callback and hardened cipher suite policy.
-		tlsCfg := &tls.Config{
-			MinVersion:   tls.VersionTLS12,
-			CipherSuites: []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305},
-			CurvePreferences: []tls.CurveID{
-				tls.X25519,
-				tls.CurveP256,
-				tls.CurveP384,
-			},
-			PreferServerCipherSuites: true,
-			GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				host := strings.TrimSuffix(strings.ToLower(chi.ServerName), ".")
-				// Ask provider for certificate
-				m.mu.RLock()
-				prov := m.certs
-				m.mu.RUnlock()
-				if prov == nil {
-					return nil, errors.New("cert provider unavailable")
+		tlsCfg := tlsMuxBaseConfig()
+		tlsCfg.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			host := strings.TrimSuffix(strings.ToLower(chi.ServerName), ".")
+			m.mu.RLock()
+			prov := m.certs
+			m.mu.RUnlock()
+			if prov == nil {
+				return nil, errors.New("cert provider unavailable")
+			}
+			cert, err := prov.GetCertificate(host)
+			if err != nil {
+				return nil, err
+			}
+			cfg := tlsMuxBaseConfig()
+			cfg.Certificates = []tls.Certificate{*cert}
+
+			remotePort := 443
+			if services != nil && chi.Conn != nil {
+				if addr, ok := chi.Conn.RemoteAddr().(*net.TCPAddr); ok {
+					if hint, haveHint := services.peekProxyHint(m.Port(), addr.Port); haveHint && hint.remotePort > 0 {
+						remotePort = hint.remotePort
+					}
 				}
-				return prov.GetCertificate(host)
-			},
+			}
+			if route := m.resolveRoute(host, remotePort); route.requiresTLSMuxAuth {
+				cfg.ClientAuth = tls.RequestClientCert
+				cfg.SessionTicketsDisabled = true
+			}
+			return cfg, nil
 		}
 		tlsLn := tls.NewListener(ln, tlsCfg)
 		for {
@@ -189,6 +225,19 @@ func (m *TlsMux) Stop() {
 
 func (m *TlsMux) Port() int { m.mu.RLock(); defer m.mu.RUnlock(); return m.port }
 
+func tlsMuxBaseConfig() *tls.Config {
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		CipherSuites: []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305},
+		CurvePreferences: []tls.CurveID{
+			tls.X25519,
+			tls.CurveP256,
+			tls.CurveP384,
+		},
+		PreferServerCipherSuites: true,
+	}
+}
+
 func (m *TlsMux) serveTLSConn(c net.Conn, services *ServiceManager) {
 	// Extract SNI from tls.Conn
 	tlsConn, ok := c.(*tls.Conn)
@@ -223,13 +272,46 @@ func (m *TlsMux) serveTLSConn(c net.Conn, services *ServiceManager) {
 		host = m.portalHost
 		m.mu.RUnlock()
 	}
-	upstream := m.resolveUpstream(host)
-	if upstream == 0 {
+	effectiveRemotePort := 443
+	if haveHint && hint.remotePort > 0 {
+		effectiveRemotePort = hint.remotePort
+	}
+	route := m.resolveRoute(host, effectiveRemotePort)
+	if route.upstream == 0 {
 		log.Printf("WARN: tlsmux: unknown host %q", host)
 		c.Close()
 		return
 	}
-	backendAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(upstream))
+	if route.requiresTLSMuxAuth {
+		clientIP := peerClientIP(tlsConn, hint, haveHint)
+		decision := m.tunnelAuthDecision(route, host, effectiveRemotePort, clientIP)
+		result, err := m.verifyTunnelClient(state, route, host, effectiveRemotePort, clientIP)
+		if err != nil {
+			decision.applyVerificationError(err)
+			m.recordTunnelAuthDecision(decision)
+			log.Printf("WARN: tlsmux mTLS denied host=%q app=%q listener=%q remote_port=%d client_ip=%q: %v", host, route.app, route.listener, effectiveRemotePort, clientIP, err)
+			c.Close()
+			return
+		}
+		if !result.NotAfter.IsZero() {
+			until := time.Until(result.NotAfter)
+			if until <= 0 {
+				decision.applyVerificationResult(result)
+				decision.DenyReason = TunnelAuthReasonCertificateExpired
+				m.recordTunnelAuthDecision(decision)
+				log.Printf("WARN: tlsmux mTLS denied host=%q app=%q listener=%q: expired tunnel certificate", host, route.app, route.listener)
+				c.Close()
+				return
+			}
+			timer := time.AfterFunc(until, func() { _ = tlsConn.Close() })
+			defer timer.Stop()
+		}
+		decision.Allowed = true
+		decision.applyVerificationResult(result)
+		m.recordTunnelAuthDecision(decision)
+		log.Printf("INFO: tlsmux mTLS allowed host=%q app=%q listener=%q user=%q serial=%q", host, route.app, route.listener, result.UserID, result.Serial)
+	}
+	backendAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(route.upstream))
 	backend, err := net.DialTimeout("tcp", backendAddr, 5*time.Second)
 	if err != nil {
 		log.Printf("WARN: tlsmux upstream dial %s failed: %v", backendAddr, err)
@@ -244,14 +326,12 @@ func (m *TlsMux) serveTLSConn(c net.Conn, services *ServiceManager) {
 			if haveHint && hint.remotePort > 0 {
 				remotePort = hint.remotePort
 			}
-			if haveHint {
-				clientIP = hint.clientIP
-			}
+			clientIP = hintClientIP(hint, haveHint)
 			isTLS := true
 			if haveHint {
 				isTLS = hint.isTLS || isTLS
 			}
-			services.RegisterProxyHint(upstream, addr.Port, remotePort, isTLS, clientIP)
+			services.RegisterProxyHint(route.upstream, addr.Port, remotePort, isTLS, clientIP)
 		}
 	}
 	// Bi-directional copy: cleartext HTTP over TLS to upstream HTTP
@@ -266,7 +346,162 @@ func (m *TlsMux) serveTLSConn(c net.Conn, services *ServiceManager) {
 	_ = backend.Close()
 }
 
-func (m *TlsMux) resolveUpstream(host string) int {
+type tlsMuxRoute struct {
+	upstream           int
+	app                string
+	listener           string
+	requiresTLSMuxAuth bool
+	endpoint           *ServiceEndpoint
+}
+
+func (m *TlsMux) verifyTunnelClient(state tls.ConnectionState, route tlsMuxRoute, host string, remotePort int, clientIP string) (TunnelClientVerificationResult, error) {
+	m.mu.RLock()
+	verifier := m.verifier
+	m.mu.RUnlock()
+	if verifier == nil {
+		return TunnelClientVerificationResult{}, NewTunnelClientVerificationError(TunnelAuthReasonVerifierUnavailable, fmt.Errorf("tunnel verifier unavailable"), TunnelClientVerificationResult{})
+	}
+	if route.endpoint == nil {
+		return TunnelClientVerificationResult{}, NewTunnelClientVerificationError(TunnelAuthReasonMissingRouteMetadata, fmt.Errorf("missing route endpoint"), TunnelClientVerificationResult{})
+	}
+	return verifier.VerifyTunnelClient(context.Background(), TunnelClientVerification{
+		PeerCertificates: state.PeerCertificates,
+		Host:             host,
+		RemotePort:       remotePort,
+		App:              route.endpoint.App,
+		Listener:         route.endpoint.Name,
+		ClientIP:         clientIP,
+		ConnectionAuth:   route.endpoint.ConnectionAuth,
+		Now:              time.Now(),
+	})
+}
+
+func (m *TlsMux) tunnelAuthDecision(route tlsMuxRoute, host string, remotePort int, clientIP string) TunnelAuthDecision {
+	return TunnelAuthDecision{
+		Host:         host,
+		RemotePort:   remotePort,
+		App:          route.app,
+		Listener:     route.listener,
+		ClientIP:     clientIP,
+		VerifierType: tunnelAuthVerifierType(route),
+		Time:         time.Now().UTC(),
+	}
+}
+
+func (m *TlsMux) recordTunnelAuthDecision(decision TunnelAuthDecision) {
+	if decision.Time.IsZero() {
+		decision.Time = time.Now().UTC()
+	}
+	if m.tunnelAuthMetrics != nil {
+		m.tunnelAuthMetrics.Record(decision)
+	}
+	m.mu.RLock()
+	recorder := m.decisionRecorder
+	m.mu.RUnlock()
+	if recorder != nil {
+		recorder(decision)
+	}
+}
+
+func tunnelAuthVerifierType(route tlsMuxRoute) string {
+	if route.endpoint == nil || route.endpoint.ConnectionAuth == nil || route.endpoint.ConnectionAuth.MTLS == nil {
+		return ""
+	}
+	return route.endpoint.ConnectionAuth.MTLS.Verifier.Type
+}
+
+func (d *TunnelAuthDecision) applyVerificationResult(result TunnelClientVerificationResult) {
+	d.UserID = result.UserID
+	d.Username = result.Username
+	d.Role = result.Role
+	d.Serial = result.Serial
+}
+
+func (d *TunnelAuthDecision) applyVerificationError(err error) {
+	d.DenyReason = tunnelAuthDenyReason(err)
+	var vErr *TunnelClientVerificationError
+	if errors.As(err, &vErr) {
+		if vErr.Reason != "" {
+			d.DenyReason = vErr.Reason
+		}
+		d.applyVerificationResult(vErr.Identity)
+	}
+}
+
+func tunnelAuthDenyReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "unsupported verifier"):
+		return TunnelAuthReasonUnsupportedVerifier
+	case strings.Contains(msg, "missing client certificate"):
+		return TunnelAuthReasonMissingClientCertificate
+	case strings.Contains(msg, "invalid client certificate"):
+		return TunnelAuthReasonInvalidClientCertificate
+	case strings.Contains(msg, "unknown certificate serial"):
+		return TunnelAuthReasonUnknownCertificateSerial
+	case strings.Contains(msg, "expired"):
+		return TunnelAuthReasonCertificateExpired
+	case strings.Contains(msg, "audience mismatch"):
+		return TunnelAuthReasonAudienceMismatch
+	case strings.Contains(msg, "source ip denied"):
+		return TunnelAuthReasonSourceIPDenied
+	case strings.Contains(msg, "verifier unavailable"):
+		return TunnelAuthReasonVerifierUnavailable
+	case strings.Contains(msg, "missing route endpoint"):
+		return TunnelAuthReasonMissingRouteMetadata
+	default:
+		return TunnelAuthReasonVerificationFailed
+	}
+}
+
+func peerClientIP(c net.Conn, hint connectionHint, haveHint bool) string {
+	if haveHint {
+		return hintClientIP(hint, true)
+	}
+	if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok && addr.IP != nil {
+		return addr.IP.String()
+	}
+	return ""
+}
+
+func hintClientIP(hint connectionHint, haveHint bool) string {
+	if !haveHint {
+		return ""
+	}
+	return normalizeClientIPHint(hint.clientIP)
+}
+
+func normalizeClientIPHint(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if ip := net.ParseIP(raw); ip != nil {
+		return ip.String()
+	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		if ip := net.ParseIP(strings.Trim(raw, "[]")); ip != nil {
+			return ip.String()
+		}
+	}
+	host, _, err := net.SplitHostPort(raw)
+	if err != nil {
+		return raw
+	}
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return ip.String()
+	}
+	return raw
+}
+
+func (m *TlsMux) resolveUpstream(host string, remotePort int) int {
+	return m.resolveRoute(host, remotePort).upstream
+}
+
+func (m *TlsMux) resolveRoute(host string, remotePort int) tlsMuxRoute {
 	m.mu.RLock()
 	portal := m.portalHost
 	domain := m.domain
@@ -276,28 +511,28 @@ func (m *TlsMux) resolveUpstream(host string) int {
 	m.mu.RUnlock()
 
 	if host == "" {
-		return 0
+		return tlsMuxRoute{}
 	}
 	if host == portal {
-		return portalPort
+		return tlsMuxRoute{upstream: portalPort}
 	}
 	// Alias domains: route by the listener they target.
 	if hostLabel, ok := aliases[host]; ok {
 		if hostLabel == portalHostLabel || hostLabel == "" {
-			return portalPort
+			return tlsMuxRoute{upstream: portalPort}
 		}
 		if m.services != nil {
-			if ep, found := m.services.ResolveByHostLabel(hostLabel, 443); found {
-				return ep.PublicPort
+			if ep, found := m.services.ResolveByHostLabel(hostLabel, remotePort); found {
+				return endpointTLSMuxRoute(ep)
 			}
 		}
-		return 0
+		return tlsMuxRoute{}
 	}
 	// <app>.<domain> or <listener>-<app>.<domain> → map to ServiceManager public_port
 	// Per RFC 20260114: use DerivedHostLabel for routing (primary=<app>, others=<listener>-<app>)
 	if domain != "" && strings.HasSuffix(host, "."+domain) {
-		if port := m.resolveByDomain(host, domain); port != 0 {
-			return port
+		if route := m.resolveByDomainRoute(host, domain, remotePort); route.upstream != 0 {
+			return route
 		}
 	}
 	// Check additional remote bases (RFC 20260312).
@@ -305,7 +540,7 @@ func (m *TlsMux) resolveUpstream(host string) int {
 	// portal hostname is not misclassified as a subdomain of a less-specific base.
 	for _, rb := range bases {
 		if host == rb.PortalHost {
-			return portalPort
+			return tlsMuxRoute{upstream: portalPort}
 		}
 	}
 	// Longest domain match (consistent with resolver's PortalHostForRequest).
@@ -318,24 +553,39 @@ func (m *TlsMux) resolveUpstream(host string) int {
 		}
 	}
 	if bestDomain != "" {
-		if port := m.resolveByDomain(host, bestDomain); port != 0 {
-			return port
+		if route := m.resolveByDomainRoute(host, bestDomain, remotePort); route.upstream != 0 {
+			return route
 		}
 	}
-	return 0
+	return tlsMuxRoute{}
 }
 
-func (m *TlsMux) resolveByDomain(host, domain string) int {
+func (m *TlsMux) resolveByDomain(host, domain string, remotePort int) int {
+	return m.resolveByDomainRoute(host, domain, remotePort).upstream
+}
+
+func (m *TlsMux) resolveByDomainRoute(host, domain string, remotePort int) tlsMuxRoute {
 	label := strings.TrimSuffix(host, "."+domain)
 	if i := strings.Index(label, "."); i != -1 {
 		label = label[:i]
 	}
 	if label != "" && m.services != nil {
-		if ep, ok := m.services.ResolveByHostLabel(label, 443); ok {
-			return ep.PublicPort
+		if ep, ok := m.services.ResolveByHostLabel(label, remotePort); ok {
+			return endpointTLSMuxRoute(ep)
 		}
 	}
-	return 0
+	return tlsMuxRoute{}
+}
+
+func endpointTLSMuxRoute(ep ServiceEndpoint) tlsMuxRoute {
+	epCopy := ep
+	return tlsMuxRoute{
+		upstream:           ep.PublicPort,
+		app:                ep.App,
+		listener:           ep.Name,
+		requiresTLSMuxAuth: ep.RequiresTLSMuxAuth,
+		endpoint:           &epCopy,
+	}
 }
 
 // ErrNoCert is returned by a CertProvider when no certificate is available.

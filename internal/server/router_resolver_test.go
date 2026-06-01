@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"piccolod/internal/api"
+	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/services"
 )
 
@@ -55,6 +56,16 @@ func TestServiceRemoteResolver(t *testing.T) {
 		t.Fatalf("expected portal HTTP traffic to map to 8081, got %d (ok=%v)", port, ok)
 	}
 
+	port, ok = resolver.Resolve("demo.portal.example.com", 80, false)
+	if !ok || port != 8081 {
+		t.Fatalf("expected app HTTP-01/redirect traffic to map to portal HTTP port 8081, got %d (ok=%v)", port, ok)
+	}
+
+	port, ok = resolver.Resolve("demo.portal.example.com", 80, true)
+	if !ok || port != 9090 {
+		t.Fatalf("expected tls mux to handle tls requests on port 80, got %d (ok=%v)", port, ok)
+	}
+
 	port, ok = resolver.Resolve("demo.portal.example.com", 8000, true)
 	if !ok || port != 9090 {
 		t.Fatalf("expected tls mux to handle tls requests on 8000, got %d (ok=%v)", port, ok)
@@ -66,6 +77,89 @@ func TestServiceRemoteResolver(t *testing.T) {
 	}
 
 	svc.Stop()
+}
+
+func TestServiceRemoteResolver_MTLSRemotePortsAreTLSMuxOnly(t *testing.T) {
+	oldPort := os.Getenv("PORT")
+	os.Setenv("PORT", "8081")
+	defer os.Setenv("PORT", oldPort)
+
+	svc := services.NewServiceManager()
+	defer svc.Stop()
+	resolver := newServiceRemoteResolver(svc)
+	resolver.SetRemoteBases("self-hosted", []remoteBase{
+		{source: "self-hosted", portalHost: "portal.example.com", domain: "portal.example.com"},
+	})
+	resolver.SetTlsMuxPort(9090)
+
+	listeners := []api.AppListener{
+		{Name: "demo", GuestPort: 8080, Protocol: api.ListenerProtocolHTTP, Flow: api.FlowTCP, Primary: true},
+		{
+			Name:        "admin",
+			GuestPort:   2022,
+			Protocol:    api.ListenerProtocolHTTP,
+			Flow:        api.FlowTCP,
+			RemotePorts: []int{8443},
+			ConnectionAuth: &api.ConnectionAuth{MTLS: &api.ConnectionAuthMTLS{
+				Verifier: api.ConnectionAuthMTLSVerifier{Type: "piccolo_session"},
+			}},
+		},
+		{
+			Name:      "ops",
+			GuestPort: 9091,
+			Protocol:  api.ListenerProtocolHTTP,
+			Flow:      api.FlowTCP,
+			ConnectionAuth: &api.ConnectionAuth{MTLS: &api.ConnectionAuthMTLS{
+				Verifier: api.ConnectionAuthMTLSVerifier{Type: "piccolo_session"},
+			}},
+		},
+		{
+			Name:      "ssh",
+			GuestPort: 22,
+			Protocol:  api.ListenerProtocolRaw,
+			Flow:      api.FlowTCP,
+			TLSWrap:   true,
+			ConnectionAuth: &api.ConnectionAuth{MTLS: &api.ConnectionAuthMTLS{
+				Verifier: api.ConnectionAuthMTLSVerifier{Type: "piccolo_session"},
+			}},
+		},
+	}
+	if _, err := svc.AllocateForApp("demo", listeners); err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+
+	port, ok := resolver.Resolve("admin-demo.portal.example.com", 8443, true)
+	if !ok || port != 9090 {
+		t.Fatalf("expected mTLS custom remote port to route to mux 9090, got %d ok=%v", port, ok)
+	}
+	if port, ok := resolver.Resolve("admin-demo.portal.example.com", 8443, false); ok {
+		t.Fatalf("expected non-TLS mTLS hostname to have no legacy route, got %d", port)
+	}
+	if got := resolver.ResolveRoute("admin-demo.portal.example.com", 8443, false); got.Decision != nexusclient.RouteDeny {
+		t.Fatalf("expected terminal deny for non-TLS mTLS hostname, got %+v", got)
+	}
+	if got := resolver.ResolveRoute("admin-demo.portal.example.com", 443, true); got.Decision != nexusclient.RouteDeny {
+		t.Fatalf("expected terminal deny for disallowed mTLS remote port, got %+v", got)
+	}
+	port, ok = resolver.Resolve("ops-demo.portal.example.com", 80, true)
+	if !ok || port != 9090 {
+		t.Fatalf("expected TLS traffic on inherited port 80 for mTLS HTTP listener to map to mux 9090, got %d ok=%v", port, ok)
+	}
+	port, ok = resolver.Resolve("ops-demo.portal.example.com", 80, false)
+	if !ok || port != 8081 {
+		t.Fatalf("expected cleartext port 80 for mTLS HTTP listener to map to portal HTTP port 8081, got %d ok=%v", port, ok)
+	}
+	port, ok = resolver.Resolve("ssh-demo.portal.example.com", 80, false)
+	if !ok || port != 8081 {
+		t.Fatalf("expected raw mTLS hostname HTTP-01 traffic to map to portal HTTP port 8081, got %d ok=%v", port, ok)
+	}
+	port, ok = resolver.Resolve("ssh-demo.portal.example.com", 443, true)
+	if !ok || port != 9090 {
+		t.Fatalf("expected raw mTLS hostname TLS traffic to map to mux 9090, got %d ok=%v", port, ok)
+	}
+	if got := resolver.ResolveRoute("ssh-demo.portal.example.com", 443, false); got.Decision != nexusclient.RouteDeny {
+		t.Fatalf("expected terminal deny for non-TLS raw mTLS hostname payload port, got %+v", got)
+	}
 }
 
 func TestResolvePortalPortZero(t *testing.T) {

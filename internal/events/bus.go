@@ -15,8 +15,8 @@ type Topic string
 const (
 	TopicLockStateChanged        Topic = "lock_state_changed"
 	TopicLeadershipRoleChanged   Topic = "leadership_role_changed"
-	TopicDeviceEvent   Topic = "device_event"
-	TopicControlHealth Topic = "control_health"
+	TopicDeviceEvent             Topic = "device_event"
+	TopicControlHealth           Topic = "control_health"
 	TopicControlStoreCommit      Topic = "control_store_commit"
 	TopicRemoteConfigChanged     Topic = "remote_config_changed"
 	TopicVolumeStateChanged      Topic = "volume_state_changed"
@@ -38,8 +38,8 @@ const (
 	TopicStorageEmergency       Topic = "storage_emergency"        // Storage entered emergency mode
 	TopicStoragePoolInitialized Topic = "storage_pool_initialized" // LVM data pool initialized
 	TopicStoragePoolActivated   Topic = "storage_pool_activated"   // LVM data pool activated
-	TopicStorageLocked          Topic = "storage_locked"            // Storage locked (LVM deactivated)
-	TopicStorageAlert           Topic = "storage_alert"             // User-visible storage pressure notification (deprecated, see TopicResourcePressure)
+	TopicStorageLocked          Topic = "storage_locked"           // Storage locked (LVM deactivated)
+	TopicStorageAlert           Topic = "storage_alert"            // User-visible storage pressure notification (deprecated, see TopicResourcePressure)
 
 	// Resource stewardship pressure events
 	TopicResourcePressure Topic = "resource_pressure" // Unified pressure signal for memory, cpu, disk per app slice
@@ -107,15 +107,18 @@ type ControlStoreCommit struct {
 // distinguish raw vs HTTP/Websocket on the same flow (e.g., mDNS suppression
 // of tcp+raw from LAN host-based announcements per plan §D9/D15).
 type ServiceEndpointInfo struct {
-	App              string
-	Name             string
-	DerivedHostLabel string
-	Flow             api.ListenerFlow
-	Protocol         api.ListenerProtocol
+	App                string
+	Name               string
+	DerivedHostLabel   string
+	Flow               api.ListenerFlow
+	Protocol           api.ListenerProtocol
+	RequiresTLSMuxAuth bool
 }
 
 // ServiceEndpointsChanged announces endpoint lifecycle transitions for an app.
 //   - Added: new endpoints now routable (install, start, restore)
+//   - Updated: endpoint routing metadata changed without lifecycle change;
+//     downstream should refresh derived views without treating resources as gone
 //   - Deactivated: endpoints temporarily offline (app stop, reconcile rebuild);
 //     downstream should stop routing but preserve associated resources (certs, DNS)
 //   - Removed: endpoints permanently gone (uninstall, failed install, listener config
@@ -123,6 +126,7 @@ type ServiceEndpointInfo struct {
 type ServiceEndpointsChanged struct {
 	App         string
 	Added       []ServiceEndpointInfo
+	Updated     []ServiceEndpointInfo
 	Deactivated []ServiceEndpointInfo
 	Removed     []ServiceEndpointInfo
 }
@@ -131,7 +135,7 @@ type ServiceEndpointsChanged struct {
 // The health aggregator subscribes to this and recomputes affected listener health.
 type CertificateChangedEvent struct {
 	CertID       string    `json:"cert_id"`
-	Status       string    `json:"status"`        // "ok", "pending", "error"
+	Status       string    `json:"status"` // "ok", "pending", "error"
 	FailureClass string    `json:"failure_class,omitempty"`
 	FailureCode  string    `json:"failure_code,omitempty"`
 	Timestamp    time.Time `json:"timestamp"`
@@ -149,22 +153,22 @@ type ListenerHealthEvent struct {
 // ListenerHealth represents the health status of an app listener.
 // This is a summary type for events; the full type is in services/health.go.
 type ListenerHealth struct {
-	Status         string                     `json:"status"`                    // ok, degraded, recovering, error
-	ReasonCode     string                     `json:"reason_code"`               // Machine-readable code
-	Reason         string                     `json:"reason"`                    // Human-readable explanation
-	Details        *string                    `json:"details,omitempty"`         // Technical details
-	RecoveryETA    *time.Time                 `json:"recovery_eta,omitempty"`    // When next retry/check will occur
-	Recoverable    bool                       `json:"recoverable"`               // Can system self-heal?
-	ActionRequired bool                       `json:"action_required"`           // Does user need to do something?
+	Status         string                      `json:"status"`                  // ok, degraded, recovering, error
+	ReasonCode     string                      `json:"reason_code"`             // Machine-readable code
+	Reason         string                      `json:"reason"`                  // Human-readable explanation
+	Details        *string                     `json:"details,omitempty"`       // Technical details
+	RecoveryETA    *time.Time                  `json:"recovery_eta,omitempty"`  // When next retry/check will occur
+	Recoverable    bool                        `json:"recoverable"`             // Can system self-heal?
+	ActionRequired bool                        `json:"action_required"`         // Does user need to do something?
 	CertStatuses   map[string]CertHealthStatus `json:"cert_statuses,omitempty"` // Per-cert health (certID → status)
-	LastChecked    time.Time                  `json:"last_checked"`
-	LastOK         *time.Time                 `json:"last_ok,omitempty"` // When backend was last healthy
+	LastChecked    time.Time                   `json:"last_checked"`
+	LastOK         *time.Time                  `json:"last_ok,omitempty"` // When backend was last healthy
 }
 
 // CertHealthStatus tracks individual certificate health for events.
 type CertHealthStatus struct {
-	Status      string     `json:"status"`                 // ok, recovering, error
-	ReasonCode  string     `json:"reason_code"`            // e.g., "cert_pending", "cert_dns_error"
+	Status      string     `json:"status"`      // ok, recovering, error
+	ReasonCode  string     `json:"reason_code"` // e.g., "cert_pending", "cert_dns_error"
 	RecoveryETA *time.Time `json:"recovery_eta,omitempty"`
 }
 
@@ -221,17 +225,17 @@ const (
 // Published by pressure-attribution components (pool guard for disk,
 // the pressure monitor for memory/CPU). See plan D-7 and D-15.
 type ResourcePressureEvent struct {
-	Resource              string  `json:"resource"`                         // memory | cpu | disk
-	Severity              string  `json:"severity"`                         // info | warn | urgent
-	AppInstanceID         string  `json:"app_instance_id,omitempty"`        // per-app attribution; empty for global (pool-wide disk)
-	HeaviestContributor   string  `json:"heaviest_contributor,omitempty"`   // service name within app (multi-service apps)
-	SliceMetric           float64 `json:"slice_metric,omitempty"`           // PSI percent or pool percent
-	DeclaredMinRequired   int64   `json:"declared_min_required,omitempty"`  // D-15 drift: manifest value
-	ObservedRSSPeak       int64   `json:"observed_rss_peak,omitempty"`      // D-15 drift: observed vs declared
-	OOMKillCount          int64   `json:"oom_kill_count,omitempty"`         // memory.events.oom_kill delta
-	Message               string  `json:"message,omitempty"`
-	ActionTaken           string  `json:"action_taken,omitempty"` // e.g. "workspaces_stopped", "autogrow_refused"
-	AffectedApps          []string `json:"affected_apps,omitempty"`
+	Resource            string   `json:"resource"`                        // memory | cpu | disk
+	Severity            string   `json:"severity"`                        // info | warn | urgent
+	AppInstanceID       string   `json:"app_instance_id,omitempty"`       // per-app attribution; empty for global (pool-wide disk)
+	HeaviestContributor string   `json:"heaviest_contributor,omitempty"`  // service name within app (multi-service apps)
+	SliceMetric         float64  `json:"slice_metric,omitempty"`          // PSI percent or pool percent
+	DeclaredMinRequired int64    `json:"declared_min_required,omitempty"` // D-15 drift: manifest value
+	ObservedRSSPeak     int64    `json:"observed_rss_peak,omitempty"`     // D-15 drift: observed vs declared
+	OOMKillCount        int64    `json:"oom_kill_count,omitempty"`        // memory.events.oom_kill delta
+	Message             string   `json:"message,omitempty"`
+	ActionTaken         string   `json:"action_taken,omitempty"` // e.g. "workspaces_stopped", "autogrow_refused"
+	AffectedApps        []string `json:"affected_apps,omitempty"`
 }
 
 // AppStatusChangedEvent is emitted when an app's status changes.

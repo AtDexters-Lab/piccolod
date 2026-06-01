@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,6 +62,7 @@ import (
 	"piccolod/internal/sysconfig/timezone"
 	"piccolod/internal/terminal"
 	"piccolod/internal/tpm"
+	"piccolod/internal/tunnelauth"
 	"piccolod/internal/update"
 
 	"github.com/coreos/go-systemd/v22/daemon"
@@ -108,6 +110,7 @@ type GinServer struct {
 	dispatcher     *commands.Dispatcher
 	routeManager   *router.Manager
 	tlsMux         *services.TlsMux
+	tunnelAuth     *tunnelauth.Service
 	remoteResolver *serviceRemoteResolver
 	httpSrv        *http.Server
 
@@ -460,6 +463,14 @@ func (r *serviceRemoteResolver) RecordConnectionHint(localPort, sourcePort, remo
 }
 
 func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS bool) (int, bool) {
+	res := r.ResolveRoute(hostname, remotePort, isTLS)
+	if res.Decision == nexusclient.RouteAllow {
+		return res.Port, true
+	}
+	return 0, false
+}
+
+func (r *serviceRemoteResolver) ResolveRoute(hostname string, remotePort int, isTLS bool) nexusclient.RouteResolution {
 	h := strings.TrimSuffix(strings.ToLower(hostname), ".")
 	r.mu.RLock()
 	aliases := r.aliases
@@ -475,8 +486,9 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 
 	// Check aliases first — they carry per-hostname routing (hostLabel).
 	if aliases != nil {
-		if port, ok := r.resolveAlias(h, aliases, portalPort, tlsMuxPort, normPort, isTLS); ok {
-			return port, true
+		res := r.resolveAlias(h, aliases, portalPort, tlsMuxPort, normPort, isTLS)
+		if res.Decision != nexusclient.RouteNoMatch {
+			return res
 		}
 	}
 
@@ -486,8 +498,9 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 	// Pass 1: exact portal match only.
 	for _, rb := range bases {
 		if rb.portalHost != "" && h == rb.portalHost {
-			if port, ok := r.resolveAgainstBase(h, rb.portalHost, rb.domain, portalPort, tlsMuxPort, normPort, isTLS); ok {
-				return port, true
+			res := r.resolveAgainstBase(h, rb.portalHost, rb.domain, portalPort, tlsMuxPort, normPort, isTLS)
+			if res.Decision != nexusclient.RouteNoMatch {
+				return res
 			}
 		}
 	}
@@ -505,12 +518,72 @@ func (r *serviceRemoteResolver) Resolve(hostname string, remotePort int, isTLS b
 		}
 	}
 	if bestBase != nil {
-		if port, ok := r.resolveAgainstBase(h, bestBase.portalHost, bestBase.domain, portalPort, tlsMuxPort, normPort, isTLS); ok {
-			return port, true
+		res := r.resolveAgainstBase(h, bestBase.portalHost, bestBase.domain, portalPort, tlsMuxPort, normPort, isTLS)
+		if res.Decision != nexusclient.RouteNoMatch {
+			return res
 		}
 	}
 
-	return 0, false
+	return nexusclient.RouteResolution{Decision: nexusclient.RouteNoMatch}
+}
+
+func (r *serviceRemoteResolver) ResolveTunnelTarget(hostname string, remotePort int) (services.ServiceEndpoint, bool) {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+	if h == "" {
+		return services.ServiceEndpoint{}, false
+	}
+	if remotePort <= 0 {
+		remotePort = 443
+	}
+	r.mu.RLock()
+	aliases := r.aliases
+	bases := r.remoteBases
+	r.mu.RUnlock()
+
+	if aliases != nil {
+		if label, ok := aliases[h]; ok {
+			return r.resolveTunnelTargetByLabel(label, remotePort)
+		}
+	}
+
+	for _, rb := range bases {
+		if rb.portalHost != "" && h == rb.portalHost {
+			return services.ServiceEndpoint{}, false
+		}
+	}
+	var bestDomain string
+	var bestLen int
+	for _, rb := range bases {
+		if rb.portalHost == "" || h == rb.portalHost || rb.domain == "" {
+			continue
+		}
+		if strings.HasSuffix(h, "."+rb.domain) && len(rb.domain) > bestLen {
+			bestDomain = rb.domain
+			bestLen = len(rb.domain)
+		}
+	}
+	if bestDomain == "" {
+		return services.ServiceEndpoint{}, false
+	}
+	label := h[:len(h)-len("."+bestDomain)]
+	if idx := strings.Index(label, "."); idx != -1 {
+		label = label[:idx]
+	}
+	return r.resolveTunnelTargetByLabel(label, remotePort)
+}
+
+func (r *serviceRemoteResolver) resolveTunnelTargetByLabel(label string, remotePort int) (services.ServiceEndpoint, bool) {
+	if label == "" || label == nexusclient.PortalHostLabel || r.services == nil {
+		return services.ServiceEndpoint{}, false
+	}
+	ep, ok := r.services.ResolveByHostLabel(label, remotePort)
+	if !ok || !ep.RequiresTLSMuxAuth || ep.ConnectionAuth == nil || ep.ConnectionAuth.MTLS == nil {
+		return services.ServiceEndpoint{}, false
+	}
+	if ep.ConnectionAuth.MTLS.Verifier.Type != "piccolo_session" {
+		return services.ServiceEndpoint{}, false
+	}
+	return ep, true
 }
 
 // resolveAlias resolves a hostname against the alias map.
@@ -519,35 +592,32 @@ func (r *serviceRemoteResolver) resolveAlias(
 	aliases map[string]string,
 	portalPort, tlsMuxPort, normPort int,
 	isTLS bool,
-) (int, bool) {
+) nexusclient.RouteResolution {
 	hostLabel, ok := aliases[h]
 	if !ok {
-		return 0, false
+		return nexusclient.RouteResolution{Decision: nexusclient.RouteNoMatch}
 	}
 	if hostLabel == nexusclient.PortalHostLabel || hostLabel == "" {
 		if normPort == 80 && portalPort > 0 {
-			return portalPort, true
+			return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: portalPort}
 		}
 		if isTLS && tlsMuxPort > 0 {
-			return tlsMuxPort, true
+			return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: tlsMuxPort}
 		}
-		return 0, false
+		return nexusclient.RouteResolution{Decision: nexusclient.RouteNoMatch}
 	}
 	if r.services != nil {
+		if ep, found := r.services.ResolveByHostLabelAnyPort(hostLabel); found && routeHTTP01ToPortal(ep, normPort, portalPort, isTLS) {
+			return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: portalPort}
+		}
 		if ep, found := r.services.ResolveByHostLabel(hostLabel, normPort); found {
-			if ep.Flow == api.FlowTLS {
-				return ep.PublicPort, true
-			}
-			if normPort == 80 {
-				return ep.PublicPort, true
-			}
-			if isTLS && tlsMuxPort > 0 {
-				return tlsMuxPort, true
-			}
-			return ep.PublicPort, true
+			return routeEndpoint(ep, normPort, isTLS, tlsMuxPort)
+		}
+		if ep, found := r.services.ResolveByHostLabelAnyPort(hostLabel); found && ep.RequiresTLSMuxAuth {
+			return nexusclient.RouteResolution{Decision: nexusclient.RouteDeny}
 		}
 	}
-	return 0, false
+	return nexusclient.RouteResolution{Decision: nexusclient.RouteNoMatch}
 }
 
 // resolveAgainstBase resolves a hostname against a single portal+domain base.
@@ -555,16 +625,16 @@ func (r *serviceRemoteResolver) resolveAgainstBase(
 	h, portal, domain string,
 	portalPort, tlsMuxPort, normPort int,
 	isTLS bool,
-) (int, bool) {
+) nexusclient.RouteResolution {
 	// Portal host (apex): route to portal port / TLS mux.
 	if h == portal {
 		if normPort == 80 && portalPort > 0 {
-			return portalPort, true
+			return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: portalPort}
 		}
 		if isTLS && tlsMuxPort > 0 {
-			return tlsMuxPort, true
+			return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: tlsMuxPort}
 		}
-		return 0, false
+		return nexusclient.RouteResolution{Decision: nexusclient.RouteNoMatch}
 	}
 
 	// Extract host label from <app>.<base> or <listener>-<app>.<base>
@@ -576,23 +646,43 @@ func (r *serviceRemoteResolver) resolveAgainstBase(
 				label = label[:idx]
 			}
 			if label != "" && r.services != nil {
+				if ep, ok := r.services.ResolveByHostLabelAnyPort(label); ok && routeHTTP01ToPortal(ep, normPort, portalPort, isTLS) {
+					return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: portalPort}
+				}
 				if ep, ok := r.services.ResolveByHostLabel(label, normPort); ok {
-					if ep.Flow == api.FlowTLS {
-						return ep.PublicPort, true
-					}
-					if normPort == 80 {
-						return ep.PublicPort, true
-					}
-					if isTLS && tlsMuxPort > 0 {
-						return tlsMuxPort, true
-					}
-					return ep.PublicPort, true
+					return routeEndpoint(ep, normPort, isTLS, tlsMuxPort)
+				}
+				if ep, ok := r.services.ResolveByHostLabelAnyPort(label); ok && ep.RequiresTLSMuxAuth {
+					return nexusclient.RouteResolution{Decision: nexusclient.RouteDeny}
 				}
 			}
 		}
 	}
 
-	return 0, false
+	return nexusclient.RouteResolution{Decision: nexusclient.RouteNoMatch}
+}
+
+func routeHTTP01ToPortal(ep services.ServiceEndpoint, normPort, portalPort int, isTLS bool) bool {
+	return !isTLS && normPort == 80 && portalPort > 0 && ep.Flow != api.FlowTLS
+}
+
+func routeEndpoint(ep services.ServiceEndpoint, normPort int, isTLS bool, tlsMuxPort int) nexusclient.RouteResolution {
+	if ep.RequiresTLSMuxAuth {
+		if isTLS && tlsMuxPort > 0 {
+			return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: tlsMuxPort}
+		}
+		return nexusclient.RouteResolution{Decision: nexusclient.RouteDeny}
+	}
+	if ep.Flow == api.FlowTLS {
+		return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: ep.PublicPort}
+	}
+	if isTLS && tlsMuxPort > 0 {
+		return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: tlsMuxPort}
+	}
+	if normPort == 80 {
+		return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: ep.PublicPort}
+	}
+	return nexusclient.RouteResolution{Decision: nexusclient.RouteAllow, Port: ep.PublicPort}
 }
 
 // remoteStatusAdapter adapts remote.Manager to services.RemoteStatusProvider.
@@ -768,6 +858,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	if strings.TrimSpace(controlDir) == "" {
 		return nil, fmt.Errorf("control volume mount unavailable")
 	}
+	tunnelAuth := tunnelauth.New(filepath.Join(controlDir, "tunnel-auth"))
+	tlsMux.SetTunnelClientVerifier(tunnelAuth)
 	// NOTE: Today we do not migrate existing app state into the control volume because we have
 	// no pre-existing deployments. If that assumption changes we must add a migration path,
 	// otherwise legacy installations would appear empty after upgrade.
@@ -810,6 +902,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		mdnsManager:       mdnsMgr,
 		routeManager:      routeMgr,
 		tlsMux:            tlsMux,
+		tunnelAuth:        tunnelAuth,
 		remoteResolver:    remoteResolver,
 		events:            eventsBus,
 		progress:          progressReporter,
@@ -830,6 +923,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		lifecycle:         lifecycle.New(initialLifecycleState(cmgr)),
 	}
 	s.opCtx, s.opCancel = context.WithCancel(context.Background())
+	tlsMux.SetTunnelAuthDecisionRecorder(s.publishTunnelAuthDecision)
 
 	// Wire catalog manifest sync now that GinServer is in scope. The adapter
 	// implements app.SyncHost using the existing helpers on s.
@@ -2149,6 +2243,7 @@ func (s *GinServer) setupGinRoutes() {
 		admin.POST("/crypto/lock", s.handleCryptoLock)
 		admin.POST("/crypto/recovery-key/generate", s.handleCryptoRecoveryGenerate)
 		admin.POST("/crypto/recovery-key/ack", s.handleCryptoRecoveryKeyAck)
+		admin.POST("/tunnels/certificates", s.requireUnlocked(), s.handleTunnelCertificateIssue)
 
 		// Auto-unlock surface — requires unlocked + admin. GET returns state +
 		// has_outstanding_blob; PUT applies a partial update with cleanup on
@@ -2479,21 +2574,22 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 	lanPortURL := s.determineLocalURL(c, ep, scheme)
 
 	result := gin.H{
-		"app":                ep.App,
-		"name":               ep.Name,
-		"guest_port":         ep.GuestPort,
-		"host_port":          ep.HostBind,
-		"public_port":        ep.PublicPort,
-		"remote_ports":       ep.RemotePorts,
-		"remote_host":        remoteHostValue,
-		"flow":               ep.Flow,
-		"protocol":           ep.Protocol,
-		"primary":            ep.Primary,
-		"derived_host_label": ep.DerivedHostLabel,
-		"middleware":         ep.Middleware,
-		"scheme":             scheme,
-		"local_url":          lanPortURL, // Keep for backward compatibility
-		"lan_port_url":       lanPortURL, // New explicit name
+		"app":                   ep.App,
+		"name":                  ep.Name,
+		"guest_port":            ep.GuestPort,
+		"host_port":             ep.HostBind,
+		"public_port":           ep.PublicPort,
+		"remote_ports":          ep.RemotePorts,
+		"remote_host":           remoteHostValue,
+		"flow":                  ep.Flow,
+		"protocol":              ep.Protocol,
+		"primary":               ep.Primary,
+		"derived_host_label":    ep.DerivedHostLabel,
+		"middleware":            ep.Middleware,
+		"scheme":                scheme,
+		"requires_tls_mux_auth": ep.RequiresTLSMuxAuth,
+		"local_url":             lanPortURL, // Keep for backward compatibility
+		"lan_port_url":          lanPortURL, // New explicit name
 	}
 
 	if ep.Auth != nil {
@@ -2504,7 +2600,7 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 	}
 
 	// Add host-based URLs only for HTTP/WS listeners (per RFC 20260114)
-	if ep.DerivedHostLabel != "" {
+	if ep.DerivedHostLabel != "" && !ep.RequiresTLSMuxAuth {
 		// LAN host URL: only if mDNS is enabled (mdnsManager is nil when disabled)
 		if s.mdnsManager != nil {
 			lanBase := s.mdnsManager.Hostname()
@@ -2540,12 +2636,12 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 
 	// Add request-independent LAN fallback URL (RFC 20260125)
 	// This is used by UI for "Access Locally" overlay when remote access is degraded.
-	if ep.DerivedHostLabel != "" && s.mdnsManager != nil {
+	if ep.DerivedHostLabel != "" && s.mdnsManager != nil && !ep.RequiresTLSMuxAuth {
 		// Host-based fallback via mDNS
 		lanBase := s.mdnsManager.Hostname()
 		lanHostname := hostnamepkg.DeriveLANHostname(ep.DerivedHostLabel, lanBase)
 		result["lan_fallback_url"] = fmt.Sprintf("%s://%s", scheme, lanHostname)
-	} else {
+	} else if !ep.RequiresTLSMuxAuth {
 		// Port-based fallback using device's preferred outbound IP
 		// Use computed scheme to match listener protocol (http/https/ws/wss)
 		if deviceIP := getPreferredOutboundIP(); deviceIP != "" {
@@ -2558,6 +2654,9 @@ func (s *GinServer) formatServiceEndpoint(c *gin.Context, ep services.ServiceEnd
 
 func (s *GinServer) determineLocalURL(c *gin.Context, ep services.ServiceEndpoint, scheme string) *string {
 	r := c.Request
+	if ep.RequiresTLSMuxAuth {
+		return nil
+	}
 
 	// Suppress local URLs only for nexus/TLS-mux proxied requests (remote access).
 	// Identified by secureContextKey set in the secure loopback handler.

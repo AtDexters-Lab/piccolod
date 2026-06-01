@@ -98,17 +98,36 @@ func TestValidateAppDefinition_MultiContainer_RejectsBindPortCollision(t *testin
 	}
 }
 
-func TestValidateAppDefinition_MultiContainer_RequiresPrimaryBindPortsForListeners(t *testing.T) {
-	// This test verifies that multi-container apps require bind_ports to include listener guest_ports.
-	// The check only applies when there are 2+ services (single-service apps skip this check).
+func TestValidateAppDefinition_MultiContainer_ListenerPortMayBelongToAnyService(t *testing.T) {
 	// RFC 20260130: listener name is the app identity, set Primary=true for test
 	app := &api.AppDefinition{
 		Listeners: []api.AppListener{
 			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+			{Name: "admin", GuestPort: 2022, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw},
 		},
 		PrimaryService: "main",
 		Services: map[string]api.AppService{
-			"main": {Image: "nginx:alpine", BindPorts: []int{}},
+			"main": {Image: "nginx:alpine", BindPorts: []int{8080}},
+			"db":   {Image: "postgres:16", BindPorts: []int{2022}},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+
+	SetDefaults(app)
+	if err := ValidateAppDefinition(app); err != nil {
+		t.Fatalf("expected non-primary service-owned listener port to be valid, got: %v", err)
+	}
+}
+
+func TestValidateAppDefinition_MultiContainer_RequiresServiceBindPortForListeners(t *testing.T) {
+	app := &api.AppDefinition{
+		Listeners: []api.AppListener{
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+			{Name: "admin", GuestPort: 2022, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw},
+		},
+		PrimaryService: "main",
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{8080}},
 			"db":   {Image: "postgres:16", BindPorts: []int{5432}},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},

@@ -135,7 +135,7 @@ func TestFindFreeName_IDFreeButSubdomainTaken(t *testing.T) {
 		"blogapp": {
 			Extensions: map[string]interface{}{"mode": "service"},
 			Services: map[string]api.AppService{
-				"main": {Image: "docker.io/library/blog:latest"},
+				"main": {Image: "docker.io/library/blog:latest", BindPorts: []int{8080}},
 			},
 			Listeners: []api.AppListener{
 				{Name: "blog", GuestPort: 8080, Primary: true},

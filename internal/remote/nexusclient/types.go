@@ -22,12 +22,12 @@ type AliasEntry struct {
 
 // Config represents the minimum information needed to connect to the nexus proxy.
 type Config struct {
-	Endpoint       string               // Single endpoint (backward compat for self-hosted adapter)
-	Endpoints      []string             // Multiple relay endpoints (namek); takes precedence over Endpoint
+	Endpoint       string   // Single endpoint (backward compat for self-hosted adapter)
+	Endpoints      []string // Multiple relay endpoints (namek); takes precedence over Endpoint
 	DeviceSecret   string
-	PortalHostname string               // Fully-qualified hostname (e.g., portal.home.example.com)
-	Aliases        []AliasEntry         // Additional hostnames routed to this device (e.g., custom domains)
-	ClaimMappings  []api.PortClaimInfo  // Port claims with local targets; TCP/UDP derived at start time
+	PortalHostname string              // Fully-qualified hostname (e.g., portal.home.example.com)
+	Aliases        []AliasEntry        // Additional hostnames routed to this device (e.g., custom domains)
+	ClaimMappings  []api.PortClaimInfo // Port claims with local targets; TCP/UDP derived at start time
 }
 
 // ResolvedEndpoints returns a deduplicated, trimmed list of endpoints.
@@ -63,6 +63,26 @@ type Adapter interface {
 // RemoteResolver resolves incoming Nexus requests to local listener ports.
 type RemoteResolver interface {
 	Resolve(hostname string, remotePort int, isTLS bool) (int, bool)
+}
+
+type RouteDecision int
+
+const (
+	RouteNoMatch RouteDecision = iota
+	RouteAllow
+	RouteDeny
+)
+
+type RouteResolution struct {
+	Decision RouteDecision
+	Port     int
+}
+
+// RemoteRouteResolver is the newer resolver shape that can distinguish an
+// ordinary miss from a terminal policy denial. Nexus may try port-claim
+// fallback only after RouteNoMatch.
+type RemoteRouteResolver interface {
+	ResolveRoute(hostname string, remotePort int, isTLS bool) RouteResolution
 }
 
 // PortController is an optional extension. Implementers may choose to take

@@ -142,7 +142,8 @@ services:
     image: ubuntu:22.04
 
     # REQUIRED (may be empty): declare every port this service binds inside the shared network namespace.
-    # If multiple services exist, the primary service MUST include every listener guest_port here.
+    # Every listener guest_port MUST appear in exactly one service's bind_ports. The declaring
+    # service is the documented owner; runtime routing still targets the shared namespace + port.
     bind_ports: [8080, 22]
 
     # Optional: start/stop ordering only (not readiness).
@@ -316,12 +317,50 @@ listeners:
           type: prefix
           strategy: oidc_passthrough
 
+    # Optional: connection-level admission before listener bytes reach the app.
+    #
+    # IP/CIDR rules:
+    # - default: allow | deny (default is allow)
+    # - rules are first-match-wins; unmatched sources use default.
+    #
+    # mTLS:
+    # - connection_auth.mtls requires x-piccolo.requires_features to include
+    #   connection_auth_mtls_v1.
+    # - V1 supports only verifier.type: piccolo_session.
+    # - Valid on protocol: http, protocol: websocket, and protocol: raw only
+    #   when flow: tcp plus tls_wrap: true.
+    # - Invalid on flow: tls, flow: udp, raw TCP without tls_wrap, and with port_claim.
+    # - For mTLS listeners, remote_ports are TLS-mux-only remote ports: TLS/SNI traffic
+    #   may route to the TLS mux, non-TLS payload traffic returns no route. Port 80
+    #   HTTP-01 challenge and redirect traffic for known app hostnames is still handled
+    #   by piccolod, not by the app listener.
+    # - If combined with auth.rules on HTTP/WebSocket, both connection_auth.mtls and
+    #   the L7 auth rule must pass. Ordinary browsers will fail unless they present
+    #   an accepted client certificate.
+    connection_auth:
+      default: deny
+      rules:
+        - match: 10.0.0.0/8
+          strategy: allow
+      mtls:
+        verifier:
+          type: piccolo_session
+
   - name: ssh
     guest_port: 22
     flow: tcp
     protocol: raw
-    remote_ports: [22]
-    # port_claim: 2222  # Optional: expose SSH on a specific LAN port
+    tls_wrap: true
+    remote_ports: [443]
+    connection_auth:
+      mtls:
+        verifier:
+          type: piccolo_session
+    # Developer-mode no-auth sshd is acceptable only when this verified
+    # connection_auth_mtls_v1 Piccolo guard is present and the container port has
+    # no other exposure path.
+    # Do not set port_claim with connection_auth.mtls in v1; that would create
+    # a direct port path where the TLS mux cannot enforce client cert auth.
 
   # Example: DNS listener with port claims (e.g., Pi-hole)
   # DNS requires both UDP and TCP on port 53. Two listeners can share the same
@@ -391,6 +430,8 @@ workspace_name: ""  # Only used when mode: workspace AND no listeners defined
 # REQUIRED: you must set `x-piccolo.mode` for every app.
 x-piccolo:
   mode: service # service | workspace
+  requires_features:
+    - connection_auth_mtls_v1 # Required if any listener uses connection_auth.mtls.
 
   replication:
     hot:
