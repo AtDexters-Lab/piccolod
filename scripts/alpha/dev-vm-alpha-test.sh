@@ -15,6 +15,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> rootfs-verify    # stage 6: block-native rootfs verification
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> service-app      # stage 7: service app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> workspace-app    # stage 8: workspace app lifecycle
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> app-resize       # stage 19: app storage resize recovery
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> reboot           # stage 9: reboot & unlock cycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> storage-post     # stage 10: post-reboot storage
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> stewardship      # stage 11: resource stewardship (slice drop-ins, podman args)
@@ -197,6 +198,21 @@ dump_logs() {
     lines=$(wc -l < "$outfile")
     echo -e "  ${CYAN}LOGS${NC} Saved $lines lines → $outfile"
   fi
+}
+
+delete_app_if_present() {
+  local app_name="$1"
+  local token code
+  token=$(csrf || true)
+  if [[ -z "$token" ]]; then
+    echo "000"
+    return 0
+  fi
+  code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 30 --max-time 120 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X DELETE -H "X-CSRF-Token: $token" \
+    "http://$IP/api/v1/apps/$app_name" 2>/dev/null || true)
+  echo "$code"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -675,6 +691,194 @@ except: print('')" 2>/dev/null)
   else
     echo -e "  ${CYAN}INFO${NC} [8.8] $golden_after golden LV(s) remain (may be shared with other images)"
   fi
+}
+
+# ─────────────────────────────────────────────────────────
+# Stage 19: Application Storage Resize Recovery
+#
+# Reproduces the field failure where an app LV already grew, but the LUKS
+# mapper, ext4 filesystem, and piccolo.volume.json stayed at the old size.
+# The resize API must converge forward without issuing a same-size/shrinking
+# lvresize and must pass a non-interactive key file to cryptsetup resize.
+# ─────────────────────────────────────────────────────────
+stage_app_resize() {
+  echo -e "\n${CYAN}═══ Stage 19: Application Storage Resize Recovery ═══${NC}"
+  ensure_session
+
+  local APP_NAME="resizetest"
+  local APP_VOLUME_ID="app-$APP_NAME"
+  local LV_NAME="vol-$APP_VOLUME_ID"
+  local MAPPER="piccolo-vol-$APP_VOLUME_ID"
+  local MOUNT_DIR="/piccolo-core/mounts/$APP_VOLUME_ID"
+  local META_PATH="/piccolo-core/volumes/$APP_VOLUME_ID/piccolo.volume.json"
+
+  local cleanup_code
+  cleanup_code=$(delete_app_if_present "$APP_NAME")
+  if [[ "$cleanup_code" == "200" ]]; then
+    echo -e "  ${CYAN}INFO${NC} Removed existing $APP_NAME before resize regression"
+    sleep 5
+  fi
+
+  local template_yaml
+  template_yaml=$(cat <<'EOF'
+listeners:
+  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: http
+
+services:
+  main:
+    image: docker.io/traefik/whoami:latest
+    bind_ports: [80]
+
+resources:
+  priority: normal
+  memory:
+    min_required: 64MB
+    profile: bounded
+
+x-piccolo:
+  mode: service
+EOF
+)
+
+  local payload
+  payload=$(YAML="$template_yaml" python3 -c "
+import json, os
+print(json.dumps({
+    'app_definition': os.environ['YAML'],
+    'inputs': {'__app_address__': 'resizetest'},
+    'catalog_source': 'none'
+}))")
+
+  local token install_http
+  token=$(csrf)
+  install_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 300 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null)
+  check "19.1" "Resize test service app installed" "$install_http" "201"
+
+  if [[ "$install_http" != "201" ]]; then
+    dump_logs "stage19-install-fail"
+    return
+  fi
+
+  local app_status=""
+  for i in $(seq 1 90); do
+    app_status=$(api "/api/v1/apps/$APP_NAME" | python3 -c "
+import sys, json
+try: print(json.load(sys.stdin).get('data',{}).get('app',{}).get('status',''))
+except: print('')" 2>/dev/null)
+    [[ "$app_status" == "running" ]] && break
+    sleep 2
+  done
+  check "19.2" "Resize test app reaches running" "$app_status" "running"
+  if [[ "$app_status" != "running" ]]; then
+    dump_logs "stage19-running-fail"
+    delete_app_if_present "$APP_NAME" >/dev/null
+    return
+  fi
+
+  local meta_before
+  meta_before=$(vssh "python3 -c 'import json; print(json.load(open(\"$META_PATH\")).get(\"size_bytes\",0))'" 2>/dev/null || echo 0)
+  if [[ "$meta_before" =~ ^[0-9]+$ && "$meta_before" -gt 0 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [19.3] Initial app volume metadata present ($meta_before bytes)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [19.3] Initial app volume metadata missing"
+    ((FAIL_COUNT++)) || true
+    dump_logs "stage19-meta-fail"
+    delete_app_if_present "$APP_NAME" >/dev/null
+    return
+  fi
+
+  local gib=$((1024 * 1024 * 1024))
+  local target_bytes=$((meta_before + gib))
+  local actual_bytes=$((meta_before + 2 * gib))
+
+  check_ssh_ok "19.4" "Manually grew LV only beyond requested resize target" \
+    "lvresize -y --size ${actual_bytes}B piccolo-data-vg/$LV_NAME"
+
+  local meta_stale
+  meta_stale=$(vssh "python3 -c 'import json; print(json.load(open(\"$META_PATH\")).get(\"size_bytes\",0))'" 2>/dev/null || echo 0)
+  if [[ "$meta_stale" == "$meta_before" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [19.5] Metadata intentionally remains stale before API repair"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [19.5] Metadata changed before API repair: before=$meta_before after=$meta_stale"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  local body_file resp_file resize_code resize_resp
+  body_file=$(mktemp /tmp/claude-1000/resize-body-XXXXXX)
+  resp_file=$(mktemp /tmp/claude-1000/resize-resp-XXXXXX)
+  printf '{"size_bytes":%d}' "$target_bytes" > "$body_file"
+  token=$(csrf)
+  resize_code=$(curl -s -o "$resp_file" -w '%{http_code}' --connect-timeout 30 --max-time 180 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d @"$body_file" "http://$IP/api/v1/apps/$APP_NAME/resize-storage" 2>/dev/null)
+  resize_resp=$(cat "$resp_file" 2>/dev/null || true)
+  rm -f "$body_file" "$resp_file"
+  check "19.6" "Resize API repaired partial LV-only growth" "$resize_code" "200"
+  if [[ "$resize_code" != "200" ]]; then
+    echo "       response: $(echo "$resize_resp" | head -c 200)"
+    dump_logs "stage19-resize-fail"
+    delete_app_if_present "$APP_NAME" >/dev/null
+    return
+  fi
+
+  local lv_after
+  lv_after=$(vssh "lvs --noheadings --nosuffix --units b -o lv_size piccolo-data-vg/$LV_NAME | python3 -c 'import sys; parts=sys.stdin.read().strip().split(); print(int(float(parts[0])) if parts else 0)'" 2>/dev/null || echo 0)
+  if [[ "$lv_after" =~ ^[0-9]+$ && "$lv_after" -ge "$actual_bytes" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [19.7] LV remains at manually-grown size ($lv_after bytes)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [19.7] LV size $lv_after is below expected $actual_bytes"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  local meta_after
+  meta_after=$(vssh "python3 -c 'import json; print(json.load(open(\"$META_PATH\")).get(\"size_bytes\",0))'" 2>/dev/null || echo 0)
+  if [[ "$meta_after" =~ ^[0-9]+$ && "$lv_after" =~ ^[0-9]+$ && "$meta_after" -eq "$lv_after" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [19.8] Metadata converged to actual LV size ($meta_after bytes)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [19.8] Metadata did not match LV size: metadata=$meta_after lv=$lv_after"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  local crypt_after mapper_floor
+  crypt_after=$(vssh "cryptsetup status $MAPPER | python3 -c 'import re,sys; m=re.search(r\"size:\\s+(\\d+)\\s+\\[512-byte\", sys.stdin.read()); print(int(m.group(1))*512 if m else 0)'" 2>/dev/null || echo 0)
+  mapper_floor=$((lv_after - 32 * 1024 * 1024))
+  if [[ "$crypt_after" =~ ^[0-9]+$ && "$crypt_after" -ge "$mapper_floor" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [19.9] LUKS mapper grew with LV ($crypt_after bytes usable)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [19.9] LUKS mapper stayed too small: mapper=$crypt_after floor=$mapper_floor"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  local fs_after
+  fs_after=$(vssh "df -B1 --output=size $MOUNT_DIR | tail -n +2 | tr -d ' '" 2>/dev/null || echo 0)
+  if [[ "$fs_after" =~ ^[0-9]+$ && "$fs_after" -ge "$target_bytes" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [19.10] ext4 filesystem grew beyond requested target ($fs_after bytes)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [19.10] ext4 filesystem too small: fs=$fs_after target=$target_bytes"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  local recent_logs
+  recent_logs=$(vssh "journalctl -u piccolod --no-pager -n 250 | grep -Ei 'app-resizetest|vol-app-resizetest|piccolo-vol-app-resizetest|Nothing to read|matches existing' || true" 2>/dev/null)
+  check "19.11" "Resize used no-shrink LV guard" "$recent_logs" "thin LV already at or above target"
+  check_not "19.12" "No interactive cryptsetup resize failure" "$recent_logs" "Nothing to read on input"
+  check_not "19.13" "No same-size lvresize failure" "$recent_logs" "matches existing size"
+
+  cleanup_code=$(delete_app_if_present "$APP_NAME")
+  check "19.14" "Resize test app uninstalled" "$cleanup_code" "200"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -2526,7 +2730,7 @@ except: print('||0|0|False')" 2>/dev/null)
 # ─────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────
-mkdir -p "$(dirname "$COOKIE_JAR")"
+mkdir -p "$(dirname "$COOKIE_JAR")" /tmp/claude-1000
 
 case "$STAGE" in
   prereq)            stage_prereq ;;
@@ -2538,6 +2742,7 @@ case "$STAGE" in
   rootfs-verify)     stage_rootfs_verify ;;
   service-app)       stage_service_app ;;
   workspace-app)     stage_workspace_app ;;
+  app-resize)        stage_app_resize ;;
   reboot)            stage_reboot ;;
   storage-post)      stage_storage_post ;;
   stewardship)       stage_stewardship ;;
@@ -2560,6 +2765,7 @@ case "$STAGE" in
     stage_storage_inspect
     stage_rootfs_verify
     stage_service_app
+    stage_app_resize
     stage_workspace_app
     stage_stewardship
     stage_connection_auth
@@ -2574,7 +2780,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent async-recovery-key logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app app-resize reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent async-recovery-key logs all"
     exit 1
     ;;
 esac

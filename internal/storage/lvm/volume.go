@@ -112,6 +112,47 @@ func (m *LVManager) ResizeLV(ctx context.Context, name string, newSizeBytes int6
 	return nil
 }
 
+// LVSizeBytes returns the current logical size of an LV.
+func (m *LVManager) LVSizeBytes(ctx context.Context, name string) (int64, error) {
+	lvPath := fmt.Sprintf("%s/%s", m.vgName, name)
+	out, err := m.run.RunWithOutput(ctx, "lvs",
+		"--noheadings", "--nosuffix", "--units", "b",
+		"-o", "lv_size",
+		lvPath,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("lvs size %s: %w", lvPath, err)
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("lvs size %s: empty output", lvPath)
+	}
+	sizeBytes, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse lv_size %q for %s: %w", fields[0], lvPath, err)
+	}
+	return alignToSector(int64(sizeBytes)), nil
+}
+
+// EnsureLVSizeAtLeast grows a thin LV to at least minSizeBytes and never
+// shrinks an LV that is already larger. It returns the size the caller should
+// treat as the converged LV size.
+func (m *LVManager) EnsureLVSizeAtLeast(ctx context.Context, name string, minSizeBytes int64) (int64, error) {
+	minSizeBytes = alignToSector(minSizeBytes)
+	currentSize, err := m.LVSizeBytes(ctx, name)
+	if err != nil {
+		return 0, err
+	}
+	if currentSize >= minSizeBytes {
+		log.Printf("thin LV already at or above target: %s/%s current=%d target=%d", m.vgName, name, currentSize, minSizeBytes)
+		return currentSize, nil
+	}
+	if err := m.ResizeLV(ctx, name, minSizeBytes); err != nil {
+		return 0, err
+	}
+	return minSizeBytes, nil
+}
+
 // RenameLV renames a thin logical volume.
 func (m *LVManager) RenameLV(ctx context.Context, oldName, newName string) error {
 	if err := m.run.Run(ctx, "lvrename", m.vgName, oldName, newName); err != nil {

@@ -47,7 +47,7 @@ resolve_vm() {
 get_ip() {
   local vm="$1"
   local ip=""
-  ip=$(VBoxManage guestproperty get "$vm" "/VirtualBox/GuestInfo/Net/0/V4/IP" 2>/dev/null \
+  ip=$(timeout 5s VBoxManage guestproperty get "$vm" "/VirtualBox/GuestInfo/Net/0/V4/IP" 2>/dev/null \
     | grep -oP 'Value: \K.*' || true)
   if [[ -n "$ip" && "$ip" != "0.0.0.0" ]]; then
     echo "$ip" > "$VM_IP_FILE"

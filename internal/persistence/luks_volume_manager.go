@@ -518,11 +518,11 @@ func (m *luksVolumeManager) reconcileAttachedSize(ctx context.Context, volumeID 
 	switch meta.Type {
 	case volumeTypeServiceData:
 		mapper := volMapperName(volumeID)
-		_ = m.run.Run(ctx, "cryptsetup", "resize", mapper)
+		_ = m.luksResizeWithPoolKeyfile(ctx, mapper)
 		_, _ = m.run.RunWithOutput(ctx, "resize2fs", "/dev/mapper/"+mapper)
 	case volumeTypeWorkspace:
 		mapper := volMapperName(volumeID)
-		_ = m.run.Run(ctx, "cryptsetup", "resize", mapper)
+		_ = m.luksResizeWithPoolKeyfile(ctx, mapper)
 		_ = m.run.Run(ctx, "btrfs", "filesystem", "resize", "max", paths.MountDir(volumeID))
 	}
 }
@@ -1351,6 +1351,28 @@ func (m *luksVolumeManager) luksOpenWithPoolKeyfile(ctx context.Context, device,
 		"--allow-discards",
 		"--key-file", keyPath,
 		device, mapper,
+	)
+}
+
+func (m *luksVolumeManager) luksResizeWithPoolKeyfile(ctx context.Context, mapper string) error {
+	if m.crypto == nil {
+		return errors.New("crypto manager unavailable")
+	}
+	poolKey, err := m.crypto.UnwrapPoolKeyfile()
+	if err != nil {
+		return fmt.Errorf("unwrap pool keyfile: %w", err)
+	}
+	defer cryptoutil.SecureZero(poolKey)
+
+	keyPath, cleanup, err := writeKeyToTmpfsDir(m.tmpfsDir, poolKey)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	return m.run.Run(ctx, "cryptsetup", "resize",
+		"--key-file", keyPath,
+		mapper,
 	)
 }
 

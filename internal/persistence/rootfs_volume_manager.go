@@ -664,9 +664,9 @@ func (m *luksVolumeManager) attachRootfsLocked(ctx context.Context, volumeID str
 // resized in lockstep with the LV. Used by resizeConverge to enforce the
 // strict ordering codex iter-7 B2 pinned.
 //
-// Mapper: when non-empty, cryptsetup resize <Mapper> runs after the LV
-// resize succeeds. Empty means no live LUKS mapper to resize (volume is
-// detached, or the strict caller's probe says so).
+// Mapper: when non-empty, cryptsetup resize <Mapper> runs with the pool keyfile
+// after the LV resize succeeds. Empty means no live LUKS mapper to resize
+// (volume is detached, or the strict caller's probe says so).
 //
 // FSResize: filesystem-specific online-grow callback (btrfs filesystem
 // resize for workspace, resize2fs for application). Invoked only when
@@ -749,11 +749,12 @@ func (m *luksVolumeManager) resizeConverge(
 	if live.FSResize != nil && live.Mapper == "" {
 		return fmt.Errorf("resizeConverge: FSResize requires Mapper (meta %s)", metaPath)
 	}
-	if err := m.lvMgr.ResizeLV(ctx, meta.LVName, newSizeBytes); err != nil {
+	actualSizeBytes, err := m.lvMgr.EnsureLVSizeAtLeast(ctx, meta.LVName, newSizeBytes)
+	if err != nil {
 		return fmt.Errorf("lvresize: %w", err)
 	}
 	if live.Mapper != "" {
-		if err := m.run.Run(ctx, "cryptsetup", "resize", live.Mapper); err != nil {
+		if err := m.luksResizeWithPoolKeyfile(ctx, live.Mapper); err != nil {
 			return fmt.Errorf("cryptsetup resize: %w", err)
 		}
 		if live.FSResize != nil {
@@ -762,7 +763,7 @@ func (m *luksVolumeManager) resizeConverge(
 			}
 		}
 	}
-	meta.SizeBytes = newSizeBytes
+	meta.SizeBytes = actualSizeBytes
 	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
 		return fmt.Errorf("update metadata: %w", err)
 	}

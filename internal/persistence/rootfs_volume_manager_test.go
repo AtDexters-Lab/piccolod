@@ -5,9 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
+	"piccolod/internal/crypt"
 	"piccolod/internal/state/paths"
+	"piccolod/internal/storage/lvm"
+	"piccolod/internal/testutil"
 )
 
 func TestServiceRootfsVolumeID(t *testing.T) {
@@ -98,40 +102,40 @@ func TestVersionedServiceRootfsVolumeID(t *testing.T) {
 
 func TestGoldenLVSizeForImage(t *testing.T) {
 	tests := []struct {
-		name          string
+		name           string
 		imageSizeBytes int64
-		want          int64
+		want           int64
 	}{
 		{
-			name:          "zero_falls_back_to_default",
+			name:           "zero_falls_back_to_default",
 			imageSizeBytes: 0,
-			want:          defaultGoldenLVSize,
+			want:           defaultGoldenLVSize,
 		},
 		{
-			name:          "negative_falls_back_to_default",
+			name:           "negative_falls_back_to_default",
 			imageSizeBytes: -100,
-			want:          defaultGoldenLVSize,
+			want:           defaultGoldenLVSize,
 		},
 		{
-			name:          "small_image_plus_1GiB_wins",
+			name:           "small_image_plus_1GiB_wins",
 			imageSizeBytes: 50 << 20, // 50 MiB
 			// 1.5x = 75 MiB, +1 GiB = ~1074 MiB → +1 GiB wins
 			want: 50<<20 + 1<<30,
 		},
 		{
-			name:          "medium_image_plus_1GiB_wins",
+			name:           "medium_image_plus_1GiB_wins",
 			imageSizeBytes: 500 << 20, // 500 MiB
 			// 1.5x = 750 MiB, +1 GiB = 1524 MiB → +1 GiB wins
 			want: 500<<20 + 1<<30,
 		},
 		{
-			name:          "large_image_1.5x_wins",
+			name:           "large_image_1.5x_wins",
 			imageSizeBytes: 4 << 30, // 4 GiB
 			// 1.5x = 6 GiB, +1 GiB = 5 GiB → 1.5x wins
 			want: 4<<30 + 4<<30/2,
 		},
 		{
-			name:          "boundary_at_2GiB",
+			name:           "boundary_at_2GiB",
 			imageSizeBytes: 2 << 30, // 2 GiB
 			// 1.5x = 3 GiB, +1 GiB = 3 GiB → equal, sizeA is used (both 3 GiB)
 			want: 2<<30 + 2<<30/2,
@@ -266,11 +270,11 @@ func TestLiveResizeFromState(t *testing.T) {
 	fsResize := func(context.Context) error { return nil }
 
 	cases := []struct {
-		name           string
-		state          AttachState
-		wantErr        bool
-		wantMapper     string
-		wantFSResize   bool
+		name         string
+		state        AttachState
+		wantErr      bool
+		wantMapper   string
+		wantFSResize bool
 	}{
 		{"Attached_full_live", AttachStateAttached, false, mapper, true},
 		{"Detached_lv_only", AttachStateDetached, false, "", false},
@@ -304,4 +308,158 @@ func TestLiveResizeFromState(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResizeConvergeRecoversPartialApplicationResize(t *testing.T) {
+	core, _ := paths.SetRootsForTest(t)
+	cryptoMgr := newResizeTestCryptManager(t, core)
+	run := &fakeRunner{
+		Outputs: map[string]string{
+			testutil.BuildKey("lvs", []string{
+				"--noheadings", "--nosuffix", "--units", "b",
+				"-o", "lv_size",
+				"piccolo-data-vg/vol-app-drawguess",
+			}): "21474836480\n",
+		},
+	}
+	mgr := &luksVolumeManager{
+		run:      run,
+		crypto:   cryptoMgr,
+		tmpfsDir: t.TempDir(),
+		lvMgr:    lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+	}
+
+	metaPath := filepath.Join(paths.VolumeMetaDir("app-drawguess"), metadataV2File)
+	if err := os.MkdirAll(filepath.Dir(metaPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := &volumeMetaV3{
+		Version:   metadataV3Version,
+		Type:      volumeTypeServiceData,
+		LVName:    "vol-app-drawguess",
+		VGName:    lvm.DefaultVGName,
+		SizeBytes: 10 << 30,
+		FSType:    "ext4",
+	}
+	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
+		t.Fatal(err)
+	}
+
+	live := liveResizeSpec{
+		Mapper: "piccolo-vol-app-drawguess",
+		FSResize: func(ctx context.Context) error {
+			return run.Run(ctx, "resize2fs", "/dev/mapper/piccolo-vol-app-drawguess")
+		},
+	}
+	if err := mgr.resizeConverge(context.Background(), meta, metaPath, 20<<30, live); err != nil {
+		t.Fatalf("resizeConverge: %v", err)
+	}
+
+	updated, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.SizeBytes != 20<<30 {
+		t.Fatalf("metadata size: got %d, want %d", updated.SizeBytes, int64(20<<30))
+	}
+
+	calls := run.GetCalls()
+	for _, call := range calls {
+		if strings.HasPrefix(call, "lvresize ") {
+			t.Fatalf("did not expect lvresize when LV already matched target, calls=%v", calls)
+		}
+	}
+	requireCallContaining(t, calls, "cryptsetup resize --key-file ")
+	requireCallContaining(t, calls, " piccolo-vol-app-drawguess")
+	requireCallContaining(t, calls, "resize2fs /dev/mapper/piccolo-vol-app-drawguess")
+}
+
+func TestResizeConvergeDoesNotShrinkLVWhenMetadataIsStale(t *testing.T) {
+	core, _ := paths.SetRootsForTest(t)
+	cryptoMgr := newResizeTestCryptManager(t, core)
+	run := &fakeRunner{
+		Outputs: map[string]string{
+			testutil.BuildKey("lvs", []string{
+				"--noheadings", "--nosuffix", "--units", "b",
+				"-o", "lv_size",
+				"piccolo-data-vg/vol-app-drawguess",
+			}): "32212254720\n",
+		},
+	}
+	mgr := &luksVolumeManager{
+		run:      run,
+		crypto:   cryptoMgr,
+		tmpfsDir: t.TempDir(),
+		lvMgr:    lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+	}
+
+	metaPath := filepath.Join(paths.VolumeMetaDir("app-drawguess"), metadataV2File)
+	if err := os.MkdirAll(filepath.Dir(metaPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := &volumeMetaV3{
+		Version:   metadataV3Version,
+		Type:      volumeTypeServiceData,
+		LVName:    "vol-app-drawguess",
+		VGName:    lvm.DefaultVGName,
+		SizeBytes: 10 << 30,
+		FSType:    "ext4",
+	}
+	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
+		t.Fatal(err)
+	}
+
+	live := liveResizeSpec{Mapper: "piccolo-vol-app-drawguess"}
+	if err := mgr.resizeConverge(context.Background(), meta, metaPath, 20<<30, live); err != nil {
+		t.Fatalf("resizeConverge: %v", err)
+	}
+
+	updated, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.SizeBytes != 30<<30 {
+		t.Fatalf("metadata size: got %d, want %d", updated.SizeBytes, int64(30<<30))
+	}
+
+	calls := run.GetCalls()
+	for _, call := range calls {
+		if strings.HasPrefix(call, "lvresize ") {
+			t.Fatalf("did not expect lvresize shrink from larger actual LV, calls=%v", calls)
+		}
+	}
+	requireCallContaining(t, calls, "cryptsetup resize --key-file ")
+	requireCallContaining(t, calls, " piccolo-vol-app-drawguess")
+}
+
+func newResizeTestCryptManager(t *testing.T, core string) *crypt.Manager {
+	t.Helper()
+	mgr, err := crypt.NewManager(core)
+	if err != nil {
+		t.Fatalf("crypt.NewManager: %v", err)
+	}
+	if err := mgr.Setup("test-password"); err != nil {
+		t.Fatalf("crypt.Setup: %v", err)
+	}
+	if err := mgr.Unlock("test-password"); err != nil {
+		t.Fatalf("crypt.Unlock: %v", err)
+	}
+	rawKey := make([]byte, 64)
+	for i := range rawKey {
+		rawKey[i] = byte(i + 1)
+	}
+	if err := mgr.StorePoolKeyfile(rawKey); err != nil {
+		t.Fatalf("StorePoolKeyfile: %v", err)
+	}
+	return mgr
+}
+
+func requireCallContaining(t *testing.T, calls []string, needle string) {
+	t.Helper()
+	for _, call := range calls {
+		if strings.Contains(call, needle) {
+			return
+		}
+	}
+	t.Fatalf("expected call containing %q, got %v", needle, calls)
 }
