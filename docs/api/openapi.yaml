@@ -1745,6 +1745,13 @@ components:
             rpm_updates_available: { type: integer, description: Count of pending RPM updates (best-effort) }
             piccolod_active: { type: string, description: "Active piccolod RPM version, if installed" }
             piccolod_staged: { type: string, description: "Staged piccolod RPM version, if differs from active" }
+            stale: { type: boolean, description: "True when the status body is an expired or invalidated cache snapshot while a refresh is running" }
+            refreshing: { type: boolean, description: "True when the backend is refreshing OS update status in the background" }
+            degraded: { type: boolean, description: "True when live status probing failed or timed out and the response is a best-effort fallback" }
+            degraded_reason: { type: string, description: "Best-effort diagnostic reason for degraded status" }
+            cache_empty: { type: boolean, description: "True when degraded status was returned without any prior cached snapshot" }
+            cached_at: { type: string, format: date-time, description: "Timestamp of the cache snapshot used for a stale response" }
+            cache_age_seconds: { type: integer, description: "Age of the cache snapshot used for a stale response" }
             last_run: { $ref: '#/components/schemas/TransactionalUpdateRun' }
             last_request: { $ref: '#/components/schemas/UpdateRequest' }
             derived_outcome: { type: string, description: "Derived outcome of the last request (applied, pending-reboot, not-applied, empty when unknown)" }

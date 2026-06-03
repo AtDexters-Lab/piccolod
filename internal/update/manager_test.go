@@ -745,21 +745,17 @@ func TestStatusServedFromSnapshotCache(t *testing.T) {
 		t.Errorf("cached Status made %d runner calls; expected ≤%d (isInProgress overhead)", cachedDelta, expectedIsInProgressShellouts)
 	}
 
-	beforeInv := r.calls.Load()
 	m.invalidateStatusCache()
-	if _, err := m.Status(context.Background()); err != nil {
+	if st, err := m.Status(context.Background()); err != nil {
 		t.Fatalf("post-invalidate Status: %v", err)
-	}
-	postInvDelta := r.calls.Load() - beforeInv
-	if postInvDelta < primingDelta-expectedIsInProgressShellouts {
-		t.Errorf("post-invalidate Status made %d calls; expected full readStatus (~%d)", postInvDelta, primingDelta)
+	} else if stale, _ := st.Meta["stale"].(bool); !stale {
+		t.Fatalf("post-invalidate Status should serve stale cache while refreshing, got meta=%v", st.Meta)
 	}
 }
 
 // TestStatusInvalidateDuringRefresh asserts that a sample taken before an
-// invalidate is NOT published after the invalidate (otherwise the next
-// Status() call serves pre-invalidation stale data, defeating the contract
-// that Apply/Rollback/Reboot guarantee a fresh re-read).
+// invalidate is NOT published as fresh after the invalidate. Stale cache may
+// still be returned to callers, but it must be explicitly marked stale.
 func TestStatusInvalidateDuringRefresh(t *testing.T) {
 	tmp := t.TempDir()
 	m, err := newMicroOSBackend(
@@ -835,13 +831,154 @@ func TestApplyInvalidatesStatusCache(t *testing.T) {
 	// Apply will fail (fakeRunner doesn't implement systemd-run for TU), but the
 	// invalidation hook in the Manager facade fires via defer regardless.
 	_ = m.Apply(context.Background())
-	beforeStatus := r.calls.Load()
+	if st, err := m.Status(context.Background()); err != nil {
+		t.Fatalf("post-apply Status: %v", err)
+	} else if stale, _ := st.Meta["stale"].(bool); !stale {
+		t.Fatalf("post-Apply Status should serve stale cache while refreshing, got meta=%v", st.Meta)
+	}
+}
+
+type hangingStatusRunner struct{}
+
+func (hangingStatusRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	switch name {
+	case "systemctl":
+		if len(args) > 0 && args[0] == "list-units" {
+			return "", "", 0, nil
+		}
+		if len(args) > 0 && args[0] == "is-active" {
+			return "", "", 3, nil
+		}
+	}
+	<-ctx.Done()
+	return "", "", -1, ctx.Err()
+}
+
+type hangingInProgressRunner struct {
+	enabled atomic.Bool
+	hangs   atomic.Int32
+}
+
+func (r *hangingInProgressRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	if name == "systemctl" {
+		if len(args) > 0 && (args[0] == "list-units" || args[0] == "is-active") {
+			if !r.enabled.Load() {
+				return "", "", 3, nil
+			}
+			if r.hangs.Add(1) == 1 {
+				<-ctx.Done()
+				return "", "", -1, ctx.Err()
+			}
+			return "", "", 3, nil
+		}
+	}
+	select {
+	case <-ctx.Done():
+		return "", "", -1, ctx.Err()
+	default:
+		return "", "", 0, nil
+	}
+}
+
+func TestStatusDegradesWhenInitialProbeTimesOut(t *testing.T) {
+	tmp := t.TempDir()
+	m, err := newMicroOSBackend(
+		WithRunner(hangingStatusRunner{}),
+		WithStateDir(tmp),
+		WithRuntimeDir(filepath.Join(tmp, "run")),
+		WithSupportOverride(true),
+		WithCurrentVersion("v-test"),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+		WithStatusRequestTimeout(10*time.Millisecond),
+		WithStatusRefreshTimeout(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	start := time.Now()
+	st, err := m.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status should degrade instead of erroring: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Status took %v; expected bounded degraded response", elapsed)
+	}
+	if st.CurrentVersion != "v-test" || st.AvailableVersion != "v-test" {
+		t.Fatalf("unexpected degraded versions: %+v", st)
+	}
+	if degraded, _ := st.Meta["degraded"].(bool); !degraded {
+		t.Fatalf("expected degraded meta, got %v", st.Meta)
+	}
+	if empty, _ := st.Meta["cache_empty"].(bool); !empty {
+		t.Fatalf("expected cache_empty meta, got %v", st.Meta)
+	}
+}
+
+func TestStatusDegradesWhenInProgressProbeTimesOut(t *testing.T) {
+	tmp := t.TempDir()
+	r := &hangingInProgressRunner{}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithStateDir(tmp),
+		WithRuntimeDir(filepath.Join(tmp, "run")),
+		WithSupportOverride(true),
+		WithCurrentVersion("v-test"),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+		WithStatusRequestTimeout(10*time.Millisecond),
+		WithStatusRefreshTimeout(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	r.enabled.Store(true)
+
+	start := time.Now()
+	st, err := m.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status should degrade instead of erroring: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Status took %v; expected bounded degraded response", elapsed)
+	}
+	if degraded, _ := st.Meta["degraded"].(bool); !degraded {
+		t.Fatalf("expected degraded meta, got %v", st.Meta)
+	}
+	if empty, _ := st.Meta["cache_empty"].(bool); !empty {
+		t.Fatalf("expected cache_empty meta, got %v", st.Meta)
+	}
+}
+
+func TestStatusInProgressTimeoutDoesNotRemoveMarker(t *testing.T) {
+	tmp := t.TempDir()
+	runDir := filepath.Join(tmp, "run")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatalf("mkdir run dir: %v", err)
+	}
+	marker := filepath.Join(runDir, "update.inprogress")
+	r := &hangingInProgressRunner{}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithStateDir(tmp),
+		WithRuntimeDir(runDir),
+		WithSupportOverride(true),
+		WithCurrentVersion("v-test"),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+		WithStatusRequestTimeout(10*time.Millisecond),
+		WithStatusRefreshTimeout(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	if err := os.WriteFile(marker, []byte("apply piccolo-tu-test.service"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	r.enabled.Store(true)
 
 	if _, err := m.Status(context.Background()); err != nil {
-		t.Fatalf("post-apply Status: %v", err)
+		t.Fatalf("Status should degrade instead of erroring: %v", err)
 	}
-	postStatusDelta := r.calls.Load() - beforeStatus
-	if postStatusDelta < primingCalls-expectedIsInProgressShellouts {
-		t.Errorf("expected Apply to invalidate cache (post-Status delta=%d, priming=%d)", postStatusDelta, primingCalls)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("in-progress marker should remain after timeout, got %v", err)
 	}
 }

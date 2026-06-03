@@ -15,6 +15,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> rootfs-verify    # stage 6: block-native rootfs verification
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> service-app      # stage 7: service app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> workspace-app    # stage 8: workspace app lifecycle
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> system-update    # stage 4a: OS update status + diagnostic log availability
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> app-resize       # stage 19: app storage resize recovery
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> reboot           # stage 9: reboot & unlock cycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> storage-post     # stage 10: post-reboot storage
@@ -306,7 +307,15 @@ stage_boot() {
 
   local health
   health=$(api "/api/v1/health/live")
-  check "1.3" "HTTP health OK" "$health" '"status":"ok"'
+  if echo "$health" | grep -Eq '"status":"(ok|warn)"'; then
+    echo -e "  ${GREEN}PASS${NC} [1.3] HTTP health reachable before setup ($health)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [1.3] HTTP health unexpected before setup"
+    echo -e "       expected status: ok or warn"
+    echo -e "       actual:   $(echo "$health" | head -3)"
+    ((FAIL_COUNT++)) || true
+  fi
 }
 
 # ─────────────────────────────────────────────────────────
@@ -374,6 +383,76 @@ stage_post_setup() {
   else
     skip "4.4" "Storage diagnostics" "empty response"
   fi
+}
+
+# ─────────────────────────────────────────────────────────
+# Stage 4a: OS update status + diagnostic log availability
+# ─────────────────────────────────────────────────────────
+stage_system_update() {
+  echo -e "\n${CYAN}═══ Stage 4a: System Update Status Smoke ═══${NC}"
+  ensure_session
+
+  local status_file status_code start_ns end_ns elapsed_ms
+  status_file=$(mktemp /tmp/claude-1000/os-update-status-XXXXXX)
+  start_ns=$(date +%s%N)
+  status_code=$(curl -s -o "$status_file" -w '%{http_code}' \
+    --connect-timeout 5 --max-time 12 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    "http://$IP/api/v1/updates/os" 2>/dev/null || true)
+  end_ns=$(date +%s%N)
+  elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+  check "4a.1" "/updates/os returns successful status" "$status_code" "200"
+  if [[ "$status_code" == "200" ]]; then
+    local shape
+    shape=$(python3 - "$status_file" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    required = ["current_version", "available_version", "pending", "requires_reboot", "last_checked", "meta"]
+    missing = [k for k in required if k not in data]
+    meta = data.get("meta")
+    if missing:
+        print("missing:" + ",".join(missing))
+    elif not isinstance(meta, dict):
+        print("bad-meta")
+    else:
+        flags = [k for k in ("stale", "refreshing", "degraded", "cache_empty") if meta.get(k) is True]
+        print("ok flags=" + ",".join(flags))
+except Exception as exc:
+    print("invalid-json:" + str(exc))
+PY
+)
+    check "4a.2" "/updates/os response has OSUpdate shape" "$shape" "ok"
+  else
+    echo "       response: $(head -c 200 "$status_file" 2>/dev/null || true)"
+  fi
+  rm -f "$status_file"
+
+  if [[ "$elapsed_ms" -lt 8000 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [4a.3] /updates/os completed within bounded read window (${elapsed_ms}ms)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [4a.3] /updates/os took ${elapsed_ms}ms (expected <8000ms)"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  local log_file log_code log_bytes
+  log_file=$(mktemp /tmp/claude-1000/diagnostic-log-XXXXXX)
+  log_code=$(curl -s -o "$log_file" -w '%{http_code}' \
+    --connect-timeout 10 --max-time 75 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    "http://$IP/api/v1/system/admin/diagnostic-log" 2>/dev/null || true)
+  check "4a.4" "Admin diagnostic log downloads independently of update status" "$log_code" "200"
+  log_bytes=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+  if [[ "$log_bytes" =~ ^[0-9]+$ && "$log_bytes" -gt 0 ]]; then
+    echo -e "  ${GREEN}PASS${NC} [4a.5] Diagnostic log response is non-empty ($log_bytes bytes)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [4a.5] Diagnostic log response is empty"
+    ((FAIL_COUNT++)) || true
+  fi
+  rm -f "$log_file"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -2738,6 +2817,7 @@ case "$STAGE" in
   pre-setup)         stage_pre_setup ;;
   setup)             stage_setup ;;
   post-setup)        stage_post_setup ;;
+  system-update)     stage_system_update ;;
   storage-inspect)   stage_storage_inspect ;;
   rootfs-verify)     stage_rootfs_verify ;;
   service-app)       stage_service_app ;;
@@ -2762,6 +2842,7 @@ case "$STAGE" in
     stage_pre_setup
     stage_setup
     stage_post_setup
+    stage_system_update
     stage_storage_inspect
     stage_rootfs_verify
     stage_service_app
@@ -2780,7 +2861,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup storage-inspect rootfs-verify service-app workspace-app app-resize reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent async-recovery-key logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app workspace-app app-resize reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent async-recovery-key logs all"
     exit 1
     ;;
 esac

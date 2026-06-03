@@ -15,7 +15,6 @@ import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class SystemTab extends StatelessWidget {
-
   const SystemTab({required this.controller, super.key});
   final SettingsController controller;
 
@@ -34,7 +33,9 @@ class SystemTab extends StatelessWidget {
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
             ),
             SizedBox(height: 8),
-            Text('You will be redirected to login once the system is back online.'),
+            Text(
+              'You will be redirected to login once the system is back online.',
+            ),
           ],
         ),
       );
@@ -54,7 +55,6 @@ class SystemTab extends StatelessWidget {
         const SizedBox(height: 16),
 
         if (update != null || isBusy) ...[
-          // 1. Hero Status Card
           _UpdateStatusCard(
             update: update,
             isChecking: isBusy,
@@ -62,99 +62,110 @@ class SystemTab extends StatelessWidget {
             onReboot: controller.rebootOS,
             autoUnlock: controller.autoUnlock,
           ),
-
-          const SizedBox(height: 48),
-
-          if (update != null) ...[
-            // 2. Advanced / Danger Zone (Only show if we have data)
-            Text('Advanced Options', style: PiccoloTheme.textTheme.titleMedium),
-            const SizedBox(height: 16),
-            PiccoloCard(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  InfoRow('Current Version', update.currentVersion),
-                  InfoRow('Last Checked', _formatDate(update.lastChecked)),
-                  const Divider(height: 32),
-                  const _DiagnosticLogSection(),
-                  const Divider(height: 32),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text('Rollback System', style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold)),
-                            const SizedBox(height: 4),
-                            Text(
-                              'Revert to the previous system snapshot. Useful if an update caused issues.',
-                              style: PiccoloTheme.textTheme.labelSmall,
-                            ),
-                          ],
-                        ),
-                      ),
-                      OutlinedButton(
-                        onPressed: (controller.isLoading || isBusy) ? null : () => _showRollbackConfirmation(context),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: PiccoloTheme.critical,
-                          side: const BorderSide(color: PiccoloTheme.critical),
-                        ),
-                        child: const Text('Rollback'),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ],
-
-          const SizedBox(height: 48),
-          const _InstallToDiskCard(),
-          const SizedBox(height: 48),
-          Text('Update Logs', style: PiccoloTheme.textTheme.titleMedium),
-          const SizedBox(height: 16),
-          LogStreamViewer(
-            systemUnit: 'transactional-update',
-            height: 320,
-            autoConnect: isBusy,
-          ),
         ] else
-           const Text('System information unavailable.'),
+          const Text('System information unavailable.'),
 
+        const SizedBox(height: 48),
+
+        Text('Advanced Options', style: PiccoloTheme.textTheme.titleMedium),
+        const SizedBox(height: 16),
+        PiccoloCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (update != null) ...[
+                InfoRow('Current Version', update.currentVersion),
+                InfoRow('Last Checked', _formatDate(update.lastChecked)),
+                const Divider(height: 32),
+              ],
+              const _DiagnosticLogSection(),
+              if (update != null) ...[
+                const Divider(height: 32),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Rollback System',
+                            style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Revert to the previous system snapshot. Useful if an update caused issues.',
+                            style: PiccoloTheme.textTheme.labelSmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                    OutlinedButton(
+                      onPressed: (controller.isLoading || isBusy)
+                          ? null
+                          : () => _showRollbackConfirmation(context),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: PiccoloTheme.critical,
+                        side: const BorderSide(color: PiccoloTheme.critical),
+                      ),
+                      child: const Text('Rollback'),
+                    ),
+                  ],
+                ),
+              ],
+            ],
+          ),
+        ),
+
+        const SizedBox(height: 48),
+        const _InstallToDiskCard(),
+        const SizedBox(height: 48),
+        Text('Update Logs', style: PiccoloTheme.textTheme.titleMedium),
+        const SizedBox(height: 16),
+        LogStreamViewer(
+          systemUnit: 'transactional-update',
+          height: 320,
+          autoConnect: isBusy,
+        ),
       ],
     );
   }
 
   void _showRollbackConfirmation(BuildContext context) {
-    unawaited(showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Confirm Rollback'),
-        content: const Text(
-          'Are you sure you want to rollback the system to the previous snapshot?\n\n'
-          'This will discard any system changes made since the last update. User data (files) will be preserved.',
+    unawaited(
+      showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Confirm Rollback'),
+          content: const Text(
+            'Are you sure you want to rollback the system to the previous snapshot?\n\n'
+            'This will discard any system changes made since the last update. User data (files) will be preserved.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                Navigator.pop(context);
+                unawaited(controller.rollbackOS());
+              },
+              style: FilledButton.styleFrom(
+                backgroundColor: PiccoloTheme.critical,
+              ),
+              child: const Text('Rollback'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () {
-              Navigator.pop(context);
-              unawaited(controller.rollbackOS());
-            },
-            style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.critical),
-            child: const Text('Rollback'),
-          ),
-        ],
       ),
-    ));
+    );
   }
 
   String _formatDate(DateTime dt) {
     // Simple formatter, can be replaced with intl package later
-    return "${dt.year}-${dt.month.toString().padLeft(2,'0')}-${dt.day.toString().padLeft(2,'0')} ${dt.hour.toString().padLeft(2,'0')}:${dt.minute.toString().padLeft(2,'0')}";
+    return "${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}";
   }
 }
 
@@ -165,7 +176,6 @@ String _formatHour(int h) {
 }
 
 class _UpdateStatusCard extends StatelessWidget {
-
   const _UpdateStatusCard({
     required this.update,
     required this.isChecking,
@@ -190,7 +200,9 @@ class _UpdateStatusCard extends StatelessWidget {
     var accentColor = PiccoloTheme.success;
     var icon = PiccoloIcons.success;
     var title = 'System is up to date';
-    var subtitle = update != null ? 'Version ${update!.currentVersion}' : 'Checking version...';
+    var subtitle = update != null
+        ? 'Version ${update!.currentVersion}'
+        : 'Checking version...';
     Widget? action;
 
     if (isChecking) {
@@ -201,7 +213,7 @@ class _UpdateStatusCard extends StatelessWidget {
       action = const SizedBox(
         height: 24,
         width: 24,
-        child: CircularProgressIndicator(strokeWidth: 2)
+        child: CircularProgressIndicator(strokeWidth: 2),
       );
     } else if (pendingReboot) {
       accentColor = PiccoloTheme.cobalt600; // or Info color
@@ -256,8 +268,12 @@ class _UpdateStatusCard extends StatelessWidget {
               shape: BoxShape.circle,
             ),
             child: isChecking
-              ? SizedBox(width: 32, height: 32, child: CircularProgressIndicator(color: accentColor))
-              : Icon(icon, color: accentColor, size: 32),
+                ? SizedBox(
+                    width: 32,
+                    height: 32,
+                    child: CircularProgressIndicator(color: accentColor),
+                  )
+                : Icon(icon, color: accentColor, size: 32),
           ),
           const SizedBox(width: 24),
           Expanded(
@@ -266,14 +282,19 @@ class _UpdateStatusCard extends StatelessWidget {
               children: [
                 Text(title, style: PiccoloTheme.textTheme.headlineSmall),
                 const SizedBox(height: 4),
-                Text(subtitle, style: PiccoloTheme.textTheme.bodyMedium?.copyWith(color: PiccoloTheme.inkMuted)),
+                Text(
+                  subtitle,
+                  style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
+                    color: PiccoloTheme.inkMuted,
+                  ),
+                ),
               ],
             ),
           ),
           if (action != null) ...[
             const SizedBox(width: 24),
             action,
-          ]
+          ],
         ],
       ),
     );
@@ -312,11 +333,13 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
   Future<void> _checkBootMode() async {
     try {
       final onboarding = await _api.get('/api/v1/system/onboarding');
-      final bootMode = (onboarding as Map<String, dynamic>)['boot_mode'] as String?;
+      final bootMode =
+          (onboarding as Map<String, dynamic>)['boot_mode'] as String?;
       final state = onboarding['state'] as String?;
       if (mounted) {
         setState(() {
-          _isUSBBoot = bootMode == 'usb' &&
+          _isUSBBoot =
+              bootMode == 'usb' &&
               (state == 'try_piccolo' || state == 'complete');
           _loaded = true;
         });
@@ -329,7 +352,9 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
   Future<void> _fetchDisks() async {
     try {
       final response = await _api.get('/api/v1/storage/disks');
-      final rawDisks = (response as Map<String, dynamic>)['disks'] as List<dynamic>? ?? <dynamic>[];
+      final rawDisks =
+          (response as Map<String, dynamic>)['disks'] as List<dynamic>? ??
+          <dynamic>[];
       setState(() {
         _disks = rawDisks.cast<Map<String, dynamic>>();
         _showInstallFlow = true;
@@ -361,7 +386,9 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
           ),
           FilledButton(
             onPressed: () => Navigator.pop(context, true),
-            style: FilledButton.styleFrom(backgroundColor: PiccoloTheme.critical),
+            style: FilledButton.styleFrom(
+              backgroundColor: PiccoloTheme.critical,
+            ),
             child: const Text('Erase and Install'),
           ),
         ],
@@ -378,11 +405,14 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
     try {
       await _api.fetchCsrfToken();
       final taskId = 'install-${DateTime.now().millisecondsSinceEpoch}';
-      await _api.post('/api/v1/system/install-to-disk', body: {
-        'target_disk': _selectedDisk,
-        'confirm_data_loss': true,
-        'task_id': taskId,
-      });
+      await _api.post(
+        '/api/v1/system/install-to-disk',
+        body: {
+          'target_disk': _selectedDisk,
+          'confirm_data_loss': true,
+          'task_id': taskId,
+        },
+      );
       setState(() => _taskId = taskId);
     } on Object catch (e) {
       setState(() {
@@ -424,15 +454,23 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
               color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
               borderRadius: BorderRadius.circular(Radii.sm),
             ),
-            child: const Icon(PiccoloIcons.saveToDisk, color: PiccoloTheme.cobalt600, size: 24),
+            child: const Icon(
+              PiccoloIcons.saveToDisk,
+              color: PiccoloTheme.cobalt600,
+              size: 24,
+            ),
           ),
           const SizedBox(width: 16),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('Install to Disk',
-                    style: PiccoloTheme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.bold)),
+                Text(
+                  'Install to Disk',
+                  style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
                 const SizedBox(height: 4),
                 Text(
                   'Running from USB. Install Piccolo to an internal disk for permanent use.',
@@ -462,8 +500,12 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Install to Disk',
-              style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+          Text(
+            'Install to Disk',
+            style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+              fontWeight: FontWeight.bold,
+            ),
+          ),
           const SizedBox(height: 8),
           const Text(
             'Select an internal disk. All data on the selected disk will be erased.',
@@ -478,16 +520,23 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
                 color: PiccoloTheme.critical.withValues(alpha: 0.08),
                 borderRadius: BorderRadius.circular(Radii.sm),
               ),
-              child: Text(_error!,
-                  style: const TextStyle(fontSize: 13, color: PiccoloTheme.critical)),
+              child: Text(
+                _error!,
+                style: const TextStyle(
+                  fontSize: 13,
+                  color: PiccoloTheme.critical,
+                ),
+              ),
             ),
           ],
           if (_disks.isEmpty)
             const Center(
               child: Padding(
                 padding: EdgeInsets.all(24),
-                child: Text('No internal disks found.',
-                    style: TextStyle(color: PiccoloTheme.inkMuted)),
+                child: Text(
+                  'No internal disks found.',
+                  style: TextStyle(color: PiccoloTheme.inkMuted),
+                ),
               ),
             )
           else
@@ -500,7 +549,9 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
                 isSelected: _selectedDisk == disk['device'],
                 onTap: _isInstalling
                     ? null
-                    : () => setState(() => _selectedDisk = disk['device'] as String?),
+                    : () => setState(
+                        () => _selectedDisk = disk['device'] as String?,
+                      ),
               ),
           const SizedBox(height: 16),
           Row(
@@ -512,12 +563,17 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
               ),
               const SizedBox(width: 12),
               FilledButton(
-                onPressed: (_selectedDisk != null && !_isInstalling) ? _startInstall : null,
+                onPressed: (_selectedDisk != null && !_isInstalling)
+                    ? _startInstall
+                    : null,
                 child: _isInstalling
                     ? const SizedBox(
                         width: 20,
                         height: 20,
-                        child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                        child: CircularProgressIndicator(
+                          color: Colors.white,
+                          strokeWidth: 2,
+                        ),
                       )
                     : const Text('Install'),
               ),
@@ -539,8 +595,12 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Installing Piccolo',
-              style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+          Text(
+            'Installing Piccolo',
+            style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+              fontWeight: FontWeight.bold,
+            ),
+          ),
           const SizedBox(height: 8),
           const Text(
             'Do not power off or disconnect the device.',
@@ -572,10 +632,18 @@ class _InstallToDiskCardState extends State<_InstallToDiskCard> {
       ),
       child: Column(
         children: [
-          const Icon(PiccoloIcons.success, color: PiccoloTheme.success, size: 48),
+          const Icon(
+            PiccoloIcons.success,
+            color: PiccoloTheme.success,
+            size: 48,
+          ),
           const SizedBox(height: 16),
-          Text('Piccolo has been installed',
-              style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600)),
+          Text(
+            'Piccolo has been installed',
+            style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           const SizedBox(height: 8),
           const Text(
             'Remove the USB drive and reboot to start using Piccolo from the internal disk.',
@@ -614,7 +682,6 @@ class _DiagnosticLogSection extends StatelessWidget {
 }
 
 class _SettingsDiskTile extends StatelessWidget {
-
   const _SettingsDiskTile({
     required this.device,
     required this.model,
@@ -647,7 +714,9 @@ class _SettingsDiskTile extends StatelessWidget {
                   : PiccoloTheme.ink.withValues(alpha: 0.1),
               width: isSelected ? 2 : 1,
             ),
-            color: isSelected ? PiccoloTheme.cobalt600.withValues(alpha: 0.04) : null,
+            color: isSelected
+                ? PiccoloTheme.cobalt600.withValues(alpha: 0.04)
+                : null,
           ),
           child: Row(
             children: [

@@ -28,12 +28,15 @@ const (
 	defaultStateFilename    = "state.json"
 	transactionalUpdateUnit = "transactional-update.service"
 
-	// Status snapshot served from cache to avoid running readStatus (up to ~14s
-	// of shell-outs to snapper/rpm/btrfs/journalctl) on every UI poll. The Watch
-	// loop refreshes the snapshot at statusRefreshInterval; Apply/Rollback/Reboot
-	// invalidate it at the Manager facade so post-action UI reflects the change.
+	// Status snapshots keep UI reads off the slow live shell-out path. Fresh cache
+	// is returned directly; stale cache is returned with "refreshing" metadata while
+	// a bounded background refresh probes snapper/rpm/btrfs/journalctl/zypper.
+	// Apply/Rollback/Reboot invalidate freshness at the Manager facade so post-action
+	// UI does not present stale data as fresh.
 	statusSnapshotTTL     = 60 * time.Second
 	statusRefreshInterval = 30 * time.Second
+	statusRequestTimeout  = 5 * time.Second
+	statusRefreshTimeout  = 20 * time.Second
 
 	// Auto-recovery circuit breaker: bound how often checkAndRecover may fire
 	// the agent-package fallback so a persistently-failing OS update can't loop
@@ -109,10 +112,13 @@ type microOSBackend struct {
 	// high-water mark for invalidation: a sample taken before this timestamp
 	// must NOT be published (would overwrite a concurrent invalidate from
 	// Apply/Rollback/Reboot with pre-mutation data).
-	statusMu            sync.RWMutex
-	statusCache         Status
-	statusCachedAt      time.Time
-	statusInvalidatedAt time.Time
+	statusMu             sync.RWMutex
+	statusCache          Status
+	statusCachedAt       time.Time
+	statusInvalidatedAt  time.Time
+	statusRefreshActive  bool
+	statusRequestTimeout time.Duration
+	statusRefreshTimeout time.Duration
 
 	// Auto-recovery circuit breaker, guarded by mu. In-memory is authoritative;
 	// it is mirrored best-effort to recoveryPath so a reboot-loop accumulates
@@ -143,6 +149,24 @@ func WithClock(fn func() time.Time) Option { return func(m *microOSBackend) { m.
 
 // WithTimeout overrides the transactional-update timeout.
 func WithTimeout(d time.Duration) Option { return func(m *microOSBackend) { m.timeout = d } }
+
+// WithStatusRequestTimeout bounds the initial uncached status probe (used in tests).
+func WithStatusRequestTimeout(d time.Duration) Option {
+	return func(m *microOSBackend) {
+		if d > 0 {
+			m.statusRequestTimeout = d
+		}
+	}
+}
+
+// WithStatusRefreshTimeout bounds background status refresh probes (used in tests).
+func WithStatusRefreshTimeout(d time.Duration) Option {
+	return func(m *microOSBackend) {
+		if d > 0 {
+			m.statusRefreshTimeout = d
+		}
+	}
+}
 
 // WithStateDir overrides the persistent state directory (default PICCOLO_CORE_ROOT/update).
 func WithStateDir(dir string) Option {
@@ -245,13 +269,15 @@ func newMicroOSBackend(opts ...Option) (*microOSBackend, error) {
 	}
 
 	m := &microOSBackend{
-		runner:       execRunner{},
-		clock:        time.Now,
-		timeout:      timeout,
-		runtimeDir:   defaultRuntimeDir,
-		statePath:    filepath.Join(paths.CoreRoot(), defaultStateSubdir, defaultStateFilename),
-		readFile:     os.ReadFile,
-		snapshotsDir: "/.snapshots",
+		runner:               execRunner{},
+		clock:                time.Now,
+		timeout:              timeout,
+		statusRequestTimeout: statusRequestTimeout,
+		statusRefreshTimeout: statusRefreshTimeout,
+		runtimeDir:           defaultRuntimeDir,
+		statePath:            filepath.Join(paths.CoreRoot(), defaultStateSubdir, defaultStateFilename),
+		readFile:             os.ReadFile,
+		snapshotsDir:         "/.snapshots",
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -297,30 +323,35 @@ func (m *microOSBackend) Status(ctx context.Context) (Status, error) {
 		}, nil
 	}
 
+	probeCtx, cancel := context.WithTimeout(ctx, m.statusRequestTimeout)
+	defer cancel()
+
 	// If an update is running, return 429 so clients know to poll/wait.
 	// This ensures multi-tab consistency (Tab A starts update, Tab B sees 429).
-	if m.isInProgress(ctx) {
+	if m.isInProgress(probeCtx) {
 		return Status{}, ErrInProgress
 	}
 
-	m.statusMu.RLock()
-	if !m.statusCachedAt.IsZero() && time.Since(m.statusCachedAt) < statusSnapshotTTL {
-		st := m.statusCache
-		m.statusMu.RUnlock()
+	if st, ok := m.cachedStatus(false); ok {
 		return st, nil
 	}
-	m.statusMu.RUnlock()
+	if st, ok := m.cachedStatus(true); ok {
+		m.scheduleStatusRefresh()
+		return st, nil
+	}
 
 	sampleStart := time.Now()
-	st, err := m.readStatus(ctx)
+	st, err := m.readStatus(probeCtx)
 	if err != nil {
-		return st, err
+		m.scheduleStatusRefresh()
+		return m.statusFallback(err), nil
 	}
 	// readStatus's helpers swallow command errors — if the request ctx was
 	// cancelled mid-call, st may be a partial/empty sample. Don't pollute the
 	// 60s cache with that.
-	if ctx.Err() != nil {
-		return st, ctx.Err()
+	if probeCtx.Err() != nil {
+		m.scheduleStatusRefresh()
+		return m.statusFallback(probeCtx.Err()), nil
 	}
 	m.publishStatusSnapshot(st, sampleStart)
 	return st, nil
@@ -328,9 +359,107 @@ func (m *microOSBackend) Status(ctx context.Context) (Status, error) {
 
 func (m *microOSBackend) invalidateStatusCache() {
 	m.statusMu.Lock()
-	m.statusCachedAt = time.Time{}
 	m.statusInvalidatedAt = time.Now()
 	m.statusMu.Unlock()
+}
+
+func (m *microOSBackend) cachedStatus(allowStale bool) (Status, bool) {
+	m.statusMu.RLock()
+	if m.statusCachedAt.IsZero() {
+		m.statusMu.RUnlock()
+		return Status{}, false
+	}
+	isInvalidated := m.statusCachedAt.Before(m.statusInvalidatedAt)
+	isExpired := time.Since(m.statusCachedAt) >= statusSnapshotTTL
+	if !allowStale && (isInvalidated || isExpired) {
+		m.statusMu.RUnlock()
+		return Status{}, false
+	}
+	st := m.statusCache
+	cachedAt := m.statusCachedAt
+	m.statusMu.RUnlock()
+	if allowStale && (isInvalidated || isExpired) {
+		st = withStatusMeta(st, map[string]interface{}{
+			"stale":             true,
+			"refreshing":        true,
+			"cached_at":         cachedAt.UTC().Format(time.RFC3339),
+			"cache_age_seconds": int(time.Since(cachedAt).Seconds()),
+		})
+	}
+	return st, true
+}
+
+func (m *microOSBackend) statusFallback(err error) Status {
+	if st, ok := m.cachedStatus(true); ok {
+		if err != nil {
+			st = withStatusMeta(st, map[string]interface{}{
+				"degraded":        true,
+				"degraded_reason": err.Error(),
+			})
+		}
+		return st
+	}
+
+	currentVersion := m.currentVersion
+	if currentVersion == "" {
+		currentVersion = m.getOSReleaseVersion("")
+	}
+	if currentVersion == "" {
+		currentVersion = "unknown"
+	}
+	meta := map[string]interface{}{
+		"supported":   true,
+		"degraded":    true,
+		"refreshing":  true,
+		"cache_empty": true,
+	}
+	if err != nil {
+		meta["degraded_reason"] = err.Error()
+	}
+	if intent := m.loadState(); intent != nil {
+		meta["last_request"] = intent
+	}
+	return Status{
+		CurrentVersion:   currentVersion,
+		AvailableVersion: currentVersion,
+		Pending:          false,
+		RequiresReboot:   false,
+		LastChecked:      m.clock(),
+		Meta:             meta,
+	}
+}
+
+func withStatusMeta(st Status, fields map[string]interface{}) Status {
+	meta := make(map[string]interface{}, len(st.Meta)+len(fields))
+	for k, v := range st.Meta {
+		meta[k] = v
+	}
+	for k, v := range fields {
+		meta[k] = v
+	}
+	st.Meta = meta
+	return st
+}
+
+func (m *microOSBackend) scheduleStatusRefresh() {
+	m.statusMu.Lock()
+	if m.statusRefreshActive {
+		m.statusMu.Unlock()
+		return
+	}
+	m.statusRefreshActive = true
+	m.statusMu.Unlock()
+
+	go func() {
+		defer func() {
+			m.statusMu.Lock()
+			m.statusRefreshActive = false
+			m.statusMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), m.statusRefreshTimeout)
+		defer cancel()
+		m.refreshStatusCache(ctx)
+	}()
 }
 
 // publishStatusSnapshot writes a freshly-sampled status under statusMu, but
@@ -481,8 +610,10 @@ func (m *microOSBackend) refreshStatusCache(ctx context.Context) {
 		return
 	}
 	sampleStart := time.Now()
-	st, err := m.readStatus(ctx)
-	if err != nil || ctx.Err() != nil {
+	probeCtx, cancel := context.WithTimeout(ctx, m.statusRefreshTimeout)
+	defer cancel()
+	st, err := m.readStatus(probeCtx)
+	if err != nil || probeCtx.Err() != nil {
 		return
 	}
 	m.publishStatusSnapshot(st, sampleStart)
@@ -1106,6 +1237,9 @@ func (m *microOSBackend) isInProgress(ctx context.Context) bool {
 			if _, _, code, _ := m.runner.Run(ctx, "systemctl", "is-active", "--quiet", unit); code == 0 {
 				return true
 			}
+			if ctx.Err() != nil {
+				return false
+			}
 		}
 		// Clean up stale marker
 		_ = os.Remove(marker)
@@ -1113,6 +1247,9 @@ func (m *microOSBackend) isInProgress(ctx context.Context) bool {
 
 	// Check for any running piccolo-tu-* transient units
 	stdout, _, _, _ := m.runner.Run(ctx, "systemctl", "list-units", "--type=service", "--state=running", "--no-legend", "--plain", "piccolo-tu-*")
+	if ctx.Err() != nil {
+		return false
+	}
 	if strings.TrimSpace(stdout) != "" {
 		return true
 	}
@@ -1120,6 +1257,9 @@ func (m *microOSBackend) isInProgress(ctx context.Context) bool {
 	// Fall back to transactional-update.service (legacy) just in case
 	if _, _, code, _ := m.runner.Run(ctx, "systemctl", "is-active", "--quiet", transactionalUpdateUnit); code == 0 {
 		return true
+	}
+	if ctx.Err() != nil {
+		return false
 	}
 	return false
 }

@@ -145,15 +145,22 @@ class SettingsController extends ChangeNotifier {
     try {
       final response = await ApiClient().get('/api/v1/updates/os');
       if (_disposed) return;
-      _osUpdate = OSUpdate.fromJson(response as Map<String, dynamic>);
+      final update = OSUpdate.fromJson(response as Map<String, dynamic>);
+      _osUpdate = update;
       _error = null;
-      _isBackendBusy = false;
+      _isBackendBusy = update.isUncertain;
+      if (_isBackendBusy && !_isUpdateInProgress) {
+        unawaited(_pollWhileBusy());
+      }
     } on Object catch (e) {
       if (_disposed) return;
       if (e.toString().contains('429')) {
         // Backend is busy (Preparing update)
         _isBackendBusy = true;
         _error = null;
+        if (!_isUpdateInProgress) {
+          unawaited(_pollWhileBusy());
+        }
         // We keep the old _osUpdate if available, or null
       } else {
         _error = e.toString();
@@ -214,10 +221,13 @@ class SettingsController extends ChangeNotifier {
     if (_disposed) return;
     _setLoading(true);
     try {
-      await ApiClient().post('/api/v1/auth/password', body: {
-        'old_password': oldPassword,
-        'new_password': newPassword,
-      });
+      await ApiClient().post(
+        '/api/v1/auth/password',
+        body: {
+          'old_password': oldPassword,
+          'new_password': newPassword,
+        },
+      );
       if (_disposed) return;
       _error = null;
       // Success
@@ -230,16 +240,16 @@ class SettingsController extends ChangeNotifier {
   }
 
   Future<void> disableRemote() async {
-     try {
-       await ApiClient().post('/api/v1/remote/disable');
-       if (_disposed) return;
-       await fetchRemoteStatus();
-     } on Object catch (e) {
-       if (!_disposed) {
-         _error = e.toString();
-         notifyListeners();
-       }
-     }
+    try {
+      await ApiClient().post('/api/v1/remote/disable');
+      if (_disposed) return;
+      await fetchRemoteStatus();
+    } on Object catch (e) {
+      if (!_disposed) {
+        _error = e.toString();
+        notifyListeners();
+      }
+    }
   }
 
   Future<void> downloadCACertificate() async {
@@ -332,7 +342,6 @@ class SettingsController extends ChangeNotifier {
       await minWait;
       if (_disposed) return;
       await _pollForCompletion();
-
     } on Object catch (e) {
       if (!_disposed) _error = e.toString();
     } finally {
@@ -353,8 +362,8 @@ class SettingsController extends ChangeNotifier {
       try {
         await ApiClient().post('/api/v1/updates/os/rollback');
       } on Object catch (e) {
-         if (_disposed) return;
-         if (!e.toString().contains('429')) {
+        if (_disposed) return;
+        if (!e.toString().contains('429')) {
           _error = e.toString();
           return;
         }
@@ -372,31 +381,31 @@ class SettingsController extends ChangeNotifier {
   }
 
   Future<void> _pollForCompletion() async {
-      var idleCount = 0;
-      const maxIdleChecks = 3;
+    var idleCount = 0;
+    const maxIdleChecks = 3;
 
-      while (!_disposed) {
-        await fetchOSUpdate(silent: true);
-        if (_disposed) break;
+    while (!_disposed) {
+      await fetchOSUpdate(silent: true);
+      if (_disposed) break;
 
-        if (_isBackendBusy) {
-          idleCount = 0;
-          await Future<void>.delayed(const Duration(seconds: 5));
-          continue;
-        }
-
-        if (_osUpdate?.pending ?? false) {
-          break;
-        }
-
-        // If we are here, status is 200 OK + Pending=False.
-        idleCount++;
-        if (idleCount >= maxIdleChecks) {
-          break;
-        }
-
-        await Future<void>.delayed(const Duration(seconds: 2));
+      if (_isBackendBusy || (_osUpdate?.isUncertain ?? false)) {
+        idleCount = 0;
+        await Future<void>.delayed(const Duration(seconds: 5));
+        continue;
       }
+
+      if (_osUpdate?.pending ?? false) {
+        break;
+      }
+
+      // If we are here, status is fresh 200 OK + Pending=False.
+      idleCount++;
+      if (idleCount >= maxIdleChecks) {
+        break;
+      }
+
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
   }
 
   // ─────────────────────────────────────────────────────────
@@ -439,7 +448,10 @@ class SettingsController extends ChangeNotifier {
       if (windowStartHour != null) ar['window_start_hour'] = windowStartHour;
       if (windowEndHour != null) ar['window_end_hour'] = windowEndHour;
       if (ar.isNotEmpty) body['auto_reboot'] = ar;
-      final response = await ApiClient().put('/api/v1/security/auto-unlock', body: body);
+      final response = await ApiClient().put(
+        '/api/v1/security/auto-unlock',
+        body: body,
+      );
       if (_disposed) return;
       _autoUnlock = AutoUnlockState.fromJson(response as Map<String, dynamic>);
       _error = null;
@@ -465,17 +477,25 @@ class SettingsController extends ChangeNotifier {
     _autoUnlockTestLatencyMs = null;
     notifyListeners();
     try {
-      final response = await ApiClient().post('/api/v1/security/auto-unlock/test');
+      final response = await ApiClient().post(
+        '/api/v1/security/auto-unlock/test',
+      );
       if (_disposed) return;
       final data = response as Map<String, dynamic>? ?? <String, dynamic>{};
       final ok = data['success'] == true;
-      _autoUnlockTestResult = ok ? '' : ((data['error_kind'] as String?) ?? 'unknown');
+      _autoUnlockTestResult = ok
+          ? ''
+          : ((data['error_kind'] as String?) ?? 'unknown');
       _autoUnlockTestLatencyMs = data['latency_ms'] as int?;
     } on ApiException catch (e) {
       // 429 from the orchestrator's 5s rate-limit. Map to a synthetic token
       // so the UI can render the friendly "Tested too recently" copy via
       // autoUnlockFailureReasonLabel instead of surfacing a raw exception.
-      if (!_disposed) _autoUnlockTestResult = e.statusCode == 429 ? 'rate_limited' : e.toString();
+      if (!_disposed) {
+        _autoUnlockTestResult = e.statusCode == 429
+            ? 'rate_limited'
+            : e.toString();
+      }
     } on Object catch (e) {
       if (!_disposed) _autoUnlockTestResult = e.toString();
     } finally {
