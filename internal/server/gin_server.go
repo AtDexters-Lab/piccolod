@@ -1662,7 +1662,6 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	if err := s.initSecureLoopback(); err != nil {
 		return nil, fmt.Errorf("secure loopback init: %w", err)
 	}
-	s.refreshRemoteRuntime()
 
 	// Update manager (MicroOS transactional-update)
 	if s.updateManager == nil {
@@ -1711,6 +1710,11 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Rehydrate proxies for containers that survived restarts
 	appMgr.RestoreServices(context.Background())
+	// Start self-hosted remote routing after app endpoints have been restored.
+	// Otherwise Nexus can advertise persisted app aliases while ServiceManager
+	// still has no local listener metadata, producing a transient no-route
+	// window on boot.
+	s.refreshRemoteRuntime()
 
 	s.staticCache = newStaticAssetCache(webassets.FS, "web")
 

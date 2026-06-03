@@ -553,10 +553,20 @@ listeners:
     guest_port: 80
     flow: tcp
     protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
   - name: webapp
     guest_port: 8080
     flow: tcp
     protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
 services:
   main:
     image: docker.io/library/wordpress:6

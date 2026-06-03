@@ -741,6 +741,17 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		appDef.Services[svcName] = svc
 	}
 
+	proxyOIDCAppID, proxyOIDCCreated, err := s.ensureProxyOIDCClientBeforeInstall(installCtx, appDef)
+	if err != nil {
+		writeGinError(c, http.StatusInternalServerError, "Failed to register proxy OIDC client: "+err.Error())
+		return
+	}
+	cleanupProxyOIDC := func() {
+		if proxyOIDCCreated && proxyOIDCAppID != "" {
+			s.deleteProxyOIDCClient(context.Background(), proxyOIDCAppID)
+		}
+	}
+
 	// Note: OIDC clients are registered AFTER Install (below). Init scripts
 	// can receive OIDC credentials via {{ .System.Auth.* }} but cannot perform
 	// full OIDC authorization flows during init — redirect URIs are only
@@ -748,6 +759,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	// credentials for the app to use after install (like Immich does).
 	appInstance, err := s.appManager.Install(installCtx, appDef)
 	if err != nil {
+		cleanupProxyOIDC()
 		if handleAppManagerError(c, err, "install app") {
 			return
 		}
@@ -759,6 +771,7 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	if oidcClientID != "" {
 		if err := clientMgr.CreateClient(installCtx, oidcClientID, oidcClientSecret, appInstance.InstanceID); err != nil {
 			log.Printf("ERROR: failed to persist OIDC client for %s: %v. Rolling back install.", appInstance.InstanceID, err)
+			cleanupProxyOIDC()
 			// Rollback: uninstall the app
 			if rbErr := s.appManager.Uninstall(installCtx, appInstance.InstanceID); rbErr != nil {
 				log.Printf("CRITICAL: failed to rollback uninstall for %s: %v", appInstance.InstanceID, rbErr)
@@ -819,6 +832,58 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		Message: "App '" + appInstance.InstanceID + "' installed successfully",
 	}
 	c.JSON(http.StatusCreated, response)
+}
+
+func installInstanceIDForDefinition(def *api.AppDefinition) (string, error) {
+	if def == nil {
+		return "", fmt.Errorf("app definition required")
+	}
+	if len(def.Listeners) > 0 {
+		var primary string
+		for _, l := range def.Listeners {
+			if !l.Primary {
+				continue
+			}
+			if primary != "" {
+				return "", fmt.Errorf("multiple primary listeners: %q and %q", primary, l.Name)
+			}
+			primary = strings.TrimSpace(l.Name)
+		}
+		if primary == "" {
+			return "", fmt.Errorf("no primary listener found")
+		}
+		return primary, nil
+	}
+	if name := strings.TrimSpace(def.WorkspaceName); name != "" {
+		return name, nil
+	}
+	return "", fmt.Errorf("cannot derive instance ID")
+}
+
+func (s *GinServer) ensureProxyOIDCClientBeforeInstall(ctx context.Context, def *api.AppDefinition) (string, bool, error) {
+	if s == nil || !s.requiresProxyOIDCClient(def) {
+		return "", false, nil
+	}
+	appID, err := installInstanceIDForDefinition(def)
+	if err != nil {
+		return "", false, err
+	}
+	if s.appManager != nil {
+		if _, err := s.appManager.Get(ctx, appID); err == nil {
+			return appID, false, nil
+		}
+	}
+	clientMgr := s.getOIDCClientManager()
+	if clientMgr == nil {
+		return appID, false, errOIDCManagerUnavailable
+	}
+	if _, err := clientMgr.GetProxyClientByAppName(ctx, appID); err == nil {
+		return appID, false, nil
+	}
+	if err := s.registerProxyOIDCClient(ctx, appID); err != nil {
+		return appID, false, err
+	}
+	return appID, true, nil
 }
 
 // handleGinAppList handles GET /api/v1/apps - List all apps with status

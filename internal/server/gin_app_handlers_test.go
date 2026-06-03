@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -921,6 +922,313 @@ func (s *stubTestRootfsManager) ResizeWorkspace(_ context.Context, _ string, _ i
 }
 func (s *stubTestRootfsManager) ResizeApplication(_ context.Context, _ string, _ int64) error {
 	return nil
+}
+
+func TestInstallInstanceIDForDefinition(t *testing.T) {
+	tests := []struct {
+		name    string
+		def     *api.AppDefinition
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "primary listener",
+			def: &api.AppDefinition{
+				Listeners: []api.AppListener{
+					{Name: "secondary"},
+					{Name: "piclu", Primary: true},
+				},
+			},
+			want: "piclu",
+		},
+		{
+			name: "workspace without listeners",
+			def: &api.AppDefinition{
+				WorkspaceName: "code",
+			},
+			want: "code",
+		},
+		{
+			name:    "nil definition",
+			wantErr: true,
+		},
+		{
+			name: "multiple primary listeners",
+			def: &api.AppDefinition{
+				Listeners: []api.AppListener{
+					{Name: "one", Primary: true},
+					{Name: "two", Primary: true},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "listeners without primary",
+			def: &api.AppDefinition{
+				Listeners: []api.AppListener{{Name: "one"}},
+			},
+			wantErr: true,
+		},
+		{
+			name:    "no install identity",
+			def:     &api.AppDefinition{},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := installInstanceIDForDefinition(tt.def)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got id %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("installInstanceIDForDefinition() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnsureProxyOIDCClientBeforeInstall(t *testing.T) {
+	ctx := context.Background()
+	srv := &GinServer{
+		persistence: &testOIDCPersistence{
+			control: &testOIDCControl{oidcClients: newMemoryOIDCClientRepo()},
+		},
+	}
+	def := &api.AppDefinition{
+		Listeners: []api.AppListener{
+			{Name: "piclu", Primary: true},
+		},
+	}
+
+	appID, created, err := srv.ensureProxyOIDCClientBeforeInstall(ctx, def)
+	if err != nil {
+		t.Fatalf("ensureProxyOIDCClientBeforeInstall: %v", err)
+	}
+	if appID != "piclu" {
+		t.Fatalf("appID = %q, want piclu", appID)
+	}
+	if !created {
+		t.Fatalf("expected proxy OIDC client to be created")
+	}
+
+	clientMgr := srv.getOIDCClientManager()
+	client, err := clientMgr.GetProxyClientByAppName(ctx, "piclu")
+	if err != nil {
+		t.Fatalf("GetProxyClientByAppName: %v", err)
+	}
+	if client.ID != "piccolo-piclu-proxy" {
+		t.Fatalf("client ID = %q, want piccolo-piclu-proxy", client.ID)
+	}
+	if client.AppID != "piclu" {
+		t.Fatalf("client AppID = %q, want piclu", client.AppID)
+	}
+	if client.Type != persistence.OIDCClientTypeProxy {
+		t.Fatalf("client Type = %q, want %q", client.Type, persistence.OIDCClientTypeProxy)
+	}
+
+	appID, created, err = srv.ensureProxyOIDCClientBeforeInstall(ctx, def)
+	if err != nil {
+		t.Fatalf("second ensureProxyOIDCClientBeforeInstall: %v", err)
+	}
+	if appID != "piclu" {
+		t.Fatalf("second appID = %q, want piclu", appID)
+	}
+	if created {
+		t.Fatalf("expected second call to reuse existing proxy OIDC client")
+	}
+}
+
+func TestEnsureProxyOIDCClientBeforeInstall_NoOpForPublicListener(t *testing.T) {
+	def := &api.AppDefinition{
+		Listeners: []api.AppListener{
+			{
+				Name:    "piclu",
+				Primary: true,
+				Auth: &api.ListenerAuth{Rules: []api.ListenerAuthRule{
+					{Path: "/", Type: "prefix", Strategy: "public"},
+				}},
+			},
+		},
+	}
+
+	appID, created, err := (&GinServer{}).ensureProxyOIDCClientBeforeInstall(context.Background(), def)
+	if err != nil {
+		t.Fatalf("ensureProxyOIDCClientBeforeInstall: %v", err)
+	}
+	if appID != "" {
+		t.Fatalf("appID = %q, want empty", appID)
+	}
+	if created {
+		t.Fatalf("expected no proxy OIDC client for public listener")
+	}
+}
+
+func TestEnsureProxyOIDCClientBeforeInstall_RequiresOIDCManager(t *testing.T) {
+	def := &api.AppDefinition{
+		Listeners: []api.AppListener{
+			{Name: "piclu", Primary: true},
+		},
+	}
+
+	appID, created, err := (&GinServer{}).ensureProxyOIDCClientBeforeInstall(context.Background(), def)
+	if err != errOIDCManagerUnavailable {
+		t.Fatalf("error = %v, want %v", err, errOIDCManagerUnavailable)
+	}
+	if appID != "piclu" {
+		t.Fatalf("appID = %q, want piclu", appID)
+	}
+	if created {
+		t.Fatalf("expected no proxy OIDC client when manager is unavailable")
+	}
+}
+
+func TestGinAppInstall_CleansPrecreatedProxyOIDCClientWhenAppOIDCPersistFails(t *testing.T) {
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+
+	repo := newMemoryOIDCClientRepo()
+	repo.failAppClientCreate = true
+	srv.persistence = &testOIDCPersistence{
+		control: &testOIDCControl{oidcClients: repo},
+	}
+
+	payload := `{
+		"app_definition": "type: user\nlisteners:\n  - name: __primary\n    guest_port: 80\n    flow: tcp\n    protocol: http\n    auth:\n      rules:\n        - path: \"/\"\n          type: prefix\n          strategy: protected\nservices:\n  main:\n    image: docker.io/library/nginx:alpine\n    bind_ports: [80]\n    oidc_client:\n      redirect_uri_paths:\n        - /callback\n      ca_mount_path: /etc/ssl/certs/piccolo-internal-ca.crt\n      env:\n        ISSUER_URL: \"{{ .System.Auth.Issuer }}\"\n        CLIENT_ID: \"{{ .System.Auth.ClientID }}\"\n        CLIENT_SECRET: \"{{ .System.Auth.ClientSecret }}\"\nx-piccolo:\n  mode: service\n",
+		"inputs": {"__app_address__": "rollbackoidc"}
+	}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/apps", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	attachAuth(req, sessionCookie, csrfToken)
+
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("install status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "Failed to register OIDC client") {
+		t.Fatalf("expected OIDC client registration failure, body=%s", w.Body.String())
+	}
+	if _, err := repo.Get(context.Background(), "piccolo-rollbackoidc-proxy"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("proxy OIDC client after rollback err=%v, want ErrNotFound", err)
+	}
+	if _, err := srv.appManager.Get(context.Background(), "rollbackoidc"); err == nil {
+		t.Fatalf("expected app rollback to uninstall rollbackoidc")
+	}
+}
+
+type memoryOIDCClientRepo struct {
+	clients             map[string]persistence.OIDCClient
+	failAppClientCreate bool
+}
+
+func newMemoryOIDCClientRepo() *memoryOIDCClientRepo {
+	return &memoryOIDCClientRepo{clients: make(map[string]persistence.OIDCClient)}
+}
+
+func (r *memoryOIDCClientRepo) Create(_ context.Context, client persistence.OIDCClient) error {
+	if client.ID == "" || client.Secret == "" || client.AppID == "" {
+		return fmt.Errorf("client id, secret, and app_id required")
+	}
+	if r.failAppClientCreate && client.Type == persistence.OIDCClientTypeApp {
+		return fmt.Errorf("forced app OIDC client create failure")
+	}
+	if _, ok := r.clients[client.ID]; ok {
+		return fmt.Errorf("client already exists")
+	}
+	r.clients[client.ID] = client
+	return nil
+}
+
+func (r *memoryOIDCClientRepo) Get(_ context.Context, clientID string) (persistence.OIDCClient, error) {
+	client, ok := r.clients[clientID]
+	if !ok {
+		return persistence.OIDCClient{}, persistence.ErrNotFound
+	}
+	return client, nil
+}
+
+func (r *memoryOIDCClientRepo) GetByAppID(_ context.Context, appID string) (persistence.OIDCClient, error) {
+	for _, client := range r.clients {
+		if client.AppID == appID {
+			return client, nil
+		}
+	}
+	return persistence.OIDCClient{}, persistence.ErrNotFound
+}
+
+func (r *memoryOIDCClientRepo) Delete(_ context.Context, clientID string) error {
+	if _, ok := r.clients[clientID]; !ok {
+		return persistence.ErrNotFound
+	}
+	delete(r.clients, clientID)
+	return nil
+}
+
+func (r *memoryOIDCClientRepo) DeleteByAppID(_ context.Context, appID string) error {
+	deleted := false
+	for id, client := range r.clients {
+		if client.AppID == appID {
+			delete(r.clients, id)
+			deleted = true
+		}
+	}
+	if !deleted {
+		return persistence.ErrNotFound
+	}
+	return nil
+}
+
+func (r *memoryOIDCClientRepo) List(context.Context) ([]persistence.OIDCClient, error) {
+	clients := make([]persistence.OIDCClient, 0, len(r.clients))
+	for _, client := range r.clients {
+		clients = append(clients, client)
+	}
+	return clients, nil
+}
+
+type testOIDCPersistence struct {
+	control persistence.ControlStore
+}
+
+func (p *testOIDCPersistence) Control() persistence.ControlStore          { return p.control }
+func (p *testOIDCPersistence) Volumes() persistence.VolumeManager         { return nil }
+func (p *testOIDCPersistence) Rootfs() persistence.RootfsVolumeManager    { return nil }
+func (p *testOIDCPersistence) Devices() persistence.DeviceManager         { return nil }
+func (p *testOIDCPersistence) StorageAdapter() persistence.StorageAdapter { return nil }
+func (p *testOIDCPersistence) Consensus() persistence.ConsensusManager    { return nil }
+func (p *testOIDCPersistence) ControlVolume() persistence.VolumeHandle {
+	return persistence.VolumeHandle{}
+}
+func (p *testOIDCPersistence) AttachAppLogs(context.Context)  {}
+func (p *testOIDCPersistence) Shutdown(context.Context) error { return nil }
+
+type testOIDCControl struct {
+	oidcClients persistence.OIDCClientRepo
+}
+
+func (c *testOIDCControl) Auth() persistence.AuthRepo                              { return nil }
+func (c *testOIDCControl) Remote() persistence.RemoteRepo                          { return nil }
+func (c *testOIDCControl) AppState() persistence.AppStateRepo                      { return nil }
+func (c *testOIDCControl) Users() persistence.UserRepo                             { return nil }
+func (c *testOIDCControl) OIDCClients() persistence.OIDCClientRepo                 { return c.oidcClients }
+func (c *testOIDCControl) OIDCKeys() persistence.OIDCKeyRepo                       { return nil }
+func (c *testOIDCControl) OIDCAuthCodes() persistence.OIDCAuthCodeRepo             { return nil }
+func (c *testOIDCControl) OIDCRefreshTokens() persistence.OIDCRefreshTokenRepo     { return nil }
+func (c *testOIDCControl) OIDCConfig() persistence.OIDCConfigRepo                  { return nil }
+func (c *testOIDCControl) WebAuthnCredentials() persistence.WebAuthnCredentialRepo { return nil }
+func (c *testOIDCControl) InviteTokens() persistence.InviteTokenRepo               { return nil }
+func (c *testOIDCControl) Close(context.Context) error                             { return nil }
+func (c *testOIDCControl) Revision(context.Context) (uint64, string, error)        { return 0, "", nil }
+func (c *testOIDCControl) QuickCheck(context.Context) (persistence.ControlHealthReport, error) {
+	return persistence.ControlHealthReport{}, nil
 }
 
 // createGinTestServer creates a Gin test server instance with filesystem state management
