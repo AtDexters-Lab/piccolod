@@ -15,11 +15,13 @@ class InstalledConfigWizard extends StatefulWidget {
     required this.appService,
     required this.onApplied,
     super.key,
+    this.onTaskStarted,
   });
 
   final String appId;
   final AppService appService;
   final Future<void> Function() onApplied;
+  final void Function(String taskId, String taskType)? onTaskStarted;
 
   @override
   State<InstalledConfigWizard> createState() => _InstalledConfigWizardState();
@@ -267,6 +269,7 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
       _error = null;
       _taskId = taskId;
     });
+    widget.onTaskStarted?.call(taskId, 'update_config');
     _revealTaskProgress();
     try {
       await widget.appService.applyInstalledConfigUpdate(

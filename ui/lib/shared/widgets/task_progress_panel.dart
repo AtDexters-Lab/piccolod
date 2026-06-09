@@ -8,14 +8,17 @@ import 'package:piccolo_os/core/services/websocket_connection.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class TaskProgressPanel extends StatefulWidget {
-
   const TaskProgressPanel({
-    required this.taskId, required this.taskType, super.key,
+    required this.taskId,
+    required this.taskType,
+    super.key,
+    this.onEvent,
     this.onComplete,
     this.urlPath,
   });
   final String taskId;
   final String taskType;
+  final void Function(TaskProgressEvent event)? onEvent;
   final void Function(TaskProgressEvent event)? onComplete;
 
   /// Optional URL path override for the WebSocket progress stream.
@@ -98,6 +101,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
           _history.add(evt);
         }
       });
+      widget.onEvent?.call(evt);
       if (evt.isComplete) {
         widget.onComplete?.call(evt);
       }
@@ -319,7 +323,6 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
 }
 
 class _ProgressSubtask {
-
   const _ProgressSubtask({
     required this.name,
     required this.message,
