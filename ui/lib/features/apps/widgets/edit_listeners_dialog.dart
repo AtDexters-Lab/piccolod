@@ -5,12 +5,13 @@ import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class EditListenersDialog extends StatefulWidget {
-
   const EditListenersDialog({
-    required this.initialListeners, required this.onSave, super.key,
+    required this.initialListeners,
+    super.key,
+    this.errorMessage,
   });
   final List<AppListener> initialListeners;
-  final void Function(List<AppListener>) onSave;
+  final String? errorMessage;
 
   @override
   State<EditListenersDialog> createState() => _EditListenersDialogState();
@@ -28,10 +29,12 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
 
   void _addListener() {
     setState(() {
-      _listeners.add(AppListener(
-        name: 'service-${_listeners.length + 1}',
-        guestPort: 8080,
-      ));
+      _listeners.add(
+        AppListener(
+          name: 'service-${_listeners.length + 1}',
+          guestPort: 8080,
+        ),
+      );
     });
   }
 
@@ -56,6 +59,39 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
         height: 500,
         child: Column(
           children: [
+            if (widget.errorMessage != null &&
+                widget.errorMessage!.isNotEmpty) ...[
+              Container(
+                padding: const EdgeInsets.all(Spacing.md),
+                decoration: BoxDecoration(
+                  color: PiccoloTheme.critical.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(Radii.sm),
+                  border: Border.all(
+                    color: PiccoloTheme.critical.withValues(alpha: 0.2),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(
+                      PiccoloIcons.error,
+                      size: 16,
+                      color: PiccoloTheme.critical,
+                    ),
+                    const SizedBox(width: Spacing.sm),
+                    Expanded(
+                      child: Text(
+                        widget.errorMessage!,
+                        style: const TextStyle(
+                          color: PiccoloTheme.critical,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: Spacing.base),
+            ],
             Container(
               padding: const EdgeInsets.all(Spacing.md),
               decoration: BoxDecoration(
@@ -64,7 +100,11 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
               ),
               child: const Row(
                 children: [
-                  Icon(PiccoloIcons.info, size: 16, color: PiccoloTheme.cobalt600),
+                  Icon(
+                    PiccoloIcons.info,
+                    size: 16,
+                    color: PiccoloTheme.cobalt600,
+                  ),
                   SizedBox(width: Spacing.sm),
                   Expanded(
                     child: Text(
@@ -88,7 +128,9 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
                   itemBuilder: (context, index) {
                     final l = _listeners[index];
                     return _ListenerRow(
-                      key: ValueKey('$index-${l.protocol}-${l.flow}-${classifyAccess(l.auth)}'),
+                      key: ValueKey(
+                        '$index-${l.protocol}-${l.flow}-${classifyAccess(l.auth)}',
+                      ),
                       listener: l,
                       onDelete: () => _removeListener(index),
                       onChange: (updated) => _updateListener(index, updated),
@@ -114,8 +156,7 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
         FilledButton(
           onPressed: () {
             if (_formKey.currentState!.validate()) {
-              widget.onSave(_listeners);
-              Navigator.of(context).pop();
+              Navigator.of(context).pop(List<AppListener>.from(_listeners));
             }
           },
           child: const Text('Save Changes'),
@@ -126,7 +167,6 @@ class _EditListenersDialogState extends State<EditListenersDialog> {
 }
 
 class _ListenerRow extends StatelessWidget {
-
   const _ListenerRow({
     required this.listener,
     required this.onDelete,
@@ -189,6 +229,7 @@ class _ListenerRow extends StatelessWidget {
           Expanded(
             flex: 2,
             child: DropdownButtonFormField<String>(
+              isExpanded: true,
               initialValue: listener.protocol,
               decoration: const InputDecoration(
                 labelText: 'Protocol',
@@ -202,18 +243,21 @@ class _ListenerRow extends StatelessWidget {
               ],
               onChanged: (val) {
                 if (val != null) {
-                  onChange(_copyWith(
-                    protocol: val,
-                    clearAuth: val == 'raw',
-                  ));
+                  onChange(
+                    _copyWith(
+                      protocol: val,
+                      clearAuth: val == 'raw',
+                    ),
+                  );
                 }
               },
             ),
           ),
           const SizedBox(width: Spacing.md),
-           Expanded(
+          Expanded(
             flex: 2,
             child: DropdownButtonFormField<String>(
+              isExpanded: true,
               initialValue: listener.flow,
               decoration: const InputDecoration(
                 labelText: 'Flow',
@@ -227,12 +271,14 @@ class _ListenerRow extends StatelessWidget {
               ],
               onChanged: (val) {
                 if (val != null) {
-                  onChange(_copyWith(
-                    flow: val,
-                    clearAuth: val != 'tcp',
-                    clearPortClaim: val == 'tls',
-                    protocol: val == 'udp' ? 'raw' : null,
-                  ));
+                  onChange(
+                    _copyWith(
+                      flow: val,
+                      clearAuth: val != 'tcp',
+                      clearPortClaim: val == 'tls',
+                      protocol: val == 'udp' ? 'raw' : null,
+                    ),
+                  );
                 }
               },
             ),
@@ -260,7 +306,9 @@ class _ListenerRow extends StatelessWidget {
                 inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                 onChanged: (val) {
                   final port = val.isEmpty ? null : int.tryParse(val);
-                  onChange(_copyWith(portClaim: port, clearPortClaim: val.isEmpty));
+                  onChange(
+                    _copyWith(portClaim: port, clearPortClaim: val.isEmpty),
+                  );
                 },
                 validator: (val) {
                   if (val == null || val.isEmpty) return null; // optional
@@ -286,6 +334,7 @@ class _ListenerRow extends StatelessWidget {
     final isCustom = access == 'custom';
 
     final dropdown = DropdownButtonFormField<String>(
+      isExpanded: true,
       initialValue: access,
       decoration: const InputDecoration(
         labelText: 'Access',
@@ -311,7 +360,8 @@ class _ListenerRow extends StatelessWidget {
 
     if (isCustom) {
       return Tooltip(
-        message: 'This listener has custom path-based auth rules configured via the app definition.',
+        message:
+            'This listener has custom path-based auth rules configured via the app definition.',
         child: dropdown,
       );
     }

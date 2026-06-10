@@ -6,10 +6,12 @@ import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/app_status_event.dart';
 import 'package:piccolo_os/core/models/listener_health.dart';
 import 'package:piccolo_os/core/models/task_progress.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/app_service.dart';
 import 'package:piccolo_os/core/services/task_progress_client.dart';
 import 'package:piccolo_os/core/utils/task_id.dart';
 import 'package:piccolo_os/features/apps/app_launcher.dart';
+import 'package:piccolo_os/features/apps/app_operation_lifecycle.dart';
 import 'package:piccolo_os/features/apps/installed_config_wizard.dart';
 import 'package:piccolo_os/features/apps/manifest_update_wizard.dart';
 import 'package:piccolo_os/features/apps/widgets/edit_listeners_dialog.dart';
@@ -55,80 +57,7 @@ class AppDetailView extends StatefulWidget {
   State<AppDetailView> createState() => _AppDetailViewState();
 }
 
-enum _OperationPhase { submitting, running, failed }
-
 enum _AppMenuAction { applyYaml, rollback, uninstall }
-
-class _TrackedOperation {
-  const _TrackedOperation({
-    required this.taskId,
-    required this.taskType,
-    required this.phase,
-    required this.submittedAt,
-    this.latest,
-  });
-
-  final String taskId;
-  final String taskType;
-  final _OperationPhase phase;
-  final DateTime submittedAt;
-  final TaskProgressEvent? latest;
-
-  bool get hasProgress => latest != null;
-
-  _TrackedOperation copyWith({
-    _OperationPhase? phase,
-    TaskProgressEvent? latest,
-  }) {
-    return _TrackedOperation(
-      taskId: taskId,
-      taskType: taskType,
-      phase: phase ?? this.phase,
-      submittedAt: submittedAt,
-      latest: latest ?? this.latest,
-    );
-  }
-}
-
-class _RecentSubmission {
-  const _RecentSubmission({
-    required this.appId,
-    required this.taskId,
-    required this.taskType,
-    required this.submittedAt,
-    required this.expiresAt,
-  });
-
-  factory _RecentSubmission.fromJson(Map<String, dynamic> json) {
-    return _RecentSubmission(
-      appId: (json['app_id'] ?? '').toString(),
-      taskId: (json['task_id'] ?? '').toString(),
-      taskType: (json['task_type'] ?? '').toString(),
-      submittedAt:
-          DateTime.tryParse((json['submitted_at'] ?? '').toString()) ??
-          DateTime.fromMillisecondsSinceEpoch(0),
-      expiresAt:
-          DateTime.tryParse((json['expires_at'] ?? '').toString()) ??
-          DateTime.fromMillisecondsSinceEpoch(0),
-    );
-  }
-
-  final String appId;
-  final String taskId;
-  final String taskType;
-  final DateTime submittedAt;
-  final DateTime expiresAt;
-
-  bool get isExpired => DateTime.now().isAfter(expiresAt);
-
-  Map<String, dynamic> toJson() => {
-    'app_id': appId,
-    'task_id': taskId,
-    'task_type': taskType,
-    'submitted_at': submittedAt.toIso8601String(),
-    'expires_at': expiresAt.toIso8601String(),
-  };
-}
 
 class _ReadinessObservation {
   const _ReadinessObservation({
@@ -154,6 +83,76 @@ class _ReadinessPresentation {
   final BannerSeverity severity;
   final String title;
   final String message;
+}
+
+class _OperationDialogHandle {
+  BuildContext? _context;
+  bool _isOpen = true;
+  bool _isClosing = false;
+  bool _closeRequested = false;
+
+  void attach(BuildContext context) {
+    _context = context;
+    if (_closeRequested) {
+      scheduleMicrotask(close);
+    }
+  }
+
+  void close() {
+    if (!_isOpen || _isClosing) return;
+    final context = _context;
+    if (context == null) {
+      _closeRequested = true;
+      return;
+    }
+    final navigator = Navigator.of(context);
+    _isClosing = true;
+    navigator.pop();
+  }
+
+  void markClosed() {
+    _isOpen = false;
+    _isClosing = false;
+    _context = null;
+  }
+}
+
+class _OperationSubmitResult {
+  const _OperationSubmitResult({
+    required this.accepted,
+    this.error,
+    this.trackingContinues = false,
+    this.blockedByActiveOperation = false,
+  });
+
+  final bool accepted;
+  final Object? error;
+  final bool trackingContinues;
+  final bool blockedByActiveOperation;
+}
+
+class _PendingListenerSave {
+  const _PendingListenerSave({
+    required this.appName,
+    required this.listeners,
+  });
+
+  final String appName;
+  final List<AppListener> listeners;
+}
+
+class _RecentOperationFailure {
+  const _RecentOperationFailure({
+    required this.title,
+    required this.message,
+    this.severity = BannerSeverity.error,
+    this.pendingListenerSave,
+  });
+
+  final String title;
+  final String message;
+  final BannerSeverity severity;
+  final _PendingListenerSave? pendingListenerSave;
 }
 
 class _TaskProgressSubscription extends StatefulWidget {
@@ -230,11 +229,19 @@ class _AppDetailViewState extends State<AppDetailView>
   bool _snapshotAvailable = false;
   DateTime? _lastDetailRefreshAt;
 
-  _TrackedOperation? _activeOperation;
+  TrackedAppOperation? _activeOperation;
+  _RecentOperationFailure? _recentOperationFailure;
   _ReadinessObservation? _readiness;
   Timer? _noProgressTimer;
   Timer? _readinessTimer;
   Timer? _activeTaskPollTimer;
+  _OperationDialogHandle? _operationDialogHandle;
+  final Set<String> _terminallySettledTaskIds = <String>{};
+  final Set<String> _pendingSubmitTaskIds = <String>{};
+  final Set<String> _pendingSubmitNoProgressTaskIds = <String>{};
+  final Set<String> _missingProgressSettledSubmitTaskIds = <String>{};
+  final Map<String, _PendingListenerSave> _pendingListenerSaves =
+      <String, _PendingListenerSave>{};
 
   // SSE streams (via unified EventStreamClient)
   StreamSubscription<AppStatusEvent>? _statusSub;
@@ -242,16 +249,6 @@ class _AppDetailViewState extends State<AppDetailView>
   ListenerHealth? _primaryHealth;
   String? _primaryListenerName;
 
-  static const _operationTaskTypes = {
-    'update_image',
-    'update_config',
-    'update_manifest',
-    'update_listeners',
-    'start_app',
-    'stop_app',
-    'rollback_app',
-    'uninstall_app',
-  };
   static const _recentSubmissionTtl = Duration(minutes: 35);
   static const _noProgressTimeout = Duration(seconds: 12);
   static const _readinessWindow = Duration(seconds: 75);
@@ -327,7 +324,7 @@ class _AppDetailViewState extends State<AppDetailView>
     await _syncActiveOperationFromServer();
   }
 
-  Future<void> _loadData({bool showLoading = true}) async {
+  Future<Object?> _loadData({bool showLoading = true}) async {
     if (showLoading) {
       setState(() {
         _isLoading = true;
@@ -338,7 +335,7 @@ class _AppDetailViewState extends State<AppDetailView>
     try {
       final detail = await widget.appService.getAppDetail(widget.appId);
 
-      if (!mounted) return;
+      if (!mounted) return null;
 
       setState(() {
         _app = detail.app;
@@ -353,64 +350,134 @@ class _AppDetailViewState extends State<AppDetailView>
           detail.containers,
         );
         _lastDetailRefreshAt = DateTime.now();
+        _error = null;
         _isLoading = false;
       });
+      return null;
     } on Object catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = e.toString();
-        _isLoading = false;
-      });
+      if (mounted) {
+        final shouldShowError = showLoading || _app == null;
+        setState(() {
+          _error = shouldShowError ? e.toString() : null;
+          _isLoading = false;
+        });
+      }
+      return e;
     }
   }
 
-  Future<bool> _handleActionWithProgress({
-    required String taskType,
+  Future<_OperationSubmitResult> _handleActionWithProgress({
+    required AppOperationType type,
     required Future<void> Function(String taskId) action,
-    bool refreshOnSuccess = true,
+    void Function(TrackedAppOperation operation)? onSubmitted,
   }) async {
-    if (!mounted) return false;
+    if (!mounted) return const _OperationSubmitResult(accepted: false);
     if (_activeOperation != null) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            '${_operationLabel(_activeOperation!.taskType)} is already in progress.',
+            '${_activeOperation!.type.policy.label} is already in progress.',
           ),
         ),
       );
-      return false;
+      return const _OperationSubmitResult(
+        accepted: false,
+        blockedByActiveOperation: true,
+      );
     }
 
     final taskId = generateTaskId();
-    _beginSubmittedOperation(taskId: taskId, taskType: taskType);
-    _showOperationDialog(taskId: taskId, taskType: taskType);
+    final submittedOperation = _beginSubmittedOperation(
+      taskId: taskId,
+      type: type,
+    );
+    onSubmitted?.call(submittedOperation);
+    final dialogHandle = _showOperationDialog(
+      taskId: taskId,
+      type: type,
+    );
 
     Object? actionError;
+    _pendingSubmitTaskIds.add(taskId);
     try {
       await action(taskId);
     } on Object catch (e) {
       actionError = e;
+    } finally {
+      _pendingSubmitTaskIds.remove(taskId);
+      _pendingSubmitNoProgressTaskIds.remove(taskId);
     }
 
-    if (actionError != null && mounted) {
-      final hasProgress =
-          _activeOperation?.taskId == taskId && _activeOperation!.hasProgress;
-      if (!hasProgress) {
-        _clearActiveOperation(removeRecentSubmission: true);
+    if (actionError != null) {
+      if (_missingProgressSettledSubmitTaskIds.remove(taskId)) {
+        return const _OperationSubmitResult(accepted: true);
       }
+      final operation = _operationForTask(
+        taskId: taskId,
+        fallback: submittedOperation,
+      );
+      final hasProgress =
+          operation.taskId == _activeOperation?.taskId && operation.hasProgress;
+      final settlement = type.policy.settle(
+        _classifySubmitFailure(actionError),
+        hasProgress: hasProgress,
+      );
+      if (settlement.closeProgressDialog) {
+        dialogHandle.close();
+      }
+      final applied = await _applyOperationSettlement(operation, settlement);
+      if (!applied) return const _OperationSubmitResult(accepted: true);
+      final trackingAvailable =
+          settlement.keepTracking && _activeOperation?.taskId == taskId;
+      if (trackingAvailable) {
+        final active = _activeOperation;
+        if (active != null && !active.hasProgress) {
+          _scheduleNoProgressTimeout(active);
+        }
+      }
+      if (!mounted) return const _OperationSubmitResult(accepted: false);
+      final message = trackingAvailable
+          ? 'Request status is unclear; continuing to track ${type.policy.label.toLowerCase()}.'
+          : 'Action failed: $actionError';
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Action failed: $actionError')));
-      return false;
+      ).showSnackBar(SnackBar(content: Text(message)));
+      return _OperationSubmitResult(
+        accepted: false,
+        error: actionError,
+        trackingContinues: trackingAvailable,
+      );
     }
 
-    // Notify other widgets (e.g., Stage) that app state changed.
-    widget.desktopController.notifyAppsChanged();
-
-    if (refreshOnSuccess && mounted) {
-      await _loadData(showLoading: false);
+    final operation = _operationForTask(
+      taskId: taskId,
+      fallback: submittedOperation,
+    );
+    _missingProgressSettledSubmitTaskIds.remove(taskId);
+    final settlement = type.policy.settleAfterHttpSuccess(
+      isStillTracked: operation.taskId == _activeOperation?.taskId,
+    );
+    if (settlement != null) {
+      final applied = await _applyOperationSettlement(operation, settlement);
+      if (applied && type == AppOperationType.updateListeners) {
+        _pendingListenerSaves.remove(operation.taskId);
+      }
+      if (applied && mounted) {
+        setState(() => _clearRecentOperationFailureForSuccess(type));
+      }
+    } else if (operation.taskId == _activeOperation?.taskId &&
+        !operation.hasProgress) {
+      _scheduleNoProgressTimeout(operation);
     }
-    return true;
+    return const _OperationSubmitResult(accepted: true);
+  }
+
+  static AppOperationOutcome _classifySubmitFailure(Object error) {
+    if (error is ApiException &&
+        isDeterministicAppOperationSubmitRejectionStatus(error.statusCode)) {
+      return AppOperationOutcome.submitRejected;
+    }
+    return AppOperationOutcome.submitUnclear;
   }
 
   Future<void> _syncActiveOperationFromServer() async {
@@ -418,26 +485,25 @@ class _AppDetailViewState extends State<AppDetailView>
       final tasks = await widget.appService.getActiveTasks();
       if (!mounted) return;
       final matching =
-          tasks
-              .where(
-                (task) =>
-                    task.instanceId == widget.appId &&
-                    _operationTaskTypes.contains(task.taskType) &&
-                    !task.isComplete,
-              )
-              .toList()
-            ..sort((a, b) {
-              final at = a.timestamp ?? DateTime.fromMillisecondsSinceEpoch(0);
-              final bt = b.timestamp ?? DateTime.fromMillisecondsSinceEpoch(0);
-              return bt.compareTo(at);
-            });
+          tasks.where((task) {
+            if (task.instanceId != widget.appId || task.isComplete) {
+              return false;
+            }
+            return appOperationTypeFromTaskType(task.taskType) != null;
+          }).toList()..sort((a, b) {
+            final at = a.timestamp ?? DateTime.fromMillisecondsSinceEpoch(0);
+            final bt = b.timestamp ?? DateTime.fromMillisecondsSinceEpoch(0);
+            return bt.compareTo(at);
+          });
 
       if (matching.isNotEmpty) {
         final task = matching.first;
+        final type = appOperationTypeFromTaskType(task.taskType);
+        if (type == null) return;
         _adoptOperation(
           taskId: task.taskId,
-          taskType: task.taskType,
-          phase: _OperationPhase.running,
+          type: type,
+          phase: AppOperationPhase.running,
           submittedAt: task.timestamp ?? DateTime.now(),
           latest: task,
         );
@@ -451,15 +517,10 @@ class _AppDetailViewState extends State<AppDetailView>
         if (active != null) _settleOperationWithoutActiveTask(active);
         return;
       }
-      if (!_operationTaskTypes.contains(recent.taskType)) {
-        final active = _activeOperation;
-        if (active != null) _settleOperationWithoutActiveTask(active);
-        return;
-      }
       _adoptOperation(
         taskId: recent.taskId,
-        taskType: recent.taskType,
-        phase: _OperationPhase.submitting,
+        type: recent.type,
+        phase: AppOperationPhase.submitting,
         submittedAt: recent.submittedAt,
       );
     } on Object catch (e) {
@@ -467,43 +528,53 @@ class _AppDetailViewState extends State<AppDetailView>
     }
   }
 
-  void _beginSubmittedOperation({
+  TrackedAppOperation _beginSubmittedOperation({
     required String taskId,
-    required String taskType,
+    required AppOperationType type,
   }) {
     _cancelReadinessObservation();
     final now = DateTime.now();
+    final operation = TrackedAppOperation(
+      taskId: taskId,
+      type: type,
+      phase: AppOperationPhase.submitting,
+      submittedAt: now,
+    );
     _writeRecentSubmission(
-      _RecentSubmission(
+      RecentAppOperation(
         appId: widget.appId,
         taskId: taskId,
-        taskType: taskType,
+        type: type,
         submittedAt: now,
         expiresAt: now.add(_recentSubmissionTtl),
       ),
     );
     _adoptOperation(
-      taskId: taskId,
-      taskType: taskType,
-      phase: _OperationPhase.submitting,
-      submittedAt: now,
+      taskId: operation.taskId,
+      type: operation.type,
+      phase: operation.phase,
+      submittedAt: operation.submittedAt,
     );
+    return operation;
   }
 
   void _adoptWizardOperation({
     required String taskId,
     required String taskType,
   }) {
-    _beginSubmittedOperation(taskId: taskId, taskType: taskType);
+    final type = appOperationTypeFromTaskType(taskType);
+    if (type == null) return;
+    _beginSubmittedOperation(taskId: taskId, type: type);
   }
 
   void _adoptOperation({
     required String taskId,
-    required String taskType,
-    required _OperationPhase phase,
+    required AppOperationType type,
+    required AppOperationPhase phase,
     required DateTime submittedAt,
     TaskProgressEvent? latest,
   }) {
+    if (_terminallySettledTaskIds.contains(taskId)) return;
     final active = _activeOperation;
     if (active != null &&
         active.taskId == taskId &&
@@ -514,24 +585,42 @@ class _AppDetailViewState extends State<AppDetailView>
 
     _noProgressTimer?.cancel();
     setState(() {
-      _activeOperation = _TrackedOperation(
+      if (_recentOperationFailure?.pendingListenerSave == null) {
+        _recentOperationFailure = null;
+      }
+      _activeOperation = TrackedAppOperation(
         taskId: taskId,
-        taskType: taskType,
+        type: type,
         phase: phase,
         submittedAt: submittedAt,
         latest: latest,
       );
     });
-    if (latest == null || !latest.isComplete) {
-      _noProgressTimer = Timer(_noProgressTimeout, () {
-        if (!mounted) return;
-        final active = _activeOperation;
-        if (active == null || active.taskId != taskId || active.hasProgress) {
-          return;
-        }
-        _handleNoProgressTimeout(active);
-      });
-    }
+    _scheduleNoProgressTimeout(_activeOperation!);
+  }
+
+  void _scheduleNoProgressTimeout(TrackedAppOperation operation) {
+    if (operation.latest != null && operation.latest!.isComplete) return;
+    _noProgressTimer?.cancel();
+    _noProgressTimer = Timer(_noProgressTimeout, () {
+      if (!mounted) return;
+      final active = _activeOperation;
+      if (active == null ||
+          active.taskId != operation.taskId ||
+          active.hasProgress) {
+        return;
+      }
+      _handleNoProgressTimeout(active);
+    });
+  }
+
+  TrackedAppOperation _operationForTask({
+    required String taskId,
+    required TrackedAppOperation fallback,
+  }) {
+    final active = _activeOperation;
+    if (active != null && active.taskId == taskId) return active;
+    return fallback;
   }
 
   void _handleOperationEvent(TaskProgressEvent event) {
@@ -542,80 +631,223 @@ class _AppDetailViewState extends State<AppDetailView>
     setState(() {
       _activeOperation = active.copyWith(
         phase: event.error != null && event.error!.isNotEmpty
-            ? _OperationPhase.failed
-            : _OperationPhase.running,
+            ? AppOperationPhase.failed
+            : AppOperationPhase.running,
         latest: event,
       );
     });
 
     if (!event.isComplete) return;
     if (event.error != null && event.error!.isNotEmpty) {
-      unawaited(_failOperation(event));
+      unawaited(_failOperation(active, event));
       return;
     }
-    unawaited(_completeOperation(event));
+    unawaited(_completeOperation(active));
   }
 
-  Future<void> _failOperation(TaskProgressEvent event) async {
-    _clearRecentSubmission();
-    final label = _operationLabel(event.taskType);
+  Future<void> _failOperation(
+    TrackedAppOperation operation,
+    TaskProgressEvent event,
+  ) async {
+    final label = operation.type.policy.label;
     final error = event.error ?? 'Operation failed.';
-    _clearActiveOperation(removeRecentSubmission: false);
-    await _loadData(showLoading: false);
+    final pendingListenerSave =
+        operation.type == AppOperationType.updateListeners
+        ? _pendingListenerSaves.remove(operation.taskId)
+        : null;
+    final applied = await _applyOperationSettlement(
+      operation,
+      operation.type.policy.settle(AppOperationOutcome.progressFailed),
+    );
+    if (!applied) return;
     if (!mounted) return;
+    setState(() {
+      if (pendingListenerSave == null &&
+          _recentOperationFailure?.pendingListenerSave != null) {
+        return;
+      }
+      _recentOperationFailure = _RecentOperationFailure(
+        title: '$label failed',
+        message: error,
+        pendingListenerSave: pendingListenerSave,
+      );
+    });
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text('$label failed: $error')));
   }
 
-  Future<void> _completeOperation(TaskProgressEvent event) async {
-    _clearRecentSubmission();
-    widget.desktopController.notifyAppsChanged();
-    if (event.taskType == 'uninstall_app') {
-      if (!mounted) return;
-      setState(() {
-        _activeOperation = null;
-        _app = null;
-        _listeners = [];
-        _containers = [];
-        _selectedService = null;
-      });
-      return;
+  Future<void> _completeOperation(TrackedAppOperation operation) async {
+    final applied = await _applyOperationSettlement(
+      operation,
+      operation.type.policy.settle(AppOperationOutcome.progressSucceeded),
+    );
+    if (applied && operation.type == AppOperationType.updateListeners) {
+      _pendingListenerSaves.remove(operation.taskId);
     }
-
-    _clearActiveOperation(removeRecentSubmission: false);
-    await _loadData(showLoading: false);
-    if (!mounted) return;
-    if (event.taskType == 'update_image') {
-      _startReadinessObservation(updateCompleted: true);
+    if (applied && mounted) {
+      setState(() => _clearRecentOperationFailureForSuccess(operation.type));
     }
   }
 
-  void _handleNoProgressTimeout(_TrackedOperation operation) {
-    _clearActiveOperation(removeRecentSubmission: false);
-    if (operation.taskType == 'update_image') {
-      _clearRecentSubmission();
-      _startReadinessObservation(updateCompleted: false);
-    } else {
-      _clearRecentSubmission();
-      unawaited(_loadData(showLoading: false));
+  void _clearRecentOperationFailureForSuccess(AppOperationType type) {
+    final failure = _recentOperationFailure;
+    if (failure == null) return;
+    if (failure.pendingListenerSave != null &&
+        type != AppOperationType.updateListeners) {
+      return;
+    }
+    _recentOperationFailure = null;
+  }
+
+  void _handleNoProgressTimeout(TrackedAppOperation operation) {
+    _noProgressTimer?.cancel();
+    _noProgressTimer = null;
+    var settledPendingSubmit = false;
+    if (_pendingSubmitTaskIds.contains(operation.taskId)) {
+      if (!_pendingSubmitNoProgressTaskIds.add(operation.taskId)) {
+        _pendingSubmitTaskIds.remove(operation.taskId);
+        _pendingSubmitNoProgressTaskIds.remove(operation.taskId);
+        _missingProgressSettledSubmitTaskIds.add(operation.taskId);
+        settledPendingSubmit = true;
+      } else {
+        _closeOperationDialog();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Still waiting for ${operation.type.policy.label.toLowerCase()} to be accepted. Continuing to track status.',
+            ),
+          ),
+        );
+        _scheduleNoProgressTimeout(operation);
+        return;
+      }
+    }
+
+    if (settledPendingSubmit) {
+      _closeOperationDialog();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Could not attach to ${_operationLabel(operation.taskType)} progress. Refreshed app state.',
+            'Could not confirm ${operation.type.policy.label.toLowerCase()} progress. Refreshed app state.',
+          ),
+        ),
+      );
+    }
+
+    final settlement = operation.type.policy.settle(
+      AppOperationOutcome.progressMissing,
+    );
+    final pendingListenerSave =
+        operation.type == AppOperationType.updateListeners
+        ? _pendingListenerSaves.remove(operation.taskId)
+        : null;
+    unawaited(
+      _applyOperationSettlement(operation, settlement).then((applied) {
+        if (!applied || !mounted || pendingListenerSave == null) return;
+        setState(() {
+          _recentOperationFailure = _RecentOperationFailure(
+            title: '${operation.type.policy.label} status unclear',
+            message:
+                'Could not attach to progress. Your changes are preserved; refresh was attempted before retrying.',
+            severity: BannerSeverity.warning,
+            pendingListenerSave: pendingListenerSave,
+          );
+        });
+      }),
+    );
+    if (settlement.detailAction == AppOperationDetailAction.refresh) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Could not attach to ${operation.type.policy.label} progress. Refreshed app state.',
           ),
         ),
       );
     }
   }
 
-  void _settleOperationWithoutActiveTask(_TrackedOperation operation) {
-    _clearActiveOperation(removeRecentSubmission: false);
-    if (operation.taskType == 'update_image') {
-      _startReadinessObservation(updateCompleted: false);
+  void _settleOperationWithoutActiveTask(TrackedAppOperation operation) {
+    unawaited(
+      _applyOperationSettlement(
+        operation,
+        operation.type.policy.settle(AppOperationOutcome.activeTaskMissing),
+      ),
+    );
+  }
+
+  Future<bool> _applyOperationSettlement(
+    TrackedAppOperation? operation,
+    AppOperationSettlement settlement,
+  ) async {
+    final taskId = operation?.taskId;
+    if (taskId != null && _terminallySettledTaskIds.contains(taskId)) {
+      return false;
+    }
+    if (settlement.isTerminal && taskId != null) {
+      _terminallySettledTaskIds.add(taskId);
+    }
+
+    if (settlement.clearRecentSubmission) _clearRecentSubmission();
+    if (settlement.notifyAppsChanged) {
+      widget.desktopController.notifyAppsChanged();
+    }
+    if (settlement.closeProgressDialog) {
+      _closeOperationDialog();
+    }
+    if (settlement.clearActiveOperation) {
+      _clearActiveOperation(removeRecentSubmission: false);
+    }
+
+    if (settlement.detailAction == AppOperationDetailAction.refresh) {
+      await _loadData(showLoading: false);
+    } else if (settlement.detailAction ==
+        AppOperationDetailAction.clearDeletedApp) {
+      _clearDeletedAppDetail(operation);
+    } else if (settlement.detailAction ==
+        AppOperationDetailAction.verifyDeletedApp) {
+      await _verifyDeletedAppDetail(operation);
+    }
+
+    final readiness = settlement.readiness;
+    if (readiness != null && mounted) {
+      _startReadinessObservation(updateCompleted: readiness.updateCompleted);
+    }
+    return true;
+  }
+
+  void _clearDeletedAppDetail(TrackedAppOperation? operation) {
+    _noProgressTimer?.cancel();
+    _noProgressTimer = null;
+    _cancelReadinessObservation();
+    if (!mounted) return;
+    setState(() {
+      if (operation == null || _activeOperation?.taskId == operation.taskId) {
+        _activeOperation = null;
+      }
+      _app = null;
+      _listeners = [];
+      _containers = [];
+      _selectedService = null;
+      _snapshotAvailable = false;
+      _primaryHealth = null;
+      _primaryListenerName = null;
+      _error = null;
+    });
+  }
+
+  Future<void> _verifyDeletedAppDetail(TrackedAppOperation? operation) async {
+    final error = await _loadData(showLoading: false);
+    if (!mounted) return;
+    if (error is! ApiException || error.statusCode != 404) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Uninstall status is unclear. Refreshed app state.'),
+        ),
+      );
       return;
     }
-    unawaited(_loadData(showLoading: false));
+    _clearDeletedAppDetail(operation);
   }
 
   void _clearActiveOperation({required bool removeRecentSubmission}) {
@@ -650,56 +882,72 @@ class _AppDetailViewState extends State<AppDetailView>
     }
   }
 
-  void _showOperationDialog({
+  _OperationDialogHandle _showOperationDialog({
     required String taskId,
-    required String taskType,
+    required AppOperationType type,
   }) {
+    final handle = _OperationDialogHandle();
+    _operationDialogHandle = handle;
     unawaited(
       showDialog<void>(
         context: context,
-        builder: (context) => AlertDialog(
-          title: Text(_operationLabel(taskType)),
-          content: SizedBox(
-            width: 520,
-            child: TaskProgressPanel(
-              taskId: taskId,
-              taskType: taskType,
-              onComplete: (event) {
-                if (event.error != null && event.error!.isNotEmpty) return;
-                if (Navigator.of(context).canPop()) {
-                  Navigator.of(context).pop();
-                }
-              },
+        builder: (dialogContext) {
+          handle.attach(dialogContext);
+          return AlertDialog(
+            title: Text(type.policy.label),
+            content: SizedBox(
+              width: 520,
+              child: TaskProgressPanel(
+                taskId: taskId,
+                taskType: type.policy.taskType,
+                onComplete: (event) {
+                  if (event.error != null && event.error!.isNotEmpty) return;
+                  handle.close();
+                },
+              ),
             ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Keep Working'),
-            ),
-          ],
-        ),
-      ),
+            actions: [
+              TextButton(
+                onPressed: handle.close,
+                child: const Text('Keep Working'),
+              ),
+            ],
+          );
+        },
+      ).whenComplete(() {
+        handle.markClosed();
+        if (identical(_operationDialogHandle, handle)) {
+          _operationDialogHandle = null;
+        }
+      }),
     );
+    return handle;
+  }
+
+  void _closeOperationDialog() {
+    final handle = _operationDialogHandle;
+    if (handle == null) return;
+    handle.close();
+    _operationDialogHandle = null;
   }
 
   String _recentSubmissionKey() =>
       'piccolo.app-detail.recent-operation.${widget.appId}';
 
-  _RecentSubmission? _readRecentSubmission() {
+  RecentAppOperation? _readRecentSubmission() {
     try {
       final raw = web.window.localStorage.getItem(_recentSubmissionKey());
       if (raw == null || raw.isEmpty) return null;
       final decoded = jsonDecode(raw);
       if (decoded is! Map) return null;
-      return _RecentSubmission.fromJson(Map<String, dynamic>.from(decoded));
+      return RecentAppOperation.fromJson(Map<String, dynamic>.from(decoded));
     } on Object catch (e) {
       debugPrint('Failed to read recent app operation: $e');
       return null;
     }
   }
 
-  void _writeRecentSubmission(_RecentSubmission submission) {
+  void _writeRecentSubmission(RecentAppOperation submission) {
     try {
       web.window.localStorage.setItem(
         _recentSubmissionKey(),
@@ -718,7 +966,7 @@ class _AppDetailViewState extends State<AppDetailView>
 
   Future<void> _handleUpdate() async {
     await _handleActionWithProgress(
-      taskType: 'update_image',
+      type: AppOperationType.updateImage,
       action: (taskId) =>
           widget.appService.updateApp(widget.appId, taskId: taskId),
     );
@@ -791,7 +1039,7 @@ class _AppDetailViewState extends State<AppDetailView>
     if (confirmed != true) return;
 
     await _handleActionWithProgress(
-      taskType: 'rollback_app',
+      type: AppOperationType.rollback,
       action: (taskId) =>
           widget.appService.rollbackApp(widget.appId, taskId: taskId),
     );
@@ -805,49 +1053,147 @@ class _AppDetailViewState extends State<AppDetailView>
 
     if (confirmed != true) return;
 
-    final ok = await _handleActionWithProgress(
-      taskType: 'uninstall_app',
-      refreshOnSuccess: false,
+    await _handleActionWithProgress(
+      type: AppOperationType.uninstall,
       action: (taskId) => widget.appService.uninstallApp(
         widget.appId,
         taskId: taskId,
       ),
     );
-    if (!ok || !mounted) return;
-    setState(() {
-      _app = null;
-      _listeners = [];
-      _containers = [];
-      _selectedService = null;
-    });
   }
 
   void _showEditListenersDialog() {
     if (_app == null) return;
 
+    final appName = _app!.name;
     // Convert current services to AppListener list
     final initialListeners = _listeners
         .map(AppListener.fromServiceEndpoint)
         .toList();
 
-    unawaited(
-      showDialog<void>(
-        context: context,
+    unawaited(_editListeners(appName, initialListeners));
+  }
+
+  Future<void> _editListeners(
+    String appName,
+    List<AppListener> initialListeners, {
+    String? initialErrorMessage,
+  }) async {
+    var draft = initialListeners;
+    var errorMessage = initialErrorMessage;
+    while (mounted && _app != null) {
+      if (!mounted) return;
+      final dialogContext = context;
+      if (!dialogContext.mounted) return;
+      final newListeners = await showDialog<List<AppListener>>(
+        context: dialogContext,
         builder: (context) => EditListenersDialog(
-          initialListeners: initialListeners,
-          onSave: (newListeners) async {
-            await _handleActionWithProgress(
-              taskType: 'update_listeners',
-              action: (taskId) => widget.appService.updateAppListeners(
-                _app!.name,
-                newListeners,
-                taskId: taskId,
-              ),
-            );
-          },
+          initialListeners: draft,
+          errorMessage: errorMessage,
         ),
-      ),
+      );
+      if (newListeners == null || !mounted || _app == null) return;
+      String? pendingTaskId;
+      final result = await _handleActionWithProgress(
+        type: AppOperationType.updateListeners,
+        onSubmitted: (operation) {
+          pendingTaskId = operation.taskId;
+          _pendingListenerSaves[operation.taskId] = _PendingListenerSave(
+            appName: appName,
+            listeners: List<AppListener>.from(newListeners),
+          );
+        },
+        action: (taskId) => widget.appService.updateAppListeners(
+          appName,
+          newListeners,
+          taskId: taskId,
+        ),
+      );
+      if (result.accepted || result.trackingContinues) {
+        return;
+      }
+      if (result.blockedByActiveOperation) {
+        _replacePendingListenerRecoveryDraft(appName, newListeners);
+        return;
+      }
+      if (pendingTaskId != null) {
+        _pendingListenerSaves.remove(pendingTaskId);
+      }
+      draft = newListeners;
+      errorMessage =
+          'Could not save listeners. Your changes are preserved; review and try again.';
+    }
+  }
+
+  void _replacePendingListenerRecoveryDraft(
+    String appName,
+    List<AppListener> listeners,
+  ) {
+    if (!mounted) return;
+    final existing = _recentOperationFailure;
+    final hasPendingRecovery = existing?.pendingListenerSave != null;
+    setState(() {
+      _recentOperationFailure = _RecentOperationFailure(
+        title: hasPendingRecovery
+            ? existing!.title
+            : 'Updating listeners paused',
+        message: hasPendingRecovery
+            ? existing!.message
+            : 'Another operation is in progress. Your changes are preserved; review them after it finishes.',
+        severity: hasPendingRecovery
+            ? existing!.severity
+            : BannerSeverity.warning,
+        pendingListenerSave: _PendingListenerSave(
+          appName: appName,
+          listeners: List<AppListener>.from(listeners),
+        ),
+      );
+    });
+  }
+
+  Future<void> _reviewFailedListenerSave(
+    _PendingListenerSave pending,
+  ) async {
+    if (!mounted || _app == null) return;
+    _closeOperationDialog();
+    await _editListeners(
+      pending.appName,
+      pending.listeners,
+      initialErrorMessage:
+          'Could not save listeners. Your changes are preserved; review and try again.',
     );
+  }
+
+  Future<void> _dismissOperationFailureBanner(
+    _RecentOperationFailure failure,
+  ) async {
+    if (failure.pendingListenerSave != null) {
+      final discard = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Discard listener draft?'),
+          content: const Text(
+            'This will remove the preserved listener changes from this window.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: PiccoloTheme.critical,
+              ),
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Discard Draft'),
+            ),
+          ],
+        ),
+      );
+      if (discard != true) return;
+    }
+    if (!mounted || !identical(_recentOperationFailure, failure)) return;
+    setState(() => _recentOperationFailure = null);
   }
 
   void _openTerminal() {
@@ -883,6 +1229,9 @@ class _AppDetailViewState extends State<AppDetailView>
         _buildHeader(),
 
         if (_activeOperation != null) _buildOperationBanner(_activeOperation!),
+
+        if (_recentOperationFailure != null)
+          _buildOperationFailureBanner(_recentOperationFailure!),
 
         if (_readiness != null) _buildReadinessBanner(_readiness!),
 
@@ -1055,7 +1404,7 @@ class _AppDetailViewState extends State<AppDetailView>
   Widget _buildActionToolbar() {
     final paused = _mutatingActionsPaused;
     final pauseReason = paused
-        ? '${_operationLabel(_activeOperation!.taskType)} is in progress'
+        ? '${_activeOperation!.type.policy.label} is in progress'
         : null;
 
     Widget pausedTooltip(Widget child) {
@@ -1102,7 +1451,7 @@ class _AppDetailViewState extends State<AppDetailView>
                   onPressed: paused
                       ? null
                       : () => _handleActionWithProgress(
-                          taskType: 'stop_app',
+                          type: AppOperationType.stop,
                           action: (taskId) => widget.appService.stopApp(
                             _app!.name,
                             taskId: taskId,
@@ -1118,7 +1467,7 @@ class _AppDetailViewState extends State<AppDetailView>
                   onPressed: paused
                       ? null
                       : () => _handleActionWithProgress(
-                          taskType: 'start_app',
+                          type: AppOperationType.start,
                           action: (taskId) => widget.appService.startApp(
                             _app!.name,
                             taskId: taskId,
@@ -1210,17 +1559,17 @@ class _AppDetailViewState extends State<AppDetailView>
     }
   }
 
-  Widget _buildOperationBanner(_TrackedOperation operation) {
+  Widget _buildOperationBanner(TrackedAppOperation operation) {
     final latest = operation.latest;
     final progress = latest?.progress ?? -1;
-    final label = _operationLabel(operation.taskType);
+    final label = operation.type.policy.label;
     final message = latest?.message.isNotEmpty ?? false
         ? latest!.message
-        : operation.phase == _OperationPhase.submitting
+        : operation.phase == AppOperationPhase.submitting
         ? 'Submitting request'
         : 'Working';
     final isError =
-        operation.phase == _OperationPhase.failed ||
+        operation.phase == AppOperationPhase.failed ||
         (latest?.error != null && latest!.error!.isNotEmpty);
 
     return Container(
@@ -1283,9 +1632,86 @@ class _AppDetailViewState extends State<AppDetailView>
           TextButton(
             onPressed: () => _showOperationDialog(
               taskId: operation.taskId,
-              taskType: operation.taskType,
+              type: operation.type,
             ),
             child: const Text('Details'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOperationFailureBanner(_RecentOperationFailure failure) {
+    final pending = failure.pendingListenerSave;
+    final canReviewPending = pending != null && _activeOperation == null;
+    final accent = switch (failure.severity) {
+      BannerSeverity.info => PiccoloTheme.info,
+      BannerSeverity.warning => PiccoloTheme.warning,
+      BannerSeverity.error => PiccoloTheme.critical,
+    };
+    final icon = switch (failure.severity) {
+      BannerSeverity.info => PiccoloIcons.info,
+      BannerSeverity.warning => PiccoloIcons.warning,
+      BannerSeverity.error => PiccoloIcons.error,
+    };
+    return Container(
+      padding: const EdgeInsets.all(Spacing.md),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: 0.08),
+        border: const Border(
+          top: BorderSide(color: PiccoloTheme.hairline),
+          bottom: BorderSide(color: PiccoloTheme.hairline),
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, color: accent, size: 20),
+          const SizedBox(width: Spacing.sm),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  failure.title,
+                  style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    color: accent,
+                  ),
+                ),
+                const SizedBox(height: Spacing.xs),
+                Text(
+                  failure.message,
+                  style: PiccoloTheme.textTheme.bodySmall?.copyWith(
+                    color: PiccoloTheme.inkMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (pending != null) ...[
+            const SizedBox(width: Spacing.sm),
+            Tooltip(
+              message: canReviewPending
+                  ? 'Review preserved listener changes'
+                  : 'Wait for the current operation to finish',
+              child: TextButton(
+                onPressed: canReviewPending
+                    ? () => unawaited(_reviewFailedListenerSave(pending))
+                    : null,
+                child: const Text('Review Changes'),
+              ),
+            ),
+          ],
+          const SizedBox(width: Spacing.sm),
+          IconButton(
+            tooltip: pending != null ? 'Discard Draft' : 'Dismiss',
+            onPressed: () => unawaited(
+              _dismissOperationFailureBanner(failure),
+            ),
+            icon: Icon(
+              pending != null ? PiccoloIcons.delete : PiccoloIcons.close,
+            ),
           ),
         ],
       ),
@@ -1466,29 +1892,6 @@ class _AppDetailViewState extends State<AppDetailView>
   }
 
   bool get _mutatingActionsPaused => _activeOperation != null;
-
-  String _operationLabel(String taskType) {
-    switch (taskType) {
-      case 'update_image':
-        return 'Updating image';
-      case 'update_config':
-        return 'Updating config';
-      case 'update_manifest':
-        return 'Applying YAML';
-      case 'update_listeners':
-        return 'Updating listeners';
-      case 'start_app':
-        return 'Starting app';
-      case 'stop_app':
-        return 'Stopping app';
-      case 'rollback_app':
-        return 'Rolling back app';
-      case 'uninstall_app':
-        return 'Uninstalling app';
-      default:
-        return taskType;
-    }
-  }
 
   static String? _findPrimaryListenerName(List<ServiceEndpoint> listeners) {
     // Prefer the endpoint marked as primary
