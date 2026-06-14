@@ -1,6 +1,13 @@
 import 'package:piccolo_os/core/models/app_status_event.dart';
 import 'package:piccolo_os/core/models/listener_health.dart';
 
+List<String> _readStringList(Map<String, dynamic> json, String key) {
+  final raw = json[key];
+  return raw is List<dynamic>
+      ? raw.map((e) => e.toString()).toList()
+      : const [];
+}
+
 class App {
   App({
     required this.id,
@@ -16,6 +23,12 @@ class App {
     this.definition = const {},
     this.primaryListenerHealth,
     this.catalogSource = '',
+    this.catalogUpdatePending = false,
+    this.catalogUpdatePendingHash = '',
+    this.catalogUpdatePendingReason = '',
+    this.catalogUpdatePendingFlow = '',
+    this.accessRepairPending = false,
+    this.accessRepairMessage = '',
   });
 
   factory App.fromJson(Map<String, dynamic> json) {
@@ -111,6 +124,16 @@ class App {
 
     // Catalog source tracks which catalog item this app was installed from
     final catalogSource = (json['catalog_source'] ?? '').toString();
+    final catalogUpdatePending = json['catalog_update_pending'] == true;
+    final catalogUpdatePendingHash = (json['catalog_update_pending_hash'] ?? '')
+        .toString();
+    final catalogUpdatePendingReason =
+        (json['catalog_update_pending_reason'] ?? '').toString();
+    final catalogUpdatePendingFlow = (json['catalog_update_pending_flow'] ?? '')
+        .toString();
+    final accessRepairPending = json['access_repair_pending'] == true;
+    final accessRepairMessage = (json['access_repair_message'] ?? '')
+        .toString();
 
     return App(
       id: instanceId,
@@ -126,6 +149,12 @@ class App {
       definition: def,
       primaryListenerHealth: primaryHealth,
       catalogSource: catalogSource,
+      catalogUpdatePending: catalogUpdatePending,
+      catalogUpdatePendingHash: catalogUpdatePendingHash,
+      catalogUpdatePendingReason: catalogUpdatePendingReason,
+      catalogUpdatePendingFlow: catalogUpdatePendingFlow,
+      accessRepairPending: accessRepairPending,
+      accessRepairMessage: accessRepairMessage,
     );
   }
   final String id;
@@ -141,6 +170,12 @@ class App {
   final ListenerHealth? primaryListenerHealth;
   final String
   catalogSource; // Tracks which catalog item this app was installed from
+  final bool catalogUpdatePending;
+  final String catalogUpdatePendingHash;
+  final String catalogUpdatePendingReason;
+  final String catalogUpdatePendingFlow;
+  final bool accessRepairPending;
+  final String accessRepairMessage;
   final String
   statusMessage; // Transient status context (e.g., "Re-pulling base image")
 
@@ -151,6 +186,12 @@ class App {
   bool get isError => status.toLowerCase() == AppStatusEvent.statusError;
   bool get isStarting => status.toLowerCase() == AppStatusEvent.statusStarting;
   bool get isWorkspace => mode.toLowerCase() == 'workspace';
+  bool get hasManifestReviewCatalogUpdate =>
+      catalogUpdatePending &&
+      catalogUpdatePendingFlow.toLowerCase() == 'manifest_review';
+  bool get hasConfigReviewCatalogUpdate =>
+      catalogUpdatePending &&
+      catalogUpdatePendingFlow.toLowerCase() == 'config';
 
   Map<String, String> environmentForService(String? serviceName) {
     final svc = serviceName?.trim();
@@ -188,6 +229,12 @@ class App {
       definition: definition,
       primaryListenerHealth: primaryListenerHealth,
       catalogSource: catalogSource,
+      catalogUpdatePending: catalogUpdatePending,
+      catalogUpdatePendingHash: catalogUpdatePendingHash,
+      catalogUpdatePendingReason: catalogUpdatePendingReason,
+      catalogUpdatePendingFlow: catalogUpdatePendingFlow,
+      accessRepairPending: accessRepairPending,
+      accessRepairMessage: accessRepairMessage,
     );
   }
 }
@@ -284,19 +331,12 @@ class ManifestUpdateSummary {
   });
 
   factory ManifestUpdateSummary.fromJson(Map<String, dynamic> json) {
-    List<String> readList(String key) {
-      final raw = json[key];
-      return raw is List<dynamic>
-          ? raw.map((e) => e.toString()).toList()
-          : const [];
-    }
-
     return ManifestUpdateSummary(
-      willChange: readList('will_change'),
-      willRestart: readList('will_restart'),
-      willPreserve: readList('will_preserve'),
-      expectedInterruption: readList('expected_interruption'),
-      rejected: readList('rejected'),
+      willChange: _readStringList(json, 'will_change'),
+      willRestart: _readStringList(json, 'will_restart'),
+      willPreserve: _readStringList(json, 'will_preserve'),
+      expectedInterruption: _readStringList(json, 'expected_interruption'),
+      rejected: _readStringList(json, 'rejected'),
     );
   }
   final List<String> willChange;
@@ -304,6 +344,81 @@ class ManifestUpdateSummary {
   final List<String> willPreserve;
   final List<String> expectedInterruption;
   final List<String> rejected;
+}
+
+class ManifestUpdateDecision {
+  const ManifestUpdateDecision({
+    required this.flag,
+    required this.outcome,
+    required this.summary,
+    this.path = '',
+    this.reason = '',
+  });
+
+  factory ManifestUpdateDecision.fromJson(Map<String, dynamic> json) {
+    return ManifestUpdateDecision(
+      flag: (json['flag'] ?? '').toString(),
+      path: (json['path'] ?? '').toString(),
+      outcome: (json['outcome'] ?? '').toString(),
+      summary: (json['summary'] ?? '').toString(),
+      reason: (json['reason'] ?? '').toString(),
+    );
+  }
+
+  final String flag;
+  final String path;
+  final String outcome;
+  final String summary;
+  final String reason;
+}
+
+class ManifestUpdateReviewItem {
+  const ManifestUpdateReviewItem({
+    required this.path,
+    required this.kind,
+    required this.confirmation,
+    this.oldValue = '',
+    this.newValue = '',
+  });
+
+  factory ManifestUpdateReviewItem.fromJson(Map<String, dynamic> json) {
+    return ManifestUpdateReviewItem(
+      path: (json['path'] ?? '').toString(),
+      kind: (json['kind'] ?? '').toString(),
+      oldValue: (json['old'] ?? '').toString(),
+      newValue: (json['new'] ?? '').toString(),
+      confirmation: (json['confirmation'] ?? '').toString(),
+    );
+  }
+
+  final String path;
+  final String kind;
+  final String oldValue;
+  final String newValue;
+  final String confirmation;
+}
+
+class ManifestUpdateDataSafetySummary {
+  const ManifestUpdateDataSafetySummary({
+    required this.snapshotRequired,
+    this.reason = '',
+    this.failureBehavior = '',
+    this.rollbackLimit = '',
+  });
+
+  factory ManifestUpdateDataSafetySummary.fromJson(Map<String, dynamic> json) {
+    return ManifestUpdateDataSafetySummary(
+      snapshotRequired: json['snapshot_required'] == true,
+      reason: (json['reason'] ?? '').toString(),
+      failureBehavior: (json['failure_behavior'] ?? '').toString(),
+      rollbackLimit: (json['rollback_limit'] ?? '').toString(),
+    );
+  }
+
+  final bool snapshotRequired;
+  final String reason;
+  final String failureBehavior;
+  final String rollbackLimit;
 }
 
 class ManifestUpdateResult {
@@ -318,10 +433,25 @@ class ManifestUpdateResult {
     this.dryRunToken = '',
     this.renderedAppId = '',
     this.blockingReason = '',
+    this.updateClass = '',
+    this.accessRepairPending = false,
+    this.accessRepairMessage = '',
+    this.decisions = const [],
+    this.exposureReview = const [],
+    this.requiredConfirmations = const [],
+    this.operationRiskFlags = const [],
+    this.runtimeReadiness = const [],
+    this.stagedImageRootfs = const [],
+    this.listenerRoutingAuth = const [],
+    this.storageBoundary = const [],
+    this.dataSafety,
   });
 
   factory ManifestUpdateResult.fromJson(Map<String, dynamic> json) {
     final rawSummary = json['summary'];
+    final rawDecisions = json['decisions'];
+    final rawExposureReview = json['exposure_review'];
+    final rawDataSafety = json['data_safety'];
     return ManifestUpdateResult(
       instanceId: (json['instance_id'] ?? '').toString(),
       baseManifestHash: (json['base_manifest_hash'] ?? '').toString(),
@@ -329,14 +459,48 @@ class ManifestUpdateResult {
       dryRunToken: (json['dry_run_token'] ?? '').toString(),
       renderedAppId: (json['rendered_app_id'] ?? '').toString(),
       diffKind: (json['diff_kind'] ?? '').toString(),
+      updateClass: (json['update_class'] ?? '').toString(),
       applicable: json['applicable'] == true,
       blockingReason: (json['blocking_reason'] ?? '').toString(),
       metadataOnly: json['metadata_only'] == true,
+      accessRepairPending: json['access_repair_pending'] == true,
+      accessRepairMessage: (json['access_repair_message'] ?? '').toString(),
       summary: rawSummary is Map<dynamic, dynamic>
           ? ManifestUpdateSummary.fromJson(
               Map<String, dynamic>.from(rawSummary),
             )
           : const ManifestUpdateSummary(),
+      decisions: rawDecisions is List<dynamic>
+          ? rawDecisions
+                .whereType<Map<dynamic, dynamic>>()
+                .map(
+                  (e) => ManifestUpdateDecision.fromJson(
+                    Map<String, dynamic>.from(e),
+                  ),
+                )
+                .toList()
+          : const [],
+      exposureReview: rawExposureReview is List<dynamic>
+          ? rawExposureReview
+                .whereType<Map<dynamic, dynamic>>()
+                .map(
+                  (e) => ManifestUpdateReviewItem.fromJson(
+                    Map<String, dynamic>.from(e),
+                  ),
+                )
+                .toList()
+          : const [],
+      requiredConfirmations: _readStringList(json, 'required_confirmations'),
+      operationRiskFlags: _readStringList(json, 'operation_risk_flags'),
+      runtimeReadiness: _readStringList(json, 'runtime_readiness'),
+      stagedImageRootfs: _readStringList(json, 'staged_image_rootfs'),
+      listenerRoutingAuth: _readStringList(json, 'listener_routing_auth'),
+      storageBoundary: _readStringList(json, 'storage_boundary'),
+      dataSafety: rawDataSafety is Map<dynamic, dynamic>
+          ? ManifestUpdateDataSafetySummary.fromJson(
+              Map<String, dynamic>.from(rawDataSafety),
+            )
+          : null,
     );
   }
   final String instanceId;
@@ -345,10 +509,22 @@ class ManifestUpdateResult {
   final String dryRunToken;
   final String renderedAppId;
   final String diffKind;
+  final String updateClass;
   final bool applicable;
   final String blockingReason;
   final bool metadataOnly;
+  final bool accessRepairPending;
+  final String accessRepairMessage;
   final ManifestUpdateSummary summary;
+  final List<ManifestUpdateDecision> decisions;
+  final List<ManifestUpdateReviewItem> exposureReview;
+  final List<String> requiredConfirmations;
+  final List<String> operationRiskFlags;
+  final List<String> runtimeReadiness;
+  final List<String> stagedImageRootfs;
+  final List<String> listenerRoutingAuth;
+  final List<String> storageBoundary;
+  final ManifestUpdateDataSafetySummary? dataSafety;
 }
 
 class InstalledConfigReadResult {
@@ -498,6 +674,8 @@ class InstalledConfigUpdateResult {
     required this.summary,
     this.dryRunToken = '',
     this.blockingReason = '',
+    this.accessRepairPending = false,
+    this.accessRepairMessage = '',
     this.actions = const [],
   });
 
@@ -517,6 +695,8 @@ class InstalledConfigUpdateResult {
       applicable: json['applicable'] == true,
       blockingReason: (json['blocking_reason'] ?? '').toString(),
       metadataOnly: json['metadata_only'] == true,
+      accessRepairPending: json['access_repair_pending'] == true,
+      accessRepairMessage: (json['access_repair_message'] ?? '').toString(),
       actions: rawActions is List<dynamic>
           ? rawActions
                 .whereType<Map<dynamic, dynamic>>()
@@ -547,6 +727,8 @@ class InstalledConfigUpdateResult {
   final bool applicable;
   final String blockingReason;
   final bool metadataOnly;
+  final bool accessRepairPending;
+  final String accessRepairMessage;
   final List<InstalledConfigActionSummary> actions;
   final ManifestUpdateSummary summary;
 }

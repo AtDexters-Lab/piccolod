@@ -1,5 +1,7 @@
 import 'package:piccolo_os/core/models/task_progress.dart';
 
+const _legacyUpdateManifestTaskType = 'update_manifest';
+
 enum AppOperationType {
   updateImage,
   updateConfig,
@@ -270,8 +272,9 @@ const appOperationPolicies = <AppOperationType, AppOperationPolicy>{
   ),
   AppOperationType.updateManifest: AppOperationPolicy(
     type: AppOperationType.updateManifest,
-    taskType: 'update_manifest',
-    label: 'Applying YAML',
+    taskType: 'update_service_app',
+    label: 'Updating app',
+    observesReadiness: true,
     httpSuccessCompletesOperation: true,
   ),
   AppOperationType.updateListeners: AppOperationPolicy(
@@ -312,9 +315,13 @@ extension AppOperationTypePolicy on AppOperationType {
 
 final Set<String> appOperationTaskTypeSet = appOperationPolicies.values
     .map((policy) => policy.taskType)
+    .followedBy(const [_legacyUpdateManifestTaskType])
     .toSet();
 
 AppOperationType? appOperationTypeFromTaskType(String taskType) {
+  if (taskType == _legacyUpdateManifestTaskType) {
+    return AppOperationType.updateManifest;
+  }
   for (final entry in appOperationPolicies.entries) {
     if (entry.value.taskType == taskType) return entry.key;
   }

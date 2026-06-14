@@ -5,6 +5,7 @@ import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/app_service.dart';
 import 'package:piccolo_os/core/utils/task_id.dart';
+import 'package:piccolo_os/features/apps/apply_settlement.dart';
 import 'package:piccolo_os/shared/widgets/task_progress_panel.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
@@ -70,10 +71,13 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
   InstalledConfigUpdateResult? _dryRun;
   String? _error;
   String? _taskId;
+  String? _accessRepairMessage;
   bool _loading = true;
   bool _busy = false;
   bool _dryRunning = false;
   bool _applied = false;
+  bool _applyResponsePending = false;
+  bool _applyTaskSucceeded = false;
 
   @override
   void initState() {
@@ -149,7 +153,10 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
 
   void _invalidateDryRun() {
     if (_dryRun == null || _taskId != null) return;
-    setState(() => _dryRun = null);
+    setState(() {
+      _dryRun = null;
+      _accessRepairMessage = null;
+    });
   }
 
   Future<void> _dryRunUpdate() async {
@@ -187,6 +194,7 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
       _dryRunning = true;
       _dryRun = null;
       _error = null;
+      _accessRepairMessage = null;
     });
     try {
       final result = await widget.appService.dryRunInstalledConfigUpdate(
@@ -268,17 +276,46 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
       _busy = true;
       _error = null;
       _taskId = taskId;
+      _accessRepairMessage = null;
+      _applyResponsePending = true;
+      _applyTaskSucceeded = false;
     });
     widget.onTaskStarted?.call(taskId, 'update_config');
     _revealTaskProgress();
     try {
-      await widget.appService.applyInstalledConfigUpdate(
+      final result = await widget.appService.applyInstalledConfigUpdate(
         widget.appId,
         dryRun,
         taskId: taskId,
       );
+      if (!mounted || _applied) return;
+      _applyResponsePending = false;
+      if (result.accessRepairPending) {
+        _applied = true;
+        await widget.onApplied();
+        if (!mounted) return;
+        setState(() {
+          _busy = false;
+          _taskId = null;
+          _dryRun = result;
+          _accessRepairMessage = result.accessRepairMessage.isEmpty
+              ? 'Config committed, but access publication needs repair.'
+              : result.accessRepairMessage;
+        });
+        _revealDryRunSummary();
+        return;
+      }
+      await _finishApply();
     } on Object catch (e) {
       if (!mounted) return;
+      _applyResponsePending = false;
+      if (shouldFinishApplyFromTaskSuccess(
+        taskSucceeded: _applyTaskSucceeded,
+        alreadyApplied: _applied,
+      )) {
+        await _finishApply();
+        return;
+      }
       setState(() {
         _busy = false;
         _taskId = null;
@@ -290,16 +327,26 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
 
   Future<void> _completeApply(TaskProgressEvent event) async {
     if (_applied) return;
+    if (_applyResponsePending) {
+      _applyTaskSucceeded = event.error == null || event.error!.isEmpty;
+      return;
+    }
     if (event.error != null && event.error!.isNotEmpty) {
       if (!mounted) return;
       setState(() {
         _busy = false;
         _taskId = null;
+        _applyResponsePending = false;
         _error = event.error;
       });
       _revealError();
       return;
     }
+    await _finishApply();
+  }
+
+  Future<void> _finishApply() async {
+    if (_applied) return;
     _applied = true;
     await widget.onApplied();
     if (mounted) Navigator.of(context).pop();
@@ -322,11 +369,12 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
       actions: [
         TextButton(
           onPressed: _busy ? null : () => Navigator.of(context).pop(),
-          child: const Text('Cancel'),
+          child: Text(_taskId != null || _applied ? 'Close' : 'Cancel'),
         ),
         FilledButton.icon(
           onPressed:
               _busy ||
+                  _applied ||
                   _dryRun == null ||
                   !_dryRun!.applicable ||
                   _taskId != null
@@ -404,6 +452,12 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
         ],
         if (_dryRun != null) ...[
           const SizedBox(height: Spacing.lg),
+          if (_accessRepairMessage != null)
+            _Banner(
+              icon: PiccoloIcons.warning,
+              color: PiccoloTheme.warning,
+              text: _accessRepairMessage!,
+            ),
           KeyedSubtree(
             key: _dryRunSummaryKey,
             child: _buildDryRunSummary(_dryRun!),

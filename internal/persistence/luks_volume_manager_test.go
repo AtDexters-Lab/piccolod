@@ -22,8 +22,8 @@ type fakeBlockDevice struct {
 	err    error
 }
 
-func (d *fakeBlockDevice) Name() string               { return d.name }
-func (d *fakeBlockDevice) Path() string                { return "/dev/fake/" + d.name }
+func (d *fakeBlockDevice) Name() string                 { return d.name }
+func (d *fakeBlockDevice) Path() string                 { return "/dev/fake/" + d.name }
 func (d *fakeBlockDevice) Open(_ context.Context) error { return nil }
 func (d *fakeBlockDevice) Close(_ context.Context) error {
 	d.closed = true
@@ -431,11 +431,11 @@ func TestLuksSetKeyslot_KillAddWhenSlotOccupied(t *testing.T) {
 // reports whether the given keyslot ID is present.
 func TestLuksDumpSlotOccupied(t *testing.T) {
 	cases := []struct {
-		name     string
-		dump     string
-		slot     int
-		want     bool
-		wantErr  bool
+		name    string
+		dump    string
+		slot    int
+		want    bool
+		wantErr bool
 	}{
 		{"empty keyslots", `{"keyslots":{}}`, 1, false, false},
 		{"slot 1 present", `{"keyslots":{"1":{"type":"luks2"}}}`, 1, true, false},
@@ -461,8 +461,7 @@ func TestLuksDumpSlotOccupied(t *testing.T) {
 }
 
 func TestProvisionKeyslotOnAllVolumes_RejectsInvalidSlot(t *testing.T) {
-	mgr := &luksVolumeManager{
-	}
+	mgr := &luksVolumeManager{}
 
 	if err := mgr.provisionKeyslotOnAllVolumes(context.Background(), 0, []byte("pass")); err == nil {
 		t.Error("expected error for slot 0")
@@ -570,8 +569,7 @@ func TestReconcileAllVolumeStates_V3Ephemeral(t *testing.T) {
 }
 
 func TestResolveLUKSDevice_RejectsEphemeral(t *testing.T) {
-	mgr := &luksVolumeManager{
-	}
+	mgr := &luksVolumeManager{}
 
 	meta := &volumeMetaV3{
 		Version: metadataV3Version,
@@ -595,8 +593,8 @@ func TestDestroyVolume_Ephemeral_NoCryptsetup(t *testing.T) {
 	lvMgr := lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName)
 
 	mgr := &luksVolumeManager{
-		run:          run,
-		lvMgr:        lvMgr,
+		run:   run,
+		lvMgr: lvMgr,
 	}
 
 	// Create ephemeral volume metadata.
@@ -662,8 +660,8 @@ func TestProvisionKeyslotOnAllVolumes_SkipsEphemeral(t *testing.T) {
 	}
 
 	mgr := &luksVolumeManager{
-		run:          run,
-		tmpfsDir:     t.TempDir(),
+		run:      run,
+		tmpfsDir: t.TempDir(),
 		// crypto is nil — provisionKeyslotOnAllVolumes will fail on UnwrapLUKSMasterKey.
 		// But ephemeral volumes should be skipped before we get to any per-volume operations.
 	}
@@ -687,15 +685,15 @@ func TestReconcileOrphanLVs(t *testing.T) {
 	// Stub lvs output: mix of known, orphan, snapshot, and failed-rollback LVs.
 	// Format: lv_name  lv_size  lv_attr  pool_lv
 	lvsOutput := strings.Join([]string{
-		"  eph-scratch       53687091200  Vwi-a-tz--  thinpool",  // known (has metadata)
-		"  vol-app-myapp     10737418240  Vwi-a-tz--  thinpool",  // known (has metadata)
-		"  golden-abc123     3221225472   Vwi---tz--  thinpool",  // known (has metadata)
-		"  eph-orphan        53687091200  Vwi---tz--  thinpool",  // orphan — should be removed
-		"  ws-old-install    5368709120   Vwi-a-tz--  thinpool",  // orphan (active) — should be deactivated + removed
-		"  snap-app-myapp--gen1  10737418240  Vwi---tz--  thinpool", // tuple snapshot — skip
+		"  eph-scratch       53687091200  Vwi-a-tz--  thinpool",           // known (has metadata)
+		"  vol-app-myapp     10737418240  Vwi-a-tz--  thinpool",           // known (has metadata)
+		"  golden-abc123     3221225472   Vwi---tz--  thinpool",           // known (has metadata)
+		"  eph-orphan        53687091200  Vwi---tz--  thinpool",           // orphan — should be removed
+		"  ws-old-install    5368709120   Vwi-a-tz--  thinpool",           // orphan (active) — should be deactivated + removed
+		"  snap-app-myapp--gen1  10737418240  Vwi---tz--  thinpool",       // tuple snapshot — skip
 		"  vol-app-myapp--failed-gen2  10737418240  Vwi---tz--  thinpool", // tuple failed rollback — skip
-		"  thinpool          214748364800  twi-a-t---  ",          // thin pool itself — skip
-		"  foreign-lv        1073741824   -wi-a-----  ",          // not in pool — ListLVs filters it
+		"  thinpool          214748364800  twi-a-t---  ",                  // thin pool itself — skip
+		"  foreign-lv        1073741824   -wi-a-----  ",                   // not in pool — ListLVs filters it
 	}, "\n")
 
 	lvsKey := testutil.BuildKey("lvs", []string{
@@ -710,8 +708,8 @@ func TestReconcileOrphanLVs(t *testing.T) {
 	lvMgr := lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName)
 
 	mgr := &luksVolumeManager{
-		run:          run,
-		lvMgr:        lvMgr,
+		run:   run,
+		lvMgr: lvMgr,
 	}
 
 	// Create metadata for the "known" LVs.
@@ -747,7 +745,7 @@ func TestReconcileOrphanLVs(t *testing.T) {
 
 	// Verify orphan "eph-orphan" was removed.
 	expectRemoved := map[string]bool{
-		"eph-orphan":    false,
+		"eph-orphan":     false,
 		"ws-old-install": false,
 	}
 	for _, call := range calls {
@@ -797,6 +795,60 @@ func TestReconcileOrphanLVs(t *testing.T) {
 				t.Error("tuple failed rollback LV should not be removed")
 			}
 		}
+	}
+}
+
+func TestRollbackDataVolumeResumesPartialRenameState(t *testing.T) {
+	paths.SetRootsForTest(t)
+	activeLV := "vol-app-piclu"
+	snapshotLV := "snap-app-piclu--manifest-test"
+	failedLV := "vol-app-piclu--failed-manifest-test"
+	run := &fakeRunner{
+		Errs: map[string]error{
+			testutil.BuildKey("lvs", []string{"--noheadings", lvm.DefaultVGName + "/" + activeLV}): errors.New("active LV missing"),
+		},
+	}
+	lvMgr := lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName)
+	mgr := &luksVolumeManager{
+		run:              run,
+		lvMgr:            lvMgr,
+		kernelSnapshotFn: staticSnapshot(newSnap().build()),
+	}
+	metaDir := paths.VolumeMetaDir("app-piclu")
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"version":2,"type":"luks-thinlv","wrapped_key":"wrapped","nonce":"nonce","lv_name":"` + activeLV + `","vg_name":"` + lvm.DefaultVGName + `","size_bytes":1073741824,"fs_type":"ext4"}`
+	if err := os.WriteFile(filepath.Join(metaDir, metadataV2File), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	renamesCommitted, snapshotPromoted, err := mgr.RollbackDataVolume(context.Background(), "piclu", snapshotLV, failedLV)
+	if !renamesCommitted || !snapshotPromoted {
+		t.Fatalf("rollback result = committed:%v promoted:%v, want true/true", renamesCommitted, snapshotPromoted)
+	}
+	if err == nil {
+		t.Fatalf("rollback err = nil, want attach failure after resumed promotion")
+	}
+	calls := run.GetCalls()
+	for _, call := range calls {
+		if strings.Contains(call, "lvrename "+lvm.DefaultVGName+" "+activeLV+" "+failedLV) {
+			t.Fatalf("resumed rollback retried active->failed rename: %v", calls)
+		}
+		if strings.HasPrefix(call, "umount ") {
+			t.Fatalf("resumed rollback retried detach before promotion: %v", calls)
+		}
+	}
+	wantRename := "lvrename " + lvm.DefaultVGName + " " + snapshotLV + " " + activeLV
+	foundRename := false
+	for _, call := range calls {
+		if call == wantRename {
+			foundRename = true
+			break
+		}
+	}
+	if !foundRename {
+		t.Fatalf("resumed rollback did not promote snapshot, calls=%v", calls)
 	}
 }
 
@@ -859,7 +911,7 @@ func TestDetachAppVolume_ContinuesOnUmountFailure(t *testing.T) {
 			run := &fakeRunner{Errs: errs}
 
 			mgr := &luksVolumeManager{
-				run:                        run,
+				run: run,
 			}
 
 			err := mgr.detachAppVolume(context.Background(), handle)
@@ -927,7 +979,7 @@ func TestDetachEphemeralVolume_ContinuesOnUmountFailure(t *testing.T) {
 	}}
 
 	mgr := &luksVolumeManager{
-		run:                        run,
+		run: run,
 	}
 
 	err := mgr.detachEphemeralVolume(context.Background(), handle)

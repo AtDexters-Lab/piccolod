@@ -7,6 +7,7 @@ import (
 
 func TestReconcile_AddRemoveChange(t *testing.T) {
 	m := NewServiceManager()
+	useFakeProxyListeners(m)
 	// Seed existing app endpoints
 	eps, err := m.AllocateForApp("app", []api.AppListener{{Name: "a", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolRaw}})
 	if err != nil {
@@ -39,6 +40,7 @@ func TestReconcile_AddRemoveChange(t *testing.T) {
 
 func TestReconcile_AuthAddition(t *testing.T) {
 	m := NewServiceManager()
+	useFakeProxyListeners(m)
 
 	// Allocate with no auth
 	eps, err := m.AllocateForApp("app", []api.AppListener{
@@ -83,8 +85,59 @@ func TestReconcile_AuthAddition(t *testing.T) {
 	}
 }
 
+func TestPrepareReconcileDefersProxyOnlyPublish(t *testing.T) {
+	m := NewServiceManager()
+	useFakeProxyListeners(m)
+	m.registry["app"] = map[string]ServiceEndpoint{
+		"web": {
+			App:        "app",
+			Name:       "web",
+			GuestPort:  80,
+			HostBind:   18080,
+			PublicPort: 28080,
+			Flow:       api.FlowTCP,
+			Protocol:   api.ListenerProtocolHTTP,
+		},
+	}
+	m.allocator.usedHost[18080] = struct{}{}
+	m.allocator.usedPublic[publicKey(28080, "tcp")] = struct{}{}
+
+	auth := &api.ListenerAuth{
+		Rules: []api.ListenerAuthRule{{Path: "/", Type: "prefix", Strategy: "public"}},
+	}
+	prepared, err := m.PrepareReconcile("app", []api.AppListener{
+		{Name: "web", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Auth: auth},
+	})
+	if err != nil {
+		t.Fatalf("prepare reconcile: %v", err)
+	}
+	if len(prepared.Result().ProxyOnlyChanged) != 1 {
+		t.Fatalf("want proxy-only change, got %+v", prepared.Result())
+	}
+	ep, ok := m.GetAppListener("app", "web")
+	if !ok {
+		t.Fatalf("endpoint missing before publish")
+	}
+	if ep.Auth != nil {
+		t.Fatalf("prepare should not publish auth into registry, got %+v", ep.Auth)
+	}
+
+	if _, _, err := prepared.Publish(); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	t.Cleanup(m.StopAll)
+	ep, ok = m.GetAppListener("app", "web")
+	if !ok {
+		t.Fatalf("endpoint missing after publish")
+	}
+	if ep.Auth == nil || ep.Auth.Rules[0].Strategy != "public" {
+		t.Fatalf("publish did not update registry auth: %+v", ep.Auth)
+	}
+}
+
 func TestReconcile_AuthRemoval(t *testing.T) {
 	m := NewServiceManager()
+	useFakeProxyListeners(m)
 
 	// Allocate with auth
 	auth := &api.ListenerAuth{
@@ -124,6 +177,7 @@ func TestReconcile_AuthRemoval(t *testing.T) {
 
 func TestReconcile_NewListenerWithAuth(t *testing.T) {
 	m := NewServiceManager()
+	useFakeProxyListeners(m)
 
 	// Allocate with one listener, no auth
 	_, err := m.AllocateForApp("app", []api.AppListener{

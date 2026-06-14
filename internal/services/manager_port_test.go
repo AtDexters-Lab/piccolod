@@ -8,6 +8,7 @@ import (
 
 func TestReserveHostPortPreventsReallocation(t *testing.T) {
 	manager := NewServiceManager()
+	manager.UseInMemoryNetworkForTest()
 
 	eps, err := manager.AllocateForApp("app", []api.AppListener{
 		{Name: "http", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},

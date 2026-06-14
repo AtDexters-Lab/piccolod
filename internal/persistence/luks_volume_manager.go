@@ -2007,8 +2007,34 @@ func (m *luksVolumeManager) SnapshotDataVolume(ctx context.Context, instanceID, 
 	return nil
 }
 
+func (m *luksVolumeManager) CheckDataSnapshotViability(ctx context.Context, instanceID string) error {
+	if err := m.checkThinPoolCapacity(ctx); err != nil {
+		return err
+	}
+	if m.lvMgr != nil {
+		originLV := "vol-app-" + instanceID
+		if !m.lvMgr.LVExists(ctx, originLV) {
+			return fmt.Errorf("data volume LV %s does not exist", originLV)
+		}
+	}
+	return nil
+}
+
+func (m *luksVolumeManager) CheckDataSnapshotHealth(ctx context.Context, snapshotLVName string) error {
+	if err := m.checkThinPoolCapacity(ctx); err != nil {
+		return err
+	}
+	if m.lvMgr != nil && !m.lvMgr.LVExists(ctx, snapshotLVName) {
+		return fmt.Errorf("data snapshot LV %s does not exist", snapshotLVName)
+	}
+	return nil
+}
+
 // DestroyDataSnapshot removes a data volume snapshot LV.
 func (m *luksVolumeManager) DestroyDataSnapshot(ctx context.Context, snapshotLVName string) error {
+	if m.lvMgr != nil && !m.lvMgr.LVExists(ctx, snapshotLVName) {
+		return nil
+	}
 	// Deactivate before removal (may already be inactive).
 	_ = m.lvMgr.DeactivateLV(ctx, snapshotLVName)
 	if err := m.lvMgr.RemoveThinLV(ctx, snapshotLVName); err != nil {
@@ -2036,22 +2062,36 @@ func (m *luksVolumeManager) DestroyDataSnapshot(ctx context.Context, snapshotLVN
 func (m *luksVolumeManager) RollbackDataVolume(ctx context.Context, instanceID, snapshotLVName, failedLVName string) (bool, bool, error) {
 	volumeID := "app-" + instanceID
 	handle := VolumeHandle{ID: volumeID, MountDir: paths.MountDir(volumeID)}
+	activeLV := "vol-app-" + instanceID
 
-	// 1. Full teardown: unmount + LUKS close + device stack close.
-	if err := m.Detach(ctx, handle); err != nil {
-		return false, false, fmt.Errorf("detach data volume before rollback: %w", err)
+	resumingPartial := false
+	if m.lvMgr != nil &&
+		!m.lvMgr.LVExists(ctx, activeLV) &&
+		m.lvMgr.LVExists(ctx, failedLVName) &&
+		m.lvMgr.LVExists(ctx, snapshotLVName) {
+		resumingPartial = true
+		log.Printf("WARN: rollback data volume for %s: resuming partial LV rename state (failed=%s snapshot=%s)", instanceID, failedLVName, snapshotLVName)
 	}
 
-	// 2. Rename active → failed.
-	activeLV := "vol-app-" + instanceID
-	if err := m.lvMgr.RenameLV(ctx, activeLV, failedLVName); err != nil {
-		// Attempt recovery: re-attach original.
-		_ = m.Attach(ctx, handle, AttachOptions{Role: VolumeRoleLeader})
-		return false, false, fmt.Errorf("rename active LV to failed: %w", err)
+	if !resumingPartial {
+		// 1. Full teardown: unmount + LUKS close + device stack close.
+		if err := m.Detach(ctx, handle); err != nil {
+			return false, false, fmt.Errorf("detach data volume before rollback: %w", err)
+		}
+
+		// 2. Rename active → failed.
+		if err := m.lvMgr.RenameLV(ctx, activeLV, failedLVName); err != nil {
+			// Attempt recovery: re-attach original.
+			_ = m.Attach(ctx, handle, AttachOptions{Role: VolumeRoleLeader})
+			return false, false, fmt.Errorf("rename active LV to failed: %w", err)
+		}
 	}
 
 	// 3. Rename snapshot → active.
 	if err := m.lvMgr.RenameLV(ctx, snapshotLVName, activeLV); err != nil {
+		if resumingPartial {
+			return true, false, fmt.Errorf("promote snapshot LV after partial rollback: %w", err)
+		}
 		// Attempt recovery: reverse step 2 and re-attach.
 		if reverseErr := m.lvMgr.RenameLV(ctx, failedLVName, activeLV); reverseErr != nil {
 			// Reverse rename also failed — active LV is now named failedLVName,

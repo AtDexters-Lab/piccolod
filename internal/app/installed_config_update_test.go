@@ -1,10 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +23,8 @@ type installedConfigSyncHost struct {
 	requiresProxy   func(*api.AppDefinition) bool
 	registeredProxy *[]string
 	deletedProxy    *[]string
+	registerErr     error
+	registerErrCall int
 }
 
 func (h installedConfigSyncHost) FetchCatalogTemplate(ctx context.Context, catalogSource string) ([]byte, error) {
@@ -73,10 +77,15 @@ func (h installedConfigSyncHost) RequiresProxyOIDCClient(def *api.AppDefinition)
 
 func (h installedConfigSyncHost) RegisterProxyOIDCClient(ctx context.Context, instanceID string) error {
 	_ = ctx
+	call := 1
 	if h.registeredProxy != nil {
+		call = len(*h.registeredProxy) + 1
 		*h.registeredProxy = append(*h.registeredProxy, instanceID)
 	}
-	return nil
+	if h.registerErrCall > 0 && h.registerErrCall != call {
+		return nil
+	}
+	return h.registerErr
 }
 
 func (h installedConfigSyncHost) DeleteProxyOIDCClient(ctx context.Context, instanceID string) {
@@ -403,6 +412,17 @@ func TestEditConfigSurfacesPendingCatalogRequiredInput(t *testing.T) {
 	if !strings.Contains(err.Error(), "transport_hostname") {
 		t.Fatalf("unexpected sync error: %v", err)
 	}
+	pendingState, err := state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load pending install state: %v", err)
+	}
+	if pendingState.PendingReviewFlow != pendingCatalogReviewFlowConfig {
+		t.Fatalf("pending review flow = %q, want %q", pendingState.PendingReviewFlow, pendingCatalogReviewFlowConfig)
+	}
+	info := mgr.PendingCatalogUpdateInfo(context.Background(), "piclu")
+	if !info.Pending || info.Flow != pendingCatalogReviewFlowConfig {
+		t.Fatalf("pending catalog info = %+v, want config flow", info)
+	}
 	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
 	if err != nil {
 		t.Fatalf("read installed config: %v", err)
@@ -473,8 +493,290 @@ func TestEditConfigSurfacesPendingCatalogRequiredInput(t *testing.T) {
 	if len(st.PendingRawTemplate) != 0 || st.PendingRawTemplateHash != "" {
 		t.Fatalf("pending source was not cleared after apply")
 	}
+	if st.PendingReviewFlow != "" {
+		t.Fatalf("pending review flow = %q, want cleared", st.PendingReviewFlow)
+	}
 	if got := st.InstallInputs["transport_hostname"]; got != "transport.piclu.example.com" {
 		t.Fatalf("transport input = %#v", got)
+	}
+}
+
+func TestCatalogSyncStoresPendingServiceAppReviewForImageChange(t *testing.T) {
+	mgr, state, raw, _, _ := installedConfigTestApp(t)
+	oldHash := Sha256Hex(raw)
+	newRaw := []byte(strings.Replace(string(raw), "docker.io/example/piclu:stable", "docker.io/example/piclu:new", 1))
+	newHash := Sha256Hex(newRaw)
+	mgr.SetSyncHost(installedConfigSyncHost{templates: map[string][]byte{"piclu": newRaw}})
+
+	err := mgr.SyncManifest(context.Background(), "piclu")
+	if err == nil {
+		t.Fatalf("expected sync to require operator review")
+	}
+	if !strings.Contains(err.Error(), "operator review") || !strings.Contains(err.Error(), "image reference changed") {
+		t.Fatalf("unexpected sync error: %v", err)
+	}
+	st, err := state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	if st.PendingRawTemplateHash != newHash || !bytes.Equal(st.PendingRawTemplate, newRaw) {
+		t.Fatalf("pending source hash/raw mismatch: hash=%q want %q raw=%q", st.PendingRawTemplateHash, newHash, string(st.PendingRawTemplate))
+	}
+	if st.PendingReviewFlow != pendingCatalogReviewFlowManifest {
+		t.Fatalf("pending review flow = %q, want %q", st.PendingReviewFlow, pendingCatalogReviewFlowManifest)
+	}
+	appInst, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("app not found")
+	}
+	if appInst.CatalogManifestHash != oldHash {
+		t.Fatalf("catalog hash advanced to %q, want old hash %q", appInst.CatalogManifestHash, oldHash)
+	}
+	if appInst.LastSyncAttemptHash != newHash {
+		t.Fatalf("attempt hash = %q, want %q", appInst.LastSyncAttemptHash, newHash)
+	}
+	if !strings.Contains(appInst.LastSyncError, "operator review") {
+		t.Fatalf("last sync error = %q", appInst.LastSyncError)
+	}
+	info := mgr.PendingCatalogUpdateInfo(context.Background(), "piclu")
+	if !info.Pending || info.Flow != pendingCatalogReviewFlowManifest {
+		t.Fatalf("pending catalog info = %+v, want manifest review flow", info)
+	}
+	storedDef, err := state.GetAppDefinition("piclu")
+	if err != nil {
+		t.Fatalf("get stored definition: %v", err)
+	}
+	if storedDef.Services["main"].Image != "docker.io/example/piclu:stable" {
+		t.Fatalf("candidate image was applied: %q", storedDef.Services["main"].Image)
+	}
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read installed config: %v", err)
+	}
+	if read.SourceHash != oldHash {
+		t.Fatalf("read source hash = %q, want installed hash %q", read.SourceHash, oldHash)
+	}
+	if strings.Contains(strings.Join(read.Warnings, " "), "pending catalog update requires attention") {
+		t.Fatalf("service-app review source leaked into config warnings: %v", read.Warnings)
+	}
+	if _, err := mgr.DryRunInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
+		LedgerRevision:  read.LedgerRevision,
+		SourceHash:      newHash,
+		InputSchemaHash: read.InputSchemaHash,
+	}); err == nil {
+		t.Fatalf("config dry-run accepted manifest-review pending source hash")
+	}
+
+	mgr.containerManager = NewMockContainerManager()
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: paths.CoreRoot()}}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(paths.CoreRoot()))
+	appInst.ActiveRootfs[networkAnchorServiceName] = "rootfs-anchor"
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app rootfs state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:     "piclu",
+		CatalogPending: true,
+	})
+	if err != nil {
+		t.Fatalf("dry-run pending catalog update: %v", err)
+	}
+	if !dryRun.Applicable {
+		t.Fatalf("pending catalog dry run not applicable: %s", dryRun.BlockingReason)
+	}
+	if dryRun.UpdateClass != "service_app_update_v2" {
+		t.Fatalf("update class = %q, want service_app_update_v2", dryRun.UpdateClass)
+	}
+	if !slices.Contains(dryRun.RequiredConfirmations, "image_update_review") {
+		t.Fatalf("expected image review confirmation, got %v", dryRun.RequiredConfirmations)
+	}
+	applied, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		CatalogPending:     true,
+		BaseManifestHash:   dryRun.BaseManifestHash,
+		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+		DryRunToken:        dryRun.DryRunToken,
+		Confirmations:      dryRun.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply pending catalog update: %v", err)
+	}
+	if !applied.Applicable {
+		t.Fatalf("apply result not applicable")
+	}
+	st, err = state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load install state after apply: %v", err)
+	}
+	if st.RawTemplateHash != newHash {
+		t.Fatalf("committed source hash = %q, want %q", st.RawTemplateHash, newHash)
+	}
+	if len(st.PendingRawTemplate) != 0 || st.PendingRawTemplateHash != "" {
+		t.Fatalf("pending source was not cleared after reviewed apply")
+	}
+	if st.PendingReviewFlow != "" {
+		t.Fatalf("pending review flow = %q, want cleared", st.PendingReviewFlow)
+	}
+	appInst, exists = state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("app not found after apply")
+	}
+	if appInst.CatalogManifestHash != newHash {
+		t.Fatalf("catalog manifest hash = %q, want %q", appInst.CatalogManifestHash, newHash)
+	}
+	if appInst.LastSyncError != "" {
+		t.Fatalf("last sync error = %q, want cleared", appInst.LastSyncError)
+	}
+	storedDef, err = state.GetAppDefinition("piclu")
+	if err != nil {
+		t.Fatalf("get stored definition after apply: %v", err)
+	}
+	if storedDef.Services["main"].Image != "docker.io/example/piclu:new" {
+		t.Fatalf("reviewed catalog image was not applied: %q", storedDef.Services["main"].Image)
+	}
+}
+
+func TestCatalogSyncStoresPendingServiceAppReviewForRenderedOnlyTemplate(t *testing.T) {
+	mgr, state, raw, inputs, systemCtx := installedConfigTestApp(t)
+	oldHash := Sha256Hex(raw)
+	newRaw := []byte(strings.Replace(string(raw), "docker.io/example/piclu:stable", "docker.io/example/piclu:new", 1))
+	newRaw = []byte(strings.Replace(string(newRaw),
+		`      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"`,
+		`      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"
+{{ if .Inputs.gemini_api_key }}
+      RENDERED_ONLY_MARKER: "{{ .Inputs.gemini_api_key }}"
+{{ end }}`, 1))
+	newHash := Sha256Hex(newRaw)
+	if _, err := ParseAppSchema(newRaw); err == nil {
+		t.Fatalf("test template should require render before schema parse")
+	}
+	if _, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   newRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil); err != nil {
+		t.Fatalf("rendered-only template should render through install pipeline: %v", err)
+	}
+	installSt, err := state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load install state before sync: %v", err)
+	}
+	if installSt.InstallInputs == nil {
+		installSt.InstallInputs = map[string]any{}
+	}
+	installSt.InstallInputs["diag_dir"] = "/diagnostics"
+	if installSt.InputProvenance == nil {
+		installSt.InputProvenance = map[string]string{}
+	}
+	installSt.InputProvenance["diag_dir"] = InputProvenanceOperator
+	if err := state.StoreInstallState("piclu", installSt); err != nil {
+		t.Fatalf("store install state before sync: %v", err)
+	}
+
+	mgr.SetSyncHost(installedConfigSyncHost{templates: map[string][]byte{"piclu": newRaw}})
+	err = mgr.SyncManifest(context.Background(), "piclu")
+	if err == nil {
+		t.Fatalf("expected sync to require operator review")
+	}
+	if !strings.Contains(err.Error(), "operator review") || !strings.Contains(err.Error(), "image reference changed") {
+		t.Fatalf("unexpected sync error: %v", err)
+	}
+	st, err := state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	if st.PendingRawTemplateHash != newHash || !bytes.Equal(st.PendingRawTemplate, newRaw) {
+		t.Fatalf("pending source hash/raw mismatch: hash=%q want %q raw=%q", st.PendingRawTemplateHash, newHash, string(st.PendingRawTemplate))
+	}
+	if st.PendingReviewFlow != pendingCatalogReviewFlowManifest {
+		t.Fatalf("pending review flow = %q, want %q", st.PendingReviewFlow, pendingCatalogReviewFlowManifest)
+	}
+	info := mgr.PendingCatalogUpdateInfo(context.Background(), "piclu")
+	if !info.Pending || info.Hash != newHash || info.Flow != pendingCatalogReviewFlowManifest {
+		t.Fatalf("pending catalog info = %+v, want pending hash %q and manifest review flow", info, newHash)
+	}
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read installed config with pending manifest review: %v", err)
+	}
+	if read.SourceHash != oldHash {
+		t.Fatalf("read source hash = %q, want installed hash %q", read.SourceHash, oldHash)
+	}
+	if strings.Contains(strings.Join(read.Warnings, " "), "pending catalog update requires attention") {
+		t.Fatalf("rendered-only manifest-review source leaked into config warnings: %v", read.Warnings)
+	}
+	configured, err := mgr.ConfigureCustomManifestUpdate(context.Background(), "piclu", nil, true)
+	if err != nil {
+		t.Fatalf("configure pending rendered-only catalog update: %v", err)
+	}
+	if !configured.Eligible {
+		t.Fatalf("pending rendered-only catalog update not eligible: %s", configured.BlockingReason)
+	}
+	if _, ok := configured.Inputs["gemini_api_key"]; !ok {
+		t.Fatalf("configured inputs missing gemini_api_key: %v", configured.Inputs)
+	}
+	appInst, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("app not found")
+	}
+	if appInst.CatalogManifestHash != oldHash {
+		t.Fatalf("catalog hash advanced to %q, want old hash %q", appInst.CatalogManifestHash, oldHash)
+	}
+
+	mgr.containerManager = NewMockContainerManager()
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: paths.CoreRoot()}}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(paths.CoreRoot()))
+	appInst.ActiveRootfs[networkAnchorServiceName] = "rootfs-anchor"
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app rootfs state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:     "piclu",
+		CatalogPending: true,
+	})
+	if err != nil {
+		t.Fatalf("dry-run pending rendered-only catalog update: %v", err)
+	}
+	if !dryRun.Applicable {
+		t.Fatalf("pending rendered-only catalog dry run not applicable: %s", dryRun.BlockingReason)
+	}
+	applied, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		CatalogPending:     true,
+		BaseManifestHash:   dryRun.BaseManifestHash,
+		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+		DryRunToken:        dryRun.DryRunToken,
+		Confirmations:      dryRun.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply pending rendered-only catalog update: %v", err)
+	}
+	if !applied.Applicable {
+		t.Fatalf("apply result not applicable")
+	}
+	st, err = state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load install state after apply: %v", err)
+	}
+	if st.RawTemplateHash != newHash {
+		t.Fatalf("committed raw hash = %q, want %q", st.RawTemplateHash, newHash)
+	}
+	if len(st.PendingRawTemplate) != 0 || st.PendingRawTemplateHash != "" {
+		t.Fatalf("pending rendered-only source was not cleared after apply")
+	}
+	read, err = mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read committed rendered-only config: %v", err)
+	}
+	if read.SourceHash != newHash {
+		t.Fatalf("read source hash = %q, want %q", read.SourceHash, newHash)
 	}
 }
 
@@ -757,6 +1059,26 @@ func TestDryRunInstalledConfigRejectsOIDCClientChanges(t *testing.T) {
 	}
 }
 
+func TestEvaluateInstalledConfigPolicyRejectsUDPOnlyRuntimeUpdate(t *testing.T) {
+	oldDef := customManifestPolicyBaseDef()
+	oldDef.Listeners[0].Flow = api.FlowUDP
+	oldDef.Listeners[0].Protocol = api.ListenerProtocolRaw
+	oldDef.Listeners[0].Auth = nil
+	newDef := customManifestPolicyClone(t, oldDef)
+	svc := newDef.Services["main"]
+	svc.Environment["PICLU_MODE"] = "device-v2"
+	newDef.Services["main"] = svc
+	appInst := &AppInstance{InstanceID: "piclu", Enabled: true, Definition: oldDef}
+
+	policy, summary := evaluateInstalledConfigPolicy(oldDef, newDef, appInst)
+	if policy.Allowed {
+		t.Fatalf("expected UDP-only runtime config update to be rejected, summary=%+v", summary)
+	}
+	if !strings.Contains(policy.Reason, "UDP") {
+		t.Fatalf("unexpected rejection reason: %q", policy.Reason)
+	}
+}
+
 func TestApplyInstalledConfigNoopUsesTransactionAndBumpsLedgerRevision(t *testing.T) {
 	mgr, state, raw, _, _ := installedConfigTestApp(t)
 	mgr.SetSyncHost(installedConfigSyncHost{templates: map[string][]byte{"piclu": raw}})
@@ -795,6 +1117,58 @@ func TestApplyInstalledConfigNoopUsesTransactionAndBumpsLedgerRevision(t *testin
 		if _, err := os.Stat(filepath.Join(appDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("%s should be cleared after config apply, stat err=%v", name, err)
 		}
+	}
+}
+
+func TestApplyInstalledConfigRuntimeChangeSnapshotsPersistentData(t *testing.T) {
+	mgr, _, raw, _, _ := installedConfigTestApp(t)
+	mgr.containerManager = NewMockContainerManager()
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: paths.CoreRoot()}}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(paths.CoreRoot()))
+	mgr.SetSyncHost(installedConfigSyncHost{templates: map[string][]byte{"piclu": raw}})
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read installed config: %v", err)
+	}
+	dryRun, err := mgr.DryRunInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
+		Inputs:          map[string]interface{}{"gemini_api_key": "new-secret"},
+		SecretActions:   map[string]string{"gemini_api_key": "replace"},
+		LedgerRevision:  read.LedgerRevision,
+		SourceHash:      read.SourceHash,
+		InputSchemaHash: read.InputSchemaHash,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if !dryRun.Applicable || dryRun.MetadataOnly {
+		t.Fatalf("expected runtime config dry run, got applicable=%v metadata=%v reason=%q", dryRun.Applicable, dryRun.MetadataOnly, dryRun.BlockingReason)
+	}
+	if !strings.Contains(strings.Join(dryRun.Summary.WillPreserve, "\n"), "private pre-commit failure snapshot") {
+		t.Fatalf("dry-run summary did not mention private snapshot: %+v", dryRun.Summary.WillPreserve)
+	}
+
+	applied, err := mgr.ApplyInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
+		DryRunToken:        dryRun.DryRunToken,
+		CandidateDigest:    dryRun.CandidateDigest,
+		LedgerRevision:     dryRun.LedgerRevision,
+		SourceHash:         dryRun.SourceHash,
+		InputSchemaHash:    dryRun.InputSchemaHash,
+		BaseManifestHash:   dryRun.BaseManifestHash,
+		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if applied.AccessRepairPending {
+		t.Fatalf("unexpected access repair pending: %s", applied.AccessRepairMessage)
+	}
+	if len(volumes.snapshots) != 1 {
+		t.Fatalf("snapshots = %v, want one precommit snapshot", volumes.snapshots)
+	}
+	if len(volumes.destroyed) != 1 || volumes.destroyed[0] != volumes.snapshots[0] {
+		t.Fatalf("destroyed snapshots = %v, want cleanup of %s", volumes.destroyed, volumes.snapshots[0])
 	}
 }
 
@@ -1456,6 +1830,442 @@ func TestCatalogSyncRevertsProxyOIDCDeltaWhenLedgerCommitFails(t *testing.T) {
 	}
 	if len(deleted) != 1 || deleted[0] != "oidcapp" {
 		t.Fatalf("proxy deletion rollback calls = %v, want [oidcapp]", deleted)
+	}
+}
+
+func TestCatalogSyncPostCommitPublishFailureKeepsCatalogMetadataCurrent(t *testing.T) {
+	mgr, state, oldRaw := installedConfigOIDCTestApp(t)
+	oldHash := Sha256Hex(oldRaw)
+	newRaw := []byte(strings.Replace(string(oldRaw), "      redirect_uri_paths:\n        - /callback", "      authorize_paths:\n        - /authorize\n      redirect_uri_paths:\n        - /callback", 1))
+	newHash := Sha256Hex(newRaw)
+	requiresProxy := func(def *api.AppDefinition) bool {
+		if def == nil {
+			return false
+		}
+		for _, svc := range def.Services {
+			if svc.OIDCClient != nil && len(svc.OIDCClient.AuthorizePaths) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+	registered := []string{}
+	mgr.SetSyncHost(installedConfigSyncHost{
+		templates:       map[string][]byte{"oidcapp": newRaw},
+		requiresProxy:   requiresProxy,
+		registeredProxy: &registered,
+		registerErr:     errors.New("proxy client registry unavailable"),
+		registerErrCall: 2,
+	})
+
+	err := mgr.SyncManifest(context.Background(), "oidcapp")
+	if err == nil {
+		t.Fatalf("expected post-commit publication failure")
+	}
+	if !strings.Contains(err.Error(), "proxy client registry unavailable") {
+		t.Fatalf("unexpected sync error: %v", err)
+	}
+	if len(registered) != 2 {
+		t.Fatalf("proxy registration calls before failure = %v, want precommit + publish attempts", registered)
+	}
+	st, err := state.LoadInstallState("oidcapp")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	if st.RawTemplateHash != newHash {
+		t.Fatalf("ledger raw hash = %q, want committed hash %q", st.RawTemplateHash, newHash)
+	}
+	appInst, exists := state.GetApp("oidcapp")
+	if !exists {
+		t.Fatalf("app not found")
+	}
+	if appInst.CatalogManifestHash != newHash {
+		t.Fatalf("catalog hash = %q, want committed hash %q (old %q)", appInst.CatalogManifestHash, newHash, oldHash)
+	}
+	if appInst.LastSyncError != "" {
+		t.Fatalf("last sync error = %q, want clear after ledger commit", appInst.LastSyncError)
+	}
+	txn, err := state.LoadManifestUpdateTransaction("oidcapp")
+	if err != nil {
+		t.Fatalf("load manifest update transaction: %v", err)
+	}
+	if txn.Phase != "publishing_access" {
+		t.Fatalf("transaction phase = %q, want publishing_access", txn.Phase)
+	}
+
+	mgr.SetSyncHost(installedConfigSyncHost{
+		templates:       map[string][]byte{"oidcapp": newRaw},
+		requiresProxy:   requiresProxy,
+		registeredProxy: &registered,
+	})
+	blocked := mgr.recoverPendingManifestUpdates(context.Background(), state)
+	if blocked["oidcapp"] {
+		t.Fatalf("recovery should repair access without blocking")
+	}
+	if _, err := state.LoadManifestUpdateTransaction("oidcapp"); err == nil {
+		t.Fatalf("transaction should be cleared after access repair")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("load transaction: %v", err)
+	}
+	if len(registered) != 3 {
+		t.Fatalf("proxy registration calls after recovery = %v, want recovery retry", registered)
+	}
+	appInst, exists = state.GetApp("oidcapp")
+	if !exists {
+		t.Fatalf("app not found after recovery")
+	}
+	if appInst.CatalogManifestHash != newHash {
+		t.Fatalf("catalog hash after recovery = %q, want %q", appInst.CatalogManifestHash, newHash)
+	}
+	if appInst.LastSyncError != "" {
+		t.Fatalf("last sync error after recovery = %q, want clear", appInst.LastSyncError)
+	}
+}
+
+func TestCatalogSyncPostCommitMetadataFailureRecovered(t *testing.T) {
+	mgr, state, oldRaw := installedConfigOIDCTestApp(t)
+	newRaw := []byte(strings.Replace(string(oldRaw), "      redirect_uri_paths:\n        - /callback", "      authorize_paths:\n        - /authorize\n      redirect_uri_paths:\n        - /callback", 1))
+	newHash := Sha256Hex(newRaw)
+	requiresProxy := func(def *api.AppDefinition) bool {
+		if def == nil {
+			return false
+		}
+		for _, svc := range def.Services {
+			if svc.OIDCClient != nil && len(svc.OIDCClient.AuthorizePaths) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+	registered := []string{}
+	mgr.SetSyncHost(installedConfigSyncHost{
+		templates:       map[string][]byte{"oidcapp": newRaw},
+		requiresProxy:   requiresProxy,
+		registeredProxy: &registered,
+	})
+	failMetadata := true
+	state.storeAppMetadataHook = func(instanceID string, app *AppInstance) error {
+		if failMetadata && instanceID == "oidcapp" && app.CatalogManifestHash == newHash && app.LastSyncError == "" {
+			return errors.New("metadata store unavailable")
+		}
+		return nil
+	}
+
+	err := mgr.SyncManifest(context.Background(), "oidcapp")
+	if err != nil {
+		t.Fatalf("sync should publish access and leave metadata retry pending, got: %v", err)
+	}
+	st, err := state.LoadInstallState("oidcapp")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	if st.RawTemplateHash != newHash {
+		t.Fatalf("ledger raw hash = %q, want committed hash %q", st.RawTemplateHash, newHash)
+	}
+	storedDef, err := state.GetAppDefinition("oidcapp")
+	if err != nil {
+		t.Fatalf("get committed definition: %v", err)
+	}
+	if got := storedDef.Services["main"].OIDCClient.AuthorizePaths; len(got) == 0 {
+		t.Fatalf("candidate manifest was not committed before metadata recovery")
+	}
+	txn, err := state.LoadManifestUpdateTransaction("oidcapp")
+	if err != nil {
+		t.Fatalf("transaction should remain for recovery: %v", err)
+	}
+	if txn.Phase != "committed_metadata_pending" || !txn.AccessPublished || !strings.Contains(txn.LastError, "metadata store unavailable") {
+		t.Fatalf("metadata retry transaction = phase:%q access:%v err:%q", txn.Phase, txn.AccessPublished, txn.LastError)
+	}
+
+	failMetadata = false
+	blocked := mgr.recoverPendingManifestUpdates(context.Background(), state)
+	if blocked["oidcapp"] {
+		t.Fatalf("recovery should retry metadata and access without blocking")
+	}
+	if _, err := state.LoadManifestUpdateTransaction("oidcapp"); err == nil {
+		t.Fatalf("transaction should be cleared after metadata recovery")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("load transaction: %v", err)
+	}
+	st, err = state.LoadInstallState("oidcapp")
+	if err != nil {
+		t.Fatalf("load recovered install state: %v", err)
+	}
+	if st.RawTemplateHash != newHash {
+		t.Fatalf("recovered ledger raw hash = %q, want committed hash %q", st.RawTemplateHash, newHash)
+	}
+	storedDef, err = state.GetAppDefinition("oidcapp")
+	if err != nil {
+		t.Fatalf("get recovered definition: %v", err)
+	}
+	if got := storedDef.Services["main"].OIDCClient.AuthorizePaths; len(got) == 0 {
+		t.Fatalf("recovery restored previous manifest; authorize paths = %v", got)
+	}
+	fresh, err := NewFilesystemStateManager(state.stateDir)
+	if err != nil {
+		t.Fatalf("reload state: %v", err)
+	}
+	appInst, exists := fresh.GetApp("oidcapp")
+	if !exists {
+		t.Fatalf("app not found after reload")
+	}
+	if appInst.CatalogManifestHash != newHash {
+		t.Fatalf("catalog hash after recovery = %q, want %q", appInst.CatalogManifestHash, newHash)
+	}
+	if appInst.LastSyncError != "" {
+		t.Fatalf("last sync error after recovery = %q, want clear", appInst.LastSyncError)
+	}
+}
+
+func TestCatalogSyncStructuralApplySnapshotsPersistentData(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(tempDir))
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := []byte(`type: user
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      PICLU_MODE: device
+    storage:
+      persistent:
+        data:
+          container: /data
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      PICLU_MODE: device
+    storage:
+      persistent:
+        data:
+          container: /data
+        diagnostics:
+          container: /diagnostics
+          shared: true
+x-piccolo:
+  mode: service
+`)
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	res, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    map[string]interface{}{},
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:          "piclu",
+		Enabled:             true,
+		PrimaryService:      "main",
+		Containers:          map[string]string{"main": "cid-main"},
+		ActiveRootfs:        map[string]string{"main": "rootfs-main"},
+		CatalogSource:       "piclu",
+		CatalogManifestHash: Sha256Hex(oldRaw),
+		CreatedAt:           now,
+		UpdatedAt:           now,
+		Definition:          res.Definition,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCatalog, "piclu", oldRaw, map[string]interface{}{}, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+	mgr.SetSyncHost(installedConfigSyncHost{templates: map[string][]byte{"piclu": newRaw}})
+
+	if err := mgr.SyncManifest(context.Background(), "piclu"); err != nil {
+		t.Fatalf("sync manifest: %v", err)
+	}
+	if len(volumes.snapshots) != 1 {
+		t.Fatalf("snapshots = %v, want one precommit snapshot", volumes.snapshots)
+	}
+	if len(volumes.destroyed) != 1 || volumes.destroyed[0] != volumes.snapshots[0] {
+		t.Fatalf("destroyed snapshots = %v, want cleanup of %s", volumes.destroyed, volumes.snapshots[0])
+	}
+	st, err := state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	if st.RawTemplateHash != Sha256Hex(newRaw) {
+		t.Fatalf("ledger hash = %q, want %q", st.RawTemplateHash, Sha256Hex(newRaw))
+	}
+	appInst, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("app missing after sync")
+	}
+	if appInst.CatalogManifestHash != Sha256Hex(newRaw) {
+		t.Fatalf("catalog hash = %q, want %q", appInst.CatalogManifestHash, Sha256Hex(newRaw))
+	}
+}
+
+func TestRecoverPendingManifestUpdateRepairsAccessAfterPostCommitPublishFailure(t *testing.T) {
+	mgr, state, oldRaw := installedConfigOIDCTestApp(t)
+	appInst, exists := state.GetApp("oidcapp")
+	if !exists {
+		t.Fatalf("oidc app missing")
+	}
+	newRaw := []byte(strings.Replace(string(oldRaw), "      redirect_uri_paths:\n        - /callback", "      authorize_paths:\n        - /authorize\n      redirect_uri_paths:\n        - /callback", 1))
+	oldDef := appInst.Definition
+	oldHash, err := canonicalManifestHash(oldDef)
+	if err != nil {
+		t.Fatalf("old hash: %v", err)
+	}
+	st, err := state.LoadInstallState("oidcapp")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	if st.InstallSystemCtx == nil {
+		t.Fatalf("install state missing system context")
+	}
+	rendered, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   newRaw,
+		UserInputs:    st.InstallInputs,
+		SystemContext: *st.InstallSystemCtx,
+		InstanceID:    "oidcapp",
+		ExistingOIDC:  st.OIDCCredentials,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render candidate: %v", err)
+	}
+	candidateHash, err := canonicalManifestHash(rendered.Definition)
+	if err != nil {
+		t.Fatalf("candidate hash: %v", err)
+	}
+	backupPath, err := state.BackupCurrentAppDefinitionForManifestUpdate("oidcapp")
+	if err != nil {
+		t.Fatalf("backup manifest: %v", err)
+	}
+	nextState := NewV2InstallState("oidcapp", InstallSourceKindCustom, "", newRaw, st.InstallInputs, *st.InstallSystemCtx, st.OIDCCredentials, false)
+	nextState.Revision = st.Revision + 1
+	appInst.Definition = rendered.Definition
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store candidate app: %v", err)
+	}
+	if err := state.StoreInstallState("oidcapp", nextState); err != nil {
+		t.Fatalf("store candidate install state: %v", err)
+	}
+	registered := []string{}
+	requiresProxy := func(def *api.AppDefinition) bool {
+		if def == nil {
+			return false
+		}
+		for _, svc := range def.Services {
+			if svc.OIDCClient != nil && len(svc.OIDCClient.AuthorizePaths) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+	mgr.SetSyncHost(installedConfigSyncHost{
+		requiresProxy:   requiresProxy,
+		registeredProxy: &registered,
+	})
+	failMetadata := true
+	state.storeAppMetadataHook = func(instanceID string, app *AppInstance) error {
+		if failMetadata && instanceID == "oidcapp" && app.CatalogManifestHash == nextState.RawTemplateHash && app.LastSyncError == "" {
+			return errors.New("metadata store unavailable during recovery")
+		}
+		return nil
+	}
+	now := time.Now().UTC()
+	if err := state.StoreManifestUpdateTransaction("oidcapp", &ManifestUpdateTransaction{
+		OperationID:               "op-access-repair",
+		OperationKind:             "service_app_update",
+		Phase:                     "publishing_access",
+		PreviousManifestHash:      oldHash,
+		CandidateManifestHash:     candidateHash,
+		PreviousLedgerRevision:    st.Revision,
+		CandidateLedgerRevision:   nextState.Revision,
+		PreviousLedgerSourceHash:  st.RawTemplateHash,
+		CandidateLedgerSourceHash: nextState.RawTemplateHash,
+		DryRunToken:               "token",
+		RuntimeFingerprint:        "fingerprint",
+		BackupPath:                backupPath,
+		CreatedAt:                 now,
+		UpdatedAt:                 now,
+		LastError:                 "register proxy oidc client: proxy client registry unavailable",
+	}); err != nil {
+		t.Fatalf("store publishing transaction: %v", err)
+	}
+
+	blocked := mgr.recoverPendingManifestUpdates(context.Background(), state)
+	if blocked["oidcapp"] {
+		t.Fatalf("recovery should repair access without blocking")
+	}
+	txn, err := state.LoadManifestUpdateTransaction("oidcapp")
+	if err != nil {
+		t.Fatalf("transaction should remain for metadata retry: %v", err)
+	}
+	if txn.Phase != "committed_metadata_pending" || !txn.AccessPublished || !strings.Contains(txn.LastError, "metadata store unavailable during recovery") {
+		t.Fatalf("metadata retry transaction = phase:%q access:%v err:%q", txn.Phase, txn.AccessPublished, txn.LastError)
+	}
+	if len(registered) != 1 || registered[0] != "oidcapp" {
+		t.Fatalf("proxy registration calls = %v, want recovery retry", registered)
+	}
+	committedDef, err := state.GetAppDefinition("oidcapp")
+	if err != nil {
+		t.Fatalf("get committed definition: %v", err)
+	}
+	if got := committedDef.Services["main"].OIDCClient.AuthorizePaths; !slices.Equal(got, []string{"/authorize"}) {
+		t.Fatalf("committed authorize paths = %v", got)
+	}
+	failMetadata = false
+	blocked = mgr.recoverPendingManifestUpdates(context.Background(), state)
+	if blocked["oidcapp"] {
+		t.Fatalf("second recovery should clear metadata retry without blocking")
+	}
+	if _, err := state.LoadManifestUpdateTransaction("oidcapp"); err == nil {
+		t.Fatalf("transaction should be cleared after metadata recovery")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("load transaction: %v", err)
+	}
+	if len(registered) != 1 {
+		t.Fatalf("proxy registration calls after metadata retry = %v, want no duplicate access repair", registered)
 	}
 }
 

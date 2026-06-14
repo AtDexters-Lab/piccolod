@@ -57,7 +57,7 @@ class AppDetailView extends StatefulWidget {
   State<AppDetailView> createState() => _AppDetailViewState();
 }
 
-enum _AppMenuAction { applyYaml, rollback, uninstall }
+enum _AppMenuAction { applyYaml, reviewCatalogUpdate, rollback, uninstall }
 
 class _ReadinessObservation {
   const _ReadinessObservation({
@@ -972,7 +972,7 @@ class _AppDetailViewState extends State<AppDetailView>
     );
   }
 
-  void _showManifestUpdateWizard() {
+  void _showManifestUpdateWizard({bool catalogPending = false}) {
     if (_app == null) return;
     unawaited(
       showDialog<void>(
@@ -981,12 +981,12 @@ class _AppDetailViewState extends State<AppDetailView>
         builder: (context) => ManifestUpdateWizard(
           appId: _app!.name,
           appService: widget.appService,
+          catalogPending: catalogPending,
           onTaskStarted: (taskId, taskType) =>
               _adoptWizardOperation(taskId: taskId, taskType: taskType),
-          onApplied: () async {
-            widget.desktopController.notifyAppsChanged();
-            await _loadData(showLoading: false);
-          },
+          onApplied: () => _settleWizardHttpSuccess(
+            fallbackType: AppOperationType.updateManifest,
+          ),
         ),
       ),
     );
@@ -1003,13 +1003,35 @@ class _AppDetailViewState extends State<AppDetailView>
           appService: widget.appService,
           onTaskStarted: (taskId, taskType) =>
               _adoptWizardOperation(taskId: taskId, taskType: taskType),
-          onApplied: () async {
-            widget.desktopController.notifyAppsChanged();
-            await _loadData(showLoading: false);
-          },
+          onApplied: () => _settleWizardHttpSuccess(
+            fallbackType: AppOperationType.updateConfig,
+          ),
         ),
       ),
     );
+  }
+
+  Future<void> _settleWizardHttpSuccess({
+    required AppOperationType fallbackType,
+  }) async {
+    final operation = _activeOperation;
+    if (operation != null && operation.type == fallbackType) {
+      // Readiness-observing updates may settle with detailAction.none here;
+      // _applyOperationSettlement still starts readiness observation, which
+      // immediately refreshes detail state through _loadData().
+      final settlement =
+          operation.type.policy.settleAfterHttpSuccess(isStillTracked: true) ??
+          operation.type.policy.settle(AppOperationOutcome.progressSucceeded);
+      final applied = await _applyOperationSettlement(operation, settlement);
+      if (applied && mounted) {
+        setState(() => _clearRecentOperationFailureForSuccess(operation.type));
+      }
+      return;
+    }
+
+    widget.desktopController.notifyAppsChanged();
+    await _loadData(showLoading: false);
+    _clearRecentSubmission();
   }
 
   Future<void> _confirmRollback() async {
@@ -1232,6 +1254,10 @@ class _AppDetailViewState extends State<AppDetailView>
 
         if (_recentOperationFailure != null)
           _buildOperationFailureBanner(_recentOperationFailure!),
+
+        if (_app!.accessRepairPending) _buildAccessRepairPendingBanner(),
+
+        if (_app!.catalogUpdatePending) _buildCatalogUpdatePendingBanner(),
 
         if (_readiness != null) _buildReadinessBanner(_readiness!),
 
@@ -1492,7 +1518,17 @@ class _AppDetailViewState extends State<AppDetailView>
                 value: _AppMenuAction.applyYaml,
                 child: ListTile(
                   leading: Icon(PiccoloIcons.fileText),
-                  title: Text('Apply YAML'),
+                  title: Text('Review App Update'),
+                ),
+              ),
+            if (!_app!.isWorkspace &&
+                _app!.isRunning &&
+                _app!.hasManifestReviewCatalogUpdate)
+              const PopupMenuItem(
+                value: _AppMenuAction.reviewCatalogUpdate,
+                child: ListTile(
+                  leading: Icon(PiccoloIcons.fileText),
+                  title: Text('Review Catalog Update'),
                 ),
               ),
             if (_snapshotAvailable && !_app!.isWorkspace)
@@ -1552,6 +1588,8 @@ class _AppDetailViewState extends State<AppDetailView>
     switch (action) {
       case _AppMenuAction.applyYaml:
         _showManifestUpdateWizard();
+      case _AppMenuAction.reviewCatalogUpdate:
+        _showManifestUpdateWizard(catalogPending: true);
       case _AppMenuAction.rollback:
         unawaited(_confirmRollback());
       case _AppMenuAction.uninstall:
@@ -1637,6 +1675,69 @@ class _AppDetailViewState extends State<AppDetailView>
             child: const Text('Details'),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildCatalogUpdatePendingBanner() {
+    final app = _app!;
+    final isConfigReview = app.hasConfigReviewCatalogUpdate;
+    final canReview =
+        !app.isWorkspace &&
+        !_mutatingActionsPaused &&
+        (isConfigReview || app.isRunning);
+    final reason = app.catalogUpdatePendingReason.trim();
+    final baseMessage = reason.isEmpty
+        ? 'A catalog update is waiting for review.'
+        : reason;
+    final message = canReview
+        ? baseMessage
+        : _mutatingActionsPaused
+        ? '$baseMessage Current operation must finish before review.'
+        : '$baseMessage Start app to review this catalog update.';
+    final actionLabel = isConfigReview
+        ? 'Edit Config'
+        : 'Review Catalog Update';
+    return StatusBanner(
+      severity: BannerSeverity.info,
+      icon: PiccoloIcons.fileText,
+      title: 'Catalog update pending',
+      message: message,
+      action: canReview
+          ? Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: isConfigReview
+                    ? _showInstalledConfigWizard
+                    : () => _showManifestUpdateWizard(catalogPending: true),
+                icon: Icon(
+                  isConfigReview
+                      ? PiccoloIcons.settings
+                      : PiccoloIcons.fileText,
+                ),
+                label: Text(actionLabel),
+              ),
+            )
+          : null,
+    );
+  }
+
+  Widget _buildAccessRepairPendingBanner() {
+    final message = _app!.accessRepairMessage.trim().isEmpty
+        ? 'Update committed, but listener routes, auth, or public access may not match the new manifest until access publication is repaired.'
+        : _app!.accessRepairMessage.trim();
+    return StatusBanner(
+      severity: BannerSeverity.warning,
+      icon: PiccoloIcons.warning,
+      title: 'Access repair pending',
+      message: message,
+      action: Align(
+        alignment: Alignment.centerLeft,
+        child: TextButton.icon(
+          onPressed: () => unawaited(_loadData(showLoading: false)),
+          icon: const Icon(PiccoloIcons.refresh),
+          label: const Text('Refresh'),
+        ),
       ),
     );
   }

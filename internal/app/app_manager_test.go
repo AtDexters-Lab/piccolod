@@ -13,6 +13,7 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/cluster"
+	"piccolod/internal/container"
 	"piccolod/internal/events"
 	"piccolod/internal/persistence"
 	"piccolod/internal/router"
@@ -957,6 +958,61 @@ func TestAppManager_RestoreServicesSkipsStoppedApps(t *testing.T) {
 	}
 }
 
+func TestAppManager_RestoreServicesSkipsPendingManifestUpdate(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	mgr, err := NewAppManagerForTestWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	def := customManifestPolicyBaseDef()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:      "piclu",
+		Enabled:         true,
+		PrimaryService:  "main",
+		NetworkAnchorID: "anchor",
+		Containers:      map[string]string{"main": "main"},
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		Definition:      def,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	mock.containers["anchor"] = &mockContainer{
+		ID:     "anchor",
+		Status: "running",
+		Spec: container.ContainerCreateSpec{
+			Ports: []container.PortMapping{{Host: 15080, Container: 8080}},
+		},
+	}
+	if err := state.StoreManifestUpdateTransaction("piclu", &ManifestUpdateTransaction{
+		OperationID:           "op-pending",
+		Phase:                 "candidate_persisted",
+		PreviousManifestHash:  "old",
+		CandidateManifestHash: "new",
+		DryRunToken:           "token",
+		BackupPath:            filepath.Join(tempDir, "backup.yaml"),
+		CreatedAt:             now,
+		UpdatedAt:             now,
+	}); err != nil {
+		t.Fatalf("store transaction: %v", err)
+	}
+
+	mgr.RestoreServices(context.Background())
+
+	if _, err := svcMgr.GetByApp("piclu"); err == nil {
+		t.Fatalf("restore services published app with pending manifest update")
+	}
+}
+
 func TestAppManager_ReconcileOnceStartsDesiredRunningApps(t *testing.T) {
 	tempDir := t.TempDir()
 	mock := NewMockContainerManager()
@@ -1575,5 +1631,3 @@ func TestAppManager_MetadataMigration(t *testing.T) {
 		}
 	}
 }
-
-

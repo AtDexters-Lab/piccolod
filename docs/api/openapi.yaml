@@ -1330,14 +1330,22 @@ components:
         message: { type: string }
     ManifestUpdateConfigureRequest:
       type: object
-      required: [app_definition]
       properties:
-        app_definition: { type: string }
+        app_definition:
+          type: string
+          description: Required unless catalog_pending is true.
+        catalog_pending:
+          type: boolean
+          description: Use the pending catalog manifest source recorded for this app.
     ManifestUpdateDryRunRequest:
       type: object
-      required: [app_definition]
       properties:
-        app_definition: { type: string }
+        app_definition:
+          type: string
+          description: Required unless catalog_pending is true.
+        catalog_pending:
+          type: boolean
+          description: Use the pending catalog manifest source recorded for this app.
         inputs:
           type: object
           additionalProperties: true
@@ -1348,11 +1356,19 @@ components:
       type: object
       required: [dry_run_token]
       properties:
-        app_definition: { type: string }
+        app_definition:
+          type: string
+          description: Required unless catalog_pending is true.
+        catalog_pending:
+          type: boolean
+          description: Use the pending catalog manifest source recorded for this app.
         inputs:
           type: object
           additionalProperties: true
         regenerate_inputs:
+          type: array
+          items: { type: string }
+        confirmations:
           type: array
           items: { type: string }
         base_manifest_hash: { type: string }
@@ -1424,6 +1440,31 @@ components:
         rejected:
           type: array
           items: { type: string }
+    ManifestUpdateDecision:
+      type: object
+      properties:
+        flag: { type: string }
+        path: { type: string }
+        outcome:
+          type: string
+          enum: [supported, operator_review, rejected]
+        summary: { type: string }
+        reason: { type: string }
+    ManifestUpdateReviewItem:
+      type: object
+      properties:
+        path: { type: string }
+        kind: { type: string }
+        old: { type: string }
+        new: { type: string }
+        confirmation: { type: string }
+    ManifestUpdateDataSafetySummary:
+      type: object
+      properties:
+        snapshot_required: { type: boolean }
+        reason: { type: string }
+        failure_behavior: { type: string }
+        rollback_limit: { type: string }
     ManifestUpdateResult:
       type: object
       properties:
@@ -1435,10 +1476,40 @@ components:
         diff_kind:
           type: string
           enum: [none, oidc_library_only, structural_no_image, image_only, structural_with_image, unknown]
+        update_class:
+          type: string
+          enum: [manifest_update_v1, service_app_update_v2]
         applicable: { type: boolean }
         blocking_reason: { type: string, nullable: true }
         metadata_only: { type: boolean }
+        access_repair_pending: { type: boolean }
+        access_repair_message: { type: string, nullable: true }
         summary: { $ref: '#/components/schemas/ManifestUpdateSummary' }
+        decisions:
+          type: array
+          items: { $ref: '#/components/schemas/ManifestUpdateDecision' }
+        exposure_review:
+          type: array
+          items: { $ref: '#/components/schemas/ManifestUpdateReviewItem' }
+        required_confirmations:
+          type: array
+          items: { type: string }
+        operation_risk_flags:
+          type: array
+          items: { type: string }
+        runtime_readiness:
+          type: array
+          items: { type: string }
+        staged_image_rootfs:
+          type: array
+          items: { type: string }
+        listener_routing_auth:
+          type: array
+          items: { type: string }
+        storage_boundary:
+          type: array
+          items: { type: string }
+        data_safety: { $ref: '#/components/schemas/ManifestUpdateDataSafetySummary' }
     ResponseInstalledConfigRead:
       type: object
       properties:
@@ -1540,6 +1611,8 @@ components:
         applicable: { type: boolean }
         blocking_reason: { type: string, nullable: true }
         metadata_only: { type: boolean }
+        access_repair_pending: { type: boolean }
+        access_repair_message: { type: string, nullable: true }
         actions:
           type: array
           items: { $ref: '#/components/schemas/InstalledConfigActionSummary' }
@@ -1590,6 +1663,13 @@ components:
         status: { type: string, enum: [running, stopped, error] }
         primary_service: { type: string }
         network_anchor_id: { type: string }
+        catalog_source: { type: string }
+        catalog_update_pending: { type: boolean }
+        catalog_update_pending_hash: { type: string }
+        catalog_update_pending_reason: { type: string }
+        catalog_update_pending_flow: { type: string, enum: [config, manifest_review] }
+        access_repair_pending: { type: boolean }
+        access_repair_message: { type: string }
         containers:
           type: object
           additionalProperties: { type: string }

@@ -499,6 +499,11 @@ func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 	}
 
 	metadataPath := filepath.Join(appDir, "metadata.json")
+	if fsm.storeAppMetadataHook != nil {
+		if err := fsm.storeAppMetadataHook(app.InstanceID, app); err != nil {
+			return fmt.Errorf("failed to write metadata.json: %w", err)
+		}
+	}
 	if err := fsutil.AtomicWriteFile(metadataPath, metadataData, 0644); err != nil {
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}

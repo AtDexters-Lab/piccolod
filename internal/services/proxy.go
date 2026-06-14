@@ -69,6 +69,8 @@ type ProxyManager struct {
 	cspFrameAncestors string // pre-calculated CSP header value
 	wg                sync.WaitGroup
 	acme              http.Handler
+	listenTCP         func(network, address string) (net.Listener, error)
+	listenUDP         func(network string, laddr *net.UDPAddr) (udpPacketConn, error)
 
 	// Auth dependencies for trusted headers middleware (RFC 5.2)
 	userManager   *auth.UserManager
@@ -413,9 +415,16 @@ func (p *ProxyManager) SetAllowedAncestors(hosts []string) {
 
 // StartListener starts a proxy for the given endpoint (TCP or UDP).
 func (p *ProxyManager) StartListener(ep ServiceEndpoint) {
+	if err := p.StartListenerChecked(ep); err != nil {
+		log.Printf("WARN: %v", err)
+	}
+}
+
+// StartListenerChecked starts a proxy and reports bind/configuration failures
+// to callers that need durable publication guarantees.
+func (p *ProxyManager) StartListenerChecked(ep ServiceEndpoint) error {
 	if ep.Flow == api.FlowUDP {
-		p.startUDPProxy(ep)
-		return
+		return p.startUDPProxyChecked(ep)
 	}
 
 	listenHost := "0.0.0.0"
@@ -427,13 +436,16 @@ func (p *ProxyManager) StartListener(ep ServiceEndpoint) {
 	p.mu.Lock()
 	if _, exists := p.listeners[ep.PublicPort]; exists {
 		p.mu.Unlock()
-		return
+		return nil
 	}
-	ln, err := net.Listen("tcp", addr)
+	listenTCP := p.listenTCP
+	if listenTCP == nil {
+		listenTCP = net.Listen
+	}
+	ln, err := listenTCP("tcp", addr)
 	if err != nil {
-		log.Printf("WARN: Failed to bind public listener on %s: %v", addr, err)
 		p.mu.Unlock()
-		return
+		return fmt.Errorf("bind public listener on %s: %w", addr, err)
 	}
 	p.listeners[ep.PublicPort] = ln
 	p.mu.Unlock()
@@ -452,6 +464,7 @@ func (p *ProxyManager) StartListener(ep ServiceEndpoint) {
 	default:
 		p.startTCPProxy(ln, ep)
 	}
+	return nil
 }
 
 func (p *ProxyManager) handleConn(ep ServiceEndpoint, client net.Conn) {

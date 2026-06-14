@@ -14,6 +14,7 @@ type PortAllocator struct {
 	nextPublic    int
 	usedHost      map[int]struct{}
 	usedPublic    map[string]struct{} // keyed by "port/proto" (e.g., "35001/tcp", "53/udp")
+	portAvailable func(host string, port int, network string) bool
 }
 
 func NewPortAllocator(hostBind, public PortRange) *PortAllocator {
@@ -39,11 +40,15 @@ func publicKey(port int, proto string) string {
 }
 
 func (a *PortAllocator) AllocatePair() (int, int, error) {
+	return a.allocatePair(false)
+}
+
+func (a *PortAllocator) allocatePair(udp bool) (int, int, error) {
 	hb, err := a.allocateHost()
 	if err != nil {
 		return 0, 0, err
 	}
-	pp, err := a.allocatePublic()
+	pp, err := a.allocatePublicForFlow(udp)
 	if err != nil {
 		a.freeHost(hb)
 		return 0, 0, err
@@ -57,7 +62,7 @@ func (a *PortAllocator) allocateHost() (int, error) {
 	for {
 		if _, ok := a.usedHost[hb]; !ok {
 			// Probe OS availability
-			if isPortFree("127.0.0.1", hb) {
+			if a.isPortAvailable("127.0.0.1", hb, "tcp") {
 				a.usedHost[hb] = struct{}{}
 				if hb >= a.nextHostBind {
 					a.nextHostBind = hb + 1
@@ -75,12 +80,21 @@ func (a *PortAllocator) allocateHost() (int, error) {
 
 // allocatePublic auto-allocates a TCP public port from the range.
 func (a *PortAllocator) allocatePublic() (int, error) {
+	return a.allocatePublicForFlow(false)
+}
+
+func (a *PortAllocator) allocatePublicForFlow(udp bool) (int, error) {
 	pp := a.nextInRange(a.nextPublic, a.publicRange)
 	startPP := pp
+	network := "tcp"
+	if udp {
+		network = "udp"
+	}
 	for {
 		key := publicKey(pp, "tcp")
 		if _, ok := a.usedPublic[key]; !ok {
-			if isPortFree("", pp) {
+			_, udpClaimed := a.usedPublic[publicKey(pp, "udp")]
+			if (!udp || !udpClaimed) && a.isPortAvailable("", pp, network) {
 				a.usedPublic[key] = struct{}{}
 				if pp >= a.nextPublic {
 					a.nextPublic = pp + 1
@@ -98,6 +112,13 @@ func (a *PortAllocator) allocatePublic() (int, error) {
 
 func isPortFree(host string, port int) bool {
 	return isPortAvailable(host, port, "tcp")
+}
+
+func (a *PortAllocator) isPortAvailable(host string, port int, network string) bool {
+	if a.portAvailable != nil {
+		return a.portAvailable(host, port, network)
+	}
+	return isPortAvailable(host, port, network)
 }
 
 func isPortAvailable(host string, port int, network string) bool {
@@ -187,7 +208,7 @@ func (a *PortAllocator) ClaimPublicPort(port int, udp bool) error {
 	if _, exists := a.usedPublic[key]; exists {
 		return fmt.Errorf("%s port %d already in use", network, port)
 	}
-	if !isPortAvailable("", port, network) {
+	if !a.isPortAvailable("", port, network) {
 		return fmt.Errorf("%s port %d not available on host", network, port)
 	}
 	a.usedPublic[key] = struct{}{}
@@ -218,5 +239,5 @@ func (a *PortAllocator) AllocateForClaim(portClaim *int, udp bool) (int, int, er
 		}
 		return hb, *portClaim, nil
 	}
-	return a.AllocatePair()
+	return a.allocatePair(udp)
 }

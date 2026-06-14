@@ -39,8 +39,9 @@ func syncBlockedReason(usedSecretOnlyInInitScript bool) string {
 // Operation timeouts for app lifecycle handlers. These are safety ceilings —
 // the real liveness check for pulls is the stall detector in PullImageWithProgress.
 const (
-	installTimeout        = 45 * time.Minute // image pull + flatten + container create + init scripts
-	cloneWorkspaceTimeout = 10 * time.Minute // LV snapshot + anchor pull + container create
+	installTimeout          = 45 * time.Minute // image pull + flatten + container create + init scripts
+	serviceAppUpdateTimeout = installTimeout
+	cloneWorkspaceTimeout   = 10 * time.Minute // LV snapshot + anchor pull + container create
 )
 
 var (
@@ -408,13 +409,14 @@ func (s *GinServer) handleGinAppConfigure(c *gin.Context) {
 func (s *GinServer) handleGinAppManifestConfigure(c *gin.Context) {
 	appName := c.Param("name")
 	var req struct {
-		AppDefinition string `json:"app_definition"`
+		AppDefinition  string `json:"app_definition"`
+		CatalogPending bool   `json:"catalog_pending"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
+	if err := c.ShouldBindJSON(&req); err != nil || (strings.TrimSpace(req.AppDefinition) == "" && !req.CatalogPending) {
 		writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
 		return
 	}
-	result, err := s.appManager.ConfigureCustomManifestUpdate(c.Request.Context(), appName, []byte(req.AppDefinition))
+	result, err := s.appManager.ConfigureCustomManifestUpdate(c.Request.Context(), appName, []byte(req.AppDefinition), req.CatalogPending)
 	if err != nil {
 		if handleManifestUpdateError(c, err, "prepare manifest update") {
 			return
@@ -434,8 +436,9 @@ func (s *GinServer) handleGinAppManifestDryRun(c *gin.Context) {
 		AppDefinition    string                 `json:"app_definition"`
 		Inputs           map[string]interface{} `json:"inputs"`
 		RegenerateInputs []string               `json:"regenerate_inputs"`
+		CatalogPending   bool                   `json:"catalog_pending"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.AppDefinition) == "" {
+	if err := c.ShouldBindJSON(&req); err != nil || (strings.TrimSpace(req.AppDefinition) == "" && !req.CatalogPending) {
 		writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected {app_definition}")
 		return
 	}
@@ -444,6 +447,7 @@ func (s *GinServer) handleGinAppManifestDryRun(c *gin.Context) {
 		RawTemplate:      []byte(req.AppDefinition),
 		Inputs:           req.Inputs,
 		RegenerateInputs: req.RegenerateInputs,
+		CatalogPending:   req.CatalogPending,
 		SystemContext:    s.buildInstallSystemContext(),
 	})
 	if err != nil {
@@ -465,6 +469,8 @@ func (s *GinServer) handleGinAppManifestUpdate(c *gin.Context) {
 		AppDefinition      string                 `json:"app_definition"`
 		Inputs             map[string]interface{} `json:"inputs"`
 		RegenerateInputs   []string               `json:"regenerate_inputs"`
+		Confirmations      []string               `json:"confirmations"`
+		CatalogPending     bool                   `json:"catalog_pending"`
 		BaseManifestHash   string                 `json:"base_manifest_hash"`
 		RuntimeFingerprint string                 `json:"runtime_fingerprint"`
 		DryRunToken        string                 `json:"dry_run_token"`
@@ -473,13 +479,15 @@ func (s *GinServer) handleGinAppManifestUpdate(c *gin.Context) {
 		writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected dry_run_token")
 		return
 	}
-	updateCtx, cancel := s.opContext(c, 10*time.Minute)
+	updateCtx, cancel := s.opContext(c, serviceAppUpdateTimeout)
 	defer cancel()
 	result, err := s.appManager.ApplyCustomManifestUpdate(updateCtx, app.ManifestUpdateRequest{
 		InstanceID:         appName,
 		RawTemplate:        []byte(req.AppDefinition),
 		Inputs:             req.Inputs,
 		RegenerateInputs:   req.RegenerateInputs,
+		Confirmations:      req.Confirmations,
+		CatalogPending:     req.CatalogPending,
 		SystemContext:      s.buildInstallSystemContext(),
 		BaseManifestHash:   req.BaseManifestHash,
 		RuntimeFingerprint: req.RuntimeFingerprint,
@@ -533,7 +541,7 @@ func (s *GinServer) handleGinAppConfigApply(c *gin.Context) {
 		writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected dry_run_token")
 		return
 	}
-	updateCtx, cancel := s.opContext(c, 10*time.Minute)
+	updateCtx, cancel := s.opContext(c, serviceAppUpdateTimeout)
 	defer cancel()
 	result, err := s.appManager.ApplyInstalledConfigUpdate(updateCtx, appName, req)
 	if err != nil {
@@ -953,6 +961,11 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 		}
 		return
 	}
+	pendingCatalogUpdate := s.appManager.PendingCatalogUpdateInfo(c.Request.Context(), appName)
+	appInstance.CatalogUpdatePending = pendingCatalogUpdate.Pending
+	appInstance.CatalogUpdatePendingHash = pendingCatalogUpdate.Hash
+	appInstance.CatalogUpdatePendingReason = pendingCatalogUpdate.Reason
+	appInstance.CatalogUpdatePendingFlow = pendingCatalogUpdate.Flow
 
 	// Include listener endpoints inline (keyed as "listeners" to avoid colliding with manifest services).
 	listeners, _ := s.serviceManager.GetByApp(appName)

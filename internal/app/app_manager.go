@@ -29,31 +29,32 @@ import (
 
 // AppManager manages application lifecycle with filesystem-based state storage
 type AppManager struct {
-	containerManager ContainerManager
-	stateManager     *FilesystemStateManager
-	stateBaseDir     string
-	stateInitMu      sync.Mutex
-	serviceManager   *services.ServiceManager
-	routeRegistrar   router.Registrar
-	progressReporter events.ProgressReporter
-	eventBus         *events.Bus
-	eventsMu         sync.Mutex
-	eventCancel      context.CancelFunc
-	eventSubCancels  []func()
-	eventsWG         sync.WaitGroup
-	reconcileMu      sync.Mutex
-	reconcileCancel  context.CancelFunc
-	reconcileWG      sync.WaitGroup
-	stateMu          sync.RWMutex
-	leadershipMu     sync.RWMutex
-	leadershipState  map[string]cluster.Role
-	lockReader       LockStateReader
-	volumeManager    persistence.VolumeManager
-	restoreMu        sync.Mutex
-	pendingRestore   bool
-	lockOverrideMu   sync.RWMutex
-	lockOverride     *bool
-	mountVerifier    func(string) error
+	containerManager      ContainerManager
+	stateManager          *FilesystemStateManager
+	stateBaseDir          string
+	stateInitMu           sync.Mutex
+	serviceManager        *services.ServiceManager
+	routeRegistrar        router.Registrar
+	progressReporter      events.ProgressReporter
+	eventBus              *events.Bus
+	eventsMu              sync.Mutex
+	eventCancel           context.CancelFunc
+	eventSubCancels       []func()
+	eventsWG              sync.WaitGroup
+	reconcileMu           sync.Mutex
+	reconcileCancel       context.CancelFunc
+	reconcileWG           sync.WaitGroup
+	stateMu               sync.RWMutex
+	leadershipMu          sync.RWMutex
+	leadershipState       map[string]cluster.Role
+	lockReader            LockStateReader
+	volumeManager         persistence.VolumeManager
+	restoreMu             sync.Mutex
+	pendingRestore        bool
+	lockOverrideMu        sync.RWMutex
+	lockOverride          *bool
+	mountVerifier         func(string) error
+	runtimeReadinessProbe func(context.Context, []services.ServiceEndpoint, time.Duration) error
 
 	// In-memory observed status: derived from container state during reconciliation.
 	// Published via event bus and returned in API responses. Never persisted.
@@ -197,6 +198,7 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		leadershipState:          make(map[string]cluster.Role),
 		lockReader:               lockReader,
 		mountVerifier:            defaultMountVerifier,
+		runtimeReadinessProbe:    defaultRuntimeReadinessProbe,
 		observedStatus:           make(map[string]string),
 		observedStatusMessage:    make(map[string]string),
 		oidcHostname:             "piccolo.local",
@@ -1209,12 +1211,14 @@ func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*
 	testCred := &syscall.Credential{Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid())}
 	testHome := "/tmp"
 	svc := services.NewServiceManager()
+	svc.UseInMemoryNetworkForTest()
 	return &AppManager{
 		containerManager:      containerManager,
 		stateBaseDir:          base,
 		serviceManager:        svc,
 		leadershipState:       make(map[string]cluster.Role),
 		mountVerifier:         testMountVerifier,
+		runtimeReadinessProbe: testRuntimeReadinessProbe,
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
 		oidcHostname:          "piccolo.local",
@@ -1246,6 +1250,7 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 		leadershipState:       make(map[string]cluster.Role),
 		lockReader:            lockReader,
 		mountVerifier:         testMountVerifier,
+		runtimeReadinessProbe: testRuntimeReadinessProbe,
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
 		oidcHostname:          "piccolo.local",
@@ -1277,6 +1282,12 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 	for _, app := range apps {
 		publishCID := strings.TrimSpace(app.PublishContainerID())
 		if publishCID == "" {
+			continue
+		}
+		if m.manifestUpdateServiceRestoreBlocked(state, app.InstanceID) {
+			if m.serviceManager != nil {
+				m.serviceManager.DeactivateApp(app.InstanceID)
+			}
 			continue
 		}
 		// Respect desired state: disabled apps should not have proxies restored.
@@ -1323,6 +1334,30 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 		}
 		m.configureOIDCAuthorizePaths(app.InstanceID, def)
 		m.serviceManager.SetAppContainerID(app.InstanceID, publishCID)
+	}
+}
+
+func (m *AppManager) manifestUpdateServiceRestoreBlocked(state *FilesystemStateManager, instanceID string) bool {
+	txn, err := state.LoadManifestUpdateTransaction(instanceID)
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		log.Printf("WARN: restore services: manifest update transaction unreadable for %s: %v", instanceID, err)
+		return true
+	}
+	switch txn.Phase {
+	case "committed", "committed_cleanup_pending":
+		return false
+	case "committed_metadata_pending", "access_published":
+		if txn.AccessPublished {
+			return false
+		}
+		log.Printf("INFO: restore services: skipping %s while manifest update recovery owns phase %s", instanceID, txn.Phase)
+		return true
+	default:
+		log.Printf("INFO: restore services: skipping %s while manifest update recovery owns phase %s", instanceID, txn.Phase)
+		return true
 	}
 }
 
@@ -2022,6 +2057,7 @@ func (m *AppManager) List(ctx context.Context) ([]*AppInstance, error) {
 		if copy.Status == "" {
 			copy.Status = StatusStopped
 		}
+		m.decorateAppResponseState(state, &copy)
 		apps[i] = &copy
 	}
 	return apps, nil
@@ -2044,7 +2080,33 @@ func (m *AppManager) Get(ctx context.Context, instanceID string) (*AppInstance, 
 	if app.Status == "" {
 		app.Status = StatusStopped
 	}
+	m.decorateAppResponseState(state, &app)
 	return &app, nil
+}
+
+func (m *AppManager) decorateAppResponseState(state *FilesystemStateManager, app *AppInstance) {
+	if state == nil || app == nil || strings.TrimSpace(app.InstanceID) == "" {
+		return
+	}
+	txn, err := state.LoadManifestUpdateTransaction(app.InstanceID)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		log.Printf("WARN: app response %s: load manifest update transaction: %v", app.InstanceID, err)
+		return
+	}
+	if txn == nil || txn.AccessPublished || txn.Phase != "publishing_access" {
+		return
+	}
+	app.AccessRepairPending = true
+	message := strings.TrimSpace(txn.LastError)
+	if message == "" {
+		message = "Update committed, but access publication needs repair."
+	} else if !strings.HasPrefix(message, "Update committed") {
+		message = "Update committed, but access publication needs repair: " + message
+	}
+	app.AccessRepairMessage = message
 }
 
 // GetAppDefinition returns the full definition (app.yaml content) for an installed app instance.
@@ -2484,6 +2546,14 @@ func isDigestPinned(img string) bool {
 type dataVolumeSnapshotter interface {
 	SnapshotDataVolume(ctx context.Context, instanceID, snapshotLVName string) error
 	DestroyDataSnapshot(ctx context.Context, snapshotLVName string) error
+}
+
+type dataSnapshotViabilityChecker interface {
+	CheckDataSnapshotViability(ctx context.Context, instanceID string) error
+}
+
+type dataSnapshotHealthChecker interface {
+	CheckDataSnapshotHealth(ctx context.Context, snapshotLVName string) error
 }
 
 // dataVolumeRollbacker is a narrow interface for data volume rollback operations.

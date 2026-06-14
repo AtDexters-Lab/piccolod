@@ -2,9 +2,11 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -53,6 +55,11 @@ type ServiceManager struct {
 	// subsequent RemoveApp can still emit a permanent removal event for cert cleanup.
 	deactivated map[string][]events.ServiceEndpointInfo
 
+	// preparedReservations tracks committed prepared endpoints that own
+	// allocator reservations while access repair is pending, even if proxy
+	// publication failed before the registry could be swapped.
+	preparedReservations map[string]map[string]ServiceEndpoint
+
 	// App status tracking for health check suppression
 	appTransient    map[string]time.Time // app ID → time entered transient state
 	appTransientMu  sync.RWMutex
@@ -73,16 +80,58 @@ func NewServiceManager() *ServiceManager {
 		PortRange{Start: 35000, End: 45000},
 	)
 	return &ServiceManager{
-		allocator:     allocator,
-		registry:      make(map[string]map[string]ServiceEndpoint),
-		proxyManager:  NewProxyManager(),
-		stopCh:        make(chan struct{}),
-		containerIDs:  make(map[string]string),
-		leadership:    make(map[string]cluster.Role),
-		backendHealth: NewBackendHealthState(),
-		deactivated:   make(map[string][]events.ServiceEndpointInfo),
-		appTransient:  make(map[string]time.Time),
+		allocator:            allocator,
+		registry:             make(map[string]map[string]ServiceEndpoint),
+		proxyManager:         NewProxyManager(),
+		stopCh:               make(chan struct{}),
+		containerIDs:         make(map[string]string),
+		leadership:           make(map[string]cluster.Role),
+		backendHealth:        NewBackendHealthState(),
+		deactivated:          make(map[string][]events.ServiceEndpointInfo),
+		preparedReservations: make(map[string]map[string]ServiceEndpoint),
+		appTransient:         make(map[string]time.Time),
 	}
+}
+
+// UseInMemoryNetworkForTest disables OS socket probes/listens for unit tests.
+func (m *ServiceManager) UseInMemoryNetworkForTest() {
+	m.allocator.portAvailable = func(host string, port int, network string) bool {
+		return true
+	}
+	m.proxyManager.listenTCP = func(network, address string) (net.Listener, error) {
+		return inMemoryTestListener{}, nil
+	}
+	m.proxyManager.listenUDP = func(network string, laddr *net.UDPAddr) (udpPacketConn, error) {
+		return inMemoryTestUDPConn{}, nil
+	}
+}
+
+type inMemoryTestListener struct{}
+
+func (inMemoryTestListener) Accept() (net.Conn, error) {
+	return nil, net.ErrClosed
+}
+
+func (inMemoryTestListener) Close() error {
+	return nil
+}
+
+func (inMemoryTestListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+type inMemoryTestUDPConn struct{}
+
+func (inMemoryTestUDPConn) ReadFromUDP([]byte) (int, *net.UDPAddr, error) {
+	return 0, nil, net.ErrClosed
+}
+
+func (inMemoryTestUDPConn) WriteToUDP(payload []byte, addr *net.UDPAddr) (int, error) {
+	return len(payload), nil
+}
+
+func (inMemoryTestUDPConn) Close() error {
+	return nil
 }
 
 // PortUnpublisher abstracts remote unpublish notifications (e.g., Nexus).
@@ -149,6 +198,182 @@ func (m *ServiceManager) releaseEndpointPorts(ep ServiceEndpoint) {
 	} else {
 		m.allocator.ReleasePublic(ep.PublicPort)
 	}
+}
+
+func endpointPublicAllocationKey(ep ServiceEndpoint) string {
+	if ep.PortClaim != nil {
+		return publicKey(ep.PublicPort, ep.Flow.TransportProtocol())
+	}
+	return publicKey(ep.PublicPort, "tcp")
+}
+
+func (m *ServiceManager) releaseEndpointPublicAllocation(ep ServiceEndpoint) {
+	if ep.PortClaim != nil {
+		m.allocator.FreePublicProto(ep.PublicPort, ep.Flow.TransportProtocol())
+	} else {
+		m.allocator.ReleasePublic(ep.PublicPort)
+	}
+}
+
+func (m *ServiceManager) endpointHostOwnerLocked(host int) (string, string, bool) {
+	for appName, mapp := range m.registry {
+		for name, ep := range mapp {
+			if ep.HostBind == host {
+				return appName, name, true
+			}
+		}
+	}
+	for appName, mapp := range m.preparedReservations {
+		for name, ep := range mapp {
+			if ep.HostBind == host {
+				return appName, name, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func (m *ServiceManager) endpointPublicOwnerLocked(key string) (string, string, bool) {
+	for appName, mapp := range m.registry {
+		for name, ep := range mapp {
+			if endpointPublicAllocationKey(ep) == key {
+				return appName, name, true
+			}
+		}
+	}
+	for appName, mapp := range m.preparedReservations {
+		for name, ep := range mapp {
+			if endpointPublicAllocationKey(ep) == key {
+				return appName, name, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func (m *ServiceManager) endpointTransportPublicOwnerLocked(port int, protocol string) (string, string, bool) {
+	for appName, mapp := range m.registry {
+		for name, ep := range mapp {
+			if ep.PublicPort == port && ep.Flow.TransportProtocol() == protocol {
+				return appName, name, true
+			}
+		}
+	}
+	for appName, mapp := range m.preparedReservations {
+		for name, ep := range mapp {
+			if ep.PublicPort == port && ep.Flow.TransportProtocol() == protocol {
+				return appName, name, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func (m *ServiceManager) ensurePortClaimAvailableLocked(appName, listenerName string, port int, flow api.ListenerFlow, allowSameOwner bool) error {
+	protocol := flow.TransportProtocol()
+	ownerApp, ownerName, exists := m.endpointTransportPublicOwnerLocked(port, protocol)
+	if !exists {
+		return nil
+	}
+	if allowSameOwner && ownerApp == appName && ownerName == listenerName {
+		return nil
+	}
+	return fmt.Errorf("%s port %d already owned by %s/%s", protocol, port, ownerApp, ownerName)
+}
+
+func (m *ServiceManager) allocateForListenerLocked(appName string, l api.AppListener, allowSameOwner bool) (int, int, error) {
+	if l.PortClaim != nil {
+		if err := m.ensurePortClaimAvailableLocked(appName, l.Name, *l.PortClaim, l.Flow, allowSameOwner); err != nil {
+			return 0, 0, err
+		}
+	}
+	return m.allocator.AllocateForClaim(l.PortClaim, l.Flow == api.FlowUDP)
+}
+
+func (m *ServiceManager) endpointPublicationRunningLocked(ep ServiceEndpoint) bool {
+	if m.proxyManager == nil {
+		return false
+	}
+	m.proxyManager.mu.Lock()
+	defer m.proxyManager.mu.Unlock()
+	if ep.Flow == api.FlowUDP {
+		_, ok := m.proxyManager.udpListeners[ep.PublicPort]
+		return ok
+	}
+	_, ok := m.proxyManager.listeners[ep.PublicPort]
+	return ok
+}
+
+func (m *ServiceManager) releaseStalePreparedReservationsLocked(appName string, keepHosts map[int]struct{}, keepPublic map[string]struct{}) {
+	reserved := m.preparedReservations[appName]
+	if len(reserved) == 0 {
+		return
+	}
+	for _, ep := range reserved {
+		if _, keep := keepHosts[ep.HostBind]; !keep {
+			m.allocator.ReleaseHost(ep.HostBind)
+		}
+		if _, keep := keepPublic[endpointPublicAllocationKey(ep)]; !keep {
+			m.releaseEndpointPublicAllocation(ep)
+		}
+	}
+	delete(m.preparedReservations, appName)
+}
+
+func cloneEndpointMap(endpoints map[string]ServiceEndpoint) map[string]ServiceEndpoint {
+	if len(endpoints) == 0 {
+		return nil
+	}
+	out := make(map[string]ServiceEndpoint, len(endpoints))
+	for name, ep := range endpoints {
+		out[name] = ep
+	}
+	return out
+}
+
+func (m *ServiceManager) retainPreparedReservationsLocked(appName string, endpoints map[string]ServiceEndpoint) {
+	newHosts := make(map[int]struct{}, len(endpoints))
+	newPublic := make(map[string]struct{}, len(endpoints))
+	for _, ep := range endpoints {
+		m.allocator.usedHost[ep.HostBind] = struct{}{}
+		publicKey := endpointPublicAllocationKey(ep)
+		m.allocator.usedPublic[publicKey] = struct{}{}
+		newHosts[ep.HostBind] = struct{}{}
+		newPublic[publicKey] = struct{}{}
+	}
+	m.releaseStalePreparedReservationsLocked(appName, newHosts, newPublic)
+	if len(endpoints) > 0 {
+		m.preparedReservations[appName] = cloneEndpointMap(endpoints)
+	}
+}
+
+func (m *ServiceManager) reservePreparedPublicationLocked(appName string, endpoints map[string]ServiceEndpoint) error {
+	for name, ep := range endpoints {
+		if ownerApp, ownerName, ok := m.endpointHostOwnerLocked(ep.HostBind); ok && ownerApp != appName {
+			return fmt.Errorf("restore prepared publication: host bind %d for %s/%s already owned by %s/%s", ep.HostBind, appName, name, ownerApp, ownerName)
+		}
+		if _, used := m.allocator.usedHost[ep.HostBind]; used {
+			if ownerApp, _, ok := m.endpointHostOwnerLocked(ep.HostBind); !ok || ownerApp != appName {
+				return fmt.Errorf("restore prepared publication: host bind %d already reserved", ep.HostBind)
+			}
+		}
+		publicKey := endpointPublicAllocationKey(ep)
+		if ownerApp, ownerName, ok := m.endpointPublicOwnerLocked(publicKey); ok && ownerApp != appName {
+			return fmt.Errorf("restore prepared publication: public port %s for %s/%s already owned by %s/%s", publicKey, appName, name, ownerApp, ownerName)
+		}
+		if _, used := m.allocator.usedPublic[publicKey]; used {
+			if ownerApp, _, ok := m.endpointPublicOwnerLocked(publicKey); !ok || ownerApp != appName {
+				return fmt.Errorf("restore prepared publication: public port %s already reserved", publicKey)
+			}
+		}
+		if m.endpointPublicationRunningLocked(ep) {
+			if ownerApp, _, ok := m.endpointPublicOwnerLocked(publicKey); !ok || ownerApp != appName {
+				return fmt.Errorf("restore prepared publication: public listener %s already running", publicKey)
+			}
+		}
+	}
+	m.retainPreparedReservationsLocked(appName, endpoints)
+	return nil
 }
 
 func (m *ServiceManager) closeFirewallClaim(ep ServiceEndpoint) {
@@ -509,25 +734,44 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 		var public int
 		var err error
 		if l.PortClaim != nil {
-			err = m.allocator.ClaimPublicPort(*l.PortClaim, l.Flow == api.FlowUDP)
+			err = m.ensurePortClaimAvailableLocked(appName, l.Name, *l.PortClaim, l.Flow, false)
+			if err == nil {
+				err = m.allocator.ClaimPublicPort(*l.PortClaim, l.Flow == api.FlowUDP)
+			}
 			if err == nil {
 				public = *l.PortClaim
 			}
 		} else {
-			public, err = m.allocator.AllocatePublic()
+			public, err = m.allocator.allocatePublicForFlow(l.Flow == api.FlowUDP)
 		}
 		if err != nil {
 			m.allocator.freeHost(host)
-			return endpoints, err
+			for _, allocated := range endpoints {
+				m.releaseEndpointPorts(allocated)
+			}
+			m.rebuildPortClaimCache()
+			return nil, err
 		}
 		isPrimary := l.Name == primaryName
 		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l))
 		ep := buildEndpoint(appName, l, host, public, isPrimary, hostLabel)
 		registry[l.Name] = ep
 		endpoints = append(endpoints, ep)
-		m.openFirewallClaim(ep)
-		m.proxyManager.StartListener(ep)
-		m.notifyPublish(ep.PublicPort)
+	}
+
+	started := 0
+	for _, ep := range endpoints {
+		if err := m.startEndpointPublicationLocked(ep); err != nil {
+			for _, startedEp := range endpoints[:started] {
+				m.stopEndpointPublicationLocked(startedEp)
+			}
+			for _, allocated := range endpoints {
+				m.releaseEndpointPorts(allocated)
+			}
+			m.rebuildPortClaimCache()
+			return nil, err
+		}
+		started++
 	}
 
 	if len(registry) > 0 {
@@ -562,9 +806,10 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 	}
 
 	endpoints := make([]ServiceEndpoint, 0, len(listeners))
+	registry := make(map[string]ServiceEndpoint, len(listeners))
 
 	for _, l := range listeners {
-		hb, pp, err := m.allocator.AllocateForClaim(l.PortClaim, l.Flow == api.FlowUDP)
+		hb, pp, err := m.allocateForListenerLocked(appName, l, false)
 		if err != nil {
 			// Roll back ports allocated by previous iterations.
 			for _, ep := range endpoints {
@@ -578,21 +823,32 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l))
 		ep := buildEndpoint(appName, l, hb, pp, isPrimary, hostLabel)
 		endpoints = append(endpoints, ep)
-		if _, ok := m.registry[appName]; !ok {
-			m.registry[appName] = make(map[string]ServiceEndpoint)
-		}
-		m.registry[appName][l.Name] = ep
+		registry[l.Name] = ep
 	}
-
-	// Clear any stashed deactivated state from prior stop.
-	delete(m.deactivated, appName)
 
 	// Start proxies and open firewall for port claims
+	started := 0
 	for _, ep := range endpoints {
-		m.openFirewallClaim(ep)
-		m.proxyManager.StartListener(ep)
-		m.notifyPublish(ep.PublicPort)
+		if err := m.startEndpointPublicationLocked(ep); err != nil {
+			for _, startedEp := range endpoints[:started] {
+				m.stopEndpointPublicationLocked(startedEp)
+			}
+			for _, allocated := range endpoints {
+				m.releaseEndpointPorts(allocated)
+			}
+			delete(m.registry, appName)
+			m.rebuildPortClaimCache()
+			return nil, err
+		}
+		started++
 	}
+	if len(registry) > 0 {
+		m.registry[appName] = registry
+	} else {
+		delete(m.registry, appName)
+	}
+	// Clear any stashed deactivated state from prior stop.
+	delete(m.deactivated, appName)
 
 	m.rebuildPortClaimCache()
 
@@ -1169,11 +1425,126 @@ type ReconcileResult struct {
 	ProxyOnlyChanged []ServiceEndpoint
 }
 
-// Reconcile synchronizes listeners for an app in-place. Returns final endpoints and whether container changes are required.
-func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) (ReconcileResult, bool, error) {
+type endpointReplacement struct {
+	Old ServiceEndpoint
+	New ServiceEndpoint
+}
+
+// PreparedReconcile holds allocated candidate listener endpoints that have not
+// yet been published to proxy/firewall/registry state.
+type PreparedReconcile struct {
+	manager         *ServiceManager
+	appName         string
+	result          ReconcileResult
+	containerChange bool
+	newMap          map[string]ServiceEndpoint
+	allocated       []ServiceEndpoint
+	claimReserved   []ServiceEndpoint
+	start           []ServiceEndpoint
+	stopRelease     []ServiceEndpoint
+	proxyRestart    []endpointReplacement
+	claimUpdate     []endpointReplacement
+	healthRemove    []ServiceEndpoint
+	published       bool
+	released        bool
+	retainedRepair  bool
+}
+
+func (p *PreparedReconcile) Result() ReconcileResult {
+	if p == nil {
+		return ReconcileResult{}
+	}
+	return p.result
+}
+
+func (p *PreparedReconcile) Endpoints() []ServiceEndpoint {
+	if p == nil {
+		return nil
+	}
+	out := make([]ServiceEndpoint, len(p.result.Endpoints))
+	copy(out, p.result.Endpoints)
+	return out
+}
+
+func (p *PreparedReconcile) ContainerChange() bool {
+	if p == nil {
+		return false
+	}
+	return p.containerChange
+}
+
+// Release abandons prepared endpoint allocations without publishing them.
+func (p *PreparedReconcile) Release() {
+	if p == nil || p.manager == nil {
+		return
+	}
+	p.manager.mu.Lock()
+	defer p.manager.mu.Unlock()
+	if p.published || p.released {
+		return
+	}
+	if p.retainedRepair {
+		p.released = true
+		return
+	}
+	for _, ep := range p.allocated {
+		p.manager.releaseEndpointPorts(ep)
+	}
+	for _, ep := range p.claimReserved {
+		p.manager.releaseEndpointPublicAllocation(ep)
+	}
+	p.manager.rebuildPortClaimCache()
+	p.released = true
+}
+
+// RetainReservationsForRepair records prepared endpoint ownership after a
+// durable commit crossed but publication failed. This keeps same-process repair
+// from treating the retained allocator reservations as ownerless conflicts.
+func (p *PreparedReconcile) RetainReservationsForRepair() {
+	if p == nil || p.manager == nil {
+		return
+	}
+	p.manager.mu.Lock()
+	defer p.manager.mu.Unlock()
+	if p.published || p.released {
+		return
+	}
+	p.manager.retainPreparedReservationsLocked(p.appName, p.newMap)
+	p.retainedRepair = true
+	p.released = true
+}
+
+// Publish makes the prepared endpoint set authoritative and starts/stops public
+// proxy/firewall/remote publication state.
+func (p *PreparedReconcile) Publish() (ReconcileResult, bool, error) {
+	if p == nil || p.manager == nil {
+		return ReconcileResult{}, false, fmt.Errorf("prepared reconcile is nil")
+	}
+	p.manager.mu.Lock()
+	defer p.manager.mu.Unlock()
+	if p.released {
+		return ReconcileResult{}, false, fmt.Errorf("prepared reconcile already released")
+	}
+	if p.published {
+		return p.result, p.containerChange, nil
+	}
+	if err := p.manager.publishPreparedReconcileLocked(p); err != nil {
+		return ReconcileResult{}, false, err
+	}
+	p.published = true
+	return p.result, p.containerChange, nil
+}
+
+// PrepareReconcile allocates candidate listener endpoints without publishing
+// them to proxy/firewall/registry state. Call Publish after the durable commit
+// boundary, or Release on rollback.
+func (m *ServiceManager) PrepareReconcile(appName string, listeners []api.AppListener) (*PreparedReconcile, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.prepareReconcileLocked(appName, listeners)
+}
 
+func (m *ServiceManager) prepareReconcileLocked(appName string, listeners []api.AppListener) (*PreparedReconcile, error) {
 	existing := m.registry[appName]
 	if existing == nil {
 		existing = make(map[string]ServiceEndpoint)
@@ -1184,12 +1555,37 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 
 	// Check for host label collisions before making changes
 	if err := m.checkHostLabelCollisions(appName, listeners, primaryName); err != nil {
-		return ReconcileResult{}, false, err
+		return nil, err
 	}
 
 	newMap := make(map[string]ServiceEndpoint)
 	containerChange := false
 	result := ReconcileResult{}
+	incomingNames := make(map[string]struct{}, len(listeners))
+	for _, l := range listeners {
+		incomingNames[l.Name] = struct{}{}
+	}
+	removedByClaim := make(map[string]ServiceEndpoint)
+	for name, ep := range existing {
+		if _, keep := incomingNames[name]; keep || ep.PortClaim == nil {
+			continue
+		}
+		removedByClaim[publicKey(*ep.PortClaim, ep.Flow.TransportProtocol())] = ep
+	}
+	reusedRemoved := make(map[string]struct{})
+	prepared := &PreparedReconcile{
+		manager: m,
+		appName: appName,
+		newMap:  newMap,
+	}
+	releasePrepared := func() {
+		for _, ep := range prepared.allocated {
+			m.releaseEndpointPorts(ep)
+		}
+		for _, ep := range prepared.claimReserved {
+			m.releaseEndpointPublicAllocation(ep)
+		}
+	}
 
 	// Index new by name
 	for _, l := range listeners {
@@ -1197,27 +1593,28 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 		hostLabel := hostname.DeriveHostLabel(appName, l.Name, isPrimary, IsEligibleForHostRouting(l))
 
 		if old, ok := existing[l.Name]; ok {
-			// If port claim changed, treat as remove + add (different public port).
-			if portClaimChanged(old.PortClaim, l.PortClaim) {
-				// Tear down old
-				m.proxyManager.StopEndpoint(old.PublicPort, old.Flow)
-				m.closeFirewallClaim(old)
-				m.releaseEndpointPorts(old)
-				m.notifyUnpublish(old.PublicPort)
+			// If the public claim or transport changes, treat as remove + add
+			// because allocator/firewall ownership is protocol-specific.
+			reuseCurrentPublicClaim := portClaimChanged(old.PortClaim, l.PortClaim) &&
+				l.PortClaim != nil &&
+				*l.PortClaim == old.PublicPort &&
+				old.Flow.TransportProtocol() == l.Flow.TransportProtocol()
+			if !reuseCurrentPublicClaim && (portClaimChanged(old.PortClaim, l.PortClaim) || old.Flow.TransportProtocol() != l.Flow.TransportProtocol()) {
 				result.Removed = append(result.Removed, old)
+				prepared.stopRelease = append(prepared.stopRelease, old)
 
 				// Allocate new
-				hb, pp, err := m.allocator.AllocateForClaim(l.PortClaim, l.Flow == api.FlowUDP)
+				hb, pp, err := m.allocateForListenerLocked(appName, l, false)
 				if err != nil {
-					return ReconcileResult{}, false, err
+					releasePrepared()
+					return nil, err
 				}
 				newEp := buildEndpoint(appName, l, hb, pp, isPrimary, hostLabel)
 				newMap[l.Name] = newEp
-				m.openFirewallClaim(newEp)
-				m.proxyManager.StartListener(newEp)
+				prepared.allocated = append(prepared.allocated, newEp)
+				prepared.start = append(prepared.start, newEp)
 				containerChange = true
 				result.Added = append(result.Added, newEp)
-				m.notifyPublish(newEp.PublicPort)
 				continue
 			}
 
@@ -1235,49 +1632,75 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 			if endpointMDNSVisibilityChanged(old, newEp) {
 				result.Updated = append(result.Updated, newEp)
 			}
+			if reuseCurrentPublicClaim {
+				oldKey := endpointPublicAllocationKey(old)
+				newKey := endpointPublicAllocationKey(newEp)
+				if oldKey != newKey {
+					if err := m.ensurePortClaimAvailableLocked(appName, l.Name, newEp.PublicPort, newEp.Flow, true); err != nil {
+						releasePrepared()
+						return nil, err
+					}
+					if _, exists := m.allocator.usedPublic[newKey]; exists {
+						releasePrepared()
+						return nil, fmt.Errorf("%s port %d already in use", newEp.Flow.TransportProtocol(), newEp.PublicPort)
+					}
+					m.allocator.usedPublic[newKey] = struct{}{}
+					prepared.claimReserved = append(prepared.claimReserved, newEp)
+				}
+				prepared.claimUpdate = append(prepared.claimUpdate, endpointReplacement{Old: old, New: newEp})
+				result.Updated = append(result.Updated, newEp)
+			}
 
 			if proxyConfigChanged(old, newEp) {
-				m.proxyManager.StopEndpoint(old.PublicPort, old.Flow)
-				m.proxyManager.StartListener(newEp)
+				prepared.proxyRestart = append(prepared.proxyRestart, endpointReplacement{Old: old, New: newEp})
 				result.ProxyOnlyChanged = append(result.ProxyOnlyChanged, newEp)
-				m.notifyPublish(newEp.PublicPort)
 			}
 
 			newMap[l.Name] = newEp
 		} else {
+			if l.PortClaim != nil {
+				claimKey := publicKey(*l.PortClaim, l.Flow.TransportProtocol())
+				if old, ok := removedByClaim[claimKey]; ok {
+					if _, used := reusedRemoved[old.Name]; !used {
+						newEp := buildEndpoint(appName, l, old.HostBind, old.PublicPort, isPrimary, hostLabel)
+						newMap[l.Name] = newEp
+						prepared.proxyRestart = append(prepared.proxyRestart, endpointReplacement{Old: old, New: newEp})
+						prepared.healthRemove = append(prepared.healthRemove, old)
+						reusedRemoved[old.Name] = struct{}{}
+						containerChange = true
+						result.Removed = append(result.Removed, old)
+						result.Added = append(result.Added, newEp)
+						continue
+					}
+				}
+			}
 			// New listener: allocate ports, start proxy, mark container change
-			hb, pp, err := m.allocator.AllocateForClaim(l.PortClaim, l.Flow == api.FlowUDP)
+			hb, pp, err := m.allocateForListenerLocked(appName, l, false)
 			if err != nil {
-				return ReconcileResult{}, false, err
+				releasePrepared()
+				return nil, err
 			}
 			ep := buildEndpoint(appName, l, hb, pp, isPrimary, hostLabel)
 			newMap[l.Name] = ep
-			m.openFirewallClaim(ep)
-			m.proxyManager.StartListener(ep)
+			prepared.allocated = append(prepared.allocated, ep)
+			prepared.start = append(prepared.start, ep)
 			containerChange = true
 			result.Added = append(result.Added, ep)
-			m.notifyPublish(ep.PublicPort)
 		}
 	}
 
 	// Removed listeners
 	for name, ep := range existing {
 		if _, ok := newMap[name]; !ok {
-			m.proxyManager.StopEndpoint(ep.PublicPort, ep.Flow)
-			m.closeFirewallClaim(ep)
-			m.releaseEndpointPorts(ep)
+			if _, reused := reusedRemoved[name]; reused {
+				continue
+			}
 			containerChange = true
 			result.Removed = append(result.Removed, ep)
-			m.notifyUnpublish(ep.PublicPort)
-			if m.backendHealth != nil {
-				m.backendHealth.RemoveEndpoint(ep.endpointKey())
-			}
+			prepared.stopRelease = append(prepared.stopRelease, ep)
+			prepared.healthRemove = append(prepared.healthRemove, ep)
 		}
 	}
-
-	// Save
-	m.registry[appName] = newMap
-	m.rebuildPortClaimCache()
 
 	// Return endpoints slice
 	var eps []ServiceEndpoint
@@ -1285,18 +1708,152 @@ func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) 
 		eps = append(eps, ep)
 	}
 	result.Endpoints = eps
+	prepared.result = result
+	prepared.containerChange = containerChange
+	return prepared, nil
+}
+
+func (m *ServiceManager) startEndpointPublicationLocked(ep ServiceEndpoint) error {
+	m.openFirewallClaim(ep)
+	if err := m.proxyManager.StartListenerChecked(ep); err != nil {
+		m.closeFirewallClaim(ep)
+		return fmt.Errorf("start listener %s/%s public %d: %w", ep.App, ep.Name, ep.PublicPort, err)
+	}
+	m.notifyPublish(ep.PublicPort)
+	return nil
+}
+
+func (m *ServiceManager) stopEndpointPublicationLocked(ep ServiceEndpoint) {
+	m.proxyManager.StopEndpoint(ep.PublicPort, ep.Flow)
+	m.closeFirewallClaim(ep)
+	m.notifyUnpublish(ep.PublicPort)
+}
+
+func (m *ServiceManager) publishPreparedReconcileLocked(prepared *PreparedReconcile) error {
+	wasDeactivated := len(m.deactivated[prepared.appName]) > 0
+	started := []ServiceEndpoint{}
+	restarted := []endpointReplacement{}
+	startedKeys := make(map[string]struct{})
+	rollbackStarted := func(cause error) error {
+		errs := []error{cause}
+		for i := len(started) - 1; i >= 0; i-- {
+			m.stopEndpointPublicationLocked(started[i])
+		}
+		for i := len(restarted) - 1; i >= 0; i-- {
+			replacement := restarted[i]
+			if wasDeactivated {
+				m.stopEndpointPublicationLocked(replacement.New)
+				continue
+			}
+			m.proxyManager.StopEndpoint(replacement.New.PublicPort, replacement.New.Flow)
+			if err := m.proxyManager.StartListenerChecked(replacement.Old); err != nil {
+				errs = append(errs, fmt.Errorf("restore listener %s/%s public %d: %w", replacement.Old.App, replacement.Old.Name, replacement.Old.PublicPort, err))
+			}
+		}
+		return errors.Join(errs...)
+	}
+
+	for _, replacement := range prepared.proxyRestart {
+		m.proxyManager.StopEndpoint(replacement.Old.PublicPort, replacement.Old.Flow)
+		var err error
+		if wasDeactivated {
+			err = m.startEndpointPublicationLocked(replacement.New)
+		} else if startErr := m.proxyManager.StartListenerChecked(replacement.New); startErr != nil {
+			err = fmt.Errorf("restart listener %s/%s public %d: %w", replacement.New.App, replacement.New.Name, replacement.New.PublicPort, startErr)
+		}
+		if err != nil {
+			if !wasDeactivated {
+				if restoreErr := m.proxyManager.StartListenerChecked(replacement.Old); restoreErr != nil {
+					err = errors.Join(err, fmt.Errorf("restore listener %s/%s public %d: %w", replacement.Old.App, replacement.Old.Name, replacement.Old.PublicPort, restoreErr))
+				}
+			}
+			return rollbackStarted(err)
+		}
+		restarted = append(restarted, replacement)
+		startedKeys[replacement.New.endpointKey()] = struct{}{}
+	}
+	for _, ep := range prepared.start {
+		if err := m.startEndpointPublicationLocked(ep); err != nil {
+			return rollbackStarted(err)
+		}
+		started = append(started, ep)
+		startedKeys[ep.endpointKey()] = struct{}{}
+	}
+	for _, replacement := range prepared.claimUpdate {
+		if wasDeactivated {
+			if _, alreadyStarted := startedKeys[replacement.New.endpointKey()]; alreadyStarted {
+				continue
+			}
+			if err := m.startEndpointPublicationLocked(replacement.New); err != nil {
+				return rollbackStarted(err)
+			}
+			started = append(started, replacement.New)
+			startedKeys[replacement.New.endpointKey()] = struct{}{}
+		} else {
+			m.closeFirewallClaim(replacement.Old)
+			m.openFirewallClaim(replacement.New)
+		}
+	}
+	if wasDeactivated {
+		for _, ep := range prepared.newMap {
+			if _, alreadyStarted := startedKeys[ep.endpointKey()]; alreadyStarted {
+				continue
+			}
+			if err := m.startEndpointPublicationLocked(ep); err != nil {
+				return rollbackStarted(err)
+			}
+			started = append(started, ep)
+			startedKeys[ep.endpointKey()] = struct{}{}
+		}
+	}
+	for _, replacement := range prepared.claimUpdate {
+		oldKey := endpointPublicAllocationKey(replacement.Old)
+		newKey := endpointPublicAllocationKey(replacement.New)
+		if oldKey != newKey {
+			m.allocator.usedPublic[newKey] = struct{}{}
+			delete(m.allocator.usedPublic, oldKey)
+		}
+	}
+	for _, ep := range prepared.stopRelease {
+		if !wasDeactivated {
+			m.stopEndpointPublicationLocked(ep)
+		}
+		m.releaseEndpointPorts(ep)
+	}
+	for _, ep := range prepared.healthRemove {
+		if m.backendHealth != nil {
+			m.backendHealth.RemoveEndpoint(ep.endpointKey())
+		}
+	}
+
+	m.registry[prepared.appName] = prepared.newMap
+	m.rebuildPortClaimCache()
+	delete(m.deactivated, prepared.appName)
 
 	// Publish endpoint changes (non-blocking). Listener config changes are
 	// permanent — removed endpoints will not come back.
-	if len(result.Added) > 0 || len(result.Updated) > 0 || len(result.Removed) > 0 {
+	if len(prepared.result.Added) > 0 || len(prepared.result.Updated) > 0 || len(prepared.result.Removed) > 0 {
 		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
-			App:     appName,
-			Added:   endpointInfoSlice(result.Added),
-			Updated: endpointInfoSlice(result.Updated),
-			Removed: endpointInfoSlice(result.Removed),
+			App:     prepared.appName,
+			Added:   endpointInfoSlice(prepared.result.Added),
+			Updated: endpointInfoSlice(prepared.result.Updated),
+			Removed: endpointInfoSlice(prepared.result.Removed),
 		})
 	}
+	return nil
+}
 
+// Reconcile synchronizes listeners for an app in-place. Returns final endpoints and whether container changes are required.
+func (m *ServiceManager) Reconcile(appName string, listeners []api.AppListener) (ReconcileResult, bool, error) {
+	prepared, err := m.PrepareReconcile(appName, listeners)
+	if err != nil {
+		return ReconcileResult{}, false, err
+	}
+	result, containerChange, err := prepared.Publish()
+	if err != nil {
+		prepared.Release()
+		return ReconcileResult{}, false, err
+	}
 	return result, containerChange, nil
 }
 
@@ -1308,7 +1865,9 @@ func middlewareEqual(a, b []api.AppProtocolMiddleware) bool {
 		if a[i].Name != b[i].Name {
 			return false
 		}
-		// Params equality elided for v1
+		if !reflect.DeepEqual(a[i].Params, b[i].Params) {
+			return false
+		}
 	}
 	return true
 }
@@ -1409,6 +1968,169 @@ func (m *ServiceManager) DeactivateApp(appName string) {
 	m.removeAppEndpoints(appName, false)
 }
 
+// SuspendAppPublication temporarily closes an app's public/remote publication
+// while preserving registry endpoints and their allocated ports. Container
+// recreation can still reuse the existing HostBind mappings, and
+// ResumeAppPublication can restore the same public surface after commit.
+func (m *ServiceManager) SuspendAppPublication(appName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mapp, ok := m.registry[appName]
+	if !ok {
+		return
+	}
+	endpoints := make([]ServiceEndpoint, 0, len(mapp))
+	for _, ep := range mapp {
+		endpoints = append(endpoints, ep)
+		m.proxyManager.StopEndpoint(ep.PublicPort, ep.Flow)
+		m.closeFirewallClaim(ep)
+		m.notifyUnpublish(ep.PublicPort)
+		if m.backendHealth != nil {
+			m.backendHealth.RemoveEndpoint(ep.endpointKey())
+		}
+	}
+	if len(endpoints) > 0 {
+		info := endpointInfoSlice(endpoints)
+		m.deactivated[appName] = info
+		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+			App:         appName,
+			Deactivated: info,
+		})
+	}
+}
+
+// ResumeAppPublication restarts proxy/firewall/remote publication for an app
+// whose registry endpoints were preserved by SuspendAppPublication.
+func (m *ServiceManager) ResumeAppPublication(appName string) {
+	if err := m.ResumeAppPublicationChecked(appName); err != nil {
+		log.Printf("WARN: resume app publication %s: %v", appName, err)
+	}
+}
+
+// ResumeAppPublicationChecked restarts publication and reports listener bind
+// failures to callers that need transaction recovery to remain open.
+func (m *ServiceManager) ResumeAppPublicationChecked(appName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mapp, ok := m.registry[appName]
+	if !ok {
+		return nil
+	}
+	endpoints := make([]ServiceEndpoint, 0, len(mapp))
+	started := []ServiceEndpoint{}
+	for _, ep := range mapp {
+		endpoints = append(endpoints, ep)
+		if err := m.startEndpointPublicationLocked(ep); err != nil {
+			for i := len(started) - 1; i >= 0; i-- {
+				m.stopEndpointPublicationLocked(started[i])
+			}
+			return err
+		}
+		started = append(started, ep)
+	}
+	delete(m.deactivated, appName)
+	if len(endpoints) > 0 {
+		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+			App:   appName,
+			Added: endpointInfoSlice(endpoints),
+		})
+	}
+	return nil
+}
+
+// RestorePreparedPublication publishes a prepared endpoint set that was
+// durably recorded before a manifest update commit. It is used during recovery
+// when the in-memory PreparedReconcile was lost after the ledger crossed.
+func (m *ServiceManager) RestorePreparedPublication(appName string, endpoints []ServiceEndpoint) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	newMap := make(map[string]ServiceEndpoint, len(endpoints))
+	newHosts := make(map[int]struct{}, len(endpoints))
+	newPublic := make(map[string]struct{}, len(endpoints))
+	added := make([]ServiceEndpoint, 0, len(endpoints))
+	for _, ep := range endpoints {
+		if ep.Name == "" {
+			return fmt.Errorf("restore prepared publication: endpoint name is required")
+		}
+		if ep.App == "" {
+			ep.App = appName
+		}
+		newMap[ep.Name] = ep
+		newHosts[ep.HostBind] = struct{}{}
+		newPublic[endpointPublicAllocationKey(ep)] = struct{}{}
+		added = append(added, ep)
+	}
+	if err := m.reservePreparedPublicationLocked(appName, newMap); err != nil {
+		return err
+	}
+
+	var removed []ServiceEndpoint
+	wasDeactivated := len(m.deactivated[appName]) > 0
+	stoppedExisting := []ServiceEndpoint{}
+	if existing, ok := m.registry[appName]; ok {
+		for _, ep := range existing {
+			removed = append(removed, ep)
+			if !wasDeactivated {
+				m.stopEndpointPublicationLocked(ep)
+				stoppedExisting = append(stoppedExisting, ep)
+			}
+		}
+	}
+	started := []ServiceEndpoint{}
+	rollbackRestore := func(cause error) error {
+		errs := []error{cause}
+		for i := len(started) - 1; i >= 0; i-- {
+			m.stopEndpointPublicationLocked(started[i])
+		}
+		if !wasDeactivated {
+			for i := len(stoppedExisting) - 1; i >= 0; i-- {
+				ep := stoppedExisting[i]
+				if err := m.startEndpointPublicationLocked(ep); err != nil {
+					errs = append(errs, fmt.Errorf("restore listener %s/%s public %d: %w", ep.App, ep.Name, ep.PublicPort, err))
+				}
+			}
+		}
+		return errors.Join(errs...)
+	}
+	for _, ep := range added {
+		if err := m.startEndpointPublicationLocked(ep); err != nil {
+			return rollbackRestore(err)
+		}
+		started = append(started, ep)
+	}
+	for _, ep := range removed {
+		if m.backendHealth != nil {
+			m.backendHealth.RemoveEndpoint(ep.endpointKey())
+		}
+		if _, keep := newHosts[ep.HostBind]; !keep {
+			m.allocator.ReleaseHost(ep.HostBind)
+		}
+		if _, keep := newPublic[endpointPublicAllocationKey(ep)]; !keep {
+			if ep.PortClaim != nil {
+				m.allocator.FreePublicProto(ep.PublicPort, ep.Flow.TransportProtocol())
+			} else {
+				m.allocator.ReleasePublic(ep.PublicPort)
+			}
+		}
+	}
+	if len(newMap) > 0 {
+		m.registry[appName] = newMap
+	} else {
+		delete(m.registry, appName)
+	}
+	m.rebuildPortClaimCache()
+	delete(m.deactivated, appName)
+	delete(m.preparedReservations, appName)
+	if len(added) > 0 || len(removed) > 0 {
+		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+			App:     appName,
+			Added:   endpointInfoSlice(added),
+			Removed: endpointInfoSlice(removed),
+		})
+	}
+	return nil
+}
+
 // RemoveApp permanently removes all endpoints for an app (uninstall, failed install).
 // Downstream listeners (e.g., cert cleanup) act on the permanent signal.
 func (m *ServiceManager) RemoveApp(appName string) {
@@ -1439,6 +2161,9 @@ func (m *ServiceManager) removeAppEndpoints(appName string, permanent bool) {
 			}
 		}
 		delete(m.registry, appName)
+	}
+	if permanent {
+		m.releaseStalePreparedReservationsLocked(appName, nil, nil)
 	}
 	m.rebuildPortClaimCache()
 	delete(m.containerIDs, appName)

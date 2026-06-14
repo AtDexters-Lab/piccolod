@@ -512,6 +512,33 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 	}
 
 	diffKind := classifyDiff(curDef, newDef)
+	requiresPrecommitSnapshot := false
+	if diffKind != DiffKindOIDCLibraryOnly {
+		updatePolicy, _ := evaluateCustomManifestUpdatePolicy(curDef, newDef)
+		requiresPrecommitSnapshot = updatePolicy.Classification.DataSafety != nil && updatePolicy.Classification.DataSafety.SnapshotRequired
+		if !updatePolicy.Stageable {
+			reason := strings.TrimSpace(updatePolicy.Reason)
+			if reason == "" {
+				reason = "catalog update rejected by service app update policy"
+			} else {
+				reason = "catalog update rejected by service app update policy: " + reason
+			}
+			return m.recordSyncFailure(state, appInst, newHash, errors.New(reason))
+		}
+		if !updatePolicy.Allowed {
+			reason := strings.TrimSpace(updatePolicy.Reason)
+			if reason == "" {
+				reason = "catalog update requires operator review"
+			} else {
+				reason = "catalog update requires operator review: " + reason
+			}
+			if err := m.storePendingRenderedCatalogManifestReviewSource(state, instanceID, installSt, rawBytes, errors.New(reason)); err != nil {
+				log.Printf("WARN: catalog sync %s: store pending service-app update source: %v", instanceID, err)
+			}
+			return m.recordSyncFailure(state, appInst, newHash, errors.New(reason))
+		}
+	}
+
 	switch diffKind {
 	case DiffKindNone:
 		renderInstallSt.markCatalogSourceCommitted(instanceID, appInst.CatalogSource, rawBytes)
@@ -563,6 +590,7 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		CandidateLedgerSourceHash: nextInstallSt.RawTemplateHash,
 		RuntimeFingerprint:        runtimeFingerprint,
 		MetadataOnly:              diffKind == DiffKindOIDCLibraryOnly,
+		RequiresPrecommitSnapshot: requiresPrecommitSnapshot,
 		ApplyPhase:                taskPhaseApplyingManifest,
 		ApplyMessage:              "Persisting catalog manifest",
 		FinalizingMessage:         "Saving catalog config ledger",
@@ -580,9 +608,7 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 	// commitHash bumps CatalogManifestHash to newHash and persists it. Called
 	// only on success paths after the apply (or no-op-write paths) commits.
 	commitHash := func() error {
-		appInst.CatalogManifestHash = newHash
-		appInst.LastSyncError = ""
-		return state.StoreAppMetadata(appInst)
+		return storeCommittedCatalogMetadata(state, appInst, newHash)
 	}
 
 	if err := applyTxn.persistCandidateManifest(); err != nil {
@@ -640,11 +666,20 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 	if err := applyTxn.commitLedger(nextInstallSt); err != nil {
 		return m.recordSyncFailure(state, appInst, newHash, err)
 	}
+	var catalogMetadataErr error
 	if err := commitHash(); err != nil {
-		// Apply succeeded but hash commit failed — log and let next pass
-		// re-detect drift and re-apply (which will short-circuit on
-		// canonical equality and just bump the hash).
-		log.Printf("WARN: catalog sync %s: persist hash post-apply: %v", instanceID, err)
+		catalogMetadataErr = err
+		log.Printf("WARN: catalog sync %s: committed catalog metadata pending retry: %v", instanceID, err)
+	}
+	if err := applyTxn.publishAccess(); err != nil {
+		if catalogMetadataErr != nil {
+			err = errors.Join(err, catalogMetadataErr)
+		}
+		return errors.New(applyTxn.markAccessRepairPending(err))
+	}
+	if catalogMetadataErr != nil {
+		applyTxn.markCatalogMetadataPending(catalogMetadataErr)
+		return nil
 	}
 	applyTxn.complete()
 	log.Printf("INFO: catalog sync %s: applied %s", instanceID, diffKind)
@@ -671,6 +706,20 @@ func (m *AppManager) storePendingCatalogConfigSource(state *FilesystemStateManag
 	if _, err := ParseAppSchema(raw); err != nil {
 		return nil
 	}
+	return m.storePendingCatalogSourceForFlow(state, instanceID, st, raw, cause, pendingCatalogReviewFlowConfig)
+}
+
+// storePendingRenderedCatalogManifestReviewSource is for sync paths that already
+// rendered and validated the candidate manifest. The raw template may include
+// block directives that only become valid YAML after render.
+func (m *AppManager) storePendingRenderedCatalogManifestReviewSource(state *FilesystemStateManager, instanceID string, st *InstallState, raw []byte, cause error) error {
+	if state == nil || st == nil || st.IsLegacyBackfill || st.SchemaVersion < installStateSchemaVersionConfig {
+		return nil
+	}
+	return m.storePendingCatalogSourceForFlow(state, instanceID, st, raw, cause, pendingCatalogReviewFlowManifest)
+}
+
+func (m *AppManager) storePendingCatalogSourceForFlow(state *FilesystemStateManager, instanceID string, st *InstallState, raw []byte, cause error, flow string) error {
 	next, err := st.Clone()
 	if err != nil {
 		return err
@@ -679,7 +728,7 @@ func (m *AppManager) storePendingCatalogConfigSource(state *FilesystemStateManag
 	if reason == "" {
 		reason = "catalog sync render failed"
 	}
-	if !next.markPendingCatalogSource(instanceID, raw, reason) {
+	if !next.markPendingCatalogSourceForFlow(instanceID, raw, reason, flow) {
 		return nil
 	}
 	return state.StoreInstallState(instanceID, next)
@@ -791,6 +840,17 @@ func (m *AppManager) recreateContainersInPlace(
 	removeDef *api.AppDefinition,
 	appInst *AppInstance,
 ) error {
+	return m.recreateContainersInPlaceWithHook(ctx, instanceID, newDef, removeDef, appInst, nil)
+}
+
+func (m *AppManager) recreateContainersInPlaceWithHook(
+	ctx context.Context,
+	instanceID string,
+	newDef *api.AppDefinition,
+	removeDef *api.AppDefinition,
+	appInst *AppInstance,
+	beforeInstall func() error,
+) error {
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return err
@@ -806,7 +866,7 @@ func (m *AppManager) recreateContainersInPlace(
 	}
 
 	if err := m.removeContainersForMultiApp(ctx, appInst, removeDef, runtime); err != nil {
-		log.Printf("WARN: catalog sync %s: remove containers: %v", instanceID, err)
+		return fmt.Errorf("remove previous containers: %w", err)
 	}
 
 	// Compute endpoints. If the listener set changed between removeDef and
@@ -816,10 +876,12 @@ func (m *AppManager) recreateContainersInPlace(
 	if removeDef != nil && reflect.DeepEqual(removeDef.Listeners, newDef.Listeners) {
 		endpoints, _ = m.serviceManager.GetByApp(instanceID)
 		if len(endpoints) == 0 {
-			var allocErr error
-			endpoints, allocErr = m.serviceManager.AllocateForApp(instanceID, newDef.Listeners)
-			if allocErr != nil {
-				return fmt.Errorf("allocate endpoints: %w", allocErr)
+			if !allowMissingListenerEndpointsForTest() {
+				var allocErr error
+				endpoints, allocErr = m.serviceManager.AllocateForApp(instanceID, newDef.Listeners)
+				if allocErr != nil {
+					return fmt.Errorf("allocate endpoints: %w", allocErr)
+				}
 			}
 		}
 	} else {
@@ -830,6 +892,11 @@ func (m *AppManager) recreateContainersInPlace(
 		endpoints = result.Endpoints
 	}
 	m.configureOIDCAuthorizePaths(instanceID, newDef)
+	if beforeInstall != nil {
+		if err := beforeInstall(); err != nil {
+			return err
+		}
+	}
 
 	var prebuiltRootfs map[string]*rootfsMountInfo
 	if rootfs := m.currentRootfsManager(); rootfs != nil {
@@ -845,6 +912,7 @@ func (m *AppManager) recreateContainersInPlace(
 	appInst.NetworkAnchorID = result.NetworkAnchorID
 	appInst.Containers = result.Containers
 	appInst.PrimaryService = result.PrimaryService
+	appInst.ActiveRootfs = activeRootfsForDefinition(appInst.ActiveRootfs, newDef)
 	if err := state.StoreApp(appInst); err != nil {
 		return fmt.Errorf("persist container ids: %w", err)
 	}

@@ -26,6 +26,7 @@ type MockContainerManager struct {
 	removeImageErr         error
 	reloadedContainers     []string
 	reloadErr              error
+	inspectImageHook       func(imageName string) (*container.ImageConfig, error)
 }
 
 type mockContainer struct {
@@ -276,7 +277,9 @@ func (m *MockContainerManager) RemoveImage(ctx context.Context, runtime containe
 func (m *MockContainerManager) InspectImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) (*container.ImageConfig, error) {
 	_ = ctx
 	_ = runtime
-	_ = imageName
+	if m.inspectImageHook != nil {
+		return m.inspectImageHook(imageName)
+	}
 	// Mock: return a typical image config with shell defaults
 	return &container.ImageConfig{
 		Entrypoint:  nil,
@@ -325,7 +328,12 @@ func generateMockContainerID(id int) string {
 // stubRootfsManager is a minimal RootfsVolumeManager for unit tests.
 // It creates real temp directories so mount paths resolve for container specs.
 type stubRootfsManager struct {
-	baseDir string // temp dir for mock mount points
+	baseDir    string // temp dir for mock mount points
+	exists     map[string]bool
+	detached   []string
+	destroyed  []string
+	detachErr  error
+	destroyErr error
 }
 
 func newStubRootfsManager(baseDir string) *stubRootfsManager {
@@ -351,6 +359,9 @@ func (s *stubRootfsManager) CreateServiceRootfs(_ context.Context, req persisten
 	}
 	mp := filepath.Join(s.baseDir, "rootfs", volID)
 	os.MkdirAll(mp, 0o755)
+	if s.exists != nil {
+		s.exists[volID] = true
+	}
 	return persistence.RootfsHandle{VolumeID: volID, MountPath: mp, ReadOnly: true}, nil
 }
 
@@ -367,11 +378,25 @@ func (s *stubRootfsManager) ListClones(_ context.Context, _ string) ([]string, e
 func (s *stubRootfsManager) AttachRootfs(_ context.Context, volumeID string) (persistence.RootfsHandle, error) {
 	mp := filepath.Join(s.baseDir, "rootfs", volumeID)
 	os.MkdirAll(mp, 0o755)
+	if s.exists != nil {
+		s.exists[volumeID] = true
+	}
 	return persistence.RootfsHandle{VolumeID: volumeID, MountPath: mp, ReadOnly: true}, nil
 }
 
-func (s *stubRootfsManager) DetachRootfs(_ context.Context, _ string) error  { return nil }
-func (s *stubRootfsManager) DestroyRootfs(_ context.Context, _ string) error { return nil }
+func (s *stubRootfsManager) DetachRootfs(_ context.Context, volumeID string) error {
+	s.detached = append(s.detached, volumeID)
+	return s.detachErr
+}
+
+func (s *stubRootfsManager) DestroyRootfs(_ context.Context, volumeID string) error {
+	s.destroyed = append(s.destroyed, volumeID)
+	if s.exists != nil {
+		delete(s.exists, volumeID)
+	}
+	return s.destroyErr
+}
+
 func (s *stubRootfsManager) GarbageCollectGoldenLVs(_ context.Context) error { return nil }
 func (s *stubRootfsManager) ReconcileRootfsStates(_ context.Context) error   { return nil }
 
@@ -385,7 +410,12 @@ func (s *stubRootfsManager) RootfsVolumeID(mode, instanceID string) string {
 	return fmt.Sprintf("%s-%s", mode, instanceID)
 }
 
-func (s *stubRootfsManager) RootfsExists(_ string) bool { return true }
+func (s *stubRootfsManager) RootfsExists(volumeID string) bool {
+	if s.exists != nil {
+		return s.exists[volumeID]
+	}
+	return true
+}
 func (s *stubRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool) {
 	return "", "", false
 }

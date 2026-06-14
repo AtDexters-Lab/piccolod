@@ -130,6 +130,28 @@ func TestAllocateForClaim(t *testing.T) {
 	})
 }
 
+func TestAllocateForClaimAutoUDPSkipsUDPUnavailablePort(t *testing.T) {
+	alloc := NewPortAllocator(PortRange{Start: 15000, End: 15010}, PortRange{Start: 35000, End: 35002})
+	alloc.portAvailable = func(host string, port int, network string) bool {
+		_ = host
+		return !(network == "udp" && port == 35000)
+	}
+
+	_, public, err := alloc.AllocateForClaim(nil, true)
+	if err != nil {
+		t.Fatalf("allocate auto udp: %v", err)
+	}
+	if public != 35001 {
+		t.Fatalf("public port = %d, want 35001 after skipping UDP-unavailable 35000", public)
+	}
+	if _, ok := alloc.usedPublic[publicKey(35000, "tcp")]; ok {
+		t.Fatalf("UDP-unavailable port was reserved under auto key")
+	}
+	if _, ok := alloc.usedPublic[publicKey(35001, "tcp")]; !ok {
+		t.Fatalf("allocated UDP auto port not tracked under auto key")
+	}
+}
+
 func TestFreePublicProto(t *testing.T) {
 	alloc := NewPortAllocator(PortRange{Start: 15000, End: 25000}, PortRange{Start: 35000, End: 45000})
 	// Claim both TCP and UDP on port 53

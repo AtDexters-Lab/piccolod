@@ -27,6 +27,9 @@ const (
 	InputProvenanceGenerated      = "generated"
 	InputProvenanceSystem         = "system"
 	InputProvenanceLegacyUnknown  = "legacy_unknown"
+
+	pendingCatalogReviewFlowConfig   = "config"
+	pendingCatalogReviewFlowManifest = "manifest_review"
 )
 
 var (
@@ -86,20 +89,22 @@ type InstalledConfigActionSummary struct {
 }
 
 type InstalledConfigUpdateResult struct {
-	InstanceID         string                         `json:"instance_id"`
-	LedgerRevision     int64                          `json:"ledger_revision"`
-	SourceHash         string                         `json:"source_hash"`
-	InputSchemaHash    string                         `json:"input_schema_hash"`
-	BaseManifestHash   string                         `json:"base_manifest_hash"`
-	RuntimeFingerprint string                         `json:"runtime_fingerprint"`
-	DryRunToken        string                         `json:"dry_run_token,omitempty"`
-	CandidateDigest    string                         `json:"candidate_digest,omitempty"`
-	DiffKind           string                         `json:"diff_kind"`
-	Applicable         bool                           `json:"applicable"`
-	BlockingReason     string                         `json:"blocking_reason,omitempty"`
-	MetadataOnly       bool                           `json:"metadata_only"`
-	Actions            []InstalledConfigActionSummary `json:"actions,omitempty"`
-	Summary            ManifestUpdateSummary          `json:"summary"`
+	InstanceID          string                         `json:"instance_id"`
+	LedgerRevision      int64                          `json:"ledger_revision"`
+	SourceHash          string                         `json:"source_hash"`
+	InputSchemaHash     string                         `json:"input_schema_hash"`
+	BaseManifestHash    string                         `json:"base_manifest_hash"`
+	RuntimeFingerprint  string                         `json:"runtime_fingerprint"`
+	DryRunToken         string                         `json:"dry_run_token,omitempty"`
+	CandidateDigest     string                         `json:"candidate_digest,omitempty"`
+	DiffKind            string                         `json:"diff_kind"`
+	Applicable          bool                           `json:"applicable"`
+	BlockingReason      string                         `json:"blocking_reason,omitempty"`
+	MetadataOnly        bool                           `json:"metadata_only"`
+	AccessRepairPending bool                           `json:"access_repair_pending,omitempty"`
+	AccessRepairMessage string                         `json:"access_repair_message,omitempty"`
+	Actions             []InstalledConfigActionSummary `json:"actions,omitempty"`
+	Summary             ManifestUpdateSummary          `json:"summary"`
 }
 
 type installedConfigCandidate struct {
@@ -113,6 +118,7 @@ type installedConfigCandidate struct {
 	CandidateDigest    string
 	DiffKind           DiffKind
 	MetadataOnly       bool
+	RequiresSnapshot   bool
 	Definition         *api.AppDefinition
 	InstallState       *InstallState
 	Actions            []InstalledConfigActionSummary
@@ -122,9 +128,10 @@ type installedConfigCandidate struct {
 }
 
 type installedConfigPolicyResult struct {
-	Allowed      bool
-	Reason       string
-	MetadataOnly bool
+	Allowed          bool
+	Reason           string
+	MetadataOnly     bool
+	RequiresSnapshot bool
 }
 
 func NewV2InstallState(instanceID, sourceKind, sourceRef string, rawTemplate []byte, inputs map[string]interface{}, systemCtx InstallSystemContext, creds *OIDCCredentials, syncBlocked bool) *InstallState {
@@ -249,21 +256,104 @@ func (st *InstallState) pendingCatalogSource() ([]byte, string, string, bool) {
 	return st.PendingRawTemplate, hash, st.PendingReason, true
 }
 
+func (st *InstallState) pendingCatalogSourceForFlow(flow string) ([]byte, string, string, bool) {
+	pendingRaw, hash, reason, ok := st.pendingCatalogSource()
+	if !ok {
+		return nil, "", reason, false
+	}
+	if st.pendingCatalogReviewFlow() != normalizePendingCatalogReviewFlow(flow) {
+		return nil, "", "", false
+	}
+	return pendingRaw, hash, reason, true
+}
+
+func (st *InstallState) pendingCatalogReviewFlow() string {
+	if st == nil {
+		return pendingCatalogReviewFlowConfig
+	}
+	if flow := normalizePendingCatalogReviewFlow(st.PendingReviewFlow); flow != "" {
+		return flow
+	}
+	// Older pending sources did not record a consumer. Preserve config-render
+	// fallback, but route the known service-app review reason to the manifest
+	// review flow so Edit Config cannot consume it after an upgrade.
+	reason := strings.ToLower(strings.TrimSpace(st.PendingReason))
+	if strings.Contains(reason, "operator review") || strings.Contains(reason, "service app update policy") {
+		return pendingCatalogReviewFlowManifest
+	}
+	return pendingCatalogReviewFlowConfig
+}
+
+func normalizePendingCatalogReviewFlow(flow string) string {
+	switch strings.TrimSpace(flow) {
+	case pendingCatalogReviewFlowConfig, pendingCatalogReviewFlowManifest:
+		return strings.TrimSpace(flow)
+	default:
+		return ""
+	}
+}
+
+type PendingCatalogUpdateInfo struct {
+	Pending bool   `json:"pending"`
+	Hash    string `json:"hash,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Flow    string `json:"flow,omitempty"`
+}
+
+func (m *AppManager) PendingCatalogUpdateInfo(ctx context.Context, instanceID string) PendingCatalogUpdateInfo {
+	_ = ctx
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return PendingCatalogUpdateInfo{}
+	}
+	st, err := state.LoadInstallState(instanceID)
+	if err != nil {
+		return PendingCatalogUpdateInfo{}
+	}
+	_, hash, reason, ok := st.pendingCatalogSource()
+	if !ok {
+		return PendingCatalogUpdateInfo{}
+	}
+	return PendingCatalogUpdateInfo{Pending: true, Hash: hash, Reason: reason, Flow: st.pendingCatalogReviewFlow()}
+}
+
+func storeCommittedCatalogMetadata(state *FilesystemStateManager, appInst *AppInstance, sourceHash string) error {
+	if state == nil || appInst == nil || strings.TrimSpace(appInst.CatalogSource) == "" || strings.TrimSpace(sourceHash) == "" {
+		return nil
+	}
+	appInst.CatalogManifestHash = sourceHash
+	appInst.LastSyncAttemptHash = ""
+	appInst.LastSyncError = ""
+	if err := state.StoreAppMetadata(appInst); err != nil {
+		return fmt.Errorf("persist committed catalog metadata: %w", err)
+	}
+	return nil
+}
+
 func (st *InstallState) markPendingCatalogSource(instanceID string, raw []byte, reason string) bool {
+	return st.markPendingCatalogSourceForFlow(instanceID, raw, reason, pendingCatalogReviewFlowConfig)
+}
+
+func (st *InstallState) markPendingCatalogSourceForFlow(instanceID string, raw []byte, reason string, flow string) bool {
 	if st == nil || len(bytes.TrimSpace(raw)) == 0 {
 		return false
+	}
+	flow = normalizePendingCatalogReviewFlow(flow)
+	if flow == "" {
+		flow = pendingCatalogReviewFlowConfig
 	}
 	hash := Sha256Hex(raw)
 	if st.InstanceID == "" {
 		st.InstanceID = instanceID
 	}
-	if bytes.Equal(st.PendingRawTemplate, raw) && st.PendingRawTemplateHash == hash && st.PendingReason == reason {
+	if bytes.Equal(st.PendingRawTemplate, raw) && st.PendingRawTemplateHash == hash && st.PendingReason == reason && st.pendingCatalogReviewFlow() == flow {
 		return false
 	}
 	st.SchemaVersion = installStateSchemaVersionConfig
 	st.PendingRawTemplate = append([]byte(nil), raw...)
 	st.PendingRawTemplateHash = hash
 	st.PendingReason = reason
+	st.PendingReviewFlow = flow
 	st.Revision++
 	if st.Revision <= 0 {
 		st.Revision = 1
@@ -278,6 +368,7 @@ func (st *InstallState) clearPendingCatalogSource() {
 	st.PendingRawTemplate = nil
 	st.PendingRawTemplateHash = ""
 	st.PendingReason = ""
+	st.PendingReviewFlow = ""
 }
 
 func (st *InstallState) markCatalogSourceCommitted(instanceID, catalogSource string, raw []byte) {
@@ -355,6 +446,35 @@ func catalogSyncRenderInputsForRawTemplate(instanceID string, raw []byte, inputs
 	return backfillInputDefaults(schema.Inputs, filteredInputs), true
 }
 
+type schemaOnlyOIDCGenerator struct{}
+
+func (schemaOnlyOIDCGenerator) GenerateCredentials() (string, string, error) {
+	return "__schema_only_client_id__", "__schema_only_client_secret__", nil
+}
+
+func (m *AppManager) schemaForInstallStateRawTemplate(ctx context.Context, instanceID string, raw []byte, st *InstallState) (*api.AppDefinition, error) {
+	schema, parseErr := ParseAppSchema(raw)
+	if parseErr == nil {
+		PrepareSmartDefaultsForUpdate(schema, instanceID)
+		return schema, nil
+	}
+	if st == nil || st.InstallSystemCtx == nil {
+		return nil, parseErr
+	}
+	res, err := RunInstallPipeline(ctx, InstallPipelineInput{
+		RawTemplate:   raw,
+		UserInputs:    st.InstallInputs,
+		SystemContext: *st.InstallSystemCtx,
+		InstanceID:    instanceID,
+		ExistingOIDC:  st.OIDCCredentials,
+	}, schemaOnlyOIDCGenerator{}, m.syncSelfSkippingLister(instanceID))
+	if err != nil {
+		return nil, fmt.Errorf("parse raw schema: %v; render stored source for schema: %w", parseErr, err)
+	}
+	PrepareSmartDefaultsForUpdate(res.Definition, instanceID)
+	return res.Definition, nil
+}
+
 func (m *AppManager) ReadInstalledConfig(ctx context.Context, instanceID string) (*InstalledConfigReadResult, error) {
 	if err := m.ensureUnlocked(); err != nil {
 		return nil, err
@@ -390,16 +510,15 @@ func (m *AppManager) ReadInstalledConfig(ctx context.Context, instanceID string)
 	rawTemplate := st.RawTemplate
 	sourceHash := st.RawTemplateHash
 	pendingReason := ""
-	if pendingRaw, pendingHash, reason, ok := st.pendingCatalogSource(); ok {
+	if pendingRaw, pendingHash, reason, ok := st.pendingCatalogSourceForFlow(pendingCatalogReviewFlowConfig); ok {
 		rawTemplate = pendingRaw
 		sourceHash = pendingHash
 		pendingReason = reason
 	}
-	schema, err := ParseAppSchema(rawTemplate)
+	schema, err := m.schemaForInstallStateRawTemplate(ctx, instanceID, rawTemplate, st)
 	if err != nil {
 		return unrecoverableInstalledConfig(instanceID, "stored app source cannot be parsed"), nil
 	}
-	PrepareSmartDefaultsForUpdate(schema, instanceID)
 	fields := installedConfigFields(schema.Inputs, st)
 	result := &InstalledConfigReadResult{
 		InstanceID:      instanceID,
@@ -412,7 +531,7 @@ func (m *AppManager) ReadInstalledConfig(ctx context.Context, instanceID string)
 		Fields:          fields,
 	}
 	if pendingReason != "" {
-		result.Warnings = append(result.Warnings, "pending catalog update needs config values before sync can apply: "+pendingReason)
+		result.Warnings = append(result.Warnings, "pending catalog update requires attention: "+pendingReason)
 	}
 	if appInst.Mode() != ModeService {
 		result.Warnings = append(result.Warnings, "workspace config apply is not supported in v1")
@@ -551,10 +670,13 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 
+	accessRepairPending := false
 	m.emitProgress(ctx, taskTypeUpdateConfig, instanceID, taskPhaseValidating, 0, "Validating config update", false, nil)
 	defer func() {
 		if err != nil {
 			m.emitProgress(ctx, taskTypeUpdateConfig, instanceID, taskPhaseComplete, 100, "Config update failed", true, err)
+		} else if accessRepairPending {
+			m.emitProgress(ctx, taskTypeUpdateConfig, instanceID, taskPhaseComplete, 100, "Config update applied; access repair pending", true, nil)
 		} else {
 			m.emitProgress(ctx, taskTypeUpdateConfig, instanceID, taskPhaseComplete, 100, "Config update complete", true, nil)
 		}
@@ -608,7 +730,7 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 		return nil, fmt.Errorf("%w: config ledger is incomplete or corrupted; reload config form", ErrInstalledConfigConflict)
 	}
 	currentSourceHash := currentState.RawTemplateHash
-	if _, pendingHash, _, ok := currentState.pendingCatalogSource(); ok {
+	if _, pendingHash, _, ok := currentState.pendingCatalogSourceForFlow(pendingCatalogReviewFlowConfig); ok {
 		currentSourceHash = pendingHash
 	}
 	if currentState.Revision != cand.LedgerRevision || currentSourceHash != cand.SourceHash {
@@ -655,6 +777,7 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 		DryRunToken:               cand.Token,
 		RuntimeFingerprint:        cand.RuntimeFingerprint,
 		MetadataOnly:              cand.MetadataOnly,
+		RequiresPrecommitSnapshot: cand.RequiresSnapshot,
 		ApplyPhase:                taskPhaseApplyingConfig,
 		ApplyMessage:              "Persisting rendered config",
 		FinalizingMessage:         "Saving config ledger",
@@ -671,29 +794,42 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 	if err := applyTxn.commitLedger(cand.InstallState); err != nil {
 		return nil, err
 	}
+	var catalogMetadataErr error
 	if cand.InstallState.SourceKind == InstallSourceKindCatalog &&
 		appInst.CatalogSource != "" &&
 		currentState.RawTemplateHash != cand.InstallState.RawTemplateHash {
-		appInst.CatalogManifestHash = cand.InstallState.RawTemplateHash
-		appInst.LastSyncError = ""
-		if err := state.StoreAppMetadata(appInst); err != nil {
-			log.Printf("WARN: config update %s: persist catalog hash after pending source apply: %v", instanceID, err)
+		if err := storeCommittedCatalogMetadata(state, appInst, cand.InstallState.RawTemplateHash); err != nil {
+			catalogMetadataErr = err
+			log.Printf("WARN: config update %s: committed catalog metadata pending retry: %v", instanceID, err)
 		}
 	}
-	applyTxn.complete()
+	accessRepairMessage := ""
+	if err := applyTxn.publishAccess(); err != nil {
+		accessRepairPending = true
+		if catalogMetadataErr != nil {
+			err = errors.Join(err, catalogMetadataErr)
+		}
+		accessRepairMessage = applyTxn.markAccessRepairPending(err)
+	} else if catalogMetadataErr != nil {
+		applyTxn.markCatalogMetadataPending(catalogMetadataErr)
+	} else {
+		applyTxn.complete()
+	}
 	return &InstalledConfigUpdateResult{
-		InstanceID:         instanceID,
-		LedgerRevision:     cand.InstallState.Revision,
-		SourceHash:         cand.SourceHash,
-		InputSchemaHash:    cand.InputSchemaHash,
-		BaseManifestHash:   cand.BaseManifestHash,
-		RuntimeFingerprint: cand.RuntimeFingerprint,
-		CandidateDigest:    cand.CandidateDigest,
-		DiffKind:           cand.DiffKind.String(),
-		Applicable:         true,
-		MetadataOnly:       cand.MetadataOnly,
-		Actions:            cand.Actions,
-		Summary:            cand.Summary,
+		InstanceID:          instanceID,
+		LedgerRevision:      cand.InstallState.Revision,
+		SourceHash:          cand.SourceHash,
+		InputSchemaHash:     cand.InputSchemaHash,
+		BaseManifestHash:    cand.BaseManifestHash,
+		RuntimeFingerprint:  cand.RuntimeFingerprint,
+		CandidateDigest:     cand.CandidateDigest,
+		DiffKind:            cand.DiffKind.String(),
+		Applicable:          true,
+		MetadataOnly:        cand.MetadataOnly,
+		AccessRepairPending: accessRepairPending,
+		AccessRepairMessage: accessRepairMessage,
+		Actions:             cand.Actions,
+		Summary:             cand.Summary,
 	}, nil
 }
 
@@ -732,7 +868,7 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 	rawTemplate := st.RawTemplate
 	sourceHash := st.RawTemplateHash
 	pendingSource := false
-	if pendingRaw, pendingHash, _, ok := st.pendingCatalogSource(); ok {
+	if pendingRaw, pendingHash, _, ok := st.pendingCatalogSourceForFlow(pendingCatalogReviewFlowConfig); ok {
 		rawTemplate = pendingRaw
 		sourceHash = pendingHash
 		pendingSource = true
@@ -740,11 +876,10 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 	if req.SourceHash != "" && req.SourceHash != sourceHash {
 		return nil, nil, fmt.Errorf("%w: app source changed; reload config form", ErrInstalledConfigConflict)
 	}
-	schema, err := ParseAppSchema(rawTemplate)
+	schema, err := m.schemaForInstallStateRawTemplate(ctx, instanceID, rawTemplate, st)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: parse stored source: %v", ErrInstalledConfigUnavailable, err)
 	}
-	PrepareSmartDefaultsForUpdate(schema, instanceID)
 	schemaHash := inputSchemaHash(schema.Inputs)
 	if req.InputSchemaHash != "" && req.InputSchemaHash != schemaHash {
 		return nil, nil, fmt.Errorf("%w: input schema changed; reload config form", ErrInstalledConfigConflict)
@@ -821,6 +956,7 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 		CandidateDigest:    candidateDigest,
 		DiffKind:           diffKind,
 		MetadataOnly:       policy.MetadataOnly,
+		RequiresSnapshot:   policy.RequiresSnapshot,
 		Definition:         res.Definition,
 		InstallState:       &nextState,
 		Actions:            actions,
@@ -960,7 +1096,6 @@ func evaluateInstalledConfigPolicy(oldDef, newDef *api.AppDefinition, appInst *A
 		WillPreserve: []string{
 			"app identity and primary listener",
 			"existing image references and active rootfs volumes",
-			"persistent app data volumes preserved but not snapshotted",
 			"no image pull",
 		},
 	}
@@ -1055,10 +1190,19 @@ func evaluateInstalledConfigPolicy(oldDef, newDef *api.AppDefinition, appInst *A
 		summary.WillChange = append(summary.WillChange, "no runtime changes")
 		metadataOnly = true
 	}
+	if !metadataOnly && !manifestUpdateHasProbeableRuntimeListener(newCmp) {
+		return reject("runtime-changing config updates with only UDP listeners require a future UDP readiness probe")
+	}
+	requiresSnapshot := !metadataOnly && appHasPersistentStorage(oldDef)
+	if requiresSnapshot {
+		summary.WillPreserve = append(summary.WillPreserve, "persistent app data volumes preserved with private pre-commit failure snapshot")
+	} else {
+		summary.WillPreserve = append(summary.WillPreserve, "persistent app data volumes preserved but not snapshotted")
+	}
 	if !metadataOnly && !appInst.Enabled {
 		return reject("start app before applying runtime config")
 	}
-	return installedConfigPolicyResult{Allowed: true, MetadataOnly: metadataOnly}, summary
+	return installedConfigPolicyResult{Allowed: true, MetadataOnly: metadataOnly, RequiresSnapshot: requiresSnapshot}, summary
 }
 
 func inputIsSensitive(name string, spec api.AppInput) bool {

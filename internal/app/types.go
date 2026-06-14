@@ -30,6 +30,7 @@ import (
 // Reconciliation logic:
 // The reconciler starts/stops containers based on BOTH Enabled AND leadership:
 //   - desiredRunning = Enabled && (isLeaderForApp)
+//
 // This ensures containers only run on the leader node while preserving user intent across failovers.
 const (
 	StatusRunning      = "running"      // Containers are running and healthy
@@ -82,19 +83,27 @@ type ContainerManager interface {
 type AppInstance struct {
 	InstanceID    string `json:"instance_id"`
 	Enabled       bool   `json:"enabled"`
-	Status        string `json:"status"`                          // observed runtime status, not persisted
-	StatusMessage string `json:"status_message,omitempty"`        // transient status context for UI, not persisted
+	Status        string `json:"status"`                   // observed runtime status, not persisted
+	StatusMessage string `json:"status_message,omitempty"` // transient status context for UI, not persisted
 	// Container runtime metadata.
-	PrimaryService  string            `json:"primary_service,omitempty"`
-	NetworkAnchorID string            `json:"network_anchor_id,omitempty"`
-	Containers      map[string]string `json:"containers,omitempty"` // service name -> container ID
-	CreatedAt       time.Time         `json:"created_at"`
-	UpdatedAt       time.Time         `json:"updated_at"`
+	PrimaryService  string             `json:"primary_service,omitempty"`
+	NetworkAnchorID string             `json:"network_anchor_id,omitempty"`
+	Containers      map[string]string  `json:"containers,omitempty"` // service name -> container ID
+	CreatedAt       time.Time          `json:"created_at"`
+	UpdatedAt       time.Time          `json:"updated_at"`
 	Definition      *api.AppDefinition `json:"definition,omitempty"`
 
 	// CatalogSource tracks the catalog item name this app was installed from.
 	// Used for icon lookup and update tracking.
 	CatalogSource string `json:"catalog_source,omitempty"`
+	// CatalogUpdatePending is response-only state derived from install_state.
+	CatalogUpdatePending       bool   `json:"catalog_update_pending,omitempty"`
+	CatalogUpdatePendingHash   string `json:"catalog_update_pending_hash,omitempty"`
+	CatalogUpdatePendingReason string `json:"catalog_update_pending_reason,omitempty"`
+	CatalogUpdatePendingFlow   string `json:"catalog_update_pending_flow,omitempty"`
+	// AccessRepairPending is response-only state derived from manifest update transactions.
+	AccessRepairPending bool   `json:"access_repair_pending,omitempty"`
+	AccessRepairMessage string `json:"access_repair_message,omitempty"`
 
 	// ActiveRootfs tracks the active rootfs volume ID per service (RFC 20260302).
 	// nil = legacy install (use ServiceRootfsVolumeID without digest).

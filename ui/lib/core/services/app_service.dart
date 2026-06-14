@@ -260,11 +260,15 @@ class AppService {
 
   Future<ManifestUpdateConfigureResult> configureManifestUpdate(
     String appId,
-    String yamlContent,
-  ) async {
+    String yamlContent, {
+    bool catalogPending = false,
+  }) async {
     final data = await _client.post(
       '/api/v1/apps/$appId/manifest/configure',
-      body: {'app_definition': yamlContent},
+      body: {
+        'app_definition': yamlContent,
+        if (catalogPending) 'catalog_pending': true,
+      },
     );
     final rawData = (data as Map<String, dynamic>)['data'];
     return ManifestUpdateConfigureResult.fromJson(
@@ -278,14 +282,16 @@ class AppService {
     String appId,
     String yamlContent,
     Map<String, dynamic> inputs,
-    List<String> regenerateInputs,
-  ) async {
+    List<String> regenerateInputs, {
+    bool catalogPending = false,
+  }) async {
     final data = await _client.post(
       '/api/v1/apps/$appId/manifest/dry-run',
       body: {
         'app_definition': yamlContent,
         'inputs': inputs,
         'regenerate_inputs': regenerateInputs,
+        if (catalogPending) 'catalog_pending': true,
       },
     );
     final rawData = (data as Map<String, dynamic>)['data'];
@@ -300,6 +306,8 @@ class AppService {
     String appId,
     ManifestUpdateResult dryRun, {
     String? taskId,
+    List<String> confirmations = const [],
+    bool catalogPending = false,
   }) async {
     final data = await _client.post(
       '/api/v1/apps/$appId/manifest/update',
@@ -307,6 +315,8 @@ class AppService {
         'base_manifest_hash': dryRun.baseManifestHash,
         'runtime_fingerprint': dryRun.runtimeFingerprint,
         'dry_run_token': dryRun.dryRunToken,
+        'confirmations': confirmations,
+        if (catalogPending) 'catalog_pending': true,
       },
       headers: _taskHeaders(taskId),
     );

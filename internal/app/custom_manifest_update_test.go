@@ -3,21 +3,27 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"piccolod/internal/api"
+	"piccolod/internal/container"
+	"piccolod/internal/persistence"
+	"piccolod/internal/services"
 	"piccolod/internal/state/paths"
 )
 
-func TestEvaluateCustomManifestUpdatePolicy_AllowsEnvAndAdditiveStorage(t *testing.T) {
+func TestEvaluateCustomManifestUpdatePolicy_AllowsAdditiveStorage(t *testing.T) {
 	oldDef := customManifestPolicyBaseDef()
 	newDef := customManifestPolicyClone(t, oldDef)
 	svc := newDef.Services["main"]
-	svc.Environment["PICLU_DEVICE_DIAG_DIR"] = "/diagnostics"
 	svc.Storage.Persistent["diagnostics"] = api.AppVolume{
 		Container: "/diagnostics",
 		Shared:    true,
@@ -26,20 +32,69 @@ func TestEvaluateCustomManifestUpdatePolicy_AllowsEnvAndAdditiveStorage(t *testi
 
 	policy, summary := evaluateCustomManifestUpdatePolicy(oldDef, newDef)
 	if !policy.Allowed {
-		t.Fatalf("policy rejected allowed env/storage update: %s", policy.Reason)
+		t.Fatalf("policy rejected additive storage update: %s", policy.Reason)
 	}
 	if policy.MetadataOnly {
-		t.Fatalf("env/storage update must not be metadata-only")
+		t.Fatalf("storage update must not be metadata-only")
 	}
 	if len(summary.WillRestart) == 0 {
 		t.Fatalf("expected restart summary for structural update")
 	}
 	joined := strings.Join(summary.WillChange, "\n")
-	if !strings.Contains(joined, "PICLU_DEVICE_DIAG_DIR") {
-		t.Fatalf("expected env key in summary, got %q", joined)
-	}
 	if strings.Contains(joined, "/diagnostics") {
-		t.Fatalf("summary must not leak env/storage values, got %q", joined)
+		t.Fatalf("summary must not leak storage values, got %q", joined)
+	}
+	decision := findManifestDecision(policy.Classification.Decisions, "persistent_storage_added")
+	if decision == nil || decision.Outcome != "supported" {
+		t.Fatalf("expected supported persistent_storage_added decision, got %+v", decision)
+	}
+	if policy.Classification.DataSafety == nil || !policy.Classification.DataSafety.SnapshotRequired {
+		t.Fatalf("additive storage restart with existing persistent data must require private snapshot, got %+v", policy.Classification.DataSafety)
+	}
+}
+
+func TestEvaluateCustomManifestUpdatePolicy_EnvWithPersistentStorageRequiresDataImpactReview(t *testing.T) {
+	oldDef := customManifestPolicyBaseDef()
+	newDef := customManifestPolicyClone(t, oldDef)
+	svc := newDef.Services["main"]
+	svc.Environment["PICLU_DEVICE_DIAG_DIR"] = "/diagnostics"
+	newDef.Services["main"] = svc
+
+	policy, _ := evaluateCustomManifestUpdatePolicy(oldDef, newDef)
+	if policy.Allowed {
+		t.Fatalf("expected env change with existing persistent storage to require v2 review")
+	}
+	if policy.UpdateClass != "service_app_update_v2" {
+		t.Fatalf("update class = %q, want service_app_update_v2", policy.UpdateClass)
+	}
+	decision := findManifestDecision(policy.Classification.Decisions, "service_environment_changed")
+	if decision == nil || decision.Outcome != "operator_review" {
+		t.Fatalf("expected operator_review service_environment_changed decision, got %+v", decision)
+	}
+	if !slices.Contains(policy.Classification.RequiredConfirmations, "data_impact_review") {
+		t.Fatalf("expected data_impact_review confirmation, got %v", policy.Classification.RequiredConfirmations)
+	}
+	if policy.Classification.DataSafety == nil || !policy.Classification.DataSafety.SnapshotRequired {
+		t.Fatalf("expected data safety snapshot requirement, got %+v", policy.Classification.DataSafety)
+	}
+}
+
+func TestEvaluateCustomManifestUpdatePolicyRejectsUDPOnlyRuntimeUpdate(t *testing.T) {
+	oldDef := customManifestPolicyBaseDef()
+	oldDef.Listeners[0].Flow = api.FlowUDP
+	oldDef.Listeners[0].Protocol = api.ListenerProtocolRaw
+	oldDef.Listeners[0].Auth = nil
+	newDef := customManifestPolicyClone(t, oldDef)
+	svc := newDef.Services["main"]
+	svc.Environment["PICLU_MODE"] = "device-v2"
+	newDef.Services["main"] = svc
+
+	policy, summary := evaluateCustomManifestUpdatePolicy(oldDef, newDef)
+	if policy.Stageable {
+		t.Fatalf("expected UDP-only runtime update to be rejected, summary=%+v", summary)
+	}
+	if !strings.Contains(policy.Reason, "UDP") {
+		t.Fatalf("unexpected rejection reason: %q", policy.Reason)
 	}
 }
 
@@ -67,11 +122,12 @@ func TestEvaluateCustomManifestUpdatePolicy_AllowsInputMetadataOnly(t *testing.T
 	}
 }
 
-func TestEvaluateCustomManifestUpdatePolicy_RejectsOutOfScopeDeltas(t *testing.T) {
+func TestEvaluateCustomManifestUpdatePolicy_ClassifiesOperatorReviewDeltas(t *testing.T) {
 	tests := []struct {
-		name   string
-		mutate func(*api.AppDefinition)
-		want   string
+		name    string
+		mutate  func(*api.AppDefinition)
+		flag    string
+		confirm string
 	}{
 		{
 			name: "image",
@@ -80,22 +136,85 @@ func TestEvaluateCustomManifestUpdatePolicy_RejectsOutOfScopeDeltas(t *testing.T
 				svc.Image = "docker.io/example/piclu:new"
 				def.Services["main"] = svc
 			},
-			want: "image",
+			flag:    "image_refs_changed",
+			confirm: "image_update_review",
 		},
 		{
 			name: "listener auth",
 			mutate: func(def *api.AppDefinition) {
 				def.Listeners[0].Auth = &api.ListenerAuth{Rules: []api.ListenerAuthRule{{Path: "/", Type: "prefix", Strategy: "protected"}}}
 			},
-			want: "listener",
+			flag:    "listener_topology_changed",
+			confirm: exposureReviewConfirmationID("listeners.piclu"),
 		},
 		{
 			name: "added service",
 			mutate: func(def *api.AppDefinition) {
-				def.Services["worker"] = api.AppService{Image: "docker.io/library/alpine:3.18", BindPorts: []int{}}
+				def.Services["worker"] = api.AppService{Image: "docker.io/library/alpine:3.18", BindPorts: []int{}, Storage: &api.AppStorage{
+					Persistent: map[string]api.AppVolume{"worker-data": {Container: "/worker"}},
+				}}
 			},
-			want: "service",
+			flag:    "services_added",
+			confirm: "service_shape_review",
 		},
+		{
+			name: "removed stateless service",
+			mutate: func(def *api.AppDefinition) {
+				def.Services["worker"] = api.AppService{Image: "docker.io/library/alpine:3.18", BindPorts: []int{}}
+				delete(def.Services, "worker")
+			},
+			flag:    "services_removed",
+			confirm: "service_removal_review",
+		},
+		{
+			name: "temporary storage",
+			mutate: func(def *api.AppDefinition) {
+				svc := def.Services["main"]
+				if svc.Storage == nil {
+					svc.Storage = &api.AppStorage{}
+				}
+				svc.Storage.Temporary = map[string]api.AppVolume{
+					"scratch": {Container: "/scratch"},
+				}
+				def.Services["main"] = svc
+			},
+			flag:    "temporary_storage_changed",
+			confirm: "service_shape_review",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldDef := customManifestPolicyBaseDef()
+			if tc.name == "removed stateless service" {
+				oldDef.Services["worker"] = api.AppService{Image: "docker.io/library/alpine:3.18", BindPorts: []int{}}
+			}
+			newDef := customManifestPolicyClone(t, oldDef)
+			tc.mutate(newDef)
+			policy, _ := evaluateCustomManifestUpdatePolicy(oldDef, newDef)
+			if policy.Allowed {
+				t.Fatalf("expected operator review to block v1 apply")
+			}
+			if policy.UpdateClass != "service_app_update_v2" {
+				t.Fatalf("update class = %q, want service_app_update_v2", policy.UpdateClass)
+			}
+			decision := findManifestDecision(policy.Classification.Decisions, tc.flag)
+			if decision == nil || decision.Outcome != "operator_review" {
+				t.Fatalf("expected operator_review %s decision, got %+v", tc.flag, decision)
+			}
+			if !slices.Contains(policy.Classification.RequiredConfirmations, tc.confirm) {
+				t.Fatalf("expected confirmation %q in %v", tc.confirm, policy.Classification.RequiredConfirmations)
+			}
+		})
+	}
+}
+
+func TestEvaluateCustomManifestUpdatePolicy_RejectsUnsupportedDeltas(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*api.AppDefinition)
+		flag   string
+	}{
 		{
 			name: "storage mount change",
 			mutate: func(def *api.AppDefinition) {
@@ -105,7 +224,42 @@ func TestEvaluateCustomManifestUpdatePolicy_RejectsOutOfScopeDeltas(t *testing.T
 				svc.Storage.Persistent["data"] = vol
 				def.Services["main"] = svc
 			},
-			want: "volume",
+			flag: "existing_persistent_storage_mutated",
+		},
+		{
+			name: "added service with existing storage attachment",
+			mutate: func(def *api.AppDefinition) {
+				def.Services["worker"] = api.AppService{
+					Image:     "docker.io/library/alpine:3.18",
+					BindPorts: []int{},
+					Storage: &api.AppStorage{Persistent: map[string]api.AppVolume{
+						"data": {Container: "/data"},
+					}},
+				}
+			},
+			flag: "services_added",
+		},
+		{
+			name: "removed service with persistent storage",
+			mutate: func(def *api.AppDefinition) {
+				delete(def.Services, "main")
+			},
+			flag: "services_removed",
+		},
+		{
+			name: "added service with oidc client",
+			mutate: func(def *api.AppDefinition) {
+				def.Services["worker"] = api.AppService{
+					Image:     "docker.io/library/alpine:3.18",
+					BindPorts: []int{},
+					OIDCClient: &api.ServiceOIDCClient{
+						RedirectURIPaths: []string{"/callback"},
+						CAMountPath:      "/ca",
+						Env:              map[string]string{"CLIENT_ID": "CLIENT_ID"},
+					},
+				}
+			},
+			flag: "services_added",
 		},
 		{
 			name: "oidc",
@@ -118,7 +272,7 @@ func TestEvaluateCustomManifestUpdatePolicy_RejectsOutOfScopeDeltas(t *testing.T
 				}
 				def.Services["main"] = svc
 			},
-			want: "oidc_client",
+			flag: "oidc_client_changed",
 		},
 	}
 
@@ -131,10 +285,176 @@ func TestEvaluateCustomManifestUpdatePolicy_RejectsOutOfScopeDeltas(t *testing.T
 			if policy.Allowed {
 				t.Fatalf("expected rejection")
 			}
-			if !strings.Contains(policy.Reason, tc.want) {
-				t.Fatalf("reason %q does not contain %q", policy.Reason, tc.want)
+			decision := findManifestDecision(policy.Classification.Decisions, tc.flag)
+			if decision == nil || decision.Outcome != "rejected" {
+				t.Fatalf("expected rejected %s decision, got %+v; reason=%q", tc.flag, decision, policy.Reason)
 			}
 		})
+	}
+}
+
+func TestEvaluateCustomManifestUpdatePolicy_RejectsRemovedOIDCService(t *testing.T) {
+	oldDef := customManifestPolicyBaseDef()
+	oldDef.Services["worker"] = api.AppService{
+		Image:     "docker.io/library/alpine:3.18",
+		BindPorts: []int{},
+		OIDCClient: &api.ServiceOIDCClient{
+			RedirectURIPaths: []string{"/callback"},
+			CAMountPath:      "/ca",
+			Env:              map[string]string{"CLIENT_ID": "CLIENT_ID"},
+		},
+	}
+	newDef := customManifestPolicyClone(t, oldDef)
+	delete(newDef.Services, "worker")
+
+	policy, _ := evaluateCustomManifestUpdatePolicy(oldDef, newDef)
+	if policy.Allowed {
+		t.Fatalf("expected removed OIDC service to be rejected")
+	}
+	decision := findManifestDecision(policy.Classification.Decisions, "services_removed")
+	if decision == nil || decision.Outcome != "rejected" {
+		t.Fatalf("expected rejected services_removed decision, got %+v; reason=%q", decision, policy.Reason)
+	}
+}
+
+func TestEvaluateCustomManifestUpdatePolicy_OIDCAuthorizePathsRequireV2Apply(t *testing.T) {
+	oldDef := customManifestPolicyBaseDef()
+	oldSvc := oldDef.Services["main"]
+	oldSvc.OIDCClient = &api.ServiceOIDCClient{
+		RedirectURIPaths: []string{"/oidc/callback"},
+		CAMountPath:      "/etc/piccolo/ca",
+		Env:              map[string]string{"OIDC_CLIENT_ID": "client-id"},
+	}
+	oldDef.Services["main"] = oldSvc
+	newDef := customManifestPolicyClone(t, oldDef)
+	newSvc := newDef.Services["main"]
+	newSvc.OIDCClient.AuthorizePaths = []string{"/auth/start"}
+	newDef.Services["main"] = newSvc
+
+	policy, _ := evaluateCustomManifestUpdatePolicy(oldDef, newDef)
+	if policy.Allowed {
+		t.Fatalf("proxy OIDC authorize-path changes must wait for v2 apply machinery")
+	}
+	if policy.UpdateClass != "service_app_update_v2" {
+		t.Fatalf("update class = %q, want service_app_update_v2", policy.UpdateClass)
+	}
+	decision := findManifestDecision(policy.Classification.Decisions, "proxy_oidc_authorize_paths_changed")
+	if decision == nil || decision.Outcome != "supported" {
+		t.Fatalf("expected supported proxy OIDC authorize-path decision, got %+v", decision)
+	}
+	confirmation := exposureReviewConfirmationID("services.main.oidc_client.authorize_paths")
+	if !slices.Contains(policy.Classification.RequiredConfirmations, confirmation) {
+		t.Fatalf("expected %s confirmation, got %v", confirmation, policy.Classification.RequiredConfirmations)
+	}
+	if len(policy.Classification.ExposureReview) != 1 || policy.Classification.ExposureReview[0].Confirmation != confirmation {
+		t.Fatalf("expected exposure review row for OIDC authorize-path delta, got %+v", policy.Classification.ExposureReview)
+	}
+	if !strings.Contains(policy.Reason, "service app update v2 apply is required") {
+		t.Fatalf("reason = %q, want v2 apply requirement", policy.Reason)
+	}
+}
+
+func TestDryRunCustomManifestUpdate_AllowsOIDCAuthorizePathDeltaWithExistingCredentials(t *testing.T) {
+	mgr, state, raw := installedConfigOIDCTestApp(t)
+	appInst, exists := state.GetApp("oidcapp")
+	if !exists {
+		t.Fatalf("oidc app missing")
+	}
+	appInst.CatalogSource = ""
+	appInst.CatalogManifestHash = ""
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store custom oidc app: %v", err)
+	}
+	nextRaw := []byte(strings.Replace(string(raw), "      redirect_uri_paths:\n        - /callback", "      authorize_paths:\n        - /authorize\n      redirect_uri_paths:\n        - /callback", 1))
+
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "oidcapp",
+		RawTemplate:   nextRaw,
+		Inputs:        map[string]interface{}{"display_name": "OIDC app"},
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC", IssuerHint: "https://issuer.local"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if !result.Applicable {
+		t.Fatalf("authorize-path delta should be stageable, reason=%q", result.BlockingReason)
+	}
+	if result.UpdateClass != "service_app_update_v2" {
+		t.Fatalf("update class = %q, want service_app_update_v2", result.UpdateClass)
+	}
+	decision := findManifestDecision(result.Decisions, "proxy_oidc_authorize_paths_changed")
+	if decision == nil || decision.Outcome != "supported" {
+		t.Fatalf("expected supported proxy OIDC authorize-path decision, got %+v", decision)
+	}
+	if got := strings.Join(result.ListenerRoutingAuth, "\n"); !strings.Contains(got, "proxy OIDC routing delta") {
+		t.Fatalf("listener routing/auth summary missing proxy OIDC delta: %q", got)
+	}
+	confirmation := exposureReviewConfirmationID("services.main.oidc_client.authorize_paths")
+	if !slices.Contains(result.RequiredConfirmations, confirmation) {
+		t.Fatalf("expected %s confirmation, got %v", confirmation, result.RequiredConfirmations)
+	}
+	if len(result.ExposureReview) != 1 || result.ExposureReview[0].Confirmation != confirmation {
+		t.Fatalf("expected exposure review row for OIDC authorize-path delta, got %+v", result.ExposureReview)
+	}
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "oidcapp",
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		DryRunToken:        result.DryRunToken,
+	})
+	if !errors.Is(err, ErrManifestUpdateRejected) || !strings.Contains(err.Error(), confirmation) {
+		t.Fatalf("apply err = %v, want missing %s confirmation rejection", err, confirmation)
+	}
+}
+
+func TestApplyCustomManifestUpdate_PreservesExistingOIDCCredentialsInFallbackLedger(t *testing.T) {
+	mgr, state, raw := installedConfigOIDCTestApp(t)
+	appInst, exists := state.GetApp("oidcapp")
+	if !exists {
+		t.Fatalf("oidc app missing")
+	}
+	appInst.CatalogSource = ""
+	appInst.CatalogManifestHash = ""
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store custom oidc app: %v", err)
+	}
+	nextRaw := []byte(strings.Replace(string(raw), "  display_name:\n    type: string", "  operator_note:\n    type: string\n    label: Operator note\n    default: preserved\n  display_name:\n    type: string", 1))
+
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "oidcapp",
+		RawTemplate:   nextRaw,
+		Inputs:        map[string]interface{}{"display_name": "OIDC app"},
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC", IssuerHint: "https://issuer.local"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if !result.Applicable {
+		t.Fatalf("input metadata update should be stageable, reason=%q", result.BlockingReason)
+	}
+	if !result.MetadataOnly {
+		t.Fatalf("input metadata update should be metadata-only")
+	}
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "oidcapp",
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		DryRunToken:        result.DryRunToken,
+		Confirmations:      result.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	st, err := state.LoadInstallState("oidcapp")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	if st.OIDCCredentials == nil {
+		t.Fatalf("stored OIDC credentials = nil")
+	}
+	if st.OIDCCredentials.ClientID != "client-id" || st.OIDCCredentials.ClientSecret != "client-secret" {
+		t.Fatalf("stored OIDC credentials = %+v, want existing credentials", st.OIDCCredentials)
 	}
 }
 
@@ -163,10 +483,70 @@ func TestNormalizeManifestUpdateInputs_GeneratedValuesAreExplicitAndAppAddressPi
 	}
 }
 
+func TestNormalizePendingCatalogManifestReviewInputsAcceptsProvidedSecrets(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"__app_address__": {Type: "string", Required: true},
+		"api_key":         {Type: "password", Required: true},
+		"session_key":     {Type: "password", Required: true, Generate: true},
+		"region":          {Type: "string", Default: "local"},
+	}
+	st := &InstallState{
+		InstallInputs: map[string]any{
+			"existing": "kept",
+		},
+		InputProvenance: map[string]string{
+			"existing": InputProvenanceOperator,
+		},
+	}
+
+	inputs, provenance, err := normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
+		Inputs: map[string]interface{}{
+			"api_key":     "typed-api-key",
+			"session_key": "typed-session-key",
+		},
+	}, "piclu")
+	if err != nil {
+		t.Fatalf("normalize pending catalog review inputs: %v", err)
+	}
+	if got := inputs["api_key"]; got != "typed-api-key" {
+		t.Fatalf("api_key = %v, want typed value", got)
+	}
+	if got := provenance["api_key"]; got != InputProvenanceOperator {
+		t.Fatalf("api_key provenance = %q, want operator", got)
+	}
+	if got := inputs["session_key"]; got != "typed-session-key" {
+		t.Fatalf("session_key = %v, want typed value", got)
+	}
+	if got := provenance["session_key"]; got != InputProvenanceOperator {
+		t.Fatalf("session_key provenance = %q, want operator", got)
+	}
+	if _, ok := inputs["region"]; !ok {
+		t.Fatalf("region default missing from normalized inputs")
+	}
+	if got := provenance["region"]; got != InputProvenanceCatalogDefault {
+		t.Fatalf("region provenance = %q, want catalog default", got)
+	}
+
+	inputs, provenance, err = normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
+		Inputs:           map[string]interface{}{"api_key": "typed-api-key"},
+		RegenerateInputs: []string{"session_key"},
+	}, "piclu")
+	if err != nil {
+		t.Fatalf("normalize pending catalog regenerate input: %v", err)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(inputs["session_key"])); got == "" {
+		t.Fatalf("regenerated session_key is empty")
+	}
+	if got := provenance["session_key"]; got != InputProvenanceGenerated {
+		t.Fatalf("session_key regenerate provenance = %q, want generated", got)
+	}
+}
+
 func TestDryRunCustomManifestUpdate_MaterializesCandidateAndToken(t *testing.T) {
 	tempDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tempDir)
-	mgr, err := NewAppManagerForTest(nil, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -216,7 +596,6 @@ services:
     bind_ports: [8080]
     environment:
       PICLU_MODE: device
-      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"
     storage:
       persistent:
         data:
@@ -247,6 +626,1659 @@ x-piccolo:
 	}
 	if _, err := os.Stat(filepath.Join(tempDir, AppsDir, "piclu", "install_state.json")); !os.IsNotExist(err) {
 		t.Fatalf("dry run must not create install_state.json, stat err=%v", err)
+	}
+}
+
+func TestDryRunCustomManifestUpdate_ClassifiesImageReviewCandidate(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	mgr.SetMountVerifier(func(string) error { return nil })
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		Containers:     map[string]string{"main": "cid-main"},
+		ActiveRootfs:   map[string]string{"main": "rootfs-main"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     customManifestPolicyBaseDef(),
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID: "piclu",
+		RawTemplate: []byte(`type: user
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:new
+    bind_ports: [8080]
+    environment:
+      PICLU_MODE: device
+    storage:
+      persistent:
+        data:
+          container: /data
+x-piccolo:
+  mode: service
+`),
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if !result.Applicable {
+		t.Fatalf("expected image review candidate to be stageable: %s", result.BlockingReason)
+	}
+	if result.DryRunToken == "" {
+		t.Fatalf("stageable dry run must mint token")
+	}
+	if result.UpdateClass != "service_app_update_v2" {
+		t.Fatalf("update class = %q, want service_app_update_v2", result.UpdateClass)
+	}
+	decision := findManifestDecision(result.Decisions, "image_refs_changed")
+	if decision == nil || decision.Outcome != "operator_review" {
+		t.Fatalf("expected operator_review image decision, got %+v", decision)
+	}
+	if !slices.Contains(result.RequiredConfirmations, "image_update_review") {
+		t.Fatalf("expected image_update_review confirmation, got %v", result.RequiredConfirmations)
+	}
+	if result.DataSafety == nil || !result.DataSafety.SnapshotRequired {
+		t.Fatalf("expected data safety snapshot requirement, got %+v", result.DataSafety)
+	}
+	if got := strings.Join(result.StagedImageRootfs, "\n"); !strings.Contains(got, "expected rootfs") || !strings.Contains(got, "docker.io/library/mock-image@sha256:mockdigest") {
+		t.Fatalf("expected dry-run image plan with digest/rootfs, got %q", got)
+	}
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		DryRunToken:        result.DryRunToken,
+	})
+	if !errors.Is(err, ErrManifestUpdateRejected) || !strings.Contains(err.Error(), "image_update_review") {
+		t.Fatalf("apply err = %v, want missing image_update_review confirmation rejection", err)
+	}
+}
+
+func TestApplyCustomManifestUpdateRejectsImageDigestDriftAfterDryRun(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	digest := "docker.io/example/piclu@sha256:dryrun"
+	mock.inspectImageHook = func(imageName string) (*container.ImageConfig, error) {
+		return &container.ImageConfig{
+			Cmd:         []string{"/bin/sh"},
+			Digest:      strings.TrimPrefix(digest, "docker.io/example/piclu@"),
+			RepoDigests: []string{digest},
+			Size:        500 << 20,
+		}, nil
+	}
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	rootfs := newStubRootfsManager(tempDir)
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     customManifestPolicyBaseDef(),
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   customManifestImageUpdateRaw("docker.io/example/piclu:new"),
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if result.DryRunToken == "" {
+		t.Fatalf("expected dry-run token")
+	}
+
+	digest = "docker.io/example/piclu@sha256:changed"
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		DryRunToken:        result.DryRunToken,
+		Confirmations:      result.RequiredConfirmations,
+	})
+	if !errors.Is(err, ErrManifestUpdateConflict) || !strings.Contains(err.Error(), "image digest for service main changed after dry run") {
+		t.Fatalf("apply err = %v, want digest drift conflict", err)
+	}
+	stored, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("stored app missing")
+	}
+	if stored.Definition.Services["main"].Image != "docker.io/example/piclu:stable" {
+		t.Fatalf("digest drift should keep previous manifest, got image %q", stored.Definition.Services["main"].Image)
+	}
+	if len(volumes.snapshots) != 0 {
+		t.Fatalf("digest drift should reject before data snapshot, got %v", volumes.snapshots)
+	}
+}
+
+func TestApplyCustomManifestUpdate_ImageReviewStagesRootfsAndPrivateSnapshot(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	rootfs := newStubRootfsManager(tempDir)
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	svc := candidateDef.Services["main"]
+	svc.Image = "docker.io/example/piclu:new"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("image update"))
+	applied, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply image update: %v", err)
+	}
+	if applied.UpdateClass != "service_app_update_v2" {
+		t.Fatalf("update class = %q, want service_app_update_v2", applied.UpdateClass)
+	}
+	stored, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("updated app missing")
+	}
+	wantRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("docker.io/library/mock-image@sha256:mockdigest"))
+	if got := stored.ActiveRootfs["main"]; got != wantRootfs {
+		t.Fatalf("active rootfs main = %q, want %q", got, wantRootfs)
+	}
+	if stored.Definition.Services["main"].Image != "docker.io/example/piclu:new" {
+		t.Fatalf("stored image = %q", stored.Definition.Services["main"].Image)
+	}
+	if len(volumes.snapshots) != 1 {
+		t.Fatalf("snapshots = %v, want one private snapshot", volumes.snapshots)
+	}
+	if !slices.Equal(volumes.snapshots, volumes.destroyed) {
+		t.Fatalf("snapshot cleanup mismatch: snapshots=%v destroyed=%v", volumes.snapshots, volumes.destroyed)
+	}
+	if !slices.Contains(rootfs.destroyed, "rootfs-main") {
+		t.Fatalf("destroyed rootfs = %v, want old rootfs-main cleanup", rootfs.destroyed)
+	}
+	if slices.Contains(rootfs.destroyed, wantRootfs) {
+		t.Fatalf("destroyed candidate rootfs %s: %v", wantRootfs, rootfs.destroyed)
+	}
+	txnPath := filepath.Join(tempDir, AppsDir, "piclu", manifestUpdateTxnFilename)
+	if _, err := os.Stat(txnPath); !os.IsNotExist(err) {
+		t.Fatalf("transaction should be cleared after commit, stat err=%v", err)
+	}
+}
+
+func TestApplyCustomManifestUpdate_StopsRuntimeBeforePrecommitSnapshot(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(tempDir))
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	mock.containers["anchor-old"] = &mockContainer{ID: "anchor-old", Status: "running"}
+	mock.containers["main-old"] = &mockContainer{ID: "main-old", Status: "running"}
+	appInst := &AppInstance{
+		InstanceID:      "piclu",
+		Enabled:         true,
+		PrimaryService:  "main",
+		NetworkAnchorID: "anchor-old",
+		Containers:      map[string]string{"main": "main-old"},
+		ActiveRootfs:    map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		Definition:      baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	sawStoppedSnapshot := false
+	volumes.snapshotHook = func(instanceID, snapshotLVName string) error {
+		_ = snapshotLVName
+		if instanceID != "piclu" {
+			t.Fatalf("snapshot instance = %q, want piclu", instanceID)
+		}
+		if got := mock.containers["main-old"].Status; got != "stopped" {
+			t.Fatalf("main container status at snapshot = %q, want stopped", got)
+		}
+		if got := mock.containers["anchor-old"].Status; got != "stopped" {
+			t.Fatalf("anchor container status at snapshot = %q, want stopped", got)
+		}
+		sawStoppedSnapshot = true
+		return nil
+	}
+
+	svc := candidateDef.Services["main"]
+	svc.Image = "docker.io/example/piclu:new"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("image update"))
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply image update: %v", err)
+	}
+	if !sawStoppedSnapshot {
+		t.Fatalf("snapshot hook did not observe stopped old runtime")
+	}
+}
+
+func TestApplyCustomManifestUpdate_MarksAccessSuspendedDuringRuntimeSwitch(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(tempDir))
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	sawAccessSuspended := false
+	state.storeManifestUpdateTransactionHook = func(instanceID string, txn *ManifestUpdateTransaction) error {
+		if instanceID == "piclu" && txn.Phase == "access_suspended" {
+			sawAccessSuspended = true
+		}
+		return nil
+	}
+
+	svc := candidateDef.Services["main"]
+	svc.Image = "docker.io/example/piclu:new"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("image update"))
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply image update: %v", err)
+	}
+	if !sawAccessSuspended {
+		t.Fatalf("runtime switch did not persist access_suspended phase")
+	}
+}
+
+func TestApplyCustomManifestUpdate_PostCommitAccessFailureReturnsRepairPending(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	mgr.SetMountVerifier(func(string) error { return nil })
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := customManifestOIDCRaw(false)
+	newRaw := customManifestOIDCRaw(true)
+	inputs := map[string]interface{}{"display_name": "OIDC app"}
+	systemCtx := InstallSystemContext{
+		Domain:       "local",
+		Architecture: "amd64",
+		Timezone:     "Etc/UTC",
+		IssuerHint:   "https://issuer.local",
+	}
+	creds := &OIDCCredentials{ClientID: "client-id", ClientSecret: "client-secret"}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "oidcapp",
+		ExistingOIDC:  creds,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	newRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   newRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "oidcapp",
+		ExistingOIDC:  creds,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render new manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:     "oidcapp",
+		Enabled:        true,
+		PrimaryService: "main",
+		Containers:     map[string]string{"main": "cid-main"},
+		ActiveRootfs:   map[string]string{"main": "rootfs-main"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("oidcapp", NewV2InstallState("oidcapp", InstallSourceKindCustom, "", oldRaw, inputs, systemCtx, creds, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+	baseHash, err := canonicalManifestHash(oldRes.Definition)
+	if err != nil {
+		t.Fatalf("base hash: %v", err)
+	}
+	candidateHash, err := canonicalManifestHash(newRes.Definition)
+	if err != nil {
+		t.Fatalf("candidate hash: %v", err)
+	}
+	runtimeFingerprint, err := manifestRuntimeFingerprint(appInst)
+	if err != nil {
+		t.Fatalf("runtime fingerprint: %v", err)
+	}
+	ledgerExists, ledgerRevision, ledgerSourceHash, err := loadInstallLedgerFingerprint(state, "oidcapp")
+	if err != nil {
+		t.Fatalf("ledger fingerprint: %v", err)
+	}
+	policy, summary := evaluateCustomManifestUpdatePolicy(oldRes.Definition, newRes.Definition)
+	nextState := NewV2InstallState("oidcapp", InstallSourceKindCustom, "", newRaw, inputs, systemCtx, creds, false)
+	cand := &manifestUpdateCandidate{
+		Token:                "token-access-repair",
+		InstanceID:           "oidcapp",
+		RawTemplate:          newRaw,
+		Inputs:               inputs,
+		SystemContext:        systemCtx,
+		BaseManifestHash:     baseHash,
+		RuntimeFingerprint:   runtimeFingerprint,
+		BaseLedgerExists:     ledgerExists,
+		BaseLedgerRevision:   ledgerRevision,
+		BaseLedgerSourceHash: ledgerSourceHash,
+		CandidateDigest:      candidateHash,
+		InstallState:         nextState,
+		DiffKind:             classifyDiff(cloneDefinitionForCompare(oldRes.Definition), cloneDefinitionForCompare(newRes.Definition)),
+		MetadataOnly:         true,
+		Definition:           newRes.Definition,
+		Summary:              summary,
+		Classification:       policy.Classification,
+		CreatedAt:            now,
+		ExpiresAt:            now.Add(manifestUpdateTokenTTL),
+	}
+	mgr.storeManifestUpdateCandidate(cand)
+	requiresProxy := func(def *api.AppDefinition) bool {
+		for _, svc := range def.Services {
+			if svc.OIDCClient != nil && len(svc.OIDCClient.AuthorizePaths) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+	registered := []string{}
+	mgr.SetSyncHost(installedConfigSyncHost{
+		requiresProxy:   requiresProxy,
+		registeredProxy: &registered,
+		registerErr:     errors.New("proxy registry unavailable"),
+	})
+
+	applied, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "oidcapp",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply should return committed repair-pending result, got error: %v", err)
+	}
+	if !applied.AccessRepairPending || !strings.Contains(applied.AccessRepairMessage, "proxy registry unavailable") {
+		t.Fatalf("access repair result = pending:%v message:%q", applied.AccessRepairPending, applied.AccessRepairMessage)
+	}
+	if len(registered) != 1 || registered[0] != "oidcapp" {
+		t.Fatalf("proxy registration calls = %v, want failed publish attempt", registered)
+	}
+	storedDef, err := state.GetAppDefinition("oidcapp")
+	if err != nil {
+		t.Fatalf("get stored definition: %v", err)
+	}
+	if len(storedDef.Services["main"].OIDCClient.AuthorizePaths) == 0 {
+		t.Fatalf("candidate manifest was not committed")
+	}
+	st, err := state.LoadInstallState("oidcapp")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	if st.RawTemplateHash != Sha256Hex(newRaw) {
+		t.Fatalf("ledger hash = %q, want committed candidate hash %q", st.RawTemplateHash, Sha256Hex(newRaw))
+	}
+	txn, err := state.LoadManifestUpdateTransaction("oidcapp")
+	if err != nil {
+		t.Fatalf("load repair transaction: %v", err)
+	}
+	if txn.Phase != "publishing_access" || txn.AccessPublished {
+		t.Fatalf("repair transaction = phase:%q access_published:%v", txn.Phase, txn.AccessPublished)
+	}
+	if !strings.Contains(txn.LastError, "proxy registry unavailable") {
+		t.Fatalf("transaction last error = %q", txn.LastError)
+	}
+	detail, err := mgr.Get(context.Background(), "oidcapp")
+	if err != nil {
+		t.Fatalf("get app detail: %v", err)
+	}
+	if !detail.AccessRepairPending || !strings.Contains(detail.AccessRepairMessage, "proxy registry unavailable") {
+		t.Fatalf("detail access repair = pending:%v message:%q", detail.AccessRepairPending, detail.AccessRepairMessage)
+	}
+	listed, err := mgr.List(context.Background())
+	if err != nil {
+		t.Fatalf("list apps: %v", err)
+	}
+	found := false
+	for _, app := range listed {
+		if app.InstanceID != "oidcapp" {
+			continue
+		}
+		found = true
+		if !app.AccessRepairPending || !strings.Contains(app.AccessRepairMessage, "proxy registry unavailable") {
+			t.Fatalf("list access repair = pending:%v message:%q", app.AccessRepairPending, app.AccessRepairMessage)
+		}
+	}
+	if !found {
+		t.Fatalf("oidcapp missing from list")
+	}
+}
+
+func TestApplyCustomManifestUpdate_ServiceRemovalPrunesAndCleansRootfs(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	rootfs := newStubRootfsManager(tempDir)
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	mainSvc := baseDef.Services["main"]
+	mainSvc.Storage = nil
+	baseDef.Services["main"] = mainSvc
+	baseDef.Services["worker"] = api.AppService{
+		Image:     "docker.io/example/worker:stable",
+		BindPorts: []int{},
+	}
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	delete(candidateDef.Services, "worker")
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs: map[string]string{
+			"main":                   "rootfs-main",
+			"worker":                 "rootfs-worker",
+			networkAnchorServiceName: "rootfs-anchor",
+		},
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Definition: baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("remove worker"))
+
+	applied, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied.Applicable {
+		t.Fatalf("apply result applicable=false")
+	}
+	stored, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("stored app missing")
+	}
+	if _, exists := stored.Definition.Services["worker"]; exists {
+		t.Fatalf("worker service still present in committed manifest")
+	}
+	if got := stored.ActiveRootfs["worker"]; got != "" {
+		t.Fatalf("removed worker ActiveRootfs = %q, want pruned", got)
+	}
+	if got := stored.ActiveRootfs["main"]; got != "rootfs-main" {
+		t.Fatalf("main ActiveRootfs = %q, want preserved", got)
+	}
+	if !slices.Contains(rootfs.destroyed, "rootfs-worker") {
+		t.Fatalf("destroyed rootfs = %v, want rootfs-worker cleanup", rootfs.destroyed)
+	}
+	if _, err := state.LoadManifestUpdateTransaction("piclu"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("transaction after committed cleanup err = %v, want not exist", err)
+	}
+}
+
+func TestInstalledAppApplyTransactionKeepsPreparedListenerReservationAfterPublishFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	serviceManager := services.NewServiceManager()
+	mgr, err := NewAppManagerForTestWithServices(nil, tempDir, serviceManager, nil)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve test port: %v", err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	if err := probe.Close(); err != nil {
+		t.Fatalf("close test port probe: %v", err)
+	}
+
+	now := time.Now().UTC()
+	prevDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, prevDef)
+	candidateDef.Listeners[0].PortClaim = &port
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		Containers:     map[string]string{"main": "cid-main"},
+		ActiveRootfs:   map[string]string{"main": "rootfs-main"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     prevDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	prevHash, err := canonicalManifestHash(prevDef)
+	if err != nil {
+		t.Fatalf("previous hash: %v", err)
+	}
+	candidateHash, err := canonicalManifestHash(candidateDef)
+	if err != nil {
+		t.Fatalf("candidate hash: %v", err)
+	}
+	txn, err := mgr.beginInstalledAppApplyTransaction(context.Background(), state, installedAppApplyTransactionSpec{
+		OperationKind:           "service_app_update",
+		TaskType:                taskTypeUpdateServiceApp,
+		RollbackPrefix:          "app update rolled back",
+		InstanceID:              "piclu",
+		AppInst:                 appInst,
+		PreviousDefinition:      prevDef,
+		CandidateDefinition:     candidateDef,
+		PreviousManifestHash:    prevHash,
+		CandidateManifestHash:   candidateHash,
+		DryRunToken:             "token-listener-publish-failure",
+		RuntimeFingerprint:      "runtime-fingerprint",
+		MetadataOnly:            true,
+		ApplyPhase:              taskPhaseApplyingManifest,
+		ApplyMessage:            "Persisting manifest",
+		FinalizingMessage:       "Saving config ledger",
+		CandidateLedgerRevision: 1,
+	})
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	defer func() {
+		if txn.listenerPlan != nil {
+			txn.listenerPlan.Release()
+		}
+	}()
+	if err := txn.prepareListenersIfNeeded(); err != nil {
+		t.Fatalf("prepare listeners: %v", err)
+	}
+
+	blocker, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+	if err != nil {
+		t.Fatalf("occupy prepared public port %d: %v", port, err)
+	}
+	publishErr := txn.publishAccess()
+	if closeErr := blocker.Close(); closeErr != nil {
+		t.Fatalf("close port blocker: %v", closeErr)
+	}
+	if publishErr == nil {
+		t.Fatalf("publish err = nil, want bind failure")
+	}
+	if !strings.Contains(publishErr.Error(), "publish prepared listeners") {
+		t.Fatalf("publish err = %v, want prepared listener publish failure", publishErr)
+	}
+	_ = txn.markAccessRepairPending(publishErr)
+
+	otherPlan, otherErr := serviceManager.PrepareReconcile("other", []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+		PortClaim: &port,
+	}})
+	if otherErr == nil {
+		otherPlan.Release()
+		t.Fatalf("port claim %d was reusable after repair-pending publish failure", port)
+	}
+	if err := serviceManager.RestorePreparedPublication("piclu", txn.txn.PreparedListenerEndpoints); err != nil {
+		t.Fatalf("same-process access repair rejected retained prepared endpoints: %v", err)
+	}
+	if _, ok := serviceManager.GetAppListener("piclu", "piclu"); !ok {
+		t.Fatalf("same-process access repair did not publish prepared endpoint")
+	}
+}
+
+func TestInstalledAppApplyTransactionRetainsPreparedReservationWhenPublishMarkerFails(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	serviceManager := services.NewServiceManager()
+	serviceManager.UseInMemoryNetworkForTest()
+	mgr, err := NewAppManagerForTestWithServices(nil, tempDir, serviceManager, nil)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+
+	now := time.Now().UTC()
+	prevDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, prevDef)
+	candidateDef.Listeners[0].Name = "piclu-admin"
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		Containers:     map[string]string{"main": "cid-main"},
+		ActiveRootfs:   map[string]string{"main": "rootfs-main"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     prevDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	prevHash, err := canonicalManifestHash(prevDef)
+	if err != nil {
+		t.Fatalf("previous hash: %v", err)
+	}
+	candidateHash, err := canonicalManifestHash(candidateDef)
+	if err != nil {
+		t.Fatalf("candidate hash: %v", err)
+	}
+	txn, err := mgr.beginInstalledAppApplyTransaction(context.Background(), state, installedAppApplyTransactionSpec{
+		OperationKind:           "service_app_update",
+		TaskType:                taskTypeUpdateServiceApp,
+		RollbackPrefix:          "app update rolled back",
+		InstanceID:              "piclu",
+		AppInst:                 appInst,
+		PreviousDefinition:      prevDef,
+		CandidateDefinition:     candidateDef,
+		PreviousManifestHash:    prevHash,
+		CandidateManifestHash:   candidateHash,
+		DryRunToken:             "token-listener-publish-marker-failure",
+		RuntimeFingerprint:      "runtime-fingerprint",
+		MetadataOnly:            true,
+		ApplyPhase:              taskPhaseApplyingManifest,
+		ApplyMessage:            "Persisting manifest",
+		FinalizingMessage:       "Saving config ledger",
+		CandidateLedgerRevision: 1,
+	})
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	if err := txn.prepareListenersIfNeeded(); err != nil {
+		t.Fatalf("prepare listeners: %v", err)
+	}
+	if len(txn.txn.PreparedListenerEndpoints) != 1 {
+		t.Fatalf("prepared endpoints = %+v, want one", txn.txn.PreparedListenerEndpoints)
+	}
+	prepared := txn.txn.PreparedListenerEndpoints[0]
+	failPublishMarker := true
+	state.storeManifestUpdateTransactionHook = func(instanceID string, update *ManifestUpdateTransaction) error {
+		if instanceID == "piclu" && update.Phase == "publishing_access" && failPublishMarker {
+			failPublishMarker = false
+			return os.ErrPermission
+		}
+		return nil
+	}
+
+	publishErr := txn.publishAccess()
+	if publishErr == nil {
+		t.Fatalf("publishAccess err = nil, want publishing_access marker failure")
+	}
+	if !strings.Contains(publishErr.Error(), "persist access publication transaction marker") {
+		t.Fatalf("publishAccess err = %v, want marker failure", publishErr)
+	}
+	_ = txn.markAccessRepairPending(publishErr)
+
+	otherPlan, otherErr := serviceManager.PrepareReconcile("other", []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      prepared.Flow,
+		Protocol:  prepared.Protocol,
+		PortClaim: &prepared.PublicPort,
+	}})
+	if otherErr == nil {
+		otherPlan.Release()
+		t.Fatalf("prepared public port %d was reusable after publish marker failure", prepared.PublicPort)
+	}
+	if err := serviceManager.RestorePreparedPublication("piclu", txn.txn.PreparedListenerEndpoints); err != nil {
+		t.Fatalf("same-process access repair rejected retained prepared endpoints: %v", err)
+	}
+	if _, ok := serviceManager.GetAppListener("piclu", prepared.Name); !ok {
+		t.Fatalf("same-process access repair did not publish prepared endpoint")
+	}
+}
+
+func TestInstalledAppApplyTransactionKeepsAccessSuspendedWhenAccessCommitStoreFails(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	serviceManager := services.NewServiceManager()
+	serviceManager.UseInMemoryNetworkForTest()
+	mgr, err := NewAppManagerForTestWithServices(nil, tempDir, serviceManager, nil)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+
+	now := time.Now().UTC()
+	prevDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, prevDef)
+	candidateDef.Listeners[0].Name = "piclu-admin"
+	candidateDef.Listeners[0].Primary = true
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		Containers:     map[string]string{"main": "cid-main"},
+		ActiveRootfs:   map[string]string{"main": "rootfs-main"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     prevDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	prevHash, err := canonicalManifestHash(prevDef)
+	if err != nil {
+		t.Fatalf("previous hash: %v", err)
+	}
+	candidateHash, err := canonicalManifestHash(candidateDef)
+	if err != nil {
+		t.Fatalf("candidate hash: %v", err)
+	}
+	txn, err := mgr.beginInstalledAppApplyTransaction(context.Background(), state, installedAppApplyTransactionSpec{
+		OperationKind:           "service_app_update",
+		TaskType:                taskTypeUpdateServiceApp,
+		RollbackPrefix:          "app update rolled back",
+		InstanceID:              "piclu",
+		AppInst:                 appInst,
+		PreviousDefinition:      prevDef,
+		CandidateDefinition:     candidateDef,
+		PreviousManifestHash:    prevHash,
+		CandidateManifestHash:   candidateHash,
+		DryRunToken:             "token-access-published-failure",
+		RuntimeFingerprint:      "runtime-fingerprint",
+		MetadataOnly:            false,
+		ApplyPhase:              taskPhaseApplyingManifest,
+		ApplyMessage:            "Persisting manifest",
+		FinalizingMessage:       "Saving config ledger",
+		CandidateLedgerRevision: 1,
+	})
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	if err := txn.prepareListenersIfNeeded(); err != nil {
+		t.Fatalf("prepare listeners: %v", err)
+	}
+	if len(txn.txn.PreparedListenerEndpoints) == 0 {
+		t.Fatalf("prepared listener endpoints missing")
+	}
+	if err := txn.suspendAccessForRuntimeSwitch(); err != nil {
+		t.Fatalf("suspend access: %v", err)
+	}
+	state.storeManifestUpdateTransactionHook = func(instanceID string, update *ManifestUpdateTransaction) error {
+		if instanceID == "piclu" && update.Phase == "access_published" {
+			return os.ErrPermission
+		}
+		return nil
+	}
+
+	publishErr := txn.publishAccess()
+	if publishErr == nil {
+		t.Fatalf("publishAccess err = nil, want access_published store failure")
+	}
+	if !strings.Contains(publishErr.Error(), "persist access published transaction marker") {
+		t.Fatalf("publishAccess err = %v, want access_published store failure", publishErr)
+	}
+	_ = txn.markAccessRepairPending(publishErr)
+
+	storedTxn, err := state.LoadManifestUpdateTransaction("piclu")
+	if err != nil {
+		t.Fatalf("load repair transaction: %v", err)
+	}
+	if !storedTxn.AccessSuspended {
+		t.Fatalf("repair transaction cleared access_suspended after failed access commit")
+	}
+	if storedTxn.AccessPublished {
+		t.Fatalf("repair transaction access_published = true, want false")
+	}
+	if len(storedTxn.PreparedListenerEndpoints) == 0 {
+		t.Fatalf("repair transaction lost prepared listener endpoints")
+	}
+}
+
+func TestApplyCustomManifestUpdate_RollsBackWhenRuntimeReadinessFails(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(tempDir))
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	readinessCalled := false
+	mgr.runtimeReadinessProbe = func(ctx context.Context, endpoints []services.ServiceEndpoint, timeout time.Duration) error {
+		_ = ctx
+		_ = endpoints
+		_ = timeout
+		readinessCalled = true
+		return errors.New("candidate backend unreachable")
+	}
+
+	svc := candidateDef.Services["main"]
+	svc.Image = "docker.io/example/piclu:new"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("image update"))
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err == nil {
+		t.Fatalf("apply err = nil, want readiness rollback failure")
+	}
+	if !strings.Contains(err.Error(), "candidate backend unreachable") {
+		t.Fatalf("apply err = %v, want readiness failure", err)
+	}
+	if !readinessCalled {
+		t.Fatalf("readiness probe was not called")
+	}
+	stored, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("stored app missing")
+	}
+	if stored.Definition.Services["main"].Image != "docker.io/example/piclu:stable" {
+		t.Fatalf("readiness failure should restore previous manifest, got image %q", stored.Definition.Services["main"].Image)
+	}
+	if got := stored.ActiveRootfs["main"]; got != "rootfs-main" {
+		t.Fatalf("readiness failure should restore active rootfs, got %q", got)
+	}
+}
+
+func TestApplyCustomManifestUpdate_CleansSnapshotWhenHealthCheckFailsBeforeCandidateInstall(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tempDir},
+		healthErr:         errors.New("snapshot metadata unreadable"),
+	}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(tempDir))
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	svc := candidateDef.Services["main"]
+	svc.Image = "docker.io/example/piclu:new"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("image update"))
+
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err == nil || !strings.Contains(err.Error(), "snapshot metadata unreadable") {
+		t.Fatalf("apply err = %v, want snapshot health failure", err)
+	}
+	if len(volumes.snapshots) != 1 {
+		t.Fatalf("snapshots = %v, want one created snapshot", volumes.snapshots)
+	}
+	if len(volumes.rollbacks) != 0 {
+		t.Fatalf("snapshot rollback = %v, want no rollback before candidate install", volumes.rollbacks)
+	}
+	if !slices.Contains(volumes.destroyed, volumes.snapshots[0]) {
+		t.Fatalf("destroyed snapshots = %v, want cleanup of %s", volumes.destroyed, volumes.snapshots[0])
+	}
+	if _, err := state.LoadManifestUpdateTransaction("piclu"); err == nil {
+		t.Fatalf("transaction should be cleared after rollback")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("load transaction: %v", err)
+	}
+	stored, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("stored app missing")
+	}
+	if stored.Definition.Services["main"].Image != "docker.io/example/piclu:stable" {
+		t.Fatalf("snapshot health failure should restore previous manifest, got %q", stored.Definition.Services["main"].Image)
+	}
+}
+
+func TestRecoverPendingManifestUpdatePublishesPreparedListenerPlanWithoutSuspendedFlag(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	oldDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, oldDef)
+	candidateDef.Listeners[0].Name = "piclu-admin"
+	candidateDef.Listeners[0].Primary = true
+	oldHash, err := canonicalManifestHash(oldDef)
+	if err != nil {
+		t.Fatalf("old hash: %v", err)
+	}
+	candidateHash, err := canonicalManifestHash(candidateDef)
+	if err != nil {
+		t.Fatalf("candidate hash: %v", err)
+	}
+	oldRaw, err := SerializeAppDefinition(oldDef)
+	if err != nil {
+		t.Fatalf("serialize old def: %v", err)
+	}
+	candidateRaw, err := SerializeAppDefinition(candidateDef)
+	if err != nil {
+		t.Fatalf("serialize candidate def: %v", err)
+	}
+	oldState := NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, map[string]interface{}{"__app_address__": "piclu"}, InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}, nil, false)
+	oldState.Revision = 1
+	nextState := NewV2InstallState("piclu", InstallSourceKindCustom, "", candidateRaw, oldState.InstallInputs, *oldState.InstallSystemCtx, nil, false)
+	nextState.Revision = 2
+	appInst := &AppInstance{
+		InstanceID:      "piclu",
+		Enabled:         true,
+		PrimaryService:  "main",
+		NetworkAnchorID: "anchor",
+		Containers:      map[string]string{"main": "main"},
+		ActiveRootfs:    map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		Definition:      oldDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store old app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", oldState); err != nil {
+		t.Fatalf("store old install state: %v", err)
+	}
+	backupPath, err := state.BackupCurrentAppDefinitionForManifestUpdate("piclu")
+	if err != nil {
+		t.Fatalf("backup manifest: %v", err)
+	}
+	if err := mgr.serviceManager.RestorePreparedPublication("piclu", []services.ServiceEndpoint{{
+		App:                "piclu",
+		Name:               "piclu",
+		GuestPort:          8080,
+		HostBind:           15080,
+		PublicPort:         0,
+		Flow:               api.FlowTCP,
+		Protocol:           api.ListenerProtocolHTTP,
+		RequiresTLSMuxAuth: true,
+	}}); err != nil {
+		t.Fatalf("seed old publication: %v", err)
+	}
+	appInst.Definition = candidateDef
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store candidate app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", nextState); err != nil {
+		t.Fatalf("store candidate install state: %v", err)
+	}
+	prepared := []services.ServiceEndpoint{{
+		App:                "piclu",
+		Name:               "piclu-admin",
+		GuestPort:          8080,
+		HostBind:           15080,
+		PublicPort:         0,
+		Flow:               api.FlowTCP,
+		Protocol:           api.ListenerProtocolHTTP,
+		RequiresTLSMuxAuth: true,
+	}}
+	if err := state.StoreManifestUpdateTransaction("piclu", &ManifestUpdateTransaction{
+		OperationID:               "op-listener-repair",
+		OperationKind:             "service_app_update",
+		Phase:                     "publishing_access",
+		PreviousManifestHash:      oldHash,
+		CandidateManifestHash:     candidateHash,
+		PreviousLedgerRevision:    oldState.Revision,
+		CandidateLedgerRevision:   nextState.Revision,
+		PreviousLedgerSourceHash:  oldState.RawTemplateHash,
+		CandidateLedgerSourceHash: nextState.RawTemplateHash,
+		DryRunToken:               "token",
+		RuntimeFingerprint:        "fingerprint",
+		BackupPath:                backupPath,
+		PreparedListenerEndpoints: prepared,
+		AccessSuspended:           false,
+		RuntimeTouched:            true,
+		CreatedAt:                 now,
+		UpdatedAt:                 now,
+	}); err != nil {
+		t.Fatalf("store transaction: %v", err)
+	}
+
+	blocked := mgr.recoverPendingManifestUpdates(context.Background(), state)
+	if blocked["piclu"] {
+		t.Fatalf("recovery should publish prepared listener plan without blocking")
+	}
+	if _, err := state.LoadManifestUpdateTransaction("piclu"); err == nil {
+		t.Fatalf("transaction should be cleared after recovery")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("load transaction: %v", err)
+	}
+	endpoints, err := mgr.serviceManager.GetByApp("piclu")
+	if err != nil {
+		t.Fatalf("get endpoints: %v", err)
+	}
+	if len(endpoints) != 1 || endpoints[0].Name != "piclu-admin" {
+		t.Fatalf("recovered endpoints = %+v, want prepared candidate listener", endpoints)
+	}
+}
+
+func TestApplyCustomManifestUpdate_CleansCreatedRootfsOnStagingRollback(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.exists = map[string]bool{
+		"rootfs-main":             true,
+		networkAnchorServiceName:  true,
+		"rootfs-anchor":           true,
+		"svc-rootfs-piclu--main":  true,
+		"svc-rootfs-piclu--admin": true,
+	}
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	svc := candidateDef.Services["main"]
+	svc.Image = "docker.io/example/piclu:new"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("image update"))
+	wantRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("docker.io/library/mock-image@sha256:mockdigest"))
+	sawRootfsStagingMarker := false
+	state.storeManifestUpdateTransactionHook = func(instanceID string, txn *ManifestUpdateTransaction) error {
+		if instanceID == "piclu" && txn.Phase == "rootfs_staging" && slices.Contains(txn.CreatedRootfs, wantRootfs) {
+			sawRootfsStagingMarker = true
+		}
+		if instanceID == "piclu" && txn.Phase == "rootfs_staged" {
+			return os.ErrPermission
+		}
+		return nil
+	}
+
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err == nil || !strings.Contains(err.Error(), "persist staged rootfs transaction marker") {
+		t.Fatalf("apply err = %v, want staged rootfs persistence failure", err)
+	}
+	if !sawRootfsStagingMarker {
+		t.Fatalf("created rootfs cleanup marker was not persisted before rootfs_staged")
+	}
+	if !slices.Contains(rootfs.detached, wantRootfs) {
+		t.Fatalf("detached rootfs = %v, want %s", rootfs.detached, wantRootfs)
+	}
+	if !slices.Contains(rootfs.destroyed, wantRootfs) {
+		t.Fatalf("destroyed rootfs = %v, want %s", rootfs.destroyed, wantRootfs)
+	}
+	if _, err := state.LoadManifestUpdateTransaction("piclu"); err == nil {
+		t.Fatalf("transaction should be cleared after successful rollback")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("load transaction: %v", err)
+	}
+}
+
+func TestApplyCustomManifestUpdate_DoesNotDetachPreviousActiveRootfsOnSameDigestRollback(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	wantRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("docker.io/library/mock-image@sha256:mockdigest"))
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.exists = map[string]bool{
+		wantRootfs:      true,
+		"rootfs-anchor": true,
+	}
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": wantRootfs, networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	svc := candidateDef.Services["main"]
+	svc.Image = "docker.io/example/piclu:alias"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("same digest image update"))
+	state.storeManifestUpdateTransactionHook = func(instanceID string, txn *ManifestUpdateTransaction) error {
+		if instanceID == "piclu" && txn.Phase == "rootfs_staged" {
+			return os.ErrPermission
+		}
+		return nil
+	}
+
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err == nil || !strings.Contains(err.Error(), "persist staged rootfs transaction marker") {
+		t.Fatalf("apply err = %v, want staged rootfs persistence failure", err)
+	}
+	if slices.Contains(rootfs.detached, wantRootfs) {
+		t.Fatalf("previous active rootfs %s was detached during rollback: %v", wantRootfs, rootfs.detached)
+	}
+	if slices.Contains(rootfs.destroyed, wantRootfs) {
+		t.Fatalf("previous active rootfs %s was destroyed during rollback: %v", wantRootfs, rootfs.destroyed)
+	}
+}
+
+func TestApplyCustomManifestUpdate_PreservesCommittedCleanupWhenSnapshotDestroyFails(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tempDir},
+		destroyErr:        errors.New("thin snapshot busy"),
+	}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(tempDir))
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	svc := candidateDef.Services["main"]
+	svc.Image = "docker.io/example/piclu:new"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("image update"))
+
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply should commit despite cleanup retry marker: %v", err)
+	}
+	txn, err := state.LoadManifestUpdateTransaction("piclu")
+	if err != nil {
+		t.Fatalf("load cleanup-pending transaction: %v", err)
+	}
+	if txn.Phase != "committed_cleanup_pending" {
+		t.Fatalf("phase = %q, want committed_cleanup_pending", txn.Phase)
+	}
+	if txn.PrecommitDataSnapshotID == "" {
+		t.Fatalf("snapshot id should be preserved for retry")
+	}
+	volumes.destroyErr = nil
+	blocked := mgr.recoverPendingManifestUpdates(context.Background(), state)
+	if blocked["piclu"] {
+		t.Fatalf("cleanup-pending app should not be blocked")
+	}
+	if _, err := state.LoadManifestUpdateTransaction("piclu"); err == nil {
+		t.Fatalf("transaction should be cleared after cleanup retry")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("load transaction: %v", err)
+	}
+	if !slices.Contains(volumes.destroyed, txn.PrecommitDataSnapshotID) {
+		t.Fatalf("destroyed snapshots = %v, want %s", volumes.destroyed, txn.PrecommitDataSnapshotID)
+	}
+}
+
+func TestBeginInstalledAppApplyTransactionRejectsPendingCleanup(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	volumes := &manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tempDir},
+		destroyErr:        errors.New("thin snapshot busy"),
+	}
+	mgr.SetVolumeManager(volumes)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	def := customManifestPolicyBaseDef()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     def,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreManifestUpdateTransaction("piclu", &ManifestUpdateTransaction{
+		OperationID:             "op-cleanup",
+		OperationKind:           "service_app_update",
+		Phase:                   "committed_cleanup_pending",
+		PrecommitDataSnapshotID: "snap-app-piclu--manifest-op-cleanup",
+		CreatedAt:               now,
+		UpdatedAt:               now,
+	}); err != nil {
+		t.Fatalf("store cleanup-pending transaction: %v", err)
+	}
+
+	_, err = mgr.beginInstalledAppApplyTransaction(context.Background(), state, installedAppApplyTransactionSpec{
+		OperationKind:         "service_app_update",
+		InstanceID:            "piclu",
+		AppInst:               appInst,
+		PreviousDefinition:    def,
+		CandidateDefinition:   def,
+		PreviousManifestHash:  "old",
+		CandidateManifestHash: "new",
+	})
+	if !errors.Is(err, ErrManifestUpdateConflict) || !strings.Contains(err.Error(), "previous update cleanup is still pending") {
+		t.Fatalf("begin transaction err = %v, want cleanup-pending conflict", err)
+	}
+	txn, err := state.LoadManifestUpdateTransaction("piclu")
+	if err != nil {
+		t.Fatalf("load cleanup-pending transaction: %v", err)
+	}
+	if txn.Phase != "committed_cleanup_pending" {
+		t.Fatalf("phase = %q, want committed_cleanup_pending", txn.Phase)
+	}
+}
+
+func TestApplyCustomManifestUpdate_DataImpactRequiresPrivateSnapshotCapability(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	svc := candidateDef.Services["main"]
+	svc.Environment["PICLU_DEVICE_DIAG_DIR"] = "/diagnostics"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("env update"))
+	if cand.Classification.DataSafety == nil || !cand.Classification.DataSafety.SnapshotRequired {
+		t.Fatalf("expected snapshot-required candidate, got %+v", cand.Classification.DataSafety)
+	}
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err == nil || !strings.Contains(err.Error(), "precommit data snapshot required") {
+		t.Fatalf("apply err = %v, want private snapshot capability rejection", err)
+	}
+	storedDef, err := state.GetAppDefinition("piclu")
+	if err != nil {
+		t.Fatalf("get stored def: %v", err)
+	}
+	if _, exists := storedDef.Services["main"].Environment["PICLU_DEVICE_DIAG_DIR"]; exists {
+		t.Fatalf("rollback should restore previous environment, got %+v", storedDef.Services["main"].Environment)
+	}
+}
+
+func TestApplyCustomManifestUpdate_RejectsWhenSnapshotViabilityFails(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tempDir},
+		viabilityErr:      errors.New("thin pool metadata usage 91.0% exceeds threshold"),
+	}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(tempDir))
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	oldContainerID := "cid-old-main"
+	mock.containers[oldContainerID] = &mockContainer{ID: oldContainerID, Status: "running", Spec: container.ContainerCreateSpec{Name: "piclu-main"}}
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		Containers:     map[string]string{"main": oldContainerID},
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if _, _, err := mgr.serviceManager.Reconcile("piclu", baseDef.Listeners); err != nil {
+		t.Fatalf("seed listener publication: %v", err)
+	}
+	svc := candidateDef.Services["main"]
+	svc.Environment["PICLU_DEVICE_DIAG_DIR"] = "/diagnostics"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("env update"))
+
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err == nil || !strings.Contains(err.Error(), "precommit data snapshot viability") {
+		t.Fatalf("apply err = %v, want snapshot viability rejection", err)
+	}
+	if len(volumes.snapshots) != 0 {
+		t.Fatalf("snapshot should not be created after failed viability gate, got %v", volumes.snapshots)
+	}
+	storedApp, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("stored app missing")
+	}
+	if got := strings.TrimSpace(storedApp.Containers["main"]); got != oldContainerID {
+		t.Fatalf("viability preflight should not replace running container metadata, got %q want %q", got, oldContainerID)
+	}
+	if oldContainer, exists := mock.containers[oldContainerID]; !exists {
+		t.Fatalf("old container %q missing from mock runtime", oldContainerID)
+	} else if oldContainer.Status != "running" {
+		t.Fatalf("viability preflight should leave old container running, status=%q", oldContainer.Status)
+	}
+	if _, ok := mgr.serviceManager.GetAppListener("piclu", "piclu"); !ok {
+		t.Fatalf("old listener publication missing after snapshot viability gate")
+	}
+	storedDef, err := state.GetAppDefinition("piclu")
+	if err != nil {
+		t.Fatalf("get stored def: %v", err)
+	}
+	if _, exists := storedDef.Services["main"].Environment["PICLU_DEVICE_DIAG_DIR"]; exists {
+		t.Fatalf("rollback should restore previous environment, got %+v", storedDef.Services["main"].Environment)
 	}
 }
 
@@ -791,6 +2823,354 @@ func TestRecoverPendingManifestUpdate_RemovesCreatedInstallState(t *testing.T) {
 	}
 }
 
+func TestRecoverPendingManifestUpdate_RestoresPrecommitDataSnapshot(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(tempDir))
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+
+	now := time.Now().UTC()
+	prevDef := customManifestPolicyBaseDef()
+	app := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-old", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     prevDef,
+	}
+	if err := state.StoreApp(app); err != nil {
+		t.Fatalf("store previous app: %v", err)
+	}
+	backupPath, err := state.BackupCurrentAppDefinitionForManifestUpdate("piclu")
+	if err != nil {
+		t.Fatalf("backup previous manifest: %v", err)
+	}
+
+	candidateDef := customManifestPolicyClone(t, prevDef)
+	svc := candidateDef.Services["main"]
+	svc.Image = "docker.io/example/piclu:new"
+	candidateDef.Services["main"] = svc
+	app.Definition = candidateDef
+	app.ActiveRootfs = map[string]string{"main": "rootfs-new", networkAnchorServiceName: "rootfs-anchor"}
+	if err := state.StoreApp(app); err != nil {
+		t.Fatalf("store candidate app: %v", err)
+	}
+	if err := state.StoreManifestUpdateTransaction("piclu", &ManifestUpdateTransaction{
+		OperationID:             "op-recovery",
+		OperationKind:           "manifest_update",
+		Phase:                   "recreating_runtime",
+		BackupPath:              backupPath,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+		DryRunToken:             "token",
+		PreviousManifestHash:    "old",
+		CandidateManifestHash:   "new",
+		PreviousActiveRootfs:    map[string]string{"main": "rootfs-old", networkAnchorServiceName: "rootfs-anchor"},
+		CandidateActiveRootfs:   map[string]string{"main": "rootfs-new", networkAnchorServiceName: "rootfs-anchor"},
+		PrecommitDataSnapshotID: "snap-app-piclu--manifest-test",
+		FailedDataLVName:        "vol-app-piclu--failed-manifest-test",
+		RuntimeTouched:          true,
+	}); err != nil {
+		t.Fatalf("store transaction: %v", err)
+	}
+
+	blocked := mgr.recoverPendingManifestUpdates(context.Background(), state)
+	if blocked["piclu"] {
+		t.Fatalf("piclu should recover successfully")
+	}
+	if len(volumes.rollbacks) != 1 || volumes.rollbacks[0] != "snap-app-piclu--manifest-test->vol-app-piclu--failed-manifest-test" {
+		t.Fatalf("rollbacks = %v", volumes.rollbacks)
+	}
+	restored, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("restored app missing")
+	}
+	if got := restored.ActiveRootfs["main"]; got != "rootfs-old" {
+		t.Fatalf("active rootfs main = %q, want rootfs-old", got)
+	}
+	if restored.Definition.Services["main"].Image != "docker.io/example/piclu:stable" {
+		t.Fatalf("restored image = %q", restored.Definition.Services["main"].Image)
+	}
+	tupleState, err := state.LoadTupleState("piclu")
+	if err != nil {
+		t.Fatalf("load tuple state: %v", err)
+	}
+	if tupleState == nil {
+		t.Fatalf("tuple state missing")
+	}
+	foundFailedLV := false
+	for _, gen := range tupleState.Generations {
+		if gen.FailedLVName != "vol-app-piclu--failed-manifest-test" {
+			continue
+		}
+		foundFailedLV = true
+		if gen.Status != TupleStatusFailed {
+			t.Fatalf("failed LV generation status = %q, want failed", gen.Status)
+		}
+	}
+	if !foundFailedLV {
+		t.Fatalf("failed data LV was not tracked for GC: %+v", tupleState.Generations)
+	}
+}
+
+func TestRecoverPendingManifestUpdate_RestoresPrecommitDataSnapshotWhenDisabled(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(tempDir))
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+
+	now := time.Now().UTC()
+	prevDef := customManifestPolicyBaseDef()
+	app := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-old", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     prevDef,
+	}
+	if err := state.StoreApp(app); err != nil {
+		t.Fatalf("store previous app: %v", err)
+	}
+	backupPath, err := state.BackupCurrentAppDefinitionForManifestUpdate("piclu")
+	if err != nil {
+		t.Fatalf("backup previous manifest: %v", err)
+	}
+
+	candidateDef := customManifestPolicyClone(t, prevDef)
+	svc := candidateDef.Services["main"]
+	svc.Image = "docker.io/example/piclu:new"
+	candidateDef.Services["main"] = svc
+	app.Enabled = false
+	app.Definition = candidateDef
+	app.ActiveRootfs = map[string]string{"main": "rootfs-new", networkAnchorServiceName: "rootfs-anchor"}
+	if err := state.StoreApp(app); err != nil {
+		t.Fatalf("store disabled candidate app: %v", err)
+	}
+	if err := state.StoreManifestUpdateTransaction("piclu", &ManifestUpdateTransaction{
+		OperationID:             "op-recovery-disabled",
+		OperationKind:           "manifest_update",
+		Phase:                   "recreating_runtime",
+		BackupPath:              backupPath,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+		DryRunToken:             "token",
+		PreviousManifestHash:    "old",
+		CandidateManifestHash:   "new",
+		PreviousActiveRootfs:    map[string]string{"main": "rootfs-old", networkAnchorServiceName: "rootfs-anchor"},
+		CandidateActiveRootfs:   map[string]string{"main": "rootfs-new", networkAnchorServiceName: "rootfs-anchor"},
+		PrecommitDataSnapshotID: "snap-app-piclu--manifest-disabled",
+		FailedDataLVName:        "vol-app-piclu--failed-manifest-disabled",
+		RuntimeTouched:          true,
+	}); err != nil {
+		t.Fatalf("store transaction: %v", err)
+	}
+
+	blocked := mgr.recoverPendingManifestUpdates(context.Background(), state)
+	if blocked["piclu"] {
+		t.Fatalf("piclu should recover successfully")
+	}
+	if len(volumes.rollbacks) != 1 || volumes.rollbacks[0] != "snap-app-piclu--manifest-disabled->vol-app-piclu--failed-manifest-disabled" {
+		t.Fatalf("rollbacks = %v", volumes.rollbacks)
+	}
+	if len(volumes.destroyed) != 0 {
+		t.Fatalf("snapshot should be restored, not destroyed: %v", volumes.destroyed)
+	}
+	restored, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("restored app missing")
+	}
+	if restored.Enabled {
+		t.Fatalf("recovery should preserve disabled state")
+	}
+	if got := restored.ActiveRootfs["main"]; got != "rootfs-old" {
+		t.Fatalf("active rootfs main = %q, want rootfs-old", got)
+	}
+	if restored.Definition.Services["main"].Image != "docker.io/example/piclu:stable" {
+		t.Fatalf("restored image = %q", restored.Definition.Services["main"].Image)
+	}
+}
+
+func TestRestorePrecommitDataSnapshotTracksFailedLVAfterCommittedRollbackError(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		snapshotPromoted bool
+		wantSnapshotID   string
+	}{
+		{name: "snapshot-promoted", snapshotPromoted: true, wantSnapshotID: ""},
+		{name: "snapshot-not-promoted", snapshotPromoted: false, wantSnapshotID: "snap-app-piclu--manifest-test"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			paths.SetCoreRootForTest(t, tempDir)
+			paths.SetPodmanRootForTest(t, filepath.Join(tempDir, "podman"))
+			t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(tempDir, "podman-run"))
+			mgr, err := NewAppManagerForTest(nil, tempDir)
+			if err != nil {
+				t.Fatalf("new manager: %v", err)
+			}
+			volumes := &manifestUpdateSnapshotVolumeManager{
+				stubVolumeManager:        &stubVolumeManager{root: tempDir},
+				rollbackResultSet:        true,
+				rollbackRenamesCommitted: true,
+				rollbackSnapshotPromoted: tc.snapshotPromoted,
+				rollbackErr:              errors.New("rollback interrupted after rename"),
+			}
+			mgr.SetVolumeManager(volumes)
+			state, err := mgr.ensureStateManager()
+			if err != nil {
+				t.Fatalf("state manager: %v", err)
+			}
+			txn := &ManifestUpdateTransaction{
+				OperationID:             "op-recovery",
+				PrecommitDataSnapshotID: "snap-app-piclu--manifest-test",
+				FailedDataLVName:        "vol-app-piclu--failed-manifest-test",
+			}
+
+			err = mgr.restorePrecommitDataSnapshot(context.Background(), state, &AppInstance{InstanceID: "piclu"}, nil, txn)
+			if err == nil {
+				t.Fatalf("restore err = nil, want committed rollback error")
+			}
+			if !strings.Contains(err.Error(), "LV rename committed=true") {
+				t.Fatalf("restore err = %v, want committed rename context", err)
+			}
+			if txn.FailedDataLVName != "vol-app-piclu--failed-manifest-test" {
+				t.Fatalf("failed LV marker = %q", txn.FailedDataLVName)
+			}
+			if txn.PrecommitDataSnapshotID != tc.wantSnapshotID {
+				t.Fatalf("snapshot marker = %q, want %q", txn.PrecommitDataSnapshotID, tc.wantSnapshotID)
+			}
+			tupleState, err := state.LoadTupleState("piclu")
+			if err != nil {
+				t.Fatalf("load tuple state: %v", err)
+			}
+			if tupleState == nil {
+				t.Fatalf("tuple state missing")
+			}
+			foundFailedLV := false
+			for _, gen := range tupleState.Generations {
+				if gen.FailedLVName == "vol-app-piclu--failed-manifest-test" && gen.Status == TupleStatusFailed {
+					foundFailedLV = true
+				}
+			}
+			if !foundFailedLV {
+				t.Fatalf("failed data LV was not tracked in tuple state: %+v", tupleState.Generations)
+			}
+		})
+	}
+}
+
+func TestRestorePrecommitDataSnapshotRetriesAfterPartialRenameError(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	paths.SetPodmanRootForTest(t, filepath.Join(tempDir, "podman"))
+	t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(tempDir, "podman-run"))
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	volumes := &manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager:        &stubVolumeManager{root: tempDir},
+		rollbackResultSet:        true,
+		rollbackRenamesCommitted: true,
+		rollbackSnapshotPromoted: false,
+		rollbackErr:              errors.New("snapshot promotion interrupted"),
+	}
+	mgr.SetVolumeManager(volumes)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	txn := &ManifestUpdateTransaction{
+		OperationID:             "op-recovery",
+		PrecommitDataSnapshotID: "snap-app-piclu--manifest-test",
+		FailedDataLVName:        "vol-app-piclu--failed-manifest-test",
+	}
+
+	err = mgr.restorePrecommitDataSnapshot(context.Background(), state, &AppInstance{InstanceID: "piclu"}, nil, txn)
+	if err == nil {
+		t.Fatalf("restore err = nil, want partial rename failure")
+	}
+	if txn.PrecommitDataSnapshotID != "snap-app-piclu--manifest-test" {
+		t.Fatalf("snapshot marker after partial failure = %q", txn.PrecommitDataSnapshotID)
+	}
+	volumes.rollbackResultSet = false
+	volumes.rollbackErr = nil
+	err = mgr.restorePrecommitDataSnapshot(context.Background(), state, &AppInstance{InstanceID: "piclu"}, nil, txn)
+	if err != nil {
+		t.Fatalf("retry restore precommit snapshot: %v", err)
+	}
+	if txn.PrecommitDataSnapshotID != "" {
+		t.Fatalf("snapshot marker after retry = %q, want cleared", txn.PrecommitDataSnapshotID)
+	}
+	if len(volumes.rollbacks) != 2 {
+		t.Fatalf("rollback attempts = %v, want two attempts", volumes.rollbacks)
+	}
+}
+
+func TestRestorePrecommitDataSnapshotRollsBackWhenLayoutMissing(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	paths.SetPodmanRootForTest(t, filepath.Join(tempDir, "podman"))
+	t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", filepath.Join(tempDir, "podman-run"))
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	volumes := &manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tempDir},
+		ensureErr:         errors.New("active LV missing"),
+	}
+	mgr.SetVolumeManager(volumes)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	txn := &ManifestUpdateTransaction{
+		OperationID:             "op-recovery",
+		PrecommitDataSnapshotID: "snap-app-piclu--manifest-test",
+		FailedDataLVName:        "vol-app-piclu--failed-manifest-test",
+	}
+
+	err = mgr.restorePrecommitDataSnapshot(context.Background(), state, &AppInstance{InstanceID: "piclu"}, customManifestPolicyBaseDef(), txn)
+	if err != nil {
+		t.Fatalf("restore precommit snapshot: %v", err)
+	}
+	if txn.PrecommitDataSnapshotID != "" {
+		t.Fatalf("snapshot marker after rollback = %q, want cleared", txn.PrecommitDataSnapshotID)
+	}
+	if len(volumes.rollbacks) != 1 {
+		t.Fatalf("rollback attempts = %v, want one attempt despite layout failure", volumes.rollbacks)
+	}
+}
+
 func TestRecoverPendingManifestUpdate_PreservesReachedLedgerCommit(t *testing.T) {
 	tempDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tempDir)
@@ -929,6 +3309,42 @@ func TestManifestTransactionRuntimeTouchedInfersLegacyRuntimePhase(t *testing.T)
 	}
 }
 
+func TestManifestTransactionRuntimeSwitchStartedInfersMarkers(t *testing.T) {
+	tests := []struct {
+		name string
+		txn  *ManifestUpdateTransaction
+		want bool
+	}{
+		{
+			name: "explicit switch marker",
+			txn:  &ManifestUpdateTransaction{OperationKind: "manifest_update", Phase: "access_suspended", RuntimeSwitchStarted: true},
+			want: true,
+		},
+		{
+			name: "runtime touched implies switch for existing transactions",
+			txn:  &ManifestUpdateTransaction{OperationKind: "manifest_update", Phase: "recreating_runtime", RuntimeTouched: true},
+			want: true,
+		},
+		{
+			name: "pre-switch phase",
+			txn:  &ManifestUpdateTransaction{OperationKind: "manifest_update", Phase: "access_suspended"},
+			want: false,
+		},
+		{
+			name: "legacy switch phase",
+			txn:  &ManifestUpdateTransaction{Phase: "runtime_switch_started"},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := manifestTransactionRuntimeSwitchStarted(tt.txn); got != tt.want {
+				t.Fatalf("manifestTransactionRuntimeSwitchStarted() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestMarkManifestTransactionRuntimeTouchedRequiresDurableWrite(t *testing.T) {
 	tempDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tempDir)
@@ -966,15 +3382,112 @@ func TestMarkManifestTransactionRuntimeTouchedRequiresDurableWrite(t *testing.T)
 	if err := markManifestTransactionRuntimeTouched(state, "piclu", txn); err == nil {
 		t.Fatalf("expected runtime marker write to fail")
 	}
-	if txn.Phase != "candidate_persisted" || txn.RuntimeTouched || !txn.UpdatedAt.Equal(initialUpdatedAt) {
+	if txn.Phase != "candidate_persisted" || txn.RuntimeTouched || txn.RuntimeSwitchStarted || !txn.UpdatedAt.Equal(initialUpdatedAt) {
 		t.Fatalf("in-memory txn was not restored after failed marker write: %+v", txn)
 	}
 	stored, err := state.LoadManifestUpdateTransaction("piclu")
 	if err != nil {
 		t.Fatalf("load stored transaction: %v", err)
 	}
-	if stored.Phase != "candidate_persisted" || stored.RuntimeTouched {
+	if stored.Phase != "candidate_persisted" || stored.RuntimeTouched || stored.RuntimeSwitchStarted {
 		t.Fatalf("durable txn changed after failed marker write: %+v", stored)
+	}
+}
+
+func TestStoreManifestUpdateTransactionUsesPrivateFileMode(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreManifestUpdateTransaction("piclu", &ManifestUpdateTransaction{
+		OperationID:           "op",
+		OperationKind:         "manifest_update",
+		Phase:                 "candidate_persisted",
+		PreviousManifestHash:  "old",
+		CandidateManifestHash: "new",
+		BackupPath:            filepath.Join(tempDir, "backup.yaml"),
+		DryRunToken:           "token",
+		CreatedAt:             now,
+		UpdatedAt:             now,
+	}); err != nil {
+		t.Fatalf("store transaction: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(state.appsDir, "piclu", manifestUpdateTxnFilename))
+	if err != nil {
+		t.Fatalf("stat transaction: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("transaction mode = %o, want 0600", got)
+	}
+}
+
+func TestApplyCustomManifestUpdate_PreservesPlannedSnapshotMarkerWhenCreateCleanupFails(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tempDir},
+		snapshotErr:       errors.New("thin snapshot create interrupted"),
+		destroyErr:        errors.New("snapshot cleanup unavailable"),
+	}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(newStubRootfsManager(tempDir))
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	baseDef := customManifestPolicyBaseDef()
+	candidateDef := customManifestPolicyClone(t, baseDef)
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	svc := candidateDef.Services["main"]
+	svc.Environment["PICLU_DEVICE_DIAG_DIR"] = "/diagnostics"
+	candidateDef.Services["main"] = svc
+	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("env update"))
+
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   cand.BaseManifestHash,
+		RuntimeFingerprint: cand.RuntimeFingerprint,
+		DryRunToken:        cand.Token,
+		Confirmations:      cand.Classification.RequiredConfirmations,
+	})
+	if err == nil || !strings.Contains(err.Error(), "thin snapshot create interrupted") {
+		t.Fatalf("apply err = %v, want snapshot create failure", err)
+	}
+	if len(volumes.snapshots) != 1 {
+		t.Fatalf("snapshots = %v, want one create attempt", volumes.snapshots)
+	}
+	txn, err := state.LoadManifestUpdateTransaction("piclu")
+	if err != nil {
+		t.Fatalf("load transaction: %v", err)
+	}
+	if txn.PrecommitDataSnapshotID != volumes.snapshots[0] {
+		t.Fatalf("txn snapshot marker = %q, want %q", txn.PrecommitDataSnapshotID, volumes.snapshots[0])
 	}
 }
 
@@ -1019,4 +3532,228 @@ func customManifestPolicyClone(t *testing.T, def *api.AppDefinition) *api.AppDef
 		t.Fatalf("parse clone: %v", err)
 	}
 	return clone
+}
+
+func findManifestDecision(decisions []ManifestUpdateDecision, flag string) *ManifestUpdateDecision {
+	for i := range decisions {
+		if decisions[i].Flag == flag {
+			return &decisions[i]
+		}
+	}
+	return nil
+}
+
+func storeManifestUpdateCandidateForTest(t *testing.T, mgr *AppManager, state *FilesystemStateManager, appInst *AppInstance, candidateDef *api.AppDefinition, raw []byte) *manifestUpdateCandidate {
+	t.Helper()
+	baseHash, err := canonicalManifestHash(appInst.Definition)
+	if err != nil {
+		t.Fatalf("base hash: %v", err)
+	}
+	runtimeFingerprint, err := manifestRuntimeFingerprint(appInst)
+	if err != nil {
+		t.Fatalf("runtime fingerprint: %v", err)
+	}
+	ledgerExists, ledgerRevision, ledgerSourceHash, err := loadInstallLedgerFingerprint(state, appInst.InstanceID)
+	if err != nil {
+		t.Fatalf("ledger fingerprint: %v", err)
+	}
+	candidateHash, err := canonicalManifestHash(candidateDef)
+	if err != nil {
+		t.Fatalf("candidate hash: %v", err)
+	}
+	policy, summary := evaluateCustomManifestUpdatePolicy(appInst.Definition, candidateDef)
+	imagePlan, err := mgr.resolveManifestUpdateImagePlan(context.Background(), appInst.InstanceID, appInst.Definition, candidateDef)
+	if err != nil {
+		t.Fatalf("image plan: %v", err)
+	}
+	if len(imagePlan) > 0 {
+		policy.Classification.StagedImageRootfs = manifestUpdateImagePlanSummary(imagePlan)
+	}
+	token := "token-" + candidateHash[:12]
+	cand := &manifestUpdateCandidate{
+		Token:                token,
+		InstanceID:           appInst.InstanceID,
+		RawTemplate:          raw,
+		Inputs:               map[string]interface{}{"__app_address__": appInst.InstanceID},
+		SystemContext:        InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+		BaseManifestHash:     baseHash,
+		RuntimeFingerprint:   runtimeFingerprint,
+		BaseLedgerExists:     ledgerExists,
+		BaseLedgerRevision:   ledgerRevision,
+		BaseLedgerSourceHash: ledgerSourceHash,
+		CandidateDigest:      candidateHash,
+		DiffKind:             classifyDiff(cloneDefinitionForCompare(appInst.Definition), cloneDefinitionForCompare(candidateDef)),
+		MetadataOnly:         policy.MetadataOnly,
+		Definition:           candidateDef,
+		Summary:              summary,
+		Classification:       policy.Classification,
+		ImagePlan:            cloneManifestUpdateImagePlan(imagePlan),
+		CreatedAt:            time.Now().UTC(),
+		ExpiresAt:            time.Now().UTC().Add(manifestUpdateTokenTTL),
+	}
+	mgr.storeManifestUpdateCandidate(cand)
+	return cand
+}
+
+type manifestUpdateSnapshotVolumeManager struct {
+	*stubVolumeManager
+	snapshots                []string
+	destroyed                []string
+	rollbacks                []string
+	ensureErr                error
+	viabilityErr             error
+	healthErr                error
+	snapshotErr              error
+	destroyErr               error
+	rollbackResultSet        bool
+	rollbackRenamesCommitted bool
+	rollbackSnapshotPromoted bool
+	rollbackErr              error
+	snapshotHook             func(instanceID, snapshotLVName string) error
+}
+
+func (m *manifestUpdateSnapshotVolumeManager) EnsureVolume(ctx context.Context, req persistence.VolumeRequest) (persistence.VolumeHandle, error) {
+	if m.ensureErr != nil {
+		return persistence.VolumeHandle{}, m.ensureErr
+	}
+	return m.stubVolumeManager.EnsureVolume(ctx, req)
+}
+
+func (m *manifestUpdateSnapshotVolumeManager) CheckDataSnapshotViability(ctx context.Context, instanceID string) error {
+	_ = ctx
+	_ = instanceID
+	return m.viabilityErr
+}
+
+func (m *manifestUpdateSnapshotVolumeManager) CheckDataSnapshotHealth(ctx context.Context, snapshotLVName string) error {
+	_ = ctx
+	_ = snapshotLVName
+	return m.healthErr
+}
+
+func (m *manifestUpdateSnapshotVolumeManager) SnapshotDataVolume(ctx context.Context, instanceID, snapshotLVName string) error {
+	_ = ctx
+	if m.snapshotHook != nil {
+		if err := m.snapshotHook(instanceID, snapshotLVName); err != nil {
+			return err
+		}
+	}
+	m.snapshots = append(m.snapshots, snapshotLVName)
+	return m.snapshotErr
+}
+
+func (m *manifestUpdateSnapshotVolumeManager) DestroyDataSnapshot(ctx context.Context, snapshotLVName string) error {
+	_ = ctx
+	m.destroyed = append(m.destroyed, snapshotLVName)
+	return m.destroyErr
+}
+
+func (m *manifestUpdateSnapshotVolumeManager) RollbackDataVolume(ctx context.Context, instanceID string, snapshotLVName, failedLVName string) (bool, bool, error) {
+	_ = ctx
+	_ = instanceID
+	m.rollbacks = append(m.rollbacks, snapshotLVName+"->"+failedLVName)
+	if m.rollbackResultSet {
+		return m.rollbackRenamesCommitted, m.rollbackSnapshotPromoted, m.rollbackErr
+	}
+	return true, true, nil
+}
+
+func customManifestImageUpdateRaw(image string) []byte {
+	return []byte(`type: user
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+primary_service: main
+services:
+  main:
+    image: ` + image + `
+    bind_ports: [8080]
+    environment:
+      PICLU_MODE: device
+    storage:
+      persistent:
+        data:
+          container: /data
+x-piccolo:
+  mode: service
+`)
+}
+
+func customManifestOIDCRaw(withAuthorizePaths bool) []byte {
+	authorizePaths := ""
+	if withAuthorizePaths {
+		authorizePaths = "      authorize_paths:\n        - /authorize\n"
+	}
+	return []byte(`type: user
+inputs:
+  display_name:
+    type: string
+    label: Display name
+    default: OIDC app
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+primary_service: main
+services:
+  main:
+    image: docker.io/example/oidc:stable
+    bind_ports: [8080]
+    environment:
+      DISPLAY_NAME: "{{ .Inputs.display_name }}"
+      CLIENT_ID: "{{ .System.Auth.ClientID }}"
+    oidc_client:
+` + authorizePaths + `      redirect_uri_paths:
+        - /callback
+      ca_mount_path: /etc/ssl/certs/piccolo-internal-ca.crt
+      env:
+        ISSUER_URL: "{{ .System.Auth.Issuer }}"
+        CLIENT_ID: "{{ .System.Auth.ClientID }}"
+        CLIENT_SECRET: "{{ .System.Auth.ClientSecret }}"
+        PICCOLO_CA_PATH: /etc/ssl/certs/piccolo-internal-ca.crt
+x-piccolo:
+  mode: service
+`)
+}
+
+func customManifestEnvUpdateRaw() []byte {
+	return []byte(`type: user
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      PICLU_MODE: device
+      PICLU_DEVICE_DIAG_DIR: /diagnostics
+    storage:
+      persistent:
+        data:
+          container: /data
+x-piccolo:
+  mode: service
+`)
 }

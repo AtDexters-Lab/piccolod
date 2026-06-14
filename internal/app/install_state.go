@@ -38,6 +38,7 @@ type InstallState struct {
 	PendingRawTemplate     []byte                `json:"pending_raw_template,omitempty"`
 	PendingRawTemplateHash string                `json:"pending_raw_template_hash,omitempty"`
 	PendingReason          string                `json:"pending_reason,omitempty"`
+	PendingReviewFlow      string                `json:"pending_review_flow,omitempty"`
 	InputProvenance        map[string]string     `json:"input_provenance,omitempty"`
 	IsLegacyBackfill       bool                  `json:"is_legacy_backfill,omitempty"`
 	InstallInputs          map[string]any        `json:"install_inputs,omitempty"`

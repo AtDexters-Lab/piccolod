@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -56,8 +57,14 @@ type udpFlow struct {
 }
 
 // udpProxyState manages the lifecycle of a single UDP proxy listener.
+type udpPacketConn interface {
+	ReadFromUDP([]byte) (int, *net.UDPAddr, error)
+	WriteToUDP([]byte, *net.UDPAddr) (int, error)
+	Close() error
+}
+
 type udpProxyState struct {
-	conn        *net.UDPConn
+	conn        udpPacketConn
 	backendAddr *net.UDPAddr // resolved once at startup
 	stopCh      chan struct{}
 	stopped     chan struct{}
@@ -84,34 +91,43 @@ func (s *udpProxyState) stop() {
 }
 
 func (p *ProxyManager) startUDPProxy(ep ServiceEndpoint) {
+	if err := p.startUDPProxyChecked(ep); err != nil {
+		log.Printf("WARN: %v", err)
+	}
+}
+
+func (p *ProxyManager) startUDPProxyChecked(ep ServiceEndpoint) error {
 	addr := net.JoinHostPort("0.0.0.0", strconv.Itoa(ep.PublicPort))
 
 	p.mu.Lock()
 	if _, exists := p.udpListeners[ep.PublicPort]; exists {
 		p.mu.Unlock()
-		return
+		return nil
 	}
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
-		log.Printf("WARN: UDP proxy resolve %s: %v", addr, err)
 		p.mu.Unlock()
-		return
+		return fmt.Errorf("resolve UDP listener %s: %w", addr, err)
 	}
-	conn, err := net.ListenUDP("udp", udpAddr)
+	listenUDP := p.listenUDP
+	if listenUDP == nil {
+		listenUDP = func(network string, laddr *net.UDPAddr) (udpPacketConn, error) {
+			return net.ListenUDP(network, laddr)
+		}
+	}
+	conn, err := listenUDP("udp", udpAddr)
 	if err != nil {
-		log.Printf("WARN: Failed to bind UDP listener on %s: %v", addr, err)
 		p.mu.Unlock()
-		return
+		return fmt.Errorf("bind UDP listener on %s: %w", addr, err)
 	}
 
 	// Resolve backend address once.
 	backendStr := net.JoinHostPort("127.0.0.1", strconv.Itoa(ep.HostBind))
 	backendUDP, err := net.ResolveUDPAddr("udp", backendStr)
 	if err != nil {
-		log.Printf("WARN: UDP proxy resolve backend %s: %v", backendStr, err)
 		_ = conn.Close()
 		p.mu.Unlock()
-		return
+		return fmt.Errorf("resolve UDP backend %s: %w", backendStr, err)
 	}
 
 	state := &udpProxyState{
@@ -134,12 +150,11 @@ func (p *ProxyManager) startUDPProxy(ep ServiceEndpoint) {
 		Deps:              p.buildL4Deps(ep),
 	})
 	if err != nil {
-		log.Printf("ERROR: registry.BuildL4UDP for app=%s listener=%s: %v", ep.App, ep.Name, err)
 		_ = conn.Close()
 		p.mu.Lock()
 		delete(p.udpListeners, ep.PublicPort)
 		p.mu.Unlock()
-		return
+		return fmt.Errorf("registry.BuildL4UDP for app=%s listener=%s: %w", ep.App, ep.Name, err)
 	}
 	udpTerminal := middleware.UDPHandler(func(ctx middleware.UDPContext, payload []byte, _ middleware.UDPSink) {
 		flow := state.getOrCreateFlow(ctx.Source)
@@ -182,6 +197,7 @@ func (p *ProxyManager) startUDPProxy(ep ServiceEndpoint) {
 			udpChain(ctx, buf[:n], udpSink)
 		}
 	}()
+	return nil
 }
 
 // udpListenerSink adapts the UDP listener conn into middleware.UDPSink so
@@ -189,7 +205,7 @@ func (p *ProxyManager) startUDPProxy(ep ServiceEndpoint) {
 // rejection responses in step 5+). Step 4: unused — the empty L4UDP chain
 // invokes the terminal directly.
 type udpListenerSink struct {
-	conn *net.UDPConn
+	conn udpPacketConn
 }
 
 func (s udpListenerSink) WriteTo(payload []byte, addr *net.UDPAddr) (int, error) {
