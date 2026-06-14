@@ -1653,8 +1653,9 @@ print(json.dumps({'app_definition':os.environ['YAML'],'inputs':{'__app_address__
 # Stage 13: tcp+raw + __primary (listener-pipeline RFC 20260505)
 #
 # Verifies tcp+raw protocol can be __primary (was previously rejected),
-# DerivedHostLabel populates, byte passthrough works, and LAN host-based
-# routing + mDNS are correctly suppressed (HTTP-only path per RFC).
+# raw-without-wrap does not get host-routing metadata, byte passthrough works,
+# and LAN host-based routing + mDNS are correctly suppressed (HTTP-only path
+# per RFC 20260519).
 # Backend: traefik/whoami (HTTP backend used as raw bytes — the L4 chain
 # doesn't parse payloads, so HTTP-over-tcp+raw proves byte passthrough).
 # ─────────────────────────────────────────────────────────
@@ -1728,11 +1729,11 @@ ls=json.load(sys.stdin).get('data',{}).get('listeners') or []
 for l in ls:
     if l.get('lan_host_url'): print(l['lan_host_url']); break" 2>/dev/null || true)
 
-  if [[ -n "$derived" ]]; then
-    echo -e "  ${GREEN}PASS${NC} [13.2] DerivedHostLabel populated for tcp+raw: \"$derived\""
+  if [[ -z "$derived" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [13.2] DerivedHostLabel suppressed for tcp+raw without tls_wrap"
     ((PASS_COUNT++)) || true
   else
-    echo -e "  ${RED}FAIL${NC} [13.2] DerivedHostLabel empty (IsEligibleForHostRouting regression)"
+    echo -e "  ${RED}FAIL${NC} [13.2] DerivedHostLabel leaked for tcp+raw without tls_wrap: \"$derived\""
     ((FAIL_COUNT++)) || true
   fi
 
@@ -1760,7 +1761,9 @@ for l in ls:
   fi
   rm -f "$raw_body"
 
-  # LAN host-based should NOT route tcp+raw — should fall through to portal/404
+  # LAN host-based should NOT route tcp+raw — raw-without-wrap should not even
+  # expose a LAN host URL. If one appears, verify it still does not route to
+  # the raw backend before failing the metadata leak.
   if [[ -n "$lan_host_url" ]]; then
     local host_label
     host_label=$(echo "$lan_host_url" | sed 's|http://||;s|/.*||')
@@ -1770,17 +1773,20 @@ for l in ls:
       echo -e "  ${RED}FAIL${NC} [13.4] LAN host-based incorrectly routed tcp+raw to backend"
       ((FAIL_COUNT++)) || true
     else
-      echo -e "  ${GREEN}PASS${NC} [13.4] LAN host-based correctly suppressed for tcp+raw (HTTP-only path)"
-      ((PASS_COUNT++)) || true
+      echo -e "  ${RED}FAIL${NC} [13.4] LAN host URL leaked for tcp+raw without routing to backend: $lan_host_url"
+      ((FAIL_COUNT++)) || true
     fi
   else
-    skip "13.4" "LAN host-based suppression" "no lan_host_url"
+    echo -e "  ${GREEN}PASS${NC} [13.4] LAN host URL suppressed for tcp+raw without tls_wrap"
+    ((PASS_COUNT++)) || true
   fi
 
   # mDNS suppression — host-side avahi-browse shouldn't see this listener
   if command -v avahi-browse >/dev/null 2>&1; then
     local mdns_out
-    mdns_out=$(timeout 5 avahi-browse -arpt 2>/dev/null | grep -i "$derived" || true)
+    local mdns_probe="$APP_NAME"
+    if [[ -n "$derived" ]]; then mdns_probe="$derived"; fi
+    mdns_out=$(timeout 5 avahi-browse -arpt 2>/dev/null | grep -i "$mdns_probe" || true)
     if [[ -z "$mdns_out" ]]; then
       echo -e "  ${GREEN}PASS${NC} [13.5] mDNS suppression for tcp+raw (no avahi entries)"
       ((PASS_COUNT++)) || true
