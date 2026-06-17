@@ -10,7 +10,6 @@ import 'package:piccolo_os/shells/desktop/features/setup/controllers/onboarding_
 import 'package:piccolo_os/shells/desktop/features/setup/install_disk_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/onboarding_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/setup_utils.dart';
-import 'package:piccolo_os/shells/desktop/features/setup/steps/unlocking_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/credentials_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/error_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/finishing_step.dart';
@@ -26,6 +25,7 @@ import 'package:piccolo_os/shells/desktop/features/setup/steps/remote_address_st
 import 'package:piccolo_os/shells/desktop/features/setup/steps/security_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/system_error_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/unlock_step.dart';
+import 'package:piccolo_os/shells/desktop/features/setup/steps/unlocking_step.dart';
 import 'package:piccolo_os/shells/desktop/features/setup/steps/welcome_step.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
